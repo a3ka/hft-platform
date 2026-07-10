@@ -1,9 +1,8 @@
-//! obi_probe — прогнать записанный журнал, восстановить стаканы, измерить:
-//!  - глубину данных (сколько уровней, как далеко от mid они достают в %),
-//!  - применимы ли полосы 3%/8% (если крайний уровень ближе 3% — полосы захватывают ВЕСЬ
-//!    стакан и асимметрия 3%/8% не выражается на этих данных),
-//!  - распределение OBI-метрики bid_depth(3%) / (bid_depth(3%) + ask_depth(8%)).
-//! cargo run --example obi_probe -p book -- <journal-dir>
+//! obi_probe — прогнать записанный журнал, восстановить стаканы, измерить глубину данных
+//! (сколько уровней, как далеко от mid достают в %), применимость полос 3%/8% (если крайний
+//! уровень ближе 3% — полосы захватывают весь стакан → асимметрия не выражается), и
+//! распределение OBI-метрики bid_depth(3%) / (bid_depth(3%) + ask_depth(8%)).
+//! Запуск: cargo run --example obi_probe -p book -- <journal-dir>
 
 use std::collections::HashMap;
 
@@ -17,7 +16,6 @@ struct Stat {
     sum_lvl_ask: u64,
     sum_reach_bid: f64,
     sum_reach_ask: f64,
-    reach_bid_lt_3: u64, // сколько раз крайний бид ближе 3% (полоса 3% = весь стакан)
     obi: Vec<f64>,
     band3_captures_all: u64, // depth(3%) == total bid depth
 }
@@ -50,9 +48,6 @@ fn main() {
         let ra = ob.max_reach_pct(Side::Sell).unwrap_or(0.0);
         s.sum_reach_bid += rb;
         s.sum_reach_ask += ra;
-        if rb < 0.03 {
-            s.reach_bid_lt_3 += 1;
-        }
         let bid3 = ob.depth_within(Side::Buy, 0.03);
         let ask8 = ob.depth_within(Side::Sell, 0.08);
         let bid_total: i64 = ob.depth_within(Side::Buy, 10.0); // 1000% — весь стакан
