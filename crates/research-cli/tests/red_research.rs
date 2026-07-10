@@ -143,6 +143,10 @@ fn grid_spec(mode: CostsMode) -> GridSpec {
 
 #[test]
 fn test_ledger_append_only() {
+    // Осознанное ограничение оракула (critic C-001 m2): тест проверяет append-only
+    // ЭФФЕКТ (префикс-сохранность байт), не механизм O_APPEND как таковой.
+    // Механизм — требование FA §6 к реализации (research-dev: OpenOptions::append);
+    // rewrite-реализация, проходящая этот тест, будет поймана на ревью diff'а.
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("trials-ledger.jsonl");
     let mut l = Ledger::open(&path).unwrap();

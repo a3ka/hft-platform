@@ -20,15 +20,19 @@ imbalance) и Трек B-частично (полосы — Binance full-book у
 
 ## Contract impact (T1)
 
-**T1 НЕ трогается.** Обоснование:
+**`crates/contracts/**` НЕ трогается** (Block-C не срабатывает). Уточнение per critic
+C-001 M1 (классификация НЕ переопределяется — выравнено с 05 §2 + FA research-cli §N):
 - `Ord(Ack|Fill|...)` EventKind (sim FA §N "Produced") нужен ТОЛЬКО paper/live-режимам
   (запись в журнал). Backtest M-04 возвращает fills in-memory (`SimFill`, T2) в
   grid-раннер. Добавление `Ord(...)` в `EventKind` = contract-RFC на входе в M-05 (P3).
-- `TrialRecord`/`ValidationReport` — T1-формы per 05 §2, но их единственный
-  Rust-продюсер/консюмер сейчас — `research-cli`; JSON-файлы несут
-  `report_schema_version`. Промоушен типов в `crates/contracts` + JSON Schema генерация
-  (CT-I-4) — отдельный contract-RFC, когда появится Python-консюмер. → TECH-DEBT entry
-  (reviewer, при merge).
+- `TrialRecord`/`ValidationReport` **ОСТАЮТСЯ T1-формами** per 05 §2; их Rust-типы
+  временно живут в `crates/research-cli/src/types.rs` («T1-designate, промоушен
+  отложен») — FA research-cli §N несёт named-амендмент об этом (Amendment history
+  2026-07-10). JSON-артефакты несут `report_schema_version`; правило единственного
+  писателя/читателя выполняется. Промоушен в `crates/contracts` + JSON Schema
+  генерация (CT-I-4) — отдельный contract-RFC при появлении Python-консюмера.
+  **Reviewer при merge (Block J): завести TECH-DEBT entry `TD-008-t1-report-forms-
+  promotion` (TECH-DEBT.md reviewer-owned — architect писать не может).**
 
 ## Архитектурные решения (закрывают §O открытые вопросы FA — до реализации)
 
@@ -51,7 +55,7 @@ imbalance) и Трек B-частично (полосы — Binance full-book у
 | Агент | Allowed | Forbidden |
 |---|---|---|
 | architect (Fable) | `milestones/`, `crates/*/tests/**` (RED, sacred), типы/трейты-скелеты, `scripts/verify_M-04.sh`, `research/specs/S-001-*.md` | impl-код |
-| engine-dev | `crates/sim/src/**`, `crates/sim/Cargo.toml` (deps) | tests, другие крейты, contracts |
+| engine-dev | `crates/sim/src/**`, `crates/sim/Cargo.toml` (deps), **carve-out per C-001 C1: `crates/book/src/lib.rs` ТОЛЬКО реализация `top_n_depth` (сигнатура и RED-тест — architect)** | tests, другие крейты, contracts |
 | signal-engineer | `crates/signals/src/**`, `crates/signals/Cargo.toml`, `research/specs/` | tests (sacred), risk/oms |
 | research-dev | `crates/research-cli/src/**`, `crates/research-cli/Cargo.toml`, `research/latency|fees/` (артефакты по D7) | tests, registry/signals.json |
 | все dev | — | `crates/contracts/**`, `crates/journal/**`, `crates/book/**`, `crates/venue-*/**`, `.claude/**`, `docs/**`, `*/tests/**`, `scripts/**` |
@@ -61,7 +65,7 @@ imbalance) и Трек B-частично (полосы — Binance full-book у
 | # | Status | Задача | Агент | Verify |
 |---|---|---|---|---|
 | 1 | ✅ | Скелеты крейтов `sim`/`signals`/`research-cli` (типы T2, трейты, todo!-стабы) + RED-тесты + verify-скрипт | architect | компиляция OK; RED-suite падает |
-| 2 | ⏳ | `sim` impl: fill_model (пессимистичная очередь §5) + latency (таблица, SplitMix64) + fees/funding + BacktestExchange + divergence gate-checker | engine-dev | SM-I-1,2,4,5,6,7,8,10 GREEN |
+| 2 | ⏳ | `sim` impl: fill_model (пессимистичная очередь §5) + latency (таблица, SplitMix64) + fees/funding + BacktestExchange + divergence gate-checker; **+ `book::top_n_depth` (carve-out C1, RED-тест `crates/book/tests/test_top_n_depth.rs`)** | engine-dev | SM-I-1,2,4,5,6,7,8,10 GREEN + book-тест GREEN |
 | 3 | ⏳ | `signals` impl: SignalBank (изоляция паник SG-I-9) + registry-загрузчик (D3/D11) + `obi.rs` (TopN+Bands режимы, D1/D9) | signal-engineer | SG-I-1..11 + OBI-тесты GREEN |
 | 4 | ⏳ | `research-cli` impl: ledger (O_APPEND+hash-chain D8) + split (val-gate токен) + metrics (Sharpe/DSR D4/maxDD/fill-rate/turnover/capacity D5/decay) + grid/walkforward (стресс ×1.5-cost/×2-latency) + report (детерминизм) + CLI | research-dev | RC-I-1..11 GREEN |
 | 5 | ⏳ | Артефакты D7: latency-probe (δ_md из журнала + RTT-замер) → `research/latency/*.json`; `research/fees/*.json` (тарифы Binance spot/HL `[verify-at-impl]` с ссылкой на доку) | research-dev | файлы валидны, sim их грузит |

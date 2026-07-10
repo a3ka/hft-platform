@@ -39,12 +39,17 @@ check "T5a latency artifact существует" bash -c 'ls research/latency/*
 check "T5b latency artifact несёт provenance" bash -c 'grep -l "provenance" research/latency/*.json >/dev/null'
 check "T5c fees artifact существует + provenance" bash -c 'grep -l "provenance" research/fees/*.json >/dev/null'
 
-# T6: регрессия — прежние крейты живы
+# T6: регрессия — прежние крейты живы. ВНИМАНИЕ: book несёт RED-тест top_n_depth
+# (carve-out C-001 C1) — T6 красный, пока engine-dev не закрыл задачу 2.
 check "T6 workspace tests (contracts+journal+book)" bash -c 'cargo test -p contracts -p journal -p book'
 
 # T7: SignalSpec-карточка S-001 (задача 7) сверена с H-карточкой
 check "T7a S-001 spec существует" test -f research/specs/S-001-obi-asym.md
 check "T7b H-карточка пре-регистрирована" bash -c 'grep -qi "критерии фальсификации" research/hypotheses/H-20260710-obi-asym.md'
+
+# Задача 8 (прогон OBI + R-001) НАМЕРЕННО без check-строки (critic C-001 m1):
+# она гейтится накоплением full-book данных + вердиктом risk-critic + подписью
+# founder ★ — верифицируется людьми по research/reports/R-001*, не этим скриптом.
 
 # T8: инвариантные грепы (дубль структурных тестов на уровне скрипта)
 check "T8a sim не зависит от venue-*" bash -c '! grep -E "venue-(binance|hyperliquid)" crates/sim/Cargo.toml'

@@ -182,6 +182,16 @@ fill-rate, turnover, capacity-оценка, decay-кривая. Ключевое
   торгового пути (RC-I-7); чтение test-сегмента до прохождения val-гейта (RC-I-8);
   удаление/перезапись существующей записи trials-ledger (RC-I-2).
 
+> **§N amendment 2026-07-10 (M-04, per critic C-001 M1 — named, not silent):**
+> `ValidationReport`/`TrialsLedger`-записи ОСТАЮТСЯ T1-формами (05 §2 — источник
+> правды не форкается). Их Rust-типы на этапе M-04 временно живут в
+> `crates/research-cli/src/types.rs` со статусом **«T1-designate, промоушен
+> отложен»**: единственный продюсер/консюмер — `research-cli`; JSON несёт
+> `report_schema_version`. Промоушен в `crates/contracts` + JSON Schema (CT-I-4) —
+> отдельным contract-RFC при появлении первого кросс-языкового консюмера
+> (Python-тулинг). Tech-debt: `TD-008-t1-report-forms-promotion` (заводит reviewer
+> при merge M-04).
+
 ## §I. Инварианты (RC-I-1..11 + RC-I-Z) — RED-оракулы (тест падает на заглушке)
 1. **RC-I-1** Ноль LLM-вызовов: ни одна зависимость/импорт крейта не является клиентом
    LLM-провайдера (grep-канарейка по `Cargo.toml` + исходникам).
@@ -275,3 +285,4 @@ fill-rate, turnover, capacity-оценка, decay-кривая. Ключевое
 | Дата | Изменение | Автор |
 |---|---|---|
 | 2026-07-10 | v1 authoring (bridge FA) | architect (Fable) |
+| 2026-07-10 | §N amendment: T1-designate статус ValidationReport/TrialsLedger типов на M-04 (промоушен в contracts отложен до кросс-языкового консюмера; per critic C-001 M1) | architect (Fable) |

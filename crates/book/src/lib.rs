@@ -116,6 +116,15 @@ impl OrderBook {
         }
     }
 
+    /// Суммарный размер N ЛУЧШИХ уровней стороны (Трек A OBI: top-N imbalance;
+    /// M-04 C1 per research/critiques/C-001-M-04-plan.md). Меньше N уровней —
+    /// суммируем что есть; пустая сторона/n=0 → 0. Реализация — engine-dev
+    /// (M-04 task 2, узкий carve-out на этот метод).
+    pub fn top_n_depth(&self, side: Side, n: usize) -> i64 {
+        let _ = (side, n);
+        todo!("engine-dev: M-04 task 2 (carve-out per C-001 C1)")
+    }
+
     pub fn n_levels(&self, side: Side) -> usize {
         match side {
             Side::Buy => self.bids.len(),
