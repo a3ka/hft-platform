@@ -69,8 +69,8 @@ C-001 M1 (классификация НЕ переопределяется — �
 | 3 | ✅ | `signals` impl: SignalBank (изоляция паник SG-I-9) + registry-загрузчик (D3/D11) + `obi.rs` (TopN+Bands режимы, D1/D9) | signal-engineer | SG-I-1..11 + OBI-тесты GREEN |
 | 4 | ✅ | `research-cli` impl: ledger (O_APPEND+hash-chain D8) + split (val-gate токен) + metrics (Sharpe/DSR D4/maxDD/fill-rate/turnover/capacity D5/decay) + grid/walkforward (стресс ×1.5-cost/×2-latency) + report (детерминизм) + CLI | research-dev | RC-I-1..11 GREEN |
 | 5 | ✅ | Артефакты D7: latency-probe (δ_md из журнала + RTT-замер) → `research/latency/*.json`; `research/fees/*.json` (тарифы Binance spot/HL `[verify-at-impl]` с ссылкой на доку) | research-dev | файлы валидны, sim их грузит |
-| 6 | 🚧 | `scripts/verify_M-04.sh` exit=0 (fmt+clippy+все тесты+грепы) | tester | exit=0 |
-| 7 | ⏳ | SignalSpec `research/specs/S-001-obi-asym.md` (params-схема, гриды, walk-forward D6) — сверка с H-карточкой | architect+signal-engineer | RC validate находит карточку |
+| 6 | ✅ | `scripts/verify_M-04.sh` exit=0 (fmt+clippy+все тесты+грепы) | tester | exit=0 |
+| 7 | ✅ | SignalSpec `research/specs/S-001-obi-asym.md` (params-схема, гриды, walk-forward D6) — сверка с H-карточкой | architect+signal-engineer | RC validate находит карточку |
 | 8 | ⏳ | Прогон OBI Трек A (+Трек B на Binance full-book выборке): grid train → топ-K val → walk-forward → ОДНО касание test → `research/reports/R-001*` | research-dev запуск; risk-critic вердикт; founder ★ | отчёт по пре-рег. критериям H-карточки; trials-ledger заполнен |
 
 Задача 8 гейтится накоплением данных полной книги (VPS пишет с 2026-07-10) — запуск
