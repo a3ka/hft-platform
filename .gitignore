@@ -7,3 +7,4 @@
 /journal-data
 *.journal
 .DS_Store
+tmp/
