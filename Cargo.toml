@@ -7,6 +7,7 @@ members = [
   "crates/venue-binance",
   "crates/venue-hyperliquid",
   "crates/recorder",
+  "crates/signals",
 ]
 
 # M-00 bootstrap: минимальный работающий скелет (recorder-заглушка + contracts).

@@ -924,6 +924,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "research-cli"
+version = "0.0.0"
+dependencies = [
+ "book",
+ "contracts",
+ "journal",
+ "serde",
+ "serde_json",
+ "sha2",
+ "signals",
+ "sim",
+ "tempfile",
+]
+
+[[package]]
 name = "ring"
 version = "0.17.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1091,6 +1106,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sha2"
+version = "0.10.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.2.17",
+ "digest",
+]
+
+[[package]]
 name = "sharded-slab"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1113,6 +1139,30 @@ checksum = "c4db69cba1110affc0e9f7bcd48bbf87b3f4fc7c61fc9155afd4c469eb3d6c1b"
 dependencies = [
  "errno",
  "libc",
+]
+
+[[package]]
+name = "signals"
+version = "0.0.0"
+dependencies = [
+ "book",
+ "contracts",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
+name = "sim"
+version = "0.0.0"
+dependencies = [
+ "book",
+ "contracts",
+ "journal",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
