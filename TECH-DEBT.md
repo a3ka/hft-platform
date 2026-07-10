@@ -17,6 +17,28 @@
   (150GB). Добавить сегмент-ротацию + retention→Storage Box когда объём вырастет. Severity: NOTE.
 - **TD-007** DET-I-1 (бит-идентичный replay + state_hash) реализован частично (seq+read_all).
   Полный snapshot/state_hash — следующая фаза journal. Severity: NOTE.
+- **TD-008** `t1-report-forms-promotion` (M-04). Rust-типы T1-форм `TrialRecord`/
+  `ValidationReport` временно живут в `crates/research-cli/src/types.rs` со статусом
+  «T1-designate» (per docs/fa/research-cli.md §N amendment 2026-07-10 + critic C-001 M1).
+  Единственный продюсер/консюмер сейчас — research-cli; JSON несёт `report_schema_version`.
+  Промоушен в `crates/contracts` + генерация JSON Schema (CT-I-4) — отдельным contract-RFC
+  при появлении первого кросс-языкового консюмера (Python-тулинг). Severity: NOTE.
+- **TD-009** `obi-track-a-report-pending` (M-04 задача 8, ОТКРЫТА). Прогон OBI Трек A/B →
+  `research/reports/R-001*` гейтится накоплением данных полной книги (VPS пишет с 2026-07-10),
+  вердиктом risk-critic (анти-оверфит чек-лист gates.md §6) и подписью founder ★. Merge
+  M-04-кода risk/oms/venues/contracts не трогал — risk-critic обязателен на ОТЧЁТЕ, не на
+  этом merge. Также см. TD-004 (Binance @depth20 недостаточен для полос 3%/8% — нужен
+  full-book snapshot+diff). Severity: NOTE (гейт пути к деньгам, не долг кода).
+
+## Замечания reviewer'а M-04 (не блокирующие, 2026-07-10)
+- **RN-1** (NOTE) `verify_M-04.sh` T6 объединяет `contracts+journal+book` в один `check` —
+  провал любого из трёх не различается по строке. Приемлемо для регресс-гейта (все GREEN),
+  но при росте числа крейтов стоит разнести на per-crate строки для точной диагностики.
+- **RN-2** (NOTE) Латентность δ_md — эмпирика из журнала, но δ_submit/δ_cancel — measured WS
+  RTT ×2 (пессимизм-прокси, НЕ реальный order-path замер: P1 order-path ещё нет, D7 это
+  честно фиксирует в provenance). Честность δ_submit/δ_cancel обязана быть предметом
+  risk-critic на отчёте R-001 (чувствительность ×2 латентности per gates.md §6.4) — уже
+  учтено дизайном стресс-вариантов, отмечаю для явной проверки на задаче 8.
 
 ## CLOSED
 - (пусто)
