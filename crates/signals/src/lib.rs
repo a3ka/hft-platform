@@ -40,10 +40,51 @@ pub struct SignalMeta {
 pub struct SignalId(String);
 
 impl SignalId {
-    /// Валидация формата `S-NNN-<slug>` (NNN — 3 цифры; slug — [a-z0-9-]+).
+    /// Валидация формата `S-NNN-<slug>` (NNN — 3 цифры; slug — сегменты `[a-z0-9]+`,
+    /// разделённые одиночным `-`, без ведущего/хвостового/двойного дефиса). Ручная
+    /// побайтовая проверка (без regex-крейта — меньше зависимостей).
     pub fn parse(s: &str) -> Result<Self, SignalError> {
-        let _ = s;
-        todo!("signal-engineer: M-04 task 3")
+        if !s.is_ascii() {
+            return Err(SignalError::InvalidId(s.to_string()));
+        }
+        let bytes = s.as_bytes();
+        // Минимум: "S-000-a" = 7 байт.
+        if bytes.len() < 7 {
+            return Err(SignalError::InvalidId(s.to_string()));
+        }
+        if bytes[0] != b'S' || bytes[1] != b'-' {
+            return Err(SignalError::InvalidId(s.to_string()));
+        }
+        if !bytes[2].is_ascii_digit() || !bytes[3].is_ascii_digit() || !bytes[4].is_ascii_digit() {
+            return Err(SignalError::InvalidId(s.to_string()));
+        }
+        if bytes[5] != b'-' {
+            return Err(SignalError::InvalidId(s.to_string()));
+        }
+        // Safe: s.is_ascii() verified above, so byte index 6 is a char boundary.
+        let slug = &s[6..];
+        if slug.is_empty() {
+            return Err(SignalError::InvalidId(s.to_string()));
+        }
+        let mut prev_hyphen = true; // запрещает ведущий дефис в slug
+        for b in slug.bytes() {
+            match b {
+                b'a'..=b'z' | b'0'..=b'9' => prev_hyphen = false,
+                b'-' => {
+                    if prev_hyphen {
+                        // двойной или ведущий дефис
+                        return Err(SignalError::InvalidId(s.to_string()));
+                    }
+                    prev_hyphen = true;
+                }
+                _ => return Err(SignalError::InvalidId(s.to_string())),
+            }
+        }
+        if prev_hyphen {
+            // хвостовой дефис
+            return Err(SignalError::InvalidId(s.to_string()));
+        }
+        Ok(SignalId(s.to_string()))
     }
     pub fn as_str(&self) -> &str {
         &self.0
