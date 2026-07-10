@@ -137,16 +137,22 @@ impl OrderBook {
     /// (проедание книги по уровням) — из одних агрегатов уровни не восстановить.
     /// Реализация — engine-dev (расширенный carve-out per milestone M-04).
     pub fn levels(&self, side: Side) -> Vec<(i64, i64)> {
-        let _ = side;
-        todo!("engine-dev: M-04 task 2 (SVR-резолюция carve-out)")
+        match side {
+            // bid: лучший = наибольшая цена → обход BTreeMap с конца.
+            Side::Buy => self.bids.iter().rev().map(|(&p, &s)| (p, s)).collect(),
+            // ask: лучший = наименьшая цена → обход с начала.
+            Side::Sell => self.asks.iter().map(|(&p, &s)| (p, s)).collect(),
+        }
     }
 
     /// Видимый размер на конкретном ценовом уровне (0, если уровня нет).
     /// SVR-резолюция M-04: queue ahead maker-ордера = объём на НАШЕЙ цене (FA sim §5),
     /// не на лучшем уровне. Реализация — engine-dev (расширенный carve-out).
     pub fn size_at(&self, side: Side, price: i64) -> i64 {
-        let _ = (side, price);
-        todo!("engine-dev: M-04 task 2 (SVR-резолюция carve-out)")
+        match side {
+            Side::Buy => self.bids.get(&price).copied().unwrap_or(0),
+            Side::Sell => self.asks.get(&price).copied().unwrap_or(0),
+        }
     }
 
     pub fn n_levels(&self, side: Side) -> usize {

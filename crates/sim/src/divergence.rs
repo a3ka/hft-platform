@@ -36,6 +36,14 @@ pub fn p4_gate(
     report: Option<&DivergenceMetric>,
     tol: &DivergenceTolerance,
 ) -> Result<(), GateBlocked> {
-    let _ = (report, tol);
-    todo!("engine-dev: M-04 task 2")
+    let report = report.ok_or(GateBlocked::MissingReport)?;
+    if report.fill_rate_delta.abs() > tol.max_fill_rate_delta
+        || report.pnl_delta_e8.abs() > tol.max_pnl_delta_e8
+    {
+        return Err(GateBlocked::OutOfTolerance {
+            fill_rate_delta: report.fill_rate_delta,
+            pnl_delta_e8: report.pnl_delta_e8,
+        });
+    }
+    Ok(())
 }

@@ -53,9 +53,21 @@ impl LatencyTable {
 
     /// Загрузить один артефакт-файл в таблицу. Пустые сэмплы/пустой provenance → Err.
     pub fn load_artifact(&mut self, path: &Path) -> Result<(), SimError> {
-        let _ = path;
-        let _ = &self.entries;
-        todo!("engine-dev: M-04 task 2")
+        let raw = std::fs::read_to_string(path).map_err(SimError::Io)?;
+        let artifact: LatencyArtifact =
+            serde_json::from_str(&raw).map_err(|e| SimError::Parse(e.to_string()))?;
+        if artifact.provenance.trim().is_empty()
+            || artifact.delta_submit_ns.is_empty()
+            || artifact.delta_cancel_ns.is_empty()
+            || artifact.delta_md_ns.is_empty()
+        {
+            return Err(SimError::Parse(
+                "latency artifact: пустые сэмплы либо пустой provenance (D7/SM-I-8)".into(),
+            ));
+        }
+        self.entries
+            .insert((artifact.venue, artifact.symbol.clone()), artifact);
+        Ok(())
     }
 
     /// Синтетика для тестов/грида.
@@ -68,8 +80,18 @@ impl LatencyTable {
         md_ns: Vec<u64>,
         provenance: &str,
     ) {
-        let _ = (venue, symbol, submit_ns, cancel_ns, md_ns, provenance);
-        todo!("engine-dev: M-04 task 2")
+        self.entries.insert(
+            (venue, symbol.to_string()),
+            LatencyArtifact {
+                schema_version: 1,
+                venue,
+                symbol: symbol.to_string(),
+                provenance: provenance.to_string(),
+                delta_submit_ns: submit_ns,
+                delta_cancel_ns: cancel_ns,
+                delta_md_ns: md_ns,
+            },
+        );
     }
 
     pub fn has(&self, venue: Venue, symbol: &str) -> bool {
@@ -83,13 +105,54 @@ impl LatencyTable {
         symbol: &str,
         rng: &mut SplitMix64,
     ) -> Result<LatencyDraw, SimError> {
-        let _ = (venue, symbol, rng);
-        todo!("engine-dev: M-04 task 2")
+        let artifact = self
+            .entries
+            .get(&(venue, symbol.to_string()))
+            .ok_or_else(|| SimError::MissingLatency {
+                venue,
+                symbol: symbol.to_string(),
+            })?;
+        // Фиксированный порядок вызовов rng: submit, cancel, md.
+        let pick = |rng: &mut SplitMix64, samples: &[u64]| -> u64 {
+            let u = rng.next_f64();
+            let idx = ((u * samples.len() as f64) as usize).min(samples.len() - 1);
+            samples[idx]
+        };
+        let delta_submit_ns = pick(rng, &artifact.delta_submit_ns);
+        let delta_cancel_ns = pick(rng, &artifact.delta_cancel_ns);
+        let delta_md_ns = pick(rng, &artifact.delta_md_ns);
+        Ok(LatencyDraw {
+            delta_submit_ns,
+            delta_cancel_ns,
+            delta_md_ns,
+        })
     }
 
     /// Стресс ×k к латентности (RC-I-10: стресс — отдельный прогон через ту же модель).
     pub fn scaled(&self, factor: f64) -> LatencyTable {
-        let _ = factor;
-        todo!("engine-dev: M-04 task 2")
+        let entries = self
+            .entries
+            .iter()
+            .map(|(key, artifact)| {
+                let scale = |v: &[u64]| -> Vec<u64> {
+                    v.iter()
+                        .map(|&x| (x as f64 * factor).round() as u64)
+                        .collect()
+                };
+                (
+                    key.clone(),
+                    LatencyArtifact {
+                        schema_version: artifact.schema_version,
+                        venue: artifact.venue,
+                        symbol: artifact.symbol.clone(),
+                        provenance: artifact.provenance.clone(),
+                        delta_submit_ns: scale(&artifact.delta_submit_ns),
+                        delta_cancel_ns: scale(&artifact.delta_cancel_ns),
+                        delta_md_ns: scale(&artifact.delta_md_ns),
+                    },
+                )
+            })
+            .collect();
+        LatencyTable { entries }
     }
 }

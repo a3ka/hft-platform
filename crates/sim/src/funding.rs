@@ -6,6 +6,8 @@
 /// position_qty_e8 — знаковая позиция (long > 0); rate_e8 — ставка ×1e8;
 /// mark_price_e8 — цена начисления. Long платит при положительной ставке (перп-конвенция).
 pub fn funding_pnl_e8(position_qty_e8: i64, mark_price_e8: i64, rate_e8: i64) -> i64 {
-    let _ = (position_qty_e8, mark_price_e8, rate_e8);
-    todo!("engine-dev: M-04 task 2")
+    let scale = contracts::PRICE_SCALE as i128;
+    let notional = (position_qty_e8 as i128 * mark_price_e8 as i128) / scale;
+    let pnl = (notional * rate_e8 as i128) / scale;
+    -(pnl as i64)
 }

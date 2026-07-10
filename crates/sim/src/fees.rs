@@ -31,9 +31,33 @@ impl FeeSchedule {
     }
 
     pub fn load_artifact(&mut self, path: &Path) -> Result<(), SimError> {
-        let _ = path;
-        let _ = &self.entries;
-        todo!("engine-dev: M-04 task 2")
+        #[derive(serde::Deserialize)]
+        struct FeeArtifact {
+            #[allow(dead_code)]
+            schema_version: u32,
+            venue: Venue,
+            /// Методика/ссылка на доку биржи — обязательное поле честности (D7).
+            provenance: String,
+            maker_rate_e8: i64,
+            taker_rate_e8: i64,
+        }
+
+        let raw = std::fs::read_to_string(path).map_err(SimError::Io)?;
+        let artifact: FeeArtifact =
+            serde_json::from_str(&raw).map_err(|e| SimError::Parse(e.to_string()))?;
+        if artifact.provenance.trim().is_empty() {
+            return Err(SimError::Parse(
+                "fee artifact: provenance пуст (D7 честность)".into(),
+            ));
+        }
+        self.entries.insert(
+            artifact.venue,
+            FeeRates {
+                maker_rate_e8: artifact.maker_rate_e8,
+                taker_rate_e8: artifact.taker_rate_e8,
+            },
+        );
+        Ok(())
     }
 
     pub fn insert_rates(&mut self, venue: Venue, rates: FeeRates) {
@@ -53,13 +77,39 @@ impl FeeSchedule {
         maker: bool,
         notional_e8: i64,
     ) -> Result<i64, SimError> {
-        let _ = (venue, symbol, maker, notional_e8);
-        todo!("engine-dev: M-04 task 2")
+        let _ = symbol;
+        let rates = self
+            .entries
+            .get(&venue)
+            .ok_or_else(|| SimError::MissingFees {
+                venue,
+                symbol: symbol.to_string(),
+            })?;
+        let rate_e8 = if maker {
+            rates.maker_rate_e8
+        } else {
+            rates.taker_rate_e8
+        };
+        let scale = contracts::PRICE_SCALE as i128;
+        let fee = (notional_e8 as i128 * rate_e8 as i128) / scale;
+        Ok(fee as i64)
     }
 
     /// Стресс ×k к издержкам (отдельный прогон, RC-I-10).
     pub fn scaled(&self, factor: f64) -> FeeSchedule {
-        let _ = factor;
-        todo!("engine-dev: M-04 task 2")
+        let entries = self
+            .entries
+            .iter()
+            .map(|(&venue, rates)| {
+                (
+                    venue,
+                    FeeRates {
+                        maker_rate_e8: (rates.maker_rate_e8 as f64 * factor).round() as i64,
+                        taker_rate_e8: (rates.taker_rate_e8 as f64 * factor).round() as i64,
+                    },
+                )
+            })
+            .collect();
+        FeeSchedule { entries }
     }
 }
