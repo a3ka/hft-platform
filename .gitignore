@@ -1,0 +1,9 @@
+/target
+**/target
+*.log
+.env
+.env.*
+/data
+/journal-data
+*.journal
+.DS_Store
