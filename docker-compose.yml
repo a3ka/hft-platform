@@ -2,7 +2,9 @@
 # переживает редеплой — docs/06 §3/§7). Healthcheck = свежесть heartbeat-файла.
 services:
   recorder:
-    image: ghcr.io/a3ka/hft-platform-recorder:latest
+    build:
+      context: .
+    image: hft-platform-recorder:local
     container_name: hft-recorder
     restart: unless-stopped
     environment:
