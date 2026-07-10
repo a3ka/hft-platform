@@ -11,12 +11,22 @@
   `git push main` → SSH → `docker compose up --build` → healthcheck → rollback). **Проверено
   сквозным деплоем: recorder-заглушка Up/healthy, journal-том persistent.**
 
-## Код (M-00 — скелет)
-- `crates/contracts` — минимальный T1 `Event`/`EventKind` (SCHEMA_VERSION=0). Тесты: 2 GREEN.
-- `crates/recorder` — STUB (доказывает pipeline; рыночного не пишет).
-- Процессный слой `.claude/` + `CLAUDE.md` — в работе.
+## Процессный слой (M-00 — готово)
+- `CLAUDE.md` + `.claude/rules/` (5) + `.claude/agents/` (9) — EINHARD-модель под трейдинг.
+- `PROJECT-STATE.md` + `TECH-DEBT.md` (reviewer-owned).
 
-## Пока НЕ реализовано
-- Реальный даталеер/поток (Binance + Hyperliquid) — следующий блок.
-- Крейты `journal` (DET-I-1), `book`, `venues`, `risk`, `killswitch`, `oms`, `sim`,
-  `signals`, `alpha`, `portfolio`, `strategy`, `runner`, `research-cli` — пофазно per DESIGN §10.
+## Даталеер / поток данных (M-01 — РАБОТАЕТ, проверено на VPS 2026-07-10)
+- `crates/contracts` — T1 `Event`/`EventKind::Md(MdEvent)`: Trade/L2Snapshot/Funding,
+  fixed-point i64 ×1e8, Venue/Side/Level. Тесты: 2 GREEN.
+- `crates/journal` — append-only (postcard+crc32 фреймы), монотонный seq персистится
+  через рестарт, `read_all` replay. Единственный писатель. Тесты: 2 GREEN.
+- `crates/venue-binance` — spot combined-stream `@trade` + `@depth20@100ms` → MdEvent.
+- `crates/venue-hyperliquid` — WS `trades` + `l2Book` (уровни-объекты {px,sz,n}), ping-keepalive.
+- `crates/recorder` — venue-supervisor (reconnect+backoff) → mpsc(EventKind) → журнал + heartbeat.
+- **Проверено в проде (VPS):** Binance + Hyperliquid оба пишутся в персистентный журнал,
+  реальные цены/стакан, seq монотонный, контейнер healthy, автодеплой работает.
+
+## Пока НЕ реализовано (следующие фазы)
+- Крейты `book` (стакан/microprice/depth-полосы), `sim`, `research-cli`, `signals`/`alpha`/
+  `portfolio`/`strategy`, `risk`/`killswitch`/`oms`, `runner` — пофазно per DESIGN §10.
+- Полный формат журнала (сегмент-ротация, снапшоты, state_hash, DET-I-1 полный) — пофазно.
