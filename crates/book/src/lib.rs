@@ -92,6 +92,30 @@ impl OrderBook {
         }
     }
 
+    /// Кумулятивный НОТИОНАЛ (USD) в полосе `pct` от mid: Σ (price·size). Для сверки с
+    /// платформенным BID/ASK индикатором (значения в $).
+    pub fn notional_within(&self, side: Side, pct: f64) -> f64 {
+        let mid = match self.mid() {
+            Some(m) => m as f64,
+            None => return 0.0,
+        };
+        let scale = contracts::PRICE_SCALE as f64;
+        let level_usd = |p: i64, s: i64| (p as f64 / scale) * (s as f64 / scale);
+        match side {
+            Side::Buy => {
+                let thr = (mid * (1.0 - pct)) as i64;
+                self.bids.range(thr..).map(|(&p, &s)| level_usd(p, s)).sum()
+            }
+            Side::Sell => {
+                let thr = (mid * (1.0 + pct)) as i64;
+                self.asks
+                    .range(..=thr)
+                    .map(|(&p, &s)| level_usd(p, s))
+                    .sum()
+            }
+        }
+    }
+
     pub fn n_levels(&self, side: Side) -> usize {
         match side {
             Side::Buy => self.bids.len(),
