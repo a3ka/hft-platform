@@ -7,8 +7,11 @@
 //!
 //! Реализация — research-dev (M-04 task 4).
 
-use std::io;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+
+use sha2::{Digest, Sha256};
 
 use crate::types::TrialRecord;
 
@@ -27,8 +30,6 @@ impl LedgerTrialCount {
     pub fn family(&self) -> &str {
         &self.family
     }
-    // dead_code до реализации trial_count (research-dev task 4 использует и снимает allow)
-    #[allow(dead_code)]
     pub(crate) fn new_from_ledger(n: u64, family: String) -> Self {
         Self { n, family }
     }
@@ -36,6 +37,26 @@ impl LedgerTrialCount {
 
 pub struct Ledger {
     path: PathBuf,
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// Сырые непустые строки файла (байты, без завершающего \n), в порядке появления.
+/// Используется как для дописывания (последняя строка → prev_sha256), так и для
+/// сверки hash-chain (D8).
+fn raw_lines(content: &[u8]) -> Vec<&[u8]> {
+    content
+        .split(|&b| b == b'\n')
+        .filter(|l| !l.is_empty())
+        .collect()
 }
 
 impl Ledger {
@@ -53,30 +74,85 @@ impl Ledger {
 
     /// Дописать запись (проставляет prev_sha256 сам по последней строке файла).
     /// Отказ записи → Err: вызывающий грид ОБЯЗАН abort-нуть весь прогон (FA §3).
-    pub fn append(&mut self, rec: TrialRecord) -> io::Result<()> {
-        let _ = rec;
-        todo!("research-dev: M-04 task 4")
+    ///
+    /// МЕХАНИЗМ (FA §6, RC-I-2): файл открывается ТОЛЬКО через
+    /// `OpenOptions::append(true).create(true)` — ни один путь этого модуля не
+    /// открывает файл на запись/усечение иначе; API удаления/перезаписи
+    /// существующей записи структурно отсутствует.
+    pub fn append(&mut self, mut rec: TrialRecord) -> io::Result<()> {
+        let existing = if self.path.exists() {
+            fs::read(&self.path)?
+        } else {
+            Vec::new()
+        };
+        let lines = raw_lines(&existing);
+        rec.prev_sha256 = match lines.last() {
+            Some(l) => sha256_hex(l),
+            None => "genesis".to_string(),
+        };
+        let line = serde_json::to_string(&rec)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        let mut f = OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&self.path)?;
+        writeln!(f, "{line}")?;
+        Ok(())
     }
 
     pub fn read_all(&self) -> io::Result<Vec<TrialRecord>> {
-        todo!("research-dev: M-04 task 4")
+        if !self.path.exists() {
+            return Ok(Vec::new());
+        }
+        let content = fs::read_to_string(&self.path)?;
+        let mut out = Vec::new();
+        for line in content.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let rec: TrialRecord = serde_json::from_str(line)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            out.push(rec);
+        }
+        Ok(out)
     }
 
     /// Проверка hash-chain целостности (D8): каждая запись ссылается на sha256
     /// предыдущей строки. Ручное редактирование файла в обход инструмента → false.
     pub fn verify_chain(&self) -> io::Result<bool> {
-        todo!("research-dev: M-04 task 4")
+        if !self.path.exists() {
+            return Ok(true);
+        }
+        let content = fs::read(&self.path)?;
+        let lines = raw_lines(&content);
+        let mut expected_prev = "genesis".to_string();
+        for line in &lines {
+            let rec: TrialRecord = match serde_json::from_slice(line) {
+                Ok(r) => r,
+                Err(_) => return Ok(false),
+            };
+            if rec.prev_sha256 != expected_prev {
+                return Ok(false);
+            }
+            expected_prev = sha256_hex(line);
+        }
+        Ok(true)
     }
 
     /// ЕДИНСТВЕННЫЙ источник N для deflated-Sharpe (RC-I-3).
     pub fn trial_count(&self, family: &str) -> io::Result<LedgerTrialCount> {
-        let _ = family;
-        todo!("research-dev: M-04 task 4")
+        let all = self.read_all()?;
+        let n = all.iter().filter(|r| r.signal_family == family).count() as u64;
+        Ok(LedgerTrialCount::new_from_ledger(n, family.to_string()))
     }
 
     /// Sharpe-ряд семейства (для V[SR] в формуле D4).
     pub fn family_sharpes(&self, family: &str) -> io::Result<Vec<f64>> {
-        let _ = family;
-        todo!("research-dev: M-04 task 4")
+        let all = self.read_all()?;
+        Ok(all
+            .iter()
+            .filter(|r| r.signal_family == family)
+            .filter_map(|r| r.sharpe)
+            .collect())
     }
 }

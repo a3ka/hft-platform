@@ -4,6 +4,7 @@
 //!
 //! Реализация — research-dev (M-04 task 4).
 
+use std::fs;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -40,13 +41,13 @@ impl SplitState {
     }
 
     pub fn load(path: &Path) -> Result<Self, RcError> {
-        let _ = path;
-        todo!("research-dev: M-04 task 4")
+        let raw = fs::read_to_string(path).map_err(RcError::Io)?;
+        serde_json::from_str(&raw).map_err(|e| RcError::Parse(e.to_string()))
     }
 
     pub fn save(&self, path: &Path) -> Result<(), RcError> {
-        let _ = path;
-        todo!("research-dev: M-04 task 4")
+        let raw = serde_json::to_string_pretty(self).map_err(|e| RcError::Parse(e.to_string()))?;
+        fs::write(path, raw).map_err(RcError::Io)
     }
 
     /// Val-гейт: критерии пре-регистрации к val-результатам. Провал → Err (токена нет).
@@ -55,8 +56,15 @@ impl SplitState {
         val_sharpe: f64,
         min_val_sharpe: f64,
     ) -> Result<ValGateToken, RcError> {
-        let _ = (val_sharpe, min_val_sharpe);
-        todo!("research-dev: M-04 task 4")
+        if val_sharpe >= min_val_sharpe {
+            self.val_gate_passed = true;
+            Ok(ValGateToken { _priv: () })
+        } else {
+            self.val_gate_passed = false;
+            Err(RcError::GateDenied(format!(
+                "val-гейт не пройден: val_sharpe {val_sharpe} < min_val_sharpe {min_val_sharpe}"
+            )))
+        }
     }
 
     /// Выдать test-диапазон. Второе касание БЕЗ override_reason → Err::GateDenied;
@@ -66,7 +74,26 @@ impl SplitState {
         _proof: &ValGateToken,
         override_reason: Option<&str>,
     ) -> Result<(i64, i64), RcError> {
-        let _ = override_reason;
-        todo!("research-dev: M-04 task 4")
+        if !self.test_touched {
+            self.test_touched = true;
+            self.touch_log.push("первое касание test-сегмента".into());
+            if let Some(reason) = override_reason {
+                if !reason.trim().is_empty() {
+                    self.touch_log.push(format!("override: {reason}"));
+                }
+            }
+            return Ok(self.split.test_ms);
+        }
+
+        match override_reason {
+            Some(reason) if !reason.trim().is_empty() => {
+                self.touch_log.push(format!("override: {reason}"));
+                Ok(self.split.test_ms)
+            }
+            _ => Err(RcError::GateDenied(
+                "test-сегмент уже тронут; повторное касание требует override_reason (RC-I-4)"
+                    .into(),
+            )),
+        }
     }
 }
