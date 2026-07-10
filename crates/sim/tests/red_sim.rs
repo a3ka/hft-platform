@@ -414,3 +414,45 @@ fn test_divergence_report_required_before_p4_gate_passes() {
         Err(GateBlocked::OutOfTolerance { .. })
     ));
 }
+
+// ── FA §5: queue ahead = объём на НАШЕМ ценовом уровне (SVR-резолюция) ──────
+
+#[test]
+fn test_maker_ahead_uses_our_price_level_not_top() {
+    // Ордер стоит НЕ на топе: bid 100.0(2.0) — топ, наш maker buy 1.0 @ 99.0,
+    // где видимый объём 5.0. Если бы ahead ошибочно брался с ЛУЧШЕГО уровня (2.0),
+    // трейд qty 5.0 по 99.0 дал бы fill уже на seq=3. Правильно (ahead=5.0 на нашей
+    // цене): cum 5.0 == ahead → NoFill; fill начинается только после ПРЕВЫШЕНИЯ.
+    let evs = vec![
+        snap(1, 1_000, &[(100.0, 2.0), (99.0, 5.0)], &[(101.0, 2.0)]),
+        snap(2, 1_010, &[(100.0, 2.0), (99.0, 5.0)], &[(101.0, 2.0)]),
+        trade(3, 1_050, 99.0, 5.0),  // cum 5.0 == ahead 5.0 → NoFill
+        trade(4, 1_060, 99.0, 0.5),  // cum 5.5 → fill 0.5
+        trade(5, 1_070, 99.0, 10.0), // остаток 0.5
+    ];
+    let mut ex = BacktestExchange::new(table(), fee_sched(), 3);
+    let mut fills = Vec::new();
+    for ev in &evs {
+        fills.extend(ex.on_event(ev));
+        if ev.seq == 2 {
+            ex.submit(OrderIntent {
+                venue: Venue::Binance,
+                symbol: "BTCUSDT".into(),
+                side: Side::Buy,
+                price: to_fixed(99.0),
+                qty: to_fixed(1.0),
+                kind: OrderKind::Maker,
+            })
+            .unwrap();
+        }
+    }
+    assert!(
+        fills.iter().all(|f| f.seq != 3),
+        "fill на seq=3 означает, что ahead взят с ЛУЧШЕГО уровня, а не с нашего (FA §5)"
+    );
+    let first = fills.first().expect("fill обязан произойти на seq=4");
+    assert_eq!(first.seq, 4);
+    assert_eq!(first.qty, to_fixed(0.5));
+    let total: i64 = fills.iter().map(|f| f.qty).sum();
+    assert_eq!(total, to_fixed(1.0));
+}

@@ -55,7 +55,7 @@ C-001 M1 (классификация НЕ переопределяется — �
 | Агент | Allowed | Forbidden |
 |---|---|---|
 | architect (Fable) | `milestones/`, `crates/*/tests/**` (RED, sacred), типы/трейты-скелеты, `scripts/verify_M-04.sh`, `research/specs/S-001-*.md` | impl-код |
-| engine-dev | `crates/sim/src/**`, `crates/sim/Cargo.toml` (deps), **carve-out per C-001 C1: `crates/book/src/lib.rs` ТОЛЬКО реализация `top_n_depth` (сигнатура и RED-тест — architect)** | tests, другие крейты, contracts |
+| engine-dev | `crates/sim/src/**`, `crates/sim/Cargo.toml` (deps), **carve-out per C-001 C1 + SVR-резолюция 2026-07-10: `crates/book/src/lib.rs` ТОЛЬКО реализация `top_n_depth`, `levels`, `size_at` (сигнатуры и RED-тесты — architect; levels/size_at добавлены после honest-STOP engine-dev: taker_fills требует поуровневого доступа, ahead — объёма на нашей цене per FA sim §5)** | tests, другие крейты, contracts |
 | signal-engineer | `crates/signals/src/**`, `crates/signals/Cargo.toml`, `research/specs/` | tests (sacred), risk/oms |
 | research-dev | `crates/research-cli/src/**`, `crates/research-cli/Cargo.toml`, `research/latency|fees/` (артефакты по D7) | tests, registry/signals.json |
 | все dev | — | `crates/contracts/**`, `crates/journal/**`, `crates/book/**`, `crates/venue-*/**`, `.claude/**`, `docs/**`, `*/tests/**`, `scripts/**` |

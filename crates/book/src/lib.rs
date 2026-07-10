@@ -121,8 +121,32 @@ impl OrderBook {
     /// суммируем что есть; пустая сторона/n=0 → 0. Реализация — engine-dev
     /// (M-04 task 2, узкий carve-out на этот метод).
     pub fn top_n_depth(&self, side: Side, n: usize) -> i64 {
-        let _ = (side, n);
-        todo!("engine-dev: M-04 task 2 (carve-out per C-001 C1)")
+        if n == 0 {
+            return 0;
+        }
+        match side {
+            // bid: лучшие = наибольшие цены → идём с конца (BTreeMap отсортирован по возрастанию).
+            Side::Buy => self.bids.values().rev().take(n).sum(),
+            // ask: лучшие = наименьшие цены → идём с начала.
+            Side::Sell => self.asks.values().take(n).sum(),
+        }
+    }
+
+    /// Уровни стороны в порядке ОТ ЛУЧШЕГО К ХУДШЕМУ: (price, size).
+    /// SVR-резолюция M-04 (engine-dev, task 2): нужен sim::fill_model::taker_fills
+    /// (проедание книги по уровням) — из одних агрегатов уровни не восстановить.
+    /// Реализация — engine-dev (расширенный carve-out per milestone M-04).
+    pub fn levels(&self, side: Side) -> Vec<(i64, i64)> {
+        let _ = side;
+        todo!("engine-dev: M-04 task 2 (SVR-резолюция carve-out)")
+    }
+
+    /// Видимый размер на конкретном ценовом уровне (0, если уровня нет).
+    /// SVR-резолюция M-04: queue ahead maker-ордера = объём на НАШЕЙ цене (FA sim §5),
+    /// не на лучшем уровне. Реализация — engine-dev (расширенный carve-out).
+    pub fn size_at(&self, side: Side, price: i64) -> i64 {
+        let _ = (side, price);
+        todo!("engine-dev: M-04 task 2 (SVR-резолюция carve-out)")
     }
 
     pub fn n_levels(&self, side: Side) -> usize {
