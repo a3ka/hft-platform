@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = ["crates/contracts", "crates/recorder"]
+
+# M-00 bootstrap: минимальный работающий скелет (recorder-заглушка + contracts).
+# Реальные крейты (journal, book, venues, risk, ...) добавляются пофазно per docs/DESIGN.md §10.
+
+[workspace.package]
+edition = "2021"
+license = "UNLICENSED"
+authors = ["a3ka"]
+
+[profile.release]
+opt-level = 3
+lto = "thin"

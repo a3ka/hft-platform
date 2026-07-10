@@ -1,0 +1,12 @@
+[package]
+name = "recorder"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+
+# M-00 STUB: минимальный работающий бинарь — доказывает сквозной путь
+# code -> CI -> образ -> деплой на VPS -> запуск с persistent journal volume.
+# Реальный recorder (HL WebSocket -> журнал) — M-01/P1 (docs/fa/venues.md, journal.md).
+
+[dependencies]
+contracts = { path = "../contracts" }

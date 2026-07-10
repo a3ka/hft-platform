@@ -1,0 +1,21 @@
+# M-00: запуск recorder на VPS. Журнал — в именованном томе journal-data (persistent,
+# переживает редеплой — docs/06 §3/§7). Healthcheck = свежесть heartbeat-файла.
+services:
+  recorder:
+    image: ghcr.io/a3ka/hft-platform-recorder:latest
+    container_name: hft-recorder
+    restart: unless-stopped
+    environment:
+      JOURNAL_DIR: /journal
+    volumes:
+      - journal-data:/journal
+    healthcheck:
+      # heartbeat обновлён за последние 60с → healthy (recorder жив + том пишется)
+      test: ["CMD-SHELL", "test $(( $(date +%s) - $(stat -c %Y /journal/recorder.heartbeat 2>/dev/null || echo 0) )) -lt 60"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  journal-data:
