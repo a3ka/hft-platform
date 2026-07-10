@@ -256,10 +256,18 @@ fn test_deflated_sharpe_reads_global_ledger() {
     assert_eq!(l.trial_count("obi").unwrap().n(), 50);
 
     // D4: больше попыток → жёстче deflation (монотонность).
-    let dsr_few = metrics::deflated_sharpe(1.2, 500, 0.0, 3.0, &n1, 0.09);
-    let dsr_many = metrics::deflated_sharpe(1.2, 500, 0.0, 3.0, &n50, 0.09);
+    // SVR-резолюция 2026-07-10 (architect): исходные параметры (sr=1.2, T=500)
+    // насыщали Φ до ровно 1.0 в f64 для ОБОИХ N — монотонность была математически
+    // невыполнима (research-dev honest-STOP, сверено с точным erf). Параметры
+    // переведены в ненасыщающую зону: sr=0.3, T=60 → z ≈ 2.3 (N=1) vs ≈ −2.9 (N=50).
+    let dsr_few = metrics::deflated_sharpe(0.3, 60, 0.0, 3.0, &n1, 0.09);
+    let dsr_many = metrics::deflated_sharpe(0.3, 60, 0.0, 3.0, &n50, 0.09);
     assert!((0.0..=1.0).contains(&dsr_few));
     assert!((0.0..=1.0).contains(&dsr_many));
+    assert!(
+        dsr_few < 1.0,
+        "параметры теста обязаны оставаться вне зоны насыщения Φ: dsr_few={dsr_few}"
+    );
     assert!(
         dsr_many < dsr_few,
         "50 попыток обязаны дефлировать сильнее одной: {dsr_many} !< {dsr_few}"
