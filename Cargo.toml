@@ -1,6 +1,12 @@
 [workspace]
 resolver = "2"
-members = ["crates/contracts", "crates/recorder"]
+members = [
+  "crates/contracts",
+  "crates/journal",
+  "crates/venue-binance",
+  "crates/venue-hyperliquid",
+  "crates/recorder",
+]
 
 # M-00 bootstrap: минимальный работающий скелет (recorder-заглушка + contracts).
 # Реальные крейты (journal, book, venues, risk, ...) добавляются пофазно per docs/DESIGN.md §10.

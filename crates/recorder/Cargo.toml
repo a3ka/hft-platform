@@ -4,9 +4,15 @@ version = "0.0.0"
 edition.workspace = true
 license.workspace = true
 
-# M-00 STUB: минимальный работающий бинарь — доказывает сквозной путь
-# code -> CI -> образ -> деплой на VPS -> запуск с persistent journal volume.
-# Реальный recorder (HL WebSocket -> журнал) — M-01/P1 (docs/fa/venues.md, journal.md).
+# recorder: venue-адаптеры (Binance+HL) -> канал -> журнал (единственный писатель).
+# docs/fa/venues.md, journal.md. Реальные WS-клиенты в venue-* крейтах.
 
 [dependencies]
 contracts = { path = "../contracts" }
+journal = { path = "../journal" }
+venue-binance = { path = "../venue-binance" }
+venue-hyperliquid = { path = "../venue-hyperliquid" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "signal"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -1,0 +1,18 @@
+[package]
+name = "journal"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+
+# Ядро №1 (docs/fa/journal.md): append-only журнал, единственный писатель, seq — тотальный
+# порядок. MVP: постокард-фреймы + crc32 в сегмент; seq персистится в сайдкар-мете.
+# Полный формат/снапшоты/state_hash/replay — пофазно.
+
+[dependencies]
+contracts = { path = "../contracts" }
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["use-std"] }
+crc32fast = "1"
+
+[dev-dependencies]
+tempfile = "3"
