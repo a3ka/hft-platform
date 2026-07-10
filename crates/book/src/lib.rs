@@ -1,0 +1,189 @@
+//! book — L2-стакан + производные (docs/fa/book.md). Детерминированный, без I/O.
+//!
+//! Данные приходят снапшотами (Binance @depth20, HL l2Book) → `apply_snapshot` заменяет книгу.
+//! Примитив OBI: `depth_within(side, pct)` — суммарный размер в полосе pct от mid.
+//! Всё в fixed-point i64 ×1e8 (contracts::PRICE_SCALE).
+
+use std::collections::BTreeMap;
+use std::collections::HashMap;
+
+use contracts::{Level, MdEvent, MdPayload, Side, Venue};
+
+/// L2-стакан одного инструмента. bids/asks: цена(i64) → размер(i64), оба отсортированы по цене.
+#[derive(Debug, Default, Clone)]
+pub struct OrderBook {
+    bids: BTreeMap<i64, i64>,
+    asks: BTreeMap<i64, i64>,
+}
+
+impl OrderBook {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Заменить книгу снапшотом (наши данные — снапшоты; JR-first, без diff-sync на старте).
+    pub fn apply_snapshot(&mut self, bids: &[Level], asks: &[Level]) {
+        self.bids.clear();
+        self.asks.clear();
+        for l in bids {
+            if l.size > 0 {
+                self.bids.insert(l.price, l.size);
+            }
+        }
+        for l in asks {
+            if l.size > 0 {
+                self.asks.insert(l.price, l.size);
+            }
+        }
+    }
+
+    /// Лучший бид (наибольшая цена покупки).
+    pub fn best_bid(&self) -> Option<i64> {
+        self.bids.keys().next_back().copied()
+    }
+    /// Лучший аск (наименьшая цена продажи).
+    pub fn best_ask(&self) -> Option<i64> {
+        self.asks.keys().next().copied()
+    }
+
+    /// Середина (i64, целочисленное деление). None если книга односторонняя.
+    pub fn mid(&self) -> Option<i64> {
+        match (self.best_bid(), self.best_ask()) {
+            (Some(b), Some(a)) => Some((b + a) / 2),
+            _ => None,
+        }
+    }
+
+    /// Спред (аск − бид) в fixed-point.
+    pub fn spread(&self) -> Option<i64> {
+        match (self.best_bid(), self.best_ask()) {
+            (Some(b), Some(a)) => Some(a - b),
+            _ => None,
+        }
+    }
+
+    /// Микроцена: size-weighted mid = (bid*ask_sz + ask*bid_sz)/(bid_sz+ask_sz). f64.
+    pub fn microprice(&self) -> Option<f64> {
+        let (&bp, &bs) = self.bids.iter().next_back()?;
+        let (&ap, &as_) = self.asks.iter().next()?;
+        let denom = (bs + as_) as f64;
+        if denom == 0.0 {
+            return None;
+        }
+        Some((bp as f64 * as_ as f64 + ap as f64 * bs as f64) / denom)
+    }
+
+    /// Суммарный размер в полосе `pct` (доля, напр. 0.03 = 3%) от mid, на стороне `side`.
+    /// Bid: цены ≥ mid*(1−pct). Ask: цены ≤ mid*(1+pct). Возвращает 0 если mid нет.
+    pub fn depth_within(&self, side: Side, pct: f64) -> i64 {
+        let mid = match self.mid() {
+            Some(m) => m as f64,
+            None => return 0,
+        };
+        match side {
+            Side::Buy => {
+                let thr = (mid * (1.0 - pct)) as i64;
+                self.bids.range(thr..).map(|(_, &s)| s).sum()
+            }
+            Side::Sell => {
+                let thr = (mid * (1.0 + pct)) as i64;
+                self.asks.range(..=thr).map(|(_, &s)| s).sum()
+            }
+        }
+    }
+
+    pub fn n_levels(&self, side: Side) -> usize {
+        match side {
+            Side::Buy => self.bids.len(),
+            Side::Sell => self.asks.len(),
+        }
+    }
+
+    /// Насколько далеко крайний уровень стороны от mid, в долях (для диагностики глубины данных).
+    pub fn max_reach_pct(&self, side: Side) -> Option<f64> {
+        let mid = self.mid()? as f64;
+        match side {
+            Side::Buy => self.bids.keys().next().map(|&p| (mid - p as f64) / mid),
+            Side::Sell => self
+                .asks
+                .keys()
+                .next_back()
+                .map(|&p| (p as f64 - mid) / mid),
+        }
+    }
+}
+
+/// Реестр стаканов по (площадка, символ). Кормится MdEvent (L2Snapshot).
+#[derive(Debug, Default)]
+pub struct Books {
+    map: HashMap<(Venue, String), OrderBook>,
+}
+
+impl Books {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Применить событие. Trade/Funding игнорируются (книгу двигает только L2Snapshot).
+    pub fn apply(&mut self, md: &MdEvent) {
+        if let MdPayload::L2Snapshot { bids, asks, .. } = &md.payload {
+            self.map
+                .entry((md.venue, md.symbol.clone()))
+                .or_default()
+                .apply_snapshot(bids, asks);
+        }
+    }
+
+    pub fn get(&self, venue: Venue, symbol: &str) -> Option<&OrderBook> {
+        self.map.get(&(venue, symbol.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lvl(price: f64, size: f64) -> Level {
+        Level {
+            price: contracts::to_fixed(price),
+            size: contracts::to_fixed(size),
+        }
+    }
+
+    #[test]
+    fn best_mid_spread() {
+        let mut b = OrderBook::new();
+        b.apply_snapshot(
+            &[lvl(100.0, 1.0), lvl(99.0, 2.0)],
+            &[lvl(101.0, 3.0), lvl(102.0, 4.0)],
+        );
+        assert_eq!(b.best_bid(), Some(contracts::to_fixed(100.0)));
+        assert_eq!(b.best_ask(), Some(contracts::to_fixed(101.0)));
+        assert_eq!(b.mid(), Some(contracts::to_fixed(100.5)));
+        assert_eq!(b.spread(), Some(contracts::to_fixed(1.0)));
+    }
+
+    #[test]
+    fn depth_bands_filter_by_pct() {
+        // mid=100.5; bids at 100 (0.5%), 99 (~1.5%), 90 (~10%)
+        let mut b = OrderBook::new();
+        b.apply_snapshot(
+            &[lvl(100.0, 1.0), lvl(99.0, 2.0), lvl(90.0, 5.0)],
+            &[lvl(101.0, 1.0), lvl(110.0, 7.0)],
+        );
+        // 2% band on bid → includes 100 and 99 (both within 2% of 100.5), not 90
+        let d2 = b.depth_within(Side::Buy, 0.02);
+        assert_eq!(d2, contracts::to_fixed(3.0)); // 1 + 2
+                                                  // 12% band on bid → includes all three
+        let d12 = b.depth_within(Side::Buy, 0.12);
+        assert_eq!(d12, contracts::to_fixed(8.0)); // 1 + 2 + 5
+    }
+
+    #[test]
+    fn microprice_between_bid_ask() {
+        let mut b = OrderBook::new();
+        b.apply_snapshot(&[lvl(100.0, 1.0)], &[lvl(102.0, 1.0)]);
+        let mp = b.microprice().unwrap();
+        assert!(mp > contracts::to_fixed(100.0) as f64 && mp < contracts::to_fixed(102.0) as f64);
+    }
+}
