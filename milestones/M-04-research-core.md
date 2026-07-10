@@ -65,9 +65,9 @@ C-001 M1 (классификация НЕ переопределяется — �
 | # | Status | Задача | Агент | Verify |
 |---|---|---|---|---|
 | 1 | ✅ | Скелеты крейтов `sim`/`signals`/`research-cli` (типы T2, трейты, todo!-стабы) + RED-тесты + verify-скрипт | architect | компиляция OK; RED-suite падает |
-| 2 | ⏳ | `sim` impl: fill_model (пессимистичная очередь §5) + latency (таблица, SplitMix64) + fees/funding + BacktestExchange + divergence gate-checker; **+ `book::top_n_depth` (carve-out C1, RED-тест `crates/book/tests/test_top_n_depth.rs`)** | engine-dev | SM-I-1,2,4,5,6,7,8,10 GREEN + book-тест GREEN |
-| 3 | ⏳ | `signals` impl: SignalBank (изоляция паник SG-I-9) + registry-загрузчик (D3/D11) + `obi.rs` (TopN+Bands режимы, D1/D9) | signal-engineer | SG-I-1..11 + OBI-тесты GREEN |
-| 4 | ⏳ | `research-cli` impl: ledger (O_APPEND+hash-chain D8) + split (val-gate токен) + metrics (Sharpe/DSR D4/maxDD/fill-rate/turnover/capacity D5/decay) + grid/walkforward (стресс ×1.5-cost/×2-latency) + report (детерминизм) + CLI | research-dev | RC-I-1..11 GREEN |
+| 2 | ✅ | `sim` impl: fill_model (пессимистичная очередь §5) + latency (таблица, SplitMix64) + fees/funding + BacktestExchange + divergence gate-checker; **+ `book::top_n_depth` (carve-out C1, RED-тест `crates/book/tests/test_top_n_depth.rs`)** | engine-dev | SM-I-1,2,4,5,6,7,8,10 GREEN + book-тест GREEN |
+| 3 | ✅ | `signals` impl: SignalBank (изоляция паник SG-I-9) + registry-загрузчик (D3/D11) + `obi.rs` (TopN+Bands режимы, D1/D9) | signal-engineer | SG-I-1..11 + OBI-тесты GREEN |
+| 4 | 🚧 | `research-cli` impl: ledger (O_APPEND+hash-chain D8) + split (val-gate токен) + metrics (Sharpe/DSR D4/maxDD/fill-rate/turnover/capacity D5/decay) + grid/walkforward (стресс ×1.5-cost/×2-latency) + report (детерминизм) + CLI | research-dev | RC-I-1..11 GREEN |
 | 5 | ⏳ | Артефакты D7: latency-probe (δ_md из журнала + RTT-замер) → `research/latency/*.json`; `research/fees/*.json` (тарифы Binance spot/HL `[verify-at-impl]` с ссылкой на доку) | research-dev | файлы валидны, sim их грузит |
 | 6 | ⏳ | `scripts/verify_M-04.sh` exit=0 (fmt+clippy+все тесты+грепы) | tester | exit=0 |
 | 7 | ⏳ | SignalSpec `research/specs/S-001-obi-asym.md` (params-схема, гриды, walk-forward D6) — сверка с H-карточкой | architect+signal-engineer | RC validate находит карточку |
