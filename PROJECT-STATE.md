@@ -26,6 +26,25 @@
 - **Проверено в проде (VPS):** Binance + Hyperliquid оба пишутся в персистентный журнал,
   реальные цены/стакан, seq монотонный, контейнер healthy, автодеплой работает.
 
+## Journal integrity (M-05 — engine-dev part РЕАЛИЗОВАНО, reviewer APPROVED 2026-07-11; milestone IN_PROGRESS)
+Частичный merge: tasks 2/3/4 (engine-dev) на `main` (cherry-pick `8ce39a6`/`774efc9`/`2a21b8c`).
+Прод-мотив: журнал VPS на редеплое читался лишь 37% (713 714 / 1 954 182) из-за рваного фрейма +
+коллизии seq. reviewer перепрогнал независимо (worktree на чистом чекауте): J1/J2/J3 GREEN,
+anti-placebo подтверждён (все три RED падают на pre-impl main), workspace компилируется, fmt+clippy чисто.
+- `crates/recorder` — `run_writer` select-seam вынесен в lib (юнит-тестируемый J1); `main` враппит
+  SIGTERM (docker stop) + SIGINT в inject-shutdown → ветка `shutdown` ДРЕЙНит буфер (`try_recv`) +
+  `flush()` (seg+meta) перед exit. Clean-shutdown без потерь/торна (J1 GREEN). Heartbeat wall-clock
+  пишется в отдельный `.heartbeat` файл, НЕ в journal-payload (детерминизм журнала сохранён).
+- `crates/journal` — `next_seq` при `open()` авторитетно из `scan_next_seq` (скан последнего
+  валидного фрейма) = `meta.max(seg-scan)`; отставшая мета больше не даёт reuse seq (J2 GREEN).
+  `recover()` — resync-толерантное чтение через рваные фреймы (побайтовый ресинк, без rand) для
+  восстановления накопленных прод-данных (J3 GREEN). `read_all` ОСТАЁТСЯ STRICT (Err на CRC-mismatch)
+  — DET-I-1 exact-replay не ослаблен; resync — отдельный путь.
+- **ОТКРЫТО (M-05 не закрыт):** task 5 B1 (venue-binance REST-resnapshot + anti-phantom eviction,
+  venue-dev) PENDING → `verify_M-05.sh` exit=1 (только B1); task 6 (tester, verify exit 0) после B1.
+  Канарейка `recover(prod-fixture)==1_954_182` — ручная на прод-сегменте (не в CI). См. TD-010 (REST
+  limit=5000 undercount дальних полос), RN-4..6 в TECH-DEBT.
+
 ## Движок бэктеста (M-04 «Research core» — РЕАЛИЗОВАНО, reviewer APPROVED 2026-07-10)
 Цепочка: architect → critic C-001 REJECT → фиксы `f02c418` → critic C-002 NOTE (все
 находки C-001 закрыты) → dev (2 honest-STOP SVR, оба разрешены architect'ом) → tester

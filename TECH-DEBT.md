@@ -29,6 +29,36 @@
   M-04-кода risk/oms/venues/contracts не трогал — risk-critic обязателен на ОТЧЁТЕ, не на
   этом merge. Также см. TD-004 (Binance @depth20 недостаточен для полос 3%/8% — нужен
   full-book snapshot+diff). Severity: NOTE (гейт пути к деньгам, не долг кода).
+- **TD-010** `binance-rest-depth-limit-5000-undercount` (M-05 task 5 / B1, venue-dev, ОТКРЫТА).
+  Заведено по флагу founder'а от venue-dev: REST-resnapshot глубины Binance ограничен
+  `limit=5000` уровнями на один вызов — дальние полосы книги за пределами топ-5000 одним
+  снапшотом не покрываются, а reconcile против diff-книги ограничен этим потолком. Прямое
+  следствие для anti-phantom eviction (B1): в самых дальних полосах устаревшие лимитки могут
+  не эвиктиться из-за неполноты reference-снапшота. Точный масштаб undercount + стратегия
+  (пагинация vs принятие потолка с явной границей достоверности полос) — за venue-dev при
+  посадке task 5/B1; на этом merge (engine-dev part) код venue не трогался. Связано с TD-004.
+  Severity: NOTE (граница достоверности данных дальних полос, не риск ордер-пути).
+
+## Замечания reviewer'а M-05 (не блокирующие, 2026-07-11)
+- **RN-4** (AUDIT sacred-файла) engine-dev правил `scripts/verify_M-05.sh` (architect/tester-owned,
+  SACRED per scope-guard) в коммите `2a21b8c` (task #4). Правка УЗКАЯ: замена placeholder
+  `echo PENDING J1 + FAIL++` на реальный прогон `run "J1 …" cargo test -p recorder --test
+  red_shutdown_j1` — оракул J1 стал доступен после task #2. Reviewer подтверждает допустимость:
+  (а) явная авторизация founder'а на эту J1-строку; (б) правка НЕ ослабляет гейт — конвертирует
+  форсированный FAIL в честный тест-прогон; (в) сверено построчно — J2/J3/B1/fmt/clippy-строки и
+  FAIL-агрегатор не тронуты. РЕВЕРТ НЕ ТРЕБУЕТСЯ. На будущее: wiring sacred-скрипта — отдельный
+  коммит tester/architect (паттерн M-06 task 6), не бандл в feature-коммит dev'а.
+- **RN-5** (partial-merge, founder-authorized) engine-dev part M-05 (tasks 2/3/4) смержен в `main`
+  ДО полного close-out milestone'а. `verify_M-05.sh` → `VERDICT: FAIL (1)`, и единственный FAIL —
+  `B1 resnapshot anti-phantom` (venue-dev task 5) PENDING, ортогональный к journal/recorder-фиксу.
+  Push разрешён явным founder-override правила auto-push-only-on-exit-0 (B1 не в зоне engine-dev,
+  фикс journal-integrity прод-критичен). Milestone остаётся IN_PROGRESS до B1 (task 5) + wiring
+  task 6 (verify exit 0). НЕ close-out.
+- **RN-6** (DET-I-1 подтверждение) `read_all` остался STRICT (Err на первом CRC-mismatch +
+  postcard-decode→Err — сверено на `b22583c`); resync-толерантность вынесена в ОТДЕЛЬНУЮ
+  `recover()` (честный побайтовый ресинк, без rand/wall-clock). DET-I-1 exact-replay НЕ ослаблен.
+  `next_seq = meta.max(seg-scan)` — источник истины сегмент, reuse исключён (мета-lag не даёт
+  отката; мета-ahead даёт gap, не reuse — оба безопасны для монотонности).
 
 ## Замечания reviewer'а M-04 (не блокирующие, 2026-07-10)
 - **RN-1** (NOTE) `verify_M-04.sh` T6 объединяет `contracts+journal+book` в один `check` —
