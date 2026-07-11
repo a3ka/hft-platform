@@ -125,6 +125,7 @@ dependencies = [
 name = "contracts"
 version = "0.0.0"
 dependencies = [
+ "postcard",
  "serde",
  "serde_json",
 ]
