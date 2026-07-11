@@ -86,6 +86,24 @@ Python research-тулинг (`crates/research-cli` обвязка / ноутб�
   разный результат — незамечено).
 - `#[ignore]` или `#[should_panic]` без обоснования на sacred-тесте.
 
+## Прод-масштаб для sacred I/O-путей (урок TD-011, 2026-07-11)
+
+RED-оракул sacred-пути с I/O (journal `open`/`read`/`recover`, recorder writer,
+venue book-maintenance) ОБЯЗАН включать **прод-масштабный кейс**, не только крошечные
+in-memory фикстуры. Инцидент TD-011: `Journal::open` делал `read_to_end` ВСЕГО сегмента
+(прод 2.65 GiB) в RAM → recorder переставал писать (OOM-риск); юнит-RED на фикстурах в
+десятки байт этого не поймал, CI зелёный по компиляции + «Deploy success» замаскировали —
+регрессию поймал ТОЛЬКО eyes-on §8 на VPS (ssh-проверка живого прода).
+
+Требования к таким оракулам:
+- **Граница ресурса, не только корректность.** Для `open()`/загрузки — большой сегмент
+  (десятки MiB+) + проверка ОГРАНИЧЕННОЙ памяти (счётчик аллокаций через global allocator)
+  и/или времени. Оракул обязан ПАДАТЬ на наивной реализации (full-read) — анти-плацебо
+  (пример: `crates/journal/tests/red_open_bounded.rs`).
+- **Зелёные юнит-тесты + Deploy-success ≠ рабочий прод.** `.claude/rules/gates.md` §8
+  eyes-on (контейнер пишет, heartbeat свежий, сегмент растёт, CPU/MEM в норме) —
+  обязателен и решающий; healthcheck можно обмануть тихой деградацией.
+
 ## Cross-references
 
 - `.claude/rules/gates.md` §2 (RED-first в цикле гейтов), §5 (RISK-BLOCK)
