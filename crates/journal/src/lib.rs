@@ -27,20 +27,12 @@ pub struct Journal {
 }
 
 impl Journal {
-    /// Открыть/создать журнал в каталоге `dir`.
-    ///
-    /// `next_seq` АВТОРИТЕТНО выводится из скана последнего валидного фрейма сегмента
-    /// (JR-I «seq монотонный, переживает рестарт» + DET-I-1). Мета (`journal.meta`)
-    /// используется лишь как нижняя граница-подсказка: после unclean-рестарта (SIGKILL
-    /// посреди батча) мета ОТСТАЁТ от сегмента, и доверие ей вызвало бы reuse seq.
+    /// Открыть/создать журнал в каталоге `dir`. Восстанавливает `next_seq` из меты.
     pub fn open(dir: impl AsRef<Path>) -> io::Result<Self> {
         let dir = dir.as_ref();
         std::fs::create_dir_all(dir)?;
         let meta_path = dir.join(META);
-        let meta_next = read_meta(&meta_path)?;
-        // Скан сегмента — источник истины: next_seq = last_valid_seq + 1.
-        let seg_next = scan_next_seq(&dir.join(SEGMENT))?;
-        let next_seq = meta_next.max(seg_next);
+        let next_seq = read_meta(&meta_path)?;
         let seg_file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -156,46 +148,6 @@ pub fn read_all(dir: impl AsRef<Path>) -> io::Result<Vec<Event>> {
         i += len + 4;
     }
     Ok(out)
-}
-
-/// Просканировать сегмент и вывести next_seq = (последний валидный seq)+1.
-///
-/// Толерантно к хвостовому обрыву фрейма (unclean-стоп посреди flush) и к CRC-mismatch
-/// внутри сегмента: продолжает скан, отслеживая максимальный валидный seq. Это источник
-/// истины для `next_seq` при `open()` — мета отстаёт и ей доверять нельзя (reuse seq).
-fn scan_next_seq(seg_path: &Path) -> io::Result<u64> {
-    let data = match File::open(seg_path) {
-        Ok(mut f) => {
-            let mut d = Vec::new();
-            f.read_to_end(&mut d)?;
-            d
-        }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
-        Err(e) => return Err(e),
-    };
-    let mut next = 0u64;
-    let mut i = 0usize;
-    while i + 4 <= data.len() {
-        let len = u32::from_le_bytes(data[i..i + 4].try_into().unwrap()) as usize;
-        if len == 0 || i + 4 + len + 4 > data.len() {
-            i += 1; // рваный/хвостовой фрейм — ресинк по байту
-            continue;
-        }
-        let payload = &data[i + 4..i + 4 + len];
-        let crc = u32::from_le_bytes(data[i + 4 + len..i + 4 + len + 4].try_into().unwrap());
-        if crc32fast::hash(payload) != crc {
-            i += 1;
-            continue;
-        }
-        match postcard::from_bytes::<Event>(payload) {
-            Ok(ev) => {
-                next = next.max(ev.seq + 1);
-                i += 4 + len + 4;
-            }
-            Err(_) => i += 1,
-        }
-    }
-    Ok(next)
 }
 
 #[cfg(test)]
