@@ -26,6 +26,13 @@ Founder = a3ka. Ярус: crypto mid-freq, **Hyperliquid + Binance**. Старт
   SSH → git pull → `docker compose up --build` → healthcheck → rollback). Работает.
 - **Локальная разработка:** `/home/nous/hft-platform`. Сборка: `cargo build --workspace`;
   гейт: `cargo fmt --all && cargo clippy --all-targets -- -D warnings && cargo test --workspace`.
+- **pi-агенты (дешёвые dev-роли, MiniMax):** команды `pi-engine-dev` / `pi-venue-dev` /
+  `pi-research-dev` / `pi-signal-engineer` / `pi-hft-tester` (в `~/.local/bin`;
+  обвязка `.claude/wrappers/pi-dev.sh` + README там же). Лаунчер сам делает fresh
+  worktree + идентичность роли + инжектит dispatch-mandate (sacred/TDD/Done Block/не-пушь);
+  §D-промт архитектора вставляется как есть (`-p "<промт>"` или в TUI). Незапушенная
+  работа dev'а остаётся в его worktree — путь печатается при выходе; дальше
+  `HFT_WORKTREE=<путь> pi-hft-tester`, merge в main — reviewer.
 - **hft-core-rs (референс):** клон `/tmp/hft-core-rs-explore` (ephemeral); разведка даталеера в
   `/tmp/hft_dataplane_recon.md` (может исчезнуть после ребута — при нужде реклонить
   `github.com/a3ka/hft-core-rs-`).
