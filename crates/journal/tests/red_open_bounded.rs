@@ -1,23 +1,29 @@
-//! M-05 RED (sacred, architect) — TD-011: `Journal::open()` обязан выводить next_seq из
-//! сегмента ОГРАНИЧЕННОЙ памятью (ХВОСТОВОЙ скан), НЕ загружая весь сегмент в RAM.
+//! M-05 RED (sacred, architect) — TD-011: `Journal::open()` выводит next_seq из сегмента
+//! с O(1) ПАМЯТЬЮ (ХВОСТОВОЙ скан фикс. K), НЕ загружая файл (или его ДОЛЮ) в RAM.
 //!
 //! Прод-инцидент 2026-07-11: откаченный `scan_next_seq` делал `read_to_end` ВСЕГО сегмента
 //! (прод=2.65 GiB) в Vec на КАЖДОМ `open()` → recorder переставал писать (101% CPU,
-//! 2.48 GiB RAM, OOM-риск на 3-7 днях). Юнит-J2 использовал крошечные фикстуры → не поймал.
+//! 2.48 GiB RAM, OOM-риск). Юнит-J2 на крошечных фикстурах не поймал.
 //!
-//! Оракул: на БОЛЬШОМ сегменте (64 MiB) с ОТСТАЮЩЕЙ метой `open()` обязан
-//!  (1) вернуть next_seq из сегмента (== число фреймов) — семантика J2 на масштабе; и
-//!  (2) пиковая аллокация во время open() < 8 MiB — НЕ грузить файл целиком.
-//! RED на current main (meta-only → next_seq=мета≠N). Анти-плацебо: контрольный
-//! `std::fs::read` (как в откаченном read_to_end) обязан превысить бюджет.
+//! Перманентный guard фиксирует ИНВАРИАНТ, а не инстанс:
+//!  (1) корректность: next_seq из СЕГМЕНТА (не отстающей меты) — семантика J2 на масштабе;
+//!  (2) абсолютный бюджет: пик аллокации open() < 8 MiB на 64 MiB сегменте (ловит full-read);
+//!  (3) НЕЗАВИСИМОСТЬ ОТ РАЗМЕРА: пик(64 MiB) − пик(16 MiB) < 1 MiB → O(1) память. Ловит и
+//!      full-read (растёт линейно), и «читать ДОЛЮ файла» (напр. seek(len/10)) — что абсолютный
+//!      бюджет на одном размере пропустил бы (6.4 MiB на 64 MiB, но 265 MiB на 2.65 GiB).
+//! RED на current main (meta-only → next_seq≠N). Анти-плацебо: контрольный `fs::read` > бюджет.
+//! Решение (architect, 2026-07-11): двух-размерная независимость — достаточный перманентный
+//! guard; отдельный ≥2.65 GiB стрим-кейс НЕ нужен (медленно на CI; sparse-нули парсятся как
+//! пустые фреймы; независимость генерализует на любой размер). §8 прод-проверка reviewer'а —
+//! merge-time, не юнит.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::io::Write;
 use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 
 use contracts::{Event, EventKind, Level, MdPayload, Venue};
+use tempfile::TempDir;
 
-// --- считающий аллокатор: current + peak по всему тест-бинарю (файл = отдельный бинарь) ---
 static CUR: AtomicUsize = AtomicUsize::new(0);
 static PEAK: AtomicUsize = AtomicUsize::new(0);
 
@@ -39,17 +45,17 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static GA: Counting = Counting;
 
-/// Замерить пиковую аллокацию (дельту) во время выполнения `f`.
+/// Пиковая аллокация (дельта) во время `f`.
 fn peak_delta<R>(f: impl FnOnce() -> R) -> (R, usize) {
     let base = CUR.load(SeqCst);
     PEAK.store(base, SeqCst);
     let r = f();
-    let peak = PEAK.load(SeqCst);
-    (r, peak.saturating_sub(base))
+    (r, PEAK.load(SeqCst).saturating_sub(base))
 }
 
+const SEG: &str = "segment-00000000.jrnl";
+
 fn frame(seq: u64) -> Vec<u8> {
-    // L2-фрейм ~ несколько KB (реалистично: прод-журнал — большие снапшоты).
     let mk = |base: i64| -> Vec<Level> {
         (0..100)
             .map(|i| Level {
@@ -79,22 +85,15 @@ fn frame(seq: u64) -> Vec<u8> {
     out
 }
 
-const THRESHOLD: usize = 8 * 1024 * 1024; // 8 MiB бюджет памяти на open()
-const TARGET: usize = 64 * 1024 * 1024; // 64 MiB сегмент
-
-#[test]
-fn open_derives_next_seq_from_segment_with_bounded_memory() {
+/// Сегмент из валидных фреймов seq=0..N-1 размером ≥ `target` + ОТСТАЮЩАЯ мета (=5).
+fn build_fixture(target: usize) -> (TempDir, u64) {
     let dir = tempfile::tempdir().unwrap();
-    let seg_path = dir.path().join("segment-00000000.jrnl");
-
-    // Пишем 64 MiB валидных фреймов seq=0..N-1 стримингом (fixture-память не считается —
-    // замер только вокруг open()).
     let mut written = 0usize;
     let mut n: u64 = 0;
     {
-        let f = std::fs::File::create(&seg_path).unwrap();
+        let f = std::fs::File::create(dir.path().join(SEG)).unwrap();
         let mut w = std::io::BufWriter::new(f);
-        while written < TARGET {
+        while written < target {
             let b = frame(n);
             w.write_all(&b).unwrap();
             written += b.len();
@@ -102,29 +101,57 @@ fn open_derives_next_seq_from_segment_with_bounded_memory() {
         }
         w.flush().unwrap();
     }
-    // Мета ОТСТАЁТ от сегмента (как после SIGKILL) — заведомо не N.
     std::fs::write(dir.path().join("journal.meta"), 5u64.to_le_bytes()).unwrap();
-    assert!(n > 1000, "предусловие: много фреймов ({n})");
+    (dir, n)
+}
 
-    // Контроль (анти-плацебо): полное чтение сегмента (как откаченный read_to_end)
-    // выделяет ~размер файла → обязано превышать бюджет. Доказывает: замер реален.
-    let (_, peak_full) = peak_delta(|| std::fs::read(&seg_path).unwrap());
+const THRESHOLD: usize = 8 * 1024 * 1024; // абсолютный бюджет памяти open()
+const INDEP_DELTA: usize = 1024 * 1024; // допустимый рост памяти между размерами (O(1))
+const SMALL: usize = 16 * 1024 * 1024;
+const BIG: usize = 64 * 1024 * 1024;
+
+#[test]
+fn open_next_seq_from_segment_bounded_and_size_independent_memory() {
+    let (small, small_n) = build_fixture(SMALL);
+    let (big, big_n) = build_fixture(BIG);
+    assert!(
+        big_n > small_n && small_n > 1000,
+        "предусловие: {small_n} < {big_n}"
+    );
+
+    // Анти-плацебо: полное чтение (как откаченный read_to_end) превышает бюджет → замер реален.
+    let (_, peak_full) = peak_delta(|| std::fs::read(big.path().join(SEG)).unwrap());
     assert!(
         peak_full > THRESHOLD,
         "контроль: полное чтение ({peak_full} B) обязано превышать бюджет — иначе замер слеп"
     );
 
-    // ТРЕБОВАНИЕ: open() выводит next_seq из сегмента с ОГРАНИЧЕННОЙ памятью.
-    let (journal, peak_open) = peak_delta(|| journal::Journal::open(dir.path()).unwrap());
+    let (jb, peak_big) = peak_delta(|| journal::Journal::open(big.path()).unwrap());
+    let (js, peak_small) = peak_delta(|| journal::Journal::open(small.path()).unwrap());
 
+    // (1) Корректность на масштабе (J2): next_seq из СЕГМЕНТА, не из отстающей меты (=5).
     assert_eq!(
-        journal.next_seq(),
-        n,
-        "next_seq обязан быть из СЕГМЕНТА (={n}), не из отстающей меты (=5) — семантика J2 на масштабе"
+        jb.next_seq(),
+        big_n,
+        "next_seq из СЕГМЕНТА (={big_n}), не мета(=5)"
     );
+    assert_eq!(
+        js.next_seq(),
+        small_n,
+        "next_seq из СЕГМЕНТА (={small_n}), не мета(=5)"
+    );
+
+    // (2) Абсолютный бюджет — ловит full-read.
     assert!(
-        peak_open < THRESHOLD,
-        "open() выделил {peak_open} B (> {THRESHOLD} бюджета) — грузит сегмент целиком (TD-011). \
-         Требуется ХВОСТОВОЙ скан O(1) памяти."
+        peak_big < THRESHOLD,
+        "open() выделил {peak_big} B (> {THRESHOLD}) — грузит сегмент целиком (TD-011)"
+    );
+
+    // (3) Независимость от размера → O(1) память. Ловит и full-read, и чтение ДОЛИ файла.
+    let growth = peak_big.saturating_sub(peak_small);
+    assert!(
+        growth < INDEP_DELTA,
+        "память open() РАСТЁТ с размером файла (16→64 MiB: +{growth} B) — не O(1); \
+         ХВОСТОВОЙ скан обязан читать ФИКС. K байт (seek к концу), НЕ долю файла"
     );
 }
