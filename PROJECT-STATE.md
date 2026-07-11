@@ -61,10 +61,21 @@ recorder БЕЗ изменений (CPU 0.79%, MEM 5.6 MiB, сегмент ра�
 - `crates/derive::funding_breadth` (research-dev, task #5) — чистый детерминированный агрегат
   funding-breadth (%+/−, top-N по universe); проходит ХАРДЕНУТЫЙ red_breadth (асимметрия 60/20,
   хардкод-пруф). Потребители — research-cli/signals (downstream, journal-first).
+- **#4 recorder-wire BinanceFutures — ПОПРОБОВАН, РЕВЕРТНУТ (§8 eyes-on поймал прод-регрессию,
+  2026-07-11).** engine-dev wiring (`2eee4bf`: default_venues loop + `Box<dyn Fn>` type-erasure,
+  supervise() неизменён) прошёл code-review A+B (MD-only, boundary чист, fmt/clippy/workspace-test/
+  verify_M-06 GREEN) + CI + Deploy success — и БЫЛ смержен. Но §8 eyes-on на VPS показал: живой
+  futures-адаптер попал в hot-loop REST-ресинка → **133 × HTTP 418 (Binance IP ban) за 25s, депт-книга
+  не бутстрапится, 0 futures L2Snapshot в журнал**, ~5 req/s абьюз биржи с IP, общего со спот-сбором.
+  Дефект — в уже-инертном `venue-binance-futures` (no-backoff на snapshot-fail, `lib.rs:596-600`/
+  `:613-620`), который #4 сделал LIVE (НЕ в engine-dev wiring — оно корректно). **Реверт**
+  (`6ddf810`+`6de58e8`), main = tree(`3f38ab0`), прод re-verified inert-safe (418=0, CPU 0.99%,
+  MEM 5.22 MiB, seg растёт +133KB/12s, hb свежий, 0 restarts). Заведён **TD-013 (BLOCKING #4,
+  MAJOR)**. Реленд #4 — после фикса TD-013 (architect RED backoff-оракул → venue-dev impl → re-apply
+  `2eee4bf`). Урок TD-011 подтверждён 3-й раз (RN-9).
 - **M-06 остаётся IN_PROGRESS:** #1 (blast-radius compile — на main workspace компилируется),
-  #4 recorder REST-poller (engine-dev, **прод-поведенческое** — funding/OI в журнал → полный §8
-  eyes-on на ЕГО merge), #6 verify_M-06.sh exit 0 (tester). Data-quality долг: TD-012 (futures REST
-  depth limit=1000 undercount дальних полос, класс TD-004).
+  #4 (РЕВЕРТНУТ выше — gated на TD-013), #6 verify_M-06.sh exit 0 (tester, после #4). Data-quality
+  долг: TD-012 (futures REST depth limit=1000 undercount), TD-013 (futures ресинк no-backoff → 418).
 
 ## Движок бэктеста (M-04 «Research core» — РЕАЛИЗОВАНО, reviewer APPROVED 2026-07-10)
 Цепочка: architect → critic C-001 REJECT → фиксы `f02c418` → critic C-002 NOTE (все

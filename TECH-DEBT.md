@@ -48,6 +48,38 @@
   полос) — за venue-dev/architect при углублении deep-book. Класс TD-004. Severity: NOTE (граница
   достоверности данных, не риск ордер-пути; MD-only).
 
+- **TD-013** `binance-futures-rest-resnapshot-no-backoff-418-ban` (M-06 venue-binance-futures,
+  **BLOCKING #4**, ОТКРЫТА 2026-07-11). **Прод-регрессия, поймана §8 eyes-on** (класс TD-011:
+  зелёные юниты + Deploy-success замаскировали). При wire BinanceFutures в recorder (#4,
+  `2eee4bf`) futures-адаптер на ЖИВОМ прод-трафике попал в hot-loop REST-ресинка: депт-книга не
+  бутстрапится, `fetch_snapshot` (`/fapi/v1/depth?limit=1000`) отдаёт **HTTP 418 "I'm a teapot"**
+  (Binance IP rate-limit ban), и код НЕМЕДЛЕННО (без backoff) реквестит снова. Замер на VPS:
+  **133 × 418 за 25s (~5 req/s), 0 успешных снапшотов, книга не собралась**. Петля
+  само-поддерживает бан (продолжающиеся реквесты во время бана сбрасывают его таймер) и
+  абьюзит биржу с IP, ОБЩЕГО со спот-пайплайном (`venue-binance`) — риск коллатерального бана
+  рабочего спот-сбора. **Корень (reviewer описал, architect проектирует фикс — gates.md §4):**
+  `crates/venue-binance-futures/src/lib.rs:596-600` (snapshot fetch failed → `pending_snapshots.push(make_snapshot_future(...))`
+  без задержки) и `:613-620` (snapshot stale → тот же немедленный refetch). Нет exp-backoff,
+  нет honoring `Retry-After`/429/418, нет cap на частоту REST. **Нужен RED-оракул (architect):**
+  ресинк-путь при повторной ошибке снапшота ОБЯЗАН backoff'ить (exp + jitter, honor 418/429
+  cooldown), не hot-loop'ить; анти-плацебо на наивной немедленной-retry реализации.
+  Затем venue-dev impl → engine-dev релендит #4 (тривиально: re-apply `2eee4bf`). **#4 РЕВЕРТНУТ**
+  (`6ddf810`+`6de58e8`), main = tree(`3f38ab0`) inert, прод inert-safe re-verified (418=0,
+  CPU 0.99%, seg растёт, hb свежий). Связано с TD-012 (тот же limit=1000, но это completeness;
+  TD-013 — корректность/rate ресинка). Severity: MAJOR (была live прод-регрессия + exchange-abuse;
+  сейчас блокирует реленд #4).
+
+## Замечания reviewer'а M-06 #4 (2026-07-11)
+- **RN-9** (§8 eyes-on поймал то, что все зелёные гейты пропустили — снова) Code-review A+B
+  #4 PASS: wiring engine-dev'а КОРРЕКТЕН (default_venues loop, `Box<dyn Fn>` type-erasure,
+  supervise() неизменён, MD-only, boundary чист, fmt/clippy/workspace-test/verify_M-06 все
+  GREEN на worktree). Дефект НЕ в #4-wiring, а в уже-смерженном (инертном) `venue-binance-futures`
+  (venue-dev), который #4 сделал LIVE. Урок TD-011 подтверждён третий раз: «Deploy success» ≠
+  «прод работает»; юнит-тесты futures-адаптера (фикстуры, offline) не могли поймать реакцию на
+  реальный Binance rate-limit. **Wiring #4 сам по себе безупречен** — при фиксе TD-013 реленд
+  тривиален. Для architect: RED-оракул фьючерс-адаптера должен включать симуляцию 418/429-ответа
+  REST (прод-масштаб дисциплина `.claude/rules/testing.md`), не только happy-path парсинг.
+
 ## Замечания reviewer'а M-05 (не блокирующие, 2026-07-11)
 - **RN-8** (fmt-гейт под-покрытие) `verify_M-05.sh` fmt-гейт проверяет только `journal+book`, не
   `recorder` — из-за чего v2 recorder-файлы без trailing newline (`cargo fmt --all --check` FAIL)
