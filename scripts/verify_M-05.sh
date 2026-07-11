@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # verify_M-05.sh — acceptance-гейт M-05 (data-foundation). Агрегатор + FAIL-счётчик
 # (gates.md §3). Написан ДО impl — сейчас FAIL (J2 runtime-RED, J3 compile-RED), станет
-# PASS когда engine/venue-dev реализуют clean-shutdown/seq-из-сегмента/recover/anti-phantom.
+# PASS когда engine/venue-dev реализуют clean-shutdown/seq-из-сегмента/recover (journal integrity).
 set -uo pipefail
 cd "$(dirname "$0")/.."
 FAIL=0
@@ -13,9 +13,8 @@ run "J3 recover ресинк через рваный фрейм"     cargo test 
 run "J1 clean-shutdown drain+flush"               cargo test -p recorder --test red_shutdown_j1
 run "TD-011 open() bounded-memory (прод-масштаб)" cargo test -p journal --test red_open_bounded
 
-echo "== Deep-book quality =="
-echo "  PENDING  B1 resnapshot anti-phantom (venue-binance book) — оракул при task 5"
-FAIL=$((FAIL+1))
+echo "== Deep-book quality — ПЕРЕНЕСЕНО в M-06 =="
+echo "  NOTE  B1 deep-band completeness + limit=5000 undercount → M-06 depth-runner (venue-binance/-futures); НЕ часть journal-integrity M-05"
 
 echo "== Acceptance-число (проверено вручную на прод-сегменте) =="
 echo "  NOTE  recover(прод VPS segment) обязан вернуть 1 954 182 события (4 сегмента, 3 границы)"

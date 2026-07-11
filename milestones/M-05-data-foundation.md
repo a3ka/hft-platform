@@ -116,3 +116,15 @@ continuity `U==last+1` и инвалидирует+ре-снапшотит на 
 контрольный `fs::read` превышает бюджет. Реимпл (engine-dev): next_seq через ХВОСТОВОЙ скан
 (seek к концу / чтение назад до последнего валидного фрейма), O(1) память — НЕ read_to_end.
 Правило зафиксировано в `.claude/rules/testing.md` (прод-масштаб sacred I/O).
+
+## Amendment 2026-07-11 (M-05 close: journal integrity ГОТОВ; B1 → M-06)
+
+engine-dev part СМЁРЖЕН + прод-верифицирован (reviewer 67aa7e6): J1/J2/J3/TD-011 GREEN
+(tail-scan O(1) память; recover() resync; clean-shutdown). `verify_M-05.sh` → PASS.
+
+**B1 (deep-book quality) вынесен из M-05 в M-06.** Обоснование: (1) journal integrity —
+самодостаточный прод-критический юнит, готов; (2) B1-инвариант (gap→full-replace) требует
+seam в `venue-binance` book-maintainer, а тот трогается в M-06 (depth-runner); (3) реальный
+риск — не «phantom» (diff-sync держит continuity + apply_snapshot replace), а `limit=5000`
+undercount дальних полос (DATA-вопрос, не unit-инвариант). M-05 закрывается journal-integrity;
+deep-book completeness ведётся в M-06.

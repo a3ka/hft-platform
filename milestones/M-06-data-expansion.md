@@ -57,3 +57,13 @@ MarginRate impl — **Tier-3, ОТЛОЖЕН** (нужны ключи/3rd-party;
 ## Handoff
 architect (скелет venue-binance-futures + RED) → venue-dev(2,3)‖engine-dev(1 sim,4)‖
 research-dev(1 latency_probe,5)‖signal-dev(1 obi) → tester(6) → reviewer.
+
+## Amendment 2026-07-11 (принят deep-book quality из M-05)
+
+Из M-05 перенесено (coupled с depth-runner): **deep-book completeness / B1**.
+- B1-инвариант (unit, когда venue-binance выдаст testable seam): gap-инвалидация →
+  ПОЛНАЯ замена книги (нет stale-переноса). Оракул co-design с venue-dev при depth-runner (task 2).
+- **limit=5000 undercount** (REST `/api/v3/depth?limit=5000` достаёт ~top-5000 уровней →
+  полосы 15-60% недосчитаны на бутстрапе): решить митигацию (многостраничный REST / принять,
+  diff само-заживает активные уровни / диагностик-сверка книга vs свежий REST на глубине).
+  DATA-вопрос → reviewer TECH-DEBT.
