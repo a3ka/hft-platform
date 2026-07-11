@@ -1,6 +1,6 @@
 # SESSION-HANDOFF — как продолжить в новом контекстном окне
 
-> Читать ПЕРВЫМ при старте новой сессии. Последнее обновление: 2026-07-10.
+> Читать ПЕРВЫМ при старте новой сессии. Последнее обновление: 2026-07-11.
 > Порядок чтения новой сессии: **этот файл → `CLAUDE.md` → `PROJECT-STATE.md` →
 > `TECH-DEBT.md` → `docs/DESIGN.md` → релевантный `docs/fa/*` → `research/hypotheses/*`.**
 > Почти весь контекст уже в репо — новая сессия самодостаточна.
@@ -31,6 +31,20 @@ Founder = a3ka. Ярус: crypto mid-freq, **Hyperliquid + Binance**. Старт
   `github.com/a3ka/hft-core-rs-`).
 
 ## 3. Что реализовано (детали — PROJECT-STATE.md)
+- **M-04 Research core СМЁРЖЕН (2026-07-11, reviewer APPROVED ×2):** движок бэктеста
+  ГОТОВ. Крейты: `sim` (честный fill-model: пессимистичная очередь tail-no-cancel-credit,
+  латентность ТОЛЬКО из измеренных артефактов, fees fail-closed, BacktestExchange,
+  divergence P4-gate, SplitMix64), `signals` (trait Signal, Граница A; OBI TopN+Bands;
+  SignalBank c изоляцией паник; registry c code_hash-сверкой), `research-cli`
+  (grid/walk-forward/trials-ledger append-only+hash-chain/deflated Sharpe BLdP/
+  детерминированные отчёты/CLI grid|validate|report + бинарь latency_probe), `book` +=
+  top_n_depth/levels/size_at. Артефакты честности: research/latency/*.json (δ_md из
+  журнала; δ_submit/cancel = RTT×2 ПРОКСИ до P1) + research/fees/*.json (с provenance).
+  Milestone: milestones/M-04-research-core.md (решения D1-D11); критик-вердикты
+  research/critiques/C-001/C-002. Задачи 1-7 ✅; **задача 8 (прогон OBI) ОТКРЫТА**.
+- **Пилот прогнан end-to-end на боевом журнале** (663718 событий): конвейер работает;
+  вскрыт и починен дефект harness v1 (несбалансированные qty входа/выхода → фиктивный
+  PnL; после фикса PnL/цикл ≈ издержки). trials-ledger: первые 4+ записи семейства obi.
 - **Процессный слой:** CLAUDE.md + .claude/rules(5) + .claude/agents(9) + PROJECT-STATE + TECH-DEBT.
 - **Даталеер РАБОТАЕТ в проде:** crates `contracts` (T1 Event/MdEvent, fixed-point i64×1e8),
   `journal` (append-only, seq персистится, read_all), `venue-binance` (**full-book diff-sync**:
@@ -62,16 +76,27 @@ Coin/TOTAL/…). Полосы вычислимы ТОЛЬКО через full-bo
 2. **SPOT vs FUTURES** — founder ещё не ответил, что ему нужно (спот сделан; фьючерсы =
    `wss://fstream.binance.com`, отдельный адаптер/режим).
 3. HL глубину >20 уровней получить не удалось (проверить nSigFigs / иной эндпоинт) — TD-005.
+4. **`ts_exch_ms=0` у Binance L2Snapshot в журнале** (находка задачи 5 M-04): парсер
+   venue-binance не заполняет биржевой ts у снапшотов → они исключены из δ_md-эмпирики
+   (~63k событий/символ). Маленький фикс в venue-binance (+ risk-блок: venue-* → reviewer
+   обязателен). Не блокирует бэктест.
+5. δ_submit/δ_cancel в latency-артефактах — RTT-прокси ×2 (реальный order-path не измерен
+   до P3/testnet); reviewer RN-2: обязательный фокус risk-critic на отчёте R-001.
 
-## 6. СЛЕДУЮЩАЯ ЗАДАЧА (founder дал добро)
-**Строить движок бэктеста: `sim` + `research-cli`** (docs/fa/sim.md, research-cli.md, 02-quant-desk.md).
-Цель — проверить, предсказывает ли `DIFF 3B-8A` (и какие полосы/горизонты) движение цены. Дисциплина:
-пре-регистрация (карточка есть), time-split train/val/test, trials-ledger append-only, пессимистичный
-fill, критерии фальсификации (в карточке). Порядок: сначала `sim` (fill-model из journal),
-затем `research-cli` (грид/walk-forward/ValidationReport), затем прогон OBI Трек A (top-N imbalance
-вычислим уже сейчас) и Трек B (полосы 3%/8% — теперь вычислимы через full-book).
-Экономия: делегировать код субагентам (sonnet), Fable — архитектура/sacred/сборка. Дать VPS
-накопить несколько часов глубокой книги перед серьёзным бэктестом.
+## 6. СЛЕДУЮЩАЯ ЗАДАЧА
+**M-04 задача 8 — формальный прогон OBI** (единственная открытая; всё для неё готово):
+1. Дать VPS накопить **3-7 дней** полной книги (пишется с 2026-07-10; на 2026-07-11 было
+   ~164MB/663k событий ≈ часы — этого мало, только шум).
+2. scp сегмент → `tmp/journal-vps/` (см. §3 диагностику), затем через research-cli:
+   грид по `research/specs/S-001-obi-asym.md` (Трек A top_n + Трек B bands на Binance),
+   time-split через `split::SplitState` (test — ОДИН раз, за ValGateToken), walk-forward,
+   стресс ×1.5-cost/×2-latency, отчёт `research/reports/R-001*` (metrics.json детерминирован).
+   Пилотная обвязка-пример: tmp/pilot/grid-S-001-pilot-trackA.json (ledger для формального
+   прогона — ГЛОБАЛЬНЫЙ research/trials-ledger.jsonl).
+3. risk-critic (сильная модель) вердикт по R-001 (фокус: RTT-прокси латентности, RN-2) →
+   founder ★ принять/убить по пре-рег. критериям H-карточки.
+Параллельно можно: фикс ts_exch_ms (§5 п.4); расследование магнитудной загадки (§5 п.1).
+Экономия: код — субагенты (sonnet), Fable — архитектура/sacred/вердикты.
 
 ## 7. Дисциплина (напоминание)
 Гейт перед «готово»: fmt+clippy(-D warnings)+test зелёные + Done Block. Атомарные коммиты.
