@@ -13,9 +13,17 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use contracts::{EventKind, SysEvent};
+use contracts::{EventKind, SysEvent, Venue};
 use journal::Journal;
 use tokio::sync::mpsc;
+
+/// Площадки, которые рекордер супервизит по умолчанию. `main` спавнит `supervise()` по
+/// ЭТОМУ списку (config-driven, не хардкод). STUB (M-06 #4): BinanceFutures ещё не
+/// подключён — engine-dev добавит его + переведёт `main` на спавн из этого списка.
+/// RED-оракул: `crates/recorder/tests/red_futures_wired.rs`.
+pub fn default_venues() -> Vec<Venue> {
+    vec![Venue::Binance, Venue::Hyperliquid]
+}
 
 /// Writer-цикл: пишет события из `rx` в журнал. По `shutdown` ОБЯЗАН сдрейнить уже
 /// буферизованные события (`try_recv` пока `Empty` или `Disconnected`), сделать
