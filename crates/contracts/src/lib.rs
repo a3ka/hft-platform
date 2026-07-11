@@ -11,7 +11,8 @@ use serde::{Deserialize, Serialize};
 pub const PRICE_SCALE: i64 = 100_000_000;
 
 /// Версия схемы журнального формата. В каждом сегменте (CT-I-6).
-pub const SCHEMA_VERSION: u32 = 0;
+/// 1: CT-RFC-01 — аддитивно OpenInterest/Liquidation/MarginRate + Venue::BinanceFutures.
+pub const SCHEMA_VERSION: u32 = 1;
 
 /// Единица упорядоченного журнала (docs/fa/journal.md §5). `seq` — тотальный порядок,
 /// назначается журналом (единственный писатель, JR-I-1). Коннекторы seq НЕ проставляют.
@@ -41,11 +42,15 @@ pub enum SysEvent {
     ConnDown(Venue),
 }
 
-/// Площадка. Расширяется аддитивно.
+/// Площадка. Расширяется аддитивно (СТРОГО в конец — CT-I §6, сохраняет postcard-индексы).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Venue {
+    /// Binance СПОТ-рынок.
     Binance,
+    /// Hyperliquid ПЕРП (основной рынок HL: l2Book/trades перпа).
     Hyperliquid,
+    /// Binance USDT-M ПЕРП-фьючерсы (fstream). Добавлено CT-RFC-01.
+    BinanceFutures,
 }
 
 /// Сторона.
@@ -64,6 +69,7 @@ pub struct Level {
 
 /// Нормализованное рыночное событие. `symbol` — канонический тикер площадки как есть
 /// (Binance "BTCUSDT" / Hyperliquid "BTC"); нормализация кросс-venue — задача выше (book/strategy).
+/// Для MarginRate `symbol` — актив ("USDT"/"USDC"); для OpenInterest/Liquidation — инструмент.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MdEvent {
     pub venue: Venue,
@@ -71,9 +77,9 @@ pub struct MdEvent {
     pub payload: MdPayload,
 }
 
-/// Тип рыночного апдейта. price/size — fixed-point ×1e8; ставки фандинга — ×1e8.
-/// L2Snapshot: и Binance @depth20, и HL l2Book шлют СНАПШОТ стакана целиком на апдейте —
-/// пишем как снапшот (снимает нужду в snapshot+diff-sync на старте).
+/// Тип рыночного апдейта. price/size — fixed-point ×1e8; ставки — ×1e8.
+/// L2Snapshot: и Binance, и HL шлют СНАПШОТ стакана целиком на апдейте — пишем как снапшот.
+/// Новые варианты — только аддитивно В КОНЕЦ (CT-I §6, сохраняет postcard-дискриминанты).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum MdPayload {
     Trade {
@@ -88,6 +94,26 @@ pub enum MdPayload {
         ts_exch_ms: i64,
     },
     Funding {
+        rate_e8: i64,
+        ts_exch_ms: i64,
+    },
+    /// Открытый интерес перп-контракта. `oi_e8` — в БАЗОВОМ активе ×1e8 (нотионал = oi×mark,
+    /// derive downstream). Добавлено CT-RFC-01.
+    OpenInterest {
+        oi_e8: i64,
+        ts_exch_ms: i64,
+    },
+    /// Форс-ликвидация (forced order). `side` — ЛИКВИДИРУЕМАЯ сторона (НЕ сторона агрессора;
+    /// M-06 парсер обязан сохранить смысл — C-003 note). Добавлено CT-RFC-01.
+    Liquidation {
+        price: i64,
+        size: i64,
+        side: Side,
+        ts_exch_ms: i64,
+    },
+    /// Прокси спроса на займы: margin interest rate ×1e8 (интервал ставки — в provenance
+    /// артефакта/парсера). `symbol` = актив ("USDT"/"USDC"). Добавлено CT-RFC-01 (Tier-3 impl).
+    MarginRate {
         rate_e8: i64,
         ts_exch_ms: i64,
     },
