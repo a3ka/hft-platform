@@ -58,7 +58,7 @@ async fn main() -> anyhow::Result<()> {
         schema_version = contracts::SCHEMA_VERSION, "recorder start"
     );
 
-    let (tx, mut rx) = mpsc::channel::<EventKind>(50_000);
+    let (tx, rx) = mpsc::channel::<EventKind>(50_000);
 
     {
         let (tx_b, syms) = (tx.clone(), binance_symbols.clone());
@@ -78,37 +78,23 @@ async fn main() -> anyhow::Result<()> {
             .await;
         });
     }
-    drop(tx); // writer завершится, только если все продюсеры уйдут (в норме не уходят).
+    drop(tx); // writer завершится, если все продюсеры уйдут ЛИБО по SIGTERM/SIGINT (graceful).
 
-    // Единственный писатель — журнал в этой задаче.
-    let mut journal = Journal::open(&dir)?;
+    // Единственный писатель — журнал. select!-цикл вынесен в lib::run_writer (J1-seam).
+    let journal = Journal::open(&dir)?;
     let hb_path = dir.join("recorder.heartbeat");
-    let mut count: u64 = 0;
-    let mut hb = tokio::time::interval(Duration::from_secs(10));
 
-    loop {
+    // SIGTERM (docker stop) + SIGINT (Ctrl-C) → graceful shutdown (дрейн буфера + flush).
+    let shutdown = async {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+        let mut sigint = signal(SignalKind::interrupt()).expect("install SIGINT handler");
         tokio::select! {
-            maybe = rx.recv() => match maybe {
-                Some(kind) => {
-                    journal.append(kind)?;
-                    count += 1;
-                    if count.is_multiple_of(1000) {
-                        journal.flush()?;
-                        tracing::info!(events = count, next_seq = journal.next_seq(), "journal progress");
-                    }
-                }
-                None => { tracing::warn!("all producers gone — writer exit"); break; }
-            },
-            _ = hb.tick() => {
-                journal.append(EventKind::Sys(SysEvent::Heartbeat))?;
-                journal.flush()?;
-                let now_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
-                let _ = std::fs::write(&hb_path, now_ms.to_string());
-                tracing::debug!(events = count, "heartbeat");
-            }
+            _ = sigterm.recv() => tracing::info!("SIGTERM — graceful shutdown"),
+            _ = sigint.recv() => tracing::info!("SIGINT — graceful shutdown"),
         }
-    }
-    journal.flush()?;
+    };
+
+    recorder::run_writer(rx, journal, hb_path, shutdown).await?;
     Ok(())
 }
