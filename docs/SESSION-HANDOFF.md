@@ -100,6 +100,9 @@ Coin/TOTAL/…). Полосы вычислимы ТОЛЬКО через full-bo
 
 ## 7. Дисциплина (напоминание)
 Гейт перед «готово»: fmt+clippy(-D warnings)+test зелёные + Done Block. Атомарные коммиты.
+**После КАЖДОГО push в main — post-merge деплой-гейт (`.claude/rules/gates.md` §8):
+дождаться CI+Deploy success И проверить VPS по ssh (контейнер healthy, heartbeat свежий);
+milestone не закрывается поверх красного/непроверенного прода.**
 sacred: contracts T1, journal (DET-I-1), risk/killswitch, */tests — architect-only. Коммитить только
 при зелёном clippy (был инцидент — закоммитил с clippy-ошибкой, CI покраснел; всегда гейтить commit
 на clippy=0). Секреты в чат не вставлять. Push только при зелёных гейтах.

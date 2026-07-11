@@ -23,6 +23,10 @@
   (`set -euo pipefail`, exit≠0 на FAIL).
 - **Auto-push только при зелёных гейтах.** Любое касание `risk`/`killswitch`/`oms`/`venues`/
   `contracts` → обязательный reviewer + **risk-critic**.
+- **Push ≠ конец цикла: прод живёт на VPS.** После push в `main` — post-merge
+  деплой-гейт (`.claude/rules/gates.md` §8): дождаться CI+Deploy success + проверить
+  VPS по ssh (контейнер healthy, heartbeat свежий); пруф — в close-out отчёт.
+  Milestone не закрывается поверх красного/непроверенного прода.
 
 ## Делегирование и маршрутизация моделей (экономия)
 

@@ -102,6 +102,29 @@ Reviewer не пропускается НИКОГДА для substantive-изм�
 live-параметры напрямую. Байпас-поверхности не существует (`RK-I-2`) — это не
 конфигурируемая опция, а архитектурный факт, проверяемый тестом.
 
+## 8. Post-merge деплой-гейт — прод живёт на ДРУГОМ сервере (добавлено 2026-07-11)
+
+Разработка идёт локально (`/home/nous/hft-platform`), но проект РАБОТАЕТ на VPS
+(Hetzner, доступ и схема — `docs/SESSION-HANDOFF.md` §2): push в `main` триггерит
+GitHub Actions (`ci.yml` + `deploy.yml` → build на VPS → healthcheck → rollback).
+Push — НЕ конец цикла. Агент, сделавший push (reviewer в конце milestone-цикла;
+architect для docs/process-only), ОБЯЗАН до закрытия работы:
+
+1. **Дождаться CI + Deploy** до терминального статуса: `gh run watch <id> --exit-status`
+   (или `gh run list` до `completed success` обоих). Красный CI/Deploy → немедленный
+   фикс или revert; milestone НЕ закрывается поверх красного прода.
+2. **Проверить прод на VPS** (минимум):
+   `ssh -i /home/nous/.ssh/hft_deploy -o IdentitiesOnly=yes root@167.233.192.131 \
+      'docker ps --format "{{.Names}} {{.Status}}"; cat /var/lib/docker/volumes/hft-platform_journal-data/_data/recorder.heartbeat'`
+   Ожидание: контейнер(ы) `(healthy)`, heartbeat свежий (мс epoch ≈ сейчас), журнал
+   растёт. Если деплой менял поведение данных (парсеры/форматы) — sanity свежих
+   событий по мере возможности.
+3. **Пруф в close-out**: сырые строки `gh run list` (success) + вывод ssh-проверки —
+   в Done Block / §C close-out отчёта. «Запушил и ушёл» = нарушение гейта.
+
+Rollback в `deploy.yml` — страховка, не оправдание: он ловит падение healthcheck,
+но не тихую деградацию (контейнер жив, данные испорчены). Глаза обязательны.
+
 ## Cross-references
 
 - `.claude/rules/scope-guard.md` — зоны, за нарушение которых гейт 4 реджектит
