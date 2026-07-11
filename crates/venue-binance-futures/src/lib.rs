@@ -13,12 +13,14 @@
 //! snapshot-sync (`/fapi/v1/depth`) + REST OI-poll (`/fapi/v1/openInterest`). Одна
 //! WS-сессия; reconnect/backoff — забота вызывающего supervisor (как в `venue-binance`).
 
-use contracts::{to_fixed, EventKind, Level, MdEvent, MdPayload, Side, SysEvent, Venue};
+use contracts::{
+    from_fixed, to_fixed, EventKind, Level, MdEvent, MdPayload, Side, SysEvent, Venue,
+};
 use futures_util::stream::FuturesUnordered;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
@@ -129,14 +131,126 @@ fn parse_l2_levels(levels: &Value) -> Option<Vec<Level>> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Async runner (WS depth@100ms + WS forceOrder + REST snapshot/OI poll)
+// Book maintainer (seam, N2/INV-N2)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Maintainer фьючерс-стакана per symbol. Seam тестируемого book-maintainer'а
+/// (N2/INV-N2): при `apply_snapshot` — ПОЛНАЯ пересборка (REPLACE-семантика,
+/// без переноса stale уровней через gap-ресинк); `apply_diff` — upsert/remove по уровням
+/// (`size==0` → удалить); `notional_within` — аналитика глубины внутри полосы от mid.
+/// Используется в async runner'е (sync-автомат per symbol хранит одну такую книгу).
+/// price/size — fixed-point ×1e8 (per `contracts::PRICE_SCALE`).
+pub struct FuturesDepthBook {
+    bids: BTreeMap<i64, i64>,
+    asks: BTreeMap<i64, i64>,
+}
+
+impl FuturesDepthBook {
+    /// Пустой стакан.
+    pub fn new() -> Self {
+        Self {
+            bids: BTreeMap::new(),
+            asks: BTreeMap::new(),
+        }
+    }
+
+    /// REPLACE-снапшот: полная замена обеих сторон (clear + insert). Уровни `size<=0`
+    /// (битые) дропаются на insert-стадии — в стакане таких быть не должно.
+    /// Корректность INV-N2 (no phantom-liq после gap) обеспечивается именно REPLACE:
+    /// stale дальние уровни из старого state'а НЕ переносятся, если их нет в `bids`/`asks`.
+    pub fn apply_snapshot(&mut self, bids: &[Level], asks: &[Level]) {
+        let mut new_bids = BTreeMap::new();
+        for lvl in bids {
+            if lvl.size > 0 {
+                new_bids.insert(lvl.price, lvl.size);
+            }
+        }
+        let mut new_asks = BTreeMap::new();
+        for lvl in asks {
+            if lvl.size > 0 {
+                new_asks.insert(lvl.price, lvl.size);
+            }
+        }
+        self.bids = new_bids;
+        self.asks = new_asks;
+    }
+
+    /// Diff: `size==0` → удалить уровень (per Binance diff-spec); `size>0` → upsert;
+    /// `size<0` (защитно) → игнорировать. Невалидный уровень не паникует.
+    pub fn apply_diff(&mut self, bids: &[Level], asks: &[Level]) {
+        for lvl in bids {
+            if lvl.size == 0 {
+                self.bids.remove(&lvl.price);
+            } else if lvl.size > 0 {
+                self.bids.insert(lvl.price, lvl.size);
+            }
+        }
+        for lvl in asks {
+            if lvl.size == 0 {
+                self.asks.remove(&lvl.price);
+            } else if lvl.size > 0 {
+                self.asks.insert(lvl.price, lvl.size);
+            }
+        }
+    }
+
+    /// Σ(price × size) по уровням стороны `side`, чья relative-distance от mid ≤ `band`.
+    /// `mid = (best_bid + best_ask) / 2`. Конвенция стороны: `Side::Buy` → bids,
+    /// `Side::Sell` → asks (bids несут BUY-интерес, asks — SELL-интерес). Пустая книга /
+    /// невалидный mid → 0.0. NOTIONAL возвращается в «долларах» (price×size как real
+    /// float, делённый на `PRICE_SCALE²` неявно через `from_fixed`).
+    pub fn notional_within(&self, side: Side, band: f64) -> f64 {
+        let (best_bid, best_ask) = match (self.bids.iter().next_back(), self.asks.iter().next()) {
+            (Some((&b, _)), Some((&a, _))) => (b, a),
+            _ => return 0.0,
+        };
+        let mid_f = (best_bid as f64 + best_ask as f64) / 2.0;
+        if mid_f <= 0.0 {
+            return 0.0;
+        }
+        let book = match side {
+            Side::Buy => &self.bids,
+            Side::Sell => &self.asks,
+        };
+        let mut total = 0.0f64;
+        for (&price, &size) in book.iter() {
+            let rel = ((price as f64) - mid_f).abs() / mid_f;
+            if rel <= band {
+                total += from_fixed(price) * from_fixed(size);
+            }
+        }
+        total
+    }
+
+    /// Crate-private доступ к bids/asks для runner'а (сжатие в L2Snapshot-бакеты, —
+    /// book-maintainer не владеет output-форматом; emit-логика в runner'е). НЕ часть
+    /// публичного seam — только `new`/`apply_snapshot`/`apply_diff`/`notional_within`.
+    pub(crate) fn bids_map(&self) -> &BTreeMap<i64, i64> {
+        &self.bids
+    }
+    pub(crate) fn asks_map(&self) -> &BTreeMap<i64, i64> {
+        &self.asks
+    }
+}
+
+impl Default for FuturesDepthBook {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Async runner (WS depth@100ms + WS forceOrder + WS !markPrice@arr
+//               + REST snapshot-sync + REST OI-poll)
 // Зеркалит `venue-binance::run` — одна сессия, supervisor-pattern снаружи.
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Локальная копия полного фьючерс-стакана одного символа. price/size — fixed-point ×1e8.
+/// Локальная копия полного фьючерс-стакана одного символа. Делегирует поддержание
+/// bids/asks maintainer'у `FuturesDepthBook` (seam N2/INV-N2), здесь держит ТОЛЬКО
+/// метаданные для sync-автомата (last_update_id для непрерывности, event_time для
+/// честного биржевого времени в `L2Snapshot`).
 struct OrderBook {
-    bids: BTreeMap<i64, i64>,
-    asks: BTreeMap<i64, i64>,
+    book: FuturesDepthBook,
     last_update_id: u64,
     /// `E` последнего применённого WS diff'а, мс. `0` — только REST-бутстрап без diff'ов
     /// (нет биржевого времени → символ НЕ эмитится в `emit_book_snapshots`).
@@ -183,14 +297,23 @@ type SnapshotFuture = Pin<Box<dyn Future<Output = (String, anyhow::Result<OrderB
 /// `Sys(ConnUp(BinanceFutures))` — сразу после успешного WS-коннекта. Возвращает `Ok(())`
 /// при штатном закрытии/дисконнекте/уходе получателя; `Err(_)` — при ошибке коннекта.
 /// Reconnect/backoff — забота supervisor'а снаружи (emitter-not-owner, как в `venue-binance`).
+///
+/// Подписки: `<sym>@depth@100ms` + `<sym>@forceOrder` per symbol (deph-sync + liquidations)
+/// и один АГРЕГИРОВАННЫЙ `!markPrice@arr` (funding-rate broadcast по всем символам —
+/// фильтруем на нашу выборку). Альтернатива — per-symbol `<sym>@markPrice` (N потоков на
+/// N символов); используем `!markPrice@arr` ради одной сессии вместо N — фильтрация дешевая.
 pub async fn run(tx: mpsc::Sender<EventKind>, symbols: Vec<String>) -> anyhow::Result<()> {
-    let mut streams = Vec::with_capacity(symbols.len() * 2);
+    let mut streams = Vec::with_capacity(symbols.len() * 2 + 1);
     for s in &symbols {
         let lower = s.to_lowercase();
         streams.push(format!("{lower}@depth@100ms"));
         streams.push(format!("{lower}@forceOrder"));
     }
+    streams.push("!markPrice@arr".to_string());
     let url = format!("{WS_BASE}{}", streams.join("/"));
+
+    // Upcased set для O(1) фильтрации markPrice@arr -> нужные символы.
+    let symbol_set: HashSet<String> = symbols.iter().map(|s| s.to_uppercase()).collect();
 
     let (ws_stream, _response) = tokio_tungstenite::connect_async(&url).await?;
     let (mut write, mut read) = ws_stream.split();
@@ -236,7 +359,7 @@ pub async fn run(tx: mpsc::Sender<EventKind>, symbols: Vec<String>) -> anyhow::R
                 };
                 match msg {
                     Message::Text(text) => {
-                        if !handle_text_message(&text, &tx, &mut states, &client, &mut pending_snapshots).await {
+                        if !handle_text_message(&text, &tx, &mut states, &symbol_set, &client, &mut pending_snapshots).await {
                             return Ok(());
                         }
                     }
@@ -267,12 +390,14 @@ pub async fn run(tx: mpsc::Sender<EventKind>, symbols: Vec<String>) -> anyhow::R
 }
 
 /// Разобрать одно combined-stream текстовое сообщение и применить эффект:
-/// `forceOrder` → немедленная эмиссия `Liquidation`; `depth` diff → прогон через sync-автомат.
+/// `forceOrder` → немедленная эмиссия `Liquidation`; `depth` diff → прогон через sync-автомат;
+/// `!markPrice@arr` → парс каждого item как funding, фильтр по `symbol_set`, эмит `Funding`.
 /// Возвращает `false`, если `tx` закрыт (получатель ушёл).
 async fn handle_text_message(
     text: &str,
     tx: &mpsc::Sender<EventKind>,
     states: &mut HashMap<String, SymbolState>,
+    symbol_set: &HashSet<String>,
     client: &reqwest::Client,
     pending_snapshots: &mut FuturesUnordered<SnapshotFuture>,
 ) -> bool {
@@ -315,6 +440,29 @@ async fn handle_text_message(
             }
         } else {
             tracing::debug!(raw = %raw, "venue-binance-futures: malformed forceOrder, skipping");
+        }
+    } else if stream == "!markPrice@arr" {
+        // `!markPrice@arr` несёт массив объектов `{e,E,s,p,i,P,r,T,...}` per символ.
+        // Парсим каждый item, эмитим только те, чей `s` есть в нашей выборке.
+        let Some(arr) = data.as_array() else {
+            tracing::debug!(stream = %stream, "venue-binance-futures: !markPrice@arr without array, skipping");
+            return true;
+        };
+        for item in arr {
+            let raw = match serde_json::to_string(item) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let Some(event) = parse_mark_price(&raw) else {
+                // Парс-фейл по конкретному item — skip, остальные item'ы пробуем.
+                continue;
+            };
+            if !symbol_set.contains(&event.symbol) {
+                continue;
+            }
+            if tx.send(EventKind::Md(event)).await.is_err() {
+                return false;
+            }
         }
     } else if stream.contains("@depth") {
         if let Some((symbol, diff)) = parse_depth_diff(stream, data) {
@@ -369,20 +517,17 @@ fn parse_diff_levels(levels: &Value) -> Option<Vec<(i64, i64)>> {
 }
 
 fn apply_diff_to_book(book: &mut OrderBook, diff: &DepthDiff) {
-    for (price, size) in &diff.bids {
-        if *size == 0 {
-            book.bids.remove(price);
-        } else {
-            book.bids.insert(*price, *size);
-        }
-    }
-    for (price, size) in &diff.asks {
-        if *size == 0 {
-            book.asks.remove(price);
-        } else {
-            book.asks.insert(*price, *size);
-        }
-    }
+    let bids: Vec<Level> = diff
+        .bids
+        .iter()
+        .map(|&(price, size)| Level { price, size })
+        .collect();
+    let asks: Vec<Level> = diff
+        .asks
+        .iter()
+        .map(|&(price, size)| Level { price, size })
+        .collect();
+    book.book.apply_diff(&bids, &asks);
     book.last_update_id = diff.u_final;
     book.last_event_time_ms = diff.event_time_ms;
 }
@@ -489,27 +634,28 @@ async fn fetch_snapshot(client: &reqwest::Client, symbol: &str) -> anyhow::Resul
     let response = client.get(&url).send().await?.error_for_status()?;
     let snapshot: DepthSnapshotResponse = response.json().await?;
 
-    let mut bids = BTreeMap::new();
+    let mut bids = Vec::with_capacity(snapshot.bids.len());
     for (price, qty) in &snapshot.bids {
         let price: f64 = price.parse()?;
         let qty: f64 = qty.parse()?;
-        let size = to_fixed(qty);
-        if size != 0 {
-            bids.insert(to_fixed(price), size);
-        }
+        bids.push(Level {
+            price: to_fixed(price),
+            size: to_fixed(qty),
+        });
     }
-    let mut asks = BTreeMap::new();
+    let mut asks = Vec::with_capacity(snapshot.asks.len());
     for (price, qty) in &snapshot.asks {
         let price: f64 = price.parse()?;
         let qty: f64 = qty.parse()?;
-        let size = to_fixed(qty);
-        if size != 0 {
-            asks.insert(to_fixed(price), size);
-        }
+        asks.push(Level {
+            price: to_fixed(price),
+            size: to_fixed(qty),
+        });
     }
+    let mut book = FuturesDepthBook::new();
+    book.apply_snapshot(&bids, &asks);
     Ok(OrderBook {
-        bids,
-        asks,
+        book,
         last_update_id: snapshot.last_update_id,
         last_event_time_ms: 0,
     })
@@ -582,25 +728,25 @@ async fn emit_book_snapshots(
     tx: &mpsc::Sender<EventKind>,
 ) -> bool {
     for (symbol, state) in states.iter() {
-        let Some(book) = &state.book else {
+        let Some(book_state) = &state.book else {
             continue;
         };
-        let ts_exch_ms = book.last_event_time_ms;
+        let ts_exch_ms = book_state.last_event_time_ms;
         if ts_exch_ms == 0 {
             continue;
         }
-        let Some((&best_bid, _)) = book.bids.iter().next_back() else {
+        let Some((&best_bid, _)) = book_state.book.bids_map().iter().next_back() else {
             continue;
         };
-        let Some((&best_ask, _)) = book.asks.iter().next() else {
+        let Some((&best_ask, _)) = book_state.book.asks_map().iter().next() else {
             continue;
         };
         let mid = (best_bid + best_ask) / 2;
         if mid <= 0 {
             continue;
         }
-        let bids = bucket_levels(book.bids.iter().rev(), mid);
-        let asks = bucket_levels(book.asks.iter(), mid);
+        let bids = bucket_levels(book_state.book.bids_map().iter().rev(), mid);
+        let asks = bucket_levels(book_state.book.asks_map().iter(), mid);
         let event = EventKind::md(
             Venue::BinanceFutures,
             symbol.clone(),
@@ -648,9 +794,21 @@ where
         .collect()
 }
 
-/// `!markPrice@arr` / `<symbol>@markPrice` (markPriceUpdate) → `MdEvent{BinanceFutures, Funding}`.
-/// `rate_e8` = поле `r` (funding rate) ×1e8; `ts_exch_ms` = `E` (event time); symbol = `s`.
-/// Нужен как РЕАЛЬНЫЙ вход для derive funding-breadth (M-06 #5) — иначе breadth без данных.
-pub fn parse_mark_price(_json: &str) -> Option<MdEvent> {
-    None // STUB — venue-dev (M-06 funding-parser task, N3)
+/// `!markPrice@arr` (single item) / `<symbol>@markPrice` (markPriceUpdate) →
+/// `MdEvent{BinanceFutures, Funding}`. `rate_e8` = поле `r` (funding rate) ×1e8;
+/// `ts_exch_ms` = `E` (event time); symbol = `s`. Знак `r` СОХРАНЯЕТСЯ (положит/отрицат
+/// критичны для funding-breadth derive, M-06 #5). Битая/неполная форма → `None` (VN-I-7).
+pub fn parse_mark_price(json: &str) -> Option<MdEvent> {
+    let v: Value = serde_json::from_str(json).ok()?;
+    let symbol = v.get("s")?.as_str()?.to_string();
+    let rate: f64 = v.get("r")?.as_str()?.parse().ok()?;
+    let ts_exch_ms = v.get("E")?.as_i64()?;
+    Some(MdEvent {
+        venue: Venue::BinanceFutures,
+        symbol,
+        payload: MdPayload::Funding {
+            rate_e8: to_fixed(rate),
+            ts_exch_ms,
+        },
+    })
 }
