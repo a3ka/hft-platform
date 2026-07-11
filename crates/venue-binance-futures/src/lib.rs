@@ -26,3 +26,10 @@ pub fn parse_depth_snapshot(_symbol: &str, _json: &str) -> Option<MdEvent> {
 pub fn parse_open_interest(_symbol: &str, _json: &str) -> Option<MdEvent> {
     None // STUB — venue-dev (M-06 task 3)
 }
+
+/// `!markPrice@arr` / `<symbol>@markPrice` (markPriceUpdate) → `MdEvent{BinanceFutures, Funding}`.
+/// `rate_e8` = поле `r` (funding rate) ×1e8; `ts_exch_ms` = `E` (event time); symbol = `s`.
+/// Нужен как РЕАЛЬНЫЙ вход для derive funding-breadth (M-06 #5) — иначе breadth без данных.
+pub fn parse_mark_price(_json: &str) -> Option<MdEvent> {
+    None // STUB — venue-dev (M-06 funding-parser task, N3)
+}
