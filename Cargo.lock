@@ -1587,8 +1587,15 @@ dependencies = [
 name = "venue-binance-futures"
 version = "0.0.0"
 dependencies = [
+ "anyhow",
  "contracts",
+ "futures-util",
+ "reqwest",
+ "serde",
  "serde_json",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
 ]
 
 [[package]]
