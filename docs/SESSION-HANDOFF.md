@@ -110,6 +110,10 @@ Coin/TOTAL/…). Полосы вычислимы ТОЛЬКО через full-bo
 **После КАЖДОГО push в main — post-merge деплой-гейт (`.claude/rules/gates.md` §8):
 дождаться CI+Deploy success И проверить VPS по ssh (контейнер healthy, heartbeat свежий);
 milestone не закрывается поверх красного/непроверенного прода.**
+**Перед push — push-scope проверка (`gates.md` §8): в `git log origin/main..HEAD` только
+СВОИ коммиты (чекаут общий — чужие незапушенные RED-коммиты уезжают с твоим push;
+инцидент 2026-07-11). RED-оракулы до реализации — локально или на feat-ветке
+(`pi-<role> --branch feat/M-NN`), main всегда зелёный.**
 sacred: contracts T1, journal (DET-I-1), risk/killswitch, */tests — architect-only. Коммитить только
 при зелёном clippy (был инцидент — закоммитил с clippy-ошибкой, CI покраснел; всегда гейтить commit
 на clippy=0). Секреты в чат не вставлять. Push только при зелёных гейтах.
