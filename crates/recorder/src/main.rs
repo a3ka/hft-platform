@@ -87,32 +87,55 @@ async fn main() -> anyhow::Result<()> {
 
     let dir =
         PathBuf::from(std::env::var("JOURNAL_DIR").unwrap_or_else(|_| "./journal-data".into()));
-    let binance_symbols = env_csv("BINANCE_SYMBOLS", &["BTCUSDT", "ETHUSDT"]);
-    let hl_coins = env_csv("HL_COINS", &["BTC", "ETH"]);
 
     tracing::info!(
-        journal_dir = %dir.display(), ?binance_symbols, ?hl_coins,
-        schema_version = contracts::SCHEMA_VERSION, "recorder start"
+        journal_dir = %dir.display(),
+        schema_version = contracts::SCHEMA_VERSION,
+        venues = ?recorder::default_venues(),
+        "recorder start"
     );
 
     let (tx, rx) = mpsc::channel::<EventKind>(50_000);
 
-    {
-        let (tx_b, syms) = (tx.clone(), binance_symbols.clone());
+    // spawn one supervisor per venue from `default_venues()` — config-driven, не 3 хардкод-блока.
+    // M-06 #4: добавлен `Venue::BinanceFutures` (fstream @depth@100ms + @forceOrder + funding
+    // + REST OI poll). Аргументы площадок: `BINANCE_SYMBOLS` / `HL_COINS` / `BINANCE_FUTURES_SYMBOLS`.
+    //
+    // Type-erasure: три `::run`-функции имеют РАЗНЫЕ concrete-типы возвращаемых futures →
+    // общая сигнатура `Fn(Sender) -> Fut` в `supervise()` вместить нельзя. Решение —
+    // `Box<dyn Fn(Sender) -> Pin<Box<dyn Future + Send>>>` per call (один dyn-индирект на
+    // создание future; внутри спарн-цикла это дешевле, чем статически дублировать N^2 supervisor'ов).
+    type VenueRunFut =
+        std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send>>;
+    type VenueRunFn = Box<dyn Fn(mpsc::Sender<EventKind>) -> VenueRunFut + Send + Sync>;
+
+    for venue in recorder::default_venues() {
+        let tx_v = tx.clone();
+        let (name, run_fn): (&'static str, VenueRunFn) = match venue {
+            Venue::Binance => {
+                let syms = env_csv("BINANCE_SYMBOLS", &["BTCUSDT", "ETHUSDT"]);
+                (
+                    "binance",
+                    Box::new(move |t| Box::pin(venue_binance::run(t, syms.clone()))),
+                )
+            }
+            Venue::Hyperliquid => {
+                let coins = env_csv("HL_COINS", &["BTC", "ETH"]);
+                (
+                    "hyperliquid",
+                    Box::new(move |t| Box::pin(venue_hyperliquid::run(t, coins.clone()))),
+                )
+            }
+            Venue::BinanceFutures => {
+                let syms = env_csv("BINANCE_FUTURES_SYMBOLS", &["BTCUSDT", "ETHUSDT"]);
+                (
+                    "binance_futures",
+                    Box::new(move |t| Box::pin(venue_binance_futures::run(t, syms.clone()))),
+                )
+            }
+        };
         tokio::spawn(async move {
-            supervise("binance", Venue::Binance, tx_b, move |t| {
-                venue_binance::run(t, syms.clone())
-            })
-            .await;
-        });
-    }
-    {
-        let (tx_h, coins) = (tx.clone(), hl_coins.clone());
-        tokio::spawn(async move {
-            supervise("hyperliquid", Venue::Hyperliquid, tx_h, move |t| {
-                venue_hyperliquid::run(t, coins.clone())
-            })
-            .await;
+            supervise(name, venue, tx_v, run_fn).await;
         });
     }
     drop(tx); // writer завершится, только если все продюсеры уйдут (в норме не уходят).

@@ -12,6 +12,7 @@ contracts = { path = "../contracts" }
 journal = { path = "../journal" }
 venue-binance = { path = "../venue-binance" }
 venue-hyperliquid = { path = "../venue-hyperliquid" }
+venue-binance-futures = { path = "../venue-binance-futures" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "signal"] }
 anyhow = "1"
 tracing = "0.1"

@@ -18,11 +18,12 @@ use journal::Journal;
 use tokio::sync::mpsc;
 
 /// Площадки, которые рекордер супервизит по умолчанию. `main` спавнит `supervise()` по
-/// ЭТОМУ списку (config-driven, не хардкод). STUB (M-06 #4): BinanceFutures ещё не
-/// подключён — engine-dev добавит его + переведёт `main` на спавн из этого списка.
+/// ЭТОМУ списку (config-driven, не хардкод). M-06 #4: BinanceFutures подключён — эмиттер
+/// `venue-binance-futures::run` уже выдаёт depth (@depth@100ms) и liquidations (@forceOrder)
+/// и funding (!markPrice@arr) и OI (REST poll), всё через одну WS-сессию.
 /// RED-оракул: `crates/recorder/tests/red_futures_wired.rs`.
 pub fn default_venues() -> Vec<Venue> {
-    vec![Venue::Binance, Venue::Hyperliquid]
+    vec![Venue::Binance, Venue::Hyperliquid, Venue::BinanceFutures]
 }
 
 /// Writer-цикл: пишет события из `rx` в журнал. По `shutdown` ОБЯЗАН сдрейнить уже
