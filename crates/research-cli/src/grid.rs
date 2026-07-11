@@ -86,8 +86,14 @@ struct OpenPosition {
 
 enum Action {
     None,
+    /// Вход активировался с нулевым исполнением (книга до лимита пуста) —
+    /// позиции нет, сбросить и не ждать выхода.
+    AbandonEntry,
+    /// Выход (первичный ИЛИ retry по остатку при частичном exit-филле) —
+    /// qty = фактически набранный вход минус уже исполненный выход.
     RequestExit {
         side: Side,
+        qty: i64,
     },
     RequestEntry {
         side: Side,
@@ -152,13 +158,21 @@ fn run_one_cell(
             }
         }
 
-        // Закрытие позиции при первом exit-филле (harness v1: qty фикс. 1.0 — на
-        // синтетических/реальных данных с достаточной глубиной исполняется одним тейком).
+        // Закрытие позиции ТОЛЬКО при ПОЛНОМ выходе (exit_qty >= entry_qty):
+        // частичный exit-филл оставляет позицию открытой — остаток дожимается
+        // retry-интентом ниже. PnL-формула sign*(exit_notional − entry_notional)
+        // корректна ТОЛЬКО при exit_qty == entry_qty (несбалансированные нотионалы
+        // дают фиктивный PnL масштаба цены, а не издержек — пилот 2026-07-10).
         let ready_to_close = position
             .as_ref()
-            .is_some_and(|p| p.exit_order_id.is_some() && p.exit_qty_e8 > 0);
+            .is_some_and(|p| p.entry_qty_e8 > 0 && p.exit_qty_e8 >= p.entry_qty_e8);
         if ready_to_close {
             let pos = position.take().expect("checked Some above");
+            debug_assert_eq!(
+                pos.exit_qty_e8, pos.entry_qty_e8,
+                "PnL-инвариант: полный выход обязан быть РОВНО набранным входом \
+                 (retry запрашивает только остаток)"
+            );
             let sign: i64 = match pos.entry_side {
                 Side::Buy => 1,
                 Side::Sell => -1,
@@ -178,13 +192,33 @@ fn run_one_cell(
 
         // Определяем ДЕЙСТВИЕ до мутации `position` (иначе конфликт заимствований
         // между immutable-чтением состояния и mutable-записью order_id/новой позиции).
+        // Гейт exchange.open_orders() == 0 — «предыдущий ордер РАЗРЕШЁН»: taker-ордер
+        // sim'а никогда не попадает в active (исполняется либо умирает при активации),
+        // значит 0 открытых ⟺ и вход, и текущий exit-интент уже отработали.
         let action = if let Some(pos) = &position {
-            if pos.exit_order_id.is_none() && ev.ts_mono_ns >= pos.exit_due_mono_ns {
-                let side = match pos.entry_side {
-                    Side::Buy => Side::Sell,
-                    Side::Sell => Side::Buy,
-                };
-                Action::RequestExit { side }
+            if exchange.open_orders() > 0 {
+                // Вход или exit ещё в полёте (δ_submit не созрел) — ждём.
+                Action::None
+            } else if pos.entry_qty_e8 == 0 {
+                // Вход активировался и исполнился В НОЛЬ (видимой глубины до лимита
+                // не было) — позиции НЕТ; сброс, выхода не ждём.
+                Action::AbandonEntry
+            } else if ev.ts_mono_ns >= pos.exit_due_mono_ns {
+                let remaining = pos.entry_qty_e8 - pos.exit_qty_e8;
+                if remaining > 0 {
+                    // Первичный выход (exit_qty=0) ЛИБО retry по остатку после
+                    // частичного exit-филла — запрашиваем ровно недобор.
+                    let side = match pos.entry_side {
+                        Side::Buy => Side::Sell,
+                        Side::Sell => Side::Buy,
+                    };
+                    Action::RequestExit {
+                        side,
+                        qty: remaining,
+                    }
+                } else {
+                    Action::None
+                }
             } else {
                 Action::None
             }
@@ -201,15 +235,22 @@ fn run_one_cell(
 
         match action {
             Action::None => {}
-            Action::RequestExit { side } => {
+            Action::AbandonEntry => {
+                position = None;
+            }
+            Action::RequestExit { side, qty } => {
                 if let Some(book) = quote_books.get(obi_params.venue, &obi_params.symbol) {
                     if let Some(price) = marketable_price(book, side) {
                         let intent = OrderIntent {
                             venue: obi_params.venue,
                             symbol: obi_params.symbol.clone(),
                             side,
+                            // Выход РОВНО набранным входом (минус уже исполненный
+                            // выход) — не константой: sim честно НЕ доисполняет
+                            // остаток taker'а, и фиксированная 1.0 при частичном
+                            // входе давала exit_qty > entry_qty → мусорный PnL.
                             price,
-                            qty: contracts::to_fixed(1.0),
+                            qty,
                             kind: OrderKind::Taker,
                         };
                         if let Ok(order_id) = exchange.submit(intent) {
