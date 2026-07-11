@@ -1576,6 +1576,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "venue-binance-futures"
+version = "0.0.0"
+dependencies = [
+ "contracts",
+ "serde_json",
+]
+
+[[package]]
 name = "venue-hyperliquid"
 version = "0.0.0"
 dependencies = [

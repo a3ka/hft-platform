@@ -1,0 +1,13 @@
+[package]
+name = "venue-binance-futures"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+
+# Адаптер Binance USDT-M перп (fstream). Emitter-not-owner: WS/REST -> parse -> normalize
+# -> MdEvent (Venue::BinanceFutures). seq НЕ проставляет (журнал). M-06 skeleton (architect):
+# чистые парс-функции + RED; async-runner (tokio/tungstenite/reqwest) — impl venue-dev.
+
+[dependencies]
+contracts = { path = "../contracts" }
+serde_json = "1"

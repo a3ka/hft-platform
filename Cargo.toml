@@ -5,6 +5,7 @@ members = [
   "crates/journal",
   "crates/book",
   "crates/venue-binance",
+  "crates/venue-binance-futures",
   "crates/venue-hyperliquid",
   "crates/recorder",
   "crates/signals",
