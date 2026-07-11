@@ -57,5 +57,8 @@ fn next_seq_authoritative_from_segment_not_stale_meta() {
     let mut seqs: Vec<u64> = after.iter().map(|e| e.seq).collect();
     seqs.sort_unstable();
     let dups = seqs.windows(2).filter(|w| w[0] == w[1]).count();
-    assert_eq!(dups, 0, "обнаружены дублирующиеся seq — reuse через рестарт");
+    assert_eq!(
+        dups, 0,
+        "обнаружены дублирующиеся seq — reuse через рестарт"
+    );
 }
