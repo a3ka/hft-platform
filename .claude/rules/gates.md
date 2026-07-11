@@ -59,6 +59,11 @@ tech-debt правок. Блоки:
 Reviewer не пропускается НИКОГДА для substantive-изменений. После APPROVED reviewer
 обновляет `PROJECT-STATE.md` + `TECH-DEBT.md` и делает push (аналог EINHARD F-032 J5).
 
+**Граница reviewer↔architect (закреплено 2026-07-11, инцидент TD-011):** reviewer ОПИСЫВАЕТ
+дефект (что/где/симптом/воспроизведение), но НЕ проектирует фикс. Дизайн решения
+(напр. tail-scan/seek) + RED-оракул на регресс — зона architect (RED-first). Reviewer
+находит проблему → architect проектирует защиту → dev реализует.
+
 ## 5. RISK-BLOCK — асимметричная цена ошибки
 
 Любой milestone, трогающий `crates/risk/**`, `crates/killswitch/**`, `crates/oms/**`,
