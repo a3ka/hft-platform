@@ -16,17 +16,18 @@ fn c5_funding_breadth_correct_and_deterministic() {
     let mut f = BTreeMap::new();
     f.insert("BTC".to_string(), 100); // +
     f.insert("ETH".to_string(), 50); // +
-    f.insert("SOL".to_string(), -30); // -
+    f.insert("SOL".to_string(), 30); // + (асимметрия: 3 pos / 1 neg — хардкод-пруф)
     f.insert("XRP".to_string(), -10); // -
     f.insert("DOGE".to_string(), 0); // flat
 
     let got = funding_breadth(&universe, &f);
-    // n=5 (AVAX исключён); positive=2/5=40%, negative=2/5=40%, flat DOGE не считается.
+    // n=5 (AVAX исключён); positive=3/5=60% (BTC,ETH,SOL), negative=1/5=20% (XRP),
+    // DOGE flat не считается. Разные pct → хардкодом {x,x,5} НЕ пройдёшь (reviewer RN).
     assert_eq!(
         got,
         Breadth {
-            pct_positive_e8: 40_000_000,
-            pct_negative_e8: 40_000_000,
+            pct_positive_e8: 60_000_000,
+            pct_negative_e8: 20_000_000,
             n: 5,
         }
     );
