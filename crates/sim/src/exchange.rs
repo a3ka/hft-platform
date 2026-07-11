@@ -272,7 +272,10 @@ impl BacktestExchange {
                     self.active.remove(&id);
                 }
             }
-            MdPayload::Funding { .. } => {}
+            MdPayload::Funding { .. }
+            | MdPayload::OpenInterest { .. }
+            | MdPayload::Liquidation { .. }
+            | MdPayload::MarginRate { .. } => {}
         }
 
         fills

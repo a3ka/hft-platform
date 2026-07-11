@@ -35,6 +35,7 @@ fn venue_str(v: Venue) -> &'static str {
     match v {
         Venue::Binance => "Binance",
         Venue::Hyperliquid => "Hyperliquid",
+        Venue::BinanceFutures => "BinanceFutures",
     }
 }
 
@@ -108,6 +109,10 @@ fn main() {
             MdPayload::Trade { ts_exch_ms, .. } => (*ts_exch_ms, "Trade"),
             MdPayload::L2Snapshot { ts_exch_ms, .. } => (*ts_exch_ms, "L2Snapshot"),
             MdPayload::Funding { ts_exch_ms, .. } => (*ts_exch_ms, "Funding"),
+            // CT-RFC-01: новые md-варианты не участвуют в md-latency пробе.
+            MdPayload::OpenInterest { .. }
+            | MdPayload::Liquidation { .. }
+            | MdPayload::MarginRate { .. } => continue,
         };
         let key = (venue_str(md.venue).to_string(), md.symbol.clone());
         if ts_exch_ms <= 0 {
