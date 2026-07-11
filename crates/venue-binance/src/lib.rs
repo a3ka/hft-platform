@@ -565,3 +565,93 @@ fn now_ms() -> i64 {
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SACRED (architect-owned; venue-dev не меняет): RED-тесты фикса ts_exch_ms=0
+// у L2Snapshot (SESSION-HANDOFF §5 п.4). Спецификация: снапшот несёт БИРЖЕВОЕ
+// время «E» последнего применённого diff'а, per-symbol; без применённых diff'ов
+// (только REST-бутстрап — биржевого времени нет) символ НЕ эмитится (время не
+// выдумываем). Inline-модуль: тестируемые функции приватны (конвенция крейта).
+// Тесты компилируются после добавления полей event_time_ms/last_event_time_ms
+// (compile-RED на текущем коде — named в коммите фикс-цикла).
+#[cfg(test)]
+mod ts_exch_tests {
+    use super::*;
+
+    fn diff_json(e: i64, u_first: u64, u_final: u64) -> serde_json::Value {
+        serde_json::json!({
+            "e": "depthUpdate", "E": e, "s": "BTCUSDT",
+            "U": u_first, "u": u_final,
+            "b": [["100.0", "2.0"]],
+            "a": [["101.0", "3.0"]]
+        })
+    }
+
+    #[test]
+    fn parse_depth_diff_extracts_event_time() {
+        let (sym, diff) = parse_depth_diff("btcusdt@depth@100ms", &diff_json(1_752_000_000_123, 5, 7))
+            .expect("валидный diff парсится");
+        assert_eq!(sym, "BTCUSDT");
+        assert_eq!(diff.event_time_ms, 1_752_000_000_123, "E обязан извлекаться");
+        // отсутствие E → 0 (не паника, не now)
+        let mut v = diff_json(0, 8, 9);
+        v.as_object_mut().unwrap().remove("E");
+        let (_, d2) = parse_depth_diff("btcusdt@depth@100ms", &v).expect("diff без E валиден");
+        assert_eq!(d2.event_time_ms, 0);
+    }
+
+    #[test]
+    fn apply_diff_propagates_event_time_to_book() {
+        let mut book = OrderBook {
+            bids: std::collections::BTreeMap::new(),
+            asks: std::collections::BTreeMap::new(),
+            last_update_id: 4,
+            last_event_time_ms: 0,
+        };
+        let (_, diff) = parse_depth_diff("btcusdt@depth@100ms", &diff_json(777_000, 5, 6)).unwrap();
+        apply_diff_to_book(&mut book, &diff);
+        assert_eq!(book.last_update_id, 6);
+        assert_eq!(book.last_event_time_ms, 777_000, "время последнего diff'а — в книге");
+    }
+
+    #[tokio::test]
+    async fn emit_uses_last_diff_event_time_not_wallclock() {
+        let mut synced = SymbolState::new();
+        let mut book = OrderBook {
+            bids: std::collections::BTreeMap::new(),
+            asks: std::collections::BTreeMap::new(),
+            last_update_id: 10,
+            last_event_time_ms: 0,
+        };
+        let (_, diff) = parse_depth_diff("btcusdt@depth@100ms", &diff_json(1_600_000_000_000, 11, 12)).unwrap();
+        apply_diff_to_book(&mut book, &diff);
+        synced.book = Some(book);
+
+        // символ ТОЛЬКО после REST-бутстрапа: diff'ы не применялись → биржевого времени нет
+        let mut bootstrap_only = SymbolState::new();
+        bootstrap_only.book = Some(OrderBook {
+            bids: [(to_fixed(50.0), to_fixed(1.0))].into_iter().collect(),
+            asks: [(to_fixed(51.0), to_fixed(1.0))].into_iter().collect(),
+            last_update_id: 1,
+            last_event_time_ms: 0,
+        });
+
+        let mut states = HashMap::new();
+        states.insert("BTCUSDT".to_string(), synced);
+        states.insert("NODIFF".to_string(), bootstrap_only);
+
+        let (tx, mut rx) = mpsc::channel(16);
+        assert!(emit_book_snapshots(&states, &tx).await);
+        drop(tx);
+
+        let mut got = Vec::new();
+        while let Some(ev) = rx.recv().await {
+            got.push(ev);
+        }
+        assert_eq!(got.len(), 1, "символ без применённых diff'ов НЕ эмитится (время не выдумываем)");
+        let EventKind::Md(md) = &got[0] else { panic!("ожидали Md") };
+        assert_eq!(md.symbol, "BTCUSDT");
+        let MdPayload::L2Snapshot { ts_exch_ms, .. } = &md.payload else { panic!("ожидали L2Snapshot") };
+        assert_eq!(*ts_exch_ms, 1_600_000_000_000, "ts_exch_ms = E последнего diff'а, НЕ now_ms()");
+    }
+}
