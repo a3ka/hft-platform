@@ -102,3 +102,17 @@ continuity `U==last+1` и инвалидирует+ре-снапшотит на 
 
 Итог п.1: C5 ✓, J1 ✓ (RED landed); B1 — design-closed (инвариант + лимитация
 специфицированы; unit-RED ждёт venue-dev seam, осознанно НЕ форсирую placebo).
+
+## Amendment 2026-07-11 (TD-011 — прод-масштаб open())
+
+Инцидент: engine-dev tasks 2/3/4 смёржены → reviewer §8 поймал прод-регрессию → REVERT
+(main 4ca054e). `journal::scan_next_seq` (из `Journal::open()`) делал `read_to_end` всего
+сегмента (прод 2.65 GiB) в RAM → recorder не писал (101% CPU, OOM-риск). J2 на крошечных
+фикстурах не поймал.
+
+Новый sacred-оракул: `crates/journal/tests/red_open_bounded.rs` (TD-011) — 64 MiB сегмент +
+отстающая мета → `open()` обязан (а) вернуть next_seq из СЕГМЕНТА (семантика J2 на масштабе),
+(б) пик аллокации < 8 MiB (счётчик через global allocator). RED на current main; анти-плацебо:
+контрольный `fs::read` превышает бюджет. Реимпл (engine-dev): next_seq через ХВОСТОВОЙ скан
+(seek к концу / чтение назад до последнего валидного фрейма), O(1) память — НЕ read_to_end.
+Правило зафиксировано в `.claude/rules/testing.md` (прод-масштаб sacred I/O).
