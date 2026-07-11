@@ -127,6 +127,8 @@ fn write_meta(path: &Path, next_seq: u64) -> io::Result<()> {
 }
 
 /// Прочитать все события сегмента по порядку (для replay/тестов). MVP.
+/// STRICT: любой CRC-mismatch → Err (инвариант DET-I-1 exact-replay). Для
+/// resync-толерантного чтения повреждённого журнала — `recover`.
 pub fn read_all(dir: impl AsRef<Path>) -> io::Result<Vec<Event>> {
     let path = dir.as_ref().join(SEGMENT);
     let mut data = Vec::new();
@@ -196,6 +198,47 @@ fn scan_next_seq(seg_path: &Path) -> io::Result<u64> {
         }
     }
     Ok(next)
+}
+
+/// Resync-толерантное чтение: возвращает ВСЕ валидные события сегмента, ресинхронизируясь
+/// через рваные фреймы (unclean SIGKILL посреди BufWriter-flush оставляет торн-фрейм В
+/// СЕРЕДИНЕ). В отличие от strict `read_all` (падает на первом CRC-mismatch ради DET-I-1),
+/// `recover` при повреждении сдвигается по одному байту, пока не найдёт следующий валидный
+/// фрейм (честный ресинк — без rand-детекта). Для восстановления накопленных прод-данных.
+pub fn recover(dir: impl AsRef<Path>) -> io::Result<Vec<Event>> {
+    let path = dir.as_ref().join(SEGMENT);
+    let data = match File::open(&path) {
+        Ok(mut f) => {
+            let mut d = Vec::new();
+            f.read_to_end(&mut d)?;
+            d
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i + 4 <= data.len() {
+        let len = u32::from_le_bytes(data[i..i + 4].try_into().unwrap()) as usize;
+        if len == 0 || i + 4 + len + 4 > data.len() {
+            i += 1; // рваный/хвостовой фрейм — ресинк по байту
+            continue;
+        }
+        let payload = &data[i + 4..i + 4 + len];
+        let crc = u32::from_le_bytes(data[i + 4 + len..i + 4 + len + 4].try_into().unwrap());
+        if crc32fast::hash(payload) != crc {
+            i += 1; // CRC-mismatch (торн-фрейм) — ресинк
+            continue;
+        }
+        match postcard::from_bytes::<Event>(payload) {
+            Ok(ev) => {
+                out.push(ev);
+                i += 4 + len + 4;
+            }
+            Err(_) => i += 1, // payload не декодируется — ложное совпадение len/crc, ресинк
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
