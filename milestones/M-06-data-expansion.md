@@ -67,3 +67,42 @@ research-dev(1 latency_probe,5)‖signal-dev(1 obi) → tester(6) → reviewer.
   полосы 15-60% недосчитаны на бутстрапе): решить митигацию (многостраничный REST / принять,
   diff само-заживает активные уровни / диагностик-сверка книга vs свежий REST на глубине).
   DATA-вопрос → reviewer TECH-DEBT.
+## Amendment 2026-07-11 (reviewer N2/N3/N4 → architect RED-first)
+
+Контекст: venue-dev #2/#3 APPROVED (парсеры C2/C2b/C3 GREEN, MD-only). reviewer нашёл
+пробелы; architect проектирует оракулы (граница gates.md §4).
+
+### N3 — funding-парсер (RED landed)
+`parse_mark_price` (markPriceUpdate `r`→Funding) — STUB + RED `tests/red_funding.rs`
+(положит. И отрицат. ставка, знак не хардкодится). Реальный вход для C5 funding-breadth.
+Задача: venue-dev реализует parse_mark_price + подписку `!markPrice@arr` в runner. GREEN:
+`cargo test -p venue-binance-futures --test red_funding`.
+
+### N2 — deep-book resync/eviction (оракул СПЕЦ; унифицирует B1 из M-05)
+Риск (reviewer): futures diff-sync-книга (apply_diff/handle_diff/emit_book_snapshots) —
+ресинк + eviction дальних уровней БЕЗ теста → фантомная ликвидность в полосах 15-60%.
+**Мой анализ:** «phantom» — СЛАБЫЙ риск (U/u-continuity не даёт пропустить cancel;
+apply_snapshot = replace). Реальный тестируемый ИНВАРИАНТ — корректность пути gap:
+
+  **INV-N2:** при разрыве непрерывности (`U != last_update_id + 1`) книга ИНВАЛИДИРУЕТСЯ
+  и ПОЛНОСТЬЮ пересобирается из свежего REST-снапшота — НЕТ переноса stale-уровней
+  (дальний уровень, присутствовавший до gap и ОТСУТСТВУЮЩИЙ в свежем снапшоте, удалён).
+
+Оракул (анти-плацебо): seed-снапшот → diff добавляет уровень на ~40% от mid → gap →
+свежий REST-снапшот БЕЗ него → `notional_within(Side, 0.50)` его НЕ содержит. Падает на
+merge-семантике / отсутствии eviction.
+
+**Требуемый seam (venue-dev выставляет — §4: дизайн мой, impl их):** тестируемый
+book-maintainer, напр. `pub(crate) struct FuturesDepthBook { apply_snapshot(&[Level],&[Level])
+= REPLACE; apply_diff(&[Level],&[Level]) size==0→remove; notional_within(Side,f64) }`.
+RED `tests/red_resnapshot_futures.rs` ФИНАЛИЗИРУЮ против этого seam, когда venue-dev
+выставит maintainer в runner (не проектирую вслепую против невидимой ветки — иначе
+mismatch/rework только что одобренного кода). Это ДИЗАЙН оракула (инвариант+seam), не
+отсрочка: как только maintainer есть — RED .rs коммичу.
+
+Комплемент N2 — `limit=5000` undercount (completeness, DATA-вопрос, отдельно; уже в
+amendment выше): N2 = корректность resync; limit=5000 = полнота глубины.
+
+### N4 — MD-only carve-out (закреплено в gates.md §5)
+`venue-*` MD-only (нет order-egress) → risk-critic НЕ нужен, reviewer подтверждает MD-only.
+Правило и milestone больше не противоречат.
