@@ -39,6 +39,24 @@
   посадке task 5/B1; на этом merge (engine-dev part) код venue не трогался. Связано с TD-004.
   Severity: NOTE (граница достоверности данных дальних полос, не риск ордер-пути).
 
+## 🔴 BLOCKER (M-05, 2026-07-11)
+- **TD-011** `scan_next_seq-full-segment-read-oom` (M-05 task#3, engine-dev, ОТКРЫТА, БЛОКЕР).
+  Прод-инцидент: после merge+deploy engine-dev part M-05 recorder перестал писать журнал
+  (0 роста/15с, heartbeat заморожен, 101% CPU, 2.48 GiB RAM). Корень: `journal::scan_next_seq`
+  (вызывается из `Journal::open()` на КАЖДОМ старте) делает `File::read_to_end` ВСЕГО сегмента
+  (прод = 2.65 GiB) в `Vec` + побайтовый скан всего файла. На прод-масштабе: (а) блокирует старт
+  writer-цикла на минуты (writer-loop даже не начался — heartbeat/segment заморожены с момента
+  старта), (б) грозит OOM по мере роста журнала (3–7 дней → >7.5 GiB VPS RAM). Юнит-RED J2
+  (`next_seq_authoritative_from_segment_not_stale_meta`) использовал крошечные in-memory фикстуры
+  → патология не воспроизводилась. Healthcheck обманут (контейнер «healthy» — процесс жив),
+  авто-rollback `deploy.yml` НЕ сработал (тихая деградация ≠ падение healthcheck). Поймано только
+  eyes-on §8 ssh-проверкой. **Откачено** (`c2ad02c`/`ffdc410`/`e190356` → known-good `918cac2`).
+  ФИКС (engine-dev): `next_seq` из ограниченного ХВОСТОВОГО скана — seek к концу файла и чтение
+  назад/последние N MB до последнего валидного фрейма, без загрузки всего сегмента в RAM; O(1) по
+  памяти. ARCHITECT: добавить прод-масштаб RED-оракул (open() на большом/многогиговом сегменте —
+  ограничение по памяти И времени старта), иначе анти-плацебо не ловит этот класс. Severity: BLOCKER
+  (регрессия прод-записи данных). Пока открыт — engine-dev part M-05 НЕ мержится повторно.
+
 ## Замечания reviewer'а M-05 (не блокирующие, 2026-07-11)
 - **RN-4** (AUDIT sacred-файла) engine-dev правил `scripts/verify_M-05.sh` (architect/tester-owned,
   SACRED per scope-guard) в коммите `2a21b8c` (task #4). Правка УЗКАЯ: замена placeholder
@@ -53,7 +71,9 @@
   `B1 resnapshot anti-phantom` (venue-dev task 5) PENDING, ортогональный к journal/recorder-фиксу.
   Push разрешён явным founder-override правила auto-push-only-on-exit-0 (B1 не в зоне engine-dev,
   фикс journal-integrity прод-критичен). Milestone остаётся IN_PROGRESS до B1 (task 5) + wiring
-  task 6 (verify exit 0). НЕ close-out.
+  task 6 (verify exit 0). НЕ close-out. **⚠ ОТКАЧЕНО через ~4 мин — прод-регрессия, см. TD-011.**
+  Урок: eyes-on §8 ssh-проверка ОБЯЗАТЕЛЬНА и поймала то, что зелёный CI/юнит-тесты/Deploy-success
+  пропустили; «Deploy success» ≠ «прод пишет данные».
 - **RN-6** (DET-I-1 подтверждение) `read_all` остался STRICT (Err на первом CRC-mismatch +
   postcard-decode→Err — сверено на `b22583c`); resync-толерантность вынесена в ОТДЕЛЬНУЮ
   `recover()` (честный побайтовый ресинк, без rand/wall-clock). DET-I-1 exact-replay НЕ ослаблен.
