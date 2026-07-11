@@ -18,11 +18,35 @@ pub struct Breadth {
 /// `latest_funding` — последняя ставка ×1e8 на инструмент. Инструменты вселенной без
 /// записи в `latest_funding` в `n` НЕ входят. rate>0 → positive, rate<0 → negative,
 /// rate==0 → ни то ни другое (flat). Детерминировано (порядок не влияет).
-pub fn funding_breadth(_universe: &[String], _latest_funding: &BTreeMap<String, i64>) -> Breadth {
-    // STUB — research-dev (M-06 task 5). RED: crates/derive/tests/red_breadth.rs
+pub fn funding_breadth(universe: &[String], latest_funding: &BTreeMap<String, i64>) -> Breadth {
+    // M-06 task 5 (research-dev). Чистая детерминированная функция: без I/O/wall-clock/rand.
+    // Идём по `universe` в его порядке (детерминизм входа) и смотрим наличие+знак ставки.
+    // rate>0 → positive; rate<0 → negative; rate==0 → flat (n учитывается, знак — нет).
+    // Инструмент в universe без записи в `latest_funding` в n НЕ входит (semantics спекa).
+    let mut n: u32 = 0;
+    let mut positive: u32 = 0;
+    let mut negative: u32 = 0;
+    for sym in universe {
+        if let Some(&rate) = latest_funding.get(sym) {
+            n += 1;
+            match rate {
+                r if r > 0 => positive += 1,
+                r if r < 0 => negative += 1,
+                _ => {} // flat: учтён в n, ни +, ни −.
+            }
+        }
+    }
+    // Доля ×1e8, целочисленно (round-toward-zero). n==0 → 0% (нет данных — не NaN, не паника).
+    let pct_e8 = |c: u32| -> i64 {
+        if n == 0 {
+            0
+        } else {
+            (c as i64).saturating_mul(100_000_000) / n as i64
+        }
+    };
     Breadth {
-        pct_positive_e8: 0,
-        pct_negative_e8: 0,
-        n: 0,
+        pct_positive_e8: pct_e8(positive),
+        pct_negative_e8: pct_e8(negative),
+        n,
     }
 }
