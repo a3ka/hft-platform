@@ -1,0 +1,59 @@
+# M-06 — Data expansion: futures depth + OI + liquidations + funding-breadth (P1)
+
+STATUS: 🚧 IN_PROGRESS. Authored: architect (Fable), 2026-07-11.
+Предпосылка: CT-RFC-01 применён (C-003 PASS) — T1 несёт Venue::BinanceFutures +
+MdPayload::{OpenInterest,Liquidation,MarginRate}. Гейты: critic не требуется (контракты
+уже прошли CT-RFC-01; новый крейт venue-binance-futures — триггер §1.4, но это тонкий
+адаптер по образцу venue-binance → critic по усмотрению founder'а); **reviewer обязателен**
+(trogает venue-*). risk-critic НЕ требуется (ордер-путь не трогается).
+
+## Objective
+1. Вернуть workspace в компайл после CT-RFC-01 (consumer blast-radius).
+2. Собрать новые данные под квант-стратегии: глубина Binance futures, funding (+breadth),
+   open interest, ликвидации. funding-breadth/CVD/базис — DERIVE downstream (journal-first).
+
+## Contract impact (T1)
+**НЕ трогается** — типы уже есть (CT-RFC-01). M-06 только ПРОИЗВОДИТ/ПОТРЕБЛЯЕТ их.
+
+## Allowed / Forbidden paths (scope-guard)
+| Агент | Allowed | Forbidden |
+|---|---|---|
+| architect | `milestones/M-06-*.md`, `crates/*/tests/**` (RED), `crates/venue-binance-futures/` СКЕЛЕТ (Cargo.toml+lib-стаб+RED, по образцу M-04 task 1), `scripts/verify_M-06.sh` | impl-парсеры/поллер |
+| venue-dev | `crates/venue-binance-futures/src/**` (fstream depth+OI+liquidations+funding парсеры), `crates/venue-binance/src/**` (если futures-режим встраивается), consumer-arm'ы в своих venue-крейтах | tests, contracts |
+| engine-dev | `crates/recorder/src/**` (poller-компонент: REST cadence фикс.конфиг → журнал), `crates/sim/src/exchange.rs` (explicit ignore-arm новых payload'ов) | tests, contracts, risk |
+| research-dev | `crates/research-cli/src/**` (latency_probe match-arm'ы; funding-breadth DERIVE-утилита downstream) | tests, contracts |
+| signal-engineer | `crates/signals/src/obi.rs` (explicit ignore-arm) | tests |
+| все dev | — | `crates/contracts/**`, `*/tests/**`, `scripts/**` |
+
+## §Tasks
+| # | Status | Задача | Агент | Verify |
+|---|---|---|---|---|
+| 1 | ⏳ | **Blast-radius fix (компайл):** MUST-FIX exhaustive — `sim/src/exchange.rs:223` (MdPayload), `research-cli/bin/latency_probe.rs:34-38` (Venue)+`:107-111` (MdPayload); EXPLICIT-ARM (сейчас wildcard, C-003 §3) — `book/src/lib.rs:190-197`, `signals/src/obi.rs:84-87`; examples dump/bands/obi_probe. Новые payload'ы — ЯВНЫЙ ignore (не молчаливый wildcard). | engine/research/signal-dev по зонам | workspace компилируется; C1-RED GREEN |
+| 2 | ⏳ | `venue-binance-futures` скелет (architect) → парсеры: fstream `@depth@100ms`+`/fapi/v1/depth` (L2Snapshot, Venue::BinanceFutures); `@forceOrder` → Liquidation; `!markPrice@arr`/`premiumIndex` → Funding | architect(скелет+RED)→venue-dev | C2-RED GREEN |
+| 3 | ⏳ | OI: `/fapi/v1/openInterest` (+`openInterestHist`) → MdPayload::OpenInterest | venue-dev | C3-RED GREEN |
+| 4 | ⏳ | recorder-poller: REST-источники (funding all-perps `premiumIndex` 1 вызовом; OI) с фикс.cadence-конфигом → журнал с ts_exch | engine-dev | poller пишет события, cadence детерминирован |
+| 5 | ⏳ | funding-breadth top-300 (%+/−) — DERIVE-утилита downstream (research-cli/book), НЕ T1; ранжирование по OI/volume | research-dev | breadth считается из потока Funding детерминированно |
+| 6 | ⏳ | `scripts/verify_M-06.sh` exit=0 | tester | exit=0 |
+
+MarginRate impl — **Tier-3, ОТЛОЖЕН** (нужны ключи/3rd-party; тип уже в T1, продюсер позже).
+
+## RED-тесты (sacred, architect-only)
+- **C1 `consumers_ignore_new_md_variants`** (`crates/sim/tests/`) — sim.on_event(OpenInterest/
+  Liquidation/MarginRate) → НЕ паникует, НЕ создаёт fills (явный ignore, не обработка).
+- **C2 `binance_futures_liquidation_side_is_liquidated_side`** (`crates/venue-binance-futures/
+  tests/`) — сырой forceOrder `S=SELL` (ликвидируется LONG) → `MdPayload::Liquidation{side:Sell}`.
+  **C-003 note:** side = ЛИКВИДИРУЕМАЯ сторона, НЕ агрессор — иначе CVD/liq-flow инвертирует знак.
+- **C2b** futures `@depth` → L2Snapshot с Venue::BinanceFutures; глубина полос вычислима.
+- **C3 `open_interest_parse`** — сырой openInterest JSON → MdPayload::OpenInterest{oi_e8}.
+- **C5 `funding_breadth_derive_deterministic`** (`crates/research-cli/tests/`) — из фикс.
+  набора Funding-событий top-N breadth детерминирован (одинаковый вход → одинаковый %).
+
+Анти-плацебо: каждый RED падает на заглушке/до импла.
+
+## Acceptance
+`bash scripts/verify_M-06.sh; echo "exit=$?"` → `VERDICT: PASS`, exit=0. Ключ: workspace
+снова компилируется + новые парсеры GREEN + funding-breadth детерминирован.
+
+## Handoff
+architect (скелет venue-binance-futures + RED) → venue-dev(2,3)‖engine-dev(1 sim,4)‖
+research-dev(1 latency_probe,5)‖signal-dev(1 obi) → tester(6) → reviewer.
