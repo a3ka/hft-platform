@@ -48,6 +48,24 @@ max RSS 6 MiB, next_seq корректен) ДО merge, и eyes-on на VPS по
 - **M-05 остаётся IN_PROGRESS:** task 5 B1 (venue-dev, anti-phantom resnapshot) PENDING → `verify_M-05.sh`
   exit=1 (только B1); task 6 (tester, verify exit 0) после B1. TD-010 (REST limit=5000) открыт.
 
+## Data expansion (M-06 — inert-части MERGED, reviewer APPROVED 2026-07-11; milestone IN_PROGRESS)
+Смержены ДВЕ инертные (не потребляются recorder'ом до #4 poller → прод-поведение НЕ изменено)
+APPROVED-ветки; main стал полностью GREEN (впервые за цикл RED-on-main). §8 eyes-on после deploy:
+recorder БЕЗ изменений (CPU 0.79%, MEM 5.6 MiB, сегмент растёт +261 KB/12s, next_seq растёт, restarts=0).
+- `crates/venue-binance-futures` (venue-dev, tasks #2/#3 + N2/N3) — USDT-M перп fstream-адаптер:
+  парсеры `@depth@100ms`→L2Snapshot, `@forceOrder`→Liquidation (side = ликвидируемая сторона, C2),
+  `/fapi/v1/openInterest`→OpenInterest (C3); `parse_mark_price` (`markPriceUpdate`→Funding, знак, N3);
+  `FuturesDepthBook.apply_snapshot` = REPLACE-семантика (INV-N2: gap-ресинк эвиктит stale дальние
+  уровни → анти-фантомная ликвидность). 5/5 RED GREEN, MD-only (ордер-путь не тронут → risk-critic
+  не нужен, gates.md §5 N4 carve-out). НЕ потребляется recorder'ом (нет в его deps).
+- `crates/derive::funding_breadth` (research-dev, task #5) — чистый детерминированный агрегат
+  funding-breadth (%+/−, top-N по universe); проходит ХАРДЕНУТЫЙ red_breadth (асимметрия 60/20,
+  хардкод-пруф). Потребители — research-cli/signals (downstream, journal-first).
+- **M-06 остаётся IN_PROGRESS:** #1 (blast-radius compile — на main workspace компилируется),
+  #4 recorder REST-poller (engine-dev, **прод-поведенческое** — funding/OI в журнал → полный §8
+  eyes-on на ЕГО merge), #6 verify_M-06.sh exit 0 (tester). Data-quality долг: TD-012 (futures REST
+  depth limit=1000 undercount дальних полос, класс TD-004).
+
 ## Движок бэктеста (M-04 «Research core» — РЕАЛИЗОВАНО, reviewer APPROVED 2026-07-10)
 Цепочка: architect → critic C-001 REJECT → фиксы `f02c418` → critic C-002 NOTE (все
 находки C-001 закрыты) → dev (2 honest-STOP SVR, оба разрешены architect'ом) → tester

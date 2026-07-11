@@ -38,6 +38,15 @@
   (пагинация vs принятие потолка с явной границей достоверности полос) — за venue-dev при
   посадке task 5/B1; на этом merge (engine-dev part) код venue не трогался. Связано с TD-004.
   Severity: NOTE (граница достоверности данных дальних полос, не риск ордер-пути).
+- **TD-012** `binance-futures-rest-depth-limit-1000-undercount` (M-06 venue-dev, ОТКРЫТА).
+  Аналог TD-010/TD-004 для USDT-M перп: REST depth-снапшот `/fapi/v1/depth` futures ограничен
+  `limit=1000` уровнями на вызов — дальние полосы книги за топ-1000 одним снапшотом не покрываются,
+  reconcile diff-книги ограничен этим потолком. `FuturesDepthBook.apply_snapshot` (REPLACE, INV-N2)
+  корректно эвиктит stale в пределах снапшота, но за границей top-1000 reference неполон. Также
+  открытый вопрос `!markPrice@arr` update-rate (согласовать с research-dev, если важна cadence
+  funding-breadth). Точный масштаб undercount + стратегия (пагинация vs явная граница достоверности
+  полос) — за venue-dev/architect при углублении deep-book. Класс TD-004. Severity: NOTE (граница
+  достоверности данных, не риск ордер-пути; MD-only).
 
 ## Замечания reviewer'а M-05 (не блокирующие, 2026-07-11)
 - **RN-8** (fmt-гейт под-покрытие) `verify_M-05.sh` fmt-гейт проверяет только `journal+book`, не
