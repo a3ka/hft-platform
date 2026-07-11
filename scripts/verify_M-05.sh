@@ -10,7 +10,8 @@ run() { local l="$1"; shift; if "$@" >/dev/null 2>&1; then echo "  PASS  $l"; el
 echo "== Journal integrity =="
 run "J2 next_seq из сегмента (нет seq-reuse)" cargo test -p journal --test red_shutdown
 run "J3 recover ресинк через рваный фрейм"     cargo test -p journal --test red_recover
-run "J1 clean-shutdown drain+flush (recorder run_writer)" cargo test -p recorder --test red_shutdown_j1
+echo "  PENDING  J1 clean-shutdown (recorder SIGTERM integration) — оракул при task 2"
+FAIL=$((FAIL+1))
 
 echo "== Deep-book quality =="
 echo "  PENDING  B1 resnapshot anti-phantom (venue-binance book) — оракул при task 5"
