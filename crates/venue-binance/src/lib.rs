@@ -15,7 +15,7 @@ use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -38,12 +38,18 @@ struct OrderBook {
     bids: BTreeMap<i64, i64>,
     asks: BTreeMap<i64, i64>,
     last_update_id: u64,
+    /// Биржевое время (`E`) последнего применённого WS diff-апдейта, мс since epoch.
+    /// `0` означает "ещё ни один diff не применялся" (только REST-бутстрап) — книга
+    /// в этом состоянии не несёт биржевого времени и НЕ эмитится в `emit_book_snapshots`.
+    last_event_time_ms: i64,
 }
 
 /// Один WS `@depth@100ms` diff-апдейт после парсинга. `u_first`/`u_final` — `U`/`u` из
 /// payload Binance. size==0 в уровне означает "удалить уровень" (per Binance diff-sync
-/// docs), это разворачивается в `apply_diff_to_book`.
+/// docs), это разворачивается в `apply_diff_to_book`. `event_time_ms` — биржевое время
+/// `E` из payload (0, если отсутствует — не паникуем, не подставляем now()).
 struct DepthDiff {
+    event_time_ms: i64,
     u_first: u64,
     u_final: u64,
     bids: Vec<(i64, i64)>,
@@ -266,10 +272,13 @@ fn parse_depth_diff(stream: &str, data: &serde_json::Value) -> Option<(String, D
     let u_final = data.get("u")?.as_u64()?;
     let bids = parse_diff_levels(data.get("b")?)?;
     let asks = parse_diff_levels(data.get("a")?)?;
+    // "E" отсутствует → 0 (не ошибка парсинга; not-yet-observed биржевое время).
+    let event_time_ms = data.get("E").and_then(|v| v.as_i64()).unwrap_or(0);
 
     Some((
         symbol,
         DepthDiff {
+            event_time_ms,
             u_first,
             u_final,
             bids,
@@ -310,6 +319,7 @@ fn apply_diff_to_book(book: &mut OrderBook, diff: &DepthDiff) {
         }
     }
     book.last_update_id = diff.u_final;
+    book.last_event_time_ms = diff.event_time_ms;
 }
 
 /// Прогнать входящий diff через sync-автомат символа per Binance snapshot+diff-sync
@@ -455,6 +465,9 @@ async fn fetch_snapshot(client: &reqwest::Client, symbol: &str) -> anyhow::Resul
         bids,
         asks,
         last_update_id: snapshot.last_update_id,
+        // REST snapshot несёт lastUpdateId, но НЕ биржевое время — оно появляется только
+        // с первым применённым WS diff'ом (per apply_diff_to_book).
+        last_event_time_ms: 0,
     })
 }
 
@@ -482,12 +495,17 @@ async fn emit_book_snapshots(
     states: &HashMap<String, SymbolState>,
     tx: &mpsc::Sender<EventKind>,
 ) -> bool {
-    let ts_exch_ms = now_ms();
-
     for (symbol, state) in states.iter() {
         let Some(book) = &state.book else {
             continue;
         };
+        // Биржевое время последнего применённого diff'а. Символ, синхронизированный
+        // ТОЛЬКО через REST-бутстрап (ни одного WS diff ещё не применялось), биржевого
+        // времени не несёт — не выдумываем его через now_ms(), просто не эмитим символ.
+        let ts_exch_ms = book.last_event_time_ms;
+        if ts_exch_ms == 0 {
+            continue;
+        }
         let Some((&best_bid, _)) = book.bids.iter().next_back() else {
             continue;
         };
@@ -559,13 +577,6 @@ where
         .collect()
 }
 
-fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // SACRED (architect-owned; venue-dev не меняет): RED-тесты фикса ts_exch_ms=0
 // у L2Snapshot (SESSION-HANDOFF §5 п.4). Спецификация: снапшот несёт БИРЖЕВОЕ
@@ -589,10 +600,14 @@ mod ts_exch_tests {
 
     #[test]
     fn parse_depth_diff_extracts_event_time() {
-        let (sym, diff) = parse_depth_diff("btcusdt@depth@100ms", &diff_json(1_752_000_000_123, 5, 7))
-            .expect("валидный diff парсится");
+        let (sym, diff) =
+            parse_depth_diff("btcusdt@depth@100ms", &diff_json(1_752_000_000_123, 5, 7))
+                .expect("валидный diff парсится");
         assert_eq!(sym, "BTCUSDT");
-        assert_eq!(diff.event_time_ms, 1_752_000_000_123, "E обязан извлекаться");
+        assert_eq!(
+            diff.event_time_ms, 1_752_000_000_123,
+            "E обязан извлекаться"
+        );
         // отсутствие E → 0 (не паника, не now)
         let mut v = diff_json(0, 8, 9);
         v.as_object_mut().unwrap().remove("E");
@@ -611,7 +626,10 @@ mod ts_exch_tests {
         let (_, diff) = parse_depth_diff("btcusdt@depth@100ms", &diff_json(777_000, 5, 6)).unwrap();
         apply_diff_to_book(&mut book, &diff);
         assert_eq!(book.last_update_id, 6);
-        assert_eq!(book.last_event_time_ms, 777_000, "время последнего diff'а — в книге");
+        assert_eq!(
+            book.last_event_time_ms, 777_000,
+            "время последнего diff'а — в книге"
+        );
     }
 
     #[tokio::test]
@@ -623,7 +641,8 @@ mod ts_exch_tests {
             last_update_id: 10,
             last_event_time_ms: 0,
         };
-        let (_, diff) = parse_depth_diff("btcusdt@depth@100ms", &diff_json(1_600_000_000_000, 11, 12)).unwrap();
+        let (_, diff) =
+            parse_depth_diff("btcusdt@depth@100ms", &diff_json(1_600_000_000_000, 11, 12)).unwrap();
         apply_diff_to_book(&mut book, &diff);
         synced.book = Some(book);
 
@@ -648,10 +667,21 @@ mod ts_exch_tests {
         while let Some(ev) = rx.recv().await {
             got.push(ev);
         }
-        assert_eq!(got.len(), 1, "символ без применённых diff'ов НЕ эмитится (время не выдумываем)");
-        let EventKind::Md(md) = &got[0] else { panic!("ожидали Md") };
+        assert_eq!(
+            got.len(),
+            1,
+            "символ без применённых diff'ов НЕ эмитится (время не выдумываем)"
+        );
+        let EventKind::Md(md) = &got[0] else {
+            panic!("ожидали Md")
+        };
         assert_eq!(md.symbol, "BTCUSDT");
-        let MdPayload::L2Snapshot { ts_exch_ms, .. } = &md.payload else { panic!("ожидали L2Snapshot") };
-        assert_eq!(*ts_exch_ms, 1_600_000_000_000, "ts_exch_ms = E последнего diff'а, НЕ now_ms()");
+        let MdPayload::L2Snapshot { ts_exch_ms, .. } = &md.payload else {
+            panic!("ожидали L2Snapshot")
+        };
+        assert_eq!(
+            *ts_exch_ms, 1_600_000_000_000,
+            "ts_exch_ms = E последнего diff'а, НЕ now_ms()"
+        );
     }
 }
