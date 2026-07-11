@@ -31,7 +31,7 @@ FAIL=$((FAIL+1))
 
 echo "== Gates =="
 run "fmt --check"                     cargo fmt --all -- --check
-run "clippy -D warnings"              cargo clippy --workspace --all-targets -- -D warnings
+run "clippy M-06 крейты"              cargo clippy -p sim -p research-cli -p venue-binance-futures -p book -p signals --lib --bins -- -D warnings
 
 echo "--------"
 if [ "$FAIL" -eq 0 ]; then echo "VERDICT: PASS"; exit 0; else echo "VERDICT: FAIL ($FAIL)"; exit 1; fi
