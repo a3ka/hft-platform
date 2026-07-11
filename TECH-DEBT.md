@@ -39,25 +39,12 @@
   посадке task 5/B1; на этом merge (engine-dev part) код venue не трогался. Связано с TD-004.
   Severity: NOTE (граница достоверности данных дальних полос, не риск ордер-пути).
 
-## 🔴 BLOCKER (M-05, 2026-07-11)
-- **TD-011** `scan_next_seq-full-segment-read-oom` (M-05 task#3, engine-dev, ОТКРЫТА, БЛОКЕР).
-  Прод-инцидент: после merge+deploy engine-dev part M-05 recorder перестал писать журнал
-  (0 роста/15с, heartbeat заморожен, 101% CPU, 2.48 GiB RAM). Корень: `journal::scan_next_seq`
-  (вызывается из `Journal::open()` на КАЖДОМ старте) делает `File::read_to_end` ВСЕГО сегмента
-  (прод = 2.65 GiB) в `Vec` + побайтовый скан всего файла. На прод-масштабе: (а) блокирует старт
-  writer-цикла на минуты (writer-loop даже не начался — heartbeat/segment заморожены с момента
-  старта), (б) грозит OOM по мере роста журнала (3–7 дней → >7.5 GiB VPS RAM). Юнит-RED J2
-  (`next_seq_authoritative_from_segment_not_stale_meta`) использовал крошечные in-memory фикстуры
-  → патология не воспроизводилась. Healthcheck обманут (контейнер «healthy» — процесс жив),
-  авто-rollback `deploy.yml` НЕ сработал (тихая деградация ≠ падение healthcheck). Поймано только
-  eyes-on §8 ssh-проверкой. **Откачено** (`c2ad02c`/`ffdc410`/`e190356` → known-good `918cac2`).
-  ФИКС (engine-dev): `next_seq` из ограниченного ХВОСТОВОГО скана — seek к концу файла и чтение
-  назад/последние N MB до последнего валидного фрейма, без загрузки всего сегмента в RAM; O(1) по
-  памяти. ARCHITECT: добавить прод-масштаб RED-оракул (open() на большом/многогиговом сегменте —
-  ограничение по памяти И времени старта), иначе анти-плацебо не ловит этот класс. Severity: BLOCKER
-  (регрессия прод-записи данных). Пока открыт — engine-dev part M-05 НЕ мержится повторно.
-
 ## Замечания reviewer'а M-05 (не блокирующие, 2026-07-11)
+- **RN-8** (fmt-гейт под-покрытие) `verify_M-05.sh` fmt-гейт проверяет только `journal+book`, не
+  `recorder` — из-за чего v2 recorder-файлы без trailing newline (`cargo fmt --all --check` FAIL)
+  прошли verify зелёным. Поймано reviewer'ом вручную (`cargo fmt --all`), engine-dev пофиксил
+  (`7db4479`). → architect: расширить fmt-гейт verify_M-05.sh на recorder. Также урок: verify-скрипт
+  milestone'а обязан fmt-check ВСЕ тронутые крейты, не подмножество.
 - **RN-4** (AUDIT sacred-файла) engine-dev правил `scripts/verify_M-05.sh` (architect/tester-owned,
   SACRED per scope-guard) в коммите `2a21b8c` (task #4). Правка УЗКАЯ: замена placeholder
   `echo PENDING J1 + FAIL++` на реальный прогон `run "J1 …" cargo test -p recorder --test
@@ -101,4 +88,14 @@
   sacred-файла dev-агентом.
 
 ## CLOSED
-- (пусто)
+- **TD-011** `scan_next_seq-full-segment-read-oom` (M-05 task#3) — **RESOLVED 2026-07-11**.
+  Инцидент: v1 `Journal::open()` делал `read_to_end` ВСЕГО сегмента (прод 2.65 GiB) в RAM на каждом
+  старте → recorder не писал (101% CPU, 2.48 GiB RAM, OOM-риск); юнит-RED на крошечных фикстурах не
+  поймал; healthcheck обманут; поймано eyes-on §8. Откачено (`c2ad02c`/`ffdc410`/`e190356`).
+  ФИКС (v2, `a356c81`): `scan_tail_for_last_seq` — читает последние ≤4 MiB (seek+read_exact),
+  `next_seq = max(meta, tail+1)`, O(1) память. Верификация: (а) architect RED-оракул
+  `red_open_bounded.rs` (64 MiB + counting-allocator, бюджет 8 MiB) GREEN; (б) reviewer НЕЗАВИСИМЫЙ
+  прод-масштаб харнес (2.94 GiB): open()=4 ms, max RSS 6 MiB, next_seq корректен; (в) eyes-on §8 на
+  VPS после merge/deploy: новый recorder пишет (CPU 0.53%, MEM 5.41 MiB, tail-scan реального 2.71 GiB
+  прод-сегмента → `next_seq=3467845`, сегмент растёт). Урок закреплён в `.claude/rules/testing.md`
+  (прод-масштаб RED для sacred I/O) + RN-8 (fmt-гейт под-покрытие).

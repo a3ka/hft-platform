@@ -26,24 +26,27 @@
 - **Проверено в проде (VPS):** Binance + Hyperliquid оба пишутся в персистентный журнал,
   реальные цены/стакан, seq монотонный, контейнер healthy, автодеплой работает.
 
-## Journal integrity (M-05 — engine-dev part MERGED затем REVERTED, прод-регрессия 2026-07-11; milestone IN_PROGRESS)
-**НЕ на main (откачено).** Tasks 2/3/4 (engine-dev) были смержены (cherry-pick
-`8ce39a6`/`774efc9`/`2a21b8c`, push `1602735`), Deploy на VPS success — но **eyes-on прод-проверка
-(§8) поймала тихую деградацию**: recorder не писал журнал (0 байт роста за 15с, heartbeat заморожен),
-процесс 101% CPU / 2.48 GiB RAM. Причина — `scan_next_seq` (task#3) читает ВЕСЬ сегмент
-(`read_to_end`, прод = 2.65 GiB) в RAM + побайтовый скан на КАЖДОМ `Journal::open()`: на прод-масштабе
-блокирует старт writer-цикла на минуты и грозит OOM по мере роста журнала (3–7 дней). Юнит-RED (J2)
-использовал крошечные in-memory фикстуры → дефект не проявлялся. Healthcheck обманут («healthy»),
-авто-rollback не сработал (это тихая деградация, не падение). reviewer откатил (`c2ad02c`/`ffdc410`/
-`e190356`) → recorder/journal возвращены к known-good `918cac2`; прод-запись восстановлена.
-- **Инцидент/блокер:** см. TD-011. Fix — engine-dev: `next_seq` из ОГРАНИЧЕННОГО хвостового скана
-  (seek к последним N MB / чтение назад до последнего валидного фрейма), без загрузки всего сегмента
-  в RAM; architect добавляет прод-масштаб RED-оракул (память/время open() на большом сегменте).
-- Ревью-факт: на чистом чекауте J1/J2/J3 были GREEN, anti-placebo подтверждён, fmt/clippy чисто —
-  но **зелёные юнит-тесты не поймали прод-масштаб** (урок: RED-оракулы sacred-пути журнала должны
-  включать large-segment кейс). См. RN-4..7 в TECH-DEBT.
-- **M-05 остаётся IN_PROGRESS:** engine-dev tasks 2/3/4 — назад в работу (fix scan_next_seq);
-  task 5 B1 (venue-dev) PENDING; task 6 (tester) после. TD-010 (REST limit=5000) остаётся открытым.
+## Journal integrity (M-05 — engine-dev part MERGED + прод-верифицирован 2026-07-11; milestone IN_PROGRESS)
+Tasks 2/3/4 (engine-dev) НА main (`a356c81`/`e8c3540`/`7db4479`, push `7db4479`), founder ★-authorized
+partial-merge (RN-5; B1 остаётся PENDING). Прошёл полный цикл: v1 откатан из-за TD-011 (full-segment
+`read_to_end` в `open()` → recorder не писал, 101% CPU/2.48 GiB); v2 — **ХВОСТОВОЙ tail-scan O(1)
+памяти**; reviewer НЕЗАВИСИМО перепроверил §8 на прод-масштабе (2.94 GiB синт-сегмент: open()=4 ms,
+max RSS 6 MiB, next_seq корректен) ДО merge, и eyes-on на VPS после deploy: **новый recorder пишет**
+(CPU 0.53%, MEM 5.41 MiB, сегмент растёт, `journal progress next_seq=3467845` — tail-scan реального
+2.71 GiB прод-сегмента отработал за ~секунды). TD-011 **RESOLVED**.
+- `crates/recorder` — `run_writer` select-seam в lib (юнит-тестируемый J1); `main` враппит SIGTERM/SIGINT
+  → ветка `shutdown` дрейнит буфер (`try_recv`) + `flush()` перед exit. Heartbeat wall-clock — в отдельный
+  `.heartbeat` файл, НЕ в journal-payload (детерминизм журнала сохранён).
+- `crates/journal` — `next_seq` при `open()` из `scan_tail_for_last_seq` (читает последние ≤4 MiB
+  сегмента, seek+read_exact, buf освобождается до write-open) = `max(meta, tail_seq+1)`; O(1) память,
+  нет reuse (J2/TD-011 GREEN на прод-масштабе). `recover()` — resync-толерантное чтение (offline CLI,
+  НЕ в горячем `open()`; полный read_to_end допустим только offline). `read_all` STRICT (Err на
+  CRC-mismatch) — DET-I-1 exact-replay не ослаблен.
+- **Урок (зафиксирован в `.claude/rules/testing.md`):** RED-оракул sacred I/O-пути ОБЯЗАН включать
+  прод-масштаб (арх-оракул `red_open_bounded.rs` — 64 MiB + counting-allocator бюджет 8 MiB); зелёные
+  юнит-тесты + Deploy-success ≠ рабочий прод — eyes-on §8 решающий. См. TD-011 (CLOSED), RN-4..8.
+- **M-05 остаётся IN_PROGRESS:** task 5 B1 (venue-dev, anti-phantom resnapshot) PENDING → `verify_M-05.sh`
+  exit=1 (только B1); task 6 (tester, verify exit 0) после B1. TD-010 (REST limit=5000) открыт.
 
 ## Движок бэктеста (M-04 «Research core» — РЕАЛИЗОВАНО, reviewer APPROVED 2026-07-10)
 Цепочка: architect → critic C-001 REJECT → фиксы `f02c418` → critic C-002 NOTE (все
