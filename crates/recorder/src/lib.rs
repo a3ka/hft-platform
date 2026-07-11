@@ -1,33 +1,84 @@
-//! recorder (lib) — тестируемый seam writer-цикла. M-05 SKELETON (architect).
+//! recorder (lib) — тестируемый seam writer-цикла. M-05 task 2 (engine-dev).
 //!
-//! Мотив (J1): сейчас единственный `journal.flush()` в `main.rs:112` срабатывает лишь
-//! при «все продюсеры ушли» (в проде не бывает); SIGTERM-хендлера нет → docker stop
-//! (SIGTERM→SIGKILL) убивает процесс посреди цикла → рваный фрейм + отставшая мета.
+//! Мотив (J1): раньше единственный `journal.flush()` в `main.rs:112` срабатывал лишь
+//! при «все продюсеры ушли» (в проде не бывает); SIGTERM-хендлера не было → docker stop
+//! (SIGTERM→SIGKILL) убивал процесс посреди цикла → рваный фрейм + отставшая мета.
 //!
-//! Фикс (M-05 task 2, engine-dev): вынести select!-цикл сюда, добавить `shutdown`-ветку
-//! и ДРЕЙН буфера + `flush()` перед выходом; `main` враппит SIGTERM в `shutdown`.
+//! Фикс: select!-цикл с явной `shutdown`-веткой → по сигналу ДРЕЙН буфера mpsc +
+//! `Journal::flush()` (seg+meta) + exit. `main` враппит SIGTERM/SIGINT в `shutdown`.
 //! Инъектируемый `shutdown: impl Future` делает clean-shutdown ЮНИТ-тестируемым (J1)
 //! без OS-сигналов.
 
 use std::future::Future;
 use std::path::PathBuf;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use contracts::EventKind;
+use contracts::{EventKind, SysEvent};
 use journal::Journal;
 use tokio::sync::mpsc;
 
-/// Writer-цикл: пишет события из `rx` в журнал; по `shutdown` ОБЯЗАН сдрейнить уже
-/// буферизованные события, `flush()` (seg+meta) и выйти чисто (без рваного фрейма,
-/// без потери/reuse seq). STUB — engine-dev (M-05 task 2). RED: tests/red_shutdown_j1.rs.
+/// Writer-цикл: пишет события из `rx` в журнал. По `shutdown` ОБЯЗАН сдрейнить уже
+/// буферизованные события (`try_recv` пока `Empty` или `Disconnected`), сделать
+/// финальный `Journal::flush()` (seg+meta) и выйти чисто — без рваного фрейма,
+/// без потери/reuse seq. `biased;` гарантирует приоритет shutdown над rx.recv().
 pub async fn run_writer(
-    rx: mpsc::Receiver<EventKind>,
-    journal: Journal,
+    mut rx: mpsc::Receiver<EventKind>,
+    mut journal: Journal,
     hb_path: PathBuf,
     shutdown: impl Future<Output = ()>,
 ) -> anyhow::Result<()> {
-    // STUB: игнорирует rx и shutdown, не пишет события. journal дропается → Drop::flush
-    // (пустой). J1 ждёт 150 событий на диске → RED.
-    let _ = (rx, hb_path, shutdown);
-    drop(journal);
+    use tokio::sync::mpsc::error::TryRecvError;
+
+    let mut count: u64 = 0;
+    let mut hb = tokio::time::interval(Duration::from_secs(10));
+    tokio::pin!(shutdown);
+
+    'outer: loop {
+        tokio::select! {
+            // biased: shutdown первым, чтобы стоп-сигнал не зависал за медленным rx.
+            biased;
+            _ = &mut shutdown => {
+                tracing::info!("shutdown signalled — drain+flush");
+                // Дрейн буфера канала. tx ещё может быть жив (supervisor-таски).
+                loop {
+                    match rx.try_recv() {
+                        Ok(kind) => {
+                            journal.append(kind)?;
+                            count += 1;
+                        }
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Disconnected) => break,
+                    }
+                }
+                journal.flush()?;
+                tracing::info!(events = count, "shutdown clean");
+                break 'outer;
+            }
+            maybe = rx.recv() => match maybe {
+                Some(kind) => {
+                    journal.append(kind)?;
+                    count += 1;
+                    if count.is_multiple_of(1000) {
+                        journal.flush()?;
+                        tracing::info!(events = count, next_seq = journal.next_seq(), "journal progress");
+                    }
+                }
+                None => {
+                    tracing::warn!("all producers gone — writer exit");
+                    break 'outer;
+                }
+            },
+            _ = hb.tick() => {
+                journal.append(EventKind::Sys(SysEvent::Heartbeat))?;
+                journal.flush()?;
+                let now_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+                let _ = std::fs::write(&hb_path, now_ms.to_string());
+                tracing::debug!(events = count, "heartbeat");
+            }
+        }
+    }
+
+    journal.flush()?;
     Ok(())
 }

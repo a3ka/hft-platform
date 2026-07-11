@@ -3,6 +3,9 @@
 //!
 //! Конфиг через env: JOURNAL_DIR, BINANCE_SYMBOLS (csv, e.g. BTCUSDT,ETHUSDT),
 //! HL_COINS (csv, e.g. BTC,ETH). Reconnect — внутри venue::run; здесь supervisor + backoff.
+//!
+//! M-05 (engine-dev): SIGTERM/SIGINT → `shutdown` future → `run_writer` дренит mpsc +
+//! flush перед exit (J1 — clean-shutdown).
 
 use std::future::Future;
 use std::path::PathBuf;
@@ -40,6 +43,40 @@ where
     }
 }
 
+/// Future, который резолвится по первому из SIGTERM / SIGINT (Unix) или Ctrl-C (fallback).
+/// M-05 task 2 (engine-dev): даёт writer'у шанс сдрейнить буфер + flush до выхода.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigterm = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(error = %e, "SIGTERM handler install failed — falling back to ctrl_c");
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+        let mut sigint = match signal(SignalKind::interrupt()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(error = %e, "SIGINT handler install failed — falling back to ctrl_c");
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = sigterm.recv() => tracing::info!("SIGTERM received — initiating clean shutdown"),
+            _ = sigint.recv()  => tracing::info!("SIGINT received — initiating clean shutdown"),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        tracing::info!("Ctrl-C received — initiating clean shutdown");
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -58,7 +95,7 @@ async fn main() -> anyhow::Result<()> {
         schema_version = contracts::SCHEMA_VERSION, "recorder start"
     );
 
-    let (tx, mut rx) = mpsc::channel::<EventKind>(50_000);
+    let (tx, rx) = mpsc::channel::<EventKind>(50_000);
 
     {
         let (tx_b, syms) = (tx.clone(), binance_symbols.clone());
@@ -81,34 +118,9 @@ async fn main() -> anyhow::Result<()> {
     drop(tx); // writer завершится, только если все продюсеры уйдут (в норме не уходят).
 
     // Единственный писатель — журнал в этой задаче.
-    let mut journal = Journal::open(&dir)?;
+    let journal = Journal::open(&dir)?;
     let hb_path = dir.join("recorder.heartbeat");
-    let mut count: u64 = 0;
-    let mut hb = tokio::time::interval(Duration::from_secs(10));
 
-    loop {
-        tokio::select! {
-            maybe = rx.recv() => match maybe {
-                Some(kind) => {
-                    journal.append(kind)?;
-                    count += 1;
-                    if count.is_multiple_of(1000) {
-                        journal.flush()?;
-                        tracing::info!(events = count, next_seq = journal.next_seq(), "journal progress");
-                    }
-                }
-                None => { tracing::warn!("all producers gone — writer exit"); break; }
-            },
-            _ = hb.tick() => {
-                journal.append(EventKind::Sys(SysEvent::Heartbeat))?;
-                journal.flush()?;
-                let now_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
-                let _ = std::fs::write(&hb_path, now_ms.to_string());
-                tracing::debug!(events = count, "heartbeat");
-            }
-        }
-    }
-    journal.flush()?;
+    recorder::run_writer(rx, journal, hb_path, shutdown_signal()).await?;
     Ok(())
 }
