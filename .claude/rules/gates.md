@@ -72,6 +72,14 @@ Reviewer не пропускается НИКОГДА для substantive-изм�
 ложноположительный risk-gate или пропуск в oms стоит депозита — асимметрия хуже, чем
 лишний цикл ревью.
 
+**MD-only carve-out (закреплено 2026-07-11, M-06):** venue-* адаптер, читающий ТОЛЬКО
+рыночные данные (WS/REST → нормализация → `MdEvent`, БЕЗ order-egress — никаких
+submit/cancel/подписи торговых действий), НЕ требует risk-critic — достаточно reviewer.
+risk-critic ОБЯЗАТЕЛЕН, как только venue-* код трогает ORDER-путь (submit/cancel/auth
+торговли). Причина: асимметричная цена ошибки живёт на пути к деньгам (ордера), а не на
+read-only MD-приёмнике. Reviewer в Block-scope подтверждает, что диф действительно MD-only
+(нет order-egress) — иначе RISK-BLOCK применяется полностью.
+
 - risk-critic пишет вердикт в `research/critiques/C-NNN.md` (KILL | CONCERNS | PASS).
 - KILL/CONCERNS блокирует merge до устранения находок или явного founder-override
   с именованным обоснованием.
