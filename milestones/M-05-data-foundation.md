@@ -72,3 +72,33 @@ Ground-truth (resync-сканер architect'а по прод-сегменту): 
 ## Handoff
 architect (RED+милестоун) → critic (DET-чувствительно) → engine-dev(2,3,4)‖venue-dev(5) →
 tester(6) → reviewer. Параллельно: CT-RFC-01 (расширение типов данных) — отдельный трек.
+
+## Amendment 2026-07-11 (founder «делай п.1»; architect design-close)
+
+Решения приняты (по рекомендации architect, founder «1»):
+- **recorder → lib+bin** (J1 seam). Приземлено: `recorder/src/lib.rs::run_writer(rx, journal,
+  hb, shutdown: impl Future)` skeleton + RED `tests/red_shutdown_j1.rs` (runtime-RED, контракт
+  clean-shutdown = drain буфера + flush). engine-dev выносит select!-цикл из `main.rs:89-113`
+  + врап SIGTERM.
+- **derive крейт** (C5, M-06): чистые downstream-агрегаты; funding_breadth + RED. GREEN — research-dev.
+
+**B1 ПЕРЕОРИЕНТИРОВАН (по чтению `venue-binance/src/lib.rs`).** Найдено: diff-sync ведёт
+continuity `U==last+1` и инвалидирует+ре-снапшотит на разрыве; `book::apply_snapshot`
+(`book/src/lib.rs:25-27`) уже REPLACE (clear+insert). Значит «фантомная ликвидность» —
+СЛАБЫЙ риск (пропуск cancel без gap протокол не даёт). Реальный риск глубоких полос —
+**undercount**: REST `limit=5000` (`lib.rs:24`) достаёт лишь ~top-5000 уровней; глубже —
+пусто на бутстрапе, пока по уровню не пройдёт дифф (само-заживает для АКТИВНЫХ уровней;
+ре-снапшот НЕ чинит — REST max 5000).
+
+Следствие:
+1. **Тестируемый инвариант B1 (unit) ОТЛОЖЕН до seam:** «gap-инвалидация → полная замена
+   книги (нет stale-переноса)». venue-binance book-maintainer приватен (`struct OrderBook`
+   `lib.rs:37`); нужен testable seam (pub(crate) + тест-доступ) — СО-ДИЗАЙН с venue-dev,
+   чтобы RED совпал с их рефактором (не плодим placebo под выдуманный API).
+2. **Лимитация limit=5000 (→ reviewer TECH-DEBT):** глубокие полосы 15-60% недосчитываются
+   на бутстрапе. Решить митигацию: (а) многостраничный REST/иной источник глубины,
+   (б) принять undercount (diff само-заживает активные уровни), (в) диагностик-сверка
+   поддерживаемой книги vs свежий REST на глубине. Это ВОПРОС ДАННЫХ, не баг кода.
+
+Итог п.1: C5 ✓, J1 ✓ (RED landed); B1 — design-closed (инвариант + лимитация
+специфицированы; unit-RED ждёт venue-dev seam, осознанно НЕ форсирую placebo).
