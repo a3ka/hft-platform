@@ -21,7 +21,7 @@ MdPayload::{OpenInterest,Liquidation,MarginRate}. Гейты: critic не тре
 | architect | `milestones/M-06-*.md`, `crates/*/tests/**` (RED), `crates/venue-binance-futures/` СКЕЛЕТ (Cargo.toml+lib-стаб+RED, по образцу M-04 task 1), `scripts/verify_M-06.sh` | impl-парсеры/поллер |
 | venue-dev | `crates/venue-binance-futures/src/**` (fstream depth+OI+liquidations+funding парсеры), `crates/venue-binance/src/**` (если futures-режим встраивается), consumer-arm'ы в своих venue-крейтах | tests, contracts |
 | engine-dev | `crates/recorder/src/**` (poller-компонент: REST cadence фикс.конфиг → журнал), `crates/sim/src/exchange.rs` (explicit ignore-arm новых payload'ов) | tests, contracts, risk |
-| research-dev | `crates/research-cli/src/**` (latency_probe match-arm'ы; funding-breadth DERIVE-утилита downstream) | tests, contracts |
+| research-dev | `crates/research-cli/src/**` (latency_probe match-arm'ы) + `crates/derive/src/**` (funding-breadth DERIVE, отдельный крейт) | tests, contracts |
 | signal-engineer | `crates/signals/src/obi.rs` (explicit ignore-arm) | tests |
 | все dev | — | `crates/contracts/**`, `*/tests/**`, `scripts/**` |
 
@@ -32,7 +32,7 @@ MdPayload::{OpenInterest,Liquidation,MarginRate}. Гейты: critic не тре
 | 2 | ⏳ | `venue-binance-futures` скелет (architect) → парсеры: fstream `@depth@100ms`+`/fapi/v1/depth` (L2Snapshot, Venue::BinanceFutures); `@forceOrder` → Liquidation; `!markPrice@arr`/`premiumIndex` → Funding | architect(скелет+RED)→venue-dev | C2-RED GREEN |
 | 3 | ⏳ | OI: `/fapi/v1/openInterest` (+`openInterestHist`) → MdPayload::OpenInterest | venue-dev | C3-RED GREEN |
 | 4 | ⏳ | recorder-poller: REST-источники (funding all-perps `premiumIndex` 1 вызовом; OI) с фикс.cadence-конфигом → журнал с ts_exch | engine-dev | poller пишет события, cadence детерминирован |
-| 5 | ⏳ | funding-breadth top-300 (%+/−) — DERIVE-утилита downstream (research-cli/book), НЕ T1; ранжирование по OI/volume | research-dev | breadth считается из потока Funding детерминированно |
+| 5 | ⏳ | funding-breadth top-300 (%+/−) — DERIVE в крейте `derive`, НЕ T1; ранжирование по OI/volume | research-dev | breadth считается из потока Funding детерминированно |
 | 6 | ⏳ | `scripts/verify_M-06.sh` exit=0 | tester | exit=0 |
 
 MarginRate impl — **Tier-3, ОТЛОЖЕН** (нужны ключи/3rd-party; тип уже в T1, продюсер позже).
@@ -45,7 +45,7 @@ MarginRate impl — **Tier-3, ОТЛОЖЕН** (нужны ключи/3rd-party;
   **C-003 note:** side = ЛИКВИДИРУЕМАЯ сторона, НЕ агрессор — иначе CVD/liq-flow инвертирует знак.
 - **C2b** futures `@depth` → L2Snapshot с Venue::BinanceFutures; глубина полос вычислима.
 - **C3 `open_interest_parse`** — сырой openInterest JSON → MdPayload::OpenInterest{oi_e8}.
-- **C5 `funding_breadth_derive_deterministic`** (`crates/research-cli/tests/`) — из фикс.
+- **C5 `funding_breadth_derive_deterministic`** (`crates/derive/tests/`) — из фикс.
   набора Funding-событий top-N breadth детерминирован (одинаковый вход → одинаковый %).
 
 Анти-плацебо: каждый RED падает на заглушке/до импла.
