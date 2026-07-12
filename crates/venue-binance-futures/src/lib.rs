@@ -319,10 +319,15 @@ struct OrderBook {
     last_event_time_ms: i64,
 }
 
-/// Один WS `@depth@100ms` diff (fstream формат идентичен spot: `U`/`u` update IDs,
-/// `b`/`a` — массивы `[price, qty]`-пар). `size==0` — удалить уровень.
+/// Один WS `@depth@100ms` diff (fstream формат для USDT-M FUTURES). Поля:
+/// `pu` (previous final update id) — ЧЕЙНИТСЯ на book.last_update_id (==) и определяет
+/// continuity (per Binance USD-M docs); `U`/`u` — update-id'ы ВНУТРИ diff'а, МОГУТ
+/// ПРЫГАТЬ (не +1) — потому СПОТ-правило `u_first == last+1` НЕПРИМЕНИМО.
+/// `b`/`a` — массивы `[price, qty]`-пар. `size==0` — удалить уровень.
+/// `pu` обязателен в fstream-payload (отсутствие = malformed → Skip).
 struct DepthDiff {
     event_time_ms: i64,
+    pu: u64,
     u_first: u64,
     u_final: u64,
     bids: Vec<(i64, i64)>,
@@ -358,8 +363,8 @@ enum DiffAction {
     /// Книга ещё не синхронизирована — буферизовать, запросить снапшот если ещё не в
     /// процессе.
     Buffer,
-    /// Разрыв непрерывности (`U != last_update_id + 1`) — книга инвалидируется,
-    /// пере-синхронизация с нуля.
+    /// Разрыв непрерывности (`pu != last_update_id` для FUTURES) — книга инвалидируется,
+    /// пере-синхронизация с нуля. (Исторически было спот-правило `U != last+1`; см. TD-014 T2.)
     Gap,
     /// Апдейт непрерывен — применить к книге.
     Apply,
@@ -494,9 +499,14 @@ impl FuturesSession {
                 let action = match &state.book {
                     None => DiffAction::Buffer,
                     Some(book) => {
+                        // TD-014 T2 FIX (continuity = pu, не спот u_first+1): FUTURES-правило
+                        // `pu == book.last_update_id` → Apply; иначе → Gap. СПОТ-правило
+                        // `u_first == last+1` ложно флагает валидные futures-jump'ы как gap
+                        // (U/u ПРЫГАЮТ у perp, чейн через `pu`) → вечный resync churn → sparse
+                        // L2 + 429-ban + 0 Funding downstream.
                         if diff.u_final <= book.last_update_id {
                             DiffAction::Skip
-                        } else if diff.u_first != book.last_update_id + 1 {
+                        } else if diff.pu != book.last_update_id {
                             DiffAction::Gap
                         } else {
                             DiffAction::Apply
@@ -620,7 +630,17 @@ impl FuturesSession {
             }
         };
 
-        // Reconcile-loop: применять buffered diff'ы, пока они contiguous с `last_update_id`.
+        // Reconcile-loop: применять buffered diff'ы, пока они contiguous с `last_update_id`
+        // снапшота. TD-014 T2 FIX: для STEADY-STATE (on_ws_text) continuity = pu (== last),
+        // но для RECONCILE-LOOP правило ЛЕНЬЕЕЕ — Binance-стиль `U <= lastUpdateId+1 AND
+        // u >= lastUpdateId+1` (мы имеем snapshot как fallback, можем быть снисходительнее):
+        //  • DROP: `u_final <= L` (diff полностью покрыт снапшотом);
+        //  • STALE: `u_first > L+1` (diff начинается ПОСЛЕ gap'а от снапшота — не bridge'нуть,
+        //    сервер/VENUE race; refetch с backoff);
+        //  • APPLY: иначе (`u_first <= L+1`, diff contiguous или перекрывает snapshot).
+        // После первого apply `last_update_id` двигается на `u_final`, и последующие diff'ы
+        // проверяются по той же схеме (что для валидных futures diff'ов с `U == pu+1`
+        // вырождается в `pu == previous u` — FUTURES-continuity).
         loop {
             let front = state.pending.front().map(|d| (d.u_final, d.u_first));
             let Some((u_final, u_first)) = front else {
@@ -631,13 +651,15 @@ impl FuturesSession {
                 return effects;
             };
             if u_final <= book.last_update_id {
+                // DROP: diff полностью покрыт снапшотом (мы уже знаем эти updates).
                 state.pending.pop_front();
                 continue;
             }
             if u_first > book.last_update_id + 1 {
-                // Stale: снапшот отстал от буфера diff'ов — сетевой/венюный race, НЕ
-                // server rate-limit (Retry-After нерелевантен), backoff всё равно
-                // применяем (анти-hot-loop: не лупить REST до полного resync).
+                // STALE: diff стартует ПОСЛЕ gap'а от снапшота (`U > L+1` в Binance-терминах)
+                // — не bridge'нуть: между `L+1` и `u_first-1` неизвестные updates.
+                // Сетевой/венюный race, НЕ server rate-limit (Retry-After нерелевантен),
+                // backoff всё равно применяем (анти-hot-loop: не лупить REST до полного resync).
                 tracing::warn!(
                     symbol = %symbol,
                     "venue-binance-futures: snapshot stale vs buffered diffs, refetching with backoff"
@@ -650,10 +672,9 @@ impl FuturesSession {
                 });
                 return effects;
             }
-            // u_first <= last_update_id+1 <= u_final: applicable.
+            // APPLY: diff contiguous или перекрывает snapshot (`u_first <= L+1`).
             // TD-014 FIX (a): `apply_diff_to_book` двигает `last_update_id`, поэтому
-            // НЕСКОЛЬКО contiguous diff'ов применяются подряд (без фикса 2-й diff
-            // был бы "stale" относительно снимка last_update_id, который НЕ двигался).
+            // НЕСКОЛЬКО contiguous diff'ов применяются подряд.
             let diff = state
                 .pending
                 .pop_front()
@@ -702,12 +723,16 @@ impl FuturesSession {
     }
 }
 
-/// fstream `@depth@100ms` diff payload (формат идентичен spot): `U`/`u` + `b`/`a`.
+/// fstream `@depth@100ms` diff payload (FUTURES формат): `pu` (previous final update id,
+/// обязателен) + `U`/`u` (update-id'ы внутри diff'а, МОГУТ ПРЫГАТЬ) + `b`/`a`.
+/// `pu` — ЯКОРЬ continuity для FUTURES (чейн на book.last_update_id), см. TD-014 T2.
 fn parse_depth_diff(stream: &str, data: &Value) -> Option<(String, DepthDiff)> {
     let symbol = match data.get("s").and_then(|v| v.as_str()) {
         Some(s) => s.to_string(),
         None => stream.split('@').next()?.to_uppercase(),
     };
+    // `pu` обязателен для USDT-M futures (отсутствие = malformed → None, fail-closed).
+    let pu = data.get("pu")?.as_u64()?;
     let u_first = data.get("U")?.as_u64()?;
     let u_final = data.get("u")?.as_u64()?;
     let bids = parse_diff_levels(data.get("b")?)?;
@@ -717,6 +742,7 @@ fn parse_depth_diff(stream: &str, data: &Value) -> Option<(String, DepthDiff)> {
         symbol,
         DepthDiff {
             event_time_ms,
+            pu,
             u_first,
             u_final,
             bids,
