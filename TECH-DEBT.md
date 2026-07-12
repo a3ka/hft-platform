@@ -49,7 +49,7 @@
   достоверности данных, не риск ордер-пути; MD-only).
 
 - **TD-013** `binance-futures-rest-resnapshot-no-backoff-418-ban` (M-06 venue-binance-futures,
-  **BLOCKING #4**, ОТКРЫТА 2026-07-11). **Прод-регрессия, поймана §8 eyes-on** (класс TD-011:
+  **ФИКС MERGED inert 2026-07-12, closes при §8 реленда #4**). **Прод-регрессия, поймана §8 eyes-on** (класс TD-011:
   зелёные юниты + Deploy-success замаскировали). При wire BinanceFutures в recorder (#4,
   `2eee4bf`) futures-адаптер на ЖИВОМ прод-трафике попал в hot-loop REST-ресинка: депт-книга не
   бутстрапится, `fetch_snapshot` (`/fapi/v1/depth?limit=1000`) отдаёт **HTTP 418 "I'm a teapot"**
@@ -68,6 +68,23 @@
   CPU 0.99%, seg растёт, hb свежий). Связано с TD-012 (тот же limit=1000, но это completeness;
   TD-013 — корректность/rate ресинка). Severity: MAJOR (была live прод-регрессия + exchange-abuse;
   сейчас блокирует реленд #4).
+  **ФИКС (MERGED inert `cc4f529`, reviewer APPROVED 2026-07-12):** architect RED `449bb38`
+  (`tests/red_backoff.rs`) → venue-dev `cc4f529` — чистая политика `pub struct Backoff`
+  (`next_delay(Option<Retry-After>)`: BASE 100ms, exp ×2, cap 5мин, honor cooldown; `reset()` на
+  success), wire'нута в `handle_snapshot`: на fail/stale → `next_delay` → **реальный
+  `tokio::time::sleep(delay).await` внутри `make_snapshot_future` ПЕРЕД `fetch_snapshot`**; на
+  success → `reset()`. `fetch_snapshot` мапит 418→120s/429→10s cooldown (или `Retry-After` header)
+  ДО `error_for_status` → hot-loop рвётся на первом 418. **Reviewer-верификация анти-плацебо (RED
+  тестит только политику, НЕ await):** код-рид подтвердил РЕАЛЬНЫЙ sleep в I/O-future (не
+  сконструированный-и-забытый Backoff); sleep суспендит только futures символа, не runner. Все
+  тесты + workspace GREEN, fmt/clippy clean. **ОСТАЁТСЯ:** (1) реленд #4 (engine-dev, re-apply
+  `2eee4bf`) → ПОЛНЫЙ §8 eyes-on LIVE-проверка (418-backoff реально работает: cooldown-sleeps,
+  книга бутстрапится, futures L2Snapshot в журнал) — ТОЛЬКО тогда TD-013 CLOSED; (2) **RN-10
+  (jitter, NOTE):** джиттер decorrel'ации hammering'а НЕ добавлен — спека RED-оракула его не требует
+  (политика детерминирована, джиттер = забота I/O-caller). При 2 символах + 418→120s cooldown
+  риск синхронного hammering'а низкий. Если нужен ±jitter — потребует rand/fastrand в
+  venue-binance-futures `[dependencies]` (own-crate, formally allowed) + покрытие; отдельная
+  мелкая задача, не блокер реленда.
 
 ## Замечания reviewer'а M-06 #4 (2026-07-11)
 - **RN-9** (§8 eyes-on поймал то, что все зелёные гейты пропустили — снова) Code-review A+B

@@ -73,9 +73,26 @@ recorder БЕЗ изменений (CPU 0.79%, MEM 5.6 MiB, сегмент ра�
   MEM 5.22 MiB, seg растёт +133KB/12s, hb свежий, 0 restarts). Заведён **TD-013 (BLOCKING #4,
   MAJOR)**. Реленд #4 — после фикса TD-013 (architect RED backoff-оракул → venue-dev impl → re-apply
   `2eee4bf`). Урок TD-011 подтверждён 3-й раз (RN-9).
+- **TD-013 фикс (Backoff) — MERGED inert, reviewer APPROVED 2026-07-12.** Цепочка реленда:
+  architect RED `449bb38` (`tests/red_backoff.rs` — политика `Backoff::next_delay`/`reset`: ≥100ms
+  первый ретрай, exp-рост, cap 5мин, honor Retry-After, reset на success) → venue-dev `cc4f529`
+  (impl + wiring в `handle_snapshot`). Reviewer подтвердил **анти-плацебо WIRING** (ключевой риск:
+  RED тестит ТОЛЬКО чистую политику, НЕ I/O-await): `make_snapshot_future(.., Some(delay))` делает
+  **РЕАЛЬНЫЙ `tokio::time::sleep(delay).await` ПЕРЕД `fetch_snapshot`** (не сконструированный-но-
+  проигнорированный Backoff); `fetch_snapshot` распознаёт 418→120s/429→10s cooldown ДО
+  `error_for_status` → hot-loop рвётся на первом 418. sleep суспендит только futures данного символа
+  (FuturesUnordered), не runner. red_backoff + red_parse/red_funding/red_resnapshot все GREEN,
+  workspace GREEN, fmt/clippy clean. **INERT** (recorder НЕ зависит от venue-binance-futures на
+  этом merge — dep реверта #4 отсутствует; Backoff-код недостижим из recorder). §8 inert-safety
+  на VPS: recorder БЕЗ изменений (spot+HL only, 0 futures/418, CPU 0.64%, MEM 5.4 MiB, seg
+  +98KB/8s, hb ~10s cadence свежий, 0 restarts). Джиттер НЕ добавлен (спека оракула его не требует;
+  политика детерминирована) — NOTE в TD-013, не блокер.
 - **M-06 остаётся IN_PROGRESS:** #1 (blast-radius compile — на main workspace компилируется),
-  #4 (РЕВЕРТНУТ выше — gated на TD-013), #6 verify_M-06.sh exit 0 (tester, после #4). Data-quality
-  долг: TD-012 (futures REST depth limit=1000 undercount), TD-013 (futures ресинк no-backoff → 418).
+  **#4 РЕЛЕНД pending (engine-dev): re-apply `2eee4bf` поверх `cc4f529` → прод-поведенческое →
+  ПОЛНЫЙ §8 eyes-on (проверить: 418-backoff работает LIVE — sleeps/cooldown, книга бутстрапится,
+  futures L2Snapshot/OI/Funding в журнал, CPU/MEM в норме)**, #6 verify_M-06.sh exit 0 (tester,
+  после #4). Data-quality долг: TD-012 (futures REST depth limit=1000 undercount). TD-013 —
+  fix merged inert, closes при успешном §8 реленда #4.
 
 ## Движок бэктеста (M-04 «Research core» — РЕАЛИЗОВАНО, reviewer APPROVED 2026-07-10)
 Цепочка: architect → critic C-001 REJECT → фиксы `f02c418` → critic C-002 NOTE (все
