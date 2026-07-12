@@ -568,13 +568,21 @@ impl FuturesSession {
 
         let mut book = match result {
             Ok(json) => match parse_snapshot_for_book(&json) {
-                Some((last_update_id, bids, asks)) => {
+                Some((last_update_id, ts_exch_ms, bids, asks)) => {
                     let mut fb = FuturesDepthBook::new();
                     fb.apply_snapshot(&bids, &asks);
                     OrderBook {
                         book: fb,
                         last_update_id,
-                        last_event_time_ms: 0,
+                        // TD-014 v2 FIX (recovery-sync): pre-populate `last_event_time_ms`
+                        // из `T` снапшота (fallback `E`, иначе 0). Если буфер-diff'ы
+                        // applied в reconcile — `apply_diff_to_book` перезапишет их
+                        // более свежим `diff.event_time_ms`. Если буфер пуст/DROP'нут
+                        // (recovery-снапшот впереди буфера) — `ts_exch_ms` снапшота
+                        // остаётся, и `tick()` эмитит L2 (а не пропускает по gate'у
+                        // «нет биржевого времени»). Live: после gap+stale+recovery книга
+                        // остаётся с `last_event_time_ms=0` → вечный 0 L2 в журнале.
+                        last_event_time_ms: ts_exch_ms,
                     }
                 }
                 None => {
@@ -730,16 +738,21 @@ fn parse_diff_levels(levels: &Value) -> Option<Vec<(i64, i64)>> {
     Some(out)
 }
 
-/// Распарсить snapshot JSON → `(lastUpdateId, bids, asks)` для `OrderBook`. Битая/неполная
-/// форма → `None`. `bids`/`asks` проходят через `apply_snapshot`, который фильтрует
-/// `size<=0` (битые уровни) на insert-стадии — потому зеркалит поведение старого
-/// `fetch_snapshot`.
-fn parse_snapshot_for_book(json: &str) -> Option<(u64, Vec<Level>, Vec<Level>)> {
+/// Распарсить snapshot JSON → `(lastUpdateId, ts_exch_ms, bids, asks)` для `OrderBook`.
+/// `ts_exch_ms` — поле `T` (transact-time снапшота; primary, как в `parse_depth_snapshot`),
+/// fallback `E` (event-time диспатча), иначе `0`. Битая/неполная форма → `None`. `bids`/`asks`
+/// проходят через `apply_snapshot`, который фильтрует `size<=0` (битые уровни) на insert-стадии.
+fn parse_snapshot_for_book(json: &str) -> Option<(u64, i64, Vec<Level>, Vec<Level>)> {
     let v: Value = serde_json::from_str(json).ok()?;
     let last_update_id = v.get("lastUpdateId")?.as_u64()?;
+    let ts_exch_ms = v
+        .get("T")
+        .and_then(|t| t.as_i64())
+        .or_else(|| v.get("E").and_then(|t| t.as_i64()))
+        .unwrap_or(0);
     let bids = parse_l2_levels(v.get("bids")?)?;
     let asks = parse_l2_levels(v.get("asks")?)?;
-    Some((last_update_id, bids, asks))
+    Some((last_update_id, ts_exch_ms, bids, asks))
 }
 
 fn apply_diff_to_book(book: &mut OrderBook, diff: &DepthDiff) {
