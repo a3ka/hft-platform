@@ -107,6 +107,16 @@
   depth + markPrice + REST snapshot/backoff сценарии, стабильно эмитить L2Snapshot и Funding после
   resync/backoff, без hot-loop и без starvation markPrice path. Затем venue-dev fix → engine-dev
   reland #4 → reviewer full §8. Severity: MAJOR (prod behavior blocker, no order-path impact).
+  **LIVE RELAND-2 RESULT (`af7725f` over `595fc24`, 2026-07-12):** TD-014 fix attempt added
+  `FuturesSession` seam + `run()` delegation and local `red_live_emit` passed; reviewer static check
+  confirmed live path delegates WS text / snapshot result / tick through the seam (no obvious parallel
+  untested runner path). Local gates all GREEN: `red_futures_wired`, `venue-binance-futures` 7/7,
+  workspace tests, fmt/clippy, `verify_M-06.sh` PASS exit=0. Pre-merge §8 on VPS still NOT GREEN:
+  journal tail since deploy had `BinanceFutures` ConnUp and OpenInterest=16 with `seq_gaps=0`, but
+  **0 `BinanceFutures.L2Snapshot` and 0 `BinanceFutures.Funding`**; logs showed repeated
+  `depth continuity gap detected`, `snapshot stale vs buffered diffs`, and 429 backoff. Candidate was
+  not merged; VPS restored to `origin/main` `2bbcbd7` and rechecked healthy, spot+HL only. Current
+  RED/live oracle missed this production mode; TD-014 remains OPEN/BLOCKING.
 
 ## Замечания reviewer'а M-06 #4 (2026-07-11)
 - **RN-9** (§8 eyes-on поймал то, что все зелёные гейты пропустили — снова) Code-review A+B
@@ -125,6 +135,11 @@
   не доходят до journal. Урок: RED #4 `default_venues` wiring достаточен для engine-dev contract,
   но не покрывает venue-runner liveness. Следующий RED должен быть не только "recorder wires
   BinanceFutures", а "futures runner under resync/backoff emits depth+funding".
+- **RN-12** (§8 reland-2 oracle miss) `red_live_emit` + `FuturesSession` seam closed an obvious
+  anti-placebo gap, but still did not model the live Binance sequence that keeps the adapter in
+  gap/stale/backoff with 429 and no L2/Funding emission. Static delegation proof is necessary but
+  insufficient; next chain must make the liveness oracle reproduce this prod failure mode before
+  another #4 reland.
 
 ## Замечания reviewer'а M-05 (не блокирующие, 2026-07-11)
 - **RN-8** (fmt-гейт под-покрытие) `verify_M-05.sh` fmt-гейт проверяет только `journal+book`, не

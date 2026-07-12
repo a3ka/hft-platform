@@ -99,11 +99,25 @@ recorder БЕЗ изменений (CPU 0.79%, MEM 5.6 MiB, сегмент ра�
   Funding из `!markPrice@arr` не rare-event, поэтому это не §8-GREEN. Реверт `e6b4a75` + `d819cc3`;
   main снова inert-safe: VPS HEAD `d819cc3`, spot+HL only, 0 futures/418, hb age 8s, segment +60KB/5s,
   CPU ~0.7-5%, MEM ~5.8 MiB, restarts=0. Открыт **TD-014 (BLOCKING #4)**.
+- **TD-014 fix + #4 RELAND-2 — REJECTED (§8 live NOT GREEN, 2026-07-12).**
+  Цепочка `0f924dc` RED `red_live_emit` → `595fc24` FuturesSession seam/run() delegation →
+  `3d9c214` RED recorder wiring → `af7725f` engine-dev reland прошла локально:
+  `red_futures_wired` PASS, `venue-binance-futures` 7/7 PASS, workspace tests PASS,
+  fmt/clippy clean, `verify_M-06.sh` PASS exit=0. Static review подтвердил: `run()` реально
+  делегирует WS/snapshot/tick через `FuturesSession`, recorder wiring итерационный,
+  `supervise()` не тронут, diff MD-only. Но pre-merge §8 deploy на VPS показал: 3 `venue connect`
+  строки есть, `BinanceFutures` ConnUp + OpenInterest пишутся, seq непрерывен (`seq_gaps=0`),
+  heartbeat свежий, CPU/MEM нормальные, restarts=0; **при этом live journal-tail с момента deploy:
+  0 `BinanceFutures.L2Snapshot`, 0 `BinanceFutures.Funding`**. Логи продолжают цикл
+  `depth continuity gap detected` / `snapshot stale vs buffered diffs` / 429 backoff.
+  Это НЕ §8-GREEN; branch НЕ смержен. VPS восстановлен на `origin/main` `2bbcbd7`
+  (spot+HL only, no futures supervisor, healthy, hb age ~3s).
 - **M-06 остаётся IN_PROGRESS:** #1 (blast-radius compile — на main workspace компилируется),
   inert venue-futures / derive части на main, **#4 BLOCKED by TD-014** (live depth/funding emission
   after backoff; recorder wiring itself remains clean), #6 verify_M-06.sh exit 0 (tester) только после
-  успешного #4. Следующая цепочка: architect RED/live-equivalent oracle for futures bootstrap+funding
-  emission → venue-dev fix → engine-dev reland → reviewer full §8 → tester verify. Data-quality долг:
+  успешного #4. Следующая цепочка: architect RED/live-equivalent oracle stronger than current
+  `red_live_emit` production miss → venue-dev fix → engine-dev reland → reviewer full §8 → tester verify.
+  Data-quality долг:
   TD-012 (futures REST depth limit=1000 undercount). TD-013 anti-hot-loop live-verified, но milestone
   close-out не достигнут из-за TD-014.
 
