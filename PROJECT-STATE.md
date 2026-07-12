@@ -112,11 +112,22 @@ recorder БЕЗ изменений (CPU 0.79%, MEM 5.6 MiB, сегмент ра�
   `depth continuity gap detected` / `snapshot stale vs buffered diffs` / 429 backoff.
   Это НЕ §8-GREEN; branch НЕ смержен. VPS восстановлен на `origin/main` `2bbcbd7`
   (spot+HL only, no futures supervisor, healthy, hb age ~3s).
+- **TD-014 v2 + #4 reland `fac7c07` — REJECTED (§8 live NOT GREEN, 2026-07-12).**
+  Цепочка `71255c5` strong live-lifecycle RED + `fac7c07` recovery-snapshot T/E fix прошла
+  локально: `red_futures_wired` PASS, `venue-binance-futures` 7/7 PASS, workspace tests PASS,
+  fmt/clippy clean, `verify_M-06.sh` PASS exit=0; static review подтвердил MD-only и реальное
+  recorder wiring. Pre-merge deploy на VPS (`fac7c07`) стартовал 3 venue, был healthy,
+  heartbeat свежий, seq непрерывен (`seq_gaps=0`), OI писал. Но §8 journal-tail с deploy:
+  `BinanceFutures.L2Snapshot=16`, `OpenInterest=16`, **`Funding=0`**; L2 sparse, не ~1/s/symbol.
+  Логи за live-window: `depth continuity gap` 311, `snapshot stale` 44, `429` 18, CPU до 6.99%
+  на старте (позже ~1.2%). Это НЕ §8-GREEN; branch НЕ смержен. VPS восстановлен на
+  `origin/main` `3eff0db` (spot+HL only, no futures supervisor, healthy, hb age ~4.5s).
 - **M-06 остаётся IN_PROGRESS:** #1 (blast-radius compile — на main workspace компилируется),
   inert venue-futures / derive части на main, **#4 BLOCKED by TD-014** (live depth/funding emission
   after backoff; recorder wiring itself remains clean), #6 verify_M-06.sh exit 0 (tester) только после
   успешного #4. Следующая цепочка: architect RED/live-equivalent oracle stronger than current
-  `red_live_emit` production miss → venue-dev fix → engine-dev reland → reviewer full §8 → tester verify.
+  TD-014 v2 production miss (sparse L2 + 0 Funding + gap/stale/429 churn) → venue-dev fix →
+  engine-dev reland → reviewer full §8 → tester verify.
   Data-quality долг:
   TD-012 (futures REST depth limit=1000 undercount). TD-013 anti-hot-loop live-verified, но milestone
   close-out не достигнут из-за TD-014.

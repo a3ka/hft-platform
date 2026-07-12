@@ -117,6 +117,15 @@
   `depth continuity gap detected`, `snapshot stale vs buffered diffs`, and 429 backoff. Candidate was
   not merged; VPS restored to `origin/main` `2bbcbd7` and rechecked healthy, spot+HL only. Current
   RED/live oracle missed this production mode; TD-014 remains OPEN/BLOCKING.
+  **LIVE TD-014 v2 RESULT (`fac7c07` over `71255c5`, 2026-07-12):** stronger local lifecycle
+  oracle passed and reviewer confirmed the code path is still MD-only and recorder wiring is real.
+  Local gates all GREEN: `red_futures_wired`, `venue-binance-futures` 7/7, workspace tests,
+  fmt/clippy, `verify_M-06.sh` PASS exit=0. Pre-merge §8 on VPS still NOT GREEN: journal tail since
+  deploy had `BinanceFutures.L2Snapshot=16`, `OpenInterest=16`, `seq_gaps=0`, but
+  **`BinanceFutures.Funding=0`**; L2 was sparse rather than expected ~1/s/symbol. Logs during the
+  live window showed ongoing churn (`depth continuity gap` 311, `snapshot stale` 44, `429` 18);
+  initial CPU reached 6.99% before settling near 1.2%. Candidate was not merged; VPS restored to
+  `origin/main` `3eff0db` and rechecked healthy, spot+HL only. TD-014 remains OPEN/BLOCKING.
 
 ## Замечания reviewer'а M-06 #4 (2026-07-11)
 - **RN-9** (§8 eyes-on поймал то, что все зелёные гейты пропустили — снова) Code-review A+B
@@ -140,6 +149,10 @@
   gap/stale/backoff with 429 and no L2/Funding emission. Static delegation proof is necessary but
   insufficient; next chain must make the liveness oracle reproduce this prod failure mode before
   another #4 reland.
+- **RN-13** (§8 TD-014 v2 miss) `71255c5` strengthened the lifecycle oracle enough to make L2
+  nonzero in live, but not enough to satisfy product behavior: Funding stayed at 0, L2 cadence was
+  sparse, and the runner continued gap/stale/429 churn. Next oracle must cover the actual persisted
+  cadence and funding path under this churn, not only a deterministic recovery-snapshot unit path.
 
 ## Замечания reviewer'а M-05 (не блокирующие, 2026-07-11)
 - **RN-8** (fmt-гейт под-покрытие) `verify_M-05.sh` fmt-гейт проверяет только `journal+book`, не
