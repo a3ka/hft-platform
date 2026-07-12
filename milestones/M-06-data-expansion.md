@@ -106,3 +106,27 @@ amendment выше): N2 = корректность resync; limit=5000 = полн
 ### N4 — MD-only carve-out (закреплено в gates.md §5)
 `venue-*` MD-only (нет order-egress) → risk-critic НЕ нужен, reviewer подтверждает MD-only.
 Правило и milestone больше не противоречат.
+
+## Amendment 2026-07-12 (TD-013 — resync backoff; #4 откачен §8)
+
+Инцидент: #4 смёржен → §8 eyes-on поймал 418-ban (recorder hammering Binance) → REVERT
+(main b74449c inert-safe). Корень: `venue-binance-futures/src/lib.rs` — snapshot-fail и
+stale ветки НЕМЕДЛЕННО `pending_snapshots.push(make_snapshot_future(...))` без задержки →
+при 418/429 hot-loop.
+
+**Дизайн (architect, §4 — venue-dev реализует):** чистая политика `Backoff` (per-symbol):
+`new()` / `next_delay(&mut self, retry_after: Option<Duration>) -> Duration` (детерминир.:
+exp база × attempt, cap; НЕ меньше `retry_after` из 418/429 Retry-After/cooldown) / `reset()`
+(на success). Джиттер применяет async-вызывающий (I/O-boundary), НЕ эта политика (тестируема).
+
+**Wiring (venue-dev):** resync-путь консультирует `Backoff` — на fail/stale вычислить
+delay + ЖДАТЬ его перед re-push (delayed re-push / sleep); на успешном снапшоте `reset()`.
+Honor Retry-After. INITIAL-connect 418-толерантность (остаточный IP-cooldown после ban).
+
+**Оракул:** `tests/red_backoff.rs` (compile-RED, seam `Backoff`). Тестирует ПОЛИТИКУ (чистую);
+reviewer верифицирует WIRING (путь реально ждёт, не только конструирует Backoff); §8 —
+что hammering'а в проде нет (тот же паттерн seam+§8, что J1). risk-critic НЕ нужен (MD-only,
+read-side REST).
+
+**TD-013 (correctness/rate) ≠ TD-012 (completeness/limit=1000)** — разные фиксы.
+Цепочка реленда: architect(RED, здесь) → venue-dev(Backoff+wire) → engine-dev(reland #4 = re-apply 2eee4bf) → tester(#6).
