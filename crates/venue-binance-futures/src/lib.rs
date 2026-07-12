@@ -467,10 +467,34 @@ impl FuturesSession {
             } else {
                 tracing::debug!(raw = %raw, "venue-binance-futures: malformed forceOrder, skipping");
             }
+        } else if stream.ends_with("@markPrice") || stream.ends_with("@markPrice@1s") {
+            // TD-014 T3 FIX: per-symbol `<sym>@markPrice[/@1s]` (combined-stream fstream).
+            // `data` = ОДИНОЧНЫЙ markPriceUpdate объект (не array). Агрегированный
+            // `!markPrice@arr` на combined endpoint НЕ доставляется Binance'ом (live-capture:
+            // markPrice=0 при depth=139) → Funding=0 в журнале. Per-symbol форма надёжна.
+            // `parse_mark_price` уже понимает одиночный объект (поля `s`/`r`/`E`).
+            let raw = match serde_json::to_string(data) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::debug!(error = %e, "venue-binance-futures: failed to re-serialize per-symbol markPrice data");
+                    return effects;
+                }
+            };
+            if let Some(event) = parse_mark_price(&raw) {
+                if !self.symbol_set.contains(&event.symbol) {
+                    tracing::debug!(stream = %stream, sym = %event.symbol, "venue-binance-futures: per-symbol markPrice не в нашей выборке");
+                    return effects;
+                }
+                effects.push(SessionEffect::Emit(event));
+            } else {
+                tracing::debug!(raw = %raw, "venue-binance-futures: malformed per-symbol markPrice, skipping");
+            }
         } else if stream == "!markPrice@arr" {
-            // TD-014 FIX (b): !markPrice@arr → Funding эмитится ВНЕ зависимости от
-            // book-state (во время depth-resync не starve). Парсим каждый item,
-            // фильтруем по нашей выборке.
+            // TD-014 FIX (b): агрегированная array-форма (legacy / не-combined endpoint).
+            // На combined НЕ доставляется (см. T3), но оставлена для регрессии (оракул
+            // `red_live_funding.rs` assert'ит обе формы) — и для отдельных WS-сессий
+            // без depth (где `!markPrice@arr` работает). Парсим каждый item, фильтруем
+            // по нашей выборке.
             let Some(arr) = data.as_array() else {
                 tracing::debug!(stream = %stream, "venue-binance-futures: !markPrice@arr without array, skipping");
                 return effects;
@@ -889,13 +913,17 @@ type SnapshotFuture = Pin<Box<dyn Future<Output = (String, SnapshotResult)> + Se
 /// L2Snapshot bucketizing) живёт в seam'е и покрыта RED-тестом `tests/red_live_emit.rs`.
 /// «Верный рефактор текущей логики» оставил бы multi-diff-stale → оракул RED, форсит фикс.
 pub async fn run(tx: mpsc::Sender<EventKind>, symbols: Vec<String>) -> anyhow::Result<()> {
-    let mut streams = Vec::with_capacity(symbols.len() * 2 + 1);
+    let mut streams = Vec::with_capacity(symbols.len() * 3);
     for s in &symbols {
         let lower = s.to_lowercase();
         streams.push(format!("{lower}@depth@100ms"));
         streams.push(format!("{lower}@forceOrder"));
+        // TD-014 T3 FIX: PER-SYMBOL `<sym>@markPrice@1s` вместо агрегированного
+        // `!markPrice@arr`. На combined endpoint Binance НЕ доставляет `!markPrice@arr`
+        // вместе с per-symbol стримами (live-capture: markPrice=0 при depth=139 → 0
+        // Funding в журнале). Per-symbol форма надёжна в combined-stream.
+        streams.push(format!("{lower}@markPrice@1s"));
     }
-    streams.push("!markPrice@arr".to_string());
     let url = format!("{WS_BASE}{}", streams.join("/"));
 
     let (ws_stream, _response) = tokio_tungstenite::connect_async(&url).await?;
