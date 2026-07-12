@@ -87,12 +87,25 @@ recorder БЕЗ изменений (CPU 0.79%, MEM 5.6 MiB, сегмент ра�
   на VPS: recorder БЕЗ изменений (spot+HL only, 0 futures/418, CPU 0.64%, MEM 5.4 MiB, seg
   +98KB/8s, hb ~10s cadence свежий, 0 restarts). Джиттер НЕ добавлен (спека оракула его не требует;
   политика детерминирована) — NOTE в TD-013, не блокер.
+- **#4 reland после TD-013 — REJECTED / REVERTED (§8 live NOT GREEN, 2026-07-12).**
+  Reland `8b26d6c` (recorder dep `venue-binance-futures`, `default_venues()`, итерационный spawn
+  supervisor'ов; `supervise()` не тронут) прошёл локально RED `red_futures_wired` (1 passed),
+  fmt/clippy/workspace tests, `verify_M-06.sh` PASS exit=0, GitHub CI + Deploy success. §8 eyes-on
+  на VPS подтвердил часть TD-013: **hot-loop 418 НЕ повторился** (rate-limit retries spaced
+  ~50-60s / cooldown, не 133×418/25s), CPU/MEM нормальные, restarts=0, heartbeat свежий, journal
+  растёт, seq непрерывен. Но продуктовый критерий #4 НЕ выполнен: в live journal-tail были
+  `BinanceFutures` OpenInterest + ConnUp, но **0 BinanceFutures L2Snapshot и 0 Funding** (20 MiB и
+  115 MiB хвосты), при повторяющихся `depth continuity gap` / `snapshot stale ... backoff` циклах.
+  Funding из `!markPrice@arr` не rare-event, поэтому это не §8-GREEN. Реверт `e6b4a75` + `d819cc3`;
+  main снова inert-safe: VPS HEAD `d819cc3`, spot+HL only, 0 futures/418, hb age 8s, segment +60KB/5s,
+  CPU ~0.7-5%, MEM ~5.8 MiB, restarts=0. Открыт **TD-014 (BLOCKING #4)**.
 - **M-06 остаётся IN_PROGRESS:** #1 (blast-radius compile — на main workspace компилируется),
-  **#4 РЕЛЕНД pending (engine-dev): re-apply `2eee4bf` поверх `cc4f529` → прод-поведенческое →
-  ПОЛНЫЙ §8 eyes-on (проверить: 418-backoff работает LIVE — sleeps/cooldown, книга бутстрапится,
-  futures L2Snapshot/OI/Funding в журнал, CPU/MEM в норме)**, #6 verify_M-06.sh exit 0 (tester,
-  после #4). Data-quality долг: TD-012 (futures REST depth limit=1000 undercount). TD-013 —
-  fix merged inert, closes при успешном §8 реленда #4.
+  inert venue-futures / derive части на main, **#4 BLOCKED by TD-014** (live depth/funding emission
+  after backoff; recorder wiring itself remains clean), #6 verify_M-06.sh exit 0 (tester) только после
+  успешного #4. Следующая цепочка: architect RED/live-equivalent oracle for futures bootstrap+funding
+  emission → venue-dev fix → engine-dev reland → reviewer full §8 → tester verify. Data-quality долг:
+  TD-012 (futures REST depth limit=1000 undercount). TD-013 anti-hot-loop live-verified, но milestone
+  close-out не достигнут из-за TD-014.
 
 ## Движок бэктеста (M-04 «Research core» — РЕАЛИЗОВАНО, reviewer APPROVED 2026-07-10)
 Цепочка: architect → critic C-001 REJECT → фиксы `f02c418` → critic C-002 NOTE (все

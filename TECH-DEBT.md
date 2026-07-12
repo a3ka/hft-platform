@@ -85,6 +85,28 @@
   риск синхронного hammering'а низкий. Если нужен ±jitter — потребует rand/fastrand в
   venue-binance-futures `[dependencies]` (own-crate, formally allowed) + покрытие; отдельная
   мелкая задача, не блокер реленда.
+  **LIVE RELAND RESULT (`8b26d6c`, 2026-07-12):** anti-hot-loop часть TD-013 прошла §8: при 418
+  recorder логировал cooldown/retry-after sleeps с интервалами ~50-60s на BTCUSDT/ETHUSDT, а не
+  прошлые 133×418/25s; CPU/MEM нормальные, restarts=0. Но полный #4 §8 NOT GREEN из-за нового
+  blocker'а TD-014 (нет live L2Snapshot/Funding), поэтому milestone close-out не достигнут.
+
+- **TD-014** `binance-futures-live-depth-funding-not-emitted-after-backoff` (M-06 #4 reland,
+  **ОТКРЫТА / BLOCKING #4**). После фикса TD-013 reland `8b26d6c` прошёл code-review, локальные
+  gates (`red_futures_wired`, fmt, clippy, workspace tests, `verify_M-06.sh` PASS) и GitHub
+  CI+Deploy, но §8 eyes-on на VPS НЕ прошёл продуктовый критерий recorder wire. Наблюдения:
+  3 `venue connect` строки были (`binance`, `hyperliquid`, `binance_futures`), journal рос, seq
+  непрерывен (`seq_gaps=0` на tail-inspection), heartbeat свежий, restarts=0, TD-013 backoff
+  live-работал. Однако в 20 MiB / 115 MiB live journal tails были только `BinanceFutures`
+  OpenInterest + ConnUp; **0 `BinanceFutures` L2Snapshot и 0 Funding**, при частых
+  `venue-binance-futures: depth continuity gap detected, resyncing book` и `snapshot stale vs
+  buffered diffs, refetching with backoff`. Liquidation может быть редким событием, но Funding из
+  `!markPrice@arr` rare-event'ом не является, поэтому отсутствие Funding блокирует reland.
+  Реверт выполнен (`e6b4a75` + `d819cc3`); prod inert-safe re-verified (VPS HEAD `d819cc3`,
+  spot+HL only, futures/418=0, hb age 8s, segment +60KB/5s, CPU/MEM нормальные, restarts=0).
+  **Нужен architect RED/live-equivalent oracle:** futures runner обязан, при mock/controlled fstream
+  depth + markPrice + REST snapshot/backoff сценарии, стабильно эмитить L2Snapshot и Funding после
+  resync/backoff, без hot-loop и без starvation markPrice path. Затем venue-dev fix → engine-dev
+  reland #4 → reviewer full §8. Severity: MAJOR (prod behavior blocker, no order-path impact).
 
 ## Замечания reviewer'а M-06 #4 (2026-07-11)
 - **RN-9** (§8 eyes-on поймал то, что все зелёные гейты пропустили — снова) Code-review A+B
@@ -96,6 +118,13 @@
   реальный Binance rate-limit. **Wiring #4 сам по себе безупречен** — при фиксе TD-013 реленд
   тривиален. Для architect: RED-оракул фьючерс-адаптера должен включать симуляцию 418/429-ответа
   REST (прод-масштаб дисциплина `.claude/rules/testing.md`), не только happy-path парсинг.
+
+## Замечания reviewer'а M-06 #4 reland (2026-07-12)
+- **RN-11** (§8 split-result) Reland `8b26d6c` доказал, что TD-013 backoff больше не hot-loop'ит
+  Binance 418, но одновременно показал новый live blocker: после backoff futures depth/funding
+  не доходят до journal. Урок: RED #4 `default_venues` wiring достаточен для engine-dev contract,
+  но не покрывает venue-runner liveness. Следующий RED должен быть не только "recorder wires
+  BinanceFutures", а "futures runner under resync/backoff emits depth+funding".
 
 ## Замечания reviewer'а M-05 (не блокирующие, 2026-07-11)
 - **RN-8** (fmt-гейт под-покрытие) `verify_M-05.sh` fmt-гейт проверяет только `journal+book`, не
