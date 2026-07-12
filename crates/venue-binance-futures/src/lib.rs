@@ -240,6 +240,67 @@ impl Default for FuturesDepthBook {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Backoff (TD-013): чистая политика задержки retry snapshot-fetch'а
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Чистая детерминированная политика задержки retry snapshot-fetch'а (TD-013).
+/// §8 eyes-on поймал прод-регрессию: snapshot-fail/stale ветки немедленно
+/// `pending_snapshots.push(make_snapshot_future(...))` → hot-loop → 418-ban от Binance.
+/// Эта политика + её wiring в `handle_snapshot` фиксят это.
+///
+/// Контракт (`tests/red_backoff.rs`):
+///  • `next_delay(None)` первый раз возвращает ≥ `BASE` (не hot-loop);
+///  • exp рост `BASE × MULTIPLIER^attempt` за каждую неудачу;
+///  • ограничено сверху `CAP` (5 мин) — не уходит в бесконечность;
+///  • `next_delay(Some(ra))` обязан honor'ить `Retry-After` из 418/429 (≥ `ra`);
+///  • `reset()` (на успешном снапшоте) возвращает к базовой задержке.
+///
+/// Джиттер НЕ в политике (детерминизм тестов) — применяет I/O-boundary caller
+/// на async-уровне (`handle_snapshot` — там, где конструируется future).
+pub struct Backoff {
+    attempt: u32,
+}
+
+impl Backoff {
+    /// Базовая задержка первого retry (100мс — тест-минимум + практичный не-hot-loop).
+    pub const BASE: Duration = Duration::from_millis(100);
+    /// Верхняя граница (5 мин — после cap'а retry продолжается с этим интервалом).
+    pub const CAP: Duration = Duration::from_secs(300);
+    /// Множитель экспоненты (×2 за неудачу).
+    pub const MULTIPLIER: u32 = 2;
+
+    /// Новая политика (первый retry даёт `BASE`, далее exp).
+    pub fn new() -> Self {
+        Self { attempt: 0 }
+    }
+
+    /// Следующая задержка. `retry_after` из 418/429 `Retry-After` header (если есть)
+    /// обязан быть honor'нут: возвращаемый `delay ≥ max(exp_computed, retry_after)`.
+    /// После вызова `attempt` инкрементируется (следующая неудача — exp растёт).
+    pub fn next_delay(&mut self, retry_after: Option<Duration>) -> Duration {
+        let factor = Self::MULTIPLIER.saturating_pow(self.attempt);
+        let exp = Self::BASE.saturating_mul(factor).min(Self::CAP);
+        let chosen = match retry_after {
+            Some(ra) if ra > exp => ra,
+            _ => exp,
+        };
+        self.attempt = self.attempt.saturating_add(1);
+        chosen
+    }
+
+    /// Успешный snapshot — сброс attempt к 0 (следующая неудача — снова базовая).
+    pub fn reset(&mut self) {
+        self.attempt = 0;
+    }
+}
+
+impl Default for Backoff {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Async runner (WS depth@100ms + WS forceOrder + WS !markPrice@arr
 //               + REST snapshot-sync + REST OI-poll)
 // Зеркалит `venue-binance::run` — одна сессия, supervisor-pattern снаружи.
@@ -268,10 +329,13 @@ struct DepthDiff {
 }
 
 /// Состояние sync-конечного-автомата одного символа (см. `venue-binance`).
+/// `backoff` (TD-013) — per-symbol политика retry для snapshot-fetch'а: на fail/stale
+/// вычисляет задержку (exp + honor `Retry-After`), на success — `reset()`.
 struct SymbolState {
     book: Option<OrderBook>,
     pending: VecDeque<DepthDiff>,
     resyncing: bool,
+    backoff: Backoff,
 }
 
 impl SymbolState {
@@ -280,6 +344,7 @@ impl SymbolState {
             book: None,
             pending: VecDeque::new(),
             resyncing: false,
+            backoff: Backoff::new(),
         }
     }
 }
@@ -291,7 +356,38 @@ enum DiffAction {
     Apply,
 }
 
-type SnapshotFuture = Pin<Box<dyn Future<Output = (String, anyhow::Result<OrderBook>)> + Send>>;
+/// Ошибка snapshot-fetch'а с разделением rate-limit (418/429 + `Retry-After`) и прочих.
+/// `RateLimited` пробросит через `handle_snapshot` `retry_after` в `Backoff::next_delay`,
+/// чтобы не лупить мгновенно в бан-IP (TD-013, §8).
+#[derive(Debug)]
+pub(crate) enum SnapshotError {
+    RateLimited { retry_after: Duration },
+    Other(anyhow::Error),
+}
+
+impl std::fmt::Display for SnapshotError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RateLimited { retry_after } => {
+                write!(f, "rate-limited, retry after {retry_after:?}")
+            }
+            Self::Other(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for SnapshotError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Other(e) => Some(e.as_ref()),
+            _ => None,
+        }
+    }
+}
+
+type SnapshotResult = Result<OrderBook, SnapshotError>;
+
+type SnapshotFuture = Pin<Box<dyn Future<Output = (String, SnapshotResult)> + Send>>;
 
 /// Запустить сессию Binance USDT-M futures WS+REST. Шлёт `EventKind::Md(..)` в `tx`;
 /// `Sys(ConnUp(BinanceFutures))` — сразу после успешного WS-коннекта. Возвращает `Ok(())`
@@ -335,7 +431,8 @@ pub async fn run(tx: mpsc::Sender<EventKind>, symbols: Vec<String>) -> anyhow::R
         let symbol = s.to_uppercase();
         let mut state = SymbolState::new();
         state.resyncing = true;
-        pending_snapshots.push(make_snapshot_future(client.clone(), symbol.clone()));
+        // Bootstrap: новая попытка, backoff=0 → BASE=100ms на возможный fail.
+        pending_snapshots.push(make_snapshot_future(client.clone(), symbol.clone(), None));
         states.insert(symbol, state);
     }
 
@@ -558,7 +655,13 @@ fn handle_diff(
             state.pending.push_back(diff);
             if !state.resyncing {
                 state.resyncing = true;
-                pending_snapshots.push(make_snapshot_future(client.clone(), symbol.to_string()));
+                // Bootstrap-fetch: attempt=0 → next_delay() вернёт BASE=100ms; передаём
+                // None (без pre-delay) — это новая попытка, не retry.
+                pending_snapshots.push(make_snapshot_future(
+                    client.clone(),
+                    symbol.to_string(),
+                    None,
+                ));
             }
         }
         DiffAction::Gap => {
@@ -570,7 +673,13 @@ fn handle_diff(
             state.pending.clear();
             state.pending.push_back(diff);
             state.resyncing = true;
-            pending_snapshots.push(make_snapshot_future(client.clone(), symbol.to_string()));
+            // После gap книга инвалидирована; бэкофф сброшен предыдущим success —
+            // attempt=0 → BASE=100ms. None (новая попытка, не retry).
+            pending_snapshots.push(make_snapshot_future(
+                client.clone(),
+                symbol.to_string(),
+                None,
+            ));
         }
         DiffAction::Apply => {
             if let Some(book) = state.book.as_mut() {
@@ -581,10 +690,12 @@ fn handle_diff(
 }
 
 /// REST snapshot завершился — реконcилировать с буфером diff'ов (Binance algorithm).
+/// TD-013 wiring: на fail/stale — `Backoff::next_delay(retry_after)` + РЕАЛЬНЫЙ sleep
+/// перед re-push (анти-hot-loop, §8); на success — `backoff.reset()`.
 fn handle_snapshot(
     states: &mut HashMap<String, SymbolState>,
     symbol: String,
-    result: anyhow::Result<OrderBook>,
+    result: SnapshotResult,
     client: &reqwest::Client,
     pending_snapshots: &mut FuturesUnordered<SnapshotFuture>,
 ) {
@@ -594,8 +705,23 @@ fn handle_snapshot(
     let mut book = match result {
         Ok(book) => book,
         Err(e) => {
-            tracing::warn!(symbol = %symbol, error = %e, "venue-binance-futures: snapshot fetch failed, retrying");
-            pending_snapshots.push(make_snapshot_future(client.clone(), symbol.clone()));
+            // Извлечь Retry-After из типизированной ошибки (418/429) — `Other` (network/
+            // parse/HTTP≠418/429) идёт без `retry_after` (exp база).
+            let retry_after = match &e {
+                SnapshotError::RateLimited { retry_after } => Some(*retry_after),
+                SnapshotError::Other(_) => None,
+            };
+            tracing::warn!(
+                symbol = %symbol,
+                error = %e,
+                "venue-binance-futures: snapshot fetch failed, retrying with backoff"
+            );
+            let delay = state.backoff.next_delay(retry_after);
+            pending_snapshots.push(make_snapshot_future(
+                client.clone(),
+                symbol.clone(),
+                Some(delay),
+            ));
             return;
         }
     };
@@ -604,6 +730,8 @@ fn handle_snapshot(
         let Some((u_final, u_first)) = front else {
             state.book = Some(book);
             state.resyncing = false;
+            // SUCCESS: снапшот согласован с буфером (или буфер пуст) → сброс backoff.
+            state.backoff.reset();
             return;
         };
         if u_final <= book.last_update_id {
@@ -611,12 +739,20 @@ fn handle_snapshot(
             continue;
         }
         if u_first > book.last_update_id + 1 {
+            // Stale: снапшот отстал от буфера diff'ов — это сетевой/венюный race, НЕ
+            // server rate-limit (Retry-After нерелевантен), backoff всё равно применяем
+            // (анти-hot-loop: не лупить REST до полного resync).
             tracing::warn!(
                 symbol = %symbol,
-                "venue-binance-futures: snapshot stale vs buffered diffs, refetching"
+                "venue-binance-futures: snapshot stale vs buffered diffs, refetching with backoff"
             );
             state.resyncing = true;
-            pending_snapshots.push(make_snapshot_future(client.clone(), symbol.clone()));
+            let delay = state.backoff.next_delay(None);
+            pending_snapshots.push(make_snapshot_future(
+                client.clone(),
+                symbol.clone(),
+                Some(delay),
+            ));
             return;
         }
         let diff = state
@@ -629,15 +765,42 @@ fn handle_snapshot(
 
 /// `GET /fapi/v1/depth` → `OrderBook`. `T` снапшота НЕ несёт биржевого времени —
 /// оно появляется с первым применённым WS diff'ом (Binance docs).
-async fn fetch_snapshot(client: &reqwest::Client, symbol: &str) -> anyhow::Result<OrderBook> {
+///
+/// TD-013: 418 (Binance IP-ban) / 429 (rate-limit) распознаём ДО `error_for_status` и
+/// пробразовываем в `SnapshotError::RateLimited { retry_after }`, чтобы `handle_snapshot`
+/// мог honor'ить `Retry-After` через `Backoff` (анти-hot-loop, §8). Без Retry-After —
+/// дефолт по статусу (418 — длинный cooldown, т.к. это IP-ban; 429 — средний).
+async fn fetch_snapshot(
+    client: &reqwest::Client,
+    symbol: &str,
+) -> Result<OrderBook, SnapshotError> {
     let url = format!("{REST_DEPTH_BASE}{symbol}&limit={REST_DEPTH_LIMIT}");
-    let response = client.get(&url).send().await?.error_for_status()?;
-    let snapshot: DepthSnapshotResponse = response.json().await?;
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| SnapshotError::Other(e.into()))?;
+    let status = response.status();
+    if status.as_u16() == 418 || status.as_u16() == 429 {
+        let retry_after = parse_retry_after_header(response.headers())
+            .unwrap_or_else(|| default_rate_limit_cooldown(status.as_u16()));
+        return Err(SnapshotError::RateLimited { retry_after });
+    }
+    let snapshot: DepthSnapshotResponse = response
+        .error_for_status()
+        .map_err(|e| SnapshotError::Other(e.into()))?
+        .json()
+        .await
+        .map_err(|e| SnapshotError::Other(e.into()))?;
 
     let mut bids = Vec::with_capacity(snapshot.bids.len());
     for (price, qty) in &snapshot.bids {
-        let price: f64 = price.parse()?;
-        let qty: f64 = qty.parse()?;
+        let price: f64 = price
+            .parse()
+            .map_err(|e: std::num::ParseFloatError| SnapshotError::Other(anyhow::Error::from(e)))?;
+        let qty: f64 = qty
+            .parse()
+            .map_err(|e: std::num::ParseFloatError| SnapshotError::Other(anyhow::Error::from(e)))?;
         bids.push(Level {
             price: to_fixed(price),
             size: to_fixed(qty),
@@ -645,8 +808,12 @@ async fn fetch_snapshot(client: &reqwest::Client, symbol: &str) -> anyhow::Resul
     }
     let mut asks = Vec::with_capacity(snapshot.asks.len());
     for (price, qty) in &snapshot.asks {
-        let price: f64 = price.parse()?;
-        let qty: f64 = qty.parse()?;
+        let price: f64 = price
+            .parse()
+            .map_err(|e: std::num::ParseFloatError| SnapshotError::Other(anyhow::Error::from(e)))?;
+        let qty: f64 = qty
+            .parse()
+            .map_err(|e: std::num::ParseFloatError| SnapshotError::Other(anyhow::Error::from(e)))?;
         asks.push(Level {
             price: to_fixed(price),
             size: to_fixed(qty),
@@ -661,6 +828,23 @@ async fn fetch_snapshot(client: &reqwest::Client, symbol: &str) -> anyhow::Resul
     })
 }
 
+/// `Retry-After` header (RFC 7231 §7.1.3) → `Duration`. Binance использует формат
+/// delta-seconds (целое число секунд); HTTP-date игнорируем (Binance не применяет).
+fn parse_retry_after_header(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let v = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
+    v.parse::<u64>().ok().map(Duration::from_secs)
+}
+
+/// Дефолтный cooldown когда `Retry-After` отсутствует: 418 (IP-ban) — длинный,
+/// 429 (rate-limit) — средний. Не 0 — иначе backoff не спасёт от hammering'а.
+fn default_rate_limit_cooldown(status: u16) -> Duration {
+    match status {
+        418 => Duration::from_secs(120),
+        429 => Duration::from_secs(10),
+        _ => Duration::from_secs(60),
+    }
+}
+
 #[derive(Deserialize)]
 struct DepthSnapshotResponse {
     #[serde(rename = "lastUpdateId")]
@@ -669,8 +853,20 @@ struct DepthSnapshotResponse {
     asks: Vec<(String, String)>,
 }
 
-fn make_snapshot_future(client: reqwest::Client, symbol: String) -> SnapshotFuture {
+/// Сконструировать `SnapshotFuture` с опциональной pre-delay задержкой (TD-013 wiring).
+/// `pre_delay = None` — новая попытка (bootstrap, immediate). `pre_delay = Some(d)` —
+/// retry после fail/stale; внутри `tokio::time::sleep(d).await` ПЕРЕД `fetch_snapshot`.
+fn make_snapshot_future(
+    client: reqwest::Client,
+    symbol: String,
+    pre_delay: Option<Duration>,
+) -> SnapshotFuture {
     Box::pin(async move {
+        if let Some(delay) = pre_delay {
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+        }
         let result = fetch_snapshot(&client, &symbol).await;
         (symbol, result)
     })
