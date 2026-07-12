@@ -153,6 +153,15 @@ architect пушит `feat/M-NN`, dev-агенты бутстрапятся `pi-
 reviewer мержит в main уже GREEN. Прямой push RED-состояния в main = нарушение
 этого гейта (кроме явного founder-override).
 
+**Intra-chain push на feat-ветку (закреплено 2026-07-12, инцидент TD-014 chain-break):**
+в цепочке на общей feat-ветке (architect→venue/engine-dev→...→reviewer) КАЖДЫЙ dev в
+цепочке ПУШИТ свой GREEN-коммит на shared `feat/M-NN` (ff), чтобы следующий агент
+забутстрапился на актуальном состоянии. Правило «push — только reviewer после APPROVED»
+относится к **main** (merge `feat→main` + §8 деплой-гейт), НЕ к intra-chain push на feat.
+Мандат dev-агенту должен явно РАЗРЕШАТЬ push на feat-ветку (иначе коммит виснет в
+worktree-ветке, цепочка рвётся — TD-014). Push-scope (`git log origin/feat/M-NN..HEAD` =
+только твои коммиты) обязателен по-прежнему.
+
 ## Cross-references
 
 - `.claude/rules/scope-guard.md` — зоны, за нарушение которых гейт 4 реджектит
