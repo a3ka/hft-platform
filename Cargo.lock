@@ -874,7 +874,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "venue-binance",
- "venue-binance-futures",
  "venue-hyperliquid",
 ]
 
