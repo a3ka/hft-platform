@@ -122,12 +122,25 @@ recorder БЕЗ изменений (CPU 0.79%, MEM 5.6 MiB, сегмент ра�
   Логи за live-window: `depth continuity gap` 311, `snapshot stale` 44, `429` 18, CPU до 6.99%
   на старте (позже ~1.2%). Это НЕ §8-GREEN; branch НЕ смержен. VPS восстановлен на
   `origin/main` `3eff0db` (spot+HL only, no futures supervisor, healthy, hb age ~4.5s).
+- **TD-014 T2 + #4 reland `669ce40` — REJECTED (§8 live NOT GREEN, 2026-07-12).**
+  Цепочка `38c3175` RED futures-continuity (`pu`, не spot `U == last+1`) + `669ce40`
+  dual-rule fix прошла локально: `red_futures_wired` PASS, `venue-binance-futures` 8/8 PASS,
+  workspace tests PASS, fmt/clippy clean, `verify_M-06.sh` PASS exit=0. Static review подтвердил
+  MD-only и корректное разделение: steady-state strict `pu == last_update_id`, reconcile-loop
+  Binance-style `U <= L+1 && u >= L+1`, `pu` fail-closed. Pre-merge §8 на VPS показал реальный
+  прогресс: 3 venue стартовали, recorder healthy, heartbeat свежий, CPU ~1.1%, MEM ~7.5 MiB,
+  restarts=0, `seq_gaps=0`, fresh tail с deploy: `BinanceFutures.L2Snapshot=470`,
+  `OpenInterest=54`; после стартового окна последние 3 минуты имели `gap=0`, `stale=0`, `429=0`
+  (одиночный 418 без hot-loop). Но обязательный live-критерий всё ещё НЕ выполнен:
+  **`BinanceFutures.Funding=0`** в 48 MiB journal-tail за несколько минут live-window.
+  `!markPrice@arr` не является rare-event, поэтому это не §8-GREEN. Branch НЕ смержен; VPS
+  восстановлен на `origin/main` `4012c55` (spot+HL only, healthy, hb age ~6s, CPU 0.58%).
 - **M-06 остаётся IN_PROGRESS:** #1 (blast-radius compile — на main workspace компилируется),
-  inert venue-futures / derive части на main, **#4 BLOCKED by TD-014** (live depth/funding emission
-  after backoff; recorder wiring itself remains clean), #6 verify_M-06.sh exit 0 (tester) только после
-  успешного #4. Следующая цепочка: architect RED/live-equivalent oracle stronger than current
-  TD-014 v2 production miss (sparse L2 + 0 Funding + gap/stale/429 churn) → venue-dev fix →
-  engine-dev reland → reviewer full §8 → tester verify.
+  inert venue-futures / derive части на main, **#4 BLOCKED by TD-014** (live Funding emission still
+  absent; depth cadence/churn materially improved by T2 but full §8 not green), #6 verify_M-06.sh
+  exit 0 (tester) только после успешного #4. Следующая цепочка: architect RED/live-equivalent oracle
+  stronger than current TD-014 T2 production miss (dense L2 + OI, but 0 persisted Funding) →
+  venue-dev fix → engine-dev reland → reviewer full §8 → tester verify.
   Data-quality долг:
   TD-012 (futures REST depth limit=1000 undercount). TD-013 anti-hot-loop live-verified, но milestone
   close-out не достигнут из-за TD-014.

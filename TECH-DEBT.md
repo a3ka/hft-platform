@@ -126,6 +126,17 @@
   live window showed ongoing churn (`depth continuity gap` 311, `snapshot stale` 44, `429` 18);
   initial CPU reached 6.99% before settling near 1.2%. Candidate was not merged; VPS restored to
   `origin/main` `3eff0db` and rechecked healthy, spot+HL only. TD-014 remains OPEN/BLOCKING.
+  **LIVE TD-014 T2 RESULT (`669ce40` over `38c3175`, 2026-07-12):** futures-continuity oracle
+  (`pu`, not spot `U == last+1`) passed locally and reviewer static check confirmed the dual-rule
+  implementation is MD-only: strict `pu == last_update_id` in steady-state, Binance snapshot-bridge
+  rule in reconcile-loop, mandatory `pu` fail-closed. Local gates all GREEN: `red_futures_wired`,
+  `venue-binance-futures` 8/8, workspace tests, fmt/clippy, `verify_M-06.sh` PASS exit=0. Pre-merge
+  §8 on VPS showed T2 materially improved live depth: `BinanceFutures.L2Snapshot=470`,
+  `OpenInterest=54`, `seq_gaps=0`; after startup, last 3m had `gap=0`, `stale=0`, `429=0`, CPU
+  ~1.1%, restarts=0, and only one non-looping 418. However, the acceptance criterion still failed:
+  **`BinanceFutures.Funding=0`** in the 48 MiB journal tail since deploy. Candidate was not merged;
+  VPS restored to `origin/main` `4012c55` and rechecked healthy, spot+HL only. TD-014 remains
+  OPEN/BLOCKING, now narrowed to persisted live Funding emission under the real fstream path.
 
 ## Замечания reviewer'а M-06 #4 (2026-07-11)
 - **RN-9** (§8 eyes-on поймал то, что все зелёные гейты пропустили — снова) Code-review A+B
@@ -153,6 +164,12 @@
   nonzero in live, but not enough to satisfy product behavior: Funding stayed at 0, L2 cadence was
   sparse, and the runner continued gap/stale/429 churn. Next oracle must cover the actual persisted
   cadence and funding path under this churn, not only a deterministic recovery-snapshot unit path.
+- **RN-14** (§8 TD-014 T2 split-result) `669ce40` fixed the futures continuity failure enough for
+  dense live L2 and quiet post-startup logs, but the product gate still failed because no
+  `BinanceFutures.Funding` reached the persisted journal. Next oracle must assert the real
+  `!markPrice@arr` live path all the way to `MdPayload::Funding` in journal-recovered output, with
+  observable parse/drop counters or equivalent diagnostics; parser-only fixtures are no longer
+  sufficient.
 
 ## Замечания reviewer'а M-05 (не блокирующие, 2026-07-11)
 - **RN-8** (fmt-гейт под-покрытие) `verify_M-05.sh` fmt-гейт проверяет только `journal+book`, не
