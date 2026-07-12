@@ -78,8 +78,10 @@ fn td014_futures_runner_emits_l2_and_funding_after_resync_no_starvation() {
     // Тик → bounded L2Snapshot ОБЯЗАН эмититься (книга синкнута, есть биржевое время).
     let et = s.tick();
     assert!(
-        emitted(&et).iter().any(|md| md.venue == Venue::BinanceFutures
-            && matches!(md.payload, MdPayload::L2Snapshot { .. })),
+        emitted(&et)
+            .iter()
+            .any(|md| md.venue == Venue::BinanceFutures
+                && matches!(md.payload, MdPayload::L2Snapshot { .. })),
         "TD-014: после snapshot-sync с НЕСКОЛЬКИМИ contiguous diff'ами обязан эмитить L2Snapshot \
          (live: 0 L2 — вероятно last_update_id не двигается при apply → 2-й diff вечно stale)"
     );

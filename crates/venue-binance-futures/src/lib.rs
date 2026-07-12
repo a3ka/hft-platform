@@ -4,21 +4,24 @@
 //! (`Venue::BinanceFutures`). seq/ts_wall/ts_mono НЕ проставляет — это журнал (JR-I-1),
 //! поэтому парс-функции возвращают `MdEvent`, не `Event`.
 //!
-//! Парс-функции (`parse_force_order` / `parse_depth_snapshot` / `parse_open_interest`) —
-//! чистые детерминированные функции границы нормализации, покрытые RED-оракулами
-//! `tests/red_parse.rs`. Fail-closed: битая/неожиданная форма → `None` (не паника, не
-//! фабрикация правдоподобного значения, VN-I-7).
+//! Парс-функции (`parse_force_order` / `parse_depth_snapshot` / `parse_open_interest` /
+//! `parse_mark_price`) — чистые детерминированные функции границы нормализации, покрытые
+//! RED-оракулами `tests/red_parse.rs` и `tests/red_funding.rs`. Fail-closed: битая/неожиданная
+//! форма → `None` (не паника, не фабрикация правдоподобного значения, VN-I-7).
 //!
-//! `run` — async-сессия: WS fstream (`<sym>@depth@100ms` + `<sym>@forceOrder`) + REST
-//! snapshot-sync (`/fapi/v1/depth`) + REST OI-poll (`/fapi/v1/openInterest`). Одна
-//! WS-сессия; reconnect/backoff — забота вызывающего supervisor (как в `venue-binance`).
+//! TD-014: sync-state-машина `FuturesSession` (БЕЗ сети/каналов) — тестируемый seam
+//! для liveness-проблем (multi-diff stale, Funding-starve). `run()` — тонкая I/O-обёртка,
+//! ДЕЛЕГИРУЮЩАЯ в `FuturesSession` (live == tested; иначе дефект снова невидим, §8 REJECT
+//! #4 reland). `SessionEffect` — что сессия «хочет» эмитить/запросить: `Emit(MdEvent)`
+//! или `FetchSnapshot { symbol, after }` (after — задержка перед REST-фетчем; TD-013:
+//! `Duration::ZERO` для bootstrap/gap → fire immediately, `>= Backoff::BASE` для retry →
+//! не hot-loop; для Err(418/429) — honor `default_rate_limit_cooldown(status)`).
 
 use contracts::{
     from_fixed, to_fixed, EventKind, Level, MdEvent, MdPayload, Side, SysEvent, Venue,
 };
 use futures_util::stream::FuturesUnordered;
 use futures_util::{SinkExt, StreamExt};
-use serde::Deserialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::future::Future;
@@ -301,9 +304,7 @@ impl Default for Backoff {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Async runner (WS depth@100ms + WS forceOrder + WS !markPrice@arr
-//               + REST snapshot-sync + REST OI-poll)
-// Зеркалит `venue-binance::run` — одна сессия, supervisor-pattern снаружи.
+// Sync-state-машина FuturesSession (TD-014) — тестируемый seam
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Локальная копия полного фьючерс-стакана одного символа. Делегирует поддержание
@@ -314,7 +315,7 @@ struct OrderBook {
     book: FuturesDepthBook,
     last_update_id: u64,
     /// `E` последнего применённого WS diff'а, мс. `0` — только REST-бутстрап без diff'ов
-    /// (нет биржевого времени → символ НЕ эмитится в `emit_book_snapshots`).
+    /// (нет биржевого времени → символ НЕ эмитится в `tick`).
     last_event_time_ms: i64,
 }
 
@@ -349,232 +350,348 @@ impl SymbolState {
     }
 }
 
+/// Что делать с входящим diff-апдейтом относительно текущего состояния символа
+/// (sync-конечный-автомат). Внутри `FuturesSession::on_ws_text`.
 enum DiffAction {
+    /// Апдейт старше текущего состояния книги — отбросить.
     Skip,
+    /// Книга ещё не синхронизирована — буферизовать, запросить снапшот если ещё не в
+    /// процессе.
     Buffer,
+    /// Разрыв непрерывности (`U != last_update_id + 1`) — книга инвалидируется,
+    /// пере-синхронизация с нуля.
     Gap,
+    /// Апдейт непрерывен — применить к книге.
     Apply,
 }
 
-/// Ошибка snapshot-fetch'а с разделением rate-limit (418/429 + `Retry-After`) и прочих.
-/// `RateLimited` пробросит через `handle_snapshot` `retry_after` в `Backoff::next_delay`,
-/// чтобы не лупить мгновенно в бан-IP (TD-013, §8).
-#[derive(Debug)]
-pub(crate) enum SnapshotError {
-    RateLimited { retry_after: Duration },
-    Other(anyhow::Error),
-}
-
-impl std::fmt::Display for SnapshotError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::RateLimited { retry_after } => {
-                write!(f, "rate-limited, retry after {retry_after:?}")
-            }
-            Self::Other(e) => write!(f, "{e}"),
-        }
-    }
-}
-
-impl std::error::Error for SnapshotError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Other(e) => Some(e.as_ref()),
-            _ => None,
-        }
-    }
-}
-
-type SnapshotResult = Result<OrderBook, SnapshotError>;
-
-type SnapshotFuture = Pin<Box<dyn Future<Output = (String, SnapshotResult)> + Send>>;
-
-/// Запустить сессию Binance USDT-M futures WS+REST. Шлёт `EventKind::Md(..)` в `tx`;
-/// `Sys(ConnUp(BinanceFutures))` — сразу после успешного WS-коннекта. Возвращает `Ok(())`
-/// при штатном закрытии/дисконнекте/уходе получателя; `Err(_)` — при ошибке коннекта.
-/// Reconnect/backoff — забота supervisor'а снаружи (emitter-not-owner, как в `venue-binance`).
+/// Эффект sync-state-машины `FuturesSession`: то, что она «хочет» эмитить во внешний мир
+/// или запросить у I/O-слоя. `run()` ОБЯЗАН делегировать в `FuturesSession` — иначе
+/// дефекты (TD-014) снова невидимы юнит-тестам (live != tested → регресс повторяется).
 ///
-/// Подписки: `<sym>@depth@100ms` + `<sym>@forceOrder` per symbol (deph-sync + liquidations)
-/// и один АГРЕГИРОВАННЫЙ `!markPrice@arr` (funding-rate broadcast по всем символам —
-/// фильтруем на нашу выборку). Альтернатива — per-symbol `<sym>@markPrice` (N потоков на
-/// N символов); используем `!markPrice@arr` ради одной сессии вместо N — фильтрация дешевая.
-pub async fn run(tx: mpsc::Sender<EventKind>, symbols: Vec<String>) -> anyhow::Result<()> {
-    let mut streams = Vec::with_capacity(symbols.len() * 2 + 1);
-    for s in &symbols {
-        let lower = s.to_lowercase();
-        streams.push(format!("{lower}@depth@100ms"));
-        streams.push(format!("{lower}@forceOrder"));
+/// * `Emit(MdEvent)` — нормализованное событие для журнала (Liquidation/Funding/L2Snapshot).
+/// * `FetchSnapshot { symbol, after }` — запросить REST-снапшот; `after` — задержка
+///   перед запросом: `Duration::ZERO` для bootstrap/gap (fire immediately), `>= Backoff::BASE`
+///   для retry (TD-013: не hot-loop); для Err(418/429) session уже заложил
+///   `default_rate_limit_cooldown(status)` внутрь `after`.
+#[derive(Debug, Clone)]
+pub enum SessionEffect {
+    Emit(MdEvent),
+    FetchSnapshot { symbol: String, after: Duration },
+}
+
+/// Тестируемая sync-state-машина `venue-binance-futures` БЕЗ сети/каналов (TD-014).
+/// Инкапсулирует per-symbol `SymbolState` (буфер diff'ов + book + `Backoff`) и
+/// symbol-set для фильтрации `!markPrice@arr`. Никогда не ходит в сеть и не шлёт в mpsc —
+/// только накапливает состояние и возвращает `Vec<SessionEffect>` для I/O-обёртки.
+///
+/// Контракт (`tests/red_live_emit.rs`):
+///  • `on_ws_text(&str)` обрабатывает depth-diff / forceOrder / `!markPrice@arr`;
+///    depth-diff → sync-автомат (Buffer/Gap/Apply/Skip); forceOrder/markPrice → `Emit`.
+///  • `on_snapshot_result(&str, Result<String, u16>)` — Ok(json) реконсилит с буфером
+///    (TD-014 FIX: применяет НЕСКОЛЬКО contiguous diff'ов подряд, двигая
+///    `last_update_id = diff.u_final` при каждом apply), Err(418/429) → `Backoff`-delay,
+///    Err(other) → exp `Backoff`-delay (не hot-loop).
+///  • `tick()` эмитит bounded L2Snapshot per синкнутый символ (нужен биржевой ts).
+///
+/// `run()` — тонкая I/O-обёртка (async, ws/REST/mpsc), которая ДЕЛЕГИРУЕТ в этот seam.
+/// «Верный рефактор текущей логики» оставил multi-diff-stale → оракул RED, форсит фикс
+/// (TD-014 FIX (a): `apply_diff_to_book` ДВИГАЕТ `last_update_id`; (b): Funding из
+/// `!markPrice@arr` эмитится НЕЗАВИСИМО от состояния книги, не starve).
+pub struct FuturesSession {
+    symbol_set: HashSet<String>,
+    states: HashMap<String, SymbolState>,
+}
+
+impl FuturesSession {
+    /// Новая сессия для выборки `symbols`. symbol-set (upcased) — для O(1) фильтрации
+    /// `!markPrice@arr` (Binance агрегирует mark-prices по всем перпам; нас интересуют
+    /// только символы нашей выборки). States — пустой; per-symbol `SymbolState` создаётся
+    /// lazily при первом depth-diff'е (через `entry().or_insert_with`).
+    pub fn new(symbols: &[String]) -> Self {
+        let symbol_set: HashSet<String> = symbols.iter().map(|s| s.to_uppercase()).collect();
+        Self {
+            symbol_set,
+            states: HashMap::new(),
+        }
     }
-    streams.push("!markPrice@arr".to_string());
-    let url = format!("{WS_BASE}{}", streams.join("/"));
 
-    // Upcased set для O(1) фильтрации markPrice@arr -> нужные символы.
-    let symbol_set: HashSet<String> = symbols.iter().map(|s| s.to_uppercase()).collect();
+    /// Обработать одно combined-stream текстовое сообщение fstream. Возвращает эффекты,
+    /// которые I/O-обёртка (`run`) должна применить: эмитить в `tx` / поставить snapshot
+    /// future с пред-calculated задержкой.
+    ///
+    /// Funding из `!markPrice@arr` эмитится НЕЗАВИСИМО от состояния книги (TD-014 FIX (b):
+    /// иначе во время длительного depth-resync funding starves → 0 Funding в журнале).
+    pub fn on_ws_text(&mut self, text: &str) -> Vec<SessionEffect> {
+        let mut effects = Vec::new();
+        let value: Value = match serde_json::from_str(text) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::debug!(error = %e, raw = %text, "venue-binance-futures: malformed JSON, skipping");
+                return effects;
+            }
+        };
 
-    let (ws_stream, _response) = tokio_tungstenite::connect_async(&url).await?;
-    let (mut write, mut read) = ws_stream.split();
+        let stream = match value.get("stream").and_then(|v| v.as_str()) {
+            Some(s) => s,
+            None => {
+                tracing::debug!(raw = %text, "venue-binance-futures: message without 'stream', skipping");
+                return effects;
+            }
+        };
+        let data = match value.get("data") {
+            Some(d) => d,
+            None => {
+                tracing::debug!(raw = %text, "venue-binance-futures: message without 'data', skipping");
+                return effects;
+            }
+        };
 
-    if tx
-        .send(EventKind::Sys(SysEvent::ConnUp(Venue::BinanceFutures)))
-        .await
-        .is_err()
-    {
-        return Ok(());
-    }
-
-    let client = reqwest::Client::new();
-    let mut states: HashMap<String, SymbolState> = HashMap::new();
-    let mut pending_snapshots: FuturesUnordered<SnapshotFuture> = FuturesUnordered::new();
-
-    // Стартовая синхронизация depth по каждому символу (REST snapshot + буфер diff'ов).
-    for s in &symbols {
-        let symbol = s.to_uppercase();
-        let mut state = SymbolState::new();
-        state.resyncing = true;
-        // Bootstrap: новая попытка, backoff=0 → BASE=100ms на возможный fail.
-        pending_snapshots.push(make_snapshot_future(client.clone(), symbol.clone(), None));
-        states.insert(symbol, state);
-    }
-
-    let mut emit_interval = tokio::time::interval(EMIT_PERIOD);
-    emit_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // OI poll: первый tick `interval` срабатывает мгновенно — это намеренно (наблюдение
-    // OI сразу после синхронизации WS, не через OI_POLL_PERIOD); дальнейшие тики — каждые
-    // OI_POLL_PERIOD. `Burst` — дефолт, подходит.
-    let mut oi_interval = tokio::time::interval(OI_POLL_PERIOD);
-
-    loop {
-        tokio::select! {
-            msg = read.next() => {
-                let Some(msg) = msg else { return Ok(()) };
-                let msg = match msg {
-                    Ok(m) => m,
-                    Err(e) => {
-                        tracing::debug!(error = %e, "venue-binance-futures: WS read error, ending session");
-                        return Ok(());
+        if stream.ends_with("@forceOrder") {
+            // Combined-stream fstream оборачивает событие в `{"stream":"...", "data":{...}}`,
+            // где `data` уже форма fstream — его прямо скармливаем `parse_force_order`.
+            let raw = match serde_json::to_string(data) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::debug!(error = %e, "venue-binance-futures: failed to re-serialize forceOrder data");
+                    return effects;
+                }
+            };
+            if let Some(event) = parse_force_order(&raw) {
+                effects.push(SessionEffect::Emit(event));
+            } else {
+                tracing::debug!(raw = %raw, "venue-binance-futures: malformed forceOrder, skipping");
+            }
+        } else if stream == "!markPrice@arr" {
+            // TD-014 FIX (b): !markPrice@arr → Funding эмитится ВНЕ зависимости от
+            // book-state (во время depth-resync не starve). Парсим каждый item,
+            // фильтруем по нашей выборке.
+            let Some(arr) = data.as_array() else {
+                tracing::debug!(stream = %stream, "venue-binance-futures: !markPrice@arr without array, skipping");
+                return effects;
+            };
+            for item in arr {
+                let raw = match serde_json::to_string(item) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                let Some(event) = parse_mark_price(&raw) else {
+                    // Парс-фейл по конкретному item — skip, остальные item'ы пробуем.
+                    continue;
+                };
+                if !self.symbol_set.contains(&event.symbol) {
+                    continue;
+                }
+                effects.push(SessionEffect::Emit(event));
+            }
+        } else if stream.contains("@depth") {
+            if let Some((symbol, diff)) = parse_depth_diff(stream, data) {
+                // Сначала вычислить action (immutable borrow), потом мутировать.
+                let state = self
+                    .states
+                    .entry(symbol.clone())
+                    .or_insert_with(SymbolState::new);
+                let action = match &state.book {
+                    None => DiffAction::Buffer,
+                    Some(book) => {
+                        if diff.u_final <= book.last_update_id {
+                            DiffAction::Skip
+                        } else if diff.u_first != book.last_update_id + 1 {
+                            DiffAction::Gap
+                        } else {
+                            DiffAction::Apply
+                        }
                     }
                 };
-                match msg {
-                    Message::Text(text) => {
-                        if !handle_text_message(&text, &tx, &mut states, &symbol_set, &client, &mut pending_snapshots).await {
-                            return Ok(());
+                match action {
+                    DiffAction::Skip => {}
+                    DiffAction::Buffer => {
+                        state.pending.push_back(diff);
+                        if !state.resyncing {
+                            state.resyncing = true;
+                            effects.push(SessionEffect::FetchSnapshot {
+                                symbol: symbol.clone(),
+                                after: Duration::ZERO,
+                            });
                         }
                     }
-                    Message::Ping(payload) => {
-                        if write.send(Message::Pong(payload)).await.is_err() {
-                            return Ok(());
+                    DiffAction::Gap => {
+                        tracing::warn!(
+                            symbol = %symbol,
+                            "venue-binance-futures: depth continuity gap detected, resyncing book"
+                        );
+                        state.book = None;
+                        state.pending.clear();
+                        state.pending.push_back(diff);
+                        state.resyncing = true;
+                        // Gap: предыдущий book инвалидирован; backoff сброшен предыдущим
+                        // success → attempt=0 → BASE=100ms. None (новая попытка, не retry).
+                        effects.push(SessionEffect::FetchSnapshot {
+                            symbol: symbol.clone(),
+                            after: Duration::ZERO,
+                        });
+                    }
+                    DiffAction::Apply => {
+                        if let Some(book) = state.book.as_mut() {
+                            // TD-014 FIX (a): `apply_diff_to_book` ДВИГАЕТ
+                            // `last_update_id = diff.u_final` — без этого 2-й contiguous
+                            // diff вечно "stale" → книга не синкается → 0 L2.
+                            apply_diff_to_book(book, &diff);
                         }
                     }
-                    Message::Close(_) => return Ok(()),
-                    Message::Binary(_) | Message::Pong(_) | Message::Frame(_) => {}
                 }
-            }
-            Some((symbol, result)) = pending_snapshots.next(), if !pending_snapshots.is_empty() => {
-                handle_snapshot(&mut states, symbol, result, &client, &mut pending_snapshots);
-            }
-            _ = emit_interval.tick() => {
-                if !emit_book_snapshots(&states, &tx).await {
-                    return Ok(());
-                }
-            }
-            _ = oi_interval.tick() => {
-                if !poll_open_interest(&client, &symbols, &tx).await {
-                    return Ok(());
-                }
-            }
-        }
-    }
-}
-
-/// Разобрать одно combined-stream текстовое сообщение и применить эффект:
-/// `forceOrder` → немедленная эмиссия `Liquidation`; `depth` diff → прогон через sync-автомат;
-/// `!markPrice@arr` → парс каждого item как funding, фильтр по `symbol_set`, эмит `Funding`.
-/// Возвращает `false`, если `tx` закрыт (получатель ушёл).
-async fn handle_text_message(
-    text: &str,
-    tx: &mpsc::Sender<EventKind>,
-    states: &mut HashMap<String, SymbolState>,
-    symbol_set: &HashSet<String>,
-    client: &reqwest::Client,
-    pending_snapshots: &mut FuturesUnordered<SnapshotFuture>,
-) -> bool {
-    let value: Value = match serde_json::from_str(text) {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::debug!(error = %e, raw = %text, "venue-binance-futures: malformed JSON, skipping");
-            return true;
-        }
-    };
-
-    let stream = match value.get("stream").and_then(|v| v.as_str()) {
-        Some(s) => s,
-        None => {
-            tracing::debug!(raw = %text, "venue-binance-futures: message without 'stream', skipping");
-            return true;
-        }
-    };
-    let data = match value.get("data") {
-        Some(d) => d,
-        None => {
-            tracing::debug!(raw = %text, "venue-binance-futures: message without 'data', skipping");
-            return true;
-        }
-    };
-
-    if stream.ends_with("@forceOrder") {
-        // Combined-stream fstream оборачивает событие в `{"stream":"...", "data":{...}}`,
-        // где `data` уже форма fstream — его прямо скармливаем `parse_force_order`.
-        let raw = match serde_json::to_string(data) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::debug!(error = %e, "venue-binance-futures: failed to re-serialize forceOrder data");
-                return true;
-            }
-        };
-        if let Some(event) = parse_force_order(&raw) {
-            if tx.send(EventKind::Md(event)).await.is_err() {
-                return false;
+            } else {
+                tracing::debug!(stream = %stream, "venue-binance-futures: unparseable depth frame");
             }
         } else {
-            tracing::debug!(raw = %raw, "venue-binance-futures: malformed forceOrder, skipping");
+            tracing::debug!(stream = %stream, "venue-binance-futures: unrecognized stream, skipping");
         }
-    } else if stream == "!markPrice@arr" {
-        // `!markPrice@arr` несёт массив объектов `{e,E,s,p,i,P,r,T,...}` per символ.
-        // Парсим каждый item, эмитим только те, чей `s` есть в нашей выборке.
-        let Some(arr) = data.as_array() else {
-            tracing::debug!(stream = %stream, "venue-binance-futures: !markPrice@arr without array, skipping");
-            return true;
-        };
-        for item in arr {
-            let raw = match serde_json::to_string(item) {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
-            let Some(event) = parse_mark_price(&raw) else {
-                // Парс-фейл по конкретному item — skip, остальные item'ы пробуем.
-                continue;
-            };
-            if !symbol_set.contains(&event.symbol) {
-                continue;
-            }
-            if tx.send(EventKind::Md(event)).await.is_err() {
-                return false;
-            }
-        }
-    } else if stream.contains("@depth") {
-        if let Some((symbol, diff)) = parse_depth_diff(stream, data) {
-            let state = states
-                .entry(symbol.clone())
-                .or_insert_with(SymbolState::new);
-            handle_diff(state, &symbol, diff, client, pending_snapshots);
-        } else {
-            tracing::debug!(stream = %stream, "venue-binance-futures: unparseable depth frame");
-        }
-    } else {
-        tracing::debug!(stream = %stream, "venue-binance-futures: unrecognized stream, skipping");
+
+        effects
     }
 
-    true
+    /// REST snapshot завершился — реконcилировать с буфером diff'ов (Binance algorithm).
+    /// `Ok(json)` — распарсить, применить contiguous buffered diff'ы, пометить символ
+    /// синхронизированным, сбросить backoff. `Err(status)` — увеличить backoff и вернуть
+    /// `FetchSnapshot` с задержкой (TD-013: не hot-loop; 418/429 → honor
+    /// `default_rate_limit_cooldown`).
+    pub fn on_snapshot_result(
+        &mut self,
+        symbol: &str,
+        result: Result<String, u16>,
+    ) -> Vec<SessionEffect> {
+        let mut effects = Vec::new();
+        let state = match self.states.get_mut(symbol) {
+            Some(s) => s,
+            None => return effects,
+        };
+
+        let mut book = match result {
+            Ok(json) => match parse_snapshot_for_book(&json) {
+                Some((last_update_id, bids, asks)) => {
+                    let mut fb = FuturesDepthBook::new();
+                    fb.apply_snapshot(&bids, &asks);
+                    OrderBook {
+                        book: fb,
+                        last_update_id,
+                        last_event_time_ms: 0,
+                    }
+                }
+                None => {
+                    tracing::warn!(
+                        symbol = %symbol,
+                        "venue-binance-futures: snapshot malformed, retrying with backoff"
+                    );
+                    let delay = state.backoff.next_delay(None);
+                    effects.push(SessionEffect::FetchSnapshot {
+                        symbol: symbol.to_string(),
+                        after: delay,
+                    });
+                    return effects;
+                }
+            },
+            Err(status) => {
+                // 418 (IP-ban) / 429 (rate-limit) → honor `default_rate_limit_cooldown`;
+                // прочие → exp база без cooldown.
+                let retry_after = if status == 418 || status == 429 {
+                    Some(default_rate_limit_cooldown(status))
+                } else {
+                    None
+                };
+                tracing::warn!(
+                    symbol = %symbol,
+                    status,
+                    "venue-binance-futures: snapshot fetch failed, retrying with backoff"
+                );
+                let delay = state.backoff.next_delay(retry_after);
+                effects.push(SessionEffect::FetchSnapshot {
+                    symbol: symbol.to_string(),
+                    after: delay,
+                });
+                return effects;
+            }
+        };
+
+        // Reconcile-loop: применять buffered diff'ы, пока они contiguous с `last_update_id`.
+        loop {
+            let front = state.pending.front().map(|d| (d.u_final, d.u_first));
+            let Some((u_final, u_first)) = front else {
+                state.book = Some(book);
+                state.resyncing = false;
+                // SUCCESS: снапшот согласован с буфером (или буфер пуст) → сброс backoff.
+                state.backoff.reset();
+                return effects;
+            };
+            if u_final <= book.last_update_id {
+                state.pending.pop_front();
+                continue;
+            }
+            if u_first > book.last_update_id + 1 {
+                // Stale: снапшот отстал от буфера diff'ов — сетевой/венюный race, НЕ
+                // server rate-limit (Retry-After нерелевантен), backoff всё равно
+                // применяем (анти-hot-loop: не лупить REST до полного resync).
+                tracing::warn!(
+                    symbol = %symbol,
+                    "venue-binance-futures: snapshot stale vs buffered diffs, refetching with backoff"
+                );
+                state.resyncing = true;
+                let delay = state.backoff.next_delay(None);
+                effects.push(SessionEffect::FetchSnapshot {
+                    symbol: symbol.to_string(),
+                    after: delay,
+                });
+                return effects;
+            }
+            // u_first <= last_update_id+1 <= u_final: applicable.
+            // TD-014 FIX (a): `apply_diff_to_book` двигает `last_update_id`, поэтому
+            // НЕСКОЛЬКО contiguous diff'ов применяются подряд (без фикса 2-й diff
+            // был бы "stale" относительно снимка last_update_id, который НЕ двигался).
+            let diff = state
+                .pending
+                .pop_front()
+                .expect("front() just returned Some");
+            apply_diff_to_book(&mut book, &diff);
+        }
+    }
+
+    /// Периодический тик (вызывается раз в `EMIT_PERIOD` из `run`): эмитит один
+    /// `L2Snapshot` на синхронизированный символ (есть book + биржевое время).
+    /// Символ только после REST-бутстрапа (без применённых diff'ов) не имеет биржевого
+    /// времени — НЕ выдумываем, пропускаем.
+    pub fn tick(&self) -> Vec<SessionEffect> {
+        let mut effects = Vec::new();
+        for (symbol, state) in self.states.iter() {
+            let Some(book_state) = &state.book else {
+                continue;
+            };
+            let ts_exch_ms = book_state.last_event_time_ms;
+            if ts_exch_ms == 0 {
+                continue;
+            }
+            let Some((&best_bid, _)) = book_state.book.bids_map().iter().next_back() else {
+                continue;
+            };
+            let Some((&best_ask, _)) = book_state.book.asks_map().iter().next() else {
+                continue;
+            };
+            let mid = (best_bid + best_ask) / 2;
+            if mid <= 0 {
+                continue;
+            }
+            let bids = bucket_levels(book_state.book.bids_map().iter().rev(), mid);
+            let asks = bucket_levels(book_state.book.asks_map().iter(), mid);
+            effects.push(SessionEffect::Emit(MdEvent {
+                venue: Venue::BinanceFutures,
+                symbol: symbol.clone(),
+                payload: MdPayload::L2Snapshot {
+                    bids,
+                    asks,
+                    ts_exch_ms,
+                },
+            }));
+        }
+        effects
+    }
 }
 
 /// fstream `@depth@100ms` diff payload (формат идентичен spot): `U`/`u` + `b`/`a`.
@@ -613,6 +730,18 @@ fn parse_diff_levels(levels: &Value) -> Option<Vec<(i64, i64)>> {
     Some(out)
 }
 
+/// Распарсить snapshot JSON → `(lastUpdateId, bids, asks)` для `OrderBook`. Битая/неполная
+/// форма → `None`. `bids`/`asks` проходят через `apply_snapshot`, который фильтрует
+/// `size<=0` (битые уровни) на insert-стадии — потому зеркалит поведение старого
+/// `fetch_snapshot`.
+fn parse_snapshot_for_book(json: &str) -> Option<(u64, Vec<Level>, Vec<Level>)> {
+    let v: Value = serde_json::from_str(json).ok()?;
+    let last_update_id = v.get("lastUpdateId")?.as_u64()?;
+    let bids = parse_l2_levels(v.get("bids")?)?;
+    let asks = parse_l2_levels(v.get("asks")?)?;
+    Some((last_update_id, bids, asks))
+}
+
 fn apply_diff_to_book(book: &mut OrderBook, diff: &DepthDiff) {
     let bids: Vec<Level> = diff
         .bids
@@ -625,155 +754,232 @@ fn apply_diff_to_book(book: &mut OrderBook, diff: &DepthDiff) {
         .map(|&(price, size)| Level { price, size })
         .collect();
     book.book.apply_diff(&bids, &asks);
+    // TD-014 FIX (a): ДВИГАТЬ `last_update_id` при apply, иначе 2-й contiguous diff
+    // вечно "stale" относительно неподвижного last_update_id → вечный resync → 0 L2.
     book.last_update_id = diff.u_final;
     book.last_event_time_ms = diff.event_time_ms;
 }
 
-/// Прогнать diff через sync-автомат (см. Binance snapshot+diff-sync docs).
-fn handle_diff(
-    state: &mut SymbolState,
-    symbol: &str,
-    diff: DepthDiff,
-    client: &reqwest::Client,
-    pending_snapshots: &mut FuturesUnordered<SnapshotFuture>,
-) {
-    let action = match &state.book {
-        None => DiffAction::Buffer,
-        Some(book) => {
-            if diff.u_final <= book.last_update_id {
-                DiffAction::Skip
-            } else if diff.u_first != book.last_update_id + 1 {
-                DiffAction::Gap
-            } else {
-                DiffAction::Apply
-            }
-        }
-    };
-    match action {
-        DiffAction::Skip => {}
-        DiffAction::Buffer => {
-            state.pending.push_back(diff);
-            if !state.resyncing {
-                state.resyncing = true;
-                // Bootstrap-fetch: attempt=0 → next_delay() вернёт BASE=100ms; передаём
-                // None (без pre-delay) — это новая попытка, не retry.
-                pending_snapshots.push(make_snapshot_future(
-                    client.clone(),
-                    symbol.to_string(),
-                    None,
-                ));
-            }
-        }
-        DiffAction::Gap => {
-            tracing::warn!(
-                symbol = %symbol,
-                "venue-binance-futures: depth continuity gap detected, resyncing book"
-            );
-            state.book = None;
-            state.pending.clear();
-            state.pending.push_back(diff);
-            state.resyncing = true;
-            // После gap книга инвалидирована; бэкофф сброшен предыдущим success —
-            // attempt=0 → BASE=100ms. None (новая попытка, не retry).
-            pending_snapshots.push(make_snapshot_future(
-                client.clone(),
-                symbol.to_string(),
-                None,
-            ));
-        }
-        DiffAction::Apply => {
-            if let Some(book) = state.book.as_mut() {
-                apply_diff_to_book(book, &diff);
-            }
-        }
-    }
-}
-
-/// REST snapshot завершился — реконcилировать с буфером diff'ов (Binance algorithm).
-/// TD-013 wiring: на fail/stale — `Backoff::next_delay(retry_after)` + РЕАЛЬНЫЙ sleep
-/// перед re-push (анти-hot-loop, §8); на success — `backoff.reset()`.
-fn handle_snapshot(
-    states: &mut HashMap<String, SymbolState>,
-    symbol: String,
-    result: SnapshotResult,
-    client: &reqwest::Client,
-    pending_snapshots: &mut FuturesUnordered<SnapshotFuture>,
-) {
-    let Some(state) = states.get_mut(&symbol) else {
-        return;
-    };
-    let mut book = match result {
-        Ok(book) => book,
-        Err(e) => {
-            // Извлечь Retry-After из типизированной ошибки (418/429) — `Other` (network/
-            // parse/HTTP≠418/429) идёт без `retry_after` (exp база).
-            let retry_after = match &e {
-                SnapshotError::RateLimited { retry_after } => Some(*retry_after),
-                SnapshotError::Other(_) => None,
-            };
-            tracing::warn!(
-                symbol = %symbol,
-                error = %e,
-                "venue-binance-futures: snapshot fetch failed, retrying with backoff"
-            );
-            let delay = state.backoff.next_delay(retry_after);
-            pending_snapshots.push(make_snapshot_future(
-                client.clone(),
-                symbol.clone(),
-                Some(delay),
-            ));
-            return;
-        }
-    };
-    loop {
-        let front = state.pending.front().map(|d| (d.u_final, d.u_first));
-        let Some((u_final, u_first)) = front else {
-            state.book = Some(book);
-            state.resyncing = false;
-            // SUCCESS: снапшот согласован с буфером (или буфер пуст) → сброс backoff.
-            state.backoff.reset();
-            return;
-        };
-        if u_final <= book.last_update_id {
-            state.pending.pop_front();
+/// Сжать одну сторону книги в бакеты по relative-distance от `mid` (как `venue-binance`).
+fn bucket_levels<'a, I>(iter: I, mid: i64) -> Vec<Level>
+where
+    I: Iterator<Item = (&'a i64, &'a i64)>,
+{
+    let mut bucket_order: Vec<i64> = Vec::new();
+    let mut buckets: HashMap<i64, (i64, i64)> = HashMap::new();
+    for (price, size) in iter {
+        let dist = (*price - mid).abs() as f64;
+        let rel = dist / mid as f64;
+        if rel > MAX_REL_DIST {
             continue;
         }
-        if u_first > book.last_update_id + 1 {
-            // Stale: снапшот отстал от буфера diff'ов — это сетевой/венюный race, НЕ
-            // server rate-limit (Retry-After нерелевантен), backoff всё равно применяем
-            // (анти-hot-loop: не лупить REST до полного resync).
-            tracing::warn!(
-                symbol = %symbol,
-                "venue-binance-futures: snapshot stale vs buffered diffs, refetching with backoff"
-            );
-            state.resyncing = true;
-            let delay = state.backoff.next_delay(None);
-            pending_snapshots.push(make_snapshot_future(
-                client.clone(),
-                symbol.clone(),
-                Some(delay),
-            ));
-            return;
+        let bucket_idx = (rel / BUCKET_WIDTH).floor() as i64;
+        match buckets.get_mut(&bucket_idx) {
+            Some(entry) => entry.1 += *size,
+            None => {
+                buckets.insert(bucket_idx, (*price, *size));
+                bucket_order.push(bucket_idx);
+            }
         }
-        let diff = state
-            .pending
-            .pop_front()
-            .expect("front() just returned Some");
-        apply_diff_to_book(&mut book, &diff);
+    }
+    bucket_order
+        .into_iter()
+        .map(|idx| {
+            let (price, size) = buckets[&idx];
+            Level { price, size }
+        })
+        .collect()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// I/O-обёртка (TD-014 FIX): run() ДЕЛЕГИРУЕТ в FuturesSession (live == tested)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Ошибка snapshot-fetch'а с разделением rate-limit (418/429 + `Retry-After`) и прочих.
+/// `status` пробросится через `run` в `FuturesSession::on_snapshot_result` как `Err(status)`,
+/// чтобы сессия могла применить `default_rate_limit_cooldown` для rate-limit'нутых кодов
+/// (TD-013: анти-hot-loop). `Retry-After` из headers пока honored внутри `fetch_snapshot_raw`
+/// (на случай INITIAL-connect после IP-ban — заголовок важнее дефолта).
+#[derive(Debug)]
+pub(crate) enum SnapshotError {
+    RateLimited { status: u16, retry_after: Duration },
+    Other(anyhow::Error),
+}
+
+impl std::fmt::Display for SnapshotError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RateLimited {
+                status,
+                retry_after,
+            } => {
+                write!(
+                    f,
+                    "rate-limited (status {status}), retry after {retry_after:?}"
+                )
+            }
+            Self::Other(e) => write!(f, "{e}"),
+        }
     }
 }
 
-/// `GET /fapi/v1/depth` → `OrderBook`. `T` снапшота НЕ несёт биржевого времени —
-/// оно появляется с первым применённым WS diff'ом (Binance docs).
+impl std::error::Error for SnapshotError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Other(e) => Some(e.as_ref()),
+            _ => None,
+        }
+    }
+}
+
+/// `SnapshotResult` — сырая JSON-строка (snapshot) или `SnapshotError`. Передаётся из
+/// `fetch_snapshot_raw` через `SnapshotFuture` в `run`, где транслируется в
+/// `Result<String, u16>` для `FuturesSession::on_snapshot_result` (потеря `retry_after`
+/// на этом шаге — сессия использует `default_rate_limit_cooldown(status)`, см. doc).
+type SnapshotResult = Result<String, SnapshotError>;
+
+type SnapshotFuture = Pin<Box<dyn Future<Output = (String, SnapshotResult)> + Send>>;
+
+/// Запустить сессию Binance USDT-M futures WS+REST. Шлёт `EventKind::Md(..)` в `tx`;
+/// `Sys(ConnUp(BinanceFutures))` — сразу после успешного WS-коннекта. Возвращает `Ok(())`
+/// при штатном закрытии/дисконнекте/уходе получателя; `Err(_)` — при ошибке коннекта.
+/// Reconnect/backoff — забота supervisor'а снаружи (emitter-not-owner, как в `venue-binance`).
+///
+/// TD-014: `run()` — ТОНКАЯ I/O-обёртка, делегирующая в `FuturesSession` (sync-state-машина
+/// БЕЗ сети/каналов). Вся нетривиальная логика (depth-sync, Funding-emit, backoff,
+/// L2Snapshot bucketizing) живёт в seam'е и покрыта RED-тестом `tests/red_live_emit.rs`.
+/// «Верный рефактор текущей логики» оставил бы multi-diff-stale → оракул RED, форсит фикс.
+pub async fn run(tx: mpsc::Sender<EventKind>, symbols: Vec<String>) -> anyhow::Result<()> {
+    let mut streams = Vec::with_capacity(symbols.len() * 2 + 1);
+    for s in &symbols {
+        let lower = s.to_lowercase();
+        streams.push(format!("{lower}@depth@100ms"));
+        streams.push(format!("{lower}@forceOrder"));
+    }
+    streams.push("!markPrice@arr".to_string());
+    let url = format!("{WS_BASE}{}", streams.join("/"));
+
+    let (ws_stream, _response) = tokio_tungstenite::connect_async(&url).await?;
+    let (mut write, mut read) = ws_stream.split();
+
+    if tx
+        .send(EventKind::Sys(SysEvent::ConnUp(Venue::BinanceFutures)))
+        .await
+        .is_err()
+    {
+        return Ok(());
+    }
+
+    let client = reqwest::Client::new();
+    let mut session = FuturesSession::new(&symbols);
+    let mut pending_snapshots: FuturesUnordered<SnapshotFuture> = FuturesUnordered::new();
+
+    // Стартовая синхронизация depth по каждому символу (REST snapshot — не ждём первого
+    // diff'а, чтобы bootstrap latency был минимален; pending diff'ы буферизуются в
+    // `FuturesSession::on_ws_text` пока snapshot не вернётся).
+    for s in &symbols {
+        let symbol = s.to_uppercase();
+        pending_snapshots.push(make_snapshot_future(client.clone(), symbol, Duration::ZERO));
+    }
+
+    let mut emit_interval = tokio::time::interval(EMIT_PERIOD);
+    emit_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // OI poll: первый tick `interval` срабатывает мгновенно — это намеренно (наблюдение
+    // OI сразу после синхронизации WS, не через OI_POLL_PERIOD); дальнейшие тики — каждые
+    // OI_POLL_PERIOD. `Burst` — дефолт, подходит.
+    let mut oi_interval = tokio::time::interval(OI_POLL_PERIOD);
+
+    loop {
+        tokio::select! {
+            msg = read.next() => {
+                let Some(msg) = msg else { return Ok(()) };
+                let msg = match msg {
+                    Ok(m) => m,
+                    Err(e) => {
+                        tracing::debug!(error = %e, "venue-binance-futures: WS read error, ending session");
+                        return Ok(());
+                    }
+                };
+                match msg {
+                    Message::Text(text) => {
+                        for eff in session.on_ws_text(&text) {
+                            if !apply_session_effect(eff, &tx, &client, &mut pending_snapshots).await {
+                                return Ok(());
+                            }
+                        }
+                    }
+                    Message::Ping(payload) => {
+                        if write.send(Message::Pong(payload)).await.is_err() {
+                            return Ok(());
+                        }
+                    }
+                    Message::Close(_) => return Ok(()),
+                    Message::Binary(_) | Message::Pong(_) | Message::Frame(_) => {}
+                }
+            }
+            Some((symbol, result)) = pending_snapshots.next(), if !pending_snapshots.is_empty() => {
+                // Транслировать `SnapshotResult` (Ok(json) / Err(RateLimited{status,..}) /
+                // Err(Other)) в `Result<String, u16>` для seam'а. `retry_after` из заголовка
+                // уже honored внутри `fetch_snapshot_raw`; здесь теряется (сессия
+                // использует `default_rate_limit_cooldown(status)`).
+                let session_result: Result<String, u16> = match result {
+                    Ok(json) => Ok(json),
+                    Err(SnapshotError::RateLimited { status, .. }) => Err(status),
+                    Err(SnapshotError::Other(_)) => Err(500),
+                };
+                for eff in session.on_snapshot_result(&symbol, session_result) {
+                    if !apply_session_effect(eff, &tx, &client, &mut pending_snapshots).await {
+                        return Ok(());
+                    }
+                }
+            }
+            _ = emit_interval.tick() => {
+                for eff in session.tick() {
+                    if let SessionEffect::Emit(md) = eff {
+                        if tx.send(EventKind::Md(md)).await.is_err() {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+            _ = oi_interval.tick() => {
+                if !poll_open_interest(&client, &symbols, &tx).await {
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
+/// Применить `SessionEffect` к I/O: `Emit` → `tx.send`; `FetchSnapshot` → пушнуть
+/// future с пред-calculated задержкой. `false` если `tx` закрыт (получатель ушёл) —
+/// `run` обязан вернуть `Ok(())`.
+async fn apply_session_effect(
+    eff: SessionEffect,
+    tx: &mpsc::Sender<EventKind>,
+    client: &reqwest::Client,
+    pending_snapshots: &mut FuturesUnordered<SnapshotFuture>,
+) -> bool {
+    match eff {
+        SessionEffect::Emit(md) => tx.send(EventKind::Md(md)).await.is_ok(),
+        SessionEffect::FetchSnapshot { symbol, after } => {
+            pending_snapshots.push(make_snapshot_future(client.clone(), symbol, after));
+            true
+        }
+    }
+}
+
+/// Запросить REST snapshot для символа и вернуть СЫРОЙ JSON (без парсинга). Парс и
+/// reconcile делает `FuturesSession::on_snapshot_result` — иначе дублирование логики
+/// и seam снова становится невидимым.
 ///
 /// TD-013: 418 (Binance IP-ban) / 429 (rate-limit) распознаём ДО `error_for_status` и
-/// пробразовываем в `SnapshotError::RateLimited { retry_after }`, чтобы `handle_snapshot`
-/// мог honor'ить `Retry-After` через `Backoff` (анти-hot-loop, §8). Без Retry-After —
-/// дефолт по статусу (418 — длинный cooldown, т.к. это IP-ban; 429 — средний).
-async fn fetch_snapshot(
+/// преобразовываем в `SnapshotError::RateLimited { status, retry_after }` —
+/// `retry_after` из `Retry-After` header (если есть) ИЛИ `default_rate_limit_cooldown(status)`.
+async fn fetch_snapshot_raw(
     client: &reqwest::Client,
     symbol: &str,
-) -> Result<OrderBook, SnapshotError> {
+) -> Result<String, SnapshotError> {
     let url = format!("{REST_DEPTH_BASE}{symbol}&limit={REST_DEPTH_LIMIT}");
     let response = client
         .get(&url)
@@ -784,48 +990,18 @@ async fn fetch_snapshot(
     if status.as_u16() == 418 || status.as_u16() == 429 {
         let retry_after = parse_retry_after_header(response.headers())
             .unwrap_or_else(|| default_rate_limit_cooldown(status.as_u16()));
-        return Err(SnapshotError::RateLimited { retry_after });
+        return Err(SnapshotError::RateLimited {
+            status: status.as_u16(),
+            retry_after,
+        });
     }
-    let snapshot: DepthSnapshotResponse = response
+    let text = response
         .error_for_status()
         .map_err(|e| SnapshotError::Other(e.into()))?
-        .json()
+        .text()
         .await
         .map_err(|e| SnapshotError::Other(e.into()))?;
-
-    let mut bids = Vec::with_capacity(snapshot.bids.len());
-    for (price, qty) in &snapshot.bids {
-        let price: f64 = price
-            .parse()
-            .map_err(|e: std::num::ParseFloatError| SnapshotError::Other(anyhow::Error::from(e)))?;
-        let qty: f64 = qty
-            .parse()
-            .map_err(|e: std::num::ParseFloatError| SnapshotError::Other(anyhow::Error::from(e)))?;
-        bids.push(Level {
-            price: to_fixed(price),
-            size: to_fixed(qty),
-        });
-    }
-    let mut asks = Vec::with_capacity(snapshot.asks.len());
-    for (price, qty) in &snapshot.asks {
-        let price: f64 = price
-            .parse()
-            .map_err(|e: std::num::ParseFloatError| SnapshotError::Other(anyhow::Error::from(e)))?;
-        let qty: f64 = qty
-            .parse()
-            .map_err(|e: std::num::ParseFloatError| SnapshotError::Other(anyhow::Error::from(e)))?;
-        asks.push(Level {
-            price: to_fixed(price),
-            size: to_fixed(qty),
-        });
-    }
-    let mut book = FuturesDepthBook::new();
-    book.apply_snapshot(&bids, &asks);
-    Ok(OrderBook {
-        book,
-        last_update_id: snapshot.last_update_id,
-        last_event_time_ms: 0,
-    })
+    Ok(text)
 }
 
 /// `Retry-After` header (RFC 7231 §7.1.3) → `Duration`. Binance использует формат
@@ -837,6 +1013,9 @@ fn parse_retry_after_header(headers: &reqwest::header::HeaderMap) -> Option<Dura
 
 /// Дефолтный cooldown когда `Retry-After` отсутствует: 418 (IP-ban) — длинный,
 /// 429 (rate-limit) — средний. Не 0 — иначе backoff не спасёт от hammering'а.
+/// Используется в `fetch_snapshot_raw` (как fallback к header) И в
+/// `FuturesSession::on_snapshot_result` (для Err(418/429) от run-уровня — сессия
+/// не получает `retry_after`, опирается на дефолт).
 fn default_rate_limit_cooldown(status: u16) -> Duration {
     match status {
         418 => Duration::from_secs(120),
@@ -845,36 +1024,28 @@ fn default_rate_limit_cooldown(status: u16) -> Duration {
     }
 }
 
-#[derive(Deserialize)]
-struct DepthSnapshotResponse {
-    #[serde(rename = "lastUpdateId")]
-    last_update_id: u64,
-    bids: Vec<(String, String)>,
-    asks: Vec<(String, String)>,
-}
-
-/// Сконструировать `SnapshotFuture` с опциональной pre-delay задержкой (TD-013 wiring).
-/// `pre_delay = None` — новая попытка (bootstrap, immediate). `pre_delay = Some(d)` —
-/// retry после fail/stale; внутри `tokio::time::sleep(d).await` ПЕРЕД `fetch_snapshot`.
+/// Сконструировать `SnapshotFuture` с заданной pre-delay задержкой. `after = ZERO` —
+/// fire immediately (bootstrap/gap); `after > 0` — retry после fail/stale, внутри
+/// `tokio::time::sleep(after).await` ПЕРЕД `fetch_snapshot_raw` (TD-013 wiring,
+/// анти-hot-loop, §8).
 fn make_snapshot_future(
     client: reqwest::Client,
     symbol: String,
-    pre_delay: Option<Duration>,
+    after: Duration,
 ) -> SnapshotFuture {
     Box::pin(async move {
-        if let Some(delay) = pre_delay {
-            if !delay.is_zero() {
-                tokio::time::sleep(delay).await;
-            }
+        if !after.is_zero() {
+            tokio::time::sleep(after).await;
         }
-        let result = fetch_snapshot(&client, &symbol).await;
+        let result = fetch_snapshot_raw(&client, &symbol).await;
         (symbol, result)
     })
 }
 
 /// Периодический REST-опрос `/fapi/v1/openInterest` per symbol → `MdEvent::OpenInterest`.
 /// Fail-closed: HTTP/parse failure → логируем + skip конкретный символ (не паникуем,
-/// polling продолжится со следующего тика — VN-I-7).
+/// polling продолжится со следующего тика — VN-I-7). НЕ идёт через `FuturesSession` —
+/// OI REST polling не имеет sync-state (push-аналога нет, опрос по таймеру).
 async fn poll_open_interest(
     client: &reqwest::Client,
     symbols: &[String],
@@ -915,79 +1086,6 @@ async fn poll_open_interest(
         }
     }
     true
-}
-
-/// Эмитировать по одному `L2Snapshot` на синхронизированный символ. Символ только после
-/// REST-бутстрапа (без применённых WS diff'ов) не имеет биржевого времени — не выдумываем.
-async fn emit_book_snapshots(
-    states: &HashMap<String, SymbolState>,
-    tx: &mpsc::Sender<EventKind>,
-) -> bool {
-    for (symbol, state) in states.iter() {
-        let Some(book_state) = &state.book else {
-            continue;
-        };
-        let ts_exch_ms = book_state.last_event_time_ms;
-        if ts_exch_ms == 0 {
-            continue;
-        }
-        let Some((&best_bid, _)) = book_state.book.bids_map().iter().next_back() else {
-            continue;
-        };
-        let Some((&best_ask, _)) = book_state.book.asks_map().iter().next() else {
-            continue;
-        };
-        let mid = (best_bid + best_ask) / 2;
-        if mid <= 0 {
-            continue;
-        }
-        let bids = bucket_levels(book_state.book.bids_map().iter().rev(), mid);
-        let asks = bucket_levels(book_state.book.asks_map().iter(), mid);
-        let event = EventKind::md(
-            Venue::BinanceFutures,
-            symbol.clone(),
-            MdPayload::L2Snapshot {
-                bids,
-                asks,
-                ts_exch_ms,
-            },
-        );
-        if tx.send(event).await.is_err() {
-            return false;
-        }
-    }
-    true
-}
-
-/// Сжать одну сторону книги в бакеты по relative-distance от `mid` (как `venue-binance`).
-fn bucket_levels<'a, I>(iter: I, mid: i64) -> Vec<Level>
-where
-    I: Iterator<Item = (&'a i64, &'a i64)>,
-{
-    let mut bucket_order: Vec<i64> = Vec::new();
-    let mut buckets: HashMap<i64, (i64, i64)> = HashMap::new();
-    for (price, size) in iter {
-        let dist = (*price - mid).abs() as f64;
-        let rel = dist / mid as f64;
-        if rel > MAX_REL_DIST {
-            continue;
-        }
-        let bucket_idx = (rel / BUCKET_WIDTH).floor() as i64;
-        match buckets.get_mut(&bucket_idx) {
-            Some(entry) => entry.1 += *size,
-            None => {
-                buckets.insert(bucket_idx, (*price, *size));
-                bucket_order.push(bucket_idx);
-            }
-        }
-    }
-    bucket_order
-        .into_iter()
-        .map(|idx| {
-            let (price, size) = buckets[&idx];
-            Level { price, size }
-        })
-        .collect()
 }
 
 /// `!markPrice@arr` (single item) / `<symbol>@markPrice` (markPriceUpdate) →
