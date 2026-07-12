@@ -13,9 +13,19 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use contracts::{EventKind, SysEvent};
+use contracts::{EventKind, SysEvent, Venue};
 use journal::Journal;
 use tokio::sync::mpsc;
+
+/// Площадки, которые рекордер супервизит по умолчанию. `main` спавнит `supervise()` по
+/// ЭТОМУ списку (config-driven, не хардкод). M-06 #4 (reland, post-TD-013): BinanceFutures
+/// подключён — эмиттер `venue-binance-futures::run` выдаёт depth (@depth@100ms), liquidations
+/// (@forceOrder), funding (!markPrice@arr) и OI (REST poll) через одну WS-сессию +
+/// honourащий TD-013 backoff (анти 418-hot-loop, см. §8 eyes-on).
+/// RED-оракул: `crates/recorder/tests/red_futures_wired.rs`.
+pub fn default_venues() -> Vec<Venue> {
+    vec![Venue::Binance, Venue::Hyperliquid, Venue::BinanceFutures]
+}
 
 /// Writer-цикл: пишет события из `rx` в журнал. По `shutdown` ОБЯЗАН сдрейнить уже
 /// буферизованные события (`try_recv` пока `Empty` или `Disconnected`), сделать
