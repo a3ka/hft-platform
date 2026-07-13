@@ -1,6 +1,7 @@
 # M-07 — Strategy brain: `alpha` → `portfolio` → `strategy` (мозг стратегии)
 
-STATUS: 🚧 PROPOSED. Authored: architect (Opus), 2026-07-13.
+STATUS: 🚧 PROPOSED (revision 2 — закрыты находки critic C-004: C1, C2, M1).
+Authored: architect (Opus), 2026-07-13.
 Гейты: **critic ОБЯЗАТЕЛЕН** (`.claude/rules/gates.md` §1 триггеры: 3 новых крейта,
 ≥5 коммитов) → engine-dev → research-dev → tester → reviewer.
 **risk-critic НЕ требуется:** milestone не трогает `crates/risk|killswitch|oms|contracts|venue-*`
@@ -57,9 +58,9 @@ wiring весов из `signals.json` (граница B, P3); netting/корре
 
 | Агент | Allowed | Forbidden |
 |---|---|---|
-| architect | `milestones/`, `docs/fa/strategy-brain.md`, `crates/{alpha,portfolio,strategy}/{Cargo.toml,src}` — **ТОЛЬКО T2-типы + trait-сигнатуры + `todo!()`-стабы** (скелет, паттерн M-04 task 1), `crates/*/tests/**` (RED, sacred), `scripts/verify_M-07.sh`, workspace-root `Cargo.toml` (members), **carve-out A1:** `crates/sim/src/types.rs` + `lib.rs` + `Cargo.toml` — ТОЛЬКО релокация T2 `OrderIntent`/`OrderKind` (удаление определения + `pub use strategy::...` + path-dep). Обоснование: релокация T2-формы атомарна по определению — половинчатое состояние (два определения одного типа) = ровно тот дефект, против которого стоит ST-I-7; логика не пишется | любой impl-код (тела `todo!()`), `crates/research-cli/src/**` |
+| architect | `milestones/`, `docs/fa/strategy-brain.md`, `crates/{alpha,portfolio,strategy}/{Cargo.toml,src}` — **ТОЛЬКО T2-типы + trait-сигнатуры + `todo!()`-стабы** (скелет, паттерн M-04 task 1), `crates/*/tests/**` (RED, sacred), `scripts/verify_M-07.sh`, workspace-root `Cargo.toml` (members), **carve-out A1:** `crates/sim/src/types.rs` + `lib.rs` + `Cargo.toml` — ТОЛЬКО релокация T2 `OrderIntent`/`OrderKind` (удаление определения + `pub use strategy::...` + path-dep). Обоснование: релокация T2-формы атомарна по определению — половинчатое состояние (два определения одного типа) = ровно тот дефект, против которого стоит ST-I-7; логика не пишется. **carve-out A2 (revision 2, по C-004 C2):** `crates/research-cli/src/strategy_cell.rs` (новый) + `lib.rs` (`pub mod`) + `Cargo.toml` (path-deps на мозг) — ТОЛЬКО типы/константы-дефолты/сигнатуры D7/D8 с `todo!()`-телами. Обоснование: без этих форм задача 6 гейтилась только грепами, удовлетворяемыми комментарием (C2) — RED-оракул невозможно написать против несуществующей сигнатуры | любой impl-код (тела `todo!()`), логика в `crates/research-cli/src/grid.rs` |
 | engine-dev | `crates/{alpha,portfolio,strategy}/src/**` + их `Cargo.toml` (свои deps), `crates/sim/src/**` + `crates/sim/Cargo.toml` (свои deps) | `*/tests/**` (sacred), `crates/{contracts,risk,killswitch,journal,venue-*}/**`, `crates/research-cli/**`, `scripts/**`, `docs/**` |
-| research-dev | `crates/research-cli/src/**` + `crates/research-cli/Cargo.toml` | всё остальное; `research/trials-ledger.jsonl` (ручная правка) |
+| research-dev | `crates/research-cli/src/**` + `crates/research-cli/Cargo.toml` | всё остальное; `research/trials-ledger.jsonl` (ручная правка); `crates/research-cli/tests/**` (sacred) |
 | tester | read-only; прогон `scripts/verify_M-07.sh` | правки кода |
 | reviewer | `PROJECT-STATE.md`, `TECH-DEBT.md`, merge `feat/M-07 → main` + §8 деплой-гейт | код |
 
@@ -71,8 +72,8 @@ wiring весов из `signals.json` (граница B, P3); netting/корре
 | 2 | ⏳ | `alpha` impl: `LinearAlpha` (комбинация весов, stale-expiry, clamp, детерминированный порядок) | engine-dev | `cargo test -p alpha` GREEN (AL-I-1..5) |
 | 3 | ⏳ | `portfolio` impl: `RiskBudget` + `size()` (сайзинг, fail-safe кап, flatten, fail-closed без лимита) | engine-dev | `cargo test -p portfolio` GREEN (PF-I-1..4) |
 | 4 | ⏳ | `strategy` impl: `DirectionalStrategy` (books → signals → alpha → portfolio → diff → интенты; in-flight + ttl; маркетабельная цена) | engine-dev | `cargo test -p strategy` GREEN (ST-I-1..7) |
-| 5 | ⏳ | `sim::StrategyBacktest` harness: прогон `dyn Strategy` через `BacktestExchange`, мост `SimFill → FillReport`, `BacktestReport` (D3/D7) | engine-dev | `cargo test -p sim` GREEN (ST-I-8 + регрессия SM-I-*) |
-| 6 | ⏳ | `research-cli/grid.rs`: снять ad-hoc harness (`OpenPosition`/`Action`), перевести ячейку на `sim::StrategyBacktest` + strategy-пайплайн; ledger/metrics/стресс-режимы семантически сохранены (D7/D8) | research-dev | `cargo test -p research-cli` GREEN; грепы T8 verify |
+| 5 | ⏳ | `sim::StrategyBacktest` harness: прогон `dyn Strategy` через `BacktestExchange`, мост `SimFill → FillReport` (сторона/инструмент — из интента через `order_meta`), `BacktestReport` (D3/D7) | engine-dev | `cargo test -p sim` GREEN (**ST-I-8a..f**: интенты доходят; **8e спай — КАЖДЫЙ филл доложен и верно подписан**; **8f — мутация будущего не меняет прошлое**; регрессия SM-I-*) |
+| 6 | ⏳ | `research-cli`: (а) реализовать `strategy_cell` (D7/D8: дефолты, `cell_params_hash`, `capital_ref_e8`, `returns_from_equity`); (б) переписать `grid.rs` — снять ad-hoc harness (`OpenPosition`/`Action`), гонять ячейку через `sim::StrategyBacktest` + `DirectionalStrategy`; ledger/стресс-режимы семантически сохранены | research-dev | `cargo test -p research-cli` GREEN (**GR-I-1..7**, включая ПОВЕДЕНЧЕСКИЕ GR-I-6/7: блок `strategy` реально меняет оборот; деадбенд глушит торговлю; ledger несёт канонический хэш) + RC-I-* регрессия |
 | 7 | ⏳ | Прогон `scripts/verify_M-07.sh` на чистом чекауте | tester | `VERDICT: PASS`, exit=0 |
 | 8 | ⏳ | Review + merge `feat/M-07 → main` + post-merge §8 (CI/Deploy + VPS eyes-on: recorder НЕ должен измениться — M-07 инертен для прода) | reviewer | Done Block + §8 пруф |
 
@@ -87,11 +88,21 @@ wiring весов из `signals.json` (граница B, P3); netting/корре
   включая `i64::MAX`-edge), PF-I-3 (нет лимита → 0), PF-I-4 (позиция без форкаста → flatten).
 - `crates/strategy/tests/red_strategy.rs` — ST-I-1 (diff 0→+X, +X→0), ST-I-2 (target ==
   current → нет интента), ST-I-3 (in-flight не дублирует; ttl → повтор), ST-I-4 (детерминизм),
-  ST-I-5 (no-lookahead: префикс-стабильность).
+  ST-I-5 (prefix-stability/replay-determinism — честная формулировка per C-004 M1).
 - `crates/strategy/tests/structural.rs` — ST-I-6 (грепы: нет sim/venue/journal/tokio/reqwest/
   rand/SystemTime/Instant/HashMap), ST-I-7 (`OrderIntent` ровно в одном крейте).
-- `crates/sim/tests/red_strategy_backtest.rs` — ST-I-8 (интеграция strategy→BacktestExchange:
-  прогон ×2 бит-идентичен; позиция стратегии == нетто филлов; интенты дошли до биржи).
+- `crates/sim/tests/red_strategy_backtest.rs` — ST-I-8a..d (интенты дошли до биржи;
+  согласованность позиции; детерминизм при seed; префикс филлов) + **ST-I-8e (C-004 C1):
+  спай-стратегия — `run()` обязан доложить КАЖДЫЙ филл и подписать `FillReport` верно
+  (сторона из интента, price/qty/fee/ts из `SimFill`); падает на пропуске `on_fill`,
+  выдуманных филлах и подписи «всё как Buy»** + **ST-I-8f (C-004 M1): настоящий
+  no-lookahead — мутация ТОЛЬКО будущих событий среза не меняет исполнения в прошлом**.
+- **`crates/research-cli/tests/red_grid_strategy.rs` (C-004 C2)** — GR-I-1..7: дефолты D8;
+  fail-closed валидация блока `strategy`; `params_hash` покрывает strategy+costs;
+  returns = Δequity/capital_ref (D7); capital_ref-формула; **ПОВЕДЕНЧЕСКИЕ GR-I-6/7** —
+  разный `max_position_e8` обязан дать разный оборот, а деадбенд шире лимита — ноль
+  интентов (ad-hoc harness с фиксированным `qty=1.0` оба валит), ledger несёт канонический
+  `cell_params_hash`. Именно эти два оракула, а не грепы, гейтят задачу 6.
 
 **Анти-плацебо.** Все RED падают на скелете (`todo!()` → panic), а не «зелены против
 заглушки». Ключевые оракулы спроектированы так, чтобы наивная реализация ПАДАЛА:
