@@ -1,6 +1,8 @@
 # M-07 — Strategy brain: `alpha` → `portfolio` → `strategy` (мозг стратегии)
 
-STATUS: 🚧 IN_PROGRESS (revision 3 — reviewer-находка: сэмплинг equity_curve, оракулы ST-I-8g/8h; задача 9 BLOCKING).
+STATUS: ✅ DONE (2026-07-13; reviewer APPROVED, ff-merge в `main` `5141fd9`, reviewer-коммит
+`656c7ca`; CI+Deploy success; §8 eyes-on на VPS GREEN — recorder инертен; `verify_M-07.sh`
+21/21 PASS, exit=0). Revision 3 (reviewer-находка: сэмплинг equity_curve → ST-I-8g/8h → задача 9).
 Authored: architect (Opus), 2026-07-13.
 Гейты: **critic ОБЯЗАТЕЛЕН** (`.claude/rules/gates.md` §1 триггеры: 3 новых крейта,
 ≥5 коммитов) → engine-dev → research-dev → tester → reviewer.
@@ -69,14 +71,14 @@ wiring весов из `signals.json` (граница B, P3); netting/корре
 | # | Status | Задача | Агент | Verify |
 |---|---|---|---|---|
 | 1 | ✅ | Скелеты `alpha`/`portfolio`/`strategy` (T2-типы, трейты, `todo!()`), релокация `OrderIntent` (carve-out A1), workspace members, RED-suite, `verify_M-07.sh` | architect | workspace компилируется; fmt+clippy зелёные; RED-suite ПАДАЕТ (todo!) |
-| 2 | ⏳ | `alpha` impl: `LinearAlpha` (комбинация весов, stale-expiry, clamp, детерминированный порядок) | engine-dev | `cargo test -p alpha` GREEN (AL-I-1..5) |
-| 3 | ⏳ | `portfolio` impl: `RiskBudget` + `size()` (сайзинг, fail-safe кап, flatten, fail-closed без лимита) | engine-dev | `cargo test -p portfolio` GREEN (PF-I-1..4) |
-| 4 | ⏳ | `strategy` impl: `DirectionalStrategy` (books → signals → alpha → portfolio → diff → интенты; in-flight + ttl; маркетабельная цена) | engine-dev | `cargo test -p strategy` GREEN (ST-I-1..7) |
-| 5 | ⏳ | `sim::StrategyBacktest` harness: прогон `dyn Strategy` через `BacktestExchange`, мост `SimFill → FillReport` (сторона/инструмент — из интента через `order_meta`), `BacktestReport` (D3/D7) | engine-dev | `cargo test -p sim` GREEN (**ST-I-8a..f**: интенты доходят; **8e спай — КАЖДЫЙ филл доложен и верно подписан**; **8f — мутация будущего не меняет прошлое**; регрессия SM-I-*) |
-| 6 | ⏳ | `research-cli`: (а) реализовать `strategy_cell` (D7/D8: дефолты, `cell_params_hash`, `capital_ref_e8`, `returns_from_equity`); (б) переписать `grid.rs` — снять ad-hoc harness (`OpenPosition`/`Action`), гонять ячейку через `sim::StrategyBacktest` + `DirectionalStrategy`; ledger/стресс-режимы семантически сохранены | research-dev | `cargo test -p research-cli` GREEN (**GR-I-1..7**, включая ПОВЕДЕНЧЕСКИЕ GR-I-6/7: блок `strategy` реально меняет оборот; деадбенд глушит торговлю; ledger несёт канонический хэш) + RC-I-* регрессия |
-| 7 | ⏳ | Прогон `scripts/verify_M-07.sh` на чистом чекауте | tester | `VERDICT: PASS`, exit=0 |
-| 9 | ⏳ | **(rev 3, BLOCKING)** Фикс сэмплинга `equity_curve_e8` в `sim::StrategyBacktest::run` (D7): точка привязывается к «на ЭТОМ событии был ≥1 филл», а не к `curve.len() < fills.len()`. Попутно убрать мёртвый `let _ = signed_qty;` и висячий комментарий (`strategy_backtest.rs:85-88,117,156-162`) | engine-dev | `cargo test -p sim` GREEN, включая **ST-I-8g/8h**; `verify_M-07.sh` T5b PASS |
-| 8 | ⏳ | Review + merge `feat/M-07 → main` + post-merge §8 (CI/Deploy + VPS eyes-on: recorder НЕ должен измениться — M-07 инертен для прода) | reviewer | Done Block + §8 пруф |
+| 2 | ✅ | `alpha` impl: `LinearAlpha` (комбинация весов, stale-expiry, clamp, детерминированный порядок) | engine-dev | `cargo test -p alpha` GREEN (AL-I-1..5) |
+| 3 | ✅ | `portfolio` impl: `RiskBudget` + `size()` (сайзинг, fail-safe кап, flatten, fail-closed без лимита) | engine-dev | `cargo test -p portfolio` GREEN (PF-I-1..4) |
+| 4 | ✅ | `strategy` impl: `DirectionalStrategy` (books → signals → alpha → portfolio → diff → интенты; in-flight + ttl; маркетабельная цена) | engine-dev | `cargo test -p strategy` GREEN (ST-I-1..7) |
+| 5 | ✅ | `sim::StrategyBacktest` harness: прогон `dyn Strategy` через `BacktestExchange`, мост `SimFill → FillReport` (сторона/инструмент — из интента через `order_meta`), `BacktestReport` (D3/D7) | engine-dev | `cargo test -p sim` GREEN (**ST-I-8a..f**: интенты доходят; **8e спай — КАЖДЫЙ филл доложен и верно подписан**; **8f — мутация будущего не меняет прошлое**; регрессия SM-I-*) |
+| 6 | ✅ | `research-cli`: (а) реализовать `strategy_cell` (D7/D8: дефолты, `cell_params_hash`, `capital_ref_e8`, `returns_from_equity`); (б) переписать `grid.rs` — снять ad-hoc harness (`OpenPosition`/`Action`), гонять ячейку через `sim::StrategyBacktest` + `DirectionalStrategy`; ledger/стресс-режимы семантически сохранены | research-dev | `cargo test -p research-cli` GREEN (**GR-I-1..7**, включая ПОВЕДЕНЧЕСКИЕ GR-I-6/7: блок `strategy` реально меняет оборот; деадбенд глушит торговлю; ledger несёт канонический хэш) + RC-I-* регрессия |
+| 7 | ✅ | Прогон `scripts/verify_M-07.sh` на чистом чекауте | tester | `VERDICT: PASS`, exit=0 |
+| 9 | ✅ | **(rev 3, BLOCKING)** Фикс сэмплинга `equity_curve_e8` в `sim::StrategyBacktest::run` (D7): точка привязывается к «на ЭТОМ событии был ≥1 филл», а не к `curve.len() < fills.len()`. Попутно убрать мёртвый `let _ = signed_qty;` и висячий комментарий (`strategy_backtest.rs:85-88,117,156-162`) | engine-dev | `cargo test -p sim` GREEN, включая **ST-I-8g/8h**; `verify_M-07.sh` T5b PASS |
+| 8 | ✅ | Review + merge `feat/M-07 → main` + post-merge §8 (CI/Deploy + VPS eyes-on: recorder НЕ должен измениться — M-07 инертен для прода) | reviewer | Done Block + §8 пруф |
 
 Задачи 2 и 3 параллелятся; 4 зависит от 2+3; 5 от 4; 6 от 5.
 
@@ -123,3 +125,42 @@ contracts/journal/book/signals + структурные грепы, включа
 
 architect → **critic** (гейт §1: 3 новых крейта, ≥5 коммитов) → engine-dev (2,3 → 4 → 5)
 → research-dev (6) → tester (7) → reviewer (8, merge + §8).
+
+## Close-out (2026-07-13, architect)
+
+**Результат.** Мозг стратегии построен и сквозной: `SignalOut → Forecast → TargetPosition →
+OrderIntent → sim::BacktestExchange`. Ad-hoc harness из `research-cli/src/grid.rs` (taker-in
+по сигналу, taker-out по horizon) УДАЛЁН — бэктест больше не меряет логику, которой не будет
+в live (DESIGN §1, равенство 2). Тот же `dyn Strategy` в P3+ погонит `runner` на живом фиде.
+
+**Пруф (reviewer, §8):** ff-merge `5141fd9` → `main`, reviewer-коммит `656c7ca`; CI + Deploy
+success; §8 eyes-on на VPS GREEN — recorder инертен (поведение не изменилось; инертность
+подтверждена и структурно: дерево зависимостей recorder не содержит `alpha`/`portfolio`/
+`strategy`/`sim` — канарейка T10). `verify_M-07.sh` 21/21 PASS, exit=0.
+
+**Чему научил цикл (для следующих milestone'ов):**
+1. **Гейт зелёный ≠ инвариант проверен.** Дважды ловили дыру НЕ в коде, а в моём RED-suite:
+   C-004 C2 (задача 6 гейтилась грепами, удовлетворяемыми комментарием) и rev 3 (форма
+   `equity_curve` не ассертилась НИГДЕ — verify показывал 20/20 при неверной реализации).
+   Правило: **если инвариант живёт в данных, которые кто-то ниже по потоку считает метрикой,
+   оракул обязан сверять эти данные ПОЭЛЕМЕНТНО с независимым пересчётом, а не по длине/факту
+   существования.**
+2. **Поведенческий оракул > греп.** GR-I-6/7 падали на РЕАЛЬНЫХ числах старого harness'а
+   (одинаковый оборот при `max_position` ×30; торговля при глухом деадбенде) — такое
+   комментарием не обойти.
+3. **Цена ошибки определяет глубину оракула.** Дефект сэмплинга кривой не ронял ничего —
+   он тихо занижал σ и завышал Sharpe, а этот путь ведёт к подписи founder'а (gates §6/§7).
+   Такие места гейтятся отдельной строкой в verify (T5b), а не агрегатом.
+
+**Следствия для M-08 (risk/killswitch/oms) — обязательны к учёту при планировании:**
+- `portfolio::size` — **pre-trade sanity, НЕ риск-гейт**. `PF-I-2` (кап позиции) ничего не
+  гарантирует про деньги: он лишь не даёт конвейеру решений ВЫРАЗИТЬ абсурдный размер.
+- Fail-closed `RiskApproved<Order>` (приватный конструктор в `crates/risk`) встаёт **МЕЖДУ**
+  `strategy` и `oms`: `OrderIntent` — намерение, не разрешение. Типовой барьер (`RK-I-1`):
+  venue/oms принимает ТОЛЬКО `RiskApproved<_>`; `strategy` его сконструировать не может.
+- M-08 трогает `risk`/`killswitch`/`oms` → **RISK-BLOCK** (`gates.md` §5): critic + **risk-critic**
+  (сильная модель) обязательны; RED-suite `RK-I-1..10` + `INTG-I-*` обязан падать на заглушках.
+
+**Открытый долг, унаследованный отсюда:** TD-015 (несопоставимость эпох trials-ledger) —
+правило чтения закреплено в `.claude/rules/gates.md` §6.3/§6.4 (пункт 0 чек-листа risk-critic)
+и в амендменте к M-04 задаче 8. Кода-долга нет; долг — дисциплина чтения ledger'а.
