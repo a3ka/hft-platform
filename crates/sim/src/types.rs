@@ -1,26 +1,13 @@
 //! T2/T3 доменный словарь sim (FA §3). Владеет крейт; architect-каркас.
+//!
+//! `OrderIntent`/`OrderKind` здесь БОЛЬШЕ НЕ ОПРЕДЕЛЯЮТСЯ (M-07 D1, carve-out A1):
+//! форма ордер-интента принадлежит Слою 4 (`strategy` — её продюсер), иначе live-`runner`
+//! линковал бы симулятор ради типа. Ре-экспорт сохраняет публичный API `sim`;
+//! определение ровно одно на систему (ST-I-7, зеркало CT-I-1).
 
 use contracts::{Side, Venue};
 
-/// Maker (лимитка в очередь) | Taker (проедание видимой книги).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OrderKind {
-    Maker,
-    Taker,
-}
-
-/// Намерение от oms/harness — форма идентична тому, что получил бы реальный venue (FA §2).
-#[derive(Debug, Clone, PartialEq)]
-pub struct OrderIntent {
-    pub venue: Venue,
-    pub symbol: String,
-    pub side: Side,
-    /// Лимит-цена ×1e8 (maker) / marketable-предел (taker).
-    pub price: i64,
-    /// Размер ×1e8.
-    pub qty: i64,
-    pub kind: OrderKind,
-}
+pub use strategy::types::{OrderIntent, OrderKind};
 
 /// Состояние очереди maker-ордера (FA §5). ahead = видимый объём ПЕРЕД нами на уровне
 /// в момент активации (хвост уровня); cum_traded — суммарный traded-объём по нашей цене

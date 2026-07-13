@@ -15,6 +15,7 @@ pub mod fill_model;
 pub mod funding;
 pub mod latency;
 pub mod rng;
+pub mod strategy_backtest;
 pub mod types;
 
 pub use divergence::{p4_gate, DivergenceMetric, DivergenceTolerance, GateBlocked};
@@ -22,6 +23,7 @@ pub use exchange::BacktestExchange;
 pub use fees::{FeeRates, FeeSchedule};
 pub use latency::{LatencyDraw, LatencyTable};
 pub use rng::SplitMix64;
+pub use strategy_backtest::{BacktestReport, StrategyBacktest};
 pub use types::{
     FillDecision, OrderIntent, OrderKind, QueueState, SimError, SimFill, SimOrder, TradedTick,
 };
