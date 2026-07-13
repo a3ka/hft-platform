@@ -175,8 +175,15 @@ reviewer мержит в main уже GREEN. Прямой push RED-состоян
 worktree-ветке, цепочка рвётся — TD-014). Push-scope (`git log origin/feat/M-NN..HEAD` =
 только твои коммиты) обязателен по-прежнему.
 
+## 9. Изоляция ролей в общем чекауте (добавлено 2026-07-13)
+
+Общий рабочий каталог + `git checkout` разными ролями = потерянная работа и потерянные
+артефакты гейтов. Правила — `.claude/rules/branch-hygiene.md` (worktree на роль; вердикт
+критика КОММИТИТСЯ на ветку milestone'а, а не остаётся untracked-файлом).
+
 ## Cross-references
 
+- `.claude/rules/branch-hygiene.md` — ветки/worktree/артефакты ролей
 - `.claude/rules/scope-guard.md` — зоны, за нарушение которых гейт 4 реджектит
 - `.claude/rules/testing.md` — детали RED-first дисциплины
 - `.claude/rules/commit-discipline.md` — Done Block формат
