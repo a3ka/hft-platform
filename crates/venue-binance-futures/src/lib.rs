@@ -34,6 +34,8 @@ const WS_BASE: &str = "wss://fstream.binance.com/stream?streams=";
 const REST_DEPTH_BASE: &str = "https://fapi.binance.com/fapi/v1/depth?symbol=";
 const REST_DEPTH_LIMIT: &str = "1000";
 const REST_OI_BASE: &str = "https://fapi.binance.com/fapi/v1/openInterest?symbol=";
+// All-perps premiumIndex в 1 вызове (без ?symbol=) — поле `lastFundingRate` + `time` per entry.
+const REST_PREMIUM_INDEX: &str = "https://fapi.binance.com/fapi/v1/premiumIndex";
 
 /// Ширина relative-distance бакета при сжатии полного фьючерс-стакана в L2Snapshot
 /// (0.02% от mid — единообразно с `venue-binance`, BUCKET_WIDTH).
@@ -45,6 +47,11 @@ const EMIT_PERIOD: Duration = Duration::from_secs(1);
 /// Период опроса REST `/fapi/v1/openInterest` (10с). Binance Futures REST не публикует
 /// push-стрим OI — это KISS-выбор; конкретный cadence уточняется recorder'ом (M-06 task 4).
 const OI_POLL_PERIOD: Duration = Duration::from_secs(10);
+/// Период опроса REST `/fapi/v1/premiumIndex` (TD-014 T4): Funding через REST-poll —
+/// единственный надёжный путь (WS markPrice не доставляется live, см. §8 REJECT ×5).
+/// Cadence как OI (10с); funding меняется каждые 8ч на Binance, но poll-избыточность
+/// дёшева и даёт consistent-тактинг для recorder'а (Funding всегда свежий в журнале).
+const FUNDING_POLL_PERIOD: Duration = Duration::from_secs(10);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Чистые парс-функции (RED-boundary)
@@ -114,6 +121,50 @@ pub fn parse_open_interest(symbol: &str, json: &str) -> Option<MdEvent> {
             ts_exch_ms,
         },
     })
+}
+
+/// `/fapi/v1/premiumIndex` (all-perps массив) → `Vec<MdEvent{BinanceFutures, Funding}>`.
+/// Каждая запись `{symbol, lastFundingRate, time, ...}` → Funding{rate_e8, ts_exch_ms}.
+/// Poller фильтрует по подписанным символам (REST отдаёт ВСЕ perp'ы в 1 вызове).
+/// Знак `lastFundingRate` СОХРАНЯЕТСЯ (положит/отрицат критичны для funding-breadth
+/// derive, M-06 #5). Битая/неполная запись → пропускается (не падает весь poll).
+/// Пустой/не-array JSON → пустой Vec (VN-I-7, fail-closed: poll повторится на след. тике).
+pub fn parse_premium_index(json: &str) -> Vec<MdEvent> {
+    let v: Value = match serde_json::from_str(json) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::debug!(error = %e, "venue-binance-futures: premiumIndex JSON parse failed");
+            return Vec::new();
+        }
+    };
+    let Some(arr) = v.as_array() else {
+        tracing::debug!("venue-binance-futures: premiumIndex not an array, skipping");
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for item in arr {
+        let Some(symbol) = item.get("symbol").and_then(|x| x.as_str()) else {
+            continue;
+        };
+        let Some(rate_str) = item.get("lastFundingRate").and_then(|x| x.as_str()) else {
+            continue;
+        };
+        let Ok(rate) = rate_str.parse::<f64>() else {
+            continue;
+        };
+        let Some(time) = item.get("time").and_then(|x| x.as_i64()) else {
+            continue;
+        };
+        out.push(MdEvent {
+            venue: Venue::BinanceFutures,
+            symbol: symbol.to_string(),
+            payload: MdPayload::Funding {
+                rate_e8: to_fixed(rate),
+                ts_exch_ms: time,
+            },
+        });
+    }
+    out
 }
 
 /// `[["price","qty"], ...]` → `Vec<Level>` (fixed-point ×1e8). Невалидный уровень — весь
@@ -913,16 +964,14 @@ type SnapshotFuture = Pin<Box<dyn Future<Output = (String, SnapshotResult)> + Se
 /// L2Snapshot bucketizing) живёт в seam'е и покрыта RED-тестом `tests/red_live_emit.rs`.
 /// «Верный рефактор текущей логики» оставил бы multi-diff-stale → оракул RED, форсит фикс.
 pub async fn run(tx: mpsc::Sender<EventKind>, symbols: Vec<String>) -> anyhow::Result<()> {
-    let mut streams = Vec::with_capacity(symbols.len() * 3);
+    // TD-014 T4: WS markPrice подписка УБРАНА (live-capture: 0 markPrice при 400 depth,
+    // sandbox и прод-VPS — WS markPrice не доставляется в этом сетапе). Funding теперь
+    // идёт через REST-poll `/fapi/v1/premiumIndex` (тот же механизм, что OI).
+    let mut streams = Vec::with_capacity(symbols.len() * 2);
     for s in &symbols {
         let lower = s.to_lowercase();
         streams.push(format!("{lower}@depth@100ms"));
         streams.push(format!("{lower}@forceOrder"));
-        // TD-014 T3 FIX: PER-SYMBOL `<sym>@markPrice@1s` вместо агрегированного
-        // `!markPrice@arr`. На combined endpoint Binance НЕ доставляет `!markPrice@arr`
-        // вместе с per-symbol стримами (live-capture: markPrice=0 при depth=139 → 0
-        // Funding в журнале). Per-symbol форма надёжна в combined-stream.
-        streams.push(format!("{lower}@markPrice@1s"));
     }
     let url = format!("{WS_BASE}{}", streams.join("/"));
 
@@ -955,6 +1004,9 @@ pub async fn run(tx: mpsc::Sender<EventKind>, symbols: Vec<String>) -> anyhow::R
     // OI сразу после синхронизации WS, не через OI_POLL_PERIOD); дальнейшие тики — каждые
     // OI_POLL_PERIOD. `Burst` — дефолт, подходит.
     let mut oi_interval = tokio::time::interval(OI_POLL_PERIOD);
+    // Funding poll (TD-014 T4): тот же pattern, отдельный тик. 1 вызов → ВСЕ perp'ы →
+    // фильтр на наши символы → Funding events.
+    let mut funding_interval = tokio::time::interval(FUNDING_POLL_PERIOD);
 
     loop {
         tokio::select! {
@@ -1011,6 +1063,11 @@ pub async fn run(tx: mpsc::Sender<EventKind>, symbols: Vec<String>) -> anyhow::R
             }
             _ = oi_interval.tick() => {
                 if !poll_open_interest(&client, &symbols, &tx).await {
+                    return Ok(());
+                }
+            }
+            _ = funding_interval.tick() => {
+                if !poll_premium_index(&client, &symbols, &tx).await {
                     return Ok(());
                 }
             }
@@ -1152,6 +1209,59 @@ async fn poll_open_interest(
             }
         }
     }
+    true
+}
+
+/// Периодический REST-опрос `/fapi/v1/premiumIndex` (all-perps в 1 вызове) →
+/// `MdEvent::Funding` для каждого подписанного символа. TD-014 T4: WS markPrice не
+/// доставляется (live-capture: 0 msg), Funding надёжно идёт через REST-poll (тот же
+/// паттерн, что OI-poll — OI=66 персистится live, тот же механизм здесь).
+///
+/// Fail-closed: HTTP/parse failure → лог + skip весь тик (poll повторится). Битые
+/// записи внутри массива → skip конкретную (всё равно поллим весь массив). НЕ идёт
+/// через `FuturesSession` — у funding нет sync-state, это REST polling по таймеру.
+async fn poll_premium_index(
+    client: &reqwest::Client,
+    symbols: &[String],
+    tx: &mpsc::Sender<EventKind>,
+) -> bool {
+    let subscribed: HashSet<String> = symbols.iter().map(|s| s.to_uppercase()).collect();
+    let resp = match client.get(REST_PREMIUM_INDEX).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::debug!(error = %e, "venue-binance-futures: premiumIndex poll HTTP error, skipping tick");
+            return true;
+        }
+    };
+    let body = match resp.error_for_status() {
+        Ok(r) => match r.text().await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::debug!(error = %e, "venue-binance-futures: premiumIndex poll body read, skipping tick");
+                return true;
+            }
+        },
+        Err(e) => {
+            tracing::debug!(error = %e, "venue-binance-futures: premiumIndex poll HTTP status, skipping tick");
+            return true;
+        }
+    };
+    let events = parse_premium_index(&body);
+    let mut emitted = 0usize;
+    for event in events {
+        if !subscribed.contains(&event.symbol) {
+            continue; // Поллер отдаёт ВСЕ perp'ы; фильтруем на нашу выборку.
+        }
+        if tx.send(EventKind::Md(event)).await.is_err() {
+            return false;
+        }
+        emitted += 1;
+    }
+    tracing::trace!(
+        emitted,
+        total_parsed = ?(),
+        "venue-binance-futures: premiumIndex tick"
+    );
     true
 }
 
