@@ -137,6 +137,19 @@
   **`BinanceFutures.Funding=0`** in the 48 MiB journal tail since deploy. Candidate was not merged;
   VPS restored to `origin/main` `4012c55` and rechecked healthy, spot+HL only. TD-014 remains
   OPEN/BLOCKING, now narrowed to persisted live Funding emission under the real fstream path.
+  **LIVE TD-014 T3 RESULT (`99b1329` over `c747a97`, 2026-07-13):** per-symbol markPrice oracle
+  passed locally and reviewer static check confirmed `run()` subscribes to
+  `<sym>@markPrice@1s`, while `FuturesSession::on_ws_text` emits Funding from both per-symbol
+  single-object markPrice and legacy `!markPrice@arr`. Local gates all GREEN: `red_futures_wired`,
+  `venue-binance-futures` 9/9, workspace tests, fmt/clippy, `verify_M-06.sh` PASS exit=0.
+  Pre-merge §8 on VPS still NOT GREEN: journal tails since deploy had
+  `BinanceFutures.L2Snapshot=637`, `OpenInterest=66`, `seq_gaps=0`; later log window was clean
+  (`gap=0`, `stale=0`, `429=0`, CPU ~1.2%, restarts=0), but **`BinanceFutures.Funding=0`**
+  persisted and logs had `markPrice/Funding=0`. Candidate was not merged; VPS restored to
+  `origin/main` `1d5ecfa` and rechecked healthy, spot+HL only. TD-014 remains OPEN/BLOCKING.
+  The next fix must instrument or reproduce raw WS delivery/stream-name/parse-drop behavior:
+  current unit coverage proves parser/session handling, but not that Binance actually delivers
+  a usable markPrice message through this combined session.
 
 ## Замечания reviewer'а M-06 #4 (2026-07-11)
 - **RN-9** (§8 eyes-on поймал то, что все зелёные гейты пропустили — снова) Code-review A+B
@@ -170,6 +183,13 @@
   `!markPrice@arr` live path all the way to `MdPayload::Funding` in journal-recovered output, with
   observable parse/drop counters or equivalent diagnostics; parser-only fixtures are no longer
   sufficient.
+- **RN-15** (§8 TD-014 T3 miss) `99b1329` added per-symbol `<sym>@markPrice@1s` and passed the
+  new RED, but live still persisted zero Funding while L2/OI were healthy and churn was gone.
+  This rules out recorder wiring and most depth-sync starvation theories. Next cycle should add
+  raw WS markPrice observability before another reland: count received stream names, parse failures,
+  symbol-filter drops, and emitted Funding, or capture a short live fstream sample under the exact
+  combined URL. Without those counters, local RED can keep proving paths for messages that prod
+  never receives or silently drops.
 
 ## Замечания reviewer'а M-05 (не блокирующие, 2026-07-11)
 - **RN-8** (fmt-гейт под-покрытие) `verify_M-05.sh` fmt-гейт проверяет только `journal+book`, не

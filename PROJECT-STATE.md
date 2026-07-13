@@ -135,12 +135,26 @@ recorder БЕЗ изменений (CPU 0.79%, MEM 5.6 MiB, сегмент ра�
   **`BinanceFutures.Funding=0`** в 48 MiB journal-tail за несколько минут live-window.
   `!markPrice@arr` не является rare-event, поэтому это не §8-GREEN. Branch НЕ смержен; VPS
   восстановлен на `origin/main` `4012c55` (spot+HL only, healthy, hb age ~6s, CPU 0.58%).
+- **TD-014 T3 + #4 reland `99b1329` — REJECTED (§8 live NOT GREEN, 2026-07-13).**
+  Цепочка `c747a97` RED per-symbol markPrice + `99b1329` per-symbol `<sym>@markPrice@1s`
+  subscription прошла локально: `red_futures_wired` PASS, `venue-binance-futures` 9/9 PASS,
+  workspace tests PASS, fmt/clippy clean, `verify_M-06.sh` PASS exit=0. Static review подтвердил:
+  runner подписывает per-symbol `@markPrice@1s`, `FuturesSession` поддерживает одиночный
+  `markPriceUpdate` и legacy `!markPrice@arr`, diff MD-only. Pre-merge §8 на VPS показал:
+  recorder healthy, 3 venue стартовали, heartbeat свежий, CPU ~1.1-1.2%, MEM ~6-7 MiB,
+  restarts=0, `seq_gaps=0`, fresh tails с deploy: `BinanceFutures.L2Snapshot=637`,
+  `OpenInterest=66`; позднее окно имело `gap=0`, `stale=0`, `429=0`. Но обязательный
+  live-критерий всё ещё НЕ выполнен: **`BinanceFutures.Funding=0`** в persisted journal
+  после нескольких минут live-window; logs за позднее окно также `markPrice/Funding=0`.
+  Branch НЕ смержен; VPS восстановлен на `origin/main` `1d5ecfa` (spot+HL only, healthy,
+  futures logs after restore=0).
 - **M-06 остаётся IN_PROGRESS:** #1 (blast-radius compile — на main workspace компилируется),
   inert venue-futures / derive части на main, **#4 BLOCKED by TD-014** (live Funding emission still
-  absent; depth cadence/churn materially improved by T2 but full §8 not green), #6 verify_M-06.sh
-  exit 0 (tester) только после успешного #4. Следующая цепочка: architect RED/live-equivalent oracle
-  stronger than current TD-014 T2 production miss (dense L2 + OI, but 0 persisted Funding) →
-  venue-dev fix → engine-dev reland → reviewer full §8 → tester verify.
+  absent even after per-symbol markPrice subscription; depth cadence/churn are green), #6
+  verify_M-06.sh exit 0 (tester) только после успешного #4. Следующая цепочка: architect
+  RED/live-equivalent oracle stronger than current TD-014 T3 production miss (raw WS
+  markPrice delivery / stream-name / parse-drop diagnostics, dense L2 + OI but 0 persisted
+  Funding) → venue-dev fix → engine-dev reland → reviewer full §8 → tester verify.
   Data-quality долг:
   TD-012 (futures REST depth limit=1000 undercount). TD-013 anti-hot-loop live-verified, но milestone
   close-out не достигнут из-за TD-014.
