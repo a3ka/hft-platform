@@ -87,13 +87,13 @@ merge сверяет диф построчно: только `pub`-модифи�
 | # | Status | Задача | Агент | Verify |
 |---|---|---|---|---|
 | 1 | ⏳ | **CT-RFC-02**: T1-формы (`DataSource`, `SegmentHeader`, `SCHEMA_VERSION`=2) + JSON Schema + фикстуры + RED (`CT-I-6`, `CT-RFC02-1..4`); скелеты `journal` (сигнатуры `stream`/`EpochFilter`/ротация, `todo!()`); `verify_M-08.sh` | architect | workspace компилируется; fmt+clippy зелёные; RED падает |
-| 2 | ⏳ | `journal` impl: заголовок сегмента; **ротация** `segment-NNNNNNNN.jrnl` (E2, seq сквозной); `stream()` — bounded-memory итератор (E5); legacy-путь ЧЕРЕЗ МАНИФЕСТ (`journal.legacy.json` + отпечаток первого MiB + `current_size >= size_bytes_at_decl`; незадекларированный/битый/усечённый → `Err`, НИКАКОГО вменения `OwnCapture` — CT-RFC02-1 rev 2); `EpochFilter` (E6) | engine-dev | `cargo test -p journal` GREEN, включая **прод-масштабный** bounded-memory оракул (≥64 MiB сегмент, counting-allocator) |
-| 3 | ⏳ | `journal` retention: cold-выгрузка (Storage Box) + удаление ТОЛЬКО после подтверждённой выгрузки (E3); **fail-closed по диску** (E4: `min_free_bytes` → storage-guard `Err`, без движения seq/байтов, `storage_status().writable=false` в heartbeat + алерт; `Sys`-события в журнал НЕТ) | engine-dev | RED: удаление невыгруженного сегмента невозможно; диск < порога → запись останавливается ЯВНО |
-| 4 | ⏳ | `recorder`: писать заголовок (provenance = версия recorder'а + git sha), переживать ротацию без потери событий; **bounded-RSS** (E7) | engine-dev | RED: длительный прогон в бюджете памяти; ротация посреди потока не теряет и не дублирует `seq` |
-| 5 | ⏳ | `research-cli`: перевести чтение на `journal::stream` + `EpochFilter` (E5/E6); грид больше НЕ держит `Vec<Event>` в памяти; gap-статистика (E8) → `research/data-quality/` | research-dev | RED: грид отрабатывает на большом журнале в бюджете памяти; смешение эпох без явного фильтра невозможно |
-| 6 | ⏳ | `.github/workflows/deploy.yml`: `needs: ci` (E9) | architect | красный CI не выкатывает прод (проверяется на PR-прогоне) |
-| 9 | ⏳ | **(rev 3, TD-016 — MAJOR, прод-лик)** `venue-binance`: книга обязана ЭВИКТИТЬ уровни. Корень: `apply_diff_to_book` (`src/lib.rs:306`) делает только upsert/remove-при-нуле — уровни, из которых цена ушла, апдейтов больше не получают и живут вечно (`MAX_REL_DIST` применяется к ЭМИССИИ, не к книге). Замер: 50k→200k диффов = 100k→400k уровней ⇒ ≈ **+6.5 MiB/час** на проде (8.4→48.3 MiB за 5 ч, контейнер всё это время healthy). Контракт: **кап `MAX_BOOK_LEVELS_PER_SIDE = 5000`** на сторону (= глубина REST-снапшота, из которого книга бутстрапится), эвиктятся САМЫЕ ДАЛЬНИЕ от mid; **топ книги и полосы OBI не деградируют** | venue-dev | `cargo test -p venue-binance` GREEN (**T8c**: кап соблюдён, лучший bid/ask свежие, память O(1) по числу диффов); прежние тесты venue-binance GREEN |
-| 10 | ⏳ | **(rev 4, МИНА — вскрыта при разборе SVR research-dev)** `journal::read_all`/`recover` захардкожены на `segment-00000000.jrnl` и парсят магию v2 как len-поле → на новом журнале **молча возвращают 0 событий**. Их зовут `journal/examples/dump.rs`, `book/examples/bands.rs`, `book/examples/obi_probe.rs` — **вся наша диагностика полос OBI**. После деплоя M-08 она показывала бы «данных нет» при зелёных гейтах (класс TD-011). Требуется: обход ВСЕХ сегментов по возрастанию индекса, пропуск магии+заголовка, та же классификация legacy, что у `stream` | engine-dev | `cargo test -p journal --test red_read_all_v2` GREEN (T7b) |
+| 2 | ✅ | `journal` impl: заголовок сегмента; **ротация** `segment-NNNNNNNN.jrnl` (E2, seq сквозной); `stream()` — bounded-memory итератор (E5); legacy-путь ЧЕРЕЗ МАНИФЕСТ (`journal.legacy.json` + отпечаток первого MiB + `current_size >= size_bytes_at_decl`; незадекларированный/битый/усечённый → `Err`, НИКАКОГО вменения `OwnCapture` — CT-RFC02-1 rev 2); `EpochFilter` (E6) | engine-dev | `cargo test -p journal` GREEN, включая **прод-масштабный** bounded-memory оракул (≥64 MiB сегмент, counting-allocator) |
+| 3 | ✅ | `journal` retention: cold-выгрузка (Storage Box) + удаление ТОЛЬКО после подтверждённой выгрузки (E3); **fail-closed по диску** (E4: `min_free_bytes` → storage-guard `Err`, без движения seq/байтов, `storage_status().writable=false` в heartbeat + алерт; `Sys`-события в журнал НЕТ) | engine-dev | RED: удаление невыгруженного сегмента невозможно; диск < порога → запись останавливается ЯВНО |
+| 4 | ✅ | `recorder`: писать заголовок (provenance = версия recorder'а + git sha), переживать ротацию без потери событий; **bounded-RSS** (E7) | engine-dev | RED: длительный прогон в бюджете памяти; ротация посреди потока не теряет и не дублирует `seq` |
+| 5 | ✅ | `research-cli`: перевести чтение на `journal::stream` + `EpochFilter` (E5/E6); грид больше НЕ держит `Vec<Event>` в памяти; gap-статистика (E8) → `research/data-quality/` | research-dev | RED: грид отрабатывает на большом журнале в бюджете памяти; смешение эпох без явного фильтра невозможно |
+| 6 | ✅ | `.github/workflows/deploy.yml`: `needs: ci` (E9) | architect | красный CI не выкатывает прод (проверяется на PR-прогоне) |
+| 9 | ✅ | **(rev 3, TD-016 — MAJOR, прод-лик)** `venue-binance`: книга обязана ЭВИКТИТЬ уровни. Корень: `apply_diff_to_book` (`src/lib.rs:306`) делает только upsert/remove-при-нуле — уровни, из которых цена ушла, апдейтов больше не получают и живут вечно (`MAX_REL_DIST` применяется к ЭМИССИИ, не к книге). Замер: 50k→200k диффов = 100k→400k уровней ⇒ ≈ **+6.5 MiB/час** на проде (8.4→48.3 MiB за 5 ч, контейнер всё это время healthy). Контракт: **кап `MAX_BOOK_LEVELS_PER_SIDE = 5000`** на сторону (= глубина REST-снапшота, из которого книга бутстрапится), эвиктятся САМЫЕ ДАЛЬНИЕ от mid; **топ книги и полосы OBI не деградируют** | venue-dev | `cargo test -p venue-binance` GREEN (**T8c**: кап соблюдён, лучший bid/ask свежие, память O(1) по числу диффов); прежние тесты venue-binance GREEN |
+| 10 | ✅ | **(rev 4, МИНА — вскрыта при разборе SVR research-dev)** `journal::read_all`/`recover` захардкожены на `segment-00000000.jrnl` и парсят магию v2 как len-поле → на новом журнале **молча возвращают 0 событий**. Их зовут `journal/examples/dump.rs`, `book/examples/bands.rs`, `book/examples/obi_probe.rs` — **вся наша диагностика полос OBI**. После деплоя M-08 она показывала бы «данных нет» при зелёных гейтах (класс TD-011). Требуется: обход ВСЕХ сегментов по возрастанию индекса, пропуск магии+заголовка, та же классификация legacy, что у `stream` | engine-dev | `cargo test -p journal --test red_read_all_v2` GREEN (T7b) |
 | 7 | ⏳ | Прогон `scripts/verify_M-08.sh` на чистом чекауте | tester | `VERDICT: PASS`, exit=0 |
 | 8 | ⏳ | Review + merge + **§8 деплой-гейт: прод НЕ инертен** — ssh-проверка, что recorder пишет в НОВЫЙ сегмент, старый 8.3 GB сегмент цел и читается, heartbeat свежий, RSS в норме | reviewer | Done Block + §8 пруф (сырой ssh-вывод) |
 
@@ -129,6 +129,25 @@ merge сверяет диф построчно: только `pub`-модифи�
 (`red_stream_bounded` + `red_rotation` гоняют десятки тысяч `append` через ротацию) плюс §8
 eyes-on на VPS (RSS после суток аптайма). Отдельный recorder-оракул заводится, ЕСЛИ §8 покажет
 рост — сейчас лик не доказан (одна точка 48 MiB), а тест на «5 часов аптайма» в CI не живёт.
+
+## Runbook деплоя (обязателен, закодирован в `crates/journal/tests/red_prod_migration.rs`)
+
+Проверено тестом, а не руками:
+1. Recorder **стартует** на каталоге с НЕзадекларированным боевым сегментом → **запись не
+   зависит** от того, успел ли оператор что-то задекларировать. Деплой не может остановить сбор.
+2. Пишет в **НОВЫЙ** `segment-00000001.jrnl` (магия+заголовок); боевой 8.3 GB — **байт-в-байт
+   нетронут** (в безголовый сегмент дописывать запрещено).
+3. `seq` **продолжается** со старого журнала.
+4. `stream()` (research-путь) **отказывает** (`ForeignSegment`), пока legacy не задекларирован →
+   данные без эпохи в обучение не утекают.
+5. **После деплоя** оператор выполняет `declare_legacy` на VPS (sha256 первого MiB + размер) →
+   `stream()` отдаёт legacy + новые сегменты в порядке `seq`, эпохи названы.
+
+**Решение по `read_all`/`recover` (принято 2026-07-13, риск engine-dev §E-1):** они остаются
+ОФЛАЙН-ДИАГНОСТИКОЙ с мягкой классификацией (манифест не требуют) — оператору важнее увидеть,
+что реально лежит на диске, чем «ForeignSegment → ничего» (это и была мина TD-011). Барьер:
+гейт **T11e** запрещает звать их из любых `crates/*/src` кроме `journal` — прод и research
+ходят ТОЛЬКО через `stream` с явным `EpochFilter`.
 
 ## Acceptance
 
