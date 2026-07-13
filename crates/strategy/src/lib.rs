@@ -96,14 +96,8 @@ impl Strategy for DirectionalStrategy {
     /// Нет книги/лучшей цены → интента НЕТ (не «отправим по любой цене»).
     fn on_event(&mut self, ev: &Event) -> Vec<OrderIntent> {
         // ── 1. In-flight expiry по event-time (никакого wall-clock, M-07 D4). ──────────
-        let ttl_ns = match (self.cfg.intent_ttl_ms as u64).checked_mul(1_000_000) {
-            Some(v) => v,
-            None => {
-                // intent_ttl_ms уже проверен на >0; overflow нам не грозит де-факто, но
-                // защищаемся: тогда TTL = u64::MAX (никогда не протухнет — для эв. тайм).
-                u64::MAX
-            }
-        };
+        // intent_ttl_ms уже валидирован на >0; при overflow → MAX (никогда не протухнет).
+        let ttl_ns = (self.cfg.intent_ttl_ms as u64).saturating_mul(1_000_000);
         self.in_flight
             .retain(|_, f| ev.ts_mono_ns <= f.submitted_ts_mono_ns.saturating_add(ttl_ns));
 

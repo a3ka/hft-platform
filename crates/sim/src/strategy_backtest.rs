@@ -124,13 +124,12 @@ impl StrategyBacktest {
             }
 
             // Пересчитать equity_curve, если в этом событии были филлы.
-            if !fills_out.is_empty()
-                && equity_curve_e8.len() < fills_out.len()
-            {
+            if !fills_out.is_empty() && equity_curve_e8.len() < fills_out.len() {
                 let mut eq: i128 = cash_e8;
                 for inst in &self.instruments_seen {
                     let pos = strategy.position_e8(inst) as i128;
-                    let mid_price = match books.get(inst.venue, &inst.symbol).and_then(|b| b.mid()) {
+                    let mid_price = match books.get(inst.venue, &inst.symbol).and_then(|b| b.mid())
+                    {
                         Some(p) => p as i128,
                         None => continue,
                     };

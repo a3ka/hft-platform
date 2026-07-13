@@ -158,11 +158,7 @@ impl Alpha for LinearAlpha {
         }
 
         // ── 2. Детерминированно обойти инструменты, присутствующие в конфиге. ───────────
-        let instruments: Vec<Instrument> = self
-            .weight_sum_per_instrument
-            .keys()
-            .cloned()
-            .collect();
+        let instruments: Vec<Instrument> = self.weight_sum_per_instrument.keys().cloned().collect();
 
         let mut forecasts = Vec::new();
         for inst in &instruments {
