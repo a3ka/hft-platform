@@ -52,12 +52,16 @@ check "T8c мозг без HashMap/HashSet (детерминизм обхода)
 check "T8d OrderIntent определён ровно один раз" bash -c '[ "$(grep -rln "pub struct OrderIntent" crates/*/src | wc -l)" -eq 1 ]'
 check "T8e OrderIntent живёт в strategy (Слой 4)" bash -c 'grep -rln "pub struct OrderIntent" crates/*/src | grep -q "^crates/strategy/src/"'
 
-# T9 (задача 6, канарейка замены harness'а): ad-hoc taker-in/taker-out harness из grid.rs
-# СНЯТ, грид гоняет настоящий strategy-пайплайн. Без этого M-07 бессмысленен: бэктест
-# продолжал бы мерить логику, которой не будет в live (DESIGN §1 равенство 2).
-check "T9a ad-hoc harness удалён из research-cli" bash -c '! grep -rnE "struct OpenPosition|enum Action" crates/research-cli/src'
-check "T9b grid использует sim::StrategyBacktest" bash -c 'grep -rq "StrategyBacktest" crates/research-cli/src'
-check "T9c grid гоняет strategy-пайплайн" bash -c 'grep -rqE "DirectionalStrategy|dyn Strategy" crates/research-cli/src'
+# T9 (задача 6): грид ОБЯЗАН гонять настоящий strategy-пайплайн. Гейт — ПОВЕДЕНЧЕСКИЙ
+# (C-004 C2: грепы удовлетворяются комментарием/мёртвым кодом, поэтому они здесь вторичны).
+# GR-I-6/7 падают на любом harness'е, игнорирующем блок `strategy` ячейки.
+check "T9a GR-I-1..7 grid на strategy-пайплайне (ПОВЕДЕНЧЕСКИЙ гейт)" cargo test -p research-cli --test red_grid_strategy
+check "T9b ad-hoc harness удалён из research-cli" bash -c '! grep -rnE "struct OpenPosition|enum Action" crates/research-cli/src'
+# Грепы ниже игнорируют строки-комментарии (`//`, `//!`) — упоминание в доке не считается
+# использованием (C-004 C2).
+check "T9c grid РЕАЛЬНО инстанцирует StrategyBacktest" bash -c 'grep -rn "StrategyBacktest" crates/research-cli/src | grep -vE "^[^:]+:[0-9]+: *//" | grep -q "StrategyBacktest::new"'
+check "T9d grid РЕАЛЬНО строит стратегию" bash -c 'grep -rn "DirectionalStrategy" crates/research-cli/src | grep -vE "^[^:]+:[0-9]+: *//" | grep -q "DirectionalStrategy::new"'
+check "T9e grid считает returns по D7 (equity/capital_ref)" bash -c 'grep -rn "returns_from_equity\|capital_ref_e8" crates/research-cli/src/grid.rs | grep -vE "^[^:]+:[0-9]+: *//" | grep -q .'
 
 # T10: M-07 инертен для прода — recorder НЕ должен был получить новые зависимости
 # (мозг стратегии не торгует и не пишет журнал; §8 деплой-гейт ожидает НУЛЕВОЕ изменение
