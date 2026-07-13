@@ -48,7 +48,7 @@ max RSS 6 MiB, next_seq корректен) ДО merge, и eyes-on на VPS по
 - **M-05 остаётся IN_PROGRESS:** task 5 B1 (venue-dev, anti-phantom resnapshot) PENDING → `verify_M-05.sh`
   exit=1 (только B1); task 6 (tester, verify exit 0) после B1. TD-010 (REST limit=5000) открыт.
 
-## Data expansion (M-06 — inert-части MERGED, reviewer APPROVED 2026-07-11; milestone IN_PROGRESS)
+## Data expansion (M-06 — #4 reland MERGED, reviewer APPROVED 2026-07-13; close-out pending)
 Смержены ДВЕ инертные (не потребляются recorder'ом до #4 poller → прод-поведение НЕ изменено)
 APPROVED-ветки; main стал полностью GREEN (впервые за цикл RED-on-main). §8 eyes-on после deploy:
 recorder БЕЗ изменений (CPU 0.79%, MEM 5.6 MiB, сегмент растёт +261 KB/12s, next_seq растёт, restarts=0).
@@ -148,16 +148,23 @@ recorder БЕЗ изменений (CPU 0.79%, MEM 5.6 MiB, сегмент ра�
   после нескольких минут live-window; logs за позднее окно также `markPrice/Funding=0`.
   Branch НЕ смержен; VPS восстановлен на `origin/main` `1d5ecfa` (spot+HL only, healthy,
   futures logs after restore=0).
-- **M-06 остаётся IN_PROGRESS:** #1 (blast-radius compile — на main workspace компилируется),
-  inert venue-futures / derive части на main, **#4 BLOCKED by TD-014** (live Funding emission still
-  absent even after per-symbol markPrice subscription; depth cadence/churn are green), #6
-  verify_M-06.sh exit 0 (tester) только после успешного #4. Следующая цепочка: architect
-  RED/live-equivalent oracle stronger than current TD-014 T3 production miss (raw WS
-  markPrice delivery / stream-name / parse-drop diagnostics, dense L2 + OI but 0 persisted
-  Funding) → venue-dev fix → engine-dev reland → reviewer full §8 → tester verify.
+- **TD-014 T4 + #4 reland `c123bbd` — APPROVED / MERGED (§8 live GREEN, 2026-07-13).**
+  Цепочка `d9b3b1c` RED premiumIndex REST funding poll + `c123bbd` venue-dev pivot прошла:
+  local reviewer gates GREEN (`red_futures_wired`, `venue-binance-futures` 10/10 including T4,
+  workspace tests, fmt, clippy, `verify_M-06.sh` PASS exit=0), remote Docker verify on VPS
+  GREEN (`VERDICT: PASS exit=0` after installing rustfmt/clippy components in `rust:1-slim`),
+  and §8 live GREEN. VPS candidate `c123bbd`: recorder healthy, 3 venue connect, heartbeat fresh,
+  CPU ~1.5%, MEM ~9.5 MiB, restarts=0, late window `418=0`, `429=0`, `gap=0`, `stale=0`.
+  Persisted journal since deploy: `seq_gaps=0`, `BinanceFutures.L2Snapshot=465`,
+  `OpenInterest=48`, **`Funding=48`**. Merge commit: `1504d8b` (`M-06 reland #4
+  (TD-014 v2+T2+T3+T4)`). TD-014 CLOSED.
+- **M-06 статус после reviewer:** #1 compile/C1 green, inert venue-futures + derive части на main,
+  **#4 recorder-wire BinanceFutures merged and live-green**, #5 funding-breadth green. Milestone
+  close-out остаётся за tester/architect chain: tester #6 clean-checkout `verify_M-06.sh` /
+  architect close-out docs. Reviewer НЕ трогал milestone status columns.
   Data-quality долг:
-  TD-012 (futures REST depth limit=1000 undercount). TD-013 anti-hot-loop live-verified, но milestone
-  close-out не достигнут из-за TD-014.
+  TD-012 (futures REST depth limit=1000 undercount). TD-013 anti-hot-loop live-verified; TD-014
+  live funding/depth emission closed by T4.
 
 ## Движок бэктеста (M-04 «Research core» — РЕАЛИЗОВАНО, reviewer APPROVED 2026-07-10)
 Цепочка: architect → critic C-001 REJECT → фиксы `f02c418` → critic C-002 NOTE (все

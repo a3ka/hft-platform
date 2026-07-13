@@ -91,7 +91,7 @@
   blocker'а TD-014 (нет live L2Snapshot/Funding), поэтому milestone close-out не достигнут.
 
 - **TD-014** `binance-futures-live-depth-funding-not-emitted-after-backoff` (M-06 #4 reland,
-  **ОТКРЫТА / BLOCKING #4**). После фикса TD-013 reland `8b26d6c` прошёл code-review, локальные
+  **CLOSED 2026-07-13 by `c123bbd` + §8 live GREEN**). После фикса TD-013 reland `8b26d6c` прошёл code-review, локальные
   gates (`red_futures_wired`, fmt, clippy, workspace tests, `verify_M-06.sh` PASS) и GitHub
   CI+Deploy, но §8 eyes-on на VPS НЕ прошёл продуктовый критерий recorder wire. Наблюдения:
   3 `venue connect` строки были (`binance`, `hyperliquid`, `binance_futures`), journal рос, seq
@@ -150,6 +150,15 @@
   The next fix must instrument or reproduce raw WS delivery/stream-name/parse-drop behavior:
   current unit coverage proves parser/session handling, but not that Binance actually delivers
   a usable markPrice message through this combined session.
+  **LIVE TD-014 T4 RESULT (`c123bbd` over `d9b3b1c`, 2026-07-13):** venue-dev pivoted Funding
+  from dead WS markPrice delivery to REST `/fapi/v1/premiumIndex` all-perps polling, matching the
+  live-proven OI REST path. Local gates all GREEN: `red_futures_wired`, `venue-binance-futures`
+  10/10, workspace tests, fmt/clippy, `verify_M-06.sh` PASS exit=0. Remote Docker verify on VPS
+  also GREEN (`VERDICT: PASS exit=0`; host has no Rust toolchain, so reviewer ran it in
+  `rust:1-slim` with rustfmt/clippy components installed). Pre-merge §8 on VPS GREEN:
+  `BinanceFutures.L2Snapshot=465`, `OpenInterest=48`, **`Funding=48`**, `seq_gaps=0`;
+  late logs `418=0`, `429=0`, `gap=0`, `stale=0`, CPU/MEM normal, restarts=0. Candidate was
+  merged via `1504d8b`; TD-014 CLOSED.
 
 ## Замечания reviewer'а M-06 #4 (2026-07-11)
 - **RN-9** (§8 eyes-on поймал то, что все зелёные гейты пропустили — снова) Code-review A+B
@@ -190,6 +199,12 @@
   symbol-filter drops, and emitted Funding, or capture a short live fstream sample under the exact
   combined URL. Without those counters, local RED can keep proving paths for messages that prod
   never receives or silently drops.
+- **RN-16** (§8 TD-014 T4 closure) REST `/fapi/v1/premiumIndex` polling closed the live Funding
+  gap immediately. Lesson: after repeated WS-delivery misses, prefer the already live-proven REST
+  ingestion path over more parser/session oracles for a stream the exchange/network is not
+  delivering in this deployment. Keep WS markPrice parser tests as regression coverage, but do not
+  depend on WS markPrice for production funding-breadth until a separate raw-capture task proves
+  delivery.
 
 ## Замечания reviewer'а M-05 (не блокирующие, 2026-07-11)
 - **RN-8** (fmt-гейт под-покрытие) `verify_M-05.sh` fmt-гейт проверяет только `journal+book`, не
