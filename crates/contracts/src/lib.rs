@@ -12,7 +12,65 @@ pub const PRICE_SCALE: i64 = 100_000_000;
 
 /// Версия схемы журнального формата. В каждом сегменте (CT-I-6).
 /// 1: CT-RFC-01 — аддитивно OpenInterest/Liquidation/MarginRate + Venue::BinanceFutures.
-pub const SCHEMA_VERSION: u32 = 1;
+/// 2: CT-RFC-02 — `SegmentHeader` (первый фрейм сегмента) + provenance/эпохи.
+pub const SCHEMA_VERSION: u32 = 2;
+
+/// Версия, при которой сегменты ещё писались БЕЗ `SegmentHeader` (боевой сегмент,
+/// пишется с 2026-07-10). Читается навсегда (CT-I-3) через вменённый заголовок.
+pub const SCHEMA_VERSION_PRE_HEADER: u32 = 1;
+
+/// `epoch_id`, вменяемый legacy-сегментам без заголовка (CT-RFC-02 §3).
+pub const LEGACY_EPOCH_ID: &str = "own-legacy-pre-rfc02";
+
+/// Происхождение данных сегмента (CT-RFC-02). Расширяется СТРОГО в конец
+/// (сохраняет postcard-дискриминанты).
+///
+/// Зачем: купленная история и собственный захват — РАЗНЫЕ реальности (чужая глубина книги,
+/// чужие часы, чужие гэпы). Смешать их в обучении альфы без пометки = обучать на данных,
+/// которых у нас никогда не было. Журнал бессмертен — задним числом источник не проставить.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DataSource {
+    /// Наш собственный live-захват (recorder → venue-адаптеры).
+    OwnCapture,
+    /// Импорт исторических данных стороннего поставщика.
+    Vendor,
+    /// Синтетика (тесты/стресс-фикстуры). В обучение по умолчанию НЕ попадает.
+    Synthetic,
+}
+
+/// Первый фрейм КАЖДОГО сегмента (CT-I-6, CT-RFC-02). Делает эпоху данных ЧИТАЕМЫМ ФАКТОМ,
+/// а не устной договорённостью.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SegmentHeader {
+    pub schema_version: u32,
+    pub source: DataSource,
+    /// Чем/кем/когда собран: для `OwnCapture` — версия recorder'а + git sha; для `Vendor` —
+    /// поставщик, датасет, дата выгрузки, лицензия.
+    pub provenance: String,
+    /// Стабильный ключ эпохи, по которому research фильтрует данные
+    /// (`own-2026-07`, `tardis-binance-spot-2024`). Смешение эпох — ЯВНОЕ решение.
+    pub epoch_id: String,
+    /// Часы создания сегмента (отчёты; в детерминизм реплея НЕ входит).
+    pub created_wall_ms: i64,
+    /// seq первого события сегмента (сшивка при ротации).
+    pub first_seq: u64,
+}
+
+impl SegmentHeader {
+    /// Заголовок, ВМЕНЯЕМЫЙ legacy-сегменту без заголовка (CT-RFC-02 §3): такие данные —
+    /// наш собственный захват, это известно из истории репозитория, и фиксируется явно,
+    /// а не молчанием.
+    pub fn legacy_implied(created_wall_ms: i64, first_seq: u64) -> Self {
+        Self {
+            schema_version: SCHEMA_VERSION_PRE_HEADER,
+            source: DataSource::OwnCapture,
+            provenance: "pre-RFC02 recorder capture (implied, no header on segment)".to_string(),
+            epoch_id: LEGACY_EPOCH_ID.to_string(),
+            created_wall_ms,
+            first_seq,
+        }
+    }
+}
 
 /// Единица упорядоченного журнала (docs/fa/journal.md §5). `seq` — тотальный порядок,
 /// назначается журналом (единственный писатель, JR-I-1). Коннекторы seq НЕ проставляют.
