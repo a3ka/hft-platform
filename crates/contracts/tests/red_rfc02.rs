@@ -5,8 +5,8 @@
 //! пережить bump схемы байт-в-байт (журнал бессмертен, CT-I-3).
 
 use contracts::{
-    DataSource, Event, EventKind, MdPayload, SegmentHeader, Side, Venue, LEGACY_EPOCH_ID,
-    SCHEMA_VERSION, SCHEMA_VERSION_PRE_HEADER,
+    DataSource, Event, EventKind, LegacyManifest, LegacySegmentDecl, MdPayload, SegmentHeader,
+    Side, Venue, LEGACY_EPOCH_ID, SCHEMA_VERSION, SCHEMA_VERSION_PRE_HEADER,
 };
 
 /// CT-I-6: версия схемы 2 — сегменты несут заголовок.
@@ -33,23 +33,71 @@ fn ct_rfc02_segment_header_roundtrips() {
     assert_eq!(h, back);
 }
 
-/// CT-RFC02-1: вменённый заголовок legacy-сегмента — источник НАЗВАН, а не пуст.
-/// Наивная реализация (`Default` / пустая строка / `Vendor`) здесь падает.
+/// CT-RFC02-1 (rev 2, после C-005 C2): заголовок legacy-сегмента строится ИЗ ЯВНОЙ
+/// ДЕКЛАРАЦИИ манифеста, а НЕ вменяется по правилу «не разобрался → значит наш».
+/// Происхождение берётся из того, что оператор записал, — включая случай, когда
+/// задекларирован ВЕНДОРСКИЙ безголовый сегмент (он обязан остаться вендорским).
 #[test]
-fn ct_rfc02_legacy_implied_header_names_the_epoch() {
-    let h = SegmentHeader::legacy_implied(1_752_000_000_000, 0);
+fn ct_rfc02_legacy_header_comes_from_explicit_declaration() {
+    let own = LegacySegmentDecl {
+        file_name: "segment-00000000.jrnl".to_string(),
+        fingerprint_sha256: "ab".repeat(32),
+        size_bytes_at_decl: 8_877_245_289,
+        source: DataSource::OwnCapture,
+        provenance: "pre-RFC02 recorder capture, VPS, 2026-07-10..".to_string(),
+        epoch_id: LEGACY_EPOCH_ID.to_string(),
+    };
+    let h = SegmentHeader::from_legacy_decl(&own, 1_752_000_000_000, 0);
     assert_eq!(h.schema_version, SCHEMA_VERSION_PRE_HEADER);
-    assert_eq!(
-        h.source,
-        DataSource::OwnCapture,
-        "боевой сегмент (пишется с 2026-07-10) — НАШ захват; это факт истории репозитория, \
-         и он обязан быть зафиксирован явно, а не молчанием"
-    );
+    assert_eq!(h.source, DataSource::OwnCapture);
     assert_eq!(h.epoch_id, LEGACY_EPOCH_ID);
-    assert!(
-        !h.provenance.is_empty(),
-        "provenance пустым быть не может — иначе эпоха неотличима от вендорской"
+    assert!(!h.provenance.is_empty());
+
+    // Ключевое: декларация — источник правды. Безголовый ВЕНДОРСКИЙ дамп не превращается
+    // в наш захват (прежнее fail-open правило делало ровно это).
+    let vendor = LegacySegmentDecl {
+        file_name: "vendor-dump.jrnl".to_string(),
+        source: DataSource::Vendor,
+        epoch_id: "tardis-2024".to_string(),
+        ..own.clone()
+    };
+    let hv = SegmentHeader::from_legacy_decl(&vendor, 1_752_000_000_000, 0);
+    assert_eq!(
+        hv.source,
+        DataSource::Vendor,
+        "задекларированный вендорский сегмент обязан остаться Vendor — молчаливая приписка \
+         OwnCapture = обучение альфы на чужой реальности"
     );
+    assert_eq!(hv.epoch_id, "tardis-2024");
+}
+
+/// Манифест ищет декларацию по имени файла; незадекларированный файл → None
+/// (потребитель обязан на этом упасть, а не «вменить своё» — CT-RFC02-1 rev 2).
+#[test]
+fn ct_rfc02_manifest_lookup_is_explicit() {
+    let m = LegacyManifest {
+        declarations: vec![LegacySegmentDecl {
+            file_name: "segment-00000000.jrnl".to_string(),
+            fingerprint_sha256: "cd".repeat(32),
+            size_bytes_at_decl: 10,
+            source: DataSource::OwnCapture,
+            provenance: "x".to_string(),
+            epoch_id: LEGACY_EPOCH_ID.to_string(),
+        }],
+    };
+    assert!(m.find("segment-00000000.jrnl").is_some());
+    assert!(
+        m.find("segment-99999999.jrnl").is_none(),
+        "незадекларированный сегмент НЕ имеет происхождения — читатель обязан вернуть Err"
+    );
+}
+
+/// Магия сегмента — стабильная константа: по ней читатель отличает «новый формат» от
+/// «безголового старого», а не гадает по успеху парсинга.
+#[test]
+fn ct_rfc02_segment_magic_is_stable() {
+    assert_eq!(&contracts::SEGMENT_MAGIC, b"HFTJRN02");
+    assert_eq!(contracts::LEGACY_FINGERPRINT_BYTES, 1024 * 1024);
 }
 
 /// CT-I-3 (журнал бессмертен): bump схемы НЕ ломает wire-формат `Event`.

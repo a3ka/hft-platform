@@ -19,8 +19,51 @@ pub const SCHEMA_VERSION: u32 = 2;
 /// пишется с 2026-07-10). Читается навсегда (CT-I-3) через вменённый заголовок.
 pub const SCHEMA_VERSION_PRE_HEADER: u32 = 1;
 
-/// `epoch_id`, вменяемый legacy-сегментам без заголовка (CT-RFC-02 §3).
+/// `epoch_id` legacy-сегмента, ЯВНО задекларированного в манифесте (CT-RFC-02 §3).
 pub const LEGACY_EPOCH_ID: &str = "own-legacy-pre-rfc02";
+
+/// Магия в начале КАЖДОГО сегмента schema ≥ 2 (CT-RFC-02 **rev 2**, находка critic C-005 C2).
+///
+/// Прежнее правило «первый фрейм не разобрался как заголовок → считаем `OwnCapture`» было
+/// **FAIL-OPEN**: битый или чужой сегмент тихо получал бы наше происхождение — ровно та
+/// приписка эпохи, против которой этот RFC и написан. Классификация теперь однозначна:
+/// - магия есть → заголовок ОБЯЗАН разобраться (иначе `Err`, сегмент не читается);
+/// - магии нет → сегмент legacy ТОЛЬКО если ЯВНО задекларирован в манифесте и отпечаток
+///   совпал (иначе `Err` — «чужой/неизвестный сегмент», не «наш»).
+pub const SEGMENT_MAGIC: [u8; 8] = *b"HFTJRN02";
+
+/// Сколько первых байт сегмента покрывает отпечаток legacy-декларации.
+pub const LEGACY_FINGERPRINT_BYTES: u64 = 1024 * 1024;
+
+/// Декларация legacy-сегмента (без заголовка) — ЯВНОЕ утверждение оператора: «эти байты
+/// имеют такое-то происхождение». Живёт в `journal.legacy.json` рядом с сегментами.
+///
+/// Fail-closed: незадекларированный сегмент без магии НЕ читается вовсе (`Err`), а не
+/// «считается нашим». Отпечаток (sha256 первого MiB) + размер на момент декларации
+/// защищают от подмены файла под знакомым именем. Боевой сегмент РАСТЁТ — реализация
+/// обязана допускать рост хвоста, но не изменение префикса.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct LegacySegmentDecl {
+    pub file_name: String,
+    /// sha256 первых `LEGACY_FINGERPRINT_BYTES` байт файла (hex).
+    pub fingerprint_sha256: String,
+    pub size_bytes_at_decl: u64,
+    pub source: DataSource,
+    pub provenance: String,
+    pub epoch_id: String,
+}
+
+/// Содержимое `journal.legacy.json` (манифест деклараций).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct LegacyManifest {
+    pub declarations: Vec<LegacySegmentDecl>,
+}
+
+impl LegacyManifest {
+    pub fn find(&self, file_name: &str) -> Option<&LegacySegmentDecl> {
+        self.declarations.iter().find(|d| d.file_name == file_name)
+    }
+}
 
 /// Происхождение данных сегмента (CT-RFC-02). Расширяется СТРОГО в конец
 /// (сохраняет postcard-дискриминанты).
@@ -28,7 +71,7 @@ pub const LEGACY_EPOCH_ID: &str = "own-legacy-pre-rfc02";
 /// Зачем: купленная история и собственный захват — РАЗНЫЕ реальности (чужая глубина книги,
 /// чужие часы, чужие гэпы). Смешать их в обучении альфы без пометки = обучать на данных,
 /// которых у нас никогда не было. Журнал бессмертен — задним числом источник не проставить.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub enum DataSource {
     /// Наш собственный live-захват (recorder → venue-адаптеры).
     OwnCapture,
@@ -40,7 +83,7 @@ pub enum DataSource {
 
 /// Первый фрейм КАЖДОГО сегмента (CT-I-6, CT-RFC-02). Делает эпоху данных ЧИТАЕМЫМ ФАКТОМ,
 /// а не устной договорённостью.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SegmentHeader {
     pub schema_version: u32,
     pub source: DataSource,
@@ -57,15 +100,22 @@ pub struct SegmentHeader {
 }
 
 impl SegmentHeader {
-    /// Заголовок, ВМЕНЯЕМЫЙ legacy-сегменту без заголовка (CT-RFC-02 §3): такие данные —
-    /// наш собственный захват, это известно из истории репозитория, и фиксируется явно,
-    /// а не молчанием.
-    pub fn legacy_implied(created_wall_ms: i64, first_seq: u64) -> Self {
+    /// Заголовок legacy-сегмента, построенный ИЗ ЯВНОЙ ДЕКЛАРАЦИИ манифеста (CT-RFC-02 rev 2).
+    ///
+    /// **Это НЕ вменение по умолчанию** (прежнее fail-open правило убито находкой C-005 C2):
+    /// источник/эпоха берутся из того, что оператор явно записал в `journal.legacy.json`,
+    /// и применяются лишь после сверки отпечатка. Незадекларированный сегмент без магии —
+    /// ошибка чтения, а не «наш захват».
+    pub fn from_legacy_decl(
+        decl: &LegacySegmentDecl,
+        created_wall_ms: i64,
+        first_seq: u64,
+    ) -> Self {
         Self {
             schema_version: SCHEMA_VERSION_PRE_HEADER,
-            source: DataSource::OwnCapture,
-            provenance: "pre-RFC02 recorder capture (implied, no header on segment)".to_string(),
-            epoch_id: LEGACY_EPOCH_ID.to_string(),
+            source: decl.source,
+            provenance: decl.provenance.clone(),
+            epoch_id: decl.epoch_id.clone(),
             created_wall_ms,
             first_seq,
         }
@@ -74,7 +124,7 @@ impl SegmentHeader {
 
 /// Единица упорядоченного журнала (docs/fa/journal.md §5). `seq` — тотальный порядок,
 /// назначается журналом (единственный писатель, JR-I-1). Коннекторы seq НЕ проставляют.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Event {
     pub seq: u64,
     pub ts_mono_ns: u64,
@@ -84,7 +134,7 @@ pub struct Event {
 
 /// Закрытый версионируемый enum видов событий. Новые варианты — только аддитивно (в конец)
 /// через contract-RFC (CT-I §6).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub enum EventKind {
     /// Системное: жив/связь.
     Sys(SysEvent),
@@ -93,7 +143,7 @@ pub enum EventKind {
     // Ord(..), Risk(..), Recon(..), Ctl(..) — добавляются в P3 via contract-RFC.
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub enum SysEvent {
     Heartbeat,
     ConnUp(Venue),
@@ -101,7 +151,7 @@ pub enum SysEvent {
 }
 
 /// Площадка. Расширяется аддитивно (СТРОГО в конец — CT-I §6, сохраняет postcard-индексы).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 pub enum Venue {
     /// Binance СПОТ-рынок.
     Binance,
@@ -112,14 +162,14 @@ pub enum Venue {
 }
 
 /// Сторона.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub enum Side {
     Buy,
     Sell,
 }
 
 /// Уровень стакана. price/size — fixed-point ×1e8.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Level {
     pub price: i64,
     pub size: i64,
@@ -128,7 +178,7 @@ pub struct Level {
 /// Нормализованное рыночное событие. `symbol` — канонический тикер площадки как есть
 /// (Binance "BTCUSDT" / Hyperliquid "BTC"); нормализация кросс-venue — задача выше (book/strategy).
 /// Для MarginRate `symbol` — актив ("USDT"/"USDC"); для OpenInterest/Liquidation — инструмент.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MdEvent {
     pub venue: Venue,
     pub symbol: String,
@@ -138,7 +188,7 @@ pub struct MdEvent {
 /// Тип рыночного апдейта. price/size — fixed-point ×1e8; ставки — ×1e8.
 /// L2Snapshot: и Binance, и HL шлют СНАПШОТ стакана целиком на апдейте — пишем как снапшот.
 /// Новые варианты — только аддитивно В КОНЕЦ (CT-I §6, сохраняет postcard-дискриминанты).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub enum MdPayload {
     Trade {
         price: i64,
