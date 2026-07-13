@@ -953,14 +953,17 @@ dependencies = [
 name = "research-cli"
 version = "0.0.0"
 dependencies = [
+ "alpha",
  "book",
  "contracts",
  "journal",
+ "portfolio",
  "serde",
  "serde_json",
  "sha2",
  "signals",
  "sim",
+ "strategy",
  "tempfile",
 ]
 
