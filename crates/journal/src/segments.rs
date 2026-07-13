@@ -240,6 +240,77 @@ pub(crate) fn read_event_frame<R: Read>(mut r: R) -> io::Result<Option<Event>> {
     Ok(Some(ev))
 }
 
+/// M-08 task 10: прочитать ВСЕ события из одного сегмент-файла.
+pub(crate) fn read_segment_events(path: &Path, strict: bool) -> io::Result<Vec<Event>> {
+    if strict {
+        read_segment_events_strict(path)
+    } else {
+        read_segment_events_tolerant(path)
+    }
+}
+
+fn read_segment_events_strict(path: &Path) -> io::Result<Vec<Event>> {
+    let mut f = File::open(path)?;
+    // v2: пропустить magic+header; legacy: seek back на 0.
+    let _hdr = read_v2_header_and_skip(&mut f)?;
+    let mut out = Vec::new();
+    let mut reader = BufReader::with_capacity(64 * 1024, f);
+    while let Some(ev) = read_event_frame(&mut reader)? {
+        out.push(ev);
+    }
+    Ok(out)
+}
+
+fn read_segment_events_tolerant(path: &Path) -> io::Result<Vec<Event>> {
+    let mut f = File::open(path)?;
+    let _hdr = read_v2_header_and_skip(&mut f)?;
+    let mut data = Vec::new();
+    f.read_to_end(&mut data)?;
+    if data.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < data.len() {
+        if i + 4 > data.len() {
+            break;
+        }
+        let len = u32::from_le_bytes(data[i..i + 4].try_into().unwrap()) as usize;
+        let frame_end = match i
+            .checked_add(4)
+            .and_then(|x| x.checked_add(len))
+            .and_then(|x| x.checked_add(4))
+        {
+            Some(end) => end,
+            None => {
+                i += 1;
+                continue;
+            }
+        };
+        if frame_end > data.len() {
+            i += 1;
+            continue;
+        }
+        let payload = &data[i + 4..i + 4 + len];
+        let stored_crc = u32::from_le_bytes(data[i + 4 + len..i + 4 + len + 4].try_into().unwrap());
+        if crc32fast::hash(payload) != stored_crc {
+            i += 1;
+            continue;
+        }
+        match postcard::from_bytes::<Event>(payload) {
+            Ok(ev) => {
+                out.push(ev);
+                i = frame_end;
+            }
+            Err(_) => {
+                i += 1;
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Прочитать payload одного frame'а (без десериализации). `Ok(None)` означает чистый
 /// EOF (нет даже 4 байт на длину). Resync через рваный фрейм — `journal::recover()`
 /// (M-05 J3), НЕ прод-путь.
@@ -384,6 +455,30 @@ fn parse_segment_index(name: &str) -> Option<u32> {
         return None;
     }
     rest.parse::<u32>().ok()
+}
+
+/// Обойти `segment-NNNNNNNN.jrnl` каталога по возрастанию индекса — БЕЗ классификации
+/// по манифесту. Используется в `read_all`/`recover` (ОФЛАЙН-диагностика, не требует
+/// декларации — в отличие от прод-пути `stream`, который через `list_segments`
+/// отвергает чужие/незадекларированные файлы).
+pub(crate) fn iter_segments_sorted(dir: &Path) -> io::Result<Vec<PathBuf>> {
+    let mut out: Vec<(u32, PathBuf)> = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let p = entry.path();
+        if p.extension().and_then(OsStr::to_str) != Some("jrnl") {
+            continue;
+        }
+        let name = match p.file_name().and_then(OsStr::to_str) {
+            Some(s) => s.to_string(),
+            None => continue,
+        };
+        if let Some(idx) = parse_segment_index(&name) {
+            out.push((idx, p));
+        }
+    }
+    out.sort_by_key(|(idx, _)| *idx);
+    Ok(out.into_iter().map(|(_, p)| p).collect())
 }
 
 /// Какие эпохи читатель СОГЛАСЕН смешивать — фильтр вызывается через `EpochFilter::accepts`.

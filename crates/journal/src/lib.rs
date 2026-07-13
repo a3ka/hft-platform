@@ -390,103 +390,44 @@ fn scan_tail_for_last_seq(seg_path: &Path) -> io::Result<Option<u64>> {
     Ok(last_valid_seq)
 }
 
-/// Прочитать все события сегмента по порядку (для replay/тестов). MVP.
-/// **DET-I-1 strict**: первая CRC-ошибка → `Err`. Для resync используй `recover()`.
+/// Прочитать все события журнала по порядку (для replay/малых фикстур). M-08 task 10.
+///
+/// Обходит ВСЕ `segment-NNNNNNNN.jrnl` каталога по возрастанию индекса, сшивая их
+/// в один `Vec<Event>` по порядку `seq`. v2-сегменты: пропускается magic + header.
+/// legacy (без магии): читается как сырые фреймы с начала файла — БЕЗ требования
+/// декларации в манифесте (`stream` требует, `read_all` — нет: это ОФЛАЙН-диагностика,
+/// не прод-чтение). Если вендор подсунет мусор под нашим именем, он прочитается
+/// как мусор; прод-путь `stream` его отвергнет.
+///
+/// **DET-I-1 strict**: первая CRC-ошибка / torn-фрейм → `Err` (ровно на одном сегменте,
+/// без «silent drop»). Используется `dump.rs`/`bands.rs`/`obi_probe.rs` (диагностика),
+/// НЕ прод-путь чтения (для прод — `stream`, O(1) памяти на сегмент).
 pub fn read_all(dir: impl AsRef<Path>) -> io::Result<Vec<Event>> {
-    let path = dir.as_ref().join(SEGMENT);
-    let mut data = Vec::new();
-    match File::open(&path) {
-        Ok(mut f) => {
-            f.read_to_end(&mut data)?;
-        }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e),
-    }
+    let dir = dir.as_ref();
+    let segs = segments::iter_segments_sorted(dir)?;
     let mut out = Vec::new();
-    let mut i = 0usize;
-    while i + 4 <= data.len() {
-        let len = u32::from_le_bytes(data[i..i + 4].try_into().unwrap()) as usize;
-        i += 4;
-        if i + len + 4 > data.len() {
-            break; // хвостовой обрыв фрейма — игнор (JR-I-2: полный фрейм или ничего)
-        }
-        let payload = &data[i..i + len];
-        let crc = u32::from_le_bytes(data[i + len..i + len + 4].try_into().unwrap());
-        if crc32fast::hash(payload) != crc {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "crc mismatch"));
-        }
-        let ev: Event = postcard::from_bytes(payload)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        out.push(ev);
-        i += len + 4;
+    for seg in segs {
+        out.extend(segments::read_segment_events(&seg, true)?);
     }
     Ok(out)
 }
 
-/// **M-05 task 4 / J3:** resync-толерантное чтение через рваные фреймы.
+/// **M-05 task 4 / J3 + M-08 task 10:** resync-толерантное чтение всего журнала.
 ///
-/// Полный проход по сегменту. На CRC-ошибке / torn / десериализации — байт-ресинк
-/// вперёд до следующего валидного фрейма. Возвращает ВСЕ валидные события в порядке
-/// seq. Отдельная функция от `read_all` (DET-I-1 strict), полный проход (НЕ в горячем
-/// `open()`) — для CLI-инструмента восстановления прод-журнала.
+/// Полный проход по каталогу. На CRC-ошибке / torn / десериализации ВНУТРИ сегмента —
+/// байт-ресинк вперёд до следующего валидного фрейма. Чужой/незадекларированный
+/// безголовый сегмент — `Err` (через `list_segments`), как и в `stream()`.
 ///
-/// Принимает `dir` (каталог журнала) — чтобы соответствовать API `read_all`.
-/// **Не** bounded-memory: читает ВЕСЬ сегмент в RAM. Для прод 2.65 GiB — ОК
-/// только как offline-инструмент, не как часть `open()`.
+/// Отдельная функция от `read_all` (strict), НЕ в горячем `open()` — для CLI-инструмента
+/// восстановления прод-журнала. **Не** bounded-memory: читает ВЕСЬ сегмент в RAM.
+/// Для прод 2.65 GiB — ОК только как offline-инструмент, не как часть `open()`.
 pub fn recover(dir: impl AsRef<Path>) -> io::Result<Vec<Event>> {
-    let path = dir.as_ref().join(SEGMENT);
-    let mut data = Vec::new();
-    match File::open(&path) {
-        Ok(mut f) => {
-            f.read_to_end(&mut data)?;
-        }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e),
-    }
-
+    let dir = dir.as_ref();
+    let segs = segments::iter_segments_sorted(dir)?;
     let mut out = Vec::new();
-    let mut i = 0usize;
-
-    while i < data.len() {
-        if i + 4 > data.len() {
-            break;
-        }
-        let len = u32::from_le_bytes(data[i..i + 4].try_into().unwrap()) as usize;
-
-        let frame_end = match i
-            .checked_add(4)
-            .and_then(|x| x.checked_add(len))
-            .and_then(|x| x.checked_add(4))
-        {
-            Some(end) => end,
-            None => {
-                i += 1; // переполнение → мусор → байт-ресинк
-                continue;
-            }
-        };
-        if frame_end > data.len() {
-            i += 1; // torn или мусорный len → байт-ресинк
-            continue;
-        }
-
-        let payload = &data[i + 4..i + 4 + len];
-        let stored_crc = u32::from_le_bytes(data[i + 4 + len..i + 4 + len + 4].try_into().unwrap());
-        if crc32fast::hash(payload) != stored_crc {
-            i += 1; // CRC fail → байт-ресинк
-            continue;
-        }
-
-        match postcard::from_bytes::<Event>(payload) {
-            Ok(ev) => {
-                out.push(ev);
-                i = frame_end;
-            }
-            Err(_) => {
-                i += 1; // deserialize fail → байт-ресинк
-            }
-        }
+    for seg in segs {
+        out.extend(segments::read_segment_events(&seg, false)?);
     }
-
     Ok(out)
 }
 
@@ -505,6 +446,20 @@ mod tests {
             }
             j.flush().unwrap();
         }
+        // M-08 task 10: legacy-path сегмент (без магии) читается read_all ТОЛЬКО
+        // через явную декларацию в journal.legacy.json (fail-closed CT-RFC-02 rev 2).
+        declare_legacy(
+            dir.path(),
+            contracts::LegacySegmentDecl {
+                file_name: "segment-00000000.jrnl".to_string(),
+                fingerprint_sha256: String::new(),
+                size_bytes_at_decl: 0,
+                source: contracts::DataSource::OwnCapture,
+                provenance: "lib.rs unit test".to_string(),
+                epoch_id: contracts::LEGACY_EPOCH_ID.to_string(),
+            },
+        )
+        .expect("declare_legacy");
         let evs = read_all(dir.path()).unwrap();
         assert_eq!(evs.len(), 5);
         for (i, e) in evs.iter().enumerate() {
