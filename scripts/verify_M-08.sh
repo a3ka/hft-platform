@@ -42,6 +42,10 @@ check "T5 journal legacy + эпохи (CT-RFC02-1..4)" cargo test -p journal --t
 # T6 (задача 3): ретеншен (типовой барьер ColdCopyProof) + fail-closed по диску
 check "T6 journal ретеншен + disk-guard (E3/E4)" cargo test -p journal --test red_retention
 
+# T7b (задача 10, МИНА): read_all/recover обязаны понимать v2 (магия+заголовок) и ВСЕ сегменты.
+# Иначе dump/bands/obi_probe после M-08 молча показывают «данных нет» при зелёных гейтах.
+check "T7b read_all/recover понимают v2 + все сегменты (задача 10)" cargo test -p journal --test red_read_all_v2
+
 # T7 (задача 2/4): регрессия журнала — старые инварианты живы (DET-I-1, TD-011 bounded open)
 check "T7 journal регрессия (вкл. red_open_bounded)" cargo test -p journal
 
