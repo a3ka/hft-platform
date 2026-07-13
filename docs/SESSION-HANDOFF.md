@@ -91,6 +91,32 @@ Coin/TOTAL/…). Полосы вычислимы ТОЛЬКО через full-bo
    до P3/testnet); reviewer RN-2: обязательный фокус risk-critic на отчёте R-001.
 
 ## 6. СЛЕДУЮЩАЯ ЗАДАЧА
+
+> **Обновлено 2026-07-13: M-07 «Strategy brain» ЗАКРЫТ** (reviewer APPROVED, merge `5141fd9`,
+> CI+Deploy success, §8 eyes-on GREEN — recorder инертен; `verify_M-07.sh` 21/21 exit=0).
+> Появились крейты `alpha` (ансамбль сигналов → `Forecast`), `portfolio` (sizing → `TargetPosition`,
+> **pre-risk sanity, НЕ риск-гейт**), `strategy` (`DirectionalStrategy` → `OrderIntent`, владелец
+> формы) + `sim::StrategyBacktest`. Ad-hoc harness грида удалён: бэктест теперь гоняет ТОТ ЖЕ код
+> решений, что и будущий live (DESIGN §1, равенство 2).
+>
+> **Развилка для founder'а — две готовые к запуску ветки:**
+> 1. **M-08 (risk + killswitch + oms)** — fail-closed `RiskApproved<Order>` МЕЖДУ `strategy` и
+>    `oms`; RISK-BLOCK (`gates.md` §5): critic + **risk-critic** обязательны, `RK-I-1..10` +
+>    `INTG-I-*` RED-suite. Это путь к testnet-торговле (P3).
+> 2. **M-04 задача 8 — формальный прогон OBI → `research/reports/R-001`** (TD-009): теперь ОБЯЗАН
+>    идти на strategy-пайплайне M-07 и соблюдать **TD-015** (эпохи trials-ledger несопоставимы:
+>    в метрики/deflated-Sharpe — только записи кода `>= 5141fd9`; пре-M-07 записи мерили удалённый
+>    harness). Правило закреплено в `.claude/rules/gates.md` §6.3/§6.4 + амендмент в
+>    `milestones/M-04-research-core.md`. Гейт: risk-critic + подпись founder ★.
+>
+> **Процессные находки reviewer'а (вне M-07, ждут решения founder'а):**
+> - **Deploy НЕ гейтится на CI** (`.github/workflows`): «Deploy to VPS» зеленеет, пока CI ещё идёт →
+>   красный CI не остановит прод. Кандидат на `needs: ci` — мелкая правка, высокий эффект.
+> - **Дрейф памяти recorder:** контейнер с ~5ч аптайма показывал MEM 48 MiB против 5–9 MiB
+>   исторически. Одна точка, предшествует M-07, лик НЕ доказан — но это класс тихой деградации,
+>   которую healthcheck маскирует (урок TD-011). Нужен наблюдательный оракул/замер, не молчание.
+
+### (архив) Предыдущая формулировка
 > Обновлено 2026-07-13: **M-05 (journal integrity) и M-06 (data expansion: futures depth/OI/
 > liquidations/funding + funding-breadth) ЗАКРЫТЫ** (reviewer-approved, §8 live-green). TD-011
 > (journal OOM) и TD-014 (futures liveness) CLOSED. Ниже — след. задача, теперь РАЗБЛОКИРОВАННАЯ.
