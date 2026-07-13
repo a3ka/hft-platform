@@ -197,7 +197,62 @@ PASS на чистом чекауте → reviewer APPROVED. Тесты: 28 RED�
   накоплением full-book данных (VPS пишет с 2026-07-10) + вердиктом risk-critic + подписью
   founder ★. Merge кода НЕ трогал risk/oms/venues/contracts, поэтому risk-critic — на отчёте.
 
+## Мозг стратегии (M-07 «Strategy brain» — РЕАЛИЗОВАНО, reviewer APPROVED 2026-07-13)
+Закрыта дыра равенства DESIGN §1 №2 (`backtest == paper == live`): решения больше НЕ захардкожены
+в ad-hoc harness'е `research-cli/grid.rs` (taker-in по `SignalOut`, taker-out по `horizon_ms`,
+фиксированный `qty=1.0`) — бэктест гоняет НАСТОЯЩИЙ код решений, тот же объект, который в P3+
+исполнит live-`runner`. Цепочка: architect → critic C-004 (rev1 REJECT → rev2 APPROVE) → engine-dev
+(2–5) → research-dev (6) → tester (7) → **reviewer CHANGES REQUESTED (equity-curve дефект)** →
+architect rev3 (RED ST-I-8g/8h) → engine-dev (9) → reviewer APPROVED. Merge: ff `5141fd9`.
+`verify_M-07.sh` — 21/21 PASS, exit=0 (reviewer перепрогнал независимо на чистом чекауте).
+
+- `crates/alpha` (Слой 2) — `LinearAlpha`: ансамбль `edge = clamp(Σwᵢvᵢ/Σ|wᵢ|, ±1e8)`,
+  `horizon = max(horizonᵢ)`, `confidence` = доля живого веса; stale-expiry сэмпла по `horizon_ms`
+  (сигнал не живёт вечно, AL-I-4); BTreeMap-детерминизм обхода; веса fail-closed валидируются
+  (пусто/ноль/дубль → Err). AL-I-1..5 GREEN.
+- `crates/portfolio` (Слой 3) — `RiskBudget` + `size()`: `target = clamp(edge·max_pos/1e8, ±max_pos)`
+  на i128 (PF-I-2 держит `i64::MAX`-edge без переполнения); **дефолтного лимита НЕ существует** —
+  инструмент без явного лимита → target 0 (fail-closed, анти-`risk_guard` DESIGN §9); позиция без
+  форкаста → flatten. PF-I-1..4 GREEN. ⚠ Это pre-trade sanity, **НЕ риск-гейт** — fail-closed
+  `RiskApproved<Order>` (RK-I-1..10) приходит в M-08 и встаёт МЕЖДУ `strategy` и `oms`.
+- `crates/strategy` (Слой 4) — `DirectionalStrategy`: `Event → signals → alpha → portfolio →
+  diff(target vs current) → OrderIntent`; in-flight дедуп с TTL по **event-time** (никакого
+  wall-clock, D4); маркетабельная цена (i128); нет видимой книги → интента НЕТ. Структурно не знает,
+  кто его исполняет: нет зависимостей на `sim`/`venue-*`/`journal`/`risk`, нет `HashMap`/`rand`/
+  `SystemTime` (ST-I-6 грепами + T8a-c). `OrderIntent`/`OrderKind` релоцированы `sim` → `strategy`
+  (T2, D1; канарейка ST-I-7/T8d-e: `pub struct OrderIntent` ровно в одном крейте); `sim`
+  ре-экспортирует. ST-I-1..7 GREEN.
+- `crates/sim::StrategyBacktest` (D3) — harness `run(&[Event], &mut dyn Strategy) -> BacktestReport`.
+  Порядок на событии строго: `exchange.on_event` → `strategy.on_fill` по каждому филлу (мост
+  `SimFill → FillReport` через `order_meta`) → `strategy.on_event` → `exchange.submit`. Стратегия
+  никогда не видит событие раньше биржи и не видит будущего (ST-I-8f: мутация будущего не меняет
+  прошлого). ST-I-8a..h GREEN.
+- `crates/research-cli` — ad-hoc harness (`OpenPosition`/`Action`) **удалён** (канарейка T9b);
+  грид гоняет ячейку через `StrategyBacktest` + `DirectionalStrategy` (T9c/T9d — грепы игнорируют
+  комментарии); `strategy_cell` (D7/D8): дефолты блока `strategy`, `cell_params_hash` (покрывает
+  strategy+costs), `capital_ref_e8 = max_position·mid₀`, `returns = Δequity/capital_ref`.
+  Гейт задачи 6 — **ПОВЕДЕНЧЕСКИЙ** (GR-I-6/7: разный `max_position_e8` обязан дать разный оборот;
+  деадбенд шире лимита → ноль интентов — оба валят harness с фиксированным `qty=1.0`). GR-I-1..7 GREEN.
+- **Дефект, пойманный reviewer'ом на PR-гейте (не оракулами) — equity-curve.** `StrategyBacktest`
+  привязывал точку equity к НАКОПЛЕННОМУ числу филлов (`curve.len() < fills.len()`), а не к «на ЭТОМ
+  событии был филл»: событие с 2+ филлами давало 1 точку, а дефицит добирался на ПОСЛЕДУЮЩИХ
+  БЕСФИЛЛОВЫХ событиях → фантомные точки → лишние near-zero доходности → **σ занижена → Sharpe
+  ЗАВЫШЕН** → `ValidationReport` → trials-ledger → подпись founder'а (gates §6/§7). Достижимо на
+  реальных данных (ttl-expiry переотправляет интент, пока taker-ордер ждёт traded-тик → оба филлятся
+  на одном тике). Дыра была в RED-suite: `equity_curve` не ассертилась НИГДЕ (GR-I-4 тестировала
+  `returns_from_equity` как чистую функцию на рукописном векторе и кривую из `run()` не видела) —
+  тот же класс, что C-004 C2, этажом выше. Фикс: `had_new_fill_this_event` (rev3, `5141fd9`).
+  Новые sacred-оракулы **ST-I-8g** (кривая сверяется ПОЭЛЕМЕНТНО с независимо пересчитанным MTM:
+  значения + моменты + количество; фикстура обязана быть мульти-филловой) и **ST-I-8h** (бесфилловые
+  события не добавляют точек) + гейт T5b в `verify_M-07.sh`. **Анти-плацебо доказан reviewer'ом
+  независимо:** оба оракула FAIL против пред-фиксной реализации (`left: 2, right: 1` — 2 фантомные
+  точки при 1 событии с филлами), остальные 6 ST-I-8a..f остались GREEN (регрессии нет).
+- **Прод инертен (T10):** `recorder` не зависит от `alpha`/`portfolio`/`strategy`/`sim` — мозг не
+  торгует и не пишет журнал. §8 eyes-on после deploy подтвердил НУЛЕВОЕ изменение поведения recorder'а.
+
 ## Пока НЕ реализовано (следующие фазы)
-- Крейты `alpha`/`portfolio`/`strategy`, `risk`/`killswitch`/`oms`, `runner` — пофазно per
-  DESIGN §10. `book` microprice/depth-полосы сверх M-04-примитивов — по мере надобности.
+- Крейты `risk`/`killswitch`/`oms`, `runner` — пофазно per DESIGN §10 (M-08: fail-closed риск-гейт
+  между `strategy` и `oms`). MM-котирование, wiring весов из `signals.json` (граница B),
+  netting/корреляции — вне M-07 (named-not-silent). `book` microprice/depth-полосы сверх
+  M-04-примитивов — по мере надобности.
 - Полный формат журнала (сегмент-ротация, снапшоты, state_hash, DET-I-1 полный) — пофазно.
