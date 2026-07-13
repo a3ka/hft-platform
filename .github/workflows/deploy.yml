@@ -22,9 +22,42 @@ on:
   workflow_dispatch:
 
 jobs:
+  # M-08 E9 (находка reviewer'а 2026-07-13): Deploy зеленел, ПОКА CI ЕЩЁ ШЁЛ — красный CI
+  # не останавливал выкатку в прод. `needs:` между workflow'ами не работает, поэтому гейт
+  # явный: ждём терминальный статус CI по ЭТОМУ ЖЕ SHA. Fail-closed: красный CI, отмена
+  # или таймаут → деплой НЕ идёт (прод дороже скорости выкатки).
+  ci:
+    name: Gate on CI (fail-closed)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wait for CI success on this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 80); do   # 80 × 15s = 20 мин потолок
+            run=$(gh api "repos/${REPO}/actions/runs?head_sha=${SHA}" \
+                    --jq '[.workflow_runs[] | select(.name=="CI")] | sort_by(.created_at) | last')
+            status=$(echo "${run}" | jq -r '.status // "missing"')
+            conclusion=$(echo "${run}" | jq -r '.conclusion // "null"')
+            echo "attempt ${i}: CI status=${status} conclusion=${conclusion}"
+            if [ "${status}" = "completed" ]; then
+              if [ "${conclusion}" = "success" ]; then
+                echo "CI зелёный — деплой разрешён"; exit 0
+              fi
+              echo "CI НЕ зелёный (${conclusion}) — деплой заблокирован"; exit 1
+            fi
+            sleep 15
+          done
+          echo "CI не дошёл до терминального статуса за 20 мин — деплой заблокирован (fail-closed)"
+          exit 1
+
   deploy:
     name: Deploy (build on VPS)
     runs-on: ubuntu-latest
+    needs: ci
     # environment: production   # ← P4: включить + Required reviewers для live-торговли
     steps:
       - name: Deploy via SSH
