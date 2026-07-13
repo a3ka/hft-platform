@@ -130,3 +130,39 @@ read-side REST).
 
 **TD-013 (correctness/rate) ≠ TD-012 (completeness/limit=1000)** — разные фиксы.
 Цепочка реленда: architect(RED, здесь) → venue-dev(Backoff+wire) → engine-dev(reland #4 = re-apply 2eee4bf) → tester(#6).
+
+## Amendment 2026-07-12 (TD-014 — futures runner live-emit; #4 reland §8-rejected)
+
+Инцидент: #4 reland прошёл TD-013 (backoff live-OK, нет hot-loop), но §8 REJECT — в live-журнале
+0 BinanceFutures L2Snapshot + 0 Funding (только ConnUp + OpenInterest), логи вечно "depth
+continuity gap / snapshot stale vs buffered diffs, refetching".
+
+**Анализ (architect):** (a) `handle_snapshot` reconcile-loop применяет буфер-diff'ы, но stale-чек
+(`u_first > book.last_update_id + 1`) сравнивает с last_update_id, который, вероятно, НЕ двигается
+при apply → 2-й contiguous diff вечно "stale" → книга никогда не синкается → 0 L2. (b) Funding из
+!markPrice@arr не эмитится/starve'ится resync-циклом → 0 Funding. Оба НЕВИДИМЫ юнит-тестам:
+`handle_diff/handle_snapshot/emit_book_snapshots` ходят в сеть (reqwest) и шлют в tx напрямую.
+
+**Дизайн (architect, §4 — venue-dev реализует):** тестируемый seam `FuturesSession` —
+sync-state-машина БЕЗ сети/каналов:
+```
+pub struct FuturesSession;                      // wraps states + symbol_set
+pub enum SessionEffect { Emit(MdEvent), FetchSnapshot { symbol: String, after: Duration } }
+FuturesSession::new(&[String]) -> Self
+  .on_ws_text(&mut self, text: &str) -> Vec<SessionEffect>            // depth/forceOrder/markPrice
+  .on_snapshot_result(&mut self, symbol: &str, Result<String, u16>) -> Vec<SessionEffect>  // Ok(json)/Err(http)
+  .tick(&mut self) -> Vec<SessionEffect>                              // 1с: emit bounded L2Snapshot
+```
+`run()` становится тонкой I/O-оболочкой, ДЕЛЕГИРУЮЩЕЙ в `FuturesSession` (live == tested — иначе
+дефект снова невидим). FIX: двигать `last_update_id` при apply (multi-diff sync); Funding из
+markPrice эмитить НЕЗАВИСИМО от состояния книги (не starve).
+
+**Оракул:** `tests/red_live_emit.rs` (compile-RED): 2 contiguous diff'а + snapshot(L=100) → sync +
+эмит L2; markPrice во время resync → Funding; 418 → backoff. Анти-плацебо: верный рефактор
+ТЕКУЩЕЙ логики оставляет multi-diff-stale → RED, форсит фикс.
+
+**Acceptance:** red_live_emit GREEN + red_backoff/parse/funding/resnapshot GREEN + fmt/clippy/
+workspace + (после reland #4) verify_M-06 PASS + reviewer §8 LIVE: BinanceFutures L2Snapshot +
+Funding + OpenInterest в журнале, no hot-loop, heartbeat fresh, seq continuous, CPU/MEM norm,
+restarts=0. TD-014 (liveness/emit) ≠ TD-013 (rate/backoff) ≠ TD-012 (completeness/limit=1000).
+risk-critic НЕ нужен (MD-only). Цепочка: architect(RED, здесь) → venue-dev(seam+fix) → engine-dev(reland #4) → tester(#6).
