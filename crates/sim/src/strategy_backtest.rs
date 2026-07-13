@@ -83,12 +83,16 @@ impl StrategyBacktest {
         let mut turnover_e8: i128 = 0;
         let mut equity_curve_e8: Vec<i64> = Vec::new();
         let mut books = Books::new();
+        let scale = contracts::PRICE_SCALE as i128;
 
         for ev in events {
             // ── 1. Биржа видит событие первой (SM-I-4: модель не видит будущего). ────────
             let new_fills = self.exchange.on_event(ev);
+            let had_new_fill_this_event = !new_fills.is_empty();
 
             // ── 2. Доложить филлы стратегии (мост SimFill → FillReport, M-07 D2). ───────
+            // ВАЖНО: все on_fill'ы до books.apply — тогда equity-марк отражает позицию,
+            // в которую УЖЕ включены все филлы этого события (M-07 D7 / ST-I-8g oracle).
             for sim_fill in &new_fills {
                 let (instrument, side) = match self.order_meta.get(&sim_fill.order_id) {
                     Some(meta) => meta.clone(),
@@ -96,12 +100,7 @@ impl StrategyBacktest {
                 };
                 self.instruments_seen.insert(instrument.clone());
 
-                let signed_qty = match side {
-                    Side::Buy => sim_fill.qty,
-                    Side::Sell => -sim_fill.qty,
-                };
-                let notional_e128 = (sim_fill.price as i128) * (sim_fill.qty as i128)
-                    / (contracts::PRICE_SCALE as i128);
+                let notional_e128 = (sim_fill.price as i128) * (sim_fill.qty as i128) / scale;
                 // Buy тратит (notional + fee); sell приносит (notional − fee).
                 let cash_delta = if matches!(side, Side::Buy) {
                     -(notional_e128 + sim_fill.fee_e8 as i128)
@@ -120,25 +119,19 @@ impl StrategyBacktest {
                     ts_mono_ns: sim_fill.ts_mono_ns,
                 };
                 strategy.on_fill(&report);
-
-                // ── 3.1 Точка mark-to-market для equity_curve (на событии с филлом). ──────
-                // Реконструируем mid на момент этого события — используем последний
-                // применённый биржей снапшот. `Books::apply(Ev.kind = Md)` идёт ПОСЛЕ
-                // exchange.on_event (мы его вызываем ниже), поэтому см. ниже.
-                // Чтобы избежать двух проходов по books, отложим расчёт equity до
-                // применения Md-снапшота (если он был). Для большинства тиков книги
-                // обновляются именно L2Snapshot — он и даёт mid.
-                let _ = signed_qty; // намерение ясно: атрибуция PnL — за пределами M-07
             }
             fills_out.extend(new_fills);
 
-            // ── 2.5 Применить Md-событие к локальной реконструкции книги (для mark-to-market). ──
+            // ── 2.5 Применить Md-событие к локальной реконструкции книги (mid для MTM). ──
             if let EventKind::Md(md) = &ev.kind {
                 books.apply(md);
             }
 
-            // Пересчитать equity_curve, если в этом событии были филлы.
-            if !fills_out.is_empty() && equity_curve_e8.len() < fills_out.len() {
+            // ── 2.7 Equity-точка: РОВНО ОДНА на событие, где биржа дала ≥1 филл (D7/ST-I-8g).
+            // Привязка к флагу `had_new_fill_this_event` (НЕ к накопленному fills_out.len()),
+            // иначе на бесфилловых событиях между филлами появляются фантомные точки,
+            // которые занижают σ returns-серии и ЗАВЫШАЮТ Sharpe → путь в trials-ledger.
+            if had_new_fill_this_event {
                 let mut eq: i128 = cash_e8;
                 for inst in &self.instruments_seen {
                     let pos = strategy.position_e8(inst) as i128;
@@ -147,7 +140,7 @@ impl StrategyBacktest {
                         Some(p) => p as i128,
                         None => continue,
                     };
-                    eq += pos * mid_price / (contracts::PRICE_SCALE as i128);
+                    eq += pos * mid_price / scale;
                 }
                 let clamped = eq.clamp(i64::MIN as i128, i64::MAX as i128) as i64;
                 equity_curve_e8.push(clamped);
@@ -166,14 +159,6 @@ impl StrategyBacktest {
                 }
                 // Err → пропускаем (Bi/SM-SM-I-8 на sim: нет тарифа/латентности → submit не состоится).
             }
-
-            // Гарантируем 1 equity-точку на КАЖДОЕ событие, где были fills_out вообще.
-            // (if-выше использовал разницу len — это нормально, но нам нужен обновляемый
-            // итератор: нужно после добавления новых fills_out учёт делать).
-            // В текущей реализации проверка `len() < fills_out.len()` сработает при первом
-            // добавлении, но не при последующих без новых fills_out на текущем шаге.
-            // Корректная семантика: append equity каждый шаг, на котором в `new_fills`
-            // было >0 — пересчитаем начисто:
         }
 
         // Финальные positions — через strategy.position_e8 по каждому известному инструменту
