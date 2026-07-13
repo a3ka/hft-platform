@@ -235,6 +235,32 @@ pub fn run_grid(
     Ok(results)
 }
 
+/// Источник событий для грида на ПРОД-МАСШТАБЕ (M-08 E5/E6, carve-out A3).
+///
+/// Каталог журнала + ЯВНО названная эпоха. Грид открывает свежий bounded-memory стрим
+/// на КАЖДУЮ ячейку — журнал (8.3 GB и растёт) в память не помещается и помещаться не должен.
+pub struct JournalSource {
+    pub dir: std::path::PathBuf,
+    /// Эпоху нельзя не назвать (CT-RFC02-2): вендорские данные не подмешиваются молча.
+    pub filter: journal::EpochFilter,
+}
+
+/// Стрим-версия `run_grid` (M-08 задача 5). Семантика ячеек/ledger/стресс-режимов —
+/// ТА ЖЕ (оракул эквивалентности в `tests/red_stream_grid.rs`), отличается только тем,
+/// что события не материализуются в `Vec<Event>`.
+///
+/// Реализация — research-dev (M-08 task 5).
+pub fn run_grid_streamed(
+    _source: &JournalSource,
+    _spec: &GridSpec,
+    _split: SplitKind,
+    _range_ms: (i64, i64),
+    _env: &mut GridRunEnv<'_>,
+    _test_proof: Option<&ValGateToken>,
+) -> Result<Vec<CellResult>, RcError> {
+    todo!("M-08 task 5 (research-dev): по ячейке — свежий journal::stream, bounded memory")
+}
+
 /// Механическая сортировка топ-K по предварительной метрике (Sharpe без deflation —
 /// deflation только на финальной валидации, FA §5). НЕ трогает val/test.
 pub fn top_k(results: &[CellResult], k: usize) -> Vec<CellResult> {
