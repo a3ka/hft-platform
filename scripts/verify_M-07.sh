@@ -38,6 +38,11 @@ check "T4 strategy tests (ST-I-1..7)" cargo test -p strategy
 
 # T5 (задача 5): sim — интеграция strategy→BacktestExchange (ST-I-8) + регрессия SM-I-*
 check "T5 sim tests (ST-I-8 + SM-I-* регрессия)" cargo test -p sim
+# T5b (rev 3, reviewer-находка): ФОРМА equity-кривой (D7) — одна точка на СОБЫТИЕ с филлами,
+# ноль точек на бесфилловых. Отдельная строка, потому что искажение кривой не роняет
+# компиляцию и не видно в агрегате: оно тихо завышает Sharpe в ValidationReport →
+# trials-ledger → подпись founder'а (gates §6/§7).
+check "T5b ST-I-8g/8h форма equity-кривой (D7)" cargo test -p sim --test red_strategy_backtest equity
 
 # T6 (задача 6): research-cli на настоящем strategy-пайплайне (RC-I-* регрессия)
 check "T6 research-cli tests (RC-I-* регрессия)" cargo test -p research-cli

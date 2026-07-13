@@ -1,6 +1,6 @@
 # M-07 — Strategy brain: `alpha` → `portfolio` → `strategy` (мозг стратегии)
 
-STATUS: 🚧 PROPOSED (revision 2 — закрыты находки critic C-004: C1, C2, M1).
+STATUS: 🚧 IN_PROGRESS (revision 3 — reviewer-находка: сэмплинг equity_curve, оракулы ST-I-8g/8h; задача 9 BLOCKING).
 Authored: architect (Opus), 2026-07-13.
 Гейты: **critic ОБЯЗАТЕЛЕН** (`.claude/rules/gates.md` §1 триггеры: 3 новых крейта,
 ≥5 коммитов) → engine-dev → research-dev → tester → reviewer.
@@ -51,7 +51,7 @@ wiring весов из `signals.json` (граница B, P3); netting/корре
 | D4 | Дедупликация ордеров в полёте | `in_flight` per instrument; запись истекает по **event-time** через `intent_ttl_ms` (никакого wall-clock). Без этого стратегия шлёт интент на каждом тике, пока филл не пришёл (ST-I-3) |
 | D5 | Ансамбль v1 | `LinearAlpha`: `edge = clamp(Σwᵢvᵢ/Σ\|wᵢ\|, ±1e8)`, `horizon = max(horizonᵢ)`, `confidence = доля живого веса`, stale-expiry по `horizon_ms` сэмпла (FA §4). Один сигнал — вырожденный случай той же формулы (не отдельный путь) |
 | D6 | Сайзинг v1 | `target = clamp(edge·max_pos/1e8, ±max_pos)` (i128); нет лимита → target 0; позиция без форкаста → target 0 (flatten). Это **pre-risk sanity, НЕ риск-гейт** — настоящий fail-closed барьер приходит в M-08 |
-| D7 | Метрики грида после замены harness'а | `BacktestReport` несёт `fills`, `intents`, `cash_e8`, `positions`, `turnover_e8`, `equity_curve_e8` (mark-to-market по последнему mid на каждом событии с филлом). `research-cli` считает returnsᵢ = `Δequity_e8 / capital_ref_e8`, где `capital_ref_e8 = max_position_e8 × mid₀` ячейки (детерминированно, задокументировать в отчёте). Числа PnL ОТЛИЧАЮТСЯ от пилота v1 — это ожидаемо (мерили другую логику); ledger append-only, старые записи не переписываются |
+| D7 | Метрики грида после замены harness'а | `BacktestReport` несёт `fills`, `intents`, `cash_e8`, `positions`, `turnover_e8`, `equity_curve_e8`. **Семантика кривой УТОЧНЕНА (rev 3, reviewer-находка на PR-гейте; оракулы ST-I-8g/8h):** РОВНО одна точка на КАЖДОЕ СОБЫТИЕ, где биржа вернула ≥1 филл (2 филла на одном событии = 1 точка, а НЕ 2), снятая ПОСЛЕ применения события к книге и учёта ВСЕХ филлов события; на бесфилловых событиях точек НЕТ; `len(equity_curve) == #уникальных seq в fills`. Привязка к накопленному числу филлов (`curve.len() < fills.len()`) ЗАПРЕЩЕНА — она добирает фантомные точки в бесфилловом хвосте → σ занижена → Sharpe завышен → отчёт → ledger → подпись founder'а. `research-cli` считает returnsᵢ = `Δequity_e8 / capital_ref_e8`, где `capital_ref_e8 = max_position_e8 × mid₀` ячейки (детерминированно, задокументировать в отчёте). Числа PnL ОТЛИЧАЮТСЯ от пилота v1 — это ожидаемо (мерили другую логику); ledger append-only, старые записи не переписываются |
 | D8 | Совместимость grid-ячеек | Ячейка = `ObiParams` + опциональный блок `strategy`: `{max_position_e8=1e8, min_order_e8=1e6, intent_ttl_ms=1000, marketable_margin_bp=100, kind="taker"}` (дефолты при отсутствии) → существующие спеки `S-001` парсятся. `params_hash` меняется → это НОВЫЕ trial-записи, честно |
 
 ## Allowed / Forbidden paths (scope-guard)
@@ -75,6 +75,7 @@ wiring весов из `signals.json` (граница B, P3); netting/корре
 | 5 | ⏳ | `sim::StrategyBacktest` harness: прогон `dyn Strategy` через `BacktestExchange`, мост `SimFill → FillReport` (сторона/инструмент — из интента через `order_meta`), `BacktestReport` (D3/D7) | engine-dev | `cargo test -p sim` GREEN (**ST-I-8a..f**: интенты доходят; **8e спай — КАЖДЫЙ филл доложен и верно подписан**; **8f — мутация будущего не меняет прошлое**; регрессия SM-I-*) |
 | 6 | ⏳ | `research-cli`: (а) реализовать `strategy_cell` (D7/D8: дефолты, `cell_params_hash`, `capital_ref_e8`, `returns_from_equity`); (б) переписать `grid.rs` — снять ad-hoc harness (`OpenPosition`/`Action`), гонять ячейку через `sim::StrategyBacktest` + `DirectionalStrategy`; ledger/стресс-режимы семантически сохранены | research-dev | `cargo test -p research-cli` GREEN (**GR-I-1..7**, включая ПОВЕДЕНЧЕСКИЕ GR-I-6/7: блок `strategy` реально меняет оборот; деадбенд глушит торговлю; ledger несёт канонический хэш) + RC-I-* регрессия |
 | 7 | ⏳ | Прогон `scripts/verify_M-07.sh` на чистом чекауте | tester | `VERDICT: PASS`, exit=0 |
+| 9 | ⏳ | **(rev 3, BLOCKING)** Фикс сэмплинга `equity_curve_e8` в `sim::StrategyBacktest::run` (D7): точка привязывается к «на ЭТОМ событии был ≥1 филл», а не к `curve.len() < fills.len()`. Попутно убрать мёртвый `let _ = signed_qty;` и висячий комментарий (`strategy_backtest.rs:85-88,117,156-162`) | engine-dev | `cargo test -p sim` GREEN, включая **ST-I-8g/8h**; `verify_M-07.sh` T5b PASS |
 | 8 | ⏳ | Review + merge `feat/M-07 → main` + post-merge §8 (CI/Deploy + VPS eyes-on: recorder НЕ должен измениться — M-07 инертен для прода) | reviewer | Done Block + §8 пруф |
 
 Задачи 2 и 3 параллелятся; 4 зависит от 2+3; 5 от 4; 6 от 5.
