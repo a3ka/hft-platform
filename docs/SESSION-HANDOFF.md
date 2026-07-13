@@ -91,6 +91,10 @@ Coin/TOTAL/…). Полосы вычислимы ТОЛЬКО через full-bo
    до P3/testnet); reviewer RN-2: обязательный фокус risk-critic на отчёте R-001.
 
 ## 6. СЛЕДУЮЩАЯ ЗАДАЧА
+> Обновлено 2026-07-13: **M-05 (journal integrity) и M-06 (data expansion: futures depth/OI/
+> liquidations/funding + funding-breadth) ЗАКРЫТЫ** (reviewer-approved, §8 live-green). TD-011
+> (journal OOM) и TD-014 (futures liveness) CLOSED. Ниже — след. задача, теперь РАЗБЛОКИРОВАННАЯ.
+
 **M-04 задача 8 — формальный прогон OBI** (единственная открытая; всё для неё готово):
 1. Дать VPS накопить **3-7 дней** полной книги (пишется с 2026-07-10; на 2026-07-11 было
    ~164MB/663k событий ≈ часы — этого мало, только шум).

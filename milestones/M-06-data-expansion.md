@@ -1,6 +1,6 @@
 # M-06 — Data expansion: futures depth + OI + liquidations + funding-breadth (P1)
 
-STATUS: 🚧 IN_PROGRESS. Authored: architect (Fable), 2026-07-11.
+STATUS: ✅ DONE (close-out 2026-07-13; reland #4 APPROVED 9272a89 + MERGED 1504d8b + §8 LIVE-GREEN). Authored: architect (Fable), 2026-07-11.
 Предпосылка: CT-RFC-01 применён (C-003 PASS) — T1 несёт Venue::BinanceFutures +
 MdPayload::{OpenInterest,Liquidation,MarginRate}. Гейты: critic не требуется (контракты
 уже прошли CT-RFC-01; новый крейт venue-binance-futures — триггер §1.4, но это тонкий
@@ -28,12 +28,12 @@ MdPayload::{OpenInterest,Liquidation,MarginRate}. Гейты: critic не тре
 ## §Tasks
 | # | Status | Задача | Агент | Verify |
 |---|---|---|---|---|
-| 1 | ⏳ | **Blast-radius fix (компайл):** MUST-FIX exhaustive — `sim/src/exchange.rs:223` (MdPayload), `research-cli/bin/latency_probe.rs:34-38` (Venue)+`:107-111` (MdPayload); EXPLICIT-ARM (сейчас wildcard, C-003 §3) — `book/src/lib.rs:190-197`, `signals/src/obi.rs:84-87`; examples dump/bands/obi_probe. Новые payload'ы — ЯВНЫЙ ignore (не молчаливый wildcard). | engine/research/signal-dev по зонам | workspace компилируется; C1-RED GREEN |
-| 2 | ⏳ | `venue-binance-futures` скелет (architect) → парсеры: fstream `@depth@100ms`+`/fapi/v1/depth` (L2Snapshot, Venue::BinanceFutures); `@forceOrder` → Liquidation; `!markPrice@arr`/`premiumIndex` → Funding | architect(скелет+RED)→venue-dev | C2-RED GREEN |
-| 3 | ⏳ | OI: `/fapi/v1/openInterest` (+`openInterestHist`) → MdPayload::OpenInterest | venue-dev | C3-RED GREEN |
-| 4 | ⏳ | recorder-poller: REST-источники (funding all-perps `premiumIndex` 1 вызовом; OI) с фикс.cadence-конфигом → журнал с ts_exch | engine-dev | poller пишет события, cadence детерминирован |
-| 5 | ⏳ | funding-breadth top-300 (%+/−) — DERIVE в крейте `derive`, НЕ T1; ранжирование по OI/volume | research-dev | breadth считается из потока Funding детерминированно |
-| 6 | ⏳ | `scripts/verify_M-06.sh` exit=0 | tester | exit=0 |
+| 1 | ✅ | **Blast-radius fix (компайл):** MUST-FIX exhaustive — `sim/src/exchange.rs:223` (MdPayload), `research-cli/bin/latency_probe.rs:34-38` (Venue)+`:107-111` (MdPayload); EXPLICIT-ARM (сейчас wildcard, C-003 §3) — `book/src/lib.rs:190-197`, `signals/src/obi.rs:84-87`; examples dump/bands/obi_probe. Новые payload'ы — ЯВНЫЙ ignore (не молчаливый wildcard). | engine/research/signal-dev по зонам | workspace компилируется; C1-RED GREEN |
+| 2 | ✅ | `venue-binance-futures` скелет (architect) → парсеры: fstream `@depth@100ms`+`/fapi/v1/depth` (L2Snapshot, Venue::BinanceFutures); `@forceOrder` → Liquidation; `!markPrice@arr`/`premiumIndex` → Funding | architect(скелет+RED)→venue-dev | C2-RED GREEN |
+| 3 | ✅ | OI: `/fapi/v1/openInterest` (+`openInterestHist`) → MdPayload::OpenInterest | venue-dev | C3-RED GREEN |
+| 4 | ✅ | recorder-poller: REST-источники (funding all-perps `premiumIndex` 1 вызовом; OI) с фикс.cadence-конфигом → журнал с ts_exch | engine-dev | poller пишет события, cadence детерминирован |
+| 5 | ✅ | funding-breadth top-300 (%+/−) — DERIVE в крейте `derive`, НЕ T1; ранжирование по OI/volume | research-dev | breadth считается из потока Funding детерминированно |
+| 6 | ✅ | `scripts/verify_M-06.sh` exit=0 | tester | exit=0 |
 
 MarginRate impl — **Tier-3, ОТЛОЖЕН** (нужны ключи/3rd-party; тип уже в T1, продюсер позже).
 
@@ -166,3 +166,28 @@ workspace + (после reland #4) verify_M-06 PASS + reviewer §8 LIVE: Binance
 Funding + OpenInterest в журнале, no hot-loop, heartbeat fresh, seq continuous, CPU/MEM norm,
 restarts=0. TD-014 (liveness/emit) ≠ TD-013 (rate/backoff) ≠ TD-012 (completeness/limit=1000).
 risk-critic НЕ нужен (MD-only). Цепочка: architect(RED, здесь) → venue-dev(seam+fix) → engine-dev(reland #4) → tester(#6).
+
+## Amendment 2026-07-13 (M-06 CLOSE-OUT — DONE)
+
+**M-06 ЗАКРЫТ.** Reland #4 APPROVED (reviewer `9272a89`) + MERGED (`1504d8b`) + §8 LIVE-GREEN;
+tester #6 PASS на чистом чекауте (`verify_M-06.sh` exit=0; fmt/clippy/workspace GREEN; worktree clean).
+Все §Tasks ✅.
+
+**TD-014 (futures liveness) — CLOSED** после 3 итераций §8 eyes-on (unit-green ≠ prod-green):
+- **T1** recovery-эмит L2 (recovery-снапшот дропал все buffered diff'ы → `last_event_time_ms=0` → 0 L2).
+- **T2** continuity: Binance USDT-M FUTURES чейнит diff'ы через `pu == last_update_id`, не спот
+  `u_first == last+1` — устранил 311-gap resync-churn (sparse L2, 429).
+- **T4** Funding: WS mark-price НЕ доставляется (эмпирика architect'а — live WS-capture точного URL
+  адаптера: 400 depth / 0 markPrice, и sandbox, и прод-VPS) → **пивот на REST `/fapi/v1/premiumIndex`
+  poll** (тот же proven механизм, что OpenInterest) → Funding>0 live. (T3 per-symbol WS — тупик,
+  эмпирически доказал недоставку.)
+
+Урок (зафиксирован в `.claude/rules/gates.md §8b` + `testing.md`): для sacred I/O-путей local-green +
+Deploy-success ≠ рабочий прод; §8 eyes-on решающ. Транспорт-доставка биржи не юнит-тестируема —
+диагностируется live-capture'ом.
+
+Связанные долги (reviewer-owned, в бэклоге): TD-012 (futures REST depth `limit=1000` undercount дальних
+полос); MarginRate impl — Tier-3.
+
+**Следующее:** M-04 задача 8 (формальный прогон OBI) — теперь РАЗБЛОКИРОВАНА: journal integrity (M-05)
++ futures MD live (M-06) готовы. Осталось накопить данные полной книги → грид/walk-forward/отчёт.
