@@ -8,7 +8,7 @@
 //! Реализация `LinearAlpha` — engine-dev (M-07 task 2).
 //! Инварианты AL-I-1..5 — RED-оракулы в `tests/` (sacred, architect-only).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use contracts::{Event, Venue};
 use signals::{SignalId, SignalOut};
@@ -87,23 +87,149 @@ pub struct Sample {
 
 /// v1-ансамбль: взвешенная сумма (FA §4). Сэмпл участвует, пока
 /// `ev.ts_mono_ns ≤ ts_event + horizon_ms·1e6` (stale-expiry, AL-I-4).
-#[allow(dead_code)] // снимается в GREEN (engine-dev, M-07 task 2)
 pub struct LinearAlpha {
-    weights: Vec<SignalWeight>,
-    /// Ключ — (инструмент, signal_id как строка): BTreeMap, не HashMap (порядок = детерминизм).
+    /// (Инструмент, signal_id как строка) → ПОДПИСАННЫЙ вес ×1e8. BTreeMap — детерминизм.
+    /// SignalId (signals::*[​[derive]] не имеет Ord) → ключ строковый, value Ord есть.
+    weights: BTreeMap<(Instrument, String), i64>,
+    /// Сумма |w| на инструмент (для confidence_e8 = доля живого веса ансамбля, FA §4).
+    weight_sum_per_instrument: BTreeMap<Instrument, i128>,
+    /// Последний сэмпл на (инструмент, signal_id). BTreeMap — детерминизм обхода.
     last: BTreeMap<(Instrument, String), Sample>,
 }
 
 impl LinearAlpha {
-    /// Веса валидируются на входе (fail-closed): пустой набор / нулевой вес → Err.
-    pub fn new(_weights: Vec<SignalWeight>) -> Result<Self, AlphaError> {
-        todo!("M-07 task 2 (engine-dev): валидация весов + инициализация состояния")
+    /// Веса валидируются на входе (fail-closed): пустой набор / нулевой вес / дубль → Err.
+    pub fn new(weights: Vec<SignalWeight>) -> Result<Self, AlphaError> {
+        if weights.is_empty() {
+            return Err(AlphaError::EmptyWeights);
+        }
+        let mut by_key: BTreeMap<(Instrument, String), i64> = BTreeMap::new();
+        let mut sum_per_inst: BTreeMap<Instrument, i128> = BTreeMap::new();
+        let mut seen_keys: BTreeSet<(Instrument, String)> = BTreeSet::new();
+        for w in weights {
+            if w.weight_e8 == 0 {
+                return Err(AlphaError::ZeroWeight(format!(
+                    "{}|{}",
+                    w.instrument.ord_key().1,
+                    w.signal_id.as_str()
+                )));
+            }
+            let key = (w.instrument.clone(), w.signal_id.as_str().to_string());
+            if !seen_keys.insert(key.clone()) {
+                return Err(AlphaError::DuplicateWeight(format!(
+                    "{}|{}",
+                    w.instrument.ord_key().1,
+                    w.signal_id.as_str()
+                )));
+            }
+            by_key.insert(key, w.weight_e8);
+            let entry = sum_per_inst.entry(w.instrument.clone()).or_insert(0);
+            *entry += (w.weight_e8 as i128).abs();
+        }
+        Ok(LinearAlpha {
+            weights: by_key,
+            weight_sum_per_instrument: sum_per_inst,
+            last: BTreeMap::new(),
+        })
     }
 }
 
 impl Alpha for LinearAlpha {
-    fn update(&mut self, _ev: &Event, _signal_outs: &[SignalOut]) -> Vec<Forecast> {
-        todo!("M-07 task 2 (engine-dev): stale-expiry → взвешенная сумма → clamp → сортировка")
+    fn update(&mut self, ev: &Event, signal_outs: &[SignalOut]) -> Vec<Forecast> {
+        // ── 1. Обновить last[(inst, sid)] по каждому входящему SignalOut. Один и тот же
+        // signal_id может быть на разные инструменты (multi-instrument ensemble) —
+        // тогда сэмпл записывается во ВСЕ его (inst, sid) ключи. ─────────────────────
+        for out in signal_outs {
+            let sample = Sample {
+                value_e8: out.value,
+                horizon_ms: out.meta.horizon_ms,
+                ts_event_mono_ns: out.ts_event_mono_ns,
+            };
+            // Детерминированный порядок ключей BTreeMap; collect чтобы избежать aliasing.
+            let matches: Vec<(Instrument, String)> = self
+                .weights
+                .keys()
+                .filter(|(_, sid)| sid.as_str() == out.signal_id.as_str())
+                .cloned()
+                .collect();
+            for key in matches {
+                self.last.insert(key, sample);
+            }
+        }
+
+        // ── 2. Детерминированно обойти инструменты, присутствующие в конфиге. ───────────
+        let instruments: Vec<Instrument> = self
+            .weight_sum_per_instrument
+            .keys()
+            .cloned()
+            .collect();
+
+        let mut forecasts = Vec::new();
+        for inst in &instruments {
+            let total_abs_w: i128 = self
+                .weight_sum_per_instrument
+                .get(inst)
+                .copied()
+                .unwrap_or(0);
+            if total_abs_w <= 0 {
+                continue;
+            }
+
+            // ── 3. По каждому (instrument, signal_id)-весу проверить свежесть sample. ──
+            let mut num: i128 = 0; // Σ w·v
+            let mut den_fresh: i128 = 0; // Σ |w| для свежих
+            let mut max_horizon_ms: i64 = 0;
+
+            for ((i, sid), &w) in &self.weights {
+                if i != inst {
+                    continue;
+                }
+                let sample = match self.last.get(&(i.clone(), sid.clone())) {
+                    Some(s) => *s,
+                    None => continue, // ни разу не было сэмпла → не свежий, не считаем
+                };
+                let horizon_ns = match (sample.horizon_ms as u64).checked_mul(1_000_000) {
+                    Some(v) => v,
+                    None => continue, // pathological horizon → безопаснее исключить
+                };
+                let threshold = sample.ts_event_mono_ns.saturating_add(horizon_ns);
+                let fresh = ev.ts_mono_ns <= threshold;
+                if !fresh {
+                    continue;
+                }
+                num += (w as i128) * (sample.value_e8 as i128);
+                den_fresh += (w as i128).abs();
+                if sample.horizon_ms > max_horizon_ms {
+                    max_horizon_ms = sample.horizon_ms;
+                }
+            }
+
+            if den_fresh == 0 {
+                // Все протухли (либо сэмплов никогда не было) — отсутствие мнения ≠ edge=0.
+                continue;
+            }
+
+            // ── 4. Edge = clamp(num / den_fresh, ±EDGE_SCALE). num и den_fresh оба в ×1e8,
+            // результат — в ×1e8. ───────────────────────────────────────────────────────
+            let edge_raw = num / den_fresh;
+            let edge_clamped = edge_raw.clamp(-(EDGE_SCALE as i128), EDGE_SCALE as i128);
+            let edge_e8 = edge_clamped as i64;
+
+            // ── 5. Confidence = доля ЖИВОГО веса × EDGE_SCALE (i128 — без переполнения). ──
+            let conf_raw = den_fresh * (EDGE_SCALE as i128) / total_abs_w;
+            let confidence_e8 = conf_raw.clamp(0, EDGE_SCALE as i128) as i64;
+
+            forecasts.push(Forecast {
+                instrument: inst.clone(),
+                ts_mono_ns: ev.ts_mono_ns,
+                edge_e8,
+                horizon_ms: max_horizon_ms,
+                confidence_e8,
+            });
+        }
+
+        // Выход отсортирован по instrument (FA §4). BTreeMap-обход и так отсортирован.
+        forecasts
     }
 }
 
