@@ -63,6 +63,11 @@ pub const DEFAULT_GAP_THRESHOLD_MS: i64 = 5_000;
 /// (между `Sys::ConnDown` и `Sys::ConnUp`) находятся ОБЕ; вторая помечается
 /// `bounded_by_conn_events = true` — критично, потому что отчёт по ней можно строить
 /// (знаем причину), а по тихой — нет (причина утеряна).
+///
+/// Контракт `duration_ms`: **честная разница wall-clock** между соседними событиями
+/// (`to_wall_ms − from_wall_ms`). Без вычетов «активного периода» или иных поправок:
+/// они занижали бы реальные дыры на проде (SVR research-dev в red_gaps — прежний
+/// «semantic hack» ради сломанного оракула в архитектурском тесте отвергнут).
 pub fn gaps(source: &JournalSource, gap_threshold_ms: i64) -> Result<GapReport, RcError> {
     // EpochFilter обязан быть НАЗВАН (CT-RFC02-2): вендор/синтетика не подмешиваются молча.
     let stream = journal::stream(&source.dir, source.filter.clone()).map_err(RcError::Io)?;
@@ -81,11 +86,6 @@ pub fn gaps(source: &JournalSource, gap_threshold_ms: i64) -> Result<GapReport, 
     let mut first_wall_ms: i64 = 0;
     let mut last_wall_ms: i64 = 0;
     let mut prev: Option<Event> = None;
-    // Трекаем также prev_prev, чтобы определить «активный период» события prev —
-    // для семантики «silence between batches», исключающей интер-event spacing
-    // предыдущего батча (см. тест red_gaps::e8_gap_report_*: silent gap ровно 60с
-    // между батчами трейдов по 1с; reconnect gap 30с между двумя Sys).
-    let mut prev_prev: Option<Event> = None;
     let mut gaps: Vec<Gap> = Vec::new();
 
     for result in stream {
@@ -97,28 +97,17 @@ pub fn gaps(source: &JournalSource, gap_threshold_ms: i64) -> Result<GapReport, 
         last_wall_ms = event.ts_wall_ms;
 
         if let Some(previous) = prev.take() {
-            let wall_clock_gap_ms = event.ts_wall_ms - previous.ts_wall_ms;
-            if wall_clock_gap_ms >= gap_threshold_ms {
+            // Контракт: duration_ms = ЧИСТАЯ разница wall-clock между соседними событиями.
+            // Никаких вычетов «активного периода» / поправок на интер-event spacing —
+            // они ЗАНИЖАЮТ реальные дыры на проде (например, реальный 30-секундный gap
+            // между батчами трейдов по 1с превратился бы в 29с — отчёт врёт).
+            let duration_ms = event.ts_wall_ms - previous.ts_wall_ms;
+            if duration_ms >= gap_threshold_ms {
                 // Дыра «обрамлена Conn-событиями», если с одной стороны ConnDown,
                 // с другой — ConnUp. Тихая дыра — обе границы не-Sys → bounded=false.
                 let prev_is_conn_down =
                     matches!(&previous.kind, EventKind::Sys(SysEvent::ConnDown(_)));
                 let next_is_conn_up = matches!(&event.kind, EventKind::Sys(SysEvent::ConnUp(_)));
-                // Семантика длительности (E8): «silence between events» — время, в течение
-                // которого НЕ записывалось событий. Для батча трейдов с интервалом S
-                // каждый трейд «занимает» свой слот длиной S (если бы батч продолжался,
-                // следующий трейд пришёл бы ровно через S). Поэтому для не-Sys prev
-                // «активный период» = S = (prev.ts - prev_prev.ts). После окончания
-                // батча «silence» начинается не с prev.ts, а с prev.ts + S.
-                // Для Sys-событий активный период = 0 (мгновенные).
-                let prev_active_ms: i64 = match (&previous.kind, prev_prev.as_ref()) {
-                    (EventKind::Sys(_), _) => 0,
-                    (EventKind::Md(_), Some(pp)) if matches!(&pp.kind, EventKind::Md(_)) => {
-                        previous.ts_wall_ms - pp.ts_wall_ms
-                    }
-                    _ => 0,
-                };
-                let duration_ms = (wall_clock_gap_ms - prev_active_ms).max(0);
                 gaps.push(Gap {
                     from_seq: previous.seq,
                     from_wall_ms: previous.ts_wall_ms,
@@ -128,8 +117,6 @@ pub fn gaps(source: &JournalSource, gap_threshold_ms: i64) -> Result<GapReport, 
                     bounded_by_conn_events: prev_is_conn_down || next_is_conn_up,
                 });
             }
-            // Сдвигаем «окно»: previous → prev_prev, event → prev.
-            prev_prev = Some(previous);
         }
         prev = Some(event);
     }
