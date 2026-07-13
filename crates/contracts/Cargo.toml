@@ -9,6 +9,8 @@ license.workspace = true
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
+# CT-I-4: JSON Schema ГЕНЕРИРУЕТСЯ из Rust-типов (канон), а не пишется руками (05 §4/§6).
+schemars = "0.8"
 
 [dev-dependencies]
 serde_json = "1"

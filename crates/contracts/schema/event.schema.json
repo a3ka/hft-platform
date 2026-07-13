@@ -1,0 +1,361 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Event",
+  "description": "Единица упорядоченного журнала (docs/fa/journal.md §5). `seq` — тотальный порядок, назначается журналом (единственный писатель, JR-I-1). Коннекторы seq НЕ проставляют.",
+  "type": "object",
+  "required": [
+    "kind",
+    "seq",
+    "ts_mono_ns",
+    "ts_wall_ms"
+  ],
+  "properties": {
+    "kind": {
+      "$ref": "#/definitions/EventKind"
+    },
+    "seq": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0.0
+    },
+    "ts_mono_ns": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0.0
+    },
+    "ts_wall_ms": {
+      "type": "integer",
+      "format": "int64"
+    }
+  },
+  "definitions": {
+    "EventKind": {
+      "description": "Закрытый версионируемый enum видов событий. Новые варианты — только аддитивно (в конец) через contract-RFC (CT-I §6).",
+      "oneOf": [
+        {
+          "description": "Системное: жив/связь.",
+          "type": "object",
+          "required": [
+            "Sys"
+          ],
+          "properties": {
+            "Sys": {
+              "$ref": "#/definitions/SysEvent"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Рыночные данные (нормализованные из venue-адаптеров).",
+          "type": "object",
+          "required": [
+            "Md"
+          ],
+          "properties": {
+            "Md": {
+              "$ref": "#/definitions/MdEvent"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "Level": {
+      "description": "Уровень стакана. price/size — fixed-point ×1e8.",
+      "type": "object",
+      "required": [
+        "price",
+        "size"
+      ],
+      "properties": {
+        "price": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "size": {
+          "type": "integer",
+          "format": "int64"
+        }
+      }
+    },
+    "MdEvent": {
+      "description": "Нормализованное рыночное событие. `symbol` — канонический тикер площадки как есть (Binance \"BTCUSDT\" / Hyperliquid \"BTC\"); нормализация кросс-venue — задача выше (book/strategy). Для MarginRate `symbol` — актив (\"USDT\"/\"USDC\"); для OpenInterest/Liquidation — инструмент.",
+      "type": "object",
+      "required": [
+        "payload",
+        "symbol",
+        "venue"
+      ],
+      "properties": {
+        "payload": {
+          "$ref": "#/definitions/MdPayload"
+        },
+        "symbol": {
+          "type": "string"
+        },
+        "venue": {
+          "$ref": "#/definitions/Venue"
+        }
+      }
+    },
+    "MdPayload": {
+      "description": "Тип рыночного апдейта. price/size — fixed-point ×1e8; ставки — ×1e8. L2Snapshot: и Binance, и HL шлют СНАПШОТ стакана целиком на апдейте — пишем как снапшот. Новые варианты — только аддитивно В КОНЕЦ (CT-I §6, сохраняет postcard-дискриминанты).",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "Trade"
+          ],
+          "properties": {
+            "Trade": {
+              "type": "object",
+              "required": [
+                "price",
+                "side",
+                "size",
+                "ts_exch_ms"
+              ],
+              "properties": {
+                "price": {
+                  "type": "integer",
+                  "format": "int64"
+                },
+                "side": {
+                  "$ref": "#/definitions/Side"
+                },
+                "size": {
+                  "type": "integer",
+                  "format": "int64"
+                },
+                "ts_exch_ms": {
+                  "type": "integer",
+                  "format": "int64"
+                }
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "L2Snapshot"
+          ],
+          "properties": {
+            "L2Snapshot": {
+              "type": "object",
+              "required": [
+                "asks",
+                "bids",
+                "ts_exch_ms"
+              ],
+              "properties": {
+                "asks": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/definitions/Level"
+                  }
+                },
+                "bids": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/definitions/Level"
+                  }
+                },
+                "ts_exch_ms": {
+                  "type": "integer",
+                  "format": "int64"
+                }
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "Funding"
+          ],
+          "properties": {
+            "Funding": {
+              "type": "object",
+              "required": [
+                "rate_e8",
+                "ts_exch_ms"
+              ],
+              "properties": {
+                "rate_e8": {
+                  "type": "integer",
+                  "format": "int64"
+                },
+                "ts_exch_ms": {
+                  "type": "integer",
+                  "format": "int64"
+                }
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Открытый интерес перп-контракта. `oi_e8` — в БАЗОВОМ активе ×1e8 (нотионал = oi×mark, derive downstream). Добавлено CT-RFC-01.",
+          "type": "object",
+          "required": [
+            "OpenInterest"
+          ],
+          "properties": {
+            "OpenInterest": {
+              "type": "object",
+              "required": [
+                "oi_e8",
+                "ts_exch_ms"
+              ],
+              "properties": {
+                "oi_e8": {
+                  "type": "integer",
+                  "format": "int64"
+                },
+                "ts_exch_ms": {
+                  "type": "integer",
+                  "format": "int64"
+                }
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Форс-ликвидация (forced order). `side` — ЛИКВИДИРУЕМАЯ сторона (НЕ сторона агрессора; M-06 парсер обязан сохранить смысл — C-003 note). Добавлено CT-RFC-01.",
+          "type": "object",
+          "required": [
+            "Liquidation"
+          ],
+          "properties": {
+            "Liquidation": {
+              "type": "object",
+              "required": [
+                "price",
+                "side",
+                "size",
+                "ts_exch_ms"
+              ],
+              "properties": {
+                "price": {
+                  "type": "integer",
+                  "format": "int64"
+                },
+                "side": {
+                  "$ref": "#/definitions/Side"
+                },
+                "size": {
+                  "type": "integer",
+                  "format": "int64"
+                },
+                "ts_exch_ms": {
+                  "type": "integer",
+                  "format": "int64"
+                }
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Прокси спроса на займы: margin interest rate ×1e8 (интервал ставки — в provenance артефакта/парсера). `symbol` = актив (\"USDT\"/\"USDC\"). Добавлено CT-RFC-01 (Tier-3 impl).",
+          "type": "object",
+          "required": [
+            "MarginRate"
+          ],
+          "properties": {
+            "MarginRate": {
+              "type": "object",
+              "required": [
+                "rate_e8",
+                "ts_exch_ms"
+              ],
+              "properties": {
+                "rate_e8": {
+                  "type": "integer",
+                  "format": "int64"
+                },
+                "ts_exch_ms": {
+                  "type": "integer",
+                  "format": "int64"
+                }
+              }
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "Side": {
+      "description": "Сторона.",
+      "type": "string",
+      "enum": [
+        "Buy",
+        "Sell"
+      ]
+    },
+    "SysEvent": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "Heartbeat"
+          ]
+        },
+        {
+          "type": "object",
+          "required": [
+            "ConnUp"
+          ],
+          "properties": {
+            "ConnUp": {
+              "$ref": "#/definitions/Venue"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "ConnDown"
+          ],
+          "properties": {
+            "ConnDown": {
+              "$ref": "#/definitions/Venue"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "Venue": {
+      "description": "Площадка. Расширяется аддитивно (СТРОГО в конец — CT-I §6, сохраняет postcard-индексы).",
+      "oneOf": [
+        {
+          "description": "Binance СПОТ-рынок.",
+          "type": "string",
+          "enum": [
+            "Binance"
+          ]
+        },
+        {
+          "description": "Hyperliquid ПЕРП (основной рынок HL: l2Book/trades перпа).",
+          "type": "string",
+          "enum": [
+            "Hyperliquid"
+          ]
+        },
+        {
+          "description": "Binance USDT-M ПЕРП-фьючерсы (fstream). Добавлено CT-RFC-01.",
+          "type": "string",
+          "enum": [
+            "BinanceFutures"
+          ]
+        }
+      ]
+    }
+  }
+}
