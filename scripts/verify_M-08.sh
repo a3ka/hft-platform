@@ -46,6 +46,11 @@ check "T6 journal ретеншен + disk-guard (E3/E4)" cargo test -p journal -
 # Иначе dump/bands/obi_probe после M-08 молча показывают «данных нет» при зелёных гейтах.
 check "T7b read_all/recover понимают v2 + все сегменты (задача 10)" cargo test -p journal --test red_read_all_v2
 
+# T7c (ПРОД-МИГРАЦИЯ): что произойдёт на VPS при деплое — recorder стартует на каталоге с
+# НЕзадекларированным боевым 8.3 GB сегментом, пишет в НОВЫЙ сегмент, старый не трогает,
+# seq продолжается; research НЕ видит данных до declare_legacy. Раньше это «проверялось руками».
+check "T7c прод-миграция (recorder стартует, legacy байт-в-байт цел)" cargo test -p journal --test red_prod_migration
+
 # T7 (задача 2/4): регрессия журнала — старые инварианты живы (DET-I-1, TD-011 bounded open)
 check "T7 journal регрессия (вкл. red_open_bounded)" cargo test -p journal
 
@@ -78,6 +83,10 @@ check "T10 регрессия alpha/portfolio/strategy/sim/signals/book" bash -c
 check "T11a имя сегмента НЕ захардкожено (только КОД, не комментарии)" bash -c 'grep -rn "segment-00000000" crates/journal/src/segments.rs crates/recorder/src 2>/dev/null | grep -vE "^[^:]+:[0-9]+: *(//|///|//!)" | grep -q . && exit 1 || exit 0'
 check "T11b research-cli не читает журнал через read_all" bash -c '! grep -rn "journal::read_all\|read_all(&journal_dir)" crates/research-cli/src'
 check "T11c research-cli называет эпоху явно (EpochFilter)" bash -c 'grep -rq "EpochFilter" crates/research-cli/src'
+# T11e: read_all/recover — ОФЛАЙН-ДИАГНОСТИКА (мягкая классификация, без манифеста).
+# Их нельзя звать из прод/research-путей: там только stream с явным EpochFilter, иначе
+# данные без эпохи (в т.ч. вендорские) утекут в обучение.
+check "T11e read_all/recover только в examples/tests, не в прод-путях" bash -c '! grep -rn "journal::read_all\|journal::recover" crates/*/src | grep -v "^crates/journal/src/"'
 check "T11d T1-формы CT-RFC-02 определены ровно в contracts" bash -c '[ "$(grep -rln "pub struct SegmentHeader" crates/*/src | wc -l)" -eq 1 ]'
 
 # T12 (задача 6): деплой гейтится на CI — красный CI не выкатывает прод
