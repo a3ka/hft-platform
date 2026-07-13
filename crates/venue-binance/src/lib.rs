@@ -31,6 +31,17 @@ const MAX_REL_DIST: f64 = 0.60;
 /// Период эмиссии bounded L2Snapshot per symbol.
 const EMIT_PERIOD: Duration = Duration::from_secs(1);
 
+/// Кап числа уровней на одну сторону (`bids`/`asks`) в локальной full-book книге.
+/// Равен глубине REST-снапшота (`limit=5000`, `REST_DEPTH_LIMIT`), из которого книга
+/// бутстрапится. При превышении капа самые дальние от mid уровни ЭВИКТЯТСЯ при каждом
+/// `apply_diff_to_book`. Корневой фикс TD-016: без эвикции книга копит «мёртвые»
+/// уровни, из которых цена давно ушла (апдейтов биржа больше не шлёт, `size==0` не
+/// приходит) — измерено: ~+6.5 MiB/час на проде. Хранить дальше `MAX_BOOK_LEVELS_PER_SIDE`
+/// от mid бессмысленно: (а) за пределами капа в эмиссию (`±60%`, bucketed) они не
+/// влияют; (б) восстановить их из REST-снапшота всё равно нельзя — снапшот сам
+/// ограничен той же глубиной 5000.
+const MAX_BOOK_LEVELS_PER_SIDE: usize = 5000;
+
 /// Локальная копия полного стакана одного символа. price/size — fixed-point ×1e8
 /// (per `contracts::PRICE_SCALE`), ключ `BTreeMap` — цена, что даёт бесплатную
 /// сортировку + O(log n) upsert/remove на diff-апдейте.
@@ -303,6 +314,31 @@ fn parse_diff_levels(levels: &serde_json::Value) -> Option<Vec<(i64, i64)>> {
 
 /// Применить один diff (уже проверенный на непрерывность вызывающим) к книге:
 /// upsert/remove по уровням, `last_update_id = diff.u_final`.
+///
+/// **Кап `MAX_BOOK_LEVELS_PER_SIDE` (TD-016, M-08 task 9):** после upsert/remove книга
+/// ОБЯЗАНА быть ограничена в размере — иначе происходит лик (+6.5 MiB/час на проде по
+/// замерам reviewer), потому что биржа никогда не шлёт size=0 для уровней, из которых
+/// цена давно ушла (их просто не существует в её представлении). Стратегия эвикции:
+///
+/// 1. **Activity reference = `diff_mid`** = (max bid in this diff + min ask in this diff) / 2
+///    — точка, вокруг которой лежит новый снимок книги. Использовать (best_bid +
+///    best_ask) / 2 из самой книги НЕЛЬЗЯ: при дрейфе цены вверх (как у
+///    `crates/venues/tests/red_book_bounded.rs`) книга становится crossed (старые asks
+///    ниже новых bids), и computed-mid становится бессмысленным.
+/// 2. **Strict-side filter:** bids ≥ diff_mid и asks ≤ diff_mid — артефакты crossed/drift
+///    состояния, удаляются. В нормальной (не-crossed) книге фильтр не трогает ничего
+///    (bids всегда < mid, asks всегда > mid), но при дрейфе именно он отделяет
+///    «актуальные» уровни рядом с текущим mid от накопленного исторического хвоста.
+/// 3. **Cap:** `MAX_BOOK_LEVELS_PER_SIDE` = 5000 (= глубина REST-снапшота, из которого
+///    книга бутстрапится; хранить дальше 5000 от mid — бессмысленно: (а) в эмиссию ±60%
+///    bucketed не влияет, (б) восстановить из REST нельзя). Эвикция идёт ХВОСТОМ:
+///    `pop_first` (min bid = самая дальняя ниже mid) и `pop_last` (max ask = самая
+///    дальняя выше mid). Топ книги (лучший bid/ask) и производные (OBI-полосы) не
+///    деградируют.
+///
+/// Fallback: односторонний/пустой diff → activity reference недоступен → только пп. 2-3
+/// стандартного cap (по min/max BTreeMap без фильтра по стороне). Это не идеал, но
+/// безопасный деградированный путь до прихода двустороннего диффа.
 pub fn apply_diff_to_book(book: &mut OrderBook, diff: &DepthDiff) {
     for (price, size) in &diff.bids {
         if *size == 0 {
@@ -320,6 +356,72 @@ pub fn apply_diff_to_book(book: &mut OrderBook, diff: &DepthDiff) {
     }
     book.last_update_id = diff.u_final;
     book.last_event_time_ms = diff.event_time_ms;
+
+    // ── TD-016: ограничение книги ────────────────────────────────────────
+    // 1) activity reference из самого диффа (он имеет обе стороны в нормальном
+    //    `@depth` стриме; для пустых/односторонних — fallback ниже на cap-только).
+    let diff_mid: Option<i64> = match (
+        diff.bids.iter().map(|(p, _)| *p).max(),
+        diff.asks.iter().map(|(p, _)| *p).min(),
+    ) {
+        (Some(bb), Some(ba)) => {
+            let m = (bb + ba) / 2;
+            if m <= 0 {
+                None
+            } else {
+                Some(m)
+            }
+        }
+        _ => None,
+    };
+
+    if let Some(diff_mid) = diff_mid {
+        // 2) Strict-side filter: bids ≥ diff_mid и asks ≤ diff_mid — нарушение нормальной
+        //    топологии книги (bids должны быть ниже mid, asks — выше), удаляются. Это
+        //    очищает остатки crossed-состояния при дрейфе.
+        book.bids.retain(|p, _| *p < diff_mid);
+        book.asks.retain(|p, _| *p > diff_mid);
+
+        // 3) Cap до MAX_BOOK_LEVELS_PER_SIDE per side, эвикция ХВОСТА от mid.
+        if book.bids.len() > MAX_BOOK_LEVELS_PER_SIDE {
+            let to_drop = book.bids.len() - MAX_BOOK_LEVELS_PER_SIDE;
+            for _ in 0..to_drop {
+                if book.bids.pop_first().is_none() {
+                    break;
+                }
+            }
+        }
+        if book.asks.len() > MAX_BOOK_LEVELS_PER_SIDE {
+            let to_drop = book.asks.len() - MAX_BOOK_LEVELS_PER_SIDE;
+            for _ in 0..to_drop {
+                if book.asks.pop_last().is_none() {
+                    break;
+                }
+            }
+        }
+    } else {
+        // Fallback для одностороннего/пустого диффа: cap-только без side-filter'а
+        // (нельзя вычислить diff_mid → нельзя фильтровать «неправильную сторону»).
+        // В прод-WS-стриме `@depth` всегда даёт обе стороны в одном сообщении, так что
+        // этот путь — теоретический, но без него возможна регрессия при маломальски
+        // неполном payload'е (ретраи, частичные апдейты по WS).
+        if book.bids.len() > MAX_BOOK_LEVELS_PER_SIDE {
+            let to_drop = book.bids.len() - MAX_BOOK_LEVELS_PER_SIDE;
+            for _ in 0..to_drop {
+                if book.bids.pop_first().is_none() {
+                    break;
+                }
+            }
+        }
+        if book.asks.len() > MAX_BOOK_LEVELS_PER_SIDE {
+            let to_drop = book.asks.len() - MAX_BOOK_LEVELS_PER_SIDE;
+            for _ in 0..to_drop {
+                if book.asks.pop_last().is_none() {
+                    break;
+                }
+            }
+        }
+    }
 }
 
 /// Прогнать входящий diff через sync-автомат символа per Binance snapshot+diff-sync
