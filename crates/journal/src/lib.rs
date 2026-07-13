@@ -20,6 +20,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use contracts::{Event, EventKind};
 
+pub mod segments;
+
+pub use segments::{
+    declare_legacy, fingerprint, free_bytes, is_foreign_segment, is_storage_guard, prune_segment,
+    segments as list_segments, storage_status, stream, verify_cold_copy, ColdCopyProof,
+    EpochFilter, EventStream, SegmentInfo, StorageStatus, WriterConfig, LEGACY_MANIFEST,
+};
+
 const META: &str = "journal.meta";
 const SEGMENT: &str = "segment-00000000.jrnl";
 
@@ -68,6 +76,23 @@ impl Journal {
             since_flush: 0,
             epoch: SystemTime::now(),
         })
+    }
+
+    /// Открыть журнал с provenance-конфигом (M-08 E2/E4, CT-RFC-02).
+    ///
+    /// Отличия от `open()` (legacy-путь, остаётся для совместимости):
+    /// - каждый НОВЫЙ сегмент открывается заголовком `SegmentHeader` (CT-I-6);
+    /// - при превышении `max_segment_bytes` сегмент РОТИРУЕТСЯ (`seq` продолжается сквозь
+    ///   границу — тотальный порядок один на журнал, JR-I-1);
+    /// - при свободном месте < `min_free_bytes` запись останавливается ЯВНО (fail-closed:
+    ///   `append` → `Err`), а не «пишет, пока диск не кончится».
+    pub fn open_with(_dir: impl AsRef<Path>, _cfg: WriterConfig) -> io::Result<Self> {
+        todo!("M-08 task 2 (engine-dev): заголовок сегмента + ротация + disk-guard")
+    }
+
+    /// Индекс активного сегмента (`segment-NNNNNNNN.jrnl`).
+    pub fn active_segment_index(&self) -> u32 {
+        todo!("M-08 task 2 (engine-dev)")
     }
 
     pub fn next_seq(&self) -> u64 {

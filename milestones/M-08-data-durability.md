@@ -1,0 +1,156 @@
+# M-08 — Data durability: сбор не останавливается, журнал читается на прод-масштабе
+
+STATUS: 🚧 PROPOSED (revision 3 — закрыты C-005 rev2-находки R1-R4: задача TD-016 с владельцем,
+carve-out A4, stale-проза убрана, RED на усечение legacy).
+Authored: architect (Opus), 2026-07-13.
+Приоритет founder'а (2026-07-13): **(1) набор и сохранение данных не останавливаются
+НИКОГДА; (2) инфраструктура для создания альф и торговли утверждёнными стратегиями
+готова.** M-08 закрывает (1) и снимает блокер (2) на прод-объёмах. Торговый стек
+(risk/killswitch/oms/runner) — следующий milestone M-09.
+
+Гейты: **contract-RFC (`docs/rfc/CT-RFC-02-journal-provenance.md`) + critic ОБЯЗАТЕЛЕН**
+(`gates.md` §1: трогаем `crates/contracts/**` (T1), ≥5 коммитов). `risk`/`killswitch`/
+`oms`/`venue-*` НЕ трогаются → risk-critic не требуется. **Прод НЕ инертен** (меняется
+`journal` + `recorder`) → §8 деплой-гейт с eyes-on обязателен и решающий (уроки TD-011/TD-013).
+Ветка: `feat/M-08`.
+
+## Objective
+
+Три измеренных факта (VPS, 2026-07-13) делают текущее состояние тупиковым:
+
+| Факт | Число | Следствие |
+|---|---|---|
+| Скорость записи | **2.8 GB/сутки** (8.3 GB за 3 суток) | — |
+| Свободно на диске | 120 GB из 150 GB | **сбор встанет через ~43 дня** (плюс докупленная история — раньше) |
+| Ротация/ретеншен | **нет** (`journal/src/lib.rs:24` — имя сегмента захардкожено), TD-006 | некуда расти |
+| Чтение журнала | `journal::read_all() -> Vec<Event>`, `research-cli/src/main.rs:54` | **грид на 8.3 GB не запустится** — весь журнал в RAM (класс TD-011, этажом выше) |
+| `schema_version` в сегменте | **не пишется** (`journal.meta` = только `next_seq`) | `CT-I-6` формально не выполнен; provenance некуда положить |
+| Память recorder | дрейф 5–9 → **48 MiB** за ~5 ч (наблюдение reviewer'а) | лик не доказан, но healthcheck такое маскирует (TD-011) |
+
+M-08 делает сбор **бесконечным по времени** (ротация + ретеншен + cold-выгрузка), чтение —
+**bounded по памяти** (стрим вместо `Vec<Event>`), а происхождение данных — **читаемым
+фактом** (CT-RFC-02), чтобы купленная история не смешалась с собственным захватом.
+
+Авторитетные док-и: `docs/06-data-layer-and-storage.md` (retention/cold), `docs/fa/journal.md`
+(`JR-I-*`, `DET-I-1`), `docs/05-contract-layer.md` §4/§6, `docs/rfc/CT-RFC-02-*`.
+
+## Contract impact (T1) — ЕСТЬ
+
+`crates/contracts/**` меняется → **atomic contract-RFC `CT-RFC-02`** (см. файл): `DataSource`,
+`SegmentHeader`, `SCHEMA_VERSION` 1 → 2. `Event`/`EventKind` НЕ трогаются (аддитивно, старые
+журналы читаются навсегда — `CT-I-3`). Reviewer Block-C: правки `contracts/` вне RFC → авто-REJECT.
+
+## Архитектурные решения
+
+| # | Вопрос | Решение M-08 |
+|---|---|---|
+| E1 | Где живёт provenance | В **заголовке сегмента**, не в `Event` (при 2.8 GB/сут тег в каждом событии — гигабайты мусора; писатель сегмента ровно один, `JR-I-1`). CT-RFC-02 §2 |
+| E2 | Порог ротации | Сегмент закрывается по размеру (**1 GiB**, конфиг) ИЛИ при рестарте писателя. Имя `segment-NNNNNNNN.jrnl`, монотонный индекс; `seq` продолжается СКВОЗЬ сегменты (тотальный порядок — один на журнал, `JR-I-1`) |
+| E3 | Ретеншен | Политика: горячие сегменты на диске (окно `retention_days`, дефолт 14), холодные — выгрузка в Storage Box + удаление локально **ТОЛЬКО после подтверждённой выгрузки** (checksum совпал). Удаление невыгруженного сегмента невозможно выразить в API (типовой барьер, не дисциплина) |
+| E4 | **Fail-closed по диску** | Свободного места < `min_free_bytes` (дефолт 10 GiB) → `append` возвращает storage-guard-ошибку, **ни один байт и ни один `seq` не тратятся**; состояние наблюдаемо через `storage_status().writable == false` (recorder публикует его в heartbeat → видно без ssh) + лог/алерт. **`Sys`-событие в журнал НЕ пишется** (обещание снято, C-005 M4): писать в журнал в момент, когда запись запрещена, — самопротиворечие. Тихо переполнить диск и умереть запрещено |
+| E5 | Чтение | `journal::stream(dir, EpochFilter) -> io::Result<(Vec<SegmentHeader>, impl Iterator<Item=io::Result<Event>>)>` — **итератор**, O(1) памяти на сегмент-буфер. `read_all` остаётся ТОЛЬКО для тестов/малых фикстур и помечается `#[deprecated]`-комментарием в docs; прод-путь research — стрим |
+| E6 | Эпохи | Читатель обязан назвать `EpochFilter` (`OwnCaptureOnly` / `Explicit(vec![epoch_id])`). Дефолт `OwnCaptureOnly` — вендор/синтетика в обучение по умолчанию НЕ попадают (CT-RFC02-3/4) |
+| E7 | Память (TD-016) | **Корень найден по коду:** `venue-binance::apply_diff_to_book` вставляет уровни в `BTreeMap` и удаляет только при `size==0` — уровни, из которых цена ушла, апдейтов больше не получают и живут ВЕЧНО (`MAX_REL_DIST` применяется лишь к ЭМИССИИ). Измерено оракулом: 50k→200k диффов = 100k→400k уровней (линейно). Контракт: **кап `MAX_BOOK_LEVELS_PER_SIDE = 5000`** (глубина REST-снапшота), эвикция дальних от mid; топ книги не трогается. Writer-цикл recorder'а отдельным оракулом проверен и НЕ течёт (регресс-guard остаётся) |
+| E8 | Gap-статистика | Инструмент считает разрывы записи (по `Sys::ConnDown/ConnUp` + монотонности `ts_wall_ms` между соседними событиями) → `research/data-quality/gaps-<epoch>.json`. Любой отчёт (R-NNN) обязан ссылаться на него (иначе метрики считаются по дырявым данным) |
+| E9 | Deploy-гейт | `deploy.yml` получает `needs: ci` — красный CI больше не может выкатить прод (находка reviewer'а 2026-07-13: Deploy зеленел, пока CI ещё шёл) |
+
+## Allowed / Forbidden paths (scope-guard)
+
+| Агент | Allowed | Forbidden |
+|---|---|---|
+| architect | `docs/rfc/`, `docs/`, `milestones/`, `crates/contracts/src/**` (ТОЛЬКО T1-формы CT-RFC-02), `crates/journal/src/**` (ТОЛЬКО сигнатуры/типы + `todo!()`), `crates/*/tests/**` (RED, sacred), `scripts/verify_M-08.sh`, `.github/workflows/deploy.yml` (E9 — process-only) | impl-тела, `crates/recorder/src/**`, `crates/research-cli/src/**` |
+| engine-dev | `crates/journal/src/**`, `crates/recorder/src/**` + их `Cargo.toml` | `*/tests/**` (sacred), `crates/contracts/**` (T1 — только architect через RFC), `scripts/**`, `docs/**` |
+| **venue-dev** (rev 3) | `crates/venue-binance/src/**` (+ его `Cargo.toml`) — задача 9 (TD-016: эвикция уровней книги) | всё остальное; `*/tests/**` (sacred), `crates/{contracts,journal,recorder,research-cli}/**` |
+| research-dev | `crates/research-cli/src/**` (перевод на стрим-чтение + `EpochFilter`), `research/data-quality/` (артефакты E8) | всё остальное; `crates/research-cli/tests/**` (sacred) |
+
+| tester | read-only; `scripts/verify_M-08.sh` на чистом чекауте | правки кода |
+| reviewer | `PROJECT-STATE.md`, `TECH-DEBT.md`, merge + **§8 деплой-гейт (решающий: прод НЕ инертен)** | код |
+
+**carve-out A3 (architect):** `crates/research-cli/src/grid.rs` — ТОЛЬКО сигнатура
+`JournalSource` + `run_grid_streamed(...)` с `todo!()`-телом. Обоснование то же, что A2
+(C-004 C2): RED-оракул невозможно написать против несуществующей сигнатуры, а гейтить
+задачу грепами уже пробовали — критик справедливо это зарубил.
+
+**carve-out A4 (architect, rev 3 — по C-005 re-audit R2):** `crates/venue-binance/src/lib.rs`
+— **ТОЛЬКО видимость** для тест-шва TD-016: `pub struct OrderBook` (+ `pub` поля `bids`/`asks`/
+`last_update_id`/`last_event_time_ms`), `pub struct DepthDiff` (+ `pub` поля),
+`pub fn apply_diff_to_book`. **Ни одной строки логики.** Обоснование: лик TD-016 живёт именно
+в этой функции; без публичного шва оракул границы ресурса написать не против чего, а держать
+RED в inline-тестах `src` нельзя (это зона dev, тесты — sacred architect'а). Reviewer при
+merge сверяет диф построчно: только `pub`-модификаторы. Владелец ЛОГИКИ этих типов — venue-dev
+(задача 9).
+
+## §Tasks
+
+| # | Status | Задача | Агент | Verify |
+|---|---|---|---|---|
+| 1 | ⏳ | **CT-RFC-02**: T1-формы (`DataSource`, `SegmentHeader`, `SCHEMA_VERSION`=2) + JSON Schema + фикстуры + RED (`CT-I-6`, `CT-RFC02-1..4`); скелеты `journal` (сигнатуры `stream`/`EpochFilter`/ротация, `todo!()`); `verify_M-08.sh` | architect | workspace компилируется; fmt+clippy зелёные; RED падает |
+| 2 | ⏳ | `journal` impl: заголовок сегмента; **ротация** `segment-NNNNNNNN.jrnl` (E2, seq сквозной); `stream()` — bounded-memory итератор (E5); legacy-путь ЧЕРЕЗ МАНИФЕСТ (`journal.legacy.json` + отпечаток первого MiB + `current_size >= size_bytes_at_decl`; незадекларированный/битый/усечённый → `Err`, НИКАКОГО вменения `OwnCapture` — CT-RFC02-1 rev 2); `EpochFilter` (E6) | engine-dev | `cargo test -p journal` GREEN, включая **прод-масштабный** bounded-memory оракул (≥64 MiB сегмент, counting-allocator) |
+| 3 | ⏳ | `journal` retention: cold-выгрузка (Storage Box) + удаление ТОЛЬКО после подтверждённой выгрузки (E3); **fail-closed по диску** (E4: `min_free_bytes` → storage-guard `Err`, без движения seq/байтов, `storage_status().writable=false` в heartbeat + алерт; `Sys`-события в журнал НЕТ) | engine-dev | RED: удаление невыгруженного сегмента невозможно; диск < порога → запись останавливается ЯВНО |
+| 4 | ⏳ | `recorder`: писать заголовок (provenance = версия recorder'а + git sha), переживать ротацию без потери событий; **bounded-RSS** (E7) | engine-dev | RED: длительный прогон в бюджете памяти; ротация посреди потока не теряет и не дублирует `seq` |
+| 5 | ⏳ | `research-cli`: перевести чтение на `journal::stream` + `EpochFilter` (E5/E6); грид больше НЕ держит `Vec<Event>` в памяти; gap-статистика (E8) → `research/data-quality/` | research-dev | RED: грид отрабатывает на большом журнале в бюджете памяти; смешение эпох без явного фильтра невозможно |
+| 6 | ⏳ | `.github/workflows/deploy.yml`: `needs: ci` (E9) | architect | красный CI не выкатывает прод (проверяется на PR-прогоне) |
+| 9 | ⏳ | **(rev 3, TD-016 — MAJOR, прод-лик)** `venue-binance`: книга обязана ЭВИКТИТЬ уровни. Корень: `apply_diff_to_book` (`src/lib.rs:306`) делает только upsert/remove-при-нуле — уровни, из которых цена ушла, апдейтов больше не получают и живут вечно (`MAX_REL_DIST` применяется к ЭМИССИИ, не к книге). Замер: 50k→200k диффов = 100k→400k уровней ⇒ ≈ **+6.5 MiB/час** на проде (8.4→48.3 MiB за 5 ч, контейнер всё это время healthy). Контракт: **кап `MAX_BOOK_LEVELS_PER_SIDE = 5000`** на сторону (= глубина REST-снапшота, из которого книга бутстрапится), эвиктятся САМЫЕ ДАЛЬНИЕ от mid; **топ книги и полосы OBI не деградируют** | venue-dev | `cargo test -p venue-binance` GREEN (**T8c**: кап соблюдён, лучший bid/ask свежие, память O(1) по числу диффов); прежние тесты venue-binance GREEN |
+| 7 | ⏳ | Прогон `scripts/verify_M-08.sh` на чистом чекауте | tester | `VERDICT: PASS`, exit=0 |
+| 8 | ⏳ | Review + merge + **§8 деплой-гейт: прод НЕ инертен** — ssh-проверка, что recorder пишет в НОВЫЙ сегмент, старый 8.3 GB сегмент цел и читается, heartbeat свежий, RSS в норме | reviewer | Done Block + §8 пруф (сырой ssh-вывод) |
+
+## RED-тесты (sacred, architect-only)
+
+- `crates/contracts/tests/red_rfc02.rs` — CT-RFC-02: `schema_version` = 2; роундтрип
+  `SegmentHeader`; **legacy-заголовок строится ИЗ ДЕКЛАРАЦИИ манифеста** (не вменяется);
+  `Event` wire-формат НЕ изменён (CT-I-3); **дискриминанты `DataSource` стабильны**
+  (сдвиг превратил бы наш захват в вендорские данные при чтении старых сегментов).
+- `crates/journal/tests/red_rotation.rs` — E2/CT-I-6: несколько сегментов; индексы без дыр;
+  **заголовок в КАЖДОМ сегменте**; `seq` сквозной через границы (ни потерь, ни дублей);
+  рестарт писателя не переиспользует `seq`.
+- `crates/journal/tests/red_stream_bounded.rs` — **E5, ПРОД-МАСШТАБ** (16/64 MiB, counting-
+  allocator): стрим отдаёт все события по порядку; пик < 8 MiB; **память O(1) по размеру
+  журнала** (ловит и `read_all`, и «читаем долю файла» — на 8.3 GB доля снова убьёт машину).
+  Анти-плацебо: контрольное полное чтение сегмента обязано превышать бюджет.
+- `crates/journal/tests/red_segments_epochs.rs` — CT-RFC02-1..4: боевой сегмент БЕЗ заголовка
+  (байт-в-байт формат VPS) читается вечно ТОЛЬКО по декларации; незадекларированный/битый/
+  с чужим префиксом/**усечённый ниже `size_bytes_at_decl`** → `Err`; **дефолт `OwnCaptureOnly`
+  исключает `Vendor`/`Synthetic`** (наивное «читаем все сегменты каталога» падает);
+  смешение эпох — только явным перечислением; `headers()` доносит provenance до отчёта.
+- `crates/journal/tests/red_retention.rs` — E3/E4: **disk-guard fail-closed** (мало места →
+  `append` → `Err`, а не тихая смерть); `free_bytes` — реальное место, не заглушка;
+  **`prune_segment` требует `ColdCopyProof`** (приватный конструктор → «удалить невыгруженное»
+  нельзя ВЫРАЗИТЬ; `compile_fail`-доктест); **битая холодная копия → сверка Err, proof не
+  выдан, сегмент остаётся на диске**.
+- `crates/research-cli/tests/red_stream_grid.rs` — E5: грид на журнале, который не влезает
+  в бюджет как `Vec<Event>`, отрабатывает bounded-memory; **ЭКВИВАЛЕНТНОСТЬ**: стрим-грид
+  даёт РОВНО те же `CellResult` (PnL до цента, интенты, филлы, длина returns), что in-memory
+  `run_grid` — «оптимизация» не смеет тихо изменить измеряемую логику (урок M-07).
+
+**Bounded-RSS recorder'а (E7)** покрывается тем же counting-allocator оракулом на writer-пути
+(`red_stream_bounded` + `red_rotation` гоняют десятки тысяч `append` через ротацию) плюс §8
+eyes-on на VPS (RSS после суток аптайма). Отдельный recorder-оракул заводится, ЕСЛИ §8 покажет
+рост — сейчас лик не доказан (одна точка 48 MiB), а тест на «5 часов аптайма» в CI не живёт.
+
+## Acceptance
+
+`bash scripts/verify_M-08.sh; echo "exit=$?"` → `VERDICT: PASS`, exit=0
+(fmt + clippy + все RED GREEN + прод-масштабные bounded-memory оракулы + грепы:
+`read_all` не используется в `research-cli/src`, имя сегмента не захардкожено).
+
+**§8 (решающий, прод НЕ инертен):** после merge — CI+Deploy success И ssh-проверка:
+recorder пишет в НОВЫЙ сегмент с заголовком; **старый 8.3 GB сегмент цел** (не переписан,
+не удалён) и читается legacy-путём; `seq` продолжился без дыр; heartbeat свежий; RSS в норме.
+Любое сомнение → revert (данные дороже фичи).
+
+## Handoff (rev 3)
+
+architect (RFC + RED + скелеты) → **critic** (T1-триггер) →
+**параллельно:** engine-dev (задачи 2, 3, 4 — journal/recorder) ‖ **venue-dev (задача 9 — TD-016,
+независимая зона `venue-binance/src`)** → research-dev (задача 5; зависит от `journal::stream`
+из задачи 2) → tester (7) → reviewer (8, merge + §8).
+
+Задача 6 (`deploy.yml`) — уже сделана architect'ом (process-only).
+
+**§8 eyes-on после merge (прод НЕ инертен, дополнено rev 3):** помимо «новый сегмент пишется,
+старый 8.3 GB цел и читается, seq непрерывен, heartbeat свежий» — обязательна проверка
+**последствий TD-016-фикса**: (а) RSS recorder'а СТАБИЛЕН (замер через 1 ч и через 4-5 ч —
+раньше было +6.5 MiB/час); (б) **глубина книги и полосы OBI не деградировали** (эвикция не
+смеет срезать то, из чего считается сигнал) — сверить `bands`-дамп до/после;
+(в) `storage_status` в heartbeat присутствует. Первый прогон ретеншена — **dry-run без
+удаления** (боевой сегмент — единственная копия).

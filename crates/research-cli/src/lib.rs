@@ -6,6 +6,7 @@
 //! Каркас — architect (M-04 task 1); реализация — research-dev (task 4).
 //! Инварианты RC-I-1..11 — RED-оракулы в `tests/` (sacred).
 
+pub mod data_quality;
 pub mod grid;
 pub mod ledger;
 pub mod metrics;

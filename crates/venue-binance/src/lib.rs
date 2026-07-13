@@ -34,26 +34,26 @@ const EMIT_PERIOD: Duration = Duration::from_secs(1);
 /// Локальная копия полного стакана одного символа. price/size — fixed-point ×1e8
 /// (per `contracts::PRICE_SCALE`), ключ `BTreeMap` — цена, что даёт бесплатную
 /// сортировку + O(log n) upsert/remove на diff-апдейте.
-struct OrderBook {
-    bids: BTreeMap<i64, i64>,
-    asks: BTreeMap<i64, i64>,
-    last_update_id: u64,
+pub struct OrderBook {
+    pub bids: BTreeMap<i64, i64>,
+    pub asks: BTreeMap<i64, i64>,
+    pub last_update_id: u64,
     /// Биржевое время (`E`) последнего применённого WS diff-апдейта, мс since epoch.
     /// `0` означает "ещё ни один diff не применялся" (только REST-бутстрап) — книга
     /// в этом состоянии не несёт биржевого времени и НЕ эмитится в `emit_book_snapshots`.
-    last_event_time_ms: i64,
+    pub last_event_time_ms: i64,
 }
 
 /// Один WS `@depth@100ms` diff-апдейт после парсинга. `u_first`/`u_final` — `U`/`u` из
 /// payload Binance. size==0 в уровне означает "удалить уровень" (per Binance diff-sync
 /// docs), это разворачивается в `apply_diff_to_book`. `event_time_ms` — биржевое время
 /// `E` из payload (0, если отсутствует — не паникуем, не подставляем now()).
-struct DepthDiff {
-    event_time_ms: i64,
-    u_first: u64,
-    u_final: u64,
-    bids: Vec<(i64, i64)>,
-    asks: Vec<(i64, i64)>,
+pub struct DepthDiff {
+    pub event_time_ms: i64,
+    pub u_first: u64,
+    pub u_final: u64,
+    pub bids: Vec<(i64, i64)>,
+    pub asks: Vec<(i64, i64)>,
 }
 
 /// Состояние sync-конечного-автомата одного символа.
@@ -303,7 +303,7 @@ fn parse_diff_levels(levels: &serde_json::Value) -> Option<Vec<(i64, i64)>> {
 
 /// Применить один diff (уже проверенный на непрерывность вызывающим) к книге:
 /// upsert/remove по уровням, `last_update_id = diff.u_final`.
-fn apply_diff_to_book(book: &mut OrderBook, diff: &DepthDiff) {
+pub fn apply_diff_to_book(book: &mut OrderBook, diff: &DepthDiff) {
     for (price, size) in &diff.bids {
         if *size == 0 {
             book.bids.remove(price);
