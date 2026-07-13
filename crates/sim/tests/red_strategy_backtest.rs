@@ -9,11 +9,11 @@
 use std::collections::BTreeMap;
 
 use alpha::{Instrument, LinearAlpha, SignalWeight, EDGE_SCALE};
-use contracts::{Event, EventKind, Level, MdPayload, Venue};
+use contracts::{Event, EventKind, Level, MdPayload, Side, Venue};
 use portfolio::RiskBudget;
 use signals::{RegistryStatus, Signal, SignalId, SignalMeta, SignalOut, SignalSpecRef};
 use sim::{BacktestReport, FeeRates, FeeSchedule, LatencyTable, StrategyBacktest};
-use strategy::{DirectionalStrategy, OrderKind, Strategy, StrategyConfig};
+use strategy::{DirectionalStrategy, FillReport, OrderIntent, OrderKind, Strategy, StrategyConfig};
 
 const MS: u64 = 1_000_000;
 const SIG: &str = "S-001-obi-asym";
@@ -220,5 +220,201 @@ fn st_i_8d_prefix_run_is_prefix_of_full_run() {
     assert!(
         prefix.intents <= full.intents,
         "префикс не может произвести БОЛЬШЕ решений, чем полный поток"
+    );
+}
+
+// ── ST-I-8e (C-004 C1): независимый оракул ДОСТАВКИ филлов стратегии ──────────────────
+//
+// Прежний ST-I-8b сравнивал позицию стратегии с `report.positions` — обе могли быть нулём
+// у реализации, которая НИКОГДА не зовёт `strategy.on_fill(...)`. Спай ниже фиксирует
+// КАЖДЫЙ вызов `on_fill` и его содержимое, поэтому падает, если `run()`:
+//   (а) не докладывает филлы стратегии вовсе;
+//   (б) неверно подписывает FillReport (сторона/инструмент/цена/размер не из SimFill);
+//   (в) выдумывает филлы, которых не было на бирже.
+// Спай НЕ зависит от DirectionalStrategy — он проверяет ТОЛЬКО мост StrategyBacktest.
+
+/// Стратегия-шпион: шлёт заранее заданные интенты и записывает всё, что ей доложили.
+struct SpyStrategy {
+    /// seq события → интент, который надо отдать бирже.
+    script: BTreeMap<u64, OrderIntent>,
+    /// Полный журнал вызовов `on_fill` (порядок сохраняется).
+    seen: Vec<FillReport>,
+}
+
+impl SpyStrategy {
+    /// Нетто-позиция, посчитанная ИЗ ДОЛОЖЕННЫХ филлов (buy +, sell −).
+    fn signed_net_e8(&self) -> i64 {
+        self.seen
+            .iter()
+            .map(|f| match f.side {
+                Side::Buy => f.qty_e8,
+                Side::Sell => -f.qty_e8,
+            })
+            .sum()
+    }
+}
+
+impl Strategy for SpyStrategy {
+    fn on_event(&mut self, ev: &Event) -> Vec<OrderIntent> {
+        self.script.get(&ev.seq).cloned().into_iter().collect()
+    }
+    fn on_fill(&mut self, fill: &FillReport) {
+        self.seen.push(fill.clone());
+    }
+    fn position_e8(&self, _instrument: &Instrument) -> i64 {
+        self.signed_net_e8()
+    }
+}
+
+fn spy() -> SpyStrategy {
+    let buy = OrderIntent {
+        venue: Venue::Binance,
+        symbol: "BTCUSDT".to_string(),
+        side: Side::Buy,
+        price: 10_201_000_000, // 101.0 × 1.01 — маркетабельно
+        qty: EDGE_SCALE,       // 1.0
+        kind: OrderKind::Taker,
+    };
+    let sell = OrderIntent {
+        side: Side::Sell,
+        price: 9_900_000_000, // 100.0 × 0.99
+        ..buy.clone()
+    };
+    SpyStrategy {
+        script: BTreeMap::from([(2, buy), (8, sell)]),
+        seen: Vec::new(),
+    }
+}
+
+/// ST-I-8e: `StrategyBacktest::run` ОБЯЗАН доложить стратегии КАЖДЫЙ филл биржи, корректно
+/// подписав его (instrument/side/price/qty/fee/ts из соответствующего `SimFill` и интента).
+#[test]
+fn st_i_8e_run_reports_every_fill_back_to_strategy() {
+    let mut bt = StrategyBacktest::new(table(), fees(), 42);
+    let mut s = spy();
+    let report = bt.run(&events(), &mut s);
+
+    // (а) доставка вообще произошла
+    assert!(
+        !report.fills.is_empty(),
+        "фикстура обязана дать филлы (иначе оракул бессмысленен)"
+    );
+    assert_eq!(
+        s.seen.len(),
+        report.fills.len(),
+        "стратегии обязан быть доложен КАЖДЫЙ филл биржи: доложено {}, исполнено {} \
+         (пропуск on_fill → стратегия торгует по фантомной позиции)",
+        s.seen.len(),
+        report.fills.len()
+    );
+
+    // (б) подпись FillReport соответствует SimFill (цена/размер/комиссия/время) —
+    // выдуманные или перепутанные филлы не пройдут.
+    for (got, sim_fill) in s.seen.iter().zip(report.fills.iter()) {
+        assert_eq!(got.instrument, btc(), "инструмент филла");
+        assert_eq!(got.price_e8, sim_fill.price, "цена филла из SimFill");
+        assert_eq!(got.qty_e8, sim_fill.qty, "размер филла из SimFill");
+        assert_eq!(got.fee_e8, sim_fill.fee_e8, "комиссия филла из SimFill");
+        assert_eq!(
+            got.ts_mono_ns, sim_fill.ts_mono_ns,
+            "время филла из SimFill"
+        );
+        assert!(got.qty_e8 > 0, "размер филла — положительная величина");
+    }
+
+    // (в) СТОРОНА восстановлена из интента (в SimFill стороны нет — её обязан подставить
+    // мост order_meta). Реализация, подписывающая всё как Buy, здесь падает.
+    let buys: i64 = s
+        .seen
+        .iter()
+        .filter(|f| f.side == Side::Buy)
+        .map(|f| f.qty_e8)
+        .sum();
+    let sells: i64 = s
+        .seen
+        .iter()
+        .filter(|f| f.side == Side::Sell)
+        .map(|f| f.qty_e8)
+        .sum();
+    assert!(buys > 0, "BUY-интент (seq 2) обязан дать BUY-филлы");
+    assert!(
+        sells > 0,
+        "SELL-интент (seq 8) обязан дать SELL-филлы — сторона берётся из интента, \
+         не из SimFill (там её нет)"
+    );
+
+    // Нетто из ДОЛОЖЕННЫХ филлов == нетто-позиция отчёта: два независимых источника истины.
+    let reported = report.positions.get(&btc()).copied().unwrap_or(0);
+    assert_eq!(
+        s.signed_net_e8(),
+        reported,
+        "позиция отчёта обязана быть выводима из доложенных стратегии филлов"
+    );
+}
+
+/// ST-I-8f (NO-LOOKAHEAD, замена переоценённого ST-I-5, C-004 M1): `run()` получает ВЕСЬ
+/// срез событий — это и есть настоящая поверхность подглядывания. Мутируем ТОЛЬКО будущее
+/// (события после seq=6): решения и исполнения в прошлом обязаны остаться бит-в-бит теми же.
+/// Реализация, заглядывающая вперёд по срезу, здесь падает; префикс-стабильность (ST-I-5)
+/// такое не ловит.
+#[test]
+fn st_i_8f_mutating_the_future_cannot_change_the_past() {
+    let baseline = events();
+
+    // Тот же поток, но у событий seq > 6 книга РАДИКАЛЬНО другая (цены ×2).
+    let mutated: Vec<Event> = baseline
+        .iter()
+        .map(|e| {
+            if e.seq <= 6 {
+                return e.clone();
+            }
+            let EventKind::Md(md) = &e.kind else {
+                return e.clone();
+            };
+            let MdPayload::L2Snapshot { ts_exch_ms, .. } = &md.payload else {
+                return e.clone();
+            };
+            Event {
+                kind: EventKind::md(
+                    Venue::Binance,
+                    "BTCUSDT",
+                    MdPayload::L2Snapshot {
+                        bids: vec![Level {
+                            price: contracts::to_fixed(200.0),
+                            size: contracts::to_fixed(10.0),
+                        }],
+                        asks: vec![Level {
+                            price: contracts::to_fixed(202.0),
+                            size: contracts::to_fixed(10.0),
+                        }],
+                        ts_exch_ms: *ts_exch_ms,
+                    },
+                ),
+                ..e.clone()
+            }
+        })
+        .collect();
+
+    let run_stream = |evs: &[Event]| -> Vec<sim::SimFill> {
+        let mut bt = StrategyBacktest::new(table(), fees(), 7);
+        let mut s = strat();
+        bt.run(evs, &mut s)
+            .fills
+            .into_iter()
+            .filter(|f| f.seq <= 6) // только «прошлое»
+            .collect()
+    };
+
+    let past_baseline = run_stream(&baseline);
+    let past_mutated = run_stream(&mutated);
+
+    assert!(
+        !past_baseline.is_empty(),
+        "в прошлом обязаны быть исполнения (иначе оракул пуст)"
+    );
+    assert_eq!(
+        past_baseline, past_mutated,
+        "изменение БУДУЩЕГО изменило исполнения в ПРОШЛОМ — значит, где-то читается \
+         срез событий вперёд (нарушение SM-I-4 / no-lookahead)"
     );
 }
