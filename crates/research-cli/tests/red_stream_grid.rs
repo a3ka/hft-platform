@@ -221,15 +221,44 @@ fn streamed_grid_equals_in_memory_grid() {
         "число ячеек обязано совпасть"
     );
     for (a, b) in in_memory.iter().zip(streamed.iter()) {
+        // ПОЛНАЯ семантика CellResult (C-005 M3): «оптимизация» не смеет тихо изменить
+        // ни одно число, которое дальше уходит в ValidationReport → trials-ledger →
+        // подпись founder'а (gates §6/§7).
+        assert_eq!(a.params, b.params, "params ячейки");
         assert_eq!(a.params_hash, b.params_hash, "хэш ячейки");
-        assert_eq!(a.intents, b.intents, "интенты обязаны совпасть");
-        assert_eq!(a.fills, b.fills, "филлы обязаны совпасть");
-        assert_eq!(a.net_pnl_e8, b.net_pnl_e8, "PnL обязан совпасть до цента");
+        assert_eq!(a.intents, b.intents, "интенты");
+        assert_eq!(a.fills, b.fills, "филлы");
+        assert_eq!(a.net_pnl_e8, b.net_pnl_e8, "PnL до цента");
         assert_eq!(a.turnover_e8, b.turnover_e8, "оборот");
+        assert_eq!(a.max_drawdown_e8, b.max_drawdown_e8, "max drawdown");
         assert_eq!(
-            a.returns.len(),
-            b.returns.len(),
-            "returns-серия обязана совпасть по длине (D7-семантика equity-кривой)"
+            a.returns, b.returns,
+            "returns-серия обязана совпасть ПОЭЛЕМЕНТНО (не только по длине) — иначе \
+             стрим-путь тихо меняет σ и Sharpe отчёта"
+        );
+        assert_eq!(
+            a.sharpe.to_bits(),
+            b.sharpe.to_bits(),
+            "Sharpe обязан совпасть БИТ-В-БИТ (детерминизм, DESIGN §1)"
+        );
+    }
+
+    // Побочный эффект ledger'а (RC-I-9) — тот же: те же записи, тот же порядок.
+    let recs_mem = l1.read_all().expect("ledger in-memory");
+    let recs_str = l2.read_all().expect("ledger streamed");
+    assert_eq!(
+        recs_mem.len(),
+        recs_str.len(),
+        "оба пути обязаны записать одинаковое число trial-записей"
+    );
+    for (a, b) in recs_mem.iter().zip(recs_str.iter()) {
+        assert_eq!(a.params_hash, b.params_hash, "ledger: хэш ячейки");
+        assert_eq!(a.signal_family, b.signal_family, "ledger: семейство");
+        assert_eq!(a.code_hash, b.code_hash, "ledger: code_hash эпохи (TD-015)");
+        assert_eq!(
+            a.sharpe.map(f64::to_bits),
+            b.sharpe.map(f64::to_bits),
+            "ledger: Sharpe бит-в-бит (по нему считается deflated Sharpe → подпись founder)"
         );
     }
 }

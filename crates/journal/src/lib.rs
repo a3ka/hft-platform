@@ -23,8 +23,9 @@ use contracts::{Event, EventKind};
 pub mod segments;
 
 pub use segments::{
-    free_bytes, prune_segment, segments as list_segments, stream, verify_cold_copy, ColdCopyProof,
-    EpochFilter, EventStream, SegmentInfo, WriterConfig,
+    declare_legacy, fingerprint, free_bytes, is_foreign_segment, is_storage_guard, prune_segment,
+    segments as list_segments, storage_status, stream, verify_cold_copy, ColdCopyProof,
+    EpochFilter, EventStream, SegmentInfo, StorageStatus, WriterConfig, LEGACY_MANIFEST,
 };
 
 const META: &str = "journal.meta";

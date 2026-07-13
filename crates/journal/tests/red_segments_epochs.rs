@@ -12,7 +12,10 @@
 
 use std::io::Write;
 
-use contracts::{DataSource, EventKind, MdPayload, Side, Venue, LEGACY_EPOCH_ID};
+use contracts::{
+    DataSource, EventKind, LegacyManifest, LegacySegmentDecl, MdPayload, Side, Venue,
+    LEGACY_EPOCH_ID,
+};
 use journal::{EpochFilter, Journal, WriterConfig};
 
 fn trade(i: u64) -> EventKind {
@@ -38,6 +41,27 @@ fn cfg(source: DataSource, epoch: &str) -> WriterConfig {
     }
 }
 
+/// Вариант с другим содержимым (для проверки отпечатка).
+fn write_legacy_segment_with_offset(dir: &std::path::Path, n: u64, offset: u64) {
+    let path = dir.join("segment-00000000.jrnl");
+    let f = std::fs::File::create(path).expect("create");
+    let mut w = std::io::BufWriter::new(f);
+    for seq in 0..n {
+        let ev = contracts::Event {
+            seq,
+            ts_mono_ns: seq + offset,
+            ts_wall_ms: 1_752_000_000_000 + (seq + offset) as i64,
+            kind: trade(seq + offset),
+        };
+        let payload = postcard::to_stdvec(&ev).expect("ser");
+        w.write_all(&(payload.len() as u32).to_le_bytes()).unwrap();
+        w.write_all(&payload).unwrap();
+        w.write_all(&crc32fast::hash(&payload).to_le_bytes())
+            .unwrap();
+    }
+    w.flush().unwrap();
+}
+
 /// Записать сегмент СТАРОГО формата (без заголовка) — байт-в-байт как боевой
 /// `segment-00000000.jrnl`, который сейчас лежит на VPS (8.3 GB).
 fn write_legacy_segment(dir: &std::path::Path, n: u64) {
@@ -61,21 +85,43 @@ fn write_legacy_segment(dir: &std::path::Path, n: u64) {
     std::fs::write(dir.join("journal.meta"), n.to_le_bytes()).expect("meta");
 }
 
-/// CT-RFC02-1: боевой сегмент БЕЗ заголовка читается навсегда, с ВМЕНЁННОЙ эпохой
-/// `OwnCapture` — ни одно событие не теряется. Переписывать 8.3 GB боевых данных запрещено,
-/// поэтому legacy-путь обязан существовать вечно (CT-I-3).
+/// Задекларировать legacy-сегмент в манифесте (операторская процедура).
+fn declare(dir: &std::path::Path, file: &str, source: DataSource, epoch: &str) {
+    let fp = journal::fingerprint(&dir.join(file)).expect("fingerprint");
+    let size = std::fs::metadata(dir.join(file)).expect("meta").len();
+    let m = LegacyManifest {
+        declarations: vec![LegacySegmentDecl {
+            file_name: file.to_string(),
+            fingerprint_sha256: fp,
+            size_bytes_at_decl: size,
+            source,
+            provenance: format!("declared fixture {epoch}"),
+            epoch_id: epoch.to_string(),
+        }],
+    };
+    std::fs::write(
+        dir.join(journal::LEGACY_MANIFEST),
+        serde_json::to_vec_pretty(&m).expect("ser"),
+    )
+    .expect("write manifest");
+}
+
+/// CT-RFC02-1 (rev 2): боевой сегмент БЕЗ заголовка читается вечно — но ТОЛЬКО будучи ЯВНО
+/// задекларированным (магии нет → происхождение берётся из манифеста после сверки отпечатка).
 #[test]
-fn legacy_segment_without_header_is_read_with_implied_own_capture_epoch() {
+fn declared_legacy_segment_is_read_with_declared_epoch() {
     let dir = tempfile::tempdir().expect("tempdir");
     write_legacy_segment(dir.path(), 500);
+    declare(
+        dir.path(),
+        "segment-00000000.jrnl",
+        DataSource::OwnCapture,
+        LEGACY_EPOCH_ID,
+    );
 
     let segs = journal::list_segments(dir.path()).expect("segments");
     assert_eq!(segs.len(), 1);
-    assert_eq!(
-        segs[0].header.source,
-        DataSource::OwnCapture,
-        "legacy-сегмент — НАШ захват (вменение, а не молчание)"
-    );
+    assert_eq!(segs[0].header.source, DataSource::OwnCapture);
     assert_eq!(segs[0].header.epoch_id, LEGACY_EPOCH_ID);
     assert_eq!(
         segs[0].header.schema_version,
@@ -87,8 +133,96 @@ fn legacy_segment_without_header_is_read_with_implied_own_capture_epoch() {
         .map(|e| e.expect("event"))
         .collect();
     assert_eq!(evs.len(), 500, "ни одно legacy-событие не потеряно");
-    assert_eq!(evs[0].seq, 0);
     assert_eq!(evs[499].seq, 499);
+}
+
+/// **C-005 C2 (fail-closed):** НЕзадекларированный безголовый сегмент НЕ получает нашего
+/// происхождения — чтение обязано вернуть Err. Прежнее правило («не разобрался заголовок →
+/// OwnCapture») здесь молча приписало бы чужим данным наш захват.
+#[test]
+fn undeclared_headerless_segment_is_rejected_not_imputed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_legacy_segment(dir.path(), 100); // манифеста НЕТ
+
+    match journal::list_segments(dir.path()) {
+        Err(e) => assert!(
+            journal::is_foreign_segment(&e),
+            "ожидалась ошибка ForeignSegment, получено: {e}"
+        ),
+        Ok(segs) => panic!(
+            "незадекларированный безголовый сегмент прочитан как {:?} — это ТИХАЯ ПРИПИСКА \
+             происхождения (fail-open), ровно то, что CT-RFC-02 обязан исключить",
+            segs.first().map(|s| s.header.source)
+        ),
+    }
+}
+
+/// Подмена файла под знакомым именем: декларация есть, но отпечаток НЕ совпадает → Err.
+#[test]
+fn declared_segment_with_wrong_fingerprint_is_rejected() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_legacy_segment(dir.path(), 100);
+    declare(
+        dir.path(),
+        "segment-00000000.jrnl",
+        DataSource::OwnCapture,
+        LEGACY_EPOCH_ID,
+    );
+
+    // Тот же путь, ДРУГИЕ байты (вендорский дамп подсунут под нашим именем).
+    write_legacy_segment_with_offset(dir.path(), 100, 777);
+
+    assert!(
+        journal::list_segments(dir.path()).is_err(),
+        "отпечаток не совпал → сегмент обязан быть отвергнут (иначе декларация ничего не \
+         гарантирует: подменил файл — получил наше происхождение)"
+    );
+}
+
+/// Битые байты в начале сегмента: ни магии, ни валидных фреймов → Err, а не «наш захват».
+#[test]
+fn corrupt_segment_is_rejected_not_imputed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("segment-00000000.jrnl"),
+        b"\x00\x01\x02 garbage not a journal at all",
+    )
+    .expect("write");
+
+    assert!(
+        journal::list_segments(dir.path()).is_err(),
+        "мусорный файл обязан быть отвергнут, а не классифицирован как OwnCapture"
+    );
+}
+
+/// Задекларированный ВЕНДОРСКИЙ безголовый дамп остаётся Vendor и не попадает в дефолтную
+/// выборку (иначе купленная история молча войдёт в обучение).
+#[test]
+fn declared_headerless_vendor_stays_vendor() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_legacy_segment(dir.path(), 50);
+    declare(
+        dir.path(),
+        "segment-00000000.jrnl",
+        DataSource::Vendor,
+        "tardis-2024",
+    );
+
+    let segs = journal::list_segments(dir.path()).expect("segments");
+    assert_eq!(segs[0].header.source, DataSource::Vendor);
+
+    let n = {
+        let mut n = 0usize;
+        for e in journal::stream(dir.path(), EpochFilter::OwnCaptureOnly).expect("stream") {
+            e.expect("event");
+            n += 1;
+        }
+        n
+    };
+    assert_eq!(
+        n, 0,
+        "вендорский сегмент не смеет попасть в OwnCaptureOnly-выборку"
+    );
 }
 
 /// CT-RFC02-3/4: по умолчанию (`OwnCaptureOnly`) вендорские и синтетические сегменты

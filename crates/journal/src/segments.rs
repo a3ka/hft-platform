@@ -14,7 +14,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-use contracts::{DataSource, Event, SegmentHeader};
+use contracts::{DataSource, Event, LegacySegmentDecl, SegmentHeader};
 
 /// Порог ротации по размеру (E2). Сегмент закрывается, когда превысил его.
 pub const DEFAULT_MAX_SEGMENT_BYTES: u64 = 1024 * 1024 * 1024; // 1 GiB
@@ -79,10 +79,56 @@ impl EpochFilter {
     }
 }
 
-/// Перечислить сегменты каталога по возрастанию индекса; у сегмента без заголовка —
-/// вменённый legacy-заголовок (CT-RFC02-1). Не читает события (O(1) на сегмент).
+/// Имя манифеста легаси-деклараций (CT-RFC-02 rev 2).
+pub const LEGACY_MANIFEST: &str = "journal.legacy.json";
+
+/// Классификация сегмента — ЕДИНСТВЕННОЕ место, где данные получают происхождение.
+/// Fail-closed (находка critic C-005 C2):
+///
+/// | Что на диске | Результат |
+/// |---|---|
+/// | магия `SEGMENT_MAGIC` + валидный заголовок | заголовок из файла |
+/// | магия есть, заголовок битый | **`Err` (CorruptHeader)** — НЕ «наш» |
+/// | магии нет, файл ЗАДЕКЛАРИРОВАН в манифесте, отпечаток совпал | заголовок из декларации |
+/// | магии нет, файл задекларирован, **отпечаток НЕ совпал** | **`Err`** (подмена файла) |
+/// | магии нет, файла нет в манифесте | **`Err` (ForeignSegment)** — НЕ «наш» |
+///
+/// Прежнее правило «не разобрался → `OwnCapture`» было fail-open: чужой/битый сегмент
+/// молча получал наше происхождение — ровно та приписка эпохи, против которой писан RFC.
 pub fn segments(_dir: impl AsRef<Path>) -> io::Result<Vec<SegmentInfo>> {
-    todo!("M-08 task 2 (engine-dev): скан каталога, парс заголовка/вменение legacy")
+    todo!("M-08 task 2 (engine-dev): магия → header; иначе манифест+отпечаток; иначе Err")
+}
+
+/// Отпечаток первых `LEGACY_FINGERPRINT_BYTES` байт файла (sha256, hex).
+pub fn fingerprint(_path: &Path) -> io::Result<String> {
+    todo!("M-08 task 2 (engine-dev)")
+}
+
+/// Записать декларацию легаси-сегмента в манифест (операторская процедура: боевой
+/// сегмент 8.3 GB декларируется ОДИН раз, до деплоя ротации).
+pub fn declare_legacy(_dir: impl AsRef<Path>, _decl: LegacySegmentDecl) -> io::Result<()> {
+    todo!("M-08 task 2 (engine-dev): посчитать отпечаток, дописать journal.legacy.json")
+}
+
+/// Сегмент без магии и без валидной декларации (чужой/неизвестный).
+/// Читатель ОБЯЗАН вернуть такую ошибку, а не вменить `OwnCapture`.
+pub fn is_foreign_segment(_e: &io::Error) -> bool {
+    todo!("M-08 task 2 (engine-dev): маркер ошибки ForeignSegment")
+}
+
+/// Ошибка disk-guard (E4): свободного места меньше `min_free_bytes`.
+pub fn is_storage_guard(_e: &io::Error) -> bool {
+    todo!("M-08 task 3 (engine-dev): маркер ошибки StorageGuard")
+}
+
+/// Наблюдаемое состояние хранилища (E4). Recorder публикует его в heartbeat-файл —
+/// чтобы деградация была видна БЕЗ ssh (урок TD-011/TD-016: healthcheck молчит).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StorageStatus {
+    pub free_bytes: u64,
+    pub min_free_bytes: u64,
+    /// `false` → запись остановлена (fail-closed), журнал не растёт.
+    pub writable: bool,
 }
 
 /// Bounded-memory поток событий журнала (E5). Память НЕ зависит от размера журнала:
@@ -134,6 +180,17 @@ pub fn verify_cold_copy(_seg: &SegmentInfo, _cold_root: &Path) -> io::Result<Col
 
 /// Удалить горячую копию сегмента. Требует `ColdCopyProof` — данные не могут исчезнуть
 /// «по политике ретеншена», не оказавшись сперва в холодном хранилище.
+///
+/// Типовой барьер ИСПОЛНЯЕМ (доктест, N1 из C-005): proof нельзя сконструировать снаружи.
+///
+/// ```compile_fail
+/// # use journal::{prune_segment, ColdCopyProof, SegmentInfo};
+/// # fn f(seg: &SegmentInfo) {
+/// // Приватное поле → внешний крейт не может создать proof: НЕ СКОМПИЛИРУЕТСЯ.
+/// let fake = ColdCopyProof { _private: () };
+/// let _ = prune_segment(seg, fake);
+/// # }
+/// ```
 pub fn prune_segment(_seg: &SegmentInfo, _proof: ColdCopyProof) -> io::Result<()> {
     todo!("M-08 task 3 (engine-dev): удалить ТОЛЬКО горячую копию, после proof")
 }
@@ -141,4 +198,9 @@ pub fn prune_segment(_seg: &SegmentInfo, _proof: ColdCopyProof) -> io::Result<()
 /// Свободное место на файловой системе каталога (E4).
 pub fn free_bytes(_dir: impl AsRef<Path>) -> io::Result<u64> {
     todo!("M-08 task 3 (engine-dev): statvfs/statfs")
+}
+
+/// Текущее состояние хранилища журнала (E4) — для recorder-heartbeat и алертов.
+pub fn storage_status(_dir: impl AsRef<Path>, _cfg: &WriterConfig) -> io::Result<StorageStatus> {
+    todo!("M-08 task 3 (engine-dev): free_bytes vs min_free_bytes")
 }
