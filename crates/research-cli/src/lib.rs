@@ -11,6 +11,7 @@ pub mod ledger;
 pub mod metrics;
 pub mod report;
 pub mod split;
+pub mod strategy_cell;
 pub mod types;
 pub mod walkforward;
 
