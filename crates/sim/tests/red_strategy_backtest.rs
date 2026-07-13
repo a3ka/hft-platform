@@ -235,8 +235,9 @@ fn st_i_8d_prefix_run_is_prefix_of_full_run() {
 
 /// Стратегия-шпион: шлёт заранее заданные интенты и записывает всё, что ей доложили.
 struct SpyStrategy {
-    /// seq события → интент, который надо отдать бирже.
-    script: BTreeMap<u64, OrderIntent>,
+    /// seq события → интенты, которые надо отдать бирже (список: на одном событии
+    /// стратегия вправе отдать НЕСКОЛЬКО интентов — ST-I-8g опирается на это).
+    script: BTreeMap<u64, Vec<OrderIntent>>,
     /// Полный журнал вызовов `on_fill` (порядок сохраняется).
     seen: Vec<FillReport>,
 }
@@ -256,7 +257,7 @@ impl SpyStrategy {
 
 impl Strategy for SpyStrategy {
     fn on_event(&mut self, ev: &Event) -> Vec<OrderIntent> {
-        self.script.get(&ev.seq).cloned().into_iter().collect()
+        self.script.get(&ev.seq).cloned().unwrap_or_default()
     }
     fn on_fill(&mut self, fill: &FillReport) {
         self.seen.push(fill.clone());
@@ -281,7 +282,7 @@ fn spy() -> SpyStrategy {
         ..buy.clone()
     };
     SpyStrategy {
-        script: BTreeMap::from([(2, buy), (8, sell)]),
+        script: BTreeMap::from([(2, vec![buy]), (8, vec![sell])]),
         seen: Vec::new(),
     }
 }
@@ -416,5 +417,169 @@ fn st_i_8f_mutating_the_future_cannot_change_the_past() {
         past_baseline, past_mutated,
         "изменение БУДУЩЕГО изменило исполнения в ПРОШЛОМ — значит, где-то читается \
          срез событий вперёд (нарушение SM-I-4 / no-lookahead)"
+    );
+}
+
+// ── ST-I-8g (reviewer-находка M-07 rev 3): ФОРМА equity-кривой ────────────────────────
+//
+// Reviewer поймал на PR-гейте: точка equity привязывалась к НАКОПЛЕННОМУ числу филлов
+// (`curve.len() < fills.len()`), а не к «на ЭТОМ событии был филл». Если событие принесло
+// 2+ филла, пушится одна точка, а дефицит добирается на ПОСЛЕДУЮЩИХ БЕСФИЛЛОВЫХ событиях →
+// фантомные точки, снятые не в те моменты → лишние near-zero доходности → σ занижена,
+// Sharpe ЗАВЫШЕН → ValidationReport → trials-ledger → подпись founder'а (gates §6/§7).
+//
+// Мой RED-suite этого не ловил вообще (equity_curve не ассертился нигде) — дыра того же
+// класса, что C-004 C2, этажом выше. Оракул ниже проверяет кривую ПОЭЛЕМЕНТНО против
+// независимо пересчитанного mark-to-market, а не только её длину.
+//
+// Мульти-филловое событие строится законно: стратегия отдаёт ДВА интента на ОДНОМ событии
+// (API это позволяет — `on_event -> Vec<OrderIntent>`; в реальности этот же путь даёт
+// ttl-expiry-переотправка при неотменённом первом ордере). Оба taker-ордера созревают по
+// δ_submit и исполняются на ОДНОМ следующем событии → 2 филла, 1 точка кривой.
+
+/// Спай, отдающий ДВА интента на одном событии (seq 3) — единственный источник филлов.
+fn spy_two_intents_one_event() -> SpyStrategy {
+    let base = OrderIntent {
+        venue: Venue::Binance,
+        symbol: "BTCUSDT".to_string(),
+        side: Side::Buy,
+        price: 10_201_000_000, // маркетабельно (101.0 × 1.01)
+        qty: EDGE_SCALE / 2,   // 0.5
+        kind: OrderKind::Taker,
+    };
+    let second = OrderIntent {
+        qty: EDGE_SCALE / 4, // 0.25
+        ..base.clone()
+    };
+    SpyStrategy {
+        script: BTreeMap::from([(3, vec![base, second])]),
+        seen: Vec::new(),
+    }
+}
+
+#[test]
+fn st_i_8g_equity_curve_samples_events_with_fills_exactly_once() {
+    let evs = events(); // 12 снапшотов, шаг 500ms; δ_submit = 1ms
+    let mut bt = StrategyBacktest::new(table(), fees(), 42);
+    let mut s = spy_two_intents_one_event();
+    let report = bt.run(&evs, &mut s);
+
+    // Фикстура обязана быть мульти-филловой, иначе оракул ничего не доказывает.
+    assert!(
+        report.fills.len() >= 2,
+        "фикстура должна дать ≥2 филла (получено {})",
+        report.fills.len()
+    );
+    let mut fill_seqs: Vec<u64> = report.fills.iter().map(|f| f.seq).collect();
+    fill_seqs.dedup();
+    assert_eq!(
+        fill_seqs.len(),
+        1,
+        "фикстура должна свести все филлы на ОДНО событие (seq: {fill_seqs:?})"
+    );
+    assert_eq!(
+        s.seen.len(),
+        report.fills.len(),
+        "предусловие ST-I-8e: каждый филл доложен стратегии"
+    );
+
+    // ── Независимый пересчёт кривой по спеке D7 ────────────────────────────────────────
+    // На КАЖДОМ событии с ≥1 филлом — РОВНО одна точка, снятая ПОСЛЕ применения события
+    // к книге и ПОСЛЕ учёта ВСЕХ филлов этого события. На бесфилловых событиях — ничего.
+    let scale = contracts::PRICE_SCALE as i128;
+    let mut books = book::Books::new();
+    let mut cash_e8: i128 = 0;
+    let mut pos_e8: i128 = 0;
+    let mut expected: Vec<i64> = Vec::new();
+    let mut i = 0usize;
+
+    for ev in &evs {
+        if let EventKind::Md(md) = &ev.kind {
+            books.apply(md);
+        }
+        let mut had_fill = false;
+        while i < report.fills.len() && report.fills[i].seq == ev.seq {
+            let f = &report.fills[i];
+            let side = s.seen[i].side; // сторона — из доложенного стратегии FillReport
+            let notional = (f.price as i128) * (f.qty as i128) / scale;
+            match side {
+                Side::Buy => {
+                    cash_e8 -= notional + f.fee_e8 as i128;
+                    pos_e8 += f.qty as i128;
+                }
+                Side::Sell => {
+                    cash_e8 += notional - f.fee_e8 as i128;
+                    pos_e8 -= f.qty as i128;
+                }
+            }
+            had_fill = true;
+            i += 1;
+        }
+        if had_fill {
+            let mid = books
+                .get(Venue::Binance, "BTCUSDT")
+                .and_then(|b| b.mid())
+                .expect("книга видна на событии с филлом") as i128;
+            expected.push((cash_e8 + pos_e8 * mid / scale) as i64);
+        }
+    }
+    assert_eq!(i, report.fills.len(), "все филлы разобраны по событиям");
+
+    // (1) КОЛИЧЕСТВО: одна точка на событие с филлами, а не на филл.
+    assert_eq!(
+        report.equity_curve_e8.len(),
+        expected.len(),
+        "equity-точек должно быть СТОЛЬКО ЖЕ, сколько СОБЫТИЙ с филлами ({}), а не филлов \
+         ({}). Привязка к накопленному числу филлов добирает фантомные точки на \
+         бесфилловых событиях → искажение returns-серии → завышенный Sharpe",
+        expected.len(),
+        report.fills.len()
+    );
+    assert!(
+        report.equity_curve_e8.len() < report.fills.len(),
+        "в этой фикстуре событий с филлами СТРОГО меньше, чем филлов — иначе оракул слеп"
+    );
+
+    // (2) ЗНАЧЕНИЯ И МОМЕНТЫ: кривая совпадает с независимым mark-to-market поэлементно.
+    assert_eq!(
+        report.equity_curve_e8, expected,
+        "equity-кривая обязана совпадать с mark-to-market, снятым РОВНО на событиях с \
+         филлами (после применения события к книге и учёта всех филлов события)"
+    );
+
+    // (3) Терминальная точка согласована с cash/positions отчёта (арифметика не разъехалась).
+    assert_eq!(
+        report.cash_e8 as i128, cash_e8,
+        "cash отчёта == независимый cash"
+    );
+    assert_eq!(
+        report.positions.get(&btc()).copied().unwrap_or(0) as i128,
+        pos_e8,
+        "позиция отчёта == нетто доложенных филлов"
+    );
+}
+
+/// ST-I-8h: на событиях БЕЗ филлов точек не появляется — прямая формулировка второй
+/// половины ST-I-8g (наивная реализация «добирает» их именно в бесфилловом хвосте).
+#[test]
+fn st_i_8h_no_equity_points_on_fill_less_events() {
+    let evs = events();
+    let mut bt = StrategyBacktest::new(table(), fees(), 42);
+    let mut s = spy_two_intents_one_event();
+    let report = bt.run(&evs, &mut s);
+
+    let events_with_fills: std::collections::BTreeSet<u64> =
+        report.fills.iter().map(|f| f.seq).collect();
+    assert!(!events_with_fills.is_empty(), "фикстура обязана дать филлы");
+    assert!(
+        evs.len() > events_with_fills.len() + 2,
+        "в потоке обязан быть длинный БЕСФИЛЛОВЫЙ хвост — иначе добор фантомных точек \
+         негде поймать"
+    );
+    assert_eq!(
+        report.equity_curve_e8.len(),
+        events_with_fills.len(),
+        "точек ровно столько, сколько событий с филлами: бесфилловые события НЕ добавляют \
+         точек (ни «догоняющих», ни «доборных»)"
     );
 }
