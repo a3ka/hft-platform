@@ -41,6 +41,29 @@ fn cfg(source: DataSource, epoch: &str) -> WriterConfig {
     }
 }
 
+/// Дописать события в конец существующего legacy-сегмента (эмуляция живой записи).
+fn append_legacy_events(dir: &std::path::Path, from_seq: u64, n: u64) {
+    let f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(dir.join("segment-00000000.jrnl"))
+        .expect("open append");
+    let mut w = std::io::BufWriter::new(f);
+    for seq in from_seq..from_seq + n {
+        let ev = contracts::Event {
+            seq,
+            ts_mono_ns: seq,
+            ts_wall_ms: 1_752_000_000_000 + seq as i64,
+            kind: trade(seq),
+        };
+        let payload = postcard::to_stdvec(&ev).expect("ser");
+        w.write_all(&(payload.len() as u32).to_le_bytes()).unwrap();
+        w.write_all(&payload).unwrap();
+        w.write_all(&crc32fast::hash(&payload).to_le_bytes())
+            .unwrap();
+    }
+    w.flush().unwrap();
+}
+
 /// Вариант с другим содержимым (для проверки отпечатка).
 fn write_legacy_segment_with_offset(dir: &std::path::Path, n: u64, offset: u64) {
     let path = dir.join("segment-00000000.jrnl");
@@ -177,6 +200,71 @@ fn declared_segment_with_wrong_fingerprint_is_rejected() {
         "отпечаток не совпал → сегмент обязан быть отвергнут (иначе декларация ничего не \
          гарантирует: подменил файл — получил наше происхождение)"
     );
+}
+
+/// **R4 (C-005 re-audit):** тот же первый MiB, но файл УСЕЧЁН ниже `size_bytes_at_decl` → Err.
+///
+/// Отпечатка префикса недостаточно: реализация, сверяющая только первый MiB, примет
+/// укороченный (или подменённый с сохранением префикса) файл как наш задекларированный
+/// сегмент — и мы молча потеряем хвост ЕДИНСТВЕННОЙ копии 8.3 GB боевых данных.
+/// Правило: рост хвоста после декларации — норма; СЖАТИЕ — fail-closed.
+#[test]
+fn declared_segment_truncated_below_declared_size_is_rejected() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_legacy_segment(dir.path(), 4_000); // достаточно длинный файл
+    declare(
+        dir.path(),
+        "segment-00000000.jrnl",
+        DataSource::OwnCapture,
+        LEGACY_EPOCH_ID,
+    );
+
+    let path = dir.path().join("segment-00000000.jrnl");
+    let full = std::fs::metadata(&path).expect("meta").len();
+
+    // Усекаем ХВОСТ, не трогая префикс (отпечаток первого MiB останется тем же).
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .expect("open");
+    f.set_len(full / 2).expect("truncate");
+    drop(f);
+
+    match journal::list_segments(dir.path()) {
+        Err(_) => {}
+        Ok(segs) => panic!(
+            "усечённый сегмент ({} B вместо {} B при декларации) принят как {:?}/{} — \
+             реализация сверяет только префикс и молча теряет хвост единственной копии \
+             боевых данных",
+            full / 2,
+            full,
+            segs[0].header.source,
+            segs[0].header.epoch_id
+        ),
+    }
+}
+
+/// Рост файла ПОСЛЕ декларации — норма (боевой сегмент пишется 24/7): сегмент читается.
+#[test]
+fn declared_segment_that_grew_after_declaration_is_accepted() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_legacy_segment(dir.path(), 200);
+    declare(
+        dir.path(),
+        "segment-00000000.jrnl",
+        DataSource::OwnCapture,
+        LEGACY_EPOCH_ID,
+    );
+
+    // Дописываем ещё события в тот же файл (recorder продолжает работать).
+    append_legacy_events(dir.path(), 200, 100);
+
+    let segs = journal::list_segments(dir.path()).expect(
+        "рост хвоста после декларации ДОЛЖЕН приниматься — иначе живой сегмент перестанет \
+         читаться сразу после декларации",
+    );
+    assert_eq!(segs[0].header.source, DataSource::OwnCapture);
+    assert_eq!(segs[0].header.epoch_id, LEGACY_EPOCH_ID);
 }
 
 /// Битые байты в начале сегмента: ни магии, ни валидных фреймов → Err, а не «наш захват».
