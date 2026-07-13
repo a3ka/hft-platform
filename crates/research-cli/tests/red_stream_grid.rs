@@ -66,6 +66,9 @@ fn snapshot() -> EventKind {
     )
 }
 
+/// Журнал ≥ `target_bytes` РЕАЛЬНЫХ байт на диске (замеряем файлы, а не оцениваем «на глаз»:
+/// прежняя оценка `written += 300` завышала размер фрейма в 4× и делала анти-плацебо-контроль
+/// слепым — дефект теста, вскрыт SVR research-dev).
 fn build_journal(target_bytes: u64) -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("tempdir");
     let cfg = WriterConfig {
@@ -76,13 +79,35 @@ fn build_journal(target_bytes: u64) -> tempfile::TempDir {
         epoch_id: "own-test".to_string(),
     };
     let mut j = Journal::open_with(dir.path(), cfg).expect("open_with");
-    let mut written: u64 = 0;
-    while written < target_bytes {
-        j.append(snapshot()).expect("append");
-        written += 300; // грубая оценка размера фрейма — нужна лишь для остановки цикла
+    loop {
+        for _ in 0..2_000 {
+            j.append(snapshot()).expect("append");
+        }
+        j.flush().expect("flush");
+        if journal_bytes(dir.path()) >= target_bytes {
+            break;
+        }
     }
-    j.flush().expect("flush");
     dir
+}
+
+/// Суммарный размер сегментов на диске.
+fn journal_bytes(dir: &std::path::Path) -> u64 {
+    std::fs::read_dir(dir)
+        .expect("read_dir")
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "jrnl"))
+        .map(|e| e.metadata().map(|m| m.len()).unwrap_or(0))
+        .sum()
+}
+
+/// Материализовать ВЕСЬ журнал в память — то, что делал прежний research-путь (`read_all`).
+/// Это и baseline для эквивалентности, и контроль анти-плацебо по памяти.
+fn materialize(dir: &std::path::Path) -> Vec<contracts::Event> {
+    journal::stream(dir, EpochFilter::OwnCaptureOnly)
+        .expect("stream")
+        .map(|e| e.expect("event"))
+        .collect()
 }
 
 fn cell() -> serde_json::Value {
@@ -145,11 +170,13 @@ fn streamed_grid_runs_in_bounded_memory() {
     let lat = latency();
     let fee = fees();
 
-    // Контроль анти-плацебо: материализация журнала в память ВЫХОДИТ за бюджет.
-    let (_, peak_read_all) = peak_delta(|| journal::read_all(dir.path()).expect("read_all"));
+    // Контроль анти-плацебо: материализация журнала в Vec<Event> (прежний research-путь)
+    // ВЫХОДИТ за бюджет — значит бюджет реально что-то доказывает.
+    let (_, peak_materialized) = peak_delta(|| materialize(dir.path()));
     assert!(
-        peak_read_all > BUDGET,
-        "контроль: read_all выделил {peak_read_all} B — фикстура слишком мала, оракул слеп"
+        peak_materialized > BUDGET,
+        "контроль: материализация журнала выделила {peak_materialized} B (≤ бюджета) — \
+         фикстура слишком мала, оракул слеп"
     );
 
     let source = JournalSource {
@@ -185,7 +212,9 @@ fn streamed_grid_runs_in_bounded_memory() {
 fn streamed_grid_equals_in_memory_grid() {
     let dir = build_journal(512 * 1024);
 
-    let events = journal::read_all(dir.path()).expect("read_all");
+    // Baseline: события материализуются (через стрим — способ ЧТЕНИЯ здесь не проверяется;
+    // сравниваются СЕМАНТИКИ ГРИДА: in-memory `run_grid` vs `run_grid_streamed`).
+    let events = materialize(dir.path());
     let led1 = tempfile::tempdir().expect("led1");
     let mut l1 = Ledger::open(led1.path().join("t.jsonl")).expect("ledger");
     let lat = latency();

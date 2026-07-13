@@ -140,7 +140,14 @@ fn e8_gap_report_finds_silent_and_conn_bounded_gaps() {
     );
 
     let silent = &r.gaps[0];
-    assert_eq!(silent.duration_ms, 60_000, "тихая дыра — ровно 60с");
+    // duration = ЧИСТАЯ разница wall-clock между соседними событиями (61с: последнее
+    // событие батча в T0+9с, следующее — в T0+70с). Никаких вычитаний «активного периода»:
+    // на проде это занижало бы реальные дыры (архитектурная правка после SVR research-dev —
+    // прежний ассерт 60_000 был ОШИБКОЙ теста и вынуждал изобретать искусственную семантику).
+    assert_eq!(
+        silent.duration_ms, 61_000,
+        "тихая дыра = to_wall_ms − from_wall_ms, без «поправок»"
+    );
     assert!(
         !silent.bounded_by_conn_events,
         "дыра БЕЗ Sys-маркеров обязана быть помечена как тихая — это самый опасный случай \
@@ -148,13 +155,16 @@ fn e8_gap_report_finds_silent_and_conn_bounded_gaps() {
     );
 
     let reconnect = &r.gaps[1];
-    assert_eq!(reconnect.duration_ms, 30_000, "реконнект-дыра — ровно 30с");
+    assert_eq!(
+        reconnect.duration_ms, 30_000,
+        "реконнект-дыра: ConnDown → 30с → ConnUp"
+    );
     assert!(
         reconnect.bounded_by_conn_events,
         "дыра между ConnDown и ConnUp обязана быть распознана как штатный реконнект"
     );
 
-    assert_eq!(r.gap_total_ms, 90_000);
+    assert_eq!(r.gap_total_ms, 91_000, "61с тихой + 30с реконнект");
     // coverage = 1 − 90_000 / (last − first); фиксируем как детерминированное число.
     let span = r.last_wall_ms - r.first_wall_ms;
     let expect_cov =
