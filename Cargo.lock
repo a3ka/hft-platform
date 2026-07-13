@@ -596,6 +596,7 @@ version = "0.0.0"
 dependencies = [
  "contracts",
  "crc32fast",
+ "libc",
  "postcard",
  "serde",
  "serde_json",

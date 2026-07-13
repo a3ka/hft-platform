@@ -16,6 +16,9 @@ crc32fast = "1"
 # M-08 / CT-RFC-02: манифест legacy-деклараций (journal.legacy.json) + отпечаток сегмента.
 serde_json = "1"
 sha2 = "0.10"
+# M-08 / E4 (fail-closed по диску): statvfs для реального свободного места.
+# std::os::unix::fs::MetadataExt даёт только blocks() (total), не bavail.
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
