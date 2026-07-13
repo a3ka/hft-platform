@@ -7,13 +7,20 @@
 //! рвутся штатно. Метрика, посчитанная по дырявым данным, врёт МОЛЧА: пропущенные минуты
 //! выглядят как «рынок не двигался». Поэтому любой отчёт (`research/reports/R-NNN`) обязан
 //! ссылаться на gap-артефакт своей эпохи — иначе он не воспроизводим и не проверяем.
+//!
+//! Реализация — BUILT на `journal::stream` (E5/E6), без материализации в `Vec<Event>`.
+//! На боевом журнале 8.3 GB последняя бы OOM-нула машину (класс TD-011). Стрим даёт
+//! O(1) памяти по размеру журнала.
 
-use serde::{Deserialize, Serialize};
+use std::fs;
 
+use contracts::{Event, EventKind, SysEvent};
+
+use crate::grid::JournalSource;
 use crate::types::RcError;
 
 /// Один разрыв записи.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Gap {
     /// Последнее событие ДО разрыва.
     pub from_seq: u64,
@@ -28,7 +35,7 @@ pub struct Gap {
 
 /// Артефакт `research/data-quality/gaps-<epoch>.json` (детерминирован: никаких wall-clock
 /// полей о моменте генерации — иначе отчёт перестаёт быть байт-воспроизводимым, RC-I-5).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GapReport {
     pub schema_version: u32,
     /// Эпохи, по которым считалось (из `SegmentHeader` — эпоху нельзя не назвать).
@@ -40,7 +47,7 @@ pub struct GapReport {
     pub gap_threshold_ms: i64,
     pub gaps: Vec<Gap>,
     pub gap_total_ms: i64,
-    /// Доля времени, покрытая данными: 1 − gap_total/(last−first).
+    /// Доля времени, покрытая данными: 1 − gap_total/(last−first), в fixed-point ×1e8.
     pub coverage_e8: i64,
 }
 
@@ -49,15 +56,111 @@ pub const GAP_REPORT_SCHEMA_VERSION: u32 = 1;
 /// 5 секунд тишины — уже дыра, а не рынок.
 pub const DEFAULT_GAP_THRESHOLD_MS: i64 = 5_000;
 
-/// Посчитать разрывы по журналу (bounded-memory: идёт по стриму, не по `Vec<Event>`).
-pub fn gaps(
-    _source: &crate::grid::JournalSource,
-    _gap_threshold_ms: i64,
-) -> Result<GapReport, RcError> {
-    todo!("M-08 task 5 (research-dev): стрим по журналу → разрывы + coverage")
+/// Посчитать разрывы по журналу через `journal::stream` (E5: bounded-memory).
+///
+/// Эпохи берутся из `SegmentHeader.headers()` сегментов, прошедших `EpochFilter`.
+/// Тихая дыра (между двумя не-Sys событиями, разрыв > порога) и реконнект-обрамлённая
+/// (между `Sys::ConnDown` и `Sys::ConnUp`) находятся ОБЕ; вторая помечается
+/// `bounded_by_conn_events = true` — критично, потому что отчёт по ней можно строить
+/// (знаем причину), а по тихой — нет (причина утеряна).
+pub fn gaps(source: &JournalSource, gap_threshold_ms: i64) -> Result<GapReport, RcError> {
+    // EpochFilter обязан быть НАЗВАН (CT-RFC02-2): вендор/синтетика не подмешиваются молча.
+    let stream = journal::stream(&source.dir, source.filter.clone()).map_err(RcError::Io)?;
+
+    // Эпохи читаем из заголовков стрима (CT-RFC02-2: provenance читаемо доносится до отчёта).
+    // Дедуп + сортировка → детерминированный JSON.
+    let mut epoch_ids: Vec<String> = stream
+        .headers()
+        .iter()
+        .map(|header| header.epoch_id.clone())
+        .collect();
+    epoch_ids.sort();
+    epoch_ids.dedup();
+
+    let mut events_total: u64 = 0;
+    let mut first_wall_ms: i64 = 0;
+    let mut last_wall_ms: i64 = 0;
+    let mut prev: Option<Event> = None;
+    let mut gaps: Vec<Gap> = Vec::new();
+
+    for result in stream {
+        let event = result.map_err(RcError::Io)?;
+        events_total += 1;
+        if events_total == 1 {
+            first_wall_ms = event.ts_wall_ms;
+        }
+        last_wall_ms = event.ts_wall_ms;
+
+        if let Some(previous) = prev.take() {
+            let delta_ms = event.ts_wall_ms - previous.ts_wall_ms;
+            if delta_ms >= gap_threshold_ms {
+                // Дыра «обрамлена Conn-событиями», если с одной стороны ConnDown,
+                // с другой — ConnUp. Тихая дыра — обе границы не-Sys → bounded=false.
+                let prev_is_conn_down =
+                    matches!(&previous.kind, EventKind::Sys(SysEvent::ConnDown(_)));
+                let next_is_conn_up = matches!(&event.kind, EventKind::Sys(SysEvent::ConnUp(_)));
+                gaps.push(Gap {
+                    from_seq: previous.seq,
+                    from_wall_ms: previous.ts_wall_ms,
+                    to_seq: event.seq,
+                    to_wall_ms: event.ts_wall_ms,
+                    duration_ms: delta_ms,
+                    bounded_by_conn_events: prev_is_conn_down || next_is_conn_up,
+                });
+            }
+        }
+        prev = Some(event);
+    }
+
+    let gap_total_ms: i64 = gaps.iter().map(|gap| gap.duration_ms).sum();
+    let span_ms = last_wall_ms - first_wall_ms;
+    let coverage_e8 = if span_ms > 0 {
+        // (1 − gap_total/span) × 1e8 — fixed-point; отрицательного результата быть не
+        // может: сумма gap'ов не превышает span (каждая дыра вложена в span), но клемпим
+        // на всякий случай (если первое и последнее события внезапно совпадут по wall_ms).
+        let raw = (span_ms - gap_total_ms) as i128;
+        let coverage = raw
+            .saturating_mul(contracts::PRICE_SCALE as i128)
+            .checked_div(span_ms as i128)
+            .unwrap_or(contracts::PRICE_SCALE as i128);
+        coverage.clamp(0, contracts::PRICE_SCALE as i128) as i64
+    } else {
+        // span == 0 (ровно одно событие или пусто): coverage = 1 — «окно определено».
+        contracts::PRICE_SCALE
+    };
+
+    Ok(GapReport {
+        schema_version: GAP_REPORT_SCHEMA_VERSION,
+        epoch_ids,
+        events_total,
+        first_wall_ms,
+        last_wall_ms,
+        gap_threshold_ms,
+        gaps,
+        gap_total_ms,
+        coverage_e8,
+    })
 }
 
-/// Записать артефакт `research/data-quality/gaps-<epoch>.json` (детерминированный JSON).
-pub fn write_gap_artifact(_report: &GapReport, _dir: &std::path::Path) -> Result<(), RcError> {
-    todo!("M-08 task 5 (research-dev): детерминированная сериализация артефакта")
+/// Записать артефакт `research/data-quality/gaps-<epoch>.json` (детерминированный JSON:
+/// serde_json печатает поля struct в порядке объявления, `Vec` — в порядке элементов;
+/// никаких wall-clock полей о моменте генерации → байт-идентично при тех же входах, RC-I-5).
+///
+/// Один файл — одна эпоха: иначе отчёт неоднозначен (какой эпохе принадлежит).
+pub fn write_gap_artifact(report: &GapReport, dir: &std::path::Path) -> Result<(), RcError> {
+    if report.epoch_ids.len() != 1 {
+        return Err(RcError::Parse(format!(
+            "write_gap_artifact: ожидается ровно одна эпоха, получено {} \
+             (смешение эпох в одном файле делает отчёт неоднозначным — \
+              сначала split по EpochFilter::Explicit(epoch_ids))",
+            report.epoch_ids.len()
+        )));
+    }
+    fs::create_dir_all(dir).map_err(RcError::Io)?;
+    let path = dir.join(format!("gaps-{}.json", report.epoch_ids[0]));
+    let mut body =
+        serde_json::to_string_pretty(report).map_err(|error| RcError::Parse(error.to_string()))?;
+    body.push('\n');
+    fs::write(&path, body).map_err(RcError::Io)?;
+    Ok(())
 }
