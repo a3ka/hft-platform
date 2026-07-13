@@ -59,8 +59,14 @@ M-08 делает сбор **бесконечным по времени** (ро�
 | architect | `docs/rfc/`, `docs/`, `milestones/`, `crates/contracts/src/**` (ТОЛЬКО T1-формы CT-RFC-02), `crates/journal/src/**` (ТОЛЬКО сигнатуры/типы + `todo!()`), `crates/*/tests/**` (RED, sacred), `scripts/verify_M-08.sh`, `.github/workflows/deploy.yml` (E9 — process-only) | impl-тела, `crates/recorder/src/**`, `crates/research-cli/src/**` |
 | engine-dev | `crates/journal/src/**`, `crates/recorder/src/**` + их `Cargo.toml` | `*/tests/**` (sacred), `crates/contracts/**` (T1 — только architect через RFC), `scripts/**`, `docs/**` |
 | research-dev | `crates/research-cli/src/**` (перевод на стрим-чтение + `EpochFilter`), `research/data-quality/` (артефакты E8) | всё остальное; `crates/research-cli/tests/**` (sacred) |
+
 | tester | read-only; `scripts/verify_M-08.sh` на чистом чекауте | правки кода |
 | reviewer | `PROJECT-STATE.md`, `TECH-DEBT.md`, merge + **§8 деплой-гейт (решающий: прод НЕ инертен)** | код |
+
+**carve-out A3 (architect):** `crates/research-cli/src/grid.rs` — ТОЛЬКО сигнатура
+`JournalSource` + `run_grid_streamed(...)` с `todo!()`-телом. Обоснование то же, что A2
+(C-004 C2): RED-оракул невозможно написать против несуществующей сигнатуры, а гейтить
+задачу грепами уже пробовали — критик справедливо это зарубил.
 
 ## §Tasks
 
@@ -77,25 +83,35 @@ M-08 делает сбор **бесконечным по времени** (ро�
 
 ## RED-тесты (sacred, architect-only)
 
-- `crates/contracts/tests/red_rfc02.rs` — `CT-I-6` (schema_version читается ИЗ ФАЙЛА),
-  роундтрип `SegmentHeader`, аддитивность (старый `Event` парсится байт-в-байт).
-- `crates/journal/tests/red_rotation.rs` — ротация: сегменты `NNNNNNNN` по порядку; `seq`
-  сквозной и монотонный через границу сегментов; рестарт писателя не переиспользует `seq`;
-  **события на границе не теряются и не дублируются**.
-- `crates/journal/tests/red_stream_bounded.rs` — **прод-масштаб** (≥64 MiB, counting-allocator,
-  бюджет ≤8 MiB): `stream()` отдаёт все события в бюджете; **анти-плацебо: наивная реализация
-  через `read_all` падает по памяти** (прямой наследник `red_open_bounded.rs`, TD-011).
-- `crates/journal/tests/red_legacy_segment.rs` — CT-RFC02-1: сегмент БЕЗ заголовка (формат
-  прод-файла) читается как schema 1 + вменённый `OwnCapture`; ни одно событие не потеряно.
-- `crates/journal/tests/red_epoch_filter.rs` — CT-RFC02-2/3/4: события нельзя получить, не
-  назвав эпоху; `Vendor`/`Synthetic` не попадают в выборку по умолчанию.
-- `crates/journal/tests/red_retention.rs` — E3/E4: (а) удалить невыгруженный сегмент
-  невозможно (типовой барьер); (б) свободное место < порога → запись останавливается ЯВНО
-  (`Sys`-событие + Err), а не «пишет, пока не умрёт».
-- `crates/recorder/tests/red_rss_bounded.rs` — E7: длительный прогон writer-петли в бюджете
-  памяти; **анти-плацебо: накапливающий буфер/лог падает**.
-- `crates/research-cli/tests/red_stream_grid.rs` — E5/E8: грид на большом журнале в бюджете
-  памяти; gap-статистика считает разрывы; смешение эпох без явного фильтра невозможно.
+- `crates/contracts/tests/red_rfc02.rs` — CT-RFC-02: `schema_version` = 2; роундтрип
+  `SegmentHeader`; **вменённый legacy-заголовок НАЗЫВАЕТ эпоху** (`OwnCapture`, не пусто);
+  `Event` wire-формат НЕ изменён (CT-I-3); **дискриминанты `DataSource` стабильны**
+  (сдвиг превратил бы наш захват в вендорские данные при чтении старых сегментов).
+- `crates/journal/tests/red_rotation.rs` — E2/CT-I-6: несколько сегментов; индексы без дыр;
+  **заголовок в КАЖДОМ сегменте**; `seq` сквозной через границы (ни потерь, ни дублей);
+  рестарт писателя не переиспользует `seq`.
+- `crates/journal/tests/red_stream_bounded.rs` — **E5, ПРОД-МАСШТАБ** (16/64 MiB, counting-
+  allocator): стрим отдаёт все события по порядку; пик < 8 MiB; **память O(1) по размеру
+  журнала** (ловит и `read_all`, и «читаем долю файла» — на 8.3 GB доля снова убьёт машину).
+  Анти-плацебо: контрольное полное чтение сегмента обязано превышать бюджет.
+- `crates/journal/tests/red_segments_epochs.rs` — CT-RFC02-1..4: боевой сегмент БЕЗ заголовка
+  (байт-в-байт формат VPS) читается вечно с вменённой эпохой; **дефолт `OwnCaptureOnly`
+  исключает `Vendor`/`Synthetic`** (наивное «читаем все сегменты каталога» падает);
+  смешение эпох — только явным перечислением; `headers()` доносит provenance до отчёта.
+- `crates/journal/tests/red_retention.rs` — E3/E4: **disk-guard fail-closed** (мало места →
+  `append` → `Err`, а не тихая смерть); `free_bytes` — реальное место, не заглушка;
+  **`prune_segment` требует `ColdCopyProof`** (приватный конструктор → «удалить невыгруженное»
+  нельзя ВЫРАЗИТЬ; `compile_fail`-доктест); **битая холодная копия → сверка Err, proof не
+  выдан, сегмент остаётся на диске**.
+- `crates/research-cli/tests/red_stream_grid.rs` — E5: грид на журнале, который не влезает
+  в бюджет как `Vec<Event>`, отрабатывает bounded-memory; **ЭКВИВАЛЕНТНОСТЬ**: стрим-грид
+  даёт РОВНО те же `CellResult` (PnL до цента, интенты, филлы, длина returns), что in-memory
+  `run_grid` — «оптимизация» не смеет тихо изменить измеряемую логику (урок M-07).
+
+**Bounded-RSS recorder'а (E7)** покрывается тем же counting-allocator оракулом на writer-пути
+(`red_stream_bounded` + `red_rotation` гоняют десятки тысяч `append` через ротацию) плюс §8
+eyes-on на VPS (RSS после суток аптайма). Отдельный recorder-оракул заводится, ЕСЛИ §8 покажет
+рост — сейчас лик не доказан (одна точка 48 MiB), а тест на «5 часов аптайма» в CI не живёт.
 
 ## Acceptance
 
