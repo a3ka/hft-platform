@@ -9,6 +9,13 @@ name: Deploy to VPS
 #  3) HUMAN-GATE на деплой добавляется на P4 (live-торговля): раскомментировать `environment:
 #     production` + настроить Required reviewers. Сейчас (recorder/testnet, без денег) не нужен.
 
+# TD-018 (2026-07-14): gate-job зовёт `gh api .../actions/runs` — без явных permissions
+# у GITHUB_TOKEN нет `actions: read` → 403 → гейт fail-closed НИКОГДА не пропустит деплой
+# (прод замораживается при зелёном CI). Права выданы минимальные: только чтение.
+permissions:
+  actions: read
+  contents: read
+
 on:
   push:
     branches: [main]
