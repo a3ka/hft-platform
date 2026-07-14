@@ -2,10 +2,15 @@
 //! Тонкая обвязка над `research_cli` библиотекой; сам CLI не покрыт RED-suite'ом
 //! (sacred-тесты бьют по библиотечным функциям напрямую) — важна работоспособность
 //! и компилируемость (milestone M-04 task 4).
+//!
+//! M-08 E5/E6 (задача 5): CLI-`grid` ходит в журнал через `journal::stream` +
+//! `EpochFilter::OwnCaptureOnly`. На боевых 8.3 GB старый путь с материализацией
+//! в `Vec<Event>` OOM-нул бы машину (класс TD-011).
 
 use std::path::{Path, PathBuf};
 
-use research_cli::grid::{run_grid, GridRunEnv};
+use journal::EpochFilter;
+use research_cli::grid::{run_grid_streamed, GridRunEnv, JournalSource};
 use research_cli::ledger::Ledger;
 use research_cli::report::{
     journal_sha256, require_preregistration, write_metrics_json, write_narrative_md,
@@ -51,9 +56,17 @@ fn cmd_grid(args: &[String]) -> Result<(), String> {
         other => return Err(format!("неизвестный --split {other}")),
     };
 
-    let events = journal::read_all(&journal_dir).map_err(|e| e.to_string())?;
     let spec_raw = std::fs::read_to_string(&spec_path).map_err(|e| e.to_string())?;
     let spec: GridSpec = serde_json::from_str(&spec_raw).map_err(|e| e.to_string())?;
+
+    // M-08 E5/E6: прод-путь чтения — `journal::stream` + ЯВНО названный EpochFilter.
+    // CLI по умолчанию использует `OwnCaptureOnly`: vendor/синтетика в обучение по
+    // умолчанию НЕ попадают (CT-RFC02-3/4). Осознанное смешение эпох — через
+    // программный API с `EpochFilter::Explicit(...)`.
+    let source = JournalSource {
+        dir: PathBuf::from(&journal_dir),
+        filter: EpochFilter::OwnCaptureOnly,
+    };
 
     let mut latency = LatencyTable::new();
     if let Some(p) = flag(args, "--latency") {
@@ -74,7 +87,7 @@ fn cmd_grid(args: &[String]) -> Result<(), String> {
         fees: &fees,
     };
 
-    let results = run_grid(&events, &spec, split, (from, to), &mut env, None)
+    let results = run_grid_streamed(&source, &spec, split, (from, to), &mut env, None)
         .map_err(|e| format!("{e:?}"))?;
 
     println!(

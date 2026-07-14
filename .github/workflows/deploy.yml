@@ -22,9 +22,42 @@ on:
   workflow_dispatch:
 
 jobs:
+  # M-08 E9 (находка reviewer'а 2026-07-13): Deploy зеленел, ПОКА CI ЕЩЁ ШЁЛ — красный CI
+  # не останавливал выкатку в прод. `needs:` между workflow'ами не работает, поэтому гейт
+  # явный: ждём терминальный статус CI по ЭТОМУ ЖЕ SHA. Fail-closed: красный CI, отмена
+  # или таймаут → деплой НЕ идёт (прод дороже скорости выкатки).
+  ci:
+    name: Gate on CI (fail-closed)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wait for CI success on this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 80); do   # 80 × 15s = 20 мин потолок
+            run=$(gh api "repos/${REPO}/actions/runs?head_sha=${SHA}" \
+                    --jq '[.workflow_runs[] | select(.name=="CI")] | sort_by(.created_at) | last')
+            status=$(echo "${run}" | jq -r '.status // "missing"')
+            conclusion=$(echo "${run}" | jq -r '.conclusion // "null"')
+            echo "attempt ${i}: CI status=${status} conclusion=${conclusion}"
+            if [ "${status}" = "completed" ]; then
+              if [ "${conclusion}" = "success" ]; then
+                echo "CI зелёный — деплой разрешён"; exit 0
+              fi
+              echo "CI НЕ зелёный (${conclusion}) — деплой заблокирован"; exit 1
+            fi
+            sleep 15
+          done
+          echo "CI не дошёл до терминального статуса за 20 мин — деплой заблокирован (fail-closed)"
+          exit 1
+
   deploy:
     name: Deploy (build on VPS)
     runs-on: ubuntu-latest
+    needs: ci
     # environment: production   # ← P4: включить + Required reviewers для live-торговли
     steps:
       - name: Deploy via SSH
@@ -35,10 +68,14 @@ jobs:
           key: ${{ secrets.VPS_SSH_KEY }}
           command_timeout: 15m
           script: |
-            set -uo pipefail
+            # M-08 M6 (C-005): было `set -uo pipefail` — без -e упавший git fetch/reset НЕ
+            # останавливал скрипт, и docker собирался на СТАРОМ чекауте (тихий фантомный
+            # деплой: workflow зелёный, на VPS — прежний код). Fail-closed:
+            set -euo pipefail
             cd /root/hft-platform
             PREV=$(git rev-parse HEAD)
-            git fetch -q origin main && git reset --hard -q origin/main
+            git fetch -q origin main
+            git reset --hard -q origin/main
             echo "=== deploy $(git rev-parse --short HEAD) (prev $(git rev-parse --short "$PREV")) ==="
             if docker compose up -d --build recorder \
                && timeout 300 sh -c 'until [ "$(docker inspect -f "{{.State.Health.Status}}" hft-recorder 2>/dev/null)" = healthy ]; do sleep 5; done'; then

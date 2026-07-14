@@ -15,7 +15,8 @@ use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -31,29 +32,38 @@ const MAX_REL_DIST: f64 = 0.60;
 /// Период эмиссии bounded L2Snapshot per symbol.
 const EMIT_PERIOD: Duration = Duration::from_secs(1);
 
+/// Аварийный backstop числа уровней на сторону (контракт эвикции v2, architect, после C1).
+///
+/// **Не рабочий инструмент, а страховка от OOM.** Рабочая граница — ДИСТАНЦИЯ: уровни дальше
+/// `MAX_REL_DIST` (±60%) от mid КНИГИ не эмитятся и ни в один расчёт не входят → эвиктятся
+/// безопасно. Всё, что ВНУТРИ окна, входит в суммы полос OBI — резать его нельзя.
+/// Срабатывание этого капа = ТРЕВОГА (данные подозрительны), а не штатный режим;
+/// эвиктится САМОЕ ДАЛЬНЕЕ от mid, топ книги не трогается.
+pub const BACKSTOP_LEVELS_PER_SIDE: usize = 50_000;
+
 /// Локальная копия полного стакана одного символа. price/size — fixed-point ×1e8
 /// (per `contracts::PRICE_SCALE`), ключ `BTreeMap` — цена, что даёт бесплатную
 /// сортировку + O(log n) upsert/remove на diff-апдейте.
-struct OrderBook {
-    bids: BTreeMap<i64, i64>,
-    asks: BTreeMap<i64, i64>,
-    last_update_id: u64,
+pub struct OrderBook {
+    pub bids: BTreeMap<i64, i64>,
+    pub asks: BTreeMap<i64, i64>,
+    pub last_update_id: u64,
     /// Биржевое время (`E`) последнего применённого WS diff-апдейта, мс since epoch.
     /// `0` означает "ещё ни один diff не применялся" (только REST-бутстрап) — книга
     /// в этом состоянии не несёт биржевого времени и НЕ эмитится в `emit_book_snapshots`.
-    last_event_time_ms: i64,
+    pub last_event_time_ms: i64,
 }
 
 /// Один WS `@depth@100ms` diff-апдейт после парсинга. `u_first`/`u_final` — `U`/`u` из
 /// payload Binance. size==0 в уровне означает "удалить уровень" (per Binance diff-sync
 /// docs), это разворачивается в `apply_diff_to_book`. `event_time_ms` — биржевое время
 /// `E` из payload (0, если отсутствует — не паникуем, не подставляем now()).
-struct DepthDiff {
-    event_time_ms: i64,
-    u_first: u64,
-    u_final: u64,
-    bids: Vec<(i64, i64)>,
-    asks: Vec<(i64, i64)>,
+pub struct DepthDiff {
+    pub event_time_ms: i64,
+    pub u_first: u64,
+    pub u_final: u64,
+    pub bids: Vec<(i64, i64)>,
+    pub asks: Vec<(i64, i64)>,
 }
 
 /// Состояние sync-конечного-автомата одного символа.
@@ -303,7 +313,29 @@ fn parse_diff_levels(levels: &serde_json::Value) -> Option<Vec<(i64, i64)>> {
 
 /// Применить один diff (уже проверенный на непрерывность вызывающим) к книге:
 /// upsert/remove по уровням, `last_update_id = diff.u_final`.
-fn apply_diff_to_book(book: &mut OrderBook, diff: &DepthDiff) {
+///
+/// **Контракт эвикции v2 (M-08 task 9b, после C1-блокера PR-гейта):**
+///
+/// **A. Дифф — не источник истины о том, чего в нём НЕТ.** `@depth@100ms` содержит
+///    ТОЛЬКО изменившиеся уровни. Если лучший bid не менялся в окне 100 мс (штатная
+///    ситуация) — в диффе его просто нет, и `retain` по `mid` самого диффа стирает
+///    ЖИВЫЕ уровни, включая лучший bid. Испорченный стакан уходит в `L2Snapshot`
+///    НАВСЕГДА (журнал бессмертен), а RSS/healthcheck остаются зелёными — класс TD-011.
+///    Единственное санкционированное удаление по диффу — явный `size == 0` от биржи.
+///
+/// **B. Граница памяти — ДИСТАНЦИЯ от mid КНИГИ** (best_bid/best_ask ПОСЛЕ применения
+///    диффа). Окно — `MAX_REL_DIST` (±60%, то же, что у эмиссии в `bucket_levels`).
+///    Уровни ВНЕ окна эвиктятся: они не эмитятся и ни в один расчёт не входят.
+///    Уровни ВНУТРИ окна НЕ ТРОГАЮТСЯ: они входят в суммы полос OBI; резать внутри
+///    = портить и сигнал, и первичные данные.
+///
+/// **C. `BACKSTOP_LEVELS_PER_SIDE` = 50_000 — аварийный кап от OOM** (контракт
+///    эвикции v2, architect). Если после (B) уровней всё равно больше капа — эвиктится
+///    САМОЕ ДАЛЬНЕЕ от mid (top книги не трогается), и логируется `tracing::warn`
+///    (срабатывание = «данные подозрительны»; ожидаемый фикс — M-09, инкрементальные
+///    bucket-агрегаты вместо сырой книги). Это НЕ рабочий инструмент, а страховка.
+pub fn apply_diff_to_book(book: &mut OrderBook, diff: &DepthDiff) {
+    // A: только size==0 удаляет уровень; всё остальное — upsert.
     for (price, size) in &diff.bids {
         if *size == 0 {
             book.bids.remove(price);
@@ -320,6 +352,104 @@ fn apply_diff_to_book(book: &mut OrderBook, diff: &DepthDiff) {
     }
     book.last_update_id = diff.u_final;
     book.last_event_time_ms = diff.event_time_ms;
+
+    // B: mid КНИГИ (после применения диффа).
+    let mid: i64 = match (book.bids.iter().next_back(), book.asks.iter().next()) {
+        (Some((bb, _)), Some((ba, _))) => (bb + ba) / 2,
+        _ => 0,
+    };
+
+    if mid > 0 {
+        // Окно эвикции — ±MAX_REL_DIST от mid КНИГИ. Уровни, чей |price − mid| > max_dist,
+        // НЕ эмитятся и НИГДЕ не считаются → безопасно эвиктятся. Уровни внутри окна
+        // входят в суммы полос OBI — НЕ ТРОГАЕМ. Используем .abs() симметрично по обеим
+        // сторонам: артефакты crossed-state (bid выше mid / ask ниже mid) эвиктятся как
+        // «далёкие» и не отравляют top-of-book.
+        //
+        // Эвикция идёт через `BTreeMap::range(..lo)` + `range((hi+1)..)` — O(log N + K),
+        // где K — число подлежащих удалению. В steady-state (mid дрейфует медленно,
+        // большинство уровней внутри окна) K=0 → один bound-check на сторону, ~20 нс.
+        // `retain` был бы O(N) даже когда ничего не удаляется, что на 50k уровнях делает
+        // бенчмарк `td016_memory_bounded_when_price_drifts_out_of_band` (200k итераций)
+        // непрактично медленным. Семантика идентична.
+        let max_dist = (mid as f64 * MAX_REL_DIST) as i64;
+        let lo = mid.saturating_sub(max_dist);
+        let hi = mid.saturating_add(max_dist);
+        evict_outside_window(&mut book.bids, lo, hi);
+        evict_outside_window(&mut book.asks, lo, hi);
+    }
+
+    // C: backstop-кап — аварийный от OOM, эвиктит самые дальние от mid.
+    evict_backstop(&mut book.bids, mid, /*is_bids=*/ true);
+    evict_backstop(&mut book.asks, mid, /*is_bids=*/ false);
+}
+
+/// Эвиктировать из `side` уровни с ценами вне окна `[lo, hi]`. Использует
+/// `BTreeMap::range(..lo)` и `range((hi+1)..)` — O(log N + K) суммарно вместо O(N)
+/// у `retain`. Семантика: keys < lo удаляются, keys > hi удаляются, keys ∈ [lo, hi]
+/// сохраняются (включая границы).
+fn evict_outside_window(side: &mut BTreeMap<i64, i64>, lo: i64, hi: i64) {
+    let below: Vec<i64> = side.range(..lo).map(|(k, _)| *k).collect();
+    for k in below {
+        side.remove(&k);
+    }
+    // `hi + 1` через saturating_add: при hi == i64::MAX возвращаем i64::MAX (диапазон
+    // [i64::MAX, ∞) включает только key == i64::MAX — на практике пусто).
+    let hi_next = hi.saturating_add(1);
+    let above: Vec<i64> = side.range(hi_next..).map(|(k, _)| *k).collect();
+    for k in above {
+        side.remove(&k);
+    }
+}
+
+/// Backstop-кап (контракт v2, architect): если после эвикции по дистанции уровней всё
+/// равно больше `BACKSTOP_LEVELS_PER_SIDE`, эвиктим САМОЕ ДАЛЬНЕЕ от mid (top книги не
+/// трогается), и логируем `tracing::warn` — срабатывание = «данные подозрительны».
+///
+/// BTreeMap хранит ключи (цены) по возрастанию. На стороне bids ключи лежат ниже mid,
+/// на стороне asks — выше mid. «Самое дальнее от mid» для bids = наименьший ключ
+/// (`pop_first`), для asks = наибольший (`pop_last`). Без mid (одна сторона книги)
+/// эвиктим с произвольного конца: top охраняется неявно тем, что мы эвиктим ровно
+/// `len − BACKSTOP_LEVELS_PER_SIDE` уровней с одного конца, а не середину.
+fn evict_backstop(side: &mut BTreeMap<i64, i64>, mid: i64, is_bids: bool) {
+    if side.len() <= BACKSTOP_LEVELS_PER_SIDE {
+        return;
+    }
+    let count = side.len();
+    tracing::warn!(
+        side = if is_bids { "bids" } else { "asks" },
+        levels = count,
+        cap = BACKSTOP_LEVELS_PER_SIDE,
+        "venue-binance: backstop cap triggered — book exceeds in-band cap after distance \
+         eviction; evicting furthest from mid (data suspicious; expected fix: M-09 \
+         incremental bucket-aggregates instead of raw book)"
+    );
+    let to_drop = side.len() - BACKSTOP_LEVELS_PER_SIDE;
+    if mid > 0 {
+        if is_bids {
+            // bids: ключи < mid, pop_first = наименьший = самый дальний от mid (снизу).
+            for _ in 0..to_drop {
+                if side.pop_first().is_none() {
+                    break;
+                }
+            }
+        } else {
+            // asks: ключи > mid, pop_last = наибольший = самый дальний от mid (сверху).
+            for _ in 0..to_drop {
+                if side.pop_last().is_none() {
+                    break;
+                }
+            }
+        }
+    } else {
+        // Без mid (одна сторона книги / пусто) — эвиктим с наименьшего ключа. Симметрия
+        // теряется, но это теоретический путь (прод-WS `@depth` всегда даёт обе стороны).
+        for _ in 0..to_drop {
+            if side.pop_first().is_none() {
+                break;
+            }
+        }
+    }
 }
 
 /// Прогнать входящий diff через sync-автомат символа per Binance snapshot+diff-sync
@@ -489,6 +619,33 @@ fn make_snapshot_future(client: reqwest::Client, symbol: String) -> SnapshotFutu
     })
 }
 
+/// Минимальный интервал между per-(venue,symbol) логами числа уровней (контракт
+/// эвикции v2, наблюдаемость §D: "не реже 1/мин"). Глобальный статик rate-limit'а по
+/// символу — защита от log-storm на каждом тике `emit_interval` (1 Гц).
+const LEVELS_LOG_PERIOD: Duration = Duration::from_secs(60);
+
+/// Last-log-timestamp per symbol. Static Mutex — не лучший паттерн в проде, но для
+/// диагностической метрики (не критический путь) приемлемо; частота мутаций — 1/мин на
+/// символ, contention на Mutex минимальный.
+static LAST_LEVELS_LOG: std::sync::LazyLock<Mutex<HashMap<String, Instant>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Наблюдаемость TD-016: периодический (≥ 1/мин) `tracing::info` с числом уровней per
+/// (venue,symbol). Вызывается из `emit_book_snapshots` (раз в `EMIT_PERIOD` = 1 Гц);
+/// фактически логирует ровно 1/мин на символ благодаря rate-limit'у.
+fn maybe_log_book_levels(symbol: &str, bids: usize, asks: usize) {
+    let mut map = LAST_LEVELS_LOG.lock().expect("levels-log mutex poisoned");
+    let now = Instant::now();
+    let should_log = map
+        .get(symbol)
+        .map(|t| now.duration_since(*t) >= LEVELS_LOG_PERIOD)
+        .unwrap_or(true);
+    if should_log {
+        tracing::info!(symbol, bids, asks, "book levels");
+        map.insert(symbol.to_string(), now);
+    }
+}
+
 /// Эмитировать по одному `L2Snapshot` на синхронизированный символ: полный стакан сжат в
 /// 0.02%-от-mid бакеты, обрезан на ±60% от mid. Возвращает `false`, если `tx` закрыт.
 async fn emit_book_snapshots(
@@ -499,6 +656,13 @@ async fn emit_book_snapshots(
         let Some(book) = &state.book else {
             continue;
         };
+
+        // D (контракт эвикции v2): наблюдаемость per (venue,symbol) — число in-band
+        // уровней логируется не реже 1/мин. §8 обязан измерять УРОВНИ, а не только RSS:
+        // атрибуция лика TD-016 к книге сделана по коду и на проде НЕ доказана; без этого
+        // метрика не отделить лик книги от лика HL-адаптера / tracing-буферов.
+        maybe_log_book_levels(symbol, book.bids.len(), book.asks.len());
+
         // Биржевое время последнего применённого diff'а. Символ, синхронизированный
         // ТОЛЬКО через REST-бутстрап (ни одного WS diff ещё не применялось), биржевого
         // времени не несёт — не выдумываем его через now_ms(), просто не эмитим символ.

@@ -17,7 +17,8 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use contracts::{EventKind, MdPayload, Venue};
+use contracts::{Event, EventKind, MdPayload, Venue};
+use journal::EpochFilter;
 use sim::{FeeSchedule, LatencyTable};
 
 /// Максимум delta_md-сэмплов на инструмент (равномерная подвыборка сверх этого).
@@ -80,28 +81,39 @@ fn main() {
         .map(PathBuf::from)
         .unwrap_or_else(|| root.join("research/fees"));
 
-    let events = match journal::read_all(&journal_dir) {
-        Ok(e) => e,
+    // M-08 E5/E6: прод-путь чтения — `journal::stream` + ЯВНО названный EpochFilter.
+    // На боевых 8.3 GB материализация событий в RAM OOM-нула бы машину (класс TD-011).
+    // Здесь latency-пробе нужны ТОЛЬКО `OwnCapture` — vendor/синтетика не участвуют
+    // в методике (CT-RFC02-3/4).
+    let mut stream = match journal::stream(&journal_dir, EpochFilter::OwnCaptureOnly) {
+        Ok(s) => s,
         Err(e) => {
-            eprintln!("error: чтение журнала {}: {e}", journal_dir.display());
+            eprintln!(
+                "error: открытие стрима журнала {}: {e}",
+                journal_dir.display()
+            );
             std::process::exit(1);
         }
     };
-    let total_events = events.len();
-    println!(
-        "journal: {} — {} событий",
-        journal_dir.display(),
-        total_events
-    );
 
-    // delta_md по (venue, symbol) — BTreeMap для детерминированного порядка вывода.
-    // missing_ts: события с ts_exch_ms<=0 (биржевая метка ОТСУТСТВУЕТ — например,
-    // потоки без event-time) — это НЕ замер латентности (delta был бы полной
-    // эпохой wall-clock, ~56 лет, и отравил бы inverse-CDF sim'а) → исключаются
-    // и считаются отдельно; методика зафиксирована в provenance.
+    // Два прохода не нужны: в первом же проходе считаем total и собираем сэмплы.
+    // Стрим одноразовый — rewind'а нет, поэтому накапливаем счётчик локально.
+    let mut total_events: u64 = 0;
     let mut md_samples: BTreeMap<(String, String), Vec<u64>> = BTreeMap::new();
     let mut missing_ts: BTreeMap<(String, String, &'static str), usize> = BTreeMap::new();
-    for ev in &events {
+    let mut first_error: Option<String> = None;
+    loop {
+        let ev: Event = match stream.next() {
+            Some(Ok(ev)) => ev,
+            Some(Err(e)) => {
+                if first_error.is_none() {
+                    first_error = Some(format!("{e}"));
+                }
+                break;
+            }
+            None => break,
+        };
+        total_events += 1;
         let EventKind::Md(md) = &ev.kind else {
             continue;
         };
@@ -124,6 +136,18 @@ fn main() {
         let delta_ns = (ev.ts_wall_ms - ts_exch_ms).max(0) as u64 * 1_000_000;
         md_samples.entry(key).or_default().push(delta_ns);
     }
+
+    if let Some(err) = first_error {
+        eprintln!(
+            "error: чтение стрима {} прервано после {total_events} событий: {err}",
+            journal_dir.display()
+        );
+        std::process::exit(1);
+    }
+    println!(
+        "journal: {} — {total_events} событий",
+        journal_dir.display()
+    );
 
     for ((venue, symbol, kind), n) in &missing_ts {
         println!("skipped (ts_exch_ms<=0, не замер): {venue} {symbol} {kind} — {n} событий");

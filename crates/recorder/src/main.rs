@@ -14,10 +14,11 @@
 
 use std::future::Future;
 use std::path::PathBuf;
+use std::process::Command;
 use std::time::Duration;
 
 use contracts::{EventKind, SysEvent, Venue};
-use journal::Journal;
+use journal::{Journal, WriterConfig};
 use tokio::sync::mpsc;
 
 fn env_csv(key: &str, default: &[&str]) -> Vec<String> {
@@ -146,10 +147,141 @@ async fn main() -> anyhow::Result<()> {
     }
     drop(tx); // writer завершится, только если все продюсеры уйдут (в норме не уходят).
 
-    // Единственный писатель — журнал в этой задаче.
-    let journal = Journal::open(&dir)?;
+    // === M-08 task 4: писать заголовок сегмента (CT-RFC-02, E2/E4) ===
+    //
+    // Каждый НОВЫЙ сегмент открывается заголовком SegmentHeader с provenance =
+    // версия recorder'а + git sha + epoch_id. Ротация — внутри `Journal::append()`
+    // (порог из `WriterConfig::max_segment_bytes`), disk-guard — там же.
+    // Миграция с `Journal::open()` на `open_with()` ОДНА запись = ОДИН коммит; на этой
+    // неделе прод-сегмент (8.3 GB, без магии) будет прочитан legacy-путём через
+    // явную декларацию `journal.legacy.json` (CT-RFC-02 rev 2, fail-closed).
+    let cfg = build_writer_config();
+    tracing::info!(
+        max_segment_bytes = cfg.max_segment_bytes,
+        min_free_bytes = cfg.min_free_bytes,
+        provenance = %cfg.provenance,
+        epoch_id = %cfg.epoch_id,
+        "writer config",
+    );
+    let journal = Journal::open_with(&dir, cfg)?;
     let hb_path = dir.join("recorder.heartbeat");
 
     recorder::run_writer(rx, journal, hb_path, shutdown_signal()).await?;
     Ok(())
+}
+
+/// Собрать `WriterConfig` для recorder'а: собственный захват, порог 1 GiB/сегмент,
+/// 10 GiB disk-guard, provenance = версия recorder'а + короткий git SHA (если доступен).
+fn build_writer_config() -> WriterConfig {
+    let version = env!("CARGO_PKG_VERSION");
+    let git_sha = git_short_sha().unwrap_or_else(|| "no-git-info".to_string());
+    let provenance = format!("recorder v{version} (git:{git_sha})");
+    // epoch_id — стабильный ключ эпохи. По умолчанию: "own-<UTC-YYYY-MM>". Оператор
+    // может переопределить через env (прод-развёртывание с известным epoch_id).
+    let epoch_id = std::env::var("EPOCH_ID").unwrap_or_else(|_| default_epoch_id_now());
+    WriterConfig::own_capture(provenance, epoch_id)
+}
+
+/// Короткий git SHA текущего HEAD (если рабочая копия — git-репо). Иначе `None`.
+/// `git rev-parse --short HEAD` вызывается синхронно на старте recorder'а (раз в процесс).
+fn git_short_sha() -> Option<String> {
+    let out = Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8(out.stdout).ok()?;
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// `own-<UTC-YYYY-MM>` из текущего времени (дефолт для дев-сборки без явного `EPOCH_ID`).
+fn default_epoch_id_now() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let secs_per_day = 86_400u64;
+    // Unix epoch → 1970-01-01. Грубый расчёт year-month (UTC, без leap-секунд) — достаточно
+    // для группировки эпох по месяцу; точный разбор chrono — за рамками M-08.
+    let days = now / secs_per_day;
+    let (y, m) = days_to_ym(days);
+    format!("own-{y:04}-{m:02}")
+}
+
+/// Дни → (year, month_utc) без chrono. Алгоритм: 400-летний Gregorian cycle.
+fn days_to_ym(days_since_1970: u64) -> (i32, u32) {
+    let mut z = days_since_1970 as i64;
+    let mut year = 1970i32;
+    loop {
+        let leap = is_leap(year);
+        let year_days = if leap { 366 } else { 365 };
+        if z < year_days {
+            break;
+        }
+        z -= year_days;
+        year += 1;
+    }
+    let leap = is_leap(year);
+    let months = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    let mut month = 1u32;
+    for &dm in &months {
+        if z < dm {
+            break;
+        }
+        z -= dm;
+        month += 1;
+    }
+    (year, month)
+}
+
+fn is_leap(y: i32) -> bool {
+    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn days_to_ym_epoch() {
+        assert_eq!(days_to_ym(0), (1970, 1));
+    }
+
+    #[test]
+    fn days_to_ym_one_year_later() {
+        // 1971-01-01 = day 365
+        assert_eq!(days_to_ym(365), (1971, 1));
+    }
+
+    #[test]
+    fn days_to_ym_leap_year() {
+        // 2000-02-29 = day 11015 (29 Feb 2000)
+        // 1970-01-01 ... 2000-02-29 = 30 лет + 60 дней в феврале 2000
+        // Approximate day: 30*365 + 7 (leap) = 10957 дней до 2000-01-01, + 31 (янв) + 28 (фев до 29) = 11016
+        // Точное: 2000-02-29 = day 11016 в предположении что 1970-01-01 это день 0.
+        let (y, m) = days_to_ym(11016);
+        assert_eq!(y, 2000);
+        assert_eq!(m, 2);
+    }
 }

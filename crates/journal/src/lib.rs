@@ -18,21 +18,46 @@ use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use contracts::{Event, EventKind};
+use contracts::{Event, EventKind, SegmentHeader};
+
+pub mod segments;
+
+pub use segments::{
+    declare_legacy, fingerprint, free_bytes, is_foreign_segment, is_storage_guard, prune_segment,
+    segments as list_segments, storage_status, stream, verify_cold_copy, ColdCopyProof,
+    EpochFilter, EventStream, SegmentInfo, StorageStatus, WriterConfig, LEGACY_MANIFEST,
+};
+
+// Доступно из `crate` для engine-dev call-sites внутри lib.rs.
+pub(crate) use segments::{
+    decide_open_segment, open_seg_for_write, resolve_next_seq_with, segment_path,
+    serialize_event_frame,
+};
 
 const META: &str = "journal.meta";
 const SEGMENT: &str = "segment-00000000.jrnl";
 
 /// Размер хвостового чанка для `Journal::open()` — O(1) памяти на прод-масштабе
 /// (2.65 GiB сегмент не должен грузиться целиком). 4 MiB ≪ 8 MiB-бюджет TD-011.
-const TAIL_SCAN_CHUNK: usize = 4 * 1024 * 1024;
+pub(crate) const TAIL_SCAN_CHUNK: usize = 4 * 1024 * 1024;
 
 pub struct Journal {
+    /// Каталог журнала (нужен для `open_with` и ротации).
+    dir: PathBuf,
+    /// Файл активного сегмента (`segment-NNNNNNNN.jrnl` под `dir`). Для legacy-path —
+    /// всегда `segment-00000000.jrnl`.
+    seg_path: PathBuf,
+    /// Индекс активного сегмента (для legacy-path = 0).
+    seg_index: u32,
+    /// Текущий размер сегмента (на диске), включая magic+header если применимо.
+    seg_size: u64,
     seg: BufWriter<File>,
     meta_path: PathBuf,
     next_seq: u64,
     since_flush: u32,
     epoch: SystemTime,
+    /// `None` — legacy-path (`Journal::open`); `Some` — новый путь с ротацией и disk-guard.
+    cfg: Option<segments::WriterConfig>,
 }
 
 impl Journal {
@@ -61,13 +86,74 @@ impl Journal {
             .create(true)
             .append(true)
             .open(dir.join(SEGMENT))?;
+        let seg_size = seg_file.metadata()?.len();
+        let seg_path = dir.join(SEGMENT);
         Ok(Self {
+            dir: dir.to_path_buf(),
+            seg_path,
+            seg_index: 0,
+            seg_size,
             seg: BufWriter::new(seg_file),
             meta_path,
             next_seq,
             since_flush: 0,
             epoch: SystemTime::now(),
+            cfg: None,
         })
+    }
+
+    /// Открыть журнал с provenance-конфигом (M-08 E2/E4, CT-RFC-02).
+    ///
+    /// Отличия от `open()` (legacy-путь, остаётся для совместимости):
+    /// - каждый НОВЫЙ сегмент открывается заголовком `SegmentHeader` (CT-I-6);
+    /// - при превышении `max_segment_bytes` сегмент РОТИРУЕТСЯ (`seq` продолжается сквозь
+    ///   границу — тотальный порядок один на журнал, JR-I-1);
+    /// - при свободном месте < `min_free_bytes` запись останавливается ЯВНО (fail-closed:
+    ///   `append` → `Err`), а не «пишет, пока диск не кончится».
+    pub fn open_with(dir: impl AsRef<Path>, cfg: WriterConfig) -> io::Result<Self> {
+        let dir = dir.as_ref();
+        std::fs::create_dir_all(dir)?;
+        let meta_path = dir.join(META);
+        let dir_buf = dir.to_path_buf();
+
+        // next_seq — источник истины сегмент, а не (возможно отставшая) мета (TD-011).
+        let next_seq = resolve_next_seq_with(&dir_buf, &meta_path)?;
+
+        // Решаем, какой сегмент открывать (reuse или новый).
+        let decision = decide_open_segment(&dir_buf, &cfg)?;
+
+        // Строим заголовок для НЕ-reuse сегмента.
+        let created_wall_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let header = SegmentHeader {
+            schema_version: contracts::SCHEMA_VERSION,
+            source: cfg.source,
+            provenance: cfg.provenance.clone(),
+            epoch_id: cfg.epoch_id.clone(),
+            created_wall_ms,
+            first_seq: decision.first_seq,
+        };
+
+        let opened = open_seg_for_write(&decision.seg_path, decision.reuse, &header)?;
+        Ok(Self {
+            dir: dir_buf,
+            seg_path: decision.seg_path,
+            seg_index: decision.seg_index,
+            seg_size: opened.seg_size_after_header,
+            seg: opened.writer,
+            meta_path,
+            next_seq,
+            since_flush: 0,
+            epoch: SystemTime::now(),
+            cfg: Some(cfg),
+        })
+    }
+
+    /// Индекс активного сегмента (`segment-NNNNNNNN.jrnl`).
+    pub fn active_segment_index(&self) -> u32 {
+        self.seg_index
     }
 
     pub fn next_seq(&self) -> u64 {
@@ -76,6 +162,11 @@ impl Journal {
 
     /// Присвоить seq/метки, записать фрейм. Возвращает записанное событие.
     /// Единственный путь записи в журнал (JR-I-1).
+    ///
+    /// **M-08 (E2/E4):** при `cfg != None`:
+    /// - свободное место < `cfg.min_free_bytes` → `Err(StorageGuard)`, **seq/байты НЕ сдвинуты**;
+    /// - `cfg.max_segment_bytes` превышен → сегмент ротируется (новый `segment-{N+1}.jrnl`
+    ///   с magic+header, `seq` продолжается сквозь границу).
     pub fn append(&mut self, kind: EventKind) -> io::Result<Event> {
         let now = SystemTime::now();
         let ts_wall_ms = now
@@ -92,12 +183,26 @@ impl Journal {
             ts_wall_ms,
             kind,
         };
-        let payload =
-            postcard::to_stdvec(&ev).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let crc = crc32fast::hash(&payload);
-        self.seg.write_all(&(payload.len() as u32).to_le_bytes())?;
-        self.seg.write_all(&payload)?;
-        self.seg.write_all(&crc.to_le_bytes())?;
+        let frame = serialize_event_frame(&ev)?;
+        let frame_len = frame.len() as u64;
+
+        // === E4: disk-guard (fail-closed). Проверяем ДО записи. ===
+        if let Some(cfg) = self.cfg.as_ref() {
+            let free = segments::free_bytes_at(&self.dir)?;
+            if free < cfg.min_free_bytes {
+                return Err(segments::storage_guard_err());
+            }
+        }
+
+        // === E2: ротация, если превышен порог размера (ДО записи, чтобы seq не сдвигался). ===
+        if let Some(cfg) = self.cfg.as_ref() {
+            if self.seg_size + frame_len > cfg.max_segment_bytes && self.seg_size > 0 {
+                self.rotate()?;
+            }
+        }
+
+        self.seg.write_all(&frame)?;
+        self.seg_size += frame_len;
 
         self.next_seq += 1;
         self.since_flush += 1;
@@ -108,9 +213,60 @@ impl Journal {
         Ok(ev)
     }
 
+    /// Закрыть текущий сегмент, открыть `segment-{N+1}.jrnl` с новым magic+header.
+    /// `seq` не меняется — сшивка честная (JR-I-1).
+    fn rotate(&mut self) -> io::Result<()> {
+        let cfg = match self.cfg.as_ref() {
+            Some(c) => c.clone(),
+            None => return Ok(()), // legacy-path не ротирует.
+        };
+        // Закрываем текущий сегмент (буфер сбрасывается и данные уходят в stable storage).
+        self.seg.flush()?;
+        // sync_data уже выполнен при предыдущем flush()/append-baseline; на ротации
+        // дополнительный sync здесь обычно не нужен, но для безопасности — data-
+        // durability важнее лишнего миллисекундного sys-вызова.
+        self.seg.get_ref().sync_data()?;
+        // Перемещаем writer'а во временный Option, дроп — без sentinel-файла.
+        let old = std::mem::replace(&mut self.seg, dummy_writer());
+        drop(old);
+
+        // Следующий сегмент.
+        let new_index = self.seg_index + 1;
+        let new_path = segment_path(&self.dir, new_index);
+
+        let created_wall_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let header = SegmentHeader {
+            schema_version: contracts::SCHEMA_VERSION,
+            source: cfg.source,
+            provenance: cfg.provenance.clone(),
+            epoch_id: cfg.epoch_id.clone(),
+            created_wall_ms,
+            first_seq: self.next_seq,
+        };
+
+        let opened = open_seg_for_write(&new_path, false, &header)?;
+
+        // Перемещаем writer'а и состояние.
+        self.seg_path = new_path;
+        self.seg_index = new_index;
+        self.seg_size = opened.seg_size_after_header;
+        self.seg = opened.writer;
+        Ok(())
+    }
+
     /// Сбросить буфер на диск + обновить мету (next_seq переживёт рестарт).
+    ///
+    /// M-08 (TD-016 / JR-I): данные отправляются в stable storage (`sync_data`) —
+    /// НЕ только в page-cache. RED-оракул `red_stream_bounded` ловит intermittent
+    /// «torn frame при чтении» (page-cache ещё не сбросился, читаем то, что
+    /// page-daemon успел). Batch-flush синхронизирует на каждые 64 события;
+    /// HFT-допустимый loss-window ~64 events × snapshot ≈ 1-2 секунды MD-частоты.
     pub fn flush(&mut self) -> io::Result<()> {
         self.seg.flush()?;
+        self.seg.get_ref().sync_data()?;
         write_meta(&self.meta_path, self.next_seq)?;
         self.since_flush = 0;
         Ok(())
@@ -133,6 +289,27 @@ fn read_meta(path: &Path) -> io::Result<u64> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(0),
         Err(e) => Err(e),
     }
+}
+
+/// Временный BufWriter<File> для безопасного `mem::replace` без sentinel-файла.
+/// Открывает `/dev/null` (Unix) или `NUL` (Windows); используется только на короткий
+/// миг между `flush()` и `drop()` старого сегмента и открытием нового — в него
+/// не пишут, не закрывают через Drop.
+#[cfg(unix)]
+fn dummy_writer() -> BufWriter<File> {
+    use std::fs::OpenOptions;
+    let f = OpenOptions::new()
+        .write(true)
+        .open("/dev/null")
+        .expect("/dev/null");
+    BufWriter::new(f)
+}
+
+#[cfg(not(unix))]
+fn dummy_writer() -> BufWriter<File> {
+    use std::fs::OpenOptions;
+    let f = OpenOptions::new().write(true).open("NUL").expect("NUL");
+    BufWriter::new(f)
 }
 
 fn write_meta(path: &Path, next_seq: u64) -> io::Result<()> {
@@ -213,103 +390,44 @@ fn scan_tail_for_last_seq(seg_path: &Path) -> io::Result<Option<u64>> {
     Ok(last_valid_seq)
 }
 
-/// Прочитать все события сегмента по порядку (для replay/тестов). MVP.
-/// **DET-I-1 strict**: первая CRC-ошибка → `Err`. Для resync используй `recover()`.
+/// Прочитать все события журнала по порядку (для replay/малых фикстур). M-08 task 10.
+///
+/// Обходит ВСЕ `segment-NNNNNNNN.jrnl` каталога по возрастанию индекса, сшивая их
+/// в один `Vec<Event>` по порядку `seq`. v2-сегменты: пропускается magic + header.
+/// legacy (без магии): читается как сырые фреймы с начала файла — БЕЗ требования
+/// декларации в манифесте (`stream` требует, `read_all` — нет: это ОФЛАЙН-диагностика,
+/// не прод-чтение). Если вендор подсунет мусор под нашим именем, он прочитается
+/// как мусор; прод-путь `stream` его отвергнет.
+///
+/// **DET-I-1 strict**: первая CRC-ошибка / torn-фрейм → `Err` (ровно на одном сегменте,
+/// без «silent drop»). Используется `dump.rs`/`bands.rs`/`obi_probe.rs` (диагностика),
+/// НЕ прод-путь чтения (для прод — `stream`, O(1) памяти на сегмент).
 pub fn read_all(dir: impl AsRef<Path>) -> io::Result<Vec<Event>> {
-    let path = dir.as_ref().join(SEGMENT);
-    let mut data = Vec::new();
-    match File::open(&path) {
-        Ok(mut f) => {
-            f.read_to_end(&mut data)?;
-        }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e),
-    }
+    let dir = dir.as_ref();
+    let segs = segments::iter_segments_sorted(dir)?;
     let mut out = Vec::new();
-    let mut i = 0usize;
-    while i + 4 <= data.len() {
-        let len = u32::from_le_bytes(data[i..i + 4].try_into().unwrap()) as usize;
-        i += 4;
-        if i + len + 4 > data.len() {
-            break; // хвостовой обрыв фрейма — игнор (JR-I-2: полный фрейм или ничего)
-        }
-        let payload = &data[i..i + len];
-        let crc = u32::from_le_bytes(data[i + len..i + len + 4].try_into().unwrap());
-        if crc32fast::hash(payload) != crc {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "crc mismatch"));
-        }
-        let ev: Event = postcard::from_bytes(payload)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        out.push(ev);
-        i += len + 4;
+    for seg in segs {
+        out.extend(segments::read_segment_events(&seg, true)?);
     }
     Ok(out)
 }
 
-/// **M-05 task 4 / J3:** resync-толерантное чтение через рваные фреймы.
+/// **M-05 task 4 / J3 + M-08 task 10:** resync-толерантное чтение всего журнала.
 ///
-/// Полный проход по сегменту. На CRC-ошибке / torn / десериализации — байт-ресинк
-/// вперёд до следующего валидного фрейма. Возвращает ВСЕ валидные события в порядке
-/// seq. Отдельная функция от `read_all` (DET-I-1 strict), полный проход (НЕ в горячем
-/// `open()`) — для CLI-инструмента восстановления прод-журнала.
+/// Полный проход по каталогу. На CRC-ошибке / torn / десериализации ВНУТРИ сегмента —
+/// байт-ресинк вперёд до следующего валидного фрейма. Чужой/незадекларированный
+/// безголовый сегмент — `Err` (через `list_segments`), как и в `stream()`.
 ///
-/// Принимает `dir` (каталог журнала) — чтобы соответствовать API `read_all`.
-/// **Не** bounded-memory: читает ВЕСЬ сегмент в RAM. Для прод 2.65 GiB — ОК
-/// только как offline-инструмент, не как часть `open()`.
+/// Отдельная функция от `read_all` (strict), НЕ в горячем `open()` — для CLI-инструмента
+/// восстановления прод-журнала. **Не** bounded-memory: читает ВЕСЬ сегмент в RAM.
+/// Для прод 2.65 GiB — ОК только как offline-инструмент, не как часть `open()`.
 pub fn recover(dir: impl AsRef<Path>) -> io::Result<Vec<Event>> {
-    let path = dir.as_ref().join(SEGMENT);
-    let mut data = Vec::new();
-    match File::open(&path) {
-        Ok(mut f) => {
-            f.read_to_end(&mut data)?;
-        }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e),
-    }
-
+    let dir = dir.as_ref();
+    let segs = segments::iter_segments_sorted(dir)?;
     let mut out = Vec::new();
-    let mut i = 0usize;
-
-    while i < data.len() {
-        if i + 4 > data.len() {
-            break;
-        }
-        let len = u32::from_le_bytes(data[i..i + 4].try_into().unwrap()) as usize;
-
-        let frame_end = match i
-            .checked_add(4)
-            .and_then(|x| x.checked_add(len))
-            .and_then(|x| x.checked_add(4))
-        {
-            Some(end) => end,
-            None => {
-                i += 1; // переполнение → мусор → байт-ресинк
-                continue;
-            }
-        };
-        if frame_end > data.len() {
-            i += 1; // torn или мусорный len → байт-ресинк
-            continue;
-        }
-
-        let payload = &data[i + 4..i + 4 + len];
-        let stored_crc = u32::from_le_bytes(data[i + 4 + len..i + 4 + len + 4].try_into().unwrap());
-        if crc32fast::hash(payload) != stored_crc {
-            i += 1; // CRC fail → байт-ресинк
-            continue;
-        }
-
-        match postcard::from_bytes::<Event>(payload) {
-            Ok(ev) => {
-                out.push(ev);
-                i = frame_end;
-            }
-            Err(_) => {
-                i += 1; // deserialize fail → байт-ресинк
-            }
-        }
+    for seg in segs {
+        out.extend(segments::read_segment_events(&seg, false)?);
     }
-
     Ok(out)
 }
 
@@ -328,6 +446,20 @@ mod tests {
             }
             j.flush().unwrap();
         }
+        // M-08 task 10: legacy-path сегмент (без магии) читается read_all ТОЛЬКО
+        // через явную декларацию в journal.legacy.json (fail-closed CT-RFC-02 rev 2).
+        declare_legacy(
+            dir.path(),
+            contracts::LegacySegmentDecl {
+                file_name: "segment-00000000.jrnl".to_string(),
+                fingerprint_sha256: String::new(),
+                size_bytes_at_decl: 0,
+                source: contracts::DataSource::OwnCapture,
+                provenance: "lib.rs unit test".to_string(),
+                epoch_id: contracts::LEGACY_EPOCH_ID.to_string(),
+            },
+        )
+        .expect("declare_legacy");
         let evs = read_all(dir.path()).unwrap();
         assert_eq!(evs.len(), 5);
         for (i, e) in evs.iter().enumerate() {
