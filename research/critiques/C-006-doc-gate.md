@@ -199,6 +199,119 @@ High. I read the audited commits, `gates.md`, `commit-discipline.md`, `branch-hy
 
 ---
 
+## Re-audit (rev 10) - 2026-07-14T21:59Z
+
+**Audited repair range:** `dc85455..323a86b`
+**Expected/audited HEAD:** `323a86b` - `fix(doc-gate): rev9 — проба сама была плацебо (P15 не создавала симлинк)`
+**Worktree:** `/tmp/hft-critic-dg-r10`, detached at `origin/docs/doc-gate` after exact HEAD check.
+
+## Rev 10 Verdict
+
+**REJECT remains.**
+
+The rev9 P15 blocker is closed: P15 now creates an actual symlink, the current 17-case probe passes, and the rev8 barrier fails P14/P15/P16 exactly as expected. The setup guard also fails closed when P15 is deliberately broken.
+
+The remaining blocker is the same placebo class in other advertised scenarios. P7 and P12 can have their merge setup broken and the full probe still prints `VERDICT: PASS (17/17)`. In those cases the suite no longer proves "evil merge" or "artifact born in merge commit"; it proves a different failure path while reporting the intended scenario as covered. `gates.md` §9 now explicitly says setup for every scenario is fail-closed, but that is not true for the merge scenarios.
+
+## Rev 10 Required Execution
+
+- Branch precondition: PASS. `git fetch origin && git rev-parse --short origin/docs/doc-gate` returned `323a86b`.
+- Current RED probe: PASS. `bash scripts/tests/red_protected_artifacts.sh` returned `VERDICT: PASS (17/17)`, `exit=0`.
+- Anti-placebo against rev8 barrier: PASS. `BARRIER=/tmp/rev8.sh bash scripts/tests/red_protected_artifacts.sh` returned `VERDICT: FAIL (3)`, with P14, P15, and P16 failing.
+- P15 deliberate broken-setup check: PASS. Removing the P15 `mkdir -p "$r/research/critiques"` line makes the probe return `exit=1` with:
+
+```text
+FAIL  P15 — SETUP НЕ СОСТОЯЛСЯ: по пути research/critiques/C-001.md режим '<нет>', ожидался 120000.
+VERDICT: FAIL (1)
+```
+
+## Rev 10 Manual Setup-Placebo Checks
+
+**Still broken:**
+
+- P7 (`evil merge`) setup can fail silently. I changed only the merge command to use a nonexistent branch. The script still returned `exit=0` and printed `PASS  P7 ...` plus `VERDICT: PASS (17/17)`. That no longer tests "artifact removed inside a merge commit"; it passes because the barrier denies after history becomes unverifiable / altered by the later amend path.
+- P12 (`artifact born in merge commit`) setup can fail silently. I changed only the `merge --no-commit side3` command to a nonexistent branch. The script still returned `exit=0` and printed `PASS  P12 ...` plus `VERDICT: PASS (17/17)`. That no longer tests merge-born artifact handling; it degenerates to a normal add-delete path.
+- P13 (`artifact arrived by merge and remains alive`) also has the same harness weakness for the false-positive side: breaking the merge command still returned `exit=0` and printed `PASS  P13 ...`, even though no artifact arrived by merge.
+
+**Not observed for P11 under the same simple break:**
+
+- Breaking P11's merge command produced `exit=1` with P11 failing (`exit=0, ожидалось deny`). So P11 is not the current silent-PASS example under that mutation.
+
+## Rev 10 Text / Guarantee Check
+
+- Scenario count: PASS for the stale counter repair. `gates.md` §9 now says 17 scenarios instead of 9.
+- Force-push boundary: PASS. The text still states the in-branch script can fail-closed/detect but cannot prevent force-push; full prevention remains GitHub branch protection / founder scope.
+- New unsupported promise: FAIL. `gates.md` §9 says "setup каждого сценария fail-closed", but only P14/P15/P16 have explicit state assertions. P7/P12/P13 disprove the "each scenario" part by execution.
+
+## Rev 10 Required Repair
+
+1. Make setup fail-closed for the merge scenarios that define the historical blockers:
+   - P7 must assert the commit under test is actually a merge commit and the protected file was removed inside that merge result.
+   - P12 must assert the protected artifact was created in a merge commit before it is deleted.
+   - P13 must assert the protected artifact actually arrived through the merge and remains present.
+2. Ensure command failures during setup are counted as `SETUP НЕ СОСТОЯЛСЯ`, not converted into a different scenario that still satisfies `expect`.
+3. Keep the now-good P14/P15/P16 anti-placebo behavior: rev8 barrier must continue to fail all three.
+4. Do not broaden this repair into founder-priority edits; P2.5, BACKLOG order, and HL-depth fork remain founder ★.
+
+## Rev 10 Confidence
+
+High for REJECT. The rev9 fix closed the symlink placebo, but the same class remains in core merge scenarios that C-006 explicitly introduced after earlier critic findings. A gate whose regression tests can silently stop exercising their named scenario still overstates coverage.
+
+=== HANDOFF: critic -> architect ===
+
+## §A - Metadata
+- UTC datetime: 2026-07-14T21:59Z
+- Gate: C-006 doc-gate, rev10 re-audit
+- Status: REJECT remains
+- HEAD before critic verdict: `323a86b` - `fix(doc-gate): rev9 — проба сама была плацебо (P15 не создавала симлинк)`
+
+## §B - What I Checked
+- Required 17-case RED probe.
+- Anti-placebo against rev8 barrier from `2773e9c`.
+- Deliberate broken P15 setup.
+- Deliberate broken setup for P7, P11, P12, and P13 merge scenarios.
+- `gates.md` §9 counter / force-push boundary / coverage promise.
+
+## §C - Artifacts / Results
+- Updated verdict artifact: `research/critiques/C-006-doc-gate.md`
+- Verdict: REJECT.
+- Closed: P15 symlink setup and rev8 anti-placebo now work.
+- Open blocker: P7/P12/P13 can still silently stop testing their named merge scenarios while the suite reports `PASS (17/17)`.
+
+## §D - Next Agent + Invocation
+- **Next agent:** architect.
+- **Expected HEAD before architect starts:** the pushed rev10 verdict commit containing this section.
+- **Push status:** critic must commit and push this verdict to `origin/docs/doc-gate`.
+- **Paste-ready prompt:**
+  ```
+  Ты — architect. Same C-006 doc-gate loop, rev10 REJECT.
+
+  Expected HEAD: the pushed rev10 critic commit on origin/docs/doc-gate. Run:
+  git fetch origin
+  git rev-parse --short origin/docs/doc-gate
+  If HEAD differs, STOP: prompt stale.
+
+  Read `research/critiques/C-006-doc-gate.md` section "Re-audit (rev 10)".
+  Repair only the remaining blocker: setup fail-closed is still incomplete for
+  merge scenarios. P7 and P12 can have merge setup broken and the suite still
+  reports PASS(17/17); P13 has the same issue on the false-positive merge case.
+
+  Required outcome:
+  - Add setup assertions for P7/P12/P13 so they prove the named merge state happened.
+  - Make setup command failures report `SETUP НЕ СОСТОЯЛСЯ`, not a silent PASS.
+  - Keep rev8 anti-placebo failing P14/P15/P16.
+  - Do not change founder-owned priorities: P2.5, BACKLOG order, and HL-depth fork remain founder ★.
+  ```
+
+## §E - Risks / Open Questions
+- The barrier implementation remains acceptable; the blocker is still the RED probe harness.
+- `gates.md` §9 should not claim every scenario setup is fail-closed until merge scenarios prove it.
+- Founder ★ pending: P2.5 acceptance, BACKLOG queue, HL-depth / first-live-signal fork.
+
+=== END HANDOFF ===
+
+---
+
 ## Re-audit (rev 9) - 2026-07-14T19:16Z
 
 **Audited repair range:** `836036d..764fb78`
