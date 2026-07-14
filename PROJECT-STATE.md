@@ -250,6 +250,69 @@ architect rev3 (RED ST-I-8g/8h) → engine-dev (9) → reviewer APPROVED. Merge:
 - **Прод инертен (T10):** `recorder` не зависит от `alpha`/`portfolio`/`strategy`/`sim` — мозг не
   торгует и не пишет журнал. §8 eyes-on после deploy подтвердил НУЛЕВОЕ изменение поведения recorder'а.
 
+## Data durability (M-08 «сбор не останавливается» + CT-RFC-02 — MERGED на `main` 2026-07-14, reviewer APPROVED; **прод ещё НЕ обновлён — §8 заблокирован TD-018**)
+Merge-коммит `1123b13` (CI success). **ВНИМАНИЕ: `main` ≠ прод.** Автодеплой упал на собственном
+новом CI-гейте (`gh api actions/runs` → HTTP 403, нет `permissions: actions: read`) — TD-018.
+Прод продолжает работать на `656c7ca` (старый recorder, один сегмент 15.0 GB, RSS 139 MiB @ 17 ч).
+Milestone НЕ закрыт: §8 eyes-on (RSS, полосы OBI, новый сегмент, целость legacy) не выполнен.
+
+- `crates/contracts` (**CT-RFC-02**, atomic RFC `docs/rfc/CT-RFC-02-journal-provenance.md`) —
+  `SCHEMA_VERSION` 1→2; provenance живёт в ЗАГОЛОВКЕ СЕГМЕНТА, не в `Event` (при 2.8 GB/сут тег в
+  каждом событии = гигабайты мусора): `SegmentHeader{schema_version, source, provenance, epoch_id,
+  created_wall_ms, first_seq}`, `DataSource{OwnCapture,Vendor,Synthetic}`, `LegacySegmentDecl`/
+  `LegacyManifest`, `SEGMENT_MAGIC = HFTJRN02`. **`Event`/`EventKind` НЕ изменены** (аддитивно,
+  старые журналы читаются навсегда — CT-I-3; в дифе только `derive(JsonSchema)`). Пакет полный:
+  типы + JSON Schema **сгенерированная** (`examples/gen_schema.rs`, сверяется с типами тестом
+  `red_schema`) + фикстуры valid/invalid + `CHANGELOG.md`. Классификация сегментов **fail-closed**
+  (находка critic C-005 C2): магия есть → заголовок ОБЯЗАН разобраться; магии нет → сегмент
+  читается ТОЛЬКО по ЯВНОЙ декларации в `journal.legacy.json` со сверкой отпечатка (sha256 первого
+  MiB + размер). Прежнее «не разобрался → считаем OwnCapture» было fail-open — чужие данные
+  получали наше происхождение.
+- `crates/journal` — **ротация** (`segment-NNNNNNNN.jrnl`, 1 GiB, `seq` сквозной через границы,
+  заголовок в каждом сегменте); **`stream(dir, EpochFilter)`** — bounded-memory итератор (прод-путь
+  research; RED на 16/64 MiB с counting-allocator, пик < 8 MiB — на 15 GB `Vec<Event>` не влезет
+  никогда, класс TD-011 этажом выше); **`EpochFilter`** (дефолт `OwnCaptureOnly` — вендор/синтетика
+  в обучение по умолчанию НЕ попадают); **retention**: `prune_segment` требует `ColdCopyProof` с
+  приватным конструктором → «удалить невыгруженный сегмент» невозможно ВЫРАЗИТЬ (типовой барьер,
+  `compile_fail`-доктест), битая холодная копия → proof не выдан; **disk-guard fail-closed**
+  (свободно < `min_free_bytes` → `append` → `Err`, ни байта и ни одного `seq`; `storage_status()
+  .writable=false` в heartbeat; `Sys`-событие в журнал НЕ пишется — писать в журнал в момент,
+  когда запись запрещена, самопротиворечиво).
+- **Задача 10 (МИНА, поймана architect'ом при разборе SVR):** `read_all`/`recover` были
+  захардкожены на `segment-00000000.jrnl` и парсили магию v2 как len-поле → на новом журнале
+  **молча вернули бы 0 событий**, а их зовут `book/examples/{bands,obi_probe}.rs` — вся диагностика
+  полос OBI. Исправлено: обход ВСЕХ сегментов, понимание v2 + legacy wire-формата. Остаются
+  ОФЛАЙН-диагностикой с мягкой классификацией; барьер **T11e** (verify) запрещает звать их из
+  любых `crates/*/src` кроме `journal` — прод и research ходят ТОЛЬКО через `stream` с явным
+  `EpochFilter`. Reviewer проверил фактически: новый `recover` читает боевой legacy-хвост
+  (14 119 событий из 40 MiB хвоста прод-сегмента).
+- `crates/recorder` — пишет заголовок сегмента (provenance = версия recorder'а + git sha, эпоха
+  `own-YYYY-MM`), переживает ротацию без потери/дублей `seq`. **Прод-миграция под тестом (T7c)**:
+  recorder СТАРТУЕТ на каталоге с НЕзадекларированным боевым сегментом (запись не зависит от
+  декларации — деплой не может остановить сбор), пишет в НОВЫЙ `segment-00000001.jrnl`, старый
+  сегмент байт-в-байт нетронут (дописывать в безголовый запрещено).
+- `crates/research-cli` — чтение переведено на `journal::stream` + `EpochFilter` (грид больше НЕ
+  держит `Vec<Event>`); RED требует **ЭКВИВАЛЕНТНОСТИ** стрим-грида и in-memory (PnL до цента,
+  интенты, филлы) — «оптимизация» не смеет тихо изменить измеряемую логику (урок M-07); gap-статистика
+  (`data_quality`) → `research/data-quality/gaps-<epoch>.json`, отчёт обязан на неё ссылаться.
+- `crates/venue-binance` (**TD-016, задачи 9/9b**) — эвикция уровней книги. **v1 отреджекчена
+  reviewer'ом на PR-гейте** (кап 5000 + side-filter по mid ДИФФА стирал живые уровни, включая best
+  bid, на асимметричном диффе → тихая порча `L2Snapshot` при зелёных RSS/health). **v2 (`421d5b6`)**:
+  уровень удаляет ТОЛЬКО `size==0`; эвикция — по расстоянию от mid КНИГИ за пределами окна ЭМИССИИ
+  (`MAX_REL_DIST` ±60%) ⇒ режется ровно то, что никогда не эмитится; `BACKSTOP_LEVELS_PER_SIDE
+  = 50_000` от OOM (+`tracing::warn`); наблюдаемость D (`book levels` ≥1/мин) — чтобы §8 мерил
+  УРОВНИ, а не только RSS. Reviewer доказал анти-плацебо независимо: 2 новых оракула FAIL против
+  v1-impl, GREEN против v2. **Атрибуция лика к книге на проде НЕ доказана** — §8 покажет.
+- `.github/workflows/deploy.yml` — Deploy гейтится на CI (fail-closed) + `set -euo pipefail` в
+  ssh-скрипте (раньше упавший `git fetch/reset` не останавливал сборку → фантомный деплой).
+  **Гейт написан, но не работает — TD-018.**
+- Гейты (reviewer перепрогнал независимо): workspace **164 passed / 0 failed**; `verify_M-08.sh`
+  **26/26 PASS, exit=0**; fmt/clippy clean; CI на merge-коммите success.
+- **Урок (зафиксирован architect'ом в процессе, `5fabd2b`):** два milestone'а подряд дефект прошёл
+  ВСЕ зелёные оракулы и был пойман reviewer'ом на PR-гейте — оба раза причина одна: **фикстура
+  «счастливого пути»** (M-07 — событие с одним филлом; M-08 — симметричный дифф). Оракул границы
+  ресурса обязан иметь и деградированный/асимметричный вход.
+
 ## Пока НЕ реализовано (следующие фазы)
 - Крейты `risk`/`killswitch`/`oms`, `runner` — пофазно per DESIGN §10 (M-08: fail-closed риск-гейт
   между `strategy` и `oms`). MM-котирование, wiring весов из `signals.json` (граница B),

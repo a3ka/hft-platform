@@ -29,6 +29,36 @@
   наблюдаемость: писать RSS в heartbeat/лог, чтобы дрейф был виден без ssh. Severity: **MAJOR**
   (24/7 прод-сбор данных; отказ recorder'а = потеря рыночных данных, которые не восстановить
   задним числом — данные невоспроизводимы, в отличие от кода).
+  **СТАТУС 2026-07-14 (M-08 задачи 9/9b, merge `1123b13`): фикс НА `main`, на проде НЕ ПОДТВЕРЖДЁН.**
+  Корень найден по коду (`venue-binance::apply_diff_to_book`: уровень, из которого цена ушла,
+  `size=0` больше не получает и живёт вечно). **v1-эвикция (кап 5000 + side-filter по mid ДИФФА)
+  отреджекчена reviewer'ом на PR-гейте:** на асимметричном диффе (лучший bid в окне не менялся —
+  штатная ситуация) она стирала ЖИВЫЕ уровни, включая best bid → тихая порча `L2Snapshot` в
+  журнале при зелёных RSS/health (класс TD-011). v2 (`421d5b6`): side-filter снят (уровень удаляет
+  ТОЛЬКО `size==0`); эвикция — по расстоянию от mid КНИГИ за пределами окна эмиссии
+  (`MAX_REL_DIST` ±60%), т.е. режется ровно то, что НИКОГДА не эмитится и ни в один расчёт не
+  входит; `BACKSTOP_LEVELS_PER_SIDE = 50_000` — аварийный кап от OOM (эвиктит самое дальнее,
+  `tracing::warn`); наблюдаемость D — `tracing::info!(symbol, bids, asks, "book levels")` ≥1/мин.
+  Анти-плацебо доказан reviewer'ом независимо: `c1_asymmetric_diff_must_not_delete_live_levels` и
+  `td016_evicts_only_levels_outside_emission_window` **FAIL против v1-impl**, GREEN против v2.
+  **Атрибуция лика к книге кодом НЕ доказана.** Если после деплоя RSS всё равно растёт — лик не
+  здесь (кандидаты: `venue-hyperliquid` — тоже full-book на BTreeMap; tracing-буферы). Ответ даст
+  §8-замер (RSS сразу/1ч/4-5ч + метрика уровней D). **§8 НЕ ВЫПОЛНЕН — деплой заблокирован
+  TD-018 (ниже).** Прод по-прежнему на `656c7ca`: RSS **139 MiB @ 17 ч аптайма** (≈ +8 MiB/час,
+  лик активен, контейнер `healthy`). Долг ОСТАЁТСЯ OPEN до §8-подтверждения на проде.
+- **TD-018** `deploy-ci-gate-cannot-read-ci-status` (найдено reviewer'ом на §8 M-08, 2026-07-14).
+  Гейт TD-017 (`deploy.yml` job `ci`, «Wait for CI success on this commit») **не работает**:
+  `gh api repos/$REPO/actions/runs?head_sha=$SHA` возвращает **`HTTP 403 Resource not accessible
+  by integration`** — у дефолтного `${{ github.token }}` в этом репо нет права `actions: read`, а
+  блока `permissions:` в `deploy.yml` НЕТ. Гейт fail-closed отработал «правильно» (Deploy не пошёл,
+  прод не тронут), но по НЕВЕРНОЙ причине: он не может прочитать статус CI **никогда** →
+  **автодеплой полностью заблокирован** (run `29318076908` на `1123b13`: CI success, Deploy failure
+  на шаге гейта). Следствие: код M-08 лежит на зелёном `main`, но НЕ в проде; §8 eyes-on
+  невыполним, milestone не закрывается. **Фикс — мелкий, зона architect** (CI/процессный слой):
+  добавить в `deploy.yml` `permissions: { actions: read, contents: read }` (либо перевести гейт на
+  `workflow_run` с фильтром `conclusion == success`), затем re-run Deploy на `1123b13`.
+  Severity: **MAJOR** (гейт-байпас наоборот: пайплайн не может выкатить прод; при этом «Deploy
+  failure» на зелёном main легко принять за флаки и обойти руками — обход = возврат TD-017).
 - **TD-017** `deploy-not-gated-on-ci` (замечено reviewer'ом на §8 M-07, 2026-07-13).
   `.github/workflows/deploy.yml` — САМОСТОЯТЕЛЬНЫЙ workflow на `push: branches: [main]`
   (paths: `crates/**`, `Cargo.toml`, `Cargo.lock`, `Dockerfile`, `docker-compose.yml`),
@@ -42,6 +72,10 @@
   `needs: ci` (или `workflow_run` с фильтром `conclusion == success`). Зона — architect
   (процессный/CI-слой), не reviewer. Severity: **MAJOR** (гейт-байпас: gates §8 требует
   «дождаться CI+Deploy success», но пайплайн допускает Deploy success ПРИ красном CI).
+  **СТАТУС 2026-07-14 (M-08 задача 6, merge `1123b13`): гейт НАПИСАН** (`deploy.yml` job `ci`
+  «Wait for CI success on this commit» + `deploy: needs: ci`, fail-closed на красный CI / таймаут /
+  отмену; verify-гейт T12 проверяет структурно), **но в проде НЕ РАБОТАЕТ — TD-018 (403 на чтении
+  статуса CI).** Долг ОСТАЁТСЯ OPEN до первого успешного прохода гейта на реальном деплое.
 - **TD-001** recorder Docker-образ работает root'ом (M-00 заглушка). Hardening (non-root +
   права journal-тома) — при реальном recorder (M-01). Severity: MINOR.
 - **TD-002** `hetzner-server` приватный ключ был вставлен в чат (скомпрометирован). Пересоздать
@@ -52,8 +86,13 @@
   (полосы 3%/8%) нужна бОльшая глубина → полноценный snapshot+diff-sync (recon §A/§D). Severity: NOTE (следующая фаза).
 - **TD-005** HL `l2Book` даёт снапшоты по изменению книги (наблюдалось ~реже Binance). Проверить
   полноту cadence; при нужде добавить `bbo`. Funding/liquidations пока не подписаны. Severity: NOTE.
-- **TD-006** Журнал — один сегмент без ротации/ретеншена/cold-выгрузки (docs/06). Пока места вдоволь
-  (150GB). Добавить сегмент-ротацию + retention→Storage Box когда объём вырастет. Severity: NOTE.
+- **TD-006** Журнал — один сегмент без ротации/ретеншена/cold-выгрузки (docs/06). Severity:
+  повышен до **MAJOR** (2026-07-13: 15.0 GB в одном сегменте, ~2.8 GB/сутки, 114 GB свободно).
+  **СТАТУС 2026-07-14 (M-08 задачи 2/3, merge `1123b13`): реализовано на `main`, в проде НЕ
+  ПОДТВЕРЖДЕНО** — ротация `segment-NNNNNNNN.jrnl` (1 GiB, seq сквозной), retention с
+  `ColdCopyProof` (удалить невыгруженный сегмент нельзя ВЫРАЗИТЬ в API), disk-guard fail-closed
+  (`min_free_bytes` → `append` → `Err`, ни байта, ни seq). Деплой заблокирован TD-018; на проде
+  по-прежнему один растущий сегмент `segment-00000000.jrnl` (15.0 GB). Закрывается после §8.
 - **TD-007** DET-I-1 (бит-идентичный replay + state_hash) реализован частично (seq+read_all).
   Полный snapshot/state_hash — следующая фаза journal. Severity: NOTE.
 - **TD-008** `t1-report-forms-promotion` (M-04). Rust-типы T1-форм `TrialRecord`/
