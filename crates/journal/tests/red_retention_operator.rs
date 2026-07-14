@@ -233,18 +233,15 @@ fn r5_undeclared_legacy_segment_is_never_pruned() {
     journal_with_segments(dir.path(), 3_000); // + новые сегменты v2
 
     let pol = policy(cold.path(), 1, 0);
-    match journal::retention_plan(dir.path(), &pol, T0 + 100 * DAY_MS) {
-        // Либо план строится и НЕ включает незадекларированный legacy...
-        Ok(plan) => {
-            let legacy = dir.path().join("segment-00000000.jrnl");
-            assert!(
-                plan.offload_and_prune.iter().all(|s| s.path != legacy),
-                "НЕЗАДЕКЛАРИРОВАННЫЙ legacy-сегмент попал в план удаления — у него нет эпохи, \
-                 значит нет и права его удалять (это может быть чужой файл, а копия одна)"
-            );
-        }
-        // ...либо план вообще отказывается строиться (тоже fail-closed) — но не молчит.
-        Err(_) => {}
+    // Либо план строится и НЕ включает незадекларированный legacy, либо план вообще
+    // отказывается строиться (тоже fail-closed) — но молча удалить его нельзя.
+    if let Ok(plan) = journal::retention_plan(dir.path(), &pol, T0 + 100 * DAY_MS) {
+        let legacy = dir.path().join("segment-00000000.jrnl");
+        assert!(
+            plan.offload_and_prune.iter().all(|s| s.path != legacy),
+            "НЕЗАДЕКЛАРИРОВАННЫЙ legacy-сегмент попал в план удаления — у него нет эпохи, \
+             значит нет и права его удалять (это может быть чужой файл, а копия одна)"
+        );
     }
 }
 
