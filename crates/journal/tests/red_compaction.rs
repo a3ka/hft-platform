@@ -271,3 +271,164 @@ fn c6_mixed_raw_and_compacted_streams_in_seq_order() {
         assert_eq!(e.seq, k as u64, "seq сквозной через raw и сжатые сегменты");
     }
 }
+
+// ═══ КРАХ-ОКНО КОМПАКЦИИ (rev 9; блокер reviewer'а на PR-гейте M-08) ═══════════════════
+//
+// Дефект, который прошёл C1–C6: `compact_segment` между `rename(.tmp → .zst)` и
+// `remove_file(оригинал)` оставляет на диске ОБА файла. Прод-путь чтения (`segments()` →
+// `list_segments`/`stream`) коллизию индексов НЕ дедуплицирует (дедуп есть только в офлайновом
+// `iter_segments_sorted`) ⇒ сегмент читается ДВАЖДЫ. Замер reviewer'а: 3000 событий → 3172.
+// DET-I-1 нарушен: `replay(journal) != реальность`, и порча уходит в research МОЛЧА.
+// Хуже: ветка `if dst.exists() { return Ok(...) }` рапортует успех, НЕ удаляя оригинал ⇒
+// состояние НЕ самоизлечивается, дубликаты становятся постоянным свойством журнала.
+//
+// Окно достижимо штатно: cron жмёт 1 GiB сегменты на VPS; kill/OOM/reboot ровно здесь — норма,
+// а не экзотика. C1 этого не ловил, потому что проверял ТОЛЬКО счастливый путь (успешный вызов) —
+// ровно дефект фикстуры по `.claude/rules/testing.md` (чек-лист, п. 3: «то, чего не должно быть
+// на диске, но оно есть»).
+//
+// КОНТРАКТ (architect, D-COMP-1/D-COMP-2):
+//   D-COMP-1: коллизия raw+.zst одного индекса — НЕ ошибка чтения, но читатель обязан отдать
+//             РОВНО ОДИН сегмент. Побеждает СЫРОЙ — то же правило, что в `iter_segments_sorted`
+//             (одно правило на оба пути, а не два разных).
+//   D-COMP-2: `dst.exists()` НЕ ЗНАЧИТ «успех». Компакция обязана СВЕРИТЬ существующий `.zst`
+//             с оригиналом и только тогда удалить оригинал (самоизлечение). Не сошлось →
+//             `.zst` удаляется, оригинал остаётся ГОРЯЧИМ, сегмент попадает в `failed`.
+//             Оригинал не удаляется НИКОГДА без доказанной копии — тот же принцип, что ColdCopyProof.
+
+/// Снимок сырых сегментов (путь + байты) — ими воспроизводим крах между rename и remove.
+fn raw_segments(dir: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+    let mut v: Vec<_> = std::fs::read_dir(dir)
+        .expect("read_dir")
+        .filter_map(|e| {
+            let p = e.expect("entry").path();
+            let name = p.file_name()?.to_str()?.to_string();
+            if name.starts_with("segment-") && name.ends_with(".jrnl") {
+                let bytes = std::fs::read(&p).expect("read seg");
+                Some((p, bytes))
+            } else {
+                None
+            }
+        })
+        .collect();
+    v.sort_by(|a, b| a.0.cmp(&b.0));
+    v
+}
+
+/// Воспроизвести КРАХ: `.zst` уже на месте, оригинал ещё НЕ удалён. Возвращает число
+/// восстановленных сырых сегментов (0 ⇒ фикстура не создала крах-окна — тест обязан упасть).
+fn simulate_crash_after_rename(before: &[(std::path::PathBuf, Vec<u8>)]) -> usize {
+    let mut restored = 0;
+    for (p, bytes) in before {
+        if !p.exists() {
+            std::fs::write(p, bytes).expect("restore raw");
+            restored += 1;
+        }
+    }
+    restored
+}
+
+/// C7 (D-COMP-1): крах между rename и remove НЕ смеет удваивать события в прод-пути чтения.
+#[test]
+fn c7_crash_window_must_not_duplicate_events() {
+    let dir = tempfile::tempdir().expect("dir");
+    build(dir.path(), 3_000, 128 * 1024);
+    let n_before = all_events(dir.path()).len();
+    assert_eq!(n_before, 3_000, "фикстура");
+
+    let raws = raw_segments(dir.path());
+    journal::compact_closed_segments(dir.path(), 0, DEFAULT_COMPACT_LEVEL).expect("compact");
+    let restored = simulate_crash_after_rename(&raws);
+    assert!(
+        restored > 0,
+        "ни один сегмент не сжат — крах-окна нет, тест бессмыслен"
+    );
+
+    let n_after = all_events(dir.path()).len();
+    assert_eq!(
+        n_after, n_before,
+        "после краха компакции прод-путь отдал {n_after} событий вместо {n_before}: сегмент \
+         читается ДВАЖДЫ (raw и .zst одного индекса). DET-I-1 нарушен — фантомные события \
+         уходят в research/бэктест молча, никто не падает"
+    );
+}
+
+/// C8 (D-COMP-2): повторная компакция САМОИЗЛЕЧИВАЕТ крах-окно (сирота-оригинал удаляется).
+#[test]
+fn c8_repeated_compaction_self_heals_crash_window() {
+    let dir = tempfile::tempdir().expect("dir");
+    build(dir.path(), 3_000, 128 * 1024);
+    let n_before = all_events(dir.path()).len();
+
+    let raws = raw_segments(dir.path());
+    journal::compact_closed_segments(dir.path(), 0, DEFAULT_COMPACT_LEVEL).expect("compact");
+    let restored = simulate_crash_after_rename(&raws);
+    assert!(restored > 0, "крах-окно не воспроизведено");
+
+    // Второй прогон обязан ДОДЕЛАТЬ работу, а не рапортовать успех поверх сироты.
+    journal::compact_closed_segments(dir.path(), 0, DEFAULT_COMPACT_LEVEL).expect("compact #2");
+
+    let orphans: Vec<_> = raws
+        .iter()
+        .filter(|(p, _)| p.exists())
+        .filter(|(p, _)| {
+            // активный сегмент не сжимается (C2) — он и обязан остаться сырым
+            let zst = p.with_file_name(format!("{}.zst", p.file_name().unwrap().to_str().unwrap()));
+            zst.exists()
+        })
+        .collect();
+    assert!(
+        orphans.is_empty(),
+        "повторная компакция НЕ убрала сироту: {:?} — дубликаты стали ПОСТОЯННЫМ свойством журнала \
+         (ветка `if dst.exists() {{ return Ok }}` рапортует успех, не удаляя оригинал)",
+        orphans.iter().map(|(p, _)| p).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        all_events(dir.path()).len(),
+        n_before,
+        "события не теряются"
+    );
+}
+
+/// C9 (D-COMP-2): БИТЫЙ `.zst` НИКОГДА не приводит к удалению оригинала.
+/// Удалить можно лишь то, чья копия ДОКАЗАНО читается (принцип ColdCopyProof).
+#[test]
+fn c9_corrupt_zst_never_deletes_raw() {
+    let dir = tempfile::tempdir().expect("dir");
+    build(dir.path(), 3_000, 128 * 1024);
+    let n_before = all_events(dir.path()).len();
+
+    let raws = raw_segments(dir.path());
+    journal::compact_closed_segments(dir.path(), 0, DEFAULT_COMPACT_LEVEL).expect("compact");
+    let restored = simulate_crash_after_rename(&raws);
+    assert!(restored > 0, "крах-окно не воспроизведено");
+
+    // Портим КАЖДЫЙ .zst: копия больше не доказуема.
+    let mut corrupted = 0;
+    for e in std::fs::read_dir(dir.path()).expect("read_dir") {
+        let p = e.expect("entry").path();
+        if p.to_str().map(|s| s.ends_with(".zst")).unwrap_or(false) {
+            let mut b = std::fs::read(&p).expect("read zst");
+            let mid = b.len() / 2;
+            b[mid] ^= 0xFF;
+            std::fs::write(&p, &b).expect("write zst");
+            corrupted += 1;
+        }
+    }
+    assert!(corrupted > 0, "нет .zst — нечего портить");
+
+    // Компакция может вернуть Err/failed — но НЕ СМЕЕТ удалить сырой сегмент.
+    let _ = journal::compact_closed_segments(dir.path(), 0, DEFAULT_COMPACT_LEVEL);
+
+    for (p, _) in &raws {
+        assert!(
+            p.exists(),
+            "оригинал {p:?} УДАЛЁН при битой сжатой копии — данные потеряны безвозвратно"
+        );
+    }
+    assert_eq!(
+        all_events(dir.path()).len(),
+        n_before,
+        "при битой копии прод-путь обязан читать СЫРОЙ сегмент (D-COMP-1: raw побеждает)"
+    );
+}

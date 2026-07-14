@@ -196,6 +196,56 @@ cron/монитор не узнают о disk_pressure"
 пробрасывает exit≠0 (проверено прогоном со стабом, не грепом)"
 fi
 
+# ── D7: КОМПАКЦИЯ ВЫЗЫВАЕТСЯ ИЗ ДОСТАВЛЕННОГО АРТЕФАКТА (rev 9, блокер reviewer'а) ──────
+# Виток 1: библиотека написана — её никто не вызывал. Виток 2: бинарь есть — доставки нет.
+# Виток 3 (этот): функция compact_closed_segments существует РОВНО в одном месте — в `cargo test`.
+# Ни режима у бинаря, ни compose-сервиса, ни cron, ни runbook ⇒ на VPS компакцию запустить НЕЧЕМ,
+# и дедлайн диска (8.83 GB/сут, ~12 дней) не сдвигается НИ НА ЧАС. Гейт доказывает ЗАПУСК.
+COMPACT_JOB="deploy/bin/journal-compaction-cron.sh"
+d7=0
+if [ ! -f "${COMPACT_JOB}" ]; then
+  d7=1
+  fail "D7 нет ${COMPACT_JOB} — компакцию на проде вызвать нечем (третий виток TD-020: \
+функция есть, оператора нет). Дедлайн диска не двигается"
+elif ! grep -qE 'journal-compaction-cron\.sh[[:space:]]*$' "${CRON}"; then
+  d7=1
+  fail "D7 ${CRON} не запускает компакцию по расписанию — она существует, но никогда не случится"
+else
+  sb=$(mktemp -d); mkdir -p "${sb}/journal" "${sb}/cold"
+  if cargo build -q -p journal --bin journal-retention 2>/dev/null; then
+    BIN2="$(cargo metadata --format-version 1 --no-deps 2>/dev/null \
+             | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')/debug/journal-retention"
+    [ -x "${BIN2}" ] || BIN2="target/debug/journal-retention"
+    mapfile -t c_argv < <(
+      RETENTION_PRINT_ARGV=1 \
+      RETENTION_JOURNAL_DIR="${sb}/journal" \
+      JOURNAL_COLD_DIR="${sb}/cold" \
+      RETENTION_MIN_FREE_GB=0 \
+      bash "${COMPACT_JOB}"
+    )
+    # argv компакции обязан нести режим compact — иначе задание жмёт не то, что обещает.
+    case " ${c_argv[*]} " in
+      *" --mode compact "*) : ;;
+      *) d7=1; fail "D7 argv задания компакции не содержит '--mode compact': ${c_argv[*]}" ;;
+    esac
+    set +e
+    "${BIN2}" "${c_argv[@]}" > "${sb}/compact.out" 2>&1
+    rc_c=$?
+    set -e
+    if [ "${rc_c}" -ne 0 ]; then
+      d7=1
+      fail "D7 НАСТОЯЩИЙ бинарь не отработал режим компакции (exit=${rc_c}) — на проде запускать нечего"
+      sed 's/^/      /' "${sb}/compact.out" | head -5
+    fi
+  else
+    d7=1
+    fail "D7 не собрался journal-retention — режим компакции проверить нечем"
+  fi
+  rm -rf "${sb}"
+fi
+[ "${d7}" -eq 0 ] && pass "D7 компакция РЕАЛЬНО вызывается из доставленного бинаря (--mode compact) \
+и стоит в cron — дедлайн диска двигается фактом, а не тестом"
+
 # ── D6: runbook доставки (кто монтирует Storage Box и как включается Apply) ───────────
 if [ -f deploy/README.md ] && grep -qi 'storage box\|/mnt/journal-cold' deploy/README.md; then
   pass "D6 deploy/README описывает монтирование холодного хранилища и включение Apply"
