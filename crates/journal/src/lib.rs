@@ -27,6 +27,10 @@ pub use segments::{
     segments as list_segments, storage_status, stream, verify_cold_copy, ColdCopyProof,
     EpochFilter, EventStream, SegmentInfo, StorageStatus, WriterConfig, LEGACY_MANIFEST,
 };
+pub use segments::{
+    retention_execute, retention_plan, RetentionMode, RetentionPlan, RetentionPolicy,
+    RetentionReport,
+};
 
 // Доступно из `crate` для engine-dev call-sites внутри lib.rs.
 pub(crate) use segments::{

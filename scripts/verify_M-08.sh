@@ -51,6 +51,13 @@ check "T7b read_all/recover понимают v2 + все сегменты (за�
 # seq продолжается; research НЕ видит данных до declare_legacy. Раньше это «проверялось руками».
 check "T7c прод-миграция (recorder стартует, legacy байт-в-байт цел)" cargo test -p journal --test red_prod_migration
 
+# T6b (задача 11, TD-020 — ГЛАВНАЯ невыполненная цель M-08): ОПЕРАТОРСКИЙ путь ретеншена.
+# Библиотека была, оператора не было → диск растёт, ~40 дней до стопа сбора.
+check "T6b ретеншен: операторский путь (TD-020)" cargo test -p journal --test red_retention_operator
+
+# T8d (задача 12, TD-019): heartbeat несёт СОСТОЯНИЕ (пишет ли, есть ли место), а не только время
+check "T8d heartbeat со storage_status (TD-019)" cargo test -p recorder --test red_heartbeat_status
+
 # T7 (задача 2/4): регрессия журнала — старые инварианты живы (DET-I-1, TD-011 bounded open)
 check "T7 journal регрессия (вкл. red_open_bounded)" cargo test -p journal
 

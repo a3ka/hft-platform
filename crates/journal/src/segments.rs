@@ -1085,3 +1085,86 @@ pub(crate) fn open_seg_for_write(
 }
 
 // (Используется локально в `free_bytes_at` под Unix; глобального re-export не требуется.)
+
+// ── Ретеншен: ОПЕРАТОРСКИЙ ПУТЬ (M-08 task 11, TD-020) ────────────────────────────────
+//
+// Находка §8 (reviewer): `verify_cold_copy`/`prune_segment`/`ColdCopyProof` существуют как
+// БИБЛИОТЕКА, но их никто не вызывает — ни recorder, ни CLI, ни cron. Главная цель M-08
+// («сбор не остановится НИКОГДА») поэтому НЕ достигнута: диск растёт те же ~2.8 GB/сут,
+// просто кусками по 1 GiB. ~40 дней до disk-guard.
+//
+// Решение: ОТДЕЛЬНЫЙ бинарь `journal-retention` + cron на VPS. Не поток внутри recorder'а:
+// падение/зависание ретеншена не имеет права ронять СБОР ДАННЫХ (сбор дороже уборки).
+// Каркас — architect; реализация — engine-dev.
+
+/// Политика ретеншена (операторский конфиг).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetentionPolicy {
+    /// Сегменты старше N суток — кандидаты на выгрузку+удаление.
+    pub retain_days: u32,
+    /// Минимум ПОСЛЕДНИХ сегментов, которые остаются горячими независимо от возраста
+    /// (реплей/диагностика недавнего прошлого без обращения к холодному хранилищу).
+    pub keep_min_segments: u32,
+    /// Корень холодного хранилища (Storage Box / смонтированный путь).
+    pub cold_root: PathBuf,
+    /// Порог, ниже которого пустое место требует ВНЕОЧЕРЕДНОЙ выгрузки (алерт).
+    pub min_free_bytes: u64,
+}
+
+/// Режим запуска. **Дефолт оператора — `DryRun`** (первый прогон на проде — обязательно он).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetentionMode {
+    DryRun,
+    Apply,
+}
+
+/// План: что БУДЕТ сделано. Строится ДЕТЕРМИНИРОВАННО (часы передаются аргументом —
+/// никакого `SystemTime::now()` внутри: план обязан быть воспроизводим и тестируем).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RetentionPlan {
+    /// Выгрузить в холодное хранилище и затем удалить горячую копию.
+    pub offload_and_prune: Vec<SegmentInfo>,
+    /// Пропущены с причиной (активный сегмент; моложе retain_days; в keep_min_segments;
+    /// legacy без декларации — у него нет эпохи, значит нет и права его удалять).
+    pub skipped: Vec<(SegmentInfo, String)>,
+    /// Свободного места меньше `min_free_bytes`, а выгружать нечего → внеочередная тревога.
+    pub disk_pressure: bool,
+}
+
+/// Итог применения плана.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RetentionReport {
+    pub mode: RetentionMode,
+    pub offloaded: Vec<PathBuf>,
+    pub pruned: Vec<PathBuf>,
+    /// Сегменты, у которых сверка холодной копии НЕ прошла (остались горячими).
+    pub failed: Vec<(PathBuf, String)>,
+    pub freed_bytes: u64,
+}
+
+/// Построить план. `now_wall_ms` — снаружи (детерминизм, DESIGN §1).
+///
+/// Гарантии (RED `red_retention_operator.rs`):
+/// - АКТИВНЫЙ (последний) сегмент НИКОГДА не попадает в план — в него сейчас пишут;
+/// - `keep_min_segments` последних остаются горячими независимо от возраста;
+/// - legacy-сегмент без декларации в манифесте НЕ удаляется (нет эпохи → нет права).
+pub fn retention_plan(
+    _dir: impl AsRef<Path>,
+    _policy: &RetentionPolicy,
+    _now_wall_ms: i64,
+) -> io::Result<RetentionPlan> {
+    todo!("M-08 task 11 (engine-dev): отбор кандидатов, детерминированно, без wall-clock внутри")
+}
+
+/// Выполнить план. В `DryRun` НИ ОДИН байт не копируется и не удаляется — только отчёт.
+/// В `Apply`: для каждого сегмента сперва `verify_cold_copy` (sha256-сверка), и ТОЛЬКО
+/// полученный `ColdCopyProof` даёт право на `prune_segment`. Сбой сверки → сегмент остаётся
+/// горячим, попадает в `failed`, exit-код ненулевой (оператор обязан узнать).
+pub fn retention_execute(
+    _dir: impl AsRef<Path>,
+    _plan: &RetentionPlan,
+    _policy: &RetentionPolicy,
+    _mode: RetentionMode,
+) -> io::Result<RetentionReport> {
+    todo!("M-08 task 11 (engine-dev): DryRun = ноль побочных эффектов; Apply = proof → prune")
+}
