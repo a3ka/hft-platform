@@ -17,6 +17,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# M-08 / TD-019: heartbeat-файл пишется как JSON с состоянием (storage_status, seq, ...).
+serde_json = "1"
 
 [dev-dependencies]
 tempfile = "3"

@@ -27,6 +27,10 @@ pub use segments::{
     segments as list_segments, storage_status, stream, verify_cold_copy, ColdCopyProof,
     EpochFilter, EventStream, SegmentInfo, StorageStatus, WriterConfig, LEGACY_MANIFEST,
 };
+pub use segments::{
+    retention_execute, retention_plan, RetentionMode, RetentionPlan, RetentionPolicy,
+    RetentionReport,
+};
 
 // Доступно из `crate` для engine-dev call-sites внутри lib.rs.
 pub(crate) use segments::{
@@ -158,6 +162,22 @@ impl Journal {
 
     pub fn next_seq(&self) -> u64 {
         self.next_seq
+    }
+
+    /// Состояние хранилища для heartbeat (E4/TD-019): свободное место + порог disk-guard.
+    ///
+    /// Для legacy-`open()` (без `cfg`) порог берётся 0 (никакого fail-closed не настроено);
+    /// для `open_with()` — `cfg.min_free_bytes`. `writable` = `free_bytes >= min_free_bytes`.
+    /// Ошибка чтения места возвращается как есть — heartbeat-потребитель сам решит, что
+    /// с ней делать (recorder, например, логирует warn и пишет `null`-поля).
+    pub fn storage_status(&self) -> io::Result<StorageStatus> {
+        let min_free = self.cfg.as_ref().map(|c| c.min_free_bytes).unwrap_or(0);
+        let free = segments::free_bytes_at(&self.dir)?;
+        Ok(StorageStatus {
+            free_bytes: free,
+            min_free_bytes: min_free,
+            writable: free >= min_free,
+        })
     }
 
     /// Присвоить seq/метки, записать фрейм. Возвращает записанное событие.

@@ -30,8 +30,8 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use contracts::{
-    DataSource, Event, LegacyManifest, LegacySegmentDecl, SegmentHeader, LEGACY_FINGERPRINT_BYTES,
-    SEGMENT_MAGIC,
+    DataSource, Event, EventKind, LegacyManifest, LegacySegmentDecl, MdPayload, SegmentHeader,
+    LEGACY_FINGERPRINT_BYTES, SEGMENT_MAGIC,
 };
 use sha2::{Digest, Sha256};
 
@@ -1085,3 +1085,331 @@ pub(crate) fn open_seg_for_write(
 }
 
 // (Используется локально в `free_bytes_at` под Unix; глобального re-export не требуется.)
+
+// ── Ретеншен: ОПЕРАТОРСКИЙ ПУТЬ (M-08 task 11, TD-020) ────────────────────────────────
+//
+// Находка §8 (reviewer): `verify_cold_copy`/`prune_segment`/`ColdCopyProof` существуют как
+// БИБЛИОТЕКА, но их никто не вызывает — ни recorder, ни CLI, ни cron. Главная цель M-08
+// («сбор не остановится НИКОГДА») поэтому НЕ достигнута: диск растёт те же ~2.8 GB/сут,
+// просто кусками по 1 GiB. ~40 дней до disk-guard.
+//
+// Решение: ОТДЕЛЬНЫЙ бинарь `journal-retention` + cron на VPS. Не поток внутри recorder'а:
+// падение/зависание ретеншена не имеет права ронять СБОР ДАННЫХ (сбор дороже уборки).
+// Каркас — architect; реализация — engine-dev.
+
+/// Политика ретеншена (операторский конфиг).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetentionPolicy {
+    /// Сегменты старше N суток — кандидаты на выгрузку+удаление.
+    pub retain_days: u32,
+    /// Минимум ПОСЛЕДНИХ сегментов, которые остаются горячими независимо от возраста
+    /// (реплей/диагностика недавнего прошлого без обращения к холодному хранилищу).
+    pub keep_min_segments: u32,
+    /// Корень холодного хранилища (Storage Box / смонтированный путь).
+    pub cold_root: PathBuf,
+    /// Порог, ниже которого пустое место требует ВНЕОЧЕРЕДНОЙ выгрузки (алерт).
+    pub min_free_bytes: u64,
+}
+
+/// Режим запуска. **Дефолт оператора — `DryRun`** (первый прогон на проде — обязательно он).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetentionMode {
+    DryRun,
+    Apply,
+}
+
+/// План: что БУДЕТ сделано. Строится ДЕТЕРМИНИРОВАННО (часы передаются аргументом —
+/// никакого `SystemTime::now()` внутри: план обязан быть воспроизводим и тестируем).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RetentionPlan {
+    /// Выгрузить в холодное хранилище и затем удалить горячую копию.
+    pub offload_and_prune: Vec<SegmentInfo>,
+    /// Пропущены с причиной (активный сегмент; моложе retain_days; в keep_min_segments;
+    /// legacy без декларации — у него нет эпохи, значит нет и права его удалять).
+    pub skipped: Vec<(SegmentInfo, String)>,
+    /// Свободного места меньше `min_free_bytes`, а выгружать нечего → внеочередная тревога.
+    pub disk_pressure: bool,
+}
+
+/// Итог применения плана.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RetentionReport {
+    pub mode: RetentionMode,
+    pub offloaded: Vec<PathBuf>,
+    pub pruned: Vec<PathBuf>,
+    /// Сегменты, у которых сверка холодной копии НЕ прошла (остались горячими).
+    pub failed: Vec<(PathBuf, String)>,
+    pub freed_bytes: u64,
+}
+
+/// Построить план. `now_wall_ms` — снаружи (детерминизм, DESIGN §1).
+///
+/// Гарантии (RED `red_retention_operator.rs`):
+/// - АКТИВНЫЙ (последний) сегмент НИКОГДА не попадает в план — в него сейчас пишут;
+/// - `keep_min_segments` последних остаются горячими независимо от возраста;
+/// - legacy-сегмент без декларации в манифесте НЕ удаляется (нет эпохи → нет права);
+/// - план ДЕТЕРМИНИРОВАН: тот же `now_wall_ms` + та же политика + тот же каталог → тот же план.
+///
+/// Алгоритм:
+///   1. Обойти каталог, классифицировать каждый `*.jrnl`. На `Err` (foreign / corrupt /
+///      truncated) — синтезировать `SegmentInfo` для skipped (а не возвращать `Err`,
+///      иначе один чужой файл отменил бы весь план: оператор обязан узнать о нём,
+///      а не получать «ничего не планируется»);
+///   2. Активный = сегмент с МАКСИМАЛЬНЫМ индексом (писатель всегда дописывает
+///      в сегмент последнего индекса; см. `decide_open_segment`);
+///   3. Отобрать кандидатов: всё, что не активное, не foreign, и возраст ≥ `retain_days`;
+///   4. Из кандидатов исключить `keep_min_segments` последних (по индексу);
+///   5. `disk_pressure` = `free_bytes(dir) < policy.min_free_bytes`.
+pub fn retention_plan(
+    dir: impl AsRef<Path>,
+    policy: &RetentionPolicy,
+    now_wall_ms: i64,
+) -> io::Result<RetentionPlan> {
+    let dir = dir.as_ref();
+
+    // (1) Обход каталога: classify с обработкой foreign/corrupt как skipped.
+    let manifest = load_manifest(dir)?;
+    let mut classified: Vec<SegmentInfo> = Vec::new();
+    let mut foreign_skipped: Vec<(SegmentInfo, String)> = Vec::new();
+
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let p = entry.path();
+        if p.extension().and_then(OsStr::to_str) != Some("jrnl") {
+            continue;
+        }
+        match classify_segment(&p, &manifest) {
+            Ok(info) => classified.push(info),
+            Err(e) => {
+                // Foreign / corrupt / truncated. Синтезируем info для skipped — оператор
+                // видит файл и причину, а не «план не построен, проверяй вручную».
+                let reason = classify_failure_reason(&e);
+                let file_name = p
+                    .file_name()
+                    .and_then(OsStr::to_str)
+                    .unwrap_or("<non-utf8>")
+                    .to_string();
+                let index = parse_segment_index(&file_name).unwrap_or(u32::MAX);
+                let size_bytes = fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+                let synthetic = SegmentInfo {
+                    path: p.clone(),
+                    index,
+                    header: SegmentHeader {
+                        schema_version: 0, // sentinel: неизвестно (нет магии / нет заголовка)
+                        source: DataSource::Synthetic,
+                        provenance: format!("<{reason}>"),
+                        epoch_id: String::new(),
+                        created_wall_ms: 0,
+                        first_seq: 0,
+                    },
+                    size_bytes,
+                };
+                let _ = file_name;
+                foreign_skipped.push((synthetic, reason));
+            }
+        }
+    }
+    // Стабильная сортировка по индексу — критична для воспроизводимости плана (R6)
+    // и для определения «последних N» в keep_min.
+    classified.sort_by_key(|s| s.index);
+    foreign_skipped.sort_by_key(|(s, _)| s.index);
+
+    // (2) Активный сегмент = сегмент с МАКСИМАЛЬНЫМ индексом среди classified.
+    // Если classified пуст (всё foreign / каталог пуст) — активного нет; все foreign в skipped.
+    let active_index: Option<u32> = classified.iter().map(|s| s.index).max();
+
+    let mut skipped: Vec<(SegmentInfo, String)> = Vec::new();
+    let mut candidates: Vec<SegmentInfo> = Vec::new();
+    if let Some(act_idx) = active_index {
+        for s in classified {
+            if s.index == act_idx {
+                skipped.push((s, "active segment (writer holds it open)".to_string()));
+            } else {
+                candidates.push(s);
+            }
+        }
+    } else {
+        // Никаких «своих» сегментов. Foreign остаются skipped (для оператора).
+    }
+    skipped.extend(foreign_skipped);
+
+    // (3) Возрастной фильтр: кандидаты старше retain_days.
+    // Возраст = now_wall_ms − ts_exch_ms первого события сегмента (fallback на
+    // header.created_wall_ms, если первый фрейм нечитаем).
+    let cutoff_ms = i64::from(policy.retain_days) * 86_400_000;
+    let mut young_passed: Vec<SegmentInfo> = Vec::with_capacity(candidates.len());
+    for s in candidates {
+        let seg_ts = first_event_data_ts(&s.path)
+            .ok()
+            .flatten()
+            .unwrap_or(s.header.created_wall_ms);
+        let age_ms = now_wall_ms.saturating_sub(seg_ts);
+        if age_ms < cutoff_ms {
+            skipped.push((
+                s,
+                format!(
+                    "younger than retain_days: age={}ms < {}ms (seg_ts={})",
+                    age_ms, cutoff_ms, seg_ts
+                ),
+            ));
+        } else {
+            young_passed.push(s);
+        }
+    }
+
+    // (4) keep_min_segments: последние N (по индексу, отсортированы по возрастанию)
+    // из young_passed остаются горячими.
+    let keep_min = policy.keep_min_segments as usize;
+    let final_candidates: Vec<SegmentInfo>;
+    if young_passed.len() > keep_min {
+        let split = young_passed.len() - keep_min;
+        let (front, back) = young_passed.split_at(split);
+        final_candidates = front.to_vec();
+        for s in back {
+            skipped.push((s.clone(), "protected by keep_min_segments".to_string()));
+        }
+    } else {
+        // Все young_passed защищены keep_min (или keep_min=0, и тогда просто пусто).
+        for s in young_passed {
+            skipped.push((s, "protected by keep_min_segments".to_string()));
+        }
+        final_candidates = Vec::new();
+    }
+
+    // (5) disk_pressure: free_bytes < min_free_bytes.
+    let free = free_bytes_at(dir)?;
+    let disk_pressure = free < policy.min_free_bytes;
+
+    Ok(RetentionPlan {
+        offload_and_prune: final_candidates,
+        skipped,
+        disk_pressure,
+    })
+}
+
+/// Классифицировать причину отказа `classify_segment` в человеко-читаемую строку.
+fn classify_failure_reason(e: &io::Error) -> String {
+    if is_foreign_segment(e) {
+        "undeclared legacy: no magic and no journal.legacy.json entry".to_string()
+    } else {
+        format!("classify error: {e}")
+    }
+}
+
+/// Прочитать timestamp (ms) ДАННЫХ первого события сегмента: для MD — `ts_exch_ms`,
+/// для `Sys` — `ts_wall_ms` (нет биржевого времени).
+///
+/// Используется `retention_plan` для возрастного фильтра. Семантика:
+/// "насколько стары ДАННЫЕ в сегменте относительно `now_wall_ms`" — измеряется по
+/// биржевому времени событий, а не по моменту записи в журнал (`created_wall_ms`
+/// сегмента ≈ wall clock при append). Это позволяет тестам с фиксированным
+/// `now_wall_ms` получать детерминированный план: биржевые timestamps событий задаются
+/// явно (`trade(i)` пишет `ts_exch_ms = T0 + i`), и план строится по ним, а не по
+/// «сейчас на стеных часах».
+///
+/// На любую ошибку (нет файла, битый заголовок, нет событий) — `Ok(None)`:
+/// вызывающий использует fallback (header.created_wall_ms).
+fn first_event_data_ts(path: &Path) -> io::Result<Option<i64>> {
+    let mut f = match File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    // Пропускаем magic+header (для v2) или не делаем ничего (для legacy).
+    // Битый заголовок → Ok(None): fallback на created_wall_ms вызывающего.
+    if read_v2_header_and_skip(&mut f).is_err() {
+        return Ok(None);
+    }
+    let mut reader = BufReader::with_capacity(64 * 1024, f);
+    let Some(ev) = read_event_frame(&mut reader)? else {
+        return Ok(None);
+    };
+    let ts = match &ev.kind {
+        EventKind::Sys(_) => ev.ts_wall_ms,
+        EventKind::Md(md) => match &md.payload {
+            MdPayload::Trade { ts_exch_ms, .. }
+            | MdPayload::L2Snapshot { ts_exch_ms, .. }
+            | MdPayload::Funding { ts_exch_ms, .. }
+            | MdPayload::OpenInterest { ts_exch_ms, .. }
+            | MdPayload::Liquidation { ts_exch_ms, .. }
+            | MdPayload::MarginRate { ts_exch_ms, .. } => *ts_exch_ms,
+        },
+    };
+    Ok(Some(ts))
+}
+
+/// Выполнить план. В `DryRun` НИ ОДИН байт не копируется и не удаляется — только отчёт.
+/// В `Apply`: для каждого сегмента сперва `verify_cold_copy` (sha256-сверка), и ТОЛЬКО
+/// полученный `ColdCopyProof` даёт право на `prune_segment`. Сбой сверки → сегмент остаётся
+/// горячим, попадает в `failed`, exit-код ненулевой (оператор обязан узнать).
+///
+/// Параметр `dir` нужен для контекста (например, чтобы убедиться, что путь сегмента
+/// лежит под `dir` — анти-паттерн «символическая ссылка ведёт наружу»). Сейчас
+/// дополнительная валидация намеренно минимальна: путь сегмента уже проверен
+/// `classify_segment`, план построен из легитимных сегментов каталога.
+pub fn retention_execute(
+    _dir: impl AsRef<Path>,
+    plan: &RetentionPlan,
+    policy: &RetentionPolicy,
+    mode: RetentionMode,
+) -> io::Result<RetentionReport> {
+    match mode {
+        RetentionMode::DryRun => {
+            // НОЛЬ побочных эффектов. Никакого создания каталогов, никакого хеширования,
+            // никакого удаления — даже create_dir_all здесь не зовём (это было бы
+            // побочным эффектом на файловой системе: см. RED `r2_dry_run_touches_nothing`).
+            Ok(RetentionReport {
+                mode: RetentionMode::DryRun,
+                offloaded: Vec::new(),
+                pruned: Vec::new(),
+                failed: Vec::new(),
+                freed_bytes: 0,
+            })
+        }
+        RetentionMode::Apply => {
+            let mut offloaded: Vec<PathBuf> = Vec::new();
+            let mut pruned: Vec<PathBuf> = Vec::new();
+            let mut failed: Vec<(PathBuf, String)> = Vec::new();
+            let mut freed_bytes: u64 = 0;
+
+            for seg in &plan.offload_and_prune {
+                // (1) verify_cold_copy: sha256-сверка src == dst.
+                match verify_cold_copy(seg, &policy.cold_root) {
+                    Ok(proof) => {
+                        // (2) ТИПОВОЙ БАРЬЕР: proof получен — можно prune.
+                        // ColdCopyProof сконструировать извне невозможно (поле приватное).
+                        match prune_segment(seg, proof) {
+                            Ok(()) => {
+                                offloaded.push(seg.path.clone());
+                                pruned.push(seg.path.clone());
+                                freed_bytes += seg.size_bytes;
+                            }
+                            Err(e) => {
+                                failed.push((
+                                    seg.path.clone(),
+                                    format!("prune failed after verified cold copy: {e}"),
+                                ));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        // Сверка провалилась → сегмент ОСТАЁТСЯ горячим (R3). Ошибка
+                        // попадает в `failed` — оператор узнает из отчёта.
+                        failed.push((
+                            seg.path.clone(),
+                            format!("cold copy verification failed: {e}"),
+                        ));
+                    }
+                }
+            }
+
+            Ok(RetentionReport {
+                mode: RetentionMode::Apply,
+                offloaded,
+                pruned,
+                failed,
+                freed_bytes,
+            })
+        }
+    }
+}

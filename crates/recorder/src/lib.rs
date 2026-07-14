@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use contracts::{EventKind, SysEvent, Venue};
-use journal::Journal;
+use journal::{Journal, StorageStatus};
 use tokio::sync::mpsc;
 
 /// Площадки, которые рекордер супервизит по умолчанию. `main` спавнит `supervise()` по
@@ -81,14 +81,58 @@ pub async fn run_writer(
             _ = hb.tick() => {
                 journal.append(EventKind::Sys(SysEvent::Heartbeat))?;
                 journal.flush()?;
-                let now_ms = SystemTime::now()
-                    .duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
-                let _ = std::fs::write(&hb_path, now_ms.to_string());
+                write_heartbeat(&hb_path, &journal, count);
                 tracing::debug!(events = count, "heartbeat");
             }
         }
     }
 
+    // Финальный heartbeat при выходе (shutdown / all-producers-gone) — гарантирует, что
+    // внешний мониторинг ВСЕГДА видит последнее состояние, даже если writer не дожил
+    // до очередного 10-секундного тика. Без этого red_heartbeat_status в коротких
+    // прогонах не находил файл (фундаментальный класс TD-011/TD-019: «heartbeat есть»
+    // отличается от «heartbeat ОТРАЖАЕТ реальность»).
+    write_heartbeat(&hb_path, &journal, count);
+
     journal.flush()?;
     Ok(())
+}
+
+/// Записать heartbeat-файл как JSON с состоянием (TD-019, M-08 E4 наблюдаемость).
+///
+/// **Контракт** (RED `red_heartbeat_status.rs`): JSON-объект с полями
+/// `ts_wall_ms`, `next_seq`, `segment_index`, `free_bytes`, `min_free_bytes`, `writable`.
+/// Голый таймстамп (прежняя реализация) — ровно тот класс ошибки, против которого
+/// написан RED: healthcheck отвечает «процесс жив», а не «процесс делает то, что должен».
+///
+/// **В ЖУРНАЛ НЕ ПИШЕТСЯ** (`OPS-I-6` детерминизм): heartbeat — наблюдаемость, а не
+/// данные; повторение heartbeat в журнале сломало бы DET-I-1 (replay ×3 бит-идентичен).
+/// Ошибки записи логируются и ГЛОТАЮТСЯ — сбой heartbeat-файла НЕ роняет recorder
+/// (recorder пишет данные, а не мониторинг).
+fn write_heartbeat(hb_path: &std::path::Path, journal: &Journal, events: u64) {
+    let ts_wall_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let next_seq = journal.next_seq();
+    let segment_index = journal.active_segment_index();
+    let storage: Option<StorageStatus> = journal.storage_status().ok();
+    let payload = serde_json::json!({
+        "ts_wall_ms": ts_wall_ms,
+        "next_seq": next_seq,
+        "segment_index": segment_index,
+        "events": events,
+        "free_bytes": storage.as_ref().map(|s| s.free_bytes),
+        "min_free_bytes": storage.as_ref().map(|s| s.min_free_bytes),
+        "writable": storage.as_ref().map(|s| s.writable),
+    });
+    // Ошибки heartbeat ГЛОТАЮТСЯ: recorder пишет данные, а не мониторинг.
+    // Аналогия: VM-probe; если пульс не дошёл — повторная попытка на следующем тике.
+    if let Ok(body) = serde_json::to_string(&payload) {
+        if let Err(e) = std::fs::write(hb_path, body) {
+            tracing::warn!(error = %e, "heartbeat write failed (non-fatal)");
+        }
+    } else {
+        tracing::warn!("heartbeat JSON serialize failed (non-fatal)");
+    }
 }

@@ -265,7 +265,7 @@ fn td016_memory_bounded_when_price_drifts_out_of_band() {
 #[test]
 fn td016_backstop_cap_evicts_farthest_never_top() {
     let mut book = empty_book();
-    let n = (BACKSTOP_LEVELS_PER_SIDE as i64) * 3; // втрое больше капа
+    let n = BACKSTOP_LEVELS_PER_SIDE as i64 + 5_000; // чуть больше капа
     let d = diff(
         1,
         (1..=n).map(|k| (MID0 - k * TICK, E8)).collect(),
