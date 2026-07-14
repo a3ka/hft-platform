@@ -1,28 +1,23 @@
 #!/usr/bin/env bash
-# Механический барьер: артефакты гейтов нельзя удалить или увести из-под защиты.
+# Механический барьер: артефакт гейта, который СУЩЕСТВОВАЛ, обязан существовать на HEAD.
 #
 # Защищено:
 #   research/critiques/*.md   — вердикты critic/risk-critic (аудит-трейл гейтов)
 #   milestones/*.md           — спеки, по которым исполняют dev-агенты
-#   docs/rfc/**               — contract-RFC (T1-governance; КАНОНИЧЕСКИЙ путь)
-#   docs/contract-rfc/**      — исторический путь тех же RFC (защищаем, пока существует)
+#   docs/rfc/**               — contract-RFC (КАНОН); docs/contract-rfc/** — исторический путь
 #
-# Что ловим (findings C-006 rev3 — прошлая версия проверяла только НЕТТО-диф и обходилась):
-#   1. покоммитно, от merge-base до HEAD → add→delete внутри ветки больше не «схлопывается»;
-#   2. rename ИЗ защищённого в НЕзащищённый путь (увод из-под защиты) = удаление;
-#      rename защищённый→защищённый разрешён;
-#   3. override действует ТОЛЬКО в ТОМ ЖЕ коммите, который удаляет (не «где-то в диапазоне»);
-#   4. оба каталога RFC;
-#   5. MERGE-КОММИТЫ (находка C-006 rev4): merge может САМ выбросить файл, присутствующий во
-#      ВСЕХ родителях («злой мерж»). `--no-merges` это пропускал — критик воспроизвёл: merge,
-#      удаляющий milestones/*.md, давал exit=0.
+# ── Почему критерий именно такой (эволюция после трёх итераций критика) ──────────────
+# Прежние версии гонялись за СПОСОБОМ исчезновения (D в коммите, R в коммите, D в мерже…) —
+# и каждый раз находился новый способ: `git mv` внутри merge-коммита (статус R, не D);
+# `merge -s ours`, выбрасывающий файл, который жил только в side-ветке (относительно первого
+# родителя удаления нет вовсе). Латать частные случаи бесполезно.
 #
-# Критерий нарушения: артефакт удалён/уведён коммитом ветки И ОТСУТСТВУЕТ НА HEAD.
-# Так ловится и add→delete внутри ветки (на HEAD его нет), и «снёс чужой вердикт»
-# (на HEAD его нет), но НЕ наказывается легитимный сценарий «удалил → восстановил»
-# (инцидент 139b399 → 352b1db: вердикт снесли по ошибке и вернули — на HEAD он есть).
-#
-# Осознанное удаление: строка `ALLOW-ARTIFACT-DELETE: <причина>` в теле ЭТОГО коммита.
+# Инвариант формулируется от РЕЗУЛЬТАТА, а не от способа:
+#   если защищённый путь существовал (в базе ИЛИ был добавлен в этой ветке),
+#   он ОБЯЗАН существовать на HEAD — либо под тем же именем, либо переехав в другой
+#   защищённый путь, либо его удалил коммит с явным `ALLOW-ARTIFACT-DELETE:` в СВОЁМ теле.
+# Любой способ исчезновения (delete, rename-out, evil merge, -s ours, add→delete) ловится
+# автоматически, потому что все они дают один и тот же результат: файла нет на HEAD.
 set -euo pipefail
 
 BASE_REF="${1:-origin/main}"
@@ -35,96 +30,61 @@ is_protected() {
   esac
 }
 
+# 1) Защищённые пути, которые СУЩЕСТВОВАЛИ: в базе + добавленные/переименованные в диапазоне.
+existed=$(
+  { git ls-tree -r --name-only "${base}"
+    git log --diff-filter=AR -M --name-only --format='' "${base}..HEAD"
+  } | sort -u | grep -vE '^$' || true
+)
+
 violations=0
+for path in ${existed}; do
+  is_protected "${path}" || continue
+  git cat-file -e "HEAD:${path}" 2>/dev/null && continue     # цел — вопросов нет
 
-# ── Слой B: MERGE-КОММИТЫ («злой мерж», C-006 rev4) ───────────────────────────────────
-# Файл, который есть во ВСЕХ родителях, но отсутствует в самом merge-коммите, выброшен ИМ.
-# (Если файл удалён на одной из веток — он отсутствует в этом родителе, и это не «злой мерж»:
-#  такое удаление ловится слоем A на коммите, который его сделал.)
-for mc in $(git rev-list --merges --reverse "${base}..HEAD"); do
-  parents=$(git log -1 --format='%P' "${mc}")
-  body=$(git log -1 --format='%B' "${mc}")
-  subject=$(git log -1 --format='%h %s' "${mc}")
-  override=0
-  printf '%s' "${body}" | grep -q '^ALLOW-ARTIFACT-DELETE:' && override=1
+  # Файла нет на HEAD. Ищем коммит(ы), которые его убрали.
+  removed_by=$(git log --diff-filter=DR -M --format='%H' "${base}..HEAD" -- "${path}" || true)
 
-  first_parent=$(echo "${parents}" | awk '{print $1}')
-  # Кандидаты: защищённые пути, удалённые относительно ПЕРВОГО родителя.
-  while IFS=$'\t' read -r status path _rest; do
-    [ -z "${status:-}" ] && continue
-    case "${status}" in D*) ;; *) continue ;; esac
-    is_protected "${path}" || continue
-
-    in_all_parents=1
-    for p in ${parents}; do
-      git cat-file -e "${p}:${path}" 2>/dev/null || in_all_parents=0
-    done
-    [ "${in_all_parents}" -eq 1 ] || continue   # удалён на ветке-родителе → слой A уже разобрал
-
-    if git cat-file -e "HEAD:${path}" 2>/dev/null; then
-      echo "NOTE  ${subject}: merge выбрасывал ${path}, но на HEAD артефакт ПРИСУТСТВУЕТ"
-    elif [ "${override}" -eq 1 ]; then
-      echo "NOTE  ${subject}: удаление ${path} в merge разрешено ALLOW-ARTIFACT-DELETE"
-    else
-      echo "FAIL  ${subject}: MERGE-КОММИТ выбрасывает защищённый артефакт: ${path}"
-      echo "      (файл есть во ВСЕХ родителях — значит его выбросил сам merge, «злой мерж»)"
-      violations=$((violations + 1))
+  ok=0
+  reason=""
+  for c in ${removed_by}; do
+    # (а) переезд в ДРУГОЙ защищённый путь — легитимная миграция (docs/contract-rfc → docs/rfc)
+    newp=$(git show -M --name-status --format='' "${c}" \
+             | awk -v p="${path}" '$1 ~ /^R/ && $2 == p {print $3}' | head -1)
+    # Достаточно, чтобы новый путь тоже был ЗАЩИЩЁН: он сам проверяется этим же циклом
+    # (цепочка переименований A→B→C внутри защиты легитимна; требовать существования B на
+    # HEAD нельзя — он мог переехать дальше).
+    if [ -n "${newp}" ] && is_protected "${newp}"; then
+      ok=1; reason="переехал в ${newp} (остался под защитой)"; break
     fi
-  done < <(git diff --name-status "${first_parent}" "${mc}")
-done
+    # (б) осознанное удаление — override в ТЕЛЕ ЭТОГО коммита
+    if git log -1 --format='%B' "${c}" | grep -q '^ALLOW-ARTIFACT-DELETE:'; then
+      ok=1; reason="ALLOW-ARTIFACT-DELETE в $(git log -1 --format='%h' "${c}")"; break
+    fi
+  done
 
-# ── Слой A: обычные коммиты ────────────────────────────────────────────────────────────
-for commit in $(git rev-list --no-merges --reverse "${base}..HEAD"); do
-  body=$(git log -1 --format='%B' "${commit}")
-  override=0
-  if printf '%s' "${body}" | grep -q '^ALLOW-ARTIFACT-DELETE:'; then
-    override=1
+  if [ "${ok}" -eq 1 ]; then
+    echo "NOTE  ${path}: ${reason}"
+  else
+    violations=$((violations + 1))
+    if [ -z "${removed_by}" ]; then
+      echo "FAIL  ${path}: артефакт ИСЧЕЗ с HEAD, и ни один коммит его не удалял"
+      echo "      (значит его выбросил MERGE — evil merge / -s ours / rename внутри мержа)"
+    else
+      echo "FAIL  ${path}: артефакт удалён без ALLOW-ARTIFACT-DELETE"
+      for c in ${removed_by}; do echo "      $(git log -1 --format='%h %s' "${c}")"; done
+    fi
   fi
-  subject=$(git log -1 --format='%h %s' "${commit}")
-
-  # -M: детекция переименований. Формат: "D<TAB>path" | "R100<TAB>old<TAB>new"
-  while IFS=$'\t' read -r status a b; do
-    [ -z "${status:-}" ] && continue
-    case "${status}" in
-      D*)
-        if is_protected "${a}"; then
-          if git cat-file -e "HEAD:${a}" 2>/dev/null; then
-            echo "NOTE  ${subject}: удалял ${a}, но на HEAD артефакт ПРИСУТСТВУЕТ (восстановлен)"
-          elif [ "${override}" -eq 1 ]; then
-            echo "NOTE  ${subject}: удаление ${a} разрешено ALLOW-ARTIFACT-DELETE"
-          else
-            echo "FAIL  ${subject}: УДАЛЯЕТ защищённый артефакт (и его нет на HEAD): ${a}"
-            violations=$((violations + 1))
-          fi
-        fi
-        ;;
-      R*)
-        if is_protected "${a}"; then
-          if is_protected "${b}"; then
-            : # защищённый → защищённый: легитимный переезд (docs/contract-rfc → docs/rfc)
-          elif git cat-file -e "HEAD:${a}" 2>/dev/null; then
-            echo "NOTE  ${subject}: уводил ${a}, но на HEAD артефакт ПРИСУТСТВУЕТ"
-          elif [ "${override}" -eq 1 ]; then
-            echo "NOTE  ${subject}: увод ${a} → ${b} разрешён ALLOW-ARTIFACT-DELETE"
-          else
-            echo "FAIL  ${subject}: УВОДИТ артефакт из-под защиты: ${a} → ${b}"
-            echo "      (переименование в незащищённый путь = то же удаление, только тихое)"
-            violations=$((violations + 1))
-          fi
-        fi
-        ;;
-    esac
-  done < <(git show -M --name-status --format='' "${commit}")
 done
 
 if [ "${violations}" -gt 0 ]; then
   echo
   echo "Артефакты гейтов — аудит-трейл, а не черновики. Почти всегда FAIL означает:"
   echo "  • ты не на своей ветке (общий чекаут переключили), ЛИБО"
-  echo "  • сделан 'git commit -a' / 'git add -A' (запрещено, .claude/rules/branch-hygiene.md)."
+  echo "  • 'git commit -a' / 'git add -A' (запрещено, .claude/rules/branch-hygiene.md)."
   echo "Осознанное удаление — строкой в теле ТОГО ЖЕ коммита:"
   echo "  ALLOW-ARTIFACT-DELETE: <причина>"
   exit 1
 fi
 
-echo "OK: защищённые артефакты целы (${base:0:7}..HEAD, покоммитно, с учётом переименований)"
+echo "OK: защищённые артефакты целы на HEAD (${base:0:7}..HEAD; проверка по РЕЗУЛЬТАТУ, не по способу)"
