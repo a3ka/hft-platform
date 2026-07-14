@@ -81,8 +81,13 @@ exit=0}
 4. Reviewer (не dev, не architect) — последний в цепочке для substantive-изменений;
    именно reviewer делает push после APPROVED и обновляет `PROJECT-STATE.md` +
    `TECH-DEBT.md`.
-5. Architect пушит сам ТОЛЬКО для чисто-процессных правок (`.claude/rules/*`,
-   `docs/04-workflow.md` и т.п.), не тронувших код/контракты/риск.
+5. **Architect НЕ пушит архитектурные документы сам** (уточнено 2026-07-14, doc-гейт
+   `.claude/rules/gates.md` §9). Класс A (DESIGN §-структура/роадмап, `docs/0N-*`, `docs/fa/*`,
+   новые milestone'ы, `BACKLOG.md`, `.claude/rules/*`, `.claude/agents/*`) идёт через
+   critic → reviewer → push reviewer'ом; фазы/приоритеты — ещё и founder ★.
+   Self-push architect'у разрешён ТОЛЬКО для класса B (статус-колонки, close-out-пруфы,
+   опечатки, битые ссылки). Причина: документ — источник, из которого агенты исполняют;
+   ошибка в спеке не падает в CI, а тихо тиражируется в код.
 
 Если любой гейт не прошёл — **не пушить**, вернуть Handoff §E с явным блокером
 (`.claude/rules/handoff-block.md`).
