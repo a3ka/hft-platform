@@ -315,6 +315,27 @@ CI + Deploy на merge-коммите — success. **Анти-плацебо д�
 - **M-08 остаётся 🚧 IN_PROGRESS.** Закрывается ТОЛЬКО после задачи 14 + §8 с реальным dry-run
   ретеншена на проде.
 
+### rev 7/8 (задачи 14/15) — REVIEWER REJECTED + REVERTED (`b43044d`, 2026-07-14)
+Стек `d43d923..91f11aa` (task 14 delivery + task 15 compaction + D5/C5 fixes) прошёл локальные
+reviewer-гейты: `fmt`, `clippy -D warnings`, workspace **178 passed / 0 failed**,
+`verify_M-08.sh` PASS, `verify_delivery_M-08.sh` PASS, deep delivery PASS. Анти-плацебо:
+старый cron из `e4f23d1` валит новый D5 (`bad minute`, exit=1); C1-C6 валятся на `76aadb2`;
+наивная C5-мутация "распаковать .zst в `Vec<u8>`" валится на ~100 MB пика.
+
+**§8 PROD RED:** после merge/push `91f11aa` CI и Deploy были зелёные, VPS был healthy
+(`restarts=0`, heartbeat свежий, recorder писал), но реальное задание
+`/root/hft-platform/deploy/bin/journal-retention-cron.sh` упало ДО плана:
+`journal-retention: неизвестный флаг --dir=/journal`. Причина: cron/compose передают
+`--flag=value`, а CLI `journal-retention` парсит только пару `--flag value`. Это тот же класс
+TD-020: артефакт в образе/cron существует, но операторский путь не отрабатывает на боевом
+каталоге. Установленный для проверки cron-артефакт и alert-marker удалены.
+
+По правилу §8 "красный прод → revert" стек откатан одним коммитом `b43044d`; rollback CI
+`29359107762` и Deploy `29359107734` GREEN. Прод после отката: `/root/hft-platform` HEAD
+`b43044d`, `hft-recorder` healthy/restarts=0, heartbeat свежий, активный `segment-00000003.jrnl`
+растёт, `/etc/cron.d/hft-journal-retention` отсутствует. **M-08 остаётся IN_PROGRESS; TD-020,
+TD-006 и TD-022 остаются OPEN.**
+
 - `crates/contracts` (**CT-RFC-02**, atomic RFC `docs/rfc/CT-RFC-02-journal-provenance.md`) —
   `SCHEMA_VERSION` 1→2; provenance живёт в ЗАГОЛОВКЕ СЕГМЕНТА, не в `Event` (при 2.8 GB/сут тег в
   каждом событии = гигабайты мусора): `SegmentHeader{schema_version, source, provenance, epoch_id,

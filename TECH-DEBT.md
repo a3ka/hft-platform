@@ -135,6 +135,15 @@
   хранилища + cron + алерт на exit≠0 (2 = сверка не прошла, 3 = disk_pressure). Первый прогон на
   проде — ОБЯЗАТЕЛЬНО `--mode dry-run` (дефолт уже такой), Apply — отдельной командой после
   визуального подтверждения отчёта. M-08 не закрывается до этого.
+  **СТАТУС 2026-07-14 (M-08 tasks 14/15 PR-gate, stack `d43d923..91f11aa`, rollback `b43044d`):
+  доставка REJECTED и откатана.** Локально delivery-оракулы были зелёные, включая deep build/run,
+  но §8 на VPS доказал, что реальное cron-задание не работает: лог
+  `journal-retention: неизвестный флаг --dir=/journal`, exit=1. Скрипт/compose передают
+  `--flag=value`, CLI принимает только `--flag value`. D5 всё ещё недостаточен: он доказал
+  устанавливаемость cron и поведение alert-обёртки со стабом `docker`, но не прогнал реальный
+  binary+compose argv path. Следующая задача 14 должна либо поддержать оба синтаксиса в CLI, либо
+  передавать split-аргументы в compose/cron, и обязана иметь оракул, который запускает реальное
+  задание до `retention_plan`, а не только stub.
 - **TD-021** `memory-metric-includes-page-cache` (найдено reviewer'ом на §8 M-08, 2026-07-14).
   Все прежние замеры памяти recorder'а (мои в TD-016: 8.4 → 48 → 139 MiB; оракульная мотивация
   «+6.5 MiB/час») снимались через `docker stats`, который показывает cgroup `memory.current` —
@@ -146,6 +155,14 @@
   `.claude/rules/testing.md` (прод-масштаб для sacred I/O-путей) и в чек-лист §8
   (`.claude/rules/gates.md`): **RSS мерить как anon, не как cgroup-total**. Зона: architect
   (процессный слой). Severity: **MAJOR** (метрика вводила в заблуждение два milestone'а подряд).
+- **TD-022** `closed-segment-compaction-not-delivered` (M-08 task 15, reviewer §8, 2026-07-14).
+  Компакция закрытых сегментов была реализована в стековой ветке (`d131519`, oracle fix `e4f23d1`)
+  и локально выглядела не-плацебо: C1-C6 FAIL против `76aadb2`, GREEN на `91f11aa`, C5 валит
+  наивную реализацию "распаковать .zst целиком в RAM". Но стек был откатан из-за красного task 14
+  на prod dry-run, поэтому **компакции нет ни на main, ни на проде**, закрытый сегмент не сжат,
+  свободное место и deadline disk-guard не отодвинуты. Следующий виток должен доставить
+  операторский/CLI-путь компакции или явную §8-команду, реально сжать закрытый сегмент на VPS,
+  доказать чтение `journal::stream` после сжатия и отсутствие потери событий. Severity: **MAJOR**.
 - **TD-018** `deploy-ci-gate-cannot-read-ci-status` (найдено reviewer'ом на §8 M-08, 2026-07-14).
   Гейт TD-017 (`deploy.yml` job `ci`, «Wait for CI success on this commit») **не работает**:
   `gh api repos/$REPO/actions/runs?head_sha=$SHA` возвращает **`HTTP 403 Resource not accessible
@@ -203,6 +220,9 @@
   `HFTJRN02`; `seq` сквозной, `restarts=0`). **Ретеншен и cold-выгрузка — ❌ В ПРОДЕ НЕ РАБОТАЮТ**
   (бинарь не доставлен, холодного хранилища нет — см. TD-020). ⇒ **TD-006 остаётся OPEN**: диск
   по-прежнему монотонно растёт, просто кусками по 1 GiB. Закрывается вместе с TD-020 (задача 14).
+  **СТАТУС 2026-07-14 (tasks 14/15 rollback `b43044d`): всё ещё OPEN.** Реальная prod-компакция
+  закрытого сегмента не была выполнена: стек с `compact_closed_segments` откатан из-за красного
+  dry-run ретеншена, свободное место не увеличено, deadline disk-guard не отодвинут.
 - **TD-007** DET-I-1 (бит-идентичный replay + state_hash) реализован частично (seq+read_all).
   Полный snapshot/state_hash — следующая фаза journal. Severity: NOTE.
 - **TD-008** `t1-report-forms-promotion` (M-04). Rust-типы T1-форм `TrialRecord`/
