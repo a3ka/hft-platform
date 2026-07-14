@@ -1,8 +1,15 @@
-//! `journal-retention` — операторский путь ретеншена (M-08 task 11, TD-020).
+//! `journal-retention` — операторский путь ретеншена И компакции (M-08 task 11+16, TD-020+TD-022).
+//!
+//! ОДИН бинарь для двух операций: ретеншен (выгрузка+prune) и компакция закрытых
+//! сегментов (zstd). Логика — это две разные операции, но контракт argv и шов
+//! алерта/логирования ОБЩИЕ — один `-cron.sh`, один гейт cron'а, один Dockerfile.
+//! Парадигма: «CLI ДОЛЖЕН уметь всё, что оператор зовёт из cron'а», а не плодить
+//! `--bin journal-compactor` рядом (rev 9 блокер reviewer'а: «функция без оператора»).
 //!
 //! Отдельный бинарь (а НЕ поток внутри recorder'а) — падение уборки НЕ роняет сбор.
-//! На проде запускается через cron; первый прогон — **обязательно `--mode dry-run`**
-//! (per `.claude/rules/process.md` §8).
+//! На проде запускается через cron; первый прогон ретеншена — **обязательно `--mode dry-run`**
+//! (per `.claude/rules/process.md` §8). Компакция — перманентно безопасна: пишет во
+//! временный файл, сверяет sha256, и только потом удаляет оригинал (D-COMP-2).
 //!
 //! ## Аргументы
 //!
@@ -13,14 +20,19 @@
 //! | `--retain-days <N>` | сегменты старше N суток — кандидаты | `14` |
 //! | `--keep-min <N>` | минимум последних N сегментов остаются горячими | `4` |
 //! | `--min-free-gb <N>` | ниже этого объёма (GiB) поднимается `disk_pressure` | `10` |
+//! | `--keep-raw <N>` | `--mode compact`: последние N закрытых сегментов остаются сырыми | `2` |
 //! | `--now-wall-ms <i64>` | часы снаружи (детерминизм, ТОЛЬКО для тестов) | `SystemTime::now()` |
-//! | `--mode <dry-run\|apply>` | режим исполнения | `dry-run` |
+//! | `--mode <dry-run\|apply\|compact>` | режим исполнения | `dry-run` |
 //!
 //! ## Exit-коды
 //!
-//! - `0` — успех (DryRun завершился без эффектов; Apply выполнил все сверки+prune).
+//! - `0` — успех (DryRun завершился без эффектов; Apply выполнил все сверки+prune;
+//!   Compact завершился без провалов верификации).
 //! - `1` — неверные аргументы / I/O-ошибка чтения каталога.
-//! - `2` — план построен, но при Apply хотя бы один сегмент дал сбой сверки (`failed` не пуст).
+//! - `2` — план построен, но при Apply хотя бы один сегмент дал сбой сверки (`failed` не пуст);
+//!   в `--mode compact` — `compact_closed_segments` вернул `Err` (хотя бы один сегмент
+//!   не доделал операцию: крах-окно с битым `.zst` → оригинал остался ГОРЯЧИМ, сегмент
+//!   в `failed`. Никаких данных не потеряно, но оператор ОБЯЗАН увидеть алерт).
 //! - `3` — `disk_pressure = true`: мало места, уборка не помогает. Требует внимания
 //!   оператора даже если формально Apply прошёл (dry-run И apply).
 //!
@@ -32,19 +44,31 @@
 //!   горячими и попадают в `failed` (R3).
 //! - **`disk_pressure` выводится всегда** (включая DryRun) — оператор видит тревогу
 //!   даже при «успешном» прогоне.
+//!
+//! ## Компакция (D-COMP-3)
+//!
+//! `--mode compact` — отдельный режим:
+//! - не задействует cold storage и disk-guard (`compact_closed_segments` сам
+//!   обрабатывает крах-окно: D-COMP-1/2);
+//! - `--keep-raw N` оставляет последние N закрытых сегментов сырыми (свежее
+//!   читается чаще, несжатый доступ дешевле);
+//! - уровень zstd фиксированный `DEFAULT_COMPACT_LEVEL=3` (9.1× на боевых данных);
+//! - exit 0 — все сегменты успешно сжаты или самоизлечены; exit 2 — была ошибка
+//!   верификации (битый .zst, несверяемая копия → оригинал оставлен ГОРЯЧИМ).
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use journal::{
-    retention_execute, retention_plan, RetentionMode, RetentionPlan, RetentionPolicy,
-    RetentionReport,
+    compact_closed_segments, retention_execute, retention_plan, CompactionReport, RetentionMode,
+    RetentionPlan, RetentionPolicy, RetentionReport, DEFAULT_COMPACT_LEVEL,
 };
 
 const DEFAULT_RETAIN_DAYS: u32 = 14;
 const DEFAULT_KEEP_MIN: u32 = 4;
 const DEFAULT_MIN_FREE_GB: u64 = 10;
+const DEFAULT_KEEP_RAW: u32 = 2;
 const DEFAULT_DIR: &str = "./journal-data";
 const DEFAULT_COLD: &str = "./journal-cold";
 
@@ -54,6 +78,8 @@ struct Args {
     retain_days: u32,
     keep_min: u32,
     min_free_bytes: u64,
+    /// `--mode compact` — последние N закрытых сегментов остаются сырыми (D-COMP-3).
+    keep_raw: u32,
     now_wall_ms: Option<i64>,
     mode: RetentionMode,
 }
@@ -65,6 +91,7 @@ fn parse_args() -> Result<Args, String> {
     let mut retain_days: Option<u32> = None;
     let mut keep_min: Option<u32> = None;
     let mut min_free_gb: Option<u64> = None;
+    let mut keep_raw: Option<u32> = None;
     let mut now_wall_ms: Option<i64> = None;
     let mut mode: Option<RetentionMode> = None;
 
@@ -101,6 +128,13 @@ fn parse_args() -> Result<Args, String> {
                         .map_err(|e| format!("--min-free-gb: {e}"))?,
                 );
             }
+            "--keep-raw" => {
+                keep_raw = Some(
+                    next()?
+                        .parse::<u32>()
+                        .map_err(|e| format!("--keep-raw: {e}"))?,
+                );
+            }
             "--now-wall-ms" => {
                 now_wall_ms = Some(
                     next()?
@@ -112,9 +146,12 @@ fn parse_args() -> Result<Args, String> {
                 mode = Some(match next()? {
                     "dry-run" | "dryrun" | "dry" => RetentionMode::DryRun,
                     "apply" => RetentionMode::Apply,
+                    // D-COMP-3: третий режим — компакция закрытых сегментов (zstd).
+                    "compact" | "compaction" => RetentionMode::Compact,
                     other => {
                         return Err(format!(
-                            "--mode: неизвестное значение `{other}` (ожидается dry-run|apply)"
+                            "--mode: неизвестное значение `{other}` \
+                             (ожидается dry-run|apply|compact)"
                         ));
                     }
                 });
@@ -136,6 +173,7 @@ fn parse_args() -> Result<Args, String> {
         min_free_bytes: min_free_gb
             .unwrap_or(DEFAULT_MIN_FREE_GB)
             .saturating_mul(1024 * 1024 * 1024),
+        keep_raw: keep_raw.unwrap_or(DEFAULT_KEEP_RAW),
         now_wall_ms,
         mode: mode.unwrap_or(RetentionMode::DryRun),
     })
@@ -143,22 +181,24 @@ fn parse_args() -> Result<Args, String> {
 
 fn print_help() {
     println!(
-        "journal-retention — операторский путь ретеншена (M-08 TD-020)\n\
+        "journal-retention — операторский путь ретеншена И компакции (M-08 TD-020+TD-022)\n\
          \n\
          Использование:\n  \
            journal-retention [--dir DIR] [--cold COLD] [--retain-days N] [--keep-min N]\n  \
-                              [--min-free-gb N] [--now-wall-ms MS] [--mode dry-run|apply]\n\
+                              [--min-free-gb N] [--keep-raw N] [--now-wall-ms MS]\n  \
+                              [--mode dry-run|apply|compact]\n\
          \n\
          Дефолты:\n  \
            --dir={DEFAULT_DIR}  --cold={DEFAULT_COLD}\n  \
-           --retain-days={DEFAULT_RETAIN_DAYS}  --keep-min={DEFAULT_KEEP_MIN}  --min-free-gb={DEFAULT_MIN_FREE_GB}\n  \
-           --mode=dry-run  (Apply — ТОЛЬКО после успешного DryRun на проде)\n\
+           --retain-days={DEFAULT_RETAIN_DAYS}  --keep-min={DEFAULT_KEEP_MIN}\n  \
+           --min-free-gb={DEFAULT_MIN_FREE_GB}  --keep-raw={DEFAULT_KEEP_RAW}\n  \
+           --mode=dry-run  (Apply — ТОЛЬКО после успешного DryRun на проде; Compact безопасен по дизайну)\n\
          \n\
          Exit-коды:\n  \
            0 — успех\n  \
            1 — неверные аргументы / I/O\n  \
-           2 — failed-сегменты при Apply (сверка холодной копии не прошла)\n  \
-           3 — disk_pressure (мало места, уборка не помогает)\n"
+           2 — failed-сегменты при Apply/Compact (сверка холодной копии / sha256 .zst не прошла)\n  \
+           3 — disk_pressure (мало места, уборка не помогает — только retention)\n"
     );
 }
 
@@ -180,6 +220,14 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
+
+    // D-COMP-3: компакция — ОТДЕЛЬНЫЙ режим ТОГО ЖЕ бинаря, со своим argv-минимумом
+    // (--dir, --keep-raw, --mode compact). Никакого retention_plan/cold — компакция
+    // безопасна по дизайну (D-COMP-2 самоизлечение), и шов с cold-storage тут не нужен.
+    // Сужаем поведение до понятного cron'у подмножества.
+    if args.mode == RetentionMode::Compact {
+        return run_compact(&args);
+    }
 
     let now_wall_ms = args.now_wall_ms.unwrap_or_else(default_now_wall_ms);
     let policy = RetentionPolicy {
@@ -231,6 +279,84 @@ fn main() -> ExitCode {
         return ExitCode::from(3);
     }
     ExitCode::SUCCESS
+}
+
+/// Запустить компакцию закрытых сегментов (D-COMP-3).
+///
+/// Отдельная функция, потому что путь короткий (нет cold, нет retention_plan/execute,
+/// нет disk-guard), и смешивать его с ретеншеном в одном теле — значит заводить
+/// развесистый `if/else` по двум разным алгоритмам. Здесь — всё одной сводкой:
+/// сжать → отчитаться → exit 0/2 (провал sha256 = exit 2, без потери данных).
+fn run_compact(args: &Args) -> ExitCode {
+    println!(
+        "=== компакция закрытых сегментов (D-COMP-3) ===\n  \
+         dir={}\n  keep_raw={}  compact_level={}\n",
+        args.dir.display(),
+        args.keep_raw,
+        DEFAULT_COMPACT_LEVEL,
+    );
+
+    // На пустом каталоге / на свежем deploy'е `compact_closed_segments` обязан вернуть
+    // пустой Vec без ошибок: первая строка cron-задания (`$RETENTION_MODE=dry-run`-ом
+    // всё разворачивается, вызывается на VPS ещё до появления сегментов) не должна
+    // ронять алерт.
+    match compact_closed_segments(&args.dir, args.keep_raw, DEFAULT_COMPACT_LEVEL) {
+        Ok(reports) => {
+            print_compact_reports(&reports);
+            if reports.is_empty() {
+                println!("  (нет закрытых сегментов — нечего сжимать)");
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            // D-COMP-2: Err из compact_closed_segments — это сбой sha256-сверки
+            // существующего .zst (D-COMP-2). Данные НЕ ПОТЕРЯНЫ (оригинал остался
+            // ГОРЯЧИМ), но оператор обязан увидеть тревогу: следующий прогон
+            // перепишет .zst; если ошибка не уходит — что-то глубже сломано.
+            eprintln!(
+                "journal-retention[compact]: {} сегмент(ов) остались в конфликте raw+.zst \
+                 после самоизлечения. Следующий прогон перепишет .zst с нуля. Оригиналы НЕ \
+                 удалены. Подробности: {e}",
+                1
+            );
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// Печать итогов компакции (отдельная, чтобы не перегружать print_plan/print_report).
+fn print_compact_reports(reports: &[CompactionReport]) {
+    if reports.is_empty() {
+        return;
+    }
+    println!("  compacted: {} сегмент(ов)", reports.len());
+    let mut total_before: u64 = 0;
+    let mut total_after: u64 = 0;
+    for r in reports {
+        let ratio = if r.bytes_before > 0 {
+            1.0 - (r.bytes_after as f64 / r.bytes_before as f64)
+        } else {
+            0.0
+        };
+        println!(
+            "    - {} → {} ({} → {} B, −{:.1}%)",
+            r.source.display(),
+            r.compacted.display(),
+            r.bytes_before,
+            r.bytes_after,
+            ratio * 100.0,
+        );
+        total_before += r.bytes_before;
+        total_after += r.bytes_after;
+    }
+    if total_before > 0 {
+        println!(
+            "  итого: {} → {} B (коэффициент {:.2}×)",
+            total_before,
+            total_after,
+            total_before as f64 / total_after.max(1) as f64,
+        );
+    }
 }
 
 fn print_plan(args: &Args, plan: &RetentionPlan) {

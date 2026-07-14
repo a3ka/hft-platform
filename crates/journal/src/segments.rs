@@ -1285,10 +1285,23 @@ pub struct RetentionPolicy {
 }
 
 /// Режим запуска. **Дефолт оператора — `DryRun`** (первый прогон на проде — обязательно он).
+///
+/// M-08 task 16 (D-COMP-3): добавлен вариант `Compact` — третий режим ТОГО ЖЕ бинаря
+/// `journal-retention` (`--mode compact`). Компакция сжатием закрытых сегментов
+/// переехала в общий бинарь, чтобы:
+/// - один контракт argv на задание/cron (а не два разных бинаря с разным парсером);
+/// - один Dockerfile pipeline (`--bin recorder --bin journal-retention` уже всё
+///   включает, расщеплять ради операции — размножать интерфейс);
+///
+/// `Compact` НЕ проходит через `retention_plan`/`retention_execute` (это другой
+/// алгоритм с другой инвариантной): `retention_execute` возвращает пустой отчёт
+/// для этого режима — вызывающий (бинарь) переходит к `compact_closed_segments`
+/// напрямую. БИБЛИОТЕКА — отдельные API, БИНАРЬ — один.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetentionMode {
     DryRun,
     Apply,
+    Compact,
 }
 
 /// План: что БУДЕТ сделано. Строится ДЕТЕРМИНИРОВАННО (часы передаются аргументом —
@@ -1582,6 +1595,20 @@ pub fn retention_execute(
                 pruned,
                 failed,
                 freed_bytes,
+            })
+        }
+        RetentionMode::Compact => {
+            // D-COMP-3: компакция идёт через ОТДЕЛЬНЫЙ API (`compact_closed_segments`),
+            // НЕ через `retention_plan`/`retention_execute`. Сюда мы попадаем только если
+            // бинарь по ошибке перенаправил Compact в этот код — отдаём пустой отчёт
+            // и оставляем main'у свободу вызвать `compact_closed_segments` напрямую
+            // (это и есть нормальный путь).
+            Ok(RetentionReport {
+                mode: RetentionMode::Compact,
+                offloaded: Vec::new(),
+                pruned: Vec::new(),
+                failed: Vec::new(),
+                freed_bytes: 0,
             })
         }
     }

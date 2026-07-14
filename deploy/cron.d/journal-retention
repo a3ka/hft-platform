@@ -41,7 +41,18 @@ RETENTION_MIN_FREE_GB=10
 RETENTION_MODE=dry-run
 RETENTION_LOG=/var/log/hft/journal-retention.log
 RETENTION_ALERT_FILE=/var/lib/hft/retention.alert
+# D-COMP-3 (M-08 task 16, TD-022): компакция закрытых сегментов — отдельное расписание,
+# НЕ коллидирующее по времени с ретеншеном (оба пишут в /journal; 03:50 UTC — за 17 минут
+# ДО ретеншена, чтобы fsync-волна компакции не наложилась на ретеншен-выгрузку).
+COMPACTION_KEEP_RAW=2
+COMPACTION_LOG=/var/log/hft/journal-compaction.log
+COMPACTION_ALERT_FILE=/var/lib/hft/compaction.alert
 
-# Ежедневно в 04:07 UTC. Время — стартовая точка, согласуется с founder'ом.
 # m h dom mon dow user command
+# РетеRтеншен: ежедневно 04:07 UTC (по cron'у НИКОГДА apply — конструктивный барьер,
+# иначе автоматическое удаление без глаза оператора = TD-020).
 7 4 * * * root /root/hft-platform/deploy/bin/journal-retention-cron.sh
+# Компакция: ежедневно 03:50 UTC. Безопасна по дизайну (D-COMP-2: оригинал удаляется
+# только после sha256-сверки .zst); dry-run-семантика НЕ размывается — компакция это
+# отдельный режим того же бинаря, не часть apply.
+50 3 * * * root /root/hft-platform/deploy/bin/journal-compaction-cron.sh

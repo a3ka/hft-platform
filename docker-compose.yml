@@ -66,5 +66,36 @@ services:
       - "${JOURNAL_COLD_DIR:-/mnt/journal-cold}:/cold"
     # Контейнер одноразовый — без restart; запускается по cron или вручную оператором.
 
+  # D-COMP-3 (M-08 task 16, TD-022): компакция закрытых сегментов (zstd) — ОТДЕЛЬНЫЙ
+  # ops-сервис, а не пуш в recorder/retenшен. Тому три причины:
+  #  • режим `--mode compact` третьего бинаря требует RW на /journal (создаёт .zst,
+  #    после самоизлечения (D-COMP-2) удаляет .jrnl), а retention сидит на RO;
+  #  • неделимая операция — НЕ часть cron-задания ретеншена: разные env (нет cold,
+  #    есть --keep-raw), разные гейты, разные маркеры алертов;
+  #  • компакция безопаснее ретеншена по определению (orig удаляется ТОЛЬКО после
+  #    sha256-сверки .zst) — но изоляция процессов всё равно нужна, чтобы падение
+  #    одного не роняло другой (урок TD-011).
+  journal-compaction:
+    image: hft-platform-recorder:local
+    container_name: hft-journal-compaction
+    profiles: ["ops"]
+    entrypoint: ["/usr/local/bin/journal-retention"]
+    command:
+      - --dir=/journal
+      - "--keep-raw=${COMPACTION_KEEP_RAW:-2}"
+      - --mode=compact
+    # Без COLD — компакция работает ТОЛЬКО локально. cold_root у journal-retention
+    # неприменим.
+    environment:
+      # Объявлен для единообразия с retention-сервисом; в compact-режиме НЕ читается.
+      JOURNAL_COLD_DIR: ${JOURNAL_COLD_DIR:-/mnt/journal-cold}
+    volumes:
+      # RW — компакция пишет .zst и удаляет .jrnl после самоизлечения. Конкуренция
+      # с recorder'ом ИСКЛЮЧЕНА логикой: `compact_segment` отвергает сегмент с
+      # МАКСИМАЛЬНЫМ индексом (тот, куда пишет recorder), поэтому recorder ничего
+      # не замечает, а cron-задание — не мешает recorder'у.
+      - journal-data:/journal
+    # Без restart — операторский одноразовый процесс (cron или ручной запуск).
+
 volumes:
   journal-data:
