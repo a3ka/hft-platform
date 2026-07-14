@@ -58,6 +58,14 @@ check "T6b ретеншен: операторский путь (TD-020)" cargo t
 # T8d (задача 12, TD-019): heartbeat несёт СОСТОЯНИЕ (пишет ли, есть ли место), а не только время
 check "T8d heartbeat со storage_status (TD-019)" cargo test -p recorder --test red_heartbeat_status
 
+# T6c (задача 14, TD-020 виток 2): ГЕЙТ ДОСТАВКИ — бинарь обязан быть В ПРОД-ОБРАЗЕ и
+# запускаться; холодное хранилище смонтировано; планировщик и runbook лежат В РЕПО.
+# «cargo test GREEN» ≠ «функция существует в проде» — доказательством является ЗАПУСК.
+check "T6c доставка ретеншена (TD-020: образ+cold+cron+runbook)" bash scripts/verify_delivery_M-08.sh
+
+# T6d (задача 15, TD-022): компакция закрытых сегментов — сжатие НЕ теряет данные
+check "T6d компакция закрытых сегментов (TD-022)" cargo test -p journal --test red_compaction
+
 # T7 (задача 2/4): регрессия журнала — старые инварианты живы (DET-I-1, TD-011 bounded open)
 check "T7 journal регрессия (вкл. red_open_bounded)" cargo test -p journal
 
