@@ -23,10 +23,6 @@ use contracts::{Event, EventKind, SegmentHeader};
 pub mod segments;
 
 pub use segments::{
-    compact_closed_segments, compact_segment, CompactionReport, COMPACTED_SUFFIX,
-    DEFAULT_COMPACT_LEVEL,
-};
-pub use segments::{
     declare_legacy, fingerprint, free_bytes, is_foreign_segment, is_storage_guard, prune_segment,
     segments as list_segments, storage_status, stream, verify_cold_copy, ColdCopyProof,
     EpochFilter, EventStream, SegmentInfo, StorageStatus, WriterConfig, LEGACY_MANIFEST,
