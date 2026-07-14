@@ -562,15 +562,37 @@ fn parse_segment_index_any(name: &str) -> Option<u32> {
     parse_segment_index(base)
 }
 
-/// Обойти `segment-NNNNNNNN.jrnl` И `segment-NNNNNNNN.jrnl.zst` каталога по возрастанию
-/// индекса — БЕЗ классификации по манифесту. Используется в `read_all`/`recover`
-/// (ОФЛАЙН-диагностика, не требует декларации — в отличие от прод-пути `stream`,
-/// который через `list_segments` отвергает чужие/незадекларированные файлы).
+/// Обойти сегменты каталога по возрастанию индекса с дедупликацией по индексу.
 ///
-/// Сжатые и сырые сегменты с одинаковым индексом НЕ ДОЛЖНЫ существовать одновременно
-/// (компакция удаляет оригинал). Если такое обнаружено — побеждает сырой (recorder
-/// пишет в него после возможного отката), сжатый игнорируется.
+/// **ЕДИНСТВЕННЫЙ хелпер выбора победителя коллизии** (D-COMP-1, rev 9 блокер
+/// reviewer'а на PR-гейте M-08). Используется ОБОИМИ путями чтения — `segments()`
+/// (прод-путь через `stream`/`list_segments`) и `iter_segments_sorted()`
+/// (ОФЛАЙН-диагностика `read_all`/`recover`). Без общего хелпера возникает ровно тот
+/// баг, что привёл к блокеру: на одну ситуацию (raw + .zst одного индекса) было два
+/// разных правила (`segments` коллизию НЕ дедуплицировал → 3000 событий читалось как
+/// 3172 и DET-I-1 молча нарушался).
+///
+/// Правило: при коллизии по индексу **побеждает СЫРОЙ `.jrnl`**, `.zst` игнорируется.
+/// Обоснование: recorder при ошибке открытия или rollback переоткроет сырой сегмент
+/// той же эпохи (тот же `first_seq`/тот же контент байт-в-байт до компакции — замер
+/// reviewer'а показал: 3000 событий превращаются в 3172 именно потому, что и raw и
+/// .zst одинаково валидны по CRC32, и оба попадают в стрим). Сжатый сегмент — это
+/// ПРОИЗВОДНАЯ копия; источник истины — сырой (пока он существует).
+///
+/// Возвращает ПУТИ, не классификацию (`SegmentInfo`). Манифест legacy-деклараций НЕ
+/// загружается: для офлайн-диагностики (`read_all`/`recover`) он не требуется —
+/// в отличие от прод-пути, который через `segments()` отвергает чужие/незадекларированные
+/// файлы.
 pub(crate) fn iter_segments_sorted(dir: &Path) -> io::Result<Vec<PathBuf>> {
+    dedup_indexed_paths(dir)
+}
+
+/// Дедуплицировать `segment-*.jrnl` и `segment-*.jrnl.zst` каталога по индексу.
+/// При коллизии побеждает СЫРОЙ (см. `iter_segments_sorted`).
+///
+/// Публичные пути ОБЯЗАНЫ использовать ЭТОТ хелпер (а не собирать индексы параллельно
+/// по своим правилам): иначе воспроизводится rev 9-блокер.
+fn dedup_indexed_paths(dir: &Path) -> io::Result<Vec<PathBuf>> {
     let mut by_index: std::collections::BTreeMap<u32, PathBuf> = std::collections::BTreeMap::new();
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
@@ -592,7 +614,7 @@ pub(crate) fn iter_segments_sorted(dir: &Path) -> io::Result<Vec<PathBuf>> {
                 e.insert(p);
             }
             std::collections::btree_map::Entry::Occupied(mut e) => {
-                // При коллизии (и .jrnl, и .jrnl.zst для одного индекса): побеждает сырой.
+                // D-COMP-1: при коллизии (raw + .zst для одного индекса) побеждает СЫРОЙ.
                 let existing = e.get();
                 let existing_is_zst = existing
                     .file_name()
@@ -601,7 +623,8 @@ pub(crate) fn iter_segments_sorted(dir: &Path) -> io::Result<Vec<PathBuf>> {
                 if existing_is_zst && !is_zst {
                     e.insert(p);
                 }
-                // иначе — оставляем существующий (сырой побеждает, или оба сжатых — берём первый).
+                // Иначе — оставляем существующий (сырой уже стоит, или оба сжатых —
+                // берём первый; повторная компакция того же индекса не наша забота).
             }
         }
     }
@@ -615,20 +638,16 @@ pub(crate) fn iter_segments_sorted(dir: &Path) -> io::Result<Vec<PathBuf>> {
 /// Включает ОБА формата: сырой `.jrnl` и сжатый `.jrnl.zst`. Сжатые сегменты несут
 /// ту же магию+заголовок (первые байты потока zstd декодируются в исходный v2-сегмент),
 /// поэтому классификация по содержимому — единая.
+///
+/// **D-COMP-1 (rev 9):** прод-путь ОБЯЗАН использовать ОБЩИЙ хелпер дедупликации
+/// `dedup_indexed_paths` (как и `iter_segments_sorted`). Раньше `segments()` коллизию
+/// `.jrnl` + `.jrnl.zst` НЕ дедуплицировал — сегмент читался дважды, 3000 событий
+/// превращались в 3172, DET-I-1 нарушался. Теперь это правило одно на оба пути.
 pub fn segments(dir: impl AsRef<Path>) -> io::Result<Vec<SegmentInfo>> {
     let dir = dir.as_ref();
     let manifest = load_manifest(dir)?;
     let mut out = Vec::new();
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let p = entry.path();
-        let name = match p.file_name().and_then(OsStr::to_str) {
-            Some(s) => s,
-            None => continue,
-        };
-        if !name.ends_with(".jrnl") && !is_compacted_name(name) {
-            continue;
-        }
+    for p in dedup_indexed_paths(dir)? {
         out.push(classify_segment(&p, &manifest)?);
     }
     // Стабильная сортировка по индексу — критично для сшивки по границе.
@@ -1600,12 +1619,22 @@ pub struct CompactionReport {
 /// Сжать ЗАКРЫТЫЙ сегмент. Порядок обязателен (RED `red_compaction.rs`):
 ///
 /// 1. **Активный сегмент НИКОГДА не сжимается** — в него пишут прямо сейчас (`Err`).
-/// 2. Пишем во ВРЕМЕННЫЙ файл `*.jrnl.zst.tmp` (падение на середине → оригинал цел,
+/// 2. **САМОИЗЛЕЧЕНИЕ КРАХ-ОКНА (rev 9, D-COMP-2):** если `.zst` уже на диске
+///    (предыдущий вызов умер между `rename` и `remove_file(src)`) — НЕ рапортуем
+///    «успех, мы тут не нужны». Сверим sha256 существующего `.zst` (распаковка →
+///    `Sha256::update`) с sha256 оригинала:
+///    - совпало → оригинал удалить (доделать прошлую работу; именно это и было
+///      пропущено в старой ветке `if dst.exists() { return Ok(..) }`); возврат
+///      `CompactionReport` (самоизлечение);
+///    - НЕ совпало → `.zst` удалить, оригинал оставить ГОРЯЧИМ, `Err(InvalidData)`
+///      (принцип `ColdCopyProof`: удалить можно лишь то, чья копия ДОКАЗАНО
+///      читается — битая копия не даёт такого права).
+/// 3. Пишем во ВРЕМЕННЫЙ файл `*.jrnl.zst.tmp` (падение на середине → оригинал цел,
 ///    мусор отбрасывается).
-/// 3. **Верифицируем ДО удаления:** распаковываем .tmp и сверяем sha256 с оригиналом.
+/// 4. **Верифицируем ДО удаления:** распаковываем .tmp и сверяем sha256 с оригиналом.
 ///    Расхождение → `Err`, оригинал остаётся, .tmp удаляется. Данные незаменимы —
 ///    «сжали и удалили, а там мусор» недопустимо.
-/// 4. `fsync` + атомарный `rename` .tmp → .zst, и только ПОТОМ удаляем оригинал.
+/// 5. `fsync` + атомарный `rename` .tmp → .zst, и только ПОТОМ удаляем оригинал.
 ///
 /// Это тот же принцип, что `ColdCopyProof`: удалить можно лишь то, чья копия ДОКАЗАНО читается.
 pub fn compact_segment(seg: &SegmentInfo, level: i32) -> io::Result<CompactionReport> {
@@ -1644,13 +1673,43 @@ pub fn compact_segment(seg: &SegmentInfo, level: i32) -> io::Result<CompactionRe
     let tmp = src.with_file_name(format!("{base}{}.tmp", COMPACTED_SUFFIX)); // .jrnl.zst.tmp
 
     if dst.exists() {
-        // Уже сжат (двойной вызов / гонка). Не пересжимаем: второй вызов обязан быть идемпотентен.
-        // Возвращаем отчёт с bytes_after == bytes_before (без изменений).
+        // (2) D-COMP-2 — САМОИЗЛЕЧЕНИЕ КРАХ-ОКНА. Прошлая редакция рапортовала
+        // `if dst.exists() { return Ok(...) }`, оставляя оригинал-сироту навсегда
+        // (3000 событий читались как 3172, DET-I-1 нарушен, фикс —
+        // неудаляемый дубликат). Теперь сверяем sha256 существующего `.zst`
+        // с sha256 оригинала; только совпадение даёт право удалить оригинал.
+        let orig_sha = sha256_file(src)?;
+        let verify_sha = sha256_decompressed(&dst).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "self-heal: existing .zst не читается ({e}); оригинал {src:?} оставлен \
+                     ГОРЯЧИМ, .zst НЕ удалён"
+                ),
+            )
+        })?;
+        if verify_sha != orig_sha {
+            // Битый .zst (FUSE-баг, частичная перезапись и пр.). Удаляем .zst,
+            // оригинал оставляем ГОРЯЧИМ — данные не теряются; следующий компакт-
+            // прогон перепишет `.zst` с нуля уже из верифицированного источника.
+            let _ = fs::remove_file(&dst);
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "self-heal: existing .zst sha256 mismatch; оригинал {src:?} оставлен \
+                     ГОРЯЧИМ, .zst удалён. orig={orig_sha} decompressed=.zst={verify_sha}"
+                ),
+            ));
+        }
+        // Совпало → безопасно доделать прошлую работу (удалить оригинал).
+        fs::remove_file(src)?;
+        let bytes_after = fs::metadata(&dst).map(|m| m.len()).unwrap_or(0);
+        let bytes_before = fs::metadata(src).map(|m| m.len()).unwrap_or(seg.size_bytes);
         return Ok(CompactionReport {
             source: src.clone(),
             compacted: dst.clone(),
-            bytes_before: fs::metadata(src).map(|m| m.len()).unwrap_or(0),
-            bytes_after: fs::metadata(&dst).map(|m| m.len()).unwrap_or(0),
+            bytes_before,
+            bytes_after,
         });
     }
 
