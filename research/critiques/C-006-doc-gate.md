@@ -199,6 +199,137 @@ High. I read the audited commits, `gates.md`, `commit-discipline.md`, `branch-hy
 
 ---
 
+## Re-audit (rev 8) - 2026-07-14T18:27Z
+
+**Audited repair range:** `d830d3d..2773e9c`
+**Expected/audited HEAD:** `2773e9c` - `fix(doc-gate): rev7 - артефакт, рождённый В ТЕЛЕ МЕРЖА, был невидим для барьера`
+**Worktree:** `/tmp/hft-critic-dg-r8`, local branch `critic-dg-r8`, created from `origin/docs/doc-gate` after exact HEAD check.
+
+## Rev 8 Verdict
+
+**REJECT remains.**
+
+The rev7 blocker is closed in the intended place: protected artifacts introduced through side branches or created directly inside a merge commit are now included by state scanning (`git ls-tree` over every commit tree), and P12 is red against the old rev7 barrier. However, the barrier still treats "path exists" as "artifact exists". A protected Markdown artifact can be replaced by a directory or symlink at the same path and the barrier exits `0`.
+
+That is still silent loss of the audit artifact. `research/critiques/C-001.md` is no longer a verdict file, but `git cat-file -e HEAD:research/critiques/C-001.md` succeeds because the path resolves to a tree or symlink blob. The current invariant is therefore checked too weakly: protected artifacts must remain normal files under protected paths, not merely any Git object at that path.
+
+## Rev 8 Probe Results
+
+**Required probes:**
+- Current barrier probe: PASS, `bash scripts/tests/red_protected_artifacts.sh` returned `PASS (13/13)`, `exit=0`.
+- Anti-placebo against rev7 barrier: PASS, `BARRIER=/tmp/rev7.sh bash scripts/tests/red_protected_artifacts.sh` returned `FAIL (1)`, with P12 failing exactly as expected. P11 and P13 passing against rev7 is acknowledged and not a placebo.
+- CI wiring: PASS. `protected-artifacts` remains in `status-check.needs`; the job calls the barrier with event-derived `EVENT_NAME`, `PUSH_BEFORE`, and `PR_BASE_SHA`, then runs the RED probe.
+
+**Manual scenario not covered by the 13 probes - blocker:**
+
+1. Base contains `research/critiques/C-001.md`.
+2. A later commit removes that file.
+3. The same commit creates a directory at the same path: `research/critiques/C-001.md/README.txt`.
+4. Run the barrier as a push event with `PUSH_BEFORE=<base>`.
+
+Observed output:
+
+```text
+OK: защищённые артефакты целы на HEAD (...; проверка по РЕЗУЛЬТАТУ, не по способу)
+file_to_directory_exit=0
+head_object_type=tree
+```
+
+The same type-substitution class also passes with a symlink:
+
+```text
+OK: защищённые артефакты целы на HEAD (...; проверка по РЕЗУЛЬТАТУ, не по способу)
+file_to_symlink_exit=0
+head_tree_entry=120000 blob ... research/critiques/C-001.md
+```
+
+This is not an allowed protected->protected rename and not an explicit `ALLOW-ARTIFACT-DELETE:`. The artifact file is gone; only a non-artifact object remains at the same path.
+
+**Manual false-positive checks:**
+- Honest merge with source-only changes: PASS, `exit=0`.
+- Protected rename chain `docs/contract-rfc/... -> docs/rfc/... -> docs/rfc/...`: PASS, `exit=0`.
+- Protected artifact added in branch and still alive on HEAD: PASS, `exit=0`.
+- Octopus `-s ours` merge that drops a side-only protected artifact: FAIL, `exit=1` as required.
+
+## Rev 8 Text / Guarantee Check
+
+- Force-push boundary is still stated honestly: the in-branch script can fail-closed, but GitHub branch protection/no-force-push is the only prevention.
+- The state-based explanation in `gates.md` §9 is directionally correct for merge-born artifacts.
+- The guarantee remains overstated because §9 speaks about protected "artifacts" existing on HEAD, while the implementation accepts a tree or symlink at the artifact path. The executable guarantee is currently only "some Git object exists at that path."
+- Minor drift: `gates.md` and CI comments still say the probe covers 10 / 9 scenarios in places, while the executable probe is 13 scenarios. This is not the blocker, but it should be cleaned up with the next repair.
+
+## Rev 8 Founder-Priority / Scope Checks
+
+- Founder-priority non-drift: PASS. `d830d3d..2773e9c` touches only `.claude/rules/gates.md`, `scripts/check_protected_artifacts.sh`, and `scripts/tests/red_protected_artifacts.sh`; it does not touch `milestones/BACKLOG.md`, `docs/DESIGN.md`, `docs/fa/ops.md`, `PROJECT-STATE.md`, `TECH-DEBT.md`, or `docs/SESSION-HANDOFF.md`.
+- Critic scope: PASS. This commit changes only the verdict artifact under `research/critiques/`.
+
+## Rev 8 Required Repair
+
+1. Add RED probes for protected artifact type-substitution: file -> directory/tree and file -> symlink at the same path.
+2. Make the barrier distinguish a preserved normal file from a tree, symlink, submodule/gitlink, or other non-file object at the protected path.
+3. Keep the rev7 P11/P12/P13 probes and anti-placebo check; they are meaningful and should remain.
+4. Update `gates.md`/CI comments so the stated probe count and artifact guarantee match the executable gate.
+
+## Rev 8 Confidence
+
+High for REJECT. The mandatory 13-probe suite is green and the rev7 anti-placebo is meaningful, but the new type-substitution bypass is directly reproducible with `exit=0`.
+
+=== HANDOFF: critic -> architect ===
+
+## §A - Metadata
+- UTC datetime: 2026-07-14T18:27Z
+- Gate: C-006 doc-gate, rev8 re-audit
+- Status: REJECT remains
+- HEAD before critic verdict: `2773e9c` - `fix(doc-gate): rev7 - артефакт, рождённый В ТЕЛЕ МЕРЖА, был невидим для барьера`
+
+## §B - What I Checked
+- Current RED probe: 13/13.
+- Anti-placebo against the old rev7 barrier at `34e46f6`, with P12 failing.
+- Manual type-substitution bypasses: protected file -> directory and protected file -> symlink.
+- False-positive cases: honest merge, protected rename chain, added-and-alive artifact.
+- Octopus `-s ours` side-only artifact drop.
+- Founder-priority non-drift.
+
+## §C - Artifacts / Results
+- Updated verdict artifact: `research/critiques/C-006-doc-gate.md`
+- Verdict: REJECT.
+- Closed: merge-born protected artifacts are now covered by state scanning.
+- Open blocker: non-file object at the same protected path passes as preserved artifact.
+
+## §D - Next Agent + Invocation
+- **Next agent:** architect.
+- **Expected HEAD before architect starts:** the pushed rev8 verdict commit containing this section.
+- **Push status:** critic must commit and push this verdict to `origin/docs/doc-gate`.
+- **Paste-ready prompt:**
+  ```
+  Ты — architect. Same C-006 doc-gate loop, rev8 REJECT.
+
+  Expected HEAD: the pushed rev8 critic commit on origin/docs/doc-gate. Run:
+  git fetch origin
+  git rev-parse --short origin/docs/doc-gate
+  If HEAD differs, STOP: prompt stale.
+
+  Read `research/critiques/C-006-doc-gate.md` section "Re-audit (rev 8)".
+  Repair only the remaining blocker: protected Markdown artifact replaced by a directory/tree
+  or symlink at the same path passes `scripts/check_protected_artifacts.sh` with exit=0.
+
+  Required outcome:
+  - Add RED probes for file->directory/tree and file->symlink type-substitution.
+  - Make the barrier require protected artifacts on HEAD to remain normal files, not just any Git object at the path.
+  - Keep rev7 state-scanning coverage for merge-born artifacts and the anti-placebo check.
+  - Do not change founder-owned priorities: P2.5, BACKLOG order, and HL-depth fork remain founder ★.
+  ```
+
+## §E - Risks / Open Questions
+- Branch protection "no force-push" on `main` remains a founder/GitHub setting, not repairable by an in-branch script.
+- `gates.md`/CI comments should stop advertising stale 10/9 scenario counts after the next repair.
+- TD-020 / storage pressure remains time-sensitive outside this doc-gate loop.
+- Founder ★ pending: P2.5 acceptance, BACKLOG queue, HL-depth / first-live-signal fork.
+
+=== END HANDOFF ===
+
+---
+
 ## Re-audit (rev 7) - 2026-07-14T17:59Z
 
 **Audited repair range:** `2aaa870..34e46f6`
