@@ -250,11 +250,21 @@ architect rev3 (RED ST-I-8g/8h) → engine-dev (9) → reviewer APPROVED. Merge:
 - **Прод инертен (T10):** `recorder` не зависит от `alpha`/`portfolio`/`strategy`/`sim` — мозг не
   торгует и не пишет журнал. §8 eyes-on после deploy подтвердил НУЛЕВОЕ изменение поведения recorder'а.
 
-## Data durability (M-08 «сбор не останавливается» + CT-RFC-02 — MERGED на `main` 2026-07-14, reviewer APPROVED; **прод ещё НЕ обновлён — §8 заблокирован TD-018**)
-Merge-коммит `1123b13` (CI success). **ВНИМАНИЕ: `main` ≠ прод.** Автодеплой упал на собственном
-новом CI-гейте (`gh api actions/runs` → HTTP 403, нет `permissions: actions: read`) — TD-018.
-Прод продолжает работать на `656c7ca` (старый recorder, один сегмент 15.0 GB, RSS 139 MiB @ 17 ч).
-Milestone НЕ закрыт: §8 eyes-on (RSS, полосы OBI, новый сегмент, целость legacy) не выполнен.
+## Data durability (M-08 «сбор не останавливается» + CT-RFC-02 — MERGED + В ПРОДЕ 2026-07-14, reviewer APPROVED; **milestone НЕ закрыт: цель E7/E3 не достигнута**)
+Прод: `b7721d1` (merge `1123b13` + фикс TD-018). CI+Deploy success; **§8 eyes-on ВЫПОЛНЕН**
+(4.2 ч наблюдения). Прод здоров: `restarts=0`, `panic/ERROR=0`, `backstop=0`, heartbeat свежий.
+**Что подтверждено на боевых данных:** старый сегмент 15 188 347 171 B **заморожен** (mtime =
+момент деплоя, байт-в-байт цел) → пишется НОВЫЙ `segment-00000001.jrnl` с магией `HFTJRN02`;
+`seq` непрерывен через границу (legacy `max=16049333` → new `min=16049334`, `seq_gaps=0`);
+`declare_legacy` выполнен (`sha256:db1ef99e…`, size зафиксирован), и **fail-closed доказан**:
+без манифеста `stream` отдаёт `foreign segment (no magic, no declaration)`, при этом **запись не
+прерывается** (T7c в проде); полосы OBI на прогретой книге НЕ деградировали (`avg buckets
+1154/969` vs baseline `1316/1452`; полоса 600–6000 bps `1115/873` vs `975/845`).
+**Чего milestone НЕ дал (открыто):** ретеншен никем не вызывается (TD-020 — «сбор не остановится
+никогда» НЕ достигнуто, ~40 дней до disk-guard); эвикция книги не удерживает рост (TD-016 остаётся
+OPEN: уровни 5k → 13.8k за 4 ч, окно ±60% ничего не режет); `storage_status` не публикуется в
+heartbeat (TD-019). Отдельно: метрика памяти, по которой TD-016 был заведён, оказалась
+загрязнена page cache — настоящий рост кучи +1 MiB/час, не +8 (TD-021).
 
 - `crates/contracts` (**CT-RFC-02**, atomic RFC `docs/rfc/CT-RFC-02-journal-provenance.md`) —
   `SCHEMA_VERSION` 1→2; provenance живёт в ЗАГОЛОВКЕ СЕГМЕНТА, не в `Event` (при 2.8 GB/сут тег в
@@ -305,7 +315,9 @@ Milestone НЕ закрыт: §8 eyes-on (RSS, полосы OBI, новый се
   v1-impl, GREEN против v2. **Атрибуция лика к книге на проде НЕ доказана** — §8 покажет.
 - `.github/workflows/deploy.yml` — Deploy гейтится на CI (fail-closed) + `set -euo pipefail` в
   ssh-скрипте (раньше упавший `git fetch/reset` не останавливал сборку → фантомный деплой).
-  **Гейт написан, но не работает — TD-018.**
+  **Гейт РАБОТАЕТ, доказан сквозным прогоном** (TD-017 + TD-018 CLOSED): run @`1123b13` → Deploy
+  FAILURE (гейт не пустил, 403 на чтении статуса CI), после `permissions: actions:read`
+  (`b7721d1`) → CI success → Deploy success. Deploy при красном CI более невозможен.
 - Гейты (reviewer перепрогнал независимо): workspace **164 passed / 0 failed**; `verify_M-08.sh`
   **26/26 PASS, exit=0**; fmt/clippy clean; CI на merge-коммите success.
 - **Урок (зафиксирован architect'ом в процессе, `5fabd2b`):** два milestone'а подряд дефект прошёл
