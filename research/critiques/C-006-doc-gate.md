@@ -199,6 +199,127 @@ High. I read the audited commits, `gates.md`, `commit-discipline.md`, `branch-hy
 
 ---
 
+## Re-audit (rev 12) - 2026-07-14T23:56Z
+
+**Audited repair range:** `9bdf6d1..918c4de`
+**Expected/audited HEAD:** `918c4de` - `fix(doc-gate): rev11 — setup P4/P5/P8/P9 тоже был плацебо`
+**Worktree:** `/tmp/hft-critic-dg-r12`, detached at `origin/docs/doc-gate` after exact HEAD check.
+
+## Rev 12 Verdict
+
+**REJECT remains.**
+
+The rev11 blocker is mostly closed: P4/P5/P8/P9 now fail closed when their scenario-defining setup is removed or changed. The merge and type-substitution guards also remain intact, and the rev8 anti-placebo still fails P14/P15/P16 as required.
+
+The remaining setup-placebo cases are now narrowed to **P1 and P17**. Both are expected-OK scenarios, so a no-op / unchanged branch can still satisfy the same expected exit code while no longer proving the named scenario. `gates.md` §9 explicitly claims deletion of the scenario-defining command for any scenario fails the probe; that is still false.
+
+## Rev 12 Required Execution
+
+- Branch precondition: PASS. `git fetch origin && git rev-parse --short origin/docs/doc-gate` returned `918c4de`.
+- Current RED probe: PASS. `bash scripts/tests/red_protected_artifacts.sh` returned `VERDICT: PASS (17/17)`, `exit=0`.
+- Anti-placebo against rev8 barrier: PASS. `BARRIER=/tmp/rev8.sh bash scripts/tests/red_protected_artifacts.sh` returned `VERDICT: FAIL (3)`, with P14/P15/P16 failing.
+
+## Rev 12 Setup-Placebo Sweep
+
+**Previously rejected cases now closed:**
+
+- P4: replacing `git mv docs/rfc/CT-RFC-01.md docs/rfc/CT-RFC-01-renamed.md` with `true` now returns `exit=1` with `P4 — SETUP НЕ СОСТОЯЛСЯ`.
+- P5: replacing the P5 `git rm milestones/M-01.md` with `true` now returns `exit=1` with `P5 — SETUP НЕ СОСТОЯЛСЯ`.
+- P8: replacing the zero-SHA value with a real ancestor commit now returns `exit=1` with `P8 — SETUP НЕ СОСТОЯЛСЯ`.
+- P9: replacing the divergent base with an ancestor commit now returns `exit=1` with `P9 — SETUP НЕ СОСТОЯЛСЯ`.
+
+**Remaining scenarios requested in this audit:**
+
+- P2: removing the protected verdict deletion returns `exit=1`; not a silent PASS.
+- P3: removing the protected -> unprotected move returns `exit=1`; not a silent PASS.
+- P6: removing the first deletion returns `exit=1`; not a silent PASS.
+- P10: replacing the empty event call with a valid push event returns `exit=1`; not a silent PASS.
+- P14: removing directory creation returns `exit=1` with `P14 — SETUP НЕ СОСТОЯЛСЯ`.
+- P15: removing symlink creation returns `exit=1` with `P15 — SETUP НЕ СОСТОЯЛСЯ`.
+- P16: making the file non-empty returns `exit=1` with `P16 — SETUP НЕ СОСТОЯЛСЯ`.
+
+**Still broken:**
+
+- P1: replacing the source-only commit (`echo "правка" >> src.rs; git commit ...`) with `true` still returns `exit=0` and prints `PASS  P1 ...` plus `VERDICT: PASS (17/17)`. It no longer proves that a non-protected source-only push passes; it proves an empty/no-op range passes.
+- P17: replacing the protected artifact content edit + commit with `true` still returns `exit=0` and prints `PASS  P17 ...` plus `VERDICT: PASS (17/17)`. It no longer proves that ordinary protected content edits pass; it proves a clean branch passes.
+
+## Rev 12 Text / Guarantee Check
+
+- Scenario count: PASS. `gates.md` §9 says 17 scenarios.
+- Force-push boundary: PASS. The text still says the in-branch barrier can fail-closed/detect but cannot prevent force-push; full prevention remains GitHub branch protection / founder scope.
+- "Setup each scenario fail-closed": FAIL. P1 and P17 disprove the "любой сценарий" / "КАЖДОГО из 17" claim by execution.
+
+## Rev 12 Required Repair
+
+1. Add setup assertions for P1:
+   - prove `before..HEAD` contains at least one non-merge commit;
+   - prove the changed path is unprotected (`src.rs`) and no protected path changed/disappeared;
+   - if the source-only commit is removed, report `SETUP НЕ СОСТОЯЛСЯ`.
+2. Add setup assertions for P17:
+   - prove `research/critiques/C-001.md` exists as a normal non-empty file on HEAD;
+   - prove its blob/content differs from `before`;
+   - if the content edit commit is removed, report `SETUP НЕ СОСТОЯЛСЯ`.
+3. Keep all now-closed guards: P4/P5/P8/P9, P7/P11/P12/P13, and P14/P15/P16.
+4. Do not change founder-owned priorities: P2.5, BACKLOG order, and HL-depth fork remain founder ★.
+
+## Rev 12 Confidence
+
+High for REJECT. The sweep requested by founder narrowed the remaining setup-placebo class to P1/P17. The barrier implementation remains acceptable; the RED probe and `gates.md` claim are still ahead of the proof for those two expected-OK scenarios.
+
+=== HANDOFF: critic -> architect ===
+
+## §A - Metadata
+- UTC datetime: 2026-07-14T23:56Z
+- Gate: C-006 doc-gate, rev12 re-audit
+- Status: REJECT remains
+- HEAD before critic verdict: `918c4de` - `fix(doc-gate): rev11 — setup P4/P5/P8/P9 тоже был плацебо`
+
+## §B - What I Checked
+- Required 17-case RED probe.
+- Anti-placebo against rev8 barrier from `2773e9c`.
+- Setup-placebo mutations for P1/P2/P3/P6/P10/P14/P15/P16/P17.
+- Regression spot-checks for P4/P5/P8/P9.
+- `gates.md` §9 counter / force-push boundary / setup-fail-closed promise.
+
+## §C - Artifacts / Results
+- Updated verdict artifact: `research/critiques/C-006-doc-gate.md`
+- Verdict: REJECT.
+- Closed: P4/P5/P8/P9 setup guards now fail closed; prior merge/type-substitution guards remain good.
+- Open blocker: P1 and P17 can still silently stop testing their named expected-OK scenario while the suite reports `PASS (17/17)`.
+
+## §D - Next Agent + Invocation
+- **Next agent:** architect.
+- **Expected HEAD before architect starts:** the pushed rev12 verdict commit containing this section.
+- **Push status:** critic must commit and push this verdict to `origin/docs/doc-gate`.
+- **Paste-ready prompt:**
+  ```
+  Ты — architect. Same C-006 doc-gate loop, rev12 REJECT.
+
+  Expected HEAD: the pushed rev12 critic commit on origin/docs/doc-gate. Run:
+  git fetch origin
+  git rev-parse --short origin/docs/doc-gate
+  If HEAD differs, STOP: prompt stale.
+
+  Read `research/critiques/C-006-doc-gate.md` section "Re-audit (rev 12)".
+  Repair only the remaining setup-placebo blocker: P1 and P17.
+
+  Required outcome:
+  - P1 proves a real non-protected source-only commit happened, not an empty/no-op range.
+  - P17 proves protected artifact content actually changed and remains a normal non-empty file.
+  - Removing either scenario-defining edit must produce `SETUP НЕ СОСТОЯЛСЯ`, not PASS(17/17).
+  - Keep all existing guards for P4/P5/P8/P9, P7/P11/P12/P13, and P14/P15/P16.
+  - Do not change founder-owned priorities: P2.5, BACKLOG order, and HL-depth fork remain founder ★.
+  ```
+
+## §E - Risks / Open Questions
+- The protected-artifacts barrier itself remains acceptable; this is still a RED probe harness issue.
+- After P1/P17 are guarded, the "setup every scenario fail-closed" claim should finally match executable proof.
+- Founder ★ pending: P2.5 acceptance, BACKLOG queue, HL-depth / first-live-signal fork.
+
+=== END HANDOFF ===
+
+---
+
 ## Re-audit (rev 11) - 2026-07-14T23:17Z
 
 **Audited repair range:** `3d36d1a..8261f2a`
