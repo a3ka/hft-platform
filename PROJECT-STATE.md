@@ -269,6 +269,52 @@ OPEN: уровни 5k → 13.8k за 4 ч, окно ±60% ничего не ре
 heartbeat (TD-019). Отдельно: метрика памяти, по которой TD-016 был заведён, оказалась
 загрязнена page cache — настоящий рост кучи +1 MiB/час, не +8 (TD-021).
 
+### rev 6 (задачи 11/12/13) — КОД MERGED + В ПРОДЕ (`8882c1e`, reviewer APPROVED 2026-07-14); **milestone ВСЁ ЕЩЁ НЕ ЗАКРЫТ: ГЛАВНАЯ цель (TD-020) не достигнута**
+Цепочка: architect RED (`4475bfa`, `6f1b7f4`) → engine-dev (`8b4dc6f` task 11, `24d8e83` task 12) →
+tester PASS → reviewer. Гейты (перепрогнаны reviewer'ом независимо на чистом worktree):
+workspace **172 passed / 0 failed**; `verify_M-08.sh` **28/28 PASS, exit=0**; fmt/clippy clean;
+CI + Deploy на merge-коммите — success. **Анти-плацебо доказан reviewer'ом независимо:** все 7
+оракулов `red_retention_operator` (R1–R7) + `red_heartbeat_status` **FAIL против пред-фиксного
+дерева `4475bfa`** (`not yet implemented` в `retention_plan`; heartbeat не JSON), GREEN на HEAD.
+- `crates/journal` (**task 11, TD-020**) — `retention_plan(dir, policy, now_wall_ms)` /
+  `retention_execute(...)` + **бинарь `journal-retention`** (`src/bin/`). Часы СНАРУЖИ (план
+  детерминирован, `DET-I-1`-дисциплина); **`DryRun` — дефолт CLI** (конструктивный барьер против
+  «случайно удалил»); Apply идёт ТОЛЬКО через `verify_cold_copy` → `ColdCopyProof` → `prune_segment`
+  (сверка sha256 холодной копии; сбой сверки → сегмент остаётся ГОРЯЧИМ и попадает в `failed`,
+  exit=2). Активный сегмент никогда не в плане; `keep_min_segments` защищает последние N;
+  НЕЗАДЕКЛАРИРОВАННЫЙ legacy не удаляется (нет эпохи → нет права); `disk_pressure` при пустом плане
+  поднимает флаг (exit=3), а не молчит. Оракулы содержат деградированные входы (недоступное
+  холодное хранилище, чужой сегмент, пустой план) — per `.claude/rules/testing.md`.
+- `crates/recorder` (**task 12, TD-019**) — heartbeat = JSON `{ts_wall_ms, next_seq, segment_index,
+  events, free_bytes, min_free_bytes, writable}` вместо 13 байт таймстампа; финальный heartbeat при
+  выходе. В журнал НЕ пишется (детерминизм). Healthcheck compose'а смотрит на **mtime** файла, не на
+  содержимое → смена формата прод-безопасна (проверено: контейнер healthy после деплоя).
+- `crates/venue-binance` (**task 13, TD-016 переспека после TD-021**) — `BACKSTOP_LEVELS_PER_SIDE`
+  50k → **200k**: приоритет развёрнут (точность данных > экономия памяти), т.к. «лик» был измерен
+  загрязнённой page-cache метрикой, а эвикция резала уровни внутри полос OBI 6–60 %. Кап остаётся
+  ТОЛЬКО аварийным потолком от OOM.
+- **§8 eyes-on (прод `8882c1e`, 2026-07-14) — GREEN по деплоенной части:** контейнер healthy,
+  `restarts=0`, `panic/ERROR/backstop = 0`; **боевой legacy-сегмент цел БАЙТ-В-БАЙТ** — полный
+  sha256 15 188 347 171 B до и после деплоя совпал (`234583c8e5c0…`), mtime заморожен (08:47);
+  recorder продолжает писать в `segment-00000002.jrnl` (магия `HFTJRN02`, растёт 437 → 528 MB);
+  **heartbeat несёт состояние** (`writable=true`, `free_bytes=119 134 494 720`,
+  `min_free_bytes=10 737 418 240`, `next_seq=18 733 828`, `segment_index=2`) ⇒ **TD-019 CLOSED**;
+  `RssAnon = 11 376 kB` (правильная метрика per TD-021), `book levels` ≈ 5000/сторона после
+  рестарта — baseline для наблюдения асимптоты (задача 13).
+- **БЛОКЕР close-out'а (найден reviewer'ом на PR-гейте, подтверждён на проде): TD-020 НЕ ЗАКРЫТ —
+  бинарь `journal-retention` НЕ ДОСТАВЛЯЕТСЯ В ПРОД.** `Dockerfile` собирает `cargo build --release
+  **--bin recorder**` и копирует в runtime-образ ТОЛЬКО `recorder` (факт на проде:
+  `docker exec hft-recorder ls /usr/local/bin/` → один `recorder`); на VPS нет Rust toolchain;
+  холодное хранилище не смонтировано (`/mnt/*` пуст, Storage Box не заведён); cron отсутствует
+  (`/etc/cron.d/` → только `e2scrub_all`). ⇒ §8-пункты «dry-run ретеншена на проде» и «cron»
+  **физически невыполнимы**, ретеншен по-прежнему **никем не вызывается**. Это тот же класс дефекта,
+  что и исходный TD-020, этажом выше: раньше была библиотека без оператора — теперь оператор без
+  доставки. Диск: 111 GB свободно, ~2.8 GB/сут ⇒ таймер ~40 дней тикает. Нужна **задача 14**
+  (доставка: сборка `journal-retention` в образ/на хост + монтирование холодного хранилища +
+  cron + алерт на exit≠0) — спека architect, impl engine-dev.
+- **M-08 остаётся 🚧 IN_PROGRESS.** Закрывается ТОЛЬКО после задачи 14 + §8 с реальным dry-run
+  ретеншена на проде.
+
 - `crates/contracts` (**CT-RFC-02**, atomic RFC `docs/rfc/CT-RFC-02-journal-provenance.md`) —
   `SCHEMA_VERSION` 1→2; provenance живёт в ЗАГОЛОВКЕ СЕГМЕНТА, не в `Event` (при 2.8 GB/сут тег в
   каждом событии = гигабайты мусора): `SegmentHeader{schema_version, source, provenance, epoch_id,
