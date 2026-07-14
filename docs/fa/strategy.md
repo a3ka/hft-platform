@@ -3,6 +3,9 @@
 > FA. Authored by architect (Fable) 2026-07-10 по образцу `fa/risk.md`. STABLE/APPEND-ONLY.
 > MM-квотер: перевод `TargetQuotes` (от `portfolio`) в конкретные ордер-действия на каждое
 > событие. Пара-документ: `fa/portfolio.md` (продюсер `TargetPosition`/`TargetQuotes`).
+> ⚠ **Нумерация milestone'ов в этом документе ИСТОРИЧЕСКАЯ** (`M-05`/`M-06` здесь означают не то,
+> что реально сделано под этими номерами). Актуальная очередь и гейты — `milestones/BACKLOG.md`;
+> фазы — `docs/DESIGN.md` §10 (между P2 и P3 добавлена **P2.5 Data safety net**).
 
 ## §1. Идентичность модуля
 - **Имя / крейт:** `strategy` (`crates/strategy/`).

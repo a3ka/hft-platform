@@ -3,6 +3,9 @@
 > Authored by architect (Fable) 2026-07-10. STABLE/APPEND-ONLY. Слой 1 (data plane),
 > сосед `book`. Единственный сетевой актор системы — переносит EINHARD-паттерн
 > «emitter, не owner» (аналог `integrations` INTEG-I-8) на биржевой шов.
+> ⚠ **Нумерация milestone'ов в этом документе ИСТОРИЧЕСКАЯ** (`M-05`/`M-06` здесь означают не то,
+> что реально сделано под этими номерами). Актуальная очередь и гейты — `milestones/BACKLOG.md`;
+> фазы — `docs/DESIGN.md` §10 (между P2 и P3 добавлена **P2.5 Data safety net**).
 
 ## §1. Идентичность модуля
 - **Имя / крейт(ы):** `venues` (`crates/venues/`, трейты + реестр адаптеров) +
