@@ -52,7 +52,8 @@ jobs:
         run: bash scripts/check_protected_artifacts.sh
 
       # Сам барьер обязан быть проверен ТОЙ ЖЕ проводкой, какой его зовёт CI (иначе гейт,
-      # проверенный не тем вызовом, — не проверен). 10 сценариев, включая fail-closed.
+      # проверенный не тем вызовом, — не проверен). 17 сценариев: удаление, rename-out,
+      # evil merge, merge-born, подмена типа (каталог/симлинк), усечение в 0 байт, fail-closed.
       - name: Проба барьера (анти-плацебо)
         run: bash scripts/tests/red_protected_artifacts.sh
 

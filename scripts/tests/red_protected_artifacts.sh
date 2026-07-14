@@ -164,6 +164,37 @@ git -C "$r" checkout -q -; git -C "$r" merge -q --no-ff -m "merge: side4" side4
 expect "P13 артефакт, пришедший мержем и ЦЕЛЫЙ, пропускается (нет ложных срабатываний)" ok \
   "$(run_barrier "$r" push "$before")"
 
+# ── P14 (rev8): файл подменён КАТАЛОГОМ на том же пути ────────────────────────────────
+# `git cat-file -e HEAD:path` говорит «объект есть» и для ДЕРЕВА — артефакт уничтожен, барьер молчал.
+r=$(new_repo); before=$(git -C "$r" rev-parse HEAD)
+git -C "$r" rm -q research/critiques/C-001.md
+mkdir -p "$r/research/critiques/C-001.md"
+echo "мусор" > "$r/research/critiques/C-001.md/README.md"
+git -C "$r" add research/critiques/C-001.md >/dev/null
+git -C "$r" commit -qm "chore: на месте вердикта теперь каталог"
+expect "P14 файл подменён КАТАЛОГОМ — ВАЛИТ гейт" deny "$(run_barrier "$r" push "$before")"
+
+# ── P15 (rev8): файл подменён СИМЛИНКОМ ───────────────────────────────────────────────
+r=$(new_repo); before=$(git -C "$r" rev-parse HEAD)
+git -C "$r" rm -q research/critiques/C-001.md
+ln -s /dev/null "$r/research/critiques/C-001.md"
+git -C "$r" add research/critiques/C-001.md >/dev/null
+git -C "$r" commit -qm "chore: вердикт теперь симлинк в /dev/null"
+expect "P15 файл подменён СИМЛИНКОМ — ВАЛИТ гейт" deny "$(run_barrier "$r" push "$before")"
+
+# ── P16 (rev8): файл усечён в НОЛЬ БАЙТ — то же удаление, только вежливое ─────────────
+r=$(new_repo); before=$(git -C "$r" rev-parse HEAD)
+: > "$r/research/critiques/C-001.md"
+git -C "$r" commit -qam "chore: вердикт выпотрошен до нуля байт"
+expect "P16 артефакт усечён в 0 байт — ВАЛИТ гейт" deny "$(run_barrier "$r" push "$before")"
+
+# ── P17 (rev8, ЛОЖНОЕ СРАБАТЫВАНИЕ): обычная правка содержимого — пропускается ────────
+r=$(new_repo); before=$(git -C "$r" rev-parse HEAD)
+echo "дополнение вердикта" >> "$r/research/critiques/C-001.md"
+git -C "$r" commit -qam "critic: дополнил вердикт"
+expect "P17 правка содержимого артефакта пропускается (нет ложных срабатываний)" ok \
+  "$(run_barrier "$r" push "$before")"
+
 echo
 if [ "${FAILED}" -gt 0 ]; then
   echo "VERDICT: FAIL (${FAILED})"
@@ -171,4 +202,4 @@ if [ "${FAILED}" -gt 0 ]; then
   echo "чего в пайплайне нет — а это хуже отсутствия правила."
   exit 1
 fi
-echo "VERDICT: PASS (13/13) — барьер держит при ТОЙ ЖЕ проводке, какой его зовёт CI"
+echo "VERDICT: PASS (17/17) — барьер держит при ТОЙ ЖЕ проводке, какой его зовёт CI"
