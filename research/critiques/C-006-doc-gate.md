@@ -199,6 +199,144 @@ High. I read the audited commits, `gates.md`, `commit-discipline.md`, `branch-hy
 
 ---
 
+## Re-audit (rev 4) - 2026-07-14T15:48Z
+
+**Audited repair range:** `6fd3081..b13deb2`
+**Expected/audited HEAD:** `b13deb2` - `docs(doc-gate): C-006 rev3 - барьер артефактов переписан (покоммитно, переименования, override)`
+**Worktree:** `/tmp/hft-critic-dg-r4`, local branch `critic-dg-r4` created from `origin/docs/doc-gate` after HEAD check.
+
+## Rev 4 Verdict
+
+**REJECT remains.**
+
+The rev3 blocker is mostly repaired: add->delete, protected->unprotected rename, same-commit override, RFC path coverage, and CI wiring now work. The remaining blocker is the acknowledged `--no-merges` gap: a merge commit can delete a protected milestone without any non-merge commit deleting it, and the current script passes.
+
+## Rev 4 Checks
+
+**1. Commit-by-commit barrier - CLOSED except merge commits.**
+
+Script now computes `merge-base(origin/main, HEAD)` and scans commits, not only final net diff. Probe results from disposable worktree at `b13deb2`:
+- Clean branch: PASS, `exit=0`.
+- Branch-local `research/critiques/probe-add-delete.md` add->delete: FAIL, `exit=1`.
+- `research/critiques/C-006-doc-gate.md` move to `tmp/probe/...`: FAIL, `exit=1`.
+- Protected->protected RFC rename inside `docs/rfc/`: PASS, `exit=0`.
+- Later override marker after an earlier deletion: FAIL, `exit=1`.
+- Same-commit `ALLOW-ARTIFACT-DELETE:` on deletion: PASS, `exit=0`.
+- `docs/rfc/*` deletion: FAIL, `exit=1`.
+- `docs/contract-rfc/*` add->delete: FAIL, `exit=1`.
+- Delete->restore of C-006: PASS, `exit=0`, with NOTE.
+- Nested protected path and protected symlink deletion: FAIL, `exit=1`.
+- Benign merge commit with no protected deletion: PASS, `exit=0`.
+
+**2. HEAD-presence criterion - ACCEPTED.**
+
+The rule "deleted/moved and absent on HEAD" does not weaken the deletion barrier for its stated purpose: preventing final loss of gate/milestone/RFC artifacts. It correctly avoids permanent red on honest delete->restore history such as `139b399 -> 352b1db`. It does not protect content integrity after restore, but that is a different control surface; semantic edits to protected docs remain governed by class A review.
+
+**3. Merge-commit hole - STILL BLOCKING.**
+
+I reproduced the hole:
+
+- Created a merge commit whose parents both retained `milestones/M-05-data-foundation.md`.
+- Deleted `milestones/M-05-data-foundation.md` only in the merge commit.
+- Ran `bash scripts/check_protected_artifacts.sh origin/main`.
+- Result: PASS, `exit=0`.
+
+Reason: `git rev-list --no-merges` skips the merge commit, and no non-merge commit in the range has a `D` for that path. This matters now, not theoretically: the next reviewer step is explicitly a merge of `docs/td021-rules` and `docs/doc-gate`, and reviewer merges are exactly where protected artifacts can be lost through conflict resolution or an over-broad index.
+
+Required repair:
+- Include merge commits in the scan.
+- For merge commits, inspect the merge commit's tree against at least the first parent for protected deletions / protected->unprotected renames. If the script wants to avoid duplicate failures for side-branch deletions already inspected, it can still special-case "same deletion already failed/allowed in a non-merge commit"; but skipping merges entirely is not acceptable for this gate.
+- Keep the HEAD-presence exception: if a later commit restores the protected path by final HEAD, emit NOTE rather than FAIL.
+
+**4. Branch/base cases - NOTE.**
+
+The real audited branch is already behind/diverged from current `origin/main` (`merge-base` = `2542d2a`), and the script handled that cleanly. The first commit in the branch range is scanned. A benign merge passed. Force-push cannot be fully solved by an in-branch script: if a force-push erases the commit that added a branch-local artifact and the artifact is absent from the new history, CI has no prior remote state to compare. That needs repository branch protection / no-force-push policy, not only this script.
+
+**5. Rev1/rev3 verdict preservation - PASS.**
+
+`research/critiques/C-006-doc-gate.md` preserves the original C-006 verdict and the rev3 section. Branch history includes:
+- `00244ae` - original C-006 verdict.
+- `a61856d` - `docs(critic): C-006 re-audit rev3 - REJECT`.
+
+**6. FA historical notes - PASS.**
+
+The seven FA notes added in `alpha`, `oms`, `portfolio`, `risk`, `strategy`, `venues`, plus the existing `killswitch` note, do not rewrite module semantics. They correctly warn that old `M-05`/`M-06` numbering is historical and point agents to `milestones/BACKLOG.md` and `docs/DESIGN.md` §10 with P2.5 inserted before P3.
+
+**7. Founder priorities - PASS.**
+
+`6fd3081..b13deb2` does not touch `milestones/BACKLOG.md`, `docs/DESIGN.md`, or `docs/fa/ops.md`. P2.5, queue order, and the HL-depth fork remain founder ★ decisions.
+
+## Rev 4 Required Repair
+
+1. Remove the `--no-merges` blind spot. Protected deletions / protected->unprotected renames introduced by a merge commit must fail when the protected path is absent on HEAD.
+2. Keep the current successful behavior for add->delete, rename-out, protected->protected rename, same-commit override, both RFC paths, delete->restore, nested paths, and symlink entries.
+3. Add a regression probe or documented manual test for "merge commit deletes protected milestone" so this specific gap cannot reappear.
+
+## Rev 4 Additional Process Note
+
+I agree with architect's proposed class A follow-up: `handoff-block.md` should require an explicit "expected HEAD" in §D plus an instruction to run `git log --oneline -1` and STOP on mismatch. This is not the protected-artifacts blocker, but it addresses the repeated stale-prompt failure mode and belongs in the same doc-gate/process-hardening family.
+
+## Rev 4 Confidence
+
+High. I read the repair diff and ran probes for add->delete, rename-out, protected->protected rename, same-commit override, later override, both RFC paths, delete->restore, nested path, symlink path, benign merge, and malicious merge.
+
+=== HANDOFF: critic -> architect ===
+
+## §A - Metadata
+- UTC datetime: 2026-07-14T15:48Z
+- Branch audited: `origin/docs/doc-gate` at `b13deb2`
+- Local verdict branch: `critic-dg-r4`
+- Status: REJECT remains
+- Audited range: `6fd3081..b13deb2`
+
+## §B - What I checked
+- Protected-artifacts script behavior against required bypasses and false positives.
+- CI `protected-artifacts` still included in `status-check.needs`.
+- Rev1/rev3 verdict preservation.
+- FA historical notes.
+- Founder priority non-drift.
+
+## §C - Outcome
+- Closed: add->delete, rename-out, protected->protected rename, both RFC paths, same-commit override, CI wiring, delete->restore exception, stale FA numbering notes.
+- Blocking: merge commits are skipped; a merge commit can delete a protected milestone and pass.
+
+## §D - Next Agent + Invocation
+- **Next agent:** architect, same C-006 doc-gate repair loop.
+- **After repair:** critic rev5 re-audit. If REJECT is lifted, hand off to reviewer to merge `docs/td021-rules` then `docs/doc-gate`, then founder ★ for P2.5 / BACKLOG queue / HL-depth fork.
+- **Paste-ready prompt for architect:**
+  ```
+  Ты — architect on docs/doc-gate. Same C-006 doc-gate repair loop, not a new gate.
+
+  Expected HEAD before repair: b13deb2. Run:
+  git fetch && git worktree add /tmp/hft-architect-dg-r5 origin/docs/doc-gate && cd /tmp/hft-architect-dg-r5
+  git log --oneline -1
+  If HEAD is not b13deb2, STOP: prompt stale.
+
+  Read `research/critiques/C-006-doc-gate.md` section "Re-audit (rev 4)".
+  Repair only the remaining blocker: protected-artifacts merge-commit blind spot.
+
+  Required:
+  1. Include merge commits in the protected-artifacts scan.
+  2. Fail a merge commit that deletes a protected path or moves protected -> unprotected when the protected path is absent on HEAD.
+  3. Preserve current accepted behavior: add->delete FAIL, rename-out FAIL, protected->protected rename PASS, same-commit override PASS, later override FAIL, both RFC dirs protected, delete->restore NOTE/PASS.
+  4. Add or document a regression probe for "merge commit deletes protected milestone".
+
+  Optional class A process follow-up if you choose to include it in this same repair:
+  update `handoff-block.md` so §D must include expected HEAD and the receiving agent must `git log --oneline -1` then STOP on mismatch.
+
+  Do not reorder founder priorities. Leave P2.5, BACKLOG order, and HL fork as founder ★.
+  Commit repairs, then hand back to critic for rev5 re-audit.
+  ```
+
+## §E - Risks / Open Questions
+- Force-push erasure of branch-local artifacts cannot be fully detected by this script after history is rewritten; needs repo branch protection/no-force-push discipline.
+- TD-020 remains time-bound: about 40 days to disk-guard if retention delivery slips.
+- Founder ★ still pending: accept P2.5, confirm BACKLOG queue, decide HL-depth / first-live-signal fork.
+
+=== END HANDOFF ===
+
+---
+
 ## Re-audit (rev 3) - 2026-07-14T13:39Z
 
 **Audited repair range:** `191d5ef..6fd3081`  
