@@ -1,5 +1,13 @@
-# M-00: запуск recorder на VPS. Журнал — в именованном томе journal-data (persistent,
-# переживает редеплой — docs/06 §3/§7). Healthcheck = свежесть heartbeat-файла.
+# M-00 + M-08 rev 7 (TD-020 доставка): запуск recorder + ops-сервис ретеншена на VPS.
+#
+# recorder — 24/7 (сбор). journal-retention — отдельный сервис под profiles: ["ops"]
+# (D2): не поднимается вместе с recorder'ом (`docker compose up -d` без `--profile ops`
+# стартует ТОЛЬКО recorder), не может его уронить; запускается cron'ом или оператором
+# (`docker compose run --rm journal-retention …`).
+#
+# Журнал — в именованном томе journal-data (persistent, переживает редеплой — docs/06 §3/§7).
+# Холодное хранилище (Hetzner Storage Box через CIFS) — bind-mount на хосте → в контейнер.
+# Healthcheck recorder'а = свежесть heartbeat-файла (TD-019: JSON с storage_status).
 services:
   recorder:
     build:
@@ -12,12 +20,51 @@ services:
     volumes:
       - journal-data:/journal
     healthcheck:
-      # heartbeat обновлён за последние 60с → healthy (recorder жив + том пишется)
+      # heartbeat обновлён за последние 60с → healthy (recorder жив + том пишется).
+      # TD-019: heartbeat = JSON с ts_wall_ms/next_seq/segment_index/free_bytes/writable —
+      # одна только «свежесть» ещё не значит «пишет» (урок TD-011: healthcheck молчит).
       test: ["CMD-SHELL", "test $(( $(date +%s) - $(stat -c %Y /journal/recorder.heartbeat 2>/dev/null || echo 0) )) -lt 60"]
       interval: 20s
       timeout: 5s
       retries: 3
       start_period: 15s
+
+  # D2 + D3: ops-профиль. Не поднимается без `--profile ops`. Тег/образ — тот же
+  # (D1: один образ, чтобы wire-format всегда один). Том journal-data общий с recorder'ом
+  # (R/W не нужен для dry-run — достаточно RO; для apply нужно W на upload в /cold).
+  journal-retention:
+    image: hft-platform-recorder:local
+    container_name: hft-journal-retention
+    profiles: ["ops"]
+    # По умолчанию — dry-run (D4: первый прогон на проде = dry-run). Оператор переопределяет
+    # entrypoint/args при ручном запуске apply: `docker compose run --rm journal-retention
+    # --mode apply ...` (см. deploy/README.md).
+    entrypoint: ["/usr/local/bin/journal-retention"]
+    command:
+      - --dir=/journal
+      # D3: --cold пробрасывается через JOURNAL_COLD_DIR (host → /cold). Хранилище
+      # монтируется на ХОСТЕ в JOURNAL_COLD_DIR (по умолчанию /mnt/journal-cold) и
+      # bind-mount'ится сюда. На Storage Box обычно CIFS — fstab в deploy/README.md.
+      - "--cold=${JOURNAL_COLD_DIR:-/cold}"
+      - --retain-days=${RETENTION_RETAIN_DAYS:-14}
+      - --keep-min=${RETENTION_KEEP_MIN:-4}
+      - --min-free-gb=${RETENTION_MIN_FREE_GB:-10}
+      - --mode=dry-run
+    environment:
+      # JOURNAL_COLD_DIR задаётся в .env на хосте (или export'ится) — путь к bind-mount
+      # холодного хранилища. По умолчанию /mnt/journal-cold (CIFS Storage Box, см. D6).
+      JOURNAL_COLD_DIR: ${JOURNAL_COLD_DIR:-/mnt/journal-cold}
+    volumes:
+      # Тот же том, что у recorder'а: dry-run читает, apply читает+пишет в /cold.
+      # На проде том всегда RO для retention-сервиса, чтобы apply не словил гонку с
+      # recorder'ом (хотя mutex через сегменты обеспечивает и сама логика prune —
+      # только сегменты НЕ-активные).
+      - journal-data:/journal:ro
+      # D3: bind-mount холодного хранилища. Если JOURNAL_COLD_DIR не существует на
+      # хосте — `docker compose run` упадёт с ошибкой монтирования ДО старта бинаря
+      # (явный fail-closed: легче заметить, чем тихо получить exit 2 в логе cron).
+      - "${JOURNAL_COLD_DIR:-/mnt/journal-cold}:/cold"
+    # Контейнер одноразовый — без restart; запускается по cron или вручную оператором.
 
 volumes:
   journal-data:
