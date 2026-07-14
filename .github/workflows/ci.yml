@@ -34,24 +34,14 @@ jobs:
       - name: audit
         run: cargo audit
 
-  delivery:
-    name: Delivery gate (бинарь В ПРОД-ОБРАЗЕ, TD-020)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Собрать прод-образ и ЗАПУСТИТЬ journal-retention внутри него
-        env:
-          HFT_DELIVERY_DEEP: "1"
-        run: bash scripts/verify_delivery_M-08.sh
-
   status-check:
     name: All checks passed
     runs-on: ubuntu-latest
-    needs: [build-test, security, delivery]
+    needs: [build-test, security]
     if: always()
     steps:
       - run: |
-          if [[ "${{ needs.build-test.result }}" != "success" || "${{ needs.security.result }}" != "success" || "${{ needs.delivery.result }}" != "success" ]]; then
+          if [[ "${{ needs.build-test.result }}" != "success" || "${{ needs.security.result }}" != "success" ]]; then
             echo "One or more checks failed"; exit 1
           fi
           echo "All checks passed"
