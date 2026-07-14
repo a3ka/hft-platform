@@ -74,18 +74,86 @@ else
 запускать уборку без ручного docker exec"
 fi
 
-# ── D5: планировщик В РЕПО (а не «настроим на VPS руками») ────────────────────────────
+# ── D5: планировщик В РЕПО и он РЕАЛЬНО УСТАНАВЛИВАЕТСЯ ───────────────────────────────
+# Прежняя редакция D5 грепала слова (`dry-run`, `ALERT`) — и пропустила cron-файл, который
+# cron ОТКАЗЫВАЕТСЯ ставить: команда была разбита переносами `\`, которых cron не понимает
+# (каждая физическая строка = отдельная запись ⇒ `crontab -n` → «bad minute», exit=1).
+# Поймал reviewer на PR-гейте. Тот же класс, что весь TD-020: грепом доказывается ТЕКСТ,
+# а нужен ФАКТ. Поэтому ниже — парсер cron'а, а не grep, и прогон тела задания, а не чтение.
 CRON="deploy/cron.d/journal-retention"
-if [ -f "${CRON}" ]; then
-  if grep -q 'dry-run' "${CRON}" && grep -qE 'logger|ALERT|retention\.alert' "${CRON}"; then
-    pass "D5 cron-юнит в репо: dry-run по расписанию + алерт на ненулевой exit"
-  else
-    fail "D5 ${CRON} есть, но не запускает dry-run и/или не алертит на exit≠0 \
-(2 = сверка холодной копии не прошла, 3 = disk_pressure — молчать про них нельзя)"
-  fi
-else
+CRON_JOB="deploy/bin/journal-retention-cron.sh"
+
+if [ ! -f "${CRON}" ]; then
   fail "D5 нет ${CRON} — планировщик существует только в голове оператора; ровно так TD-020 \
 и родился (артефакт, которого нет в репо, не существует)"
+elif [ ! -f "${CRON_JOB}" ]; then
+  fail "D5 нет ${CRON_JOB} — cron ссылается на скрипт, которого нет в репо"
+else
+  d5=0
+
+  # (1) УСТАНАВЛИВАЕМОСТЬ — то, чего не было. Валидируем ТЕМ ЖЕ парсером, что и cron.
+  if command -v crontab >/dev/null 2>&1; then
+    if ! crontab -n "${CRON}" >/dev/null 2>&1; then
+      d5=1
+      fail "D5 ${CRON} НЕ УСТАНАВЛИВАЕТСЯ (crontab -n → exit≠0):"
+      crontab -n "${CRON}" 2>&1 | sed 's/^/      /'
+      echo "      Частая причина: перенос команды через '\\' — cron этого НЕ поддерживает."
+    fi
+  else
+    # Нет crontab в окружении — не молчим и не зачитываем как PASS: проверяем структурно.
+    echo "NOTE  D5 crontab(1) недоступен — синтаксис проверяется структурно (в CI/на VPS он есть)"
+  fi
+
+  # (2) Переносов строк в записях быть не может — cron их не понимает (структурный дубль (1),
+  #     работает и там, где crontab(1) не установлен).
+  if grep -qE '\\[[:space:]]*$' "${CRON}"; then
+    d5=1
+    fail "D5 ${CRON} содержит перенос строки '\\' — cron трактует продолжение как НОВУЮ запись \
+(«bad minute») и файл не устанавливается. Команда обязана быть ОДНОЙ строкой; логика — в ${CRON_JOB}"
+  fi
+
+  # (3) Задание вызывает наш скрипт, а не инлайн-простыню.
+  if ! grep -qE '^[0-9*/,-]+[[:space:]]+.*journal-retention-cron\.sh[[:space:]]*$' "${CRON}"; then
+    d5=1
+    fail "D5 в ${CRON} нет записи расписания, вызывающей ${CRON_JOB} одной строкой"
+  fi
+
+  # (4) Тело задания синтаксически валидно и исполняемо.
+  if ! bash -n "${CRON_JOB}" 2>/dev/null; then
+    d5=1
+    fail "D5 ${CRON_JOB} не проходит bash -n (синтаксическая ошибка)"
+  fi
+  [ -x "${CRON_JOB}" ] || { d5=1; fail "D5 ${CRON_JOB} не исполняемый (chmod +x) — cron его не запустит"; }
+
+  # (5) ПОВЕДЕНИЕ, а не текст: при ненулевом exit'е бинаря задание ОБЯЗАНО поднять алерт и
+  #     пробросить код. Подставляем docker-стаб (exit=3 = disk_pressure) и смотрим на ФАКТ.
+  #     Молчащая уборка — это TD-020 на третьем витке: сбой, которого никто не увидел.
+  sandbox=$(mktemp -d)
+  mkdir -p "${sandbox}/bin" "${sandbox}/root"
+  printf '#!/bin/sh\nexit 3\n' > "${sandbox}/bin/docker"
+  chmod +x "${sandbox}/bin/docker"
+  set +e
+  PATH="${sandbox}/bin:${PATH}" \
+    HFT_ROOT="${sandbox}/root" \
+    RETENTION_LOG="${sandbox}/retention.log" \
+    RETENTION_ALERT_FILE="${sandbox}/retention.alert" \
+    bash "${CRON_JOB}" >/dev/null 2>&1
+  rc_stub=$?
+  set -e
+  if [ "${rc_stub}" -ne 3 ]; then
+    d5=1
+    fail "D5 задание НЕ пробрасывает exit бинаря (стаб вернул 3, задание — ${rc_stub}); \
+cron/монитор не узнают о disk_pressure"
+  fi
+  if [ ! -s "${sandbox}/retention.alert" ]; then
+    d5=1
+    fail "D5 задание НЕ подняло маркер алерта на exit≠0 — сбой ретеншена остался бы НЕЗАМЕЧЕННЫМ \
+(2 = сверка холодной копии не прошла, 3 = disk_pressure)"
+  fi
+  rm -rf "${sandbox}"
+
+  [ "${d5}" -eq 0 ] && pass "D5 cron-юнит РЕАЛЬНО устанавливается (crontab -n), задание алертит и \
+пробрасывает exit≠0 (проверено прогоном со стабом, не грепом)"
 fi
 
 # ── D6: runbook доставки (кто монтирует Storage Box и как включается Apply) ───────────

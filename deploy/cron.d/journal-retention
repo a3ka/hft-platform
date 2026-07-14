@@ -1,56 +1,47 @@
 # /etc/cron.d/hft-journal-retention
-# M-08 rev 7, задача 14 (TD-020 доставка): планировщик В РЕПО, а не в голове оператора.
+# M-08 задача 14 (TD-020 доставка): планировщик В РЕПО, а не в голове оператора.
+#
+# ⚠ ОГРАНИЧЕНИЯ CRON-ПАРСЕРА — на них мы уже обожглись (reviewer, PR-гейт M-08):
+#   • перенос строки через `\` НЕ ПОДДЕРЖИВАЕТСЯ: каждая физическая строка — отдельная запись.
+#     Первая редакция держала здесь многострочную команду ⇒ `crontab -n` → «bad minute»,
+#     файл НЕ УСТАНАВЛИВАЛСЯ. Гейт D5 этого не поймал, потому что грепал слова (`dry-run`,
+#     `ALERT`), а не устанавливаемость — grep-green артефакт. Тот же класс, что весь TD-020:
+#     «текст в репо» ≠ «работает в проде».
+#   • `%` в команде = перевод строки (спецсимвол cron);
+#   • `${VAR}` в КОМАНДНОЙ части не раскрывается (env ниже виден только процессу задания).
+# Поэтому: команда — ОДНА строка, вся логика — в deploy/bin/journal-retention-cron.sh,
+# где её можно проверить (`bash -n`, прогон со стабом docker) и где нет ограничений парсера.
 #
 # Контракт:
-#   - dry-run ежедневно (дефолт --mode бинаря — тоже dry-run; здесь продублировано
-#     явно для документирования намерения: «по cron'у НИКОГДА apply»);
-#   - лог в /var/log/hft/journal-retention.log (ротация — logrotate, см. deploy/README.md);
-#   - алерт на exit≠0: `logger -p user.err` (попадает в syslog/journald → алертинг)
-#     + маркер-файл /var/lib/hft/retention.alert (для healthcheck'а внешнего монитора).
+#   - dry-run ежедневно (дефолт бинаря — тоже dry-run; здесь продублировано ЯВНО:
+#     «по cron'у НИКОГДА apply» — автоматическое удаление без глаза оператора и есть TD-020);
+#   - лог: /var/log/hft/journal-retention.log (ротация — logrotate, см. deploy/README.md);
+#   - алерт на exit≠0: `logger -p user.err` (syslog/journald) + маркер-файл
+#     /var/lib/hft/retention.alert для внешнего монитора; успешный прогон маркер гасит.
 #
-# Apply — ВРУЧНУЮ оператором после визуального разбора отчёта dry-run'а:
+# Apply — ВРУЧНУЮ, после визуального разбора отчёта dry-run'а:
 #     docker compose run --rm journal-retention --mode apply
-# Cron'ом apply НЕ запускается (тот же TD-020: «автоматизация без оператора = ретеншен
-# без глаза = удалить единственную копию»).
-#
-# Расписание: ежедневно в 04:07 UTC (после резервных копий и перед утренним трафиком).
-# Конкретное время — по согласованию с founder'ом (этот cron — стартовая точка).
 #
 # Установка:
+#   sudo install -m 0755 deploy/bin/journal-retention-cron.sh /root/hft-platform/deploy/bin/
 #   sudo install -m 0644 deploy/cron.d/journal-retention /etc/cron.d/hft-journal-retention
-#   sudo install -d -o hft -g hft /var/log/hft /var/lib/hft
+#   sudo install -d /var/log/hft /var/lib/hft
+# Проверка ДО установки (ровно это делает гейт D5):
+#   crontab -n deploy/cron.d/journal-retention   → exit 0
 # Удаление (revoke):
 #   sudo rm /etc/cron.d/hft-journal-retention
 
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-# Cron не раскрывает ${VAR} из окружения хоста — прокидываем явно.
+HFT_ROOT=/root/hft-platform
 JOURNAL_COLD_DIR=/mnt/journal-cold
 RETENTION_RETAIN_DAYS=14
 RETENTION_KEEP_MIN=4
 RETENTION_MIN_FREE_GB=10
+RETENTION_MODE=dry-run
+RETENTION_LOG=/var/log/hft/journal-retention.log
+RETENTION_ALERT_FILE=/var/lib/hft/retention.alert
 
+# Ежедневно в 04:07 UTC. Время — стартовая точка, согласуется с founder'ом.
 # m h dom mon dow user command
-07 4 * * * root cd /root/hft-platform && \
-    docker compose run --rm journal-retention \
-        --dir=/journal \
-        --cold="${JOURNAL_COLD_DIR}" \
-        --retain-days="${RETENTION_RETAIN_DAYS}" \
-        --keep-min="${RETENTION_KEEP_MIN}" \
-        --min-free-gb="${RETENTION_MIN_FREE_GB}" \
-        --mode=dry-run \
-        >> /var/log/hft/journal-retention.log 2>&1
-    rc=$?; \
-    if [ $rc -ne 0 ]; then \
-        # D5: алерт на exit≠0 (2 = сверка холодной копии не прошла, 3 = disk_pressure).
-        # Оператор ОБЯЗАН увидеть тревогу. logger идёт в syslog (journald на systemd-хостах);
-        # маркер-файл — для внешнего healthcheck'а (ping /var/lib/hft/retention.alert из zabbix/nagios).
-        logger -p user.err -t hft-journal-retention \
-            "ALERT: dry-run exit=$rc (2=failed_cold_verify, 3=disk_pressure, 1=arg/io). Лог: /var/log/hft/journal-retention.log"; \
-        install -m 0644 /dev/null /var/lib/hft/retention.alert; \
-        date -u +%Y-%m-%dT%H:%M:%SZ >> /var/lib/hft/retention.alert; \
-        echo "exit=$rc" >> /var/lib/hft/retention.alert; \
-    else \
-        # Чистим маркер на УСПЕШНОМ прогоне (следующий fail снова поднимет алерт).
-        rm -f /var/lib/hft/retention.alert; \
-    fi
+7 4 * * * root /root/hft-platform/deploy/bin/journal-retention-cron.sh

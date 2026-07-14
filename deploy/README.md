@@ -52,17 +52,33 @@ ls -la /mnt/journal-cold   # должна быть пустая (или ваша
 
 ## 2. Установка cron-юнита
 
+Cron-запись вызывает **тело задания** `deploy/bin/journal-retention-cron.sh` ОДНОЙ строкой
+(cron не понимает переносов `\` — многострочная команда не устанавливается вовсе, см. шапку
+`deploy/cron.d/journal-retention`). Поэтому ставятся ДВА артефакта: скрипт и cron-файл.
+
 ```bash
+# 0) СНАЧАЛА проверить, что cron вообще примет файл (ровно это делает гейт D5):
+crontab -n deploy/cron.d/journal-retention     # обязан быть exit=0
+
 sudo install -d -o root -g root /var/log/hft /var/lib/hft
+sudo install -m 0755 deploy/bin/journal-retention-cron.sh /root/hft-platform/deploy/bin/journal-retention-cron.sh
 sudo install -m 0644 deploy/cron.d/journal-retention /etc/cron.d/hft-journal-retention
 sudo systemctl restart cron   # или crond — зависит от дистрибутива
 ```
 
-Проверка:
+Проверка (не «файл лежит», а «оно работает» — урок TD-020):
 
 ```bash
 cat /etc/cron.d/hft-journal-retention
-ls -l /etc/cron.d/hft-journal-retention
+ls -l /root/hft-platform/deploy/bin/journal-retention-cron.sh   # обязан быть исполняемым
+
+# Прогнать задание РУКАМИ (оно dry-run по умолчанию — ничего не удалит):
+sudo /root/hft-platform/deploy/bin/journal-retention-cron.sh; echo "exit=$?"
+sudo tail -20 /var/log/hft/journal-retention.log
+
+# Алерт-маркер: появляется при exit≠0 (2 = сверка холодной копии не прошла, 3 = disk_pressure),
+# гаснет на успешном прогоне. Именно его пингует внешний монитор.
+ls -l /var/lib/hft/retention.alert 2>/dev/null || echo "маркера нет — последний прогон успешен"
 ```
 
 ## 3. Первый прогон — DRY-RUN (обязательно)
