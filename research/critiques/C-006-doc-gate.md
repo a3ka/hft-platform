@@ -199,6 +199,127 @@ High. I read the audited commits, `gates.md`, `commit-discipline.md`, `branch-hy
 
 ---
 
+## Re-audit (rev 9) - 2026-07-14T19:16Z
+
+**Audited repair range:** `836036d..764fb78`
+**Expected/audited HEAD:** `764fb78` - `fix(doc-gate): rev8 — артефакт можно было подменить каталогом/симлинком/пустым файлом`
+**Worktree:** `/tmp/hft-critic-dg-r9`, detached at `origin/docs/doc-gate` after exact HEAD check.
+
+## Rev 9 Verdict
+
+**REJECT remains.**
+
+The rev8 barrier implementation is materially repaired: on HEAD it requires a protected artifact to be a normal non-empty file (`100644`/`100755`) and rejects directory/tree, symlink, gitlink/submodule mode `160000`, and zero-byte replacement. The required current run is green, and P14/P16 are red against the rev8 barrier as requested.
+
+The blocker is in the RED probe / anti-placebo layer. Scenario P15 claims to test "file replaced by symlink", but its setup fails before creating the symlink because `git rm` removes the empty `research/critiques` directory in the temp repo. The script does not fail on setup errors, so P15 reports PASS by testing plain deletion, not symlink replacement. A correctly constructed symlink replacement is still accepted by the rev8 barrier with `exit=0`; therefore P15 is a placebo against the previous broken behavior and `gates.md` overstates the probe coverage.
+
+## Rev 9 Required Execution
+
+- Branch precondition: PASS. `git fetch origin && git rev-parse --short origin/docs/doc-gate` returned `764fb78`.
+- Current RED probe: PASS by exit code, `bash scripts/tests/red_protected_artifacts.sh` returned `VERDICT: PASS (17/17)`, `exit=0`.
+- Anti-placebo against rev8 barrier: PASS for the requested P14/P16 checks. `BARRIER=/tmp/rev8.sh bash scripts/tests/red_protected_artifacts.sh` returned `VERDICT: FAIL (2)`, with P14 and P16 failing.
+- P15 probe validity: FAIL. Both current and rev8 anti-placebo runs emitted:
+
+```text
+ln: failed to create symbolic link '.../research/critiques/C-001.md': No such file or directory
+fatal: pathspec 'research/critiques/C-001.md' did not match any files
+PASS  P15 файл подменён СИМЛИНКОМ — ВАЛИТ гейт
+```
+
+The PASS is therefore not evidence that a symlink was created or rejected.
+
+## Rev 9 Manual Probes
+
+**Bypass probes not covered correctly by the 17-case suite:**
+
+- Manual symlink at protected path against current rev9 barrier: FAIL as required, `exit=1`; output names `СИМЛИНК, не файл`.
+- Manual symlink at protected path against rev8 barrier (`2773e9c`): PASS incorrectly, `exit=0`; this proves P15 should be an anti-placebo failure if the scenario were constructed correctly.
+- Manual gitlink/submodule at protected path (`160000 commit ... research/critiques/C-001.md`): FAIL as required, `exit=1`; output names `SUBMODULE, не файл`.
+- Manual octopus `merge -s ours` dropping a side-only protected artifact: FAIL as required, `exit=1`.
+
+**False-positive checks:**
+
+- Protected rename chain inside `docs/rfc/`: PASS, `exit=0`.
+- Protected artifact content edit: PASS, `exit=0`.
+- Same-size content substitution / junk content: PASS, `exit=0`; this is acceptable because the stated boundary is normal non-empty file presence, not semantic content integrity.
+- Honest origin/main-style merge with no protected loss: PASS, `exit=0`.
+
+## Rev 9 Text / Guarantee Check
+
+- Force-push boundary: PASS. `gates.md` says in-branch scripts can fail-closed/detect unverifiable history but cannot prevent force-push; full prevention is founder/GitHub branch protection.
+- Content substitution boundary: PASS. The docs define "artifact exists" as normal non-empty file presence. They do not promise semantic hash/content integrity.
+- Scenario counters: FAIL. `gates.md` now says the probe has 17 scenarios, but the bottom of §9 still says "Проверено на 9 сценариях". The CI comment says 17 scenarios and names symlink/type substitution, but P15 is not actually exercising symlink substitution.
+
+## Rev 9 Required Repair
+
+1. Fix P15 setup so it creates an actual symlink after `git rm`:
+   - recreate the parent directory before `ln -s`, or otherwise prevent `git rm` from pruning it;
+   - make setup command failures fail the probe instead of silently falling through to `expect`.
+2. Re-run the anti-placebo check against `2773e9c`; P15 should fail against rev8 along with P14/P16, or the test is still not proving the rev8 class.
+3. Update `gates.md` §9 stale "9 scenarios" text to match the actual probe count and include symlink/gitlink/zero-byte coverage accurately.
+4. Keep the current barrier implementation behavior for `100644`/`100755` non-empty files and rejection of `040000`/`120000`/`160000`.
+
+## Rev 9 Confidence
+
+High for REJECT. The current barrier closes the artifact-mode hole, including manual gitlink/submodule mode, but the committed RED probe contains a concrete setup failure and reports a false PASS for P15. Since C-006 is explicitly about anti-placebo doc gates, a malformed scenario advertised as covered is blocking.
+
+=== HANDOFF: critic -> architect ===
+
+## §A - Metadata
+- UTC datetime: 2026-07-14T19:16Z
+- Gate: C-006 doc-gate, rev9 re-audit
+- Status: REJECT remains
+- HEAD before critic verdict: `764fb78` - `fix(doc-gate): rev8 — артефакт можно было подменить каталогом/симлинком/пустым файлом`
+
+## §B - What I Checked
+- Required 17-case RED probe.
+- Anti-placebo against rev8 barrier from `2773e9c`.
+- Manual symlink, gitlink/submodule `160000`, octopus `-s ours`, rename-chain, content-edit, same-size junk, and honest merge probes.
+- `gates.md` §9 / CI comment alignment with executable guarantee.
+
+## §C - Artifacts / Results
+- Updated verdict artifact: `research/critiques/C-006-doc-gate.md`
+- Verdict: REJECT.
+- Closed: current barrier rejects directory, symlink, gitlink/submodule, and zero-byte protected artifact substitutions.
+- Open blocker: P15 symlink RED scenario is malformed and green against rev8 for the wrong reason; `gates.md` retains stale scenario-count text.
+
+## §D - Next Agent + Invocation
+- **Next agent:** architect.
+- **Expected HEAD before architect starts:** the pushed rev9 verdict commit containing this section.
+- **Push status:** critic must commit and push this verdict to `origin/docs/doc-gate`.
+- **Paste-ready prompt:**
+  ```
+  Ты — architect. Same C-006 doc-gate loop, rev9 REJECT.
+
+  Expected HEAD: the pushed rev9 critic commit on origin/docs/doc-gate. Run:
+  git fetch origin
+  git rev-parse --short origin/docs/doc-gate
+  If HEAD differs, STOP: prompt stale.
+
+  Read `research/critiques/C-006-doc-gate.md` section "Re-audit (rev 9)".
+  Repair only the remaining blocker: P15 in `scripts/tests/red_protected_artifacts.sh`
+  claims to test symlink replacement, but `git rm` prunes the parent directory and
+  `ln -s` fails; the test then passes by exercising plain deletion. A correctly
+  constructed symlink is accepted by the rev8 barrier, so P15 must become a real
+  anti-placebo failure against `2773e9c`.
+
+  Required outcome:
+  - Fix P15 setup and setup-failure handling.
+  - Verify current barrier still passes the full suite.
+  - Verify rev8 barrier fails P14/P15/P16, not only P14/P16.
+  - Update stale `gates.md` §9 "9 scenarios" text to match the actual probe count.
+  - Do not change founder-owned priorities: P2.5, BACKLOG order, and HL-depth fork remain founder ★.
+  ```
+
+## §E - Risks / Open Questions
+- The current barrier behavior is acceptable; avoid redesigning the fix beyond the probe/setup and stale counter repair.
+- Branch protection "no force-push" remains outside the in-branch script and stays founder/GitHub configuration.
+- Founder ★ pending: P2.5 acceptance, BACKLOG queue, HL-depth / first-live-signal fork.
+
+=== END HANDOFF ===
+
+---
+
 ## Re-audit (rev 8) - 2026-07-14T18:27Z
 
 **Audited repair range:** `d830d3d..2773e9c`
