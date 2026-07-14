@@ -184,12 +184,18 @@ live с зашитым микро-профилем лимитов (не флаг
 
 ## §12. Фазовый роадмап (acceptance = ворота, не даты)
 
+> ⚠ **Подчинённая копия.** Источник правды по фазам — `DESIGN.md` §10 + `milestones/BACKLOG.md`.
+> При расхождении верна DESIGN. Обновлено 2026-07-14: между P2 и P3 добавлена **P2.5 Data safety
+> net** (PROPOSED, doc-гейт §9) — таблица ниже приведена в соответствие; агент, планирующий
+> следующий milestone, обязан свериться с DESIGN §10, а не с этой таблицей.
+
 | Фаза | Содержимое | Acceptance (все — исполняемые ворота) |
 |---|---|---|
 | **P0 Журнал** | journal + replay + state_hash + recorder HL-фида | 24ч записи; replay ×3 бит-идентичен (DET-I-1) |
 | **P1 Data plane** | venue-hyperliquid MD, book+ресинк, recorder-демон, замеры латентностей | 7 дней данных; gap-статистика; целостность книги green; распределения δ собраны |
 | **P2 Research core** | sim fill-model, research-cli (grid, walk-forward, metrics.json), сигнал №1 OBI формализован | OBI-отчёт по пре-регистрированным критериям (02 §3); paper-режим работает |
-| **P3 Risk+OMS** | gate, killswitch, oms; HL **testnet** торговля | RED-suite RK-I-1..10 GREEN (падали на заглушках); 48ч testnet-MM чисто; disconnect-drill: заявок на бирже нет |
+| **P2.5 Data safety net** | ops: cold-copy+restore-drill, recon книги с биржей, /metrics+алерты (`docs/fa/ops.md`) | бэкап ВОССТАНАВЛИВАЕТСЯ; инъецированная порча книги ловится recon'ом; recon не даёт rate-limit-инцидентов (OPS-I-9) |
+| **P3 Risk+OMS** | gate, killswitch, oms; HL **testnet** торговля ЧЕРЕЗ runner | RED-suite RK-I-1..10 GREEN (падали на заглушках); disconnect-drill: заявок на бирже нет; **48ч testnet — только после runner/arming** (см. BACKLOG M-11/M-12) |
 | **P4 Live-micro** | одна пара, микро-инвентарь, 2–4 недели | recon mismatch = 0; каждый цент PnL объясняется реплеем; sim-vs-live дивергенция в допуске |
 | **P5 Scale** | Binance-адаптер, lead-lag сигнал №3, рабочие лимиты, квант-деск на полном цикле | по отдельному плану |
 
