@@ -65,6 +65,25 @@ expect() { # $1=имя $2=ожидаемый-исход(ok|deny) $3=actual-exit
   else fail "$1 — exit=$3, ожидалось $2"; fi
 }
 
+# ── SETUP ОБЯЗАН БЫТЬ FAIL-CLOSED (блокер rev9, critic) ───────────────────────────────
+# P15 «подмена симлинком» НЕ СОЗДАВАЛА симлинк: `git rm` удалял единственный файл в
+# `research/critiques/`, каталог исчезал, `ln -s` падал с «No such file or directory» — а проба
+# молча продолжала и печатала PASS, тестируя на самом деле обычное удаление. То есть проба,
+# написанная ПРОТИВ плацебо-гейтов, сама оказалась плацебо: несостоявшийся setup зачитывался
+# за успех. Теперь сценарий обязан ДОКАЗАТЬ, что подготовил ровно то состояние, которое
+# собирается проверять; не доказал — FAIL, а не «ну и ладно».
+head_mode() { git -C "$1" ls-tree HEAD -- "$2" 2>/dev/null | awk '{print $1}'; }
+
+setup_is() { # $1=repo $2=path $3=ожидаемый-режим $4=имя-сценария → 0, если состояние подготовлено
+  local m; m=$(head_mode "$1" "$2")
+  if [ "${m}" != "$3" ]; then
+    fail "$4 — SETUP НЕ СОСТОЯЛСЯ: по пути $2 режим '${m:-<нет>}', ожидался $3. \
+Проба тестировала бы НЕ ТО, что заявляет (ровно плацебо, ради которого её и писали)"
+    return 1
+  fi
+  return 0
+}
+
 # ── P1: чистый push (артефакты не тронуты) — барьер обязан ПРОПУСТИТЬ ─────────────────
 r=$(new_repo); before=$(git -C "$r" rev-parse HEAD)
 echo "правка" >> "$r/src.rs"; git -C "$r" commit -qam "feat: обычная правка кода"
@@ -172,21 +191,34 @@ mkdir -p "$r/research/critiques/C-001.md"
 echo "мусор" > "$r/research/critiques/C-001.md/README.md"
 git -C "$r" add research/critiques/C-001.md >/dev/null
 git -C "$r" commit -qm "chore: на месте вердикта теперь каталог"
-expect "P14 файл подменён КАТАЛОГОМ — ВАЛИТ гейт" deny "$(run_barrier "$r" push "$before")"
+# `ls-tree HEAD -- path` для каталога отдаёт запись дерева (040000) — это и есть подмена типа.
+if setup_is "$r" research/critiques/C-001.md 040000 "P14"; then
+  expect "P14 файл подменён КАТАЛОГОМ — ВАЛИТ гейт" deny "$(run_barrier "$r" push "$before")"
+fi
 
 # ── P15 (rev8): файл подменён СИМЛИНКОМ ───────────────────────────────────────────────
 r=$(new_repo); before=$(git -C "$r" rev-parse HEAD)
 git -C "$r" rm -q research/critiques/C-001.md
+# `git rm` унёс единственный файл ⇒ каталога больше нет. Без mkdir симлинк НЕ создавался, и
+# проба тихо тестировала обычное удаление (блокер rev9). Каталог восстанавливаем ЯВНО.
+mkdir -p "$r/research/critiques"
 ln -s /dev/null "$r/research/critiques/C-001.md"
 git -C "$r" add research/critiques/C-001.md >/dev/null
 git -C "$r" commit -qm "chore: вердикт теперь симлинк в /dev/null"
-expect "P15 файл подменён СИМЛИНКОМ — ВАЛИТ гейт" deny "$(run_barrier "$r" push "$before")"
+if setup_is "$r" research/critiques/C-001.md 120000 "P15"; then
+  expect "P15 файл подменён СИМЛИНКОМ — ВАЛИТ гейт" deny "$(run_barrier "$r" push "$before")"
+fi
 
 # ── P16 (rev8): файл усечён в НОЛЬ БАЙТ — то же удаление, только вежливое ─────────────
 r=$(new_repo); before=$(git -C "$r" rev-parse HEAD)
 : > "$r/research/critiques/C-001.md"
 git -C "$r" commit -qam "chore: вердикт выпотрошен до нуля байт"
-expect "P16 артефакт усечён в 0 байт — ВАЛИТ гейт" deny "$(run_barrier "$r" push "$before")"
+if setup_is "$r" research/critiques/C-001.md 100644 "P16" \
+   && [ "$(git -C "$r" cat-file -s "$(git -C "$r" rev-parse HEAD:research/critiques/C-001.md)")" -eq 0 ]; then
+  expect "P16 артефакт усечён в 0 байт — ВАЛИТ гейт" deny "$(run_barrier "$r" push "$before")"
+else
+  fail "P16 — SETUP НЕ СОСТОЯЛСЯ: файл не пуст, проба тестировала бы не то"
+fi
 
 # ── P17 (rev8, ЛОЖНОЕ СРАБАТЫВАНИЕ): обычная правка содержимого — пропускается ────────
 r=$(new_repo); before=$(git -C "$r" rev-parse HEAD)

@@ -306,7 +306,7 @@ Doc-гейт применяется и к правкам самого doc-гей
 - Легитимны без override: цепочка переименований внутри защиты (`docs/contract-rfc/` → `docs/rfc/`
   и дальше); удаление, восстановленное позже (артефакт есть на HEAD); честный `merge origin/main`.
 - Канонический путь RFC — **`docs/rfc/`**; `docs/contract-rfc/` защищён как исторический.
-- Проверено на 9 сценариях: `git mv` в merge → FAIL; `merge -s ours` (side-only вердикт) → FAIL;
+- Проверено на 17 сценариях (проба `scripts/tests/red_protected_artifacts.sh`, setup каждого сценария fail-closed): `git mv` в merge → FAIL; `merge -s ours` (side-only вердикт) → FAIL;
   evil merge (`D`) → FAIL; add→delete → FAIL; rename-out → FAIL; override в другом коммите → FAIL;
   override в том же коммите → PASS; цепочка protected→protected → PASS; честный merge → PASS.
   Время прогона: ~40 мс (на +120 коммитов — <1 с).
