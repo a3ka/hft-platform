@@ -84,6 +84,40 @@ setup_is() { # $1=repo $2=path $3=ожидаемый-режим $4=имя-сце
   return 0
 }
 
+# ── SETUP-GUARD ДЛЯ MERGE-СЦЕНАРИЕВ (блокер rev10, critic) ────────────────────────────
+# Тот же класс, что P15: `git merge`/`git commit` в песочнице могут молча не состояться (конфликт,
+# checkout не туда, пустой мерж), а `expect` этого не видит — сценарий рапортует «evil merge» /
+# «merge-born», хотя проверяет ЛИНЕЙНОЕ удаление. Каждый merge-сценарий обязан ДОКАЗАТЬ свою
+# форму: (1) в диапазоне есть merge-коммит; (2) артефакт достиг заявленного HEAD-состояния;
+# для born-in-merge — (3) артефакт действительно СУЩЕСТВОВАЛ где-то в диапазоне.
+setup_has_merge() { # $1=repo $2=before $3=имя → 0, если в before..HEAD есть merge-коммит
+  local n; n=$(git -C "$1" rev-list --merges "$2"..HEAD 2>/dev/null | wc -l | tr -d ' ')
+  if [ "${n:-0}" -lt 1 ]; then
+    fail "$3 — SETUP НЕ СОСТОЯЛСЯ: в ${2:0:7}..HEAD НЕТ merge-коммита (мерж молча не прошёл); \
+проверялось бы линейное удаление, а не заявленный merge-сценарий"
+    return 1
+  fi
+  return 0
+}
+setup_head_absent() { # $1=repo $2=path $3=имя → 0, если пути НЕТ на HEAD (сценарий удаления)
+  if git -C "$1" cat-file -e "HEAD:$2" 2>/dev/null; then
+    fail "$3 — SETUP НЕ СОСТОЯЛСЯ: $2 всё ещё на HEAD — удаление, которое сценарий обязан \
+проверять, не случилось"
+    return 1
+  fi
+  return 0
+}
+setup_existed_in_range() { # $1=repo $2=path $3=before $4=имя → 0, если путь был в дереве диапазона
+  local c
+  git -C "$1" cat-file -e "$3:$2" 2>/dev/null && return 0
+  for c in $(git -C "$1" rev-list "$3"..HEAD); do
+    git -C "$1" cat-file -e "${c}:$2" 2>/dev/null && return 0
+  done
+  fail "$4 — SETUP НЕ СОСТОЯЛСЯ: $2 не существовал НИ В ОДНОМ коммите диапазона — \
+born-in-merge/side не подготовлен (add молча не прошёл)"
+  return 1
+}
+
 # ── P1: чистый push (артефакты не тронуты) — барьер обязан ПРОПУСТИТЬ ─────────────────
 r=$(new_repo); before=$(git -C "$r" rev-parse HEAD)
 echo "правка" >> "$r/src.rs"; git -C "$r" commit -qam "feat: обычная правка кода"
@@ -132,7 +166,9 @@ git -C "$r" checkout -q main >/dev/null 2>&1 || git -C "$r" checkout -q -
 git -C "$r" merge -q --no-ff -m "merge: side" side >/dev/null 2>&1
 git -C "$r" rm -q research/critiques/C-001.md
 git -C "$r" commit -q --amend --no-edit >/dev/null 2>&1   # артефакт исчез ВНУТРИ merge-коммита
-expect "P7 артефакт, выброшенный мержем, ВАЛИТ гейт" deny "$(run_barrier "$r" push "$before")"
+if setup_has_merge "$r" "$before" "P7" && setup_head_absent "$r" research/critiques/C-001.md "P7"; then
+  expect "P7 артефакт, выброшенный мержем, ВАЛИТ гейт" deny "$(run_barrier "$r" push "$before")"
+fi
 
 # ── P8: fail-closed — zero-SHA before (создание ветки / force-push) ───────────────────
 # «Базы нет» НЕ ЗНАЧИТ «проверять нечего»: это значит, что мы не можем гарантировать целостность.
@@ -159,7 +195,11 @@ echo "вердикт, рождённый в ветке" > "$r/research/critiques
 git -C "$r" add research/critiques/C-002.md >/dev/null; git -C "$r" commit -qm "critic: вердикт C-002"
 git -C "$r" checkout -q -; git -C "$r" merge -q --no-ff -m "merge: side2 (вердикт приезжает мержем)" side2
 git -C "$r" rm -q research/critiques/C-002.md; git -C "$r" commit -qm "docs: правки (вердикт уехал за компанию)"
-expect "P11 артефакт, пришедший МЕРЖЕМ, и удалённый потом — ВАЛИТ гейт" deny "$(run_barrier "$r" push "$before")"
+if setup_has_merge "$r" "$before" "P11" \
+   && setup_existed_in_range "$r" research/critiques/C-002.md "$before" "P11" \
+   && setup_head_absent "$r" research/critiques/C-002.md "P11"; then
+  expect "P11 артефакт, пришедший МЕРЖЕМ, и удалённый потом — ВАЛИТ гейт" deny "$(run_barrier "$r" push "$before")"
+fi
 
 # ── P12 (rev7): артефакт СОЗДАН ПРЯМО В ТЕЛЕ merge-коммита — и удалён потом ───────────
 r=$(new_repo); before=$(git -C "$r" rev-parse HEAD)
@@ -170,7 +210,11 @@ echo "вердикт, рождённый в мерже" > "$r/research/critiques
 git -C "$r" add research/critiques/C-003.md >/dev/null
 git -C "$r" commit -qm "merge: side3 (+ вердикт C-003 прямо в теле мержа)"
 git -C "$r" rm -q research/critiques/C-003.md; git -C "$r" commit -qm "chore: прибрал"
-expect "P12 артефакт, рождённый В МЕРЖЕ, и удалённый потом — ВАЛИТ гейт" deny "$(run_barrier "$r" push "$before")"
+if setup_has_merge "$r" "$before" "P12" \
+   && setup_existed_in_range "$r" research/critiques/C-003.md "$before" "P12" \
+   && setup_head_absent "$r" research/critiques/C-003.md "P12"; then
+  expect "P12 артефакт, рождённый В МЕРЖЕ, и удалённый потом — ВАЛИТ гейт" deny "$(run_barrier "$r" push "$before")"
+fi
 
 # ── P13 (rev7, ЛОЖНОЕ СРАБАТЫВАНИЕ): артефакт пришёл мержем и ЦЕЛ — пропускается ──────
 # Расширение множества «существовавших» не смеет сделать барьер параноиком: honest merge,
@@ -180,8 +224,10 @@ git -C "$r" checkout -qb side4
 echo "вердикт" > "$r/research/critiques/C-004.md"
 git -C "$r" add research/critiques/C-004.md >/dev/null; git -C "$r" commit -qm "critic: вердикт C-004"
 git -C "$r" checkout -q -; git -C "$r" merge -q --no-ff -m "merge: side4" side4
-expect "P13 артефакт, пришедший мержем и ЦЕЛЫЙ, пропускается (нет ложных срабатываний)" ok \
-  "$(run_barrier "$r" push "$before")"
+if setup_has_merge "$r" "$before" "P13" && setup_is "$r" research/critiques/C-004.md 100644 "P13"; then
+  expect "P13 артефакт, пришедший мержем и ЦЕЛЫЙ, пропускается (нет ложных срабатываний)" ok \
+    "$(run_barrier "$r" push "$before")"
+fi
 
 # ── P14 (rev8): файл подменён КАТАЛОГОМ на том же пути ────────────────────────────────
 # `git cat-file -e HEAD:path` говорит «объект есть» и для ДЕРЕВА — артефакт уничтожен, барьер молчал.
