@@ -90,6 +90,14 @@ Coin/TOTAL/…). Полосы вычислимы ТОЛЬКО через full-bo
 5. δ_submit/δ_cancel в latency-артефактах — RTT-прокси ×2 (реальный order-path не измерен
    до P3/testnet); reviewer RN-2: обязательный фокус risk-critic на отчёте R-001.
 
+## 5.5. ГОТОВНОСТЬ (снимок 2026-07-14) — детали в `milestones/BACKLOG.md`
+
+| Готово | Не готово (по приоритету) |
+|---|---|
+| journal (ротация/эпохи/стрим/ретеншен), contracts T1 v2 (provenance), venue-* MD, recorder 24/7, book, signals+OBI, alpha/portfolio/strategy, sim, research-cli | **ops: бэкапа/метрик/алертов/recon НЕТ** (15 GB данных в ОДНОЙ копии) · **отчётов R-* — ноль** · **risk/killswitch/oms/runner — нет** · подпись Ed25519 (граница C) — нет · HL-глубина ≤20 ур. (TD-005) · полный DET-I-1 (TD-007) |
+
+Фаза: P0 ✅ · P1 ✅ · **P2 ≈80%** (research-движок готов, отчёта нет) · **P2.5 (data safety net) — новая, следующая** · P3+ 0%.
+
 ## 6. СЛЕДУЮЩАЯ ЗАДАЧА
 
 > **Обновлено 2026-07-13: M-07 «Strategy brain» ЗАКРЫТ** (reviewer APPROVED, merge `5141fd9`,
