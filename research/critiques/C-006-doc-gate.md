@@ -199,6 +199,113 @@ High. I read the audited commits, `gates.md`, `commit-discipline.md`, `branch-hy
 
 ---
 
+## Re-audit (rev 6) - 2026-07-14T16:37Z
+
+**Audited repair range:** `efe2ccc..e3bfc42`
+**Expected/audited HEAD:** `e3bfc42` - `docs(doc-gate): C-006 rev5 - барьер переписан от РЕЗУЛЬТАТА (закрыты обе дыры мержа)`
+**Worktree:** `/tmp/hft-critic-dg-r6`, local branch `critic-dg-r6`, created from `origin/docs/doc-gate` after exact HEAD check.
+
+## Rev 6 Verdict
+
+**NOTE - REJECT lifted.**
+
+The protected-artifacts blocker is closed for silent-loss cases. The barrier now checks the result invariant: every protected artifact that existed at merge-base or was added in the branch must exist at HEAD, be renamed to another protected path, or have an explicit same-commit `ALLOW-ARTIFACT-DELETE:`.
+
+One residual limitation remains, but it is fail-closed rather than unsafe: if a merge commit intentionally deletes a protected artifact and includes `ALLOW-ARTIFACT-DELETE:` in that merge commit body, the script still fails because it cannot attribute result-based disappearance to that merge. That blocks a rare legitimate deletion, but it does not allow artifact loss. Intentional deletion can be done as a normal commit with same-commit override.
+
+## Rev 6 Probe Results
+
+Executed against disposable worktree `/tmp/hft-critic-dg-r6-probe` at `e3bfc42`.
+
+**Required loss/bypass probes:**
+- Baseline audited branch: PASS, `exit=0`.
+- Branch-local add->delete of `research/critiques/C-999.md`: FAIL, `exit=1`.
+- Protected -> unprotected rename (`research/critiques/C-005-M-08.md` -> `notes/...`): FAIL, `exit=1`.
+- Protected -> protected rename inside `research/critiques/`: PASS, `exit=0`.
+- Delete real canonical RFC `docs/rfc/CT-RFC-01-market-data-expansion.md`: FAIL, `exit=1`.
+- Historical RFC path `docs/contract-rfc/CT-RFC-PROBE.md` add->delete: FAIL, `exit=1`.
+- Same-commit `ALLOW-ARTIFACT-DELETE:` on protected milestone delete: PASS, `exit=0`.
+- Later override marker after earlier protected milestone delete: FAIL, `exit=1`.
+- Merge commit deletes protected milestone: FAIL, `exit=1`.
+- Merge commit moves protected verdict to unprotected `notes/`: FAIL, `exit=1`.
+- `merge -s ours` drops side-only protected verdict: FAIL, `exit=1`.
+
+**False-positive / legitimate probes:**
+- Benign merge with no protected loss: PASS, `exit=0`.
+- Protected rename chain inside `research/critiques/`: PASS, `exit=0`.
+- Performance with +120 empty commits: PASS, `exit=0`, ~0.04s wall time in local probe.
+
+**Residual NOTE:**
+- Merge commit deletes protected milestone with same-commit `ALLOW-ARTIFACT-DELETE:`: FAIL, `exit=1`. This is conservative and does not permit silent loss, but it means intentional protected deletion should be a normal explicit commit, not hidden in a merge commit.
+
+## Rev 6 Other Checks
+
+- CI wiring: PASS. `protected-artifacts` remains in `status-check.needs`; it is not optional.
+- Verdict trail: PASS. Original C-006, rev3, rev4, and rev5 verdict sections/commits are present.
+- Founder-priority non-drift: PASS. `efe2ccc..e3bfc42` does not touch `milestones/BACKLOG.md`, `docs/DESIGN.md`, `docs/fa/ops.md`, `PROJECT-STATE.md`, `TECH-DEBT.md`, or `docs/SESSION-HANDOFF.md`.
+- Scope: PASS. My change is limited to this verdict artifact under `research/critiques/`.
+
+## Rev 6 Recommendation
+
+Proceed to reviewer with NOTE. Reviewer should merge `docs/td021-rules` before/with `docs/doc-gate` as appropriate and keep an eye on `.claude/rules/*` conflicts. Founder ★ remains required for P2.5 acceptance, BACKLOG queue, and HL-depth / first-live-signal fork.
+
+## Rev 6 Confidence
+
+High. The probe set covers every bypass that caused rev2-rev5 REJECT plus the requested RFC/override/merge cases. The remaining limitation is explicitly fail-closed.
+
+=== HANDOFF: critic -> reviewer ===
+
+## §A - Metadata
+- UTC datetime: 2026-07-14T16:37Z
+- Gate: C-006 doc-gate, rev6 re-audit
+- Status: NOTE - REJECT lifted; reviewer merge gate next
+- HEAD before critic verdict: `e3bfc42` - `docs(doc-gate): C-006 rev5 - барьер переписан от РЕЗУЛЬТАТА (закрыты обе дыры мержа)`
+
+## §B - What I Checked
+- Protected-artifacts script against add->delete, rename-out, both RFC paths, same-commit vs later override, evil merge delete, merge rename-out, and `merge -s ours` side-only artifact drop.
+- CI `protected-artifacts` required by `status-check.needs`.
+- Verdict trail preservation.
+- Founder-priority non-drift.
+
+## §C - Artifacts / Results
+- Updated verdict artifact: `research/critiques/C-006-doc-gate.md`
+- Verdict: NOTE - REJECT lifted.
+- Probe result: all silent-loss blockers fail as required.
+- Residual note: merge-commit same-commit override fails closed; use a normal explicit override commit for intentional protected deletion.
+
+## §D - Next Agent + Invocation
+- **Next agent:** reviewer.
+- **Expected HEAD before reviewer starts:** the pushed rev6 verdict commit containing this section.
+- **Push status:** critic must push this verdict commit to `origin/docs/doc-gate` after commit.
+- **Paste-ready prompt:**
+  ```
+  Ты — reviewer. Same C-006 doc-gate cycle.
+
+  Expected HEAD: the pushed rev6 verdict commit on origin/docs/doc-gate. Run:
+  git fetch origin
+  git rev-parse --short origin/docs/doc-gate
+  If HEAD differs, STOP: prompt stale.
+
+  Review `research/critiques/C-006-doc-gate.md` section "Re-audit (rev 6)" and the repair range `efe2ccc..HEAD`.
+  Critic verdict: NOTE - REJECT lifted.
+
+  Tasks:
+  1. Merge/order branches as needed: `docs/td021-rules` then `docs/doc-gate` (both touch `.claude/rules/`).
+  2. Verify protected-artifacts CI remains mandatory.
+  3. Confirm no founder priority was changed by agents: P2.5, BACKLOG order, and HL-depth fork remain founder ★.
+  4. Route to founder ★ for P2.5 acceptance / BACKLOG queue / HL-depth fork after reviewer merge gate.
+  ```
+
+## §E - Risks / Open Questions
+- Expected-HEAD should become mandatory in `handoff-block.md` §D; stale prompts happened repeatedly in this cycle.
+- Force-push history erasure cannot be fully detected by an in-branch script after rewrite; requires branch protection/no-force-push discipline.
+- TD-020 remains time-bound: about 40 days to disk-guard if retention delivery slips.
+- Founder ★ pending: P2.5 acceptance, BACKLOG queue, HL-depth / first-live-signal fork.
+
+=== END HANDOFF ===
+
+---
+
 ## Re-audit (rev 5) - 2026-07-14T16:07Z
 
 **Audited repair range:** `b13deb2..efe2ccc`
