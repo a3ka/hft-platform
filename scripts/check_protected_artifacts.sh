@@ -18,10 +18,50 @@
 #   защищённый путь, либо его удалил коммит с явным `ALLOW-ARTIFACT-DELETE:` в СВОЁМ теле.
 # Любой способ исчезновения (delete, rename-out, evil merge, -s ours, add→delete) ловится
 # автоматически, потому что все они дают один и тот же результат: файла нет на HEAD.
-set -euo pipefail
+#
+# ── БАЗА СРАВНЕНИЯ = СОСТОЯНИЕ ДО СОБЫТИЯ (блокер B1, reviewer, C-006) ────────────────
+# Прежняя проводка (`check_protected_artifacts.sh origin/main`) делала гейт ЛОЖНЫМ: на
+# `push`-событии `actions/checkout` ставит `origin/main` на ТОЛЬКО ЧТО ЗАПУШЕННЫЙ коммит,
+# поэтому `merge-base(origin/main, HEAD) == HEAD`, диапазон пуст и скрипт печатал «OK»
+# ВСЕГДА. PR в этом репо не используются (все прогоны — event=push на main), так что барьер
+# не срабатывал ни разу: коммит, сносящий вердикт критика, проходил CI зелёным. Ложный гейт
+# опаснее отсутствующего — он создаёт ощущение защиты.
+#
+# Правильная база берётся из САМОГО СОБЫТИЯ:
+#   push         → `github.event.before` (состояние ветки ДО пуша);
+#   pull_request → `github.event.pull_request.base.sha`.
+# Всё, что мешает установить базу достоверно (пустое событие, zero-SHA при создании ветки
+# или force-push, база отсутствует в истории, база не предок HEAD ⇒ история переписана),
+# → **FAIL, а не пропуск**: «базы нет» не значит «проверять нечего», это значит «не могу
+# гарантировать целостность». Fail-closed — та же дисциплина, что у риск-гейта.
+#
+# Проба: `scripts/tests/red_protected_artifacts.sh` (10 сценариев, зовёт барьер ТОЙ ЖЕ
+# проводкой, какой его зовёт CI; против пред-фиксной версии падает 7/10).
+set -uo pipefail
 
-BASE_REF="${1:-origin/main}"
-base=$(git merge-base "${BASE_REF}" HEAD)
+die() { echo "FAIL  $*"; echo; echo "Барьер fail-closed: база сравнения не установлена достоверно."; exit 1; }
+
+raw="${1:-}"
+if [ -z "${raw}" ]; then
+  case "${EVENT_NAME:-}" in
+    push)         raw="${PUSH_BEFORE:-}" ;;
+    pull_request) raw="${PR_BASE_SHA:-}" ;;
+    "")           die "событие не задано (EVENT_NAME пуст) — барьер зовут не так, как его зовёт CI" ;;
+    *)            die "неизвестное событие '${EVENT_NAME}' — база сравнения не определена" ;;
+  esac
+fi
+
+[ -n "${raw}" ] || die "база события пуста (EVENT_NAME=${EVENT_NAME:-?})"
+case "${raw}" in
+  *[!0]*) : ;;  # есть хоть один ненулевой символ — не zero-SHA
+  *)      die "база = zero-SHA (создание ветки или force-push) — целостность артефактов не доказуема" ;;
+esac
+git rev-parse -q --verify "${raw}^{commit}" >/dev/null 2>&1 \
+  || die "база '${raw}' отсутствует в истории (переписана force-push'ем / поверхностный клон)"
+git merge-base --is-ancestor "${raw}" HEAD 2>/dev/null \
+  || die "база '${raw}' НЕ предок HEAD — история переписана (force-push); что исчезло, недоказуемо"
+
+base=$(git rev-parse "${raw}^{commit}")
 
 is_protected() {
   case "$1" in

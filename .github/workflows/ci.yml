@@ -41,8 +41,20 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      # База сравнения приходит ИЗ СОБЫТИЯ, а не из origin/main: на push-событии checkout
+      # ставит origin/main на только что запушенный коммит ⇒ диапазон пуст ⇒ гейт был бы
+      # зелёным ВСЕГДА (блокер B1). Пустая/zero/переписанная база → барьер fail-closed.
       - name: Коммит не смеет удалять вердикты критика / милестоуны / RFC
-        run: bash scripts/check_protected_artifacts.sh origin/main
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: bash scripts/check_protected_artifacts.sh
+
+      # Сам барьер обязан быть проверен ТОЙ ЖЕ проводкой, какой его зовёт CI (иначе гейт,
+      # проверенный не тем вызовом, — не проверен). 10 сценариев, включая fail-closed.
+      - name: Проба барьера (анти-плацебо)
+        run: bash scripts/tests/red_protected_artifacts.sh
 
   status-check:
     name: All checks passed
