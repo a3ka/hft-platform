@@ -130,6 +130,40 @@ expect "P9 база не предок HEAD — fail-closed" deny "$(run_barrier 
 r=$(new_repo)
 expect "P10 без события — fail-closed" deny "$(run_barrier "$r" "" "")"
 
+# ── P11 (rev7): артефакт РОДИЛСЯ В SIDE-ВЕТКЕ, пришёл мержем — и удалён потом ─────────
+# Дыра, которую нашёл критик: множество «существовавших» собиралось через
+# `git log --diff-filter=AR`, а git log НЕ показывает диффы merge-коммитов ⇒ артефакт,
+# пришедший мержем, барьер не видел вовсе и его удаление пропускал (exit=0).
+r=$(new_repo); before=$(git -C "$r" rev-parse HEAD)
+git -C "$r" checkout -qb side2
+echo "вердикт, рождённый в ветке" > "$r/research/critiques/C-002.md"
+git -C "$r" add research/critiques/C-002.md >/dev/null; git -C "$r" commit -qm "critic: вердикт C-002"
+git -C "$r" checkout -q -; git -C "$r" merge -q --no-ff -m "merge: side2 (вердикт приезжает мержем)" side2
+git -C "$r" rm -q research/critiques/C-002.md; git -C "$r" commit -qm "docs: правки (вердикт уехал за компанию)"
+expect "P11 артефакт, пришедший МЕРЖЕМ, и удалённый потом — ВАЛИТ гейт" deny "$(run_barrier "$r" push "$before")"
+
+# ── P12 (rev7): артефакт СОЗДАН ПРЯМО В ТЕЛЕ merge-коммита — и удалён потом ───────────
+r=$(new_repo); before=$(git -C "$r" rev-parse HEAD)
+git -C "$r" checkout -qb side3
+echo "правка" >> "$r/src.rs"; git -C "$r" commit -qam "side3: правка"
+git -C "$r" checkout -q -; git -C "$r" merge -q --no-ff --no-commit side3 >/dev/null 2>&1
+echo "вердикт, рождённый в мерже" > "$r/research/critiques/C-003.md"
+git -C "$r" add research/critiques/C-003.md >/dev/null
+git -C "$r" commit -qm "merge: side3 (+ вердикт C-003 прямо в теле мержа)"
+git -C "$r" rm -q research/critiques/C-003.md; git -C "$r" commit -qm "chore: прибрал"
+expect "P12 артефакт, рождённый В МЕРЖЕ, и удалённый потом — ВАЛИТ гейт" deny "$(run_barrier "$r" push "$before")"
+
+# ── P13 (rev7, ЛОЖНОЕ СРАБАТЫВАНИЕ): артефакт пришёл мержем и ЦЕЛ — пропускается ──────
+# Расширение множества «существовавших» не смеет сделать барьер параноиком: honest merge,
+# приносящий вердикт критика, обязан проходить.
+r=$(new_repo); before=$(git -C "$r" rev-parse HEAD)
+git -C "$r" checkout -qb side4
+echo "вердикт" > "$r/research/critiques/C-004.md"
+git -C "$r" add research/critiques/C-004.md >/dev/null; git -C "$r" commit -qm "critic: вердикт C-004"
+git -C "$r" checkout -q -; git -C "$r" merge -q --no-ff -m "merge: side4" side4
+expect "P13 артефакт, пришедший мержем и ЦЕЛЫЙ, пропускается (нет ложных срабатываний)" ok \
+  "$(run_barrier "$r" push "$before")"
+
 echo
 if [ "${FAILED}" -gt 0 ]; then
   echo "VERDICT: FAIL (${FAILED})"
@@ -137,4 +171,4 @@ if [ "${FAILED}" -gt 0 ]; then
   echo "чего в пайплайне нет — а это хуже отсутствия правила."
   exit 1
 fi
-echo "VERDICT: PASS (10/10) — барьер держит при ТОЙ ЖЕ проводке, какой его зовёт CI"
+echo "VERDICT: PASS (13/13) — барьер держит при ТОЙ ЖЕ проводке, какой его зовёт CI"
