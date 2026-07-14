@@ -139,7 +139,13 @@ architect для docs/process-only), ОБЯЗАН до закрытия рабо
 1. **Дождаться CI + Deploy** до терминального статуса: `gh run watch <id> --exit-status`
    (или `gh run list` до `completed success` обоих). Красный CI/Deploy → немедленный
    фикс или revert; milestone НЕ закрывается поверх красного прода.
-2. **Проверить прод на VPS** (минимум):
+2. **Проверить прод на VPS** (минимум).
+   ⚠ **RSS мерить ТОЛЬКО как `RssAnon` из `/proc/<pid>/status`** (закреплено 2026-07-14, TD-021).
+   `docker stats` и `cgroup memory.current` включают **page cache файла журнала** — recorder пишет
+   ~30 MB/мин, поэтому «память» растёт даже при нулевом лике. Факт с прода: `anon 13.5 MB` против
+   `file 163 MB`; мнимый «+8 MiB/час» оказался кэшем, реальный рост кучи — +1 MiB/час. На этой
+   вранувшей метрике был заведён TD-016 и написан оракул — то есть **мы чинили не то и рисковали
+   данными**. Любой вывод «есть лик» без `RssAnon` — не вывод.
    `ssh -i /home/nous/.ssh/hft_deploy -o IdentitiesOnly=yes root@167.233.192.131 \
       'docker ps --format "{{.Names}} {{.Status}}"; cat /var/lib/docker/volumes/hft-platform_journal-data/_data/recorder.heartbeat'`
    Ожидание: контейнер(ы) `(healthy)`, heartbeat свежий (мс epoch ≈ сейчас), журнал

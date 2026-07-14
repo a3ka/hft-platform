@@ -35,6 +35,20 @@ TD-014» (2026-07-12), «reviewer переключил общий чекаут �
    не игнорировать: выяснить владельца по `research/critiques/`, `milestones/`, содержимому;
    передать founder'у, если владелец не определяется.
 
+## Запрет `commit -a` / `add -A` в общем чекауте (закреплено 2026-07-14)
+
+Третий инцидент того же класса: reviewer, находясь в ОБЩЕМ чекауте, который architect переключил
+на `docs/doc-gate`, сделал `git commit -am` — и (а) **снёс вердикт критика** `C-006-doc-gate.md`
+(198 строк, артефакт гейта), (б) увёл свои §8-правки не в `main`.
+
+**Правила:**
+1. **Никогда `git commit -a` / `git add -A` в общем чекауте.** Только явные пути:
+   `git commit -- PROJECT-STATE.md TECH-DEBT.md`.
+2. Reviewer/critic работают **из своего worktree** (см. выше), а не в общем каталоге.
+3. **Коммит НЕ ИМЕЕТ ПРАВА удалять** `research/critiques/*`, `milestones/*`, `docs/rfc/*` —
+   это артефакты гейтов и аудит-трейл. Если `git status` показывает их удаление — СТОП, ты не на
+   своей ветке. (Механический барьер — pre-commit/CI-проверка — вынесен на doc-гейт: `C-006` re-audit.)
+
 ## Cross-references
 - `.claude/rules/gates.md` §8 (push-scope, RED не живёт на main, intra-chain push)
 - `.claude/rules/handoff-block.md` (§D push-статус)
