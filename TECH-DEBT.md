@@ -163,6 +163,47 @@
   свободное место и deadline disk-guard не отодвинуты. Следующий виток должен доставить
   операторский/CLI-путь компакции или явную §8-команду, реально сжать закрытый сегмент на VPS,
   доказать чтение `journal::stream` после сжатия и отсутствие потери событий. Severity: **MAJOR**.
+  - **rev 9 (reviewer §8, 2026-07-14) — REJECTED + REVERTED (`82b33db`).** Стек rev9
+    (`cb46e34`+`9cf5acf`+`1ff1b55`, задачи 15 crash-window self-heal + 16 оператор компакции)
+    прошёл ВСЕ локальные гейты на merge-коммите (`fmt`/`clippy`/**181 passed**/`verify_M-08` PASS/
+    `verify_delivery` PASS вкл. D5a+D7/`crontab -n` 0). Оба rev8-блокера reviewer'а закрыты и
+    подтверждены фактом: (1) D-COMP-1 — `segments()` (прод-путь `stream`) дедуплицирует raw+.zst
+    через общий `dedup_indexed_paths` (raw побеждает); репро крах-окна: было 3172 события → стало
+    3000; (2) D-COMP-2 — self-heal ветки `dst.exists()` со sha256-сверкой, битый `.zst` НЕ удаляет
+    оригинал. Анти-плацебо C7/C8/C9 падают против `cb46e34`, GREEN на HEAD.
+    **НО §8 eyes-on на VPS вскрыл НОВЫЙ, БОЛЕЕ ОПАСНЫЙ дефект (data-loss):** оператор
+    `--mode compact --keep-raw N` жмёт **старейшие** закрытые сегменты первыми, а `segment-0` на
+    проде — **15 GB LEGACY** (без v2-магии `HFTJRN02`, задекларирован в `journal.legacy.json`,
+    невосполнимая история 2026-07-10..14). `compact_segment` его СЖИМАЕТ (sha сырых == sha
+    распакованных → верификация проходит → оригинал УДАЛЯЕТСЯ), но обратное чтение `.zst` идёт
+    через `skip_v2_header_forward`, который ТРЕБУЕТ v2-магию → `CorruptHeader` → `segments()`/
+    `list_segments`/`stream` падают на первом же классифае ⇒ **ВЕСЬ ЖУРНАЛ НЕЧИТАЕМ, а оригинал
+    legacy стёрт.** Доказано фактом в песочнице (не на проде — prod-каталог НЕ тронут): раскладка
+    legacy-0(declared)+v2-1(closed)+v2-2(active), реальная `compact_closed_segments(keep_raw=1)` →
+    после неё `list_segments`/`stream` = `corrupt SegmentHeader`. Cron на VPS НЕ установлен
+    (`/etc/cron.d` пуст) ⇒ авто-порчи нет, prod цел (5 сырых сегментов); но код+runbook на main
+    инструктировали оператора установить cron, который уничтожил бы историю при первом запуске.
+    **Следующий виток (architect): компакция ОБЯЗАНА не трогать legacy-сегменты** (либо
+    `compact_segment` возвращает `Err` на сегмент без v2-магии — конструктивный барьер, RED-оракул;
+    либо `.zst` несёт восстановимый v2-заголовок и legacy читается после сжатия). RED-набор обязан
+    включать legacy-сегмент в каталоге (дефект фикстуры: C1-C9 строят ТОЛЬКО v2 через
+    `Journal::open_with` — прод-раскладка с legacy не покрыта). Severity: **CRITICAL** (потеря
+    невосполнимых первичных данных).
+- **TD-023** `book-memory-oracle-flaky-under-parallel-tests` (найдено reviewer'ом на §8 M-08 rev9,
+  2026-07-14). `crates/venue-binance/tests/red_book_bounded.rs::td016_memory_bounded_when_price_
+  drifts_out_of_band` меряет прирост памяти через **процесс-глобальный** `static CUR` +
+  `#[global_allocator]` (`CUR.load` до/после `pump()`). Под `cargo test --all` 7 тестов бинаря
+  бегут параллельно и соседние потоки загрязняют глобальный счётчик → `growth` ловит чужие живые
+  аллокации. На 2-ядерном CI-раннере (run `29375951711` @`2b2311f`): `growth=6 559 969 B > 4 MiB` →
+  FAILED, exit 101; **тот же коммит на re-run — GREEN** (флак подтверждён: red→green без изменений
+  кода). Локально: 5/5 в изоляции, 6/6 полным бинарём (больше ядер/памяти — окно уже). Тест sacred
+  (architect-only), не вызван изменением M-08 (0 строк дифа по `venue-binance`/`book`, идентичен
+  последнему зелёному main `76d9560`). Тот же класс, что C5/TD-021: **метрика на глобальном
+  аллокаторе не изолирована от параллельного прогона.** Фикс — зона architect: сериализовать замер
+  (`--test-threads=1` для бинаря / `serial_test`), либо мерить размер книги напрямую (не глобальный
+  аллокатор), либо поднять допуск с запасом. Severity: **MAJOR** (флак на критическом CI-пути:
+  `main` перестаёт быть детерминированно зелёным; «Deploy failure на зелёном коде» легко принять за
+  инфраструктурный флак и обойти руками — маскирует настоящие регрессии).
 - **TD-018** `deploy-ci-gate-cannot-read-ci-status` (найдено reviewer'ом на §8 M-08, 2026-07-14).
   Гейт TD-017 (`deploy.yml` job `ci`, «Wait for CI success on this commit») **не работает**:
   `gh api repos/$REPO/actions/runs?head_sha=$SHA` возвращает **`HTTP 403 Resource not accessible

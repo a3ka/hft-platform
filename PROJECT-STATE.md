@@ -315,6 +315,40 @@ CI + Deploy на merge-коммите — success. **Анти-плацебо д�
 - **M-08 остаётся 🚧 IN_PROGRESS.** Закрывается ТОЛЬКО после задачи 14 + §8 с реальным dry-run
   ретеншена на проде.
 
+### rev 9 (задачи 15/16) — REVIEWER APPROVED (код) → §8 PROD REJECTED + REVERTED (`82b33db`, 2026-07-14)
+Стек rev9 (`cb46e34` RED C7-C9+D7 / `9cf5acf` task 15 crash-window self-heal / `1ff1b55` task 16
+оператор компакции) закрыл ОБА rev8-блокера reviewer'а и подтверждён фактом:
+- **D-COMP-1** (дубликаты в прод-пути): `segments()` теперь дедуплицирует raw+.zst через общий
+  `dedup_indexed_paths` (raw побеждает при коллизии). Репро крах-окна: было 3172 события → 3000.
+- **D-COMP-2** (self-heal): ветка `dst.exists()` сверяет sha256 распакованного `.zst` с оригиналом;
+  совпало → доделать (удалить оригинал), битый `.zst` → удалить `.zst`, оригинал ГОРЯЧИЙ, `Err`.
+- **D-COMP-3** (оператор): `--mode compact` у `journal-retention` + compose-сервис + cron + гейт D7
+  (реальный запуск бинаря, не греп).
+
+Локальные гейты на **merge-коммите** (не только feat): `fmt` 0, `clippy -D warnings` 0,
+`cargo test --workspace` **181/0**, `verify_M-08` PASS, `verify_delivery` PASS (вкл. D5a+D7),
+`crontab -n` 0. Анти-плацебо: C7/C8/C9 FAIL против `cb46e34`, GREEN на HEAD; наивная C5-мутация
+"распаковать в RAM" валит C5 (100.7 MB пик). Merge `2b2311f` запушен в main.
+
+**CI-флак (не блокер merge, но задержал):** первый CI на `2b2311f` — RED, exit 101 на
+`td016_memory_bounded_when_price_drifts_out_of_band` (**НЕ** тест компакции; глобальный
+аллокатор-счётчик, флак под параллельным `cargo test --all`). Re-run того же коммита — GREEN
+(флак подтверждён). Заведён **TD-023**. Deploy re-run → success, компакция доехала до VPS.
+
+**§8 PROD RED — CRITICAL data-loss дефект (доказан фактом, prod НЕ тронут):** eyes-on на VPS
+показал, что `segment-00000000.jrnl` (15 GB) — **LEGACY** (магия `0c 00…`, не `HFTJRN02`;
+задекларирован в `journal.legacy.json`). Оператор `--mode compact` жмёт СТАРЕЙШИЕ закрытые первыми
+⇒ выбрал бы legacy-0. `compact_segment` его сжимает (sha сырых == sha распакованных → верификация
+проходит → **оригинал удаляется**), но обратное чтение `.zst` требует v2-магии
+(`skip_v2_header_forward`) → `CorruptHeader` → `list_segments`/`stream` падают ⇒ **ВЕСЬ ЖУРНАЛ
+НЕЧИТАЕМ, 15 GB невосполнимой истории стёрты.** Воспроизведено в песочнице (legacy-0+v2-1+v2-2 →
+`compact_closed_segments(keep_raw=1)` → `list_segments`/`stream` = `corrupt SegmentHeader`);
+**реальную компакцию на prod-каталоге НЕ запускал** (prod цел: 5 сырых сегментов, cron НЕ
+установлен). По правилу §8 «красный/опасный прод → revert» весь стек rev9 откатан `82b33db`.
+См. **TD-022 rev9** (виток: компакция ОБЯЗАНА не трогать legacy; RED-набор обязан включать
+legacy-сегмент — C1-C9 строят только v2, прод-раскладка не покрыта) + **TD-023** (флак-оракул).
+**M-08 остаётся IN_PROGRESS; TD-020, TD-006, TD-022 остаются OPEN; TD-023 новый.**
+
 ### rev 7/8 (задачи 14/15) — REVIEWER REJECTED + REVERTED (`b43044d`, 2026-07-14)
 Стек `d43d923..91f11aa` (task 14 delivery + task 15 compaction + D5/C5 fixes) прошёл локальные
 reviewer-гейты: `fmt`, `clippy -D warnings`, workspace **178 passed / 0 failed**,
