@@ -199,6 +199,124 @@ High. I read the audited commits, `gates.md`, `commit-discipline.md`, `branch-hy
 
 ---
 
+## Re-audit (rev 7) - 2026-07-14T17:59Z
+
+**Audited repair range:** `2aaa870..34e46f6`
+**Expected/audited HEAD:** `34e46f6` - `fix(doc-gate): B1 - барьер артефактов был ЛОЖНЫМ ГЕЙТОМ (база бралась не из события)`
+**Worktree:** `/tmp/hft-critic-dg-r7`, local branch `critic-dg-r7`, created from `origin/docs/doc-gate` after exact HEAD check.
+
+## Rev 7 Verdict
+
+**REJECT remains.**
+
+The B1 wiring defect is materially repaired: CI now passes event-derived base SHAs into `protected-artifacts`, the RED probe runs through the same wiring, and the anti-placebo check is red against the pre-fix barrier. However, the barrier still does not enforce the result invariant it claims in `gates.md` §9: a protected artifact can be created inside a merge commit and then deleted later, and the current script exits `0`.
+
+This is not a theoretical wording issue. It is an artifact-loss path outside `scripts/tests/red_protected_artifacts.sh`, and it contradicts the rule text that says any artifact that "was added in the branch" must exist on HEAD or have same-commit `ALLOW-ARTIFACT-DELETE:`.
+
+## Rev 7 Probe Results
+
+**Required probes:**
+- Current barrier probe: PASS, `bash scripts/tests/red_protected_artifacts.sh` returned `PASS (10/10)`, `exit=0`.
+- Anti-placebo against pre-fix barrier: PASS, `BARRIER=/tmp/old-protected-artifacts-r7.sh bash scripts/tests/red_protected_artifacts.sh` returned `FAIL (7)`, `exit=1`. The probe is not green against the broken `2aaa870` wiring.
+- Sandbox honesty: PASS. Manual P2/P3/P6/P7 checks failed with meaningful barrier output (`FAIL ... артефакт удалён...` / `FAIL ... артефакт ИСЧЕЗ...`) rather than crash/`exit=128`.
+- Fail-closed base checks: PASS. Zero-SHA, empty event, and base-not-ancestor all fail with `exit=1`; the non-ancestor case reports `база ... НЕ предок HEAD`.
+- CI wiring: PASS. `protected-artifacts` is in `status-check.needs`; the job calls `scripts/check_protected_artifacts.sh` with `EVENT_NAME`, `PUSH_BEFORE`, and `PR_BASE_SHA`, then runs the RED probe.
+
+**New blocker found by execution:**
+
+Manual scenario not covered by the RED probe:
+1. Start from base containing existing protected artifacts.
+2. Create a side branch with ordinary source work.
+3. Merge the side branch with `--no-ff --no-commit`.
+4. During the merge commit, add `research/critiques/C-777-merge-born.md`.
+5. In the next normal commit, delete `research/critiques/C-777-merge-born.md`.
+6. Run the barrier as a push event with `PUSH_BEFORE=<base>`.
+
+Observed output:
+
+```text
+OK: защищённые артефакты целы на HEAD (...; проверка по РЕЗУЛЬТАТУ, не по способу)
+merge_born_delete_exit=0
+```
+
+The merge-born protected artifact existed in the branch history and is absent from HEAD without same-commit override. The barrier passes because its "added in range" set does not include additions made inside merge commits. That reopens the same class of hole C-006 has been tightening since rev4/rev6: the rule promises result-based preservation, but the implementation still misses a way an artifact can enter and later disappear.
+
+## Rev 7 Text / Guarantee Check
+
+- `gates.md` §9 base wiring text is now honest about the B1 incident: the base comes from `github.event.before` / `pull_request.base.sha`, not `origin/main`.
+- Force-push boundary is stated honestly: the script can fail-closed/detect an unverifiable base, but preventing main history rewrite requires GitHub branch protection/no-force-push outside this repo.
+- The mechanical guarantee is still overstated. §9 says any disappearance including merge cases is caught automatically, and defines the invariant as "existed in base or was added in branch." The merge-born add->delete probe disproves that claim.
+
+## Rev 7 Founder-Priority / Scope Checks
+
+- Founder-priority non-drift: PASS. `2aaa870..34e46f6` touches only `.claude/rules/gates.md`, `.github/workflows/ci.yml`, `scripts/check_protected_artifacts.sh`, and `scripts/tests/red_protected_artifacts.sh`; it does not touch `milestones/BACKLOG.md`, `docs/DESIGN.md`, `docs/fa/ops.md`, `PROJECT-STATE.md`, `TECH-DEBT.md`, or `docs/SESSION-HANDOFF.md`.
+- Critic scope: PASS. This commit changes only the verdict artifact under `research/critiques/`.
+
+## Rev 7 Required Repair
+
+1. Add a RED probe for a protected artifact created inside a merge commit and deleted later in the same pushed range.
+2. Make the barrier's protected-artifact set include artifacts that enter history through merge commits, or otherwise prove the same result invariant for that case.
+3. Keep the B1 anti-placebo check: the probe must remain red against the pre-fix `2aaa870` barrier and green only when called through the same event wiring as CI.
+4. Update `gates.md` §9 only after the executable probe and barrier actually provide the stated guarantee.
+
+## Rev 7 Confidence
+
+High for the current REJECT. The repaired CI wiring and fail-closed base behavior are verified by execution. The remaining blocker is a direct, reproducible silent-loss bypass with `exit=0`.
+
+=== HANDOFF: critic -> architect ===
+
+## §A - Metadata
+- UTC datetime: 2026-07-14T17:59Z
+- Gate: C-006 doc-gate, rev7 re-audit
+- Status: REJECT remains
+- HEAD before critic verdict: `34e46f6` - `fix(doc-gate): B1 - барьер артефактов был ЛОЖНЫМ ГЕЙТОМ (база бралась не из события)`
+
+## §B - What I Checked
+- Event-derived CI wiring for `protected-artifacts`.
+- RED probe current barrier and anti-placebo against the pre-fix `2aaa870` barrier.
+- Fail-closed behavior for missing/zero/non-ancestor base.
+- A new manual disappearance scenario not covered by the RED probe: protected artifact born inside a merge commit, then deleted later.
+- Founder-priority non-drift.
+
+## §C - Artifacts / Results
+- Updated verdict artifact: `research/critiques/C-006-doc-gate.md`
+- Verdict: REJECT.
+- Closed: B1 false-gate wiring is materially repaired and anti-placebo is meaningful.
+- Open blocker: merge-born protected artifact add->delete passes with `exit=0`.
+
+## §D - Next Agent + Invocation
+- **Next agent:** architect.
+- **Expected HEAD before architect starts:** the pushed rev7 verdict commit containing this section.
+- **Push status:** critic must commit and push this verdict to `origin/docs/doc-gate`.
+- **Paste-ready prompt:**
+  ```
+  Ты — architect. Same C-006 doc-gate loop, rev7 REJECT.
+
+  Expected HEAD: the pushed rev7 critic commit on origin/docs/doc-gate. Run:
+  git fetch origin
+  git rev-parse --short origin/docs/doc-gate
+  If HEAD differs, STOP: prompt stale.
+
+  Read `research/critiques/C-006-doc-gate.md` section "Re-audit (rev 7)".
+  Repair only the remaining blocker: protected artifact created inside a merge commit and deleted later passes `scripts/check_protected_artifacts.sh` with exit=0.
+
+  Required outcome:
+  - Add a RED probe for merge-born protected artifact add->delete.
+  - Make the barrier enforce the same result invariant for artifacts introduced by merge commits.
+  - Keep event-derived CI wiring and the anti-placebo check against the pre-fix barrier.
+  - Do not change founder-owned priorities: P2.5, BACKLOG order, and HL-depth fork remain founder ★.
+  ```
+
+## §E - Risks / Open Questions
+- Branch protection "no force-push" on `main` remains a founder/GitHub setting, not repairable by an in-branch script.
+- The `gates.md` §9 text must not be promoted while it says every merge disappearance mode is caught; rev7 shows one still passes.
+- TD-020 / storage pressure remains time-sensitive outside this doc-gate loop.
+- Founder ★ pending: P2.5 acceptance, BACKLOG queue, HL-depth / first-live-signal fork.
+
+=== END HANDOFF ===
+
+---
+
 ## Re-audit (rev 6) - 2026-07-14T16:37Z
 
 **Audited repair range:** `efe2ccc..e3bfc42`
