@@ -199,6 +199,119 @@ High. I read the audited commits, `gates.md`, `commit-discipline.md`, `branch-hy
 
 ---
 
+## Re-audit (rev 11) - 2026-07-14T23:17Z
+
+**Audited repair range:** `3d36d1a..8261f2a`
+**Expected/audited HEAD:** `8261f2a` - `fix(doc-gate): rev10 — setup merge-сценариев тоже был плацебо (P7/P11/P12/P13)`
+**Worktree:** `/tmp/hft-critic-dg-r11`, detached at `origin/docs/doc-gate` after exact HEAD check.
+
+## Rev 11 Verdict
+
+**REJECT remains.**
+
+The rev10 merge-scenario blocker is closed: P7, P11, P12, and P13 now have merge/state setup guards, and deliberate `git merge -> true` mutations for P7 and P12 fail with `SETUP НЕ СОСТОЯЛСЯ` instead of silently passing.
+
+The remaining blocker is the same setup-placebo class in non-merge scenarios. `gates.md` §9 now claims "setup КАЖДОГО сценария fail-closed", but P4, P5, P8, and P9 can still pass if their scenario-defining setup is removed or changed. That means the probe still overstates coverage for "protected rename inside protection", "same-commit override", and base fail-closed cases.
+
+## Rev 11 Required Execution
+
+- Branch precondition: PASS. `git fetch origin && git rev-parse --short origin/docs/doc-gate` returned `8261f2a`.
+- Current RED probe: PASS. `bash scripts/tests/red_protected_artifacts.sh` returned `VERDICT: PASS (17/17)`, `exit=0`.
+- Anti-placebo against rev8 barrier: PASS. `BARRIER=/tmp/rev8.sh bash scripts/tests/red_protected_artifacts.sh` returned `VERDICT: FAIL (3)`, with P14/P15/P16 failing.
+- P7 deliberate broken-merge check: PASS. Replacing the P7 `git merge ... side` line with `true` made the probe return `exit=1` with `P7 — SETUP НЕ СОСТОЯЛСЯ`.
+- P12 deliberate broken-merge check: PASS. Replacing the P12 `git merge --no-commit side3` line with `true` made the probe return `exit=1` with `P12 — SETUP НЕ СОСТОЯЛСЯ`.
+- Additional merge guard spot-checks: PASS. P11 and P13 also fail closed under the same `git merge -> true` mutation class.
+
+## Rev 11 Remaining Setup-Placebo Findings
+
+**Still broken:**
+
+- P4 (`protected -> protected rename`) can silently stop testing a rename. Replacing `git mv docs/rfc/CT-RFC-01.md docs/rfc/CT-RFC-01-renamed.md` with `true` still returned `exit=0` and printed `PASS  P4 ...` plus `VERDICT: PASS (17/17)`. That proves only a clean branch passes, not that a protected rename is allowed.
+- P5 (`ALLOW-ARTIFACT-DELETE in the same commit`) can silently stop testing an allowed deletion. Replacing the P5 `git rm milestones/M-01.md` with `true` still returned `exit=0` and printed `PASS  P5 ...` plus `VERDICT: PASS (17/17)`. The commit with the trailer did not prove it authorized an actual deletion.
+- P8 (`zero-SHA base fail-closed`) can pass for the wrong reason. Replacing the zero-SHA argument with the real pre-delete base still returned `exit=0` and printed `PASS  P8 ...`; the denial came from ordinary artifact deletion, not zero-SHA fail-closed.
+- P9 (`base is not ancestor fail-closed`) can pass for the wrong reason. Replacing the alien/non-ancestor base with the real pre-delete base still returned `exit=0` and printed `PASS  P9 ...`; again, the denial came from ordinary artifact deletion, not the non-ancestor base check.
+
+**Not observed for P6 under the same simple break:**
+
+- Removing the P6 deletion makes P6 fail (`exit=0, ожидалось deny`), so P6 is not a silent-PASS case under that mutation.
+
+## Rev 11 Text / Guarantee Check
+
+- Scenario count: PASS. `gates.md` §9 says 17 scenarios.
+- Force-push boundary: PASS. The text still says the in-branch barrier can fail-closed/detect but cannot prevent force-push; full prevention remains GitHub branch protection / founder scope.
+- "Setup each scenario fail-closed": FAIL. Merge and type-substitution scenarios now have guards, but P4/P5/P8/P9 disprove the "each scenario" claim.
+
+## Rev 11 Required Repair
+
+1. Add setup assertions for P4 and P5:
+   - P4 must prove the original protected path is absent, the new protected path exists on HEAD, and the rename/move happened in the range.
+   - P5 must prove the protected artifact is absent on HEAD and the deleting commit itself contains `ALLOW-ARTIFACT-DELETE:`.
+2. Add setup assertions for P8/P9 base semantics:
+   - P8 must prove the argument passed to `run_barrier` is all-zero before expecting deny.
+   - P9 must prove the base argument is not an ancestor of HEAD before expecting deny.
+3. Keep the now-good P7/P11/P12/P13 and P14/P15/P16 guards.
+4. Do not change founder-owned priorities: P2.5, BACKLOG order, and HL-depth fork remain founder ★.
+
+## Rev 11 Confidence
+
+High for REJECT. The requested merge mutations are fixed, but the same anti-placebo standard exposes unguarded non-merge scenarios. Since `gates.md` now explicitly claims fail-closed setup for every scenario, the documented guarantee is still ahead of the executable proof.
+
+=== HANDOFF: critic -> architect ===
+
+## §A - Metadata
+- UTC datetime: 2026-07-14T23:17Z
+- Gate: C-006 doc-gate, rev11 re-audit
+- Status: REJECT remains
+- HEAD before critic verdict: `8261f2a` - `fix(doc-gate): rev10 — setup merge-сценариев тоже был плацебо (P7/P11/P12/P13)`
+
+## §B - What I Checked
+- Required 17-case RED probe.
+- Anti-placebo against rev8 barrier from `2773e9c`.
+- Deliberate broken P7/P11/P12/P13 merge setup.
+- Deliberate broken P4/P5/P8/P9 setup/base semantics.
+- `gates.md` §9 counter / force-push boundary / setup-fail-closed promise.
+
+## §C - Artifacts / Results
+- Updated verdict artifact: `research/critiques/C-006-doc-gate.md`
+- Verdict: REJECT.
+- Closed: merge-scenario setup guards now fail closed.
+- Open blocker: P4/P5/P8/P9 can still silently stop testing their named scenario while the suite reports `PASS (17/17)`.
+
+## §D - Next Agent + Invocation
+- **Next agent:** architect.
+- **Expected HEAD before architect starts:** the pushed rev11 verdict commit containing this section.
+- **Push status:** critic must commit and push this verdict to `origin/docs/doc-gate`.
+- **Paste-ready prompt:**
+  ```
+  Ты — architect. Same C-006 doc-gate loop, rev11 REJECT.
+
+  Expected HEAD: the pushed rev11 critic commit on origin/docs/doc-gate. Run:
+  git fetch origin
+  git rev-parse --short origin/docs/doc-gate
+  If HEAD differs, STOP: prompt stale.
+
+  Read `research/critiques/C-006-doc-gate.md` section "Re-audit (rev 11)".
+  Repair only the remaining blocker: setup fail-closed is still incomplete for
+  P4/P5/P8/P9. Merge scenarios are now accepted.
+
+  Required outcome:
+  - P4 proves protected->protected rename actually happened.
+  - P5 proves the same commit both deletes the artifact and carries ALLOW-ARTIFACT-DELETE.
+  - P8 proves the base argument is zero-SHA.
+  - P9 proves the base argument is not an ancestor of HEAD.
+  - Keep rev8 anti-placebo failing P14/P15/P16 and merge guards for P7/P11/P12/P13.
+  - Do not change founder-owned priorities: P2.5, BACKLOG order, and HL-depth fork remain founder ★.
+  ```
+
+## §E - Risks / Open Questions
+- The protected-artifacts barrier itself remains acceptable; this is still a RED probe harness issue.
+- `gates.md` §9 should not claim every scenario setup is fail-closed until P4/P5/P8/P9 prove it too.
+- Founder ★ pending: P2.5 acceptance, BACKLOG queue, HL-depth / first-live-signal fork.
+
+=== END HANDOFF ===
+
+---
+
 ## Re-audit (rev 10) - 2026-07-14T21:59Z
 
 **Audited repair range:** `dc85455..323a86b`
