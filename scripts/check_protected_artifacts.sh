@@ -12,7 +12,10 @@
 #   2. rename ИЗ защищённого в НЕзащищённый путь (увод из-под защиты) = удаление;
 #      rename защищённый→защищённый разрешён;
 #   3. override действует ТОЛЬКО в ТОМ ЖЕ коммите, который удаляет (не «где-то в диапазоне»);
-#   4. оба каталога RFC.
+#   4. оба каталога RFC;
+#   5. MERGE-КОММИТЫ (находка C-006 rev4): merge может САМ выбросить файл, присутствующий во
+#      ВСЕХ родителях («злой мерж»). `--no-merges` это пропускал — критик воспроизвёл: merge,
+#      удаляющий milestones/*.md, давал exit=0.
 #
 # Критерий нарушения: артефакт удалён/уведён коммитом ветки И ОТСУТСТВУЕТ НА HEAD.
 # Так ловится и add→delete внутри ветки (на HEAD его нет), и «снёс чужой вердикт»
@@ -34,8 +37,43 @@ is_protected() {
 
 violations=0
 
-# --no-merges: содержимое merge-коммита приходит из родителей; «злой мерж» ловится на самих
-# коммитах ветки. Порядок — от старых к новым (для читаемого вывода).
+# ── Слой B: MERGE-КОММИТЫ («злой мерж», C-006 rev4) ───────────────────────────────────
+# Файл, который есть во ВСЕХ родителях, но отсутствует в самом merge-коммите, выброшен ИМ.
+# (Если файл удалён на одной из веток — он отсутствует в этом родителе, и это не «злой мерж»:
+#  такое удаление ловится слоем A на коммите, который его сделал.)
+for mc in $(git rev-list --merges --reverse "${base}..HEAD"); do
+  parents=$(git log -1 --format='%P' "${mc}")
+  body=$(git log -1 --format='%B' "${mc}")
+  subject=$(git log -1 --format='%h %s' "${mc}")
+  override=0
+  printf '%s' "${body}" | grep -q '^ALLOW-ARTIFACT-DELETE:' && override=1
+
+  first_parent=$(echo "${parents}" | awk '{print $1}')
+  # Кандидаты: защищённые пути, удалённые относительно ПЕРВОГО родителя.
+  while IFS=$'\t' read -r status path _rest; do
+    [ -z "${status:-}" ] && continue
+    case "${status}" in D*) ;; *) continue ;; esac
+    is_protected "${path}" || continue
+
+    in_all_parents=1
+    for p in ${parents}; do
+      git cat-file -e "${p}:${path}" 2>/dev/null || in_all_parents=0
+    done
+    [ "${in_all_parents}" -eq 1 ] || continue   # удалён на ветке-родителе → слой A уже разобрал
+
+    if git cat-file -e "HEAD:${path}" 2>/dev/null; then
+      echo "NOTE  ${subject}: merge выбрасывал ${path}, но на HEAD артефакт ПРИСУТСТВУЕТ"
+    elif [ "${override}" -eq 1 ]; then
+      echo "NOTE  ${subject}: удаление ${path} в merge разрешено ALLOW-ARTIFACT-DELETE"
+    else
+      echo "FAIL  ${subject}: MERGE-КОММИТ выбрасывает защищённый артефакт: ${path}"
+      echo "      (файл есть во ВСЕХ родителях — значит его выбросил сам merge, «злой мерж»)"
+      violations=$((violations + 1))
+    fi
+  done < <(git diff --name-status "${first_parent}" "${mc}")
+done
+
+# ── Слой A: обычные коммиты ────────────────────────────────────────────────────────────
 for commit in $(git rev-list --no-merges --reverse "${base}..HEAD"); do
   body=$(git log -1 --format='%B' "${commit}")
   override=0
