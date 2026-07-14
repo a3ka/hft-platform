@@ -1,42 +1,48 @@
-//! RED M-08 (sacred, architect-only) — **корень TD-016**: локальная full-book книга
-//! venue-адаптера ОБЯЗАНА быть ограничена по памяти при бесконечном потоке diff-ов.
+//! SACRED (architect-only) — TD-016: граница памяти книги venue-адаптера.
 //!
-//! Замеры reviewer'а (ОДИН контейнер, restarts=0): 8.4 MiB (1 мин) → 21.6 MiB (2 ч) →
-//! 48.3 MiB (5 ч), ≈ **+6.5 MiB/час**, при этом healthy/heartbeat свежий (healthcheck
-//! такое не ловит — класс TD-011). Recorder-writer-цикл проверен отдельным оракулом
-//! (`recorder/tests/red_rss_bounded.rs`) и памятью НЕ течёт → лик выше по потоку.
+//! ## Две мои ошибки (фиксирую, чтобы не повторить в третий раз)
 //!
-//! **Механизм (найден по коду, `venue-binance/src/lib.rs:306` `apply_diff_to_book`):**
-//! diff вставляет уровни в `BTreeMap` и удаляет только при `size == 0`. Уровень, из
-//! которого цена УШЛА, апдейтов больше не получает — и остаётся в книге НАВСЕГДА.
-//! `MAX_REL_DIST = 0.60` применяется только к ЭМИССИИ снапшота, не к поддержанию книги.
-//! За сутки дрейфа цены книга набирает десятки тысяч мёртвых уровней.
+//! 1. Лик нашёл reviewer: RSS recorder'а 8.4 MiB (1 мин) → 48.3 MiB (5 ч) ≈ **+6.5 MiB/час**,
+//!    контейнер всё это время healthy — healthcheck такое не ловит (класс TD-011).
+//! 2. Мой первый контракт и первый оракул были НЕВЕРНЫ (блокер C1 на PR-гейте):
+//!    - фикстура была СИММЕТРИЧНОЙ (дифф обновлял top-3 обеих сторон) → `diff_mid` совпадал с
+//!      реальным mid, и оракул зеленел против реализации, которая на АСИММЕТРИЧНОМ диффе
+//!      стирала живые топовые уровни, включая лучший bid;
+//!    - «кап 5000 уровней» как граница бессмысленен: число уровней ничего не говорит о
+//!      дистанции, и он режет ровно то, из чего считается сигнал.
 //!
-//! **Контракт (architect, уточнён по факту прогона):** ±60%-полоса ограничителем НЕ является
-//! (за час цена столько не проходит, а книга всё равно растёт линейно — измерено: 100k → 400k
-//! уровней). Настоящее ограничение — **КАП уровней на сторону** (`MAX_BOOK_LEVELS_PER_SIDE =
-//! 5000`, ровно глубина REST-снапшота, из которого книга и бутстрапится): при апдейте книга
-//! эвиктит уровни, самые дальние от mid, сверх капа. Всё, что за пределами 5000 уровней от
-//! середины, в эмиссию (±60%, bucketed) не влияет и не восстановимо из REST — хранить его
-//! бессмысленно, а стоит оно 6.5 MiB/час.
+//! ## Контракт эвикции v2
 //!
-//! Анти-плацебо: текущая реализация (без эвикции) падает по обоим ассертам.
+//! **A. Дифф ничего не говорит о том, чего в нём НЕТ.** `@depth` содержит ТОЛЬКО изменившиеся
+//!    уровни; лучший bid может не меняться целое окно — это норма. Единственное санкционированное
+//!    удаление по диффу — явный `size == 0` от биржи. Удалять по «mid самого диффа» неправомерно.
+//!
+//! **B. Граница — ДИСТАНЦИЯ от mid КНИГИ, а не число уровней.** Эмиссия в журнал — bucketed по
+//!    полосам до `MAX_REL_DIST` (±60%), и в сумму полосы входят ВСЕ уровни внутри окна. Значит
+//!    эвикция ВНУТРИ окна меняет суммы полос → портит и сигнал, и первичные данные (журнал
+//!    бессмертен). Эвиктить безопасно только то, что ВНЕ окна: оно не эмитится и нигде не считается.
+//!
+//! **C. Кап — аварийный backstop (`BACKSTOP_LEVELS_PER_SIDE`), а не рабочий инструмент.**
+//!    Эвиктит самое дальнее от mid, топ не трогает. Его срабатывание — тревога, не норма.
+//!
+//! **D. Если после (B) память всё равно растёт** — уровни внутри окна реальны, и хранить сырую
+//!    книгу нельзя вовсе: правильный фикс — инкрементальные bucket-агрегаты вместо полной книги
+//!    (дизайн M-09). Поэтому §8 обязан ИЗМЕРИТЬ число in-band уровней, а не только RSS — иначе
+//!    мы снова чиним по догадке.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 
-use venue_binance::{apply_diff_to_book, DepthDiff, OrderBook};
+use venue_binance::{apply_diff_to_book, DepthDiff, OrderBook, BACKSTOP_LEVELS_PER_SIDE};
 
 static CUR: AtomicUsize = AtomicUsize::new(0);
-static PEAK: AtomicUsize = AtomicUsize::new(0);
 
 struct Counting;
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, l: Layout) -> *mut u8 {
         let p = System.alloc(l);
         if !p.is_null() {
-            let c = CUR.fetch_add(l.size(), SeqCst) + l.size();
-            PEAK.fetch_max(c, SeqCst);
+            CUR.fetch_add(l.size(), SeqCst);
         }
         p
     }
@@ -49,6 +55,10 @@ unsafe impl GlobalAlloc for Counting {
 static GA: Counting = Counting;
 
 const E8: i64 = 100_000_000;
+const TICK: i64 = 1_000_000; // $0.01 ×1e8
+const MID0: i64 = 65_000_000_000_000; // $65_000 ×1e8
+/// Зеркало `MAX_REL_DIST` в `venue-binance/src/lib.rs` — окно эмиссии.
+const MAX_REL_DIST: f64 = 0.60;
 
 fn empty_book() -> OrderBook {
     OrderBook {
@@ -59,148 +69,219 @@ fn empty_book() -> OrderBook {
     }
 }
 
-/// Поток diff-ов: цена дрейфует вверх, каждый апдейт трогает 20 уровней вокруг текущего mid.
-/// Уровни, оставшиеся позади, апдейтов БОЛЬШЕ НЕ ПОЛУЧАЮТ (биржа не шлёт size=0 для того,
-/// что давно ушло из окна) — ровно прод-сценарий.
-fn pump(book: &mut OrderBook, updates: u64) {
-    for u in 0..updates {
-        let mid = 65_000_000_000_000i64 + (u as i64) * 1_000_000; // дрейф ~0.01$/апдейт
-        let bids: Vec<(i64, i64)> = (1..=10).map(|k| (mid - k * 1_000_000, 5 * E8)).collect();
-        let asks: Vec<(i64, i64)> = (1..=10).map(|k| (mid + k * 1_000_000, 5 * E8)).collect();
-        let diff = DepthDiff {
-            event_time_ms: 1_752_000_000_000 + u as i64,
-            u_first: u + 1,
-            u_final: u + 1,
-            bids,
-            asks,
-        };
-        apply_diff_to_book(book, &diff);
+fn diff(u: u64, bids: Vec<(i64, i64)>, asks: Vec<(i64, i64)>) -> DepthDiff {
+    DepthDiff {
+        event_time_ms: 1_752_000_000_000 + u as i64,
+        u_first: u,
+        u_final: u,
+        bids,
+        asks,
     }
 }
 
-fn levels(book: &OrderBook) -> usize {
-    book.bids.len() + book.asks.len()
+fn bootstrap(book: &mut OrderBook, mid: i64, n: i64) {
+    let d = diff(
+        1,
+        (1..=n).map(|k| (mid - k * TICK, 5 * E8)).collect(),
+        (1..=n).map(|k| (mid + k * TICK, 5 * E8)).collect(),
+    );
+    apply_diff_to_book(book, &d);
 }
 
-/// Кап уровней на сторону — та же глубина, что даёт REST-снапшот (`limit=5000`).
-const MAX_BOOK_LEVELS_PER_SIDE: usize = 5_000;
+// ── C1 (блокер PR-гейта): АСИММЕТРИЧНЫЕ диффы ─────────────────────────────────────────
 
-/// (1) КАП: сколько бы diff-ов ни пришло, книга держит не больше `MAX_BOOK_LEVELS_PER_SIDE`
-/// уровней на сторону — самые дальние от mid эвиктятся. Лучшие уровни при этом обязаны
-/// сохраниться (эвикция не смеет ломать топ книги — из него считается сигнал).
+/// (1a) Дифф БЕЗ лучшего bid (обновились глубокий bid и лучший ask) — штатная ситуация.
+/// Ни один живой уровень не смеет исчезнуть.
 #[test]
-fn td016_book_levels_are_capped_per_side() {
+fn c1_asymmetric_diff_must_not_delete_live_levels() {
     let mut book = empty_book();
-    pump(&mut book, 50_000);
+    bootstrap(&mut book, MID0, 100);
+    let (bids_before, asks_before) = (book.bids.len(), book.asks.len());
+    let best_bid_before = *book.bids.keys().next_back().expect("bids");
 
-    assert!(
-        book.bids.len() <= MAX_BOOK_LEVELS_PER_SIDE,
-        "bids: {} уровней (кап {MAX_BOOK_LEVELS_PER_SIDE}) — книга копит мёртвые уровни, \
-         которые биржа больше НИКОГДА не обнулит: это и есть утечка TD-016 (+6.5 MiB/час)",
+    apply_diff_to_book(
+        &mut book,
+        &diff(
+            2,
+            vec![(MID0 - 5 * TICK, 6 * E8)],
+            vec![(MID0 + TICK, 6 * E8)],
+        ),
+    );
+
+    assert_eq!(
+        book.bids.len(),
+        bids_before,
+        "асимметричный дифф УДАЛИЛ живые bid-уровни ({} → {}): эвикция берёт «середину» из \
+         самого диффа, а дифф содержит только ИЗМЕНИВШИЕСЯ уровни и ничего не говорит о тех, \
+         что не упомянул. Испорченный стакан уходит в журнал (L2Snapshot) навсегда, а RSS и \
+         healthcheck остаются зелёными — класс TD-011",
+        bids_before,
         book.bids.len()
     );
+    assert_eq!(book.asks.len(), asks_before, "asks не должны пострадать");
     assert!(
-        book.asks.len() <= MAX_BOOK_LEVELS_PER_SIDE,
-        "asks: {} уровней (кап {MAX_BOOK_LEVELS_PER_SIDE})",
-        book.asks.len()
-    );
-
-    // Эвикция режет ДАЛЬНИЕ уровни, а не топ: лучший bid/ask обязаны остаться свежими.
-    let last_mid = 65_000_000_000_000i64 + 49_999 * 1_000_000;
-    let best_bid = *book.bids.keys().next_back().expect("bids");
-    let best_ask = *book.asks.keys().next().expect("asks");
-    assert!(
-        best_bid < last_mid && last_mid - best_bid <= 10 * 1_000_000,
-        "лучший bid обязан быть у текущего mid — эвикция срезала ТОП вместо хвоста"
-    );
-    assert!(
-        best_ask > last_mid && best_ask - last_mid <= 10 * 1_000_000,
-        "лучший ask обязан быть у текущего mid"
+        book.bids.contains_key(&best_bid_before),
+        "ЛУЧШИЙ BID удалён — спред фиктивно расширён, полосы OBI перекошены"
     );
 }
 
-/// (2) ГРАНИЦА РЕСУРСА: память книги НЕ растёт с числом обработанных апдейтов.
-/// 200k апдейтов обязаны стоить примерно столько же, сколько 50k (O(1) по времени работы,
-/// а не O(число диффов)). Наивная реализация (только upsert) растёт линейно.
+/// (1b) Односторонний дифф (только bids) — противоположная сторона не трогается.
 #[test]
-fn td016_book_memory_is_independent_of_update_count() {
-    let measure = |updates: u64| -> (usize, usize) {
-        let base = CUR.load(SeqCst);
-        PEAK.store(base, SeqCst);
-        let mut book = empty_book();
-        pump(&mut book, updates);
-        let live = CUR.load(SeqCst).saturating_sub(base); // удержанная память книги
-        let n = levels(&book);
-        (live, n)
-    };
+fn c1_one_sided_diff_must_not_delete_opposite_side() {
+    let mut book = empty_book();
+    bootstrap(&mut book, MID0, 50);
+    let asks_before = book.asks.len();
+    let best_ask_before = *book.asks.keys().next().expect("asks");
 
-    let (mem_small, lv_small) = measure(50_000);
-    let (mem_big, lv_big) = measure(200_000);
+    apply_diff_to_book(&mut book, &diff(2, vec![(MID0 - 3 * TICK, 9 * E8)], vec![]));
+
+    assert_eq!(
+        book.asks.len(),
+        asks_before,
+        "односторонний дифф изменил ПРОТИВОПОЛОЖНУЮ сторону книги"
+    );
+    assert!(
+        book.asks.contains_key(&best_ask_before),
+        "лучший ask удалён"
+    );
+}
+
+/// (1c) Дифф только по ДАЛЬНИМ уровням — топ книги обязан выжить.
+#[test]
+fn c1_far_only_diff_must_not_touch_top_of_book() {
+    let mut book = empty_book();
+    bootstrap(&mut book, MID0, 100);
+    let best_bid = *book.bids.keys().next_back().expect("bids");
+    let best_ask = *book.asks.keys().next().expect("asks");
+
+    apply_diff_to_book(
+        &mut book,
+        &diff(
+            2,
+            vec![(MID0 - 90 * TICK, 3 * E8)],
+            vec![(MID0 + 90 * TICK, 3 * E8)],
+        ),
+    );
 
     assert!(
-        lv_big < lv_small * 2,
-        "число уровней растёт с числом апдейтов ({lv_small} → {lv_big}) — книга копит \
-         мёртвые уровни вместо эвикции"
+        book.bids.contains_key(&best_bid) && book.asks.contains_key(&best_ask),
+        "дифф по дальним уровням снёс топ книги"
+    );
+    assert_eq!(
+        book.bids.len(),
+        100,
+        "число bid-уровней не должно измениться"
+    );
+    assert_eq!(
+        book.asks.len(),
+        100,
+        "число ask-уровней не должно измениться"
+    );
+}
+
+/// (1d) `size == 0` — единственное санкционированное биржей удаление.
+#[test]
+fn c1_only_explicit_zero_size_removes_a_level() {
+    let mut book = empty_book();
+    bootstrap(&mut book, MID0, 10);
+    apply_diff_to_book(&mut book, &diff(2, vec![(MID0 - 2 * TICK, 0)], vec![]));
+    assert!(
+        !book.bids.contains_key(&(MID0 - 2 * TICK)),
+        "size=0 обязан удалить уровень"
+    );
+    assert_eq!(book.bids.len(), 9, "и ТОЛЬКО его");
+}
+
+// ── B: граница памяти — дистанция от mid КНИГИ ────────────────────────────────────────
+
+/// Эвиктится только то, что ВНЕ окна эмиссии; всё внутри окна (входит в полосы OBI) — живёт.
+#[test]
+fn td016_evicts_only_levels_outside_emission_window() {
+    let mut book = empty_book();
+    bootstrap(&mut book, MID0, 10);
+
+    let far_bid = (MID0 as f64 * 0.20) as i64; // −80% от mid: вне окна
+    let far_ask = (MID0 as f64 * 1.80) as i64; // +80%: вне окна
+    let in_band_bid = (MID0 as f64 * 0.70) as i64; // −30%: ВНУТРИ окна (полоса 30%)
+
+    apply_diff_to_book(
+        &mut book,
+        &diff(
+            2,
+            vec![(far_bid, 4 * E8), (in_band_bid, 4 * E8)],
+            vec![(far_ask, 4 * E8)],
+        ),
+    );
+
+    assert!(
+        !book.bids.contains_key(&far_bid) && !book.asks.contains_key(&far_ask),
+        "уровни за пределами ±{:.0}% от mid не эвиктятся — они не попадают ни в эмиссию, ни в \
+         полосы OBI, биржа их никогда не обнулит, и они живут в памяти вечно (лик TD-016)",
+        MAX_REL_DIST * 100.0
+    );
+    assert!(
+        book.bids.contains_key(&in_band_bid),
+        "уровень ВНУТРИ окна эмиссии удалён — суммы полос OBI испорчены, сигнал деградировал \
+         тихо, а RSS при этом стабилен (худший из возможных исходов)"
+    );
+}
+
+/// Дрейф цены: уровни, ВЫШЕДШИЕ за окно, эвиктятся → память не растёт с числом апдейтов.
+#[test]
+fn td016_memory_bounded_when_price_drifts_out_of_band() {
+    let pump = |updates: i64| -> (usize, usize) {
+        let base = CUR.load(SeqCst);
+        let mut book = empty_book();
+        for u in 0..updates {
+            let mid = MID0 + u * 40 * TICK; // +$0.40 за апдейт
+            let d = diff(
+                u as u64 + 1,
+                (1..=10).map(|k| (mid - k * TICK, 5 * E8)).collect(),
+                (1..=10).map(|k| (mid + k * TICK, 5 * E8)).collect(),
+            );
+            apply_diff_to_book(&mut book, &d);
+        }
+        let held = CUR.load(SeqCst).saturating_sub(base);
+        (book.bids.len() + book.asks.len(), held)
+    };
+
+    let (levels_small, mem_small) = pump(100_000); // mid +62% → уровни начинают покидать окно
+    let (levels_big, mem_big) = pump(200_000); // mid +123%
+
+    assert!(
+        levels_big < levels_small * 2,
+        "число уровней растёт пропорционально числу апдейтов ({levels_small} → {levels_big}): \
+         уровни, из которых цена ушла, не эвиктятся — это и есть лик TD-016"
     );
     let growth = mem_big.saturating_sub(mem_small);
     assert!(
-        growth < 512 * 1024,
-        "память книги выросла на {growth} B при увеличении числа апдейтов 50k→200k — \
-         это линейный лик (TD-016). Книга обязана быть O(глубина окна), а не O(история)"
+        growth < 4 * 1024 * 1024,
+        "память книги выросла на {growth} B при удвоении числа апдейтов — граница не держит"
     );
 }
 
-/// (3) ЭВИКЦИЯ НЕ СМЕЕТ РЕЗАТЬ ЖИВУЮ КНИГУ (guard над фиксом TD-016).
-///
-/// Из этой книги считается сигнал OBI (полосы 1.5–60% от mid). Реализация, которая ради
-/// «ограничения памяти» выбрасывает нормальные некроссящиеся уровни, не превысив кап,
-/// тихо испортит сигнал — и §8 покажет «RSS стабилен», а полосы поедут.
-///
-/// Сценарий: спокойная книга (100 уровней на сторону, без дрейфа), диффом обновляются ТОЛЬКО
-/// 3 верхних уровня каждой стороны. Ни один прочий уровень исчезнуть не имеет права.
+/// Аварийный backstop: патологически плотная книга ВНУТРИ окна всё равно ограничена;
+/// эвиктится самое дальнее от mid, топ не трогается.
 #[test]
-fn td016_eviction_preserves_uncrossed_levels_under_cap() {
+fn td016_backstop_cap_evicts_farthest_never_top() {
     let mut book = empty_book();
-    let mid = 65_000_000_000_000i64;
+    let n = (BACKSTOP_LEVELS_PER_SIDE as i64) * 3; // втрое больше капа
+    let d = diff(
+        1,
+        (1..=n).map(|k| (MID0 - k * TICK, E8)).collect(),
+        (1..=n).map(|k| (MID0 + k * TICK, E8)).collect(),
+    );
+    apply_diff_to_book(&mut book, &d);
 
-    // Бутстрап: 100 уровней на сторону вокруг mid (шаг $0.01), под капом.
-    let boot = DepthDiff {
-        event_time_ms: 1_752_000_000_000,
-        u_first: 1,
-        u_final: 1,
-        bids: (1..=100).map(|k| (mid - k * 1_000_000, 5 * E8)).collect(),
-        asks: (1..=100).map(|k| (mid + k * 1_000_000, 5 * E8)).collect(),
-    };
-    apply_diff_to_book(&mut book, &boot);
-    assert_eq!(levels(&book), 200, "предусловие: книга собрана");
-
-    // Обычный апдейт: биржа прислала только 3 верхних уровня каждой стороны.
-    let tick = DepthDiff {
-        event_time_ms: 1_752_000_000_100,
-        u_first: 2,
-        u_final: 2,
-        bids: (1..=3).map(|k| (mid - k * 1_000_000, 7 * E8)).collect(),
-        asks: (1..=3).map(|k| (mid + k * 1_000_000, 7 * E8)).collect(),
-    };
-    apply_diff_to_book(&mut book, &tick);
-
-    assert_eq!(
-        levels(&book),
-        200,
-        "эвикция удалила живые некроссящиеся уровни, хотя кап (5000/сторону) далеко не достигнут \
-         — из этой книги считаются полосы OBI: сигнал будет тихо испорчен, а RSS-метрика \
-         покажет «всё хорошо». bids={} asks={}",
+    assert!(
+        book.bids.len() <= BACKSTOP_LEVELS_PER_SIDE && book.asks.len() <= BACKSTOP_LEVELS_PER_SIDE,
+        "backstop-кап не сработал: bids={} asks={} (кап {BACKSTOP_LEVELS_PER_SIDE}) — книга \
+         может съесть память без предела",
         book.bids.len(),
         book.asks.len()
     );
-    assert_eq!(
-        book.bids.get(&(mid - 1_000_000)).copied(),
-        Some(7 * E8),
-        "обновлённый лучший bid обязан нести НОВЫЙ размер"
-    );
-    assert_eq!(
-        book.bids.get(&(mid - 100_000_000)).copied(),
-        Some(5 * E8),
-        "дальний (но живой, в пределах капа) уровень обязан сохраниться"
+    assert!(
+        book.bids.contains_key(&(MID0 - TICK)) && book.asks.contains_key(&(MID0 + TICK)),
+        "backstop-кап срезал ТОП книги вместо дальнего хвоста"
     );
 }
