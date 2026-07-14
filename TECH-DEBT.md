@@ -41,11 +41,67 @@
   `tracing::warn`); наблюдаемость D — `tracing::info!(symbol, bids, asks, "book levels")` ≥1/мин.
   Анти-плацебо доказан reviewer'ом независимо: `c1_asymmetric_diff_must_not_delete_live_levels` и
   `td016_evicts_only_levels_outside_emission_window` **FAIL против v1-impl**, GREEN против v2.
-  **Атрибуция лика к книге кодом НЕ доказана.** Если после деплоя RSS всё равно растёт — лик не
-  здесь (кандидаты: `venue-hyperliquid` — тоже full-book на BTreeMap; tracing-буферы). Ответ даст
-  §8-замер (RSS сразу/1ч/4-5ч + метрика уровней D). **§8 НЕ ВЫПОЛНЕН — деплой заблокирован
-  TD-018 (ниже).** Прод по-прежнему на `656c7ca`: RSS **139 MiB @ 17 ч аптайма** (≈ +8 MiB/час,
-  лик активен, контейнер `healthy`). Долг ОСТАЁТСЯ OPEN до §8-подтверждения на проде.
+  **§8 ВЫПОЛНЕН 2026-07-14 (прод `b7721d1`, 4.2 ч наблюдения, метрика D). ДОЛГ ОСТАЁТСЯ OPEN —
+  фикс НЕ удерживает книгу; попутно опровергнута исходная метрика:**
+  1. **Прежняя метрика («+8 MiB/час», по `docker stats`) БЫЛА ЗАГРЯЗНЕНА.** `docker stats`/
+     `memory.current` cgroup включают **page cache** файла журнала, а recorder пишет ~30 MB/мин.
+     Замер cgroup `memory.stat` на проде: `anon 13 492 224` (куча) против `file 163 508 224`
+     (кэш журнала, reclaimable). Настоящий рост кучи — **≈ +1 MiB/час** (`RssAnon` 13 176 →
+     16 228 KB за 4 ч), а не +8. Историческая точка «139 MiB @17ч» и оракульная «48 MiB @5ч»
+     мерились ТЕМ ЖЕ загрязнённым способом → величина TD-016 была завышена. **Мерить `RssAnon`
+     (`/proc/<pid>/status`), НЕ `docker stats`** — см. TD-021.
+  2. **Но лик книги РЕАЛЕН и фиксом v2 НЕ УСТРАНЁН.** Метрика D (`book levels`) за 4.2 ч:
+     BTC `5072/5064 → 13840/3000`, ETH `5203/5095 → 12927/5344` — монотонный рост, ~+2000
+     уровней/час на растущей стороне. Механика видна в самих числах: цена идёт вверх → bids, из-под
+     которых цена ушла, `size=0` больше НЕ получают и остаются навсегда; asks тают. Причина
+     неэффективности v2: окно эвикции `MAX_REL_DIST` = **±60 % от mid** при BTC ~118k$ = ±71 000 $
+     — оно не эвиктит практически НИЧЕГО. Единственный реальный потолок — `BACKSTOP_LEVELS_PER_SIDE
+     = 50 000` (при текущем темпе достижим за ~18 ч; на §8-окне не сработал, `backstop=0`).
+  3. **Следствие для ДАННЫХ (важнее памяти):** мёртвые уровни лежат ВНУТРИ окна эмиссии ⇒ попадают
+     в `L2Snapshot` и в полосы OBI 6–60 %. Дальние полосы сигнала содержат ФАНТОМНУЮ ликвидность,
+     которой на бирже нет. Это не регрессия M-08 (так было и до него), но это ровно тот дефект,
+     ради которого писался E7. Нужен контракт, который ограничивает книгу ТАМ, где живёт сигнал
+     (кап уровней с сохранением топа / окно по дистанции, СОРАЗМЕРНОЕ полосам OBI / bucket-агрегаты
+     вместо сырой книги — зона architect, RED-first).
+  4. Что фикс v2 всё же дал: он **безопасен для данных** (v1 стирал живые уровни, включая best bid
+     — порча журнала) и §8 подтвердил, что глубина НЕ деградировала: полосы на прогретой книге
+     (4.2 ч) — `avg bid/ask buckets 1154/969` против baseline `1316/1452`, полоса 600–6000 bps
+     `1115/873` против `975/845`, >6000 bps — ноль в обоих. Плюс метрика D, без которой пункты
+     1–3 были бы догадками.
+  Прод на §8-окне здоров: `restarts=0`, `panic/ERROR=0`, `backstop=0`, heartbeat свежий,
+  `seq_gaps=0`. Revert НЕ требуется. Severity: **MAJOR** (data-quality сигнала + неограниченный
+  рост до 50k/сторона).
+- **TD-019** `storage-status-not-published-in-heartbeat` (найдено reviewer'ом на §8 M-08, 2026-07-14).
+  Обещание M-08 E4: «состояние наблюдаемо через `storage_status().writable == false` (recorder
+  публикует его в heartbeat → **видно без ssh**)». По факту `crates/recorder` **ни разу не зовёт**
+  `journal::storage_status` (grep пуст), а `recorder.heartbeat` = **13 байт** (только ms epoch).
+  Проверено на проде: `/root/jctl guard` → `writable=true free_bytes=121230888960`, т.е. API
+  работает — но наружу не выведен. Сам disk-guard fail-closed РАБОТАЕТ и деградация не тихая:
+  `run_writer` делает `journal.append(kind)?` → при storage-guard `Err` writer возвращает `Err` →
+  recorder падает громко (контейнер unhealthy/restart-loop), а не молча теряет события. То есть
+  это дыра в НАБЛЮДАЕМОСТИ, не в safety. Зона: engine-dev (recorder) по RED от architect'а.
+  Severity: **MINOR** (safety не нарушен; но «увидим переполнение диска без ssh» — не выполнено).
+- **TD-020** `retention-implemented-but-never-invoked` (найдено reviewer'ом на §8 M-08, 2026-07-14).
+  Ретеншен есть как БИБЛИОТЕКА (`prune_segment` + `ColdCopyProof` + cold-выгрузка, RED зелёный),
+  но его **никто не вызывает**: grep `prune_segment|ColdCopyProof|retention` по `crates/recorder/src`
+  и `crates/*/src/bin` — **пусто**. Нет ни оператора, ни CLI, ни cron, ни конфигурации Storage Box.
+  Следствие: цель M-08 «сбор не останавливается НИКОГДА» **не достигнута** — ротация лишь дробит
+  диск на сегменты по 1 GiB, а суммарный рост остаётся ~2.8 GB/сут при 113 GB свободных ⇒ **~40 дней
+  до disk-guard**, после чего recorder встанет (fail-closed, но встанет). §8-пункт «ретеншен —
+  dry-run» выполнить было НЕЧЕМ: механизма в проде не существует. Нужен операторский путь
+  (CLI/крон + конфиг Storage Box) — зона architect (спека) → engine-dev (impl).
+  Severity: **MAJOR** (это ГЛАВНАЯ цель milestone'а; таймер ~40 дней уже тикает).
+- **TD-021** `memory-metric-includes-page-cache` (найдено reviewer'ом на §8 M-08, 2026-07-14).
+  Все прежние замеры памяти recorder'а (мои в TD-016: 8.4 → 48 → 139 MiB; оракульная мотивация
+  «+6.5 MiB/час») снимались через `docker stats`, который показывает cgroup `memory.current` —
+  **включая page cache** файла журнала. Recorder пишет ~30 MB/мин ⇒ кэш растёт линейно и выглядит
+  как утечка. Факт с прода (`memory.stat`): `anon 13 492 224` / `file 163 508 224`. Правильная
+  метрика — `RssAnon` из `/proc/<pid>/status` (или `memory.stat anon`), она дала **+1 MiB/час**
+  вместо +8. **Урок процессный:** метрика ресурса, по которой заводится долг и пишется RED-оракул,
+  сама обязана быть провалидирована — иначе оракул «границы ресурса» гейтит призрак. Внести в
+  `.claude/rules/testing.md` (прод-масштаб для sacred I/O-путей) и в чек-лист §8
+  (`.claude/rules/gates.md`): **RSS мерить как anon, не как cgroup-total**. Зона: architect
+  (процессный слой). Severity: **MAJOR** (метрика вводила в заблуждение два milestone'а подряд).
 - **TD-018** `deploy-ci-gate-cannot-read-ci-status` (найдено reviewer'ом на §8 M-08, 2026-07-14).
   Гейт TD-017 (`deploy.yml` job `ci`, «Wait for CI success on this commit») **не работает**:
   `gh api repos/$REPO/actions/runs?head_sha=$SHA` возвращает **`HTTP 403 Resource not accessible
@@ -59,6 +115,9 @@
   `workflow_run` с фильтром `conclusion == success`), затем re-run Deploy на `1123b13`.
   Severity: **MAJOR** (гейт-байпас наоборот: пайплайн не может выкатить прод; при этом «Deploy
   failure» на зелёном main легко принять за флаки и обойти руками — обход = возврат TD-017).
+  **✅ CLOSED 2026-07-14 (`b7721d1`, architect): `permissions: actions:read` добавлены. Доказано
+  СКВОЗНЫМ прогоном, а не глазами: run 29318076908 @`1123b13` → Deploy FAILURE на 403 (гейт не
+  пустил), run 29318836147 @`b7721d1` → CI success → Deploy SUCCESS. Прод обновлён.**
 - **TD-017** `deploy-not-gated-on-ci` (замечено reviewer'ом на §8 M-07, 2026-07-13).
   `.github/workflows/deploy.yml` — САМОСТОЯТЕЛЬНЫЙ workflow на `push: branches: [main]`
   (paths: `crates/**`, `Cargo.toml`, `Cargo.lock`, `Dockerfile`, `docker-compose.yml`),
@@ -72,10 +131,11 @@
   `needs: ci` (или `workflow_run` с фильтром `conclusion == success`). Зона — architect
   (процессный/CI-слой), не reviewer. Severity: **MAJOR** (гейт-байпас: gates §8 требует
   «дождаться CI+Deploy success», но пайплайн допускает Deploy success ПРИ красном CI).
-  **СТАТУС 2026-07-14 (M-08 задача 6, merge `1123b13`): гейт НАПИСАН** (`deploy.yml` job `ci`
-  «Wait for CI success on this commit» + `deploy: needs: ci`, fail-closed на красный CI / таймаут /
-  отмену; verify-гейт T12 проверяет структурно), **но в проде НЕ РАБОТАЕТ — TD-018 (403 на чтении
-  статуса CI).** Долг ОСТАЁТСЯ OPEN до первого успешного прохода гейта на реальном деплое.
+  **✅ CLOSED 2026-07-14 (M-08 задача 6 + TD-018 фикс `b7721d1`).** Гейт `deploy.yml` job `ci`
+  («Wait for CI success on this commit») + `deploy: needs: ci`, fail-closed на красный CI / таймаут /
+  отмену; verify-гейт T12 проверяет связь структурно. Работоспособность доказана СКВОЗНЫМ прогоном:
+  красный/непрочитанный CI Deploy НЕ пустил (`1123b13`), зелёный — пустил (`b7721d1` → Deploy
+  success → VPS HEAD `b7721d1`). Deploy success при красном CI более невозможен.
 - **TD-001** recorder Docker-образ работает root'ом (M-00 заглушка). Hardening (non-root +
   права journal-тома) — при реальном recorder (M-01). Severity: MINOR.
 - **TD-002** `hetzner-server` приватный ключ был вставлен в чат (скомпрометирован). Пересоздать
