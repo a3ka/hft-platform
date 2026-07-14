@@ -240,8 +240,60 @@ pub(crate) fn read_event_frame<R: Read>(mut r: R) -> io::Result<Option<Event>> {
     Ok(Some(ev))
 }
 
+/// Прочитать v2-заголовок БЕЗ Seek (forward-only). Для сжатых сегментов, где zstd::Decoder
+/// не импл Seek. Требует магию (иначе → `CorruptHeader`): legacy-формата под zstd не бывает.
+fn skip_v2_header_forward<R: Read>(mut r: R) -> io::Result<SegmentHeader> {
+    let mut magic = [0u8; SEGMENT_MAGIC.len()];
+    r.read_exact(&mut magic)?;
+    if magic != SEGMENT_MAGIC {
+        return Err(corrupt_header_err());
+    }
+    let payload = read_frame_payload(&mut r)?.ok_or_else(corrupt_header_err)?;
+    let header: SegmentHeader = postcard::from_bytes(&payload).map_err(|_| corrupt_header_err())?;
+    Ok(header)
+}
+
+/// Открыть zstd-поток поверх файла компактного сегмента. Двойной BufReader:
+/// внешний — чтобы `read_event_frame`/`skip_v2_header_forward` читали крупными блоками
+/// (внутренний аллокатор zstd не любит тысячи мелких read'ов); внутренний — буфер между
+/// диском и zstd-декодером.
+///
+/// НЕ буферизует весь сегмент: на боевых 1 GiB .zst это OOM (класс TD-011).
+pub(crate) fn open_compacted_reader(
+    f: File,
+) -> io::Result<BufReader<zstd::Decoder<'static, BufReader<File>>>> {
+    let inner = BufReader::with_capacity(64 * 1024, f);
+    let decoder = zstd::Decoder::with_buffer(inner)?;
+    Ok(BufReader::with_capacity(64 * 1024, decoder))
+}
+
 /// M-08 task 10: прочитать ВСЕ события из одного сегмент-файла.
 pub(crate) fn read_segment_events(path: &Path, strict: bool) -> io::Result<Vec<Event>> {
+    // M-08 task 15 (TD-022): сжатый сегмент читается через zstd-декодер; raw — как раньше.
+    let is_zst = path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .is_some_and(is_compacted_name);
+    if is_zst {
+        let f = File::open(path)?;
+        let mut decoder = open_compacted_reader(f)?;
+        skip_v2_header_forward(&mut decoder)?;
+        // ОФЛАЙН-диагностика (`read_all`/`recover`): кладутся ВСЕ события в Vec —
+        // допустимо для фикстур и dump-инструментов, на проде не используется.
+        // На боевом 1 GiB .zst это может быть большой Vec; НО в прод-пути — `stream`,
+        // он стримит (batched allocation). raw-ветка читает `data` через `read_to_end`
+        // для tolerant — те же гарантии.
+        let mut data = Vec::new();
+        let mut buf = [0u8; 64 * 1024];
+        loop {
+            let n = decoder.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            data.extend_from_slice(&buf[..n]);
+        }
+        return parse_event_frames(&data);
+    }
     if strict {
         read_segment_events_strict(path)
     } else {
@@ -249,6 +301,9 @@ pub(crate) fn read_segment_events(path: &Path, strict: bool) -> io::Result<Vec<E
     }
 }
 
+/// Raw-сегмент: CRC-ошибка / torn / десериализация → `Err` (DET-I-1 strict, ровно на одном
+/// сегменте, без silent drop). Используется `dump.rs`/`bands.rs`/`obi_probe.rs` (диагностика),
+/// НЕ прод-путь чтения (для прод — `stream`, O(1) памяти на сегмент).
 fn read_segment_events_strict(path: &Path) -> io::Result<Vec<Event>> {
     let mut f = File::open(path)?;
     // v2: пропустить magic+header; legacy: seek back на 0.
@@ -261,11 +316,20 @@ fn read_segment_events_strict(path: &Path) -> io::Result<Vec<Event>> {
     Ok(out)
 }
 
+/// Raw-сегмент: tolerant (resync через байт-ресинк вперёд на CRC-ошибке / torn).
+/// Для ОФЛАЙН-инструмента `journal::recover()` (M-05 J3): CRC-ошибка не фатальна,
+/// данные после неё всё ещё ценны (ручной разбор).
 fn read_segment_events_tolerant(path: &Path) -> io::Result<Vec<Event>> {
     let mut f = File::open(path)?;
     let _hdr = read_v2_header_and_skip(&mut f)?;
     let mut data = Vec::new();
     f.read_to_end(&mut data)?;
+    parse_event_frames(&data)
+}
+
+/// Внутренняя tolerant-парсия: для ОФЛАЙН-диагностики (`read_all`/`recover`).
+/// Принимает уже прочитанный буфер событий (raw или распакованный из .zst).
+fn parse_event_frames(data: &[u8]) -> io::Result<Vec<Event>> {
     if data.is_empty() {
         return Ok(Vec::new());
     }
@@ -390,10 +454,17 @@ fn classify_segment(path: &Path, manifest: &LegacyManifest) -> io::Result<Segmen
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "non-utf8 file name"))?
         .to_string();
 
-    let index = parse_segment_index(&file_name)
+    let index = parse_segment_index_any(&file_name)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "not a segment file"))?;
 
     let size_bytes = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+
+    // M-08 task 15 (TD-022): сжатый сегмент — другой формат, другая схема классификации
+    // (нет legacy-пути: zstd-обёртка всегда поверх v2, иначе компакция бы не создала файл).
+    if is_compacted_name(&file_name) {
+        return classify_compacted_segment(path, index, size_bytes);
+    }
+
     let has_magic = matches!(read_magic_prefix(path)?, Some(m) if m == SEGMENT_MAGIC);
 
     let now_ms = SystemTime::now()
@@ -448,6 +519,28 @@ fn classify_segment(path: &Path, manifest: &LegacyManifest) -> io::Result<Segmen
     }
 }
 
+/// Классифицировать СЖАТЫЙ сегмент (`segment-NN.jrnl.zst`). Всегда v2 (компакция
+/// применяется только к закрытым v2-сегментам). Декодируем магию+заголовок из zstd-потока
+/// (forward-only, без Seek — zstd::Decoder не импл Seek по построению).
+///
+/// Ошибки декодирования → `Err(CorruptHeader)` или `Err(InvalidData)`. Порченый .zst
+/// НИКОГДА не вменяется в v2 с припиской «наш» — тот же fail-closed, что для raw
+/// (CT-RFC-02 rev 2 находка C2).
+fn classify_compacted_segment(path: &Path, index: u32, size_bytes: u64) -> io::Result<SegmentInfo> {
+    let f = File::open(path)?;
+    let mut decoder = open_compacted_reader(f)?;
+    let header = skip_v2_header_forward(&mut decoder).map_err(|e| match e.kind() {
+        io::ErrorKind::UnexpectedEof => corrupt_header_err(),
+        _ => e,
+    })?;
+    Ok(SegmentInfo {
+        path: path.to_path_buf(),
+        index,
+        header,
+        size_bytes,
+    })
+}
+
 /// Извлечь индекс из имени `segment-NNNNNNNN.jrnl`.
 fn parse_segment_index(name: &str) -> Option<u32> {
     let rest = name.strip_prefix("segment-")?.strip_suffix(".jrnl")?;
@@ -457,33 +550,71 @@ fn parse_segment_index(name: &str) -> Option<u32> {
     rest.parse::<u32>().ok()
 }
 
-/// Обойти `segment-NNNNNNNN.jrnl` каталога по возрастанию индекса — БЕЗ классификации
-/// по манифесту. Используется в `read_all`/`recover` (ОФЛАЙН-диагностика, не требует
-/// декларации — в отличие от прод-пути `stream`, который через `list_segments`
-/// отвергает чужие/незадекларированные файлы).
+/// Является ли имя сегмента сжатым (`segment-NNNNNNNN.jrnl.zst`).
+fn is_compacted_name(name: &str) -> bool {
+    name.ends_with(".jrnl.zst")
+}
+
+/// Получить индекс из имени — как сжатого, так и несжатого сегмента.
+/// Для `segment-NN.jrnl.zst` индекс берётся из базовой части (до `.zst`).
+fn parse_segment_index_any(name: &str) -> Option<u32> {
+    let base = name.strip_suffix(".zst").unwrap_or(name);
+    parse_segment_index(base)
+}
+
+/// Обойти `segment-NNNNNNNN.jrnl` И `segment-NNNNNNNN.jrnl.zst` каталога по возрастанию
+/// индекса — БЕЗ классификации по манифесту. Используется в `read_all`/`recover`
+/// (ОФЛАЙН-диагностика, не требует декларации — в отличие от прод-пути `stream`,
+/// который через `list_segments` отвергает чужие/незадекларированные файлы).
+///
+/// Сжатые и сырые сегменты с одинаковым индексом НЕ ДОЛЖНЫ существовать одновременно
+/// (компакция удаляет оригинал). Если такое обнаружено — побеждает сырой (recorder
+/// пишет в него после возможного отката), сжатый игнорируется.
 pub(crate) fn iter_segments_sorted(dir: &Path) -> io::Result<Vec<PathBuf>> {
-    let mut out: Vec<(u32, PathBuf)> = Vec::new();
+    let mut by_index: std::collections::BTreeMap<u32, PathBuf> = std::collections::BTreeMap::new();
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let p = entry.path();
-        if p.extension().and_then(OsStr::to_str) != Some("jrnl") {
-            continue;
-        }
         let name = match p.file_name().and_then(OsStr::to_str) {
-            Some(s) => s.to_string(),
+            Some(s) => s,
             None => continue,
         };
-        if let Some(idx) = parse_segment_index(&name) {
-            out.push((idx, p));
+        if !name.ends_with(".jrnl") && !is_compacted_name(name) {
+            continue;
+        }
+        let idx = match parse_segment_index_any(name) {
+            Some(i) => i,
+            None => continue,
+        };
+        let is_zst = is_compacted_name(name);
+        match by_index.entry(idx) {
+            std::collections::btree_map::Entry::Vacant(e) => {
+                e.insert(p);
+            }
+            std::collections::btree_map::Entry::Occupied(mut e) => {
+                // При коллизии (и .jrnl, и .jrnl.zst для одного индекса): побеждает сырой.
+                let existing = e.get();
+                let existing_is_zst = existing
+                    .file_name()
+                    .and_then(OsStr::to_str)
+                    .is_some_and(is_compacted_name);
+                if existing_is_zst && !is_zst {
+                    e.insert(p);
+                }
+                // иначе — оставляем существующий (сырой побеждает, или оба сжатых — берём первый).
+            }
         }
     }
-    out.sort_by_key(|(idx, _)| *idx);
-    Ok(out.into_iter().map(|(_, p)| p).collect())
+    Ok(by_index.into_values().collect())
 }
 
 /// Какие эпохи читатель СОГЛАСЕН смешивать — фильтр вызывается через `EpochFilter::accepts`.
 ///
 /// ЕДИНСТВЕННЫЙ публичный путь `list_segments` — все сегменты каталога.
+///
+/// Включает ОБА формата: сырой `.jrnl` и сжатый `.jrnl.zst`. Сжатые сегменты несут
+/// ту же магию+заголовок (первые байты потока zstd декодируются в исходный v2-сегмент),
+/// поэтому классификация по содержимому — единая.
 pub fn segments(dir: impl AsRef<Path>) -> io::Result<Vec<SegmentInfo>> {
     let dir = dir.as_ref();
     let manifest = load_manifest(dir)?;
@@ -491,7 +622,11 @@ pub fn segments(dir: impl AsRef<Path>) -> io::Result<Vec<SegmentInfo>> {
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let p = entry.path();
-        if p.extension().and_then(OsStr::to_str) != Some("jrnl") {
+        let name = match p.file_name().and_then(OsStr::to_str) {
+            Some(s) => s,
+            None => continue,
+        };
+        if !name.ends_with(".jrnl") && !is_compacted_name(name) {
             continue;
         }
         out.push(classify_segment(&p, &manifest)?);
@@ -597,7 +732,11 @@ pub struct EventStream {
     segments: Vec<SegmentInfo>,
     selected_headers: Vec<SegmentHeader>,
     cursor: usize,
-    reader: Option<BufReader<File>>,
+    /// Унифицированный reader для raw и compacted сегментов. `Box<dyn Read>` (а не
+    /// `BufReader<File>` как раньше) — потому что zstd::Decoder не импл Seek, а единый
+    /// тип позволяет общую обработку через `read_event_frame` (которой Seek не нужен —
+    /// только forward-чтение).
+    reader: Option<Box<dyn Read>>,
     finished: bool,
 }
 
@@ -613,6 +752,10 @@ impl EventStream {
     /// - `Ok(true)`  — сегмент открыт (cursor сдвинут, `self.reader = Some(_)`);
     /// - `Ok(false)` — сегментов больше нет;
     /// - `Err(_)`    — ошибка открытия файла сегмента (возвращается через `next()`).
+    ///
+    /// Для raw `.jrnl` — `read_v2_header_and_skip` (поддерживает Seek для legacy-fallback).
+    /// Для `.jrnl.zst` — `skip_v2_header_forward` (zstd::Decoder не импл Seek, но legacy
+    /// под zstd не бывает: компакция только над v2).
     fn open_next_segment(&mut self) -> io::Result<bool> {
         if self.cursor >= self.segments.len() {
             self.reader = None;
@@ -620,13 +763,24 @@ impl EventStream {
         }
         let seg = &self.segments[self.cursor];
         self.cursor += 1;
-        let f = File::open(&seg.path)?;
-        let mut r = BufReader::with_capacity(64 * 1024, f);
-        // v2: пропустить magic+header. legacy: перемотки не было.
-        if read_v2_header_and_skip(&mut r).ok().flatten().is_none() {
-            // noop
+        let is_zst = seg
+            .path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .is_some_and(is_compacted_name);
+        if is_zst {
+            let f = File::open(&seg.path)?;
+            let mut decoder = open_compacted_reader(f)?;
+            skip_v2_header_forward(&mut decoder)?;
+            self.reader = Some(Box::new(decoder));
+        } else {
+            let f = File::open(&seg.path)?;
+            let mut r = BufReader::with_capacity(64 * 1024, f);
+            if read_v2_header_and_skip(&mut r).ok().flatten().is_none() {
+                // noop: legacy-сегмент (без магии)
+            }
+            self.reader = Some(Box::new(r));
         }
-        self.reader = Some(r);
         Ok(true)
     }
 }
@@ -637,7 +791,7 @@ impl Iterator for EventStream {
     fn next(&mut self) -> Option<io::Result<Event>> {
         loop {
             if let Some(reader) = self.reader.as_mut() {
-                match read_event_frame(reader) {
+                match read_event_frame(reader.as_mut()) {
                     Ok(Some(ev)) => return Some(Ok(ev)),
                     Ok(None) => {
                         // EOF сегмента — закрываем reader и пробуем следующий.
@@ -1454,16 +1608,189 @@ pub struct CompactionReport {
 /// 4. `fsync` + атомарный `rename` .tmp → .zst, и только ПОТОМ удаляем оригинал.
 ///
 /// Это тот же принцип, что `ColdCopyProof`: удалить можно лишь то, чья копия ДОКАЗАНО читается.
-pub fn compact_segment(_seg: &SegmentInfo, _level: i32) -> io::Result<CompactionReport> {
-    todo!("M-08 task 15 (engine-dev): tmp → verify(sha256 после распаковки) → rename → удалить оригинал")
+pub fn compact_segment(seg: &SegmentInfo, level: i32) -> io::Result<CompactionReport> {
+    let src = &seg.path;
+    // (1) Активный сегмент — это тот, у кого индекс МАКСИМАЛЬНЫЙ в каталоге (recorder
+    // дописывает ТОЛЬКО в последний сегмент; см. `decide_open_segment`). Если это он —
+    // отказываем. Никаких «почти активных», никакого TTL: единственный определитель —
+    // позиция в каталоге. Иначе сожмём сегмент, в который пишут, и запись начнёт
+    // дописывать в .zst, что:
+    //   - порушит wire-format (recorder пишет v2-фреймы, не zstd-поток);
+    //   - оставит .zst «недописанным» (zstd не предупредит, что поток обрезан);
+    //   - при следующем open'е recorder откроет новый сегмент → потеря seq-границы.
+    let dir = src
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "segment path has no parent"))?;
+    let latest_idx = latest_segment_index(dir)?;
+    if Some(seg.index) == latest_idx {
+        return Err(io::Error::other(format!(
+            "cannot compact active segment segment-{:08}.jrnl (writer holds it open)",
+            seg.index
+        )));
+    }
+
+    // (2) Имена .tmp / .zst строятся из базовой части (`segment-NN.jrnl` + суффикс).
+    let base = src
+        .file_name()
+        .and_then(OsStr::to_str)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "non-utf8 file name"))?;
+    if !base.ends_with(".jrnl") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("compact_segment: ожидался .jrnl, получили `{base}`"),
+        ));
+    }
+    let dst = src.with_file_name(format!("{base}{}", COMPACTED_SUFFIX)); // .jrnl.zst
+    let tmp = src.with_file_name(format!("{base}{}.tmp", COMPACTED_SUFFIX)); // .jrnl.zst.tmp
+
+    if dst.exists() {
+        // Уже сжат (двойной вызов / гонка). Не пересжимаем: второй вызов обязан быть идемпотентен.
+        // Возвращаем отчёт с bytes_after == bytes_before (без изменений).
+        return Ok(CompactionReport {
+            source: src.clone(),
+            compacted: dst.clone(),
+            bytes_before: fs::metadata(src).map(|m| m.len()).unwrap_or(0),
+            bytes_after: fs::metadata(&dst).map(|m| m.len()).unwrap_or(0),
+        });
+    }
+
+    // (3) Хеш оригинала ДО любых мутаций — для сверки после сжатия.
+    let orig_sha = sha256_file(src)?;
+    let orig_size = fs::metadata(src)?.len();
+
+    // (4) Сжатие в .tmp. При ЛЮБОЙ ошибке (I/O, zstd) — откат, оригинал цел.
+    if let Err(e) = compress_to_tmp(src, &tmp, level) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+
+    // (5) Верификация: распаковываем .tmp, считаем sha256, сравниваем с оригиналом.
+    // Данные незаменимы: «сжали и удалили, а там мусор» недопустимо.
+    let verify_sha = match sha256_decompressed(&tmp) {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = fs::remove_file(&tmp);
+            return Err(e);
+        }
+    };
+    if verify_sha != orig_sha {
+        let _ = fs::remove_file(&tmp);
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "compaction sha256 mismatch: orig={orig_sha} decompressed={verify_sha} \
+                 (сегмент НЕ тронут — данные не удалены; .tmp удалён)"
+            ),
+        ));
+    }
+
+    // (6) fsync .tmp + атомарный rename → .zst.
+    {
+        let f = File::open(&tmp)?;
+        f.sync_all()?;
+    }
+    if let Err(e) = fs::rename(&tmp, &dst) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+
+    // (7) Только теперь удаляем оригинал. Между шагом 6 и 7 на диске лежат ОБА файла:
+    // оригинал и .zst (rename не удаляет src). На короткий миг место вырастает; для
+    // прод-замера это <1 GiB × 1 = безопасно (минуты до окончания операции).
+    fs::remove_file(src)?;
+
+    let compacted_size = fs::metadata(&dst).map(|m| m.len()).unwrap_or(0);
+    Ok(CompactionReport {
+        source: src.clone(),
+        compacted: dst,
+        bytes_before: orig_size,
+        bytes_after: compacted_size,
+    })
 }
 
-/// Сжать все закрытые сегменты старше `min_age_segments` (активный и `keep_raw` последних —
-/// не трогаем: свежие читаются чаще всего, а несжатый доступ дешевле).
+/// Сжать ВСЕ закрытые сегменты старше `keep_raw` последних. Активный и `keep_raw` самых
+/// свежих НЕ трогаем: свежие читаются чаще, несжатый доступ дешевле (особенно для
+/// debug-инструментов и bands-дампа).
+///
+/// Алгоритм:
+///   1. Обойти каталог через `segments()` (включая .zst).
+///   2. Определить активный = с максимальным индексом.
+///   3. Отсортировать по индексу, отбросить активный + последние `keep_raw`.
+///   4. На каждом из оставшихся вызвать `compact_segment`.
 pub fn compact_closed_segments(
-    _dir: impl AsRef<Path>,
-    _keep_raw: u32,
-    _level: i32,
+    dir: impl AsRef<Path>,
+    keep_raw: u32,
+    level: i32,
 ) -> io::Result<Vec<CompactionReport>> {
-    todo!("M-08 task 15 (engine-dev): отбор закрытых сегментов + compact_segment по каждому")
+    let dir = dir.as_ref();
+    let all = segments(dir)?;
+    if all.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Активный = сегмент с МАКСИМАЛЬНЫМ индексом. Сегменты с .jrnl.zst УЖЕ сжаты
+    // (повторно не сжимаем: `compact_segment` идемпотентен, но фильтруем заранее —
+    // экономим sha256/распаковку).
+    let active_idx = all.iter().map(|s| s.index).max();
+    let mut closed: Vec<&SegmentInfo> = all
+        .iter()
+        .filter(|s| Some(s.index) != active_idx)
+        .filter(|s| {
+            !s.path
+                .file_name()
+                .and_then(OsStr::to_str)
+                .is_some_and(is_compacted_name)
+        })
+        .collect();
+    // Последние `keep_raw` (по индексу, ASC) — защищены.
+    closed.sort_by_key(|s| s.index);
+    let keep_raw = keep_raw as usize;
+    let split = closed.len().saturating_sub(keep_raw);
+    let to_compact: Vec<&SegmentInfo> = closed[..split].to_vec();
+
+    let mut reports = Vec::with_capacity(to_compact.len());
+    for s in to_compact {
+        reports.push(compact_segment(s, level)?);
+    }
+    Ok(reports)
+}
+
+// ── Внутренние helpers компакции ────────────────────────────────────────────────────
+
+/// Сжать `src` → `tmp` через zstd с указанным уровнем. Не fsync, не удаляет src.
+/// На ошибке `tmp` может быть частично записан — вызывающий удаляет.
+fn compress_to_tmp(src: &Path, tmp: &Path, level: i32) -> io::Result<()> {
+    let mut src_f = File::open(src)?;
+    let tmp_f = File::create(tmp)?;
+    // zstd::Encoder оборачивает Write; при drop() finish() делается автоматически.
+    let mut encoder = zstd::Encoder::new(tmp_f, level)?;
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = src_f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        encoder.write_all(&buf[..n])?;
+    }
+    encoder.finish()?;
+    Ok(())
+}
+
+/// sha256 распакованного потока из .zst файла. Используется для верификации, что
+/// сжатие/распаковка — round-trip с потерей нулевых байт (для zstd это гарантия формата,
+/// но в коде могли быть баги; сверяем).
+fn sha256_decompressed(path: &Path) -> io::Result<String> {
+    let f = File::open(path)?;
+    let decoder = open_compacted_reader(f)?;
+    let mut reader = BufReader::with_capacity(64 * 1024, decoder);
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("sha256:{:x}", hasher.finalize()))
 }
