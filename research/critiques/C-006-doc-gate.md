@@ -196,3 +196,121 @@ High. I read the audited commits, `gates.md`, `commit-discipline.md`, `branch-hy
 - The priority "data safety net before money path" is technically coherent, but only after the acceptance gates above are made executable.
 
 === END HANDOFF ===
+
+---
+
+## Re-audit (rev 3) - 2026-07-14T13:39Z
+
+**Audited repair range:** `191d5ef..6fd3081`  
+**Audited HEAD:** `6fd3081` - `docs(doc-gate): C-006 rev2 - SESSION-HANDOFF мимо P2.5, механический барьер артефактов, класс B`  
+**Worktree note:** local `docs/doc-gate` was occupied by an older dirty worktree, so this audit was performed on `critic-docgate-r3` created from `origin/docs/doc-gate` at the requested HEAD.  
+**Audit-trail note:** this branch contains the original C-006 verdict but not the previously local rev2 section commit `88318f9`; rev3 therefore restates the rev2 blockers by substance.
+
+## Rev 3 Verdict
+
+**REJECT remains.**
+
+The routing repair in `docs/SESSION-HANDOFF.md` is materially correct, and founder priorities were not reordered. The remaining blocker is the mechanical barrier: as implemented, it does not catch the exact protected-artifact loss class it was introduced to prevent.
+
+## Rev 3 Checks
+
+**1. SESSION-HANDOFF routing - CLOSED.**
+
+`docs/SESSION-HANDOFF.md:101-137` now explicitly says not to dispatch `risk / killswitch / oms / runner / testnet`, states that the old `M-08 = risk + killswitch + oms` wording is obsolete, and points the active queue to `BACKLOG` + `DESIGN` §10. It also surfaces founder ★ decisions for P2.5 and the HL-depth fork. A fresh agent reading the active handoff should not enter the trading stack before P2.5.
+
+Residual notes:
+- `docs/SESSION-HANDOFF.md:139-156` keeps the old text under an explicit archive heading; acceptable.
+- Stale FA numbering remains in module docs: `docs/fa/risk.md`, `docs/fa/oms.md`, `docs/fa/alpha.md`, `docs/fa/portfolio.md`, `docs/fa/strategy.md`, and `docs/fa/venues.md` still contain old `P3 (M-05)`, `M-05/M-06`, or `48ч testnet-MM` wording without the historical warning now added to `docs/fa/killswitch.md`. This no longer routes the next agent past P2.5, but it can mislead later module dispatch. Treat as NOTE: apply the same "historical numbering, BACKLOG is current" note before any risk/oms/runner milestone handoff.
+
+**2. Mechanical protected-artifact barrier - STILL BLOCKING.**
+
+Claimed mechanism: `scripts/check_protected_artifacts.sh` checks `git diff --name-status origin/main...HEAD` and rejects `D` under `research/critiques/*.md`, `milestones/*.md`, `docs/rfc/*`, unless any commit message in the range contains `ALLOW-ARTIFACT-DELETE:`.
+
+Probe results from a disposable worktree at `6fd3081`:
+- Clean branch: PASS, `exit=0`.
+- Delete an existing main-branch milestone (`milestones/M-05-data-foundation.md`): FAIL, `exit=1`. This case works.
+- Delete `research/critiques/C-006-doc-gate.md`: PASS, `exit=0`. This is the exact class of file the barrier was introduced to protect, and it is missed because the file is branch-local and absent from `origin/main`; add-then-delete inside the branch disappears from the final net diff.
+- Move `research/critiques/C-006-doc-gate.md` to `tmp/probe/C-006-doc-gate.md`: PASS, `exit=0`. This is a trivial namespace escape; final net diff only shows `A tmp/probe/...`.
+- Delete an existing milestone in one commit, then add an unrelated later commit with `ALLOW-ARTIFACT-DELETE:` in the body: PASS, `exit=0`. Override is range-wide, not tied to the deleting commit.
+- Delete `docs/contract-rfc/CT-RFC-01-market-data-expansion.md`: PASS, `exit=0`. The script protects `docs/rfc/*`, but the repo also has real RFCs under `docs/contract-rfc/*`.
+
+Why this blocks: the stated goal is to prevent silent loss of gate/milestone/RFC artifacts. A net diff against `origin/main...HEAD` is not enough; it misses branch-local add/delete, branch-local move-out, and any protected path not listed exactly.
+
+Required repair:
+- Compute `merge_base=$(git merge-base "$BASE" HEAD)` and inspect commit history over `"${merge_base}..HEAD"`, not only final net diff.
+- Fail per commit on `D` of protected paths.
+- Inspect renames with rename detection; allow protected -> protected rename, but fail protected -> unprotected move unless the same commit has an explicit override.
+- Include both `docs/rfc/*` and `docs/contract-rfc/*`, or define one canonical RFC path and migrate the other before enforcing.
+- Scope `ALLOW-ARTIFACT-DELETE:` to the same commit that deletes/moves the artifact, preferably with path/reason, not any commit in the range.
+- Keep CI as mandatory; pre-commit may be additive but is not sufficient.
+
+**3. Class B mirror - CLOSED.**
+
+`.claude/rules/commit-discipline.md:84-92` now mirrors the non-semantic class B boundary: status columns, close-out proofs, formatting, prose spelling only; semantic command/path/threshold/role/invariant/task/acceptance/cross-reference edits are class A.
+
+**4. Founder priorities - PASS.**
+
+The rev3 repair range does not touch `milestones/BACKLOG.md`, `docs/DESIGN.md`, or `docs/fa/ops.md`. P2.5 remains PROPOSED, the queue order is not rewritten, and the HL-depth / first-signal fork remains founder ★.
+
+## Rev 3 Required Repairs
+
+1. Replace the protected-artifacts check with a commit-history check that catches branch-local add/delete and protected -> unprotected rename.
+2. Protect the actual RFC paths present in this repo (`docs/rfc/*` and `docs/contract-rfc/*`, unless one is intentionally retired).
+3. Tie `ALLOW-ARTIFACT-DELETE:` to the deleting/moving commit, not to any later commit in the range.
+4. NOTE before later trading-stack dispatch: add the same historical-numbering warning from `docs/fa/killswitch.md` to stale `risk`/`oms`/`alpha`/`portfolio`/`strategy`/`venues` FA sections.
+
+## Rev 3 Confidence
+
+High. I read the repair diff, `SESSION-HANDOFF`, `commit-discipline`, `gates`, `ci.yml`, `check_protected_artifacts.sh`, `killswitch` FA, and repo-wide P2.5/P3/M-05/M-06 references. I also executed the protected-artifacts script against clean, delete, rename-out, override, and real-RFC deletion probes.
+
+=== HANDOFF: critic -> architect ===
+
+## §A - Metadata
+- UTC datetime: 2026-07-14T13:39Z
+- Branch audited: `origin/docs/doc-gate` at `6fd3081`
+- Local verdict branch: `critic-docgate-r3`
+- Status: REJECT remains
+- Audited range: `191d5ef..6fd3081`
+
+## §B - What I checked
+- Rev2 blocker 1: active `SESSION-HANDOFF` routing past P2.5.
+- Rev2 blocker 2: mechanical protected-artifacts barrier, including deletion, rename/move-out, override, base behavior, and real RFC paths.
+- Class B mirror in `commit-discipline`.
+- Founder priority preservation in `BACKLOG`/`DESIGN`/P2.5.
+
+## §C - Outcome
+- `SESSION-HANDOFF` repair: accepted.
+- Class B mirror: accepted.
+- Founder priorities: unchanged.
+- Mechanical barrier: rejected. It misses branch-local verdict deletion and protected -> unprotected move-out, and does not protect `docs/contract-rfc/*`.
+
+## §D - Next Agent + Invocation
+- **Next agent:** architect, same C-006 doc-gate repair loop.
+- **After repair:** critic rev4 re-audit. If REJECT is lifted, hand off to reviewer to merge `docs/doc-gate` + `docs/td021-rules`, then founder ★ for P2.5 / queue / HL fork.
+- **Paste-ready prompt for architect:**
+  ```
+  Ты — architect on docs/doc-gate. Same C-006 doc-gate repair loop, not a new gate.
+
+  Read `research/critiques/C-006-doc-gate.md` section "Re-audit (rev 3)".
+  Repair only the remaining blocker: protected-artifacts CI.
+
+  Required:
+  1. Replace net-diff-only `git diff --name-status origin/main...HEAD` with commit-history inspection from merge-base to HEAD so branch-local add→delete is caught.
+  2. Fail protected -> unprotected rename/move-out; allow only protected -> protected rename without override.
+  3. Protect both `docs/rfc/*` and `docs/contract-rfc/*`, or explicitly migrate to one canonical path before enforcing.
+  4. Require `ALLOW-ARTIFACT-DELETE:` in the same commit that deletes/moves the artifact, not anywhere in the range.
+  5. Keep CI mandatory; pre-commit may be optional only.
+
+  Optional NOTE cleanup before later trading-stack dispatch:
+  add the same historical-numbering warning from `docs/fa/killswitch.md` to stale risk/oms/alpha/portfolio/strategy/venues FA sections.
+
+  Do not reorder founder priorities. Leave P2.5 and HL fork as founder ★.
+  Commit repairs, then hand back to critic for rev4 re-audit.
+  ```
+
+## §E - Risks / Open Questions
+- Three branches remain in flight: `docs/doc-gate`, `docs/td021-rules`, `feat/M-08-closeout`. Reviewer must merge in an order that does not lose `PROJECT-STATE`/`TECH-DEBT`.
+- TD-020 remains the only hard deadline pressure: about 40 days to disk-guard if retention is not wired.
+- Founder ★ still needed for P2.5 acceptance and HL-depth / first-live-signal fork.
+
+=== END HANDOFF ===
