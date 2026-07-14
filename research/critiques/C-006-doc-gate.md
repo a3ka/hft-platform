@@ -199,6 +199,134 @@ High. I read the audited commits, `gates.md`, `commit-discipline.md`, `branch-hy
 
 ---
 
+## Re-audit (rev 5) - 2026-07-14T16:07Z
+
+**Audited repair range:** `b13deb2..efe2ccc`
+**Expected/audited HEAD:** `efe2ccc` - `docs(doc-gate): C-006 rev4 - барьер ловит «злой мерж» (последний блокер)`
+**Worktree:** `/tmp/hft-critic-dg-r5`, local branch `critic-dg-r5` created from `origin/docs/doc-gate` after HEAD check.
+
+## Rev 5 Verdict
+
+**REJECT remains.**
+
+The original rev4 blocker is partially closed: a merge commit that deletes a protected file present in all parents now fails. Two merge-layer bypasses remain:
+
+1. A merge commit can move a protected file to an unprotected path and pass.
+2. `merge -s ours` can drop a protected artifact that exists only on the side branch and pass.
+
+Both are protected-artifact loss modes. They are not just theoretical because the next requested reviewer action is a merge of process/doc branches.
+
+## Rev 5 Probe Results
+
+Executed in disposable worktree `/tmp/hft-critic-dg-r5-probe` at `efe2ccc`.
+
+**Closed cases:**
+- Baseline audited branch: PASS, `exit=0`.
+- Rev4 scenario, merge commit deletes `milestones/M-05-data-foundation.md` while all parents retain it: FAIL, `exit=1`.
+- Octopus merge (3 parents) deletes same protected milestone while all parents retain it: FAIL, `exit=1`.
+- Side branch deletes protected milestone with same-commit `ALLOW-ARTIFACT-DELETE`, then merge: PASS, `exit=0`; no double FAIL.
+- Benign merge with no protected deletion: PASS, `exit=0`.
+- Protected -> protected rename in a merge (`docs/rfc/...` to another `docs/rfc/...`): PASS, `exit=0`.
+- Branch from another branch with no protected deletion: PASS, `exit=0`.
+- First normal commit after doc-gate with no protected deletion: PASS, `exit=0`.
+- Performance: branch with 120 additional empty commits ran in ~0.81s wall time; acceptable for CI.
+
+**Still open:**
+- Merge commit moves `milestones/M-05-data-foundation.md` to `tmp/probe/M-05-data-foundation.md`: PASS, `exit=0`. This is a protected -> unprotected rename inside a merge and should fail.
+- `merge -s ours` discards side-branch `research/critiques/probe-side-only.md`: PASS, `exit=0`. The side branch added a protected artifact; the merge commit omitted it; Layer B misses it because the path is not present in all parents.
+
+**Force-push assessment:**
+
+The script cannot fully detect a force-push that erases prior branch history. After rewrite, the old protected artifact addition/deletion may simply no longer exist in the commit graph available to CI. That is not repairable by this in-branch script alone; it requires branch protection / no-force-push discipline. This is a residual process risk, not the current blocker.
+
+## Why Layer B Is Still Too Narrow
+
+Current Layer B checks only paths deleted relative to the first parent and only treats the merge as malicious when the path exists in all parents. That catches common-file deletion, but misses two important cases:
+
+- `R*` rename status in a merge is ignored, so protected -> unprotected move-out is not treated as deletion.
+- Side-only protected artifacts are allowed to disappear in the merge result, especially with `-s ours`, because they do not exist in all parents.
+
+The protected-artifact invariant is about final artifact preservation, not just files common to all parents. If a protected path exists in any parent and is absent from the merge result and final HEAD, the merge needs either to preserve it, move it to another protected path, or carry same-commit `ALLOW-ARTIFACT-DELETE:`.
+
+## Rev 5 Required Repair
+
+1. In Layer B, compare the merge commit against every parent, not only the first parent.
+2. Use rename-aware status for merge diffs and apply the same rule as Layer A:
+   - protected -> protected rename: PASS.
+   - protected -> unprotected rename: FAIL unless same merge commit has `ALLOW-ARTIFACT-DELETE:`.
+3. Catch side-only protected artifacts dropped by merge result (`-s ours` case). A protected path present in any parent and absent in merge result/HEAD is loss unless it is accounted for by a same-commit override or a protected -> protected rename in the merge.
+4. Preserve already-good behavior: common-file merge delete FAIL; octopus common-file delete FAIL; side-branch legitimate delete with same-commit override PASS; benign merge PASS; 120+ commit performance remains acceptable.
+
+## Rev 5 Other Checks
+
+- Verdict trail: PASS. Original C-006, rev3, and rev4 sections are present. Branch history includes `00244ae`, `a61856d`, and `8a2fc89` for verdict commits.
+- Founder priorities: PASS. `b13deb2..efe2ccc` does not touch `milestones/BACKLOG.md`, `docs/DESIGN.md`, `docs/fa/ops.md`, `PROJECT-STATE.md`, or `TECH-DEBT.md`.
+- CI wiring: PASS. `protected-artifacts` remains in `status-check.needs`.
+
+## Rev 5 Process Note
+
+I still agree that `handoff-block.md` should make expected HEAD mandatory in §D, with receiving agents instructed to run `git log --oneline -1` and STOP on mismatch. This is class A process hardening and should not be smuggled in, but it directly addresses the stale-prompt failure mode observed twice in this cycle.
+
+## Rev 5 Confidence
+
+High. I read the repair diff and ran probes for common-file merge delete, octopus delete, merge rename-out, `-s ours` side artifact drop, side-branch legitimate override delete, benign merge, protected -> protected merge rename, branch-from-branch, first-commit branch, and 120-commit performance.
+
+=== HANDOFF: critic -> architect ===
+
+## §A - Metadata
+- UTC datetime: 2026-07-14T16:07Z
+- Branch audited: `origin/docs/doc-gate` at `efe2ccc`
+- Local verdict branch: `critic-dg-r5`
+- Status: REJECT remains
+- Audited range: `b13deb2..efe2ccc`
+
+## §B - What I Checked
+- The rev4 merge-commit blocker and required bypass/false-positive probes.
+- Verdict preservation.
+- Founder-priority non-drift.
+- CI protected-artifacts wiring.
+
+## §C - Outcome
+- Closed: common-file malicious merge delete, octopus common-file delete, same-commit override, benign merge, protected -> protected merge rename, performance.
+- Blocking: merge protected -> unprotected rename passes; `merge -s ours` can drop side-only protected artifacts.
+
+## §D - Next Agent + Invocation
+- **Next agent:** architect, same C-006 doc-gate repair loop.
+- **After repair:** critic rev6 re-audit. If REJECT is lifted, hand off to reviewer to merge `docs/td021-rules` then `docs/doc-gate`, then founder ★ for P2.5 / BACKLOG queue / HL-depth fork.
+- **Paste-ready prompt for architect:**
+  ```
+  Ты — architect on docs/doc-gate. Same C-006 doc-gate repair loop, not a new gate.
+
+  Expected HEAD before repair: efe2ccc. Run:
+  git fetch && git worktree add /tmp/hft-architect-dg-r6 origin/docs/doc-gate && cd /tmp/hft-architect-dg-r6
+  git log --oneline -1
+  If HEAD is not efe2ccc, STOP: prompt stale.
+
+  Read `research/critiques/C-006-doc-gate.md` section "Re-audit (rev 5)".
+  Repair only the remaining protected-artifacts merge-layer blockers:
+
+  Required:
+  1. Merge Layer B must detect protected -> unprotected rename/move-out in merge commits.
+  2. Merge Layer B must detect `merge -s ours` / side-only protected artifact drops: protected path exists in any parent, absent in merge result and HEAD.
+  3. Preserve accepted cases: common-file merge delete FAIL; octopus common-file delete FAIL; protected -> protected merge rename PASS; side-branch legitimate delete with same-commit override PASS; benign merge PASS; current Layer A behavior unchanged.
+  4. Keep CI mandatory and performance acceptable on 100+ commits.
+
+  Optional class A process follow-up remains separate unless you intentionally include it:
+  make expected HEAD mandatory in `handoff-block.md` §D.
+
+  Do not reorder founder priorities. Leave P2.5, BACKLOG order, and HL fork as founder ★.
+  Commit repairs, then hand back to critic for rev6 re-audit.
+  ```
+
+## §E - Risks / Open Questions
+- Force-push history erasure is not fully detectable by this script after the rewrite; needs branch protection/no-force-push policy.
+- TD-020 remains time-bound: about 40 days to disk-guard if retention delivery slips.
+- Founder ★ still pending: accept P2.5, confirm BACKLOG queue, decide HL-depth / first-live-signal fork.
+
+=== END HANDOFF ===
+
+---
+
 ## Re-audit (rev 4) - 2026-07-14T15:48Z
 
 **Audited repair range:** `6fd3081..b13deb2`
