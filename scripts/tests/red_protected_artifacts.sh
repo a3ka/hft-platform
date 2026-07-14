@@ -118,6 +118,57 @@ born-in-merge/side не подготовлен (add молча не прошёл
   return 1
 }
 
+# ── SETUP-GUARD для НЕ-merge сценариев (блокер rev11, critic) ─────────────────────────
+# Тот же класс: если scenario-defining команда (git mv / git rm+trailer / выбор base) молча не
+# сработала, сценарий проходит по ДРУГОЙ причине (P4 деградирует в «чистая ветка», P8/P9 — в
+# «обычное удаление»), а проба рапортует заявленное покрытие. Каждый сценарий доказывает форму.
+setup_renamed_within() { # $1=repo $2=старый-путь $3=новый-путь $4=before $5=имя
+  # старого нет на HEAD, новый ЕСТЬ на HEAD как файл, и переименование видно в диапазоне (статус R).
+  if git -C "$1" cat-file -e "HEAD:$2" 2>/dev/null; then
+    fail "$5 — SETUP НЕ СОСТОЯЛСЯ: старый путь $2 всё ещё на HEAD — переименование не случилось"; return 1
+  fi
+  if [ "$(head_mode "$1" "$3")" != "100644" ] && [ "$(head_mode "$1" "$3")" != "100755" ]; then
+    fail "$5 — SETUP НЕ СОСТОЯЛСЯ: новый путь $3 не файл на HEAD — переименование не случилось"; return 1
+  fi
+  if ! git -C "$1" log --diff-filter=R -M --name-status --format='' "$4"..HEAD \
+        | grep -qE "^R[0-9]*	${2}	${3}$"; then
+    fail "$5 — SETUP НЕ СОСТОЯЛСЯ: git не видит переименование $2 → $3 (статус R) в диапазоне — \
+проверялась бы просто чистая ветка, а не rename внутри защиты"; return 1
+  fi
+  return 0
+}
+setup_deleted_with_override() { # $1=repo $2=путь $3=before $4=имя
+  # артефакта нет на HEAD, и КОММИТ, удаливший его, сам несёт ALLOW-ARTIFACT-DELETE в теле.
+  if git -C "$1" cat-file -e "HEAD:$2" 2>/dev/null; then
+    fail "$4 — SETUP НЕ СОСТОЯЛСЯ: $2 всё ещё на HEAD — удаление не случилось, override нечего \
+подтверждать"; return 1
+  fi
+  local c; c=$(git -C "$1" log --diff-filter=D --format='%H' "$3"..HEAD -- "$2" | head -1)
+  if [ -z "${c}" ]; then
+    fail "$4 — SETUP НЕ СОСТОЯЛСЯ: ни один коммит диапазона не удалял $2"; return 1
+  fi
+  if ! git -C "$1" log -1 --format='%B' "${c}" | grep -q '^ALLOW-ARTIFACT-DELETE:'; then
+    fail "$4 — SETUP НЕ СОСТОЯЛСЯ: удаляющий коммит НЕ несёт ALLOW-ARTIFACT-DELETE — \
+проверялось бы обычное удаление, а не осознанный override"; return 1
+  fi
+  return 0
+}
+setup_base_is_zero() { # $1=аргумент-базы $2=имя → 0, если это zero-SHA
+  case "$1" in
+    *[!0]*) fail "$2 — SETUP НЕ СОСТОЯЛСЯ: база '$1' НЕ zero-SHA — отказ пришёл бы от обычного \
+удаления, а не от zero-SHA fail-closed"; return 1 ;;
+    "")     fail "$2 — SETUP НЕ СОСТОЯЛСЯ: база пуста, а не zero-SHA"; return 1 ;;
+    *) return 0 ;;
+  esac
+}
+setup_base_not_ancestor() { # $1=repo $2=аргумент-базы $3=имя → 0, если база НЕ предок HEAD
+  if git -C "$1" merge-base --is-ancestor "$2" HEAD 2>/dev/null; then
+    fail "$3 — SETUP НЕ СОСТОЯЛСЯ: база '${2:0:7}' ЯВЛЯЕТСЯ предком HEAD — отказ пришёл бы от \
+обычного удаления, а не от проверки «база не предок»"; return 1
+  fi
+  return 0
+}
+
 # ── P1: чистый push (артефакты не тронуты) — барьер обязан ПРОПУСТИТЬ ─────────────────
 r=$(new_repo); before=$(git -C "$r" rev-parse HEAD)
 echo "правка" >> "$r/src.rs"; git -C "$r" commit -qam "feat: обычная правка кода"
@@ -140,7 +191,9 @@ expect "P3 переезд артефакта из-под защиты ВАЛИТ
 r=$(new_repo); before=$(git -C "$r" rev-parse HEAD)
 git -C "$r" mv docs/rfc/CT-RFC-01.md docs/rfc/CT-RFC-01-renamed.md
 git -C "$r" commit -qm "docs: переименование RFC внутри защиты"
-expect "P4 переезд внутри защиты пропускается" ok "$(run_barrier "$r" push "$before")"
+if setup_renamed_within "$r" docs/rfc/CT-RFC-01.md docs/rfc/CT-RFC-01-renamed.md "$before" "P4"; then
+  expect "P4 переезд внутри защиты пропускается" ok "$(run_barrier "$r" push "$before")"
+fi
 
 # ── P5: осознанное удаление с override В ТЕЛЕ ТОГО ЖЕ коммита ─────────────────────────
 r=$(new_repo); before=$(git -C "$r" rev-parse HEAD)
@@ -148,7 +201,9 @@ git -C "$r" rm -q milestones/M-01.md
 git -C "$r" commit -qm "chore: удаляю милестоун
 
 ALLOW-ARTIFACT-DELETE: спека слита в M-02, согласовано founder'ом"
-expect "P5 ALLOW-ARTIFACT-DELETE в том же коммите пропускается" ok "$(run_barrier "$r" push "$before")"
+if setup_deleted_with_override "$r" milestones/M-01.md "$before" "P5"; then
+  expect "P5 ALLOW-ARTIFACT-DELETE в том же коммите пропускается" ok "$(run_barrier "$r" push "$before")"
+fi
 
 # ── P6: override в ЧУЖОМ коммите диапазона не легитимизирует удаление ─────────────────
 r=$(new_repo); before=$(git -C "$r" rev-parse HEAD)
@@ -173,13 +228,27 @@ fi
 # ── P8: fail-closed — zero-SHA before (создание ветки / force-push) ───────────────────
 # «Базы нет» НЕ ЗНАЧИТ «проверять нечего»: это значит, что мы не можем гарантировать целостность.
 r=$(new_repo); git -C "$r" rm -q research/critiques/C-001.md; git -C "$r" commit -qm "снос под видом новой ветки"
-expect "P8 zero-SHA база — fail-closed (не пропуск)" deny \
-  "$(run_barrier "$r" push "0000000000000000000000000000000000000000")"
+ZERO=0000000000000000000000000000000000000000
+if setup_base_is_zero "$ZERO" "P8"; then
+  expect "P8 zero-SHA база — fail-closed (не пропуск)" deny "$(run_barrier "$r" push "$ZERO")"
+fi
 
 # ── P9: fail-closed — база не предок HEAD (история переписана force-push'ем) ──────────
-r=$(new_repo); orphan=$(new_repo); alien=$(git -C "$orphan" rev-parse HEAD)
+r=$(new_repo)
+main_br=$(git -C "$r" branch --show-current)
+base_root=$(git -C "$r" rev-parse HEAD)
 git -C "$r" rm -q research/critiques/C-001.md; git -C "$r" commit -qm "снос при переписанной истории"
-expect "P9 база не предок HEAD — fail-closed" deny "$(run_barrier "$r" push "${alien}")"
+# Расходящийся СИБЛИНГ от корня В ТОМ ЖЕ репо: объект СУЩЕСТВУЕТ в объектной базе $r (иначе барьер
+# отклонил бы по ветке «объект отсутствует», а не «не предок»), но предком HEAD НЕ является
+# (у alt и HEAD общий предок base_root, но alt — параллельная ветка). Так P9 бьёт именно в
+# проверку «база не предок» (история переписана force-push'ем), а не в missing-object.
+git -C "$r" checkout -q -b alt "${base_root}"
+git -C "$r" commit -q --allow-empty -m "divergent (переписанная история)"
+alt=$(git -C "$r" rev-parse HEAD)
+git -C "$r" checkout -q "${main_br}"   # назад на ветку с удалением (её видит run_barrier)
+if setup_base_not_ancestor "$r" "${alt}" "P9"; then
+  expect "P9 база не предок HEAD — fail-closed" deny "$(run_barrier "$r" push "${alt}")"
+fi
 
 # ── P10: fail-closed — событие не задано (барьер зовут «как удобно», а не как CI) ─────
 r=$(new_repo)
