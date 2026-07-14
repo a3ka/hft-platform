@@ -125,15 +125,55 @@ else
   fi
   [ -x "${CRON_JOB}" ] || { d5=1; fail "D5 ${CRON_JOB} не исполняемый (chmod +x) — cron его не запустит"; }
 
-  # (5) ПОВЕДЕНИЕ, а не текст: при ненулевом exit'е бинаря задание ОБЯЗАНО поднять алерт и
-  #     пробросить код. Подставляем docker-стаб (exit=3 = disk_pressure) и смотрим на ФАКТ.
-  #     Молчащая уборка — это TD-020 на третьем витке: сбой, которого никто не увидел.
+  # (5) ГЛАВНОЕ: argv задания обязан принимать НАСТОЯЩИЙ бинарь.
+  #
+  # На проде задание упало именно здесь: скрипт передавал `--dir=/journal`, а парсер бинаря
+  # понимает только РАЗДЕЛЬНУЮ форму (`--dir /journal`). Прежняя редакция D5 этого не увидела,
+  # потому что подставляла СТАБ `docker`, глотавший любые аргументы — **застабила ровно тот
+  # контракт, который и ломался**. Стаб проверяет обвязку (алерт/exit), но НЕ контракт argv.
+  # Поэтому теперь: собираем настоящий `journal-retention` и скармливаем ему ТОТ argv, который
+  # задание реально отдаёт (единственный источник — сам скрипт, RETENTION_PRINT_ARGV=1).
+  # Дрейф между cron-скриптом и парсером после этого невозможен: он валит гейт.
   sandbox=$(mktemp -d)
-  mkdir -p "${sandbox}/bin" "${sandbox}/root"
-  printf '#!/bin/sh\nexit 3\n' > "${sandbox}/bin/docker"
-  chmod +x "${sandbox}/bin/docker"
+  mkdir -p "${sandbox}/journal" "${sandbox}/cold" "${sandbox}/root"
+
+  if cargo build -q -p journal --bin journal-retention 2>/dev/null; then
+    BIN="$(cargo metadata --format-version 1 --no-deps 2>/dev/null \
+            | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')/debug/journal-retention"
+    [ -x "${BIN}" ] || BIN="target/debug/journal-retention"
+
+    # argv берём ИЗ ЗАДАНИЯ (не переписываем руками — иначе гейт проверял бы свою фантазию).
+    mapfile -t job_argv < <(
+      RETENTION_PRINT_ARGV=1 \
+      RETENTION_JOURNAL_DIR="${sandbox}/journal" \
+      JOURNAL_COLD_DIR="${sandbox}/cold" \
+      RETENTION_MIN_FREE_GB=0 \
+      bash "${CRON_JOB}"
+    )
+
+    set +e
+    "${BIN}" "${job_argv[@]}" > "${sandbox}/real.out" 2>&1
+    rc_real=$?
+    set -e
+    if [ "${rc_real}" -ne 0 ]; then
+      d5=1
+      fail "D5 НАСТОЯЩИЙ бинарь ОТВЕРГ argv задания (exit=${rc_real}) — ровно так задание упало \
+на проде. argv: ${job_argv[*]}"
+      sed 's/^/      /' "${sandbox}/real.out" | head -5
+    else
+      pass "D5a настоящий journal-retention ПРИНИМАЕТ argv задания (dry-run отработал, exit=0)"
+    fi
+  else
+    d5=1
+    fail "D5 не собрался journal-retention — контракт argv проверить нечем (гейт не смеет молчать)"
+  fi
+
+  # (6) Обвязка: при ненулевом exit'е задание ОБЯЗАНО поднять алерт и пробросить код.
+  #     Здесь стаб уместен — мы проверяем реакцию НА сбой, а не контракт argv (его проверил (5)).
+  printf '#!/bin/sh\nexit 3\n' > "${sandbox}/fake-runner"
+  chmod +x "${sandbox}/fake-runner"
   set +e
-  PATH="${sandbox}/bin:${PATH}" \
+  RETENTION_RUNNER="${sandbox}/fake-runner" \
     HFT_ROOT="${sandbox}/root" \
     RETENTION_LOG="${sandbox}/retention.log" \
     RETENTION_ALERT_FILE="${sandbox}/retention.alert" \
@@ -142,7 +182,7 @@ else
   set -e
   if [ "${rc_stub}" -ne 3 ]; then
     d5=1
-    fail "D5 задание НЕ пробрасывает exit бинаря (стаб вернул 3, задание — ${rc_stub}); \
+    fail "D5 задание НЕ пробрасывает exit (раннер вернул 3, задание — ${rc_stub}); \
 cron/монитор не узнают о disk_pressure"
   fi
   if [ ! -s "${sandbox}/retention.alert" ]; then

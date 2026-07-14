@@ -12,7 +12,21 @@
 # прогон со стабом) и где нет ограничений cron-парсера (`%`, переносы, длина).
 set -uo pipefail
 
+# ⚠ ФОРМА АРГУМЕНТОВ — РАЗДЕЛЬНАЯ (`--dir X`), НЕ `--dir=X`.
+# На проде задание упало именно на этом: парсер бинаря (`journal-retention`) сравнивает аргумент
+# ЦЕЛИКОМ (`match arg { "--dir" => ... }`) и берёт значение СЛЕДУЮЩИМ элементом argv, т.е.
+# `--dir=/journal` для него — неизвестный флаг. Сбивает с толку то, что `--help` самого бинаря
+# печатает `=`-форму (это его дефект, заведён отдельной задачей) — но контракт argv определяет
+# ПАРСЕР, а не текст справки. Оракул D5 этого не поймал, потому что подставлял стаб `docker`,
+# который глотал любые аргументы: **застабил ровно тот контракт, который и ломался**.
+# Теперь D5 гоняет НАСТОЯЩИЙ бинарь с ЭТИМ argv (см. RETENTION_RUNNER ниже) — дрейф между
+# скриптом и парсером больше не может пройти незамеченным.
 HFT_ROOT="${HFT_ROOT:-/root/hft-platform}"
+# Шов для гейта: по умолчанию — прод-путь (compose), но оракул подставляет сюда прямой бинарь,
+# чтобы проверить argv ПО-НАСТОЯЩЕМУ, а не против стаба.
+RETENTION_RUNNER="${RETENTION_RUNNER:-docker compose run --rm journal-retention}"
+# Каталог журнала ВНУТРИ контейнера (в тесте — временный каталог на хосте).
+RETENTION_JOURNAL_DIR="${RETENTION_JOURNAL_DIR:-/journal}"
 JOURNAL_COLD_DIR="${JOURNAL_COLD_DIR:-/mnt/journal-cold}"
 RETENTION_RETAIN_DAYS="${RETENTION_RETAIN_DAYS:-14}"
 RETENTION_KEEP_MIN="${RETENTION_KEEP_MIN:-4}"
@@ -34,16 +48,29 @@ alert() { # exit≠0 обязан быть ВИДЕН: молчащая убор
   echo "ALERT ${msg}" >&2
 }
 
+# Argv — РАЗДЕЛЬНОЙ формой (см. шапку). Единственное место, где он определён: и прод, и гейт
+# берут его отсюда, поэтому разъехаться они не могут.
+ARGV=(
+  --dir "${RETENTION_JOURNAL_DIR}"
+  --cold "${JOURNAL_COLD_DIR}"
+  --retain-days "${RETENTION_RETAIN_DAYS}"
+  --keep-min "${RETENTION_KEEP_MIN}"
+  --min-free-gb "${RETENTION_MIN_FREE_GB}"
+  --mode "${RETENTION_MODE}"
+)
+
+# Печать argv — ДО любых side-эффектов (cd/mkdir): контракт argv не зависит от того, где мы
+# и существует ли прод-каталог. Иначе гейт не смог бы его прочитать (и не прочитал — первая
+# попытка вернула пустой argv, потому что скрипт падал на `cd` раньше печати).
+if [ "${RETENTION_PRINT_ARGV:-0}" = "1" ]; then
+  printf '%s\n' "${ARGV[@]}"
+  exit 0
+fi
+
 cd "${HFT_ROOT}" 2>/dev/null || { alert "journal-retention: нет каталога ${HFT_ROOT}"; exit 1; }
 
-docker compose run --rm journal-retention \
-  --dir=/journal \
-  --cold="${JOURNAL_COLD_DIR}" \
-  --retain-days="${RETENTION_RETAIN_DAYS}" \
-  --keep-min="${RETENTION_KEEP_MIN}" \
-  --min-free-gb="${RETENTION_MIN_FREE_GB}" \
-  --mode="${RETENTION_MODE}" \
-  >> "${LOG}" 2>&1
+# shellcheck disable=SC2086 — RETENTION_RUNNER намеренно расщепляется на слова (это команда).
+${RETENTION_RUNNER} "${ARGV[@]}" >> "${LOG}" 2>&1
 rc=$?
 
 if [ "${rc}" -ne 0 ]; then
