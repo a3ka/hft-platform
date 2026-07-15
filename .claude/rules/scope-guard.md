@@ -9,9 +9,9 @@
 |---|---|---|
 | **architect** (Fable) | `docs/`, `contracts/` T1-типы (только через contract-RFC, `.claude/rules/gates.md`), `*/tests/` (RED-спеки), `scripts/verify_*.sh`, `milestones/M-NN-*.md` | ЛЮБОЙ impl-код (`crates/*/src/`, `research/*/src/`), билд-конфиги (`Cargo.toml` deps секции) |
 | **signal-engineer** | ТОЛЬКО `crates/signals/**` + `research/specs/`, `research/hypotheses/` (по назначению) | `journal/venues/book/oms/risk/killswitch/portfolio/strategy` — запрещены безусловно (граница A, `docs/03-integration-contract.md` §4) |
-| **engine-dev** (journal/book/oms/sim/runner/alpha/portfolio/strategy) | `crates/{journal,book,oms,sim,runner,alpha,portfolio,strategy}/src/**` (impl, НЕ типы) | `crates/risk/`, `crates/killswitch/`, `crates/contracts/` (T1), другие крейты вне своего списка |
-| **venue-dev** | `crates/venue-*/src/**` (адаптеры бирж) | всё вне `venue-*`; `risk`/`killswitch` |
-| **research-dev** | `crates/research-cli/src/**`, `research/reports/` (генерация) | `crates/{risk,killswitch,journal,oms}`, `research/trials-ledger.json` (append-only механизм — не ручная правка) |
+| **engine-dev** (journal/book/oms/sim/runner/alpha/portfolio/strategy/**ops**) | `crates/{journal,book,oms,sim,runner,alpha,portfolio,strategy,ops}/src/**` (impl, НЕ типы) + `deploy/**` (ops/деплой-механика: cron, Dockerfile, compose, метрики-scrape — НЕ секреты) | `crates/risk/`, `crates/killswitch/`, `crates/contracts/` (T1), другие крейты вне своего списка |
+| **venue-dev** | `crates/venue-*/src/**` (адаптеры бирж; вкл. recon REST-fetch M-09 — **MD-only**, без order-egress) | всё вне `venue-*`; `risk`/`killswitch` |
+| **research-dev** | `crates/research-cli/src/**`, `research/reports/`, `research/data-quality/**` (генерация: gap-статистика + recon-сводки, офлайн-агрегация журнала) | `crates/{risk,killswitch,journal,oms}`, `research/trials-ledger.json` (append-only механизм — не ручная правка) |
 | **risk-critic** | ТОЛЬКО `research/critiques/*.md` (вердикт-файлы) | ничего в коде; не пишет milestone'ы |
 | **critic** | ТОЛЬКО `research/critiques/` verdict-файлы (не milestone'ы) | `crates/`, `docs/`, `research/registry/` |
 | **tester** | read-only на код; отчёт в чат/handoff | никаких правок кода |

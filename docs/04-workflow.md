@@ -18,7 +18,7 @@ STATUS: DESIGN v1 (2026-07-10, Fable). Это «как мы строим пла�
 |---|---|---|---|
 | **architect** | Fable (дорого — экономно) | `docs/`, `contracts/` типы, `*/tests/` (RED-спеки), `scripts/verify_*.sh`, milestone-файлы | архитектура, T-контракты, RED-тесты, acceptance-скрипты, milestone'ы. **НИКОГДА не пишет impl-код** |
 | **critic** | средняя (Codex/дешёвая) | `research/critiques/`, verdict-файлы (не milestone'ы) | plan-time гейт: аудит закоммиченного набора артефактов milestone'а ДО dev |
-| **engine-dev** | кодовая дешёвая | `crates/{journal,book,oms,sim,runner,alpha,portfolio,strategy}/src` | impl движка по milestone'у + RED-тестам |
+| **engine-dev** | кодовая дешёвая | `crates/{journal,book,oms,sim,runner,alpha,portfolio,strategy,ops}/src` + `deploy/**` (ops/деплой-механика) | impl движка + слой наблюдаемости (`ops`: метрики/recon-компаратор/алерты, MD-only) по milestone'у + RED |
 | **venue-dev** | кодовая дешёвая | `crates/venue-*/src` | адаптеры бирж (HL→Binance) |
 | **signal-engineer** | кодовая средняя | `crates/signals/src`, `research/specs` | сигналы (SignalSpec→код) — квант-деск, граница A |
 | **research-dev** | дешёвая | `crates/research-cli/src` | грид/walk-forward/отчёты |

@@ -33,17 +33,24 @@ recon-дизайном FA §4 и уточняется на critic-аудите �
 
 ## Allowed / Forbidden paths (scope-guard)
 
-**Allowed (по задачам):**
-- `contracts/` T1 — ТОЛЬКО через CT-RFC-03 (architect, atomic RFC).
-- новый крейт `crates/ops/**` (метрики + recon-оркестратор + правила алертов) — вводится этим
-  milestone'ом (триггер critic §1.4).
-- `crates/venue-*/src/**` — recon-путь читает REST-снапшот (venue-dev; MD-only, но добавляет
+Роли — под ОБНОВЛЁННЫЙ `scope-guard.md` (C-007 C3/C4: без нового agent-профиля, явные carve-out'ы
+существующим ролям):
+
+- `contracts/` T1 — ТОЛЬКО через CT-RFC-03 (**architect**, atomic RFC).
+- новый крейт `crates/ops/**` (метрики + recon-оркестратор-компаратор + правила алертов) —
+  вводится этим milestone'ом (триггер critic §1.4). Владелец — **engine-dev** (scope-guard
+  carve-out; ops — слой наблюдаемости, MD-only, НЕ risk/killswitch/oms).
+- `crates/venue-*/src/**` — recon **REST-fetch** снапшота (**venue-dev**; MD-only, добавляет
   order-НЕзависимый REST-трафик → OPS-I-9 обязателен).
-- `deploy/**` (бэкап cold-copy + restore-drill + `/metrics` scrape) — ops-механика.
-- `*/tests/**` (OPS-I-* RED, sacred), `scripts/verify_M-09.sh` — architect.
+- `deploy/**` (бэкап cold-copy + restore-drill + `/metrics` scrape) — **engine-dev**
+  (деплой-механика, scope-guard carve-out; не секреты).
+- `research/data-quality/**` (офлайн-сводка recon-расхождений + gap-статистика, агрегация журнала)
+  — **research-dev** (scope-guard; ТА ЖЕ роль/путь, что уже пишет gap-статистику).
+- `*/tests/**` (OPS-I-* RED, sacred), `scripts/verify_M-09.sh` — **architect**.
 
 **Forbidden:** `crates/risk|killswitch|oms` (не эта фаза); order-egress в venue-* (recon — только
-чтение REST); ручная правка `research/registry/signals.json`.
+чтение REST); запись рантаймом в `research/data-quality/` (это офлайн-агрегация — рантайм пишет
+`Sys`-событие в журнал + живые метрики, OPS-I-6); ручная правка `research/registry/signals.json`.
 
 ## §Tasks (план; RED-оракулы пишутся ПОСЛЕ critic+FA-приёмки)
 
@@ -51,9 +58,9 @@ recon-дизайном FA §4 и уточняется на critic-аудите �
 |---|---|---|---|---|
 | 0 | ⏳ | **FA-приёмка (ПРЕДУСЛОВИЕ):** `docs/fa/ops.md` PROPOSED → ACTIVE через doc-гейт | critic → reviewer → founder ★ | вердикт critic + founder-подпись; STATUS ACTIVE |
 | 1 | ⏳ | **CT-RFC-03 (T1, БЛОКИРУЮЩАЯ):** вариант `SysEvent::ReconDivergence`/`Resync` (форма — по FA §4) + JSON Schema + фикстуры + `CT-I-6`/RFC-RED; аддитивность CT-I-3 | architect | workspace компилируется; roundtrip старых журналов; RFC-RED падает на заглушке |
-| 2 | ⏳ | **Recon (OPS-I-1 + OPS-I-9):** периодический REST-снапшот vs локальная книга; расхождение > `ε` → алерт + ресинк + `Sys`-событие; **rate-budget/backoff** (honor 418/429/`Retry-After`, cap, запрет ресинк-штормов — прямой урок TD-013) | venue-dev + ops | RED: (а) `ε_test` — инъецированная порча книги (удалённый/искажённый уровень, расхождение best) ОБЯЗАНА поднять алерт; (б) OPS-I-9 — инъецированный поток REST-ошибок НЕ даёт hot-loop |
-| 3 | ⏳ | **Сохранность (OPS-I-2/3):** cold-copy журнала offsite (Storage Box) + **restore-drill** (скачать→прочитать `journal::stream`, `seq` непрерывен) — на РЕАЛЬНОМ сегменте, legacy-0 первым | ops | RED/§8: restore-drill на реальном сегменте (не фикстуре); удаление горячей копии — только через `ColdCopyProof` |
-| 4 | ⏳ | **Метрики+алерты (OPS-I-4..8):** `/metrics` (Prometheus text; recorder+venue+journal) + правила P0/P1/P2; **двусторонний паритет OPS-I-5** (каждый класс §7.1 → ≥1 правило; каждое правило → существующая метрика; CI в ОБЕ стороны); тишина потока (OPS-I-8); метрики НЕ в журнал (OPS-I-6), не в горячем пути (OPS-I-7) | ops | RED: grep-канарейка на каждую метрику §3; CI-скрипт паритета валит и «правило без метрики», и «класс без правила» |
+| 2 | ⏳ | **Recon (OPS-I-1 + OPS-I-9):** периодический REST-снапшот vs локальная книга; расхождение > `ε` → алерт + ресинк + `Sys`-событие; **rate-budget/backoff** (honor 418/429/`Retry-After`, cap, запрет ресинк-штормов — прямой урок TD-013) | venue-dev (REST) + engine-dev (ops) | RED: (а) `ε_test` — инъецированная порча книги (удалённый/искажённый уровень, расхождение best) ОБЯЗАНА поднять алерт; (б) OPS-I-9 — инъецированный поток REST-ошибок НЕ даёт hot-loop |
+| 3 | ⏳ | **Сохранность (OPS-I-2/3):** cold-copy журнала offsite (Storage Box) + **restore-drill** (скачать→прочитать `journal::stream`, `seq` непрерывен) — на РЕАЛЬНОМ сегменте, legacy-0 первым | engine-dev | RED/§8: restore-drill на реальном сегменте (не фикстуре); удаление горячей копии — только через `ColdCopyProof` |
+| 4 | ⏳ | **Метрики+алерты (OPS-I-4..8):** `/metrics` (Prometheus text; recorder+venue+journal) + правила P0/P1/P2; **двусторонний паритет OPS-I-5** (каждый класс §7.1 → ≥1 правило; каждое правило → существующая метрика; CI в ОБЕ стороны); тишина потока (OPS-I-8); метрики НЕ в журнал (OPS-I-6), не в горячем пути (OPS-I-7) | engine-dev | RED: grep-канарейка на каждую метрику §3; CI-скрипт паритета валит и «правило без метрики», и «класс без правила» |
 | 5 | ⏳ | `scripts/verify_M-09.sh` — ≥1 проверка на задачу; финальный `VERDICT` | architect | exit=0 на GREEN |
 | 6 | ⏳ | tester clean-checkout + reviewer §8 (прод НЕ инертен: recon реально шлёт REST и пишет `Sys` при инъекции; `/metrics` отдаёт) | tester/reviewer | Done Block + §8 пруф |
 
@@ -87,4 +94,4 @@ recon-дизайном FA §4 и уточняется на critic-аудите �
 ## Handoff (план)
 
 FA-приёмка (critic → reviewer → founder ★) → CT-RFC-03 (architect + critic) → RED-оракулы
-(architect по OPS-I-*) → dev (venue-dev recon / ops метрики+бэкап) → tester → reviewer §8.
+(architect по OPS-I-*) → dev (venue-dev REST-fetch + engine-dev ops-компаратор/метрики/бэкап; research-dev data-quality) → tester → reviewer §8.
