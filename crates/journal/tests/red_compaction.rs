@@ -12,6 +12,7 @@
 //! `ColdCopyProof`). Данные незаменимы; «сжали и удалили, а там мусор» недопустимо.
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::io::Write;
 use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 
 use contracts::{DataSource, EventKind, Level, MdPayload, Venue};
@@ -430,5 +431,153 @@ fn c9_corrupt_zst_never_deletes_raw() {
         all_events(dir.path()).len(),
         n_before,
         "при битой копии прод-путь обязан читать СЫРОЙ сегмент (D-COMP-1: raw побеждает)"
+    );
+}
+
+// ═══ LEGACY-БЕЗОПАСНОСТЬ КОМПАКЦИИ (rev 10; CRITICAL, §8 eyes-on поймал на VPS) ═══════════
+//
+// Дефект, который прошёл C1–C9 и весь код-гейт reviewer'а, но был пойман §8 на проде:
+// `compact_closed_segments` жмёт СТАРЕЙШИЕ закрытые сегменты первыми (to_compact =
+// closed[..len-keep_raw]). На проде `segment-00000000.jrnl` — **15 GB LEGACY** (без v2-магии
+// HFTJRN02, задекларирован в journal.legacy.json — невосполнимая история). `compact_segment`
+// его СЖИМАЕТ (sha256 сырых байт == sha256 распаковки → сверка проходит → ОРИГИНАЛ УДАЛЯЕТСЯ),
+// но обратное чтение `.zst` идёт через `skip_v2_header_forward`, который ТРЕБУЕТ v2-магию
+// («legacy под zstd не бывает») → `CorruptHeader` → `segments()`/`list_segments`/`stream`
+// падают на первом классифае ⇒ ВЕСЬ ЖУРНАЛ НЕЧИТАЕМ, 15 GB стёрты.
+//
+// Почему C1–C9 не поймали: их фикстуры строят ТОЛЬКО v2 через `Journal::open_with` — прод-
+// раскладка (legacy-0 + v2-закрытые + активный) не покрыта. Ровно дефект фикстуры по
+// `.claude/rules/testing.md` (чек-лист 2026-07-14, п.5 «прод-масштаб/прод-раскладка» + п.3
+// «деградированный вход»): счастливый путь был идеальным, а прод — нет.
+//
+// КОНТРАКТ (architect, D-COMP-4): компакция НИКОГДА не трогает сегмент без v2-магии.
+// `compact_segment` обязан вернуть `Err` на сегменте, чьи первые байты != SEGMENT_MAGIC,
+// ДО любой мутации (конструктивный барьер — тот же принцип, что «активный не сжимаем»).
+// Legacy читается только как есть; сжатие legacy архитектурно запрещено.
+
+/// Записать LEGACY-сегмент `segment-00000000.jrnl` — байт-в-байт как боевой на VPS: postcard-
+/// фреймы + crc32, БЕЗ v2-заголовка/магии. Плюс `journal.meta`, чтобы писатель продолжил seq.
+fn write_legacy_seg0(dir: &std::path::Path, n: u64) {
+    let path = dir.join("segment-00000000.jrnl");
+    let f = std::fs::File::create(&path).expect("create legacy");
+    let mut w = std::io::BufWriter::new(f);
+    for seq in 0..n {
+        let ev = contracts::Event {
+            seq,
+            ts_mono_ns: seq,
+            ts_wall_ms: 1_752_000_000_000 + seq as i64,
+            kind: EventKind::md(
+                Venue::Binance,
+                "BTCUSDT",
+                MdPayload::Trade {
+                    price: 6_400_000_000_000 + seq as i64,
+                    size: 100,
+                    side: if seq % 2 == 0 {
+                        contracts::Side::Buy
+                    } else {
+                        contracts::Side::Sell
+                    },
+                    ts_exch_ms: 1_752_000_000_000 + seq as i64,
+                },
+            ),
+        };
+        let payload = postcard::to_stdvec(&ev).expect("ser");
+        w.write_all(&(payload.len() as u32).to_le_bytes()).unwrap();
+        w.write_all(&payload).unwrap();
+        w.write_all(&crc32fast::hash(&payload).to_le_bytes())
+            .unwrap();
+    }
+    w.flush().unwrap();
+    std::fs::write(dir.join("journal.meta"), n.to_le_bytes()).expect("meta");
+}
+
+/// Задекларировать legacy-сегмент в манифесте (операторская процедура; на VPS так и сделано).
+fn declare_seg0(dir: &std::path::Path) {
+    let file = "segment-00000000.jrnl";
+    let fp = journal::fingerprint(&dir.join(file)).expect("fingerprint");
+    let size = std::fs::metadata(dir.join(file)).expect("meta").len();
+    let m = contracts::LegacyManifest {
+        declarations: vec![contracts::LegacySegmentDecl {
+            file_name: file.to_string(),
+            fingerprint_sha256: fp,
+            size_bytes_at_decl: size,
+            source: DataSource::OwnCapture,
+            provenance: "declared legacy fixture (prod-layout)".to_string(),
+            epoch_id: "own-legacy".to_string(),
+        }],
+    };
+    std::fs::write(
+        dir.join(journal::LEGACY_MANIFEST),
+        serde_json::to_vec_pretty(&m).expect("ser"),
+    )
+    .expect("write manifest");
+}
+
+/// C10 (D-COMP-4, CRITICAL): компакция НИКОГДА не сжимает legacy-сегмент.
+/// Прод-раскладка: legacy-0 (declared) + v2-закрытые + v2-активный. Текущая реализация жмёт
+/// legacy-0 (старейший, keep_raw его не защищает) → `.zst` нечитаем → журнал уничтожен.
+#[test]
+fn c10_compaction_never_touches_legacy_segment() {
+    let dir = tempfile::tempdir().expect("dir");
+
+    // (1) legacy-0 как на проде: без магии, задекларирован.
+    let n_legacy = 500u64;
+    write_legacy_seg0(dir.path(), n_legacy);
+    declare_seg0(dir.path());
+
+    // (2) поверх — v2-сегменты (писатель стартует на каталоге с legacy-0 → пишет segment-1+,
+    //     T7c: legacy байт-в-байт не трогается). Малый max_segment_bytes → ротация в активный.
+    {
+        let mut j = Journal::open_with(dir.path(), cfg(96 * 1024)).expect("open_with");
+        for i in 0..3_000 {
+            j.append(snapshot(i)).expect("append");
+        }
+        j.flush().expect("flush");
+    }
+
+    // ПРЕДУСЛОВИЕ (фикстура обязана дать РОВНО прод-раскладку, иначе тест бессмыслен —
+    // урок: несостоявшийся setup не должен молча пройти).
+    let segs = journal::list_segments(dir.path()).expect("list_segments");
+    assert!(
+        segs.iter().any(|s| s.index == 0),
+        "фикстура: legacy-0 не в списке сегментов"
+    );
+    assert!(
+        segs.iter().filter(|s| s.index > 0).count() >= 2,
+        "фикстура: нужны хотя бы один v2-закрытый + v2-активный сверх legacy-0"
+    );
+    let before = all_events(dir.path());
+    assert_eq!(
+        before.len() as u64,
+        n_legacy + 3_000,
+        "предусловие: до компакции журнал читается целиком (legacy + v2)"
+    );
+    let legacy_path = dir.path().join("segment-00000000.jrnl");
+    assert!(legacy_path.exists(), "фикстура: legacy-0 файла нет");
+
+    // (3) РЕАЛЬНАЯ компакция, как её вызовет cron (keep_raw=1 → to_compact включает legacy-0).
+    let _ = journal::compact_closed_segments(dir.path(), 1, DEFAULT_COMPACT_LEVEL);
+
+    // (4) ГЛАВНОЕ: legacy НЕ тронут и журнал по-прежнему ЧИТАЕТСЯ ЦЕЛИКОМ.
+    assert!(
+        legacy_path.exists(),
+        "legacy-сегмент УДАЛЁН компакцией — 15 GB невосполнимой истории стёрты (§8 CRITICAL)"
+    );
+    assert!(
+        !dir.path().join("segment-00000000.jrnl.zst").exists(),
+        "legacy сжат в .zst — он читается через skip_v2_header_forward, который требует v2-магию \
+         ⇒ CorruptHeader ⇒ ВЕСЬ журнал нечитаем"
+    );
+    let after = all_events(dir.path());
+    assert_eq!(
+        after.len(),
+        before.len(),
+        "после компакции журнал отдал {} событий вместо {} — legacy-путь испорчен, история потеряна",
+        after.len(),
+        before.len()
+    );
+    assert_eq!(
+        after, before,
+        "поток событий изменился — порча/потеря первичных данных"
     );
 }
