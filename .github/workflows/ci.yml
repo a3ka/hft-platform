@@ -44,14 +44,37 @@ jobs:
           HFT_DELIVERY_DEEP: "1"
         run: bash scripts/verify_delivery_M-08.sh
 
+  protected-artifacts:
+    name: Protected artifacts (gate trail)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # База сравнения приходит ИЗ СОБЫТИЯ, а не из origin/main: на push-событии checkout
+      # ставит origin/main на только что запушенный коммит ⇒ диапазон пуст ⇒ гейт был бы
+      # зелёным ВСЕГДА (блокер B1). Пустая/zero/переписанная база → барьер fail-closed.
+      - name: Коммит не смеет удалять вердикты критика / милестоуны / RFC
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: bash scripts/check_protected_artifacts.sh
+
+      # Сам барьер обязан быть проверен ТОЙ ЖЕ проводкой, какой его зовёт CI (иначе гейт,
+      # проверенный не тем вызовом, — не проверен). 17 сценариев: удаление, rename-out,
+      # evil merge, merge-born, подмена типа (каталог/симлинк), усечение в 0 байт, fail-closed.
+      - name: Проба барьера (анти-плацебо)
+        run: bash scripts/tests/red_protected_artifacts.sh
+
   status-check:
     name: All checks passed
     runs-on: ubuntu-latest
-    needs: [build-test, security, delivery]
+    needs: [build-test, security, delivery, protected-artifacts]
     if: always()
     steps:
       - run: |
-          if [[ "${{ needs.build-test.result }}" != "success" || "${{ needs.security.result }}" != "success" || "${{ needs.delivery.result }}" != "success" ]]; then
+          if [[ "${{ needs.build-test.result }}" != "success" || "${{ needs.security.result }}" != "success" || "${{ needs.delivery.result }}" != "success" || "${{ needs.protected-artifacts.result }}" != "success" ]]; then
             echo "One or more checks failed"; exit 1
           fi
           echo "All checks passed"
