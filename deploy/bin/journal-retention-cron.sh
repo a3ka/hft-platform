@@ -37,8 +37,13 @@ RETENTION_MODE="${RETENTION_MODE:-dry-run}"
 LOG="${RETENTION_LOG:-/var/log/hft/journal-retention.log}"
 # Маркер для ВНЕШНЕГО монитора (zabbix/nagios пингуют файл): есть → последний прогон упал.
 ALERT_FILE="${RETENTION_ALERT_FILE:-/var/lib/hft/retention.alert}"
+# Позитивный heartbeat (D9, rev12): *.alert детектирует «прогон УПАЛ», но НЕ «cron молча
+# не запускался» (не установлен / crond мёртв / ребут без cron). На УСПЕШНОМ прогоне
+# пишем сюда UTC-таймстамп; внешний монитор алертит по СВЕЖЕСТИ (старше ~26 ч = cron не
+# отработал). Имя env-var — КОНТРАКТ гейта D9, не менять без обновления verify_delivery_M-08.sh.
+LAST_SUCCESS="${RETENTION_LAST_SUCCESS:-/var/lib/hft/retention.last-success}"
 
-mkdir -p "$(dirname "${LOG}")" "$(dirname "${ALERT_FILE}")" 2>/dev/null || true
+mkdir -p "$(dirname "${LOG}")" "$(dirname "${ALERT_FILE}")" "$(dirname "${LAST_SUCCESS}")" 2>/dev/null || true
 
 alert() { # exit≠0 обязан быть ВИДЕН: молчащая уборка = TD-020 на третьем витке
   local msg="$1"
@@ -78,5 +83,9 @@ if [ "${rc}" -ne 0 ]; then
 else
   # Успешный прогон гасит маркер — следующий сбой поднимет тревогу заново.
   rm -f "${ALERT_FILE}" 2>/dev/null || true
+  # Позитивный heartbeat (D9): «cron жил» отличается от «cron не установлен» только свежестью
+  # этого файла. Пишется ПОСЛЕ гашения alert'а — даже если `date` упадёт (нет прав / read-only FS),
+  # сбой не поднимет ложный алерт, просто heartbeat замолчит (мониторинг ловит старьё).
+  date -u +%Y-%m-%dT%H:%M:%SZ > "${LAST_SUCCESS}" 2>/dev/null || true
 fi
 exit "${rc}"

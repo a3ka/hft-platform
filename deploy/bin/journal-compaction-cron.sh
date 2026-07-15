@@ -44,8 +44,13 @@ COMPACTION_COMPACT_LEVEL="${COMPACTION_COMPACT_LEVEL:-3}"
 LOG="${COMPACTION_LOG:-/var/log/hft/journal-compaction.log}"
 # Маркер для ВНЕШНЕГО монитора: есть → последний прогон упал.
 ALERT_FILE="${COMPACTION_ALERT_FILE:-/var/lib/hft/compaction.alert}"
+# Позитивный heartbeat (D9, rev12): см. комментарий в journal-retention-cron.sh — та же
+# семантика. *.alert ловит сбой, *.last-success ловит «cron молча не запустился» (не
+# установлен / crond мёртв / ребут) — это РАЗНЫЕ классы дефектов, и нужен ОБА маркера.
+# Имя env-var — КОНТРАКТ гейта D9, не менять без обновления verify_delivery_M-08.sh.
+LAST_SUCCESS="${COMPACTION_LAST_SUCCESS:-/var/lib/hft/compaction.last-success}"
 
-mkdir -p "$(dirname "${LOG}")" "$(dirname "${ALERT_FILE}")" 2>/dev/null || true
+mkdir -p "$(dirname "${LOG}")" "$(dirname "${ALERT_FILE}")" "$(dirname "${LAST_SUCCESS}")" 2>/dev/null || true
 
 alert() { # exit≠0 обязан быть ВИДЕН — иначе cron будет молча «успевать»
   local msg="$1"
@@ -81,5 +86,8 @@ if [ "${rc}" -ne 0 ]; then
 но требует внимания; 1=arg/io). Лог: ${LOG}"
 else
   rm -f "${ALERT_FILE}" 2>/dev/null || true
+  # Позитивный heartbeat (D9): см. journal-retention-cron.sh — та же семантика, имя файла —
+  # КОНТРАКТ гейта (COMPACTION_LAST_SUCCESS, дефолт /var/lib/hft/compaction.last-success).
+  date -u +%Y-%m-%dT%H:%M:%SZ > "${LAST_SUCCESS}" 2>/dev/null || true
 fi
 exit "${rc}"
