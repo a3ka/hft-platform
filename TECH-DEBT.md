@@ -270,6 +270,23 @@
   run), а не только через cron-argv. Данные НЕ пострадали (бинарь падал на arg-парсинге ДО мутаций;
   legacy цел). Severity: **MAJOR** (операторский интерфейс хрупкий/сломан вне точных cron-скриптов;
   apply-команда из README целится в неверный каталог).
+  **✅ CLOSED 2026-07-15 (task 19 / rev11, `e31e23e`, §8 PROD GREEN).** Цепочка: architect
+  `475bbd5` RED `red_cli_argv.rs` (гоняет НАСТОЯЩИЙ бинарь `CARGO_BIN_EXE_journal-retention`:
+  equals-форма dry-run + compact + регресс раздельной формы) + гейт **D8** (`verify_delivery`
+  извлекает `command:`-блок ОБОИХ сервисов из compose, подставляет `${VAR:-default}`+sandbox
+  СОХРАНЯЯ форму флага, прогоняет реальным бинарём — прямо закрывает слепое пятно D5a/D7) →
+  engine-dev `935bc9b` фикс парсера (нормализация argv ДО цикла: `--flag=value` →
+  `split_once('=')` → `[--flag, value]`; раздельная форма без изменений — регрессии нет) +
+  `e31e23e` README §4 (Apply = ПОЛНЫЙ повтор argv, не «короткая» `--mode apply`, что теряла `--dir`).
+  **Анти-плацебо доказан reviewer'ом независимо:** оба equals-теста FAIL против `475bbd5` (без
+  фикса, exit=1 «equals-форма отвергнута»), раздельный проходит; GREEN на HEAD. Гейты: workspace
+  **185/0**, verify_M-08 PASS, verify_delivery PASS вкл. **D8 обоих сервисов**, crontab -n 0.
+  **§8 PROD (VPS `e31e23e`):** `docker compose --profile ops run --rm journal-compaction` (ровно
+  та equals-form команда, что падала до фикса) → **exit=0**, сжаты сегменты 6,7 (10.43×), диск
+  +1.94 GB; `docker compose --profile ops run --rm journal-retention` (dry-run) → **exit=0**,
+  0 prune, legacy/active/young корректно skipped, disk_pressure нет; **legacy-0 байт-в-байт цел**
+  (sha256 `234583c8…bdbdc72`, size+mtime не изменились), recorder healthy, restarts=0. Задокументи-
+  рованный операторский путь через compose теперь работает end-to-end. Data не пострадали.
 - **TD-018** `deploy-ci-gate-cannot-read-ci-status` (найдено reviewer'ом на §8 M-08, 2026-07-14).
   Гейт TD-017 (`deploy.yml` job `ci`, «Wait for CI success on this commit») **не работает**:
   `gh api repos/$REPO/actions/runs?head_sha=$SHA` возвращает **`HTTP 403 Resource not accessible

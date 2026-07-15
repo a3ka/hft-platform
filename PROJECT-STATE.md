@@ -387,6 +387,28 @@ reviewer сверил `tree(4d92373)==tree(2b2311f)` побайтово — arch
   для durable-сдвига дедлайна нужна установка + фикс TD-024); ретеншен (`--mode apply`, cold-выгрузка)
   не запускался — нет Storage Box (founder ★); TD-016 наблюдение и TD-006/TD-020 остаются OPEN.
 
+### rev 11 (задача 19 — TD-024 equals-form CLI) — REVIEWER APPROVED + MERGED (`e31e23e`, §8 PROD GREEN, 2026-07-15)
+Фикс delivery-дефекта, пойманного §8 rev10: операторский путь через `docker compose run` был сломан.
+Ветка `feat/M-08-td024` (3 коммита, fast-forward): `475bbd5` architect RED `red_cli_argv.rs` (гоняет
+НАСТОЯЩИЙ бинарь: equals dry-run/compact + регресс раздельной) + гейт **D8** → `935bc9b` engine-dev
+фикс парсера → `e31e23e` engine-dev README §4.
+- **Фикс (`crates/journal/src/bin/journal-retention.rs`):** нормализация argv ДО цикла разбора —
+  `--flag=value` → `split_once('=')` → `[--flag, value]` (equals-форма из compose `command:` и `--help`
+  теперь понимается); раздельная форма (cron) проходит без изменений — регрессии нет.
+- **D8** (`verify_delivery`): извлекает `command:`-блок ОБОИХ сервисов из `docker-compose.yml`, гонит
+  реальный бинарь ровно этой формой argv → закрывает слепое пятно D5a/D7 (гоняли только cron-argv).
+- **Гейты (reviewer независимо):** fmt/clippy clean, workspace **185/0**, `red_cli_argv` 3/3,
+  `red_compaction` 10/10, verify_M-08 PASS, verify_delivery PASS (D8 обоих сервисов), crontab -n 0.
+  **Анти-плацебо:** оба equals-теста FAIL против `475bbd5` (без фикса), раздельный проходит; GREEN на HEAD.
+- **§8 PROD (VPS `e31e23e`, CI+Deploy success):** `docker compose --profile ops run --rm
+  journal-compaction` (equals-form команда, падала «неизвестный флаг» до фикса) → **exit=0**, сжаты
+  сегменты 6,7 (10.43×), **диск +1.94 GB**; `... journal-retention` (dry-run) → **exit=0**, 0 prune,
+  legacy/active/young skipped, disk_pressure нет; **boевой legacy-0 БАЙТ-В-БАЙТ ЦЕЛ** (sha256
+  `234583c8…bdbdc72`), recorder healthy, restarts=0. ⇒ **TD-024 CLOSED**; операторский compose-путь
+  работает end-to-end.
+- **M-08 всё ещё IN_PROGRESS:** остаётся установка cron (durable-компакция) + Storage Box (ретеншен
+  apply, founder ★); TD-006/TD-020 OPEN до этого.
+
 ### rev 7/8 (задачи 14/15) — REVIEWER REJECTED + REVERTED (`b43044d`, 2026-07-14)
 Стек `d43d923..91f11aa` (task 14 delivery + task 15 compaction + D5/C5 fixes) прошёл локальные
 reviewer-гейты: `fmt`, `clippy -D warnings`, workspace **178 passed / 0 failed**,
