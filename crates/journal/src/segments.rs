@@ -1685,6 +1685,38 @@ pub fn compact_segment(seg: &SegmentInfo, level: i32) -> io::Result<CompactionRe
         )));
     }
 
+    // (1.5) M-08 task 17 (D-COMP-4, CRITICAL, §8): компакция НИКОГДА не трогает legacy/
+    // foreign сегменты. На проде `segment-00000000.jrnl` — 15 GB LEGACY (без v2-магии,
+    // задекларирован в `journal.legacy.json`, невосполнимая история). Предыдущая
+    // реализация его СЖИМАЛА: sha256 round-trip проходит → оригинал удаляется → обратное
+    // чтение `.zst` идёт через `skip_v2_header_forward`, который ТРЕБУЕТ v2-магию
+    // («legacy под zstd не бывает») → `CorruptHeader` → `segments()`/`list_segments`/
+    // `stream` падают на первом классифае ⇒ ВЕСЬ ЖУРНАЛ НЕЧИТАЕМ, 15 GB стёрты.
+    //
+    // Конструктивный барьер (тот же принцип, что «активный не сжимаем»): ПЕРВЫЕ байты
+    // файла ОБЯЗАНЫ быть `SEGMENT_MAGIC` (HFTJRN02), иначе — `Err` ДО любой мутации
+    // (rename / remove / create `.tmp`/`.zst`). Проверяется существующим хелпером
+    // `read_magic_prefix`, который возвращает `Ok(None)` для файла короче магии
+    // (на диске ничего разумного быть не может) и `Ok(Some(buf))` иначе.
+    //
+    // Legacy читается как есть (через манифест + fingerprint — см. `classify_segment`),
+    // но сжатие legacy архитектурно запрещено: обратного декодера для legacy-в-zstd
+    // не существует, и не должен существовать (CT-RFC-02 rev 2 fail-closed находка C2).
+    match read_magic_prefix(src)? {
+        Some(m) if m == SEGMENT_MAGIC => {} // ok: v2-сегмент, можно сжимать
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "compact_segment: legacy/foreign segment cannot be compacted (no v2 magic; \
+                     legacy читается только как есть, сжатие архитектурно запрещено, \
+                     D-COMP-4): {}",
+                    src.display()
+                ),
+            ));
+        }
+    }
+
     // (2) Имена .tmp / .zst строятся из базовой части (`segment-NN.jrnl` + суффикс).
     let base = src
         .file_name()
@@ -1836,7 +1868,25 @@ pub fn compact_closed_segments(
 
     let mut reports = Vec::with_capacity(to_compact.len());
     for s in to_compact {
-        reports.push(compact_segment(s, level)?);
+        match compact_segment(s, level) {
+            Ok(r) => reports.push(r),
+            // D-COMP-4: legacy/foreign сегменты пропускаются МОЛЧА (Err → в failed, не трогаем).
+            // Иначе на проде (где legacy-0 задекларирован) первая же попытка сжатия
+            // валила бы задание с exit=2 и поднимала ложный алерт «raw+.zst конфликт»,
+            // хотя данные не пострадали. Идентифицируем по единственному маркеру из
+            // `compact_segment` (других источников этой подстроки в err нет):
+            Err(e)
+                if e.to_string()
+                    .contains("legacy/foreign segment cannot be compacted") =>
+            {
+                // Намеренно тихо: (а) compact-вызов на legacy-сегменте — штатная
+                // ситуация прод-раскладки, не сбой; (б) библиотека не пишет в stderr
+                // (это прерогатива бинаря и оператора); (в) сегмент остаётся
+                // читаемым через `list_segments`/`stream` — оператор видит его
+                // статус иначе (legacy-сегмент в выводе stream/heartbeat/storage_status).
+            }
+            Err(e) => return Err(e),
+        }
     }
     Ok(reports)
 }
