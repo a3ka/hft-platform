@@ -188,6 +188,13 @@
   проверяется отдельно в `red_retention`). Зона: architect (SACRED-тест, не reviewer). Патч
   однострочный (min_free_bytes: 0 в own_capture-вызовах теста) ИЛИ явное требование к test-env.
   Severity: **MINOR** (тест-качество/окружение; прод не затронут, CI зелёный).
+  **✅ CLOSED 2026-07-15 (`7937b59`, architect).** Оба вызова `WriterConfig::own_capture(...)` в
+  `red_prod_migration.rs` обёрнуты в `WriterConfig { min_free_bytes: 0, ..own_capture(...) }` —
+  меняется ТОЛЬКО disk-guard порог (проверяется отдельно в `red_retention`), ассерты миграции
+  (legacy байт-в-байт цел, seq, новый сегмент, stream-blocked-until-declared) НЕ тронуты. Reviewer
+  перепрогнал на full-disk-освобождённом хосте (61G): `red_prod_migration` **2/2** (был StorageGuard-
+  FAIL), workspace **185/0**, **`verify_M-08.sh` VERDICT: PASS** — tester task 7 разблокирован
+  независимо от свободного места хоста. Test-only, §8 не требуется (recorder от теста не зависит).
 - **TD-021** `memory-metric-includes-page-cache` (найдено reviewer'ом на §8 M-08, 2026-07-14).
   Все прежние замеры памяти recorder'а (мои в TD-016: 8.4 → 48 → 139 MiB; оракульная мотивация
   «+6.5 MiB/час») снимались через `docker stats`, который показывает cgroup `memory.current` —
