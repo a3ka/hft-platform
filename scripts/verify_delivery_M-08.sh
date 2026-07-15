@@ -308,6 +308,39 @@ else
   d8=1; fail "D8 не собрался journal-retention — compose command:-форму проверить нечем"
 fi
 
+# ── D9: cron-задание пишет ПОЗИТИВНЫЙ heartbeat (silent-absence, урок всей сессии) ────
+# Маркер `*.alert` детектирует «прогон УПАЛ», но НЕ «cron НИКОГДА не запускался» (не установлен /
+# crond мёртв / ребут без cron): отсутствие `*.alert` неоднозначно — «ок» ИЛИ «молчит». Для
+# deadline-критичной компакции это дыра: замолчит — диск заполнится тихо, никто не узнает.
+# Нужен ПОЗИТИВНЫЙ сигнал: на УСПЕШНОМ прогоне задание пишет `*.last-success` с UTC-таймстампом,
+# а внешний монитор алертит по ЕГО СВЕЖЕСТИ (старше ~26 ч = cron не отработал). D9 проверяет,
+# что маркер РЕАЛЬНО пишется — прогоном со стабом-успехом, не грепом.
+d9=0
+for pair in "retention:deploy/bin/journal-retention-cron.sh" "compaction:deploy/bin/journal-compaction-cron.sh"; do
+  name="${pair%%:*}"; job="${pair#*:}"
+  if [ ! -f "${job}" ]; then d9=1; fail "D9 нет ${job}"; continue; fi
+  sb=$(mktemp -d); mkdir -p "${sb}/root"
+  printf '#!/bin/sh\nexit 0\n' > "${sb}/ok-runner"; chmod +x "${sb}/ok-runner"
+  set +e
+  RETENTION_RUNNER="${sb}/ok-runner" \
+    HFT_ROOT="${sb}/root" \
+    RETENTION_LOG="${sb}/${name}.log" COMPACTION_LOG="${sb}/${name}.log" \
+    RETENTION_ALERT_FILE="${sb}/${name}.alert" COMPACTION_ALERT_FILE="${sb}/${name}.alert" \
+    RETENTION_LAST_SUCCESS="${sb}/${name}.last-success" \
+    COMPACTION_LAST_SUCCESS="${sb}/${name}.last-success" \
+    bash "${job}" >/dev/null 2>&1
+  set -e
+  if [ ! -s "${sb}/${name}.last-success" ]; then
+    d9=1
+    fail "D9 ${name}: на УСПЕШНОМ прогоне НЕ записан ${name}.last-success — «cron молча не \
+запустился» (не установлен / crond мёртв / ребут) остаётся НЕЗАМЕЧЕННЫМ; отсутствие *.alert \
+неоднозначно. Нужен позитивный heartbeat + внешний монитор по его свежести"
+  fi
+  rm -rf "${sb}"
+done
+[ "${d9}" -eq 0 ] && pass "D9 cron-задания пишут позитивный *.last-success — silent-absence \
+детектируется по свежести маркера (не только сбой)"
+
 echo
 if [ "${FAILED}" -gt 0 ]; then
   echo "DELIVERY: FAIL (${FAILED})"
