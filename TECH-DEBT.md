@@ -144,6 +144,20 @@
   binary+compose argv path. Следующая задача 14 должна либо поддержать оба синтаксиса в CLI, либо
   передавать split-аргументы в compose/cron, и обязана иметь оракул, который запускает реальное
   задание до `retention_plan`, а не только stub.
+  **СТАТУС 2026-07-15 (reland `8a2e377`, reviewer §8): КОМПАКЦИОННЫЙ оператор ДОСТАВЛЕН и РЕАЛЬНО
+  ВЫПОЛНЕН на проде — часть цели достигнута, но ДОЛГ ОСТАЁТСЯ OPEN.** Что сделано и доказано:
+  reviewer выполнил §8-B — реальную компакцию боевого `/journal` через доставленный cron-скрипт
+  `deploy/bin/journal-compaction-cron.sh` (exit=0, legacy-0 байт-в-байт цел, 5 сегментов сжаты,
+  **диск +4.69 GB**, recorder healthy). Т.е. компакция «двигает диск фактом», как требовал гейт.
+  **Чего ещё НЕТ (почему OPEN):** (1) **cron НЕ УСТАНОВЛЕН** на проде (`/etc/cron.d` без hft) —
+  reviewer запустил скрипт ВРУЧНУЮ; без установленного cron компакция разовая, диск снова растёт
+  (для durable-сдвига дедлайна нужна установка `deploy/cron.d/journal-retention` + маркер/алерт);
+  (2) **TD-024** — задокументированные ad-hoc команды compose (`docker compose run --rm
+  journal-compaction`) СЛОМАНЫ equals-form'ом; работает только точный cron-argv (хрупко);
+  (3) **РЕТЕНШЕН** (`--mode apply`, освобождение через cold-выгрузку) по-прежнему не запускался —
+  нет Storage Box (`/mnt/*` пуст, founder ★). Компакция снижает темп роста (~9× на закрытых), но
+  БЕЗ ретеншена диск всё равно растёт (медленнее). Установка cron + Storage Box + фикс TD-024 —
+  условие полного закрытия TD-020 и M-08.
 - **TD-021** `memory-metric-includes-page-cache` (найдено reviewer'ом на §8 M-08, 2026-07-14).
   Все прежние замеры памяти recorder'а (мои в TD-016: 8.4 → 48 → 139 MiB; оракульная мотивация
   «+6.5 MiB/час») снимались через `docker stats`, который показывает cgroup `memory.current` —
@@ -189,6 +203,27 @@
     включать legacy-сегмент в каталоге (дефект фикстуры: C1-C9 строят ТОЛЬКО v2 через
     `Journal::open_with` — прод-раскладка с legacy не покрыта). Severity: **CRITICAL** (потеря
     невосполнимых первичных данных).
+  - **✅ CLOSED 2026-07-15 (reland `8a2e377`, reviewer §8 GREEN на РЕАЛЬНОМ проде).** Цепочка:
+    architect `4d92373` (чистый revert-of-revert `82b33db` — восстановил rev9-стек 1:1, reviewer
+    сверил tree(4d92373)==tree(2b2311f) побайтово) + `7754308` C10 RED + `0c7bef4` TD-023 +
+    `0cd4eca` D-COMP-4 (`compact_segment` → `Err` на сегменте без `SEGMENT_MAGIC` в первых байтах,
+    ДО любой мутации; `compact_closed_segments` тихо пропускает legacy) + `8a2e377` §8-план.
+    **D-COMP-4:** конструктивный барьер по первым 8 байтам файла (как «активный не сжимаем»).
+    **Анти-плацебо доказан reviewer'ом независимо:** C10 FAIL против `7754308` (без барьера,
+    `red_compaction.rs:562` «legacy стёрты»), GREEN на HEAD. Гейты (перепрогнаны на чистом
+    worktree): fmt/clippy clean, **workspace 182/0**, `red_compaction` **10/10** (C1-C10),
+    `red_book_bounded` 7/7, `verify_M-08.sh` PASS, `verify_delivery_M-08.sh` PASS (D1-D7 + deep
+    D1-deep/D2-deep). **§8 два шага (`--mode compact --dry-run` НЕ существует):**
+    (A) sandbox с доставленным бинарём (образ `hft-platform-recorder:local`) на faithful прод-
+    раскладке (no-magic declared legacy-0 + 35 v2): legacy байт-в-байт цел, `.zst` для legacy НЕ
+    создан, 32 v2 сжаты (14.5×), `journal::stream` = 3500 событий ДО и ПОСЛЕ (потерь нет).
+    (B) **РЕАЛЬНАЯ компакция боевого `/journal` через доставленный cron-скрипт** (`exit=0`, alert
+    не взведён): **боевой legacy-0 БАЙТ-В-БАЙТ ЦЕЛ** (полный sha256 `234583c8…bdbdc72` == эталон,
+    size=15188347171, mtime=1784018822 не изменились — барьер сработал на живом 15 GB legacy);
+    сегменты 1-5 → `.jrnl.zst`, `zstd -t` каждого = исходный raw-размер (данные целы, +D-COMP-2
+    sha-roundtrip до удаления raw); **свободно 111.20 → 115.88 GB (+4.69 GB) — диск двинулся**;
+    recorder healthy, restarts=0, next_seq растёт, heartbeat свежий (конкурентная компакция
+    закрытых не задела живого писателя). Legacy-безопасность компакции доказана на РЕАЛЬНОМ активе.
 - **TD-023** `book-memory-oracle-flaky-under-parallel-tests` (найдено reviewer'ом на §8 M-08 rev9,
   2026-07-14). `crates/venue-binance/tests/red_book_bounded.rs::td016_memory_bounded_when_price_
   drifts_out_of_band` меряет прирост памяти через **процесс-глобальный** `static CUR` +
@@ -204,6 +239,37 @@
   аллокатор), либо поднять допуск с запасом. Severity: **MAJOR** (флак на критическом CI-пути:
   `main` перестаёт быть детерминированно зелёным; «Deploy failure на зелёном коде» легко принять за
   инфраструктурный флак и обойти руками — маскирует настоящие регрессии).
+  **✅ CLOSED 2026-07-15 (reland `8a2e377`, `0c7bef4`, architect).** Оракул переписан
+  (`td016_book_saturates_at_backstop_not_grows_with_updates`): глобальный аллокатор-счётчик
+  удалён целиком (он и был источником гонки), память книги = O(числа уровней) `BTreeMap`,
+  поэтому меряем число уровней напрямую против контрактного потолка `2·BACKSTOP_LEVELS_PER_SIDE`
+  (детерминированно, без гонки). Порог 4 MiB был вдобавок ФИКЦИЕЙ (остался с rev1 при backstop
+  5000; rev6 поднял до 200k/сторону). reviewer перепрогнал: 7/7 стабильно, GREEN под полным
+  `cargo test --workspace` (77 блоков, 182/0) — флак устранён. Sacred-тест, правка architect'а.
+
+- **TD-024** `compose-service-command-uses-equals-form-binary-rejects` (найдено reviewer'ом на §8
+  M-08 rev10, 2026-07-15). §8 Step B: попытка запустить компакцию через ЗАДОКУМЕНТИРОВАННУЮ
+  операторскую команду `docker compose run --rm journal-compaction` упала:
+  `journal-retention: неизвестный флаг` — сервисы `journal-compaction` И `journal-retention` в
+  `docker-compose.yml` держат `command:` в форме `--dir=/journal`/`--mode=compact`/`--keep-raw=2`
+  (equals-form), а ручной arg-парсер бинаря (`match arg { "--dir" => next() }`) `=`-форму НЕ
+  разбирает → «неизвестный флаг», exit 1. Хуже того, любая документированная команда вида
+  `docker compose run --rm journal-retention --mode apply` (README D6) APPEND'ит аргумент, а в
+  `docker compose run SERVICE ARG` этот ARG **ЗАМЕНЯЕТ** весь `command:`-блок ⇒ теряется
+  `--dir=/journal` ⇒ бинарь берёт `DEFAULT_DIR=./journal-data` (пустой каталог в контейнере), а
+  НЕ боевой `/journal`. **Работает ТОЛЬКО потому, что cron-скрипты** (`journal-{retention,
+  compaction}-cron.sh`) передают ПОЛНЫЙ раздельный argv (`--dir /journal … --mode compact`),
+  который заменяет блок целиком корректным набором — именно через cron-скрипт reviewer выполнил
+  §8-B успешно. Т.е. прод-путь (cron) работает, но задокументированные ad-hoc операторские команды
+  и bare-запуск сервиса СЛОМАНЫ (та же серия «текст в репо ≠ работает в проде», что весь TD-020;
+  гейт `verify_delivery` D5a/D7 гонял ТОЛЬКО cron-argv, а `command:`-блок compose против живого
+  бинаря не проверял). **Фикс (architect/engine-dev):** либо `command:` в раздельной форме
+  (`- --dir` / `- /journal` отдельными элементами списка), либо парсер принимает `--flag=value`
+  (`split_once('=')`); README-команды привести к форме, которая НЕ теряет `--dir`. Плюс гейт
+  `verify_delivery`: прогнать РЕАЛЬНЫЙ бинарь именно через `command:`-блок compose (bare service
+  run), а не только через cron-argv. Данные НЕ пострадали (бинарь падал на arg-парсинге ДО мутаций;
+  legacy цел). Severity: **MAJOR** (операторский интерфейс хрупкий/сломан вне точных cron-скриптов;
+  apply-команда из README целится в неверный каталог).
 - **TD-018** `deploy-ci-gate-cannot-read-ci-status` (найдено reviewer'ом на §8 M-08, 2026-07-14).
   Гейт TD-017 (`deploy.yml` job `ci`, «Wait for CI success on this commit») **не работает**:
   `gh api repos/$REPO/actions/runs?head_sha=$SHA` возвращает **`HTTP 403 Resource not accessible
@@ -261,6 +327,10 @@
   `HFTJRN02`; `seq` сквозной, `restarts=0`). **Ретеншен и cold-выгрузка — ❌ В ПРОДЕ НЕ РАБОТАЮТ**
   (бинарь не доставлен, холодного хранилища нет — см. TD-020). ⇒ **TD-006 остаётся OPEN**: диск
   по-прежнему монотонно растёт, просто кусками по 1 GiB. Закрывается вместе с TD-020 (задача 14).
+  **СТАТУС 2026-07-15 (reland `8a2e377`, reviewer §8-B): компакция РЕАЛЬНО сжала боевые сегменты
+  (диск +4.69 GB, ~5-9× на закрытых), но ДОЛГ OPEN.** Разовая ручная компакция место освободила;
+  для durable-сдвига дедлайна нужен УСТАНОВЛЕННЫЙ cron (сейчас не установлен) + фикс TD-024, а для
+  реального СНИЖЕНИЯ (не только замедления роста) — ретеншен с cold-выгрузкой (Storage Box, ★).
   **СТАТУС 2026-07-14 (tasks 14/15 rollback `b43044d`): всё ещё OPEN.** Реальная prod-компакция
   закрытого сегмента не была выполнена: стек с `compact_closed_segments` откатан из-за красного
   dry-run ретеншена, свободное место не увеличено, deadline disk-guard не отодвинут.

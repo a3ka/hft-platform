@@ -349,6 +349,44 @@ CI + Deploy на merge-коммите — success. **Анти-плацебо д�
 legacy-сегмент — C1-C9 строят только v2, прод-раскладка не покрыта) + **TD-023** (флак-оракул).
 **M-08 остаётся IN_PROGRESS; TD-020, TD-006, TD-022 остаются OPEN; TD-023 новый.**
 
+### rev 10 (задачи 17/18 — legacy-безопасность компакции) — REVIEWER APPROVED + MERGED (`8a2e377`, §8 PROD GREEN, 2026-07-15)
+Реленд rev9-стека + фикс CRITICAL data-loss (TD-022). Ветка `feat/M-08-compaction-reland` (5 коммитов,
+линейна, fast-forward): `4d92373` (**чистый revert-of-revert** `82b33db` — восстановил rev9-стек 1:1;
+reviewer сверил `tree(4d92373)==tree(2b2311f)` побайтово — architect НЕ дописывал impl, механическое
+восстановление уже-ревьюненного) → `7754308` C10 RED (architect) → `0c7bef4` TD-023 fix (architect) →
+`0cd4eca` **D-COMP-4** (engine-dev) → `8a2e377` §8-план (architect).
+- **D-COMP-4** (`crates/journal/src/segments.rs`): `compact_segment` возвращает `Err` на сегменте, чьи
+  первые байты `!= SEGMENT_MAGIC` (`HFTJRN02`), **ДО любой мутации** (конструктивный барьер — тот же
+  принцип, что «активный не сжимаем»); `compact_closed_segments` тихо пропускает legacy/foreign (Err по
+  маркеру → в `failed`, не пробрасывает). Legacy читается как есть; сжатие legacy архитектурно запрещено.
+- **C10** (sacred RED, architect): прод-раскладка legacy-0(declared, no-magic) + v2-закрытые + активный;
+  реальная `compact_closed_segments(keep_raw=1)` → legacy НЕ тронут, `.zst` для legacy НЕ создан,
+  `stream` до==после. Закрывает дефект фикстуры C1-C9 (строили только v2 — прод-раскладка не покрыта).
+- **Гейты (reviewer перепрогнал независимо на чистом worktree):** fmt/clippy clean, **workspace 182/0**,
+  `red_compaction` **10/10** (C1-C10), `red_book_bounded` 7/7, `verify_M-08` PASS, `verify_delivery` PASS
+  (D1-D7 + **deep** D1-deep/D2-deep, реальный образ). **Анти-плацебо доказан независимо:** C10 FAIL
+  против `7754308` (без барьера — «legacy стёрты», `red_compaction.rs:562`), GREEN на HEAD. CI+Deploy
+  на merge success.
+- **§8 (два шага; `--mode compact --dry-run` НЕ существует — режимы взаимоисключающи):**
+  - **Step A (delivered binary на sandbox):** образ `hft-platform-recorder:local` на faithful прод-
+    раскладке → legacy байт-в-байт цел, legacy `.zst` НЕ создан, 32 v2 сжаты (14.5×), `stream`=3500
+    до и после (потерь нет). Барьер доказан в ДОСТАВЛЕННОМ артефакте до касания боевого legacy.
+  - **Step B (РЕАЛЬНАЯ компакция боевого `/journal`):** через доставленный cron-скрипт (exit=0, alert
+    не взведён). **Боевой legacy-0 БАЙТ-В-БАЙТ ЦЕЛ** — полный sha256 `234583c8…bdbdc72` == эталон,
+    size=15188347171, mtime=1784018822 не изменились (D-COMP-4 сработал на живом 15 GB legacy);
+    сегменты 1-5 → `.jrnl.zst`, `zstd -t` каждого = исходный raw-размер (данные целы); **свободно
+    111.20 → 115.88 GB (+4.69 GB) — диск ДВИНУЛСЯ**; recorder healthy, restarts=0, next_seq растёт,
+    heartbeat свежий (конкурентная компакция закрытых не задела живого писателя).
+- **⇒ TD-022 CLOSED** (legacy-безопасность доказана на РЕАЛЬНОМ активе), **TD-023 CLOSED** (флак устранён).
+- **§8 ПОЙМАЛ новый delivery-дефект → TD-024 (MAJOR, OPEN):** compose-сервисы `journal-compaction`/
+  `journal-retention` держат `command:` в equals-form (`--dir=/journal`), а бинарь `=`-форму НЕ
+  разбирает → задокументированные `docker compose run --rm journal-<svc>` СЛОМАНЫ; работает только
+  точный cron-argv (раздельная форма), через который reviewer и выполнил §8-B. `verify_delivery`
+  гонял только cron-argv, не `command:`-блок против живого бинаря.
+- **M-08 всё ещё IN_PROGRESS (НЕ закрыт):** cron НЕ установлен на проде (компакция разовая-ручная →
+  для durable-сдвига дедлайна нужна установка + фикс TD-024); ретеншен (`--mode apply`, cold-выгрузка)
+  не запускался — нет Storage Box (founder ★); TD-016 наблюдение и TD-006/TD-020 остаются OPEN.
+
 ### rev 7/8 (задачи 14/15) — REVIEWER REJECTED + REVERTED (`b43044d`, 2026-07-14)
 Стек `d43d923..91f11aa` (task 14 delivery + task 15 compaction + D5/C5 fixes) прошёл локальные
 reviewer-гейты: `fmt`, `clippy -D warnings`, workspace **178 passed / 0 failed**,
