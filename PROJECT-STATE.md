@@ -15,6 +15,29 @@
 - `CLAUDE.md` + `.claude/rules/` (5) + `.claude/agents/` (9) — EINHARD-модель под трейдинг.
 - `PROJECT-STATE.md` + `TECH-DEBT.md` (reviewer-owned).
 
+### Doc-гейт + protected-artifacts барьер (C-006 — CLOSED, MERGED 2026-07-15, reviewer APPROVED)
+Цикл C-006 завершён (founder-решение: принять после P1/P17, без новых витков критика). Смержены
+ДВЕ ветки (порядок td021-rules → doc-gate): `af33d61` (td021-rules) + `0d5f8f8` (doc-gate), полная
+история rev3–rev12 (architect fix ⇄ critic REJECT) сохранена. Reviewer резолвил конфликты:
+PROJECT-STATE/TECH-DEBT → в пользу main (надмножество); `.claude/rules/testing.md` → ОБЕ секции
+(TD-021 «оракул мерит то, что обещает» + «Целостность гейта — 4 свойства»); `ci.yml` → ОБА job'а
+(delivery + protected-artifacts, `status-check.needs` = все четыре).
+- **`scripts/check_protected_artifacts.sh`** — барьер: коммит/мерж не смеет удалить/подменить/усечь
+  вердикт критика (`research/critiques/`), milestone, RFC. **База сравнения из СОБЫТИЯ** (не
+  `origin/main` — иначе диапазон пуст и гейт зелён всегда, блокер B1); пустая/zero/переписанная база
+  → **fail-closed**. Ловит: удаление, rename-out, evil-merge, merge-born-then-dropped, подмену типа
+  (каталог/симлинк), усечение в 0 байт.
+- **`scripts/tests/red_protected_artifacts.sh`** — проба барьера ТОЙ ЖЕ проводкой, что CI (17
+  сценариев). **Анти-плацебо доказан reviewer'ом независимо:** rev8-барьер → FAIL(3) P14/P15/P16
+  (подмена типа/усечение); guard-мутация (P7 merge→true, P17 echo→true) → «SETUP НЕ СОСТОЯЛСЯ», не
+  ложный PASS. На merged-дереве VERDICT: PASS (17/17).
+- **CI job `protected-artifacts`** (`ci.yml`) — base-from-event, fail-closed, в `status-check.needs`.
+- **Мета-правило `.claude/rules/testing.md` «Целостность гейта — 4 свойства»**: гейт обязан (1)
+  гонять прод-форму, (2) мерить свой инвариант не окружение, (3) падать против слома И несостоявшегося
+  setup, (4) наблюдать ОТСУТСТВИЕ не только сбой. Итог ~10 дефектов серии за сессию (D8/D9 — эталон).
+- **Открытый пункт (founder ★):** барьер force-push ДЕТЕКТИРУЕТ (fail-closed на zero/переписанную
+  базу), но не ПРЕДОТВРАЩАЕТ — закрывается branch protection «no force-push» на `main` (GitHub-настройка).
+
 ## Даталеер / поток данных (M-01 — РАБОТАЕТ, проверено на VPS 2026-07-10)
 - `crates/contracts` — T1 `Event`/`EventKind::Md(MdEvent)`: Trade/L2Snapshot/Funding,
   fixed-point i64 ×1e8, Venue/Side/Level. Тесты: 2 GREEN.
