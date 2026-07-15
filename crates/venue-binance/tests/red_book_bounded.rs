@@ -30,29 +30,15 @@
 //!    (дизайн M-09). Поэтому §8 обязан ИЗМЕРИТЬ число in-band уровней, а не только RSS — иначе
 //!    мы снова чиним по догадке.
 
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
-
 use venue_binance::{apply_diff_to_book, DepthDiff, OrderBook, BACKSTOP_LEVELS_PER_SIDE};
 
-static CUR: AtomicUsize = AtomicUsize::new(0);
-
-struct Counting;
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, l: Layout) -> *mut u8 {
-        let p = System.alloc(l);
-        if !p.is_null() {
-            CUR.fetch_add(l.size(), SeqCst);
-        }
-        p
-    }
-    unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
-        System.dealloc(p, l);
-        CUR.fetch_sub(l.size(), SeqCst);
-    }
-}
-#[global_allocator]
-static GA: Counting = Counting;
+// TD-023: прежняя редакция мерила память через `#[global_allocator]` + глобальный счётчик `CUR`.
+// Две беды сразу: (1) ФЛАК — под параллельным `cargo test --all` соседние тесты ТОГО ЖЕ процесса
+// alloc/free'ят и загрязняют глобальный счётчик, поэтому «рост» скакал (reviewer: 6.56 MB на
+// 2 ядрах против <4 MiB при -j1) → main краснел на ровном месте; (2) МЕРИЛИ НЕ ТУ ВЕЛИЧИНУ —
+// аллокатор считает аллокации ВСЕГО процесса, а нам нужна память КНИГИ. Память книги —
+// детерминированно O(числа уровней) (`BTreeMap<i64,i64>`), поэтому меряем число уровней напрямую.
+// Глобальный аллокатор удалён целиком — он и был источником гонки.
 
 const E8: i64 = 100_000_000;
 const TICK: i64 = 1_000_000; // $0.01 ×1e8
@@ -226,11 +212,21 @@ fn td016_evicts_only_levels_outside_emission_window() {
     );
 }
 
-/// Дрейф цены: уровни, ВЫШЕДШИЕ за окно, эвиктятся → память не растёт с числом апдейтов.
+/// Непрерывный поток апдейтов НЕ уводит книгу в неограниченный рост: число уровней **насыщается**
+/// и держится потолком `BACKSTOP_LEVELS_PER_SIDE`, а не растёт с числом апдейтов.
+///
+/// ⚠ TD-023 — вторая правка этого теста (устаревшая метрика, 8-й случай класса за сессию):
+/// прежний ассерт был `growth = mem_big − mem_small < 4 MiB`, где `mem_*` — глобальный
+/// аллокатор-счётчик. Помимо флака (гонка счётчика под параллельным `cargo test`), сам ПОРОГ
+/// 4 MiB был ФИКЦИЕЙ: он остался с rev1, когда `BACKSTOP` был 5000/сторону. rev6 поднял backstop
+/// до **200 000/сторону** («точность данных > экономия памяти», TD-021) ⇒ книга законно держит до
+/// 400 000 уровней ≈ 25 MB, и 4 MiB недостижимы. Замер «проходил» лишь потому, что `growth` —
+/// РАЗНОСТЬ двух больших шумных чисел, которая под шумом иногда падала < 4 MiB (green), иногда нет
+/// (red). Настоящая гарантия ограниченности здесь — не `MAX_REL_DIST` (в drift-сценарии окно
+/// растёт вместе с mid и почти ничего не эвиктит), а АВАРИЙНЫЙ backstop. Его и проверяем.
 #[test]
-fn td016_memory_bounded_when_price_drifts_out_of_band() {
-    let pump = |updates: i64| -> (usize, usize) {
-        let base = CUR.load(SeqCst);
+fn td016_book_saturates_at_backstop_not_grows_with_updates() {
+    let pump = |updates: i64| -> usize {
         let mut book = empty_book();
         for u in 0..updates {
             let mid = MID0 + u * 40 * TICK; // +$0.40 за апдейт
@@ -241,22 +237,26 @@ fn td016_memory_bounded_when_price_drifts_out_of_band() {
             );
             apply_diff_to_book(&mut book, &d);
         }
-        let held = CUR.load(SeqCst).saturating_sub(base);
-        (book.bids.len() + book.asks.len(), held)
+        book.bids.len() + book.asks.len()
     };
 
-    let (levels_small, mem_small) = pump(100_000); // mid +62% → уровни начинают покидать окно
-    let (levels_big, mem_big) = pump(200_000); // mid +123%
+    let levels_small = pump(100_000);
+    let levels_big = pump(200_000); // вдвое больше апдейтов
 
+    // (1) Насыщение: удвоение числа апдейтов НЕ удваивает число уровней — книга ограничена,
+    //     иначе это неограниченный рост (лик). Замер детерминирован (гонки нет).
     assert!(
         levels_big < levels_small * 2,
         "число уровней растёт пропорционально числу апдейтов ({levels_small} → {levels_big}): \
-         уровни, из которых цена ушла, не эвиктятся — это и есть лик TD-016"
+         книга не ограничена ничем — это лик"
     );
-    let growth = mem_big.saturating_sub(mem_small);
+    // (2) Жёсткий потолок — backstop на обе стороны. Это ФАКТИЧЕСКАЯ гарантия ограниченности
+    //     памяти книги (память = O(levels)); порог берётся из контракта, а не из воздуха.
+    let cap = 2 * BACKSTOP_LEVELS_PER_SIDE;
     assert!(
-        growth < 4 * 1024 * 1024,
-        "память книги выросла на {growth} B при удвоении числа апдейтов — граница не держит"
+        levels_big <= cap,
+        "число уровней {levels_big} превысило backstop-потолок {cap} (2×{BACKSTOP_LEVELS_PER_SIDE}) \
+         — аварийный кап не держит, память книги не ограничена"
     );
 }
 
