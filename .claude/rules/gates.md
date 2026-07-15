@@ -327,7 +327,9 @@ Doc-гейт применяется и к правкам самого doc-гей
 
 - `.claude/rules/branch-hygiene.md` — ветки/worktree/артефакты ролей
 - `.claude/rules/scope-guard.md` — зоны, за нарушение которых гейт 4 реджектит
-- `.claude/rules/testing.md` — детали RED-first дисциплины
+- `.claude/rules/testing.md` — детали RED-first дисциплины + **«Целостность гейта — 4 свойства»**
+  (гейт обязан: прогонять прод-форму; мерить свой инвариант, не окружение; падать против
+  сломанного И против несостоявшегося setup; наблюдать отсутствие, не только сбой)
 - `.claude/rules/commit-discipline.md` — Done Block формат
 - `docs/DESIGN.md` §4 (RK-I-*), §5 (честность симулятора), §6 (границы A/B/C), §7 (анти-оверфит)
 - `docs/05-contract-layer.md` §4 (contract-RFC), §6 (CT-I-*)

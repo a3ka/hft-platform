@@ -168,11 +168,44 @@ setup_base_not_ancestor() { # $1=repo $2=аргумент-базы $3=имя →
   fi
   return 0
 }
+setup_source_only_commit() { # $1=repo $2=before $3=имя → 0, если диапазон непуст и изменён ТОЛЬКО незащищённый
+  if [ "$(git -C "$1" rev-parse HEAD)" = "$2" ]; then
+    fail "$3 — SETUP НЕ СОСТОЯЛСЯ: диапазон ПУСТ (коммит не случился) — барьер тривиально \
+пропускает пустой диапазон, «чистый push» не проверен"; return 1
+  fi
+  local changed p; changed=$(git -C "$1" diff --name-only "$2" HEAD)
+  [ -n "${changed}" ] || { fail "$3 — SETUP НЕ СОСТОЯЛСЯ: коммит ничего не изменил"; return 1; }
+  for p in ${changed}; do
+    if is_protected "${p}"; then
+      fail "$3 — SETUP НЕ СОСТОЯЛСЯ: изменён ЗАЩИЩЁННЫЙ ${p} — это не «чистый source-only push»"
+      return 1
+    fi
+  done
+  return 0
+}
+setup_file_content_changed() { # $1=repo $2=path $3=before $4=имя → 0, если blob изменён и это нормальный непустой файл
+  if [ "$(git -C "$1" rev-parse HEAD)" = "$3" ]; then
+    fail "$4 — SETUP НЕ СОСТОЯЛСЯ: диапазон ПУСТ (правка не закоммичена) — барьер пропускает \
+пустой диапазон, «правка содержимого» не проверена"; return 1
+  fi
+  local b0 b1; b0=$(git -C "$1" rev-parse "$3:$2" 2>/dev/null || echo A)
+  b1=$(git -C "$1" rev-parse "HEAD:$2" 2>/dev/null || echo B)
+  if [ "${b0}" = "${b1}" ]; then
+    fail "$4 — SETUP НЕ СОСТОЯЛСЯ: содержимое $2 НЕ изменилось (тот же blob) — правка не случилась"
+    return 1
+  fi
+  setup_is "$1" "$2" 100644 "$4" || return 1   # остался нормальным файлом (не подмена типа)
+  [ "$(git -C "$1" cat-file -s "${b1}" 2>/dev/null || echo 0)" -gt 0 ] \
+    || { fail "$4 — SETUP НЕ СОСТОЯЛСЯ: $2 на HEAD пуст — это уже не «правка», а выхолащивание"; return 1; }
+  return 0
+}
 
 # ── P1: чистый push (артефакты не тронуты) — барьер обязан ПРОПУСТИТЬ ─────────────────
 r=$(new_repo); before=$(git -C "$r" rev-parse HEAD)
 echo "правка" >> "$r/src.rs"; git -C "$r" commit -qam "feat: обычная правка кода"
-expect "P1 чистый push пропускается" ok "$(run_barrier "$r" push "$before")"
+if setup_source_only_commit "$r" "$before" "P1"; then
+  expect "P1 чистый push пропускается" ok "$(run_barrier "$r" push "$before")"
+fi
 
 # ── P2: ГЛАВНЫЙ (B1) — push-коммит СНОСИТ вердикт критика ─────────────────────────────
 # Ровно тот инцидент, ради которого барьер писался (139b399 удалил C-006 вместе с §8-правками).
@@ -339,8 +372,10 @@ fi
 r=$(new_repo); before=$(git -C "$r" rev-parse HEAD)
 echo "дополнение вердикта" >> "$r/research/critiques/C-001.md"
 git -C "$r" commit -qam "critic: дополнил вердикт"
-expect "P17 правка содержимого артефакта пропускается (нет ложных срабатываний)" ok \
-  "$(run_barrier "$r" push "$before")"
+if setup_file_content_changed "$r" research/critiques/C-001.md "$before" "P17"; then
+  expect "P17 правка содержимого артефакта пропускается (нет ложных срабатываний)" ok \
+    "$(run_barrier "$r" push "$before")"
+fi
 
 echo
 if [ "${FAILED}" -gt 0 ]; then
