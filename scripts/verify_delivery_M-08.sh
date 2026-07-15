@@ -254,6 +254,60 @@ else
 переход на Apply) — ретеншен без оператора = TD-020"
 fi
 
+# ── D8: compose `command:`-БЛОК реально парсится бинарём (TD-024, слепое пятно D5a/D7) ─
+# D5a/D7 гоняли argv CRON-СКРИПТА (раздельная форма) — и пропустили, что docker-compose держит
+# `command:` в EQUALS-форме (`--dir=/journal`, `--mode=compact`), которую ручной парсер бинаря
+# НЕ разбирает ⇒ `docker compose run --rm journal-compaction` падает «неизвестный флаг». Гейт
+# обязан прогнать РОВНО ту форму argv, которой сервис запускается в проде, а не другую.
+extract_cmd() { # $1 = имя сервиса → печатает элементы command: по одному в строке
+  awk -v svc="$1" '
+    $0 ~ "^  " svc ":[[:space:]]*$" { insvc=1; next }
+    insvc && /^  [^ ]/ { insvc=0 }
+    insvc && /^    command:[[:space:]]*$/ { incmd=1; next }
+    insvc && incmd && /^      - / {
+      line=$0; sub(/^      - /,"",line); gsub(/^"|"$/,"",line); print line; next
+    }
+    insvc && incmd && /^    [^ ]/ { incmd=0 }
+  ' docker-compose.yml
+}
+
+d8=0
+if cargo build -q -p journal --bin journal-retention 2>/dev/null; then
+  D8BIN="$(cargo metadata --format-version 1 --no-deps 2>/dev/null \
+            | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')/debug/journal-retention"
+  [ -x "${D8BIN}" ] || D8BIN="target/debug/journal-retention"
+  for svc in journal-retention journal-compaction; do
+    sb=$(mktemp -d); mkdir -p "${sb}/journal" "${sb}/cold"
+    mapfile -t raw < <(extract_cmd "${svc}")
+    if [ "${#raw[@]}" -eq 0 ]; then
+      d8=1; fail "D8 у сервиса ${svc} не найден command:-блок (compose изменён?)"; rm -rf "${sb}"; continue
+    fi
+    # ${VAR:-default} → default; боевые пути → sandbox (сохраняя ФОРМУ флага).
+    argv=()
+    for a in "${raw[@]}"; do
+      a=$(printf '%s' "${a}" | sed -E 's/\$\{[A-Za-z_][A-Za-z0-9_]*:-([^}]*)\}/\1/g')
+      a=${a//\/mnt\/journal-cold/${sb}/cold}
+      a=${a//\/cold/${sb}/cold}
+      a=${a//\/journal/${sb}/journal}
+      argv+=("${a}")
+    done
+    # Бинарь может легитимно вернуть ≠0 (disk_pressure/пустой каталог) — нам важен ТОЛЬКО
+    # факт разбора argv, поэтому `|| true` (иначе set -e убьёт скрипт на честном exit бинаря).
+    out=$("${D8BIN}" "${argv[@]}" 2>&1 || true)
+    if printf '%s' "${out}" | grep -qE 'неизвестный флаг|неизвестное значение|требует значение|unknown|unexpected argument'; then
+      d8=1
+      fail "D8 сервис ${svc}: бинарь НЕ разобрал compose command:-форму — \`docker compose run ${svc}\` \
+упал бы в проде. argv: ${argv[*]}"
+      printf '%s\n' "${out}" | head -2 | sed 's/^/      /'
+    else
+      pass "D8 ${svc}: compose command:-форма разобрана настоящим бинарём"
+    fi
+    rm -rf "${sb}"
+  done
+else
+  d8=1; fail "D8 не собрался journal-retention — compose command:-форму проверить нечем"
+fi
+
 echo
 if [ "${FAILED}" -gt 0 ]; then
   echo "DELIVERY: FAIL (${FAILED})"
