@@ -52,7 +52,14 @@ fn prod_like_dir() -> (tempfile::TempDir, u64, Vec<u8>) {
 fn prod_migration_recorder_starts_and_never_touches_legacy_bytes() {
     let (dir, legacy_next_seq, legacy_bytes) = prod_like_dir();
 
-    let cfg = WriterConfig::own_capture("recorder v0 (git:test)", "own-2026-07");
+    let cfg = WriterConfig {
+        // TD-025: disk-guard (min_free_bytes) проверяется ОТДЕЛЬНО в red_retention. Этот
+        // тест — про КОРРЕКТНОСТЬ миграции (новый сегмент, legacy цел, seq), и его исход
+        // НЕ СМЕЕТ зависеть от свободного места хоста (иначе StorageGuard на full-disk
+        // чекауте валит tester — тест меряет окружение, а не миграцию; класс TD-023).
+        min_free_bytes: 0,
+        ..WriterConfig::own_capture("recorder v0 (git:test)", "own-2026-07")
+    };
     let mut j = Journal::open_with(dir.path(), cfg).expect(
         "recorder ОБЯЗАН стартовать на каталоге с НЕзадекларированным legacy-сегментом: \
          иначе деплой M-08 = остановка сбора данных на проде",
@@ -97,7 +104,14 @@ fn prod_migration_recorder_starts_and_never_touches_legacy_bytes() {
 fn prod_migration_stream_blocked_until_legacy_declared() {
     let (dir, _, _) = prod_like_dir();
     {
-        let cfg = WriterConfig::own_capture("recorder v0 (git:test)", "own-2026-07");
+        let cfg = WriterConfig {
+            // TD-025: disk-guard (min_free_bytes) проверяется ОТДЕЛЬНО в red_retention. Этот
+            // тест — про КОРРЕКТНОСТЬ миграции (новый сегмент, legacy цел, seq), и его исход
+            // НЕ СМЕЕТ зависеть от свободного места хоста (иначе StorageGuard на full-disk
+            // чекауте валит tester — тест меряет окружение, а не миграцию; класс TD-023).
+            min_free_bytes: 0,
+            ..WriterConfig::own_capture("recorder v0 (git:test)", "own-2026-07")
+        };
         let mut j = Journal::open_with(dir.path(), cfg).expect("open_with");
         for i in 0..50 {
             j.append(trade(1_000 + i)).expect("append");
