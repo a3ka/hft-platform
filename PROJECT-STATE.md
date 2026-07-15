@@ -387,6 +387,37 @@ reviewer сверил `tree(4d92373)==tree(2b2311f)` побайтово — arch
   для durable-сдвига дедлайна нужна установка + фикс TD-024); ретеншен (`--mode apply`, cold-выгрузка)
   не запускался — нет Storage Box (founder ★); TD-016 наблюдение и TD-006/TD-020 остаются OPEN.
 
+### rev 12 (задача 20 — активация cron, хвост 1) — REVIEWER APPROVED + MERGED (`d3e7db2`, §8 CRON АКТИВЕН, 2026-07-15)
+Durable-компакция: cron активирован на проде + позитивный heartbeat (silent-absence детектируется).
+Ветка `feat/M-08-cron-activation` (2 коммита, ff): `eb0e6cc` architect (README модель активации +
+мониторинг + гейт **D9 RED** + milestone) → `d3e7db2` engine-dev (cron-скрипты пишут `*.last-success`).
+- **Positive heartbeat (D9):** оба cron-скрипта на УСПЕШНОМ прогоне пишут `*.last-success` (UTC).
+  `*.alert` ловит «прогон УПАЛ», `*.last-success` freshness ловит «cron НЕ запускался» (не установлен/
+  crond мёртв/ребут) — РАЗНЫЕ классы отказа, нужны ОБА (урок сессии: и сбой, и МОЛЧАНИЕ видимы). D9-гейт
+  прогоняет скрипт со стабом-успехом, проверяет запись маркера — не грепом.
+- **Модель активации (governance):** артефакты доставляются через репо/образ, но `install /etc/cron.d`
+  — ОСОЗНАННЫЙ РУЧНОЙ шаг с founder-★ (не авто-`deploy.yml`: цена ошибки на автомате с data-модифи-
+  цирующим расписанием выше). Retention остаётся `--mode=dry-run` (apply — после Storage Box).
+- **Гейты (reviewer независимо):** fmt/clippy clean, verify_delivery PASS (D8+**D9** обоих сервисов),
+  crontab -n 0. **CI на `d3e7db2` GREEN** (adequate-disk runner). RED-first: D9-гейт при `eb0e6cc` есть,
+  `*.last-success` в скриптах — только с `d3e7db2`.
+  ⚠ **`verify_M-08.sh` FAIL ЛОКАЛЬНО** на `red_prod_migration` (`error: StorageGuard`) — pre-existing
+  **env-флейк**: тест берёт `WriterConfig::own_capture` (min_free=10 GiB), а локальный диск 8.9 GiB/98%.
+  НЕ логика, НЕ эта ветка (crates/journal не тронут): **CI на adequate-disk = GREEN**. Заведён **TD-025**
+  (architect: min_free_bytes:0 в тесте как у соседних фикстур ИЛИ требование к test-env; блокирует
+  tester task 7 на full-disk чекауте).
+- **§8 CRON АКТИВАЦИЯ на VPS (founder-★ авторизация relayed через диспетч):** deploy НЕ триггерился
+  (deploy-only пути), поэтому reviewer обновил чекаут VPS до `d3e7db2` (скрипты несут `.last-success`),
+  установил `/etc/cron.d/hft-journal-retention` (компакция `50 3`, ретеншен dry-run `7 4`) + `/var/{log,
+  lib}/hft`, restart cron. **Eyes-on АВТО-прогона** (temp every-minute schedule): cron сам отработал →
+  **свежий `compaction.last-success` 2026-07-15T18:56:02Z** (heartbeat пишется), alert не взведён,
+  **legacy-0 байт-в-байт цел** (`234583c8…`), recorder healthy restarts=0; прогон компактил 0 (keep_raw=2
+  берёг единственные 2 закрытых, legacy skipped — штатно). Real-schedule восстановлен. Disk-moving
+  компакция через ЭТОТ код-путь доказана §8-B rev10/rev11 дважды (+4.69, +1.94 GB); recurring 03:50
+  сожмёт по мере накопления. ⇒ **хвост 1 закрыт; TD-024 CLOSED; TD-006/TD-020 durable-замедлены.**
+- **M-08 всё ещё IN_PROGRESS:** хвост 2 — Storage Box + retention apply (founder ★). После него:
+  tester clean-checkout verify (см. TD-025 про disk) → architect close-out → reviewer финальный §8.
+
 ### rev 11 (задача 19 — TD-024 equals-form CLI) — REVIEWER APPROVED + MERGED (`e31e23e`, §8 PROD GREEN, 2026-07-15)
 Фикс delivery-дефекта, пойманного §8 rev10: операторский путь через `docker compose run` был сломан.
 Ветка `feat/M-08-td024` (3 коммита, fast-forward): `475bbd5` architect RED `red_cli_argv.rs` (гоняет

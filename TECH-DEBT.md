@@ -158,6 +158,36 @@
   нет Storage Box (`/mnt/*` пуст, founder ★). Компакция снижает темп роста (~9× на закрытых), но
   БЕЗ ретеншена диск всё равно растёт (медленнее). Установка cron + Storage Box + фикс TD-024 —
   условие полного закрытия TD-020 и M-08.
+  **СТАТУС 2026-07-15 (task 20 / rev12, `d3e7db2`, reviewer §8): CRON АКТИВИРОВАН — компакция теперь
+  DURABLE (авто), но ДОЛГ OPEN до Storage Box.** Из трёх хвостов выше закрыты (1) и (2):
+  • **(2) TD-024 CLOSED** (task 19) — compose-путь чинён, парсер принимает equals-форму.
+  • **(1) cron УСТАНОВЛЕН и АВТО-прогон подтверждён eyes-on** (task 20): `/etc/cron.d/hft-journal-
+    retention` (компакция `50 3 * * *`, ретеншен dry-run `7 4 * * *`), crond active; reviewer
+    доказал АВТО-запуск (temp every-minute) — cron сам отработал: **свежий `compaction.last-success`
+    2026-07-15T18:56:02Z** (позитивный heartbeat пишется, silent-absence детектируется), alert не
+    взведён, legacy-0 байт-в-байт цел (`234583c8…`), recorder healthy. Тот прогон компактил 0
+    (keep_raw=2 берёг единственные 2 закрытых; legacy skipped) — штатно; реальный 03:50 сожмёт по
+    мере накопления закрытых сегментов (recorder закрывает ~9/сут). Disk-moving компакция через ЭТОТ
+    же код-путь доказана в §8-B дважды (+4.69, +1.94 GB). Мониторинг: `*.alert` (сбой) + `*.last-success`
+    freshness (>26ч = молчит) — оба маркера, D9-гейт.
+  • **(3) РЕТЕНШЕН apply — по-прежнему OPEN:** нет Storage Box (`/mnt/*` пуст, founder ★); cron стоит
+    на `--mode=dry-run` (правильно — apply без cold-выгрузки не должен удалять). Компакция снижает ТЕМП
+    роста, но durable-СНИЖЕНИЕ = ретеншен с cold. **TD-020 закрывается вместе с Storage Box + первым
+    успешным apply.**
+- **TD-025** `red-prod-migration-fails-on-full-host-disk` (найдено reviewer'ом на §8 M-08 task 20,
+  2026-07-15). SACRED-тест `crates/journal/tests/red_prod_migration.rs` использует
+  `WriterConfig::own_capture(...)`, у которого `min_free_bytes` = ПРОД-дефолт **10 GiB**. На чекауте с
+  <10 GiB свободного (у reviewer'а локально: 8.9 GiB / 437G, 98%) оба теста падают с `error:
+  StorageGuard` (disk-guard срабатывает на реальный порог) — `verify_M-08.sh` → VERDICT: FAIL.
+  **Это НЕ логика:** подтверждено независимо — CI (adequate-disk runner) на `d3e7db2` `cargo test`
+  GREEN, и ветка task 20 не трогает `crates/journal`. Пре-existing env-чувствительность: пороговый
+  тест зависит от АБСОЛЮТНОГО свободного места ХОСТА. Соседние фикстуры (`red_rotation`,
+  `red_segments_epochs`) задают `min_free_bytes: 0` явно; `red_prod_migration` унаследовал прод-дефолт.
+  **Следствие:** блокирует task 7 (tester `verify_M-08` PASS на чистом чекауте) на full-disk хосте —
+  тестовое окружение обязано иметь ≥10 GiB, ЛИБО тест задаёт `min_free_bytes: 0` (как соседи; disk-guard
+  проверяется отдельно в `red_retention`). Зона: architect (SACRED-тест, не reviewer). Патч
+  однострочный (min_free_bytes: 0 в own_capture-вызовах теста) ИЛИ явное требование к test-env.
+  Severity: **MINOR** (тест-качество/окружение; прод не затронут, CI зелёный).
 - **TD-021** `memory-metric-includes-page-cache` (найдено reviewer'ом на §8 M-08, 2026-07-14).
   Все прежние замеры памяти recorder'а (мои в TD-016: 8.4 → 48 → 139 MiB; оракульная мотивация
   «+6.5 MiB/час») снимались через `docker stats`, который показывает cgroup `memory.current` —
@@ -348,6 +378,11 @@
   (диск +4.69 GB, ~5-9× на закрытых), но ДОЛГ OPEN.** Разовая ручная компакция место освободила;
   для durable-сдвига дедлайна нужен УСТАНОВЛЕННЫЙ cron (сейчас не установлен) + фикс TD-024, а для
   реального СНИЖЕНИЯ (не только замедления роста) — ретеншен с cold-выгрузкой (Storage Box, ★).
+  **СТАТУС 2026-07-15 (task 20, `d3e7db2`): CRON АКТИВИРОВАН — компакция теперь durable, TD-024
+  CLOSED. Диск durable-замедлен, но НЕ снижается без ретеншена.** cron установлен (`50 3` компакция,
+  `7 4` ретеншен dry-run), АВТО-прогон подтверждён eyes-on (см. TD-020). Темп роста будет durable
+  сбит компакцией (~9×), но абсолютное СНИЖЕНИЕ диска требует ретеншена apply + Storage Box (★).
+  **TD-006 закрывается вместе с TD-020** (Storage Box + первый успешный retention apply).
   **СТАТУС 2026-07-14 (tasks 14/15 rollback `b43044d`): всё ещё OPEN.** Реальная prod-компакция
   закрытого сегмента не была выполнена: стек с `compact_closed_segments` откатан из-за красного
   dry-run ретеншена, свободное место не увеличено, deadline disk-guard не отодвинут.
