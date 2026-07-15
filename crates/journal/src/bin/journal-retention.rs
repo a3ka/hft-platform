@@ -95,7 +95,22 @@ fn parse_args() -> Result<Args, String> {
     let mut now_wall_ms: Option<i64> = None;
     let mut mode: Option<RetentionMode> = None;
 
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    // TD-024: нормализовать argv ПЕРЕД циклом разбора. `--flag=value` (equals-форма — ровно
+    // то, что лежит в `docker-compose.yml command:` и печатает `--help`) раскладываем в два
+    // отдельных элемента `--flag` + `value`, чтобы ручной `match arg { "--flag" => next() }`
+    // ниже мог работать единой формой для обоих вариантов. Раздельная форма (как в cron-скрипте)
+    // проходит через `vec![a]` без изменений — регрессии нет.
+    let args: Vec<String> = std::env::args()
+        .skip(1)
+        .flat_map(|a| {
+            if a.starts_with("--") {
+                if let Some((k, v)) = a.split_once('=') {
+                    return vec![k.to_string(), v.to_string()];
+                }
+            }
+            vec![a]
+        })
+        .collect();
     let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
