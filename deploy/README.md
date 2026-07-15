@@ -173,7 +173,26 @@ docker compose --profile ops run --rm journal-retention
 echo "exit=$?"  # должно быть 0
 
 # Шаг 4.2: первый apply вручную (НЕ через cron).
-docker compose --profile ops run --rm journal-retention --mode apply
+#
+# ⚠️ ЛОВУШКА TD-024: `docker compose run <svc> --mode apply` НЕ дописывает `--mode apply`
+# к `command:`-блоку сервиса, а ЗАМЕНЯЕТ его ЦЕЛИКОМ. В итоге бинарь запускается с ОДНИМ
+# аргументом `--mode=apply` → DEFAULT_DIR становится `./journal-data` (а не боевой
+# `/journal`), DEFAULT_COLD=`./journal-cold` (а не `/cold`) → apply «отработает» на
+# пустом/чужом каталоге, что для ретеншена = «нечего удалять» (на сухую ничего не
+# сломается, но и данные не уйдут в Storage Box; оператор думает, что apply прошёл).
+#
+# Безопасная форма — повторить ВЕСЬ argv из compose `command:` с заменой `--mode=dry-run`
+# на `--mode=apply`. Это гарантирует, что `--dir=/journal`, `--cold=/cold`,
+# `--retain-days`, `--keep-min`, `--min-free-gb` НЕ потеряны и apply попадёт ровно в
+# боевой каталог. Альтернатива через `--env`/override-файл работает, но ручное повторение
+# argv — проще проверить глазами (см. §5: «команда не из репо — потенциальный drift»).
+docker compose --profile ops run --rm journal-retention \
+  --dir=/journal \
+  --cold=/cold \
+  --retain-days=14 \
+  --keep-min=4 \
+  --min-free-gb=10 \
+  --mode=apply
 echo "exit=$?"
 ```
 
