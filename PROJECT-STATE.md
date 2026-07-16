@@ -543,6 +543,46 @@ TD-006 и TD-022 остаются OPEN.**
   «счастливого пути»** (M-07 — событие с одним филлом; M-08 — симметричный дифф). Оракул границы
   ресурса обязан иметь и деградированный/асимметричный вход.
 
+## Data safety net (M-09 «система сама сообщает о тихой деградации», P2.5 — 🚧 ACTIVE; task 1 CT-RFC-03 MERGED + В ПРОДЕ inert-safe, reviewer Block-C APPROVED 2026-07-16)
+Milestone открыт (план принят: critic C-007 APPROVE → reviewer → founder ★ P2.5). **Задача 1
+(CT-RFC-03, T1, БЛОКИРУЮЩАЯ) — смержена в прод**, merge `cf53e81` (`--no-ff` feat/M-09 → main).
+Цепочка: architect (`64c0a9e`) → critic C-008 APPROVE (`367c2de`) → reviewer Block-C APPROVED.
+- `crates/contracts` (**CT-RFC-03**, atomic RFC `docs/rfc/CT-RFC-03-recon-audit.md`) — аддитивный
+  вариант `SysEvent::ReconDivergence(ReconAudit)` (postcard-дискриминант **3** строго в хвост;
+  Heartbeat/ConnUp/ConnDown=0/1/2 неизменны) + `ReconAudit{venue,symbol,divergence_bps,
+  best_price_diverged,action}` + `ReconAction{AlertOnly,Resynced}`. Durable-след recon-расхождения
+  в ЖУРНАЛЕ (не лог/метрика, OPS-I-6): офлайн отвечает «каким участкам данных верить».
+  `best_price_diverged` отделяет порчу лучшей цены (ε_test / C1-класс, эвикция стирала best bid)
+  от шума дальних полос. Поля struct ФИКСИРОВАНЫ — расширение только новым RFC (postcard
+  struct-append не аддитивен для старых записей). `schema_version` НЕ бампится (остаётся 2):
+  аддитивный `EventKind`, не изменение формата сегмента (прецедент CT-RFC-01); старые журналы
+  читаются байт-в-байт (CT-I-3). Пакет полный: типы + JSON Schema **сгенерирована**
+  (`gen_schema`, гейт `red_schema` CT-I-4) + фикстуры valid/invalid + CHANGELOG + RED `red_rfc03.rs`.
+  `Event`/`EventKind`/`MdEvent`/`Venue`/`SegmentHeader`/старые `SysEvent`-варианты НЕ изменены.
+- **Contract Block-C (reviewer, независимая верификация на чистом worktree):** scope — диф только
+  `crates/contracts/**` внутри атомарного RFC-коммита + критик-вердикт C-008; не-RFC T1-правок нет;
+  Cargo.toml/Cargo.lock/order-path/risk/oms/venue не тронуты. CT-I-1 канарейка: `EventKind`/
+  `SysEvent`/`ReconAudit`/`ReconAction` определены ровно в одном крейте. CT-I-4: регенерация схемы →
+  нулевой diff. **Анти-плацебо доказан reviewer'ом независимо:** удаление варианта → compile-RED
+  (exit 101); восстановление → GREEN 6/6. Гейты: `red_rfc03` 6/6, `red_schema` 2/2, contracts all
+  GREEN, **workspace 191/0** (аддитивность не сломала потребителей), fmt/clippy clean.
+- **MD-only observability — risk-critic НЕ требуется** (gates §5 carve-out): вариант — чистое
+  аудит-событие, НЕ несёт risk/order/money-формы (нет `RiskApproved`/`Order`/`Ctl`/`Decision`),
+  нет order-egress; consistent с founder-★ M-09 планом и прецедентом CT-RFC-01/02 (contract-RFC
+  гейтится critic'ом, risk-critic — когда контракт трогает safety/деньги-путь). Reviewer подтвердил
+  отсутствие order-пути в дифе.
+- **§8 eyes-on (прод `cf53e81`, 2026-07-16) — GREEN, инертно:** CI success + Deploy success (гейт
+  `deploy: needs: ci` отработал). VPS git sha = `cf53e81`; recorder healthy, **restarts=0**
+  (started 10:01:59Z), `panic/ERROR/backstop = 0`; heartbeat свежий (~2с) и несёт состояние
+  (`writable=true`, `free_bytes=111 GB`, `next_seq=30 627 037`, `segment_index=14`); ротация идёт
+  (`segment-00000014.jrnl` растёт, `seq` сквозной); 3 venue подключены (binance/hyperliquid/
+  binance_futures); `RssAnon = 11 828 kB` (норма per TD-021, ср. M-08 baseline 11 376 kB).
+  **`ReconDivergence` в журнал НЕ пишется** — эмиттера ещё нет (recon runtime = task 2), поведение
+  recorder тождественно до-деплойному. book levels baseline после рестарта: BTC `5030/5027`,
+  ETH `5033/5028` (точка отсчёта для наблюдения TD-016).
+- **Разблокирует task 2** (recon runtime OPS-I-1..9). **M-09 остаётся 🚧 ACTIVE** — далее architect:
+  RED-оракулы OPS-I-1..9 + `scripts/verify_M-09.sh` (task 2+).
+
 ## Пока НЕ реализовано (следующие фазы)
 - Крейты `risk`/`killswitch`/`oms`, `runner` — пофазно per DESIGN §10 (M-08: fail-closed риск-гейт
   между `strategy` и `oms`). MM-котирование, wiring весов из `signals.json` (граница B),
