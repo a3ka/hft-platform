@@ -289,6 +289,62 @@
         }
       ]
     },
+    "ReconAction": {
+      "description": "Действие recon по факту расхождения (CT-RFC-03). Порядок вариантов ФИКСИРОВАН (postcard).",
+      "oneOf": [
+        {
+          "description": "Расхождение зафиксировано, принудительный ресинк НЕ выполнялся (ниже resync-порога, либо ресинк уже идёт по venue-логике).",
+          "type": "string",
+          "enum": [
+            "AlertOnly"
+          ]
+        },
+        {
+          "description": "Выполнен принудительный ресинк книги из REST-снапшота (`book_resync_total`++).",
+          "type": "string",
+          "enum": [
+            "Resynced"
+          ]
+        }
+      ]
+    },
+    "ReconAudit": {
+      "description": "Полезная нагрузка recon-аудита (CT-RFC-03). Поля ФИКСИРОВАНЫ: добавление поля в struct ломает postcard-формат старых записей ⇒ расширение — только новым contract-RFC. Набор выбран минимальным и достаточным, чтобы офлайн-тулинг (research-dev, `research/data-quality/`) мог ответить «каким сегментам данных верить»: venue+symbol+момент (из `Event.seq/ts`)+магнитуда+ была ли порча лучшей цены+что сделали.",
+      "type": "object",
+      "required": [
+        "action",
+        "best_price_diverged",
+        "divergence_bps",
+        "symbol",
+        "venue"
+      ],
+      "properties": {
+        "action": {
+          "description": "Что recon сделал по факту расхождения.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ReconAction"
+            }
+          ]
+        },
+        "best_price_diverged": {
+          "description": "Расхождение по ЛУЧШЕЙ цене (bid/ask). `true` — это порча (`ε_test`), а не шум полос: эвикция C1-класса стирала именно best bid. Отдельный флаг, потому что это качественно иной класс, чем расхождение дальних сумм.",
+          "type": "boolean"
+        },
+        "divergence_bps": {
+          "description": "Максимальное расхождение сумм ценовых полос локальной книги vs REST-снапшота, bps (×1). Магнитуда (≥ 0 по смыслу; тип `i64` — единая fixed-point-конвенция контрактов).",
+          "type": "integer",
+          "format": "int64"
+        },
+        "symbol": {
+          "description": "Канонический тикер площадки (как в `MdEvent.symbol`).",
+          "type": "string"
+        },
+        "venue": {
+          "$ref": "#/definitions/Venue"
+        }
+      }
+    },
     "Side": {
       "description": "Сторона.",
       "type": "string",
@@ -325,6 +381,19 @@
           "properties": {
             "ConnDown": {
               "$ref": "#/definitions/Venue"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Аудит сверки локальной книги с независимым REST-снапшотом биржи (OPS-I-1, CT-RFC-03). Пишется, когда recon обнаружил расхождение выше порога — durable-след «каким участкам данных верить». Метрики (`book_divergence_bps`) в журнал НЕ пишутся (OPS-I-6): расхождение — доменный ФАКТ о данных, а не наблюдательная метрика. **Строго в конце enum** (postcard- дискриминант 3; Heartbeat/ConnUp/ConnDown = 0/1/2 неизменны, CT-I §6).",
+          "type": "object",
+          "required": [
+            "ReconDivergence"
+          ],
+          "properties": {
+            "ReconDivergence": {
+              "$ref": "#/definitions/ReconAudit"
             }
           },
           "additionalProperties": false

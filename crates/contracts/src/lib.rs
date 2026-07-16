@@ -148,6 +148,43 @@ pub enum SysEvent {
     Heartbeat,
     ConnUp(Venue),
     ConnDown(Venue),
+    /// Аудит сверки локальной книги с независимым REST-снапшотом биржи (OPS-I-1, CT-RFC-03).
+    /// Пишется, когда recon обнаружил расхождение выше порога — durable-след «каким участкам
+    /// данных верить». Метрики (`book_divergence_bps`) в журнал НЕ пишутся (OPS-I-6): расхождение
+    /// — доменный ФАКТ о данных, а не наблюдательная метрика. **Строго в конце enum** (postcard-
+    /// дискриминант 3; Heartbeat/ConnUp/ConnDown = 0/1/2 неизменны, CT-I §6).
+    ReconDivergence(ReconAudit),
+}
+
+/// Полезная нагрузка recon-аудита (CT-RFC-03). Поля ФИКСИРОВАНЫ: добавление поля в struct ломает
+/// postcard-формат старых записей ⇒ расширение — только новым contract-RFC. Набор выбран
+/// минимальным и достаточным, чтобы офлайн-тулинг (research-dev, `research/data-quality/`) мог
+/// ответить «каким сегментам данных верить»: venue+symbol+момент (из `Event.seq/ts`)+магнитуда+
+/// была ли порча лучшей цены+что сделали.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ReconAudit {
+    pub venue: Venue,
+    /// Канонический тикер площадки (как в `MdEvent.symbol`).
+    pub symbol: String,
+    /// Максимальное расхождение сумм ценовых полос локальной книги vs REST-снапшота, bps (×1).
+    /// Магнитуда (≥ 0 по смыслу; тип `i64` — единая fixed-point-конвенция контрактов).
+    pub divergence_bps: i64,
+    /// Расхождение по ЛУЧШЕЙ цене (bid/ask). `true` — это порча (`ε_test`), а не шум полос:
+    /// эвикция C1-класса стирала именно best bid. Отдельный флаг, потому что это качественно
+    /// иной класс, чем расхождение дальних сумм.
+    pub best_price_diverged: bool,
+    /// Что recon сделал по факту расхождения.
+    pub action: ReconAction,
+}
+
+/// Действие recon по факту расхождения (CT-RFC-03). Порядок вариантов ФИКСИРОВАН (postcard).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub enum ReconAction {
+    /// Расхождение зафиксировано, принудительный ресинк НЕ выполнялся (ниже resync-порога,
+    /// либо ресинк уже идёт по venue-логике).
+    AlertOnly,
+    /// Выполнен принудительный ресинк книги из REST-снапшота (`book_resync_total`++).
+    Resynced,
 }
 
 /// Площадка. Расширяется аддитивно (СТРОГО в конец — CT-I §6, сохраняет postcard-индексы).
