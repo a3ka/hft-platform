@@ -49,10 +49,16 @@ pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// реализуется через комбинацию `max_per_min` + внешний scheduler (оркестратор).
 pub const DEFAULT_MAX_PER_MIN: u32 = 1;
 
-/// `GET /api/v3/depth?symbol=...&limit=5000` — независимый эндпоинт для recon.
-/// Источник истины для сравнения с локально реконструированной книгой.
-const REST_DEPTH_BASE: &str = "https://api.binance.com/api/v3/depth?symbol=";
-const REST_DEPTH_LIMIT: &str = "5000";
+/// Боевой `base_url` (дефолт `ReconConfig::new`, чтобы прод не менялся).
+/// Поле `ReconConfig.base_url` подменяется `with_base_url(..)` для тестов (liveness-RED
+/// стреляет в локальный 418-мок на `127.0.0.1:0`).
+pub const PROD_BASE_URL: &str = "https://api.binance.com";
+/// Путь + query-префикс `/api/v3/depth?symbol=` — единый для прод и теста; в тесте мок
+/// принимает ЛЮБОЙ path (он не парсит URL, отвечает 418 на всё), так что подстановка
+/// только хоста безопасна.
+const DEPTH_PATH_PREFIX: &str = "/api/v3/depth?symbol=";
+/// `limit=5000` — топ-5000 уровней с каждой стороны, как в бутстрапе `lib.rs::run`.
+const DEPTH_LIMIT: &str = "5000";
 
 /// Ошибка recon-fetch'а. Семантика согласована с `ops::budget::RestOutcome` через
 /// [`ReconError::to_outcome`]: `RateLimited → RateLimited { retry_after }`, прочее → `Error`.
@@ -206,15 +212,21 @@ pub fn parse_retry_after_header(headers: &reqwest::header::HeaderMap) -> Option<
 
 /// Сырой JSON-fetch одного snapshot с timeout-ом. Публичный — может переиспользоваться
 /// оркестратором для offline-тестов на записанных снимках (replay-проверка, audit).
+///
+/// **URL строится из `cfg.base_url`** (по умолчанию `PROD_BASE_URL`) — шов для
+/// liveness-RED-теста: подменой `base_url` фетчер направляется на локальный 418-мок.
+/// Только источник URL подменяется; парсинг/классификация/бюджет — без изменений.
 pub async fn fetch_snapshot_json(
     client: &reqwest::Client,
-    symbol: &str,
-    timeout: Duration,
+    cfg: &ReconConfig,
 ) -> Result<String, ReconError> {
-    let url = format!("{REST_DEPTH_BASE}{symbol}&limit={REST_DEPTH_LIMIT}");
+    let url = format!(
+        "{}{}{}&limit={DEPTH_LIMIT}",
+        cfg.base_url, DEPTH_PATH_PREFIX, cfg.symbol
+    );
     let response = client
         .get(&url)
-        .timeout(timeout)
+        .timeout(cfg.request_timeout)
         .send()
         .await
         .map_err(|e| ReconError::Other(e.into()))?;
@@ -239,10 +251,9 @@ pub async fn fetch_snapshot_json(
 /// тестов и для оркестратора, если он предпочитает делать цикл сам.
 pub async fn fetch_recon_snapshot(
     client: &reqwest::Client,
-    symbol: &str,
-    timeout: Duration,
+    cfg: &ReconConfig,
 ) -> Result<OrderBook, ReconError> {
-    let json = fetch_snapshot_json(client, symbol, timeout).await?;
+    let json = fetch_snapshot_json(client, cfg).await?;
     parse_recon_snapshot(&json)
 }
 
@@ -251,6 +262,9 @@ pub async fn fetch_recon_snapshot(
 #[derive(Debug, Clone)]
 pub struct ReconConfig {
     pub symbol: String,
+    /// Базовый URL для REST snapshot fetch. Дефолт = `PROD_BASE_URL` (api.binance.com);
+    /// подменяется через `with_base_url` в тестах (liveness-RED) или для staging.
+    pub base_url: String,
     pub request_timeout: Duration,
     pub max_per_min: u32,
 }
@@ -259,9 +273,18 @@ impl ReconConfig {
     pub fn new(symbol: impl Into<String>) -> Self {
         Self {
             symbol: symbol.into(),
+            base_url: PROD_BASE_URL.to_string(),
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             max_per_min: DEFAULT_MAX_PER_MIN,
         }
+    }
+
+    /// Шов для тестов: подменить `base_url` (например, на `http://127.0.0.1:PORT`).
+    /// Прод не меняется (дефолт `PROD_BASE_URL` остаётся в `ReconConfig::new`).
+    /// Builder-style: `ReconConfig::new("BTCUSDT").with_base_url("http://localhost:8080")`.
+    pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
+        self.base_url = url.into();
+        self
     }
 }
 
@@ -302,7 +325,7 @@ impl ReconFetcher {
     /// Один fetch (HTTP + parse → `OrderBook` или `ReconError`). Публичный для
     /// unit/integration тестов и для оркестратора.
     pub async fn fetch_once(&self) -> Result<OrderBook, ReconError> {
-        fetch_recon_snapshot(&self.client, &self.cfg.symbol, self.cfg.request_timeout).await
+        fetch_recon_snapshot(&self.client, &self.cfg).await
     }
 
     /// Запустить цикл до закрытия `tx` (получатель ушёл → graceful exit).
@@ -543,6 +566,7 @@ mod tests {
         let client = reqwest::Client::new();
         let cfg = ReconConfig {
             symbol: "BTCUSDT".into(),
+            base_url: PROD_BASE_URL.to_string(),
             request_timeout: Duration::from_secs(5),
             max_per_min: 5,
         };
