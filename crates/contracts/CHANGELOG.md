@@ -3,6 +3,26 @@
 Формат: одна секция на contract-RFC. Журнал бессмертен: старые записи обязаны читаться
 новым кодом всегда (CT-I-3). Правки T1 вне RFC → авто-REJECT (CT-I-2, Block-C).
 
+## schema_version 2 — CT-RFC-03 «Аудит сверки с биржей» (2026-07-16)
+
+Аддитивно (версия НЕ меняется — как CT-RFC-01, это вариант `EventKind`, не формат сегмента):
+- `SysEvent::ReconDivergence(ReconAudit)` — durable-след recon-расхождения (OPS-I-1, M-09):
+  `{venue, symbol, divergence_bps, best_price_diverged, action}`; **строго в конце** enum
+  (postcard-дискриминант 3; Heartbeat/ConnUp/ConnDown = 0/1/2 неизменны).
+- `ReconAction { AlertOnly, Resynced }` (0/1).
+
+**Мотив.** Recon (сверка локальной книги с REST-снапшотом биржи) — единственная проверка
+ПРАВИЛЬНОСТИ данных (эвикция C1 стирала best bid при зелёном healthcheck). Расхождение — факт
+о ДАННЫХ, обязан жить в том же журнале, что данные (не в логе/метрике), иначе нельзя ответить
+«каким сегментам верить». Метрики в журнал не пишутся (OPS-I-6) — поэтому нужен доменный вариант.
+
+**НЕ изменено:** `Event`, `EventKind`, `MdEvent`, `MdPayload`, `Venue`, `Side`, `Level`,
+`SegmentHeader`, `SysEvent::{Heartbeat,ConnUp,ConnDown}` — wire-формат прежний, старые сегменты
+читаются байт-в-байт (CT-I-3, RED `red_rfc03.rs`). `schema_version` остаётся 2.
+
+**Схема:** `event.schema.json` перегенерирована (`gen_schema`), гейт `red_schema.rs` (CT-I-4).
+Фикстуры: `valid/event-recon.json`, `invalid/event-recon-unknown-action.json`.
+
 ## schema_version 2 — CT-RFC-02 «Provenance и эпохи журнала» (2026-07-13)
 
 **Мотив.** Founder докупает историю. Купленные данные обязаны входить через тот же журнал,
