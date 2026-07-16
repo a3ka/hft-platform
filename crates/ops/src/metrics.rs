@@ -11,7 +11,9 @@
 //! явно; RED-оракул проверяет, что labeled-серии рендерятся с нужными ключами и что значение
 //! РЕАЛЬНО меняется (no-op/статический вывод обязаны падать).
 
-use std::sync::atomic::AtomicU64;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Arc, Mutex};
 
 /// Тип метрики: счётчик (монотонно растёт) или gauge (устанавливается).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,31 +118,119 @@ pub fn metric_names() -> Vec<&'static str> {
     METRICS.iter().map(|m| m.name).collect()
 }
 
+/// Ключ серии: имя + сортированный по ключу вектор `(key, value)`-пар.
+/// Сортировка детерминирует канонический порядок меток в выводе (одинаковые серии рендерятся
+/// одинаково вне зависимости от порядка передачи).
+type SeriesKey = (String, Vec<(String, String)>);
+
 /// Реестр метрик. Инкремент — lock-free (`&self`, атомики, OPS-I-7); экспорт — по запросу.
+///
+/// Внутренняя структура:
+///  - `Mutex<HashMap>` защищает только создание/поиск серии (холодный путь: первое касание);
+///  - `Arc<AtomicI64>` — инкремент/запись БЕЗ удержания мьютекса (горячий путь, OPS-I-7);
+///  - на чтение (`prometheus_text`) мьютекс удерживается — scrape-вызов НЕ горячий.
+///
+/// Counter и Gauge делят `AtomicI64`: counter растёт монотонно (`fetch_add`), gauge перезаписывается
+/// (`store`). Один HashMap дешевле, чем два; тип метрики уже различает семантику.
 pub struct Metrics {
-    _writes: AtomicU64,
+    series: Mutex<HashMap<SeriesKey, Arc<AtomicI64>>>,
 }
 
 impl Metrics {
     pub fn new() -> Self {
-        todo!("OPS-I-4: инициализировать все METRICS (с нулями), учесть размерности labels")
+        Self {
+            series: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Найти или создать серию (короткое удержание мьютекса). Возвращает `Arc<AtomicI64>`,
+    /// с которым операции можно делать БЕЗ мьютекса.
+    fn get_or_create(&self, name: &str, labels: &[(&str, &str)]) -> Arc<AtomicI64> {
+        let key = build_key(name, labels);
+        let mut map = self.series.lock().expect("metrics mutex poisoned");
+        map.entry(key)
+            .or_insert_with(|| Arc::new(AtomicI64::new(0)))
+            .clone()
     }
 
     /// Инкремент СЧЁТЧИКА `name` c данными `labels` на `by`. `&self` (атомик, OPS-I-7).
     /// `labels` — пары (ключ, значение) для размерностей из `MetricSpec.labels`.
-    pub fn inc_counter(&self, _name: &str, _labels: &[(&str, &str)], _by: u64) {
-        todo!("OPS-I-7: атомарный fetch_add по (name, labels); no-op запрещён (RED проверит рост)")
+    pub fn inc_counter(&self, name: &str, labels: &[(&str, &str)], by: u64) {
+        let cell = self.get_or_create(name, labels);
+        cell.fetch_add(by as i64, Ordering::Relaxed);
     }
 
     /// Установить GAUGE `name` c `labels` в `value`. `&self` (атомик).
-    pub fn set_gauge(&self, _name: &str, _labels: &[(&str, &str)], _value: i64) {
-        todo!("OPS-I-7: атомарная запись по (name, labels); no-op запрещён")
+    pub fn set_gauge(&self, name: &str, labels: &[(&str, &str)], value: i64) {
+        let cell = self.get_or_create(name, labels);
+        cell.store(value, Ordering::Relaxed);
     }
 
-    /// Prometheus text. OPS-I-4: КАЖДАЯ метрика `METRICS` присутствует; labeled-серии рендерятся
-    /// как `name{k1="v1",k2="v2"} value` с ВСЕМИ ключами из `MetricSpec.labels` (C-009 M2).
+    /// Prometheus text. OPS-I-4: КАЖДАЯ метрика `METRICS` присутствует (через `# HELP`/`# TYPE`
+    /// строки — иначе неизмеренная метрика исчезает, и grep-канарейка валится); labeled-серии
+    /// рендерятся как `name{k1="v1",k2="v2"} value` с ВСЕМИ ключами из `MetricSpec.labels`
+    /// (C-009 M2 — размерность не схлопывается).
     pub fn prometheus_text(&self) -> String {
-        todo!("OPS-I-4: рендер всех METRICS; labeled — с ключами labels; значения из атомиков")
+        let mut out = String::with_capacity(2048);
+
+        // (1) Каждая МЕТРИКА из канона → `# HELP` и `# TYPE` строки. Это гарантирует, что
+        // `text.contains(spec.name)` проходит ДО того, как у метрики появилась хотя бы одна серия
+        // (OPS-I-4: «отсутствие метрики = отсутствие подсистемы»).
+        for spec in METRICS {
+            out.push_str(&format!("# HELP {} {}\n", spec.name, spec.name));
+            out.push_str(&format!(
+                "# TYPE {} {}\n",
+                spec.name,
+                match spec.kind {
+                    MetricKind::Counter => "counter",
+                    MetricKind::Gauge => "gauge",
+                }
+            ));
+        }
+
+        // (2) Все известные серии. Короткое копирование ключей+значений под мьютексом, дальше
+        // рендер без блокировки.
+        let snapshot: Vec<(SeriesKey, i64)> = {
+            let map = self.series.lock().expect("metrics mutex poisoned");
+            map.iter()
+                .map(|(k, cell)| (k.clone(), cell.load(Ordering::Relaxed)))
+                .collect()
+        };
+
+        for ((name, labels), value) in snapshot {
+            out.push_str(&render_series(&name, &labels, value));
+        }
+
+        out
+    }
+}
+
+/// Канонический ключ серии: имя + лекс-сортированные `(key, value)`-пары.
+fn build_key(name: &str, labels: &[(&str, &str)]) -> SeriesKey {
+    let mut sorted: Vec<(String, String)> = labels
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+        .collect();
+    sorted.sort_by(|a, b| a.0.cmp(&b.0));
+    (name.to_string(), sorted)
+}
+
+/// Рендер одной серии: `name{k="v",...} value` (или `name value` для безлейбловых).
+fn render_series(name: &str, labels: &[(String, String)], value: i64) -> String {
+    if labels.is_empty() {
+        format!("{name} {value}\n")
+    } else {
+        let mut s = String::with_capacity(64);
+        s.push_str(name);
+        s.push('{');
+        for (i, (k, v)) in labels.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push_str(&format!("{k}=\"{v}\""));
+        }
+        s.push_str(&format!("}} {value}\n"));
+        s
     }
 }
 

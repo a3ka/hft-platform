@@ -8,7 +8,7 @@
 //! калибруется), `ε_max` (fail-closed потолок; `ε_prod ≤ ε_max`).
 
 use book::OrderBook;
-use contracts::{ReconAction, ReconAudit, Venue};
+use contracts::{ReconAction, ReconAudit, Side, Venue};
 
 /// ε_test (гейт RED, НЕ калибруется): ЛЮБОЕ расхождение best bid/ask ИЛИ ≥ этого по суммам полос.
 pub const EPS_TEST_BPS: i64 = 50;
@@ -28,8 +28,14 @@ pub struct ReconThresholds {
 
 impl ReconThresholds {
     /// `Err`, если `prod_bps > EPS_MAX_BPS` (fail-closed: нельзя откалибровать порог до бесконечности).
-    pub fn new(_prod_bps: i64) -> Result<Self, String> {
-        todo!("OPS-I-1: prod_bps ≤ EPS_MAX_BPS иначе Err (fail-closed потолок)")
+    pub fn new(prod_bps: i64) -> Result<Self, String> {
+        if prod_bps > EPS_MAX_BPS {
+            return Err(format!(
+                "ε_prod={prod_bps} > ε_max={EPS_MAX_BPS}: fail-closed потолок превышен \
+                 (нельзя откалибровать порог до бесконечности, OPS-I-1)"
+            ));
+        }
+        Ok(Self { prod_bps })
     }
     pub fn prod_bps(&self) -> i64 {
         self.prod_bps
@@ -49,23 +55,56 @@ impl ReconOutcome {
     /// Превышает `ε_test`: best-price разошлась ИЛИ `divergence_bps ≥ EPS_TEST_BPS`.
     /// Всегда алерт (с первой минуты, `ε_test` не калибруется).
     pub fn exceeds_test(&self) -> bool {
-        todo!("OPS-I-1: best_price_diverged || divergence_bps >= EPS_TEST_BPS")
+        self.best_price_diverged || self.divergence_bps >= EPS_TEST_BPS
     }
     /// Превышает рабочий `ε_prod` (алерт в проде после калибровки).
-    pub fn exceeds_prod(&self, _thr: &ReconThresholds) -> bool {
-        todo!("OPS-I-1: best_price_diverged || divergence_bps >= thr.prod_bps")
+    pub fn exceeds_prod(&self, thr: &ReconThresholds) -> bool {
+        self.best_price_diverged || self.divergence_bps >= thr.prod_bps
     }
     /// Аудит-событие для журнала (CT-RFC-03). `divergence_bps`/`best_price_diverged` — из self.
-    pub fn to_audit(&self, _venue: Venue, _symbol: &str, _action: ReconAction) -> ReconAudit {
-        todo!("OPS-I-1: собрать ReconAudit из outcome (venue/symbol/bps/best/action)")
+    pub fn to_audit(&self, venue: Venue, symbol: &str, action: ReconAction) -> ReconAudit {
+        ReconAudit {
+            venue,
+            symbol: symbol.to_string(),
+            divergence_bps: self.divergence_bps,
+            best_price_diverged: self.best_price_diverged,
+            action,
+        }
     }
 }
 
 /// Сверить локальную книгу с REST-референсом: best bid/ask + суммы полос `RECON_BANDS`.
 /// Чистая функция (детерминизм). `reference` — книга, собранная из REST-снапшота (venue-dev).
-pub fn reconcile(_local: &OrderBook, _reference: &OrderBook) -> ReconOutcome {
-    todo!(
-        "OPS-I-1: best_price_diverged = (best_bid|best_ask отличаются); \
-         divergence_bps = max по RECON_BANDS от |sum_local - sum_ref| / sum_ref в bps"
-    )
+///
+/// **Bounded-time:** O(|RECON_BANDS| × |side| × depth) = O(n) по сумме уровней обеих сторон.
+/// Для 5000-уровневой книги Binance — десятки тысяч операций за один reconcile; на медленном CPU
+/// десятки мкс (замер в §6.1 FA). Никаких вложенных сканов по одним и тем же уровням.
+///
+/// `best_price_diverged`: лучшая цена ЛЮБОЙ стороны отличается. Это ПОРЧА (C1 — эвикция стирала
+/// именно best bid), не шум дальних полос; алертится ВСЕГДА (ε_test), независимо от ε_prod.
+///
+/// `divergence_bps`: максимум по `RECON_BANDS` относительного расхождения сумм объёмов в полосе,
+/// в basis points (1 bp = 0.01%, ×10000). `denom = max(|sum_ref|, 1)` — нулевой референс даёт
+/// `|sum_local|/1`, а не деление на 0 (REF-снапшот с одной битой стороной не должен падать).
+pub fn reconcile(local: &OrderBook, reference: &OrderBook) -> ReconOutcome {
+    let best_price_diverged =
+        local.best_bid() != reference.best_bid() || local.best_ask() != reference.best_ask();
+
+    let mut max_bps: i64 = 0;
+    for &band in &RECON_BANDS {
+        for side in [Side::Buy, Side::Sell] {
+            let l = local.depth_within(side, band);
+            let r = reference.depth_within(side, band);
+            let denom = if r.abs() < 1 { 1 } else { r.abs() };
+            let diff_bps = ((l - r).abs() * 10_000) / denom;
+            if diff_bps > max_bps {
+                max_bps = diff_bps;
+            }
+        }
+    }
+
+    ReconOutcome {
+        divergence_bps: max_bps,
+        best_price_diverged,
+    }
 }

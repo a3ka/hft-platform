@@ -8,6 +8,9 @@
 pub const SILENCE_THRESHOLD_MS: i64 = 5 * 60 * 1000;
 
 /// `true` — поток молчит дольше порога (алерт P1). Отсутствие события — САМ сигнал, а не «ждём ещё».
-pub fn is_silent(_md_event_age_ms: i64, _threshold_ms: i64) -> bool {
-    todo!("OPS-I-8: age_ms > threshold_ms")
+///
+/// Чистая функция, детерминирована (часы снаружи — вызывающий передаёт возраст).
+/// Строгое `>` : ровно-порог ещё НЕ тишина (граничный кейс RED).
+pub fn is_silent(md_event_age_ms: i64, threshold_ms: i64) -> bool {
+    md_event_age_ms > threshold_ms
 }
