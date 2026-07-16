@@ -10,10 +10,21 @@
 //! (тот же `EventKind`-конверт, что у всех событий; никакого спец-пути).
 
 use book::OrderBook;
-use contracts::{EventKind, Venue};
+use contracts::{EventKind, ReconAction, SysEvent, Venue};
 
 use crate::metrics::Metrics;
 use crate::recon::{reconcile, ReconThresholds};
+
+/// Канонические `venue`-labels для метрик §3 (согласованы с `venue_binance::VENUE_LABEL`,
+/// `venue_binance_futures::VENUE_LABEL`). `hl` отдельным RED'ом; пока нет recon-фетчера
+/// на HL (M-09 task 2 — binance/futures), `match` с `_ => "unknown"` страхует.
+fn venue_label(v: Venue) -> &'static str {
+    match v {
+        Venue::Binance => "binance",
+        Venue::BinanceFutures => "binance_futures",
+        Venue::Hyperliquid => "hyperliquid",
+    }
+}
 
 /// Обработать один recon-снапшот.
 ///
@@ -27,24 +38,39 @@ use crate::recon::{reconcile, ReconThresholds};
 /// Возвращает `true`, если событие эмитировано. `emit` — замыкание рекордера, шлющее в его
 /// mpsc-канал (`JR-I-1`). Функция журнал НЕ трогает.
 pub fn handle_recon_snapshot(
-    _local: &OrderBook,
-    _reference: &OrderBook,
-    _thr: &ReconThresholds,
-    _venue: Venue,
-    _symbol: &str,
-    _metrics: &Metrics,
-    mut _emit: impl FnMut(EventKind),
+    local: &OrderBook,
+    reference: &OrderBook,
+    thr: &ReconThresholds,
+    venue: Venue,
+    symbol: &str,
+    metrics: &Metrics,
+    mut emit: impl FnMut(EventKind),
 ) -> bool {
-    // Подсказка impl (engine-dev): let out = reconcile(local, reference);
-    //   if out.exceeds_test() || out.exceeds_prod(thr) {
-    //       let audit = out.to_audit(venue, symbol, ReconAction::Resynced);
-    //       emit(EventKind::Sys(SysEvent::ReconDivergence(audit)));
-    //       metrics.set_gauge("book_divergence_bps", &[("venue",..),("symbol",symbol)], out.divergence_bps);
-    //       metrics.inc_counter("book_resync_total", &[("venue",..),("symbol",symbol)], 1);
-    //       true
-    //   } else { false }
-    let _ = reconcile;
-    todo!(
-        "OPS-I-1 sink: divergence → emit Sys(ReconDivergence) + метрики; норма → false, без эмита"
-    )
+    let out = reconcile(local, reference);
+
+    // `exceeds_test()` (ε_test, не калибруется) ИЛИ `exceeds_prod(thr)` (ε_prod).
+    // Любое из них — расхождение, требующее ресинка и аудита (`FA §4`: алерт + ресинк +
+    // `Sys(ReconDivergence)`). `ReconAction::Resynced` — ресинк уже произведён на уровне
+    // venue-фетчера (book.apply_snapshot(reference)); см. handoff M-09 task 2.
+    if out.exceeds_test() || out.exceeds_prod(thr) {
+        let audit = out.to_audit(venue, symbol, ReconAction::Resynced);
+        emit(EventKind::Sys(SysEvent::ReconDivergence(audit)));
+
+        let vlabel = venue_label(venue);
+        metrics.set_gauge(
+            "book_divergence_bps",
+            &[("venue", vlabel), ("symbol", symbol)],
+            out.divergence_bps,
+        );
+        metrics.inc_counter(
+            "book_resync_total",
+            &[("venue", vlabel), ("symbol", symbol)],
+            1,
+        );
+        true
+    } else {
+        // НОРМА: алерт ТОЛЬКО on divergence. Канал не шумит (alert only on divergence;
+        // `red_recon_sink::normal_book_is_silent` ловит no-op-impl).
+        false
+    }
 }

@@ -14,10 +14,16 @@ use std::future::Future;
 /// Запустить recon-итерацию ИЗОЛИРОВАННО. Паника/ошибка внутри `f` поймана и НЕ пробрасывается
 /// наружу — append-цикл рекордера не затрагивается (`JR-I-1`, 24/7). Возвращает `JoinHandle`;
 /// `.await` на нём отдаёт `Err(JoinError)` при панике, но НЕ разворачивает стек вызывающего.
-pub fn spawn_recon_isolated<F, Fut>(_f: F) -> tokio::task::JoinHandle<()>
+pub fn spawn_recon_isolated<F, Fut>(f: F) -> tokio::task::JoinHandle<()>
 where
     F: FnOnce() -> Fut + Send + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
-    todo!("M-09: tokio::spawn(async move {{ f().await }}) — паника таска изолируется рантаймом")
+    // `tokio::spawn` гарантирует, что паника внутри `async`-блока поймана рантаймом:
+    // задача завершается с `JoinError`, а НЕ разворачивает стек вызывающего. Это и есть
+    // изоляция `JR-I-1` (writer живёт 24/7, recon-сбой не смеет его задеть). См. RED
+    // `red_recon_loop::recon_panic_does_not_stop_append`.
+    tokio::spawn(async move {
+        f().await;
+    })
 }
