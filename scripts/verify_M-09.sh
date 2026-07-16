@@ -43,22 +43,34 @@ else
   pass "OPS-I-6 метрики не в журнал (ops не зависит от journal в рантайме)"
 fi
 
-# ── OPS-I-5 (двусторонний паритет): код (METRIC_NAMES) ↔ FA §3 ↔ FA §7.1 ───────────────
-# Канон имён — METRIC_NAMES в коде. FA §3 и §7.1 обязаны быть согласованы с ним В ОБЕ СТОРОНЫ.
+# ── OPS-I-5 (двусторонний паритет): код (METRICS) ↔ FA §3 ↔ FA §7.1 ────────────────────
+# Канон имён метрик — `METRICS` (name: "…") в коде. FA §3 и §7.1 согласованы с ним В ОБЕ СТОРОНЫ.
 FA="docs/fa/ops.md"
-names_code=$(grep -oE '"[a-z_]+"' crates/ops/src/metrics.rs | tr -d '"' | sort -u)
+names_code=$(grep -oE 'name: "[a-z_]+"' crates/ops/src/metrics.rs | sed -E 's/name: "//; s/"//' | sort -u)
 names_fa3=$(sed -n '/## §3/,/## §4/p' "${FA}" | grep '^| `' | grep -oE '`[a-z_]+(\{[^}]*\})?`' | sed -E 's/`//g; s/\{.*//' | sort -u)
 names_fa71=$(sed -n '/### §7.1/,/Правило паритета/p' "${FA}" | grep '^| `' | grep -oE '`[a-z_]+(\{[^}]*\})?`' | sed -E 's/`//g; s/\{.*//' | sort -u)
 
 # (а) каждое имя §7.1 существует в §3 И в коде (правило без метрики невозможно).
 miss71=$(comm -23 <(echo "${names_fa71}") <(echo "${names_code}") | grep -v '^$' || true)
 [ -z "${miss71}" ] && pass "OPS-I-5 §7.1→код: каждое правило ссылается на существующую метрику" \
-  || fail "OPS-I-5 §7.1 ссылается на метрику(и) вне METRIC_NAMES: ${miss71//$'\n'/ }"
+  || fail "OPS-I-5 §7.1 ссылается на метрику(и) вне METRICS: ${miss71//$'\n'/ }"
 
 # (б) каждая метрика кода объявлена в §3 (метрика без места в §3 = вне паритета).
 miss3=$(comm -23 <(echo "${names_code}") <(echo "${names_fa3}") | grep -v '^$' || true)
-[ -z "${miss3}" ] && pass "OPS-I-5 код→§3: каждая METRIC_NAMES объявлена в §3" \
-  || fail "OPS-I-5 METRIC_NAMES вне §3: ${miss3//$'\n'/ }"
+[ -z "${miss3}" ] && pass "OPS-I-5 код→§3: каждая METRICS объявлена в §3" \
+  || fail "OPS-I-5 метрика(и) кода вне §3: ${miss3//$'\n'/ }"
+
+# (в, C-009 M1) КАЖДЫЙ КАНОНИЧЕСКИЙ КЛАСС ИНЦИДЕНТА обязан иметь строку §7.1 (иначе целый класс
+# выпадает из паритета — ровно C-007 C1). Удаление, напр., строки `C1-M08` (порча книги, P0)
+# обязано ВАЛИТЬ гейт. Список — канон P0/P1-классов ops.md §7; расширяется вместе с §7.1.
+REQUIRED_INCIDENTS="TD-011 TD-013 TD-014 TD-016 C1-M08 TD-006 OPS-BKP OPS-SILENCE OPS-RESYNC OPS-GAP"
+rows71=$(sed -n '/### §7.1/,/Правило паритета/p' "${FA}" | grep -oE '^\| `[A-Za-z0-9-]+`' | tr -d '`|' | tr -d ' ' | sort -u)
+miss_inc=""
+for id in ${REQUIRED_INCIDENTS}; do
+  echo "${rows71}" | grep -qx "${id}" || miss_inc="${miss_inc} ${id}"
+done
+[ -z "${miss_inc}" ] && pass "OPS-I-5 §7.1 покрывает все канонические классы инцидентов (класс без правила невозможен)" \
+  || fail "OPS-I-5 из §7.1 пропали ОБЯЗАТЕЛЬНЫЕ классы инцидентов:${miss_inc} — целый класс порчи вне алертов (регрессия C-007 C1)"
 
 echo
 if [ "${FAILED}" -gt 0 ]; then
