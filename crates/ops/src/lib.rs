@@ -9,3 +9,4 @@ pub mod budget;
 pub mod metrics;
 pub mod recon;
 pub mod silence;
+pub mod sink;
