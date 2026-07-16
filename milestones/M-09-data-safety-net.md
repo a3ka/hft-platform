@@ -1,8 +1,9 @@
 # M-09 — Data safety net: система сама сообщает о тихой деградации (P2.5)
 
-STATUS: **PROPOSED** (план, 2026-07-15, architect). Проходит plan-time гейт (`gates.md` §1 + §1.1
-T1-триггер): critic → (contract-RFC) → reviewer → founder ★ (приёмка фазы P2.5). До вердикта
-critic'а RED-оракулы и типы CT-RFC-03 НЕ пишутся (форма `SysEvent` зависит от recon-дизайна FA).
+STATUS: **ACTIVE** (план ПРИНЯТ 2026-07-16: critic C-007 APPROVE → reviewer APPROVED → founder ★
+приёмка фазы P2.5; исходный PROPOSED — 2026-07-15, architect). Doc-гейт `gates.md` §9 пройден,
+`docs/fa/ops.md` → ACTIVE. **Следующий шаг impl-цепочки:** architect пишет CT-RFC-03 (T1,
+БЛОКИРУЮЩАЯ) + RED-оракулы по OPS-I-1..9 на `feat/M-09` (RED не живёт на main, `gates.md` §8).
 
 **ЗАВИСИМОСТЬ (жёсткая):** `docs/fa/ops.md` — STATUS PROPOSED. Пока FA не ПРИНЯТ
 (critic → reviewer → founder ★), этот milestone не уходит в impl: OPS-I-1..9 из FA — источник
@@ -56,7 +57,7 @@ recon-дизайном FA §4 и уточняется на critic-аудите �
 
 | # | Статус | Задача | Кто | Acceptance |
 |---|---|---|---|---|
-| 0 | ⏳ | **FA-приёмка (ПРЕДУСЛОВИЕ):** `docs/fa/ops.md` PROPOSED → ACTIVE через doc-гейт | critic → reviewer → founder ★ | вердикт critic + founder-подпись; STATUS ACTIVE |
+| 0 | ✅ | **FA-приёмка (ПРЕДУСЛОВИЕ):** `docs/fa/ops.md` PROPOSED → ACTIVE через doc-гейт | critic → reviewer → founder ★ | ✅ 2026-07-16: critic C-007 APPROVE + reviewer APPROVED + founder ★; `ops.md` STATUS ACTIVE |
 | 1 | ⏳ | **CT-RFC-03 (T1, БЛОКИРУЮЩАЯ):** вариант `SysEvent::ReconDivergence`/`Resync` (форма — по FA §4) + JSON Schema + фикстуры + `CT-I-6`/RFC-RED; аддитивность CT-I-3 | architect | workspace компилируется; roundtrip старых журналов; RFC-RED падает на заглушке |
 | 2 | ⏳ | **Recon (OPS-I-1 + OPS-I-9):** периодический REST-снапшот vs локальная книга; расхождение > `ε` → алерт + ресинк + `Sys`-событие; **rate-budget/backoff** (honor 418/429/`Retry-After`, cap, запрет ресинк-штормов — прямой урок TD-013) | venue-dev (REST) + engine-dev (ops) | RED: (а) `ε_test` — инъецированная порча книги (удалённый/искажённый уровень, расхождение best) ОБЯЗАНА поднять алерт; (б) OPS-I-9 — инъецированный поток REST-ошибок НЕ даёт hot-loop |
 | 3 | ⏳ | **Сохранность (OPS-I-2/3):** cold-copy журнала offsite (Storage Box) + **restore-drill** (скачать→прочитать `journal::stream`, `seq` непрерывен) — на РЕАЛЬНОМ сегменте, legacy-0 первым | engine-dev | RED/§8: restore-drill на реальном сегменте (не фикстуре); удаление горячей копии — только через `ColdCopyProof` |

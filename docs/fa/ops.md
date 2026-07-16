@@ -1,7 +1,9 @@
 # FA — ops: наблюдаемость, сверка с биржей, сохранность данных (Слой 7)
 
-STATUS: **PROPOSED** (FA v1, 2026-07-14, architect). Проходит doc-гейт (`gates.md` §9):
-critic → reviewer → founder ★. До вердикта работа по этому FA НЕ стартует.
+STATUS: **ACTIVE** (FA v1 ПРИНЯТ 2026-07-16 через doc-гейт `gates.md` §9 Class A:
+critic C-007 APPROVE → reviewer APPROVED → founder ★ приёмка фазы P2.5. Исходный PROPOSED:
+2026-07-14, architect). Работа по этому FA (milestone M-09) разблокирована; OPS-I-1..9 —
+источник RED-оракулов. Изменения FA после приёмки — снова через doc-гейт §9.
 
 Планово-архитектурный документ: **что** мы строим и **какие инварианты** держим.
 Реализация — отдельными milestone'ами (`milestones/BACKLOG.md`).
