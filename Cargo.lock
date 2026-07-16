@@ -1685,8 +1685,10 @@ name = "venue-binance"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "book",
  "contracts",
  "futures-util",
+ "ops",
  "reqwest",
  "serde",
  "serde_json",
@@ -1700,8 +1702,10 @@ name = "venue-binance-futures"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "book",
  "contracts",
  "futures-util",
+ "ops",
  "reqwest",
  "serde",
  "serde_json",
