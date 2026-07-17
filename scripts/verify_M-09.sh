@@ -28,6 +28,8 @@ run "T1 схема CT-I-4 (event.schema.json == типы)" \
 # ── Task 2 (recon + budget + метрики) — RED пока impl не готов ────────────────────────
 run "T2 OPS-I-1 recon (ε_test, деградированные входы)" \
   cargo test -p ops --test red_ops_recon
+run "T2 OPS-I-1 recon LIVE-режим (near-book depth-aware, §8 анти-флуд, skew-толерантность)" \
+  cargo test -p ops --test red_recon_live
 run "T2 OPS-I-9 rate-budget (анти-hot-loop, TD-013)" \
   cargo test -p ops --test red_ops_budget
 run "T2 OPS-I-4/7/8 метрики+тишина" \

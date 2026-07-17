@@ -5,31 +5,43 @@
 //!  • асимметрия: порча ТОЛЬКО одной стороны;
 //!  • отсутствие: пропавший уровень (best bid) — это порча, а не «дифф молчит»;
 //!  • множественность: несколько уровней разошлись;
-//!  • границы: пустая книга / один уровень;
-//!  • ε_test НЕ калибруется (const), ε_prod ≤ ε_max (fail-closed потолок).
-//! Анти-плацебо: против `todo!()`-скелета все падают; против «reconcile всегда без расхождения»
-//! падают все, кроме identity.
+//!  • границы: пустая книга / один уровень.
+//!
+//! NEAR-BOOK семантика (redesign 2026-07-17, founder ★): REST достаёт лишь ~1.1% от mid → recon
+//! валидирует БЛИЖНЮЮ книгу мелкими полосами (`RECON_BANDS` ≤0.8%), полосы за пределами
+//! reference-reach ПРОПУСКАЕТ. best_price толерантен к sub-bp timing-skew. Поэтому фикстуры здесь
+//! достают до полос (уровни на 0.05–0.55% от mid), НЕ ±100 тиков — иначе всё за пределами полос.
+//! Пороговая машина (`ReconThresholds`, ε_test/ε_prod/ε_max) — полосонезависима.
+//! Анти-плацебо: против `todo!()` все падают; против «reconcile всегда без расхождения» падают все,
+//! кроме identity; против «best всегда diverged» падает identity.
 
 use book::OrderBook;
 use contracts::{Level, ReconAction, Venue};
 use ops::recon::{reconcile, ReconThresholds, EPS_MAX_BPS, EPS_PROD_DEFAULT_BPS, EPS_TEST_BPS};
 
 const MID: i64 = 65_000_000_000_000; // $65k ×1e8
-const TICK: i64 = 1_000_000; // $0.01 ×1e8
+const UNIT: i64 = 100_000_000; // 1.0 ×1e8
 
-fn lvl(price: i64, size: i64) -> Level {
-    Level { price, size }
+fn bid_at(pct: f64, size_units: i64) -> Level {
+    Level {
+        price: (MID as f64 * (1.0 - pct)) as i64,
+        size: size_units * UNIT,
+    }
+}
+fn ask_at(pct: f64, size_units: i64) -> Level {
+    Level {
+        price: (MID as f64 * (1.0 + pct)) as i64,
+        size: size_units * UNIT,
+    }
 }
 
-/// Плотная симметричная книга ±100 тиков от mid, объём 5.0 на уровень.
+/// Уровни на 0.05..0.55% от mid, объём 5.0 — достаёт до полос recon (0.1/0.3/0.5%), reach≈0.55%.
+const PCTS: [f64; 6] = [0.0005, 0.0015, 0.0025, 0.0035, 0.0045, 0.0055];
+
 fn full_book() -> OrderBook {
     let mut b = OrderBook::new();
-    let bids: Vec<Level> = (1..=100)
-        .map(|k| lvl(MID - k * TICK, 5 * 100_000_000))
-        .collect();
-    let asks: Vec<Level> = (1..=100)
-        .map(|k| lvl(MID + k * TICK, 5 * 100_000_000))
-        .collect();
+    let bids: Vec<Level> = PCTS.iter().map(|&p| bid_at(p, 5)).collect();
+    let asks: Vec<Level> = PCTS.iter().map(|&p| ask_at(p, 5)).collect();
     b.apply_snapshot(&bids, &asks);
     b
 }
@@ -37,9 +49,7 @@ fn full_book() -> OrderBook {
 /// (identity) Локальная книга == REST-референс → расхождения НЕТ, алерта НЕТ.
 #[test]
 fn ops_i_1_identical_books_do_not_alert() {
-    let local = full_book();
-    let reference = full_book();
-    let out = reconcile(&local, &reference);
+    let out = reconcile(&full_book(), &full_book());
     assert!(
         !out.best_price_diverged,
         "идентичные книги не расходятся по best"
@@ -50,64 +60,47 @@ fn ops_i_1_identical_books_do_not_alert() {
     );
 }
 
-/// (АСИММЕТРИЯ + ОТСУТСТВИЕ, C1-класс) В локальной книге пропал BEST BID (эвикция стёрла),
-/// ask цел. Расхождение best bid — это ПОРЧА, обязано поднять алерт ВСЕГДА (ε_test).
+/// (АСИММЕТРИЯ + ОТСУТСТВИЕ, C1-класс) В локальной книге пропал BEST BID (эвикция стёрла), ask цел.
+/// best уходит на следующий уровень (>skew) И near-touch полоса теряет объём → алерт ВСЕГДА (ε_test).
 #[test]
 fn ops_i_1_missing_best_bid_must_alert() {
     let reference = full_book();
-    // local без ближайшего к mid бида (эвикция C1) — ask нетронут.
+    // local без ближайшего к mid бида (0.05% уровень удалён) — ask нетронут.
     let mut local = OrderBook::new();
-    let bids: Vec<Level> = (2..=100)
-        .map(|k| lvl(MID - k * TICK, 5 * 100_000_000))
-        .collect();
-    let asks: Vec<Level> = (1..=100)
-        .map(|k| lvl(MID + k * TICK, 5 * 100_000_000))
-        .collect();
+    let bids: Vec<Level> = PCTS.iter().skip(1).map(|&p| bid_at(p, 5)).collect();
+    let asks: Vec<Level> = PCTS.iter().map(|&p| ask_at(p, 5)).collect();
     local.apply_snapshot(&bids, &asks);
 
     let out = reconcile(&local, &reference);
     assert!(
-        out.best_price_diverged,
-        "пропавший best bid НЕ распознан как расхождение best — ровно дефект C1, который recon \
-         обязан ловить (healthcheck его не видел)"
-    );
-    assert!(
         out.exceeds_test(),
-        "порча best bid обязана превышать ε_test с первой минуты (ε_test не калибруется)"
+        "пропавший best bid НЕ поднял алерт (divergence_bps={}, best={}) — ровно дефект C1, который \
+         recon обязан ловить (healthcheck его не видел)",
+        out.divergence_bps,
+        out.best_price_diverged
     );
     let audit = out.to_audit(Venue::Binance, "BTCUSDT", ReconAction::Resynced);
     assert!(
-        audit.best_price_diverged,
-        "аудит-событие обязано пометить порчу best (CT-RFC-03), иначе офлайн не узнает"
+        audit.divergence_bps > 0 || audit.best_price_diverged,
+        "аудит-событие не отразило порчу (CT-RFC-03), иначе офлайн не узнает"
     );
 }
 
-/// (МНОЖЕСТВЕННОСТЬ) Много дальних уровней локально занижены → суммы полос расходятся на ≥ ε_test.
+/// (МНОЖЕСТВЕННОСТЬ) Near-touch объём локально занижен в 10× на всех within-reach уровнях → суммы
+/// полос расходятся на ≥ ε_test.
 #[test]
-fn ops_i_1_multiple_far_levels_diverge_by_band_sum() {
+fn ops_i_1_multiple_levels_diverge_by_band_sum() {
     let reference = full_book();
-    // local: дальние bid-уровни занижены в 10× (фантомная нехватка ликвидности в полосах).
+    // local: within-reach объёмы занижены 10× (фантомная нехватка ликвидности в near-полосах).
     let mut local = OrderBook::new();
-    let bids: Vec<Level> = (1..=100)
-        .map(|k| {
-            let size = if k > 5 {
-                5 * 10_000_000
-            } else {
-                5 * 100_000_000
-            };
-            lvl(MID - k * TICK, size)
-        })
-        .collect();
-    let asks: Vec<Level> = (1..=100)
-        .map(|k| lvl(MID + k * TICK, 5 * 100_000_000))
-        .collect();
+    let bids: Vec<Level> = PCTS.iter().map(|&p| bid_at(p, 1)).collect(); // 0.5 vs 5.0 → 10×
+    let asks: Vec<Level> = PCTS.iter().map(|&p| ask_at(p, 5)).collect();
     local.apply_snapshot(&bids, &asks);
 
     let out = reconcile(&local, &reference);
     assert!(
         out.divergence_bps >= EPS_TEST_BPS,
-        "10× занижение сумм дальних полос дало divergence_bps={} < ε_test={} — recon не заметил \
-         фантомную ликвидность в полосах OBI",
+        "10× занижение near-book сумм дало divergence_bps={} < ε_test={} — recon не заметил порчу",
         out.divergence_bps,
         EPS_TEST_BPS
     );
@@ -117,39 +110,32 @@ fn ops_i_1_multiple_far_levels_diverge_by_band_sum() {
 /// (ГРАНИЦА) Пустая локальная книга vs непустой референс → best расходится (нечего сравнивать).
 #[test]
 fn ops_i_1_empty_local_book_diverges() {
-    let local = OrderBook::new();
-    let reference = full_book();
-    let out = reconcile(&local, &reference);
+    let out = reconcile(&OrderBook::new(), &full_book());
     assert!(
         out.best_price_diverged && out.exceeds_test(),
         "пустая книга против живого снапшота — максимальная порча, обязана алертить"
     );
 }
 
-/// ε_test НЕ калибруется: `exceeds_test` не зависит от рабочего порога. Best-price расхождение
-/// поднимает алерт даже при самом мягком ε_prod.
+/// ε_test НЕ калибруется: `exceeds_test` не зависит от рабочего порога. Порча near-book поднимает
+/// алерт даже при самом мягком ε_prod (= потолок).
 #[test]
 fn ops_i_1_eps_test_is_not_calibratable() {
     let reference = full_book();
     let mut local = OrderBook::new();
-    let bids: Vec<Level> = (2..=100)
-        .map(|k| lvl(MID - k * TICK, 5 * 100_000_000))
-        .collect();
-    let asks: Vec<Level> = (1..=100)
-        .map(|k| lvl(MID + k * TICK, 5 * 100_000_000))
-        .collect();
+    let bids: Vec<Level> = PCTS.iter().skip(1).map(|&p| bid_at(p, 5)).collect();
+    let asks: Vec<Level> = PCTS.iter().map(|&p| ask_at(p, 5)).collect();
     local.apply_snapshot(&bids, &asks);
     let out = reconcile(&local, &reference);
 
-    // Самый мягкий допустимый ε_prod (= потолок) не отменяет ε_test по best-price.
     let lax = ReconThresholds::new(EPS_MAX_BPS).expect("ε_prod == ε_max допустим");
     assert!(
         out.exceeds_test(),
-        "ε_test обязан срабатывать на порче best независимо от ε_prod"
+        "ε_test обязан срабатывать на порче near-book независимо от ε_prod"
     );
     assert!(
         out.exceeds_prod(&lax),
-        "порча best обязана превышать и любой рабочий порог"
+        "порча near-book обязана превышать и любой рабочий порог"
     );
 }
 

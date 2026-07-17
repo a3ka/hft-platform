@@ -16,33 +16,40 @@ use ops::recon::{ReconThresholds, EPS_PROD_DEFAULT_BPS};
 use ops::sink::handle_recon_snapshot;
 
 const MID: i64 = 65_000_000_000_000;
-const TICK: i64 = 1_000_000;
+const UNIT: i64 = 100_000_000; // 1.0 ×1e8
 
-fn lvl(p: i64, s: i64) -> Level {
-    Level { price: p, size: s }
+fn bid_at(pct: f64, size_units: i64) -> Level {
+    Level {
+        price: (MID as f64 * (1.0 - pct)) as i64,
+        size: size_units * UNIT,
+    }
 }
+fn ask_at(pct: f64, size_units: i64) -> Level {
+    Level {
+        price: (MID as f64 * (1.0 + pct)) as i64,
+        size: size_units * UNIT,
+    }
+}
+
+/// Уровни на 0.05..0.55% от mid (near-book redesign 2026-07-17): достают до полос recon (0.1/0.3/0.5%),
+/// reach≈0.55%. НЕ ±100 тиков (±0.0015%) — те были бы целиком ВНУТРИ первой полосы и с новым
+/// skip-за-reach правилом дали бы ложную тишину.
+const PCTS: [f64; 6] = [0.0005, 0.0015, 0.0025, 0.0035, 0.0045, 0.0055];
 
 fn full_book() -> OrderBook {
     let mut b = OrderBook::new();
-    let bids: Vec<Level> = (1..=100)
-        .map(|k| lvl(MID - k * TICK, 5 * 100_000_000))
-        .collect();
-    let asks: Vec<Level> = (1..=100)
-        .map(|k| lvl(MID + k * TICK, 5 * 100_000_000))
-        .collect();
+    let bids: Vec<Level> = PCTS.iter().map(|&p| bid_at(p, 5)).collect();
+    let asks: Vec<Level> = PCTS.iter().map(|&p| ask_at(p, 5)).collect();
     b.apply_snapshot(&bids, &asks);
     b
 }
 
-/// local без best bid (эвикция C1) — ask цел.
+/// local без best bid (эвикция C1) — 0.05% уровень удалён, ask цел. best уходит на 0.15% (>skew),
+/// near-touch полоса теряет объём → расхождение.
 fn book_missing_best_bid() -> OrderBook {
     let mut b = OrderBook::new();
-    let bids: Vec<Level> = (2..=100)
-        .map(|k| lvl(MID - k * TICK, 5 * 100_000_000))
-        .collect();
-    let asks: Vec<Level> = (1..=100)
-        .map(|k| lvl(MID + k * TICK, 5 * 100_000_000))
-        .collect();
+    let bids: Vec<Level> = PCTS.iter().skip(1).map(|&p| bid_at(p, 5)).collect();
+    let asks: Vec<Level> = PCTS.iter().map(|&p| ask_at(p, 5)).collect();
     b.apply_snapshot(&bids, &asks);
     b
 }
