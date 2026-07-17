@@ -262,3 +262,178 @@ After commit, hand back to critic for re-audit. Include commit SHA and updated m
 - None beyond the two REJECT blockers. The volume-window oracle design itself is reachable and anti-placebo.
 
 === END HANDOFF ===
+
+---
+
+## Re-audit 3b19a0c
+
+**Date:** 2026-07-17T22:09:47Z  
+**Agent:** critic  
+**Audited branch/head:** `origin/feat/M-09-task2 @ 3b19a0c`  
+**Audited revision commit:** `3b19a0c` (on top of `cbf011f`)  
+**Scope:** narrow re-audit of prior C-011 blockers B1/B2 only
+
+### Verdict
+
+**APPROVE**
+
+### B1 — verify gates the stateful sink oracle
+
+PASS.
+
+Evidence:
+
+```bash
+grep -n "red_recon_sink" scripts/verify_M-09.sh
+# 36:  cargo test -p ops --test red_recon_sink
+```
+
+`scripts/verify_M-09.sh:33-36` now runs both the window detector oracle and the stateful
+sink/emission oracle under Task 2. The gate no longer goes green while `handle_recon_snapshot`
+is still `todo!()`.
+
+Command:
+
+```bash
+bash scripts/verify_M-09.sh; echo exit=$?
+```
+
+Result: expected RED-phase failure:
+
+- FAIL: `red_recon_window`
+- FAIL: `red_recon_sink`
+- final line: `VERDICT: FAIL (2)`
+- exit: `1`
+
+This closes C-011 B1.
+
+### B2 — recorder carve-out
+
+PASS.
+
+Evidence:
+
+- `milestones/M-09-data-safety-net.md:48-57` explicitly grants engine-dev a Task-2 carve-out for
+  `crates/recorder/src/{main.rs,recon_loop.rs}`.
+- The carve-out names the planned `main.rs` rewire: hoist `ReconDetector::new(thr)` before
+  `while let Some(reference)`, pass `&mut detector` into `handle_recon_snapshot`, and remove the
+  old `thr` argument.
+- The same block limits the carve-out to recon-loop wiring / MD-only feeder work and explicitly
+  keeps the journal-write path and other recorder logic out of scope.
+- `milestones/M-09-data-safety-net.md:122-125` repeats the same engine-dev rewire note and points
+  back to Allowed paths.
+
+Assessment:
+
+- The carve-out is sufficient for the required `main.rs` state hoist and sink signature rewire.
+- Including `recon_loop.rs` is acceptable because the milestone text limits it to `apply_md_to_books`
+  / MD-book feeder work, not journal writing.
+- It does not authorize order-egress, `risk`, `killswitch`, `oms`, T1, or broader recorder changes.
+  Reviewer Block-scope has a concrete check: any recorder diff must be a subset of those two files
+  and must not touch journal-write/order path.
+
+This closes C-011 B2.
+
+### Revision scope
+
+PASS.
+
+`3b19a0c` touches only architect-owned plan/gate files:
+
+```text
+M milestones/M-09-data-safety-net.md
+M scripts/verify_M-09.sh
+```
+
+No code, tests, T1/contracts, `risk`, `killswitch`, `oms`, or venue/order path changed in the
+revision commit. `git diff --check cbf011f..3b19a0c` is clean.
+
+### Recommended next action
+
+Proceed to engine-dev for Task 2 implementation.
+
+=== HANDOFF: critic -> engine-dev ===
+
+#### §A — Metadata
+
+- UTC datetime: 2026-07-17T22:09:47Z
+- From agent: critic
+- Milestone: M-09 Task 2 volume-window recon
+- Verdict: APPROVE
+- Audited branch/head: `origin/feat/M-09-task2 @ 3b19a0c`
+- Critic verdict file: `research/critiques/C-011-M-09-volume-window.md`
+
+#### §B — What I checked
+
+- C-011 B1: `scripts/verify_M-09.sh` now runs `red_recon_sink`
+- C-011 B2: milestone Allowed paths now grants a narrow recorder recon-loop carve-out
+- Revision scope: only `milestones/M-09-data-safety-net.md` and `scripts/verify_M-09.sh`
+- Prior oracle semantics remain approved by C-011: reachable 21/21 and anti-placebo in both directions
+
+#### §C — Outcomes
+
+- APPROVE: plan-time blockers are closed.
+- Current RED-phase verify is correctly `VERDICT: FAIL (2)` on `red_recon_window` + `red_recon_sink`.
+- No CT-RFC needed for the windowed alert shape; T1 is unchanged.
+
+#### §D — Paste-ready prompt for engine-dev
+
+```text
+Ты — engine-dev проекта hft-platform. Рабочий каталог /home/nous/hft-platform.
+
+Branch: feat/M-09-task2. Bootstrap in your own worktree from latest origin/feat/M-09-task2.
+Read first:
+- CLAUDE.md
+- .claude/rules/scope-guard.md
+- .claude/rules/testing.md
+- milestones/M-09-data-safety-net.md §Allowed paths + Task 2 second §8 block
+- docs/fa/ops.md §4.3 / §6 OPS-I-1
+- research/critiques/C-011-M-09-volume-window.md, especially "Re-audit 3b19a0c"
+
+Task: implement M-09 Task 2 volume-window recon.
+
+Allowed paths:
+- crates/ops/src/recon.rs
+- crates/ops/src/sink.rs
+- crates/recorder/src/main.rs ONLY for recon-loop wiring per milestone carve-out
+- crates/recorder/src/recon_loop.rs ONLY for MD-book feeder / recon-loop wiring per milestone carve-out, if needed
+
+Forbidden:
+- Do not edit tests, docs, milestones, scripts/verify_M-09.sh, or research/critiques.
+- Do not touch crates/risk, crates/killswitch, crates/oms, crates/contracts/T1, venue order-egress, journal-write path, or unrelated recorder logic.
+
+Implementation contract:
+- Implement ReconDetector::observe as a stateful window over signed near-touch volume deltas per (band, side).
+- Use best-price per-cycle via reconcile (immediate alert), not windowed.
+- Keep per-cycle volume divergence as metric gauge only.
+- Skip volume bands beyond reference.max_reach_pct(side).
+- Threshold for window alert: EPS_TEST_BPS.min(thr.prod_bps()).
+- Implement handle_recon_snapshot through ReconDetector: update book_divergence_bps every cycle; emit Sys(ReconDivergence) + increment book_resync_total only on alert.
+- Rewire recorder recon-loop to hoist ReconDetector::new(thr) before while-loop and pass &mut detector to handle_recon_snapshot; remove old thr argument.
+
+Required verification:
+- cargo test -p ops --test red_recon_window
+- cargo test -p ops --test red_recon_sink
+- cargo test -p ops --test red_recon_live --test red_ops_recon
+- bash scripts/verify_M-09.sh
+
+Expected after implementation:
+- red_recon_window: 7/7 PASS
+- red_recon_sink: 4/4 PASS
+- red_recon_live + red_ops_recon: PASS
+- verify_M-09.sh should no longer fail on Task 2 window/sink; report any remaining RED from later M-09 tasks exactly.
+
+Commit and push:
+- One or more atomic commits scoped to Task 2.
+- Before push: `git log origin/feat/M-09-task2..HEAD --oneline` must contain only your commits.
+- Push fast-forward to `origin/feat/M-09-task2`.
+
+Return Done Block with raw command outputs and handoff to tester, then reviewer §8.
+```
+
+#### §E — Outstanding risks
+
+- Production `K` and windowed `ε_prod` remain `[verify-at-impl]` / §8 calibration; the oracle pins semantics, not final live tuning.
+- Final acceptance still requires feeder integration and reviewer §8 live Binance re-run after engine-dev implementation.
+
+=== END HANDOFF ===
