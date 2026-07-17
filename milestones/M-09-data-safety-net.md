@@ -45,6 +45,16 @@ recon-дизайном FA §4 и уточняется на critic-аудите �
   order-НЕзависимый REST-трафик → OPS-I-9 обязателен).
 - `deploy/**` (бэкап cold-copy + restore-drill + `/metrics` scrape) — **engine-dev**
   (деплой-механика, scope-guard carve-out; не секреты).
+- **`crates/recorder/src/{main.rs,recon_loop.rs}` — ТОЛЬКО recon-loop wiring (engine-dev, явный
+  Task-2 carve-out).** Оркестратор recon (`main.rs`: hoist `ReconDetector::new(thr)` ДО цикла
+  `while let Some(reference)`, передать `&mut detector` первым аргументом `handle_recon_snapshot`,
+  убрать старый `thr`-аргумент) + books-feeder (`recon_loop.rs`: `apply_md_to_books` из
+  `MdEvent::L2Snapshot`). MD-only плюмбинг для recon; **journal-write путь (`JR-I-1`: журнал пишет
+  только recorder) и прочая логика recorder НЕ трогаются**. Причина carve-out: оконное состояние
+  (`ReconDetector`) обязано жить у ВЛАДЕЛЬЦА цикла снапшотов (рекордера) — вынести некуда без
+  скрытого глобального состояния; recorder не входит в scope-guard-строку engine-dev, поэтому нужен
+  явный milestone-carve-out (C-011 B2). Reviewer в Block-scope подтверждает: диф recorder ⊂ этих
+  двух файлов и не трогает journal-write/order-путь.
 - `research/data-quality/**` (офлайн-сводка recon-расхождений + gap-статистика, агрегация журнала)
   — **research-dev** (scope-guard; ТА ЖЕ роль/путь, что уже пишет gap-статистику).
 - `*/tests/**` (OPS-I-* RED, sacred), `scripts/verify_M-09.sh` — **architect**.
@@ -109,9 +119,10 @@ Per-cycle порог по объёму **принципиально нежизн
   {best=false, divergence_bps=|mean|}) — **CT-RFC не нужен**.
 - фикс — ТОЛЬКО `crates/ops` (`ReconDetector` в `recon.rs` + stateful `sink.rs`; **engine-dev**).
   venue REST-фетчер / best-price / depth-skip / `BEST_SKEW` — НЕ трогаются (работают).
-- **engine-dev рервайрит `crates/recorder/src/main.rs`** recon-loop: `ReconDetector::new(thr)` ДО
-  `while let Some(reference)`, передать `&mut detector` первым аргументом `handle_recon_snapshot`
-  (сигнатура sink изменена — old `thr`-параметр убран). 3-строчная механическая правка.
+- **engine-dev рервайрит `crates/recorder/src/main.rs`** recon-loop (явный Task-2 carve-out —
+  см. §Allowed paths): `ReconDetector::new(thr)` ДО `while let Some(reference)`, передать
+  `&mut detector` первым аргументом `handle_recon_snapshot` (сигнатура sink изменена — old
+  `thr`-параметр убран). 3-строчная механическая правка, MD-only, journal-write не трогается.
 - sacred RED: НОВЫЙ `crates/ops/tests/red_recon_window.rs` (7 оракулов: churn→тишина вкл. 3-подряд-знак,
   персистентный дефицit/профицит, C1-эвикция оконно, ε_test не калибруем оконно, детерминизм);
   `red_recon_sink.rs` переписан на stateful (churn-последовательность→тишина, персистент/best→эмит);

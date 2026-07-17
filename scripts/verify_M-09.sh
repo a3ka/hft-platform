@@ -32,6 +32,8 @@ run "T2 OPS-I-1 recon LIVE-режим (near-book depth-aware, §8 анти-фл�
   cargo test -p ops --test red_recon_live
 run "T2 OPS-I-1 recon ОКОННАЯ персистентность (churn→тишина, порча→алерт; второй §8-провал, §4.3)" \
   cargo test -p ops --test red_recon_window
+run "T2 OPS-I-1 recon SINK stateful (эмиссия через ReconDetector: churn-последовательность→тишина, персистент/best→Sys+метрики)" \
+  cargo test -p ops --test red_recon_sink
 run "T2 OPS-I-9 rate-budget (анти-hot-loop, TD-013)" \
   cargo test -p ops --test red_ops_budget
 run "T2 OPS-I-4/7/8 метрики+тишина" \
