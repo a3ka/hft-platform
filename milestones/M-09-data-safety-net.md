@@ -86,6 +86,43 @@ recon-дизайном FA §4 и уточняется на critic-аудите �
 - **отдельный трек (НЕ M-09):** фантом дальних полос 6–60% (TD-016) REST-неверифицируем — корректность
   within-band эвикции + возможный platform-reference (§5.1 магнитудная загадка). Founder ★ развилка позже.
 
+## Task 2 — ВТОРОЙ §8-провал: объёмный timing-skew → оконная персистентность (2026-07-17, architect + founder ★)
+
+После near-book redesign engine-dev реализовал near-book recon (`4bd67ec`, 16/16 recon-сюита GREEN).
+Reviewer прогнал §8 отдельным замером (2 живых прогона Binance ×210с, оба feeder'а): depth-asymmetry
+(виток 1) ЗАКРЫТА, best-price ложняки УСТРАНЕНЫ (`best_price_diverged=false`), магнитуда упала ~10–30×.
+**НО recon ВСЁ ЕЩЁ флудил** `ReconDivergence` ~1/цикл/символ (`band_divergence` 16–853 bps, большинство
+`> ε_test=50`) на ЗДОРОВОМ рынке. §8-тишина НЕ достигнута — этажом глубже.
+
+**Измеренный корень (architect, воспроизведён 2026-07-17):** near-book ОБЪЁМНЫЕ суммы полос расходятся
+между local (WS-книга, момент T1) и reference (async REST, момент T2) из-за timing-skew — near-touch
+объём BTC/ETH churn'ит за секунды, **ЗНАК per-cycle ГУЛЯЕТ** (`+-+`, `+--`, `-0+`; BTC BID 0.1% даже
+`---`). Прежний оракул `deep_local_vs_truncated_reference_does_not_flood` сравнивал ИДЕНТИЧНЫЙ near-book
+объём у local и reference → снова не смоделировал live (объёмный скью), тот же класс green-unit/live-flood.
+Per-cycle порог по объёму **принципиально нежизнеспособен** (тупик семантики), НЕ калибровка.
+
+**Redesign (founder ★ 2026-07-17 — оконная персистентность; детали `docs/fa/ops.md §4.3`):**
+- дискриминатор churn↔порча — НЕ магнитуда, а ПЕРСИСТЕНТНОСТЬ ЗНАКА (churn mean→0 за окно; порча держит
+  знак). recon становится STATEFUL (`ReconDetector`): окно `RECON_WINDOW` циклов на (полосу,сторону),
+  знаковое среднее. Best-price — ПО-ПРЕЖНЕМУ per-cycle (immediate). `book_divergence_bps` per-cycle →
+  ДЕМОТИРОВАН в метрику-гейдж (не триггер эмиссии). T1 НЕ меняется (windowed-алерт = `ReconAudit`
+  {best=false, divergence_bps=|mean|}) — **CT-RFC не нужен**.
+- фикс — ТОЛЬКО `crates/ops` (`ReconDetector` в `recon.rs` + stateful `sink.rs`; **engine-dev**).
+  venue REST-фетчер / best-price / depth-skip / `BEST_SKEW` — НЕ трогаются (работают).
+- **engine-dev рервайрит `crates/recorder/src/main.rs`** recon-loop: `ReconDetector::new(thr)` ДО
+  `while let Some(reference)`, передать `&mut detector` первым аргументом `handle_recon_snapshot`
+  (сигнатура sink изменена — old `thr`-параметр убран). 3-строчная механическая правка.
+- sacred RED: НОВЫЙ `crates/ops/tests/red_recon_window.rs` (7 оракулов: churn→тишина вкл. 3-подряд-знак,
+  персистентный дефицit/профицит, C1-эвикция оконно, ε_test не калибруем оконно, детерминизм);
+  `red_recon_sink.rs` переписан на stateful (churn-последовательность→тишина, персистент/best→эмит);
+  `red_recon_live.rs`/`red_ops_recon.rs` — per-cycle объёмные оракулы сняты (переехали в окно), best/
+  depth-skip остались. Прототип корректного impl → 21/21 GREEN (достижимо); анти-плацебо в обе стороны
+  (per-cycle → churn падает; always-silent → персистент падает). Skeleton (todo!()): window+sink RED,
+  live+ops_recon GREEN.
+- **§8-acceptance уточнён (founder ★):** «recon молчит на здоровой книге» достижимо ТОЛЬКО оконно;
+  per-cycle тишина по объёму невозможна физически (churn до 2007 bps). Задержка объёмной порчи — до
+  `K` циклов (best-порча — immediate). `K` + оконный `ε_prod` — калибровка на живом churn + §8.
+
 ## Acceptance (исполняемые ворота — BACKLOG M-09 + OPS-I-*)
 
 1. **`ε_test` не калибруется:** инъецированная порча книги ОБЯЗАНА поднять алерт; `ε_prod`
