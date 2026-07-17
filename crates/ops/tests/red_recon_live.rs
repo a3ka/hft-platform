@@ -163,6 +163,19 @@ fn deep_local_vs_truncated_reference_does_not_flood() {
         out.divergence_bps,
         out.best_price_diverged
     );
+    // ПИН DEPTH-SKIP (reconcile-путь, C-011 Concern-1 / Mutation B reviewer'а). `exceeds_test()`
+    // стал BEST-ONLY (§4.3: объём → окно), поэтому ассерция выше БОЛЬШЕ не трогает skip-путь и стала
+    // placebo к своему имени. Гейдж `divergence_bps` — единственная величина, которую считает
+    // reconcile по полосам, и ТОЛЬКО skip удерживает её на 0: near-book (0.1/0.3%) идентичен → 0, а
+    // полоса 0.5% ЗА reference.max_reach_pct (0.4%) ПРОПУСКАЕТСЯ. Убери skip (Mutation B) → полоса 0.5%
+    // сравнит local(0.45%-уровень)≫reference → divergence_bps≈26315 → ассерция ПАДАЕТ (анти-плацебо).
+    assert_eq!(
+        out.divergence_bps, 0,
+        "reconcile посчитал per-cycle расхождение ({}) на глубокой полосе, которую reference НЕ \
+         достаёт — depth-skip снят/сломан (§8-флуд #1 вернётся на тонком рынке). near-book идентичен, \
+         недостижимая полоса обязана ПРОПУСКАТЬСЯ → гейдж = 0",
+        out.divergence_bps
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -24,7 +24,7 @@
 //!  • ОТСУТСТВИЕ: churn с 3-подряд-одного-знака (реальный замер) не смеет тихо провоцировать алерт.
 
 use book::OrderBook;
-use contracts::Level;
+use contracts::{Level, Side};
 use ops::recon::{ReconDetector, ReconThresholds, EPS_MAX_BPS, EPS_PROD_DEFAULT_BPS, RECON_WINDOW};
 
 const MID: i64 = 65_000_000_000_000; // $65k ×1e8
@@ -308,4 +308,97 @@ fn detector_is_deterministic_across_replay() {
         "фикстура-сетап не состоялся: персистентный хвост обязан был поднять хотя бы один алерт \
          (иначе детерминизм проверяется вхолостую на вечной тишине)"
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// (8) DEPTH-SKIP В ОКОННОМ ПУТИ (C-011 Concern-1, Mutation B reviewer'а). Пиннит фикс ПЕРВОГО
+//     §8-флуда (асимметрия глубины §4.2): полоса, которую reference НЕ достаёт, ПРОПУСКАЕТСЯ в
+//     observe(). Прочие оракулы сюиты используют reference, достающий ВСЕ полосы (0.55%), поэтому
+//     skip-`continue` там НИКОГДА не срабатывает — depth-skip был не запиннен НИ ОДНИМ RED-оракулом
+//     (Mutation B: удаление skip → 21/21 всё равно GREEN). Здесь reference ТОНКИЙ (reach ~0.15%),
+//     local ПЕРСИСТЕНТНО держит односторонний объём на НЕДОСТИЖИМЫХ полосах 0.3%/0.5% каждый цикл.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Reference достаёт только 0.05%/0.15% (reach≈0.15%) — полосы 0.3%/0.5% ВНЕ его reach.
+fn truncated_reference() -> OrderBook {
+    let mut b = OrderBook::new();
+    let shallow = &PCTS[0..2]; // 0.05%, 0.15% — как REST, обрезанный на тонком/волатильном рынке
+    let bids: Vec<Level> = shallow
+        .iter()
+        .map(|&p| Level {
+            price: (MID as f64 * (1.0 - p)) as i64,
+            size: BASE as i64 * UNIT,
+        })
+        .collect();
+    let asks: Vec<Level> = shallow
+        .iter()
+        .map(|&p| Level {
+            price: (MID as f64 * (1.0 + p)) as i64,
+            size: BASE as i64 * UNIT,
+        })
+        .collect();
+    b.apply_snapshot(&bids, &asks);
+    b
+}
+
+/// (8, GREEN со skip; ПАДАЕТ без skip = Mutation B) reference тонкий (≤0.15%), local — полная книга
+/// (0.55%), near-book 0.1% ИДЕНТИЧЕН, а на НЕДОСТИЖИМЫХ полосах 0.3%/0.5% local персистентно держит
+/// односторонний объём ВСЕ RECON_WINDOW циклов. Детектор ОБЯЗАН молчать: невалидируемая полоса
+/// (reference.max_reach_pct(side) < band) ПРОПУСКАЕТСЯ, невалидируемое ≠ расхождение (§4.2).
+/// Анти-плацебо: убери skip в observe() → local(300)≫reference(200) на полосе 0.3% каждый цикл →
+/// окно держит персистентный +знак → ЛОЖНЫЙ алерт → тест ПАДАЕТ (это §8-флуд #1, вернувшийся на
+/// тонком рынке при зелёных гейтах — ровно то, что поймал reviewer Mutation B).
+#[test]
+fn unreachable_band_is_skipped_not_flooded() {
+    let mut det = detector();
+    let reference = truncated_reference();
+    // local — ПОЛНАЯ книга (reach 0.55%): near-book 0.05%/0.15% совпадает с reference (size BASE),
+    // а глубже (0.25%..0.55%) несёт объём, которого reference не видит. НЕ меняется по циклам
+    // (персистентно) — если бы это считалось расхождением, окно держало бы знак и флудило.
+    let local = scaled_book(1.0, 1.0);
+
+    // Страховка сетапа (testing.md: гейт обязан краснеть и при несостоявшемся setup): reference
+    // ДЕЙСТВИТЕЛЬНО не достаёт 0.3%/0.5%, а local — достаёт (иначе тест проверяет skip вхолостую).
+    for side in [Side::Buy, Side::Sell] {
+        let rr = reference.max_reach_pct(side).expect("reference не пуст");
+        assert!(
+            rr < 0.003,
+            "фикстура-сетап: reference обязан НЕ достигать полосу 0.3% (reach={rr}) — иначе skip не тестируется"
+        );
+        let lr = local.max_reach_pct(side).expect("local не пуст");
+        assert!(
+            lr >= 0.005,
+            "фикстура-сетап: local обязан достигать полосу 0.5% (reach={lr}) — иначе нечему флудить без skip"
+        );
+    }
+
+    let (any_alert, any_best) = run_sequence_ref(&mut det, &local, &reference);
+    assert!(
+        !any_best,
+        "фикстура: best (0.05%) идентичен → best_price_diverged=false. Тест изолирует depth-skip \
+         объёмного пути от best-пути"
+    );
+    assert!(
+        !any_alert,
+        "local держал объём на НЕДОСТИЖИМЫХ reference'ом полосах 0.3%/0.5% ПЕРСИСТЕНТНО, а детектор \
+         поднял алерт — depth-skip в observe() снят/сломан. Полоса за reference.max_reach_pct обязана \
+         ПРОПУСКАТЬСЯ (§4.2), иначе §8-флуд #1 (асимметрия глубины) вернётся на тонком/волатильном \
+         рынке при зелёных гейтах (Mutation B reviewer'а, C-011 Concern-1)"
+    );
+}
+
+/// Как `run_sequence`, но с ЯВНЫМ reference (тот же local каждый цикл — персистентно).
+fn run_sequence_ref(
+    det: &mut ReconDetector,
+    local: &OrderBook,
+    reference: &OrderBook,
+) -> (bool, bool) {
+    let mut any_alert = false;
+    let mut any_best = false;
+    for _ in 0..RECON_WINDOW {
+        let v = det.observe(local, reference);
+        any_alert |= v.alert;
+        any_best |= v.best_price_diverged;
+    }
+    (any_alert, any_best)
 }
