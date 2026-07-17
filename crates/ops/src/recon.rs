@@ -209,39 +209,151 @@ pub struct ReconVerdict {
     pub gauge_divergence_bps: i64,
 }
 
+/// Кольцевой буфер знаковых наблюдений (i64 bps) для одного (band, side) окна. Ёмкость =
+/// `RECON_WINDOW`. Скользящее среднее = сумма / количество заполненных слотов.
+///
+/// Детерминизм: ровно `RECON_WINDOW` циклов на «заполнение» — до тех пор `count < RECON_WINDOW`,
+/// вердикт по объёму НЕ выносится (частичное окно = шум). Это та самая семантика
+/// «заполненное окно держит |signed_mean|» (`ops.md` §4.3): до заполнения решения нет.
+#[derive(Debug, Clone)]
+struct Window {
+    buf: [i64; RECON_WINDOW],
+    count: usize, // сколько слотов заполнено (0..=RECON_WINDOW)
+    head: usize,  // позиция следующей записи (кольцевой)
+}
+
+impl Window {
+    fn new() -> Self {
+        Self {
+            buf: [0i64; RECON_WINDOW],
+            count: 0,
+            head: 0,
+        }
+    }
+    /// Записать наблюдение. Кольцевой буфер: после заполнения старейшее значение перезатирается.
+    fn push(&mut self, v: i64) {
+        self.buf[self.head] = v;
+        self.head = (self.head + 1) % RECON_WINDOW;
+        if self.count < RECON_WINDOW {
+            self.count += 1;
+        }
+    }
+    /// Знаковое среднее окна. До заполнения (`count < RECON_WINDOW`) → 0 (не используется;
+    /// вызывающий обязан проверять `is_full()` ДО интерпретации `mean()`).
+    fn mean(&self) -> i64 {
+        if self.count == 0 {
+            return 0;
+        }
+        let sum: i64 = self.buf.iter().take(self.count).sum();
+        sum / self.count as i64
+    }
+    fn is_full(&self) -> bool {
+        self.count == RECON_WINDOW
+    }
+}
+
 /// Оконный детектор персистентности per (venue, symbol). Держит окно на каждую (полосу × сторону).
 /// Живёт в оркестраторе рядом с `ReconBudget` (рантайм-состояние). `thr` — калибруемый ε_prod (окно),
 /// `EPS_TEST_BPS` — фиксированный гейт (не калибруется): персистентная порча с `|mean| ≥ ε_test` алертит
 /// независимо от ε_prod.
-///
-/// СКЕЛЕТ (architect: сигнатура + контракт). Внутреннее поле окна — impl-деталь engine-dev; здесь
-/// хранится только калибруемый `thr` (ε_prod окна). `EPS_TEST_BPS` — фиксированный гейт (не
-/// калибруется): персистентная порча с `|mean| ≥ ε_test` алертит независимо от ε_prod (fail-closed).
 #[derive(Debug, Clone)]
 pub struct ReconDetector {
-    /// Калибруемый ε_prod окна (`≤ EPS_MAX_BPS`). engine-dev добавляет внутреннее окно персистентности
-    /// per (полоса,сторона) рядом (impl-деталь; форма — за engine-dev, ops.md §4.3).
+    /// Калибруемый ε_prod окна (`≤ EPS_MAX_BPS`). Применяется как `min(EPS_TEST_BPS, prod_bps)`.
     thr: ReconThresholds,
+    /// Окна персистентности: `windows[band_idx][side]`. Полосы 0..RECON_BANDS.len(), стороны
+    /// 0=Buy/1=Sell. Полосы, которые reference не достаёт в данном цикле, не пишут наблюдение
+    /// (skip-семантика, §4.3: невалидируемое ≠ расхождение).
+    windows: [[Window; 2]; RECON_BANDS.len()],
 }
 
 impl ReconDetector {
     pub fn new(thr: ReconThresholds) -> Self {
-        Self { thr }
+        Self {
+            thr,
+            windows: [
+                [Window::new(), Window::new()],
+                [Window::new(), Window::new()],
+                [Window::new(), Window::new()],
+            ],
+        }
     }
 
     /// Скормить один recon-цикл: best (per-cycle, immediate) + знаковый ОБЪЁМ каждой (полосы,стороны)
-    /// в окно; алерт, если best разошёлся ИЛИ ЗАПОЛНЕННОЕ окно держит `|signed_mean|` над порогом
-    /// (`ε_test` гейт ИЛИ `ε_prod`). Детерминирована (окно — чистое рантайм-состояние, без wall-clock/rand).
+    /// в окно; алерт, если best разошёлся ИЛИ хотя бы одно ЗАПОЛНЕННОЕ окно держит `|signed_mean|`
+    /// над порогом `EPS_TEST_BPS.min(thr.prod_bps())`.
     ///
-    /// Контракт (RED `red_recon_window.rs`, sacred): churn (знак per-cycle гуляет) → mean→0 → ТИШИНА
-    /// даже при той же per-cycle магнитуде, что у порчи; персистентный дефицит/профицит (C1-стрип /
-    /// TD-016 near-touch фантом) → АЛЕРТ; skip полос за пределами `reference.max_reach_pct(side)`.
+    /// Детерминирована: окно — чистое рантайм-состояние, без wall-clock/rand; одинаковая
+    /// последовательность наблюдений → одинаковая последовательность вердиктов.
+    ///
+    /// Контракт (RED `red_recon_window.rs`, sacred): churn (знак per-cycle гуляет) → mean→0 →
+    /// ТИШИНА даже при той же per-cycle магнитуде, что у порчи; персистентный дефицит/профицит
+    /// (C1-стрип / TD-016 near-touch фантом) → АЛЕРТ; полосы за пределами
+    /// `reference.max_reach_pct(side)` ПРОПУСКАЮТСЯ (невалидируемое ≠ расхождение).
     pub fn observe(&mut self, local: &OrderBook, reference: &OrderBook) -> ReconVerdict {
-        // engine-dev: реализовать оконный детектор персистентности (ops.md §4.3). Best-ветка —
-        // per-cycle через `reconcile(local, reference)`; объём — знаковое среднее окна per (полоса,сторона),
-        // порог `EPS_TEST_BPS.min(self.thr.prod_bps())`. См. reverted-прототип в истории коммита.
-        let _ = (&self.thr, local, reference);
-        todo!("engine-dev: оконный детектор персистентности объёма — контракт в red_recon_window.rs (ops.md §4.3)")
+        // (1) Best-price — per-cycle через `reconcile` (immediate, §4.2a).
+        let per_cycle = reconcile(local, reference);
+        let best_price_diverged = per_cycle.best_price_diverged;
+
+        // (2) Окно персистентности на (полоса, сторона). Наблюдение = знаковое относительное
+        //     расхождение СУММЫ объёма полосы, в bps. Полоса, которую reference не достаёт
+        //     (`reference.max_reach_pct(side) < band`) → пропуск (skip-семантика). Это и есть
+        //     фикс §4.3: на глубоких полосах reference пуст, локально данных больше → НЕ
+        //     считаем расхождением, не пишем в окно.
+        let threshold = EPS_TEST_BPS.min(self.thr.prod_bps());
+        let mut max_abs_mean: i64 = 0;
+        let mut any_full = false;
+
+        for (band_idx, &band) in RECON_BANDS.iter().enumerate() {
+            for (side_idx, side) in [Side::Buy, Side::Sell].iter().enumerate() {
+                let ref_reach = reference.max_reach_pct(*side).unwrap_or(0.0);
+                if ref_reach < band {
+                    continue; // полоса невалидируема reference'ом — пропуск
+                }
+                let l = local.depth_within(*side, band);
+                let r = reference.depth_within(*side, band);
+                let denom = if r.abs() < 1 { 1 } else { r.abs() };
+                // Знаковое (local − reference) в bps. Может быть отрицательным (дефицит local).
+                let signed_bps = ((l - r) * 10_000) / denom;
+                self.windows[band_idx][side_idx].push(signed_bps);
+
+                // Если окно заполнено — это кандидат на алерт.
+                let w = &self.windows[band_idx][side_idx];
+                if w.is_full() {
+                    any_full = true;
+                    let abs_mean = w.mean().unsigned_abs() as i64;
+                    if abs_mean > max_abs_mean {
+                        max_abs_mean = abs_mean;
+                    }
+                }
+            }
+        }
+
+        // (3) Алерт: best разошёлся (immediate) ИЛИ заполненное окно с |mean| ≥ порога.
+        let window_alert = any_full && max_abs_mean >= threshold;
+        let alert = best_price_diverged || window_alert;
+
+        // (4) window_divergence_bps: для аудита (CT-RFC-03). Если сработала best-ветка
+        //     (immediate), это per-cycle гейдж (окно ещё не накопилось или не пробилось).
+        //     Если сработало окно — |mean| худшего пробилося окна. T1 не меняется: окно-
+        //     алерт = best=false + divergence_bps=|mean|.
+        let window_divergence_bps = if window_alert {
+            max_abs_mean
+        } else if best_price_diverged {
+            per_cycle.divergence_bps
+        } else {
+            // Тишина: гейдж — для метрики (он уйдёт через gauge_divergence_bps). Аудит-
+            // расхождения нет, 0 — нейтрально (T1 не запрещает 0: AlertOnly-action с
+            // divergence_bps=0 неотличим от «не алертили», но на этом пути мы НЕ
+            // эмитим см. `sink::handle_recon_snapshot`).
+            0
+        };
+
+        ReconVerdict {
+            alert,
+            best_price_diverged,
+            window_divergence_bps,
+            gauge_divergence_bps: per_cycle.divergence_bps,
+        }
     }
 
     /// Аудит-событие (CT-RFC-03) из последнего вердикта. `divergence_bps` = оконная/гейдж-магнитуда,

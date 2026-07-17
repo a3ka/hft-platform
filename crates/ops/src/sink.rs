@@ -10,7 +10,7 @@
 //! (тот же `EventKind`-конверт, что у всех событий; никакого спец-пути).
 
 use book::OrderBook;
-use contracts::{EventKind, Venue};
+use contracts::{EventKind, ReconAction, SysEvent, Venue};
 
 use crate::metrics::Metrics;
 use crate::recon::ReconDetector;
@@ -47,24 +47,32 @@ pub fn handle_recon_snapshot(
     venue: Venue,
     symbol: &str,
     metrics: &Metrics,
-    emit: impl FnMut(EventKind),
+    mut emit: impl FnMut(EventKind),
 ) -> bool {
-    // СКЕЛЕТ (architect: сигнатура). engine-dev реализует по RED `red_recon_sink.rs` (sacred):
-    //  1. `verdict = detector.observe(local, reference)`;
-    //  2. `book_divergence_bps{venue,symbol}` = `verdict.gauge_divergence_bps` КАЖДЫЙ цикл (§3, не эмиссия);
-    //  3. если `verdict.alert`: emit `EventKind::Sys(ReconDivergence(ReconDetector::verdict_to_audit(...
-    //     ReconAction::Resynced)))` + `book_resync_total{venue,symbol}`++ → return true;
-    //  4. иначе (churn/норма) — НИЧЕГО не эмитить (канал не шумит на здоровом рынке) → return false.
-    // `emit` — замыкание рекордера в его mpsc-канал (JR-I-1); журнал НЕ трогать (OPS-I-6).
-    let _ = (
-        detector,
-        local,
-        reference,
-        venue,
-        symbol,
-        metrics,
-        emit,
-        venue_label(venue),
+    // (1) Вердикт детектора (best-price per-cycle + оконный объём).
+    let verdict = detector.observe(local, reference);
+
+    // (2) Гейдж `book_divergence_bps{venue,symbol}` — КАЖДЫЙ цикл (§3, наблюдаемость, не эмиссия).
+    //     Это per-cycle магнитуда: на здоровом churn'е она будет скакать, и это ОК (мы хотим
+    //     видеть churn); окно берёт на себя решение об эмиссии.
+    metrics.set_gauge(
+        "book_divergence_bps",
+        &[("venue", venue_label(venue)), ("symbol", symbol)],
+        verdict.gauge_divergence_bps,
     );
-    todo!("engine-dev: оркестрация оконного recon — контракт в red_recon_sink.rs (ops.md §4.3)")
+
+    // (3) Алерт → принудительный ресинк + Sys(ReconDivergence) + book_resync_total++.
+    if verdict.alert {
+        let audit = ReconDetector::verdict_to_audit(&verdict, venue, symbol, ReconAction::Resynced);
+        emit(EventKind::Sys(SysEvent::ReconDivergence(audit)));
+        metrics.inc_counter(
+            "book_resync_total",
+            &[("venue", venue_label(venue)), ("symbol", symbol)],
+            1,
+        );
+        return true;
+    }
+
+    // (4) Тишина: churn (mean→0) или норма — НЕ шуметь (канал рекордера, §8).
+    false
 }
