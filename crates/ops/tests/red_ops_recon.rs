@@ -17,7 +17,7 @@
 
 use book::OrderBook;
 use contracts::{Level, ReconAction, Venue};
-use ops::recon::{reconcile, ReconThresholds, EPS_MAX_BPS, EPS_PROD_DEFAULT_BPS, EPS_TEST_BPS};
+use ops::recon::{reconcile, ReconThresholds, EPS_MAX_BPS, EPS_PROD_DEFAULT_BPS};
 
 const MID: i64 = 65_000_000_000_000; // $65k ×1e8
 const UNIT: i64 = 100_000_000; // 1.0 ×1e8
@@ -86,26 +86,10 @@ fn ops_i_1_missing_best_bid_must_alert() {
     );
 }
 
-/// (МНОЖЕСТВЕННОСТЬ) Near-touch объём локально занижен в 10× на всех within-reach уровнях → суммы
-/// полос расходятся на ≥ ε_test.
-#[test]
-fn ops_i_1_multiple_levels_diverge_by_band_sum() {
-    let reference = full_book();
-    // local: within-reach объёмы занижены 10× (фантомная нехватка ликвидности в near-полосах).
-    let mut local = OrderBook::new();
-    let bids: Vec<Level> = PCTS.iter().map(|&p| bid_at(p, 1)).collect(); // 0.5 vs 5.0 → 10×
-    let asks: Vec<Level> = PCTS.iter().map(|&p| ask_at(p, 5)).collect();
-    local.apply_snapshot(&bids, &asks);
-
-    let out = reconcile(&local, &reference);
-    assert!(
-        out.divergence_bps >= EPS_TEST_BPS,
-        "10× занижение near-book сумм дало divergence_bps={} < ε_test={} — recon не заметил порчу",
-        out.divergence_bps,
-        EPS_TEST_BPS
-    );
-    assert!(out.exceeds_test());
-}
+// (МНОЖЕСТВЕННОСТЬ/ОБЪЁМ) 10× занижение near-book сумм — это ПЕРСИСТЕНТНЫЙ ОБЪЁМНЫЙ дефицит →
+// ПЕРЕЕХАЛ В ОКОННЫЙ ДЕТЕКТОР (второй §8-провал: per-cycle объём churn'ит). Оракул —
+// `red_recon_window::persistent_volume_deficit_alerts`. Здесь (reconcile, per-cycle) остаётся
+// BEST-ONLY ε_test: `divergence_bps` считается как гейдж, но эмиссию по объёму принимает окно.
 
 /// (ГРАНИЦА) Пустая локальная книга vs непустой референс → best расходится (нечего сравнивать).
 #[test]

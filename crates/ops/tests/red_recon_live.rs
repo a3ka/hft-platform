@@ -166,41 +166,13 @@ fn deep_local_vs_truncated_reference_does_not_flood() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// (b-анти-плацебо) В пределах reference-reach recon ОБЯЗАН ловить порчу — иначе over-skip.
+// (b-анти-плацебо) В пределах reference-reach порча ОБЪЁМА near-touch → ПЕРЕЕХАЛА В ОКОННЫЙ ДЕТЕКТОР.
+// Второй §8-провал (2026-07-17): per-cycle объём churn'ит (timing-skew local/async REST) → per-cycle
+// порог по объёму нежизнеспособен. `exceeds_test()` теперь BEST-ONLY (immediate). Персистентная
+// объёмная порча (C1-эвикция within-reach уровня, TD-016 near-touch фантом) ловится оконным средним
+// знака — оракулы `crates/ops/tests/red_recon_window.rs` (near_book_eviction_persists_then_alerts,
+// persistent_volume_deficit/surplus). Здесь остаётся ТОЛЬКО per-cycle best/depth-skip путь.
 // ─────────────────────────────────────────────────────────────────────────────
-
-/// (D, GREEN, C1-детектор) within-reach уровень УДАЛЁН из local (эвикция C1 стирала живой уровень),
-/// reference его имеет. Полоса 0.3% ⊂ reference-reach → сравнивается → расхождение. Толерантность/skip
-/// НЕ смеют это спрятать. Анти-плацебо против «skip всё / всегда тихо».
-#[test]
-fn near_book_eviction_within_reach_diverges() {
-    let reference = sym(&[(0.0005, 8), (0.002, 10), (0.004, 5)]);
-    // local: near-book с УДАЛЁННЫМ уровнем 0.2% (в пределах reference-reach) — C1-порча.
-    let local = sym(&[(0.0005, 8), (0.004, 5)]);
-    let out = reconcile(&local, &reference);
-    assert!(
-        out.exceeds_test(),
-        "within-reach уровень 0.2% удалён (C1-порча книги), а recon смолчал (divergence_bps={}) — \
-         near-book полосы ⊂ reference-reach ОБЯЗАНЫ ловить порчу, skip не смеет заходить в reach",
-        out.divergence_bps
-    );
-}
-
-/// (E, GREEN, TD-016 near-touch детектор) local несёт ФАНТОМНЫЙ within-reach объём (уровень, из-под
-/// которого цена ушла, не обнулён), reference — свежий, его нет. Полоса ⊂ reach → расхождение.
-#[test]
-fn near_touch_phantom_within_reach_diverges() {
-    let reference = sym(&[(0.0005, 8), (0.002, 5), (0.004, 5)]);
-    // local: тот же near-book, но 0.2% несёт 4× фантомного объёма (не обнулён после ухода цены).
-    let local = sym(&[(0.0005, 8), (0.002, 20), (0.004, 5)]);
-    let out = reconcile(&local, &reference);
-    assert!(
-        out.exceeds_test(),
-        "local несёт 4× фантомного within-reach объёма (TD-016 near-touch), а recon смолчал \
-         (divergence_bps={}) — near-book фантом обязан ловиться",
-        out.divergence_bps
-    );
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // (F) ПУСТОЙ reference — не тихий OK. REST вернул пустую книгу (halt/сбой) при живой local ⇒ сигнал.

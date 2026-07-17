@@ -10,10 +10,10 @@
 //! (тот же `EventKind`-конверт, что у всех событий; никакого спец-пути).
 
 use book::OrderBook;
-use contracts::{EventKind, ReconAction, SysEvent, Venue};
+use contracts::{EventKind, Venue};
 
 use crate::metrics::Metrics;
-use crate::recon::{reconcile, ReconThresholds};
+use crate::recon::ReconDetector;
 
 /// Канонические `venue`-labels для метрик §3 (согласованы с `venue_binance::VENUE_LABEL`,
 /// `venue_binance_futures::VENUE_LABEL`). `hl` отдельным RED'ом; пока нет recon-фетчера
@@ -26,51 +26,45 @@ fn venue_label(v: Venue) -> &'static str {
     }
 }
 
-/// Обработать один recon-снапшот.
+/// Обработать один recon-снапшот через ОКОННЫЙ детектор (`ops.md` §4.3, второй §8-провал).
 ///
-/// - сверяет `local` с REST-`reference` (`ops::recon::reconcile`);
-/// - при расхождении выше порога (`exceeds_test()` ИЛИ `exceeds_prod(thr)`): выполняется
-///   принудительный ресинк (`ReconAction::Resynced`, FA §4), эмитится
-///   `EventKind::Sys(SysEvent::ReconDivergence(audit))` через `emit`, обновляются метрики
-///   (`book_divergence_bps{venue,symbol}` set, `book_resync_total{venue,symbol}` inc);
-/// - в НОРМЕ (нет расхождения): НИЧЕГО не эмитится (alert only on divergence — канал не шумит).
+/// STATEFUL: `detector` держит окно персистентности per (venue,symbol) (передаётся `&mut`, живёт в
+/// оркестраторе рядом с `ReconBudget`). Логика:
+/// - `detector.observe(local, reference)` → best-price (per-cycle, immediate) + объём near-touch в
+///   окно; вердикт `alert` = best разошёлся ИЛИ заполненное окно держит `|signed_mean|` над порогом
+///   (персистентная порча; churn mean→0 → тишина);
+/// - гейдж `book_divergence_bps{venue,symbol}` обновляется КАЖДЫЙ цикл (наблюдаемость §3, не эмиссия);
+/// - при `alert`: принудительный ресинк (`ReconAction::Resynced`), эмит
+///   `EventKind::Sys(SysEvent::ReconDivergence(audit))`, `book_resync_total{venue,symbol}`++;
+/// - иначе (churn/норма): событие НЕ эмитится (канал не шумит на здоровом рынке — §8-тишина).
 ///
-/// Возвращает `true`, если событие эмитировано. `emit` — замыкание рекордера, шлющее в его
-/// mpsc-канал (`JR-I-1`). Функция журнал НЕ трогает.
+/// Возвращает `true`, если событие эмитировано. `emit` — замыкание рекордера в его mpsc-канал
+/// (`JR-I-1`). Функция журнал НЕ трогает (`OPS-I-6`).
 pub fn handle_recon_snapshot(
+    detector: &mut ReconDetector,
     local: &OrderBook,
     reference: &OrderBook,
-    thr: &ReconThresholds,
     venue: Venue,
     symbol: &str,
     metrics: &Metrics,
-    mut emit: impl FnMut(EventKind),
+    emit: impl FnMut(EventKind),
 ) -> bool {
-    let out = reconcile(local, reference);
-
-    // `exceeds_test()` (ε_test, не калибруется) ИЛИ `exceeds_prod(thr)` (ε_prod).
-    // Любое из них — расхождение, требующее ресинка и аудита (`FA §4`: алерт + ресинк +
-    // `Sys(ReconDivergence)`). `ReconAction::Resynced` — ресинк уже произведён на уровне
-    // venue-фетчера (book.apply_snapshot(reference)); см. handoff M-09 task 2.
-    if out.exceeds_test() || out.exceeds_prod(thr) {
-        let audit = out.to_audit(venue, symbol, ReconAction::Resynced);
-        emit(EventKind::Sys(SysEvent::ReconDivergence(audit)));
-
-        let vlabel = venue_label(venue);
-        metrics.set_gauge(
-            "book_divergence_bps",
-            &[("venue", vlabel), ("symbol", symbol)],
-            out.divergence_bps,
-        );
-        metrics.inc_counter(
-            "book_resync_total",
-            &[("venue", vlabel), ("symbol", symbol)],
-            1,
-        );
-        true
-    } else {
-        // НОРМА: алерт ТОЛЬКО on divergence. Канал не шумит (alert only on divergence;
-        // `red_recon_sink::normal_book_is_silent` ловит no-op-impl).
-        false
-    }
+    // СКЕЛЕТ (architect: сигнатура). engine-dev реализует по RED `red_recon_sink.rs` (sacred):
+    //  1. `verdict = detector.observe(local, reference)`;
+    //  2. `book_divergence_bps{venue,symbol}` = `verdict.gauge_divergence_bps` КАЖДЫЙ цикл (§3, не эмиссия);
+    //  3. если `verdict.alert`: emit `EventKind::Sys(ReconDivergence(ReconDetector::verdict_to_audit(...
+    //     ReconAction::Resynced)))` + `book_resync_total{venue,symbol}`++ → return true;
+    //  4. иначе (churn/норма) — НИЧЕГО не эмитить (канал не шумит на здоровом рынке) → return false.
+    // `emit` — замыкание рекордера в его mpsc-канал (JR-I-1); журнал НЕ трогать (OPS-I-6).
+    let _ = (
+        detector,
+        local,
+        reference,
+        venue,
+        symbol,
+        metrics,
+        emit,
+        venue_label(venue),
+    );
+    todo!("engine-dev: оркестрация оконного recon — контракт в red_recon_sink.rs (ops.md §4.3)")
 }
