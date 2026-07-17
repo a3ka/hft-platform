@@ -22,7 +22,7 @@ use book::OrderBook;
 use contracts::{EventKind, SysEvent, Venue};
 use journal::{Journal, WriterConfig};
 use ops::metrics::Metrics;
-use ops::recon::ReconThresholds;
+use ops::recon::{ReconDetector, ReconThresholds};
 use ops::sink::handle_recon_snapshot;
 use recorder::recon_loop::spawn_recon_isolated;
 use tokio::sync::{mpsc, Mutex};
@@ -153,12 +153,18 @@ fn spawn_recon_wiring(
     // 3. Orchestrator: читает tx_book, сравнивает с live, шлёт divergence-события.
     //    Сам по себе НЕ долгий: просыпается только когда пришёл снапшот. Backoff в
     //    отсутствие снапшотов не нужен — fetcher уже rate-limit'ит по `ReconBudget`.
+    //
+    //    M-09 task 2: оконный детектор персистентности (`ops.md` §4.3) — STATEFUL, поэтому
+    //    `ReconDetector::new(thr)` поднимается ДО `while let Some(reference)` и передаётся
+    //    `&mut detector` в каждый вызов `handle_recon_snapshot`. Детектор живёт всё время
+    //    жизни orchestrator-таска (per (venue,symbol) рядом с ReconBudget).
     let metrics_o = Arc::clone(&metrics);
     let events_o = events_tx.clone();
     let symbol_o = symbol.clone();
     spawn_recon_isolated(move || async move {
         let thresholds = ReconThresholds::new(ops::recon::EPS_PROD_DEFAULT_BPS)
             .expect("EPS_PROD_DEFAULT_BPS is a valid prod threshold (≤ EPS_MAX_BPS, fail-closed)");
+        let mut detector = ReconDetector::new(thresholds);
         while let Some(reference) = rx_book.recv().await {
             // local: из live-книги (ЗАГЛУШКА для §8 end-to-end). Пока books пустые,
             // divergence считается относительно пустой книги → `exceeds_test() == true`
@@ -171,9 +177,9 @@ fn spawn_recon_wiring(
                     .unwrap_or_else(OrderBook::new)
             };
             handle_recon_snapshot(
+                &mut detector,
                 &local,
                 &reference,
-                &thresholds,
                 venue,
                 &symbol_o,
                 &metrics_o,
