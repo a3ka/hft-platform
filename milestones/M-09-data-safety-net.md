@@ -65,6 +65,27 @@ recon-дизайном FA §4 и уточняется на critic-аудите �
 | 5 | ⏳ | `scripts/verify_M-09.sh` — ≥1 проверка на задачу; финальный `VERDICT` | architect | exit=0 на GREEN |
 | 6 | ⏳ | tester clean-checkout + reviewer §8 (прод НЕ инертен: recon реально шлёт REST и пишет `Sys` при инъекции; `/metrics` отдаёт) | tester/reviewer | Done Block + §8 пруф |
 
+## Task 2 — §8-провал и recon-redesign (2026-07-17, architect + founder ★)
+
+§8 первого impl провалился: recon эмитил `ReconDivergence` на КАЖДОМ цикле здорового рынка
+(`divergence_bps=2436..7754`, `best_price_diverged=true`) без инъекции порчи. **Измеренный корень**
+(architect, живой Binance REST): `/api/v3/depth?limit=5000` достаёт лишь **~1.1–1.7% от mid**, а
+`RECON_BANDS=[1.5%,3%,8%]` сравнивали суммы полос там, где у reference НЕТ данных → структурный флуд
+(асимметрия глубины, не бакетинг). Бакетинг эмита при этом даёт **0.0 bps** на мелких полосах — фикс
+«сырая книга адаптера» ОТВЕРГНУТ замером.
+
+**Redesign (founder ★ 2026-07-17 — near-book recon + отдельный трек 6–60%), детали `docs/fa/ops.md §4.2`:**
+- фикс — **ТОЛЬКО `crates/ops::recon`** (engine-dev): (a) best-price толерантность `BEST_SKEW_BPS`;
+  (b) `RECON_BANDS → [0.1%,0.3%,0.5%]` + пропуск полосы за `reference.max_reach_pct`; (c) пустой
+  reference → расхождение best. **venue-dev/wiring НЕ трогаются** (бакет-фидер валиден, замер 0 bps).
+- sacred RED переписан на LIVE-режим: `crates/ops/tests/red_recon_live.rs` (7 оракулов: skew-толер.,
+  десинк, §8-анти-флуд глубины, near-book C1, near-touch фантом, пустой ref, гард мелких полос) +
+  `red_ops_recon.rs`/`red_recon_sink.rs` переведены на band-достающие фикстуры. Прогон против
+  прототипа корректного impl — 16/16 GREEN (достижимо); против текущего impl — падают ровно
+  band-shallow + skew + depth-skip (анти-плацебо в обе стороны).
+- **отдельный трек (НЕ M-09):** фантом дальних полос 6–60% (TD-016) REST-неверифицируем — корректность
+  within-band эвикции + возможный platform-reference (§5.1 магнитудная загадка). Founder ★ развилка позже.
+
 ## Acceptance (исполняемые ворота — BACKLOG M-09 + OPS-I-*)
 
 1. **`ε_test` не калибруется:** инъецированная порча книги ОБЯЗАНА поднять алерт; `ε_prod`
