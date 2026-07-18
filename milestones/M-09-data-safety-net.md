@@ -134,6 +134,27 @@ Per-cycle порог по объёму **принципиально нежизн
   per-cycle тишина по объёму невозможна физически (churn до 2007 bps). Задержка объёмной порчи — до
   `K` циклов (best-порча — immediate). `K` + оконный `ε_prod` — калибровка на живом churn + §8.
 
+## Task 2 — ТРЕТИЙ §8-провал: seed-race (A) + объёмный runtime нежизнеспособен (B, развилка ★) (2026-07-18)
+
+Код смержен в main (`b1adec0`), юнит-гейты зелёные (ops 33/33, workspace 256/0, `verify_M-09` PASS),
+но reviewer §8 eyes-on намерил ФЛУД `Sys(ReconDivergence)` в durable-журнал на ЗДОРОВОМ рынке (прод НЕ
+инертен). Детали и дизайн — `docs/fa/ops.md §4.3.1` (seed-gate) + `§4.3.2` (развилка). Два дефекта:
+
+- **(A) seed-race — ИСПРАВЛЯЕТСЯ (RED написан).** 4 стартовых `best_diverged=true div=10000/рестарт`:
+  fetcher тянет REST ДО первого `L2Snapshot` feeder'а → сравнение с ПУСТОЙ local. Дизайн — SELF-SEEDING
+  `ReconDetector` (`seeded: bool`, true на первой непустой local; до seed — no-alert, окно не кормится;
+  пост-seed пустота = порча → эмит). RED (sacred): `empty_local_before_first_seed_does_not_emit` (падает
+  против текущего impl), `empty_local_after_seed_is_corruption_and_emits` (анти-плацебо). Импл — engine-dev
+  в `crates/ops/src/recon.rs` (`ReconDetector`, БЕЗ смены сигнатуры sink/recorder — carve-out не расширяется).
+
+- **(B) объёмный оконный флуд — РАЗВИЛКА founder ★.** 12+ оконных `best=false div=41..1129 Resynced`,
+  ~1/мин, все символы; часть ≫ ε_max=50 → порогом не подавляемы. ТРЕТИЙ §8-провал одного класса.
+  Диагноз: систематический (не zero-mean) сдвиг WS-бакет-книги(T1) vs raw-REST(T2) по near-touch объёму
+  — усреднение окна гасит дисперсию, НЕ bias. **architect рекомендует B2** (runtime=best-price+seed-gate;
+  объём→офлайн research-dev, БЕЗ рантайм-эмиссии — честная граница §4.2). B1 (калибровка+K) не лечит
+  систематический bias и упирается в fail-closed `ε_max=50`. Оконные волумные оракулы (1–7) помечены
+  «под форком», НЕ удалены до подписи ★. T1 (`ReconAudit`) не трогается ни в одном варианте.
+
 ## Acceptance (исполняемые ворота — BACKLOG M-09 + OPS-I-*)
 
 1. **`ε_test` не калибруется:** инъецированная порча книги ОБЯЗАНА поднять алерт; `ε_prod`

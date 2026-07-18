@@ -22,6 +22,14 @@
 //!    (валит per-cycle-magnitude impl И «K подряд одного знака» impl); порча обязана алертить
 //!    (валит always-silent impl);
 //!  • ОТСУТСТВИЕ: churn с 3-подряд-одного-знака (реальный замер) не смеет тихо провоцировать алерт.
+//!
+//! ⚠ ВОЛУМНЫЕ ОКОННЫЕ ОРАКУЛЫ (1–7: volume_timing_skew / churn_* / persistent_* / near_book_eviction
+//! / windowed_eps / detector_is_deterministic) — ПОД ФОРКОМ founder ★ (ТРЕТИЙ §8-провал, `ops.md`
+//! §4.3). Их фикстуры используют СИНТЕТИЧЕСКИЙ zero-mean churn (±1500 идеально балансируется за K),
+//! а ПРОД дал ОСТАТОЧНЫЙ ненулевой mean 41..1129 bps (часть ≫ ε_max=50) — усреднение окна НЕ гасит
+//! СИСТЕМАТИЧЕСКИЙ сдвиг WS-книги(T1) vs raw-REST(T2). Этот runtime-путь по ОБЪЁМУ НЕ считать
+//! валидированным до решения развилки B1(калибровка)↔B2(объём→офлайн, runtime=best-only). Оракулы
+//! (8) depth-skip и (9) seed-gate ОРТОГОНАЛЬНЫ форку и валидны при любом исходе.
 
 use book::OrderBook;
 use contracts::{Level, Side};
@@ -401,4 +409,96 @@ fn run_sequence_ref(
         any_best |= v.best_price_diverged;
     }
     (any_alert, any_best)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// (9) SEED-GATE (ТРЕТИЙ §8-провал, дефект A). Прод-факт (reviewer, b1adec0): recon эмитил 4
+//     стартовых `best_diverged=true div_bps=10000 Resynced` на КАЖДЫЙ рестарт recorder'а —
+//     orchestrator сравнивал REST-reference с ПУСТОЙ local-книгой (fetcher тянет REST ДО того как
+//     books-feeder положил первый `L2Snapshot`; `books.get(...).unwrap_or(OrderBook::new())`).
+//     «Нет своей книги» (ещё не seeded) ≠ «биржа испортилась». Дизайн (spec engine-dev): детектор
+//     SELF-SEEDING — держит `seeded: bool`, ставит true на первой НЕПУСТОЙ local; до seed observe
+//     возвращает no-alert и НЕ кормит окно (не отравляет его пустышкой). Детерминизм сохранён
+//     (seeded — рантайм-состояние по последовательности наблюдений).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// (9a, ПАДАЕТ против текущего impl — стартовый флуд) Пока local ПУСТА (не seeded), recon НЕ эмитит
+/// НИЧЕГО, даже против полного REST-reference. Текущий impl: `reconcile(empty, full)` →
+/// `best_diverged=true` → alert (4×10000 Resynced/рестарт). Self-seeding обязан это подавить.
+#[test]
+fn empty_local_before_first_seed_does_not_emit() {
+    let mut det = detector();
+    let reference = reference(); // полный REST-снапшот
+    let empty = OrderBook::new(); // своя книга ещё не пришла (feeder не отработал)
+    let mut any_alert = false;
+    for _ in 0..RECON_WINDOW {
+        let v = det.observe(&empty, &reference);
+        any_alert |= v.alert;
+    }
+    assert!(
+        !any_alert,
+        "recon эмитил на ПУСТОЙ (не seeded) local — стартовый флуд `best_diverged=true div=10000` \
+         (дефект A, третий §8-провал): fetcher тянет REST ДО первого L2Snapshot books-feeder'а. \
+         Пустая СВОЯ книга ≠ порча биржи — детектор обязан self-seed'иться на первой НЕПУСТОЙ local \
+         и молчать до seed"
+    );
+}
+
+/// (9b, GREEN сейчас и после — анти-плацебо к seed-gate: не over-suppress) ПОСЛЕ первого реального
+/// снапшота (seeded) внезапно пустая local — это РЕАЛЬНАЯ потеря/порча книги, НЕ старт → ОБЯЗАН
+/// эмитить (best-путь). Seed-gate НЕ смеет глушить пост-seed пустоту. Валит impl «всегда молчать на
+/// пустой local».
+#[test]
+fn empty_local_after_seed_is_corruption_and_emits() {
+    let mut det = detector();
+    let reference = reference();
+    // (1) первый РЕАЛЬНЫЙ снапшот seeds детектор; книги идентичны → тишина.
+    let seed = scaled_book(1.0, 1.0);
+    let v0 = det.observe(&seed, &reference);
+    assert!(
+        !v0.alert,
+        "seed-цикл на идентичных книгах не должен алертить (иначе фикстура невалидна)"
+    );
+    // (2) local внезапно ПУСТА ПОСЛЕ seed → потеря книги (порча) → best расходится → эмит.
+    let empty = OrderBook::new();
+    let v1 = det.observe(&empty, &reference);
+    assert!(
+        v1.alert && v1.best_price_diverged,
+        "пост-seed пустая local (потеря живой книги — РЕАЛЬНАЯ порча, не старт) не поднялась: \
+         seed-gate заглушил настоящее расхождение (over-suppress). Гейт молчит ТОЛЬКО до первого seed"
+    );
+}
+
+/// (9c, ПАДАЕТ против текущего impl И против poison-window impl — находка critic C-012) Seed-gate =
+/// ДВА обязательства: до seed observe (1) НЕ алертит И (2) НЕ КОРМИТ окно. Оракул 9a пиннил только (1).
+/// Плохой impl может подавить стартовый алерт, НО протолкнуть pre-seed наблюдения (пустая local vs
+/// полный REST → signed = (0−full)/full·10000 = −10000 bps/полоса) В ОКНО. Тогда ПОСЛЕ seed окно
+/// отравлено −10000: на здоровом рынке знаковое среднее уезжает в дефицит → ЛОЖНЫЙ алерт.
+/// Фикстура: RECON_WINDOW циклов pre-seed пустой local, затем RECON_WINDOW циклов ЗДОРОВЫХ
+/// ИДЕНТИЧНЫХ книг (signed 0). Корректный self-seeding (не кормит окно до seed) → тишина всю
+/// последовательность. Poison-window impl → фаза 2 алертит (окно держит −10000). Current impl →
+/// алертит в обеих фазах.
+#[test]
+fn pre_seed_empty_does_not_poison_window() {
+    let mut det = detector();
+    let reference = reference(); // полный REST
+    let empty = OrderBook::new();
+    let healthy = scaled_book(1.0, 1.0); // == reference → signed 0 (здоровый рынок)
+
+    let mut any_alert = false;
+    // Фаза 1: RECON_WINDOW циклов ДО seed (пустая local). Не алерт (9a) И не кормит окно (9c).
+    for _ in 0..RECON_WINDOW {
+        any_alert |= det.observe(&empty, &reference).alert;
+    }
+    // Фаза 2: RECON_WINDOW циклов ЗДОРОВЫХ идентичных книг (seed на первом, дальше signed 0).
+    for _ in 0..RECON_WINDOW {
+        any_alert |= det.observe(&healthy, &reference).alert;
+    }
+    assert!(
+        !any_alert,
+        "pre-seed пустая local ОТРАВИЛА окно: после seed на ЗДОРОВЫХ идентичных книгах detector \
+         алертит — pre-seed пустышки (signed −10000 bps/полоса) попали в окно и сдвинули знаковое \
+         среднее в ложный дефицит. observe ДО seed обязан НЕ КОРМИТЬ окно, а не только молчать \
+         (critic C-012: 9a пиннил no-alert, но не no-feed)"
+    );
 }
