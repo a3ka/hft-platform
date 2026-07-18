@@ -24,7 +24,7 @@ use journal::{Journal, WriterConfig};
 use ops::metrics::Metrics;
 use ops::recon::{ReconDetector, ReconThresholds};
 use ops::sink::handle_recon_snapshot;
-use recorder::recon_loop::spawn_recon_isolated;
+use recorder::recon_loop::{apply_md_to_books, spawn_recon_isolated};
 use tokio::sync::{mpsc, Mutex};
 
 fn env_csv(key: &str, default: &[&str]) -> Vec<String> {
@@ -96,10 +96,9 @@ async fn shutdown_signal() {
 /// бесполезны, журнал не замусоривается).
 const RECON_BOOK_BUFFER: usize = 4;
 
-/// Live-книга по (venue, symbol). Сейчас ЗАГЛУШКА: `Arc<Mutex<HashMap<(Venue, String),
-/// OrderBook>>>`, заполняется только оркестратором после первого recon-снапшота (см. TODO
-/// ниже). Для end-to-end §8 — НУЖЕН books-feeder из `MdEvent::L2Snapshot` (M-09 task 2
-/// следующая итерация; правки вне scope текущей задачи, чтобы не сломать J1-флоу).
+/// Live-книга по (venue, symbol). Заполняется BOOKS-FEEDER'ом (`apply_md_to_books`) из потока
+/// `MdEvent::L2Snapshot` (см. books-feeder-таск в `main` ниже); до первого снимка — пустая,
+/// orchestrator использует дефолт `OrderBook::new()` (контракт `red_recon_wiring`).
 type BooksLive = Arc<Mutex<std::collections::HashMap<(Venue, String), OrderBook>>>;
 
 /// Запустить recon-fetcher (изолированно) и orchestrator для ОДНОГО (venue, symbol).
@@ -219,9 +218,19 @@ async fn main() -> anyhow::Result<()> {
     // `book_resync_total` через `ops::sink`; venue-fetcher'ы уже пишут `venue_http_status_total`.
     let metrics = Arc::new(Metrics::new());
 
-    // M-09: live-книга для recon. Сейчас ЗАГЛУШКА — заполнится из `MdEvent::L2Snapshot`
-    // в следующей итерации (books-feeder, архитектурная правка, не блокер GREEN impl).
+    // M-09: live-книга для recon. Заполняется BOOKS-FEEDER'ом из `MdEvent::L2Snapshot`-потока
+    // через fanout-tap ниже (см. books-feeder-таск). До первого L2Snapshot — пустая;
+    // orchestrator использует дефолт `OrderBook::new()` и в §8 это ВРЕМЕННО даёт ложный флуд
+    // (книга появится сразу после первого снапшота в feeder-таске).
     let books: BooksLive = Arc::new(Mutex::new(std::collections::HashMap::new()));
+
+    // MD-events TAP для books-feeder. Отдельный канал (не writer-канал) — федер-таск не конкурирует
+    // с writer'ом за lock recv()'а (mpsc::Receiver не share'ится). Логика: каждый venue-emitter
+    // шлёт СВОИ события и в writer (через fanout ниже), и в `md_tx` (через тот же fanout, best-effort);
+    // books-feeder-таск читает `md_rx` и зовёт `apply_md_to_books(&books, &ev)` для каждого Md.
+    // Только `EventKind::Md(MdPayload::L2Snapshot)` реально двигает книгу; Trade/Funding/OI/… ignored
+    // (контракт `red_recon_wiring::feeder_ignores_non_l2_events`).
+    let (md_tx, md_rx) = mpsc::channel::<EventKind>(50_000);
 
     // spawn one supervisor per venue from `default_venues()` — config-driven, не 3 хардкод-блока.
     // M-06 #4 (reland, post-TD-013): добавлен `Venue::BinanceFutures` (fstream @depth@100ms +
@@ -236,8 +245,44 @@ async fn main() -> anyhow::Result<()> {
         std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send>>;
     type VenueRunFn = Box<dyn Fn(mpsc::Sender<EventKind>) -> VenueRunFut + Send + Sync>;
 
+    // M-09: BOOKS-FEEDER (MD-only). Читает md_rx, применяет L2Snapshot к `books`. ИЗОЛИРОВАННЫЙ
+    // таск (паника в feeder не роняет writer). Тот же RECON_LOOP механизм изоляции, что у fetcher'а
+    // и оркестратора (JR-I-1, 24/7).
+    spawn_recon_isolated({
+        let books_for_feeder = Arc::clone(&books);
+        move || async move {
+            let mut md_rx = md_rx;
+            while let Some(ev) = md_rx.recv().await {
+                apply_md_to_books(&books_for_feeder, &ev).await;
+            }
+        }
+    });
+
     for venue in recorder::default_venues() {
         let tx_v = tx.clone();
+        let md_tx_v = md_tx.clone();
+        // M-09: per-venue FANOUT. Venue шлёт `EventKind` в `fanout_tx`; fanout-таск форвардит
+        // (a) в writer (`tx_v`) с backpressure (`send().await` — путь записи НЕ теряет события);
+        // (b) в books-feeder (`md_tx_v`) best-effort (`try_send` — при переполнении дроп, книги
+        //     наблюдательны и не критичны; следующий L2Snapshot восполнит). Клон `EventKind`
+        //     неизбежен (mpsc::Sender — exclusive owner); для L2Snapshot это клон `Vec<Level>`,
+        //     на cadence 100ms с ~100 уровнями — десятки мкс, не hot-path проблема. journal-write
+        //     путь и order-путь НЕ затронуты (writer-канал сохраняет свою backpressure-семантику).
+        let (fanout_tx, mut fanout_rx) = mpsc::channel::<EventKind>(50_000);
+        tokio::spawn(async move {
+            while let Some(ev) = fanout_rx.recv().await {
+                // (a) writer: блокирующий send → сохраняем обратное давление прежним (как если бы
+                //     venue слал прямо в `tx_v` без fanout). На saturated writer fanout
+                //     буферизует до 50_000 событий, далее venue блокируется — аналогично прежнему.
+                if tx_v.send(ev.clone()).await.is_err() {
+                    // writer закрыт — прекращаем fanout (recon-таски тоже встанут).
+                    break;
+                }
+                // (b) books-feeder: best-effort. Дроп при переполнении — следующий L2Snapshot
+                //     восполнит stale-состояние; recon пропустит ОДИН цикл сравнения, не катастрофа.
+                let _ = md_tx_v.try_send(ev);
+            }
+        });
         let (name, run_fn): (&'static str, VenueRunFn) = match venue {
             Venue::Binance => {
                 let syms = env_csv("BINANCE_SYMBOLS", &["BTCUSDT", "ETHUSDT"]);
@@ -262,7 +307,7 @@ async fn main() -> anyhow::Result<()> {
             }
         };
         tokio::spawn(async move {
-            supervise(name, venue, tx_v, run_fn).await;
+            supervise(name, venue, fanout_tx, run_fn).await;
         });
 
         // M-09 task 2: per-venue recon wiring (fetcher + orchestrator). Изолированно через
