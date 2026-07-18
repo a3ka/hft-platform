@@ -583,7 +583,7 @@ Milestone открыт (план принят: critic C-007 APPROVE → reviewer
 - **Разблокирует task 2** (recon runtime OPS-I-1..9). **M-09 остаётся 🚧 ACTIVE** — далее architect:
   RED-оракулы OPS-I-1..9 + `scripts/verify_M-09.sh` (task 2+).
 
-### task 2 (recon runtime) — КОД MERGED (`b1adec0`) → §8 PROD FAILED → **дефект A (seed-gate) ИСПРАВЛЕН + §8 RE-RUN PASS (`e9fc258`, 2026-07-18)**; дефект B (оконный объём) ОСТАЁТСЯ под founder ★ §4.3.2; **Task 2 НЕ ЗАКРЫТ**
+### task 2 (recon runtime) — КОД MERGED (`b1adec0`) → §8 PROD FAILED → **дефект A (seed-gate) ИСПРАВЛЕН (`e9fc258`) + дефект B ЗАКРЫТ B2 (`4939d8f`, §8 PROD GREEN, reviewer APPROVED 2026-07-18)**; **Task 2 функционально ЗАКРЫТ (best-only+seed-gate); M-09 остаётся 🚧 ACTIVE (tasks 3/4/5/6)**
 Цепочка (25 коммитов): venue REST-fetcher (Binance spot+futures, TD-013 structural) + `crates/ops`
 (recon/budget/metrics/silence) + windowed-персистентность (§4.3) + depth-skip pin (Concern-1
 reviewer → architect `5c621f5` → critic `3483a04`) + books-feeder (`apply_md_to_books` +
@@ -636,6 +636,57 @@ Sacred RED `red_recon_window.rs`: 9a `empty_local_before_first_seed_does_not_emi
     103..747) на ~12-мин отметке (окно K=12 наполнилось), в т.ч. на **нетронутом BinanceFutures**
     (systematic WS(T1)-vs-REST(T2) near-touch объёмный bias, НЕ zero-mean churn). **Остаётся OPEN,
     развилка §4.3.2 (B1 vs B2; architect рекомендует B2) — founder ★, эскалация через architect.**
+
+#### B2 (дефект B закрыт: рантайм recon = best-only + seed-gate, merge `4939d8f`, reviewer §8 PROD GREEN + APPROVED 2026-07-18)
+Founder ★ 2026-07-18 принял **B2** (`docs/fa/ops.md §4.3.2`): объёмную near-touch сверку УБРАТЬ из
+рантайма (REST-неверифицируема — систематический WS(T1)-vs-REST(T2) bias, три §8-провала одного
+класса), рантайм-alert ⟺ `best_price_diverged` + seed-gate; объём → офлайн-трек research-dev (BACKLOG,
+не блокирует). Цепочка: architect RED (`060da7f` `red_recon_window.rs`→`red_recon_runtime.rs`, объёмные
+оконные оракулы 1–7 СНЯТЫ, добавлены `runtime_persistent_volume_deficit/surplus_is_silent`,
+`runtime_nonbest_eviction_is_silent`, seed-gate 9a/9b/9c остаются) → engine-dev impl (`4939d8f`).
+- `crates/ops/src/recon.rs` (+/−, чистое удаление window-машинерии) — `struct Window`/`windows`/push-цикл/
+  `window_divergence_bps`/`gauge_divergence_bps` слиты в один `divergence_bps` (per-cycle гейдж);
+  `observe()`: `alert = per_cycle.best_price_diverged`. **Seed-gate СОХРАНЁН полностью** (§4.3.1).
+  `RECON_WINDOW`/`thr` — вестигиальные (`#[allow(dead_code)]`) для API-совместимости с sacred-RED и
+  recorder-carve-out. `ReconDetector::new(ReconThresholds)` НЕ изменён → **сигнатуры
+  `sink::handle_recon_snapshot`/recorder НЕ выросли (carve-out НЕ расширен)**; `crates/recorder/src/**`
+  НЕ тронут. **T1 `ReconAudit` НЕ меняется → CT-RFC НЕ нужен.** MD-only (recon только читает REST) →
+  risk-critic N/A.
+- **Диф ⊂ `{crates/ops/src/recon.rs, crates/ops/src/sink.rs}`** (Block-scope), sacred-тесты
+  (`crates/ops/tests/**`, `crates/recorder/tests/**`) НЕ тронуты dev-коммитом (RED-first: architect
+  `060da7f` до impl `4939d8f`).
+- **Гейты (reviewer перепрогнал независимо на чистом worktree):** ops **33/33** (`red_recon_runtime`
+  8/8, `red_recon_sink` 4/4), recorder **8/8** (`red_recon_wiring` 2/2), workspace clippy 0, fmt clean,
+  `verify_M-09.sh` **VERDICT PASS (12/12)**. **Анти-плацебо reviewer'ом независимо:** против pre-B2 src
+  (`a418968`, window-active) РОВНО 3 B2-silent оракула ПАДАЮТ (`runtime_persistent_volume_deficit/
+  surplus_is_silent`, `runtime_nonbest_eviction_is_silent`: `FAILED. 5 passed; 3 failed`); против B2 —
+  33/33 GREEN. Best-emit оракулы (`runtime_post_seed_empty_local_still_emits`,
+  `best_desync_emits_immediately`) запрещают «заглушить всё».
+- **§8 EYES-ON PROD GREEN (reviewer, pre-merge деплой кандидата `4939d8f` на VPS, нативный
+  release-recorder против live Binance spot+futures + HL, 2026-07-18):** декодер `journal::stream`
+  (bounded-memory, только активный сегмент; recon-эмиссии видны ТОЛЬКО в журнале — stdout/лог их не
+  несёт, `/metrics`-эндпоинта нет — см. NOTE ниже).
+  - **BASELINE (window-impl `e3491d9`, тот же журнал ДО деплоя):** `RECON_DIVERGENCE=1414, best_true=0,
+    best_false=1414, div_bps=[5..816]` — объёмный флуд B на здоровом рынке подтверждён живым.
+  - **healthy ~9 мин (post-B2, ~13k событий, seq≥43683000): `RECON_DIVERGENCE=0`** (best_true=0,
+    best_false=0), panic/ERROR=0, ConnDown=0. **Флуд B удалён** (не подавлен порогом — путь удалён).
+  - **injection (спот-WS 9443 заморожен через `DOCKER-USER` DROP, спот-REST 443 + futures WS 443 + HL
+    живы → дыра ограничена спотом; книга заморожена — доказано stale `book levels` BTC 5334/4861
+    неизменны):** ETH REST-дрейф $1863.17→$1861.58 = **8.5 bps > 5** → **4× `best_diverged=true` эмит**
+    (Binance ETHUSDT, div_bps 725..2597, Resynced), best_false=0. Best-путь §8-жив под B2 (гейт против
+    always-silent на живом проде). Инъекция полностью обратима: rule снят, спот-WS восстановился (fresh
+    changing `book levels`), iptables чист, контейнер healthy весь прогон (restarts=0, hb свежий,
+    seq монотонный, writable=true).
+- **Итог task 2:** дефект B закрыт УДАЛЕНИЕМ единственного флудившего пути; best-путь+seed-gate
+  §8-зелёные. Объёмная сверка жива как per-cycle ГЕЙДЖ `book_divergence_bps` (наблюдаемость, офлайн-трек
+  research-dev — BACKLOG «M-09 хвост»). **Task 2 функционально ЗАКРЫТ.** M-09 остаётся 🚧 ACTIVE:
+  tasks 3 (сохранность/restore-drill), 4 (`/metrics` HTTP + правила алертов), 5 (verify финал),
+  6 (tester+reviewer финальный §8).
+- **NOTE (наблюдаемость, не блокер B2):** `/metrics` HTTP-эндпоинт ещё НЕ существует (нет сервера в
+  recorder — это task 4), поэтому §8-пункт «/metrics отдаёт book_divergence_bps» для B2 НЕ проверялся
+  (преждевременен). Recon-эмиссии на проде наблюдаемы ТОЛЬКО через журнал (`Sys(ReconDivergence)`) —
+  ни stdout-лога, ни метрик-скрейпа. Это делает §8 recon трудоёмким (нужен bounded-memory декодер
+  журнала); закрывается task 4.
 
 ## Пока НЕ реализовано (следующие фазы)
 - Крейты `risk`/`killswitch`/`oms`, `runner` — пофазно per DESIGN §10 (M-08: fail-closed риск-гейт

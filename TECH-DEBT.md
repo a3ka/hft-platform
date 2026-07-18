@@ -26,17 +26,30 @@
     (3) систематический bias между WS-реконструкцией и REST-снапшотом near-touch объёма (не zero-mean
     churn — тогда никакое K не поможет, и near-touch объёмный recon через REST нежизнеспособен).
     values 860/1129 ≫ ε_max=50 → порогом (fail-closed ≤50) не подавляются в принципе.
-  **Severity: MAJOR (частично закрыт).** **(A) seed-gate — ✅ RESOLVED** (`e9fc258`, §8 re-run PASS).
-  **(B) оконный объёмный флуд — ОСТАЁТСЯ OPEN**, развилка founder ★ §4.3.2. §8 re-run reviewer'а
-  (2026-07-18) ПОДТВЕРДИЛ B живым: 12× `best_diverged=false div_bps 103..747` на ~12-мин отметке,
-  в т.ч. на **нетронутом инъекцией BinanceFutures** → это НЕ артефакт заморозки спота, а
-  систематический WS(T1)-vs-REST(T2) near-touch объёмный bias (НЕ zero-mean churn → усреднение окна
-  гасит дисперсию, но не bias; часть значений ≫ ε_max=50 → порогом непобедимы). **architect
-  рекомендует B2** (runtime = best-price per-cycle + seed-gate; объёмная сверка → офлайн research-dev,
-  БЕЗ рантайм-эмиссии). B1 (калибровка K/cadence) НЕ лечит систематический bias. Оконные объёмные
-  оракулы (`red_recon_window` 1-7) помечены «под форком», НЕ удалены до подписи ★. T1 (`ReconAudit`)
-  не меняется ни в одном варианте. **Прод НЕ инертен (льёт ~1 ложный объёмный audit/мин после
-  ~12 мин) — приоритет; эскалация founder'у через architect.**
+  **Severity: MAJOR — ✅ CLOSED 2026-07-18 (обе ветки).** **(A) seed-gate — RESOLVED** (`e9fc258`,
+  §8 re-run PASS). **(B) оконный объёмный флуд — ✅ CLOSED B2** (`4939d8f`, founder ★ §4.3.2, reviewer
+  §8 PROD GREEN + APPROVED). Диагноз B подтверждён: систематический WS(T1)-vs-REST(T2) near-touch
+  объёмный bias (НЕ zero-mean churn → усреднение окна гасит дисперсию, но не bias; часть ≫ ε_max=50 →
+  порогом непобедимы), в т.ч. на нетронутом BinanceFutures. B1 (калибровка K/cadence) отклонён (не
+  лечит bias, упирается в fail-closed ε_max=50). **★ РЕШЕНИЕ B2:** рантайм-эмиссию объёмной сверки
+  УБРАТЬ (единственный флудивший путь удалён, а не подавлен порогом); рантайм-alert ⟺
+  `best_price_diverged` + seed-gate; объём → офлайн-трек research-dev (BACKLOG «M-09 хвост», НЕ блокер).
+  T1 `ReconAudit` НЕ меняется → CT-RFC НЕ нужен. **§8 PROD ДОКАЗАЛ УДАЛЕНИЕ ФЛУДА** (не тестами —
+  живым замером журнала на VPS, декодер `journal::stream` bounded-memory):
+  - BASELINE (window-impl `e3491d9`, тот же журнал ДО деплоя): `RECON_DIVERGENCE=1414 best_true=0
+    best_false=1414 div=[5..816]` — флуд B живой.
+  - post-B2 healthy ~9 мин (~13k событий): **`RECON_DIVERGENCE=0`** — флуд удалён; panic/ERROR=0.
+  - injection (спот-WS 9443 заморожен, спот-REST жив, ETH дрейф 8.5 bps>5, книга доказано stale):
+    **4× `best_diverged=true` div 725..2597 Resynced** — best-путь §8-жив (не always-silent). Инъекция
+    обратима, спот-WS восстановлен, контейнер healthy весь прогон.
+  Анти-плацебо reviewer'ом независимо: против pre-B2 src (`a418968`) 3 B2-silent оракула ПАДАЮТ, против
+  B2 — ops 33/33. Оконные объёмные оракулы (`red_recon_window` 1–7) СНЯТЫ (файл → `red_recon_runtime.rs`).
+  **Остаточная задача — НЕ долг рантайма, а офлайн-follow-up:** объёмная near-touch сверка над записанной
+  книгой (research-dev, `research/data-quality/`), необязательная. **Прод B2 инертен по объёму
+  (0 ложных audit), best-путь работает.**
+  **⚠ NUMBERING COLLISION:** этот номер `TD-025` (recon) КОНФЛИКТУЕТ со вторым `TD-025`
+  (`red-prod-migration-fails-on-full-host-disk`, M-08 task 20, ниже в этом файле) — коллизия предшествует
+  B2, требует отдельного renumber-прохода (не тронуто здесь во избежание рассинхрона кросс-ссылок).
 - **TD-016** `recorder-memory-drift-under-healthy-status` (замечено reviewer'ом на §8 eyes-on
   M-07, 2026-07-13). **Класс TD-011: тихая деградация под ЗЕЛЁНЫМ статусом** — контейнер
   `healthy`, heartbeat свежий, журнал растёт, `restarts=0`, и при этом RSS монотонно ползёт.
