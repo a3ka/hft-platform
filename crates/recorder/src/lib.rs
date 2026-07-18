@@ -17,6 +17,9 @@ use contracts::{EventKind, SysEvent, Venue};
 use journal::{Journal, StorageStatus};
 use tokio::sync::mpsc;
 
+/// M-09: recon-loop (изоляция recon-сбоя от append, JR-I-1). Скелет — impl engine-dev по RED.
+pub mod recon_loop;
+
 /// Площадки, которые рекордер супервизит по умолчанию. `main` спавнит `supervise()` по
 /// ЭТОМУ списку (config-driven, не хардкод). M-06 #4 (reland, post-TD-013): BinanceFutures
 /// подключён — эмиттер `venue-binance-futures::run` выдаёт depth (@depth@100ms), liquidations

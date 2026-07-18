@@ -9,6 +9,8 @@ license.workspace = true
 
 [dependencies]
 contracts = { path = "../contracts" }
+book = { path = "../book" }
+ops = { path = "../ops" }
 tokio = { version = "1", features = ["rt", "macros", "time", "sync", "net"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3"
