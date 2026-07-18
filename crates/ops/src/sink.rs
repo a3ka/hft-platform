@@ -26,14 +26,15 @@ fn venue_label(v: Venue) -> &'static str {
     }
 }
 
-/// Обработать один recon-снапшот через ОКОННЫЙ детектор (`ops.md` §4.3, второй §8-провал).
+/// Обработать один recon-снапшот через детектор (B2: best-only + seed-gate, `docs/fa/ops.md` §4.3.2).
 ///
-/// STATEFUL: `detector` держит окно персистентности per (venue,symbol) (передаётся `&mut`, живёт в
-/// оркестраторе рядом с `ReconBudget`). Логика:
-/// - `detector.observe(local, reference)` → best-price (per-cycle, immediate) + объём near-touch в
-///   окно; вердикт `alert` = best разошёлся ИЛИ заполненное окно держит `|signed_mean|` над порогом
-///   (персистентная порча; churn mean→0 → тишина);
-/// - гейдж `book_divergence_bps{venue,symbol}` обновляется КАЖДЫЙ цикл (наблюдаемость §3, не эмиссия);
+/// STATEFUL: `detector` держит seed-gate per (venue,symbol) (передаётся `&mut`, живёт в оркестраторе
+/// рядом с `ReconBudget`). Логика:
+/// - `detector.observe(local, reference)` → best-price (per-cycle, immediate) + per-cycle гейдж
+///   `divergence_bps`; вердикт `alert` ⟺ `best_price_diverged` (B2: объёмная ветка снята с рантайма,
+///   `§4.3.2` — near-touch объём REST-неверифицируем, систематический WS-vs-REST bias);
+/// - гейдж `book_divergence_bps{venue,symbol}` обновляется КАЖДЫЙ цикл (наблюдаемость §3, не эмиссия,
+///   офлайн-трек research-dev);
 /// - при `alert`: принудительный ресинк (`ReconAction::Resynced`), эмит
 ///   `EventKind::Sys(SysEvent::ReconDivergence(audit))`, `book_resync_total{venue,symbol}`++;
 /// - иначе (churn/норма): событие НЕ эмитится (канал не шумит на здоровом рынке — §8-тишина).
@@ -53,12 +54,13 @@ pub fn handle_recon_snapshot(
     let verdict = detector.observe(local, reference);
 
     // (2) Гейдж `book_divergence_bps{venue,symbol}` — КАЖДЫЙ цикл (§3, наблюдаемость, не эмиссия).
-    //     Это per-cycle магнитуда: на здоровом churn'е она будет скакать, и это ОК (мы хотим
-    //     видеть churn); окно берёт на себя решение об эмиссии.
+    //     Под B2 (`§4.3.2`) это per-cycle магнитуда из `reconcile().divergence_bps`; используется
+    //     офлайн-треком research-dev и оператором (визуально), НЕ триггерит эмиссию. Объёмной
+    //     ветки в рантайме нет.
     metrics.set_gauge(
         "book_divergence_bps",
         &[("venue", venue_label(venue)), ("symbol", symbol)],
-        verdict.gauge_divergence_bps,
+        verdict.divergence_bps,
     );
 
     // (3) Алерт → принудительный ресинк + Sys(ReconDivergence) + book_resync_total++.
