@@ -265,6 +265,187 @@ After commit, hand back to critic for re-audit. Include commit SHA and updated m
 
 ---
 
+## Re-audit 5c621f5 — depth-skip pin
+
+**Date:** 2026-07-18T10:02:51Z  
+**Agent:** critic  
+**Audited branch/head:** `origin/feat/M-09-task2 @ 5c621f5`  
+**Audited revision commit:** `5c621f5`  
+**Scope:** narrow re-audit of new RED pin for depth-skip regression (reviewer Concern-1 / C-011)
+
+### Verdict
+
+**APPROVE**
+
+### Scope
+
+PASS.
+
+`5c621f5` touches only architect-owned sacred RED tests:
+
+```text
+M crates/ops/tests/red_recon_live.rs
+M crates/ops/tests/red_recon_window.rs
+```
+
+`crates/ops/src/**` is not touched by the revision commit. No implementation, T1/contracts,
+`risk`, `killswitch`, `oms`, venue/order-egress, docs, or verify script changed.
+
+### GREEN Against Current Impl
+
+PASS.
+
+Command:
+
+```bash
+cargo test -p ops --test red_recon_window --test red_recon_live
+```
+
+Result:
+
+- `red_recon_live`: 5/5 PASS
+- `red_recon_window`: 8/8 PASS
+
+The added depth-skip pin is compatible with the current implementation.
+
+### Anti-placebo — Mutation B Removes Depth-skip
+
+PASS.
+
+Temporary mutation:
+
+```bash
+sed -i 's/ref_reach < band/false/g' crates/ops/src/recon.rs
+```
+
+This changed exactly the two depth-skip sites in `crates/ops/src/recon.rs`:
+
+```text
+138: if false {
+309: if false {
+```
+
+Command:
+
+```bash
+cargo test -p ops --test red_recon_window
+```
+
+Result: expected precise failure profile, **7/8 PASS**:
+
+- FAILED: `unreachable_band_is_skipped_not_flooded`
+- all other window oracles passed
+
+Command:
+
+```bash
+cargo test -p ops --test red_recon_live
+```
+
+Result: expected precise failure profile, **4/5 PASS**:
+
+- FAILED: `deep_local_vs_truncated_reference_does_not_flood`
+- all other live oracles passed
+
+This proves the pin is narrow: it catches removed depth-skip in both `observe` and `reconcile`
+without weakening the rest of the oracle suite.
+
+The mutation was reverted before this verdict was written.
+
+### Setup-guard
+
+PASS.
+
+`crates/ops/tests/red_recon_window.rs:360-372` explicitly asserts the fixture state before
+testing alert behavior:
+
+- `reference.max_reach_pct(side) < 0.003`
+- `local.max_reach_pct(side) >= 0.005`
+
+I temporarily broke the setup by making `truncated_reference()` include levels through `0.35%`.
+
+Command:
+
+```bash
+cargo test -p ops --test red_recon_window unreachable_band_is_skipped_not_flooded -- --exact
+```
+
+Result: expected setup failure:
+
+```text
+фикстура-сетап: reference обязан НЕ достигать полосу 0.3% (reach=0.0035) — иначе skip не тестируется
+```
+
+After reverting the temporary setup mutation, the same focused test passed:
+
+```text
+test unreachable_band_is_skipped_not_flooded ... ok
+```
+
+This satisfies `.claude/rules/testing.md` property 3: the oracle fails if its own setup did not
+prepare the claimed thin-reference/full-local scenario.
+
+### Recommended next action
+
+Proceed back to reviewer to close Concern-1 and continue the normal PR gate.
+
+=== HANDOFF: critic -> reviewer ===
+
+#### §A — Metadata
+
+- UTC datetime: 2026-07-18T10:02:51Z
+- From agent: critic
+- Milestone: M-09 Task 2 recon
+- Verdict: APPROVE
+- Audited branch/head: `origin/feat/M-09-task2 @ 5c621f5`
+- Critic verdict file: `research/critiques/C-011-M-09-volume-window.md`
+
+#### §B — What I checked
+
+- Revision scope for `5c621f5`
+- GREEN behavior against current implementation
+- Mutation B removing depth-skip in both `reconcile` and `observe`
+- Setup-guard failure when the thin-reference fixture is broken
+
+#### §C — Outcomes
+
+- APPROVE: reviewer Concern-1 depth-skip pin is closed.
+- The new pin is narrow: one targeted failure per suite under depth-skip removal, other oracles remain green.
+- Temporary mutations were reverted; worktree was clean before verdict edit.
+
+#### §D — Paste-ready prompt for reviewer
+
+```text
+Ты — reviewer проекта hft-platform. Рабочий каталог /home/nous/hft-platform.
+
+Branch: feat/M-09-task2. Bootstrap in your own worktree from latest origin/feat/M-09-task2.
+Read:
+- CLAUDE.md
+- .claude/rules/gates.md
+- .claude/rules/scope-guard.md
+- milestones/M-09-data-safety-net.md
+- research/critiques/C-011-M-09-volume-window.md, especially "Re-audit 5c621f5 — depth-skip pin"
+
+Task: resume M-09 Task 2 reviewer gate. Close Concern-1 if the critic re-audit section is present
+and committed, then continue reviewer Block-scope / Done Block / §8 live re-run.
+
+Expected next actions:
+- Verify feat branch includes critic APPROVE for 5c621f5.
+- Merge feat/M-09-task2 to main only if reviewer gates pass.
+- Run §8 live Binance re-run after merge/deploy per gates.md: recon silent on healthy book and catches injection.
+```
+
+#### §E — Outstanding risks
+
+- Live §8 remains the final acceptance surface: depth-skip is inert on BTC/ETH when all bands are
+  within reach, so this unit pin protects thin/volatile reference reach regressions that live BTC/ETH
+  did not exercise.
+- Production `K` and windowed `ε_prod` remain calibration topics; this pin only guards depth-skip semantics.
+
+=== END HANDOFF ===
+
+---
+
 ## Re-audit 3b19a0c
 
 **Date:** 2026-07-17T22:09:47Z  
