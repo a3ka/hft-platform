@@ -179,12 +179,11 @@ fn deep_local_vs_truncated_reference_does_not_flood() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// (b-анти-плацебо) В пределах reference-reach порча ОБЪЁМА near-touch → ПЕРЕЕХАЛА В ОКОННЫЙ ДЕТЕКТОР.
-// Второй §8-провал (2026-07-17): per-cycle объём churn'ит (timing-skew local/async REST) → per-cycle
-// порог по объёму нежизнеспособен. `exceeds_test()` теперь BEST-ONLY (immediate). Персистентная
-// объёмная порча (C1-эвикция within-reach уровня, TD-016 near-touch фантом) ловится оконным средним
-// знака — оракулы `crates/ops/tests/red_recon_window.rs` (near_book_eviction_persists_then_alerts,
-// persistent_volume_deficit/surplus). Здесь остаётся ТОЛЬКО per-cycle best/depth-skip путь.
+// (b-анти-плацебо) `exceeds_test()` — BEST-ONLY (§4.2a/§4.3.2 B2). Объёмная порча near-touch НЕ триггерит
+// рантайм: под B2 (founder ★ 2026-07-18) объёмная сверка снята из рантайма (REST-неверифицируема,
+// систематический WS-vs-REST bias — три §8-провала). Рантайм-контракт «персистентный объём МОЛЧИТ»
+// пиннит `crates/ops/tests/red_recon_runtime.rs` (runtime_persistent_volume_*, runtime_nonbest_eviction);
+// объёмная сверка как ТРЕНД → офлайн-трек research-dev. Здесь остаётся per-cycle best/depth-skip гейдж.
 // ─────────────────────────────────────────────────────────────────────────────
 
 // ─────────────────────────────────────────────────────────────────────────────

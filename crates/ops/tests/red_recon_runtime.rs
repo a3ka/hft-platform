@@ -1,50 +1,53 @@
-//! RED OPS-I-1 ОКОННАЯ ПЕРСИСТЕНТНОСТЬ (sacred, architect-only) — near-book ОБЪЁМ churn'ит, порча
-//! персистентна. Второй §8-провал (2026-07-17): reviewer прогнал live-recon (2×210с живой Binance,
-//! оба feeder'а) — depth-asymmetry (виток 1) и best-price ложняки закрыты, но recon ВСЁ РАВНО флудил
-//! `ReconDivergence` ~1/цикл/символ (`band_divergence` 16–853 bps > ε_test=50) на ЗДОРОВОМ рынке.
+//! RED OPS-I-1 РАНТАЙМ-КОНТРАКТ ПОД B2 (sacred, architect-only) — рантайм-recon = **best-price
+//! per-cycle + seed-gate**; near-touch ОБЪЁМ в рантайме МОЛЧИТ (REST-неверифицируем).
 //!
-//! КОРЕНЬ (architect измерил, `api.binance.com/api/v3/depth?limit=5000`, BTC/ETH 2026-07-17):
-//! два async REST-снапшота ~2.5с врозь расходятся по near-touch суммам полос на сотни bps, и ЗНАК
-//! per-cycle ГУЛЯЕТ (BTC BID 0.3% `+--`, ASK 0.3% `+-+`, ETH ASK 0.1% `-0+`; BTC BID 0.1% дал ДАЖЕ
-//! 3 подряд одного знака `---`). Это чистый timing-skew биржи (local — WS-книга момента T1,
-//! reference — async REST момента T2), НЕ ошибка local и НЕ TD-016 фантом. Per-cycle порог по
-//! ОБЪЁМУ ПРИНЦИПИАЛЬНО нежизнеспособен: любой порог тишины прячет порчу, любой ловящий порчу флудит.
+//! B2 ПРИНЯТ founder ★ 2026-07-18 (`docs/fa/ops.md` §4.3.2). Три §8-провала подряд по одному классу
+//! (near-touch объём): depth-asymmetry (§4.2) → per-cycle volume → windowed volume (§4.3). Корень
+//! глубже калибровки: усреднение окна гасит ДИСПЕРСИЮ (zero-mean churn), но НЕ СИСТЕМАТИЧЕСКИЙ сдвиг.
+//! §8 re-run reviewer'а (merge `e9fc258`) намерил 12× `best_diverged=false div_bps 103..747` на
+//! ЗДОРОВОМ рынке, **в т.ч. на нетронутом инъекцией `BinanceFutures`** → систематический
+//! WS(T1)-vs-REST(T2) объёмный bias, часть значений ≫ ε_max=50 (порогом fail-closed непобедимы).
 //!
-//! ДИЗАЙН (`ops.md` §4.3): дискриминатор churn↔порча — НЕ магнитуда, а ПЕРСИСТЕНТНОСТЬ ЗНАКА. Recon
-//! становится STATEFUL (`ReconDetector`): окно `RECON_WINDOW` циклов на (полосу,сторону); знаковое
-//! среднее. churn (знак гуляет) → mean→0 → ТИШИНА; порча (C1-стрип / TD-016 near-touch фантом держат
-//! знак) → |mean| над порогом → АЛЕРТ. Best-price — ПО-ПРЕЖНЕМУ per-cycle (immediate).
+//! РЕШЕНИЕ B2: рантайм-эмиссию объёмной сверки УБРАТЬ. Рантайм-alert ⟺ `best_price_diverged`
+//! (best-price REST-верифицируем: §8 healthy 0 эмиссий, injection 6× best=true). Объёмная сверка →
+//! ОФЛАЙН-трек (research-dev) над записанной книгой, необязательный follow-up. Полная книга/объёмы
+//! пишутся в журнал БЕЗ изменений.
 //!
-//! Гейт-целостность (`.claude/rules/testing.md`, 4 свойства + «RED двух источников → live-режим»):
-//!  • ПРОД-ФОРМА: последовательность циклов (не один такт), два РАЗНЫХ момента (timing-skew объёма);
-//!  • СВОЙ инвариант: знаковое среднее окна, не per-cycle магнитуда;
-//!  • анти-плацебо В ОБЕ стороны — churn (та же per-cycle магнитуда, что у порчи) обязан молчать
-//!    (валит per-cycle-magnitude impl И «K подряд одного знака» impl); порча обязана алертить
-//!    (валит always-silent impl);
-//!  • ОТСУТСТВИЕ: churn с 3-подряд-одного-знака (реальный замер) не смеет тихо провоцировать алерт.
+//! ЧТО ПИННИТ ЭТОТ ФАЙЛ (рантайм-контракт B2):
+//!  • seed-gate (§4.3.1) — 9a/9b/9c: до первого своего непустого снапшота recon молчит и НЕ кормит
+//!    состояние; пост-seed пустая local = РЕАЛЬНАЯ порча (best-путь) → эмит;
+//!  • **B2-ядро** — персистентный объёмный сдвиг (тот самый, что флудил прод, ≫ ε_max) в рантайме
+//!    МОЛЧИТ; within-reach эвикция НЕ-best уровня в рантайме МОЛЧИТ (объём → офлайн);
+//!  • best-путь — по-прежнему эмитит (пост-seed пустая local; см. также `red_recon_sink`/`red_ops_recon`
+//!    для best-десинка и `red_recon_live` для skew-толерантности/depth-skip гейджа);
+//!  • детерминизм рантайм-вердиктов (seed — чистое рантайм-состояние, без wall-clock/rand).
 //!
-//! ⚠ ВОЛУМНЫЕ ОКОННЫЕ ОРАКУЛЫ (1–7: volume_timing_skew / churn_* / persistent_* / near_book_eviction
-//! / windowed_eps / detector_is_deterministic) — ПОД ФОРКОМ founder ★ (ТРЕТИЙ §8-провал, `ops.md`
-//! §4.3). Их фикстуры используют СИНТЕТИЧЕСКИЙ zero-mean churn (±1500 идеально балансируется за K),
-//! а ПРОД дал ОСТАТОЧНЫЙ ненулевой mean 41..1129 bps (часть ≫ ε_max=50) — усреднение окна НЕ гасит
-//! СИСТЕМАТИЧЕСКИЙ сдвиг WS-книги(T1) vs raw-REST(T2). Этот runtime-путь по ОБЪЁМУ НЕ считать
-//! валидированным до решения развилки B1(калибровка)↔B2(объём→офлайн, runtime=best-only). Оракулы
-//! (8) depth-skip и (9) seed-gate ОРТОГОНАЛЬНЫ форку и валидны при любом исходе.
+//! АНТИ-ПЛАЦЕБО В ОБЕ СТОРОНЫ (`.claude/rules/testing.md`):
+//!  • B2-silent оракулы ПАДАЮТ против window-active impl (текущий прод-код эмитит на персистентном
+//!    объёме — это §8-флуд B, который B2 удаляет) → доказывают РЕАЛЬНОЕ изменение поведения;
+//!  • best-emit оракулы (9b + red_recon_sink/red_ops_recon) ПАДАЮТ против always-silent impl →
+//!    запрещают «заглушить всё». Вместе набор допускает ровно best-only+seed-gate.
+//!
+//! testing.md чек-лист против РЕАЛЬНОГО (не идеального) входа: асимметрия — односторонний bid-дефицит
+//! и односторонняя best-порча; множественность — все полосы расходятся в одном такте; отсутствие —
+//! удалённый within-reach уровень НЕ рантайм-алерт (объём→офлайн); границы — пустая local до/после
+//! seed, пустой reference (red_recon_live); прод-масштаб — сдвиг ≫ ε_max (моделирует прод 103..747).
 
 use book::OrderBook;
-use contracts::{Level, Side};
-use ops::recon::{ReconDetector, ReconThresholds, EPS_MAX_BPS, EPS_PROD_DEFAULT_BPS, RECON_WINDOW};
+use contracts::Level;
+use ops::recon::{ReconDetector, ReconThresholds, EPS_PROD_DEFAULT_BPS, RECON_WINDOW};
 
 const MID: i64 = 65_000_000_000_000; // $65k ×1e8
 const UNIT: i64 = 100_000_000; // 1.0 объёма ×1e8
-const BASE: f64 = 100.0; // базовый объём уровня (units) — масштабируется для дефицита/профицита
+const BASE: f64 = 100.0; // базовый объём уровня (units)
 
 /// Уровни на 0.05..0.55% от mid → reach≈0.55%, покрывает полосы recon 0.1/0.3/0.5%.
 const PCTS: [f64; 6] = [0.0005, 0.0015, 0.0025, 0.0035, 0.0045, 0.0055];
 
 /// Книга, где объём КАЖДОГО уровня стороны масштабирован: bid×`bid_scale`, ask×`ask_scale`.
 /// ЦЕНЫ уровней НЕ меняются (best-price идентичен reference → best_price_diverged=false, изолируем
-/// ОБЪЁМ). `scale=1.0` — reference-эталон; `1.15` — профицит +1500 bps; `0.85` — дефицит −1500 bps.
+/// ОБЪЁМ). `scale=1.0` — reference-эталон; `1.15` — профицит +1500 bps; `0.85` — дефицит −1500 bps
+/// (≫ ε_max=50 — моделирует прод-класс входа: часть значений порогом непобедима).
 fn scaled_book(bid_scale: f64, ask_scale: f64) -> OrderBook {
     let mut b = OrderBook::new();
     let bids: Vec<Level> = PCTS
@@ -87,141 +90,71 @@ fn run_sequence(det: &mut ReconDetector, locals: &[OrderBook]) -> (bool, bool) {
     (any_alert, any_best)
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// (1) CHURN → ТИШИНА. Знак per-cycle гуляет (чередование) → mean→0. Та же per-cycle МАГНИТУДА
-//     (±1500 bps), что у порчи ниже — различает ТОЛЬКО персистентность. Валит per-cycle-порог impl.
-// ─────────────────────────────────────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════════════════════════════════
+// B2-ЯДРО: ОБЪЁМ В РАНТАЙМЕ МОЛЧИТ (near-touch объём REST-неверифицируем — §4.3.2).
+// Эти оракулы — ИНВЕРСИЯ снятых оконных оракулов (persistent_volume_deficit/surplus/eviction
+// ТРЕБОВАЛИ алерт; под B2 тот же вход ТРЕБУЕТ ТИШИНУ). Анти-плацебо: падают против window-active
+// impl (прод-код эмитит на персистентном объёме — §8-флуд B).
+// ═════════════════════════════════════════════════════════════════════════════════════════════
 
+/// (B2-1, ПАДАЕТ против window-active impl) ПЕРСИСТЕНТНЫЙ ОБЪЁМНЫЙ ДЕФИЦИТ (−1500 bps ≫ ε_max) держится
+/// 2×`RECON_WINDOW` циклов — ровно прод-класс, флудивший §8 (best=false, систематический сдвиг). Под B2
+/// рантайм МОЛЧИТ: объёмная эмиссия снята, near-touch объём REST-неверифицируем → офлайн-трек. best-цена
+/// цела → изоляция объёмного пути от best.
 #[test]
-fn volume_timing_skew_does_not_alert() {
+fn runtime_persistent_volume_deficit_is_silent() {
     let mut det = detector();
-    // BID-объём чередуется 1.15/0.85 (профицит/дефицит) — чистый timing-skew, знак гуляет.
-    // ASK держит эталон (изолируем один канал churn). Best-цена не двигается (масштаб — по объёму).
-    let locals: Vec<OrderBook> = (0..RECON_WINDOW)
-        .map(|i| {
-            let bid_scale = if i % 2 == 0 { 1.15 } else { 0.85 };
-            scaled_book(bid_scale, 1.0)
-        })
+    // local держит bid-объём на 15% НИЖЕ reference КАЖДЫЙ цикл (тот же вход, что в снятом оракуле
+    // persistent_volume_deficit_alerts — теперь ТРЕБУЕТ ТИШИНУ). 2×окна: далеко за наполнением.
+    let locals: Vec<OrderBook> = (0..RECON_WINDOW * 2)
+        .map(|_| scaled_book(0.85, 1.0))
         .collect();
     let (any_alert, any_best) = run_sequence(&mut det, &locals);
     assert!(
         !any_best,
-        "фикстура сломана: best-цена разошлась — тест должен изолировать ОБЪЁМ (best_scale не трогали)"
+        "фикстура сломана: best-цена разошлась — тест изолирует ОБЪЁМ (цены не трогаются)"
     );
     assert!(
         !any_alert,
-        "near-touch объём churn'ил (знак чередуется, mean→0), а recon поднял ReconDivergence — это \
-         ровно §8-флуд на здоровом рынке, который поймал reviewer (band_divergence 16–853 bps на \
-         timing-skew). Per-cycle порог по объёму нежизнеспособен — окно обязано усреднить churn в 0"
+        "рантайм эмитил на ПЕРСИСТЕНТНОМ объёмном дефиците (−1500 bps ≫ ε_max, 2×{RECON_WINDOW} циклов) — \
+         это РОВНО §8-флуд B, который B2 удаляет. Под B2 объёмная сверка снята из рантайма (REST-\
+         неверифицируема, систематический WS-vs-REST bias) → офлайн-трек. Рантайм-alert обязан быть \
+         ⟺ best_price_diverged; объёмный оконный путь снят из решения об эмиссии (window-active impl \
+         не удалён)"
     );
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// (2) CHURN С 3-ПОДРЯД-ОДНОГО-ЗНАКА → ТИШИНА (анти-плацебо против «K подряд → алерт»). Реальный
-//     замер BTC BID 0.1% дал `---` (3 подряд «−»); окно всё равно сбалансировано → mean→0.
-// ─────────────────────────────────────────────────────────────────────────────
-
+/// (B2-2, ПАДАЕТ против window-active impl) ПЕРСИСТЕНТНЫЙ ОБЪЁМНЫЙ ПРОФИЦИТ (TD-016 near-touch фантом,
+/// +1500 bps) — под B2 тоже ТИШИНА в рантайме (фантом near-touch/дальних полос → офлайн, §4.2/§4.3.2).
 #[test]
-#[allow(clippy::assertions_on_constants, clippy::manual_is_multiple_of)]
-fn churn_with_same_sign_run_stays_silent() {
-    // Фикстура-предусловие (документирует форму; guard на случай смены RECON_WINDOW на нечётное).
-    assert!(
-        RECON_WINDOW >= 6 && RECON_WINDOW % 2 == 0,
-        "фикстура рассчитана на чётное окно ≥6 (баланс +/− с 3-раном); RECON_WINDOW={RECON_WINDOW}"
-    );
+fn runtime_persistent_volume_surplus_is_silent() {
     let mut det = detector();
-    // Сбалансированная последовательность знаков с блоком 3-подряд «+» и 3-подряд «−» в начале.
-    // Ровно RECON_WINDOW/2 профицитов и RECON_WINDOW/2 дефицитов → знаковое среднее = 0.
-    let half = RECON_WINDOW / 2;
-    let mut plus_left = half;
-    let mut minus_left = half;
-    let mut scales: Vec<f64> = Vec::with_capacity(RECON_WINDOW);
-    // первые 3 «+», затем 3 «−» (реальный churn-ран), остаток — чередование до баланса.
-    for i in 0..RECON_WINDOW {
-        let want_plus = if i < 3 {
-            true
-        } else if i < 6 {
-            false
-        } else {
-            i % 2 == 0
-        };
-        let plus = if want_plus && plus_left > 0 {
-            plus_left -= 1;
-            true
-        } else if minus_left > 0 {
-            minus_left -= 1;
-            false
-        } else {
-            plus_left -= 1;
-            true
-        };
-        scales.push(if plus { 1.15 } else { 0.85 });
-    }
-    let locals: Vec<OrderBook> = scales.iter().map(|&s| scaled_book(s, 1.0)).collect();
-    let (any_alert, _) = run_sequence(&mut det, &locals);
-    assert!(
-        !any_alert,
-        "churn с 3-подряд-одного-знака (реальный замер BTC BID 0.1% `---`) поднял алерт — детектор \
-         среагировал на КОРОТКИЙ ран знака, а не на устойчивый сдвиг окна (наивный «K подряд → алерт» \
-         вместо знакового среднего). Окно сбалансировано (mean=0) — обязана быть тишина"
-    );
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// (3) ПЕРСИСТЕНТНЫЙ ДЕФИЦИТ (C1-класс) → АЛЕРТ. local ОДНОСТОРОННЕ ниже reference каждый цикл.
-//     Та же per-cycle магнитуда, что у churn (−1500 bps), но знак ДЕРЖИТСЯ → mean=−1500 → алерт.
-// ─────────────────────────────────────────────────────────────────────────────
-
-#[test]
-fn persistent_volume_deficit_alerts() {
-    let mut det = detector();
-    // local держит bid-объём на 15% НИЖЕ reference КАЖДЫЙ цикл (near-touch ликвидность «испарилась» —
-    // класс C1: наша книга систематически недосчитывает near-book объём).
-    let locals: Vec<OrderBook> = (0..RECON_WINDOW).map(|_| scaled_book(0.85, 1.0)).collect();
+    let locals: Vec<OrderBook> = (0..RECON_WINDOW * 2)
+        .map(|_| scaled_book(1.15, 1.0))
+        .collect();
     let (any_alert, any_best) = run_sequence(&mut det, &locals);
+    assert!(!any_best, "фикстура: best цела (изоляция объёма)");
     assert!(
-        !any_best,
-        "фикстура: best не должна расходиться (изолируем персистентный ОБЪЁМНЫЙ дефицит)"
-    );
-    assert!(
-        any_alert,
-        "local держал −15% near-book объёма ВСЕ {RECON_WINDOW} циклов (персистентный дефицит, C1-класс), \
-         а recon смолчал — знаковое среднее окна = −1500 bps обязано пробить порог. Детектор не \
-         отличает персистентную порчу от churn (та же магнитуда, но знак держится)"
+        !any_alert,
+        "рантайм эмитил на персистентном объёмном ПРОФИЦИТЕ (+1500 bps, TD-016 near-touch фантом) — под \
+         B2 объёмная сверка снята из рантайма; фантом обнаруживается офлайн над записанной книгой, не \
+         рантайм-эмиссией"
     );
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// (4) ПЕРСИСТЕНТНЫЙ ПРОФИЦИТ (TD-016 near-touch фантом) → АЛЕРТ. local систематически ВЫШЕ reference
-//     (уровень, из-под которого цена ушла, не обнулён → фантомный объём держится).
-// ─────────────────────────────────────────────────────────────────────────────
-
+/// (B2-3, ОТСУТСТВИЕ + ПАДАЕТ против window-active impl) within-reach уровень (НЕ best, 0.25%) удалён
+/// ПЕРСИСТЕНТНО — конкретная форма C1, НЕ двигающая best. Под B2 рантайм МОЛЧИТ (объёмное проявление C1 →
+/// офлайн; в рантайме C1 ловится ТОЛЬКО через best bid). Снятый оракул near_book_eviction_persists_then_alerts
+/// требовал алерт — под B2 инвертирован в тишину. best (0.05%) цел → best_price_diverged=false.
 #[test]
-fn persistent_volume_surplus_alerts() {
-    let mut det = detector();
-    let locals: Vec<OrderBook> = (0..RECON_WINDOW).map(|_| scaled_book(1.15, 1.0)).collect();
-    let (any_alert, _) = run_sequence(&mut det, &locals);
-    assert!(
-        any_alert,
-        "local держал +15% фантомного near-book объёма ВСЕ {RECON_WINDOW} циклов (TD-016 near-touch \
-         фантом — систематический local>ref), а recon смолчал — персистентный профицит обязан алертить"
-    );
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// (5) КОНКРЕТНАЯ ФОРМА C1: within-reach уровень (НЕ best) УДАЛЁН персистентно → дефицит полос
-//     0.3%/0.5% держится → алерт. best (0.05%) цел → best_price_diverged=false (изоляция окна).
-// ─────────────────────────────────────────────────────────────────────────────
-
-#[test]
-fn near_book_eviction_persists_then_alerts() {
+fn runtime_nonbest_eviction_is_silent() {
     let mut det = detector();
     let reference = reference();
-    // local: near-book БЕЗ уровня 0.25% (эвикция C1 стёрла within-reach уровень; best 0.05% цел).
+    // local: near-book БЕЗ уровня 0.25% (эвикция C1 стёрла within-reach НЕ-best уровень; best 0.05% цел).
     let evicted: Vec<f64> = PCTS.iter().copied().filter(|&p| p != 0.0025).collect();
     let mut any_alert = false;
     let mut any_best = false;
-    for _ in 0..RECON_WINDOW {
+    for _ in 0..RECON_WINDOW * 2 {
         let mut local = OrderBook::new();
         let bids: Vec<Level> = evicted
             .iter()
@@ -244,192 +177,58 @@ fn near_book_eviction_persists_then_alerts() {
     }
     assert!(
         !any_best,
-        "фикстура: best bid (0.05%) цел — эвикция стёрла within-reach уровень 0.25%, НЕ best (изоляция \
-         оконного объёмного пути от best-пути)"
-    );
-    assert!(
-        any_alert,
-        "within-reach уровень 0.25% удалён ПЕРСИСТЕНТНО (C1-эвикция), а recon смолчал — устойчивый \
-         дефицит полос 0.3%/0.5% обязан пробить окно"
-    );
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// (6) ε_test (оконный) НЕ КАЛИБРУЕТСЯ: персистентная порча с |mean| ≥ ε_test алертит даже при
-//     ε_prod = ε_max (самый мягкий допустимый рабочий порог). fail-closed.
-// ─────────────────────────────────────────────────────────────────────────────
-
-#[test]
-fn windowed_eps_test_not_calibratable() {
-    // ε_prod задан на ПОТОЛКЕ (ε_max) — максимально «оглушённый» допустимый детектор.
-    let lax = ReconThresholds::new(EPS_MAX_BPS).expect("ε_prod == ε_max допустим");
-    let mut det = ReconDetector::new(lax);
-    let locals: Vec<OrderBook> = (0..RECON_WINDOW).map(|_| scaled_book(0.85, 1.0)).collect();
-    let (any_alert, _) = run_sequence(&mut det, &locals);
-    assert!(
-        any_alert,
-        "персистентная порча (−1500 bps окно) НЕ пробила детектор при ε_prod=ε_max — ε_test обязан \
-         быть фиксированным гейтом (нельзя откалибровать окно до бесконечности, fail-closed)"
-    );
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// (7) ДЕТЕРМИНИЗМ ЭМИССИЙ: одинаковая последовательность наблюдений → одинаковая последовательность
-//     вердиктов (окно — рантайм-состояние, но чистое: нет wall-clock/rand). DET-принцип для recon.
-// ─────────────────────────────────────────────────────────────────────────────
-
-#[test]
-fn detector_is_deterministic_across_replay() {
-    let reference = reference();
-    // Смешанная последовательность: churn-хвост + персистентный дефицит (чтобы были и тишина, и алерт).
-    let scales: Vec<f64> = (0..RECON_WINDOW * 2)
-        .map(|i| {
-            if i < RECON_WINDOW {
-                if i % 2 == 0 {
-                    1.15
-                } else {
-                    0.85
-                }
-            } else {
-                0.85 // персистентный дефицит во второй половине
-            }
-        })
-        .collect();
-    let locals: Vec<OrderBook> = scales.iter().map(|&s| scaled_book(s, 1.0)).collect();
-
-    let verdicts = |()| -> Vec<bool> {
-        let mut det = detector();
-        locals
-            .iter()
-            .map(|l| det.observe(l, &reference).alert)
-            .collect()
-    };
-    let run1 = verdicts(());
-    let run2 = verdicts(());
-    assert_eq!(
-        run1, run2,
-        "два прогона одной последовательности дали РАЗНЫЕ эмиссии — детектор недетерминирован \
-         (окно обязано быть чистым рантайм-состоянием, без wall-clock/rand; DET-принцип recon)"
-    );
-    assert!(
-        run1.iter().any(|&a| a),
-        "фикстура-сетап не состоялся: персистентный хвост обязан был поднять хотя бы один алерт \
-         (иначе детерминизм проверяется вхолостую на вечной тишине)"
-    );
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// (8) DEPTH-SKIP В ОКОННОМ ПУТИ (C-011 Concern-1, Mutation B reviewer'а). Пиннит фикс ПЕРВОГО
-//     §8-флуда (асимметрия глубины §4.2): полоса, которую reference НЕ достаёт, ПРОПУСКАЕТСЯ в
-//     observe(). Прочие оракулы сюиты используют reference, достающий ВСЕ полосы (0.55%), поэтому
-//     skip-`continue` там НИКОГДА не срабатывает — depth-skip был не запиннен НИ ОДНИМ RED-оракулом
-//     (Mutation B: удаление skip → 21/21 всё равно GREEN). Здесь reference ТОНКИЙ (reach ~0.15%),
-//     local ПЕРСИСТЕНТНО держит односторонний объём на НЕДОСТИЖИМЫХ полосах 0.3%/0.5% каждый цикл.
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Reference достаёт только 0.05%/0.15% (reach≈0.15%) — полосы 0.3%/0.5% ВНЕ его reach.
-fn truncated_reference() -> OrderBook {
-    let mut b = OrderBook::new();
-    let shallow = &PCTS[0..2]; // 0.05%, 0.15% — как REST, обрезанный на тонком/волатильном рынке
-    let bids: Vec<Level> = shallow
-        .iter()
-        .map(|&p| Level {
-            price: (MID as f64 * (1.0 - p)) as i64,
-            size: BASE as i64 * UNIT,
-        })
-        .collect();
-    let asks: Vec<Level> = shallow
-        .iter()
-        .map(|&p| Level {
-            price: (MID as f64 * (1.0 + p)) as i64,
-            size: BASE as i64 * UNIT,
-        })
-        .collect();
-    b.apply_snapshot(&bids, &asks);
-    b
-}
-
-/// (8, GREEN со skip; ПАДАЕТ без skip = Mutation B) reference тонкий (≤0.15%), local — полная книга
-/// (0.55%), near-book 0.1% ИДЕНТИЧЕН, а на НЕДОСТИЖИМЫХ полосах 0.3%/0.5% local персистентно держит
-/// односторонний объём ВСЕ RECON_WINDOW циклов. Детектор ОБЯЗАН молчать: невалидируемая полоса
-/// (reference.max_reach_pct(side) < band) ПРОПУСКАЕТСЯ, невалидируемое ≠ расхождение (§4.2).
-/// Анти-плацебо: убери skip в observe() → local(300)≫reference(200) на полосе 0.3% каждый цикл →
-/// окно держит персистентный +знак → ЛОЖНЫЙ алерт → тест ПАДАЕТ (это §8-флуд #1, вернувшийся на
-/// тонком рынке при зелёных гейтах — ровно то, что поймал reviewer Mutation B).
-#[test]
-fn unreachable_band_is_skipped_not_flooded() {
-    let mut det = detector();
-    let reference = truncated_reference();
-    // local — ПОЛНАЯ книга (reach 0.55%): near-book 0.05%/0.15% совпадает с reference (size BASE),
-    // а глубже (0.25%..0.55%) несёт объём, которого reference не видит. НЕ меняется по циклам
-    // (персистентно) — если бы это считалось расхождением, окно держало бы знак и флудило.
-    let local = scaled_book(1.0, 1.0);
-
-    // Страховка сетапа (testing.md: гейт обязан краснеть и при несостоявшемся setup): reference
-    // ДЕЙСТВИТЕЛЬНО не достаёт 0.3%/0.5%, а local — достаёт (иначе тест проверяет skip вхолостую).
-    for side in [Side::Buy, Side::Sell] {
-        let rr = reference.max_reach_pct(side).expect("reference не пуст");
-        assert!(
-            rr < 0.003,
-            "фикстура-сетап: reference обязан НЕ достигать полосу 0.3% (reach={rr}) — иначе skip не тестируется"
-        );
-        let lr = local.max_reach_pct(side).expect("local не пуст");
-        assert!(
-            lr >= 0.005,
-            "фикстура-сетап: local обязан достигать полосу 0.5% (reach={lr}) — иначе нечему флудить без skip"
-        );
-    }
-
-    let (any_alert, any_best) = run_sequence_ref(&mut det, &local, &reference);
-    assert!(
-        !any_best,
-        "фикстура: best (0.05%) идентичен → best_price_diverged=false. Тест изолирует depth-skip \
-         объёмного пути от best-пути"
+        "фикстура: best bid (0.05%) цел — эвикция стёрла within-reach уровень 0.25%, НЕ best"
     );
     assert!(
         !any_alert,
-        "local держал объём на НЕДОСТИЖИМЫХ reference'ом полосах 0.3%/0.5% ПЕРСИСТЕНТНО, а детектор \
-         поднял алерт — depth-skip в observe() снят/сломан. Полоса за reference.max_reach_pct обязана \
-         ПРОПУСКАТЬСЯ (§4.2), иначе §8-флуд #1 (асимметрия глубины) вернётся на тонком/волатильном \
-         рынке при зелёных гейтах (Mutation B reviewer'а, C-011 Concern-1)"
+        "within-reach НЕ-best уровень 0.25% удалён персистентно (объёмное проявление C1), а рантайм \
+         эмитил — под B2 объёмная сверка снята из рантайма (REST-неверифицируема). C1, двигающий best, \
+         ловится best-путём; объёмный — офлайн-треком над записанной книгой"
     );
 }
 
-/// Как `run_sequence`, но с ЯВНЫМ reference (тот же local каждый цикл — персистентно).
-fn run_sequence_ref(
-    det: &mut ReconDetector,
-    local: &OrderBook,
-    reference: &OrderBook,
-) -> (bool, bool) {
-    let mut any_alert = false;
-    let mut any_best = false;
-    for _ in 0..RECON_WINDOW {
-        let v = det.observe(local, reference);
-        any_alert |= v.alert;
-        any_best |= v.best_price_diverged;
-    }
-    (any_alert, any_best)
+// ═════════════════════════════════════════════════════════════════════════════════════════════
+// BEST-ПУТЬ ОСТАЁТСЯ (запрет «заглушить всё»): пост-seed пустая local — РЕАЛЬНАЯ порча → эмит.
+// (Также: best-десинк — red_recon_sink::best_desync_emits_immediately, red_ops_recon; skew — red_recon_live.)
+// ═════════════════════════════════════════════════════════════════════════════════════════════
+
+/// (BEST, GREEN — анти-плацебо к B2-silent: НЕ «заглушить всё») ПОСЛЕ seed внезапно пустая local — это
+/// РЕАЛЬНАЯ потеря/порча книги (best исчез) → ОБЯЗАН эмитить. Валит always-silent impl. Прямой guard
+/// против «B2 = молчать всегда» на РАНТАЙМ-пути (best).
+#[test]
+fn runtime_post_seed_empty_local_still_emits() {
+    let mut det = detector();
+    let reference = reference();
+    let seed = scaled_book(1.0, 1.0);
+    let v0 = det.observe(&seed, &reference);
+    assert!(
+        !v0.alert,
+        "seed на идентичных книгах не алертит (иначе фикстура невалидна)"
+    );
+    let empty = OrderBook::new();
+    let v1 = det.observe(&empty, &reference);
+    assert!(
+        v1.alert && v1.best_price_diverged,
+        "пост-seed пустая local (потеря живой книги — РЕАЛЬНАЯ порча) не эмитировала — B2 НЕ смеет глушить \
+         best-путь; рантайм молчит ТОЛЬКО по объёму, best-расхождение эмитит всегда"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// (9) SEED-GATE (ТРЕТИЙ §8-провал, дефект A). Прод-факт (reviewer, b1adec0): recon эмитил 4
-//     стартовых `best_diverged=true div_bps=10000 Resynced` на КАЖДЫЙ рестарт recorder'а —
-//     orchestrator сравнивал REST-reference с ПУСТОЙ local-книгой (fetcher тянет REST ДО того как
-//     books-feeder положил первый `L2Snapshot`; `books.get(...).unwrap_or(OrderBook::new())`).
-//     «Нет своей книги» (ещё не seeded) ≠ «биржа испортилась». Дизайн (spec engine-dev): детектор
-//     SELF-SEEDING — держит `seeded: bool`, ставит true на первой НЕПУСТОЙ local; до seed observe
-//     возвращает no-alert и НЕ кормит окно (не отравляет его пустышкой). Детерминизм сохранён
-//     (seeded — рантайм-состояние по последовательности наблюдений).
+// (9) SEED-GATE (третий §8-провал, дефект A — §8-подтверждён РАБОЧИМ, merge e9fc258). Ортогонален B2,
+//     остаётся sacred. Прод-факт (reviewer, b1adec0): recon эмитил 4 стартовых `best_diverged=true
+//     div_bps=10000 Resynced` на КАЖДЫЙ рестарт — сравнение REST-reference с ПУСТОЙ local (fetcher
+//     тянет REST ДО первого L2Snapshot feeder'а). Дизайн — SELF-SEEDING `ReconDetector` (`seeded: bool`,
+//     true на первой НЕПУСТОЙ local; до seed — no-alert И не кормит состояние).
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// (9a, ПАДАЕТ против текущего impl — стартовый флуд) Пока local ПУСТА (не seeded), recon НЕ эмитит
-/// НИЧЕГО, даже против полного REST-reference. Текущий impl: `reconcile(empty, full)` →
-/// `best_diverged=true` → alert (4×10000 Resynced/рестарт). Self-seeding обязан это подавить.
+/// (9a, ПАДАЛ против pre-seed impl) Пока local ПУСТА (не seeded), recon НЕ эмитит НИЧЕГО даже против
+/// полного REST-reference. Self-seeding подавляет стартовый флуд `best_diverged=true div=10000`.
 #[test]
 fn empty_local_before_first_seed_does_not_emit() {
     let mut det = detector();
-    let reference = reference(); // полный REST-снапшот
-    let empty = OrderBook::new(); // своя книга ещё не пришла (feeder не отработал)
+    let reference = reference();
+    let empty = OrderBook::new();
     let mut any_alert = false;
     for _ in 0..RECON_WINDOW {
         let v = det.observe(&empty, &reference);
@@ -438,67 +237,94 @@ fn empty_local_before_first_seed_does_not_emit() {
     assert!(
         !any_alert,
         "recon эмитил на ПУСТОЙ (не seeded) local — стартовый флуд `best_diverged=true div=10000` \
-         (дефект A, третий §8-провал): fetcher тянет REST ДО первого L2Snapshot books-feeder'а. \
-         Пустая СВОЯ книга ≠ порча биржи — детектор обязан self-seed'иться на первой НЕПУСТОЙ local \
-         и молчать до seed"
+         (дефект A): fetcher тянет REST ДО первого L2Snapshot. Пустая СВОЯ книга ≠ порча биржи — \
+         детектор обязан self-seed'иться на первой НЕПУСТОЙ local и молчать до seed"
     );
 }
 
-/// (9b, GREEN сейчас и после — анти-плацебо к seed-gate: не over-suppress) ПОСЛЕ первого реального
-/// снапшота (seeded) внезапно пустая local — это РЕАЛЬНАЯ потеря/порча книги, НЕ старт → ОБЯЗАН
-/// эмитить (best-путь). Seed-gate НЕ смеет глушить пост-seed пустоту. Валит impl «всегда молчать на
-/// пустой local».
+/// (9b, GREEN — анти-плацебо к seed-gate: не over-suppress) ПОСЛЕ первого снапшота (seeded) внезапно
+/// пустая local — РЕАЛЬНАЯ потеря/порча → эмит (best-путь). Валит «всегда молчать на пустой local».
 #[test]
 fn empty_local_after_seed_is_corruption_and_emits() {
     let mut det = detector();
     let reference = reference();
-    // (1) первый РЕАЛЬНЫЙ снапшот seeds детектор; книги идентичны → тишина.
     let seed = scaled_book(1.0, 1.0);
     let v0 = det.observe(&seed, &reference);
     assert!(
         !v0.alert,
-        "seed-цикл на идентичных книгах не должен алертить (иначе фикстура невалидна)"
+        "seed-цикл на идентичных книгах не алертит (иначе фикстура невалидна)"
     );
-    // (2) local внезапно ПУСТА ПОСЛЕ seed → потеря книги (порча) → best расходится → эмит.
     let empty = OrderBook::new();
     let v1 = det.observe(&empty, &reference);
     assert!(
         v1.alert && v1.best_price_diverged,
-        "пост-seed пустая local (потеря живой книги — РЕАЛЬНАЯ порча, не старт) не поднялась: \
-         seed-gate заглушил настоящее расхождение (over-suppress). Гейт молчит ТОЛЬКО до первого seed"
+        "пост-seed пустая local (потеря живой книги — РЕАЛЬНАЯ порча, не старт) не поднялась: seed-gate \
+         заглушил настоящее расхождение (over-suppress). Гейт молчит ТОЛЬКО до первого seed"
     );
 }
 
-/// (9c, ПАДАЕТ против текущего impl И против poison-window impl — находка critic C-012) Seed-gate =
-/// ДВА обязательства: до seed observe (1) НЕ алертит И (2) НЕ КОРМИТ окно. Оракул 9a пиннил только (1).
-/// Плохой impl может подавить стартовый алерт, НО протолкнуть pre-seed наблюдения (пустая local vs
-/// полный REST → signed = (0−full)/full·10000 = −10000 bps/полоса) В ОКНО. Тогда ПОСЛЕ seed окно
-/// отравлено −10000: на здоровом рынке знаковое среднее уезжает в дефицит → ЛОЖНЫЙ алерт.
-/// Фикстура: RECON_WINDOW циклов pre-seed пустой local, затем RECON_WINDOW циклов ЗДОРОВЫХ
-/// ИДЕНТИЧНЫХ книг (signed 0). Корректный self-seeding (не кормит окно до seed) → тишина всю
-/// последовательность. Poison-window impl → фаза 2 алертит (окно держит −10000). Current impl →
-/// алертит в обеих фазах.
+/// (9c, ПАДАЛ против current+poison impl — находка critic C-012) Seed-gate = ДВА обязательства: до seed
+/// observe (1) НЕ алертит И (2) НЕ КОРМИТ состояние. Плохой impl может подавить стартовый алерт, но
+/// протолкнуть pre-seed наблюдения (пустая local vs полный REST → большой односторонний сигнал) в
+/// состояние — тогда после seed на здоровом рынке всплывает ложный алерт. Фикстура: `RECON_WINDOW`
+/// циклов pre-seed пустой local, затем `RECON_WINDOW` циклов ЗДОРОВЫХ ИДЕНТИЧНЫХ книг → тишина всю
+/// последовательность у корректного self-seeding (не кормит состояние до seed). Под B2 объёмного окна
+/// нет, но контракт «не кормить состояние до seed» + «здоровое после seed молчит» сохранён и остаётся
+/// guard'ом seed-gate'а под любым impl (best-путь тоже обязан молчать на здоровых идентичных книгах).
 #[test]
-fn pre_seed_empty_does_not_poison_window() {
+fn pre_seed_empty_does_not_poison_state() {
     let mut det = detector();
-    let reference = reference(); // полный REST
+    let reference = reference();
     let empty = OrderBook::new();
-    let healthy = scaled_book(1.0, 1.0); // == reference → signed 0 (здоровый рынок)
+    let healthy = scaled_book(1.0, 1.0); // == reference → здоровый рынок
 
     let mut any_alert = false;
-    // Фаза 1: RECON_WINDOW циклов ДО seed (пустая local). Не алерт (9a) И не кормит окно (9c).
     for _ in 0..RECON_WINDOW {
         any_alert |= det.observe(&empty, &reference).alert;
     }
-    // Фаза 2: RECON_WINDOW циклов ЗДОРОВЫХ идентичных книг (seed на первом, дальше signed 0).
     for _ in 0..RECON_WINDOW {
         any_alert |= det.observe(&healthy, &reference).alert;
     }
     assert!(
         !any_alert,
-        "pre-seed пустая local ОТРАВИЛА окно: после seed на ЗДОРОВЫХ идентичных книгах detector \
-         алертит — pre-seed пустышки (signed −10000 bps/полоса) попали в окно и сдвинули знаковое \
-         среднее в ложный дефицит. observe ДО seed обязан НЕ КОРМИТЬ окно, а не только молчать \
-         (critic C-012: 9a пиннил no-alert, но не no-feed)"
+        "pre-seed пустая local ОТРАВИЛА состояние: после seed на ЗДОРОВЫХ идентичных книгах детектор \
+         алертит — pre-seed пустышки попали в состояние. observe ДО seed обязан НЕ КОРМИТЬ состояние, а \
+         не только молчать (critic C-012: 9a пиннил no-alert, но не no-feed)"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// (ДЕТЕРМИНИЗМ) одинаковая последовательность наблюдений → одинаковая последовательность вердиктов
+//     (seed — рантайм-состояние, но чистое: нет wall-clock/rand). DET-принцип для рантайм-recon.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn runtime_detector_is_deterministic_across_replay() {
+    let reference = reference();
+    // Смешанная последовательность рантайм-пути: пустой pre-seed → seed здоровым → пост-seed пустой
+    // (порча, best-эмит) → здоровый. Проверяем и тишину, и алерт на РАНТАЙМ-пути (best + seed-gate).
+    let verdicts = |()| -> Vec<bool> {
+        let mut det = detector();
+        let seq: Vec<OrderBook> = vec![
+            OrderBook::new(),      // pre-seed пусто → no-alert (seed-gate)
+            scaled_book(1.0, 1.0), // seed здоровым → no-alert
+            OrderBook::new(),      // пост-seed пусто → best-эмит (порча)
+            scaled_book(1.0, 1.0), // здоровый → no-alert
+        ];
+        seq.iter()
+            .map(|l| det.observe(l, &reference).alert)
+            .collect()
+    };
+    let run1 = verdicts(());
+    let run2 = verdicts(());
+    assert_eq!(
+        run1, run2,
+        "два прогона одной последовательности дали РАЗНЫЕ эмиссии — детектор недетерминирован (seed — \
+         чистое рантайм-состояние, без wall-clock/rand; DET-принцип рантайм-recon)"
+    );
+    assert!(
+        run1.iter().any(|&a| a),
+        "фикстура-сетап не состоялся: пост-seed пустая local обязана была поднять best-алерт (иначе \
+         детерминизм проверяется вхолостую на вечной тишине)"
     );
 }

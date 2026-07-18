@@ -1,19 +1,19 @@
-//! RED OPS-I-1 sink (sacred, architect-only) — оркестрация recon через ОКОННЫЙ детектор: churn на
-//! здоровом рынке → ТИШИНА (канал не шумит); персистентная порча / best-десинк → доменное событие
-//! `EventKind::Sys(ReconDivergence)` в канал рекордера + метрики. Оркестраторный контракт (engine-dev impl).
+//! RED OPS-I-1 sink ПОД B2 (sacred, architect-only) — оркестрация recon: рантайм эмитит `Sys` ТОЛЬКО
+//! на best-price расхождении; персистентный ОБЪЁМ (даже ≫ ε_max) в рантайме МОЛЧИТ. Оркестраторный
+//! контракт (engine-dev impl).
+//!
+//! B2 ПРИНЯТ founder ★ 2026-07-18 (`docs/fa/ops.md` §4.3.2). ТРЕТИЙ §8-провал показал: оконное знаковое
+//! среднее near-touch ОБЪЁМА НЕ сходится к 0 на живом рынке (систематический WS(T1)-vs-REST(T2) bias,
+//! 103..747 bps, в т.ч. на нетронутом BinanceFutures). Объёмная сверка снята из рантайма → офлайн-трек.
+//! Рантайм-alert ⟺ best_price_diverged (best-price §8-подтверждён: healthy 0, injection 6× best=true).
 //!
 //! Тестируется БЕЗ живого `Recorder`: `emit`-замыкание собирает `EventKind` в `Vec`. Доказывает
 //! `JR-I-1` (единственный путь — `EventKind::Sys(ReconDivergence)` через emit, не journal.append) и
 //! `OPS-I-6` (ops журнал не трогает: sink принимает emit-замыкание + `&mut ReconDetector`, не journal-handle).
 //!
-//! ВТОРОЙ §8-провал (2026-07-17): прежний `normal_book_is_silent` сравнивал книгу С СОБОЙ (local==reference)
-//! → всегда GREEN на юните, а на проде sink флудил `ReconDivergence` на КАЖДОМ цикле здорового рынка
-//! (near-touch объём churn'ит между WS-книгой и async REST). Теперь sink STATEFUL (`ReconDetector` держит
-//! окно per venue/symbol), а «норма» моделируется ПОСЛЕДОВАТЕЛЬНОСТЬЮ churn-циклов (два источника,
-//! разные моменты), НЕ книгой-с-собой — `.claude/rules/testing.md` «RED двух источников → live-режим».
-//!
-//! Анти-плацебо: против `todo!()` — все падают; «всегда эмитить» валит churn-тишину;
-//! «никогда не эмитить» валит persistent-emit И best-emit.
+//! Анти-плацебо В ОБЕ СТОРОНЫ: против `todo!()` — все падают; персистентный-объём→тишина ВАЛИТ
+//! window-active impl (текущий прод-код эмитил на персистентном объёме — §8-флуд B); best-desync→эмит
+//! ВАЛИТ always-silent impl («заглушить всё» запрещено).
 
 use book::OrderBook;
 use contracts::{EventKind, Level, SysEvent, Venue};
@@ -54,7 +54,7 @@ fn reference() -> OrderBook {
 }
 
 /// local без best bid (эвикция C1) — 0.05% уровень удалён, ask цел. best уходит на 0.15% (>skew) →
-/// best-price расхождение → immediate emit (per-cycle, без окна).
+/// best-price расхождение → immediate emit (per-cycle, рантайм-путь под B2).
 fn book_missing_best_bid() -> OrderBook {
     let mut b = OrderBook::new();
     let bids: Vec<Level> = PCTS
@@ -80,8 +80,8 @@ fn detector() -> ReconDetector {
     ReconDetector::new(ReconThresholds::new(EPS_PROD_DEFAULT_BPS).expect("thr"))
 }
 
-/// CHURN на здоровом рынке → НИЧЕГО не эмитится за ВСЮ последовательность. Прежний дефект: sink
-/// шумел на каждом такте. Знак per-cycle чередуется → окно усредняет в 0 → тишина.
+/// CHURN на здоровом рынке → НИЧЕГО не эмитится. Best-цена цела (масштаб — по объёму) → под B2 путь
+/// объёма не эмитит вовсе → тишина. Прежний дефект: sink шумел на каждом такте.
 #[test]
 fn churn_sequence_is_silent() {
     let mut det = detector();
@@ -104,23 +104,23 @@ fn churn_sequence_is_silent() {
     }
     assert!(
         emitted.is_empty(),
-        "sink эмитил {} recon-событий на ЗДОРОВОМ churn'ащем рынке (near-touch объём мигает знаком) — \
-         ровно §8-флуд, который поймал reviewer. Оконный детектор обязан гасить churn в тишину",
+        "sink эмитил {} recon-событий на ЗДОРОВОМ churn'ащем рынке — под B2 объёмный путь не эмитит вовсе",
         emitted.len()
     );
 }
 
-/// ПЕРСИСТЕНТНАЯ порча объёма (local держит −15% near-book каждый цикл) → РОВНО одно событие после
-/// заполнения окна (best цел → `best_price_diverged=false`, `divergence_bps>0` = оконная магнитуда).
+/// (B2, ПАДАЕТ против window-active impl) ПЕРСИСТЕНТНЫЙ объёмный дефицит (−15% ≫ ε_max) 2×`RECON_WINDOW`
+/// циклов — прод-класс, флудивший §8 (best=false). Под B2 sink МОЛЧИТ: объёмная сверка снята из рантайма
+/// → офлайн. Инверсия снятого `persistent_divergence_emits_recondivergence` (тот требовал эмит).
 #[test]
-fn persistent_divergence_emits_recondivergence() {
+fn persistent_volume_sequence_does_not_emit() {
     let mut det = detector();
     let reference = reference();
     let metrics = Metrics::new();
     let mut emitted: Vec<EventKind> = Vec::new();
 
-    for _ in 0..RECON_WINDOW {
-        let local = scaled_book(0.85, 1.0); // персистентный дефицит
+    for _ in 0..RECON_WINDOW * 2 {
+        let local = scaled_book(0.85, 1.0); // персистентный дефицит, best цел
         handle_recon_snapshot(
             &mut det,
             &local,
@@ -132,29 +132,16 @@ fn persistent_divergence_emits_recondivergence() {
         );
     }
     assert!(
-        !emitted.is_empty(),
-        "персистентный дефицит объёма (−15% ВСЕ {RECON_WINDOW} циклов) не эмитировал событие — \
-         C1-класс порчи не аудируется"
+        emitted.is_empty(),
+        "sink эмитил {} событий на ПЕРСИСТЕНТНОМ объёмном дефиците (−1500 bps ≫ ε_max, 2×{RECON_WINDOW} \
+         циклов, best цел) — это §8-флуд B, который B2 удаляет. Под B2 рантайм эмитит ⟺ best-расхождение; \
+         объёмная порча аудируется офлайн-треком над записанной книгой, не рантайм-`Sys` (window-active \
+         impl не удалён)",
+        emitted.len()
     );
-    match emitted.last().expect("есть событие") {
-        EventKind::Sys(SysEvent::ReconDivergence(audit)) => {
-            assert_eq!(audit.venue, Venue::Binance);
-            assert_eq!(audit.symbol, "BTCUSDT");
-            assert!(
-                !audit.best_price_diverged,
-                "объёмная персистентная порча помечена как best-расхождение — офлайн спутает класс \
-                 (best цел, разошёлся ОБЪЁМ)"
-            );
-            assert!(
-                audit.divergence_bps > 0,
-                "аудит оконной порчи не несёт магнитуду (divergence_bps=0) — офлайн не оценит тяжесть"
-            );
-        }
-        other => panic!("не Sys(ReconDivergence): {other:?}"),
-    }
 }
 
-/// Best-price десинк (пропал best bid) → immediate emit УЖЕ на первом цикле (окно не нужно для best).
+/// Best-price десинк (пропал best bid) → immediate emit УЖЕ на первом цикле (рантайм-путь под B2).
 #[test]
 fn best_desync_emits_immediately() {
     let mut det = detector();
@@ -175,7 +162,7 @@ fn best_desync_emits_immediately() {
     assert!(
         did && emitted.len() == 1,
         "пропавший best bid не дал immediate emit на первом цикле (did={did}, emitted={}) — best-путь \
-         обязан быть per-cycle, без ожидания окна",
+         обязан быть per-cycle (рантайм-триггер под B2)",
         emitted.len()
     );
     match &emitted[0] {
@@ -187,48 +174,52 @@ fn best_desync_emits_immediately() {
     }
 }
 
-/// Персистентная порча → метрики реально обновлены: `book_divergence_bps` set, `book_resync_total`
-/// инкрементирован (обе с labels venue/symbol). No-op метрики валят тест.
+/// Best-десинк → метрики реально обновлены: `book_resync_total` инкрементирован (recon-эмиссия) +
+/// `book_divergence_bps` гейдж выведен (обе с labels venue/symbol). No-op метрики валят тест. Под B2
+/// счётчик ресинков растёт на BEST-расхождении (объём не эмитит), а гейдж обновляется каждый цикл.
 #[test]
-fn divergence_updates_metrics() {
+fn metrics_updated_on_best_resync() {
     let mut det = detector();
     let reference = reference();
     let metrics = Metrics::new();
 
-    for _ in 0..RECON_WINDOW {
-        let local = scaled_book(0.85, 1.0);
-        handle_recon_snapshot(
-            &mut det,
-            &local,
-            &reference,
-            Venue::Binance,
-            "BTCUSDT",
-            &metrics,
-            |_| {},
-        );
-    }
+    // best-десинк (пропал best bid) → эмиссия + ресинк; гейдж обновляется в этом же цикле.
+    let local = book_missing_best_bid();
+    let did = handle_recon_snapshot(
+        &mut det,
+        &local,
+        &reference,
+        Venue::Binance,
+        "BTCUSDT",
+        &metrics,
+        |_| {},
+    );
+    assert!(
+        did,
+        "best-десинк не эмитировал — метрика ресинка не сможет обновиться"
+    );
 
     let text = metrics.prometheus_text();
     let div = text
         .lines()
         .find(|l| l.starts_with("book_divergence_bps") && l.contains("symbol=\"BTCUSDT\""))
-        .expect("book_divergence_bps{symbol=BTCUSDT} не выведена");
+        .expect("book_divergence_bps{symbol=BTCUSDT} не выведена (гейдж наблюдаемости, §3)");
     let resync = text
         .lines()
         .find(|l| l.starts_with("book_resync_total") && l.contains("symbol=\"BTCUSDT\""))
-        .expect("book_resync_total{symbol=BTCUSDT} не выведена после ресинка");
+        .expect("book_resync_total{symbol=BTCUSDT} не выведена после best-ресинка");
     let val = |l: &str| {
         l.split_whitespace()
             .last()
             .and_then(|v| v.parse::<i64>().ok())
-            .unwrap_or(0)
+            .unwrap_or(-1)
     };
     assert!(
-        val(div) > 0,
-        "book_divergence_bps не обновлён (0) после персистентного расхождения"
+        val(div) >= 0,
+        "book_divergence_bps не выведен как число (гейдж наблюдаемости обязан присутствовать)"
     );
     assert!(
         val(resync) >= 1,
-        "book_resync_total не инкрементирован после ресинка"
+        "book_resync_total не инкрементирован после best-ресинка (C1-класс P0-метрика §7.1)"
     );
 }

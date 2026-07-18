@@ -86,10 +86,11 @@ fn ops_i_1_missing_best_bid_must_alert() {
     );
 }
 
-// (МНОЖЕСТВЕННОСТЬ/ОБЪЁМ) 10× занижение near-book сумм — это ПЕРСИСТЕНТНЫЙ ОБЪЁМНЫЙ дефицит →
-// ПЕРЕЕХАЛ В ОКОННЫЙ ДЕТЕКТОР (второй §8-провал: per-cycle объём churn'ит). Оракул —
-// `red_recon_window::persistent_volume_deficit_alerts`. Здесь (reconcile, per-cycle) остаётся
-// BEST-ONLY ε_test: `divergence_bps` считается как гейдж, но эмиссию по объёму принимает окно.
+// (МНОЖЕСТВЕННОСТЬ/ОБЪЁМ) Персистентный объёмный дефицит near-book под B2 (founder ★ 2026-07-18)
+// НЕ триггерит рантайм: объёмная сверка снята (REST-неверифицируема). `reconcile` (per-cycle) считает
+// `divergence_bps` только как ГЕЙДЖ наблюдаемости; `exceeds_test()` — BEST-ONLY. Рантайм-контракт
+// «персистентный объём МОЛЧИТ» пиннит `red_recon_runtime::runtime_persistent_volume_deficit_is_silent`;
+// объёмная порча аудируется офлайн-треком research-dev над записанной книгой.
 
 /// (ГРАНИЦА) Пустая локальная книга vs непустой референс → best расходится (нечего сравнивать).
 #[test]
