@@ -264,6 +264,14 @@ pub struct ReconDetector {
     /// 0=Buy/1=Sell. Полосы, которые reference не достаёт в данном цикле, не пишут наблюдение
     /// (skip-семантика, §4.3: невалидируемое ≠ расхождение).
     windows: [[Window; 2]; RECON_BANDS.len()],
+    /// Seed-gate (дефект A, третий §8-провал 2026-07-17, `docs/fa/ops.md` §4.3.1). `false` до
+    /// первой НЕПУСТОЙ local (`best_bid` ИЛИ `best_ask` есть); после первой непустой — `true`
+    /// навсегда. До seed `observe` возвращает no-alert и НЕ кормит окно: «моя книга ещё не
+    /// пришла» (orchestrator взял пустую `OrderBook::new()` ДО первого `L2Snapshot` feeder'а) —
+    /// это НЕ «биржа испортилась». Пост-seed пустая local — РЕАЛЬНАЯ потеря/порча → best-путь
+    /// эмитит немедленно (gate НЕ глушит пост-seed порчу). Чистое рантайм-состояние по
+    /// последовательности наблюдений → детерминизм сохранён.
+    seeded: bool,
 }
 
 impl ReconDetector {
@@ -275,6 +283,7 @@ impl ReconDetector {
                 [Window::new(), Window::new()],
                 [Window::new(), Window::new()],
             ],
+            seeded: false,
         }
     }
 
@@ -282,14 +291,40 @@ impl ReconDetector {
     /// в окно; алерт, если best разошёлся ИЛИ хотя бы одно ЗАПОЛНЕННОЕ окно держит `|signed_mean|`
     /// над порогом `EPS_TEST_BPS.min(thr.prod_bps())`.
     ///
-    /// Детерминирована: окно — чистое рантайм-состояние, без wall-clock/rand; одинаковая
-    /// последовательность наблюдений → одинаковая последовательность вердиктов.
+    /// **Seed-gate (первым делом, ДО `reconcile` и ДО push в окно):** пока `!self.seeded` и
+    /// `local` пуста (`best_bid().is_none() && best_ask().is_none()`) — вернуть no-alert,
+    /// окно НЕ кормить (не отравлять пустышкой `−10000 bps/полоса`). На первой непустой local —
+    /// выставить `self.seeded = true` и продолжить обычный путь. Пост-seed пустая local —
+    /// РЕАЛЬНАЯ потеря/порча, идёт через обычный best-путь (gate НЕ over-suppress'ит).
+    ///
+    /// Детерминирована: окно + seeded — чистое рантайм-состояние по последовательности наблюдений,
+    /// без wall-clock/rand; одинаковая последовательность наблюдений → одинаковая последовательность
+    /// вердиктов.
     ///
     /// Контракт (RED `red_recon_window.rs`, sacred): churn (знак per-cycle гуляет) → mean→0 →
     /// ТИШИНА даже при той же per-cycle магнитуде, что у порчи; персистентный дефицит/профицит
     /// (C1-стрип / TD-016 near-touch фантом) → АЛЕРТ; полосы за пределами
     /// `reference.max_reach_pct(side)` ПРОПУСКАЮТСЯ (невалидируемое ≠ расхождение).
     pub fn observe(&mut self, local: &OrderBook, reference: &OrderBook) -> ReconVerdict {
+        // (0) Seed-gate: до первой НЕПУСТОЙ local детектор молчит и НЕ кормит окно.
+        //     «Моя книга ещё не пришла» (orchestrator взял `OrderBook::new()` ДО первого
+        //     `L2Snapshot` books-feeder'а) ≠ «биржа испортилась». Тест 9c пиннит «не кормит
+        //     окно»: pre-seed пустышки (signed −10000 bps/полоса) иначе ОТРАВЛЯЮТ окно и дают
+        //     ложный алерт на ЗДОРОВЫХ идентичных книгах после seed (C-012).
+        if !self.seeded {
+            let local_empty = local.best_bid().is_none() && local.best_ask().is_none();
+            if local_empty {
+                return ReconVerdict {
+                    alert: false,
+                    best_price_diverged: false,
+                    window_divergence_bps: 0,
+                    gauge_divergence_bps: 0,
+                };
+            }
+            // Первая непустая local: фиксируем seed и идём обычным путём (reconcile + окно).
+            self.seeded = true;
+        }
+
         // (1) Best-price — per-cycle через `reconcile` (immediate, §4.2a).
         let per_cycle = reconcile(local, reference);
         let best_price_diverged = per_cycle.best_price_diverged;
