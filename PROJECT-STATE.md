@@ -583,7 +583,7 @@ Milestone открыт (план принят: critic C-007 APPROVE → reviewer
 - **Разблокирует task 2** (recon runtime OPS-I-1..9). **M-09 остаётся 🚧 ACTIVE** — далее architect:
   RED-оракулы OPS-I-1..9 + `scripts/verify_M-09.sh` (task 2+).
 
-### task 2 (recon runtime) — КОД MERGED (`b1adec0`, `--no-ff`) → §8 PROD **FAILED** (флуд windowed-volume, 2026-07-18); **Task 2 НЕ ЗАКРЫТ, remediation под founder ★**
+### task 2 (recon runtime) — КОД MERGED (`b1adec0`) → §8 PROD FAILED → **дефект A (seed-gate) ИСПРАВЛЕН + §8 RE-RUN PASS (`e9fc258`, 2026-07-18)**; дефект B (оконный объём) ОСТАЁТСЯ под founder ★ §4.3.2; **Task 2 НЕ ЗАКРЫТ**
 Цепочка (25 коммитов): venue REST-fetcher (Binance spot+futures, TD-013 structural) + `crates/ops`
 (recon/budget/metrics/silence) + windowed-персистентность (§4.3) + depth-skip pin (Concern-1
 reviewer → architect `5c621f5` → critic `3483a04`) + books-feeder (`apply_md_to_books` +
@@ -615,6 +615,27 @@ per-venue MD fanout-tap, `9db808c`). Reviewer APPROVED по коду; merge `b1a
 - **Итог:** recon-ЛОГИКА и books-feeder корректны в юнит-мире; §8 показал, что windowed K=12 +
   ε_prod=5 + sub-min cadence НЕ дают тишину на проде. Task 2 acceptance («recon молчит на здоровой
   книге») НЕ достигнут. **Milestone M-09 остаётся 🚧 ACTIVE.**
+
+#### §8 RE-RUN (дефект A seed-gate, reviewer, 2026-07-18, merge `e9fc258`) → PASS
+Architect (RED-first) → engine-dev: self-seeding `ReconDetector` (`crates/ops/src/recon.rs`,
+`seeded: bool`, early-return ДО reconcile и ДО push в окно, `seeded=true` на первой непустой local).
+Sacred RED `red_recon_window.rs`: 9a `empty_local_before_first_seed_does_not_emit`, 9b
+`empty_local_after_seed_is_corruption_and_emits` (анти-плацебо over-suppress), 9c
+`pre_seed_empty_does_not_poison_window` (C-012 gap). critic C-012 re-audit `5ec8094` → APPROVE.
+- **Юнит (clean-checkout tester + reviewer merged-tree):** ops 36/36, `red_recon_window` 11/11,
+  workspace clippy 0, `verify_M-09.sh` VERDICT PASS. Scope: только `crates/ops/src/recon.rs` (+37/-2).
+- **§8 LIVE eyes-on (reviewer, нативный release-recorder против live Binance spot+futures, 4 recon-пары):**
+  - **healthy ~8 мин: 0 `Sys(ReconDivergence)`** (best=true:0, best=false:0). Seed Binance BTC/ETH
+    @ ~2s (seq 96/97); первый REST-fetch (~0.3s) пришёл ДО seed, но пустая local ПОДАВЛЕНА gate'ом,
+    не сэмитила. **Стартовый флуд A (`best_diverged=true div=10000`, 4/рестарт) УСТРАНЁН.**
+  - **injection (спот-WS заморожен: kill сокета + conntrack flush + DROP reconnect; спот-REST жив):
+    6× `best_diverged=true` эмит** (Binance spot BTC/ETH, div_bps 700..1952) — seed-gate НЕ
+    over-suppress'ит реальную порчу (анти-плацебо 9b подтверждён на живом проде). Инъекция полностью
+    обратима: после снятия — WS восстановился, L2 возобновился, прод-сеть чиста.
+  - **дефект B (оконный объёмный флуд) ПОДТВЕРЖДЁН ЖИВЫМ:** 12× `best_diverged=false` (div_bps
+    103..747) на ~12-мин отметке (окно K=12 наполнилось), в т.ч. на **нетронутом BinanceFutures**
+    (systematic WS(T1)-vs-REST(T2) near-touch объёмный bias, НЕ zero-mean churn). **Остаётся OPEN,
+    развилка §4.3.2 (B1 vs B2; architect рекомендует B2) — founder ★, эскалация через architect.**
 
 ## Пока НЕ реализовано (следующие фазы)
 - Крейты `risk`/`killswitch`/`oms`, `runner` — пофазно per DESIGN §10 (M-08: fail-closed риск-гейт
