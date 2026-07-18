@@ -69,7 +69,7 @@ recon-дизайном FA §4 и уточняется на critic-аудите �
 |---|---|---|---|---|
 | 0 | ✅ | **FA-приёмка (ПРЕДУСЛОВИЕ):** `docs/fa/ops.md` PROPOSED → ACTIVE через doc-гейт | critic → reviewer → founder ★ | ✅ 2026-07-16: critic C-007 APPROVE + reviewer APPROVED + founder ★; `ops.md` STATUS ACTIVE |
 | 1 | ✅ | **CT-RFC-03 (T1, БЛОКИРУЮЩАЯ):** `SysEvent::ReconDivergence(ReconAudit)` + `ReconAction` (аддитивно, хвост) + сген. JSON Schema + фикстуры + `red_rfc03` | architect | ✅ merged `cf53e81`, §8 inert-safe; roundtrip+CT-I-3+compile-RED зелёные; schema_version не бампнут |
-| 2 | 🚧 | **(RED написан: `crates/ops` скелет + 14 оракулов; impl → venue-dev/engine-dev)** **Recon (OPS-I-1 + OPS-I-9):** периодический REST-снапшот vs локальная книга; расхождение > `ε` → алерт + ресинк + `Sys`-событие; **rate-budget/backoff** (honor 418/429/`Retry-After`, cap, запрет ресинк-штормов — прямой урок TD-013) | venue-dev (REST) + engine-dev (ops) | RED: (а) `ε_test` — инъецированная порча книги (удалённый/искажённый уровень, расхождение best) ОБЯЗАНА поднять алерт; (б) OPS-I-9 — инъецированный поток REST-ошибок НЕ даёт hot-loop |
+| 2 | 🚧 | **(B2 ПРИНЯТ founder ★ 2026-07-18; RED B2 готов → engine-dev)** **Recon (OPS-I-1 + OPS-I-9):** рантайм = **best-price per-cycle + seed-gate**; best-расхождение → алерт + ресинк + `Sys`-событие; объёмная near-touch сверка СНЯТА с рантайма (REST-неверифицируема) → офлайн-трек; **rate-budget/backoff** (honor 418/429/`Retry-After`, cap — TD-013) | engine-dev (ops) | RED (B2): (а) best-порча (пропавший/сдвинутый best) ОБЯЗАНА эмитить; (б) персистентный объёмный сдвиг (≫ε_max) в рантайме МОЛЧИТ; (в) seed-gate; (г) OPS-I-9 — REST-ошибки НЕ дают hot-loop |
 | 3 | ⏳ | **Сохранность (OPS-I-2/3):** cold-copy журнала offsite (Storage Box) + **restore-drill** (скачать→прочитать `journal::stream`, `seq` непрерывен) — на РЕАЛЬНОМ сегменте, legacy-0 первым | engine-dev | RED/§8: restore-drill на реальном сегменте (не фикстуре); удаление горячей копии — только через `ColdCopyProof` |
 | 4 | ⏳ | **Метрики+алерты (OPS-I-4..8):** `/metrics` (Prometheus text; recorder+venue+journal) + правила P0/P1/P2; **двусторонний паритет OPS-I-5** (каждый класс §7.1 → ≥1 правило; каждое правило → существующая метрика; CI в ОБЕ стороны); тишина потока (OPS-I-8); метрики НЕ в журнал (OPS-I-6), не в горячем пути (OPS-I-7) | engine-dev | RED: grep-канарейка на каждую метрику §3; CI-скрипт паритета валит и «правило без метрики», и «класс без правила» |
 | 5 | ⏳ | `scripts/verify_M-09.sh` — ≥1 проверка на задачу; финальный `VERDICT` | architect | exit=0 на GREEN |
@@ -147,18 +147,52 @@ Per-cycle порог по объёму **принципиально нежизн
   против текущего impl), `empty_local_after_seed_is_corruption_and_emits` (анти-плацебо). Импл — engine-dev
   в `crates/ops/src/recon.rs` (`ReconDetector`, БЕЗ смены сигнатуры sink/recorder — carve-out не расширяется).
 
-- **(B) объёмный оконный флуд — РАЗВИЛКА founder ★.** 12+ оконных `best=false div=41..1129 Resynced`,
-  ~1/мин, все символы; часть ≫ ε_max=50 → порогом не подавляемы. ТРЕТИЙ §8-провал одного класса.
-  Диагноз: систематический (не zero-mean) сдвиг WS-бакет-книги(T1) vs raw-REST(T2) по near-touch объёму
-  — усреднение окна гасит дисперсию, НЕ bias. **architect рекомендует B2** (runtime=best-price+seed-gate;
-  объём→офлайн research-dev, БЕЗ рантайм-эмиссии — честная граница §4.2). B1 (калибровка+K) не лечит
-  систематический bias и упирается в fail-closed `ε_max=50`. Оконные волумные оракулы (1–7) помечены
-  «под форком», НЕ удалены до подписи ★. T1 (`ReconAudit`) не трогается ни в одном варианте.
+- **(B) объёмный оконный флуд — ✅ B2 ПРИНЯТ founder ★ 2026-07-18.** 12+ оконных `best=false
+  div=41..1129 Resynced` (§8 re-run: 103..747), ~1/мин, все символы; часть ≫ ε_max=50 → порогом не
+  подавляемы; **в т.ч. на нетронутом инъекцией `BinanceFutures`** → систематический (не zero-mean) сдвиг
+  WS-бакет-книги(T1) vs raw-REST(T2) по near-touch объёму — усреднение окна гасит дисперсию, НЕ bias.
+  ТРЕТИЙ §8-провал одного класса. B1 (калибровка+K) не лечит систематический bias и упирается в
+  fail-closed `ε_max=50` → отклонён. **★ РЕШЕНИЕ B2 (founder ★):** рантайм-recon = best-price per-cycle +
+  seed-gate; рантайм-эмиссию объёмной near-touch сверки убрать (REST-неверифицируема). Полная
+  книга/объёмы/глубина пишутся в журнал БЕЗ изменений. Объёмная сверка — офлайн-трек (research-dev),
+  необязательный follow-up. Детали — `docs/fa/ops.md` §4.3.2 (принято через doc-гейт `gates.md` §9 —
+  правка ACTIVE FA + milestone Acceptance).
+
+### Task 2 — B2 impl-контракт (2026-07-18, architect RED-first готов → engine-dev)
+
+**Что делает B2 (в рамках M-09 task 2, БЕЗ нового milestone, БЕЗ CT-RFC — `ReconAudit` T1 НЕ трогается):**
+- **engine-dev, `crates/ops/src/recon.rs`:** `ReconDetector::observe` → **рантайм-alert ⟺
+  `best_price_diverged`** (объёмный оконный путь снят из решения об эмиссии). Рекомендация architect —
+  чистое удаление window-машинерии (окна/`window_alert`), т.к. под B2 они мёртвый код: гейдж
+  `book_divergence_bps` берётся из `reconcile().divergence_bps` (per-cycle), а не из окна. `seeded`
+  (seed-gate §4.3.1) СОХРАНЯЕТСЯ (`&mut ReconDetector` по-прежнему нужен → **сигнатуры
+  `sink::handle_recon_snapshot`/recorder НЕ растут, carve-out НЕ расширяется**). Гейдж обновляется каждый
+  цикл (наблюдаемость), но алерт не поднимает. Детерминизм сохранён. **Обнови doc-комменты в `recon.rs`,
+  ссылающиеся на `red_recon_window.rs` → `red_recon_runtime.rs`.**
+- **architect (sacred RED, ГОТОВО — reachability §8-подтверждён локально):** `red_recon_window.rs` →
+  переименован `red_recon_runtime.rs`; объёмные оконные оракулы 1–7 СНЯТЫ (идея → офлайн-спека
+  research-dev); добавлены `runtime_persistent_volume_deficit/surplus_is_silent`,
+  `runtime_nonbest_eviction_is_silent`, `runtime_post_seed_empty_local_still_emits`, детерминизм;
+  seed-gate 9a/9b/9c ОСТАЮТСЯ. `red_recon_sink.rs` переспецирован (персистентный объём→тишина,
+  best-десинк→эмит+метрики). `red_recon_live.rs`/`red_ops_recon.rs` — best/depth-skip гейдж без изменений
+  логики (только устаревшие ссылки поправлены). Анти-плацебо ПОДТВЕРЖДЁН в ОБЕ стороны: против текущего
+  window-active impl 4 B2-silent оракула ПАДАЮТ; против always-silent impl best-эмит оракулы ПАДАЮТ;
+  против best-only+seed-gate impl вся ops-сюита GREEN (reachability).
+
+**§8-acceptance task-2 (для reviewer):** healthy → **тишина** (best-путь; §8 уже дал 0 эмиссий на healthy
+после seed-gate); injection best-порчи (заморозка WS, REST жив) → **эмит** (§8 уже дал 6× `best=true`).
+**Объёмной тишины в рантайме НЕ требовать** — объёмного рантайм-пути больше нет (удалён, а не подавлен
+порогом). Это закрывает дефект B: единственный флудивший путь удалён; best-путь §8-зелёный.
+
+**Офлайн-объёмный трек — НЕ блокирует закрытие дефекта B** (см. BACKLOG «M-09 хвост: офлайн data-quality
+объёмная сверка», research-dev).
 
 ## Acceptance (исполняемые ворота — BACKLOG M-09 + OPS-I-*)
 
-1. **`ε_test` не калибруется:** инъецированная порча книги ОБЯЗАНА поднять алерт; `ε_prod`
-   калибруется отдельно, но не выше `ε_max` (fail-closed потолок). (OPS-I-1)
+1. **(B2) рантайм = best-only + seed-gate:** инъецированная BEST-порча (пропавший/сдвинутый best сверх
+   `BEST_SKEW_BPS`) ОБЯЗАНА эмитить `Sys`; персистентный ОБЪЁМНЫЙ сдвиг (даже ≫`ε_max`) в рантайме
+   МОЛЧИТ (объём REST-неверифицируем → офлайн-трек); seed-gate: пустая своя книга до первого снапшота
+   молчит. `ReconThresholds` fail-closed (`ε_prod ≤ ε_max`) сохранён как конструктор-инвариант. (OPS-I-1)
 2. **OPS-I-9 rate-budget:** инъецированный поток REST-ошибок НЕ даёт hot-loop; 418/429/`Retry-After`
    соблюдаются; бюджет на venue не превышается (recon добавляет ровно тот трафик, что нас банил).
 3. **restore-drill:** холодная копия СКАЧИВАЕТСЯ и ЧИТАЕТСЯ на РЕАЛЬНОМ сегменте, `seq` непрерывен.
