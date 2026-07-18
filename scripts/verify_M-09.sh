@@ -30,9 +30,9 @@ run "T2 OPS-I-1 recon (ε_test, деградированные входы)" \
   cargo test -p ops --test red_ops_recon
 run "T2 OPS-I-1 recon LIVE-режим (near-book depth-aware, §8 анти-флуд, skew-толерантность)" \
   cargo test -p ops --test red_recon_live
-run "T2 OPS-I-1 recon ОКОННАЯ персистентность (churn→тишина, порча→алерт; второй §8-провал, §4.3)" \
-  cargo test -p ops --test red_recon_window
-run "T2 OPS-I-1 recon SINK stateful (эмиссия через ReconDetector: churn-последовательность→тишина, персистент/best→Sys+метрики)" \
+run "T2 OPS-I-1 recon РАНТАЙМ-КОНТРАКТ B2 (best-only+seed-gate; персистентный объём→ТИШИНА, best-порча→эмит; §4.3.2)" \
+  cargo test -p ops --test red_recon_runtime
+run "T2 OPS-I-1 recon SINK B2 (эмиссия ⟺ best: персистентный объём→тишина, best-десинк→Sys+метрики)" \
   cargo test -p ops --test red_recon_sink
 run "T2 OPS-I-9 rate-budget (анти-hot-loop, TD-013)" \
   cargo test -p ops --test red_ops_budget
