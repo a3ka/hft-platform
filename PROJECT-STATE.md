@@ -583,6 +583,39 @@ Milestone открыт (план принят: critic C-007 APPROVE → reviewer
 - **Разблокирует task 2** (recon runtime OPS-I-1..9). **M-09 остаётся 🚧 ACTIVE** — далее architect:
   RED-оракулы OPS-I-1..9 + `scripts/verify_M-09.sh` (task 2+).
 
+### task 2 (recon runtime) — КОД MERGED (`b1adec0`, `--no-ff`) → §8 PROD **FAILED** (флуд windowed-volume, 2026-07-18); **Task 2 НЕ ЗАКРЫТ, remediation под founder ★**
+Цепочка (25 коммитов): venue REST-fetcher (Binance spot+futures, TD-013 structural) + `crates/ops`
+(recon/budget/metrics/silence) + windowed-персистентность (§4.3) + depth-skip pin (Concern-1
+reviewer → architect `5c621f5` → critic `3483a04`) + books-feeder (`apply_md_to_books` +
+per-venue MD fanout-tap, `9db808c`). Reviewer APPROVED по коду; merge `b1adec0`.
+- **Юнит-гейты ЗЕЛЁНЫЕ (не поймали прод):** ops 33/33, recorder 10/10 (`red_recon_wiring` 2/2,
+  `red_recon_loop` 1/1), **workspace 256/0**, clippy 0, `verify_M-09.sh` VERDICT PASS.
+  Анти-плацебо depth-skip подтверждён reviewer'ом (`sed 's/ref_reach<band/false/'` валит
+  `unreachable_band_is_skipped_not_flooded` + `deep_local_vs_truncated`). MD-only → risk-critic N/A.
+- **§8 EYES-ON ПРОВАЛ (reviewer, прод `b1adec0`, 2026-07-18):** контейнер healthy, restarts=0,
+  sha=`b1adec0`, heartbeat свежий — но recon **ФЛУДИТ** `Sys(ReconDivergence)` на здоровом рынке.
+  Замер журнала (декодер по `journal::read_all` активного сегмента, все post-deploy Sys):
+  - **4 стартовых** (`best_diverged=true div_bps=10000 Resynced`, по 1 на venue×symbol) — сравнение
+    с ПУСТОЙ local-книгой до первого L2Snapshot (fetcher делает ПЕРВЫЙ fetch немедленно на старте,
+    до наполнения feeder'ом). Транзиент на КАЖДЫЙ рестарт → пишет ложную «порчу+ресинк» в durable-
+    журнал (мелкий, но реальный дефект — TD ниже).
+  - **12+ оконных** (`best_diverged=false div_bps=41..1129 Resynced`) по ВСЕМ 4 символам, ~1/мин —
+    оконное знаковое среднее near-touch ОБЪЁМА НЕ сходится к 0 на живом рынке: остаточный churn
+    41..1129 bps ≫ ε_prod=5, часть ≫ ε_max=50. **Третий §8-провал того же класса** (near-touch
+    объём local WS-книга vs REST-reference), уже ПОСЛЕ windowed-редизайна.
+  - **Cadence-расхождение:** дизайн (`ops.md §4.3`) полагает cadence 5 мин (K=12 → окно 1 час);
+    прод-fetcher budget-gated (`ops::budget`: RECON_BASE_DELAY=100ms, next_delay≈0 на Ok,
+    `may_request` = `max_per_min`/60с) → реальная cadence ~1/мин, окно K=12 ≈ 12 мин на
+    КОРРЕЛИРОВАННЫХ выборках → mean не гасится.
+- **Действие reviewer'а:** blanket merge-revert ОТВЕРГНУТ (удалял бы critic-вердикты C-009/010/011 =
+  потеря аудита + trip `protected-artifacts` CI → deploy не запустится → прод всё равно флудит).
+  Прод НЕ инертен и льёт ~1 ложный audit/мин — **remediation срочная, под founder ★** (targeted:
+  gate recon-эмиссии до наполнения книги + рекалибровка K/ε_prod + фикс cadence на 5 мин; либо
+  artifact-preserving откат recorder recon-wiring — это КОД, зона architect/engine-dev). Detail: TD-025.
+- **Итог:** recon-ЛОГИКА и books-feeder корректны в юнит-мире; §8 показал, что windowed K=12 +
+  ε_prod=5 + sub-min cadence НЕ дают тишину на проде. Task 2 acceptance («recon молчит на здоровой
+  книге») НЕ достигнут. **Milestone M-09 остаётся 🚧 ACTIVE.**
+
 ## Пока НЕ реализовано (следующие фазы)
 - Крейты `risk`/`killswitch`/`oms`, `runner` — пофазно per DESIGN §10 (M-08: fail-closed риск-гейт
   между `strategy` и `oms`). MM-котирование, wiring весов из `signals.json` (граница B),

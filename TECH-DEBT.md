@@ -3,6 +3,35 @@
 > **Reviewer-owned.** Открытые долги/риски, замеченные при работе. Закрытые переносятся вниз.
 
 ## OPEN
+- **TD-025** `recon-runtime-floods-ReconDivergence-on-healthy-prod` (замечено reviewer'ом на §8
+  eyes-on M-09 task 2, прод `b1adec0`, 2026-07-18). **Класс TD-011: юнит-гейты ЗЕЛЁНЫЕ (ops 33/33,
+  workspace 256/0, verify PASS), а прод пишет ложь под healthy-статусом.** Recon-runtime смержен
+  в main (`b1adec0`) и задеплоен; на ЗДОРОВОМ рынке recon **флудит** `Sys(ReconDivergence)` в
+  durable-журнал ~1/мин. Замер (декодер `journal::read_all` активного сегмента, все post-deploy Sys):
+  - **(A) стартовый транзиент:** 4 события `best_diverged=true div_bps=10000 Resynced` (по одному на
+    venue×symbol) — orchestrator сравнивает REST-reference с ПУСТОЙ local-книгой, т.к. fetcher делает
+    ПЕРВЫЙ fetch немедленно на старте, ДО того как books-feeder применил первый L2Snapshot. Пишется
+    на КАЖДЫЙ рестарт recorder'а → ложная «порча best + ресинк» в аудит-трейл, чья единственная цель —
+    «каким участкам данных верить». Фикс (architect RED-first → engine-dev): гейт — не сравнивать/не
+    эмитить, пока local-книга (venue,symbol) не получила ≥1 снапшот (не пуста).
+  - **(B) оконный флуд:** 12+ событий `best_diverged=false div_bps=41..1129 Resynced` по всем 4
+    символам, ~1/мин. Оконное знаковое среднее near-touch ОБЪЁМА НЕ сходится к 0 на живом рынке:
+    остаточный churn 41..1129 bps ≫ ε_prod=5, часть ≫ ε_max=50. **Третий §8-провал того же класса**
+    (near-touch объём: local WS-книга момента T1 vs async REST момента T2), уже ПОСЛЕ windowed-
+    редизайна `ops.md §4.3`. Гипотезы (диагностика — architect/founder): (1) реальная cadence ~1/мин
+    (budget-gated), а дизайн полагал 5 мин → K=12 покрывает КОРРЕЛИРОВАННЫЕ выборки → mean не гасится;
+    (2) K=12 в принципе мал для гашения prod-churn (дизайн: ПЕРВИЧНЫЙ рычаг — ДЛИНА окна, не порог);
+    (3) систематический bias между WS-реконструкцией и REST-снапшотом near-touch объёма (не zero-mean
+    churn — тогда никакое K не поможет, и near-touch объёмный recon через REST нежизнеспособен).
+    values 860/1129 ≫ ε_max=50 → порогом (fail-closed ≤50) не подавляются в принципе.
+  **Severity: MAJOR** — прод активно засоряет durable-журнал ложными corruption-audit'ами; Task 2
+  acceptance («recon молчит на здоровой книге») НЕ достигнут; milestone НЕ закрыт. **Remediation под
+  founder ★** (revert vs fix-forward — решение founder'а): blanket merge-revert НЕПРИГОДЕН (удаляет
+  critic-вердикты C-009/010/011 + trip `protected-artifacts` CI → deploy не идёт → прод всё равно
+  флудит). Нужен targeted КОД-фикс (architect RED-first → engine-dev): (A) seed-gate книги, (B)
+  рекалибровка K/ε_prod + cadence на 5 мин ИЛИ пере-осмысление объёмного near-touch recon (может
+  быть, только best-price per-cycle жизнеспособен, а объём — отдельный оффлайн-трек). **Прод НЕ
+  инертен — приоритет.**
 - **TD-016** `recorder-memory-drift-under-healthy-status` (замечено reviewer'ом на §8 eyes-on
   M-07, 2026-07-13). **Класс TD-011: тихая деградация под ЗЕЛЁНЫМ статусом** — контейнер
   `healthy`, heartbeat свежий, журнал растёт, `restarts=0`, и при этом RSS монотонно ползёт.
