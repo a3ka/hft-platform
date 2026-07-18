@@ -468,3 +468,37 @@ fn empty_local_after_seed_is_corruption_and_emits() {
          seed-gate заглушил настоящее расхождение (over-suppress). Гейт молчит ТОЛЬКО до первого seed"
     );
 }
+
+/// (9c, ПАДАЕТ против текущего impl И против poison-window impl — находка critic C-012) Seed-gate =
+/// ДВА обязательства: до seed observe (1) НЕ алертит И (2) НЕ КОРМИТ окно. Оракул 9a пиннил только (1).
+/// Плохой impl может подавить стартовый алерт, НО протолкнуть pre-seed наблюдения (пустая local vs
+/// полный REST → signed = (0−full)/full·10000 = −10000 bps/полоса) В ОКНО. Тогда ПОСЛЕ seed окно
+/// отравлено −10000: на здоровом рынке знаковое среднее уезжает в дефицит → ЛОЖНЫЙ алерт.
+/// Фикстура: RECON_WINDOW циклов pre-seed пустой local, затем RECON_WINDOW циклов ЗДОРОВЫХ
+/// ИДЕНТИЧНЫХ книг (signed 0). Корректный self-seeding (не кормит окно до seed) → тишина всю
+/// последовательность. Poison-window impl → фаза 2 алертит (окно держит −10000). Current impl →
+/// алертит в обеих фазах.
+#[test]
+fn pre_seed_empty_does_not_poison_window() {
+    let mut det = detector();
+    let reference = reference(); // полный REST
+    let empty = OrderBook::new();
+    let healthy = scaled_book(1.0, 1.0); // == reference → signed 0 (здоровый рынок)
+
+    let mut any_alert = false;
+    // Фаза 1: RECON_WINDOW циклов ДО seed (пустая local). Не алерт (9a) И не кормит окно (9c).
+    for _ in 0..RECON_WINDOW {
+        any_alert |= det.observe(&empty, &reference).alert;
+    }
+    // Фаза 2: RECON_WINDOW циклов ЗДОРОВЫХ идентичных книг (seed на первом, дальше signed 0).
+    for _ in 0..RECON_WINDOW {
+        any_alert |= det.observe(&healthy, &reference).alert;
+    }
+    assert!(
+        !any_alert,
+        "pre-seed пустая local ОТРАВИЛА окно: после seed на ЗДОРОВЫХ идентичных книгах detector \
+         алертит — pre-seed пустышки (signed −10000 bps/полоса) попали в окно и сдвинули знаковое \
+         среднее в ложный дефицит. observe ДО seed обязан НЕ КОРМИТЬ окно, а не только молчать \
+         (critic C-012: 9a пиннил no-alert, но не no-feed)"
+    );
+}
