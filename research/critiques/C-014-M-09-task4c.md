@@ -206,3 +206,126 @@ After these RED changes, re-run critic. Do not dispatch engine-dev on the curren
 ## Cleanup
 
 All temporary prototypes and mutations were reverted before this verdict. Final pre-verdict worktree status was clean except this critique file.
+
+---
+
+## Re-audit — 2026-07-19T23:26:11Z
+
+**Audited repair head:** `39fdc07` — `docs(M-09): C-014 repair — task 4C spec (run_books_feeder + labels + live-wiring)`
+**Repair commits:** `ea3799f` + `5a61782` + `39fdc07` over verdict `4c864a9`
+**Local audit worktree:** `/tmp/hft-critic-m09-t4c-r2` detached at `origin/feat/M-09-task4c-metric-emission`
+
+### Re-audit verdict
+
+**REJECT remains.**
+
+The repair closes the two exact C-014 blockers in their broad form, but it leaves a narrower false-green in the same label-shape family. The current RED proves that a metric has a labeled sample with the required keys; it does not prove the required label values/cardinality or the required non-zero counter value.
+
+### What is fixed
+
+**Gap 1, unlabeled `md_*`: CLOSED for missing labels.**
+
+The repair added `has_labeled_sample(text, name, keys)` and moved `md_events_total` / `md_event_age_ms` from plain `has_sample` to labeled checks (`crates/recorder/tests/red_metrics_emission.rs:60-72`, `:143-153`).
+
+Temporary mutation: `run_writer` emitted `md_events_total` and `md_event_age_ms` as unlabeled samples.
+
+```text
+cargo test -p recorder --test red_metrics_emission writer_emits_journal_and_md_metrics; echo exit=$?
+test writer_emits_journal_and_md_metrics ... FAILED
+md_events_total НЕ несёт labeled SAMPLE `{venue,symbol,kind}` ...
+exit=101
+```
+
+After restoring labels, the same test passed:
+
+```text
+test writer_emits_journal_and_md_metrics ... ok
+exit=0
+```
+
+**Gap 2, helper-only/non-live: CLOSED for missing main calls.**
+
+The repair introduced `run_books_feeder` as the tested live-loop seam and added a verify canary that greps `main.rs` for `run_books_feeder` and `sample_rss` (`scripts/verify_M-09.sh:139-152`). A correct temporary prototype with `run_books_feeder` + `sample_rss` called from `main` reached:
+
+```text
+cargo test -p recorder --test red_metrics_emission; echo exit=$?
+running 3 tests ... ok
+exit=0
+
+bash scripts/verify_M-09.sh; echo exit=$?
+PASS  OPS-I-10 live-wiring: отдельные продюсеры (feeder/sampler) вызваны в живом main
+VERDICT: PASS
+exit=0
+
+cargo test -p recorder --test red_rss_bounded; echo exit=$?
+test e7_writer_loop_memory_is_bounded_and_event_count_independent ... ok
+exit=0
+```
+
+Temporary mutation: leave helper seams working, but remove `run_books_feeder` and `sample_rss` calls/imports from `main`.
+
+```text
+bash scripts/verify_M-09.sh; echo exit=$?
+FAIL  OPS-I-10 продюсеры НЕ вызваны в живом main: run_books_feeder(book_levels) sample_rss(recorder_rss_anon_bytes) ...
+VERDICT: FAIL (1)
+exit=1
+```
+
+### Remaining blocker — label cardinality/value false-green
+
+Severity: BLOCKER.
+
+The repair still accepts a producer that carries label keys but collapses the `side` dimension or never increments the MD counter.
+
+**Mutation A: `book_levels` side collapse.**
+
+Temporary implementation wrote both book sides with `side="bid"`:
+
+```text
+metrics.set_gauge("book_levels", &[("venue", venue), ("symbol", &symbol), ("side", "bid")], bids);
+metrics.set_gauge("book_levels", &[("venue", venue), ("symbol", &symbol), ("side", "bid")], asks);
+```
+
+Result:
+
+```text
+cargo test -p recorder --test red_metrics_emission live_feeder_loop_emits_book_levels; echo exit=$?
+test live_feeder_loop_emits_book_levels ... ok
+exit=0
+
+bash scripts/verify_M-09.sh; echo exit=$?
+PASS  T4C OPS-I-10 живая ЭМИССИЯ метрик (...)
+PASS  OPS-I-10 live-wiring: отдельные продюсеры (feeder/sampler) вызваны в живом main
+VERDICT: PASS
+exit=0
+```
+
+This is not sufficient. `book_levels{venue,symbol,side}` means bid and ask are distinct time series. If both writes use `side="bid"`, the ask write overwrites the bid series and one side disappears from observability. The current fixture is symmetric (`5` bid levels and `5` ask levels), and `sample_value(text, "book_levels") == Some(5)` reads the first matching sample without binding labels (`crates/recorder/tests/red_metrics_emission.rs:184-187`), so the collapse is invisible.
+
+**Mutation B: `md_events_total` labeled sample with value 0.**
+
+Temporary implementation emitted the correct label keys but incremented by `0`.
+
+```text
+cargo test -p recorder --test red_metrics_emission writer_emits_journal_and_md_metrics; echo exit=$?
+test writer_emits_journal_and_md_metrics ... ok
+exit=0
+```
+
+This regresses part of the original task text: milestone task 4C says `md_events_total{venue,symbol,kind}` must be `>0` after the writer processes MD events (`milestones/M-09-data-safety-net.md:265-270`). The old `sample_value(... "md_events_total") >= 1` check was removed during the label repair and was not replaced with a label-aware value check.
+
+Required architect repair:
+
+1. Add a label-aware extractor such as `labeled_sample_value(text, name, labels)`.
+2. Make the book fixture asymmetric, for example bid depth `3`, ask depth `5`.
+3. Assert both exact series:
+   - `book_levels{venue="binance",symbol="BTCUSDT",side="bid"} == 3`;
+   - `book_levels{venue="binance",symbol="BTCUSDT",side="ask"} == 5`.
+4. Assert `md_events_total{venue="binance",symbol="BTCUSDT",kind="<L2 label>"} >= 1`; do not accept a labeled zero sample after 30 MD events.
+5. Keep the current live-wiring canary; it is a useful guard, even though it remains a grep smoke check rather than the semantic oracle.
+
+### Scope / cleanup
+
+The repair commits stayed in architect-owned docs/tests/verify paths. No implementation, contracts, risk, killswitch, OMS, or order-egress files were committed.
+
+All temporary prototypes and mutations were reverted before this re-audit section was appended. Final pre-verdict worktree status was clean except `research/critiques/C-014-M-09-task4c.md`.
