@@ -48,6 +48,8 @@ run "T4A OPS-I-4 /metrics socket (recorder биндит loopback, реальны
   cargo test -p recorder --test red_metrics_endpoint
 run "T4B OPS-I-5 правила алертов + rule-паритет (правило→метрика, класс→правило, рендер)" \
   cargo test -p ops --test red_ops_alerts
+run "T4C OPS-I-10 живая ЭМИССИЯ метрик (прогон writer/feeder/sampler → SAMPLE, не HELP/TYPE; TD-027)" \
+  cargo test -p recorder --test red_metrics_emission
 
 # ── OPS-I-6 (структурно): метрики НЕ пишутся в журнал — crates/ops не зависит от journal ─
 # (в рантайме; journal — ТОЛЬКО dev-dependency для restore-drill task 3). Метрики — не события
@@ -111,6 +113,27 @@ if [ -f "${ALERTS_SRC}" ]; then
     || fail "OPS-I-5 ALERT_RULES содержит правила на классы вне §7.1:${orphan} — паритет односторонний"
 else
   fail "OPS-I-5 task 4B: ${ALERTS_SRC} отсутствует — каталог правил не создан (compile-RED до engine-dev)"
+fi
+
+# (д, task 4C / OPS-I-10) EMISSION-КАНАРЕЙКА: КАЖДАЯ объявленная метрика §3 покрыта либо
+# emission-оракулом (red_metrics_emission.rs — прогон продюсера, SAMPLE-ассерт), либо явно
+# классифицирована event/elsewhere (эмитится по триггеру / уже wired в другом продюсере). Метрика
+# вне обоих множеств = потенциальный TD-027 (объявлена, но никто не проверяет её РАНТАЙМ-эмиссию).
+EMIT_TEST="crates/recorder/tests/red_metrics_emission.rs"
+# event/elsewhere: эмитятся по триггеру (event) или уже wired в отдельном продюсере (elsewhere,
+# со своим RED). Расширяется вместе с §3 продюсер-картой — новая метрика без покрытия ВАЛИТ гейт.
+EVENT_OR_ELSEWHERE="venue_ws_reconnects_total venue_http_status_total journal_write_errors_total journal_seq_gaps_total book_divergence_bps book_resync_total backup_restore_drill_ok"
+if [ -f "${EMIT_TEST}" ]; then
+  uncovered=""
+  for m in ${names_code}; do
+    if grep -q "\"${m}\"" "${EMIT_TEST}"; then continue; fi
+    echo " ${EVENT_OR_ELSEWHERE} " | grep -q " ${m} " && continue
+    uncovered="${uncovered} ${m}"
+  done
+  [ -z "${uncovered}" ] && pass "OPS-I-10 каждая §3-метрика покрыта emission-оракулом или классифицирована event/elsewhere" \
+    || fail "OPS-I-10 метрики без проверки РАНТАЙМ-эмиссии:${uncovered} — объявлена, но никто не ассертит продюсера (TD-027-риск)"
+else
+  fail "OPS-I-10 task 4C: ${EMIT_TEST} отсутствует — emission-оракул не создан"
 fi
 
 echo
