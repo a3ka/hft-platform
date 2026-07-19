@@ -329,3 +329,101 @@ Required architect repair:
 The repair commits stayed in architect-owned docs/tests/verify paths. No implementation, contracts, risk, killswitch, OMS, or order-egress files were committed.
 
 All temporary prototypes and mutations were reverted before this re-audit section was appended. Final pre-verdict worktree status was clean except `research/critiques/C-014-M-09-task4c.md`.
+
+---
+
+## Re-audit #2 — 2026-07-19T23:36:49Z
+
+**Audited repair head:** `7da7444` — `test(M-09): C-014 re-audit repair — label-aware values + асимметричная фикстура`
+**Repair commits:** `7da7444` over re-audit verdict `dd6c543`
+**Local audit worktree:** `/tmp/hft-critic-m09-t4c-r3` detached at `origin/feat/M-09-task4c-metric-emission`
+
+### Re-audit #2 verdict
+
+**REJECT remains.**
+
+The repair closes the two blocker mutations from the first re-audit: side-collapse for `book_levels` and labeled-zero `md_events_total` now fail. A fourth false-green remains: `md_events_total` can use the wrong `kind` label value while still passing the RED suite and `verify_M-09.sh`.
+
+### What is fixed
+
+**Side-collapse: CLOSED.**
+
+The repair added `labeled_sample_value`, changed the book fixture to asymmetric depth (`bid=5`, `ask=3`), and asserts both exact labeled series (`crates/recorder/tests/red_metrics_emission.rs:74-89`, `:199-233`).
+
+Temporary mutation: `emit_book_levels` emitted both sides with `side="bid"`.
+
+```text
+cargo test -p recorder --test red_metrics_emission live_feeder_loop_emits_book_levels; echo exit=$?
+test live_feeder_loop_emits_book_levels ... FAILED
+book_levels{side=bid} != 5
+left: Some(3)
+right: Some(5)
+exit=101
+```
+
+**`md_events_total` value 0: CLOSED.**
+
+The repair restored a value assertion using `labeled_sample_value(... "md_events_total" ...) >= 1` (`crates/recorder/tests/red_metrics_emission.rs:179-186`).
+
+Temporary mutation: `md_events_total{venue,symbol,kind}` was incremented by `0`.
+
+```text
+cargo test -p recorder --test red_metrics_emission writer_emits_journal_and_md_metrics; echo exit=$?
+test writer_emits_journal_and_md_metrics ... FAILED
+md_events_total{venue=binance,symbol=BTCUSDT} == 0 после 30 Md-событий ...
+exit=101
+```
+
+**Correct prototype remains reachable.**
+
+With a temporary correct implementation (`book_levels{side="bid"} = 5`, `book_levels{side="ask"} = 3`, `md_events_total` increment by `1`, feeder/sampler wired in `main`):
+
+```text
+cargo test -p recorder --test red_metrics_emission; echo exit=$?
+running 3 tests ... ok
+exit=0
+
+bash scripts/verify_M-09.sh; echo exit=$?
+PASS  T4C OPS-I-10 живая ЭМИССИЯ метрик (...)
+PASS  OPS-I-10 live-wiring: отдельные продюсеры (feeder/sampler) вызваны в живом main
+VERDICT: PASS
+exit=0
+
+cargo test -p recorder --test red_rss_bounded; echo exit=$?
+test e7_writer_loop_memory_is_bounded_and_event_count_independent ... ok
+exit=0
+```
+
+### Remaining blocker — `kind` label value is not pinned
+
+Severity: BLOCKER.
+
+The current writer test verifies that `md_events_total` has a `kind=` key (`has_labeled_sample`) and that some `md_events_total{venue="binance",symbol="BTCUSDT",...}` value is non-zero. It does not require the `kind` value to match the event payload.
+
+Temporary mutation: classify `MdPayload::L2Snapshot` as `kind="trade"` while still incrementing by `1`.
+
+```text
+cargo test -p recorder --test red_metrics_emission writer_emits_journal_and_md_metrics; echo exit=$?
+test writer_emits_journal_and_md_metrics ... ok
+exit=0
+
+bash scripts/verify_M-09.sh; echo exit=$?
+PASS  T4C OPS-I-10 живая ЭМИССИЯ метрик (...)
+PASS  OPS-I-10 live-wiring: отдельные продюсеры (feeder/sampler) вызваны в живом main
+VERDICT: PASS
+exit=0
+```
+
+This is a real OPS-I-10 / TD-014 hole, not cosmetic label strictness. `md_events_total{venue,symbol,kind}` is the metric used to detect that an event class disappeared. If all L2 snapshots, funding, open interest, or liquidations are counted under the wrong `kind`, the metric is live but semantically blind by class.
+
+Required architect repair:
+
+1. Include the expected `kind` label in the value assertion for the L2 fixture, for example `kind="l2_snapshot"` if that is the canonical label.
+2. Prefer adding at least one second MD payload kind in the writer test, e.g. `Funding`, and assert a distinct labeled series for it. That catches "all payloads use one fixed kind" as well as a wrong L2 label.
+3. Add a small comment in the test naming the canonical kind labels expected from engine-dev so implementation does not invent incompatible spellings.
+
+### Scope / cleanup
+
+The `7da7444` repair commit touched only `crates/recorder/tests/red_metrics_emission.rs`. Scope is clean.
+
+All temporary prototypes and mutations were reverted before this re-audit #2 section was appended. Final pre-verdict worktree status was clean except `research/critiques/C-014-M-09-task4c.md`.
