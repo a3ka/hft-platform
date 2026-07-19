@@ -136,6 +136,21 @@ else
   fail "OPS-I-10 task 4C: ${EMIT_TEST} отсутствует — emission-оракул не создан"
 fi
 
+# (е, task 4C / OPS-I-10 LIVE-WIRING, C-014 gap-2) Продюсеры, живущие ОТДЕЛЬНО от run_writer
+# (book_levels — feeder-loop; recorder_rss_anon_bytes — sampler), ОБЯЗАНЫ вызываться в ЖИВОМ main.
+# «Хелпер работает в тесте, но main его не зовёт» = helper-only-non-live = рекурсия TD-027 (C-014).
+# run_writer/journal/md — уже в main (recorder пишет), их liveness пиннит сам emission-тест.
+MAIN="crates/recorder/src/main.rs"
+if [ -f "${MAIN}" ]; then
+  wiring_miss=""
+  grep -q "run_books_feeder" "${MAIN}" || wiring_miss="${wiring_miss} run_books_feeder(book_levels)"
+  grep -q "sample_rss" "${MAIN}" || wiring_miss="${wiring_miss} sample_rss(recorder_rss_anon_bytes)"
+  [ -z "${wiring_miss}" ] && pass "OPS-I-10 live-wiring: отдельные продюсеры (feeder/sampler) вызваны в живом main" \
+    || fail "OPS-I-10 продюсеры НЕ вызваны в живом main:${wiring_miss} — helper-only non-live (TD-027 рекурсия, C-014 gap-2)"
+else
+  fail "OPS-I-10 live-wiring: ${MAIN} отсутствует"
+fi
+
 echo
 if [ "${FAILED}" -gt 0 ]; then
   echo "VERDICT: FAIL (${FAILED})"
