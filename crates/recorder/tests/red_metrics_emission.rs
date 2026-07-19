@@ -71,14 +71,34 @@ fn has_labeled_sample(text: &str, name: &str, keys: &[&str]) -> bool {
     })
 }
 
-fn l2_event(sym: &str, n: usize) -> EventKind {
-    let bids: Vec<Level> = (0..n)
+/// Значение КОНКРЕТНОЙ labeled-серии `name{... k="v" ...}` (первая, где присутствуют ВСЕ пары
+/// `key="val"`). Label-aware (C-014 re-audit): различает `side="bid"` от `side="ask"` и ловит
+/// labeled-но-НУЛЕВОЙ sample (`md_events_total{...} 0`), который `has_labeled_sample` пропускал.
+fn labeled_sample_value(text: &str, name: &str, pairs: &[(&str, &str)]) -> Option<i64> {
+    text.lines()
+        .find(|l| {
+            !l.starts_with('#')
+                && l.starts_with(name)
+                && l[name.len()..].starts_with('{')
+                && pairs
+                    .iter()
+                    .all(|(k, v)| l.contains(&format!("{k}=\"{v}\"")))
+        })
+        .and_then(|l| l.split_whitespace().last())
+        .and_then(|v| v.parse::<i64>().ok())
+}
+
+/// АСИММЕТРИЧНЫЙ снапшот: `n_bid` бидов, `n_ask` асков (n_bid != n_ask ловит side-collapse —
+/// импл, эмитящий обе стороны как `side="bid"` или копирующий одну глубину на обе, даст неверное
+/// значение хотя бы для одной стороны).
+fn l2_event(sym: &str, n_bid: usize, n_ask: usize) -> EventKind {
+    let bids: Vec<Level> = (0..n_bid)
         .map(|i| Level {
             price: 65_000 * UNIT - (i as i64 + 1) * UNIT,
             size: UNIT,
         })
         .collect();
-    let asks: Vec<Level> = (0..n)
+    let asks: Vec<Level> = (0..n_ask)
         .map(|i| Level {
             price: 65_000 * UNIT + (i as i64 + 1) * UNIT,
             size: UNIT,
@@ -106,7 +126,7 @@ async fn writer_emits_journal_and_md_metrics() {
     let (tx, rx) = tokio::sync::mpsc::channel::<EventKind>(500);
     // 30 L2Snapshot (Md) + 20 Heartbeat (Sys) — writer append'ит все, метрики обязаны ожить.
     for _ in 0..30 {
-        tx.send(l2_event("BTCUSDT", 5)).await.unwrap();
+        tx.send(l2_event("BTCUSDT", 5, 5)).await.unwrap();
     }
     for _ in 0..20 {
         tx.send(EventKind::Sys(SysEvent::Heartbeat)).await.unwrap();
@@ -156,6 +176,14 @@ async fn writer_emits_journal_and_md_metrics() {
         "journal_bytes_written_total == 0 после 50 append'ов — writer пишет, а счётчик байт мёртв \
          (ровно TD-011-метрика «жив, но не пишет» неработоспособна)"
     );
+    // Label-aware value (C-014 re-audit): labeled-но-НУЛЕВОЙ `md_events_total{...} 0` НЕ проходит.
+    assert!(
+        labeled_sample_value(&text, "md_events_total", &[("venue", "binance"), ("symbol", "BTCUSDT")])
+            .unwrap_or(0)
+            >= 1,
+        "md_events_total{{venue=binance,symbol=BTCUSDT}} == 0 после 30 Md-событий — labeled-серия есть, \
+         но НЕ инкрементируется (TD-014-метрика «класс событий пропал» мертва по значению)"
+    );
 }
 
 /// (2, ПАДАЕТ против registry-only И против helper-only-non-live) Гоняем ЖИВОЙ feeder-loop
@@ -169,7 +197,9 @@ async fn live_feeder_loop_emits_book_levels() {
     let metrics = Arc::new(Metrics::new());
 
     let (tx, rx) = tokio::sync::mpsc::channel::<EventKind>(16);
-    tx.send(l2_event("BTCUSDT", 5)).await.unwrap();
+    // АСИММЕТРИЯ (C-014 re-audit): 5 бидов, 3 аска → side-collapse (обе стороны как side="bid" или
+    // копия одной глубины) даст неверное значение хотя бы одной стороне.
+    tx.send(l2_event("BTCUSDT", 5, 3)).await.unwrap();
     drop(tx); // закрываем канал → run_books_feeder дообработает и выйдет
 
     // Гоняем САМ live-loop (не leaf emit-хелпер): его же спавнит main (verify live-wiring канарейка).
@@ -181,10 +211,25 @@ async fn live_feeder_loop_emits_book_levels() {
         "book_levels НЕ несёт labeled SAMPLE `{{venue,symbol,side}}` после прогона live-feeder — либо \
          feeder-loop не эмитит (TD-027), либо размерность схлопнута (C-009 M2). TD-016-метрика мертва"
     );
+    // ОБЕ стороны с ТОЧНЫМИ значениями (label-aware): ловит side-collapse и копирование глубины.
     assert_eq!(
-        sample_value(&text, "book_levels"),
+        labeled_sample_value(
+            &text,
+            "book_levels",
+            &[("venue", "binance"), ("symbol", "BTCUSDT"), ("side", "bid")]
+        ),
         Some(5),
-        "book_levels != 5 после снапшота на 5 уровней/сторону — глубина измеряется неверно"
+        "book_levels{{side=bid}} != 5 — bid-глубина не измеряется (или side-collapse: обе стороны не bid)"
+    );
+    assert_eq!(
+        labeled_sample_value(
+            &text,
+            "book_levels",
+            &[("venue", "binance"), ("symbol", "BTCUSDT"), ("side", "ask")]
+        ),
+        Some(3),
+        "book_levels{{side=ask}} != 3 — ask-сторона отсутствует/схлопнута в bid (5) или скопирована — \
+         глубина одной стороны не различима (side-размерность бесполезна)"
     );
 }
 
