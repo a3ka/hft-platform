@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # M-09 Data safety net — acceptance-гейт. ≥1 проверка на задачу §Tasks.
 #
-# Пока impl (crates/ops) на todo!()-скелете — RED-оракулы OPS-I-* ПАДАЮТ, и VERDICT: FAIL (это
-# корректно: RED-фаза). Гейт зеленеет, когда engine-dev/venue-dev реализуют по оракулам.
-# Структурные проверки (паритет OPS-I-5, OPS-I-6 «метрики не в журнал», наличие крейта, CT-RFC-03)
-# проходят уже сейчас.
+# Task 1/2 (CT-RFC-03, recon+budget+метрики) — GREEN на main (смержено). Task 4 (метрики+алерты:
+# /metrics HTTP-сервер + правила P0/P1/P2) — RED, пока engine-dev не создал ops::server / ops::alerts /
+# recorder::metrics_server (compile-RED, изолированные test-бинарники). VERDICT: FAIL до impl task 4 —
+# это корректная RED-фаза. Структурные проверки (паритет OPS-I-5, OPS-I-6) проходят по мере готовности.
 #
 # FAIL-агрегатор (gates.md §3): считаем провалы, exit 1 при FAIL>0. НЕ маскируем через `|| echo`.
 
@@ -38,6 +38,16 @@ run "T2 OPS-I-9 rate-budget (анти-hot-loop, TD-013)" \
   cargo test -p ops --test red_ops_budget
 run "T2 OPS-I-4/7/8 метрики+тишина" \
   cargo test -p ops --test red_ops_metrics
+
+# ── Task 4 (метрики+алерты): /metrics HTTP-сервер + правила P0/P1/P2 + rule-паритет ────
+# RED пока engine-dev не создал ops::server / ops::alerts / recorder::metrics_server (compile-RED,
+# изолированные test-бинарники — не ломают task-2 оракулы).
+run "T4A OPS-I-4 /metrics HTTP-сервер ЧИСТЫЙ (GET/metrics→200+тело, 404, 405; ops::server)" \
+  cargo test -p ops --test red_ops_server
+run "T4A OPS-I-4 /metrics socket (recorder биндит loopback, реальный TCP GET→200+тело)" \
+  cargo test -p recorder --test red_metrics_endpoint
+run "T4B OPS-I-5 правила алертов + rule-паритет (правило→метрика, класс→правило, рендер)" \
+  cargo test -p ops --test red_ops_alerts
 
 # ── OPS-I-6 (структурно): метрики НЕ пишутся в журнал — crates/ops не зависит от journal ─
 # (в рантайме; journal — ТОЛЬКО dev-dependency для restore-drill task 3). Метрики — не события
@@ -77,6 +87,31 @@ for id in ${REQUIRED_INCIDENTS}; do
 done
 [ -z "${miss_inc}" ] && pass "OPS-I-5 §7.1 покрывает все канонические классы инцидентов (класс без правила невозможен)" \
   || fail "OPS-I-5 из §7.1 пропали ОБЯЗАТЕЛЬНЫЕ классы инцидентов:${miss_inc} — целый класс порчи вне алертов (регрессия C-007 C1)"
+
+# (г, task 4B) КАТАЛОГ ПРАВИЛ (ops::alerts::ALERT_RULES) ↔ FA §7.1 incident-IDs В ОБЕ СТОРОНЫ.
+# Rust-канон правил и FA §7.1 не смеют расходиться: правило на класс вне §7.1 = сирота; класс §7.1
+# без правила в каталоге = дыра. incident-ID берём из `incident: "…"` в alerts.rs (compile-RED, пока
+# engine-dev не создал файл → каталог пуст → все обязательные классы «пропали» → FAIL, корректный RED).
+ALERTS_SRC="crates/ops/src/alerts.rs"
+if [ -f "${ALERTS_SRC}" ]; then
+  cat_ids=$(grep -oE 'incident: "[A-Za-z0-9-]+"' "${ALERTS_SRC}" | sed -E 's/incident: "//; s/"//' | sort -u)
+  # обязательный класс §7.1 без правила в каталоге → дыра
+  miss_rule=""
+  for id in ${REQUIRED_INCIDENTS}; do
+    echo "${cat_ids}" | grep -qx "${id}" || miss_rule="${miss_rule} ${id}"
+  done
+  [ -z "${miss_rule}" ] && pass "OPS-I-5 каталог правил покрывает все обязательные классы §7.1" \
+    || fail "OPS-I-5 ALERT_RULES не покрывает классы §7.1:${miss_rule} — класс без правила (rule-side дыра)"
+  # правило-сирота: incident каталога вне строк §7.1 (${rows71})
+  orphan=""
+  for id in ${cat_ids}; do
+    echo "${rows71}" | grep -qx "${id}" || orphan="${orphan} ${id}"
+  done
+  [ -z "${orphan}" ] && pass "OPS-I-5 каталог правил → §7.1: нет правил-сирот (все привязаны к классу)" \
+    || fail "OPS-I-5 ALERT_RULES содержит правила на классы вне §7.1:${orphan} — паритет односторонний"
+else
+  fail "OPS-I-5 task 4B: ${ALERTS_SRC} отсутствует — каталог правил не создан (compile-RED до engine-dev)"
+fi
 
 echo
 if [ "${FAILED}" -gt 0 ]; then
