@@ -58,9 +58,11 @@ recon-дизайном FA §4 и уточняется на critic-аудите �
   продюсер-карта): `run_writer` (lib.rs) эмитит `journal_bytes_written_total`/`journal_seq_current`/
   `journal_segment_index`/`journal_disk_free_bytes`/`journal_write_errors_total`/`journal_seq_gaps_total`
   + `md_events_total`/`md_event_age_ms` (классификация `EventKind` при append; данные storage/seq УЖЕ
-  считаются для heartbeat); `apply_md_to_books` (recon_loop.rs) → `book_levels`; периодический sampler
-  (`main.rs`/новый `metric_emit.rs`, `/proc/self/status` RssAnon) → `recorder_rss_anon_bytes`; supervisor
-  (`main.rs`) ИЛИ venue-`run` → `venue_ws_reconnects_total`. **ЖЁСТКИЕ ГРАНИЦЫ:** метрики — ТОЛЬКО
+  считаются для heartbeat); ЖИВОЙ feeder-loop `run_books_feeder` (lib.rs; экстракт inline books-feeder'а
+  из `main.rs` — применяет `apply_md_to_books` + эмитит) → `book_levels`, и `main` ОБЯЗАН его спавнить
+  (C-014 gap-2 live-wiring); периодический sampler (`main.rs` спавн + `metric_emit.rs`, `/proc/self/status`
+  RssAnon) → `recorder_rss_anon_bytes`; supervisor (`main.rs`) ИЛИ venue-`run` → `venue_ws_reconnects_total`.
+  **ЖЁСТКИЕ ГРАНИЦЫ:** метрики — ТОЛЬКО
   атомик-инкременты рядом с существующими операциями (**OPS-I-7**, не новый горячий путь); **в журнал
   НЕ пишутся** (**OPS-I-6** — `metrics.inc/set`, НЕ `journal.append`); `run_writer` меняет ТОЛЬКО эмиссию
   (append/flush/shutdown-семантика `JR-I-1` НЕ меняется — architect обновляет её RED-вызовы под новую
@@ -264,9 +266,13 @@ total`. Правила P0/P1 формирующих инцидентов (TD-011
     (а) `run_writer` (новая сигнатура с `&Metrics`) на последовательности Md+Sys событий + shutdown →
     `prometheus_text()` несёт SAMPLE для `journal_bytes_written_total`>0, `journal_seq_current`>0,
     `journal_segment_index`, `journal_disk_free_bytes`, `md_events_total{venue,symbol,kind}`>0,
-    `md_event_age_ms{venue}`; (б) `apply_md_to_books` (с `&Metrics`) на L2Snapshot → `book_levels{...,side}`
-    SAMPLE; (в) sampler-сейм → `recorder_rss_anon_bytes` SAMPLE. Хелпер `has_sample(text,name)` отличает
-    SAMPLE-строку от `# HELP/# TYPE` — анти-TD-027 (registry-only impl падает).
+    `md_event_age_ms{venue}`; (б) ЖИВОЙ loop `run_books_feeder(md_rx, books, &Metrics)` — ТОТ ЖЕ, что
+    спавнит `main` (НЕ leaf-хелпер) — на L2Snapshot → `book_levels{venue,symbol,side}` SAMPLE; (в) sampler
+    → `recorder_rss_anon_bytes` SAMPLE. **C-014 gap-1:** labeled-метрики (`md_*`, `book_levels`)
+    проверяются `has_labeled_sample(text,name,keys)` — размерность ОБЯЗАНА присутствовать (схлопнутый
+    `md_events_total 30` без `{venue,symbol,kind}` НЕ проходит, урок C-009 M2). `has_sample` отличает
+    SAMPLE от `# HELP/# TYPE` — анти-TD-027. **C-014 gap-2:** book_levels/rss тестируются ЧЕРЕЗ live-loop
+    /sampler, а verify live-wiring-канарейка требует их ВЫЗОВА в `main.rs` (helper-only-non-live → FAIL).
   - Обновлены sacred RED-вызовы `run_writer` под новую сигнатуру (`red_shutdown_j1`, `red_heartbeat_status`,
     `red_rss_bounded`, `red_recon_wiring`) — append/flush/shutdown-семантика (`JR-I-1`) НЕ меняется, только
     добавлен `&Metrics`-аргумент.
