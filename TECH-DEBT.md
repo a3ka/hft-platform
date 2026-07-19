@@ -3,6 +3,38 @@
 > **Reviewer-owned.** Открытые долги/риски, замеченные при работе. Закрытые переносятся вниз.
 
 ## OPEN
+- **TD-027** `ops-metrics-declared-and-cataloged-but-not-wired-to-emission` (найдено reviewer'ом на §8
+  eyes-on M-09 task 4, прод `9a352d6`, 2026-07-19). **Класс TD-011: зелёные гейты (ops 52/52, verify
+  PASS, паритет GREEN) маскируют нерабочий предохранитель.** `/metrics` живёт и отдаёт 15 объявленных
+  семейств (HELP/TYPE на все), НО живые SAMPLES на проде есть ТОЛЬКО у 2: `book_divergence_bps`
+  (sink, 4 серии non-zero) и `venue_http_status_total` (venue recon). Остальные **13 объявлены в
+  реестре `METRICS` + зацитированы в каталоге правил `ops::alerts`, но НИКОГДА не инкрементируются**
+  в рантайме (grep call-site пуст): `journal_bytes_written_total`, `journal_seq_current`,
+  `journal_seq_gaps_total`, `journal_segment_index`, `journal_disk_free_bytes`,
+  `journal_write_errors_total`, `md_events_total`, `md_event_age_ms`, `venue_ws_reconnects_total`,
+  `book_levels`, `recorder_rss_anon_bytes`, `book_resync_total` (0 — корректно, ресинков не было),
+  `backup_restore_drill_ok` (task 3).
+  **СЛЕДСТВИЕ (важное — цель milestone'а):** правила алертов для ТРЁХ ФОРМИРУЮЩИХ M-09 инцидентов
+  ссылаются на МЁРТВЫЕ метрики → эти алерты НИКОГДА не сработают:
+  **TD-011 (P0 «recorder жив, но не пишет» — инцидент №1 milestone'а) → `journal_bytes_written_total`
+  (не wired); TD-014 (P1) → `md_events_total` (не wired); TD-016 (P1) → `recorder_rss_anon_bytes`
+  (не wired); OPS-GAP → `journal_seq_gaps_total` (не wired).** «Система сама сообщает о тихой
+  деградации» для этих классов НЕ достигнута.
+  **Почему паритет это НЕ ловит:** OPS-I-5 — РЕЕСТРОВО-СТАТИЧЕСКИЙ (имя ∈ `METRICS` const ↔ правило ↔
+  §7.1). Он проверяет согласованность ИМЁН, НЕ рантайм-эмиссию. Зелёный паритет даёт ЛОЖНУЮ уверенность,
+  что алерты подкреплены живыми метриками.
+  **Почему НЕ в task 4 (не дефект task 4, а его граница):** task-4 carve-out ЯВНО запрещает трогать
+  journal-write путь (`JR-I-1`) и recorder hot-loop; эмиссия `journal_*` требует именно этого пути,
+  `recorder_rss_anon_bytes` — sampler-таск, `md_events_total`/`book_levels` — recorder-цикл. Это
+  ОТДЕЛЬНАЯ работа с собственным carve-out. Task 4 (эндпоинт + каталог + паритет) СВОЮ приёмку выполнил
+  (см. PROJECT-STATE) — долг НЕ блокирует APPROVED task 4, но БЛОКИРУЕТ реальную наблюдаемость.
+  **Нужно (architect RED-first, следующая задача — task 4C / метрик-эмиссия):** развести каждую
+  объявленную метрику до РЕАЛЬНОГО инкремента (journal append → bytes/seq/gaps/segment/disk/write_errors;
+  MD-событие → md_events_total/age; venue reconnect → ws_reconnects; book-maintenance → book_levels;
+  rss-sampler → recorder_rss_anon_bytes) + RED/§8, который ассертит РАНТАЙМ-эмиссию (не только реестр).
+  **ДО провижининга Alertmanager (§O, founder ★) эти метрики ОБЯЗАНЫ быть живыми — иначе алерты театр.**
+  Severity: **MAJOR** (цель milestone'а для 3 формирующих инцидентов не достигнута; регрессии нет —
+  эндпоинт+каталог net-new и корректны).
 - **TD-025** `recon-runtime-floods-ReconDivergence-on-healthy-prod` (замечено reviewer'ом на §8
   eyes-on M-09 task 2, прод `b1adec0`, 2026-07-18). **Класс TD-011: юнит-гейты ЗЕЛЁНЫЕ (ops 33/33,
   workspace 256/0, verify PASS), а прод пишет ложь под healthy-статусом.** Recon-runtime смержен
@@ -225,7 +257,9 @@
     на `--mode=dry-run` (правильно — apply без cold-выгрузки не должен удалять). Компакция снижает ТЕМП
     роста, но durable-СНИЖЕНИЕ = ретеншен с cold. **TD-020 закрывается вместе с Storage Box + первым
     успешным apply.**
-- **TD-025** `red-prod-migration-fails-on-full-host-disk` (найдено reviewer'ом на §8 M-08 task 20,
+- **TD-026** `red-prod-migration-fails-on-full-host-disk` (найдено reviewer'ом на §8 M-08 task 20,
+  2026-07-15; **перенумерован из TD-025 → TD-026 reviewer'ом 2026-07-19** — коллизия номера с recon-flood
+  TD-025, `docs(M-09) task 4` close-out).
   2026-07-15). SACRED-тест `crates/journal/tests/red_prod_migration.rs` использует
   `WriterConfig::own_capture(...)`, у которого `min_free_bytes` = ПРОД-дефолт **10 GiB**. На чекауте с
   <10 GiB свободного (у reviewer'а локально: 8.9 GiB / 437G, 98%) оба теста падают с `error:

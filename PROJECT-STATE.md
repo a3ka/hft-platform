@@ -426,9 +426,9 @@ Durable-компакция: cron активирован на проде + поз
   `*.last-success` в скриптах — только с `d3e7db2`.
   ⚠ **`verify_M-08.sh` FAIL ЛОКАЛЬНО** на `red_prod_migration` (`error: StorageGuard`) — pre-existing
   **env-флейк**: тест берёт `WriterConfig::own_capture` (min_free=10 GiB), а локальный диск 8.9 GiB/98%.
-  НЕ логика, НЕ эта ветка (crates/journal не тронут): **CI на adequate-disk = GREEN**. Заведён **TD-025**
-  (architect: min_free_bytes:0 в тесте как у соседних фикстур ИЛИ требование к test-env; блокирует
-  tester task 7 на full-disk чекауте).
+  НЕ логика, НЕ эта ветка (crates/journal не тронут): **CI на adequate-disk = GREEN**. Заведён **TD-026**
+  (перенумерован из TD-025 2026-07-19 — коллизия с recon-flood TD-025) (architect: min_free_bytes:0 в
+  тесте как у соседних фикстур ИЛИ требование к test-env; блокирует tester task 7 на full-disk чекауте).
 - **§8 CRON АКТИВАЦИЯ на VPS (founder-★ авторизация relayed через диспетч):** deploy НЕ триггерился
   (deploy-only пути), поэтому reviewer обновил чекаут VPS до `d3e7db2` (скрипты несут `.last-success`),
   установил `/etc/cron.d/hft-journal-retention` (компакция `50 3`, ретеншен dry-run `7 4`) + `/var/{log,
@@ -439,7 +439,7 @@ Durable-компакция: cron активирован на проде + поз
   компакция через ЭТОТ код-путь доказана §8-B rev10/rev11 дважды (+4.69, +1.94 GB); recurring 03:50
   сожмёт по мере накопления. ⇒ **хвост 1 закрыт; TD-024 CLOSED; TD-006/TD-020 durable-замедлены.**
 - **M-08 всё ещё IN_PROGRESS:** хвост 2 — Storage Box + retention apply (founder ★). После него:
-  tester clean-checkout verify (см. TD-025 про disk) → architect close-out → reviewer финальный §8.
+  tester clean-checkout verify (см. TD-026 про disk) → architect close-out → reviewer финальный §8.
 
 ### rev 11 (задача 19 — TD-024 equals-form CLI) — REVIEWER APPROVED + MERGED (`e31e23e`, §8 PROD GREEN, 2026-07-15)
 Фикс delivery-дефекта, пойманного §8 rev10: операторский путь через `docker compose run` был сломан.
@@ -687,6 +687,48 @@ Founder ★ 2026-07-18 принял **B2** (`docs/fa/ops.md §4.3.2`): объё�
   (преждевременен). Recon-эмиссии на проде наблюдаемы ТОЛЬКО через журнал (`Sys(ReconDivergence)`) —
   ни stdout-лога, ни метрик-скрейпа. Это делает §8 recon трудоёмким (нужен bounded-memory декодер
   журнала); закрывается task 4.
+
+### task 4 (метрики + алерты) — MERGED + В ПРОДЕ (`9a352d6`, reviewer APPROVED + §8 PROD GREEN 2026-07-19); **приёмка task 4 выполнена, НО наблюдаемость ещё не функциональна — TD-027**
+Цепочка: architect RED (`08c8d89` `red_ops_server`/`red_ops_alerts`/`red_metrics_endpoint`) + verify
+(`b5b7604`) → critic C-013 APPROVE_WITH_NOTES (`e2d1c33`) → engine-dev 4A (`604ea0b` /metrics loopback-
+сервер) + 4B (`9a352d6` каталог правил + паритет). Reviewer ff-merge `9a352d6`.
+- **(4A) `/metrics` scrape-сервер** — `crates/ops/src/server.rs` (ЧИСТАЯ `http_response(request_line,
+  &Metrics)`: GET /metrics→200+тело, не-/metrics→404, не-GET→405; без tokio/IO, детерминирована) +
+  `crates/recorder/src/metrics_server.rs` (socket accept-loop, read-line лимит 8 KiB анти-slowloris,
+  per-conn task, cancel-safe). `main.rs`: `spawn_metrics_server` — bind `METRICS_BIND_ADDR` (дефолт
+  **`127.0.0.1:9101`** loopback-only, без внешнего доступа §3); **бинд-сбой → WARN + продолжение БЕЗ
+  эндпоинта** (метрики — не data-path; запись в журнал не падает из-за bind). recorder/Cargo.toml:
+  +tokio features `net`+`io-util` (свои, shared-access). **journal-write/order путь НЕ тронут**
+  (Block-scope подтверждён: recorder diff ⊂ {main.rs spawn, metrics_server.rs}). MD-only, read-only
+  scrape → risk-critic N/A.
+- **(4B) каталог правил `ops::alerts`** — `ALERT_RULES` (incident→severity→metric→summary), P0/P1 +
+  P2-observational carve-out; рендер `to_prometheus_rules()` → `deploy/alerts/ops.rules.yml`
+  (reviewer перегенерил `dump_rules` — IDENTICAL, нет drift, критик N2). **Двусторонний паритет OPS-I-5**
+  (правило→метрика, класс §7.1→правило, нет orphan-rule) — verify shell + RED, анти-плацебо reviewer'ом
+  независимо: http_response always-200 → `red_ops_server` FAIL (405/404); пустой `ALERT_RULES` →
+  `red_ops_alerts` FAIL (coverage/parity).
+- **Гейты (reviewer независимо на чистом worktree):** ops **52/52**, recorder **10/10**, clippy 0,
+  fmt clean, `verify_M-09.sh` **VERDICT PASS** (18 проверок вкл. T4A/T4B). Scope чист (tests только
+  architect `08c8d89`; contracts НЕ тронуты → CT-RFC не нужен; Cargo.toml только +net/io-util). Критик
+  C-013 APPROVE_WITH_NOTES; N1 (tokio features) + N2 (yml derived) — оба проверены reviewer'ом.
+- **§8 PROD GREEN (VPS `9a352d6`, CI+Deploy success, 2026-07-19):** контейнер healthy, restarts=0,
+  hb свежий, panic/ERROR=0, `metrics-server bound 127.0.0.1:9101`. `/metrics` через busybox-sidecar
+  (`--network container:hft-recorder`, loopback не проброшен наружу — §3): **HTTP 200**, тело несёт
+  **`book_divergence_bps{venue,symbol}` для всех 4 символов с НЕНУЛЕВЫМИ значениями** (binance BTC/ETH
+  + binance_futures BTC/ETH: 6..332) + `venue_http_status_total{code=200}` non-zero. **Приёмка task 4
+  (эндпоинт+каталог+паритет+§8 book_divergence_bps) ВЫПОЛНЕНА.**
+- **⚠ БЛОКЕР РЕАЛЬНОЙ НАБЛЮДАЕМОСТИ (reviewer §8, TD-027 OPEN):** из 15 объявленных семейств живые
+  SAMPLES ТОЛЬКО у 2 (`book_divergence_bps`, `venue_http_status_total`). Остальные 13 —
+  **объявлены+зацитированы в правилах, но НЕ инкрементируются** (grep call-site пуст). Следствие:
+  правила алертов ТРЁХ ФОРМИРУЮЩИХ инцидентов ссылаются на МЁРТВЫЕ метрики — **TD-011 (P0) →
+  `journal_bytes_written_total`, TD-014 (P1) → `md_events_total`, TD-016 (P1) → `recorder_rss_anon_bytes`,
+  OPS-GAP → `journal_seq_gaps_total`** — эти алерты НИКОГДА не сработают. Паритет OPS-I-5 реестрово-
+  статичен (имена, не эмиссия) → зелёный, но ложно-успокаивает. Эмиссия требует journal-write пути +
+  recorder hot-loop, которые carve-out task 4 ЯВНО запрещает → это ОТДЕЛЬНАЯ задача (4C, architect
+  RED-first со своим carve-out). ДО Alertmanager (§O) метрики обязаны быть живыми. **M-09 остаётся
+  🚧 ACTIVE:** task 3 (Storage Box, founder ★), **task 4C (метрик-эмиссия, TD-027)**, task 5/6.
+- Перенумерация: коллизия `TD-025` (recon-flood vs M-08 disk-migration) разведена — M-08 disk →
+  **TD-026**; новый долг эмиссии — **TD-027**.
 
 ## Пока НЕ реализовано (следующие фазы)
 - Крейты `risk`/`killswitch`/`oms`, `runner` — пофазно per DESIGN §10 (M-08: fail-closed риск-гейт
