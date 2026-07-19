@@ -24,6 +24,7 @@ async fn j1_clean_shutdown_drains_and_flushes_no_loss() {
         rx,
         journal,
         dir.path().join("recorder.heartbeat"),
+        std::sync::Arc::new(ops::metrics::Metrics::new()),
         async move {
             let _ = sd_rx.await;
         },

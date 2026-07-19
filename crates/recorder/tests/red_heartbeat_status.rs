@@ -28,9 +28,15 @@ async fn td019_heartbeat_carries_storage_status() {
     let (sd_tx, sd_rx) = tokio::sync::oneshot::channel::<()>();
     sd_tx.send(()).expect("shutdown");
 
-    run_writer(rx, journal, hb.clone(), async move {
-        let _ = sd_rx.await;
-    })
+    run_writer(
+        rx,
+        journal,
+        hb.clone(),
+        std::sync::Arc::new(ops::metrics::Metrics::new()),
+        async move {
+            let _ = sd_rx.await;
+        },
+    )
     .await
     .expect("run_writer");
 

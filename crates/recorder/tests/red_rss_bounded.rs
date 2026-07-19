@@ -96,6 +96,7 @@ fn run_n(n: usize) -> usize {
                 rx,
                 journal,
                 dir.path().join("recorder.heartbeat"),
+                std::sync::Arc::new(ops::metrics::Metrics::new()),
                 async move {
                     let _ = sd_rx.await;
                 },
