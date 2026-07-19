@@ -53,6 +53,19 @@ recon-дизайном FA §4 и уточняется на critic-аудите �
   экспорт НЕ в горячем пути (OPS-I-7: scrape читает атомики по запросу).** recorder Cargo.toml: engine-dev
   добавляет СВОЮ tokio-feature `net` (shared-access правило scope-guard). Reviewer в Block-scope
   подтверждает: диф recorder ⊂ `{main.rs (spawn), metrics_server.rs}`, MD-only, без journal/order.
+- **`crates/recorder/src/{lib.rs,main.rs,recon_loop.rs,metric_emit.rs}` + `crates/venue-*/src/**` —
+  task-4C metric-emission carve-out (engine-dev; venue-dev для reconnect).** Развести продюсеры (§3
+  продюсер-карта): `run_writer` (lib.rs) эмитит `journal_bytes_written_total`/`journal_seq_current`/
+  `journal_segment_index`/`journal_disk_free_bytes`/`journal_write_errors_total`/`journal_seq_gaps_total`
+  + `md_events_total`/`md_event_age_ms` (классификация `EventKind` при append; данные storage/seq УЖЕ
+  считаются для heartbeat); `apply_md_to_books` (recon_loop.rs) → `book_levels`; периодический sampler
+  (`main.rs`/новый `metric_emit.rs`, `/proc/self/status` RssAnon) → `recorder_rss_anon_bytes`; supervisor
+  (`main.rs`) ИЛИ venue-`run` → `venue_ws_reconnects_total`. **ЖЁСТКИЕ ГРАНИЦЫ:** метрики — ТОЛЬКО
+  атомик-инкременты рядом с существующими операциями (**OPS-I-7**, не новый горячий путь); **в журнал
+  НЕ пишутся** (**OPS-I-6** — `metrics.inc/set`, НЕ `journal.append`); `run_writer` меняет ТОЛЬКО эмиссию
+  (append/flush/shutdown-семантика `JR-I-1` НЕ меняется — architect обновляет её RED-вызовы под новую
+  сигнатуру с `&Metrics`); venue-* тронуть ТОЛЬКО reconnect-счётчик (MD-only, без order-egress). Reviewer
+  Block-scope: диф ⊂ названных файлов, каждая правка = атомик-эмиссия рядом с существующим кодом.
 - **`crates/recorder/src/{main.rs,recon_loop.rs}` — ТОЛЬКО recon-loop wiring (engine-dev, явный
   Task-2 carve-out).** Оркестратор recon (`main.rs`: hoist `ReconDetector::new(thr)` ДО цикла
   `while let Some(reference)`, передать `&mut detector` первым аргументом `handle_recon_snapshot`,
@@ -79,7 +92,8 @@ recon-дизайном FA §4 и уточняется на critic-аудите �
 | 1 | ✅ | **CT-RFC-03 (T1, БЛОКИРУЮЩАЯ):** `SysEvent::ReconDivergence(ReconAudit)` + `ReconAction` (аддитивно, хвост) + сген. JSON Schema + фикстуры + `red_rfc03` | architect | ✅ merged `cf53e81`, §8 inert-safe; roundtrip+CT-I-3+compile-RED зелёные; schema_version не бампнут |
 | 2 | ✅ | **B2 ЗАКРЫТ + В ПРОДЕ (`17b02a7`, §8 PROD GREEN 2026-07-18: healthy 0 эмиссий, injection best-порчи → 4× best=true, флуд B удалён).** Recon (OPS-I-1 + OPS-I-9): рантайм = best-price per-cycle + seed-gate; объёмная near-touch сверка снята с рантайма (REST-неверифицируема) → офлайн-трек; rate-budget/backoff (TD-013) | engine-dev (ops) | ✅ merge B2 `4939d8f`; §8 PROD GREEN `17b02a7`; TD-025(B) CLOSED |
 | 3 | ⏳ | **Сохранность (OPS-I-2/3):** cold-copy журнала offsite (Storage Box) + **restore-drill** (скачать→прочитать `journal::stream`, `seq` непрерывен) — на РЕАЛЬНОМ сегменте, legacy-0 первым | engine-dev | RED/§8: restore-drill на реальном сегменте (не фикстуре); удаление горячей копии — только через `ColdCopyProof` |
-| 4 | 🚧 | **Метрики+алерты (OPS-I-4..8) — ACTIVE (RED-first готов, architect):** **(A)** `/metrics` HTTP-сервер (Prometheus text, отдельный loopback-порт, без внешнего доступа — §3): реестр+`prometheus_text()` УЖЕ есть, СЕРВЕРА НЕТ (дыра §8 — recon мерили журналом). **(B)** каталог правил P0/P1/P2 (`ops::alerts`) + **двусторонний паритет OPS-I-5** (класс §7.1 → ≥1 правило; правило → существующая метрика; CI в ОБЕ стороны) + рендер `deploy/alerts/`. Тишина потока (OPS-I-8), метрики НЕ в журнал (OPS-I-6), не в горячем пути (OPS-I-7) | architect RED → engine-dev impl (ops + recorder metrics-server carve-out) | RED: (A) HTTP GET /metrics → 200 + body несёт §3-метрику (не заглушка), не-/metrics → 404, не-GET → 405, socket на loopback; (B) каталог: правило-без-метрики / класс-без-правила → CI FAIL (обе стороны); §8: curl /metrics на VPS отдаёт `book_divergence_bps{venue,symbol}` |
+| 4 | ✅ | **Метрики+алерты (OPS-I-4..8) ЗАКРЫТ + В ПРОДЕ (`1919350`/код `9a352d6`, §8 PROD GREEN).** (A) `/metrics` loopback-сервер отдаёт; (B) каталог правил + паритет OPS-I-5. **⚠ §8 вскрыл TD-027 (MAJOR): 13/15 метрик ОБЪЯВЛЕНЫ, но НЕ wired — правила формирующих инцидентов ссылаются на мёртвые метрики → задача 4C.** | architect → critic → engine-dev → tester → reviewer | ✅ merge `9a352d6`; §8 GREEN (/metrics отдаёт `book_divergence_bps` non-zero). TD-027 OPEN → task 4C |
+| 4C | 🚧 | **Живая ЭМИССИЯ метрик (OPS-I-10, урок TD-027) — ACTIVE (RED-first готов, architect):** развести КАЖДУЮ объявленную §3-метрику до реального инкремента продюсером (journal writer → `journal_*`; MD → `md_events_total`/`md_event_age_ms`; supervisor → `venue_ws_reconnects_total`; books-feeder → `book_levels`; sampler → `recorder_rss_anon_bytes`). RED ассертит РАНТАЙМ-эмиссию (SAMPLE-серия, не HELP/TYPE) через прогон продюсера. **OPS-I-6** (метрики НЕ в журнал) + **OPS-I-7** (атомики, не горячий путь) сохранить. **Свой carve-out** (task 4 ЗАПРЕЩАЛ writer/hot-loop/venue) | architect RED → engine-dev (+venue-dev reconnect) → tester → reviewer §8 | RED: прогон writer/feeder/sampler → `prometheus_text()` несёт SAMPLE для КАЖДОЙ steady-метрики (не только `# HELP/TYPE`); event-метрики эмитят на триггере; verify-канарейка: каждая `METRICS`-запись покрыта emission-оракулом; §8: curl /metrics на VPS — ВСЕ steady-метрики non-zero |
 | 5 | ⏳ | `scripts/verify_M-09.sh` — ≥1 проверка на задачу; финальный `VERDICT` | architect | exit=0 на GREEN |
 | 6 | ⏳ | tester clean-checkout + reviewer §8 (прод НЕ инертен: recon реально шлёт REST и пишет `Sys` при инъекции; `/metrics` отдаёт) | tester/reviewer | Done Block + §8 пруф |
 
@@ -234,6 +248,36 @@ bounded-декодером журнала).**
 Allowed-paths правка = doc-гейт §9 Class A). MD-only (только чтение атомиков + serve, без order-egress) →
 risk-critic N/A. §8: curl `/metrics` на VPS отдаёт `book_divergence_bps{venue,symbol}` (наблюдаемость,
 которой не было). T1 НЕ трогается → CT-RFC не нужен.
+
+## Task 4C — spec (2026-07-19, architect RED-first готов → engine-dev)
+
+**Корень TD-027 (§8, reviewer):** task 4 дал реестр+сервер+правила+паритет OPS-I-5 (зелёный), но 13/15
+метрик НЕ подключены к продюсерам → инкрементируются только `book_divergence_bps` + `venue_http_status_
+total`. Правила P0/P1 формирующих инцидентов (TD-011/014/016/OPS-GAP) ссылаются на МЁРТВЫЕ метрики.
+Паритет проверял ИМЕНА реестра, а не РАНТАЙМ-ЭМИССИЮ — тот же класс, что recon-wiring кормил пустую книгу.
+
+**Инвариант OPS-I-10 (FA §6):** объявлена ⟹ эмитится. У каждой §3-метрики — названный продюсер-сейм (§3
+продюсер-карта); RED прогоняет ПРОДЮСЕР и ассертит SAMPLE-серию (`name{labels} value`), не только HELP/TYPE.
+
+- **architect RED (sacred, ГОТОВО):**
+  - `crates/recorder/tests/red_metrics_emission.rs` — прогоняет РЕАЛЬНЫЕ продюсеры с общим `Arc<Metrics>`:
+    (а) `run_writer` (новая сигнатура с `&Metrics`) на последовательности Md+Sys событий + shutdown →
+    `prometheus_text()` несёт SAMPLE для `journal_bytes_written_total`>0, `journal_seq_current`>0,
+    `journal_segment_index`, `journal_disk_free_bytes`, `md_events_total{venue,symbol,kind}`>0,
+    `md_event_age_ms{venue}`; (б) `apply_md_to_books` (с `&Metrics`) на L2Snapshot → `book_levels{...,side}`
+    SAMPLE; (в) sampler-сейм → `recorder_rss_anon_bytes` SAMPLE. Хелпер `has_sample(text,name)` отличает
+    SAMPLE-строку от `# HELP/# TYPE` — анти-TD-027 (registry-only impl падает).
+  - Обновлены sacred RED-вызовы `run_writer` под новую сигнатуру (`red_shutdown_j1`, `red_heartbeat_status`,
+    `red_rss_bounded`, `red_recon_wiring`) — append/flush/shutdown-семантика (`JR-I-1`) НЕ меняется, только
+    добавлен `&Metrics`-аргумент.
+  - `scripts/verify_M-09.sh` — **emission-канарейка (OPS-I-10):** каждая `METRICS`-запись покрыта
+    assert'ом в emission-оракуле ИЛИ явно помечена `event`/`deferred` (backup_restore_drill_ok — task 3).
+- **engine-dev impl (+venue-dev):** продюсер-инкременты по carve-out (§Allowed paths task-4C). ТОЛЬКО
+  атомики рядом с существующими операциями (OPS-I-7); НЕ в журнал (OPS-I-6); `run_writer` меняет ТОЛЬКО
+  эмиссию. `venue_ws_reconnects_total` — supervisor или venue-`run` (venue-dev, MD-only).
+- **Гейты:** critic (Class A: FA §1/§3/§6 + milestone Allowed-paths + касание sacred writer-сейма `JR-I-1`).
+  MD-only (метрики read-side, без order-egress) → risk-critic N/A. **§8: curl /metrics на VPS — ВСЕ
+  steady-метрики non-zero** (ровно проверка, что вскрыла TD-027). T1 НЕ трогается → CT-RFC не нужен.
 
 ## Acceptance (исполняемые ворота — BACKLOG M-09 + OPS-I-*)
 
