@@ -43,8 +43,16 @@ recon-дизайном FA §4 и уточняется на critic-аудите �
   carve-out; ops — слой наблюдаемости, MD-only, НЕ risk/killswitch/oms).
 - `crates/venue-*/src/**` — recon **REST-fetch** снапшота (**venue-dev**; MD-only, добавляет
   order-НЕзависимый REST-трафик → OPS-I-9 обязателен).
-- `deploy/**` (бэкап cold-copy + restore-drill + `/metrics` scrape) — **engine-dev**
-  (деплой-механика, scope-guard carve-out; не секреты).
+- `deploy/**` (бэкап cold-copy + restore-drill + `/metrics` scrape + **`deploy/alerts/` правила
+  P0/P1/P2, task 4B**) — **engine-dev** (деплой-механика, scope-guard carve-out; не секреты).
+- **`crates/recorder/src/{main.rs,metrics_server.rs}` — task-4 metrics-server carve-out (engine-dev).**
+  Task 4A: рекордер спавнит async-таск, биндит `tokio::net::TcpListener` на loopback (127.0.0.1:порт,
+  без внешнего доступа — §3) и на каждый запрос зовёт ЧИСТУЮ `ops::server::http_response(request_line,
+  &metrics)`. Socket-loop — новый `metrics_server.rs`; `main.rs` — только `spawn` + bind-addr из env.
+  `Arc<Metrics>` рекордер уже владеет. **journal-write путь (`JR-I-1`) и order-путь НЕ трогаются;
+  экспорт НЕ в горячем пути (OPS-I-7: scrape читает атомики по запросу).** recorder Cargo.toml: engine-dev
+  добавляет СВОЮ tokio-feature `net` (shared-access правило scope-guard). Reviewer в Block-scope
+  подтверждает: диф recorder ⊂ `{main.rs (spawn), metrics_server.rs}`, MD-only, без journal/order.
 - **`crates/recorder/src/{main.rs,recon_loop.rs}` — ТОЛЬКО recon-loop wiring (engine-dev, явный
   Task-2 carve-out).** Оркестратор recon (`main.rs`: hoist `ReconDetector::new(thr)` ДО цикла
   `while let Some(reference)`, передать `&mut detector` первым аргументом `handle_recon_snapshot`,
@@ -69,9 +77,9 @@ recon-дизайном FA §4 и уточняется на critic-аудите �
 |---|---|---|---|---|
 | 0 | ✅ | **FA-приёмка (ПРЕДУСЛОВИЕ):** `docs/fa/ops.md` PROPOSED → ACTIVE через doc-гейт | critic → reviewer → founder ★ | ✅ 2026-07-16: critic C-007 APPROVE + reviewer APPROVED + founder ★; `ops.md` STATUS ACTIVE |
 | 1 | ✅ | **CT-RFC-03 (T1, БЛОКИРУЮЩАЯ):** `SysEvent::ReconDivergence(ReconAudit)` + `ReconAction` (аддитивно, хвост) + сген. JSON Schema + фикстуры + `red_rfc03` | architect | ✅ merged `cf53e81`, §8 inert-safe; roundtrip+CT-I-3+compile-RED зелёные; schema_version не бампнут |
-| 2 | 🚧 | **(B2 ПРИНЯТ founder ★ 2026-07-18; RED B2 готов → engine-dev)** **Recon (OPS-I-1 + OPS-I-9):** рантайм = **best-price per-cycle + seed-gate**; best-расхождение → алерт + ресинк + `Sys`-событие; объёмная near-touch сверка СНЯТА с рантайма (REST-неверифицируема) → офлайн-трек; **rate-budget/backoff** (honor 418/429/`Retry-After`, cap — TD-013) | engine-dev (ops) | RED (B2): (а) best-порча (пропавший/сдвинутый best) ОБЯЗАНА эмитить; (б) персистентный объёмный сдвиг (≫ε_max) в рантайме МОЛЧИТ; (в) seed-gate; (г) OPS-I-9 — REST-ошибки НЕ дают hot-loop |
+| 2 | ✅ | **B2 ЗАКРЫТ + В ПРОДЕ (`17b02a7`, §8 PROD GREEN 2026-07-18: healthy 0 эмиссий, injection best-порчи → 4× best=true, флуд B удалён).** Recon (OPS-I-1 + OPS-I-9): рантайм = best-price per-cycle + seed-gate; объёмная near-touch сверка снята с рантайма (REST-неверифицируема) → офлайн-трек; rate-budget/backoff (TD-013) | engine-dev (ops) | ✅ merge B2 `4939d8f`; §8 PROD GREEN `17b02a7`; TD-025(B) CLOSED |
 | 3 | ⏳ | **Сохранность (OPS-I-2/3):** cold-copy журнала offsite (Storage Box) + **restore-drill** (скачать→прочитать `journal::stream`, `seq` непрерывен) — на РЕАЛЬНОМ сегменте, legacy-0 первым | engine-dev | RED/§8: restore-drill на реальном сегменте (не фикстуре); удаление горячей копии — только через `ColdCopyProof` |
-| 4 | ⏳ | **Метрики+алерты (OPS-I-4..8):** `/metrics` (Prometheus text; recorder+venue+journal) + правила P0/P1/P2; **двусторонний паритет OPS-I-5** (каждый класс §7.1 → ≥1 правило; каждое правило → существующая метрика; CI в ОБЕ стороны); тишина потока (OPS-I-8); метрики НЕ в журнал (OPS-I-6), не в горячем пути (OPS-I-7) | engine-dev | RED: grep-канарейка на каждую метрику §3; CI-скрипт паритета валит и «правило без метрики», и «класс без правила» |
+| 4 | 🚧 | **Метрики+алерты (OPS-I-4..8) — ACTIVE (RED-first готов, architect):** **(A)** `/metrics` HTTP-сервер (Prometheus text, отдельный loopback-порт, без внешнего доступа — §3): реестр+`prometheus_text()` УЖЕ есть, СЕРВЕРА НЕТ (дыра §8 — recon мерили журналом). **(B)** каталог правил P0/P1/P2 (`ops::alerts`) + **двусторонний паритет OPS-I-5** (класс §7.1 → ≥1 правило; правило → существующая метрика; CI в ОБЕ стороны) + рендер `deploy/alerts/`. Тишина потока (OPS-I-8), метрики НЕ в журнал (OPS-I-6), не в горячем пути (OPS-I-7) | architect RED → engine-dev impl (ops + recorder metrics-server carve-out) | RED: (A) HTTP GET /metrics → 200 + body несёт §3-метрику (не заглушка), не-/metrics → 404, не-GET → 405, socket на loopback; (B) каталог: правило-без-метрики / класс-без-правила → CI FAIL (обе стороны); §8: curl /metrics на VPS отдаёт `book_divergence_bps{venue,symbol}` |
 | 5 | ⏳ | `scripts/verify_M-09.sh` — ≥1 проверка на задачу; финальный `VERDICT` | architect | exit=0 на GREEN |
 | 6 | ⏳ | tester clean-checkout + reviewer §8 (прод НЕ инертен: recon реально шлёт REST и пишет `Sys` при инъекции; `/metrics` отдаёт) | tester/reviewer | Done Block + §8 пруф |
 
@@ -186,6 +194,46 @@ Per-cycle порог по объёму **принципиально нежизн
 
 **Офлайн-объёмный трек — НЕ блокирует закрытие дефекта B** (см. BACKLOG «M-09 хвост: офлайн data-quality
 объёмная сверка», research-dev).
+
+## Task 4 — spec (2026-07-19, architect RED-first готов → engine-dev)
+
+Реестр метрик (`ops::metrics::METRICS`, `prometheus_text()`), silence (`ops::silence`) и паритет ИМЁН
+метрик (`verify_M-09.sh`) УЖЕ есть и зелёные. Task 4 закрывает ДВЕ дыры:
+
+**4A — `/metrics` HTTP-сервер (гэп: `prometheus_text()` есть, но никто не сервит — §8 recon мерили
+bounded-декодером журнала).**
+- **architect RED (sacred, ГОТОВО):** `crates/ops/tests/red_ops_server.rs` — ЧИСТЫЙ контракт
+  `ops::server::http_response(request_line: &str, metrics: &Metrics) -> String`:
+  `GET /metrics HTTP/1.1` → `HTTP/1.1 200`, заголовок `Content-Type: text/plain; version=0.0.4`, тело =
+  `prometheus_text()` (несёт §3-метрики + РЕАЛЬНОЕ значение set-гейджа, не заглушка); не-`/metrics` →
+  `404`; не-GET → `405`. + `crates/recorder/tests/red_metrics_endpoint.rs` — bind эфемерного
+  `127.0.0.1:0`, `recorder::metrics_server::serve(listener, Arc<Metrics>)`, реальный TCP GET → 200 + тело
+  несёт метрику (socket-путь, loopback = без внешнего доступа).
+- **engine-dev impl:** `crates/ops/src/server.rs` (ЧИСТАЯ `http_response`, БЕЗ tokio — ops остаётся
+  лёгким, только `contracts`+`book`); `crates/recorder/src/metrics_server.rs` (`serve` — accept-loop:
+  прочитать request-line, вызвать `ops::server::http_response`, записать, закрыть) + `main.rs` спавн +
+  bind-addr из env (дефолт loopback). recorder Cargo: +tokio feature `net`.
+
+**4B — правила алертов P0/P1/P2 + двусторонний паритет OPS-I-5 (rule-side).**
+- **architect RED (sacred, ГОТОВО):** `crates/ops/tests/red_ops_alerts.rs` — контракт
+  `ops::alerts::{Severity{P0,P1,P2}, AlertRule{incident,severity,metric,summary}, ALERT_RULES,
+  to_prometheus_rules()}`: (1) КАЖДОЕ `rule.metric ∈ metric_names()` (правило-без-метрики → FAIL);
+  (2) КАЖДЫЙ обязательный класс инцидента §7.1 имеет ≥1 правило (класс-без-правила → FAIL, канон-список
+  в оракуле = `verify` REQUIRED_INCIDENTS); (3) `to_prometheus_rules()` рендерит каждое правило с его
+  метрикой И severity (не пустой рендер — семантика, анти-плацебо). Анти-плацебо в обе стороны:
+  правило→несуществующая метрика падает (1); удаление правила класса падает (2); пустой рендер падает (3).
+- **verify_M-09.sh:** кросс-чек каталога `ALERT_RULES` ↔ FA §7.1 incident-IDs В ОБЕ СТОРОНЫ (Rust-канон и
+  FA не расходятся); прогон `red_ops_server` + `red_ops_alerts`.
+- **engine-dev impl:** `crates/ops/src/alerts.rs` (каталог зеркалит FA §7.1 + рендер Prometheus-правил —
+  ОДИН канон); `deploy/alerts/ops.rules.yml` = вывод `to_prometheus_rules()` (deploy-артефакт). **Живой
+  Alertmanager/Prometheus НЕ провижен (§O открыт)** — правила АВТОРИРУЮТСЯ + паритет-проверяются сейчас;
+  live-alerting включается, когда founder ★ провижит Prometheus. Это ЧЕСТНО: «метрика без алерта
+  бесполезна» (OPS-I-5) закрывается артефактом+паритетом; scrape-endpoint (4A) §8-валидируется живым curl.
+
+**Гейты task 4:** critic (новый модуль `ops::server`+`ops::alerts` + recorder carve-out + milestone
+Allowed-paths правка = doc-гейт §9 Class A). MD-only (только чтение атомиков + serve, без order-egress) →
+risk-critic N/A. §8: curl `/metrics` на VPS отдаёт `book_divergence_bps{venue,symbol}` (наблюдаемость,
+которой не было). T1 НЕ трогается → CT-RFC не нужен.
 
 ## Acceptance (исполняемые ворота — BACKLOG M-09 + OPS-I-*)
 
