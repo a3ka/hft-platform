@@ -21,9 +21,9 @@ use std::sync::Arc;
 use contracts::{EventKind, Level, MdEvent, MdPayload, SysEvent, Venue};
 use journal::Journal;
 use ops::metrics::Metrics;
-use recorder::metric_emit::{emit_book_levels, sample_rss};
-use recorder::recon_loop::{apply_md_to_books, ReconBooks};
-use recorder::run_writer;
+use recorder::metric_emit::sample_rss;
+use recorder::recon_loop::ReconBooks;
+use recorder::{run_books_feeder, run_writer};
 
 const UNIT: i64 = 100_000_000;
 
@@ -55,6 +55,20 @@ fn sample_value(text: &str, name: &str) -> Option<i64> {
         })
         .and_then(|l| l.split_whitespace().last())
         .and_then(|v| v.parse::<i64>().ok())
+}
+
+/// Как `has_sample`, но требует ЛЕЙБЛОВАННУЮ серию (`name{...}`) с КАЖДЫМ ключом из `keys`
+/// (`key="..."`). Ловит СХЛОПЫВАНИЕ РАЗМЕРНОСТИ (C-014 gap-1 / урок C-009 M2): безлейбловый
+/// `md_events_total 30` вместо `md_events_total{venue,symbol,kind}` — venue/symbol/kind не различить,
+/// метрика бесполезна (TD-014 «класс событий пропал» нельзя локализовать по venue/kind). `has_sample`
+/// такое пропускал (` ` после имени) → false-GREEN; здесь размерность обязана присутствовать.
+fn has_labeled_sample(text: &str, name: &str, keys: &[&str]) -> bool {
+    text.lines().any(|l| {
+        !l.starts_with('#')
+            && l.starts_with(name)
+            && l[name.len()..].starts_with('{')
+            && keys.iter().all(|k| l.contains(&format!("{k}=")))
+    })
 }
 
 fn l2_event(sym: &str, n: usize) -> EventKind {
@@ -113,13 +127,12 @@ async fn writer_emits_journal_and_md_metrics() {
     .unwrap();
 
     let text = metrics.prometheus_text();
+    // Безлейбловые journal-метрики: SAMPLE-серия обязана присутствовать.
     for m in [
         "journal_bytes_written_total",
         "journal_seq_current",
         "journal_segment_index",
         "journal_disk_free_bytes",
-        "md_events_total",
-        "md_event_age_ms",
     ] {
         assert!(
             has_sample(&text, m),
@@ -127,37 +140,51 @@ async fn writer_emits_journal_and_md_metrics() {
              продюсер не подключён (TD-027: объявлена, но мертва). OPS-I-10 нарушен"
         );
     }
+    // Labeled md-метрики: размерность ОБЯЗАНА присутствовать (C-014 gap-1) — иначе схлопнутый
+    // `md_events_total 30` прошёл бы, а venue/symbol/kind не различить (TD-014 не локализуем).
+    assert!(
+        has_labeled_sample(&text, "md_events_total", &["venue", "symbol", "kind"]),
+        "md_events_total НЕ несёт labeled SAMPLE `{{venue,symbol,kind}}` после 30 Md-событий — либо \
+         не эмитится (TD-027), либо размерность схлопнута (C-009 M2): класс событий не локализовать"
+    );
+    assert!(
+        has_labeled_sample(&text, "md_event_age_ms", &["venue"]),
+        "md_event_age_ms НЕ несёт labeled SAMPLE `{{venue}}` — тишина потока (OPS-I-8) не различима по venue"
+    );
     assert!(
         sample_value(&text, "journal_bytes_written_total").unwrap_or(0) > 0,
         "journal_bytes_written_total == 0 после 50 append'ов — writer пишет, а счётчик байт мёртв \
          (ровно TD-011-метрика «жив, но не пишет» неработоспособна)"
     );
-    assert!(
-        sample_value(&text, "md_events_total").unwrap_or(0) >= 1,
-        "md_events_total не инкрементирован на 30 Md-событиях (TD-014-метрика «класс событий пропал» мертва)"
-    );
 }
 
-/// (2, ПАДАЕТ против registry-only) books-feeder-эмиссия: после apply_snapshot + emit_book_levels
-/// метрика `book_levels{...,side}` несёт SAMPLE с реальной глубиной.
+/// (2, ПАДАЕТ против registry-only И против helper-only-non-live) Гоняем ЖИВОЙ feeder-loop
+/// `run_books_feeder` — ТОТ ЖЕ, что спавнит `main` (C-014 gap-2: leaf-хелпер, который тест зовёт
+/// напрямую, а main НЕ вызывает, — это рекурсия TD-027). Loop читает Md из канала, применяет к книге
+/// и эмитит `book_levels{venue,symbol,side}`. Тест шлёт L2Snapshot, закрывает канал → loop
+/// обрабатывает и выходит → ассерт labeled SAMPLE с реальной глубиной.
 #[tokio::test]
-async fn feeder_emits_book_levels() {
+async fn live_feeder_loop_emits_book_levels() {
     let books: ReconBooks = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
-    let metrics = Metrics::new();
+    let metrics = Arc::new(Metrics::new());
 
-    apply_md_to_books(&books, &l2_event("BTCUSDT", 5)).await;
-    emit_book_levels(&books, &metrics).await;
+    let (tx, rx) = tokio::sync::mpsc::channel::<EventKind>(16);
+    tx.send(l2_event("BTCUSDT", 5)).await.unwrap();
+    drop(tx); // закрываем канал → run_books_feeder дообработает и выйдет
+
+    // Гоняем САМ live-loop (не leaf emit-хелпер): его же спавнит main (verify live-wiring канарейка).
+    run_books_feeder(rx, Arc::clone(&books), Arc::clone(&metrics)).await;
 
     let text = metrics.prometheus_text();
     assert!(
-        has_sample(&text, "book_levels"),
-        "book_levels НЕ несёт SAMPLE после наполнения книги — TD-016-метрика (рост уровней) мертва \
-         (объявлена, но продюсер не подключён)"
+        has_labeled_sample(&text, "book_levels", &["venue", "symbol", "side"]),
+        "book_levels НЕ несёт labeled SAMPLE `{{venue,symbol,side}}` после прогона live-feeder — либо \
+         feeder-loop не эмитит (TD-027), либо размерность схлопнута (C-009 M2). TD-016-метрика мертва"
     );
     assert_eq!(
         sample_value(&text, "book_levels"),
         Some(5),
-        "book_levels != 5 после снапшота на 5 уровней/сторону — глубина не измеряется корректно"
+        "book_levels != 5 после снапшота на 5 уровней/сторону — глубина измеряется неверно"
     );
 }
 
