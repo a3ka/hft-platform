@@ -20,6 +20,10 @@ use tokio::sync::mpsc;
 /// M-09: recon-loop (изоляция recon-сбоя от append, JR-I-1). Скелет — impl engine-dev по RED.
 pub mod recon_loop;
 
+/// M-09 task 4A: `/metrics` scrape-эндпоинт на loopback (ЧИСТАЯ трансформация —
+/// `ops::server::http_response`, socket I/O — здесь). `docs/fa/ops.md` §3.
+pub mod metrics_server;
+
 /// Площадки, которые рекордер супервизит по умолчанию. `main` спавнит `supervise()` по
 /// ЭТОМУ списку (config-driven, не хардкод). M-06 #4 (reland, post-TD-013): BinanceFutures
 /// подключён — эмиттер `venue-binance-futures::run` выдаёт depth (@depth@100ms), liquidations

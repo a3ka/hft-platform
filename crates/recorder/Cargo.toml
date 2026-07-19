@@ -22,7 +22,7 @@ venue-binance-futures = { path = "../venue-binance-futures" }
 # `ReconFetcher`. Передавать Client извне (из deploy-конфига) — следующая итерация
 # (TLS/proxy tuning); сейчас bare `Client::new()`.
 reqwest = { version = "0.12", default-features = false }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "signal", "net", "io-util"] }
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

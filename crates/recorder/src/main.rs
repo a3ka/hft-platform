@@ -218,6 +218,15 @@ async fn main() -> anyhow::Result<()> {
     // `book_resync_total` через `ops::sink`; venue-fetcher'ы уже пишут `venue_http_status_total`.
     let metrics = Arc::new(Metrics::new());
 
+    // M-09 task 4A: `/metrics` scrape-эндпоинт на loopback (`ops.md §3 — без внешнего
+    // доступа`). Bind-addr из env `METRICS_BIND_ADDR`, дефолт `127.0.0.1:9101` — loopback-only
+    // (НЕ `0.0.0.0`; случайная публикация наружу здесь невозможна). 9101 — чтобы не
+    // конфликтовать с типичным node_exporter 9100. Бинд-сбой (порт занят, EBADF) → WARN
+    // + продолжение БЕЗ scrape-эндпоинта (recorder пишет данные, а не мониторинг; запись в
+    // журнал НЕ должна падать из-за bind-сбоя на metrics). Journal-write/order-путь
+    // НЕ затронуты (serve живёт в отдельном таске).
+    spawn_metrics_server(Arc::clone(&metrics)).await;
+
     // M-09: live-книга для recon. Заполняется BOOKS-FEEDER'ом из `MdEvent::L2Snapshot`-потока
     // через fanout-tap ниже (см. books-feeder-таск). До первого L2Snapshot — пустая;
     // orchestrator использует дефолт `OrderBook::new()` и в §8 это ВРЕМЕННО даёт ложный флуд
@@ -440,6 +449,38 @@ fn days_to_ym(days_since_1970: u64) -> (i32, u32) {
 
 fn is_leap(y: i32) -> bool {
     (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+}
+
+/// Заспавнить `/metrics` scrape-сервер на loopback. M-09 task 4A.
+///
+/// Bind-addr берётся из env `METRICS_BIND_ADDR` (дефолт `127.0.0.1:9101`) — явно
+/// loopback-only, без внешнего доступа (`ops.md §3`). Бинд-сбой (порт занят, EBADF)
+/// логируется и таск НЕ спавнится — recorder продолжает писать данные в журнал, как
+/// если бы scrape-эндпоинт отсутствовал (а он отсутствует — graceful degradation, не
+/// паника процесса).
+async fn spawn_metrics_server(metrics: Arc<Metrics>) {
+    // Дефолт — loopback `127.0.0.1:9101`. Если env содержит `0.0.0.0:...` явно — выполнится
+    // (операторский override), но по умолчанию внешний bind невозможен. Prometheus
+    // стандартно слушает на loopback + reverse-proxy; для HFT — bind-loopback + ssh-tunnel
+    // к Prometheus — самый безопасный путь.
+    let bind_addr = std::env::var("METRICS_BIND_ADDR")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "127.0.0.1:9101".to_string());
+
+    match tokio::net::TcpListener::bind(&bind_addr).await {
+        Ok(listener) => {
+            tracing::info!(bind_addr = %bind_addr, "metrics-server bound (/metrics scrape)");
+            tokio::spawn(recorder::metrics_server::serve(listener, metrics));
+        }
+        Err(e) => {
+            tracing::warn!(
+                bind_addr = %bind_addr,
+                error = %e,
+                "metrics-server bind failed — /metrics НЕ доступен; recorder продолжает без него"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
