@@ -6,62 +6,66 @@
 //! ссылались на МЁРТВЫЕ метрики. Тот же класс, что recon-wiring кормил пустую книгу: паритет
 //! проверял ИМЕНА реестра, а не РАНТАЙМ-ЭМИССИЮ.
 //!
-//! Контракт OPS-I-10: ОБЪЯВЛЕНА ⟹ ЭМИТИТСЯ. Эти оракулы прогоняют РЕАЛЬНЫЕ продюсер-сеймы
-//! (§3 продюсер-карта) с общим `Arc<Metrics>` и ассертят SAMPLE-серию (`name{labels} value`), а НЕ
-//! только `# HELP`/`# TYPE`. `has_sample` отличает эмиссию от реестра — анти-TD-027 в лоб.
+//! Контракт OPS-I-10: ОБЪЯВЛЕНА ⟹ ЭМИТИТСЯ. Оракулы прогоняют РЕАЛЬНЫЕ продюсер-сеймы (§3
+//! продюсер-карта) с общим `Arc<Metrics>` и ассертят SAMPLE-серию с ВЕРНОЙ размерностью И значением.
 //!
-//! Анти-плацебо: registry-only impl (продюсеры не трогают metrics) несёт лишь HELP/TYPE → has_sample
-//! == false → все падают. Против `todo!()`-сеймов — все падают. Против wired impl — GREEN.
+//! СТРОГОСТЬ (C-014 + re-audit #1/#2/#3): недостаточно «серия присутствует». Оракул обязан ловить:
+//!  - registry-only (только HELP/TYPE) — `has_sample`;
+//!  - схлопывание размерности (безлейбловый `md_events_total 30`) — `has_labeled_sample`;
+//!  - КОЛЛАПС ЗНАЧЕНИЙ LABEL (все venue→"binance", side→"bid", неверный kind) — МУЛЬТИ-вендор/символ/
+//!    kind/side фикстура + `labeled_sample_value` с ТОЧНЫМИ per-серия числами;
+//!  - DEAD-ZERO для steady-величин (`journal_seq_current`/`journal_disk_free_bytes`/`md_event_age_ms`
+//!    всегда 0) — value-ассерты `> 0` / точное `now-last`.
 //!
-//! Сеймы (engine-dev, carve-out task-4C): `run_writer(...,&Metrics,...)` эмитит journal_* + md_*;
-//! `metric_emit::emit_book_levels` — book_levels; `metric_emit::sample_rss` — recorder_rss_anon_bytes.
+//! Анти-плацебо доказан architect'ом прототипом в обе стороны (см. Handoff). Против wired impl — GREEN.
 
 use std::sync::Arc;
 
 use contracts::{EventKind, Level, MdEvent, MdPayload, Side, SysEvent, Venue};
 use journal::Journal;
 use ops::metrics::Metrics;
-use recorder::metric_emit::sample_rss;
+use recorder::metric_emit::{sample_md_age, sample_rss};
 use recorder::recon_loop::ReconBooks;
 use recorder::{run_books_feeder, run_writer};
 
 const UNIT: i64 = 100_000_000;
 
-/// SAMPLE-строка метрики `name`: НЕ комментарий (`#`) и начинается с `name` + `{`/` ` (серия
-/// `name{labels} v` или `name v`). Отличает РАНТАЙМ-эмиссию от реестровых `# HELP`/`# TYPE` строк.
-fn has_sample(text: &str, name: &str) -> bool {
-    text.lines().any(|l| {
-        !l.starts_with('#')
-            && l.starts_with(name)
-            && l[name.len()..]
-                .chars()
-                .next()
-                .map(|c| c == ' ' || c == '{')
-                .unwrap_or(false)
-    })
+/// Канонический venue-label (контракт, согласован с `ops::sink`/venue-адаптерами).
+fn vlabel(v: Venue) -> &'static str {
+    match v {
+        Venue::Binance => "binance",
+        Venue::BinanceFutures => "binance_futures",
+        Venue::Hyperliquid => "hyperliquid",
+    }
 }
 
-/// Значение последнего поля SAMPLE-строки метрики `name` (первая совпавшая серия).
+/// SAMPLE-строка `name` (серия `name{...} v` или `name v`), НЕ `# HELP`/`# TYPE`.
+fn has_sample(text: &str, name: &str) -> bool {
+    text.lines().any(|l| is_series_line(l, name))
+}
+
 fn sample_value(text: &str, name: &str) -> Option<i64> {
     text.lines()
-        .find(|l| {
-            !l.starts_with('#')
-                && l.starts_with(name)
-                && l[name.len()..]
-                    .chars()
-                    .next()
-                    .map(|c| c == ' ' || c == '{')
-                    .unwrap_or(false)
-        })
-        .and_then(|l| l.split_whitespace().last())
-        .and_then(|v| v.parse::<i64>().ok())
+        .find(|l| is_series_line(l, name))
+        .and_then(parse_last)
 }
 
-/// Как `has_sample`, но требует ЛЕЙБЛОВАННУЮ серию (`name{...}`) с КАЖДЫМ ключом из `keys`
-/// (`key="..."`). Ловит СХЛОПЫВАНИЕ РАЗМЕРНОСТИ (C-014 gap-1 / урок C-009 M2): безлейбловый
-/// `md_events_total 30` вместо `md_events_total{venue,symbol,kind}` — venue/symbol/kind не различить,
-/// метрика бесполезна (TD-014 «класс событий пропал» нельзя локализовать по venue/kind). `has_sample`
-/// такое пропускал (` ` после имени) → false-GREEN; здесь размерность обязана присутствовать.
+fn is_series_line(l: &str, name: &str) -> bool {
+    !l.starts_with('#')
+        && l.starts_with(name)
+        && l[name.len()..]
+            .chars()
+            .next()
+            .map(|c| c == ' ' || c == '{')
+            .unwrap_or(false)
+}
+
+fn parse_last(l: &str) -> Option<i64> {
+    l.split_whitespace().last().and_then(|v| v.parse().ok())
+}
+
+/// Требует ЛЕЙБЛОВАННУЮ серию `name{...}` с КАЖДЫМ ключом из `keys` (`key=`). Ловит схлопывание
+/// размерности (безлейбловый sample; урок C-009 M2).
 fn has_labeled_sample(text: &str, name: &str, keys: &[&str]) -> bool {
     text.lines().any(|l| {
         !l.starts_with('#')
@@ -71,9 +75,8 @@ fn has_labeled_sample(text: &str, name: &str, keys: &[&str]) -> bool {
     })
 }
 
-/// Значение КОНКРЕТНОЙ labeled-серии `name{... k="v" ...}` (первая, где присутствуют ВСЕ пары
-/// `key="val"`). Label-aware (C-014 re-audit): различает `side="bid"` от `side="ask"` и ловит
-/// labeled-но-НУЛЕВОЙ sample (`md_events_total{...} 0`), который `has_labeled_sample` пропускал.
+/// Значение КОНКРЕТНОЙ серии `name{... k="v" ...}` (первая с ВСЕМИ парами). Label-aware: различает
+/// venue/symbol/kind/side и ловит labeled-но-нулевой sample.
 fn labeled_sample_value(text: &str, name: &str, pairs: &[(&str, &str)]) -> Option<i64> {
     text.lines()
         .find(|l| {
@@ -84,14 +87,11 @@ fn labeled_sample_value(text: &str, name: &str, pairs: &[(&str, &str)]) -> Optio
                     .iter()
                     .all(|(k, v)| l.contains(&format!("{k}=\"{v}\"")))
         })
-        .and_then(|l| l.split_whitespace().last())
-        .and_then(|v| v.parse::<i64>().ok())
+        .and_then(parse_last)
 }
 
-/// АСИММЕТРИЧНЫЙ снапшот: `n_bid` бидов, `n_ask` асков (n_bid != n_ask ловит side-collapse —
-/// импл, эмитящий обе стороны как `side="bid"` или копирующий одну глубину на обе, даст неверное
-/// значение хотя бы для одной стороны).
-fn l2_event(sym: &str, n_bid: usize, n_ask: usize) -> EventKind {
+/// АСИММЕТРИЧНЫЙ снапшот произвольной площадки: `n_bid` бидов, `n_ask` асков.
+fn l2_event(venue: Venue, sym: &str, n_bid: usize, n_ask: usize) -> EventKind {
     let bids: Vec<Level> = (0..n_bid)
         .map(|i| Level {
             price: 65_000 * UNIT - (i as i64 + 1) * UNIT,
@@ -105,7 +105,7 @@ fn l2_event(sym: &str, n_bid: usize, n_ask: usize) -> EventKind {
         })
         .collect();
     EventKind::Md(MdEvent {
-        venue: Venue::Binance,
+        venue,
         symbol: sym.to_string(),
         payload: MdPayload::L2Snapshot {
             bids,
@@ -115,14 +115,12 @@ fn l2_event(sym: &str, n_bid: usize, n_ask: usize) -> EventKind {
     })
 }
 
-/// КАНОНИЧЕСКИЕ значения label `kind` для `md_events_total{kind=…}` (контракт engine-dev — ОДИН на
-/// вариант `MdPayload`; C-014 re-audit #2): `Trade`→`trade`, `L2Snapshot`→`l2snapshot`,
-/// `Funding`→`funding`, `OpenInterest`→`open_interest`, `Liquidation`→`liquidation`,
-/// `MarginRate`→`margin_rate`. kind ОБЯЗАН отражать РЕАЛЬНЫЙ тип payload — иначе TD-014 «класс
-/// событий пропал» неотличим (l2snapshot, помеченный как trade, скрывает пропажу L2-потока).
-fn trade_event(sym: &str) -> EventKind {
+/// КАНОНИЧЕСКИЕ `kind`-label (контракт engine-dev — ОДИН на вариант `MdPayload`): `Trade`→`trade`,
+/// `L2Snapshot`→`l2snapshot`, `Funding`→`funding`, `OpenInterest`→`open_interest`,
+/// `Liquidation`→`liquidation`, `MarginRate`→`margin_rate`. kind ОБЯЗАН отражать РЕАЛЬНЫЙ тип payload.
+fn trade_event(venue: Venue, sym: &str) -> EventKind {
     EventKind::Md(MdEvent {
-        venue: Venue::Binance,
+        venue,
         symbol: sym.to_string(),
         payload: MdPayload::Trade {
             price: 65_000 * UNIT,
@@ -133,8 +131,8 @@ fn trade_event(sym: &str) -> EventKind {
     })
 }
 
-/// (1, ПАДАЕТ против registry-only) Прогон РЕАЛЬНОГО writer'а на Md+Sys событиях → journal-* и md-*
-/// метрики несут SAMPLE (не только HELP/TYPE). Ровно TD-027: writer append'ит, но метрики были мертвы.
+/// (1) РЕАЛЬНЫЙ writer → journal-* (значение, не только присутствие) + md_events_total с РАЗЛИЧИМЫМИ
+/// venue/symbol/kind (мульти-вендор/символ/kind ловит коллапс любой размерности; C-014 re-audit #3).
 #[tokio::test]
 async fn writer_emits_journal_and_md_metrics() {
     let dir = tempfile::tempdir().unwrap();
@@ -142,13 +140,26 @@ async fn writer_emits_journal_and_md_metrics() {
     let metrics = Arc::new(Metrics::new());
 
     let (tx, rx) = tokio::sync::mpsc::channel::<EventKind>(500);
-    // 30 L2Snapshot + 10 Trade (ДВА разных MD-kind) + 20 Heartbeat (Sys). Два kind ловят «kind не
-    // отражает тип payload» (C-014 re-audit #2): счётчики per-kind обязаны совпасть с числом СВОЕГО типа.
+    // Матрица, где КАЖДАЯ размерность различима уникальным счётчиком (коллапс любой → неверное число):
     for _ in 0..30 {
-        tx.send(l2_event("BTCUSDT", 5, 5)).await.unwrap();
+        tx.send(l2_event(Venue::Binance, "BTCUSDT", 5, 5))
+            .await
+            .unwrap(); // baseline
+    }
+    for _ in 0..5 {
+        tx.send(l2_event(Venue::BinanceFutures, "BTCUSDT", 5, 5))
+            .await
+            .unwrap(); // venue различает
+    }
+    for _ in 0..7 {
+        tx.send(l2_event(Venue::Binance, "ETHUSDT", 5, 5))
+            .await
+            .unwrap(); // symbol различает
     }
     for _ in 0..10 {
-        tx.send(trade_event("BTCUSDT")).await.unwrap();
+        tx.send(trade_event(Venue::Binance, "BTCUSDT"))
+            .await
+            .unwrap(); // kind различает
     }
     for _ in 0..20 {
         tx.send(EventKind::Sys(SysEvent::Heartbeat)).await.unwrap();
@@ -169,110 +180,122 @@ async fn writer_emits_journal_and_md_metrics() {
     .unwrap();
 
     let text = metrics.prometheus_text();
-    // Безлейбловые journal-метрики: SAMPLE-серия обязана присутствовать.
-    for m in [
-        "journal_bytes_written_total",
-        "journal_seq_current",
-        "journal_segment_index",
-        "journal_disk_free_bytes",
-    ] {
-        assert!(
-            has_sample(&text, m),
-            "после прогона writer'а метрика `{m}` НЕ несёт SAMPLE-серию (только # HELP/# TYPE) — \
-             продюсер не подключён (TD-027: объявлена, но мертва). OPS-I-10 нарушен"
-        );
-    }
-    // Labeled md-метрики: размерность ОБЯЗАНА присутствовать (C-014 gap-1) — иначе схлопнутый
-    // `md_events_total 30` прошёл бы, а venue/symbol/kind не различить (TD-014 не локализуем).
+    // journal_segment_index может быть 0 легитимно (первый сегмент) → только присутствие серии.
     assert!(
-        has_labeled_sample(&text, "md_events_total", &["venue", "symbol", "kind"]),
-        "md_events_total НЕ несёт labeled SAMPLE `{{venue,symbol,kind}}` после 30 Md-событий — либо \
-         не эмитится (TD-027), либо размерность схлопнута (C-009 M2): класс событий не локализовать"
+        has_sample(&text, "journal_segment_index"),
+        "journal_segment_index НЕ несёт SAMPLE — продюсер не подключён (TD-027)"
     );
-    assert!(
-        has_labeled_sample(&text, "md_event_age_ms", &["venue"]),
-        "md_event_age_ms НЕ несёт labeled SAMPLE `{{venue}}` — тишина потока (OPS-I-8) не различима по venue"
-    );
+    // DEAD-ZERO ловим (C-014 re-audit #3): steady-величины обязаны быть > 0.
     assert!(
         sample_value(&text, "journal_bytes_written_total").unwrap_or(0) > 0,
-        "journal_bytes_written_total == 0 после 50 append'ов — writer пишет, а счётчик байт мёртв \
-         (ровно TD-011-метрика «жив, но не пишет» неработоспособна)"
+        "journal_bytes_written_total == 0 после 72 append'ов — счётчик байт мёртв (TD-011)"
     );
-    // KIND-aware ТОЧНЫЕ счётчики (C-014 re-audit #2): kind ОБЯЗАН отражать ТИП payload. Импл,
-    // помечающий L2Snapshot как kind="trade" (или любой неверный kind), даёт {kind=l2snapshot}
-    // отсутствующим/неверным → TD-014 «пропал класс событий» невозможно детектировать.
+    assert!(
+        sample_value(&text, "journal_seq_current").unwrap_or(0) > 0,
+        "journal_seq_current == 0 после 72 append'ов — seq-гейдж мёртв/константа (dead-zero, C-014 re-audit #3)"
+    );
+    assert!(
+        sample_value(&text, "journal_disk_free_bytes").unwrap_or(0) > 0,
+        "journal_disk_free_bytes == 0 — свободное место на диске не измеряется (dead-zero; TD-006 P0-метрика мертва)"
+    );
+    // md_events_total: КАЖДАЯ размерность различима (коллапс venue/symbol/kind → неверное число).
+    let b = vlabel(Venue::Binance);
+    let bf = vlabel(Venue::BinanceFutures);
     assert_eq!(
         labeled_sample_value(
             &text,
             "md_events_total",
-            &[("venue", "binance"), ("symbol", "BTCUSDT"), ("kind", "l2snapshot")]
+            &[("venue", b), ("symbol", "BTCUSDT"), ("kind", "l2snapshot")]
         ),
         Some(30),
-        "md_events_total{{kind=l2snapshot}} != 30 после 30 L2Snapshot — kind не отражает тип payload \
-         (напр. L2 помечен как trade) → пропажа L2-потока (TD-014) незаметна. Канон: L2Snapshot→l2snapshot"
+        "md_events_total{{binance,BTCUSDT,l2snapshot}} != 30 — baseline не эмитится/схлопнут"
+    );
+    assert_eq!(
+        labeled_sample_value(&text, "md_events_total", &[("venue", bf), ("symbol", "BTCUSDT"), ("kind", "l2snapshot")]),
+        Some(5),
+        "md_events_total{{binance_futures,...}} != 5 — VENUE-размерность схлопнута (все venue=binance, C-014 re-audit #3)"
     );
     assert_eq!(
         labeled_sample_value(
             &text,
             "md_events_total",
-            &[("venue", "binance"), ("symbol", "BTCUSDT"), ("kind", "trade")]
+            &[("venue", b), ("symbol", "ETHUSDT"), ("kind", "l2snapshot")]
+        ),
+        Some(7),
+        "md_events_total{{...,ETHUSDT,...}} != 7 — SYMBOL-размерность схлопнута"
+    );
+    assert_eq!(
+        labeled_sample_value(
+            &text,
+            "md_events_total",
+            &[("venue", b), ("symbol", "BTCUSDT"), ("kind", "trade")]
         ),
         Some(10),
-        "md_events_total{{kind=trade}} != 10 после 10 Trade — kind-размерность не различает классы \
-         событий (trade слит с l2snapshot или пуст). Канон: Trade→trade"
+        "md_events_total{{...,kind=trade}} != 10 — KIND не отражает тип payload (TD-014 незаметен)"
     );
 }
 
-/// (2, ПАДАЕТ против registry-only И против helper-only-non-live) Гоняем ЖИВОЙ feeder-loop
-/// `run_books_feeder` — ТОТ ЖЕ, что спавнит `main` (C-014 gap-2: leaf-хелпер, который тест зовёт
-/// напрямую, а main НЕ вызывает, — это рекурсия TD-027). Loop читает Md из канала, применяет к книге
-/// и эмитит `book_levels{venue,symbol,side}`. Тест шлёт L2Snapshot, закрывает канал → loop
-/// обрабатывает и выходит → ассерт labeled SAMPLE с реальной глубиной.
+/// (2) md_event_age_ms через ДЕТЕРМИНИРОВАННЫЙ sampler-сейм `sample_md_age(metrics, venue, now, last)`
+/// → gauge = `now - last` (возраст с последнего приёма; OPS-I-8 silence растёт при тишине). Ловит
+/// dead-zero (константа 0) И venue-коллапс: per-venue РАЗНЫЕ значения.
+#[tokio::test]
+async fn md_age_sampler_emits_real_age_per_venue() {
+    let metrics = Metrics::new();
+    // now=5000; binance приняли на 4800 (age 200), binance_futures на 4000 (age 1000).
+    sample_md_age(&metrics, vlabel(Venue::Binance), 5_000, 4_800);
+    sample_md_age(&metrics, vlabel(Venue::BinanceFutures), 5_000, 4_000);
+
+    let text = metrics.prometheus_text();
+    assert!(
+        has_labeled_sample(&text, "md_event_age_ms", &["venue"]),
+        "md_event_age_ms НЕ несёт labeled SAMPLE `{{venue}}` — silence-метрика (OPS-I-8) мертва"
+    );
+    assert_eq!(
+        labeled_sample_value(&text, "md_event_age_ms", &[("venue", vlabel(Venue::Binance))]),
+        Some(200),
+        "md_event_age_ms{{binance}} != 200 (now-last=5000-4800) — dead-zero/константа или не считает возраст"
+    );
+    assert_eq!(
+        labeled_sample_value(&text, "md_event_age_ms", &[("venue", vlabel(Venue::BinanceFutures))]),
+        Some(1000),
+        "md_event_age_ms{{binance_futures}} != 1000 — VENUE-коллапс (перезаписан binance) или dead-zero"
+    );
+}
+
+/// (3) ЖИВОЙ feeder-loop `run_books_feeder` (тот же, что спавнит main — НЕ leaf; C-014 gap-2) на
+/// ДВУХ площадках с АСИММЕТРИЧНОЙ глубиной → `book_levels{venue,symbol,side}` per-серия точные значения
+/// (ловит side-collapse И venue-collapse).
 #[tokio::test]
 async fn live_feeder_loop_emits_book_levels() {
     let books: ReconBooks = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
     let metrics = Arc::new(Metrics::new());
 
     let (tx, rx) = tokio::sync::mpsc::channel::<EventKind>(16);
-    // АСИММЕТРИЯ (C-014 re-audit): 5 бидов, 3 аска → side-collapse (обе стороны как side="bid" или
-    // копия одной глубины) даст неверное значение хотя бы одной стороне.
-    tx.send(l2_event("BTCUSDT", 5, 3)).await.unwrap();
-    drop(tx); // закрываем канал → run_books_feeder дообработает и выйдет
+    tx.send(l2_event(Venue::Binance, "BTCUSDT", 5, 3))
+        .await
+        .unwrap(); // bid=5 ask=3
+    tx.send(l2_event(Venue::BinanceFutures, "BTCUSDT", 4, 2))
+        .await
+        .unwrap(); // bid=4 ask=2
+    drop(tx);
 
-    // Гоняем САМ live-loop (не leaf emit-хелпер): его же спавнит main (verify live-wiring канарейка).
     run_books_feeder(rx, Arc::clone(&books), Arc::clone(&metrics)).await;
 
     let text = metrics.prometheus_text();
-    assert!(
-        has_labeled_sample(&text, "book_levels", &["venue", "symbol", "side"]),
-        "book_levels НЕ несёт labeled SAMPLE `{{venue,symbol,side}}` после прогона live-feeder — либо \
-         feeder-loop не эмитит (TD-027), либо размерность схлопнута (C-009 M2). TD-016-метрика мертва"
-    );
-    // ОБЕ стороны с ТОЧНЫМИ значениями (label-aware): ловит side-collapse и копирование глубины.
-    assert_eq!(
-        labeled_sample_value(
-            &text,
-            "book_levels",
-            &[("venue", "binance"), ("symbol", "BTCUSDT"), ("side", "bid")]
-        ),
-        Some(5),
-        "book_levels{{side=bid}} != 5 — bid-глубина не измеряется (или side-collapse: обе стороны не bid)"
-    );
-    assert_eq!(
-        labeled_sample_value(
-            &text,
-            "book_levels",
-            &[("venue", "binance"), ("symbol", "BTCUSDT"), ("side", "ask")]
-        ),
-        Some(3),
-        "book_levels{{side=ask}} != 3 — ask-сторона отсутствует/схлопнута в bid (5) или скопирована — \
-         глубина одной стороны не различима (side-размерность бесполезна)"
-    );
+    let b = vlabel(Venue::Binance);
+    let bf = vlabel(Venue::BinanceFutures);
+    for (venue, side, want) in [(b, "bid", 5), (b, "ask", 3), (bf, "bid", 4), (bf, "ask", 2)] {
+        assert_eq!(
+            labeled_sample_value(&text, "book_levels", &[("venue", venue), ("symbol", "BTCUSDT"), ("side", side)]),
+            Some(want),
+            "book_levels{{venue={venue},side={side}}} != {want} — side-collapse или venue-collapse \
+             (глубина одной стороны/площадки не различима — TD-016-метрика бесполезна)"
+        );
+    }
 }
 
-/// (3, ПАДАЕТ против registry-only) RSS-sampler: sample_rss эмитит `recorder_rss_anon_bytes` SAMPLE
-/// (TD-016 лик памяти). Значение из `/proc/self/status` RssAnon (Linux CI) — присутствие серии
-/// критично (анти-TD-027); точное значение проверяет §8 на проде (non-zero тренд).
+/// (4) RSS-sampler: `sample_rss` эмитит `recorder_rss_anon_bytes` SAMPLE (TD-016). Присутствие
+/// критично (анти-TD-027); точное значение — §8 на проде (non-zero тренд).
 #[tokio::test]
 async fn rss_sampler_emits_anon_bytes() {
     let metrics = Metrics::new();
@@ -280,7 +303,6 @@ async fn rss_sampler_emits_anon_bytes() {
     let text = metrics.prometheus_text();
     assert!(
         has_sample(&text, "recorder_rss_anon_bytes"),
-        "recorder_rss_anon_bytes НЕ несёт SAMPLE после sample_rss — TD-016-метрика (лик памяти) мертва; \
-         sampler не подключён к /proc/self/status RssAnon"
+        "recorder_rss_anon_bytes НЕ несёт SAMPLE после sample_rss — TD-016-метрика мертва (sampler не подключён)"
     );
 }

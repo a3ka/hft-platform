@@ -145,6 +145,7 @@ if [ -f "${MAIN}" ]; then
   wiring_miss=""
   grep -q "run_books_feeder" "${MAIN}" || wiring_miss="${wiring_miss} run_books_feeder(book_levels)"
   grep -q "sample_rss" "${MAIN}" || wiring_miss="${wiring_miss} sample_rss(recorder_rss_anon_bytes)"
+  grep -q "sample_md_age" "${MAIN}" || wiring_miss="${wiring_miss} sample_md_age(md_event_age_ms)"
   [ -z "${wiring_miss}" ] && pass "OPS-I-10 live-wiring: отдельные продюсеры (feeder/sampler) вызваны в живом main" \
     || fail "OPS-I-10 продюсеры НЕ вызваны в живом main:${wiring_miss} — helper-only non-live (TD-027 рекурсия, C-014 gap-2)"
 else
