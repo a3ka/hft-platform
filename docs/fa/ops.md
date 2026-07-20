@@ -72,9 +72,9 @@ healthcheck проверяет, что процесс жив, а не что о�
 
 | Метрика | Продюсер-сейм | Класс |
 |---|---|---|
-| `journal_bytes_written_total`, `journal_seq_current`, `journal_segment_index`, `journal_disk_free_bytes` | `recorder::run_writer` (после append/flush — данные уже считаются для heartbeat) | steady |
+| `journal_frames_written_total`, `journal_seq_current`, `journal_segment_index`, `journal_disk_free_bytes` | `recorder::run_writer` (после append/flush — данные уже считаются для heartbeat) | steady |
 | `journal_write_errors_total` | `run_writer` (ветка ошибки append) | event |
-| `journal_seq_gaps_total` | `run_writer`/journal recovery (разрыв seq при open/append) | event |
+| `journal_seq_gaps_total` | **READ/REPLAY-сторона (restore-drill task 3 / replay-verify)** — НЕ writer (NOTE-2 TD-027: writer-seq монотонен ПО ПОСТРОЕНИЮ, разрыв на write невозможен; gap детектируется только при ЧТЕНИИ сегментов через границы) | read-side (deferred → task 3) |
 | `md_events_total{venue,symbol,kind}`, `md_event_age_ms{venue}` | `run_writer` (классификация `EventKind::Md` при append; age — wall-clock, НЕ в журнал) | steady |
 | `venue_ws_reconnects_total{venue}` | recorder-супервизор (reconnect/backoff-цикл) ИЛИ venue-`run` | event |
 | `venue_http_status_total{venue,code}` | venue recon REST (УЖЕ wired) | steady |
@@ -86,9 +86,9 @@ healthcheck проверяет, что процесс жив, а не что о�
 | Метрика | Тип | Зачем (какой инцидент ловит) |
 |---|---|---|
 | `recorder_rss_anon_bytes` | gauge | TD-016 (рост кучи) — тренд. **ИСТОЧНИК ФИКСИРОВАН: `RssAnon` из `/proc/<pid>/status`** (НЕ `docker stats` и НЕ cgroup `memory.current` — они включают page cache файла журнала ⇒ ложный «лик», TD-021). Мерит анонимную кучу процесса, а НЕ page cache и НЕ рост книги (это `book_levels`) |
-| `journal_bytes_written_total` | counter | «пишем ли вообще» (TD-011: heartbeat был, данных не было) |
+| `journal_frames_written_total` | counter | «пишем ли вообще» (TD-011: heartbeat был, данных не было). **Считает КАДРЫ (записи), НЕ байты (NOTE-1 TD-027: имя честное — счётчик инкрементируется на каждый append; для TD-011-liveness достаточно «растёт ли»). Байтовый объём — вне scope; при нужде — отдельная метрика с длиной кадра из `Journal::append`** |
 | `journal_seq_current` | gauge | монотонность/остановка потока |
-| `journal_seq_gaps_total` | counter | пропуски в `seq` (дырка в потоке); база P1-правила «gap-доля за сутки» (ratio считается в alert-правиле) |
+| `journal_seq_gaps_total` | counter | пропуски в `seq` (дырка в потоке); база P1-правила «gap-доля за сутки». **NOTE-2 (TD-027): продюсер — READ/REPLAY (restore-drill task 3), НЕ writer (writer-seq монотонен → на write разрыв невозможен). До task 3 легитимно 0; OPS-GAP срабатывает на gap, найденный дриллом/replay** |
 | `journal_segment_index` | gauge | ротация работает |
 | `journal_disk_free_bytes` | gauge | fail-closed по диску (E4) — предупреждать ДО стопа |
 | `journal_write_errors_total` | counter | RK-I-5 (отказ записи = halt) |
@@ -434,7 +434,7 @@ TD-013 родился ровно на этом пути: REST-ресинк бе�
 
 | ID инцидента | Что было | Правило (класс) | Метрика |
 |---|---|---|---|
-| `TD-011` | recorder жив, но НЕ пишет | запись остановилась (P0) | `journal_bytes_written_total` (нет роста) |
+| `TD-011` | recorder жив, но НЕ пишет | запись остановилась (P0) | `journal_frames_written_total` (нет роста) |
 | `TD-013` | 133×418 за 25 с, IP-бан | rate-limit-ответы (P1) | `venue_http_status_total{code=418\|429}` |
 | `TD-014` | 0 Funding при «успешном» деплое | класс событий пропал (P1) | `md_events_total{kind}` (нулевая производная) |
 | `TD-016` | рост кучи | `RssAnon`-тренд (P1) | `recorder_rss_anon_bytes` + `book_levels` |
@@ -443,7 +443,7 @@ TD-013 родился ровно на этом пути: REST-ресинк бе�
 | `OPS-BKP` | бэкап не восстанавливается | restore-drill провален (P0) | `backup_restore_drill_ok` |
 | `OPS-SILENCE` | жив, но поток замолчал | тишина > 5 мин (P1) | `md_event_age_ms{venue}` |
 | `OPS-RESYNC` | скрытая проблема книги/фида | частые ресинки (P1) | `book_resync_total{venue,symbol}` |
-| `OPS-GAP` | дырки в потоке | gap-доля за сутки > 1% (P1) | `journal_seq_gaps_total` |
+| `OPS-GAP` | дырки в потоке (обнаруживаются при ЧТЕНИИ/replay, NOTE-2) | gap-доля за сутки > 1% (P1) | `journal_seq_gaps_total` (продюсер — restore-drill/replay, task 3; writer-seq монотонен) |
 
 **Правило паритета (OPS-I-5; урок hft-core-rs, усилено C-006 M7):** метрика без алерта бесполезна,
 алерт без метрики невозможен, **и класс инцидента без правила — тоже дыра**. CI проверяет В ОБЕ
