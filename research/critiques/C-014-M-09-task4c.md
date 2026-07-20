@@ -427,3 +427,134 @@ Required architect repair:
 The `7da7444` repair commit touched only `crates/recorder/tests/red_metrics_emission.rs`. Scope is clean.
 
 All temporary prototypes and mutations were reverted before this re-audit #2 section was appended. Final pre-verdict worktree status was clean except `research/critiques/C-014-M-09-task4c.md`.
+
+---
+
+## Re-audit #3 — 2026-07-20T12:13:10Z
+
+**Audited repair head:** `4979dbd` — `test(M-09): C-014 re-audit #2 repair — kind-aware счётчики + канон kind-строки`
+**Repair commits:** `4979dbd` over re-audit #2 verdict `5dfb375`
+**Local audit worktree:** `/tmp/hft-critic-m09-t4c-r4` detached at `origin/feat/M-09-task4c-metric-emission`
+
+### Re-audit #3 verdict
+
+**REJECT remains.**
+
+The repair closes the wrong-kind blocker from re-audit #2. The updated writer oracle now requires exact per-kind counters: `md_events_total{kind="l2snapshot"} == 30` and `md_events_total{kind="trade"} == 10`. However, fifth false-greens remain in the same "declared/labeled but semantically wrong" class:
+
+1. all venue labels can collapse to `venue="binance"` and the suite still passes;
+2. `journal_seq_current`, `journal_disk_free_bytes`, and `md_event_age_ms` can emit dead zero values and the suite still passes.
+
+### What is fixed
+
+**Wrong `kind` value: CLOSED.**
+
+The repair added a second MD payload (`Trade`), canonical kind strings in the test comments, and exact label-aware assertions for both L2 and trade series (`crates/recorder/tests/red_metrics_emission.rs:118-134`, `:144-152`, `:201-223`). The milestone also documents the canonical `kind` label values at `milestones/M-09-data-safety-net.md:57-64`.
+
+Temporary mutation: classify `MdPayload::L2Snapshot` as `kind="trade"` while still incrementing by `1`.
+
+```text
+cargo test -p recorder --test red_metrics_emission writer_emits_journal_and_md_metrics; echo exit=$?
+test writer_emits_journal_and_md_metrics ... FAILED
+md_events_total{kind=l2snapshot} != 30 ...
+left: None
+right: Some(30)
+exit=101
+```
+
+**Correct prototype remains reachable.**
+
+With a temporary correct implementation (`L2Snapshot -> l2snapshot`, `Trade -> trade`, `book_levels` bid/ask exact values, feeder/sampler wired in `main`):
+
+```text
+cargo test -p recorder --test red_metrics_emission; echo exit=$?
+running 3 tests
+test rss_sampler_emits_anon_bytes ... ok
+test live_feeder_loop_emits_book_levels ... ok
+test writer_emits_journal_and_md_metrics ... ok
+exit=0
+
+bash scripts/verify_M-09.sh; echo exit=$?
+PASS  T4C OPS-I-10 живая ЭМИССИЯ метрик (...)
+PASS  OPS-I-10 live-wiring: отдельные продюсеры (feeder/sampler) вызваны в живом main
+VERDICT: PASS
+exit=0
+
+cargo test -p recorder --test red_rss_bounded; echo exit=$?
+test e7_writer_loop_memory_is_bounded_and_event_count_independent ... ok
+exit=0
+```
+
+### Remaining blocker A — `venue` label collapse
+
+Severity: BLOCKER.
+
+Temporary mutation: both writer and book-level producer mapped every `Venue` to `venue="binance"`.
+
+```text
+fn venue_label(_v: Venue) -> &'static str { "binance" }
+```
+
+Result:
+
+```text
+cargo test -p recorder --test red_metrics_emission; echo exit=$?
+running 3 tests ... ok
+exit=0
+
+bash scripts/verify_M-09.sh; echo exit=$?
+PASS  T4C OPS-I-10 живая ЭМИССИЯ метрик (...)
+PASS  OPS-I-10 live-wiring: отдельные продюсеры (feeder/sampler) вызваны в живом main
+VERDICT: PASS
+exit=0
+```
+
+This is materially the same class as wrong `kind`: the metric is live and labeled, but the label value hides which producer/venue failed. `md_events_total{venue,symbol,kind}`, `md_event_age_ms{venue}`, and `book_levels{venue,symbol,side}` all rely on `venue` for TD-014/OPS-SILENCE/TD-016 localization. The current fixtures only use `Venue::Binance`, so they cannot detect venue collapse.
+
+Required repair:
+
+1. Add at least one non-Binance fixture to the writer test, preferably `Venue::Hyperliquid` or `Venue::BinanceFutures`, and assert exact `md_events_total{venue=...,symbol=...,kind=...}` values for both venues.
+2. Add at least one non-Binance `L2Snapshot` through `run_books_feeder` and assert exact `book_levels{venue=...,symbol=...,side=bid/ask}` for that venue.
+3. Assert `md_event_age_ms` has a labeled sample for every venue fed in the writer test, not only `venue="binance"`.
+
+### Remaining blocker B — dead zero values for steady writer gauges
+
+Severity: BLOCKER.
+
+Temporary mutation: keep samples present, but set:
+
+```text
+journal_seq_current = 0
+journal_disk_free_bytes = 0
+md_event_age_ms = 0
+```
+
+Results:
+
+```text
+cargo test -p recorder --test red_metrics_emission writer_emits_journal_and_md_metrics; echo exit=$?
+test writer_emits_journal_and_md_metrics ... ok
+exit=0
+
+bash scripts/verify_M-09.sh; echo exit=$?
+PASS  T4C OPS-I-10 живая ЭМИССИЯ метрик (...)
+VERDICT: PASS
+exit=0
+```
+
+`journal_segment_index == 0` is legitimate on the first segment, so sample-presence is enough there. But `journal_seq_current == 0` after the writer drains 60 events is not legitimate, and `journal_disk_free_bytes == 0` on the tempdir means the disk-guard alert surface is dead by value while the gate is green. The milestone text says `journal_seq_current` is expected `>0`, and §8 requires steady metrics non-zero; the RED should pin that.
+
+`md_event_age_ms == 0` is also suspicious for this fixture because every MD event uses `ts_exch_ms = 1`; a real age calculation should be positive. More importantly, a permanently zero age gauge blinds OPS-I-8. If architect wants task 4C to remain "emission only" for this metric, document that value semantics are deferred; otherwise pin `md_event_age_ms{venue="binance"} > 0` under the current fixture.
+
+Required repair:
+
+1. Assert `journal_seq_current >= 60` or exact expected next sequence after the test batch.
+2. Assert `journal_disk_free_bytes > 0` in the tempdir-backed writer test.
+3. Either assert `md_event_age_ms{venue=...} > 0` for the synthetic `ts_exch_ms = 1` events, or explicitly carve value semantics for age out of task 4C and leave it to a separate OPS-I-8 producer/value oracle.
+4. Keep `journal_segment_index` as sample-only unless the fixture forces rotation; `0` is valid for the first segment.
+
+### Scope / cleanup
+
+The `4979dbd` repair commit touched only `crates/recorder/tests/red_metrics_emission.rs` and `milestones/M-09-data-safety-net.md`. Scope is clean.
+
+All temporary prototypes and mutations were reverted before this re-audit #3 section was appended. Final pre-verdict worktree status was clean except `research/critiques/C-014-M-09-task4c.md`.
