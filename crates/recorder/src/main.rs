@@ -16,7 +16,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use book::OrderBook;
 use contracts::{EventKind, SysEvent, Venue};
@@ -24,7 +24,7 @@ use journal::{Journal, WriterConfig};
 use ops::metrics::Metrics;
 use ops::recon::{ReconDetector, ReconThresholds};
 use ops::sink::handle_recon_snapshot;
-use recorder::recon_loop::{apply_md_to_books, spawn_recon_isolated};
+use recorder::recon_loop::spawn_recon_isolated;
 use tokio::sync::{mpsc, Mutex};
 
 fn env_csv(key: &str, default: &[&str]) -> Vec<String> {
@@ -37,11 +37,24 @@ fn env_csv(key: &str, default: &[&str]) -> Vec<String> {
 /// Supervisor: гоняет venue::run в цикле с exp-backoff (fail-closed к «нет данных», не паника
 /// процесса). ConnDown фиксируется в журнале через канал (единый путь к писателю). ConnUp
 /// эмитит сам venue::run при успешном коннекте.
-async fn supervise<F, Fut>(name: &'static str, venue: Venue, tx: mpsc::Sender<EventKind>, run: F)
-where
+///
+/// **M-09 task 4C:** на каждой итерации (сбой или exit) — `venue_ws_reconnects_total{venue}`++
+/// (event-метрика на реальный триггер, §8-видимый). OPS-I-7: lock-free атомик-инкремент.
+async fn supervise<F, Fut>(
+    name: &'static str,
+    venue: Venue,
+    tx: mpsc::Sender<EventKind>,
+    metrics: Arc<Metrics>,
+    run: F,
+) where
     F: Fn(mpsc::Sender<EventKind>) -> Fut,
     Fut: Future<Output = anyhow::Result<()>>,
 {
+    let venue_lbl = match venue {
+        Venue::Binance => "binance",
+        Venue::BinanceFutures => "binance_futures",
+        Venue::Hyperliquid => "hyperliquid",
+    };
     let mut backoff = 1u64;
     loop {
         tracing::info!(venue = name, "venue connect");
@@ -49,6 +62,8 @@ where
             Ok(()) => tracing::warn!(venue = name, "venue run exited — reconnect"),
             Err(e) => tracing::error!(venue = name, error = %e, "venue run error — reconnect"),
         }
+        // reconnect-event: counter++ рядом с триггером (OPS-I-7, lock-free).
+        metrics.inc_counter("venue_ws_reconnects_total", &[("venue", venue_lbl)], 1);
         let _ = tx.send(EventKind::Sys(SysEvent::ConnDown(venue))).await;
         tokio::time::sleep(Duration::from_secs(backoff)).await;
         backoff = (backoff * 2).min(30);
@@ -227,6 +242,52 @@ async fn main() -> anyhow::Result<()> {
     // НЕ затронуты (serve живёт в отдельном таске).
     spawn_metrics_server(Arc::clone(&metrics)).await;
 
+    // M-09 task 4C: last_receipt per venue (для `md_event_age_ms`). Обновляется в fanout при
+    // каждом `EventKind::Md`; читается sampler-таском (1 Гц). `Mutex` — короткий (insert на
+    // каждое MD-событие), `HashMap` — по 3 ключам (venue). Не в журнал (OPS-I-6): это
+    // runtime-состояние, не доменный факт.
+    let last_receipt: Arc<Mutex<std::collections::HashMap<Venue, i64>>> =
+        Arc::new(Mutex::new(std::collections::HashMap::new()));
+
+    // M-09 task 4C: SAMPLER-ТАСК (1 Гц) — эмитит `recorder_rss_anon_bytes` (RssAnon из
+    // /proc/self/status) + `md_event_age_ms{venue}` (now − last_receipt[venue]). Не в горячем
+    // пути: /proc/self/status — раз в секунду, Mutex<HashMap> — раз в секунду. Journal-write
+    // путь НЕ затронут (только метрики, OPS-I-6). Сам `last_receipt` строится в fanout-тасках
+    // (см. ниже); sampler только ЧИТАЕТ.
+    {
+        let metrics_sampler = Arc::clone(&metrics);
+        let last_receipt_sampler = Arc::clone(&last_receipt);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(1));
+            // `MissedTickBehavior::Skip` — если tick пропущен, НЕ догоняем пачкой (CDS: на старте
+            // под нагрузкой возможен drift, но важнее не плодить лавину lock-ов).
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                // (a) RssAnon — через `metric_emit::sample_rss` (lock-free атомик-эмиссия).
+                recorder::metric_emit::sample_rss(&metrics_sampler);
+                // (b) per-venue md_event_age_ms.
+                let now_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
+                // Снимок last_receipt (lock короткий, без await внутри map).
+                let snapshot: Vec<(Venue, i64)> = {
+                    let map = last_receipt_sampler.lock().await;
+                    map.iter().map(|(v, t)| (*v, *t)).collect()
+                };
+                for (venue, last_ms) in snapshot {
+                    let lbl = match venue {
+                        Venue::Binance => "binance",
+                        Venue::BinanceFutures => "binance_futures",
+                        Venue::Hyperliquid => "hyperliquid",
+                    };
+                    recorder::metric_emit::sample_md_age(&metrics_sampler, lbl, now_ms, last_ms);
+                }
+            }
+        });
+    }
+
     // M-09: live-книга для recon. Заполняется BOOKS-FEEDER'ом из `MdEvent::L2Snapshot`-потока
     // через fanout-tap ниже (см. books-feeder-таск). До первого L2Snapshot — пустая;
     // orchestrator использует дефолт `OrderBook::new()` и в §8 это ВРЕМЕННО даёт ложный флуд
@@ -254,22 +315,19 @@ async fn main() -> anyhow::Result<()> {
         std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send>>;
     type VenueRunFn = Box<dyn Fn(mpsc::Sender<EventKind>) -> VenueRunFut + Send + Sync>;
 
-    // M-09: BOOKS-FEEDER (MD-only). Читает md_rx, применяет L2Snapshot к `books`. ИЗОЛИРОВАННЫЙ
-    // таск (паника в feeder не роняет writer). Тот же RECON_LOOP механизм изоляции, что у fetcher'а
-    // и оркестратора (JR-I-1, 24/7).
-    spawn_recon_isolated({
-        let books_for_feeder = Arc::clone(&books);
-        move || async move {
-            let mut md_rx = md_rx;
-            while let Some(ev) = md_rx.recv().await {
-                apply_md_to_books(&books_for_feeder, &ev).await;
-            }
-        }
+    // M-09 task 4C: BOOKS-FEEDER (живой loop, эмитит `book_levels`). ВЫНЕСЕН в `recorder::run_books_feeder`
+    // (тот же, что `main` спавнит — не leaf, C-014 gap-2 live-wiring канарейка). Books +
+    // метрики + Rx-канал — всё что нужно; last_receipt НЕ здесь (см. fanout ниже).
+    let books_for_feeder: BooksLive = Arc::clone(&books);
+    let metrics_for_feeder = Arc::clone(&metrics);
+    tokio::spawn(async move {
+        recorder::run_books_feeder(md_rx, books_for_feeder, metrics_for_feeder).await;
     });
 
     for venue in recorder::default_venues() {
         let tx_v = tx.clone();
         let md_tx_v = md_tx.clone();
+        let metrics_v = Arc::clone(&metrics);
         // M-09: per-venue FANOUT. Venue шлёт `EventKind` в `fanout_tx`; fanout-таск форвардит
         // (a) в writer (`tx_v`) с backpressure (`send().await` — путь записи НЕ теряет события);
         // (b) в books-feeder (`md_tx_v`) best-effort (`try_send` — при переполнении дроп, книги
@@ -277,6 +335,10 @@ async fn main() -> anyhow::Result<()> {
         //     неизбежен (mpsc::Sender — exclusive owner); для L2Snapshot это клон `Vec<Level>`,
         //     на cadence 100ms с ~100 уровнями — десятки мкс, не hot-path проблема. journal-write
         //     путь и order-путь НЕ затронуты (writer-канал сохраняет свою backpressure-семантику).
+        //
+        // M-09 task 4C: fanout ТАКЖЕ обновляет `last_receipt[venue]` для каждого `EventKind::Md`
+        // (для `md_event_age_ms` sampler-таска). Mutex короткий (insert), не в горячем пути.
+        let last_receipt_v = Arc::clone(&last_receipt);
         let (fanout_tx, mut fanout_rx) = mpsc::channel::<EventKind>(50_000);
         tokio::spawn(async move {
             while let Some(ev) = fanout_rx.recv().await {
@@ -289,7 +351,17 @@ async fn main() -> anyhow::Result<()> {
                 }
                 // (b) books-feeder: best-effort. Дроп при переполнении — следующий L2Snapshot
                 //     восполнит stale-состояние; recon пропустит ОДИН цикл сравнения, не катастрофа.
-                let _ = md_tx_v.try_send(ev);
+                let _ = md_tx_v.try_send(ev.clone());
+                // (c) M-09 task 4C: last_receipt для sampler-таска `md_event_age_ms`.
+                //     wall_ms берём тут (lock-окно — один insert; не держим lock через await).
+                if let EventKind::Md(md) = &ev {
+                    let now_ms = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_millis() as i64)
+                        .unwrap_or(0);
+                    let mut map = last_receipt_v.lock().await;
+                    map.insert(md.venue, now_ms);
+                }
             }
         });
         let (name, run_fn): (&'static str, VenueRunFn) = match venue {
@@ -316,7 +388,7 @@ async fn main() -> anyhow::Result<()> {
             }
         };
         tokio::spawn(async move {
-            supervise(name, venue, fanout_tx, run_fn).await;
+            supervise(name, venue, fanout_tx, metrics_v, run_fn).await;
         });
 
         // M-09 task 2: per-venue recon wiring (fetcher + orchestrator). Изолированно через
@@ -358,7 +430,14 @@ async fn main() -> anyhow::Result<()> {
     let journal = Journal::open_with(&dir, cfg)?;
     let hb_path = dir.join("recorder.heartbeat");
 
-    recorder::run_writer(rx, journal, hb_path, shutdown_signal()).await?;
+    recorder::run_writer(
+        rx,
+        journal,
+        hb_path,
+        Arc::clone(&metrics),
+        shutdown_signal(),
+    )
+    .await?;
     Ok(())
 }
 
