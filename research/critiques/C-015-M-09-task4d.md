@@ -137,3 +137,52 @@ The verify emission canary agrees with the intended deferral by classifying `jou
 REJECT until the milestone allowed-path/task-4C producer text is made coherent with NOTE-2.
 
 After that repair, the plan is likely approvable: NOTE-1 rename reachability and anti-placebo are solid, and the NOTE-2 FA contract is honest.
+
+## Re-audit — 2026-07-20T18:19:01Z
+
+Verdict: APPROVE.
+
+Audited repair head: `f7d828a` (`docs(M-09): C-015 repair — seq_gaps убран из run_writer emit-списка (read-side)`). The handoff's `6f9d68e` reference appears stale; the fetched remote head is `f7d828a`.
+
+### Prior blocker
+
+CLOSED. `milestones/M-09-data-safety-net.md:58-60` no longer lists `journal_seq_gaps_total` in the `run_writer` emission set. The writer list is now:
+
+- `journal_frames_written_total`
+- `journal_seq_current`
+- `journal_segment_index`
+- `journal_disk_free_bytes`
+- `journal_write_errors_total` as a writer-event on append error
+- `md_events_total`
+
+This matches FA §3/§7.1 and NOTE-2: writer seq is monotonic by construction, so `journal_seq_gaps_total` is a read/replay-side signal, deferred to task 3 restore-drill/replay. `journal_write_errors_total` correctly remains in the writer path because append failure is a writer-side event.
+
+### Grep audit
+
+`rg -n "journal_seq_gaps_total|journal_frames_written_total|journal_bytes_written_total"` confirms the active plan surfaces are coherent:
+
+- FA §3/§7.1 assigns `journal_seq_gaps_total` to restore-drill/replay, not writer.
+- Milestone task 3 owns the `journal_seq_gaps_total` producer.
+- Milestone task 4D documents NOTE-2 reclassification only.
+- `scripts/verify_M-09.sh` keeps `journal_seq_gaps_total` in `EVENT_OR_ELSEWHERE`, consistent with read-side deferral.
+- `crates/recorder/tests/red_metrics_emission.rs` still expects `journal_frames_written_total`, so NOTE-1 did not regress.
+
+Remaining old-name or pre-implementation references are non-blocking in this plan-time state:
+
+- Current `crates/ops/src`, `crates/recorder/src`, and `deploy/alerts` still use `journal_bytes_written_total` until engine-dev performs the approved rename.
+- `PROJECT-STATE.md` and `TECH-DEBT.md` are reviewer-owned historical/close-out surfaces.
+- Earlier C-015/C-014 critique text is historical audit context.
+
+### NOTE-1 regression check
+
+No regression found. The repair changed only `milestones/M-09-data-safety-net.md`; the already-validated NOTE-1 RED oracle remains intact. Active FA/milestone/test surfaces require `journal_frames_written_total`, while current implementation remains RED on the old name until engine-dev executes the rename.
+
+### Next handoff
+
+APPROVE to engine-dev:
+
+- Rename `journal_bytes_written_total` → `journal_frames_written_total` in `ops::metrics::METRICS`, `ops::alerts`, deploy rule rendering, `recorder::run_writer`, and `metric_emit` comments/helpers.
+- Do not add a writer producer for `journal_seq_gaps_total`.
+- Keep NOTE-2 doc-only for task 4D; the `journal_seq_gaps_total` producer belongs to task 3 restore-drill/replay.
+
+risk-critic N/A: MD-only contract repair and metrics rename plan, no order-egress path.
