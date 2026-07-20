@@ -3,8 +3,32 @@
 > **Reviewer-owned.** Открытые долги/риски, замеченные при работе. Закрытые переносятся вниз.
 
 ## OPEN
-- **TD-027** `ops-metrics-declared-and-cataloged-but-not-wired-to-emission` (найдено reviewer'ом на §8
-  eyes-on M-09 task 4, прод `9a352d6`, 2026-07-19). **Класс TD-011: зелёные гейты (ops 52/52, verify
+- **TD-027** `ops-metrics-declared-and-cataloged-but-not-wired-to-emission` — **✅ CLOSED task 4C
+  (`ac645ac`, reviewer §8 PROD GREEN + APPROVED 2026-07-20).** Фикс: OPS-I-10 «объявлена ⟹ эмитится»
+  — продюсер-сеймы `emit_post_append` (writer), `run_books_feeder`, `sample_rss`/`sample_md_age`
+  (sampler в main), все вызваны в живом `main.rs`. Sacred RED `red_metrics_emission.rs` (6 critic
+  re-audit'ов: label-aware value-ассерты, dead-zero, dimension/value-collapse, kind-aware, RssAnon≠VmRSS)
+  прогоняет РЕАЛЬНЫЕ продюсеры и ассертит SAMPLE (не registry-only). verify-гейт OPS-I-10 (покрытие
+  §3-карты + live-wiring канарейка). **§8 PROD (VPS `ac645ac`) ДОКАЗАЛ живые SAMPLE'ы** (не тестами —
+  scrape /metrics через busybox-sidecar): `journal_bytes_written_total=15245` (TD-011 P0 liveness жив),
+  `journal_seq_current=51923737`, `journal_segment_index=49`, `journal_disk_free_bytes=103.6G`,
+  `md_events_total{venue,symbol,kind}` живой kind-aware (trade 8124/5414, l2snapshot, funding,
+  open_interest — TD-014 жив), `md_event_age_ms{venue}` 83/992/77, `book_levels{venue,symbol,side}`
+  живой per-серия (TD-016 жив), `recorder_rss_anon_bytes=17506304` (RssAnon, TD-016 P1 жив). Гейты
+  reviewer'ом независимо: workspace **282/0**, red_metrics_emission 5/5, clippy 0, fmt clean,
+  `verify_M-09.sh` **PASS (20)**; scope dev-коммита ⊂ `recorder/src/{lib,main,metric_emit}.rs`; critic
+  C-014 re-audit #6 APPROVE. Алерты 3 формирующих инцидентов (TD-011/014/016) теперь ссылаются на
+  ЖИВЫЕ метрики. **Остаточные NOTE (не блокеры, зафиксированы):**
+  (1) `journal_bytes_written_total` считает КАДРЫ, не байты (точный байт-счётчик требует правки sacred
+  `Journal::append`) — для TD-011 P0 «recorder жив, но не пишет» кадры/окно = валидный liveness-сигнал,
+  но имя вводит в заблуждение (переименовать в `_frames_` ИЛИ протянуть длину кадра из append — мелкая
+  follow-up задача architect);
+  (2) `journal_seq_gaps_total` — БЕЗ writer-продюсера (в append-потоке рекордера seq монотонен по
+  построению → естественного gap-триггера нет; классифицирована как event/elsewhere). Правило алерта
+  **OPS-GAP** ссылается на неё → на writer-пути оно НИКОГДА не сработает. Gap реально детектируется
+  ТОЛЬКО на READ/replay-пути (`read_all`/`stream` через границы сегментов) — нужен либо продюсер там,
+  либо пересмотр правила OPS-GAP (зона architect). Ниже — исходное описание (для истории).
+  **Класс TD-011: зелёные гейты (ops 52/52, verify
   PASS, паритет GREEN) маскируют нерабочий предохранитель.** `/metrics` живёт и отдаёт 15 объявленных
   семейств (HELP/TYPE на все), НО живые SAMPLES на проде есть ТОЛЬКО у 2: `book_divergence_bps`
   (sink, 4 серии non-zero) и `venue_http_status_total` (venue recon). Остальные **13 объявлены в

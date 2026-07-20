@@ -730,6 +730,47 @@ Founder ★ 2026-07-18 принял **B2** (`docs/fa/ops.md §4.3.2`): объё�
 - Перенумерация: коллизия `TD-025` (recon-flood vs M-08 disk-migration) разведена — M-08 disk →
   **TD-026**; новый долг эмиссии — **TD-027**.
 
+### task 4C (живая эмиссия метрик, OPS-I-10) — MERGED + В ПРОДЕ (`ac645ac`, reviewer APPROVED + §8 PROD GREEN 2026-07-20); **TD-027 CLOSED — безопасник теперь на ЖИВЫХ метриках**
+Фикс TD-027: контракт **OPS-I-10 «объявлена ⟹ эмитится»**. Цепочка: architect RED `f28e78d` +
+6 critic re-audit'ов C-014 (#1–#6, hardening оракула: label-aware value-ассерты, dead-zero,
+dimension/value-collapse, kind-aware, RssAnon≠VmRSS) → engine-dev impl `ac645ac`. Reviewer ff-merge.
+- `crates/recorder/src/lib.rs` — `emit_post_append(metrics, journal, event)`: ЕДИНАЯ точка эмиссии
+  после КАЖДОГО `append` (`journal_seq_current`/`journal_segment_index`/`journal_disk_free_bytes` gauge,
+  `journal_bytes_written_total`++ , `md_events_total{venue,symbol,kind}`++ для `Md`); `journal_write_
+  errors_total`++ на Err append (event-триггер, все 3 пути). `run_books_feeder` (живой loop) эмитит
+  `book_levels{venue,symbol,side}`. **JR-I-1 append/flush/shutdown семантика НЕ изменена** (добавлена
+  ТОЛЬКО эмиссия — OPS-I-7 lock-free атомики; OPS-I-6 без journal-зависимости).
+- `crates/recorder/src/metric_emit.rs` — `sample_rss` (RssAnon из `/proc/self/status`, НЕ VmRSS —
+  TD-021; None без fallback), `sample_md_age` (возраст per-venue, dead-zero избегается — растёт на
+  тишине, OPS-I-8), `parse_rss_anon`. `crates/recorder/src/main.rs` — sampler-таск (1 Гц) зовёт
+  `sample_rss`/`sample_md_age`, feeder зовёт `run_books_feeder`, writer зовёт `run_writer` +
+  supervisor эмитит `venue_ws_reconnects_total` (live-wiring: все продюсеры в живом `main`, не helper).
+- **Scope:** dev-коммит `ac645ac` ⊂ `recorder/src/{lib,main,metric_emit}.rs` (sacred tests/contracts/
+  journal/alerts/docs/milestones НЕ тронуты; всё это — architect/critic коммиты цепочки). MD-only.
+- **Sacred RED `red_metrics_emission.rs`** прогоняет РЕАЛЬНЫЕ `run_writer`/`run_books_feeder`/samplers
+  с мульти-вендор/символ/kind/side фикстурой и ассертит ТОЧНЫЕ per-label значения (30/5/7/10, 5/3/4/2/
+  6/1, age 200/1000) + dead-zero (`>0`) + RssAnon≠VmRSS → registry-only/collapse НЕ проходят. Verify-гейт
+  OPS-I-10 (покрытие §3-карты + live-wiring канарейка).
+- **Гейты (reviewer независимо на чистом worktree):** workspace **282/0** (94 блока), red_metrics_emission
+  5/5, clippy 0, fmt clean, `verify_M-09.sh` **VERDICT PASS (20 проверок)** вкл. T4C OPS-I-10 + OPS-I-5
+  паритет в обе стороны + OPS-I-10 покрытие/live-wiring. Критик C-014 re-audit #6 **APPROVE**.
+- **§8 PROD GREEN (VPS `ac645ac`, CI+Deploy success, 2026-07-20):** healthy, restarts=0, panic/ERROR=0.
+  `/metrics` через busybox-sidecar (loopback) — **13 ранее-мёртвых метрик теперь несут ЖИВЫЕ SAMPLE'ы:**
+  `journal_bytes_written_total=15245` (TD-011 P0 liveness жив), `journal_seq_current=51923737`,
+  `journal_segment_index=49`, `journal_disk_free_bytes=103.6G`, `md_events_total{venue,symbol,kind}`
+  живой kind-aware (trade 8124/5414, l2snapshot, funding, open_interest — TD-014 жив),
+  `md_event_age_ms{venue}` 83/992/77, `book_levels{venue,symbol,side}` живой per-серия (HL=20 — TD-016
+  жив), `recorder_rss_anon_bytes=17506304` (RssAnon ~17 MB, TD-016 P1 жив). Event-метрики
+  (`journal_write_errors_total`/`journal_seq_gaps_total`/`venue_ws_reconnects_total`) корректно
+  отсутствуют на здоровом прогоне (реальный триггер не наступил). **TD-027 CLOSED.**
+- **Остаточные NOTE (не блокеры, в TD-027):** (1) `journal_bytes_written_total` считает КАДРЫ, не байты
+  (имя вводит в заблуждение; для TD-011-liveness — валидно); (2) `journal_seq_gaps_total` без
+  writer-продюсера → правило **OPS-GAP** на writer-пути не сработает (gap детектируется только на
+  read/replay — нужен продюсер там или пересмотр правила; зона architect).
+- **M-09 остаётся 🚧 ACTIVE:** task 3 (сохранность/restore-drill — заблокирован Storage Box founder ★),
+  task 5 (verify финал), task 6 (tester+reviewer финальный §8 milestone'а). Живое alerting-роутинг
+  (Alertmanager, §O) — отдельное founder ★ решение; метрики под него теперь ЖИВЫЕ.
+
 ## Пока НЕ реализовано (следующие фазы)
 - Крейты `risk`/`killswitch`/`oms`, `runner` — пофазно per DESIGN §10 (M-08: fail-closed риск-гейт
   между `strategy` и `oms`). MM-котирование, wiring весов из `signals.json` (граница B),
