@@ -29,6 +29,7 @@ founder отдельно (Fastify-сервер + open-source TradingView, ест
 | OF-I-3 | **Cumulative delta монотонно накапливает** знаковую агрессию; дивергенция с ценой — производный сигнал. RED: последовательность → точная кумулята; сброс окна детерминирован |
 | OF-I-4 | **Экспорт-контракт честен (данные для downstream-виза):** экспорт footprint несёт (цена, buy_vol, sell_vol, delta) per bin в СТАБИЛЬНОМ документированном формате; агрегация НЕ теряет сторону и НЕ выдумывает уровни, которых не было (та же дисциплина, что C1/эвикция). RED: асимметр. вход → корректные bins. Рендер — не наша забота, но данные обязаны быть точны и самодостаточны |
 | OF-I-5 | **Trade-flow ≠ book-flow (честная граница):** absorption/iceberg/DOM НЕ вычислимы из trade+snapshot (нужны raw book-дельты). Phase A их НЕ заявляет; они — M-18 |
+| OF-I-6 | **Depth time-series per (side, band):** для каждой площадки/символа/стороны (BID/ASK ОТДЕЛЬНО)/полосы (`RECON_BANDS` + глубже для Binance) — временной ряд суммарной глубины `depth_within(side, band)` по таймфреймам (1s база → 1m/1h/… агрегация). Экспорт как `LineData{time,value}` серии для линейного графика. RED: BID и ASK РАЗДЕЛЕНЫ (не суммированы/не перепутаны); полоса корректна (0.3% ≠ 0.5%); агрегация в бакет таймфрейма детерминирована; чистый редьюсер над `L2Snapshot` (Phase A, БЕЗ raw-дельт) |
 
 ## Allowed / Forbidden paths
 
@@ -50,6 +51,7 @@ founder отдельно (Fastify-сервер + open-source TradingView, ест
 | 4 | ⏳ | Реализация trade-flow сигналов (footprint-дельта, cumulative delta, per-price imbalance) — чистые редьюсеры | signal-engineer | OF-I-1/2/3 GREEN |
 | 5 | ⏳ | Экспорт footprint/delta серий в документированном формате (JSON/series: цена, buy_vol, sell_vol, delta per bin/бар) + схема+пример в `research/exports/` для founder-фронта | research-dev | OF-I-4 GREEN; экспорт корректен и стабилен (рендер — вне scope) |
 | 6 | ⏳ | (опц.) прогон trade-flow сигнала через M-10 kill-screen | research-dev | вердикт по пре-рег критериям |
+| 7 | ⏳ | **Depth time-series (OF-I-6):** редьюсер `depth_within(side,band)` над `L2Snapshot` → ряд per (venue,symbol,side,band,timeframe); экспорт `LineData` серий для линейного графика (BID/ASK раздельно) | research-dev | OF-I-6 GREEN; экспорт per side/band корректен |
 
 ## Гейты
 
@@ -68,6 +70,9 @@ founder отдельно (Fastify-сервер + open-source TradingView, ест
   (cumulative delta), `HistogramData{time,value,color}` (footprint-дельта/бар, цвет=знак),
   сигналы — маркеры/серия. `time` = UTC seconds. Full per-price footprint-bins отдаём как данные;
   их custom-series рендер — фронт-работа (вне scope).
+- **Depth-серии (OF-I-6, per side/band):** `LineData{time,value}` per (venue,symbol,side,band,timeframe)
+  — глубина `depth_within(side,band)`; запрос `?venue&symbol&side&band&resolution&from&to`. Фронт рисует
+  N линий (BID/ASK × полосы) на панели. Value = глубина в конце бакета таймфрейма (детерминир.).
 - **Механизм подачи:** лёгкий read-only эндпоинт ИЛИ файл-экспорт (impl research-dev) — НЕ
   детерминированный рантайм-путь (recorder не трогается).
 
