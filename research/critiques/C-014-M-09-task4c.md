@@ -724,3 +724,161 @@ Required repair:
 The `d630ca2` repair commit touched `crates/recorder/tests/red_metrics_emission.rs`, `milestones/M-09-data-safety-net.md`, and `scripts/verify_M-09.sh`. Scope is coherent for architect RED/verify repair.
 
 All temporary prototypes and mutations were reverted before this re-audit #4 section was appended. Final pre-verdict worktree status was clean except `research/critiques/C-014-M-09-task4c.md`.
+
+---
+
+## Re-audit #5 — 2026-07-20T12:57:16Z
+
+**Audited repair head:** `f815a87` — `test(M-09): C-014 re-audit #4 repair — book_levels symbol-collapse pin`
+**Repair commits:** `f815a87` over re-audit #4 verdict `f5ecb88`
+**Local audit worktree:** `/tmp/hft-critic-m09-t4c-r6` detached at `origin/feat/M-09-task4c-metric-emission`
+
+### Re-audit #5 verdict
+
+**REJECT remains.**
+
+The repair closes the re-audit #4 blocker: `book_levels{venue,symbol,side}` now has a three-book matrix that independently pins venue, symbol, and side. The requested `symbol="BTCUSDT"` anti-placebo fails.
+
+However, a seventh false-green remains: `recorder_rss_anon_bytes` is still only sample-presence checked. A sampler that always emits `0`, or a sampler that reads `VmRSS` instead of the mandated `RssAnon`, leaves `red_metrics_emission` and `verify_M-09.sh` green. That is material because FA §3 fixes the source to `/proc/<pid>/status` `RssAnon` specifically, and §7.1 TD-016 consumes this metric as the anonymous-heap leak signal.
+
+### What is fixed
+
+**Correct prototype remains reachable.**
+
+Temporary correct implementation: `run_writer(..., Arc<Metrics>, shutdown)`, `metric_emit::{emit_book_levels,sample_md_age,sample_rss}`, `run_books_feeder`, and live `main` calls for feeder/samplers.
+
+```text
+cargo test -p recorder --test red_metrics_emission; echo exit=$?
+running 4 tests
+test md_age_sampler_emits_real_age_per_venue ... ok
+test rss_sampler_emits_anon_bytes ... ok
+test live_feeder_loop_emits_book_levels ... ok
+test writer_emits_journal_and_md_metrics ... ok
+exit=0
+
+bash scripts/verify_M-09.sh; echo exit=$?
+VERDICT: PASS
+exit=0
+
+cargo test -p recorder --test red_rss_bounded; echo exit=$?
+test e7_writer_loop_memory_is_bounded_and_event_count_independent ... ok
+exit=0
+```
+
+**`book_levels` symbol-collapse: CLOSED.**
+
+Temporary mutation:
+
+```rust
+metrics.set_gauge(
+    "book_levels",
+    &[("venue", venue), ("symbol", "BTCUSDT"), ("side", "bid")],
+    book.n_levels(Side::Buy) as i64,
+);
+metrics.set_gauge(
+    "book_levels",
+    &[("venue", venue), ("symbol", "BTCUSDT"), ("side", "ask")],
+    book.n_levels(Side::Sell) as i64,
+);
+```
+
+Result:
+
+```text
+cargo test -p recorder --test red_metrics_emission live_feeder_loop_emits_book_levels -- --exact; echo exit=$?
+live_feeder_loop_emits_book_levels ... FAILED
+left: Some(4)
+right: Some(5)
+exit=101
+
+cargo test -p recorder --test red_metrics_emission; echo exit=$?
+running 4 tests
+test live_feeder_loop_emits_book_levels ... FAILED
+exit=101
+```
+
+The failure hits the first collapsed Binance/BTCUSDT bid assertion because the later Binance/ETHUSDT sample overwrites the hard-coded BTCUSDT series. That is enough: the oracle now detects symbol collapse.
+
+### Remaining blocker — RSS sampler can be dead or wrong-source
+
+Severity: BLOCKER.
+
+Current `rss_sampler_emits_anon_bytes` asserts only `has_sample("recorder_rss_anon_bytes")`. That catches registry-only / helper-not-called, but not value liveness and not the source identity required by FA §3.
+
+**Anti-placebo A: always-zero sampler still passes.**
+
+Temporary mutation:
+
+```rust
+pub fn sample_rss(metrics: &Metrics) {
+    metrics.set_gauge("recorder_rss_anon_bytes", &[], 0);
+}
+```
+
+Result:
+
+```text
+cargo test -p recorder --test red_metrics_emission rss_sampler_emits_anon_bytes -- --exact; echo exit=$?
+rss_sampler_emits_anon_bytes ... ok
+exit=0
+
+cargo test -p recorder --test red_metrics_emission; echo exit=$?
+running 4 tests ... ok
+exit=0
+
+bash scripts/verify_M-09.sh; echo exit=$?
+VERDICT: PASS
+exit=0
+```
+
+This is the same dead-zero class already closed for `journal_seq_current`, `journal_disk_free_bytes`, and `md_event_age_ms`.
+
+**Anti-placebo B: wrong source (`VmRSS`) still passes.**
+
+Temporary mutation:
+
+```rust
+.find(|line| line.starts_with("VmRSS:"))
+```
+
+instead of:
+
+```rust
+.find(|line| line.starts_with("RssAnon:"))
+```
+
+Result:
+
+```text
+cargo test -p recorder --test red_metrics_emission rss_sampler_emits_anon_bytes -- --exact; echo exit=$?
+rss_sampler_emits_anon_bytes ... ok
+exit=0
+
+cargo test -p recorder --test red_metrics_emission; echo exit=$?
+running 4 tests ... ok
+exit=0
+```
+
+This is material, not stylistic. `docs/fa/ops.md` §3 says the source is fixed to `RssAnon` and explicitly rejects cgroup/docker-style memory because page cache produces false leak signals (TD-021). `VmRSS` is not identical to `RssAnon`; it includes additional resident pages and can reintroduce the same false-observation class.
+
+Required repair:
+
+1. Make `rss_sampler_emits_anon_bytes` assert the sampled value is `> 0` after `sample_rss(&metrics)`.
+2. Add a deterministic parser/source oracle for `/proc/self/status`, e.g. `metric_emit::parse_rss_anon_bytes(status: &str) -> Option<i64>` or an equivalent testable seam.
+3. Feed a fixture where `VmRSS` and `RssAnon` differ and assert the emitted/parsed value equals `RssAnon * 1024`, not `VmRSS * 1024`.
+
+Example fixture shape:
+
+```text
+VmRSS:      9999 kB
+RssAnon:     123 kB
+RssFile:    9876 kB
+```
+
+Expected `recorder_rss_anon_bytes == 123 * 1024`.
+
+### Scope / cleanup
+
+The `f815a87` repair commit touched only `crates/recorder/tests/red_metrics_emission.rs`. Scope is clean.
+
+All temporary prototypes and mutations were reverted before this re-audit #5 section was appended. Final pre-verdict worktree status was clean except `research/critiques/C-014-M-09-task4c.md`.
