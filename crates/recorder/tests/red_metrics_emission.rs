@@ -24,7 +24,7 @@ use std::sync::Arc;
 use contracts::{EventKind, Level, MdEvent, MdPayload, Side, SysEvent, Venue};
 use journal::Journal;
 use ops::metrics::Metrics;
-use recorder::metric_emit::{sample_md_age, sample_rss};
+use recorder::metric_emit::{parse_rss_anon, sample_md_age, sample_rss};
 use recorder::recon_loop::ReconBooks;
 use recorder::{run_books_feeder, run_writer};
 
@@ -312,15 +312,53 @@ async fn live_feeder_loop_emits_book_levels() {
     }
 }
 
-/// (4) RSS-sampler: `sample_rss` эмитит `recorder_rss_anon_bytes` SAMPLE (TD-016). Присутствие
-/// критично (анти-TD-027); точное значение — §8 на проде (non-zero тренд).
-#[tokio::test]
-async fn rss_sampler_emits_anon_bytes() {
+/// Фикстура `/proc/self/status`, где VmRSS ≠ RssAnon (VmRSS включает page cache файла журнала —
+/// ложный «лик», TD-021). Парсер ОБЯЗАН взять RssAnon, НЕ VmRSS.
+const PROC_STATUS_FIXTURE: &str = "Name:\trecorder\n\
+VmPeak:\t 2100000 kB\n\
+VmRSS:\t   999999 kB\n\
+RssAnon:\t   12345 kB\n\
+RssFile:\t   50000 kB\n\
+RssShmem:\t      0 kB\n";
+
+/// (4a, ДЕТЕРМИНИРОВАННЫЙ parser-оракул, C-014 re-audit #5) `parse_rss_anon` берёт ИМЕННО `RssAnon`
+/// (не `VmRSS`/`RssFile`) и переводит kB→байты (×1024). TD-021: VmRSS/cgroup включают page cache →
+/// ложный лик. Отсутствие `RssAnon` → `None` (НЕ fallback на VmRSS/0).
+#[test]
+fn rss_parser_reads_rss_anon_not_vmrss() {
+    let bytes = parse_rss_anon(PROC_STATUS_FIXTURE).expect("RssAnon обязан распарситься");
+    assert_eq!(
+        bytes,
+        12_345 * 1024,
+        "parse_rss_anon вернул {bytes}, а не RssAnon(12345 kB)×1024 — читает VmRSS/RssFile или не ×1024 \
+         (TD-021: page cache завышает VmRSS → ложный лик; метрика обязана мерить АНОНИМНУЮ кучу)"
+    );
+    assert_ne!(
+        bytes,
+        999_999 * 1024,
+        "parse_rss_anon вернул VmRSS вместо RssAnon (TD-021 регресс)"
+    );
+    assert!(
+        parse_rss_anon("Name:\tx\nVmRSS:\t 100 kB\n").is_none(),
+        "без строки RssAnon парсер обязан вернуть None, а не fallback на VmRSS/0 (иначе тихо мерит не то)"
+    );
+}
+
+/// (4b, ЖИВОЙ sampler >0) `sample_rss` на РЕАЛЬНОМ `/proc/self/status` эмитит `recorder_rss_anon_bytes`
+/// SAMPLE с НЕНУЛЕВЫМ значением (живой процесс на Linux всегда имеет RssAnon>0). Ловит sample-only-0
+/// (C-014 re-audit #5) И registry-only (TD-027).
+#[test]
+fn rss_sampler_emits_positive_anon_bytes() {
     let metrics = Metrics::new();
     sample_rss(&metrics);
     let text = metrics.prometheus_text();
     assert!(
         has_sample(&text, "recorder_rss_anon_bytes"),
         "recorder_rss_anon_bytes НЕ несёт SAMPLE после sample_rss — TD-016-метрика мертва (sampler не подключён)"
+    );
+    assert!(
+        sample_value(&text, "recorder_rss_anon_bytes").unwrap_or(0) > 0,
+        "recorder_rss_anon_bytes == 0 после sample_rss — sampler эмитит 0/константу вместо реального \
+         RssAnon (живой процесс на Linux имеет RssAnon>0; dead-zero, C-014 re-audit #5)"
     );
 }

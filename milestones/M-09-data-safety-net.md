@@ -66,8 +66,9 @@ recon-дизайном FA §4 и уточняется на critic-аудите �
   `last_receipt` per venue, периодический sampler (main спавнит; live-wiring канарейка) зовёт с реальным
   `now`.** ЖИВОЙ feeder-loop `run_books_feeder` (lib.rs; экстракт inline books-feeder'а
   из `main.rs` — применяет `apply_md_to_books` + эмитит) → `book_levels`, и `main` ОБЯЗАН его спавнить
-  (C-014 gap-2 live-wiring); периодический sampler (`main.rs` спавн + `metric_emit.rs`, `/proc/self/status`
-  RssAnon) → `recorder_rss_anon_bytes`; supervisor (`main.rs`) ИЛИ venue-`run` → `venue_ws_reconnects_total`.
+  (C-014 gap-2 live-wiring); периодический sampler (`main.rs` спавн + `metric_emit.rs`) → чистый
+  `parse_rss_anon(status)` берёт ИМЕННО `RssAnon` (НЕ `VmRSS`/cgroup — page cache завышает, TD-021) ×1024 →
+  `recorder_rss_anon_bytes` (>0 на живом); supervisor (`main.rs`) ИЛИ venue-`run` → `venue_ws_reconnects_total`.
   **ЖЁСТКИЕ ГРАНИЦЫ:** метрики — ТОЛЬКО
   атомик-инкременты рядом с существующими операциями (**OPS-I-7**, не новый горячий путь); **в журнал
   НЕ пишутся** (**OPS-I-6** — `metrics.inc/set`, НЕ `journal.append`); `run_writer` меняет ТОЛЬКО эмиссию
