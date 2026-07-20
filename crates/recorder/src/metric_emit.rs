@@ -7,7 +7,7 @@
 //! Карта продюсеров (FA §3, доп. от C-014 re-audit #1..#5):
 //! - `recorder_rss_anon_bytes`         — `sample_rss`        (этот файл, /proc/self/status).
 //! - `md_event_age_ms{venue}`          — `sample_md_age`     (sampler-таск в `main`, раз в секунду).
-//! - `journal_bytes_written_total`     — `run_writer`        (post-`append`, реальные байты).
+//! - `journal_frames_written_total`    — `run_writer`        (post-`append`, +1/кадр; NOTE-1: кадры, не байты).
 //! - `journal_seq_current`             — `run_writer`        (post-`append`, =`next_seq`).
 //! - `journal_segment_index`           — `run_writer`        (post-`append`, =`active_segment_index`).
 //! - `journal_disk_free_bytes`         — `run_writer`        (post-`append`, =`storage_status().free_bytes`).

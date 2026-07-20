@@ -6,13 +6,13 @@ groups:
     interval: 30s
     rules:
       - alert: TD-011
-        expr: rate(journal_bytes_written_total[1m]) == 0
+        expr: rate(journal_frames_written_total[1m]) == 0
         for: 1m
         labels:
           severity: P0
           incident: TD-011
         annotations:
-          summary: "journal bytes written — нулевой прирост за 60с (recorder жив, но не пишет)"
+          summary: "journal frames written — нулевой прирост за 60с (recorder жив, но не пишет)"
       - alert: TD-013
         expr: sum(rate(venue_http_status_total{code=~"418|429"}[5m])) / sum(rate(venue_http_status_total[5m])) > 0.5
         for: 5m

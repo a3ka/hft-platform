@@ -106,14 +106,13 @@ fn emit_post_append(metrics: &Metrics, journal: &Journal, appended: &EventKind) 
         // страховка от экзотики.
         metrics.set_gauge("journal_disk_free_bytes", &[], storage.free_bytes as i64);
     }
-    // (4) journal_bytes_written_total: реaльные байты. `next_seq` — НЕ байты (кадр
-    //     переменной длины), поэтому инкрементируем РАЗМЕР КАДРА на каждом append. Но
-    //     `append` НЕ возвращает длину кадра (только `Event`); инкремент = 1 «кадр» —
-    //     грубый proxy, но стабильно растёт и не врёт как «0» (dead-zero, C-014 r-audit
-    //     #3). Точный байтовый счётчик требует менять `Journal::append` (sacred). На
-    //     RED-оракуле `journal_bytes_written_total > 0` после 72 append'ов — инкремент+1
-    //     на каждый кадр это гарантирует (72 > 0, выполнено).
-    metrics.inc_counter("journal_bytes_written_total", &[], 1);
+    // (4) journal_frames_written_total: TD-011 liveness — «пишем ли вообще». NOTE-1 (TD-027):
+    //     имя честное — счётчик КАДРОВ (не байт); `next_seq` — НЕ байты (кадр переменной
+    //     длины), поэтому инкрементируем +1 на каждый append. Точный байтовый счётчик требует
+    //     менять `Journal::append` (sacred) — out of scope для task 4D. На RED-оракуле
+    //     `journal_frames_written_total > 0` после 72 append'ов — инкремент+1 на каждый кадр
+    //     это гарантирует (72 > 0, выполнено).
+    metrics.inc_counter("journal_frames_written_total", &[], 1);
     // (5) md_events_total{venue,symbol,kind}: ТОЛЬКО для `EventKind::Md`. Канонический
     //     `kind` из payload (см. `md_kind_label`). Heartbeat/Sys/др. — no-op, не двигают
     //     счётчик рыночных событий.

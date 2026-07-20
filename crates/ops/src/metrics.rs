@@ -42,7 +42,7 @@ pub const METRICS: &[MetricSpec] = &[
         labels: &[],
     },
     MetricSpec {
-        name: "journal_bytes_written_total",
+        name: "journal_frames_written_total",
         kind: Counter,
         labels: &[],
     },

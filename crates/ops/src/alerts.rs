@@ -56,13 +56,14 @@ pub struct AlertRule {
 /// **Анти-плацебо:** правило-без-метрики валит (1); удаление правила обязательного класса валит
 /// (2); пустой/безсеверитийный рендер валит (3). Подробности — `crates/ops/tests/red_ops_alerts.rs`.
 pub const ALERT_RULES: &[AlertRule] = &[
-    // TD-011 — recorder жив, но НЕ пишет. Метрика — счётчик записанных байт журнала; «нет
-    // роста за окно» = recorder стоит. P0 (запись остановилась — данные невосстановимы).
+    // TD-011 — recorder жив, но НЕ пишет. Метрика — счётчик записанных КАДРОВ журнала
+    // (NOTE-1: кадры, не байты; имя честное после TD-027-rename); «нет роста за окно» =
+    // recorder стоит. P0 (запись остановилась — данные невосстановимы).
     AlertRule {
         incident: "TD-011",
         severity: Severity::P0,
-        metric: "journal_bytes_written_total",
-        summary: "journal bytes written — нулевой прирост за 60с (recorder жив, но не пишет)",
+        metric: "journal_frames_written_total",
+        summary: "journal frames written — нулевой прирост за 60с (recorder жив, но не пишет)",
     },
     // TD-013 — rate-limit-ответы 418/429 от биржи > N/мин (133×418 за 25с → IP-бан). Метрика —
     // счётчик HTTP-ответов по коду; правило «доля 4xx в окне > порога» — Prometheus сам агрегирует
@@ -189,9 +190,9 @@ pub fn to_prometheus_rules() -> String {
 /// обещания «это правильное число»). Live-tuning вынесен в §O (founder ★).
 fn expr_for(rule: &AlertRule) -> String {
     match (rule.incident, rule.metric) {
-        ("TD-011", "journal_bytes_written_total") => {
+        ("TD-011", "journal_frames_written_total") => {
             // Counter: rate за 60с == 0 ⇒ recorder не пишет.
-            "rate(journal_bytes_written_total[1m]) == 0".to_string()
+            "rate(journal_frames_written_total[1m]) == 0".to_string()
         }
         ("TD-013", "venue_http_status_total") => {
             // Counter с label `code` (418|429): доля 4xx-rate к общему HTTP-rate > 50%.
