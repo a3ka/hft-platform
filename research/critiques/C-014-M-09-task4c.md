@@ -558,3 +558,169 @@ Required repair:
 The `4979dbd` repair commit touched only `crates/recorder/tests/red_metrics_emission.rs` and `milestones/M-09-data-safety-net.md`. Scope is clean.
 
 All temporary prototypes and mutations were reverted before this re-audit #3 section was appended. Final pre-verdict worktree status was clean except `research/critiques/C-014-M-09-task4c.md`.
+
+---
+
+## Re-audit #4 — 2026-07-20T12:44:34Z
+
+**Audited repair head:** `d630ca2` — `test(M-09): C-014 re-audit #3 repair — мульти-вендор/символ фикстура + dead-zero пины + md_age sampler`
+**Repair commits:** `d630ca2` over re-audit #3 verdict `7ca5f11`
+**Local audit worktree:** `/tmp/hft-critic-m09-t4c-r5` detached at `origin/feat/M-09-task4c-metric-emission`
+
+### Re-audit #4 verdict
+
+**REJECT remains.**
+
+The repair closes the two blockers from re-audit #3:
+
+1. writer-side `venue` / `symbol` / `kind` collapse is now pinned by exact per-series `md_events_total` values;
+2. dead-zero for `journal_seq_current`, `journal_disk_free_bytes`, and `md_event_age_ms` is now pinned.
+
+However, there is still a sixth false-green in the same label-value collapse class: `book_levels{venue,symbol,side}` can ignore the `symbol` argument and always emit `symbol="BTCUSDT"`. The full task-4C oracle and `verify_M-09.sh` remain green.
+
+### Requested blocker checks
+
+**Correct prototype is reachable.**
+
+Temporary correct implementation: `run_writer(..., Arc<Metrics>, shutdown)`, `metric_emit::{emit_book_levels,sample_md_age,sample_rss}`, `run_books_feeder`, and live `main` calls for feeder/samplers.
+
+```text
+cargo test -p recorder --test red_metrics_emission; echo exit=$?
+running 4 tests
+test md_age_sampler_emits_real_age_per_venue ... ok
+test rss_sampler_emits_anon_bytes ... ok
+test live_feeder_loop_emits_book_levels ... ok
+test writer_emits_journal_and_md_metrics ... ok
+exit=0
+
+bash scripts/verify_M-09.sh; echo exit=$?
+VERDICT: PASS
+exit=0
+
+cargo test -p recorder --test red_rss_bounded; echo exit=$?
+test e7_writer_loop_memory_is_bounded_and_event_count_independent ... ok
+exit=0
+```
+
+**Venue collapse: CLOSED.**
+
+Temporary mutation: `metric_emit::venue_label(BinanceFutures|Hyperliquid) -> "binance"`.
+
+```text
+cargo test -p recorder --test red_metrics_emission writer_emits_journal_and_md_metrics -- --exact; echo exit=$?
+writer_emits_journal_and_md_metrics ... FAILED
+left: Some(35)
+right: Some(30)
+exit=101
+
+cargo test -p recorder --test red_metrics_emission live_feeder_loop_emits_book_levels -- --exact; echo exit=$?
+live_feeder_loop_emits_book_levels ... FAILED
+left: Some(4)
+right: Some(5)
+exit=101
+```
+
+**Writer `symbol` / `kind` collapse: CLOSED.**
+
+Temporary mutations:
+
+1. writer emits every `md_events_total` with `symbol="BTCUSDT"`;
+2. writer maps `Trade -> "l2snapshot"`.
+
+```text
+symbol-collapse:
+writer_emits_journal_and_md_metrics ... FAILED
+left: Some(37)
+right: Some(30)
+exit=101
+
+kind-collapse:
+writer_emits_journal_and_md_metrics ... FAILED
+left: Some(40)
+right: Some(30)
+exit=101
+```
+
+**Dead-zero: CLOSED.**
+
+Temporary mutations:
+
+1. `journal_seq_current = 0`;
+2. `journal_disk_free_bytes = 0`;
+3. `sample_md_age(...) -> 0`.
+
+```text
+seq_current=0:
+writer_emits_journal_and_md_metrics ... FAILED
+journal_seq_current == 0 после 72 append'ов
+exit=101
+
+disk_free=0:
+writer_emits_journal_and_md_metrics ... FAILED
+journal_disk_free_bytes == 0
+exit=101
+
+md_age=0:
+md_age_sampler_emits_real_age_per_venue ... FAILED
+left: Some(0)
+right: Some(200)
+exit=101
+```
+
+### Remaining blocker — `book_levels` symbol collapse
+
+Severity: BLOCKER.
+
+Temporary mutation:
+
+```rust
+pub fn emit_book_levels(metrics: &Metrics, venue: Venue, symbol: &str, book: &OrderBook) {
+    let venue = venue_label(venue);
+    metrics.set_gauge(
+        "book_levels",
+        &[("venue", venue), ("symbol", "BTCUSDT"), ("side", "bid")],
+        book.n_levels(Side::Buy) as i64,
+    );
+    metrics.set_gauge(
+        "book_levels",
+        &[("venue", venue), ("symbol", "BTCUSDT"), ("side", "ask")],
+        book.n_levels(Side::Sell) as i64,
+    );
+}
+```
+
+Result:
+
+```text
+cargo test -p recorder --test red_metrics_emission live_feeder_loop_emits_book_levels -- --exact; echo exit=$?
+test live_feeder_loop_emits_book_levels ... ok
+exit=0
+
+cargo test -p recorder --test red_metrics_emission; echo exit=$?
+running 4 tests ... ok
+exit=0
+
+bash scripts/verify_M-09.sh; echo exit=$?
+VERDICT: PASS
+exit=0
+```
+
+This is not cosmetic. The metric contract is `book_levels{venue,symbol,side}`. The repair fixture varies `venue` and `side`, but both feeder events use `symbol="BTCUSDT"`, so a defective producer can publish all book-depth series under one symbol and still pass. That hides per-instrument TD-016 localization in the same way previous repairs hid venue/kind/side failures.
+
+Required repair:
+
+1. Add a second symbol to `live_feeder_loop_emits_book_levels`, with distinct bid/ask counts, e.g. `Venue::Binance, "ETHUSDT", 6, 1`.
+2. Assert exact `book_levels{venue="binance",symbol="ETHUSDT",side="bid"} == 6` and `side="ask" == 1`.
+3. Keep the existing BinanceFutures fixture; it is still needed for venue-collapse.
+
+### Non-blocking notes
+
+`journal_bytes_written_total` remains value-under-specified. A temporary mutation that increments it only once after the first append (`final value == 1`) still passes the writer test and full task-4C oracle. I am not making this the rejection reason because task 4C and §8 currently require non-zero emission, and no §7.1 alert consumes byte-accurate values. If the intended contract is truly bytes, not liveness/append activity, add a separate value oracle with a large payload and require the counter to exceed the event count or otherwise reflect written frame bytes.
+
+`sample_md_age(...).max(0)` is not a blocker here. Negative age comes from clock skew / timestamp ordering; clamping an age gauge to non-negative is a reasonable implementation choice unless a separate clock-skew invariant is introduced. The current positive `now-last` assertions are enough for OPS-I-10 emission/value reachability.
+
+### Scope / cleanup
+
+The `d630ca2` repair commit touched `crates/recorder/tests/red_metrics_emission.rs`, `milestones/M-09-data-safety-net.md`, and `scripts/verify_M-09.sh`. Scope is coherent for architect RED/verify repair.
+
+All temporary prototypes and mutations were reverted before this re-audit #4 section was appended. Final pre-verdict worktree status was clean except `research/critiques/C-014-M-09-task4c.md`.
