@@ -129,6 +129,29 @@ OBI-полосами**: иначе на HL нечего считать.
 Обязательное условие: `schemars` → JSON Schema 2020-12 (D-1) — первый момент, когда схему читает
 не наш код.
 
+### Order-flow трек (данные Фабио + фронт) — данные-first, founder ★ приоритет 🟠
+Разбивка build-vs-integrate (анализ architect 2026-07-20): внешние MCP/сервисы — просмотрщики с
+лицензией «не хранить»; владеть order-flow можно только СВОИМ захватом. Историч. данные для бэктеста —
+бесплатны/дёшевы (Binance `data.binance.vision` free; HL CC0-зеркала). Сторону агрессора мы УЖЕ пишем →
+trade-flow сигналы вычислимы сейчас; book-дельты (absorption/DOM) выбрасываем → нужен захват.
+
+- **M-16 — историч. импорт** (research-only): Binance free + HL CC0 → журнал-формат. Шире окно M-10 +
+  глубина HL для OBI Трек B. Provenance-изоляция, без T1. → milestone готов, RED следующим.
+- **M-17 — order-flow Phase A (бэкенд):** trade-flow сигналы (footprint/cumulative delta, чистые
+  редьюсеры) + **экспорт под `code2alpha`** (UDF 1s-бары + lightweight-charts серии). Виз — НЕ здесь.
+  Без T1. → milestone готов, RED следующим.
+- **M-18 — order-flow Phase B (захват, BUILD):** персист сырых @depth book-дельт (`CT-RFC-04 L2Delta`) →
+  absorption/DOM. **T1 + sacred live-path + risk-critic.** Time-sensitive («начать собирать» — дельты
+  теряются ежедневно). → не написан.
+- **M-19 — frontend cockpit (ПОЗЖЕ, после бэка):** дорабатываем `a3ka/code2alpha` (Next+lightweight-charts
+  v5, UDF DataFeed) в research+monitoring cockpit: свечи+order-flow(footprint/delta/DOM/heatmap)+сигналы+
+  бэктест-отчёты+**детерминированный replay журнала**+мониторинг /metrics. Тир 1/2 (native/custom-series)
+  → после M-17; Тир 3 (DOM/heatmap bespoke canvas) → после M-18. Фронт-работа founder'а, не Rust-цепочка.
+  Полный список отображаемого — `milestones/M-19-frontend-cockpit.md`.
+
+**Порядок трека:** M-17 (бэкенд сигналы+экспорт) ∥ M-18-CT-RFC (начать захват дельт) ∥ M-16 (импорт) →
+затем M-19 (фронт на готовых данных). OBI (M-10) — ортогонален, простейший depth-сигнал, обкатка стека.
+
 ---
 
 ## Что НЕ делаем (осознанно)
