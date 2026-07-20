@@ -49,7 +49,7 @@ founder отдельно (Fastify-сервер + open-source TradingView, ест
 | 2 | ⏳ | `verify_M-17.sh` | architect | exit=0 на GREEN |
 | 3 | ⏳ | Пре-регистрация: `H-*-orderflow` + `S-002-footprint` (критерии фальсификации ДО бэктеста) | signal-engineer | карточка + spec |
 | 4 | ⏳ | Реализация trade-flow сигналов (footprint-дельта, cumulative delta, per-price imbalance) — чистые редьюсеры | signal-engineer | OF-I-1/2/3 GREEN |
-| 5 | ⏳ | Экспорт footprint/delta серий в документированном формате (JSON/series: цена, buy_vol, sell_vol, delta per bin/бар) + схема+пример в `research/exports/` для founder-фронта | research-dev | OF-I-4 GREEN; экспорт корректен и стабилен (рендер — вне scope) |
+| 5 | ⏳ | Экспорт в докум. формате: (а) **per-price footprint bins** `FootprintBar{time_s, bins:[PriceBin{price,buy_vol,sell_vol,delta}]}` (полный footprint, C-016); (б) cumulative/depth/OHLCV серии в lightweight-charts shape; (в) **`research/exports/format.md` со схемой + примером + `export_schema_version`** (стабильный контракт под code2alpha, verify_M-17 ТРЕБУЕТ файл — C-016) | research-dev | OF-I-4 + `red_footprint_bins` GREEN; format.md существует |
 | 6 | ⏳ | (опц.) прогон trade-flow сигнала через M-10 kill-screen | research-dev | вердикт по пре-рег критериям |
 | 7 | ⏳ | **Depth time-series (OF-I-6):** редьюсер `depth_within(side,band)` над `L2Snapshot` → ряд per (venue,symbol,side,band,timeframe); экспорт `LineData` серий для линейного графика (BID/ASK раздельно) | research-dev | OF-I-6 GREEN; экспорт per side/band корректен |
 

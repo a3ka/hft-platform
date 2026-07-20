@@ -22,6 +22,10 @@ run "OF-I-6 depth time-series (BID≠ASK, band-монотонность, close-�
 run "OF-I-2/3 footprint + cumulative delta (знаковая buy−sell, running, стороны не перепутаны)" \
   cargo test -p research-cli --test red_footprint
 
+# ── OF-I-4 PER-PRICE footprint bins (полный footprint для custom-series фронта; C-016) ──
+run "OF-I-4 footprint BINS per-price (price→{buy_vol,sell_vol,delta}, цены не слиты)" \
+  cargo test -p research-cli --test red_footprint_bins
+
 # ── OF-I-4 свечи из сделок (UDF-бары под code2alpha DataFeed) ───────────────────────────
 run "OF-I-4 OHLCV-бары (open=first/high=max/low=min/close=last/volume=Σsize, 1s база)" \
   cargo test -p research-cli --test red_ohlcv
@@ -32,10 +36,15 @@ if [ -f crates/signals/src/obi.rs ]; then
 else
   fail "crates/signals/src/obi.rs отсутствует — база сигналов не на месте"
 fi
-if [ -d research/exports ] && ls research/exports/*.md >/dev/null 2>&1; then
-  pass "research/exports/ несёт документир. формат экспорта для founder-фронта"
+# ── ОБЯЗАТЕЛЬНО (C-016): экспорт-контракт документирован (схема + ПРИМЕР под code2alpha) ─
+# M-17 OF-I-4/task 5 обещают экспорт-формат; M-19 фронт строится ПРОТИВ него. Без файла — false-green
+# (impl мог отдать серии без документир./стабильного формата). Требуем: схема-спека + пример UDF-бар и
+# footprint-bin + серий (LineData/HistogramData) с `export_schema_version`.
+if [ -f research/exports/format.md ] && grep -q "export_schema_version" research/exports/format.md; then
+  pass "OF-I-4 экспорт-формат документирован (research/exports/format.md + export_schema_version)"
 else
-  echo "NOTE  research/exports/ ещё не создан (research-dev task 5 — схема+пример под code2alpha)"
+  fail "OF-I-4 нет research/exports/format.md с export_schema_version — экспорт-контракт под code2alpha \
+не зафиксирован (C-016: обещан в OF-I-4/task 5, M-19 фронт строится против него; без него false-green)"
 fi
 
 echo
