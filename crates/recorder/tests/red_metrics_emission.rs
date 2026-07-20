@@ -262,9 +262,12 @@ async fn md_age_sampler_emits_real_age_per_venue() {
     );
 }
 
-/// (3) ЖИВОЙ feeder-loop `run_books_feeder` (тот же, что спавнит main — НЕ leaf; C-014 gap-2) на
-/// ДВУХ площадках с АСИММЕТРИЧНОЙ глубиной → `book_levels{venue,symbol,side}` per-серия точные значения
-/// (ловит side-collapse И venue-collapse).
+/// (3) ЖИВОЙ feeder-loop `run_books_feeder` (тот же, что спавнит main — НЕ leaf; C-014 gap-2). ТРИ
+/// книги `(venue,symbol)` с УНИКАЛЬНОЙ асимметричной глубиной — так что venue, symbol И side различимы
+/// НЕЗАВИСИМО (C-014 re-audit #4: symbol-collapse `symbol="BTCUSDT"` всегда — тоже false-GREEN):
+///  - (Binance, BTCUSDT) bid=5 ask=3;
+///  - (Binance, ETHUSDT) bid=4 ask=2  — ТА ЖЕ площадка, ДРУГОЙ символ → symbol обязан различать;
+///  - (BinanceFutures, BTCUSDT) bid=6 ask=1 — ДРУГАЯ площадка, ТОТ ЖЕ символ → venue обязан различать.
 #[tokio::test]
 async fn live_feeder_loop_emits_book_levels() {
     let books: ReconBooks = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
@@ -273,10 +276,13 @@ async fn live_feeder_loop_emits_book_levels() {
     let (tx, rx) = tokio::sync::mpsc::channel::<EventKind>(16);
     tx.send(l2_event(Venue::Binance, "BTCUSDT", 5, 3))
         .await
-        .unwrap(); // bid=5 ask=3
-    tx.send(l2_event(Venue::BinanceFutures, "BTCUSDT", 4, 2))
+        .unwrap();
+    tx.send(l2_event(Venue::Binance, "ETHUSDT", 4, 2))
         .await
-        .unwrap(); // bid=4 ask=2
+        .unwrap();
+    tx.send(l2_event(Venue::BinanceFutures, "BTCUSDT", 6, 1))
+        .await
+        .unwrap();
     drop(tx);
 
     run_books_feeder(rx, Arc::clone(&books), Arc::clone(&metrics)).await;
@@ -284,12 +290,24 @@ async fn live_feeder_loop_emits_book_levels() {
     let text = metrics.prometheus_text();
     let b = vlabel(Venue::Binance);
     let bf = vlabel(Venue::BinanceFutures);
-    for (venue, side, want) in [(b, "bid", 5), (b, "ask", 3), (bf, "bid", 4), (bf, "ask", 2)] {
+    // (venue, symbol, side, want) — уникальные значения: коллапс venue|symbol|side → неверное число.
+    for (venue, symbol, side, want) in [
+        (b, "BTCUSDT", "bid", 5),
+        (b, "BTCUSDT", "ask", 3),
+        (b, "ETHUSDT", "bid", 4),
+        (b, "ETHUSDT", "ask", 2),
+        (bf, "BTCUSDT", "bid", 6),
+        (bf, "BTCUSDT", "ask", 1),
+    ] {
         assert_eq!(
-            labeled_sample_value(&text, "book_levels", &[("venue", venue), ("symbol", "BTCUSDT"), ("side", side)]),
+            labeled_sample_value(
+                &text,
+                "book_levels",
+                &[("venue", venue), ("symbol", symbol), ("side", side)]
+            ),
             Some(want),
-            "book_levels{{venue={venue},side={side}}} != {want} — side-collapse или venue-collapse \
-             (глубина одной стороны/площадки не различима — TD-016-метрика бесполезна)"
+            "book_levels{{venue={venue},symbol={symbol},side={side}}} != {want} — коллапс venue|symbol|\
+             side (глубина не различима по площадке/символу/стороне — TD-016-метрика бесполезна)"
         );
     }
 }
