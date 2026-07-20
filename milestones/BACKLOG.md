@@ -154,6 +154,43 @@ trade-flow сигналы вычислимы сейчас; book-дельты (ab
 
 ---
 
+## Порядок исполнения (сквозной roadmap, 2026-07-20, founder ★)
+
+Логическая последовательность по зависимостям + queue-rule (данные → доказательство сигнала →
+барьер к деньгам → исполнение). Блоки 1–3 — параллелятся; блок 4 — строго после барьера.
+
+**Блок 1 — Order-flow данные + сигналы (СЕЙЧАС, параллельно):**
+1. **M-18 CT-RFC-04 + захват дельт** — START (time-sensitive: сырые book-дельты теряются ежедневно).
+   T1 + sacred live-path → critic + risk-critic, аккуратно. Разблокирует absorption/DOM.
+2. **M-17 order-flow бэкенд** — trade-flow сигналы (footprint/cumulative delta) + депт-ряды BID/ASK
+   по полосам/таймфреймам + экспорт под `code2alpha` (UDF+lightweight-charts). Из УЖЕ собираемых данных.
+3. **M-16 историч. импорт** — Binance free + HL CC0 → журнал (шире окно + глубина HL).
+
+**Блок 2 — Доказать стек + сигналы:**
+4. **M-10 OBI kill-screen** — первый сквозной прогон research-стека (обкатка; kill-screen, не промоушен).
+5. **Прогон order-flow сигналов** (footprint/delta/OBI) через kill-screen на накопленных+импортированных
+   данных → R-002+ отчёты. risk-critic анти-оверфит §6 → founder ★.
+
+**Блок 3 — Фронт (визуализация):**
+6. **M-19 cockpit** — дораб. `code2alpha`. Тир1/2 (свечи+delta+депт-линии+сигналы+бэктест) после M-17;
+   Тир3 (DOM-ladder+Bookmap-heatmap) после M-18; replay журнала + мониторинг /metrics — параллельно.
+
+**Блок 4 — Путь к деньгам (строго после барьера, queue-rule):**
+7. **M-11 Risk + Killswitch + OMS** — fail-closed барьер (`RiskApproved`), самый дорогой, неизбежный.
+8. **M-13 HL depth** (если HL — первая площадка исполнения; частично снято HL CC0).
+9. **M-12 Runner** (paper/testnet) + границы B/C (Ed25519-подпись).
+10. **M-14 DET-I-1 полный** (`state_hash`+снапшоты) — до P4 live-micro.
+
+**Кросс-cutting / founder ★ (когда удобно, не блокируют блоки 1–3):**
+- **Storage Box** (провижининг) → разблокирует M-09 task 3 (restore-drill) + M-08 retention-apply.
+  Durability — принятый single-copy риск (reviewer записать в TECH-DEBT).
+- **Live alerting** (Prometheus/Alertmanager→Telegram) — метрики+правила готовы (§O).
+- **M-15 vendor import** — когда founder назовёт поставщика купленной истории.
+
+**Текущий фокус:** блок 1 — M-17 RED (в процессе) + M-18 CT-RFC (запустить). M-10 готов к прогону.
+
+---
+
 ## Что НЕ делаем (осознанно)
 
 - **MM-котирование** — до `oms` + `risk` (двусторонние квоты без rate-budget и kill-switch = слив).
