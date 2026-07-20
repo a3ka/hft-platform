@@ -882,3 +882,119 @@ Expected `recorder_rss_anon_bytes == 123 * 1024`.
 The `f815a87` repair commit touched only `crates/recorder/tests/red_metrics_emission.rs`. Scope is clean.
 
 All temporary prototypes and mutations were reverted before this re-audit #5 section was appended. Final pre-verdict worktree status was clean except `research/critiques/C-014-M-09-task4c.md`.
+
+---
+
+## Re-audit #6 — 2026-07-20T13:11:03Z
+
+**Audited repair head:** `948896c` — `test(M-09): C-014 re-audit #5 repair — RssAnon parser-оракул (не VmRSS) + rss>0`
+**Repair commits:** `948896c` over re-audit #5 verdict `b4fafcd`
+**Local audit worktree:** `/tmp/hft-critic-m09-t4c-r7` detached at `origin/feat/M-09-task4c-metric-emission`
+
+### Re-audit #6 verdict
+
+**APPROVE.**
+
+The re-audit #5 blocker is closed. `recorder_rss_anon_bytes` is no longer sample-only: the oracle now pins both source identity (`RssAnon`, not `VmRSS`) and positive live sample value. I found no eighth false-green of a new steady-emission class after this repair.
+
+This approval is scoped to the plan-time RED oracle for M-09 task 4C. Event metrics remain correctly outside this steady-emission oracle unless their trigger is injected (`journal_write_errors_total`, `journal_seq_gaps_total`, `venue_ws_reconnects_total`, `book_resync_total`). Reviewer §8 still owns the live `/metrics` curl on VPS: all steady series present, non-zero where required, with correct labels/dimensions.
+
+### What is fixed
+
+**Correct prototype is reachable.**
+
+Temporary correct implementation: `run_writer(..., Arc<Metrics>, shutdown)`, `metric_emit::{emit_book_levels,sample_md_age,parse_rss_anon,sample_rss}`, `run_books_feeder`, and live `main` calls for feeder/samplers.
+
+```text
+cargo test -p recorder --test red_metrics_emission; echo exit=$?
+running 5 tests
+test rss_parser_reads_rss_anon_not_vmrss ... ok
+test rss_sampler_emits_positive_anon_bytes ... ok
+test md_age_sampler_emits_real_age_per_venue ... ok
+test live_feeder_loop_emits_book_levels ... ok
+test writer_emits_journal_and_md_metrics ... ok
+exit=0
+
+bash scripts/verify_M-09.sh; echo exit=$?
+VERDICT: PASS
+exit=0
+
+cargo test -p recorder --test red_rss_bounded; echo exit=$?
+test e7_writer_loop_memory_is_bounded_and_event_count_independent ... ok
+exit=0
+```
+
+**Parser `VmRSS` false-green: CLOSED.**
+
+Temporary mutation:
+
+```rust
+if !trimmed.starts_with("VmRSS:") {
+    return None;
+}
+```
+
+instead of `RssAnon:`.
+
+Result:
+
+```text
+cargo test -p recorder --test red_metrics_emission rss_parser_reads_rss_anon_not_vmrss -- --exact; echo exit=$?
+rss_parser_reads_rss_anon_not_vmrss ... FAILED
+left: 1023998976
+right: 12641280
+exit=101
+
+cargo test -p recorder --test red_metrics_emission; echo exit=$?
+running 5 tests
+test rss_parser_reads_rss_anon_not_vmrss ... FAILED
+exit=101
+```
+
+This is the required TD-021 guard: the fixture has `VmRSS != RssAnon`, and the oracle requires `RssAnon * 1024`.
+
+**Sampler dead-zero false-green: CLOSED.**
+
+Temporary mutation:
+
+```rust
+pub fn sample_rss(metrics: &Metrics) {
+    metrics.set_gauge("recorder_rss_anon_bytes", &[], 0);
+}
+```
+
+Result:
+
+```text
+cargo test -p recorder --test red_metrics_emission rss_sampler_emits_positive_anon_bytes -- --exact; echo exit=$?
+rss_sampler_emits_positive_anon_bytes ... FAILED
+recorder_rss_anon_bytes == 0 после sample_rss
+exit=101
+
+cargo test -p recorder --test red_metrics_emission; echo exit=$?
+running 5 tests
+test rss_sampler_emits_positive_anon_bytes ... FAILED
+exit=101
+```
+
+### Convergence boundary
+
+The steady-emission oracle now pins the classes that caused the C-014 sequence:
+
+1. registry-only / HELP-TYPE-only output is rejected by sample-line checks;
+2. labeled metrics require labels, not unlabeled samples;
+3. label values are independently pinned for `md_events_total{venue,symbol,kind}` and `book_levels{venue,symbol,side}`;
+4. side, kind, venue, and symbol collapse have anti-placebo coverage;
+5. dead-zero is pinned for `journal_seq_current`, `journal_disk_free_bytes`, `md_event_age_ms`, and `recorder_rss_anon_bytes`;
+6. `md_event_age_ms` value semantics are pinned by `now-last`;
+7. RSS source identity is pinned to `RssAnon`, not `VmRSS`;
+8. `journal_segment_index` remains presence-only because `0` is legitimate on the first segment;
+9. `journal_bytes_written_total` remains `>0` by contract wording here: FA §3 uses it as "are we writing at all"; exact byte accounting beyond liveness is not required for this plan-time gate.
+
+Remaining event/elsewhere metrics need trigger-specific coverage or reviewer §8, not another steady-emission oracle round. That includes `venue_ws_reconnects_total`, `journal_write_errors_total`, `journal_seq_gaps_total`, `book_resync_total`, `venue_http_status_total`, `book_divergence_bps`, and `backup_restore_drill_ok`.
+
+### Scope / cleanup
+
+The `948896c` repair commit touched `crates/recorder/tests/red_metrics_emission.rs` and `milestones/M-09-data-safety-net.md`. Scope is coherent for architect RED/spec repair.
+
+All temporary prototypes and mutations were reverted before this re-audit #6 section was appended. Final pre-verdict worktree status was clean except `research/critiques/C-014-M-09-task4c.md`.
