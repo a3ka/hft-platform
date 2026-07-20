@@ -57,6 +57,22 @@ founder отдельно (Fastify-сервер + open-source TradingView, ест
 - **risk-critic N/A для ИМПЛА сигнала** (нет safety/order-path); но БЭКТЕСТ-ОТЧЁТ (task 6) — анти-оверфит §6 + risk-critic (как M-10).
 - Экспорт-формат — стабильный контракт для downstream-фронта (версионируется); рендер вне scope.
 
+## Экспорт-контракт (под готовый фронт founder'а — `code2alpha`, lightweight-charts v5)
+
+Формат НЕ изобретаем — целим в то, что фронт УЖЕ умеет (проверено architect'ом по `code2alpha`):
+
+- **Свечи:** TradingView **UDF** (`config`/`symbol_info`/`history`) с базой **1s** (`type:'second',
+  baseInterval:1`) — фронт агрегирует клиентски до 1m/1h/D. Наш бэкенд агрегирует trades/snapshots в
+  1s-OHLCV. Прецедент: `hft-core-rs-` `/v1/bars`.
+- **Order-flow серии (наш вклад):** в shape lightweight-charts v5 — `LineData{time,value}`
+  (cumulative delta), `HistogramData{time,value,color}` (footprint-дельта/бар, цвет=знак),
+  сигналы — маркеры/серия. `time` = UTC seconds. Full per-price footprint-bins отдаём как данные;
+  их custom-series рендер — фронт-работа (вне scope).
+- **Механизм подачи:** лёгкий read-only эндпоинт ИЛИ файл-экспорт (impl research-dev) — НЕ
+  детерминированный рантайм-путь (recorder не трогается).
+
+Стабильность: формат версионируется (`export_schema_version`); внутреннее вычисление меняем, не ломая фронт.
+
 ## Связь с роадмапом
 
 Phase A (этот) — trade-flow, из существующих данных, СЕЙЧАС. Phase B (**M-18**, CT-RFC-04 `L2Delta` +
