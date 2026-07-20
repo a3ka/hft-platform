@@ -55,7 +55,7 @@ recon-дизайном FA §4 и уточняется на critic-аудите �
   подтверждает: диф recorder ⊂ `{main.rs (spawn), metrics_server.rs}`, MD-only, без journal/order.
 - **`crates/recorder/src/{lib.rs,main.rs,recon_loop.rs,metric_emit.rs}` + `crates/venue-*/src/**` —
   task-4C metric-emission carve-out (engine-dev; venue-dev для reconnect).** Развести продюсеры (§3
-  продюсер-карта): `run_writer` (lib.rs) эмитит `journal_bytes_written_total`/`journal_seq_current`/
+  продюсер-карта): `run_writer` (lib.rs) эмитит `journal_frames_written_total`/`journal_seq_current`/
   `journal_segment_index`/`journal_disk_free_bytes`/`journal_write_errors_total`/`journal_seq_gaps_total`
   + `md_events_total` (классификация `EventKind` при append; **канон `kind`-label — ОДИН на вариант
   `MdPayload`: `trade`/`l2snapshot`/`funding`/`open_interest`/`liquidation`/`margin_rate`; kind ОБЯЗАН
@@ -272,7 +272,7 @@ total`. Правила P0/P1 формирующих инцидентов (TD-011
 - **architect RED (sacred, ГОТОВО):**
   - `crates/recorder/tests/red_metrics_emission.rs` — прогоняет РЕАЛЬНЫЕ продюсеры с общим `Arc<Metrics>`:
     (а) `run_writer` (новая сигнатура с `&Metrics`) на последовательности Md+Sys событий + shutdown →
-    `prometheus_text()` несёт SAMPLE для `journal_bytes_written_total`>0, `journal_seq_current`>0,
+    `prometheus_text()` несёт SAMPLE для `journal_frames_written_total`>0, `journal_seq_current`>0,
     `journal_segment_index`, `journal_disk_free_bytes`, `md_events_total{venue,symbol,kind}`>0,
     `md_event_age_ms{venue}`; (б) ЖИВОЙ loop `run_books_feeder(md_rx, books, &Metrics)` — ТОТ ЖЕ, что
     спавнит `main` (НЕ leaf-хелпер) — на L2Snapshot → `book_levels{venue,symbol,side}` SAMPLE; (в) sampler
