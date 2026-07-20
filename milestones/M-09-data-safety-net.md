@@ -56,8 +56,8 @@ recon-дизайном FA §4 и уточняется на critic-аудите �
 - **`crates/recorder/src/{lib.rs,main.rs,recon_loop.rs,metric_emit.rs}` + `crates/venue-*/src/**` —
   task-4C metric-emission carve-out (engine-dev; venue-dev для reconnect).** Развести продюсеры (§3
   продюсер-карта): `run_writer` (lib.rs) эмитит `journal_frames_written_total`/`journal_seq_current`/
-  `journal_segment_index`/`journal_disk_free_bytes`/`journal_write_errors_total`/`journal_seq_gaps_total`
-  + `md_events_total` (классификация `EventKind` при append; **канон `kind`-label — ОДИН на вариант
+  `journal_segment_index`/`journal_disk_free_bytes`/`journal_write_errors_total` (последний — writer-event
+  на ошибке append) + `md_events_total` (классификация `EventKind` при append; **канон `kind`-label — ОДИН на вариант
   `MdPayload`: `trade`/`l2snapshot`/`funding`/`open_interest`/`liquidation`/`margin_rate`; kind ОБЯЗАН
   отражать РЕАЛЬНЫЙ тип payload; venue/symbol/kind РАЗЛИЧИМЫ, не схлопнуты — C-014 re-audit #2/#3**;
   данные storage/seq УЖЕ считаются для heartbeat; steady `journal_seq_current`/`disk_free_bytes` > 0,
