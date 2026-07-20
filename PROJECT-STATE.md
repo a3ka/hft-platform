@@ -763,10 +763,22 @@ dimension/value-collapse, kind-aware, RssAnon≠VmRSS) → engine-dev impl `ac64
   жив), `recorder_rss_anon_bytes=17506304` (RssAnon ~17 MB, TD-016 P1 жив). Event-метрики
   (`journal_write_errors_total`/`journal_seq_gaps_total`/`venue_ws_reconnects_total`) корректно
   отсутствуют на здоровом прогоне (реальный триггер не наступил). **TD-027 CLOSED.**
-- **Остаточные NOTE (не блокеры, в TD-027):** (1) `journal_bytes_written_total` считает КАДРЫ, не байты
-  (имя вводит в заблуждение; для TD-011-liveness — валидно); (2) `journal_seq_gaps_total` без
-  writer-продюсера → правило **OPS-GAP** на writer-пути не сработает (gap детектируется только на
-  read/replay — нужен продюсер там или пересмотр правила; зона architect).
+- **Остаточные NOTE (в TD-027):** (1) **✅ DONE task 4D** (см. ниже) — метрика переименована в
+  `journal_frames_written_total`; (2) `journal_seq_gaps_total` без writer-продюсера → правило **OPS-GAP**
+  на writer-пути не сработает (gap детектируется только на read/replay — нужен продюсер там или пересмотр
+  правила; зона architect, придёт с task 3).
+
+#### task 4D (NOTE-1 rename metric-contract) — MERGED + В ПРОДЕ (`83c340c`, reviewer APPROVED + §8 PROD GREEN 2026-07-20)
+Чистый rename `journal_bytes_written_total → journal_frames_written_total` (NOTE-1 TD-027: честное имя —
+счётчик КАДРОВ, +1/append). Цепочка: architect RED `028fe08` (oracle → новое имя) + docs → critic C-015
+audit+re-audit APPROVE → engine-dev `f442c96`. Диф dev-коммита ⊂ 5 файлов (ops/{alerts,metrics}.rs,
+recorder/{lib,metric_emit}.rs, deploy/alerts/ops.rules.yml) — только строковый литерал + комментарии,
+никаких новых веток/guard/флагов, поведение идентично. TD-011 PromQL перерендерена
+(`rate(journal_frames_written_total[1m]) == 0`); yml == renderer (drift 0); старое имя 0 hits в crates/+deploy.
+Sacred (oracle) обновлён architect'ом, не dev. Гейты reviewer'ом независимо: workspace **282/0**, clippy 0,
+fmt clean, `verify_M-09.sh` **PASS (21)**. **§8 PROD (`83c340c`):** `journal_frames_written_total=4099`
+растёт, старое имя ОТСУТСТВУЕТ, journal_seq/segment/disk живые, healthy restarts=0, panic/ERROR=0.
+**TD-027 NOTE-1 DONE; NOTE-2 (seq_gaps read-side) остаётся до task 3.**
 - **M-09 остаётся 🚧 ACTIVE:** task 3 (сохранность/restore-drill — заблокирован Storage Box founder ★),
   task 5 (verify финал), task 6 (tester+reviewer финальный §8 milestone'а). Живое alerting-роутинг
   (Alertmanager, §O) — отдельное founder ★ решение; метрики под него теперь ЖИВЫЕ.

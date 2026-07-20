@@ -18,12 +18,17 @@
   reviewer'ом независимо: workspace **282/0**, red_metrics_emission 5/5, clippy 0, fmt clean,
   `verify_M-09.sh` **PASS (20)**; scope dev-коммита ⊂ `recorder/src/{lib,main,metric_emit}.rs`; critic
   C-014 re-audit #6 APPROVE. Алерты 3 формирующих инцидентов (TD-011/014/016) теперь ссылаются на
-  ЖИВЫЕ метрики. **Остаточные NOTE (не блокеры, зафиксированы):**
-  (1) `journal_bytes_written_total` считает КАДРЫ, не байты (точный байт-счётчик требует правки sacred
-  `Journal::append`) — для TD-011 P0 «recorder жив, но не пишет» кадры/окно = валидный liveness-сигнал,
-  но имя вводит в заблуждение (переименовать в `_frames_` ИЛИ протянуть длину кадра из append — мелкая
-  follow-up задача architect);
-  (2) `journal_seq_gaps_total` — БЕЗ writer-продюсера (в append-потоке рекордера seq монотонен по
+  ЖИВЫЕ метрики. **Остаточные NOTE:**
+  (1) **✅ DONE task 4D (`f442c96`/merge `83c340c`, reviewer §8 PROD GREEN 2026-07-20):** метрика
+  переименована `journal_bytes_written_total → journal_frames_written_total` (честное имя — счётчик
+  КАДРОВ, +1/append; точный байт-счётчик потребовал бы правки sacred `Journal::append` — out of scope).
+  Чистый rename: 5 файлов (ops/{alerts,metrics}, recorder/{lib,metric_emit}, deploy/alerts/ops.rules.yml),
+  только строковый литерал + комментарии, поведение идентично; TD-011 PromQL перерендерена
+  (`rate(journal_frames_written_total[1m]) == 0`, yml == renderer, drift 0). Гейты reviewer'ом: workspace
+  282/0, clippy 0, verify PASS (21). **§8 PROD (`83c340c`): `journal_frames_written_total=4099` растёт,
+  старое имя ОТСУТСТВУЕТ (grep пусто), healthy restarts=0.** Sacred (oracle `red_metrics_emission.rs`)
+  обновлён architect'ом (`028fe08`), не dev. critic C-015 re-audit APPROVE.
+  (2) **OPEN (до task 3):** `journal_seq_gaps_total` — БЕЗ writer-продюсера (в append-потоке рекордера seq монотонен по
   построению → естественного gap-триггера нет; классифицирована как event/elsewhere). Правило алерта
   **OPS-GAP** ссылается на неё → на writer-пути оно НИКОГДА не сработает. Gap реально детектируется
   ТОЛЬКО на READ/replay-пути (`read_all`/`stream` через границы сегментов) — нужен либо продюсер там,
