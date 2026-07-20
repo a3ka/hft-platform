@@ -57,7 +57,10 @@ recon-дизайном FA §4 и уточняется на critic-аудите �
   task-4C metric-emission carve-out (engine-dev; venue-dev для reconnect).** Развести продюсеры (§3
   продюсер-карта): `run_writer` (lib.rs) эмитит `journal_bytes_written_total`/`journal_seq_current`/
   `journal_segment_index`/`journal_disk_free_bytes`/`journal_write_errors_total`/`journal_seq_gaps_total`
-  + `md_events_total`/`md_event_age_ms` (классификация `EventKind` при append; данные storage/seq УЖЕ
+  + `md_events_total`/`md_event_age_ms` (классификация `EventKind` при append; **канон `kind`-label —
+  ОДИН на вариант `MdPayload`: `trade`/`l2snapshot`/`funding`/`open_interest`/`liquidation`/`margin_rate`;
+  kind ОБЯЗАН отражать РЕАЛЬНЫЙ тип payload, иначе TD-014 «класс пропал» неотличим — C-014 re-audit #2**;
+  данные storage/seq УЖЕ
   считаются для heartbeat); ЖИВОЙ feeder-loop `run_books_feeder` (lib.rs; экстракт inline books-feeder'а
   из `main.rs` — применяет `apply_md_to_books` + эмитит) → `book_levels`, и `main` ОБЯЗАН его спавнить
   (C-014 gap-2 live-wiring); периодический sampler (`main.rs` спавн + `metric_emit.rs`, `/proc/self/status`

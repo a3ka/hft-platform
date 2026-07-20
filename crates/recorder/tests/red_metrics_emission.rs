@@ -18,7 +18,7 @@
 
 use std::sync::Arc;
 
-use contracts::{EventKind, Level, MdEvent, MdPayload, SysEvent, Venue};
+use contracts::{EventKind, Level, MdEvent, MdPayload, Side, SysEvent, Venue};
 use journal::Journal;
 use ops::metrics::Metrics;
 use recorder::metric_emit::sample_rss;
@@ -115,6 +115,24 @@ fn l2_event(sym: &str, n_bid: usize, n_ask: usize) -> EventKind {
     })
 }
 
+/// КАНОНИЧЕСКИЕ значения label `kind` для `md_events_total{kind=…}` (контракт engine-dev — ОДИН на
+/// вариант `MdPayload`; C-014 re-audit #2): `Trade`→`trade`, `L2Snapshot`→`l2snapshot`,
+/// `Funding`→`funding`, `OpenInterest`→`open_interest`, `Liquidation`→`liquidation`,
+/// `MarginRate`→`margin_rate`. kind ОБЯЗАН отражать РЕАЛЬНЫЙ тип payload — иначе TD-014 «класс
+/// событий пропал» неотличим (l2snapshot, помеченный как trade, скрывает пропажу L2-потока).
+fn trade_event(sym: &str) -> EventKind {
+    EventKind::Md(MdEvent {
+        venue: Venue::Binance,
+        symbol: sym.to_string(),
+        payload: MdPayload::Trade {
+            price: 65_000 * UNIT,
+            size: UNIT,
+            side: Side::Buy,
+            ts_exch_ms: 1,
+        },
+    })
+}
+
 /// (1, ПАДАЕТ против registry-only) Прогон РЕАЛЬНОГО writer'а на Md+Sys событиях → journal-* и md-*
 /// метрики несут SAMPLE (не только HELP/TYPE). Ровно TD-027: writer append'ит, но метрики были мертвы.
 #[tokio::test]
@@ -124,9 +142,13 @@ async fn writer_emits_journal_and_md_metrics() {
     let metrics = Arc::new(Metrics::new());
 
     let (tx, rx) = tokio::sync::mpsc::channel::<EventKind>(500);
-    // 30 L2Snapshot (Md) + 20 Heartbeat (Sys) — writer append'ит все, метрики обязаны ожить.
+    // 30 L2Snapshot + 10 Trade (ДВА разных MD-kind) + 20 Heartbeat (Sys). Два kind ловят «kind не
+    // отражает тип payload» (C-014 re-audit #2): счётчики per-kind обязаны совпасть с числом СВОЕГО типа.
     for _ in 0..30 {
         tx.send(l2_event("BTCUSDT", 5, 5)).await.unwrap();
+    }
+    for _ in 0..10 {
+        tx.send(trade_event("BTCUSDT")).await.unwrap();
     }
     for _ in 0..20 {
         tx.send(EventKind::Sys(SysEvent::Heartbeat)).await.unwrap();
@@ -176,13 +198,28 @@ async fn writer_emits_journal_and_md_metrics() {
         "journal_bytes_written_total == 0 после 50 append'ов — writer пишет, а счётчик байт мёртв \
          (ровно TD-011-метрика «жив, но не пишет» неработоспособна)"
     );
-    // Label-aware value (C-014 re-audit): labeled-но-НУЛЕВОЙ `md_events_total{...} 0` НЕ проходит.
-    assert!(
-        labeled_sample_value(&text, "md_events_total", &[("venue", "binance"), ("symbol", "BTCUSDT")])
-            .unwrap_or(0)
-            >= 1,
-        "md_events_total{{venue=binance,symbol=BTCUSDT}} == 0 после 30 Md-событий — labeled-серия есть, \
-         но НЕ инкрементируется (TD-014-метрика «класс событий пропал» мертва по значению)"
+    // KIND-aware ТОЧНЫЕ счётчики (C-014 re-audit #2): kind ОБЯЗАН отражать ТИП payload. Импл,
+    // помечающий L2Snapshot как kind="trade" (или любой неверный kind), даёт {kind=l2snapshot}
+    // отсутствующим/неверным → TD-014 «пропал класс событий» невозможно детектировать.
+    assert_eq!(
+        labeled_sample_value(
+            &text,
+            "md_events_total",
+            &[("venue", "binance"), ("symbol", "BTCUSDT"), ("kind", "l2snapshot")]
+        ),
+        Some(30),
+        "md_events_total{{kind=l2snapshot}} != 30 после 30 L2Snapshot — kind не отражает тип payload \
+         (напр. L2 помечен как trade) → пропажа L2-потока (TD-014) незаметна. Канон: L2Snapshot→l2snapshot"
+    );
+    assert_eq!(
+        labeled_sample_value(
+            &text,
+            "md_events_total",
+            &[("venue", "binance"), ("symbol", "BTCUSDT"), ("kind", "trade")]
+        ),
+        Some(10),
+        "md_events_total{{kind=trade}} != 10 после 10 Trade — kind-размерность не различает классы \
+         событий (trade слит с l2snapshot или пуст). Канон: Trade→trade"
     );
 }
 
