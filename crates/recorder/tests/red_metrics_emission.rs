@@ -187,8 +187,8 @@ async fn writer_emits_journal_and_md_metrics() {
     );
     // DEAD-ZERO ловим (C-014 re-audit #3): steady-величины обязаны быть > 0.
     assert!(
-        sample_value(&text, "journal_bytes_written_total").unwrap_or(0) > 0,
-        "journal_bytes_written_total == 0 после 72 append'ов — счётчик байт мёртв (TD-011)"
+        sample_value(&text, "journal_frames_written_total").unwrap_or(0) > 0,
+        "journal_frames_written_total == 0 после 72 append'ов — счётчик кадров мёртв (TD-011; NOTE-1: кадры, не байты)"
     );
     assert!(
         sample_value(&text, "journal_seq_current").unwrap_or(0) > 0,
