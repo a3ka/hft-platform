@@ -3,6 +3,17 @@
 > **Reviewer-owned.** Открытые долги/риски, замеченные при работе. Закрытые переносятся вниз.
 
 ## OPEN
+- **TD-028** `export-io-ram-linear-in-journal-size` (замечено reviewer'ом на PR-гейте M-17, 2026-07-21;
+  флаг research-dev). `crates/research-cli/src/export_io.rs::export_to_dir` собирает trades/snapshots в
+  `HashMap<(Venue, String), InstrumentBucket>` за ОДИН проход `journal::stream`, затем сериализует
+  per-instrument. Стрим сам bounded-memory (per-сегмент), но БУФЕРЫ (`Vec<TradeRow>`/`Vec<(i64,OrderBook)>`)
+  копятся в RAM за всю выборку → **память линейна по объёму журнала**. На прод-масштабе (>10⁷ событий,
+  15+ GB журнал) экспорт всей истории может не влезть в RAM — класс TD-011 этажом выше (research-путь, не
+  прод-сбор, поэтому Severity ниже). НЕ блокер M-17 (приёмка = корректность+детерминизм, оба GREEN; экспорт
+  окна/инструмента текущего масштаба работает). **Нужно для прод-M-19** (фронт против полной истории):
+  chunked/streaming-write (per-(venue,symbol) файл закрывать по мере прохода, или time-window партиции) —
+  зона research-dev, при подключении M-19 к реальному объёму. Severity: **NOTE** (research-инструмент, не
+  24/7 прод; данные не теряются — экспорт либо отработает, либо честно OOM'нет, журнал цел).
 - **TD-027** `ops-metrics-declared-and-cataloged-but-not-wired-to-emission` — **✅ CLOSED task 4C
   (`ac645ac`, reviewer §8 PROD GREEN + APPROVED 2026-07-20).** Фикс: OPS-I-10 «объявлена ⟹ эмитится»
   — продюсер-сеймы `emit_post_append` (writer), `run_books_feeder`, `sample_rss`/`sample_md_age`

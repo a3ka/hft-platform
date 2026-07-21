@@ -783,6 +783,39 @@ fmt clean, `verify_M-09.sh` **PASS (21)**. **§8 PROD (`83c340c`):** `journal_fr
   task 5 (verify финал), task 6 (tester+reviewer финальный §8 milestone'а). Живое alerting-роутинг
   (Alertmanager, §O) — отдельное founder ★ решение; метрики под него теперь ЖИВЫЕ.
 
+## Order-flow export (M-17 «order-flow Phase A — бэкенд+экспорт под code2alpha» — MERGED + §8 INERT-SAFE, reviewer APPROVED 2026-07-21)
+Research-only: экспорт-механизм журнал→JSON для будущего фронта code2alpha (M-19). **Рекордер НЕ зависит
+от research-cli** → §8 = inert-safety (поведение сбора не меняется). Цепочка: architect RED (6 файлов:
+red_{depth_series,footprint,footprint_bins,ohlcv}) + verify + spec → critic C-016 (REJECT→re-audit APPROVE)
+→ research-dev impl `749b759` → **reviewer CHANGES REQUESTED (dev правил sacred-тест red_footprint_bins.rs:
+`#[allow(clippy::needless_lifetimes)]`)** → architect hot-fix `fb66b52` (элидировал `bin()` lifetime в корне,
+убрал allow, sacred-authorship восстановлена) → reviewer APPROVED. Merge ff `fb66b52`.
+- `crates/research-cli/src/{depth_series,orderflow,export,export_io}.rs` + `main.rs` (`cmd_export`) — 4 новых
+  pub-модуля. `export_io::export_to_dir` — ЕДИНСТВЕННАЯ I/O-граница: `journal::stream` (read-only,
+  `EpochFilter::OwnCaptureOnly` по дефолту — vendor/синтетика не подмешивается) + `fs::write`. НИКАКОГО
+  `Journal::open`/`.append(EventKind)` — **RC-I-7** подтверждён pre-existing structural-тестом
+  `tests/structural.rs::test_no_journal_write_path` (grep src) GREEN.
+- **Детерминизм (RC-I-5):** все редьюсеры `BTreeMap`-keyed (`depth_series`/`export`/`orderflow`); `export_io`
+  СОРТИРУЕТ ключи `(venue,symbol)` перед записью → байт-стабильный вывод; в payload нет wall-clock (кроме
+  `first/last_wall_ms` из самих событий). `book_divergence`-класса недетерминизма нет.
+- `research/exports/format.md` — стабильный v1 контракт под code2alpha (`export_schema_version:1`, UDF 1s-бары
+  + lightweight-charts серии + per-price footprint bins). Breaking-изменения формы — только через bump + RFC
+  (M-19 фронт строится против v1; менять аддитивно).
+- **Block-scope:** diff ⊂ research-cli src+tests + milestones (architect) + C-016 (critic) + format.md + verify.
+  **Contracts НЕ тронуты → Block-C clean; CT-RFC не нужен.** Не трогает risk/oms/killswitch/venues → risk-critic N/A.
+- **Гейты (reviewer независимо на чистом worktree @fb66b52):** fmt clean, **clippy 0 БЕЗ единого allow**
+  (элид-фикс в корне), research-cli **48/0**, `verify_M-17.sh` **VERDICT PASS (6/6)**. Sacred-тесты правил
+  ТОЛЬКО architect; dev-коммит `85bae9d` (allow) откачен architect-хотфиксом.
+- **§8 INERT-SAFE (VPS `fb66b52`, CI+Deploy success, 2026-07-21):** рекордер БЕЗ изменений — healthy,
+  restarts=0, heartbeat свежий, **seq растёт** (`next_seq 56991588 → 56991931` за 12с), `writable=true`,
+  panic/ERROR=0. M-17 не касается hot-path сбора (research-cli вне дерева зависимостей recorder).
+- **Долг (TD-028, NOTE, не блокер M-17):** `export_io` копит `HashMap<(Venue,String),InstrumentBucket>` за
+  один проход → RAM линейна по объёму журнала; на >10⁷ событий для прод-M-19 нужен chunked-write. Приёмка
+  M-17 — корректность + детерминизм (оба GREEN), не масштаб.
+- **Процессная заметка (branch-hygiene, не блокер):** research-dev вёл работу на `research-dev/feat-orderflow-plan`,
+  а не на shared `feat/orderflow-plan` (`@241c77e`, без impl) — последний рискует остаться осиротевшим
+  указателем. Зафиксировано для architect (подчистить ветку).
+
 ## Пока НЕ реализовано (следующие фазы)
 - Крейты `risk`/`killswitch`/`oms`, `runner` — пофазно per DESIGN §10 (M-08: fail-closed риск-гейт
   между `strategy` и `oms`). MM-котирование, wiring весов из `signals.json` (граница B),
