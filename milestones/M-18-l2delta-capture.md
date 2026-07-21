@@ -40,6 +40,7 @@ valid/invalid + CHANGELOG + red_rfc04) — уже в наборе architect'а (
 | L2D-I-3 | **Семантика уровней (= apply_diff_to_book §A, testing.md «отсутствие»):** `size==0` = явный remove; уровень, которого в дельте НЕТ, — НЕ трогается; пустая сторона = «не менялось», не «очистить» |
 | L2D-I-4 | **Continuity перпа по `pu`, не по `U==last+1`** (урок TD-014): futures несёт `prev_final=Some(pu)`, spot — `None`; путаница ломает gap-детекцию. RED `red_l2delta_futures` |
 | L2D-I-5 | **Sacred write-path exact:** L2Delta переживает write→read_all (postcard+crc32) байт-в-байт; DET-I-1 не ослаблен. RED `red_l2delta_persist` |
+| L2D-I-8 | **Rollback-safety (C-018):** L2Delta изолирован в сегменте M-18-provenance (git-sha) — pre-M18 сегмент НЕ получает variant-6 → чистый quarantine при откате; seq не переиспользуется через границу. Silent-откат на pre-M18 бинарь запрещён (runbook `ops.md` §5.1). RED `red_l2delta_rollback_boundary` |
 | L2D-I-6 | **Инертность к бэктесту и safety:** `sim` ИГНОРИРУЕТ L2Delta (fill ведётся из L2Snapshot+Trade — сырая дельта = двойной учёт); order-путь/risk не тронуты (MD-only). Консюмер-армы (5 сайтов, RFC §6) — дефолт IGNOR; исключения: journal ts (#1), recorder лейбл `"l2delta"` (#3) |
 | L2D-I-7 | **Магия/версия неизменны:** `SEGMENT_MAGIC=HFTJRN02`, `SCHEMA_VERSION=2` — bump сломал бы чтение боевых сегментов. verify-канарейка |
 
@@ -47,8 +48,9 @@ valid/invalid + CHANGELOG + red_rfc04) — уже в наборе architect'а (
 
 - `crates/contracts/src/lib.rs` (T1 `L2Delta`, ТОЛЬКО через CT-RFC-04), `schema/`, `fixtures/`,
   `CHANGELOG.md`, `docs/rfc/CT-RFC-04-l2delta.md` — **architect** (T1 via RFC).
-- `*/tests/**` (red_rfc04, red_l2delta_capture, red_l2delta_futures, red_l2delta_persist),
-  `scripts/verify_M-18.sh`, milestone — **architect** (sacred).
+- `*/tests/**` (red_rfc04, red_l2delta_capture, red_l2delta_futures, red_l2delta_persist,
+  red_l2delta_rollback_boundary), `scripts/verify_M-18.sh`, `docs/fa/ops.md` §5.1 (rollback-runbook),
+  milestone — **architect** (sacred/docs).
 - `crates/venue-binance/src/lib.rs` (spot `l2delta_event` + emit в `run`/`handle_text_message`) — **venue-dev** (MD-only).
 - `crates/venue-binance-futures/src/lib.rs` (`pub struct DepthDiff` + `l2delta_event(Some(pu))` + emit) — **venue-dev** (MD-only).
 - `crates/journal/src/segments.rs` (арм L2Delta в `segment_last_ts` OR-паттерн) — **engine-dev**.
@@ -62,20 +64,22 @@ valid/invalid + CHANGELOG + red_rfc04) — уже в наборе architect'а (
 | # | Статус | Задача | Кто | Acceptance |
 |---|---|---|---|---|
 | 1 | ✅ DONE | CT-RFC-04 doc + `MdPayload::L2Delta` T1 + сген. JSON Schema + фикстуры valid/invalid + CHANGELOG + `red_rfc04` | architect | red_rfc04 + red_schema GREEN; L2D-I-1 |
-| 2 | ✅ DONE | Sacred RED: `red_l2delta_capture` (spot), `red_l2delta_futures` (fut), `red_l2delta_persist` (journal) + `verify_M-18.sh` | architect | compile-RED падает без impl; достижим прототипом |
+| 2 | ✅ DONE | Sacred RED: `red_l2delta_capture` (spot), `red_l2delta_futures` (fut), `red_l2delta_persist` + `red_l2delta_rollback_boundary` (journal) + `verify_M-18.sh` + RFC §10 + `ops.md` §5.1 runbook | architect | compile-RED падает без impl; достижим (prototype-revert GREEN) |
 | 3 | ⏳ | venue-binance СПОТ: `pub fn l2delta_event(&DepthDiff)` (prev_final=None) + вызов в emit-пути для каждого распарсенного diff'а (независимо от sync-FSM). **Эмиссия — ТОЛЬКО BTCUSDT (founder ★ (а)):** allow-list символов; не-BTC diff L2Delta НЕ эмитит (остаётся на L2Snapshot) | venue-dev | L2D-I-2/3 GREEN; wiring-канарейка; non-BTC не эмитит |
 | 4 | ⏳ | venue-binance-futures ПЕРП: `pub struct DepthDiff` + `l2delta_event` (prev_final=Some(pu)) + emit, **эмиссия ТОЛЬКО BTCUSDT (founder ★ (а))** | venue-dev | L2D-I-2/4 GREEN |
 | 5 | ⏳ | Консюмер-армы — РОВНО 5 сайтов (RFC §6, prototype-verified): (1) `journal/segments.rs segment_last_ts` +ts; (2) `sim/exchange.rs` IGNOR; (3) `recorder/lib.rs md_kind_label` → `"l2delta"`; (4) `journal/examples/dump.rs` IGNOR; (5) `research-cli/bin/latency_probe.rs` → continue. `red_l2delta_persist` GREEN; workspace собирается | engine-dev | L2D-I-5/6 GREEN; `cargo build --workspace --all-targets` ok (0×E0004) |
-| 6 | ⏳ | **§8 live-emit на VPS** (РЕШАЮЩИЙ, unit≠live TD-014): после deploy в журнале появляются `Binance.L2Delta` + `BinanceFutures.L2Delta` для **BTCUSDT** с живого WS; **scope-(а): не-BTC L2Delta ОТСУТСТВУЕТ** (ETH и др. — только L2Snapshot); темп записи в бюджете §5 (ниже, чем полный набор); recorder healthy, `seq_gaps=0`, disk `writable=true` | reviewer | §8 GREEN + пруф в close-out |
+| 6 | ⏳ | **§8 live-emit на VPS** (РЕШАЮЩИЙ, unit≠live TD-014): после deploy в журнале появляются `Binance.L2Delta` + `BinanceFutures.L2Delta` для **BTCUSDT** с живого WS; **scope-(а): не-BTC L2Delta ОТСУТСТВУЕТ**; **rollback-safety (C-018): первое L2Delta ушло в НОВЫЙ сегмент (не в pre-M18 активный), post-M18 сегмент идентифицируем по provenance; runbook `ops.md` §5.1 понят — авто-rollback не вслепую**; темп записи в бюджете §5; recorder healthy, `seq_gaps=0`, disk `writable=true` | reviewer | §8 GREEN + пруф в close-out |
 | 7 | ⏳ | tester: чистый чекаут — fmt/clippy/`cargo test`/`verify_M-18.sh` PASS exit=0 | tester | VERDICT: PASS |
 
 ## Гейты
 
 - **critic** (новый milestone §9 Class A; T1-триггер; ≥5 коммитов; ломающих форму T1 НЕТ — аддитивно).
 - **risk-critic ОБЯЗАТЕЛЕН** (`gates.md` §5): T1-изменение + sacred live-path (venue/recorder/journal).
-  Фокус: (0) объём/ретеншен-развилка §5 RFC — ускорение disk-таймера ~40→~20 дней ⇒ TD-020 срочен;
-  (1) MD-only (order-путь не тронут); (2) инертность бэктеста (sim игнорирует); (3) магия/версия целы
-  (прод-чтение); (4) аддитивность дискриминантов (старые журналы). Вердикт `research/critiques/C-0NN.md`.
+  **C-018 = CONCERNS (2026-07-21):** PASS по MD-only/sim-инертности/магии/дискриминантам; blocking
+  concern — **rollback-safety** (pre-M18 бинарь не декодит variant-6 → silent-откат = seq-reuse).
+  **Устранено architect'ом (rev2):** RED `red_l2delta_rollback_boundary` (L2Delta изолирован в
+  M-18-provenance сегменте) + RFC §10 + runbook `ops.md` §5.1 + §8 rollback-check (task 6) +
+  follow-up TD (startup schema-guard). Требует re-audit risk-critic.
 - **§8 post-merge** (прод НЕ инертен — recorder начинает писать L2Delta): задача 6, решающий live-гейт.
 - Founder ★ РЕШЕНО (2026-07-21): развилка §5 RFC = **вариант (а)** — захват только BTCUSDT (spot+perp). risk-critic оценивает уже выбранную (более безопасную) ветку.
 

@@ -71,6 +71,15 @@ done
 # ── Задача 5 (engine-dev): консюмер-армы + sacred write-path персистит L2Delta ───────────
 run "journal red_l2delta_persist (L2Delta переживает write→read_all exact; spot+futures)" \
   cargo test -p journal --test red_l2delta_persist
+# ── Rollback-safety (C-018 risk-critic): L2Delta изолирован в M-18-provenance сегменте ──
+run "journal red_l2delta_rollback_boundary (L2Delta в НОВОМ сегменте; pre-M18 чист → quarantine; нет seq-reuse)" \
+  cargo test -p journal --test red_l2delta_rollback_boundary
+# ── Структурно: runbook отката задокументирован (C-018 mitigation) ──────────────────────
+if grep -q "L2Delta" docs/rfc/CT-RFC-04-l2delta.md && grep -qE "§5\.1|Runbook: откат" docs/fa/ops.md; then
+  pass "rollback-runbook задокументирован (RFC §10 + ops.md §5.1) — C-018 mitigation"
+else
+  fail "нет rollback-runbook (RFC §10 / ops.md §5.1) — C-018 blocking concern не закрыт"
+fi
 # Полный workspace собирается ⇒ ВСЕ исчерпывающие match MdPayload получили арм L2Delta (E0004 закрыты).
 run "workspace собирается со всеми armами L2Delta (E0004 закрыты: journal/sim + любой оставшийся)" \
   cargo build --workspace --all-targets

@@ -160,6 +160,44 @@ ts:1752000000123}}` НА ДЕРЕВЕ БЕЗ L2Delta → 49 байт (в тес�
 
 - Не строит движок реконструкции стакана / absorption-сигналы (семья S-003+, M-19 Тир-3, research).
 - Не трогает order-путь и risk-инварианты (MD-only). recorder пишет L2Delta generic'ом (без правок).
-- Не решает развилку §5 (а/б) — это решение founder'а по вердикту risk-critic.
 - Не доставляет ретеншен в прод (TD-020 task 14) — но делает его срочным (§5).
-```
+
+## §10. Rollback-safety: L2Delta — forward-миграция журнала (C-018 risk-critic)
+
+**Проблема (asymmetric-cost, sacred data-path).** `L2Delta` — variant-6 в append-only журнале на
+ОБЩЕМ персистентном томе. **Pre-M18 бинарь его не декодит** (postcard strict). Что происходит при
+откате на pre-M18 бинарь против журнала, где уже есть L2Delta:
+- hot-путь `scan_tail_for_last_seq` → `postcard::from_bytes::<Event>` даёт `Err` на L2Delta-фрейме
+  → `i += 1` (SKIP, не крах) → но `next_seq` может НЕДОСЧИТАТЬСЯ (последний seq был в
+  пропущенном L2Delta-фрейме) → **тихий SEQ REUSE** при записи нового сегмента (хуже громкого
+  краха — портит тотальный порядок, DET-I-1);
+- offline `read_all` → **hard `Err`** на первом L2Delta-фрейме.
+
+⇒ **Silent auto-rollback на pre-M18 бинарь ПРОТИВ ТОГО ЖЕ журнала ЗАПРЕЩЁН.** `deploy.yml`
+healthcheck→revert небезопасен для этого деплоя. Замечание общее: свойство касается ЛЮБОГО нового
+варианта `EventKind`/`MdPayload` (CT-RFC-01/03 тоже) — M-18 лишь выявил; политика ниже — общая.
+
+**Структурная защита (уже держится, RED `red_l2delta_rollback_boundary`).** M-18 бинарь несёт НОВЫЙ
+git-sha в `SegmentHeader.provenance` (`recorder v{ver} (git:{sha})`, main.rs:449) → `decide_open_segment`
+видит provenance-mismatch → открывает **НОВЫЙ сегмент**. Значит L2Delta НИКОГДА не дописывается в
+pre-M18 сегмент; post-M18 сегменты идентифицируемы по provenance (git-sha) и `created_wall_ms`.
+Граница чистая ⇒ quarantine = file-move целого сегмента, без потери pre-M18 данных.
+
+**Процедура отката (runbook — `docs/fa/ops.md` §5.1):** stop recorder → выявить post-M18 сегменты
+(provenance git-sha == M-18+ ИЛИ `created_wall_ms ≥ deploy_ts`) → переместить их в quarantine ВНЕ
+journal-тома → запустить pre-M18 бинарь (видит только ≤pre-M18 сегменты, `scan_tail` декодит чисто,
+`next_seq` верный, пишет в свежий сегмент) → quarantined L2Delta сохранён для re-forward. **НИКОГДА**
+не запускать pre-M18 бинарь против журнала с L2Delta в активном/хвостовом сегменте.
+
+**Deploy-гейт (§8/task 6, reviewer):** для M-18 деплоя авто-rollback — не «тихая страховка»;
+reviewer подтверждает, что runbook понят, и что первое L2Delta ушло в НОВЫЙ сегмент (не в pre-M18
+активный). **Follow-up TD (reviewer-owned):** recorder startup-guard, который ГРОМКО падает, если
+активный сегмент несёт события, которые бинарь не умеет декодить (schema-version-aware старт) —
+общий фикс для всех будущих вариантов; требует отдельного schema-gate, здесь только фиксируется.
+
+## §11. Чего RFC НЕ делает
+
+- Не строит движок реконструкции стакана / absorption-сигналы (семья S-003+, M-19 Тир-3, research).
+- Не трогает order-путь и risk-инварианты (MD-only). recorder пишет L2Delta generic'ом (без правок).
+- Не решает развилку §5 — founder ★ выбрал (а) BTC-only.
+- Не строит startup schema-guard (follow-up TD, §10) — M-18 закрывает откат процедурно + структурно.
