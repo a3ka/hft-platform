@@ -1,8 +1,9 @@
 # M-18 — Захват сырых book-дельт `L2Delta` (CT-RFC-04, Phase B / book-flow)
 
-STATUS: **PROPOSED** (2026-07-21, architect). Блок-1 roadmap (BACKLOG «Порядок исполнения»),
-TIME-SENSITIVE. Doc-гейт §9 Class A. Гейты: **critic + risk-critic** (T1 + sacred live-path).
-Ветка: `feat/M-18-l2delta`. RFC: `docs/rfc/CT-RFC-04-l2delta.md`.
+STATUS: **🚧 IN_PROGRESS** (код смержен в main `f635bd2`, reviewer APPROVED 2026-07-21; **§8 live-emit
+task 6 — post-merge деплой-гейт, milestone НЕ закрыт до §8 GREEN**). Блок-1 roadmap (BACKLOG «Порядок
+исполнения»), TIME-SENSITIVE. Doc-гейт §9 Class A. Гейты пройдены: **critic C-017 APPROVE + risk-critic
+C-018 rev3 PASS** (T1 + sacred live-path). Ветка: `feat/M-18-l2delta`. RFC: `docs/rfc/CT-RFC-04-l2delta.md`.
 
 ## Objective
 
@@ -65,11 +66,11 @@ valid/invalid + CHANGELOG + red_rfc04) — уже в наборе architect'а (
 |---|---|---|---|---|
 | 1 | ✅ DONE | CT-RFC-04 doc + `MdPayload::L2Delta` T1 + сген. JSON Schema + фикстуры valid/invalid + CHANGELOG + `red_rfc04` | architect | red_rfc04 + red_schema GREEN; L2D-I-1 |
 | 2 | ✅ DONE | Sacred RED: `red_l2delta_capture` (spot), `red_l2delta_futures` (fut), `red_l2delta_persist` + `red_l2delta_rollback_boundary` (journal) + `verify_M-18.sh` + RFC §10 + `ops.md` §5.1 runbook | architect | compile-RED падает без impl; достижим (prototype-revert GREEN) |
-| 3 | ⏳ | venue-binance СПОТ: `pub fn l2delta_event(&DepthDiff)` (prev_final=None) + вызов в emit-пути для каждого распарсенного diff'а (независимо от sync-FSM). **Эмиссия — ТОЛЬКО BTCUSDT (founder ★ (а)):** allow-list символов; не-BTC diff L2Delta НЕ эмитит (остаётся на L2Snapshot) | venue-dev | L2D-I-2/3 GREEN; wiring-канарейка; non-BTC не эмитит |
-| 4 | ⏳ | venue-binance-futures ПЕРП: `pub struct DepthDiff` + `l2delta_event` (prev_final=Some(pu)) + emit, **эмиссия ТОЛЬКО BTCUSDT (founder ★ (а))** | venue-dev | L2D-I-2/4 GREEN |
-| 5 | ⏳ | Консюмер-армы — РОВНО 5 сайтов (RFC §6, prototype-verified): (1) `journal/segments.rs segment_last_ts` +ts; (2) `sim/exchange.rs` IGNOR; (3) `recorder/lib.rs md_kind_label` → `"l2delta"`; (4) `journal/examples/dump.rs` IGNOR; (5) `research-cli/bin/latency_probe.rs` → continue. `red_l2delta_persist` GREEN; workspace собирается | engine-dev | L2D-I-5/6 GREEN; `cargo build --workspace --all-targets` ok (0×E0004) |
-| 6 | ⏳ | **§8 live-emit на VPS** (РЕШАЮЩИЙ, unit≠live TD-014): после deploy в журнале появляются `Binance.L2Delta` + `BinanceFutures.L2Delta` для **BTCUSDT** с живого WS; **scope-(а): не-BTC L2Delta ОТСУТСТВУЕТ**; **rollback-safety (C-018): первое L2Delta ушло в НОВЫЙ сегмент (не в pre-M18 активный), post-M18 сегмент идентифицируем по provenance; runbook `ops.md` §5.1 понят — авто-rollback не вслепую**; темп записи в бюджете §5; recorder healthy, `seq_gaps=0`, disk `writable=true` | reviewer | §8 GREEN + пруф в close-out |
-| 7 | ⏳ | tester: чистый чекаут — fmt/clippy/`cargo test`/`verify_M-18.sh` PASS exit=0 | tester | VERDICT: PASS |
+| 3 | ✅ DONE | venue-binance СПОТ: `pub fn l2delta_event(&DepthDiff)` (prev_final=None) + вызов в emit-пути для каждого распарсенного diff'а (независимо от sync-FSM). **Эмиссия — ТОЛЬКО BTCUSDT (founder ★ (а)):** allow-list символов; не-BTC diff L2Delta НЕ эмитит (остаётся на L2Snapshot) | venue-dev | L2D-I-2/3 GREEN; wiring-канарейка; non-BTC не эмитит |
+| 4 | ✅ DONE | venue-binance-futures ПЕРП: `pub struct DepthDiff` + `l2delta_event` (prev_final=Some(pu)) + emit, **эмиссия ТОЛЬКО BTCUSDT (founder ★ (а))** | venue-dev | L2D-I-2/4 GREEN |
+| 5 | ✅ DONE | Консюмер-армы — РОВНО 5 сайтов (RFC §6, prototype-verified): (1) `journal/segments.rs segment_last_ts` +ts; (2) `sim/exchange.rs` IGNOR; (3) `recorder/lib.rs md_kind_label` → `"l2delta"`; (4) `journal/examples/dump.rs` IGNOR; (5) `research-cli/bin/latency_probe.rs` → continue. `red_l2delta_persist` GREEN; workspace собирается | engine-dev | L2D-I-5/6 GREEN; `cargo build --workspace --all-targets` ok (0×E0004) |
+| 6 | 🚧 | **§8 live-emit на VPS** (РЕШАЮЩИЙ, unit≠live TD-014): после deploy в журнале появляются `Binance.L2Delta` + `BinanceFutures.L2Delta` для **BTCUSDT** с живого WS; **scope-(а): не-BTC L2Delta ОТСУТСТВУЕТ**; **rollback-safety (C-018): первое L2Delta ушло в НОВЫЙ сегмент (не в pre-M18 активный), post-M18 сегмент идентифицируем по provenance; runbook `ops.md` §5.1 понят — авто-rollback не вслепую**; темп записи в бюджете §5; recorder healthy, `seq_gaps=0`, disk `writable=true` | reviewer | §8 GREEN + пруф в close-out |
+| 7 | ✅ DONE | tester: чистый чекаут — fmt/clippy/`cargo test`/`verify_M-18.sh` PASS exit=0 | tester | VERDICT: PASS |
 
 ## Гейты
 

@@ -816,6 +816,53 @@ red_{depth_series,footprint,footprint_bins,ohlcv}) + verify + spec → critic C-
   а не на shared `feat/orderflow-plan` (`@241c77e`, без impl) — последний рискует остаться осиротевшим
   указателем. Зафиксировано для architect (подчистить ветку).
 
+## Book-flow capture (M-18 «сырые book-дельты L2Delta» + CT-RFC-04 — КОД MERGED `f635bd2`, reviewer APPROVED 2026-07-21; **🚧 IN_PROGRESS: §8 live-emit task 6 не выполнен — milestone НЕ закрыт**)
+Order-flow book-flow (absorption/iceberg/DOM — метод Fabio) вычислим ТОЛЬКО из сырых инкрементальных
+book-дельт `@depth@100ms` RAW DIFF, которые мы уже принимаем, но выбрасывали (в журнал уходил лишь
+бакетированный `L2Snapshot`). M-18 добавляет T1-вариант `MdPayload::L2Delta` и капчит каждый распарсенный
+diff. Цепочка: architect(1/2) → critic **C-017 REJECT→APPROVE** → founder ★ развилка §5 = **(а) BTC-only
+spot+perp** → venue-dev(3/4 MD-only) ∥ engine-dev(5, 5 армов) → risk-critic **C-018 CONCERNS→rev3 PASS**
+→ tester PASS → reviewer APPROVED. Merge `--no-ff` `f635bd2`.
+- **Гейты (reviewer перепрогнал независимо на чистом worktree @e768e88):** fmt clean; clippy
+  workspace/all-targets `-D warnings` **0**; `cargo test --workspace` **315 passed / 0 failed** (103 блока);
+  `verify_M-18.sh` **16/16 PASS, exit=0**. Совпало с tester-вердиктом.
+- `crates/contracts` (**CT-RFC-04**, atomic RFC `docs/rfc/CT-RFC-04-l2delta.md`) — `MdPayload::L2Delta
+  { bids, asks, first_update_id, final_update_id, prev_final_update_id, ts_exch_ms }`, аддитивно В КОНЕЦ
+  (postcard-дискриминант **6**, после `MarginRate=5`). **`SEGMENT_MAGIC=HFTJRN02` / `SCHEMA_VERSION=2` НЕ
+  тронуты** — старые сегменты (варианты 0..5) читаются байт-в-байт (CT-I-3, гвоздь-тест `red_rfc04`
+  историч. блоб). Пакет полный: тип + сген. JSON Schema (`red_schema`) + фикстуры valid/invalid + CHANGELOG.
+  **Block-C: правка `contracts/` ТОЛЬКО через CT-RFC-04 → НЕ авто-reject** (CT-I-2 соблюдён).
+- `crates/venue-binance` (спот, task 3) / `crates/venue-binance-futures` (перп, task 4) — **MD-only**
+  (0 order-egress: grep `submit/cancel/auth/signature` в диффе пуст): `pub fn l2delta_event(&symbol,&diff)`
+  чистый транслятор БЕЗ ПОТЕРЬ (U→first, u→final, E→ts, уровни включая `size==0`, пустая сторона; spot
+  `prev_final=None`, futures `prev_final=Some(pu)` — continuity перпа по `pu`, урок TD-014). Эмиссия
+  КАЖДОГО распарсенного diff'а НЕЗАВИСИМО от sync-FSM (ground-truth, L2D-I-2), gated `const
+  L2DELTA_CAPTURE_SYMBOLS = ["BTCUSDT"]` (**founder ★ (а)**): спот шлёт `tx.send`, перп —
+  `SessionEffect::Emit`. `DepthDiff` перпа стал `pub` (own-crate тип, scope-guard OK).
+- `crates/{journal,sim,recorder,research-cli}` (engine-dev, task 5) — **РОВНО 5 консюмер-армов** (E0004
+  закрыты, `cargo build --workspace --all-targets` ok): (1) `journal/segments.rs segment_last_ts` +ts;
+  (2) `sim/exchange.rs` **IGNOR** (честный fill из L2Snapshot+Trade; сырая дельта = двойной учёт — L2D-I-6,
+  подтверждено risk-critic); (3) `recorder/lib.rs md_kind_label` → `"l2delta"` (Prometheus-лейбл);
+  (4) `journal/examples/dump.rs` IGNOR; (5) `research-cli/latency_probe.rs` → continue.
+- **Sacred RED (architect-authored, dev НЕ трогал — сверено `git log --format=%an`):** `red_rfc04`,
+  `red_l2delta_capture`(spot), `red_l2delta_futures`(perp), `red_l2delta_persist`(write→read_all exact,
+  DET-I-1), `red_l2delta_rollback_boundary`(L2Delta изолирован в M-18-provenance сегменте). Анти-плацебо
+  доказан critic (C-017) и risk-critic (C-018 rev3, прогон прототипа).
+- **Rollback-safety (C-018, sacred data-path):** schema-forward деплой ОДНОСТОРОННИЙ. pre-M18 бинарь не
+  декодит variant-6 → тихий seq-reuse при откате против того же журнала. Закрыто СТРУКТУРНО (новый git-sha
+  в `SegmentHeader.provenance` → `decide_open_segment` открывает НОВЫЙ сегмент; L2Delta никогда не в
+  pre-M18 сегменте; RED зелёный+анти-плацебо) + ПРОЦЕДУРНО (runbook `ops.md` §5.1: fix-forward предпочтителен;
+  архив терминальный; re-stitch в live ЗАПРЕЩЁН). Машинные барьеры отложены в **TD-029 (startup
+  schema-guard)** + **TD-030 (reader first_seq-guard)** — отдельные journal-hardening milestone'ы (C-018
+  merge-condition 1, занесены reviewer'ом).
+- **§8 ОБЪЁМ (C-018 pt.0):** BTC-only ≈ +0.75..1.25 GB/сут поверх ~2.8 → таймер диска ~40 → ~27..31 дней.
+  НЕ портит данные (disk-guard fail-closed), но делает доставку ретеншена (TD-020, M-08 task 14) СРОЧНОЙ.
+- **⏳ ОТКРЫТО — БЛОКЕР close-out (task 6, РЕШАЮЩИЙ, урок TD-014 unit≠live):** §8 post-merge деплой-гейт НЕ
+  выполнен. Требуется на VPS после deploy: первое живое BTC `L2Delta` (spot+perp) ушло в **НОВЫЙ**
+  M-18-provenance сегмент (не в pre-M18 активный); **non-BTC L2Delta ОТСУТСТВУЕТ** (scope-(а)); темп записи
+  в бюджете §5; recorder healthy, `seq_gaps=0`, disk `writable=true`; авто-rollback НЕ трактовать как слепую
+  страховку (schema-forward односторонний). **M-18 остаётся 🚧 IN_PROGRESS до §8 GREEN.**
+
 ## Пока НЕ реализовано (следующие фазы)
 - Крейты `risk`/`killswitch`/`oms`, `runner` — пофазно per DESIGN §10 (M-08: fail-closed риск-гейт
   между `strategy` и `oms`). MM-котирование, wiring весов из `signals.json` (граница B),

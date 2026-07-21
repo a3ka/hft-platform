@@ -3,6 +3,34 @@
 > **Reviewer-owned.** Открытые долги/риски, замеченные при работе. Закрытые переносятся вниз.
 
 ## OPEN
+- **TD-029** `recorder-startup-schema-guard-missing` (заведено reviewer'ом на merge M-18 как
+  merge-condition 1 из risk-critic C-018 rev3 — «TD-a»). Recorder при старте НЕ проверяет, что
+  активный/хвостовой сегмент несёт ТОЛЬКО декодируемые этим бинарём варианты `EventKind`/`MdPayload`.
+  Следствие (sacred data-path): при откате на бинарь СТАРШЕ schema-forward деплоя (напр. pre-M18, не
+  знающий `MdPayload::L2Delta` дискриминант 6) против ТОГО ЖЕ персистентного журнала hot-путь
+  `scan_tail_for_last_seq` пропускает недекодируемый фрейм → `next_seq` может недосчитаться → **тихий
+  SEQ REUSE** (порча тотального порядка, DET-I-1) — ХУЖЕ громкого краха. В M-18 этот сценарий закрыт
+  СТРУКТУРНО (provenance-изоляция: новый git-sha → `decide_open_segment` открывает НОВЫЙ сегмент,
+  L2Delta никогда не дописывается в pre-M18 сегмент; RED `red_l2delta_rollback_boundary` GREEN,
+  анти-плацебо доказан risk-critic) + ПРОЦЕДУРНО (runbook `ops.md` §5.1). TD-029 добавляет МАШИННЫЙ
+  барьер: recorder ГРОМКО падает на старте, если активный сегмент несёт события, которые бинарь не
+  умеет декодить (schema-version-aware старт) — превращает тихий seq-reuse в громкий отказ. **Отдельный
+  journal-hardening milestone, НЕ M-18** (зона: architect — спека/RED; engine-dev — impl). Severity:
+  MINOR (триггер — операторский откат ЗА schema-forward деплой, узкий и ручной; в M-18 уже закрыт
+  структурно+процедурно; MD-only blast radius — не путь к деньгам).
+- **TD-030** `reader-first_seq-guard-missing` (заведено reviewer'ом на merge M-18 как merge-condition 1
+  из risk-critic C-018 rev3 — «TD-b»). `read_all`/`stream` сшивают сегменты по ИНДЕКСУ файла
+  (`iter_segments_sorted` + blind `extend`, `segments.rs:586/846-862`) БЕЗ проверки монотонности
+  `first_seq`. Следствие: ошибочный re-stitch терминального архива (quarantined post-M18 сегмент) в
+  живой журнал — ТИХИЙ беспорядок seq (`[0,1,2,3,4,7,5,6]`, probe risk-critic C-018 rev2), а не отказ.
+  Сейчас правило «архив не re-stitch'ится в live» — операторская дисциплина (runbook §5.1), НЕ машинный
+  барьер. TD-030: fail-closed `Err` на немонотонном `first_seq` в `read_all`/`stream` → делает правило
+  ПРИНУДИТЕЛЬНЫМ. **⚠ Класс TD-011:** наивный монотонный guard СПОТКНЁТСЯ на legacy-сегментах с
+  `first_seq=0` (сентинел, `segments.rs:509-511`) → форсить fail-closed в ГОРЯЧИЙ прод read-path под
+  таймдавлением M-18 рискует ХУДШЕЙ прод-регрессией, чем закрываемая дисциплинарная дыра. Поэтому —
+  **отдельный journal-hardening milestone, НЕ M-18** (граница reviewer↔architect gates.md §4: дефект
+  описан, защита проектируется RED-first в своём milestone). Severity: MINOR (defense-in-depth против
+  операторской ошибки; сам триггер требует нарушения явного письменного запрета из runbook).
 - **TD-028** `export-io-ram-linear-in-journal-size` (замечено reviewer'ом на PR-гейте M-17, 2026-07-21;
   флаг research-dev). `crates/research-cli/src/export_io.rs::export_to_dir` собирает trades/snapshots в
   `HashMap<(Venue, String), InstrumentBucket>` за ОДИН проход `journal::stream`, затем сериализует
