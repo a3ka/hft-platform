@@ -9,6 +9,7 @@
 //! Реализация — research-dev (M-04 task 4).
 
 use std::fs;
+use std::io::Read;
 use std::path::Path;
 
 use contracts::Event;
@@ -500,24 +501,53 @@ pub fn run_r001(config: R001RunConfig<'_>) -> Result<ValidationReport, RcError> 
     Ok(report)
 }
 
-/// формат имени файла; research-cli читает журнал read-only, без writer-хэндла, RC-I-7).
-const JOURNAL_SEGMENT_FILE: &str = "segment-00000000.jrnl";
+/// Детерминированный sha256 всех raw journal-сегментов выборки.
+///
+/// Имена и байты сегментов хэшируются в лексикографическом порядке. Чтение
+/// чанковое: многогигабайтный боевой срез не материализуется в RAM только ради
+/// provenance отчёта.
+pub fn journal_sha256(journal_dir: &Path) -> Result<String, RcError> {
+    let mut segments: Vec<_> = fs::read_dir(journal_dir)
+        .map_err(RcError::Io)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "jrnl")
+        })
+        .collect();
+    segments.sort();
+    if segments.is_empty() {
+        return Err(RcError::CorruptInput(format!(
+            "{}: journal-сегменты не найдены",
+            journal_dir.display()
+        )));
+    }
 
-fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    hasher
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    for path in segments {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| RcError::CorruptInput(format!("невалидное имя: {}", path.display())))?;
+        hasher.update(name.as_bytes());
+        hasher.update([0]);
+        let mut file = fs::File::open(&path).map_err(RcError::Io)?;
+        loop {
+            let read = file.read(&mut buffer).map_err(RcError::Io)?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+        hasher.update([0xff]);
+    }
+    Ok(hasher
         .finalize()
         .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
-}
-
-/// sha256 файла сегмента журнала (вход воспроизводимости отчёта).
-pub fn journal_sha256(journal_dir: &Path) -> Result<String, RcError> {
-    let path = journal_dir.join(JOURNAL_SEGMENT_FILE);
-    let bytes = fs::read(&path).map_err(RcError::Io)?;
-    Ok(sha256_hex(&bytes))
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
 }
 
 /// Проверить пре-регистрацию: карточка существует и содержит непустой раздел
