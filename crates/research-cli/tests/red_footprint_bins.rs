@@ -20,8 +20,7 @@ fn tr(ts: i64, price: i64, side: Side, size: i64) -> (i64, i64, Side, i64) {
 }
 
 /// Найти bin по цене в баре (порядок bins не фиксируем).
-#[allow(clippy::needless_lifetimes)] // clippy-1.94 elision lint; сигнатура pre-existing approved C-016
-fn bin<'a>(bar: &'a FootprintBar, price: i64) -> Option<&'a PriceBin> {
+fn bin(bar: &FootprintBar, price: i64) -> Option<&PriceBin> {
     bar.bins.iter().find(|b| b.price == price)
 }
 
