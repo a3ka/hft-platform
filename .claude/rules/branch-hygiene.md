@@ -34,6 +34,15 @@ TD-014» (2026-07-12), «reviewer переключил общий чекаут �
 5. **Незнакомый untracked-файл — не «чужая сессия», а нарушение (1)–(3).** Не удалять,
    не игнорировать: выяснить владельца по `research/critiques/`, `milestones/`, содержимому;
    передать founder'у, если владелец не определяется.
+6. **Git identity субагента — `--worktree` или per-commit `--author` (закреплено 2026-07-14,
+   инцидент M-18).** `git config user.name <role>` пишет в `.git/config` — ОБЩИЙ для всех worktree
+   репозитория. Два субагента, стартовавшие ПАРАЛЛЕЛЬНО в одном репо, гонят этот конфиг: последний
+   писатель побеждает → коммиты одного уезжают под identity другого (в M-18 коммиты venue-dev ушли
+   автором `engine-dev` → выглядело как scope-violation venue-кода). Роль ОБЯЗАНА задавать identity
+   worktree-локально (`git config --worktree user.name/email`, включив `extensions.worktreeConfig`)
+   ЛИБО ставить автора на каждый коммит (`git commit --author='<role> <role@noreply.local>'`).
+   **Reviewer в Block-scope сверяет `%an` (автор = роль-владелец зоны) против `%cn` (коммиттер):**
+   расхождение автора и зоны → выяснить, не identity-гонка ли это, до вердикта scope-violation.
 
 ## Запрет `commit -a` / `add -A` в общем чекауте (закреплено 2026-07-14)
 

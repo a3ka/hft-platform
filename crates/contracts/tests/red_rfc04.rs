@@ -16,7 +16,20 @@
 
 use std::path::Path;
 
-use contracts::{Event, EventKind, Level, MdEvent, MdPayload, Venue};
+use contracts::{Event, EventKind, Level, MdEvent, MdPayload, Venue, SCHEMA_VERSION};
+
+/// CT-RFC-04 rev2 (TD-031): L2Delta — новая ЭПОХА эмитируемых вариантов ⇒ `SCHEMA_VERSION` = 3.
+/// Это МАШИННЫЙ маркер изоляции сегмента (`decide_open_segment` reuse требует совпадения) —
+/// провенанс в проде константа, поэтому точное значение эпохи здесь пинится намеренно: bump
+/// нового варианта ОБЯЗАН осознанно тронуть этот assert (в отличие от «≥ 2» в red_rfc02/03).
+/// `assert_eq!` на const clippy-чист (в отличие от `assert!(const)` — assertions_on_constants).
+#[test]
+fn ct_rfc04_rev2_schema_epoch_is_three() {
+    assert_eq!(
+        SCHEMA_VERSION, 3,
+        "CT-RFC-04 rev2: L2Delta-эпоха = 3 (сегмент-изоляция, TD-031)"
+    );
+}
 
 fn spot_delta() -> MdPayload {
     MdPayload::L2Delta {

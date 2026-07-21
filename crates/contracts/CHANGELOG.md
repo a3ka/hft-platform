@@ -3,6 +3,18 @@
 Формат: одна секция на contract-RFC. Журнал бессмертен: старые записи обязаны читаться
 новым кодом всегда (CT-I-3). Правки T1 вне RFC → авто-REJECT (CT-I-2, Block-C).
 
+## schema_version 2 → 3 — CT-RFC-04 rev2 «L2Delta segment-изоляция» (2026-07-21, TD-031)
+
+**Bump 2→3.** §8 нашёл: изоляция L2Delta (сегмент schema-эпохи) держалась на `provenance`
+(git-sha), но recorder считает git-sha В РАНТАЙМЕ, а контейнер без git → provenance = КОНСТАНТА на
+всех деплоях → `decide_open_segment` reuse'ил pre-M18 сегмент → L2Delta смешался в schema-2
+(segment-55). Fix: `SCHEMA_VERSION` = **эпоха эмитируемых вариантов** (2→3 для L2Delta); reuse
+требует `header.schema_version == SCHEMA_VERSION` → schema-2 сегмент не reuse'ится schema-3 бинарём
+(git-независимо). Правило: **новый эмитируемый вариант ⇒ bump SCHEMA_VERSION**. `SEGMENT_MAGIC`
+(framing) НЕ тронут — `HFTJRN02`; magic и schema_version отделены. `red_l2delta_rollback_boundary`
+переписан прод-реалистично (ИДЕНТИЧНЫЙ прод-провенанс, изоляция по schema-эпохе — падал на
+провенанс-only reuse). Старые сегменты читаются (CT-I-3; schema на чтении не валидируется).
+
 ## schema_version 2 — CT-RFC-04 «L2Delta: персист сырых book-дельт» (2026-07-21)
 
 Аддитивно (версия НЕ меняется — вариант `MdPayload`, не формат сегмента; `SEGMENT_MAGIC`

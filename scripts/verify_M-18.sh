@@ -28,12 +28,20 @@ if grep -qE "^\s*L2Delta\s*\{" crates/contracts/src/lib.rs; then
 else
   fail "MdPayload::L2Delta отсутствует в crates/contracts/src/lib.rs"
 fi
-# SEGMENT_MAGIC и SCHEMA_VERSION НЕ ДОЛЖНЫ меняться (§3): смена сломала бы чтение боевых сегментов.
+# SEGMENT_MAGIC (framing) НЕ меняется — HFTJRN02 (смена сломала бы чтение боевых сегментов).
+# SCHEMA_VERSION (эпоха эмитируемых вариантов) rev2: 2→3 — маркер изоляции сегмента (TD-031).
 if grep -qE 'SEGMENT_MAGIC.*b"HFTJRN02"' crates/contracts/src/lib.rs \
-   && grep -qE "SCHEMA_VERSION: u32 = 2;" crates/contracts/src/lib.rs; then
-  pass "SEGMENT_MAGIC=HFTJRN02 и SCHEMA_VERSION=2 НЕ тронуты (аддитивность §3)"
+   && grep -qE "SCHEMA_VERSION: u32 = 3;" crates/contracts/src/lib.rs; then
+  pass "SEGMENT_MAGIC=HFTJRN02 (framing цел) + SCHEMA_VERSION=3 (rev2 L2Delta-эпоха, TD-031)"
 else
-  fail "SEGMENT_MAGIC/SCHEMA_VERSION изменены — L2Delta аддитивен, bump запрещён (сломает прод-чтение)"
+  fail "SEGMENT_MAGIC≠HFTJRN02 (сломает прод-чтение) ИЛИ SCHEMA_VERSION≠3 (rev2 обязан быть 3 для изоляции)"
+fi
+# TD-031 schema-gate: decide_open_segment reuse ОБЯЗАН требовать совпадения schema_version
+# (иначе schema-2 сегмент reuse'ится schema-3 бинарём → L2Delta смешивается, провенанс в проде — константа).
+if grep -qE "header\.schema_version == contracts::SCHEMA_VERSION" crates/journal/src/segments.rs; then
+  pass "decide_open_segment reuse требует schema-совпадения (TD-031 машинная изоляция)"
+else
+  fail "decide_open_segment БЕЗ schema-гейта — изоляция L2Delta ВОИД в проде (TD-031; провенанс — константа)"
 fi
 if grep -q "CT-RFC-04" crates/contracts/CHANGELOG.md; then
   pass "CHANGELOG несёт запись CT-RFC-04"
@@ -83,6 +91,11 @@ fi
 # Полный workspace собирается ⇒ ВСЕ исчерпывающие match MdPayload получили арм L2Delta (E0004 закрыты).
 run "workspace собирается со всеми armами L2Delta (E0004 закрыты: journal/sim + любой оставшийся)" \
   cargo build --workspace --all-targets
+# CLIPPY-ГЕЙТ (закрывает gate-gap: verify без clippy расходился с CI ci.yml:22, класс RN-8/TD-031).
+# Тот же прогон, что CI → clippy-only дефект (напр. assertions_on_constants в -D warnings) ловится
+# ЗДЕСЬ, а не на PR-гейте reviewer'а / красном CI.
+run "clippy --workspace --all-targets -D warnings (совпадает с CI; verify не расходится с деплой-гейтом)" \
+  cargo clippy --workspace --all-targets -- -D warnings
 
 echo
 if [ "${FAILED}" -gt 0 ]; then

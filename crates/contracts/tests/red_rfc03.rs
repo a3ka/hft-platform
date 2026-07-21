@@ -13,14 +13,20 @@ use contracts::{
     Event, EventKind, MdPayload, ReconAction, ReconAudit, Side, SysEvent, Venue, SCHEMA_VERSION,
 };
 
-/// CT-RFC-03 НЕ бампит `schema_version`: это АДДИТИВНЫЙ вариант `EventKind` (как CT-RFC-01),
-/// а не изменение формата сегмент-заголовка (то был CT-RFC-02, 1→2). Остаётся 2.
+/// CT-RFC-03 САМ по себе не бампил `schema_version` (был 2 на момент CT-RFC-03). Точное значение
+/// здесь НЕ пинится: `SCHEMA_VERSION` = эпоха эмитируемых вариантов и растёт с новыми RFC
+/// (CT-RFC-04 rev2 поднял 2→3 для L2Delta-изоляции, TD-031). Инвариант CT-RFC-03 — версия header
+/// осталась ≥ 2 (формат сегмент-заголовка не сломан), а recon-вариант аддитивен (дискриминант ниже).
 #[test]
-fn ct_rfc03_schema_version_unchanged() {
-    assert_eq!(
-        SCHEMA_VERSION, 2,
-        "recon-вариант аддитивен — формат сегмента не меняется, версия остаётся 2"
-    );
+fn ct_rfc03_schema_version_has_header() {
+    // const-контекст (см. red_rfc02): compile-time инвариант, без clippy::assertions_on_constants,
+    // без пина точного значения.
+    const {
+        assert!(
+            SCHEMA_VERSION >= 2,
+            "формат сегмент-заголовка ≥ 2 (recon-вариант аддитивен)"
+        )
+    };
 }
 
 /// Новый вариант — СТРОГО в конце `SysEvent`: дискриминант 3, а 0/1/2 неизменны.
