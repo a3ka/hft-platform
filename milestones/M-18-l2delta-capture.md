@@ -1,7 +1,9 @@
 # M-18 — Захват сырых book-дельт `L2Delta` (CT-RFC-04, Phase B / book-flow)
 
-STATUS: **🚧 IN_PROGRESS** (код смержен в main `f635bd2`, reviewer APPROVED 2026-07-21; **§8 live-emit
-task 6 — post-merge деплой-гейт, milestone НЕ закрыт до §8 GREEN**). Блок-1 roadmap (BACKLOG «Порядок
+STATUS: **🚧 IN_PROGRESS** (код смержен в main `f635bd2`, reviewer APPROVED 2026-07-21; **§8 ВЫПОЛНЕН
+`ce122d1`: капча L2Delta GREEN (BTC spot+perp live, non-BTC отсутствует), но rollback-изоляция RED —
+первое L2Delta ушло в pre-M18 сегмент 55 из-за provenance-константы `no-git-info` в контейнере →
+БЛОКЕР TD-031; milestone НЕ закрыт до фикса + повторного §8**). Блок-1 roadmap (BACKLOG «Порядок
 исполнения»), TIME-SENSITIVE. Doc-гейт §9 Class A. Гейты пройдены: **critic C-017 APPROVE + risk-critic
 C-018 rev3 PASS** (T1 + sacred live-path). Ветка: `feat/M-18-l2delta`. RFC: `docs/rfc/CT-RFC-04-l2delta.md`.
 

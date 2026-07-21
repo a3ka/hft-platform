@@ -857,11 +857,27 @@ spot+perp** → venue-dev(3/4 MD-only) ∥ engine-dev(5, 5 армов) → risk-
   merge-condition 1, занесены reviewer'ом).
 - **§8 ОБЪЁМ (C-018 pt.0):** BTC-only ≈ +0.75..1.25 GB/сут поверх ~2.8 → таймер диска ~40 → ~27..31 дней.
   НЕ портит данные (disk-guard fail-closed), но делает доставку ретеншена (TD-020, M-08 task 14) СРОЧНОЙ.
-- **⏳ ОТКРЫТО — БЛОКЕР close-out (task 6, РЕШАЮЩИЙ, урок TD-014 unit≠live):** §8 post-merge деплой-гейт НЕ
-  выполнен. Требуется на VPS после deploy: первое живое BTC `L2Delta` (spot+perp) ушло в **НОВЫЙ**
-  M-18-provenance сегмент (не в pre-M18 активный); **non-BTC L2Delta ОТСУТСТВУЕТ** (scope-(а)); темп записи
-  в бюджете §5; recorder healthy, `seq_gaps=0`, disk `writable=true`; авто-rollback НЕ трактовать как слепую
-  страховку (schema-forward односторонний). **M-18 остаётся 🚧 IN_PROGRESS до §8 GREEN.**
+- **§8 ВЫПОЛНЕН (VPS `ce122d1`, CI+Deploy success, 2026-07-21) — SPLIT: капча GREEN, rollback-изоляция RED.
+  M-18 НЕ ЗАКРЫТ, БЛОКЕР TD-031.** Что подтверждено ЖИВЫМ (метрики `/metrics` md_events_total, heartbeat):
+  - **✅ Капча L2Delta работает (tasks 3/4 продуктово подтверждены live):** `l2delta{BTCUSDT,binance}=1828`
+    (spot) + `l2delta{BTCUSDT,binance_futures}=1792` (perp) с боевого WS. **non-BTC L2Delta ОТСУТСТВУЕТ**
+    (ETH/HL несут только trade/l2snapshot/funding — scope-(а) founder ★ соблюдён обеими сторонами).
+  - **✅ Прод здоров:** recorder healthy, `restarts=0`, `seq_gaps=0` (next_seq монотонен, +134/с),
+    `writable=true`, 0 panic/ERROR/backstop; темп **3.59 GB/сут** (baseline ~2.8 + ~0.8 BTC-only) — **в
+    бюджете C-018** (+0.75..1.25). Диск 101.4 GB своб. (~25 дн до guard — ретеншен TD-020 актуален;
+    бинарь `journal-retention` на VPS ЕСТЬ, но это вне M-18).
+  - **❌ Rollback-изоляция (C-018 merge-cond 2 / L2D-I-8 / task 6) ПРОВАЛЕНА В ПРОДЕ.** Первое живое L2Delta
+    ушло НЕ в новый сегмент, а в **pre-M18 активный `segment-00000055`** (создан 12:37 pre-M18 бинарём
+    `fb66b52`, до деплоя 12:44). Причина: provenance recorder'а = `git_short_sha()` через `git rev-parse` В
+    РАНТАЙМЕ, но в runtime-контейнере git НЕТ (`NO-GIT`, `.git` отсутствует) → provenance = КОНСТАНТА
+    `recorder v0.0.0 (git:no-git-info)` на ВСЕХ деплоях → `decide_open_segment` видит provenance-match →
+    **REUSE pre-M18 сегмента**, вместо открытия нового. Значит variant-6 (L2Delta) дописан в pre-M18
+    сегмент 55 (смешанный сегмент), а СТРУКТУРНАЯ гарантия изоляции C-018 R1 (новый git-sha → новый
+    сегмент, RED `red_l2delta_rollback_boundary`) в проде **ВОИД** — тест зелёный лишь потому, что фикстура
+    ЗАДАЁТ разный provenance, а прод (нет git в контейнере) даёт константу. Класс TD-011/TD-014: unit-green
+    ≠ live. **Revert НЕ сделан** (fix-forward per runbook §5.1: деплой pre-M18 бинаря против сегмента 55,
+    где уже есть variant-6, — ровно запрещённый rollback-hazard; revert опаснее fix-forward). Заведён
+    **TD-031 (BLOCKING, MAJOR)**; зона architect (RED-first фикс). **M-18 остаётся 🚧 IN_PROGRESS.**
 
 ## Пока НЕ реализовано (следующие фазы)
 - Крейты `risk`/`killswitch`/`oms`, `runner` — пофазно per DESIGN §10 (M-08: fail-closed риск-гейт

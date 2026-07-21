@@ -3,6 +3,41 @@
 > **Reviewer-owned.** Открытые долги/риски, замеченные при работе. Закрытые переносятся вниз.
 
 ## OPEN
+- **TD-031** `segment-provenance-constant-in-container-rollback-isolation-void` (найдено reviewer'ом на
+  §8 M-18, 2026-07-21; **BLOCKING close-out M-18**). **Симптом:** после деплоя M-18 (`ce122d1`) первое
+  живое `MdPayload::L2Delta` (variant-6) ушло НЕ в новый сегмент, а в **pre-M18 активный
+  `segment-00000055.jrnl`** (создан 12:37 pre-M18 бинарём `fb66b52`, ДО деплоя 12:44). Это провал task 6
+  acceptance («первое BTC L2Delta ушло в НОВЫЙ M-18-provenance сегмент») и **C-018 merge-condition 2**
+  (условие, гейтившее risk-critic PASS). **Корень (reviewer описал; architect проектирует фикс —
+  gates.md §4):** `crates/recorder/src/main.rs:448` строит provenance через `git_short_sha()` =
+  `git rev-parse --short HEAD` В РАНТАЙМЕ, но runtime-контейнер НЕ содержит git/`.git` (проверено:
+  `docker exec … command -v git` → `NO-GIT`; `ls /.git /app/.git` → отсутствует) → `git_short_sha()`
+  возвращает `None` → provenance = КОНСТАНТА `recorder v0.0.0 (git:no-git-info)` на КАЖДОМ деплое
+  (лог recorder'а на старте: `provenance=recorder v0.0.0 (git:no-git-info)`). Поэтому
+  `decide_open_segment` (`segments.rs:1152`) видит `header.provenance == cfg.provenance` → **REUSE**
+  активного сегмента вместо открытия нового. Провенанс НИКОГДА не меняется между деплоями → сегменты
+  катятся ТОЛЬКО по размеру (1 GiB), а не на схема-forward деплое. **Следствия:**
+  1. **Структурная гарантия изоляции C-018 R1 ВОИД В ПРОДЕ.** RED `red_l2delta_rollback_boundary`
+     зелёный ТОЛЬКО потому, что фикстура ЗАДАЁТ разный `provenance`; прод (нет git в контейнере) даёт
+     константу → precondition теста в проде НЕ выполняется. Класс TD-011/TD-014: unit-green ≠ live-поведение.
+  2. **Сегмент 55 — СМЕШАННЫЙ** (pre-M18 варианты 0..5 в начале + post-M18 variant-6 в хвосте) ⇒ чистый
+     quarantine «file-move целого сегмента» из runbook §5.1 больше невозможен без потери pre-M18 данных.
+  3. **Latent rollback-hazard (C-018 R1) снова ЖИВОЙ:** pre-M18 бинарь против сегмента 55 → `scan_tail`
+     не декодит variant-6 → риск тихого seq-reuse. (Смягчение: auto-rollback `deploy.yml` теперь целится
+     в предыдущий УСПЕШНЫЙ SHA = `ce122d1`, уже M-18-aware, декодит variant-6 → немедленный авто-триггер
+     низкий; но любой ручной откат за M-18 или будущий schema-forward вариант несёт тот же дефект.)
+  **Прод СЕЙЧАС здоров и данные безопасны** (recorder healthy, `seq_gaps=0`, `writable=true`, капча
+  L2Delta работает, BTC-only соблюдён) — это НЕ активная порча, а латентный rollback-риск + невыполненная
+  структурная гарантия. **Revert НЕ сделан** (fix-forward per runbook §5.1: деплой pre-M18 бинаря против
+  журнала с variant-6 в активном сегменте — ровно запрещённый hazard; revert опаснее fix-forward).
+  **Нужно (architect, RED-first фикс-forward, прод-масштаб оракул per testing.md):** provenance/эпоха
+  ОБЯЗАНА нести дискриминатор, реально меняющийся при schema-forward деплое НЕЗАВИСИМО от наличия git в
+  рантайме — напр. git-sha вкомпилён на СБОРКЕ (`build.rs`/`vergen`/build-arg → `env!`), а не читается
+  рантаймом; ЛИБО `decide_open_segment` форсит новый сегмент, когда набор декодируемых бинарём вариантов
+  превосходит объявленный в активном сегменте; и/или машинный барьер TD-029 (startup schema-guard),
+  который делает hazard громким независимо от provenance. Оракул обязан ПАДАТЬ на текущем прод-режиме
+  (provenance-константа), а не только на фикстуре с разным provenance. Severity: **MAJOR** (sacred
+  journal-integrity / rollback-safety; MD-only, путь к деньгам не тронут; блокирует close-out M-18).
 - **TD-029** `recorder-startup-schema-guard-missing` (заведено reviewer'ом на merge M-18 как
   merge-condition 1 из risk-critic C-018 rev3 — «TD-a»). Recorder при старте НЕ проверяет, что
   активный/хвостовой сегмент несёт ТОЛЬКО декодируемые этим бинарём варианты `EventKind`/`MdPayload`.
