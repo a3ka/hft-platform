@@ -12,7 +12,7 @@ use research_cli::report::{require_preregistration, write_metrics_json};
 use research_cli::split::SplitState;
 use research_cli::types::{
     CostsMode, GridSpec, RcError, SplitKind, StressResult, TimeSplit, TrialRecord,
-    ValidationReport, REPORT_SCHEMA_VERSION, TRIALS_LEDGER_SCHEMA_VERSION,
+    ValidationReport, Verdict, REPORT_SCHEMA_VERSION, TRIALS_LEDGER_SCHEMA_VERSION,
 };
 use sim::{FeeRates, FeeSchedule, LatencyTable};
 
@@ -435,6 +435,14 @@ fn fixed_report() -> ValidationReport {
             net_pnl_e8: to_fixed(6.0),
         }],
         walkforward_sharpes: vec![0.9, 1.2, 0.8],
+        // C-019 rev2: обязательные поля честности kill-screen (M-10). Значения фикстуры —
+        // детерминизм RC-I-5, не классификация; вердикт Inconclusive (не Pass — не подразумеваем
+        // промоушен), эпоха ≥5141fd9, gap_ref задан.
+        data_span_days: 120.0,
+        se_sharpe: 0.3,
+        verdict: Verdict::Inconclusive("fixture: RC-I-5 determinism".into()),
+        gap_ref: "research/data-quality/gaps-own-2026-07.json".into(),
+        ledger_cutoff: "5141fd9".into(),
     }
 }
 
