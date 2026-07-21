@@ -34,6 +34,12 @@ use crate::types::{
     CellResult, CostsMode, GridSpec, RcError, SplitKind, TrialRecord, TRIALS_LEDGER_SCHEMA_VERSION,
 };
 
+/// Эпоха семантики strategy-grid. Она является частью хэша TrialRecord и отделяет
+/// post-M-07 equity-кривую от четырёх исторических записей старого harness'а
+/// (TD-015). Это не хэш файла сигналов: сам сигнал неизменен, изменилась семантика
+/// исполнения через DirectionalStrategy/StrategyBacktest.
+pub const LEDGER_EPOCH_CUTOFF: &str = "5141fd9";
+
 /// Аннуализация Sharpe внутри грида (сравнение ячеек между собой; не путать с
 /// итоговым отчётным Sharpe research/reports — там периодичность явная).
 const ANNUALIZATION_PERIODS_PER_YEAR: f64 = 252.0;
@@ -45,26 +51,25 @@ pub struct GridRunEnv<'a> {
     pub fees: &'a FeeSchedule,
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+/// sha256 исходника сигнала плюс маркер семантической эпохи (D3/TD-015).
+///
+/// Исторические pre-M-07 trial records несут голый sha256 `obi.rs` (его префикс
+/// `f7f4761`). После миграции на настоящий strategy-пайплайн такой хэш был бы
+/// неразличим с legacy-записями, поэтому в post-M-07 хэш включает фиксированный
+/// epoch marker. Идентичные исходы в одинаковой эпохе дают идентичный hash.
+pub fn research_code_hash() -> String {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../signals/src/obi.rs");
+    let bytes = std::fs::read(&path).unwrap_or_default();
     let mut hasher = Sha256::new();
+    hasher.update(b"research-cli-strategy-grid:");
+    hasher.update(LEDGER_EPOCH_CUTOFF.as_bytes());
+    hasher.update([0]);
     hasher.update(bytes);
     hasher
         .finalize()
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect()
-}
-
-/// sha256 исходника `crates/signals/src/obi.rs` (D3). Путь строится через
-/// `CARGO_MANIFEST_DIR` (компилируемая константа этого крейта) — детерминирован,
-/// не зависит от текущего рабочего каталога процесса. "unknown" при отсутствии файла
-/// (не должно случаться в дереве репозитория; не паникуем).
-fn signal_code_hash() -> String {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../signals/src/obi.rs");
-    match std::fs::read(&path) {
-        Ok(bytes) => sha256_hex(&bytes),
-        Err(_) => "unknown".to_string(),
-    }
 }
 
 /// Первый наблюдённый mid именно инструмента ячейки. Реконструкция идёт только вперёд
@@ -183,7 +188,7 @@ pub fn run_grid(
 
     // D11: грид инстанцирует OBI напрямую (единственный сигнал M-04/M-07).
     let signal_id_str = format!("{}-obi-asym", spec.signal_id_prefix);
-    let code_hash = signal_code_hash();
+    let code_hash = research_code_hash();
     let mut results = Vec::with_capacity(spec.cells.len());
 
     for cell in &spec.cells {
@@ -492,8 +497,7 @@ pub fn run_grid_streamed(
     }
 
     let signal_id_str = format!("{}-obi-asym", spec.signal_id_prefix);
-    let code_hash = signal_code_hash();
-
+    let code_hash = research_code_hash();
     // Конструируем runners ДО открытия стрима — fail-closed на кривом конфиге ячейки.
     // Runners держат state per-cell: BacktestExchange через события + трекинг отчёта.
     let mut runners: Vec<CellRunner> = Vec::with_capacity(spec.cells.len());

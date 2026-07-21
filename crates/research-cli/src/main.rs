@@ -13,7 +13,8 @@ use journal::EpochFilter;
 use research_cli::grid::{run_grid_streamed, GridRunEnv, JournalSource};
 use research_cli::ledger::Ledger;
 use research_cli::report::{
-    journal_sha256, require_preregistration, write_metrics_json, write_narrative_md,
+    journal_sha256, require_preregistration, run_r001, write_metrics_json, write_narrative_md,
+    R001RunConfig,
 };
 use research_cli::types::{GridSpec, SplitKind, ValidationReport};
 use sim::{FeeSchedule, LatencyTable};
@@ -134,6 +135,73 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn cmd_r001(args: &[String]) -> Result<(), String> {
+    let journal_dir = flag(args, "--journal").ok_or("--journal <dir> обязателен")?;
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .map_err(|e| format!("workspace root: {e}"))?;
+    let ledger_path = flag(args, "--ledger")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| root.join("research/trials-ledger.jsonl"));
+    let report_dir = flag(args, "--report-dir")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| root.join("research/reports"));
+    let gap_dir = flag(args, "--gap-dir")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| root.join("research/data-quality"));
+    let latency_path = flag(args, "--latency")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| root.join("research/latency/binance-BTCUSDT.json"));
+    let fees_path = flag(args, "--fees")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| root.join("research/fees/binance.json"));
+    let seed = flag(args, "--seed")
+        .map(|value| value.parse::<u64>().map_err(|e| format!("--seed: {e}")))
+        .unwrap_or(Ok(42))?;
+
+    let source = JournalSource {
+        dir: PathBuf::from(&journal_dir),
+        filter: EpochFilter::OwnCaptureOnly,
+    };
+    let stream = journal::stream(&source.dir, source.filter.clone())
+        .map_err(|e| format!("открытие стрима журнала: {e}"))?;
+    let events: Vec<contracts::Event> = stream
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("чтение журнала: {e}"))?;
+
+    let mut latency = LatencyTable::new();
+    latency
+        .load_artifact(&latency_path)
+        .map_err(|e| format!("latency: {e:?}"))?;
+    let mut fees = FeeSchedule::new();
+    fees.load_artifact(&fees_path)
+        .map_err(|e| format!("fees: {e:?}"))?;
+    let journal_hash = journal_sha256(Path::new(&journal_dir)).map_err(|e| format!("{e:?}"))?;
+    let mut ledger = Ledger::open(&ledger_path).map_err(|e| format!("ledger: {e}"))?;
+
+    let report = run_r001(R001RunConfig {
+        events: &events,
+        source: &source,
+        ledger: &mut ledger,
+        latency: &latency,
+        fees: &fees,
+        journal_sha256: journal_hash,
+        report_dir: &report_dir,
+        gap_dir: &gap_dir,
+        seed,
+    })
+    .map_err(|e| format!("R-001: {e:?}"))?;
+    println!(
+        "R-001: verdict={:?} sharpe={:.6} se={:.6} ledger_n={} report_dir={}",
+        report.verdict,
+        report.sharpe,
+        report.se_sharpe,
+        report.ledger_n,
+        report_dir.display()
+    );
+    Ok(())
+}
 fn cmd_export(args: &[String]) -> Result<(), String> {
     use std::path::PathBuf;
 
@@ -191,9 +259,10 @@ fn main() {
         Some("grid") => cmd_grid(&rest),
         Some("validate") => cmd_validate(&rest),
         Some("report") => cmd_report(&rest),
+        Some("r001") => cmd_r001(&rest),
         Some("export") => cmd_export(&rest),
         _ => {
-            eprintln!("usage: research-cli <grid|validate|report|export> ...");
+            eprintln!("usage: research-cli <grid|validate|report|r001|export> ...");
             std::process::exit(2);
         }
     };

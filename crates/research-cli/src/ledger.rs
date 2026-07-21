@@ -146,6 +146,36 @@ impl Ledger {
         Ok(LedgerTrialCount::new_from_ledger(n, family.to_string()))
     }
 
+    /// Счётчик post-M-07 эпохи для семейства. Фильтр по code_hash обязателен:
+    /// старые записи append-only ledger не переписываются и не могут участвовать
+    /// в deflated-Sharpe новой семантики (TD-015).
+    pub fn trial_count_for_code_hash(
+        &self,
+        family: &str,
+        code_hash: &str,
+    ) -> io::Result<LedgerTrialCount> {
+        let all = self.read_all()?;
+        let n = all
+            .iter()
+            .filter(|record| record.signal_family == family && record.code_hash == code_hash)
+            .count() as u64;
+        Ok(LedgerTrialCount::new_from_ledger(n, family.to_string()))
+    }
+
+    /// Sharpe-ряд только указанной code-хэш эпохи (источник V[SR] для DSR).
+    pub fn family_sharpes_for_code_hash(
+        &self,
+        family: &str,
+        code_hash: &str,
+    ) -> io::Result<Vec<f64>> {
+        let all = self.read_all()?;
+        Ok(all
+            .iter()
+            .filter(|record| record.signal_family == family && record.code_hash == code_hash)
+            .filter_map(|record| record.sharpe)
+            .collect())
+    }
+
     /// Sharpe-ряд семейства (для V[SR] в формуле D4).
     pub fn family_sharpes(&self, family: &str) -> io::Result<Vec<f64>> {
         let all = self.read_all()?;

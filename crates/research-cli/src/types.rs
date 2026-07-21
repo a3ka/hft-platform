@@ -7,7 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const REPORT_SCHEMA_VERSION: u32 = 1;
+pub const REPORT_SCHEMA_VERSION: u32 = 2;
 pub const TRIALS_LEDGER_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -101,6 +101,49 @@ pub struct StressResult {
     pub net_pnl_e8: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Verdict {
+    Kill(String),
+    Inconclusive(String),
+    Pass,
+}
+
+impl Serialize for Verdict {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::Kill(reason) => serializer.serialize_str(&format!("Kill: {reason}")),
+            Self::Inconclusive(reason) => {
+                serializer.serialize_str(&format!("Inconclusive: {reason}"))
+            }
+            Self::Pass => serializer.serialize_str("Pass"),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Verdict {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        if value == "Pass" {
+            return Ok(Self::Pass);
+        }
+        if let Some(reason) = value.strip_prefix("Kill: ") {
+            return Ok(Self::Kill(reason.to_string()));
+        }
+        if let Some(reason) = value.strip_prefix("Inconclusive: ") {
+            return Ok(Self::Inconclusive(reason.to_string()));
+        }
+        Err(serde::de::Error::custom(
+            "verdict должен быть Pass, Kill: <reason> или Inconclusive: <reason>",
+        ))
+    }
+}
+
 /// Финальный детерминированный отчёт (T1; RC-I-5: байт-идентичен при тех же входах —
 /// НИКАКИХ wall-clock полей внутри).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -127,6 +170,16 @@ pub struct ValidationReport {
     pub decay: Vec<(i64, f64)>,
     pub stress: Vec<StressResult>,
     pub walkforward_sharpes: Vec<f64>,
+    /// Календарная длина окна, на котором считался отчёт (KS-I-1/5).
+    pub data_span_days: f64,
+    /// Стандартная ошибка годового Sharpe (KS-I-1).
+    pub se_sharpe: f64,
+    /// Машинный kill-screen вердикт (KS-I-4).
+    pub verdict: Verdict,
+    /// Ссылка на E8 gap-артефакт именно этого окна (KS-I-5).
+    pub gap_ref: String,
+    /// Граница эпохи trials-ledger (TD-015), например `5141fd9`.
+    pub ledger_cutoff: String,
 }
 
 #[derive(Debug)]
