@@ -9,10 +9,15 @@ use contracts::{
     Side, Venue, LEGACY_EPOCH_ID, SCHEMA_VERSION, SCHEMA_VERSION_PRE_HEADER,
 };
 
-/// CT-I-6: версия схемы 2 — сегменты несут заголовок.
+/// CT-I-6: schema ≥ 2 — сегменты несут заголовок. Точное значение НЕ пинится здесь (оно
+/// растёт с каждым новым эмитируемым вариантом — CT-RFC-04 rev2 поднял 2→3, TD-031); инвариант
+/// CT-RFC-02 — «версия header-формата ≥ 2», а legacy (без заголовка) = 1.
 #[test]
-fn ct_rfc02_schema_version_is_two() {
-    assert_eq!(SCHEMA_VERSION, 2, "CT-RFC-02: bump 1 → 2");
+fn ct_rfc02_schema_version_has_header() {
+    assert!(
+        SCHEMA_VERSION >= 2,
+        "CT-RFC-02: сегменты с заголовком имеют schema ≥ 2 (получено {SCHEMA_VERSION})"
+    );
     assert_eq!(SCHEMA_VERSION_PRE_HEADER, 1, "legacy-сегменты = schema 1");
 }
 

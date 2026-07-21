@@ -10,10 +10,18 @@ use serde::{Deserialize, Serialize};
 /// Множитель fixed-point для денег/цен/размеров (×1e8). Никогда не f64 в деньгах (JR-I-7).
 pub const PRICE_SCALE: i64 = 100_000_000;
 
-/// Версия схемы журнального формата. В каждом сегменте (CT-I-6).
+/// Версия схемы журнального формата = **эпоха эмитируемых вариантов** событий. В каждом
+/// сегменте (CT-I-6). Bump'ится при КАЖДОМ новом варианте `EventKind`/`MdPayload`, который
+/// recorder может писать, — потому что `decide_open_segment` использует её как машинный маркер
+/// изоляции сегмента (reuse требует совпадения schema_version), а НЕ provenance: в
+/// runtime-контейнере `git rev-parse` недоступен → provenance — КОНСТАНТА на всех деплоях
+/// (TD-031), поэтому изоляция по provenance ВОИД. Отделена от `SEGMENT_MAGIC` (framing-эпоха,
+/// стабильна `HFTJRN02`): magic = формат фрейминга, schema_version = набор вариантов.
 /// 1: CT-RFC-01 — аддитивно OpenInterest/Liquidation/MarginRate + Venue::BinanceFutures.
 /// 2: CT-RFC-02 — `SegmentHeader` (первый фрейм сегмента) + provenance/эпохи.
-pub const SCHEMA_VERSION: u32 = 2;
+/// 3: CT-RFC-04 rev2 — `MdPayload::L2Delta` (эмитируемый вариант) ⇒ новая эпоха сегмента
+///    (сегмент schema-2 не reuse'ится schema-3 бинарём → L2Delta изолирован; TD-031 fix).
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// Версия, при которой сегменты ещё писались БЕЗ `SegmentHeader` (боевой сегмент,
 /// пишется с 2026-07-10). Читается навсегда (CT-I-3) через вменённый заголовок.
