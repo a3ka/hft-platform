@@ -105,16 +105,20 @@ disk-guard. Это НЕ портит данные (disk-guard fail-closed: `appe
 журнал» контракт НЕ требует (код обновляется в lockstep; инвариант — new-code-reads-old-journal).
 
 **Source-level: аддитивный вариант enum ЛОМАЕТ исчерпывающие `match MdPayload` без wildcard.**
-Полный список (компилятор — исчерпывающий оракул; проверено `cargo check` по крейтам):
+ПОЛНЫЙ список — **ровно 5 сайтов** (компилятор — исчерпывающий оракул; проверено
+prototype-revert'ом `cargo build --workspace --all-targets` до 0×E0004; C-017 blocker 1):
 
-| Сайт | Действие | Обоснование | Зона |
-|---|---|---|---|
-| `journal/src/segments.rs:1515` (`segment_last_ts`) | добавить `\| MdPayload::L2Delta { ts_exch_ms, .. }` в OR-паттерн | у дельты ЕСТЬ биржевое время — это timestamped-событие | engine-dev |
-| `sim/src/exchange.rs:223` | `MdPayload::L2Delta { .. } => {}` (ИГНОР) | честный симулятор ведёт fill из `L2Snapshot`+`Trade`; сырая дельта = двойной учёт книги ⇒ НЕ вход бэктеста | engine-dev |
+| # | Сайт | Действие | Обоснование | Зона |
+|---|---|---|---|---|
+| 1 | `journal/src/segments.rs` (`segment_last_ts`) | `\| MdPayload::L2Delta { ts_exch_ms, .. }` в OR-паттерн `=> *ts_exch_ms` | у дельты ЕСТЬ биржевое время — timestamped-событие | engine-dev |
+| 2 | `sim/src/exchange.rs` (`on_event`) | `MdPayload::L2Delta { .. } => {}` (ИГНОР) | честный симулятор ведёт fill из `L2Snapshot`+`Trade`; сырая дельта = двойной учёт книги ⇒ НЕ вход бэктеста | engine-dev |
+| 3 | `recorder/src/lib.rs` (`md_kind_label`) | `MdPayload::L2Delta { .. } => "l2delta"` | Prometheus-лейбл kind (OPS-метрики M-09); L2Delta — свой поток, отдельный лейбл | engine-dev |
+| 4 | `journal/examples/dump.rs` (payload match) | `MdPayload::L2Delta { .. } => {}` (ИГНОР) | offline-дамп; печать сырой дельты вне scope M-18 | engine-dev |
+| 5 | `research-cli/src/bin/latency_probe.rs` | `\| MdPayload::L2Delta { .. }` в `=> continue` OR-группу | latency-probe меряет δ_md для Trade/L2Snapshot/Funding; дельта — как OI/Liq/MarginRate (continue) | engine-dev |
 
-`recorder/src/recon_loop.rs:57` и `research-cli/src/export_io.rs:247` уже несут `_ =>` wildcard —
-правки НЕ требуют. Дев обязан прогнать `cargo build --workspace --all-targets` и добавить
-IGNORE-арм на ЛЮБОМ оставшемся E0004-сайте (дефолт — игнор; исключение — journal ts выше).
+`recorder/src/recon_loop.rs` и `research-cli/src/export_io.rs` уже несут `_ =>` wildcard —
+правок НЕ требуют. Дефолт арма — ИГНОР; исключения: #1 (несёт ts), #3 (лейбл `"l2delta"`).
+`verify_M-18.sh` гейтит замыкание списка через `cargo build --workspace --all-targets` (T5b).
 
 ## §7. Верность захвата (без потерь) и живой gate
 

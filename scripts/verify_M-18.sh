@@ -53,15 +53,20 @@ run "venue-binance red_l2delta_capture (U/u/E + size==0 + асимметрия �
 run "venue-binance-futures red_l2delta_futures (pu → prev_final_update_id; continuity перпа)" \
   cargo test -p venue-binance-futures --test red_l2delta_futures
 
-# ── Задача 3/4 wiring-канарейка: l2delta_event ВЫЗЫВАЕТСЯ в emit-пути (src, не только тест) ─
-# Юнит доказывает ТРАНСФОРМ; канарейка ловит «функция есть, но не вызвана» (dead-code green).
-# §8 на VPS — окончательный live-emit гейт (unit-green ≠ live, TD-014).
-if grep -qE "l2delta_event" crates/venue-binance/src/lib.rs \
-   && grep -qE "l2delta_event" crates/venue-binance-futures/src/lib.rs; then
-  pass "l2delta_event вызывается в emit-пути обоих venue-адаптеров (wiring-канарейка)"
-else
-  fail "l2delta_event не вызван в src venue-адаптера — капча не подключена к WS (dead-code green risk)"
-fi
+# ── Задача 3/4 wiring-канарейка: l2delta_event ВЫЗВАН, а не только ОПРЕДЕЛЁН (C-017 blocker 2) ─
+# Голое `grep l2delta_event` проходит на ОДНОМ определении helper'а (helper-only green). Считаем
+# CALL-сайты: строки с `l2delta_event(` МИНУС строка определения (`fn l2delta_event`) и комментарии.
+# ≥1 call на venue ⇒ функция подключена к emit-пути, а не мертва. §8 на VPS — окончательный
+# live-emit гейт (unit/структура ≠ live-доставка с боевого WS, урок TD-014).
+for v in venue-binance venue-binance-futures; do
+  f="crates/${v}/src/lib.rs"
+  calls=$(grep -nE "l2delta_event[[:space:]]*\(" "$f" 2>/dev/null | grep -vE "fn[[:space:]]+l2delta_event" | grep -vcE "^[0-9]+:[[:space:]]*//")
+  if [ "${calls:-0}" -ge 1 ]; then
+    pass "${v}: l2delta_event ВЫЗВАН в emit-пути (${calls} call-site, не только определение)"
+  else
+    fail "${v}: l2delta_event только ОПРЕДЕЛЁН, не вызван — капча не подключена к WS (helper-only green, C-017 b2)"
+  fi
+done
 
 # ── Задача 5 (engine-dev): консюмер-армы + sacred write-path персистит L2Delta ───────────
 run "journal red_l2delta_persist (L2Delta переживает write→read_all exact; spot+futures)" \
