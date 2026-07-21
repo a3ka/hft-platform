@@ -1,9 +1,17 @@
 # M-10 — R-001: первый сквозной прогон OBI (Трек A) как KILL-SCREEN
 
-STATUS: **PROPOSED** (2026-07-20, architect; rev2 2026-07-21 — фиксы C-019 REJECT: verify fail-closed
-на R-001, report-level RED честности отчёта, эпоха ledger'а `.jsonl` механически). Doc-гейт
-`gates.md` §9 Class A (новый milestone) + анти-оверфит гейт §6. Founder дал «go» на пивот к M-10
-после закрытия M-09-корректности.
+STATUS: **PROPOSED** (2026-07-20, architect; rev2 2026-07-21 — фиксы C-019; **rev3 2026-07-21 —
+C-020 CONCERNS: KILL сигнала ПРИНЯТ (отрицательный результат, D-001 на подпись founder'а), но стек
+как ИЗМЕРИТЕЛЬ не провалидирован — 4 находки A/B/C/D, RED-first защита, задачи 7-10; merge заблокирован
+до A**). Doc-гейт `gates.md` §9 Class A + анти-оверфит §6. Founder дал «go» на пивот к M-10.
+
+**⚠ rev3 разделение (важно):** вердикт СИГНАЛА (KILL OBI Трек A) и close милестоуна («стек
+провалидирован») — РАЗНЫЕ вещи. KILL робастен независимо от дефектов стека (all-negative по
+276/276 ячейкам, WF 21/21, decay/stress — ни один дефект не воскрешает мёртвый сигнал; latency×2 →
+ХУЖЕ = знак не перевёрнут). Поэтому D-001 (KILL) подписывается СЕЙЧАС. Но M-10 close-out («первое
+сквозное испытание стека прошло») блокирован находкой A: KS-I-1 (ЯДРО) фактически defeated — se_sharpe
+считался от числа ШАГОВ, не от календарного окна → ложный PASS достижим на 8ч. Пока A не устранена,
+следующий не-очевидно-мёртвый сигнал рискует ложным промоушеном.
 
 ## Objective
 
@@ -87,7 +95,12 @@ research-dev обязан звать его ПЕРЕД записью R-001 (п�
 | 3 | ⏳ | `ValidationReport` +`data_span_days`/`se_sharpe`/`verdict`/`gap_ref`/`ledger_cutoff`; **классификатор** `report::classify_verdict(&KillScreenInputs,BAR)->Verdict` (чистый) + **валидатор честности** `report::validate_report_honesty(&ReportHonesty)->Result<(),String>` (звать ПЕРЕД записью R-001); генерация в `write_metrics_json`/`write_narrative_md` | research-dev | KS-I-* GREEN (classifier + report-honesty); `verify_M-10.sh --red` PASS |
 | 4 | ⏳ | **Прогон R-001 Трек A** через `StrategyBacktest`: grid на train → топ-K → OOS+walk-forward+стресс(×1.5/×2) → `research/reports/R-001-obi-trackA.{json,md}` с ОБЯЗАТЕЛЬНЫМИ span/se/verdict/gap_ref | research-dev | отчёт валиден по verify_M-10; вердикт Kill/Inconclusive (Pass запрещён на этих данных) |
 | 5 | ⏳ | **risk-critic анти-оверфит §6** (пункт 0 — эпоха ledger'а; lookahead, издержки ×1.5/×2, режимы, ёмкость, корреляция) → `research/critiques/C-0NN` (KILL/CONCERNS/PASS) | risk-critic | вердикт закоммичен |
-| 6 | ⏳ | **founder ★** — принять/убить по пре-рег критериям (Граница C). НЕ промоушен (данных мало) — фиксация «мёртв / недостоверно / вернуться при N данных» | founder ★ | подпись/решение |
+| 6 | 🚧 | **founder ★** — принять KILL по пре-рег критериям (Граница C). Черновик решения `research/decisions/D-001-obi-trackA-kill.md` подготовлен architect'ом (sign-ready, подпись Ed25519 — за founder). НЕ промоушен | founder ★ | подпись/решение |
+| 7 | ⏳ | **(rev3, C-020 A — HIGH, БЛОКЕР merge)** `report::sharpe_se` — сигнатура `sharpe_se(sharpe, data_span_days)`; se привязан к КАЛЕНДАРНОМУ окну, не к `returns.len()`. Масштаб: премисса milestone (±11 на 3д). Сделать `pub`, документировать константу (252/365) | research-dev | `cargo test -p research-cli --test red_killscreen` GREEN (a1-a5); ложный PASS на 8ч невозможен |
+| 8 | ⏳ | **(rev3, C-020 B — MEDIUM)** fill-семантика: поле отчёта `fill_rate`→`fills_per_intent` (может быть >1); `metrics::fill_probability(filled_intents, intents)->f64` ∈[0,1] для пре-рег критерия №5. `report_schema_version` бамп | research-dev | `red_stack_honesty::b_*` GREEN; verify: отчёт без `fill_rate`, с `fills_per_intent` |
+| 9 | ⏳ | **(rev3, C-020 C — MEDIUM)** sizing-честность: отчёт несёт `sizing_applied: bool`; `report::validate_sizing_honesty(applied, capacity_e8)` — `!applied` + capacity>0 → Err. R-001 kill-screen идёт UNSIZED (лимиты §4 — зона M-11/M-12); capacity при unsized = 0/N-A + прим. в md | research-dev | `red_stack_honesty::c_*` GREEN; verify: `sizing_applied` присутствует |
+| 10 | ⏳ | **(rev3, C-020 D — MEDIUM, форвардный риск)** `metrics::robust_family_variance(&[f64])` (winsorize/trim/MAD) устойчива к выбросу; `deflated_sharpe` берёт ЕЁ вместо наивной `variance(&family_sharpes)` (report.rs:438). Выброс −226 в obi-семействе не смеет раздувать SR₀ | research-dev | `red_stack_honesty::d_*` GREEN |
+| 4b | ⏳ | **(rev3)** ПОВТОРНЫЙ прогон R-001 после задач 7-10 на РЕАЛЬНОМ окне — se/fill/capacity/DSR теперь физичны; вердикт по-прежнему Kill/Inconclusive (Pass архитектурно запрещён на этих данных) | research-dev | `verify_M-10.sh` FINAL PASS с честными полями |
 
 ## Acceptance (исполняемые ворота)
 
@@ -105,7 +118,28 @@ research-dev обязан звать его ПЕРЕД записью R-001 (п�
 - **founder ★** — Граница C (принять/убить; промоушен НЕ на этих данных).
 - НЕ safety-код (risk/killswitch/oms не трогаются) → risk-critic здесь = адверсарий ОТЧЁТА, не safety-пути.
 
+## C-020 находки (rev3) — стек как ИЗМЕРИТЕЛЬ (RED-оракулы, sacred)
+
+Прогон R-001 (первое сквозное испытание стека) вскрыл 4 дефекта. Ни один не воскрешает KILL
+(Sharpe масштаб-инвариантен, all-negative), но отчёту нельзя доверять НЕ-Kill вывод, пока они живы.
+
+| # | Находка | Severity | RED-оракул | Impl |
+|---|---|---|---|---|
+| A | `sharpe_se` от `returns.len()` (шаги), не от календарного окна → se=0.27 на 0.35д → KS-I-1 defeated, ложный PASS на 8ч достижим | **HIGH, БЛОКЕР** | `red_killscreen::a1..a5` (масштаб se к дням; short-window не Pass; long — reachable) | task 7 |
+| B | `fill_rate=1.99` (>1) — «доля исполнения» ∈[0,1] по имени, но это fills/intents | MEDIUM | `red_stack_honesty::b_*` (`fill_probability`∈[0,1]) | task 8 |
+| C | capacity $508M / turnover $10B на аккаунт $500–2k — sim без лимитов §4 | MEDIUM | `red_stack_honesty::c_*` (`validate_sizing_honesty`) | task 9 |
+| D | выброс Sharpe −226 в V[SR] семейства → раздутый SR₀ → занижённые будущие DSR | MEDIUM (форвард) | `red_stack_honesty::d_*` (`robust_family_variance`) | task 10 |
+
+**A — блокер merge M-10 в main** (`gates.md` §5: CONCERNS до фикса/именованного founder-override).
+B/C/D — не блокируют KILL, но обязательны до доверия к НЕ-Kill вердикту (закрыть в rev3 или явно
+отложить founder-решением с обоснованием). Абсолютные величины отчёта R-001 (PnL/turnover/capacity/
+fill) в решении D-001 **НЕ используются** — только знак/робастность Kill.
+
 ## Handoff (план)
 
-critic (milestone+RED) → research-dev (ValidationReport +поля + классификатор + прогон R-001) →
-risk-critic (анти-оверфит §6) → founder ★ (вердикт). Architect пишет KS-I-* RED + verify ДО прогона.
+rev1-2: critic (milestone+RED) → research-dev (поля+классификатор+прогон) → risk-critic → [сделано].
+**rev3 (C-020):** параллельно —
+(1) **founder ★** подписывает `research/decisions/D-001-obi-trackA-kill.md` (KILL, отдельно от close);
+(2) **research-dev** задачи 7-10 (A блокер + B/C/D) + 4b (повторный прогон) → **risk-critic** re-audit
+(A устранена? стек как измеритель валиден?) → **founder ★** close M-10. Architect пишет RED (A/B/C/D)
++ verify ДО impl (сделано в rev3).

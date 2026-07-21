@@ -28,8 +28,12 @@ run "T0b clippy --workspace -D warnings" cargo clippy --workspace --all-targets 
 
 # ── Task 1 (KS-I-* RED): классификатор + честность отчёта ──────────────────────────────
 # Покрывает classify_verdict (KS-I-1/4) И validate_report_honesty (KS-I-5 gap_ref, KS-I-3 эпоха).
-run "KS-I-* kill-screen + честность отчёта (classifier + gap_ref + эпоха)" \
+run "KS-I-* kill-screen + честность отчёта (classifier + gap_ref + эпоха + se-масштаб C-020 A)" \
   cargo test -p research-cli --test red_killscreen
+
+# ── C-020 B/C/D: честность стека как ИЗМЕРИТЕЛЯ (fill-семантика, sizing/capacity, робастная V[SR]) ──
+run "C-020 стек-честность (fill_probability∈[0,1], unsized→no capacity, robust V[SR])" \
+  cargo test -p research-cli --test red_stack_honesty
 
 # ── KS-I-2 пре-регистрация (§4.1): H-карточка с критериями фальсификации СУЩЕСТВУЕТ ────
 HCARD="research/hypotheses/H-20260710-obi-asym.md"
@@ -79,6 +83,21 @@ else
 метрики/deflated-Sharpe обязаны считаться ТОЛЬКО по записям кода ≥ 5141fd9"
   else
     pass "KS-I-3 отчёт не содержит пре-M-07 эпохи (f7f4761) — эпохи не смешаны (глубокий подсчёт — risk-critic пункт 0)"
+  fi
+
+  # C-020 B: fill-метрика честна по имени. «fill_rate» (может быть >1) переименована в fills_per_intent;
+  # «доля/вероятность исполнения» ∈[0,1] живёт как fill_probability (если нужна пре-рег критерию №5).
+  if grep -qE '"fill_rate"' "${REPORT_JSON}"; then
+    fail "C-020 B отчёт несёт поле \`fill_rate\` (было 1.99 > 1) — имя подразумевает долю ∈[0,1]; переименуй в \`fills_per_intent\`"
+  else
+    pass "C-020 B поля \`fill_rate\` в отчёте нет (переименовано в fills_per_intent — честное имя)"
+  fi
+
+  # C-020 C: unsized прогон обязан НАЗВАТЬ себя и не заявлять нефизичную ёмкость.
+  if grep -qE '"sizing_applied"' "${REPORT_JSON}"; then
+    pass "C-020 C отчёт несёт \`sizing_applied\` (прогон честно помечен sized/unsized)"
+  else
+    fail "C-020 C отчёт БЕЗ \`sizing_applied\` — capacity/turnover на аккаунт \$500–2k недостоверны без пометки лимитов (§4)"
   fi
 
   # KS-I-1: ложный Pass на шуме — verdict=Pass, но нижняя CI-граница sharpe−2·se ≤ BAR=0.5.

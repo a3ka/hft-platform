@@ -33,7 +33,7 @@
 //! `honest_report_is_reachable_valid` (полностью честный отчёт обязан проходить).
 
 use research_cli::report::{
-    classify_verdict, validate_report_honesty, KillScreenInputs, ReportHonesty, Verdict,
+    classify_verdict, sharpe_se, validate_report_honesty, KillScreenInputs, ReportHonesty, Verdict,
 };
 
 /// Бар нижней CI-границы Sharpe (KS-I-1) — фикс, не калибруется (согласован с пре-рег «≤0.5 → мёртв»).
@@ -236,5 +236,98 @@ fn honest_report_is_reachable_valid() {
     assert!(
         validate_report_honesty(&honest_report()).is_ok(),
         "полностью честный отчёт (gap_ref задан, эпоха ≥5141fd9, span/se конечны) обязан быть ВАЛИДЕН"
+    );
+}
+
+// ── KS-I-1 ЯДРО: se_sharpe ПРИВЯЗАН К КАЛЕНДАРНОМУ ОКНУ, не к числу шагов (C-020 A, БЛОКЕР) ─────
+// Находка risk-critic C-020 A (HIGH): `sharpe_se(returns, sharpe)` считал se от returns.len()
+// (~1.4e4 шагов) → se=0.27 на окне 0.353 дня → гейт KS-I-1 (sharpe−2·se>BAR) DEFEATED: ложный PASS
+// достижим на 8-часовом окне (sharpe>~1.04). Это ровно исход, объявленный «АРХИТЕКТУРНО ЗАПРЕЩЁН».
+// Здесь Kill не дал ему проявиться (oos<0), но на положительном сигнале защита не сработала бы.
+//
+// КОНТРАКТ (research-dev impl): сигнатура МЕНЯЕТСЯ — se зависит от КАЛЕНДАРНОГО span, не от шагов:
+//   `pub fn sharpe_se(sharpe: f64, data_span_days: f64) -> f64`
+// Масштаб задан ПРЕМИССОЙ самого milestone'а («SE годового Sharpe ≈ ±11 на 3–7 днях»):
+//   se ≈ sqrt(DAYS_PER_YEAR / data_span_days · (1 + 0.5·sharpe²/ppy)) ⇒ на 3д ≈11, на 7д ≈7, на 0.35д ≈32.
+// Точную константу (252 trading / 365 календарь; форма SR-члена) выбирает research-dev и ДОКУМЕНТИРУЕТ;
+// оракул пиннит МАСШТАБ и ПОВЕДЕНИЕ, а не константу. Компайл-RED против старой сигнатуры (returns).
+//
+// Прод-режим значение (урок TD-031): фикстуры используют РЕАЛЬНОЕ окно R-001 (0.353 дня), где дефект
+// и проявился, а не «удобное» большое окно, которое замаскировало бы step-count реализацию.
+
+/// Здоровые пре-рег критерии + заданные sharpe/se — чтобы Kill не преempt'ил KS-I-1.
+fn healthy_with(sharpe: f64, se_sharpe: f64, span: f64) -> KillScreenInputs {
+    KillScreenInputs {
+        sharpe,
+        se_sharpe,
+        data_span_days: span,
+        ..healthy()
+    }
+}
+
+#[test]
+fn a1_se_is_huge_on_short_window() {
+    // Реальное окно R-001: 0.353 дня. Любая календарная формула даёт se ~27..40; step-count → 0.27.
+    let se = sharpe_se(1.0, 0.353);
+    assert!(
+        se > 10.0,
+        "se на окне 0.353 дня = {se} (ожидается ~30). Значение <10 означает привязку к числу ШАГОВ \
+         (returns.len), а не к КАЛЕНДАРНОМУ окну — KS-I-1 defeated (C-020 A). se=0.27 тут падает"
+    );
+}
+
+#[test]
+fn a2_se_matches_milestone_premise_on_days() {
+    // Премисса milestone: «SE годового Sharpe ≈ ±11 на 3–7 днях». Пиннит масштаб к дням.
+    let se3 = sharpe_se(1.0, 3.0);
+    let se7 = sharpe_se(1.0, 7.0);
+    assert!(
+        (5.0..=25.0).contains(&se3),
+        "se на 3 днях = {se3}, ожидается порядок ±11 (премисса milestone). Вне [5,25] → масштаб сломан"
+    );
+    assert!(
+        (3.0..=20.0).contains(&se7),
+        "se на 7 днях = {se7}, ожидается порядок ±7. Вне [3,20] → масштаб сломан"
+    );
+}
+
+#[test]
+fn a3_se_decreases_monotonically_with_span() {
+    // Больше КАЛЕНДАРНЫХ данных → теснее оценка. Step-count реализация этого не гарантирует
+    // (при равномерной частоте returns.len ∝ span, но при неравномерной — нет; календарь — гарантирует).
+    let s0 = sharpe_se(1.0, 0.353);
+    let s1 = sharpe_se(1.0, 3.0);
+    let s2 = sharpe_se(1.0, 30.0);
+    let s3 = sharpe_se(1.0, 365.0);
+    assert!(
+        s0 > s1 && s1 > s2 && s2 > s3,
+        "se обязан УБЫВАТЬ с календарным окном: {s0} > {s1} > {s2} > {s3} — иначе окно не влияет на достоверность"
+    );
+}
+
+#[test]
+fn a4_se_is_tight_on_long_window() {
+    // 10 лет данных → se мал → Pass достижим честно.
+    let se = sharpe_se(1.0, 3650.0);
+    assert!(
+        se < 1.0,
+        "se на 10-летнем окне = {se}, ожидается <1 (данных много) — иначе Pass недостижим НИКОГДА"
+    );
+}
+
+#[test]
+fn a5_short_window_defeats_pass_long_window_reaches_it() {
+    // ИНТЕГРАЦИЯ с classify_verdict: честный se закрывает ложный PASS на коротком окне
+    // и оставляет Pass достижимым на длинном (иначе kill-screen — заглушка, а не гейт).
+    let short = healthy_with(3.0, sharpe_se(3.0, 0.353), 0.353);
+    assert!(
+        !matches!(classify_verdict(&short, BAR), Verdict::Pass),
+        "sharpe=3 на окне 0.353 дня при ЧЕСТНОМ se не смеет дать Pass — на 8 часах годовой SR это шум (KS-I-1)"
+    );
+    let long = healthy_with(3.0, sharpe_se(3.0, 3650.0), 3650.0);
+    assert!(
+        matches!(classify_verdict(&long, BAR), Verdict::Pass),
+        "sharpe=3 на 10-летнем окне при честном se ОБЯЗАН давать Pass — иначе honest se сделал kill-screen \
+         неспособным к Pass вообще (заглушка). Достижимость Pass — анти-плацебо со стороны «всё зарубить»"
     );
 }
