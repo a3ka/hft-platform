@@ -1518,7 +1518,8 @@ fn first_event_data_ts(path: &Path) -> io::Result<Option<i64>> {
             | MdPayload::Funding { ts_exch_ms, .. }
             | MdPayload::OpenInterest { ts_exch_ms, .. }
             | MdPayload::Liquidation { ts_exch_ms, .. }
-            | MdPayload::MarginRate { ts_exch_ms, .. } => *ts_exch_ms,
+            | MdPayload::MarginRate { ts_exch_ms, .. }
+            | MdPayload::L2Delta { ts_exch_ms, .. } => *ts_exch_ms,
         },
     };
     Ok(Some(ts))
