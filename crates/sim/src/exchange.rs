@@ -276,6 +276,10 @@ impl BacktestExchange {
             | MdPayload::OpenInterest { .. }
             | MdPayload::Liquidation { .. }
             | MdPayload::MarginRate { .. } => {}
+            // CT-RFC-04: сырая L2-дельта игнорируется симом — честный fill-путь ведёт
+            // книгу из L2Snapshot+Trade; учёт дельты поверх снапшота был бы двойным
+            // счётом книги, а не входом бэктеста.
+            MdPayload::L2Delta { .. } => {}
         }
 
         fills
