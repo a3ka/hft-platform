@@ -75,8 +75,8 @@ research-dev обязан звать его ПЕРЕД записью R-001 (п�
 - `research/hypotheses/`, `research/specs/` — пре-рег уже есть (`H-20260710`, `S-001`); правки — signal-engineer по назначению.
 - `crates/research-cli/src/**` (ValidationReport +поля, verdict-классификатор, report-генерация, прогон грида) — **research-dev**.
 - `crates/signals/src/obi.rs` — сигнал УЖЕ есть (M-04); детерминизм-тест — signal-engineer при нужде.
-- `research/reports/R-001*`, `research/trials-ledger.json` (append-only механизм, НЕ ручная правка) — **research-dev** (генерация).
-- **Forbidden:** ручная правка `trials-ledger.json`; касание test-окна >1 раза; `crates/{risk,killswitch,oms,contracts}`; промоушен статуса сигнала (Граница B/C — только founder-подпись).
+- `research/reports/R-001*`, `research/trials-ledger.jsonl` (append-only механизм, НЕ ручная правка) — **research-dev** (генерация).
+- **Forbidden:** ручная правка `trials-ledger.jsonl`; касание test-окна >1 раза; `crates/{risk,killswitch,oms,contracts}`; промоушен статуса сигнала (Граница B/C — только founder-подпись).
 
 ## §Tasks (RED-first: architect гейты ДО прогона)
 
