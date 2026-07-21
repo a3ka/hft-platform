@@ -19,10 +19,14 @@ use contracts::{
 /// осталась ≥ 2 (формат сегмент-заголовка не сломан), а recon-вариант аддитивен (дискриминант ниже).
 #[test]
 fn ct_rfc03_schema_version_has_header() {
-    assert!(
-        SCHEMA_VERSION >= 2,
-        "формат сегмент-заголовка ≥ 2 (recon-вариант аддитивен); получено {SCHEMA_VERSION}"
-    );
+    // const-контекст (см. red_rfc02): compile-time инвариант, без clippy::assertions_on_constants,
+    // без пина точного значения.
+    const {
+        assert!(
+            SCHEMA_VERSION >= 2,
+            "формат сегмент-заголовка ≥ 2 (recon-вариант аддитивен)"
+        )
+    };
 }
 
 /// Новый вариант — СТРОГО в конце `SysEvent`: дискриминант 3, а 0/1/2 неизменны.

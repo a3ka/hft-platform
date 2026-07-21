@@ -97,11 +97,14 @@ fn is_l2delta(k: &EventKind) -> bool {
 /// Изоляция L2Delta держится ЭПОХОЙ СХЕМЫ при ИДЕНТИЧНОМ (прод-константа) provenance.
 #[test]
 fn l2delta_isolated_by_schema_epoch_under_constant_provenance() {
-    // sanity: тест имеет смысл только если текущая эпоха > 2 (L2Delta-эпоха).
-    assert!(
-        SCHEMA_VERSION >= 3,
-        "L2Delta-эпоха обязана быть schema ≥ 3 (TD-031 fix); получено {SCHEMA_VERSION}"
-    );
+    // sanity: тест имеет смысл только если текущая эпоха ≥ 3 (L2Delta-эпоха). const-контекст —
+    // избегаем clippy::assertions_on_constants (рантайм-assert на const = error под `-D warnings`).
+    const {
+        assert!(
+            SCHEMA_VERSION >= 3,
+            "L2Delta-эпоха обязана быть schema ≥ 3 (TD-031 fix)"
+        )
+    };
 
     let dir = tempfile::tempdir().expect("tempdir");
     // Фаза 1: активный сегмент ДО M-18 — schema 2, прод-провенанс, только Trade.

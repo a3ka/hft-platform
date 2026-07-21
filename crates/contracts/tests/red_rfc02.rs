@@ -14,10 +14,15 @@ use contracts::{
 /// CT-RFC-02 — «версия header-формата ≥ 2», а legacy (без заголовка) = 1.
 #[test]
 fn ct_rfc02_schema_version_has_header() {
-    assert!(
-        SCHEMA_VERSION >= 2,
-        "CT-RFC-02: сегменты с заголовком имеют schema ≥ 2 (получено {SCHEMA_VERSION})"
-    );
+    // const-контекст: инвариант «header-формат ≥ 2» проверяется на этапе компиляции — избегаем
+    // clippy::assertions_on_constants (рантайм-assert на const = ошибка под `-D warnings`), при этом
+    // НЕ пиним точное значение (оно растёт с вариантами: CT-RFC-04 rev2 → 3).
+    const {
+        assert!(
+            SCHEMA_VERSION >= 2,
+            "CT-RFC-02: сегменты с заголовком имеют schema ≥ 2"
+        )
+    };
     assert_eq!(SCHEMA_VERSION_PRE_HEADER, 1, "legacy-сегменты = schema 1");
 }
 

@@ -91,6 +91,11 @@ fi
 # Полный workspace собирается ⇒ ВСЕ исчерпывающие match MdPayload получили арм L2Delta (E0004 закрыты).
 run "workspace собирается со всеми armами L2Delta (E0004 закрыты: journal/sim + любой оставшийся)" \
   cargo build --workspace --all-targets
+# CLIPPY-ГЕЙТ (закрывает gate-gap: verify без clippy расходился с CI ci.yml:22, класс RN-8/TD-031).
+# Тот же прогон, что CI → clippy-only дефект (напр. assertions_on_constants в -D warnings) ловится
+# ЗДЕСЬ, а не на PR-гейте reviewer'а / красном CI.
+run "clippy --workspace --all-targets -D warnings (совпадает с CI; verify не расходится с деплой-гейтом)" \
+  cargo clippy --workspace --all-targets -- -D warnings
 
 echo
 if [ "${FAILED}" -gt 0 ]; then
