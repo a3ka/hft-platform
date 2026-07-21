@@ -1,7 +1,9 @@
 # M-10 — R-001: первый сквозной прогон OBI (Трек A) как KILL-SCREEN
 
-STATUS: **PROPOSED** (2026-07-20, architect). Doc-гейт `gates.md` §9 Class A (новый milestone) +
-анти-оверфит гейт §6. Founder дал «go» на пивот к M-10 после закрытия M-09-корректности.
+STATUS: **PROPOSED** (2026-07-20, architect; rev2 2026-07-21 — фиксы C-019 REJECT: verify fail-closed
+на R-001, report-level RED честности отчёта, эпоха ledger'а `.jsonl` механически). Doc-гейт
+`gates.md` §9 Class A (новый milestone) + анти-оверфит гейт §6. Founder дал «go» на пивот к M-10
+после закрытия M-09-корректности.
 
 ## Objective
 
@@ -31,11 +33,20 @@ STATUS: **PROPOSED** (2026-07-20, architect). Doc-гейт `gates.md` §9 Class 
 ## Contract impact (T-designate, НЕ crates/contracts) — CT-RFC НЕ нужен
 
 `ValidationReport` (`research-cli/src/types.rs`, T1-DESIGNATE, промоушен в `contracts` отложен TD-008)
-получает ТРИ поля для честного kill-screen (сейчас их НЕТ — отчёт не может быть честным без них):
+получает поля для честного kill-screen (сейчас их НЕТ — отчёт не может быть честным без них):
 - `data_span_days: f64` — календарная длина тестового окна (дни);
 - `se_sharpe: f64` — стандартная ошибка оценки Sharpe (на коротком окне огромна → любой точечный SR — шум);
-- `verdict: Verdict { Kill(reason), Inconclusive(reason), Pass }` + `gap_ref` (ссылка на E8 gap-артефакт
-  тестового окна, `data_quality.rs`).
+- `verdict: Verdict { Kill(reason), Inconclusive(reason), Pass }`;
+- `gap_ref: String` — ссылка на E8 gap-артефакт тестового окна (`data_quality.rs`);
+- `ledger_cutoff: String` — code_hash-граница эпохи ledger'а, по которой посчитаны deflated-Sharpe/`ledger_n`
+  (TD-015; `≥ 5141fd9`) — отчёт обязан НАЗВАТЬ свою эпоху машинно, а не в прозе.
+
+Плюс **валидатор честности отчёта** `research_cli::report::{ReportHonesty, validate_report_honesty}`
+(C-019 B2/B3) — УЗКИЙ, отдельно от классификатора: `gap_ref` (E8) и эпоха ledger'а (TD-015) генерируются
+ВНЕ `classify_verdict`, поэтому гейтятся report-level RED'ом, а не пихаются в `KillScreenInputs`.
+research-dev обязан звать его ПЕРЕД записью R-001 (пустой `gap_ref` / пустая или пре-M-07 `ledger_cutoff`
+`f7f4761` / не-конечный span / отрицательная se → `Err`, отчёт не пишется).
+
 Тип живёт в `research-cli` (не в `crates/contracts`) → это research-dev-правка формы под RED architect'а,
 БЕЗ atomic contract-RFC. `report_schema_version` бампается (аддитивно).
 
@@ -50,7 +61,8 @@ STATUS: **PROPOSED** (2026-07-20, architect). Doc-гейт `gates.md` §9 Class 
 | **KS-I-2** | **Пре-регистрация (§4.1).** H-карточка с критериями фальсификации существует ДО test (`require_preregistration` уже есть). Отчёт без пре-рег предка → невалиден |
 | **KS-I-3** | **Эпоха ledger'а (TD-015).** `ledger_n` и V[SR] семейства — ТОЛЬКО по записям кода `≥ 5141fd9`; отчёт НАЗЫВАЕТ эпоху (`code_hash` + диапазон). Смешение эпох → KILL (risk-critic пункт 0) |
 | **KS-I-4** | **Критерии фальсификации — МАШИННО.** Пре-рег критерии H-карточки (Net Sharpe ≤0.5 OOS / deflated ≤0 / walk-forward нестабилен / decay < горизонта / отрицательный fill-PnL) вычисляются из отчёта; сработал любой → `verdict=Kill(reason)`. RED: отчёт, где критерий сработал, но `verdict≠Kill` → гейт ВАЛИТ |
-| **KS-I-5** | **E8 честность окна.** `verdict` ссылается на gap-статистику тестового окна (`data_quality.rs`); если доля разрывов высока — это в отчёте, не спрятано. Test-окно трогается ОДИН раз (§4.2) |
+| **KS-I-5** | **E8 честность окна.** `verdict` ссылается на gap-статистику тестового окна (`data_quality.rs`); если доля разрывов высока — это в отчёте, не спрятано. Test-окно трогается ОДИН раз (§4.2). **Механически (C-019 B2):** `validate_report_honesty` валит отчёт с пустым `gap_ref` (report-level RED, не classifier); `verify_M-10.sh` требует непустой `gap_ref` в R-001 json |
+| **KS-I-3 (доп.)** | **Механический анти-микс эпох (C-019 B3):** `validate_report_honesty` валит пустой/пре-M-07 (`f7f4761`) `ledger_cutoff`; `verify_M-10.sh` (a) читает ledger по пути `research/trials-ledger.jsonl`, (b) требует непустой `ledger_cutoff` в отчёте, (c) валит отчёт, содержащий `f7f4761`. Глубокий подсчёт `ledger_n`/V[SR] по эпохе — risk-critic пункт 0 |
 
 `BAR` для KS-I-1 — фиксированная константа в RED (не калибруется): нижняя граница Sharpe, ниже которой
 сигнал не промоушабелен даже теоретически (стартово `BAR = 0.5`, согласовано с пре-рег порогом «≤0.5 →
@@ -70,19 +82,21 @@ STATUS: **PROPOSED** (2026-07-20, architect). Doc-гейт `gates.md` §9 Class 
 
 | # | Статус | Задача | Кто | Acceptance |
 |---|---|---|---|---|
-| 1 | ⏳ | **KS-I-* RED-оракулы** (`crates/research-cli/tests/red_killscreen.rs`): kill-screen честность (KS-I-1 CI-бар, KS-I-4 критерии→Kill, KS-I-5 gap-ref), анти-плацебо в обе стороны (Pass-на-шуме валит; always-Inconclusive валит на реальном Kill) | architect | RED падает против текущего (нет verdict/se/span); достижим корректным классификатором |
-| 2 | ⏳ | `scripts/verify_M-10.sh` — анти-оверфит §6 как гейт: пре-рег есть, эпоха TD-015, отчёт несёт span/se/verdict, kill-screen enforced, ledger append-only | architect | exit=0 на валидном отчёте; ВАЛИТ отчёт с ложным Pass |
-| 3 | ⏳ | `ValidationReport` +`data_span_days`/`se_sharpe`/`verdict`/`gap_ref`; классификатор `report::classify_verdict(&report,BAR)->Verdict` (чистый); генерация в `write_metrics_json`/`write_narrative_md` | research-dev | KS-I-* GREEN |
+| 1 | ✅ | **KS-I-* RED-оракулы** (`crates/research-cli/tests/red_killscreen.rs`): classifier-честность (KS-I-1 CI-бар, KS-I-4 критерии→Kill) + **report-level честность** (KS-I-5 gap_ref, KS-I-3 эпоха через `validate_report_honesty`), анти-плацебо в обе стороны (Pass-на-шуме валит; always-Inconclusive валит на реальном Kill; always-Ok валидатор валит err-тесты; always-Err валит достижимо-честный отчёт) | architect | RED падает против текущего (нет verdict/se/span/ReportHonesty); достижим корректным классификатором+валидатором |
+| 2 | ✅ | `scripts/verify_M-10.sh` — анти-оверфит §6 как гейт: пре-рег есть, эпоха TD-015 (путь `.jsonl`, `ledger_cutoff` + анти-микс `f7f4761`), **FINAL fail-closed требует R-001 `.json`+`.md`** (флаг `--red` для RED-фазы), отчёт несёт span/se/verdict/gap_ref, kill-screen enforced | architect | FINAL exit≠0 без отчёта; ВАЛИТ ложный Pass/пустой gap_ref/пре-M-07 эпоху; exit=0 на валидном отчёте |
+| 3 | ⏳ | `ValidationReport` +`data_span_days`/`se_sharpe`/`verdict`/`gap_ref`/`ledger_cutoff`; **классификатор** `report::classify_verdict(&KillScreenInputs,BAR)->Verdict` (чистый) + **валидатор честности** `report::validate_report_honesty(&ReportHonesty)->Result<(),String>` (звать ПЕРЕД записью R-001); генерация в `write_metrics_json`/`write_narrative_md` | research-dev | KS-I-* GREEN (classifier + report-honesty); `verify_M-10.sh --red` PASS |
 | 4 | ⏳ | **Прогон R-001 Трек A** через `StrategyBacktest`: grid на train → топ-K → OOS+walk-forward+стресс(×1.5/×2) → `research/reports/R-001-obi-trackA.{json,md}` с ОБЯЗАТЕЛЬНЫМИ span/se/verdict/gap_ref | research-dev | отчёт валиден по verify_M-10; вердикт Kill/Inconclusive (Pass запрещён на этих данных) |
 | 5 | ⏳ | **risk-critic анти-оверфит §6** (пункт 0 — эпоха ledger'а; lookahead, издержки ×1.5/×2, режимы, ёмкость, корреляция) → `research/critiques/C-0NN` (KILL/CONCERNS/PASS) | risk-critic | вердикт закоммичен |
 | 6 | ⏳ | **founder ★** — принять/убить по пре-рег критериям (Граница C). НЕ промоушен (данных мало) — фиксация «мёртв / недостоверно / вернуться при N данных» | founder ★ | подпись/решение |
 
 ## Acceptance (исполняемые ворота)
 
-1. **Kill-screen честность (KS-I-1):** отчёт с `Pass` при `sharpe−2·se ≤ BAR` → verify FAIL. Отчёт без `data_span_days`/`se_sharpe` → невалиден.
-2. **Эпоха (KS-I-3/TD-015):** `ledger_n`/V[SR] только по записям `≥ 5141fd9`; отчёт называет эпоху.
+0. **FINAL fail-closed (C-019 B1):** `verify_M-10.sh` (дефолт) → FAIL, пока нет `research/reports/R-001*obi*trackA*.{json,md}`. Milestone НЕ закрывается без артефакта, ради которого создан. RED-фаза — `verify_M-10.sh --red` (отчёт отложен).
+1. **Kill-screen честность (KS-I-1):** отчёт с `Pass` при `sharpe−2·se ≤ BAR` → verify FAIL. Отчёт без непустых `data_span_days`/`se_sharpe`/`verdict`/`gap_ref`/`code_hash`/`ledger_cutoff` → невалиден.
+2. **Эпоха (KS-I-3/TD-015, C-019 B3):** ledger по пути `research/trials-ledger.jsonl`; отчёт называет эпоху (`ledger_cutoff` непустой), НЕ содержит пре-M-07 `f7f4761`; `ledger_n`/V[SR] только по записям `≥ 5141fd9` (глубоко — risk-critic пункт 0).
 3. **Критерии фальсификации (KS-I-4):** пре-рег критерий сработал → `verdict=Kill`; иначе гейт валит.
-4. **Пре-рег + time-split:** H-карточка ДО test; test-окно тронуто ОДИН раз; trials-ledger append-only.
+4. **E8 честность окна (KS-I-5, C-019 B2):** `validate_report_honesty` валит пустой `gap_ref`; отчёт ссылается на gap-артефакт тестового окна.
+5. **Пре-рег + time-split:** H-карточка ДО test; test-окно тронуто ОДИН раз; trials-ledger append-only.
 
 ## Гейты
 
