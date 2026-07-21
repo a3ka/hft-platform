@@ -254,3 +254,105 @@ The expected post-repair outcome is likely APPROVE: the core contract and lossle
 ## Cleanup
 
 Temporary reachability prototypes and anti-placebo mutations were fully reverted before this verdict. Pre-verdict worktree status was clean except for this critique file.
+
+---
+
+## Re-audit — 2026-07-21T10:43:31Z
+
+**Audited repair head:** `cb1509a` — `docs(M-18): C-017 repair — полный E0004-list (5 сайтов) + wiring-канарейка ловит helper-only-green`  
+**Base verdict:** `ca8741a` — C-017 REJECT  
+**Worktree:** `/tmp/hft-critic-m18` detached at `origin/feat/M-18-l2delta`  
+**Verdict:** APPROVE
+
+### Repair Diff
+
+The repair touches only the three expected plan/gate artifacts:
+
+- `docs/rfc/CT-RFC-04-l2delta.md`
+- `milestones/M-18-l2delta-capture.md`
+- `scripts/verify_M-18.sh`
+
+No implementation code is committed in the repair.
+
+### B1 Closure — E0004 List
+
+APPROVE. RFC §6 and milestone task 5 now name the complete known set of five consumer arms:
+
+1. `journal/src/segments.rs` / `segment_last_ts`: add `MdPayload::L2Delta { ts_exch_ms, .. }` to the timestamp OR-pattern.
+2. `sim/src/exchange.rs` / `on_event`: ignore `MdPayload::L2Delta { .. }` so fills remain driven by `L2Snapshot + Trade`.
+3. `recorder/src/lib.rs` / `md_kind_label`: map `MdPayload::L2Delta { .. }` to `"l2delta"`.
+4. `journal/examples/dump.rs`: ignore `MdPayload::L2Delta { .. }` in the diagnostic payload match.
+5. `research-cli/src/bin/latency_probe.rs`: add `MdPayload::L2Delta { .. }` to the `continue` group.
+
+I temporarily prototyped the two venue helpers plus exactly those five E0004 arms, with no live emit call-sites. The workspace build then reached 0x E0004:
+
+```text
+cargo build --workspace --all-targets; echo exit=$?
+Finished `dev` profile ...
+exit=0
+```
+
+This closes the C-017 B1 blocker. The remaining workspace-build canary is still useful as a final compiler oracle for future drift.
+
+### B2 Closure — Helper-only Wiring Canary
+
+APPROVE. `verify_M-18.sh` no longer greps for mere symbol presence. It counts `l2delta_event(` occurrences in each venue source file, subtracting the `fn l2delta_event` definition and comments, and requires at least one call-site per venue.
+
+With the same temporary helper-only prototype:
+
+- `venue_binance::l2delta_event` existed and direct RED passed.
+- `venue_binance_futures::{pub DepthDiff, l2delta_event}` existed and direct RED passed.
+- all five E0004 arms were present, so journal persist and workspace build passed.
+- no emit-path calls were added.
+
+The full gate still failed exactly on the wiring canary:
+
+```text
+bash scripts/verify_M-18.sh; echo exit=$?
+PASS  venue-binance red_l2delta_capture (...)
+PASS  venue-binance-futures red_l2delta_futures (...)
+FAIL  venue-binance: l2delta_event только ОПРЕДЕЛЁН, не вызван — капча не подключена к WS (helper-only green, C-017 b2)
+FAIL  venue-binance-futures: l2delta_event только ОПРЕДЕЛЁН, не вызван — капча не подключена к WS (helper-only green, C-017 b2)
+PASS  journal red_l2delta_persist (...)
+PASS  workspace собирается со всеми armами L2Delta (...)
+VERDICT: FAIL (2)
+exit=1
+```
+
+This closes the C-017 B2 blocker. Reviewer §8 remains the decisive live-WS proof, but the local verify gate is no longer helper-only green.
+
+### Current RED State
+
+After reverting the temporary prototype, the committed branch remains in the expected RED-first state:
+
+```text
+bash scripts/verify_M-18.sh; echo exit=$?
+PASS  CT-RFC-04 red_rfc04 (...)
+PASS  CT-I-4 red_schema (...)
+PASS  MdPayload::L2Delta присутствует в contracts
+PASS  SEGMENT_MAGIC=HFTJRN02 и SCHEMA_VERSION=2 НЕ тронуты (...)
+PASS  CHANGELOG несёт запись CT-RFC-04
+PASS  фикстура fixtures/valid/event-l2delta-spot.json
+PASS  фикстура fixtures/valid/event-l2delta-futures.json
+PASS  фикстура fixtures/invalid/event-l2delta-missing-final-id.json
+FAIL  venue-binance red_l2delta_capture (...)
+FAIL  venue-binance-futures red_l2delta_futures (...)
+FAIL  venue-binance: l2delta_event только ОПРЕДЕЛЁН, не вызван (...)
+FAIL  venue-binance-futures: l2delta_event только ОПРЕДЕЛЁН, не вызван (...)
+FAIL  journal red_l2delta_persist (...)
+FAIL  workspace собирается со всеми armами L2Delta (...)
+VERDICT: FAIL (6)
+exit=1
+```
+
+That is correct before venue-dev / engine-dev implementation.
+
+### Residual Notes
+
+- This is only the critic plan-time verdict. It is not a risk-critic PASS.
+- risk-critic remains mandatory because M-18 touches T1 and sacred live-path (`venue/recorder/journal`), and RFC §5 still requires the retention/symbol-set decision.
+- §8 live-emit on VPS remains required before close-out; unit and grep gates do not prove production delivery.
+
+### Re-audit Cleanup
+
+Temporary helper-only prototypes and E0004 arms were fully reverted before this appendix was written. The only committed re-audit change is this verdict file.
