@@ -1175,11 +1175,19 @@ pub(crate) fn decide_open_segment(dir: &Path, cfg: &WriterConfig) -> io::Result<
         };
         drop(f);
 
+        // TD-031 (L2D-I-8): reuse требует СОВПАДЕНИЯ ЭПОХИ СХЕМЫ. Изоляция держится
+        // `SCHEMA_VERSION`, не provenance: в прод-контейнере git недоступен → provenance
+        // = КОНСТАНТА `recorder v0.0.0 (git:no-git-info)` на ВСЕХ деплоях, и без schema-гейта
+        // schema-2 сегмент reuse'ился бы schema-3 бинарём → variant-6 (L2Delta) смешивался
+        // в pre-M18 сегмент, quarantine невозможен. Schema-forward ОДНОСТОРОННИЙ: silent-откат
+        // запрещён; fix-forward (RFC §10 / ops §5.1). Квалифицированный путь — намеренно:
+        // self-documenting и не зависит от состава `use contracts::{...}`.
         if header.source == cfg.source
             && header.provenance == cfg.provenance
             && header.epoch_id == cfg.epoch_id
+            && header.schema_version == contracts::SCHEMA_VERSION
         {
-            // Reuse: дописываем в существующий v2-сегмент.
+            // Reuse: дописываем в существующий v2-сегмент ТЕКУЩЕЙ schema-эпохи.
             return Ok(OpenDecision {
                 seg_index: idx,
                 seg_path: path,
