@@ -121,10 +121,11 @@ fn main() {
             MdPayload::Trade { ts_exch_ms, .. } => (*ts_exch_ms, "Trade"),
             MdPayload::L2Snapshot { ts_exch_ms, .. } => (*ts_exch_ms, "L2Snapshot"),
             MdPayload::Funding { ts_exch_ms, .. } => (*ts_exch_ms, "Funding"),
-            // CT-RFC-01: новые md-варианты не участвуют в md-latency пробе.
+            // CT-RFC-01/CT-RFC-04: новые md-варианты не участвуют в md-latency пробе.
             MdPayload::OpenInterest { .. }
             | MdPayload::Liquidation { .. }
-            | MdPayload::MarginRate { .. } => continue,
+            | MdPayload::MarginRate { .. }
+            | MdPayload::L2Delta { .. } => continue,
         };
         let key = (venue_str(md.venue).to_string(), md.symbol.clone());
         if ts_exch_ms <= 0 {
