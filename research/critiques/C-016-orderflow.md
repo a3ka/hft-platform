@@ -176,3 +176,140 @@ After repair, the plan is likely approvable. The depth-series, signed footprint 
 ## Cleanup
 
 Temporary prototypes and mutations were fully reverted before writing this verdict. Pre-verdict worktree status was clean except for this critique file.
+
+---
+
+## Re-audit — 2026-07-21T00:00:39Z
+
+**Audited repair head:** `9d4fa9a` — `test(M-17): C-016 repair — per-price footprint bins RED + verify enforce export format.md`  
+**Base verdict:** `0da57ac` — C-016 REJECT  
+**Worktree:** `/tmp/hft-critic-of-r2` detached at `origin/feat/orderflow-plan`  
+**Verdict:** APPROVE
+
+### Repair diff
+
+The repair adds:
+
+- `crates/research-cli/tests/red_footprint_bins.rs`
+- `scripts/verify_M-17.sh` gate entry for `red_footprint_bins`
+- `scripts/verify_M-17.sh` hard fail if `research/exports/format.md` with `export_schema_version` is missing
+- M-17 task 5 wording that explicitly names `FootprintBar`, `PriceBin`, and `format.md`
+
+### Current RED state
+
+Against the repaired branch before implementation:
+
+```text
+bash scripts/verify_M-17.sh; echo exit=$?
+FAIL  OF-I-6 depth time-series (...)
+FAIL  OF-I-2/3 footprint + cumulative delta (...)
+FAIL  OF-I-4 footprint BINS per-price (...)
+FAIL  OF-I-4 OHLCV-бары (...)
+PASS  signals::obi существует (...)
+FAIL  OF-I-4 нет research/exports/format.md с export_schema_version (...)
+VERDICT: FAIL (5)
+exit=1
+```
+
+`red_footprint_bins` is compile-RED before implementation:
+
+```text
+cargo test -p research-cli --test red_footprint_bins; echo exit=$?
+error[E0432]: unresolved import `research_cli::orderflow`
+exit=101
+```
+
+### Reachability
+
+I temporarily prototyped:
+
+- `research_cli::depth_series::compute`
+- `research_cli::orderflow::{footprint_delta,cumulative_delta,footprint_bins,FootprintBar,PriceBin}`
+- `research_cli::export::{ohlcv_bars,OhlcvBar}`
+
+`red_footprint_bins` became GREEN:
+
+```text
+cargo test -p research-cli --test red_footprint_bins; echo exit=$?
+running 5 tests
+test bins_are_bucketed_by_timeframe ... ok
+test empty_trades_yield_no_bars ... ok
+test distinct_prices_produce_distinct_bins ... ok
+test footprint_bins_is_deterministic ... ok
+test same_price_separates_buy_and_sell ... ok
+exit=0
+```
+
+With the prototype but **without** `research/exports/format.md`, the full verify gate still failed:
+
+```text
+bash scripts/verify_M-17.sh; echo exit=$?
+PASS  OF-I-6 depth time-series (...)
+PASS  OF-I-2/3 footprint + cumulative delta (...)
+PASS  OF-I-4 footprint BINS per-price (...)
+PASS  OF-I-4 OHLCV-бары (...)
+PASS  signals::obi существует (...)
+FAIL  OF-I-4 нет research/exports/format.md с export_schema_version (...)
+VERDICT: FAIL (1)
+exit=1
+```
+
+With the prototype plus a temporary `research/exports/format.md` containing `export_schema_version`, full verify passed:
+
+```text
+bash scripts/verify_M-17.sh; echo exit=$?
+PASS  OF-I-6 depth time-series (...)
+PASS  OF-I-2/3 footprint + cumulative delta (...)
+PASS  OF-I-4 footprint BINS per-price (...)
+PASS  OF-I-4 OHLCV-бары (...)
+PASS  signals::obi существует (...)
+PASS  OF-I-4 экспорт-формат документирован (...)
+VERDICT: PASS
+exit=0
+```
+
+This closes the C-016 false-green class: M-17 can no longer close green without both per-price footprint-bin implementation and an export contract file.
+
+### Anti-placebo
+
+Two requested mutations were caught:
+
+1. **Merge prices into one bin**: temporary mutation keyed every trade into one bin. `distinct_prices_produce_distinct_bins` failed:
+
+   ```text
+   две РАЗНЫЕ цены (65000, 65010) дали 1 bins — цены слиты
+   exit=101
+   ```
+
+2. **Swap buy/sell volumes**: temporary mutation wrote buy trades into `sell_vol` and sell trades into `buy_vol`. `same_price_separates_buy_and_sell` failed:
+
+   ```text
+   Получено (buy=2, sell=5, delta=-3) — стороны перепутаны/не разделены или delta≠buy−sell
+   exit=101
+   ```
+
+### Remaining promise audit
+
+No additional blocking RED gap found.
+
+- **Depth series**: covered by `red_depth_series.rs` for side separation, band monotonicity, timeframe bucketing, close semantics, and empty input.
+- **Cumulative delta / footprint scalar**: covered by `red_footprint.rs` for signed buy-minus-sell, sell-heavy negative delta, running cumulative behavior, and empty input.
+- **OHLCV bars**: covered by `red_ohlcv.rs` for time seconds, open/high/low/close/volume, timeframe bucketing, and empty input.
+- **Per-price footprint bins**: now covered by `red_footprint_bins.rs`.
+- **Export contract documentation**: `verify_M-17.sh` now requires `research/exports/format.md` plus `export_schema_version`.
+
+Non-blocking note: `verify_M-17.sh` validates only existence of `format.md` and the version token; it does not parse the document or mechanically prove that UDF `config/symbol_info/history`, `LineData`, `HistogramData`, depth lines, and footprint-bin examples are all present. I am not treating this as a blocker because the data semantics are pinned by Rust RED and M-17 allows either read-only endpoint or file export as delivery mechanism. Reviewer should still inspect `format.md` content at implementation review.
+
+### Next handoff
+
+APPROVE to `research-dev` for M-17 implementation:
+
+- implement `depth_series`, `orderflow`, and `export` APIs named by the RED tests;
+- add `research/exports/format.md` with `export_schema_version`, schema, and examples for OHLCV/UDF bars, cumulative delta, depth `LineData`, signed delta histogram, and per-price `FootprintBar`/`PriceBin`;
+- connect/export the data contract for `code2alpha` consumption.
+
+M-16 detailed importer RED remains architect-owned before any M-16 research-dev dispatch. `risk-critic` remains N/A for M-16/M-17 implementation scope; later backtest reports still need anti-overfit §6 + risk-critic.
+
+### Cleanup
+
+All temporary prototypes, mutations, and the temporary `research/exports/format.md` were reverted before this re-audit appendix was written.
