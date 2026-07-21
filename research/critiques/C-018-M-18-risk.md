@@ -263,3 +263,156 @@ Required repair before PASS:
 Risk verdict stays CONCERNS, not KILL: the MD-only/order-path, sim-inertness, magic/version,
 BTC-only volume posture, discriminant pinning, and original provenance-boundary RED are sound.
 The remaining issue is a procedural false guarantee in the rollback runbook.
+
+---
+
+## Re-audit rev3
+
+**UTC:** 2026-07-21T12:40Z
+**Agent:** risk-critic
+**Branch audited:** `origin/feat/M-18-l2delta` at `de8629c`
+**Worktree:** `/tmp/hft-riskcritic-m18-r3` (detached at `origin/feat/M-18-l2delta`)
+**Verdict:** PASS (conditional on two documented reviewer-owned merge obligations, below — both
+already written into the branch as follow-up TD + §8 gate; no code change required to reach PASS)
+
+### What rev3 changed
+
+rev3 (`de8629c`) rewrites RFC §10 and `ops.md` §5.1 and updates milestone L2D-I-8 / risk-critic
+note. Diff `24d0426..de8629c` touches ONLY `docs/rfc/CT-RFC-04-l2delta.md`, `docs/fa/ops.md`,
+`milestones/M-18-l2delta-capture.md` — no code, no test, no verify change. The prior `concern-2`
+(runbook prescribed a re-forward step that silently corrupts) is addressed by DELETING the false
+promise and replacing it with an honest one-way policy.
+
+### concern-2 — CLOSED (the defect was a lying runbook; the lie is gone)
+
+rev2's defect was that `ops.md` §5.1 instructed the operator to "return quarantined segments on
+re-forward; seq is continuous" — an action that silently disorders the live journal
+(`[0,1,2,3,4,7,5,6]`, my rev2 probe). rev3 removes that step entirely. The replacement policy is
+one-way (fix-forward preferred; post-M18 data = terminal archive of a separate epoch, offline
+research only; re-stitch into the live journal FORBIDDEN; preserve `journal.meta` high-water so the
+old binary does not reuse seq values). I verified every load-bearing claim against the actual code,
+not just the prose:
+
+1. **meta-preserve → seq-gap not seq-reuse.** `resolve_next_seq_with` (`crates/journal/src/
+   segments.rs:1127-1138`) computes `next_seq = meta_seq.max(tail_last_seq_of(latest_segment)+1)`.
+   After the M-18 segment is moved to the archive, `latest_segment` is the pre-M18 segment; with
+   `journal.meta` preserved at the high-water, the old binary starts at `max(meta, pre_tail+1) =
+   meta` → a GAP over the archived range, not a reuse. Claim is code-accurate.
+2. **re-stitch breaks `first_seq`.** `stream` / `read_all` assemble segments in INDEX order
+   (`segments()` → `iter_segments_sorted`, `segments.rs:586`, `846-862`) with a blind append and NO
+   monotonic-`first_seq` check. A returned archive segment carrying lower seqs at a higher index is
+   yielded out of order silently. Claim is code-accurate — and it is exactly why re-stitch must be
+   forbidden until a machine barrier exists (see TD-b).
+3. **"data is not lost" + "terminal archive is a separate epoch, does not weaken DET-I-1."** The
+   archived segment is a contiguous, CRC-framed, provenance-tagged segment; read on its own it is
+   internally seq-monotonic. DET-I-1 (bit-identical replay) is a per-journal-stream property; a cold
+   forked epoch replayed by itself is consistent, and it is never spliced into the live stream. First-
+   window L2Delta lives in the archive; rollback-window data lives in the live journal. Correct.
+
+### Reachability + anti-placebo — RE-VERIFIED by prototype run (not taken on trust)
+
+Baseline: `cargo build -p journal --tests` fails at the expected pre-impl `E0004` in
+`segment_last_ts` (`segments.rs:1515`) — normal RED phase.
+
+- Added ONLY the temporary `MdPayload::L2Delta { ts_exch_ms, .. } => *ts_exch_ms` arm to
+  `first_event_data_ts`. `cargo test -p journal --test red_l2delta_rollback_boundary` → `1 passed`
+  (`l2delta_isolated_in_new_provenance_segment ... ok`). Test is reachable and green against a
+  correct impl.
+- Anti-placebo: with the arm in place, I additionally removed the `header.provenance == cfg.
+  provenance` clause from `decide_open_segment` (make reuse ignore provenance). Same test → `FAILED`
+  with the documented message `M-18 provenance ОБЯЗАН открыть НОВЫЙ сегмент ... получено сегментов:
+  1`. The invariant genuinely bites; it is not a stub-green placebo.
+- Restored `crates/journal/src/segments.rs` via `git checkout --`; `git status --porcelain` clean;
+  baseline `E0004` back. No impl was committed.
+
+So `concern-1` (silent seq-reuse because a pre-M18 binary can't decode variant 6) remains
+MACHINE-enforced by provenance isolation, and the enforcement is real.
+
+### Residual concern → accepted as TD, NOT required in M-18
+
+The one-way policy's ENFORCEMENT is, today, operator discipline (runbook) + machine ISOLATION of
+the write boundary (concern-1 RED). There is NO machine barrier stopping an operator who violates
+the runbook and re-stitches an archived segment; that barrier is deferred to follow-up **TD-b**
+(reader `first_seq`-guard: fail-closed `Err` on non-monotonic `first_seq` in `read_all`/`stream`).
+rev3 also carries **TD-a** (recorder startup schema-guard: loud fail if the active segment carries
+undecodable events).
+
+Adversarial judgment — deferring TD-b to a separate journal-hardening milestone is correct, and
+rushing it into M-18 would be the more dangerous choice:
+
+- **Trigger is narrow and operator-initiated, not silent/automatic.** The residual corruption
+  requires an operator to (a) roll a recorder back PAST a schema-forward deploy AND (b) actively
+  defy an explicit written prohibition by re-attaching an archived segment. It is not a failure of
+  normal operation.
+- **MD-only blast radius.** No order-path/risk/oms/money-path is touched (branch diff: only
+  `crates/contracts/src/lib.rs` additive enum variant + tests/docs/fixtures; zero `submit/cancel/
+  auth/signature/OrderGateway/RiskApproved` tokens; no `venue-*/src`, `recorder/src`, `journal/src`,
+  `sim/src` impl). Worst case is out-of-order RESEARCH data, recoverable (archive preserved) — not
+  unsafe trading or lost capital.
+- **TD-b touches the sacred prod read-path and the legacy `first_seq=0` sentinel — TD-011 class.**
+  A naive monotonic-`first_seq` guard would trip on legacy segments whose `first_seq` defaults to 0
+  (`segments.rs:509-511`). Forcing a fail-closed change into `read_all`/`stream` under M-18 time
+  pressure risks a WORSE prod regression in the hot read path than the discipline gap it closes.
+  This is precisely the reviewer↔architect boundary (`gates.md` §4): defect described, defense
+  designed RED-first in its own milestone, not bolted on here.
+
+Net: the genuinely dangerous, silent failure (seq-reuse via undecodable variant) is closed by a
+green, anti-placebo-verified machine invariant. The remaining item is a defense-in-depth machine
+barrier against operator error, appropriately scheduled as TD.
+
+### Non-blocking finding (new this round) — meta-preserve guarantee is not absolute
+
+The runbook states the rollback yields a "seq-ПРОПУСК (НЕ reuse)". That holds only when
+`journal.meta` is at the TRUE high-water. `flush()` (`crates/journal/src/lib.rs:291-297`) orders
+`sync_data()` BEFORE `write_meta()`, so a crash in that window leaves durable segment data ahead of
+`meta` by up to one batch (≤64 events). If the operator then archives that segment and starts the
+old binary, `resolve_next_seq_with = max(meta, pre_tail+1)` can land on seq VALUES that also exist
+in the archived segment — i.e. cross-epoch value-reuse, not a clean gap. This is BENIGN because the
+never-merge rule keeps live and archive as separate epochs (the live stream stays internally
+monotonic; the archive is a forked cold epoch), so no single replayed stream sees a duplicate. But
+the doc should not phrase "gap, never reuse" as an absolute — under the torn-flush window it is
+cross-epoch reuse that is safe ONLY because epochs never merge, not because values are globally
+unique. Recommend softening the §5.1 / §10 wording. Non-blocking: the actual safety property
+(per-epoch monotonicity + never-merge) is preserved either way; no code or gate change needed to
+merge M-18.
+
+### Other checklist items — confirmed unchanged and sound
+
+- **MD-only / order path:** PASS. Branch diff scope confirmed above; contracts change is a pure
+  additive `MdPayload::L2Delta` variant with no order surface.
+- **Backtest inertness:** PASS as plan/gate. RFC §6 + milestone task 5 require `sim/exchange.rs` to
+  IGNORE L2Delta (raw deltas into the fill path would double-count book motion); exhaustive-match
+  compiler canary enforces an arm exists, RED enforces it is an ignore.
+- **Magic / version:** PASS. `SEGMENT_MAGIC=HFTJRN02`, `SCHEMA_VERSION=2` unchanged; verify greps
+  both; `red_rfc04` green.
+- **Additive discriminant / historical blob:** PASS. `L2Delta = 6` appended after `MarginRate = 5`;
+  pinned by `red_rfc04`; historical blob is a hand-coded byte array, non-circular.
+- **Volume:** PASS with bounded note (unchanged from rev1). BTC-only (founder ★ option (a)) keeps
+  the increment bounded; disk-guard + heartbeat + §8 measured write-rate are the operational
+  backstop; TD-020 retention remains urgent-next, not optional.
+
+### Merge conditions (reviewer must honor at merge — these gate the PASS)
+
+1. **Register both follow-up TDs in `TECH-DEBT.md`** (reviewer-owned; risk-critic/architect cannot
+   write that file): TD-a (recorder startup schema-guard) and TD-b (reader `first_seq`-guard —
+   the machine barrier that makes "no re-stitch" enforced rather than disciplinary; must respect the
+   legacy `first_seq=0` sentinel, TD-011 class). Both are separate journal-hardening milestones, NOT
+   M-18.
+2. **§8 post-merge rollback-check (milestone task 6):** verify the first live BTC L2Delta lands in a
+   NEW M-18-provenance segment; the post-M18 segment is provenance-identifiable; reviewer does not
+   treat `deploy.yml` auto-rollback as blind safety for a schema-forward deploy. Also verify BTC
+   L2Delta present (spot+perp) and non-BTC L2Delta absent.
+3. (Recommended, non-blocking) Soften the §5.1 / §10 "gap, never reuse" wording per the non-blocking
+   finding above.
+
+### Escalation
+
+No founder escalation required. concern-2 is resolved at the documentation/policy level; the
+residual is a correctly-scoped TD, not a founder-signature decision. The path to money is untouched
+(MD-only), so no border-C signature is implicated by this verdict. Handoff: PASS → reviewer, who
+executes the merge conditions above and runs the §8 deploy gate.
+
+### Cleanup
+
+Temporary arm + anti-placebo edit were made only to `crates/journal/src/segments.rs`, both reverted
+via `git checkout --`; worktree clean before writing this verdict (only this file changed).
