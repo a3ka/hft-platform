@@ -134,6 +134,56 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn cmd_export(args: &[String]) -> Result<(), String> {
+    use std::path::PathBuf;
+
+    use journal::EpochFilter;
+    use research_cli::export_io::{export_to_dir, ExportConfig};
+
+    let journal_dir = flag(args, "--journal").ok_or("--journal <dir> обязателен")?;
+    let out = flag(args, "--out").ok_or("--out <dir> обязателен")?;
+    let timeframe_ms: i64 = flag(args, "--timeframe-ms")
+        .map(|s| s.parse::<i64>().map_err(|e| format!("--timeframe-ms: {e}")))
+        .unwrap_or(Ok(1_000))?;
+    // Полосы depth — повторяемый флаг --band <float>; дефолт 0.001/0.003/0.005.
+    let mut depth_bands_pct: Vec<f64> = Vec::new();
+    let mut i = 0;
+    while let Some(pos) = args.iter().skip(i).position(|a| a == "--band") {
+        let abs = i + pos;
+        let val = args
+            .get(abs + 1)
+            .ok_or_else(|| "--band <float> требует значение".to_string())?
+            .parse::<f64>()
+            .map_err(|e| format!("--band: {e}"))?;
+        depth_bands_pct.push(val);
+        i = abs + 2;
+    }
+    if depth_bands_pct.is_empty() {
+        depth_bands_pct = vec![0.001, 0.003, 0.005];
+    }
+    // Фильтр эпох (CT-RFC02-2). По умолчанию — OwnCaptureOnly.
+    let filter = match flag(args, "--filter").as_deref() {
+        Some("own_capture_only") | None => EpochFilter::OwnCaptureOnly,
+        Some(other) => return Err(format!("неизвестный --filter {other}")),
+    };
+
+    let cfg = ExportConfig {
+        timeframe_ms,
+        depth_bands_pct,
+    };
+    let source = research_cli::grid::JournalSource {
+        dir: PathBuf::from(&journal_dir),
+        filter,
+    };
+    let written =
+        export_to_dir(&source, &cfg, std::path::Path::new(&out)).map_err(|e| format!("{e}"))?;
+    println!("export: записано {} артефактов в {out}", written.len());
+    for path in &written {
+        println!("  {}", path.display());
+    }
+    Ok(())
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let rest: Vec<String> = args.iter().skip(2).cloned().collect();
@@ -141,8 +191,9 @@ fn main() {
         Some("grid") => cmd_grid(&rest),
         Some("validate") => cmd_validate(&rest),
         Some("report") => cmd_report(&rest),
+        Some("export") => cmd_export(&rest),
         _ => {
-            eprintln!("usage: research-cli <grid|validate|report> ...");
+            eprintln!("usage: research-cli <grid|validate|report|export> ...");
             std::process::exit(2);
         }
     };

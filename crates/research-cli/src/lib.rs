@@ -7,9 +7,13 @@
 //! Инварианты RC-I-1..11 — RED-оракулы в `tests/` (sacred).
 
 pub mod data_quality;
+pub mod depth_series;
+pub mod export;
+pub mod export_io;
 pub mod grid;
 pub mod ledger;
 pub mod metrics;
+pub mod orderflow;
 pub mod report;
 pub mod split;
 pub mod strategy_cell;
