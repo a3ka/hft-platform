@@ -286,6 +286,62 @@
             }
           },
           "additionalProperties": false
+        },
+        {
+          "description": "Инкрементальная book-дельта — СЫРОЙ `@depth` diff-апдейт, персистится ДО применения к книге (CT-RFC-04). Позволяет ТОЧНО реконструировать эволюцию стакана (absorption/iceberg/DOM — book-flow «как Fabio»), что бакетированный `L2Snapshot` теряет безвозвратно. Аддитивно В КОНЕЦ (postcard-дискриминант 6; старые сегменты содержат только 0..5 → читаются байт-в-байт, CT-I-3).\n\n**Семантика уровней (та же дисциплина, что `venue-binance::apply_diff_to_book` §A и `.claude/rules/testing.md` «отсутствие»):** `bids`/`asks` — ТОЛЬКО ИЗМЕНИВШИЕСЯ уровни. `size > 0` = установить объём на цене; `size == 0` = УДАЛИТЬ уровень (явный remove от биржи). Уровень, которого в дельте НЕТ, — НЕ изменился: дельта НЕ является источником истины о неупомянутом, реконструкция его НЕ трогает. Пустая сторона (`[]`) = «на этой стороне ничего не менялось», а НЕ «очистить сторону».\n\n**Sequencing (детерминированная реконструкция + gap-детекция БЕЗ обращения к бирже):** `first_update_id` = Binance `U`, `final_update_id` = `u` — границы update-id этой дельты. `prev_final_update_id` = futures `pu` (чейнится: `pu == предыдущий final_update_id`); для СПОТ-потока `None` (там непрерывность выражается как `U == prev.u + 1`). Реплей журнала по этим полям восстанавливает точный порядок и видит любой пропуск дельт.",
+          "type": "object",
+          "required": [
+            "L2Delta"
+          ],
+          "properties": {
+            "L2Delta": {
+              "type": "object",
+              "required": [
+                "asks",
+                "bids",
+                "final_update_id",
+                "first_update_id",
+                "ts_exch_ms"
+              ],
+              "properties": {
+                "asks": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/definitions/Level"
+                  }
+                },
+                "bids": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/definitions/Level"
+                  }
+                },
+                "final_update_id": {
+                  "type": "integer",
+                  "format": "uint64",
+                  "minimum": 0.0
+                },
+                "first_update_id": {
+                  "type": "integer",
+                  "format": "uint64",
+                  "minimum": 0.0
+                },
+                "prev_final_update_id": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "format": "uint64",
+                  "minimum": 0.0
+                },
+                "ts_exch_ms": {
+                  "type": "integer",
+                  "format": "int64"
+                }
+              }
+            }
+          },
+          "additionalProperties": false
         }
       ]
     },

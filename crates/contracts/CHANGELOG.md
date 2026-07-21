@@ -3,6 +3,32 @@
 Формат: одна секция на contract-RFC. Журнал бессмертен: старые записи обязаны читаться
 новым кодом всегда (CT-I-3). Правки T1 вне RFC → авто-REJECT (CT-I-2, Block-C).
 
+## schema_version 2 — CT-RFC-04 «L2Delta: персист сырых book-дельт» (2026-07-21)
+
+Аддитивно (версия НЕ меняется — вариант `MdPayload`, не формат сегмента; `SEGMENT_MAGIC`
+`HFTJRN02` неизменна — журнал идентифицирует сегменты по магии, `schema_version` на чтении
+не валидируется). Полный RFC: `docs/rfc/CT-RFC-04-l2delta.md`.
+
+**Добавлено:**
+- `MdPayload::L2Delta { bids, asks, first_update_id, final_update_id, prev_final_update_id,
+  ts_exch_ms }` — СЫРОЙ `@depth` diff (инкрементальная book-дельта), персистится ДО применения
+  к книге. **Строго в конец** enum (postcard-дискриминант **6**; Trade/L2Snapshot/Funding/
+  OpenInterest/Liquidation/MarginRate = 0..5 неизменны — RED-гвоздь + исторический байт-блоб).
+  Семантика уровней: `size==0` = remove; отсутствие ≠ удаление; пустая сторона = «не менялось».
+  `prev_final_update_id` = futures `pu` (`None` для spot). Разблокирует book-flow
+  (absorption/DOM, M-19 Тир-3).
+
+**НЕ изменено:** `Event`, `EventKind`, `MdEvent`, `Venue`, `Side`, `Level`, `SegmentHeader`,
+`SysEvent`, дискриминанты 0..5 `MdPayload` — старые сегменты читаются байт-в-байт (CT-I-3).
+
+**Схема:** `schema/event.schema.json` перегенерирована (`gen_schema`); `red_schema` гейтит
+согласованность. Фикстуры: `fixtures/valid/event-l2delta-{spot,futures}.json`,
+`fixtures/invalid/event-l2delta-missing-final-id.json`. Тест: `tests/red_rfc04.rs`.
+
+**Объём (см. RFC §5):** L2Delta аддитивен и частый (~×2 темп записи) → ускоряет disk-таймер
+(~40→~20 дней) ⇒ доставка ретеншена в прод (TD-020) становится СРОЧНОЙ. Данные MD-only,
+risk-инварианты не тронуты; disk-guard fail-closed остаётся страховкой.
+
 ## schema_version 2 — CT-RFC-03 «Аудит сверки с биржей» (2026-07-16)
 
 Аддитивно (версия НЕ меняется — как CT-RFC-01, это вариант `EventKind`, не формат сегмента):
