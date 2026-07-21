@@ -17,6 +17,13 @@ Order-flow book-flow (absorption / iceberg / DOM / Bookmap-heatmap — мето�
 сегменты по магии; версия на чтении не валидируется), старые журналы читаются байт-в-байт (CT-I-3).
 L2Delta НЕ заменяет `L2Snapshot` (тот остаётся recon-якорем) — дельта тонкая эволюция между якорями.
 
+**★ Решение founder'а (2026-07-21) по развилке §5 RFC — вариант (а): захват ТОЛЬКО BTCUSDT
+(spot + perp).** Эмиссия L2Delta включена лишь для самого ликвидного инструмента → объём под
+контролем (disk-таймер почти не ускоряется, ретеншен TD-020 важен, но не «срочен-сегодня»).
+ETH и прочие остаются на прежнем bucketed-`L2Snapshot` без изменений. Расширение набора —
+ОТДЕЛЬНОЕ решение founder'а, когда ретеншен доставлен в прод. Форма T1 универсальна; ограничение
+— чисто на стороне эмиссии адаптера (allow-list символов), RED/RFC не трогаются.
+
 ## Contract impact (T1) — ДА (CT-RFC-04)
 
 `MdPayload::L2Delta { bids, asks, first_update_id, final_update_id, prev_final_update_id, ts_exch_ms }`
@@ -56,10 +63,10 @@ valid/invalid + CHANGELOG + red_rfc04) — уже в наборе architect'а (
 |---|---|---|---|---|
 | 1 | ✅ DONE | CT-RFC-04 doc + `MdPayload::L2Delta` T1 + сген. JSON Schema + фикстуры valid/invalid + CHANGELOG + `red_rfc04` | architect | red_rfc04 + red_schema GREEN; L2D-I-1 |
 | 2 | ✅ DONE | Sacred RED: `red_l2delta_capture` (spot), `red_l2delta_futures` (fut), `red_l2delta_persist` (journal) + `verify_M-18.sh` | architect | compile-RED падает без impl; достижим прототипом |
-| 3 | ⏳ | venue-binance СПОТ: `pub fn l2delta_event(&DepthDiff)` (prev_final=None) + вызов в emit-пути для КАЖДОГО распарсенного diff'а (независимо от sync-FSM) | venue-dev | L2D-I-2/3 GREEN; wiring-канарейка |
-| 4 | ⏳ | venue-binance-futures ПЕРП: `pub struct DepthDiff` + `l2delta_event` (prev_final=Some(pu)) + emit | venue-dev | L2D-I-2/4 GREEN |
+| 3 | ⏳ | venue-binance СПОТ: `pub fn l2delta_event(&DepthDiff)` (prev_final=None) + вызов в emit-пути для каждого распарсенного diff'а (независимо от sync-FSM). **Эмиссия — ТОЛЬКО BTCUSDT (founder ★ (а)):** allow-list символов; не-BTC diff L2Delta НЕ эмитит (остаётся на L2Snapshot) | venue-dev | L2D-I-2/3 GREEN; wiring-канарейка; non-BTC не эмитит |
+| 4 | ⏳ | venue-binance-futures ПЕРП: `pub struct DepthDiff` + `l2delta_event` (prev_final=Some(pu)) + emit, **эмиссия ТОЛЬКО BTCUSDT (founder ★ (а))** | venue-dev | L2D-I-2/4 GREEN |
 | 5 | ⏳ | Консюмер-армы — РОВНО 5 сайтов (RFC §6, prototype-verified): (1) `journal/segments.rs segment_last_ts` +ts; (2) `sim/exchange.rs` IGNOR; (3) `recorder/lib.rs md_kind_label` → `"l2delta"`; (4) `journal/examples/dump.rs` IGNOR; (5) `research-cli/bin/latency_probe.rs` → continue. `red_l2delta_persist` GREEN; workspace собирается | engine-dev | L2D-I-5/6 GREEN; `cargo build --workspace --all-targets` ok (0×E0004) |
-| 6 | ⏳ | **§8 live-emit на VPS** (РЕШАЮЩИЙ, unit≠live TD-014): после deploy в журнале появляются `Binance.L2Delta` + `BinanceFutures.L2Delta` с живого WS; темп записи в бюджете §5; recorder healthy, `seq_gaps=0`, disk `writable=true` | reviewer | §8 GREEN + пруф в close-out |
+| 6 | ⏳ | **§8 live-emit на VPS** (РЕШАЮЩИЙ, unit≠live TD-014): после deploy в журнале появляются `Binance.L2Delta` + `BinanceFutures.L2Delta` для **BTCUSDT** с живого WS; **scope-(а): не-BTC L2Delta ОТСУТСТВУЕТ** (ETH и др. — только L2Snapshot); темп записи в бюджете §5 (ниже, чем полный набор); recorder healthy, `seq_gaps=0`, disk `writable=true` | reviewer | §8 GREEN + пруф в close-out |
 | 7 | ⏳ | tester: чистый чекаут — fmt/clippy/`cargo test`/`verify_M-18.sh` PASS exit=0 | tester | VERDICT: PASS |
 
 ## Гейты
@@ -70,7 +77,7 @@ valid/invalid + CHANGELOG + red_rfc04) — уже в наборе architect'а (
   (1) MD-only (order-путь не тронут); (2) инертность бэктеста (sim игнорирует); (3) магия/версия целы
   (прод-чтение); (4) аддитивность дискриминантов (старые журналы). Вердикт `research/critiques/C-0NN.md`.
 - **§8 post-merge** (прод НЕ инертен — recorder начинает писать L2Delta): задача 6, решающий live-гейт.
-- Founder ★: решение по развилке §5 RFC (а: ограниченный набор символов / б: полный + срочный ретеншен).
+- Founder ★ РЕШЕНО (2026-07-21): развилка §5 RFC = **вариант (а)** — захват только BTCUSDT (spot+perp). risk-critic оценивает уже выбранную (более безопасную) ветку.
 
 ## Handoff (план)
 
