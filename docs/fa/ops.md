@@ -447,9 +447,10 @@ quarantined сегмента, и **возврат** quarantined сегмента
 **Изоляция эпохи — машинная (TD-031 fix).** Новый сегмент при смене набора вариантов форсит НЕ
 provenance (в контейнере это git-константа!), а `SCHEMA_VERSION`: `decide_open_segment` reuse'ит
 сегмент ТОЛЬКО если `header.schema_version == SCHEMA_VERSION`. Каждый новый эмитируемый вариант ⇒
-bump `SCHEMA_VERSION`. **⚠ segment-00000055 — одноразовый СМЕШАННЫЙ** (schema-2 заголовок + L2Delta
-внутри, до fix'а): при откате — полностью tainted, чисто не quarantine-able; с fix-деплоя (schema-3)
-сегменты 56+ чисты.
+bump `SCHEMA_VERSION`. **⚠ segments {55, 56} — одноразовый СМЕШАННЫЙ набор** (schema-2 header +
+L2Delta внутри, до fix'а; pre-fix бинарь ротировал 55→56, капча продолжалась): при откате оба
+полностью tainted, чисто не quarantine-able. **Изоляция чиста с segment-57** (fix-бинарь schema-3;
+§8-подтверждено). Данные не потеряны; forensic-долг — TD-032.
 
 **Правило:** НИКОГДА не запускать бинарь старше schema-forward деплоя против журнала, чей
 активный/хвостовой сегмент несёт неизвестный ему вариант; НИКОГДА не re-stitch'ить архив в live.

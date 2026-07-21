@@ -186,8 +186,17 @@ trade-flow сигналы вычислимы сейчас; book-дельты (ab
 10. **M-14 DET-I-1 полный** (`state_hash`+снапшоты) — до P4 live-micro.
 
 **Кросс-cutting / founder ★ (когда удобно, не блокируют блоки 1–3):**
-- **Storage Box** (провижининг) → разблокирует M-09 task 3 (restore-drill) + M-08 retention-apply.
-  Durability — принятый single-copy риск (reviewer записать в TECH-DEBT).
+- 🔴 **ДОСТАВКА РЕТЕНШЕНА (TD-020 / M-08 task 14) — САМЫЙ СРОЧНЫЙ ДОЛГ.** Диск ~25 дней до disk-guard
+  (L2Delta BTC-only +0.8 GB/сут ⇒ ~3.8 GB/сут); ретеншен написан (M-08), но в прод НЕ доставлен
+  (бинарь `journal-retention` не в образе, холодного хранилища нет, cron нет). Нужно: спека architect
+  (доставка бинаря + монтирование Storage Box + cron + алерт на exit≠0) → engine-dev. **Приоритет выше
+  всего journal-hardening.**
+- **Storage Box** (провижининг) → разблокирует ретеншен-apply выше + M-09 task 3 (restore-drill).
+  Durability — принятый single-copy риск.
+- **M-21 journal-hardening** (`milestones/M-21-journal-hardening.md`, PROPOSED/QUEUED) — машинные
+  барьеры целостности (TD-032 provenance-forensics / TD-033 schema-bump энфорсмент / TD-029 startup
+  schema-guard / TD-030 reader first_seq-guard). **СТРОГО после ретеншена** (не срочно; изоляция эпох
+  уже работает через schema-гейт, §8-подтверждено).
 - **Live alerting** (Prometheus/Alertmanager→Telegram) — метрики+правила готовы (§O).
 - **M-15 vendor import** — когда founder назовёт поставщика купленной истории.
 
