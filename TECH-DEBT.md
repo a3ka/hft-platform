@@ -4,7 +4,27 @@
 
 ## OPEN
 - **TD-031** `segment-provenance-constant-in-container-rollback-isolation-void` (найдено reviewer'ом на
-  §8 M-18, 2026-07-21; **BLOCKING close-out M-18**). **Симптом:** после деплоя M-18 (`ce122d1`) первое
+  §8 M-18, 2026-07-21; **BLOCKING close-out M-18**).
+  **✅ CLOSED 2026-07-21 (merge `7a237f7`, reviewer APPROVED; фикс — МАШИННАЯ изоляция по SCHEMA-ЭПОХЕ,
+  доказано ЖИВЫМ §8, не тестами).** Фикс (не provenance-заплатка, а корень): `SCHEMA_VERSION` 2→3 +
+  `decide_open_segment` reuse требует `header.schema_version == contracts::SCHEMA_VERSION` (engine-dev
+  `c005c83`, +9/−1). `SCHEMA_VERSION` — compile-time константа, вкомпилённая в бинарь; не читается из
+  git/env/fs/часов рантайме → НЕ деградирует в no-git контейнере (в отличие от provenance). risk-critic
+  C-018 **rev4 PASS** (`9d2eefc`, prototype-verified анти-плацебо: schema-клауза снята → RED падает).
+  **§8 HARD-CHECK N2 на VPS (прод HEAD `7a237f7`, CI+Deploy success):** активный сегмент — **`segment-57`
+  с schema_version=3** (header byte[12]=`03`), первое живое L2Delta после fix-деплоя ушло в НЕГО, а НЕ в
+  schema-2 сегмент; fix-бинарь при старте увидел активный `segment-56` (schema-2 header) → `2==3` false →
+  открыл НОВЫЙ `segment-57` (schema-3) — ровно та машинная изоляция, которой provenance не дал. Метрики
+  (nsenter в netns → `127.0.0.1:9101/metrics`): `md_events_total{kind=l2delta,venue=binance,BTCUSDT}=1789`
+  + `{binance_futures,BTCUSDT}=1754`; **non-BTC L2Delta отсутствует** (scope (а)); recorder healthy,
+  `seq_gaps=0`, `next_seq` монотонен, `writable=true`, 0 panic/ERROR/backstop; write-rate ≈ 3.8 GB/сут
+  (в §8 BTC-only бюджете). **⚠ Forensic-уточнение к пунктам 2 ниже:** СМЕШАННЫХ (schema-2 + variant-6)
+  сегментов ДВА — `55` И `56`: pre-fix бинарь (`ce122d1`, schema-2) продолжал капчить L2Delta и ротировал
+  55→56 (закрыт 14:10), пока фикс не деплойнулся (~15:35). RFC §10 называет только 55 — фактический
+  tainted-набор `{55,56}`, оба schema-2 с variant-6 в хвосте; изоляция держится с `57` вперёд.
+  Provenance-константа как таковая НЕ исправлена (сегменты одной schema-эпохи по-прежнему
+  неразличимы по билду) — вынесено в отдельный follow-up (см. `provenance-forensics` ниже). Ниже —
+  исходное описание дефекта (сохранено для аудита). **Симптом:** после деплоя M-18 (`ce122d1`) первое
   живое `MdPayload::L2Delta` (variant-6) ушло НЕ в новый сегмент, а в **pre-M18 активный
   `segment-00000055.jrnl`** (создан 12:37 pre-M18 бинарём `fb66b52`, ДО деплоя 12:44). Это провал task 6
   acceptance («первое BTC L2Delta ушло в НОВЫЙ M-18-provenance сегмент») и **C-018 merge-condition 2**
@@ -38,6 +58,30 @@
   который делает hazard громким независимо от provenance. Оракул обязан ПАДАТЬ на текущем прод-режиме
   (provenance-константа), а не только на фикстуре с разным provenance. Severity: **MAJOR** (sacred
   journal-integrity / rollback-safety; MD-only, путь к деньгам не тронут; блокирует close-out M-18).
+- **TD-032** `provenance-constant-in-container-segments-not-build-distinguishable` (заведено reviewer'ом
+  на close-out M-18 как C-018 rev4 merge-condition 2 / follow-up к TD-031, 2026-07-21). TD-031 закрыл
+  СМЕШЕНИЕ ЭПОХ (schema-2 vs schema-3) машинным schema-гейтом, но НЕ исправил сам корень «provenance =
+  константа в no-git контейнере»: recorder строит provenance через `git rev-parse` В РАНТАЙМЕ
+  (`crates/recorder/src/main.rs`), контейнер без git → `recorder v0.0.0 (git:no-git-info)` на ВСЕХ
+  деплоях. Следствие (в пределах ОДНОЙ schema-эпохи): два разных билда, эмитирующих тот же набор
+  вариантов, дают ИДЕНТИЧНЫЙ provenance → сегменты неразличимы по билду, `decide_open_segment` reuse'ит
+  через рестарт/деплой одной эпохи (что для no-churn желательно, но forensically сегменты одного билда и
+  соседнего неотличимы). Нужно: git-sha вкомпилён на СБОРКЕ (`build.rs`/`vergen`/build-arg `GIT_SHA` →
+  `env!`), а не читается рантаймом → provenance реально меняется по билду, сегменты forensically
+  различимы, и defense-in-depth к schema-гейту. **Отдельный journal-hardening milestone, НЕ M-18**
+  (зона: architect спека/RED — прод-масштаб оракул, ПАДАЮЩИЙ на рантайм-git режиме, per testing.md;
+  engine-dev/architect impl). Severity: MINOR (schema-гейт TD-031 уже закрыл опасное смешение эпох;
+  это forensic-точность + defense-in-depth, MD-only, не путь к деньгам).
+- **TD-033** `emitted-variant-must-bump-schema-version-no-machine-enforcement` (заведено reviewer'ом на
+  close-out M-18 из C-018 rev4 N1, 2026-07-21). Машинная изоляция сегментов по schema-эпохе (TD-031)
+  держится ДИСЦИПЛИНОЙ «новый ЭМИТИРУЕМЫЙ вариант `EventKind`/`MdPayload` ⇒ bump `SCHEMA_VERSION`»
+  (CT-RFC-04 §3). Это задокументированное standing-правило (как замороженные дискриминанты), но у него
+  НЕТ машинного энфорсмента: будущий вариант, добавленный БЕЗ bump'а, снова откроет смешение эпох
+  (schema-N сегмент получит variant, которого его эпоха не декларировала). Нужно: сделать это ЯВНЫМ
+  пунктом contract-RFC гейта (reviewer Block-C проверяет: новый эмитируемый вариант в `crates/contracts`
+  ⇒ соответствующий bump `SCHEMA_VERSION` в том же RFC) и/или grep-канарейка в verify, сверяющая число
+  эмитируемых вариантов с `SCHEMA_VERSION`. **Зона: architect (процессный/contract-RFC слой).** Severity:
+  MINOR (латентный процессный риск; активной порчи нет, срабатывает только при будущем варианте без bump).
 - **TD-029** `recorder-startup-schema-guard-missing` (заведено reviewer'ом на merge M-18 как
   merge-condition 1 из risk-critic C-018 rev3 — «TD-a»). Recorder при старте НЕ проверяет, что
   активный/хвостовой сегмент несёт ТОЛЬКО декодируемые этим бинарём варианты `EventKind`/`MdPayload`.

@@ -816,7 +816,7 @@ red_{depth_series,footprint,footprint_bins,ohlcv}) + verify + spec → critic C-
   а не на shared `feat/orderflow-plan` (`@241c77e`, без impl) — последний рискует остаться осиротевшим
   указателем. Зафиксировано для architect (подчистить ветку).
 
-## Book-flow capture (M-18 «сырые book-дельты L2Delta» + CT-RFC-04 — КОД MERGED `f635bd2`, reviewer APPROVED 2026-07-21; **🚧 IN_PROGRESS: §8 live-emit task 6 не выполнен — milestone НЕ закрыт**)
+## Book-flow capture (M-18 «сырые book-дельты L2Delta» + CT-RFC-04 — ✅ CLOSED 2026-07-21, reviewer APPROVED; TD-031 schema-epoch изоляция merged `7a237f7`, повторный §8 GREEN на VPS)
 Order-flow book-flow (absorption/iceberg/DOM — метод Fabio) вычислим ТОЛЬКО из сырых инкрементальных
 book-дельт `@depth@100ms` RAW DIFF, которые мы уже принимаем, но выбрасывали (в журнал уходил лишь
 бакетированный `L2Snapshot`). M-18 добавляет T1-вариант `MdPayload::L2Delta` и капчит каждый распарсенный
@@ -878,6 +878,41 @@ spot+perp** → venue-dev(3/4 MD-only) ∥ engine-dev(5, 5 армов) → risk-
     ≠ live. **Revert НЕ сделан** (fix-forward per runbook §5.1: деплой pre-M18 бинаря против сегмента 55,
     где уже есть variant-6, — ровно запрещённый rollback-hazard; revert опаснее fix-forward). Заведён
     **TD-031 (BLOCKING, MAJOR)**; зона architect (RED-first фикс). **M-18 остаётся 🚧 IN_PROGRESS.**
+
+### TD-031 fix (задачи 8/9/10) — ✅ MERGED `7a237f7` + повторный §8 GREEN, reviewer APPROVED 2026-07-21; **M-18 CLOSED**
+Цепочка: architect (task 8: `SCHEMA_VERSION` 2→3 + прод-реалистичный RED, где ИДЕНТИЧНЫЙ константный
+provenance ⇒ изоляция ДЕРЖИТСЯ ТОЛЬКО schema-эпохой) → engine-dev (task 9, `c005c83`: `decide_open_segment`
+reuse требует `&& header.schema_version == contracts::SCHEMA_VERSION`, +9/−1) → risk-critic **C-018 rev4
+PASS** (`9d2eefc`) → reviewer. **Первый reviewer-прогон = REJECT** (clippy `-D warnings` красный на merged
+tree: релаксация `assert_eq!(…,2)`→`assert!(…>=2)` в `red_rfc02/03` = рантайм-assert на const →
+`clippy::assertions_on_constants` → CI ci.yml:22 упал бы → deploy fail-closed → §8 невозможен). Architect
+фикс `3afe17b`: `const { assert!(…) }` (compile-time инвариант, clippy-чист) + точная эпоха=3 пинится в
+`red_rfc04` через `assert_eq!(SCHEMA_VERSION,3)` + **clippy-гейт добавлен в `verify_M-18.sh`** (закрыл
+gate-gap класса RN-8: verify расходился с CI; гейт сразу поймал второй instance).
+- **Гейты (reviewer перепрогнал независимо на чистом worktree):** clippy `--workspace --all-targets
+  -D warnings` **exit=0** (== CI); fmt clean; `cargo test --workspace` **316 passed / 0 failed** (103 блока);
+  `verify_M-18.sh` **18/18 PASS, exit=0** (теперь включая clippy-гейт).
+- **Корень фикса — МАШИННЫЙ, git-независимый:** `SCHEMA_VERSION` = compile-time константа в бинаре, не
+  читается из git/env/fs/часов рантайме → НЕ деградирует в no-git контейнере (в отличие от provenance,
+  который был ВОИД). Оракулы усилены, не ослаблены (const-assert падает на этапе компиляции; точное
+  значение эпохи re-pinned в `red_rfc04`). Block-C: `SCHEMA_VERSION` 2→3 governed **CT-RFC-04 rev2**
+  (`docs/rfc/…` + `CHANGELOG`) — не авто-reject.
+- **Повторный §8 HARD-CHECK N2 (прод HEAD `7a237f7`, CI+Deploy success, ssh на VPS):** активный сегмент —
+  **`segment-00000057` с `schema_version=3`** (header byte[12]=`03`; heartbeat `segment_index=57`,
+  `writable=true`, `next_seq` монотонен); первое живое L2Delta после fix-деплоя ушло в НЕГО, НЕ в schema-2
+  сегмент. Fix-бинарь при старте увидел активный `segment-56` (schema-2 header) → `2==3` false → **открыл
+  НОВЫЙ `segment-57` (schema-3)** — машинная изоляция сработала там, где provenance был ВОИД. Метрики
+  (nsenter в netns → `127.0.0.1:9101/metrics`): `md_events_total{kind=l2delta,binance,BTCUSDT}=1789` (spot)
+  + `{binance_futures,BTCUSDT}=1754` (perp); **non-BTC L2Delta ОТСУТСТВУЕТ** (scope (а) founder ★);
+  recorder healthy, `seq_gaps=0`, 0 panic/ERROR/backstop; write-rate ≈ 3.8 GB/сут (в §8 BTC-only бюджете).
+- **Forensic-уточнение:** СМЕШАННЫХ (schema-2 + variant-6) сегментов ДВА — `55` И `56` (pre-fix бинарь
+  ротировал 55→56, продолжая капчить L2Delta до fix-деплоя); изоляция чиста с `57` вперёд. RFC §10 называет
+  только 55 → занесено в TD-031 (CLOSED) как forensic-note. **Follow-up (занесены reviewer'ом):** TD-032
+  (provenance build-arg `env!` — сегменты различимы по билду, defense-in-depth), TD-033 (машинный
+  энфорсмент «новый вариант ⇒ bump SCHEMA_VERSION» на contract-RFC гейте), TD-029/TD-030 (startup
+  schema-guard / reader first_seq-guard) — все отдельные journal-hardening milestone'ы, НЕ M-18.
+- **M-18 ✅ CLOSED** (задачи 8/9/10 DONE; повторный §8 GREEN на живом проде — unit≠live удовлетворён,
+  ровно то, про что TD-031). L2Delta капча (BTC-only spot+perp) продуктивна и машинно-изолирована по эпохе.
 
 ## Пока НЕ реализовано (следующие фазы)
 - Крейты `risk`/`killswitch`/`oms`, `runner` — пофазно per DESIGN §10 (M-08: fail-closed риск-гейт

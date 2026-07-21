@@ -1,11 +1,14 @@
 # M-18 — Захват сырых book-дельт `L2Delta` (CT-RFC-04, Phase B / book-flow)
 
-STATUS: **🚧 IN_PROGRESS** (код смержен в main `f635bd2`, reviewer APPROVED 2026-07-21; **§8 ВЫПОЛНЕН
-`ce122d1`: капча L2Delta GREEN (BTC spot+perp live, non-BTC отсутствует), но rollback-изоляция RED —
-первое L2Delta ушло в pre-M18 сегмент 55 из-за provenance-константы `no-git-info` в контейнере →
-БЛОКЕР TD-031; milestone НЕ закрыт до фикса + повторного §8**). Блок-1 roadmap (BACKLOG «Порядок
-исполнения»), TIME-SENSITIVE. Doc-гейт §9 Class A. Гейты пройдены: **critic C-017 APPROVE + risk-critic
-C-018 rev3 PASS** (T1 + sacred live-path). Ветка: `feat/M-18-l2delta`. RFC: `docs/rfc/CT-RFC-04-l2delta.md`.
+STATUS: **✅ CLOSED 2026-07-21** (код L2Delta merged `f635bd2`; TD-031 schema-epoch изоляция merged
+`7a237f7`, reviewer APPROVED; **повторный §8 GREEN на VPS** — первое живое BTC L2Delta ушло в НОВЫЙ
+`segment-57` schema-3, НЕ в mixed schema-2 сегмент; non-BTC отсутствует; recorder healthy, `seq_gaps=0`,
+`writable=true`). Исходный §8 `ce122d1` поймал rollback-изоляцию VOID (provenance-константа `no-git-info`
+в контейнере → L2Delta ушёл в pre-M18 сегмент 55) → TD-031; фикс — машинная изоляция по `SCHEMA_VERSION`
+(2→3, `decide_open_segment` reuse требует совпадения schema-эпохи, git-независимо). Гейты пройдены:
+**critic C-017 APPROVE + risk-critic C-018 rev4 PASS** (T1 + sacred live-path). RFC: `docs/rfc/CT-RFC-04-l2delta.md`.
+Follow-up (отдельные journal-hardening milestone'ы, НЕ M-18): TD-032 (provenance build-arg `env!`),
+TD-033 (машинный энфорсмент variant⇒bump), TD-029/TD-030.
 
 ## Objective
 
@@ -75,8 +78,8 @@ valid/invalid + CHANGELOG + red_rfc04) — уже в наборе architect'а (
 | 7 | ✅ DONE | tester: чистый чекаут — fmt/clippy/`cargo test`/`verify_M-18.sh` PASS exit=0 | tester | VERDICT: PASS |
 | **TD-031 fix** (§8-блокер: изоляция ВОИД — provenance-константа в контейнере) ↓ | | | | |
 | 8 | ✅ DONE | architect: `SCHEMA_VERSION` 2→3 (эпоха вариантов) + прод-реалистичный RED `red_l2delta_rollback_boundary` (ИДЕНТИЧНЫЙ константный provenance → изоляция по schema; падает на provenance-only reuse; prototype-revert доказан) + `verify_M-18` (schema=3 + schema-гейт канарейка) + red_rfc02/03 relax + docs (RFC §3 rev2/§10, CHANGELOG, ops §5.1, testing.md урок, branch-hygiene identity) | architect | RED падает на текущем impl, зеленеет с гейтом (доказано) |
-| 9 | ⏳ | engine-dev: `decide_open_segment` reuse требует `&& header.schema_version == contracts::SCHEMA_VERSION` (одна клауза, `crates/journal/src/segments.rs`). Убедиться: не ломает legacy (без заголовка → уже новый сегмент) и штатный рестарт (schema совпадает → reuse). `red_l2delta_rollback_boundary` GREEN; workspace тесты зелёные | engine-dev | L2D-I-8 GREEN; `verify_M-18` PASS |
-| 10 | ⏳ | reviewer: re-merge feat→main + **повторный §8** — первое живое BTC L2Delta ушло в НОВЫЙ segment-56 (schema-3, не в mixed-55); non-BTC отсутствует; recorder healthy, seq_gaps=0. Занести TD-029/first_seq-guard/provenance-forensics в TECH-DEBT | reviewer | §8 GREEN + пруф; M-18 CLOSED |
+| 9 | ✅ DONE | engine-dev: `decide_open_segment` reuse требует `&& header.schema_version == contracts::SCHEMA_VERSION` (одна клауза, `crates/journal/src/segments.rs`). Убедиться: не ломает legacy (без заголовка → уже новый сегмент) и штатный рестарт (schema совпадает → reuse). `red_l2delta_rollback_boundary` GREEN; workspace тесты зелёные | engine-dev | L2D-I-8 GREEN; `verify_M-18` PASS |
+| 10 | ✅ DONE | reviewer: re-merge feat→main (`7a237f7`) + **повторный §8 GREEN** — первое живое BTC L2Delta ушло в НОВЫЙ `segment-57` (schema-3, НЕ в mixed schema-2 55/56); non-BTC отсутствует; recorder healthy, seq_gaps=0, writable=true. TD-029/TD-030/TD-032(provenance-forensics)/TD-033(variant⇒bump) занесены в TECH-DEBT | reviewer | §8 GREEN + пруф; M-18 CLOSED |
 
 ## Гейты
 
