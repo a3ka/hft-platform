@@ -1,7 +1,22 @@
 # M-17 — Order-flow сигналы Phase A (trade-flow) + экспорт данных (бэкенд; из УЖЕ собираемых данных)
 
-STATUS: **PROPOSED** (2026-07-20, architect). Doc-гейт §9 Class A. Founder дал «go»
-(«собирать данные для визуализации и создания сигналов по стратегии Fabio»).
+STATUS: **DONE** (2026-07-21, merge `01a2e20` / код `fb66b52`; reviewer APPROVED, §8 INERT-SAFE —
+recorder не зависит от research-cli, поведение сбора не изменилось). Doc-гейт §9 Class A пройден
+(critic C-016 APPROVE). Founder дал «go» («собирать данные для визуализации и создания сигналов по
+стратегии Fabio»).
+
+**Close-out (что реально поставлено).** Phase-A-БЭКЕНД доставлен: trade-flow редьюсеры (footprint-дельта,
+cumulative delta, per-price bins), depth-ряды per (side,band) и OHLCV + документированный экспорт-контракт
+(`research/exports/format.md` + `export_schema_version`). RED-оракулы OF-I-2/3/4/6 GREEN
+(`research-cli/tests/red_{depth_series,footprint,footprint_bins,ohlcv}.rs`), `verify_M-17.sh` 6/6 PASS.
+**Отклонение от плана (зафиксировано честно):** редьюсеры реализованы research-dev'ом в
+`crates/research-cli/src/{orderflow,depth_series,export}.rs` как compute-над-журналом, а НЕ в
+`crates/signals` (Граница A) руками signal-engineer'а. Следствие: для block-2 (прогон order-flow
+сигнала через M-10 kill-screen) footprint/cumdelta ещё НЕ существуют как promotable `crates/signals::Signal`
+— это отдельная задача, не входившая в export-close-out. **Отложено в block-2 (не блокеры M-17):**
+task 3 (пре-регистрация H/S-002) и task 6 (опц. kill-screen прогон) — они гейтят БЭКТЕСТ-ОТЧЁТ, а не
+бэкенд-экспорт. TD-028 (NOTE, research-dev): `export_io` копит HashMap-буферы за проход → RAM линейна по
+объёму журнала; chunked/streaming-write нужен при подключении M-19 к полной истории.
 
 ## Objective
 
@@ -45,13 +60,13 @@ founder отдельно (Fastify-сервер + open-source TradingView, ест
 
 | # | Статус | Задача | Кто | Acceptance |
 |---|---|---|---|---|
-| 1 | ⏳ | OF-I-* RED (`crates/signals/tests/red_orderflow.rs` детерминизм+дельта; `research-cli/tests/red_footprint_export.rs` экспорт-данные) | architect | RED падает без impl; достижим |
-| 2 | ⏳ | `verify_M-17.sh` | architect | exit=0 на GREEN |
-| 3 | ⏳ | Пре-регистрация: `H-*-orderflow` + `S-002-footprint` (критерии фальсификации ДО бэктеста) | signal-engineer | карточка + spec |
-| 4 | ⏳ | Реализация trade-flow сигналов (footprint-дельта, cumulative delta, per-price imbalance) — чистые редьюсеры | signal-engineer | OF-I-1/2/3 GREEN |
-| 5 | ⏳ | Экспорт в докум. формате: (а) **per-price footprint bins** `FootprintBar{time_s, bins:[PriceBin{price,buy_vol,sell_vol,delta}]}` (полный footprint, C-016); (б) cumulative/depth/OHLCV серии в lightweight-charts shape; (в) **`research/exports/format.md` со схемой + примером + `export_schema_version`** (стабильный контракт под code2alpha, verify_M-17 ТРЕБУЕТ файл — C-016) | research-dev | OF-I-4 + `red_footprint_bins` GREEN; format.md существует |
-| 6 | ⏳ | (опц.) прогон trade-flow сигнала через M-10 kill-screen | research-dev | вердикт по пре-рег критериям |
-| 7 | ⏳ | **Depth time-series (OF-I-6):** редьюсер `depth_within(side,band)` над `L2Snapshot` → ряд per (venue,symbol,side,band,timeframe); экспорт `LineData` серий для линейного графика (BID/ASK раздельно) | research-dev | OF-I-6 GREEN; экспорт per side/band корректен |
+| 1 | ✅ DONE | OF-I-* RED — поставлено как `research-cli/tests/red_{depth_series,footprint,footprint_bins,ohlcv}.rs` (детерминизм+дельта+bins+OHLCV+depth-ряды). Анти-плацебо доказан (bins FAIL против слитых цен) | architect | RED падал без impl; достижим ✅ |
+| 2 | ✅ DONE | `verify_M-17.sh` — 6/6 PASS, exit=0 (reviewer перепрогнал независимо @fb66b52) | architect | exit=0 на GREEN ✅ |
+| 3 | ⏸ DEFERRED→block2 | Пре-регистрация `H-*-orderflow` + `S-002-footprint` — гейтит БЭКТЕСТ-ОТЧЁТ, не бэкенд-экспорт; идёт с block-2 прогоном | signal-engineer | (не в export-close-out) |
+| 4 | ✅ DONE | Trade-flow редьюсеры (footprint-дельта, cumulative delta, per-price) — чистые редьюсеры. ⚠ Поставлено research-dev'ом в `crates/research-cli/src/orderflow.rs`, НЕ в `crates/signals` (см. close-out: не promotable Signal — отдельная задача для block-2) | research-dev | OF-I-1/2/3 GREEN ✅ |
+| 5 | ✅ DONE | Экспорт: per-price footprint bins + cumulative/depth/OHLCV серии (lightweight-charts shape) + `research/exports/format.md` со схемой/примером/`export_schema_version` (C-016) | research-dev | OF-I-4 + `red_footprint_bins` GREEN; format.md существует ✅ |
+| 6 | ⏸ DEFERRED→block2 | (опц.) прогон trade-flow сигнала через M-10 kill-screen — гейтит task 3 (пре-рег) + существование promotable Signal (task 4 нюанс) | research-dev | (не в export-close-out) |
+| 7 | ✅ DONE | **Depth time-series (OF-I-6):** редьюсер `depth_within(side,band)` над `L2Snapshot` → ряд per (venue,symbol,side,band,timeframe); экспорт `LineData` (BID/ASK раздельно) | research-dev | OF-I-6 GREEN ✅ |
 
 ## Гейты
 
