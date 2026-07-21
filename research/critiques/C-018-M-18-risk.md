@@ -168,3 +168,98 @@ This is a CONCERNS-level finding: easy to close with a procedural gate, but it s
 ## Cleanup
 
 No temporary source changes were made. The worktree was clean before writing this risk verdict.
+
+---
+
+## Re-audit C-018 Resolution
+
+**UTC:** 2026-07-21T11:28:07Z  
+**Agent:** risk-critic  
+**Branch audited:** `origin/feat/M-18-l2delta` at `e92e7a3`  
+**Worktree:** `/tmp/hft-riskcritic-m18-r2` (detached at `origin/feat/M-18-l2delta`)  
+**Verdict:** CONCERNS
+
+### Closure Checks
+
+The original rollback blocker is partially closed.
+
+PASS: `red_l2delta_rollback_boundary` is reachable. Baseline RED fails at the expected
+pre-implementation E0004 in `journal::segment_last_ts`. With the five temporary RFC §6 arms
+(`journal/segments` ts, `sim/exchange` ignore, recorder label `"l2delta"`, dump ignore,
+`latency_probe` continue), this command passes:
+
+```text
+cargo test -p journal --test red_l2delta_rollback_boundary -- --nocapture
+running 1 test
+test l2delta_isolated_in_new_provenance_segment ... ok
+test result: ok. 1 passed
+```
+
+PASS: anti-placebo for the actual invariant works. Temporarily changing
+`decide_open_segment` to ignore `header.provenance` makes the same test fail with:
+
+```text
+M-18 provenance ОБЯЗАН открыть НОВЫЙ сегмент ... получено сегментов: 1
+test result: FAILED. 0 passed; 1 failed
+```
+
+PASS: `verify_M-18.sh` now includes `red_l2delta_rollback_boundary` and a structural
+runbook check. On the RED branch it still exits `1`, as expected before venue-dev/engine-dev:
+
+```text
+FAIL  journal red_l2delta_rollback_boundary (...)
+PASS  rollback-runbook задокументирован (RFC §10 + ops.md §5.1) — C-018 mitigation
+VERDICT: FAIL (7)
+```
+
+PASS: milestone task 6 now carries the live rollback check: first BTC L2Delta must land in
+a new M-18-provenance segment; post-M18 segment must be identifiable; reviewer must not
+treat deploy auto-rollback as blind safety.
+
+NOTE: startup schema-guard is recorded as reviewer-owned follow-up in RFC §10 and milestone
+gates, but not as a concrete `TECH-DEBT.md` entry in this branch. That is acceptable only
+because `TECH-DEBT.md` is reviewer-owned post-merge; reviewer must assign the actual TD at
+merge.
+
+### Remaining Blocking Concern
+
+R2 — `ops.md` §5.1 / RFC §10 overclaim the re-forward step after quarantine.
+
+The quarantine procedure is executable for the narrow rollback boundary:
+
+1. stop recorder;
+2. move post-M18 segments identified by provenance git-sha / `created_wall_ms` out of the active journal;
+3. start pre-M18 binary against a clean pre-M18 tail.
+
+But the documented step "return quarantined segments on re-forward; seq is continuous" is false
+if the pre-M18 binary writes any event while the M-18 segment is quarantined. Temporary probe:
+
+```text
+pre-M18 wrote seq 0..4
+M-18 wrote quarantined segment seq 5..6
+pre-M18 rollback wrote one Trade after quarantine
+after restoring quarantined segment, read order was [0, 1, 2, 3, 4, 7, 5, 6]
+```
+
+Reason: `journal.meta` remains advanced past the quarantined segment, so the old binary can
+write seq `7` into the pre-M18 segment. Reattaching the quarantined segment by filename then
+puts seq `5..6` after seq `7` in segment-index order. In a rotation case it can also collide
+with a newly-created `segment-00000001.jrnl`.
+
+This is not the original "old binary decodes L2Delta and reuses seq" failure; that part is
+closed by provenance isolation. It is still a rollback-safety defect because the runbook gives
+an operator a false recovery action for the preserved L2Delta data.
+
+Required repair before PASS:
+
+1. Amend `docs/fa/ops.md` §5.1 and RFC §10: quarantined post-M18 segments must not be blindly
+   returned to the active journal after the pre-M18 binary has written anything.
+2. State one allowed policy explicitly:
+   rollback is no-write/emergency only until re-forward, OR quarantined segments remain a forked
+   cold artifact requiring a named reconciliation/import procedure.
+3. Extend milestone task 6 rollback-check: if rollback occurred, reviewer must prove no pre-M18
+   writes happened before reattach, otherwise reattach is forbidden.
+
+Risk verdict stays CONCERNS, not KILL: the MD-only/order-path, sim-inertness, magic/version,
+BTC-only volume posture, discriminant pinning, and original provenance-boundary RED are sound.
+The remaining issue is a procedural false guarantee in the rollback runbook.
