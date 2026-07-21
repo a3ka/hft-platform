@@ -378,13 +378,17 @@ struct OrderBook {
 /// ПРЫГАТЬ (не +1) — потому СПОТ-правило `u_first == last+1` НЕПРИМЕНИМО.
 /// `b`/`a` — массивы `[price, qty]`-пар. `size==0` — удалить уровень.
 /// `pu` обязателен в fstream-payload (отсутствие = malformed → Skip).
-struct DepthDiff {
-    event_time_ms: i64,
-    pu: u64,
-    u_first: u64,
-    u_final: u64,
-    bids: Vec<(i64, i64)>,
-    asks: Vec<(i64, i64)>,
+///
+/// `pub` (CT-RFC-04, M-18 task #4): свой тип крейта — scope-guard разрешает публиковать
+/// (`docs/fa/venues.md` §6); `l2delta_event` и `red_l2delta_futures` конструируют его
+/// напрямую.
+pub struct DepthDiff {
+    pub event_time_ms: i64,
+    pub pu: u64,
+    pub u_first: u64,
+    pub u_final: u64,
+    pub bids: Vec<(i64, i64)>,
+    pub asks: Vec<(i64, i64)>,
 }
 
 /// Состояние sync-конечного-автомата одного символа (см. `venue-binance`).
@@ -421,6 +425,43 @@ enum DiffAction {
     Gap,
     /// Апдейт непрерывен — применить к книге.
     Apply,
+}
+
+/// Символ, для которого включена эмиссия сырых book-дельт `MdPayload::L2Delta`
+/// (CT-RFC-04, founder ★ вариант (а) 2026-07-21): захват ограничен самым ликвидным
+/// инструментом, пока ретеншен (TD-020) не доставлен в прод. Остальные символы
+/// остаются на прежнем бакетированном `L2Snapshot` без изменений — расширение набора
+/// требует отдельного решения founder'а (RFC §5).
+const L2DELTA_CAPTURE_SYMBOLS: &[&str] = &["BTCUSDT"];
+
+/// Чистый транслятор СЫРОГО fstream `@depth` diff в канонический `EventKind::Md(L2Delta)`
+/// (CT-RFC-04, L2D-I-2/4). Персистит diff БЕЗ ПОТЕРЬ, независимо от book-sync FSM —
+/// сырой diff это ground-truth рыночное событие. FUTURES: `prev_final_update_id =
+/// Some(diff.pu)` — continuity перп-книги чейнится по `pu` (не по `U == last+1`, урок
+/// TD-014); путаница со спот-семантикой ломает gap-детекцию.
+pub fn l2delta_event(symbol: &str, diff: &DepthDiff) -> EventKind {
+    let bids = diff
+        .bids
+        .iter()
+        .map(|&(price, size)| Level { price, size })
+        .collect();
+    let asks = diff
+        .asks
+        .iter()
+        .map(|&(price, size)| Level { price, size })
+        .collect();
+    EventKind::md(
+        Venue::BinanceFutures,
+        symbol,
+        MdPayload::L2Delta {
+            bids,
+            asks,
+            first_update_id: diff.u_first,
+            final_update_id: diff.u_final,
+            prev_final_update_id: Some(diff.pu),
+            ts_exch_ms: diff.event_time_ms,
+        },
+    )
 }
 
 /// Эффект sync-state-машины `FuturesSession`: то, что она «хочет» эмитить во внешний мир
@@ -568,6 +609,16 @@ impl FuturesSession {
             }
         } else if stream.contains("@depth") {
             if let Some((symbol, diff)) = parse_depth_diff(stream, data) {
+                // CT-RFC-04 (L2D-I-2/4): капчим КАЖДЫЙ распарсенный diff как сырое
+                // L2Delta-событие независимо от book-sync FSM (ground-truth рыночное
+                // событие, не свойство нашего sync-автомата). Founder ★ (а): только
+                // символы из allow-list — не-BTC не эмитит L2Delta, остаётся на
+                // L2Snapshot.
+                if L2DELTA_CAPTURE_SYMBOLS.contains(&symbol.as_str()) {
+                    if let EventKind::Md(md) = l2delta_event(&symbol, &diff) {
+                        effects.push(SessionEffect::Emit(md));
+                    }
+                }
                 // Сначала вычислить action (immutable borrow), потом мутировать.
                 let state = self
                     .states
