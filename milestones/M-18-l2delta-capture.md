@@ -40,7 +40,7 @@ valid/invalid + CHANGELOG + red_rfc04) — уже в наборе architect'а (
 | L2D-I-3 | **Семантика уровней (= apply_diff_to_book §A, testing.md «отсутствие»):** `size==0` = явный remove; уровень, которого в дельте НЕТ, — НЕ трогается; пустая сторона = «не менялось», не «очистить» |
 | L2D-I-4 | **Continuity перпа по `pu`, не по `U==last+1`** (урок TD-014): futures несёт `prev_final=Some(pu)`, spot — `None`; путаница ломает gap-детекцию. RED `red_l2delta_futures` |
 | L2D-I-5 | **Sacred write-path exact:** L2Delta переживает write→read_all (postcard+crc32) байт-в-байт; DET-I-1 не ослаблен. RED `red_l2delta_persist` |
-| L2D-I-8 | **Rollback-safety (C-018):** L2Delta изолирован в сегменте M-18-provenance (git-sha) — pre-M18 сегмент НЕ получает variant-6 → чистый quarantine при откате; seq не переиспользуется через границу. Silent-откат на pre-M18 бинарь запрещён (runbook `ops.md` §5.1). RED `red_l2delta_rollback_boundary` |
+| L2D-I-8 | **Rollback-safety (C-018):** L2Delta изолирован в сегменте M-18-provenance (git-sha) — pre-M18 сегмент НЕ получает variant-6 (RED `red_l2delta_rollback_boundary`). Schema-forward деплой ОДНОСТОРОННИЙ: silent-откат запрещён; post-M18 данные — терминальный архив (отдельная эпоха), re-stitch в live журнал ЗАПРЕЩЁН (ломает `first_seq`); fix-forward предпочтителен. Runbook `ops.md` §5.1 |
 | L2D-I-6 | **Инертность к бэктесту и safety:** `sim` ИГНОРИРУЕТ L2Delta (fill ведётся из L2Snapshot+Trade — сырая дельта = двойной учёт); order-путь/risk не тронуты (MD-only). Консюмер-армы (5 сайтов, RFC §6) — дефолт IGNOR; исключения: journal ts (#1), recorder лейбл `"l2delta"` (#3) |
 | L2D-I-7 | **Магия/версия неизменны:** `SEGMENT_MAGIC=HFTJRN02`, `SCHEMA_VERSION=2` — bump сломал бы чтение боевых сегментов. verify-канарейка |
 
@@ -75,11 +75,15 @@ valid/invalid + CHANGELOG + red_rfc04) — уже в наборе architect'а (
 
 - **critic** (новый milestone §9 Class A; T1-триггер; ≥5 коммитов; ломающих форму T1 НЕТ — аддитивно).
 - **risk-critic ОБЯЗАТЕЛЕН** (`gates.md` §5): T1-изменение + sacred live-path (venue/recorder/journal).
-  **C-018 = CONCERNS (2026-07-21):** PASS по MD-only/sim-инертности/магии/дискриминантам; blocking
-  concern — **rollback-safety** (pre-M18 бинарь не декодит variant-6 → silent-откат = seq-reuse).
-  **Устранено architect'ом (rev2):** RED `red_l2delta_rollback_boundary` (L2Delta изолирован в
-  M-18-provenance сегменте) + RFC §10 + runbook `ops.md` §5.1 + §8 rollback-check (task 6) +
-  follow-up TD (startup schema-guard). Требует re-audit risk-critic.
+  **C-018 = CONCERNS (2026-07-21):** PASS по MD-only/sim-инертности/магии/дискриминантам.
+  - *concern-1 (isolation)* — ЗАКРЫТ rev2: RED `red_l2delta_rollback_boundary` (L2Delta изолирован в
+    M-18-provenance сегменте) + RFC §10 + §8 rollback-check (task 6).
+  - *concern-2 (re-forward false promise)* re-audit: runbook обещал вернуть quarantined сегменты, но
+    re-stitch ломает `first_seq` (тихий беспорядок `[0,1,2,3,4,7,5,6]`). **Устранено rev3:** RFC §10 +
+    `ops.md` §5.1 переписаны — schema-forward ОДНОСТОРОННИЙ (fix-forward предпочтителен; архив
+    терминальный, отдельная эпоха; re-stitch ЗАПРЕЩЁН; meta сохраняется от reuse). Follow-up TD (2):
+    startup schema-guard + reader `first_seq`-guard (общая journal-hardening, отдельный milestone).
+  Требует re-audit risk-critic (rev3).
 - **§8 post-merge** (прод НЕ инертен — recorder начинает писать L2Delta): задача 6, решающий live-гейт.
 - Founder ★ РЕШЕНО (2026-07-21): развилка §5 RFC = **вариант (а)** — захват только BTCUSDT (spot+perp). risk-critic оценивает уже выбранную (более безопасную) ветку.
 
