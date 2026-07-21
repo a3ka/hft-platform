@@ -243,6 +243,17 @@ async fn handle_text_message(
         }
     } else if stream.contains("@depth") {
         if let Some((symbol, diff)) = parse_depth_diff(stream, data) {
+            // CT-RFC-04 (L2D-I-2): капчим КАЖДЫЙ распарсенный diff как сырое
+            // L2Delta-событие независимо от book-sync FSM (ground-truth рыночное
+            // событие, не свойство нашего sync-автомата). Founder ★ (а): только
+            // символы из allow-list — не-BTC не эмитит L2Delta, остаётся на
+            // L2Snapshot.
+            if L2DELTA_CAPTURE_SYMBOLS.contains(&symbol.as_str()) {
+                let event = l2delta_event(&symbol, &diff);
+                if tx.send(event).await.is_err() {
+                    return false;
+                }
+            }
             let state = states
                 .entry(symbol.clone())
                 .or_insert_with(SymbolState::new);
@@ -464,6 +475,43 @@ fn evict_backstop(side: &mut BTreeMap<i64, i64>, mid: i64, is_bids: bool) {
             }
         }
     }
+}
+
+/// Символ, для которого включена эмиссия сырых book-дельт `MdPayload::L2Delta`
+/// (CT-RFC-04, founder ★ вариант (а) 2026-07-21): захват ограничен самым ликвидным
+/// инструментом, пока ретеншен (TD-020) не доставлен в прод. Остальные символы
+/// остаются на прежнем бакетированном `L2Snapshot` без изменений — расширение набора
+/// требует отдельного решения founder'а (RFC §5).
+const L2DELTA_CAPTURE_SYMBOLS: &[&str] = &["BTCUSDT"];
+
+/// Чистый транслятор СЫРОГО `@depth` diff в канонический `EventKind::Md(L2Delta)`
+/// (CT-RFC-04, L2D-I-2/3). Персистит diff БЕЗ ПОТЕРЬ, независимо от book-sync FSM —
+/// сырой diff это ground-truth рыночное событие; наш sync-автомат (REST-бутстрап,
+/// gap-resync) не является свойством данных. СПОТ: `prev_final_update_id = None`
+/// (непрерывность спот-потока — `U == prev.u + 1`, чейн по `pu` не несёт смысла).
+pub fn l2delta_event(symbol: &str, diff: &DepthDiff) -> EventKind {
+    let bids = diff
+        .bids
+        .iter()
+        .map(|&(price, size)| Level { price, size })
+        .collect();
+    let asks = diff
+        .asks
+        .iter()
+        .map(|&(price, size)| Level { price, size })
+        .collect();
+    EventKind::md(
+        Venue::Binance,
+        symbol,
+        MdPayload::L2Delta {
+            bids,
+            asks,
+            first_update_id: diff.u_first,
+            final_update_id: diff.u_final,
+            prev_final_update_id: None,
+            ts_exch_ms: diff.event_time_ms,
+        },
+    )
 }
 
 /// Прогнать входящий diff через sync-автомат символа per Binance snapshot+diff-sync
