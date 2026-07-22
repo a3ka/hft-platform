@@ -953,6 +953,50 @@ doc-гейт (`research/critiques/C-021-cockpit-docs.md` = NOTE; NOTE-1 Semantic
   параллельно M-20 (VWAP)/M-23 (heatmap). Открытые founder-решения (docs/07 §10): TPP `formula_pending`,
   LLM-провайдер, Tardis-бюджет/окно, масштаб универсума TPP TOTAL.
 
+## Read Gateway (M-22 «snapshot + live-push + replay» — ✅ MERGED `7799ff2`, reviewer APPROVED 2026-07-22; §8 GREEN inert)
+Первый milestone Трека B кокпита (enabling-инфра): без gateway ни один виз-примитив не доезжает до фронта
+в live. **Новый крейт `crates/gateway`** — read-only консюмер журнала (Граница A) над ОДНИМ кодом
+детерминированных редьюсеров: `snapshot(at)` (полная свёртка окна), `frames_since(after, max_events)`
+(инкрементальный live-push), `replay(from,to)` (детерм. проигрыш) → **live == replay** (один редьюсер,
+разный источник хвоста). Цепочка: architect (crate-скелет + GW-I-1..8 RED + verify) → **critic C-022
+REJECT → r2 REJECT → r3 PASS** (оракулы усилены за 3 круга) → engine-dev (tasks 3/4/5) → tester PASS →
+**reviewer CHANGES REQUESTED** (fmt-гейт красный на sacred тестах) → architect fix → reviewer APPROVED.
+- `crates/gateway/src/lib.rs` (engine-dev tasks 3-5) — **bounded read-only**: все три пути зовут
+  `journal::stream(dir, EpochFilter)`, `reduce_event_stream` сворачивает поток БЕЗ материализации
+  `Vec<Event>` (state растёт только с числом time-бакетов, не событий — GW-I-2, класс TD-011 этажом выше).
+  **EpochFilter прокинут во ВСЕ пути** (snapshot/frames_since/replay), не хардкод `All` (GW-I-7);
+  `max_events` — реальный кап батча (GW-I-8); `Cursor{upto_seq}` монотонен/сериализуем; `Snapshot::apply`
+  сливает кадры без дрейфа против свёртки-с-нуля (GW-I-4); `schema_version = GATEWAY_SCHEMA_VERSION = 2`
+  (T-designate, аддитивно поверх export v1 — GW-I-5); `depth_band_provenance` обязателен на полосах >1.3%
+  (GW-I-6). Read-only доказан: sha журнал-каталога до/после = идентичен (GW-I-1); recorder НЕ зависит от
+  gateway (обратной deps нет).
+- **Контракт (T1) НЕ тронут** — `crates/contracts`/`Event`/`EventKind` только читаются (Граница A);
+  gateway DTO (`Snapshot/Frame/Cursor/SeriesBundle/GATEWAY_SCHEMA_VERSION`) — T-designate в `crates/gateway`,
+  CT-RFC не нужен, `SemanticEvent` не вводится. **risk-critic N/A** — read-only MD/viz, нет order-egress
+  (MD-only carve-out `gates.md` §5); reviewer подтвердил read-only в Block-scope по коду, не только канарейкам.
+- **Дефект, пойманный reviewer'ом на PR-гейте (не оракулами и не verify): fmt-гейт (RN-8, 3-й повтор).**
+  `cargo fmt --all -- --check` = exit 1 на ВСЕХ 5 sacred `crates/gateway/tests/*.rs` (impl fmt-clean),
+  а `verify_M-22.sh` НЕ содержал fmt-гейта вовсе → VERDICT: PASS при красном CI-fmt (`ci.yml:20`) → merge
+  дал бы красный CI на main + блок §8. Fix architect: `200e3ef` (fmt sacred тестов, whitespace-only —
+  `git diff -w` пуст, семантика сохранена) + `49a03a6` (`cargo fmt --all -- --check` добавлен ПЕРВЫМ гейтом
+  в `verify_M-22.sh`, матчит CI точно). Тот же класс, что RN-8 (M-05) и clippy-gap M-18 (TD-031): **verify
+  обязан зеркалить CI**. Impl не тронут фиксами.
+- **Гейты (reviewer перепрогнал независимо на чистом worktree @49a03a6, tree идентичен merge `7799ff2`):**
+  `cargo fmt --all -- --check` exit=0; `cargo clippy --workspace --all-targets -D warnings` exit=0;
+  `cargo test --workspace` **330 passed / 0 failed** (110 блоков); `cargo test -p gateway` **14/14 GW-I GREEN**
+  (bounded 1 / epoch_filter 4 / export_v2 2 / live_eq_replay 6 / readonly 1); `verify_M-22.sh` **8/8 PASS,
+  VERDICT: PASS, exit=0**.
+- **§8 деплой-гейт (прод ИНЕРТЕН — gateway read-only библиотека, recorder её не импортирует, Dockerfile
+  `--bin recorder`, gateway в образ не попадает):** CI `29962986971` success (5m53s), Deploy `29962986964`
+  success (7m15s). VPS HEAD `7799ff2`; eyes-on: `hft-recorder Up (healthy)`, `restarts=0`, образ содержит
+  ТОЛЬКО `recorder`+`journal-retention` (gateway-бинаря НЕТ — инертность подтверждена); heartbeat свежий,
+  `writable=true`, две пробы 16s: `next_seq 70072749→70074176` (+1427), `events 5676→7101` — recorder
+  активно пишет; `RssAnon = 14 752 kB` (TD-021-метрика, норма); 0 panic/ERROR/backstop. recorder пересобран
+  идентично, поведение данных не изменилось.
+- **M-22 ✅ CLOSED.** Разблокирует M-23/24/25 (виз-серии в `SeriesBundle` аддитивно) + M-19 (фронт).
+  Task #6 (reference-WS-бинарь) — опционален, в наборе НЕТ; если понадобится транспорт на VPS — отдельный
+  milestone со своим §8 (транспорт ≠ детерм-ядро M-22).
+
 ## Пока НЕ реализовано (следующие фазы)
 - Крейты `risk`/`killswitch`/`oms`, `runner` — пофазно per DESIGN §10 (M-08: fail-closed риск-гейт
   между `strategy` и `oms`). MM-котирование, wiring весов из `signals.json` (граница B),

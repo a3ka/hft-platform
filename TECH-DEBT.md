@@ -804,6 +804,22 @@
   late logs `418=0`, `429=0`, `gap=0`, `stale=0`, CPU/MEM normal, restarts=0. Candidate was
   merged via `1504d8b`; TD-014 CLOSED.
 
+## Замечания reviewer'а M-22 (2026-07-22)
+- **RN-17** (verify обязан зеркалить CI — 3-й инстанс класса RN-8) M-22 прошёл tester'ом с
+  `verify_M-22.sh` VERDICT: PASS, но reviewer заблокировал merge: `cargo fmt --all -- --check`
+  (ТОЧНЫЙ CI-гейт `ci.yml:20` build-test) = exit 1 на ВСЕХ 5 sacred `crates/gateway/tests/*.rs`
+  (impl fmt-clean), а `verify_M-22.sh` fmt-гейта НЕ содержал вовсе → false-green. Merge дал бы
+  красный CI на main + блок §8 (deploy `needs: ci`). Это ТРЕТИЙ инстанс одного класса: RN-8
+  (M-05, fmt-гейт покрывал journal+book, не recorder) и clippy-gap M-18/TD-031 (verify без
+  clippy-гейта → `assertions_on_constants` уехал бы на main). **Правило (durable): каждый
+  `verify_M-NN.sh` обязан ЗЕРКАЛИТЬ терминальные гейты CI — `cargo fmt --all -- --check` И
+  `cargo clippy --workspace --all-targets -D warnings` — теми же командами, что `ci.yml`.** Иначе
+  acceptance даёт зелёный там, где CI красный, и дефект ловится только reviewer'ом/на main. Fix
+  architect: `200e3ef` (fmt sacred тестов, whitespace-only, `git diff -w` пуст) + `49a03a6`
+  (fmt-гейт добавлен ПЕРВЫМ в verify). Зона систематизации — architect (процессный слой): свести в
+  `.claude/rules/gates.md` §3 требование «verify ⊇ CI-гейты» как обязательный пункт шаблона
+  acceptance-скрипта. Не блокер (M-22 смержен зелёным), но повтор класса — под наблюдением.
+
 ## Замечания reviewer'а M-06 #4 (2026-07-11)
 - **RN-9** (§8 eyes-on поймал то, что все зелёные гейты пропустили — снова) Code-review A+B
   #4 PASS: wiring engine-dev'а КОРРЕКТЕН (default_venues loop, `Box<dyn Fn>` type-erasure,
