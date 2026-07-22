@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 use std::io;
 use std::path::Path;
 
-use contracts::{Event, EventKind, Level, MdPayload, Side, Venue};
+use contracts::{Event, EventKind, Level, MdEvent, MdPayload, Side, Venue};
 use journal::EpochFilter;
 use serde::{Deserialize, Serialize};
 
@@ -37,6 +37,12 @@ pub struct Selector {
     pub symbol: String,
     pub timeframe_ms: i64,
     pub bands: Vec<f64>,
+}
+
+impl Selector {
+    fn matches(&self, md: &MdEvent) -> bool {
+        md.venue == self.venue && md.symbol == self.symbol
+    }
 }
 
 /// Монотонный read-курсор в тотальном порядке журнала (`Event.seq`).
@@ -231,7 +237,7 @@ impl Reducer {
         let EventKind::Md(md) = &event.kind else {
             return;
         };
-        if md.venue != self.selector.venue || md.symbol != self.selector.symbol {
+        if !self.selector.matches(md) {
             return;
         }
         let MdPayload::Trade {
@@ -259,7 +265,7 @@ impl Reducer {
         let EventKind::Md(md) = &event.kind else {
             return;
         };
-        if md.venue != self.selector.venue || md.symbol != self.selector.symbol {
+        if !self.selector.matches(md) {
             return;
         }
 
