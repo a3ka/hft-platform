@@ -357,9 +357,72 @@ impl Snapshot {
     /// Основа GW-I-4: `snapshot(C) + frames_since(C..C')` == `snapshot(C')`.
     ///
     /// engine-dev (M-22 task #4). Тело-заглушка — RED.
-    pub fn apply(&mut self, _frame: &Frame) {
-        unimplemented!("M-22 task #4 (engine-dev): fold Frame.delta into snapshot (bucket-merge)")
+    pub fn apply(&mut self, frame: &Frame) {
+        let mut ohlcv: BTreeMap<i64, OhlcvRow> = self
+            .series
+            .ohlcv
+            .drain(..)
+            .map(|row| (row.time_s, row))
+            .collect();
+        for incoming in &frame.delta.ohlcv {
+            match ohlcv.get_mut(&incoming.time_s) {
+                Some(current) => {
+                    current.high = current.high.max(incoming.high);
+                    current.low = current.low.min(incoming.low);
+                    current.close = incoming.close;
+                    current.volume += incoming.volume;
+                }
+                None => {
+                    ohlcv.insert(incoming.time_s, *incoming);
+                }
+            }
+        }
+        self.series.ohlcv = ohlcv.into_values().collect();
+
+        let mut deltas = cumulative_to_deltas(&self.series.cumulative_delta);
+        for (time_s, delta) in cumulative_to_deltas(&frame.delta.cumulative_delta) {
+            *deltas.entry(time_s).or_default() += delta;
+        }
+        let mut running = 0_i64;
+        self.series.cumulative_delta = deltas
+            .into_iter()
+            .map(|(time_s, delta)| {
+                running += delta;
+                (time_s, running)
+            })
+            .collect();
+
+        for incoming in &frame.delta.depth_series {
+            let current =
+                self.series.depth_series.iter_mut().find(|row| {
+                    row.side == incoming.side && row.band_pct_e8 == incoming.band_pct_e8
+                });
+            if let Some(current) = current {
+                let mut values: BTreeMap<i64, i64> = current.series.drain(..).collect();
+                values.extend(incoming.series.iter().copied());
+                current.series = values.into_iter().collect();
+                if current.depth_band_provenance.is_none() {
+                    current.depth_band_provenance = incoming.depth_band_provenance.clone();
+                }
+            } else {
+                self.series.depth_series.push(incoming.clone());
+            }
+        }
+
+        self.cursor = frame.to;
     }
+}
+
+fn cumulative_to_deltas(series: &[(i64, i64)]) -> BTreeMap<i64, i64> {
+    let mut previous = 0_i64;
+    series
+        .iter()
+        .map(|&(time_s, cumulative)| {
+            let delta = cumulative - previous;
+            previous = cumulative;
+            (time_s, delta)
+        })
+        .collect()
 }
 
 /// Полная свёртка `[start .. at]` через bounded `journal::stream`. Read-only (GW-I-1).
@@ -397,8 +460,21 @@ pub fn frames_since(
     after: Cursor,
     max_events: usize,
 ) -> io::Result<(Vec<Frame>, Cursor)> {
-    let _ = (dir.as_ref(), filter, sel, after, max_events);
-    unimplemented!("M-22 task #4 (engine-dev): bounded journal::stream tail → frames + new cursor")
+    let stream = journal::stream(dir, filter)?;
+    let (delta, cursor, consumed) =
+        reduce_event_stream(stream, sel, after, Cursor::LATEST, max_events)?;
+    if consumed == 0 {
+        return Ok((Vec::new(), after));
+    }
+    Ok((
+        vec![Frame {
+            schema_version: GATEWAY_SCHEMA_VERSION,
+            from: after,
+            to: cursor,
+            delta,
+        }],
+        cursor,
+    ))
 }
 
 /// Детерминированный replay окна `(from .. to]` тем же редьюсером, что live (VB-I-2/GW-I-3).
@@ -410,6 +486,15 @@ pub fn replay(
     from: Cursor,
     to: Cursor,
 ) -> io::Result<Vec<Frame>> {
-    let _ = (dir.as_ref(), filter, sel, from, to);
-    unimplemented!("M-22 task #4 (engine-dev): deterministic replay window → frames")
+    let stream = journal::stream(dir, filter)?;
+    let (delta, cursor, consumed) = reduce_event_stream(stream, sel, from, to, usize::MAX)?;
+    if consumed == 0 {
+        return Ok(Vec::new());
+    }
+    Ok(vec![Frame {
+        schema_version: GATEWAY_SCHEMA_VERSION,
+        from,
+        to: cursor,
+        delta,
+    }])
 }
