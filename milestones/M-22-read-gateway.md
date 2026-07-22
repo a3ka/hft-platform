@@ -1,6 +1,7 @@
 # M-22 — Read Gateway (snapshot + live-push + replay) — enabling-инфра кокпита
 
-STATUS: **APPROVED (RED-набор) — re-spin r3, critic C-022 PASS** (2026-07-22, architect). Пивот P-COCKPIT,
+STATUS: **DONE — merged to main 2026-07-22** (merge `7799ff2`, reviewer APPROVED, §8 GREEN: recorder
+unregressed, gateway инертен — бинаря в образе нет). RED-набор прошёл critic C-022 (r3 PASS). Пивот P-COCKPIT,
 Трек B (MVP-1), критический путь. Готов к impl (engine-dev tasks 3-5). Эволюция оракулов по C-022:
 r2 — GW-I-7 (EpochFilter) + GW-I-8 (cursor-bounds) + GW-I-2 (frames_since bounded); r3 — EpochFilter на
 frames_since/replay (не только snapshot), Explicit≠All, реальный `max_events`-кап-ассерт.
@@ -99,11 +100,11 @@ depth-series над `Trade`/`L2Snapshot`). **НЕ входит в M-22:** heatma
 
 | # | Статус | Задача | Кто | Acceptance |
 |---|---|---|---|---|
-| 1 | ⏳ | GW-I-* RED-набор + crate-скелет (контракт-типы + `unimplemented!()`-сигнатуры + Cargo + members) | architect | `cargo test -p gateway` КОМПИЛИРУЕТСЯ и ПАДАЕТ (unimplemented/assert); достижимо; GW-I-2 прод-масштаб обязателен |
-| 2 | ⏳ | `verify_M-22.sh` (clippy -D warnings, test -p gateway, grep-канарейки read_all/writer-import) | architect | exit=0 только на GREEN |
-| 3 | ⏳ | `snapshot(dir, EpochFilter, sel, at)` — полная свёртка серий через `journal::stream` (bounded), фильтр эпох соблюдён | engine-dev | GW-I-1/GW-I-2/GW-I-6/GW-I-7 GREEN |
-| 4 | ⏳ | `frames_since(after, max_events)` + `replay(window)` + `Snapshot::apply` — инкрементальный/детерм. хвост, cursor-контракт | engine-dev | GW-I-3/GW-I-4/GW-I-8 GREEN |
-| 5 | ⏳ | Сериализация `Snapshot`/`Frame` (JSON + postcard бинарь для тяжёлых серий) + `schema_version` | engine-dev | GW-I-5 GREEN; roundtrip |
+| 1 | ✅ | GW-I-* RED-набор + crate-скелет (контракт-типы + `unimplemented!()`-сигнатуры + Cargo + members) | architect | `cargo test -p gateway` КОМПИЛИРУЕТСЯ и ПАДАЕТ (unimplemented/assert); достижимо; GW-I-2 прод-масштаб обязателен |
+| 2 | ✅ | `verify_M-22.sh` (clippy -D warnings, test -p gateway, grep-канарейки read_all/writer-import) | architect | exit=0 только на GREEN |
+| 3 | ✅ | `snapshot(dir, EpochFilter, sel, at)` — полная свёртка серий через `journal::stream` (bounded), фильтр эпох соблюдён | engine-dev | GW-I-1/GW-I-2/GW-I-6/GW-I-7 GREEN |
+| 4 | ✅ | `frames_since(after, max_events)` + `replay(window)` + `Snapshot::apply` — инкрементальный/детерм. хвост, cursor-контракт | engine-dev | GW-I-3/GW-I-4/GW-I-8 GREEN |
+| 5 | ✅ | Сериализация `Snapshot`/`Frame` (JSON + postcard бинарь для тяжёлых серий) + `schema_version` | engine-dev | GW-I-5 GREEN; roundtrip |
 | 6 | ⏳ | (опц.) reference-WS-бинарь `gateway-serve` (tokio-tungstenite) — smoke, НЕ детерм-оракул | engine-dev | подключение → snapshot+push; транспорт-smoke |
 
 ## Гейты
