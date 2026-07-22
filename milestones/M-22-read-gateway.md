@@ -84,10 +84,13 @@ depth-series над `Trade`/`L2Snapshot`). **НЕ входит в M-22:** heatma
   телами (RED-bootstrap нового крейта — типовой контракт), `crates/gateway/Cargo.toml` (регистрация нового
   крейта — структурное решение, critic-гейт), запись `crates/gateway` в `members` root `Cargo.toml`,
   `scripts/verify_M-22.sh`.
-- **engine-dev (impl, зона расширена этим milestone'ом):** `crates/gateway/src/**` — тела
-  `snapshot/frames_since/replay` через `journal::stream` (bounded) + переиспользование M-17 редьюсеров
-  (`research-cli` reducer-функции как зависимость); (опц. task #6) reference-WS-бинарь. МОЖЕТ добавлять
-  СВОИ deps в `crates/gateway/Cargo.toml` (`[dependencies]`, shared-access правило scope-guard).
+- **engine-dev (impl) — BINDING carve-out:** этот milestone ЯВНО предоставляет engine-dev право записи в
+  `crates/gateway/src/**` + `crates/gateway/Cargo.toml` (`[dependencies]` — свои deps). Это НЕ выход за зону:
+  `crates/gateway` закреплён за engine-dev durable в `.claude/rules/scope-guard.md` (viz-backend Read Gateway,
+  Слой 8) — milestone и scope-guard согласованы. Задача: тела `snapshot/frames_since/replay/Snapshot::apply`
+  через `journal::stream` (bounded, стримовый fold — НЕ collect-then-reduce) + переиспользование M-17 редьюсеров
+  (`research-cli` как lib-зависимость); (опц. task #6) reference-WS-бинарь.
+  **База работы:** worktree на `origin/feat/M-22 @e504bfa` (НЕ origin/main — там нет crates/gateway/RED-набора).
 - **Forbidden (безусловно):** `crates/contracts` (T1), `crates/{risk,killswitch,oms,journal,recorder,venue-*}`
   (gateway их ЧИТАЕТ через public API, НЕ правит), `research-cli/src` (переиспользует как lib-зависимость, не
   меняет), `journal::read_all`/`Vec<Event>`-материализация в `gateway/src`, любой journal-writer/order-path.
