@@ -89,15 +89,15 @@ fn build() -> (tempfile::TempDir, Vec<u64>) {
     );
     // Порядок событий (seq = порядок). Индексы важны для выбора C.
     let events = vec![
-        l2(&both.0, &both.1, T0),                      // 0: книга B0
-        trade(65_000.0, 1.0, Side::Buy, T0 + 10),      // 1: сделка#1 в B0  <-- C режет ЗДЕСЬ
-        trade(65_000.0, 2.0, Side::Sell, T0 + 20),     // 2: сделка#2 в B0 (МНОЖЕСТВЕННОСТЬ, тот же бакет)
+        l2(&both.0, &both.1, T0),                  // 0: книга B0
+        trade(65_000.0, 1.0, Side::Buy, T0 + 10),  // 1: сделка#1 в B0  <-- C режет ЗДЕСЬ
+        trade(65_000.0, 2.0, Side::Sell, T0 + 20), // 2: сделка#2 в B0 (МНОЖЕСТВЕННОСТЬ, тот же бакет)
         // 3: АСИММЕТРИЯ — меняется ТОЛЬКО bid (ask те же уровни), бакет B1
         l2(&[(64_995.0, 9.0), (64_980.0, 2.0)], &both.1, T0 + 1_000),
-        trade(65_005.0, 1.5, Side::Buy, T0 + 1_010),   // 4: сделка в B1
-        l2(&both.0, &both.1, T0 + 2_000),              // 5: книга B2
-        trade(64_990.0, 0.5, Side::Sell, T0 + 2_030),  // 6: сделка в B2
-        l2(&both.0, &both.1, T0 + 3_000),              // 7: книга B3 (доп. события → ≥2 сегмента)
+        trade(65_005.0, 1.5, Side::Buy, T0 + 1_010), // 4: сделка в B1
+        l2(&both.0, &both.1, T0 + 2_000),            // 5: книга B2
+        trade(64_990.0, 0.5, Side::Sell, T0 + 2_030), // 6: сделка в B2
+        l2(&both.0, &both.1, T0 + 3_000),            // 7: книга B3 (доп. события → ≥2 сегмента)
     ];
     let mut seqs = Vec::new();
     {
@@ -133,11 +133,7 @@ fn fold(base: Snapshot, frames: &[Frame]) -> Snapshot {
 
 /// Клиентский памп: `frames_since` малыми батчами до сходимости курсора. Попутно проверяет
 /// курсор-контракт (GW-I-8): монотонность + прогресс + контигуальность кадров без дыр.
-fn drain_frames(
-    dir: &std::path::Path,
-    sel: &Selector,
-    from: Cursor,
-) -> (Vec<Frame>, Cursor) {
+fn drain_frames(dir: &std::path::Path, sel: &Selector, from: Cursor) -> (Vec<Frame>, Cursor) {
     let mut cur = from;
     let mut out: Vec<Frame> = Vec::new();
     loop {
@@ -147,7 +143,10 @@ fn drain_frames(
             assert_eq!(next, cur, "GW-I-8: пустой батч не должен двигать курсор");
             break;
         }
-        assert!(next >= cur, "GW-I-8: курсор frames_since не монотонен ({next:?} < {cur:?})");
+        assert!(
+            next >= cur,
+            "GW-I-8: курсор frames_since не монотонен ({next:?} < {cur:?})"
+        );
         assert_eq!(
             batch.first().unwrap().from,
             cur,
@@ -159,7 +158,10 @@ fn drain_frames(
             "GW-I-8: последний кадр батча обязан заканчиваться возвращённым курсором"
         );
         for w in batch.windows(2) {
-            assert_eq!(w[0].to, w[1].from, "GW-I-8: дыра между кадрами (from/to не контигуальны)");
+            assert_eq!(
+                w[0].to, w[1].from,
+                "GW-I-8: дыра между кадрами (from/to не контигуальны)"
+            );
         }
         out.extend(batch);
         assert!(next > cur, "GW-I-8: непустой батч обязан ПРОДВИНУТЬ курсор");
@@ -173,7 +175,10 @@ fn boundary_is_multi_segment() {
     // Предусловие фикстуры: окно РЕАЛЬНО пересекает границу сегмента (иначе «граница» не тестируется).
     let (dir, _seqs) = build();
     let n = journal::list_segments(dir.path()).expect("segments").len();
-    assert!(n >= 2, "фикстура обязана дать ≥2 сегмента (граница), а дала {n}");
+    assert!(
+        n >= 2,
+        "фикстура обязана дать ≥2 сегмента (граница), а дала {n}"
+    );
 }
 
 #[test]
@@ -212,8 +217,8 @@ fn mid_stream_snapshot_completeness_merges_same_bucket() {
 
     let full = gateway::snapshot(dir.path(), EpochFilter::OwnCaptureOnly, &s, Cursor::LATEST)
         .expect("snapshot full");
-    let base = gateway::snapshot(dir.path(), EpochFilter::OwnCaptureOnly, &s, c)
-        .expect("snapshot mid");
+    let base =
+        gateway::snapshot(dir.path(), EpochFilter::OwnCaptureOnly, &s, c).expect("snapshot mid");
     let (frames, end) = drain_frames(dir.path(), &s, c);
     let acc = fold(base, &frames);
     assert_eq!(
@@ -239,11 +244,18 @@ fn frames_since_respects_max_events_cap() {
     let last = *seqs.last().expect("seqs непуст");
     let k = 3usize;
 
-    let (batch, next) =
-        gateway::frames_since(dir.path(), EpochFilter::OwnCaptureOnly, &s, Cursor::START, k)
-            .expect("frames_since");
+    let (batch, next) = gateway::frames_since(
+        dir.path(),
+        EpochFilter::OwnCaptureOnly,
+        &s,
+        Cursor::START,
+        k,
+    )
+    .expect("frames_since");
     assert!(!batch.is_empty(), "непустой журнал → первый батч не пуст");
-    let next_seq = next.upto_seq.expect("курсор после непустого батча несёт seq");
+    let next_seq = next
+        .upto_seq
+        .expect("курсор после непустого батча несёт seq");
     let covered = next_seq - first + 1;
     assert!(
         covered <= k as u64,
@@ -274,7 +286,11 @@ fn cursor_and_frame_bounds_are_correct() {
     // snapshot(START) — пустая серия, курсор START.
     let empty = gateway::snapshot(dir.path(), EpochFilter::OwnCaptureOnly, &s, Cursor::START)
         .expect("snapshot start");
-    assert_eq!(empty.cursor, Cursor::START, "GW-I-8: snapshot(START).cursor == START");
+    assert_eq!(
+        empty.cursor,
+        Cursor::START,
+        "GW-I-8: snapshot(START).cursor == START"
+    );
     assert!(
         empty.series.ohlcv.is_empty()
             && empty.series.cumulative_delta.is_empty()
@@ -290,7 +306,11 @@ fn cursor_and_frame_bounds_are_correct() {
         Cursor::START,
         "GW-I-8: первый кадр с START обязан иметь from == START"
     );
-    assert_eq!(end, Cursor::at(last), "GW-I-8: дренаж обязан дойти до last_seq");
+    assert_eq!(
+        end,
+        Cursor::at(last),
+        "GW-I-8: дренаж обязан дойти до last_seq"
+    );
 }
 
 #[test]

@@ -129,10 +129,16 @@ fn gateway_snapshot_is_bounded_memory_and_size_independent() {
     );
 
     let s = sel();
-    let (snap_big, peak_big) =
-        peak_delta(|| gateway::snapshot(big.path(), EpochFilter::OwnCaptureOnly, &s, Cursor::LATEST));
+    let (snap_big, peak_big) = peak_delta(|| {
+        gateway::snapshot(big.path(), EpochFilter::OwnCaptureOnly, &s, Cursor::LATEST)
+    });
     let (snap_small, peak_small) = peak_delta(|| {
-        gateway::snapshot(small.path(), EpochFilter::OwnCaptureOnly, &s, Cursor::LATEST)
+        gateway::snapshot(
+            small.path(),
+            EpochFilter::OwnCaptureOnly,
+            &s,
+            Cursor::LATEST,
+        )
     });
     let snap_big = snap_big.expect("snapshot big");
     let snap_small = snap_small.expect("snapshot small");
@@ -172,10 +178,22 @@ fn gateway_snapshot_is_bounded_memory_and_size_independent() {
     let after_small = Cursor::at(last_seq(small.path()).saturating_sub(3));
 
     let (fr_big, peak_fr_big) = peak_delta(|| {
-        gateway::frames_since(big.path(), EpochFilter::OwnCaptureOnly, &s, after_big, usize::MAX)
+        gateway::frames_since(
+            big.path(),
+            EpochFilter::OwnCaptureOnly,
+            &s,
+            after_big,
+            usize::MAX,
+        )
     });
     let (fr_small, peak_fr_small) = peak_delta(|| {
-        gateway::frames_since(small.path(), EpochFilter::OwnCaptureOnly, &s, after_small, usize::MAX)
+        gateway::frames_since(
+            small.path(),
+            EpochFilter::OwnCaptureOnly,
+            &s,
+            after_small,
+            usize::MAX,
+        )
     });
     let _ = (fr_big.expect("frames big"), fr_small.expect("frames small"));
 

@@ -88,8 +88,14 @@ fn gateway_reads_do_not_mutate_journal() {
 
     let _ = gateway::snapshot(dir.path(), EpochFilter::OwnCaptureOnly, &s, Cursor::LATEST)
         .expect("snapshot");
-    let _ = gateway::frames_since(dir.path(), EpochFilter::OwnCaptureOnly, &s, Cursor::START, usize::MAX)
-        .expect("frames_since");
+    let _ = gateway::frames_since(
+        dir.path(),
+        EpochFilter::OwnCaptureOnly,
+        &s,
+        Cursor::START,
+        usize::MAX,
+    )
+    .expect("frames_since");
     let _ = gateway::replay(
         dir.path(),
         EpochFilter::OwnCaptureOnly,

@@ -61,8 +61,8 @@ fn build() -> tempfile::TempDir {
         j.flush().expect("flush vendor");
     }
     {
-        let mut j = Journal::open_with(dir.path(), cfg(DataSource::Synthetic, "synth-x"))
-            .expect("synth");
+        let mut j =
+            Journal::open_with(dir.path(), cfg(DataSource::Synthetic, "synth-x")).expect("synth");
         for _ in 0..5 {
             j.append(trade(1.0, Side::Sell, ts)).expect("append synth");
         }
@@ -123,8 +123,8 @@ fn epoch_filter_is_honored_own_differs_from_all() {
 
     let own = gateway::snapshot(dir.path(), EpochFilter::OwnCaptureOnly, &s, Cursor::LATEST)
         .expect("snapshot own");
-    let all = gateway::snapshot(dir.path(), EpochFilter::All, &s, Cursor::LATEST)
-        .expect("snapshot all");
+    let all =
+        gateway::snapshot(dir.path(), EpochFilter::All, &s, Cursor::LATEST).expect("snapshot all");
 
     // OwnCaptureOnly = только 10 покупок → CVD строго положителен.
     assert!(
@@ -158,8 +158,15 @@ fn explicit_epoch_selection_is_distinct_from_both_own_and_all() {
 
     // Точные значения (10 BUY / 10 SELL / 5 SELL, size=1e8): own=+10, own+vendor=0, all=−5.
     let unit = to_fixed(1.0);
-    assert_eq!(own, 10 * unit, "OwnCaptureOnly CVD обязан быть ровно +10 (10 покупок)");
-    assert_eq!(own_vendor, 0, "Explicit([own,vendor]) CVD обязан быть ровно 0 (+10 −10)");
+    assert_eq!(
+        own,
+        10 * unit,
+        "OwnCaptureOnly CVD обязан быть ровно +10 (10 покупок)"
+    );
+    assert_eq!(
+        own_vendor, 0,
+        "Explicit([own,vendor]) CVD обязан быть ровно 0 (+10 −10)"
+    );
     assert_eq!(all, -5 * unit, "All CVD обязан быть ровно −5 (+10 −10 −5)");
     assert!(
         own_vendor != own,
@@ -199,8 +206,14 @@ fn replay_honors_epoch_filter() {
         Cursor::LATEST,
     )
     .expect("replay own");
-    let rp_all = gateway::replay(dir.path(), EpochFilter::All, &s, Cursor::START, Cursor::LATEST)
-        .expect("replay all");
+    let rp_all = gateway::replay(
+        dir.path(),
+        EpochFilter::All,
+        &s,
+        Cursor::START,
+        Cursor::LATEST,
+    )
+    .expect("replay all");
     assert!(
         json(&rp_own) != json(&rp_all),
         "replay ИГНОРИРУЕТ EpochFilter: own-кадры == all-кадры (эпохи смешаны молча)"

@@ -81,8 +81,13 @@ fn sel() -> Selector {
 #[test]
 fn snapshot_carries_schema_version_and_is_v1_additive() {
     let dir = build();
-    let snap = gateway::snapshot(dir.path(), EpochFilter::OwnCaptureOnly, &sel(), Cursor::LATEST)
-        .expect("snapshot");
+    let snap = gateway::snapshot(
+        dir.path(),
+        EpochFilter::OwnCaptureOnly,
+        &sel(),
+        Cursor::LATEST,
+    )
+    .expect("snapshot");
 
     // GW-I-5: версия проставлена и равна константе gateway.
     assert_eq!(
@@ -103,8 +108,13 @@ fn snapshot_carries_schema_version_and_is_v1_additive() {
 #[test]
 fn deep_band_carries_provenance() {
     let dir = build();
-    let snap = gateway::snapshot(dir.path(), EpochFilter::OwnCaptureOnly, &sel(), Cursor::LATEST)
-        .expect("snapshot");
+    let snap = gateway::snapshot(
+        dir.path(),
+        EpochFilter::OwnCaptureOnly,
+        &sel(),
+        Cursor::LATEST,
+    )
+    .expect("snapshot");
 
     let deep_e8 = (0.03_f64 * 1e8) as i64;
     let mut saw_deep = false;
