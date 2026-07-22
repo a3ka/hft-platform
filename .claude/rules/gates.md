@@ -160,6 +160,11 @@ Push — НЕ конец цикла. Агент, сделавший push (review
    событий по мере возможности.
 3. **Пруф в close-out**: сырые строки `gh run list` (success) + вывод ssh-проверки —
    в Done Block / §C close-out отчёта. «Запушил и ушёл» = нарушение гейта.
+4. **Worktree-GC в close-out**: после merge feat→main reviewer ЗАПУСКАЕТ
+   `bash scripts/gc_worktrees.sh` — снимает отработавшие worktree'ы смерженного милстоуна
+   (безопасно: только чистые+запушенные+смерженные; активные не трогаются). Вывод — в close-out.
+   «Создал worktree и ушёл, оставив 3.5 GB» = незакрытие цикла, как «запушил и ушёл»
+   (`.claude/rules/branch-hygiene.md` §Worktree lifecycle).
 
 Rollback в `deploy.yml` — страховка, не оправдание: он ловит падение healthcheck,
 но не тихую деградацию (контейнер жив, данные испорчены). Глаза обязательны.

@@ -58,6 +58,31 @@ TD-014» (2026-07-12), «reviewer переключил общий чекаут �
    это артефакты гейтов и аудит-трейл. Если `git status` показывает их удаление — СТОП, ты не на
    своей ветке. (Механический барьер — pre-commit/CI-проверка — вынесен на doc-гейт: `C-006` re-audit.)
 
+## Worktree lifecycle — рекультивация обязательна (закреплено 2026-07-17, ENFORCED 2026-07-22)
+
+Дисковая протечка повторилась: **61 worktree × ~3.5 GB `target/` ≈ 190 GB** в `/tmp` при том, что
+исходник каждого — пара мегабайт. Корень процессный: правило «создай worktree на роль/задачу» (выше)
+кодифицировано, а «освободи после» — было записано (2026-07-17) но **не смержено и без enforcement'а** →
+мёртвая буква. `git worktree` шарит `.git`, но **не `target/`** — каждый worktree компилирует свой multi-GB
+кэш при первом гейте, и никто его не сносит. Фикс на этот раз: правило + **скрипт** + **гейт** (иначе не держится).
+
+**Правила:**
+1. **`target/` worktree — эфемерный кэш, не работа.** Регенерируется `cargo`; исходник и `.git` целы при сносе.
+2. **Enforcement — `scripts/gc_worktrees.sh`** (безопасен по конструкции): удаляет worktree ТОЛЬКО если
+   ВСЕ три: (а) чистый (`git status --porcelain` пусто); (б) нет только-локальных коммитов
+   (`git rev-list HEAD --not --remotes` == 0); (в) HEAD целиком на `origin/main` (смержен). Никогда `--force`,
+   никогда `rm -rf` вслепую; активные (dirty/unpushed/не-смерженные feat) НЕ трогаются. `--dry-run` — превью.
+3. **Reviewer в close-out (после merge feat→main)** ЗАПУСКАЕТ `bash scripts/gc_worktrees.sh` — часть close-out,
+   как обновление `PROJECT-STATE.md` (`gates.md` §8). Это снимает worktree'ы только что смерженного милстоуна.
+4. **Периодический GC (architect/reviewer)** — тот же скрипт в любой момент; безопасно идемпотентен.
+5. **Ручной снос dirty/unpushed — только с сохранением.** Если нужно снести НЕ прошедший gc-скрипт worktree
+   (реальные правки/незапушенные коммиты): сперва `git diff HEAD > /tmp/salvage-<name>.patch` (или
+   `git push origin HEAD:<branch>`), лишь потом `git worktree remove --force`. Молчаливый снос = потеря работы
+   (тот же класс, что «незапушенный коммит уехал»). Скрипт этого НЕ делает — только человек с явным решением.
+6. **Владелец GC — reviewer (close-out) + architect (периодический).** «Создал worktree и ушёл, оставив 3.5 GB» —
+   такое же незакрытие цикла, как «запушил и ушёл» (`gates.md` §8).
+
 ## Cross-references
-- `.claude/rules/gates.md` §8 (push-scope, RED не живёт на main, intra-chain push)
+- `.claude/rules/gates.md` §8 (push-scope, RED не живёт на main, intra-chain push, **close-out GC**)
 - `.claude/rules/handoff-block.md` (§D push-статус)
+- `scripts/gc_worktrees.sh` (безопасная рекультивация worktree'ов)
