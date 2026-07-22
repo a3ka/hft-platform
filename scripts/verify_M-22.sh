@@ -13,7 +13,7 @@ check() { # check "<name>" <exit-of-last-cmd>
 
 # --- Task #1/#3/#4/#5: RED-набор GW-I-1..6 зелён (компилируется + проходит) ---
 cargo test -p gateway --tests 2>&1 | tail -30
-check "GW-I-1..6 tests (cargo test -p gateway)" "${PIPESTATUS[0]}"
+check "GW-I-1..8 tests (cargo test -p gateway)" "${PIPESTATUS[0]}"
 
 # --- Task #2: clippy-гейт (весь workspace, все таргеты, без варнингов) ---
 cargo clippy --workspace --all-targets -- -D warnings 2>&1 | tail -15

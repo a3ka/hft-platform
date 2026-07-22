@@ -148,14 +148,19 @@ fn explicit_epoch_selection_is_distinct_from_both_own_and_all() {
     // иначе impl мог бы схлопнуть Explicit в один из них молча.
     let dir = build();
     let s = sel();
-    let own = cvd_snapshot(dir.path(), EpochFilter::OwnCaptureOnly, &s); // +10
-    let all = cvd_snapshot(dir.path(), EpochFilter::All, &s); // +10 −10 −5 = −5
+    let own = cvd_snapshot(dir.path(), EpochFilter::OwnCaptureOnly, &s);
+    let all = cvd_snapshot(dir.path(), EpochFilter::All, &s);
     let own_vendor = cvd_snapshot(
         dir.path(),
         EpochFilter::Explicit(vec!["own-2026-07".to_string(), "vendor-2024".to_string()]),
         &s,
-    ); // +10 −10 = 0
+    );
 
+    // Точные значения (10 BUY / 10 SELL / 5 SELL, size=1e8): own=+10, own+vendor=0, all=−5.
+    let unit = to_fixed(1.0);
+    assert_eq!(own, 10 * unit, "OwnCaptureOnly CVD обязан быть ровно +10 (10 покупок)");
+    assert_eq!(own_vendor, 0, "Explicit([own,vendor]) CVD обязан быть ровно 0 (+10 −10)");
+    assert_eq!(all, -5 * unit, "All CVD обязан быть ровно −5 (+10 −10 −5)");
     assert!(
         own_vendor != own,
         "Explicit([own,vendor]) обязан отличаться от OwnCaptureOnly (vendor учтён): {own_vendor} == {own}"

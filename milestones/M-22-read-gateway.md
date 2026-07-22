@@ -1,8 +1,9 @@
 # M-22 — Read Gateway (snapshot + live-push + replay) — enabling-инфра кокпита
 
-STATUS: **PROPOSED — re-spin r2** (2026-07-22, architect; после critic C-022 REJECT). Пивот P-COCKPIT,
-Трек B (MVP-1), критический путь. r2 закрывает C-022: B1 (GW-I-7 EpochFilter-оракул + канарейка по коду),
-B2 (GW-I-8 cursor/frame-bounds), B3 (GW-I-2 расширен на frames_since; `max_events`-кап).
+STATUS: **APPROVED (RED-набор) — re-spin r3, critic C-022 PASS** (2026-07-22, architect). Пивот P-COCKPIT,
+Трек B (MVP-1), критический путь. Готов к impl (engine-dev tasks 3-5). Эволюция оракулов по C-022:
+r2 — GW-I-7 (EpochFilter) + GW-I-8 (cursor-bounds) + GW-I-2 (frames_since bounded); r3 — EpochFilter на
+frames_since/replay (не только snapshot), Explicit≠All, реальный `max_events`-кап-ассерт.
 Doc-гейт §9 Class A: **новый крейт `crates/gateway`** ⇒ critic ОБЯЗАТЕЛЕН (`gates.md` §1.4) на
 milestone+RED+verify ДО dispatch dev'а. Источники: `docs/07-cockpit-backend-roadmap.md` §5 (D1/D4),
 `docs/fa/viz-backend.md` §3 (подсистема B) + §5 (VB-I-1..8), `research/exports/format.md` (export v1),
