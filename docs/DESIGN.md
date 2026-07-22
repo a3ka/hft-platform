@@ -93,7 +93,14 @@ risk-critic → **подпись founder'а** → перекалиброванн
 Слой 5  risk,killswitch pre-trade gate (fail-closed) + PnL/позиции/recon + аудит; отдельный KS-процесс
 Слой 6  sim,runner     симулятор исполнения; композиция режимов + arming
 Слой 7  research-cli,ops грид/walk-forward/отчёты; метрики/алерты/recon-с-биржей/бэкап (FA: docs/fa/ops.md)
+Слой 8  viz-backend    дериватив-слой (heatmap/footprint/CVD/VP/VWAP/TPP) + Read Gateway (WS live+replay) + export v2 (FA: docs/fa/viz-backend.md)
+Слой 9  ai-copilot     AI-наставник real-time (Event Engine + AI-Context + LLM-сервис + audit), ВНЕ детерминизма (FA: docs/fa/ai-copilot.md)
 ```
+
+**Слои 8-9 (пивот 2026-07-22, `docs/07-cockpit-backend-roadmap.md`)** — read-only консюмеры журнала
+(Граница A): виз-бэкенд и AI-копилот СТОЯТ ПОВЕРХ даталеера (`06`), не пишут journal, T1-ядро не трогают.
+Слой 8 детерминирован (live==replay); слой 9 ВНЕ детерминизма (LLM недетерминирован → его выводы вне
+journal, `DET-I-1` цел).
 
 Полный список крейтов — `01 §2`. Правило доступа агентов — `03 §4`.
 
@@ -234,6 +241,14 @@ mean-reversion. Первая гипотеза `H-20260710-obi-asym` обкаты
 | **P3 Risk+OMS** | gate, killswitch, oms; торговля на **HL testnet** | RED-suite RK-I-1..10 + INTG-I-* GREEN (падали на заглушках); 48ч testnet-MM чисто; disconnect-drill: заявок нет | — |
 | **P4 Live-micro** | 1 пара, профиль лимитов §4 ($500–2k), 2–4 недели | recon mismatch = 0; каждый цент PnL объясняется реплеем; sim-vs-live в допуске | ★★ (paper→live; вес сигнала) |
 | **P5 Scale** | Binance-адаптер + lead-lag №3; рабочие лимиты; квант-деск на полном цикле; корреляции/portfolio | по отдельному плану | ★ |
+| **P-COCKPIT Виз-бэкенд + AI** ⟵ *ПИВОТ 2026-07-22 (`docs/07`)* | Слои 8-9: heatmap/footprint/CVD/VP/VWAP/TPP + Read Gateway (WS) + AI-копилот; фронт — founder (`code2alpha`) | MVP-1 (heatmap/bubbles/COB/VP/CVD/VWAP на BTCUSDT) отдаёт данные фронту через WS; live==replay; TPP COIN с data-quality caveat; AI-Context+audit | ★ (приём фазы) |
+
+**ПИВОТ P-COCKPIT (амендмент 2026-07-22).** Founder перенаправил ближний фокус: **не торговый стек, а
+ДАННЫЕ + виз-бэкенд + AI-копилот** для Bookmap-подобного кокпита (Order Flow Intelligence Terminal) на
+Binance+HL; фронт — founder'а (`code2alpha`), мы даём бэкенд+экспорт. **P3 (risk/oms), P4 (live), сигналы
+(M-10 стек) — ОТЛОЖЕНЫ** до готовности данных/кокпита. Полный контекст, решения и milestone-порядок —
+`docs/07-cockpit-backend-roadmap.md`; FA — `docs/fa/{viz-backend,ai-copilot}.md`. Инвариант «LLM не в
+горячем цикле» сохранён (слой 9 вне детерминизма).
 
 Квант-деск (§7) работает параллельно с P0–P2 на записанных данных; первые подписи
 founder'а — на воротах P2 и P4.
