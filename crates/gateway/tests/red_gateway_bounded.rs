@@ -156,4 +156,39 @@ fn gateway_snapshot_is_bounded_memory_and_size_independent() {
         growth < INDEP_DELTA,
         "память snapshot РАСТЁТ с размером журнала (16→64 MiB: +{growth} B) — не O(1)"
     );
+
+    // === B3: frames_since (live-tail) ТОЖЕ bounded ===
+    // «Пропуск к курсору» near-tail: корректный impl СТРИМИТ и пропускает seq<=after (O(1) память);
+    // наивный `stream.collect::<Vec<Event>>().filter(...)` материализует историю → O(журнала).
+    // Выход мал (≈3 события после курсора) → замер изолирует память ПРОПУСКА, а не выхода.
+    let last_seq = |dir: &std::path::Path| -> u64 {
+        journal::stream(dir, EpochFilter::OwnCaptureOnly)
+            .expect("stream")
+            .map(|e| e.expect("ev").seq)
+            .last()
+            .expect("журнал непуст")
+    };
+    let after_big = Cursor::at(last_seq(big.path()).saturating_sub(3));
+    let after_small = Cursor::at(last_seq(small.path()).saturating_sub(3));
+
+    let (fr_big, peak_fr_big) = peak_delta(|| {
+        gateway::frames_since(big.path(), EpochFilter::OwnCaptureOnly, &s, after_big, usize::MAX)
+    });
+    let (fr_small, peak_fr_small) = peak_delta(|| {
+        gateway::frames_since(small.path(), EpochFilter::OwnCaptureOnly, &s, after_small, usize::MAX)
+    });
+    let _ = (fr_big.expect("frames big"), fr_small.expect("frames small"));
+
+    // Абсолютный бюджет — ловит материализацию истории при пропуске к курсору.
+    assert!(
+        peak_fr_big < THRESHOLD,
+        "frames_since выделил {peak_fr_big} B (> {THRESHOLD}) — «пропуск к курсору» \
+         материализует историю в Vec<Event>, а не стримит (C-022 B3 / TD-011)"
+    );
+    // O(1) по размеру журнала.
+    let fr_growth = peak_fr_big.saturating_sub(peak_fr_small);
+    assert!(
+        fr_growth < INDEP_DELTA,
+        "память frames_since РАСТЁТ с журналом (16→64 MiB: +{fr_growth} B) — пропуск к курсору не O(1)"
+    );
 }

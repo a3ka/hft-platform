@@ -143,15 +143,22 @@ pub fn snapshot(
     unimplemented!("M-22 task #3 (engine-dev): bounded journal::stream reduce → Snapshot")
 }
 
-/// Кадры за событиями `seq > after`, свёрнутые тем же редьюсером; возвращает новый курсор
-/// (последний свёрнутый `seq`). Bounded-memory (GW-I-2). engine-dev (M-22 task #4).
+/// Кадры за событиями `seq > after` (batched, ≤ `max_events` событий за вызов), свёрнутые тем же
+/// редьюсером; возвращает НОВЫЙ курсор (последний свёрнутый `seq`, либо `after` если новых нет).
+///
+/// **Bounded-memory (GW-I-2):** «пропуск» к `after` идёт СТРИМОМ (`journal::stream`), БЕЗ
+/// материализации истории в `Vec<Event>` — память O(1) по размеру журнала, не по `after`.
+/// `max_events` кап делает выход ограниченным → клиент пампит вызовами до сходимости курсора
+/// (live-push). **Курсор-контракт (GW-I-8):** первый кадр `.from == after`; кадры контигуальны
+/// (`f[i].to == f[i+1].from`); последний `.to == возвращённый курсор`. engine-dev (M-22 task #4).
 pub fn frames_since(
     dir: impl AsRef<Path>,
     filter: EpochFilter,
     sel: &Selector,
     after: Cursor,
+    max_events: usize,
 ) -> io::Result<(Vec<Frame>, Cursor)> {
-    let _ = (dir.as_ref(), filter, sel, after);
+    let _ = (dir.as_ref(), filter, sel, after, max_events);
     unimplemented!("M-22 task #4 (engine-dev): bounded journal::stream tail → frames + new cursor")
 }
 

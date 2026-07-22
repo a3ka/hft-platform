@@ -131,6 +131,43 @@ fn fold(base: Snapshot, frames: &[Frame]) -> Snapshot {
     acc
 }
 
+/// Клиентский памп: `frames_since` малыми батчами до сходимости курсора. Попутно проверяет
+/// курсор-контракт (GW-I-8): монотонность + прогресс + контигуальность кадров без дыр.
+fn drain_frames(
+    dir: &std::path::Path,
+    sel: &Selector,
+    from: Cursor,
+) -> (Vec<Frame>, Cursor) {
+    let mut cur = from;
+    let mut out: Vec<Frame> = Vec::new();
+    loop {
+        let (batch, next) = gateway::frames_since(dir, EpochFilter::OwnCaptureOnly, sel, cur, 3)
+            .expect("frames_since");
+        if batch.is_empty() {
+            assert_eq!(next, cur, "GW-I-8: пустой батч не должен двигать курсор");
+            break;
+        }
+        assert!(next >= cur, "GW-I-8: курсор frames_since не монотонен ({next:?} < {cur:?})");
+        assert_eq!(
+            batch.first().unwrap().from,
+            cur,
+            "GW-I-8: первый кадр батча обязан стартовать с текущего курсора"
+        );
+        assert_eq!(
+            batch.last().unwrap().to,
+            next,
+            "GW-I-8: последний кадр батча обязан заканчиваться возвращённым курсором"
+        );
+        for w in batch.windows(2) {
+            assert_eq!(w[0].to, w[1].from, "GW-I-8: дыра между кадрами (from/to не контигуальны)");
+        }
+        out.extend(batch);
+        assert!(next > cur, "GW-I-8: непустой батч обязан ПРОДВИНУТЬ курсор");
+        cur = next;
+    }
+    (out, cur)
+}
+
 #[test]
 fn boundary_is_multi_segment() {
     // Предусловие фикстуры: окно РЕАЛЬНО пересекает границу сегмента (иначе «граница» не тестируется).
@@ -177,14 +214,56 @@ fn mid_stream_snapshot_completeness_merges_same_bucket() {
         .expect("snapshot full");
     let base = gateway::snapshot(dir.path(), EpochFilter::OwnCaptureOnly, &s, c)
         .expect("snapshot mid");
-    let (frames, _end) =
-        gateway::frames_since(dir.path(), EpochFilter::OwnCaptureOnly, &s, c).expect("frames_since");
+    let (frames, end) = drain_frames(dir.path(), &s, c);
     let acc = fold(base, &frames);
     assert_eq!(
         json(&acc.series),
         json(&full.series),
         "GW-I-4: snapshot(C)+frames(C..) обязан == полной свёртке (merge бакета, не дубль)"
     );
+    // Пампленный курсор обязан дойти до хвоста и совпасть с курсором полного snapshot (GW-I-8).
+    assert_eq!(
+        end, full.cursor,
+        "GW-I-8: курсор после памп-дренажа обязан совпасть с cursor полного snapshot"
+    );
+}
+
+#[test]
+fn cursor_and_frame_bounds_are_correct() {
+    // GW-I-8: cursor-контракт snapshot + frames_since (C-022 B2).
+    let (dir, seqs) = build();
+    let s = sel();
+    let last = *seqs.last().expect("seqs непуст");
+
+    // snapshot(LATEST).cursor отражает реальный хвост.
+    let full = gateway::snapshot(dir.path(), EpochFilter::OwnCaptureOnly, &s, Cursor::LATEST)
+        .expect("snapshot full");
+    assert_eq!(
+        full.cursor,
+        Cursor::at(last),
+        "GW-I-8: snapshot(LATEST).cursor обязан == Cursor::at(last_seq)"
+    );
+
+    // snapshot(START) — пустая серия, курсор START.
+    let empty = gateway::snapshot(dir.path(), EpochFilter::OwnCaptureOnly, &s, Cursor::START)
+        .expect("snapshot start");
+    assert_eq!(empty.cursor, Cursor::START, "GW-I-8: snapshot(START).cursor == START");
+    assert!(
+        empty.series.ohlcv.is_empty()
+            && empty.series.cumulative_delta.is_empty()
+            && empty.series.depth_series.is_empty(),
+        "GW-I-8: snapshot(START) обязан дать ПУСТУЮ серию (ничего не свёрнуто)"
+    );
+
+    // Полный дренаж с нуля: контигуальность/монотонность проверяет drain_frames; курсор → last.
+    let (frames, end) = drain_frames(dir.path(), &s, Cursor::START);
+    assert!(!frames.is_empty(), "дренаж с START обязан вернуть кадры");
+    assert_eq!(
+        frames.first().unwrap().from,
+        Cursor::START,
+        "GW-I-8: первый кадр с START обязан иметь from == START"
+    );
+    assert_eq!(end, Cursor::at(last), "GW-I-8: дренаж обязан дойти до last_seq");
 }
 
 #[test]
