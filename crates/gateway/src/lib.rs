@@ -119,6 +119,17 @@ pub struct Frame {
     pub delta: SeriesBundle,
 }
 
+impl Frame {
+    fn versioned(from: Cursor, to: Cursor, delta: SeriesBundle) -> Self {
+        Self {
+            schema_version: GATEWAY_SCHEMA_VERSION,
+            from,
+            to,
+            delta,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct OhlcvAcc {
     open: i64,
@@ -466,15 +477,7 @@ pub fn frames_since(
     if consumed == 0 {
         return Ok((Vec::new(), after));
     }
-    Ok((
-        vec![Frame {
-            schema_version: GATEWAY_SCHEMA_VERSION,
-            from: after,
-            to: cursor,
-            delta,
-        }],
-        cursor,
-    ))
+    Ok((vec![Frame::versioned(after, cursor, delta)], cursor))
 }
 
 /// Детерминированный replay окна `(from .. to]` тем же редьюсером, что live (VB-I-2/GW-I-3).
@@ -491,10 +494,5 @@ pub fn replay(
     if consumed == 0 {
         return Ok(Vec::new());
     }
-    Ok(vec![Frame {
-        schema_version: GATEWAY_SCHEMA_VERSION,
-        from,
-        to: cursor,
-        delta,
-    }])
+    Ok(vec![Frame::versioned(from, cursor, delta)])
 }
