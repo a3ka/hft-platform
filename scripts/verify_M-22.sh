@@ -11,7 +11,12 @@ check() { # check "<name>" <exit-of-last-cmd>
   if [ "$2" -eq 0 ]; then note "PASS $1"; else note "FAIL $1"; FAIL=$((FAIL+1)); fi
 }
 
-# --- Task #1/#3/#4/#5: RED-набор GW-I-1..6 зелён (компилируется + проходит) ---
+# --- fmt-гейт (RN-8): МАТЧИТ CI (ci.yml build-test: cargo fmt --all -- --check) ---
+# Без этого acceptance даёт false-green при красном CI fmt-gate (инцидент reviewer B2, M-22).
+cargo fmt --all -- --check 2>&1 | tail -10
+check "cargo fmt --all -- --check (matches CI fmt-gate)" "${PIPESTATUS[0]}"
+
+# --- Task #1/#3/#4/#5: RED-набор GW-I-1..8 зелён (компилируется + проходит) ---
 cargo test -p gateway --tests 2>&1 | tail -30
 check "GW-I-1..8 tests (cargo test -p gateway)" "${PIPESTATUS[0]}"
 
