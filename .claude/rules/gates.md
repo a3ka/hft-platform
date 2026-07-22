@@ -44,6 +44,13 @@ reviewer — бэкстоп на PR-time (гейт 4 ниже всё равно 
 - `set -euo pipefail` ИЛИ явный агрегатор с FAIL-счётчиком + `exit 1` при FAIL>0.
 - **Никакого** `cmd && echo PASS || echo FAIL` (маскирует провал).
 - Минимум 1 проверка на задачу из §Tasks milestone'а.
+- **verify ⊇ терминальные CI-гейты (RN-17, durable — 3-й повтор класса).** Acceptance-скрипт ОБЯЗАН
+  гонять те же терминальные проверки, что `ci.yml`, ТЕМИ ЖЕ командами — иначе verify PASS при красном CI =
+  **false-green**: у dev «зелёно», а merge краснит `main` и блокирует §8. Минимум:
+  - `cargo fmt --all -- --check` (fmt-гейт, матчит `ci.yml` build-test);
+  - `cargo clippy --workspace --all-targets -- -D warnings` (clippy-гейт, матчит CI).
+  Повторы класса: RN-8/M-05 (fmt), clippy-gap/M-18, fmt/M-22 (18 fmt-диффов в sacred RED-тестах прошли
+  verify PASS — поймал только reviewer/CI). Правило точечно не держится → стандартное требование ко ВСЕМ verify.
 - Финальная строка `VERDICT: PASS`/`VERDICT: FAIL`; exit-код соответствует.
 - Явный список исключений (T2/T3 типы вне зоны проверки) с комментарием-обоснованием.
 
@@ -160,6 +167,11 @@ Push — НЕ конец цикла. Агент, сделавший push (review
    событий по мере возможности.
 3. **Пруф в close-out**: сырые строки `gh run list` (success) + вывод ssh-проверки —
    в Done Block / §C close-out отчёта. «Запушил и ушёл» = нарушение гейта.
+4. **Worktree-GC в close-out**: после merge feat→main reviewer ЗАПУСКАЕТ
+   `bash scripts/gc_worktrees.sh` — снимает отработавшие worktree'ы смерженного милстоуна
+   (безопасно: только чистые+запушенные+смерженные; активные не трогаются). Вывод — в close-out.
+   «Создал worktree и ушёл, оставив 3.5 GB» = незакрытие цикла, как «запушил и ушёл»
+   (`.claude/rules/branch-hygiene.md` §Worktree lifecycle).
 
 Rollback в `deploy.yml` — страховка, не оправдание: он ловит падение healthcheck,
 но не тихую деградацию (контейнер жив, данные испорчены). Глаза обязательны.
