@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 /// Версия экспорт-формы gateway. **Аддитивно** поверх `research-cli::EXPORT_SCHEMA_VERSION = 1`
 /// (VB-I-4/GW-I-5): новые серии (M-23+) добавляют поля, не переопределяют старые; форма меняется
 /// ТОЛЬКО с bump этой константы. T-designate (не T1, не `crates/contracts`).
-pub const GATEWAY_SCHEMA_VERSION: u32 = 2;
+pub const GATEWAY_SCHEMA_VERSION: u32 = 3;
 
 /// Canonical UTC-day session anchor shared by session-cumulative indicators (VB-I-6).
 pub const fn utc_session_id(ts_exch_ms: i64) -> i64 {
@@ -485,6 +485,10 @@ impl Snapshot {
                 self.series.depth_series.push(incoming.clone());
             }
         }
+
+        let mut vwap: BTreeMap<i64, i64> = self.series.vwap.drain(..).collect();
+        vwap.extend(frame.delta.vwap.iter().copied());
+        self.series.vwap = vwap.into_iter().collect();
 
         self.cursor = frame.to;
     }
