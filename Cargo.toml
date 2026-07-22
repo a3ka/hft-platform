@@ -16,6 +16,7 @@ members = [
   "crates/strategy",
   "crates/sim",
   "crates/research-cli",
+  "crates/gateway",
 ]
 
 # M-00 bootstrap: минимальный работающий скелет (recorder-заглушка + contracts).

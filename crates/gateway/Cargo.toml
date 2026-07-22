@@ -1,0 +1,23 @@
+[package]
+name = "gateway"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+
+# Слой 8 (viz-backend), подсистема B — Read Gateway (docs/fa/viz-backend.md §3).
+# READ-ONLY консюмер журнала (Граница A, VB-I-3): snapshot + cursor-frames + replay
+# над bounded `journal::stream` (C-021 NOTE-2 — НЕТ `read_all`/`Vec<Event>` в src).
+# Транспорт (WS) — тонкая оболочка вне детерминированного ядра (M-22 §Design).
+#
+# Скелет (architect): T-designate контракт-типы + сигнатуры (`unimplemented!()`).
+# Тела `snapshot/frames_since/replay/Snapshot::apply` — engine-dev (M-22 tasks 3-5),
+# он же добавляет СВОИ impl-deps (book/research-cli/postcard) в [dependencies].
+
+[dependencies]
+contracts = { path = "../contracts" }
+journal = { path = "../journal" }
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3"
+serde_json = "1"
