@@ -12,10 +12,11 @@
 //! ОБЯЗАН строить на `journal::stream(dir, EpochFilter)` (bounded); `journal::read_all`/
 //! материализация `Vec<Event>` в этом крейте ЗАПРЕЩЕНЫ (C-021 NOTE-2; GW-I-2).
 
+use std::collections::BTreeMap;
 use std::io;
 use std::path::Path;
 
-use contracts::Venue;
+use contracts::{Event, EventKind, Level, MdPayload, Side, Venue};
 use journal::EpochFilter;
 use serde::{Deserialize, Serialize};
 
@@ -118,6 +119,238 @@ pub struct Frame {
     pub delta: SeriesBundle,
 }
 
+#[derive(Clone, Copy)]
+struct OhlcvAcc {
+    open: i64,
+    high: i64,
+    low: i64,
+    close: i64,
+    volume: i64,
+}
+
+impl OhlcvAcc {
+    fn new(price: i64, size: i64) -> Self {
+        Self {
+            open: price,
+            high: price,
+            low: price,
+            close: price,
+            volume: size,
+        }
+    }
+
+    fn update(&mut self, price: i64, size: i64) {
+        self.high = self.high.max(price);
+        self.low = self.low.min(price);
+        self.close = price;
+        self.volume += size;
+    }
+}
+
+struct DepthAcc {
+    side: Side,
+    band: f64,
+    band_pct_e8: i64,
+    values: BTreeMap<i64, i64>,
+}
+
+/// Incremental form of the M-17 reducers. State grows only with the emitted time buckets,
+/// never with the number of journal events.
+struct Reducer {
+    selector: Selector,
+    ohlcv: BTreeMap<i64, OhlcvAcc>,
+    bucket_delta: BTreeMap<i64, i64>,
+    depth: Vec<DepthAcc>,
+}
+
+impl Reducer {
+    fn new(selector: &Selector) -> Self {
+        Self {
+            selector: selector.clone(),
+            ohlcv: BTreeMap::new(),
+            bucket_delta: BTreeMap::new(),
+            depth: Vec::new(),
+        }
+    }
+
+    fn bucket_time_s(&self, ts_ms: i64) -> Option<i64> {
+        let timeframe_ms = self.selector.timeframe_ms;
+        if timeframe_ms <= 0 {
+            return None;
+        }
+        let bucket = ts_ms.div_euclid(timeframe_ms);
+        Some(bucket.checked_mul(timeframe_ms).map_or(0, |ms| ms / 1_000))
+    }
+
+    fn apply(&mut self, event: &Event) {
+        let EventKind::Md(md) = &event.kind else {
+            return;
+        };
+        if md.venue != self.selector.venue || md.symbol != self.selector.symbol {
+            return;
+        }
+
+        match &md.payload {
+            MdPayload::Trade {
+                price,
+                size,
+                side,
+                ts_exch_ms,
+            } => {
+                let Some(time_s) = self.bucket_time_s(*ts_exch_ms) else {
+                    return;
+                };
+                self.ohlcv
+                    .entry(time_s)
+                    .and_modify(|bar| bar.update(*price, *size))
+                    .or_insert_with(|| OhlcvAcc::new(*price, *size));
+                let signed_size = match side {
+                    Side::Buy => *size,
+                    Side::Sell => -*size,
+                };
+                *self.bucket_delta.entry(time_s).or_default() += signed_size;
+            }
+            MdPayload::L2Snapshot {
+                bids,
+                asks,
+                ts_exch_ms,
+            } => {
+                let Some(time_s) = self.bucket_time_s(*ts_exch_ms) else {
+                    return;
+                };
+                if self.depth.is_empty() {
+                    for &band in &self.selector.bands {
+                        for side in [Side::Buy, Side::Sell] {
+                            self.depth.push(DepthAcc {
+                                side,
+                                band,
+                                band_pct_e8: (band * 1e8).round() as i64,
+                                values: BTreeMap::new(),
+                            });
+                        }
+                    }
+                }
+                for row in &mut self.depth {
+                    row.values
+                        .insert(time_s, depth_within(bids, asks, row.side, row.band));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn finish(self) -> SeriesBundle {
+        let ohlcv = self
+            .ohlcv
+            .into_iter()
+            .map(|(time_s, bar)| OhlcvRow {
+                time_s,
+                open: bar.open,
+                high: bar.high,
+                low: bar.low,
+                close: bar.close,
+                volume: bar.volume,
+            })
+            .collect();
+
+        let mut running = 0_i64;
+        let cumulative_delta = self
+            .bucket_delta
+            .into_iter()
+            .map(|(time_s, delta)| {
+                running += delta;
+                (time_s, running)
+            })
+            .collect();
+
+        let depth_series = self
+            .depth
+            .into_iter()
+            .map(|row| DepthRow {
+                side: match row.side {
+                    Side::Buy => "bid",
+                    Side::Sell => "ask",
+                }
+                .to_string(),
+                band_pct_e8: row.band_pct_e8,
+                series: row.values.into_iter().collect(),
+                depth_band_provenance: (row.band_pct_e8 > 1_300_000)
+                    .then(|| "diff-reconstructed, validated<=1.3%".to_string()),
+            })
+            .collect();
+
+        SeriesBundle {
+            ohlcv,
+            cumulative_delta,
+            depth_series,
+        }
+    }
+}
+
+fn depth_within(bids: &[Level], asks: &[Level], side: Side, band: f64) -> i64 {
+    let best_bid = bids
+        .iter()
+        .filter(|level| level.size > 0)
+        .map(|level| level.price)
+        .max();
+    let best_ask = asks
+        .iter()
+        .filter(|level| level.size > 0)
+        .map(|level| level.price)
+        .min();
+    let (Some(best_bid), Some(best_ask)) = (best_bid, best_ask) else {
+        return 0;
+    };
+    let mid = (best_bid + best_ask) / 2;
+    match side {
+        Side::Buy => {
+            let threshold = (mid as f64 * (1.0 - band)) as i64;
+            bids.iter()
+                .filter(|level| level.size > 0 && level.price >= threshold)
+                .map(|level| level.size)
+                .sum()
+        }
+        Side::Sell => {
+            let threshold = (mid as f64 * (1.0 + band)) as i64;
+            asks.iter()
+                .filter(|level| level.size > 0 && level.price <= threshold)
+                .map(|level| level.size)
+                .sum()
+        }
+    }
+}
+
+fn reduce_event_stream(
+    stream: impl Iterator<Item = io::Result<Event>>,
+    selector: &Selector,
+    after: Cursor,
+    to: Cursor,
+    max_events: usize,
+) -> io::Result<(SeriesBundle, Cursor, usize)> {
+    let mut reducer = Reducer::new(selector);
+    let mut cursor = after;
+    let mut consumed = 0_usize;
+
+    if max_events == 0 || to == Cursor::START {
+        return Ok((reducer.finish(), cursor, consumed));
+    }
+
+    for event in stream {
+        let event = event?;
+        if after.upto_seq.is_some_and(|seq| event.seq <= seq) {
+            continue;
+        }
+        if !to.includes(event.seq) || consumed == max_events {
+            break;
+        }
+        reducer.apply(&event);
+        cursor = Cursor::at(event.seq);
+        consumed += 1;
+    }
+
+    Ok((reducer.finish(), cursor, consumed))
+}
+
 impl Snapshot {
     /// Сложить кадр в снапшот (fold): бакеты, пересекающиеся по `time_s`, СЛИВАЮТСЯ (OHLCV
     /// high/low/close/volume, cumulative_delta running, depth close-семантика), НЕ дублируются.
@@ -139,8 +372,14 @@ pub fn snapshot(
     sel: &Selector,
     at: Cursor,
 ) -> io::Result<Snapshot> {
-    let _ = (dir.as_ref(), filter, sel, at);
-    unimplemented!("M-22 task #3 (engine-dev): bounded journal::stream reduce → Snapshot")
+    let stream = journal::stream(dir, filter)?;
+    let (series, cursor, _) = reduce_event_stream(stream, sel, Cursor::START, at, usize::MAX)?;
+    Ok(Snapshot {
+        schema_version: GATEWAY_SCHEMA_VERSION,
+        selector: sel.clone(),
+        cursor,
+        series,
+    })
 }
 
 /// Кадры за событиями `seq > after` (batched, ≤ `max_events` событий за вызов), свёрнутые тем же
