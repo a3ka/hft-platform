@@ -35,6 +35,16 @@ RFC-PR; ревьюер-гейт блокирует не-RFC правки.
 `TargetQuotes`, лимит-профили — владеет крейт) и **T3** (внутренние структуры). T2/T3 меняются
 свободно внутри крейта-владельца, без RFC.
 
+**Виз-бэкенд + AI-контракты (Слои 8-9, пивот 2026-07-22) — T-DESIGNATE, НЕ T1.** Экспорт-контракт
+(`export_schema_version`, `research/exports/format.md`), `SemanticEvent`/`AiEvent`, `AI-Context`,
+`Strategy-Definition`, `Audit`-запись — **производные/интерпретационные формы** над журналом (Граница A,
+read-only), НЕ рыночный факт. Живут T-designate в своих крейтах (export/gateway/ai-copilot), меняются
+**аддитивно** (bump `export_schema_version`; старые консюмеры не ломаются), **БЕЗ contract-RFC**.
+Промоушен в `crates/contracts` (T1) — ТОЛЬКО при первом кросс-языковом консюмере (паттерн TD-008), тогда
+через RFC. **Категорически: `SemanticEvent`/`AiEvent` — НЕ `Event`/`EventKind`** (T1 журнала) — разные
+имена, разные крейты, канарейка запрещает коллизию (C-021 NOTE-1, `docs/fa/ai-copilot.md` AI-I-8). AI-выводы
+(недетерминир.) в T1-журнал не пишутся вовсе (`DET-I-1` цел). Детали — `docs/fa/{viz-backend,ai-copilot}.md`.
+
 ## §3. Кодировки (locked — не переоткрываются без RFC)
 
 - Деньги/цены: fixed-point `i64`/`u64` ×1e8. Никогда f64 в деньгах.
