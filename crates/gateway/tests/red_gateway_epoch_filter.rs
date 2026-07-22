@@ -88,6 +88,34 @@ fn cvd_last(series: &gateway::SeriesBundle) -> i64 {
         .expect("cumulative_delta непуст")
 }
 
+fn json<T: serde::Serialize>(x: &T) -> String {
+    serde_json::to_string(x).expect("serialize")
+}
+
+/// Полный дренаж кадров под ЗАДАННЫМ фильтром (клиентский памп до сходимости курсора).
+fn drain(dir: &std::path::Path, filter: EpochFilter, sel: &Selector) -> Vec<gateway::Frame> {
+    let mut cur = Cursor::START;
+    let mut out = Vec::new();
+    loop {
+        let (batch, next) =
+            gateway::frames_since(dir, filter.clone(), sel, cur, usize::MAX).expect("frames_since");
+        if batch.is_empty() {
+            break;
+        }
+        out.extend(batch);
+        if next == cur {
+            break;
+        }
+        cur = next;
+    }
+    out
+}
+
+fn cvd_snapshot(dir: &std::path::Path, filter: EpochFilter, sel: &Selector) -> i64 {
+    let s = gateway::snapshot(dir, filter, sel, Cursor::LATEST).expect("snapshot");
+    cvd_last(&s.series)
+}
+
 #[test]
 fn epoch_filter_is_honored_own_differs_from_all() {
     let dir = build();
@@ -115,24 +143,61 @@ fn epoch_filter_is_honored_own_differs_from_all() {
 }
 
 #[test]
-fn explicit_epoch_selection_is_distinct() {
+fn explicit_epoch_selection_is_distinct_from_both_own_and_all() {
+    // C-022 r2 gap-2: Explicit([own,vendor]) обязан отличаться И от OwnCaptureOnly, И от All —
+    // иначе impl мог бы схлопнуть Explicit в один из них молча.
     let dir = build();
     let s = sel();
-
-    let own = gateway::snapshot(dir.path(), EpochFilter::OwnCaptureOnly, &s, Cursor::LATEST)
-        .expect("snapshot own");
-    // Explicit(own+vendor) БЕЗ synth → между own и all.
-    let own_vendor = gateway::snapshot(
+    let own = cvd_snapshot(dir.path(), EpochFilter::OwnCaptureOnly, &s); // +10
+    let all = cvd_snapshot(dir.path(), EpochFilter::All, &s); // +10 −10 −5 = −5
+    let own_vendor = cvd_snapshot(
         dir.path(),
         EpochFilter::Explicit(vec!["own-2026-07".to_string(), "vendor-2024".to_string()]),
         &s,
+    ); // +10 −10 = 0
+
+    assert!(
+        own_vendor != own,
+        "Explicit([own,vendor]) обязан отличаться от OwnCaptureOnly (vendor учтён): {own_vendor} == {own}"
+    );
+    assert!(
+        own_vendor != all,
+        "Explicit([own,vendor]) обязан отличаться от All (synth ИСКЛЮЧЁН): {own_vendor} == {all}"
+    );
+}
+
+#[test]
+fn frames_since_honors_epoch_filter() {
+    // C-022 r2 gap-1: EpochFilter соблюдён и на frames_since (не только snapshot). Кадры own-пути
+    // (только покупки) обязаны отличаться от кадров all-пути (с продажами). Impl, читающий All в
+    // frames_since независимо от фильтра, даёт одинаковые кадры → падение.
+    let dir = build();
+    let s = sel();
+    let fr_own = drain(dir.path(), EpochFilter::OwnCaptureOnly, &s);
+    let fr_all = drain(dir.path(), EpochFilter::All, &s);
+    assert!(
+        json(&fr_own) != json(&fr_all),
+        "frames_since ИГНОРИРУЕТ EpochFilter: own-кадры == all-кадры (эпохи смешаны молча)"
+    );
+}
+
+#[test]
+fn replay_honors_epoch_filter() {
+    // C-022 r2 gap-1: EpochFilter соблюдён и на replay.
+    let dir = build();
+    let s = sel();
+    let rp_own = gateway::replay(
+        dir.path(),
+        EpochFilter::OwnCaptureOnly,
+        &s,
+        Cursor::START,
         Cursor::LATEST,
     )
-    .expect("snapshot own+vendor");
-
-    // own+vendor = +10 −10 = 0; отличается и от own (+10).
+    .expect("replay own");
+    let rp_all = gateway::replay(dir.path(), EpochFilter::All, &s, Cursor::START, Cursor::LATEST)
+        .expect("replay all");
     assert!(
-        cvd_last(&own_vendor.series) != cvd_last(&own.series),
-        "Explicit([own,vendor]) обязан отличаться от OwnCaptureOnly (vendor-продажи учтены)"
+        json(&rp_own) != json(&rp_all),
+        "replay ИГНОРИРУЕТ EpochFilter: own-кадры == all-кадры (эпохи смешаны молча)"
     );
 }

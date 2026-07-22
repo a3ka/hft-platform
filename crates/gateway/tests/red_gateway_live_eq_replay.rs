@@ -229,6 +229,33 @@ fn mid_stream_snapshot_completeness_merges_same_bucket() {
 }
 
 #[test]
+fn frames_since_respects_max_events_cap() {
+    // C-022 r2 gap-3: max_events — РЕАЛЬНЫЙ кап, не декларация. При N(8) > max(3) первый вызов
+    // обязан покрыть ≤3 события и ОСТАВИТЬ хвост (курсор не на last). Impl, возвращающий весь
+    // tail одним батчем, → covered=8 > 3 → падение. (seq контигуальны в одном журнале.)
+    let (dir, seqs) = build();
+    let s = sel();
+    let first = seqs[0];
+    let last = *seqs.last().expect("seqs непуст");
+    let k = 3usize;
+
+    let (batch, next) =
+        gateway::frames_since(dir.path(), EpochFilter::OwnCaptureOnly, &s, Cursor::START, k)
+            .expect("frames_since");
+    assert!(!batch.is_empty(), "непустой журнал → первый батч не пуст");
+    let next_seq = next.upto_seq.expect("курсор после непустого батча несёт seq");
+    let covered = next_seq - first + 1;
+    assert!(
+        covered <= k as u64,
+        "frames_since покрыл {covered} событий > max_events={k} — кап ПРОИГНОРИРОВАН (весь tail одним батчем)"
+    );
+    assert!(
+        next_seq < last,
+        "при N>max_events хвост обязан ОСТАТЬСЯ (курсор {next_seq} не должен быть на last {last})"
+    );
+}
+
+#[test]
 fn cursor_and_frame_bounds_are_correct() {
     // GW-I-8: cursor-контракт snapshot + frames_since (C-022 B2).
     let (dir, seqs) = build();
