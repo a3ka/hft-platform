@@ -914,6 +914,45 @@ gate-gap класса RN-8: verify расходился с CI; гейт сраз
 - **M-18 ✅ CLOSED** (задачи 8/9/10 DONE; повторный §8 GREEN на живом проде — unit≠live удовлетворён,
   ровно то, про что TD-031). L2Delta капча (BTC-only spot+perp) продуктивна и машинно-изолирована по эпохе.
 
+## P-COCKPIT — charter-набор пивота (Слои 8-9 ACTIVE-charter; docs-only MERGED 2026-07-22, reviewer APPROVED)
+Пивот founder'а (2026-07-22): ближний фокус — **не торговый стек, а ДАННЫЕ + виз-бэкенд + AI-копилот**
+для Bookmap-подобного кокпита (Order Flow Intelligence Terminal) на Binance+HL; фронт — founder
+(`code2alpha`), мы даём бэкенд+экспорт. **P3 (risk/oms)/P4 (live)/сигналы (M-10) — ОТЛОЖЕНЫ, НЕ отменены.**
+Смержен **Class-A doc-набор** (ff `cce11a5`, чистый fast-forward `0cd447d..cce11a5`). Прошёл critic
+doc-гейт (`research/critiques/C-021-cockpit-docs.md` = NOTE; NOTE-1 SemanticEvent≠T1 + NOTE-3 HL-wording
+приземлены на ветке; NOTE-2 production-streaming → зашит в acceptance M-22, не этот merge).
+- `docs/DESIGN.md` — **Слои 8-9** (`viz-backend` дериватив+Read Gateway+export v2; `ai-copilot` Event
+  Engine+AI-Context+LLM-сервис+audit, ВНЕ детерминизма) + фаза **P-COCKPIT** в роадмапе. Слой 8
+  детерминирован (live==replay); слой 9 вне DET-I-1 (LLM недетерминирован → выводы вне journal).
+- `docs/07-cockpit-backend-roadmap.md` (LIVING DOC, architect-owned) — решения сессии D1–D5 + decision-log
+  + milestone-порядок (виз-first) + открытые founder-вопросы.
+- `docs/fa/viz-backend.md` (**VB-I-1..8**) — дериватив-слой read-only консюмер `journal::stream`; export v2
+  аддитивно; data-quality gate (глубже 1.3% — `depth_band_provenance`); модель сессии 00:00 UTC.
+- `docs/fa/ai-copilot.md` (**AI-I-1..8**) — 5 слоёв; AI read-only, вне ядра, audit обязателен;
+  `SemanticEvent`/`AiEvent` ≠ T1 `Event`/`EventKind` (канарейка AI-I-8).
+- `docs/05-contract-layer.md` — governance: виз/AI-контракты (export v2, SemanticEvent, AI-Context,
+  Strategy-Definition, Audit) — **T-designate, БЕЗ contract-RFC** (аддитивно, bump `export_schema_version`);
+  промоушен в `crates/contracts` только при кросс-языковом консюмере (паттерн TD-008). T1-ядро read-only.
+- `milestones/BACKLOG.md` — виз-first баннер; торговый трек «ОТЛОЖЕН, НЕ удалён».
+- `research/data-quality/depth-probe-staleness.md` + `crates/book/examples/depth_probe.rs` (OFFLINE-диагностика,
+  `read_all` — НЕ прод-путь, T11e carve-out `examples/`≠`src/`) — фантом-тест дальних полос: сигнатура
+  чистого фантома TD-016 НЕ подтвердилась, но и «полосы достоверны» не доказано (конфаунд resync-обнулением);
+  рефрейм — глубже ~1.3% валидированного эталона нет НИ У КОГО ⇒ планка = **корректность книги** (TD-016), не «вендор».
+- **Scope/Block-C:** тронуты ТОЛЬКО `docs/`, `milestones/BACKLOG.md`, `research/{critiques,data-quality}/`,
+  `crates/book/examples/depth_probe.rs` (пример, НЕ `src`). `crates/contracts/**` НЕ тронут; кода/risk/
+  killswitch/oms/venue нет ⇒ reviewer-only, risk-critic НЕ требуется. Гейты (reviewer перепрогнал):
+  `cargo fmt --all --check` exit=0; `cargo clippy --workspace --all-targets -- -D warnings` exit=0 (пример
+  собирается workspace'ом). **§8 деплой-гейт (light-touch, прод ИНЕРТЕН — recorder-бинарь не меняется,
+  Dockerfile `--bin recorder`, пример в образ не попадает):** CI `29948492195` completed/success (5m57s),
+  Deploy `29948492152` completed/success (7m17s, build-on-VPS 1m9s — триггернулся `crates/**` из-за примера).
+  VPS eyes-on: `hft-recorder Up (healthy)`, `restarts=0`, heartbeat свежий (`ts_wall_ms=1784746746502`,
+  age ~3.8s), `writable=true`, `free_bytes≈95 GB` (> min 10 GB), `next_seq=69171054` растёт, `segment_index=68`.
+  Прод инертен — recorder пересобрался идентично и продолжает писать; поведение данных не изменилось.
+- **Дальше (architect):** спека **M-22 (Read Gateway)** на `feat/M-22` (RED не живёт на main) с NOTE-2 в
+  acceptance (`journal::stream`+`EpochFilter`, bounded-memory, канарейка против `read_all` в прод-пути);
+  параллельно M-20 (VWAP)/M-23 (heatmap). Открытые founder-решения (docs/07 §10): TPP `formula_pending`,
+  LLM-провайдер, Tardis-бюджет/окно, масштаб универсума TPP TOTAL.
+
 ## Пока НЕ реализовано (следующие фазы)
 - Крейты `risk`/`killswitch`/`oms`, `runner` — пофазно per DESIGN §10 (M-08: fail-closed риск-гейт
   между `strategy` и `oms`). MM-котирование, wiring весов из `signals.json` (граница B),
