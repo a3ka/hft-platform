@@ -1,9 +1,10 @@
 # D-001 — KILL: OBI Трек A (S-001-obi-asym) как отрицательный результат
 
-> **СТАТУС: DRAFT — UNSIGNED (ожидает подписи founder'а).** Черновик подготовлен architect'ом
-> по делегированию founder'а (полная проверка + подготовка решения; **право подписи НЕ делегировано** —
-> Граница C, `docs/DESIGN.md` §6/§7, `gates.md` §7). Ни один агент не ставит подпись за founder'а.
-> Это НЕ промоушен (промоушен `candidate→paper→live` архитектурно запрещён на этих данных — см. ниже).
+> **СТАТУС: DRAFT — UNSIGNED (ожидает founder-аттестации; см. блок «Подпись founder'а»).** Черновик
+> подготовлен architect'ом по делегированию founder'а (полная проверка + подготовка решения; **право
+> аттестации НЕ делегировано** — Граница C, `docs/DESIGN.md` §6/§7, `gates.md` §7). Ни один агент не
+> аттестует за founder'а. Метод — git-attested коммитом founder'а (Ed25519-инфра — pending M-12; для
+> negative-result достаточно). Это НЕ промоушен (`candidate→paper→live` архитектурно запрещён — см. ниже).
 
 - **Дата (UTC):** 2026-07-21
 - **Тип решения:** фиксация отрицательного результата гипотезы (`INTG-I-2`; `INTG-I-7` — negative result)
@@ -78,15 +79,25 @@
 находкой A до её устранения (задачи 7-10 + повторный прогон 4b → risk-critic re-audit). D-001
 (сигнал) и close M-10 (стек) — независимы; подпись D-001 не разблокирует merge M-10.
 
-## Подпись (founder — Ed25519)
+## Подпись founder'а
+
+> **МЕТОД: git-attested (Ed25519 pending M-12).** Криптографическая инфраструктура подписи решений
+> (`Ctl(ParamChange{signed})` + верификация Ed25519) ещё НЕ построена — это зона M-12 (границы B/C,
+> `BACKLOG.md`). Для НЕ-денежного решения (negative-result: убить мёртвую гипотезу; не промоушен, не
+> веса, не лимиты) аудит-след = **коммит под founder git-идентичностью** с заполненным блоком ниже.
+> Криптоподпись Ed25519 догоняется задним числом батчем, когда M-12 её построит. Заполняет и коммитит
+> блок ТОЛЬКО founder — ни один агент не аттестует за него.
 
 ```
 DECISION: D-001-obi-trackA-kill
 VERDICT:  KILL (record negative result; NOT a promotion)
 SIGNER:   <founder>
-ED25519:  <SIGNATURE PLACEHOLDER — подпись ставит ТОЛЬКО founder>
+METHOD:   git-attested by founder (Ed25519 pending M-12, Граница C infra)
 DATE_UTC: <YYYY-MM-DDThh:mmZ>
 ```
+
+По заполнении: сменить `СТАТУС` (шапка) `DRAFT — UNSIGNED` → `ACCEPTED (founder-attested)` и в том же
+коммите отметить `research/hypotheses/H-20260710-obi-asym.md` → REJECTED (dead on this data).
 
 ## Cross-references
 - `research/critiques/C-020-M-10.md` (risk-critic CONCERNS)
