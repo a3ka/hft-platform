@@ -44,6 +44,11 @@ reviewer — бэкстоп на PR-time (гейт 4 ниже всё равно 
 - `set -euo pipefail` ИЛИ явный агрегатор с FAIL-счётчиком + `exit 1` при FAIL>0.
 - **Никакого** `cmd && echo PASS || echo FAIL` (маскирует провал).
 - Минимум 1 проверка на задачу из §Tasks milestone'а.
+- **fmt-гейт ОБЯЗАТЕЛЕН (RN-8, закреплено 2026-07-22 после 3-го повтора):** verify включает
+  `cargo fmt --all -- --check` — ТУ ЖЕ команду, что CI (`ci.yml` build-test). Без него verify даёт
+  **false-green**: milestone «зелёный» у dev, а merge краснит `main` (CI fmt-gate) и блокирует §8.
+  Инцидент M-22: 18 fmt-диффов в sacred RED-тестах прошли verify PASS, поймал только reviewer/CI.
+- **clippy-гейт** `cargo clippy --workspace --all-targets -- -D warnings` (тоже матчит CI).
 - Финальная строка `VERDICT: PASS`/`VERDICT: FAIL`; exit-код соответствует.
 - Явный список исключений (T2/T3 типы вне зоны проверки) с комментарием-обоснованием.
 
