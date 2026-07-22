@@ -25,6 +25,11 @@ use serde::{Deserialize, Serialize};
 /// ТОЛЬКО с bump этой константы. T-designate (не T1, не `crates/contracts`).
 pub const GATEWAY_SCHEMA_VERSION: u32 = 2;
 
+/// Canonical UTC-day session anchor shared by session-cumulative indicators (VB-I-6).
+pub const fn utc_session_id(ts_exch_ms: i64) -> i64 {
+    ts_exch_ms.div_euclid(86_400_000)
+}
+
 /// Что наблюдаем: площадка/символ/таймфрейм + depth-полосы (доли от mid, напр. `0.001` = 0.1%).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Selector {
@@ -98,6 +103,8 @@ pub struct SeriesBundle {
     /// Running cumulative delta `(time_s, знаковая агрессия до конца бакета)` (export v1 §3.2).
     pub cumulative_delta: Vec<(i64, i64)>,
     pub depth_series: Vec<DepthRow>,
+    /// Session-anchored VWAP `(time_s, price ×1e8)`, reset at 00:00 UTC.
+    pub vwap: Vec<(i64, i64)>,
 }
 
 /// Полная детерминированная свёртка окна `[start .. cursor]`.
@@ -158,6 +165,31 @@ impl OhlcvAcc {
     }
 }
 
+#[derive(Default)]
+struct VwapAcc {
+    session_id: Option<i64>,
+    sum_pv: i128,
+    sum_v: i128,
+    values: BTreeMap<i64, i64>,
+}
+
+impl VwapAcc {
+    fn apply_trade(&mut self, ts_ms: i64, time_s: i64, price: i64, size: i64, emit: bool) {
+        let session_id = utc_session_id(ts_ms);
+        if self.session_id != Some(session_id) {
+            self.session_id = Some(session_id);
+            self.sum_pv = 0;
+            self.sum_v = 0;
+        }
+        self.sum_pv += i128::from(price) * i128::from(size);
+        self.sum_v += i128::from(size);
+        if emit && self.sum_v != 0 {
+            self.values
+                .insert(time_s, (self.sum_pv / self.sum_v) as i64);
+        }
+    }
+}
+
 struct DepthAcc {
     side: Side,
     band: f64,
@@ -171,6 +203,7 @@ struct Reducer {
     selector: Selector,
     ohlcv: BTreeMap<i64, OhlcvAcc>,
     bucket_delta: BTreeMap<i64, i64>,
+    vwap: VwapAcc,
     depth: Vec<DepthAcc>,
 }
 
@@ -180,6 +213,7 @@ impl Reducer {
             selector: selector.clone(),
             ohlcv: BTreeMap::new(),
             bucket_delta: BTreeMap::new(),
+            vwap: VwapAcc::default(),
             depth: Vec::new(),
         }
     }
@@ -193,7 +227,35 @@ impl Reducer {
         Some(bucket.checked_mul(timeframe_ms).map_or(0, |ms| ms / 1_000))
     }
 
+    fn apply_vwap(&mut self, event: &Event, emit: bool) {
+        let EventKind::Md(md) = &event.kind else {
+            return;
+        };
+        if md.venue != self.selector.venue || md.symbol != self.selector.symbol {
+            return;
+        }
+        let MdPayload::Trade {
+            price,
+            size,
+            ts_exch_ms,
+            ..
+        } = &md.payload
+        else {
+            return;
+        };
+        let Some(time_s) = self.bucket_time_s(*ts_exch_ms) else {
+            return;
+        };
+        self.vwap
+            .apply_trade(*ts_exch_ms, time_s, *price, *size, emit);
+    }
+
+    fn seed_vwap(&mut self, event: &Event) {
+        self.apply_vwap(event, false);
+    }
+
     fn apply(&mut self, event: &Event) {
+        self.apply_vwap(event, true);
         let EventKind::Md(md) = &event.kind else {
             return;
         };
@@ -290,10 +352,13 @@ impl Reducer {
             })
             .collect();
 
+        let vwap = self.vwap.values.into_iter().collect();
+
         SeriesBundle {
             ohlcv,
             cumulative_delta,
             depth_series,
+            vwap,
         }
     }
 }
@@ -349,6 +414,7 @@ fn reduce_event_stream(
     for event in stream {
         let event = event?;
         if after.upto_seq.is_some_and(|seq| event.seq <= seq) {
+            reducer.seed_vwap(&event);
             continue;
         }
         if !to.includes(event.seq) || consumed == max_events {
