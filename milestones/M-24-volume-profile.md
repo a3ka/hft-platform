@@ -1,6 +1,8 @@
 # M-24 — Volume Profile (SVP) — POC/VAH/VAL в gateway SeriesBundle
 
-STATUS: **PROPOSED** (2026-07-23, architect). Пивот P-COCKPIT, Трек B (MVP-1), **второй пост-gateway
+STATUS: **DONE — merged to main 2026-07-23** (код `7bd3a69`, reviewer APPROVED, §8-lite GREEN inert;
+reviewer завёл TD-034/RN-19/RN-20). RN-19 закрыт: тай-брейк фикстуры (POC тай→низшая, VA тай→верхний)
+добавлены в `red_volume_profile.rs`. Пивот P-COCKPIT, Трек B (MVP-1), **второй пост-gateway
 индикатор** (последовательно после M-20). Чистый Trade-редьюсер в gateway, **переиспользует session-модель
 VB-I-6** (`utc_session_id`, введён M-20 — НЕ переопределять). Doc-гейт §9: **critic НЕ триггерится**
 (не T1/risk/ks/oms/venue, не новый крейт, < 5 коммитов) — reviewer-бэкстоп.
@@ -80,10 +82,10 @@ pub struct VolumeProfileRow {
 
 | # | Статус | Задача | Кто | Acceptance |
 |---|---|---|---|---|
-| 1 | ⏳ | VP-I-1..4 RED (`red_volume_profile.rs`) + `verify_M-24.sh` (fmt+clippy+test, RN-17) | architect | compile-RED (нет `volume_profile`/`VolumeProfileRow`); достижимо; VA-алгоритм проверяется на hand-computed |
-| 2 | ⏳ | `VolumeProfileRow` тип + per-session VP-аккумулятор (i128, `utc_session_id`) | engine-dev | VP-I-1/VP-I-3/VP-I-4 GREEN |
-| 3 | ⏳ | POC + Value Area (VAH/VAL/va_pct) по §Design-алгоритму | engine-dev | VP-I-2 GREEN |
-| 4 | ⏳ | Поле `volume_profile` в `SeriesBundle` + `Snapshot::apply` merge + bump schema→4 | engine-dev | VP-* GREEN; GW-I-3/GW-I-5 не сломаны; workspace green |
+| 1 | ✅ | VP-I-1..4 RED (`red_volume_profile.rs`) + `verify_M-24.sh` (fmt+clippy+test, RN-17) | architect | compile-RED (нет `volume_profile`/`VolumeProfileRow`); достижимо; VA-алгоритм проверяется на hand-computed |
+| 2 | ✅ | `VolumeProfileRow` тип + per-session VP-аккумулятор (i128, `utc_session_id`) | engine-dev | VP-I-1/VP-I-3/VP-I-4 GREEN |
+| 3 | ✅ | POC + Value Area (VAH/VAL/va_pct) по §Design-алгоритму | engine-dev | VP-I-2 GREEN |
+| 4 | ✅ | Поле `volume_profile` в `SeriesBundle` + `Snapshot::apply` merge + bump schema→4 | engine-dev | VP-* GREEN; GW-I-3/GW-I-5 не сломаны; workspace green |
 
 ## Гейты
 
