@@ -522,14 +522,34 @@ impl Reducer {
         self.vp.apply_trade(*ts_exch_ms, *price, *size);
     }
 
-    /// M-23 HM-I-4 STUB (будет имплементирован в task #4): Volume Bubbles — `(time_s, price_e8)
-    /// → (buy, sell)`. Цены НЕ выдумываются (ключи создаются только на Trade). Вызывается
-    /// ТОЛЬКО из apply (не из seed) — иначе duplicate-count при fold. Task #2-3 оставляет
-    /// STUB-noop для совместимости типов; task #4 наполнит `self.bubbles`.
-    #[allow(unused_variables)]
+    /// M-23 HM-I-4: аккумулировать сделку в Volume Bubbles — `(time_s, price_e8) → (buy, sell)`.
+    /// Цены НЕ выдумываются (ключи создаются только на Trade). Как VP: вызывается ТОЛЬКО из
+    /// apply (не из seed) — иначе duplicate-count при fold.
     fn apply_bubbles(&mut self, event: &Event) {
-        // STUB: bubbles impl выходит в task #4. Типы и поля уже на месте — HM-I-4 тест
-        // просто не находит ячеек и падает (RED), пока task #4 не реализует аккумулятор.
+        let EventKind::Md(md) = &event.kind else {
+            return;
+        };
+        if !self.selector.matches(md) {
+            return;
+        }
+        let MdPayload::Trade {
+            price,
+            size,
+            side,
+            ts_exch_ms,
+            ..
+        } = &md.payload
+        else {
+            return;
+        };
+        let Some(time_s) = self.bucket_time_s(*ts_exch_ms) else {
+            return;
+        };
+        let entry = self.bubbles.entry((time_s, *price)).or_insert((0, 0));
+        match side {
+            Side::Buy => entry.0 += *size,
+            Side::Sell => entry.1 += *size,
+        }
     }
 
     fn apply(&mut self, event: &Event) {
@@ -803,10 +823,18 @@ fn build_heatmap_and_cob(
 
 /// M-23: построить `Vec<BubbleCell>` из `bubbles: BTreeMap<(time_s, price), (buy, sell)>`.
 /// Сортировка: `(time_s, price_e8)` возрастание — стабильная (HM-I-5 детерминизм).
-/// STUB task #2-3: пустой Vec (HM-I-4 остаётся RED). Task #4 перепишет реализацию.
 fn build_volume_bubbles(bubbles: BTreeMap<(i64, i64), (i64, i64)>) -> Vec<BubbleCell> {
-    let _ = bubbles; // STUB — bubbles impl выходит в task #4
-    Vec::new()
+    bubbles
+        .into_iter()
+        .map(
+            |((time_s, price_e8), (buy_vol_e8, sell_vol_e8))| BubbleCell {
+                time_s,
+                price_e8,
+                buy_vol_e8,
+                sell_vol_e8,
+            },
+        )
+        .collect()
 }
 
 fn depth_within(bids: &[Level], asks: &[Level], side: Side, band: f64) -> i64 {
@@ -1001,11 +1029,23 @@ fn merge_cob(existing: &[CobLevel], incoming: &[CobLevel]) -> Vec<CobLevel> {
 
 /// M-23: слить bubbles двух снапшотов по `(time_s, price_e8)`. Кумулятивная семантика: для
 /// совпадающего ключа buy/sell СКЛАДЫВАЮТСЯ (НЕ последний выигрывает — это cumulative объём).
-/// STUB task #2-3: возвращает пустой Vec (HM-I-4 остаётся RED). Task #4 перепишет с реальным
-/// сложением cumulative-объёмов при fold'е.
 fn merge_bubbles(existing: &[BubbleCell], incoming: &[BubbleCell]) -> Vec<BubbleCell> {
-    let _ = (existing, incoming); // STUB
-    Vec::new()
+    let mut map: BTreeMap<(i64, i64), (i64, i64)> = BTreeMap::new();
+    for cell in existing.iter().chain(incoming.iter()) {
+        let entry = map.entry((cell.time_s, cell.price_e8)).or_insert((0, 0));
+        entry.0 += cell.buy_vol_e8;
+        entry.1 += cell.sell_vol_e8;
+    }
+    map.into_iter()
+        .map(
+            |((time_s, price_e8), (buy_vol_e8, sell_vol_e8))| BubbleCell {
+                time_s,
+                price_e8,
+                buy_vol_e8,
+                sell_vol_e8,
+            },
+        )
+        .collect()
 }
 
 fn cumulative_to_deltas(series: &[(i64, i64)]) -> BTreeMap<i64, i64> {
