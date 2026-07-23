@@ -4,9 +4,11 @@
 //! live-захват (`venue-binance::apply_diff_to_book`): `size==0` удаляет, `size>0` upsert, неупомянутое
 //! неизменно, пустая сторона = no-op (НЕ очистка). Основа heatmap (M-23).
 //!
-//! COMPILE-RED: метод `apply_delta` ещё НЕ существует → тест не компилируется. engine-dev добавляет apply_delta
-//! + ветку Books::apply(L2Delta) → GREEN. Анти-плацебо: пустая-сторона→очистка / неупомянутое→удаление →
-//! падение BL-I-3; текущий Books::apply игнорирует L2Delta → книга неизменна → падение BL-I-6.
+//! COMPILE-RED: метод `apply_delta` ещё НЕ существует → тест не компилируется; engine-dev добавляет
+//! `apply_delta` + ветку `Books::apply(L2Delta)` → GREEN.
+//!
+//! Анти-плацебо: «пустая сторона очищает» или «неупомянутое удаляется» ломает BL-I-3; текущий
+//! `Books::apply` игнорирует L2Delta (книга неизменна) — ломает BL-I-6.
 
 use book::{Books, OrderBook};
 use contracts::{Level, MdEvent, MdPayload, Side, Venue};
@@ -69,17 +71,10 @@ fn empty_side_and_unmentioned_preserved() {
 #[test]
 fn determinism() {
     // BL-I-4: тот же снапшот+дельты на двух книгах → идентичные levels().
-    let deltas: &[(&[(i64, i64)], &[(i64, i64)])] = &[
-        (&[(98, 2), (99, 0)], &[(103, 1)]),
-        (&[(100, 8)], &[(101, 0)]),
-    ];
     let run = || {
         let mut b = seeded(&[(100, 5), (99, 3)], &[(101, 4), (102, 2)]);
-        for (bd, ad) in deltas {
-            let bl: Vec<Level> = bd.iter().map(|&(p, s)| lvl(p, s)).collect();
-            let al: Vec<Level> = ad.iter().map(|&(p, s)| lvl(p, s)).collect();
-            b.apply_delta(&bl, &al);
-        }
+        b.apply_delta(&[lvl(98, 2), lvl(99, 0)], &[lvl(103, 1)]); // +98, удалить 99, +ask103
+        b.apply_delta(&[lvl(100, 8)], &[lvl(101, 0)]); // 100→8, удалить ask101
         b
     };
     let a = run();

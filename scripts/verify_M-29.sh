@@ -22,9 +22,10 @@ check "book tests (BL-I-1..6 + существующие)" "${PIPESTATUS[0]}"
 cargo test -p book --test red_l2delta_apply 2>&1 | tail -15
 check "BL-I-1..6 (red_l2delta_apply: set/remove/asymmetry/empty-side/determinism/scale/Books-route)" "${PIPESTATUS[0]}"
 
-# --- L2Snapshot-путь не сломан (регрессия) ---
-cargo test -p book 2>&1 | grep -qE "test result: ok"
-check "L2Snapshot-путь и прочие book-тесты не сломаны" $?
+# --- L2Snapshot-путь не сломан (регрессия). Прямой exit-код (без grep|pipe: pipefail+grep -q
+# закрывает pipe → cargo ловит SIGPIPE 101 — ложный FAIL; фикс SVR engine-dev). ---
+cargo test -p book >/dev/null 2>&1
+check "L2Snapshot-путь и прочие book-тесты не сломаны (cargo test -p book exit)" $?
 
 echo "-----"
 if [ "$FAIL" -eq 0 ]; then echo "VERDICT: PASS"; exit 0; else echo "VERDICT: FAIL ($FAIL failed)"; exit 1; fi
