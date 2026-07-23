@@ -1,6 +1,7 @@
 # M-20 — VWAP (session-anchored) — производный индикатор в gateway SeriesBundle
 
-STATUS: **PROPOSED — cockpit re-spec** (2026-07-22, architect). Пивот P-COCKPIT, Трек B (MVP-1),
+STATUS: **DONE — merged to main 2026-07-22** (merge `743d0b3`, reviewer APPROVED, §8-lite GREEN: recorder
+инертен). VB-I-6 примитив `utc_session_id` (pub const fn в gateway) готов для M-24/CVD-reset. Пивот P-COCKPIT, Трек B (MVP-1),
 **первый пост-gateway индикатор** (последовательно после M-22). Переориентирован с батч-экспорта
 (M-17 `format.md`) на **live gateway-путь**: VWAP-серия вливается в `gateway::SeriesBundle` аддитивно
 (export v2 bump), считается тем же streaming-редьюсером, что snapshot/frames/replay (live==replay).
@@ -68,10 +69,10 @@ rolling-N/per-bar варианты (позже, если нужны фронту
 
 | # | Статус | Задача | Кто | Acceptance |
 |---|---|---|---|---|
-| 1 | ⏳ | VW-I-1..4 RED (`red_vwap.rs`) + `verify_M-20.sh` (fmt+clippy+test, RN-17) | architect | compile-RED (нет поля `vwap`); достижимо; i128-масштаб (VW-I-2) обязателен |
-| 2 | ⏳ | VWAP session-anchored аккумулятор в gateway `Reducer` (i128, VB-I-6 session_id) | engine-dev | VW-I-1/VW-I-2/VW-I-3 GREEN |
-| 3 | ⏳ | Поле `vwap` в `SeriesBundle` + `Snapshot::apply` merge + bump `GATEWAY_SCHEMA_VERSION`→3 | engine-dev | VW-I-* GREEN; GW-I-3/GW-I-5 (live==replay/аддитивность) не сломаны; workspace green |
-| 4 | ⏳ | Per-venue корректность (тем же apply-фильтром) | engine-dev | VW-I-4 GREEN |
+| 1 | ✅ | VW-I-1..4 RED (`red_vwap.rs`) + `verify_M-20.sh` (fmt+clippy+test, RN-17) | architect | compile-RED (нет поля `vwap`); достижимо; i128-масштаб (VW-I-2) обязателен |
+| 2 | ✅ | VWAP session-anchored аккумулятор в gateway `Reducer` (i128, VB-I-6 session_id) | engine-dev | VW-I-1/VW-I-2/VW-I-3 GREEN |
+| 3 | ✅ | Поле `vwap` в `SeriesBundle` + `Snapshot::apply` merge + bump `GATEWAY_SCHEMA_VERSION`→3 | engine-dev | VW-I-* GREEN; GW-I-3/GW-I-5 (live==replay/аддитивность) не сломаны; workspace green |
+| 4 | ✅ | Per-venue корректность (тем же apply-фильтром) | engine-dev | VW-I-4 GREEN |
 
 ## Гейты
 
