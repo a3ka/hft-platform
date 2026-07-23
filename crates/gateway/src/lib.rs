@@ -23,7 +23,11 @@ use serde::{Deserialize, Serialize};
 /// Версия экспорт-формы gateway. **Аддитивно** поверх `research-cli::EXPORT_SCHEMA_VERSION = 1`
 /// (VB-I-4/GW-I-5): новые серии (M-23+) добавляют поля, не переопределяют старые; форма меняется
 /// ТОЛЬКО с bump этой константы. T-designate (не T1, не `crates/contracts`).
-pub const GATEWAY_SCHEMA_VERSION: u32 = 4;
+///
+/// 5: M-23 Heatmap+COB+Bubbles — `SeriesBundle += heatmap/cob/volume_bubbles`, типы
+///    `HeatmapCell/CobLevel/BubbleCell`. Бамп 4 → 5 (новые T-designate типы, формы
+///    аддитивны — потребители v4 читают без изменений).
+pub const GATEWAY_SCHEMA_VERSION: u32 = 5;
 
 /// Canonical UTC-day session anchor shared by session-cumulative indicators (VB-I-6).
 pub const fn utc_session_id(ts_exch_ms: i64) -> i64 {
@@ -103,6 +107,38 @@ pub struct VolumeProfileRow {
     pub bins: Vec<(i64, i64)>,
 }
 
+/// M-23 Heatmap cell — покоящийся размер на `(bucket, price, side)` из L2Delta-реконструированной
+/// книги (HM-I-1, M-29 `apply_delta`). Close-семантика per бакет (последний апдейт книги в бакете).
+/// Провенанс на ячейках глубже 1.3% от mid (`HM-I-2`, VB-I-5): `None` для shallow-полос; непустой
+/// `Some("diff-reconstructed")` для deep-полос.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct HeatmapCell {
+    pub time_s: i64,
+    pub side: String,
+    pub price_e8: i64,
+    pub size_e8: i64,
+    pub depth_band_provenance: Option<String>,
+}
+
+/// M-23 COB (Current Order Book) — уровни книги в окне на ФИНАЛЬНОМ курсоре snapshot'а
+/// (`HM-I-3`). Bid по убыванию цены, ask по возрастанию.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CobLevel {
+    pub side: String,
+    pub price_e8: i64,
+    pub size_e8: i64,
+}
+
+/// M-23 Volume Bubble — торгованный объём `(bucket_time_s, price) → (buy, sell)` из `Trade`
+/// (`HM-I-4`). Цены НЕ выдумываются: только реально торгованные (как footprint C-016).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BubbleCell {
+    pub time_s: i64,
+    pub price_e8: i64,
+    pub buy_vol_e8: i64,
+    pub sell_vol_e8: i64,
+}
+
 /// Depth time-series per (side, band) (зеркалит export v1 §4). BID/ASK — РАЗДЕЛЬНЫЕ серии.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DepthRow {
@@ -129,6 +165,17 @@ pub struct SeriesBundle {
     /// Session Volume Profile (SVP, M-24): `VolumeProfileRow` per сессия, сортировка по `session_id`.
     /// Только ТОРГОВАННЫЕ цены (VP-I-4): ключи гистограммы — реальные сделки, не «выдуманные».
     pub volume_profile: Vec<VolumeProfileRow>,
+    /// M-23 Heatmap (HM-I-1..2): per-бакет снимок L2Delta-реконструированной книги (M-29
+    /// `apply_delta`). Close-семантика per бакет — перезапись при последнем апдейте.
+    /// Ячейки ТОЛЬКО в окне `[mid*(1−W), mid*(1+W)]`, W=max(`Selector.bands`). Провенанс
+    /// обязателен на deep-ячейках (>1.3% от mid).
+    pub heatmap: Vec<HeatmapCell>,
+    /// M-23 COB (HM-I-3): уровни книги в окне на финальном курсоре snapshot'а.
+    /// Bid по убыванию цены, ask по возрастанию.
+    pub cob: Vec<CobLevel>,
+    /// M-23 Volume Bubbles (HM-I-4): торгованный объём `(time_s, price) → (buy, sell)` из `Trade`
+    /// (side→buy/sell раздельно). Цены не выдуманы — только торгованные.
+    pub volume_bubbles: Vec<BubbleCell>,
 }
 
 /// Полная детерминированная свёртка окна `[start .. cursor]`.
@@ -358,6 +405,46 @@ struct Reducer {
     depth: Vec<DepthAcc>,
     /// M-24: per-session Volume Profile accumulator (price→объём).
     vp: VolumeProfileAcc,
+    /// M-23: текущая L2Delta-реконструированная книга (M-29 `apply_delta` + `apply_snapshot`).
+    /// Owns the live book для heatmap/cob. Per-bucket snapshot книги — `heatmap_buckets`.
+    book: book::OrderBook,
+    /// M-23: per-bucket (time_s) снимок книги для heatmap (close-семантика). Размер state
+    /// O(num_buckets × levels_in_window), не O(events) (GW-I-2).
+    heatmap_buckets: BTreeMap<i64, HeatmapBucketState>,
+    /// M-23: Volume Bubbles accumulator `(time_s, price_e8) → (buy_vol_e8, sell_vol_e8)`.
+    /// Цены НЕ выдумываются — ключи создаются ТОЛЬКО в `Trade` (HM-I-4).
+    bubbles: BTreeMap<(i64, i64), (i64, i64)>,
+}
+
+/// M-23: per-bucket book snapshot для heatmap. Хранит bids/asks отдельно (Vec<(price,size)>) +
+/// кэшированный `mid` (вычисленный, когда обе стороны были непустые; при односторонней книге —
+/// fallback на ПОСЛЕДНИЙ известный `mid` для этого бакета — HM-I-1 тест с удалением ask опирается
+/// на это, чтобы heatmap вокруг snapshot-mid был когерентен).
+#[derive(Default, Clone)]
+struct HeatmapBucketState {
+    bids: Vec<(i64, i64)>,
+    asks: Vec<(i64, i64)>,
+    mid: Option<i64>,
+}
+
+impl HeatmapBucketState {
+    /// Вычислить mid ИЗ bids/asks: None, если какая-то сторона пуста. `compute_mid_from` —
+    /// pure-функция, мутаций нет.
+    fn mid_from(bids: &[(i64, i64)], asks: &[(i64, i64)]) -> Option<i64> {
+        let best_bid = bids.iter().filter(|(_, s)| *s > 0).map(|(p, _)| *p).max()?;
+        let best_ask = asks.iter().filter(|(_, s)| *s > 0).map(|(p, _)| *p).min()?;
+        Some((best_bid + best_ask) / 2)
+    }
+
+    /// Обновить бакет свежим снимком книги. Если mid вычислим — сохранить; иначе оставить
+    /// прежний кэш (односторонняя книга → используем последний известный mid).
+    fn refresh(&mut self, bids: Vec<(i64, i64)>, asks: Vec<(i64, i64)>) {
+        if let Some(m) = Self::mid_from(&bids, &asks) {
+            self.mid = Some(m);
+        }
+        self.bids = bids;
+        self.asks = asks;
+    }
 }
 
 impl Reducer {
@@ -369,6 +456,9 @@ impl Reducer {
             vwap: VwapAcc::default(),
             depth: Vec::new(),
             vp: VolumeProfileAcc::default(),
+            book: book::OrderBook::new(),
+            heatmap_buckets: BTreeMap::new(),
+            bubbles: BTreeMap::new(),
         }
     }
 
@@ -432,9 +522,20 @@ impl Reducer {
         self.vp.apply_trade(*ts_exch_ms, *price, *size);
     }
 
+    /// M-23 HM-I-4 STUB (будет имплементирован в task #4): Volume Bubbles — `(time_s, price_e8)
+    /// → (buy, sell)`. Цены НЕ выдумываются (ключи создаются только на Trade). Вызывается
+    /// ТОЛЬКО из apply (не из seed) — иначе duplicate-count при fold. Task #2-3 оставляет
+    /// STUB-noop для совместимости типов; task #4 наполнит `self.bubbles`.
+    #[allow(unused_variables)]
+    fn apply_bubbles(&mut self, event: &Event) {
+        // STUB: bubbles impl выходит в task #4. Типы и поля уже на месте — HM-I-4 тест
+        // просто не находит ячеек и падает (RED), пока task #4 не реализует аккумулятор.
+    }
+
     fn apply(&mut self, event: &Event) {
         self.apply_vwap(event, true);
         self.apply_vp(event);
+        self.apply_bubbles(event);
         let EventKind::Md(md) = &event.kind else {
             return;
         };
@@ -467,9 +568,13 @@ impl Reducer {
                 asks,
                 ts_exch_ms,
             } => {
+                // M-23: применить к L2Delta-реконструированной книге (replace), обновить
+                // heatmap-бакет для close-семантики.
+                self.book.apply_snapshot(bids, asks);
                 let Some(time_s) = self.bucket_time_s(*ts_exch_ms) else {
                     return;
                 };
+                self.refresh_heatmap_bucket(time_s);
                 if self.depth.is_empty() {
                     for &band in &self.selector.bands {
                         for side in [Side::Buy, Side::Sell] {
@@ -487,8 +592,34 @@ impl Reducer {
                         .insert(time_s, depth_within(bids, asks, row.side, row.band));
                 }
             }
+            MdPayload::L2Delta {
+                bids,
+                asks,
+                ts_exch_ms,
+                ..
+            } => {
+                // M-23: L2Delta ВЕТКА — зеркалит venue (M-29 `apply_delta`): size==0 → remove,
+                // size>0 → upsert. Обновляет книгу + heatmap-бакет. depth_series (полосы)
+                // НЕ апдейтится — депт-серия остаётся snapshot-only (M-22 семантика).
+                self.book.apply_delta(bids, asks);
+                let Some(time_s) = self.bucket_time_s(*ts_exch_ms) else {
+                    return;
+                };
+                self.refresh_heatmap_bucket(time_s);
+            }
             _ => {}
         }
+    }
+
+    /// M-23: обновить snapshot-копию книги для бакета (close-семантика). Вызывается на каждом
+    /// L2-апдейте селектора (L2Snapshot/L2Delta) — последний апдейт в бакете остаётся.
+    /// При обновлении mid либо пере-вычисляется (если обе стороны непустые), либо кэш
+    /// сохраняется (fallback на последний известный mid для HM-I-1 кейса с удалённой стороной).
+    fn refresh_heatmap_bucket(&mut self, time_s: i64) {
+        let bids = self.book.levels(Side::Buy);
+        let asks = self.book.levels(Side::Sell);
+        let entry = self.heatmap_buckets.entry(time_s).or_default();
+        entry.refresh(bids, asks);
     }
 
     fn finish(self) -> SeriesBundle {
@@ -535,14 +666,147 @@ impl Reducer {
 
         let volume_profile = self.vp.into_rows();
 
+        // M-23: heatmap + COB + bubbles. `build_heatmap_cob` использует сохранённые снимки
+        // книги из `heatmap_buckets` (close-семантика) + bubbles из `bubbles` (Trade-аккумулятор).
+        let (heatmap, cob) = build_heatmap_and_cob(&self.selector, self.heatmap_buckets);
+        let volume_bubbles = build_volume_bubbles(self.bubbles);
+
         SeriesBundle {
             ohlcv,
             cumulative_delta,
             depth_series,
             vwap,
             volume_profile,
+            heatmap,
+            cob,
+            volume_bubbles,
         }
     }
+}
+
+/// M-23: построить `Vec<HeatmapCell>` + `Vec<CobLevel>` из per-bucket снимков книги.
+/// Heatmap: per бакет, ячейки в окне `[mid*(1−W), mid*(1+W)]`, W=max(bands). Провенанс на
+/// ячейках глубже 1.3% от mid (HM-I-2). COB: финальный стакан в том же окне, mid с fallback
+/// на последний известный.
+///
+/// **GW-I-3 / HM-I-5 детерминизм:** heatmap/cob выход нормализуется по ключу `(time_s, side,
+/// price_e8)` / `(side, price_e8)` — СОВПАДАЕТ с BTreeMap-порядком `merge_heatmap`/`merge_cob`,
+/// благодаря чему `snapshot(C) + frames_since(C)` БАЙТ-идентичен `snapshot(LATEST)` (любой
+/// путь fold'а выдаёт тот же вектор, что и полная свёртка).
+fn build_heatmap_and_cob(
+    selector: &Selector,
+    heatmap_buckets: BTreeMap<i64, HeatmapBucketState>,
+) -> (Vec<HeatmapCell>, Vec<CobLevel>) {
+    let w = selector.bands.iter().copied().fold(0.0_f64, f64::max);
+    let mut heatmap_out: Vec<HeatmapCell> = Vec::new();
+    let mut last_cob_bids: Vec<(i64, i64)> = Vec::new();
+    let mut last_cob_asks: Vec<(i64, i64)> = Vec::new();
+
+    for (time_s, state) in heatmap_buckets.iter() {
+        let Some(mid) = state.mid else {
+            // mid ещё не определился (без двусторонней книги) → COB копим текущее, heatmap пропускаем.
+            last_cob_bids = state.bids.clone();
+            last_cob_asks = state.asks.clone();
+            continue;
+        };
+        if mid <= 0 {
+            last_cob_bids = state.bids.clone();
+            last_cob_asks = state.asks.clone();
+            continue;
+        }
+        let low = (mid as f64 * (1.0 - w)) as i64;
+        let high = (mid as f64 * (1.0 + w)) as i64;
+        let deep_thr = (mid as f64 * 0.013) as i64; // 1.3% от mid
+        let prov_str = "diff-reconstructed".to_string();
+
+        // bid: в окне price ∈ [low, mid]; HBMAP-порядок — (side, price) ascending →
+        // для bid — price ascending (против естественного bookmap «лучшие наверху»).
+        // GW-I-3/HM-I-5 приоритетнее UX-порядка: выходы `build` и `merge` БАЙТ-идентичны.
+        for &(price, size) in state.bids.iter() {
+            if size <= 0 || price < low || price > mid {
+                continue;
+            }
+            let dist = mid - price;
+            let deep = dist > deep_thr;
+            heatmap_out.push(HeatmapCell {
+                time_s: *time_s,
+                side: "bid".to_string(),
+                price_e8: price,
+                size_e8: size,
+                depth_band_provenance: deep.then(|| prov_str.clone()),
+            });
+        }
+
+        // ask: в окне price ∈ [mid, high]; BTreeMap-порядок — price ascending.
+        for &(price, size) in state.asks.iter() {
+            if size <= 0 || price < mid || price > high {
+                continue;
+            }
+            let dist = price - mid;
+            let deep = dist > deep_thr;
+            heatmap_out.push(HeatmapCell {
+                time_s: *time_s,
+                side: "ask".to_string(),
+                price_e8: price,
+                size_e8: size,
+                depth_band_provenance: deep.then(|| prov_str.clone()),
+            });
+        }
+
+        // COB: последний снимок книги → финальные bids/asks в окне (натуральный bookmap-порядок
+        // bids desc / asks asc сохраняется в COB — это легитимный «правый столбец» HMI).
+        last_cob_bids = state
+            .bids
+            .iter()
+            .copied()
+            .filter(|&(p, s)| s > 0 && p >= low && p <= mid)
+            .collect();
+        last_cob_bids.sort_by(|a, b| b.0.cmp(&a.0)); // bid desc
+        last_cob_asks = state
+            .asks
+            .iter()
+            .copied()
+            .filter(|&(p, s)| s > 0 && p >= mid && p <= high)
+            .collect();
+        last_cob_asks.sort_by(|a, b| a.0.cmp(&b.0)); // ask asc
+    }
+
+    // COB: привести к merge_cob порядку (side, price_e8) — BTreeMap-сортировка даёт
+    // "ask"<"bid" алфавитно, и в этой норме build == merge (GW-I-3 byte-identity).
+    let mut cob: Vec<CobLevel> = Vec::with_capacity(last_cob_bids.len() + last_cob_asks.len());
+    for (price, size) in &last_cob_asks {
+        cob.push(CobLevel {
+            side: "ask".to_string(),
+            price_e8: *price,
+            size_e8: *size,
+        });
+    }
+    for (price, size) in &last_cob_bids {
+        cob.push(CobLevel {
+            side: "bid".to_string(),
+            price_e8: *price,
+            size_e8: *size,
+        });
+    }
+    cob.sort_by(|a, b| a.side.cmp(&b.side).then(a.price_e8.cmp(&b.price_e8)));
+
+    // Heatmap нормализуем по (time_s, side, price_e8) — совпадение с merge_heatmap BTreeMap.
+    heatmap_out.sort_by(|a, b| {
+        a.time_s
+            .cmp(&b.time_s)
+            .then(a.side.cmp(&b.side))
+            .then(a.price_e8.cmp(&b.price_e8))
+    });
+
+    (heatmap_out, cob)
+}
+
+/// M-23: построить `Vec<BubbleCell>` из `bubbles: BTreeMap<(time_s, price), (buy, sell)>`.
+/// Сортировка: `(time_s, price_e8)` возрастание — стабильная (HM-I-5 детерминизм).
+/// STUB task #2-3: пустой Vec (HM-I-4 остаётся RED). Task #4 перепишет реализацию.
+fn build_volume_bubbles(bubbles: BTreeMap<(i64, i64), (i64, i64)>) -> Vec<BubbleCell> {
+    let _ = bubbles; // STUB — bubbles impl выходит в task #4
+    Vec::new()
 }
 
 fn depth_within(bids: &[Level], asks: &[Level], side: Side, band: f64) -> i64 {
@@ -679,8 +943,69 @@ impl Snapshot {
         self.series.volume_profile =
             merge_volume_profile(&self.series.volume_profile, &frame.delta.volume_profile);
 
+        // M-23 heatmap merge: keyed by (time_s, side, price_e8), close-семантика per бакет —
+        // для одного и того же ключа incoming выигрывает (последний book-applied в этом бакете).
+        // BTreeMap обеспечивает стабильный порядок (HM-I-5 / GW-I-3 детерминизм).
+        self.series.heatmap = merge_heatmap(&self.series.heatmap, &frame.delta.heatmap);
+
+        // M-23 COB merge: keyed by (side, price_e8), close-семантика — incoming выигрывает.
+        self.series.cob = merge_cob(&self.series.cob, &frame.delta.cob);
+
+        // M-23 bubbles merge: keyed by (time_s, price_e8), кумулятивная (НЕ close) —
+        // складываем buy/sell (GW-I-4: frame-серия несёт cumulative-приращение).
+        self.series.volume_bubbles =
+            merge_bubbles(&self.series.volume_bubbles, &frame.delta.volume_bubbles);
+
         self.cursor = frame.to;
     }
+}
+
+/// M-23: слить heatmap двух снапшотов по ключу `(time_s, side, price_e8)`. Семантика
+/// close (incoming выигрывает для совпадающего ключа — последний book-applied в бакете).
+/// Итоговый порядок — `(time_s, side, price_e8)` возрастание (BTreeMap).
+fn merge_heatmap(existing: &[HeatmapCell], incoming: &[HeatmapCell]) -> Vec<HeatmapCell> {
+    let mut map: BTreeMap<(i64, String, i64), HeatmapCell> = BTreeMap::new();
+    for cell in existing.iter().chain(incoming.iter()) {
+        map.insert(
+            (cell.time_s, cell.side.clone(), cell.price_e8),
+            cell.clone(),
+        );
+    }
+    map.into_values().collect()
+}
+
+/// M-23: слить cob двух снапшотов.
+///
+/// **COB = point-in-time снимоК книги (НЕ additive-серия):** каждый frame несёт полный COB на
+/// конец frame'а, merge = «incoming заменяет existing целиком» (если непустой). Альтернатива
+/// (merge по ключу с last-wins) даёт устаревшие уровни от промежуточных frame'ов — GW-I-4
+/// тест `mid_stream_snapshot_completeness_merges_same_bucket` обнаруживает это (промежуточное
+/// состояние книги в frame1 не равно финальному).
+fn merge_cob(existing: &[CobLevel], incoming: &[CobLevel]) -> Vec<CobLevel> {
+    if incoming.is_empty() {
+        // Пустой frame (событий не было, или COB не построился) → prior COB сохраняется
+        // без изменений (поддерживает partial-fold, когда финальный frame ещё не пришёл).
+        return existing.to_vec();
+    }
+    // Incoming — последнее наблюдение: заменяет existing. Дедупликация по (side, price_e8)
+    // нужна лишь на случай дублей в самом incoming (теоретически); порядок — `(side, price)`
+    // возрастание (side алфавитно: "ask" перед "bid").
+    let mut map: BTreeMap<(String, i64), CobLevel> = BTreeMap::new();
+    for level in incoming {
+        map.insert((level.side.clone(), level.price_e8), level.clone());
+    }
+    let mut out: Vec<CobLevel> = map.into_values().collect();
+    out.sort_by(|a, b| a.side.cmp(&b.side).then(a.price_e8.cmp(&b.price_e8)));
+    out
+}
+
+/// M-23: слить bubbles двух снапшотов по `(time_s, price_e8)`. Кумулятивная семантика: для
+/// совпадающего ключа buy/sell СКЛАДЫВАЮТСЯ (НЕ последний выигрывает — это cumulative объём).
+/// STUB task #2-3: возвращает пустой Vec (HM-I-4 остаётся RED). Task #4 перепишет с реальным
+/// сложением cumulative-объёмов при fold'е.
+fn merge_bubbles(existing: &[BubbleCell], incoming: &[BubbleCell]) -> Vec<BubbleCell> {
+    let _ = (existing, incoming); // STUB
+    Vec::new()
 }
 
 fn cumulative_to_deltas(series: &[(i64, i64)]) -> BTreeMap<i64, i64> {

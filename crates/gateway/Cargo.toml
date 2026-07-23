@@ -14,6 +14,7 @@ license.workspace = true
 # он же добавляет СВОИ impl-deps (book/research-cli/postcard) в [dependencies].
 
 [dependencies]
+book = { path = "../book" }
 contracts = { path = "../contracts" }
 journal = { path = "../journal" }
 serde = { version = "1", features = ["derive"] }
