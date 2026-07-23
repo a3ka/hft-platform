@@ -88,6 +88,21 @@ pub struct OhlcvRow {
     pub volume: i64,
 }
 
+/// M-24 Session Volume Profile (SVP) — гистограмма объёма по ТОРГОВАННЫМ ценам per UTC-сессия
+/// (VB-I-6, `utc_session_id`). POC = argmax объёма (тай-брейк → низшая цена); Value Area по
+/// алгоритму §Design milestone'а (70%-зона, расширение к большему соседу, тай above==below → верх).
+/// Поля — РОВНО как в milestone M-24 §Контракт-форма (RED-тесты `red_volume_profile.rs`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct VolumeProfileRow {
+    pub session_id: i64,
+    pub poc_e8: i64,
+    pub vah_e8: i64,
+    pub val_e8: i64,
+    pub va_pct_e8: i64,
+    /// `(price_e8, volume_e8)`, СОРТ по `price` возрастанию; только ТОРГОВАННЫЕ цены.
+    pub bins: Vec<(i64, i64)>,
+}
+
 /// Depth time-series per (side, band) (зеркалит export v1 §4). BID/ASK — РАЗДЕЛЬНЫЕ серии.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DepthRow {
@@ -203,6 +218,28 @@ struct DepthAcc {
     values: BTreeMap<i64, i64>,
 }
 
+/// M-24 Volume Profile accumulator (M-24 VP-аккумулятор). Per-session гистограмма
+/// `price_e8 → объём (i128)`. State растёт с числом РАЗНЫХ цен (BTreeMap-узлов), не с числом
+/// событий (GW-I-2). i128 страхует Σ size от переполнения i64 на длинных сессиях (детерминизм,
+/// без f64).
+#[derive(Default)]
+struct VolumeProfileAcc {
+    /// `session_id → (price_e8 → volume i128)`.
+    bins: BTreeMap<i64, BTreeMap<i64, i128>>,
+}
+
+impl VolumeProfileAcc {
+    fn apply_trade(&mut self, ts_ms: i64, price: i64, size: i64) {
+        let session_id = utc_session_id(ts_ms);
+        *self
+            .bins
+            .entry(session_id)
+            .or_default()
+            .entry(price)
+            .or_insert(0) += i128::from(size);
+    }
+}
+
 /// Incremental form of the M-17 reducers. State grows only with the emitted time buckets,
 /// never with the number of journal events.
 struct Reducer {
@@ -211,6 +248,8 @@ struct Reducer {
     bucket_delta: BTreeMap<i64, i64>,
     vwap: VwapAcc,
     depth: Vec<DepthAcc>,
+    /// M-24: per-session Volume Profile accumulator (price→объём).
+    vp: VolumeProfileAcc,
 }
 
 impl Reducer {
@@ -221,6 +260,7 @@ impl Reducer {
             bucket_delta: BTreeMap::new(),
             vwap: VwapAcc::default(),
             depth: Vec::new(),
+            vp: VolumeProfileAcc::default(),
         }
     }
 
@@ -260,8 +300,33 @@ impl Reducer {
         self.apply_vwap(event, false);
     }
 
+    /// M-24: аккумулировать сделку в per-session VP-гистограмму. Вызывается ТОЛЬКО из apply —
+    /// seed (события `seq <= after`) НЕ обновляет VP: per-session гистограмма без time-bucket
+    /// эмита, seed-VP дал бы cumulative state в frame.delta → double-counting при apply
+    /// (snapshot(C).vp уже содержит эти бины). Аналогия: VWAP seed = аккумулятор без эмита,
+    /// VP seed = nothing (нет time-bucket эмита → нет «разделения» emit/accumulate).
+    fn apply_vp(&mut self, event: &Event) {
+        let EventKind::Md(md) = &event.kind else {
+            return;
+        };
+        if !self.selector.matches(md) {
+            return;
+        }
+        let MdPayload::Trade {
+            price,
+            size,
+            ts_exch_ms,
+            ..
+        } = &md.payload
+        else {
+            return;
+        };
+        self.vp.apply_trade(*ts_exch_ms, *price, *size);
+    }
+
     fn apply(&mut self, event: &Event) {
         self.apply_vwap(event, true);
+        self.apply_vp(event);
         let EventKind::Md(md) = &event.kind else {
             return;
         };
