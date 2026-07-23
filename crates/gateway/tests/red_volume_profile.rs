@@ -180,3 +180,57 @@ fn vp_prices_not_invented() {
         "VP-I-4: цена без сделок (102) НЕ выдумывается"
     );
 }
+
+// === RN-19 (тай-брейки — testing.md #4): прежние фикстуры их обходили ⇒ инвариант держался
+// реализацией, не тестом. Пинуем ОБА правила §Design: POC тай→НИЗШАЯ, VA тай→ВЕРХНИЙ. ===
+
+#[test]
+fn vp_poc_tie_goes_to_lowest_price() {
+    // VP-I-1 тай: 100:5, 101:1, 102:5 — макс. объём (5) на ДВУХ ценах. POC = НИЗШАЯ (100).
+    // Анти-плацебо: impl с тай→высшая дал бы 102.
+    let dir = journal_of(vec![
+        trade(100.0, 5.0, T),
+        trade(101.0, 1.0, T + 1),
+        trade(102.0, 5.0, T + 2),
+    ]);
+    let a = snap(dir.path());
+    let row = a
+        .series
+        .volume_profile
+        .first()
+        .expect("volume_profile непуст");
+    assert_eq!(
+        row.poc_e8,
+        to_fixed(100.0),
+        "POC-тай (100 и 102 по 5) обязан разрешиться в НИЗШУЮ цену (100), не 102"
+    );
+}
+
+#[test]
+fn vp_value_area_tie_expands_upward() {
+    // VP-I-2 тай: 101:2, 102:6, 103:2. total=10, target=ceil(10·0.7)=7. POC=102(6), acc=6.
+    // Шаг: above(103)=2 == below(101)=2 → ТАЙ → берём ВЕРХНИЙ (103). acc=8≥7. VA=[102,103].
+    // ⇒ VAH=103, VAL=102. Анти-плацебо: impl с тай→нижний дал бы VAL=101, VAH=102.
+    let dir = journal_of(vec![
+        trade(101.0, 2.0, T),
+        trade(102.0, 6.0, T + 1),
+        trade(103.0, 2.0, T + 2),
+    ]);
+    let a = snap(dir.path());
+    let row = a
+        .series
+        .volume_profile
+        .first()
+        .expect("volume_profile непуст");
+    assert_eq!(row.poc_e8, to_fixed(102.0), "POC=102");
+    assert_eq!(
+        row.vah_e8,
+        to_fixed(103.0),
+        "VA-тай (above==below) → расширение ВВЕРХ: VAH=103"
+    );
+    assert_eq!(
+        row.val_e8,
+        to_fixed(102.0),
+        "VA-тай → нижняя граница остаётся POC=102 (не спускается к 101)"
+    );
+}
