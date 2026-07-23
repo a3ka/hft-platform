@@ -325,6 +325,29 @@ fn compute_vp_row(session_id: i64, hist: BTreeMap<i64, i128>) -> VolumeProfileRo
     }
 }
 
+/// M-24 Snapshot::apply helper: слить volume_profile двух снапшотов по `session_id` —
+/// восстановить per-session гистограммы из row.bins (existing + incoming), сложить аддитивно
+/// (i128 страхует сумму), пересчитать POC/VA через `compute_vp_row`. Не дубль-строки:
+/// одна `VolumeProfileRow` per сессия (VP-I-3 merge-инвариант), даже если сессия в обоих.
+fn merge_volume_profile(
+    current: &[VolumeProfileRow],
+    incoming: &[VolumeProfileRow],
+) -> Vec<VolumeProfileRow> {
+    let mut hist: BTreeMap<i64, BTreeMap<i64, i128>> = BTreeMap::new();
+    for row in current.iter().chain(incoming.iter()) {
+        let h = hist.entry(row.session_id).or_default();
+        for &(price, vol) in &row.bins {
+            *h.entry(price).or_insert(0) += i128::from(vol);
+        }
+    }
+    let mut rows: Vec<VolumeProfileRow> = hist
+        .into_iter()
+        .map(|(session_id, bins)| compute_vp_row(session_id, bins))
+        .collect();
+    rows.sort_by_key(|r| r.session_id);
+    rows
+}
+
 /// Incremental form of the M-17 reducers. State grows only with the emitted time buckets,
 /// never with the number of journal events.
 struct Reducer {
@@ -648,6 +671,13 @@ impl Snapshot {
         let mut vwap: BTreeMap<i64, i64> = self.series.vwap.drain(..).collect();
         vwap.extend(frame.delta.vwap.iter().copied());
         self.series.vwap = vwap.into_iter().collect();
+
+        // M-24: volume_profile сливается по session_id — восстанавливаем per-session гистограммы
+        // из bins (existing + incoming), складываем, пересчитываем POC/VA (compute_vp_row).
+        // Не дубль-строки: одна VolumeProfileRow per сессия (VP-I-3 merge-инвариант), даже
+        // если сессия присутствует в обоих sources.
+        self.series.volume_profile =
+            merge_volume_profile(&self.series.volume_profile, &frame.delta.volume_profile);
 
         self.cursor = frame.to;
     }
