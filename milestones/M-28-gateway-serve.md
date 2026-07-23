@@ -54,9 +54,11 @@ rate-limiting/TLS-termination (инфра-слой деплоя).
   `crates/gateway-serve/src/lib.rs` — ТОЛЬКО контракт-типы (`ServeMsg`, `Claims`, `AuthError`) + сигнатуры
   (`verify_token`, `snapshot_msg`, `frames_msgs`) с `unimplemented!()`, `crates/gateway-serve/Cargo.toml`,
   запись в `members` root `Cargo.toml`, `scripts/verify_M-28.sh`.
-- **engine-dev (impl, зона расширена — новый транспорт-крейт):** `crates/gateway-serve/src/**` — тела auth
-  (jsonwebtoken), wire, serve-adapter, WS-сервер (tokio-tungstenite: accept→verify JWT→snapshot+frames+replay).
-  Свои deps (`jsonwebtoken`, `tokio-tungstenite`, `tokio`) в `crates/gateway-serve/Cargo.toml`.
+- **engine-dev (impl) — BINDING carve-out:** `crates/gateway-serve/src/**` + `crates/gateway-serve/Cargo.toml`.
+  Это НЕ выход за зону: `crates/gateway-serve` закреплён за engine-dev durable в `.claude/rules/scope-guard.md`
+  (WS-транспорт M-28) — milestone и scope-guard согласованы (C-024 блокер #3). Тела auth (jsonwebtoken), wire,
+  serve-adapter, `server::{bind,serve}` + bin `gateway-serve` (WS: accept→verify JWT→snapshot+frames+replay).
+  Свои deps в `crates/gateway-serve/Cargo.toml`. **База:** worktree на `origin/feat/M-28-gateway-serve`.
 - **Forbidden:** `crates/contracts` (T1), `crates/gateway/src` (ЧИТАЕТ как lib, НЕ правит), `crates/{risk,
   killswitch,oms,venue-*,journal,recorder}`, ЛЮБОЙ app-БД-клиент (postgres/sqlx/diesel — GS-I-1), journal-writer,
   order-path.
@@ -68,8 +70,9 @@ rate-limiting/TLS-termination (инфра-слой деплоя).
 | 1 | ⏳ | GS-I-* RED + crate-скелет (ServeMsg/Claims/сигнатуры unimplemented + Cargo + members) + `verify_M-28.sh` | architect | compile-RED; достижимо; fmt-clean (RN-17) |
 | 2 | ⏳ | `auth::verify_token` (jsonwebtoken HS256, stateless) | engine-dev | GS-I-2 GREEN |
 | 3 | ⏳ | `wire::ServeMsg` (JSON) + serve-adapter `snapshot_msg`/`frames_msgs` (тонкий passthrough) | engine-dev | GS-I-4/GS-I-5 GREEN |
-| 4 | ⏳ | WS-сервер bin (tokio-tungstenite): accept→verify JWT→snapshot+incremental+replay | engine-dev | smoke: клиент с валидным JWT → снапшот; невалидный → отказ |
-| 5 | ⏳ | (smoke, не детерм-оракул) интеграционный WS-хендшейк тест | engine-dev/tester | локальный сервер+клиент, JWT-путь |
+| 4 | ⏳ | `server::{bind,serve,local_addr}` (tokio-tungstenite: accept→verify JWT→snapshot+push+replay) + config-парсинг в `main.rs` | engine-dev | bin компилируется; **`smoke_ws.rs` GREEN** (валидный JWT→snapshot, невалидный→отказ) |
+
+*(smoke `tests/smoke_ws.rs` — architect-provided RED, acceptance-поверхность task #4, C-024 блокер #2; НЕ детерм-оракул — IO/сеть, но обязателен. §8 деплой-гейт — решающий.)*
 
 ## Гейты
 
