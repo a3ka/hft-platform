@@ -1038,6 +1038,58 @@ PASS → reviewer APPROVED. **critic НЕ требовался** (не T1/risk/k
   GREEN-коммиты НЕ были на `origin/feat/M-20` (там остался RED) — reviewer фетчил из клона; origin/feat/M-20
   досведён reviewer'ом до GREEN при merge.
 
+## Volume Profile SVP (M-24 «сессионный профиль объёма в gateway» — ✅ MERGED `7bd3a69`, reviewer APPROVED 2026-07-23; §8-lite GREEN inert)
+Второй пост-gateway индикатор Трека B (после M-20). SVP = гистограмма объёма, торгованного на КАЖДОЙ цене
+per UTC-сессия (якорь 00:00), из неё POC (Point of Control) + Value Area (VAH/VAL/va_pct, 70%-зона вокруг POC).
+Вливается в `gateway::SeriesBundle` аддитивно (новое поле `volume_profile: Vec<VolumeProfileRow>` В КОНЕЦ,
+`GATEWAY_SCHEMA_VERSION` 3→4), считается тем же streaming-редьюсером, что snapshot/frames/replay → **live == replay**
+сохранён. **Переиспользует VB-I-6** (`utc_session_id`, введён M-20) — не переопределяет (verify-канарейка: ровно
+один `const fn utc_session_id` в src). Цепочка: architect (VP-I-1..4 RED + verify с fmt+clippy по RN-17) →
+engine-dev (tasks 2-4) → tester PASS → reviewer APPROVED. **critic НЕ требовался** (не T1/risk/ks/oms/venue, не
+новый крейт, <5 коммитов — doc-гейт §9); **risk-critic N/A** (MD-only read-only gateway). reviewer — единственный
+гейт, поэтому анти-плацебо + seed/apply-корректность проверены глубже.
+- `crates/gateway/src/lib.rs` (engine-dev, единственный тронутый файл, 3 атомарных коммита #2/#3/#4) — `VolumeProfileRow`
+  T-designate тип (поля РОВНО как milestone §Контракт-форма: `session_id/poc_e8/vah_e8/val_e8/va_pct_e8/bins`);
+  `VolumeProfileAcc` в `Reducer`: **i128-аккумуляция** `BTreeMap<session_id, BTreeMap<price_e8, i128>>`
+  (`hist[session][price] += size`; VP-I объём-взвешен, детерминизм без f64; state растёт с числом РАЗНЫХ цен, не
+  событий — GW-I-2); **POC = argmax объёма, тай → низшая цена** (компаратор `v1.cmp(v2).then(p2.cmp(p1))` —
+  reviewer проверил построчно: при равном объёме низшая цена сравнивается как «больше» → выигрывает argmax);
+  **Value Area** по §Design-алгоритму (BINDING): `target = ceil(total·70/100)` на i128, старт {POC}, расширение к
+  большему соседу (`above >= below` → верхний, тай above==below → ВЕРХНИЙ), boundary-safe (`lo>0`-guard,
+  `get(hi+1)`), `va_pct = acc·1e8/total`; **per-session (VB-I-6)** `utc_session_id(ts_exch_ms)`; **per-(venue,symbol)**
+  через централизованный `Selector::matches`; `bins` = ТОЛЬКО торгованные цены, сорт по price возр. (VP-I-4 — пустые
+  цены не выдумываются).
+- **Ключевая тонкость (reviewer проверил, т.к. critic'а не было): `apply_vp` вызывается ТОЛЬКО из `apply`, НЕ из
+  seed.** VP не имеет time-bucket эмита; если бы seed (события `seq ≤ after`) тоже аккумулировал VP, то
+  `frames_since(after).delta.volume_profile` содержал бы кумулятивные бины (включая seeded) → `Snapshot::apply`
+  merge их double-count'ил бы (snapshot(C).vp уже содержит те бины). Инвариант держится потому, что
+  `merge_volume_profile` **реконструирует гистограммы из `row.bins` (existing + incoming), складывает per (session,price)
+  в i128 и пересчитывает POC/VA** — merge АССОЦИАТИВЕН и ТОЧЕН: `snapshot(C).vp[start..C]` ⊕ `frame.vp(C..C']` = полная
+  гистограмма `[start..C']` = `snapshot(C').vp`. `snapshot()` зовёт reduce с `after=START` (ничего не seed'ится, всё
+  идёт через apply) → VP полон в одношаговом снапшоте. **live == replay для VP экземплярно проверен** оракулом
+  `red_gateway_live_eq_replay`: фикстура режет курсором C ДВЕ сделки одной цены (65000: 1.0 затем 2.0) → merge обязан
+  дать 65000: 3.0 (проверяет и accumulate `+=`, и merge-суммирование), и сравнивает ПОЛНЫЙ `SeriesBundle` (incl
+  `volume_profile`) json-идентично.
+- **Контракт (T1) НЕ тронут** — VP читает существующий `MdPayload::Trade` (Граница A). `SeriesBundle.volume_profile` /
+  `VolumeProfileRow` / `GATEWAY_SCHEMA_VERSION=4` — T-designate в `crates/gateway` (не contracts), аддитивно; CT-RFC
+  не нужен; поле добавлено В КОНЕЦ (GW-I-5 аддитивность). Forbidden соблюдён: нет f64 в аккумуляции, нет
+  `read_all`/`Vec<Event>` (через `journal::stream`), order-path/сигнал не тронуты.
+- **Гейты (reviewer перепрогнал независимо на чистом worktree @`7bd3a69`):** `cargo fmt --all -- --check` exit=0;
+  `cargo clippy --workspace --all-targets -D warnings` exit=0; `cargo test --workspace` **338 passed / 0 failed**
+  (112 блоков); `cargo test -p gateway` **22 GREEN** (red_volume_profile 4 / live_eq_replay 6 / прочие 12);
+  `verify_M-24.sh` **6/6 PASS, VERDICT: PASS, exit=0** (incl fmt+clippy RN-17 + live==replay + VB-I-6-канарейка).
+  Анти-плацебо: pre-impl дерево (`95cb9d8^`) содержит 0 ссылок `VolumeProfileRow`/`volume_profile` → RED был
+  compile-RED (тест не собирается без impl).
+- **§8-lite (прод ИНЕРТЕН — gateway read-only библиотека, recorder её не импортирует):** CI `30001408966` success,
+  Deploy `30001408977` success. VPS HEAD `7bd3a69`; eyes-on: `hft-recorder Up (healthy)`, образ = ТОЛЬКО
+  `recorder`+`journal-retention` (gateway-бинаря НЕТ); 10s-проба heartbeat `next_seq 73126916→73127312` (+396),
+  `events 1834→2229`, `ts_wall_ms` свежий, `writable=true`; `RssAnon = 13 996 kB` (TD-021-метрика, норма);
+  0 panic/ERROR/backstop.
+- **M-24 ✅ CLOSED.** Разблокирует M-19 (VP-панель: горизонтальная гистограмма + POC/VA-линии). Известный долг —
+  **TD-034** (bins экспортирует объём как i64 при i128-аккумуляторе; truncation не достижим на практике, NOTE).
+  Оракул-полнота: POC-тай→низшая и VA-тай above==below→верх реализованы верно, но не запинены отдельной фикстурой —
+  **RN-19** (не блокер, зона architect).
+
 ## Пока НЕ реализовано (следующие фазы)
 - Крейты `risk`/`killswitch`/`oms`, `runner` — пофазно per DESIGN §10 (M-08: fail-closed риск-гейт
   между `strategy` и `oms`). MM-котирование, wiring весов из `signals.json` (граница B),
