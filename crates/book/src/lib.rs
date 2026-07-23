@@ -21,6 +21,29 @@ impl OrderBook {
         Self::default()
     }
 
+    /// Применить ИНКРЕМЕНТАЛЬНУЮ дельту (Binance `@depth` diff / эквивалент).
+    /// Семантика зеркалит `venue-binance::apply_diff_to_book` §A (live == replay книги):
+    /// `size == 0` → удалить уровень; `size > 0` → upsert (set). Неупомянутые цены НЕ
+    /// трогаются (diff — НЕ источник истины о неупомянутом). Пустая сторона `[]` — цикл
+    /// пуст → no-op, НЕ очистка стороны (testing.md «отсутствие», класс TD-016).
+    /// M-29.
+    pub fn apply_delta(&mut self, bids: &[Level], asks: &[Level]) {
+        for l in bids {
+            if l.size == 0 {
+                self.bids.remove(&l.price);
+            } else {
+                self.bids.insert(l.price, l.size);
+            }
+        }
+        for l in asks {
+            if l.size == 0 {
+                self.asks.remove(&l.price);
+            } else {
+                self.asks.insert(l.price, l.size);
+            }
+        }
+    }
+
     /// Заменить книгу снапшотом (наши данные — снапшоты; JR-first, без diff-sync на старте).
     pub fn apply_snapshot(&mut self, bids: &[Level], asks: &[Level]) {
         self.bids.clear();
@@ -187,13 +210,24 @@ impl Books {
         Self::default()
     }
 
-    /// Применить событие. Trade/Funding игнорируются (книгу двигает только L2Snapshot).
+    /// Применить событие. Trade/Funding/прочее игнорируются; книгу двигает L2Snapshot
+    /// (полная замена) и L2Delta (инкрементальный diff — M-29, replay/reducer-путь).
+    /// Sequencing-поля L2Delta в M-29 НЕ валидируются (gap-detection — follow-up).
     pub fn apply(&mut self, md: &MdEvent) {
-        if let MdPayload::L2Snapshot { bids, asks, .. } = &md.payload {
-            self.map
-                .entry((md.venue, md.symbol.clone()))
-                .or_default()
-                .apply_snapshot(bids, asks);
+        match &md.payload {
+            MdPayload::L2Snapshot { bids, asks, .. } => {
+                self.map
+                    .entry((md.venue, md.symbol.clone()))
+                    .or_default()
+                    .apply_snapshot(bids, asks);
+            }
+            MdPayload::L2Delta { bids, asks, .. } => {
+                self.map
+                    .entry((md.venue, md.symbol.clone()))
+                    .or_default()
+                    .apply_delta(bids, asks);
+            }
+            _ => {}
         }
     }
 
