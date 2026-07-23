@@ -60,10 +60,11 @@ snapshot/frames/replay — **read-only, детерминированный, stat
 
 - **A. Indicator Engine** — `crates/derive` + `crates/research-cli` (расширяются). Новые агрегаты — новые
   чистые редьюсеры; RED-first на каждый (детерминизм-тест обязателен).
-- **B. Read Gateway** (M-22, новый крейт, напр. `crates/gateway`) — **enabling-инфра кокпита**. Тейлит журнал
-  live, прогоняет редьюсеры, отдаёт: (1) снапшот при подключении, (2) инкрементальный **WS-push** (поверх
-  Fastify founder'а), (3) replay (детерминированный проигрыш окна). Тяжёлые серии (heatmap/depth) — бинарные
-  фреймы. **Read-only**: не пишет журнал, recorder не зависит от gateway.
+- **B. Read Gateway** (M-22, крейт `crates/gateway` — библиотека; транспорт `gateway-serve` — отд. milestone).
+  **enabling-инфра кокпита.** Тейлит журнал live, прогоняет редьюсеры, отдаёт: (1) снапшот при подключении,
+  (2) инкрементальный **WS-push** — `gateway-serve` держит WS **напрямую** (tokio-tungstenite, D1/D6; Fastify
+  НЕ в горячей полосе), (3) replay (детерминированный проигрыш окна). Тяжёлые серии (heatmap/depth) — бинарные
+  фреймы (postcard). **Read-only**: не пишет журнал, recorder не зависит от gateway.
 - **C. Export contract v2** — `research/exports/format.md` расширяется АДДИТИВНО (bump `export_schema_version`,
   без T1-RFC — T-designate, как v1; `docs/05` §governance). Новые серии: heatmap, volume_profile, vwap,
   liq/oi/funding-profiles, tpp (с provenance §4).

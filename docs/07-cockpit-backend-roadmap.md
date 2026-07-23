@@ -20,8 +20,10 @@
 - **Новый фокус:** ДАННЫЕ + виз-бэкенд + AI-копилот. «Инфраструктура → данные → потом сигналы/торговля».
 - **Источники:** оставляем изначальные **Binance + Hyperliquid**. **OKX убран** (ранее рассматривался —
   отменён). Новые venue добавляем постепенно ПОТОМ.
-- **Фронт — founder** (`a3ka/code2alpha`, Next15 + lightweight-charts v5 + Fastify). **Мы — бэкенд +
-  стабильный экспорт-контракт.** M-19 (frontend cockpit) — зона founder'а.
+- **Фронт — founder** (`a3ka/code2alpha`, Next15 + lightweight-charts v5). **Мы — бэкенд +
+  стабильный экспорт-контракт.** M-19 (frontend cockpit) — зона founder'а. *(Транспорт уточнён 2026-07-23,
+  D1/D6: горячий WS держит Rust `gateway-serve` напрямую; Fastify как обязательный middle-tier ОТМЕНЁН —
+  app-плоскость (auth/БД) = Next.js+Postgres.)*
 - Визуально: смесь **Bookmap + Trading Platform Pro (TPP)**. Референсы: `tmp/design_screens/`
   (Bookmap-скрины, TPP-скрины, `BID_ASK_*.pdf`, `TradingPlatformPro_Datasets.pdf`, funding — стратегия,
   отложена). Не копировать код/ассеты конкурентов — оригинальная система (бриф §27).
