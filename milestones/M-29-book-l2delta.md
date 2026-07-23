@@ -1,6 +1,6 @@
 # M-29 — book применяет L2Delta (replay/reducer-путь) — основа heatmap
 
-STATUS: **PROPOSED** (2026-07-23, architect). Пивот P-COCKPIT, **Трек A (корректность книги)** —
+STATUS: **DONE — merged to main 2026-07-23** (код `04ce788`, reviewer APPROVED, §8-lite GREEN inert). Пивот P-COCKPIT, **Трек A (корректность книги)** —
 **предусловие M-23 Heatmap**. `crates/book::OrderBook` (replay/reducer-путь) сейчас применяет ТОЛЬКО
 `L2Snapshot`; сырой `MdPayload::L2Delta` (собирается M-18) ИГНОРИРУЕТСЯ → heatmap из инкрементального
 стакана строить не на чем. M-29 добавляет каноническое L2Delta-применение в книгу. Критик НЕ триггерится
@@ -59,9 +59,9 @@ resync-целостность (apply_snapshot не должен ронять в�
 
 | # | Статус | Задача | Кто | Acceptance |
 |---|---|---|---|---|
-| 1 | ⏳ | BL-I-1..6 RED (`red_l2delta_apply.rs`) + `verify_M-29.sh` (fmt+clippy+test, RN-17) | architect | compile-RED (нет `apply_delta`); достижимо; degraded-inputs (BL-I-3) обязателен |
-| 2 | ⏳ | `OrderBook::apply_delta` (set/remove/неупомянутое/пустая-сторона, зеркало venue) | engine-dev | BL-I-1..5 GREEN |
-| 3 | ⏳ | `Books::apply` ветка `MdPayload::L2Delta` → apply_delta | engine-dev | BL-I-6 GREEN; L2Snapshot-путь не сломан; workspace green |
+| 1 | ✅ | BL-I-1..6 RED (`red_l2delta_apply.rs`) + `verify_M-29.sh` (fmt+clippy+test, RN-17) | architect | compile-RED (нет `apply_delta`); достижимо; degraded-inputs (BL-I-3) обязателен |
+| 2 | ✅ | `OrderBook::apply_delta` (set/remove/неупомянутое/пустая-сторона, зеркало venue) | engine-dev | BL-I-1..5 GREEN |
+| 3 | ✅ | `Books::apply` ветка `MdPayload::L2Delta` → apply_delta | engine-dev | BL-I-6 GREEN; L2Snapshot-путь не сломан; workspace green |
 
 ## Гейты
 
