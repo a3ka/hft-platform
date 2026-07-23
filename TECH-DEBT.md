@@ -817,6 +817,11 @@
   merged via `1504d8b`; TD-014 CLOSED.
 
 ## Замечания reviewer'а M-24 (2026-07-23)
+- **RN-19 ✅ CLOSED** (merged `2a36c9f`, reviewer APPROVED 2026-07-23). architect добавил обе тай-брейк фикстуры в
+  `red_volume_profile.rs`: `vp_poc_tie_goes_to_lowest_price` (равный макс-объём на 100 и 102 → POC=100) и
+  `vp_value_area_tie_expands_upward` (`above==below` → VAH=103/VAL=102). Оба GREEN + анти-плацебо (обратный выбор
+  стороны падает); `verify_M-24.sh` 6/6 PASS, `cargo test --workspace` 340/0 (reviewer перепрогнал независимо).
+  Инвариант тай-брейков §Design теперь держится ТЕСТОМ. Ниже — исходное описание.
 - **RN-19** (оракул-полнота: тай-брейки POC/VA реализованы верно, но не запинены фикстурой — класс «happy-path
   фикстуры», testing.md чек-лист #4 «Границы»). VP-I-1 требует «POC тай → низшая цена», VP-I-2 требует «VA тай
   above==below → верхний», и impl оба обрабатывает КОРРЕКТНО (reviewer проверил построчно: POC-компаратор

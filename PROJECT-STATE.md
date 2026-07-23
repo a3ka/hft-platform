@@ -1112,8 +1112,14 @@ engine-dev (tasks 2-4) → tester PASS → reviewer APPROVED. **critic НЕ тр
   0 panic/ERROR/backstop.
 - **M-24 ✅ CLOSED.** Разблокирует M-19 (VP-панель: горизонтальная гистограмма + POC/VA-линии). Известный долг —
   **TD-034** (bins экспортирует объём как i64 при i128-аккумуляторе; truncation не достижим на практике, NOTE).
-  Оракул-полнота: POC-тай→низшая и VA-тай above==below→верх реализованы верно, но не запинены отдельной фикстурой —
-  **RN-19** (не блокер, зона architect).
+- **RN-19 ✅ CLOSED (merged `2a36c9f`, reviewer APPROVED 2026-07-23).** architect добавил тай-брейк фикстуры в
+  `red_volume_profile.rs`: `vp_poc_tie_goes_to_lowest_price` (100:5/101:1/102:5 → POC=100, пинует POC-тай→низшая) и
+  `vp_value_area_tie_expands_upward` (101:2/102:6/103:2, target=7 → VAH=103/VAL=102, пинует VA-тай above==below→верх).
+  Оба GREEN против импла + анти-плацебо (тай→высшая дал бы POC=102; тай→нижний дал бы VAL=101). Теперь оба тай-брейка
+  §Design держатся ТЕСТОМ, не только реализацией. Гейты (reviewer перепрогнал независимо @`2a36c9f`): `verify_M-24.sh`
+  6/6 VERDICT: PASS exit=0 (fmt+clippy+gateway+live_eq_replay+VB-I-6); `cargo test --workspace` **340 passed / 0 failed**
+  (+2 RN-19); `red_volume_profile` 6/6. Диф — test-only + milestone STATUS→DONE (оба architect-owned, кода/src/contracts
+  не тронуто). §8-lite inert (тест не в бинаре; gateway не dep recorder'а). Merge commit `2a36c9f` (ff).
 
 ## Пока НЕ реализовано (следующие фазы)
 - Крейты `risk`/`killswitch`/`oms`, `runner` — пофазно per DESIGN §10 (M-08: fail-closed риск-гейт
