@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 /// Версия экспорт-формы gateway. **Аддитивно** поверх `research-cli::EXPORT_SCHEMA_VERSION = 1`
 /// (VB-I-4/GW-I-5): новые серии (M-23+) добавляют поля, не переопределяют старые; форма меняется
 /// ТОЛЬКО с bump этой константы. T-designate (не T1, не `crates/contracts`).
-pub const GATEWAY_SCHEMA_VERSION: u32 = 3;
+pub const GATEWAY_SCHEMA_VERSION: u32 = 4;
 
 /// Canonical UTC-day session anchor shared by session-cumulative indicators (VB-I-6).
 pub const fn utc_session_id(ts_exch_ms: i64) -> i64 {
@@ -126,6 +126,9 @@ pub struct SeriesBundle {
     pub depth_series: Vec<DepthRow>,
     /// Session-anchored VWAP `(time_s, price ×1e8)`, reset at 00:00 UTC.
     pub vwap: Vec<(i64, i64)>,
+    /// Session Volume Profile (SVP, M-24): `VolumeProfileRow` per сессия, сортировка по `session_id`.
+    /// Только ТОРГОВАННЫЕ цены (VP-I-4): ключи гистограммы — реальные сделки, не «выдуманные».
+    pub volume_profile: Vec<VolumeProfileRow>,
 }
 
 /// Полная детерминированная свёртка окна `[start .. cursor]`.
@@ -237,6 +240,88 @@ impl VolumeProfileAcc {
             .or_default()
             .entry(price)
             .or_insert(0) += i128::from(size);
+    }
+
+    /// Свернуть per-session гистограммы в `Vec<VolumeProfileRow>` (сортировка по `session_id`
+    /// возрастанию). Для каждой сессии — POC (argmax объёма, тай → низшая цена) + Value Area
+    /// (VAH/VAL/va_pct) по §Design milestone'а M-24 (BINDING, детерминированный, i128 без f64).
+    fn into_rows(self) -> Vec<VolumeProfileRow> {
+        let mut rows: Vec<VolumeProfileRow> = self
+            .bins
+            .into_iter()
+            .map(|(session_id, hist)| compute_vp_row(session_id, hist))
+            .collect();
+        rows.sort_by_key(|r| r.session_id);
+        rows
+    }
+}
+
+/// M-24: per-session `VolumeProfileRow` (POC + Value Area по §Design). bins сортируется
+/// по price возр., bins[i].1 = volume (i128 на этапе вычисления, итоговый `i64` ×1e8 в row).
+fn compute_vp_row(session_id: i64, hist: BTreeMap<i64, i128>) -> VolumeProfileRow {
+    // bins сорт по price возр.
+    let mut sorted_bins: Vec<(i64, i128)> = hist.into_iter().collect();
+    sorted_bins.sort_by_key(|&(p, _)| p);
+
+    // total = Σ volume (i128).
+    let total: i128 = sorted_bins.iter().map(|(_, v)| *v).sum();
+    debug_assert!(total > 0, "compute_vp_row вызван на пустой гистограмме");
+
+    // POC: argmax объёма, тай → низшая цена. max_by: «self больше other» → v1>v2, или v1==v2
+    // и p1<p2 (тогда p2>p1 → Greater: self выигрывает).
+    let poc_idx = sorted_bins
+        .iter()
+        .enumerate()
+        .max_by(|(_, (p1, v1)), (_, (p2, v2))| v1.cmp(v2).then(p2.cmp(p1)))
+        .map(|(i, _)| i)
+        .expect("≥1 bin");
+    let poc_e8 = sorted_bins[poc_idx].0;
+
+    // Value Area: target = ceil(total · 70 / 100) — ≥70% объёма. total>0, без знака-потери.
+    let target = (total * 70 + 99) / 100;
+    let mut lo = poc_idx;
+    let mut hi = poc_idx;
+    let mut acc = sorted_bins[poc_idx].1;
+
+    while acc < target {
+        let above = sorted_bins.get(hi + 1).map(|(_, v)| *v).unwrap_or(0);
+        let below = if lo > 0 {
+            sorted_bins.get(lo - 1).map(|(_, v)| *v).unwrap_or(0)
+        } else {
+            0
+        };
+        if above == 0 && below == 0 {
+            break;
+        }
+        if above >= below {
+            // тай above==below → ВЕРХНИЙ (≥ берёт верх).
+            hi += 1;
+            acc += above;
+        } else {
+            // below > 0 → lo ≥ 1, lo-1 безопасен.
+            lo -= 1;
+            acc += below;
+        }
+    }
+
+    let vah_e8 = sorted_bins[hi].0;
+    let val_e8 = sorted_bins[lo].0;
+    // va_pct = acc / total ×1e8 (i128 → i64). Делим ПОСЛЕ умножения, чтобы не терять точность.
+    let va_pct_e8 = (acc * 100_000_000 / total) as i64;
+
+    // bins в row: сорт по price возр.; volume из i128 → i64 (контракт `bins: Vec<(i64,i64)>`).
+    let bins: Vec<(i64, i64)> = sorted_bins
+        .into_iter()
+        .map(|(p, v)| (p, v as i64))
+        .collect();
+
+    VolumeProfileRow {
+        session_id,
+        poc_e8,
+        vah_e8,
+        val_e8,
+        va_pct_e8,
+        bins,
     }
 }
 
@@ -425,11 +510,14 @@ impl Reducer {
 
         let vwap = self.vwap.values.into_iter().collect();
 
+        let volume_profile = self.vp.into_rows();
+
         SeriesBundle {
             ohlcv,
             cumulative_delta,
             depth_series,
             vwap,
+            volume_profile,
         }
     }
 }
