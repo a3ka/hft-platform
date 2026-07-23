@@ -52,6 +52,13 @@ founder-подписью (Граница C).
 invalidation, последующий исход. Живёт в **ОТДЕЛЬНОМ** store (не market-журнал). Назначение: воспроизводимость
 рассуждения, ретро-разбор («что AI видел и почему сказал»), обучение. Аудит — не опция.
 
+**Размещение store (D6, `docs/07` §5, 2026-07-23):** Audit-Log + user-чаты + `strategies` (versioned-конфиг
+§2.3) живут в **application-плоскости — Postgres** (Next.js + `ai_chats`/`ai_messages`/`audit_log`/`strategies`),
+НЕ в market-журнале (`DET-I-1` цел; `AI-I-1`). **Поток стратегии:** юзер редактирует в UI Next.js → Postgres →
+`ai-copilot` читает active strategy (из Postgres или через API Next.js) при сборке AI-контекста → LLM → вывод
+стримится юзеру + пишется в `audit_log`. `gateway-serve` (market-плоскость) про стратегии/чаты НЕ знает
+(разделение плоскостей — `viz-backend` §1 VB-I-9). AI пишет в app-БД, но НЕ в market-журнал (`AI-I-1`).
+
 ## §4. Инварианты (RED-оракулы; sacred, architect-only)
 
 | ID | Инвариант |

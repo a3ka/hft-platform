@@ -52,17 +52,18 @@
 - **recorder** 24/7 в проде: Binance spot+futures, HL; ротация+компакция+ретеншен-доставка живут; recon (M-09).
 - Экспорт-механизм сейчас — **БАТЧ-файл** `<out>/<venue>/<symbol>.json` (read-only, RC-I-7).
 
-## §5. Решения этой сессии (D1–D5 + данные + AI)
+## §5. Решения этой сессии (D1–D6 + данные + AI)
 
 | # | Решение | Статус |
 |---|---|---|
-| **D1 Транспорт** | **WebSocket поверх Fastify** (у founder уже заложено переключение на WS). Снапшот-при-подключении + инкрементальный push + replay-контролы. Heatmap/depth — бинарные фреймы, остальное JSON. | ✅ принято |
+| **D1 Транспорт** (уточнён 2026-07-23) | **Rust `gateway-serve` держит WS напрямую** (tokio-tungstenite), НЕ Fastify-middle-tier. Снапшот-при-подключении + инкрементальный push + replay-контролы; heatmap/depth — бинарные фреймы (postcard), остальное JSON. **Fastify отменён** как обязательный слой: горячий бинарь идёт Rust→браузер без Node-релея (Node-релей = тупой высокобандвидтный прокси + непротестированный слой в детерм-пути). Тейлер co-located с журналом на VPS ⇒ естественно Rust. См. **D6** (app-плоскость). | ✅ принято (Path 1) |
 | **D2 TPP scope** | Строим **COIN-scope** (BTC/ETH) сейчас; **TOTAL/TOTAL1-3/OTHERS** — потом (нужен универсум монет + масштаб сбора). «Всё как у TPP» = принято как цель. | ✅ принято |
 | **D2 TPP формула** | Файлов ХВАТАЕТ для heatmap/VP/VWAP/CVD/footprint/Bid-Ask/Delta — строю сам. **Нужно от founder ТОЛЬКО:** (а) состав `TOTAL1/2/3/OTHERS`; (б) формулы «Secrets» — **MLSP, Margin, Ratio, Speed, Market Diff** (их методик в файлах НЕТ). До этого — `formula_pending`. | ⏳ ждёт founder (частично) |
 | **D2 TPP ДАННЫЕ** | Bid/Ask/Delta требуют глубины **3/5/8/15/30% от mid**. REST Binance кап ~1.3% (BTC spot) / 0.09-0.26% (futures) — сам по себе НЕ годится (= наш TD-004/010). Diff-книга уходит глубже. **НО дальние полосы = потенциальный ФАНТОМ (TD-016, OPEN).** См. §6. | 🔴 БЛОКЕР (TD-016) |
 | **D3 AI размещение** | **Отдельный бэкенд-сервис `ai-copilot`** вне детерминированного ядра, зовёт внешний **мультимодальный LLM-API**, стримит на фронт через WS + пишет Audit-Log. Работает непрерывно без открытого UI. Модель-агностичен. | ✅ принято (провайдер — ждёт founder) |
 | **D4 MVP** | **MVP-1 (без блокеров, строим сейчас):** Read Gateway + heatmap + volume bubbles + COB + Volume Profile (SVP/CVP/FRVP) + CVD (session-reset 00:00 UTC) + VWAP. Цель — **Binance BTCUSDT**. **MVP-2:** TPP COIN→TOTAL, Event Engine, AI. | ✅ принято |
 | **D5 История** | **Tardis.dev** для истории с 2019 (Binance Spot BTCUSDT `incremental_book_L2` с 2019-12-01; futures с 2020-02). HL в 2019 НЕ существовал. Replay-окно (raw локально) — TBD; Storage Box — когда окно перерастёт диск. Бэкфил — отдельно (M-16-класс). | ✅ направление (бюджет — ждёт founder) |
+| **D6 App-плоскость** (2026-07-23) | **Две плоскости по природе данных, НЕ один Fastify-блоб.** (1) **Market-плоскость** — Rust `gateway-serve`: журнал → snapshot/frames/replay, **read-only, детерминированная, stateless по юзеру**. (2) **Application-плоскость** — **Next.js сам** (full-stack): auth (Auth.js/провайдер) + **Postgres** (Neon/Supabase/VPS) для `users/strategies/ai_chats/settings/audit_log`. **Fastify лишний** — Next.js нативно делает всё, что он делал бы. **Мост auth:** Next.js выпускает короткоживущий подписанный **JWT** (HS256 или **Ed25519** — как `INTG-I` founder-подписи); Rust ТОЛЬКО верифицирует подпись (крейт `jsonwebtoken`), в user-БД НЕ ходит. **Инвариант:** user-данные (стратегии/чаты/настройки) — в Postgres, **НЕ в market-журнале** (бережём `DET-I-1`, тот же класс, что `AI-I-1` «AI-выводы вне журнала»). Границы ответственности: app-стек (Next+Postgres+Auth) = founder; ядро (gateway-serve transport + verify-JWT, read-only) = architect. | ✅ принято (Path 1) |
 
 ## §6. Данные — открытый узел (depth-probe + TD-016)
 
