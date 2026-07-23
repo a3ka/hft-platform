@@ -953,6 +953,31 @@ doc-гейт (`research/critiques/C-021-cockpit-docs.md` = NOTE; NOTE-1 Semantic
   параллельно M-20 (VWAP)/M-23 (heatmap). Открытые founder-решения (docs/07 §10): TPP `formula_pending`,
   LLM-провайдер, Tardis-бюджет/окно, масштаб универсума TPP TOTAL.
 
+### D6 App-плоскость + D1 транспорт-уточнение (docs-only MERGED `4741846`, reviewer APPROVED 2026-07-23; deploy ИНЕРТЕН)
+Ветка `docs/cockpit-d6-appplane` (ff `ab9aba6..4741846`, чистый fast-forward поверх `b8c60db`).
+Прошла critic doc-гейт с витком: **C-023 REJECT (`27d827b`) → architect r2 (`83cd926`) → C-023 r2 PASS
+(`4741846`)** — REJECT снимал остаточную Fastify-двусмысленность, r2 её закрыл.
+- **D1 (уточнён):** горячий WS держит Rust `gateway-serve` **напрямую** (tokio-tungstenite), **Fastify
+  как обязательный middle-tier ОТМЕНЁН** (Node-релей = непротестированный слой в детерм-пути). Бинарные
+  фреймы — postcard. `docs/07` §5 D1 + `docs/fa/viz-backend.md` §1/§4-B переписаны согласованно.
+- **D6 (принято, Path 1):** **две плоскости по природе данных.** (1) Market-плоскость — `gateway-serve`:
+  журнал→snapshot/frames/replay, **read-only, детерминированная, stateless по юзеру** (architect-зона).
+  (2) Application-плоскость — **Next.js + Postgres** (`users/strategies/ai_chats/settings/audit_log`),
+  зона founder'а; Fastify лишний. **Мост auth:** Next выпускает короткоживущий подписанный JWT
+  (HS256/Ed25519), Rust ТОЛЬКО верифицирует подпись (`jsonwebtoken`), в user-БД НЕ ходит.
+- **Инвариант VB-I-9** (новый, sacred/architect-only, RED — future): `gateway-serve` не читает/не пишет
+  application-БД; auth = stateless verify JWT без user-БД-lookup; grep-канарейка «gateway не импортирует
+  postgres/sqlx/diesel». User-состояние (стратегии/чаты/настройки) вне market-журнала → `DET-I-1` цел
+  (тот же класс, что `AI-I-1` «AI-выводы вне журнала»). `docs/fa/ai-copilot.md` §3: Audit-Log/чаты/
+  strategies живут в Postgres, `ai-copilot` пишет в app-БД, но НЕ в market-журнал.
+- **Scope/Block-C:** тронуты ТОЛЬКО `docs/07-cockpit-backend-roadmap.md`, `docs/fa/{viz-backend,ai-copilot}.md`,
+  `research/critiques/C-023-d6-appplane.md`. `crates/contracts/**` НЕ тронут; кода/risk/killswitch/oms/venue
+  нет ⇒ reviewer-only, risk-critic НЕ требуется. Авторство коммитов чистое (2 architect + 2 critic).
+  **§8 deploy — ИНЕРТЕН** (docs-only, `crates/**` не тронут → Dockerfile/бинарь не меняются).
+- **Дальше (architect):** транспортный milestone `gateway-serve` (D1/D6 superseding над историческим
+  M-22-текстом `milestones/M-22-read-gateway.md:52-56`) + RED-оракул на VB-I-9 (import-канарейка). D6 —
+  надмножество для транспортного решения.
+
 ## Read Gateway (M-22 «snapshot + live-push + replay» — ✅ MERGED `7799ff2`, reviewer APPROVED 2026-07-22; §8 GREEN inert)
 Первый milestone Трека B кокпита (enabling-инфра): без gateway ни один виз-примитив не доезжает до фронта
 в live. **Новый крейт `crates/gateway`** — read-only консюмер журнала (Граница A) над ОДНИМ кодом
