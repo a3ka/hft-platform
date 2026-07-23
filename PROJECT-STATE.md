@@ -997,6 +997,47 @@ REJECT → r2 REJECT → r3 PASS** (оракулы усилены за 3 кру�
   Task #6 (reference-WS-бинарь) — опционален, в наборе НЕТ; если понадобится транспорт на VPS — отдельный
   milestone со своим §8 (транспорт ≠ детерм-ядро M-22).
 
+## VWAP session-anchored (M-20 «дисплей-VWAP в gateway» — ✅ MERGED `743d0b3`, reviewer APPROVED 2026-07-23; §8-lite GREEN inert)
+Первый пост-gateway индикатор Трека B: VWAP = Σ(px·sz)/Σ(sz) по сессии (якорь 00:00 UTC) вливается в
+`gateway::SeriesBundle` аддитивно (новое поле `vwap`, `GATEWAY_SCHEMA_VERSION` 2→3), считается тем же
+streaming-редьюсером, что snapshot/frames/replay → **live == replay** сохранён. Устанавливает session-примитив
+**VB-I-6** (`utc_session_id` — переиспользуемый `pub const fn`), который M-24 (SVP)/CVD-reset берут как ЕДИНЫЙ
+источник. Цепочка: architect (VW-I-1..4 RED + verify с fmt+clippy по RN-17) → engine-dev (tasks 2-4) → tester
+PASS → reviewer APPROVED. **critic НЕ требовался** (не T1/risk/ks/oms/venue, не новый крейт, <5 коммитов);
+**risk-critic N/A** (MD-only read-only). reviewer — единственный гейт, поэтому анти-плацебо проверен глубже.
+- `crates/gateway/src/lib.rs` (engine-dev, единственный тронутый файл, 79+/3−) — `VwapAcc` в `Reducer`:
+  **i128-аккумуляция** `sum_pv += i128(price)·i128(size)` / `sum_v += i128(size)` (VW-I-2: BTC px·sz ≈ 6e21
+  переполняет i64 на ОДНОМ произведении — architect-оракул `vwap_i128_prod_scale` падает на i64/f64);
+  **session-reset** по `utc_session_id = ts_exch_ms.div_euclid(86_400_000)` (VW-I-3: сделки по разные стороны
+  UTC-полуночи → сброс, пост-бакет несёт только новую сессию — не блендит 100/200→150); **per-venue** через
+  централизованный `Selector::matches` (VW-I-4); значение бакета = session-cumulative `(sum_pv/sum_v) as i64`
+  (close-семантика, пустые не эмитятся). Нет f64 в аккумуляции (детерминизм; verify-канарейка).
+- **Ключевая тонкость (reviewer проверил, т.к. critic'а не было): `seed_vwap(emit=false)` на пропущенных
+  событиях (`seq ≤ after`) в `reduce_event_stream`.** VWAP session-**кумулятивен**, поэтому `frames_since(after)`
+  обязан «прогреть» аккумулятор (sum_pv/sum_v/session_id) от начала сессии БЕЗ эмиссии бакетов — тогда первый
+  эмитированный бакет несёт истинную session-cumulative величину, и `frames_since` VWAP == `snapshot` VWAP на
+  общих бакетах ⇒ **live == replay держится для кумулятивного индикатора** (GW-I-3/4/8 GREEN 6/6). Прогрев —
+  fold без материализации (держатся только 2×i128 + session_id; `values`-map при emit=false не растёт) ⇒
+  bounded-memory (GW-I-2) не нарушен. `Snapshot::apply` сливает `vwap` через BTreeMap-overwrite (кадр несёт
+  более полную session-cumulative величину бакета → перезапись корректна).
+- **Контракт (T1) НЕ тронут** — VWAP читает существующий `MdPayload::Trade` (Граница A). `SeriesBundle.vwap` /
+  `GATEWAY_SCHEMA_VERSION=3` — T-designate, аддитивно; CT-RFC не нужен; GW-I-5 (аддитивность) подтверждён —
+  `red_gateway_export_v2` GREEN с новым полем + v3.
+- **Гейты (reviewer перепрогнал независимо на чистом worktree @299466f, tree идентичен merge `743d0b3`):**
+  `cargo fmt --all -- --check` exit=0; `cargo clippy --workspace --all-targets -D warnings` exit=0;
+  `cargo test --workspace` **334 passed / 0 failed** (111 блоков); `cargo test -p gateway` **18 GREEN**
+  (red_vwap 4 / live_eq_replay 6 / bounded 1 / export_v2 2 / epoch_filter 4 / readonly 1); `verify_M-20.sh`
+  **6/6 PASS, VERDICT: PASS, exit=0** (включая fmt+clippy RN-17 + f64-канарейку).
+- **§8-lite (прод ИНЕРТЕН — gateway read-only библиотека, recorder её не импортирует):** CI `29968074481`
+  success (5m52s), Deploy `29968074476` success (7m13s). VPS HEAD `743d0b3`; eyes-on: `hft-recorder Up
+  (healthy)`, `restarts=0`, образ = ТОЛЬКО `recorder`+`journal-retention` (gateway-бинаря НЕТ); heartbeat
+  свежий, `writable=true`, 10s-проба: `next_seq 70426490→70427579` (+1089), `events 3161→4249` — пишет;
+  `RssAnon = 15 860 kB` (TD-021-метрика, норма); 0 panic/ERROR/backstop.
+- **M-20 ✅ CLOSED.** Разблокирует M-19 (фронт рисует VWAP-линию). Session-примитив VB-I-6 готов для M-24 (SVP)
+  и CVD-reset. **Хайджин-замечание (RN-18):** engine-dev вёл работу в ОТДЕЛЬНОМ клоне `/tmp/hft-engine-m20`,
+  GREEN-коммиты НЕ были на `origin/feat/M-20` (там остался RED) — reviewer фетчил из клона; origin/feat/M-20
+  досведён reviewer'ом до GREEN при merge.
+
 ## Пока НЕ реализовано (следующие фазы)
 - Крейты `risk`/`killswitch`/`oms`, `runner` — пофазно per DESIGN §10 (M-08: fail-closed риск-гейт
   между `strategy` и `oms`). MM-котирование, wiring весов из `signals.json` (граница B),

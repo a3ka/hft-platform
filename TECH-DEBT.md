@@ -804,6 +804,20 @@
   late logs `418=0`, `429=0`, `gap=0`, `stale=0`, CPU/MEM normal, restarts=0. Candidate was
   merged via `1504d8b`; TD-014 CLOSED.
 
+## Замечания reviewer'а M-20 (2026-07-23)
+- **RN-18** (intra-chain push gap — GREEN-коммиты в отдельном клоне, не на `origin/feat/M-NN`) engine-dev
+  реализовал M-20 в ОТДЕЛЬНОМ клоне `/tmp/hft-engine-m20` (не worktree общего чекаута — `git worktree list`
+  его не видит) и НЕ запушил GREEN на `origin/feat/M-20` (там остался только RED `d15e7a8`). tester был
+  вынужден гонять гейты в engine-клоне; reviewer — фетчить объекты из `/tmp/hft-engine-m20` (`git fetch
+  <path> feat/M-20`), проверять и лишь затем досводить `origin/feat/M-20` до GREEN + merge. Тот же класс, что
+  M-22 N1 (коммиты висели на `engine-dev/M-22`, не на shared feat). Работает, но хрупко: коммиты живут ТОЛЬКО
+  в локальном /tmp-клоне до reviewer'а — упади машина, цепочка теряется (ровно риск `branch-hygiene.md` +
+  gates §8 intra-chain). **Правило (durable, зона architect — процессный слой):** мандат dev-агенту обязан
+  явно требовать `git push origin HEAD:feat/M-NN` СВОИХ GREEN-коммитов ПЕРЕД handoff'ом на tester (не работа
+  в приватном клоне); tester/reviewer бутстрапятся с `origin/feat/M-NN`, а не из чужого worktree. Внести в
+  `.claude/rules/gates.md` §8 / handoff-мандат dev как обязательный пункт. Не блокер (M-20 смержен зелёным,
+  аудит-трейл восстановлен), повтор класса — под наблюдением.
+
 ## Замечания reviewer'а M-22 (2026-07-22)
 - **RN-17** (verify обязан зеркалить CI — 3-й инстанс класса RN-8) M-22 прошёл tester'ом с
   `verify_M-22.sh` VERDICT: PASS, но reviewer заблокировал merge: `cargo fmt --all -- --check`
