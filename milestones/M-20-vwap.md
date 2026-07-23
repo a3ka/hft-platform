@@ -1,77 +1,93 @@
-# M-20 — VWAP (session-anchored + rolling) — производный индикатор + кандидат-сигнал
+# M-20 — VWAP (session-anchored) — производный индикатор в gateway SeriesBundle
 
-STATUS: **PROPOSED / QUEUED** (2026-07-21, architect, по запросу founder'а). НЕ стартует без явного
-`go` founder'а И до готовности инфраструктуры (см. «Место в очереди»). Doc-гейт §9 Class A при
-старте (critic на milestone+RED ДО dispatch). Блок-2/3 roadmap (индикаторы/сигналы после инфры).
+STATUS: **PROPOSED — cockpit re-spec** (2026-07-22, architect). Пивот P-COCKPIT, Трек B (MVP-1),
+**первый пост-gateway индикатор** (последовательно после M-22). Переориентирован с батч-экспорта
+(M-17 `format.md`) на **live gateway-путь**: VWAP-серия вливается в `gateway::SeriesBundle` аддитивно
+(export v2 bump), считается тем же streaming-редьюсером, что snapshot/frames/replay (live==replay).
+Низкий риск (чистый Trade-редьюсер, без book/L2Delta). Doc-гейт §9: **critic НЕ триггерится** (не
+контракт T1, не risk/ks/oms/venue, не новый крейт, < 5 коммитов) — reviewer-бэкстоп на PR-time.
 
 ## Objective
 
-VWAP = Σ(price × size) / Σ(size) по окну — вычислим **напрямую из уже собираемого `MdPayload::Trade`**
-(price+size+side+ts_exch_ms): новый захват и T1 НЕ нужны. Это чистый детерминированный редьюсер над
-потоком `Event` (журнал-принцип, «сигнал не видит будущего»). M-20 даёт:
-- **Дисплей-VWAP** (session-anchored + rolling + per-bar) как `LineData` серию для cockpit'а (M-19),
-  через тот же экспорт-контракт `code2alpha`, что M-17 (без новой инфраструктуры);
-- **кандидат-сигнал** «отклонение цены от VWAP» (mean-reversion) — семья S-002+, идёт через
-  анти-оверфит §6 + kill-screen (M-10), как любой сигнал; **вычислимость ≠ альфа**.
+VWAP = Σ(price × size) / Σ(size) по **сессии** (якорь 00:00 UTC), вычислим напрямую из уже собираемого
+`MdPayload::Trade`. M-20 даёт **дисплей-VWAP** как серию `vwap: Vec<(time_s, vwap_e8)>` в
+`gateway::SeriesBundle` для кокпита (M-19), через тот же gateway-транспорт, что M-22. Устанавливает
+**session-модель (VB-I-6)** — единый примитив «якорь 00:00 UTC», который переиспользуют M-24 (SVP) и
+CVD-reset (НЕ переопределяют, один источник).
 
-Устанавливает паттерн «производный индикатор» (детерминированный редьюсер над `Trade`), которому
-следуют будущие индикаторы (TWAP, MA-семейство) — их не нужно каждый раз спекать с нуля.
+**В scope M-20 (дисплей-VWAP):** session-anchored VWAP в gateway + session-модель. **НЕ в scope:**
+rolling-N/per-bar варианты (позже, если нужны фронту), VWAP-deviation **сигнал** (Граница A, отложен
+с торговым треком — квант-деск), gap-флаг честности (VW-I-5 — data-quality, отдельно). Батч-экспорт
+(`research-cli` format.md) VWAP — опционально позже; cockpit-путь (gateway) первичен.
 
-## Contract impact (T1) — НЕТ
+## Contract impact (T1) — НЕТ; export v2 — T-designate аддитивно
 
-VWAP читает существующий `MdPayload::Trade`. Дисплей — производная `LineData` серия (экспорт M-17).
-Новых T1-форм нет → CT-RFC не требуется.
+- **T1-ядро НЕ трогаем** — VWAP читает существующий `MdPayload::Trade` (Граница A, read-only). CT-RFC не нужен.
+- **`gateway::SeriesBundle` += поле `vwap: Vec<(i64 time_s, i64 vwap_e8)>`** (аддитивно; старые v1/v2-консюмеры
+  не ломаются — serde игнорирует незнакомое, GW-I-5). **`GATEWAY_SCHEMA_VERSION` bump 2 → 3** (новая серия).
+  `Snapshot::apply` (bucket-merge) обязан слить `vwap` как остальные серии (session-cumulative — см. §Design).
 
-## Инварианты (RED, sacred)
+## Design (пиновка для engine-dev)
 
-| ID | Инвариант |
-|---|---|
-| VW-I-1 | **Корректность + детерминизм:** VWAP = Σ(price·size)/Σ(size) на фикстуре с известными сделками → ТОЧНОЕ значение (проверяется вручную посчитанным); два прогона одного потока → идентичны. RED: рукописный набор сделок → ожидаемый VWAP до последнего знака |
-| VW-I-2 | **Прод-масштаб без переполнения:** Σ(price·size) на fixed-point ×1e8 копится в **i128** (`i64`-цена × `i64`-размер переполняет i64 на одном произведении, не то что на сумме); НЕТ f64 в аккумуляции (детерминизм). RED: большой поток high-price×large-size — результат корректен, нет overflow/паники |
-| VW-I-3 | **Окна корректны:** (а) session-anchored — сброс аккумулятора на границе якоря (UTC-день или заданный anchor); (б) rolling-N — старые сделки ВЫПАДАЮТ из окна; (в) per-bar — агрегация в бакет таймфрейма детерминирована. RED: последовательность через границу якоря/окна → правильный сброс/выпадение |
-| VW-I-4 | **Per (venue, symbol) — не смешивать площадки:** VWAP считается отдельно на venue; кросс-venue VWAP (если делаем) — ЯВНЫЙ отдельный агрегат с пометкой, не молчаливое суммирование разной ликвидности. RED: сделки двух venue → раздельные VWAP, не слитый |
-| VW-I-5 | **Честность по дырам ленты:** VWAP окна, где лента `Trade` имеет gap (реконнект recorder'а), помечается/отчёт ССЫЛАЕТСЯ на data-quality (`research/data-quality/gaps-*`, M-08). Неполная лента ≠ «точный VWAP» (та же дисциплина, что эпохи ledger'а). RED/гейт: окно с инъецированным gap → VWAP несёт флаг неполноты |
-| VW-I-6 | **(если делаем сигнал) VWAP-deviation — чистый редьюсер:** отклонение `(price − vwap)/vwap` без доступа к будущему, детерминизм-тест обязателен; пре-регистрация H/S-карточки с критериями фальсификации ДО касания test-данных (Граница A) |
+- **VWAP-аккумулятор — в gateway `Reducer`** (рядом с ohlcv/bucket_delta/depth), стримовый fold над
+  `journal::stream` (bounded, как весь gateway — GW-I-2). НЕ collect-then-reduce.
+- **Session-anchored (VB-I-6):** сессия = UTC-день от `ts_exch_ms`: `session_id = ts_exch_ms.div_euclid(86_400_000)`.
+  Аккумулятор держит `(sum_pv: i128, sum_v: i128, session_id)`. На сделке: если `session_id` сменился →
+  **сброс** `sum_pv/sum_v`. Затем `sum_pv += price·size` (i128!), `sum_v += size`. VWAP бакета =
+  `(sum_pv / sum_v)` как `i64` (единицы `price_e8`; session-cumulative running до конца бакета).
+  Session-anchor-хелпер (`session_id`) — переиспользуемый примитив (VB-I-6): M-24/CVD-reset берут ЕГО, не свой.
+- **i128 обязателен (VW-I-2):** `price_e8 (i64) · size_e8 (i64)` переполняет i64 на ОДНОМ произведении
+  (BTC ~1.2e13 × size 5e8 = 6e21 >> i64_max 9.2e18). Копить в i128; НЕТ f64 в аккумуляции (детерминизм).
+- **Бакетирование** VWAP-точек — `bucket_time_s(ts_exch_ms)` (тот же, что ohlcv). Значение бакета =
+  session-cumulative VWAP на конец бакета (close-семантика; пустые бакеты не эмитятся).
+- **Per (venue, symbol)** — `Reducer.apply` уже фильтрует `md.venue/symbol` по `Selector`; VWAP идёт тем же
+  путём → площадки не смешиваются (VW-I-4).
+
+## Инварианты (RED, sacred — architect-only)
+
+| ID | Инвариант | Оракул |
+|---|---|---|
+| **VW-I-1** | **Корректность + детерминизм.** VWAP = Σ(px·sz)/Σ(sz) на фикстуре с известными сделками → ТОЧНОЕ значение (посчитано вручную до знака); два прогона одного потока → идентичны. | `red_vwap.rs::vwap_exact` |
+| **VW-I-2** | **i128 прод-масштаб без переполнения.** Σ(px·sz) на BTC-масштабе (px ~1.2e13 × sz ~5e8 = 6e21) копится в i128; результат корректен, нет overflow/паники. Анти-плацебо: i64/f64-impl переполняется/теряет точность → падение. | `red_vwap.rs::vwap_i128_prod_scale` |
+| **VW-I-3** | **Session reset (00:00 UTC, VB-I-6).** Сделки по разные стороны UTC-полуночи → аккумулятор СБРАСЫВАЕТСЯ: VWAP пост-полуночного бакета отражает ТОЛЬКО новую сессию (не смешан с прошлым днём). Анти-плацебо: impl без сброса → блендит через границу → падение. | `red_vwap.rs::vwap_session_reset` |
+| **VW-I-4** | **Per-venue — не смешивать площадки.** На журнале с 2 venue VWAP берёт ТОЛЬКО сделки `Selector.venue`; чужая площадка не подмешивается. | `red_vwap.rs::vwap_per_venue` |
+
+*(VW-I-5 gap-честность и VW-I-6 VWAP-deviation сигнал — ОТЛОЖЕНЫ: data-quality/квант-деск, вне cockpit-MVP.)*
 
 ## Allowed / Forbidden paths
 
-- `crates/research-cli/src/**` (VWAP-редьюсер session/rolling/per-bar + экспорт `LineData` серии) — **research-dev**.
-- `crates/signals/src/**` (VWAP-deviation сигнал, если делаем — семья S-002+) — **signal-engineer** (Граница A).
-- `research/specs/S-0NN-vwap-*.md`, `research/hypotheses/H-*.md` (пре-регистрация сигнала) — signal-engineer.
-- `research/exports/format.md` (добавить VWAP-серию в контракт, `export_schema_version` bump) — research-dev.
-- `*/tests/**` (VW-I-* RED), `scripts/verify_M-20.sh`, milestone — **architect** (sacred).
-- **Forbidden:** `crates/{risk,killswitch,oms,journal,recorder,venue-*,contracts}`; любой order-path; промоушен сигнала (Граница B/C — founder-подпись); f64 в аккумуляции VWAP.
+- **architect (sacred):** `milestones/M-20-vwap.md`, `crates/gateway/tests/red_vwap.rs` (VW-I-1..4 RED),
+  `scripts/verify_M-20.sh`.
+- **engine-dev (impl, зона gateway):** `crates/gateway/src/lib.rs` — VWAP-аккумулятор в `Reducer` +
+  поле `vwap` в `SeriesBundle` + `vwap` в `Snapshot::apply` (bucket-merge, session-cumulative) + bump
+  `GATEWAY_SCHEMA_VERSION` → 3. Свои deps — при необходимости (маловероятно).
+- **Forbidden:** `crates/contracts` (T1), `crates/{risk,killswitch,oms,venue-*,journal,recorder}`, любой
+  order-path, f64 в аккумуляции VWAP, `read_all`/`Vec<Event>` в gateway/src (GW-I-2), сигнал/промоушен (Граница B/C).
 
 ## §Tasks (RED-first)
 
 | # | Статус | Задача | Кто | Acceptance |
 |---|---|---|---|---|
-| 1 | ⏳ | VW-I-* RED (`research-cli/tests/red_vwap.rs`: корректность/детерминизм/i128-масштаб/окна/per-venue/gap-честность) | architect | RED падает без impl; достижим; прод-масштаб (VW-I-2) обязателен |
-| 2 | ⏳ | `verify_M-20.sh` | architect | exit=0 на GREEN |
-| 3 | ⏳ | VWAP-редьюсер: session-anchored + rolling-N + per-bar (чистый, i128, детерминированный) | research-dev | VW-I-1..4 GREEN |
-| 4 | ⏳ | Экспорт VWAP как `LineData` серии под code2alpha + `format.md` (bump `export_schema_version`) | research-dev | серия корректна; format.md обновлён |
-| 5 | ⏳ | Gap-честность: VWAP окна ссылаются на data-quality; неполнота помечена | research-dev | VW-I-5 GREEN |
-| 6 | ⏳ | (опц.) VWAP-deviation сигнал + пре-регистрация H/S-карточки | signal-engineer | VW-I-6 GREEN; карточка+spec |
-| 7 | ⏳ | (опц.) прогон VWAP-deviation через M-10 kill-screen → отчёт `research/reports/R-*` | research-dev | вердикт по пре-рег. критериям |
+| 1 | ⏳ | VW-I-1..4 RED (`red_vwap.rs`) + `verify_M-20.sh` (fmt+clippy+test, RN-17) | architect | compile-RED (нет поля `vwap`); достижимо; i128-масштаб (VW-I-2) обязателен |
+| 2 | ⏳ | VWAP session-anchored аккумулятор в gateway `Reducer` (i128, VB-I-6 session_id) | engine-dev | VW-I-1/VW-I-2/VW-I-3 GREEN |
+| 3 | ⏳ | Поле `vwap` в `SeriesBundle` + `Snapshot::apply` merge + bump `GATEWAY_SCHEMA_VERSION`→3 | engine-dev | VW-I-* GREEN; GW-I-3/GW-I-5 (live==replay/аддитивность) не сломаны; workspace green |
+| 4 | ⏳ | Per-venue корректность (тем же apply-фильтром) | engine-dev | VW-I-4 GREEN |
 
 ## Гейты
 
-- **critic** (новый milestone §9 Class A при старте). Сигнал (task 6) = Граница A, детерминизм-тест обязателен.
-- **risk-critic N/A для ИНДИКАТОРА** (дисплей-VWAP: MD-only, нет safety/order-path). НО **бэктест-ОТЧЁТ**
-  VWAP-deviation сигнала (task 7) — анти-оверфит §6 + risk-critic (как M-10/M-17); эпоха ledger'а (TD-015).
-- §8 не применим (research-only compute, не деплой-путь; прод-recorder не трогается).
+- **critic — НЕ требуется** (не T1/risk/ks/oms/venue, не новый крейт, < 5 коммитов). reviewer — UNCONDITIONAL бэкстоп.
+- **risk-critic N/A** (MD-only read-only, нет order-path).
+- **verify_M-20.sh** ОБЯЗАН включать `cargo fmt --all -- --check` + `cargo clippy --workspace --all-targets -- -D warnings`
+  (RN-17: verify ⊇ терминальные CI-гейты — иначе false-green, инцидент M-22).
+- **§8:** gateway read-only, recorder-образ не меняется (бинаря gateway в образе нет) → прод инертен; reviewer merge feat/M-20→main + §8-lite.
 
-## Место в очереди (зависимости)
+## Место в очереди
 
-- **Не блокирует и не блокируется инфраструктурой безопасности** (M-11 risk/oms не нужен — это compute
-  над записанными данными). Но по приоритету founder'а — ПОСЛЕ закрытия инфры (M-18 захват + M-09
-  data-safety), в фазе «индикаторы/сигналы» (блок-2/3 BACKLOG).
-- Independent от M-16/M-17/M-19; переиспользует экспорт-контракт M-17 (`format.md`) и, для отчёта,
-  расширенное окно данных M-16.
-- **Дисплей-VWAP** (tasks 3-5) — дёшево, самостоятельная ценность (линия на графике). **Сигнал**
-  (tasks 6-7) — квант-десковая работа с полным анти-оверфит гейтом, отдельно и позже.
+- **Первый в последовательности пост-M-22** (founder: делать последовательно). Далее: M-24 Volume Profile
+  (переиспользует session-модель VB-I-6), затем M-23 Heatmap (тяжелее — L2Delta/book/TD-016), затем M-25.
+- Не блокируется ничем (M-22 gateway готов; Trade уже собирается). Блокирует M-19 (фронт рисует VWAP-линию).
 
 ## Handoff (план при старте)
 
-critic → research-dev (редьюсер+экспорт, tasks 3-5) → (опц.) signal-engineer (пре-рег+сигнал) +
-research-dev (прогон) → risk-critic на ОТЧЁТ. Architect: VW-I-* RED + verify.
+architect (RED+verify+milestone) → engine-dev (tasks 2-4, VWAP-аккумулятор в gateway) → tester
+(чистый прогон incl. `cargo fmt --all --check`) → reviewer (merge feat/M-20→main + §8-lite).
