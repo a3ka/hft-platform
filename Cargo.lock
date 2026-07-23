@@ -348,12 +348,15 @@ name = "gateway-serve"
 version = "0.0.0"
 dependencies = [
  "contracts",
+ "futures-util",
  "gateway",
  "journal",
  "jsonwebtoken",
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
+ "tokio-tungstenite",
 ]
 
 [[package]]

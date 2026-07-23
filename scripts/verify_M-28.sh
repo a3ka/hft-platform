@@ -44,6 +44,13 @@ fi
 # --- recorder НЕ зависит от gateway-serve ---
 ! grep -qE '^gateway-serve[[:space:]]*=' crates/recorder/Cargo.toml 2>/dev/null; check "recorder does NOT depend on gateway-serve" $?
 
-note "NOTE: WS-сервер (task #4) + smoke (task #5) — интеграционные, НЕ детерм-оракулы; §8 деплой-гейт решающий."
+# --- Task #4 acceptance surface (C-024 блокер #2): bin компилируется + WS smoke-тест присутствует ---
+cargo build -p gateway-serve --bins 2>&1 | tail -6
+check "gateway-serve bin компилируется (cargo build --bins)" "${PIPESTATUS[0]}"
+
+[ -f crates/gateway-serve/tests/smoke_ws.rs ]; check "WS smoke-тест присутствует (task #4 acceptance)" $?
+# smoke прогоняется в общем test-гейте выше (RED до реализации server::bind); §8 деплой-гейт — решающий.
+
+note "NOTE: WS smoke (valid JWT→snapshot / invalid→reject) — интеграционный, НЕ детерм-оракул; §8 деплой-гейт решающий."
 echo "-----"
 if [ "$FAIL" -eq 0 ]; then echo "VERDICT: PASS"; exit 0; else echo "VERDICT: FAIL ($FAIL failed)"; exit 1; fi

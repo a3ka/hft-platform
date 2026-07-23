@@ -89,3 +89,50 @@ pub mod serve {
         )
     }
 }
+
+/// WS-сервер (bin-путь, task #4). ТОНКАЯ IO-оболочка: accept → verify JWT (`auth::verify_token`) →
+/// snapshot (`serve::snapshot_msg`) + инкрементальный push (`serve::frames_msgs`) + replay. Read-only,
+/// stateless по юзеру. Токен передаётся клиентом в query (`?token=<jwt>`). Тела — engine-dev (task #4).
+pub mod server {
+    use std::net::SocketAddr;
+    use std::path::PathBuf;
+
+    use gateway::Selector;
+    use journal::EpochFilter;
+    use jsonwebtoken::DecodingKey;
+
+    /// Конфиг сервиса (bin читает из env/args). MVP — одна `(venue, symbol)`; мульти-подписка позже.
+    pub struct ServeConfig {
+        /// Адрес bind, напр. `"127.0.0.1:8080"` или `"127.0.0.1:0"` (ephemeral для тестов).
+        pub addr: String,
+        pub journal_dir: PathBuf,
+        pub filter: EpochFilter,
+        pub selector: Selector,
+        /// Ключ верификации JWT (выпущен Next.js; D6). Stateless — без user-БД.
+        pub decoding_key: DecodingKey,
+    }
+
+    /// Забинденный сервер, готовый принимать WS. `local_addr` даёт реальный порт (для ephemeral-тестов).
+    pub struct Server {
+        _private: (),
+    }
+
+    /// Забиндить WS-listener на `cfg.addr`. engine-dev (task #4): `tokio::net::TcpListener`.
+    pub async fn bind(cfg: ServeConfig) -> std::io::Result<Server> {
+        let _ = cfg;
+        unimplemented!("M-28 task #4 (engine-dev): bind WS listener (tokio) на cfg.addr")
+    }
+
+    impl Server {
+        /// Фактический адрес (ephemeral-порт разрешён в реальный) — для smoke-теста.
+        pub fn local_addr(&self) -> SocketAddr {
+            unimplemented!("M-28 task #4 (engine-dev): listener.local_addr()")
+        }
+
+        /// Accept-loop: на соединение — verify JWT из query; успех → snapshot + push + replay; провал →
+        /// закрыть с отказом. Read-only (GS-I-3): приём фрейма = только replay-контролы, не запись.
+        pub async fn serve(self) -> std::io::Result<()> {
+            unimplemented!("M-28 task #4 (engine-dev): accept loop + per-conn snapshot/push/replay")
+        }
+    }
+}
