@@ -1121,6 +1121,41 @@ engine-dev (tasks 2-4) → tester PASS → reviewer APPROVED. **critic НЕ тр
   (+2 RN-19); `red_volume_profile` 6/6. Диф — test-only + milestone STATUS→DONE (оба architect-owned, кода/src/contracts
   не тронуто). §8-lite inert (тест не в бинаре; gateway не dep recorder'а). Merge commit `2a36c9f` (ff).
 
+## Book применяет L2Delta (M-29 «replay/reducer-путь реконструирует стакан из diff» — ✅ MERGED `04ce788`, reviewer APPROVED 2026-07-23; §8-lite GREEN inert)
+Пивот P-COCKPIT, Трек A (корректность книги) — **предусловие M-23 Heatmap**. `crates/book::OrderBook` применял
+ТОЛЬКО `L2Snapshot`; сырой журналированный `MdPayload::L2Delta` (собирается M-18) ИГНОРИРОВАЛСЯ → heatmap из
+инкрементального стакана строить было не на чем. M-29 добавляет каноническое L2Delta-применение в replay/reducer-путь.
+Цепочка: architect (BL-I-1..6 RED + verify RN-17 + r2-фикс clippy/SIGPIPE) → engine-dev (tasks 2-3) → tester PASS →
+reviewer APPROVED. **critic НЕ требовался** (не T1/risk/ks/oms/venue, не новый крейт, <5 коммитов); **risk-critic N/A**
+(MD-only read-side). reviewer — единственный гейт.
+- `crates/book/src/lib.rs` (engine-dev, единственный тронутый файл, +40/−6) — `OrderBook::apply_delta(&mut self,
+  bids, asks)`: `size==0` → `remove(price)`, `size>0` → `insert` (upsert), неупомянутая цена НЕ трогается (diff не
+  авторитет об неупомянутом), пустая сторона `[]` → цикл пуст → **no-op, НЕ очистка стороны** (класс TD-016/BL-I-3);
+  `Books::apply` расширен `match` с веткой `MdPayload::L2Delta { bids, asks, .. } → entry(...).apply_delta(...)`,
+  L2Snapshot-ветка не тронута, Trade/Funding/прочее → `_ => {}`.
+- **live == replay книги (ключевой инвариант):** reviewer сверил построчно — `book::apply_delta` семантически
+  ИДЕНТИЧЕН live-захвату `venue-binance::apply_diff_to_book` (`// A: только size==0 удаляет уровень; всё остальное —
+  upsert`). Значит книга, реконструированная из журналированных L2Delta на replay-пути, бит-в-бит совпадает с той,
+  что видел venue вживую. Sequencing-поля L2Delta (`first/final/prev_final_update_id`) в M-29 НЕ валидируются —
+  явное решение Трека A (журнал предполагается упорядоченным; gap-detection — follow-up).
+- **Контракт (T1) НЕ тронут** — читает существующий `MdPayload::L2Delta` (Граница A, вариант из M-18/CT-RFC-04);
+  `apply_delta` — публичный метод крейта `book`, не T1-тип. CT-RFC не нужен. Forbidden соблюдён: venue-эталон не
+  правился (читался как референс), contracts/risk/oms/journal/order-path не тронуты.
+- **Гейты (reviewer перепрогнал независимо на чистом worktree @`04ce788`):** `verify_M-29.sh` **6/6 PASS, VERDICT:
+  PASS, exit=0** (fmt+clippy RN-17 + book tests + red_l2delta_apply + L2Snapshot-регрессия); `cargo test -p book
+  --test red_l2delta_apply` **6/6** (set_and_remove/asymmetry/empty_side/determinism/multi_level_and_scale/
+  books_apply_routes_l2delta); `cargo test --workspace` **346 passed / 0 failed** (113 блоков). Анти-плацебо:
+  pre-impl дерево (`04ce788^`) содержит 0 `fn apply_delta` → RED был compile-RED; BL-I-6 падал бы на старом impl
+  (L2Delta игнорировался → книга неизменна). BL-I-3 (пустая сторона/неупомянутое) и BL-I-5 (500 уровней,
+  set+remove вперемешку, in-delta ordering: 1000 set→removed) — деградированные входы per testing.md.
+- **§8-lite (прод ИНЕРТЕН — `crates/book` reducer/replay-путь, read-side MD only; recorder применяет diff через
+  venue live-путь, не через `book`):** CI + Deploy success; VPS eyes-on: recorder healthy, инертен, пишет.
+- **M-29 ✅ CLOSED.** Разблокирует **M-23 Heatmap** (редьюсер над L2Delta-реконструированной книгой, несёт
+  `depth_band_provenance` «diff-reconstructed» VB-I-5). **Трек A follow-up (отдельные milestone'ы, НЕ в M-29):**
+  gap-detection по update-id (chaining `U==prev.u+1`/`pu==prev.u`, нужен book со счётчиком); **TD-016** эвикция
+  мёртвых уровней (recon-дизайн — OPEN); resync-целостность (`apply_snapshot` не должен ронять восстановимые
+  дальние уровни). M-28 gateway-serve — независимая параллельная цепочка.
+
 ## Пока НЕ реализовано (следующие фазы)
 - Крейты `risk`/`killswitch`/`oms`, `runner` — пофазно per DESIGN §10 (M-08: fail-closed риск-гейт
   между `strategy` и `oms`). MM-котирование, wiring весов из `signals.json` (граница B),
