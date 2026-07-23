@@ -200,6 +200,15 @@ reviewer мержит в main уже GREEN. Прямой push RED-состоян
 worktree-ветке, цепочка рвётся — TD-014). Push-scope (`git log origin/feat/M-NN..HEAD` =
 только твои коммиты) обязателен по-прежнему.
 
+**RN-18 — push на origin ПЕРЕД handoff = hard-precondition (2-й повтор класса, закреплено 2026-07-22).**
+Инциденты: M-22 (коммиты застряли на `engine-dev/M-22`, не на `feat/M-22`), M-20 (GREEN жил в приватном
+`/tmp`-клоне). Цепочка НЕ должна зависеть от git-объектов в ЧУЖОМ локальном worktree/клоне — они не видны
+следующему агенту, который бутстрапится с `origin`. Правило: **Handoff dev→(tester|reviewer) НЕВАЛИДЕН,
+пока `git log origin/feat/M-NN..HEAD` не пуст → сначала `git push origin HEAD:feat/M-NN`, потом Handoff.**
+§D push-статус обязан быть `✅ pushed to origin/feat/M-NN @<sha>` (не «commits ready локально»). Проверка
+для tester/reviewer: бутстрап ТОЛЬКО с `origin/feat/M-NN`; если ревьюишь SHA, которого нет на origin —
+СТОП, верни dev'у пушить (не досведение из чужого worktree вручную — это маскирует разрыв).
+
 ## 9. DOC-ГЕЙТ — архитектурные и плановые документы (добавлено 2026-07-14)
 
 **Проблема, которую закрываем.** Гейты §1-§8 требуют critic/reviewer для КОДА, а
