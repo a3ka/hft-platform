@@ -781,14 +781,14 @@ fn build_heatmap_and_cob(
             .copied()
             .filter(|&(p, s)| s > 0 && p >= low && p <= mid)
             .collect();
-        last_cob_bids.sort_by(|a, b| b.0.cmp(&a.0)); // bid desc
+        last_cob_bids.sort_by_key(|&(p, _)| std::cmp::Reverse(p)); // bid desc (clippy 1.97: unnecessary_sort_by)
         last_cob_asks = state
             .asks
             .iter()
             .copied()
             .filter(|&(p, s)| s > 0 && p >= mid && p <= high)
             .collect();
-        last_cob_asks.sort_by(|a, b| a.0.cmp(&b.0)); // ask asc
+        last_cob_asks.sort_by_key(|&(p, _)| p); // ask asc (clippy 1.97: unnecessary_sort_by)
     }
 
     // COB: привести к merge_cob порядку (side, price_e8) — BTreeMap-сортировка даёт
