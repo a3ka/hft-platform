@@ -71,3 +71,51 @@ Secondary stale context:
 REJECT -> return to `architect` for a narrow doc re-spin that removes the remaining Fastify ambiguity from
 the D6/D1 record. Do not re-open Path 1; only make the accepted decision internally coherent. Then route
 back through critic before reviewer merge.
+
+---
+
+## Re-review r2 — 2026-07-23T15:29:34Z
+
+**Branch audited:** `origin/docs/cockpit-d6-appplane` at `83cd926`
+**Range:** `27d827b..83cd926`
+**Re-review scope:** narrow C-023 blocker closure only
+**Re-review verdict:** PASS
+
+### r2 Commit Set
+
+```text
+83cd926 architect <architect@noreply.local> docs(cockpit): r2 — убрать остаточную Fastify-двусмысленность (C-023 REJECT) [architect]
+```
+
+Scope over r2:
+
+```text
+M docs/07-cockpit-backend-roadmap.md
+M docs/fa/viz-backend.md
+```
+
+### Evidence
+
+```text
+rg -n -i "поверх fastify|over fastify|через fastify" docs/
+exit=1
+```
+
+The grep returns no matches. The specific C-023 contradiction is removed:
+
+- `docs/fa/viz-backend.md:63-66` now records Read Gateway WS-push as direct `gateway-serve`
+  (`tokio-tungstenite`, D1/D6), with Fastify explicitly outside the hot path.
+- `docs/07-cockpit-backend-roadmap.md:23-26` no longer lists Fastify in the current frontend stack and
+  adds the D1/D6 clarification: hot WS is Rust `gateway-serve` directly, app-plane is Next.js + Postgres.
+
+The previously passed C-023 checks remain accepted and were not re-opened: docs-only scope, no T1 change,
+`DET-I-1` preserved, `AI-I-1` preserved, stateless JWT verify remains read-only, and VB-I-9 remains testable
+by a future gateway import canary.
+
+`milestones/M-22-read-gateway.md:52-56` remains historical M-22 text and is still non-blocking for D6:
+transport was outside the deterministic M-22 library core. The next transport milestone should treat D6 as
+the superseding decision for direct Rust `gateway-serve` WS.
+
+### Re-review Handoff
+
+PASS -> route to `reviewer` for docs-only merge to `main`. Deploy is inert for this branch content.
