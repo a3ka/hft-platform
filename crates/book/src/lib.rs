@@ -9,11 +9,30 @@ use std::collections::HashMap;
 
 use contracts::{Level, MdEvent, MdPayload, Side, Venue};
 
+/// Результат `apply_l2delta` по непрерывности update-id (M-30 GD-I-1..6).
+/// `Applied` — дельта чейнится к предыдущей, книга обновлена.
+/// `Gap` — разрыв непрерывности ИЛИ книга уже `stale`; дельта НЕ применена (fail-closed,
+/// тот же принцип, что риск-слой `RK`: неизвестный/разорванный вход → отказ, не «применить
+/// наугад»). `apply_snapshot` — единственный выход из `Gap` (ресинк, ребутстрап чейна).
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum ContinuityStatus {
+    Applied,
+    Gap,
+}
+
 /// L2-стакан одного инструмента. bids/asks: цена(i64) → размер(i64), оба отсортированы по цене.
 #[derive(Debug, Default, Clone)]
 pub struct OrderBook {
     bids: BTreeMap<i64, i64>,
     asks: BTreeMap<i64, i64>,
+    /// `final_update_id` последней УСПЕШНО чейнённой дельты (`apply_l2delta → Applied`).
+    /// `None` сразу после `new` / `apply_snapshot` (книга «свежая», чейн ещё не заведён —
+    /// следующая дельта будет bootstrap).
+    /// M-30 GD-I-1..6.
+    last_final_update_id: Option<u64>,
+    /// Книга недостоверна из-за разрыва непрерывности (gap) дельт. Fail-closed: дальнейшие
+    /// дельты (даже «валидные» по виду) отвергаются до `apply_snapshot` (ресинк). M-30 GD-I-2/4/6.
+    stale: bool,
 }
 
 impl OrderBook {
@@ -45,6 +64,9 @@ impl OrderBook {
     }
 
     /// Заменить книгу снапшотом (наши данные — снапшоты; JR-first, без diff-sync на старте).
+    /// M-30: ресинк — снапшот сбрасывает `last_final_update_id = None` и `stale = false`,
+    /// чтобы следующая дельта завела чейн заново (bootstrap). Это ЕДИНСТВЕННЫЙ путь выхода
+    /// из `stale` (GD-I-6).
     pub fn apply_snapshot(&mut self, bids: &[Level], asks: &[Level]) {
         self.bids.clear();
         self.asks.clear();
@@ -58,6 +80,73 @@ impl OrderBook {
                 self.asks.insert(l.price, l.size);
             }
         }
+        self.last_final_update_id = None;
+        self.stale = false;
+    }
+
+    /// Применить L2-де льту С ВАЛИДАЦИЕЙ НЕПРЕРЫВНОСТИ update-id (M-30 GD-I-1..6,
+    /// чейнинг как в `venue-binance::handle_diff`).
+    ///
+    /// Правила:
+    /// - **Bootstrap** (`last_final_update_id == None`): дельта — первая после снапшота
+    ///   (или `new`); применить (`apply_delta`), `last_final = final_update_id`, `Applied`.
+    /// - **Stale** (книга уже недостоверна из-за прошлого gap): НЕ применять, вернуть `Gap`
+    ///   (fail-closed, консюмер (gateway heatmap/depth) видит период недостоверным через
+    ///   `is_stale()`).
+    /// - **Continuity OK** (чейн сходится): применить, `last_final = final_update_id`, `Applied`.
+    ///   - Спот (`prev_final_update_id == None`): `first_update_id == last_final + 1`
+    ///     (Binance spot: `U == prev.u + 1`).
+    ///   - Фьючерс (`prev_final_update_id == Some(pu)`): `pu == last_final`
+    ///     (Binance futures: `pu == prev.u`).
+    /// - **Gap** (continuity нарушена): НЕ применять, `stale = true`, `Gap`. Применение
+    ///   разорванной дельты портит книгу (fail-closed: «нет апдейта» лучше, чем ложный апдейт).
+    ///
+    /// Без побочных эффектов кроме состояния книги; детерминированный (нет `rand()`/wall-clock,
+    /// BK-I-1/4). Размеры/цены — fixed-point (i64 ×1e8) из `Level`.
+    pub fn apply_l2delta(
+        &mut self,
+        bids: &[Level],
+        asks: &[Level],
+        first_update_id: u64,
+        final_update_id: u64,
+        prev_final_update_id: Option<u64>,
+    ) -> ContinuityStatus {
+        // Stale-книга отвергает всё до ресинка (GD-I-2/4/6). Fail-closed: даже «валидная по
+        // виду» дельта на stale-книге — не применять, пока не пришёл свежий снапшот.
+        if self.stale {
+            return ContinuityStatus::Gap;
+        }
+
+        let last = match self.last_final_update_id {
+            // Bootstrap (GD-I-5): чейн ещё не заведён → принимаем дельту как первую.
+            None => {
+                self.apply_delta(bids, asks);
+                self.last_final_update_id = Some(final_update_id);
+                return ContinuityStatus::Applied;
+            }
+            Some(l) => l,
+        };
+
+        // Continuity check (GD-I-1..4):
+        //   спот — `U == prev.u + 1`; фьючерс — `pu == prev.u`.
+        let ok = match prev_final_update_id {
+            None => first_update_id == last.saturating_add(1),
+            Some(pu) => pu == last,
+        };
+        if !ok {
+            self.stale = true;
+            return ContinuityStatus::Gap;
+        }
+
+        self.apply_delta(bids, asks);
+        self.last_final_update_id = Some(final_update_id);
+        ContinuityStatus::Applied
+    }
+
+    /// Книга недостоверна (gap в чейне дельт) — консюмер ОБЯЗАН пометить период данных
+    /// недостоверным (heatmap/depth — `stale`-флаг на окне). M-30 GD-I-2/4/6.
+    pub fn is_stale(&self) -> bool {
+        self.stale
     }
 
     /// Лучший бид (наибольшая цена покупки).
