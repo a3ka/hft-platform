@@ -378,6 +378,18 @@
   `depth_band_provenance="diff-reconstructed"`. Достоверность дальних ячеек внутри окна повышает ТОЛЬКО
   фикс TD-016 (эвикция + resync-целостность) — аддитивно, провенанс уже на месте (как Bookmap: показываем
   реконструкцию честно). TD-016 остаётся **OPEN**.
+  **M-32 (depth-verification, merge `bb00915`, 2026-07-24) — ФАНТОМ-ПОДОЗРЕНИЕ ЭМПИРИЧЕСКИ СНЯТО для полос
+  1.5-30%; TD-016 остаётся OPEN по КОРРЕКТНОСТИ/эвикции.** Прямой замер на СЫРОМ `L2Delta` (BTCUSDT, gap-free
+  segment 78, 3.4 ч, 121k дельт) развёл churn от resync через sequence-gap (DV-I-3, `gaps=0/censored=0`):
+  дальние уровни РЕАЛЬНО отменяются биржей — `cancel_fraction` FAR (3-30%) = **0.805** vs NEAR = **0.981**,
+  order-flow `consistency_rate` = **0.950**. ⇒ дальние полосы 1.5-30% — ЖИВАЯ ликвидность, а НЕ мёртвые
+  «растут-вечно» фантомы (то, что shell-notional depth_probe доказать НЕ мог). **Провенанс-путь ПРИНЯТ
+  founder'ом (граница C, 2026-07-24, `research/data-quality/depth-verdict.md`):** TPP-полосы строятся на
+  diff-реконструкции с `depth_band_provenance: "diff-reconstructed, validated<=1.3%"` (VB-I-5), диапазон
+  1.5-60% (30-60% — provenance + follow-up live-замер). **Что M-32 НЕ закрыл (TD-016 по-прежнему OPEN):**
+  верификация «измеритель не врёт» ≠ «книга поддержана корректно и bounded» — эвикция мёртвых уровней и
+  resync-целостность (Track A 3б/3в) остаются за **M-31**; неограниченный рост уровней (backstop 200k)
+  наблюдается отдельно. M-32 = валидация ИЗМЕРЕНИЯ, M-31 = корректность ПОДДЕРЖКИ; ортогональны. TD-016 **OPEN**.
 - **TD-019** `storage-status-not-published-in-heartbeat` — **✅ CLOSED 2026-07-14** (M-08 task 12,
   `24d8e83`, merge `8882c1e`). heartbeat = JSON с состоянием; **доказано на проде**, а не тестами:
   `cat recorder.heartbeat` → `{"events":2736,"free_bytes":119134494720,"min_free_bytes":10737418240,

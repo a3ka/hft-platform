@@ -245,6 +245,51 @@ PASS на чистом чекауте → reviewer APPROVED. Тесты: 28 RED�
   накоплением full-book данных (VPS пишет с 2026-07-10) + вердиктом risk-critic + подписью
   founder ★. Merge кода НЕ трогал risk/oms/venues/contracts, поэтому risk-critic — на отчёте.
 
+## Верификация глубины (M-32 «depth-verification» — ✅ MERGED `bb00915`, reviewer APPROVED 2026-07-24; §8 деплой-гейт GREEN, founder-подпись граница C)
+Пивот P-COCKPIT, founder-приоритет №1 сессии. Milestone ВЕРИФИЦИРУЕТ ИЗМЕРИТЕЛЬ глубины (C-020/M-10
+«сначала провалидируй измеритель, потом доверяй», доведено до глубины) — НЕ строит TPP. Цепочка:
+architect (Q1-спека + RED DV-I-1..8 sacred) → research-dev (impl + прогон на проде) → tester PASS →
+**founder APPROVED (граница C, INTG-I-3, 2026-07-24)** → reviewer merge. critic N/A и risk-critic N/A
+(scope = `crates/research-cli/{src,tests}` + `research/data-quality/*.md` + `docs/fa/viz-backend.md` +
+milestone + verify; НЕ contracts/risk/ks/oms/venue, не новый крейт → Class-A doc + research, reviewer-бэкстоп).
+- **Q1 (эталон глубже 1.3%?) — НЕТ, паритет CONFIRMED** (`research/data-quality/depth-sources-survey.md`,
+  ≥3 независимых источника: Binance API/docs, Tardis/Kaiko/Amberdata/CoinAPI/Coinalyze, Bookmap/dxFeed/
+  TensorCharts). Достижимого эталона глубже ~1.3% от mid НЕТ ни у биржи, ни у вендора — все упираются в тот
+  же потолок (REST-snapshot 5000 spot / 1000 futures + инкрементальный WS `@depth` diff). Прежняя инференция
+  architect'а «паритет с Bookmap/TPP» → **CONFIRMED** (паритет по глубине-через-diff; глубокие полосы =
+  diff-реконструкция для ВСЕХ в классе). ⇒ Q2(в) cross-source recon = **N/A** (сверять не против чего).
+- **Q2 (достоверны ли дальние полосы?) — ДА, как diff-реконструкция.** Прямой замер на СЫРОМ
+  `MdPayload::L2Delta` (CT-RFC-04) BTCUSDT, gap-free **segment 78**, 3.4 ч, 121k дельт, 291k сделок
+  (`research/data-quality/depth-lifetime-results.md` — АВТОРИТЕТНЫЙ ЭТАЛОН): `cancel_fraction` FAR (3-30%)
+  = **0.805** vs NEAR (≤1.3%) = **0.981** ⇒ дальние уровни РЕАЛЬНО отменяются биржей (живые, не фантом
+  TD-016); order-flow `consistency_rate` = **0.950** (95% сделок находят book-decrement) ⇒ поток diff'а
+  верен; `gaps=0 / censored=0` ⇒ resync не конфаундит (то, что shell-notional depth_probe развести НЕ мог —
+  здесь sequence-gap де-конфаундит через DV-I-3). Фантом-подозрение TD-016 ЭМПИРИЧЕСКИ снято для полос 1.5-30%.
+- **Sacred RED DV-I-1..8** (architect-only, тронуты ТОЛЬКО architect-коммитами — RED-first цел): DV-I-1
+  (cancel=live), DV-I-2 (freeze=phantom), DV-I-3 (resync-де-конфаунд = censored, ЯДРО), DV-I-4 (отсутствие ≠
+  удаление), DV-I-5 (детерминизм), DV-I-6 (order-flow faithfulness), **DV-I-7/8 (прод-масштаб bounded-work**,
+  ловят O(n²) инцидента 2026-07-24 — `analyze` full-scan states / `consistency` prefix-rebuild; single-pass
+  <1с vs timeout 15с, класс TD-011). Анти-плацебо в обе стороны в каждом оракуле.
+- **FOUNDER-РЕШЕНИЕ (граница C, 2026-07-24) — APPROVED** (`research/data-quality/depth-verdict.md`, 3 решения
+  `{what,from,to,rationale,report_ref}`): строить TPP Bid/Ask/Delta полосы на нашей diff-книге с честной
+  пометкой `depth_band_provenance: "diff-reconstructed, validated<=1.3%"` (VB-I-5); **диапазон 1.5-60%**
+  (полный набор 1.5/3/5/8/15/30/60). **Граница верификации (BINDING):** живость доказана для **1.5-30%**;
+  полоса **30-60% ([3000,6000) bps) НЕ измерялась** (сидит на/за структурным потолком reach: p50 54-58%,
+  cap ±60% `MAX_REL_DIST`) → несёт provenance + caveat «beyond-measured-reach», live-верификация — follow-up
+  (расширить `BANDS_BPS` анализатора до `[3000,6000)`, переснять на segment 78) ДО включения в контракт.
+- **Гейты (reviewer перепрогнал независимо, worktree `/tmp/hft-reviewer-M-32`, чистый checkout):**
+  `verify_M-32.sh` **PASS (7/7), exit=0** — fmt clean, clippy 0 warn, DV-I-1..5 GREEN, DV-I-6 GREEN,
+  DV-I-7/8 bounded GREEN, Q1 memo CONFIRMED, вердикт 3 решения. Scope: diff ⊂ allowed (Cargo.toml —
+  additions-only `[[example]]`, не правка чужих deps). **§8 деплой-гейт GREEN (`bb00915`, 2026-07-24T22:34Z):**
+  CI run 30131317125 success + Deploy 30131317074 success (gated-on-CI fail-closed); VPS eyes-on —
+  `hft-recorder Up (healthy)`, heartbeat свежий (~1.6s, `writable=true`, `next_seq=84509973` монотонен,
+  `segment_index=83`), segment-00000083 растёт (429 MB). Прод-поведение recorder'а НЕ изменено (impl только
+  в `research-cli`, вне recorder-дерева) — §8 подтверждает лишь что деплой не сломал прод, не новое поведение данных.
+- **Follow-up (за architect'ом, вне этого merge):** (1) верификация полос 30-60% (расширить BANDS_BPS +
+  переснять — ПРЕДУСЛОВИЕ их включения); (2) TPP-построение (отдельный milestone, VB-I-5 provenance на
+  КАЖДОЙ серии >1.3%); (3) resync-восстановление в lifetime-анализаторе для мульти-сегментной агрегации
+  (каскадные gaps — §Risks-1 вердикта); (4) M-31 (эвикция/TD-016) и M-28 (gateway-serve) остаются в очереди.
+
 ## Мозг стратегии (M-07 «Strategy brain» — РЕАЛИЗОВАНО, reviewer APPROVED 2026-07-13)
 Закрыта дыра равенства DESIGN §1 №2 (`backtest == paper == live`): решения больше НЕ захардкожены
 в ad-hoc harness'е `research-cli/grid.rs` (taker-in по `SignalOut`, taker-out по `horizon_ms`,
