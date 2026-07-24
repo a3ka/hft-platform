@@ -3,6 +3,21 @@
 > **Reviewer-owned.** Открытые долги/риски, замеченные при работе. Закрытые переносятся вниз.
 
 ## OPEN
+- **TD-035** `toolchain-drift-local-clippy-weaker-than-CI` (найдено reviewer'ом на PR-гейте M-23, 2026-07-24).
+  Локальный toolchain (reviewer/tester/verify) — **clippy/rustc 1.94.1**, CI — **rust-1.97.0**. Lint
+  `clippy::unnecessary_sort_by` затянулся между версиями → локальный `cargo clippy -- -D warnings` СЛАБЕЕ CI.
+  Следствие: M-23 (`8613066`) прошёл `verify_M-23.sh` + tester + reviewer локально (все на 1.94) с 2 clippy-ошибками,
+  которые CI (1.97) отреджектил на merge (`gateway/src/lib.rs:784,791`). Это класс **«green local ≠ green CI»**: три
+  локальных `-D warnings`-гейта дали false-green, потому что RN-17 («verify ⊇ терминальные CI-гейты») подразумевал
+  ОДИНАКОВЫЙ toolchain, а он дрейфанул. Отдельно verify_M-23.sh не CI-эквивалентен и по флагам: CI гоняет
+  `clippy --all-targets --all-features`, verify — `--workspace --all-targets` (без `--all-features`).
+  **Обход в M-23:** engine-dev fix-forward `94230c4` (2 строки), reviewer перепроверил CI-эквивалентным
+  `cargo +1.97.0 clippy --workspace --all-targets --all-features -- -D warnings` (exit 0) перед reland.
+  **Durable-фикс (зона architect, процессный/CI-слой):** (а) закрепить toolchain — `rust-toolchain.toml` с CI-версией,
+  чтобы локальный clippy == CI бит-в-бит; (б) унифицировать verify_*.sh clippy-инвокейшн с CI (`--all-features`).
+  Пока не сделано — reviewer ОБЯЗАН на PR-гейте гонять clippy CI-версией (или не считать локальный `-D warnings`
+  достаточным до зелёного CI). Severity: **MAJOR** (скрытый gate-байпас: локальные гейты не эквивалентны CI —
+  прошёл 3 гейта, пойман только на merge; на будущих milestone'ах повторится с любым новым lint).
 - **TD-031** `segment-provenance-constant-in-container-rollback-isolation-void` (найдено reviewer'ом на
   §8 M-18, 2026-07-21; **BLOCKING close-out M-18**).
   **✅ CLOSED 2026-07-21 (merge `7a237f7`, reviewer APPROVED; фикс — МАШИННАЯ изоляция по SCHEMA-ЭПОХЕ,
@@ -336,6 +351,11 @@
   `depth_band_provenance: diff-reconstructed, validated≤1.3%` (не выдаются за биржевой факт). Блокирует
   включение TPP-полос в export-контракт; RED-спека на venue-book (resync не роняет восстановимые дальние
   полосы в 0) — зона architect, предусловие Трека C (TPP COIN).
+  **M-23 (heatmap, `94230c4`) ПОТРЕБЛЯЕТ TD-016 честно, НЕ закрывает.** Heatmap/COB оконны (`[mid·(1±W)]`,
+  W=max(bands)) — дальние мёртвые уровни за окном в дисплей не эмитятся; ячейки глубже 1.3 % несут
+  `depth_band_provenance="diff-reconstructed"`. Достоверность дальних ячеек внутри окна повышает ТОЛЬКО
+  фикс TD-016 (эвикция + resync-целостность) — аддитивно, провенанс уже на месте (как Bookmap: показываем
+  реконструкцию честно). TD-016 остаётся **OPEN**.
 - **TD-019** `storage-status-not-published-in-heartbeat` — **✅ CLOSED 2026-07-14** (M-08 task 12,
   `24d8e83`, merge `8882c1e`). heartbeat = JSON с состоянием; **доказано на проде**, а не тестами:
   `cat recorder.heartbeat` → `{"events":2736,"free_bytes":119134494720,"min_free_bytes":10737418240,

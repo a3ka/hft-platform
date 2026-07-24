@@ -1156,6 +1156,54 @@ reviewer APPROVED. **critic НЕ требовался** (не T1/risk/ks/oms/ven
   мёртвых уровней (recon-дизайн — OPEN); resync-целостность (`apply_snapshot` не должен ронять восстановимые
   дальние уровни). M-28 gateway-serve — независимая параллельная цепочка.
 
+## Heatmap + COB + Volume Bubbles (M-23 «ядро Bookmap-кокпита» — ✅ MERGED `94230c4`, reviewer APPROVED 2026-07-24; §8-lite см. ниже)
+Пивот P-COCKPIT, Трек B (MVP-1), центральный виз-примитив (Bookmap-heatmap). **Разблокирован M-29** (`OrderBook::apply_delta`
+на main): gateway держит L2Delta-реконструированную книгу и строит из неё три новые серии в `SeriesBundle`.
+Цепочка: architect (HM-I-1..5 compile-RED + verify RN-17) → engine-dev (tasks 2-4) → tester PASS → **reviewer REJECT
+(clippy CI-fail, toolchain drift — см. TD-035)** → engine-dev fix-forward `94230c4` → tester PASS (1.97) → reviewer APPROVED.
+**critic НЕ требовался** (gateway impl + book-dep, не T1/risk/ks/oms/venue, не новый крейт, <5 коммитов); **risk-critic N/A**
+(MD-only read-side). reviewer — единственный гейт.
+- `crates/gateway/src/lib.rs` (engine-dev, единственный тронутый impl-файл, +367) — три серии, все из книги/сделок:
+  - **Heatmap** `Vec<HeatmapCell{time_s,side,price_e8,size_e8,depth_band_provenance}>` — per-bucket снимок
+    L2Delta-реконструированной книги (close-семантика: последний book-апдейт в бакете). **Окно** `[mid·(1−W), mid·(1+W)]`,
+    **W=max(Selector.bands)** (переиспользование поля, без ripple — урок M-24); уровень вне окна НЕ эмитится. Ячейка глубже
+    **1.3 %** от mid несёт `depth_band_provenance="diff-reconstructed"` (VB-I-5 — честность diff-реконструкции; дальний фантом
+    TD-016 в дисплей не тащится). `HeatmapBucketState.mid` — fallback на ПОСЛЕДНИЙ известный mid при односторонней книге.
+  - **COB** `Vec<CobLevel{side,price_e8,size_e8}>` — финальный стакан в окне (bid desc/ask asc). merge = **incoming заменяет
+    existing целиком** (point-in-time снимок, НЕ additive — иначе устаревшие уровни промежуточных frame'ов; ловит
+    `mid_stream_snapshot_completeness`).
+  - **Volume Bubbles** `Vec<BubbleCell{time_s,price_e8,buy_vol_e8,sell_vol_e8}>` — торгованный объём `(time×price)` из `Trade`
+    (side→buy/sell раздельно), цены НЕ выдумываются (только торгованные, класс footprint C-016); merge кумулятивен (buy/sell
+    складываются). Аккумулируется ТОЛЬКО в `apply`, не в `seed` (анти-дубль при fold — `seed_vwap` зовёт лишь `apply_vwap(false)`).
+  - `Reducer` держит `book::OrderBook`, ветка `MdPayload::L2Delta` расширяет `apply` (`apply_delta` зеркалит venue, M-29);
+    `apply_snapshot`→`apply_delta` кормят общий book/heatmap_buckets путь. Аккумуляция в i64 (f64 ТОЛЬКО в window-boundary
+    math, как существующий `depth_within`); `read_all` в gateway/src отсутствует (только `stream`, GW-I-2).
+- **`GATEWAY_SCHEMA_VERSION` bump 4 → 5** — аддитивно: `SeriesBundle += heatmap/cob/volume_bubbles` в КОНЕЦ, новые T-designate
+  типы в `crates/gateway` (НЕ T1, CT-RFC не нужен); потребители v4 читают без изменений (reviewer подтвердил v4-shaped/additive
+  consumer-совместимость GREEN). `crates/gateway/Cargo.toml` += `book = { path="../book" }` (ADD-only, own-dep; Cargo.lock +book).
+- **live == replay (GW-I-3 / HM-I-5):** новые серии покрыты — `snapshot_equals_folded_frames_from_start` и
+  `mid_stream_snapshot_completeness_merges_same_bucket` сверяют `json(&acc.series)` == `json(&full.series)`, т.е. ВЕСЬ
+  `SeriesBundle` включая heatmap/cob/volume_bubbles, на фикстуре с **асимметричным** L2 (bid-only) и мульти-сделочным бакетом
+  (деградированные входы per testing.md) → merge_heatmap/merge_cob/merge_bubbles реально исполняются через границу frame'а.
+- **Fix-forward `94230c4` (engine-dev, 2 строки в gateway/src):** `sort_by(|a,b| b.0.cmp(&a.0))` → `sort_by_key(|&(p,_)|
+  Reverse(p))` (bid desc), `sort_by(|a,b| a.0.cmp(&b.0))` → `sort_by_key(|&(p,_)| p)` (ask asc) в `build_heatmap_and_cob`.
+  Семантика/порядок идентичны → live==replay не тронут. Причина реджекта: **toolchain drift** — CI clippy `rust-1.97.0`
+  ловит `unnecessary_sort_by`, локальный (reviewer/tester/verify) `1.94.1` — нет (TD-035).
+- **Гейты (reviewer перепрогнал НЕЗАВИСИМО на чистом worktree @`94230c4`):** **CI-эквивалентный
+  `cargo +1.97.0 clippy --workspace --all-targets --all-features -- -D warnings` → exit 0** (тот самый инвокейшн, что поймал
+  дефект); `cargo +1.97.0 fmt --all --check` → exit 0; `verify_M-23.sh` **5/5 PASS, VERDICT: PASS, exit=0**;
+  `cargo +1.97.0 test -p gateway --tests` — HM-I-1..5 GREEN (red_heatmap 4/4 + red_bubbles 1/1) + red_gateway_live_eq_replay 6/6
+  + export_v2 2/2 + readonly/vwap/vp GREEN. tester независимо: workspace 1.97.0 **0 FAILED**. Анти-плацебо: pre-impl дерево
+  (`fd75fd6`) не содержит полей `heatmap/cob/volume_bubbles` → RED был compile-RED.
+- **Scope/Sacred (reviewer):** 4 коммита — `fd75fd6` (architect: RED + verify + milestone, sacred), `ebc98fe`+`8613066`
+  (engine-dev: gateway/src + own Cargo.toml/lock), `94230c4` (engine-dev: 2-строчный clippy-fix, ТОЛЬКО gateway/src).
+  contracts(T1)/risk/killswitch/oms/venue-*/journal/recorder/**book/src**/docs НЕ тронуты. Forbidden соблюдён.
+- **§8-lite (прод ИНЕРТЕН by construction — gateway = read-side reducer/replay поверх журнала; recorder НЕ зависит от gateway,
+  `Dockerfile` собирает `--bin recorder` → образ не меняется):** CI+Deploy watched + VPS eyes-on — **PENDING (proof дополняется
+  reviewer'ом после deploy-гейта; см. §8 close-out ниже по факту).**
+- **M-23 MERGED, milestone STATUS→DONE — за architect** (reviewer уведомляет). **Дальше:** Трек A (gap-detection + **TD-016**
+  эвикция — предусловие ДАЛЬНЕЙ достоверности heatmap/TPP-полос), M-25 liq/OI/funding-профили, M-28 gateway-serve (транспорт).
+
 ## Пока НЕ реализовано (следующие фазы)
 - Крейты `risk`/`killswitch`/`oms`, `runner` — пофазно per DESIGN §10 (M-08: fail-closed риск-гейт
   между `strategy` и `oms`). MM-котирование, wiring весов из `signals.json` (граница B),
