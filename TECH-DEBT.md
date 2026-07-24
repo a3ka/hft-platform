@@ -3,7 +3,15 @@
 > **Reviewer-owned.** Открытые долги/риски, замеченные при работе. Закрытые переносятся вниз.
 
 ## OPEN
-- **TD-035** `toolchain-drift-local-clippy-weaker-than-CI` (найдено reviewer'ом на PR-гейте M-23, 2026-07-24).
+- **TD-035** `toolchain-drift-local-clippy-weaker-than-CI` — **✅ CLOSED 2026-07-24** (architect durable-фикс
+  `94d055a`, reviewer APPROVED/merged). Пин `rust-toolchain.toml` (`channel = "1.97.0"`, components rustfmt+clippy)
+  + `ci.yml` `dtolnay/rust-toolchain@stable → @1.97.0` (обе job'ы) ⇒ ЕДИНАЯ версия local==CI. gates.md §3 (RN-17)
+  расширен: verify ОБЯЗАН гонять CI-точную команду (`clippy --all-targets --all-features -- -D warnings`) НА
+  ТОЙ ЖЕ версии toolchain; бамп версии — ОДновременно в обоих местах. **Доказано, а не заявлено:** (1) reviewer
+  в worktree — `rust-toolchain.toml` авто-разрешил local в `rustc 1.97.0 / clippy 0.1.97` (был 1.94.1), CI-точный
+  clippy → exit 0; (2) CI на merge (run 30087853334) **success** с `@1.97.0` — пин работает в CI-окружении;
+  (3) **`Delivery gate`** (сборка прод-образа recorder+journal-retention) green с `rust-toolchain.toml` в контексте
+  ⇒ Docker-билд honors пин 1.97.0 (local==CI==Docker-build). Ниже — исходное описание.
   Локальный toolchain (reviewer/tester/verify) — **clippy/rustc 1.94.1**, CI — **rust-1.97.0**. Lint
   `clippy::unnecessary_sort_by` затянулся между версиями → локальный `cargo clippy -- -D warnings` СЛАБЕЕ CI.
   Следствие: M-23 (`8613066`) прошёл `verify_M-23.sh` + tester + reviewer локально (все на 1.94) с 2 clippy-ошибками,

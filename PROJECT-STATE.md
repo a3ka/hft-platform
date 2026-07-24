@@ -1205,8 +1205,12 @@ reviewer APPROVED. **critic НЕ требовался** (не T1/risk/ks/oms/ven
   gateway НЕ доставлен** ⇒ инертность доказана; heartbeat свежий/`writable:true`, `next_seq` растёт 80311662→80312736 за 13s
   (+1074 events, ts_wall +10s cadence), 0 panic/ERROR/backstop; `book levels` ≈5000/сторона (TD-016 наблюдение — стабильно
   у baseline). gateway-изменение НЕ повлияло на recorder (как и ожидалось — нет dep).
-- **M-23 MERGED, milestone STATUS→DONE — за architect** (reviewer уведомляет). **Дальше:** Трек A (gap-detection + **TD-016**
-  эвикция — предусловие ДАЛЬНЕЙ достоверности heatmap/TPP-полос), M-25 liq/OI/funding-профили, M-28 gateway-serve (транспорт).
+- **M-23 ПОЛНОСТЬЮ ЗАКРЫТ (`94d055a`, reviewer APPROVED 2026-07-24):** milestone STATUS→DONE (tasks #1-4 ✅, architect
+  `4ef3398`); **TD-035 durable-фикс приземлён** (пин `rust-toolchain.toml=1.97.0` + `ci.yml @1.97.0` + gates §3
+  toolchain-parity) — CI на merge (30087853334) success с `@1.97.0`, local==CI==Docker-build доказано, TD-035 CLOSED.
+  §8: docs/CI-config — Deploy НЕ триггерился (пути не матчат; прод остаётся на `7515a38`, healthy/inert).
+  **Дальше:** Трек A (gap-detection + **TD-016** эвикция — предусловие ДАЛЬНЕЙ достоверности heatmap/TPP-полос),
+  M-25 liq/OI/funding-профили, M-28 gateway-serve (транспорт).
 
 ## Пока НЕ реализовано (следующие фазы)
 - Крейты `risk`/`killswitch`/`oms`, `runner` — пофазно per DESIGN §10 (M-08: fail-closed риск-гейт
