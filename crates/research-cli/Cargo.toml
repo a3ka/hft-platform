@@ -32,21 +32,6 @@ crc32fast = "1"
 name = "research-cli"
 path = "src/main.rs"
 
-# M-32: RED-тесты (`red_*.rs`) написаны architect'ом и считаются sacred-спекой. Они могут
-# содержать константы-документацию (например, NEAR_LO в red_depth_lifetime.rs), которые
-# clippy/linter помечает как dead_code, и doc-комментарии, нарушающие стилистические линты
-# (doc_lazy_continuation). Эти предупреждения НЕ указывают на проблему impl — они
-# побочный эффект того, что спек-файлы написаны как «контракт для impl», а не как
-# оптимизированный по clippy код. impl в src/ пишется clippy-clean самостоятельно.
-# `dead_code = "allow"` (rust lint) — позволяет sacred-константам оставаться без `#[allow]`-меток;
-# собственный impl/src-код остаётся под контролем code-review (не злоупотребляем).
-[lints.clippy]
-doc_lazy_continuation = "allow"
-[lints.rust]
-dead_code = "allow"
-[lib]
-path = "src/lib.rs"
-
 # M-32 task 2b: one-shot анализ прод-журнала через analyze/consistency на примере BTCUSDT L2Delta.
 # EpochFilter НАЗВАН (CT-RFC02-2): `OwnCaptureOnly` (свой захват, без вендорских/синтетики).
 # Запуск: cargo run --release -p research-cli --example depth_lifetime -- <journal-dir>
