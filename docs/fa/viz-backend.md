@@ -39,7 +39,7 @@ snapshot/frames/replay — **read-only, детерминированный, stat
 | **Volume Profile** (SVP/CVP/FRVP/Anchored/Composite: POC/VAH/VAL/HVN/LVN, VA%) | Trade | ❌ новый (M-24) |
 | **VWAP** (session/anchored, HLC3, σ-полосы) | Trade | 🟡 M-20 (QUEUED) |
 | **Liquidations/OI/Funding профили** | Liquidation/OI/Funding | 🟡 новый (M-25) |
-| **TPP Bid/Ask, Delta** (полосы 1.5/3/5/8/15/30%, per side, COIN-scope) | L2 (book depth) | 🔴 data-quality gate (§4) |
+| **TPP Bid/Ask, Delta** (полосы 1.5/3/5/8/15/30/60%, per side, COIN-scope) | L2 (book depth) | ✅ APPROVED (M-32, provenance; 30–60% — follow-up live-замер) |
 | TPP TOTAL/TOTAL1-3/OTHERS, Secrets (MLSP/Margin/Ratio/Speed) | — | ⛔ `formula_pending` (founder-спека) |
 
 **Модель сессии** (00:00 UTC anchor/reset, session templates) — общий примитив для VWAP / SVP / CVD-reset;
@@ -82,13 +82,14 @@ snapshot/frames/replay — **read-only, детерминированный, stat
 - **Корректность книги — предусловие TPP** (замена «вендор y/n»): (а) эвикция мёртвых уровней (**TD-016**,
   Track A — **M-31**); (б) целостность при resync (ресинк к мелкому снапшоту не должен ронять восстановимые
   дальние полосы в 0 как «настоящий» факт). RED-спека на venue-book — до включения TPP-полос в контракт.
-- **ВЕРИФИКАЦИЯ достоверности глубины — отдельное предусловие (M-32, founder-приоритет).** Корректность
-  книги (M-31) ≠ доказанная достоверность дальних полос. **M-32-depth-verification** валидирует ИЗМЕРИТЕЛЬ
-  (C-020/M-10 «сначала провалидируй, потом доверяй», доведённый до глубины): Q1 — фактический обзор источников
-  (есть ли эталон глубже 1.3%; «паритет с Bookmap/TPP» — доказать/опровергнуть); Q2 — эмпирические trust-тесты
-  над журналом БЕЗ deeper-эталона: L2Delta-lifetime/staleness (дальние уровни получают `size=0` или замерзают,
-  де-конфаунд resync через sequencing) + order-flow faithfulness. **TPP-полосы 3-30% НЕ включаются в export-контракт,
-  пока M-32 не выдаст founder-вердикт** (эталон / diff-provenance VB-I-5).
+- **ВЕРИФИКАЦИЯ достоверности глубины (M-32) — ЗАВЕРШЕНА, founder-решение принято (2026-07-24).**
+  M-32-depth-verification провалидировал ИЗМЕРИТЕЛЬ (C-020/M-10, доведено до глубины): **Q1** — эталона глубже
+  1.3% нет ни у кого (паритет с Bookmap/TPP CONFIRMED); **Q2** — дальние полосы ЖИВЫЕ (cancel_fraction FAR=0.805
+  vs NEAR=0.981, order-flow consistency=0.950, gaps=0 на gap-free segment 78) → фантом TD-016 эмпирически снят.
+  **✅ FOUNDER APPROVED:** строить TPP-полосы на diff-книге с `depth_band_provenance: "diff-reconstructed,
+  validated<=1.3%"` (VB-I-5), **диапазон 1.5–60%**. **Граница верификации:** живость доказана для **1.5–30%**;
+  **30–60% — provenance + follow-up live-замер** (расширить band-схему анализатора до `[3000,6000)` bps,
+  переснять на segment 78) ДО включения этих полос. См. `research/data-quality/depth-verdict.md`.
 - **`formula_pending`** для неподтверждённых формул (TPP TOTAL-состав, Secrets) — бэкенд НЕ выдумывает
   (бриф §27). Серия объявлена, значение — `pending`, пока founder не подпишет методологию.
 - **История 2019+** — только через вендора (**Tardis.dev**, Binance spot L2 с 2019-12); НЕ для глубины, для
