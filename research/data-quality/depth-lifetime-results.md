@@ -8,6 +8,20 @@ GREEN DV-I-1..5 + DV-I-7/8 bounded-work) + расширение `crates/research
 (FaithEvent + consistency, GREEN DV-I-6 + DV-I-8 bounded-work).
 **Тесты:** все GREEN (`cargo test -p research-cli` → DV-I-1..8 pass).
 
+## АВТОРИТЕТНЫЙ ЭТАЛОН (для вердикта M-32 task 5) — ТОЛЬКО gap-free segment 78
+
+> Финальные числа (reviewer/founder-подтверждённые, gap-free `segment-00000078.jrnl`, `gaps=0`):
+> **NEAR cancel_fraction = 0.981** · **FAR cancel_fraction = 0.805** · **order-flow consistency_rate = 0.950**.
+> Per-band распределение ниже — тот же прогон (лёгкая итерационная разница 0.803/0.955 в пределах шума).
+
+**⚠ КАСКАДНЫЕ GAP'Ы — мульти-сегментный прогон НЕВАЛИДЕН (находка tester §E).** Прогон по 3 сегментам
+(78+79+80) дал `gaps=201908` и `cancel_fraction=1.000` — это **АРТЕФАКТ fail-closed**, НЕ доказательство
+«всё отменяется»: анализатор (как `book::OrderBook::apply_l2delta`, DV-I-3) после ПЕРВОГО sequence-gap
+на границе сегментов блокирует running-state и квалифицирует КАЖДЫЙ последующий contiguous-тик как gap
+(каскад). Границы сегментов = разрыв чейна `U/u/pu` без ресинк-снапшота в потоке. **Для lifetime-вердикта
+использовать ТОЛЬКО segment 78** (внутренне gap-free, `gaps=0`, `censored=0`). Мульти-сегмент требует
+resync-восстановления между сегментами (follow-up, не блокирует вердикт).
+
 ## Данные
 
 - **Сегмент:** `/var/lib/docker/volumes/hft-platform_journal-data/_data/segment-00000078.jrnl`
