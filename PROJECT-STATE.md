@@ -290,6 +290,42 @@ milestone + verify; НЕ contracts/risk/ks/oms/venue, не новый крейт
   КАЖДОЙ серии >1.3%); (3) resync-восстановление в lifetime-анализаторе для мульти-сегментной агрегации
   (каскадные gaps — §Risks-1 вердикта); (4) M-31 (эвикция/TD-016) и M-28 (gateway-serve) остаются в очереди.
 
+## Верификация полос 30-60% (M-33 «depth-band-3060» — ✅ MERGED `6ec6453`, reviewer APPROVED 2026-07-24; §8 деплой-гейт GREEN)
+Follow-up #1 из вердикта M-32 — закрывает границу верификации: живость полос 30-60% ([3000,6000) bps),
+которая в M-32 была доказана лишь для 1.5-30%. Цепочка: architect (RED DV-I-9 sacred + milestone + verify)
+→ research-dev (impl: `BANDS_BPS += (3000,6000)` + пересъёмка seg78) → architect (вердикт task 3) → reviewer
+merge. critic N/A и risk-critic N/A (scope = `crates/research-cli/{src,tests}` + `research/data-quality/*.md`
++ milestone + verify; НЕ contracts/risk/ks/oms/venue/book/signals, не новый крейт → Class-A doc + research).
+- **Что сделано:** `BANDS_BPS` (pub const в `depth_lifetime.rs`) расширен на `(3000,6000)` + clamp-fallback
+  зеркалит новую границу (`unwrap_or 3000→6000`); полоса переснята на том же gap-free **segment 78** (тот же
+  авторитетный эталон, `gaps=0`). Диф impl минимален (const + comment, НЕ логика — reviewer сверил построчно).
+- **Результат (`research/data-quality/depth-lifetime-results.md` §M-33):** 30-60% — **ЖИВАЯ-РАЗРЕЖЕННАЯ**
+  (alive-sparse): **bid cancel_fraction=0.622** (n=156, устойчива, 1/n=0.6% swing), **ask=0.366** (n=41,
+  шумная, 2.4% swing). Тренд по глубине монотонно ↓ (bid 0.867→0.796→0.622) — дальние уровни «стикче»
+  (крупные лимиты, меньше churn), НО cancel_fraction > 0.5 (bid) ⇒ НЕ замёрзшая у потолка. n=156/41 (не ≈0)
+  ⇒ книга ТУДА дотягивается, но сильно разрежена (сидит на структурном потолке reach p50 54-58%, cap ±60%).
+- **Пре-регистрированный founder-флаг НЕ сработал:** порог «drop >50% от соседней [1500,3000) ПО ОБЕ стороны»
+  → bid drop 21.9%, ask drop 33.5% — оба <50% ⇒ 30-60% **live-verified**, покрывается уже-подписанным
+  founder-диапазоном 1.5-60% (M-32 граница C) — **новая founder-подпись НЕ требуется** (architect не подставил
+  авто-approve: подпись понадобилась бы ТОЛЬКО при аномалии-заморозке, её нет). **Все полосы 1.5-60% теперь
+  live-verified** (30-60% — с caveat разрежённости: band-суммы интерпретировать с бОльшей неопределённостью).
+- **Sacred RED DV-I-9** (`red_depth_band_3060.rs`, architect-only): уровень на 45% (4500 bps) атрибутируется
+  в ОТДЕЛЬНУЮ полосу `lo_bps=3000`, не клампится в `[1500,3000)`. Анти-плацебо: против нерасширенного impl
+  `band(_,3000)=None` → FAIL, после `BANDS_BPS +=` → GREEN. DV-I-1..8 (M-32) регресс-GREEN (расширение схемы
+  не сломало обобщённую band-итерацию).
+- **Гейты (reviewer перепрогнал независимо, worktree `/tmp/hft-reviewer-M-33`):** `verify_M-33.sh` **PASS
+  (6/6), exit=0** — fmt clean, clippy 0 warn, DV-I-9 GREEN, DV-I-1..6 регресс-GREEN, DV-I-7/8 bounded
+  регресс-GREEN, memo содержит полосу 30-60%. Push-scope: 3 коммита M-33 (architect/research-dev).
+  **§8 деплой-гейт GREEN (`6ec6453`, 2026-07-24T23:35Z):** CI run 30133821123 success + Deploy 30133821163
+  success (gated-on-CI fail-closed); VPS eyes-on — `hft-recorder Up (healthy)`, heartbeat свежий (~6s,
+  `writable=true`, `next_seq=84638227` монотонен, `segment_index=83`), segment-83 растёт (545 MB).
+  Прод-поведение recorder'а НЕ изменено (impl только в `research-cli`) — §8 подтверждает лишь что деплой не сломал прод.
+- **TECH-DEBT без изменений:** M-33 верифицировал ИЗМЕРИТЕЛЬ (30-60% живость); TD-016 (корректность поддержки
+  книги: эвикция мёртвых уровней + resync-целостность + bounded-рост) — по-прежнему за **M-31**.
+- **Follow-up (за architect/founder):** M-34 TPP-построение (Bid/Ask/Delta export 1.5-60% на diff-книге,
+  VB-I-5 provenance на КАЖДОЙ серии >1.3%) — следующий приоритет по founder-greenlight; M-35 resync-recovery
+  (мульти-сегментная агрегация lifetime, каскадные gaps); M-31 (эвикция/TD-016), M-28 (gateway-serve) в очереди.
+
 ## Мозг стратегии (M-07 «Strategy brain» — РЕАЛИЗОВАНО, reviewer APPROVED 2026-07-13)
 Закрыта дыра равенства DESIGN §1 №2 (`backtest == paper == live`): решения больше НЕ захардкожены
 в ad-hoc harness'е `research-cli/grid.rs` (taker-in по `SignalOut`, taker-out по `horizon_ms`,
