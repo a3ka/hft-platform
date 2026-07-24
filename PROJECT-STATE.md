@@ -1198,9 +1198,13 @@ reviewer APPROVED. **critic НЕ требовался** (не T1/risk/ks/oms/ven
 - **Scope/Sacred (reviewer):** 4 коммита — `fd75fd6` (architect: RED + verify + milestone, sacred), `ebc98fe`+`8613066`
   (engine-dev: gateway/src + own Cargo.toml/lock), `94230c4` (engine-dev: 2-строчный clippy-fix, ТОЛЬКО gateway/src).
   contracts(T1)/risk/killswitch/oms/venue-*/journal/recorder/**book/src**/docs НЕ тронуты. Forbidden соблюдён.
-- **§8-lite (прод ИНЕРТЕН by construction — gateway = read-side reducer/replay поверх журнала; recorder НЕ зависит от gateway,
-  `Dockerfile` собирает `--bin recorder` → образ не меняется):** CI+Deploy watched + VPS eyes-on — **PENDING (proof дополняется
-  reviewer'ом после deploy-гейта; см. §8 close-out ниже по факту).**
+- **§8-lite (прод ИНЕРТЕН by construction — gateway = read-side reducer/replay поверх журнала; recorder НЕ зависит от gateway)
+  — ✅ GREEN (reviewer eyes-on, 2026-07-24T10:30Z, прод `7515a38`):** CI run 30085826636 **success** (fmt+clippy+test 1.97 +
+  Delivery gate + **Protected artifacts green** — reland ДОБАВЛЯЕТ M-23-файлы, не удаляет + cargo audit); Deploy 30085826669
+  **success**. VPS eyes-on: `hft-recorder` healthy, `restarts=0`; **образ содержит ТОЛЬКО `recorder`+`journal-retention`,
+  gateway НЕ доставлен** ⇒ инертность доказана; heartbeat свежий/`writable:true`, `next_seq` растёт 80311662→80312736 за 13s
+  (+1074 events, ts_wall +10s cadence), 0 panic/ERROR/backstop; `book levels` ≈5000/сторона (TD-016 наблюдение — стабильно
+  у baseline). gateway-изменение НЕ повлияло на recorder (как и ожидалось — нет dep).
 - **M-23 MERGED, milestone STATUS→DONE — за architect** (reviewer уведомляет). **Дальше:** Трек A (gap-detection + **TD-016**
   эвикция — предусловие ДАЛЬНЕЙ достоверности heatmap/TPP-полос), M-25 liq/OI/funding-профили, M-28 gateway-serve (транспорт).
 
