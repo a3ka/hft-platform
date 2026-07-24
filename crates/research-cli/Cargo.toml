@@ -31,3 +31,10 @@ crc32fast = "1"
 [[bin]]
 name = "research-cli"
 path = "src/main.rs"
+
+# M-32 task 2b: one-shot анализ прод-журнала через analyze/consistency на примере BTCUSDT L2Delta.
+# EpochFilter НАЗВАН (CT-RFC02-2): `OwnCaptureOnly` (свой захват, без вендорских/синтетики).
+# Запуск: cargo run --release -p research-cli --example depth_lifetime -- <journal-dir>
+[[example]]
+name = "depth_lifetime"
+path = "examples/depth_lifetime.rs"
