@@ -300,8 +300,16 @@ impl Books {
     }
 
     /// Применить событие. Trade/Funding/прочее игнорируются; книгу двигает L2Snapshot
-    /// (полная замена) и L2Delta (инкрементальный diff — M-29, replay/reducer-путь).
-    /// Sequencing-поля L2Delta в M-29 НЕ валидируются (gap-detection — follow-up).
+    /// (полная замена, ресинк) и L2Delta (инкрементальный diff — M-29 raw `apply_delta`
+    /// для путей без чейнинга; M-30 `apply_l2delta` для чейнинг-aware пути, default).
+    ///
+    /// **M-30:** L2Delta-путь в `Books::apply` ИДЁТ через `apply_l2delta` с передачей
+    /// sequencing-полей (`first_update_id`/`final_update_id`/`prev_final_update_id`) — это
+    /// единственный публичный путь дельт через `Books`, чтобы gap-детекция была
+    /// материал-и-и-дефолт (BK-I-3, нельзя «забыть»). `apply_delta` (raw) сохранён как
+    /// публичный метод на `OrderBook` для случаев, где sequencing не нужен (фикстуры,
+    /// unit-тесты редьюсера). На `Gap` книга остаётся `stale` (доступно через
+    /// `OrderBook::is_stale()`).
     pub fn apply(&mut self, md: &MdEvent) {
         match &md.payload {
             MdPayload::L2Snapshot { bids, asks, .. } => {
@@ -310,11 +318,24 @@ impl Books {
                     .or_default()
                     .apply_snapshot(bids, asks);
             }
-            MdPayload::L2Delta { bids, asks, .. } => {
+            MdPayload::L2Delta {
+                bids,
+                asks,
+                first_update_id,
+                final_update_id,
+                prev_final_update_id,
+                ..
+            } => {
                 self.map
                     .entry((md.venue, md.symbol.clone()))
                     .or_default()
-                    .apply_delta(bids, asks);
+                    .apply_l2delta(
+                        bids,
+                        asks,
+                        *first_update_id,
+                        *final_update_id,
+                        *prev_final_update_id,
+                    );
             }
             _ => {}
         }
