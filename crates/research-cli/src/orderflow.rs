@@ -23,7 +23,7 @@
 //! Детерминизм: BTreeMap для стабильной итерации; чистые редьюсеры (без wall-clock/rand/I/O).
 
 use contracts::{Level, Side};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 /// Бар полного footprint'а для кастомного рендера (M-19 Тир2 — cluster chart).
 /// `bins` отсортированы по `price` (BTreeMap на этапе редьюсера → детерминированный выход).
@@ -200,73 +200,36 @@ pub struct FaithReport {
     pub inconsistent: u64,
 }
 
-/// Снимок running-книги на момент сделки (для второго прохода forward-scan).
-#[allow(dead_code)]
-type TradeSnapshot = (usize, i64, i64, i64, BTreeMap<i64, i64>);
-
 /// Проверить согласованность trade-flow с book-flow. Чистый редьюсер; детерминирован.
 ///
-/// **Алгоритм (single-pass O(N)):**
-///   - `running_book`: price → size, инкрементально обновляется по мере итерации.
-///   - `pending`: VecDeque незарезолвленных сделок (ts, price, size, current_size_at_P).
-///   - Для каждого Trade: проверяем, декрементируется ли size_at(P) при обработке Delta;
-///     записываем в `pending` (если ещё не резолвлено) и резолвим при первом подходящем Delta.
-///   - Для каждой Delta: применяем к `running_book`; затем пробегаем по `pending`,
-///     проверяя декремент; резолвленные переводим в `consistent`/`inconsistent` по исходу.
-///   - При достижении конца потока все ещё pending → `inconsistent` (поток не отразил филл).
-///   - При переполнении окна `ts - pending_trade.ts > window_ms` → торговля timed out,
-///     переводим в `inconsistent` (исключаем из pending).
+/// **Алгоритм (один forward-pass):**
+///   - `book` обновляется инкрементально во внешнем цикле;
+///   - `PendingSet::by_time` истекает строго с front по timestamp;
+///   - `PendingSet::by_price` направляет Delta только к сделкам на затронутой цене;
+///   - rebuild `events[..i]` и полный скан pending на каждой Delta отсутствуют.
 ///
-/// Сложность: каждый Delta проходит по `pending` один раз (после резолва — больше не
-/// рассматривается); суммарно O(N + T·W), где W — среднее число pending на момент Delta.
-/// На реальном потоке BTCUSDT (window=1с, ~10ms/event) W ≤ ~100, итого O(N).
+/// Каждая pending-сделка хранит пик видимого размера книги после trade. Её динамический
+/// target равен `max_size_since_trade - trade.size`; это позволяет сначала увидеть
+/// уровень после старта сегмента, а затем проверить его декремент. Сделка согласована,
+/// когда будущая Delta в `(ts, ts+window_ms]` опускает уровень до target или снимает
+/// его. Работа ограничена событиями той же цены внутри конечного окна.
 pub fn consistency(events: &[FaithEvent], window_ms: i64) -> FaithReport {
-    let mut r = FaithReport::default();
+    let mut report = FaithReport::default();
     if window_ms <= 0 {
-        // Защита от мусорного окна — нулевая отчётность (как в `footprint_delta`).
-        return r;
+        return report;
     }
+
     let mut book: BTreeMap<i64, i64> = BTreeMap::new();
-    let mut pending: std::collections::VecDeque<PendingTrade> = std::collections::VecDeque::new();
-    for ev in events {
-        match ev {
-            FaithEvent::Delta {
-                ts_ms: dts,
-                bids,
-                asks,
-            } => {
-                let dts_val = *dts;
-                apply_delta_to_book(&mut book, bids, asks);
-                // Резолвим pending: для каждой сделки проверяем, накопленный декремент с момента
-                // сделки до текущего состояния >= size ИЛИ book[P] == 0.
-                // Отслеживаем per-trade running_max_size (= book[P] при КАЖДОМ delta в окне).
-                // Если book[P] когда-либо был > max_so_far (например, populate), max_so_far
-                // обновляется; декремент считается как `max_so_far - cur_size`.
-                // Дельта вне окна — игнорируем; trade остаётся в pending до eviction'а.
-                let mut i = 0;
-                while i < pending.len() {
-                    let trade = &mut pending[i];
-                    if dts_val.saturating_sub(trade.ts_ms) > window_ms {
-                        i += 1;
-                        continue;
-                    }
-                    if dts_val <= trade.ts_ms {
-                        i += 1;
-                        continue;
-                    }
-                    let cur_size = book.get(&trade.price).copied().unwrap_or(0);
-                    // Обновляем пик book[P] с момента сделки: populate (0 → 10) тоже считается.
-                    if cur_size > trade.max_size_since_trade {
-                        trade.max_size_since_trade = cur_size;
-                    }
-                    // Декремент считается от пика — `max_size - cur_size` (или cur_size == 0).
-                    let peak = trade.max_size_since_trade;
-                    if cur_size == 0 || peak.saturating_sub(cur_size) >= trade.size {
-                        r.consistent += 1;
-                        pending.remove(i);
-                    } else {
-                        i += 1;
-                    }
+    let mut pending = PendingSet::default();
+
+    for event in events {
+        match event {
+            FaithEvent::Delta { ts_ms, bids, asks } => {
+                pending.expire_before(*ts_ms, window_ms, &mut report);
+                let touched = apply_delta_to_book(&mut book, bids, asks);
+                for price in touched {
+                    let current_size = book.get(&price).copied().unwrap_or(0);
+                    pending.resolve_price(price, *ts_ms, window_ms, current_size, &mut report);
                 }
             }
             FaithEvent::Trade {
@@ -275,64 +238,151 @@ pub fn consistency(events: &[FaithEvent], window_ms: i64) -> FaithReport {
                 side: _,
                 size,
             } => {
-                r.checked += 1;
-                // Eviction: сначала убираем просроченные.
-                while let Some(front) = pending.front() {
-                    if ts_ms.saturating_sub(front.ts_ms) > window_ms {
-                        r.inconsistent += 1;
-                        pending.pop_front();
-                    } else {
-                        break;
-                    }
-                }
-                // Запоминаем текущий size_at(price) — это «до» любой будущей Delta.
-                let cur_size = book.get(price).copied().unwrap_or(0);
-                // Всегда пушим в pending: даже если cur_size == 0, последующая Delta может
-                // populate + decrement в окне — тогда учитываем. При end-of-window eviction'е
-                // (end-of-stream или на следующей сделке) trade без разрешения → inconsistent.
-                pending.push_back(PendingTrade {
+                pending.expire_before(*ts_ms, window_ms, &mut report);
+                report.checked += 1;
+                let size_at_trade = book.get(price).copied().unwrap_or(0);
+                pending.push(PendingTrade {
                     ts_ms: *ts_ms,
                     price: *price,
                     size: *size,
-                    cur_size,
-                    max_size_since_trade: cur_size,
+                    max_size_since_trade: size_at_trade,
                 });
             }
         }
     }
-    // Конец потока: все, что осталось в pending, не нашли декремента → inconsistent.
-    r.inconsistent += pending.len() as u64;
-    r
+
+    pending.finish(&mut report);
+    report
 }
 
-/// Запись в очереди незарезолвленных сделок: `(ts_ms, price, size, cur_size_at_P,
-/// max_size_since_trade)`. `max_size_since_trade` обновляется при КАЖДОЙ Delta в окне:
-/// populate (0→10) тоже считается, чтобы декремент после populate корректно засчитался.
+/// Активная сделка. ID хранится отдельно в двух индексах: глобальном временном и
+/// ценовом. Сама запись существует только пока сделка не resolved/expired.
 struct PendingTrade {
     ts_ms: i64,
     price: i64,
     size: i64,
-    /// `size_at(price)` в момент ПОЯВЛЕНИЯ сделки — для детекции декремента в будущем.
-    cur_size: i64,
-    /// Пик `size_at(price)` начиная с момента сделки: обновляется при каждой Delta в окне
-    /// (populate=0→10 увеличивает peak; дальнейший декремент считается от этого пика).
     max_size_since_trade: i64,
 }
 
-/// Применить дельту к running-книге (size==0 = remove, size>0 = upsert).
-fn apply_delta_to_book(book: &mut BTreeMap<i64, i64>, bids: &[Level], asks: &[Level]) {
-    for l in bids {
-        if l.size == 0 {
-            book.remove(&l.price);
-        } else if l.size > 0 {
-            book.insert(l.price, l.size);
+#[derive(Default)]
+struct PendingSet {
+    next_id: u64,
+    active: HashMap<u64, PendingTrade>,
+    by_time: VecDeque<u64>,
+    by_price: HashMap<i64, VecDeque<u64>>,
+}
+
+impl PendingSet {
+    fn push(&mut self, trade: PendingTrade) {
+        let id = self.next_id;
+        self.next_id = self.next_id.saturating_add(1);
+        let price = trade.price;
+        self.active.insert(id, trade);
+        self.by_time.push_back(id);
+        self.by_price.entry(price).or_default().push_back(id);
+    }
+
+    /// Истечение идёт только с front временной очереди. Уже resolved ID удаляются
+    /// лениво; каждый ID покидает очередь ровно один раз.
+    fn expire_before(&mut self, ts_ms: i64, window_ms: i64, report: &mut FaithReport) {
+        while let Some(id) = self.by_time.front().copied() {
+            let Some(trade) = self.active.get(&id) else {
+                self.by_time.pop_front();
+                continue;
+            };
+            if ts_ms.saturating_sub(trade.ts_ms) <= window_ms {
+                break;
+            }
+
+            let trade = self
+                .active
+                .remove(&id)
+                .expect("front active trade disappeared");
+            self.by_time.pop_front();
+            report.inconsistent += 1;
+            self.prune_price_front(trade.price);
         }
     }
-    for l in asks {
-        if l.size == 0 {
-            book.remove(&l.price);
-        } else if l.size > 0 {
-            book.insert(l.price, l.size);
+
+    /// Проверить только pending на цене, реально затронутой Delta. Delta на том же
+    /// timestamp не проходит открытую левую границу окна.
+    fn resolve_price(
+        &mut self,
+        price: i64,
+        ts_ms: i64,
+        window_ms: i64,
+        current_size: i64,
+        report: &mut FaithReport,
+    ) {
+        let Some(mut ids) = self.by_price.remove(&price) else {
+            return;
+        };
+        let mut unresolved = VecDeque::with_capacity(ids.len());
+
+        while let Some(id) = ids.pop_front() {
+            let matched = self.active.get_mut(&id).is_some_and(|trade| {
+                if current_size > trade.max_size_since_trade {
+                    trade.max_size_since_trade = current_size;
+                }
+                ts_ms > trade.ts_ms
+                    && ts_ms.saturating_sub(trade.ts_ms) <= window_ms
+                    && (current_size == 0
+                        || trade.max_size_since_trade.saturating_sub(current_size) >= trade.size)
+            });
+            if matched {
+                self.active.remove(&id);
+                report.consistent += 1;
+            } else if self.active.contains_key(&id) {
+                unresolved.push_back(id);
+            }
+        }
+
+        if !unresolved.is_empty() {
+            self.by_price.insert(price, unresolved);
         }
     }
+
+    /// Удалить resolved/expired ID с начала одной ценовой очереди. Поскольку глобальное
+    /// истечение идёт по времени, истёкший ID всегда находится перед всеми ещё живыми
+    /// ID той же цены (возможно после уже-resolved tombstones).
+    fn prune_price_front(&mut self, price: i64) {
+        loop {
+            let stale_front = self
+                .by_price
+                .get(&price)
+                .and_then(VecDeque::front)
+                .is_some_and(|id| !self.active.contains_key(id));
+            if !stale_front {
+                break;
+            }
+            if let Some(ids) = self.by_price.get_mut(&price) {
+                ids.pop_front();
+            }
+        }
+        if self.by_price.get(&price).is_some_and(VecDeque::is_empty) {
+            self.by_price.remove(&price);
+        }
+    }
+
+    fn finish(self, report: &mut FaithReport) {
+        report.inconsistent += self.active.len() as u64;
+    }
+}
+
+/// Применить дельту к running-книге и вернуть distinct-набор затронутых цен.
+fn apply_delta_to_book(
+    book: &mut BTreeMap<i64, i64>,
+    bids: &[Level],
+    asks: &[Level],
+) -> BTreeSet<i64> {
+    let mut touched = BTreeSet::new();
+    for level in bids.iter().chain(asks) {
+        touched.insert(level.price);
+        if level.size == 0 {
+            book.remove(&level.price);
+        } else if level.size > 0 {
+            book.insert(level.price, level.size);
+        }
+    }
+    touched
 }

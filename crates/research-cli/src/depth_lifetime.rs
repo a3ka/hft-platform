@@ -22,7 +22,7 @@
 //! Детерминизм: BTreeMap для стабильной итерации; чистый редьюсер (без wall-clock/rand/I/O).
 //! Граница A.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use contracts::{Level, Side};
 
@@ -126,9 +126,9 @@ enum Fate {
 /// чтобы зафиксировать Cancelled-fate — в отличие от running-книги, где уровень удаляется.
 #[derive(Debug, Clone, Copy)]
 struct LevelState {
-    /// Sentinel `0` означает «ещё не атрибутирован к полосе» (mid ещё не появился или
-    /// уровень родился ДО первого mid); атрибутируется на следующем тике с известным mid.
-    born_band_lo_bps: i64,
+    /// Полоса рождения. `None` означает: уровень родился до появления двустороннего
+    /// mid и ожидает атрибуции в очереди `unattributed`.
+    born_band_lo_bps: Option<i64>,
     fate: Fate,
 }
 
@@ -139,56 +139,74 @@ struct LevelState {
 struct SideBook {
     book: BTreeMap<i64, i64>,
     states: BTreeMap<i64, LevelState>,
+    /// Только ещё не атрибутированные новорождённые цены. В отличие от `states`, эта
+    /// очередь не сканируется целиком каждый тик и обычно опустошается на том же тике.
+    unattributed: VecDeque<i64>,
+    /// Только живые уровни: gap/finalization не сканируют ever-growing `states`.
+    alive: BTreeSet<i64>,
 }
 
 impl SideBook {
-    /// Применить дельту с **per-birth атрибуцией полосы** (O(1) на новое рождение,
-    /// если `mid_current.is_some()`; иначе sentinel=0 — обработает `prime_attribution`
-    /// при первом известном mid).
-    ///
-    /// Семантика: `size == 0` → удалить из `book`, fate в `states` → `Cancelled`
-    /// (если Alive). `size > 0` → upsert в `book`; если price НОВЫЙ — зарегистрировать
-    /// рождение с **немедленной** атрибуцией полосы (если `mid_current` известен).
-    fn apply_delta(&mut self, side_levels: &[Level], mid_current: Option<i64>) {
+    /// Применить дельту и поставить новые рождения в O(1)-очередь атрибуции.
+    /// Атрибуция выполняется после применения ОБЕИХ сторон тика, когда известен mid
+    /// именно этого тика, а не предыдущего.
+    fn apply_delta(&mut self, side_levels: &[Level]) {
         for l in side_levels {
             if l.size == 0 {
                 self.book.remove(&l.price);
-                if let Some(state) = self.states.get_mut(&l.price) {
+                let was_alive = self.states.get_mut(&l.price).is_some_and(|state| {
                     if state.fate == Fate::Alive {
                         state.fate = Fate::Cancelled;
+                        true
+                    } else {
+                        false
                     }
+                });
+                if was_alive {
+                    self.alive.remove(&l.price);
                 }
             } else if l.size > 0 {
                 let new_birth = !self.states.contains_key(&l.price);
                 self.book.insert(l.price, l.size);
                 if new_birth {
-                    let mut state = LevelState {
-                        born_band_lo_bps: 0,
-                        fate: Fate::Alive,
-                    };
-                    if let Some(m) = mid_current {
-                        attribute_one(l.price, m, &mut state);
-                    }
-                    self.states.insert(l.price, state);
+                    self.states.insert(
+                        l.price,
+                        LevelState {
+                            born_band_lo_bps: None,
+                            fate: Fate::Alive,
+                        },
+                    );
+                    self.unattributed.push_back(l.price);
+                    self.alive.insert(l.price);
                 }
             }
             // size < 0 невозможен по контракту Level.
         }
     }
 
-    /// При gap: все alive-уровни → Censored.
+    /// Атрибутировать только очередь новорождённых, не весь `states` (DV-I-7).
+    fn attribute_newborns(&mut self, mid: i64) {
+        while let Some(price) = self.unattributed.pop_front() {
+            if let Some(state) = self.states.get_mut(&price) {
+                state.born_band_lo_bps = Some(band_for_bps(signed_bps(price, mid).abs()));
+            }
+        }
+    }
+
+    /// При gap: только текущие alive-уровни → Censored. Повторный gap после
+    /// fail-closed разрыва — O(1), поскольку `alive` уже пуст.
     fn apply_gap_censor(&mut self) {
-        for state in self.states.values_mut() {
-            if state.fate == Fate::Alive {
+        for price in std::mem::take(&mut self.alive) {
+            if let Some(state) = self.states.get_mut(&price) {
                 state.fate = Fate::Censored;
             }
         }
     }
 
-    /// Конец окна: всё, что ещё Alive → Frozen.
+    /// Конец окна: только всё ещё живые уровни → Frozen.
     fn freeze_remaining(&mut self) {
-        for state in self.states.values_mut() {
-            if state.fate == Fate::Alive {
+        for price in std::mem::take(&mut self.alive) {
+            if let Some(state) = self.states.get_mut(&price) {
                 state.fate = Fate::Frozen;
             }
         }
@@ -229,42 +247,6 @@ fn band_for_bps(abs_bps: i64) -> i64 {
     BANDS_BPS.last().map(|&(lo, _)| lo).unwrap_or(1500)
 }
 
-/// Per-side учёт «есть ли хотя бы один атрибутированный уровень» — флаг переходит из
-/// `false` в `true` ОДИН раз за время анализа (когда mid впервые стал известен И есть
-/// хоть один уровень). После этого per-birth атрибуция O(1).
-#[derive(Default)]
-struct AttributionLatch {
-    primed: bool,
-}
-
-/// Инициализация per-side атрибуции на текущем mid. Идемпотентна: при первом вызове
-/// атрибутирует все sentinel=0 уровни (O(states_at_first_mid) — амортизируется); при
-/// последующих — no-op.
-///
-/// Возвращает `true`, если это БЫЛ первый вызов (и mid != None), чтобы caller знал,
-/// что атрибуция прошла. Для O(1)-per-birth после первого mid — вызывать только если
-/// вернулось `true`.
-fn prime_attribution(book: &mut SideBook, latch: &mut AttributionLatch, mid: i64) -> bool {
-    if latch.primed {
-        return false;
-    }
-    latch.primed = true;
-    for (price, state) in book.states.iter_mut() {
-        if state.born_band_lo_bps == 0 {
-            let abs_bps = signed_bps(*price, mid).abs();
-            state.born_band_lo_bps = band_for_bps(abs_bps);
-        }
-    }
-    true
-}
-
-/// Атрибутировать ОДИН уровень по текущему mid (O(1)). Вызывать ТОЛЬКО когда mid известен.
-#[inline]
-fn attribute_one(price: i64, mid: i64, state: &mut LevelState) {
-    let abs_bps = signed_bps(price, mid).abs();
-    state.born_band_lo_bps = band_for_bps(abs_bps);
-}
-
 /// Gap-детекция. Возвращает `true`, если continuity нарушена.
 ///
 /// Правило (как `book::OrderBook::apply_l2delta`):
@@ -294,15 +276,12 @@ fn side_rank(side: Side) -> i64 {
 
 /// Главный анализатор. Чистый редьюсер; один и тот же `ticks` → идентичный `LifetimeReport`.
 ///
-/// Сложность: O(N + S₀ + S_final) где N = ticks.len(), S₀ = states на момент первого mid
-/// (амортизированно O(1) per birth после bootstrap), S_final = финальный размер states.
-/// Без per-tick full-scan (DV-I-7 — prod-scale bounded-work): после bootstrap каждый
-/// рождённый уровень атрибутируется IMMEDIATELY при apply_delta (O(1)).
+/// Сложность: O(N log S + S), где N = число входных уровней, S = число distinct-цен.
+/// Каждый уровень попадает в `unattributed` ровно один раз; ever-growing `states`
+/// сканируется только при финальной агрегации, но никогда per-tick (DV-I-7).
 pub fn analyze(ticks: &[DeltaTick]) -> LifetimeReport {
     let mut bids = SideBook::default();
     let mut asks = SideBook::default();
-    let mut bid_latch = AttributionLatch::default();
-    let mut ask_latch = AttributionLatch::default();
     let mut prev_final_update_id: Option<u64> = None;
     let mut gaps: u64 = 0;
 
@@ -317,19 +296,13 @@ pub fn analyze(ticks: &[DeltaTick]) -> LifetimeReport {
             // prev_final_update_id НЕ обновляется при gap (fail-closed: stale-книга
             // отвергает всё до ресинка — тот же принцип, что в book::OrderBook).
         } else {
-            // Порядок внутри не-gap тика:
-            //   1) apply_delta — обновляет book; новорождённые получают born_band прямо
-            //      если mid на момент применения уже известен (после первого mid оно
-            //      известно ВСЕГДА для live-сегментов);
-            //   2) пересчёт mid (running) на основе обновлённой книги;
-            //   3) если mid появился ТОЛЬКО ЧТО (None → Some(m)) — атрибутируем все
-            //      ранее рождённые sentinel=0 уровни за O(S₀); после первого вызова
-            //      prime_attribution идемпотентен (no-op).
-            bids.apply_delta(&t.bids, compute_mid(&bids, &asks));
-            asks.apply_delta(&t.asks, compute_mid(&bids, &asks));
-            if let Some(m) = compute_mid(&bids, &asks) {
-                prime_attribution(&mut bids, &mut bid_latch, m);
-                prime_attribution(&mut asks, &mut ask_latch, m);
+            // Сначала применяем обе стороны. Затем mid отражает ИМЕННО этот тик, и
+            // атрибутируется только очередь новорождённых (обычно несколько цен).
+            bids.apply_delta(&t.bids);
+            asks.apply_delta(&t.asks);
+            if let Some(mid) = compute_mid(&bids, &asks) {
+                bids.attribute_newborns(mid);
+                asks.attribute_newborns(mid);
             }
             prev_final_update_id = Some(t.final_update_id);
         }
@@ -349,24 +322,16 @@ pub fn analyze(ticks: &[DeltaTick]) -> LifetimeReport {
     }
 
     for state in bids.states.values() {
-        // born_band_lo_bps уже атрибутирован; если 0 (вырожденный случай — mid не
-        // появился) — кладём в первую полосу [0, 150). RED-тестов на этот случай нет.
-        let lo = if state.born_band_lo_bps == 0 {
-            BANDS_BPS[0].0
-        } else {
-            state.born_band_lo_bps
-        };
+        // Вырожденный односторонний поток может так и не получить mid; такие рождения
+        // детерминированно попадают в первую полосу.
+        let lo = state.born_band_lo_bps.unwrap_or(BANDS_BPS[0].0);
         let entry = aggregates
             .get_mut(&(side_rank(Side::Buy), lo))
             .expect("полоса pre-init");
         bump_fate_with_side(entry, Side::Buy, state.fate);
     }
     for state in asks.states.values() {
-        let lo = if state.born_band_lo_bps == 0 {
-            BANDS_BPS[0].0
-        } else {
-            state.born_band_lo_bps
-        };
+        let lo = state.born_band_lo_bps.unwrap_or(BANDS_BPS[0].0);
         let entry = aggregates
             .get_mut(&(side_rank(Side::Sell), lo))
             .expect("полоса pre-init");
