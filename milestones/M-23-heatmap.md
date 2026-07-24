@@ -1,6 +1,6 @@
 # M-23 — Heatmap + COB + Volume Bubbles — ядро Bookmap-кокпита
 
-STATUS: **PROPOSED** (2026-07-23, architect). Пивот P-COCKPIT, Трек B (MVP-1), **центральный виз-примитив
+STATUS: **DONE — merged to main 2026-07-24** (код `7515a38`, reviewer APPROVED, §8-lite live-GREEN inert; fix 94230c4 clippy-1.97; TD-035 toolchain-drift durable-фикс — этот же PR). Пивот P-COCKPIT, Трек B (MVP-1), **центральный виз-примитив
 (Bookmap-heatmap)**. Разблокирован M-29 (`OrderBook::apply_delta` в main). Критик НЕ триггерится (gateway
 impl + новый book-dep, не contracts/risk/ks/oms/venue, не новый крейт) — reviewer-бэкстоп.
 
@@ -76,10 +76,10 @@ pub struct BubbleCell  { pub time_s: i64, pub price_e8: i64, pub buy_vol_e8: i64
 
 | # | Статус | Задача | Кто | Acceptance |
 |---|---|---|---|---|
-| 1 | ⏳ | HM-I-1..5 RED (`red_heatmap.rs`, `red_bubbles.rs`) + `verify_M-23.sh` (fmt+clippy+test, RN-17) | architect | compile-RED (нет heatmap/cob/volume_bubbles); достижимо; окно+провенанс (HM-I-2) обязателен |
-| 2 | ⏳ | book-dep + Reducer держит OrderBook (apply_snapshot+apply_delta), ветка L2Delta | engine-dev | HM-I-1 GREEN |
-| 3 | ⏳ | Heatmap (окно, close, провенанс) + COB + типы + `SeriesBundle` поля + bump schema→5 | engine-dev | HM-I-2/HM-I-3/HM-I-5 GREEN; GW-I-3/GW-I-5 не сломаны |
-| 4 | ⏳ | Volume Bubbles аккумулятор (Trade→buy/sell per time×price, цены не выдуманы) | engine-dev | HM-I-4 GREEN; workspace green |
+| 1 | ✅ | HM-I-1..5 RED (`red_heatmap.rs`, `red_bubbles.rs`) + `verify_M-23.sh` (fmt+clippy+test, RN-17) | architect | compile-RED (нет heatmap/cob/volume_bubbles); достижимо; окно+провенанс (HM-I-2) обязателен |
+| 2 | ✅ | book-dep + Reducer держит OrderBook (apply_snapshot+apply_delta), ветка L2Delta | engine-dev | HM-I-1 GREEN |
+| 3 | ✅ | Heatmap (окно, close, провенанс) + COB + типы + `SeriesBundle` поля + bump schema→5 | engine-dev | HM-I-2/HM-I-3/HM-I-5 GREEN; GW-I-3/GW-I-5 не сломаны |
+| 4 | ✅ | Volume Bubbles аккумулятор (Trade→buy/sell per time×price, цены не выдуманы) | engine-dev | HM-I-4 GREEN; workspace green |
 
 ## Гейты
 
