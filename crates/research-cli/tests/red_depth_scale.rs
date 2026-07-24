@@ -77,9 +77,10 @@ fn dv_i_7_prodscale_analyze_bounded() {
             ts_exch_ms: i as i64,
         });
     }
-    assert_bounded("analyze(120k растущих distinct-уровней)", move || {
-        analyze(&ticks).bands.len()
-    });
+    assert_bounded(
+        "analyze(120k растущих distinct-уровней)",
+        move || analyze(&ticks).bands.len(),
+    );
 }
 
 // ── DV-I-8: consistency на 400k сделок обязан быть bounded (без prefix-rebuild) ──────────────────

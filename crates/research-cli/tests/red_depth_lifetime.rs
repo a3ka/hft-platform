@@ -10,14 +10,13 @@
 //! реконструированными снапшотами (resync их обнулял → dd=100% ложно); здесь — события отмен напрямую.
 //!
 //! Контракт (research-dev impl, `crates/research-cli/src/depth_lifetime.rs`):
-//!   `research_cli::depth_lifetime::analyze(ticks: &[DeltaTick]) -> LifetimeReport`
-//!   - чистый редьюсер; трекает mid (running best bid/ask из дельт — raw apply, БЕЗ stale-FSM,
-//!     чтобы mid не терялся после gap); атрибуция уровня к полосе — по дистанции от mid ПРИ РОЖДЕНИИ;
-//!   - per-price жизненный цикл: born → (explicit size=0 в contiguous окне = cancelled) |
-//!     (жив на конце окна, ни разу size=0 = frozen) | (исчез через seq-gap = censored);
-//!   - gap-правило (то же, что `book::OrderBook::apply_l2delta`): спот `U==prev.u+1`; фьюч `pu==prev.u`;
-//!   - вывод детерминирован (BTreeMap-порядок; `bands` отсортированы по (side, lo_bps)).
-//!   `cancel_fraction = cancelled / (cancelled + frozen)` — censored ИСКЛЮЧЕНЫ из знаменателя.
+//! `research_cli::depth_lifetime::analyze(ticks: &[DeltaTick]) -> LifetimeReport`.
+//! Чистый редьюсер; трекает mid (running best bid/ask из дельт — raw apply, БЕЗ stale-FSM, чтобы mid не
+//! терялся после gap); атрибуция уровня к полосе — по дистанции от mid ПРИ РОЖДЕНИИ. Per-price жизненный
+//! цикл: born → (explicit size=0 в contiguous окне = cancelled) | (жив на конце окна, ни разу size=0 =
+//! frozen) | (исчез через seq-gap = censored). Gap-правило (как `book::OrderBook::apply_l2delta`): спот
+//! `U==prev.u+1`; фьюч `pu==prev.u`. Вывод детерминирован (BTreeMap-порядок; `bands` отсортированы по
+//! (side, lo_bps)). `cancel_fraction = cancelled / (cancelled + frozen)` — censored ИСКЛЮЧЕНЫ из знаменателя.
 //!
 //! Анти-плацебо (ОБЕ стороны): заглушка «всё frozen» → падает DV-I-1; «всё cancelled» → DV-I-2;
 //! наивный «gap-исчезновение = отмена» → DV-I-3 (ядро); «истекает после N молчаливых тиков» → DV-I-4;
@@ -54,7 +53,7 @@ fn tick(u_first: u64, u_final: u64, ts_ms: i64, bids: Vec<Level>, asks: Vec<Leve
 }
 
 // Полосы (bps от mid), совпадают с impl-константой: [0,150)[150,300)[300,500)[500,800)[800,1500)[1500,3000).
-const NEAR_LO: i64 = 0; // полоса [0,150) bps — near, в пределах валидированного REST ≤1.3%
+// (near-полоса [0,150) — в пределах валидированного REST ≤1.3%.)
 const FAR_LO: i64 = 500; // полоса [500,800) bps — дальняя (5-8%), где живёт вопрос фантома
 const FAR_PCT: f64 = 0.06; // 600 bps → в [500,800)
 const NEAR_PCT: f64 = 0.0005; // 5 bps → в [0,150)
@@ -115,7 +114,10 @@ fn dv_i_2_never_cancelled_is_frozen() {
     ];
     let r = analyze(&ticks);
     let far = r.band(Side::Buy, FAR_LO).expect("дальняя полоса");
-    assert!(far.frozen >= 1, "жив на конце окна, ни разу size=0 ⇒ frozen≥1");
+    assert!(
+        far.frozen >= 1,
+        "жив на конце окна, ни разу size=0 ⇒ frozen≥1"
+    );
     assert_eq!(far.cancelled, 0, "не было явной отмены ⇒ cancelled=0");
     assert_eq!(far.censored, 0, "gap'а не было ⇒ censored=0");
 }
@@ -142,7 +144,10 @@ fn dv_i_3_gap_vanish_is_censored_not_cancel() {
     let r = analyze(&ticks);
     assert!(r.gaps >= 1, "скачок update-id ⇒ gap задетектирован");
     let far = r.band(Side::Buy, FAR_LO).expect("дальняя полоса");
-    assert!(far.censored >= 1, "исчез через gap ⇒ censored≥1 (fate неизвестен)");
+    assert!(
+        far.censored >= 1,
+        "исчез через gap ⇒ censored≥1 (fate неизвестен)"
+    );
     assert_eq!(
         far.cancelled, 0,
         "gap-исчезновение НЕ отмена (наивный анализатор соврал бы 'живой')"
@@ -178,8 +183,14 @@ fn dv_i_4_absence_is_not_deletion() {
     let r = analyze(&ticks);
     let far = r.band(Side::Buy, FAR_LO).expect("дальняя полоса");
     // «истекает после N молчаливых тиков» пометил бы уровень frozen ДО отмены → провал.
-    assert!(far.cancelled >= 1, "уровень дожил до явной size=0 ⇒ cancelled≥1");
-    assert_eq!(far.frozen, 0, "молчание не должно преждевременно замораживать");
+    assert!(
+        far.cancelled >= 1,
+        "уровень дожил до явной size=0 ⇒ cancelled≥1"
+    );
+    assert_eq!(
+        far.frozen, 0,
+        "молчание не должно преждевременно замораживать"
+    );
 }
 
 // ── DV-I-5: детерминизм — тот же вход → идентичный отчёт; полосы отсортированы ────────────────────
@@ -212,7 +223,10 @@ fn dv_i_5_determinism() {
     let keyed: Vec<(i64, i64)> = r1.bands.iter().map(|b| (b.side as i64, b.lo_bps)).collect();
     let mut sorted = keyed.clone();
     sorted.sort();
-    assert_eq!(keyed, sorted, "bands обязаны быть отсортированы (детерминизм порядка)");
+    assert_eq!(
+        keyed, sorted,
+        "bands обязаны быть отсортированы (детерминизм порядка)"
+    );
 }
 
 // ── Анти-плацебо чек-лист: асимметрия + множественность ─────────────────────────────────────────
@@ -255,6 +269,9 @@ fn dv_i_checklist_asymmetry_and_multiplicity() {
     let far_ask = r.band(Side::Sell, FAR_LO).expect("дальняя ask-полоса");
     // Асимметрия: ask молчал ⇒ его дальний уровень frozen (жив), НЕ censored/cancelled.
     assert_eq!(far_ask.cancelled, 0, "ask-сторона молчала ⇒ не отменена");
-    assert_eq!(far_ask.censored, 0, "односторонний bid-тик не роняет ask в censored");
+    assert_eq!(
+        far_ask.censored, 0,
+        "односторонний bid-тик не роняет ask в censored"
+    );
     assert!(far_ask.frozen >= 1, "молчащий ask-уровень жив ⇒ frozen≥1");
 }

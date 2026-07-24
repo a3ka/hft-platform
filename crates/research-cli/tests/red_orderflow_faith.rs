@@ -58,9 +58,9 @@ fn dv_i_6_trade_with_book_decrement_is_consistent() {
 #[test]
 fn dv_i_6_trade_without_book_decrement_is_inconsistent() {
     let events = vec![
-        delta(1_000, P, 10), // книга: P=10
-        trade(2_000, P, 4),  // исполнено 4 на P
-        delta(2_500, P, 10), // P не убыл (10→10) — поток НЕ отразил филл
+        delta(1_000, P, 10),       // книга: P=10
+        trade(2_000, P, 4),        // исполнено 4 на P
+        delta(2_500, P, 10),       // P не убыл (10→10) — поток НЕ отразил филл
         delta(2_800, P + UNIT, 5), // другая цена — нерелевантно
     ];
     let r = consistency(&events, 1_000);
@@ -92,12 +92,6 @@ fn dv_i_6_multiplicity_mixed() {
 // ── DV-I-6 детерминизм ──────────────────────────────────────────────────────────────────────────
 #[test]
 fn dv_i_6_determinism() {
-    let mk = || {
-        vec![
-            delta(1_000, P, 10),
-            trade(2_000, P, 4),
-            delta(2_500, P, 6),
-        ]
-    };
+    let mk = || vec![delta(1_000, P, 10), trade(2_000, P, 4), delta(2_500, P, 6)];
     assert_eq!(consistency(&mk(), 1_000), consistency(&mk(), 1_000));
 }
