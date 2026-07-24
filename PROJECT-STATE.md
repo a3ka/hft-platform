@@ -232,7 +232,11 @@ PASS на чистом чекауте → reviewer APPROVED. Тесты: 28 RED�
   (`venue-binance::handle_diff`), не задет — recorder-образ инертен (§8-lite: регрессия-sanity,
   не новое поведение). Полный переход gateway heatmap/depth на `apply_l2delta` + флаг `stale` на
   окне — follow-up. Предусловие ДАЛЬНЕЙ достоверности книги для Track A 3б (TD-016 эвикция) /
-  3в (resync-целостность).
+  3в (resync-целостность). **§8 деплой-гейт GREEN (`a52a5e4`, 2026-07-24T13:45Z):** CI
+  run 30097636377 success + Deploy 30097636342 success (Deploy gated-on-CI fail-closed);
+  VPS eyes-on — `hft-recorder Up (healthy)`, heartbeat свежий (~5.6s, `writable=true`,
+  `next_seq=81430846` монотонен), `segment-00000080.jrnl` растёт (225 MiB, mtime текущий),
+  ротация 78/79 полные @1 GiB. Recorder-образ инертен подтверждён (replay-путь не в live-эмиссии).
 - Артефакты честности с `provenance`: `research/latency/*.json` (δ_md эмпирика из журнала +
   измеренный WS RTT VPS→биржа ×2 пессимизм) и `research/fees/*.json` (Binance/HL базовые
   тарифы, скидки намеренно не учтены). sim грузит их (default-задержек в коде нет, SM-I-7/8).
