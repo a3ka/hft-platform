@@ -3,6 +3,20 @@
 > **Reviewer-owned.** Открытые долги/риски, замеченные при работе. Закрытые переносятся вниз.
 
 ## OPEN
+- **TD-036** `chain-bootstrap-from-worktree-not-origin-feat` (RN-18 process gap, замечено reviewer'ом
+  на PR-гейте M-30, 2026-07-24) — engine-dev НЕ запушил свои GREEN-коммиты (`4fd09d0`/`a896cb8`) на
+  `origin/feat/M-30-book-gap-detection` (оставался на architect-RED baseline `ff62333` = compile-RED
+  до самого merge); tester забутстрапился из ЛОКАЛЬНОГО worktree `/tmp/hft-engine-m30`, а не из origin
+  (milestone §Handoff явно требовал «бутстрап ТОЛЬКО с origin/feat/M-30 — RN-18; push GREEN перед
+  handoff»). **Класс TD-014 (chain-break):** незапушенный GREEN живёт только в чужом worktree → любой
+  следующий агент, честно бутстрапящийся с origin, увидел бы compile-RED, а не готовый импл; аудит-трейл
+  «что тестировал tester» не воспроизводим с origin. **НЕ дефект кода и НЕ блокер M-30** — reviewer
+  независимо создал СВОЙ worktree из точного `a896cb8`, прогнал все гейты с нуля (fmt/clippy/358-0/
+  verify PASS), ревью валидно; на merge reviewer ff-запушил `a896cb8` → origin/feat/M-30 (GREEN
+  восстановлен на origin) перед мержем в main. **Действие (зона architect/founder):** dispatch-mandate
+  + tester-profile для M-NN обязаны ЯВНО предписывать intra-chain push GREEN на shared `feat/M-NN`
+  ПЕРЕД handoff'ом следующему агенту (gates.md §8 «intra-chain push» уже это требует — правило есть,
+  соблюдение в цепочке M-30 не выполнено). Иначе следующий milestone рискует тем же расхождением.
 - **TD-035** `toolchain-drift-local-clippy-weaker-than-CI` — **✅ CLOSED 2026-07-24** (architect durable-фикс
   `94d055a`, reviewer APPROVED/merged). Пин `rust-toolchain.toml` (`channel = "1.97.0"`, components rustfmt+clippy)
   + `ci.yml` `dtolnay/rust-toolchain@stable → @1.97.0` (обе job'ы) ⇒ ЕДИНАЯ версия local==CI. gates.md §3 (RN-17)

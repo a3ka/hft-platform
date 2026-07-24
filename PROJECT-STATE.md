@@ -212,6 +212,27 @@ PASS на чистом чекауте → reviewer APPROVED. Тесты: 28 RED�
   T1-designate в `research-cli/src/types.rs` (промоушен → contracts отложен, см. TD-008).
 - `crates/book` — примитивы для sim: `top_n_depth` / `levels` (best-first) / `size_at`
   (carve-out C-001 C1 + SVR-резолюция; поуровневый доступ для taker_fills/ahead-семантики).
+- **`crates/book` gap-detection (M-30 «Track A 3а» — РЕАЛИЗОВАНО, reviewer APPROVED/merged,
+  2026-07-24):** закрыта ОСОЗНАННАЯ дыра M-29 — replay-книга применяла `L2Delta` БЕЗ валидации
+  sequencing. `OrderBook::apply_l2delta(bids,asks,U,u,pu) -> ContinuityStatus {Applied|Gap}`
+  чейнит дельты по update-id (спот `U==last+1`, фьючерс `pu==last`); разрыв ⇒ `Gap` + книга
+  `stale` + **дельта НЕ применена (fail-closed, тот же принцип, что риск-слой RK: разорванный
+  вход → отказ, не «применить наугад»)**; выход из `stale` — ТОЛЬКО `apply_snapshot` (ресинк
+  сбрасывает `last_final_update_id=None`+`stale=false`, чейн бутстрапится заново).
+  `Books::apply(L2Delta)` маршрутизирует через `apply_l2delta` — единственный публичный путь
+  дельт через `Books`, gap-детекция material-и-дефолт (нельзя «забыть»). M-29 `apply_delta`
+  (raw, без чейнинга) сохранён для фикстур/unit-редьюсера. RED-оракул `red_gap_detection.rs`
+  (GD-I-1..6, sacred) с анти-плацебо: GD-I-2/4 требуют «книга НЕ двинулась разорванной дельтой»
+  → impl, применяющий gap, падает. **Гейты reviewer'ом независимо (worktree `/tmp/hft-rev-m30`,
+  toolchain 1.97.0):** fmt=0, clippy=0 (0 warn), workspace **358/0**, book **20/0** (7 GD-I +
+  M-29/L2Snapshot/levels/top_n), `verify_M-30.sh` **PASS (5/5, exit=0)**. Scope: только
+  `crates/book/src/lib.rs` (+114/-4); sacred tests/verify/milestone НЕ тронуты. critic N/A
+  (book, не T1/risk/venue/новый крейт), risk-critic N/A (MD-only read-side, order-path не задет).
+  **Область:** reducer/replay-путь; live venue-приёмник имеет СВОЮ chaining-FSM
+  (`venue-binance::handle_diff`), не задет — recorder-образ инертен (§8-lite: регрессия-sanity,
+  не новое поведение). Полный переход gateway heatmap/depth на `apply_l2delta` + флаг `stale` на
+  окне — follow-up. Предусловие ДАЛЬНЕЙ достоверности книги для Track A 3б (TD-016 эвикция) /
+  3в (resync-целостность).
 - Артефакты честности с `provenance`: `research/latency/*.json` (δ_md эмпирика из журнала +
   измеренный WS RTT VPS→биржа ×2 пессимизм) и `research/fees/*.json` (Binance/HL базовые
   тарифы, скидки намеренно не учтены). sim грузит их (default-задержек в коде нет, SM-I-7/8).
