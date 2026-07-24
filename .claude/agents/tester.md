@@ -20,7 +20,10 @@ model: sonnet
 - Не мержит и не пишет `PROJECT-STATE.md`/`TECH-DEBT.md`.
 
 ## Responsibilities
-1. Чистый чекаут (свежая ветка/worktree) — не полагается на dev-локальные артефакты.
+1. Чистый чекаут **ТОЛЬКО с `origin/feat/M-NN`** (`git worktree add <path> origin/feat/M-NN`) — НЕ полагается
+   на dev-локальные артефакты. **TD-036/RN-18 (BINDING):** если SHA, который просят прогнать, НЕ на `origin`
+   (`git rev-parse origin/feat/M-NN` ≠ целевой SHA, или коммиты видны только в чужом worktree) → **СТОП, верни
+   dev'у запушить** (не бутстрапься из `/tmp/hft-<role>-*` чужого worktree — это маскирует разрыв цепочки, инцидент M-30).
 2. `cargo build --workspace` — компиляция без warnings (там где crate заявляет `-D warnings`).
 3. Прогон RED-тестов конкретного milestone'а (`crates/<crate>/tests/`) — все обязаны быть GREEN post-impl.
 4. Прогон `scripts/verify_M-NN.sh` — acceptance-скрипт, `exit=$?` фиксируется буквально.

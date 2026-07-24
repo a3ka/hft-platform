@@ -48,6 +48,10 @@ model: sonnet
 5. RED-тесты крейта (`crates/<crate>/tests/`) — спецификация, не переписывается
 
 ## Handoff
-- К `tester` — после GREEN + acceptance exit=0, Done Block с сырым stdout.
+- **TD-036/RN-18 (BINDING, hard-precondition):** ПЕРЕД handoff'ом на `tester` ОБЯЗАН `git push origin
+  HEAD:feat/M-NN` — свои GREEN-коммиты на shared feat-ветку. Handoff НЕВАЛИДЕН, пока `git log
+  origin/feat/M-NN..HEAD` не пуст. §D push-статус = `✅ pushed to origin/feat/M-NN @<sha>` (не «commits
+  ready локально»). Коммиты, живущие только в твоём worktree, невидимы tester'у (инцидент M-30: цепочка порвалась).
+- К `tester` — после GREEN + acceptance exit=0 **+ push на origin**, Done Block с сырым stdout.
 - SCOPE VIOLATION (нужна правка вне зоны, напр. в `risk`/`signals`/`contracts`) → `architect`, формат `!!! SCOPE VIOLATION REQUEST !!!` + СТОП.
 - Формат — Handoff-блок §D называет `tester`, paste-ready промпт с путём к milestone + branch.
