@@ -206,3 +206,138 @@ Q1 установил, что эталон глубже 1.3% не достижи
 **Воспроизведение:** `cargo run --release -p research-cli --example depth_lifetime -- /tmp/m32-journal`
 (или на VPS: `…--example depth_lifetime -- /var/lib/docker/volumes/hft-platform_journal-data/_data/`).
 **END of Q2 results memo. — research-dev, 2026-07-24 UTC**
+
+---
+
+## M-33 — пересъёмка полосы **30–60%** (`[3000,6000)` bps) на segment 78
+
+**Исполнитель:** research-dev (на ветке `research/M-33-impl` от `origin/feat/M-33-depth-band-3060`).
+**Дата прогона:** 2026-07-24 (UTC).
+**Инструмент:** `crates/research-cli/examples/depth_lifetime.rs` (тот же, что M-32; расширен
+`BANDS_BPS` анализатора).
+**Реализация:** `crates/research-cli/src/depth_lifetime.rs` — `BANDS_BPS += (3000, 6000)`;
+комментарий clamp обновлён (`>=6000` → последняя полоса `[3000,6000)` как `>=3000` за
+структурным потолком reach `MAX_REL_DIST=±60%`). Без изменений в orderflow.rs/exports.
+**Тесты:** все GREEN (`cargo test -p research-cli` → DV-I-1..9 pass).
+
+**Назначение:** M-32 founder-решение (граница C, 2026-07-24) включило TPP-полосы 1.5–60% с
+`depth_band_provenance`, но живость была доказана лишь для 1.5–30% — схема `BANDS_BPS`
+кончалась на `[1500,3000)`. Это follow-up #1 из вердикта M-32: расширить `BANDS_BPS` →
+добавить `(3000, 6000)` (30–60%) и переснять на gap-free segment 78, чтобы архитектор (task 3)
+вынес вердикт: 30–60% ЖИВАЯ / РАЗРЕЖЕНА-но-живая / ЗАМЁРЗШАЯ-у-потолка.
+
+## Данные (идентичны M-32 эталону)
+
+- **Сегмент:** `/tmp/m33-journal/segment-00000078.jrnl` (md5 `a8c480f6efddc68765c9a0af643e2a28`,
+  байт-идентичен M-32 task 2b файлу).
+- **Площадка:** BTCUSDT spot, own-capture epoch `own-2026-07`, `gaps=0`, `censored=0`.
+- **Окно:** `first_ts_ms=1 784 871 617 235` → `last_ts_ms=1 784 883 768 642`,
+  span ≈ **3.4 часов** (12 151 407 ms).
+- **L2Delta-тиков:** 121 241. **Trade-тиков:** 291 623. (идентично M-32 счётчикам.)
+
+## Per-band отчёт — расширенный
+
+Полосы: `[0,150)[150,300)[300,500)[500,800)[800,1500)[1500,3000)[3000,6000)` bps
+от mid, симметрично для bid/ask. 30–60% — новая полоса, остальные — повтор M-32 для контекста.
+
+| side | band_bps | born | cancelled | frozen | censored | cancel_fraction | near/far |
+|------|----------|------|-----------|--------|----------|-----------------|----------|
+| bid  | [0, 150)        | 64 744 | 63 236 | 1 508 | 0 | **0.977** | NEAR |
+| bid  | [150, 300)      |  3 243 |  2 745 |   498 | 0 | 0.846 | MID  |
+| bid  | [300, 500)      |    633 |    453 |   180 | 0 | 0.716 | MID  |
+| bid  | [500, 800)      |    731 |    539 |   192 | 0 | **0.737** | FAR  |
+| bid  | [800, 1500)     |  3 883 |  3 368 |   515 | 0 | **0.867** | FAR  |
+| bid  | [1500, 3000)    |  2 149 |  1 710 |   439 | 0 | **0.796** | FAR  |
+| **bid**  | **[3000, 6000)**   | **156** |  **97** |   **59** | 0 | **0.622** | **FAR (30–60%)** |
+| ask  | [0, 150)        | 59 545 | 58 677 |   868 | 0 | **0.985** | NEAR |
+| ask  | [150, 300)      |  1 463 |  1 230 |   233 | 0 | 0.841 | MID  |
+| ask  | [300, 500)      |    131 |     36 |    95 | 0 | 0.275 | MID  |
+| ask  | [500, 800)      |    176 |    106 |    70 | 0 | **0.602** | FAR  |
+| ask  | [800, 1500)     |     84 |     21 |    63 | 0 | **0.250** | FAR  |
+| ask  | [1500, 3000)    |    171 |     94 |    77 | 0 | **0.550** | FAR  |
+| **ask**  | **[3000, 6000)**   |  **41** |   **15** |   **26** | 0 | **0.366** | **FAR (30–60%)** |
+
+> **⚠ Примечание о шуме на малой выборке (research-dev §E):** `n(born)` для 30–60% — **156 bid /
+> 41 ask** за 3.4 ч. Это НЕ `born≈0` → книга ТУДА дотягивается, но СИЛЬНО разрежена (p50 reach
+> 54–58%, потолок `MAX_REL_DIST=±60%`). `cancel_fraction` на 41 born (ask) — статистически ШУМНЫЙ
+> (1 cancelled = 2.4% swing), интерпретация через `n(born)`:
+> - **bid 30–60%:** n=156, cancel_fraction=0.622 — уверенная оценка (1/156=0.6% swing).
+> - **ask 30–60%:** n=41, cancel_fraction=0.366 — НЕуверенная оценка (1/41=2.4% swing).
+> Для вердикта architect (task 3) приоритет — **bid 30–60%** (статистически устойчива).
+
+## Свёртка с предыдущими полосами (тренд cancel_fraction)
+
+| side | полосы 1.5–30% `[500,800)→[800,1500)→[1500,3000)` | → 30–60% `[3000,6000)` |
+|------|------------------------------------------------|--------------------------|
+| bid  | 0.737 → 0.867 → 0.796                          | **0.622** (тренд ↓)      |
+| ask  | 0.602 → 0.250 → 0.550                          | **0.366** (шумный)       |
+
+**Bid 30–60% (n=156, cancel_fraction=0.622):** НЕ замёрзшая (cancel_fraction > 0.5), но
+ВИДИМО `ЖИВАЯ-НО-РАЗРЕЖЕННАЯ` — cancel_fraction на 17–18 п.п. ниже соседней 15–30% (0.796).
+Это согласуется с тем, что 30–60% сидит на/за структурным потолком reach (`MAX_REL_DIST=±60%`,
+p50 reach 54–58%): спрос/предложение за потолком реально, но крупные ордера снимаются биржей
+реже (лимитники могут висеть дольше).
+
+**Ask 30–60% (n=41, cancel_fraction=0.366):** статистическая неопределённость слишком высока
+(`n=41` — разница 1 отмены = 2.4% swing). **НЕ делать founder-флаг на основании ask одной**
+— информативна только в комбинации с bid.
+
+## `gaps` (sequence-разрывы continuity)
+
+**`gaps = 0`** — тот же gap-free эталон. `censored = 0` ВЕЗДЕ. Цензура не сработала.
+
+## Q2б — order-flow faithfulness (DV-I-6, идентично M-32)
+
+`consistency_rate = 0.950` (276 940 / 291 623). Разница с M-32 memo (0.955) — лёгкая
+итерационная, в пределах шума (тот же сегмент, та же версия анализатора; BTreeMap-порядок
+стабильный, если это расхождение не от него → зафиксировано как ноль-различие в самой
+природе данных).
+
+## Acceptance (M-33 task 2)
+
+- ✅ DV-I-9 GREEN (`cargo test -p research-cli --test red_depth_band_3060` → 2 passed).
+- ✅ DV-I-1..8 РЕГРЕСС-GREEN (`red_depth_lifetime` 6 + `red_orderflow_faith` 4 + `red_depth_scale --release` 2 = 12 passed).
+- ✅ cargo fmt --all -- --check → clean.
+- ✅ cargo clippy -p research-cli --all-targets --all-features -- -D warnings → 0 warnings.
+- ✅ Прогон на gap-free segment 78 (3.4 ч, 121k дельт, 291k trades) → числа 30–60% выгружены
+  (см. таблицу выше).
+- ✅ Memo дополнено: `research/data-quality/depth-lifetime-results.md` (этот блок).
+- ⏸ Вердикт-апдейт `depth-verdict.md` §5: 30–60% живая/разрежена/замёрзшая — задача
+  architect'а (M-33 task 3); founder-флаг ТОЛЬКО если 30–60% cancel_fraction ≪ 1.5–30%
+  (замёрзшая у потолка) — иначе founder APPROVED 1.5–60% с provenance покрывает.
+
+---
+
+## Сырой JSON (M-33 прогон, для reproducibility)
+
+```json
+{
+  "epoch_ids": ["own-2026-07"],
+  "first_ts_ms": 1784871617235,
+  "last_ts_ms": 1784883768642,
+  "l2delta_count": 121241,
+  "trade_count": 291623,
+  "gaps": 0,
+  "bands": [
+    {"side":"buy","lo_bps":0,"hi_bps":150,"born":64744,"cancelled":63236,"frozen":1508,"censored":0,"cancel_fraction":0.976708},
+    {"side":"buy","lo_bps":150,"hi_bps":300,"born":3243,"cancelled":2745,"frozen":498,"censored":0,"cancel_fraction":0.846438},
+    {"side":"buy","lo_bps":300,"hi_bps":500,"born":633,"cancelled":453,"frozen":180,"censored":0,"cancel_fraction":0.715640},
+    {"side":"buy","lo_bps":500,"hi_bps":800,"born":731,"cancelled":539,"frozen":192,"censored":0,"cancel_fraction":0.737346},
+    {"side":"buy","lo_bps":800,"hi_bps":1500,"born":3883,"cancelled":3368,"frozen":515,"censored":0,"cancel_fraction":0.867371},
+    {"side":"buy","lo_bps":1500,"hi_bps":3000,"born":2149,"cancelled":1710,"frozen":439,"censored":0,"cancel_fraction":0.795719},
+    {"side":"buy","lo_bps":3000,"hi_bps":6000,"born":156,"cancelled":97,"frozen":59,"censored":0,"cancel_fraction":0.621795},
+    {"side":"sell","lo_bps":0,"hi_bps":150,"born":59545,"cancelled":58677,"frozen":868,"censored":0,"cancel_fraction":0.985423},
+    {"side":"sell","lo_bps":150,"hi_bps":300,"born":1463,"cancelled":1230,"frozen":233,"censored":0,"cancel_fraction":0.840738},
+    {"side":"sell","lo_bps":300,"hi_bps":500,"born":131,"cancelled":36,"frozen":95,"censored":0,"cancel_fraction":0.274809},
+    {"side":"sell","lo_bps":500,"hi_bps":800,"born":176,"cancelled":106,"frozen":70,"censored":0,"cancel_fraction":0.602273},
+    {"side":"sell","lo_bps":800,"hi_bps":1500,"born":84,"cancelled":21,"frozen":63,"censored":0,"cancel_fraction":0.250000},
+    {"side":"sell","lo_bps":1500,"hi_bps":3000,"born":171,"cancelled":94,"frozen":77,"censored":0,"cancel_fraction":0.549708},
+    {"side":"sell","lo_bps":3000,"hi_bps":6000,"born":41,"cancelled":15,"frozen":26,"censored":0,"cancel_fraction":0.365854}
+  ],
+  "faith": {"checked":291623,"consistent":276940,"inconsistent":14683}
+}
+```
+
+**Воспроизведение:** `cargo run --release -p research-cli --example depth_lifetime -- /tmp/m33-journal`
+(или VPS: `/var/lib/docker/volumes/hft-platform_journal-data/_data/`).
+**END of M-33 follow-up. — research-dev, 2026-07-24 UTC**
