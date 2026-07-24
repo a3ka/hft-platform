@@ -44,13 +44,18 @@ reviewer — бэкстоп на PR-time (гейт 4 ниже всё равно 
 - `set -euo pipefail` ИЛИ явный агрегатор с FAIL-счётчиком + `exit 1` при FAIL>0.
 - **Никакого** `cmd && echo PASS || echo FAIL` (маскирует провал).
 - Минимум 1 проверка на задачу из §Tasks milestone'а.
-- **verify ⊇ терминальные CI-гейты (RN-17, durable — 3-й повтор класса).** Acceptance-скрипт ОБЯЗАН
-  гонять те же терминальные проверки, что `ci.yml`, ТЕМИ ЖЕ командами — иначе verify PASS при красном CI =
-  **false-green**: у dev «зелёно», а merge краснит `main` и блокирует §8. Минимум:
-  - `cargo fmt --all -- --check` (fmt-гейт, матчит `ci.yml` build-test);
-  - `cargo clippy --workspace --all-targets -- -D warnings` (clippy-гейт, матчит CI).
-  Повторы класса: RN-8/M-05 (fmt), clippy-gap/M-18, fmt/M-22 (18 fmt-диффов в sacred RED-тестах прошли
-  verify PASS — поймал только reviewer/CI). Правило точечно не держится → стандартное требование ко ВСЕМ verify.
+- **verify ⊇ терминальные CI-гейты (RN-17, durable) + ТА ЖЕ toolchain-версия (TD-035).** Acceptance-скрипт
+  ОБЯЗАН гонять те же терминальные проверки, что `ci.yml`, ТЕМИ ЖЕ командами **И на ТОЙ ЖЕ версии toolchain** —
+  иначе verify PASS при красном CI = **false-green**: у dev «зелёно», а merge краснит `main` и блокирует §8.
+  Минимум:
+  - `cargo fmt --all -- --check` (fmt-гейт, матчит `ci.yml`);
+  - `cargo clippy --all-targets --all-features -- -D warnings` (clippy-гейт, БИТ-В-БИТ команда `ci.yml`);
+  - **toolchain пин:** `rust-toolchain.toml` фиксирует версию (напр. `1.97.0`); `ci.yml` использует ТУ ЖЕ
+    (`dtolnay/rust-toolchain@<версия>`, НЕ `@stable`). Бамп — ОДновременно в обоих (осознанно). Без пина
+    локальный clippy СТАРШЕ/младше CI знает ДРУГОЙ lint-набор → false-green (инцидент M-23: `unnecessary_sort_by`
+    в 1.97 поймал только merge; локальный 1.94 lint не знал).
+  Повторы класса: RN-8/M-05 (fmt), clippy-gap/M-18, fmt/M-22, **toolchain-drift/M-23 (TD-035)**. Флаг-паритет
+  БЕЗ версия-паритета недостаточен → требование ко ВСЕМ verify: команда CI-точная + toolchain запинен.
 - Финальная строка `VERDICT: PASS`/`VERDICT: FAIL`; exit-код соответствует.
 - Явный список исключений (T2/T3 типы вне зоны проверки) с комментарием-обоснованием.
 
