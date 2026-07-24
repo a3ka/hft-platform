@@ -104,6 +104,8 @@ in-memory фикстуры, как `red_depth_series.rs`; для прода — 
 | **DV-I-4** (отсутствие ≠ удаление) | Уровень, не упомянутый в дельте, — НЕ изменён (не стареет, не отменяется). Только явный `size=0` — отмена. | P set, много contiguous тиков про ДРУГИЕ цены (P молчит), затем P size=0 ⇒ P cancelled с lifetime = ПОЛНЫЙ пролёт (не усечён «молчанием»). **Анти-плацебо:** «истекает после N молчаливых тиков» → неверный lifetime / преждевременный frozen → FAIL |
 | **DV-I-5** (детерминизм) | Тот же вход → байт-идентичный отчёт (VB-I-1 класс; без wall-clock/rand/неупоряд. итерации). | Дважды тот же fixture ⇒ идентичный `LifetimeReport`. **Анти-плацебо:** HashMap-итерация в выводе → нестабильный порядок → FAIL |
 | **DV-I-6** (order-flow faithfulness, Q2б) | Trade на цене P объёмом S ДОЛЖЕН сопровождаться соответствующим убыванием книги на P (дельта, уменьшающая/снимающая P) в seq-окне; Trade на P БЕЗ book-decrement → INCONSISTENT (поток лжёт). | Trade@P,S + L2Delta P−S ⇒ consistent++. Trade@P без decrement ⇒ inconsistent++. **Анти-плацебо:** заглушка «всегда consistent» → FAIL на mismatch-fixture |
+| **DV-I-7** (прод-масштаб `analyze`) | `analyze` — single-pass O(n), ОГРАНИЧЕННАЯ работа на тик; НЕ full-scan ever-growing `states`/тик. | 120k тиков РАСТУЩИХ distinct-уровней (states→n), timeout 15с. **Анти-плацебо:** O(n²) (attribute-per-tick full-scan) → timeout → FAIL (доказано против impl инцидента); single-pass <1с |
+| **DV-I-8** (прод-масштаб `consistency`) | `consistency` — single-pass O(n), инкрементальная книга + оконный pending-буфер; БЕЗ rebuild префикса на сделку. | 400k сделок, timeout 15с. **Анти-плацебо:** O(n²) (`for prev in events[..i]`) → timeout → FAIL (доказано); single-pass <1с |
 
 ## §Анти-плацебо чек-лист (BINDING — `testing.md` «фикстура счастливого пути»)
 
@@ -113,6 +115,25 @@ in-memory фикстуры, как `red_depth_series.rs`; для прода — 
 3. **Отсутствие:** дельта молчит об уровне ≠ удалить (DV-I-4 — прямой пункт).
 4. **Границы:** пустая сторона `[]`, один уровень, переход через sequence-gap (DV-I-3), первый тик без mid.
 5. **Resync-цензура:** gap-исчезновение НЕ считается ни отменой, ни заморозкой (DV-I-3 — ядро де-конфаунда).
+
+## §Прод-масштаб инцидент 2026-07-24 + фикс-дизайн (BINDING для impl 2b/3b)
+
+Первый impl 2b/3b НЕ завершил прогон на 1 сегменте (1 GiB) за **2 часа** (99.9% CPU, RSS 118 MB —
+чистый компьют, не OOM). Диагноз architect'а (замер scaling): ДВА независимых O(n²), замаскированных
+в юнит-фикстурах капом distinct-цен:
+1. **`analyze` — `attribute_unborn` сканит ВЕСЬ ever-growing `states`-map КАЖДЫЙ тик** (`states.iter().filter(born_band==0).collect()`); states не чистится (cancelled/censored остаются) ⇒ O(n·states) ⇒ O(n²) на реальном стакане (десятки тыс. distinct-цен).
+   **Фикс:** атрибутировать полосу уровня ПРИ РОЖДЕНИИ (mid известен на том тике) — O(1) на рождение,
+   без per-tick full-scan. Если mid ещё не определён при рождении — маленькая очередь ТОЛЬКО-новорождённых
+   (обычно пустая), не скан всех states.
+2. **`consistency` — пересборка running-книги С НУЛЯ на КАЖДУЮ сделку** (`for prev in &events[..i]`) ⇒ O(n²).
+   **Фикс:** single forward-pass; running-книга поддерживается ИНКРЕМЕНТАЛЬНО в внешнем цикле; ожидающие
+   сделки — оконный буфер (VecDeque по ts + price-индекс): на Delta резолвим совпавшие pending, по истечении
+   окна — inconsistent. O(n·avg_pending) = O(n) при ограниченном окне. Никакого `events[..i]`-rebuild.
+
+Оба ловятся **DV-I-7/8** (прод-масштаб bounded-work, `red_depth_scale.rs`, timeout 15с) — architect
+доказал: ОБА FAIL против impl инцидента (timeout), single-pass укладывается на 2+ порядка. Урок закреплён
+как класс TD-011: зелёные микро-юниты ≠ прод-масштаб; sacred-анализатор над журналом ОБЯЗАН иметь
+bounded-work оракул (`testing.md` §Прод-масштаб).
 
 ## Allowed / Forbidden paths
 

@@ -21,6 +21,11 @@ cargo test -p research-cli --test red_depth_lifetime >/dev/null 2>&1 \
 cargo test -p research-cli --test red_orderflow_faith >/dev/null 2>&1 \
   && ok "DV-I-6 (red_orderflow_faith) GREEN" || bad "DV-I-6 red_orderflow_faith"
 
+# ── DV-I-7/8: ПРОД-МАСШТАБ bounded-work (ловит O(n²) — инцидент 2026-07-24). --release обязателен. ─
+cargo test -p research-cli --test red_depth_scale --release >/dev/null 2>&1 \
+  && ok "DV-I-7/8 (red_depth_scale) bounded — single-pass O(n)" \
+  || bad "DV-I-7/8 red_depth_scale — O(n²) регресс (analyze full-scan states / consistency prefix-rebuild)"
+
 # ── Задача 1 (Q1): depth-source survey memo существует + отвечает CONFIRMED/REFUTED ──────────────
 Q1=research/data-quality/depth-sources-survey.md
 if [ -f "$Q1" ]; then
