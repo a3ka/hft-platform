@@ -342,6 +342,33 @@
             }
           },
           "additionalProperties": false
+        },
+        {
+          "description": "Market-wide доступный к займу пул margin per-asset (Binance `/sapi/v1/margin/available-inventory?type=MARGIN`, auth read-only). `symbol` = актив (\"USDT\"/\"USDC\"). `available_e8` = доступный объём ×1e8 (≥0). Аддитивно В КОНЕЦ (postcard-дискриминант 7; старые сегменты 0..6 читаются байт-в-байт, CT-I-3). CT-RFC-05.\n\n**Провенанс/семантика (design-honesty, RC-I-10):** это СЫРОЙ доступный пул, НЕ утилизация. «Сколько взято/вернули» = Δ(available) во времени — ПРОИЗВОДНАЯ, считается ИНДИКАТОРОМ downstream с провенансом `derived-from-available-inventory` + caveat «капасити пула может меняться биржей ⇒ Δ = утилизация, не абсолютный borrow-ledger». Здесь храним источник. НЕ переиспользуем `MarginRate` — тот rate, этот amount (смешать = семантическая подмена).",
+          "type": "object",
+          "required": [
+            "MarginInventory"
+          ],
+          "properties": {
+            "MarginInventory": {
+              "type": "object",
+              "required": [
+                "available_e8",
+                "ts_exch_ms"
+              ],
+              "properties": {
+                "available_e8": {
+                  "type": "integer",
+                  "format": "int64"
+                },
+                "ts_exch_ms": {
+                  "type": "integer",
+                  "format": "int64"
+                }
+              }
+            }
+          },
+          "additionalProperties": false
         }
       ]
     },

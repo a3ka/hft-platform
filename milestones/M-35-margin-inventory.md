@@ -58,7 +58,7 @@ MarginInventory {
 | ID | Инвариант | Оракул |
 |---|---|---|
 | **MI-I-1** | **Roundtrip аддитивен.** `MarginInventory` postcard-roundtrip; сегмент из старых вариантов (0..6) читается байт-в-байт (CT-I-3); `SCHEMA_VERSION==4`. | `crates/contracts/tests/ct_rfc05.rs`. **Анти-плацебо:** дискриминант вставлен НЕ в конец → старый сегмент ломается → FAIL |
-| **MI-I-2** | **Parse.** `parse_available_inventory({"assets":{"USDT":"19932592.28",...},"updateTime":...}, &["USDT","USDC"])` → 2 события MarginInventory с верным `available_e8` и symbol=asset. | `crates/venue-binance-futures/tests/red_margin_inventory.rs`. **Анти-плацебо:** фильтр не тот asset / без scale → FAIL |
+| **MI-I-2** | **Parse.** `parse_available_inventory({"assets":{"USDT":"19932592.28",...},"updateTime":...}, &["USDT","USDC"])` → 2 события MarginInventory с верным `available_e8` и symbol=asset. | `crates/venue-binance/tests/red_margin_inventory.rs`. **Анти-плацебо:** фильтр не тот asset / без scale → FAIL |
 | **MI-I-3** (canary) | **Read-only.** Margin-поллер НЕ содержит order-egress. grep: нет `order`/`submit`/`cancel`/подписи торговли в margin-пути. | verify grep. **Анти-плацебо:** любой order-endpoint в margin-коде → FAIL |
 | **MI-I-4** | **Fixed-point.** `"19932592.2856805"` → `to_fixed` → i64 ×1e8 без потери >8 знаков; отрицательных/пустых нет (пул ≥0). | `red_margin_inventory.rs::fixed_point`. |
 
@@ -69,8 +69,8 @@ MarginInventory {
 - **Провенанс:** collector хранит СЫРОЙ `available`, НЕ Δ (деривация — downstream, не подмешивать).
 
 ## Allowed / Forbidden paths
-- **architect (sacred, CT-RFC):** `milestones/M-35-margin-inventory.md`, `crates/contracts/src/lib.rs` (T1 вариант + schema, ТОЛЬКО через этот RFC), сген. JSON Schema, `crates/contracts/tests/ct_rfc05.rs`, `crates/venue-binance-futures/tests/red_margin_inventory.rs`, `scripts/verify_M-35.sh`.
-- **venue-dev (impl):** `crates/venue-binance-futures/src/lib.rs` (parse + auth poll + recorder-hook), env-ключ инъекция.
+- **architect (sacred, CT-RFC):** `milestones/M-35-margin-inventory.md`, `crates/contracts/src/lib.rs` (T1 вариант + schema, ТОЛЬКО через этот RFC), сген. JSON Schema, `crates/contracts/tests/ct_rfc05.rs`, `crates/venue-binance/tests/red_margin_inventory.rs`, `scripts/verify_M-35.sh`.
+- **venue-dev (impl):** `crates/venue-binance/src/lib.rs` (parse + auth poll + recorder-hook), env-ключ инъекция.
 - **Forbidden:** risk/ks/oms, ЛЮБОЙ order-egress (submit/cancel/торговая подпись — read-only!), другие T1-варианты вне CT-RFC-05.
 
 ## Gates
