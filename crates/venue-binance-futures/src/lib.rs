@@ -51,9 +51,10 @@ const EMIT_PERIOD: Duration = Duration::from_secs(1);
 const OI_POLL_PERIOD: Duration = Duration::from_secs(10);
 /// Период опроса REST `/fapi/v1/premiumIndex` (TD-014 T4): Funding через REST-poll —
 /// единственный надёжный путь (WS markPrice не доставляется live, см. §8 REJECT ×5).
-/// Cadence как OI (10с); funding меняется каждые 8ч на Binance, но poll-избыточность
-/// дёшева и даёт consistent-тактинг для recorder'а (Funding всегда свежий в журнале).
-const FUNDING_POLL_PERIOD: Duration = Duration::from_secs(10);
+/// M-34: даунсэмпл 10с→60с (founder: «~1/мин»). Funding меняется каждые 8ч на Binance,
+/// 60с с большим запасом; снижает объём журнала ×6 (400 Funding/мин ≈ 576k/сутки).
+/// Recorder'у гарантирована свежесть Funding между изменениями.
+const FUNDING_POLL_PERIOD: Duration = Duration::from_secs(60);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Чистые парс-функции (RED-boundary)
@@ -167,6 +168,30 @@ pub fn parse_premium_index(json: &str) -> Vec<MdEvent> {
         });
     }
     out
+}
+
+/// M-34 (FB-I-1): решение по множеству эмита Funding после `parse_premium_index`.
+/// `breadth == true`  → ВСЕ `parsed` (вся вселенная перпов), порядок сохранён —
+///   для breadth-режима (founder-приоритет: funding-breadth по всем перпам).
+/// `breadth == false` → фильтр до `subscribed` (legacy-режим сохранён, регрессия
+///   трек-выборки не сломана).
+///
+/// Pure: детерминировано, без I/O; тестируется в `tests/red_funding_breadth.rs`.
+/// Порядок входа сохранён (важно для детерминизма записи в журнал, JR-I).
+/// Пустой `parsed` → пусто (fail-closed, не паника).
+pub fn select_funding_emit(
+    parsed: Vec<MdEvent>,
+    subscribed: &HashSet<String>,
+    breadth: bool,
+) -> Vec<MdEvent> {
+    if breadth {
+        parsed
+    } else {
+        parsed
+            .into_iter()
+            .filter(|e| subscribed.contains(&e.symbol))
+            .collect()
+    }
 }
 
 /// `[["price","qty"], ...]` → `Vec<Level>` (fixed-point ×1e8). Невалидный уровень — весь
@@ -1265,10 +1290,12 @@ async fn poll_open_interest(
     true
 }
 
-/// Периодический REST-опрос `/fapi/v1/premiumIndex` (all-perps в 1 вызове) →
-/// `MdEvent::Funding` для каждого подписанного символа. TD-014 T4: WS markPrice не
-/// доставляется (live-capture: 0 msg), Funding надёжно идёт через REST-poll (тот же
-/// паттерн, что OI-poll — OI=66 персистится live, тот же механизм здесь).
+/// Периодический REST-опрос `/fapi/v1/premiumIndex` (all-perps в 1 вызове).
+/// M-34 (breadth-режим): эмитит Funding по ВСЕМ перпам вселенной, НЕ только по
+/// подписанной выборке (для breadth-метрики TPP / funding-derive). Решение о множестве
+/// эмита делегировано `select_funding_emit(..., breadth=true)` — чистая функция,
+/// тестируемая без сети. TD-014 T4: WS markPrice не доставляется (live-capture: 0 msg),
+/// Funding надёжно идёт через REST-poll.
 ///
 /// Fail-closed: HTTP/parse failure → лог + skip весь тик (poll повторится). Битые
 /// записи внутри массива → skip конкретную (всё равно поллим весь массив). НЕ идёт
@@ -1301,10 +1328,7 @@ async fn poll_premium_index(
     };
     let events = parse_premium_index(&body);
     let mut emitted = 0usize;
-    for event in events {
-        if !subscribed.contains(&event.symbol) {
-            continue; // Поллер отдаёт ВСЕ perp'ы; фильтруем на нашу выборку.
-        }
+    for event in select_funding_emit(events, &subscribed, true) {
         if tx.send(EventKind::Md(event)).await.is_err() {
             return false;
         }
