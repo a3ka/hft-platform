@@ -11,6 +11,11 @@
 //! flush перед exit (J1 — clean-shutdown).
 //! M-06 #4 (reland, post-TD-013): подключён Venue::BinanceFutures — funding-breadth C5 вход.
 //! MD-only → risk-critic НЕ нужен (gates.md §5 N4).
+//! M-35 task 2e (engine-dev): рядом со спавном venue-эмиттеров — отдельный
+//! `tokio::spawn(venue_binance::run_margin_inventory(tx))` для Binance-only (signed read-only
+//! poll `/sapi/v1/margin/available-inventory` USDT/USDC). Endpoint Binance-specific — для HL и
+//! BinanceFutures не спавнится. События пишутся в общий writer-канал (JR-I-1), минуя fanout
+//! (MarginInventory — не L2, не должен bump `md_event_age_ms{venue="binance"}` по REST-cadence).
 
 use std::future::Future;
 use std::path::PathBuf;
@@ -390,6 +395,30 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(async move {
             supervise(name, venue, fanout_tx, metrics_v, run_fn).await;
         });
+
+        // M-35 task 2e: spawn margin-inventory collector. `venue_binance::run_margin_inventory`
+        // ГОТОВ (задача venue-dev: signed read-only poll `/sapi/v1/margin/available-inventory`
+        // для USDT/USDC, собственный cadence+backoff через `ReconBudget`, graceful-exit
+        // при закрытии `tx`) — но без явного спавна коллектор дремлет (recorder их не будил;
+        // §8 выявил 0 MarginInventory-событий на проде при живом ключе). Сигнатура ТОЛЬКО
+        // `tx` (без symbols — фильтр USDT/USDC жёстко зашит в venue-binance
+        // `MARGIN_INVENTORY_ASSETS`).
+        //
+        // Отдельный spawn (НЕ через `fanout_tx`): MarginInventory — read-only REST-poll, не
+        // WS-MD; пропускать его через fanout означало бы (а) bump `last_receipt[Venue::Binance]`
+        // раз в 2 мин поллом → `md_event_age_ms{venue="binance"}` обновляется по
+        // margin-cadence, а не по WS-recency (мисконцепт метрики); (б) books-feeder игнорирует
+        // не-L2, но лишний клон через md-канал. Пишем НАПРЯМУЮ в `tx_v` (общий канал в
+        // journal-writer, один путь JR-I-1) — события интерливаются с WS-MD в writer'е
+        // по seq-порядку (DET-I-1 сохраняется).
+        //
+        // Гейт: `Venue::Binance` — endpoint `/sapi/v1/margin/available-inventory` Binance-specific;
+        // HL и BinanceFutures этого пути в данной реализации НЕ имеют. Read-only: см. MI-I-3
+        // canary в `scripts/verify_M-35.sh`. На отсутствии BINANCE_API_KEY/SECRET —
+        // `run_margin_inventory` сам warn-ит и возвращается (без panic, без busy-loop).
+        if venue == Venue::Binance {
+            tokio::spawn(venue_binance::run_margin_inventory(tx.clone()));
+        }
 
         // M-09 task 2: per-venue recon wiring (fetcher + orchestrator). Изолированно через
         // `spawn_recon_isolated` (JR-I-1, 24/7 — паника recon не роняет writer).
