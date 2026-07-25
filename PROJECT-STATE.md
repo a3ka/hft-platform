@@ -350,7 +350,10 @@ oms/venue, не код).
   контент (`borrow|repay|margin|loan`) = 165; TL;DR ↔ §6.1 согласованы (все Q1a/b/c = NO); fmt --check
   exit=0; verify_M-35.sh N/A (docs-only). Push-scope: 1 коммит `df5321b` (research-dev). **§8: Deploy НЕ
   триггерится** (docs-only, `deploy.yml` paths = crates/**/Cargo/Dockerfile — не тронуты; recorder инертен,
-  VPS eyes-on не требуется); CI на push подтверждает workspace не сломан.
+  VPS eyes-on не требуется). **§8-CI НЕ ЗЕЛЁНЫЙ по внешней причине (TD-037, billing):** CI run
+  `30159262236` на push НЕ запустился (все jobs «not started» — блок биллинга аккаунта GitHub, НЕ падение
+  теста; диф docs-only, локально fmt exit=0). Merge оставлен (docs-only, sound, локально верифицирован),
+  но авто-workspace-гейт недоступен до восстановления билинга — см. **TD-037 (MAJOR, зона founder)**.
 - **RN (process NOTE):** (а) сырые probe-ответы (`/tmp/*.json`) эфемерны (worktree-сессия, не в репо) — но
   HTTP-коды затабулированы инлайн в memo, документ самодостаточен (тот же паттерн, что depth-sources-survey
   M-32); (б) ветка `research/margin-source` не была запушена в origin (жила в локальном worktree) —

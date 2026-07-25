@@ -3,6 +3,25 @@
 > **Reviewer-owned.** Открытые долги/риски, замеченные при работе. Закрытые переносятся вниз.
 
 ## OPEN
+- **TD-037** `github-actions-billing-block-halts-ci-cd` (найдено reviewer'ом на §8 M-35, 2026-07-25).
+  **ВЕСЬ CI/CD пайплайн ОСТАНОВЛЕН на уровне аккаунта GitHub, НЕ регрессия кода.** Push M-35 close-out
+  (`841d7d3`, docs-only) → CI run `30159262236` **failure за 12s**: ВСЕ 5 jobs (`fmt+clippy+test`,
+  `cargo audit`, `Protected artifacts`, `Delivery gate`, `All checks passed`) со статусом «not started»,
+  аннотация GitHub: *«The job was not started because recent account payments have failed or your spending
+  limit needs to be increased. Please check the 'Billing & plans' section.»* Ни один job не запустился —
+  это billing-блок аккаунта, НЕ падение теста/линта. Диф был docs-only (1 markdown, 0 LOC кода, локально
+  fmt exit=0) — код ни при чём. Онсет: между `2026-07-24T23:35Z` (последний зелёный CI, M-33) и
+  `2026-07-25T13:11Z` (первый билинг-фейл). **Следствие (КРИТИЧНО):** (1) `ci.yml` не может гонять
+  fmt/clippy/test/audit → нет автоматического workspace-гейта; (2) `deploy.yml` gated-on-CI (TD-017/018
+  fail-closed) → **автодеплой на VPS НЕВОЗМОЖЕН** (Deploy ждёт CI success, которого не будет) → §8 eyes-on
+  для любого milestone, тронувшего `crates/**`, **выполнить нельзя** до восстановления билинга. M-35
+  (docs-only) деплой не требовал, поэтому смержен, но СЛЕДУЮЩИЙ code-milestone (M-34 TPP и т.д.) упрётся в
+  этот блокер на §8. **Revert НЕ помогает** — billing вне репозитория. **Зона: FOUNDER** (только владелец
+  аккаунта чинит Billing & plans / spending limit; ни один агент не имеет доступа). Severity: **MAJOR**
+  (весь gate-3/§8 контур не функционирует; прод не обновляется и не верифицируется через пайплайн —
+  recorder на VPS продолжает работать на старом образе, но любой фикс/milestone застрянет). До восстановления:
+  code-milestone'ы можно верифицировать ТОЛЬКО локально (reviewer worktree fmt/clippy/test + прямой ssh на
+  VPS вручную), но auto-deploy и CI-гейт недоступны — это НЕ эквивалент §8 (нет CI-подтверждения на merge-SHA).
 - **TD-036** `chain-bootstrap-from-worktree-not-origin-feat` (RN-18 process gap, замечено reviewer'ом
   на PR-гейте M-30, 2026-07-24) — engine-dev НЕ запушил свои GREEN-коммиты (`4fd09d0`/`a896cb8`) на
   `origin/feat/M-30-book-gap-detection` (оставался на architect-RED baseline `ff62333` = compile-RED
