@@ -1,7 +1,9 @@
 # M-35 — сбор margin-утилизации (available-inventory) usdt/usdc — CT-RFC-05
 
-STATUS: **PROPOSED** (2026-07-25, architect; rev2 после critic C-024 REJECT — переформулирован в
-**proxy-collector**). Founder-решение (2026-07-25): «маржин по usdt/usdc собирать». Источник задокументирован
+STATUS: **DONE** (2026-07-25 — merged `1f342b8`, §8 GREEN: MarginInventory ЖИВА на проде — decode discr.7,
+USDT ~19.9M/USDC ~19.0M ≈ live REST, 0 auth-ошибок, ключ read-only+IP-restrict; critic C-024 r2 PASS +
+risk-critic C-025 PASS + reviewer close-out `41d3526`). rev2 после critic C-024 REJECT — переформулирован в
+**proxy-collector**. Founder-решение (2026-07-25): «маржин по usdt/usdc собирать». Источник задокументирован
 **фактами с read-only ключом** (`margin-source-survey.md §9`: endpoint/HTTP-200/USDT+USDC-значения +
 граница интерпретации). Это **CT-RFC** (новый T1-вариант) + первый **аутентифицированный** источник в
 даталеере (read-only ключ) → **critic (doc-гейт) + risk-critic (contracts §5) ОБЯЗАТЕЛЬНЫ**. НЕТ order-egress.
