@@ -50,6 +50,8 @@ reviewer — бэкстоп на PR-time (гейт 4 ниже всё равно 
   этому → milestone-verify зелёный, а `main` красный. Contract-RFC ОБЯЗАН: (1) §Tasks-задача на ревизию всех
   workspace-match; (2) `cargo build --workspace` (или `cargo test --workspace`) гейтом в `verify_M-NN.sh` —
   НЕ узкий `-p`. Тот же урок, что RN-8/M-05 (узкий скоуп маскирует поломку соседей).
+  **Перечислять broken-match'и ГРЕПОМ (`grep -rn 'MdPayload::' | match без `_=>``), НЕ по памяти** — иначе
+  сам fix окажется неполным (M-35: первый проход пропустил `recorder::md_kind_label` — энумерация по памяти).
 - **verify ⊇ терминальные CI-гейты (RN-17, durable) + ТА ЖЕ toolchain-версия (TD-035).** Acceptance-скрипт
   ОБЯЗАН гонять те же терминальные проверки, что `ci.yml`, ТЕМИ ЖЕ командами **И на ТОЙ ЖЕ версии toolchain** —
   иначе verify PASS при красном CI = **false-green**: у dev «зелёно», а merge краснит `main` и блокирует §8.
