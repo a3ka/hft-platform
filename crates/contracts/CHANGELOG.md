@@ -3,6 +3,24 @@
 Формат: одна секция на contract-RFC. Журнал бессмертен: старые записи обязаны читаться
 новым кодом всегда (CT-I-3). Правки T1 вне RFC → авто-REJECT (CT-I-2, Block-C).
 
+## schema_version 3 → 4 — CT-RFC-05 «MarginInventory» (2026-07-25)
+
+**Bump 3→4.** Аддитивно: `MdPayload::MarginInventory { available_e8, ts_exch_ms }` (postcard-дискриминант
+**7**, в КОНЕЦ enum'а). Старые сегменты (варианты 0..6) читаются байт-в-байт (CT-I-3) — доказано
+`tests/ct_rfc05.rs::mi_i_1_pre_rfc05_funding_still_decodes` (pre-change Funding-байты декодятся под schema-4).
+
+**Источник:** Binance `/sapi/v1/margin/available-inventory?type=MARGIN` (auth read-only, spot-домен).
+`symbol` = актив («USDT»/«USDC»); `available_e8` = СЫРОЙ market-wide доступный к займу пул ×1e8.
+
+**Граница (design-honesty, RC-I-10):** это supply-side СЫРОЙ пул, **НЕ** borrow/repay ledger и **НЕ**
+непогашенный объём. Утилизация/флоу (Δ available) — производная ПРОКСИ downstream (индикатор), с caveat
+`derived-from-available-inventory`. НЕ переиспользован `MarginRate` (тот — rate, этот — amount). Проба-факты:
+`research/data-quality/margin-source-survey.md §9`.
+
+**Эпоха:** `SCHEMA_VERSION` 3→4 ⇒ сегмент schema-3 не reuse'ится schema-4 бинарём (та же изоляция, что
+L2Delta/TD-031; guard `journal::segments` по равенству `schema_version`). Схема перегенерирована
+(`cargo run -p contracts --example gen_schema`); фикстуры `fixtures/{valid,invalid}/event-margin-inventory*`.
+
 ## schema_version 2 → 3 — CT-RFC-04 rev2 «L2Delta segment-изоляция» (2026-07-21, TD-031)
 
 **Bump 2→3.** §8 нашёл: изоляция L2Delta (сегмент schema-эпохи) держалась на `provenance`

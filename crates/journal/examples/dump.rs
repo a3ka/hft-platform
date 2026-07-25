@@ -31,11 +31,12 @@ fn main() {
                         }
                     }
                     contracts::MdPayload::Funding { .. } => {}
-                    // CT-RFC-01/CT-RFC-04: новые md-варианты в диагностике-дампе не считаются.
+                    // CT-RFC-01/CT-RFC-04/CT-RFC-05: новые md-варианты в диагностике-дампе не считаются.
                     contracts::MdPayload::OpenInterest { .. }
                     | contracts::MdPayload::Liquidation { .. }
                     | contracts::MdPayload::MarginRate { .. }
-                    | contracts::MdPayload::L2Delta { .. } => {}
+                    | contracts::MdPayload::L2Delta { .. }
+                    | contracts::MdPayload::MarginInventory { .. } => {}
                 }
             }
             contracts::EventKind::Sys(_) => sys += 1,

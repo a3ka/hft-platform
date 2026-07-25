@@ -19,3 +19,7 @@ serde_json = "1"
 anyhow = "1"
 tracing = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# M-35: HMAC-SHA256 + hex для signed read-only poll `/sapi/v1/margin/available-inventory`.
+# `hmac-sha256` — self-contained (no extra deps), off-the-shelf подпись Binance query.
+hex = "0.4"
+hmac-sha256 = "1.1"

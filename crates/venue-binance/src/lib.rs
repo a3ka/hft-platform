@@ -8,7 +8,7 @@
 //! ОДНА сессия соединения — reconnect/backoff делает вызывающий supervisor, а не этот
 //! модуль. Emitter-not-owner (VN-I): seq не проставляет, риск/позиции не трогает.
 
-use contracts::{to_fixed, EventKind, Level, MdPayload, Side, SysEvent, Venue};
+use contracts::{to_fixed, EventKind, Level, MdEvent, MdPayload, Side, SysEvent, Venue};
 use futures_util::stream::FuturesUnordered;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
@@ -801,6 +801,238 @@ where
             Level { price, size }
         })
         .collect()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// M-35: margin-inventory (CT-RFC-05, MarginInventory дискриминант 7).
+//
+// **Назначение.** Сбор СЫРОГО supply-пула `/sapi/v1/margin/available-inventory`
+// (Binance, read-only, signed) для активов USDT/USDC. Это proxy-индикатор
+// ёмкости margin (см. milestone §9 — «утилизация/флоу = Δ available downstream»).
+//
+// **Read-only by design (MI-I-3):** никаких submit/cancel/торговых-подписей. Ключ
+// берётся исключительно из env (`BINANCE_API_KEY`/`BINANCE_API_SECRET`), никогда
+// не логируется, не коммитится, не пишется в журнал. canary в verify_M-35.sh.
+//
+// **Auth-форма (Binance, общая):** HMAC-SHA256 от query-string (type + timestamp)
+// → hex-строка → `&signature=<hex>` + header `X-MBX-APIKEY: <key>`.
+
+/// Spot-домен для `/sapi/v1/margin/available-inventory`. Endpoint НЕ относится к
+/// futures-USDT-M (использующему `fapi.binance.com`) — это cross-margin / margin
+/// (spot-домен, `api.binance.com`). Сверять с фактическим HTTP-ответом (§9
+/// milestone) — наш контракт фиксирует только spot.
+const MARGIN_INVENTORY_URL: &str = "https://api.binance.com/sapi/v1/margin/available-inventory";
+/// Cadence опроса (founder-tunable, ~2 мин). Binance-лимит 1200 req/мин для
+/// `/sapi/v1/margin/*` — наш трафик ≪ этого, но 2 мин выбран по принципу
+/// «достаточно для downstream-Δ, не чаще».
+const MARGIN_INVENTORY_POLL_PERIOD: Duration = Duration::from_secs(120);
+/// Активы, для которых ведётся сбор. Фиксировано под M-35 (founder scope).
+/// Добавление новых — отдельный milestone (cross-margin borrow rules разные).
+const MARGIN_INVENTORY_ASSETS: &[&str] = &["USDT", "USDC"];
+/// HTTP-таймаут одного опроса (auth-REST имеет свой recvWindow=5s по умолчанию,
+/// 10с сверху — запас на TLS+подпись).
+const MARGIN_INVENTORY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Разобрать ответ `/sapi/v1/margin/available-inventory` (read-only) в
+/// `Vec<MdEvent>`. Каждый asset из `assets`, присутствующий в JSON-ответе,
+/// порождает ОДНО `MdEvent` с `MarginInventory{available_e8, ts_exch_ms}`.
+///
+/// **Fail-closed (per `red_margin_inventory::mi_i_2_absent_and_malformed_are_empty`):**
+/// - битый JSON → `Vec::new()` (НЕ паника, НЕ выдуманное значение);
+/// - нет ключа `assets` или `assets` — не объект → `Vec::new()`;
+/// - нет `updateTime` или `updateTime` — не число → `Vec::new()`;
+/// - asset из `assets` отсутствует в ответе / его значение не парсится в f64 →
+///   пропуск (не ошибка, остальные активы продолжают эмититься).
+///
+/// **scale:** `available_e8 = to_fixed(value)` — `value` × 1e8, округление half-even.
+/// **ts_exch_ms:** `updateTime` (сек) × 1000 — без этого событие помечалось бы
+///   «1970-01-01» (анти-плацебо теста `mi_i_2_parses_filtered_assets`).
+///
+/// **Pure:** никакой сети, env, IO — тестируется фикстурами в `red_margin_inventory`.
+pub fn parse_available_inventory(json: &str, assets: &[&str]) -> Vec<MdEvent> {
+    let v: serde_json::Value = match serde_json::from_str(json) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let assets_obj = match v.get("assets").and_then(|a| a.as_object()) {
+        Some(a) => a,
+        None => return Vec::new(),
+    };
+    let update_time = match v.get("updateTime").and_then(|u| u.as_i64()) {
+        Some(t) => t,
+        None => return Vec::new(),
+    };
+    // saturating_mul: при updateTime == i64::MAX (заведомо невозможно с биржи) избегаем
+    // overflow; здесь ровно 1e3, но стиль — единый с другими ts_exch_ms-конверсиями.
+    let ts_exch_ms = update_time.saturating_mul(1000);
+
+    let mut out = Vec::with_capacity(assets.len());
+    for asset in assets {
+        let value_str = match assets_obj.get(*asset).and_then(|x| x.as_str()) {
+            Some(s) => s,
+            None => continue, // asset вне ответа — fail-closed, остальные активы живут
+        };
+        let value: f64 = match value_str.parse() {
+            Ok(v) => v,
+            Err(_) => continue, // malformed number — fail-closed (VN-I-7 анти-фабрикация)
+        };
+        out.push(MdEvent {
+            venue: Venue::Binance,
+            symbol: (*asset).to_string(),
+            payload: MdPayload::MarginInventory {
+                available_e8: to_fixed(value),
+                ts_exch_ms,
+            },
+        });
+    }
+    out
+}
+
+/// Прочитать `(BINANCE_API_KEY, BINANCE_API_SECRET)` из env. Возвращает `None`,
+/// если хотя бы одной переменной нет / пустая. **НИКОГДА не логирует значения** —
+/// только факт «present / missing» (caller решает, как это отражать).
+pub fn read_margin_credentials() -> Option<(String, String)> {
+    let key = std::env::var("BINANCE_API_KEY").ok()?;
+    let secret = std::env::var("BINANCE_API_SECRET").ok()?;
+    if key.is_empty() || secret.is_empty() {
+        return None;
+    }
+    Some((key, secret))
+}
+
+/// HMAC-SHA256(query, secret) → hex-строка (lower-case). Стандарт Binance, кривая
+/// `hex` для совместимости с их reference-impl; апострофы не экранируются (hex
+/// алфавит — `[0-9a-f]`, URL-safe).
+fn sign_query(query: &str, secret: &str) -> String {
+    hex::encode(hmac_sha256::HMAC::mac(query.as_bytes(), secret.as_bytes()))
+}
+
+/// Один тик опроса: signed GET → `Vec<MdEvent>`. Без таймеров, без retry —
+/// `run_margin_inventory` оркеструет cadence + backoff. На network/HTTP/parse
+/// сбое возвращает `Vec::new()` (fail-closed) — caller отразит в метриках/логе.
+async fn poll_available_inventory(
+    client: &reqwest::Client,
+    api_key: &str,
+    api_secret: &str,
+) -> Vec<MdEvent> {
+    // timestamp — wall-clock ms (Binance требует ≤ recvWindow=5000ms от серверного
+    // времени; вне теста — это синхронизируется NTP, рассинхронизация >5с означает
+    // уже -1021 "Timestamp outside recvWindow" — caller логирует и пропускает).
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let query = format!("type=MARGIN&timestamp={timestamp}");
+    let signature = sign_query(&query, api_secret);
+    let url = format!("{MARGIN_INVENTORY_URL}?{query}&signature={signature}");
+
+    let resp = match client
+        .get(&url)
+        .header("X-MBX-APIKEY", api_key)
+        .timeout(MARGIN_INVENTORY_TIMEOUT)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::debug!(error = %e, "venue-binance: margin-inventory poll HTTP error");
+            return Vec::new();
+        }
+    };
+
+    if !resp.status().is_success() {
+        let code = resp.status();
+        // Не логируем body: Binance может вернуть наш же query-string с подписью.
+        let _ = resp.text().await;
+        tracing::debug!(status = %code, "venue-binance: margin-inventory poll non-2xx");
+        return Vec::new();
+    }
+
+    let body = match resp.text().await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::debug!(error = %e, "venue-binance: margin-inventory poll body read");
+            return Vec::new();
+        }
+    };
+
+    parse_available_inventory(&body, MARGIN_INVENTORY_ASSETS)
+}
+
+/// Периодический signed read-only poll margin-inventory. Эмитит `MarginInventory`
+/// события в `tx` для активов из `MARGIN_INVENTORY_ASSETS` (USDT/USDC).
+///
+/// **Wiring (recorder-side, M-35 task 2):** спавнить как отдельную задачу рядом с
+/// `run` (WS depth/trade); общий `tx` — `EventKind::md`-канал recorder'а. На
+/// graceful-shutdown (закрытие `tx`) — корректный выход.
+///
+/// **Auth:** env (`BINANCE_API_KEY`/`SECRET`). При их отсутствии — сэмплинг раз в
+/// `MARGIN_INVENTORY_POLL_PERIOD` пропускается (логируем warn ОДИН раз); никаких
+/// логов с key/secret, никаких записей в журнал.
+///
+/// **Rate-limit защита:** `OPS-I-9`-семантика — на 418/429 — exp backoff (не
+/// hot-loop); на прочих ошибках — также exp backoff; на 2xx — reset. Здесь
+/// используем упрощённый вариант через `ops::budget::ReconBudget` (он уже
+/// RED-тестирован, переиспользуем проверенный rate-limit модуль).
+///
+/// **НЕТ order-egress (MI-I-3 canary):** функция делает ТОЛЬКО read-only GET
+/// `/sapi/v1/margin/available-inventory`. Никаких submit/cancel/торговых-подписей.
+pub async fn run_margin_inventory(tx: mpsc::Sender<EventKind>) {
+    use ops::budget::{ReconBudget, RestOutcome};
+
+    let (api_key, api_secret) = match read_margin_credentials() {
+        Some(c) => c,
+        None => {
+            tracing::warn!(
+                "venue-binance: margin-inventory poll requires BINANCE_API_KEY / \
+                 BINANCE_API_SECRET in env; skipping (no key — read-only, no panic)"
+            );
+            // Никакого busy-loop: пусть supervisor решает, нужен ли вообще этот поллер.
+            // Возврат Ok — нормальный graceful exit (supervisor может перезапустить
+            // после применения env); с `tx` ничего не сделано.
+            return;
+        }
+    };
+
+    let client = reqwest::Client::builder()
+        .timeout(MARGIN_INVENTORY_TIMEOUT)
+        .build()
+        .expect("reqwest builder с фиксированными опциями не падает");
+    // max_per_min=1 жёстко: 1 запрос / 60с = spacing ≥ 60с скользящего окна; cadence
+    // 120с ⇒ в окне 0–1 запросов, но backoff от ошибок учитывается.
+    let mut budget = ReconBudget::new(1);
+    let start = std::time::Instant::now();
+    let mut interval = tokio::time::interval(MARGIN_INVENTORY_POLL_PERIOD);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        interval.tick().await;
+
+        let now = start.elapsed();
+        if !budget.may_request(now) {
+            continue;
+        }
+        budget.on_request(now);
+
+        let events = poll_available_inventory(&client, &api_key, &api_secret).await;
+        let outcome = if events.is_empty() {
+            // Не различаем «пустой ответ» vs «ошибка» — оба ведут к backoff: empty
+            // могут означать -1021 (timestamp drift) или -2015 (invalid API key); оба
+            // требуют НЕ продолжать на той же cadence. Если Binance вернул 200 с
+            // пустым assets — это legit edge, но backoff 1 раз не вредит.
+            RestOutcome::Error
+        } else {
+            RestOutcome::Ok
+        };
+
+        for ev in events {
+            if tx.send(EventKind::Md(ev)).await.is_err() {
+                return;
+            }
+        }
+
+        budget.next_delay(outcome);
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

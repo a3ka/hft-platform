@@ -62,7 +62,8 @@ fn venue_label(v: Venue) -> &'static str {
 /// Канонический `kind`-label для `md_events_total{venue,symbol,kind}` (контракт с RED-оракулом
 /// `red_metrics_emission::vlabel`/`md_events_total`-ассертами). Один на вариант `MdPayload`:
 /// `Trade`→`trade`, `L2Snapshot`→`l2snapshot`, `Funding`→`funding`, `OpenInterest`→`open_interest`,
-/// `Liquidation`→`liquidation`, `MarginRate`→`margin_rate`, `L2Delta`→`l2delta`. `kind` ОБЯЗАН отражать реальный
+/// `Liquidation`→`liquidation`, `MarginRate`→`margin_rate`, `L2Delta`→`l2delta`,
+/// `MarginInventory`→`margin_inventory`. `kind` ОБЯЗАН отражать реальный
 /// тип payload — иначе алерт на `kind="trade"` не сработает, когда шум по другой причине
 /// (TD-014-метрика бесполезна).
 fn md_kind_label(p: &MdPayload) -> &'static str {
@@ -74,6 +75,7 @@ fn md_kind_label(p: &MdPayload) -> &'static str {
         MdPayload::Liquidation { .. } => "liquidation",
         MdPayload::MarginRate { .. } => "margin_rate",
         MdPayload::L2Delta { .. } => "l2delta",
+        MdPayload::MarginInventory { .. } => "margin_inventory",
     }
 }
 

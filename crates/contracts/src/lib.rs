@@ -21,7 +21,9 @@ pub const PRICE_SCALE: i64 = 100_000_000;
 /// 2: CT-RFC-02 — `SegmentHeader` (первый фрейм сегмента) + provenance/эпохи.
 /// 3: CT-RFC-04 rev2 — `MdPayload::L2Delta` (эмитируемый вариант) ⇒ новая эпоха сегмента
 ///    (сегмент schema-2 не reuse'ится schema-3 бинарём → L2Delta изолирован; TD-031 fix).
-pub const SCHEMA_VERSION: u32 = 3;
+/// 4: CT-RFC-05 — `MdPayload::MarginInventory` (дискриминант 7, аддитивно) ⇒ новая эпоха
+///    (сегмент schema-3 не reuse'ится schema-4 бинарём; та же изоляция, что L2Delta/TD-031).
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// Версия, при которой сегменты ещё писались БЕЗ `SegmentHeader` (боевой сегмент,
 /// пишется с 2026-07-10). Читается навсегда (CT-I-3) через вменённый заголовок.
@@ -294,6 +296,20 @@ pub enum MdPayload {
         first_update_id: u64,
         final_update_id: u64,
         prev_final_update_id: Option<u64>,
+        ts_exch_ms: i64,
+    },
+    /// Market-wide доступный к займу пул margin per-asset (Binance
+    /// `/sapi/v1/margin/available-inventory?type=MARGIN`, auth read-only). `symbol` = актив
+    /// ("USDT"/"USDC"). `available_e8` = доступный объём ×1e8 (≥0). Аддитивно В КОНЕЦ
+    /// (postcard-дискриминант 7; старые сегменты 0..6 читаются байт-в-байт, CT-I-3). CT-RFC-05.
+    ///
+    /// **Провенанс/семантика (design-honesty, RC-I-10):** это СЫРОЙ доступный пул, НЕ утилизация.
+    /// «Сколько взято/вернули» = Δ(available) во времени — ПРОИЗВОДНАЯ, считается ИНДИКАТОРОМ
+    /// downstream с провенансом `derived-from-available-inventory` + caveat «капасити пула может
+    /// меняться биржей ⇒ Δ = утилизация, не абсолютный borrow-ledger». Здесь храним источник.
+    /// НЕ переиспользуем `MarginRate` — тот rate, этот amount (смешать = семантическая подмена).
+    MarginInventory {
+        available_e8: i64,
         ts_exch_ms: i64,
     },
 }
