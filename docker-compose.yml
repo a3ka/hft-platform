@@ -97,5 +97,49 @@ services:
       - journal-data:/journal
     # Без restart — операторский одноразовый процесс (cron или ручной запуск).
 
+# M-28 gateway-serve: WS-транспорт кокпита (market-плоскость, D1/D6). Тонкая IO-обёртка
+  # над `crates/gateway` (M-22, детерминированная read-only библиотека). Stateless JWT-verify
+  # (GS-I-2/VB-I-9): shared secret в env, БЕЗ user-БД (GS-I-1). Read-only к журналу
+  # (GS-I-3): тот же volume, что у recorder'а, но RO-bind.
+  #
+  # Отдельный сервис (не часть recorder'а) по двум причинам:
+  #  • recorder НЕ занимается транспортом (D1: один процесс — одна ответственность);
+  #  • деплой-rolling: gateway-serve можно перезапустить без остановки recorder'а.
+  #
+  # §8 деплой-гейт: healthy + WS принимает подключение с валидным JWT, отдаёт
+  # snapshot+frames; read-only подтверждён. Порт/TLS/rate-limit — инфра-слой (вне scope M-28).
+  gateway-serve:
+    image: hft-platform-recorder:local
+    container_name: hft-gateway-serve
+    restart: unless-stopped
+    environment:
+      # Loopback по умолчанию (deploy.MD §8: bind на loopback, внешний доступ через
+      # reverse-proxy / ssh-tunnel; безопасный дефолт для проды).
+      GATEWAY_ADDR: ${GATEWAY_ADDR:-127.0.0.1:8080}
+      GATEWAY_JOURNAL_DIR: /journal
+      GATEWAY_VENUE: ${GATEWAY_VENUE:-Binance}
+      GATEWAY_SYMBOL: ${GATEWAY_SYMBOL:-BTCUSDT}
+      GATEWAY_TIMEFRAME_MS: ${GATEWAY_TIMEFRAME_MS:-1000}
+      GATEWAY_BANDS: ${GATEWAY_BANDS:-0.001}
+      # ОБЯЗАТЕЛЬНО задать в .env на хосте (deploy.MD §D: shared с Next.js-подписателем,
+      # D6 marketplace). Без секрета bin падает с exit 2 (config-error).
+      GATEWAY_JWT_SECRET: ${GATEWAY_JWT_SECRET:?GATEWAY_JWT_SECRET must be set}
+    volumes:
+      # RO-bind к журналу — gateway-serve только читает (GS-I-3: read-only). Recorder
+      # владеет журналом, gateway-serve его НЕ мутирует.
+      - journal-data:/journal:ro
+    entrypoint: ["/usr/local/bin/gateway-serve"]
+    healthcheck:
+      # WS-протокол: healthcheck = TCP-connect к bind-адресу. Полноценный JWT-handshake —
+      # в §8 глазами (E2E WS-смоук). Здесь — liveness: процесс жив + port открыт.
+      test: ["CMD-SHELL", "timeout 2 bash -c '</dev/tcp/127.0.0.1/${GATEWAY_PORT:-8080}' || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    depends_on:
+      recorder:
+        condition: service_healthy
+
 volumes:
   journal-data:

@@ -12,11 +12,13 @@
 ## 0. Что есть
 
 - **Образ**: `hft-platform-recorder:local` (Dockerfile, multi-stage). Содержит
-  ВСЕ три бинаря: `recorder` (ENTRYPOINT), `journal-retention` (ops-сервис
-  ретеншена) и режим `--mode compact` того же бинаря (компакция закрытых
-  сегментов, D-COMP-3).
-- **Compose**: `docker-compose.yml`. Три сервиса:
+  ВСЕ четыре бинаря: `recorder` (ENTRYPOINT), `journal-retention` (ops-сервис
+  ретеншена), режим `--mode compact` того же бинаря (компакция закрытых
+  сегментов, D-COMP-3), и `gateway-serve` (M-28 WS-транспорт кокпита).
+- **Compose**: `docker-compose.yml`. Сервисы:
   - `recorder` (24/7, default profile) — сбор;
+  - `gateway-serve` (24/7, default profile, M-28) — WS-транспорт кокпита,
+    read-only к журналу, stateless JWT-verify, БЕЗ user-БД;
   - `journal-retention` (ops profile) — выгрузка+prune;
   - `journal-compaction` (ops profile, D-COMP-3) — компакция закрытых сегментов.
   Никаких side-car'ов: всё одна кодовая база, один образ, один бинарь-портёр.

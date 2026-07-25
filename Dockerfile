@@ -12,7 +12,7 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 # D1: ОБА бинаря собираются и копируются в runtime-образ.
-RUN cargo build --release --bin recorder --bin journal-retention
+RUN cargo build --release --bin recorder --bin journal-retention --bin gateway-serve
 
 FROM debian:stable-slim
 # journal-том монтируется сюда; переживает редеплой контейнера (docs/06 §3, §7).
@@ -25,5 +25,6 @@ RUN mkdir -p /journal /cold
 VOLUME ["/journal"]
 COPY --from=builder /build/target/release/recorder /usr/local/bin/recorder
 COPY --from=builder /build/target/release/journal-retention /usr/local/bin/journal-retention
+COPY --from=builder /build/target/release/gateway-serve /usr/local/bin/gateway-serve
 # M-00: работаем root'ом (заглушка). Hardening (non-root + права тома) — TODO при реальном recorder.
 ENTRYPOINT ["/usr/local/bin/recorder"]
