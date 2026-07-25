@@ -3,7 +3,13 @@
 > **Reviewer-owned.** Открытые долги/риски, замеченные при работе. Закрытые переносятся вниз.
 
 ## OPEN
-- **TD-037** `github-actions-billing-block-halts-ci-cd` (найдено reviewer'ом на §8 M-35, 2026-07-25).
+- **TD-037** `github-actions-billing-block-halts-ci-cd` — **✅ CLOSED 2026-07-25 (founder восстановил
+  билинг; доказано СКВОЗНЫМ прогоном, а не глазами).** Founder исправил Billing & plans после эскалации;
+  подтверждение: re-run CI на `841d7d3` → success (13:45); затем push M-34 merge `211e452` → CI run
+  30163501141 **success** + Deploy 30163501124 **success** (оба jobs СТАРТОВАЛИ и прошли, не «not started»)
+  → VPS обновлён, recorder healthy. Пайплайн (ci.yml fmt/clippy/test/audit + deploy.yml gated-on-CI)
+  функционирует. Единственный оставшийся артефакт — стей­л failure-run на `1732f91` (billing-окно, не
+  перезапускался; главная давно ушла вперёд на зелёный `211e452`). Ниже — исходное описание.
   **ВЕСЬ CI/CD пайплайн ОСТАНОВЛЕН на уровне аккаунта GitHub, НЕ регрессия кода.** Push M-35 close-out
   (`841d7d3`, docs-only) → CI run `30159262236` **failure за 12s**: ВСЕ 5 jobs (`fmt+clippy+test`,
   `cargo audit`, `Protected artifacts`, `Delivery gate`, `All checks passed`) со статусом «not started»,

@@ -361,6 +361,38 @@ oms/venue, не код).
 - **Следующий шаг (architect):** принять решение по M-35 (§E research-dev: reject / reformulate-proxy /
   on-chain / private) на основании этого memo. НЕ специфицировать volume-коллектор под rate-данные без caveat.
 
+## Funding-breadth (M-34 «фандинг по ВСЕМ перпам» — ✅ MERGED `211e452`, reviewer APPROVED 2026-07-25; §8 деплой-гейт GREEN, breadth ЖИВА на проде)
+Founder-приоритет 2026-07-25 («фандинг собирать по всему» — вход для TPP Funding-4-групп breadth-метрики).
+Цепочка: architect (RED FB-I-1 sacred + milestone + verify) → venue-dev (impl) → tester PASS → reviewer
+merge + §8. **MD-only** (read-only premiumIndex funding, БЕЗ order-egress) → **risk-critic N/A** (gates §5
+carve-out; reviewer в Block-scope подтвердил построчно: диф не трогает submit/cancel/auth-торговли).
+critic N/A (venue-* MD-only, не T1/новый крейт).
+- **Что сделано (`crates/venue-binance-futures/src/lib.rs`, venue-dev):** (1) решение emit-множества
+  вынесено в ЧИСТУЮ `select_funding_emit(parsed, subscribed, breadth) -> Vec<MdEvent>` (breadth=true → вся
+  вселенная перпов, порядок сохранён для детерминизма журнала; breadth=false → legacy-фильтр до subscribed,
+  регрессия трек-режима цела; пустой parsed → пусто fail-closed); `poll_premium_index` зовёт `breadth=true`
+  → снят symbol-фильтр «фильтруем на нашу выборку», вселенная (~400 перпов) идёт в журнал. (2) `FUNDING_POLL_
+  PERIOD` 10с→60с (founder ~1/мин; фандинг меняется каждые 8ч; ×6 экономия ≈29 MB/сут payload).
+- **Sacred RED FB-I-1** (`red_funding_breadth.rs`, architect-only): breadth=true эмитит ВСЕ перпы (≥2
+  не-subscribed обязательны), порядок сохранён; breadth=false фильтрует (регрессия); empty→empty. Анти-плацебо:
+  legacy inline-фильтр (breadth игнор) → breadth=true даёт только subscribed → FAIL. Покрывает
+  множественность/регрессию/отсутствие/порядок (`testing.md` чек-лист).
+- **Гейты (reviewer перепрогнал независимо, worktree `/tmp/hft-reviewer-M34`):** `verify_M-34.sh` **PASS
+  (5/5), exit=0** — fmt clean, clippy 0 warn, FB-I-1 GREEN, регресс venue-тестов (red_funding/poll/parse)
+  GREEN, `FUNDING_POLL_PERIOD=from_secs(60)`. Push-scope: 2 коммита M-34 (architect/venue-dev).
+- **§8 деплой-гейт GREEN (`211e452`, 2026-07-25T15:23Z):** CI run 30163501141 success + Deploy 30163501124
+  success (билинг TD-037 восстановлен — пайплайн отработал полностью). **VPS eyes-on (task 3 — суть
+  milestone'а):** `hft-recorder Up (healthy)`, heartbeat свежий (~6s, `writable=true`, `next_seq` монотонен,
+  `segment_index=88`), `panic/ERROR=0`; **funding-breadth ЖИВА** — post-deploy `segment-00000088.jrnl` несёт
+  **781 distinct USDT-символов, из них 779 non-BTC/ETH перпов** (1000PEPEUSDT, DOGEUSDT, AAVEUSDT, ADAUSDT…)
+  vs только BTC/ETH до M-34 — ≫ порога task 3 (>100). Это единственный путь, эмитящий всю вселенную перпов
+  (futures-адаптер подписан на BTC/ETH только для depth/trades), значит breadth-funding реально пишется.
+  Ровно противоположность фьючерс-саге M-06 (там §8 5× ловил Funding=0). events 2111→10206 за ~2 мин.
+- **Startup-churn (не блокер):** стартовые WARN `depth continuity gap detected, resyncing book symbol=BTCUSDT`
+  — известное startup-окно L2-ресинка futures (M-06 TD-014, отдельный от funding путь; WARN, не ERROR);
+  panic/ERROR=0, healthy. Funding идёт через независимый premiumIndex REST-poll.
+- **Follow-up:** M-34 разблокировал вход для TPP Funding-breadth-метрики (отдельный derive/export milestone).
+
 ## Мозг стратегии (M-07 «Strategy brain» — РЕАЛИЗОВАНО, reviewer APPROVED 2026-07-13)
 Закрыта дыра равенства DESIGN §1 №2 (`backtest == paper == live`): решения больше НЕ захардкожены
 в ad-hoc harness'е `research-cli/grid.rs` (taker-in по `SignalOut`, taker-out по `horizon_ms`,
