@@ -121,11 +121,17 @@ fn main() {
             MdPayload::Trade { ts_exch_ms, .. } => (*ts_exch_ms, "Trade"),
             MdPayload::L2Snapshot { ts_exch_ms, .. } => (*ts_exch_ms, "L2Snapshot"),
             MdPayload::Funding { ts_exch_ms, .. } => (*ts_exch_ms, "Funding"),
-            // CT-RFC-01/CT-RFC-04: новые md-варианты не участвуют в md-latency пробе.
+            // CT-RFC-01/CT-RFC-04/CT-RFC-05: новые md-варианты не участвуют в md-latency пробе.
+            // MarginInventory (CT-RFC-05, дискриминант 7) — СЫРОЙ пул доступного маржинального
+            // обеспечения по активу, НЕ latency-релевантно (как L2Delta/OpenInterest/MarginRate):
+            // latency = delta_wall_minus_exch по TIMESTAMP-у события, а inventory-events приходят
+            // отдельным signed read-only poll'ом, семантически другая категория. Сэмплировать в
+            // md-latency — смешение осей (capacity-poll vs market-data-stream).
             MdPayload::OpenInterest { .. }
             | MdPayload::Liquidation { .. }
             | MdPayload::MarginRate { .. }
-            | MdPayload::L2Delta { .. } => continue,
+            | MdPayload::L2Delta { .. }
+            | MdPayload::MarginInventory { .. } => continue,
         };
         let key = (venue_str(md.venue).to_string(), md.symbol.clone());
         if ts_exch_ms <= 0 {
