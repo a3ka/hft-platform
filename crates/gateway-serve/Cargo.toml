@@ -13,6 +13,7 @@ license.workspace = true
 # tokio/tokio-tungstenite в [dependencies].
 
 [dependencies]
+contracts = { path = "../contracts" }
 gateway = { path = "../gateway" }
 journal = { path = "../journal" }
 serde = { version = "1", features = ["derive"] }
@@ -20,11 +21,13 @@ serde_json = "1"
 jsonwebtoken = "9"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+futures-util = { version = "0.3", features = ["sink"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
-contracts = { path = "../contracts" }
 tempfile = "3"
-futures-util = "0.3"
+futures-util = { version = "0.3", features = ["sink"] }
 
 [[bin]]
 name = "gateway-serve"
