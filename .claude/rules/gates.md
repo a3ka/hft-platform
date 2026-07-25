@@ -52,6 +52,10 @@ reviewer — бэкстоп на PR-time (гейт 4 ниже всё равно 
   НЕ узкий `-p`. Тот же урок, что RN-8/M-05 (узкий скоуп маскирует поломку соседей).
   **Перечислять broken-match'и ГРЕПОМ (`grep -rn 'MdPayload::' | match без `_=>``), НЕ по памяти** — иначе
   сам fix окажется неполным (M-35: первый проход пропустил `recorder::md_kind_label` — энумерация по памяти).
+  **Ревизия покрывает ВСЕ таргеты `clippy --all-targets` — `src/**` + `examples/**` + `bins` (RN-18, M-35).**
+  `verify` гоняет `clippy --workspace --all-targets` → компилит и `examples/dump.rs`, и bin'ы; арм нового
+  варианта нужен и там. Allowed-paths dev-задачи ОБЯЗАН явно называть эти не-`src` файлы (иначе reviewer
+  Block-scope), а не «протаскивать» их де-факто.
 - **verify ⊇ терминальные CI-гейты (RN-17, durable) + ТА ЖЕ toolchain-версия (TD-035).** Acceptance-скрипт
   ОБЯЗАН гонять те же терминальные проверки, что `ci.yml`, ТЕМИ ЖЕ командами **И на ТОЙ ЖЕ версии toolchain** —
   иначе verify PASS при красном CI = **false-green**: у dev «зелёно», а merge краснит `main` и блокирует §8.
