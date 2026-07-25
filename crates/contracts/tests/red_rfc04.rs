@@ -18,16 +18,21 @@ use std::path::Path;
 
 use contracts::{Event, EventKind, Level, MdEvent, MdPayload, Venue, SCHEMA_VERSION};
 
-/// CT-RFC-04 rev2 (TD-031): L2Delta — новая ЭПОХА эмитируемых вариантов ⇒ `SCHEMA_VERSION` = 3.
-/// Это МАШИННЫЙ маркер изоляции сегмента (`decide_open_segment` reuse требует совпадения) —
-/// провенанс в проде константа, поэтому точное значение эпохи здесь пинится намеренно: bump
-/// нового варианта ОБЯЗАН осознанно тронуть этот assert (в отличие от «≥ 2» в red_rfc02/03).
+/// EPOCH-TRIPWIRE (cross-RFC, sacred): `SCHEMA_VERSION` = ТЕКУЩАЯ эпоха эмитируемых вариантов.
+/// МАШИННЫЙ маркер сегмент-изоляции (`decide_open_segment` reuse требует совпадения `schema_version`;
+/// провенанс в проде — константа). Точное значение пинится НАМЕРЕННО: bump нового ЭМИТИРУЕМОГО
+/// варианта ОБЯЗАН осознанно тронуть этот assert — подтверждение, что сегмент-эпоха изолирована
+/// (старый бинарь не reuse'ит новый сегмент, TD-031). Это НЕ «≥ 2» (red_rfc02/03) — он ДОЛЖЕН
+/// падать на КАЖДОМ bump, форсируя осознанное обновление (иначе — тихая эпоха-регрессия).
+/// История эпох: 3 = L2Delta (CT-RFC-04 rev2, историческая); **4 = MarginInventory (CT-RFC-05, текущая)**.
 /// `assert_eq!` на const clippy-чист (в отличие от `assert!(const)` — assertions_on_constants).
+/// Имя без числа: следующий bump меняет только значение+doc, не имя.
 #[test]
-fn ct_rfc04_rev2_schema_epoch_is_three() {
+fn schema_epoch_tripwire_current_epoch() {
     assert_eq!(
-        SCHEMA_VERSION, 3,
-        "CT-RFC-04 rev2: L2Delta-эпоха = 3 (сегмент-изоляция, TD-031)"
+        SCHEMA_VERSION, 4,
+        "текущая эпоха = 4 (CT-RFC-05 MarginInventory, сегмент-изоляция TD-031); \
+         L2Delta-эпоха 3 историческая. Bump ⇒ осознанно обнови этот tripwire."
     );
 }
 

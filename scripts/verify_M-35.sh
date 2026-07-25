@@ -19,6 +19,12 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings >/dev/null 
   && ok "clippy --workspace 0 warnings" || bad "clippy --workspace -D warnings"
 
 # ── Task 1: MI-I-1 CT-RFC-05 roundtrip/аддитивность GREEN ────────────────────────────────────────
+# ВЕСЬ contracts-suite (RN-8/RN-18: SCHEMA_VERSION-bump ⇒ полный набор, не подмножество — иначе
+# epoch-tripwire red_rfc04 ловится только на CI `cargo test --workspace`, а milestone-verify зелён).
+cargo test -p contracts >/dev/null 2>&1 \
+  && ok "contracts suite (ct_rfc01/02/03/04/05 + red_schema) GREEN — вкл. epoch-tripwire red_rfc04" \
+  || bad "contracts suite (полный) — вкл. red_rfc04 epoch-tripwire / red_rfc03"
+# (детализация ниже — для сохранения гранулярных сообщений при отдельном интересе):
 cargo test -p contracts --test ct_rfc05 >/dev/null 2>&1 \
   && ok "MI-I-1 (ct_rfc05) GREEN" || bad "MI-I-1 ct_rfc05"
 

@@ -56,6 +56,10 @@ reviewer — бэкстоп на PR-time (гейт 4 ниже всё равно 
   `verify` гоняет `clippy --workspace --all-targets` → компилит и `examples/dump.rs`, и bin'ы; арм нового
   варианта нужен и там. Allowed-paths dev-задачи ОБЯЗАН явно называть эти не-`src` файлы (иначе reviewer
   Block-scope), а не «протаскивать» их де-факто.
+- **Milestone, бампающий `SCHEMA_VERSION` ⇒ `verify` гоняет ВЕСЬ `cargo test -p contracts`, не подмножество
+  (закреплено 2026-07-25, M-35 CT-RFC-05, повтор RN-8).** В contracts есть epoch-tripwire (`red_rfc04::schema_epoch_tripwire`
+  — намеренный `assert_eq!(SCHEMA_VERSION, N)`, падает на КАЖДОМ bump). verify, тестящий только `ct_rfc05`/подмножество,
+  ЗЕЛЁН, а CI (`cargo test --workspace`) КРАСНЫЙ → main падает после мержа. verify-скоуп ОБЯЗАН совпадать с тем, что гоняет CI.
 - **verify ⊇ терминальные CI-гейты (RN-17, durable) + ТА ЖЕ toolchain-версия (TD-035).** Acceptance-скрипт
   ОБЯЗАН гонять те же терминальные проверки, что `ci.yml`, ТЕМИ ЖЕ командами **И на ТОЙ ЖЕ версии toolchain** —
   иначе verify PASS при красном CI = **false-green**: у dev «зелёно», а merge краснит `main` и блокирует §8.
