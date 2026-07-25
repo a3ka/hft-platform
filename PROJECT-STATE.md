@@ -361,6 +361,43 @@ oms/venue, не код).
 - **Следующий шаг (architect):** принять решение по M-35 (§E research-dev: reject / reformulate-proxy /
   on-chain / private) на основании этого memo. НЕ специфицировать volume-коллектор под rate-данные без caveat.
 
+## Margin-inventory collector (M-35 «available-inventory» + CT-RFC-05 — ✅ MERGED `1f342b8`, reviewer APPROVED 2026-07-25; §8 деплой-гейт GREEN, MarginInventory ЖИВА на проде)
+Architect выбрал вариант (2) из survey §6.3 (reformulate как proxy-collector). Собирается **СЫРОЙ
+supply-пул** `/sapi/v1/margin/available-inventory?type=MARGIN` (market-wide доступный к займу объём
+per-asset, USDT/USDC), НЕ ledger/утилизация — Δ-деривация осознанно downstream (milestone §9, critic
+C-024). Первый **аутентифицированный** (signed read-only) источник в даталеере.
+- **Что на main/проде:** `crates/contracts` — CT-RFC-05 `MdPayload::MarginInventory{available_e8:i64,
+  ts_exch_ms:i64}` (postcard-дискр. **7**, аддитивно; `SCHEMA_VERSION` 3→4 новая эпоха; JSON Schema regen).
+  `crates/venue-binance` — `parse_available_inventory` (fail-closed: битый JSON / нет asset / не число →
+  пропуск, не паника) + `run_margin_inventory` (signed HMAC-SHA256 GET, ключ из env, cadence 120с через
+  `ReconBudget` backoff, graceful-exit на закрытии tx). `crates/recorder/main.rs` — `tokio::spawn(
+  run_margin_inventory(tx))` под гейтом `Venue::Binance`, пишет НАПРЯМУЮ в writer-канал минуя fanout
+  (MarginInventory — REST-poll, не WS-MD; не должен bump'ить `md_event_age_ms{venue="binance"}`).
+  Exhaustive-match армы (journal/sim/recorder/research-cli/dump) — задачи 2b/2c/2d.
+- **Governance (оба ОБЯЗАТЕЛЬНЫ — contracts T1 + первый auth-источник):** critic **C-024 r2 PASS**
+  (`a174696`, CT-RFC-05 форма + proxy-рамка), risk-critic **C-025 PASS** (`f8b5dad`): ключ фактически
+  read-only (`enableReading` only; trade/withdraw/futures/margin/transfer = False), нет order-egress,
+  `MdPayload::MarginInventory` — MD вне risk/OMS. MI-I-3 canary (verify grep) GREEN.
+- **§8 eyes-on GREEN (прод `1f342b8`, 2026-07-25):** VPS HEAD `1f342b8`, `hft-recorder Up healthy`,
+  heartbeat свежий (`writable:true`, seq растёт), **0 auth-ошибок** (-2014/-1021/-1130). **Проверка
+  DECODE'ом** (не grep бинарника): свежий сегмент `segment-00000090.jrnl` → `journal::read_all` →
+  **4 события `MarginInventory` дискр.7** (2 цикла × USDT+USDC). Значения: journal USDT `19 896 509.23` /
+  USDC `18 982 236.04` (ts_exch_ms 1785011995000). **Sanity vs live REST** (signed запрос С VPS —
+  IP-restrict `167.233.192.131` работает, HTTP 200 без error-code): REST USDT `20 607 082` / USDC
+  `18 370 399` (~3–4% дрейф за ~3.4 мин — ожидаемо для флуктуирующего supply-пула). Тот же порядок
+  величины, верный asset-mapping — recorder пишет РЕАЛЬНЫЙ available, не нули/чужой asset.
+- **Два дефекта пойманы гейтами (не ушли в прод):** (1) **red_rfc04 epoch-tripwire регрессия** — CT-RFC-05
+  bump `SCHEMA_VERSION` 3→4 уронил намеренный tripwire `assert_eq!(SCHEMA_VERSION,3)` в
+  `contracts/tests/red_rfc04.rs`; поймал CI `cargo test --all` (НЕ verify_M-35 — RN-8-класс: acceptance
+  тестил подмножество contracts-suite). Deploy-гейт fail-closed удержал прод (VPS не тронут). Fix architect
+  `b3a5a95` (tripwire 3→4 + verify += полный contracts-suite + gates правило: SCHEMA_VERSION-bump ⇒ весь
+  contracts). (2) **TD-020-класс: коллектор готов, но не заспавнен** — `run_margin_inventory` существовал,
+  но `recorder/main.rs` его не будил → первый §8 показал **0 MarginInventory** при живом ключе (0 auth-ошибок).
+  Fix task 2e (`bc42e73`, engine-dev): явный `tokio::spawn`. Урок: «код на main» ≠ «функция работает в проде» —
+  доказывает только §8 decode, не `cargo test`.
+- **Хронология merge:** CT-RFC-05+parse+армы `ba61c62` (CI red по red_rfc04 → prod удержан) → fix `b3a5a95`
+  (green, deployed, коллектор дремал) → wiring `1f342b8` (task 2e, §8 GREEN — MarginInventory ожила).
+
 ## Funding-breadth (M-34 «фандинг по ВСЕМ перпам» — ✅ MERGED `211e452`, reviewer APPROVED 2026-07-25; §8 деплой-гейт GREEN, breadth ЖИВА на проде)
 Founder-приоритет 2026-07-25 («фандинг собирать по всему» — вход для TPP Funding-4-групп breadth-метрики).
 Цепочка: architect (RED FB-I-1 sacred + milestone + verify) → venue-dev (impl) → tester PASS → reviewer

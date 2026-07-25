@@ -895,6 +895,34 @@
   late logs `418=0`, `429=0`, `gap=0`, `stale=0`, CPU/MEM normal, restarts=0. Candidate was
   merged via `1504d8b`; TD-014 CLOSED.
 
+## Замечания reviewer'а M-35 (margin-inventory / CT-RFC-05, 2026-07-25)
+- **RN-18 ✅ CLOSED** (architect `a6d178f`). `journal/examples/dump.rs` арм нового MdPayload-варианта был
+  вне литеральных Allowed-paths task 2b, но необходим для `clippy --all-targets`; architect формально
+  расширил Allowed-paths 2b + gates правило (exhaustive-match ревизия покрывает src+examples+bins).
+- **RN-20 (epoch-tripwire регрессия, ✅ пойман+исправлен, урок процессный).** CT-RFC-05 bump
+  `SCHEMA_VERSION` 3→4 уронил намеренный tripwire `contracts/tests/red_rfc04.rs::
+  ct_rfc04_rev2_schema_epoch_is_three` (`assert_eq!(SCHEMA_VERSION,3)` — by-design ловит эпоху-bump без
+  осознанного апдейта). Пойман **CI `cargo test --all` ПОСЛЕ merge в main** (`ba61c62`) — НЕ локальным
+  `verify_M-35.sh`, т.к. тот гонял подмножество contracts-suite (ct_rfc05/red_schema/ct_rfc01/red_rfc02,
+  БЕЗ red_rfc04) — **RN-8-класс** (acceptance тестит меньше, чем CI). Deploy-гейт fail-closed удержал прод
+  (VPS не тронут, откатывать нечего). Fix-forward architect `b3a5a95`: tripwire 3→4 (L2Delta-эпоха
+  историческая, текущая=MarginInventory) + `verify_M-35.sh` += ПОЛНЫЙ contracts-suite + gates правило
+  (SCHEMA_VERSION-bump ⇒ verify гоняет ВЕСЬ `cargo test -p contracts`, не подмножество). Урок закреплён:
+  milestone, бампающий эпоху схемы, обязан прогонять все epoch-tripwire'ы локально.
+- **RN-21 (TD-020-класс: коллектор дремлет, ✅ пойман §8 + исправлен task 2e).** `run_margin_inventory`
+  существовал и был GREEN по unit-тестам, но `recorder/main.rs` его не спавнил → первый §8 после
+  `b3a5a95` показал **0 MarginInventory** на проде при живом ключе (0 auth-ошибок — просто некому было
+  поллить). Fix task 2e (`bc42e73`, engine-dev): явный `tokio::spawn(run_margin_inventory)` под
+  `Venue::Binance`. Урок (тот же, что TD-020): «код на main + зелёный cargo test» ≠ «функция работает в
+  проде» — для активируемого через spawn/wiring кода доказательством является §8 decode журнала, а не
+  unit-suite. Оракул task 2e — законно §8 (spawn в `main()` не unit-тестируем; паттерн M-06/M-09 wiring).
+- **C-025 IP-restrict условие ✅ ВЫПОЛНЕНО.** risk-critic C-025 PASS был обусловлен flip `ipRestrict:false→
+  true` на `167.233.192.131` до §8. Подтверждено фактически: signed REST-запрос С VPS (IP совпадает) →
+  HTTP 200 с данными; ключ read-only-функционален и IP-заперт (запрос с другого IP был бы отклонён).
+- **Recorder-owner (scope-guard `966e45e`) — разрешён.** Кто армирует exhaustive-match recorder'а при новом
+  T1-варианте было неоднозначно (пропущено в `45ec491`); `966e45e` закрепил recorder→engine-dev в
+  scope-guard + gates (энумерация грепом, не по памяти). Больше не долг.
+
 ## Замечания reviewer'а M-24 (2026-07-23)
 - **RN-19 ✅ CLOSED** (merged `2a36c9f`, reviewer APPROVED 2026-07-23). architect добавил обе тай-брейк фикстуры в
   `red_volume_profile.rs`: `vp_poc_tie_goes_to_lowest_price` (равный макс-объём на 100 и 102 → POC=100) и
