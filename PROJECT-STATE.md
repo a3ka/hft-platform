@@ -326,6 +326,38 @@ merge. critic N/A и risk-critic N/A (scope = `crates/research-cli/{src,tests}` 
   VB-I-5 provenance на КАЖДОЙ серии >1.3%) — следующий приоритет по founder-greenlight; M-35 resync-recovery
   (мульти-сегментная агрегация lifetime, каскадные gaps); M-31 (эвикция/TD-016), M-28 (gateway-serve) в очереди.
 
+## Margin-source survey (M-35-prereq «margin borrow/repay» — ✅ MERGED `545a41b`, reviewer APPROVED 2026-07-25; NEGATIVE-RESULT, решение по M-35 за architect'ом)
+Пре-условный survey под founder-вводную M-35 («таймлайн borrowed vs repaid по USDT/USDC на Binance
+margin»). Цепочка: research-dev (survey memo) → reviewer merge. Docs-only, БЕЗ RED (research memo,
+reviewer-бэкстоп). critic/risk-critic N/A (scope = `research/data-quality/*.md` — не contracts/risk/ks/
+oms/venue, не код).
+- **Вердикт (NEGATIVE, задокументирован с пруфами):** публичный market-wide агрегат borrow/repay VOLUME
+  (USDT/USDC) на Binance margin **НЕ ДОСТИЖИМ**. Пруфы (`research/data-quality/margin-source-survey.md`,
+  8 первоисточников, 35+ raw curl-probes 2026-07-25): все 12 `/sapi/v1/margin/*` endpoint'ов → `-2014
+  auth-required` (контр-проверка: `/api/v3/depth`, `/fapi/v1/openInterest` = 200 публичны — значит дело в
+  auth-gate margin-категории, не сеть); `data-api.binance.vision` margin-категории НЕТ (8×404); BAPI surface
+  только retail-collateral-config (Wayback CDX `*public*/*aggregate*/*loan-stat*` = 0 hits); 7 вендоров
+  (CoinGlass/Kaiko/Amberdata/Coinalyze/CryptoQuant/Glassnode/CMC) публикуют только RATE (%), не VOLUME;
+  контр-проверка Bitfinex/Kraken = 404 (отраслевая тенденция — margin risk-aggregate закрыт by-design).
+- **Ценность negative-result:** закрывает вопрос ДО спецификации коллектора — architect НЕ специфицирует
+  `research-cli/metrics/margin.rs` под несуществующий источник (иначе через 2 цикла milestone переоткрылся бы).
+  Design-honesty (`CLAUDE.md`) + RC-I-10 (не подменять прокси за реальные данные). Рекомендации §6.3 (по
+  убыванию): (1) reject M-35 в текущем scope; (2) reformulate как proxy-signal с ЯВНЫМ caveat (hourly
+  interestRateHistory = RATE, не VOLUME, помечать в ValidationReport); (3) on-chain attribution (Nansen/
+  Chainalysis, отдельный milestone); (4) private data agreement (Kaiko Enterprise, legal/B2B).
+- **Гейты (reviewer, worktree `/tmp/hft-reviewer-M35`):** scope docs-only (1 файл, 407 строк, 0 LOC кода;
+  forbidden-path guard CLEAN); греп-гейты — LLM-инференция (`i think|probably|likely|i assume`) = **0**,
+  контент (`borrow|repay|margin|loan`) = 165; TL;DR ↔ §6.1 согласованы (все Q1a/b/c = NO); fmt --check
+  exit=0; verify_M-35.sh N/A (docs-only). Push-scope: 1 коммит `df5321b` (research-dev). **§8: Deploy НЕ
+  триггерится** (docs-only, `deploy.yml` paths = crates/**/Cargo/Dockerfile — не тронуты; recorder инертен,
+  VPS eyes-on не требуется); CI на push подтверждает workspace не сломан.
+- **RN (process NOTE):** (а) сырые probe-ответы (`/tmp/*.json`) эфемерны (worktree-сессия, не в репо) — но
+  HTTP-коды затабулированы инлайн в memo, документ самодостаточен (тот же паттерн, что depth-sources-survey
+  M-32); (б) ветка `research/margin-source` не была запушена в origin (жила в локальном worktree) —
+  контент сохранён через merge в main, но intra-chain push на origin желателен (branch-hygiene).
+- **Следующий шаг (architect):** принять решение по M-35 (§E research-dev: reject / reformulate-proxy /
+  on-chain / private) на основании этого memo. НЕ специфицировать volume-коллектор под rate-данные без caveat.
+
 ## Мозг стратегии (M-07 «Strategy brain» — РЕАЛИЗОВАНО, reviewer APPROVED 2026-07-13)
 Закрыта дыра равенства DESIGN §1 №2 (`backtest == paper == live`): решения больше НЕ захардкожены
 в ad-hoc harness'е `research-cli/grid.rs` (taker-in по `SignalOut`, taker-out по `horizon_ms`,
