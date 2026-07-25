@@ -8,10 +8,15 @@ FAIL=0
 ok()  { echo "PASS: $1"; }
 bad() { echo "FAIL: $1"; FAIL=$((FAIL+1)); }
 
-# ── Гейт 0: fmt + clippy ────────────────────────────────────────────────────────────────────────
+# ── Гейт 0: fmt + WORKSPACE build (T1-enum-вариант ⇒ exhaustive-match во ВСЕХ крейтах!) ──────────
 cargo fmt --all -- --check >/dev/null 2>&1 && ok "fmt clean" || bad "cargo fmt --all -- --check"
-cargo clippy -p contracts -p venue-binance --all-targets --all-features -- -D warnings >/dev/null 2>&1 \
-  && ok "clippy contracts+venue-binance 0 warnings" || bad "clippy -D warnings"
+# КРИТИЧНО (урок reviewer 2026-07-25, класс RN-8): новый MdPayload-вариант ломает exhaustive
+# `match` в journal/sim/research-cli (E0004). Скоуп `-p contracts` СЛЕП к этому → workspace-build обязателен.
+cargo build --workspace >/dev/null 2>&1 \
+  && ok "cargo build --workspace (все exhaustive-match покрывают MarginInventory)" \
+  || bad "cargo build --workspace — E0004 non-exhaustive match на MarginInventory (journal/sim/research-cli)"
+cargo clippy --workspace --all-targets --all-features -- -D warnings >/dev/null 2>&1 \
+  && ok "clippy --workspace 0 warnings" || bad "clippy --workspace -D warnings"
 
 # ── Task 1: MI-I-1 CT-RFC-05 roundtrip/аддитивность GREEN ────────────────────────────────────────
 cargo test -p contracts --test ct_rfc05 >/dev/null 2>&1 \
