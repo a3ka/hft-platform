@@ -1,17 +1,23 @@
 # M-35 — сбор margin-утилизации (available-inventory) usdt/usdc — CT-RFC-05
 
-STATUS: **PROPOSED** (2026-07-25, architect). Founder-решение (2026-07-25): «маржин по usdt/usdc собирать».
-Достижимость ДОКАЗАНА (`margin-source-survey.md §9`, architect re-probe с read-only ключом): market-wide
-`available-inventory` → Δ = borrow/repay utilization. Это **CT-RFC** (новый T1-вариант) + первый
-**аутентифицированный** источник в даталеере (read-only ключ) → **critic (doc-гейт) + risk-critic
-(contracts §5) ОБЯЗАТЕЛЬНЫ**. Reviewer/risk-critic подтверждают: НЕТ order-egress (read-only).
+STATUS: **PROPOSED** (2026-07-25, architect; rev2 после critic C-024 REJECT — переформулирован в
+**proxy-collector**). Founder-решение (2026-07-25): «маржин по usdt/usdc собирать». Источник задокументирован
+**фактами с read-only ключом** (`margin-source-survey.md §9`: endpoint/HTTP-200/USDT+USDC-значения +
+граница интерпретации). Это **CT-RFC** (новый T1-вариант) + первый **аутентифицированный** источник в
+даталеере (read-only ключ) → **critic (doc-гейт) + risk-critic (contracts §5) ОБЯЗАТЕЛЬНЫ**. НЕТ order-egress.
 
-## Мотивация
+## Мотивация (ЧЕСТНАЯ рамка — proxy, НЕ ledger)
 
-Founder-индикатор Margin = «сколько взято/вернули в долг usdt/usdc + разница». Прямого ledger нет, НО
-`/sapi/v1/margin/available-inventory?type=MARGIN` (auth, read-only) отдаёт **market-wide доступный к займу
-пул per-asset с `updateTime`** (замер: USDT $19.93M, USDC $20.51M, 402 актива). **Δ(available) во времени =
-net borrow/repay flow** (пул падает → взяли; растёт → вернули). Почти наверняка так строит Margin TPP.
+Founder хочет Margin-индикатор по usdt/usdc. **Публичного raw borrow/repay LEDGER «взято/вернули/нетто» у
+Binance НЕТ** (survey §1-§8, стоит в силе). НО под read-only auth достижима **supply-сторона:**
+`/sapi/v1/margin/available-inventory?type=MARGIN` отдаёт **market-wide СЫРОЙ доступный к займу пул per-asset**
+с `updateTime` (замер §9: USDT `19932592.29`, USDC `20514052.57`, HTTP 200, 402 актива).
+
+**Граница интерпретации (BINDING, critic C-024):** `available` = СЫРОЙ supply-пул (сколько ЕЩЁ можно занять),
+**НЕ** непогашенный объём и **НЕ** borrow/repay ledger. Утилизация/флоу — **ПРОИЗВОДНАЯ ПРОКСИ downstream**
+(Δ available, или `borrowLimit − available`), помечается `derived-from-available-inventory` + caveat
+«ёмкость пула меняется биржей ⇒ Δ конфаундится». M-35 журналирует **СЫРОЙ supply-факт**; интерпретация —
+осознанно downstream (как L2Delta-сырьё vs book-реконструкция). НЕ выдаём за ledger.
 
 **Дисциплина хранения (design-honesty):** collector пишет СЫРОЙ `available` (источник истины). Утилизация/
 флоу (Δ) — **производная, считается ИНДИКАТОРОМ downstream** (отдельный milestone), с провенансом

@@ -405,3 +405,42 @@ information-asymmetric traders).
 §6 — отклонить M-35 в текущем scope или переформулировать (proxy с явным caveat / on-chain
 attribution / private data agreement). См. обвязку `research-dev` agent-profile §"Handoff → SCOPE
 VIOLATION (нужна правка в реестре/journal writer) → architect".
+
+---
+
+## §9. RE-PROBE С READ-ONLY КЛЮЧОМ (architect, 2026-07-25) — proxy достижим; ledger НЕТ (§8 стоит)
+
+§1-§8 гонялись **БЕЗ ключа** → `-2014 auth` на `/sapi/v1/margin/*` был прочитан как «данных нет».
+Founder дал read-only ключ (права ТОЛЬКО `enableReading`, подтверждено `apiRestrictions`). Пере-проба
+**НЕ отменяет вывод §8** (публичного raw borrow/repay **ledger** «взято/вернули/нетто» нет), но
+**уточняет:** supply-сторона (доступный к займу пул) достижима под auth → возможен **утилизация-ПРОКСИ**,
+а НЕ ledger.
+
+### Proof-артефакт (redacted, non-secret; ключ НЕ в выводе)
+
+| поле | значение |
+|---|---|
+| endpoint | `GET https://api.binance.com/sapi/v1/margin/available-inventory?type=MARGIN` (signed, `X-MBX-APIKEY`) |
+| время пробы (UTC) | 2026-07-25 |
+| HTTP | **200** |
+| форма ответа | `{"assets":{"<ASSET>":"<available_str>",...},"updateTime":<sec>}` |
+| USDT available | `19932592.2856805` |
+| USDC available | `20514052.57370351` |
+| BTC / ETH / SOL | `181.49188335` / `4278.39826663` / `0` |
+| активов в пуле | 402 |
+| `updateTime` | `1784991235` (сек) |
+| смежные (crossMarginData) | per-asset `borrowLimit` + `dailyInterest`/`yearlyInterest` (market-wide) |
+
+### Граница интерпретации (BINDING — то, что запросил critic C-024)
+
+- **`available` = СЫРОЙ supply-side пул, доступный к займу** (сколько ЕЩЁ можно занять), **НЕ** непогашенный
+  объём займов и **НЕ** raw borrow/repay ledger.
+- **Утилизация/флоу — ПРОИЗВОДНАЯ и ПРОКСИ:** Δ(available) ≈ net-flow ТОЛЬКО при неизменной ёмкости пула;
+  ёмкость (`borrowLimit`) биржа меняет → Δ конфаундится. Более честная утилизация = `borrowLimit − available`
+  (обе величины market-wide, auth). Всё это — **downstream индикатор**, помечается
+  `depth_band_provenance`-класс `derived-from-available-inventory` + caveat. **НЕ выдаётся за borrow-ledger.**
+- ⇒ **M-35 = proxy-collector СЫРОГО `available` пула** (журналируем supply-side факт). §8 (ledger недостижим)
+  остаётся в силе — противоречия нет.
+
+**Вывод для M-35:** переформулирован как **proxy-collector** (не ledger-collector). CT-RFC-05 хранит СЫРОЙ
+`available_e8`; интерпретация-как-утилизация — осознанно downstream, с caveat.
