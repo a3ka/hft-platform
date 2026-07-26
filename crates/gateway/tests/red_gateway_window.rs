@@ -159,8 +159,9 @@ fn windowed_live_eq_replay() {
     // VB-I-2 под окном: full(LATEST) ≡ snapshot(C) + frames_since(C..), окно одинаково у обоих.
     let t0 = 20_278 * DAY_MS;
     let mut events = Vec::new();
-    for i in 0..30i64 {
-        events.push(trade(100.0 + i as f64, 1.0, Side::Buy, t0 + i * 1_000)); // 30 бакетов
+    // 180 бакетов (180с) > окно 60с → окно РЕАЛЬНО обрезает историю (иначе тест не про окно).
+    for i in 0..180i64 {
+        events.push(trade(100.0 + i as f64, 1.0, Side::Buy, t0 + i * 1_000));
     }
     let dir = journal_of(events);
     let w = Some(WINDOW_MS);
@@ -190,10 +191,10 @@ fn windowed_live_eq_replay() {
         merged.series, full.series,
         "windowed live != replay: snapshot(C)+frames != full под окном (эвикция/merge/база рассинхронены)"
     );
-    // И это действительно окно (меньше 30 бакетов).
+    // И это действительно окно (обрезано из 180 бакетов истории до ~окна).
     assert!(
-        full.series.ohlcv.len() < 30,
-        "окно обязано обрезать историю (ohlcv={} из 30 бакетов)",
+        full.series.ohlcv.len() < 180,
+        "окно обязано обрезать историю (ohlcv={} из 180 бакетов)",
         full.series.ohlcv.len()
     );
 }

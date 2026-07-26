@@ -8,10 +8,11 @@
 //! Прошлый оракул был СЛЕП: он пинил ВСЕ события в один бакет (`FIXED_TS`), поэтому число
 //! time-бакетов = 1 и рост per-bucket состояния (`heatmap_buckets`, ohlcv, bubbles, vwap.values)
 //! НЕ давился. Именно этот рост убил прод (RSS 7.3GB, OOM). Новый тест раскидывает события по
-//! МНОГИМ бакетам за МНОГО UTC-дней и требует: память snapshot ограничена окном `[at−W, at]`, а
-//! НЕ числом бакетов истории. Окновой режим — `Selector.window_ms = Some(W)` (задача #1 M-37).
-//! Анти-плацебо: текущая unbounded-реализация удерживает ВСЕ бакеты → память растёт с историей →
-//! бюджет/size-independence нарушены. Деградированный вход (testing.md): много сессий (много дней).
+//! МНОГИМ time-бакетам (20000 бакетов) и требует: память snapshot ограничена окном `[at−W, at]`,
+//! а НЕ числом бакетов истории. Окновой режим — `Selector.window_ms = Some(W)` (задача #1 M-37).
+//! Анти-плацебо: текущая unbounded-реализация удерживает ВСЕ бакеты → память растёт с числом
+//! бакетов → бюджет/size-independence нарушены. Деградированный вход (testing.md): L2Snapshot +
+//! Trade на КАЖДЫЙ бакет → давятся ВСЕ per-bucket серии (heatmap/ohlcv/depth/cvd/vp/bubbles).
 //!
 //! COMPILE-RED сейчас: поле `Selector.window_ms` ещё НЕ существует → файл не компилируется, пока
 //! engine-dev (task #1) не добавит его. GREEN после эвикции бакетов (task #2).
@@ -19,7 +20,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 
-use contracts::{DataSource, EventKind, Level, MdPayload, Venue};
+use contracts::{to_fixed, DataSource, EventKind, Level, MdPayload, Side, Venue};
 use gateway::{Cursor, Selector};
 use journal::{EpochFilter, Journal, WriterConfig};
 
@@ -170,9 +171,23 @@ fn snapshot_stream_working_set_bounded() {
 const BASE_TS: i64 = 1_752_000_000_000;
 const WINDOW_MS: i64 = 60_000; // окно 60с → ~60 удержанных бакетов при timeframe 1000ms
 const FEW_BUCKETS: u64 = 2_000;
-const MANY_BUCKETS: u64 = 20_000; // 10× истории few → пересекает много UTC-дней
+const MANY_BUCKETS: u64 = 20_000; // 10× бакетов few (давит рост per-bucket состояния, не days)
 
-/// Один L2Snapshot на бакет: ts растёт на 1000ms/бакет → num_buckets = num_events.
+fn trade_at(i: u64, ts: i64) -> EventKind {
+    EventKind::md(
+        Venue::Binance,
+        "BTCUSDT",
+        MdPayload::Trade {
+            price: to_fixed(64_000.0), // ≈ mid книги (bids base 6.4e12)
+            size: to_fixed(1.0),
+            side: if i % 2 == 0 { Side::Buy } else { Side::Sell },
+            ts_exch_ms: ts,
+        },
+    )
+}
+
+/// На КАЖДЫЙ бакет: L2Snapshot (depth/heatmap/cob) + Trade (ohlcv/cvd/vwap/vp/volume_bubbles),
+/// чтобы давить рост ВСЕХ per-bucket серий. ts растёт на 1000ms/бакет → num_buckets = num событий/2.
 fn build_buckets(num_buckets: u64) -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("tempdir");
     let cfg = WriterConfig {
@@ -185,9 +200,10 @@ fn build_buckets(num_buckets: u64) -> tempfile::TempDir {
     {
         let mut j = Journal::open_with(dir.path(), cfg).expect("open_with");
         for b in 0..num_buckets {
-            let ts = BASE_TS + (b as i64) * 1_000; // отдельный 1с-бакет на событие
+            let ts = BASE_TS + (b as i64) * 1_000; // отдельный 1с-бакет на пару событий
             j.append(book(6_400_000_000_000, 6_400_100_000_000, b as i64, ts))
-                .expect("append");
+                .expect("append book");
+            j.append(trade_at(b, ts)).expect("append trade");
         }
         j.flush().expect("flush");
     }
@@ -219,16 +235,30 @@ fn snapshot_memory_bounded_by_window_not_history() {
     let snap_many = snap_many.expect("snapshot many");
     let snap_few = snap_few.expect("snapshot few");
 
-    // (1) Корректность: окновые серии непусты, но ОБРЕЗАНЫ окном (heatmap/ohlcv в пределах ~W).
+    // (1) Корректность: окновые серии непусты (trade→ohlcv, L2→heatmap/depth), но ОБРЕЗАНЫ окном.
     assert!(
-        !snap_many.series.ohlcv.is_empty() && !snap_many.series.heatmap.is_empty(),
-        "окновой snapshot обязан отдать непустые серии в окне"
+        !snap_many.series.ohlcv.is_empty()
+            && !snap_many.series.heatmap.is_empty()
+            && !snap_many.series.depth_series.is_empty(),
+        "окновой snapshot обязан отдать непустые ohlcv/heatmap/depth в окне"
     );
     let window_buckets = (WINDOW_MS / 1_000) as usize + 2; // допуск на граничный бакет
+                                                           // Явные window-bounds на per-bucket серии (≈1 запись/бакет): ohlcv, depth_series, volume_bubbles.
+                                                           // heatmap (много ячеек/бакет) покрыт бюджетом памяти (2) — на всю историю превысил бы порог.
     assert!(
         snap_many.series.ohlcv.len() <= window_buckets,
-        "ohlcv обязан быть ограничен окном: {} бакетов > окно {window_buckets}",
+        "ohlcv не ограничен окном: {} > {window_buckets}",
         snap_many.series.ohlcv.len()
+    );
+    assert!(
+        snap_many.series.depth_series.len() <= window_buckets,
+        "depth_series не ограничен окном: {} > {window_buckets}",
+        snap_many.series.depth_series.len()
+    );
+    assert!(
+        snap_many.series.volume_bubbles.len() <= window_buckets,
+        "volume_bubbles не ограничен окном: {} > {window_buckets}",
+        snap_many.series.volume_bubbles.len()
     );
 
     // (2) Абсолютный бюджет на журнале с МНОГИМИ бакетами (ловит удержание всех бакетов истории).
