@@ -1,12 +1,15 @@
-//! RED M-20 VW-I-1..4 (sacred, architect-only) — session-anchored VWAP в gateway SeriesBundle.
+//! RED M-36 VW-I-1..4 (sacred, architect-only) — **journal-cumulative (all-time) VWAP** в gateway SeriesBundle.
 //!
-//! VWAP = Σ(price·size)/Σ(size) по сессии (якорь 00:00 UTC, VB-I-6), чистый Trade-редьюсер в gateway
-//! `Reducer` (стримовый fold, bounded — GW-I-2). Новая серия `SeriesBundle.vwap: Vec<(time_s, vwap_e8)>`.
+//! ПЕРЕСМОТР M-20 (VB-I-6, founder-decision M-36): VWAP БОЛЬШЕ НЕ session-anchored. VWAP =
+//! Σ(price·size)/Σ(size) по ВСЕМ сделкам от старта курсора, БЕЗ сброса на 00:00 UTC. `sum_pv/sum_v`
+//! копятся по всему `journal::stream` (чистый Trade-редьюсер, bounded — GW-I-2). SVP/CVD остаются
+//! session-anchored (не трогаются). Серия `SeriesBundle.vwap: Vec<(time_s, vwap_e8)>`.
 //!
-//! COMPILE-RED сейчас: поле `snap.series.vwap` ещё НЕ существует → тест не компилируется (как M-17
-//! `red_depth_series` против несуществующего `compute`). engine-dev добавляет поле + аккумулятор +
-//! bump GATEWAY_SCHEMA_VERSION→3 → GREEN. Анти-плацебо: пустой `vwap: Vec::new()`-заглушка компилирует,
-//! но `.last()` == None → падение; i64/f64-impl переполняется на VW-I-2; impl без session-сброса — на VW-I-3.
+//! Анти-плацебо (impl-заглушки, которые эти тесты обязаны ЛОВИТЬ):
+//!  • пустой `vwap: Vec::new()` → `.last()` == None → падение (VW-I-1);
+//!  • i64/f64-аккумуляция → переполнение на BTC-масштабе (VW-I-2);
+//!  • **impl с session-reset** (текущий M-20 код) → на кросс-полуночной сделке даёт 200 вместо
+//!    блендированного 150 → падение (VW-I-3 all-time). Тест инвертирован против M-20.
 
 use contracts::{to_fixed, DataSource, EventKind, MdPayload, Side, Venue};
 use gateway::{Cursor, Selector};
@@ -117,11 +120,12 @@ fn vwap_i128_prod_scale() {
 }
 
 #[test]
-fn vwap_session_reset() {
-    // VW-I-3: сделки по разные стороны UTC-полуночи → аккумулятор СБРАСЫВАЕТСЯ.
+fn vwap_cumulative_across_midnight() {
+    // VW-I-3 (M-36 all-time, ИНВЕРСИЯ M-20): сделки по разные стороны UTC-полуночи → аккумулятор
+    // НЕ сбрасывается, VWAP БЛЕНДИТ через границу дня.
     let midnight = 20_278 * DAY_MS; // = 1_752_019_200_000, граница UTC-дня
     let dir = journal_of(vec![
-        // сессия D (день 20277): цена 100
+        // день 20277: цена 100 @ size 1
         trade(
             Venue::Binance,
             "BTCUSDT",
@@ -130,7 +134,7 @@ fn vwap_session_reset() {
             Side::Buy,
             midnight - 30_000,
         ),
-        // сессия D+1 (день 20278): цена 200 — VWAP обязан СБРОСИТЬСЯ, не блендить со 100
+        // день 20278: цена 200 @ size 1 — VWAP обязан БЛЕНДИТЬ со 100 (нет session-reset)
         trade(
             Venue::Binance,
             "BTCUSDT",
@@ -143,14 +147,18 @@ fn vwap_session_reset() {
     let a = snap(dir.path(), &sel(60_000)); // 1-мин бакеты → пред/пост полуночи разные бакеты
     assert_eq!(
         vwap_last(&a),
-        20_000_000_000,
-        "VW-I-3: пост-полуночный VWAP = 200 ×1e8 (сессия сброшена); impl без сброса дал бы 150 (блендинг)"
+        15_000_000_000,
+        "VW-I-3 all-time: пост-полуночный VWAP = (100·1+200·1)/(1+1) = 150 ×1e8 (кумулятив от старта); \
+         session-reset impl дал бы 200 ×1e8 (20_000_000_000) — анти-плацебо"
     );
-    // Пред-полуночный бакет обязан присутствовать со значением 100 (сессия D).
+    // Пред-полуночный бакет обязан нести кумулятив на тот момент = 100 ×1e8.
     assert!(
         a.series.vwap.iter().any(|&(_, v)| v == 10_000_000_000),
-        "VW-I-3: бакет сессии D обязан нести VWAP=100 ×1e8"
+        "VW-I-3 all-time: первый бакет обязан нести VWAP=100 ×1e8 (кумулятив после первой сделки)"
     );
+    // Детерминизм: повторный прогон идентичен (VB-I-1).
+    let b = snap(dir.path(), &sel(60_000));
+    assert_eq!(a.series.vwap, b.series.vwap, "all-time VWAP недетерминирован");
 }
 
 #[test]

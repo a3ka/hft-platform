@@ -105,7 +105,7 @@ snapshot/frames/replay — **read-only, детерминированный, stat
 | VB-I-3 | Read Gateway read-only: grep-канарейка — gateway не импортирует journal-writer/recorder-write; recorder не зависит от gateway |
 | VB-I-4 | export v2 аддитивен: старые консюмеры v1 не ломаются; форма меняется только с bump `export_schema_version` (CT-I-аналог) |
 | VB-I-5 | Серия глубже 1.3% несёт `depth_band_provenance`; отсутствие поля → серия невалидна (честность измерителя) |
-| VB-I-6 | Модель сессии (00:00 UTC) — единый примитив для VWAP/SVP/CVD-reset; расхождение anchor между ними запрещено (один источник) |
+| VB-I-6 | **Per-series anchor policy (M-36, founder-decision — пересмотр M-20).** VWAP = **journal-cumulative** (all-time от старта курсора, БЕЗ session-reset — `sum_pv/sum_v` копятся по всему `journal::stream`). SVP + CVD = session-anchored (00:00 UTC, `utc_session_id`). Якоря РАЗНЫЕ намеренно; прежнее «единый источник, расхождение запрещено» отменено — но каждый якорь ЯВНО задекларирован и детерминирован (VB-I-1). Смена семантики VWAP ⇒ bump `GATEWAY_SCHEMA_VERSION` |
 | VB-I-7 | `formula_pending`-серия НЕ эмитит вычисленное значение (только маркер), пока формула не подписана founder'ом |
 | VB-I-8 | Volume Profile: цены без сделок НЕ выдумываются (как footprint-bins v1, C-016); POC/VAH/VAL детерминированы от разбиения |
 | VB-I-9 | **Граница плоскостей (D6):** `gateway-serve` НЕ читает/не пишет application-БД (Postgres); auth = ТОЛЬКО stateless verify подписанного JWT, без user-БД-lookup. grep-канарейка: gateway не импортирует postgres/sqlx/diesel-клиент. User-состояние (стратегии/чаты/настройки) вне market-журнала (`DET-I-1`) |
