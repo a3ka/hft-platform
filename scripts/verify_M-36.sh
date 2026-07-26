@@ -20,7 +20,7 @@ chk cargo test -p gateway --test red_vwap --quiet
 step "task #2 — live == replay (VB-I-2): build==merge байт-идентичность несёт all-time VWAP-суммы"
 chk cargo test -p gateway --test red_gateway_live_eq_replay --quiet
 
-step "task #3 — journal терпит удаление нижнего сегмента (guard прод-purge legacy)"
+step "task #4 — journal терпит удаление нижнего сегмента (guard прод-purge legacy)"
 chk cargo test -p journal --test red_seg0_removed --quiet
 
 step "регрессия — остальной gateway/journal suite не сломан сменой семантики VWAP"

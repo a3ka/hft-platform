@@ -158,7 +158,10 @@ fn vwap_cumulative_across_midnight() {
     );
     // Детерминизм: повторный прогон идентичен (VB-I-1).
     let b = snap(dir.path(), &sel(60_000));
-    assert_eq!(a.series.vwap, b.series.vwap, "all-time VWAP недетерминирован");
+    assert_eq!(
+        a.series.vwap, b.series.vwap,
+        "all-time VWAP недетерминирован"
+    );
 }
 
 #[test]

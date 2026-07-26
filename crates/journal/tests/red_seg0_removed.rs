@@ -71,7 +71,10 @@ fn seg0_removal_tolerated_remaining_segments_read_clean() {
         seg_count >= 3,
         "фикстура должна дать ≥3 сегмента (получили {seg_count}); уменьши max_segment_bytes"
     );
-    assert!(seg0.exists(), "segment-00000000.jrnl должен существовать до удаления");
+    assert!(
+        seg0.exists(),
+        "segment-00000000.jrnl должен существовать до удаления"
+    );
 
     // baseline: полный журнал читается, N событий.
     let full = read_all(dir.path()).expect("read_all baseline");
@@ -90,14 +93,23 @@ fn seg0_removal_tolerated_remaining_segments_read_clean() {
         after.len()
     );
 
-    let mut streamed = 0usize;
-    for r in stream(dir.path(), EpochFilter::OwnCaptureOnly).expect("stream открылся") {
-        r.expect("stream после удаления seg0 обязан читать без crc/continuity ошибки");
-        streamed += 1;
-    }
+    let streamed: Vec<_> = stream(dir.path(), EpochFilter::OwnCaptureOnly)
+        .expect("stream открылся")
+        .map(|r| r.expect("stream после удаления seg0 обязан читать без crc/continuity ошибки"))
+        .collect();
+    // read_all и stream обязаны отдать ИДЕНТИЧНЫЙ поток выживших событий (порядок + содержимое),
+    // не только одинаковое число (усиление C-026).
     assert_eq!(
-        streamed,
-        after.len(),
-        "stream и read_all обязаны видеть одинаковое число выживших событий"
+        after, streamed,
+        "stream и read_all обязаны отдать один и тот же поток выживших событий"
     );
+    // seq строго монотонно растёт — continuity НЕ сломана дырой на индексе 0.
+    for w in after.windows(2) {
+        assert!(
+            w[1].seq > w[0].seq,
+            "seq обязан строго расти после удаления seg0: {} !< {}",
+            w[0].seq,
+            w[1].seq
+        );
+    }
 }
