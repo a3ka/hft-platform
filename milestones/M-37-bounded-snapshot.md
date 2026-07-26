@@ -55,6 +55,9 @@ L2Snapshot каждую 1с (`EMIT_PERIOD=1s`, venue-binance/src/lib.rs:35) → 
 | `crates/gateway/tests/red_gateway_window.rs` (новый — split-retention + windowed live==replay) | architect |
 | `scripts/verify_M-37.sh`, `milestones/M-37-*.md` | architect |
 | `crates/gateway/src/lib.rs` (Selector `window_ms`; эвикция бакетов; CVD running-база; VP session-эвикт) | **engine-dev** |
+| `crates/gateway-serve/src/{main.rs,lib.rs}` (wiring `GATEWAY_WINDOW_MS`→Selector, task #7) | **engine-dev** |
+| `crates/gateway-serve/tests/red_serve_window_wiring.rs` (RED wiring) | architect |
+| `docker-compose.yml` (env `GATEWAY_WINDOW_MS` для gateway-serve, task #7c) | **engine-dev** |
 | `docs/fa/viz-backend.md` (новый инвариант bounded-window) | architect |
 
 ## Forbidden paths
@@ -73,6 +76,10 @@ L2Snapshot каждую 1с (`EMIT_PERIOD=1s`, venue-binance/src/lib.rs:35) → 
 | 4 | VP эвикт ТОЛЬКО целыми прошлыми сессиями; текущая целиком | red_gateway_window (VP POC) | engine-dev | ⏳ |
 | 5 | (RED) Переписать слепой `red_gateway_bounded`: multi-bucket + multi-day + counting-allocator memory-budget. Анти-плацебо: падает на unbounded-реализации | — | architect | ✅ DONE (compile-RED на `window_ms`) |
 | 6 | (RED) `red_gateway_window`: CVD-база переживает эвикцию + VP whole-session + windowed live==replay | — | architect | ✅ DONE (compile-RED на `window_ms`) |
+| 7a | (wiring, TD-020) Вынести сборку config из `main.rs` в тестируемую `serve_config_from_env(get: impl Fn(&str)->Option<String>) -> Result<ServeConfig, String>` (lib.rs); `main` — тонкий вызыватель `\|k\| std::env::var(k).ok()`. Читать `GATEWAY_WINDOW_MS` (Option<i64>, unset/пусто→None) | red_serve_window_wiring | engine-dev | ⏳ |
+| 7b | `build_selector` + арг `window_ms: Option<i64>` → `Selector.window_ms` | red_serve_window_wiring | engine-dev | ⏳ |
+| 7c | `docker-compose.yml`: gateway-serve env `GATEWAY_WINDOW_MS=60000` (иначе прод дефолтит в None=unbounded → §8 снова OOM) | §8 E2E | engine-dev | ⏳ |
+| 7d | (RED) `red_serve_window_wiring`: env→`Selector.window_ms` + `build_selector` проброс | — | architect | ✅ DONE (compile-RED) |
 
 **Анти-плацебо (задача 5 — критично):** оракул ОБЯЗАН содержать десятки-сотни бакетов на много
 UTC-дней (не один бакет), чтобы давить рост per-bucket состояния. Против текущего кода — превышение
@@ -89,9 +96,13 @@ memory-бюджета (OOM-класс). Деградированный вход 
 ## Acceptance
 
 `bash scripts/verify_M-37.sh; echo exit=$?` → `VERDICT: PASS`. Покрывает: fmt + build --workspace +
-clippy --all-targets + red_gateway_bounded (memory-budget GREEN) + red_gateway_window + регрессия
-gateway/journal. §8 E2E на VPS (валидный JWT → Snapshot schema, снапшот СТРОИТСЯ, RSS bounded —
-замерить) — reviewer на деплой-гейте, пруф в close-out.
+clippy --all-targets + red_gateway_bounded (memory-budget) + red_gateway_window +
+red_serve_window_wiring (task #7) + регрессия gateway/journal.
+
+**§8 E2E (reviewer, деплой-гейт) — ОБЯЗАТЕЛЬНО с активированным окном:** прод gateway-serve поднят с
+`GATEWAY_WINDOW_MS=60000` (task 7c, docker-compose); валидный JWT → Snapshot СТРОИТСЯ (не OOM) +
+`RssAnon` выходит на ПЛАТО (не рост ~90MB/s). Без установленного env прод дефолтит в `None`=unbounded
+→ §8 снова OOM — это и был провал первого захода (reducer инертен в бинаре, TD-020). Пруф в close-out.
 
 ## Гейты
 - **critic (plan-time):** ДА — новый инвариант bounded-memory + переписка sacred-оракула + ≥5 задач.

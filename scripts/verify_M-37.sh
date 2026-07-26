@@ -20,6 +20,9 @@ chk cargo test -p gateway --test red_gateway_bounded --quiet
 step "task #3/#4/#6 — split-retention (CVD-база, VP whole-session) + windowed live==replay"
 chk cargo test -p gateway --test red_gateway_window --quiet
 
+step "task #7 — GATEWAY_WINDOW_MS доходит до прод-Selector (wiring gateway-serve, TD-020)"
+chk cargo test -p gateway-serve --test red_serve_window_wiring --quiet
+
 step "регрессия — live==replay (VB-I-2) сохранён под окном"
 chk cargo test -p gateway --test red_gateway_live_eq_replay --quiet
 
