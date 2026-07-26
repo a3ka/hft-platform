@@ -71,8 +71,8 @@ L2Snapshot каждую 1с (`EMIT_PERIOD=1s`, venue-binance/src/lib.rs:35) → 
 | 2 | Reducer: эвикт бакет-оконного состояния (heatmap/ohlcv/bucket_delta/bubbles/depth.values) для бакетов `< at−W` | red_gateway_bounded (memory-budget) | engine-dev | ⏳ |
 | 3 | CVD running-база (session) — эвикция не сдвигает кривую | red_gateway_window (CVD база) | engine-dev | ⏳ |
 | 4 | VP эвикт ТОЛЬКО целыми прошлыми сессиями; текущая целиком | red_gateway_window (VP POC) | engine-dev | ⏳ |
-| 5 | (RED) Переписать слепой `red_gateway_bounded`: multi-bucket + multi-day (много сессий), counting-allocator/RSS-бюджет (паттерн journal `red_open_bounded.rs`, TD-011). Анти-плацебо: падает на текущей unbounded-реализации (бюджет превышен) | — | architect | ⏳ |
-| 6 | (RED) `red_gateway_window`: split-retention (сессионно-скалярное переживает эвикцию, бакет-оконное эвиктится) + windowed live==replay (full ≡ snapshot(C)+frames при ОДНОМ [at−W,at]) | — | architect | ⏳ |
+| 5 | (RED) Переписать слепой `red_gateway_bounded`: multi-bucket + multi-day + counting-allocator memory-budget. Анти-плацебо: падает на unbounded-реализации | — | architect | ✅ DONE (compile-RED на `window_ms`) |
+| 6 | (RED) `red_gateway_window`: CVD-база переживает эвикцию + VP whole-session + windowed live==replay | — | architect | ✅ DONE (compile-RED на `window_ms`) |
 
 **Анти-плацебо (задача 5 — критично):** оракул ОБЯЗАН содержать десятки-сотни бакетов на много
 UTC-дней (не один бакет), чтобы давить рост per-bucket состояния. Против текущего кода — превышение
