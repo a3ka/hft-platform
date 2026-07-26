@@ -27,7 +27,13 @@ use serde::{Deserialize, Serialize};
 /// 5: M-23 Heatmap+COB+Bubbles — `SeriesBundle += heatmap/cob/volume_bubbles`, типы
 ///    `HeatmapCell/CobLevel/BubbleCell`. Бамп 4 → 5 (новые T-designate типы, формы
 ///    аддитивны — потребители v4 читают без изменений).
-pub const GATEWAY_SCHEMA_VERSION: u32 = 5;
+/// 6: M-36 — **VWAP семантика**: `SeriesBundle.vwap` БОЛЬШЕ НЕ session-anchored, а journal-cumulative
+///    (all-time Σ(price·size)/Σ(size) от старта курсора, без reset на 00:00 UTC). Форма
+///    `Vec<(i64,i64)>` неизменна, но СЕМАНТИКА пересмотрена (VB-I-6: per-series anchor policy;
+///    VWAP=journal-cumulative, SVP/CVD=session-anchored). Бамп 5 → 6 сигналит будущему
+///    фронту о смене anchor. Потребители v5, читавшие vwap как session-серию, должны
+///    пересмотреть интерпретацию.
+pub const GATEWAY_SCHEMA_VERSION: u32 = 6;
 
 /// Canonical UTC-day session anchor shared by session-cumulative indicators (VB-I-6).
 pub const fn utc_session_id(ts_exch_ms: i64) -> i64 {
@@ -160,7 +166,10 @@ pub struct SeriesBundle {
     /// Running cumulative delta `(time_s, знаковая агрессия до конца бакета)` (export v1 §3.2).
     pub cumulative_delta: Vec<(i64, i64)>,
     pub depth_series: Vec<DepthRow>,
-    /// Session-anchored VWAP `(time_s, price ×1e8)`, reset at 00:00 UTC.
+    /// All-time VWAP `(time_s, price ×1e8)`, cumulative `Σ(price·size)/Σ(size)` от старта
+    /// курсора (M-36, VB-I-6 reversal). БЕЗ reset на 00:00 UTC — `sum_pv/sum_v` копятся
+    /// через границу дня. Session-anchored индикаторы — SVP/CVD (см. `volume_profile`/
+    /// `cumulative_delta`).
     pub vwap: Vec<(i64, i64)>,
     /// Session Volume Profile (SVP, M-24): `VolumeProfileRow` per сессия, сортировка по `session_id`.
     /// Только ТОРГОВАННЫЕ цены (VP-I-4): ключи гистограммы — реальные сделки, не «выдуманные».
@@ -238,20 +247,17 @@ impl OhlcvAcc {
 
 #[derive(Default)]
 struct VwapAcc {
-    session_id: Option<i64>,
     sum_pv: i128,
     sum_v: i128,
     values: BTreeMap<i64, i64>,
 }
 
 impl VwapAcc {
-    fn apply_trade(&mut self, ts_ms: i64, time_s: i64, price: i64, size: i64, emit: bool) {
-        let session_id = utc_session_id(ts_ms);
-        if self.session_id != Some(session_id) {
-            self.session_id = Some(session_id);
-            self.sum_pv = 0;
-            self.sum_v = 0;
-        }
+    fn apply_trade(&mut self, time_s: i64, price: i64, size: i64, emit: bool) {
+        // M-36 (VB-I-6 reversal): VWAP all-time. `sum_pv`/`sum_v` копятся через границу
+        // 00:00 UTC — session-reset СНЯТ. Семантика: `Σ(price·size)/Σ(size)` за ВСЕ сделки
+        // селектора от старта курсора. i128 страхует от переполнения на BTC-масштабе
+        // (VW-I-2). `time_s` — бакет (ts/1000) для эмита (close-семантика per бакет).
         self.sum_pv += i128::from(price) * i128::from(size);
         self.sum_v += i128::from(size);
         if emit && self.sum_v != 0 {
@@ -490,8 +496,7 @@ impl Reducer {
         let Some(time_s) = self.bucket_time_s(*ts_exch_ms) else {
             return;
         };
-        self.vwap
-            .apply_trade(*ts_exch_ms, time_s, *price, *size, emit);
+        self.vwap.apply_trade(time_s, *price, *size, emit);
     }
 
     fn seed_vwap(&mut self, event: &Event) {
