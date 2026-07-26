@@ -84,14 +84,18 @@ jobs:
             git fetch -q origin main
             git reset --hard -q origin/main
             echo "=== deploy $(git rev-parse --short HEAD) (prev $(git rev-parse --short "$PREV")) ==="
-            if docker compose up -d --build recorder \
-               && timeout 300 sh -c 'until [ "$(docker inspect -f "{{.State.Health.Status}}" hft-recorder 2>/dev/null)" = healthy ]; do sleep 5; done'; then
-              echo "=== healthy — deployed $(git rev-parse --short HEAD) ==="
+            # M-28: поднимаем И gateway-serve (WS-транспорт, 24/7 default-profile). Health-gate
+            # ОБОИХ fail-closed (класс M-35: сервис в compose, но пайплайн его не стартовал/не проверял).
+            if docker compose up -d --build recorder gateway-serve \
+               && timeout 300 sh -c 'until [ "$(docker inspect -f "{{.State.Health.Status}}" hft-recorder 2>/dev/null)" = healthy ]; do sleep 5; done' \
+               && timeout 300 sh -c 'until [ "$(docker inspect -f "{{.State.Health.Status}}" hft-gateway-serve 2>/dev/null)" = healthy ]; do sleep 5; done'; then
+              echo "=== healthy (recorder + gateway-serve) — deployed $(git rev-parse --short HEAD) ==="
               docker image prune -f
             else
               echo "=== DEPLOY FAILED — logs + rollback to $(git rev-parse --short "$PREV") ==="
               docker logs hft-recorder --tail 50 || true
+              docker logs hft-gateway-serve --tail 50 || true
               git reset --hard -q "$PREV"
-              docker compose up -d --build recorder
+              docker compose up -d --build recorder gateway-serve
               exit 1
             fi
