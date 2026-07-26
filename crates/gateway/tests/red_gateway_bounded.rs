@@ -243,21 +243,57 @@ fn snapshot_memory_bounded_by_window_not_history() {
         "окновой snapshot обязан отдать непустые ohlcv/heatmap/depth в окне"
     );
     let window_buckets = (WINDOW_MS / 1_000) as usize + 2; // допуск на граничный бакет
-                                                           // Явные window-bounds на per-bucket серии (≈1 запись/бакет): ohlcv, depth_series, volume_bubbles.
-                                                           // heatmap (много ячеек/бакет) покрыт бюджетом памяти (2) — на всю историю превысил бы порог.
+    let w_s = WINDOW_MS / 1_000; // окно в единицах time_s (timeframe 1000ms → шаг 1/бакет)
+    let max_ts = snap_many.series.ohlcv.last().expect("ohlcv непуст").time_s;
+    let lo = max_ts - w_s; // нижняя граница окна [lo, max_ts]
+
+    // ВНИМАНИЕ (C-027 K3): per-bucket точки depth лежат ВНУТРИ `DepthRow.series`, а НЕ во внешнем
+    // `Vec<DepthRow>` (внешний = число side×band). Бюджет памяти (2) покрывает heatmap (много ячеек).
     assert!(
-        snap_many.series.ohlcv.len() <= window_buckets,
-        "ohlcv не ограничен окном: {} > {window_buckets}",
+        snap_many.series.ohlcv.len() <= window_buckets
+            && snap_many
+                .series
+                .ohlcv
+                .iter()
+                .all(|r| r.time_s >= lo && r.time_s <= max_ts),
+        "ohlcv вне окна (len={}, окно={window_buckets}, [{lo},{max_ts}])",
         snap_many.series.ohlcv.len()
     );
     assert!(
-        snap_many.series.depth_series.len() <= window_buckets,
-        "depth_series не ограничен окном: {} > {window_buckets}",
-        snap_many.series.depth_series.len()
+        !snap_many.series.depth_series.is_empty(),
+        "depth_series (строки side×band) непуст"
+    );
+    for row in &snap_many.series.depth_series {
+        assert!(
+            !row.series.is_empty(),
+            "DepthRow.series пуст (side={}, band={})",
+            row.side,
+            row.band_pct_e8
+        );
+        assert!(
+            row.series.len() <= window_buckets,
+            "DepthRow.series удерживает историю: {} > {window_buckets} бакетов (side={})",
+            row.series.len(),
+            row.side
+        );
+        assert!(
+            row.series.iter().all(|&(t, _)| t >= lo && t <= max_ts),
+            "DepthRow.series содержит точки вне окна [{lo}, {max_ts}] (side={})",
+            row.side
+        );
+    }
+    assert!(
+        !snap_many.series.volume_bubbles.is_empty(),
+        "volume_bubbles пуст — Trade-фикстура обязана дать пузыри"
     );
     assert!(
-        snap_many.series.volume_bubbles.len() <= window_buckets,
-        "volume_bubbles не ограничен окном: {} > {window_buckets}",
+        snap_many.series.volume_bubbles.len() <= window_buckets
+            && snap_many
+                .series
+                .volume_bubbles
+                .iter()
+                .all(|c| c.time_s >= lo && c.time_s <= max_ts),
+        "volume_bubbles вне окна (len={}, окно={window_buckets}, [{lo},{max_ts}])",
         snap_many.series.volume_bubbles.len()
     );
 
