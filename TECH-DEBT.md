@@ -3,6 +3,32 @@
 > **Reviewer-owned.** Открытые долги/риски, замеченные при работе. Закрытые переносятся вниз.
 
 ## OPEN
+- **TD-038** `gateway-snapshot-crc-mismatch-on-live-compacted-journal` (найдено reviewer'ом на §8 M-28,
+  2026-07-26). **Класс TD-011/M-08: зелёные юниты + Deploy-success + healthy TCP-healthcheck ≠ рабочий
+  прод.** M-28 gateway-serve — ПЕРВЫЙ раз, когда код `crates/gateway` (M-22/23, read-side reducer/replay
+  над журналом) реально запущен против ЖИВОГО прод-журнала (до M-28 образ нёс только
+  `recorder`+`journal-retention`, gateway был инертен). §8 E2E вскрыл: JWT-verify корректен
+  (`ws auth ok`; wrong-key/expired → `Error`/reject), но авторизованная сессия падает на снапшоте —
+  `gateway-serve conn ended with error error=frame crc mismatch`, снапшот клиенту НЕ уходит.
+  **ДЕТЕРМИНИРОВАННО (3/3 прогона FAIL — НЕ torn-tail race).** Дефект НЕ в транспорте M-28 (хендшейк/
+  auth/passthrough корректны, gates GREEN), а ниже — в `gateway::snapshot` → `journal::stream`
+  (`EpochFilter::OwnCaptureOnly`, `Cursor::LATEST`) на РЕАЛЬНОЙ раскладке прод-журнала:
+  1 задекларированный legacy raw-сегмент `segment-00000000.jrnl` (15.19 GB, `journal.legacy.json`,
+  OwnCapture) + **88 компактированных `segment-*.jrnl.zst`** (D-COMP-3) + 5 активных raw-сегментов
+  (89–93). Юнит-фикстуры используют ТОЛЬКО свежий несжатый журнал (`Journal::open_with` → flush → read),
+  поэтому ни `.zst`-компакция, ни legacy-раскладка в тестах не покрыты. Рабочая гипотеза (диагностика —
+  зона architect, НЕ reviewer): stream парсит байты `.zst`-сегмента (или legacy) как raw postcard+crc
+  фреймы → детерминированный crc mismatch; STRICT-чтение (DET-I-1, Err на первом mismatch) корректно
+  фейлит, но снапшот-путь обязан УМЕТЬ читать компактированную/многоформатную раскладку. **Прод НЕ
+  повреждён:** gateway-serve read-only (mount `/journal` `rw=false mode=ro`), recorder healthy/`restarts=0`/
+  heartbeat свежий/`writable=true` — сбор данных не задет; revert НЕ требуется (сервис безвреден-но-нефункционален,
+  loopback-only, без ports-publish). **Нужно (architect → RED-first, gates §4 reviewer описывает / architect
+  проектирует):** RED-оракул — `gateway::snapshot`/`stream` над журналом, СОДЕРЖАЩИМ компактированные `.zst`
+  + задекларированный legacy + активный сегмент, обязан вернуть `Ok(Snapshot)` (анти-плацебо: падает на
+  текущей реализации с crc mismatch); прод-масштаб дисциплина `.claude/rules/testing.md`. Затем fix в
+  крейте-владельце (`journal` stream-reader для `.zst` ЛИБО `gateway` snapshot read-path) → engine-dev impl →
+  reviewer повторный §8 E2E. Severity: **MAJOR** (продуктовая цель M-28 — «фронт получает снапшот+live» —
+  на проде НЕ работает; milestone НЕ закрывается до фикса + §8-GREEN E2E).
 - **TD-037** `github-actions-billing-block-halts-ci-cd` — **✅ CLOSED 2026-07-25 (founder восстановил
   билинг; доказано СКВОЗНЫМ прогоном, а не глазами).** Founder исправил Billing & plans после эскалации;
   подтверждение: re-run CI на `841d7d3` → success (13:45); затем push M-34 merge `211e452` → CI run

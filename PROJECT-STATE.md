@@ -1422,6 +1422,37 @@ reviewer APPROVED. **critic НЕ требовался** (не T1/risk/ks/oms/ven
   **Дальше:** Трек A (gap-detection + **TD-016** эвикция — предусловие ДАЛЬНЕЙ достоверности heatmap/TPP-полос),
   M-25 liq/OI/funding-профили, M-28 gateway-serve (транспорт).
 
+## Кокпит-транспорт (M-28 «gateway-serve WS» — КОД MERGED в main (`40b8113`), но **§8 NOT GREEN → milestone НЕ закрыт**, reviewer 2026-07-26)
+Цепочка: architect spec/RED (GS-I-1..5) → critic **C-024 REJECT → r2 PASS** → engine-dev impl (tasks #2-4) →
+reviewer BLOCK на §8 (B1 deploy-gap + B2 секрет) → architect B1 (`8cadba0` deploy.yml health-gate) + founder B2
+(GATEWAY_JWT_SECRET на VPS `.env` 600) → **reviewer консолидация + merge + §8**. Merge `40b8113` (`--no-ff`;
+консолидация: 3 impl-коммита engine-dev cherry-pick'нуты поверх B1 на `origin/feat/M-28-gateway-serve`, идентичность
+engine-dev сохранена). Гейты reviewer НЕЗАВИСИМО на чистом worktree: **workspace build exit 0; test 389 passed/0 failed
+(129 блоков); `verify_M-28.sh` VERDICT: PASS exit=0** (fmt --all, clippy --workspace -D warnings, GS-I-2/4/5, канарейки
+GS-I-1/GS-I-3, bin build). CI 30199831629 + Deploy 30199831637 — оба **success**.
+- `crates/gateway-serve` (engine-dev, тонкая IO-оболочка над `crates/gateway` M-22) — WS-транспорт кокпита:
+  `auth::verify_token` (jsonwebtoken HS256, **stateless — без user-БД**, GS-I-2), `wire::ServeMsg` (JSON-конверт,
+  JS-декодируемо, GS-I-4), `serve::{snapshot_msg,frames_msgs}` (тонкий passthrough над `gateway::{snapshot,frames_since}`,
+  GS-I-5), `server::{bind,serve}` + bin (tokio-tungstenite: accept→verify JWT из `?token=`→snapshot+push(250ms)+replay).
+  **Read-only:** нет journal-writer/app-БД (канарейки GREEN); клиентские WS-фреймы читаются-и-игнорируются (MVP).
+  risk-critic N/A (read-only, нет order-path). Block-C N/A (contracts не тронуты).
+- `deploy.yml` (**B1**, architect `8cadba0`, класс M-35 «сервис в compose, но пайплайн не стартовал») — deploy-шаг
+  теперь `up -d --build recorder gateway-serve` + **fail-closed health-gate ОБОИХ** (`docker inspect Health.Status
+  hft-recorder` И `hft-gateway-serve`) + rollback обоих. `docker-compose.yml`: сервис `gateway-serve` (образ
+  `hft-platform-recorder:local`, RO-bind `/journal:ro`, healthcheck TCP-проба 127.0.0.1:8080, `depends_on recorder
+  healthy`, secret через `${GATEWAY_JWT_SECRET:?}`). Dockerfile собирает+копирует 3-й бинарь `gateway-serve`.
+- **§8 eyes-on (прод `40b8113`, 2026-07-26) — ЧАСТИЧНО GREEN, но продуктовый критерий ПРОВАЛЕН:**
+  ✅ `hft-gateway-serve` Up (healthy) — **B1 сработал** (сервис стартовал пайплайном И прошёл health-gate);
+  ✅ `hft-recorder` healthy, `restarts=0`, heartbeat свежий (`next_seq` растёт 91534926→91569413, `writable=true`) —
+  **сбор НЕ задет**; ✅ read-only подтверждён (`/journal` mount `rw=false mode=ro`); ✅ JWT-auth E2E: wrong-key → `Error`,
+  expired → `Error`, оба reject без snapshot. ❌ **ВАЛИДНЫЙ JWT → snapshot НЕ приходит:** `ws auth ok` →
+  `conn ended with error error=frame crc mismatch` (ДЕТЕРМИНИРОВАННО 3/3). Дефект — НЕ в транспорте M-28
+  (auth/handshake/passthrough корректны), а в `gateway::snapshot`/`journal::stream` на живой раскладке журнала
+  (legacy 15GB + 88 компактированных `.zst` + активные сегменты); M-28 — первый запуск gateway-кода на проде,
+  §8 вскрыл. ⇒ **TD-038 (BLOCKING M-28, MAJOR)**. Прод НЕ повреждён, revert НЕ требуется (gateway-serve read-only,
+  безвреден-но-нефункционален). **M-28 остаётся 🚧 IN_PROGRESS** до фикса TD-038 (architect RED → engine-dev) +
+  повторного §8 E2E-GREEN (валидный JWT → Snapshot со `schema_version`).
+
 ## Пока НЕ реализовано (следующие фазы)
 - Крейты `risk`/`killswitch`/`oms`, `runner` — пофазно per DESIGN §10 (M-08: fail-closed риск-гейт
   между `strategy` и `oms`). MM-котирование, wiring весов из `signals.json` (граница B),
