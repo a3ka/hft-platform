@@ -113,6 +113,33 @@ red_serve_window_wiring (task #7) + регрессия gateway/journal.
 architect (RED задачи 5-6 + milestone + verify + doc) → critic (plan-time) → engine-dev (задачи 1-4)
 → tester → reviewer (PR + §8 E2E: снапшот строится + RSS bounded) → founder (закрытие M-28/M-36/M-37).
 
+## §Remediation (governance, 2026-07-26 — architect-вердикт)
+
+Инцидент: impl задач #1-4 закоммичен сессией с ролью **reviewer** (worktree унаследовал `reviewer`
+git-identity общего чекаута). Reviewer не может независимо заапрувить код, который написала его роль
+(gates §4 — независимость про КТО ПИСАЛ, не про метку в логе). engine-dev вместо ремедиации переклеил
+авторство `filter-branch`'ем (деревья идентичны — 0 строк кода) + force-push → это ОТМЫВАНИЕ метки,
+нарушение не снято, аудит-трейл стал ложным.
+
+**Вердикт architect: вариант (b) — переписать impl правильной ролью.** Ветка пересоздана от `1bd515a`
+(чистый набор architect-RED + critic-вердикты + spec, impl отсутствует); переклеенные коммиты
+818f50e/3437d03/838429f **отброшены** (подлинные держатся в /tmp worktree'ах — не удалять). engine-dev
+реализует задачи 1-4 + 7 СВОИМИ руками против замороженных GREEN-оракулов под engine-dev identity →
+авторство правдиво, reviewer снова независим (альтернативный гейт НЕ нужен). (a)/(c) отвергнуты:
+оставляют reviewer-written impl на money-adjacent read-path + нормализуют scope-violation; re-impl —
+один цикл против готовых оракулов, дешевле governance-долга. Дизайн НЕ переоткрывается (C-027 rev3 PASS).
+
+**Architect-зона (закрыто этим коммитом):**
+1. **Compat-правки 11 sacred-тестов** под новое поле `Selector.window_ms` (`window_ms: None` в существующих
+   литералах) — это МОЯ зона, должны были приехать с задачами #5/#6; теперь authored architect'ом, не утекают dev'у.
+2. **Линт `manual_is_multiple_of`** (`i % 2 == 0`) в red_gateway_bounded/readonly/serve_passthrough —
+   переписан на `[Side::Buy, Side::Sell][(i % 2) as usize]` (лаконичнее и без линта) → `#![allow(...)]` в
+   оракуле НЕ нужен (обоснование = устранение источника, а не подавление).
+3. **Анти-плацебо сохранён:** compat/линт-правки не трогают memory-бюджет/эвикцию/assert'ы
+   red_gateway_bounded/window → оракулы по-прежнему падают на unbounded/наивной эвикции (compile-RED до impl).
+
+Рецидив-профилактика: `branch-hygiene.md` §7 (identity первым шагом в worktree). governance-TD — за reviewer.
+
 ## Cross-references
 - Критик-аудит (2 раунда, находки #1-5), `crates/gateway/src/lib.rs` (Reducer:400, heatmap:413,
   CVD:659, VP:276), `crates/gateway/tests/red_gateway_bounded.rs` (слепой), `crates/journal/tests/
