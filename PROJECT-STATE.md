@@ -1452,6 +1452,46 @@ GS-I-1/GS-I-3, bin build). CI 30199831629 + Deploy 30199831637 — оба **succ
   §8 вскрыл. ⇒ **TD-038 (BLOCKING M-28, MAJOR)**. Прод НЕ повреждён, revert НЕ требуется (gateway-serve read-only,
   безвреден-но-нефункционален). **M-28 остаётся 🚧 IN_PROGRESS** до фикса TD-038 (architect RED → engine-dev) +
   повторного §8 E2E-GREEN (валидный JWT → Snapshot со `schema_version`).
+- **ОБНОВЛЕНИЕ 2026-07-26 (M-36 merge `65519ae` + §8 ops-purge):** crc-корень TD-038 (торн-crc фрейм в legacy)
+  УСТРАНЁН физическим удалением legacy-сегмента на проде, но валидный JWT → Snapshot ВСЁ РАВНО не приходит —
+  теперь из-за **OOM** (gateway-serve дорастает до ~7.3 GB RSS на unbounded reduce и убивается host-OOM). Активный
+  блокер M-28 переехал с TD-038 (crc, закрыт purge'ем) на **TD-039 (OOM, BLOCKING M-28 И M-36)**. M-28 по-прежнему
+  🚧 IN_PROGRESS — §8 E2E-GREEN (валидный JWT → Snapshot) недостижим до фикса TD-039.
+
+## Кокпит-снапшот прод (M-36 «gateway snapshot: legacy purge + VWAP all-time» — КОД MERGED в main (`65519ae`), §8 ops-purge ВЫПОЛНЕН, но **§8 E2E NOT GREEN → milestone НЕ закрыт**, reviewer 2026-07-26)
+Цепочка: architect (RED `red_vwap` all-time + `red_seg0_removed` guard + `verify_M-36.sh` + `docs/fa/viz-backend.md`
+VB-I-6 per-series anchor) → critic **C-026 REJECT (fmt sacred) → rev2 PASS** (`1458885` fmt-фикс + усиление seg0-guard)
+→ engine-dev (`ef21fec`, tasks #1-3) → tester PASS → **reviewer APPROVED + merge + §8 ops-purge**. Merge `65519ae`
+(`--no-ff`; push-scope чист — только M-36-коммиты). CI 30206945723 + Deploy 30206945673 — оба **success**.
+- **Code-контракт (reviewer НЕЗАВИСИМО на чистом worktree @`ef21fec`):** scope чист — engine-dev тронул ТОЛЬКО
+  `crates/gateway/src/lib.rs` (+17/-12), sacred tests/verify/milestone/docs не тронуты; contracts/risk/killswitch/oms/
+  venue-* — 0 файлов (risk-critic N/A: read-path, нет order-egress, MD-only carve-out класс; Block-C N/A). RED-first
+  соблюдён (тесты в отдельных architect-коммитах); **анти-плацебо доказан reviewer'ом независимо** — против
+  пред-impl дерева (session-reset) `vwap_cumulative_across_midnight` FAIL (`left 200e8 / right 150e8`). Гейты:
+  fmt/build/clippy clean, **workspace 390 passed/0 failed (130 блоков)**, `verify_M-36.sh` **VERDICT: PASS exit=0**.
+- `crates/gateway/src/lib.rs` (engine-dev) — `VwapAcc`: session-reset СНЯТ (`session_id` поле удалено, `apply_trade`
+  потерял `ts_ms`); `sum_pv/sum_v` (i128, VW-I-2 анти-переполнение) копятся all-time от `Cursor::START` через границу
+  00:00 UTC. `SeriesBundle.vwap` doc: session→all-time. `GATEWAY_SCHEMA_VERSION` **5→6** (форма `Vec<(i64,i64)>`
+  неизменна, семантика пересмотрена; консюмеров ещё нет). VB-I-6 → per-series anchor (VWAP=journal-cumulative;
+  SVP/CVD остаются session, НЕ тронуты). **T1 не тронут** (VWAP живёт в gateway, не в `Event`/`EventKind` — CT-RFC не нужен).
+- **§8 ops-purge legacy на VPS (task 5, reviewer/founder, founder-подтверждён в-сессии) — ВЫПОЛНЕН, IRREVERSIBLE:**
+  baseline (recorder healthy `restarts=0`, heartbeat свежий, активный `segment_index=94`, legacy seg0 заморожен Jul 14)
+  → backup `journal.legacy.json` в `/root/journal.legacy.json.m36bak.*` → снята декларация legacy (manifest =
+  `{"declarations": []}`) → `rm segment-00000000.jrnl` (15 188 347 171 B, необратимо) → recorder не задет
+  (`restarts=0`, продолжает писать в seg94, heartbeat `writable=true`), диск 43%→34% (освобождено ~14 GB).
+- **§8 E2E snapshot (task 5, schema_version=6 + latency) — NOT GREEN → milestone НЕ закрыт.** После purge crc mismatch
+  БОЛЬШЕ НЕ воспроизводится (TD-038 crc-корень снят), но валидный JWT → Snapshot НЕ приходит: gateway-serve
+  **OOM-killed на построении снапшота** (host-OOM ~7.3 GB RSS, dmesg oom-killer; `RestartCount` 0→1 на одно
+  подключение; живой замер `RssAnon` 308 kB→672 MB за 8 s монотонно ~90 MB/s). Это НЕ порча (crc/parse-ошибок нет) —
+  unbounded reduce всего журнала (93 `.zst` + активные, ~16 GB) на каждое подключение. ⇒ **TD-039 (BLOCKING M-28 И
+  M-36, MAJOR)** — отложенный вопрос M-36 §Objective п.4 (чекпоинт-редьюсер) эскалирован: замер дал OOM, а не
+  «медленно» ⇒ bounded-memory снапшот / checkpoint-редьюсер ОБЯЗАТЕЛЕН. latency-число не снято (снапшот не строится).
+- **Прод НЕ повреждён, revert НЕ требуется:** recorder — отдельный процесс, healthy/`restarts=0`/heartbeat свежий/
+  `writable=true`, сбор данных не задет; gateway-serve idle-healthy, падает ТОЛЬКО на подключении; живых
+  cockpit-консюмеров нет (M-28 IN_PROGRESS). M-36 code (VWAP all-time) корректен и остаётся — OOM предшествует M-36.
+- **M-36 остаётся 🚧 IN_PROGRESS.** Закрывается ТОЛЬКО после фикса TD-039 (новый milestone: architect RED
+  прод-масштаб bounded-reduce/checkpoint → engine-dev → reviewer §8 E2E-GREEN валидный JWT → Snapshot schema_version=6
+  + latency) и founder-подписи выбора архитектуры снапшота.
 
 ## Пока НЕ реализовано (следующие фазы)
 - Крейты `risk`/`killswitch`/`oms`, `runner` — пофазно per DESIGN §10 (M-08: fail-closed риск-гейт

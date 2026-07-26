@@ -3,6 +3,35 @@
 > **Reviewer-owned.** Открытые долги/риски, замеченные при работе. Закрытые переносятся вниз.
 
 ## OPEN
+- **TD-039** `gateway-snapshot-unbounded-memory-OOM-on-prod-scale-journal` (найдено reviewer'ом на §8 M-36,
+  2026-07-26). **Класс TD-011, этажом выше: unbounded reduce журнала → OOM, под ЗЕЛЁНЫМ idle-healthcheck.**
+  После того как M-36 purge убрал legacy-сегмент (снял crc-блокер TD-038 в корне — см. ниже), §8 E2E gateway-serve
+  на проде вскрыл СЛЕДУЮЩИЙ блокер: валидный JWT → `ws auth ok` → **gateway-serve OOM-killed на построении
+  снапшота** → Docker рестартит (`RestartCount` 0→1 на ОДНО подключение) → клиент получает чистый EOF, снапшот
+  НЕ уходит. Это НЕ порча (crc/parse-ошибок в логах НЕТ; legacy-crc-фрейм уже удалён) — это **память**.
+  **Доказательство (не гипотеза):** kernel oom-killer в `dmesg` — `Out of memory: Killed process (gateway-serve)
+  total-vm:7343460kB, anon-rss:7336824kB` (процесс дорос до **~7.3 GB** при 7.5 GB RAM хоста и убит; global host-OOM,
+  поэтому `docker inspect OOMKilled=false ExitCode=0` — это НЕ cgroup-limit kill, docker просто перезапустил чистый
+  процесс). Живой замер `RssAnon` во время одного построения снапшота: **308 kB → 672 MB за 8 s, монотонно ~90 MB/s**,
+  без плато → траектория ведёт в OOM. Раскладка прод-журнала на момент замера (после purge): 93 компактированных
+  `segment-*.jrnl.zst` (zstd-magic `28b5 2ffd`, НЕ `HFTJRN02`) + активные raw-сегменты (`HFTJRN02`), суммарно ~16 GB;
+  `gateway::snapshot` (lib.rs:1067) реплеит ВЕСЬ журнал от `Cursor::START` по OwnCapture НА КАЖДОЕ подключение.
+  Плавный (не скачкообразный) рост anon указывает на накопление, а не на единичный bogus-`len`-alloc — механизм
+  (материализация событий / per-bucket серии по всей all-time истории / буферизация распаковки `.zst`) — **зона
+  диагностики architect, НЕ reviewer** (gates §4: reviewer описывает симптом/repro, architect проектирует фикс).
+  **Прод НЕ повреждён:** recorder — ОТДЕЛЬНЫЙ процесс, healthy/`restarts=0`/heartbeat свежий/`writable=true`, сбор
+  не задет; gateway-serve idle-healthy (healthcheck TCP проходит) и падает ТОЛЬКО на подключении; живых
+  cockpit-консюмеров ещё нет (M-28 IN_PROGRESS). Revert M-36 НЕ помогает (OOM предшествует M-36, был замаскирован
+  crc-крашем legacy) и НЕ требуется. **Это ровно отложенный вопрос M-36 §Objective п.4 («чекпоинт-редьюсер —
+  сначала замерить latency post-purge»), эскалированный: замер дал не «медленно», а OOM ⇒ bounded-memory снапшот /
+  чекпоинт-редьюсер становится ОБЯЗАТЕЛЬНЫМ, не опциональным.** **Нужно (новый milestone, architect → RED-first):**
+  RED-оракул прод-масштаба на `gateway::snapshot`/`journal::stream` над журналом из компактированных `.zst` +
+  активных сегментов (десятки GB эквивалента) с counting-allocator/RSS-бюджетом (паттерн `red_open_bounded.rs`,
+  TD-011), падающий на текущей unbounded-реализации; фикс — bounded-streaming reduce ЛИБО checkpoint-редьюсер
+  (дешёвый снапшот без реплея всей истории) в крейте-владельце (`gateway`/`journal`) → engine-dev impl → reviewer
+  повторный §8 E2E. Founder подписывает выбор архитектуры снапшота (было отложено на §Ops M-36 п.8). Severity:
+  **MAJOR** (продуктовая цель M-28/M-36 — «фронт получает снапшот» — на проде физически не строится; блокирует ОБА
+  milestone'а).
 - **TD-038** `gateway-snapshot-crc-mismatch-on-live-compacted-journal` (найдено reviewer'ом на §8 M-28,
   2026-07-26). **Класс TD-011/M-08: зелёные юниты + Deploy-success + healthy TCP-healthcheck ≠ рабочий
   прод.** M-28 gateway-serve — ПЕРВЫЙ раз, когда код `crates/gateway` (M-22/23, read-side reducer/replay
@@ -29,6 +58,16 @@
   крейте-владельце (`journal` stream-reader для `.zst` ЛИБО `gateway` snapshot read-path) → engine-dev impl →
   reviewer повторный §8 E2E. Severity: **MAJOR** (продуктовая цель M-28 — «фронт получает снапшот+live» —
   на проде НЕ работает; milestone НЕ закрывается до фикса + §8-GREEN E2E).
+  **СТАТУС 2026-07-26 (M-36 merge `65519ae` + §8 ops-purge, reviewer): crc-КОРЕНЬ УСТРАНЁН, но снапшот на проде
+  ВСЁ РАВНО не строится — активный блокер переехал в TD-039 (OOM).** M-36 диагностировал crc точно: ОДИН торн-crc
+  фрейм (#713714, оффсет ≈193.7 MiB) в замороженном 15 GB legacy `segment-00000000.jrnl` (эпоха pre-RFC02, TD-011);
+  фреймы 0..713713 чисты. Гипотеза M-28 «stream парсит `.zst` как raw → crc» оказалась НЕВЕРНОЙ для crc — крашил
+  именно legacy-фрейм, который stream читает ПЕРВЫМ (от `Cursor::START`), маскируя всё ниже. Founder-подтверждённый
+  §Ops purge (legacy НЕ нужен): декларация снята из `journal.legacy.json` (backup в `/root/`), сам сегмент удалён
+  (`rm`, необратимо, 14 GB диска освобождено, recorder не задет), manifest = `{"declarations": []}`. **crc mismatch
+  на проде БОЛЬШЕ НЕ воспроизводится** — но снапшот теперь падает по ДРУГОЙ причине (OOM на unbounded reduce
+  оставшихся `.zst`+активных сегментов, ~7.3 GB RSS). ⇒ crc-часть TD-038 закрыта purge'ем; «рабочий прод-снапшот»
+  (общая цель M-28) остаётся НЕ достигнут и теперь гейтится **TD-039**. Оба milestone'а (M-28, M-36) блокирует TD-039.
 - **TD-037** `github-actions-billing-block-halts-ci-cd` — **✅ CLOSED 2026-07-25 (founder восстановил
   билинг; доказано СКВОЗНЫМ прогоном, а не глазами).** Founder исправил Billing & plans после эскалации;
   подтверждение: re-run CI на `841d7d3` → success (13:45); затем push M-34 merge `211e452` → CI run
