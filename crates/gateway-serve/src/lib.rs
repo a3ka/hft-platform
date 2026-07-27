@@ -442,18 +442,105 @@ pub mod _gw {
 
 /// Билдер `Selector` для bin (engine-dev). Main-функция читает env, вызывает эту функцию —
 /// и не пишет `gateway::` в non-comment коде (verify-канарейка, см. `_gw`).
+///
+/// M-37 task #7b: `window_ms: Option<i64>` пробрасывается в `Selector.window_ms`. `Some(W)`
+/// включает bounded-window reducer на gateway-serve (live-режим); `None` — offline unbounded
+/// (read-side инструменты). Тест `red_serve_window_wiring::build_selector_propagates_window`
+/// проверяет прямой проброс.
 pub fn build_selector(
     venue: contracts::Venue,
     symbol: String,
     timeframe_ms: i64,
     bands: Vec<f64>,
+    window_ms: Option<i64>,
 ) -> _gw::Selector {
     _gw::Selector {
         venue,
         symbol,
         timeframe_ms,
         bands,
+        window_ms,
     }
+}
+
+/// Построить `ServeConfig` через ИНЖЕКТИРУЕМЫЙ getter env (`get(k) -> Option<String>`).
+/// **M-37 task #7a:** анти-TD-020 — инлайн-`main.rs` с прямым `std::env::var` НЕ тестируется;
+/// вынесение в чистую функцию доказывает пробрасывание `GATEWAY_WINDOW_MS` (и остальных
+/// `GATEWAY_*`) на unit-тесте уровня (`red_serve_window_wiring`). `main` → тонкий вызыватель
+/// `|k| std::env::var(k).ok()`.
+///
+/// Переменные и дефолты (любая «отсутствует / пусто» → дефолт):
+/// - `GATEWAY_JWT_SECRET`  — ОБЯЗАТЕЛЬНА (HS256, общий секрет с Next.js, D6). `Err` если
+///   отсутствует или пусто.
+/// - `GATEWAY_ADDR`        — дефолт `"127.0.0.1:8080"` (loopback; сознательный безопасный
+///   дефолт, внешний bind — conscious choice оператора).
+/// - `GATEWAY_JOURNAL_DIR` — дефолт `"./journal-data"`.
+/// - `GATEWAY_VENUE`       — дефолт `"Binance"`. Поддержка `Binance | BinanceFutures |
+///   Hyperliquid`, иначе `Err`.
+/// - `GATEWAY_SYMBOL`      — дефолт `"BTCUSDT"`.
+/// - `GATEWAY_TIMEFRAME_MS`— дефолт `1000` (i64, parse).
+/// - `GATEWAY_BANDS`       — comma-separated float'ы, дефолт `"0.001"`.
+/// - `GATEWAY_WINDOW_MS`   — M-37: `None` если отсутствует/пусто/не парсится → offline
+///   unbounded; `Some(W_ms)` → bounded-window reducer в проде (анти-TD-020: без активного W
+///   прод-снапшот ООМ-ит).
+pub fn serve_config_from_env(
+    get: impl Fn(&str) -> Option<String>,
+) -> Result<server::ServeConfig, String> {
+    use journal::EpochFilter;
+    use jsonwebtoken::DecodingKey;
+
+    let secret = get("GATEWAY_JWT_SECRET")
+        .ok_or_else(|| "GATEWAY_JWT_SECRET must be set (HS256 shared secret)".to_string())?;
+    if secret.trim().is_empty() {
+        return Err("GATEWAY_JWT_SECRET must not be empty".to_string());
+    }
+
+    let addr = get("GATEWAY_ADDR").unwrap_or_else(|| "127.0.0.1:8080".to_string());
+
+    let journal_dir = get("GATEWAY_JOURNAL_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("./journal-data"));
+
+    let venue = match get("GATEWAY_VENUE")
+        .unwrap_or_else(|| "Binance".to_string())
+        .as_str()
+    {
+        "Binance" => contracts::Venue::Binance,
+        "BinanceFutures" => contracts::Venue::BinanceFutures,
+        "Hyperliquid" => contracts::Venue::Hyperliquid,
+        other => return Err(format!("unsupported GATEWAY_VENUE={other}")),
+    };
+
+    let symbol = get("GATEWAY_SYMBOL").unwrap_or_else(|| "BTCUSDT".to_string());
+
+    let timeframe_ms: i64 = get("GATEWAY_TIMEFRAME_MS")
+        .unwrap_or_else(|| "1000".to_string())
+        .parse()
+        .map_err(|e| format!("GATEWAY_TIMEFRAME_MS parse: {e}"))?;
+
+    let bands: Vec<f64> = get("GATEWAY_BANDS")
+        .unwrap_or_else(|| "0.001".to_string())
+        .split(',')
+        .map(|s| s.trim().parse::<f64>())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("GATEWAY_BANDS parse: {e}"))?;
+
+    // M-37 task #7a: GATEWAY_WINDOW_MS → Option<i64>. unset/пусто → None (offline).
+    // Невалидное число (parse-ошибка) → None (graceful fallback) — баг .env опечатки не
+    // блокирует запуск; прод-§8 E2E с явным W=60000 в docker-compose.
+    let window_ms: Option<i64> = match get("GATEWAY_WINDOW_MS") {
+        None => None,
+        Some(s) if s.trim().is_empty() => None,
+        Some(s) => s.trim().parse::<i64>().ok(),
+    };
+
+    Ok(server::ServeConfig {
+        addr,
+        journal_dir,
+        filter: EpochFilter::OwnCaptureOnly,
+        selector: build_selector(venue, symbol, timeframe_ms, bands, window_ms),
+        decoding_key: DecodingKey::from_secret(secret.as_bytes()),
+    })
 }
 
 /// Sentinel для verify_M-28.sh — положительная канарейка «gateway-serve использует

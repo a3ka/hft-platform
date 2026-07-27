@@ -78,6 +78,7 @@ fn sel(bands: Vec<f64>) -> Selector {
         symbol: "BTCUSDT".to_string(),
         timeframe_ms: 1_000,
         bands,
+        window_ms: None,
     }
 }
 
