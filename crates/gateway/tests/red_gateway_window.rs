@@ -334,6 +334,11 @@ fn windowed_live_eq_replay_overlap_multistep() {
     // M-38a: поток ПЕРЕСЕКАЕТ 00:00 UTC (180 бакетов вокруг границы: 90 в S1, 90 в S2) → merge
     // per-session с reset. Overlap-fold обязан удержать session-local значения S2 (не накопленные
     // через границу) БАЙТ-идентично между live и replay.
+    //
+    // C-028 K2: КУРСОР У ГРАНИЦЫ (не в глубине S2). snapshot(C) существующее окно содержит ХВОСТ S1
+    // + ГОЛОВУ S2; финальное окно уходит целиком в S2 → S1 должна whole-dropped'иться НА ПУТИ MERGE
+    // (existing пересекает финальное окно — testing.md §vantage). Явные pre/post-asserts вокруг fold'а
+    // ловят реализацию, которая роняет прошлую сессию в `Reducer::finish`, но НЕ в bundle-merge.
     let d2 = 20_279 * DAY_MS;
     let t0 = d2 - 90_000; // старт за 90s до 00:00 UTC → i=0..89 в S1, i=90..179 в S2
     let mut events = Vec::new();
@@ -347,8 +352,14 @@ fn windowed_live_eq_replay_overlap_multistep() {
         .expect("stream")
         .map(|e| e.expect("ev").seq)
         .collect();
-    // C близко к концу → existing-окно [C−W, C] ПЕРЕСЕКАЕТСЯ с [LATEST−W, LATEST].
-    let c = Cursor::at(seqs[seqs.len() - 6]);
+    // C-028 K2: курсор У ГРАНИЦЫ (не в глубине S2). Время C = d2+35s → окно snapshot(C) =
+    // [d2−25s, d2+35s] содержит ХВОСТ S1 (23:59:35..59) + ГОЛОВУ S2 (00:00:00..35). Финальное окно
+    // [d2+29s, d2+89s] целиком в S2 → S1 обязана быть whole-dropped на пути merge (существующее
+    // состояние ПЕРЕСЕКАЕТ финальное окно — testing.md §vantage). Это давит ИМЕННО на
+    // bundle-merge/`evict_series_bundle_under_window`: реализация может корректно ронять прошлую
+    // сессию в `Reducer::finish` для snapshot(LATEST), но оставить хвост S1 в existing при apply.
+    let c_idx = ((d2 + 35_000 - t0) / 1_000) as usize; // = 125 (событие на времени d2+35s)
+    let c = Cursor::at(seqs[c_idx]);
 
     let full = snap(dir.path(), w, Cursor::LATEST);
     let mut merged = snap(dir.path(), w, c);
@@ -375,6 +386,31 @@ fn windowed_live_eq_replay_overlap_multistep() {
         "base S2 = 29 эвиктнутых ранних бакетов текущей сессии"
     );
 
+    // PRE-fold vantage (C-028 K2): existing-состояние merged (= snapshot(C)) обязано СОДЕРЖАТЬ S1
+    // (хвост в окне [d2−25s, d2+35s]) — иначе whole-drop нечему тестировать. full же уже БЕЗ S1.
+    assert!(
+        merged
+            .series
+            .cumulative_delta
+            .iter()
+            .any(|(t, _)| session_of(*t) == s1),
+        "pre-fold: snapshot(C) у границы обязан нести хвост S1 в cumulative_delta (иначе overlap \
+         с финальным окном не пересекает прошлую сессию → whole-drop не под тестом)"
+    );
+    assert!(
+        !full
+            .series
+            .cumulative_delta
+            .iter()
+            .any(|(t, _)| session_of(*t) == s1),
+        "pre-fold: full(LATEST) обязан быть БЕЗ строк S1 (финальное окно целиком в S2)"
+    );
+    assert_eq!(
+        session_base(&full.series.cvd_session_base, s1),
+        0,
+        "pre-fold: base S1 в full = 0 (сессия whole-dropped, не в base)"
+    );
+
     // Multi-step: тянем кадры батчами по 2 до сходимости курсора (fold — накопление ошибки).
     let mut cur = c;
     loop {
@@ -393,6 +429,24 @@ fn windowed_live_eq_replay_overlap_multistep() {
         cur = next;
     }
 
+    // POST-fold whole-drop (C-028 K2): S1, живая в existing до fold'а, обязана исчезнуть ЦЕЛИКОМ —
+    // ни строки в cumulative_delta, ни базы в ledger. Наивный bundle-merge, роняющий только префикс
+    // ТЕКУЩЕЙ сессии (а не whole прошлой), оставил бы хвост S1 → это assert поймает.
+    assert!(
+        !merged
+            .series
+            .cumulative_delta
+            .iter()
+            .any(|(t, _)| session_of(*t) == s1),
+        "post-fold: S1 обязана быть whole-dropped из merged (bundle-merge не уронил прошлую сессию \
+         из existing под финальным окном)"
+    );
+    assert_eq!(
+        session_base(&merged.series.cvd_session_base, s1),
+        0,
+        "post-fold: base S1 в merged = 0 (whole-drop, не осела в per-session ledger)"
+    );
+
     // Предусловие: окна реально пересеклись (тест про overlap, не про evict-all).
     assert!(
         full.series.cumulative_delta.len() > 5,
@@ -409,6 +463,6 @@ fn windowed_live_eq_replay_overlap_multistep() {
     );
     assert_eq!(
         merged.series, full.series,
-        "windowed live != replay под пересекающимся окном + multi-step (TD-042)"
+        "windowed live != replay под пересекающимся окном (у границы 00:00 UTC) + multi-step (TD-042/K2)"
     );
 }

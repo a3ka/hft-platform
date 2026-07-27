@@ -1,6 +1,6 @@
 # M-38a — CVD session-anchored ledger (TD-043)
 
-**Статус:** PROPOSED (RED+doc+verify закоммичены architect'ом; ждёт critic → engine-dev)
+**Статус:** PROPOSED (RED+doc+verify закоммичены architect'ом; C-028 K1/K2 исправлены; ждёт re-review critic → engine-dev)
 **Закрывает:** TD-043 (CVD single-running через 00:00 UTC — M-37 §TD-042 «явно ОТЛОЖЕНО, завести
 отдельный TD»; `Reducer::finish` lib.rs:836-842 несёт пометку «для multi-session нужен per-session
 ledger … в M-37 не покрыт»).
@@ -66,7 +66,8 @@ UTC-сессия (`utc_session_id`) — свой running с нуля; running о
 | Путь | Роль |
 |---|---|
 | `crates/gateway/tests/red_gateway_cvd_session.rs` (новый — session-reset анти-плацебо) | architect |
-| `crates/gateway/tests/red_gateway_window.rs` (обновить: cvd_base_survives + 2-session live + overlap-multistep под session + форма v7) | architect |
+| `crates/gateway/tests/red_gateway_schema_v7.rs` (новый — C-028 K1: константа/Snapshot/Frame ==7, runtime-RED) | architect |
+| `crates/gateway/tests/red_gateway_window.rs` (обновить: cvd_base_survives + 2-session live + overlap-multistep у ГРАНИЦЫ 00:00 UTC с whole-drop pre/post-asserts — C-028 K2 + форма v7) | architect |
 | `scripts/verify_M-38a.sh`, `milestones/M-38a-*.md` | architect |
 | `docs/fa/viz-backend.md` (VB-I-6 CVD session-anchored + VB-I-10 per-session ledger) | architect |
 | `crates/gateway/src/lib.rs` (`CvdSession`; `cvd` per-session; unified `session_max_time_s`; эвикция/merge per-session; форма `cvd_session_base: Vec<(i64,i64)>`; bump `GATEWAY_SCHEMA_VERSION`=7) | **engine-dev** |
@@ -83,21 +84,28 @@ UTC-сессия (`utc_session_id`) — свой running с нуля; running о
 | # | Задача | Оракул | Роль | Статус |
 |---|---|---|---|---|
 | 1 | (RED) `red_gateway_cvd_session.rs`: reset на 00:00 UTC (reset/асимметрия/множественность/3 сессии), runtime-анти-плацебо (падает на single-running) | — | architect | ✅ DONE (анти-плацебо: 4 FAIL — 13e8/58e8/7e8 vs session-local) |
-| 2 | (RED) обновить `red_gateway_window.rs`: `cvd_base_survives` (per-session base v7), `cvd_two_sessions_live_across_midnight_window` (2 ledger живы), `windowed_live_eq_replay_overlap_multistep` (пересекает полночь, session-fold) | — | architect | ✅ DONE (compile-RED формы v7: `&i64`→`&[(i64,i64)]`) |
+| 2 | (RED) обновить `red_gateway_window.rs`: `cvd_base_survives` (per-session base v7), `cvd_two_sessions_live_across_midnight_window` (2 ledger живы), `windowed_live_eq_replay_overlap_multistep` (курсор У ГРАНИЦЫ 00:00 UTC → whole-drop S1 на bundle-merge, pre/post-asserts — C-028 K2) | — | architect | ✅ DONE (compile-RED формы v7: `&i64`→`&[(i64,i64)]`; K2 vantage у границы) |
 | 3 | (RED) `docs/fa/viz-backend.md` VB-I-6/VB-I-10 + `verify_M-38a.sh` | — | architect | ✅ DONE |
 | 4 | `CvdSession`+`cvd: BTreeMap<session_id, CvdSession>`; заменить плоские `bucket_delta`/`cvd_session_base:i64` | red_gateway_cvd_session + window | engine-dev | ⏳ OPEN |
 | 5 | Unified `session_max_time_s` (убрать дубль `vp_session_max_time_s`), общий для VP+CVD эвикции | red_gateway_window (VP POC регрессия) | engine-dev | ⏳ OPEN |
 | 6 | `evict_window_state` per-session: фолд внутрисессионного префикса в base(sid); whole-session drop | red_gateway_window (2-session) | engine-dev | ⏳ OPEN |
 | 7 | `Reducer::finish` per-session running (reset на границе) + форма `cvd_session_base: Vec<(session_id,base)>` | red_gateway_cvd_session | engine-dev | ⏳ OPEN |
 | 8 | `merge_cvd_running`/`evict_series_bundle_under_window` per-session (byte-identity live==replay через полночь) | red_gateway_window (overlap-multistep) | engine-dev | ⏳ OPEN |
-| 9 | bump `GATEWAY_SCHEMA_VERSION` 6→7 + doc-комментарий (семантика CVD + форма cvd_session_base) | red_gateway_export_v2 | engine-dev | ⏳ OPEN |
+| 9 | bump `GATEWAY_SCHEMA_VERSION` 6→7 + doc-комментарий (семантика CVD + форма cvd_session_base) | red_gateway_schema_v7 (константа/Snapshot/Frame ==7; C-028 K1); red_gateway_export_v2 (v1-аддитивность как регрессия) | engine-dev | ⏳ OPEN |
 
 **Анти-плацебо (задачи 1-2, ПРОВЕРЕНО фактически):** `red_gateway_cvd_session` — 4 runtime-FAIL на
 текущем single-running CVD (S2 несёт running S1 через 00:00: 13e8 vs 3e8, 58e8 vs −7e8, 7e8 vs −3e8,
 7e8 vs −4e8). `red_gateway_window` — compile-RED формы v7 (`cvd_session_base: &i64` vs `&[(i64,i64)]`).
 testing.md чек-лист: п.1 асимметрия (buy-heavy S1 / sell-only S2), п.2 множественность (2+ филла в
 бакете границы), п.3 отсутствие (S2 не наследует S1), п.4 границы (переход 00:00 UTC), п.5 прод-масштаб
-— N/A (CVD чистый compute, ресурс-оракул — M-38b), п.7 vantage (overlap-курсор у границы + multistep-fold).
+— N/A (CVD чистый compute, ресурс-оракул — M-38b), п.7 vantage (C-028 K2: overlap-курсор У ГРАНИЦЫ
+d2+35s → snapshot(C) = хвост S1 + голова S2, финальное окно целиком в S2 → whole-drop S1 на пути
+bundle-merge, ЯВНЫЕ pre/post-asserts вокруг multistep-fold'а).
+
+**C-028 K1 (schema-оракул RED, ПРОВЕРЕНО фактически):** `red_gateway_schema_v7` — 3 runtime-FAIL на
+текущем `GATEWAY_SCHEMA_VERSION=6` (константа 6!=7, `Snapshot.schema_version` 6!=7, `Frame.schema_version`
+[6]!=7; frames non-empty). Тавтологичный `snap.schema_version==GATEWAY_SCHEMA_VERSION` из
+`red_gateway_export_v2` больше НЕ named-гейт bump'а (остаётся как v1-аддитивность/провенанс регрессия).
 
 ## Contract impact
 
@@ -109,8 +117,9 @@ testing.md чек-лист: п.1 асимметрия (buy-heavy S1 / sell-only 
 ## Acceptance
 
 `bash scripts/verify_M-38a.sh; echo exit=$?` → `VERDICT: PASS`. Покрывает: fmt + build --workspace +
-clippy --all-targets + red_gateway_cvd_session (reset) + red_gateway_window (форма v7/2-session/overlap)
-+ red_gateway_export_v2 (schema v7) + регрессия gateway (VP/VWAP/heatmap/epoch/live==replay) + journal
+clippy --all-targets + red_gateway_cvd_session (reset) + red_gateway_window (форма v7/2-session/overlap
+у границы) + red_gateway_schema_v7 (константа/Snapshot/Frame ==7, C-028 K1) + red_gateway_export_v2
+(v1-аддитивность регрессия) + регрессия gateway (VP/VWAP/heatmap/epoch/live==replay) + journal
 + gateway-serve (v7 passthrough).
 
 **§8 E2E (reviewer, деплой-гейт):** валидный JWT → Snapshot **v7** СТРОИТСЯ на прод-журнале VPS;
