@@ -1272,9 +1272,10 @@ fn merge_bubbles(existing: &[BubbleCell], incoming: &[BubbleCell]) -> Vec<Bubble
 ///    пришедшего frame'а (heatmap в frame.delta уже правильно ограничен своим reducer'ом).
 /// 5. `volume_bubbles` — per (time_s, price).
 /// 6. `cumulative_delta` — удаляем записи `< lo_time_s`; CVD running-base (`cvd_session_base`)
-///    инкрементируем на сумму эвиктнутых delta, оставшиеся значения сдвигаем на тот же shift
-///    (running-сумма при эвикции префикса уменьшается на эту сумму → компенсируем сдвигом,
-///    чтобы конечные значения совпали с unbounded-версией).
+///    инкрементируем на сумму эвиктнутых delta. Значения АБСОЛЮТНЫ (`Reducer::finish` уже
+///    прибавил `cvd_session_base` к каждому), эвикция префикса их НЕ меняет (только базу).
+///    `merge_cvd_running` идемпотентен на абсолютных значениях с корректной базой (первый
+///    удержанный: `d = value − cvd_session_base = δ`).
 /// 7. `volume_profile` — VP whole-session эвикция выполнена на стороне reducer'а (см.
 ///    `Reducer::evict_window_state`). При fold'е bins восстанавливаются по session_id через
 ///    `merge_volume_profile`.
@@ -1300,15 +1301,16 @@ fn evict_series_bundle_under_window(series: &mut SeriesBundle, lo_time_s: i64) {
     // volume_bubbles
     series.volume_bubbles.retain(|c| c.time_s >= lo_time_s);
 
-    // cumulative_delta: эвикт + сдвиг + инкремент cvd_session_base.
-    // До эвикции: value[t] = old_base + running(retained up to t), где running стартует с 0
-    // (на удержанных бакетах) — `Reducer::finish` прибавляет cvd_session_base ПОСЛЕ running
-    // (см. конец `finish()`).
-    // Эвиктируем записи < lo_time_s. Сумма эвиктнутых delta вычисляется через
-    // diff: delta[t] = value[t] - prev; prev = value[t_предыдущего]; first prev = old_base.
-    // После эвикции значения сдвигаются на +evicted_sum и cvd_session_base += evicted_sum,
-    // чтобы на КАЖДОМ удержанном бакете новый running(retained, начиная с prev=new_base)
-    // восстановил сумму сдвинутую обратно.
+    // cumulative_delta: эвикт + инкремент cvd_session_base. НЕ сдвигать значения —
+    // они АБСОЛЮТНЫ (`Reducer::finish` уже добавил cvd_session_base к каждому), эвикция
+    // префикса их не меняет (только базу). Сумма эвиктнутых delta идёт в cvd_session_base,
+    // чтобы следующая merge_cvd_running корректно восстановила running (первый удержанный
+    // d = value − cvd_session_base = δ, и т.д. — идемпотентно).
+    //
+    // TD-042: предыдущая версия добавляла +evicted_sum к каждому удержанному значению.
+    // Под пересекающимся окном `snapshot(C) + frames_since(C..) ≢ snapshot(LATEST)`:
+    // existing уже абсолютен, +evicted_sum сдвигал его вверх на сумму, которая в `full` НЕ
+    // была сдвинута (Reducer не сдвигает — корректен). Сдвиг КОПИЛСЯ по apply.
     let mut evicted_sum: i64 = 0;
     let mut prev: i64 = series.cvd_session_base;
     series.cumulative_delta.retain_mut(|&mut (t, ref mut v)| {
@@ -1323,21 +1325,20 @@ fn evict_series_bundle_under_window(series: &mut SeriesBundle, lo_time_s: i64) {
         }
     });
     if evicted_sum != 0 {
-        for (_, v) in series.cumulative_delta.iter_mut() {
-            *v += evicted_sum;
-        }
+        // Только базу: удержанные значения оставляем абсолютными.
         series.cvd_session_base += evicted_sum;
     }
 }
 
 /// M-37: CVD running-base merge. После `evict_series_bundle_under_window` existing имеет
-/// `cvd_session_base_e` (включая инкремент от только что эвиктнутых бакетов) и значения,
-/// сдвинутые на тот же инкремент. Incoming имеет `cvd_session_base_i` и свои значения
-/// (`cvd_session_base_i` + running(retained_i)).
+/// `cvd_session_base_e` (включая инкремент от только что эвиктнутых бакетов) и АБСОЛЮТНЫЕ
+/// значения (никакого сдвига удержанных — TD-042, dispatch: `finish` уже добавил
+/// `cvd_session_base` к каждому). Incoming имеет `cvd_session_base_i` и свои
+/// абсолютные значения (`cvd_session_base_i` + running(retained_i)).
 ///
 /// **Алгоритм:**
 /// 1. Дельты existing извлекаем с «previous» = cvd_session_base_e (тогда первая дельта
-///    корректна, а не «весь prefix»).
+///    корректна: `value[первый_удержанный] − cvd_session_base_e = δ`).
 /// 2. Дельты incoming извлекаем с «previous» = cvd_session_base_i.
 /// 3. Суммируем дельты по time_s (один time_s — одна дельта с каждой стороны; union).
 /// 4. Ре-дериваем running с new_base = cvd_session_base_e + cvd_session_base_i.

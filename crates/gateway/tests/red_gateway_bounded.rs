@@ -14,11 +14,13 @@
 //! бакетов → бюджет/size-independence нарушены. Деградированный вход (testing.md): L2Snapshot +
 //! Trade на КАЖДЫЙ бакет → давятся ВСЕ per-bucket серии (heatmap/ohlcv/depth/cvd/vp/bubbles).
 //!
-//! COMPILE-RED сейчас: поле `Selector.window_ms` ещё НЕ существует → файл не компилируется, пока
-//! engine-dev (task #1) не добавит его. GREEN после эвикции бакетов (task #2).
+//! Статус: GREEN против M-37-impl (Selector.window_ms реализован). TD-040: замер сериализован
+//! `MEASURE_LOCK` + размер сегмента КОНСТАНТЕН → гейт мерит инвариант, не планировщик/окружение
+//! (counting-allocator процесс-глобален; параллельные тесты загрязняли PEAK: dev PASS / CI FAIL).
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+use std::sync::Mutex;
 
 use contracts::{to_fixed, DataSource, EventKind, Level, MdPayload, Side, Venue};
 use gateway::{Cursor, Selector};
@@ -45,6 +47,12 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static GA: Counting = Counting;
 
+/// TD-040: counting-allocator `CUR/PEAK` — ПРОЦЕСС-ГЛОБАЛЬНЫЙ. cargo гоняет тесты одного бинаря
+/// ПАРАЛЛЕЛЬНО → одновременный `peak_delta` в двух тестах видит чужие аллокации → недетерминизм
+/// (dev PASS / CI FAIL). Оба замеряющих теста берут этот лок на ВСЁ время → замер отражает только
+/// СВОИ аллокации (мерим инвариант, не планировщик — testing.md §Целостность гейта п.2).
+static MEASURE_LOCK: Mutex<()> = Mutex::new(());
+
 fn peak_delta<R>(f: impl FnOnce() -> R) -> (R, usize) {
     let base = CUR.load(SeqCst);
     PEAK.store(base, SeqCst);
@@ -53,11 +61,18 @@ fn peak_delta<R>(f: impl FnOnce() -> R) -> (R, usize) {
 }
 
 const THRESHOLD: usize = 8 * 1024 * 1024;
-const INDEP_DELTA: usize = 1024 * 1024;
+// Допуск size-независимости. TD-040: сегменты КОНСТАНТНОГО размера (SEG_BYTES), поэтому рост между
+// SMALL/BIG отражает ТОЛЬКО число сегментов (стрим vs аккумуляция), не размер сегмента. 2 MiB
+// поглощает шум интерливинга аллокаций dev↔CI, но << роста при материализации (МиБ × число сегментов).
+const INDEP_DELTA: usize = 2 * 1024 * 1024;
 
-// ---- Свойство 1: stream working-set (single-bucket, TD-011) ----
-const SMALL: u64 = 16 * 1024 * 1024;
-const BIG: u64 = 64 * 1024 * 1024;
+// ---- Свойство 1: stream working-set (single-bucket, TD-011/TD-040) ----
+// РАЗМЕР СЕГМЕНТА КОНСТАНТЕН — журнал растёт ЧИСЛОМ сегментов, не размером сегмента. Иначе
+// per-segment буфер коррелирует с размером журнала → гейт мерит ОКРУЖЕНИЕ (allocator-интерливинг),
+// а не инвариант (testing.md §Целостность гейта п.2; инцидент TD-040: dev PASS / CI FAIL на 1 MiB-дельте).
+const SEG_BYTES: u64 = 1024 * 1024;
+const SMALL: u64 = 16 * 1024 * 1024; // 16 сегментов
+const BIG: u64 = 64 * 1024 * 1024; // 64 сегмента (4× count при том же размере сегмента)
 const FIXED_TS: i64 = 1_752_000_000_000;
 
 fn book(base_bid: i64, base_ask: i64, jitter: i64, ts: i64) -> EventKind {
@@ -83,7 +98,7 @@ fn book(base_bid: i64, base_ask: i64, jitter: i64, ts: i64) -> EventKind {
 fn build_single_bucket(target: u64) -> (tempfile::TempDir, u64) {
     let dir = tempfile::tempdir().expect("tempdir");
     let cfg = WriterConfig {
-        max_segment_bytes: target / 4,
+        max_segment_bytes: SEG_BYTES, // КОНСТАНТА (TD-040): журнал растёт числом сегментов
         min_free_bytes: 0,
         source: DataSource::OwnCapture,
         provenance: "test".to_string(),
@@ -123,6 +138,7 @@ fn sel_unbounded() -> Selector {
 #[test]
 fn snapshot_stream_working_set_bounded() {
     // Свойство 1: единый бакет → выход O(1) → замер = рабочее множество СТРИМА (ловит read_all).
+    let _measure = MEASURE_LOCK.lock().unwrap(); // сериализация замера (TD-040)
     let (small, small_n) = build_single_bucket(SMALL);
     let (big, big_n) = build_single_bucket(BIG);
     assert!(
@@ -130,13 +146,13 @@ fn snapshot_stream_working_set_bounded() {
         "предусловие: {small_n} < {big_n}"
     );
 
-    let first_seg = journal::list_segments(big.path()).expect("segments")[0]
-        .path
-        .clone();
-    let (_, peak_full) = peak_delta(|| std::fs::read(&first_seg).expect("read"));
+    // Анти-плацебо контраст: read_all МАТЕРИАЛИЗУЕТ весь журнал (peak ≥ размер журнала) — доказывает,
+    // что бюджет СПОСОБЕН поймать материализацию. stream ниже обязан быть НАМНОГО меньше. Контраст
+    // ~64 MiB vs <THRESHOLD устойчив к MiB-шуму интерливинга (мерим инвариант, не окружение — TD-040).
+    let (_, peak_readall) = peak_delta(|| journal::read_all(big.path()).expect("read_all"));
     assert!(
-        peak_full > THRESHOLD / 2,
-        "контроль: чтение сегмента слишком мало ({peak_full} B)"
+        peak_readall > THRESHOLD,
+        "контроль: read_all журнала дал peak {peak_readall} ≤ {THRESHOLD} — увеличь фикстуру"
     );
 
     let s = sel_unbounded();
@@ -160,10 +176,12 @@ fn snapshot_stream_working_set_bounded() {
         peak_big < THRESHOLD,
         "snapshot выделил {peak_big} B — журнал грузится целиком (read_all, TD-011)"
     );
+    // O(1) по ЧИСЛУ сегментов (стрим держит один reader за раз, не аккумулирует). При том же
+    // размере сегмента 4× сегментов → та же память; иначе stream копит историю (read_all-класс).
     let growth = peak_big.saturating_sub(peak_small);
     assert!(
         growth < INDEP_DELTA,
-        "память растёт с РАЗМЕРОМ журнала (+{growth} B) — не O(1)"
+        "память растёт с числом сегментов журнала (+{growth} B) — stream аккумулирует, не O(1)"
     );
 }
 
@@ -222,6 +240,7 @@ fn sel_windowed() -> Selector {
 
 #[test]
 fn snapshot_memory_bounded_by_window_not_history() {
+    let _measure = MEASURE_LOCK.lock().unwrap(); // сериализация замера (TD-040)
     let few = build_buckets(FEW_BUCKETS);
     let many = build_buckets(MANY_BUCKETS);
     let s = sel_windowed();

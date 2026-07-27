@@ -70,21 +70,46 @@ L2Snapshot каждую 1с (`EMIT_PERIOD=1s`, venue-binance/src/lib.rs:35) → 
 
 | # | Задача | Оракул | Роль | Статус |
 |---|---|---|---|---|
-| 1 | `Selector.window_ms: Option<i64>` (None=offline unbounded; Some(W)=live cockpit). Окно от `at` | компилируется + red_gateway_window | engine-dev | ⏳ |
-| 2 | Reducer: эвикт бакет-оконного состояния (heatmap/ohlcv/bucket_delta/bubbles/depth.values) для бакетов `< at−W` | red_gateway_bounded (memory-budget) | engine-dev | ⏳ |
-| 3 | CVD running-база (session) — эвикция не сдвигает кривую | red_gateway_window (CVD база) | engine-dev | ⏳ |
-| 4 | VP эвикт ТОЛЬКО целыми прошлыми сессиями; текущая целиком | red_gateway_window (VP POC) | engine-dev | ⏳ |
+| 1 | `Selector.window_ms: Option<i64>` (None=offline unbounded; Some(W)=live cockpit). Окно от `at` | компилируется + red_gateway_window | engine-dev | ✅ DONE (impl принят reviewer) |
+| 2 | Reducer: эвикт бакет-оконного состояния (heatmap/ohlcv/bucket_delta/bubbles/depth.values) для бакетов `< at−W` | red_gateway_bounded (memory-budget) | engine-dev | ✅ DONE (impl принят reviewer) |
+| 3 | CVD running-база (session) — эвикция не сдвигает кривую | red_gateway_window (CVD база) | engine-dev | ✅ DONE (impl принят reviewer) |
+| 4 | VP эвикт ТОЛЬКО целыми прошлыми сессиями; текущая целиком | red_gateway_window (VP POC) | engine-dev | ✅ DONE (impl принят reviewer) |
 | 5 | (RED) Переписать слепой `red_gateway_bounded`: multi-bucket + multi-day + counting-allocator memory-budget. Анти-плацебо: падает на unbounded-реализации | — | architect | ✅ DONE (compile-RED на `window_ms`) |
 | 6 | (RED) `red_gateway_window`: CVD-база переживает эвикцию + VP whole-session + windowed live==replay | — | architect | ✅ DONE (compile-RED на `window_ms`) |
-| 7a | (wiring, TD-020) Вынести сборку config из `main.rs` в тестируемую `serve_config_from_env(get: impl Fn(&str)->Option<String>) -> Result<ServeConfig, String>` (lib.rs); `main` — тонкий вызыватель `\|k\| std::env::var(k).ok()`. Читать `GATEWAY_WINDOW_MS` (Option<i64>, unset/пусто→None) | red_serve_window_wiring | engine-dev | ⏳ |
-| 7b | `build_selector` + арг `window_ms: Option<i64>` → `Selector.window_ms` | red_serve_window_wiring | engine-dev | ⏳ |
-| 7c | `docker-compose.yml`: gateway-serve env `GATEWAY_WINDOW_MS=60000` (иначе прод дефолтит в None=unbounded → §8 снова OOM) | §8 E2E | engine-dev | ⏳ |
+| 7a | (wiring, TD-020) Вынести сборку config из `main.rs` в тестируемую `serve_config_from_env(get: impl Fn(&str)->Option<String>) -> Result<ServeConfig, String>` (lib.rs); `main` — тонкий вызыватель `\|k\| std::env::var(k).ok()`. Читать `GATEWAY_WINDOW_MS` (Option<i64>, unset/пусто→None) | red_serve_window_wiring | engine-dev | ✅ DONE (impl принят reviewer) |
+| 7b | `build_selector` + арг `window_ms: Option<i64>` → `Selector.window_ms` | red_serve_window_wiring | engine-dev | ✅ DONE (impl принят reviewer) |
+| 7c | `docker-compose.yml`: gateway-serve env `GATEWAY_WINDOW_MS=60000` (иначе прод дефолтит в None=unbounded → §8 снова OOM) | §8 E2E | engine-dev | ✅ DONE (impl принят reviewer) |
 | 7d | (RED) `red_serve_window_wiring`: env→`Selector.window_ms` + `build_selector` проброс | — | architect | ✅ DONE (compile-RED) |
+| 8 | (TD-042) `evict_series_bundle_under_window`: НЕ сдвигать удержанные `cumulative_delta` на `+evicted_sum` — значения АБСОЛЮТНЫ, эвикция префикса их не меняет (только `cvd_session_base += evicted_sum`). Сверить, что `merge_cvd_running` даёт full-равенство | `windowed_live_eq_replay_overlap_multistep` | engine-dev | ⏳ OPEN |
+| 9 | (RED) overlap+multistep оракул TD-042 (C у конца → окна пересекаются; fold батчами → накопление) | — | architect | ✅ DONE (анти-плацебо: падал на c5d9ab8, сдвиг +1.1e9) |
 
 **Анти-плацебо (задача 5 — критично):** оракул ОБЯЗАН содержать десятки-сотни бакетов на много
 UTC-дней (не один бакет), чтобы давить рост per-bucket состояния. Против текущего кода — превышение
 memory-бюджета (OOM-класс). Деградированный вход (testing.md): смесь сессий, односторонние апдейты
 книги, много разных цен в bubbles/VP.
+
+## §TD-042 — CVD prefix-shift под пересекающимся окном (reviewer-находка, задача #8)
+
+**Симптом:** под окном `snapshot(C) + frames_since(C..) ≢ snapshot(LATEST)`. `evict_series_bundle_under_window`
+при эвикции префикса добавляет сумму эвиктнутых delta к КАЖДОМУ удержанному `cumulative_delta` И
+инкрементирует `cvd_session_base`. Но значения `cumulative_delta` АБСОЛЮТНЫ (`Reducer::finish` уже
+добавил `cvd_session_base` к каждому) → сдвиг их портит. Ошибка КОПИТСЯ по apply. В штатном live
+(push-loop каждые ~сотни мс) окна пересекаются ВСЕГДА → это норма, не край.
+
+**Фикс (дизайн architect, impl engine-dev):** в `evict_series_bundle_under_window` УБРАТЬ сдвиг
+удержанных значений (`*v += evicted_sum`). Оставить: удаление записей `< lo_time_s` + `cvd_session_base
++= evicted_sum`. Значения остаются абсолютными; `merge_cvd_running` идемпотентен на абсолютных
+значениях с корректной базой (первый удержанный: `d = value − cvd_session_base = δ`), поэтому
+восстановит full-равенство. Сверить оракулом (задача #9).
+
+**Почему пропустил прошлый оракул:** `windowed_live_eq_replay` ставил C в СЕРЕДИНУ (окна не
+пересекаются → existing эвиктится целиком → сдвиг по ПУСТОМУ списку). Класс «идеальная фикстура» —
+ТРЕТИЙ раз подряд (M-07 equity, M-08 симметричный дифф). Новый оракол #9: C у конца + multi-step.
+
+**⚠ Явно ОТЛОЖЕНО (не silent skip):** multi-session CVD под окном (окно, пересекающее 00:00 UTC).
+`Reducer::finish` несёт пометку, что per-session ledger НЕ покрыт — текущий CVD single-running под
+окном. Ортогонально TD-042 (prefix-shift); кокпит-окна суб-сессионны (60s). Завести отдельный TD
+(reviewer) — НЕ смешивать с TD-042. Оракол multi-session-CVD-window — предусловие того будущего TD.
 
 ## Contract impact
 
