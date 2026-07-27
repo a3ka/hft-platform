@@ -48,7 +48,7 @@ fn build() -> tempfile::TempDir {
                 MdPayload::Trade {
                     price: to_fixed(65_000.0),
                     size: to_fixed(1.0),
-                    side: [Side::Buy, Side::Sell][(i % 2) as usize],
+                    side: if i % 2 == 0 { Side::Buy } else { Side::Sell },
                     ts_exch_ms: ts + 5,
                 },
             ))
@@ -77,7 +77,6 @@ fn sel() -> Selector {
         symbol: "BTCUSDT".to_string(),
         timeframe_ms: 1_000,
         bands: vec![0.001],
-        window_ms: None,
     }
 }
 

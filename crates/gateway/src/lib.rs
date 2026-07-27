@@ -40,51 +40,18 @@ pub const fn utc_session_id(ts_exch_ms: i64) -> i64 {
     ts_exch_ms.div_euclid(86_400_000)
 }
 
-/// Что наблюдаем: площадка/символ/таймфрейм + depth-полосы (доли от mid, напр. `0.001` = 0.1%) +
-/// **bounded-window** (M-37, VB-I-10, TD-039).
-///
-/// `window_ms` — ширина скользящего окна `[at−W, at]` для бакет-оконного состояния
-/// (`heatmap_buckets` / `ohlcv` / `bucket_delta` / `bubbles` / `depth[].values` /
-/// эмитируемые точки vwap/cvd per-бакет):
-/// - `None` — offline-режим (read-side инструменты, `research-cli`, replay-tutor): свёртка
-///   хранит все бакеты истории (unbounded);
-/// - `Some(W)` — live-cockpit (gateway-serve WS под продом): эвиктим бакеты `time_s < at − W`
-///   ПОСЛЕ их вклада в сессионно-скалярные агрегаты (VWAP all-time, CVD session running-base,
-///   VP текущая сессия целиком).
-///
-/// Окно привязано к КУРСОРУ `at`, не к wall-clock — одно правило применяется в `full` /
-/// `snapshot(C)` / свёртке кадров (иначе ломается VB-I-2 live==replay под нагрузкой).
+/// Что наблюдаем: площадка/символ/таймфрейм + depth-полосы (доли от mid, напр. `0.001` = 0.1%).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Selector {
     pub venue: Venue,
     pub symbol: String,
     pub timeframe_ms: i64,
     pub bands: Vec<f64>,
-    /// M-37 bounded-window: `None` = offline unbounded, `Some(W)` = live bounded `[at−W, at]`.
-    /// `#[serde(default)]` — обратная совместимость: v6-снапшоты без поля десериализуются как
-    /// unbounded (offline-режим). См. `VB-I-10` / TD-039 / `red_gateway_window.rs`.
-    #[serde(default)]
-    pub window_ms: Option<i64>,
 }
 
 impl Selector {
     fn matches(&self, md: &MdEvent) -> bool {
         md.venue == self.venue && md.symbol == self.symbol
-    }
-
-    /// M-37 task #1: нижняя граница (inclusive) окна `[at−W, at]` в единицах `time_s`
-    /// (= `ts_ms / 1000`). `window_ms = None` → `None` (unbounded, ничего не эвиктим).
-    /// `at_ms` — текущий курсор в миллисекундах (заголовок бакета `at * timeframe_ms`).
-    pub fn window_lo_time_s(&self, at_ms: i64) -> Option<i64> {
-        let w = self.window_ms?;
-        if w <= 0 {
-            return None;
-        }
-        let timeframe_ms = self.timeframe_ms.max(1);
-        let lo_ms = at_ms - w;
-        // bucket_time_s = bucket_ms / 1000, где bucket_ms = ts_ms.div_euclid(timeframe_ms) * timeframe_ms
-        let lo_bucket_ms = lo_ms.div_euclid(timeframe_ms) * timeframe_ms;
-        Some(lo_bucket_ms / 1_000)
     }
 }
 
@@ -198,14 +165,6 @@ pub struct SeriesBundle {
     pub ohlcv: Vec<OhlcvRow>,
     /// Running cumulative delta `(time_s, знаковая агрессия до конца бакета)` (export v1 §3.2).
     pub cumulative_delta: Vec<(i64, i64)>,
-    /// M-37 task #3: «сдвиг» running-суммы CVD — сумма знаковых delta эвиктнутых бакетов.
-    /// Используется merge-логикой `Snapshot::apply` для корректной свёртки CVD при fold'е:
-    /// иначе при эвикции префикса первое значение `cumulative_delta` интерпретировалось бы как
-    /// «весь prefix», и running-сумма ломалась. `#[serde(default)]` — обратная совместимость с
-    /// v6-снапшотами без поля (offline unbounded, base = 0). См. `VB-I-10` /
-    /// `red_gateway_window::cvd_base_survives_window_eviction`.
-    #[serde(default)]
-    pub cvd_session_base: i64,
     pub depth_series: Vec<DepthRow>,
     /// All-time VWAP `(time_s, price ×1e8)`, cumulative `Σ(price·size)/Σ(size)` от старта
     /// курсора (M-36, VB-I-6 reversal). БЕЗ reset на 00:00 UTC — `sum_pv/sum_v` копятся
@@ -245,23 +204,15 @@ pub struct Frame {
     pub from: Cursor,
     pub to: Cursor,
     pub delta: SeriesBundle,
-    /// M-37: timestamp (ms) последнего event в этом кадре (= «at» для финального окна при merge).
-    /// `Snapshot::apply` использует его для эвикции existing-бакетов вне `[at−W, at]` и
-    /// пересчёта `cvd_session_base` (без `at_ms` merge не знал бы финального окна и не мог
-    /// восстановить `snapshot(C) + frames_since(C..) ≡ snapshot(LATEST)` под окном).
-    /// `#[serde(default)]` — обратная совместимость с v6-кадрами без поля (offline unbounded).
-    #[serde(default)]
-    pub at_ms: i64,
 }
 
 impl Frame {
-    fn versioned(from: Cursor, to: Cursor, delta: SeriesBundle, at_ms: i64) -> Self {
+    fn versioned(from: Cursor, to: Cursor, delta: SeriesBundle) -> Self {
         Self {
             schema_version: GATEWAY_SCHEMA_VERSION,
             from,
             to,
             delta,
-            at_ms,
         }
     }
 }
@@ -456,18 +407,10 @@ struct Reducer {
     selector: Selector,
     ohlcv: BTreeMap<i64, OhlcvAcc>,
     bucket_delta: BTreeMap<i64, i64>,
-    /// M-37 task #3: сумма знаковых delta эвиктнутых бакетов — база для CVD running-суммы
-    /// (при fold'е в `Snapshot::apply` инкрементнутый cvd_session_base даёт running-значения
-    /// на удержанных бакетах, идентичные unbounded-свёртке).
-    cvd_session_base: i64,
     vwap: VwapAcc,
     depth: Vec<DepthAcc>,
     /// M-24: per-session Volume Profile accumulator (price→объём).
     vp: VolumeProfileAcc,
-    /// M-37 task #4: `session_id → max(bucket_time_s)` для whole-session эвикции VP. Обновляется
-    /// в `apply_vp` на КАЖДОЙ сделке (нужен для решения «эвиктить ли сессию целиком» —
-    /// сессия с max внутри окна удерживается, сессия полностью вне окна удаляется).
-    vp_session_max_time_s: BTreeMap<i64, i64>,
     /// M-23: текущая L2Delta-реконструированная книга (M-29 `apply_delta` + `apply_snapshot`).
     /// Owns the live book для heatmap/cob. Per-bucket snapshot книги — `heatmap_buckets`.
     book: book::OrderBook,
@@ -477,10 +420,6 @@ struct Reducer {
     /// M-23: Volume Bubbles accumulator `(time_s, price_e8) → (buy_vol_e8, sell_vol_e8)`.
     /// Цены НЕ выдумываются — ключи создаются ТОЛЬКО в `Trade` (HM-I-4).
     bubbles: BTreeMap<(i64, i64), (i64, i64)>,
-    /// M-37: timestamp (ms) последнего event, обработанного reducer'ом. Используется в `finish()`
-    /// как «at» для окна и попадает в `Frame.at_ms` (нужен `apply()` для эвикции existing под
-    /// финальное окно при fold'е кадров live==replay под нагрузкой).
-    at_ms: i64,
 }
 
 /// M-23: per-bucket book snapshot для heatmap. Хранит bids/asks отдельно (Vec<(price,size)>) +
@@ -520,89 +459,12 @@ impl Reducer {
             selector: selector.clone(),
             ohlcv: BTreeMap::new(),
             bucket_delta: BTreeMap::new(),
-            // M-37 task #3: CVD running-base стартует с 0 (эвиктнутых дельт ещё нет). При эвикции
-            // `evict_window_state` инкрементирует на сумму эвиктнутых delta (`accumulate`, не
-            // «set to N»), так что fold нескольких кадров подряд корректно кумулятивен.
-            cvd_session_base: 0,
             vwap: VwapAcc::default(),
             depth: Vec::new(),
             vp: VolumeProfileAcc::default(),
-            // M-37 task #4: per-session max(bucket_time_s) для whole-session VP эвикции.
-            vp_session_max_time_s: BTreeMap::new(),
             book: book::OrderBook::new(),
             heatmap_buckets: BTreeMap::new(),
             bubbles: BTreeMap::new(),
-            // M-37: timestamp (ms) последнего event; финальное «at» для `Frame.at_ms` и
-            // для вычисления нижней границы окна `[at-W, at]` в `evict_window_state`.
-            at_ms: 0,
-        }
-    }
-
-    /// M-37 task #2: эвиктировать бакет-оконное состояние для `time_s < lo_time_s`.
-    /// Вызывается на КАЖДОМ event (после обновления `at_ms`) — давление памяти O(окно) вместо
-    /// O(история) (VB-I-10, TD-039).
-    ///
-    /// **Сессионно-скалярное** (CVD running-base через `cvd_session_base`, VWAP sum_pv/sum_v
-    /// внутри `VwapAcc`) НЕ эвиктируется — они переживают bucket-эвикцию (C-027 K3
-    /// `red_gateway_window::cvd_base_survives_window_eviction`).
-    ///
-    /// **VP whole-session:** эвиктируем ТОЛЬКО целыми ПРОШЛЫМИ сессиями (C-027 K3 #2
-    /// `red_gateway_window::vp_current_session_whole_not_bucket_windowed`). Текущая сессия
-    /// удерживается целиком, даже если её ранние бакеты вне окна — иначе POC/VAH/VAL текущей
-    /// сессии порежется (`vp_current_session_whole_not_bucket_windowed`).
-    fn evict_window_state(&mut self, lo_time_s: i64) {
-        if lo_time_s <= 0 {
-            return; // lo_time_s ≤ 0 → окно растянуто в прошлое за пределы возможных бакетов
-                    // (все time_s ≥ 0), ничего реально не эвиктим.
-        }
-
-        // bucket_delta: эвикт + перенос суммы в cvd_session_base (CVD running-base переживает).
-        // accumulate (не set to N) — нужен для fold-корректности: кадр с cvd_session_base=I
-        // при apply() складывает свою базу I в existing-базу.
-        let mut evicted_delta_sum: i64 = 0;
-        self.bucket_delta.retain(|&t, &mut d| {
-            if t < lo_time_s {
-                evicted_delta_sum += d;
-                false
-            } else {
-                true
-            }
-        });
-        self.cvd_session_base += evicted_delta_sum;
-
-        // ohlcv: бакет целостный (open/high/low/close/volume на этот бакет) — удаляем целиком.
-        self.ohlcv.retain(|&t, _| t >= lo_time_s);
-
-        // depth[].values: per-side×band серия — эвикт по time_s.
-        for row in &mut self.depth {
-            row.values.retain(|&t, _| t >= lo_time_s);
-        }
-
-        // vwap.values: эмитированные per-бакет точки VWAP. sum_pv/sum_v СОХРАНЯЮТСЯ в
-        // `VwapAcc` (all-time, M-36) и НЕ здесь — здесь только эвикт отображённых точек,
-        // чтобы SeriesBundle.vwap был бакет-оконным.
-        self.vwap.values.retain(|&t, _| t >= lo_time_s);
-
-        // heatmap_buckets: per-бакет снимок книги — close-семантика, после эвикции пересоберётся
-        // из пришедших frame'ов (heatmap в frame.delta уже ограничен своим reducer'ом).
-        self.heatmap_buckets.retain(|&t, _| t >= lo_time_s);
-
-        // bubbles: ключ `(time_s, price_e8)` — эвикт по time_s.
-        self.bubbles.retain(|&(t, _), _| t >= lo_time_s);
-
-        // VP whole-session (M-37 task #4): эвикт ТОЛЬКО целыми прошлыми сессиями. Текущая
-        // сессия (max_bucket_time_s ≥ lo_time_s) удерживается целиком (POC/VAH/VAL не
-        // порежутся). Условие эвикции = «max этой сессии < lo_time_s» (сессия полностью вне
-        // окна = её последний бакет уже эвиктнут).
-        let to_evict: Vec<i64> = self
-            .vp_session_max_time_s
-            .iter()
-            .filter(|(_, &max_t)| max_t < lo_time_s)
-            .map(|(&sid, _)| sid)
-            .collect();
-        for sid in to_evict {
-            self.vp.bins.remove(&sid);
-            self.vp_session_max_time_s.remove(&sid);
         }
     }
 
@@ -663,20 +525,6 @@ impl Reducer {
             return;
         };
         self.vp.apply_trade(*ts_exch_ms, *price, *size);
-        // M-37 task #4: per-session max(bucket_time_s) для whole-session VP эвикции
-        // (см. `evict_window_state`). VP хранится per-сессия, не per-бакет → обновляем max на
-        // каждой сделке, чтобы `evict_window_state` мог решить «целиком ли прошлая сессия вне
-        // окна [at-W, at]».
-        if let Some(bucket_time_s) = self.bucket_time_s(*ts_exch_ms) {
-            let sid = utc_session_id(*ts_exch_ms);
-            let entry = self
-                .vp_session_max_time_s
-                .entry(sid)
-                .or_insert(bucket_time_s);
-            if bucket_time_s > *entry {
-                *entry = bucket_time_s;
-            }
-        }
     }
 
     /// M-23 HM-I-4: аккумулировать сделку в Volume Bubbles — `(time_s, price_e8) → (buy, sell)`.
@@ -719,18 +567,6 @@ impl Reducer {
         if !self.selector.matches(md) {
             return;
         }
-
-        // M-37 task #1+#2+#3+#4: продвигаем `at_ms` на текущий event (нужен для `Frame.at_ms`
-        // и для расчёта нижней границы окна `[at−W, at]` в `evict_window_state`). Покрывает
-        // ВСЕ типы md-payload'ов (Trade/L2Snapshot/L2Delta) — окно должно двигаться от любых
-        // наблюдений селектора, не только от сделок.
-        let ts_exch_ms = match &md.payload {
-            MdPayload::Trade { ts_exch_ms, .. } => *ts_exch_ms,
-            MdPayload::L2Snapshot { ts_exch_ms, .. } => *ts_exch_ms,
-            MdPayload::L2Delta { ts_exch_ms, .. } => *ts_exch_ms,
-            _ => return,
-        };
-        self.at_ms = ts_exch_ms;
 
         match &md.payload {
             MdPayload::Trade {
@@ -798,14 +634,6 @@ impl Reducer {
             }
             _ => {}
         }
-
-        // M-37 tasks #2-4: после обновления состояния — эвиктировать бакет-оконное состояние
-        // вне `[at−W, at]`. Селектор СВОЙ (reducer держит копию), свежий `at` — в `self.at_ms`.
-        // Если окно не задано (`window_ms = None`) или at меньше окна — `lo_time_s` либо None,
-        // либо ≤ 0 → `evict_window_state` early-return (no-op).
-        if let Some(lo_time_s) = self.selector.window_lo_time_s(self.at_ms) {
-            self.evict_window_state(lo_time_s);
-        }
     }
 
     /// M-23: обновить snapshot-копию книги для бакета (close-семантика). Вызывается на каждом
@@ -833,15 +661,8 @@ impl Reducer {
             })
             .collect();
 
-        // M-37 task #3: CVD running-sum с базой (CVD running-base переживает bucket-эвикцию).
-        // running считается ТОЛЬКО по удержанным бакетам (`bucket_delta` после эвикции), а
-        // `cvd_session_base` прибавляется к КАЖДОМУ значению — так running на удержанных бакетах
-        // == running на этих же бакетах в unbounded-свёртке (разница ровно в сумме эвиктнутых
-        // delta, которая и есть cvd_session_base). Это даёт наивную single-running сумму без
-        // session-reset — для multi-session нужен per-session ledger (см. C-027 K3 #1);
-        // в M-37 тестах multi-session CVD не покрыт, оставлено как есть.
         let mut running = 0_i64;
-        let mut cumulative_delta: Vec<(i64, i64)> = self
+        let cumulative_delta = self
             .bucket_delta
             .into_iter()
             .map(|(time_s, delta)| {
@@ -849,11 +670,6 @@ impl Reducer {
                 (time_s, running)
             })
             .collect();
-        if self.cvd_session_base != 0 {
-            for (_, v) in cumulative_delta.iter_mut() {
-                *v += self.cvd_session_base;
-            }
-        }
 
         let depth_series = self
             .depth
@@ -880,16 +696,9 @@ impl Reducer {
         let (heatmap, cob) = build_heatmap_and_cob(&self.selector, self.heatmap_buckets);
         let volume_bubbles = build_volume_bubbles(self.bubbles);
 
-        // M-37 task #3: export cvd_session_base в SeriesBundle (для merge-логики в `apply()`).
-        // При fold'е existing (с base_e) + incoming (с base_i) их base складываются и
-        // применяются к merged `cumulative_delta` — иначе эвиктнутые prefix'ы обеих сторон
-        // потеряются (см. `merge_cvd_running`).
-        let cvd_session_base = self.cvd_session_base;
-
         SeriesBundle {
             ohlcv,
             cumulative_delta,
-            cvd_session_base,
             depth_series,
             vwap,
             volume_profile,
@@ -897,14 +706,6 @@ impl Reducer {
             cob,
             volume_bubbles,
         }
-    }
-
-    /// M-37: `finish` с возвратом `at_ms` (нужен `Frame.at_ms` для `Snapshot::apply` —
-    /// эвикция existing под финальное окно при fold'е). Разворачивает `self.finish()` +
-    /// достаёт `at_ms` из редицированного состояния.
-    fn finish_with_at(self) -> (SeriesBundle, i64) {
-        let at_ms = self.at_ms;
-        (self.finish(), at_ms)
     }
 }
 
@@ -1080,14 +881,13 @@ fn reduce_event_stream(
     after: Cursor,
     to: Cursor,
     max_events: usize,
-) -> io::Result<(SeriesBundle, Cursor, usize, i64)> {
+) -> io::Result<(SeriesBundle, Cursor, usize)> {
     let mut reducer = Reducer::new(selector);
     let mut cursor = after;
     let mut consumed = 0_usize;
 
     if max_events == 0 || to == Cursor::START {
-        let (series, _at_ms) = reducer.finish_with_at();
-        return Ok((series, cursor, consumed, 0_i64));
+        return Ok((reducer.finish(), cursor, consumed));
     }
 
     for event in stream {
@@ -1104,8 +904,7 @@ fn reduce_event_stream(
         consumed += 1;
     }
 
-    let (series, at_ms) = reducer.finish_with_at();
-    Ok((series, cursor, consumed, at_ms))
+    Ok((reducer.finish(), cursor, consumed))
 }
 
 impl Snapshot {
@@ -1113,29 +912,8 @@ impl Snapshot {
     /// high/low/close/volume, cumulative_delta running, depth close-семантика), НЕ дублируются.
     /// Основа GW-I-4: `snapshot(C) + frames_since(C..C')` == `snapshot(C')`.
     ///
-    /// M-37 (VB-I-10): под окном `[at−W, at]` (`frame.at_ms` = «at») existing эвиктируется ДО
-    /// merge — иначе `snapshot(C) + frames_since(C..) ≠ snapshot(LATEST)`: existing держит
-    /// бакеты `[C−W, C]`, а финальное окно — `[LATEST−W, LATEST]` (C и LATEST не совпадают).
-    /// CVD running-base пересчитывается через `cvd_session_base` (existing += sum эвиктнутых,
-    /// merged = existing + incoming) — CVD-кривая остаётся непрерывной под окном.
+    /// engine-dev (M-22 task #4). Тело-заглушка — RED.
     pub fn apply(&mut self, frame: &Frame) {
-        // 1. Финальное окно: `[frame.at_ms − W, frame.at_ms]` (None = unbounded, ничего не эвиктим).
-        let final_lo_time_s = self.selector.window_lo_time_s(frame.at_ms);
-
-        // 2. M-37 task #2: ЭВИКЦИЯ existing под финальное окно. Этот шаг критичен для
-        // байт-идентичности `snapshot(C) + frames_since(C..) ≡ snapshot(LATEST)` под окном
-        // (без него existing держит бакеты `[C−W, C]`, которые в `snapshot(LATEST)` уже вне
-        // `[LATEST−W, LATEST]`).
-        if let Some(lo) = final_lo_time_s {
-            evict_series_bundle_under_window(&mut self.series, lo);
-        }
-
-        // 3. M-37 task #3: CVD running-base merge. ВАЖНО — existing уже эвиктнут (его
-        // `cvd_session_base` инкрементирован на сумму эвиктнутых delta, значения
-        // `cumulative_delta` сдвинуты). Merge ниже использует новый `cvd_session_base` как
-        // «previous» для обоих сторон.
-        merge_cvd_running(&mut self.series, &frame.delta);
-
         let mut ohlcv: BTreeMap<i64, OhlcvRow> = self
             .series
             .ohlcv
@@ -1156,6 +934,19 @@ impl Snapshot {
             }
         }
         self.series.ohlcv = ohlcv.into_values().collect();
+
+        let mut deltas = cumulative_to_deltas(&self.series.cumulative_delta);
+        for (time_s, delta) in cumulative_to_deltas(&frame.delta.cumulative_delta) {
+            *deltas.entry(time_s).or_default() += delta;
+        }
+        let mut running = 0_i64;
+        self.series.cumulative_delta = deltas
+            .into_iter()
+            .map(|(time_s, delta)| {
+                running += delta;
+                (time_s, running)
+            })
+            .collect();
 
         for incoming in &frame.delta.depth_series {
             let current =
@@ -1262,116 +1053,16 @@ fn merge_bubbles(existing: &[BubbleCell], incoming: &[BubbleCell]) -> Vec<Bubble
         .collect()
 }
 
-/// M-37: эвиктировать бакет-оконное состояние `SeriesBundle` под окно `[lo_time_s, ∞)`.
-/// Действия (вызывается из `Snapshot::apply` ДО merge, чтобы existing совпал с финальным окном):
-///
-/// 1. `ohlcv` — бакет-целостные (OHLCV) — удаляем целиком.
-/// 2. `depth_series[].series` — per-side×band, эвикт по time_s.
-/// 3. `vwap` — эмитированные точки (sum_pv/sum_v остаются all-time внутри `VwapAcc`, не здесь).
-/// 4. `heatmap` — per (time_s, side, price); close-семантика, после эвикции пересоберётся из
-///    пришедшего frame'а (heatmap в frame.delta уже правильно ограничен своим reducer'ом).
-/// 5. `volume_bubbles` — per (time_s, price).
-/// 6. `cumulative_delta` — удаляем записи `< lo_time_s`; CVD running-base (`cvd_session_base`)
-///    инкрементируем на сумму эвиктнутых delta, оставшиеся значения сдвигаем на тот же shift
-///    (running-сумма при эвикции префикса уменьшается на эту сумму → компенсируем сдвигом,
-///    чтобы конечные значения совпали с unbounded-версией).
-/// 7. `volume_profile` — VP whole-session эвикция выполнена на стороне reducer'а (см.
-///    `Reducer::evict_window_state`). При fold'е bins восстанавливаются по session_id через
-///    `merge_volume_profile`.
-fn evict_series_bundle_under_window(series: &mut SeriesBundle, lo_time_s: i64) {
-    if lo_time_s <= 0 {
-        return;
-    }
-
-    // ohlcv
-    series.ohlcv.retain(|row| row.time_s >= lo_time_s);
-
-    // depth_series[].series
-    for row in &mut series.depth_series {
-        row.series.retain(|&(t, _)| t >= lo_time_s);
-    }
-
-    // vwap
-    series.vwap.retain(|&(t, _)| t >= lo_time_s);
-
-    // heatmap
-    series.heatmap.retain(|c| c.time_s >= lo_time_s);
-
-    // volume_bubbles
-    series.volume_bubbles.retain(|c| c.time_s >= lo_time_s);
-
-    // cumulative_delta: эвикт + сдвиг + инкремент cvd_session_base.
-    // До эвикции: value[t] = old_base + running(retained up to t), где running стартует с 0
-    // (на удержанных бакетах) — `Reducer::finish` прибавляет cvd_session_base ПОСЛЕ running
-    // (см. конец `finish()`).
-    // Эвиктируем записи < lo_time_s. Сумма эвиктнутых delta вычисляется через
-    // diff: delta[t] = value[t] - prev; prev = value[t_предыдущего]; first prev = old_base.
-    // После эвикции значения сдвигаются на +evicted_sum и cvd_session_base += evicted_sum,
-    // чтобы на КАЖДОМ удержанном бакете новый running(retained, начиная с prev=new_base)
-    // восстановил сумму сдвинутую обратно.
-    let mut evicted_sum: i64 = 0;
-    let mut prev: i64 = series.cvd_session_base;
-    series.cumulative_delta.retain_mut(|&mut (t, ref mut v)| {
-        if t < lo_time_s {
-            let delta = *v - prev;
-            evicted_sum += delta;
-            prev = *v;
-            false
-        } else {
-            prev = *v;
-            true
-        }
-    });
-    if evicted_sum != 0 {
-        for (_, v) in series.cumulative_delta.iter_mut() {
-            *v += evicted_sum;
-        }
-        series.cvd_session_base += evicted_sum;
-    }
-}
-
-/// M-37: CVD running-base merge. После `evict_series_bundle_under_window` existing имеет
-/// `cvd_session_base_e` (включая инкремент от только что эвиктнутых бакетов) и значения,
-/// сдвинутые на тот же инкремент. Incoming имеет `cvd_session_base_i` и свои значения
-/// (`cvd_session_base_i` + running(retained_i)).
-///
-/// **Алгоритм:**
-/// 1. Дельты existing извлекаем с «previous» = cvd_session_base_e (тогда первая дельта
-///    корректна, а не «весь prefix»).
-/// 2. Дельты incoming извлекаем с «previous» = cvd_session_base_i.
-/// 3. Суммируем дельты по time_s (один time_s — одна дельта с каждой стороны; union).
-/// 4. Ре-дериваем running с new_base = cvd_session_base_e + cvd_session_base_i.
-/// 5. `series.cvd_session_base = new_base` для последующих merge.
-fn merge_cvd_running(series: &mut SeriesBundle, incoming: &SeriesBundle) {
-    let base_e = series.cvd_session_base;
-    let base_i = incoming.cvd_session_base;
-
-    let mut deltas: BTreeMap<i64, i64> = BTreeMap::new();
-    // existing
-    let mut prev = base_e;
-    for &(t, v) in &series.cumulative_delta {
-        let d = v - prev;
-        prev = v;
-        deltas.insert(t, d);
-    }
-    // incoming
-    let mut prev = base_i;
-    for &(t, v) in &incoming.cumulative_delta {
-        let d = v - prev;
-        prev = v;
-        *deltas.entry(t).or_insert(0) += d;
-    }
-
-    let new_base = base_e + base_i;
-    let mut running = new_base;
-    series.cumulative_delta = deltas
-        .into_iter()
-        .map(|(t, d)| {
-            running += d;
-            (t, running)
+fn cumulative_to_deltas(series: &[(i64, i64)]) -> BTreeMap<i64, i64> {
+    let mut previous = 0_i64;
+    series
+        .iter()
+        .map(|&(time_s, cumulative)| {
+            let delta = cumulative - previous;
+            previous = cumulative;
+            (time_s, delta)
         })
-        .collect();
-    series.cvd_session_base = new_base;
+        .collect()
 }
 
 /// Полная свёртка `[start .. at]` через bounded `journal::stream`. Read-only (GW-I-1).
@@ -1385,8 +1076,7 @@ pub fn snapshot(
     at: Cursor,
 ) -> io::Result<Snapshot> {
     let stream = journal::stream(dir, filter)?;
-    let (series, cursor, _, _at_ms) =
-        reduce_event_stream(stream, sel, Cursor::START, at, usize::MAX)?;
+    let (series, cursor, _) = reduce_event_stream(stream, sel, Cursor::START, at, usize::MAX)?;
     Ok(Snapshot {
         schema_version: GATEWAY_SCHEMA_VERSION,
         selector: sel.clone(),
@@ -1402,12 +1092,7 @@ pub fn snapshot(
 /// материализации истории в `Vec<Event>` — память O(1) по размеру журнала, не по `after`.
 /// `max_events` кап делает выход ограниченным → клиент пампит вызовами до сходимости курсора
 /// (live-push). **Курсор-контракт (GW-I-8):** первый кадр `.from == after`; кадры контигуальны
-/// (`f[i].to == f[i+1].from`); последний `.to == возвращённый курсор`.
-///
-/// M-37: возвращаемый `Frame` несёт `at_ms` (= «at» последнего event в кадре) для корректного
-/// fold'а `Snapshot(C) + frames_since(C..) == snapshot(LATEST)` под окном (`apply()` использует
-/// `at_ms` для эвикции existing под финальное окно — иначе existing держит бакеты `[C−W, C]`,
-/// а финальное окно — `[LATEST−W, LATEST]`).
+/// (`f[i].to == f[i+1].from`); последний `.to == возвращённый курсор`. engine-dev (M-22 task #4).
 pub fn frames_since(
     dir: impl AsRef<Path>,
     filter: EpochFilter,
@@ -1416,17 +1101,16 @@ pub fn frames_since(
     max_events: usize,
 ) -> io::Result<(Vec<Frame>, Cursor)> {
     let stream = journal::stream(dir, filter)?;
-    let (delta, cursor, consumed, at_ms) =
+    let (delta, cursor, consumed) =
         reduce_event_stream(stream, sel, after, Cursor::LATEST, max_events)?;
     if consumed == 0 {
         return Ok((Vec::new(), after));
     }
-    Ok((vec![Frame::versioned(after, cursor, delta, at_ms)], cursor))
+    Ok((vec![Frame::versioned(after, cursor, delta)], cursor))
 }
 
 /// Детерминированный replay окна `(from .. to]` тем же редьюсером, что live (VB-I-2/GW-I-3).
-///
-/// M-37: возвращаемый `Frame` несёт `at_ms` для финального окна (см. `frames_since`).
+/// engine-dev (M-22 task #4).
 pub fn replay(
     dir: impl AsRef<Path>,
     filter: EpochFilter,
@@ -1435,9 +1119,9 @@ pub fn replay(
     to: Cursor,
 ) -> io::Result<Vec<Frame>> {
     let stream = journal::stream(dir, filter)?;
-    let (delta, cursor, consumed, at_ms) = reduce_event_stream(stream, sel, from, to, usize::MAX)?;
+    let (delta, cursor, consumed) = reduce_event_stream(stream, sel, from, to, usize::MAX)?;
     if consumed == 0 {
         return Ok(Vec::new());
     }
-    Ok(vec![Frame::versioned(from, cursor, delta, at_ms)])
+    Ok(vec![Frame::versioned(from, cursor, delta)])
 }

@@ -109,7 +109,6 @@ snapshot/frames/replay — **read-only, детерминированный, stat
 | VB-I-7 | `formula_pending`-серия НЕ эмитит вычисленное значение (только маркер), пока формула не подписана founder'ом |
 | VB-I-8 | Volume Profile: цены без сделок НЕ выдумываются (как footprint-bins v1, C-016); POC/VAH/VAL детерминированы от разбиения |
 | VB-I-9 | **Граница плоскостей (D6):** `gateway-serve` НЕ читает/не пишет application-БД (Postgres); auth = ТОЛЬКО stateless verify подписанного JWT, без user-БД-lookup. grep-канарейка: gateway не импортирует postgres/sqlx/diesel-клиент. User-состояние (стратегии/чаты/настройки) вне market-журнала (`DET-I-1`) |
-| VB-I-10 | **Bounded-window snapshot (M-37, TD-039).** Память `snapshot`/`frames_since` ограничена ОКНОМ `[at−W, at]` (`Selector.window_ms=Some(W)`), НЕ числом time-бакетов истории — иначе host-OOM (прод: RSS 7.3GB). Раздельное удержание: **бакет-оконное** (heatmap/ohlcv/depth/bubbles — эвикт бакетов `<at−W`) vs **сессионно-скалярное** (VWAP all-time `sum_pv/sum_v`; CVD running-база сессии; VP полная ТЕКУЩАЯ сессия, эвикт целыми ПРОШЛЫМИ сессиями). Окно привязано к курсору `at`, не wall-clock; одно правило в `full`/`snapshot(C)`/свёртке кадров (VB-I-2 live==replay сохраняется). `window_ms=None` — offline-режим (полная свёртка). Оракул ОБЯЗАН давить рост по бакетам (multi-bucket/multi-day), НЕ один бакет (урок слепого `red_gateway_bounded`). Латентность (не память) — Путь Б, M-38 (чекпоинт) |
 
 ## §6. Соответствие контракт-слою (`05`) и даталееру (`06`)
 

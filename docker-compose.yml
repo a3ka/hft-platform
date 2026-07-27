@@ -121,11 +121,6 @@ services:
       GATEWAY_SYMBOL: ${GATEWAY_SYMBOL:-BTCUSDT}
       GATEWAY_TIMEFRAME_MS: ${GATEWAY_TIMEFRAME_MS:-1000}
       GATEWAY_BANDS: ${GATEWAY_BANDS:-0.001}
-      # M-37 task #7c (анти-TD-020): прод-окно ОКНОВОГО reducer'а. Без активного окна
-      # gateway-serve дефолтит в `window_ms = None` = unbounded → снапшот ООМ-ит (TD-039
-      # воспроизводится через §8 E2E). 60s = ~60 бакетов в окне при `timeframe_ms=1000`,
-      # достаточно для 60 секунд истории + память O(окно), не O(длина журнала).
-      GATEWAY_WINDOW_MS: ${GATEWAY_WINDOW_MS:-60000}
       # ОБЯЗАТЕЛЬНО задать в .env на хосте (deploy.MD §D: shared с Next.js-подписателем,
       # D6 marketplace). Без секрета bin падает с exit 2 (config-error).
       GATEWAY_JWT_SECRET: ${GATEWAY_JWT_SECRET:?GATEWAY_JWT_SECRET must be set}
