@@ -198,3 +198,66 @@ fn windowed_live_eq_replay() {
         full.series.ohlcv.len()
     );
 }
+
+#[test]
+fn windowed_live_eq_replay_overlap_multistep() {
+    // TD-042 (пропуск предыдущего оракула: C был в СЕРЕДИНЕ → окна не пересекались → сдвиг шёл по
+    // ПУСТОМУ списку). Здесь C около КОНЦА → удержанное окно snapshot(C) ПЕРЕСЕКАЕТСЯ с финальным
+    // [LATEST−W, LATEST]. cumulative_delta АБСОЛЮТЕН → эвикция префикса НЕ должна менять удержанные
+    // значения. Плюс multi-step fold (кадры малыми батчами, как штатный live push-loop) → сдвиг
+    // КОПИТСЯ на каждом apply. Штатный live даёт пересечение окон ВСЕГДА — это норма, не край.
+    let t0 = 20_278 * DAY_MS;
+    let mut events = Vec::new();
+    for i in 0..180i64 {
+        events.push(trade(100.0 + i as f64, 1.0, Side::Buy, t0 + i * 1_000));
+    }
+    let dir = journal_of(events);
+    let w = Some(WINDOW_MS);
+
+    let seqs: Vec<u64> = journal::stream(dir.path(), EpochFilter::OwnCaptureOnly)
+        .expect("stream")
+        .map(|e| e.expect("ev").seq)
+        .collect();
+    // C близко к концу → existing-окно [C−W, C] ПЕРЕСЕКАЕТСЯ с [LATEST−W, LATEST].
+    let c = Cursor::at(seqs[seqs.len() - 6]);
+
+    let full = snap(dir.path(), w, Cursor::LATEST);
+    let mut merged = snap(dir.path(), w, c);
+
+    // Multi-step: тянем кадры батчами по 2 до сходимости курсора (fold — накопление ошибки).
+    let mut cur = c;
+    loop {
+        let (batch, next) =
+            gateway::frames_since(dir.path(), EpochFilter::OwnCaptureOnly, &sel(w), cur, 2)
+                .expect("frames_since");
+        if batch.is_empty() {
+            break;
+        }
+        for f in &batch {
+            merged.apply(f);
+        }
+        if next == cur {
+            break;
+        }
+        cur = next;
+    }
+
+    // Предусловие: окна реально пересеклись (тест про overlap, не про evict-all).
+    assert!(
+        full.series.cumulative_delta.len() > 5,
+        "финальное окно должно удержать пересечение (>5 бакетов)"
+    );
+    assert_eq!(
+        merged.series.cumulative_delta, full.series.cumulative_delta,
+        "TD-042: cumulative_delta абсолютен — эвикция префикса под ПЕРЕСЕКАЮЩИМСЯ окном НЕ должна \
+         сдвигать удержанные значения (баг: merged сдвинут на сумму эвиктнутых delta, копится по apply)"
+    );
+    assert_eq!(
+        merged.series.cvd_session_base, full.series.cvd_session_base,
+        "cvd_session_base расходится merged vs full"
+    );
+    assert_eq!(
+        merged.series, full.series,
+        "windowed live != replay под пересекающимся окном + multi-step (TD-042)"
+    );
+}
