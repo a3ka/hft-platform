@@ -238,6 +238,21 @@ pub struct SeriesBundle {
     /// Session Volume Profile (SVP, M-24): `VolumeProfileRow` per сессия, сортировка по `session_id`.
     /// Только ТОРГОВАННЫЕ цены (VP-I-4): ключи гистограммы — реальные сделки, не «выдуманные».
     pub volume_profile: Vec<VolumeProfileRow>,
+    /// M-38a (TD-045): per-session VP `max_time_s` — зеркало `Reducer::session_max_time_s`,
+    /// перенесённое в bundle для применения ИДЕНТИЧНОГО редьюсеру критерия whole-session drop
+    /// `vp_session_max_time_s[sid] < lo_time_s` на пути merge (`Snapshot::apply` /
+    /// `evict_series_bundle_under_window`). Без этого merge структурно не мог воспроизвести
+    /// критерий `Reducer::evict_window_state` — старый `row.session_id < utc_session_id(at)`
+    /// ронял прошлую сессию СРАЗУ после 00:00 UTC, хотя финальное окно `[at−W, at]` её ещё
+    /// пересекало (TD-045 регрессия PR-гейта reviewer'а, K2 vantage `overlap_multistep`). Форма
+    /// `(session_id, max_time_s)` сорт по `session_id` возрастанию; сессия без записи
+    /// трактуется как «нет данных о max» (используется только в эвикции — drop-критерий). Часть
+    /// формы v7 (наряду с `cvd_session_base: Vec<(session_id, base)>`) — bump 6→7 уже выполнен
+    /// в task #9, второй bump для TD-045 НЕ требуется (v7 ещё не в main). `#[serde(default)]`
+    /// — defensive default для консюмеров v7, не читающих поле; консюмер ОБЯЗАН гейтить на
+    /// `schema_version==7`. См. `VB-I-10` / `red_gateway_window::windowed_live_eq_replay_*`.
+    #[serde(default)]
+    pub vp_session_max_time_s: Vec<(i64, i64)>,
     /// M-23 Heatmap (HM-I-1..2): per-бакет снимок L2Delta-реконструированной книги (M-29
     /// `apply_delta`). Close-семантика per бакет — перезапись при последнем апдейте.
     /// Ячейки ТОЛЬКО в окне `[mid*(1−W), mid*(1+W)]`, W=max(`Selector.bands`). Провенанс
@@ -924,6 +939,19 @@ impl Reducer {
 
         let volume_profile = self.vp.into_rows();
 
+        // M-38a (TD-045, task #11): per-session VP `max_time_s` экспортируется в bundle для
+        // применения ИДЕНТИЧНОГО редьюсеру whole-session drop-критерия на пути merge
+        // (`Snapshot::apply` / `evict_series_bundle_under_window`). Источник — единая структура
+        // `self.session_max_time_s` (M-38a task #5 унификация VP+CVD), консистентна с
+        // `volume_profile` (Reducer одновременно дропает из `vp.bins` и `session_max_time_s`
+        // в `evict_window_state`). СОРТ по `session_id` возрастанию — зеркалит `volume_profile`
+        // и форму v7 `cvd_session_base: Vec<(session_id, ...)>` для согласованного merge.
+        let vp_session_max_time_s: Vec<(i64, i64)> = self
+            .session_max_time_s
+            .iter()
+            .map(|(&sid, &max_t)| (sid, max_t))
+            .collect();
+
         // M-23: heatmap + COB + bubbles. `build_heatmap_cob` использует сохранённые снимки
         // книги из `heatmap_buckets` (close-семантика) + bubbles из `bubbles` (Trade-аккумулятор).
         let (heatmap, cob) = build_heatmap_and_cob(&self.selector, self.heatmap_buckets);
@@ -934,6 +962,9 @@ impl Reducer {
         // fold'е existing (base_e(sid)) + incoming (base_i(sid)) их базы складываются PER
         // SESSION и применяются к merged `cumulative_delta` — иначе эвиктнутые prefix'ы обеих
         // сторон потеряются (см. `merge_cvd_running`).
+        // M-38a (TD-045, task #11): `vp_session_max_time_s` (Vec, per-session — собран выше)
+        // экспортируется в SeriesBundle для merge-логики `Snapshot::apply` (whole-session drop
+        // по `vp_session_max_time_s[sid] < lo_time_s`).
 
         SeriesBundle {
             ohlcv,
@@ -942,6 +973,7 @@ impl Reducer {
             depth_series,
             vwap,
             volume_profile,
+            vp_session_max_time_s,
             heatmap,
             cob,
             volume_bubbles,
@@ -1231,34 +1263,63 @@ impl Snapshot {
         vwap.extend(frame.delta.vwap.iter().copied());
         self.series.vwap = vwap.into_iter().collect();
 
-        // M-38a (task #8, VP whole-session drop at bundle-merge — same latent gap the K2
-        // overlap-multistep vantage exposes for CVD, now also exercised for VP): existing may
-        // carry a session's FULL VolumeProfileRow from an earlier merge, but
-        // `evict_series_bundle_under_window` never touches `volume_profile` (VP eviction is
-        // Reducer-internal, `evict_window_state`/`session_max_time_s`). A session absent from
-        // `incoming.volume_profile` while the current frame has moved to a STRICTLY LATER UTC
-        // day than that session (journal time monotonic ⇒ it will never receive more data) is
-        // done forever — drop it from existing BEFORE merge, mirroring CVD whole-session drop.
-        // Guard on both conditions (absence AND day-advance) so a batch that happens to carry
-        // zero Trade events (VP only updates on Trade) doesn't falsely evict a still-current
-        // session.
-        let current_day = utc_session_id(frame.at_ms);
-        let incoming_sids: std::collections::BTreeSet<i64> = frame
-            .delta
-            .volume_profile
-            .iter()
-            .map(|r| r.session_id)
-            .collect();
-        self.series
-            .volume_profile
-            .retain(|row| incoming_sids.contains(&row.session_id) || row.session_id >= current_day);
+        // M-38a (TD-045, task #11): VP whole-session drop теперь ВЫПОЛНЯЕТСЯ в
+        // `evict_series_bundle_under_window` ДО merge (см. шаг 2 выше) — единый критерий
+        // `vp_session_max_time_s[sid] < lo_time_s`, идентичный `Reducer::evict_window_state`.
+        // Старый код drop'ал VP-сессию здесь по `row.session_id < utc_session_id(at)` — ронял
+        // прошлую сессию СРАЗУ после 00:00 UTC, даже если финальное окно её ещё пересекало
+        // (TD-045 регрессия PR-гейта reviewer'а: existing-состояние, ПЕРЕСЕКАЮЩЕЕ финальное
+        // окно, роняло S1 → GW-I-4/VB-I-2 сломан). Удалён.
 
         // M-24: volume_profile сливается по session_id — восстанавливаем per-session гистограммы
         // из bins (existing + incoming), складываем, пересчитываем POC/VA (compute_vp_row).
         // Не дубль-строки: одна VolumeProfileRow per сессия (VP-I-3 merge-инвариант), даже
-        // если сессия присутствует в обоих sources.
+        // если сессия присутствует в обоих sources. Сессия, ЭВИКТНУТАЯ в шаге 2
+        // (whole-session drop по `vp_session_max_time_s[sid] < lo_time_s`), но восстановленная
+        // incoming'ом через bins-reconstruct, — ре-деривится здесь с актуальным POC/VA.
         self.series.volume_profile =
             merge_volume_profile(&self.series.volume_profile, &frame.delta.volume_profile);
+
+        // M-38a (TD-045, task #11): merge `vp_session_max_time_s` — max(existing[sid],
+        // incoming[sid]) per session_id. Existing уже префикс-эвиктнут в шаге 2 (только
+        // сессии с `max_time_s >= lo_time_s` от `evict_series_bundle_under_window`);
+        // incoming — свёртка frame'а через тот же редьюсер. Для общих сессий
+        // incoming.max >= existing.max (время журнала монотонно → max растёт); max(., .)
+        // согласовано с `merge_volume_profile`'ом (та же union session_ids).
+        // Зеркалит CVD-merge `cvd_session_base` (тоже max на сессию; форма v7).
+        let mut vp_max: BTreeMap<i64, i64> = BTreeMap::new();
+        for &(sid, max_t) in &self.series.vp_session_max_time_s {
+            vp_max.insert(sid, max_t);
+        }
+        for &(sid, max_t) in &frame.delta.vp_session_max_time_s {
+            let entry = vp_max.entry(sid).or_insert(max_t);
+            if max_t > *entry {
+                *entry = max_t;
+            }
+        }
+        let mut merged_vp_session_max_time_s: Vec<(i64, i64)> = vp_max.into_iter().collect();
+
+        // M-38a (TD-045, task #11): VP whole-session drop ПОСЛЕ merge (mirror CVD
+        // `merge_cvd_running`'s whole-session check). Решение по merged
+        // `vp_session_max_time_s[sid] < lo_time_s` — если merged max сессии ниже `lo`,
+        // значит НИ existing, НИ incoming не дали ни одного бакета в финальное окно
+        // (журнал монотонен → сессия полностью вне окна НАВСЕГДА, в дальнейшем вклада
+        // не будет). Зеркалит `Reducer::evict_window_state` (session-level criterion).
+        // СТАРЫЙ код ронял здесь по `row.session_id < utc_session_id(at)` — это роняло
+        // прошлую сессию СРАЗУ после 00:00 UTC, даже если финальное окно её ещё
+        // пересекало (TD-045 регрессия PR-гейта reviewer'а: existing-состояние,
+        // ПЕРЕСЕКАЮЩЕЕ финальное окно, роняло S1 → GW-I-4/VB-I-2 сломан).
+        if let Some(lo) = final_lo_time_s {
+            merged_vp_session_max_time_s.retain(|&(_, max_t)| max_t >= lo);
+            let drop_sids: std::collections::BTreeSet<i64> = merged_vp_session_max_time_s
+                .iter()
+                .map(|&(sid, _)| sid)
+                .collect();
+            self.series
+                .volume_profile
+                .retain(|r| drop_sids.contains(&r.session_id));
+        }
+        self.series.vp_session_max_time_s = merged_vp_session_max_time_s;
 
         // M-23 heatmap merge: keyed by (time_s, side, price_e8), close-семантика per бакет —
         // для одного и того же ключа incoming выигрывает (последний book-applied в этом бакете).
@@ -1356,9 +1417,15 @@ fn merge_bubbles(existing: &[BubbleCell], incoming: &[BubbleCell]) -> Vec<Bubble
 ///    `merge_cvd_running`, где видно, приносит ли incoming строки для сессии тоже.
 ///    `merge_cvd_running` идемпотентен на абсолютных значениях с корректной per-session базой
 ///    (первый удержанный: `d = value − base(sid) = δ`).
-/// 7. `volume_profile` — VP whole-session эвикция выполнена на стороне reducer'а (см.
-///    `Reducer::evict_window_state`). При fold'е bins восстанавливаются по session_id через
-///    `merge_volume_profile`.
+/// 7. `vp_session_max_time_s` (M-38a TD-045, task #11) — префиксная фильтрация per-session
+///    `max_time_s`: ЗАПИСИ с `max_time_s < lo_time_s` удаляются здесь, но решение о drop'е
+///    `volume_profile` строки ПРИНИМАЕТСЯ ПОСЛЕ merge в `Snapshot::apply` (по merged
+///    `vp_session_max_time_s[sid] < lo_time_s`). Аналогия CVD: prefix-фолд в эвикции, drop —
+///    в merge (где видно, принёс ли incoming bins для сессии). Если удалить VP-сессию здесь,
+///    `merge_volume_profile` потеряет её bins от existing, даже если incoming её восстановит
+///    (регрессия `windowed_live_eq_replay`: existing S, max < lo, incoming S, max >= lo →
+///    merged = incoming only). Whole-session drop VP в `apply` после merge_volume_profile и
+///    merge vp_session_max_time_s.
 fn evict_series_bundle_under_window(series: &mut SeriesBundle, lo_time_s: i64) {
     if lo_time_s <= 0 {
         return;
@@ -1433,6 +1500,16 @@ fn evict_series_bundle_under_window(series: &mut SeriesBundle, lo_time_s: i64) {
     }
     series.cumulative_delta = new_cumulative_delta;
     series.cvd_session_base = new_bases.into_iter().collect();
+
+    // M-38a (TD-045, task #11): префиксная фильтрация `vp_session_max_time_s` —
+    // `max_time_s < lo_time_s` исключаем здесь (подготовка к merge: merged-решение в
+    // `Snapshot::apply` после `merge_volume_profile`). НЕ дропаем `volume_profile` rows
+    // здесь — их bins нужны для `merge_volume_profile` (иначе регрессия
+    // `windowed_live_eq_replay`: existing сессия целиком отлетает, incoming восстановить
+    // не может). Итоговый whole-session drop — в `apply` ниже.
+    series
+        .vp_session_max_time_s
+        .retain(|&(_sid, max_t)| max_t >= lo_time_s);
 }
 
 /// M-38a (TD-043, task #8): CVD running merge PER-SESSION. После
