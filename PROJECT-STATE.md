@@ -1493,6 +1493,40 @@ VB-I-6 per-series anchor) → critic **C-026 REJECT (fmt sacred) → rev2 PASS**
   прод-масштаб bounded-reduce/checkpoint → engine-dev → reviewer §8 E2E-GREEN валидный JWT → Snapshot schema_version=6
   + latency) и founder-подписи выбора архитектуры снапшота.
 
+## CVD session-anchored ledger (M-38a — ⛔ **PR-гейт: CHANGES REQUESTED, НЕ смержен**, reviewer 2026-07-27)
+Ветка `feat/M-38a-cvd-session-ledger` @ `291e288` (ff-поверх `origin/main` cb28145; `HEAD..origin/main` пуст —
+re-merge puzzle отсутствует, локальный `main` в общем чекауте просто устарел).
+- **Что ПРИНЯТО по существу (перепроверено reviewer'ом на своём worktree, не пересказом tester'а):** CVD
+  per-session ledger (`CvdSession{base, bucket_delta}`, `cvd: BTreeMap<session_id, CvdSession>`) — reset на
+  00:00 UTC реализован, running больше не течёт через границу суток; unified `session_max_time_s` (дубль
+  `vp_session_max_time_s` убран); `Reducer::finish`/`evict_window_state`/`merge_cvd_running`/
+  `evict_series_bundle_under_window` переписаны per-session; `GATEWAY_SCHEMA_VERSION = 7`.
+  Гейты на моём прогоне: `cargo fmt --all --check` exit=0, `clippy --all-targets --workspace -D warnings`
+  exit=0, `cargo test -p gateway -p journal -p gateway-serve` — **0 failed** (40 блоков).
+- **Процессная дисциплина соблюдена:** RED-first порядок честный (architect `7669bf5`/`dfd98bc` — только
+  `tests/`+`docs/`+`verify`+milestone; engine-dev `6827965`/`870ab0e` — только `src/`; ни один sacred-тест
+  dev'ом не тронут, сверено `git log --name-only` по авторам). `crates/{contracts,risk,killswitch,oms,venue-*}`
+  — 0 файлов в диффе ⇒ Block-C неприменим, risk-critic не требуется (read-path, order-egress нет).
+  C-028 rev2 PASS присутствует в цепочке. `verify_M-38a.sh` — реальный гейт (FAIL-счётчик + `exit 1`).
+- **⛔ БЛОКЕР — `TD-045`: регрессия байт-идентичности VP на merge-пути.** Новый блок в `Snapshot::apply`
+  (`lib.rs:1245-1254`) дропает из existing VP-сессию по критерию «день ушёл вперёд», который НЕ совпадает
+  с оконным критерием редьюсера ⇒ сразу после полуночи merge выбрасывает вчерашнюю сессию, которую
+  `snapshot(LATEST)` ещё удерживает. Доказано прогоном: репро reviewer'а FAIL на `291e288`
+  (`merged.vp=[20279]` vs `full.vp=[20278,20279]`) и **PASS на `origin/main`** ⇒ это регрессия, а не
+  унаследованный дефект. Оракул C-028 K2 односторонний (парного vantage «сессия обязана уцелеть» нет);
+  снятие блока валит K2, возврат — валит репро: реализация не может удовлетворить оба, т.к.
+  `VolumeProfileRow` не несёт времени. Дизайн фикса + парный RED — **зона architect** (gates.md §4).
+- **NOTE `TD-046`:** `session_of(time_s)` ломается при `GATEWAY_TIMEFRAME_MS`, не выравненном на границу
+  суток (бакет пересекает 00:00 UTC → дубль `time_s`, две сессии сваливаются в одну). Прод-дефолт 1000 ms
+  не затронут.
+- **RN-17 (не блокирующее):** `6827965` покрывает задачи #4-#8 одним коммитом (формально «бандл на 5 задач»,
+  `.claude/rules/commit-discipline.md`). Принято как единая непрерывная миграция типа (промежуточные
+  состояния не компилируются) + тело коммита даёт по-задачный разбор, так что аудит-трейл сохранён;
+  задача #9 корректно вынесена отдельно. На будущее — фиксировать «non-separable migration» в теле явно.
+- **Статус: 🚧 IN_PROGRESS.** Push в `main` НЕ выполнен, §8 деплой-гейт НЕ запускался (merge не состоялся).
+  Дальше: architect — RED на удержание прошлой сессии под пересекающим окном + дизайн VP-эвикции на
+  merge-пути → engine-dev → повторный PR-гейт.
+
 ## Bounded-snapshot (M-37 «Путь А: убрать OOM» — ✅ **MERGED `e4a8bc6` + §8 E2E GREEN на проде**, reviewer APPROVED 2026-07-27; TD-039 CLOSED)
 **Снапшот кокпита больше не убивает хост.** Прод (`e4a8bc6`, журнал 18 GB = 96 `.zst` + 7 raw): валидный JWT →
 **Snapshot доставлен 1 126 460 B**, `selector.window_ms=60000`, серии окновые (`ohlcv/cvd/vwap` = 50 бакетов,

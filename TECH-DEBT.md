@@ -3,6 +3,55 @@
 > **Reviewer-owned.** Открытые долги/риски, замеченные при работе. Закрытые переносятся вниз.
 
 ## OPEN
+- **TD-045** `vp-whole-session-drop-at-bundle-merge-evicts-still-live-session` (найдено reviewer'ом на
+  PR-гейте M-38a, 2026-07-27). **БЛОКЕР merge M-38a. Это РЕГРЕССИЯ относительно `origin/main` cb28145,
+  доказанная прогоном, а не анализом.** `Snapshot::apply` (`crates/gateway/src/lib.rs:1245-1254`,
+  коммит `6827965`) получил новый блок, дропающий из existing VP-сессию, если её нет в
+  `incoming.volume_profile` И `row.session_id < utc_session_id(frame.at_ms)`. Условие «день ушёл вперёд»
+  НЕ эквивалентно оконному критерию редьюсера (`session_max_time_s[sid] < lo_time_s`,
+  `evict_window_state`): сразу после 00:00 UTC окно `[at−W, at]` ЕЩЁ пересекает вчерашнюю сессию, и
+  `Reducer` её УДЕРЖИВАЕТ, а merge-путь уже выбросил — `snapshot(C) + frames_since(C..) ≢ snapshot(LATEST)`.
+  Нарушен GW-I-4/VB-I-2 — ровно тот инвариант, ради которого писался M-38a.
+  **Репро (reviewer, фикстура зеркалит `windowed_live_eq_replay_overlap_multistep`, но fold
+  ОСТАНАВЛИВАЕТСЯ раньше — финальное окно ещё пересекает S1):** 180 сделок 1/s вокруг 00:00 UTC
+  (`d2 = 20_279 * 86_400_000`, `t0 = d2 − 90s`), `window_ms = 60_000`, курсор `C = d2+35s`,
+  fold до `at = d2+45s` ⇒ финальное окно `[d2−15s, d2+45s]` пересекает S1.
+  ```
+  merged.vp sessions = [20279]            # M-38a HEAD 291e288
+  full.vp   sessions = [20278, 20279]
+  assertion failed: VP: merged != full под окном, которое ЕЩЁ пересекает S1
+  ```
+  На `origin/main` (cb28145) ТОТ ЖЕ репро — `test result: ok. 1 passed` ⇒ регрессия внесена M-38a.
+  **Оракул односторонний — вот почему это прошло все зелёные гейты.** `windowed_live_eq_replay_overlap_multistep`
+  (C-028 K2) фиксирует ТОЛЬКО направление «S1 обязана быть dropped» (финальное окно целиком в S2) и не
+  имеет парного vantage «S1 обязана УЦЕЛЕТЬ, пока окно её пересекает». Проверено переключением: с блоком
+  K2-оракул GREEN / репро reviewer'а FAIL; без блока K2-оракул FAIL / репро GREEN — реализация не может
+  удовлетворить оба, потому что информации не хватает структурно: `VolumeProfileRow` несёт
+  `session_id/poc/vah/val/va_pct/bins` и НЕ несёт времени, поэтому `evict_series_bundle_under_window`
+  физически не может воспроизвести критерий `session_max_time_s[sid] < lo`. **Дизайн фикса — зона architect**
+  (gates.md §4: reviewer описывает дефект, не проектирует решение); нужен парный RED-оракул на удержание
+  прошлой сессии, пока окно её пересекает. **Класс «идеальная фикстура» — ЧЕТВЁРТЫЙ РАЗ ПОДРЯД**
+  (M-07 equity-curve, M-08 асимметричный дифф, M-37 TD-042, теперь M-38a): оракул давит на инвариант
+  ровно с одной стороны, реализация ложится в эту сторону, вторая сторона ломается молча.
+  Severity: **MAJOR** (нарушен headline-инвариант milestone'а; данные кокпита расходятся live vs replay
+  до W секунд после каждой полуночи; ордер-пути нет).
+- **TD-046** `cvd-session-split-breaks-when-timeframe-does-not-align-to-utc-midnight` (найдено reviewer'ом
+  на PR-гейте M-38a, 2026-07-27). Латентный, конфиг-зависимый. M-38a постулирует
+  «`session_of(time_s) = time_s.div_euclid(86_400)` эквивалентен `utc_session_id(ts_ms)`»
+  (`milestones/M-38a-cvd-session-ledger.md:60-62`). Это верно, только если бакет НЕ пересекает 00:00 UTC.
+  `GATEWAY_TIMEFRAME_MS` — свободный env (`crates/gateway-serve/src/lib.rs:516`), без проверки на
+  делимость. При `timeframe_ms`, не выравненном на границу суток, сделки ДВУХ сессий попадают в ОДИН
+  `bucket_time_s`: `Reducer::finish` эмитит две строки с ОДИНАКОВЫМ `time_s` (running не монотонен), а
+  merge-путь (`session_of(time_s)`) сваливает обе в ОДНУ сессию. Репро (reviewer, `GATEWAY_TIMEFRAME_MS`
+  = 11_000, две сделки `d2−2s` BUY 5.0 и `d2+2s` SELL 3.0):
+  ```
+  cumulative_delta = [(1752105597, 500000000), (1752105597, -300000000)]
+  cvd_session_base = []
+  ```
+  **Прод сейчас НЕ затронут** — дефолт `GATEWAY_TIMEFRAME_MS=1000` (`docker-compose.yml:122`,
+  `gateway-serve/src/lib.rs:517`) делит сутки нацело. Нужен либо гвард на выравнивание timeframe, либо
+  вывод сессии бакета из `ts_exch_ms` вместо `session_of(time_s)`. Зона: architect (RED-first).
+  Severity: **NOTE** (латентный футган конфигурации; в текущем проде не срабатывает).
 - **TD-044** `gateway-snapshot-latency-full-history-replay-per-connection` (заведено reviewer'ом на §8 M-37,
   2026-07-27). **Память вылечена (TD-039 CLOSED), латентность — НЕТ, и это блокирует close-out M-28/M-36.**
   Замер на проде (`e4a8bc6`, журнал 18 GB / 96 `.zst` + 7 raw): **первый Snapshot доставлен за 409.74 s
