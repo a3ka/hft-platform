@@ -1493,7 +1493,36 @@ VB-I-6 per-series anchor) → critic **C-026 REJECT (fmt sacred) → rev2 PASS**
   прод-масштаб bounded-reduce/checkpoint → engine-dev → reviewer §8 E2E-GREEN валидный JWT → Snapshot schema_version=6
   + latency) и founder-подписи выбора архитектуры снапшота.
 
-## Bounded-snapshot (M-37 «Путь А: убрать OOM» — **НЕ В MAIN: смержен и ОТКАЧЕН на деплой-гейте**, reviewer 2026-07-27)
+## Bounded-snapshot (M-37 «Путь А: убрать OOM» — ✅ **MERGED `e4a8bc6` + §8 E2E GREEN на проде**, reviewer APPROVED 2026-07-27; TD-039 CLOSED)
+**Снапшот кокпита больше не убивает хост.** Прод (`e4a8bc6`, журнал 18 GB = 96 `.zst` + 7 raw): валидный JWT →
+**Snapshot доставлен 1 126 460 B**, `selector.window_ms=60000`, серии окновые (`ohlcv/cvd/vwap` = 50 бакетов,
+`heatmap=1174`, `bubbles=330`), `cvd_session_base=-282 577 471 000` (сессионно-скалярное пережило эвикцию всей
+истории). **RssAnon `26 280 → 26 472 kB` (+192 kB) при >21 GiB прочитанного — ПЛАТО** против
+`308 kB → 672 MB/8 s → 7.3 GB → oom-kill` вчера; `dmesg` OOM-события ТОЛЬКО от 26 июля, за 27-е — ноль;
+`restarts=0`; recorder не задет (healthy, heartbeat свежий, `writable=true`).
+- Реленд выполнен **revert-of-revert** (`259e7e2`) + merge (`e4a8bc6`) — сохранены ПОДЛИННЫЕ SHA авторов
+  (аудит-трейл TD-041), а не cherry-pick с новыми хэшами. Reviewer проверил, что merged-дерево **байт-идентично**
+  отревьюенной ветке по всем 9 тронутым файлам, и что фича РЕАЛЬНО в дереве (`window_ms`, `serve_config_from_env`,
+  `GATEWAY_WINDOW_MS` в compose) — класс TD-020 «код на main ≠ функция в проде»; подтверждено и в контейнере
+  (`docker exec ... env` → `GATEWAY_WINDOW_MS=60000`).
+- Гейты (reviewer независимо, на MERGED дереве): `verify_M-37.sh` **VERDICT PASS exit=0** (9/9),
+  `cargo test --workspace` **passed=398 failed=0** (132 блока), fmt/clippy/build exit=0; CI + Deploy на
+  `e4a8bc6` — **оба success**. TD-040-регресс: `red_gateway_bounded` 3/3 + 4/4 стабильно.
+- **Два дефекта поймано reviewer'ом на PR-гейте, оба закрыты циклом architect→engine-dev:**
+  **TD-040** (сакральный оракул давал РАЗНЫЙ вердикт на dev и CI — мерил окружение, а не инвариант; фикс
+  `c5d9ab8`: `MEASURE_LOCK` + константный `SEG_BYTES` + `read_all`-контраст) и **TD-042** (`Snapshot::apply`
+  под окном ДВАЖДЫ учитывал эвиктнутый CVD-префикс ⇒ GW-I-4/VB-I-2 нарушены; фикс `2c3e5e4` по RED `1f39899`).
+  **Анти-плацебо доказан reviewer'ом независимо в обоих случаях:** отключение эвикции валит `red_gateway_bounded`
+  2/2 и `red_gateway_window` 3/3; реинтродукция CVD-сдвига валит РОВНО новый оракул
+  `windowed_live_eq_replay_overlap_multistep` (1 из 4) — три старых остаются зелёными, что и подтверждает диагноз
+  «старые фикстуры слепы». Собственный rev2-репро reviewer'а (курсор у конца ⇒ окна пересекаются) + усиленный
+  вариант (mixed BUY/SELL, fold по одному событию) — PASS на фиксе, FAIL на реинтродукции.
+- **M-37 НЕ закрывает M-28/M-36:** вылечена ПАМЯТЬ, не латентность — первый снапшот строится **409.74 s**
+  (per-connection реплей всей истории; заявлено в M-37 §Objective как Путь Б / M-38). Заведён **TD-044**
+  (блокирует close-out M-28/M-36) и **TD-043** (multi-session CVD под окном не покрыт — явно отложено).
+  Кадры (`Frame`) в этом §8 НЕ наблюдались — проверен путь Snapshot; live-push остаётся к проверке на M-28.
+
+## Bounded-snapshot — история захода (M-37 rev1: смержен и ОТКАЧЕН на деплой-гейте, reviewer 2026-07-27)
 - **Состояние main: код M-37 ОТСУТСТВУЕТ.** Merge `f1d5eed` → CI RED → revert `9680857` → восстановление
   аудит-артефактов `8ae7713`. **Main зелёный** (CI 8ae7713: все 5 job'ов success). Прод — на `65519ae`
   (deploy на docs-only коммит не триггерится), §8 eyes-on: `hft-gateway-serve` Up 9h (healthy),
