@@ -86,12 +86,12 @@ UTC-сессия (`utc_session_id`) — свой running с нуля; running о
 | 1 | (RED) `red_gateway_cvd_session.rs`: reset на 00:00 UTC (reset/асимметрия/множественность/3 сессии), runtime-анти-плацебо (падает на single-running) | — | architect | ✅ DONE (анти-плацебо: 4 FAIL — 13e8/58e8/7e8 vs session-local) |
 | 2 | (RED) обновить `red_gateway_window.rs`: `cvd_base_survives` (per-session base v7), `cvd_two_sessions_live_across_midnight_window` (2 ledger живы), `windowed_live_eq_replay_overlap_multistep` (курсор У ГРАНИЦЫ 00:00 UTC → whole-drop S1 на bundle-merge, pre/post-asserts — C-028 K2) | — | architect | ✅ DONE (compile-RED формы v7: `&i64`→`&[(i64,i64)]`; K2 vantage у границы) |
 | 3 | (RED) `docs/fa/viz-backend.md` VB-I-6/VB-I-10 + `verify_M-38a.sh` | — | architect | ✅ DONE |
-| 4 | `CvdSession`+`cvd: BTreeMap<session_id, CvdSession>`; заменить плоские `bucket_delta`/`cvd_session_base:i64` | red_gateway_cvd_session + window | engine-dev | ⏳ OPEN |
-| 5 | Unified `session_max_time_s` (убрать дубль `vp_session_max_time_s`), общий для VP+CVD эвикции | red_gateway_window (VP POC регрессия) | engine-dev | ⏳ OPEN |
-| 6 | `evict_window_state` per-session: фолд внутрисессионного префикса в base(sid); whole-session drop | red_gateway_window (2-session) | engine-dev | ⏳ OPEN |
-| 7 | `Reducer::finish` per-session running (reset на границе) + форма `cvd_session_base: Vec<(session_id,base)>` | red_gateway_cvd_session | engine-dev | ⏳ OPEN |
-| 8 | `merge_cvd_running`/`evict_series_bundle_under_window` per-session (byte-identity live==replay через полночь) | red_gateway_window (overlap-multistep) | engine-dev | ⏳ OPEN |
-| 9 | bump `GATEWAY_SCHEMA_VERSION` 6→7 + doc-комментарий (семантика CVD + форма cvd_session_base) | red_gateway_schema_v7 (константа/Snapshot/Frame ==7; C-028 K1); red_gateway_export_v2 (v1-аддитивность как регрессия) | engine-dev | ⏳ OPEN |
+| 4 | `CvdSession`+`cvd: BTreeMap<session_id, CvdSession>`; заменить плоские `bucket_delta`/`cvd_session_base:i64` | red_gateway_cvd_session + window | engine-dev | ✅ DONE |
+| 5 | Unified `session_max_time_s` (убрать дубль `vp_session_max_time_s`), общий для VP+CVD эвикции | red_gateway_window (VP POC регрессия) | engine-dev | ✅ DONE |
+| 6 | `evict_window_state` per-session: фолд внутрисессионного префикса в base(sid); whole-session drop | red_gateway_window (2-session) | engine-dev | ✅ DONE |
+| 7 | `Reducer::finish` per-session running (reset на границе) + форма `cvd_session_base: Vec<(session_id,base)>` | red_gateway_cvd_session | engine-dev | ✅ DONE |
+| 8 | `merge_cvd_running`/`evict_series_bundle_under_window` per-session (byte-identity live==replay через полночь) | red_gateway_window (overlap-multistep) | engine-dev | ✅ DONE |
+| 9 | bump `GATEWAY_SCHEMA_VERSION` 6→7 + doc-комментарий (семантика CVD + форма cvd_session_base) | red_gateway_schema_v7 (константа/Snapshot/Frame ==7; C-028 K1); red_gateway_export_v2 (v1-аддитивность как регрессия) | engine-dev | ✅ DONE |
 
 **Анти-плацебо (задачи 1-2, ПРОВЕРЕНО фактически):** `red_gateway_cvd_session` — 4 runtime-FAIL на
 текущем single-running CVD (S2 несёт running S1 через 00:00: 13e8 vs 3e8, 58e8 vs −7e8, 7e8 vs −3e8,
