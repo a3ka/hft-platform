@@ -1,6 +1,6 @@
 # M-37 — bounded-memory snapshot (Путь А: убрать OOM)
 
-**Статус:** PROPOSED
+**Статус:** DONE (смержен main @ e4a8bc6; §8 E2E GREEN — RssAnon плато 26 MB на 21 GiB; TD-039/040/042 CLOSED)
 **Закрывает:** TD-039 (gateway snapshot OOM ~7.3GB → host-OOM на 7.5GB VPS)
 **Разблокирует:** M-28 §8 E2E + M-36 close-out (сейчас снапшот не строится — падает по памяти)
 **Не входит (следующий milestone M-38):** латентность. Путь А ограничивает ПАМЯТЬ; снапшот всё
@@ -80,7 +80,7 @@ L2Snapshot каждую 1с (`EMIT_PERIOD=1s`, venue-binance/src/lib.rs:35) → 
 | 7b | `build_selector` + арг `window_ms: Option<i64>` → `Selector.window_ms` | red_serve_window_wiring | engine-dev | ✅ DONE (impl принят reviewer) |
 | 7c | `docker-compose.yml`: gateway-serve env `GATEWAY_WINDOW_MS=60000` (иначе прод дефолтит в None=unbounded → §8 снова OOM) | §8 E2E | engine-dev | ✅ DONE (impl принят reviewer) |
 | 7d | (RED) `red_serve_window_wiring`: env→`Selector.window_ms` + `build_selector` проброс | — | architect | ✅ DONE (compile-RED) |
-| 8 | (TD-042) `evict_series_bundle_under_window`: НЕ сдвигать удержанные `cumulative_delta` на `+evicted_sum` — значения АБСОЛЮТНЫ, эвикция префикса их не меняет (только `cvd_session_base += evicted_sum`). Сверить, что `merge_cvd_running` даёт full-равенство | `windowed_live_eq_replay_overlap_multistep` | engine-dev | ⏳ OPEN |
+| 8 | (TD-042) `evict_series_bundle_under_window`: НЕ сдвигать удержанные `cumulative_delta` на `+evicted_sum` — значения АБСОЛЮТНЫ, эвикция префикса их не меняет (только `cvd_session_base += evicted_sum`). Сверить, что `merge_cvd_running` даёт full-равенство | `windowed_live_eq_replay_overlap_multistep` | engine-dev | ✅ DONE (смержен; TD-042 CLOSED) |
 | 9 | (RED) overlap+multistep оракул TD-042 (C у конца → окна пересекаются; fold батчами → накопление) | — | architect | ✅ DONE (анти-плацебо: падал на c5d9ab8, сдвиг +1.1e9) |
 
 **Анти-плацебо (задача 5 — критично):** оракул ОБЯЗАН содержать десятки-сотни бакетов на много
