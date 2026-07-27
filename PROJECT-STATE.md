@@ -1493,9 +1493,72 @@ VB-I-6 per-series anchor) → critic **C-026 REJECT (fmt sacred) → rev2 PASS**
   прод-масштаб bounded-reduce/checkpoint → engine-dev → reviewer §8 E2E-GREEN валидный JWT → Snapshot schema_version=6
   + latency) и founder-подписи выбора архитектуры снапшота.
 
-## CVD session-anchored ledger (M-38a — ⛔ **PR-гейт: CHANGES REQUESTED, НЕ смержен**, reviewer 2026-07-27)
-Ветка `feat/M-38a-cvd-session-ledger` @ `291e288` (ff-поверх `origin/main` cb28145; `HEAD..origin/main` пуст —
-re-merge puzzle отсутствует, локальный `main` в общем чекауте просто устарел).
+## CVD session-anchored ledger (M-38a — ✅ **MERGED `28c186c` + §8 E2E GREEN на проде**, reviewer APPROVED 2026-07-27; TD-043 и TD-045 CLOSED)
+**CVD кокпита больше не течёт через полночь, а merge-путь больше не выбрасывает живую сессию VP.**
+Ветка `feat/M-38a-cvd-session-ledger` (`7669bf5..e4822e3`) смержена в `main` merge-коммитом `28c186c`
+(`--no-ff`, подлинные SHA авторов сохранены — аудит-трейл TD-041).
+- **Что вошло:** CVD per-session ledger (`cvd: BTreeMap<session_id, CvdSession{base, bucket_delta}>`) —
+  running обнуляется на 00:00 UTC (VB-I-6, founder-подпись 2026-07-27); unified `session_max_time_s`
+  (ОДИН критерий эвикции для VP и CVD); форма v7 — `cvd_session_base: Vec<(session_id, base)>` +
+  `vp_session_max_time_s: Vec<(session_id, max_time_s)>`; `GATEWAY_SCHEMA_VERSION` 6→7.
+- **TD-045 (регрессия, найденная reviewer'ом на PR-гейте rev1) ЗАКРЫТА в корень** (`e4822e3` по RED
+  `1d38a19`, critic C-029 PASS): whole-session drop VP выполняется в `Snapshot::apply` ПОСЛЕ
+  `merge_volume_profile` по ИДЕНТИЧНОМУ редьюсеру критерию `vp_session_max_time_s[sid] < lo_time_s`;
+  старый предикат `row.session_id < utc_session_id(at)` УДАЛЁН. `evict_series_bundle_under_window`
+  только префикс-фильтрует записи max-времён и НЕ роняет bins (иначе existing-сессия, восстанавливаемая
+  incoming'ом, теряет ранние bins).
+- **Гейты reviewer'а на СВОЁМ worktree (не пересказ tester'а), HEAD ветки `e4822e3`:** `cargo fmt
+  --all --check` exit=0; `clippy --workspace --all-targets -D warnings` exit=0; `cargo test -p gateway
+  -p journal -p gateway-serve` — **passed=103 failed=0** (39 блоков); `bash scripts/verify_M-38a.sh` →
+  **VERDICT: PASS exit=0** (11/11). На MERGED дереве (`28c186c`) повторно: verify PASS exit=0 +
+  `cargo test --workspace` **passed=407 failed=0** (134 блока); дифф merged-дерева против отревьюенной
+  ветки = ровно 3 docs-файла из `main` (`e42d5e7`), кодового дрейфа нет.
+- **Анти-плацебо доказан reviewer'ом НЕЗАВИСИМО от architect-фикстуры.** Откат ТОЛЬКО `lib.rs` на
+  pre-fix `e12779f` при тестах с HEAD: architect-оракул `windowed_live_eq_replay_past_session_survives_overlap`
+  → FAILED (`merged.vp=[20279]`), и СОБСТВЕННЫЙ 3-сессионный репро reviewer'а (S1 глубоко в прошлом → drop,
+  S2 пересекается окном → survive, S3 текущая — drop и survive в ОДНОМ fold'е) → FAILED
+  (`merged.vp=[20280]`). На `e4822e3` оба GREEN + `merged.series == full.series` побайтово. Второй
+  репро reviewer'а («сессия с паузой»: existing max < lo, incoming её восстанавливает) — GREEN на фиксе,
+  подтверждает, что порядок «drop ПОСЛЕ merge» выбран верно. Репро-файлы НЕ коммичены (зона reviewer'а —
+  только `PROJECT-STATE`/`TECH-DEBT`), приведены в TECH-DEBT TD-045 сырым выводом.
+- **§8 деплой-гейт — GREEN.** CI `30311103336` **success** + Deploy `30311103170` **success** на `28c186c`;
+  VPS `/root/hft-platform` HEAD = `28c186c`; `hft-recorder` и `hft-gateway-serve` — `(healthy)`,
+  `restarts=0` у обоих; heartbeat свежий (`ts_wall_ms=1785192910651` при `now=1785192912`), `writable=true`,
+  журнал растёт (`next_seq` 104 624 944 → 104 812 368 за 14 мин).
+  **E2E валидным JWT (HS256, stdlib-клиент reviewer'а в netns контейнера):**
+  ```
+  snapshot_bytes=2731437 elapsed_s=351.14
+  schema_version= 7
+  selector= {"venue":"Binance","symbol":"BTCUSDT","timeframe_ms":1000,"window_ms":60000}
+  series_keys= [... 'cvd_session_base', ..., 'volume_profile', 'vp_session_max_time_s', 'vwap']
+  cvd_session_base= [[20661, -129026987000]]        # per-session Vec-форма v7 (не скаляр v6)
+  vp_sessions= [20661]      vp_session_max_time_s= [[20661, 1785192460]]
+  cvd_points= 56  (одна сессия 20661 в окне 60 s)   V7_OK= True
+  ```
+  Прод строит Snapshot **v7** на боевом журнале (RssAnon gateway-serve 20 928 kB — плато, TD-039 не
+  вернулся; хост `free -m` 7 046 MB available). VP-сессия и запись `vp_session_max_time_s` согласованы
+  (одна и та же 20661), CVD-леджер — per-session (v6-скаляр отсутствует как форма).
+- **Честная граница §8:** midnight-reset НА ПРОДЕ в этом прогоне НЕ наблюдался — окно `[at−60s, at]`
+  целиком внутри сессии 20661 (замер в 22:47 UTC), а milestone допускает это явно («sanity свежих событий
+  у границы дня, ЕСЛИ журнал её покрывает»). Прямая проверка требует, чтобы 60-секундное окно попало на
+  00:00 UTC, т.е. чтобы 6-минутная сборка снапшота (TD-044) закончилась в первые ~50 s суток; ловить это
+  параллельными подключениями = N полных реплеев по 64 GB на боевом хосте с recorder'ом — не оправдано.
+  Инвариант держат оракулы (`red_gateway_cvd_session` 4/4, `cvd_two_sessions_live_across_midnight_window`,
+  парные vantage `overlap_multistep`/`past_session_survives_overlap`); прод-подтверждение границы станет
+  дешёвым после M-38b (чекпоинт снимает 6-минутный реплей) — там и проверить.
+- **Открытым остаётся `TD-046`** (`session_of` ломается при `GATEWAY_TIMEFRAME_MS`, не делящем сутки;
+  прод-дефолт 1000 ms не затронут) и заведён **`TD-047`** (док-долг: `docs/fa/viz-backend.md` VB-I-6
+  описывает v7-форму без `vp_session_max_time_s`, хотя поле уходит на провод). Оба — зона architect.
+- **RN-17 (не блокирующее, повтор из rev1):** `6827965` покрывал задачи #4-#8 одним коммитом; принято как
+  неразделимая миграция типа с по-задачным разбором в теле. **RN-19 (новое):** задача #11 в
+  `milestones/M-38a-cvd-session-ledger.md` осталась `⏳ OPEN` — engine-dev не воспользовался carve-out'ом
+  статус-колонки; фактически задача выполнена и смержена. Правка milestone-файла — не зона reviewer'а.
+- **Разблокировано:** M-38b (checkpoint-reducer) — модель сессии CVD зафиксирована ДО чекпоинта,
+  как и требовал M-38a §Objective. TD-044 (латентность 351 s на первый снапшот) остаётся MAJOR и
+  продолжает держать close-out M-28/M-36.
+
+## CVD session-anchored ledger — история захода (M-38a rev1: PR-гейт CHANGES REQUESTED, reviewer 2026-07-27)
+Ветка `feat/M-38a-cvd-session-ledger` @ `291e288`.
 - **Что ПРИНЯТО по существу (перепроверено reviewer'ом на своём worktree, не пересказом tester'а):** CVD
   per-session ledger (`CvdSession{base, bucket_delta}`, `cvd: BTreeMap<session_id, CvdSession>`) — reset на
   00:00 UTC реализован, running больше не течёт через границу суток; unified `session_max_time_s` (дубль
@@ -1523,9 +1586,9 @@ re-merge puzzle отсутствует, локальный `main` в общем 
   `.claude/rules/commit-discipline.md`). Принято как единая непрерывная миграция типа (промежуточные
   состояния не компилируются) + тело коммита даёт по-задачный разбор, так что аудит-трейл сохранён;
   задача #9 корректно вынесена отдельно. На будущее — фиксировать «non-separable migration» в теле явно.
-- **Статус: 🚧 IN_PROGRESS.** Push в `main` НЕ выполнен, §8 деплой-гейт НЕ запускался (merge не состоялся).
-  Дальше: architect — RED на удержание прошлой сессии под пересекающим окном + дизайн VP-эвикции на
-  merge-пути → engine-dev → повторный PR-гейт.
+- **Статус rev1: 🚧 IN_PROGRESS** (на момент вердикта). Цикл замкнулся штатно: architect `1d38a19`
+  (парный RED + дизайн задачи #11) → critic `C-029` PASS → engine-dev `e4822e3` → tester PASS →
+  reviewer APPROVED + merge `28c186c` (см. секцию выше).
 
 ## Bounded-snapshot (M-37 «Путь А: убрать OOM» — ✅ **MERGED `e4a8bc6` + §8 E2E GREEN на проде**, reviewer APPROVED 2026-07-27; TD-039 CLOSED)
 **Снапшот кокпита больше не убивает хост.** Прод (`e4a8bc6`, журнал 18 GB = 96 `.zst` + 7 raw): валидный JWT →

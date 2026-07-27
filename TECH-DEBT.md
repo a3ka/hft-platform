@@ -3,9 +3,39 @@
 > **Reviewer-owned.** Открытые долги/риски, замеченные при работе. Закрытые переносятся вниз.
 
 ## OPEN
-- **TD-045** `vp-whole-session-drop-at-bundle-merge-evicts-still-live-session` (найдено reviewer'ом на
-  PR-гейте M-38a, 2026-07-27). **БЛОКЕР merge M-38a. Это РЕГРЕССИЯ относительно `origin/main` cb28145,
-  доказанная прогоном, а не анализом.** `Snapshot::apply` (`crates/gateway/src/lib.rs:1245-1254`,
+- **TD-047** `v7-wire-форма-в-docs/fa/viz-backend.md-не-упоминает-vp_session_max_time_s` (заведено
+  reviewer'ом на merge-гейте M-38a, 2026-07-27). Доксинк, не код. `VB-I-6` перечисляет форму v7 как
+  «`SeriesBundle.cvd_session_base: Vec<(session_id, base)>` (per-session)», но фикс TD-045 (`e4822e3`,
+  задача #11) добавил в ТУ ЖЕ v7-форму ВТОРОЕ per-session поле — `vp_session_max_time_s:
+  Vec<(session_id, max_time_s)>`, которое уходит на провод (`gateway-serve` JSON passthrough) и является
+  частью контракта с фронтом. FA-спека описывает v7 неполно ⇒ консюмер, читающий только `docs/fa/`,
+  не знает о поле; следующий bump рискует «случайно» его переопределить. Зона: architect (`docs/fa/**`
+  вне зоны reviewer'а). Фикс: дописать поле в VB-I-6/VB-I-10 при ближайшем касании gateway (M-38b —
+  чекпоинт всё равно фиксирует форму состояния). Severity: **NOTE** (док-долг; код/поведение корректны,
+  оракул `red_gateway_window` держит байт-идентичность поля).
+- **TD-045** `vp-whole-session-drop-at-bundle-merge-evicts-still-live-session` — **✅ CLOSED 2026-07-27**
+  (`e4822e3` engine-dev по RED `1d38a19` architect'а + critic C-029 PASS; merge `28c186c`).
+  **Фикс в корень:** `SeriesBundle` теперь несёт `vp_session_max_time_s: Vec<(session_id, max_time_s)>`
+  (форма v7, зеркало `cvd_session_base`), `Reducer::finish` эмитит его из единой `session_max_time_s`,
+  `evict_series_bundle_under_window` префикс-фильтрует записи, а whole-session drop VP выполняется в
+  `Snapshot::apply` ПОСЛЕ `merge_volume_profile` по ИДЕНТИЧНОМУ редьюсеру критерию
+  `vp_session_max_time_s[sid] < lo_time_s`. Старый предикат `row.session_id < utc_session_id(at)` УДАЛЁН
+  (не закомментирован — сверено по диффу). Порядок «drop после merge» существенен: drop в эвикции терял
+  бы bins existing для сессии, которую incoming восстанавливает (проверено reviewer'ом отдельным
+  репро-тестом «сессия с паузой» — GREEN).
+  **Анти-плацебо доказан reviewer'ом НЕЗАВИСИМО от architect-фикстуры** (собственный 3-сессионный
+  репро: S1 глубоко в прошлом → drop, S2 пересекается окном → survive, S3 текущая, в ОДНОМ fold'е):
+  ```
+  # lib.rs откачен на e12779f (pre-fix), тесты HEAD:
+  test windowed_live_eq_replay_past_session_survives_overlap ... FAILED   (architect RED)
+       merged.vp=[20279]  # S1 потеряна
+  test reviewer_probe_three_sessions_drop_and_survive_in_one_fold ... FAILED   (репро reviewer'а)
+       merged.vp=[20280]  # S2 потеряна, хотя окно её пересекает
+  # на e4822e3 (fix): оба GREEN, + merged.series == full.series побайтово
+  ```
+  Остаточный риск: **нулевой на safety**, поле только read-path кокпита. Док-долг вынесен в TD-047.
+  **История дефекта (оставлена для аудита — класс «идеальная фикстура»).** Это была РЕГРЕССИЯ
+  относительно `origin/main` cb28145, доказанная прогоном, а не анализом. `Snapshot::apply` (`crates/gateway/src/lib.rs:1245-1254`,
   коммит `6827965`) получил новый блок, дропающий из existing VP-сессию, если её нет в
   `incoming.volume_profile` И `row.session_id < utc_session_id(frame.at_ms)`. Условие «день ушёл вперёд»
   НЕ эквивалентно оконному критерию редьюсера (`session_max_time_s[sid] < lo_time_s`,
@@ -33,10 +63,19 @@
   прошлой сессии, пока окно её пересекает. **Класс «идеальная фикстура» — ЧЕТВЁРТЫЙ РАЗ ПОДРЯД**
   (M-07 equity-curve, M-08 асимметричный дифф, M-37 TD-042, теперь M-38a): оракул давит на инвариант
   ровно с одной стороны, реализация ложится в эту сторону, вторая сторона ломается молча.
-  Severity: **MAJOR** (нарушен headline-инвариант milestone'а; данные кокпита расходятся live vs replay
-  до W секунд после каждой полуночи; ордер-пути нет).
+  Severity была: **MAJOR** (нарушен headline-инвариант milestone'а; данные кокпита расходились live vs
+  replay до W секунд после каждой полуночи; ордер-пути нет).
+- **TD-043** `multi-session-cvd-under-window-not-covered` — **✅ CLOSED 2026-07-27** (M-38a, merge
+  `28c186c`). CVD стал per-session ledger (`cvd: BTreeMap<session_id, CvdSession{base, bucket_delta}>`),
+  running обнуляется на 00:00 UTC, эвикция целыми прошлыми сессиями по ТОМУ ЖЕ критерию, что VP
+  (unified `session_max_time_s`), форма `cvd_session_base: Vec<(session_id, base)>`,
+  `GATEWAY_SCHEMA_VERSION` 6→7. Оракулы: `red_gateway_cvd_session` (4 runtime-RED на single-running),
+  `red_gateway_window::cvd_two_sessions_live_across_midnight_window`, `red_gateway_schema_v7`.
+  Трактовка «сессия» в VP и CVD теперь ОДНА (исходная претензия долга снята). Подтверждено на проде
+  (§8 E2E M-38a, см. `PROJECT-STATE.md`).
 - **TD-046** `cvd-session-split-breaks-when-timeframe-does-not-align-to-utc-midnight` (найдено reviewer'ом
-  на PR-гейте M-38a, 2026-07-27). Латентный, конфиг-зависимый. M-38a постулирует
+  на PR-гейте M-38a, 2026-07-27; **ОСТАЁТСЯ OPEN** после merge `28c186c` — фикс вне scope M-38a,
+  founder согласовал follow-up). Латентный, конфиг-зависимый. M-38a постулирует
   «`session_of(time_s) = time_s.div_euclid(86_400)` эквивалентен `utc_session_id(ts_ms)`»
   (`milestones/M-38a-cvd-session-ledger.md:60-62`). Это верно, только если бакет НЕ пересекает 00:00 UTC.
   `GATEWAY_TIMEFRAME_MS` — свободный env (`crates/gateway-serve/src/lib.rs:516`), без проверки на
