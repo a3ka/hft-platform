@@ -251,6 +251,11 @@ Binance+HL; фронт — founder'а (`code2alpha`), мы даём бэкенд
 `docs/07-cockpit-backend-roadmap.md`; FA — `docs/fa/{viz-backend,ai-copilot}.md`. Инвариант «LLM не в
 горячем цикле» сохранён (слой 9 вне детерминизма).
 
+**Read-path латентность (TD-044) и сквозной арх-аудит — отдельные долговечные роадмапы:**
+`milestones/M-38-roadmap.md` (чекпоинт+live-seek+shared-tailer, M-38a→b→M-39) и
+`docs/08-arch-improvement-roadmap.md` (сквозной аудит 2026-07-27: риски R1-R10 → milestone'ы M-40..M-44,
+системные паттерны). Свежая сессия читает их как источник по декомпозиции.
+
 Квант-деск (§7) работает параллельно с P0–P2 на записанных данных; первые подписи
 founder'а — на воротах P2 и P4.
 

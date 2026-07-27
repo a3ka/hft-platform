@@ -31,9 +31,22 @@
 
 ## Последовательность работ (read-path M-38a→b→39 идёт своим чередом, см. M-38-roadmap)
 
-**ШАГ 0 — НЕМЕДЛЕННО, вне milestone (необратимость данных, ВПЕРЁД кокпита):**
-- **0a. R1** — Storage Box + первый retention-apply + restore-drill. **founder-действие** (операторская зона). Диск тикает — не ждать.
-- **0b. R2** — новый TD + RED (retention над смесью raw+.zst) + фикс через `segments()`. Блокирует 0a от тихого провала. architect→engine-dev.
+**ШАГ 0 — необратимость данных (ВПЕРЁД кокпита):**
+- **0a. R1** — Storage Box + первый retention-apply + restore-drill. **founder-действие** (операторская зона).
+  **ОТЛОЖЕНО founder'ом ~2 недели (2026-07-27)** — пока не критично; вернуться ~2026-08-10. Диск тикает (~40 дней) — держать в поле зрения.
+- **0b. R2 → `M-40`** — RED (retention над смесью raw+.zst) + фикс через `segments()`. architect→engine-dev.
+
+### Привязка к milestone'ам (scheduled)
+| Шаг | Риск | Milestone | Статус |
+|---|---|---|---|
+| 0a | R1 | — (founder-действие) | ОТЛОЖЕНО ~2 нед |
+| 0b | R2 | `M-40-retention-compaction-dedup` | PLANNED |
+| 1a | R4 | `M-41-venue-hyperliquid-tests` | PLANNED |
+| 1b | R9 + докс-дрейф | `M-42-docs-governance-sync` | PLANNED |
+| 1c | R10 | `M-43-ops-hardening` | PLANNED |
+| 2 | R5, R7 | встроены в `M-38b`/`M-39` (M-38-roadmap) | — |
+| 3 | R6 + TD-029/030/032/033 | `M-44-book-hardening` | PLANNED |
+| 5 | R3, R8, INTG-I-* | отложено до quant/P3 | DEFERRED |
 
 **ШАГ 1 — параллельно M-38 (дёшево, высокий ROI, разные зоны):**
 - 1a. venue-hyperliquid RED-суита (R4) — architect-RED → venue-dev.
