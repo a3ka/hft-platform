@@ -35,6 +35,15 @@ use serde::{Deserialize, Serialize};
 ///    пересмотреть интерпретацию.
 pub const GATEWAY_SCHEMA_VERSION: u32 = 6;
 
+/// M-38a: UTC-day session id из уже-бакетированного `time_s` (секунды) — зеркалит
+/// `utc_session_id(ts_ms)` в секундном пространстве (`time_s.div_euclid(86_400) ==
+/// ts_ms.div_euclid(86_400_000)` при `time_s = ts_ms/1000`). Используется per-session CVD
+/// merge/eviction, которые оперируют уже забакетированными строками `SeriesBundle`
+/// (`cumulative_delta: Vec<(time_s, ...)>`), а не сырым `ts_exch_ms`.
+fn session_of(time_s: i64) -> i64 {
+    time_s.div_euclid(86_400)
+}
+
 /// Canonical UTC-day session anchor shared by session-cumulative indicators (VB-I-6).
 pub const fn utc_session_id(ts_exch_ms: i64) -> i64 {
     ts_exch_ms.div_euclid(86_400_000)
@@ -197,15 +206,24 @@ pub struct DepthRow {
 pub struct SeriesBundle {
     pub ohlcv: Vec<OhlcvRow>,
     /// Running cumulative delta `(time_s, знаковая агрессия до конца бакета)` (export v1 §3.2).
+    /// M-38a (TD-043, VB-I-6): running РЕСЕТИТСЯ на границе UTC-сессии (00:00 UTC) — каждая
+    /// сессия несёт свой running с нуля (+ `cvd_session_base(sid)`), НЕ единая сумма через все
+    /// дни (M-37 баг). Конкатенация per-session running-серий в порядке `session_id`
+    /// возрастания; внутри сессии — `time_s` возрастания.
     pub cumulative_delta: Vec<(i64, i64)>,
-    /// M-37 task #3: «сдвиг» running-суммы CVD — сумма знаковых delta эвиктнутых бакетов.
-    /// Используется merge-логикой `Snapshot::apply` для корректной свёртки CVD при fold'е:
-    /// иначе при эвикции префикса первое значение `cumulative_delta` интерпретировалось бы как
-    /// «весь prefix», и running-сумма ломалась. `#[serde(default)]` — обратная совместимость с
-    /// v6-снапшотами без поля (offline unbounded, base = 0). См. `VB-I-10` /
-    /// `red_gateway_window::cvd_base_survives_window_eviction`.
+    /// M-38a (TD-043): per-session CVD ledger base — `(session_id, base)`, СОРТ по `session_id`
+    /// возрастания. `base` = сумма знаковых delta эвиктнутых внутрисессионных бакетов ЭТОЙ
+    /// сессии (переносится в running при merge/фолде — иначе при эвикции префикса первое
+    /// удержанное значение `cumulative_delta` интерпретировалось бы как «весь prefix», и
+    /// running-сумма ломалась). Сессия БЕЗ записи в этом векторе трактуется как `base=0`
+    /// (никогда не эвиктилась внутрисессионно, либо целиком удалена как прошлая — см.
+    /// `evict_series_bundle_under_window`). Заменяет M-37 скалярный `cvd_session_base: i64`
+    /// (форма v6→v7, non-additive bump). `#[serde(default)]` — не type-совместимость с v6
+    /// (скаляр), а defensive-default для консюмеров, ещё не читающих поле; консюмер обязан
+    /// гейтить на `schema_version==7`. См. `VB-I-10` / `red_gateway_window::cvd_base_survives_*`
+    /// / `red_gateway_cvd_session.rs`.
     #[serde(default)]
-    pub cvd_session_base: i64,
+    pub cvd_session_base: Vec<(i64, i64)>,
     pub depth_series: Vec<DepthRow>,
     /// All-time VWAP `(time_s, price ×1e8)`, cumulative `Σ(price·size)/Σ(size)` от старта
     /// курсора (M-36, VB-I-6 reversal). БЕЗ reset на 00:00 UTC — `sum_pv/sum_v` копятся
@@ -450,24 +468,34 @@ fn merge_volume_profile(
     rows
 }
 
+/// M-38a (TD-043, VB-I-6): per-session CVD ledger element. `base` — running-сдвиг сессии
+/// (сумма знаковых delta уже эвиктнутых внутрисессионных бакетов); `bucket_delta` — удержанные
+/// per-бакет знаковые дельты ЭТОЙ сессии. Running сессии стартует с `base` (изначально 0 —
+/// НИКАКОГО наследования от предыдущей сессии, TD-043 фикс single-running M-37 бага).
+#[derive(Default)]
+struct CvdSession {
+    base: i64,
+    bucket_delta: BTreeMap<i64, i64>,
+}
+
 /// Incremental form of the M-17 reducers. State grows only with the emitted time buckets,
 /// never with the number of journal events.
 struct Reducer {
     selector: Selector,
     ohlcv: BTreeMap<i64, OhlcvAcc>,
-    bucket_delta: BTreeMap<i64, i64>,
-    /// M-37 task #3: сумма знаковых delta эвиктнутых бакетов — база для CVD running-суммы
-    /// (при fold'е в `Snapshot::apply` инкрементнутый cvd_session_base даёт running-значения
-    /// на удержанных бакетах, идентичные unbounded-свёртке).
-    cvd_session_base: i64,
+    /// M-38a (TD-043): per-session CVD ledger, `session_id → CvdSession`. Заменяет M-37
+    /// плоские `bucket_delta: BTreeMap<i64,i64>` + скалярный `cvd_session_base: i64` — каждая
+    /// UTC-сессия (`utc_session_id`, VB-I-6) держит СВОЙ running с нуля (сброс на 00:00 UTC).
+    cvd: BTreeMap<i64, CvdSession>,
     vwap: VwapAcc,
     depth: Vec<DepthAcc>,
     /// M-24: per-session Volume Profile accumulator (price→объём).
     vp: VolumeProfileAcc,
-    /// M-37 task #4: `session_id → max(bucket_time_s)` для whole-session эвикции VP. Обновляется
-    /// в `apply_vp` на КАЖДОЙ сделке (нужен для решения «эвиктить ли сессию целиком» —
-    /// сессия с max внутри окна удерживается, сессия полностью вне окна удаляется).
-    vp_session_max_time_s: BTreeMap<i64, i64>,
+    /// M-37 task #4 / M-38a task #5: `session_id → max(bucket_time_s)` — ОДНА структура на VP
+    /// И CVD whole-session эвикцию (унифицировано, было раздельное `vp_session_max_time_s`).
+    /// Обновляется в `apply_vp` на КАЖДОЙ сделке (нужен для решения «эвиктить ли сессию
+    /// целиком» — сессия с max внутри окна удерживается, сессия полностью вне окна удаляется).
+    session_max_time_s: BTreeMap<i64, i64>,
     /// M-23: текущая L2Delta-реконструированная книга (M-29 `apply_delta` + `apply_snapshot`).
     /// Owns the live book для heatmap/cob. Per-bucket snapshot книги — `heatmap_buckets`.
     book: book::OrderBook,
@@ -519,16 +547,16 @@ impl Reducer {
         Self {
             selector: selector.clone(),
             ohlcv: BTreeMap::new(),
-            bucket_delta: BTreeMap::new(),
-            // M-37 task #3: CVD running-base стартует с 0 (эвиктнутых дельт ещё нет). При эвикции
-            // `evict_window_state` инкрементирует на сумму эвиктнутых delta (`accumulate`, не
-            // «set to N»), так что fold нескольких кадров подряд корректно кумулятивен.
-            cvd_session_base: 0,
+            // M-38a: per-session CVD ledger стартует пустым — каждая сессия создаётся лениво
+            // (`self.cvd.entry(sid).or_default()`) при первой сделке этой UTC-сессии, running
+            // стартует с `base=0` (никакого наследования от предыдущей сессии, TD-043).
+            cvd: BTreeMap::new(),
             vwap: VwapAcc::default(),
             depth: Vec::new(),
             vp: VolumeProfileAcc::default(),
-            // M-37 task #4: per-session max(bucket_time_s) для whole-session VP эвикции.
-            vp_session_max_time_s: BTreeMap::new(),
+            // M-37 task #4 / M-38a task #5: per-session max(bucket_time_s), унифицировано на
+            // VP И CVD whole-session эвикцию.
+            session_max_time_s: BTreeMap::new(),
             book: book::OrderBook::new(),
             heatmap_buckets: BTreeMap::new(),
             bubbles: BTreeMap::new(),
@@ -538,37 +566,48 @@ impl Reducer {
         }
     }
 
-    /// M-37 task #2: эвиктировать бакет-оконное состояние для `time_s < lo_time_s`.
-    /// Вызывается на КАЖДОМ event (после обновления `at_ms`) — давление памяти O(окно) вместо
-    /// O(история) (VB-I-10, TD-039).
+    /// M-37 task #2 / M-38a task #6: эвиктировать бакет-оконное состояние для `time_s <
+    /// lo_time_s`. Вызывается на КАЖДОМ event (после обновления `at_ms`) — давление памяти
+    /// O(окно) вместо O(история) (VB-I-10, TD-039).
     ///
-    /// **Сессионно-скалярное** (CVD running-base через `cvd_session_base`, VWAP sum_pv/sum_v
-    /// внутри `VwapAcc`) НЕ эвиктируется — они переживают bucket-эвикцию (C-027 K3
-    /// `red_gateway_window::cvd_base_survives_window_eviction`).
+    /// **CVD per-session (M-38a, TD-043):** внутрисессионный префикс (бакеты `< lo_time_s`
+    /// УДЕРЖИВАЕМОЙ сессии) фолдится в `base` ЭТОЙ сессии — running-база переживает
+    /// bucket-эвикцию локально для каждой сессии (зеркально M-37
+    /// `cvd_base_survives_window_eviction`, теперь per-session). Целиком ПРОШЕДШАЯ сессия
+    /// (см. unified whole-session drop ниже) удаляется целиком — base+bucket_delta.
     ///
     /// **VP whole-session:** эвиктируем ТОЛЬКО целыми ПРОШЛЫМИ сессиями (C-027 K3 #2
     /// `red_gateway_window::vp_current_session_whole_not_bucket_windowed`). Текущая сессия
     /// удерживается целиком, даже если её ранние бакеты вне окна — иначе POC/VAH/VAL текущей
     /// сессии порежется (`vp_current_session_whole_not_bucket_windowed`).
+    ///
+    /// **Unified whole-session criterion (M-38a task #5):** ОДНА структура `session_max_time_s`
+    /// решает whole-session drop И для VP, И для CVD — сессия эвиктится целиком, когда
+    /// `session_max_time_s[sid] < lo_time_s` (последний бакет, КОГДА-ЛИБО виденный в этой
+    /// сессии, уже позади окна — она никогда больше не получит вклада, время в журнале
+    /// монотонно). Условие эквивалентно «CVD-сессия полностью выфолдилась в base выше»: если
+    /// ВСЕ бакеты сессии `< lo_time_s`, то и максимум её бакетов `< lo_time_s`.
     fn evict_window_state(&mut self, lo_time_s: i64) {
         if lo_time_s <= 0 {
             return; // lo_time_s ≤ 0 → окно растянуто в прошлое за пределы возможных бакетов
                     // (все time_s ≥ 0), ничего реально не эвиктим.
         }
 
-        // bucket_delta: эвикт + перенос суммы в cvd_session_base (CVD running-base переживает).
-        // accumulate (не set to N) — нужен для fold-корректности: кадр с cvd_session_base=I
-        // при apply() складывает свою базу I в existing-базу.
-        let mut evicted_delta_sum: i64 = 0;
-        self.bucket_delta.retain(|&t, &mut d| {
-            if t < lo_time_s {
-                evicted_delta_sum += d;
-                false
-            } else {
-                true
-            }
-        });
-        self.cvd_session_base += evicted_delta_sum;
+        // CVD per-session (M-38a task #4/#6): для КАЖДОЙ удержанной сессии фолдим бакеты
+        // `< lo_time_s` в её `base` (accumulate, не «set to N» — нужно для fold-корректности
+        // многошагового apply). Whole-session drop — ниже, унифицировано с VP.
+        for session in self.cvd.values_mut() {
+            let mut evicted_delta_sum: i64 = 0;
+            session.bucket_delta.retain(|&t, &mut d| {
+                if t < lo_time_s {
+                    evicted_delta_sum += d;
+                    false
+                } else {
+                    true
+                }
+            });
+            session.base += evicted_delta_sum;
+        }
 
         // ohlcv: бакет целостный (open/high/low/close/volume на этот бакет) — удаляем целиком.
         self.ohlcv.retain(|&t, _| t >= lo_time_s);
@@ -590,19 +629,22 @@ impl Reducer {
         // bubbles: ключ `(time_s, price_e8)` — эвикт по time_s.
         self.bubbles.retain(|&(t, _), _| t >= lo_time_s);
 
-        // VP whole-session (M-37 task #4): эвикт ТОЛЬКО целыми прошлыми сессиями. Текущая
-        // сессия (max_bucket_time_s ≥ lo_time_s) удерживается целиком (POC/VAH/VAL не
-        // порежутся). Условие эвикции = «max этой сессии < lo_time_s» (сессия полностью вне
-        // окна = её последний бакет уже эвиктнут).
+        // Unified whole-session eviction (M-37 task #4 + M-38a task #5): VP И CVD делят ОДИН
+        // критерий — `session_max_time_s[sid] < lo_time_s` (сессия полностью вне окна = её
+        // последний КОГДА-ЛИБО виденный бакет уже эвиктнут). Текущая сессия (max ≥ lo_time_s)
+        // удерживается целиком (POC/VAH/VAL VP не порежутся; CVD base/bucket_delta сессии не
+        // тронуты сверх fold'а выше). Прошлая сессия — удаляется целиком из ОБЕИХ структур
+        // (VP bins + CVD base/bucket_delta).
         let to_evict: Vec<i64> = self
-            .vp_session_max_time_s
+            .session_max_time_s
             .iter()
             .filter(|(_, &max_t)| max_t < lo_time_s)
             .map(|(&sid, _)| sid)
             .collect();
         for sid in to_evict {
             self.vp.bins.remove(&sid);
-            self.vp_session_max_time_s.remove(&sid);
+            self.cvd.remove(&sid);
+            self.session_max_time_s.remove(&sid);
         }
     }
 
@@ -663,16 +705,13 @@ impl Reducer {
             return;
         };
         self.vp.apply_trade(*ts_exch_ms, *price, *size);
-        // M-37 task #4: per-session max(bucket_time_s) для whole-session VP эвикции
-        // (см. `evict_window_state`). VP хранится per-сессия, не per-бакет → обновляем max на
-        // каждой сделке, чтобы `evict_window_state` мог решить «целиком ли прошлая сессия вне
-        // окна [at-W, at]».
+        // M-37 task #4 / M-38a task #5: per-session max(bucket_time_s) — ЕДИНАЯ структура
+        // для whole-session эвикции И VP, И CVD (см. `evict_window_state`). VP и CVD хранятся
+        // per-сессия, не per-бакет → обновляем max на каждой сделке, чтобы `evict_window_state`
+        // мог решить «целиком ли прошлая сессия вне окна [at-W, at]» для обоих индикаторов.
         if let Some(bucket_time_s) = self.bucket_time_s(*ts_exch_ms) {
             let sid = utc_session_id(*ts_exch_ms);
-            let entry = self
-                .vp_session_max_time_s
-                .entry(sid)
-                .or_insert(bucket_time_s);
+            let entry = self.session_max_time_s.entry(sid).or_insert(bucket_time_s);
             if bucket_time_s > *entry {
                 *entry = bucket_time_s;
             }
@@ -750,7 +789,13 @@ impl Reducer {
                     Side::Buy => *size,
                     Side::Sell => -*size,
                 };
-                *self.bucket_delta.entry(time_s).or_default() += signed_size;
+                // M-38a (TD-043): per-session CVD ledger — session ВЫВОДИТСЯ из `ts_exch_ms`
+                // (VB-I-6), НЕ из журнального `Event` (T1 не тронут). Каждая UTC-сессия ведёт
+                // свой `bucket_delta` независимо — reset на 00:00 UTC (никакого наследования
+                // от предыдущей сессии).
+                let sid = utc_session_id(*ts_exch_ms);
+                let session = self.cvd.entry(sid).or_default();
+                *session.bucket_delta.entry(time_s).or_default() += signed_size;
             }
             MdPayload::L2Snapshot {
                 bids,
@@ -833,25 +878,24 @@ impl Reducer {
             })
             .collect();
 
-        // M-37 task #3: CVD running-sum с базой (CVD running-base переживает bucket-эвикцию).
-        // running считается ТОЛЬКО по удержанным бакетам (`bucket_delta` после эвикции), а
-        // `cvd_session_base` прибавляется к КАЖДОМУ значению — так running на удержанных бакетах
-        // == running на этих же бакетах в unbounded-свёртке (разница ровно в сумме эвиктнутых
-        // delta, которая и есть cvd_session_base). Это даёт наивную single-running сумму без
-        // session-reset — для multi-session нужен per-session ledger (см. C-027 K3 #1);
-        // в M-37 тестах multi-session CVD не покрыт, оставлено как есть.
-        let mut running = 0_i64;
-        let mut cumulative_delta: Vec<(i64, i64)> = self
-            .bucket_delta
-            .into_iter()
-            .map(|(time_s, delta)| {
+        // M-38a (TD-043, task #7): CVD running-sum PER-SESSION, reset на границе 00:00 UTC.
+        // `self.cvd` — `BTreeMap<session_id, CvdSession>`, итерация ascending по `session_id`
+        // (внешний цикл) И по `time_s` внутри сессии (`bucket_delta` тоже `BTreeMap`) — так
+        // как session_id монотонно растёт вместе с временем (сессии — непересекающиеся
+        // календарные дни), результирующий `cumulative_delta` остаётся globally ascending по
+        // `time_s`. Running сессии стартует С `session.base` (сдвиг эвиктнутых внутрисессионных
+        // бакетов — переживает bucket-эвикцию ЛОКАЛЬНО для сессии), но НИКОГДА не наследует
+        // running предыдущей сессии (TD-043 fix — M-37 бага единой суммы через все дни).
+        let mut cumulative_delta: Vec<(i64, i64)> = Vec::new();
+        let mut cvd_session_base: Vec<(i64, i64)> = Vec::new();
+        for (sid, session) in self.cvd {
+            if session.base != 0 {
+                cvd_session_base.push((sid, session.base));
+            }
+            let mut running = session.base;
+            for (time_s, delta) in session.bucket_delta {
                 running += delta;
-                (time_s, running)
-            })
-            .collect();
-        if self.cvd_session_base != 0 {
-            for (_, v) in cumulative_delta.iter_mut() {
-                *v += self.cvd_session_base;
+                cumulative_delta.push((time_s, running));
             }
         }
 
@@ -880,11 +924,11 @@ impl Reducer {
         let (heatmap, cob) = build_heatmap_and_cob(&self.selector, self.heatmap_buckets);
         let volume_bubbles = build_volume_bubbles(self.bubbles);
 
-        // M-37 task #3: export cvd_session_base в SeriesBundle (для merge-логики в `apply()`).
-        // При fold'е existing (с base_e) + incoming (с base_i) их base складываются и
-        // применяются к merged `cumulative_delta` — иначе эвиктнутые prefix'ы обеих сторон
-        // потеряются (см. `merge_cvd_running`).
-        let cvd_session_base = self.cvd_session_base;
+        // M-38a task #7: `cvd_session_base` (Vec, per-session — собран выше в цикле по
+        // `self.cvd`) экспортируется в SeriesBundle для merge-логики `Snapshot::apply()`. При
+        // fold'е existing (base_e(sid)) + incoming (base_i(sid)) их базы складываются PER
+        // SESSION и применяются к merged `cumulative_delta` — иначе эвиктнутые prefix'ы обеих
+        // сторон потеряются (см. `merge_cvd_running`).
 
         SeriesBundle {
             ohlcv,
@@ -1116,24 +1160,28 @@ impl Snapshot {
     /// M-37 (VB-I-10): под окном `[at−W, at]` (`frame.at_ms` = «at») existing эвиктируется ДО
     /// merge — иначе `snapshot(C) + frames_since(C..) ≠ snapshot(LATEST)`: existing держит
     /// бакеты `[C−W, C]`, а финальное окно — `[LATEST−W, LATEST]` (C и LATEST не совпадают).
-    /// CVD running-base пересчитывается через `cvd_session_base` (existing += sum эвиктнутых,
-    /// merged = existing + incoming) — CVD-кривая остаётся непрерывной под окном.
+    /// M-38a (TD-043, C-028 K2): CVD running-base пересчитывается PER-SESSION через
+    /// `cvd_session_base: Vec<(session_id, base)>` (existing += sum эвиктнутых внутри каждой
+    /// сессии, merged(sid) = existing(sid) + incoming(sid)); сессия целиком позади финального
+    /// окна — whole-session drop (см. `evict_series_bundle_under_window`), НЕ переносится в
+    /// merge. CVD-кривая остаётся session-locally непрерывной под окном (reset на границах
+    /// сохранён при fold'е).
     pub fn apply(&mut self, frame: &Frame) {
         // 1. Финальное окно: `[frame.at_ms − W, frame.at_ms]` (None = unbounded, ничего не эвиктим).
         let final_lo_time_s = self.selector.window_lo_time_s(frame.at_ms);
 
-        // 2. M-37 task #2: ЭВИКЦИЯ existing под финальное окно. Этот шаг критичен для
-        // байт-идентичности `snapshot(C) + frames_since(C..) ≡ snapshot(LATEST)` под окном
-        // (без него existing держит бакеты `[C−W, C]`, которые в `snapshot(LATEST)` уже вне
-        // `[LATEST−W, LATEST]`).
+        // 2. M-37 task #2 / M-38a task #8: ЭВИКЦИЯ existing под финальное окно (per-session
+        // CVD fold + whole-session drop). Этот шаг критичен для байт-идентичности
+        // `snapshot(C) + frames_since(C..) ≡ snapshot(LATEST)` под окном (без него existing
+        // держит бакеты `[C−W, C]`, которые в `snapshot(LATEST)` уже вне `[LATEST−W, LATEST]`).
         if let Some(lo) = final_lo_time_s {
             evict_series_bundle_under_window(&mut self.series, lo);
         }
 
-        // 3. M-37 task #3: CVD running-base merge. ВАЖНО — existing уже эвиктнут (его
-        // `cvd_session_base` инкрементирован на сумму эвиктнутых delta, значения
-        // `cumulative_delta` сдвинуты). Merge ниже использует новый `cvd_session_base` как
-        // «previous» для обоих сторон.
+        // 3. M-38a task #8: CVD running-base merge PER-SESSION. ВАЖНО — existing уже эвиктнут
+        // (его per-session `cvd_session_base` инкрементирован на сумму эвиктнутых delta ЭТОЙ
+        // сессии, значения `cumulative_delta` не сдвинуты — TD-042 дисциплина). Merge ниже
+        // использует новый per-session `cvd_session_base` как «previous» для обеих сторон.
         merge_cvd_running(&mut self.series, &frame.delta);
 
         let mut ohlcv: BTreeMap<i64, OhlcvRow> = self
@@ -1177,6 +1225,28 @@ impl Snapshot {
         let mut vwap: BTreeMap<i64, i64> = self.series.vwap.drain(..).collect();
         vwap.extend(frame.delta.vwap.iter().copied());
         self.series.vwap = vwap.into_iter().collect();
+
+        // M-38a (task #8, VP whole-session drop at bundle-merge — same latent gap the K2
+        // overlap-multistep vantage exposes for CVD, now also exercised for VP): existing may
+        // carry a session's FULL VolumeProfileRow from an earlier merge, but
+        // `evict_series_bundle_under_window` never touches `volume_profile` (VP eviction is
+        // Reducer-internal, `evict_window_state`/`session_max_time_s`). A session absent from
+        // `incoming.volume_profile` while the current frame has moved to a STRICTLY LATER UTC
+        // day than that session (journal time monotonic ⇒ it will never receive more data) is
+        // done forever — drop it from existing BEFORE merge, mirroring CVD whole-session drop.
+        // Guard on both conditions (absence AND day-advance) so a batch that happens to carry
+        // zero Trade events (VP only updates on Trade) doesn't falsely evict a still-current
+        // session.
+        let current_day = utc_session_id(frame.at_ms);
+        let incoming_sids: std::collections::BTreeSet<i64> = frame
+            .delta
+            .volume_profile
+            .iter()
+            .map(|r| r.session_id)
+            .collect();
+        self.series
+            .volume_profile
+            .retain(|row| incoming_sids.contains(&row.session_id) || row.session_id >= current_day);
 
         // M-24: volume_profile сливается по session_id — восстанавливаем per-session гистограммы
         // из bins (existing + incoming), складываем, пересчитываем POC/VA (compute_vp_row).
@@ -1271,11 +1341,16 @@ fn merge_bubbles(existing: &[BubbleCell], incoming: &[BubbleCell]) -> Vec<Bubble
 /// 4. `heatmap` — per (time_s, side, price); close-семантика, после эвикции пересоберётся из
 ///    пришедшего frame'а (heatmap в frame.delta уже правильно ограничен своим reducer'ом).
 /// 5. `volume_bubbles` — per (time_s, price).
-/// 6. `cumulative_delta` — удаляем записи `< lo_time_s`; CVD running-base (`cvd_session_base`)
-///    инкрементируем на сумму эвиктнутых delta. Значения АБСОЛЮТНЫ (`Reducer::finish` уже
-///    прибавил `cvd_session_base` к каждому), эвикция префикса их НЕ меняет (только базу).
-///    `merge_cvd_running` идемпотентен на абсолютных значениях с корректной базой (первый
-///    удержанный: `d = value − cvd_session_base = δ`).
+/// 6. `cumulative_delta` (M-38a, per-session, TD-043) — сгруппировать записи по
+///    `session_of(time_s)`; в каждой сессии удалить `< lo_time_s`, сложив их дельты в
+///    `cvd_session_base(sid)` (значения АБСОЛЮТНЫ — `Reducer::finish` уже прибавил base к
+///    каждой, эвикция префикса их НЕ меняет, только базу). ЭТОТ шаг НИКОГДА не роняет сессию
+///    целиком (даже если held опустел — окно могло просто сдвинуться ВНУТРИ ещё активной
+///    сессии, incoming принесёт новые строки на следующем merge-шаге). Whole-session drop
+///    (C-028 K2, «сессия целиком позади окна навсегда» — зеркально VP-критерию) — в
+///    `merge_cvd_running`, где видно, приносит ли incoming строки для сессии тоже.
+///    `merge_cvd_running` идемпотентен на абсолютных значениях с корректной per-session базой
+///    (первый удержанный: `d = value − base(sid) = δ`).
 /// 7. `volume_profile` — VP whole-session эвикция выполнена на стороне reducer'а (см.
 ///    `Reducer::evict_window_state`). При fold'е bins восстанавливаются по session_id через
 ///    `merge_volume_profile`.
@@ -1301,78 +1376,144 @@ fn evict_series_bundle_under_window(series: &mut SeriesBundle, lo_time_s: i64) {
     // volume_bubbles
     series.volume_bubbles.retain(|c| c.time_s >= lo_time_s);
 
-    // cumulative_delta: эвикт + инкремент cvd_session_base. НЕ сдвигать значения —
-    // они АБСОЛЮТНЫ (`Reducer::finish` уже добавил cvd_session_base к каждому), эвикция
-    // префикса их не меняет (только базу). Сумма эвиктнутых delta идёт в cvd_session_base,
-    // чтобы следующая merge_cvd_running корректно восстановила running (первый удержанный
-    // d = value − cvd_session_base = δ, и т.д. — идемпотентно).
+    // cumulative_delta (M-38a per-session, task #8): сгруппировать существующие строки по
+    // `session_of(time_s)`, фолднуть `< lo_time_s` в base ТОЙ сессии. Значения АБСОЛЮТНЫ
+    // (`Reducer::finish` уже прибавил base к каждой), эвикция префикса их НЕ сдвигает — только
+    // базу (TD-042: предыдущая scalar-версия сдвигала удержанные значения, сдвиг копился по
+    // apply под пересекающимся окном; per-session фолд той же дисциплины избегает регрессии).
     //
-    // TD-042: предыдущая версия добавляла +evicted_sum к каждому удержанному значению.
-    // Под пересекающимся окном `snapshot(C) + frames_since(C..) ≢ snapshot(LATEST)`:
-    // existing уже абсолютен, +evicted_sum сдвигал его вверх на сумму, которая в `full` НЕ
-    // была сдвинута (Reducer не сдвигает — корректен). Сдвиг КОПИЛСЯ по apply.
-    let mut evicted_sum: i64 = 0;
-    let mut prev: i64 = series.cvd_session_base;
-    series.cumulative_delta.retain_mut(|&mut (t, ref mut v)| {
-        if t < lo_time_s {
-            let delta = *v - prev;
-            evicted_sum += delta;
-            prev = *v;
-            false
-        } else {
-            prev = *v;
-            true
-        }
-    });
-    if evicted_sum != 0 {
-        // Только базу: удержанные значения оставляем абсолютными.
-        series.cvd_session_base += evicted_sum;
+    // ВАЖНО: этот шаг САМ ПО СЕБЕ никогда не «роняет» сессию целиком — он ТОЛЬКО фолдит
+    // эвиктнутый префикс в base и переносит base дальше, даже если held пуст (сессия могла
+    // просто временно не иметь удержанных строк, потому что окно сдвинулось ВНУТРИ ТОЙ ЖЕ
+    // ещё активной сессии — held опустошится, а на следующем шаге incoming принесёт новые
+    // строки той же сессии; drop здесь был бы регрессией на single-session тесте
+    // `windowed_live_eq_replay`). Whole-session drop (C-028 K2) выполняется НИЖЕ по потоку —
+    // в `merge_cvd_running`, где видно, приносит ли INCOMING новые строки для сессии: если
+    // ни existing (после этого фолда), ни incoming не дают НИ ОДНОЙ строки — сессия
+    // действительно позади окна НАВСЕГДА (время в журнале монотонно, она уже никогда не
+    // получит вклад), и merge отбрасывает её base.
+    let mut bases: BTreeMap<i64, i64> = series.cvd_session_base.iter().copied().collect();
+    let mut rows_by_session: BTreeMap<i64, Vec<(i64, i64)>> = BTreeMap::new();
+    for &(t, v) in &series.cumulative_delta {
+        rows_by_session
+            .entry(session_of(t))
+            .or_default()
+            .push((t, v));
     }
+    let mut sessions: std::collections::BTreeSet<i64> = bases.keys().copied().collect();
+    sessions.extend(rows_by_session.keys().copied());
+
+    let mut new_cumulative_delta: Vec<(i64, i64)> = Vec::new();
+    let mut new_bases: BTreeMap<i64, i64> = BTreeMap::new();
+    for sid in sessions {
+        let rows = rows_by_session.remove(&sid).unwrap_or_default();
+        let base = bases.remove(&sid).unwrap_or(0);
+        let mut evicted_sum: i64 = 0;
+        let mut prev: i64 = base;
+        let mut held: Vec<(i64, i64)> = Vec::new();
+        for (t, v) in rows {
+            if t < lo_time_s {
+                evicted_sum += v - prev;
+                prev = v;
+            } else {
+                held.push((t, v));
+                prev = v;
+            }
+        }
+        let new_base = base + evicted_sum;
+        if new_base != 0 {
+            new_bases.insert(sid, new_base);
+        }
+        new_cumulative_delta.extend(held);
+    }
+    series.cumulative_delta = new_cumulative_delta;
+    series.cvd_session_base = new_bases.into_iter().collect();
 }
 
-/// M-37: CVD running-base merge. После `evict_series_bundle_under_window` existing имеет
-/// `cvd_session_base_e` (включая инкремент от только что эвиктнутых бакетов) и АБСОЛЮТНЫЕ
-/// значения (никакого сдвига удержанных — TD-042, dispatch: `finish` уже добавил
-/// `cvd_session_base` к каждому). Incoming имеет `cvd_session_base_i` и свои
-/// абсолютные значения (`cvd_session_base_i` + running(retained_i)).
+/// M-38a (TD-043, task #8): CVD running merge PER-SESSION. После
+/// `evict_series_bundle_under_window` existing имеет per-session base `base_e(sid)` (включая
+/// инкремент от только что эвиктнутых бакетов ЭТОЙ сессии) и АБСОЛЮТНЫЕ значения (никакого
+/// сдвига удержанных — TD-042, `finish`/предыдущий merge уже добавили base к каждой). Incoming
+/// имеет свой per-session `base_i(sid)` и абсолютные значения.
 ///
-/// **Алгоритм:**
-/// 1. Дельты existing извлекаем с «previous» = cvd_session_base_e (тогда первая дельта
-///    корректна: `value[первый_удержанный] − cvd_session_base_e = δ`).
-/// 2. Дельты incoming извлекаем с «previous» = cvd_session_base_i.
-/// 3. Суммируем дельты по time_s (один time_s — одна дельта с каждой стороны; union).
-/// 4. Ре-дериваем running с new_base = cvd_session_base_e + cvd_session_base_i.
-/// 5. `series.cvd_session_base = new_base` для последующих merge.
+/// **Алгоритм (per сессия, union существующих+incoming session_id):**
+/// 1. Дельты existing-строк ЭТОЙ сессии извлекаем с «previous» = `base_e(sid)` (тогда первая
+///    дельта корректна: `value[первый_удержанный] − base_e(sid) = δ`).
+/// 2. Дельты incoming-строк ЭТОЙ сессии извлекаем с «previous» = `base_i(sid)`.
+/// 3. Суммируем дельты по `time_s` (один `time_s` — одна дельта с каждой стороны при
+///    overlap на границе курсора; union).
+/// 4. Ре-дериваем running сессии с `new_base(sid) = base_e(sid) + base_i(sid)` — КАЖДАЯ сессия
+///    ре-деривится с СВОЕЙ базы (reset между сессиями сохранён, TD-043 — сессии НЕ делят
+///    running между собой).
+/// 5. `series.cvd_session_base` = per-session `new_base` (нулевые базы опускаются — форма
+///    v7 конвенция «отсутствие сессии = base 0»).
+///
+/// **Whole-session drop (C-028 K2):** если ДЛЯ ДАННОЙ сессии НИ existing (уже эвиктнутый выше
+/// `evict_series_bundle_under_window`), НИ incoming не дали НИ ОДНОЙ строки — сессия целиком
+/// позади финального окна И incoming (текущий/будущий вклад) тоже её не касается: время в
+/// журнале монотонно ⇒ она уже никогда не получит вклад. В этом случае `new_base` НЕ
+/// переносится (сессия отсутствует и в `cumulative_delta`, и в `cvd_session_base` — трактуется
+/// как base=0). Отличие от «просто пусто temporarily»: если существующие строки session'а
+/// ещё не были все эвиктнуты (существующая сессия жива в окне), `deltas` НЕ пуст (existing
+/// вносит хотя бы одну строку) — drop не срабатывает; сессия, чьи держащиеся строки ВСЕ
+/// только что эвиктнуты (existing пуст), но incoming продолжает приносить новые строки той же
+/// (ещё активной) сессии — тоже НЕ дропается (incoming вносит строки → `deltas` не пуст).
 fn merge_cvd_running(series: &mut SeriesBundle, incoming: &SeriesBundle) {
-    let base_e = series.cvd_session_base;
-    let base_i = incoming.cvd_session_base;
+    let existing_bases: BTreeMap<i64, i64> = series.cvd_session_base.iter().copied().collect();
+    let incoming_bases: BTreeMap<i64, i64> = incoming.cvd_session_base.iter().copied().collect();
 
-    let mut deltas: BTreeMap<i64, i64> = BTreeMap::new();
-    // existing
-    let mut prev = base_e;
+    let mut existing_rows: BTreeMap<i64, Vec<(i64, i64)>> = BTreeMap::new();
     for &(t, v) in &series.cumulative_delta {
-        let d = v - prev;
-        prev = v;
-        deltas.insert(t, d);
+        existing_rows.entry(session_of(t)).or_default().push((t, v));
     }
-    // incoming
-    let mut prev = base_i;
+    let mut incoming_rows: BTreeMap<i64, Vec<(i64, i64)>> = BTreeMap::new();
     for &(t, v) in &incoming.cumulative_delta {
-        let d = v - prev;
-        prev = v;
-        *deltas.entry(t).or_insert(0) += d;
+        incoming_rows.entry(session_of(t)).or_default().push((t, v));
     }
 
-    let new_base = base_e + base_i;
-    let mut running = new_base;
-    series.cumulative_delta = deltas
-        .into_iter()
-        .map(|(t, d)| {
+    let mut sessions: std::collections::BTreeSet<i64> = existing_bases.keys().copied().collect();
+    sessions.extend(incoming_bases.keys().copied());
+    sessions.extend(existing_rows.keys().copied());
+    sessions.extend(incoming_rows.keys().copied());
+
+    let mut new_cumulative_delta: Vec<(i64, i64)> = Vec::new();
+    let mut new_bases: Vec<(i64, i64)> = Vec::new();
+    for sid in sessions {
+        let base_e = existing_bases.get(&sid).copied().unwrap_or(0);
+        let base_i = incoming_bases.get(&sid).copied().unwrap_or(0);
+
+        let mut deltas: BTreeMap<i64, i64> = BTreeMap::new();
+        let mut prev = base_e;
+        for &(t, v) in existing_rows.get(&sid).map(Vec::as_slice).unwrap_or(&[]) {
+            deltas.insert(t, v - prev);
+            prev = v;
+        }
+        let mut prev = base_i;
+        for &(t, v) in incoming_rows.get(&sid).map(Vec::as_slice).unwrap_or(&[]) {
+            *deltas.entry(t).or_insert(0) += v - prev;
+            prev = v;
+        }
+
+        // Whole-session drop (C-028 K2): ни existing, ни incoming не дали ни одной строки для
+        // этой сессии → она позади финального окна НАВСЕГДА (журнал монотонен) — не переносим
+        // ни base, ни строки (пропускаем сессию целиком).
+        if deltas.is_empty() {
+            continue;
+        }
+
+        let new_base = base_e + base_i;
+        if new_base != 0 {
+            new_bases.push((sid, new_base));
+        }
+        let mut running = new_base;
+        for (t, d) in deltas {
             running += d;
-            (t, running)
-        })
-        .collect();
-    series.cvd_session_base = new_base;
+            new_cumulative_delta.push((t, running));
+        }
+    }
+
+    series.cumulative_delta = new_cumulative_delta;
+    series.cvd_session_base = new_bases;
 }
 
 /// Полная свёртка `[start .. at]` через bounded `journal::stream`. Read-only (GW-I-1).
