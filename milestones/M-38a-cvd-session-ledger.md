@@ -92,6 +92,21 @@ UTC-сессия (`utc_session_id`) — свой running с нуля; running о
 | 7 | `Reducer::finish` per-session running (reset на границе) + форма `cvd_session_base: Vec<(session_id,base)>` | red_gateway_cvd_session | engine-dev | ✅ DONE |
 | 8 | `merge_cvd_running`/`evict_series_bundle_under_window` per-session (byte-identity live==replay через полночь) | red_gateway_window (overlap-multistep) | engine-dev | ✅ DONE |
 | 9 | bump `GATEWAY_SCHEMA_VERSION` 6→7 + doc-комментарий (семантика CVD + форма cvd_session_base) | red_gateway_schema_v7 (константа/Snapshot/Frame ==7; C-028 K1); red_gateway_export_v2 (v1-аддитивность как регрессия) | engine-dev | ✅ DONE |
+| 10 | (RED, TD-045) `windowed_live_eq_replay_past_session_survives_overlap` — ПАРНЫЙ vantage к whole-drop: прошлая сессия УЦЕЛЕВАЕТ в merged, пока финальное окно её пересекает (K2 был односторонним) | — | architect | ✅ DONE (анти-плацебо: merged.vp=[S2] vs full=[S1,S2] на 4e3c116) |
+| 11 | (TD-045 fix) VP несёт per-session `vp_session_max_time_s` в SeriesBundle (v7-форма, БЕЗ второго bump — v7 ещё не в main); `evict_series_bundle_under_window`/`Snapshot::apply` дропают VP-сессию по ИДЕНТИЧНОМУ критерию редьюсера `vp_session_max_time_s[sid] < lo_time_s`, НЕ `session_id < utc_session_id(at)` | red_gateway_window (ОБА vantage) | engine-dev | ⏳ OPEN |
+
+### §TD-045 — VP whole-session drop на merge-пути (reviewer PR-гейт REJECT)
+**Корень:** `Snapshot::apply` дропал VP-сессию по `session_id < utc_session_id(at)`, а редьюсер — по
+`session_max_time_s[sid] < lo_time_s`. Сразу после 00:00 UTC окно `[at−W, at]` ещё пересекает вчерашнюю
+сессию → редьюсер держит, merge выбрасывает → GW-I-4/VB-I-2 сломан. `VolumeProfileRow` не несёт времени
+→ merge структурно не мог воспроизвести критерий. Оракул C-028 K2 был ОДНОСТОРОННИМ (только «drop»,
+без парного «survive») — 4-й «идеальный фикстур» подряд.
+**Дизайн фикса (architect; impl задача 11):** зеркало CVD — VP несёт per-session `max_time_s` в bundle
+(`vp_session_max_time_s: Vec<(session_id, max_time_s)>`), merge применяет ТОТ ЖЕ критерий `max_time_s < lo`.
+Проверено: удовлетворяет ОБА vantage (survive при lo=d2−15s, S1 max=d2−1s ≥ lo; drop при lo=d2+29s, S1 max < lo).
+**TD-046 (NOTE, не блокер M-38a):** `session_of=div_euclid(time_s,86_400)` ломается при GATEWAY_TIMEFRAME_MS,
+не делящем сутки (бакет через 00:00 → две сессии, один time_s). Прод-дефолт 1000 OK. Follow-up: гвардить
+`86_400_000 % timeframe_ms == 0` (gateway-serve config) ИЛИ выводить сессию бакета из `ts_exch_ms`. Вне M-38a.
 
 **Анти-плацебо (задачи 1-2, ПРОВЕРЕНО фактически):** `red_gateway_cvd_session` — 4 runtime-FAIL на
 текущем single-running CVD (S2 несёт running S1 через 00:00: 13e8 vs 3e8, 58e8 vs −7e8, 7e8 vs −3e8,

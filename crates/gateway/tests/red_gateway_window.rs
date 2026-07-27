@@ -466,3 +466,87 @@ fn windowed_live_eq_replay_overlap_multistep() {
         "windowed live != replay под пересекающимся окном (у границы 00:00 UTC) + multi-step (TD-042/K2)"
     );
 }
+
+#[test]
+fn windowed_live_eq_replay_past_session_survives_overlap() {
+    // TD-045 — ПАРНЫЙ vantage к whole-drop (overlap_multistep): fold ОСТАНАВЛИВАЕТСЯ, пока финальное
+    // окно ЕЩЁ ПЕРЕСЕКАЕТ прошлую сессию S1 → S1 обязана УЦЕЛЕТЬ в merged (== full). Односторонний
+    // оракул K2 пинует только «S1 dropped» (финальное окно целиком в S2); эта дыра дала регрессию:
+    // merge дропает VP-сессию по `session_id < utc_session_id(at)`, а не по оконному критерию редьюсера
+    // (`session_max_time_s[sid] < lo`) → роняет S1 сразу после 00:00, хотя окно её ещё держит.
+    // Анти-плацебо: падает на текущем merge (merged.vp теряет S1), GREEN только когда merge применяет
+    // ИДЕНТИЧНЫЙ оконный критерий (per-session max_time_s в bundle).
+    let d2 = 20_279 * DAY_MS;
+    let t0 = d2 - 90_000; // i=0..89 в S1, i=90..179 в S2
+    let mut events = Vec::new();
+    for i in 0..180i64 {
+        events.push(trade(100.0 + i as f64, 1.0, Side::Buy, t0 + i * 1_000));
+    }
+    let dir = journal_of(events);
+    let w = Some(WINDOW_MS);
+
+    let seqs: Vec<u64> = journal::stream(dir.path(), EpochFilter::OwnCaptureOnly)
+        .expect("stream")
+        .map(|e| e.expect("ev").seq)
+        .collect();
+    // C у границы (d2+35s); finalize at d2+45s → финальное окно [d2−15s, d2+45s] ЕЩЁ пересекает S1.
+    let c_idx = ((d2 + 35_000 - t0) / 1_000) as usize; // 125
+    let at_idx = ((d2 + 45_000 - t0) / 1_000) as usize; // 135
+    let c = Cursor::at(seqs[c_idx]);
+    let at_final = Cursor::at(seqs[at_idx]);
+
+    let full = snap(dir.path(), w, at_final);
+    let mut merged = snap(dir.path(), w, c);
+    // fold РОВНО (at_idx − c_idx) событий (126..=135) → merged.at = d2+45s, то же окно, что у full.
+    let (frames, _next) = gateway::frames_since(
+        dir.path(),
+        EpochFilter::OwnCaptureOnly,
+        &sel(w),
+        c,
+        at_idx - c_idx,
+    )
+    .expect("frames_since");
+    for f in &frames {
+        merged.apply(f);
+    }
+
+    let s1 = session_of(t0 / 1000);
+    let s2 = session_of((t0 + 179_000) / 1000);
+
+    // Предусловие: финальное окно ПЕРЕСЕКАЕТ S1 → full.vp содержит ОБЕ сессии (иначе тест не про survive).
+    let full_vp: Vec<i64> = full
+        .series
+        .volume_profile
+        .iter()
+        .map(|r| r.session_id)
+        .collect();
+    assert!(
+        full_vp.contains(&s1) && full_vp.contains(&s2),
+        "предусловие: финальное окно [d2−15s,d2+45s] пересекает S1 → full.vp = обе сессии (={full_vp:?})"
+    );
+
+    // TD-045: S1 обязана УЦЕЛЕТЬ в merged, пока окно её пересекает.
+    let merged_vp: Vec<i64> = merged
+        .series
+        .volume_profile
+        .iter()
+        .map(|r| r.session_id)
+        .collect();
+    assert!(
+        merged_vp.contains(&s1),
+        "TD-045: S1 обязана уцелеть в merged, пока финальное окно её пересекает (merge уронил её по \
+         session_id<utc_session_id(at), а не по оконному критерию) — merged.vp={merged_vp:?}"
+    );
+
+    // Байт-идентичность live==replay (VB-I-2): VP полностью совпадает.
+    assert_eq!(
+        merged.series.volume_profile, full.series.volume_profile,
+        "TD-045: VP merged != full под пересекающимся окном — whole-session drop на merge не совпадает \
+         с оконным критерием редьюсера"
+    );
+    // И вся свёртка байт-идентична (CVD-часть уже принята; тут пинуем именно VP-регрессию в составе).
+    assert_eq!(
+        merged.series, full.series,
+        "TD-045: windowed live != replay при пересечении окном прошлой сессии (VP whole-drop merge)"
+    );
+}
