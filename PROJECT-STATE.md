@@ -1518,6 +1518,32 @@ VB-I-6 per-series anchor) → critic **C-026 REJECT (fmt sacred) → rev2 PASS**
   `GATEWAY_WINDOW_MS=60000` (снапшот СТРОИТСЯ + `RssAnon` выходит на ПЛАТО). Повторный заход требует
   revert-of-revert либо свежей ветки.
 
+### rev2 (`c5d9ab8`, TD-040 фикс architect'а) — PR-гейт reviewer'а: **CHANGES REQUESTED, НЕ смержен** (2026-07-27)
+- **TD-040 ЗАКРЫТ по существу** (окончательное закрытие — после зелёного CI, которого не будет до merge):
+  фикс `c5d9ab8` убрал зависимость замера от окружения (`MEASURE_LOCK` сериализует оба замеряющих теста —
+  counting-allocator процесс-глобален, а cargo гонял их параллельно; `SEG_BYTES = 1 MiB` константой — журнал
+  растёт ЧИСЛОМ сегментов, не размером; анти-плацебо-контраст `read_all`; `INDEP_DELTA` 1→2 MiB при контрасте
+  ~64 MiB). Reviewer перепрогнал независимо: **4/4 полных прогона `red_gateway_bounded` (оба свойства,
+  дефолтный параллелизм) — PASS**; флак не воспроизводится.
+- **Гейты (reviewer, независимо, на своём worktree `/tmp/hft-reviewer-M37` @ `c5d9ab8`):** `verify_M-37.sh`
+  **VERDICT: PASS exit=0** (9/9 строк), `cargo test --workspace` **passed=397 failed=0** (132 блока),
+  fmt/build/clippy exit=0. **Анти-плацебо доказан reviewer'ом независимо:** при отключённой эвикции
+  (`evict_window_state` → no-op) `red_gateway_bounded` FAIL 2/2 и `red_gateway_window` FAIL 3/3 — оракулы
+  не плацебо. Block-scope: engine-dev тронул ровно `gateway/src/lib.rs`, `gateway-serve/src/{lib,main}.rs`,
+  `docker-compose.yml`; sacred-тесты/verify/milestone — только architect. Block-C — N/A (`contracts` не тронут).
+  RISK-BLOCK не применяется (read-path, без order-egress). Независимость авторства восстановлена (impl —
+  `engine-dev@noreply.local`, TD-041 вариант (b) подтверждён).
+- **НО: новый блокер TD-042, найден reviewer'ом на PR-гейте** — `Snapshot::apply` под окном ДВАЖДЫ учитывает
+  эвиктнутый CVD-префикс (сдвигает значения `cumulative_delta` И инкрементирует `cvd_session_base` на ту же
+  сумму) ⇒ **GW-I-4/VB-I-2 нарушены под окном**: `snapshot(C) + frames_since(C..) ≢ snapshot(LATEST)`.
+  Repro reviewer'а детерминирован: тот же журнал, что в `windowed_live_eq_replay`, но курсор `C` близко к
+  LATEST ⇒ окна ПЕРЕСЕКАЮТСЯ ⇒ merged CVD сдвинут на `+5e8` на всех 61 удержанных бакетах. Оракул это
+  пропустил, потому что ставит `C` в СЕРЕДИНУ истории — тогда existing эвиктируется целиком и цикл сдвига
+  идёт по пустому списку. Непокрытым остался ШТАТНЫЙ live-режим (push-loop тянет кадры каждые ~сотни мс ⇒
+  пересечение окон — норма), причём ошибка КОПИТСЯ с каждым `apply`. **«Идеальная фикстура» — третий раз
+  подряд** (M-07 equity-curve, M-08 асимметричный дифф). Цель M-37 (bounded memory) дефектом не затронута,
+  offline-путь (`window_ms = None`) не затронут. Дизайн фикса + RED-оракул — **architect** (gates §4).
+
 ## Пока НЕ реализовано (следующие фазы)
 - Крейты `risk`/`killswitch`/`oms`, `runner` — пофазно per DESIGN §10 (M-08: fail-closed риск-гейт
   между `strategy` и `oms`). MM-котирование, wiring весов из `signals.json` (граница B),
