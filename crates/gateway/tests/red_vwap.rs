@@ -59,6 +59,7 @@ fn sel(timeframe_ms: i64) -> Selector {
         symbol: "BTCUSDT".to_string(),
         timeframe_ms,
         bands: vec![0.001],
+        window_ms: None,
     }
 }
 
