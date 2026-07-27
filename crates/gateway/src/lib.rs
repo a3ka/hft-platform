@@ -33,7 +33,12 @@ use serde::{Deserialize, Serialize};
 ///    VWAP=journal-cumulative, SVP/CVD=session-anchored). Бамп 5 → 6 сигналит будущему
 ///    фронту о смене anchor. Потребители v5, читавшие vwap как session-серию, должны
 ///    пересмотреть интерпретацию.
-pub const GATEWAY_SCHEMA_VERSION: u32 = 6;
+/// 7: M-38a (TD-043) — **CVD session-anchored ledger**: `cumulative_delta` running теперь
+///    ОБНУЛЯЕТСЯ на границе 00:00 UTC (per UTC-сессия свой running с нуля — ЗЕРКАЛЬНО VP,
+///    было: единая running-сумма через все дни, M-37 баг). Форма `cvd_session_base` меняется
+///    скаляр `i64` → `Vec<(session_id, base)>` (per-session; отсутствие сессии в векторе ⇒
+///    base=0). Non-additive (семантика И форма) — бамп 6 → 7 (VB-I-6/VB-I-10).
+pub const GATEWAY_SCHEMA_VERSION: u32 = 7;
 
 /// M-38a: UTC-day session id из уже-бакетированного `time_s` (секунды) — зеркалит
 /// `utc_session_id(ts_ms)` в секундном пространстве (`time_s.div_euclid(86_400) ==
