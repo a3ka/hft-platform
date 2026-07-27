@@ -1,6 +1,6 @@
 # M-38a — CVD session-anchored ledger (TD-043)
 
-**Статус:** PROPOSED (RED+doc+verify закоммичены architect'ом; C-028 K1/K2 исправлены; ждёт re-review critic → engine-dev)
+**Статус:** DONE (смержен main @ 28c186c; §8 GREEN на проде — Snapshot schema_version=7, cvd_session_base per-session + vp_session_max_time_s; TD-043/TD-045 CLOSED. Reviewer 970d8bd.)
 **Закрывает:** TD-043 (CVD single-running через 00:00 UTC — M-37 §TD-042 «явно ОТЛОЖЕНО, завести
 отдельный TD»; `Reducer::finish` lib.rs:836-842 несёт пометку «для multi-session нужен per-session
 ledger … в M-37 не покрыт»).
@@ -93,7 +93,7 @@ UTC-сессия (`utc_session_id`) — свой running с нуля; running о
 | 8 | `merge_cvd_running`/`evict_series_bundle_under_window` per-session (byte-identity live==replay через полночь) | red_gateway_window (overlap-multistep) | engine-dev | ✅ DONE |
 | 9 | bump `GATEWAY_SCHEMA_VERSION` 6→7 + doc-комментарий (семантика CVD + форма cvd_session_base) | red_gateway_schema_v7 (константа/Snapshot/Frame ==7; C-028 K1); red_gateway_export_v2 (v1-аддитивность как регрессия) | engine-dev | ✅ DONE |
 | 10 | (RED, TD-045) `windowed_live_eq_replay_past_session_survives_overlap` — ПАРНЫЙ vantage к whole-drop: прошлая сессия УЦЕЛЕВАЕТ в merged, пока финальное окно её пересекает (K2 был односторонним) | — | architect | ✅ DONE (анти-плацебо: merged.vp=[S2] vs full=[S1,S2] на 4e3c116) |
-| 11 | (TD-045 fix) VP несёт per-session `vp_session_max_time_s` в SeriesBundle (v7-форма, БЕЗ второго bump — v7 ещё не в main); `evict_series_bundle_under_window`/`Snapshot::apply` дропают VP-сессию по ИДЕНТИЧНОМУ критерию редьюсера `vp_session_max_time_s[sid] < lo_time_s`, НЕ `session_id < utc_session_id(at)` | red_gateway_window (ОБА vantage) | engine-dev | ⏳ OPEN |
+| 11 | (TD-045 fix) VP несёт per-session `vp_session_max_time_s` в SeriesBundle (v7-форма, БЕЗ второго bump — v7 ещё не в main); `evict_series_bundle_under_window`/`Snapshot::apply` дропают VP-сессию по ИДЕНТИЧНОМУ критерию редьюсера `vp_session_max_time_s[sid] < lo_time_s`, НЕ `session_id < utc_session_id(at)` | red_gateway_window (ОБА vantage) | engine-dev | ✅ DONE (смержен e4822e3; RN-19) |
 
 ### §TD-045 — VP whole-session drop на merge-пути (reviewer PR-гейт REJECT)
 **Корень:** `Snapshot::apply` дропал VP-сессию по `session_id < utc_session_id(at)`, а редьюсер — по
