@@ -1493,6 +1493,31 @@ VB-I-6 per-series anchor) → critic **C-026 REJECT (fmt sacred) → rev2 PASS**
   прод-масштаб bounded-reduce/checkpoint → engine-dev → reviewer §8 E2E-GREEN валидный JWT → Snapshot schema_version=6
   + latency) и founder-подписи выбора архитектуры снапшота.
 
+## Bounded-snapshot (M-37 «Путь А: убрать OOM» — **НЕ В MAIN: смержен и ОТКАЧЕН на деплой-гейте**, reviewer 2026-07-27)
+- **Состояние main: код M-37 ОТСУТСТВУЕТ.** Merge `f1d5eed` → CI RED → revert `9680857` → восстановление
+  аудит-артефактов `8ae7713`. **Main зелёный** (CI 8ae7713: все 5 job'ов success). Прод — на `65519ae`
+  (deploy на docs-only коммит не триггерится), §8 eyes-on: `hft-gateway-serve` Up 9h (healthy),
+  `hft-recorder` Up 10h (healthy), heartbeat отставание ~3.2 s, `writable=true`, журнал 19 GB растёт.
+- **На main оставлены (аудит-трейл):** `milestones/M-37-bounded-snapshot.md`, `research/critiques/C-027-M-37.md`.
+  Сознательно НЕ возвращены: impl, RED-оракулы `red_gateway_window.rs`/`red_serve_window_wiring.rs`,
+  `scripts/verify_M-37.sh` — RED без реализации красит main (`gates.md` §8).
+- **Работа сохранена** в `feat/M-37-bounded-snapshot` @ `c2b926a` (2 коммита engine-dev поверх architect-базы
+  `caca518`). Локальные гейты зелёные: `verify_M-37.sh` VERDICT PASS exit=0, `cargo test --workspace`
+  passed=397 failed=0 (132 блока), fmt/clippy/build exit=0.
+- **Блокер — TD-040:** `red_gateway_bounded::snapshot_stream_working_set_bounded` красный на CI (2/2, вкл.
+  rerun) и зелёный локально (4/4): «память растёт с РАЗМЕРОМ журнала (+2 468 066 B) — не O(1)» при пороге
+  `INDEP_DELTA` 1 MiB. Упавший оракул — Свойство 1 эпохи TD-011 (offline `window_ms: None`), НЕ оконный оракул
+  M-37: `snapshot_memory_bounded_by_window_not_history` на CI **GREEN** — оконная эвикция работает.
+- **PR-гейт reviewer'а (пройден до деплой-гейта):** Block-scope — dev-диапазон `caca518..c2b926a` = 4 файла,
+  все в Allowed paths; sacred-тесты/`contracts`/`risk`/milestones/verify/docs dev'ом не тронуты. Block-C — N/A
+  (`crates/contracts/**` не тронут). RISK-BLOCK — не применяется (gateway read-only viz, без order-egress).
+  Авторство — reviewer-коммитов выше main нет (см. TD-041, governance-ремедиация `caca518`, вариант (b),
+  подтверждена сравнением tree/blob).
+- **M-37 остаётся 🚧 IN_PROGRESS**, TD-039 и TD-020 — **OPEN**. Дальше: architect диагностирует TD-040
+  (зона architect по `gates.md` §4) → engine-dev → reviewer повторный merge + §8 E2E с
+  `GATEWAY_WINDOW_MS=60000` (снапшот СТРОИТСЯ + `RssAnon` выходит на ПЛАТО). Повторный заход требует
+  revert-of-revert либо свежей ветки.
+
 ## Пока НЕ реализовано (следующие фазы)
 - Крейты `risk`/`killswitch`/`oms`, `runner` — пофазно per DESIGN §10 (M-08: fail-closed риск-гейт
   между `strategy` и `oms`). MM-котирование, wiring весов из `signals.json` (граница B),
