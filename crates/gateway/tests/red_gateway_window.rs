@@ -16,7 +16,23 @@ use gateway::{Cursor, Selector};
 use journal::{EpochFilter, Journal, WriterConfig};
 
 const DAY_MS: i64 = 86_400_000;
+const DAY_S: i64 = 86_400;
 const WINDOW_MS: i64 = 60_000;
+
+/// M-38a: UTC-сессия из бакет-`time_s` (зеркалит `gateway::utc_session_id` в секундах).
+fn session_of(time_s: i64) -> i64 {
+    time_s.div_euclid(DAY_S)
+}
+
+/// M-38a: per-session base из формы v7 `cvd_session_base: Vec<(session_id, base)>`.
+/// Сессия без base-записи трактуется как base=0.
+fn session_base(bases: &[(i64, i64)], sid: i64) -> i64 {
+    bases
+        .iter()
+        .find(|(s, _)| *s == sid)
+        .map(|(_, b)| *b)
+        .unwrap_or(0)
+}
 
 fn cfg() -> WriterConfig {
     WriterConfig {
@@ -70,6 +86,8 @@ fn snap(dir: &std::path::Path, window_ms: Option<i64>, at: Cursor) -> gateway::S
 #[test]
 fn cvd_base_survives_window_eviction() {
     // Одна UTC-сессия. Сделка A рано (вне окна), B в окне. CVD = running-сумма сессии.
+    // M-38a (форма v7): base эвиктнутого бакета A хранится в per-session ledger
+    // `cvd_session_base: Vec<(session_id, base)>` ЭТОЙ сессии (не в скаляре).
     let t0 = 20_278 * DAY_MS; // начало UTC-дня
     let a = t0 + 10_000;
     let b = t0 + 130_000; // +130s → окно 60s эвиктит бакет A
@@ -95,6 +113,20 @@ fn cvd_base_survives_window_eviction() {
         "окно обязано отбросить ранний бакет A из CVD-серии (окно={}, полный={})",
         win.series.cumulative_delta.len(),
         full.series.cumulative_delta.len()
+    );
+    // Форма v7 (compile-RED против скаляра M-37): base эвиктнутого бакета A (+10) осело в
+    // per-session ledger ЭТОЙ сессии; base = сумма эвиктнутых внутрисессионных дельт.
+    let s = session_of(a / 1000);
+    assert_eq!(
+        session_base(&win.series.cvd_session_base, s),
+        to_fixed(10.0),
+        "base текущей сессии обязан нести дельту эвиктнутого бакета A (+10)"
+    );
+    // full (без окна, ничего не эвиктнуто) → base сессии = 0.
+    assert_eq!(
+        session_base(&full.series.cvd_session_base, s),
+        0,
+        "без окна эвикции нет → per-session base = 0"
     );
 }
 
@@ -155,6 +187,98 @@ fn vp_current_session_whole_not_bucket_windowed() {
 }
 
 #[test]
+fn cvd_two_sessions_live_across_midnight_window() {
+    // M-38a: окно ЧЕРЕЗ 00:00 UTC → 2 session-ledger элемента живы ОДНОВРЕМЕННО (хвост S1 +
+    // голова S2). Каждая сессия — свой running (reset на границе, зеркально VP). Окно режет
+    // ТОЛЬКО охват (ранний бакет S1), НЕ session-local значения.
+    let d1 = 20_278 * DAY_MS;
+    let d2 = 20_279 * DAY_MS; // 00:00 UTC следующего дня
+    let w = Some(120_000_i64); // окно 120s
+    let dir = journal_of(vec![
+        trade(100.0, 8.0, Side::Buy, d1 + 10_000), // S1 ранний (вне окна → эвикт → base S1)
+        trade(100.0, 4.0, Side::Buy, d2 - 30_000), // S1 хвост 23:59:30 (в окне [at-120s, at])
+        trade(100.0, 3.0, Side::Sell, d2 + 30_000), // S2 голова 00:00:30 (в окне, = at)
+    ]);
+    let full = snap(dir.path(), None, Cursor::LATEST);
+    let win = snap(dir.path(), w, Cursor::LATEST);
+
+    let s1 = session_of(d1 / 1000);
+    let s2 = session_of(d2 / 1000);
+
+    // Обе сессии живы в окне (2 ledger-элемента).
+    assert!(
+        win.series
+            .cumulative_delta
+            .iter()
+            .any(|(t, _)| session_of(*t) == s1),
+        "S1-хвост обязан быть жив в окне (23:59:30 внутри [at-120s, at])"
+    );
+    assert!(
+        win.series
+            .cumulative_delta
+            .iter()
+            .any(|(t, _)| session_of(*t) == s2),
+        "S2-голова обязана быть жива в окне"
+    );
+
+    // S2 running session-local = -3 (НЕ несёт S1 +8/+4). full и win дают одно session-local.
+    let win_s2 = win
+        .series
+        .cumulative_delta
+        .iter()
+        .rev()
+        .find(|(t, _)| session_of(*t) == s2)
+        .expect("S2 в окне")
+        .1;
+    let full_s2 = full
+        .series
+        .cumulative_delta
+        .iter()
+        .rev()
+        .find(|(t, _)| session_of(*t) == s2)
+        .expect("S2 в full")
+        .1;
+    assert_eq!(
+        win_s2,
+        -to_fixed(3.0),
+        "S2 running session-local = -3 (reset на 00:00 UTC)"
+    );
+    assert_eq!(
+        win_s2, full_s2,
+        "session-local S2 не зависит от окна (окно меняет охват, не значение)"
+    );
+
+    // Форма v7: per-session base. Ранний бакет S1 (+8) эвиктнут → осел в base ЭТОЙ сессии S1.
+    // S2 эвикции не было → base S2 = 0.
+    assert_eq!(
+        session_base(&win.series.cvd_session_base, s1),
+        to_fixed(8.0),
+        "base S1 = сумма эвиктнутых ранних бакетов S1 (+8)"
+    );
+    assert_eq!(
+        session_base(&win.series.cvd_session_base, s2),
+        0,
+        "base S2 = 0 (голова сессии, эвикции внутри S2 не было)"
+    );
+    // Хвост S1 (23:59:30, в окне) удержан: его running session-local = base(S1)+8+4 = 8+4=... нет,
+    // running S1 = base(эвиктнут +8) применён к удержанному бакету (+4) → 8+4 = 12 (непрерывность
+    // сессии под окном, зеркально M-37 cvd_base_survives).
+    let win_s1 = win
+        .series
+        .cumulative_delta
+        .iter()
+        .rev()
+        .find(|(t, _)| session_of(*t) == s1)
+        .expect("S1-хвост в окне")
+        .1;
+    assert_eq!(
+        win_s1,
+        to_fixed(12.0),
+        "S1-хвост running = base(+8) + удержанный бакет(+4) = +12 (непрерывность S1 под окном)"
+    );
+}
+
+#[test]
 fn windowed_live_eq_replay() {
     // VB-I-2 под окном: full(LATEST) ≡ snapshot(C) + frames_since(C..), окно одинаково у обоих.
     let t0 = 20_278 * DAY_MS;
@@ -206,7 +330,12 @@ fn windowed_live_eq_replay_overlap_multistep() {
     // [LATEST−W, LATEST]. cumulative_delta АБСОЛЮТЕН → эвикция префикса НЕ должна менять удержанные
     // значения. Плюс multi-step fold (кадры малыми батчами, как штатный live push-loop) → сдвиг
     // КОПИТСЯ на каждом apply. Штатный live даёт пересечение окон ВСЕГДА — это норма, не край.
-    let t0 = 20_278 * DAY_MS;
+    //
+    // M-38a: поток ПЕРЕСЕКАЕТ 00:00 UTC (180 бакетов вокруг границы: 90 в S1, 90 в S2) → merge
+    // per-session с reset. Overlap-fold обязан удержать session-local значения S2 (не накопленные
+    // через границу) БАЙТ-идентично между live и replay.
+    let d2 = 20_279 * DAY_MS;
+    let t0 = d2 - 90_000; // старт за 90s до 00:00 UTC → i=0..89 в S1, i=90..179 в S2
     let mut events = Vec::new();
     for i in 0..180i64 {
         events.push(trade(100.0 + i as f64, 1.0, Side::Buy, t0 + i * 1_000));
@@ -223,6 +352,28 @@ fn windowed_live_eq_replay_overlap_multistep() {
 
     let full = snap(dir.path(), w, Cursor::LATEST);
     let mut merged = snap(dir.path(), w, c);
+
+    // Session-reset на full: финальное окно целиком в S2; последний бакет = 90-й бакет S2 → +90
+    // (session-local, reset на 00:00 UTC). Текущий single-running дал бы +180 (S1+S2 сквозняком).
+    let s1 = session_of(t0 / 1000);
+    let s2 = session_of((t0 + 179_000) / 1000);
+    assert_eq!(
+        full.series.cumulative_delta.last().expect("cvd непуст").1,
+        to_fixed(90.0),
+        "S2 session-local: последний бакет = +90 (reset на 00:00 UTC), НЕ +180 через границу"
+    );
+    // Прошлая сессия S1 dropped целиком (не осела в base) — зеркально whole-session VP эвикции.
+    assert_eq!(
+        session_base(&full.series.cvd_session_base, s1),
+        0,
+        "прошлая сессия S1 dropped целиком (не в base)"
+    );
+    // base S2 = сумма эвиктнутых ранних S2-бакетов (i=90..118, +0..+28s → 29 бакетов по +1 = +29).
+    assert_eq!(
+        session_base(&full.series.cvd_session_base, s2),
+        to_fixed(29.0),
+        "base S2 = 29 эвиктнутых ранних бакетов текущей сессии"
+    );
 
     // Multi-step: тянем кадры батчами по 2 до сходимости курсора (fold — накопление ошибки).
     let mut cur = c;
