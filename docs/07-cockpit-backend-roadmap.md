@@ -180,3 +180,31 @@ M-10 стек-фиксы (сигналы), funding-стратегия.
 - `feat/M-10-rebased` — замороженная RED-спека сигналов (C-020 A/B/C/D) + D-001 (OBI KILL).
 - `tmp/design_screens/` — Bookmap/TPP референсы + брифы.
 - `milestones/{M-16,M-17,M-18,M-19,M-20,M-21}.md`.
+
+## §14. Order Flow Intelligence — 4 индикатора + L2Delta fidelity (founder 2026-07-27)
+
+Founder подтвердил 4 доп. индикатора кокпита. Все — чистые редьюсеры над `Event` (Trade + L2Snapshot/
+L2Delta), read-side, детерминированные (VB-I-1). Milestone'ы: **`M-46`** (индикаторы), **`M-45`** (охват L2Delta).
+
+**Ключевой факт fidelity (замер живого Binance WS + код, 2026-07-27):**
+- Сделки (`@trade` + агрессор `m`) — полная fidelity.
+- Книга: `venue-binance` пишет 1 Гц бакетированный `L2Snapshot` (bucket 2bps, ±60%). **M-18 уже пишет
+  СЫРОЙ `L2Delta` (100мс diff), но по allow-list — ТОЛЬКО BTC** («объём под контролем»). Для BTC суб-секундная
+  точная-цена fidelity доступна УЖЕ.
+- Замер diff: ~1.5 KB/с на ликвидный символ (BTC/ETH) — в 5-10× дешевле снапшота → расширять L2Delta дёшево
+  (диск +~0.1-0.3 GB/сут; runway почти не двигает — `docs/08`).
+- Order-level (MBO/ID заявок) публично НЕ дают ни Binance, ни HL → spoofing/refill навсегда **net-level
+  инференсы** (как Bookmap/TPP); размечаются провенансом, не выдаются за факт.
+
+**Индикаторы (M-46):**
+| Индикатор | Тип | Fidelity | Когда |
+|---|---|---|---|
+| Time & Sales | сырьё (лента) | полная | сейчас |
+| Refill / iceberg | инференс Trade×book | рабочая | сейчас |
+| Liquidity tracker | инференс L2 add/pull | грубый (1с) → точный (L2Delta) | грубый сейчас; точный BTC-сейчас/др.-после M-45 |
+| Spoofing radar | инференс net-level | нужен суб-сек L2Delta | BTC сейчас; др. после M-45 |
+
+**Порядок:** R1 (бэкап/ретеншен, `docs/08` ШАГ 0) → **M-45** (расширить L2Delta allow-list с BTC на символы
+кокпита) → **M-46** Фаза 2 (spoofing/точный liquidity на др. символах). Фаза 1 M-46 (Time&Sales/Refill/
+грубый liquidity) — без зависимостей, можно сразу. Провенанс `orderflow_inference: "net-level, no MBO"` +
+глубина VB-I-5 — обязательны.
