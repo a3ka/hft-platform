@@ -112,13 +112,13 @@ legacy-сегменту), и на этом журнале условие `first_
 
 | # | Status | Задача | Агент | Acceptance |
 |---|---|---|---|---|
-| 1 | ⏳ OPEN | Снять безусловный fail-loud в `advance_to` (`lib.rs:2178-2186`); бутстрап на усечённом журнале ЛЕГАЛЕН | engine-dev | `red_checkpoint_bootstrap_truncated` GREEN |
-| 2 | ⏳ OPEN | `history_start_seq` + `history_truncated` в `Snapshot` и в заголовке чекпоинта; значение — из ПЕРВОГО реально свёрнутого события (не из `header.first_seq`, TD-030) | engine-dev | оба пути дают одинаковые значения |
-| 3 | ⏳ OPEN | Fail-loud СУЖЕН до разрыва: валидный чекпоинт с курсором `C` и `earliest_seq > C + 1` → `Err`, ничего не писать | engine-dev | `gap_between_checkpoint_and_journal_is_loud` GREEN |
-| 4 | ⏳ OPEN | `GATEWAY_SCHEMA_VERSION` 7→8 + `docs/fa/viz-backend.md` уже обновлён architect'ом; проброс полей через `gateway-serve` на провод | engine-dev | `red_gateway_schema_version` GREEN (оракул версионно-агностичен, C-032 R1) |
-| 5 | ⏳ OPEN | **ops:** `deploy/bin/gateway-checkpoint-cron.sh` + запись в `deploy/cron.d/` (чекпоинт ДО retention). **Контракт (C-032 R4):** обёртка поддерживает `HFT_CRON_PRINT_ARGV=1` — печатает argv, который выполнила бы, и выходит 0 БЕЗ побочных эффектов (без docker, без записи), чтобы гейт проверял её ИСПОЛНЕНИЕМ | engine-dev | канарейки исполняют обёртку |
-| 6 | ⏳ OPEN | **ops:** `deploy/bin/journal-retention-cron.sh` передаёт `--checkpoint-coverage=<путь>` + тот же `HFT_CRON_PRINT_ARGV=1`. **Путь артефакта обязан СОВПАДАТЬ** с `--coverage-out` обёртки чекпоинтера — рассогласование = retention молча работает по несуществующему покрытию (fail-closed no-op) | engine-dev | канарейка КОМПОЗИЦИИ двух обёрток |
-| 7 | ⏳ OPEN | Прогон `bash scripts/verify_M-48.sh` → `VERDICT: PASS` | engine-dev | exit=0 + Done Block |
+| 1 | ✅ DONE | Снять безусловный fail-loud в `advance_to` (`lib.rs:2178-2186`); бутстрап на усечённом журнале ЛЕГАЛЕН | engine-dev | `red_checkpoint_bootstrap_truncated` GREEN |
+| 2 | ✅ DONE | `history_start_seq` + `history_truncated` в `Snapshot` и в заголовке чекпоинта; значение — из ПЕРВОГО реально свёрнутого события (не из `header.first_seq`, TD-030) | engine-dev | оба пути дают одинаковые значения |
+| 3 | ✅ DONE | Fail-loud СУЖЕН до разрыва: валидный чекпоинт с курсором `C` и `earliest_seq > C + 1` → `Err`, ничего не писать | engine-dev | `gap_between_checkpoint_and_journal_is_loud` GREEN |
+| 4 | ✅ DONE | `GATEWAY_SCHEMA_VERSION` 7→8 + `docs/fa/viz-backend.md` уже обновлён architect'ом; проброс полей через `gateway-serve` на провод | engine-dev | `red_gateway_schema_version` GREEN (оракул версионно-агностичен, C-032 R1) |
+| 5 | ✅ DONE | **ops:** `deploy/bin/gateway-checkpoint-cron.sh` + запись в `deploy/cron.d/` (чекпоинт ДО retention). **Контракт (C-032 R4):** обёртка поддерживает `HFT_CRON_PRINT_ARGV=1` — печатает argv, который выполнила бы, и выходит 0 БЕЗ побочных эффектов (без docker, без записи), чтобы гейт проверял её ИСПОЛНЕНИЕМ | engine-dev | канарейки исполняют обёртку |
+| 6 | ✅ DONE | **ops:** `deploy/bin/journal-retention-cron.sh` передаёт `--checkpoint-coverage=<путь>` + тот же `HFT_CRON_PRINT_ARGV=1`. **Путь артефакта обязан СОВПАДАТЬ** с `--coverage-out` обёртки чекпоинтера — рассогласование = retention молча работает по несуществующему покрытию (fail-closed no-op) | engine-dev | канарейка КОМПОЗИЦИИ двух обёрток |
+| 7 | ✅ DONE | Прогон `bash scripts/verify_M-48.sh` → `VERDICT: PASS` | engine-dev | exit=0 + Done Block |
 
 ### Ревизия rev2 — критик C-032 REJECT, четыре блокера закрыты
 
