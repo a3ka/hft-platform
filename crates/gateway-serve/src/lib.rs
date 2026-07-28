@@ -67,29 +67,54 @@ pub mod wire {
     }
 }
 
-/// Serve-adapter — ТОНКИЙ passthrough над `gateway::{snapshot,frames_since}` (GS-I-5: без трансформации
-/// серий → live==replay цел). engine-dev (M-28 task #3).
+/// Serve-adapter — ТОНКИЙ passthrough над `gateway::{snapshot_from_checkpoint,frames_since}`
+/// (GS-I-5: без трансформации серий → live==replay цел). engine-dev (M-28 task #3 + M-38b #15).
 pub mod serve {
     use std::io;
     use std::path::Path;
 
-    use crate::_gw::{frames_since as gw_frames_since, snapshot as gw_snapshot, Cursor, Selector};
+    use crate::_gw::{
+        frames_since as gw_frames_since, snapshot_from_checkpoint, Cursor, ReadStats, Selector,
+    };
     use journal::EpochFilter;
 
     use super::wire::ServeMsg;
 
-    /// Снапшот-при-подключении: `gateway::snapshot(..)` → `ServeMsg::Snapshot`. Read-only.
+    /// Снапшот-при-подключении с УЧЁТОМ чекпоинта: `gateway::snapshot_from_checkpoint(..)`
+    /// → `(ServeMsg, ReadStats)`. Read-only.
+    ///
+    /// M-38b (rev4, B3): без чекпоинта путь сводился к `gateway::snapshot` (= O(история);
+    /// 409.74 s на проде). С чекпоинтом `snapshot_from_checkpoint`:
+    /// - читает валидный чекпоинт, валидирует header/CRC/lineage;
+    /// - досчитывает хвост через `journal::stream_from(ckpt_cursor)` (GW-I-11);
+    /// - любая невалидность чекпоинта → ТИХИЙ rebuild от START (GW-I-9(б));
+    /// - возвращает честные `ReadStats{events_decoded, segments_opened}` — для §8 eyes-on.
+    ///
+    /// `ckpt_dir: Option<&Path>` — `None` = кэш не сконфигурирован (= прямой rebuild,
+    /// единственный сценарий dev/test без прод-обвязки).
+    /// На проде ВСЕГДА задан `GATEWAY_CHECKPOINT_DIR` через `serve_config_from_env`,
+    /// compose монтирует `gateway-ckpt:/ckpt:ro` (писатель — только gateway-checkpoint
+    /// ops-сервис; см. `docker-compose.yml`).
+    ///
+    /// GS-I-5: тонкая обёртка — НЕ трансформируем серии, НЕ пересортировываем, НЕ фильтруем.
+    /// Байт-идентичность с `gateway::snapshot` гарантирована как для случая «с чекпоинтом»,
+    /// так и для fallback’а (через transparent rebuild).
     pub fn snapshot_msg(
         dir: impl AsRef<Path>,
         filter: EpochFilter,
         sel: &Selector,
         at: Cursor,
-    ) -> io::Result<ServeMsg> {
-        // GS-I-5: тонкая обёртка — НЕ трансформируем серии, НЕ пересортировываем, НЕ фильтруем.
-        // `gateway::snapshot` уже вернёт детерминированную свёртку (GW-I-1..3); мы только
-        // заворачиваем в `ServeMsg` (GS-I-4 JSON wire).
-        let snap = gw_snapshot(dir.as_ref(), filter, sel, at)?;
-        Ok(ServeMsg::Snapshot(snap))
+        ckpt_dir: Option<&Path>,
+    ) -> io::Result<(ServeMsg, ReadStats)> {
+        let (snap, stats) = match ckpt_dir {
+            Some(p) => snapshot_from_checkpoint(dir.as_ref(), filter, sel, p, at)?,
+            None => snapshot_from_checkpoint(dir.as_ref(), filter, sel, Path::new(""), at)?,
+            // "пустой путь" внутри `read_checkpoint` провалится в `ckpt_path.exists()`
+            // и вернёт `Ok(None)` → rebuild; безопасный эквивалент «нет чекпоинта».
+            // Альтернатива — рефакторить публичную сигнатуру `snapshot_from_checkpoint`
+            // под `Option<&Path>`, но это касается слоя gateway (риск scope guard).
+        };
+        Ok((ServeMsg::Snapshot(snap), stats))
     }
 
     /// Инкрементальные кадры: `gateway::frames_since(..)` → `Vec<ServeMsg::Frame>` + новый курсор.
@@ -140,6 +165,12 @@ pub mod server {
         pub selector: Selector,
         /// Ключ верификации JWT (выпущен Next.js; D6). Stateless — без user-БД.
         pub decoding_key: DecodingKey,
+        /// M-38b (rev4, B3): путь к каталогу чекпоинтов (`GATEWAY_CHECKPOINT_DIR` в env
+        /// → монтируется `gateway-ckpt:/ckpt:ro` в compose). `None` = чекпоинт не сконфигурирован
+        /// (= прямой rebuild, эквивалент `gateway::snapshot`; только для dev/test).
+        /// На проде ВСЕГДА задан: без чекпоинта читаем всю историю при каждом коннекте —
+        /// 409.74 s на 18 GB журнала (TD-044, ровно тот замер, который M-38b лечит).
+        pub checkpoint_dir: Option<std::path::PathBuf>,
     }
 
     // === impl Clone для Spawn-per-conn (без изменения публичных полей ServeConfig) ===
@@ -157,6 +188,7 @@ pub mod server {
                 filter: self.filter.clone(),
                 selector: self.selector.clone(),
                 decoding_key: self.decoding_key.clone(),
+                checkpoint_dir: self.checkpoint_dir.clone(),
             }
         }
     }
@@ -324,12 +356,25 @@ pub mod server {
         let (mut sink, mut stream) = ws.split();
 
         // (6a) Snapshot-при-подключении. Snapshot идёт целиком (M-22 deterministic).
-        let snap_msg = super::serve::snapshot_msg(
+        // M-38b (B3): если в конфиге есть чекпоинт — `snapshot_from_checkpoint` потребляет
+        // его, иначе прозрачно rebuilds от START. `ReadStats` логируются: §8 eyes-on видит
+        // «полегчало, читается хвост» через кривую latency или ручной grep.
+        let (snap_msg, stats) = super::serve::snapshot_msg(
             cfg.journal_dir.as_path(),
             cfg.filter.clone(),
             &cfg.selector,
             crate::_gw::Cursor::LATEST,
+            cfg.checkpoint_dir.as_deref(),
         )?;
+        // M-38b (rev4, B3): ReadStats логируются. §8 eyes-on ловит «полегчало, читает
+        // хвост» по latency. Сейчас эмитим на debug — не спамим прод при норме, а §8
+        // и глазастый оператор видят одной строкой вывод.
+        tracing::debug!(
+            events_decoded = stats.events_decoded,
+            segments_opened = stats.segments_opened,
+            ckpt_dir_present = cfg.checkpoint_dir.is_some(),
+            "snapshot-при-подключении построен",
+        );
         let snap_bytes = serde_json::to_vec(&snap_msg)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         let snap_text = String::from_utf8(snap_bytes)
@@ -451,7 +496,10 @@ pub mod server {
 /// SIGPIPE-флейка на `sed | grep -q` под `set -o pipefail`.
 #[doc(hidden)]
 pub mod _gw {
-    pub use gateway::{frames_since, snapshot, Cursor, Frame, Selector, Snapshot};
+    pub use gateway::{
+        frames_since, snapshot, snapshot_from_checkpoint, Cursor, Frame, ReadStats, Selector,
+        Snapshot,
+    };
 }
 
 /// Билдер `Selector` для bin (engine-dev). Main-функция читает env, вызывает эту функцию —
@@ -564,12 +612,22 @@ pub fn serve_config_from_env(
         Some(s) => s.trim().parse::<i64>().ok(),
     };
 
+    // M-38b (rev4, B3): путь к каталогу чекпоинтов. unset/пусто → None — НЕ ошибка
+    // (кокпит работает, просто без ускорения; прежнее поведение до прод-обвязки).
+    // Прод пишет `GATEWAY_CHECKPOINT_DIR=/ckpt`, compose монтирует `gateway-ckpt:/ckpt:ro`.
+    let checkpoint_dir = match get("GATEWAY_CHECKPOINT_DIR") {
+        None => None,
+        Some(s) if s.trim().is_empty() => None,
+        Some(s) => Some(std::path::PathBuf::from(s.trim())),
+    };
+
     Ok(server::ServeConfig {
         addr,
         journal_dir,
         filter: EpochFilter::OwnCaptureOnly,
         selector: build_selector(venue, symbol, timeframe_ms, bands, window_ms),
         decoding_key: DecodingKey::from_secret(secret.as_bytes()),
+        checkpoint_dir,
     })
 }
 

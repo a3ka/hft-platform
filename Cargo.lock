@@ -341,6 +341,7 @@ dependencies = [
  "contracts",
  "crc32fast",
  "journal",
+ "libc",
  "postcard",
  "serde",
  "serde_json",

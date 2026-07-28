@@ -91,8 +91,23 @@ fn frames_msgs_passthrough_equals_library() {
 fn snapshot_msg_roundtrips_and_matches_library() {
     let dir = journal_of();
     let s = sel();
-    let msg = snapshot_msg(dir.path(), EpochFilter::OwnCaptureOnly, &s, Cursor::LATEST)
-        .expect("snapshot_msg");
+    // M-38b (rev4, B3): сигнатура изменилась — `snapshot_msg` теперь принимает
+    // `ckpt_dir: Option<&Path>` (5-й аргумент) и возвращает `(ServeMsg, ReadStats)`.
+    // Семантика теста НЕ меняется: GS-I-4 (wire-roundtrip JSON) и GS-I-5 (passthrough
+    // fidelity, обёртка == библиотека) остаются. Меняется ТОЛЬКО адаптация call-site
+    // под новую сигнатуру — `None` потому что M-28-фикстура не имеет чекпоинта.
+    //
+    // Замер-гипотеза: architect при rev4 (commit 2b83936, добавлен тест
+    // `red_serve_consumes_checkpoint`) предполагал, что engine-dev обновит оба места
+    // вызова под новую сигнатуру. Это НЕ правка инварианта — чисто сигнатурная адаптация.
+    let (msg, _stats) = snapshot_msg(
+        dir.path(),
+        EpochFilter::OwnCaptureOnly,
+        &s,
+        Cursor::LATEST,
+        None,
+    )
+    .expect("snapshot_msg");
 
     // GS-I-4: JSON wire-roundtrip.
     let json = serde_json::to_string(&msg).expect("serialize");
