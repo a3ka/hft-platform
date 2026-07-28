@@ -3,8 +3,14 @@
 > **Reviewer-owned.** Открытые долги/риски, замеченные при работе. Закрытые переносятся вниз.
 
 ## OPEN
-- **TD-047** `v7-wire-форма-в-docs/fa/viz-backend.md-не-упоминает-vp_session_max_time_s` (заведено
-  reviewer'ом на merge-гейте M-38a, 2026-07-27). Доксинк, не код. `VB-I-6` перечисляет форму v7 как
+- **TD-047** `v7-wire-форма-в-docs/fa/viz-backend.md-не-упоминает-vp_session_max_time_s` —
+  **✅ CLOSED 2026-07-28** (architect `6fc6350`, приехал в `main` с merge M-47 `47577c0`; проверено
+  reviewer'ом по диффу: `VB-I-6` теперь перечисляет ОБА per-session поля v7 — `cvd_session_base` и
+  `vp_session_max_time_s` — с семантикой «последний виденный `bucket_time_s` сессии», требованием
+  сортировки, пометкой `serde(default)` = defensive-default (НЕ совместимость, консюмер гейтит на
+  `schema_version == 7`) и существенным порядком «whole-session drop VP ПОСЛЕ `merge_volume_profile`»;
+  `VB-I-10` дописан тем же критерием `vp_session_max_time_s[sid] < lo_time_s`, идентичным
+  `Reducer::evict_window_state`). Доксинк, не код. `VB-I-6` перечисляет форму v7 как
   «`SeriesBundle.cvd_session_base: Vec<(session_id, base)>` (per-session)», но фикс TD-045 (`e4822e3`,
   задача #11) добавил в ТУ ЖЕ v7-форму ВТОРОЕ per-session поле — `vp_session_max_time_s:
   Vec<(session_id, max_time_s)>`, которое уходит на провод (`gateway-serve` JSON passthrough) и является
@@ -73,9 +79,30 @@
   `red_gateway_window::cvd_two_sessions_live_across_midnight_window`, `red_gateway_schema_v7`.
   Трактовка «сессия» в VP и CVD теперь ОДНА (исходная претензия долга снята). Подтверждено на проде
   (§8 E2E M-38a, см. `PROJECT-STATE.md`).
-- **TD-046** `cvd-session-split-breaks-when-timeframe-does-not-align-to-utc-midnight` (найдено reviewer'ом
-  на PR-гейте M-38a, 2026-07-27; **ОСТАЁТСЯ OPEN** после merge `28c186c` — фикс вне scope M-38a,
-  founder согласовал follow-up). Латентный, конфиг-зависимый. M-38a постулирует
+- **TD-046** `cvd-session-split-breaks-when-timeframe-does-not-align-to-utc-midnight` —
+  **✅ CLOSED 2026-07-28** (M-47, merge `47577c0`; RED `f90f170` architect → impl `42a958e`/`9deb9ec`
+  engine-dev; severity по факту прогона поднималась NOTE→MINOR — см. ниже). **Закрыт fail-closed
+  гвардом `GW-I-10`, а не переносом семантики:** `gateway::validate_selector(&Selector)` (критерий
+  `timeframe_ms > 0 && 86_400_000 % timeframe_ms == 0`) вызывается ПЕРВОЙ строкой на ВСЕХ трёх
+  публичных входах библиотеки (`snapshot`/`frames_since`/`replay`, `InvalidInput` + подстрока
+  `timeframe_ms` в сообщении), `gateway-serve::serve_config_from_env` дополнительно отказывает
+  на СТАРТЕ. Байпас-поверхности не остаётся: публичный API крейта `gateway` — ровно эти три функции
+  плюс типы (`Reducer` приватен), а единственный консюмер крейта в workspace — `gateway-serve`
+  (проверено reviewer'ом по `Cargo.toml` и `grep Selector`).
+  **Прогон RED вскрыл ВТОРОЙ режим, в этой записи не описанный:** при `timeframe_ms <= 0`
+  `Reducer::bucket_time_s` возвращал `None` ⇒ `ohlcv`/`cumulative_delta`/`vwap`/`heatmap`/`bubbles`
+  выходили ПУСТЫМИ, а `volume_profile` — ЗАПОЛНЕННЫМ (VP якорится от `utc_session_id(ts_ms)` мимо
+  бакета): кокпит получал `Ok` без единой ошибки — тихая полу-правда, хуже паники.
+  **Анти-плацебо доказан reviewer'ом НЕЗАВИСИМО мутациями impl** (тесты HEAD, правился только
+  `src`): no-op заглушка гварда → `FAILED. 2 passed; 6 failed`; «всегда `Err`» → `FAILED. 6 passed;
+  2 failed` (парный vantage `aligned_*` — гвард не переширокий); снятие вызова ТОЛЬКО из `replay` →
+  `misaligned_timeframe_rejected_by_replay ... FAILED` (каждый вход покрыт отдельно); снятие
+  старт-гварда → 4 FAILED в `red_timeframe_guard_startup`.
+  **§8 на ПРОД-АРТЕФАКТЕ** (тот же образ `hft-platform-recorder:local`, что работает на VPS):
+  `GATEWAY_TIMEFRAME_MS=11000` → `exit_code=2` + `config error: ... не выравнен на границу UTC-суток`;
+  `604800000` (недельный, «круглый») → `exit_code=2`; дефолт `1000` → `listening ... (read-only,
+  JWT-auth)`. Прод-дефолт не затронут, поведение принятых конфигов байт-идентично.
+  Историческое описание дефекта (актуально как контекст): M-38a постулирует
   «`session_of(time_s) = time_s.div_euclid(86_400)` эквивалентен `utc_session_id(ts_ms)`»
   (`milestones/M-38a-cvd-session-ledger.md:60-62`). Это верно, только если бакет НЕ пересекает 00:00 UTC.
   `GATEWAY_TIMEFRAME_MS` — свободный env (`crates/gateway-serve/src/lib.rs:516`), без проверки на
@@ -90,7 +117,11 @@
   **Прод сейчас НЕ затронут** — дефолт `GATEWAY_TIMEFRAME_MS=1000` (`docker-compose.yml:122`,
   `gateway-serve/src/lib.rs:517`) делит сутки нацело. Нужен либо гвард на выравнивание timeframe, либо
   вывод сессии бакета из `ts_exch_ms` вместо `session_of(time_s)`. Зона: architect (RED-first).
-  Severity: **NOTE** (латентный футган конфигурации; в текущем проде не срабатывает).
+  Severity была: **MINOR** (латентный футган конфигурации + тихая полу-правда при `tf <= 0`;
+  в текущем проде не срабатывал). Выбран гвард, а не вывод сессии из `ts_exch_ms`: второе требовало
+  non-additive смены формы провода v7→v8 ровно в момент, когда M-38b замораживает форму состояния
+  в чекпоинте, и покупало поддержку конфигов, для которых session-anchored серия всё равно
+  не определена.
 - **TD-044** `gateway-snapshot-latency-full-history-replay-per-connection` (заведено reviewer'ом на §8 M-37,
   2026-07-27). **Память вылечена (TD-039 CLOSED), латентность — НЕТ, и это блокирует close-out M-28/M-36.**
   Замер на проде (`e4a8bc6`, журнал 18 GB / 96 `.zst` + 7 raw): **первый Snapshot доставлен за 409.74 s

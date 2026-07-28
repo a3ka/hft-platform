@@ -1670,6 +1670,73 @@ VB-I-6 per-series anchor) → critic **C-026 REJECT (fmt sacred) → rev2 PASS**
   подряд** (M-07 equity-curve, M-08 асимметричный дифф). Цель M-37 (bounded memory) дефектом не затронута,
   offline-путь (`window_ms = None`) не затронут. Дизайн фикса + RED-оракул — **architect** (gates §4).
 
+## Гвард выравнивания timeframe (M-47 «GW-I-10 fail-closed» — ✅ **MERGED `47577c0` + §8 GREEN на проде**, reviewer APPROVED 2026-07-28; TD-046 и TD-047 CLOSED)
+**Конфиг, при котором session-anchored серии (CVD/SVP) были бы ложью, больше не выразим.** Ветка
+`feat/M-47` (`6fc6350..4215d79`) смержена в `main` merge-коммитом `47577c0` (`--no-ff`, авторские SHA
+сохранены). Цепочка: architect RED `f90f170` + спека/гейт `c5d0c64` → engine-dev `42a958e` (task #1)
+и `9deb9ec` (task #2) → tester (чистый прогон, коммитов нет) → reviewer.
+- **Что вошло (56 строк impl, 2 файла):** `gateway::validate_selector(&Selector) -> io::Result<()>` —
+  критерий `timeframe_ms > 0 && 86_400_000 % timeframe_ms == 0`, отказ `io::ErrorKind::InvalidInput`
+  с подстрокой `timeframe_ms` в сообщении; вызов ПЕРВОЙ строкой в `snapshot`, `frames_since`, `replay`;
+  `gateway-serve::serve_config_from_env` отказывает на СТАРТЕ (`Err(String)`, имя переменной названо).
+  Форма провода НЕ менялась: `GATEWAY_SCHEMA_VERSION` остаётся **7**, CT-RFC не требовался
+  (сужается только МНОЖЕСТВО принимаемых входов). Ордер-путей нет — MD-only read-path, risk-critic
+  не требуется (`gates.md` §5 carve-out); Block-C чист (`crates/contracts/**` не тронут).
+- **Почему гвард, а не вывод сессии из `ts_exch_ms`:** второе требует, чтобы КЛЮЧ бакета на проводе
+  нёс сессию (`cumulative_delta: Vec<(time_s, value)>` две сессии с равным `time_s` не различает) ⇒
+  non-additive v7→v8 + переработка merge-пути ровно тогда, когда M-38b замораживает форму состояния
+  в чекпоинте — и покупается этим поддержка конфигов, для которых серия всё равно не определена.
+- **Байпас-поверхности не осталось** (проверено reviewer'ом, а не принято на слово): публичный API
+  крейта `gateway` — ровно `snapshot`/`frames_since`/`replay` + типы (`Reducer` приватен, бинарей
+  у крейта нет); единственный консюмер в workspace — `gateway-serve` (по `Cargo.toml`), который ходит
+  только через `serve::snapshot_msg`/`frames_msgs` → те же три функции; клиент по WS таймфрейм не
+  задаёт (селектор собирается один раз из env). Канарейка гейта (`≥4` упоминания `validate_selector`
+  по коду с вырезанными комментариями) даёт ровно 4 = определение + 3 входа.
+- **Гейты reviewer'а на СВОЁМ worktree (не пересказ tester'а), ветка `4215d79`:** `verify_M-47.sh`
+  → **12/12 PASS, exit=0**; `cargo test --workspace` → **passed=421 failed=0** (136 блоков) — важно,
+  потому что гвард сужает вход ДЛЯ ВСЕГО workspace, а Done Block tester'а покрывал только
+  `gateway`/`gateway-serve`. На MERGED дереве (`47577c0`) `verify_M-47.sh` повторно **PASS exit=0**.
+- **Анти-плацебо доказан reviewer'ом НЕЗАВИСИМО — мутациями impl при тестах HEAD** (правился только
+  `src`, тесты sacred не трогались):
+  ```
+  no-op заглушка гварда (if false)      → FAILED. 2 passed; 6 failed
+  «всегда Err» (if true)                → FAILED. 6 passed; 2 failed   ← парный vantage aligned_*
+  снят вызов ТОЛЬКО из replay           → misaligned_timeframe_rejected_by_replay ... FAILED
+  снят старт-гвард в gateway-serve      → FAILED. 2 passed; 4 failed
+  ```
+  То есть каждый из четырёх входов покрыт отдельным оракулом, и гвард не переширокий.
+- **§8 деплой-гейт — GREEN.** CI `30362656885` **success** + Deploy `30362656636` **success** на
+  `47577c0`; VPS `/root/hft-platform` HEAD = `47577c0`; `hft-recorder` и `hft-gateway-serve` —
+  `(healthy)`, `restarts=0` у обоих; heartbeat свежий (`ts_wall_ms=1785245947608` при `now=1785245951`),
+  `writable=true`, журнал растёт (`next_seq` 107 887 306 → 108 071 568 за 15 мин); RssAnon
+  gateway-serve 22 256 kB (плато, TD-039 не вернулся), хост `available` 7 040 MB.
+  **Анти-плацебо на ПРОД-АРТЕФАКТЕ** (тот же образ `hft-platform-recorder:local`, что работает на VPS):
+  ```
+  GATEWAY_TIMEFRAME_MS=11000     → exit_code=2  config error: ... не выравнен на границу UTC-суток
+  GATEWAY_TIMEFRAME_MS=604800000 → exit_code=2  (недельный «круглый» бакет отвергнут)
+  GATEWAY_TIMEFRAME_MS=1000      → gateway-serve: listening on 127.0.0.1:39635 (read-only, JWT-auth)
+  ```
+  **E2E валидным JWT (HS256, stdlib-клиент reviewer'а в netns контейнера):**
+  ```
+  handshake: HTTP/1.1 101 Switching Protocols
+  snapshot_bytes=1526865 elapsed_s=371.36     schema_version= 7
+  selector= {"venue":"Binance","symbol":"BTCUSDT","timeframe_ms":1000,"bands":[0.001],"window_ms":60000}
+  ohlcv_rows= 61  cvd_points= 61  vwap_points= 61
+  cvd_session_base= [[20662, -12042587000]]   vp_session_max_time_s= [[20662, 1785245927]]
+  GUARD_ACCEPTED_OK= True
+  ```
+  Прод строит Snapshot **v7** ПОСЛЕ гварда — принятый конфиг (`1000`) не пострадал, серии не пусты.
+- **Замечания (не блокирующие).** **RN-20:** engine-dev в `4215d79` поправил не только колонку Status
+  в §Tasks (carve-out `scope-guard.md`), но и строку `**Статус:**` в шапке milestone-файла — формально
+  за пределами carve-out'а; содержательно верно, вреда нет, зафиксировано как прецедент.
+  **RN-21:** в `server`-цикле ошибка `frames_msgs` логируется на уровне `DEBUG` и соединение живёт
+  дальше — если бы невалидный селектор всё же добрался до рантайма, клиент видел бы тишину, а не
+  ошибку; сейчас недостижимо (старт-гвард), долг не заводится, но при M-38b/M-39 (новые сборщики
+  `Selector`) это первое место, где стоит поднять уровень лога. **TD-044** (371 s до первого снапшота)
+  M-47 не касается и продолжает держать close-out M-28/M-36.
+- **Разблокировано:** M-38b (checkpoint-reducer) — `selector_fingerprint` теперь ключует ТОЛЬКО
+  валидированный селектор; чекпоинт под невалидным таймфреймом снять невозможно.
+
 ## Пока НЕ реализовано (следующие фазы)
 - Крейты `risk`/`killswitch`/`oms`, `runner` — пофазно per DESIGN §10 (M-08: fail-closed риск-гейт
   между `strategy` и `oms`). MM-котирование, wiring весов из `signals.json` (граница B),
