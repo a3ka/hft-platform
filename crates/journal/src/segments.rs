@@ -747,6 +747,10 @@ pub struct StorageStatus {
 ///
 /// Потребитель обязан назвать `EpochFilter` — эпоху НЕЛЬЗЯ не заметить (CT-RFC02-2:
 /// типовой барьер, а не дисциплина).
+///
+/// M-38b (TD-044, GW-I-11): детерминированные счётчики `events_decoded`/`segments_opened`
+/// инкрементируются в `next()`/`open_next_segment` — НЕ аллокатор, НЕ wall-time
+/// (урок TD-040: аллокатор-оракул M-37 флакал на параллельных прогонах).
 pub struct EventStream {
     segments: Vec<SegmentInfo>,
     selected_headers: Vec<SegmentHeader>,
@@ -757,12 +761,36 @@ pub struct EventStream {
     /// только forward-чтение).
     reader: Option<Box<dyn Read>>,
     finished: bool,
+    /// M-38b (GW-I-11): счётчик реально декодированных событий (включая те, что были
+    /// отфильтрованы по `after_seq`). ЧЕСТНЫЙ: при `stream(.., None)` или при полном
+    /// rebuild равен общему числу событий в журнале.
+    events_decoded: u64,
+    /// M-38b (GW-I-11): счётчик реально открытых сегментов (включая активный). При seek
+    /// у хвоста ОБЯЗАН быть существенно меньше общего числа сегментов.
+    segments_opened: u32,
+    /// M-38b: `after_seq` — порог сегментного пропуска. `None` ≡ полный проход
+    /// (эквивалентно `stream`). Внутрисегментный forward-фильтр `seq > after` тоже
+    /// активен (zstd не Seek).
+    after_seq: Option<u64>,
 }
 
 impl EventStream {
     /// Заголовки сегментов, попавших в выборку — эпоха читаемо присутствует в отчёте.
     pub fn headers(&self) -> &[SegmentHeader] {
         &self.selected_headers
+    }
+
+    /// M-38b (GW-I-11): число событий, реально декодированных парсером из фреймов.
+    /// Включает события, отфильтрованные по `after_seq` (внутрисегментный forward-скан).
+    /// Не зависит от того, какие события попали в `next()`. ДЕТЕРМИНИРОВАННЫЙ счётчик.
+    pub fn events_decoded(&self) -> u64 {
+        self.events_decoded
+    }
+
+    /// M-38b (GW-I-11): число сегментов, чей reader был открыт. Включает активный
+    /// сегмент. Сегменты, пропущенные целиком по `first_seq` next-сегмента, НЕ учитываются.
+    pub fn segments_opened(&self) -> u32 {
+        self.segments_opened
     }
 }
 
@@ -775,6 +803,11 @@ impl EventStream {
     /// Для raw `.jrnl` — `read_v2_header_and_skip` (поддерживает Seek для legacy-fallback).
     /// Для `.jrnl.zst` — `skip_v2_header_forward` (zstd::Decoder не импл Seek, но legacy
     /// под zstd не бывает: компакция только над v2).
+    ///
+    /// M-38b (GW-I-11): счётчик `segments_opened` инкрементируется ТОЛЬКО когда сегмент
+    /// реально открыт (не пропущен). Пропуск сегмента определяется в `stream_from` ДО
+    /// первого вызова `next()` — сегменты с `last_seq <= after_seq` (last = `first_seq`
+    /// следующего − 1) удаляются из self.segments до перехода сюда.
     fn open_next_segment(&mut self) -> io::Result<bool> {
         if self.cursor >= self.segments.len() {
             self.reader = None;
@@ -800,6 +833,7 @@ impl EventStream {
             }
             self.reader = Some(Box::new(r));
         }
+        self.segments_opened += 1;
         Ok(true)
     }
 }
@@ -811,7 +845,20 @@ impl Iterator for EventStream {
         loop {
             if let Some(reader) = self.reader.as_mut() {
                 match read_event_frame(reader.as_mut()) {
-                    Ok(Some(ev)) => return Some(Ok(ev)),
+                    Ok(Some(ev)) => {
+                        self.events_decoded += 1;
+                        // M-38b (GW-I-11): внутрисегментный forward-фильтр — zstd не Seek,
+                        // читаем с начала сегмента, пропускаем события `seq <= after` без
+                        // эмита. Сегмент уже подобран по `first_seq` next-сегмента выше
+                        // (см. `stream_from`), так что фильтр срабатывает максимум на одном
+                        // сегменте (активном или его предшественнике).
+                        if let Some(after) = self.after_seq {
+                            if ev.seq <= after {
+                                continue;
+                            }
+                        }
+                        return Some(Ok(ev));
+                    }
                     Ok(None) => {
                         // EOF сегмента — закрываем reader и пробуем следующий.
                         drop(self.reader.take());
@@ -844,14 +891,59 @@ impl Iterator for EventStream {
 /// Открыть поток чтения (E5/E6). Единственный прод-путь чтения журнала:
 /// `read_all()` остаётся ТОЛЬКО для тестов/малых фикстур.
 pub fn stream(dir: impl AsRef<Path>, filter: EpochFilter) -> io::Result<EventStream> {
+    stream_from(dir, filter, None)
+}
+
+/// M-38b (TD-044, GW-I-11): live-seek с СЕГМЕНТНЫМ ПРОПУСКОМ. `after_seq` — порог:
+/// сегмент пропускается ЦЕЛИКОМ, если ВСЕ его события `<= after_seq` (т.е. его `last_seq`
+/// ≤ `after_seq`); эквивалентно `first_seq` СЛЕДУЮЩЕГО сегмента `≤ after_seq + 1`.
+/// Сам последний (активный) сегмент пропустить нельзя — `next_seg` нет, `last_seq`
+/// неизвестен, поэтому он читается всегда, и фильтр применяется ВНУТРИСЕГМЕНТНО
+/// (forward-скан, zstd не Seek).
+///
+/// **Legacy (`first_seq == 0`, до CT-RFC-02) НЕ пропускается НИКОГДА.** У него
+/// `first_seq` синтезирован нулём как «безопасный дефолт» (segments.rs:509-512), реальный
+/// `first_seq` неизвестен → пропуск по `first_seq` сожрал бы его события. Защита:
+/// `schema_version != SCHEMA_VERSION_PRE_HEADER` ОБЯЗАН для пропуска.
+///
+/// `after_seq = None` ≡ `stream()` (полный проход).
+pub fn stream_from(
+    dir: impl AsRef<Path>,
+    filter: EpochFilter,
+    after_seq: Option<u64>,
+) -> io::Result<EventStream> {
     let all = segments(dir.as_ref())?;
-    let mut selected = Vec::with_capacity(all.len());
-    let mut headers = Vec::with_capacity(all.len());
+    let mut selected: Vec<SegmentInfo> = Vec::with_capacity(all.len());
+    let mut headers: Vec<SegmentHeader> = Vec::with_capacity(all.len());
     for s in all {
         if filter.accepts(&s.header) {
             headers.push(s.header.clone());
             selected.push(s);
         }
+    }
+    // selected уже отсортирован по индексу (см. `segments`); сохраняем это для расчёта
+    // `last_seq = next_seg.first_seq - 1`.
+    if let Some(after) = after_seq {
+        // Пропускаем сегменты с `next_seg.first_seq <= after + 1` ⟺ `last_seg <= after`.
+        // НО: legacy (`schema_version == SCHEMA_VERSION_PRE_HEADER`) НЕ пропускаем.
+        let mut kept: Vec<SegmentInfo> = Vec::with_capacity(selected.len());
+        for i in 0..selected.len() {
+            let seg = &selected[i];
+            if seg.header.schema_version == contracts::SCHEMA_VERSION_PRE_HEADER {
+                kept.push(seg.clone());
+                continue;
+            }
+            if i + 1 < selected.len() {
+                let next_first = selected[i + 1].header.first_seq;
+                // last_seq(seg) = next_first - 1. Если <= after ⟹ пропустить.
+                if next_first > 0 && next_first - 1 <= after {
+                    continue;
+                }
+            }
+            // Последний сегмент (нет next) или first_seq > after ⇒ не пропускаем.
+            kept.push(seg.clone());
+        }
+        selected = kept;
     }
     Ok(EventStream {
         segments: selected,
@@ -859,6 +951,9 @@ pub fn stream(dir: impl AsRef<Path>, filter: EpochFilter) -> io::Result<EventStr
         cursor: 0,
         reader: None,
         finished: false,
+        events_decoded: 0,
+        segments_opened: 0,
+        after_seq,
     })
 }
 
