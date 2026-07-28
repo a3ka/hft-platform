@@ -1,10 +1,18 @@
 # M-47 — GW-I-10: fail-closed гвард выравнивания `timeframe_ms` (TD-046)
 
-- **Статус:** DONE (GREEN — engine-dev M-47 task #1-3: `validate_selector` + `serve_config_from_env` гвард; verify_M-47.sh VERDICT: PASS, exit 0)
+- **Статус:** ✅ **CLOSED** 2026-07-28 — смержен в `main` как `47577c0` (`--no-ff`), reviewer
+  APPROVED, бухгалтерия `bba0656`. Цепочка: architect (спека+RED+verify `f90f170`/`c5d0c64`) →
+  engine-dev (impl, `4215d79` close-out) → tester → reviewer (PR-гейт + merge + §8).
+  `verify_M-47.sh` — VERDICT: PASS, exit 0 (12/12) на ветке И на merged-дереве;
+  `cargo test --workspace` — 421 passed / 0 failed. **§8 деплой-гейт GREEN:** VPS на `47577c0`,
+  `hft-recorder` + `hft-gateway-serve` healthy (restarts=0), E2E JWT→Snapshot v7;
+  гвард проверен на ПРОД-ОБРАЗЕ (`GATEWAY_TIMEFRAME_MS=11000` и `604800000` → exit_code=2,
+  `1000` принят) — не grep по коду, а поведение артефакта. **TD-046 и TD-047 — CLOSED.**
 - **Автор спеки:** architect, 2026-07-28
 - **Базовый HEAD:** `origin/main @ b7ac2f8`
-- **Ветка:** `feat/M-38b` (RED-коммит `f90f170`; милстоун мелкий — едет на той же ветке,
-  мержится ПЕРВЫМ, до чекпоинта; см. §Порядок мержа)
+- **Ветка:** `feat/M-47` (RED-коммит `f90f170`, спека `c5d0c64`). Отпочкована от общей ветки
+  ДО артефактов M-38b: compile-RED чекпоинта иначе навсегда красил бы гейт M-47, а M-47 обязан
+  был мержиться первым и независимо (см. §Порядок мержа).
 - **Тех-долг:** TD-046 (severity NOTE → повышена до **MINOR**, см. §Objective)
 - **Зона:** read-path (`crates/gateway`, `crates/gateway-serve`). MD-only, ордер-пути нет.
 
@@ -151,6 +159,11 @@ cumulative_delta: [(1752105597, 500000000), (1752105597, -300000000)]
 M-47 и M-38b трогают один файл (`crates/gateway/src/lib.rs`). **M-47 мержится ПЕРВЫМ** — он
 крошечный, а M-38b строит `selector_fingerprint` поверх уже валидированного селектора. Если
 M-38b уходит в работу параллельно, engine-dev M-38b ребейзится на M-47 после его merge.
+
+**✅ ВЫПОЛНЕНО.** M-47 в `main` (`47577c0`); `feat/M-38b` ребейзнут на актуальный `main`
+architect'ом. Следствие для M-38b: чекпоинт под невыравненным `timeframe_ms` теперь снять
+НЕВОЗМОЖНО в принципе — `validate_selector` отвергает такой селектор на всех входах, поэтому
+`selector_fingerprint` ключует только валидированную конфигурацию.
 
 ## Гейты
 
