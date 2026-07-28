@@ -30,12 +30,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tempfile = "3"
 serde_json = "1"
 
-# M-38b: clippy-lints, которые срабатывают на sacred RED-тестах (Rust 1.97+). Тесты
-# писались архитектором под старые clippy-версии; править тесты — SCOPE VIOLATION,
-# поэтому отключаем на уровне пакета (только для test-target).
-[lints.clippy]
-"doc_lazy_continuation" = { level = "allow", priority = -1 }
-"manual_is_multiple_of" = { level = "allow", priority = -1 }
+# M-38b (rev3 D3, rev4): ВСЕ `[lints.*]` откачены — blanket-allow линтов прячет
+# «Result проигнорирован» в проде (fail-closed политика архитектора). Architect
+# подтвердил ЗАМЕРОМ: после починки 4 мест `i % 2 == 0` → `i.is_multiple_of(2)`
+# clippy с ЯВНО возвращёнными `-D unused_must_use -D clippy::manual_is_multiple_of
+# -D clippy::manual_unwrap_or` даёт exit=0. Верифицирующая канарейка в verify_M-38b.sh
+# запрещает появление blanket-allow в любом Cargo.toml.
 
 [[bin]]
 name = "gateway-checkpoint"
