@@ -1394,6 +1394,18 @@ pub struct RetentionPolicy {
     pub cold_root: PathBuf,
     /// Порог, ниже которого пустое место требует ВНЕОЧЕРЕДНОЙ выгрузки (алерт).
     pub min_free_bytes: u64,
+    /// M-38b (C-030 R1, GW-I-9 в связке с ретеншеном): минимум `seq`, свёрнутый ЧЕКПОНТОМ
+    /// по ВСЕМ сконфигурированным селекторам (gateway-checkpoint публикует ОДНО число).
+    /// Локальный prune РАЗРЕШЁН только для сегментов, чьи события полностью покрыты
+    /// (`last_seq(seg) <= covered_through_seq`). Дефолт `None` = «нет артефакта покрытия» =
+    /// fail-closed (никаких prune).
+    pub checkpoint_covered_through_seq: Option<u64>,
+    /// M-38b (отклонение от буквы C-030, см. milestone §Связка с ретеншеном): escape-hatch,
+    /// разрешающий prune БЕЗ покрытия чекпоинтом. Дефолт `false` (fail-closed). Если
+    /// `true` — КАЖДЫЙ prune без покрытия ОБЯЗАН быть назван в
+    /// `RetentionReport.pruned_without_checkpoint_coverage` (аудит-трейл). Молчаливого
+    /// выхода нет.
+    pub allow_prune_without_checkpoint: bool,
 }
 
 /// Режим запуска. **Дефолт оператора — `DryRun`** (первый прогон на проде — обязательно он).
@@ -1422,8 +1434,13 @@ pub enum RetentionMode {
 pub struct RetentionPlan {
     /// Выгрузить в холодное хранилище и затем удалить горячую копию.
     pub offload_and_prune: Vec<SegmentInfo>,
+    /// M-38b (C-030 R1): выгрузить в холодное, но НЕ удалять горячую копию (нет покрытия
+    /// чекпоинтом — бэкап R1 идёт, локальная копия остаётся, skip-репорт — на
+    /// операторе). Дефолт пустой, если нет непокрытых сегментов.
+    pub offload_only: Vec<SegmentInfo>,
     /// Пропущены с причиной (активный сегмент; моложе retain_days; в keep_min_segments;
-    /// legacy без декларации — у него нет эпохи, значит нет и права его удалять).
+    /// legacy без декларации — у него нет эпохи, значит нет и права его удалять;
+    /// **НЕ ПОКРЫТ чекпоинтом** — главный новый класс).
     pub skipped: Vec<(SegmentInfo, String)>,
     /// Свободного места меньше `min_free_bytes`, а выгружать нечего → внеочередная тревога.
     pub disk_pressure: bool,
@@ -1435,6 +1452,12 @@ pub struct RetentionReport {
     pub mode: RetentionMode,
     pub offloaded: Vec<PathBuf>,
     pub pruned: Vec<PathBuf>,
+    /// M-38b (C-030 R1, escape-hatch аудит): пути сегментов, удалённых БЕЗ покрытия
+    /// чекпоинтом (override `allow_prune_without_checkpoint = true`). Каждый ОБЯЗАН быть
+    /// поимённо перечислен — иначе операторский override становится тихим: «freed N bytes»
+    /// в логе, а read-путь потерял историю, и этого нигде не видно. Сверяется с
+    /// `pruned` — при валидном покрытии должно быть пусто.
+    pub pruned_without_checkpoint_coverage: Vec<PathBuf>,
     /// Сегменты, у которых сверка холодной копии НЕ прошла (остались горячими).
     pub failed: Vec<(PathBuf, String)>,
     pub freed_bytes: u64,
@@ -1516,6 +1539,11 @@ pub fn retention_plan(
     // Если classified пуст (всё foreign / каталог пуст) — активного нет; все foreign в skipped.
     let active_index: Option<u32> = classified.iter().map(|s| s.index).max();
 
+    // M-38b: копия all_segs для плана (last_seq = next.first_seq - 1). Берём ДО move
+    // classified в for-loop ниже.
+    let mut segs_by_idx = classified.clone();
+    segs_by_idx.sort_by_key(|s| s.index);
+
     let mut skipped: Vec<(SegmentInfo, String)> = Vec::new();
     let mut candidates: Vec<SegmentInfo> = Vec::new();
     if let Some(act_idx) = active_index {
@@ -1558,7 +1586,7 @@ pub fn retention_plan(
     // (4) keep_min_segments: последние N (по индексу, отсортированы по возрастанию)
     // из young_passed остаются горячими.
     let keep_min = policy.keep_min_segments as usize;
-    let final_candidates: Vec<SegmentInfo>;
+    let mut final_candidates: Vec<SegmentInfo>;
     if young_passed.len() > keep_min {
         let split = young_passed.len() - keep_min;
         let (front, back) = young_passed.split_at(split);
@@ -1574,12 +1602,87 @@ pub fn retention_plan(
         final_candidates = Vec::new();
     }
 
-    // (5) disk_pressure: free_bytes < min_free_bytes.
+    // (5) M-38b (C-030 R1): СТРОГАЯ СВЯЗКА prune ↔ покрытие чекпоинтом.
+    //   `last_seq(seg) <= checkpoint_covered_through_seq` ⟺ «все события сегмента
+    //   свёрнуты чекпоинтом, read-путь их уже не прочтёт — prune безопасен».
+    //   `last_seq(seg) = next_seg.first_seq - 1` (если есть next), либо `None` для
+    //   активного. Без `next_seg` (активный) — `last_seq` неизвестен ⇒ консервативно
+    //   НЕ покрыт.
+    //
+    //   Разделение плана:
+    //   - covered (last_seq <= covered) → offload_and_prune;
+    //   - uncovered (last_seq > covered) → offload_only + skip-репорт с причиной
+    //     «нет покрытия чекпоинтом» (R1 идёт, локальная копия остаётся).
+    //   - allow_prune_without_checkpoint=true → uncovered тоже идёт в offload_and_prune,
+    //     но попадает в `pruned_without_checkpoint_coverage` в отчёте.
+    //
+    //   Нет артефакта покрытия (`None`) = fail-closed: ВСЕ непокрытые сегменты → skip,
+    //   даже при allow_prune_without_checkpoint=true (override без артефакта = бессмыслен).
+    let covered = policy.checkpoint_covered_through_seq;
+    let override_enabled = policy.allow_prune_without_checkpoint;
+    let mut offload_and_prune: Vec<SegmentInfo> = Vec::new();
+    let mut offload_only: Vec<SegmentInfo> = Vec::new();
+    if let Some(covered_seq) = covered {
+        // segs_by_idx уже отсортирован по индексу выше (см. шаг (2)).
+        for (i, s) in segs_by_idx.iter().enumerate() {
+            // last_seq(s) = segs_by_idx[i+1].first_seq - 1, иначе None (активный).
+            let last_seq_opt = if i + 1 < segs_by_idx.len() {
+                Some(segs_by_idx[i + 1].header.first_seq.saturating_sub(1))
+            } else {
+                None
+            };
+            let covered_seg = match last_seq_opt {
+                Some(ls) => ls <= covered_seq,
+                None => false, // активный сегмент — last_seq неизвестен ⇒ не покрыт
+            };
+            if covered_seg {
+                continue; // сегмент покрыт — финальная фильтрация ниже
+            }
+            // Сегмент НЕ покрыт. Решаем: prune (с override), offload_only, или skip.
+            if override_enabled {
+                // Override разрешает prune без покрытия — оставляем в final_candidates
+                // (он попадёт в offload_and_prune) и пометим в отчёте позже.
+            } else {
+                // Без override — снимаем из кандидатов на prune. Бэкап идёт всегда
+                // (offload_only), локальная копия остаётся.
+                offload_only.push(s.clone());
+                skipped.push((
+                    s.clone(),
+                    format!(
+                        "checkpoint coverage not proven: last_seq > {} (covered_through_seq); \
+                         offload_only — локальная копия остаётся до прогресса чекпоинтера",
+                        covered_seq
+                    ),
+                ));
+            }
+        }
+        // Если override включён, final_candidates ОСТАЁТСЯ как есть (все кандидаты
+        // на prune). Отчёт `pruned_without_checkpoint_coverage` заполним в execute по
+        // факту: какой из pruned был uncovered.
+        if !override_enabled {
+            final_candidates.clear(); // непокрытые удалены из offload_and_prune
+        }
+    } else {
+        // Нет артефакта покрытия = fail-closed. Все потенциальные кандидаты на prune
+        // НЕ покрыты — превращаем в offload_only + skip-репорт.
+        for s in final_candidates.drain(..) {
+            offload_only.push(s.clone());
+            skipped.push((
+                s,
+                "checkpoint coverage artifact absent (fail-closed): бэкап идёт, \
+                 локальная копия остаётся"
+                    .to_string(),
+            ));
+        }
+    }
+
+    // (6) disk_pressure: free_bytes < min_free_bytes.
     let free = free_bytes_at(dir)?;
     let disk_pressure = free < policy.min_free_bytes;
 
     Ok(RetentionPlan {
-        offload_and_prune: final_candidates,
+        offload_and_prune,
+        offload_only,
         skipped,
         disk_pressure,
     })
@@ -1662,6 +1765,7 @@ pub fn retention_execute(
                 mode: RetentionMode::DryRun,
                 offloaded: Vec::new(),
                 pruned: Vec::new(),
+                pruned_without_checkpoint_coverage: Vec::new(),
                 failed: Vec::new(),
                 freed_bytes: 0,
             })
@@ -1669,10 +1773,31 @@ pub fn retention_execute(
         RetentionMode::Apply => {
             let mut offloaded: Vec<PathBuf> = Vec::new();
             let mut pruned: Vec<PathBuf> = Vec::new();
+            let mut pruned_without_checkpoint_coverage: Vec<PathBuf> = Vec::new();
             let mut failed: Vec<(PathBuf, String)> = Vec::new();
             let mut freed_bytes: u64 = 0;
 
+            // M-38b (C-030 R1): для каждого сегмента из offload_and_prune определяем,
+            // был ли он uncovered (override). Пересчитываем last_seq тем же способом,
+            // что и retention_plan, чтобы корректно классифицировать.
+            let covered = policy.checkpoint_covered_through_seq;
+            let all_segs_for_check = segments(_dir).unwrap_or_default();
+            let mut sorted_segs = all_segs_for_check.clone();
+            sorted_segs.sort_by_key(|s| s.index);
+
             for seg in &plan.offload_and_prune {
+                // Классифицируем: покрыт или нет (для override-аудита).
+                let pos = sorted_segs.iter().position(|s| s.index == seg.index);
+                let last_seq_opt = match pos {
+                    Some(i) if i + 1 < sorted_segs.len() => {
+                        Some(sorted_segs[i + 1].header.first_seq.saturating_sub(1))
+                    }
+                    _ => None, // активный
+                };
+                let is_uncovered = match (last_seq_opt, covered) {
+                    (Some(ls), Some(c)) => ls > c,
+                    _ => true, // активный или нет артефакта покрытия = uncovered
+                };
                 // (1) verify_cold_copy: sha256-сверка src == dst.
                 match verify_cold_copy(seg, &policy.cold_root) {
                     Ok(proof) => {
@@ -1682,6 +1807,9 @@ pub fn retention_execute(
                             Ok(()) => {
                                 offloaded.push(seg.path.clone());
                                 pruned.push(seg.path.clone());
+                                if is_uncovered {
+                                    pruned_without_checkpoint_coverage.push(seg.path.clone());
+                                }
                                 freed_bytes += seg.size_bytes;
                             }
                             Err(e) => {
@@ -1707,6 +1835,7 @@ pub fn retention_execute(
                 mode: RetentionMode::Apply,
                 offloaded,
                 pruned,
+                pruned_without_checkpoint_coverage,
                 failed,
                 freed_bytes,
             })
@@ -1721,6 +1850,7 @@ pub fn retention_execute(
                 mode: RetentionMode::Compact,
                 offloaded: Vec::new(),
                 pruned: Vec::new(),
+                pruned_without_checkpoint_coverage: Vec::new(),
                 failed: Vec::new(),
                 freed_bytes: 0,
             })

@@ -82,6 +82,14 @@ struct Args {
     keep_raw: u32,
     now_wall_ms: Option<i64>,
     mode: RetentionMode,
+    /// M-38b (C-030 R1): путь к артефакту покрытия `covered_through_seq`, публикуемому
+    /// `gateway-checkpoint` (минимум по всем сконфигурированным селекторам).
+    /// None = «нет артефакта» = fail-closed (никаких prune, даже с override).
+    checkpoint_coverage: Option<PathBuf>,
+    /// M-38b: операторский escape-hatch — разрешает prune БЕЗ покрытия чекпоинтом.
+    /// Дефолт `false` (fail-closed); verify-канарейка verify_M-38b.sh блокирует
+    /// передачу этого флага в проде (поведенческий fail-closed).
+    allow_prune_without_checkpoint: bool,
 }
 
 /// Парсинг argv. Возвращает Err с человеко-читаемой подсказкой на первой ошибке.
@@ -94,6 +102,8 @@ fn parse_args() -> Result<Args, String> {
     let mut keep_raw: Option<u32> = None;
     let mut now_wall_ms: Option<i64> = None;
     let mut mode: Option<RetentionMode> = None;
+    let mut checkpoint_coverage: Option<PathBuf> = None;
+    let mut allow_prune_without_checkpoint: bool = false;
 
     // TD-024: нормализовать argv ПЕРЕД циклом разбора. `--flag=value` (equals-форма — ровно
     // то, что лежит в `docker-compose.yml command:` и печатает `--help`) раскладываем в два
@@ -171,6 +181,16 @@ fn parse_args() -> Result<Args, String> {
                     }
                 });
             }
+            // M-38b (C-030 R1): путь к артефакту покрытия `covered_through_seq`. Если
+            // файла нет или он не парсится в u64 — `covered = None` (fail-closed).
+            "--checkpoint-coverage" => {
+                checkpoint_coverage = Some(PathBuf::from(next()?));
+            }
+            // M-38b: операторский escape-hatch. Дефолт `false` (fail-closed);
+            // verify-канарейка verify_M-38b.sh ЗАПРЕЩАЕТ передачу этого флага в проде.
+            "--allow-prune-without-checkpoint" => {
+                allow_prune_without_checkpoint = true;
+            }
             "-h" | "--help" => {
                 print_help();
                 std::process::exit(0);
@@ -191,6 +211,8 @@ fn parse_args() -> Result<Args, String> {
         keep_raw: keep_raw.unwrap_or(DEFAULT_KEEP_RAW),
         now_wall_ms,
         mode: mode.unwrap_or(RetentionMode::DryRun),
+        checkpoint_coverage,
+        allow_prune_without_checkpoint,
     })
 }
 
@@ -245,11 +267,26 @@ fn main() -> ExitCode {
     }
 
     let now_wall_ms = args.now_wall_ms.unwrap_or_else(default_now_wall_ms);
+    // M-38b (C-030 R1): артефакт покрытия чекпоинта `--checkpoint-coverage <path>` —
+    // читаем число `covered_through_seq` (минимум по сконфигурированным селекторам,
+    // публикуемый `gateway-checkpoint`). Если файла нет — `covered = None` (fail-closed).
+    // M-38b (C-031 NOTE): escape-hatch `--allow-prune-without-checkpoint` ЗАПРЕЩЁН на проде
+    // (канарейка verify_M-38b.sh блокирует дефолт), но CLI его объявляет для явных override.
+    let covered_through_seq = if let Some(ref path) = args.checkpoint_coverage {
+        match std::fs::read_to_string(path) {
+            Ok(s) => s.trim().parse::<u64>().ok(),
+            Err(_) => None, // missing file → fail-closed
+        }
+    } else {
+        None
+    };
     let policy = RetentionPolicy {
         retain_days: args.retain_days,
         keep_min_segments: args.keep_min,
         cold_root: args.cold.clone(),
         min_free_bytes: args.min_free_bytes,
+        checkpoint_covered_through_seq: covered_through_seq,
+        allow_prune_without_checkpoint: args.allow_prune_without_checkpoint,
     };
 
     let plan = match retention_plan(&args.dir, &policy, now_wall_ms) {
