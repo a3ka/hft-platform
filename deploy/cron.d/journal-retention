@@ -56,3 +56,13 @@ COMPACTION_ALERT_FILE=/var/lib/hft/compaction.alert
 # только после sha256-сверки .zst); dry-run-семантика НЕ размывается — компакция это
 # отдельный режим того же бинаря, не часть apply.
 50 3 * * * root /root/hft-platform/deploy/bin/journal-compaction-cron.sh
+# M-48 (TD-048, GW-I-12): чекпоинтер ДОЛЖЕН отработать ДО ретеншена, иначе покрытие
+# `covered_through_seq` — пустое/устаревшее и retention либо уходит в fail-closed
+# no-op (`offload_only` без prune), либо прунит по вчерашнему рубежу. 04:00 UTC —
+# за 7 минут ДО ретеншена (04:07). `gateway-checkpoint-cron.sh` ПИШЕТ артефакт
+# покрытия (`--coverage-out=/ckpt/covered_through_seq`), retention ЧИТАЕТ его
+# (`--checkpoint-coverage=/ckpt/covered_through_seq`); пути ОБЯЗАНЫ совпадать
+# (verify_M-48 канарейка КОМПОЗИЦИИ). При падении чекпоинтера — alert-файл
+# /var/lib/hft/gateway-checkpoint.alert, ретеншен в том же цикле всё равно
+# отработает (fail-closed no-op), но оператор увидит свежий алерт.
+0 4 * * * root /root/hft-platform/deploy/bin/gateway-checkpoint-cron.sh
