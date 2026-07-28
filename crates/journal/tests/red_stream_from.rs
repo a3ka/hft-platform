@@ -205,42 +205,128 @@ fn counters_report_full_pass_honestly() {
 // 3. LEGACY — `first_seq == 0` не является фактом (TD-030)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Legacy-сегмент (без v2-заголовка) несёт синтезированный `first_seq = 0`
-/// (`segments.rs:509-512` — «безопасный дефолт», не измеренное значение). Пропускать такой
-/// сегмент по `first_seq` НЕЛЬЗЯ: события в нём могут иметь любые seq. Различать legacy от
-/// нормального сегмента 0 (у которого `first_seq` тоже 0, т.к. seq стартует с 0) обязано
-/// `schema_version` заголовка, а НЕ значение `first_seq`.
+/// **Переписано после C-030 R2 (critic REJECT): прошлая версия была ПЛАЦЕБО.** Она
+/// утверждала, что защищает legacy, но legacy-сегмента не строила (`assert legacy_count == 0`)
+/// и проверяла обычную полноту v2-журнала. Реализация, пропускающая сегмент по правилу
+/// `header.first_seq <= after_seq` БЕЗ проверки `schema_version`, проходила её и падала бы на
+/// проде. Ровно тот класс, который комментарий обещал исключить.
 ///
-/// Проверяем инвариантом полноты: при наличии legacy-сегмента ни одно событие не теряется
-/// ни при каком `after_seq`.
+/// Теперь фикстура строит НАСТОЯЩИЙ legacy-сегмент — байт-в-байт как боевой headerless
+/// `segment-00000000.jrnl` (тот же приём, что `red_segments_epochs`/`red_prod_migration`):
+/// сегмент без магии + декларация в `journal.legacy.json`, поверх — v2-сегменты.
+///
+/// **Почему это ловит дефект.** У legacy-сегмента `first_seq` СИНТЕЗИРОВАН как `0`
+/// (`segments.rs:509-512` — «безопасный дефолт», не измеренное значение), хотя реально он
+/// содержит события `0..LEGACY_N`. Правило пропуска по СОБСТВЕННОМУ `first_seq` даёт
+/// `0 <= after` → сегмент пропускается ВСЕГДА → при `after < LEGACY_N-1` теряются его события.
+/// Корректное правило смотрит на `first_seq` СЛЕДУЮЩЕГО сегмента (сегмент можно пропустить,
+/// только если все его события ≤ after) и/или на `schema_version`.
+const LEGACY_N: u64 = 200;
+
+/// Записать боевой headerless-сегмент (без магии) + `journal.meta`, затем задекларировать его.
+fn legacy_plus_v2_journal() -> tempfile::TempDir {
+    use std::io::Write as _;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("segment-00000000.jrnl");
+    {
+        let f = std::fs::File::create(&path).expect("create legacy");
+        let mut w = std::io::BufWriter::new(f);
+        for seq in 0..LEGACY_N {
+            let ev = contracts::Event {
+                seq,
+                ts_mono_ns: seq,
+                ts_wall_ms: 1_752_000_000_000 + seq as i64,
+                kind: trade(seq),
+            };
+            let payload = postcard::to_stdvec(&ev).expect("ser");
+            w.write_all(&(payload.len() as u32).to_le_bytes()).unwrap();
+            w.write_all(&payload).unwrap();
+            w.write_all(&crc32fast::hash(&payload).to_le_bytes())
+                .unwrap();
+        }
+        w.flush().unwrap();
+    }
+    // `journal.meta` — следующий seq (иначе новый писатель начнёт с 0 и seq поедут).
+    std::fs::write(dir.path().join("journal.meta"), LEGACY_N.to_le_bytes()).expect("meta");
+
+    // Операторская процедура: без декларации чтение fail-closed (CT-RFC-02).
+    journal::declare_legacy(
+        dir.path(),
+        contracts::LegacySegmentDecl {
+            file_name: "segment-00000000.jrnl".to_string(),
+            fingerprint_sha256: journal::fingerprint(&path).expect("fingerprint"),
+            size_bytes_at_decl: std::fs::metadata(&path).expect("meta").len(),
+            source: DataSource::OwnCapture,
+            provenance: "M-38b fixture: headerless prod-shaped segment".to_string(),
+            epoch_id: contracts::LEGACY_EPOCH_ID.to_string(),
+        },
+    )
+    .expect("declare_legacy");
+
+    // Поверх legacy — обычные v2-сегменты (несколько, ротация по 16 KiB).
+    {
+        let mut j = Journal::open_with(dir.path(), cfg()).expect("open_with поверх legacy");
+        for i in LEGACY_N..LEGACY_N + 400 {
+            j.append(trade(i)).expect("append");
+        }
+        j.flush().expect("flush");
+    }
+    dir
+}
+
 #[test]
 fn legacy_segment_is_never_skipped() {
-    let dir = multi_segment_journal(false);
+    let dir = legacy_plus_v2_journal();
     let segs = journal::list_segments(dir.path()).expect("segments");
-    let legacy_count = segs
+
+    // АНТИ-ПЛАЦЕБО: фикстура ОБЯЗАНА содержать настоящий legacy-сегмент. Если его нет —
+    // тест ничего не проверяет, и это должно быть падением, а не тихим «ok» (C-030 R2).
+    let legacy: Vec<_> = segs
         .iter()
         .filter(|s| s.header.schema_version == contracts::SCHEMA_VERSION_PRE_HEADER)
-        .count();
-    // Фикстура сама по себе legacy не создаёт — тест обязан это ЗАМЕТИТЬ, а не молча
-    // «пройти» на журнале без legacy (иначе оракул слеп, класс «идеальная фикстура»).
+        .collect();
     assert_eq!(
-        legacy_count, 0,
-        "фикстура не должна содержать legacy — проверка ниже касается общего инварианта полноты"
+        legacy.len(),
+        1,
+        "фикстура обязана содержать РОВНО один legacy-сегмент, иначе оракул слеп; \
+         заголовки: {:?}",
+        segs.iter()
+            .map(|s| (s.index, s.header.schema_version, s.header.first_seq))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        legacy[0].header.first_seq, 0,
+        "у legacy `first_seq` СИНТЕЗИРОВАН нулём — это и есть ловушка TD-030"
+    );
+    assert!(
+        segs.len() >= 3,
+        "нужен legacy + минимум два v2-сегмента, есть {}",
+        segs.len()
     );
 
     let all = all_seqs(dir.path());
-    for after in [0_u64, 1, N / 2, N - 2] {
+    assert_eq!(
+        all.len() as u64,
+        LEGACY_N + 400,
+        "фикстура: legacy + v2 события обязаны читаться все"
+    );
+
+    // Полнота на КАЖДОМ after — включая позиции ВНУТРИ legacy-диапазона, где пропуск
+    // legacy-сегмента уничтожает данные.
+    for after in 0..all.len() as u64 {
         let got = seqs_from(dir.path(), Some(after));
         let want: Vec<u64> = all.iter().copied().filter(|s| *s > after).collect();
-        assert_eq!(got, want, "полнота хвоста нарушена при after={after}");
+        assert_eq!(
+            got,
+            want,
+            "stream_from(after={after}) потерял события. Если пропали seq из \
+             0..{LEGACY_N} — реализация пропустила LEGACY-сегмент по его синтетическому \
+             first_seq=0 (TD-030). Пропускать сегмент можно, только если ВСЕ его события \
+             ≤ after, т.е. по first_seq СЛЕДУЮЩЕГО сегмента и/или с проверкой schema_version. \
+             Получено {} событий, ожидалось {}",
+            got.len(),
+            want.len()
+        );
     }
-
-    // Явная фиксация требования к реализации: сегмент 0 нормального журнала имеет
-    // first_seq == 0 — ровно то же значение, что синтезируется для legacy. Значит правило
-    // пропуска, смотрящее ТОЛЬКО на first_seq, не может быть корректным.
-    assert_eq!(
-        segs[0].header.first_seq, 0,
-        "seq журнала стартует с 0 ⇒ first_seq сегмента 0 неотличим по значению от legacy-дефолта; \
-         правило пропуска обязано смотреть на schema_version, а не только на first_seq (TD-030)"
-    );
 }

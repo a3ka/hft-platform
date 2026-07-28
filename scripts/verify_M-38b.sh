@@ -26,8 +26,18 @@ chk cargo test -p gateway --test red_checkpoint_is_cache --quiet
 step "task #4 — GW-I-11: снапшот из чекпоинта у хвоста не декодирует историю (прод-масштаб)"
 chk cargo test -p gateway --test red_checkpoint_resource_bound --quiet
 
-step "task #5 — journal::stream_from: полнота хвоста + сегментный пропуск + legacy first_seq"
+step "task #5 — journal::stream_from: полнота хвоста + сегментный пропуск + РЕАЛЬНЫЙ legacy-сегмент"
 chk cargo test -p journal --test red_stream_from --quiet
+
+# rev2 (C-030 R3): третий форсинг — покрытый префикс физически удалён, скрытый полный реплей
+# невозможен. Первые два форсинга наблюдают самоотчёт реализации; этот наблюдает физику диска.
+step "task #4 rev2 — байт-идентичность после prune ПОКРЫТОГО префикса + суффикс-lineage"
+chk cargo test -p gateway --test red_checkpoint_prefix_pruned --quiet
+
+# rev2 (C-030 R1): строгая связка prune ↔ покрытие чекпоинтом; offload при этом НЕ блокируется
+# (иначе строгость останавливает R1 — offsite-бэкап, экзистенциальный риск docs/08).
+step "task #5b — retention: prune только при доказанном покрытии, иначе skip-репорт"
+chk cargo test -p journal --test red_retention_checkpoint_coverage --quiet
 
 step "task #6 — резюмируемый live-путь: кадры идентичны frames_since, докорм ограничен"
 chk cargo test -p gateway --test red_frames_seek_bound --quiet
@@ -54,6 +64,12 @@ chk grep -q 'gateway-checkpoint' docker-compose.yml
 
 # Версия формата чекпоинта объявлена отдельно от GATEWAY_SCHEMA_VERSION: чекпоинт — внутренний
 # кэш (T3), его форма эволюционирует независимо от контракта провода.
+# rev2 (C-030 R1): артефакт покрытия обязан ПУБЛИКОВАТЬСЯ чекпоинтером и ПОТРЕБЛЯТЬСЯ retention'ом.
+# «Объявлено ⟹ вызвано» — иначе гейт prune существует в коде и не работает в проде (класс TD-020).
+step "канарейка — covered_through_seq публикуется чекпоинтером и читается retention-бинарём"
+chk bash -c "sed 's://.*::' crates/gateway/src/bin/gateway-checkpoint.rs | grep -q 'covered_through_seq'"
+chk bash -c "sed 's://.*::' crates/journal/src/bin/journal-retention.rs | grep -q 'checkpoint-coverage'"
+
 step "канарейка — ckpt_schema_version объявлен, GATEWAY_SCHEMA_VERSION не сдвинут"
 chk bash -c "sed 's://.*::' crates/gateway/src/*.rs | grep -qE 'ckpt_schema_version|CKPT_SCHEMA_VERSION'"
 chk bash -c "grep -qE 'GATEWAY_SCHEMA_VERSION: u32 = 7;' crates/gateway/src/lib.rs"

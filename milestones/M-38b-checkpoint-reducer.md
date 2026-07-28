@@ -1,6 +1,7 @@
 # M-38b — checkpoint-reducer + live-seek (TD-044)
 
-- **Статус:** PROPOSED (спека + RED закоммичены; critic ОБЯЗАТЕЛЕН до dev)
+- **Статус:** PROPOSED rev2 (спека + RED закоммичены; **critic C-030 REJECT по rev1 — исправлено,
+  требуется ПОВТОРНЫЙ critic до dev**)
 - **Автор спеки:** architect, 2026-07-28
 - **Базовый HEAD:** `origin/main @ b7ac2f8`; ветка `feat/M-38b`
 - **Тех-долг:** TD-044 (**MAJOR** — держит close-out M-28 и M-36)
@@ -46,6 +47,13 @@ N полных реплеев, стоимость растёт ~2.8 GB/сут.
 | `bubbles` | `BTreeMap<(i64,i64),(i64,i64)>` | — |
 | `at_ms` | `i64` | — |
 | + курсор | `Cursor{upto_seq: Option<u64>}` | до какого `seq` состояние свёрнуто |
+
+**`Reducer.selector` в этой таблице отсутствует НАМЕРЕННО (C-030 N1).** Это не пропуск: `selector` —
+конфигурация, а не изменяемое состояние. В чекпоинт кладётся только `selector_fingerprint`
+(заголовок); при загрузке редьюсер собирается с селектором, который передал ВЫЗЫВАЮЩИЙ, и лишь
+после сверки фингерпринта. Сериализовать копию селектора ЗАПРЕЩЕНО — иначе чекпоинт начнёт
+навязывать устаревший конфиг (например, старые `bands`) молча, вместо того чтобы честно
+инвалидироваться по фингерпринту.
 
 Ни одного `HashMap`, `Instant`, `SystemTime` — детерминизм экспорта достижим. Полноту держит
 компилятор: `#[derive(Serialize, Deserialize)]` на структуре `Reducer` заставит покрыть каждое
@@ -105,10 +113,19 @@ pub struct OrderBook {
   совпасть по печати). **NaN в `bands` запретить** в `serve_config_from_env` (NaN != NaN ⇒
   фингерпринт нестабилен);
 - `epoch_filter_fingerprint` (`OwnCaptureOnly` / `Explicit(sorted)` / `All`);
-- `journal_lineage` — sha по ЗАГОЛОВКАМ сегментов: `(index, epoch_id, source, first_seq)`.
-  **Намеренно БЕЗ `created_wall_ms` и размера файла**: компакция `.jrnl → .jrnl.zst` их меняет,
-  но события те же — чекпоинт обязан пережить компакцию. Вендорная эпоха / purge / смена
-  источника — меняют, и чекпоинт обязан быть выброшен;
+- `journal_lineage` — **манифест** заголовков сегментов `(index, epoch_id, source, first_seq)`,
+  которые чекпоинт свернул. **Намеренно БЕЗ `created_wall_ms` и размера файла**: компакция
+  `.jrnl → .jrnl.zst` их меняет, но события те же — чекпоинт обязан пережить компакцию.
+  **Правило валидации — СУФФИКС-СОВМЕСТИМОЕ (C-030 N2/R1, обязательное):** sha «по всем текущим
+  заголовкам» НЕВЕРЕН, потому что законный retention-prune покрытого префикса меняет множество
+  видимых заголовков и объявил бы валидный чекпоинт чужим → тихий rebuild по остаткам → кокпит
+  молча получает УСЕЧЁННУЮ историю (all-time VWAP едет). Валидно ⟺
+  (а) каждый ВИДИМЫЙ сейчас сегмент с `index ≤ max_index(манифест)` совпадает со своей записью
+  в манифесте поле-в-поле; (б) отсутствующие записи манифеста допустимы ТОЛЬКО если их сегменты
+  целиком покрыты курсором чекпоинта (законный prune префикса); (в) любое расхождение,
+  переупорядочивание или неизвестный сегмент внутри покрытого диапазона → rebuild.
+  Прецедент: журнал уже штатно живёт без нижнего сегмента (M-36/TD-038 purge, `red_seg0_removed`).
+  Вендорная эпоха / смена источника / подмена оставшегося заголовка — по-прежнему инвалидируют;
 - CRC; `ckpt.cursor > at` (просят снапшот РАНЬШЕ чекпоинта).
 
 ### (3) live-seek + резюмируемый редьюсер
@@ -143,11 +160,50 @@ GW-I-10 занят M-47 (выравнивание timeframe). Нумерацию
 | `i128` в postcard | Проверить на bootstrap; fallback — пара `(hi: i64, lo: u64)` |
 | Гонка писателей чекпоинта | atomic tmp+rename + flock; journal-том смонтирован **`:ro`** (JR-I-1 цел) |
 
+### (4) Связка с ретеншеном — СТРОГАЯ (решение critic C-030 R1, принято)
+
+Открытый вопрос rev1 («мягкая или строгая связка») закрыт: **строгая**. Локальный prune разрешён
+только при ДОКАЗАННОМ покрытии чекпоинтом; иначе сегмент остаётся горячим и попадает в skip-репорт.
+
+**Почему.** После M-38b read-путь имеет состояние, свёрнутое до `seq`. Если retention удалит
+локальный префикс, который чекпоинт не свернул, `snapshot_from_checkpoint` пересчитает по
+остаткам и молча вернёт УСЕЧЁННУЮ историю — all-time VWAP (VB-I-6) поедет без единой ошибки, а
+восстановить нечем (холодная копия read-путём не читается). Тихая ложь в данных ⇒ fail-closed.
+
+**Критерий селектор-агностичен** (journal НЕ знает про селекторы — инверсия слоёв недопустима):
+`gateway-checkpoint` публикует ОДНО число `covered_through_seq` (минимум по всем сконфигурированным
+селекторам), journal потребляет только его:
+
+```text
+сегмент prunable ⟺ last_seq(сегмент) <= covered_through_seq
+                 ⟺ first_seq(следующий) <= covered_through_seq + 1
+```
+
+`last_seq` берётся из заголовка СЛЕДУЮЩЕГО сегмента — сам сегмент читать не нужно.
+
+**Offload НЕ гейтится, гейтится только PRUNE.** Иначе строгость заблокировала бы R1 (offsite-бэкап,
+экзистенциальный риск docs/08). План разделяется: `offload_and_prune` (покрыт → копия + удаление)
+и **новый `offload_only`** (устарел, но не покрыт → копия в cold, локальная остаётся, skip-репорт).
+Бэкап идёт всегда; ждёт только освобождение места.
+
+**Отклонение от буквы C-030 (architect, вынесено критику явно).** Буквальная строгость означает:
+чекпоинтер сломан ⇒ место не освобождается НИКОГДА ⇒ disk-guard останавливает ЗАПИСЬ, то есть мы
+теряем НОВЫЕ данные ради старых. Поэтому добавлен `allow_prune_without_checkpoint` — **не дефолт**,
+задаётся явным флагом оператора, и каждый такой prune ОБЯЗАН быть поимённо назван в
+`RetentionReport.pruned_without_checkpoint_coverage` (аудит-трейл; молчаливого выхода нет).
+Если критик сочтёт escape-hatch недопустимым — удаляется вместе с тестом
+`override_prunes_but_is_named_in_report`, дефолтное поведение не меняется.
+
 ## Allowed paths
 
 - `crates/gateway/src/**` — `checkpoint` модуль, `snapshot_from_checkpoint`, резюм-API,
   `src/bin/gateway-checkpoint.rs` (engine-dev)
-- `crates/journal/src/segments.rs` — `stream_from` + счётчики `ReadStats` на `EventStream` (engine-dev)
+- `crates/journal/src/segments.rs` — `stream_from` + счётчики `ReadStats` на `EventStream`;
+  **rev2 (C-030 R1):** `RetentionPolicy.{checkpoint_covered_through_seq, allow_prune_without_checkpoint}`,
+  `RetentionPlan.offload_only`, `RetentionReport.pruned_without_checkpoint_coverage`, гейт prune
+  в `retention_plan`/`retention_execute` (engine-dev)
+- `crates/journal/src/bin/journal-retention.rs` — **rev2:** флаги `--checkpoint-coverage <path>`
+  и `--allow-prune-without-checkpoint`, проброс в политику (engine-dev)
 - `crates/book/src/lib.rs` — ТОЛЬКО `#[derive(Serialize, Deserialize)]` на `OrderBook` (+ serde в
   `[dependencies]` этого крейта). Никакой другой правки книги (engine-dev)
 - `crates/gateway-serve/src/lib.rs` — резюмируемый редьюсер в соединении, запрет NaN в bands (engine-dev)
@@ -179,6 +235,8 @@ GW-I-10 занят M-47 (выравнивание timeframe). Нумерацию
 | 3 | ⏳ OPEN | `checkpoint::advance(journal_dir, ckpt_dir, sel, filter)` — atomic tmp+rename + flock; идемпотентность | engine-dev | `red_checkpoint_is_cache::advance_idempotent` GREEN |
 | 4 | ⏳ OPEN | `gateway::snapshot_from_checkpoint(...) -> io::Result<(Snapshot, ReadStats)>` — загрузка, валидация, докорм хвостом; ЛЮБАЯ невалидность → тихий rebuild | engine-dev | `red_checkpoint_byte_identity` + `red_checkpoint_is_cache` GREEN |
 | 5 | ⏳ OPEN | `journal::stream_from(dir, filter, after_seq)` — сегментный пропуск по `first_seq`; **legacy `first_seq==0` не пропускается**; `ReadStats` счётчики на `EventStream` | engine-dev | `journal::red_stream_from` GREEN |
+| 5b | ⏳ OPEN | **rev2 (C-030 R1):** гейт prune в retention — новые поля политики/плана/отчёта, `offload_only`, skip-репорт с причиной, содержащей `checkpoint`; флаги бинаря `--checkpoint-coverage` / `--allow-prune-without-checkpoint` | engine-dev | `journal::red_retention_checkpoint_coverage` GREEN |
+| 5c | ⏳ OPEN | **rev2 (C-030 R1):** `gateway-checkpoint` публикует артефакт покрытия `covered_through_seq` (минимум по селекторам) в `GATEWAY_CHECKPOINT_DIR`; ops-цепочка cron: сначала чекпоинт, затем retention с этим артефактом | engine-dev | канарейка verify + §8 |
 | 6 | ⏳ OPEN | Резюмируемый редьюсер в соединении `gateway-serve` (докорм через `stream_from(cursor)`, состояние живёт между тиками) + запрет NaN в `bands` | engine-dev | `red_frames_seek_bound` GREEN |
 | 7 | ⏳ OPEN | Бинарь `crates/gateway/src/bin/gateway-checkpoint.rs` + ops-сервис в `docker-compose.yml` (journal-том `:ro`, ckpt-том RW), зеркально `journal-retention` | engine-dev | verify-канарейки; §8 — reviewer |
 | 8 | ⏳ OPEN | Прогон гейта `bash scripts/verify_M-38b.sh` → `VERDICT: PASS` | engine-dev | exit=0, Done Block сырым выводом |
@@ -195,13 +253,16 @@ GW-I-10 занят M-47 (выравнивание timeframe). Нумерацию
 | `crates/gateway/tests/red_frames_seek_bound.rs` | GW-I-11 + GW-I-8: резюм-API у хвоста ограничен, кадры байт-идентичны текущему `frames_since`, контигуальность курсоров цела |
 | `crates/journal/tests/red_stream_from.rs` | Сегментный пропуск по `first_seq`; legacy `first_seq==0` НЕ пропускается; граница сегмента; смесь raw/`.zst` |
 | `crates/book/tests/red_orderbook_serde_roundtrip.rs` | §Findings: книга, доведённая до `stale` разрывом чейна, после serde-roundtrip остаётся `stale` и отвергает дельты; `last_final_update_id` переживает roundtrip (следующая дельта проверяется на непрерывность, а не bootstrap'ится). Падает на «`levels()` + `apply_snapshot()`» |
+| **`crates/gateway/tests/red_checkpoint_prefix_pruned.rs`** (rev2, C-030 R3/N2) | ТРЕТИЙ форсинг: покрытый префикс ФИЗИЧЕСКИ удалён — скрытый полный реплей невозможен (истории нет). Плюс суффикс-совместимость lineage, цикл «advance→prune→advance→prune», и отсутствие непокрытого хвоста не досочиняется из чекпоинта |
+| **`crates/journal/tests/red_retention_checkpoint_coverage.rs`** (rev2, C-030 R1) | Строгая связка: непокрытые сегменты не прунятся и названы в skip-репорте; покрытые — прунятся (парный vantage); граница `last_seq` vs `last_seq−1`; отсутствие артефакта ≠ «покрыто»; offload не блокируется; override назван в отчёте |
 
 ### Почему одной байт-идентичности НЕДОСТАТОЧНО (главное для critic'а)
 
 **Реализация, которая ПОЛНОСТЬЮ ИГНОРИРУЕТ чекпоинт и всегда реплеит от START, проходит
 ВСЕ тесты байт-идентичности и все тесты инвалидации.** Она же — самый вероятный «зелёный»
 исход, если оракул односторонний (класс «идеальная фикстура», пойманный ЧЕТЫРЕ раза подряд:
-M-07, M-08, TD-042, TD-045). Форсингов ровно два, и оба обязаны быть в наборе:
+M-07, M-08, TD-042, TD-045). Форсингов **три** (третий добавлен по C-030 R3), и все обязаны
+быть в наборе:
 
 1. **Подменный чекпоинт** (GW-I-9г) — файл, снятый с ДРУГОГО журнала, но проходящий ВСЮ
    валидацию (тот же селектор, та же схема, тот же `journal_lineage` — он считается по
@@ -215,6 +276,14 @@ M-07, M-08, TD-042, TD-045). Форсингов ровно два, и оба о�
    атомарная запись своим бинарём + права на ckpt-том, а не хэш.
 2. **Resource-bound** (GW-I-11) — счётчик декодированных событий. Тихий rebuild декодирует всю
    историю и падает по счётчику.
+3. **Удалённый покрытый префикс** (rev2, C-030 R3) — `red_checkpoint_prefix_pruned`.
+   **Критик показал, что первых двух НЕДОСТАТОЧНО:** проходит реализация, которая грузит чекпоинт
+   ровно настолько, чтобы возмутить выход в тесте (1), делает ПОЛНЫЙ реплей от START для
+   корректности, и возвращает маленький `ReadStats`, собранный отдельным `stream_from` по хвосту.
+   Дыра в том, что (1) и (2) наблюдают то, что реализация САМА о себе сообщает. Третий форсинг
+   наблюдает физику: покрытых сегментов на диске НЕТ. Скрытый реплей не может вернуть правильные
+   байты — истории не существует. Без wall-clock и аллокатора: только удалённые файлы и байтовое
+   сравнение с эталоном, снятым ДО удаления.
 
 Счётчики — ДЕТЕРМИНИРОВАННЫЕ (`ReadStats`, инкремент в `EventStream::next`), не аллокатор и не
 wall-time; тесты ресурса не гоняются в параллель с чужими (урок TD-040: глобальный allocator +
@@ -242,7 +311,22 @@ journal-**writer** API (расширение VB-I-3 на бинарь чекпо
 
 ## Гейты
 
-- **plan-time critic — ОБЯЗАТЕЛЕН** (`gates.md` §3: ≥5 коммитов + касание `crates/journal`).
+### История ревизий
+
+- **rev1** (`f3c8fbb`) → **critic C-030: REJECT**. Блокеры: (R1) связка с ретеншеном не
+  специфицирована и не покрыта тестом; (R2) `red_stream_from` содержал ПЛАЦЕБО — тест обещал
+  защиту legacy, но legacy-сегмента не строил; (R3) двух форсингов недостаточно против скрытого
+  полного реплея с поддельно-маленьким `ReadStats`. NOTE: N1 (уточнить статус `selector`),
+  N2 (lineage под pruning).
+- **rev2** (этот документ) — все четыре пункта «Required revision» C-030 закрыты:
+  (1) строгая связка + `red_retention_checkpoint_coverage`; (2) реальная legacy-фикстура
+  (проверена фактически: сегменты `[(0, ver=1 legacy, first_seq=0), (1, v4, 200), (2, v4, 549)]`,
+  600 событий); (3) третий форсинг `red_checkpoint_prefix_pruned`; (4) `selector` объявлен
+  конфигурацией, а не состоянием. **Одно осознанное отклонение** — операторский
+  `allow_prune_without_checkpoint` (см. §Связка с ретеншеном), вынесено критику явно.
+
+- **plan-time critic — ОБЯЗАТЕЛЕН, ПОВТОРНО** (C-030: «Do not dispatch engine-dev yet»;
+  `gates.md` §3: ≥5 коммитов + касание `crates/journal`).
   Отдельно просить критика проверить: (1) достаточность форсингов «чекпоинт реально читается»;
   (2) полноту списка полей состояния против `crates/gateway/src/lib.rs:501-533`; (3) строгость
   связки с ретеншеном (`docs/06` §4): prune требует покрытия чекпоинтом `cursor ≥ последнего seq
