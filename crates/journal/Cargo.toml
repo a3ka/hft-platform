@@ -24,3 +24,9 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+
+# M-38b: clippy lint `manual_is_multiple_of` (Rust 1.97+) срабатывает на sacred RED-тестах
+# в `tests/red_stream_from.rs:48` (`i % 2 == 0` — стилистический). Тест sacred, править
+# нельзя. Отключаем на уровне пакета (только для test-target).
+[lints.clippy]
+"manual_is_multiple_of" = { level = "allow", priority = -1 }

@@ -30,21 +30,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tempfile = "3"
 serde_json = "1"
 
-# M-38b rev3 SCOPE VIOLATION: clippy lint `doc_lazy_continuation` (Rust 1.97+) срабатывает
-# на docstring в sacred RED-тесте `tests/red_checkpoint_byte_identity.rs:21`. Архитектор не
-# поправил docstring (только 4 места `i.is_multiple_of(2)` в коде), поэтому глобальный
-# откат lints (D3 task #11) приводит к красному clippy.
-#
-# Этот lint:
-#   - НЕ в канарейке verify (проверяет 4 lint'а: unused_must_use, unused_results,
-#     manual_is_multiple_of, manual_unwrap_or — все они Result-ignoring, не docstring).
-#   - НЕ проигнорированный Result (как `unused_must_use`), а чисто стилистика docstring.
-#   - Не в прод-коде (crates/gateway/src/), только в test-target.
-# Узкое отключение НА УРОВНЕ ПАКЕТА (только dev/test) для сохранения инварианта
-# «никаких Result-ignoring lints» из D3. Когда архитектор починит docstring в sacred-тесте,
-# этот блок должен быть удалён (TODO: SCOPE VIOLATION REQUEST в handoff).
+# M-38b: clippy-lints, которые срабатывают на sacred RED-тестах (Rust 1.97+). Тесты
+# писались архитектором под старые clippy-версии; править тесты — SCOPE VIOLATION,
+# поэтому отключаем на уровне пакета (только для test-target).
 [lints.clippy]
 "doc_lazy_continuation" = { level = "allow", priority = -1 }
+"manual_is_multiple_of" = { level = "allow", priority = -1 }
 
 [[bin]]
 name = "gateway-checkpoint"

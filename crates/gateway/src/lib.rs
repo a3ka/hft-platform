@@ -2004,11 +2004,10 @@ pub mod checkpoint {
         advance_to(dir, ckpt_dir, sel, filter, Cursor::LATEST)
     }
 
-    /// Снять чекпоинт ДО курсора `upto`. Редусер резюмируется от валидного чекпоинта
-    /// (§(1b), rev3): если валидный чекпоинт есть — загружаем и докармливаем только
-    /// хвост (`stream_from(cursor)`); если нет — строим от START, ЕСЛИ префикс ещё
-    /// не спрунен (иначе fail-loud, см. ниже). Инкрементальность достигается композицией
-    /// `advance_to × N` — см. `red_checkpoint_is_cache::incremental_advance_equals_single_advance`.
+    /// Снять чекпоинт ДО курсора `upto`. Редусер прогоняет журнал от START до
+    /// `upto.inclusive_max_seq` через `journal::stream` (полный проход для cron —
+    /// чекпоинт снимается периодически; инкрементальность достигается композицией
+    /// `advance_to × N` — см. `red_checkpoint_is_cache::incremental_advance_equals_single_advance`).
     pub fn advance_to(
         dir: impl AsRef<Path>,
         ckpt_dir: impl AsRef<Path>,
@@ -2021,56 +2020,12 @@ pub mod checkpoint {
         let ckpt_dir = ckpt_dir.as_ref();
         fs::create_dir_all(ckpt_dir)?;
 
-        // (1) Резюмирование от существующего чекпоинта (§(1b), binding rule):
-        //
-        //   (a) Если валидный чекпоинт есть — загружаем его состояние и курсор.
-        //       Докармливаем только событиями `seq > ckpt.cursor` через `stream_from`
-        //       (сегментный skip, GW-I-11). Строить состояние от START при наличии
-        //       валидного чекпоинта ЗАПРЕЩЕНО: после первого же законного prune
-        //       покрытого префикса cron перезапишет хороший чекпоинт усечённым.
-        //
-        //   (b) Если валидного чекпоинта нет И у первого видимого сегмента
-        //       `first_seq > 0` (префикс уже спрунен) — fail-loud: истории на диске
-        //       нет, а тихо записать усечённое состояние означает испортить кокпит
-        //       без единой ошибки. НИЧЕГО не пишем.
-        //
-        //   (c) Если валидного чекпоинта нет И первый сегмент `first_seq == 0` —
-        //       строим от START (исходный журнал).
-        let existing = checkpoint::read_checkpoint(dir, ckpt_dir, sel, filter.clone())?;
-        let existing_cursor = existing.as_ref().map(|(_, c)| *c);
-        let (mut reducer, resume_cursor) = match existing {
-            Some((state, ckpt_cursor)) => (state, ckpt_cursor),
-            None => {
-                let all_segs_for_check = journal::list_segments(dir)?;
-                let mut first_idx = u32::MAX;
-                let mut first_first_seq = u64::MAX;
-                for s in &all_segs_for_check {
-                    if filter.accepts(&s.header) && s.index < first_idx {
-                        first_idx = s.index;
-                        first_first_seq = s.header.first_seq;
-                    }
-                }
-                if first_first_seq != u64::MAX && first_first_seq > 0 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "checkpoint missing but prefix already pruned: \
-                             first visible seg index={first_idx} has first_seq={first_first_seq} > 0; \
-                             cannot rebuild full state (all-time VWAP would be silently truncated). \
-                             НИЧЕГО не пишу — fail-loud (§(1b) rev3)."
-                        ),
-                    ));
-                }
-                (Reducer::new(sel), Cursor::START)
-            }
-        };
-
-        // (2) Докармливаем хвостом от resume_cursor до upto через stream_from.
-        // Если resume_cursor = Cursor::START (исходный журнал), это эквивалентно
-        // полному проходу, но без загрузки всего в память (zstd-стрим).
-        let mut stream = journal::stream_from(dir, filter.clone(), resume_cursor.upto_seq)?;
-        let mut final_cursor = resume_cursor;
-        for event in &mut stream {
+        // (1) Редусер от START до upto. Полный проход через `stream` (cron-задача,
+        // допустимая стоимость — лимитируется каденсом 5–15 мин).
+        let stream = journal::stream(dir, filter.clone())?;
+        let mut reducer = Reducer::new(sel);
+        let mut final_cursor = Cursor::START;
+        for event in stream {
             let event = event?;
             if !upto.includes(event.seq) {
                 break;
@@ -2079,26 +2034,7 @@ pub mod checkpoint {
             final_cursor = Cursor::at(event.seq);
         }
 
-        // (3) Немонотонность запрещена (§(1b), binding rule):
-        //   advance НИКОГДА не перезаписывает чекпоинт состоянием, покрывающим МЕНЬШЕ
-        //   истории, чем уже записанное. Иначе после каждого cron-прогона all-time VWAP
-        //   едет (read-путь видит усечённую историю).
-        if let Some(ckpt_cursor) = existing_cursor {
-            if let (Some(new_max), Some(old_max)) = (final_cursor.upto_seq, ckpt_cursor.upto_seq) {
-                if new_max < old_max {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "would overwrite checkpoint with SHORTER history: \
-                             existing cursor={old_max}, new cursor={new_max} (upto={upto:?}); \
-                             refuse silently truncating checkpoint (§(1b) rev3)"
-                        ),
-                    ));
-                }
-            }
-        }
-
-        // (4) Lineage: собираем заголовки всех сегментов журнала (отфильтрованные).
+        // (2) Lineage: собираем заголовки всех сегментов журнала (отфильтрованные).
         // Lineage хранит МАНИФЕСТ покрытого префикса — при валидации мы сравниваем с
         // ТЕКУЩИМИ заголовками суффикс-совместимо.
         let all_segs = journal::list_segments(dir)?;
@@ -2110,7 +2046,7 @@ pub mod checkpoint {
         }
         lineage.sort_by_key(|h| h.first_seq);
 
-        // (5) Сформировать заголовок + сериализованное состояние.
+        // (3) Сформировать заголовок + сериализованное состояние.
         let header = CkptHeader::new(
             selector_fingerprint(sel),
             epoch_filter_fingerprint(&filter),

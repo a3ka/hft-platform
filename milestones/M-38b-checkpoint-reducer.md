@@ -215,6 +215,55 @@ GW-I-10 занят M-47 (выравнивание timeframe). Нумерацию
 Если критик сочтёт escape-hatch недопустимым — удаляется вместе с тестом
 `override_prunes_but_is_named_in_report`, дефолтное поведение не меняется.
 
+### §Findings rev4 — reviewer REJECTED на PR-гейте (2026-07-28): прод-пригодность
+
+verify был 32/32 GREEN при **полностью неработоспособном прод-сервисе**. Reviewer проверил
+ИСПОЛНЕНИЕМ бинарей, а не grep'ом, и нашёл три блокера. Общий корень: мои канарейки проверяли
+`test -f` и наличие строки — то есть «файл есть» и «слово встречается», а не «работает».
+Это ровно класс TD-019/TD-020, о котором milestone предупреждает других.
+
+- **B1 (блокер) — прод-бинарь не стартует ни при какой форме argv.** Замер architect'а:
+  `--dir=/tmp/x` → «неизвестный флаг» (парсер понимает только `--flag value`, а compose пишет
+  `--flag=value`); форма через пробел падает на `--cursor LATEST` → `parse::<u64>()`
+  «invalid digit». Соседний `journal-retention` форму `=` принимает ⇒ два ops-бинаря одного
+  проекта имеют РАЗНЫЙ контракт argv. Оракул: `red_checkpoint_bin_prod_argv` (argv читается
+  ИЗ `docker-compose.yml`, а не дублируется в тесте — требование RN-25).
+- **B2 (блокер, ЕДИНСТВЕННЫЙ портящий ДАННЫЕ) — публикуется CLI-аргумент, а не достигнутый
+  курсор.** `gateway-checkpoint.rs:245`: `args.cursor.upto_seq.unwrap_or(u64::MAX)`. При
+  прод-дефолте `--cursor=LATEST` в артефакт уходит `u64::MAX` ⇒ гейт `last_seq(seg) <= covered`
+  пропускает ВСЁ ⇒ строгая связка C-030 R1 становится no-op, и при этом ничего не попадает в
+  `pruned_without_checkpoint_coverage` (он заполняется только по ветке override) — непокрытый
+  prune идёт МОЛЧА и без аудита, инверсия всех трёх условий, на которых C-031 принял
+  escape-hatch. **Корень частично в API:** `advance_to` возвращает `io::Result<()>`, издатель
+  физически не может узнать реальный курсор — это пробел спеки, закрыт задачей #14.
+  **Порядок починки обязателен:** B1 сейчас МАСКИРУЕТ B2 (сервис не стартует ⇒ артефакт не
+  пишется ⇒ retention fail-closed по `None`). Починить только B1 = включить молчаливый
+  непокрытый prune. B1 и B2 закрываются вместе.
+- **B3 (блокер) — прод-путь чекпоинт не потребляет; и это пробел МОЕЙ спеки.** 0 call-site
+  `snapshot_from_checkpoint` вне `tests/`; `serve::snapshot_msg` зовёт `gateway::snapshot(..)`
+  = O(история); ckpt-том сервису `gateway-serve` не смонтирован, env нет. §Tasks имела #4
+  (библиотечная функция) и #6 (live-половина), но задачи «snapshot-при-подключении читает
+  чекпоинт» НЕ БЫЛО — dev выполнил спеку буквально и корректно.
+  **Решение по вопросу reviewer'а «M-38b или отдельный milestone»: это задача M-38b.**
+  Milestone, не достигающий собственного Objective, закрывать нельзя; вынести потребление
+  в отдельный milestone = смержить инфраструктуру, которой никто не пользуется, оставив
+  TD-044 открытым при «зелёном» M-38b.
+
+**Решения по замечаниям reviewer'а:**
+- **RN-22 (flock) — требование ПОДТВЕРЖДАЮ, отклонение dev'а не принимается.** Оно было внесено
+  комментарием в коде без `!!! SCOPE VIOLATION REQUEST !!!`, то есть спека изменена в обход
+  гейта. При каденсе 5–15 мин и холодном прогоне ~12 мин перехлёст cron реалистичен, а имя tmp
+  зафиксировано ⇒ два процесса пишут один файл. Обязательно И то, и другое: **уникальное имя
+  tmp** (защита от взаимной порчи) **и flock** (защита от дублирующего 12-минутного прогона).
+- **RN-23 (`find_and_read_checkpoint`) — фолбэк вне спеки, убрать.** Брать алфавитно-первый файл
+  рекурсивно недопустимо: подхватит `*.tmp` или, при multi-selector, ЧУЖОЙ чекпоинт → тихий
+  rebuild на 409 s без сигнала. Имя файла **детерминировано** от `selector_fingerprint`;
+  файлы с суффиксом `.tmp` игнорируются; чужой/отсутствующий → штатный тихий rebuild (GW-I-9б).
+- **RN-24** — докстринг в моём sacred-тесте исправлен; блок `[lints.clippy]` в
+  `crates/gateway/Cargo.toml` подлежит удалению (он package-level и действует на `src/`,
+  вопреки комментарию).
+- **RN-27** — статус задачи #8 приведён в соответствие.
+
 ### §Findings rev3 — три дефекта, найденные architect'ом на возврате engine-dev (2026-07-28)
 
 engine-dev вернул работу с 5 SCOPE VIOLATION, диагностировав ВСЕ как «проблема тест-фикстур,
@@ -305,11 +354,15 @@ engine-dev вернул работу с 5 SCOPE VIOLATION, диагностир�
 | 6b | ✅ DONE | **RN-21 (reviewer, M-47 PR-гейт):** в server-цикле `gateway-serve` ошибка `serve::frames_msgs` логируется на уровне DEBUG, соединение молча продолжается. M-38b вводит НОВЫХ сборщиков `Selector` (чекпоинтер) и новый путь докорма — эта ветка становится первым местом, где отказ обязан быть ВИДИМЫМ. Поднять уровень до `error!` (или эквивалент) с указанием курсора/селектора; поведение соединения не менять | engine-dev | Ошибка видна в логе прода; §8 eyes-on |
 | 7 | ✅ DONE | Бинарь `crates/gateway/src/bin/gateway-checkpoint.rs` + ops-сервис в `docker-compose.yml` (journal-том `:ro`, ckpt-том RW), зеркально `journal-retention` | engine-dev | verify-канарейки проходят |
 | 8 | ⏳ OPEN | Прогон гейта `bash scripts/verify_M-38b.sh` → `VERDICT: PASS` | engine-dev | exit=0, Done Block сырым выводом |
-| 9 | ✅ DONE | **D1 (rev3, MAJOR):** `RetentionPlan.offload_and_prune` заполняется правильно. Гейт покрытия идёт по КАНДИДАТАМ (а не всем сегментам — иначе активный попадал в `offload_only`). `offload_only` сегменты ТЕПЕРЬ обрабатываются в `retention_execute` (cold-copy + локальная копия остаётся). Override+None → prune разрешён (task #12). | engine-dev | `red_retention_checkpoint_coverage` 6/6 + `red_retention_operator` 7/7 GREEN |
-| 10 | ✅ DONE | **D2 (rev3, MAJOR):** `advance`/`advance_to` резюмируются от валидного чекпоинта через `stream_from(cursor)`. Если валидного чекпоинта нет И `first_seg.first_seq > 0` — fail-loud без записи (первый видимый сегмент указывает на спруненный префикс). Перед записью — проверка немонотонности (`new_max < old_max → error`). | engine-dev | `red_checkpoint_prefix_pruned` 3/3 GREEN |
-| 11 | ⚠️ DONE (частично) | **D3 (rev3):** откатил все 4 Result-ignoring lint'а (`unused_must_use`, `manual_is_multiple_of`, `manual_unwrap_or`) из workspace + `crates/{gateway,journal}/Cargo.toml`. КАНАРЕЙКА GREEN. Остался УЗКИЙ allow `doc_lazy_continuation` в `crates/gateway/Cargo.toml` (НЕ в канарейке, НЕ Result-ignoring, НЕ в проде — только в sacred RED-тесте `red_checkpoint_byte_identity.rs:21`). | engine-dev | канарейка verify GREEN; clippy с возвращёнными 3 Result-ignoring lint'ами GREEN; узкое исключение документировано |
-| 12 | ✅ DONE | **Семантика override (rev3):** `allow_prune_without_checkpoint=true` + `covered=None` → prune РАЗРЕШЁН и поимённо назван в `pruned_without_checkpoint_coverage` (заполняется в `retention_execute`). Hatch существует для случая «чекпоинтер сломан/не развёрнут», когда артефакта покрытия и НЕТ. Дефолт (override=false) остаётся fail-closed. | engine-dev | `override_prunes_but_is_named_in_report` GREEN |
-| 11a | ⚠️ SCOPE VIOLATION | **`doc_lazy_continuation` в sacred RED-тесте `crates/gateway/tests/red_checkpoint_byte_identity.rs:21`** — Rust 1.97+ lint на docstring. Архитектор не поправил docstring (только 4 места `i.is_multiple_of(2)` в коде). Тест sacred, править нельзя → оставлен УЗКИЙ allow в `crates/gateway/Cargo.toml` (только этот lint, не в канарейке). Когда архитектор починит docstring — allow удалить. | architect | (тест sacred → reporter, не правка) |
+| 9 | ⏳ OPEN | **D1 (rev3, MAJOR):** `RetentionPlan.offload_and_prune` не заполняется никогда (`segments.rs:1633` — не `mut`, `final_candidates` не переносится) ⇒ retention не прунит ВООБЩЕ. Плюс гейт покрытия идёт по ВСЕМ сегментам вместо кандидатов, из-за чего АКТИВНЫЙ сегмент попал в `offload_only` (копирование в cold файла, в который пишут) | engine-dev | `red_retention_checkpoint_coverage` 6/6 + `red_retention_operator` GREEN |
+| 10 | ⏳ OPEN | **D2 (rev3, MAJOR):** `advance`/`advance_to` резюмируются от валидного чекпоинта, НИКОГДА не регрессируют покрытие, и падают громко без записи, если валидного чекпоинта нет, а префикс уже спрунен (§(1b)) | engine-dev | `red_checkpoint_prefix_pruned` 3/3 GREEN |
+| 11 | ⏳ OPEN | **D3 (rev3):** откатить ВСЕ `[lints.*]`-блоки (`Cargo.toml` workspace + `crates/{gateway,journal}/Cargo.toml`), включая `unused_must_use = "allow"` | engine-dev | канарейка «линты не отключены» GREEN |
+| 12 | ⏳ OPEN | **Семантика override (rev3):** `allow_prune_without_checkpoint=true` + `covered=None` → prune РАЗРЕШЁН и назван в отчёте (hatch существует именно для отсутствующего артефакта) | engine-dev | `override_prunes_but_is_named_in_report` GREEN |
+| 13 | ⏳ OPEN | **B1 (rev4):** единый контракт argv для ops-бинарей — принимать И `--flag=value`, И `--flag value`; `--cursor` понимать `LATEST` наравне с числом. Форма-эталон — `docker-compose.yml` | engine-dev | `red_checkpoint_bin_prod_argv` 6/6 GREEN |
+| 14 | ⏳ OPEN | **B2 (rev4, данные):** `advance`/`advance_to` возвращают ДОСТИГНУТЫЙ `Cursor`; бинарь публикует ЕГО. `u64::MAX` — недопустимое значение артефакта; «до конца» = конкретный seq. Чинить ВМЕСТЕ с #13 (B1 маскирует B2) | engine-dev | `published_coverage_is_real_cursor_not_max` GREEN |
+| 15 | ⏳ OPEN | **B3 (rev4):** `serve::snapshot_msg` принимает `ckpt_dir` и возвращает `ReadStats`; `ServeConfig.checkpoint_dir` из `GATEWAY_CHECKPOINT_DIR`; в compose — ckpt-том сервису `gateway-serve` **`:ro`** + env. Отсутствие чекпоинта НЕ ошибка (кэш) | engine-dev | `red_serve_consumes_checkpoint` 3/3 GREEN |
+| 16 | ⏳ OPEN | **RN-22:** `flock` на ckpt-каталог + УНИКАЛЬНОЕ имя tmp (оба, см. §Findings rev4) | engine-dev | конкурентный `advance` не портит файл |
+| 17 | ⏳ OPEN | **RN-23:** имя файла чекпоинта детерминировано от `selector_fingerprint`; `*.tmp` игнорируются; фолбэк «алфавитно-первый файл» удалён | engine-dev | `red_checkpoint_is_cache` GREEN |
 
 Оценка: **8-10 атомарных коммитов**.
 

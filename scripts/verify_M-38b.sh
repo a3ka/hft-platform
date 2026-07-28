@@ -73,6 +73,19 @@ step "канарейка — бинарь gateway-checkpoint существуе�
 chk test -f crates/gateway/src/bin/gateway-checkpoint.rs
 chk grep -q 'gateway-checkpoint' docker-compose.yml
 
+# rev4 (reviewer B1/B2): канарейки выше — `test -f` и grep — были ЗЕЛЁНЫМИ при бинаре, который
+# не стартует ни при какой форме argv. Единственная честная проверка ops-бинаря — ЗАПУСТИТЬ его
+# теми аргументами, что стоят в docker-compose.yml, и посмотреть на выход и на артефакт.
+step "task #13/#14 — прод-argv из docker-compose.yml + covered_through_seq = достигнутый курсор"
+chk cargo test -p gateway --test red_checkpoint_bin_prod_argv --quiet
+
+# rev4 (reviewer B3): Objective недостижим, пока snapshot-при-подключении не читает чекпоинт.
+step "task #15 — gateway-serve потребляет чекпоинт (проводка env + поведение, не grep)"
+chk cargo test -p gateway-serve --test red_serve_consumes_checkpoint --quiet
+chk bash -c "sed 's://.*::' crates/gateway-serve/src/lib.rs | grep -q 'snapshot_from_checkpoint'"
+chk bash -c "sed -n '/^  gateway-serve:/,/^  [a-z-]*:\$/p' docker-compose.yml | grep -qE 'gateway-ckpt:/ckpt:ro'"
+chk bash -c "sed -n '/^  gateway-serve:/,/^  [a-z-]*:\$/p' docker-compose.yml | grep -q 'GATEWAY_CHECKPOINT_DIR'"
+
 # Версия формата чекпоинта объявлена отдельно от GATEWAY_SCHEMA_VERSION: чекпоинт — внутренний
 # кэш (T3), его форма эволюционирует независимо от контракта провода.
 # rev2 (C-030 R1): артефакт покрытия обязан ПУБЛИКОВАТЬСЯ чекпоинтером и ПОТРЕБЛЯТЬСЯ retention'ом.
