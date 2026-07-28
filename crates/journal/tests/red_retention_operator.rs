@@ -51,6 +51,7 @@ fn policy(cold: &std::path::Path, retain_days: u32, keep_min: u32) -> RetentionP
         keep_min_segments: keep_min,
         cold_root: cold.to_path_buf(),
         min_free_bytes: 0,
+        ..Default::default()
     }
 }
 
@@ -274,6 +275,7 @@ fn r7_disk_pressure_with_empty_plan_is_flagged() {
         keep_min_segments: 1_000, // всё защищено
         cold_root: cold.path().to_path_buf(),
         min_free_bytes: u64::MAX, // места «не хватает» заведомо
+        ..Default::default()
     };
     let plan = journal::retention_plan(dir.path(), &pol, T0 + DAY_MS).expect("plan");
 

@@ -386,7 +386,21 @@ pub mod server {
                     ) {
                         Ok(pair) => pair,
                         Err(e) => {
-                            tracing::debug!(error = %e, "frames_msgs failed (журнал недоступен)");
+                            // RN-21 (reviewer, M-47 PR-гейт): в проде отказ
+                            // `frames_msgs` — это NEW live-push канал (M-38b задача #6
+                            // вводит резюмируемый `LiveReducer`). Раньше был debug — молча
+                            // проглатывали, и §8 не видел проблему. Поведение соединения
+                            // (молча продолжаем, НЕ закрываем WS) сохраняем — НО поднимаем
+                            // до `error!` с курсором/селектором в контексте, чтобы §8 eyes-on
+                            // обнаружил «чекпоинтер/reducer сломался» по логу, а не по жалобе
+                            // оператора в 3 AM.
+                            tracing::error!(
+                                error = %e,
+                                cursor = ?cursor,
+                                symbol = %cfg.selector.symbol,
+                                venue = ?cfg.selector.venue,
+                                "frames_msgs failed (журнал/чекпоинтер недоступен) — соединение продолжается, но live-push молчит"
+                            );
                             continue;
                         }
                     };

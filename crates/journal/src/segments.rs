@@ -1383,7 +1383,11 @@ pub(crate) fn open_seg_for_write(
 // Каркас — architect; реализация — engine-dev.
 
 /// Политика ретеншена (операторский конфиг).
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// M-38b (C-030 R1): добавлены два поля — `checkpoint_covered_through_seq` и
+/// `allow_prune_without_checkpoint`. Дефолт через `..Default::default()` подставляет
+/// `covered = None` (= fail-closed) и `override = false` (= без override).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RetentionPolicy {
     /// Сегменты старше N суток — кандидаты на выгрузку+удаление.
     pub retain_days: u32,
@@ -1394,17 +1398,23 @@ pub struct RetentionPolicy {
     pub cold_root: PathBuf,
     /// Порог, ниже которого пустое место требует ВНЕОЧЕРЕДНОЙ выгрузки (алерт).
     pub min_free_bytes: u64,
-    /// M-38b (C-030 R1, GW-I-9 в связке с ретеншеном): минимум `seq`, свёрнутый ЧЕКПОНТОМ
-    /// по ВСЕМ сконфигурированным селекторам (gateway-checkpoint публикует ОДНО число).
-    /// Локальный prune РАЗРЕШЁН только для сегментов, чьи события полностью покрыты
-    /// (`last_seq(seg) <= covered_through_seq`). Дефолт `None` = «нет артефакта покрытия» =
-    /// fail-closed (никаких prune).
+    /// M-38b (C-030 R1): минимум `seq`, свёрнутый ЧЕКПОНТОМ по ВСЕМ сконфигурированным
+    /// селекторам (gateway-checkpoint публикует ОДНО число). Локальный prune РАЗРЕШЁН
+    /// только для сегментов, чьи события полностью покрыты (`last_seq(seg) <= covered`).
+    /// Дефолт `None` = «нет артефакта покрытия» = fail-closed (никаких prune).
     pub checkpoint_covered_through_seq: Option<u64>,
-    /// M-38b (отклонение от буквы C-030, см. milestone §Связка с ретеншеном): escape-hatch,
-    /// разрешающий prune БЕЗ покрытия чекпоинтом. Дефолт `false` (fail-closed). Если
-    /// `true` — КАЖДЫЙ prune без покрытия ОБЯЗАН быть назван в
-    /// `RetentionReport.pruned_without_checkpoint_coverage` (аудит-трейл). Молчаливого
-    /// выхода нет.
+    /// M-38b (отклонение от буквы C-030): escape-hatch, разрешающий prune БЕЗ покрытия.
+    /// Дефолт `false` (fail-closed). Если `true` — каждый prune без покрытия ОБЯЗАН
+    /// быть назван в `RetentionReport.pruned_without_checkpoint_coverage`.
+    pub allow_prune_without_checkpoint: bool,
+}
+
+/// M-38b (C-030 R1): DEPRECATED alias для backwards-compatibility. Используйте
+/// поля `RetentionPolicy.checkpoint_covered_through_seq` /
+/// `RetentionPolicy.allow_prune_without_checkpoint` напрямую.
+#[deprecated(note = "use RetentionPolicy fields directly")]
+pub struct RetentionCoverage {
+    pub checkpoint_covered_through_seq: Option<u64>,
     pub allow_prune_without_checkpoint: bool,
 }
 
@@ -1620,7 +1630,7 @@ pub fn retention_plan(
     //   даже при allow_prune_without_checkpoint=true (override без артефакта = бессмыслен).
     let covered = policy.checkpoint_covered_through_seq;
     let override_enabled = policy.allow_prune_without_checkpoint;
-    let mut offload_and_prune: Vec<SegmentInfo> = Vec::new();
+    let offload_and_prune: Vec<SegmentInfo> = Vec::new();
     let mut offload_only: Vec<SegmentInfo> = Vec::new();
     if let Some(covered_seq) = covered {
         // segs_by_idx уже отсортирован по индексу выше (см. шаг (2)).

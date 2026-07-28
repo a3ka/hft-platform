@@ -1741,7 +1741,8 @@ pub fn replay(
 ) -> io::Result<Vec<Frame>> {
     validate_selector(sel)?;
     let mut stream = journal::stream(dir, filter)?;
-    let (delta, cursor, consumed, at_ms) = reduce_event_stream(&mut stream, sel, from, to, usize::MAX)?;
+    let (delta, cursor, consumed, at_ms) =
+        reduce_event_stream(&mut stream, sel, from, to, usize::MAX)?;
     if consumed == 0 {
         return Ok(Vec::new());
     }
@@ -1818,10 +1819,15 @@ pub fn snapshot_from_checkpoint(
     let ckpt_dir = ckpt_dir.as_ref();
 
     // (1) Попытка прочитать чекпоинт. Любая невалидность → молчаливый rebuild.
-    if let Some((mut state, ckpt_cursor)) = checkpoint::read_checkpoint(dir, ckpt_dir, sel, filter.clone())? {
+    if let Some((mut state, ckpt_cursor)) =
+        checkpoint::read_checkpoint(dir, ckpt_dir, sel, filter.clone())?
+    {
         // GW-I-9(б): `ckpt.cursor > at` — просили снапшот РАНЬШЕ чекпоинта.
         // Тихий rebuild до `at`.
-        if !(ckpt_cursor.upto_seq.is_some_and(|cs| at.upto_seq.is_some_and(|a| cs > a))) {
+        if !(ckpt_cursor
+            .upto_seq
+            .is_some_and(|cs| at.upto_seq.is_some_and(|a| cs > a)))
+        {
             // (2) Чекпоинт валиден и не «из будущего». Досчитываем хвостом от
             // `ckpt_cursor` до `at`. Используем `stream_from` (GW-I-11 сегментный
             // skip). Редусер инициализируется восстановленным состоянием, и на нём
@@ -1839,11 +1845,7 @@ pub fn snapshot_from_checkpoint(
             }
             // Обновить stats ПОСЛЕ итерации (счётчики инкрементируются в `next()`).
             let stats = read_stats_from_stream(&stream);
-            let final_cursor = if at == Cursor::LATEST {
-                cursor
-            } else {
-                at
-            };
+            let final_cursor = if at == Cursor::LATEST { cursor } else { at };
             let (series, reducer_at_ms) = state.finish_with_at();
             let _ = reducer_at_ms;
             return Ok((
@@ -1963,9 +1965,10 @@ pub mod checkpoint {
     }
 
     /// M-38b: фингерпринт `EpochFilter` — три варианта.
-    /// - `OwnCaptureOnly` → 0x_OWNCAP_HASH
+    /// - `OwnCaptureOnly` → hash от строки `"OwnCaptureOnly"`
     /// - `Explicit(sorted_eps)` → hash от отсортированных `epoch_id`
-    /// - `All` → 0x_ALL_HASH
+    /// - `All` → hash от строки `"All"`
+    ///
     /// Сортировка Explicit — детерминизм (порядок в runtime не должен менять фингерпринт).
     pub fn epoch_filter_fingerprint(filter: &EpochFilter) -> u64 {
         use std::collections::hash_map::DefaultHasher;
@@ -2050,10 +2053,12 @@ pub mod checkpoint {
             lineage,
             final_cursor,
         );
-        let state_bytes = postcard::to_stdvec(&reducer)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("postcard state: {e}")))?;
-        let header_bytes = postcard::to_stdvec(&header)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("postcard header: {e}")))?;
+        let state_bytes = postcard::to_stdvec(&reducer).map_err(|e| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("postcard state: {e}"))
+        })?;
+        let header_bytes = postcard::to_stdvec(&header).map_err(|e| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("postcard header: {e}"))
+        })?;
 
         // (4) Atomic write: tmp + rename.
         let final_path = ckpt_dir.join(CKPT_FILENAME);
@@ -2148,7 +2153,7 @@ pub mod checkpoint {
             return None;
         }
         // (1) magic
-        if &bytes[0..8] != CKPT_MAGIC {
+        if bytes[0..8] != CKPT_MAGIC {
             return None;
         }
         // (2) ckpt_schema_version
@@ -2172,13 +2177,14 @@ pub mod checkpoint {
             Err(_) => return None,
         };
         // (5) state_len + state_postcard
-        let state_len = u32::from_le_bytes(bytes[header_end..header_end + 4].try_into().ok()?) as usize;
+        let state_len =
+            u32::from_le_bytes(bytes[header_end..header_end + 4].try_into().ok()?) as usize;
         let state_end = header_end + 4 + state_len;
         if bytes.len() < state_end {
             return None;
         }
         // (6) CRC32 — для детерминизма идемпотентности. CRC по `header_bytes || state_bytes`
-// (только postcard-сериализованные тела, без magic/версий/длин/state_len).
+        // (только postcard-сериализованные тела, без magic/версий/длин/state_len).
         let mut hasher = crc32fast::Hasher::new();
         hasher.update(&bytes[20..header_end]);
         hasher.update(&bytes[header_end + 4..state_end]);
@@ -2341,33 +2347,48 @@ impl LiveReducer {
         let ckpt_dir = ckpt_dir.as_ref();
 
         // Попытка загрузить чекпоинт.
-        let (mut reducer, cursor) = match checkpoint::read_checkpoint(dir, ckpt_dir, sel, filter.clone())? {
-            Some((r, c)) => (r, c),
-            None => {
-                // Без чекпоинта — reducer ПУСТОЙ, cursor = START. Scan ВСЕХ событий для
-                // честного ReadStats (events_decoded, segments_opened) — но НЕ применяем
-                // их к reducer. Тест `pumped_frames_identical_to_frames_since` вызывает
-                // pump в цикле и ожидает кадры для ВСЕХ событий: pump walks от START и
-                // применяет события в chunks of max_events.
-                // Тест `resume_without_checkpoint_reports_full_replay` ассертит
-                // `events_decoded == N` (честный счётчик scan'а).
-                let mut stream = journal::stream(dir, filter.clone())?;
-                // Прокрутить stream, чтобы инкрементировать счётчики (декодируем
-                // фреймы, но не делаем work с ними).
-                for _event in &mut stream {
-                    // читаем, но игнорируем — счётчик events_decoded инкрементируется внутри.
+        let (mut reducer, cursor) =
+            match checkpoint::read_checkpoint(dir, ckpt_dir, sel, filter.clone())? {
+                Some((r, c)) => (r, c),
+                None => {
+                    // Без чекпоинта — reducer ПУСТОЙ, cursor = START. Scan ВСЕХ событий для
+                    // честного ReadStats (events_decoded, segments_opened) — но НЕ применяем
+                    // их к reducer. Тест `pumped_frames_identical_to_frames_since` вызывает
+                    // pump в цикле и ожидает кадры для ВСЕХ событий: pump walks от START и
+                    // применяет события в chunks of max_events.
+                    // Тест `resume_without_checkpoint_reports_full_replay` ассертит
+                    // `events_decoded == N` (честный счётчик scan'а).
+                    let mut stream = journal::stream(dir, filter.clone())?;
+                    // Прокрутить stream, чтобы инкрементировать счётчики (декодируем
+                    // фреймы, но не делаем work с ними).
+                    for _event in &mut stream {
+                        // читаем, но игнорируем — счётчик events_decoded инкрементируется внутри.
+                    }
+                    let stats = read_stats_from_stream(&stream);
+                    let reducer = Reducer::new(sel);
+                    return Ok((
+                        Self {
+                            reducer,
+                            cursor: Cursor::START,
+                            selector: sel.clone(),
+                        },
+                        stats,
+                    ));
                 }
-                let stats = read_stats_from_stream(&stream);
-                let reducer = Reducer::new(sel);
-                return Ok((Self { reducer, cursor: Cursor::START, selector: sel.clone() }, stats));
-            }
-        };
+            };
 
         // Чекпоинт валиден — reducer уже свёрнут, cursor = ckpt_cursor.
-// Хвост НЕ применяем здесь: pump добирает его в chunks of max_events (как frames_since).
-// Это даёт byte-identity с frames_since и позволяет fold'ить кадры в snapshot.
+        // Хвост НЕ применяем здесь: pump добирает его в chunks of max_events (как frames_since).
+        // Это даёт byte-identity с frames_since и позволяет fold'ить кадры в snapshot.
         reducer.selector = sel.clone();
-        Ok((Self { reducer, cursor, selector: sel.clone() }, ReadStats::default()))
+        Ok((
+            Self {
+                reducer,
+                cursor,
+                selector: sel.clone(),
+            },
+            ReadStats::default(),
+        ))
     }
 
     /// Докачать новые события от текущего курсора, вернуть кадры (`Vec<Frame>`) +
@@ -2419,14 +2440,12 @@ impl LiveReducer {
         // Применяем те же события к self.reducer (state живёт между pump'ами).
         // Это нужно для snapshot-финализации, но не для самого кадра.
         let mut stream = journal::stream_from(dir, filter, self.cursor.upto_seq)?;
-        let mut consumed = 0_usize;
-        for event in &mut stream {
+        for (consumed, event) in (&mut stream).enumerate() {
             let event = event?;
             if consumed >= max_events {
                 break;
             }
             self.reducer.apply(&event);
-            consumed += 1;
         }
         let stats = read_stats_from_stream(&stream);
         if frames.is_empty() {

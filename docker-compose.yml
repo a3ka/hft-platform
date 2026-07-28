@@ -146,5 +146,46 @@ services:
       recorder:
         condition: service_healthy
 
+  # M-38b (TD-044, GW-I-9): ops-сервис чекпоинтера. Снимает чекпоинт `Reducer`
+  # (полное состояние селектора + lineage) в ОТДЕЛЬНЫЙ RW-том `gateway-ckpt`,
+  # публикует артефакт `covered_through_seq` для retention (C-030 R1). Запускается
+  # по cron'у ПЕРЕД `journal-retention` — порядок критичен (retention без покрытия
+  # не прунит). Аналог `journal-retention` / `journal-compaction` — `profiles: ["ops"]`,
+  # одноразовый контейнер.
+  #
+  # Безопасность:
+  # - journal-том смонтирован `:ro` — чекпоинтер не мутирует журнал (JR-I-1 цел,
+  #   единственный писатель — recorder).
+  # - `covered_through_seq` пишется ТОЛЬКО при успешном `advance_to`. Если
+  #   `advance_to` упал — артефакт остаётся СТАРЫМ, retention в следующем цикле
+  #   использует устаревший артефакт (= fail-closed).
+  # - Дефолт `WINDOW_MS=60000` (M-37 анти-TD-020): без активного окна прод-снапшот
+  #   ООМ-ит (TD-039 воспроизводится через §8 E2E). Деплойер переопределяет, если
+  #   нужна иная политика.
+  gateway-checkpoint:
+    image: hft-platform-recorder:local
+    container_name: hft-gateway-checkpoint
+    profiles: ["ops"]
+    entrypoint: ["/usr/local/bin/gateway-checkpoint"]
+    command:
+      - --dir=/journal
+      - --ckpt-dir=/ckpt
+      - --coverage-out=/ckpt/covered_through_seq
+      - --venue=${GATEWAY_VENUE:-Binance}
+      - --symbol=${GATEWAY_SYMBOL:-BTCUSDT}
+      - --timeframe-ms=${GATEWAY_TIMEFRAME_MS:-1000}
+      - --bands=${GATEWAY_BANDS:-0.001}
+      - --window-ms=${GATEWAY_WINDOW_MS:-60000}
+      # `--cursor LATEST` — снимаем чекпоинт ДО хвоста; усечённый прогон возможен
+      # через `--cursor <i64>` (задаётся в cron-обёртке для инкрементальных снапшотов).
+      - --cursor=LATEST
+    volumes:
+      # RO-bind к журналу (JR-I-1) + RW-bind к чекпоинт-тому.
+      - journal-data:/journal:ro
+      - gateway-ckpt:/ckpt
+    # Одноразовый (без restart) — вызывается cron'ом или оператором вручную.
+
 volumes:
   journal-data:
+  # M-38b: RW-том для чекпоинтов (по аналогии с journal-cold для холодного бэкапа).
+  gateway-ckpt:
