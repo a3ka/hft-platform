@@ -70,6 +70,14 @@ step "канарейка — covered_through_seq публикуется чекп
 chk bash -c "sed 's://.*::' crates/gateway/src/bin/gateway-checkpoint.rs | grep -q 'covered_through_seq'"
 chk bash -c "sed 's://.*::' crates/journal/src/bin/journal-retention.rs | grep -q 'checkpoint-coverage'"
 
+# rev2 NOTE (critic C-031): escape-hatch prune обязан оставаться ВЫКЛЮЧЕННЫМ в проде.
+# Канарейка поведенческая, а не «флаг существует»: проверяем, что ops-сервис ретеншена в
+# docker-compose НЕ передаёт --allow-prune-without-checkpoint. Иначе fail-closed дефолт
+# формально есть в коде, а прод молча работает с открытым футганом (класс TD-020 наоборот).
+step "канарейка — прод НЕ включает allow-prune-without-checkpoint, но флаг объявлен явно"
+chk bash -c "! grep -q 'allow-prune-without-checkpoint' <(sed -n '/^  journal-retention:/,/^  [a-z]/p' docker-compose.yml)"
+chk bash -c "sed 's://.*::' crates/journal/src/bin/journal-retention.rs | grep -q 'allow-prune-without-checkpoint'"
+
 step "канарейка — ckpt_schema_version объявлен, GATEWAY_SCHEMA_VERSION не сдвинут"
 chk bash -c "sed 's://.*::' crates/gateway/src/*.rs | grep -qE 'ckpt_schema_version|CKPT_SCHEMA_VERSION'"
 chk bash -c "grep -qE 'GATEWAY_SCHEMA_VERSION: u32 = 7;' crates/gateway/src/lib.rs"

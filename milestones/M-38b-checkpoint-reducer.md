@@ -238,6 +238,7 @@ GW-I-10 занят M-47 (выравнивание timeframe). Нумерацию
 | 5b | ⏳ OPEN | **rev2 (C-030 R1):** гейт prune в retention — новые поля политики/плана/отчёта, `offload_only`, skip-репорт с причиной, содержащей `checkpoint`; флаги бинаря `--checkpoint-coverage` / `--allow-prune-without-checkpoint` | engine-dev | `journal::red_retention_checkpoint_coverage` GREEN |
 | 5c | ⏳ OPEN | **rev2 (C-030 R1):** `gateway-checkpoint` публикует артефакт покрытия `covered_through_seq` (минимум по селекторам) в `GATEWAY_CHECKPOINT_DIR`; ops-цепочка cron: сначала чекпоинт, затем retention с этим артефактом | engine-dev | канарейка verify + §8 |
 | 6 | ⏳ OPEN | Резюмируемый редьюсер в соединении `gateway-serve` (докорм через `stream_from(cursor)`, состояние живёт между тиками) + запрет NaN в `bands` | engine-dev | `red_frames_seek_bound` GREEN |
+| 6b | ⏳ OPEN | **RN-21 (reviewer, M-47 PR-гейт):** в server-цикле `gateway-serve` ошибка `serve::frames_msgs` логируется на уровне DEBUG, соединение молча продолжается. M-38b вводит НОВЫХ сборщиков `Selector` (чекпоинтер) и новый путь докорма — эта ветка становится первым местом, где отказ обязан быть ВИДИМЫМ. Поднять уровень до `error!` (или эквивалент) с указанием курсора/селектора; поведение соединения не менять | engine-dev | Ошибка видна в логе прода; §8 eyes-on |
 | 7 | ⏳ OPEN | Бинарь `crates/gateway/src/bin/gateway-checkpoint.rs` + ops-сервис в `docker-compose.yml` (journal-том `:ro`, ckpt-том RW), зеркально `journal-retention` | engine-dev | verify-канарейки; §8 — reviewer |
 | 8 | ⏳ OPEN | Прогон гейта `bash scripts/verify_M-38b.sh` → `VERDICT: PASS` | engine-dev | exit=0, Done Block сырым выводом |
 
@@ -318,6 +319,12 @@ journal-**writer** API (расширение VB-I-3 на бинарь чекпо
   защиту legacy, но legacy-сегмента не строил; (R3) двух форсингов недостаточно против скрытого
   полного реплея с поддельно-маленьким `ReadStats`. NOTE: N1 (уточнить статус `selector`),
   N2 (lineage под pruning).
+- **rev2** → **critic C-031: NOTE, engine-dev разблокирован.** R1/R2/R3 признаны закрытыми,
+  N1/N2 достаточными; отклонение `allow_prune_without_checkpoint` ПРИНЯТО при условии
+  `default=false` + явный операторский флаг + поимённый аудит каждого prune. Остаточный NOTE —
+  канарейка на escape-hatch в verify (сделано architect'ом: verify проверяет, что прод-сервис
+  ретеншена НЕ передаёт флаг, и что флаг объявлен в бинаре явно) + dev ОБЯЗАН сохранить
+  fail-closed дефолт.
 - **rev2** (этот документ) — все четыре пункта «Required revision» C-030 закрыты:
   (1) строгая связка + `red_retention_checkpoint_coverage`; (2) реальная legacy-фикстура
   (проверена фактически: сегменты `[(0, ver=1 legacy, first_seq=0), (1, v4, 200), (2, v4, 549)]`,
