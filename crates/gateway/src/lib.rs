@@ -52,7 +52,17 @@ fn default_selector() -> Selector {
 ///    было: единая running-сумма через все дни, M-37 баг). Форма `cvd_session_base` меняется
 ///    скаляр `i64` → `Vec<(session_id, base)>` (per-session; отсутствие сессии в векторе ⇒
 ///    base=0). Non-additive (семантика И форма) — бамп 6 → 7 (VB-I-6/VB-I-10).
-pub const GATEWAY_SCHEMA_VERSION: u32 = 7;
+/// 8: M-48 (TD-048) — **провенанс истории (VB-I-11)**: `Snapshot` (+ заголовок чекпоинта) несёт
+///    `history_start_seq` (seq ПЕРВОГО реально свёрнутого события — НЕ `header.first_seq`,
+///    который у legacy синтезирован нулём, TD-030) и `history_truncated`. Поля АДДИТИВНЫ,
+///    но консюмер ОБЯЗАН узнать о них — иначе кокпит продолжит выдавать усечённую историю
+///    за полную (класс тихой лжи, ровно тот, ради которого `depth_band_provenance` /
+///    VB-I-5). Бутстрап чекпоинта на усечённом журнале ЛЕГАЛЕН — отказ только при
+///    РАЗРЫВЕ между валидным чекпоинтом и журналом (`earliest_seq > ckpt.cursor + 1`).
+///    `#[serde(default)]` на новых полях: v7-консьюмер читает v8 с дефолтами `(0, false)`
+///    (формально полная история; v7 он и так не отличает от усечённой — но и не врёт,
+///    потому что не имеет кода, использующего эти поля).
+pub const GATEWAY_SCHEMA_VERSION: u32 = 8;
 
 /// M-38b (TD-044, GW-I-9): версия ВНУТРЕННЕГО формата чекпоинта. Независима от
 /// `GATEWAY_SCHEMA_VERSION` (форма провода не меняется, меняется скорость её получения):
@@ -301,6 +311,22 @@ pub struct Snapshot {
     /// Курсор, ДО которого (включительно) свёрнута серия.
     pub cursor: Cursor,
     pub series: SeriesBundle,
+    /// M-48 (TD-048, VB-I-11): seq ПЕРВОГО РЕАЛЬНО свёрнутого события. Брать из
+    /// `header.first_seq` сегмента НЕЛЬЗЯ — у legacy-сегментов он синтезирован нулём
+    /// (`segments.rs:509-512`, TD-030) и соврал бы ровно там, где важна правда.
+    /// `#[serde(default)]` — обратная совместимость с v7-консьюмером (читает v8 с
+    /// дефолтом 0; v7 не умеет отличать «нет поля» от «история полная», но и не врёт —
+    /// он не имеет кода, использующего эти поля).
+    #[serde(default)]
+    pub history_start_seq: u64,
+    /// M-48 (VB-I-11): `true` ⇔ `history_start_seq > 0` ⇔ префикс журнала спрунен
+    /// (purge M-36 / retention-prune `docs/06` §4). Консюмер (кокпит / AI) ОБЯЗАН
+    /// не выдавать серию за полную историю инструмента (тот же класс честности, что
+    /// `depth_band_provenance` VB-I-5 и `formula_pending` VB-I-7). Анти-плацебо:
+    /// реализация «всегда truncated=true» падает на НЕусечённом журнале, заглушка
+    /// «всегда false» — на усечённом. `#[serde(default)]` — см. `history_start_seq`.
+    #[serde(default)]
+    pub history_truncated: bool,
 }
 
 /// Инкрементальный кадр: приращение серий за `(from .. to]`.
@@ -1207,14 +1233,23 @@ fn reduce_event_stream(
     after: Cursor,
     to: Cursor,
     max_events: usize,
-) -> io::Result<(SeriesBundle, Cursor, usize, i64)> {
+) -> io::Result<(SeriesBundle, Cursor, usize, i64, u64)> {
     let mut reducer = Reducer::new(selector);
     let mut cursor = after;
     let mut consumed = 0_usize;
+    // M-48 (TD-048, VB-I-11): seq ПЕРВОГО события, к которому был вызван
+    // `reducer.apply` (НЕ `seed_vwap` — seed только обновляет VWAP-аккумулятор для
+    // корректности all-time Σ, но не «сворачивает» событие в серию). При `after ==
+    // Cursor::START` это seq самого раннего видимого события журнала (= 0 на полном
+    // журнале, `> 0` на усечённом). При `after > START` это seq первой записи в
+    // окне `(after..]` — для snapshot/cкpt-путей это НЕ история, а хвост; caller
+    // ОБЯЗАН брать `history_start_seq` из чекпоинта (если валиден), а не из этого
+    // возврата. `0` если не было ни одного `apply` (пустой журнал / пустое окно).
+    let mut first_folded_seq: u64 = 0;
 
     if max_events == 0 || to == Cursor::START {
         let (series, _at_ms) = reducer.finish_with_at();
-        return Ok((series, cursor, consumed, 0_i64));
+        return Ok((series, cursor, consumed, 0_i64, first_folded_seq));
     }
 
     for event in stream {
@@ -1227,12 +1262,19 @@ fn reduce_event_stream(
             break;
         }
         reducer.apply(&event);
+        if consumed == 0 {
+            // `consumed == 0` означает «первый `apply`» (а не «первая итерация» —
+            // `seed_vwap` не инкрементирует `consumed`). Так что `event.seq` —
+            // это seq ПЕРВОГО свёрнутого события (0 на полном журнале, >0 на
+            // усечённом). Здесь 0 — корректное значение, никакого Option не надо.
+            first_folded_seq = event.seq;
+        }
         cursor = Cursor::at(event.seq);
         consumed += 1;
     }
 
     let (series, at_ms) = reducer.finish_with_at();
-    Ok((series, cursor, consumed, at_ms))
+    Ok((series, cursor, consumed, at_ms, first_folded_seq))
 }
 
 impl Snapshot {
@@ -1689,13 +1731,20 @@ pub fn snapshot(
 ) -> io::Result<Snapshot> {
     validate_selector(sel)?;
     let mut stream = journal::stream(dir, filter)?;
-    let (series, cursor, _, _at_ms) =
+    let (series, cursor, _, _at_ms, first_folded_seq) =
         reduce_event_stream(&mut stream, sel, Cursor::START, at, usize::MAX)?;
+    // M-48 (TD-048, VB-I-11): провенанс истории берётся из ПЕРВОГО свёрнутого события
+    // (НЕ из `header.first_seq` — у legacy он синтезирован нулём, TD-030). На полном
+    // журнале первый свёрнутый seq = 0 ⇒ `history_truncated = false`; на усечённом —
+    // >0 ⇒ `true`. `first_folded_seq == 0` и при пустом журнале (нет ни одного события) —
+    // тогда «усечённости» нет (просто пусто), `history_truncated = false`.
     Ok(Snapshot {
         schema_version: GATEWAY_SCHEMA_VERSION,
         selector: sel.clone(),
         cursor,
         series,
+        history_start_seq: first_folded_seq,
+        history_truncated: first_folded_seq > 0,
     })
 }
 
@@ -1721,7 +1770,7 @@ pub fn frames_since(
 ) -> io::Result<(Vec<Frame>, Cursor)> {
     validate_selector(sel)?;
     let mut stream = journal::stream(dir, filter)?;
-    let (delta, cursor, consumed, at_ms) =
+    let (delta, cursor, consumed, at_ms, _first_folded_seq) =
         reduce_event_stream(&mut stream, sel, after, Cursor::LATEST, max_events)?;
     if consumed == 0 {
         return Ok((Vec::new(), after));
@@ -1741,7 +1790,7 @@ pub fn replay(
 ) -> io::Result<Vec<Frame>> {
     validate_selector(sel)?;
     let mut stream = journal::stream(dir, filter)?;
-    let (delta, cursor, consumed, at_ms) =
+    let (delta, cursor, consumed, at_ms, _first_folded_seq) =
         reduce_event_stream(&mut stream, sel, from, to, usize::MAX)?;
     if consumed == 0 {
         return Ok(Vec::new());
@@ -1819,7 +1868,7 @@ pub fn snapshot_from_checkpoint(
     let ckpt_dir = ckpt_dir.as_ref();
 
     // (1) Попытка прочитать чекпоинт. Любая невалидность → молчаливый rebuild.
-    if let Some((mut state, ckpt_cursor)) =
+    if let Some((mut state, ckpt_cursor, ckpt_header)) =
         checkpoint::read_checkpoint(dir, ckpt_dir, sel, filter.clone())?
     {
         // GW-I-9(б): `ckpt.cursor > at` — просили снапшот РАНЬШЕ чекпоинта.
@@ -1848,12 +1897,17 @@ pub fn snapshot_from_checkpoint(
             let final_cursor = if at == Cursor::LATEST { cursor } else { at };
             let (series, reducer_at_ms) = state.finish_with_at();
             let _ = reducer_at_ms;
+            // M-48 (VB-I-11): провенанс истории ПЕРЕСИМ от чекпоинта, не вычисляем
+            // из хвостовых событий (D2: `red_checkpoint_bootstrap_truncated
+            // ::advance_after_covered_prune_does_not_regress_history_start`).
             return Ok((
                 Snapshot {
                     schema_version: GATEWAY_SCHEMA_VERSION,
                     selector: sel.clone(),
                     cursor: final_cursor,
                     series,
+                    history_start_seq: ckpt_header.history_start_seq,
+                    history_truncated: ckpt_header.history_truncated,
                 },
                 stats,
             ));
@@ -1863,7 +1917,7 @@ pub fn snapshot_from_checkpoint(
     // (3) Fallback: rebuild от START. ЧЕСТНЫЙ полный проход — `ReadStats` декодирует
     // ВСЕ события (форсинг без чекпоинта декодирует N, см. `red_checkpoint_resource_bound`).
     let mut stream = journal::stream(dir, filter)?;
-    let (series, cursor, _consumed, _at_ms) =
+    let (series, cursor, _consumed, _at_ms, first_folded_seq) =
         reduce_event_stream(&mut stream, sel, Cursor::START, at, usize::MAX)?;
     // Re-read stats AFTER iteration (счётчики инкрементируются в `next()`).
     let stats = read_stats_from_stream(&stream);
@@ -1873,6 +1927,9 @@ pub fn snapshot_from_checkpoint(
             selector: sel.clone(),
             cursor,
             series,
+            // M-48 (VB-I-11): провенанс из первого свёрнутого события (см. `snapshot`).
+            history_start_seq: first_folded_seq,
+            history_truncated: first_folded_seq > 0,
         },
         stats,
     ))
@@ -1977,7 +2034,9 @@ pub mod checkpoint {
     }
 
     /// Первый видимый (отфильтрованный) `first_seq` сегмента, либо `Ok(None)`
-    /// если журнал пуст. Используется для fail-loud-детекта (правило §(1b).3).
+    /// если журнал пуст. Используется для детекта разрыва «чекпоинт↔журнал» (M-48,
+    /// GW-I-12): если валидный чекпоинт с курсором `C` и самый ранний видимый
+    /// `first_seq > C + 1` — между ними разрыв, докорм запрещён.
     fn first_visible_seq(dir: &Path, filter: &EpochFilter) -> io::Result<Option<u64>> {
         let segs = journal::list_segments(dir)?;
         let mut min_seq: Option<u64> = None;
@@ -1991,6 +2050,14 @@ pub mod checkpoint {
     /// M-38b: заголовок чекпоинта — magic + версии + фингерпринты + lineage + cursor.
     /// Сериализуется как первая часть файла ДО postcard(state), чтобы при изменении
     /// формата валидация отказывала БЕЗ попытки десериализации state.
+    ///
+    /// M-48 (TD-048, VB-I-11): `history_start_seq` + `history_truncated` добавлены
+    /// для проброса провенанса истории на snapshot-path. Поля АДДИТИВНЫ с дефолтами
+    /// `(0, false)` — старые чекпоинты (созданные до M-48) корректно десериализуются
+    /// через `#[serde(default)]` и получают эти дефолты. Семантика: «all-time» ≡ «от
+    /// самого раннего seq, доступного под данным EpochFilter» — система НЕ отказывается
+    /// отдать то, что есть, но ОБЯЗАНА не выдавать это за другое (тот же класс честности,
+    /// что `depth_band_provenance` VB-I-5). Бутстрап на усечённом журнале ЛЕГАЛЕН.
     #[derive(Serialize, Deserialize, Debug, PartialEq)]
     pub struct CkptHeader {
         pub magic: [u8; 8],
@@ -2017,6 +2084,16 @@ pub mod checkpoint {
         pub journal_lineage: Vec<SegmentHeader>,
         /// Курсор, ДО которого (включительно) свёрнуто состояние чекпоинта.
         pub cursor: Cursor,
+        /// M-48 (VB-I-11): seq ПЕРВОГО реально свёрнутого события (НЕ
+        /// `header.first_seq` — у legacy он синтезирован нулём, TD-030). `0` на
+        /// полном журнале, `>0` на усечённом (purge M-36 / retention-prune).
+        /// `#[serde(default)]` — старые чекпоинты (до M-48) десериализуются с `0`,
+        /// что корректно отражает их «исходное» состояние.
+        #[serde(default)]
+        pub history_start_seq: u64,
+        /// M-48 (VB-I-11): `true` ⇔ `history_start_seq > 0`. См. `Snapshot.history_truncated`.
+        #[serde(default)]
+        pub history_truncated: bool,
     }
 
     impl CkptHeader {
@@ -2025,6 +2102,8 @@ pub mod checkpoint {
             epoch_filter_fingerprint: u64,
             journal_lineage: Vec<SegmentHeader>,
             cursor: Cursor,
+            history_start_seq: u64,
+            history_truncated: bool,
         ) -> Self {
             Self {
                 magic: CKPT_MAGIC,
@@ -2034,6 +2113,8 @@ pub mod checkpoint {
                 epoch_filter_fingerprint,
                 journal_lineage,
                 cursor,
+                history_start_seq,
+                history_truncated,
             }
         }
     }
@@ -2157,11 +2238,32 @@ pub mod checkpoint {
         //      Докорм только `seq > ckpt_cursor.upto_seq` (GW-I-11 сегментный skip).
         //      Дополнительно проверяем правило немонотонности (п.2):
         //      `ckpt_cursor.upto_seq <= upto.upto_seq` (иначе Err).
-        //   B. Чекпоинта НЕТ → проверить, не упрунен ли префикс (п.3).
-        //      Берём первый видимый сегмент; `first_seq > 0` ⇒ отказать.
-        //      Иначе редьюсер от START.
-        let (mut reducer, base_cursor): (Reducer, Cursor) = match existing {
-            Some((r, ckpt_cursor)) => {
+        //      Дополнительно (M-48, GW-I-12 суженный fail-loud): если самый ранний
+        //      доступный seq журнала `> ckpt_cursor.upto_seq + 1` — между ними
+        //      ОБЯЗАН быть разрыв (события спрунены и не свёрнуты ни в чекпоинт,
+        //      ни в журнал). Докорм «поверх дырки» дал бы состояние, которое
+        //      не соответствует ни одной реальной истории. → `Err` И ничего не
+        //      пишем (C-032 R3: сравнение байтов ckpt-каталога до/после).
+        //      Стык `earliest == ckpt_cursor.upto_seq + 1` — штатный, не разрыв
+        //      (законный prune покрытого префикса; `red_checkpoint_bootstrap_truncated
+        //      ::contiguous_boundary_is_not_a_gap` давит off-by-one здесь).
+        //   B. Чекпоинта НЕТ → bootstrap ОТ START.
+        //      Раньше здесь стоял безусловный fail-loud (`first_seq > 0` → Err):
+        //      прод-форма TD-048 (purge M-36 необратимо удалил segment-00000000,
+        //      condition истинно НАВСЕГДА ⇒ чекпоинт не поднимается никогда).
+        //      M-48: «all-time» ≡ «от самого раннего seq, доступного под данным
+        //      EpochFilter» — bootstrap на усечённом журнале ЛЕГАЛЕН. Провенанс
+        //      (`history_start_seq`/`history_truncated`) берётся из ПЕРВОГО
+        //      реально свёрнутого события и пишется в `CkptHeader` ниже.
+        let (mut reducer, base_cursor, history_start_seq, history_truncated): (
+            Reducer,
+            Cursor,
+            u64,
+            bool,
+        ) = match existing {
+            Some((r, ckpt_cursor, ckpt_header)) => {
+                // Монотонность (C-030 rev3 D2, пин по двум каналам в C-034 R2):
+                // возврат Err И байты ckpt-каталога не меняются.
                 if let (Some(c), Some(u)) = (ckpt_cursor.upto_seq, upto.upto_seq) {
                     if c > u {
                         return Err(io::Error::other(format!(
@@ -2171,26 +2273,96 @@ pub mod checkpoint {
                         )));
                     }
                 }
-                (r, ckpt_cursor)
-            }
-            None => {
-                // Fail-loud: история усечена, а чекпоинта нет.
-                let first_visible_seq = first_visible_seq(dir, &filter).ok().flatten();
-                if let Some(first) = first_visible_seq {
-                    if first > 0 {
+                // M-48 (GW-I-12 суженный fail-loud): разрыв «чекпоинт↔журнал».
+                // Семантика: стык `earliest == ckpt_cursor.upto_seq + 1` — НЕ
+                // разрыв (законный prune покрытого префикса). Всё, что `> ckpt+1`
+                // — разрыв, и докорм недопустим (иначе мы перезапишем чекпоинт
+                // состоянием, не соответствующим ни одной реальной истории).
+                // `first_visible_seq` смотрит ТОЛЬКО на `header.first_seq`, который
+                // у legacy синтезирован нулём (TD-030) — это НЕ ловушка здесь, потому
+                // что legacy-сегмент либо (а) пропущен `stream_from` → попадёт в
+                // хвост и не повлияет на ckpt_cursor (мы добавляем события строго
+                // `> ckpt_cursor.upto_seq`), либо (б) не пропущен (нет `next_seg`)
+                // → тогда его `first_seq=0` интерпретируется как «до ckpt_cursor»,
+                // что НЕ блокирует (рановато, не разрыв). Реальная проверка —
+                // first_seq ПЕРВОГО видимого сегмента с валидным (не legacy) заголовком;
+                // `first_visible_seq` для нашего инварианта достаточно: если он
+                // ≤ ckpt_cursor, разрыва нет. Сценарий-ловушка — когда legacy —
+                // единственный оставшийся сегмент: `first_visible_seq=0` и
+                // разрыва не детектируется, но `stream_from` применит ВСЕ его
+                // события, в т.ч. `> ckpt_cursor`, и чекпоинт будет валидно
+                // расширен — это ШТАТНЫЙ случай «бутстрап на legacy-only журнале».
+                if let Some(first) = first_visible_seq(dir, &filter).ok().flatten() {
+                    if first > 0 && first.saturating_sub(1) > ckpt_cursor.upto_seq.unwrap_or(0) {
+                        // first > ckpt + 1 ⟹ разрыв.
                         return Err(io::Error::other(format!(
-                            "checkpoint::advance_to: нет валидного чекпоинта в {}, \
-                             но первый видимый сегмент имеет first_seq={} > 0 \
-                             (префикс уже спрунен). Восстановить полное состояние физически \
-                             нечем — пишем усечённый чекпоинт, в кокпите едет all-time VWAP, \
-                             откатиться нечем. ОСТАНОВИТЕСЬ и поднимите чекпоинт вне \
-                             retention'а (cold storage + ручной rebuild по нему).",
-                            ckpt_dir.display(),
+                            "checkpoint::advance_to: разрыв между чекпоинтом \
+                             (cursor={}) и журналом (earliest first_seq={}): события \
+                             между ними спрунены и не свёрнуты ни во что. Докорм \
+                             поверх дырки дал бы состояние, не соответствующее ни одной \
+                             реальной истории. Безопасно только если \
+                             earliest == cursor + 1 (стык после законного prune \
+                             покрытого префикса) — см. GW-I-12. Ничего не пишем; \
+                             требуется ручное вмешательство (cold storage + rebuild \
+                             по нему или подтверждение, что префикс действительно \
+                             покрыт курсором чекпоинта).",
+                            ckpt_cursor
+                                .upto_seq
+                                .map(|s| s.to_string())
+                                .unwrap_or_else(|| "START".to_string()),
                             first
                         )));
                     }
                 }
-                (Reducer::new(sel), Cursor::START)
+                // M-48 (VB-I-11): провенанс истории ПЕРЕСИМ от старого чекпоинта
+                // (D2 из C-030 rev3: `advance_after_covered_prune_does_not_regress_history_start`
+                // — после законного prune покрытого префикса чекпоинт по-прежнему
+                // заявляет историю с seq 0). Новые хвостовые события (>ckpt_cursor)
+                // НЕ смещают `history_start_seq` вправо.
+                (
+                    r,
+                    ckpt_cursor,
+                    ckpt_header.history_start_seq,
+                    ckpt_header.history_truncated,
+                )
+            }
+            None => {
+                // M-48: bootstrap ЛЕГАЛЕН на усечённом журнале (TD-048). Провенанс
+                // будет заполнен ниже из ПЕРВОГО реально свёрнутого события
+                // (`first_folded_seq` в цикле докорма).
+                //
+                // ЗАЩИТА ОТ «STALE ЧЕКПОНТ»: если файл чекпоинта ФИЗИЧЕСКИ ЕСТЬ
+                // (`ckpt_path.exists()`), но `read_checkpoint` вернул `None`
+                // (lineage не сошёлся после truncate, CRC не совпал, чужой
+                // селектор — любой класс невалидности) — мы НЕ вправе
+                // перезаписывать его свежим bootstrap: оператор, видя файл,
+                // будет считать, что чекпоинт валиден, и прод-снапшот молча
+                // перейдёт на усечённое состояние без явного сигнала. Особенно
+                // опасно, если журнал УСЕЧЁН (`first_visible_seq > 0`): тогда
+                // оригинальный курсор неизвестен, и bootstrap может перезаписать
+                // валидный чекпоинт с курсором `C` усечённым состоянием, что
+                // РОВНО тот класс дефекта, который этот milestone лечит (TD-048).
+                // Поэтому — `Err`, оператор должен явно удалить stale-чекпоинт
+                // (`rm ckpt-*.bin`) или восстановить префикс из cold storage.
+                if ckpt_path_for(ckpt_dir, sel).exists() {
+                    let first = first_visible_seq(dir, &filter).ok().flatten();
+                    if let Some(first) = first {
+                        if first > 0 {
+                            return Err(io::Error::other(format!(
+                                "checkpoint::advance_to: stale чекпоинт-файл {} + усечённый \
+                                 журнал (earliest first_seq={first}); оригинальный курсор \
+                                 неизвестен (read_checkpoint вернул None — lineage/CRC/версия \
+                                 не сошлись), bootstrap перезапишет валидный чекпоинт \
+                                 усечённым состоянием (класс TD-048). Удалите stale чекпоинт \
+                                 вручную (rm {}/ckpt-*.bin) или восстановите префикс из \
+                                 cold storage. Без этого докорм небезопасен.",
+                                ckpt_path_for(ckpt_dir, sel).display(),
+                                ckpt_dir.display()
+                            )));
+                        }
+                    }
+                }
+                (Reducer::new(sel), Cursor::START, 0_u64, false)
             }
         };
 
@@ -2198,6 +2370,8 @@ pub mod checkpoint {
         // Используем `stream_from` (GW-I-11 сегментный skip — НЕ читаем уже
         // покрытый префикс).
         let mut final_cursor = base_cursor;
+        let mut first_folded_seq: u64 = history_start_seq; // None-ветка: остаётся 0; Some: уже выставлен
+        let mut consumed = 0_usize;
         let mut stream = journal::stream_from(dir, filter.clone(), base_cursor.upto_seq)?;
         for event in &mut stream {
             let event = event?;
@@ -2205,8 +2379,28 @@ pub mod checkpoint {
                 break;
             }
             reducer.apply(&event);
+            consumed += 1;
+            // M-48 (VB-I-11): первый `apply` в None-ветке — это первое реально
+            // свёрнутое событие журнала. `base_cursor == START` гарантирует, что
+            // его seq — самый ранний доступный (`first_visible_seq`, корректный
+            // даже при legacy — см. `journal::stream_from` / TD-030 защиту).
+            // В Some-ветке `first_folded_seq` уже равен `history_start_seq` из
+            // старого чекпоинта (D2 сохраняем). Детектируем «первый `apply`» по
+            // счётчику `consumed == 1` (НЕ по значению 0 — это амбигуозно: 0
+            // корректное значение seq на полном журнале, см.
+            // `advance_after_covered_prune_does_not_regress_history_start`).
+            if base_cursor == Cursor::START && consumed == 1 {
+                first_folded_seq = event.seq;
+            }
             final_cursor = Cursor::at(event.seq);
         }
+        let (history_start_seq, history_truncated) = if base_cursor == Cursor::START {
+            // None-ветка: провенанс из первого свёрнутого события.
+            (first_folded_seq, first_folded_seq > 0)
+        } else {
+            // Some-ветка: провенанс УЖЕ из старого чекпоинта, не меняем.
+            (history_start_seq, history_truncated)
+        };
 
         // (4) Lineage: собираем заголовки ТЕКУЩИХ видимых сегментов. Раньше мы
         // делали то же — этот блок поведенчески не изменился.
@@ -2225,6 +2419,8 @@ pub mod checkpoint {
             epoch_filter_fingerprint(&filter),
             lineage,
             final_cursor,
+            history_start_seq,
+            history_truncated,
         );
         let state_bytes = postcard::to_stdvec(&reducer).map_err(|e| {
             io::Error::new(io::ErrorKind::InvalidData, format!("postcard state: {e}"))
@@ -2277,7 +2473,7 @@ pub mod checkpoint {
         ckpt_dir: &Path,
         sel: &Selector,
         filter: EpochFilter,
-    ) -> io::Result<Option<(Reducer, Cursor)>> {
+    ) -> io::Result<Option<(Reducer, Cursor, CkptHeader)>> {
         let ckpt_path = ckpt_path_for(ckpt_dir, sel);
         if !ckpt_path.exists() {
             return Ok(None); // отсутствует — silent rebuild; никакой рекурсии
@@ -2294,7 +2490,7 @@ pub mod checkpoint {
         dir: &Path,
         sel: &Selector,
         filter: EpochFilter,
-    ) -> Option<(Reducer, Cursor)> {
+    ) -> Option<(Reducer, Cursor, CkptHeader)> {
         if bytes.len() < 8 + 4 + 4 + 4 {
             return None;
         }
@@ -2364,7 +2560,7 @@ pub mod checkpoint {
             return None;
         }
         // (11) cursor > at — это проверит вызывающий (ему виднее at).
-        Some((reducer, header.cursor))
+        Some((reducer, header.cursor, header))
     }
 
     /// M-38b: суффикс-совместимая валидация lineage.
@@ -2495,7 +2691,7 @@ impl LiveReducer {
         // Попытка загрузить чекпоинт.
         let (mut reducer, cursor) =
             match checkpoint::read_checkpoint(dir, ckpt_dir, sel, filter.clone())? {
-                Some((r, c)) => (r, c),
+                Some((r, c, _h)) => (r, c),
                 None => {
                     // Без чекпоинта — reducer ПУСТОЙ, cursor = START. Scan ВСЕХ событий для
                     // честного ReadStats (events_decoded, segments_opened) — но НЕ применяем
