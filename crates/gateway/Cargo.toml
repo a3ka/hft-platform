@@ -18,6 +18,10 @@ book = { path = "../book" }
 contracts = { path = "../contracts" }
 journal = { path = "../journal" }
 serde = { version = "1", features = ["derive"] }
+# M-38b (TD-044, GW-I-9): postcard + crc32 для чекпоинт-формата
+# (`magic || ckpt_schema_v || gateway_schema_v || header_postcard || state_postcard || CRC32`).
+postcard = { version = "1", features = ["use-std"] }
+crc32fast = "1"
 
 [dev-dependencies]
 tempfile = "3"

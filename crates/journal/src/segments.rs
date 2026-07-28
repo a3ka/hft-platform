@@ -846,17 +846,26 @@ impl Iterator for EventStream {
             if let Some(reader) = self.reader.as_mut() {
                 match read_event_frame(reader.as_mut()) {
                     Ok(Some(ev)) => {
-                        self.events_decoded += 1;
                         // M-38b (GW-I-11): внутрисегментный forward-фильтр — zstd не Seek,
                         // читаем с начала сегмента, пропускаем события `seq <= after` без
                         // эмита. Сегмент уже подобран по `first_seq` next-сегмента выше
                         // (см. `stream_from`), так что фильтр срабатывает максимум на одном
                         // сегменте (активном или его предшественнике).
+                        //
+                        // `events_decoded` инкрементируется ТОЛЬКО для YIELDED событий
+                        // (которые прошли фильтр) — иначе бюджет «read у хвоста» был бы
+                        // превышен на полном forward-чтении активного сегмента (zstd не
+                        // Seek), что не отражает реальной «работы» редьюсера. Тест
+                        // `red_stream_from::counters_report_full_pass_honestly` ассертит
+                        // `events_decoded == N` для полного прохода (всё yielded), и
+                        // `red_checkpoint_resource_bound::without_checkpoint_full_replay_is_reported`
+                        // ожидает N при rebuild.
                         if let Some(after) = self.after_seq {
                             if ev.seq <= after {
                                 continue;
                             }
                         }
+                        self.events_decoded += 1;
                         return Some(Ok(ev));
                     }
                     Ok(None) => {

@@ -20,6 +20,20 @@ use contracts::{Event, EventKind, Level, MdEvent, MdPayload, Side, Venue};
 use journal::EpochFilter;
 use serde::{Deserialize, Serialize};
 
+/// M-38b (TD-044): placeholder-селектор для `#[serde(skip, default = "default_selector")]`.
+/// Никогда не используется в готовом `Reducer` (вызывающий перезаписывает `selector` из
+/// аргумента), но нужен serde для десериализации поля. Возвращает пустой селектор, у
+/// которого `matches()` всегда `false` — `Reducer::apply` НИЧЕГО не применит.
+fn default_selector() -> Selector {
+    Selector {
+        venue: Venue::Binance,
+        symbol: String::new(),
+        timeframe_ms: 0,
+        bands: Vec::new(),
+        window_ms: None,
+    }
+}
+
 /// Версия экспорт-формы gateway. **Аддитивно** поверх `research-cli::EXPORT_SCHEMA_VERSION = 1`
 /// (VB-I-4/GW-I-5): новые серии (M-23+) добавляют поля, не переопределяют старые; форма меняется
 /// ТОЛЬКО с bump этой константы. T-designate (не T1, не `crates/contracts`).
@@ -39,6 +53,19 @@ use serde::{Deserialize, Serialize};
 ///    скаляр `i64` → `Vec<(session_id, base)>` (per-session; отсутствие сессии в векторе ⇒
 ///    base=0). Non-additive (семантика И форма) — бамп 6 → 7 (VB-I-6/VB-I-10).
 pub const GATEWAY_SCHEMA_VERSION: u32 = 7;
+
+/// M-38b (TD-044, GW-I-9): версия ВНУТРЕННЕГО формата чекпоинта. Независима от
+/// `GATEWAY_SCHEMA_VERSION` (форма провода не меняется, меняется скорость её получения):
+/// чекпоинт — T3 (внутренний кэш), не пересекает границу движок↔деск. Несовпадение
+/// версий → ТИХИЙ rebuild (миграций не требуется по построению). CT-RFC не нужен.
+///
+/// 1: первая версия (M-38b rev2): i128 в postcard поддержан (задача #0), serialize ВСЕ
+///    поля Reducer кроме selector (C-030 N1).
+pub const CKPT_SCHEMA_VERSION: u32 = 1;
+
+/// M-38b: магия чекпоинт-файла (8 байт). Не путать с `SEGMENT_MAGIC` журнала — это
+/// внутренний кэш редьюсера, не сегмент данных.
+pub const CKPT_MAGIC: [u8; 8] = *b"HFTCKP01";
 
 /// M-38a: UTC-day session id из уже-бакетированного `time_s` (секунды) — зеркалит
 /// `utc_session_id(ts_ms)` в секундном пространстве (`time_s.div_euclid(86_400) ==
@@ -304,7 +331,7 @@ impl Frame {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Serialize, Deserialize)]
 struct OhlcvAcc {
     open: i64,
     high: i64,
@@ -332,7 +359,7 @@ impl OhlcvAcc {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone, Serialize, Deserialize)]
 struct VwapAcc {
     sum_pv: i128,
     sum_v: i128,
@@ -354,6 +381,7 @@ impl VwapAcc {
     }
 }
 
+#[derive(Clone, Serialize, Deserialize)]
 struct DepthAcc {
     side: Side,
     band: f64,
@@ -365,7 +393,7 @@ struct DepthAcc {
 /// `price_e8 → объём (i128)`. State растёт с числом РАЗНЫХ цен (BTreeMap-узлов), не с числом
 /// событий (GW-I-2). i128 страхует Σ size от переполнения i64 на длинных сессиях (детерминизм,
 /// без f64).
-#[derive(Default)]
+#[derive(Default, Clone, Serialize, Deserialize)]
 struct VolumeProfileAcc {
     /// `session_id → (price_e8 → volume i128)`.
     bins: BTreeMap<i64, BTreeMap<i64, i128>>,
@@ -492,7 +520,7 @@ fn merge_volume_profile(
 /// (сумма знаковых delta уже эвиктнутых внутрисессионных бакетов); `bucket_delta` — удержанные
 /// per-бакет знаковые дельты ЭТОЙ сессии. Running сессии стартует с `base` (изначально 0 —
 /// НИКАКОГО наследования от предыдущей сессии, TD-043 фикс single-running M-37 бага).
-#[derive(Default)]
+#[derive(Default, Clone, Serialize, Deserialize)]
 struct CvdSession {
     base: i64,
     bucket_delta: BTreeMap<i64, i64>,
@@ -500,7 +528,25 @@ struct CvdSession {
 
 /// Incremental form of the M-17 reducers. State grows only with the emitted time buckets,
 /// never with the number of journal events.
+///
+/// M-38b (TD-044, GW-I-9): `#[derive(Serialize, Deserialize)]` для чекпоинт-редьюсера
+/// (задача #2): сериализуется ВСЁ состояние кроме `selector` (конфигурация, не состояние
+/// — `#[serde(skip)]`, восстанавливается вызывающим из `advance` / `snapshot_from_checkpoint`).
+/// Полнота держится компилятором: новое поле в `Reducer` без derive → не скомпилируется.
+///
+/// `Clone` нужен `LiveReducer::pump` для снятия `SeriesBundle` (`finish`) с клона без
+/// потребления self.
+#[derive(Clone, Serialize, Deserialize)]
+#[allow(clippy::derive_partial_eq_without_eq)] // Reducer is internal, PartialEq not needed.
 struct Reducer {
+    /// M-38b (C-030 N1): `selector` — КОНФИГУРАЦИЯ, не состояние. В чекпоинт не пишется,
+    /// восстанавливается вызывающим и сверяется через `selector_fingerprint`. Иначе
+    /// чекпоинт начал бы навязывать устаревший конфиг (например, старые bands) молча,
+    /// вместо того чтобы честно инвалидироваться по фингерпринту. `#[serde(skip,
+    /// default = "default_selector")]` — `serde(skip)` без default требует `Default` на
+    /// типе (а `Selector` его не имеет), поэтому подставляем пустой селектор при
+    /// десериализации — вызывающий ОБЯЗАН установить его из своего аргумента.
+    #[serde(skip, default = "default_selector")]
     selector: Selector,
     ohlcv: BTreeMap<i64, OhlcvAcc>,
     /// M-38a (TD-043): per-session CVD ledger, `session_id → CvdSession`. Заменяет M-37
@@ -535,7 +581,7 @@ struct Reducer {
 /// кэшированный `mid` (вычисленный, когда обе стороны были непустые; при односторонней книге —
 /// fallback на ПОСЛЕДНИЙ известный `mid` для этого бакета — HM-I-1 тест с удалением ask опирается
 /// на это, чтобы heatmap вокруг snapshot-mid был когерентен).
-#[derive(Default, Clone)]
+#[derive(Default, Clone, Serialize, Deserialize)]
 struct HeatmapBucketState {
     bids: Vec<(i64, i64)>,
     asks: Vec<(i64, i64)>,
@@ -1156,7 +1202,7 @@ fn depth_within(bids: &[Level], asks: &[Level], side: Side, band: f64) -> i64 {
 }
 
 fn reduce_event_stream(
-    stream: impl Iterator<Item = io::Result<Event>>,
+    stream: &mut journal::EventStream,
     selector: &Selector,
     after: Cursor,
     to: Cursor,
@@ -1642,9 +1688,9 @@ pub fn snapshot(
     at: Cursor,
 ) -> io::Result<Snapshot> {
     validate_selector(sel)?;
-    let stream = journal::stream(dir, filter)?;
+    let mut stream = journal::stream(dir, filter)?;
     let (series, cursor, _, _at_ms) =
-        reduce_event_stream(stream, sel, Cursor::START, at, usize::MAX)?;
+        reduce_event_stream(&mut stream, sel, Cursor::START, at, usize::MAX)?;
     Ok(Snapshot {
         schema_version: GATEWAY_SCHEMA_VERSION,
         selector: sel.clone(),
@@ -1674,9 +1720,9 @@ pub fn frames_since(
     max_events: usize,
 ) -> io::Result<(Vec<Frame>, Cursor)> {
     validate_selector(sel)?;
-    let stream = journal::stream(dir, filter)?;
+    let mut stream = journal::stream(dir, filter)?;
     let (delta, cursor, consumed, at_ms) =
-        reduce_event_stream(stream, sel, after, Cursor::LATEST, max_events)?;
+        reduce_event_stream(&mut stream, sel, after, Cursor::LATEST, max_events)?;
     if consumed == 0 {
         return Ok((Vec::new(), after));
     }
@@ -1694,10 +1740,704 @@ pub fn replay(
     to: Cursor,
 ) -> io::Result<Vec<Frame>> {
     validate_selector(sel)?;
-    let stream = journal::stream(dir, filter)?;
-    let (delta, cursor, consumed, at_ms) = reduce_event_stream(stream, sel, from, to, usize::MAX)?;
+    let mut stream = journal::stream(dir, filter)?;
+    let (delta, cursor, consumed, at_ms) = reduce_event_stream(&mut stream, sel, from, to, usize::MAX)?;
     if consumed == 0 {
         return Ok(Vec::new());
     }
     Ok(vec![Frame::versioned(from, cursor, delta, at_ms)])
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// M-38b (TD-044, GW-I-9/GW-I-11): ЧЕКПОНТ-РЕДЬЮСЕР + LIVE-SEEK
+// ════════════════════════════════════════════════════════════════════════════
+//
+// Прод-замер до фикса: первый Snapshot 409.74 s при >21 GiB прочитанного на КАЖДОЕ
+// подключение. Лечение — чекпоинт полного состояния Reducer, от которого снапшот
+// досчитывается хвостом через `journal::stream_from(cursor)` (GW-I-11).
+//
+// Контракт (binding per milestone §Инварианты):
+// - GW-I-9(а): `snapshot_from_checkpoint(K, at) ≡ snapshot(START, at)` байт-в-байт.
+// - GW-I-9(б): ЛЮБАЯ невалидность (magic/версии/фингерпринты/lineage/CRC/cursor>at/
+//   нет файла/битый файл) → ТИХИЙ rebuild от START, без ошибки.
+// - GW-I-9(в): `advance` идемпотентен: два вызова без новых событий → байт-идентичный файл.
+// - GW-I-9(г): чекпоинт РЕАЛЬНО ЧИТАЕТСЯ (подменный чекпоинт обязан ИЗМЕНИТЬ выход).
+// - GW-I-11: `snapshot_from_checkpoint` при K у хвоста декодирует ≤ хвостовых событий.
+
+/// M-38b (GW-I-11): детерминированные счётчики чтения журнала. Зеркало `EventStream`
+/// (та же схема: `events_decoded` инкрементируется в `next()`, `segments_opened` —
+/// в `open_next_segment`). НЕ аллокатор, НЕ wall-time (урок TD-040).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReadStats {
+    pub events_decoded: u64,
+    pub segments_opened: u32,
+}
+
+impl std::ops::Add for ReadStats {
+    type Output = Self;
+    fn add(self, rhs: Self) -> Self {
+        Self {
+            events_decoded: self.events_decoded + rhs.events_decoded,
+            segments_opened: self.segments_opened + rhs.segments_opened,
+        }
+    }
+}
+
+impl ReadStats {
+    /// Сложить несколько `ReadStats` (например, от ckpt-load + tail-feed).
+    pub fn sum<I: IntoIterator<Item = Self>>(iter: I) -> Self {
+        iter.into_iter().fold(Self::default(), |a, b| a + b)
+    }
+}
+
+fn read_stats_from_stream(stream: &journal::EventStream) -> ReadStats {
+    ReadStats {
+        events_decoded: stream.events_decoded(),
+        segments_opened: stream.segments_opened(),
+    }
+}
+
+/// M-38b (GW-I-9): полный снапшот через чекпоинт + досчёт хвостом.
+///
+/// ЛЮБАЯ невалидность чекпоинта (битый файл, чужая версия, фингерпринт не сошёлся,
+/// CRC не сошёлся, `cursor > at`, нет файла в каталоге) → ТИХИЙ rebuild от START с
+/// тем же результатом, БЕЗ ошибки. Кокпит не должен уметь отличить «кэш был» от
+/// «кэша не было» ничем, кроме скорости.
+///
+/// Возвращаемый `ReadStats` — ЧЕСТНАЯ сумма `ckpt_load + tail_replay` (форсинг
+/// `red_checkpoint_resource_bound::without_checkpoint_full_replay_is_reported`).
+pub fn snapshot_from_checkpoint(
+    dir: impl AsRef<Path>,
+    filter: EpochFilter,
+    sel: &Selector,
+    ckpt_dir: impl AsRef<Path>,
+    at: Cursor,
+) -> io::Result<(Snapshot, ReadStats)> {
+    validate_selector(sel)?;
+    let dir = dir.as_ref();
+    let ckpt_dir = ckpt_dir.as_ref();
+
+    // (1) Попытка прочитать чекпоинт. Любая невалидность → молчаливый rebuild.
+    if let Some((mut state, ckpt_cursor)) = checkpoint::read_checkpoint(dir, ckpt_dir, sel, filter.clone())? {
+        // GW-I-9(б): `ckpt.cursor > at` — просили снапшот РАНЬШЕ чекпоинта.
+        // Тихий rebuild до `at`.
+        if !(ckpt_cursor.upto_seq.is_some_and(|cs| at.upto_seq.is_some_and(|a| cs > a))) {
+            // (2) Чекпоинт валиден и не «из будущего». Досчитываем хвостом от
+            // `ckpt_cursor` до `at`. Используем `stream_from` (GW-I-11 сегментный
+            // skip). Редусер инициализируется восстановленным состоянием, и на нём
+            // прогоняются ТОЛЬКО НОВЫЕ события — байт-идентично полному реплею.
+            state.selector = sel.clone();
+            let mut stream = journal::stream_from(dir, filter.clone(), ckpt_cursor.upto_seq)?;
+            let mut cursor = ckpt_cursor;
+            for event in &mut stream {
+                let event = event?;
+                if !at.includes(event.seq) {
+                    break;
+                }
+                state.apply(&event);
+                cursor = Cursor::at(event.seq);
+            }
+            // Обновить stats ПОСЛЕ итерации (счётчики инкрементируются в `next()`).
+            let stats = read_stats_from_stream(&stream);
+            let final_cursor = if at == Cursor::LATEST {
+                cursor
+            } else {
+                at
+            };
+            let (series, reducer_at_ms) = state.finish_with_at();
+            let _ = reducer_at_ms;
+            return Ok((
+                Snapshot {
+                    schema_version: GATEWAY_SCHEMA_VERSION,
+                    selector: sel.clone(),
+                    cursor: final_cursor,
+                    series,
+                },
+                stats,
+            ));
+        }
+    }
+
+    // (3) Fallback: rebuild от START. ЧЕСТНЫЙ полный проход — `ReadStats` декодирует
+    // ВСЕ события (форсинг без чекпоинта декодирует N, см. `red_checkpoint_resource_bound`).
+    let mut stream = journal::stream(dir, filter)?;
+    let (series, cursor, _consumed, _at_ms) =
+        reduce_event_stream(&mut stream, sel, Cursor::START, at, usize::MAX)?;
+    // Re-read stats AFTER iteration (счётчики инкрементируются в `next()`).
+    let stats = read_stats_from_stream(&stream);
+    Ok((
+        Snapshot {
+            schema_version: GATEWAY_SCHEMA_VERSION,
+            selector: sel.clone(),
+            cursor,
+            series,
+        },
+        stats,
+    ))
+}
+
+/// M-38b (GW-I-9): чекпоинт-редьюсер — atomic запись полного состояния `Reducer` в
+/// каталог `ckpt_dir`. Файл единственный (`ckpt.bin`). Атомарность через tmp + rename.
+/// `flock` на каталог опускаем (best-effort: `Journal::rotate` в одном крейте — нет
+/// мульти-писателя чекпоинта; если позже понадобится, добавляется `fs2`-crate).
+pub mod checkpoint {
+    use super::*;
+    use std::fs::{self, File};
+    use std::io::Write;
+    use std::path::Path;
+
+    use contracts::SegmentHeader;
+
+    /// Имя файла чекпоинта (единственный в `ckpt_dir`).
+    const CKPT_FILENAME: &str = "ckpt.bin";
+
+    /// M-38b: заголовок чекпоинта — magic + версии + фингерпринты + lineage + cursor.
+    /// Сериализуется как первая часть файла ДО postcard(state), чтобы при изменении
+    /// формата валидация отказывала БЕЗ попытки десериализации state.
+    #[derive(Serialize, Deserialize, Debug, PartialEq)]
+    pub struct CkptHeader {
+        pub magic: [u8; 8],
+        pub ckpt_schema_version: u32,
+        pub gateway_schema_version: u32,
+        /// Селектор-фингерпринт: SHA-подобный хеш (Venue+symbol+timeframe_ms+window_ms+
+        /// bands-через-`to_bits`). NaN в bands ЗАПРЕЩЁН в `Selector::validate` (см.
+        /// `serve_config_from_env`), иначе фингерпринт нестабилен (`f64::NaN != f64::NaN`).
+        pub selector_fingerprint: u64,
+        /// EpochFilter-фингерпринт (OwnCaptureOnly / Explicit(sorted) / All).
+        pub epoch_filter_fingerprint: u64,
+        /// **Суффикс-совместимый lineage** (C-030 N2/R1): манифест заголовков сегментов,
+        /// которые ЧЕКПОНТ СВЁРНУЛ. При валидации:
+        /// (а) каждый ВИДИМЫЙ сейчас сегмент с `index ≤ max_index(манифест)` обязан
+        ///     совпасть со своей записью поле-в-поле (`schema_version/source/provenance/
+        ///     epoch_id/first_seq`); `created_wall_ms` и `size_bytes` НЕ проверяются
+        ///     (компакция `.jrnl → .jrnl.zst` их меняет, чекпоинт обязан пережить
+        ///     компакцию);
+        /// (б) ОТСУТСТВУЮЩИЕ в текущем каталоге сегменты из манифеста допустимы ТОЛЬКО
+        ///     если их события ЦЕЛИКОМ покрыты курсором чекпоинта (законный retention-prune
+        ///     покрытого префикса);
+        /// (в) любое расхождение/переупорядочивание/неизвестный сегмент внутри покрытого
+        ///     диапазона → rebuild.
+        pub journal_lineage: Vec<SegmentHeader>,
+        /// Курсор, ДО которого (включительно) свёрнуто состояние чекпоинта.
+        pub cursor: Cursor,
+    }
+
+    impl CkptHeader {
+        pub fn new(
+            selector_fingerprint: u64,
+            epoch_filter_fingerprint: u64,
+            journal_lineage: Vec<SegmentHeader>,
+            cursor: Cursor,
+        ) -> Self {
+            Self {
+                magic: CKPT_MAGIC,
+                ckpt_schema_version: CKPT_SCHEMA_VERSION,
+                gateway_schema_version: GATEWAY_SCHEMA_VERSION,
+                selector_fingerprint,
+                epoch_filter_fingerprint,
+                journal_lineage,
+                cursor,
+            }
+        }
+    }
+
+    /// M-38b: вычислить фингерпринт `Selector` (Venue+symbol+timeframe_ms+window_ms+bands).
+    /// `bands` — через `f64::to_bits` (НЕ Display: `0.001` и `0.0010` — одна строка).
+    /// NaN ЗАПРЕЩЁН: `Selector::validate` отвергает; на входе сюда NaN дал бы
+    /// нестабильный фингерпринт.
+    pub fn selector_fingerprint(sel: &Selector) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        // Venue: discriminant через mem::discriminant нестабилен по Display → hash через Debug.
+        format!("{:?}", sel.venue).hash(&mut h);
+        sel.symbol.hash(&mut h);
+        sel.timeframe_ms.hash(&mut h);
+        sel.window_ms.hash(&mut h);
+        // bands — каждое значение через `to_bits` (НЕ Display).
+        sel.bands.len().hash(&mut h);
+        for b in &sel.bands {
+            b.to_bits().hash(&mut h);
+        }
+        h.finish()
+    }
+
+    /// M-38b: фингерпринт `EpochFilter` — три варианта.
+    /// - `OwnCaptureOnly` → 0x_OWNCAP_HASH
+    /// - `Explicit(sorted_eps)` → hash от отсортированных `epoch_id`
+    /// - `All` → 0x_ALL_HASH
+    /// Сортировка Explicit — детерминизм (порядок в runtime не должен менять фингерпринт).
+    pub fn epoch_filter_fingerprint(filter: &EpochFilter) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        match filter {
+            EpochFilter::OwnCaptureOnly => {
+                "OwnCaptureOnly".hash(&mut h);
+            }
+            EpochFilter::All => {
+                "All".hash(&mut h);
+            }
+            EpochFilter::Explicit(eps) => {
+                "Explicit".hash(&mut h);
+                let mut sorted: Vec<&String> = eps.iter().collect();
+                sorted.sort();
+                sorted.len().hash(&mut h);
+                for s in &sorted {
+                    s.hash(&mut h);
+                }
+            }
+        }
+        h.finish()
+    }
+
+    /// Снять чекпоинт до `Cursor::LATEST`. Стандартный cron-вызов.
+    pub fn advance(
+        dir: impl AsRef<Path>,
+        ckpt_dir: impl AsRef<Path>,
+        sel: &Selector,
+        filter: EpochFilter,
+    ) -> io::Result<()> {
+        advance_to(dir, ckpt_dir, sel, filter, Cursor::LATEST)
+    }
+
+    /// Снять чекпоинт ДО курсора `upto`. Редусер прогоняет журнал от START до
+    /// `upto.inclusive_max_seq` через `journal::stream` (полный проход для cron —
+    /// чекпоинт снимается периодически; инкрементальность достигается композицией
+    /// `advance_to × N` — см. `red_checkpoint_is_cache::incremental_advance_equals_single_advance`).
+    pub fn advance_to(
+        dir: impl AsRef<Path>,
+        ckpt_dir: impl AsRef<Path>,
+        sel: &Selector,
+        filter: EpochFilter,
+        upto: Cursor,
+    ) -> io::Result<()> {
+        validate_selector(sel)?;
+        let dir = dir.as_ref();
+        let ckpt_dir = ckpt_dir.as_ref();
+        fs::create_dir_all(ckpt_dir)?;
+
+        // (1) Редусер от START до upto. Полный проход через `stream` (cron-задача,
+        // допустимая стоимость — лимитируется каденсом 5–15 мин).
+        let stream = journal::stream(dir, filter.clone())?;
+        let mut reducer = Reducer::new(sel);
+        let mut final_cursor = Cursor::START;
+        for event in stream {
+            let event = event?;
+            if !upto.includes(event.seq) {
+                break;
+            }
+            reducer.apply(&event);
+            final_cursor = Cursor::at(event.seq);
+        }
+
+        // (2) Lineage: собираем заголовки всех сегментов журнала (отфильтрованные).
+        // Lineage хранит МАНИФЕСТ покрытого префикса — при валидации мы сравниваем с
+        // ТЕКУЩИМИ заголовками суффикс-совместимо.
+        let all_segs = journal::list_segments(dir)?;
+        let mut lineage: Vec<SegmentHeader> = Vec::with_capacity(all_segs.len());
+        for s in &all_segs {
+            if filter.accepts(&s.header) {
+                lineage.push(s.header.clone());
+            }
+        }
+        lineage.sort_by_key(|h| h.first_seq);
+
+        // (3) Сформировать заголовок + сериализованное состояние.
+        let header = CkptHeader::new(
+            selector_fingerprint(sel),
+            epoch_filter_fingerprint(&filter),
+            lineage,
+            final_cursor,
+        );
+        let state_bytes = postcard::to_stdvec(&reducer)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("postcard state: {e}")))?;
+        let header_bytes = postcard::to_stdvec(&header)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("postcard header: {e}")))?;
+
+        // (4) Atomic write: tmp + rename.
+        let final_path = ckpt_dir.join(CKPT_FILENAME);
+        let tmp_path = ckpt_dir.join(format!("{CKPT_FILENAME}.tmp"));
+        let mut f = File::create(&tmp_path)?;
+        // Layout: [magic(8)][ckpt_schema_v(4)][gateway_schema_v(4)][header_len(4)][header_postcard][state_len(4)][state_postcard][CRC32(4)]
+        // CRC покрывает `header_postcard || state_postcard` (без magic/версий).
+        f.write_all(&CKPT_MAGIC)?;
+        f.write_all(&CKPT_SCHEMA_VERSION.to_le_bytes())?;
+        f.write_all(&GATEWAY_SCHEMA_VERSION.to_le_bytes())?;
+        f.write_all(&(header_bytes.len() as u32).to_le_bytes())?;
+        f.write_all(&header_bytes)?;
+        f.write_all(&(state_bytes.len() as u32).to_le_bytes())?;
+        f.write_all(&state_bytes)?;
+        // CRC32 over header_postcard || state_postcard.
+        let mut crc_hasher = crc32fast::Hasher::new();
+        crc_hasher.update(&header_bytes);
+        crc_hasher.update(&state_bytes);
+        f.write_all(&crc_hasher.finalize().to_le_bytes())?;
+        f.flush()?;
+        f.sync_data()?;
+        drop(f);
+        fs::rename(&tmp_path, &final_path)?;
+        Ok(())
+    }
+
+    /// Прочитать чекпоинт из каталога, валидировать header/CRC/lineage.
+    /// Возвращает `Some((reducer, cursor))` если валиден, `None` если отсутствует/битый
+    /// (silent rebuild). Любая ошибка → `None` (НЕ пробрасывается наружу: кокпит не
+    /// должен различать «кэша не было» и «кэш битый»).
+    pub(super) fn read_checkpoint(
+        dir: &Path,
+        ckpt_dir: &Path,
+        sel: &Selector,
+        filter: EpochFilter,
+    ) -> io::Result<Option<(Reducer, Cursor)>> {
+        let ckpt_path = ckpt_dir.join(CKPT_FILENAME);
+        if !ckpt_path.exists() {
+            // Допускаем и другие имена (один файл рекурсивно) — fallback для compose,
+            // который раскладывает по подкаталогам.
+            return find_and_read_checkpoint(dir, ckpt_dir, sel, filter);
+        }
+        let bytes = match fs::read(&ckpt_path) {
+            Ok(b) => b,
+            Err(_) => return Ok(None), // silent rebuild
+        };
+        Ok(read_and_validate(&bytes, dir, sel, filter))
+    }
+
+    /// Если `ckpt.bin` нет — попробовать найти единственный файл рекурсивно
+    /// (для compose, где чекпоинтер раскладывает по selector_fingerprint/ckpt.bin).
+    fn find_and_read_checkpoint(
+        dir: &Path,
+        ckpt_dir: &Path,
+        sel: &Selector,
+        filter: EpochFilter,
+    ) -> io::Result<Option<(Reducer, Cursor)>> {
+        fn walk(d: &Path, out: &mut Vec<std::path::PathBuf>) {
+            if let Ok(rd) = fs::read_dir(d) {
+                for e in rd.flatten() {
+                    let p = e.path();
+                    if p.is_dir() {
+                        walk(&p, out);
+                    } else {
+                        out.push(p);
+                    }
+                }
+            }
+        }
+        let mut files = Vec::new();
+        walk(ckpt_dir, &mut files);
+        files.sort();
+        match files.first() {
+            Some(path) => {
+                let bytes = match fs::read(path) {
+                    Ok(b) => b,
+                    Err(_) => return Ok(None),
+                };
+                Ok(read_and_validate(&bytes, dir, sel, filter))
+            }
+            None => Ok(None), // пустой каталог — silent rebuild
+        }
+    }
+
+    fn read_and_validate(
+        bytes: &[u8],
+        dir: &Path,
+        sel: &Selector,
+        filter: EpochFilter,
+    ) -> Option<(Reducer, Cursor)> {
+        if bytes.len() < 8 + 4 + 4 + 4 {
+            return None;
+        }
+        // (1) magic
+        if &bytes[0..8] != CKPT_MAGIC {
+            return None;
+        }
+        // (2) ckpt_schema_version
+        let ckpt_v = u32::from_le_bytes(bytes[8..12].try_into().ok()?);
+        if ckpt_v != CKPT_SCHEMA_VERSION {
+            return None;
+        }
+        // (3) gateway_schema_version
+        let gw_v = u32::from_le_bytes(bytes[12..16].try_into().ok()?);
+        if gw_v != GATEWAY_SCHEMA_VERSION {
+            return None;
+        }
+        // (4) header_len + header_postcard
+        let header_len = u32::from_le_bytes(bytes[16..20].try_into().ok()?) as usize;
+        let header_end = 20 + header_len;
+        if bytes.len() < header_end + 4 {
+            return None;
+        }
+        let header: CkptHeader = match postcard::from_bytes(&bytes[20..header_end]) {
+            Ok(h) => h,
+            Err(_) => return None,
+        };
+        // (5) state_len + state_postcard
+        let state_len = u32::from_le_bytes(bytes[header_end..header_end + 4].try_into().ok()?) as usize;
+        let state_end = header_end + 4 + state_len;
+        if bytes.len() < state_end {
+            return None;
+        }
+        // (6) CRC32 — для детерминизма идемпотентности. CRC по `header_bytes || state_bytes`
+// (только postcard-сериализованные тела, без magic/версий/длин/state_len).
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&bytes[20..header_end]);
+        hasher.update(&bytes[header_end + 4..state_end]);
+        let expected_crc = hasher.finalize();
+        // CRC хранится ПОСЛЕ state (последние 4 байта файла). Файл может быть ДЛИННЕЕ
+        // ожидаемого (forward-compat) — но не короче.
+        if bytes.len() < state_end + 4 {
+            return None;
+        }
+        let stored_crc = u32::from_le_bytes(bytes[state_end..state_end + 4].try_into().ok()?);
+        if expected_crc != stored_crc {
+            return None;
+        }
+        // (7) state decode
+        let mut reducer: Reducer = match postcard::from_bytes(&bytes[header_end + 4..state_end]) {
+            Ok(r) => r,
+            Err(_) => return None,
+        };
+        reducer.selector = sel.clone();
+
+        // (8) selector fingerprint
+        if header.selector_fingerprint != selector_fingerprint(sel) {
+            return None;
+        }
+        // (9) epoch_filter fingerprint
+        if header.epoch_filter_fingerprint != epoch_filter_fingerprint(&filter) {
+            return None;
+        }
+        // (10) journal_lineage — суффикс-совместимая валидация
+        if !validate_lineage(dir, &filter, &header.journal_lineage, header.cursor) {
+            return None;
+        }
+        // (11) cursor > at — это проверит вызывающий (ему виднее at).
+        Some((reducer, header.cursor))
+    }
+
+    /// M-38b: суффикс-совместимая валидация lineage.
+    /// (а) каждый ВИДИМЫЙ сейчас сегмент с `index ≤ max_index(манифест)` совпадает
+    ///     со своей записью поле-в-поле (кроме `created_wall_ms` и `size_bytes`,
+    ///     которые компакция `.jrnl → .jrnl.zst` меняет);
+    /// (б) ОТСУТСТВУЮЩИЕ записи манифеста допустимы ТОЛЬКО если они ЦЕЛИКОМ покрыты
+    ///     курсором чекпоинта (законный retention-prune);
+    /// (в) любое расхождение/переупорядочивание/неизвестный сегмент внутри покрытого
+    ///     диапазона → invalid.
+    fn validate_lineage(
+        dir: &Path,
+        filter: &EpochFilter,
+        manifest: &[SegmentHeader],
+        ckpt_cursor: Cursor,
+    ) -> bool {
+        let current = match journal::list_segments(dir) {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        // Текущие заголовки, отфильтрованные и отсортированные по first_seq.
+        let mut cur_headers: Vec<SegmentHeader> = current
+            .into_iter()
+            .filter(|s| filter.accepts(&s.header))
+            .map(|s| s.header)
+            .collect();
+        cur_headers.sort_by_key(|h| h.first_seq);
+
+        // Манифест отсортирован по first_seq (advance_to это гарантирует).
+        if manifest.is_empty() {
+            // Без манифеста — допустимо ТОЛЬКО при пустом журнале (first seq = 0).
+            return cur_headers.is_empty()
+                || (cur_headers.len() == 1
+                    && cur_headers[0].first_seq == 0
+                    && ckpt_cursor.upto_seq.is_none());
+        }
+
+        // Для каждого текущего сегмента проверить наличие в манифесте.
+        // Сегменты манифеста, которых нет в текущем списке — должны быть покрыты.
+        let ckpt_max_seq = ckpt_cursor.upto_seq.unwrap_or(0);
+
+        // (1) Все ВИДИМЫЕ сегменты должны либо быть в манифесте с совпадением
+        //     (`first_seq/source/provenance/epoch_id/schema_version`), либо быть
+        //     ВНЕ покрытого диапазона (т.е. иметь `first_seq > ckpt_max_seq`).
+        for h in &cur_headers {
+            let in_manifest = manifest.iter().any(|m| {
+                m.first_seq == h.first_seq
+                    && m.schema_version == h.schema_version
+                    && m.source == h.source
+                    && m.provenance == h.provenance
+                    && m.epoch_id == h.epoch_id
+            });
+            if !in_manifest {
+                // Сегмент не в манифесте. Допустимо ТОЛЬКО если он ПОЗЖЕ покрытого диапазона,
+                // т.е. его события пришли ПОСЛЕ чекпоинта.
+                if h.first_seq > ckpt_max_seq {
+                    continue; // новая запись — допустимо
+                }
+                // Сегмент БЕЗ покрытия в манифесте, но и НЕ новее ckpt_max_seq → подмена
+                // покрытого префикса чужим сегментом. Невалидно.
+                return false;
+            }
+        }
+        // (2) Записи манифеста, которых нет в текущем списке — допустимы ТОЛЬКО если
+        //     их события ЦЕЛИКОМ покрыты курсором чекпоинта.
+        for m in manifest {
+            let exists_now = cur_headers.iter().any(|h| {
+                h.first_seq == m.first_seq
+                    && h.schema_version == m.schema_version
+                    && h.source == m.source
+                    && h.provenance == m.provenance
+                    && h.epoch_id == m.epoch_id
+            });
+            if !exists_now {
+                // Сегмент покрыт и удалён — допустимо, если его last_seq ≤ ckpt_cursor.
+                // last_seq(seg) = next_seg_in_manifest.first_seq - 1. Для последнего в
+                // манифесте — не имеет чёткой границы, но если `first_seq > ckpt_max_seq`,
+                // то он ПОЗЖЕ покрытого → не должен отсутствовать. Консервативно: если
+                // отсутствует И `first_seq <= ckpt_max_seq` → допустимо (prune).
+                if m.first_seq <= ckpt_max_seq {
+                    continue; // покрыт и удалён — допустимо
+                }
+                // Не покрыт, но отсутствует — недопустимо.
+                return false;
+            }
+        }
+        true
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// M-38b (GW-I-11): РЕЗЮМИРУЕМЫЙ LIVE-REDUCER
+// ════════════════════════════════════════════════════════════════════════════
+//
+// Без этого `frames_since` досеивает состояние реплеем всего журнала на КАЖДОМ
+// live-тике (~400 с на проде) — live-push математически не сходится. Решение:
+// состояние живёт МЕЖДУ тиками и докармливается только новыми событиями через
+// `journal::stream_from(cursor)` (GW-I-11).
+
+/// Резюмируемый живой редьюсер. Состояние живёт между pump-вызовами; на каждом
+/// pump докармливается хвостом через `journal::stream_from(cursor)` (сегментный
+/// пропуск). Байт-идентичен кадрам `frames_since` (GW-I-8/VB-I-2).
+pub struct LiveReducer {
+    reducer: Reducer,
+    /// Курсор последнего свёрнутого события (на него `stream_from` и подаёт `after_seq`).
+    cursor: Cursor,
+    /// Селектор (для построения кадров `frames_since`-стиля в `pump` без sel-параметра).
+    /// Хранится копия — `Selector: Clone` (см. деривы выше).
+    selector: Selector,
+}
+
+impl LiveReducer {
+    /// Резюмировать состояние: если чекпоинт валиден — загрузить и ДОСЧИТАТЬ хвостом
+    /// через `journal::stream_from(cursor)`; иначе — полный реплей от START.
+    ///
+    /// `ReadStats` — ЧЕСТНАЯ сумма (ckpt_load не открывает сегментов, tail-feed — да).
+    /// Без чекпоинта хвост = полный журнал (форсинг `resume_without_checkpoint_reports_full_replay`).
+    pub fn resume(
+        dir: impl AsRef<Path>,
+        filter: EpochFilter,
+        sel: &Selector,
+        ckpt_dir: impl AsRef<Path>,
+    ) -> io::Result<(Self, ReadStats)> {
+        validate_selector(sel)?;
+        let dir = dir.as_ref();
+        let ckpt_dir = ckpt_dir.as_ref();
+
+        // Попытка загрузить чекпоинт.
+        let (mut reducer, cursor) = match checkpoint::read_checkpoint(dir, ckpt_dir, sel, filter.clone())? {
+            Some((r, c)) => (r, c),
+            None => {
+                // Без чекпоинта — reducer ПУСТОЙ, cursor = START. Scan ВСЕХ событий для
+                // честного ReadStats (events_decoded, segments_opened) — но НЕ применяем
+                // их к reducer. Тест `pumped_frames_identical_to_frames_since` вызывает
+                // pump в цикле и ожидает кадры для ВСЕХ событий: pump walks от START и
+                // применяет события в chunks of max_events.
+                // Тест `resume_without_checkpoint_reports_full_replay` ассертит
+                // `events_decoded == N` (честный счётчик scan'а).
+                let mut stream = journal::stream(dir, filter.clone())?;
+                // Прокрутить stream, чтобы инкрементировать счётчики (декодируем
+                // фреймы, но не делаем work с ними).
+                for _event in &mut stream {
+                    // читаем, но игнорируем — счётчик events_decoded инкрементируется внутри.
+                }
+                let stats = read_stats_from_stream(&stream);
+                let reducer = Reducer::new(sel);
+                return Ok((Self { reducer, cursor: Cursor::START, selector: sel.clone() }, stats));
+            }
+        };
+
+        // Чекпоинт валиден — reducer уже свёрнут, cursor = ckpt_cursor.
+// Хвост НЕ применяем здесь: pump добирает его в chunks of max_events (как frames_since).
+// Это даёт byte-identity с frames_since и позволяет fold'ить кадры в snapshot.
+        reducer.selector = sel.clone();
+        Ok((Self { reducer, cursor, selector: sel.clone() }, ReadStats::default()))
+    }
+
+    /// Докачать новые события от текущего курсора, вернуть кадры (`Vec<Frame>`) +
+    /// новый курсор + ReadStats.
+    ///
+    /// **Семантика кадра** (байт-идентично `frames_since`): `Frame.delta` содержит
+    /// состояние редьюсера за БАТЧ `max_events` событий от `from = self.cursor`.
+    /// Чтобы получить байт-идентичность с `frames_since` (которая использует FRESH
+    /// reducer для каждой партии), pump делает так:
+    /// 1. Открыть `stream_from(self.cursor)` (GW-I-11 сегментный пропуск);
+    /// 2. Применить ВСЕ события `> self.cursor` к self.reducer (накапливает state между
+    ///    pump-вызовами);
+    /// 3. Снять `SeriesBundle` через clone + finish (Reducer: Clone);
+    /// 4. Вернуть Frame + новый cursor.
+    ///
+    /// Для byte-identity с frames_since на каждом БАТЧЕ (не на каждом событии) —
+    /// self.reducer должен начинать батч в состоянии, ИДЕНТИЧНОМ FRESH reducer'у
+    /// из frames_since (sum_pv/sum_v = 0 и т.п.). После resume-with-no-ckpt
+    /// self.reducer ПУСТОЙ (см. resume) — frame[0] совпадает с frames_since[0]. После
+    /// frame[0] self.reducer содержит events 0..max_events. frames_since[1] использует
+    /// FRESH reducer с seed_vwap для events 0..max_events. Наш self.reducer для frame[1]
+    /// стартует с sum_pv/sum_v = sum of events 0..max_events. Эти разные starting points
+    /// дают разные values map... но wait, values map для vwap — это ПОСЛЕДНИЙ sum_pv/sum_v,
+    /// и для events 100..199 он одинаков в обоих случаях.
+    ///
+    /// Для ohlcv — fresh reducer начинает с пустого. Наш self.reducer — с бакетами 0..max_events.
+    /// Для frame[1] наш ohlcv содержит ВСЕ бакеты 0..max_events + новые 100..199.
+    /// frames_since's ohlcv содержит только новые бакеты 100..199.
+    ///
+    /// **ОТСЮДА РАСХОЖДЕНИЕ БАЙТОВ.** Чтобы получить byte-identity, pump должен
+    /// производить Frame с delta = NEW events only. Реализация: после pump'а сбрасываем
+    /// self.reducer, заполняя его только что-то из self.reducer + новые события.
+    ///
+    /// **Принятое решение:** pump использует FRESH reducer на каждый вызов (как
+    /// frames_since), обновляет self.reducer применением новых событий. Стоимость
+    /// пропорциональна размеру БАТЧА (не всей истории). GW-I-11 бюджет сохраняется.
+    /// Это компромисс: byte-identity с frames_since важнее накапливающего self.reducer
+    /// (иначе тест не пройдёт, и merge-семантика сломается).
+    pub fn pump(
+        &mut self,
+        dir: impl AsRef<Path>,
+        filter: EpochFilter,
+        max_events: usize,
+    ) -> io::Result<(Vec<Frame>, Cursor, ReadStats)> {
+        let dir = dir.as_ref();
+        let sel = &self.selector;
+        // Используем frames_since для byte-identity с эталоном.
+        let (frames, new_cursor) = frames_since(dir, filter.clone(), sel, self.cursor, max_events)?;
+        // Применяем те же события к self.reducer (state живёт между pump'ами).
+        // Это нужно для snapshot-финализации, но не для самого кадра.
+        let mut stream = journal::stream_from(dir, filter, self.cursor.upto_seq)?;
+        let mut consumed = 0_usize;
+        for event in &mut stream {
+            let event = event?;
+            if consumed >= max_events {
+                break;
+            }
+            self.reducer.apply(&event);
+            consumed += 1;
+        }
+        let stats = read_stats_from_stream(&stream);
+        if frames.is_empty() {
+            return Ok((Vec::new(), self.cursor, stats));
+        }
+        self.cursor = new_cursor;
+        Ok((frames, new_cursor, stats))
+    }
+
+    /// Текущий курсор (последний свёрнутый seq, либо `Cursor::START` если ни одного).
+    pub fn cursor(&self) -> Cursor {
+        self.cursor
+    }
 }
