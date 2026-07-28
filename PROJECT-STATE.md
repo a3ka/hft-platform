@@ -1737,6 +1737,58 @@ VB-I-6 per-series anchor) → critic **C-026 REJECT (fmt sacred) → rev2 PASS**
 - **Разблокировано:** M-38b (checkpoint-reducer) — `selector_fingerprint` теперь ключует ТОЛЬКО
   валидированный селектор; чекпоинт под невалидным таймфреймом снять невозможно.
 
+## Чекпоинт-редьюсер (M-38b «Путь Б: снапшот от чекпоинта, а не от START» — КОД MERGED `606aa62`, reviewer APPROVED 2026-07-28; **§8 NOT GREEN → milestone НЕ закрыт, TD-044 OPEN**)
+
+Цель — TD-044: первый `Snapshot` строился 409.74 s (полный реплей журнала на КАЖДОЕ подключение).
+Путь Б: персистентный чекпоинт состояния `Reducer` + докорм хвостом от курсора чекпоинта.
+
+**Что реально на `main` (код APPROVED, гейты воспроизведены reviewer'ом НЕЗАВИСИМО на чистом
+worktree 88dc625, не пересказом tester'а):** `fmt=0`, `clippy -D warnings=0`,
+`cargo test --workspace` **470 passed / 0 failed / 0 ignored** (147 блоков),
+`scripts/verify_M-38b.sh` **VERDICT: PASS, exit=0** (37 шагов, 0 FAIL).
+- `crates/gateway` — модуль `checkpoint` (postcard-состояние + `ckpt_schema_version`, детерминированное
+  имя `ckpt-<selector_fingerprint:016x>.bin` (RN-23), `flock` + уникальный tmp `<final>.tmp.<pid>.<nanos>`
+  (RN-22)), `snapshot_from_checkpoint` (чекпоинт = КЭШ: любая невалидность/отсутствие → тихий rebuild),
+  `LiveReducer`, `advance`/`advance_to` (возвращают ДОСТИГНУТЫЙ курсор — B2), бинарь
+  `src/bin/gateway-checkpoint.rs` (argv принимает и `--flag=value`, и `--flag value` — B1).
+- `crates/journal` — `stream_from` (сегментный skip, GW-I-11) + `ReadStats{events_decoded,
+  segments_opened}`; retention-гейт по покрытию чекпоинта (C-030 R1): `RetentionPolicy.
+  {checkpoint_covered_through_seq, allow_prune_without_checkpoint}`, `RetentionPlan.offload_only`,
+  `RetentionReport.pruned_without_checkpoint_coverage`; флаги `--checkpoint-coverage`,
+  `--allow-prune-without-checkpoint` у `journal-retention`.
+- `crates/book` — ТОЛЬКО `#[derive(Serialize, Deserialize)]` на `OrderBook` (все 4 поля, вкл. приватные)
+  + RED `red_orderbook_serde_roundtrip`. `crates/gateway-serve` — `ServeConfig.checkpoint_dir` из
+  `GATEWAY_CHECKPOINT_DIR`, `snapshot_msg` возвращает `ReadStats`, лог на `debug` (дефолт-фильтр
+  `info,gateway_serve=debug` ⇒ в проде виден). `docker-compose.yml` — ops-сервис `gateway-checkpoint`
+  (`profiles: ["ops"]`, journal `:ro`, ckpt-том RW) + `gateway-ckpt:/ckpt:ro` сервису `gateway-serve`.
+- **Цепочка гейтов соблюдена:** RED-first (`14d6642` architect — ТОЛЬКО `*/tests/`+milestone+verify —
+  предшествует всему impl), plan-time critic ДВАЖДЫ (`C-030` REJECT R1/R2/R3 → rev2 → `C-031` NOTE,
+  engine-dev разблокирован), risk-critic не требуется (read-path, `gates.md` §5 MD-only carve-out;
+  `risk`/`killswitch`/`oms`/`venue-*` в диффе отсутствуют), `crates/contracts/**` не тронут —
+  `GATEWAY_SCHEMA_VERSION` остаётся **7** (канарейка GREEN).
+
+**Почему milestone НЕ закрыт — §8 eyes-on на VPS (`606aa62`, CI+Deploy оба success):**
+фича **ИНЕРТНА В ПРОДЕ**. Штатный ops-путь поднятия чекпоинта падает:
+`advance_to` fail-loud'ит, потому что `first_visible_seq=16049334 > 0` (сегмент 0 удалён purge'ем
+M-36 — необратимо), а escape-hatch у бинаря нет ⇒ `/ckpt` пуст ⇒ `gateway-serve` каждый раз уходит
+в fallback-реплей. E2E JWT → первый `Snapshot` (DECODE, не grep): **382.657 s**, `schema_version=7`,
+`cursor={"upto_seq":111647115}`, `ohlcv len=51`, `heatmap len=1789`, реальные цены BTC — то есть
+относительно 409.74 s улучшения НЕТ. Сырой вывод, корень, асимметрия «read-path усечённую историю
+ОТДАЁТ, checkpoint-path её СОХРАНИТЬ отказывается» и не доставленная ops-цепочка (`deploy/**` не
+входил в Allowed paths, cron чекпоинтера не заведён) — **TD-048** (MAJOR).
+**Прод при этом здоров и не деградировал:** recorder пишет (`next_seq` 111615379 → 111649748 за 8 мин,
+`writable:true`), оба контейнера `(healthy)`, оба тома читателям смонтированы `rw=false`.
+⇒ **TD-044 остаётся OPEN**, close-out M-28/M-36/M-38b по-прежнему заблокирован.
+
+**Процессные находки PR-гейта (NOTE, не блокеры merge):** (а) `Dockerfile` правился вне
+`Allowed paths` — механическая предпосылка явно разрешённого ops-сервиса; (б) engine-dev правил
+Forbidden `crates/gateway-serve/tests/{red_serve_passthrough,smoke_ws}.rs` — чистая адаптация
+call-site под сигнатуру, которую сменил САМ architect в задаче #15 (инварианты не тронуты, сверено
+по диффу); правку `crates/journal/tests/red_retention_operator.rs` (`..Default::default()`) architect
+откатил сам (задача 0d). Урок для architect: меняешь публичную сигнатуру — вези адаптацию ВСЕХ
+call-site'ов в том же RED-коммите, иначе dev вынужден лезть в sacred-зону.
+(в) `Cargo.toml` workspace — правился и полностью откачен (net-diff пуст, задача #11, сверено).
+
 ## Пока НЕ реализовано (следующие фазы)
 - Крейты `risk`/`killswitch`/`oms`, `runner` — пофазно per DESIGN §10 (M-08: fail-closed риск-гейт
   между `strategy` и `oms`). MM-котирование, wiring весов из `signals.json` (граница B),

@@ -3,6 +3,60 @@
 > **Reviewer-owned.** Открытые долги/риски, замеченные при работе. Закрытые переносятся вниз.
 
 ## OPEN
+- **TD-048** `checkpoint-не-может-быть-поднят-на-прод-журнале-со-спруненным-префиксом` (найдено
+  reviewer'ом на §8 M-38b, 2026-07-28). **Severity: MAJOR — держит TD-044, а с ним close-out
+  M-28/M-36/M-38b.** M-38b смержен (`606aa62`), CI+Deploy зелёные, прод здоров — но фича
+  **ИНЕРТНА В ПРОДЕ**: чекпоинт физически невозможно создать, поэтому латентность не изменилась.
+  **Замер (не пересказ), прод `606aa62`, журнал 23 GB / 116 сегментов:**
+  ```
+  # (1) E2E JWT → первый Snapshot при ПУСТОМ /ckpt (DECODE, не grep):
+  LATENCY first Snapshot (от ws handshake) = 382.657 s      # TD-044 baseline был 409.74 s
+  schema_version = 7; cursor = {"upto_seq": 111647115}; ohlcv len=51; heatmap len=1789
+  VERDICT: FAIL — латентность 382.657 s > 10.0 s
+
+  # (2) попытка поднять чекпоинт штатным ops-путём:
+  $ docker compose --profile ops run --rm gateway-checkpoint
+  gateway-checkpoint: advance_to failed dir=/journal ckpt=/ckpt
+    err=checkpoint::advance_to: нет валидного чекпоинта в /ckpt, но первый видимый сегмент
+    имеет first_seq=16049334 > 0 (префикс уже спрунен). Восстановить полное состояние
+    физически нечем — пишем усечённый чекпоинт, в кокпите едет all-time VWAP, откатиться
+    нечем. ОСТАНОВИТЕСЬ и поднимите чекпоинт вне retention'а (cold storage + ручной rebuild).
+  CKPT_EXIT=1
+  $ ls /var/lib/docker/volumes/hft-platform_gateway-ckpt/_data
+  zz.lock            # ckpt НЕ создан; covered_through_seq НЕ создан
+  ```
+  **Корень.** Гвард `advance_to` (`crates/gateway/src/lib.rs:2178-2186`, задача #9/D2) безусловен:
+  «нет чекпоинта И `first_visible_seq > 0` → `Err`». На проде `segment-00000000` удалён purge'ем
+  M-36 (журнал начинается с `segment-00000001`, `first_seq=16049334`), и это состояние
+  **необратимо** ⇒ бинарь `gateway-checkpoint` не сможет забутстрапиться НИКОГДА. Escape-hatch у
+  бинаря нет: флаги ровно `--dir --ckpt-dir --coverage-out --venue --symbol --timeframe-ms
+  --bands --window-ms --cursor` (проверено по `crates/gateway/src/bin/gateway-checkpoint.rs:112-140`).
+  **Асимметрия, которая и есть дефект дизайна (зона architect, reviewer не проектирует фикс):**
+  read-path `snapshot_from_checkpoint` при отсутствии чекпоинта СПОКОЙНО редуцирует от первого
+  ВИДИМОГО seq и отдаёт результат как «all-time» снапшот — это ровно тот путь, который мы
+  задекодировали в (1) за 382 s. Т.е. усечённая история УЖЕ обслуживается кокпиту; отказывается
+  её персистить только checkpoint-path. Какая семантика верна — решать architect'у, но она обязана
+  быть ОДНА на обоих путях: сейчас одно и то же состояние легально отдавать и нелегально сохранять.
+  **Следствие для ретеншена (вторая, независимая ветка долга).** Прод-инвокер
+  `deploy/bin/journal-retention-cron.sh` (cron 04:07 UTC) НЕ передаёт `--checkpoint-coverage` и не
+  включает override ⇒ `covered=None`, `allow_prune_without_checkpoint=false` ⇒ ветка
+  «true fail-closed» (`crates/journal/src/segments.rs:1699-1710`): все кандидаты уходят в
+  `offload_only`, prune НЕ происходит никогда. Сегодня это не живая регрессия (cron в `dry-run`,
+  prune и так не выполнялся), но операторский путь молча стал no-op'ом — тот же класс, что TD-020.
+  **Ops-цепочка не доставлена.** `deploy/**` НЕ входил в `Allowed paths` M-38b, поэтому
+  `deploy/bin/gateway-checkpoint-cron.sh` + запись в `deploy/cron.d/` не написаны, и на VPS
+  чекпоинтер не запланирован (`crontab -l` содержит только retention 04:07 и compaction 03:50).
+  Задача #5c milestone'а («ops-цепочка cron: сначала чекпоинт, затем retention с этим артефактом»)
+  отмечена DONE по канарейке «бинарь существует + заведён в compose» — grep-green артефакт,
+  ровно то, от чего предостерегает шапка `journal-retention-cron.sh`.
+  **Что НЕ сломано (проверено):** прод здоров и не деградировал — recorder пишет
+  (`next_seq` 111615379 → 111649748 за 8 мин, `writable:true`), оба контейнера `(healthy)`,
+  `gateway-serve` отдаёт валидный v7-снапшот с реальными ценами; ckpt-том смонтирован `:ro`
+  обоим читателям (`docker inspect` → `rw=false`), read-path чекпоинта чисто читающий
+  (`exists()` + `fs::read`, без `flock`/`create_dir_all`) — `:ro` безопасен.
+  **Зона:** architect (дизайн бутстрапа + RED-оракул на прод-форму «префикс спрунен»), затем
+  engine-dev (impl) + ops-цепочка в `deploy/**`. Reviewer описал дефект, фикс не проектирует
+  (`gates.md` §4).
 - **TD-047** `v7-wire-форма-в-docs/fa/viz-backend.md-не-упоминает-vp_session_max_time_s` —
   **✅ CLOSED 2026-07-28** (architect `6fc6350`, приехал в `main` с merge M-47 `47577c0`; проверено
   reviewer'ом по диффу: `VB-I-6` теперь перечисляет ОБА per-session поля v7 — `cvd_session_base` и
@@ -123,7 +177,14 @@
   в чекпоинте, и покупало поддержку конфигов, для которых session-anchored серия всё равно
   не определена.
 - **TD-044** `gateway-snapshot-latency-full-history-replay-per-connection` (заведено reviewer'ом на §8 M-37,
-  2026-07-27). **Память вылечена (TD-039 CLOSED), латентность — НЕТ, и это блокирует close-out M-28/M-36.**
+  2026-07-27). **ОСТАЁТСЯ OPEN после merge M-38b (`606aa62`, 2026-07-28).** M-38b доставил КОД
+  лечения (чекпоинт-редьюсер, все гейты зелёные, reviewer APPROVED), но §8 показал, что в проде он
+  **инертен**: чекпоинт невозможно поднять на журнале со спруненным префиксом ⇒ `snapshot_from_checkpoint`
+  каждый раз уходит в fallback-реплей. Прод-замер на M-38b-коде: **382.657 s** (было 409.74 s при
+  журнале 18 GB; сейчас 23 GB) — в пределах того же порядка, улучшения НЕТ. Корень, сырой вывод и
+  разбор — **TD-048**. TD-044 закрывается только прод-замером «первый Snapshot < 10 s» на РЕАЛЬНО
+  прогретом чекпоинте; до тех пор close-out M-28/M-36/M-38b остаётся заблокированным.
+  **Память вылечена (TD-039 CLOSED), латентность — НЕТ, и это блокирует close-out M-28/M-36.**
   Замер на проде (`e4a8bc6`, журнал 18 GB / 96 `.zst` + 7 raw): **первый Snapshot доставлен за 409.74 s
   (~6.8 мин)** после `ws auth ok`; процесс прочитал **>21 GiB** (`/proc/<pid>/io read_bytes`) при RssAnon,
   стоящем на 26 MB. Это ОЖИДАЕМО и заявлено в M-37 §Objective («Путь А ограничивает ПАМЯТЬ; снапшот всё ещё
