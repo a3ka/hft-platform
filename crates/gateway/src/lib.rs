@@ -1598,6 +1598,39 @@ fn merge_cvd_running(series: &mut SeriesBundle, incoming: &SeriesBundle) {
     series.cvd_session_base = new_bases;
 }
 
+/// M-47 (GW-I-10, TD-046): fail-closed гвард предусловия `Selector`. Селектор с
+/// `timeframe_ms`, не делящим `86_400_000` нацело, порождает бакеты, пересекающие
+/// 00:00 UTC ⇒ `session_id` бакета не определён ⇒ session-anchored серии (CVD — M-38a/TD-043,
+/// SVP — M-24) семантически не определены. Правильный ответ — отказ, а не «правдоподобное»
+/// значение (CLAUDE.md fail-closed). Проверяем ДЕЛИМОСТЬ суток, а не «круглость»:
+/// недельный бакет (`604_800_000`) круглый, но накрывает 7 полуночей — отвергается.
+///
+/// Принимается ⟺ `timeframe_ms > 0 && 86_400_000 % timeframe_ms == 0`. Иначе
+/// `io::ErrorKind::InvalidInput`, сообщение содержит подстроку `timeframe_ms` (оракул
+/// `red_timeframe_session_alignment` ассертит это, чтобы оператор понимал, ЧТО чинить,
+/// не читая исходников).
+///
+/// Гвард живёт ЗДЕСЬ, а не только в `gateway-serve::serve_config_from_env`: `Selector` —
+/// публичная структура с публичными полями, её собирает напрямую любой консюмер библиотеки
+/// (чекпоинтер M-38b, shared-tailer M-39, research-cli). Проверка ТОЛЬКО в конфиге транспорта
+/// оставила бы байпас-поверхность (урок TD-019/TD-020 «механизм есть, никто не зовёт»).
+/// Публичные входы библиотеки (`snapshot` / `frames_since` / `replay`) уже возвращают
+/// `io::Result<_>` — смена сигнатур не нужна.
+pub fn validate_selector(sel: &Selector) -> io::Result<()> {
+    if sel.timeframe_ms <= 0 || 86_400_000 % sel.timeframe_ms != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "GW-I-10: selector.timeframe_ms={} не выравнен на границу UTC-суток \
+                 (требуется > 0 и 86_400_000 % timeframe_ms == 0; иначе бакет пересекает \
+                 00:00 UTC ⇒ session_id бакета не определён)",
+                sel.timeframe_ms
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Полная свёртка `[start .. at]` через bounded `journal::stream`. Read-only (GW-I-1).
 ///
 /// engine-dev (M-22 task #3): ОБЯЗАН читать через `journal::stream(dir, filter)` (bounded,
@@ -1608,6 +1641,7 @@ pub fn snapshot(
     sel: &Selector,
     at: Cursor,
 ) -> io::Result<Snapshot> {
+    validate_selector(sel)?;
     let stream = journal::stream(dir, filter)?;
     let (series, cursor, _, _at_ms) =
         reduce_event_stream(stream, sel, Cursor::START, at, usize::MAX)?;
@@ -1639,6 +1673,7 @@ pub fn frames_since(
     after: Cursor,
     max_events: usize,
 ) -> io::Result<(Vec<Frame>, Cursor)> {
+    validate_selector(sel)?;
     let stream = journal::stream(dir, filter)?;
     let (delta, cursor, consumed, at_ms) =
         reduce_event_stream(stream, sel, after, Cursor::LATEST, max_events)?;
@@ -1658,6 +1693,7 @@ pub fn replay(
     from: Cursor,
     to: Cursor,
 ) -> io::Result<Vec<Frame>> {
+    validate_selector(sel)?;
     let stream = journal::stream(dir, filter)?;
     let (delta, cursor, consumed, at_ms) = reduce_event_stream(stream, sel, from, to, usize::MAX)?;
     if consumed == 0 {
