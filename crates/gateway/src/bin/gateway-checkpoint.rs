@@ -242,10 +242,8 @@ fn main() -> ExitCode {
     // MVP пишет для ОДНОГО селектора; multi-selector — TODO для прод-расширения
     // (через деплой с N инстансами gateway-checkpoint на разные селекторы и
     // ops-скрипт берёт min по всем файлам).
-    let covered_through_seq = match args.cursor.upto_seq {
-        Some(seq) => seq,
-        None => u64::MAX, // LATEST = всё свёрнуто. Прод-конвенция: MAX означает «до конца».
-    };
+    let covered_through_seq = args.cursor.upto_seq.unwrap_or(u64::MAX);
+    // LATEST = всё свёрнуто. Прод-конвенция: MAX означает «до конца».
     if let Err(e) = write_coverage_artifact(&args.coverage_out, covered_through_seq) {
         eprintln!(
             "gateway-checkpoint: не удалось записать артефакт покрытия {}: {e}",

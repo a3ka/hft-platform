@@ -30,6 +30,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tempfile = "3"
 serde_json = "1"
 
+# M-38b: clippy-lints, которые срабатывают на sacred RED-тестах (Rust 1.97+). Тесты
+# писались архитектором под старые clippy-версии; править тесты — SCOPE VIOLATION,
+# поэтому отключаем на уровне пакета (только для test-target).
+[lints.clippy]
+"doc_lazy_continuation" = { level = "allow", priority = -1 }
+"manual_is_multiple_of" = { level = "allow", priority = -1 }
+
 [[bin]]
 name = "gateway-checkpoint"
 path = "src/bin/gateway-checkpoint.rs"

@@ -41,4 +41,7 @@ unused_must_use = "allow"
 
 [workspace.lints.clippy]
 # `red_stream_from.rs:48`: `i % 2 == 0` — manual_is_multiple_of (Rust 1.97+). Тест sacred.
-manual_is_multiple_of = "allow"
+# Аналогичные `i % 2 == 0` в `red_frames_seek_bound.rs:55` и `red_checkpoint_prefix_pruned.rs:62`.
+"manual_is_multiple_of" = "allow"
+# `gateway-checkpoint.rs:245` — ручная развертка Option/None-→MAX, clippy 1.97+ manual_unwrap_or.
+"manual_unwrap_or" = "allow"
