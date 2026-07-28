@@ -1886,9 +1886,9 @@ pub mod checkpoint {
     use super::*;
     use std::fs::{self, File};
     use std::io::Write;
-    use std::path::{Path, PathBuf};
     #[cfg(unix)]
     use std::os::unix::io::AsRawFd;
+    use std::path::{Path, PathBuf};
 
     use contracts::SegmentHeader;
 

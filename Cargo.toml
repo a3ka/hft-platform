@@ -31,17 +31,3 @@ authors = ["a3ka"]
 [profile.release]
 opt-level = 3
 lto = "thin"
-
-# M-38b: clippy-lints, которые срабатывают на SACRED RED-тестах (dev-зависимости), но
-# НЕ в продакшен-коде. Тесты писались архитектором под старые clippy-версии; править
-# тесты — SCOPE VIOLATION, поэтому глобально отключаем линт в test-targets. Если линт
-# срабатывает на lib/bin — это уже реальный bug, его чиним.
-[workspace.lints.rust]
-unused_must_use = "allow"
-
-[workspace.lints.clippy]
-# `red_stream_from.rs:48`: `i % 2 == 0` — manual_is_multiple_of (Rust 1.97+). Тест sacred.
-# Аналогичные `i % 2 == 0` в `red_frames_seek_bound.rs:55` и `red_checkpoint_prefix_pruned.rs:62`.
-"manual_is_multiple_of" = "allow"
-# `gateway-checkpoint.rs:245` — ручная развертка Option/None-→MAX, clippy 1.97+ manual_unwrap_or.
-"manual_unwrap_or" = "allow"

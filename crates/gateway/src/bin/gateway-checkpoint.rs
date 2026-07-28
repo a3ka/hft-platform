@@ -189,7 +189,9 @@ fn parse_cursor_value(s: &str, flag: &str) -> Result<Cursor, String> {
         let seq = s
             .parse::<u64>()
             .map_err(|e| format!("{flag}: {e} (ожидается `LATEST` или u64)"))?;
-        Ok(Cursor { upto_seq: Some(seq) })
+        Ok(Cursor {
+            upto_seq: Some(seq),
+        })
     }
 }
 
