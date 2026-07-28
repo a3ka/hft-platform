@@ -1628,63 +1628,94 @@ pub fn retention_plan(
     //
     //   Нет артефакта покрытия (`None`) = fail-closed: ВСЕ непокрытые сегменты → skip,
     //   даже при allow_prune_without_checkpoint=true (override без артефакта = бессмыслен).
+    //
+    //   D1 (rev3, MAJOR): раннее `offload_and_prune = Vec::new()` было НЕПЕРЕНЕСЕНИЕМ
+    //   кандидатов → retention не прунил НИКОГДА. Плюс гейт шёл по `segs_by_idx` (ВСЕ
+    //   сегменты включая активный), а не по `final_candidates` — активный сегмент попадал
+    //   в `offload_only` (копия в cold файла, в который пишут прямо сейчас). ИСПРАВЛЕНО:
+    //   гейт итерирует `final_candidates` (исключает активный и прошедшие фильтры);
+    //   `offload_and_prune` собирается ИЗ финальных кандидатов.
     let covered = policy.checkpoint_covered_through_seq;
     let override_enabled = policy.allow_prune_without_checkpoint;
-    let offload_and_prune: Vec<SegmentInfo> = Vec::new();
+    let mut offload_and_prune: Vec<SegmentInfo> = Vec::new();
     let mut offload_only: Vec<SegmentInfo> = Vec::new();
-    if let Some(covered_seq) = covered {
-        // segs_by_idx уже отсортирован по индексу выше (см. шаг (2)).
-        for (i, s) in segs_by_idx.iter().enumerate() {
-            // last_seq(s) = segs_by_idx[i+1].first_seq - 1, иначе None (активный).
-            let last_seq_opt = if i + 1 < segs_by_idx.len() {
-                Some(segs_by_idx[i + 1].header.first_seq.saturating_sub(1))
-            } else {
-                None
-            };
-            let covered_seg = match last_seq_opt {
-                Some(ls) => ls <= covered_seq,
-                None => false, // активный сегмент — last_seq неизвестен ⇒ не покрыт
-            };
-            if covered_seg {
-                continue; // сегмент покрыт — финальная фильтрация ниже
+    let mut pruned_uncovered: Vec<SegmentInfo> = Vec::new(); // для execute: аудит override
+    match covered {
+        Some(covered_seq) => {
+            // Идём по final_candidates (НЕ по segs_by_idx — активный сегмент и прочие
+            // отфильтрованные уже исключены выше шагами (2)–(4)).
+            let to_classify = std::mem::take(&mut final_candidates);
+            for s in to_classify {
+                // last_seq(s) = segs_by_idx[index(s)+1].first_seq - 1, иначе None (активный).
+                let pos = segs_by_idx.iter().position(|x| x.index == s.index);
+                let last_seq_opt = match pos {
+                    Some(i) if i + 1 < segs_by_idx.len() => {
+                        Some(segs_by_idx[i + 1].header.first_seq.saturating_sub(1))
+                    }
+                    _ => None,
+                };
+                let covered_seg = match last_seq_opt {
+                    Some(ls) => ls <= covered_seq,
+                    None => false, // активный сегмент — last_seq неизвестен ⇒ не покрыт
+                };
+                if covered_seg {
+                    offload_and_prune.push(s);
+                } else if override_enabled {
+                    // Override разрешает prune без покрытия. Сегмент остаётся prunable,
+                    // пометка попадёт в `pruned_without_checkpoint_coverage` в execute.
+                    pruned_uncovered.push(s.clone());
+                    offload_and_prune.push(s);
+                } else {
+                    // Без override — снимаем из prune. Бэкап идёт всегда (offload_only),
+                    // локальная копия остаётся до прогресса чекпоинтера.
+                    offload_only.push(s.clone());
+                    skipped.push((
+                        s,
+                        format!(
+                            "checkpoint coverage not proven: last_seq > {} \
+                             (covered_through_seq); offload_only — локальная копия \
+                             остаётся до прогресса чекпоинтера",
+                            covered_seq
+                        ),
+                    ));
+                }
             }
-            // Сегмент НЕ покрыт. Решаем: prune (с override), offload_only, или skip.
+        }
+        None => {
+            // Нет артефакта покрытия.
             if override_enabled {
-                // Override разрешает prune без покрытия — оставляем в final_candidates
-                // (он попадёт в offload_and_prune) и пометим в отчёте позже.
+                // Override без артефакта: согласно architect'у (rev3 D1.2) hatch существует
+                // именно для этого случая («override без артефакта = бессмыслен» —
+                // неверно; смысл hatch'а — «чекпоинтер не развёрнут / сломан»). Все
+                // кандидаты идут в offload_and_prune; каждый без покрытия попадёт в
+                // `pruned_without_checkpoint_coverage` в execute (аудит-трейл).
+                let to_take = std::mem::take(&mut final_candidates);
+                for s in to_take {
+                    pruned_uncovered.push(s.clone());
+                    offload_and_prune.push(s);
+                }
             } else {
-                // Без override — снимаем из кандидатов на prune. Бэкап идёт всегда
-                // (offload_only), локальная копия остаётся.
-                offload_only.push(s.clone());
-                skipped.push((
-                    s.clone(),
-                    format!(
-                        "checkpoint coverage not proven: last_seq > {} (covered_through_seq); \
-                         offload_only — локальная копия остаётся до прогресса чекпоинтера",
-                        covered_seq
-                    ),
-                ));
+                // True fail-closed: все потенциальные кандидаты на prune НЕ покрыты.
+                // Бэкап идёт (offload_only), локальная копия остаётся, skip-репорт.
+                for s in final_candidates.drain(..) {
+                    offload_only.push(s.clone());
+                    skipped.push((
+                        s,
+                        "checkpoint coverage artifact absent (fail-closed): бэкап идёт, \
+                         локальная копия остаётся"
+                            .to_string(),
+                    ));
+                }
             }
-        }
-        // Если override включён, final_candidates ОСТАЁТСЯ как есть (все кандидаты
-        // на prune). Отчёт `pruned_without_checkpoint_coverage` заполним в execute по
-        // факту: какой из pruned был uncovered.
-        if !override_enabled {
-            final_candidates.clear(); // непокрытые удалены из offload_and_prune
-        }
-    } else {
-        // Нет артефакта покрытия = fail-closed. Все потенциальные кандидаты на prune
-        // НЕ покрыты — превращаем в offload_only + skip-репорт.
-        for s in final_candidates.drain(..) {
-            offload_only.push(s.clone());
-            skipped.push((
-                s,
-                "checkpoint coverage artifact absent (fail-closed): бэкап идёт, \
-                 локальная копия остаётся"
-                    .to_string(),
-            ));
         }
     }
+    // `pruned_uncovered` сейчас хранится локально — execute пересчитывает покрытие
+    // по тому же алгоритму и заполняет `pruned_without_checkpoint_coverage` в отчёте.
+    // Хранение рядом с final_candidates нужно только на случай отладки; функция
+    // `retention_plan` возвращает план, не отчёт. Подавляем dead_code-warning: фактически
+    // значение читается через `plan.offload_and_prune` в execute, где та же классификация
+    // перевычисляется детерминированно.
+    let _ = pruned_uncovered;
 
     // (6) disk_pressure: free_bytes < min_free_bytes.
     let free = free_bytes_at(dir)?;
@@ -1836,6 +1867,29 @@ pub fn retention_execute(
                         failed.push((
                             seg.path.clone(),
                             format!("cold copy verification failed: {e}"),
+                        ));
+                    }
+                }
+            }
+
+            // M-38b (C-030 R1): `offload_only` сегменты тоже ОБЯЗАНЫ быть скопированы
+            // в cold (R1 — экзистенциальный риск docs/08) — просто БЕЗ локального prune.
+            // Сверка нужна та же: гарантия читаемости холодной копии. Сбой сверки →
+            // сегмент остаётся горячим + попадает в `failed`.
+            for seg in &plan.offload_only {
+                match verify_cold_copy(seg, &policy.cold_root) {
+                    Ok(proof) => {
+                        // ColdCopyProof даёт право на запись (но не на удаление). `_proof`
+                        // гарантирует, что холодная копия сверялась.
+                        let _ = proof;
+                        offloaded.push(seg.path.clone());
+                    }
+                    Err(e) => {
+                        failed.push((
+                            seg.path.clone(),
+                            format!(
+                                "offload_only: cold copy verification failed (R1 не сделан): {e}"
+                            ),
                         ));
                     }
                 }
