@@ -1,6 +1,6 @@
 # M-47 — GW-I-10: fail-closed гвард выравнивания `timeframe_ms` (TD-046)
 
-- **Статус:** PROPOSED (RED закоммичен, dev не диспетчеризован)
+- **Статус:** DONE (GREEN — engine-dev M-47 task #1-3: `validate_selector` + `serve_config_from_env` гвард; verify_M-47.sh VERDICT: PASS, exit 0)
 - **Автор спеки:** architect, 2026-07-28
 - **Базовый HEAD:** `origin/main @ b7ac2f8`
 - **Ветка:** `feat/M-38b` (RED-коммит `f90f170`; милстоун мелкий — едет на той же ветке,
@@ -103,9 +103,9 @@ GW-I-9 **зарезервирован** за byte-identity чекпоинта (M
 
 | # | Status | Задача | Агент | Acceptance |
 |---|---|---|---|---|
-| 1 | ⏳ OPEN | `validate_selector(&Selector) -> io::Result<()>` в `crates/gateway/src/lib.rs`: `timeframe_ms > 0 && 86_400_000 % timeframe_ms == 0`, иначе `InvalidInput` с `timeframe_ms` в сообщении. Вызвать ПЕРВОЙ строкой в `snapshot`, `frames_since`, `replay` | engine-dev | `cargo test -p gateway --test red_timeframe_session_alignment` — 8 passed |
-| 2 | ⏳ OPEN | `serve_config_from_env`: после парса `GATEWAY_TIMEFRAME_MS` — тот же критерий, `Err(String)` с именем переменной. Дефолт `1000` и все выравненные значения обязаны стартовать | engine-dev | `cargo test -p gateway-serve --test red_timeframe_guard_startup` — 6 passed |
-| 3 | ⏳ OPEN | Прогон всего гейта: `bash scripts/verify_M-47.sh` → `VERDICT: PASS`, exit 0 (включая канарейку ≥4 упоминаний `validate_selector` и регрессию M-38a) | engine-dev | verify exit=0, Done Block сырым выводом |
+| 1 | ✅ DONE | `validate_selector(&Selector) -> io::Result<()>` в `crates/gateway/src/lib.rs`: `timeframe_ms > 0 && 86_400_000 % timeframe_ms == 0`, иначе `InvalidInput` с `timeframe_ms` в сообщении. Вызвать ПЕРВОЙ строкой в `snapshot`, `frames_since`, `replay` | engine-dev | `cargo test -p gateway --test red_timeframe_session_alignment` — 8 passed |
+| 2 | ✅ DONE | `serve_config_from_env`: после парса `GATEWAY_TIMEFRAME_MS` — тот же критерий, `Err(String)` с именем переменной. Дефолт `1000` и все выравненные значения обязаны стартовать | engine-dev | `cargo test -p gateway-serve --test red_timeframe_guard_startup` — 6 passed |
+| 3 | ✅ DONE | Прогон всего гейта: `bash scripts/verify_M-47.sh` → `VERDICT: PASS`, exit 0 (включая канарейку ≥4 упоминаний `validate_selector` и регрессию M-38a) | engine-dev | verify exit=0, Done Block сырым выводом |
 
 Оценка: **2-3 атомарных коммита** (< 5) — plan-time critic по §3 `gates.md` не триггерится
 (контракты не тронуты, крейт не вводится, форма T1/схемы не меняется). Reviewer — UNCONDITIONAL.
