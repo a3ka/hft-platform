@@ -333,14 +333,12 @@ fn aligned_timeframe_keeps_sessions_separate() {
     // S1: +5 +2 −1 = +6.0; S2: −3 −4 +1 = −6.0. Наследование дало бы 0.0 в конце S2.
     let last_s1 = cd
         .iter()
-        .filter(|(t, _)| session_of(*t) == s1)
-        .next_back()
+        .rfind(|(t, _)| session_of(*t) == s1)
         .expect("S1 в серии")
         .1;
     let last_s2 = cd
         .iter()
-        .filter(|(t, _)| session_of(*t) == s2)
-        .next_back()
+        .rfind(|(t, _)| session_of(*t) == s2)
         .expect("S2 в серии")
         .1;
     assert_eq!(last_s1, to_fixed(6.0), "итог S1: +5 +2 −1 = +6.0");
