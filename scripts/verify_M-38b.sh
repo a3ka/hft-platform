@@ -107,7 +107,7 @@ chk bash -c "sed 's://.*::' crates/gateway/src/*.rs | grep -qE 'ckpt_schema_vers
 chk bash -c "grep -qE 'GATEWAY_SCHEMA_VERSION: u32 = 7;' crates/gateway/src/lib.rs"
 
 step "регрессия — форма провода v7 и session-семантика M-38a не сдвинуты"
-chk cargo test -p gateway --test red_gateway_schema_v7 --quiet
+chk cargo test -p gateway --test red_gateway_schema_version --quiet
 chk cargo test -p gateway --test red_gateway_cvd_session --quiet
 chk cargo test -p gateway --test red_gateway_window --quiet
 chk cargo test -p gateway --test red_gateway_live_eq_replay --quiet

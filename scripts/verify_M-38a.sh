@@ -21,7 +21,7 @@ step "task #2/#3 — форма v7 (per-session base Vec) + окно через 
 chk cargo test -p gateway --test red_gateway_window --quiet
 
 step "task #4 — bump GATEWAY_SCHEMA_VERSION 6→7 (константа==7 в Snapshot/Frame, C-028 K1 sacred-оракул)"
-chk cargo test -p gateway --test red_gateway_schema_v7 --quiet
+chk cargo test -p gateway --test red_gateway_schema_version --quiet
 
 step "регрессия — export v1-аддитивность + depth-провенанс (GW-I-5/6) сохранены при bump'е"
 chk cargo test -p gateway --test red_gateway_export_v2 --quiet

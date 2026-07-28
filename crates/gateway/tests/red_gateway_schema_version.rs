@@ -1,4 +1,12 @@
-//! RED M-38a (sacred, architect-only) — GATEWAY_SCHEMA_VERSION bump 6→7 является ГЕЙТОМ.
+//! RED (sacred, architect-only) — **bump `GATEWAY_SCHEMA_VERSION` является ГЕЙТОМ.**
+//!
+//! **Файл намеренно версионно-АГНОСТИЧЕН по имени (M-48, C-032 R1).** Раньше он назывался
+//! `red_gateway_schema_v7.rs` и пиннил 7. M-48 поднимает версию до 8 — и оракул, прибитый к
+//! прошлой версии, превратился в блокер: engine-dev не мог провести bump, не тронув sacred-тест.
+//! Это МОЙ процессный промах, второй раз подряд того же класса (reviewer предупреждал на M-38b:
+//! «смена публичной сигнатуры без адаптации call-site'ов в том же RED-коммите вынуждает dev'а
+//! править sacred-тесты»). Правило: при смене контракта architect обновляет ВСЕ свои оракулы и
+//! verify-скрипты в ТОМ ЖЕ коммите, а имя файла не привязывается к номеру версии.
 //!
 //! C-028 K1: `red_gateway_export_v2` проверяет только `snap.schema_version == GATEWAY_SCHEMA_VERSION`
 //! (тавтология — зелёная при ЛЮБОМ значении константы). Она НЕ доказывает, что M-38a поднял версию
@@ -16,8 +24,10 @@ use contracts::{to_fixed, DataSource, EventKind, MdPayload, Side, Venue};
 use gateway::{Cursor, Selector, GATEWAY_SCHEMA_VERSION};
 use journal::{EpochFilter, Journal, WriterConfig};
 
-/// M-38a: версия схемы non-additively поднята до 7 (session-reset CVD + форма `cvd_session_base` Vec).
-const EXPECTED_SCHEMA_VERSION: u32 = 7;
+/// Текущая версия контракта провода. M-38a: 6→7 (session-reset CVD). **M-48: 7→8** —
+/// `history_start_seq` + `history_truncated` (VB-I-11): поля аддитивны, но консюмер ОБЯЗАН
+/// узнать, что история может быть усечённой, иначе продолжит считать её полной.
+const EXPECTED_SCHEMA_VERSION: u32 = 8;
 
 fn cfg() -> WriterConfig {
     WriterConfig {
@@ -66,17 +76,17 @@ fn sel() -> Selector {
 
 /// (1) Сама константа обязана быть ровно 7.
 #[test]
-fn schema_version_constant_is_7() {
+fn schema_version_constant_matches_expected() {
     assert_eq!(
         GATEWAY_SCHEMA_VERSION, EXPECTED_SCHEMA_VERSION,
-        "M-38a обязан поднять GATEWAY_SCHEMA_VERSION до 7 (non-additive: session-reset CVD + \
-         cvd_session_base скаляр→Vec). Текущее значение {GATEWAY_SCHEMA_VERSION} != 7 → bump не сделан"
+        "GATEWAY_SCHEMA_VERSION обязан быть {EXPECTED_SCHEMA_VERSION} (M-48: смена формы провода — \
+         history_start_seq/history_truncated, VB-I-11). Текущее {GATEWAY_SCHEMA_VERSION} → bump не сделан"
     );
 }
 
 /// (2) Snapshot несёт версию 7 (то, что уходит консюмеру в envelope через snapshot).
 #[test]
-fn snapshot_schema_version_is_7() {
+fn snapshot_carries_expected_schema_version() {
     let t0 = 20_278_i64 * 86_400_000;
     let dir = journal_of(vec![
         trade(100.0, 3.0, Side::Buy, t0 + 1_000),
@@ -91,7 +101,7 @@ fn snapshot_schema_version_is_7() {
     .expect("snapshot");
     assert_eq!(
         snap.schema_version, EXPECTED_SCHEMA_VERSION,
-        "Snapshot.schema_version обязан быть 7 после M-38a bump'а, а не {}",
+        "Snapshot.schema_version обязан быть {EXPECTED_SCHEMA_VERSION}, а не {}",
         snap.schema_version
     );
 }
@@ -99,7 +109,7 @@ fn snapshot_schema_version_is_7() {
 /// (3) Frame из `frames_since` несёт версию 7 (live-push путь). frames обязаны быть НЕПУСТЫ,
 /// иначе `all(==7)` вырождается в vacuous-true (анти-плацебо: проверяем, что кадры реально есть).
 #[test]
-fn frame_schema_version_is_7() {
+fn frame_carries_expected_schema_version() {
     let t0 = 20_278_i64 * 86_400_000;
     let dir = journal_of(vec![
         trade(100.0, 3.0, Side::Buy, t0 + 1_000),
@@ -122,7 +132,7 @@ fn frame_schema_version_is_7() {
         frames
             .iter()
             .all(|f| f.schema_version == EXPECTED_SCHEMA_VERSION),
-        "каждый Frame.schema_version обязан быть 7 после M-38a bump'а; получено: {:?}",
+        "каждый Frame.schema_version обязан быть {EXPECTED_SCHEMA_VERSION}; получено: {:?}",
         frames.iter().map(|f| f.schema_version).collect::<Vec<_>>()
     );
 }

@@ -276,8 +276,18 @@ fn gap_between_checkpoint_and_journal_is_loud() {
         c + 1
     );
 
+    let before = ckpt_dir_fingerprint(ckpt.path());
     let res =
         gateway::checkpoint::advance(dir.path(), ckpt.path(), &sel(), EpochFilter::OwnCaptureOnly);
+    // C-032 R3: «вернул Err» НЕДОСТАТОЧНО — реализация могла записать чекпоинт поверх дырки И
+    // вернуть ошибку. Отказ обязан быть БЕЗ ПОБОЧНЫХ ЭФФЕКТОВ: содержимое ckpt-каталога
+    // байт-в-байт прежнее. Иначе ошибка уедет в лог cron и будет забыта, а порча останется на
+    // диске и следующий запуск примет её за валидный чекпоинт.
+    assert_eq!(
+        ckpt_dir_fingerprint(ckpt.path()),
+        before,
+        "GW-I-12: при разрыве отказ обязан НИЧЕГО НЕ ПИСАТЬ, но содержимое ckpt-каталога изменилось"
+    );
     assert!(
         res.is_err(),
         "GW-I-12: разрыв между курсором чекпоинта ({c}) и самым ранним доступным seq \
@@ -328,4 +338,207 @@ fn contiguous_boundary_is_not_a_gap() {
          с C+1. Отказ здесь заблокировал бы штатный режим «prune покрытого префикса», ради \
          которого писалась суффикс-совместимая валидация lineage (C-030 N2)",
         );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 4. C-032 R2 — ЛОВУШКА legacy `first_seq = 0` (мой пропуск в rev1 оракула)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Спека требует брать `history_start_seq` из ПЕРВОГО РЕАЛЬНО СВЁРНУТОГО события, а не из
+/// `header.first_seq`. Но фикстуры выше состоят только из v2-сегментов, у которых `first_seq`
+/// ЧЕСТНЫЙ — значит реализация, читающая заголовок, проходила бы их незамеченной. Это тот же
+/// класс плацебо, на котором меня уже поймал critic в C-030 R2 (`red_stream_from`).
+///
+/// **Ловушка:** legacy-сегмент (headerless, CT-RFC-02) несёт СИНТЕЗИРОВАННЫЙ `first_seq = 0`
+/// (`segments.rs:509-512` — «безопасный дефолт», не измеренное значение), но реально содержит
+/// события с `seq >= LEGACY_FIRST_SEQ > 0`. Реализация «по заголовку» отрапортует
+/// `history_start_seq = 0, history_truncated = false` — то есть объявит усечённую историю
+/// ПОЛНОЙ. Реализация «по свёрнутому событию» даст правду.
+///
+/// Фикстура сконструирована (не снята с прода): на VPS legacy-сегмент начинался с seq 0. Она
+/// проверяет ПРАВИЛО, а правило написано именно потому, что заголовку legacy доверять нельзя.
+const LEGACY_FIRST_SEQ: u64 = 500;
+const LEGACY_COUNT: u64 = 200;
+
+fn legacy_first_journal() -> tempfile::TempDir {
+    use std::io::Write as _;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("segment-00000000.jrnl");
+    {
+        let f = std::fs::File::create(&path).expect("create legacy");
+        let mut w = std::io::BufWriter::new(f);
+        for seq in LEGACY_FIRST_SEQ..LEGACY_FIRST_SEQ + LEGACY_COUNT {
+            let ev = contracts::Event {
+                seq,
+                ts_mono_ns: seq,
+                ts_wall_ms: 1_752_000_000_000 + seq as i64,
+                kind: trade(seq),
+            };
+            let payload = postcard::to_stdvec(&ev).expect("ser");
+            w.write_all(&(payload.len() as u32).to_le_bytes()).unwrap();
+            w.write_all(&payload).unwrap();
+            w.write_all(&crc32fast::hash(&payload).to_le_bytes())
+                .unwrap();
+        }
+        w.flush().unwrap();
+    }
+    let next = LEGACY_FIRST_SEQ + LEGACY_COUNT;
+    std::fs::write(dir.path().join("journal.meta"), next.to_le_bytes()).expect("meta");
+    journal::declare_legacy(
+        dir.path(),
+        contracts::LegacySegmentDecl {
+            file_name: "segment-00000000.jrnl".to_string(),
+            fingerprint_sha256: journal::fingerprint(&path).expect("fingerprint"),
+            size_bytes_at_decl: std::fs::metadata(&path).expect("meta").len(),
+            source: DataSource::OwnCapture,
+            provenance: "M-48 fixture: headerless segment NOT starting at seq 0".to_string(),
+            epoch_id: contracts::LEGACY_EPOCH_ID.to_string(),
+        },
+    )
+    .expect("declare_legacy");
+    {
+        let mut j = Journal::open_with(dir.path(), cfg()).expect("open_with поверх legacy");
+        for i in next..next + 300 {
+            j.append(trade(i)).expect("append");
+        }
+        j.flush().expect("flush");
+    }
+    dir
+}
+
+#[test]
+fn history_start_seq_ignores_lying_legacy_header() {
+    let dir = legacy_first_journal();
+
+    // АНТИ-ПЛАЦЕБО: фикстура обязана реально содержать legacy с синтезированным нулём.
+    let segs = journal::list_segments(dir.path()).expect("segments");
+    let legacy = segs
+        .iter()
+        .find(|s| s.header.schema_version == contracts::SCHEMA_VERSION_PRE_HEADER)
+        .expect("фикстура обязана содержать legacy-сегмент, иначе ловушка не взведена");
+    assert_eq!(
+        legacy.header.first_seq, 0,
+        "у legacy `first_seq` обязан быть синтезированным нулём — в этом и ловушка"
+    );
+
+    let snap = gateway::snapshot(
+        dir.path(),
+        EpochFilter::OwnCaptureOnly,
+        &sel(),
+        Cursor::LATEST,
+    )
+    .expect("snapshot");
+
+    assert_eq!(
+        snap.history_start_seq, LEGACY_FIRST_SEQ,
+        "history_start_seq взят из ЗАГОЛОВКА legacy-сегмента (синтезированный 0), а не из \
+         первого РЕАЛЬНО свёрнутого события ({LEGACY_FIRST_SEQ}). Заголовку legacy доверять \
+         нельзя (TD-030, segments.rs:509-512) — иначе усечённая история объявляется полной"
+    );
+    assert!(
+        snap.history_truncated,
+        "история начинается с seq {LEGACY_FIRST_SEQ} > 0 ⇒ truncated=true. Реализация «по \
+         заголовку» отрапортовала бы false и выдала неполную историю за полную"
+    );
+}
+
+/// Снимок содержимого ckpt-каталога: отсортированные пары (относительный путь, байты).
+/// Отличает «отказал» от «отказал, но всё-таки записал».
+fn ckpt_dir_fingerprint(dir: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+    fn walk(root: &std::path::Path, d: &std::path::Path, out: &mut Vec<(String, Vec<u8>)>) {
+        let Ok(rd) = std::fs::read_dir(d) else {
+            return;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(root, &p, out);
+            } else {
+                let rel = p.strip_prefix(root).unwrap_or(&p).display().to_string();
+                out.push((rel, std::fs::read(&p).unwrap_or_default()));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(dir, dir, &mut out);
+    out.sort();
+    out
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 5. C-032 R3 — немонотонность по-прежнему запрещена (перепиннивание D2 из C-030 rev3)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Сужая fail-loud, легко потерять защиту, ради которой он вводился: `advance` не имеет права
+/// заменить чекпоинт состоянием, покрывающим МЕНЬШЕ истории. Здесь валидный чекпоинт заявляет
+/// историю с seq 0; затем идёт ЗАКОННЫЙ prune покрытого префикса. `advance` обязан
+/// РЕЗЮМИРОВАТЬСЯ (заявленная история остаётся с 0), а не пересобрать состояние от нового
+/// earliest, молча сузив историю.
+#[test]
+fn advance_after_covered_prune_does_not_regress_history_start() {
+    let dir = intact_journal();
+    let ckpt = tempfile::tempdir().expect("ckpt");
+
+    let segs = journal::list_segments(dir.path()).expect("segments");
+    let cut = 3_u32;
+    let cut_first = segs
+        .iter()
+        .find(|s| s.index == cut)
+        .expect("сегмент cut")
+        .header
+        .first_seq;
+
+    gateway::checkpoint::advance_to(
+        dir.path(),
+        ckpt.path(),
+        &sel(),
+        EpochFilter::OwnCaptureOnly,
+        Cursor {
+            upto_seq: Some(cut_first - 1),
+        },
+    )
+    .expect("advance_to до границы сегмента");
+
+    let (before, _) = gateway::snapshot_from_checkpoint(
+        dir.path(),
+        EpochFilter::OwnCaptureOnly,
+        &sel(),
+        ckpt.path(),
+        Cursor::LATEST,
+    )
+    .expect("snapshot_from_checkpoint до prune");
+    assert_eq!(before.history_start_seq, 0, "предусловие: история с нуля");
+    assert!(!before.history_truncated, "предусловие: журнал полон");
+
+    let earliest = truncate_prefix(dir.path(), cut);
+    assert_eq!(
+        earliest, cut_first,
+        "предусловие: earliest == C+1 (стык без разрыва)"
+    );
+
+    gateway::checkpoint::advance(dir.path(), ckpt.path(), &sel(), EpochFilter::OwnCaptureOnly)
+        .expect("advance после ЗАКОННОГО prune обязан пройти (стык, а не разрыв)");
+
+    let (after, _) = gateway::snapshot_from_checkpoint(
+        dir.path(),
+        EpochFilter::OwnCaptureOnly,
+        &sel(),
+        ckpt.path(),
+        Cursor::LATEST,
+    )
+    .expect("snapshot_from_checkpoint после prune");
+
+    assert_eq!(
+        after.history_start_seq, 0,
+        "РЕГРЕССИЯ ПОКРЫТИЯ: чекпоинт заявлял историю с seq 0, а после законного prune стал \
+         заявлять её с {}. Значит advance пересобрал состояние от нового earliest вместо \
+         резюмирования — свёрнутая история молча потеряна (D2 из C-030 rev3). Сужение fail-loud \
+         в M-48 НЕ должно было снять эту защиту",
+        after.history_start_seq
+    );
+    assert!(
+        !after.history_truncated,
+        "чекпоинт помнит историю с нуля ⇒ truncated остаётся false, несмотря на prune префикса"
+    );
 }

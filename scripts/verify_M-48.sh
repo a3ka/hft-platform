@@ -18,7 +18,9 @@ step "task #1-#3 — GW-I-12: бутстрап на усечённом журн�
 chk cargo test -p gateway --test red_checkpoint_bootstrap_truncated --quiet
 
 step "task #4 — bump схемы 7→8 и проброс полей на провод"
-chk bash -c "grep -qE 'GATEWAY_SCHEMA_VERSION: u32 = 8;' crates/gateway/src/lib.rs"
+# Оракул версионно-агностичен по имени (C-032 R1): он пиннит ТЕКУЩУЮ ожидаемую версию, поэтому
+# bump проводится dev'ом без касания sacred-тестов.
+chk cargo test -p gateway --test red_gateway_schema_version --quiet
 chk bash -c "sed 's://.*::' crates/gateway/src/lib.rs | grep -q 'history_truncated'"
 
 # ── ОПЕРАТОРСКИЙ ПУТЬ: канарейка проверяет ВЫЗЫВАТЕЛЯ ──────────────────────────
@@ -26,12 +28,32 @@ chk bash -c "sed 's://.*::' crates/gateway/src/lib.rs | grep -q 'history_truncat
 # compose» — grep-green артефакт при отсутствующем cron-вызывателе. Проверять надо того, КТО
 # зовёт, и С КАКИМИ аргументами (класс TD-019/TD-020).
 
-step "task #5 — cron-обёртка чекпоинтера существует, исполняема и заведена в cron.d"
+# C-032 R4: наличие файла и grep по нему — всё ещё «объявлено», а не «работает». Обёртки
+# ОБЯЗАНЫ поддерживать `HFT_CRON_PRINT_ARGV=1`: напечатать argv, который они бы выполнили,
+# и выйти 0 БЕЗ побочных эффектов (без docker, без записи). Тогда контракт проверяется
+# ИСПОЛНЕНИЕМ, а не чтением.
+step "task #5 — cron-обёртка чекпоинтера ИСПОЛНЯЕТСЯ и печатает валидный argv"
 chk test -x deploy/bin/gateway-checkpoint-cron.sh
+chk bash -c "HFT_CRON_PRINT_ARGV=1 deploy/bin/gateway-checkpoint-cron.sh >/dev/null 2>&1"
+chk bash -c "HFT_CRON_PRINT_ARGV=1 deploy/bin/gateway-checkpoint-cron.sh 2>/dev/null | grep -q -- '--coverage-out'"
+chk bash -c "HFT_CRON_PRINT_ARGV=1 deploy/bin/gateway-checkpoint-cron.sh 2>/dev/null | grep -qE -- '--(dir|ckpt-dir)'"
 chk bash -c "grep -rq 'gateway-checkpoint-cron.sh' deploy/cron.d/"
 
-step "task #6 — retention-обёртка ПЕРЕДАЁТ --checkpoint-coverage (без него retention — no-op)"
-chk bash -c "sed 's:#.*::' deploy/bin/journal-retention-cron.sh | grep -q -- '--checkpoint-coverage'"
+step "task #6 — retention-обёртка ИСПОЛНЯЕТСЯ и передаёт --checkpoint-coverage"
+chk test -x deploy/bin/journal-retention-cron.sh
+chk bash -c "HFT_CRON_PRINT_ARGV=1 deploy/bin/journal-retention-cron.sh >/dev/null 2>&1"
+chk bash -c "HFT_CRON_PRINT_ARGV=1 deploy/bin/journal-retention-cron.sh 2>/dev/null | grep -q -- '--checkpoint-coverage'"
+
+# КОМПОЗИЦИЯ (testing.md п.6) и есть настоящий инвариант цепочки: путь артефакта, КУДА пишет
+# чекпоинтер, обязан совпасть с путём, ОТКУДА читает retention. Рассогласование этих двух
+# строк = retention молча работает по несуществующему покрытию (fail-closed no-op, TD-020).
+step "канарейка КОМПОЗИЦИИ — обёртки согласованы по пути артефакта покрытия"
+chk bash -c '
+  out=$(HFT_CRON_PRINT_ARGV=1 deploy/bin/gateway-checkpoint-cron.sh 2>/dev/null \
+        | tr " " "\n" | sed -n "s/^--coverage-out=//p" | head -1)
+  inp=$(HFT_CRON_PRINT_ARGV=1 deploy/bin/journal-retention-cron.sh 2>/dev/null \
+        | tr " " "\n" | sed -n "s/^--checkpoint-coverage=//p" | head -1)
+  [ -n "$out" ] && [ "$out" = "$inp" ]'
 
 # Порядок в cron существен: чекпоинт обязан отработать ДО retention, иначе покрытие устаревшее
 # и prune идёт по вчерашнему рубежу. Парсить расписание cron надёжно — дороже пользы, поэтому

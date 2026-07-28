@@ -111,10 +111,27 @@ legacy-сегменту), и на этом журнале условие `first_
 | 1 | ⏳ OPEN | Снять безусловный fail-loud в `advance_to` (`lib.rs:2178-2186`); бутстрап на усечённом журнале ЛЕГАЛЕН | engine-dev | `red_checkpoint_bootstrap_truncated` GREEN |
 | 2 | ⏳ OPEN | `history_start_seq` + `history_truncated` в `Snapshot` и в заголовке чекпоинта; значение — из ПЕРВОГО реально свёрнутого события (не из `header.first_seq`, TD-030) | engine-dev | оба пути дают одинаковые значения |
 | 3 | ⏳ OPEN | Fail-loud СУЖЕН до разрыва: валидный чекпоинт с курсором `C` и `earliest_seq > C + 1` → `Err`, ничего не писать | engine-dev | `gap_between_checkpoint_and_journal_is_loud` GREEN |
-| 4 | ⏳ OPEN | `GATEWAY_SCHEMA_VERSION` 7→8 + `docs/fa/viz-backend.md` уже обновлён architect'ом; проброс полей через `gateway-serve` на провод | engine-dev | `red_gateway_schema_v8` GREEN |
-| 5 | ⏳ OPEN | **ops:** `deploy/bin/gateway-checkpoint-cron.sh` + запись в `deploy/cron.d/` (чекпоинт ДО retention), зеркально существующим cron-обёрткам | engine-dev | канарейка вызывателя |
-| 6 | ⏳ OPEN | **ops:** `deploy/bin/journal-retention-cron.sh` передаёт `--checkpoint-coverage <путь>`; без него retention — no-op (TD-020-класс) | engine-dev | канарейка вызывателя |
+| 4 | ⏳ OPEN | `GATEWAY_SCHEMA_VERSION` 7→8 + `docs/fa/viz-backend.md` уже обновлён architect'ом; проброс полей через `gateway-serve` на провод | engine-dev | `red_gateway_schema_version` GREEN (оракул версионно-агностичен, C-032 R1) |
+| 5 | ⏳ OPEN | **ops:** `deploy/bin/gateway-checkpoint-cron.sh` + запись в `deploy/cron.d/` (чекпоинт ДО retention). **Контракт (C-032 R4):** обёртка поддерживает `HFT_CRON_PRINT_ARGV=1` — печатает argv, который выполнила бы, и выходит 0 БЕЗ побочных эффектов (без docker, без записи), чтобы гейт проверял её ИСПОЛНЕНИЕМ | engine-dev | канарейки исполняют обёртку |
+| 6 | ⏳ OPEN | **ops:** `deploy/bin/journal-retention-cron.sh` передаёт `--checkpoint-coverage=<путь>` + тот же `HFT_CRON_PRINT_ARGV=1`. **Путь артефакта обязан СОВПАДАТЬ** с `--coverage-out` обёртки чекпоинтера — рассогласование = retention молча работает по несуществующему покрытию (fail-closed no-op) | engine-dev | канарейка КОМПОЗИЦИИ двух обёрток |
 | 7 | ⏳ OPEN | Прогон `bash scripts/verify_M-48.sh` → `VERDICT: PASS` | engine-dev | exit=0 + Done Block |
+
+### Ревизия rev2 — критик C-032 REJECT, четыре блокера закрыты
+
+- **R1 (мой процессный промах, ВТОРОЙ раз подряд):** `red_gateway_schema_v7.rs` пиннил версию 7,
+  а M-48 требует 8 ⇒ engine-dev не мог сделать bump, не тронув sacred-тест. Ровно то, о чём
+  предупреждал reviewer на M-38b. Оракул переименован в **`red_gateway_schema_version.rs`**
+  (имя больше не привязано к номеру), пиннит текущую ожидаемую версию; ссылки в
+  `verify_M-38a/38b/47/48.sh` обновлены в ЭТОМ же коммите. **Правило: при смене контракта
+  architect обновляет ВСЕ свои оракулы и verify-скрипты в том же коммите.**
+- **R2:** добавлена ловушка legacy — `history_start_seq_ignores_lying_legacy_header`. Прежняя
+  фикстура состояла из v2-сегментов с ЧЕСТНЫМ `first_seq`, поэтому реализация «по заголовку»
+  прошла бы её незамеченной (тот же класс плацебо, что C-030 R2).
+- **R3:** gap-тест теперь требует ОТСУТСТВИЯ побочных эффектов (снимок ckpt-каталога до/после),
+  а не только `Err`; добавлен `advance_after_covered_prune_does_not_regress_history_start` —
+  перепиннивание D2 из C-030 rev3, чтобы сужение fail-loud не сняло защиту от немонотонности.
+- **R4:** ops-канарейки ИСПОЛНЯЮТ обёртки через `HFT_CRON_PRINT_ARGV=1` и проверяют
+  КОМПОЗИЦИЮ — совпадение пути артефакта между двумя обёртками.
 
 ## Оракулы (sacred)
 
