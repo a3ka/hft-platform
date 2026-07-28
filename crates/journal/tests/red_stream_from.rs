@@ -26,7 +26,7 @@ use contracts::{to_fixed, DataSource, EventKind, MdPayload, Side, Venue};
 use journal::{EpochFilter, Journal, WriterConfig};
 
 const N: u64 = 800;
-const SEG_BYTES: u64 = 16 * 1024;
+const SEG_BYTES: u64 = 8 * 1024; // замер: N=800 → 5 сегментов (16 KiB давали 3 — оракул не запускался)
 
 fn cfg() -> WriterConfig {
     WriterConfig {
@@ -45,7 +45,11 @@ fn trade(i: u64) -> EventKind {
         MdPayload::Trade {
             price: to_fixed(100.0 + (i % 5) as f64),
             size: to_fixed(1.0),
-            side: if i % 2 == 0 { Side::Buy } else { Side::Sell },
+            side: if i.is_multiple_of(2) {
+                Side::Buy
+            } else {
+                Side::Sell
+            },
             ts_exch_ms: 1_752_000_000_000 + i as i64 * 100,
         },
     )

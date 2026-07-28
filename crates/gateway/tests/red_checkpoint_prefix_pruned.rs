@@ -43,7 +43,7 @@ use journal::{EpochFilter, Journal, WriterConfig};
 const DAY_MS: i64 = 86_400_000;
 const D2_MS: i64 = 20_279 * DAY_MS;
 const N: u64 = 2_000;
-const SEG_BYTES: u64 = 24 * 1024;
+const SEG_BYTES: u64 = 8 * 1024; // замер: N=2000 → 12 сегментов (24 KiB давали 4)
 
 fn cfg() -> WriterConfig {
     WriterConfig {
@@ -62,7 +62,11 @@ fn trade(i: u64) -> EventKind {
         MdPayload::Trade {
             price: to_fixed(100.0 + (i % 7) as f64),
             size: to_fixed(1.0 + (i % 3) as f64),
-            side: if i % 2 == 0 { Side::Buy } else { Side::Sell },
+            side: if i.is_multiple_of(2) {
+                Side::Buy
+            } else {
+                Side::Sell
+            },
             ts_exch_ms: D2_MS - (N as i64 * 100) + (i as i64 * 100),
         },
     )
@@ -93,8 +97,39 @@ fn big_journal() -> tempfile::TempDir {
     dir
 }
 
-fn canon(s: &gateway::Snapshot) -> Vec<u8> {
-    serde_json::to_vec(s).expect("сериализация")
+/// Каноническая форма — СТРОКА, а не `Vec<u8>`: байтовое сравнение то же самое (UTF-8),
+/// но падение остаётся ЧИТАЕМЫМ. Первая версия печатала два вектора байт (~291 KB на
+/// падение) — диагностировать по такому выводу невозможно, а sacred-оракул обязан
+/// объяснять, ЧТО разошлось.
+fn canon(s: &gateway::Snapshot) -> String {
+    serde_json::to_string(s).expect("сериализация")
+}
+
+/// Сравнить канонические формы и при расхождении показать ОКНО вокруг первого различия,
+/// а не оба документа целиком.
+fn assert_canon_eq(got: &str, want: &str, msg: &str) {
+    if got == want {
+        return;
+    }
+    let at = got
+        .as_bytes()
+        .iter()
+        .zip(want.as_bytes())
+        .position(|(a, b)| a != b)
+        .unwrap_or_else(|| got.len().min(want.len()));
+    let lo = at.saturating_sub(120);
+    let win = |s: &str| {
+        let hi = (at + 120).min(s.len());
+        s.get(lo..hi).unwrap_or("<не UTF-8 граница>").to_string()
+    };
+    panic!(
+        "{msg}\nПервое расхождение на байте {at} (got.len={}, want.len={}).\n\
+         got : …{}…\nwant: …{}…",
+        got.len(),
+        want.len(),
+        win(got),
+        win(want)
+    );
 }
 
 /// Удалить сегменты с индексом < `upto_index` — ровно то, что делает retention-prune после
@@ -173,15 +208,15 @@ fn covered_prefix_pruned_output_still_byte_identical() {
     )
     .expect("snapshot_from_checkpoint после prune покрытого префикса");
 
-    assert_eq!(
-        canon(&got),
-        want,
+    assert_canon_eq(
+        &canon(&got),
+        &want,
         "C-030 R3 НАРУШЕН: после удаления ПОКРЫТОГО чекпоинтом префикса результат разошёлся \
          с эталоном, снятым до prune. Два возможных корня, оба блокирующие: (а) реализация \
          втайне реплеит историю от START (её больше нет — значит выход усечён); (б) \
          journal_lineage посчитан по ТЕКУЩИМ заголовкам, удаление префикса объявило валидный \
          чекпоинт чужим → тихий rebuild по остаткам → кокпит молча получил усечённую историю \
-         (all-time VWAP поехал). Требуется суффикс-совместимая валидация lineage."
+         (all-time VWAP поехал). Требуется суффикс-совместимая валидация lineage.",
     );
 
     // Ресурс: читать можно только хвост — старых сегментов уже нет физически, но реализация
@@ -248,12 +283,12 @@ fn repeated_advance_and_prune_cycles_stay_identical() {
     )
     .expect("snapshot_from_checkpoint после двух циклов");
 
-    assert_eq!(
-        canon(&got),
-        want,
+    assert_canon_eq(
+        &canon(&got),
+        &want,
         "КОМПОЗИЦИЯ НАРУШЕНА: после двух циклов «advance → prune» результат разошёлся с \
          эталоном. Инкрементальный чекпоинт обязан переживать повторное усечение префикса — \
-         это штатный режим ops-cron, а не экзотика."
+         это штатный режим ops-cron, а не экзотика.",
     );
 }
 

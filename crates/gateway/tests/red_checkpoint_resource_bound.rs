@@ -71,7 +71,11 @@ fn big_journal() -> tempfile::TempDir {
     {
         let mut j = Journal::open_with(dir.path(), cfg()).expect("open_with");
         for i in 0..N {
-            let side = if i % 2 == 0 { Side::Buy } else { Side::Sell };
+            let side = if i.is_multiple_of(2) {
+                Side::Buy
+            } else {
+                Side::Sell
+            };
             j.append(trade(
                 100.0 + (i % 7) as f64,
                 1.0 + (i % 3) as f64,

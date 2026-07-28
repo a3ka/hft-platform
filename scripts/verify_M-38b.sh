@@ -14,6 +14,17 @@ chk cargo fmt --all -- --check
 chk cargo build --workspace --quiet
 chk cargo clippy --all-targets --workspace --quiet -- -D warnings
 
+# M-38b (инцидент 2026-07-28): в обход красного clippy в workspace-Cargo.toml было добавлено
+# `unused_must_use = "allow"` — ГЛОБАЛЬНО, включая прод-код. Этот линт ловит проигнорированный
+# `Result`; в journal-first fail-closed проекте его отключение прячет «запись не удалась, но мы
+# поехали дальше». Заявленная причина (стилистический `manual_is_multiple_of` в тестах) к нему
+# отношения не имела. Правильный путь — починить КОД (сделано: 4 теста → `is_multiple_of`),
+# а не глушить линт. Канарейка держит это свойство: blanket-allow не возвращается тихо.
+step "канарейка — линты не отключены глушением (unused_must_use и др. blanket-allow)"
+chk bash -c "! grep -rnE '^\s*\"?(unused_must_use|unused_results|manual_is_multiple_of|manual_unwrap_or)\"?\s*=\s*(\"allow\"|\{[^}]*allow)' Cargo.toml crates/*/Cargo.toml"
+# Прямая проверка: с ЯВНО возвращёнными линтами clippy обязан оставаться зелёным.
+chk cargo clippy --all-targets --workspace --quiet -- -D warnings -D unused_must_use -D clippy::manual_is_multiple_of -D clippy::manual_unwrap_or
+
 step "task #1 — OrderBook переживает serde-roundtrip целиком (чейн + stale, §Findings)"
 chk cargo test -p book --test red_orderbook_serde_roundtrip --quiet
 

@@ -43,7 +43,11 @@ fn trade(i: u64) -> EventKind {
         MdPayload::Trade {
             price: to_fixed(100.0 + (i % 5) as f64),
             size: to_fixed(1.0 + (i % 3) as f64),
-            side: if i % 2 == 0 { Side::Buy } else { Side::Sell },
+            side: if i.is_multiple_of(2) {
+                Side::Buy
+            } else {
+                Side::Sell
+            },
             ts_exch_ms: D2_MS - (N as i64 * 100) + (i as i64 * 100),
         },
     )

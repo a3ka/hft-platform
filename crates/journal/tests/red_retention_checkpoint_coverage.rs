@@ -57,7 +57,7 @@ const N: u64 = 900;
 
 fn cfg() -> WriterConfig {
     WriterConfig {
-        max_segment_bytes: 16 * 1024,
+        max_segment_bytes: 8 * 1024, // замер: N=900 → 6 сегментов (16 KiB давали 3)
         min_free_bytes: 0,
         source: DataSource::OwnCapture,
         provenance: "test".to_string(),
