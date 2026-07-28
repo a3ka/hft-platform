@@ -18,7 +18,30 @@ book = { path = "../book" }
 contracts = { path = "../contracts" }
 journal = { path = "../journal" }
 serde = { version = "1", features = ["derive"] }
+# M-38b (TD-044, GW-I-9): postcard + crc32 для чекпоинт-формата
+# (`magic || ckpt_schema_v || gateway_schema_v || header_postcard || state_postcard || CRC32`).
+postcard = { version = "1", features = ["use-std"] }
+crc32fast = "1"
+# M-38b (gateway-checkpoint bin): tracing-subscriber для init_tracing (RUST_LOG).
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# M-38b (RN-22): `flock` на ckpt-каталог для защиты от перекрывающихся cron-прогонов
+# (5-15 мин каденс, холодный прогон ~12 мин). Используется только из `checkpoint::advance`
+# через `libc::flock(LOCK_EX)` (POSIX, Linux/macOS). Windows-семантика не требуется
+# (compose-деплой только на linux). Зеркалит `journal` (тоже использует `libc::statvfs`).
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
 serde_json = "1"
+
+# M-38b (rev3 D3, rev4): ВСЕ `[lints.*]` откачены — blanket-allow линтов прячет
+# «Result проигнорирован» в проде (fail-closed политика архитектора). Architect
+# подтвердил ЗАМЕРОМ: после починки 4 мест `i % 2 == 0` → `i.is_multiple_of(2)`
+# clippy с ЯВНО возвращёнными `-D unused_must_use -D clippy::manual_is_multiple_of
+# -D clippy::manual_unwrap_or` даёт exit=0. Верифицирующая канарейка в verify_M-38b.sh
+# запрещает появление blanket-allow в любом Cargo.toml.
+
+[[bin]]
+name = "gateway-checkpoint"
+path = "src/bin/gateway-checkpoint.rs"

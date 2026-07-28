@@ -69,12 +69,16 @@ fn sel() -> Selector {
 }
 
 fn config(dir: &std::path::Path, verify_secret: &[u8]) -> ServeConfig {
+    // M-38b (rev4, B3): `ServeConfig.checkpoint_dir` — новое поле. В smoke-WS нет
+    // чекпоинта (это CI-тест, без прод-обвязки), `None` = прямой rebuild =
+    // прежнее поведение M-28 до rev4.
     ServeConfig {
         addr: "127.0.0.1:0".to_string(), // ephemeral — реальный порт из local_addr()
         journal_dir: dir.to_path_buf(),
         filter: EpochFilter::OwnCaptureOnly,
         selector: sel(),
         decoding_key: DecodingKey::from_secret(verify_secret),
+        checkpoint_dir: None,
     }
 }
 

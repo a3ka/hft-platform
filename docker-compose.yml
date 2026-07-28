@@ -126,6 +126,10 @@ services:
       # воспроизводится через §8 E2E). 60s = ~60 бакетов в окне при `timeframe_ms=1000`,
       # достаточно для 60 секунд истории + память O(окно), не O(длина журнала).
       GATEWAY_WINDOW_MS: ${GATEWAY_WINDOW_MS:-60000}
+      # M-38b (rev4, B3): путь к чекпоинт-тому на проде. unset → прямой rebuild
+      # (dev-сценарий). На проде ОБЯЗАТЕЛЬНО = /ckpt, чтобы snapshot-при-подключении
+      # не реплеил историю на 409 s (TD-044, ровно тот замер, который M-38b лечит).
+      GATEWAY_CHECKPOINT_DIR: /ckpt
       # ОБЯЗАТЕЛЬНО задать в .env на хосте (deploy.MD §D: shared с Next.js-подписателем,
       # D6 marketplace). Без секрета bin падает с exit 2 (config-error).
       GATEWAY_JWT_SECRET: ${GATEWAY_JWT_SECRET:?GATEWAY_JWT_SECRET must be set}
@@ -133,6 +137,11 @@ services:
       # RO-bind к журналу — gateway-serve только читает (GS-I-3: read-only). Recorder
       # владеет журналом, gateway-serve его НЕ мутирует.
       - journal-data:/journal:ro
+      # M-38b (rev4, B3): RO-bind к чекпоинт-тому. Монтируется именно `:ro` —
+      # ЕДИНСТВЕННЫЙ писатель чекпоинта = ops-сервис `gateway-checkpoint` (см. ниже).
+      # gateway-serve отсюда только читает через `snapshot_from_checkpoint`. RW-bind
+      # на чтении избыточен и дал бы привилегию удалить чекпоинт.
+      - gateway-ckpt:/ckpt:ro
     entrypoint: ["/usr/local/bin/gateway-serve"]
     healthcheck:
       # WS-протокол: healthcheck = TCP-connect к bind-адресу. Полноценный JWT-handshake —
@@ -146,5 +155,46 @@ services:
       recorder:
         condition: service_healthy
 
+  # M-38b (TD-044, GW-I-9): ops-сервис чекпоинтера. Снимает чекпоинт `Reducer`
+  # (полное состояние селектора + lineage) в ОТДЕЛЬНЫЙ RW-том `gateway-ckpt`,
+  # публикует артефакт `covered_through_seq` для retention (C-030 R1). Запускается
+  # по cron'у ПЕРЕД `journal-retention` — порядок критичен (retention без покрытия
+  # не прунит). Аналог `journal-retention` / `journal-compaction` — `profiles: ["ops"]`,
+  # одноразовый контейнер.
+  #
+  # Безопасность:
+  # - journal-том смонтирован `:ro` — чекпоинтер не мутирует журнал (JR-I-1 цел,
+  #   единственный писатель — recorder).
+  # - `covered_through_seq` пишется ТОЛЬКО при успешном `advance_to`. Если
+  #   `advance_to` упал — артефакт остаётся СТАРЫМ, retention в следующем цикле
+  #   использует устаревший артефакт (= fail-closed).
+  # - Дефолт `WINDOW_MS=60000` (M-37 анти-TD-020): без активного окна прод-снапшот
+  #   ООМ-ит (TD-039 воспроизводится через §8 E2E). Деплойер переопределяет, если
+  #   нужна иная политика.
+  gateway-checkpoint:
+    image: hft-platform-recorder:local
+    container_name: hft-gateway-checkpoint
+    profiles: ["ops"]
+    entrypoint: ["/usr/local/bin/gateway-checkpoint"]
+    command:
+      - --dir=/journal
+      - --ckpt-dir=/ckpt
+      - --coverage-out=/ckpt/covered_through_seq
+      - --venue=${GATEWAY_VENUE:-Binance}
+      - --symbol=${GATEWAY_SYMBOL:-BTCUSDT}
+      - --timeframe-ms=${GATEWAY_TIMEFRAME_MS:-1000}
+      - --bands=${GATEWAY_BANDS:-0.001}
+      - --window-ms=${GATEWAY_WINDOW_MS:-60000}
+      # `--cursor LATEST` — снимаем чекпоинт ДО хвоста; усечённый прогон возможен
+      # через `--cursor <i64>` (задаётся в cron-обёртке для инкрементальных снапшотов).
+      - --cursor=LATEST
+    volumes:
+      # RO-bind к журналу (JR-I-1) + RW-bind к чекпоинт-тому.
+      - journal-data:/journal:ro
+      - gateway-ckpt:/ckpt
+    # Одноразовый (без restart) — вызывается cron'ом или оператором вручную.
+
 volumes:
   journal-data:
+  # M-38b: RW-том для чекпоинтов (по аналогии с journal-cold для холодного бэкапа).
+  gateway-ckpt:

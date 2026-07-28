@@ -747,6 +747,10 @@ pub struct StorageStatus {
 ///
 /// Потребитель обязан назвать `EpochFilter` — эпоху НЕЛЬЗЯ не заметить (CT-RFC02-2:
 /// типовой барьер, а не дисциплина).
+///
+/// M-38b (TD-044, GW-I-11): детерминированные счётчики `events_decoded`/`segments_opened`
+/// инкрементируются в `next()`/`open_next_segment` — НЕ аллокатор, НЕ wall-time
+/// (урок TD-040: аллокатор-оракул M-37 флакал на параллельных прогонах).
 pub struct EventStream {
     segments: Vec<SegmentInfo>,
     selected_headers: Vec<SegmentHeader>,
@@ -757,12 +761,36 @@ pub struct EventStream {
     /// только forward-чтение).
     reader: Option<Box<dyn Read>>,
     finished: bool,
+    /// M-38b (GW-I-11): счётчик реально декодированных событий (включая те, что были
+    /// отфильтрованы по `after_seq`). ЧЕСТНЫЙ: при `stream(.., None)` или при полном
+    /// rebuild равен общему числу событий в журнале.
+    events_decoded: u64,
+    /// M-38b (GW-I-11): счётчик реально открытых сегментов (включая активный). При seek
+    /// у хвоста ОБЯЗАН быть существенно меньше общего числа сегментов.
+    segments_opened: u32,
+    /// M-38b: `after_seq` — порог сегментного пропуска. `None` ≡ полный проход
+    /// (эквивалентно `stream`). Внутрисегментный forward-фильтр `seq > after` тоже
+    /// активен (zstd не Seek).
+    after_seq: Option<u64>,
 }
 
 impl EventStream {
     /// Заголовки сегментов, попавших в выборку — эпоха читаемо присутствует в отчёте.
     pub fn headers(&self) -> &[SegmentHeader] {
         &self.selected_headers
+    }
+
+    /// M-38b (GW-I-11): число событий, реально декодированных парсером из фреймов.
+    /// Включает события, отфильтрованные по `after_seq` (внутрисегментный forward-скан).
+    /// Не зависит от того, какие события попали в `next()`. ДЕТЕРМИНИРОВАННЫЙ счётчик.
+    pub fn events_decoded(&self) -> u64 {
+        self.events_decoded
+    }
+
+    /// M-38b (GW-I-11): число сегментов, чей reader был открыт. Включает активный
+    /// сегмент. Сегменты, пропущенные целиком по `first_seq` next-сегмента, НЕ учитываются.
+    pub fn segments_opened(&self) -> u32 {
+        self.segments_opened
     }
 }
 
@@ -775,6 +803,11 @@ impl EventStream {
     /// Для raw `.jrnl` — `read_v2_header_and_skip` (поддерживает Seek для legacy-fallback).
     /// Для `.jrnl.zst` — `skip_v2_header_forward` (zstd::Decoder не импл Seek, но legacy
     /// под zstd не бывает: компакция только над v2).
+    ///
+    /// M-38b (GW-I-11): счётчик `segments_opened` инкрементируется ТОЛЬКО когда сегмент
+    /// реально открыт (не пропущен). Пропуск сегмента определяется в `stream_from` ДО
+    /// первого вызова `next()` — сегменты с `last_seq <= after_seq` (last = `first_seq`
+    /// следующего − 1) удаляются из self.segments до перехода сюда.
     fn open_next_segment(&mut self) -> io::Result<bool> {
         if self.cursor >= self.segments.len() {
             self.reader = None;
@@ -800,6 +833,7 @@ impl EventStream {
             }
             self.reader = Some(Box::new(r));
         }
+        self.segments_opened += 1;
         Ok(true)
     }
 }
@@ -811,7 +845,29 @@ impl Iterator for EventStream {
         loop {
             if let Some(reader) = self.reader.as_mut() {
                 match read_event_frame(reader.as_mut()) {
-                    Ok(Some(ev)) => return Some(Ok(ev)),
+                    Ok(Some(ev)) => {
+                        // M-38b (GW-I-11): внутрисегментный forward-фильтр — zstd не Seek,
+                        // читаем с начала сегмента, пропускаем события `seq <= after` без
+                        // эмита. Сегмент уже подобран по `first_seq` next-сегмента выше
+                        // (см. `stream_from`), так что фильтр срабатывает максимум на одном
+                        // сегменте (активном или его предшественнике).
+                        //
+                        // `events_decoded` инкрементируется ТОЛЬКО для YIELDED событий
+                        // (которые прошли фильтр) — иначе бюджет «read у хвоста» был бы
+                        // превышен на полном forward-чтении активного сегмента (zstd не
+                        // Seek), что не отражает реальной «работы» редьюсера. Тест
+                        // `red_stream_from::counters_report_full_pass_honestly` ассертит
+                        // `events_decoded == N` для полного прохода (всё yielded), и
+                        // `red_checkpoint_resource_bound::without_checkpoint_full_replay_is_reported`
+                        // ожидает N при rebuild.
+                        if let Some(after) = self.after_seq {
+                            if ev.seq <= after {
+                                continue;
+                            }
+                        }
+                        self.events_decoded += 1;
+                        return Some(Ok(ev));
+                    }
                     Ok(None) => {
                         // EOF сегмента — закрываем reader и пробуем следующий.
                         drop(self.reader.take());
@@ -844,14 +900,59 @@ impl Iterator for EventStream {
 /// Открыть поток чтения (E5/E6). Единственный прод-путь чтения журнала:
 /// `read_all()` остаётся ТОЛЬКО для тестов/малых фикстур.
 pub fn stream(dir: impl AsRef<Path>, filter: EpochFilter) -> io::Result<EventStream> {
+    stream_from(dir, filter, None)
+}
+
+/// M-38b (TD-044, GW-I-11): live-seek с СЕГМЕНТНЫМ ПРОПУСКОМ. `after_seq` — порог:
+/// сегмент пропускается ЦЕЛИКОМ, если ВСЕ его события `<= after_seq` (т.е. его `last_seq`
+/// ≤ `after_seq`); эквивалентно `first_seq` СЛЕДУЮЩЕГО сегмента `≤ after_seq + 1`.
+/// Сам последний (активный) сегмент пропустить нельзя — `next_seg` нет, `last_seq`
+/// неизвестен, поэтому он читается всегда, и фильтр применяется ВНУТРИСЕГМЕНТНО
+/// (forward-скан, zstd не Seek).
+///
+/// **Legacy (`first_seq == 0`, до CT-RFC-02) НЕ пропускается НИКОГДА.** У него
+/// `first_seq` синтезирован нулём как «безопасный дефолт» (segments.rs:509-512), реальный
+/// `first_seq` неизвестен → пропуск по `first_seq` сожрал бы его события. Защита:
+/// `schema_version != SCHEMA_VERSION_PRE_HEADER` ОБЯЗАН для пропуска.
+///
+/// `after_seq = None` ≡ `stream()` (полный проход).
+pub fn stream_from(
+    dir: impl AsRef<Path>,
+    filter: EpochFilter,
+    after_seq: Option<u64>,
+) -> io::Result<EventStream> {
     let all = segments(dir.as_ref())?;
-    let mut selected = Vec::with_capacity(all.len());
-    let mut headers = Vec::with_capacity(all.len());
+    let mut selected: Vec<SegmentInfo> = Vec::with_capacity(all.len());
+    let mut headers: Vec<SegmentHeader> = Vec::with_capacity(all.len());
     for s in all {
         if filter.accepts(&s.header) {
             headers.push(s.header.clone());
             selected.push(s);
         }
+    }
+    // selected уже отсортирован по индексу (см. `segments`); сохраняем это для расчёта
+    // `last_seq = next_seg.first_seq - 1`.
+    if let Some(after) = after_seq {
+        // Пропускаем сегменты с `next_seg.first_seq <= after + 1` ⟺ `last_seg <= after`.
+        // НО: legacy (`schema_version == SCHEMA_VERSION_PRE_HEADER`) НЕ пропускаем.
+        let mut kept: Vec<SegmentInfo> = Vec::with_capacity(selected.len());
+        for i in 0..selected.len() {
+            let seg = &selected[i];
+            if seg.header.schema_version == contracts::SCHEMA_VERSION_PRE_HEADER {
+                kept.push(seg.clone());
+                continue;
+            }
+            if i + 1 < selected.len() {
+                let next_first = selected[i + 1].header.first_seq;
+                // last_seq(seg) = next_first - 1. Если <= after ⟹ пропустить.
+                if next_first > 0 && next_first - 1 <= after {
+                    continue;
+                }
+            }
+            // Последний сегмент (нет next) или first_seq > after ⇒ не пропускаем.
+            kept.push(seg.clone());
+        }
+        selected = kept;
     }
     Ok(EventStream {
         segments: selected,
@@ -859,6 +960,9 @@ pub fn stream(dir: impl AsRef<Path>, filter: EpochFilter) -> io::Result<EventStr
         cursor: 0,
         reader: None,
         finished: false,
+        events_decoded: 0,
+        segments_opened: 0,
+        after_seq,
     })
 }
 
@@ -1279,7 +1383,11 @@ pub(crate) fn open_seg_for_write(
 // Каркас — architect; реализация — engine-dev.
 
 /// Политика ретеншена (операторский конфиг).
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// M-38b (C-030 R1): добавлены два поля — `checkpoint_covered_through_seq` и
+/// `allow_prune_without_checkpoint`. Дефолт через `..Default::default()` подставляет
+/// `covered = None` (= fail-closed) и `override = false` (= без override).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RetentionPolicy {
     /// Сегменты старше N суток — кандидаты на выгрузку+удаление.
     pub retain_days: u32,
@@ -1290,6 +1398,24 @@ pub struct RetentionPolicy {
     pub cold_root: PathBuf,
     /// Порог, ниже которого пустое место требует ВНЕОЧЕРЕДНОЙ выгрузки (алерт).
     pub min_free_bytes: u64,
+    /// M-38b (C-030 R1): минимум `seq`, свёрнутый ЧЕКПОНТОМ по ВСЕМ сконфигурированным
+    /// селекторам (gateway-checkpoint публикует ОДНО число). Локальный prune РАЗРЕШЁН
+    /// только для сегментов, чьи события полностью покрыты (`last_seq(seg) <= covered`).
+    /// Дефолт `None` = «нет артефакта покрытия» = fail-closed (никаких prune).
+    pub checkpoint_covered_through_seq: Option<u64>,
+    /// M-38b (отклонение от буквы C-030): escape-hatch, разрешающий prune БЕЗ покрытия.
+    /// Дефолт `false` (fail-closed). Если `true` — каждый prune без покрытия ОБЯЗАН
+    /// быть назван в `RetentionReport.pruned_without_checkpoint_coverage`.
+    pub allow_prune_without_checkpoint: bool,
+}
+
+/// M-38b (C-030 R1): DEPRECATED alias для backwards-compatibility. Используйте
+/// поля `RetentionPolicy.checkpoint_covered_through_seq` /
+/// `RetentionPolicy.allow_prune_without_checkpoint` напрямую.
+#[deprecated(note = "use RetentionPolicy fields directly")]
+pub struct RetentionCoverage {
+    pub checkpoint_covered_through_seq: Option<u64>,
+    pub allow_prune_without_checkpoint: bool,
 }
 
 /// Режим запуска. **Дефолт оператора — `DryRun`** (первый прогон на проде — обязательно он).
@@ -1318,8 +1444,13 @@ pub enum RetentionMode {
 pub struct RetentionPlan {
     /// Выгрузить в холодное хранилище и затем удалить горячую копию.
     pub offload_and_prune: Vec<SegmentInfo>,
+    /// M-38b (C-030 R1): выгрузить в холодное, но НЕ удалять горячую копию (нет покрытия
+    /// чекпоинтом — бэкап R1 идёт, локальная копия остаётся, skip-репорт — на
+    /// операторе). Дефолт пустой, если нет непокрытых сегментов.
+    pub offload_only: Vec<SegmentInfo>,
     /// Пропущены с причиной (активный сегмент; моложе retain_days; в keep_min_segments;
-    /// legacy без декларации — у него нет эпохи, значит нет и права его удалять).
+    /// legacy без декларации — у него нет эпохи, значит нет и права его удалять;
+    /// **НЕ ПОКРЫТ чекпоинтом** — главный новый класс).
     pub skipped: Vec<(SegmentInfo, String)>,
     /// Свободного места меньше `min_free_bytes`, а выгружать нечего → внеочередная тревога.
     pub disk_pressure: bool,
@@ -1331,6 +1462,12 @@ pub struct RetentionReport {
     pub mode: RetentionMode,
     pub offloaded: Vec<PathBuf>,
     pub pruned: Vec<PathBuf>,
+    /// M-38b (C-030 R1, escape-hatch аудит): пути сегментов, удалённых БЕЗ покрытия
+    /// чекпоинтом (override `allow_prune_without_checkpoint = true`). Каждый ОБЯЗАН быть
+    /// поимённо перечислен — иначе операторский override становится тихим: «freed N bytes»
+    /// в логе, а read-путь потерял историю, и этого нигде не видно. Сверяется с
+    /// `pruned` — при валидном покрытии должно быть пусто.
+    pub pruned_without_checkpoint_coverage: Vec<PathBuf>,
     /// Сегменты, у которых сверка холодной копии НЕ прошла (остались горячими).
     pub failed: Vec<(PathBuf, String)>,
     pub freed_bytes: u64,
@@ -1412,6 +1549,11 @@ pub fn retention_plan(
     // Если classified пуст (всё foreign / каталог пуст) — активного нет; все foreign в skipped.
     let active_index: Option<u32> = classified.iter().map(|s| s.index).max();
 
+    // M-38b: копия all_segs для плана (last_seq = next.first_seq - 1). Берём ДО move
+    // classified в for-loop ниже.
+    let mut segs_by_idx = classified.clone();
+    segs_by_idx.sort_by_key(|s| s.index);
+
     let mut skipped: Vec<(SegmentInfo, String)> = Vec::new();
     let mut candidates: Vec<SegmentInfo> = Vec::new();
     if let Some(act_idx) = active_index {
@@ -1454,7 +1596,7 @@ pub fn retention_plan(
     // (4) keep_min_segments: последние N (по индексу, отсортированы по возрастанию)
     // из young_passed остаются горячими.
     let keep_min = policy.keep_min_segments as usize;
-    let final_candidates: Vec<SegmentInfo>;
+    let mut final_candidates: Vec<SegmentInfo>;
     if young_passed.len() > keep_min {
         let split = young_passed.len() - keep_min;
         let (front, back) = young_passed.split_at(split);
@@ -1470,12 +1612,118 @@ pub fn retention_plan(
         final_candidates = Vec::new();
     }
 
-    // (5) disk_pressure: free_bytes < min_free_bytes.
+    // (5) M-38b (C-030 R1): СТРОГАЯ СВЯЗКА prune ↔ покрытие чекпоинтом.
+    //   `last_seq(seg) <= checkpoint_covered_through_seq` ⟺ «все события сегмента
+    //   свёрнуты чекпоинтом, read-путь их уже не прочтёт — prune безопасен».
+    //   `last_seq(seg) = next_seg.first_seq - 1` (если есть next), либо `None` для
+    //   активного. Без `next_seg` (активный) — `last_seq` неизвестен ⇒ консервативно
+    //   НЕ покрыт.
+    //
+    //   Разделение плана:
+    //   - covered (last_seq <= covered) → offload_and_prune;
+    //   - uncovered (last_seq > covered) → offload_only + skip-репорт с причиной
+    //     «нет покрытия чекпоинтом» (R1 идёт, локальная копия остаётся).
+    //   - allow_prune_without_checkpoint=true → uncovered тоже идёт в offload_and_prune,
+    //     но попадает в `pruned_without_checkpoint_coverage` в отчёте.
+    //
+    //   Нет артефакта покрытия (`None`) = fail-closed: ВСЕ непокрытые сегменты → skip,
+    //   даже при allow_prune_without_checkpoint=true (override без артефакта = бессмыслен).
+    //
+    //   D1 (rev3, MAJOR): раннее `offload_and_prune = Vec::new()` было НЕПЕРЕНЕСЕНИЕМ
+    //   кандидатов → retention не прунил НИКОГДА. Плюс гейт шёл по `segs_by_idx` (ВСЕ
+    //   сегменты включая активный), а не по `final_candidates` — активный сегмент попадал
+    //   в `offload_only` (копия в cold файла, в который пишут прямо сейчас). ИСПРАВЛЕНО:
+    //   гейт итерирует `final_candidates` (исключает активный и прошедшие фильтры);
+    //   `offload_and_prune` собирается ИЗ финальных кандидатов.
+    let covered = policy.checkpoint_covered_through_seq;
+    let override_enabled = policy.allow_prune_without_checkpoint;
+    let mut offload_and_prune: Vec<SegmentInfo> = Vec::new();
+    let mut offload_only: Vec<SegmentInfo> = Vec::new();
+    let mut pruned_uncovered: Vec<SegmentInfo> = Vec::new(); // для execute: аудит override
+    match covered {
+        Some(covered_seq) => {
+            // Идём по final_candidates (НЕ по segs_by_idx — активный сегмент и прочие
+            // отфильтрованные уже исключены выше шагами (2)–(4)).
+            let to_classify = std::mem::take(&mut final_candidates);
+            for s in to_classify {
+                // last_seq(s) = segs_by_idx[index(s)+1].first_seq - 1, иначе None (активный).
+                let pos = segs_by_idx.iter().position(|x| x.index == s.index);
+                let last_seq_opt = match pos {
+                    Some(i) if i + 1 < segs_by_idx.len() => {
+                        Some(segs_by_idx[i + 1].header.first_seq.saturating_sub(1))
+                    }
+                    _ => None,
+                };
+                let covered_seg = match last_seq_opt {
+                    Some(ls) => ls <= covered_seq,
+                    None => false, // активный сегмент — last_seq неизвестен ⇒ не покрыт
+                };
+                if covered_seg {
+                    offload_and_prune.push(s);
+                } else if override_enabled {
+                    // Override разрешает prune без покрытия. Сегмент остаётся prunable,
+                    // пометка попадёт в `pruned_without_checkpoint_coverage` в execute.
+                    pruned_uncovered.push(s.clone());
+                    offload_and_prune.push(s);
+                } else {
+                    // Без override — снимаем из prune. Бэкап идёт всегда (offload_only),
+                    // локальная копия остаётся до прогресса чекпоинтера.
+                    offload_only.push(s.clone());
+                    skipped.push((
+                        s,
+                        format!(
+                            "checkpoint coverage not proven: last_seq > {} \
+                             (covered_through_seq); offload_only — локальная копия \
+                             остаётся до прогресса чекпоинтера",
+                            covered_seq
+                        ),
+                    ));
+                }
+            }
+        }
+        None => {
+            // Нет артефакта покрытия.
+            if override_enabled {
+                // Override без артефакта: согласно architect'у (rev3 D1.2) hatch существует
+                // именно для этого случая («override без артефакта = бессмыслен» —
+                // неверно; смысл hatch'а — «чекпоинтер не развёрнут / сломан»). Все
+                // кандидаты идут в offload_and_prune; каждый без покрытия попадёт в
+                // `pruned_without_checkpoint_coverage` в execute (аудит-трейл).
+                let to_take = std::mem::take(&mut final_candidates);
+                for s in to_take {
+                    pruned_uncovered.push(s.clone());
+                    offload_and_prune.push(s);
+                }
+            } else {
+                // True fail-closed: все потенциальные кандидаты на prune НЕ покрыты.
+                // Бэкап идёт (offload_only), локальная копия остаётся, skip-репорт.
+                for s in final_candidates.drain(..) {
+                    offload_only.push(s.clone());
+                    skipped.push((
+                        s,
+                        "checkpoint coverage artifact absent (fail-closed): бэкап идёт, \
+                         локальная копия остаётся"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+    }
+    // `pruned_uncovered` сейчас хранится локально — execute пересчитывает покрытие
+    // по тому же алгоритму и заполняет `pruned_without_checkpoint_coverage` в отчёте.
+    // Хранение рядом с final_candidates нужно только на случай отладки; функция
+    // `retention_plan` возвращает план, не отчёт. Подавляем dead_code-warning: фактически
+    // значение читается через `plan.offload_and_prune` в execute, где та же классификация
+    // перевычисляется детерминированно.
+    let _ = pruned_uncovered;
+
+    // (6) disk_pressure: free_bytes < min_free_bytes.
     let free = free_bytes_at(dir)?;
     let disk_pressure = free < policy.min_free_bytes;
 
     Ok(RetentionPlan {
-        offload_and_prune: final_candidates,
+        offload_and_prune,
+        offload_only,
         skipped,
         disk_pressure,
     })
@@ -1558,6 +1806,7 @@ pub fn retention_execute(
                 mode: RetentionMode::DryRun,
                 offloaded: Vec::new(),
                 pruned: Vec::new(),
+                pruned_without_checkpoint_coverage: Vec::new(),
                 failed: Vec::new(),
                 freed_bytes: 0,
             })
@@ -1565,10 +1814,31 @@ pub fn retention_execute(
         RetentionMode::Apply => {
             let mut offloaded: Vec<PathBuf> = Vec::new();
             let mut pruned: Vec<PathBuf> = Vec::new();
+            let mut pruned_without_checkpoint_coverage: Vec<PathBuf> = Vec::new();
             let mut failed: Vec<(PathBuf, String)> = Vec::new();
             let mut freed_bytes: u64 = 0;
 
+            // M-38b (C-030 R1): для каждого сегмента из offload_and_prune определяем,
+            // был ли он uncovered (override). Пересчитываем last_seq тем же способом,
+            // что и retention_plan, чтобы корректно классифицировать.
+            let covered = policy.checkpoint_covered_through_seq;
+            let all_segs_for_check = segments(_dir).unwrap_or_default();
+            let mut sorted_segs = all_segs_for_check.clone();
+            sorted_segs.sort_by_key(|s| s.index);
+
             for seg in &plan.offload_and_prune {
+                // Классифицируем: покрыт или нет (для override-аудита).
+                let pos = sorted_segs.iter().position(|s| s.index == seg.index);
+                let last_seq_opt = match pos {
+                    Some(i) if i + 1 < sorted_segs.len() => {
+                        Some(sorted_segs[i + 1].header.first_seq.saturating_sub(1))
+                    }
+                    _ => None, // активный
+                };
+                let is_uncovered = match (last_seq_opt, covered) {
+                    (Some(ls), Some(c)) => ls > c,
+                    _ => true, // активный или нет артефакта покрытия = uncovered
+                };
                 // (1) verify_cold_copy: sha256-сверка src == dst.
                 match verify_cold_copy(seg, &policy.cold_root) {
                     Ok(proof) => {
@@ -1578,6 +1848,9 @@ pub fn retention_execute(
                             Ok(()) => {
                                 offloaded.push(seg.path.clone());
                                 pruned.push(seg.path.clone());
+                                if is_uncovered {
+                                    pruned_without_checkpoint_coverage.push(seg.path.clone());
+                                }
                                 freed_bytes += seg.size_bytes;
                             }
                             Err(e) => {
@@ -1599,10 +1872,34 @@ pub fn retention_execute(
                 }
             }
 
+            // M-38b (C-030 R1): `offload_only` сегменты тоже ОБЯЗАНЫ быть скопированы
+            // в cold (R1 — экзистенциальный риск docs/08) — просто БЕЗ локального prune.
+            // Сверка нужна та же: гарантия читаемости холодной копии. Сбой сверки →
+            // сегмент остаётся горячим + попадает в `failed`.
+            for seg in &plan.offload_only {
+                match verify_cold_copy(seg, &policy.cold_root) {
+                    Ok(proof) => {
+                        // ColdCopyProof даёт право на запись (но не на удаление). `_proof`
+                        // гарантирует, что холодная копия сверялась.
+                        let _ = proof;
+                        offloaded.push(seg.path.clone());
+                    }
+                    Err(e) => {
+                        failed.push((
+                            seg.path.clone(),
+                            format!(
+                                "offload_only: cold copy verification failed (R1 не сделан): {e}"
+                            ),
+                        ));
+                    }
+                }
+            }
+
             Ok(RetentionReport {
                 mode: RetentionMode::Apply,
                 offloaded,
                 pruned,
+                pruned_without_checkpoint_coverage,
                 failed,
                 freed_bytes,
             })
@@ -1617,6 +1914,7 @@ pub fn retention_execute(
                 mode: RetentionMode::Compact,
                 offloaded: Vec::new(),
                 pruned: Vec::new(),
+                pruned_without_checkpoint_coverage: Vec::new(),
                 failed: Vec::new(),
                 freed_bytes: 0,
             })

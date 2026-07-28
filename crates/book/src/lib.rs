@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 
 use contracts::{Level, MdEvent, MdPayload, Side, Venue};
+use serde::{Deserialize, Serialize};
 
 /// Результат `apply_l2delta` по непрерывности update-id (M-30 GD-I-1..6).
 /// `Applied` — дельта чейнится к предыдущей, книга обновлена.
@@ -21,7 +22,15 @@ pub enum ContinuityStatus {
 }
 
 /// L2-стакан одного инструмента. bids/asks: цена(i64) → размер(i64), оба отсортированы по цене.
-#[derive(Debug, Default, Clone)]
+///
+/// M-38b (TD-044): `#[derive(Serialize, Deserialize)]` обязателен для чекпоинт-редьюсера
+/// (`crates/gateway/checkpoint`): все четыре поля — bids/asks (через public levels),
+/// `last_final_update_id` и `stale` (через приватные поля). Соблазнительная реализация
+/// чекпоинта «сохранить `levels()`, восстановить через `apply_snapshot()`» теряет оба
+/// приватных поля и роняет gap-детекцию (класс тихой лжи, см. milestone §Findings и
+/// `crates/book/tests/red_orderbook_serde_roundtrip.rs`). Serde сериализует приватные
+/// поля напрямую — обходного конструктора не появляется, приватизация соблюдена.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct OrderBook {
     bids: BTreeMap<i64, i64>,
     asks: BTreeMap<i64, i64>,

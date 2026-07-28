@@ -73,6 +73,8 @@ version = "0.0.0"
 dependencies = [
  "contracts",
  "journal",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -337,10 +339,15 @@ version = "0.0.0"
 dependencies = [
  "book",
  "contracts",
+ "crc32fast",
  "journal",
+ "libc",
+ "postcard",
  "serde",
  "serde_json",
  "tempfile",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

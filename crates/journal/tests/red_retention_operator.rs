@@ -45,12 +45,27 @@ fn cfg() -> WriterConfig {
     }
 }
 
+/// M-38b (architect, разрешение SCOPE VIOLATION 0c/0d): эти оракулы M-08 проверяют
+/// ИНВАРИАНТ ХОЛОДНОЙ КОПИИ (`ColdCopyProof`: удалить можно лишь то, чья копия доказано
+/// читается) — они старше понятия «покрытие чекпоинтом» и НЕ про него.
+///
+/// Поэтому покрытие задаётся ЯВНО как «всё покрыто» (`Some(u64::MAX)`): это сохраняет
+/// исходный смысл M-08 и делает M-38b-гейт заведомо нейтральным для них.
+///
+/// **`..Default::default()` здесь НЕДОПУСТИМ** (был добавлен engine-dev'ом, откачено):
+/// он молча подставил бы `covered = None` (fail-closed), из-за чего оракул M-08 стал бы
+/// проверять НЕ то, что заявлено в его имени, а поведение нового гейта — и «падение
+/// из-за отсутствия покрытия» было бы неотличимо от «prune сломан». Ровно это и
+/// произошло: настоящий дефект (`offload_and_prune` не заполняется НИКОГДА) был принят
+/// за проблему тест-контракта. Safety-конфиг в оракуле указывается полем-в-поле.
 fn policy(cold: &std::path::Path, retain_days: u32, keep_min: u32) -> RetentionPolicy {
     RetentionPolicy {
         retain_days,
         keep_min_segments: keep_min,
         cold_root: cold.to_path_buf(),
         min_free_bytes: 0,
+        checkpoint_covered_through_seq: Some(u64::MAX),
+        allow_prune_without_checkpoint: false,
     }
 }
 
@@ -274,6 +289,10 @@ fn r7_disk_pressure_with_empty_plan_is_flagged() {
         keep_min_segments: 1_000, // всё защищено
         cold_root: cold.path().to_path_buf(),
         min_free_bytes: u64::MAX, // места «не хватает» заведомо
+        // M-38b: явно, а не Default — оракул про disk_pressure, гейт покрытия обязан быть
+        // нейтрален (см. комментарий к `policy()` выше).
+        checkpoint_covered_through_seq: Some(u64::MAX),
+        allow_prune_without_checkpoint: false,
     };
     let plan = journal::retention_plan(dir.path(), &pol, T0 + DAY_MS).expect("plan");
 
