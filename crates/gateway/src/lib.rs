@@ -1886,13 +1886,108 @@ pub mod checkpoint {
     use super::*;
     use std::fs::{self, File};
     use std::io::Write;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
+    #[cfg(unix)]
+    use std::os::unix::io::AsRawFd;
 
     use contracts::SegmentHeader;
 
-    /// Имя файла чекпоинта (единственный в `ckpt_dir`).
-    const CKPT_FILENAME: &str = "ckpt.bin";
+    /// RAII-обёртка над `flock(LOCK_EX)`: `Drop` снимает блокировку. `File` держится
+    /// до конца жизни guard'а — иначе `flock` ОС снимется при закрытии fd (fd
+    /// мог бы переиспользоваться другим потоком под тем же номером).
+    #[cfg(unix)]
+    struct FlockGuard {
+        _file: File,
+        _path: PathBuf,
+    }
 
+    #[cfg(unix)]
+    impl Drop for FlockGuard {
+        fn drop(&mut self) {
+            // Best-effort unlock: повторный fcntl/close всё равно освободит.
+            let fd = self._file.as_raw_fd();
+            // SAFETY: LOCK_UN + закрытие fd — обе безопасны для уже-залоченного fd.
+            unsafe {
+                libc::flock(fd, libc::LOCK_UN);
+            }
+        }
+    }
+
+    /// Имя файла чекпоинта (единственный в `ckpt_dir`). Детерминировано от
+    /// `selector_fingerprint` (RN-23): фиксированное имя при данном селекторе, никаких
+    /// `*.tmp` или алфавитно-первого-файла-рекурсивно. При multi-selector deployment
+    /// каждый селектор получает СВОЁ имя и НЕ может случайно подцепить чужой чекпоинт.
+    const CKPT_FILENAME_PREFIX: &str = "ckpt-";
+    const CKPT_FILENAME_SUFFIX: &str = ".bin";
+    /// Расширение файлов, которые `read_checkpoint` (RN-23) ОБЯЗАН ИГНОРИРОВАТЬ как
+    /// «не мои»: полу-записанный tmp от текущей записи / мусор от предыдущего падения.
+    const TMP_SUFFIX: &str = ".tmp";
+
+    /// Детерминированный (RN-23) ПУТЬ к чекпоинту для данного селектора в `ckpt_dir`.
+    /// `ckpt-<fp_hex16>.bin`, где `fp = selector_fingerprint(sel)`. Имя фиксировано —
+    /// никаких `*.tmp` и никаких «первый файл рекурсивно» (тот подхватывал чужой
+    /// или полу-записанный файл → тихий rebuild в 409 s без сигнала).
+    pub(super) fn ckpt_path_for(ckpt_dir: &Path, sel: &Selector) -> PathBuf {
+        let fp = selector_fingerprint(sel);
+        ckpt_dir.join(format!(
+            "{CKPT_FILENAME_PREFIX}{fp:016x}{CKPT_FILENAME_SUFFIX}"
+        ))
+    }
+
+    /// Уникальное имя tmp-файла: `<final>.tmp.<pid>.<nanos>`. Защищает от
+    /// «оба процесса пишут один файл» (RN-22) даже если flock игнорируется
+    /// платформой — два уровня защиты (in depth).
+    fn unique_tmp_path(final_path: &Path) -> PathBuf {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let pid = std::process::id();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let parent = final_path.parent().unwrap_or_else(|| Path::new("."));
+        let fname = final_path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "ckpt".into());
+        parent.join(format!("{fname}{TMP_SUFFIX}.{pid}.{nanos}"))
+    }
+
+    /// POSIX `flock(LOCK_EX)` на файл-маркер `<ckpt_dir>/zz.lock` (Linux/macOS). Имя
+    /// `zz.lock` выбрано так, чтобы при алфавитной сортировке `zz.lock` ВСЕГДА был
+    /// ПОСЛЕ `ckpt-<fp>.bin` (буква `z` > `c`). Тесты M-38b (`red_checkpoint_is_cache::
+    /// corrupt_and_truncated_checkpoint_rebuild` и др.) используют обёрточный помощник
+    /// `ckpt_file(dir) = walk(dir) |> sort |> first()`, который без выбора имени
+    /// сломался бы на `.lock`-префиксе (ASCII: `.` < `c`). Возвращает RAII-guard: при
+    /// дропе блокировка снимается. На non-unix — заглушка (compose-деплой только на linux).
+    #[cfg(unix)]
+    fn flock_lock_exclusive(ckpt_dir: &Path) -> io::Result<FlockGuard> {
+        fs::create_dir_all(ckpt_dir)?;
+        let lock_path = ckpt_dir.join("zz.lock");
+        let f = File::create(&lock_path)?;
+        // SAFETY: fcntl — FFI, аргументы простые.
+        let fd = f.as_raw_fd();
+        let rc = unsafe { libc::flock(fd, libc::LOCK_EX) };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(FlockGuard {
+            _file: f,
+            _path: lock_path,
+        })
+    }
+
+    /// Первый видимый (отфильтрованный) `first_seq` сегмента, либо `Ok(None)`
+    /// если журнал пуст. Используется для fail-loud-детекта (правило §(1b).3).
+    fn first_visible_seq(dir: &Path, filter: &EpochFilter) -> io::Result<Option<u64>> {
+        let segs = journal::list_segments(dir)?;
+        let mut min_seq: Option<u64> = None;
+        for s in &segs {
+            if filter.accepts(&s.header) {
+                min_seq = Some(min_seq.map_or(s.header.first_seq, |m| m.min(s.header.first_seq)));
+            }
+        }
+        Ok(min_seq)
+    }
     /// M-38b: заголовок чекпоинта — magic + версии + фингерпринты + lineage + cursor.
     /// Сериализуется как первая часть файла ДО postcard(state), чтобы при изменении
     /// формата валидация отказывала БЕЗ попытки десериализации state.
@@ -1995,37 +2090,116 @@ pub mod checkpoint {
     }
 
     /// Снять чекпоинт до `Cursor::LATEST`. Стандартный cron-вызов.
+    ///
+    /// Возвращает ДОСТИГНУТЫЙ курсор (`Cursor::at(last_seq)` или `Cursor::START`, если
+    /// журнал пуст). Бинарь-издатель ОБЯЗАН публиковать именно его как `covered_through_seq`,
+    /// а не CLI-аргумент — иначе гейт retention пускает всё (задача #14, B2).
     pub fn advance(
         dir: impl AsRef<Path>,
         ckpt_dir: impl AsRef<Path>,
         sel: &Selector,
         filter: EpochFilter,
-    ) -> io::Result<()> {
+    ) -> io::Result<Cursor> {
         advance_to(dir, ckpt_dir, sel, filter, Cursor::LATEST)
     }
 
-    /// Снять чекпоинт ДО курсора `upto`. Редусер прогоняет журнал от START до
-    /// `upto.inclusive_max_seq` через `journal::stream` (полный проход для cron —
-    /// чекпоинт снимается периодически; инкрементальность достигается композицией
-    /// `advance_to × N` — см. `red_checkpoint_is_cache::incremental_advance_equals_single_advance`).
+    /// Снять чекпоинт ДО курсора `upto`. Возвращает ДОСТИГНУТЫЙ курсор.
+    ///
+    /// Правила (rev3, §(1b), СВЯЗКА С РЕТЕНШЕНОМ):
+    /// 1. **Резюм от своего чекпоинта**: если валидный чекпоинт есть — загружает его и
+    ///    докармливает ТОЛЬКО событиями `seq > ckpt_cursor.upto_seq` через
+    ///    `journal::stream_from`. Полный проход от START при наличии валидного
+    ///    чекпоинта ЗАПРЕЩЁН — иначе после первого же законного prune покрытого
+    ///    префикса cron перезапишет хороший чекпоинт усечённым.
+    /// 2. **Немонотонность запрещена**: `final_cursor <= upto` ОБЯЗАН. Если
+    ///    `ckpt_cursor.upto_seq > upto.upto_seq` — отказываем (`Err`), никаких регрессий.
+    /// 3. **Fail-loud на усечённом префиксе без чекпоинта**: если валидного чекпоинта
+    ///    нет И первый видимый сегмент `first_seq > 0` — пишем `Err` и НИЧЕГО не пишем
+    ///    на диск. Тихая запись усечённого состояния = молчаливая потеря истории.
+    /// 4. **Нет хвоста для чтения**: если `upto == cursor(журнал, без чекпоинта)` —
+    ///    редьюсер строится от чекпоинта и дополняется ПУСТЫМ хвостом (это штатный
+    ///    кейс cron-cadence между двумя событиями).
     pub fn advance_to(
         dir: impl AsRef<Path>,
         ckpt_dir: impl AsRef<Path>,
         sel: &Selector,
         filter: EpochFilter,
         upto: Cursor,
-    ) -> io::Result<()> {
+    ) -> io::Result<Cursor> {
         validate_selector(sel)?;
         let dir = dir.as_ref();
         let ckpt_dir = ckpt_dir.as_ref();
         fs::create_dir_all(ckpt_dir)?;
 
-        // (1) Редусер от START до upto. Полный проход через `stream` (cron-задача,
-        // допустимая стоимость — лимитируется каденсом 5–15 мин).
-        let stream = journal::stream(dir, filter.clone())?;
-        let mut reducer = Reducer::new(sel);
-        let mut final_cursor = Cursor::START;
-        for event in stream {
+        // Глобальный LOCK на ckpt-каталог (защита от перекрывающихся cron-прогонов):
+        // каденс 5–15 мин, холодный прогон ~12 мин, без лока два процесса возьмут
+        // одно имя tmp и испортят файл (RN-22).
+        #[cfg(unix)]
+        let _flock_guard = flock_lock_exclusive(ckpt_dir).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!(
+                    "checkpoint::advance_to: flock({}) failed: {e}",
+                    ckpt_dir.display()
+                ),
+            )
+        })?;
+        #[cfg(not(unix))]
+        let _flock_guard = ();
+
+        // (1) Резюм или отказ (правило §(1b).1–3). Попытка прочитать существующий
+        // чекпоинт. Любая невалидность (нет файла, битый, lineage не сходится,
+        // schema mismatch) → `None`.
+        let existing = read_checkpoint(dir, ckpt_dir, sel, filter.clone())?;
+
+        // (2) Два сценария:
+        //   A. Чекпоинт ВАЛИДЕН → резюм от `ckpt_cursor`.
+        //      Докорм только `seq > ckpt_cursor.upto_seq` (GW-I-11 сегментный skip).
+        //      Дополнительно проверяем правило немонотонности (п.2):
+        //      `ckpt_cursor.upto_seq <= upto.upto_seq` (иначе Err).
+        //   B. Чекпоинта НЕТ → проверить, не упрунен ли префикс (п.3).
+        //      Берём первый видимый сегмент; `first_seq > 0` ⇒ отказать.
+        //      Иначе редьюсер от START.
+        let (mut reducer, base_cursor): (Reducer, Cursor) = match existing {
+            Some((r, ckpt_cursor)) => {
+                if let (Some(c), Some(u)) = (ckpt_cursor.upto_seq, upto.upto_seq) {
+                    if c > u {
+                        return Err(io::Error::other(format!(
+                            "checkpoint::advance_to: чекпоинт уже покрывает seq={c}, \
+                             запрошено сжатие к seq={u} — регрессия покрытия \
+                             запрещена (правило немонотонности §(1b).2)"
+                        )));
+                    }
+                }
+                (r, ckpt_cursor)
+            }
+            None => {
+                // Fail-loud: история усечена, а чекпоинта нет.
+                let first_visible_seq = first_visible_seq(dir, &filter).ok().flatten();
+                if let Some(first) = first_visible_seq {
+                    if first > 0 {
+                        return Err(io::Error::other(format!(
+                            "checkpoint::advance_to: нет валидного чекпоинта в {}, \
+                             но первый видимый сегмент имеет first_seq={} > 0 \
+                             (префикс уже спрунен). Восстановить полное состояние физически \
+                             нечем — пишем усечённый чекпоинт, в кокпите едет all-time VWAP, \
+                             откатиться нечем. ОСТАНОВИТЕСЬ и поднимите чекпоинт вне \
+                             retention'а (cold storage + ручной rebuild по нему).",
+                            ckpt_dir.display(),
+                            first
+                        )));
+                    }
+                }
+                (Reducer::new(sel), Cursor::START)
+            }
+        };
+
+        // (3) Докорм хвостом: только `seq > base_cursor.upto_seq` (A) или всё (B).
+        // Используем `stream_from` (GW-I-11 сегментный skip — НЕ читаем уже
+        // покрытый префикс).
+        let mut final_cursor = base_cursor;
+        let mut stream = journal::stream_from(dir, filter.clone(), base_cursor.upto_seq)?;
+        for event in &mut stream {
             let event = event?;
             if !upto.includes(event.seq) {
                 break;
@@ -2034,9 +2208,8 @@ pub mod checkpoint {
             final_cursor = Cursor::at(event.seq);
         }
 
-        // (2) Lineage: собираем заголовки всех сегментов журнала (отфильтрованные).
-        // Lineage хранит МАНИФЕСТ покрытого префикса — при валидации мы сравниваем с
-        // ТЕКУЩИМИ заголовками суффикс-совместимо.
+        // (4) Lineage: собираем заголовки ТЕКУЩИХ видимых сегментов. Раньше мы
+        // делали то же — этот блок поведенчески не изменился.
         let all_segs = journal::list_segments(dir)?;
         let mut lineage: Vec<SegmentHeader> = Vec::with_capacity(all_segs.len());
         for s in &all_segs {
@@ -2046,7 +2219,7 @@ pub mod checkpoint {
         }
         lineage.sort_by_key(|h| h.first_seq);
 
-        // (3) Сформировать заголовок + сериализованное состояние.
+        // (5) Сформировать заголовок + сериализованное состояние.
         let header = CkptHeader::new(
             selector_fingerprint(sel),
             epoch_filter_fingerprint(&filter),
@@ -2060,87 +2233,60 @@ pub mod checkpoint {
             io::Error::new(io::ErrorKind::InvalidData, format!("postcard header: {e}"))
         })?;
 
-        // (4) Atomic write: tmp + rename.
-        let final_path = ckpt_dir.join(CKPT_FILENAME);
-        let tmp_path = ckpt_dir.join(format!("{CKPT_FILENAME}.tmp"));
-        let mut f = File::create(&tmp_path)?;
-        // Layout: [magic(8)][ckpt_schema_v(4)][gateway_schema_v(4)][header_len(4)][header_postcard][state_len(4)][state_postcard][CRC32(4)]
-        // CRC покрывает `header_postcard || state_postcard` (без magic/версий).
-        f.write_all(&CKPT_MAGIC)?;
-        f.write_all(&CKPT_SCHEMA_VERSION.to_le_bytes())?;
-        f.write_all(&GATEWAY_SCHEMA_VERSION.to_le_bytes())?;
-        f.write_all(&(header_bytes.len() as u32).to_le_bytes())?;
-        f.write_all(&header_bytes)?;
-        f.write_all(&(state_bytes.len() as u32).to_le_bytes())?;
-        f.write_all(&state_bytes)?;
-        // CRC32 over header_postcard || state_postcard.
-        let mut crc_hasher = crc32fast::Hasher::new();
-        crc_hasher.update(&header_bytes);
-        crc_hasher.update(&state_bytes);
-        f.write_all(&crc_hasher.finalize().to_le_bytes())?;
-        f.flush()?;
-        f.sync_data()?;
-        drop(f);
+        // (6) Atomic write: tmp + rename. Имя tmp УНИКАЛЬНО (pid + nanos),
+        // чтобы при перекрытии cron-прогонов (RN-22) НЕ было «оба пишут в один файл»
+        // — даже если flock пропущен (защита в глубину).
+        let final_path = ckpt_path_for(ckpt_dir, sel);
+        let tmp_path = unique_tmp_path(&final_path);
+        {
+            let mut f = File::create(&tmp_path)?;
+            // Layout: [magic(8)][ckpt_schema_v(4)][gateway_schema_v(4)][header_len(4)][header_postcard][state_len(4)][state_postcard][CRC32(4)]
+            // CRC покрывает `header_postcard || state_postcard` (без magic/версий).
+            f.write_all(&CKPT_MAGIC)?;
+            f.write_all(&CKPT_SCHEMA_VERSION.to_le_bytes())?;
+            f.write_all(&GATEWAY_SCHEMA_VERSION.to_le_bytes())?;
+            f.write_all(&(header_bytes.len() as u32).to_le_bytes())?;
+            f.write_all(&header_bytes)?;
+            f.write_all(&(state_bytes.len() as u32).to_le_bytes())?;
+            f.write_all(&state_bytes)?;
+            // CRC32 over header_postcard || state_postcard.
+            let mut crc_hasher = crc32fast::Hasher::new();
+            crc_hasher.update(&header_bytes);
+            crc_hasher.update(&state_bytes);
+            f.write_all(&crc_hasher.finalize().to_le_bytes())?;
+            f.flush()?;
+            f.sync_data()?;
+        }
+        // rename tmp → final. Если `final_path` уже существует — `rename`
+        // атомарно заменит (POSIX гарантирует атомарность для одной ФС).
         fs::rename(&tmp_path, &final_path)?;
-        Ok(())
+        Ok(final_cursor)
     }
 
     /// Прочитать чекпоинт из каталога, валидировать header/CRC/lineage.
     /// Возвращает `Some((reducer, cursor))` если валиден, `None` если отсутствует/битый
-    /// (silent rebuild). Любая ошибка → `None` (НЕ пробрасывается наружу: кокпит не
-    /// должен различать «кэша не было» и «кэш битый»).
+    /// (silent rebuild).
+    ///
+    /// RN-23: имя файла ДЕТЕРМИНИРОВАНО от `selector_fingerprint` (`ckpt-<fp>.bin`).
+    /// НИКАКОГО «первый файл рекурсивно» — алфавитно-первый подхватил бы `*.tmp`
+    /// (полу-записанный) или чужой чекпоинт при multi-selector deployment, оба давали
+    /// тихий rebuild 409 s без сигнала. Если файл отсутствует — `None`, штатный
+    /// silent rebuild downstream'ом.
     pub(super) fn read_checkpoint(
         dir: &Path,
         ckpt_dir: &Path,
         sel: &Selector,
         filter: EpochFilter,
     ) -> io::Result<Option<(Reducer, Cursor)>> {
-        let ckpt_path = ckpt_dir.join(CKPT_FILENAME);
+        let ckpt_path = ckpt_path_for(ckpt_dir, sel);
         if !ckpt_path.exists() {
-            // Допускаем и другие имена (один файл рекурсивно) — fallback для compose,
-            // который раскладывает по подкаталогам.
-            return find_and_read_checkpoint(dir, ckpt_dir, sel, filter);
+            return Ok(None); // отсутствует — silent rebuild; никакой рекурсии
         }
         let bytes = match fs::read(&ckpt_path) {
             Ok(b) => b,
             Err(_) => return Ok(None), // silent rebuild
         };
         Ok(read_and_validate(&bytes, dir, sel, filter))
-    }
-
-    /// Если `ckpt.bin` нет — попробовать найти единственный файл рекурсивно
-    /// (для compose, где чекпоинтер раскладывает по selector_fingerprint/ckpt.bin).
-    fn find_and_read_checkpoint(
-        dir: &Path,
-        ckpt_dir: &Path,
-        sel: &Selector,
-        filter: EpochFilter,
-    ) -> io::Result<Option<(Reducer, Cursor)>> {
-        fn walk(d: &Path, out: &mut Vec<std::path::PathBuf>) {
-            if let Ok(rd) = fs::read_dir(d) {
-                for e in rd.flatten() {
-                    let p = e.path();
-                    if p.is_dir() {
-                        walk(&p, out);
-                    } else {
-                        out.push(p);
-                    }
-                }
-            }
-        }
-        let mut files = Vec::new();
-        walk(ckpt_dir, &mut files);
-        files.sort();
-        match files.first() {
-            Some(path) => {
-                let bytes = match fs::read(path) {
-                    Ok(b) => b,
-                    Err(_) => return Ok(None),
-                };
-                Ok(read_and_validate(&bytes, dir, sel, filter))
-            }
-            None => Ok(None), // пустой каталог — silent rebuild
-        }
     }
 
     fn read_and_validate(

@@ -25,6 +25,11 @@ crc32fast = "1"
 # M-38b (gateway-checkpoint bin): tracing-subscriber для init_tracing (RUST_LOG).
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# M-38b (RN-22): `flock` на ckpt-каталог для защиты от перекрывающихся cron-прогонов
+# (5-15 мин каденс, холодный прогон ~12 мин). Используется только из `checkpoint::advance`
+# через `libc::flock(LOCK_EX)` (POSIX, Linux/macOS). Windows-семантика не требуется
+# (compose-деплой только на linux). Зеркалит `journal` (тоже использует `libc::statvfs`).
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

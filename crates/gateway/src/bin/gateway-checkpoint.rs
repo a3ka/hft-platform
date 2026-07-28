@@ -21,7 +21,11 @@
 //! | `--timeframe-ms <i64>` | таймфрейм, должен делить 86_400_000 (GW-I-10) | `1000` |
 //! | `--bands <f64,f64,...>` | depth-полосы (×1, напр. `0.001,0.005`) | `0.001` |
 //! | `--window-ms <i64>` | bounded-window (M-37); `0` = offline unbounded | `60000` |
-//! | `--cursor <i64>` | курсор для advance_to (None = LATEST) | `LATEST` |
+//! | `--cursor <LATEST\|i64>` | курсор для advance_to. `LATEST` = до конца журнала | `LATEST` |
+//!
+//! Обе формы `--flag value` И `--flag=value` принимаются наравне: compose пишет
+//! `--flag=value`, cron-обёртка может писать через пробел. Соседний `journal-retention`
+//! уже так работает; здесь — единый контракт.
 //!
 //! ## Exit-коды
 //!
@@ -81,7 +85,21 @@ fn parse_args() -> Result<Args, String> {
     let mut window_ms: Option<i64> = None;
     let mut cursor: Option<Cursor> = None;
 
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    // B1 (M-38b rev4): нормализовать argv ПЕРЕД разбором. `--flag=value` (equals-форма —
+    // ровно то, что лежит в `docker-compose.yml command:`) раскладываем в два отдельных
+    // элемента `--flag` + `value`. Раздельная форма (как в cron-скрипте) проходит через
+    // `vec![a]` без изменений. Тот же подход, что у `journal-retention`.
+    let args: Vec<String> = std::env::args()
+        .skip(1)
+        .flat_map(|a| {
+            if a.starts_with("--") {
+                if let Some((k, v)) = a.split_once('=') {
+                    return vec![k.to_string(), v.to_string()];
+                }
+            }
+            vec![a]
+        })
+        .collect();
     let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
@@ -112,11 +130,12 @@ fn parse_args() -> Result<Args, String> {
                 );
             }
             "--cursor" => {
+                // B1 (rev4): `--cursor LATEST` — прод-дефолт в `docker-compose.yml`.
+                // Раньше парсер звал `parse::<u64>()` и рейзил `invalid digit found in string`
+                // (замер architect'а: `--cursor LATEST` exit=1). Также принимаем числовой
+                // вариант для `--cursor <i64>` — операторские инкрементальные снапшоты.
                 let s = next()?;
-                let seq = s.parse::<u64>().map_err(|e| format!("--cursor: {e}"))?;
-                cursor = Some(Cursor {
-                    upto_seq: Some(seq),
-                });
+                cursor = Some(parse_cursor_value(s, "--cursor")?);
             }
             "-h" | "--help" => {
                 print_help();
@@ -160,6 +179,20 @@ fn parse_args() -> Result<Args, String> {
     })
 }
 
+/// Разбор значения `--cursor`. Принимает `LATEST` (= до конца журнала) ИЛИ `u64`.
+/// `LATEST` — прод-дефолт в compose; числовое значение — операторский инкрементальный
+/// прогон в cron-обёртке.
+fn parse_cursor_value(s: &str, flag: &str) -> Result<Cursor, String> {
+    if s.eq_ignore_ascii_case("LATEST") {
+        Ok(Cursor::LATEST)
+    } else {
+        let seq = s
+            .parse::<u64>()
+            .map_err(|e| format!("{flag}: {e} (ожидается `LATEST` или u64)"))?;
+        Ok(Cursor { upto_seq: Some(seq) })
+    }
+}
+
 fn print_help() {
     println!(
         "gateway-checkpoint — операторский снимок чекпоинта редьюсера (M-38b)\n\
@@ -167,8 +200,9 @@ fn print_help() {
          Использование:\n  \
            gateway-checkpoint [--dir DIR] [--ckpt-dir DIR] [--coverage-out PATH]\n  \
                               [--venue VENUE] [--symbol STR] [--timeframe-ms N]\n  \
-                              [--bands f,f,...] [--window-ms N] [--cursor N]\n\
+                              [--bands f,f,...] [--window-ms N] [--cursor LATEST|N]\n\
          \n\
+         Обе формы `--flag value` и `--flag=value` принимаются.\n\
          Дефолты: --dir=./journal-data --ckpt-dir=./gateway-ckpt\n  \
                   --coverage-out=./gateway-ckpt/covered_through_seq\n  \
                   --venue=Binance --symbol=BTCUSDT --timeframe-ms=1000\n  \
@@ -218,32 +252,49 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     }
 
-    // Снять чекпоинт через `checkpoint::advance_to`. Любой I/O / GW-I-9 сбой →
-    // ExitCode 1 (оператор узнает). Артефакт покрытия пишем ТОЛЬКО при успехе
-    // (см. safety note в шапке файла).
-    if let Err(e) = checkpoint::advance_to(
+    // B2 (M-38b rev4): `checkpoint::advance_to` теперь возвращает ДОСТИГНУТЫЙ `Cursor`.
+    // Публикуем именно его как `covered_through_seq`. CLI-аргумент (особенно `--cursor LATEST`
+    // → `Cursor::LATEST` → `upto_seq = None`) НЕ используется для артефакта.
+    //
+    // До фикса публикация была `args.cursor.upto_seq.unwrap_or(u64::MAX)`. При
+    // `--cursor=LATEST` (прод-дефолт) в артефакт уходил `u64::MAX`, и гейт retention
+    // `last_seq(seg) <= covered` пропускал ВСЁ. Строгая связка C-030 R1 становилась
+    // no-op, причём МОЛЧА (`pruned_without_checkpoint_coverage` заполнялся только по
+    // ветке override). Инверсия всех трёх условий C-031, на которых принят escape-hatch.
+    let achieved_cursor = match checkpoint::advance_to(
         &args.dir,
         &args.ckpt_dir,
         &selector,
         EpochFilter::OwnCaptureOnly,
         args.cursor,
     ) {
-        eprintln!(
-            "gateway-checkpoint: advance_to failed dir={} ckpt={} err={e}",
-            args.dir.display(),
-            args.ckpt_dir.display()
-        );
-        return ExitCode::from(1);
-    }
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "gateway-checkpoint: advance_to failed dir={} ckpt={} err={e}",
+                args.dir.display(),
+                args.ckpt_dir.display()
+            );
+            return ExitCode::from(1);
+        }
+    };
+    let covered_through_seq = match achieved_cursor.upto_seq {
+        Some(s) => s,
+        None => {
+            // Курсор `Cursor::START` после advance. Журнал был пуст ИЛИ все события
+            // упрунены ДО видимой части. Публикуем «0» как явное «ничего не свёрнуто»:
+            // гейт retention тогда откажется прунить вообще ничего (fail-closed).
+            // Раньше здесь стоял `u64::MAX` (B2), что делало строгую связку no-op.
+            eprintln!(
+                "gateway-checkpoint: advance_to вернул пустой курсор (журнал пуст или префикс \
+                 уже спрунен); публикую `covered=0` (fail-closed): retention не прунит ничего"
+            );
+            0
+        }
+    };
 
-    // M-38b (C-030 R1, rev2 NOTE): артефакт покрытия `covered_through_seq`.
-    // Значение = `cursor.upto_seq` (то, что свёрнуто). Multi-selector deployment
-    // пишет минимум по всем селекторам в один файл (формат — число в ASCII).
-    // MVP пишет для ОДНОГО селектора; multi-selector — TODO для прод-расширения
-    // (через деплой с N инстансами gateway-checkpoint на разные селекторы и
-    // ops-скрипт берёт min по всем файлам).
-    let covered_through_seq = args.cursor.upto_seq.unwrap_or(u64::MAX);
-    // LATEST = всё свёрнуто. Прод-конвенция: MAX означает «до конца».
+    // Пишем артефакт покрытия только при успешном advance. Multi-selector deployment —
+    // через деплой N инстансов на разные селекторы и ops-скрипт берёт min.
     if let Err(e) = write_coverage_artifact(&args.coverage_out, covered_through_seq) {
         eprintln!(
             "gateway-checkpoint: не удалось записать артефакт покрытия {}: {e}",
@@ -253,22 +304,33 @@ fn main() -> ExitCode {
     }
 
     eprintln!(
-        "gateway-checkpoint: ok dir={} ckpt={} cursor={:?} covered={} out={}",
+        "gateway-checkpoint: ok dir={} ckpt={} requested_cursor={:?} achieved_cursor={:?} \
+         covered={} out={}",
         args.dir.display(),
         args.ckpt_dir.display(),
         args.cursor,
+        achieved_cursor,
         covered_through_seq,
         args.coverage_out.display()
     );
     ExitCode::SUCCESS
 }
 
-/// Atomic write (tmp + rename): защищает от полу-записанного артефакта покрытия.
+/// Atomic write (tmp + rename) с УНИКАЛЬНЫМ именем tmp: защищает от полу-записанного
+/// артефакта покрытия и от гонки двух writers на одном `tmp` (RN-22 in depth).
 fn write_coverage_artifact(path: &std::path::Path, seq: u64) -> std::io::Result<()> {
+    use std::time::{SystemTime, UNIX_EPOCH};
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension("tmp");
+    let pid = std::process::id();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut tmp = path.to_path_buf();
+    let new_ext = format!("tmp.{pid}.{nanos}");
+    tmp.set_extension(&new_ext);
     std::fs::write(&tmp, seq.to_string())?;
     std::fs::rename(&tmp, path)?;
     Ok(())
