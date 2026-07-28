@@ -229,7 +229,7 @@ GW-I-10 занят M-47 (выравнивание timeframe). Нумерацию
 
 | # | Status | Задача | Агент | Acceptance |
 |---|---|---|---|---|
-| 0 | ⏳ OPEN | **Bootstrap-проверка `i128` в postcard** (roundtrip `VwapAcc{sum_pv,sum_v}` и `vp.bins`). Не поддержан → пара `(hi i64, lo u64)` + запись в milestone | engine-dev | Отчёт в коммите; `red_checkpoint_roundtrip` компилируется |
+| 0 | ✅ DONE | **Bootstrap-проверка `i128` в postcard** (roundtrip `VwapAcc{sum_pv,sum_v}` и `vp.bins`). Не поддержан → пара `(hi i64, lo u64)` + запись в milestone | engine-dev | i128 поддержан нативно (roundtrip OK, 7 bytes для bins-test), fallback-пара не нужна |
 | 1 | ⏳ OPEN | `#[derive(Serialize, Deserialize)]` на `book::OrderBook` (все 4 приватных поля) + serde в `crates/book/Cargo.toml`. Больше НИЧЕГО в книге | engine-dev | `cargo test -p book` зелён; поля не стали pub |
 | 2 | ⏳ OPEN | `derive` на `Reducer` + всех вложенных (`OhlcvAcc`/`CvdSession`/`VwapAcc`/`DepthAcc`/`VolumeProfileAcc`/`HeatmapBucketState`) + `CkptHeader` (magic/версии/фингерпринты/lineage/cursor) + CRC | engine-dev | `red_checkpoint_roundtrip` GREEN |
 | 3 | ⏳ OPEN | `checkpoint::advance(journal_dir, ckpt_dir, sel, filter)` — atomic tmp+rename + flock; идемпотентность | engine-dev | `red_checkpoint_is_cache::advance_idempotent` GREEN |
