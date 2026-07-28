@@ -542,3 +542,113 @@ fn advance_after_covered_prune_does_not_regress_history_start() {
         "чекпоинт помнит историю с нуля ⇒ truncated остаётся false, несмотря на prune префикса"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 6. C-033 R2 — НЕМОНОТОННОСТЬ ПО КУРСОРУ: advance_to(меньший) не откатывает чекпоинт
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// **СТАТУС ЧЕСТНО: это ЗЕЛЁНЫЙ регресс-пин, а не RED.** Прогнан отдельно против текущего кода
+/// (обходя compile-RED остального файла) — `2 passed`. Значит гвард монотонности УЖЕ реализован
+/// dev'ом в M-38b (D2 из C-030 rev3), и ценность этих двух тестов не в том, чтобы его добавить,
+/// а в том, чтобы его НЕЛЬЗЯ БЫЛО СНЯТЬ при сужении fail-loud в M-48 — ровно то, на что указал
+/// критик в C-033 R2. Анти-плацебо здесь рассуждением, а не замером: при удалении гварда
+/// `advance_to(low)` пересобрал бы состояние и переписал файл ⇒ байты изменились бы ⇒ падение;
+/// а заглушка «после первой записи не писать никогда» валится парным тестом ниже.
+///
+/// Критик показал дыру в rev2: `advance_after_covered_prune_does_not_regress_history_start`
+/// давит только на НАЧАЛО истории. Гвард немонотонности можно удалить целиком, и все прежние
+/// оракулы M-48 останутся зелёными, потому что ни один не вызывает `advance_to` с курсором
+/// МЕНЬШЕ уже записанного.
+///
+/// Сценарий реален для ops: cron-обёртка запускается с `--cursor=LATEST`, а оператор рядом
+/// гоняет усечённый прогон `--cursor <seq>` для диагностики (эта форма прямо предусмотрена
+/// комментарием в `docker-compose.yml`). Если второй вызов перезапишет чекпоинт более ранним
+/// состоянием, кокпит после следующего подключения молча откатится назад по времени, а
+/// `covered_through_seq` уедет вниз — и retention, наоборот, перестанет прунить (или, при
+/// обратном порядке, спрунит то, что уже не покрыто).
+#[test]
+fn advance_to_lower_cursor_does_not_regress_checkpoint() {
+    let dir = intact_journal();
+    let ckpt = tempfile::tempdir().expect("ckpt");
+
+    let high = Cursor {
+        upto_seq: Some(N - 1),
+    };
+    let low = Cursor {
+        upto_seq: Some(N / 3),
+    };
+
+    gateway::checkpoint::advance_to(
+        dir.path(),
+        ckpt.path(),
+        &sel(),
+        EpochFilter::OwnCaptureOnly,
+        high,
+    )
+    .expect("advance_to(high) обязан пройти");
+    let after_high = ckpt_dir_fingerprint(ckpt.path());
+    assert!(
+        !after_high.is_empty(),
+        "предусловие: чекпоинт записан на высоком курсоре"
+    );
+
+    // Откат назад: разрешено вернуть Ok(no-op) или Err — но НЕ переписать состоянием с меньшим
+    // покрытием. Проверяем ИМЕННО байты на диске, а не код возврата.
+    let _ = gateway::checkpoint::advance_to(
+        dir.path(),
+        ckpt.path(),
+        &sel(),
+        EpochFilter::OwnCaptureOnly,
+        low,
+    );
+    assert_eq!(
+        ckpt_dir_fingerprint(ckpt.path()),
+        after_high,
+        "РЕГРЕССИЯ ПО КУРСОРУ: advance_to({:?}) перезаписал чекпоинт, снятый на {:?}. \
+         Монотонность покрытия — та самая защита D2 (C-030 rev3), которую сужение fail-loud \
+         в M-48 не имело права снять: после отката кокпит молча уезжает назад во времени, а \
+         covered_through_seq опускается ниже уже опубликованного (retention принимает решения \
+         по устаревшему рубежу).",
+        low.upto_seq,
+        high.upto_seq
+    );
+}
+
+/// ПАРНЫЙ vantage (п.7): гвард не переширок — движение ВПЕРЁД обязано обновлять чекпоинт.
+/// Заглушка «после первой записи не писать никогда» проходит тест выше и падает здесь.
+#[test]
+fn advance_to_higher_cursor_does_update_checkpoint() {
+    let dir = intact_journal();
+    let ckpt = tempfile::tempdir().expect("ckpt");
+
+    gateway::checkpoint::advance_to(
+        dir.path(),
+        ckpt.path(),
+        &sel(),
+        EpochFilter::OwnCaptureOnly,
+        Cursor {
+            upto_seq: Some(N / 3),
+        },
+    )
+    .expect("advance_to(low)");
+    let after_low = ckpt_dir_fingerprint(ckpt.path());
+
+    gateway::checkpoint::advance_to(
+        dir.path(),
+        ckpt.path(),
+        &sel(),
+        EpochFilter::OwnCaptureOnly,
+        Cursor {
+            upto_seq: Some(N - 1),
+        },
+    )
+    .expect("advance_to(high) поверх низкого");
+
+    assert_ne!(
+        ckpt_dir_fingerprint(ckpt.path()),
+        after_low,
+        "движение ВПЕРЁД обязано обновлять чекпоинт — иначе гвард монотонности выродился в \
+         «после первой записи не пишем никогда», и чекпоинт навсегда застрял бы на первом \
+         прогоне cron'а (латентность TD-044 не вылечена)"
+    );
+}
