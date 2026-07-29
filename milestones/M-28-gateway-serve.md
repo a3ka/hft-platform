@@ -1,6 +1,10 @@
 # M-28 — gateway-serve — WS-транспорт кокпита (snapshot+push+replay, stateless JWT-auth)
 
-STATUS: **PROPOSED** (2026-07-23, architect). Пивот P-COCKPIT, транспорт market-плоскости (D1/D6).
+STATUS: ✅ **CLOSED** 2026-07-29 — код смержен `40b8113`, §8 закрыт через M-48.
+Держался дольше всех: §8 блокировался цепочкой TD-038 (торн-crc в legacy) → TD-039 (OOM) →
+**TD-044 (латентность первого снапшота)**. Разблокирован **M-48** (merge `0215b34`, reviewer APPROVED, бухгалтерия `b85f1ce`): §8 закрыт ЗАМЕРОМ на VPS — E2E JWT→Snapshot **1.056 s** против 382.657 s на M-38b (baseline TD-044: 409.74 s), чекпоинт на проде создан впервые (`covered_through_seq=118434344`), провенанс подтверждён ДЕКОДОМ снапшота (`schema_version=8`, `history_start_seq=16049334`, `history_truncated=true`). **TD-044 и TD-048 — CLOSED.**
+
+Исходный статус: PROPOSED (2026-07-23, architect). Пивот P-COCKPIT, транспорт market-плоскости (D1/D6).
 **Новый крейт `crates/gateway-serve`** ⇒ **critic ОБЯЗАТЕЛЕН** (`gates.md` §1.4). **Supersedes**
 `milestones/M-22-read-gateway.md` §Design «Транспортная оболочка» + task #6: транспорт вынесен из M-22
 (там был опциональной оболочкой) в отдельный milestone со своим §8 (деплой на VPS).

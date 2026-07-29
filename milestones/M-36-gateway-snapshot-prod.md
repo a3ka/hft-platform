@@ -1,6 +1,7 @@
 # M-36 — gateway snapshot на проде: legacy purge + VWAP all-time
 
-**Статус:** PROPOSED
+**Статус:** ✅ **CLOSED** 2026-07-29 — код смержен `65519ae`, §8 ops-purge выполнен тогда же,
+§8 E2E закрыт через M-48. Разблокирован **M-48** (merge `0215b34`, reviewer APPROVED, бухгалтерия `b85f1ce`): §8 закрыт ЗАМЕРОМ на VPS — E2E JWT→Snapshot **1.056 s** против 382.657 s на M-38b (baseline TD-044: 409.74 s), чекпоинт на проде создан впервые (`covered_through_seq=118434344`), провенанс подтверждён ДЕКОДОМ снапшота (`schema_version=8`, `history_start_seq=16049334`, `history_truncated=true`). **TD-044 и TD-048 — CLOSED.**
 **Разблокирует:** M-28 (§8 gateway-serve E2E на проде — сейчас NOT GREEN из-за TD-038)
 **Тип:** bugfix (TD-038) + семантическая смена (VWAP) + прод-ops
 **Ветка:** `feat/M-36-gateway-snapshot-prod`
