@@ -1143,6 +1143,27 @@ pub(crate) fn latest_segment_index(dir: &Path) -> io::Result<Option<u32>> {
 
 /// Хвостовой скан КОНКРЕТНОГО сегмента (используется при `open_with` для next_seq).
 pub(crate) fn tail_last_seq_of(path: &Path) -> io::Result<Option<u64>> {
+    let is_zst = path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .is_some_and(is_compacted_name);
+    if is_zst {
+        let f = match File::open(path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let mut decoder = open_compacted_reader(f)?;
+        if skip_v2_header_forward(&mut decoder).is_err() {
+            return Ok(None);
+        }
+        let mut last_seq = None;
+        while let Some(event) = read_event_frame(&mut decoder)? {
+            last_seq = Some(event.seq);
+        }
+        return Ok(last_seq);
+    }
+
     let mut file = match File::open(path) {
         Ok(f) => f,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -1224,12 +1245,11 @@ pub(crate) fn tail_last_seq_of(path: &Path) -> io::Result<Option<u64>> {
 /// Определить next_seq для `open_with`: max(последний seq в активном сегменте + 1,
 /// `journal.meta`). Если активного сегмента нет — начинаем с meta.
 pub(crate) fn resolve_next_seq_with(dir: &Path, meta_path: &Path) -> io::Result<u64> {
-    let latest = latest_segment_index(dir)?;
+    let latest = latest_segment(dir)?;
     let meta_seq = read_meta(meta_path)?;
     match latest {
         None => Ok(meta_seq),
-        Some(idx) => {
-            let path = segment_path(dir, idx);
+        Some((_idx, path)) => {
             let seg_last = tail_last_seq_of(&path)?.map(|s| s + 1).unwrap_or(0);
             Ok(meta_seq.max(seg_last))
         }
