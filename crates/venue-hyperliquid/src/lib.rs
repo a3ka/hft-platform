@@ -189,7 +189,9 @@ fn parse_l2book(data: &serde_json::Value) -> Option<EventKind> {
     let levels = data.get("levels")?.as_array()?;
     let bids = parse_level_objects(levels.first()?)?;
     let asks = parse_level_objects(levels.get(1)?)?;
-    let ts_exch_ms = data.get("time").and_then(|v| v.as_i64()).unwrap_or(0);
+    // VN-I-7: `time` отсутствует/не число -> дроп ВСЕГО сообщения, не фабрикация ts=0
+    // (событие с ts=0 отравляет возрастной фильтр ретеншена — выглядит «старше всех»).
+    let ts_exch_ms = data.get("time")?.as_i64()?;
 
     Some(EventKind::md(
         Venue::Hyperliquid,
