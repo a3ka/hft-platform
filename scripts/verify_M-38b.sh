@@ -102,12 +102,20 @@ step "канарейка — прод НЕ включает allow-prune-without-
 chk bash -c "! grep -q 'allow-prune-without-checkpoint' <(sed -n '/^  journal-retention:/,/^  [a-z]/p' docker-compose.yml)"
 chk bash -c "sed 's://.*::' crates/journal/src/bin/journal-retention.rs | grep -q 'allow-prune-without-checkpoint'"
 
-step "канарейка — ckpt_schema_version объявлен, GATEWAY_SCHEMA_VERSION не сдвинут"
+# C-033 R1: здесь стоял жёсткий пин `GATEWAY_SCHEMA_VERSION: u32 = 7;`. Его НАМЕРЕНИЕ было
+# milestone-областным — «M-38b не трогает контракт провода» — и оно своё отработало. Но пин
+# пережил свой milestone и стал блокировать законный bump 7→8 в M-48: dev не смог бы поднять
+# версию, не правя чужой verify-скрипт. Это ТРЕТЬЕ повторение одного класса (оракул/канарейка,
+# прибитые к конкретной версии, превращаются в блокер контракта).
+# Оставлен ДОЛГОВЕЧНЫЙ инвариант: версия формата чекпоинта объявлена ОТДЕЛЬНО от версии провода
+# (чекпоинт — внутренний кэш T3, эволюционирует независимо). Пиннинг самой версии провода —
+# зона версионно-агностичного оракула `red_gateway_schema_version` (шаг ниже).
+step "канарейка — ckpt_schema_version объявлен ОТДЕЛЬНО от GATEWAY_SCHEMA_VERSION"
 chk bash -c "sed 's://.*::' crates/gateway/src/*.rs | grep -qE 'ckpt_schema_version|CKPT_SCHEMA_VERSION'"
-chk bash -c "grep -qE 'GATEWAY_SCHEMA_VERSION: u32 = 7;' crates/gateway/src/lib.rs"
+chk bash -c "sed 's://.*::' crates/gateway/src/lib.rs | grep -q 'GATEWAY_SCHEMA_VERSION'"
 
-step "регрессия — форма провода v7 и session-семантика M-38a не сдвинуты"
-chk cargo test -p gateway --test red_gateway_schema_v7 --quiet
+step "регрессия — форма провода и session-семантика M-38a не сдвинуты"
+chk cargo test -p gateway --test red_gateway_schema_version --quiet
 chk cargo test -p gateway --test red_gateway_cvd_session --quiet
 chk cargo test -p gateway --test red_gateway_window --quiet
 chk cargo test -p gateway --test red_gateway_live_eq_replay --quiet

@@ -31,6 +31,15 @@ JOURNAL_COLD_DIR="${JOURNAL_COLD_DIR:-/mnt/journal-cold}"
 RETENTION_RETAIN_DAYS="${RETENTION_RETAIN_DAYS:-14}"
 RETENTION_KEEP_MIN="${RETENTION_KEEP_MIN:-4}"
 RETENTION_MIN_FREE_GB="${RETENTION_MIN_FREE_GB:-10}"
+# M-48 (TD-048, GW-I-12): путь к артефакту `covered_through_seq`, КУДА пишет
+# `gateway-checkpoint` (`--coverage-out`). Передаём в retention через
+# `--checkpoint-coverage=<путь>` — иначе override выключен ⇒ retention молча
+# уходит в `offload_only` ⇒ prune не происходит НИКОГДА (fail-closed no-op,
+# TD-020 на третьем витке). ДОЛЖЕН СОВПАДАТЬ с путём, который пишет
+# `gateway-checkpoint-cron.sh` (--coverage-out). КОМПОЗИЦИЯ этих двух строк —
+# настоящий инвариант цепочки (testing.md п.6); проверяется канарейкой
+# `verify_M-48.sh` «КОМПОЗИЦИЯ — обёртки согласованы по пути артефакта».
+RETENTION_CHECKPOINT_COVERAGE="${RETENTION_CHECKPOINT_COVERAGE:-/ckpt/covered_through_seq}"
 # DryRun — дефолт и здесь тоже (конструктивный барьер против «случайно удалил»).
 # Apply включается ОСОЗНАННО и только после сверки холодной копии — см. deploy/README.md.
 RETENTION_MODE="${RETENTION_MODE:-dry-run}"
@@ -53,8 +62,13 @@ alert() { # exit≠0 обязан быть ВИДЕН: молчащая убор
   echo "ALERT ${msg}" >&2
 }
 
-# Argv — РАЗДЕЛЬНОЙ формой (см. шапку). Единственное место, где он определён: и прод, и гейт
-# берут его отсюда, поэтому разъехаться они не могут.
+# Argv — РАЗДЕЛЬНОЙ формой (см. шапку). ИСКЛЮЧЕНИЕ: `--checkpoint-coverage` — в
+# EQUALS-форме (`--checkpoint-coverage=<путь>`), чтобы verify_M-48 канарейка
+# КОМПОЗИЦИИ могла его распарсить regex'ом (`sed -n 's/^--checkpoint-coverage=//p'`)
+# и сравнить с `--coverage-out` чекпоинтера. Если бы был в раздельной форме,
+# regex не нашёл бы `=` — ровно тот класс «false negative в проверке
+# композиции», который milestone запрещает (C-032 R4). Парсер
+# `journal-retention` принимает обе формы.
 ARGV=(
   --dir "${RETENTION_JOURNAL_DIR}"
   --cold "${JOURNAL_COLD_DIR}"
@@ -62,12 +76,19 @@ ARGV=(
   --keep-min "${RETENTION_KEEP_MIN}"
   --min-free-gb "${RETENTION_MIN_FREE_GB}"
   --mode "${RETENTION_MODE}"
+  # M-48 (GW-I-12): обязательно передаём путь к артефакту покрытия. Без этого
+  # retention не знает, до какого seq безопасно прунить — fail-closed no-op.
+  --checkpoint-coverage="${RETENTION_CHECKPOINT_COVERAGE}"
 )
 
 # Печать argv — ДО любых side-эффектов (cd/mkdir): контракт argv не зависит от того, где мы
 # и существует ли прод-каталог. Иначе гейт не смог бы его прочитать (и не прочитал — первая
 # попытка вернула пустой argv, потому что скрипт падал на `cd` раньше печати).
-if [ "${RETENTION_PRINT_ARGV:-0}" = "1" ]; then
+# Поддерживаем обе формы env-var: историческую `RETENTION_PRINT_ARGV` (M-08) и
+# новую `HFT_CRON_PRINT_ARGV` (M-48, C-032 R4 — единый контракт для всех
+# cron-обёрток проекта). Гейт M-48 проверяет новую; старые verify-скрипты M-08
+# продолжают работать по старой.
+if [ "${RETENTION_PRINT_ARGV:-0}" = "1" ] || [ "${HFT_CRON_PRINT_ARGV:-0}" = "1" ]; then
   printf '%s\n' "${ARGV[@]}"
   exit 0
 fi

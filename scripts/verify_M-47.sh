@@ -39,7 +39,7 @@ chk bash -c "grep -qE 'GATEWAY_TIMEFRAME_MS[:=][[:space:]]*.?1000' docker-compos
 step "регрессия — session-семантика M-38a (CVD ledger/окно/схема v7) не сдвинута гвардом"
 chk cargo test -p gateway --test red_gateway_cvd_session --quiet
 chk cargo test -p gateway --test red_gateway_window --quiet
-chk cargo test -p gateway --test red_gateway_schema_v7 --quiet
+chk cargo test -p gateway --test red_gateway_schema_version --quiet
 
 step "регрессия — весь read-path suite"
 chk cargo test -p gateway --quiet
