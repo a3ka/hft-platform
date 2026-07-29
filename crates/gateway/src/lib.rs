@@ -2233,6 +2233,26 @@ pub mod checkpoint {
         // schema mismatch) → `None`.
         let existing = read_checkpoint(dir, ckpt_dir, sel, filter.clone())?;
 
+        // (1b) M-48 (task #8, B1 reviewer): для gap-детекта задачи #3 в None-ветке
+        // (`existing == None`, обычно из-за lineage/CRC/версия) — извлечь cursor из
+        // ЗАГОЛОВКА stale-файла. Без этого `ckpt.cursor` теряется, условие
+        // «`earliest > ckpt.cursor + 1`» физически недостижимо, и gap-детект
+        // становится МЁРТВЫМ КОДОМ (reviewer нейтрализовал — оракул остался 9 passed).
+        // `read_checkpoint_header` парсит magic + ckpt_v + postcard-заголовок и
+        // возвращает cursor ДАЖЕ у непригодного к использованию файла. Если файл —
+        // мусор (не парсится даже до заголовка) → None, и gap-детекту в None-ветке
+        // действительно нечего детектировать (там корректно «тихий rebuild»).
+        let header_only_cursor: Option<Cursor> = if existing.is_none() {
+            let path = ckpt_path_for(ckpt_dir, sel);
+            if path.exists() {
+                read_checkpoint_header(&path).map(|h| h.cursor)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         // (2) Два сценария:
         //   A. Чекпоинт ВАЛИДЕН → резюм от `ckpt_cursor`.
         //      Докорм только `seq > ckpt_cursor.upto_seq` (GW-I-11 сегментный skip).
@@ -2337,12 +2357,48 @@ pub mod checkpoint {
                 // бы до ручного вмешательства, а фича оставалась инертной с
                 // зелёными гейтами. Теперь этого класса не существует.
                 //
-                // NB: gap-детект в None-ветке добавляется отдельной задачей #8
-                // (B1 reviewer) — `read_checkpoint_header` отдаёт cursor даже у
-                // непригодного к использованию файла, что позволяет детектить
-                // разрыв «чекпоинт↔журнал» по ЗАГОЛОВКУ. Анти-плацебо восстанавливается
-                // ТОЛЬКО парой #9+#8 (до #9 gap-тест удовлетворялся старой «stale → Err»
-                // веткой и был мёртвым кодом, см. `gap_between_checkpoint_and_journal_is_loud`).
+                // Gap-детект в None-ветке (B1, task #8): если заголовок stale-файла
+                // парсится (см. `read_checkpoint_header`, B1) — у нас ЕСТЬ `ckpt_cursor`
+                // для проверки разрыва. Семантика та же, что в Some-ветке: стык
+                // `earliest == ckpt_cursor + 1` — НЕ разрыв, всё `> ckpt_cursor + 1` —
+                // разрыв, и докорм поверх дырки дал бы состояние, не соответствующее
+                // ни одной реальной истории. → `Err` И ничего не пишем (C-032 R3:
+                // байты ckpt-каталога не меняются). Это та единственная защита,
+                // которая остаётся после #9 (silent rebuild для stale).
+                //
+                // Анти-плацебо (B1 review): спец-проверка в None-ветке ОБЯЗАНА быть
+                // load-bearing. До #9 эта ветка удовлетворялась старой «stale → Err»
+                // веткой и gap-детект был МЁРТВЫМ КОДОМ; после #9 без header-only
+                // cursor-а нейтрализация спец-проверки в None-ветке НЕ ломала бы
+                // оракул `gap_between_checkpoint_and_journal_is_loud` (фикстура:
+                // valid ckpt + truncate deep → existing=None из-за lineage, и без
+                // header_only_cursor gap-детект в None-ветке тоже не находит курсор).
+                // После #8+9 нейтрализация спец-проверки в None-ветке ЛОМАЕТ оракул.
+                if let Some(ckpt_cursor) = header_only_cursor {
+                    if let Some(first) = first_visible_seq(dir, &filter).ok().flatten() {
+                        if first > 0
+                            && first.saturating_sub(1) > ckpt_cursor.upto_seq.unwrap_or(0)
+                        {
+                            return Err(io::Error::other(format!(
+                                "checkpoint::advance_to: разрыв между чекпоинтом \
+                                 (cursor={}) и журналом (earliest first_seq={}): события \
+                                 между ними спрунены и не свёрнуты ни во что. Докорм \
+                                 поверх дырки дал бы состояние, не соответствующее ни одной \
+                                 реальной истории. Безопасно только если \
+                                 earliest == cursor + 1 (стык после законного prune \
+                                 покрытого префикса) — см. GW-I-12. Ничего не пишем; \
+                                 требуется ручное вмешательство (cold storage + rebuild \
+                                 по нему или подтверждение, что префикс действительно \
+                                 покрыт курсором чекпоинта).",
+                                ckpt_cursor
+                                    .upto_seq
+                                    .map(|s| s.to_string())
+                                    .unwrap_or_else(|| "START".to_string()),
+                                first
+                            )));
+                        }
+                    }
+                }
                 (Reducer::new(sel), Cursor::START, 0_u64, false)
             }
         };
@@ -2464,6 +2520,62 @@ pub mod checkpoint {
             Err(_) => return Ok(None), // silent rebuild
         };
         Ok(read_and_validate(&bytes, dir, sel, filter))
+    }
+
+    /// M-48 (task #8, B1 reviewer): прочитать ТОЛЬКО заголовок чекпоинта из файла.
+    /// Парсит magic + `ckpt_schema_version` + postcard-заголовок (offsets 0..20+header_len).
+    /// Возвращает `Some(CkptHeader)` ДАЖЕ если состояние непригодно к использованию —
+    /// другая версия `gateway_schema_version`, чужой фингерпринт, несовпавший lineage,
+    /// CRC не совпал, state не десериализуется. Заголовок самодостаточен и хранит
+    /// `cursor` + `history_start_seq`, которые нужны gap-детекту (#3) даже когда
+    /// чекпоинт признан непригодным.
+    ///
+    /// **Зачем отдельная функция (B1).** До M-48 `decode_checkpoint`/`read_and_validate`
+    /// возвращали `None` при ЛЮБОМ расхождении (включая устаревшую версию схемы). Это
+    /// означало, что gap-детект задачи #3 физически недостижим на фикстуре с усечением
+    /// глубже курсора: `read_checkpoint` отдавал `None`, `ckpt_cursor` терялся,
+    /// условие «`earliest > ckpt.cursor + 1`» не выполнялось ни разу. Reviewer это
+    /// подтвердил, нейтрализовав спец-проверку — тест оставался зелёным за счёт ЧУЖОЙ
+    /// ветки («stale чекпоинт → Err», закрыто в задаче #9).
+    ///
+    /// Без `dir`, без `sel`, без `filter` — заголовок не зависит от runtime-окружения.
+    ///
+    /// НЕ проверяет (намеренно): `selector_fingerprint`, `epoch_filter_fingerprint`,
+    /// `journal_lineage` (требуют `dir`), CRC (покрывает `header || state` — без
+    /// state CRC не вычислить), state_postcard decode. Это работа `read_checkpoint`.
+    ///
+    /// Возвращает `None` ТОЛЬКО если файл структурно нечитаем: меньше magic, нет
+    /// magic, несовпадение `ckpt_schema_version` (формат файла, несовместим с текущим
+    /// парсером), `postcard::from_bytes` заголовка упал. Это уже класс «на диске мусор,
+    /// а не чекпоинт» — там gap-детекту действительно нечего детектировать, корректное
+    /// поведение «тихий rebuild без gap-проверки» (см. `advance_to` None-ветку).
+    ///
+    /// NB: устаревший `gateway_schema_version` (`bytes[12..16]` НЕ равен текущему
+    /// `GATEWAY_SCHEMA_VERSION`) — это **именно тот кейс, ради которого функция
+    /// написана**. Не отвергаем; это часть GW-I-9б «файл с прошлой версией схемы —
+    /// КЭШ, не ошибка». Свежий bump схемы на проде (v5/v6/v7/v8 — рутинны) не должен
+    /// выводить чекпоинт из строя.
+    pub(super) fn read_checkpoint_header(path: &Path) -> Option<CkptHeader> {
+        let bytes = fs::read(path).ok()?;
+        if bytes.len() < 8 + 4 + 4 + 4 {
+            return None;
+        }
+        if bytes[0..8] != CKPT_MAGIC {
+            return None;
+        }
+        let ckpt_v = u32::from_le_bytes(bytes[8..12].try_into().ok()?);
+        if ckpt_v != CKPT_SCHEMA_VERSION {
+            return None;
+        }
+        // bytes[12..16] — `gateway_schema_version` СПЕЦИАЛЬНО НЕ сверяем с текущей
+        // (см. шапку функции). Stale-файл от прежней версии — основной use-case.
+        let _gw_v = u32::from_le_bytes(bytes[12..16].try_into().ok()?);
+        let header_len = u32::from_le_bytes(bytes[16..20].try_into().ok()?) as usize;
+        let header_end = 20 + header_len;
+        if bytes.len() < header_end {
+            return None;
+        }
+        postcard::from_bytes(&bytes[20..header_end]).ok()
     }
 
     fn read_and_validate(
