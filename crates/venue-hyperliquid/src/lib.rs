@@ -146,7 +146,8 @@ pub fn parse_message(text: &str) -> Vec<EventKind> {
 
 /// One element of the `trades` `data` array:
 /// `{"coin":"BTC","px":"<str>","sz":"<str>","time":<ms>,"side":"A"|"B"}`.
-/// "A" = aggressive buy (taker buy) -> Side::Buy; "B" -> Side::Sell.
+/// Official HL notation (hyperliquid.gitbook.io -> For developers -> API -> Notation):
+/// "B" = Bid = Buy (aggressor) -> Side::Buy; "A" = Ask = Short/Sell (aggressor) -> Side::Sell.
 fn parse_trade(item: &serde_json::Value) -> Option<EventKind> {
     let coin = item.get("coin")?.as_str()?.to_string();
     if coin.contains("MID") {
@@ -157,8 +158,8 @@ fn parse_trade(item: &serde_json::Value) -> Option<EventKind> {
     let ts_exch_ms = item.get("time")?.as_i64()?;
     let side_raw = item.get("side")?.as_str()?;
     let side = match side_raw {
-        "A" => Side::Buy,
-        "B" => Side::Sell,
+        "B" => Side::Buy,
+        "A" => Side::Sell,
         _ => {
             tracing::debug!(side = %side_raw, "venue-hyperliquid: unknown trade side, skipping");
             return None;
