@@ -631,7 +631,17 @@ fn dedup_indexed_paths(dir: &Path) -> io::Result<Vec<PathBuf>> {
     Ok(by_index.into_values().collect())
 }
 
-/// Какие эпохи читатель СОГЛАСЕН смешивать — фильтр вызывается через `EpochFilter::accepts`.
+fn latest_segment(dir: &Path) -> io::Result<Option<(u32, PathBuf)>> {
+    Ok(dedup_indexed_paths(dir)?
+        .into_iter()
+        .filter_map(|path| {
+            let name = path.file_name().and_then(OsStr::to_str)?;
+            let index = parse_segment_index_any(name)?;
+            Some((index, path))
+        })
+        .max_by_key(|(index, _)| *index))
+}
+
 ///
 /// ЕДИНСТВЕННЫЙ публичный путь `list_segments` — все сегменты каталога.
 ///
@@ -1128,26 +1138,32 @@ pub(crate) fn segment_path(dir: &Path, index: u32) -> PathBuf {
 /// Найти индекс самого свежего сегмента в каталоге (`max(existing_indices)`).
 /// Возвращает `None` если сегментов нет.
 pub(crate) fn latest_segment_index(dir: &Path) -> io::Result<Option<u32>> {
-    let mut max_idx: Option<u32> = None;
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let p = entry.path();
-        if p.extension().and_then(OsStr::to_str) != Some("jrnl") {
-            continue;
-        }
-        let name = match p.file_name().and_then(OsStr::to_str) {
-            Some(s) => s.to_string(),
-            None => continue,
-        };
-        if let Some(idx) = parse_segment_index(&name) {
-            max_idx = Some(max_idx.map(|m| m.max(idx)).unwrap_or(idx));
-        }
-    }
-    Ok(max_idx)
+    Ok(latest_segment(dir)?.map(|(index, _)| index))
 }
 
 /// Хвостовой скан КОНКРЕТНОГО сегмента (используется при `open_with` для next_seq).
 pub(crate) fn tail_last_seq_of(path: &Path) -> io::Result<Option<u64>> {
+    let is_zst = path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .is_some_and(is_compacted_name);
+    if is_zst {
+        let f = match File::open(path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let mut decoder = open_compacted_reader(f)?;
+        if skip_v2_header_forward(&mut decoder).is_err() {
+            return Ok(None);
+        }
+        let mut last_seq = None;
+        while let Some(event) = read_event_frame(&mut decoder)? {
+            last_seq = Some(event.seq);
+        }
+        return Ok(last_seq);
+    }
+
     let mut file = match File::open(path) {
         Ok(f) => f,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -1229,12 +1245,11 @@ pub(crate) fn tail_last_seq_of(path: &Path) -> io::Result<Option<u64>> {
 /// Определить next_seq для `open_with`: max(последний seq в активном сегменте + 1,
 /// `journal.meta`). Если активного сегмента нет — начинаем с meta.
 pub(crate) fn resolve_next_seq_with(dir: &Path, meta_path: &Path) -> io::Result<u64> {
-    let latest = latest_segment_index(dir)?;
+    let latest = latest_segment(dir)?;
     let meta_seq = read_meta(meta_path)?;
     match latest {
         None => Ok(meta_seq),
-        Some(idx) => {
-            let path = segment_path(dir, idx);
+        Some((_idx, path)) => {
             let seg_last = tail_last_seq_of(&path)?.map(|s| s + 1).unwrap_or(0);
             Ok(meta_seq.max(seg_last))
         }
@@ -1254,11 +1269,26 @@ pub(crate) struct OpenDecision {
 ///   совпал → reuse (append), иначе → создаём новый (index = последний + 1);
 /// - нет сегментов → создаём segment-00000000.jrnl.
 pub(crate) fn decide_open_segment(dir: &Path, cfg: &WriterConfig) -> io::Result<OpenDecision> {
-    let latest_idx = latest_segment_index(dir)?;
+    let latest = latest_segment(dir)?;
     let next_seq = resolve_next_seq_with(dir, &dir.join(META))?;
 
-    if let Some(idx) = latest_idx {
-        let path = segment_path(dir, idx);
+    if let Some((idx, path)) = latest {
+        // A compacted segment is immutable and cannot be opened for append. Start a
+        // fresh raw segment after the complete indexed history.
+        if path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .is_some_and(is_compacted_name)
+        {
+            let new_idx = idx + 1;
+            return Ok(OpenDecision {
+                seg_index: new_idx,
+                seg_path: segment_path(dir, new_idx),
+                first_seq: next_seq,
+                reuse: false,
+            });
+        }
+
         // Прочитать заголовок (если есть).
         let mut f = File::open(&path)?;
         let header = match read_v2_header_and_skip(&mut f).ok().flatten() {
@@ -1499,51 +1529,7 @@ pub fn retention_plan(
     let dir = dir.as_ref();
 
     // (1) Обход каталога: classify с обработкой foreign/corrupt как skipped.
-    let manifest = load_manifest(dir)?;
-    let mut classified: Vec<SegmentInfo> = Vec::new();
-    let mut foreign_skipped: Vec<(SegmentInfo, String)> = Vec::new();
-
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let p = entry.path();
-        if p.extension().and_then(OsStr::to_str) != Some("jrnl") {
-            continue;
-        }
-        match classify_segment(&p, &manifest) {
-            Ok(info) => classified.push(info),
-            Err(e) => {
-                // Foreign / corrupt / truncated. Синтезируем info для skipped — оператор
-                // видит файл и причину, а не «план не построен, проверяй вручную».
-                let reason = classify_failure_reason(&e);
-                let file_name = p
-                    .file_name()
-                    .and_then(OsStr::to_str)
-                    .unwrap_or("<non-utf8>")
-                    .to_string();
-                let index = parse_segment_index(&file_name).unwrap_or(u32::MAX);
-                let size_bytes = fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
-                let synthetic = SegmentInfo {
-                    path: p.clone(),
-                    index,
-                    header: SegmentHeader {
-                        schema_version: 0, // sentinel: неизвестно (нет магии / нет заголовка)
-                        source: DataSource::Synthetic,
-                        provenance: format!("<{reason}>"),
-                        epoch_id: String::new(),
-                        created_wall_ms: 0,
-                        first_seq: 0,
-                    },
-                    size_bytes,
-                };
-                let _ = file_name;
-                foreign_skipped.push((synthetic, reason));
-            }
-        }
-    }
-    // Стабильная сортировка по индексу — критична для воспроизводимости плана (R6)
-    // и для определения «последних N» в keep_min.
-    classified.sort_by_key(|s| s.index);
-    foreign_skipped.sort_by_key(|(s, _)| s.index);
+    let (classified, foreign_skipped) = enumerate_retention_segments(dir)?;
 
     // (2) Активный сегмент = сегмент с МАКСИМАЛЬНЫМ индексом среди classified.
     // Если classified пуст (всё foreign / каталог пуст) — активного нет; все foreign в skipped.
@@ -1646,14 +1632,10 @@ pub fn retention_plan(
             // отфильтрованные уже исключены выше шагами (2)–(4)).
             let to_classify = std::mem::take(&mut final_candidates);
             for s in to_classify {
-                // last_seq(s) = segs_by_idx[index(s)+1].first_seq - 1, иначе None (активный).
-                let pos = segs_by_idx.iter().position(|x| x.index == s.index);
-                let last_seq_opt = match pos {
-                    Some(i) if i + 1 < segs_by_idx.len() => {
-                        Some(segs_by_idx[i + 1].header.first_seq.saturating_sub(1))
-                    }
-                    _ => None,
-                };
+                // last_seq(s) = next.first_seq - 1 only when the next header is
+                // trustworthy. A legacy declaration synthesizes first_seq=0, so the
+                // candidate's own tail is the source of truth in that case.
+                let last_seq_opt = last_seq_for_segment(&s, &segs_by_idx)?;
                 let covered_seg = match last_seq_opt {
                     Some(ls) => ls <= covered_seq,
                     None => false, // активный сегмент — last_seq неизвестен ⇒ не покрыт
@@ -1729,6 +1711,52 @@ pub fn retention_plan(
     })
 }
 
+type RetentionEnumeration = (Vec<SegmentInfo>, Vec<(SegmentInfo, String)>);
+
+fn enumerate_retention_segments(dir: &Path) -> io::Result<RetentionEnumeration> {
+    let manifest = load_manifest(dir)?;
+    let mut classified = Vec::new();
+    let mut foreign_skipped = Vec::new();
+
+    for path in dedup_indexed_paths(dir)? {
+        match classify_segment(&path, &manifest) {
+            Ok(info) => classified.push(info),
+            Err(e) => {
+                // Foreign / corrupt / truncated. Синтезируем info для skipped — оператор
+                // видит файл и причину, а не «план не построен, проверяй вручную».
+                let reason = classify_failure_reason(&e);
+                let file_name = path
+                    .file_name()
+                    .and_then(OsStr::to_str)
+                    .unwrap_or("<non-utf8>")
+                    .to_string();
+                let index = parse_segment_index_any(&file_name).unwrap_or(u32::MAX);
+                let size_bytes = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                let synthetic = SegmentInfo {
+                    path,
+                    index,
+                    header: SegmentHeader {
+                        schema_version: 0, // sentinel: неизвестно (нет магии / нет заголовка)
+                        source: DataSource::Synthetic,
+                        provenance: format!("<{reason}>"),
+                        epoch_id: String::new(),
+                        created_wall_ms: 0,
+                        first_seq: 0,
+                    },
+                    size_bytes,
+                };
+                foreign_skipped.push((synthetic, reason));
+            }
+        }
+    }
+
+    // Стабильная сортировка по индексу — критична для воспроизводимости плана (R6)
+    // и для определения «последних N» в keep_min.
+    classified.sort_by_key(|s| s.index);
+    foreign_skipped.sort_by_key(|(s, _)| s.index);
+    Ok((classified, foreign_skipped))
+}
+
 /// Классифицировать причину отказа `classify_segment` в человеко-читаемую строку.
 fn classify_failure_reason(e: &io::Error) -> String {
     if is_foreign_segment(e) {
@@ -1752,6 +1780,27 @@ fn classify_failure_reason(e: &io::Error) -> String {
 /// На любую ошибку (нет файла, битый заголовок, нет событий) — `Ok(None)`:
 /// вызывающий использует fallback (header.created_wall_ms).
 fn first_event_data_ts(path: &Path) -> io::Result<Option<i64>> {
+    let is_zst = path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .is_some_and(is_compacted_name);
+    if is_zst {
+        let f = match File::open(path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let mut reader = open_compacted_reader(f)?;
+        // Сжатый сегмент нельзя Seek'нуть: читаем заголовок и первый frame вперёд.
+        if skip_v2_header_forward(&mut reader).is_err() {
+            return Ok(None);
+        }
+        let Some(ev) = read_event_frame(&mut reader)? else {
+            return Ok(None);
+        };
+        return Ok(Some(event_data_ts(&ev)));
+    }
+
     let mut f = match File::open(path) {
         Ok(f) => f,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -1766,7 +1815,11 @@ fn first_event_data_ts(path: &Path) -> io::Result<Option<i64>> {
     let Some(ev) = read_event_frame(&mut reader)? else {
         return Ok(None);
     };
-    let ts = match &ev.kind {
+    Ok(Some(event_data_ts(&ev)))
+}
+
+fn event_data_ts(ev: &Event) -> i64 {
+    match &ev.kind {
         EventKind::Sys(_) => ev.ts_wall_ms,
         EventKind::Md(md) => match &md.payload {
             MdPayload::Trade { ts_exch_ms, .. }
@@ -1778,8 +1831,30 @@ fn first_event_data_ts(path: &Path) -> io::Result<Option<i64>> {
             | MdPayload::L2Delta { ts_exch_ms, .. }
             | MdPayload::MarginInventory { ts_exch_ms, .. } => *ts_exch_ms,
         },
+    }
+}
+
+fn last_seq_for_segment(
+    segment: &SegmentInfo,
+    sorted_segments: &[SegmentInfo],
+) -> io::Result<Option<u64>> {
+    let Some(pos) = sorted_segments
+        .iter()
+        .position(|candidate| candidate.index == segment.index)
+    else {
+        return Ok(None);
     };
-    Ok(Some(ts))
+    let Some(next) = sorted_segments.get(pos + 1) else {
+        return Ok(None);
+    };
+
+    if next.header.schema_version != contracts::SCHEMA_VERSION_PRE_HEADER {
+        return Ok(Some(next.header.first_seq.saturating_sub(1)));
+    }
+
+    // A legacy declaration has a synthetic first_seq. Establish the fact by reading
+    // the candidate's last event instead of trusting that synthetic zero.
+    tail_last_seq_of(&segment.path)
 }
 
 /// Выполнить план. В `DryRun` НИ ОДИН байт не копируется и не удаляется — только отчёт.
@@ -1822,19 +1897,15 @@ pub fn retention_execute(
             // был ли он uncovered (override). Пересчитываем last_seq тем же способом,
             // что и retention_plan, чтобы корректно классифицировать.
             let covered = policy.checkpoint_covered_through_seq;
-            let all_segs_for_check = segments(_dir).unwrap_or_default();
+            let (all_segs_for_check, _) = enumerate_retention_segments(_dir.as_ref())?;
             let mut sorted_segs = all_segs_for_check.clone();
             sorted_segs.sort_by_key(|s| s.index);
 
             for seg in &plan.offload_and_prune {
                 // Классифицируем: покрыт или нет (для override-аудита).
-                let pos = sorted_segs.iter().position(|s| s.index == seg.index);
-                let last_seq_opt = match pos {
-                    Some(i) if i + 1 < sorted_segs.len() => {
-                        Some(sorted_segs[i + 1].header.first_seq.saturating_sub(1))
-                    }
-                    _ => None, // активный
-                };
+                // The same factual rule as retention_plan: do not use a synthetic
+                // legacy first_seq as a coverage boundary.
+                let last_seq_opt = last_seq_for_segment(seg, &sorted_segs)?;
                 let is_uncovered = match (last_seq_opt, covered) {
                     (Some(ls), Some(c)) => ls > c,
                     _ => true, // активный или нет артефакта покрытия = uncovered

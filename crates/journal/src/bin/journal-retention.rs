@@ -434,6 +434,16 @@ fn print_plan(args: &Args, plan: &RetentionPlan) {
             s.header.created_wall_ms,
         );
     }
+    println!("  offload_only: {} сегмент(ов)", plan.offload_only.len());
+    for s in &plan.offload_only {
+        println!(
+            "    - {} (index={}, size={} B, ts_exch/created={})",
+            s.path.display(),
+            s.index,
+            s.size_bytes,
+            s.header.created_wall_ms,
+        );
+    }
     println!("  skipped: {} сегмент(ов)", plan.skipped.len());
     for (s, reason) in &plan.skipped {
         println!("    - {} :: {}", s.path.display(), reason);
