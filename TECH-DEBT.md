@@ -47,347 +47,6 @@
   противоположный ответ), но не защитил операторский вывод. Фикс: печатать фактический `seg_ts` (и/или
   оба поля раздельно). Severity: MINOR (наблюдаемость; неверное операторское решение возможно только при
   большом расхождении `created_wall_ms` и первого события — например у импортированной истории).
-- **TD-048** `checkpoint-не-может-быть-поднят-на-прод-журнале-со-спруненным-префиксом` —
-  **✅ CLOSED 2026-07-29** (M-48, merge `0215b34`; reviewer APPROVED после цикла REJECTED→rev5).
-  **Закрыт ПРОД-ЗАМЕРОМ, не отчётом** (§8 eyes-on на `0215b34`, CI+Deploy оба success):
-  ```
-  $ docker compose --profile ops run --rm gateway-checkpoint
-  gateway-checkpoint: ok dir=/journal ckpt=/ckpt
-    requested_cursor=Cursor { upto_seq: Some(18446744073709551615) }
-    achieved_cursor=Cursor { upto_seq: Some(118434344) }
-    covered=118434344 out=/ckpt/covered_through_seq
-  CKPT_EXIT=0  elapsed=411s            # было CKPT_EXIT=1, чекпоинт не создавался НИКОГДА
-  $ ls /var/lib/docker/volumes/hft-platform_gateway-ckpt/_data
-  ckpt-2a00318f774d9689.bin (1045469 B)   covered_through_seq (118434344)   zz.lock
-  ```
-  `covered_through_seq` = **118434344** — реальное число, не `u64::MAX`. Ops-цепочка доставлена и
-  на VPS: `/etc/cron.d/hft-journal-retention` переустановлен деплоем (`install -m 0644` +
-  `crontab -n` валидация, fail-closed) и содержит `0 4 * * * gateway-checkpoint-cron.sh` —
-  ДО retention `7 4 * * *` (раньше `grep -c gateway-checkpoint` = **0**).
-  **Три блокера rev4, найденные reviewer'ом на PR-гейте и закрытые в rev5 (каждый проверен
-  ЗАМЕРОМ/МУТАЦИЕЙ, не отчётом):**
-  - **B1 — задача #3 (gap-детект GW-I-12) была МЁРТВЫМ КОДОМ.** Нейтрализация спец-проверки
-    разрыва не ломала оракул (`9 passed, 0 failed`); зелёный давала посторонняя ветка. Причина:
-    усечение префикса инвалидировало чекпоинт ⇒ `read_checkpoint` → `None`, и курсор, нужный для
-    `earliest > cursor + 1`, был уже потерян. Фикс (задача #8): `read_checkpoint_header` читает
-    заголовок НЕЗАВИСИМО от валидации состояния (намеренно НЕ сверяя `gateway_schema_version`),
-    поэтому курсор доступен и у непригодного файла. Перепроверено мутацией после фикса:
-    нейтрализация gap-детекта в None-ветке → `gap_between_checkpoint_and_journal_is_loud` **FAILED**
-    (`9 passed, 1 failed`) ⇒ проверка load-bearing.
-  - **B2 — ветка «stale чекпоинт-файл → `Err`» ВОСПРОИЗВОДИЛА TD-048 на другом входе.**
-    `decode_checkpoint` отвергает файл при `gw_v != GATEWAY_SCHEMA_VERSION`, оставляя его на диске;
-    на проде `first_visible_seq=16049334 > 0` навсегда ⇒ после ЛЮБОГО будущего бампа схемы
-    чекпоинтер не поднялся бы до ручного `rm`. Бампы рутинны: v5 (M-23) → v6 (M-36) → v7 (M-38a) →
-    v8 (сам M-48). Воспроизведено reviewer'ом внешним scratch-крейтом: бамп 8→9 → `Err(stale
-    чекпоинт-файл ... Удалите вручную)`. Фикс (задача #9): любая невалидность → ТИХИЙ rebuild +
-    перезапись (GW-I-9б). Перепроверено тем же репро: `advance_to -> Ok(Some(1999))`, файл
-    самолечился до валидного **байт-в-байт**.
-  - **B3 — канарейка ops-цепочки была ВАКУУМНОЙ + деплой не ставил cron.d.** Шаг «обе cron-записи»
-    грепал только `journal-retention-cron.sh` (запись, существовавшую ДО M-48) и прошёл бы при
-    полностью отсутствующем чекпоинтере. Фикс (задача #10): греп ПОИМЁННО обеих записей + канарейка
-    «`deploy.yml` содержит `cron.d`» + сама установка в деплое. Проверено на VPS до merge:
-    `crontab -n` нового cron.d-файла (формат с user-полем) → `rc=0` ⇒ fail-closed путь не
-    ложно-срабатывает.
-  **Исторический контекст дефекта (M-38b, `606aa62`) — сохранён ниже как есть.**
-  **Замер (не пересказ), прод `606aa62`, журнал 23 GB / 116 сегментов:**
-  ```
-  # (1) E2E JWT → первый Snapshot при ПУСТОМ /ckpt (DECODE, не grep):
-  LATENCY first Snapshot (от ws handshake) = 382.657 s      # TD-044 baseline был 409.74 s
-  schema_version = 7; cursor = {"upto_seq": 111647115}; ohlcv len=51; heatmap len=1789
-  VERDICT: FAIL — латентность 382.657 s > 10.0 s
-
-  # (2) попытка поднять чекпоинт штатным ops-путём:
-  $ docker compose --profile ops run --rm gateway-checkpoint
-  gateway-checkpoint: advance_to failed dir=/journal ckpt=/ckpt
-    err=checkpoint::advance_to: нет валидного чекпоинта в /ckpt, но первый видимый сегмент
-    имеет first_seq=16049334 > 0 (префикс уже спрунен). Восстановить полное состояние
-    физически нечем — пишем усечённый чекпоинт, в кокпите едет all-time VWAP, откатиться
-    нечем. ОСТАНОВИТЕСЬ и поднимите чекпоинт вне retention'а (cold storage + ручной rebuild).
-  CKPT_EXIT=1
-  $ ls /var/lib/docker/volumes/hft-platform_gateway-ckpt/_data
-  zz.lock            # ckpt НЕ создан; covered_through_seq НЕ создан
-  ```
-  **Корень.** Гвард `advance_to` (`crates/gateway/src/lib.rs:2178-2186`, задача #9/D2) безусловен:
-  «нет чекпоинта И `first_visible_seq > 0` → `Err`». На проде `segment-00000000` удалён purge'ем
-  M-36 (журнал начинается с `segment-00000001`, `first_seq=16049334`), и это состояние
-  **необратимо** ⇒ бинарь `gateway-checkpoint` не сможет забутстрапиться НИКОГДА. Escape-hatch у
-  бинаря нет: флаги ровно `--dir --ckpt-dir --coverage-out --venue --symbol --timeframe-ms
-  --bands --window-ms --cursor` (проверено по `crates/gateway/src/bin/gateway-checkpoint.rs:112-140`).
-  **Асимметрия, которая и есть дефект дизайна (зона architect, reviewer не проектирует фикс):**
-  read-path `snapshot_from_checkpoint` при отсутствии чекпоинта СПОКОЙНО редуцирует от первого
-  ВИДИМОГО seq и отдаёт результат как «all-time» снапшот — это ровно тот путь, который мы
-  задекодировали в (1) за 382 s. Т.е. усечённая история УЖЕ обслуживается кокпиту; отказывается
-  её персистить только checkpoint-path. Какая семантика верна — решать architect'у, но она обязана
-  быть ОДНА на обоих путях: сейчас одно и то же состояние легально отдавать и нелегально сохранять.
-  **Следствие для ретеншена (вторая, независимая ветка долга).** Прод-инвокер
-  `deploy/bin/journal-retention-cron.sh` (cron 04:07 UTC) НЕ передаёт `--checkpoint-coverage` и не
-  включает override ⇒ `covered=None`, `allow_prune_without_checkpoint=false` ⇒ ветка
-  «true fail-closed» (`crates/journal/src/segments.rs:1699-1710`): все кандидаты уходят в
-  `offload_only`, prune НЕ происходит никогда. Сегодня это не живая регрессия (cron в `dry-run`,
-  prune и так не выполнялся), но операторский путь молча стал no-op'ом — тот же класс, что TD-020.
-  **Ops-цепочка не доставлена.** `deploy/**` НЕ входил в `Allowed paths` M-38b, поэтому
-  `deploy/bin/gateway-checkpoint-cron.sh` + запись в `deploy/cron.d/` не написаны, и на VPS
-  чекпоинтер не запланирован (`crontab -l` содержит только retention 04:07 и compaction 03:50).
-  Задача #5c milestone'а («ops-цепочка cron: сначала чекпоинт, затем retention с этим артефактом»)
-  отмечена DONE по канарейке «бинарь существует + заведён в compose» — grep-green артефакт,
-  ровно то, от чего предостерегает шапка `journal-retention-cron.sh`.
-  **Что НЕ сломано (проверено):** прод здоров и не деградировал — recorder пишет
-  (`next_seq` 111615379 → 111649748 за 8 мин, `writable:true`), оба контейнера `(healthy)`,
-  `gateway-serve` отдаёт валидный v7-снапшот с реальными ценами; ckpt-том смонтирован `:ro`
-  обоим читателям (`docker inspect` → `rw=false`), read-path чекпоинта чисто читающий
-  (`exists()` + `fs::read`, без `flock`/`create_dir_all`) — `:ro` безопасен.
-  **Зона:** architect (дизайн бутстрапа + RED-оракул на прод-форму «префикс спрунен»), затем
-  engine-dev (impl) + ops-цепочка в `deploy/**`. Reviewer описал дефект, фикс не проектирует
-  (`gates.md` §4).
-- **TD-047** `v7-wire-форма-в-docs/fa/viz-backend.md-не-упоминает-vp_session_max_time_s` —
-  **✅ CLOSED 2026-07-28** (architect `6fc6350`, приехал в `main` с merge M-47 `47577c0`; проверено
-  reviewer'ом по диффу: `VB-I-6` теперь перечисляет ОБА per-session поля v7 — `cvd_session_base` и
-  `vp_session_max_time_s` — с семантикой «последний виденный `bucket_time_s` сессии», требованием
-  сортировки, пометкой `serde(default)` = defensive-default (НЕ совместимость, консюмер гейтит на
-  `schema_version == 7`) и существенным порядком «whole-session drop VP ПОСЛЕ `merge_volume_profile`»;
-  `VB-I-10` дописан тем же критерием `vp_session_max_time_s[sid] < lo_time_s`, идентичным
-  `Reducer::evict_window_state`). Доксинк, не код. `VB-I-6` перечисляет форму v7 как
-  «`SeriesBundle.cvd_session_base: Vec<(session_id, base)>` (per-session)», но фикс TD-045 (`e4822e3`,
-  задача #11) добавил в ТУ ЖЕ v7-форму ВТОРОЕ per-session поле — `vp_session_max_time_s:
-  Vec<(session_id, max_time_s)>`, которое уходит на провод (`gateway-serve` JSON passthrough) и является
-  частью контракта с фронтом. FA-спека описывает v7 неполно ⇒ консюмер, читающий только `docs/fa/`,
-  не знает о поле; следующий bump рискует «случайно» его переопределить. Зона: architect (`docs/fa/**`
-  вне зоны reviewer'а). Фикс: дописать поле в VB-I-6/VB-I-10 при ближайшем касании gateway (M-38b —
-  чекпоинт всё равно фиксирует форму состояния). Severity: **NOTE** (док-долг; код/поведение корректны,
-  оракул `red_gateway_window` держит байт-идентичность поля).
-- **TD-045** `vp-whole-session-drop-at-bundle-merge-evicts-still-live-session` — **✅ CLOSED 2026-07-27**
-  (`e4822e3` engine-dev по RED `1d38a19` architect'а + critic C-029 PASS; merge `28c186c`).
-  **Фикс в корень:** `SeriesBundle` теперь несёт `vp_session_max_time_s: Vec<(session_id, max_time_s)>`
-  (форма v7, зеркало `cvd_session_base`), `Reducer::finish` эмитит его из единой `session_max_time_s`,
-  `evict_series_bundle_under_window` префикс-фильтрует записи, а whole-session drop VP выполняется в
-  `Snapshot::apply` ПОСЛЕ `merge_volume_profile` по ИДЕНТИЧНОМУ редьюсеру критерию
-  `vp_session_max_time_s[sid] < lo_time_s`. Старый предикат `row.session_id < utc_session_id(at)` УДАЛЁН
-  (не закомментирован — сверено по диффу). Порядок «drop после merge» существенен: drop в эвикции терял
-  бы bins existing для сессии, которую incoming восстанавливает (проверено reviewer'ом отдельным
-  репро-тестом «сессия с паузой» — GREEN).
-  **Анти-плацебо доказан reviewer'ом НЕЗАВИСИМО от architect-фикстуры** (собственный 3-сессионный
-  репро: S1 глубоко в прошлом → drop, S2 пересекается окном → survive, S3 текущая, в ОДНОМ fold'е):
-  ```
-  # lib.rs откачен на e12779f (pre-fix), тесты HEAD:
-  test windowed_live_eq_replay_past_session_survives_overlap ... FAILED   (architect RED)
-       merged.vp=[20279]  # S1 потеряна
-  test reviewer_probe_three_sessions_drop_and_survive_in_one_fold ... FAILED   (репро reviewer'а)
-       merged.vp=[20280]  # S2 потеряна, хотя окно её пересекает
-  # на e4822e3 (fix): оба GREEN, + merged.series == full.series побайтово
-  ```
-  Остаточный риск: **нулевой на safety**, поле только read-path кокпита. Док-долг вынесен в TD-047.
-  **История дефекта (оставлена для аудита — класс «идеальная фикстура»).** Это была РЕГРЕССИЯ
-  относительно `origin/main` cb28145, доказанная прогоном, а не анализом. `Snapshot::apply` (`crates/gateway/src/lib.rs:1245-1254`,
-  коммит `6827965`) получил новый блок, дропающий из existing VP-сессию, если её нет в
-  `incoming.volume_profile` И `row.session_id < utc_session_id(frame.at_ms)`. Условие «день ушёл вперёд»
-  НЕ эквивалентно оконному критерию редьюсера (`session_max_time_s[sid] < lo_time_s`,
-  `evict_window_state`): сразу после 00:00 UTC окно `[at−W, at]` ЕЩЁ пересекает вчерашнюю сессию, и
-  `Reducer` её УДЕРЖИВАЕТ, а merge-путь уже выбросил — `snapshot(C) + frames_since(C..) ≢ snapshot(LATEST)`.
-  Нарушен GW-I-4/VB-I-2 — ровно тот инвариант, ради которого писался M-38a.
-  **Репро (reviewer, фикстура зеркалит `windowed_live_eq_replay_overlap_multistep`, но fold
-  ОСТАНАВЛИВАЕТСЯ раньше — финальное окно ещё пересекает S1):** 180 сделок 1/s вокруг 00:00 UTC
-  (`d2 = 20_279 * 86_400_000`, `t0 = d2 − 90s`), `window_ms = 60_000`, курсор `C = d2+35s`,
-  fold до `at = d2+45s` ⇒ финальное окно `[d2−15s, d2+45s]` пересекает S1.
-  ```
-  merged.vp sessions = [20279]            # M-38a HEAD 291e288
-  full.vp   sessions = [20278, 20279]
-  assertion failed: VP: merged != full под окном, которое ЕЩЁ пересекает S1
-  ```
-  На `origin/main` (cb28145) ТОТ ЖЕ репро — `test result: ok. 1 passed` ⇒ регрессия внесена M-38a.
-  **Оракул односторонний — вот почему это прошло все зелёные гейты.** `windowed_live_eq_replay_overlap_multistep`
-  (C-028 K2) фиксирует ТОЛЬКО направление «S1 обязана быть dropped» (финальное окно целиком в S2) и не
-  имеет парного vantage «S1 обязана УЦЕЛЕТЬ, пока окно её пересекает». Проверено переключением: с блоком
-  K2-оракул GREEN / репро reviewer'а FAIL; без блока K2-оракул FAIL / репро GREEN — реализация не может
-  удовлетворить оба, потому что информации не хватает структурно: `VolumeProfileRow` несёт
-  `session_id/poc/vah/val/va_pct/bins` и НЕ несёт времени, поэтому `evict_series_bundle_under_window`
-  физически не может воспроизвести критерий `session_max_time_s[sid] < lo`. **Дизайн фикса — зона architect**
-  (gates.md §4: reviewer описывает дефект, не проектирует решение); нужен парный RED-оракул на удержание
-  прошлой сессии, пока окно её пересекает. **Класс «идеальная фикстура» — ЧЕТВЁРТЫЙ РАЗ ПОДРЯД**
-  (M-07 equity-curve, M-08 асимметричный дифф, M-37 TD-042, теперь M-38a): оракул давит на инвариант
-  ровно с одной стороны, реализация ложится в эту сторону, вторая сторона ломается молча.
-  Severity была: **MAJOR** (нарушен headline-инвариант milestone'а; данные кокпита расходились live vs
-  replay до W секунд после каждой полуночи; ордер-пути нет).
-- **TD-043** `multi-session-cvd-under-window-not-covered` — **✅ CLOSED 2026-07-27** (M-38a, merge
-  `28c186c`). CVD стал per-session ledger (`cvd: BTreeMap<session_id, CvdSession{base, bucket_delta}>`),
-  running обнуляется на 00:00 UTC, эвикция целыми прошлыми сессиями по ТОМУ ЖЕ критерию, что VP
-  (unified `session_max_time_s`), форма `cvd_session_base: Vec<(session_id, base)>`,
-  `GATEWAY_SCHEMA_VERSION` 6→7. Оракулы: `red_gateway_cvd_session` (4 runtime-RED на single-running),
-  `red_gateway_window::cvd_two_sessions_live_across_midnight_window`, `red_gateway_schema_v7`.
-  Трактовка «сессия» в VP и CVD теперь ОДНА (исходная претензия долга снята). Подтверждено на проде
-  (§8 E2E M-38a, см. `PROJECT-STATE.md`).
-- **TD-046** `cvd-session-split-breaks-when-timeframe-does-not-align-to-utc-midnight` —
-  **✅ CLOSED 2026-07-28** (M-47, merge `47577c0`; RED `f90f170` architect → impl `42a958e`/`9deb9ec`
-  engine-dev; severity по факту прогона поднималась NOTE→MINOR — см. ниже). **Закрыт fail-closed
-  гвардом `GW-I-10`, а не переносом семантики:** `gateway::validate_selector(&Selector)` (критерий
-  `timeframe_ms > 0 && 86_400_000 % timeframe_ms == 0`) вызывается ПЕРВОЙ строкой на ВСЕХ трёх
-  публичных входах библиотеки (`snapshot`/`frames_since`/`replay`, `InvalidInput` + подстрока
-  `timeframe_ms` в сообщении), `gateway-serve::serve_config_from_env` дополнительно отказывает
-  на СТАРТЕ. Байпас-поверхности не остаётся: публичный API крейта `gateway` — ровно эти три функции
-  плюс типы (`Reducer` приватен), а единственный консюмер крейта в workspace — `gateway-serve`
-  (проверено reviewer'ом по `Cargo.toml` и `grep Selector`).
-  **Прогон RED вскрыл ВТОРОЙ режим, в этой записи не описанный:** при `timeframe_ms <= 0`
-  `Reducer::bucket_time_s` возвращал `None` ⇒ `ohlcv`/`cumulative_delta`/`vwap`/`heatmap`/`bubbles`
-  выходили ПУСТЫМИ, а `volume_profile` — ЗАПОЛНЕННЫМ (VP якорится от `utc_session_id(ts_ms)` мимо
-  бакета): кокпит получал `Ok` без единой ошибки — тихая полу-правда, хуже паники.
-  **Анти-плацебо доказан reviewer'ом НЕЗАВИСИМО мутациями impl** (тесты HEAD, правился только
-  `src`): no-op заглушка гварда → `FAILED. 2 passed; 6 failed`; «всегда `Err`» → `FAILED. 6 passed;
-  2 failed` (парный vantage `aligned_*` — гвард не переширокий); снятие вызова ТОЛЬКО из `replay` →
-  `misaligned_timeframe_rejected_by_replay ... FAILED` (каждый вход покрыт отдельно); снятие
-  старт-гварда → 4 FAILED в `red_timeframe_guard_startup`.
-  **§8 на ПРОД-АРТЕФАКТЕ** (тот же образ `hft-platform-recorder:local`, что работает на VPS):
-  `GATEWAY_TIMEFRAME_MS=11000` → `exit_code=2` + `config error: ... не выравнен на границу UTC-суток`;
-  `604800000` (недельный, «круглый») → `exit_code=2`; дефолт `1000` → `listening ... (read-only,
-  JWT-auth)`. Прод-дефолт не затронут, поведение принятых конфигов байт-идентично.
-  Историческое описание дефекта (актуально как контекст): M-38a постулирует
-  «`session_of(time_s) = time_s.div_euclid(86_400)` эквивалентен `utc_session_id(ts_ms)`»
-  (`milestones/M-38a-cvd-session-ledger.md:60-62`). Это верно, только если бакет НЕ пересекает 00:00 UTC.
-  `GATEWAY_TIMEFRAME_MS` — свободный env (`crates/gateway-serve/src/lib.rs:516`), без проверки на
-  делимость. При `timeframe_ms`, не выравненном на границу суток, сделки ДВУХ сессий попадают в ОДИН
-  `bucket_time_s`: `Reducer::finish` эмитит две строки с ОДИНАКОВЫМ `time_s` (running не монотонен), а
-  merge-путь (`session_of(time_s)`) сваливает обе в ОДНУ сессию. Репро (reviewer, `GATEWAY_TIMEFRAME_MS`
-  = 11_000, две сделки `d2−2s` BUY 5.0 и `d2+2s` SELL 3.0):
-  ```
-  cumulative_delta = [(1752105597, 500000000), (1752105597, -300000000)]
-  cvd_session_base = []
-  ```
-  **Прод сейчас НЕ затронут** — дефолт `GATEWAY_TIMEFRAME_MS=1000` (`docker-compose.yml:122`,
-  `gateway-serve/src/lib.rs:517`) делит сутки нацело. Нужен либо гвард на выравнивание timeframe, либо
-  вывод сессии бакета из `ts_exch_ms` вместо `session_of(time_s)`. Зона: architect (RED-first).
-  Severity была: **MINOR** (латентный футган конфигурации + тихая полу-правда при `tf <= 0`;
-  в текущем проде не срабатывал). Выбран гвард, а не вывод сессии из `ts_exch_ms`: второе требовало
-  non-additive смены формы провода v7→v8 ровно в момент, когда M-38b замораживает форму состояния
-  в чекпоинте, и покупало поддержку конфигов, для которых session-anchored серия всё равно
-  не определена.
-- **TD-044** `gateway-snapshot-latency-full-history-replay-per-connection` —
-  **✅ CLOSED 2026-07-29** (M-48, merge `0215b34`). Закрыт ПРОД-ЗАМЕРОМ на РЕАЛЬНО прогретом
-  чекпоинте (§8 eyes-on, DECODE снапшота, не grep):
-  ```
-  handshake: HTTP/1.1 101 Switching Protocols
-  LATENCY first Snapshot (от ws handshake) = 1.056 s   [payload 1909321 B]
-  schema_version    = 8
-  cursor            = {"upto_seq": 118449099}
-  history_start_seq = 16049334
-  history_truncated = True
-  series: ohlcv len=61 heatmap len=1697
-  VERDICT: PASS — латентность 1.056 s < 10.0 s
-  ```
-  **409.74 s (M-37) → 382.657 s (M-38b) → 1.056 s (M-48)** — цель «< 10 s» перекрыта с запасом ~10×.
-  Одновременно подтверждён на проводе провенанс VB-I-11: `history_start_seq = 16049334` — ровно тот
-  seq, с которого журнал начинается после необратимого purge M-36, и `history_truncated = true`.
-  То есть кокпит теперь ЗНАЕТ, что «all-time» серия усечена, вместо молчаливой неправды.
-  `cursor.upto_seq = 118449099` > `covered=118434344` ⇒ хвост поверх чекпоинта досчитывается
-  корректно. ⇒ close-out M-28/M-36/M-38b/M-48 разблокирован.
-  **Исторический контекст (M-38b) — сохранён ниже как есть.**
-  ~~**ОСТАЁТСЯ OPEN после merge M-38b (`606aa62`, 2026-07-28).**~~ M-38b доставил КОД
-  лечения (чекпоинт-редьюсер, все гейты зелёные, reviewer APPROVED), но §8 показал, что в проде он
-  **инертен**: чекпоинт невозможно поднять на журнале со спруненным префиксом ⇒ `snapshot_from_checkpoint`
-  каждый раз уходит в fallback-реплей. Прод-замер на M-38b-коде: **382.657 s** (было 409.74 s при
-  журнале 18 GB; сейчас 23 GB) — в пределах того же порядка, улучшения НЕТ. Корень, сырой вывод и
-  разбор — **TD-048**. TD-044 закрывается только прод-замером «первый Snapshot < 10 s» на РЕАЛЬНО
-  прогретом чекпоинте; до тех пор close-out M-28/M-36/M-38b остаётся заблокированным.
-  **Память вылечена (TD-039 CLOSED), латентность — НЕТ, и это блокирует close-out M-28/M-36.**
-  Замер на проде (`e4a8bc6`, журнал 18 GB / 96 `.zst` + 7 raw): **первый Snapshot доставлен за 409.74 s
-  (~6.8 мин)** после `ws auth ok`; процесс прочитал **>21 GiB** (`/proc/<pid>/io read_bytes`) при RssAnon,
-  стоящем на 26 MB. Это ОЖИДАЕМО и заявлено в M-37 §Objective («Путь А ограничивает ПАМЯТЬ; снапшот всё ещё
-  стримит историю от старта → per-connection O(история)»), т.е. НЕ регрессия — до M-37 тот же путь просто
-  OOM-ил. Но следствия рабочие: (1) кокпит непригоден — 6.8 мин до первой отрисовки, и КАЖДОЕ переподключение
-  реплеит журнал заново; (2) стоимость растёт линейно с журналом (~2.8 GB/сут) — через месяц это ~12 мин;
-  (3) N одновременных клиентов = N параллельных полных реплеев. **Фикс — Путь Б (M-38, уже назван в M-37
-  §Cross-references):** чекпоинт-редьюсер с инвариантом `snapshot-from-checkpoint ≡ snapshot-from-START`
-  (байт-идентичность, DET-I-1). Зона: architect (спека + RED), engine-dev (impl).
-  Severity: **MAJOR** (держит close-out M-28 и M-36; данные и safety не затронуты).
-- **TD-043** `multi-session-cvd-under-window-not-covered` (заведено reviewer'ом на close-out M-37, 2026-07-27).
-  Явно отложенный долг, зафиксирован, чтобы не потеряться: `Reducer::finish` (`crates/gateway/src/lib.rs`,
-  комментарий на строках ~839-842) прямо говорит, что running-сумма CVD — «наивная single-running сумма без
-  session-reset; для multi-session нужен per-session ledger (см. C-027 K3 #1); в M-37 тестах multi-session CVD
-  не покрыт, оставлено как есть». Оракулы M-37 (`cvd_base_survives_window_eviction`,
-  `windowed_live_eq_replay_overlap_multistep`) гоняют ОДНУ UTC-сессию. Риск: под окном, пересекающим границу
-  UTC-суток, CVD-база может вести себя не так, как ожидает кокпит (CVD принято считать сессионным — ср. VP,
-  который в M-37 эвиктится ИМЕННО целыми сессиями, т.е. трактовка «сессия» в двух сериях РАЗНАЯ).
-  Не блокер M-37 (вне scope milestone'а, поведение не изменено относительно до-M-37) — но обязан быть
-  покрыт до того, как кокпит начнут читать глазами как источник решений. Зона: architect (RED-first).
-  Severity: **NOTE** (граница достоверности серии, не safety; ордер-пути нет).
-- **TD-042** `windowed-snapshot-apply-double-counts-evicted-cvd-prefix` (найдено reviewer'ом на PR-гейте
-  M-37 rev2, 2026-07-27). **✅ CLOSED 2026-07-27** (`2c3e5e4` engine-dev по RED `1f39899` architect'а,
-  merge `e4a8bc6`). Фикс ровно в корень: `evict_series_bundle_under_window` больше НЕ сдвигает удержанные
-  `cumulative_delta` (значения абсолютны — `Reducer::finish` уже добавил базу), инкрементируется ТОЛЬКО
-  `cvd_session_base`. **Reviewer проверил независимо, не пересказом tester'а:** (а) СОБСТВЕННЫЙ rev2-репро
-  (курсор `C` близко к LATEST ⇒ окна пересекаются) теперь PASS, плюс усиленный вариант (mixed BUY/SELL,
-  разные размеры, fold ПО ОДНОМУ событию — максимум накопления) — PASS; (б) анти-плацебо: ручная
-  реинтродукция сдвига валит РОВНО новый оракул `windowed_live_eq_replay_overlap_multistep` (1 из 4), а три
-  старых остаются зелёными — что и подтверждает исходный диагноз «старые фикстуры слепы»; (в) новый оракул
-  authored architect'ом (`1f39899`, только тесты/rules/milestone), impl — engine-dev (`2c3e5e4`, только src):
-  RED-first порядок и разделение зон соблюдены. Ниже — исходное описание. **Класс «идеальная фикстура» —
-  ТРЕТИЙ РАЗ ПОДРЯД** (M-07 equity-curve, M-08 асимметричный дифф, теперь этот): дефект прошёл ВСЕ зелёные
-  гейты (`verify_M-37.sh` PASS, workspace 397/0, все 3 оракула `red_gateway_window` GREEN) и пойман только
-  на PR-гейте.
-  **Что сломано:** `Snapshot::apply` под окном (`window_ms = Some(W)`) **прибавляет сумму эвиктнутых
-  CVD-дельт к КАЖДОМУ удержанному значению `cumulative_delta` И одновременно инкрементирует
-  `cvd_session_base` на ту же сумму** (`crates/gateway/src/lib.rs`, `evict_series_bundle_under_window`,
-  ветка `if evicted_sum != 0`). Сдвиг учитывается ДВАЖДЫ: один раз в значениях, второй — через базу, которую
-  `merge_cvd_running` затем использует как «previous» при извлечении дельт. Значения `cumulative_delta`
-  абсолютны (= unbounded-running), поэтому при эвикции префикса их менять НЕЛЬЗЯ — обновляться должна ТОЛЬКО
-  база. ⇒ **нарушен GW-I-4 / VB-I-2 под окном:** `snapshot(C) + frames_since(C..) ≢ snapshot(LATEST)`.
-  **Воспроизведение (reviewer, детерминированное, на `c5d9ab8`):** тот же журнал, что в
-  `windowed_live_eq_replay` (180 бакетов × 1 с, `WINDOW_MS=60_000`), но курсор `C` берётся БЛИЗКО к LATEST
-  (`seqs[len-6]`, а не середина). Тогда удержанное окно existing ПЕРЕСЕКАЕТСЯ с финальным окном
-  `[LATEST−W, LATEST]`. Результат: `merged.series.cumulative_delta` СДВИНУТ на `+5e8` ровно на всех 61
-  удержанных бакетах (`full` хвост `…17800000000, 17900000000, 18000000000` против `merged`
-  `…18300000000, 18400000000, 18500000000`); `cvd_session_base` при этом у обоих ОДИНАКОВ (`11900000000`) —
-  расходятся именно значения. Сдвиг = сумма дельт бакетов, эвиктнутых из existing на этом `apply`.
-  **Почему оракул это пропустил:** `windowed_live_eq_replay` ставит `C` в СЕРЕДИНУ истории (90 из 180) →
-  финальное окно `[119, 179]` не пересекается с удержанным окном existing `[30, 89]` → на `apply` из existing
-  эвиктируется ВСЁ, цикл сдвига проходит по ПУСТОМУ списку и баг не проявляется. Непокрытым остался именно
-  ШТАТНЫЙ live-режим: push-loop `gateway-serve` тянет `frames_since` каждые ~сотни мс, поэтому пересечение
-  окон — НОРМА, а не край. Ошибка КОПИТСЯ: каждый `apply` добавляет свой `evicted_sum` ⇒ CVD-кривая кокпита
-  монотонно уезжает вверх от истины.
-  **Границы дефекта (проверено):** offline/unbounded путь (`window_ms = None`) НЕ затронут — `apply` тогда
-  не эвиктирует, обе базы = 0, логика тождественна до-M-37 (`red_gateway_live_eq_replay` GREEN, и это НЕ
-  случайность). Сам `gateway-serve` `Snapshot::apply` не вызывает (шлёт Snapshot+Frame'ы клиенту), поэтому
-  прод-процесс от этого не падает — ломается КОНТРАКТ свёртки, нормативный для любого консюмера кокпита.
-  Память/OOM-цель M-37 дефект не затрагивает.
-  **Зона:** описание/repro — reviewer (этот пункт); **дизайн фикса + RED-оракул — architect** (gates §4:
-  reviewer НЕ проектирует фикс), impl — engine-dev. **Минимум для нового оракула:** `windowed_live_eq_replay`
-  обязан гоняться на курсоре `C`, при котором удержанное окно existing ПЕРЕСЕКАЕТСЯ с финальным (плюс,
-  желательно, многошаговый fold из нескольких последовательных `apply` — накопление ошибки), т.е.
-  деградированный/штатно-live вход по чек-листу `.claude/rules/testing.md`, а не удобный середина-истории.
-  Severity: **MAJOR** (тихая порча данных на live-пути кокпита под зелёными гейтами; держит M-37, а с ним
-  TD-039/M-28/M-36).
-- **TD-040** `bounded-oracle-green-locally-red-on-CI` (найдено reviewer'ом на PR-гейте M-37, 2026-07-27).
-  **✅ CLOSED 2026-07-27 — CI ЗЕЛЁНЫЙ на merge-коммите `e4a8bc6`** (run 30262458105 success; ровно тот
-  раннер, который давал 2/2 FAIL на `c2b926a`). Локально reviewer перепрогнал 4/4 + 3/3 на merged-дереве —
-  флак не воспроизводится ни разу. Ниже — как фикс закрывал корень.
-  Фикс `c5d9ab8` (architect) бьёт ровно в
-  корень, названный в этом пункте: замер больше не зависит от окружения — `MEASURE_LOCK` сериализует оба
-  замеряющих теста (counting-allocator процесс-глобален, а cargo гонял тесты одного бинаря параллельно →
-  чужие аллокации попадали в PEAK), размер сегмента зафиксирован константой `SEG_BYTES = 1 MiB` (журнал
-  растёт ЧИСЛОМ сегментов, не размером → рост отражает аккумуляцию стрима, а не per-segment буфер), добавлен
-  анти-плацебо-контраст `read_all` (peak > THRESHOLD доказывает, что бюджет СПОСОБЕН поймать материализацию),
-  `INDEP_DELTA` поднят 1 → 2 MiB при контрасте ~64 MiB. Reviewer перепрогнал НЕЗАВИСИМО: **4/4 полных прогона
-  `red_gateway_bounded` (оба свойства, дефолтный параллелизм) — PASS, 2 passed/0 failed каждый**; флак не
-  воспроизводится. Анти-плацебо доказан reviewer'ом независимо: при отключённой эвикции (`evict_window_state`
-  → no-op) ОБА свойства FAIL, а `red_gateway_window` FAIL 3/3 — оракулы не плацебо. Ниже — исходное описание.
-  `crates/gateway/tests/red_gateway_bounded.rs::snapshot_stream_working_set_bounded`
-  (Свойство 1, оракул эпохи TD-011, режим `sel_unbounded()` — `window_ms: None`, offline) падает НА CI
-  и проходит ЛОКАЛЬНО — детерминированно с обеих сторон, это НЕ флака:
-  - CI (`c2b926a`, run 30228684188 + rerun `--failed`): **2/2 FAIL** — `red_gateway_bounded.rs:164`
-    «память растёт с РАЗМЕРОМ журнала (+**2 468 066 B**) — не O(1)»; порог `INDEP_DELTA = 1 MiB`,
-    превышение **2.4×**. Второе свойство (`snapshot_memory_bounded_by_window_not_history`, собственно
-    оракул окна M-37) на CI **GREEN** — то есть оконная эвикция работает, ломается независимость от
-    размера журнала в offline-режиме.
-  - Локально (`/tmp/hft-reviewer-M37` @ `c2b926a`): **4/4 PASS** (`verify_M-37.sh` + 3 прямых прогона),
-    `cargo test --workspace` → passed=397 failed=0 (132 блока).
-  Замер — counting-allocator (`#[global_allocator]`, PEAK-дельта) на журналах SMALL=16 MiB / BIG=64 MiB;
-  рост 2.35 MiB на 48 MiB разницы (~5%) — не полный read_all (иначе было бы ~48 MiB), а нечто, масштабирующееся
-  СУБлинейно: похоже на геометрический рост буфера/Vec, чей пик по-разному ложится на разных аллокаторах.
-  **Диагностика и фикс — зона architect** (gates §4: reviewer описывает симптом/repro, architect проектирует).
-  **Отдельный вопрос к architect'у:** сакральный оракул границы ресурса, дающий РАЗНЫЙ вердикт на dev-машине и
-  на раннере, — сам по себе дефект гейта: это прямое нарушение УЖЕ ДЕЙСТВУЮЩЕГО мета-правила
-  `.claude/rules/testing.md` «Целостность гейта — 4 свойства», п. (2) — **«гейт обязан мерить свой инвариант,
-  а не окружение»** (введено в цикле C-006). Порог `INDEP_DELTA`, чей вердикт зависит от аллокатора хоста,
-  меряет окружение. Нужен либо аллокатор-независимый инвариант, либо
-  зафиксированный профиль замера. **Урок, зеркальный TD-011:** там прод-дефект прошёл зелёные юниты; здесь
-  зелёная dev-машина замаскировала то, что поймал CI. Severity: **MAJOR** (держит M-37, а с ним TD-039/TD-020).
 - **TD-041** `governance-M-37-impl-написан-ролью-reviewer-и-отмыт-filter-branch` (reviewer, 2026-07-26/27).
   **Процессный долг; технически РАЗРЕШЁН, оставлен как прецедент-запись.** Хронология:
   (1) impl задач #1-4 M-37 (+343/−37 в `crates/gateway/src/lib.rs`, `crates/gateway-serve/src/lib.rs`) написан
@@ -408,57 +67,6 @@
   коммит на задачу + явную пометку диапазона; смягчающее — #2/#3/#4 образуют неделимую единицу корректности
   (эвикция без CVD-базы сдвигает кривую, без VP whole-session ломает POC), но обоснование в теле отсутствует.
   Severity: **MINOR** (процесс; технический след устранён).
-- **TD-039** `gateway-snapshot-unbounded-memory-OOM-on-prod-scale-journal` (найдено reviewer'ом на §8 M-36,
-  2026-07-26). **✅ CLOSED 2026-07-27 (M-37 merge `e4a8bc6`) — ДОКАЗАНО НА ПРОДЕ, а не тестами.**
-  §8 E2E reviewer'а на VPS (журнал **18 GB**: 96 компактированных `.zst` + 7 raw-сегментов; тот же хост
-  7.5 GiB RAM, что OOM-ил вчера): валидный HS256-JWT → `ws auth ok` → **Snapshot ДОСТАВЛЕН, 1 126 460 B**,
-  `selector.window_ms=60000` (окно РЕАЛЬНО активно в проде — task 7c доставлен end-to-end, класс TD-020
-  «код на main ≠ функция в проде» проверен: `docker exec ... env` показывает `GATEWAY_WINDOW_MS=60000`).
-  Серии окновые: `ohlcv=50`, `cvd=50`, `vwap=50` (≈60 бакетов при `timeframe_ms=1000` ✓), `heatmap=1174`,
-  `bubbles=330`, `depth_rows=2`; `cvd_session_base=-282 577 471 000` — НЕНУЛЕВАЯ база, т.е. сессионно-скалярное
-  пережило эвикцию всей 18-гигабайтной истории (ровно дизайн M-37).
-  **Метрика (RssAnon per TD-021, НЕ `docker stats`):** `26 280 kB → 26 472 kB` (+192 kB) за ~7 минут, пока
-  процесс прочитал **>21 GiB** — ПЛАТО. Контраст с самим долгом: было `308 kB → 672 MB за 8 s (~90 MB/s)`
-  монотонно → 7.3 GB → oom-kill. **`dmesg -T`: все 4 OOM-события — `Sun Jul 26 16:13..16:19` (эпоха TD-039);
-  за 27 июля ни одного**, `RestartCount=0` у обоих контейнеров на всём окне E2E.
-  **Сбор данных не задет:** recorder healthy, `restarts=0`, heartbeat свежий, `writable=true`, `next_seq` растёт.
-  ⚠ Вылечена ПАМЯТЬ, не латентность: первый снапшот строится **409.74 s** — см. **TD-044** (блокирует
-  close-out M-28/M-36). Ниже — исходное описание.
-  **Класс TD-011, этажом выше: unbounded reduce журнала → OOM, под ЗЕЛЁНЫМ idle-healthcheck.**
-  После того как M-36 purge убрал legacy-сегмент (снял crc-блокер TD-038 в корне — см. ниже), §8 E2E gateway-serve
-  на проде вскрыл СЛЕДУЮЩИЙ блокер: валидный JWT → `ws auth ok` → **gateway-serve OOM-killed на построении
-  снапшота** → Docker рестартит (`RestartCount` 0→1 на ОДНО подключение) → клиент получает чистый EOF, снапшот
-  НЕ уходит. Это НЕ порча (crc/parse-ошибок в логах НЕТ; legacy-crc-фрейм уже удалён) — это **память**.
-  **Доказательство (не гипотеза):** kernel oom-killer в `dmesg` — `Out of memory: Killed process (gateway-serve)
-  total-vm:7343460kB, anon-rss:7336824kB` (процесс дорос до **~7.3 GB** при 7.5 GB RAM хоста и убит; global host-OOM,
-  поэтому `docker inspect OOMKilled=false ExitCode=0` — это НЕ cgroup-limit kill, docker просто перезапустил чистый
-  процесс). Живой замер `RssAnon` во время одного построения снапшота: **308 kB → 672 MB за 8 s, монотонно ~90 MB/s**,
-  без плато → траектория ведёт в OOM. Раскладка прод-журнала на момент замера (после purge): 93 компактированных
-  `segment-*.jrnl.zst` (zstd-magic `28b5 2ffd`, НЕ `HFTJRN02`) + активные raw-сегменты (`HFTJRN02`), суммарно ~16 GB;
-  `gateway::snapshot` (lib.rs:1067) реплеит ВЕСЬ журнал от `Cursor::START` по OwnCapture НА КАЖДОЕ подключение.
-  Плавный (не скачкообразный) рост anon указывает на накопление, а не на единичный bogus-`len`-alloc — механизм
-  (материализация событий / per-bucket серии по всей all-time истории / буферизация распаковки `.zst`) — **зона
-  диагностики architect, НЕ reviewer** (gates §4: reviewer описывает симптом/repro, architect проектирует фикс).
-  **Прод НЕ повреждён:** recorder — ОТДЕЛЬНЫЙ процесс, healthy/`restarts=0`/heartbeat свежий/`writable=true`, сбор
-  не задет; gateway-serve idle-healthy (healthcheck TCP проходит) и падает ТОЛЬКО на подключении; живых
-  cockpit-консюмеров ещё нет (M-28 IN_PROGRESS). Revert M-36 НЕ помогает (OOM предшествует M-36, был замаскирован
-  crc-крашем legacy) и НЕ требуется. **Это ровно отложенный вопрос M-36 §Objective п.4 («чекпоинт-редьюсер —
-  сначала замерить latency post-purge»), эскалированный: замер дал не «медленно», а OOM ⇒ bounded-memory снапшот /
-  чекпоинт-редьюсер становится ОБЯЗАТЕЛЬНЫМ, не опциональным.** **Нужно (новый milestone, architect → RED-first):**
-  RED-оракул прод-масштаба на `gateway::snapshot`/`journal::stream` над журналом из компактированных `.zst` +
-  активных сегментов (десятки GB эквивалента) с counting-allocator/RSS-бюджетом (паттерн `red_open_bounded.rs`,
-  TD-011), падающий на текущей unbounded-реализации; фикс — bounded-streaming reduce ЛИБО checkpoint-редьюсер
-  (дешёвый снапшот без реплея всей истории) в крейте-владельце (`gateway`/`journal`) → engine-dev impl → reviewer
-  повторный §8 E2E. Founder подписывает выбор архитектуры снапшота (было отложено на §Ops M-36 п.8). Severity:
-  **MAJOR** (продуктовая цель M-28/M-36 — «фронт получает снапшот» — на проде физически не строится; блокирует ОБА
-  milestone'а).
-  **UPDATE 2026-07-27 (reviewer, PR-гейт M-37):** milestone M-37 «bounded-memory snapshot (Путь А)» построен под
-  этот долг и ЗАВЁРНУТ на post-merge деплой-гейте. Смержен в main (`f1d5eed`), CI покраснел → **откачен**
-  (`9680857` + восстановление аудит-артефактов `8ae7713`; main зелёный, прод на `65519ae` здоров). Причина —
-  **TD-040** (см. выше), НЕ дефект оконной логики: оракул окна (`snapshot_memory_bounded_by_window_not_history`)
-  на CI GREEN. Работа сохранена в `feat/M-37-bounded-snapshot` @ `c2b926a` (гейты локально зелёные:
-  `verify_M-37.sh` PASS, workspace 397/0). TD-039 остаётся **OPEN** — прод по-прежнему OOM'ит на построении
-  снапшота. Повторный заход потребует revert-of-revert либо свежей ветки (git не переиграет уже смерженные коммиты).
 - **TD-038** `gateway-snapshot-crc-mismatch-on-live-compacted-journal` (найдено reviewer'ом на §8 M-28,
   2026-07-26). **Класс TD-011/M-08: зелёные юниты + Deploy-success + healthy TCP-healthcheck ≠ рабочий
   прод.** M-28 gateway-serve — ПЕРВЫЙ раз, когда код `crates/gateway` (M-22/23, read-side reducer/replay
@@ -495,31 +103,6 @@
   на проде БОЛЬШЕ НЕ воспроизводится** — но снапшот теперь падает по ДРУГОЙ причине (OOM на unbounded reduce
   оставшихся `.zst`+активных сегментов, ~7.3 GB RSS). ⇒ crc-часть TD-038 закрыта purge'ем; «рабочий прод-снапшот»
   (общая цель M-28) остаётся НЕ достигнут и теперь гейтится **TD-039**. Оба milestone'а (M-28, M-36) блокирует TD-039.
-- **TD-037** `github-actions-billing-block-halts-ci-cd` — **✅ CLOSED 2026-07-25 (founder восстановил
-  билинг; доказано СКВОЗНЫМ прогоном, а не глазами).** Founder исправил Billing & plans после эскалации;
-  подтверждение: re-run CI на `841d7d3` → success (13:45); затем push M-34 merge `211e452` → CI run
-  30163501141 **success** + Deploy 30163501124 **success** (оба jobs СТАРТОВАЛИ и прошли, не «not started»)
-  → VPS обновлён, recorder healthy. Пайплайн (ci.yml fmt/clippy/test/audit + deploy.yml gated-on-CI)
-  функционирует. Единственный оставшийся артефакт — стей­л failure-run на `1732f91` (billing-окно, не
-  перезапускался; главная давно ушла вперёд на зелёный `211e452`). Ниже — исходное описание.
-  **ВЕСЬ CI/CD пайплайн ОСТАНОВЛЕН на уровне аккаунта GitHub, НЕ регрессия кода.** Push M-35 close-out
-  (`841d7d3`, docs-only) → CI run `30159262236` **failure за 12s**: ВСЕ 5 jobs (`fmt+clippy+test`,
-  `cargo audit`, `Protected artifacts`, `Delivery gate`, `All checks passed`) со статусом «not started»,
-  аннотация GitHub: *«The job was not started because recent account payments have failed or your spending
-  limit needs to be increased. Please check the 'Billing & plans' section.»* Ни один job не запустился —
-  это billing-блок аккаунта, НЕ падение теста/линта. Диф был docs-only (1 markdown, 0 LOC кода, локально
-  fmt exit=0) — код ни при чём. Онсет: между `2026-07-24T23:35Z` (последний зелёный CI, M-33) и
-  `2026-07-25T13:11Z` (первый билинг-фейл). **Следствие (КРИТИЧНО):** (1) `ci.yml` не может гонять
-  fmt/clippy/test/audit → нет автоматического workspace-гейта; (2) `deploy.yml` gated-on-CI (TD-017/018
-  fail-closed) → **автодеплой на VPS НЕВОЗМОЖЕН** (Deploy ждёт CI success, которого не будет) → §8 eyes-on
-  для любого milestone, тронувшего `crates/**`, **выполнить нельзя** до восстановления билинга. M-35
-  (docs-only) деплой не требовал, поэтому смержен, но СЛЕДУЮЩИЙ code-milestone (M-34 TPP и т.д.) упрётся в
-  этот блокер на §8. **Revert НЕ помогает** — billing вне репозитория. **Зона: FOUNDER** (только владелец
-  аккаунта чинит Billing & plans / spending limit; ни один агент не имеет доступа). Severity: **MAJOR**
-  (весь gate-3/§8 контур не функционирует; прод не обновляется и не верифицируется через пайплайн —
-  recorder на VPS продолжает работать на старом образе, но любой фикс/milestone застрянет). До восстановления:
-  code-milestone'ы можно верифицировать ТОЛЬКО локально (reviewer worktree fmt/clippy/test + прямой ssh на
-  VPS вручную), но auto-deploy и CI-гейт недоступны — это НЕ эквивалент §8 (нет CI-подтверждения на merge-SHA).
 - **TD-036** `chain-bootstrap-from-worktree-not-origin-feat` (RN-18 process gap, замечено reviewer'ом
   на PR-гейте M-30, 2026-07-24) — engine-dev НЕ запушил свои GREEN-коммиты (`4fd09d0`/`a896cb8`) на
   `origin/feat/M-30-book-gap-detection` (оставался на architect-RED baseline `ff62333` = compile-RED
@@ -534,84 +117,6 @@
   + tester-profile для M-NN обязаны ЯВНО предписывать intra-chain push GREEN на shared `feat/M-NN`
   ПЕРЕД handoff'ом следующему агенту (gates.md §8 «intra-chain push» уже это требует — правило есть,
   соблюдение в цепочке M-30 не выполнено). Иначе следующий milestone рискует тем же расхождением.
-- **TD-035** `toolchain-drift-local-clippy-weaker-than-CI` — **✅ CLOSED 2026-07-24** (architect durable-фикс
-  `94d055a`, reviewer APPROVED/merged). Пин `rust-toolchain.toml` (`channel = "1.97.0"`, components rustfmt+clippy)
-  + `ci.yml` `dtolnay/rust-toolchain@stable → @1.97.0` (обе job'ы) ⇒ ЕДИНАЯ версия local==CI. gates.md §3 (RN-17)
-  расширен: verify ОБЯЗАН гонять CI-точную команду (`clippy --all-targets --all-features -- -D warnings`) НА
-  ТОЙ ЖЕ версии toolchain; бамп версии — ОДновременно в обоих местах. **Доказано, а не заявлено:** (1) reviewer
-  в worktree — `rust-toolchain.toml` авто-разрешил local в `rustc 1.97.0 / clippy 0.1.97` (был 1.94.1), CI-точный
-  clippy → exit 0; (2) CI на merge (run 30087853334) **success** с `@1.97.0` — пин работает в CI-окружении;
-  (3) **`Delivery gate`** (сборка прод-образа recorder+journal-retention) green с `rust-toolchain.toml` в контексте
-  ⇒ Docker-билд honors пин 1.97.0 (local==CI==Docker-build). Ниже — исходное описание.
-  Локальный toolchain (reviewer/tester/verify) — **clippy/rustc 1.94.1**, CI — **rust-1.97.0**. Lint
-  `clippy::unnecessary_sort_by` затянулся между версиями → локальный `cargo clippy -- -D warnings` СЛАБЕЕ CI.
-  Следствие: M-23 (`8613066`) прошёл `verify_M-23.sh` + tester + reviewer локально (все на 1.94) с 2 clippy-ошибками,
-  которые CI (1.97) отреджектил на merge (`gateway/src/lib.rs:784,791`). Это класс **«green local ≠ green CI»**: три
-  локальных `-D warnings`-гейта дали false-green, потому что RN-17 («verify ⊇ терминальные CI-гейты») подразумевал
-  ОДИНАКОВЫЙ toolchain, а он дрейфанул. Отдельно verify_M-23.sh не CI-эквивалентен и по флагам: CI гоняет
-  `clippy --all-targets --all-features`, verify — `--workspace --all-targets` (без `--all-features`).
-  **Обход в M-23:** engine-dev fix-forward `94230c4` (2 строки), reviewer перепроверил CI-эквивалентным
-  `cargo +1.97.0 clippy --workspace --all-targets --all-features -- -D warnings` (exit 0) перед reland.
-  **Durable-фикс (зона architect, процессный/CI-слой):** (а) закрепить toolchain — `rust-toolchain.toml` с CI-версией,
-  чтобы локальный clippy == CI бит-в-бит; (б) унифицировать verify_*.sh clippy-инвокейшн с CI (`--all-features`).
-  Пока не сделано — reviewer ОБЯЗАН на PR-гейте гонять clippy CI-версией (или не считать локальный `-D warnings`
-  достаточным до зелёного CI). Severity: **MAJOR** (скрытый gate-байпас: локальные гейты не эквивалентны CI —
-  прошёл 3 гейта, пойман только на merge; на будущих milestone'ах повторится с любым новым lint).
-- **TD-031** `segment-provenance-constant-in-container-rollback-isolation-void` (найдено reviewer'ом на
-  §8 M-18, 2026-07-21; **BLOCKING close-out M-18**).
-  **✅ CLOSED 2026-07-21 (merge `7a237f7`, reviewer APPROVED; фикс — МАШИННАЯ изоляция по SCHEMA-ЭПОХЕ,
-  доказано ЖИВЫМ §8, не тестами).** Фикс (не provenance-заплатка, а корень): `SCHEMA_VERSION` 2→3 +
-  `decide_open_segment` reuse требует `header.schema_version == contracts::SCHEMA_VERSION` (engine-dev
-  `c005c83`, +9/−1). `SCHEMA_VERSION` — compile-time константа, вкомпилённая в бинарь; не читается из
-  git/env/fs/часов рантайме → НЕ деградирует в no-git контейнере (в отличие от provenance). risk-critic
-  C-018 **rev4 PASS** (`9d2eefc`, prototype-verified анти-плацебо: schema-клауза снята → RED падает).
-  **§8 HARD-CHECK N2 на VPS (прод HEAD `7a237f7`, CI+Deploy success):** активный сегмент — **`segment-57`
-  с schema_version=3** (header byte[12]=`03`), первое живое L2Delta после fix-деплоя ушло в НЕГО, а НЕ в
-  schema-2 сегмент; fix-бинарь при старте увидел активный `segment-56` (schema-2 header) → `2==3` false →
-  открыл НОВЫЙ `segment-57` (schema-3) — ровно та машинная изоляция, которой provenance не дал. Метрики
-  (nsenter в netns → `127.0.0.1:9101/metrics`): `md_events_total{kind=l2delta,venue=binance,BTCUSDT}=1789`
-  + `{binance_futures,BTCUSDT}=1754`; **non-BTC L2Delta отсутствует** (scope (а)); recorder healthy,
-  `seq_gaps=0`, `next_seq` монотонен, `writable=true`, 0 panic/ERROR/backstop; write-rate ≈ 3.8 GB/сут
-  (в §8 BTC-only бюджете). **⚠ Forensic-уточнение к пунктам 2 ниже:** СМЕШАННЫХ (schema-2 + variant-6)
-  сегментов ДВА — `55` И `56`: pre-fix бинарь (`ce122d1`, schema-2) продолжал капчить L2Delta и ротировал
-  55→56 (закрыт 14:10), пока фикс не деплойнулся (~15:35). RFC §10 называет только 55 — фактический
-  tainted-набор `{55,56}`, оба schema-2 с variant-6 в хвосте; изоляция держится с `57` вперёд.
-  Provenance-константа как таковая НЕ исправлена (сегменты одной schema-эпохи по-прежнему
-  неразличимы по билду) — вынесено в отдельный follow-up (см. `provenance-forensics` ниже). Ниже —
-  исходное описание дефекта (сохранено для аудита). **Симптом:** после деплоя M-18 (`ce122d1`) первое
-  живое `MdPayload::L2Delta` (variant-6) ушло НЕ в новый сегмент, а в **pre-M18 активный
-  `segment-00000055.jrnl`** (создан 12:37 pre-M18 бинарём `fb66b52`, ДО деплоя 12:44). Это провал task 6
-  acceptance («первое BTC L2Delta ушло в НОВЫЙ M-18-provenance сегмент») и **C-018 merge-condition 2**
-  (условие, гейтившее risk-critic PASS). **Корень (reviewer описал; architect проектирует фикс —
-  gates.md §4):** `crates/recorder/src/main.rs:448` строит provenance через `git_short_sha()` =
-  `git rev-parse --short HEAD` В РАНТАЙМЕ, но runtime-контейнер НЕ содержит git/`.git` (проверено:
-  `docker exec … command -v git` → `NO-GIT`; `ls /.git /app/.git` → отсутствует) → `git_short_sha()`
-  возвращает `None` → provenance = КОНСТАНТА `recorder v0.0.0 (git:no-git-info)` на КАЖДОМ деплое
-  (лог recorder'а на старте: `provenance=recorder v0.0.0 (git:no-git-info)`). Поэтому
-  `decide_open_segment` (`segments.rs:1152`) видит `header.provenance == cfg.provenance` → **REUSE**
-  активного сегмента вместо открытия нового. Провенанс НИКОГДА не меняется между деплоями → сегменты
-  катятся ТОЛЬКО по размеру (1 GiB), а не на схема-forward деплое. **Следствия:**
-  1. **Структурная гарантия изоляции C-018 R1 ВОИД В ПРОДЕ.** RED `red_l2delta_rollback_boundary`
-     зелёный ТОЛЬКО потому, что фикстура ЗАДАЁТ разный `provenance`; прод (нет git в контейнере) даёт
-     константу → precondition теста в проде НЕ выполняется. Класс TD-011/TD-014: unit-green ≠ live-поведение.
-  2. **Сегмент 55 — СМЕШАННЫЙ** (pre-M18 варианты 0..5 в начале + post-M18 variant-6 в хвосте) ⇒ чистый
-     quarantine «file-move целого сегмента» из runbook §5.1 больше невозможен без потери pre-M18 данных.
-  3. **Latent rollback-hazard (C-018 R1) снова ЖИВОЙ:** pre-M18 бинарь против сегмента 55 → `scan_tail`
-     не декодит variant-6 → риск тихого seq-reuse. (Смягчение: auto-rollback `deploy.yml` теперь целится
-     в предыдущий УСПЕШНЫЙ SHA = `ce122d1`, уже M-18-aware, декодит variant-6 → немедленный авто-триггер
-     низкий; но любой ручной откат за M-18 или будущий schema-forward вариант несёт тот же дефект.)
-  **Прод СЕЙЧАС здоров и данные безопасны** (recorder healthy, `seq_gaps=0`, `writable=true`, капча
-  L2Delta работает, BTC-only соблюдён) — это НЕ активная порча, а латентный rollback-риск + невыполненная
-  структурная гарантия. **Revert НЕ сделан** (fix-forward per runbook §5.1: деплой pre-M18 бинаря против
-  журнала с variant-6 в активном сегменте — ровно запрещённый hazard; revert опаснее fix-forward).
-  **Нужно (architect, RED-first фикс-forward, прод-масштаб оракул per testing.md):** provenance/эпоха
-  ОБЯЗАНА нести дискриминатор, реально меняющийся при schema-forward деплое НЕЗАВИСИМО от наличия git в
-  рантайме — напр. git-sha вкомпилён на СБОРКЕ (`build.rs`/`vergen`/build-arg → `env!`), а не читается
-  рантаймом; ЛИБО `decide_open_segment` форсит новый сегмент, когда набор декодируемых бинарём вариантов
-  превосходит объявленный в активном сегменте; и/или машинный барьер TD-029 (startup schema-guard),
-  который делает hazard громким независимо от provenance. Оракул обязан ПАДАТЬ на текущем прод-режиме
-  (provenance-константа), а не только на фикстуре с разным provenance. Severity: **MAJOR** (sacred
-  journal-integrity / rollback-safety; MD-only, путь к деньгам не тронут; блокирует close-out M-18).
 - **TD-032** `provenance-constant-in-container-segments-not-build-distinguishable` (заведено reviewer'ом
   на close-out M-18 как C-018 rev4 merge-condition 2 / follow-up к TD-031, 2026-07-21). TD-031 закрыл
   СМЕШЕНИЕ ЭПОХ (schema-2 vs schema-3) машинным schema-гейтом, но НЕ исправил сам корень «provenance =
@@ -687,67 +192,6 @@
   chunked/streaming-write (per-(venue,symbol) файл закрывать по мере прохода, или time-window партиции) —
   зона research-dev, при подключении M-19 к реальному объёму. Severity: **NOTE** (research-инструмент, не
   24/7 прод; данные не теряются — экспорт либо отработает, либо честно OOM'нет, журнал цел).
-- **TD-027** `ops-metrics-declared-and-cataloged-but-not-wired-to-emission` — **✅ CLOSED task 4C
-  (`ac645ac`, reviewer §8 PROD GREEN + APPROVED 2026-07-20).** Фикс: OPS-I-10 «объявлена ⟹ эмитится»
-  — продюсер-сеймы `emit_post_append` (writer), `run_books_feeder`, `sample_rss`/`sample_md_age`
-  (sampler в main), все вызваны в живом `main.rs`. Sacred RED `red_metrics_emission.rs` (6 critic
-  re-audit'ов: label-aware value-ассерты, dead-zero, dimension/value-collapse, kind-aware, RssAnon≠VmRSS)
-  прогоняет РЕАЛЬНЫЕ продюсеры и ассертит SAMPLE (не registry-only). verify-гейт OPS-I-10 (покрытие
-  §3-карты + live-wiring канарейка). **§8 PROD (VPS `ac645ac`) ДОКАЗАЛ живые SAMPLE'ы** (не тестами —
-  scrape /metrics через busybox-sidecar): `journal_bytes_written_total=15245` (TD-011 P0 liveness жив),
-  `journal_seq_current=51923737`, `journal_segment_index=49`, `journal_disk_free_bytes=103.6G`,
-  `md_events_total{venue,symbol,kind}` живой kind-aware (trade 8124/5414, l2snapshot, funding,
-  open_interest — TD-014 жив), `md_event_age_ms{venue}` 83/992/77, `book_levels{venue,symbol,side}`
-  живой per-серия (TD-016 жив), `recorder_rss_anon_bytes=17506304` (RssAnon, TD-016 P1 жив). Гейты
-  reviewer'ом независимо: workspace **282/0**, red_metrics_emission 5/5, clippy 0, fmt clean,
-  `verify_M-09.sh` **PASS (20)**; scope dev-коммита ⊂ `recorder/src/{lib,main,metric_emit}.rs`; critic
-  C-014 re-audit #6 APPROVE. Алерты 3 формирующих инцидентов (TD-011/014/016) теперь ссылаются на
-  ЖИВЫЕ метрики. **Остаточные NOTE:**
-  (1) **✅ DONE task 4D (`f442c96`/merge `83c340c`, reviewer §8 PROD GREEN 2026-07-20):** метрика
-  переименована `journal_bytes_written_total → journal_frames_written_total` (честное имя — счётчик
-  КАДРОВ, +1/append; точный байт-счётчик потребовал бы правки sacred `Journal::append` — out of scope).
-  Чистый rename: 5 файлов (ops/{alerts,metrics}, recorder/{lib,metric_emit}, deploy/alerts/ops.rules.yml),
-  только строковый литерал + комментарии, поведение идентично; TD-011 PromQL перерендерена
-  (`rate(journal_frames_written_total[1m]) == 0`, yml == renderer, drift 0). Гейты reviewer'ом: workspace
-  282/0, clippy 0, verify PASS (21). **§8 PROD (`83c340c`): `journal_frames_written_total=4099` растёт,
-  старое имя ОТСУТСТВУЕТ (grep пусто), healthy restarts=0.** Sacred (oracle `red_metrics_emission.rs`)
-  обновлён architect'ом (`028fe08`), не dev. critic C-015 re-audit APPROVE.
-  (2) **OPEN (до task 3):** `journal_seq_gaps_total` — БЕЗ writer-продюсера (в append-потоке рекордера seq монотонен по
-  построению → естественного gap-триггера нет; классифицирована как event/elsewhere). Правило алерта
-  **OPS-GAP** ссылается на неё → на writer-пути оно НИКОГДА не сработает. Gap реально детектируется
-  ТОЛЬКО на READ/replay-пути (`read_all`/`stream` через границы сегментов) — нужен либо продюсер там,
-  либо пересмотр правила OPS-GAP (зона architect). Ниже — исходное описание (для истории).
-  **Класс TD-011: зелёные гейты (ops 52/52, verify
-  PASS, паритет GREEN) маскируют нерабочий предохранитель.** `/metrics` живёт и отдаёт 15 объявленных
-  семейств (HELP/TYPE на все), НО живые SAMPLES на проде есть ТОЛЬКО у 2: `book_divergence_bps`
-  (sink, 4 серии non-zero) и `venue_http_status_total` (venue recon). Остальные **13 объявлены в
-  реестре `METRICS` + зацитированы в каталоге правил `ops::alerts`, но НИКОГДА не инкрементируются**
-  в рантайме (grep call-site пуст): `journal_bytes_written_total`, `journal_seq_current`,
-  `journal_seq_gaps_total`, `journal_segment_index`, `journal_disk_free_bytes`,
-  `journal_write_errors_total`, `md_events_total`, `md_event_age_ms`, `venue_ws_reconnects_total`,
-  `book_levels`, `recorder_rss_anon_bytes`, `book_resync_total` (0 — корректно, ресинков не было),
-  `backup_restore_drill_ok` (task 3).
-  **СЛЕДСТВИЕ (важное — цель milestone'а):** правила алертов для ТРЁХ ФОРМИРУЮЩИХ M-09 инцидентов
-  ссылаются на МЁРТВЫЕ метрики → эти алерты НИКОГДА не сработают:
-  **TD-011 (P0 «recorder жив, но не пишет» — инцидент №1 milestone'а) → `journal_bytes_written_total`
-  (не wired); TD-014 (P1) → `md_events_total` (не wired); TD-016 (P1) → `recorder_rss_anon_bytes`
-  (не wired); OPS-GAP → `journal_seq_gaps_total` (не wired).** «Система сама сообщает о тихой
-  деградации» для этих классов НЕ достигнута.
-  **Почему паритет это НЕ ловит:** OPS-I-5 — РЕЕСТРОВО-СТАТИЧЕСКИЙ (имя ∈ `METRICS` const ↔ правило ↔
-  §7.1). Он проверяет согласованность ИМЁН, НЕ рантайм-эмиссию. Зелёный паритет даёт ЛОЖНУЮ уверенность,
-  что алерты подкреплены живыми метриками.
-  **Почему НЕ в task 4 (не дефект task 4, а его граница):** task-4 carve-out ЯВНО запрещает трогать
-  journal-write путь (`JR-I-1`) и recorder hot-loop; эмиссия `journal_*` требует именно этого пути,
-  `recorder_rss_anon_bytes` — sampler-таск, `md_events_total`/`book_levels` — recorder-цикл. Это
-  ОТДЕЛЬНАЯ работа с собственным carve-out. Task 4 (эндпоинт + каталог + паритет) СВОЮ приёмку выполнил
-  (см. PROJECT-STATE) — долг НЕ блокирует APPROVED task 4, но БЛОКИРУЕТ реальную наблюдаемость.
-  **Нужно (architect RED-first, следующая задача — task 4C / метрик-эмиссия):** развести каждую
-  объявленную метрику до РЕАЛЬНОГО инкремента (journal append → bytes/seq/gaps/segment/disk/write_errors;
-  MD-событие → md_events_total/age; venue reconnect → ws_reconnects; book-maintenance → book_levels;
-  rss-sampler → recorder_rss_anon_bytes) + RED/§8, который ассертит РАНТАЙМ-эмиссию (не только реестр).
-  **ДО провижининга Alertmanager (§O, founder ★) эти метрики ОБЯЗАНЫ быть живыми — иначе алерты театр.**
-  Severity: **MAJOR** (цель milestone'а для 3 формирующих инцидентов не достигнута; регрессии нет —
-  эндпоинт+каталог net-new и корректны).
 - **TD-025** `recon-runtime-floods-ReconDivergence-on-healthy-prod` (замечено reviewer'ом на §8
   eyes-on M-09 task 2, прод `b1adec0`, 2026-07-18). **Класс TD-011: юнит-гейты ЗЕЛЁНЫЕ (ops 33/33,
   workspace 256/0, verify PASS), а прод пишет ложь под healthy-статусом.** Recon-runtime смержен
@@ -907,22 +351,6 @@
   верификация «измеритель не врёт» ≠ «книга поддержана корректно и bounded» — эвикция мёртвых уровней и
   resync-целостность (Track A 3б/3в) остаются за **M-31**; неограниченный рост уровней (backstop 200k)
   наблюдается отдельно. M-32 = валидация ИЗМЕРЕНИЯ, M-31 = корректность ПОДДЕРЖКИ; ортогональны. TD-016 **OPEN**.
-- **TD-019** `storage-status-not-published-in-heartbeat` — **✅ CLOSED 2026-07-14** (M-08 task 12,
-  `24d8e83`, merge `8882c1e`). heartbeat = JSON с состоянием; **доказано на проде**, а не тестами:
-  `cat recorder.heartbeat` → `{"events":2736,"free_bytes":119134494720,"min_free_bytes":10737418240,
-  "next_seq":18733828,"segment_index":2,"ts_wall_ms":1784038790063,"writable":true}`. Деградация
-  диска теперь видна БЕЗ ssh. Healthcheck compose'а смотрит на mtime, не на содержимое → смена
-  формата прод-безопасна (контейнер healthy, restarts=0). Анти-плацебо: `red_heartbeat_status`
-  FAIL против пред-фиксного дерева (голый таймстамп не парсится как JSON). Ниже — исходное описание.
-  Обещание M-08 E4: «состояние наблюдаемо через `storage_status().writable == false` (recorder
-  публикует его в heartbeat → **видно без ssh**)». По факту `crates/recorder` **ни разу не зовёт**
-  `journal::storage_status` (grep пуст), а `recorder.heartbeat` = **13 байт** (только ms epoch).
-  Проверено на проде: `/root/jctl guard` → `writable=true free_bytes=121230888960`, т.е. API
-  работает — но наружу не выведен. Сам disk-guard fail-closed РАБОТАЕТ и деградация не тихая:
-  `run_writer` делает `journal.append(kind)?` → при storage-guard `Err` writer возвращает `Err` →
-  recorder падает громко (контейнер unhealthy/restart-loop), а не молча теряет события. То есть
-  это дыра в НАБЛЮДАЕМОСТИ, не в safety. Зона: engine-dev (recorder) по RED от architect'а.
-  Severity: **MINOR** (safety не нарушен; но «увидим переполнение диска без ssh» — не выполнено).
 - **TD-020** `retention-implemented-but-never-invoked` (найдено reviewer'ом на §8 M-08, 2026-07-14).
   Ретеншен есть как БИБЛИОТЕКА (`prune_segment` + `ColdCopyProof` + cold-выгрузка, RED зелёный),
   но его **никто не вызывает**: grep `prune_segment|ColdCopyProof|retention` по `crates/recorder/src`
@@ -1317,76 +745,6 @@
   прошлые 133×418/25s; CPU/MEM нормальные, restarts=0. Но полный #4 §8 NOT GREEN из-за нового
   blocker'а TD-014 (нет live L2Snapshot/Funding), поэтому milestone close-out не достигнут.
 
-- **TD-014** `binance-futures-live-depth-funding-not-emitted-after-backoff` (M-06 #4 reland,
-  **CLOSED 2026-07-13 by `c123bbd` + §8 live GREEN**). После фикса TD-013 reland `8b26d6c` прошёл code-review, локальные
-  gates (`red_futures_wired`, fmt, clippy, workspace tests, `verify_M-06.sh` PASS) и GitHub
-  CI+Deploy, но §8 eyes-on на VPS НЕ прошёл продуктовый критерий recorder wire. Наблюдения:
-  3 `venue connect` строки были (`binance`, `hyperliquid`, `binance_futures`), journal рос, seq
-  непрерывен (`seq_gaps=0` на tail-inspection), heartbeat свежий, restarts=0, TD-013 backoff
-  live-работал. Однако в 20 MiB / 115 MiB live journal tails были только `BinanceFutures`
-  OpenInterest + ConnUp; **0 `BinanceFutures` L2Snapshot и 0 Funding**, при частых
-  `venue-binance-futures: depth continuity gap detected, resyncing book` и `snapshot stale vs
-  buffered diffs, refetching with backoff`. Liquidation может быть редким событием, но Funding из
-  `!markPrice@arr` rare-event'ом не является, поэтому отсутствие Funding блокирует reland.
-  Реверт выполнен (`e6b4a75` + `d819cc3`); prod inert-safe re-verified (VPS HEAD `d819cc3`,
-  spot+HL only, futures/418=0, hb age 8s, segment +60KB/5s, CPU/MEM нормальные, restarts=0).
-  **Нужен architect RED/live-equivalent oracle:** futures runner обязан, при mock/controlled fstream
-  depth + markPrice + REST snapshot/backoff сценарии, стабильно эмитить L2Snapshot и Funding после
-  resync/backoff, без hot-loop и без starvation markPrice path. Затем venue-dev fix → engine-dev
-  reland #4 → reviewer full §8. Severity: MAJOR (prod behavior blocker, no order-path impact).
-  **LIVE RELAND-2 RESULT (`af7725f` over `595fc24`, 2026-07-12):** TD-014 fix attempt added
-  `FuturesSession` seam + `run()` delegation and local `red_live_emit` passed; reviewer static check
-  confirmed live path delegates WS text / snapshot result / tick through the seam (no obvious parallel
-  untested runner path). Local gates all GREEN: `red_futures_wired`, `venue-binance-futures` 7/7,
-  workspace tests, fmt/clippy, `verify_M-06.sh` PASS exit=0. Pre-merge §8 on VPS still NOT GREEN:
-  journal tail since deploy had `BinanceFutures` ConnUp and OpenInterest=16 with `seq_gaps=0`, but
-  **0 `BinanceFutures.L2Snapshot` and 0 `BinanceFutures.Funding`**; logs showed repeated
-  `depth continuity gap detected`, `snapshot stale vs buffered diffs`, and 429 backoff. Candidate was
-  not merged; VPS restored to `origin/main` `2bbcbd7` and rechecked healthy, spot+HL only. Current
-  RED/live oracle missed this production mode; TD-014 remains OPEN/BLOCKING.
-  **LIVE TD-014 v2 RESULT (`fac7c07` over `71255c5`, 2026-07-12):** stronger local lifecycle
-  oracle passed and reviewer confirmed the code path is still MD-only and recorder wiring is real.
-  Local gates all GREEN: `red_futures_wired`, `venue-binance-futures` 7/7, workspace tests,
-  fmt/clippy, `verify_M-06.sh` PASS exit=0. Pre-merge §8 on VPS still NOT GREEN: journal tail since
-  deploy had `BinanceFutures.L2Snapshot=16`, `OpenInterest=16`, `seq_gaps=0`, but
-  **`BinanceFutures.Funding=0`**; L2 was sparse rather than expected ~1/s/symbol. Logs during the
-  live window showed ongoing churn (`depth continuity gap` 311, `snapshot stale` 44, `429` 18);
-  initial CPU reached 6.99% before settling near 1.2%. Candidate was not merged; VPS restored to
-  `origin/main` `3eff0db` and rechecked healthy, spot+HL only. TD-014 remains OPEN/BLOCKING.
-  **LIVE TD-014 T2 RESULT (`669ce40` over `38c3175`, 2026-07-12):** futures-continuity oracle
-  (`pu`, not spot `U == last+1`) passed locally and reviewer static check confirmed the dual-rule
-  implementation is MD-only: strict `pu == last_update_id` in steady-state, Binance snapshot-bridge
-  rule in reconcile-loop, mandatory `pu` fail-closed. Local gates all GREEN: `red_futures_wired`,
-  `venue-binance-futures` 8/8, workspace tests, fmt/clippy, `verify_M-06.sh` PASS exit=0. Pre-merge
-  §8 on VPS showed T2 materially improved live depth: `BinanceFutures.L2Snapshot=470`,
-  `OpenInterest=54`, `seq_gaps=0`; after startup, last 3m had `gap=0`, `stale=0`, `429=0`, CPU
-  ~1.1%, restarts=0, and only one non-looping 418. However, the acceptance criterion still failed:
-  **`BinanceFutures.Funding=0`** in the 48 MiB journal tail since deploy. Candidate was not merged;
-  VPS restored to `origin/main` `4012c55` and rechecked healthy, spot+HL only. TD-014 remains
-  OPEN/BLOCKING, now narrowed to persisted live Funding emission under the real fstream path.
-  **LIVE TD-014 T3 RESULT (`99b1329` over `c747a97`, 2026-07-13):** per-symbol markPrice oracle
-  passed locally and reviewer static check confirmed `run()` subscribes to
-  `<sym>@markPrice@1s`, while `FuturesSession::on_ws_text` emits Funding from both per-symbol
-  single-object markPrice and legacy `!markPrice@arr`. Local gates all GREEN: `red_futures_wired`,
-  `venue-binance-futures` 9/9, workspace tests, fmt/clippy, `verify_M-06.sh` PASS exit=0.
-  Pre-merge §8 on VPS still NOT GREEN: journal tails since deploy had
-  `BinanceFutures.L2Snapshot=637`, `OpenInterest=66`, `seq_gaps=0`; later log window was clean
-  (`gap=0`, `stale=0`, `429=0`, CPU ~1.2%, restarts=0), but **`BinanceFutures.Funding=0`**
-  persisted and logs had `markPrice/Funding=0`. Candidate was not merged; VPS restored to
-  `origin/main` `1d5ecfa` and rechecked healthy, spot+HL only. TD-014 remains OPEN/BLOCKING.
-  The next fix must instrument or reproduce raw WS delivery/stream-name/parse-drop behavior:
-  current unit coverage proves parser/session handling, but not that Binance actually delivers
-  a usable markPrice message through this combined session.
-  **LIVE TD-014 T4 RESULT (`c123bbd` over `d9b3b1c`, 2026-07-13):** venue-dev pivoted Funding
-  from dead WS markPrice delivery to REST `/fapi/v1/premiumIndex` all-perps polling, matching the
-  live-proven OI REST path. Local gates all GREEN: `red_futures_wired`, `venue-binance-futures`
-  10/10, workspace tests, fmt/clippy, `verify_M-06.sh` PASS exit=0. Remote Docker verify on VPS
-  also GREEN (`VERDICT: PASS exit=0`; host has no Rust toolchain, so reviewer ran it in
-  `rust:1-slim` with rustfmt/clippy components installed). Pre-merge §8 on VPS GREEN:
-  `BinanceFutures.L2Snapshot=465`, `OpenInterest=48`, **`Funding=48`**, `seq_gaps=0`;
-  late logs `418=0`, `429=0`, `gap=0`, `stale=0`, CPU/MEM normal, restarts=0. Candidate was
-  merged via `1504d8b`; TD-014 CLOSED.
-
 ## Замечания reviewer'а M-35 (margin-inventory / CT-RFC-05, 2026-07-25)
 - **RN-18 ✅ CLOSED** (architect `a6d178f`). `journal/examples/dump.rs` арм нового MdPayload-варианта был
   вне литеральных Allowed-paths task 2b, но необходим для `clippy --all-targets`; architect формально
@@ -1566,6 +924,637 @@
   sacred-файла dev-агентом.
 
 ## CLOSED
+- **TD-048** `checkpoint-не-может-быть-поднят-на-прод-журнале-со-спруненным-префиксом` —
+  **✅ CLOSED 2026-07-29** (M-48, merge `0215b34`; reviewer APPROVED после цикла REJECTED→rev5).
+  **Закрыт ПРОД-ЗАМЕРОМ, не отчётом** (§8 eyes-on на `0215b34`, CI+Deploy оба success):
+  ```
+  $ docker compose --profile ops run --rm gateway-checkpoint
+  gateway-checkpoint: ok dir=/journal ckpt=/ckpt
+    requested_cursor=Cursor { upto_seq: Some(18446744073709551615) }
+    achieved_cursor=Cursor { upto_seq: Some(118434344) }
+    covered=118434344 out=/ckpt/covered_through_seq
+  CKPT_EXIT=0  elapsed=411s            # было CKPT_EXIT=1, чекпоинт не создавался НИКОГДА
+  $ ls /var/lib/docker/volumes/hft-platform_gateway-ckpt/_data
+  ckpt-2a00318f774d9689.bin (1045469 B)   covered_through_seq (118434344)   zz.lock
+  ```
+  `covered_through_seq` = **118434344** — реальное число, не `u64::MAX`. Ops-цепочка доставлена и
+  на VPS: `/etc/cron.d/hft-journal-retention` переустановлен деплоем (`install -m 0644` +
+  `crontab -n` валидация, fail-closed) и содержит `0 4 * * * gateway-checkpoint-cron.sh` —
+  ДО retention `7 4 * * *` (раньше `grep -c gateway-checkpoint` = **0**).
+  **Три блокера rev4, найденные reviewer'ом на PR-гейте и закрытые в rev5 (каждый проверен
+  ЗАМЕРОМ/МУТАЦИЕЙ, не отчётом):**
+  - **B1 — задача #3 (gap-детект GW-I-12) была МЁРТВЫМ КОДОМ.** Нейтрализация спец-проверки
+    разрыва не ломала оракул (`9 passed, 0 failed`); зелёный давала посторонняя ветка. Причина:
+    усечение префикса инвалидировало чекпоинт ⇒ `read_checkpoint` → `None`, и курсор, нужный для
+    `earliest > cursor + 1`, был уже потерян. Фикс (задача #8): `read_checkpoint_header` читает
+    заголовок НЕЗАВИСИМО от валидации состояния (намеренно НЕ сверяя `gateway_schema_version`),
+    поэтому курсор доступен и у непригодного файла. Перепроверено мутацией после фикса:
+    нейтрализация gap-детекта в None-ветке → `gap_between_checkpoint_and_journal_is_loud` **FAILED**
+    (`9 passed, 1 failed`) ⇒ проверка load-bearing.
+  - **B2 — ветка «stale чекпоинт-файл → `Err`» ВОСПРОИЗВОДИЛА TD-048 на другом входе.**
+    `decode_checkpoint` отвергает файл при `gw_v != GATEWAY_SCHEMA_VERSION`, оставляя его на диске;
+    на проде `first_visible_seq=16049334 > 0` навсегда ⇒ после ЛЮБОГО будущего бампа схемы
+    чекпоинтер не поднялся бы до ручного `rm`. Бампы рутинны: v5 (M-23) → v6 (M-36) → v7 (M-38a) →
+    v8 (сам M-48). Воспроизведено reviewer'ом внешним scratch-крейтом: бамп 8→9 → `Err(stale
+    чекпоинт-файл ... Удалите вручную)`. Фикс (задача #9): любая невалидность → ТИХИЙ rebuild +
+    перезапись (GW-I-9б). Перепроверено тем же репро: `advance_to -> Ok(Some(1999))`, файл
+    самолечился до валидного **байт-в-байт**.
+  - **B3 — канарейка ops-цепочки была ВАКУУМНОЙ + деплой не ставил cron.d.** Шаг «обе cron-записи»
+    грепал только `journal-retention-cron.sh` (запись, существовавшую ДО M-48) и прошёл бы при
+    полностью отсутствующем чекпоинтере. Фикс (задача #10): греп ПОИМЁННО обеих записей + канарейка
+    «`deploy.yml` содержит `cron.d`» + сама установка в деплое. Проверено на VPS до merge:
+    `crontab -n` нового cron.d-файла (формат с user-полем) → `rc=0` ⇒ fail-closed путь не
+    ложно-срабатывает.
+  **Исторический контекст дефекта (M-38b, `606aa62`) — сохранён ниже как есть.**
+  **Замер (не пересказ), прод `606aa62`, журнал 23 GB / 116 сегментов:**
+  ```
+  # (1) E2E JWT → первый Snapshot при ПУСТОМ /ckpt (DECODE, не grep):
+  LATENCY first Snapshot (от ws handshake) = 382.657 s      # TD-044 baseline был 409.74 s
+  schema_version = 7; cursor = {"upto_seq": 111647115}; ohlcv len=51; heatmap len=1789
+  VERDICT: FAIL — латентность 382.657 s > 10.0 s
+
+  # (2) попытка поднять чекпоинт штатным ops-путём:
+  $ docker compose --profile ops run --rm gateway-checkpoint
+  gateway-checkpoint: advance_to failed dir=/journal ckpt=/ckpt
+    err=checkpoint::advance_to: нет валидного чекпоинта в /ckpt, но первый видимый сегмент
+    имеет first_seq=16049334 > 0 (префикс уже спрунен). Восстановить полное состояние
+    физически нечем — пишем усечённый чекпоинт, в кокпите едет all-time VWAP, откатиться
+    нечем. ОСТАНОВИТЕСЬ и поднимите чекпоинт вне retention'а (cold storage + ручной rebuild).
+  CKPT_EXIT=1
+  $ ls /var/lib/docker/volumes/hft-platform_gateway-ckpt/_data
+  zz.lock            # ckpt НЕ создан; covered_through_seq НЕ создан
+  ```
+  **Корень.** Гвард `advance_to` (`crates/gateway/src/lib.rs:2178-2186`, задача #9/D2) безусловен:
+  «нет чекпоинта И `first_visible_seq > 0` → `Err`». На проде `segment-00000000` удалён purge'ем
+  M-36 (журнал начинается с `segment-00000001`, `first_seq=16049334`), и это состояние
+  **необратимо** ⇒ бинарь `gateway-checkpoint` не сможет забутстрапиться НИКОГДА. Escape-hatch у
+  бинаря нет: флаги ровно `--dir --ckpt-dir --coverage-out --venue --symbol --timeframe-ms
+  --bands --window-ms --cursor` (проверено по `crates/gateway/src/bin/gateway-checkpoint.rs:112-140`).
+  **Асимметрия, которая и есть дефект дизайна (зона architect, reviewer не проектирует фикс):**
+  read-path `snapshot_from_checkpoint` при отсутствии чекпоинта СПОКОЙНО редуцирует от первого
+  ВИДИМОГО seq и отдаёт результат как «all-time» снапшот — это ровно тот путь, который мы
+  задекодировали в (1) за 382 s. Т.е. усечённая история УЖЕ обслуживается кокпиту; отказывается
+  её персистить только checkpoint-path. Какая семантика верна — решать architect'у, но она обязана
+  быть ОДНА на обоих путях: сейчас одно и то же состояние легально отдавать и нелегально сохранять.
+  **Следствие для ретеншена (вторая, независимая ветка долга).** Прод-инвокер
+  `deploy/bin/journal-retention-cron.sh` (cron 04:07 UTC) НЕ передаёт `--checkpoint-coverage` и не
+  включает override ⇒ `covered=None`, `allow_prune_without_checkpoint=false` ⇒ ветка
+  «true fail-closed» (`crates/journal/src/segments.rs:1699-1710`): все кандидаты уходят в
+  `offload_only`, prune НЕ происходит никогда. Сегодня это не живая регрессия (cron в `dry-run`,
+  prune и так не выполнялся), но операторский путь молча стал no-op'ом — тот же класс, что TD-020.
+  **Ops-цепочка не доставлена.** `deploy/**` НЕ входил в `Allowed paths` M-38b, поэтому
+  `deploy/bin/gateway-checkpoint-cron.sh` + запись в `deploy/cron.d/` не написаны, и на VPS
+  чекпоинтер не запланирован (`crontab -l` содержит только retention 04:07 и compaction 03:50).
+  Задача #5c milestone'а («ops-цепочка cron: сначала чекпоинт, затем retention с этим артефактом»)
+  отмечена DONE по канарейке «бинарь существует + заведён в compose» — grep-green артефакт,
+  ровно то, от чего предостерегает шапка `journal-retention-cron.sh`.
+  **Что НЕ сломано (проверено):** прод здоров и не деградировал — recorder пишет
+  (`next_seq` 111615379 → 111649748 за 8 мин, `writable:true`), оба контейнера `(healthy)`,
+  `gateway-serve` отдаёт валидный v7-снапшот с реальными ценами; ckpt-том смонтирован `:ro`
+  обоим читателям (`docker inspect` → `rw=false`), read-path чекпоинта чисто читающий
+  (`exists()` + `fs::read`, без `flock`/`create_dir_all`) — `:ro` безопасен.
+  **Зона:** architect (дизайн бутстрапа + RED-оракул на прод-форму «префикс спрунен»), затем
+  engine-dev (impl) + ops-цепочка в `deploy/**`. Reviewer описал дефект, фикс не проектирует
+  (`gates.md` §4).
+- **TD-047** `v7-wire-форма-в-docs/fa/viz-backend.md-не-упоминает-vp_session_max_time_s` —
+  **✅ CLOSED 2026-07-28** (architect `6fc6350`, приехал в `main` с merge M-47 `47577c0`; проверено
+  reviewer'ом по диффу: `VB-I-6` теперь перечисляет ОБА per-session поля v7 — `cvd_session_base` и
+  `vp_session_max_time_s` — с семантикой «последний виденный `bucket_time_s` сессии», требованием
+  сортировки, пометкой `serde(default)` = defensive-default (НЕ совместимость, консюмер гейтит на
+  `schema_version == 7`) и существенным порядком «whole-session drop VP ПОСЛЕ `merge_volume_profile`»;
+  `VB-I-10` дописан тем же критерием `vp_session_max_time_s[sid] < lo_time_s`, идентичным
+  `Reducer::evict_window_state`). Доксинк, не код. `VB-I-6` перечисляет форму v7 как
+  «`SeriesBundle.cvd_session_base: Vec<(session_id, base)>` (per-session)», но фикс TD-045 (`e4822e3`,
+  задача #11) добавил в ТУ ЖЕ v7-форму ВТОРОЕ per-session поле — `vp_session_max_time_s:
+  Vec<(session_id, max_time_s)>`, которое уходит на провод (`gateway-serve` JSON passthrough) и является
+  частью контракта с фронтом. FA-спека описывает v7 неполно ⇒ консюмер, читающий только `docs/fa/`,
+  не знает о поле; следующий bump рискует «случайно» его переопределить. Зона: architect (`docs/fa/**`
+  вне зоны reviewer'а). Фикс: дописать поле в VB-I-6/VB-I-10 при ближайшем касании gateway (M-38b —
+  чекпоинт всё равно фиксирует форму состояния). Severity: **NOTE** (док-долг; код/поведение корректны,
+  оракул `red_gateway_window` держит байт-идентичность поля).
+- **TD-046** `cvd-session-split-breaks-when-timeframe-does-not-align-to-utc-midnight` —
+  **✅ CLOSED 2026-07-28** (M-47, merge `47577c0`; RED `f90f170` architect → impl `42a958e`/`9deb9ec`
+  engine-dev; severity по факту прогона поднималась NOTE→MINOR — см. ниже). **Закрыт fail-closed
+  гвардом `GW-I-10`, а не переносом семантики:** `gateway::validate_selector(&Selector)` (критерий
+  `timeframe_ms > 0 && 86_400_000 % timeframe_ms == 0`) вызывается ПЕРВОЙ строкой на ВСЕХ трёх
+  публичных входах библиотеки (`snapshot`/`frames_since`/`replay`, `InvalidInput` + подстрока
+  `timeframe_ms` в сообщении), `gateway-serve::serve_config_from_env` дополнительно отказывает
+  на СТАРТЕ. Байпас-поверхности не остаётся: публичный API крейта `gateway` — ровно эти три функции
+  плюс типы (`Reducer` приватен), а единственный консюмер крейта в workspace — `gateway-serve`
+  (проверено reviewer'ом по `Cargo.toml` и `grep Selector`).
+  **Прогон RED вскрыл ВТОРОЙ режим, в этой записи не описанный:** при `timeframe_ms <= 0`
+  `Reducer::bucket_time_s` возвращал `None` ⇒ `ohlcv`/`cumulative_delta`/`vwap`/`heatmap`/`bubbles`
+  выходили ПУСТЫМИ, а `volume_profile` — ЗАПОЛНЕННЫМ (VP якорится от `utc_session_id(ts_ms)` мимо
+  бакета): кокпит получал `Ok` без единой ошибки — тихая полу-правда, хуже паники.
+  **Анти-плацебо доказан reviewer'ом НЕЗАВИСИМО мутациями impl** (тесты HEAD, правился только
+  `src`): no-op заглушка гварда → `FAILED. 2 passed; 6 failed`; «всегда `Err`» → `FAILED. 6 passed;
+  2 failed` (парный vantage `aligned_*` — гвард не переширокий); снятие вызова ТОЛЬКО из `replay` →
+  `misaligned_timeframe_rejected_by_replay ... FAILED` (каждый вход покрыт отдельно); снятие
+  старт-гварда → 4 FAILED в `red_timeframe_guard_startup`.
+  **§8 на ПРОД-АРТЕФАКТЕ** (тот же образ `hft-platform-recorder:local`, что работает на VPS):
+  `GATEWAY_TIMEFRAME_MS=11000` → `exit_code=2` + `config error: ... не выравнен на границу UTC-суток`;
+  `604800000` (недельный, «круглый») → `exit_code=2`; дефолт `1000` → `listening ... (read-only,
+  JWT-auth)`. Прод-дефолт не затронут, поведение принятых конфигов байт-идентично.
+  Историческое описание дефекта (актуально как контекст): M-38a постулирует
+  «`session_of(time_s) = time_s.div_euclid(86_400)` эквивалентен `utc_session_id(ts_ms)`»
+  (`milestones/M-38a-cvd-session-ledger.md:60-62`). Это верно, только если бакет НЕ пересекает 00:00 UTC.
+  `GATEWAY_TIMEFRAME_MS` — свободный env (`crates/gateway-serve/src/lib.rs:516`), без проверки на
+  делимость. При `timeframe_ms`, не выравненном на границу суток, сделки ДВУХ сессий попадают в ОДИН
+  `bucket_time_s`: `Reducer::finish` эмитит две строки с ОДИНАКОВЫМ `time_s` (running не монотонен), а
+  merge-путь (`session_of(time_s)`) сваливает обе в ОДНУ сессию. Репро (reviewer, `GATEWAY_TIMEFRAME_MS`
+  = 11_000, две сделки `d2−2s` BUY 5.0 и `d2+2s` SELL 3.0):
+  ```
+  cumulative_delta = [(1752105597, 500000000), (1752105597, -300000000)]
+  cvd_session_base = []
+  ```
+  **Прод сейчас НЕ затронут** — дефолт `GATEWAY_TIMEFRAME_MS=1000` (`docker-compose.yml:122`,
+  `gateway-serve/src/lib.rs:517`) делит сутки нацело. Нужен либо гвард на выравнивание timeframe, либо
+  вывод сессии бакета из `ts_exch_ms` вместо `session_of(time_s)`. Зона: architect (RED-first).
+  Severity была: **MINOR** (латентный футган конфигурации + тихая полу-правда при `tf <= 0`;
+  в текущем проде не срабатывал). Выбран гвард, а не вывод сессии из `ts_exch_ms`: второе требовало
+  non-additive смены формы провода v7→v8 ровно в момент, когда M-38b замораживает форму состояния
+  в чекпоинте, и покупало поддержку конфигов, для которых session-anchored серия всё равно
+  не определена.
+- **TD-045** `vp-whole-session-drop-at-bundle-merge-evicts-still-live-session` — **✅ CLOSED 2026-07-27**
+  (`e4822e3` engine-dev по RED `1d38a19` architect'а + critic C-029 PASS; merge `28c186c`).
+  **Фикс в корень:** `SeriesBundle` теперь несёт `vp_session_max_time_s: Vec<(session_id, max_time_s)>`
+  (форма v7, зеркало `cvd_session_base`), `Reducer::finish` эмитит его из единой `session_max_time_s`,
+  `evict_series_bundle_under_window` префикс-фильтрует записи, а whole-session drop VP выполняется в
+  `Snapshot::apply` ПОСЛЕ `merge_volume_profile` по ИДЕНТИЧНОМУ редьюсеру критерию
+  `vp_session_max_time_s[sid] < lo_time_s`. Старый предикат `row.session_id < utc_session_id(at)` УДАЛЁН
+  (не закомментирован — сверено по диффу). Порядок «drop после merge» существенен: drop в эвикции терял
+  бы bins existing для сессии, которую incoming восстанавливает (проверено reviewer'ом отдельным
+  репро-тестом «сессия с паузой» — GREEN).
+  **Анти-плацебо доказан reviewer'ом НЕЗАВИСИМО от architect-фикстуры** (собственный 3-сессионный
+  репро: S1 глубоко в прошлом → drop, S2 пересекается окном → survive, S3 текущая, в ОДНОМ fold'е):
+  ```
+  # lib.rs откачен на e12779f (pre-fix), тесты HEAD:
+  test windowed_live_eq_replay_past_session_survives_overlap ... FAILED   (architect RED)
+       merged.vp=[20279]  # S1 потеряна
+  test reviewer_probe_three_sessions_drop_and_survive_in_one_fold ... FAILED   (репро reviewer'а)
+       merged.vp=[20280]  # S2 потеряна, хотя окно её пересекает
+  # на e4822e3 (fix): оба GREEN, + merged.series == full.series побайтово
+  ```
+  Остаточный риск: **нулевой на safety**, поле только read-path кокпита. Док-долг вынесен в TD-047.
+  **История дефекта (оставлена для аудита — класс «идеальная фикстура»).** Это была РЕГРЕССИЯ
+  относительно `origin/main` cb28145, доказанная прогоном, а не анализом. `Snapshot::apply` (`crates/gateway/src/lib.rs:1245-1254`,
+  коммит `6827965`) получил новый блок, дропающий из existing VP-сессию, если её нет в
+  `incoming.volume_profile` И `row.session_id < utc_session_id(frame.at_ms)`. Условие «день ушёл вперёд»
+  НЕ эквивалентно оконному критерию редьюсера (`session_max_time_s[sid] < lo_time_s`,
+  `evict_window_state`): сразу после 00:00 UTC окно `[at−W, at]` ЕЩЁ пересекает вчерашнюю сессию, и
+  `Reducer` её УДЕРЖИВАЕТ, а merge-путь уже выбросил — `snapshot(C) + frames_since(C..) ≢ snapshot(LATEST)`.
+  Нарушен GW-I-4/VB-I-2 — ровно тот инвариант, ради которого писался M-38a.
+  **Репро (reviewer, фикстура зеркалит `windowed_live_eq_replay_overlap_multistep`, но fold
+  ОСТАНАВЛИВАЕТСЯ раньше — финальное окно ещё пересекает S1):** 180 сделок 1/s вокруг 00:00 UTC
+  (`d2 = 20_279 * 86_400_000`, `t0 = d2 − 90s`), `window_ms = 60_000`, курсор `C = d2+35s`,
+  fold до `at = d2+45s` ⇒ финальное окно `[d2−15s, d2+45s]` пересекает S1.
+  ```
+  merged.vp sessions = [20279]            # M-38a HEAD 291e288
+  full.vp   sessions = [20278, 20279]
+  assertion failed: VP: merged != full под окном, которое ЕЩЁ пересекает S1
+  ```
+  На `origin/main` (cb28145) ТОТ ЖЕ репро — `test result: ok. 1 passed` ⇒ регрессия внесена M-38a.
+  **Оракул односторонний — вот почему это прошло все зелёные гейты.** `windowed_live_eq_replay_overlap_multistep`
+  (C-028 K2) фиксирует ТОЛЬКО направление «S1 обязана быть dropped» (финальное окно целиком в S2) и не
+  имеет парного vantage «S1 обязана УЦЕЛЕТЬ, пока окно её пересекает». Проверено переключением: с блоком
+  K2-оракул GREEN / репро reviewer'а FAIL; без блока K2-оракул FAIL / репро GREEN — реализация не может
+  удовлетворить оба, потому что информации не хватает структурно: `VolumeProfileRow` несёт
+  `session_id/poc/vah/val/va_pct/bins` и НЕ несёт времени, поэтому `evict_series_bundle_under_window`
+  физически не может воспроизвести критерий `session_max_time_s[sid] < lo`. **Дизайн фикса — зона architect**
+  (gates.md §4: reviewer описывает дефект, не проектирует решение); нужен парный RED-оракул на удержание
+  прошлой сессии, пока окно её пересекает. **Класс «идеальная фикстура» — ЧЕТВЁРТЫЙ РАЗ ПОДРЯД**
+  (M-07 equity-curve, M-08 асимметричный дифф, M-37 TD-042, теперь M-38a): оракул давит на инвариант
+  ровно с одной стороны, реализация ложится в эту сторону, вторая сторона ломается молча.
+  Severity была: **MAJOR** (нарушен headline-инвариант milestone'а; данные кокпита расходились live vs
+  replay до W секунд после каждой полуночи; ордер-пути нет).
+- **TD-044** `gateway-snapshot-latency-full-history-replay-per-connection` —
+  **✅ CLOSED 2026-07-29** (M-48, merge `0215b34`). Закрыт ПРОД-ЗАМЕРОМ на РЕАЛЬНО прогретом
+  чекпоинте (§8 eyes-on, DECODE снапшота, не grep):
+  ```
+  handshake: HTTP/1.1 101 Switching Protocols
+  LATENCY first Snapshot (от ws handshake) = 1.056 s   [payload 1909321 B]
+  schema_version    = 8
+  cursor            = {"upto_seq": 118449099}
+  history_start_seq = 16049334
+  history_truncated = True
+  series: ohlcv len=61 heatmap len=1697
+  VERDICT: PASS — латентность 1.056 s < 10.0 s
+  ```
+  **409.74 s (M-37) → 382.657 s (M-38b) → 1.056 s (M-48)** — цель «< 10 s» перекрыта с запасом ~10×.
+  Одновременно подтверждён на проводе провенанс VB-I-11: `history_start_seq = 16049334` — ровно тот
+  seq, с которого журнал начинается после необратимого purge M-36, и `history_truncated = true`.
+  То есть кокпит теперь ЗНАЕТ, что «all-time» серия усечена, вместо молчаливой неправды.
+  `cursor.upto_seq = 118449099` > `covered=118434344` ⇒ хвост поверх чекпоинта досчитывается
+  корректно. ⇒ close-out M-28/M-36/M-38b/M-48 разблокирован.
+  **Исторический контекст (M-38b) — сохранён ниже как есть.**
+  ~~**ОСТАЁТСЯ OPEN после merge M-38b (`606aa62`, 2026-07-28).**~~ M-38b доставил КОД
+  лечения (чекпоинт-редьюсер, все гейты зелёные, reviewer APPROVED), но §8 показал, что в проде он
+  **инертен**: чекпоинт невозможно поднять на журнале со спруненным префиксом ⇒ `snapshot_from_checkpoint`
+  каждый раз уходит в fallback-реплей. Прод-замер на M-38b-коде: **382.657 s** (было 409.74 s при
+  журнале 18 GB; сейчас 23 GB) — в пределах того же порядка, улучшения НЕТ. Корень, сырой вывод и
+  разбор — **TD-048**. TD-044 закрывается только прод-замером «первый Snapshot < 10 s» на РЕАЛЬНО
+  прогретом чекпоинте; до тех пор close-out M-28/M-36/M-38b остаётся заблокированным.
+  **Память вылечена (TD-039 CLOSED), латентность — НЕТ, и это блокирует close-out M-28/M-36.**
+  Замер на проде (`e4a8bc6`, журнал 18 GB / 96 `.zst` + 7 raw): **первый Snapshot доставлен за 409.74 s
+  (~6.8 мин)** после `ws auth ok`; процесс прочитал **>21 GiB** (`/proc/<pid>/io read_bytes`) при RssAnon,
+  стоящем на 26 MB. Это ОЖИДАЕМО и заявлено в M-37 §Objective («Путь А ограничивает ПАМЯТЬ; снапшот всё ещё
+  стримит историю от старта → per-connection O(история)»), т.е. НЕ регрессия — до M-37 тот же путь просто
+  OOM-ил. Но следствия рабочие: (1) кокпит непригоден — 6.8 мин до первой отрисовки, и КАЖДОЕ переподключение
+  реплеит журнал заново; (2) стоимость растёт линейно с журналом (~2.8 GB/сут) — через месяц это ~12 мин;
+  (3) N одновременных клиентов = N параллельных полных реплеев. **Фикс — Путь Б (M-38, уже назван в M-37
+  §Cross-references):** чекпоинт-редьюсер с инвариантом `snapshot-from-checkpoint ≡ snapshot-from-START`
+  (байт-идентичность, DET-I-1). Зона: architect (спека + RED), engine-dev (impl).
+  Severity: **MAJOR** (держит close-out M-28 и M-36; данные и safety не затронуты).
+- **TD-043** `multi-session-cvd-under-window-not-covered` — **✅ CLOSED 2026-07-27** (M-38a, merge
+  `28c186c`). CVD стал per-session ledger (`cvd: BTreeMap<session_id, CvdSession{base, bucket_delta}>`),
+  running обнуляется на 00:00 UTC, эвикция целыми прошлыми сессиями по ТОМУ ЖЕ критерию, что VP
+  (unified `session_max_time_s`), форма `cvd_session_base: Vec<(session_id, base)>`,
+  `GATEWAY_SCHEMA_VERSION` 6→7. Оракулы: `red_gateway_cvd_session` (4 runtime-RED на single-running),
+  `red_gateway_window::cvd_two_sessions_live_across_midnight_window`, `red_gateway_schema_v7`.
+  Трактовка «сессия» в VP и CVD теперь ОДНА (исходная претензия долга снята). Подтверждено на проде
+  (§8 E2E M-38a, см. `PROJECT-STATE.md`).
+- **TD-042** `windowed-snapshot-apply-double-counts-evicted-cvd-prefix` (найдено reviewer'ом на PR-гейте
+  M-37 rev2, 2026-07-27). **✅ CLOSED 2026-07-27** (`2c3e5e4` engine-dev по RED `1f39899` architect'а,
+  merge `e4a8bc6`). Фикс ровно в корень: `evict_series_bundle_under_window` больше НЕ сдвигает удержанные
+  `cumulative_delta` (значения абсолютны — `Reducer::finish` уже добавил базу), инкрементируется ТОЛЬКО
+  `cvd_session_base`. **Reviewer проверил независимо, не пересказом tester'а:** (а) СОБСТВЕННЫЙ rev2-репро
+  (курсор `C` близко к LATEST ⇒ окна пересекаются) теперь PASS, плюс усиленный вариант (mixed BUY/SELL,
+  разные размеры, fold ПО ОДНОМУ событию — максимум накопления) — PASS; (б) анти-плацебо: ручная
+  реинтродукция сдвига валит РОВНО новый оракул `windowed_live_eq_replay_overlap_multistep` (1 из 4), а три
+  старых остаются зелёными — что и подтверждает исходный диагноз «старые фикстуры слепы»; (в) новый оракул
+  authored architect'ом (`1f39899`, только тесты/rules/milestone), impl — engine-dev (`2c3e5e4`, только src):
+  RED-first порядок и разделение зон соблюдены. Ниже — исходное описание. **Класс «идеальная фикстура» —
+  ТРЕТИЙ РАЗ ПОДРЯД** (M-07 equity-curve, M-08 асимметричный дифф, теперь этот): дефект прошёл ВСЕ зелёные
+  гейты (`verify_M-37.sh` PASS, workspace 397/0, все 3 оракула `red_gateway_window` GREEN) и пойман только
+  на PR-гейте.
+  **Что сломано:** `Snapshot::apply` под окном (`window_ms = Some(W)`) **прибавляет сумму эвиктнутых
+  CVD-дельт к КАЖДОМУ удержанному значению `cumulative_delta` И одновременно инкрементирует
+  `cvd_session_base` на ту же сумму** (`crates/gateway/src/lib.rs`, `evict_series_bundle_under_window`,
+  ветка `if evicted_sum != 0`). Сдвиг учитывается ДВАЖДЫ: один раз в значениях, второй — через базу, которую
+  `merge_cvd_running` затем использует как «previous» при извлечении дельт. Значения `cumulative_delta`
+  абсолютны (= unbounded-running), поэтому при эвикции префикса их менять НЕЛЬЗЯ — обновляться должна ТОЛЬКО
+  база. ⇒ **нарушен GW-I-4 / VB-I-2 под окном:** `snapshot(C) + frames_since(C..) ≢ snapshot(LATEST)`.
+  **Воспроизведение (reviewer, детерминированное, на `c5d9ab8`):** тот же журнал, что в
+  `windowed_live_eq_replay` (180 бакетов × 1 с, `WINDOW_MS=60_000`), но курсор `C` берётся БЛИЗКО к LATEST
+  (`seqs[len-6]`, а не середина). Тогда удержанное окно existing ПЕРЕСЕКАЕТСЯ с финальным окном
+  `[LATEST−W, LATEST]`. Результат: `merged.series.cumulative_delta` СДВИНУТ на `+5e8` ровно на всех 61
+  удержанных бакетах (`full` хвост `…17800000000, 17900000000, 18000000000` против `merged`
+  `…18300000000, 18400000000, 18500000000`); `cvd_session_base` при этом у обоих ОДИНАКОВ (`11900000000`) —
+  расходятся именно значения. Сдвиг = сумма дельт бакетов, эвиктнутых из existing на этом `apply`.
+  **Почему оракул это пропустил:** `windowed_live_eq_replay` ставит `C` в СЕРЕДИНУ истории (90 из 180) →
+  финальное окно `[119, 179]` не пересекается с удержанным окном existing `[30, 89]` → на `apply` из existing
+  эвиктируется ВСЁ, цикл сдвига проходит по ПУСТОМУ списку и баг не проявляется. Непокрытым остался именно
+  ШТАТНЫЙ live-режим: push-loop `gateway-serve` тянет `frames_since` каждые ~сотни мс, поэтому пересечение
+  окон — НОРМА, а не край. Ошибка КОПИТСЯ: каждый `apply` добавляет свой `evicted_sum` ⇒ CVD-кривая кокпита
+  монотонно уезжает вверх от истины.
+  **Границы дефекта (проверено):** offline/unbounded путь (`window_ms = None`) НЕ затронут — `apply` тогда
+  не эвиктирует, обе базы = 0, логика тождественна до-M-37 (`red_gateway_live_eq_replay` GREEN, и это НЕ
+  случайность). Сам `gateway-serve` `Snapshot::apply` не вызывает (шлёт Snapshot+Frame'ы клиенту), поэтому
+  прод-процесс от этого не падает — ломается КОНТРАКТ свёртки, нормативный для любого консюмера кокпита.
+  Память/OOM-цель M-37 дефект не затрагивает.
+  **Зона:** описание/repro — reviewer (этот пункт); **дизайн фикса + RED-оракул — architect** (gates §4:
+  reviewer НЕ проектирует фикс), impl — engine-dev. **Минимум для нового оракула:** `windowed_live_eq_replay`
+  обязан гоняться на курсоре `C`, при котором удержанное окно existing ПЕРЕСЕКАЕТСЯ с финальным (плюс,
+  желательно, многошаговый fold из нескольких последовательных `apply` — накопление ошибки), т.е.
+  деградированный/штатно-live вход по чек-листу `.claude/rules/testing.md`, а не удобный середина-истории.
+  Severity: **MAJOR** (тихая порча данных на live-пути кокпита под зелёными гейтами; держит M-37, а с ним
+  TD-039/M-28/M-36).
+- **TD-040** `bounded-oracle-green-locally-red-on-CI` (найдено reviewer'ом на PR-гейте M-37, 2026-07-27).
+  **✅ CLOSED 2026-07-27 — CI ЗЕЛЁНЫЙ на merge-коммите `e4a8bc6`** (run 30262458105 success; ровно тот
+  раннер, который давал 2/2 FAIL на `c2b926a`). Локально reviewer перепрогнал 4/4 + 3/3 на merged-дереве —
+  флак не воспроизводится ни разу. Ниже — как фикс закрывал корень.
+  Фикс `c5d9ab8` (architect) бьёт ровно в
+  корень, названный в этом пункте: замер больше не зависит от окружения — `MEASURE_LOCK` сериализует оба
+  замеряющих теста (counting-allocator процесс-глобален, а cargo гонял тесты одного бинаря параллельно →
+  чужие аллокации попадали в PEAK), размер сегмента зафиксирован константой `SEG_BYTES = 1 MiB` (журнал
+  растёт ЧИСЛОМ сегментов, не размером → рост отражает аккумуляцию стрима, а не per-segment буфер), добавлен
+  анти-плацебо-контраст `read_all` (peak > THRESHOLD доказывает, что бюджет СПОСОБЕН поймать материализацию),
+  `INDEP_DELTA` поднят 1 → 2 MiB при контрасте ~64 MiB. Reviewer перепрогнал НЕЗАВИСИМО: **4/4 полных прогона
+  `red_gateway_bounded` (оба свойства, дефолтный параллелизм) — PASS, 2 passed/0 failed каждый**; флак не
+  воспроизводится. Анти-плацебо доказан reviewer'ом независимо: при отключённой эвикции (`evict_window_state`
+  → no-op) ОБА свойства FAIL, а `red_gateway_window` FAIL 3/3 — оракулы не плацебо. Ниже — исходное описание.
+  `crates/gateway/tests/red_gateway_bounded.rs::snapshot_stream_working_set_bounded`
+  (Свойство 1, оракул эпохи TD-011, режим `sel_unbounded()` — `window_ms: None`, offline) падает НА CI
+  и проходит ЛОКАЛЬНО — детерминированно с обеих сторон, это НЕ флака:
+  - CI (`c2b926a`, run 30228684188 + rerun `--failed`): **2/2 FAIL** — `red_gateway_bounded.rs:164`
+    «память растёт с РАЗМЕРОМ журнала (+**2 468 066 B**) — не O(1)»; порог `INDEP_DELTA = 1 MiB`,
+    превышение **2.4×**. Второе свойство (`snapshot_memory_bounded_by_window_not_history`, собственно
+    оракул окна M-37) на CI **GREEN** — то есть оконная эвикция работает, ломается независимость от
+    размера журнала в offline-режиме.
+  - Локально (`/tmp/hft-reviewer-M37` @ `c2b926a`): **4/4 PASS** (`verify_M-37.sh` + 3 прямых прогона),
+    `cargo test --workspace` → passed=397 failed=0 (132 блока).
+  Замер — counting-allocator (`#[global_allocator]`, PEAK-дельта) на журналах SMALL=16 MiB / BIG=64 MiB;
+  рост 2.35 MiB на 48 MiB разницы (~5%) — не полный read_all (иначе было бы ~48 MiB), а нечто, масштабирующееся
+  СУБлинейно: похоже на геометрический рост буфера/Vec, чей пик по-разному ложится на разных аллокаторах.
+  **Диагностика и фикс — зона architect** (gates §4: reviewer описывает симптом/repro, architect проектирует).
+  **Отдельный вопрос к architect'у:** сакральный оракул границы ресурса, дающий РАЗНЫЙ вердикт на dev-машине и
+  на раннере, — сам по себе дефект гейта: это прямое нарушение УЖЕ ДЕЙСТВУЮЩЕГО мета-правила
+  `.claude/rules/testing.md` «Целостность гейта — 4 свойства», п. (2) — **«гейт обязан мерить свой инвариант,
+  а не окружение»** (введено в цикле C-006). Порог `INDEP_DELTA`, чей вердикт зависит от аллокатора хоста,
+  меряет окружение. Нужен либо аллокатор-независимый инвариант, либо
+  зафиксированный профиль замера. **Урок, зеркальный TD-011:** там прод-дефект прошёл зелёные юниты; здесь
+  зелёная dev-машина замаскировала то, что поймал CI. Severity: **MAJOR** (держит M-37, а с ним TD-039/TD-020).
+- **TD-039** `gateway-snapshot-unbounded-memory-OOM-on-prod-scale-journal` (найдено reviewer'ом на §8 M-36,
+  2026-07-26). **✅ CLOSED 2026-07-27 (M-37 merge `e4a8bc6`) — ДОКАЗАНО НА ПРОДЕ, а не тестами.**
+  §8 E2E reviewer'а на VPS (журнал **18 GB**: 96 компактированных `.zst` + 7 raw-сегментов; тот же хост
+  7.5 GiB RAM, что OOM-ил вчера): валидный HS256-JWT → `ws auth ok` → **Snapshot ДОСТАВЛЕН, 1 126 460 B**,
+  `selector.window_ms=60000` (окно РЕАЛЬНО активно в проде — task 7c доставлен end-to-end, класс TD-020
+  «код на main ≠ функция в проде» проверен: `docker exec ... env` показывает `GATEWAY_WINDOW_MS=60000`).
+  Серии окновые: `ohlcv=50`, `cvd=50`, `vwap=50` (≈60 бакетов при `timeframe_ms=1000` ✓), `heatmap=1174`,
+  `bubbles=330`, `depth_rows=2`; `cvd_session_base=-282 577 471 000` — НЕНУЛЕВАЯ база, т.е. сессионно-скалярное
+  пережило эвикцию всей 18-гигабайтной истории (ровно дизайн M-37).
+  **Метрика (RssAnon per TD-021, НЕ `docker stats`):** `26 280 kB → 26 472 kB` (+192 kB) за ~7 минут, пока
+  процесс прочитал **>21 GiB** — ПЛАТО. Контраст с самим долгом: было `308 kB → 672 MB за 8 s (~90 MB/s)`
+  монотонно → 7.3 GB → oom-kill. **`dmesg -T`: все 4 OOM-события — `Sun Jul 26 16:13..16:19` (эпоха TD-039);
+  за 27 июля ни одного**, `RestartCount=0` у обоих контейнеров на всём окне E2E.
+  **Сбор данных не задет:** recorder healthy, `restarts=0`, heartbeat свежий, `writable=true`, `next_seq` растёт.
+  ⚠ Вылечена ПАМЯТЬ, не латентность: первый снапшот строится **409.74 s** — см. **TD-044** (блокирует
+  close-out M-28/M-36). Ниже — исходное описание.
+  **Класс TD-011, этажом выше: unbounded reduce журнала → OOM, под ЗЕЛЁНЫМ idle-healthcheck.**
+  После того как M-36 purge убрал legacy-сегмент (снял crc-блокер TD-038 в корне — см. ниже), §8 E2E gateway-serve
+  на проде вскрыл СЛЕДУЮЩИЙ блокер: валидный JWT → `ws auth ok` → **gateway-serve OOM-killed на построении
+  снапшота** → Docker рестартит (`RestartCount` 0→1 на ОДНО подключение) → клиент получает чистый EOF, снапшот
+  НЕ уходит. Это НЕ порча (crc/parse-ошибок в логах НЕТ; legacy-crc-фрейм уже удалён) — это **память**.
+  **Доказательство (не гипотеза):** kernel oom-killer в `dmesg` — `Out of memory: Killed process (gateway-serve)
+  total-vm:7343460kB, anon-rss:7336824kB` (процесс дорос до **~7.3 GB** при 7.5 GB RAM хоста и убит; global host-OOM,
+  поэтому `docker inspect OOMKilled=false ExitCode=0` — это НЕ cgroup-limit kill, docker просто перезапустил чистый
+  процесс). Живой замер `RssAnon` во время одного построения снапшота: **308 kB → 672 MB за 8 s, монотонно ~90 MB/s**,
+  без плато → траектория ведёт в OOM. Раскладка прод-журнала на момент замера (после purge): 93 компактированных
+  `segment-*.jrnl.zst` (zstd-magic `28b5 2ffd`, НЕ `HFTJRN02`) + активные raw-сегменты (`HFTJRN02`), суммарно ~16 GB;
+  `gateway::snapshot` (lib.rs:1067) реплеит ВЕСЬ журнал от `Cursor::START` по OwnCapture НА КАЖДОЕ подключение.
+  Плавный (не скачкообразный) рост anon указывает на накопление, а не на единичный bogus-`len`-alloc — механизм
+  (материализация событий / per-bucket серии по всей all-time истории / буферизация распаковки `.zst`) — **зона
+  диагностики architect, НЕ reviewer** (gates §4: reviewer описывает симптом/repro, architect проектирует фикс).
+  **Прод НЕ повреждён:** recorder — ОТДЕЛЬНЫЙ процесс, healthy/`restarts=0`/heartbeat свежий/`writable=true`, сбор
+  не задет; gateway-serve idle-healthy (healthcheck TCP проходит) и падает ТОЛЬКО на подключении; живых
+  cockpit-консюмеров ещё нет (M-28 IN_PROGRESS). Revert M-36 НЕ помогает (OOM предшествует M-36, был замаскирован
+  crc-крашем legacy) и НЕ требуется. **Это ровно отложенный вопрос M-36 §Objective п.4 («чекпоинт-редьюсер —
+  сначала замерить latency post-purge»), эскалированный: замер дал не «медленно», а OOM ⇒ bounded-memory снапшот /
+  чекпоинт-редьюсер становится ОБЯЗАТЕЛЬНЫМ, не опциональным.** **Нужно (новый milestone, architect → RED-first):**
+  RED-оракул прод-масштаба на `gateway::snapshot`/`journal::stream` над журналом из компактированных `.zst` +
+  активных сегментов (десятки GB эквивалента) с counting-allocator/RSS-бюджетом (паттерн `red_open_bounded.rs`,
+  TD-011), падающий на текущей unbounded-реализации; фикс — bounded-streaming reduce ЛИБО checkpoint-редьюсер
+  (дешёвый снапшот без реплея всей истории) в крейте-владельце (`gateway`/`journal`) → engine-dev impl → reviewer
+  повторный §8 E2E. Founder подписывает выбор архитектуры снапшота (было отложено на §Ops M-36 п.8). Severity:
+  **MAJOR** (продуктовая цель M-28/M-36 — «фронт получает снапшот» — на проде физически не строится; блокирует ОБА
+  milestone'а).
+  **UPDATE 2026-07-27 (reviewer, PR-гейт M-37):** milestone M-37 «bounded-memory snapshot (Путь А)» построен под
+  этот долг и ЗАВЁРНУТ на post-merge деплой-гейте. Смержен в main (`f1d5eed`), CI покраснел → **откачен**
+  (`9680857` + восстановление аудит-артефактов `8ae7713`; main зелёный, прод на `65519ae` здоров). Причина —
+  **TD-040** (см. выше), НЕ дефект оконной логики: оракул окна (`snapshot_memory_bounded_by_window_not_history`)
+  на CI GREEN. Работа сохранена в `feat/M-37-bounded-snapshot` @ `c2b926a` (гейты локально зелёные:
+  `verify_M-37.sh` PASS, workspace 397/0). TD-039 остаётся **OPEN** — прод по-прежнему OOM'ит на построении
+  снапшота. Повторный заход потребует revert-of-revert либо свежей ветки (git не переиграет уже смерженные коммиты).
+- **TD-037** `github-actions-billing-block-halts-ci-cd` — **✅ CLOSED 2026-07-25 (founder восстановил
+  билинг; доказано СКВОЗНЫМ прогоном, а не глазами).** Founder исправил Billing & plans после эскалации;
+  подтверждение: re-run CI на `841d7d3` → success (13:45); затем push M-34 merge `211e452` → CI run
+  30163501141 **success** + Deploy 30163501124 **success** (оба jobs СТАРТОВАЛИ и прошли, не «not started»)
+  → VPS обновлён, recorder healthy. Пайплайн (ci.yml fmt/clippy/test/audit + deploy.yml gated-on-CI)
+  функционирует. Единственный оставшийся артефакт — стей­л failure-run на `1732f91` (billing-окно, не
+  перезапускался; главная давно ушла вперёд на зелёный `211e452`). Ниже — исходное описание.
+  **ВЕСЬ CI/CD пайплайн ОСТАНОВЛЕН на уровне аккаунта GitHub, НЕ регрессия кода.** Push M-35 close-out
+  (`841d7d3`, docs-only) → CI run `30159262236` **failure за 12s**: ВСЕ 5 jobs (`fmt+clippy+test`,
+  `cargo audit`, `Protected artifacts`, `Delivery gate`, `All checks passed`) со статусом «not started»,
+  аннотация GitHub: *«The job was not started because recent account payments have failed or your spending
+  limit needs to be increased. Please check the 'Billing & plans' section.»* Ни один job не запустился —
+  это billing-блок аккаунта, НЕ падение теста/линта. Диф был docs-only (1 markdown, 0 LOC кода, локально
+  fmt exit=0) — код ни при чём. Онсет: между `2026-07-24T23:35Z` (последний зелёный CI, M-33) и
+  `2026-07-25T13:11Z` (первый билинг-фейл). **Следствие (КРИТИЧНО):** (1) `ci.yml` не может гонять
+  fmt/clippy/test/audit → нет автоматического workspace-гейта; (2) `deploy.yml` gated-on-CI (TD-017/018
+  fail-closed) → **автодеплой на VPS НЕВОЗМОЖЕН** (Deploy ждёт CI success, которого не будет) → §8 eyes-on
+  для любого milestone, тронувшего `crates/**`, **выполнить нельзя** до восстановления билинга. M-35
+  (docs-only) деплой не требовал, поэтому смержен, но СЛЕДУЮЩИЙ code-milestone (M-34 TPP и т.д.) упрётся в
+  этот блокер на §8. **Revert НЕ помогает** — billing вне репозитория. **Зона: FOUNDER** (только владелец
+  аккаунта чинит Billing & plans / spending limit; ни один агент не имеет доступа). Severity: **MAJOR**
+  (весь gate-3/§8 контур не функционирует; прод не обновляется и не верифицируется через пайплайн —
+  recorder на VPS продолжает работать на старом образе, но любой фикс/milestone застрянет). До восстановления:
+  code-milestone'ы можно верифицировать ТОЛЬКО локально (reviewer worktree fmt/clippy/test + прямой ssh на
+  VPS вручную), но auto-deploy и CI-гейт недоступны — это НЕ эквивалент §8 (нет CI-подтверждения на merge-SHA).
+- **TD-035** `toolchain-drift-local-clippy-weaker-than-CI` — **✅ CLOSED 2026-07-24** (architect durable-фикс
+  `94d055a`, reviewer APPROVED/merged). Пин `rust-toolchain.toml` (`channel = "1.97.0"`, components rustfmt+clippy)
+  + `ci.yml` `dtolnay/rust-toolchain@stable → @1.97.0` (обе job'ы) ⇒ ЕДИНАЯ версия local==CI. gates.md §3 (RN-17)
+  расширен: verify ОБЯЗАН гонять CI-точную команду (`clippy --all-targets --all-features -- -D warnings`) НА
+  ТОЙ ЖЕ версии toolchain; бамп версии — ОДновременно в обоих местах. **Доказано, а не заявлено:** (1) reviewer
+  в worktree — `rust-toolchain.toml` авто-разрешил local в `rustc 1.97.0 / clippy 0.1.97` (был 1.94.1), CI-точный
+  clippy → exit 0; (2) CI на merge (run 30087853334) **success** с `@1.97.0` — пин работает в CI-окружении;
+  (3) **`Delivery gate`** (сборка прод-образа recorder+journal-retention) green с `rust-toolchain.toml` в контексте
+  ⇒ Docker-билд honors пин 1.97.0 (local==CI==Docker-build). Ниже — исходное описание.
+  Локальный toolchain (reviewer/tester/verify) — **clippy/rustc 1.94.1**, CI — **rust-1.97.0**. Lint
+  `clippy::unnecessary_sort_by` затянулся между версиями → локальный `cargo clippy -- -D warnings` СЛАБЕЕ CI.
+  Следствие: M-23 (`8613066`) прошёл `verify_M-23.sh` + tester + reviewer локально (все на 1.94) с 2 clippy-ошибками,
+  которые CI (1.97) отреджектил на merge (`gateway/src/lib.rs:784,791`). Это класс **«green local ≠ green CI»**: три
+  локальных `-D warnings`-гейта дали false-green, потому что RN-17 («verify ⊇ терминальные CI-гейты») подразумевал
+  ОДИНАКОВЫЙ toolchain, а он дрейфанул. Отдельно verify_M-23.sh не CI-эквивалентен и по флагам: CI гоняет
+  `clippy --all-targets --all-features`, verify — `--workspace --all-targets` (без `--all-features`).
+  **Обход в M-23:** engine-dev fix-forward `94230c4` (2 строки), reviewer перепроверил CI-эквивалентным
+  `cargo +1.97.0 clippy --workspace --all-targets --all-features -- -D warnings` (exit 0) перед reland.
+  **Durable-фикс (зона architect, процессный/CI-слой):** (а) закрепить toolchain — `rust-toolchain.toml` с CI-версией,
+  чтобы локальный clippy == CI бит-в-бит; (б) унифицировать verify_*.sh clippy-инвокейшн с CI (`--all-features`).
+  Пока не сделано — reviewer ОБЯЗАН на PR-гейте гонять clippy CI-версией (или не считать локальный `-D warnings`
+  достаточным до зелёного CI). Severity: **MAJOR** (скрытый gate-байпас: локальные гейты не эквивалентны CI —
+  прошёл 3 гейта, пойман только на merge; на будущих milestone'ах повторится с любым новым lint).
+- **TD-031** `segment-provenance-constant-in-container-rollback-isolation-void` (найдено reviewer'ом на
+  §8 M-18, 2026-07-21; **BLOCKING close-out M-18**).
+  **✅ CLOSED 2026-07-21 (merge `7a237f7`, reviewer APPROVED; фикс — МАШИННАЯ изоляция по SCHEMA-ЭПОХЕ,
+  доказано ЖИВЫМ §8, не тестами).** Фикс (не provenance-заплатка, а корень): `SCHEMA_VERSION` 2→3 +
+  `decide_open_segment` reuse требует `header.schema_version == contracts::SCHEMA_VERSION` (engine-dev
+  `c005c83`, +9/−1). `SCHEMA_VERSION` — compile-time константа, вкомпилённая в бинарь; не читается из
+  git/env/fs/часов рантайме → НЕ деградирует в no-git контейнере (в отличие от provenance). risk-critic
+  C-018 **rev4 PASS** (`9d2eefc`, prototype-verified анти-плацебо: schema-клауза снята → RED падает).
+  **§8 HARD-CHECK N2 на VPS (прод HEAD `7a237f7`, CI+Deploy success):** активный сегмент — **`segment-57`
+  с schema_version=3** (header byte[12]=`03`), первое живое L2Delta после fix-деплоя ушло в НЕГО, а НЕ в
+  schema-2 сегмент; fix-бинарь при старте увидел активный `segment-56` (schema-2 header) → `2==3` false →
+  открыл НОВЫЙ `segment-57` (schema-3) — ровно та машинная изоляция, которой provenance не дал. Метрики
+  (nsenter в netns → `127.0.0.1:9101/metrics`): `md_events_total{kind=l2delta,venue=binance,BTCUSDT}=1789`
+  + `{binance_futures,BTCUSDT}=1754`; **non-BTC L2Delta отсутствует** (scope (а)); recorder healthy,
+  `seq_gaps=0`, `next_seq` монотонен, `writable=true`, 0 panic/ERROR/backstop; write-rate ≈ 3.8 GB/сут
+  (в §8 BTC-only бюджете). **⚠ Forensic-уточнение к пунктам 2 ниже:** СМЕШАННЫХ (schema-2 + variant-6)
+  сегментов ДВА — `55` И `56`: pre-fix бинарь (`ce122d1`, schema-2) продолжал капчить L2Delta и ротировал
+  55→56 (закрыт 14:10), пока фикс не деплойнулся (~15:35). RFC §10 называет только 55 — фактический
+  tainted-набор `{55,56}`, оба schema-2 с variant-6 в хвосте; изоляция держится с `57` вперёд.
+  Provenance-константа как таковая НЕ исправлена (сегменты одной schema-эпохи по-прежнему
+  неразличимы по билду) — вынесено в отдельный follow-up (см. `provenance-forensics` ниже). Ниже —
+  исходное описание дефекта (сохранено для аудита). **Симптом:** после деплоя M-18 (`ce122d1`) первое
+  живое `MdPayload::L2Delta` (variant-6) ушло НЕ в новый сегмент, а в **pre-M18 активный
+  `segment-00000055.jrnl`** (создан 12:37 pre-M18 бинарём `fb66b52`, ДО деплоя 12:44). Это провал task 6
+  acceptance («первое BTC L2Delta ушло в НОВЫЙ M-18-provenance сегмент») и **C-018 merge-condition 2**
+  (условие, гейтившее risk-critic PASS). **Корень (reviewer описал; architect проектирует фикс —
+  gates.md §4):** `crates/recorder/src/main.rs:448` строит provenance через `git_short_sha()` =
+  `git rev-parse --short HEAD` В РАНТАЙМЕ, но runtime-контейнер НЕ содержит git/`.git` (проверено:
+  `docker exec … command -v git` → `NO-GIT`; `ls /.git /app/.git` → отсутствует) → `git_short_sha()`
+  возвращает `None` → provenance = КОНСТАНТА `recorder v0.0.0 (git:no-git-info)` на КАЖДОМ деплое
+  (лог recorder'а на старте: `provenance=recorder v0.0.0 (git:no-git-info)`). Поэтому
+  `decide_open_segment` (`segments.rs:1152`) видит `header.provenance == cfg.provenance` → **REUSE**
+  активного сегмента вместо открытия нового. Провенанс НИКОГДА не меняется между деплоями → сегменты
+  катятся ТОЛЬКО по размеру (1 GiB), а не на схема-forward деплое. **Следствия:**
+  1. **Структурная гарантия изоляции C-018 R1 ВОИД В ПРОДЕ.** RED `red_l2delta_rollback_boundary`
+     зелёный ТОЛЬКО потому, что фикстура ЗАДАЁТ разный `provenance`; прод (нет git в контейнере) даёт
+     константу → precondition теста в проде НЕ выполняется. Класс TD-011/TD-014: unit-green ≠ live-поведение.
+  2. **Сегмент 55 — СМЕШАННЫЙ** (pre-M18 варианты 0..5 в начале + post-M18 variant-6 в хвосте) ⇒ чистый
+     quarantine «file-move целого сегмента» из runbook §5.1 больше невозможен без потери pre-M18 данных.
+  3. **Latent rollback-hazard (C-018 R1) снова ЖИВОЙ:** pre-M18 бинарь против сегмента 55 → `scan_tail`
+     не декодит variant-6 → риск тихого seq-reuse. (Смягчение: auto-rollback `deploy.yml` теперь целится
+     в предыдущий УСПЕШНЫЙ SHA = `ce122d1`, уже M-18-aware, декодит variant-6 → немедленный авто-триггер
+     низкий; но любой ручной откат за M-18 или будущий schema-forward вариант несёт тот же дефект.)
+  **Прод СЕЙЧАС здоров и данные безопасны** (recorder healthy, `seq_gaps=0`, `writable=true`, капча
+  L2Delta работает, BTC-only соблюдён) — это НЕ активная порча, а латентный rollback-риск + невыполненная
+  структурная гарантия. **Revert НЕ сделан** (fix-forward per runbook §5.1: деплой pre-M18 бинаря против
+  журнала с variant-6 в активном сегменте — ровно запрещённый hazard; revert опаснее fix-forward).
+  **Нужно (architect, RED-first фикс-forward, прод-масштаб оракул per testing.md):** provenance/эпоха
+  ОБЯЗАНА нести дискриминатор, реально меняющийся при schema-forward деплое НЕЗАВИСИМО от наличия git в
+  рантайме — напр. git-sha вкомпилён на СБОРКЕ (`build.rs`/`vergen`/build-arg → `env!`), а не читается
+  рантаймом; ЛИБО `decide_open_segment` форсит новый сегмент, когда набор декодируемых бинарём вариантов
+  превосходит объявленный в активном сегменте; и/или машинный барьер TD-029 (startup schema-guard),
+  который делает hazard громким независимо от provenance. Оракул обязан ПАДАТЬ на текущем прод-режиме
+  (provenance-константа), а не только на фикстуре с разным provenance. Severity: **MAJOR** (sacred
+  journal-integrity / rollback-safety; MD-only, путь к деньгам не тронут; блокирует close-out M-18).
+- **TD-027** `ops-metrics-declared-and-cataloged-but-not-wired-to-emission` — **✅ CLOSED task 4C
+  (`ac645ac`, reviewer §8 PROD GREEN + APPROVED 2026-07-20).** Фикс: OPS-I-10 «объявлена ⟹ эмитится»
+  — продюсер-сеймы `emit_post_append` (writer), `run_books_feeder`, `sample_rss`/`sample_md_age`
+  (sampler в main), все вызваны в живом `main.rs`. Sacred RED `red_metrics_emission.rs` (6 critic
+  re-audit'ов: label-aware value-ассерты, dead-zero, dimension/value-collapse, kind-aware, RssAnon≠VmRSS)
+  прогоняет РЕАЛЬНЫЕ продюсеры и ассертит SAMPLE (не registry-only). verify-гейт OPS-I-10 (покрытие
+  §3-карты + live-wiring канарейка). **§8 PROD (VPS `ac645ac`) ДОКАЗАЛ живые SAMPLE'ы** (не тестами —
+  scrape /metrics через busybox-sidecar): `journal_bytes_written_total=15245` (TD-011 P0 liveness жив),
+  `journal_seq_current=51923737`, `journal_segment_index=49`, `journal_disk_free_bytes=103.6G`,
+  `md_events_total{venue,symbol,kind}` живой kind-aware (trade 8124/5414, l2snapshot, funding,
+  open_interest — TD-014 жив), `md_event_age_ms{venue}` 83/992/77, `book_levels{venue,symbol,side}`
+  живой per-серия (TD-016 жив), `recorder_rss_anon_bytes=17506304` (RssAnon, TD-016 P1 жив). Гейты
+  reviewer'ом независимо: workspace **282/0**, red_metrics_emission 5/5, clippy 0, fmt clean,
+  `verify_M-09.sh` **PASS (20)**; scope dev-коммита ⊂ `recorder/src/{lib,main,metric_emit}.rs`; critic
+  C-014 re-audit #6 APPROVE. Алерты 3 формирующих инцидентов (TD-011/014/016) теперь ссылаются на
+  ЖИВЫЕ метрики. **Остаточные NOTE:**
+  (1) **✅ DONE task 4D (`f442c96`/merge `83c340c`, reviewer §8 PROD GREEN 2026-07-20):** метрика
+  переименована `journal_bytes_written_total → journal_frames_written_total` (честное имя — счётчик
+  КАДРОВ, +1/append; точный байт-счётчик потребовал бы правки sacred `Journal::append` — out of scope).
+  Чистый rename: 5 файлов (ops/{alerts,metrics}, recorder/{lib,metric_emit}, deploy/alerts/ops.rules.yml),
+  только строковый литерал + комментарии, поведение идентично; TD-011 PromQL перерендерена
+  (`rate(journal_frames_written_total[1m]) == 0`, yml == renderer, drift 0). Гейты reviewer'ом: workspace
+  282/0, clippy 0, verify PASS (21). **§8 PROD (`83c340c`): `journal_frames_written_total=4099` растёт,
+  старое имя ОТСУТСТВУЕТ (grep пусто), healthy restarts=0.** Sacred (oracle `red_metrics_emission.rs`)
+  обновлён architect'ом (`028fe08`), не dev. critic C-015 re-audit APPROVE.
+  (2) **OPEN (до task 3):** `journal_seq_gaps_total` — БЕЗ writer-продюсера (в append-потоке рекордера seq монотонен по
+  построению → естественного gap-триггера нет; классифицирована как event/elsewhere). Правило алерта
+  **OPS-GAP** ссылается на неё → на writer-пути оно НИКОГДА не сработает. Gap реально детектируется
+  ТОЛЬКО на READ/replay-пути (`read_all`/`stream` через границы сегментов) — нужен либо продюсер там,
+  либо пересмотр правила OPS-GAP (зона architect). Ниже — исходное описание (для истории).
+  **Класс TD-011: зелёные гейты (ops 52/52, verify
+  PASS, паритет GREEN) маскируют нерабочий предохранитель.** `/metrics` живёт и отдаёт 15 объявленных
+  семейств (HELP/TYPE на все), НО живые SAMPLES на проде есть ТОЛЬКО у 2: `book_divergence_bps`
+  (sink, 4 серии non-zero) и `venue_http_status_total` (venue recon). Остальные **13 объявлены в
+  реестре `METRICS` + зацитированы в каталоге правил `ops::alerts`, но НИКОГДА не инкрементируются**
+  в рантайме (grep call-site пуст): `journal_bytes_written_total`, `journal_seq_current`,
+  `journal_seq_gaps_total`, `journal_segment_index`, `journal_disk_free_bytes`,
+  `journal_write_errors_total`, `md_events_total`, `md_event_age_ms`, `venue_ws_reconnects_total`,
+  `book_levels`, `recorder_rss_anon_bytes`, `book_resync_total` (0 — корректно, ресинков не было),
+  `backup_restore_drill_ok` (task 3).
+  **СЛЕДСТВИЕ (важное — цель milestone'а):** правила алертов для ТРЁХ ФОРМИРУЮЩИХ M-09 инцидентов
+  ссылаются на МЁРТВЫЕ метрики → эти алерты НИКОГДА не сработают:
+  **TD-011 (P0 «recorder жив, но не пишет» — инцидент №1 milestone'а) → `journal_bytes_written_total`
+  (не wired); TD-014 (P1) → `md_events_total` (не wired); TD-016 (P1) → `recorder_rss_anon_bytes`
+  (не wired); OPS-GAP → `journal_seq_gaps_total` (не wired).** «Система сама сообщает о тихой
+  деградации» для этих классов НЕ достигнута.
+  **Почему паритет это НЕ ловит:** OPS-I-5 — РЕЕСТРОВО-СТАТИЧЕСКИЙ (имя ∈ `METRICS` const ↔ правило ↔
+  §7.1). Он проверяет согласованность ИМЁН, НЕ рантайм-эмиссию. Зелёный паритет даёт ЛОЖНУЮ уверенность,
+  что алерты подкреплены живыми метриками.
+  **Почему НЕ в task 4 (не дефект task 4, а его граница):** task-4 carve-out ЯВНО запрещает трогать
+  journal-write путь (`JR-I-1`) и recorder hot-loop; эмиссия `journal_*` требует именно этого пути,
+  `recorder_rss_anon_bytes` — sampler-таск, `md_events_total`/`book_levels` — recorder-цикл. Это
+  ОТДЕЛЬНАЯ работа с собственным carve-out. Task 4 (эндпоинт + каталог + паритет) СВОЮ приёмку выполнил
+  (см. PROJECT-STATE) — долг НЕ блокирует APPROVED task 4, но БЛОКИРУЕТ реальную наблюдаемость.
+  **Нужно (architect RED-first, следующая задача — task 4C / метрик-эмиссия):** развести каждую
+  объявленную метрику до РЕАЛЬНОГО инкремента (journal append → bytes/seq/gaps/segment/disk/write_errors;
+  MD-событие → md_events_total/age; venue reconnect → ws_reconnects; book-maintenance → book_levels;
+  rss-sampler → recorder_rss_anon_bytes) + RED/§8, который ассертит РАНТАЙМ-эмиссию (не только реестр).
+  **ДО провижининга Alertmanager (§O, founder ★) эти метрики ОБЯЗАНЫ быть живыми — иначе алерты театр.**
+  Severity: **MAJOR** (цель milestone'а для 3 формирующих инцидентов не достигнута; регрессии нет —
+  эндпоинт+каталог net-new и корректны).
+- **TD-019** `storage-status-not-published-in-heartbeat` — **✅ CLOSED 2026-07-14** (M-08 task 12,
+  `24d8e83`, merge `8882c1e`). heartbeat = JSON с состоянием; **доказано на проде**, а не тестами:
+  `cat recorder.heartbeat` → `{"events":2736,"free_bytes":119134494720,"min_free_bytes":10737418240,
+  "next_seq":18733828,"segment_index":2,"ts_wall_ms":1784038790063,"writable":true}`. Деградация
+  диска теперь видна БЕЗ ssh. Healthcheck compose'а смотрит на mtime, не на содержимое → смена
+  формата прод-безопасна (контейнер healthy, restarts=0). Анти-плацебо: `red_heartbeat_status`
+  FAIL против пред-фиксного дерева (голый таймстамп не парсится как JSON). Ниже — исходное описание.
+  Обещание M-08 E4: «состояние наблюдаемо через `storage_status().writable == false` (recorder
+  публикует его в heartbeat → **видно без ssh**)». По факту `crates/recorder` **ни разу не зовёт**
+  `journal::storage_status` (grep пуст), а `recorder.heartbeat` = **13 байт** (только ms epoch).
+  Проверено на проде: `/root/jctl guard` → `writable=true free_bytes=121230888960`, т.е. API
+  работает — но наружу не выведен. Сам disk-guard fail-closed РАБОТАЕТ и деградация не тихая:
+  `run_writer` делает `journal.append(kind)?` → при storage-guard `Err` writer возвращает `Err` →
+  recorder падает громко (контейнер unhealthy/restart-loop), а не молча теряет события. То есть
+  это дыра в НАБЛЮДАЕМОСТИ, не в safety. Зона: engine-dev (recorder) по RED от architect'а.
+  Severity: **MINOR** (safety не нарушен; но «увидим переполнение диска без ssh» — не выполнено).
+- **TD-014** `binance-futures-live-depth-funding-not-emitted-after-backoff` (M-06 #4 reland,
+  **CLOSED 2026-07-13 by `c123bbd` + §8 live GREEN**). После фикса TD-013 reland `8b26d6c` прошёл code-review, локальные
+  gates (`red_futures_wired`, fmt, clippy, workspace tests, `verify_M-06.sh` PASS) и GitHub
+  CI+Deploy, но §8 eyes-on на VPS НЕ прошёл продуктовый критерий recorder wire. Наблюдения:
+  3 `venue connect` строки были (`binance`, `hyperliquid`, `binance_futures`), journal рос, seq
+  непрерывен (`seq_gaps=0` на tail-inspection), heartbeat свежий, restarts=0, TD-013 backoff
+  live-работал. Однако в 20 MiB / 115 MiB live journal tails были только `BinanceFutures`
+  OpenInterest + ConnUp; **0 `BinanceFutures` L2Snapshot и 0 Funding**, при частых
+  `venue-binance-futures: depth continuity gap detected, resyncing book` и `snapshot stale vs
+  buffered diffs, refetching with backoff`. Liquidation может быть редким событием, но Funding из
+  `!markPrice@arr` rare-event'ом не является, поэтому отсутствие Funding блокирует reland.
+  Реверт выполнен (`e6b4a75` + `d819cc3`); prod inert-safe re-verified (VPS HEAD `d819cc3`,
+  spot+HL only, futures/418=0, hb age 8s, segment +60KB/5s, CPU/MEM нормальные, restarts=0).
+  **Нужен architect RED/live-equivalent oracle:** futures runner обязан, при mock/controlled fstream
+  depth + markPrice + REST snapshot/backoff сценарии, стабильно эмитить L2Snapshot и Funding после
+  resync/backoff, без hot-loop и без starvation markPrice path. Затем venue-dev fix → engine-dev
+  reland #4 → reviewer full §8. Severity: MAJOR (prod behavior blocker, no order-path impact).
+  **LIVE RELAND-2 RESULT (`af7725f` over `595fc24`, 2026-07-12):** TD-014 fix attempt added
+  `FuturesSession` seam + `run()` delegation and local `red_live_emit` passed; reviewer static check
+  confirmed live path delegates WS text / snapshot result / tick through the seam (no obvious parallel
+  untested runner path). Local gates all GREEN: `red_futures_wired`, `venue-binance-futures` 7/7,
+  workspace tests, fmt/clippy, `verify_M-06.sh` PASS exit=0. Pre-merge §8 on VPS still NOT GREEN:
+  journal tail since deploy had `BinanceFutures` ConnUp and OpenInterest=16 with `seq_gaps=0`, but
+  **0 `BinanceFutures.L2Snapshot` and 0 `BinanceFutures.Funding`**; logs showed repeated
+  `depth continuity gap detected`, `snapshot stale vs buffered diffs`, and 429 backoff. Candidate was
+  not merged; VPS restored to `origin/main` `2bbcbd7` and rechecked healthy, spot+HL only. Current
+  RED/live oracle missed this production mode; TD-014 remains OPEN/BLOCKING.
+  **LIVE TD-014 v2 RESULT (`fac7c07` over `71255c5`, 2026-07-12):** stronger local lifecycle
+  oracle passed and reviewer confirmed the code path is still MD-only and recorder wiring is real.
+  Local gates all GREEN: `red_futures_wired`, `venue-binance-futures` 7/7, workspace tests,
+  fmt/clippy, `verify_M-06.sh` PASS exit=0. Pre-merge §8 on VPS still NOT GREEN: journal tail since
+  deploy had `BinanceFutures.L2Snapshot=16`, `OpenInterest=16`, `seq_gaps=0`, but
+  **`BinanceFutures.Funding=0`**; L2 was sparse rather than expected ~1/s/symbol. Logs during the
+  live window showed ongoing churn (`depth continuity gap` 311, `snapshot stale` 44, `429` 18);
+  initial CPU reached 6.99% before settling near 1.2%. Candidate was not merged; VPS restored to
+  `origin/main` `3eff0db` and rechecked healthy, spot+HL only. TD-014 remains OPEN/BLOCKING.
+  **LIVE TD-014 T2 RESULT (`669ce40` over `38c3175`, 2026-07-12):** futures-continuity oracle
+  (`pu`, not spot `U == last+1`) passed locally and reviewer static check confirmed the dual-rule
+  implementation is MD-only: strict `pu == last_update_id` in steady-state, Binance snapshot-bridge
+  rule in reconcile-loop, mandatory `pu` fail-closed. Local gates all GREEN: `red_futures_wired`,
+  `venue-binance-futures` 8/8, workspace tests, fmt/clippy, `verify_M-06.sh` PASS exit=0. Pre-merge
+  §8 on VPS showed T2 materially improved live depth: `BinanceFutures.L2Snapshot=470`,
+  `OpenInterest=54`, `seq_gaps=0`; after startup, last 3m had `gap=0`, `stale=0`, `429=0`, CPU
+  ~1.1%, restarts=0, and only one non-looping 418. However, the acceptance criterion still failed:
+  **`BinanceFutures.Funding=0`** in the 48 MiB journal tail since deploy. Candidate was not merged;
+  VPS restored to `origin/main` `4012c55` and rechecked healthy, spot+HL only. TD-014 remains
+  OPEN/BLOCKING, now narrowed to persisted live Funding emission under the real fstream path.
+  **LIVE TD-014 T3 RESULT (`99b1329` over `c747a97`, 2026-07-13):** per-symbol markPrice oracle
+  passed locally and reviewer static check confirmed `run()` subscribes to
+  `<sym>@markPrice@1s`, while `FuturesSession::on_ws_text` emits Funding from both per-symbol
+  single-object markPrice and legacy `!markPrice@arr`. Local gates all GREEN: `red_futures_wired`,
+  `venue-binance-futures` 9/9, workspace tests, fmt/clippy, `verify_M-06.sh` PASS exit=0.
+  Pre-merge §8 on VPS still NOT GREEN: journal tails since deploy had
+  `BinanceFutures.L2Snapshot=637`, `OpenInterest=66`, `seq_gaps=0`; later log window was clean
+  (`gap=0`, `stale=0`, `429=0`, CPU ~1.2%, restarts=0), but **`BinanceFutures.Funding=0`**
+  persisted and logs had `markPrice/Funding=0`. Candidate was not merged; VPS restored to
+  `origin/main` `1d5ecfa` and rechecked healthy, spot+HL only. TD-014 remains OPEN/BLOCKING.
+  The next fix must instrument or reproduce raw WS delivery/stream-name/parse-drop behavior:
+  current unit coverage proves parser/session handling, but not that Binance actually delivers
+  a usable markPrice message through this combined session.
+  **LIVE TD-014 T4 RESULT (`c123bbd` over `d9b3b1c`, 2026-07-13):** venue-dev pivoted Funding
+  from dead WS markPrice delivery to REST `/fapi/v1/premiumIndex` all-perps polling, matching the
+  live-proven OI REST path. Local gates all GREEN: `red_futures_wired`, `venue-binance-futures`
+  10/10, workspace tests, fmt/clippy, `verify_M-06.sh` PASS exit=0. Remote Docker verify on VPS
+  also GREEN (`VERDICT: PASS exit=0`; host has no Rust toolchain, so reviewer ran it in
+  `rust:1-slim` with rustfmt/clippy components installed). Pre-merge §8 on VPS GREEN:
+  `BinanceFutures.L2Snapshot=465`, `OpenInterest=48`, **`Funding=48`**, `seq_gaps=0`;
+  late logs `418=0`, `429=0`, `gap=0`, `stale=0`, CPU/MEM normal, restarts=0. Candidate was
+  merged via `1504d8b`; TD-014 CLOSED.
+
 - **TD-011** `scan_next_seq-full-segment-read-oom` (M-05 task#3) — **RESOLVED 2026-07-11**.
   Инцидент: v1 `Journal::open()` делал `read_to_end` ВСЕГО сегмента (прод 2.65 GiB) в RAM на каждом
   старте → recorder не писал (101% CPU, 2.48 GiB RAM, OOM-риск); юнит-RED на крошечных фикстурах не
