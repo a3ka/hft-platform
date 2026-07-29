@@ -144,6 +144,18 @@ pub fn parse_message(text: &str) -> Vec<EventKind> {
     }
 }
 
+/// VN-I-7 fail-closed: parse a wire numeric string as a **finite, strictly positive** f64.
+/// Rejects NaN/inf/-inf (parse-succeeds-but-garbage in Rust), negatives, and zero — no
+/// price/size on a real venue is <= 0. Used for both trade px/sz and l2Book level px/sz.
+fn parse_positive_finite(raw: &str) -> Option<f64> {
+    let v: f64 = raw.parse().ok()?;
+    if v.is_finite() && v > 0.0 {
+        Some(v)
+    } else {
+        None
+    }
+}
+
 /// One element of the `trades` `data` array:
 /// `{"coin":"BTC","px":"<str>","sz":"<str>","time":<ms>,"side":"A"|"B"}`.
 /// Official HL notation (hyperliquid.gitbook.io -> For developers -> API -> Notation):
@@ -153,9 +165,14 @@ fn parse_trade(item: &serde_json::Value) -> Option<EventKind> {
     if coin.contains("MID") {
         return None;
     }
-    let price: f64 = item.get("px")?.as_str()?.parse().ok()?;
-    let size: f64 = item.get("sz")?.as_str()?.parse().ok()?;
+    let price = parse_positive_finite(item.get("px")?.as_str()?)?;
+    let size = parse_positive_finite(item.get("sz")?.as_str()?)?;
     let ts_exch_ms = item.get("time")?.as_i64()?;
+    if ts_exch_ms <= 0 {
+        // VN-I-7: неположительный epoch-ms — не валидное время биржи, дроп элемента
+        // (отравляет возрастной фильтр ретеншена и порядок реплея).
+        return None;
+    }
     let side_raw = item.get("side")?.as_str()?;
     let side = match side_raw {
         "B" => Side::Buy,
@@ -192,6 +209,10 @@ fn parse_l2book(data: &serde_json::Value) -> Option<EventKind> {
     // VN-I-7: `time` отсутствует/не число -> дроп ВСЕГО сообщения, не фабрикация ts=0
     // (событие с ts=0 отравляет возрастной фильтр ретеншена — выглядит «старше всех»).
     let ts_exch_ms = data.get("time")?.as_i64()?;
+    if ts_exch_ms <= 0 {
+        // VN-I-7: неположительный epoch-ms — целостность снапшота под сомнением, дроп целиком.
+        return None;
+    }
 
     Some(EventKind::md(
         Venue::Hyperliquid,
@@ -209,8 +230,10 @@ fn parse_level_objects(levels: &serde_json::Value) -> Option<Vec<Level>> {
     let levels = levels.as_array()?;
     let mut out = Vec::with_capacity(levels.len());
     for level in levels {
-        let price: f64 = level.get("px")?.as_str()?.parse().ok()?;
-        let size: f64 = level.get("sz")?.as_str()?.parse().ok()?;
+        // VN-I-7: битый/невалидный уровень (NaN/inf/<=0) ставит под сомнение целостность
+        // всего снапшота -> `?` пробрасывает None до parse_l2book, дроп ВСЕГО сообщения.
+        let price = parse_positive_finite(level.get("px")?.as_str()?)?;
+        let size = parse_positive_finite(level.get("sz")?.as_str()?)?;
         out.push(Level {
             price: to_fixed(price),
             size: to_fixed(size),
