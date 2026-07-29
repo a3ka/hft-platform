@@ -631,7 +631,17 @@ fn dedup_indexed_paths(dir: &Path) -> io::Result<Vec<PathBuf>> {
     Ok(by_index.into_values().collect())
 }
 
-/// Какие эпохи читатель СОГЛАСЕН смешивать — фильтр вызывается через `EpochFilter::accepts`.
+fn latest_segment(dir: &Path) -> io::Result<Option<(u32, PathBuf)>> {
+    Ok(dedup_indexed_paths(dir)?
+        .into_iter()
+        .filter_map(|path| {
+            let name = path.file_name().and_then(OsStr::to_str)?;
+            let index = parse_segment_index_any(name)?;
+            Some((index, path))
+        })
+        .max_by_key(|(index, _)| *index))
+}
+
 ///
 /// ЕДИНСТВЕННЫЙ публичный путь `list_segments` — все сегменты каталога.
 ///
@@ -1128,22 +1138,7 @@ pub(crate) fn segment_path(dir: &Path, index: u32) -> PathBuf {
 /// Найти индекс самого свежего сегмента в каталоге (`max(existing_indices)`).
 /// Возвращает `None` если сегментов нет.
 pub(crate) fn latest_segment_index(dir: &Path) -> io::Result<Option<u32>> {
-    let mut max_idx: Option<u32> = None;
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let p = entry.path();
-        if p.extension().and_then(OsStr::to_str) != Some("jrnl") {
-            continue;
-        }
-        let name = match p.file_name().and_then(OsStr::to_str) {
-            Some(s) => s.to_string(),
-            None => continue,
-        };
-        if let Some(idx) = parse_segment_index(&name) {
-            max_idx = Some(max_idx.map(|m| m.max(idx)).unwrap_or(idx));
-        }
-    }
-    Ok(max_idx)
+    Ok(latest_segment(dir)?.map(|(index, _)| index))
 }
 
 /// Хвостовой скан КОНКРЕТНОГО сегмента (используется при `open_with` для next_seq).
@@ -1254,11 +1249,26 @@ pub(crate) struct OpenDecision {
 ///   совпал → reuse (append), иначе → создаём новый (index = последний + 1);
 /// - нет сегментов → создаём segment-00000000.jrnl.
 pub(crate) fn decide_open_segment(dir: &Path, cfg: &WriterConfig) -> io::Result<OpenDecision> {
-    let latest_idx = latest_segment_index(dir)?;
+    let latest = latest_segment(dir)?;
     let next_seq = resolve_next_seq_with(dir, &dir.join(META))?;
 
-    if let Some(idx) = latest_idx {
-        let path = segment_path(dir, idx);
+    if let Some((idx, path)) = latest {
+        // A compacted segment is immutable and cannot be opened for append. Start a
+        // fresh raw segment after the complete indexed history.
+        if path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .is_some_and(is_compacted_name)
+        {
+            let new_idx = idx + 1;
+            return Ok(OpenDecision {
+                seg_index: new_idx,
+                seg_path: segment_path(dir, new_idx),
+                first_seq: next_seq,
+                reuse: false,
+            });
+        }
+
         // Прочитать заголовок (если есть).
         let mut f = File::open(&path)?;
         let header = match read_v2_header_and_skip(&mut f).ok().flatten() {
