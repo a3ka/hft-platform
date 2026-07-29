@@ -1789,6 +1789,56 @@ call-site под сигнатуру, которую сменил САМ architec
 call-site'ов в том же RED-коммите, иначе dev вынужден лезть в sacred-зону.
 (в) `Cargo.toml` workspace — правился и полностью откачен (net-diff пуст, задача #11, сверено).
 
+## M-48 — бутстрап чекпоинта на усечённом журнале + провенанс истории + ops-цепочка ✅ ЗАКРЫТ
+
+Merge `0215b34` (2026-07-29), reviewer APPROVED. Путь гейта: critic `C-032`/`C-033`/`C-034` REJECT →
+`C-035` NOTE → dev → **reviewer REJECTED (3 блокера)** → rev5 → reviewer APPROVED. Закрывает
+**TD-048** и **TD-044**, а с ними разблокирует close-out **M-28/M-36/M-38b**.
+
+**Что реализовано.** `advance_to` больше не запрещает бутстрап на журнале со спруненным префиксом:
+принята ЕДИНАЯ семантика на обоих путях — «all-time» ≡ «от самого раннего seq, доступного под данным
+`EpochFilter`». Система не отказывается отдать то, что у неё есть, — она отказывается выдавать это за
+другое: `Snapshot` и заголовок чекпоинта несут `history_start_seq` (seq ПЕРВОГО реально свёрнутого
+события, НЕ `header.first_seq` — у legacy он синтезирован нулём, TD-030) и `history_truncated`
+(**VB-I-11**, тот же класс честности, что `depth_band_provenance` VB-I-5). `GATEWAY_SCHEMA_VERSION`
+7 → 8. Fail-loud СУЖЕН до единственного случая, где отказ защищает данные, а не запрещает штатное
+состояние: разрыв «чекпоинт↔журнал» (`earliest > cursor + 1`). Доставлена ops-цепочка:
+`deploy/bin/gateway-checkpoint-cron.sh`, `--checkpoint-coverage` в retention-обёртке, запись в
+`cron.d` (04:00, ДО retention 04:07) и — главное — **установка `cron.d` на VPS самим деплоем**.
+
+**§8 eyes-on на VPS (`0215b34`, CI+Deploy оба success) — ЗАМЕР, не пересказ:**
+```
+$ docker compose --profile ops run --rm gateway-checkpoint
+gateway-checkpoint: ok ... achieved_cursor=Cursor { upto_seq: Some(118434344) } covered=118434344
+CKPT_EXIT=0  elapsed=411s              # на M-38b было CKPT_EXIT=1 — чекпоинт не создавался НИКОГДА
+$ ls /var/lib/docker/volumes/hft-platform_gateway-ckpt/_data
+ckpt-2a00318f774d9689.bin   covered_through_seq (=118434344, не u64::MAX)   zz.lock
+
+LATENCY first Snapshot (от ws handshake) = 1.056 s     # 409.74 → 382.657 → 1.056 s
+schema_version=8  history_start_seq=16049334  history_truncated=True
+cursor={"upto_seq":118449099}  ohlcv len=61  heatmap len=1697
+$ grep gateway-checkpoint /etc/cron.d/hft-*    →  0 4 * * * root .../gateway-checkpoint-cron.sh
+```
+Прод здоров: оба контейнера `(healthy)`, recorder пишет (`next_seq` 118449599 → 118453720 за 30 s,
+`writable:true`), alert-файлов нет.
+
+**PR-гейт: REJECTED на rev4 — три блокера, каждый найден ЗАМЕРОМ/МУТАЦИЕЙ, не чтением.** Все гейты
+(fmt/clippy/`cargo test --workspace`/`verify_M-48.sh`) были ЗЕЛЁНЫЕ — и зелёные по ложной причине:
+(**B1**) задача #3 «gap-детект» была МЁРТВЫМ КОДОМ — нейтрализация спец-проверки не ломала оракул,
+зелёный давала посторонняя ветка; (**B2**) ветка «stale чекпоинт → `Err`» ВОСПРОИЗВОДИЛА TD-048 при
+любом будущем бампе `GATEWAY_SCHEMA_VERSION` (бампы рутинны: v5→v6→v7→v8); (**B3**) канарейка
+ops-цепочки была ВАКУУМНОЙ (грепала запись, существовавшую до M-48), а деплой вообще не ставил
+`cron.d`. Разбор и перепроверка после rev5 — `TECH-DEBT.md` TD-048.
+
+**Sacred-барьер отработал ровно как задуман (эталонный эпизод).** engine-dev получил sacred-оракул
+с ассертом, непроходимым ни для какой корректной реализации (`assert_ne!` против байтов ДО порчи
+требовал НЕДЕТЕРМИНИЗМА, противореча `advance_idempotent`/DET-I-1). Dev **не стал подгонять
+реализацию под противоречивый тест**, а прислал SCOPE VIOLATION REQUEST и остановился; architect
+признал свой дефект и починил оракул сам (`245b5d2`), **усилив** его до пары ассертов
+(`after != stale` И `after == valid`), а не ослабив. Ни один dev-коммит не тронул ни одного
+sacred-файла (проверено по `git log --author`). Атомарность коммитов после замечания F4
+восстановлена: задачи #8/#9/#10 — по одному коммиту на задачу.
+
 ## Пока НЕ реализовано (следующие фазы)
 - Крейты `risk`/`killswitch`/`oms`, `runner` — пофазно per DESIGN §10 (M-08: fail-closed риск-гейт
   между `strategy` и `oms`). MM-котирование, wiring весов из `signals.json` (граница B),
