@@ -1499,51 +1499,7 @@ pub fn retention_plan(
     let dir = dir.as_ref();
 
     // (1) Обход каталога: classify с обработкой foreign/corrupt как skipped.
-    let manifest = load_manifest(dir)?;
-    let mut classified: Vec<SegmentInfo> = Vec::new();
-    let mut foreign_skipped: Vec<(SegmentInfo, String)> = Vec::new();
-
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let p = entry.path();
-        if p.extension().and_then(OsStr::to_str) != Some("jrnl") {
-            continue;
-        }
-        match classify_segment(&p, &manifest) {
-            Ok(info) => classified.push(info),
-            Err(e) => {
-                // Foreign / corrupt / truncated. Синтезируем info для skipped — оператор
-                // видит файл и причину, а не «план не построен, проверяй вручную».
-                let reason = classify_failure_reason(&e);
-                let file_name = p
-                    .file_name()
-                    .and_then(OsStr::to_str)
-                    .unwrap_or("<non-utf8>")
-                    .to_string();
-                let index = parse_segment_index(&file_name).unwrap_or(u32::MAX);
-                let size_bytes = fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
-                let synthetic = SegmentInfo {
-                    path: p.clone(),
-                    index,
-                    header: SegmentHeader {
-                        schema_version: 0, // sentinel: неизвестно (нет магии / нет заголовка)
-                        source: DataSource::Synthetic,
-                        provenance: format!("<{reason}>"),
-                        epoch_id: String::new(),
-                        created_wall_ms: 0,
-                        first_seq: 0,
-                    },
-                    size_bytes,
-                };
-                let _ = file_name;
-                foreign_skipped.push((synthetic, reason));
-            }
-        }
-    }
-    // Стабильная сортировка по индексу — критична для воспроизводимости плана (R6)
-    // и для определения «последних N» в keep_min.
-    classified.sort_by_key(|s| s.index);
-    foreign_skipped.sort_by_key(|(s, _)| s.index);
+    let (classified, foreign_skipped) = enumerate_retention_segments(dir)?;
 
     // (2) Активный сегмент = сегмент с МАКСИМАЛЬНЫМ индексом среди classified.
     // Если classified пуст (всё foreign / каталог пуст) — активного нет; все foreign в skipped.
@@ -1727,6 +1683,52 @@ pub fn retention_plan(
         skipped,
         disk_pressure,
     })
+}
+
+type RetentionEnumeration = (Vec<SegmentInfo>, Vec<(SegmentInfo, String)>);
+
+fn enumerate_retention_segments(dir: &Path) -> io::Result<RetentionEnumeration> {
+    let manifest = load_manifest(dir)?;
+    let mut classified = Vec::new();
+    let mut foreign_skipped = Vec::new();
+
+    for path in dedup_indexed_paths(dir)? {
+        match classify_segment(&path, &manifest) {
+            Ok(info) => classified.push(info),
+            Err(e) => {
+                // Foreign / corrupt / truncated. Синтезируем info для skipped — оператор
+                // видит файл и причину, а не «план не построен, проверяй вручную».
+                let reason = classify_failure_reason(&e);
+                let file_name = path
+                    .file_name()
+                    .and_then(OsStr::to_str)
+                    .unwrap_or("<non-utf8>")
+                    .to_string();
+                let index = parse_segment_index_any(&file_name).unwrap_or(u32::MAX);
+                let size_bytes = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                let synthetic = SegmentInfo {
+                    path,
+                    index,
+                    header: SegmentHeader {
+                        schema_version: 0, // sentinel: неизвестно (нет магии / нет заголовка)
+                        source: DataSource::Synthetic,
+                        provenance: format!("<{reason}>"),
+                        epoch_id: String::new(),
+                        created_wall_ms: 0,
+                        first_seq: 0,
+                    },
+                    size_bytes,
+                };
+                foreign_skipped.push((synthetic, reason));
+            }
+        }
+    }
+
+    // Стабильная сортировка по индексу — критична для воспроизводимости плана (R6)
+    // и для определения «последних N» в keep_min.
+    classified.sort_by_key(|s| s.index);
+    foreign_skipped.sort_by_key(|(s, _)| s.index);
+    Ok((classified, foreign_skipped))
 }
 
 /// Классифицировать причину отказа `classify_segment` в человеко-читаемую строку.
