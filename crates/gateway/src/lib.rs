@@ -2376,8 +2376,7 @@ pub mod checkpoint {
                 // После #8+9 нейтрализация спец-проверки в None-ветке ЛОМАЕТ оракул.
                 if let Some(ckpt_cursor) = header_only_cursor {
                     if let Some(first) = first_visible_seq(dir, &filter).ok().flatten() {
-                        if first > 0
-                            && first.saturating_sub(1) > ckpt_cursor.upto_seq.unwrap_or(0)
+                        if first > 0 && first.saturating_sub(1) > ckpt_cursor.upto_seq.unwrap_or(0)
                         {
                             return Err(io::Error::other(format!(
                                 "checkpoint::advance_to: разрыв между чекпоинтом \
