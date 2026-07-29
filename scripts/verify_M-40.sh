@@ -62,6 +62,22 @@ fi
 no_own_readdir 'pub fn retention_plan(' 'retention_plan' 'T1'
 no_own_readdir 'pub(crate) fn latest_segment_index(' 'latest_segment_index' 'T7'
 
+# ── Задача 4 (C-037 B2): execute не имеет права схлопывать перечисление в пустоту ──
+# `segments()` fail-closed: один чужой файл делает вызов Err, а `unwrap_or_default()`
+# превращает его в ПУСТОЙ список ⇒ last_seq неизвестен для всех ⇒ каждое удаление
+# помечается «без покрытия чекпоинтом». Замер: covered=u64::MAX, 4 из 4 prune помечены.
+EXEC_BODY="$(fn_body 'pub fn retention_execute(')"
+if [ -z "$EXEC_BODY" ]; then
+  bad "T4 канарейка не смогла извлечь тело retention_execute (сигнатура не найдена —
+      переименована/перемещена?). Гейт НЕ проверен: правь канарейку, а не игнорируй."
+elif printf '%s' "$EXEC_BODY" | grep -q 'unwrap_or_default'; then
+  bad "T4 retention_execute глушит ошибку перечисления через unwrap_or_default() —
+      один чужой файл в каталоге делает аудит покрытия (pruned_without_checkpoint_coverage)
+      недостоверным (C-037 B2)"
+else
+  ok "T4 retention_execute не глушит перечисление через unwrap_or_default()"
+fi
+
 # `extension() == Some("jrnl")` — та самая конструкция, из-за которой `.jrnl.zst` (extension
 # = "zst") выпадал из обхода. В коде крейта её быть не должно нигде.
 N_EXT=$(sed 's://.*::' "$SEG" | grep -c 'extension().*"jrnl"')
@@ -101,6 +117,21 @@ else
   bad "T1-T6 RED-набор M-40 не зелёный — запусти:
       cargo test -p journal --test red_retention_compacted --test red_restore_from_cold -- --test-threads=1"
 fi
+
+# ── Задачи 9-10 (C-037 B1/B2): именованные прогоны блокирующих оракулов ─────────────
+# Они входят в общий прогон выше, но вынесены отдельно, чтобы FAIL называл ЗАДАЧУ, а не
+# «RED-набор не зелёный»: оба закрывают fail-open/ложь-в-отчёте, найденные критиком.
+echo
+for pair in "rt_z_8:T9 синтетический first_seq=0 legacy-соседа не принимается за факт (fail-open TD-030)" \
+            "rt_z_9:T10 чужой файл не делает аудит покрытия лживым (execute-перечисление)"; do
+  t="${pair%%:*}"; desc="${pair#*:}"
+  if cargo test -p journal --test red_retention_compacted "$t" -- --test-threads=1 2>&1 \
+       | grep -qE 'test result: ok'; then
+    ok "$desc"
+  else
+    bad "$desc — запусти: cargo test -p journal --test red_retention_compacted $t -- --test-threads=1"
+  fi
+done
 
 # ── Задача 8: прод-масштаб (bounded memory при открытии) ────────────────────────────
 # Только release: в debug счётчик аллокаций ловит отладочную обвязку, а объём фикстуры
