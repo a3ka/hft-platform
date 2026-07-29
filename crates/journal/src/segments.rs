@@ -1867,7 +1867,7 @@ pub fn retention_execute(
             // был ли он uncovered (override). Пересчитываем last_seq тем же способом,
             // что и retention_plan, чтобы корректно классифицировать.
             let covered = policy.checkpoint_covered_through_seq;
-            let all_segs_for_check = segments(_dir).unwrap_or_default();
+            let all_segs_for_check = segments(_dir.as_ref())?;
             let mut sorted_segs = all_segs_for_check.clone();
             sorted_segs.sort_by_key(|s| s.index);
 
