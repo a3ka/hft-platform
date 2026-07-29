@@ -1754,6 +1754,27 @@ fn classify_failure_reason(e: &io::Error) -> String {
 /// На любую ошибку (нет файла, битый заголовок, нет событий) — `Ok(None)`:
 /// вызывающий использует fallback (header.created_wall_ms).
 fn first_event_data_ts(path: &Path) -> io::Result<Option<i64>> {
+    let is_zst = path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .is_some_and(is_compacted_name);
+    if is_zst {
+        let f = match File::open(path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let mut reader = open_compacted_reader(f)?;
+        // Сжатый сегмент нельзя Seek'нуть: читаем заголовок и первый frame вперёд.
+        if skip_v2_header_forward(&mut reader).is_err() {
+            return Ok(None);
+        }
+        let Some(ev) = read_event_frame(&mut reader)? else {
+            return Ok(None);
+        };
+        return Ok(Some(event_data_ts(&ev)));
+    }
+
     let mut f = match File::open(path) {
         Ok(f) => f,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -1768,7 +1789,11 @@ fn first_event_data_ts(path: &Path) -> io::Result<Option<i64>> {
     let Some(ev) = read_event_frame(&mut reader)? else {
         return Ok(None);
     };
-    let ts = match &ev.kind {
+    Ok(Some(event_data_ts(&ev)))
+}
+
+fn event_data_ts(ev: &Event) -> i64 {
+    match &ev.kind {
         EventKind::Sys(_) => ev.ts_wall_ms,
         EventKind::Md(md) => match &md.payload {
             MdPayload::Trade { ts_exch_ms, .. }
@@ -1780,8 +1805,7 @@ fn first_event_data_ts(path: &Path) -> io::Result<Option<i64>> {
             | MdPayload::L2Delta { ts_exch_ms, .. }
             | MdPayload::MarginInventory { ts_exch_ms, .. } => *ts_exch_ms,
         },
-    };
-    Ok(Some(ts))
+    }
 }
 
 /// Выполнить план. В `DryRun` НИ ОДИН байт не копируется и не удаляется — только отчёт.
