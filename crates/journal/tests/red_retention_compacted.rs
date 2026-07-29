@@ -828,19 +828,142 @@ fn rt_z_8_synthetic_zero_first_seq_of_legacy_neighbour_is_not_a_fact() {
         skipped_idx(&plan0)
     );
 
-    // (б) ПАРНЫЙ vantage: при реальном покрытии кандидат ОБЯЗАН пруниться. Иначе
-    // реализация «сосед legacy ⇒ никогда не покрыт» заморозит место навсегда.
-    let plan_full = journal::retention_plan(dir.path(), &policy(cold.path(), Some(u64::MAX)), now)
-        .expect("plan covered=MAX");
+    // (б) ТОЧНАЯ ГРАНИЦА (усилено по C-038 B1-rev2). Плечо `covered=u64::MAX` было СЛИШКОМ
+    // СЛАБЫМ: реализация, подставляющая для legacy-соседа НЕФАКТИЧЕСКИЙ сентинел
+    // `last_seq = u64::MAX` (то есть «не знаю, считаю непокрытым») без всякого чтения хвоста,
+    // проходила оба плеча — `MAX > 0` даёт (а), `MAX <= MAX` даёт (б). Критик поймал это
+    // мутацией; оракул был зелен по причине, отличной от защищаемого инварианта.
+    //
+    // Факт пиннится ровно так же, как в `rt_z_5`: переход происходит НА `real_last_seq`.
+    //   - сентинел `u64::MAX`      → не прунится при `real_last_seq` ⇒ падает;
+    //   - синтетический `0`        → прунится при `real_last_seq - 1` ⇒ падает;
+    //   - `first_seq` кандидата    → прунится при `real_last_seq - 1` ⇒ падает;
+    //   - «перепрыгнуть legacy» (взять first_seq сегмента ЗА ним) → завышает ⇒ падает;
+    //   - фактическое чтение хвоста кандидата → проходит.
     assert!(
-        idx(&plan_full.offload_and_prune).contains(&target),
-        "сегмент {target} (last_seq={real_last_seq}) не прунится даже при covered=u64::MAX.\n\
-         ДОЛЖНО БЫТЬ: offload_and_prune содержит {target}\nПОЛУЧЕНО: {:?}\n\
-         Гвард выродился в «рядом с legacy не пруним никогда»: «нет информации» подменило \
-         «не покрыт», и диск не освобождается. last_seq обязан быть УСТАНОВЛЕН фактически \
-         (чтение хвоста кандидата), а не объявлен неизвестным.",
-        idx(&plan_full.offload_and_prune)
+        real_last_seq > 0,
+        "фикстура не состоялась: real_last_seq={real_last_seq}, граница real_last_seq−1 \
+         невыразима — оракул проверял бы не то"
     );
+    let prune_at = |covered: u64| -> Vec<u32> {
+        idx(
+            &journal::retention_plan(dir.path(), &policy(cold.path(), Some(covered)), now)
+                .expect("plan")
+                .offload_and_prune,
+        )
+    };
+
+    assert!(
+        prune_at(real_last_seq).contains(&target),
+        "сегмент {target} не прунится при ФАКТИЧЕСКОМ покрытии covered=real_last_seq={real_last_seq}.\n\
+         ДОЛЖНО БЫТЬ: offload_and_prune содержит {target}\nПОЛУЧЕНО: {:?}\n\
+         Реализация не УСТАНАВЛИВАЕТ last_seq, а подменяет его нефактическим значением \
+         (сентинел «неизвестно» / завышенная оценка через дальнего соседа). Следствие: сегмент \
+         перед legacy не освобождает место НИКОГДА — «нет информации» подменило «не покрыт». \
+         last_seq обязан быть установлен чтением хвоста кандидата (tail_last_seq_of, bounded).",
+        prune_at(real_last_seq)
+    );
+    assert!(
+        !prune_at(real_last_seq - 1).contains(&target),
+        "сегмент {target} прунится при covered={} < real_last_seq={real_last_seq} — граница \
+         покрытия C-030 R1 сдвинута, prune уходит ВПЕРЁД чекпоинтера.\nПОЛУЧЕНО: {:?}",
+        real_last_seq - 1,
+        prune_at(real_last_seq - 1)
+    );
+
+    // (в) EXECUTE-SIDE (C-038): задача #8 требует правило В ОБОИХ местах. `retention_execute`
+    // ПЕРЕСЧИТЫВАЕТ покрытие своим кодом (segments.rs:1832) — там та же ловушка, и план,
+    // построенный верно, ещё не гарантирует правдивого отчёта.
+    //
+    // Сильнейшая форма — операторский override: `allow_prune_without_checkpoint=true` при
+    // НЕДОСТАТОЧНОМ покрытии обязывает execute НАЗВАТЬ сегмент в
+    // `pruned_without_checkpoint_coverage` (аудит-трейл), а при ФАКТИЧЕСКОМ покрытии —
+    // не называть. Нефактический `last_seq` ломает ровно одну из этих сторон.
+    let policy_override = |covered: Option<u64>| RetentionPolicy {
+        allow_prune_without_checkpoint: true,
+        ..policy(cold.path(), covered)
+    };
+
+    // (в1) Недостаточное покрытие + override → удаление ОБЯЗАНО быть названо в аудите.
+    {
+        let dir2 = tempfile::tempdir().expect("dir2");
+        let cold2 = tempfile::tempdir().expect("cold2");
+        build(dir2.path(), t0);
+        let real2 = last_seq_of(dir2.path(), target).expect("last_seq до мутации");
+        std::fs::write(
+            dir2.path().join("segment-00000003.jrnl"),
+            b"LEGACY-RAW-FRAMES-NO-V2-MAGIC-payload-payload-payload",
+        )
+        .expect("write legacy");
+        journal::declare_legacy(
+            dir2.path(),
+            LegacySegmentDecl {
+                file_name: "segment-00000003.jrnl".to_string(),
+                fingerprint_sha256: String::new(),
+                size_bytes_at_decl: 0,
+                source: DataSource::OwnCapture,
+                provenance: "legacy fixture (M-40 B1 execute)".to_string(),
+                epoch_id: "own-test".to_string(),
+            },
+        )
+        .expect("declare_legacy");
+
+        let pol = RetentionPolicy {
+            allow_prune_without_checkpoint: true,
+            ..policy(cold2.path(), Some(real2 - 1))
+        };
+        let plan = journal::retention_plan(dir2.path(), &pol, now).expect("plan override");
+        let report = journal::retention_execute(dir2.path(), &plan, &pol, RetentionMode::Apply)
+            .expect("apply override");
+        let named = report
+            .pruned_without_checkpoint_coverage
+            .iter()
+            .any(|p| p.to_string_lossy().contains("segment-00000002"));
+        assert!(
+            named,
+            "override удалил НЕПОКРЫТЫЙ сегмент {target} (real_last_seq={real2}, covered={}), \
+             но НЕ НАЗВАЛ его в pruned_without_checkpoint_coverage.\n\
+             ДОЛЖНО БЫТЬ: путь segment-00000002 присутствует в аудите\n\
+             ПОЛУЧЕНО: pruned_without_checkpoint_coverage={:?}\n pruned={:?}\n\
+             Реализация, считающая сегмент покрытым по синтетическому first_seq=0 соседа, \
+             сочтёт удаление законным и промолчит — операторский override станет тихим \
+             (ровно то, ради чего поле и введено в M-38b).",
+            real2 - 1,
+            report.pruned_without_checkpoint_coverage,
+            report.pruned
+        );
+    }
+
+    // (в2) ФАКТИЧЕСКОЕ покрытие → аудит обязан молчать (парный vantage: поле не должно
+    // срабатывать всегда, иначе оно бесполезно).
+    {
+        let pol = policy_override(Some(real_last_seq));
+        let plan = journal::retention_plan(dir.path(), &pol, now).expect("plan covered=real");
+        let report = journal::retention_execute(dir.path(), &plan, &pol, RetentionMode::Apply)
+            .expect("apply covered=real");
+        assert!(
+            report
+                .pruned_without_checkpoint_coverage
+                .iter()
+                .all(|p| !p.to_string_lossy().contains("segment-00000002")),
+            "сегмент {target} ПОКРЫТ фактически (real_last_seq={real_last_seq}, \
+             covered={real_last_seq}), но execute назвал его удалённым «без покрытия».\n\
+             ПОЛУЧЕНО: {:?}\n\
+             execute считает last_seq нефактически (сентинел/завышение), из-за чего аудит \
+             override'а лжёт в другую сторону: оператор видит инцидент, которого нет.",
+            report.pruned_without_checkpoint_coverage
+        );
+        assert!(
+            report
+                .pruned
+                .iter()
+                .any(|p| p.to_string_lossy().contains("segment-00000002")),
+            "сегмент {target} при фактическом покрытии обязан быть физически удалён.\n\
+             ПОЛУЧЕНО: pruned={:?}, failed={:?}",
+            report.pruned,
+            report.failed
+        );
+    }
 }
 
 // ═════════════════════════════════════════════════════════════════════════════════════
