@@ -1903,13 +1903,9 @@ pub fn retention_execute(
 
             for seg in &plan.offload_and_prune {
                 // Классифицируем: покрыт или нет (для override-аудита).
-                let pos = sorted_segs.iter().position(|s| s.index == seg.index);
-                let last_seq_opt = match pos {
-                    Some(i) if i + 1 < sorted_segs.len() => {
-                        Some(sorted_segs[i + 1].header.first_seq.saturating_sub(1))
-                    }
-                    _ => None, // активный
-                };
+                // The same factual rule as retention_plan: do not use a synthetic
+                // legacy first_seq as a coverage boundary.
+                let last_seq_opt = last_seq_for_segment(seg, &sorted_segs)?;
                 let is_uncovered = match (last_seq_opt, covered) {
                     (Some(ls), Some(c)) => ls > c,
                     _ => true, // активный или нет артефакта покрытия = uncovered
