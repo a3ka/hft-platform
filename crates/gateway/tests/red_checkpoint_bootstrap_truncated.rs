@@ -246,6 +246,17 @@ fn intact_journal_is_not_declared_truncated() {
 /// Разрыв «чекпоинт ↔ журнал»: валидный чекпоинт с курсором `C`, а самый ранний доступный seq
 /// журнала `> C + 1`. События между ними не свёрнуты НИ ВО ЧТО. Докорм «поверх дырки» дал бы
 /// состояние, не соответствующее ни одной реальной истории, — вот ЭТО обязано быть громким.
+///
+/// **ВАЖНО ПРО АНТИ-ПЛАЦЕБО (B1, reviewer PR-гейт).** Reviewer нейтрализовал спец-проверку
+/// разрыва — и этот тест ОСТАЛСЯ зелёным, потому что его удовлетворяла ДРУГАЯ ветка («stale
+/// чекпоинт-файл → Err»). То есть задача #3 была мёртвым кодом. Анти-плацебо здесь наступает
+/// ТОЛЬКО В ПАРЕ с задачей #9: когда невалидный файл перестаёт быть ошибкой (GW-I-9б, тихий
+/// rebuild), единственный способ пройти этот тест — настоящая проверка разрыва по ЗАГОЛОВКУ
+/// чекпоинта (задача #8: `read_checkpoint_header` отдаёт `cursor` даже у непригодного к
+/// использованию файла). Вместе с парным `contiguous_boundary_is_not_a_gap` (стык
+/// `earliest == C+1` обязан ПРОЙТИ) это не оставляет места заглушке: «всегда Err» валится о
+/// парный тест, «никогда Err» — об этот.
+/// **Не удалять и не ослаблять ни один из трёх — они работают только вместе.**
 #[test]
 fn gap_between_checkpoint_and_journal_is_loud() {
     let dir = intact_journal();
@@ -670,5 +681,115 @@ fn advance_to_higher_cursor_does_update_checkpoint() {
         "движение ВПЕРЁД обязано обновлять чекпоинт — иначе гвард монотонности выродился в \
          «после первой записи не пишем никогда», и чекпоинт навсегда застрял бы на первом \
          прогоне cron'а (латентность TD-044 не вылечена)"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 7. B2 (reviewer PR-гейт) — УСТАРЕВШИЙ чекпоинт-файл НЕ является ошибкой
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Файл чекпоинта в ckpt-каталоге (без `*.tmp`).
+fn ckpt_file_path(dir: &std::path::Path) -> std::path::PathBuf {
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+        .expect("read_dir")
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_file())
+        .filter(|p| p.extension().and_then(|s| s.to_str()) != Some("tmp"))
+        .filter(|p| {
+            p.file_name()
+                .and_then(|s| s.to_str())
+                .is_some_and(|n| !n.ends_with(".lock"))
+        })
+        .collect();
+    files.sort();
+    files
+        .pop()
+        .expect("advance обязан был создать файл чекпоинта")
+}
+
+/// Подменить `gateway_schema_version` в заголовке файла (смещение 12..16 — сразу после
+/// magic и `ckpt_schema_version`). Моделирует БУДУЩИЙ штатный bump схемы: файл на диске
+/// снят прежней версией кода.
+fn corrupt_gw_schema_version(path: &std::path::Path) {
+    let mut bytes = std::fs::read(path).expect("read ckpt");
+    assert!(bytes.len() > 16, "чекпоинт подозрительно мал");
+    let other = gateway::GATEWAY_SCHEMA_VERSION + 1;
+    bytes[12..16].copy_from_slice(&other.to_le_bytes());
+    std::fs::write(path, &bytes).expect("write ckpt");
+}
+
+/// **B2 (reviewer): устаревший чекпоинт-файл ВОСПРОИЗВОДИТ TD-048, если он фатален.**
+///
+/// `decode_checkpoint` отвергает файл при `gw_v != GATEWAY_SCHEMA_VERSION`, и файл ОСТАЁТСЯ
+/// на диске. На проде `first_visible_seq = 16049334 > 0` **навсегда** (purge M-36 необратим),
+/// поэтому реализация, которая на «файл есть, но не декодируется + префикс усечён» возвращает
+/// `Err`, после ЛЮБОГО будущего бампа схемы больше не поднимет чекпоинт — до ручного
+/// `rm ckpt-*.bin`. Бампы рутинны: v5 (M-23), v6 (M-36), v7 (M-38a), v8 (сам M-48).
+/// Это ровно TD-048, воссозданный на другом входе.
+///
+/// **Правило (GW-I-9б, уже действовавшее — здесь оно ПРИБИВАЕТСЯ):** чекпоинт — КЭШ. Любая
+/// невалидность (версия, фингерпринт, CRC, мусор) → ТИХИЙ rebuild и ПЕРЕЗАПИСЬ файла.
+/// Никогда не ошибка, никогда не «удалите вручную». Ручное вмешательство в ops-пути — это
+/// и есть инертность фичи в проде.
+#[test]
+fn stale_schema_version_checkpoint_rebuilds_silently_and_overwrites() {
+    let (dir, earliest) = truncated_journal(); // прод-форма: префикс спрунен НАВСЕГДА
+    let ckpt = tempfile::tempdir().expect("ckpt");
+
+    gateway::checkpoint::advance(dir.path(), ckpt.path(), &sel(), EpochFilter::OwnCaptureOnly)
+        .expect("бутстрап на усечённом журнале обязан пройти");
+    let path = ckpt_file_path(ckpt.path());
+    let before = std::fs::read(&path).expect("read");
+
+    // Моделируем будущий штатный bump схемы: файл снят прежней версией кода.
+    corrupt_gw_schema_version(&path);
+
+    let res =
+        gateway::checkpoint::advance(dir.path(), ckpt.path(), &sel(), EpochFilter::OwnCaptureOnly);
+    let cursor = res.unwrap_or_else(|e| {
+        panic!(
+            "B2 НАРУШЕН (воспроизведение TD-048): устаревший по версии схемы чекпоинт-файл \
+             сделан ФАТАЛЬНЫМ: {e}\n\
+             На проде first_visible_seq={earliest}>0 навсегда, поэтому после любого будущего \
+             бампа схемы (а они рутинны: v5/v6/v7/v8) gateway-checkpoint не поднимется НИКОГДА \
+             до ручного rm. Чекпоинт — КЭШ (GW-I-9б): невалидный файл обязан быть тихо \
+             перестроен и ПЕРЕЗАПИСАН, а не требовать оператора."
+        )
+    });
+    assert!(cursor.upto_seq.is_some(), "rebuild обязан вернуть курсор");
+
+    let after = std::fs::read(&path).expect("read after");
+    assert_ne!(
+        after, before,
+        "файл обязан быть ПЕРЕЗАПИСАН свежим чекпоинтом (иначе на диске навсегда останется \
+         нечитаемый файл, и каждый следующий запуск будет платить полный реплей)"
+    );
+    assert_eq!(
+        &after[12..16],
+        &gateway::GATEWAY_SCHEMA_VERSION.to_le_bytes(),
+        "перезаписанный чекпоинт обязан нести ТЕКУЩУЮ версию схемы"
+    );
+
+    // И read-path обязан работать через него, а не уходить в полный реплей.
+    let (via, _stats) = gateway::snapshot_from_checkpoint(
+        dir.path(),
+        EpochFilter::OwnCaptureOnly,
+        &sel(),
+        ckpt.path(),
+        Cursor::LATEST,
+    )
+    .expect("snapshot_from_checkpoint после самолечения");
+    let full = gateway::snapshot(
+        dir.path(),
+        EpochFilter::OwnCaptureOnly,
+        &sel(),
+        Cursor::LATEST,
+    )
+    .expect("snapshot(START)");
+    assert_eq!(
+        canon(&via),
+        canon(&full),
+        "после самолечения путь через чекпоинт обязан быть байт-идентичен реплею от START"
     );
 }
