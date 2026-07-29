@@ -54,10 +54,10 @@ contracts-типы). Сейчас суита compile-RED именно из-за 
 | # | Задача | Владелец | Статус |
 |---|---|---|---|
 | 1 | RED-суита 5 файлов (40 оракулов: 12 подлинных RED D0–D3, 28 характеризационных с мутационным контролем ×7) + verify_M-41.sh | architect | ✅ DONE |
-| 2 | Экспорт `pub fn parse_message` (compile-GREEN), семантику не менять | venue-dev | ⏳ OPEN |
-| 3 | D0: фикс инверсии сторон ("B"→Buy, "A"→Sell) + фикс лживого доккомментария | venue-dev | ⏳ OPEN |
-| 4 | D1: l2Book без `time` → дроп (убрать `unwrap_or(0)`) | venue-dev | ⏳ OPEN |
-| 5 | D2+D3: валидация значений (finite, px>0, sz>0, time>0; гранулярность по спеке выше) | venue-dev | ⏳ OPEN |
+| 2 | Экспорт `pub fn parse_message` (compile-GREEN), семантику не менять | venue-dev | ✅ DONE |
+| 3 | D0: фикс инверсии сторон ("B"→Buy, "A"→Sell) + фикс лживого доккомментария | venue-dev | ✅ DONE |
+| 4 | D1: l2Book без `time` → дроп (убрать `unwrap_or(0)`) | venue-dev | ✅ DONE |
+| 5 | D2+D3: валидация значений (finite, px>0, sz>0, time>0; гранулярность по спеке выше) | venue-dev | ✅ DONE |
 | 6 | Чистый прогон: `cargo test -p venue-hyperliquid` + `bash scripts/verify_M-41.sh` + Done Block | tester | ⏳ OPEN |
 
 ## Allowed paths
