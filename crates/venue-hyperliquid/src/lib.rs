@@ -104,7 +104,7 @@ pub async fn run(tx: mpsc::Sender<EventKind>, coins: Vec<String>) -> anyhow::Res
 /// Разобрать одно `{"channel":"<type>","data":{...}}` сообщение в 0..N нормализованных
 /// событий (trades — массив, может дать несколько событий за раз). Некорректный/неожиданный
 /// формат — лог на debug, пустой Vec (без паники).
-fn parse_message(text: &str) -> Vec<EventKind> {
+pub fn parse_message(text: &str) -> Vec<EventKind> {
     let value: serde_json::Value = match serde_json::from_str(text) {
         Ok(v) => v,
         Err(e) => {
