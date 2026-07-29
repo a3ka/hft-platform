@@ -78,7 +78,7 @@
 //! - **п.7 парный vantage.** Каждый запрет предъявлен вместе с разрешением: непокрытый .zst
 //!   НЕ прунится / покрытый .zst прунится — иначе гвард вырождается в «не пруним никогда».
 
-use contracts::{DataSource, EventKind, MdPayload, Side, Venue};
+use contracts::{DataSource, EventKind, LegacySegmentDecl, MdPayload, Side, Venue};
 use journal::{EpochFilter, Journal, RetentionMode, RetentionPlan, RetentionPolicy, WriterConfig};
 
 const DAY_MS: i64 = 86_400_000;
@@ -655,12 +655,291 @@ fn rt_z_7_retention_binary_reports_compacted_segments_and_offload_only() {
          что уедет в холодное хранилище. Сжатая история в нём не упомянута ни строкой.",
         zst_count(dir.path())
     );
+
+    // C-037 N1: раздельные проверки `contains(".jrnl.zst")` и `contains("offload_only")`
+    // выполнимы выводом, где .zst перечислены под `skipped`, а `offload_only` — пустой
+    // заголовок со счётчиком. Это ровно класс «оракул мерит не то, что обещает» (TD-021),
+    // поэтому связь проверяется ПО СЕКЦИИ: сжатый сегмент обязан быть НАЗВАН именно в
+    // корзине offload_only.
+    let section = section_lines(&stdout, "offload_only");
     assert!(
-        stdout.contains("offload_only"),
-        "операторский вывод не содержит корзину offload_only.\n\
-         ДОЛЖНО БЫТЬ: печатается наравне с offload_and_prune и skipped\nПОЛУЧЕНО:\n{stdout}\n\
+        !section.is_empty(),
+        "в выводе нет секции offload_only.\nДОЛЖНО БЫТЬ: печатается наравне с \
+         offload_and_prune и skipped\nПОЛУЧЕНО:\n{stdout}\n\
          Без артефакта покрытия чекпоинтом (сегодняшний прод-режим) ВСЕ кандидаты попадают \
          именно туда: оператор видит «offload_and_prune: 0» и делает вывод, что apply ничего \
          не сделает, хотя копирование в холодное хранилище произойдёт."
+    );
+    assert!(
+        section.iter().any(|l| l.contains(".jrnl.zst")),
+        "секция offload_only не НАЗЫВАЕТ ни одного сжатого сегмента.\n\
+         ДОЛЖНО БЫТЬ: под заголовком offload_only перечислен хотя бы один segment-*.jrnl.zst \
+         (в каталоге их {}, покрытия нет ⇒ все кандидаты обязаны быть там)\n\
+         ПОЛУЧЕНО в секции:\n{}\n\nПОЛНЫЙ вывод:\n{stdout}\n\
+         Счётчика в заголовке недостаточно: оператор решает по ИМЕНАМ, что именно уедет \
+         в холодное хранилище.",
+        zst_count(dir.path()),
+        section.join("\n")
+    );
+}
+
+/// Строки ПОД заголовком секции операторского вывода (`  <name>: N сегмент(ов)`) — до
+/// следующего заголовка того же уровня. Нужна, чтобы проверять принадлежность строки
+/// КОРЗИНЕ, а не факт её присутствия где-то в stdout.
+fn section_lines(stdout: &str, name: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut inside = false;
+    for line in stdout.lines() {
+        let header = line.trim_start();
+        let is_header = line.starts_with("  ")
+            && !line.starts_with("    ")
+            && header.contains(':')
+            && !header.starts_with('-');
+        if is_header {
+            if inside {
+                break;
+            }
+            inside = header.starts_with(name);
+            continue;
+        }
+        if inside {
+            out.push(line.to_string());
+        }
+    }
+    out
+}
+
+// ═════════════════════════════════════════════════════════════════════════════════════
+// RT-Z-8 — C-037 B1: синтетический `first_seq = 0` соседа НЕ ЕСТЬ ФАКТ (TD-030, fail-open)
+// ═════════════════════════════════════════════════════════════════════════════════════
+
+/// **Добавлено по вердикту critic C-037 (B1). Architect ошибся, критик прав — проверено
+/// замером.**
+///
+/// Гейт покрытия (C-030 R1) считает `last_seq(S) = first_seq(следующий) − 1`. Но у
+/// ЗАДЕКЛАРИРОВАННОГО legacy-сегмента `first_seq` не читается из файла — он СИНТЕЗИРУЕТСЯ
+/// нулём (`segments.rs:509-512`, `SegmentHeader::from_legacy_decl`). Тогда
+/// `last_seq(предшественник) = 0.saturating_sub(1) = 0`, и проверка `0 <= covered` истинна
+/// при ЛЮБОМ покрытии, включая `covered = 0`. Предшественник объявляется покрытым и
+/// удаляется, хотя чекпоинт не свернул ни одного его события.
+///
+/// **Возражение architect'а, которое НЕ выдержало проверки:** «legacy лежит только под
+/// индексом 0, значит у него нет предшественника». Это историческое наблюдение о старом
+/// писателе, а не инвариант: `LegacySegmentDecl.file_name` — обычная `String`, и
+/// `declare_legacy` принимает любое имя сегмента. Замер (probe architect'а, origin/feat/M-40
+/// @ 492b01e):
+///
+/// ```text
+/// declare_legacy для segment-00000003.jrnl — ПРИНЯТ
+///   seg 2 first_seq=342 schema_version=4
+///   seg 3 first_seq=0   schema_version=1   ← синтетический ноль
+/// PLAN при covered=0: offload_and_prune=[2]   ← события seq 342..510 удаляются
+///                     offload_only=[0, 1]      ← соседи защищены корректно
+/// ```
+///
+/// Дефект точечный и потому особенно опасен: соседние сегменты обрабатываются правильно,
+/// поэтому отчёт оператора выглядит здоровым.
+///
+/// **Контракт (architect):** `last_seq` обязан быть ФАКТОМ. Если заголовок следующего
+/// сегмента не даёт достоверного `first_seq` (legacy: `schema_version ==
+/// SCHEMA_VERSION_PRE_HEADER`), реализация ОБЯЗАНА установить `last_seq` иначе — прямым
+/// чтением хвоста самого кандидата (`tail_last_seq_of` уже bounded, TD-011). Принимать
+/// синтетический ноль за факт ЗАПРЕЩЕНО. «Нет информации» не равно «покрыт».
+///
+/// ПАРНЫЙ vantage обязателен: при покрытии, реально включающем последний seq кандидата,
+/// он ОБЯЗАН пруниться — иначе гвард выродится в «рядом с legacy не пруним никогда», и
+/// место не освободится (тот же класс, что covered_segments_are_pruned в C-030).
+#[test]
+fn rt_z_8_synthetic_zero_first_seq_of_legacy_neighbour_is_not_a_fact() {
+    let t0 = now_ms() - 30 * DAY_MS;
+    let dir = tempfile::tempdir().expect("dir");
+    let cold = tempfile::tempdir().expect("cold");
+    build(dir.path(), t0);
+    let now = t0 + 10 * DAY_MS;
+
+    // ФАКТИЧЕСКИЙ last_seq кандидата фиксируем ДО того, как сосед станет legacy:
+    // пока сегмент 3 нормальный, его first_seq достоверен.
+    let target: u32 = 2;
+    let real_last_seq = last_seq_of(dir.path(), target).expect("last_seq до мутации соседа");
+
+    // Сосед (сегмент 3) превращается в задекларированный legacy — ровно операторская
+    // процедура, которой на проде объявлен segment-00000000.jrnl (15 GB истории).
+    let victim = dir.path().join("segment-00000003.jrnl");
+    std::fs::write(
+        &victim,
+        b"LEGACY-RAW-FRAMES-NO-V2-MAGIC-payload-payload-payload",
+    )
+    .expect("write legacy");
+    journal::declare_legacy(
+        dir.path(),
+        LegacySegmentDecl {
+            file_name: "segment-00000003.jrnl".to_string(),
+            fingerprint_sha256: String::new(), // declare_legacy пересчитает сам
+            size_bytes_at_decl: 0,             // и размер тоже
+            source: DataSource::OwnCapture,
+            provenance: "legacy fixture (M-40 B1)".to_string(),
+            epoch_id: "own-test".to_string(),
+        },
+    )
+    .expect("declare_legacy обязан принять индекс != 0 — иначе фикстура не воспроизводит форму");
+
+    // Setup-guard (свойство 3 «целостности гейта»): фикстура обязана ДОКАЗАТЬ, что создала
+    // именно ту форму, ради которой написана, а не «просто битый файл».
+    let segs = journal::list_segments(dir.path()).expect("segments");
+    let legacy = segs
+        .iter()
+        .find(|s| s.index == 3)
+        .expect("сегмент 3 обязан остаться в перечислении");
+    assert_eq!(
+        legacy.header.schema_version,
+        contracts::SCHEMA_VERSION_PRE_HEADER,
+        "фикстура не состоялась: сегмент 3 не распознан как LEGACY (schema_version={}). \
+         Без этого оракул проверяет не ту форму и вырождается в плацебо.",
+        legacy.header.schema_version
+    );
+    assert_eq!(
+        legacy.header.first_seq, 0,
+        "фикстура не состоялась: у legacy-сегмента first_seq={} вместо синтетического 0 — \
+         ловушка TD-030 не воспроизведена",
+        legacy.header.first_seq
+    );
+
+    // (а) FAIL-OPEN ЗАПРЕЩЁН: чекпоинт свернул только seq 0 — кандидат НЕ покрыт.
+    let plan0 = journal::retention_plan(dir.path(), &policy(cold.path(), Some(0)), now)
+        .expect("plan covered=0");
+    assert!(
+        !idx(&plan0.offload_and_prune).contains(&target),
+        "C-030 R1 НАРУШЕН (fail-open через TD-030): сегмент {target} попал в prune при \
+         covered=0, хотя его события — seq ..{real_last_seq}.\n\
+         ДОЛЖНО БЫТЬ: offload_and_prune НЕ содержит {target} (и {target} уходит в offload_only)\n\
+         ПОЛУЧЕНО: offload_and_prune={:?}, offload_only={:?}\n\
+         Причина: last_seq взят из СИНТЕТИЧЕСКОГО first_seq=0 задекларированного legacy-соседа \
+         и выродился в 0, из-за чего «0 <= covered» истинно при любом покрытии. Соседние \
+         сегменты при этом обрабатываются верно, поэтому отчёт оператора выглядит здоровым, \
+         а история молча удаляется.",
+        idx(&plan0.offload_and_prune),
+        idx(&plan0.offload_only)
+    );
+    assert!(
+        idx(&plan0.offload_only).contains(&target),
+        "непокрытый сегмент {target} обязан уйти в offload_only (бэкап R1 не блокируется).\n\
+         ПОЛУЧЕНО: offload_only={:?}, skipped={:?}",
+        idx(&plan0.offload_only),
+        skipped_idx(&plan0)
+    );
+
+    // (б) ПАРНЫЙ vantage: при реальном покрытии кандидат ОБЯЗАН пруниться. Иначе
+    // реализация «сосед legacy ⇒ никогда не покрыт» заморозит место навсегда.
+    let plan_full = journal::retention_plan(dir.path(), &policy(cold.path(), Some(u64::MAX)), now)
+        .expect("plan covered=MAX");
+    assert!(
+        idx(&plan_full.offload_and_prune).contains(&target),
+        "сегмент {target} (last_seq={real_last_seq}) не прунится даже при covered=u64::MAX.\n\
+         ДОЛЖНО БЫТЬ: offload_and_prune содержит {target}\nПОЛУЧЕНО: {:?}\n\
+         Гвард выродился в «рядом с legacy не пруним никогда»: «нет информации» подменило \
+         «не покрыт», и диск не освобождается. last_seq обязан быть УСТАНОВЛЕН фактически \
+         (чтение хвоста кандидата), а не объявлен неизвестным.",
+        idx(&plan_full.offload_and_prune)
+    );
+}
+
+// ═════════════════════════════════════════════════════════════════════════════════════
+// RT-Z-9 — C-037 B2: деградированный каталог не имеет права делать отчёт лживым
+// ═════════════════════════════════════════════════════════════════════════════════════
+
+/// **Добавлено по вердикту critic C-037 (B2).** Задача #4 milestone'а требует, чтобы
+/// `retention_execute` перечислял сегменты ТЕМ ЖЕ способом, что и `retention_plan`, но
+/// `rt_z_4` гоняет только ЗДОРОВЫЙ каталог и этого не наблюдает.
+///
+/// `retention_execute` вызывает `segments(_dir).unwrap_or_default()` (`segments.rs:1825`).
+/// `segments()` — fail-closed: ОДИН чужой/битый файл делает весь вызов `Err`, а
+/// `unwrap_or_default()` превращает его в ПУСТОЙ список. Дальше `last_seq_opt = None` для
+/// каждого сегмента ⇒ `is_uncovered = true` ⇒ все удаления попадают в
+/// `pruned_without_checkpoint_coverage`.
+///
+/// Замер (probe architect'а) — ПОЛНОЕ покрытие `covered = u64::MAX`, один чужой файл:
+/// ```text
+/// APPLY pruned=4
+/// APPLY pruned_without_checkpoint_coverage=4  ← все четыре, при полном покрытии
+/// ```
+///
+/// Направление ошибки безопасное (over-reporting, не удаление лишнего), но аудит-трейл
+/// операторского override становится ЛОЖЬЮ: поле, существующее ровно для того, чтобы
+/// назвать поимённо каждое удаление без покрытия, называет удаления, которые покрыты
+/// полностью. Оператор, увидев такой отчёт, либо перестанет ему верить, либо начнёт
+/// расследовать несуществующий инцидент. Дефект живой на `main` и воспроизводится даже
+/// без единого `.zst`.
+#[test]
+fn rt_z_9_foreign_file_does_not_corrupt_coverage_audit_of_healthy_prunes() {
+    let t0 = now_ms() - 30 * DAY_MS;
+    let dir = tempfile::tempdir().expect("dir");
+    let cold = tempfile::tempdir().expect("cold");
+    build(dir.path(), t0);
+    journal::compact_closed_segments(dir.path(), 2, 3).expect("compact");
+
+    // Чужой файл с именем сегмента: незадекларированный legacy / обрыв копирования / мусор.
+    // Ровно то, из-за чего segments() отдаёт Err целиком.
+    std::fs::write(
+        dir.path().join("segment-00000042.jrnl"),
+        b"not a journal segment at all",
+    )
+    .expect("write foreign");
+
+    // Setup-guard: доказать, что фикстура создала ОБА условия — деградацию и здоровый .zst.
+    assert!(
+        journal::list_segments(dir.path()).is_err(),
+        "фикстура не состоялась: segments() обязан быть Err из-за чужого файла — иначе \
+         деградированный путь не воспроизведён и оракул проверяет не то"
+    );
+    assert!(
+        zst_count(dir.path()) >= 2,
+        "фикстура не состоялась: нужно ≥2 здоровых сжатых сегмента, есть {}",
+        zst_count(dir.path())
+    );
+
+    let now = t0 + 10 * DAY_MS;
+    let pol = policy(cold.path(), Some(u64::MAX)); // покрыто ВСЁ, без всякого override
+    let plan = journal::retention_plan(dir.path(), &pol, now).expect("plan");
+    assert!(
+        !plan.offload_and_prune.is_empty(),
+        "один чужой файл обнулил план по здоровым сегментам: offload_and_prune пуст, \
+         skipped={:?}",
+        skipped_idx(&plan)
+    );
+
+    let report =
+        journal::retention_execute(dir.path(), &plan, &pol, RetentionMode::Apply).expect("apply");
+
+    assert!(
+        report.pruned_without_checkpoint_coverage.is_empty(),
+        "АУДИТ-ТРЕЙЛ ЛЖЁТ: при covered=u64::MAX и allow_prune_without_checkpoint=false отчёт \
+         называет удаления «без покрытия чекпоинтом».\n\
+         ДОЛЖНО БЫТЬ: pruned_without_checkpoint_coverage пуст\n\
+         ПОЛУЧЕНО: {:?}\n\
+         pruned={:?}\n\
+         Причина: execute перечисляет сегменты через segments(_dir).unwrap_or_default(), и один \
+         чужой файл схлопывает список в пустой ⇒ last_seq неизвестен для ВСЕХ ⇒ каждое удаление \
+         помечено как непокрытое. Поле, созданное для поимённого аудита операторского override, \
+         перестаёт что-либо значить.",
+        report.pruned_without_checkpoint_coverage,
+        report.pruned
+    );
+    assert!(
+        report.failed.is_empty(),
+        "здоровые сегменты не должны попадать в failed из-за чужого файла: {:?}",
+        report.failed
+    );
+    assert!(
+        report
+            .pruned
+            .iter()
+            .any(|p| p.to_string_lossy().ends_with(".zst")),
+        "ни один сжатый сегмент не удалён — деградированный каталог не отменяет работу по \
+         здоровым кандидатам.\nПОЛУЧЕНО: pruned={:?}",
+        report.pruned
+    );
+    assert!(
+        report.freed_bytes > 0,
+        "freed_bytes=0 при непустом pruned — отчёт оператора недостоверен"
     );
 }
