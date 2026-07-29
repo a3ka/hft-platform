@@ -425,6 +425,13 @@
     на `--mode=dry-run` (правильно — apply без cold-выгрузки не должен удалять). Компакция снижает ТЕМП
     роста, но durable-СНИЖЕНИЕ = ретеншен с cold. **TD-020 закрывается вместе с Storage Box + первым
     успешным apply.**
+  **СТАТУС 2026-07-29 (reviewer, прод-замер VPS) — переформулировка сути долга.** Ретеншен
+  ВЫЗЫВАЕТСЯ регулярно: cron `7 4 * * *` активен, `/var/lib/hft/retention.last-success` свежий —
+  претензия «никто не вызывает» устарела и снята. Ядро риска (R1) сместилось: ретеншен работает
+  ТОЛЬКО в режиме `--mode dry-run` (штатно, как и задумано без cold-хранилища); ни одного реального
+  `--mode apply` не было выполнено НИ РАЗУ — offsite cold-выгрузки на прод-журнале не произошло.
+  Суть долга теперь: «вызывается только в dry-run; offsite-выгрузки не было», а не «не вызывается
+  никем». TD-020 остаётся OPEN до первого успешного `apply` со Storage Box.
 - **TD-026** `red-prod-migration-fails-on-full-host-disk` (найдено reviewer'ом на §8 M-08 task 20,
   2026-07-15; **перенумерован из TD-025 → TD-026 reviewer'ом 2026-07-19** — коллизия номера с recon-flood
   TD-025, `docs(M-09) task 4` close-out).
@@ -459,61 +466,6 @@
   `.claude/rules/testing.md` (прод-масштаб для sacred I/O-путей) и в чек-лист §8
   (`.claude/rules/gates.md`): **RSS мерить как anon, не как cgroup-total**. Зона: architect
   (процессный слой). Severity: **MAJOR** (метрика вводила в заблуждение два milestone'а подряд).
-- **TD-022** `closed-segment-compaction-not-delivered` (M-08 task 15, reviewer §8, 2026-07-14).
-  Компакция закрытых сегментов была реализована в стековой ветке (`d131519`, oracle fix `e4f23d1`)
-  и локально выглядела не-плацебо: C1-C6 FAIL против `76aadb2`, GREEN на `91f11aa`, C5 валит
-  наивную реализацию "распаковать .zst целиком в RAM". Но стек был откатан из-за красного task 14
-  на prod dry-run, поэтому **компакции нет ни на main, ни на проде**, закрытый сегмент не сжат,
-  свободное место и deadline disk-guard не отодвинуты. Следующий виток должен доставить
-  операторский/CLI-путь компакции или явную §8-команду, реально сжать закрытый сегмент на VPS,
-  доказать чтение `journal::stream` после сжатия и отсутствие потери событий. Severity: **MAJOR**.
-  - **rev 9 (reviewer §8, 2026-07-14) — REJECTED + REVERTED (`82b33db`).** Стек rev9
-    (`cb46e34`+`9cf5acf`+`1ff1b55`, задачи 15 crash-window self-heal + 16 оператор компакции)
-    прошёл ВСЕ локальные гейты на merge-коммите (`fmt`/`clippy`/**181 passed**/`verify_M-08` PASS/
-    `verify_delivery` PASS вкл. D5a+D7/`crontab -n` 0). Оба rev8-блокера reviewer'а закрыты и
-    подтверждены фактом: (1) D-COMP-1 — `segments()` (прод-путь `stream`) дедуплицирует raw+.zst
-    через общий `dedup_indexed_paths` (raw побеждает); репро крах-окна: было 3172 события → стало
-    3000; (2) D-COMP-2 — self-heal ветки `dst.exists()` со sha256-сверкой, битый `.zst` НЕ удаляет
-    оригинал. Анти-плацебо C7/C8/C9 падают против `cb46e34`, GREEN на HEAD.
-    **НО §8 eyes-on на VPS вскрыл НОВЫЙ, БОЛЕЕ ОПАСНЫЙ дефект (data-loss):** оператор
-    `--mode compact --keep-raw N` жмёт **старейшие** закрытые сегменты первыми, а `segment-0` на
-    проде — **15 GB LEGACY** (без v2-магии `HFTJRN02`, задекларирован в `journal.legacy.json`,
-    невосполнимая история 2026-07-10..14). `compact_segment` его СЖИМАЕТ (sha сырых == sha
-    распакованных → верификация проходит → оригинал УДАЛЯЕТСЯ), но обратное чтение `.zst` идёт
-    через `skip_v2_header_forward`, который ТРЕБУЕТ v2-магию → `CorruptHeader` → `segments()`/
-    `list_segments`/`stream` падают на первом же классифае ⇒ **ВЕСЬ ЖУРНАЛ НЕЧИТАЕМ, а оригинал
-    legacy стёрт.** Доказано фактом в песочнице (не на проде — prod-каталог НЕ тронут): раскладка
-    legacy-0(declared)+v2-1(closed)+v2-2(active), реальная `compact_closed_segments(keep_raw=1)` →
-    после неё `list_segments`/`stream` = `corrupt SegmentHeader`. Cron на VPS НЕ установлен
-    (`/etc/cron.d` пуст) ⇒ авто-порчи нет, prod цел (5 сырых сегментов); но код+runbook на main
-    инструктировали оператора установить cron, который уничтожил бы историю при первом запуске.
-    **Следующий виток (architect): компакция ОБЯЗАНА не трогать legacy-сегменты** (либо
-    `compact_segment` возвращает `Err` на сегмент без v2-магии — конструктивный барьер, RED-оракул;
-    либо `.zst` несёт восстановимый v2-заголовок и legacy читается после сжатия). RED-набор обязан
-    включать legacy-сегмент в каталоге (дефект фикстуры: C1-C9 строят ТОЛЬКО v2 через
-    `Journal::open_with` — прод-раскладка с legacy не покрыта). Severity: **CRITICAL** (потеря
-    невосполнимых первичных данных).
-  - **✅ CLOSED 2026-07-15 (reland `8a2e377`, reviewer §8 GREEN на РЕАЛЬНОМ проде).** Цепочка:
-    architect `4d92373` (чистый revert-of-revert `82b33db` — восстановил rev9-стек 1:1, reviewer
-    сверил tree(4d92373)==tree(2b2311f) побайтово) + `7754308` C10 RED + `0c7bef4` TD-023 +
-    `0cd4eca` D-COMP-4 (`compact_segment` → `Err` на сегменте без `SEGMENT_MAGIC` в первых байтах,
-    ДО любой мутации; `compact_closed_segments` тихо пропускает legacy) + `8a2e377` §8-план.
-    **D-COMP-4:** конструктивный барьер по первым 8 байтам файла (как «активный не сжимаем»).
-    **Анти-плацебо доказан reviewer'ом независимо:** C10 FAIL против `7754308` (без барьера,
-    `red_compaction.rs:562` «legacy стёрты»), GREEN на HEAD. Гейты (перепрогнаны на чистом
-    worktree): fmt/clippy clean, **workspace 182/0**, `red_compaction` **10/10** (C1-C10),
-    `red_book_bounded` 7/7, `verify_M-08.sh` PASS, `verify_delivery_M-08.sh` PASS (D1-D7 + deep
-    D1-deep/D2-deep). **§8 два шага (`--mode compact --dry-run` НЕ существует):**
-    (A) sandbox с доставленным бинарём (образ `hft-platform-recorder:local`) на faithful прод-
-    раскладке (no-magic declared legacy-0 + 35 v2): legacy байт-в-байт цел, `.zst` для legacy НЕ
-    создан, 32 v2 сжаты (14.5×), `journal::stream` = 3500 событий ДО и ПОСЛЕ (потерь нет).
-    (B) **РЕАЛЬНАЯ компакция боевого `/journal` через доставленный cron-скрипт** (`exit=0`, alert
-    не взведён): **боевой legacy-0 БАЙТ-В-БАЙТ ЦЕЛ** (полный sha256 `234583c8…bdbdc72` == эталон,
-    size=15188347171, mtime=1784018822 не изменились — барьер сработал на живом 15 GB legacy);
-    сегменты 1-5 → `.jrnl.zst`, `zstd -t` каждого = исходный raw-размер (данные целы, +D-COMP-2
-    sha-roundtrip до удаления raw); **свободно 111.20 → 115.88 GB (+4.69 GB) — диск двинулся**;
-    recorder healthy, restarts=0, next_seq растёт, heartbeat свежий (конкурентная компакция
-    закрытых не задела живого писателя). Legacy-безопасность компакции доказана на РЕАЛЬНОМ активе.
 - **TD-023** `book-memory-oracle-flaky-under-parallel-tests` (найдено reviewer'ом на §8 M-08 rev9,
   2026-07-14). `crates/venue-binance/tests/red_book_bounded.rs::td016_memory_bounded_when_price_
   drifts_out_of_band` меряет прирост памяти через **процесс-глобальный** `static CUR` +
@@ -537,46 +489,6 @@
   5000; rev6 поднял до 200k/сторону). reviewer перепрогнал: 7/7 стабильно, GREEN под полным
   `cargo test --workspace` (77 блоков, 182/0) — флак устранён. Sacred-тест, правка architect'а.
 
-- **TD-024** `compose-service-command-uses-equals-form-binary-rejects` (найдено reviewer'ом на §8
-  M-08 rev10, 2026-07-15). §8 Step B: попытка запустить компакцию через ЗАДОКУМЕНТИРОВАННУЮ
-  операторскую команду `docker compose run --rm journal-compaction` упала:
-  `journal-retention: неизвестный флаг` — сервисы `journal-compaction` И `journal-retention` в
-  `docker-compose.yml` держат `command:` в форме `--dir=/journal`/`--mode=compact`/`--keep-raw=2`
-  (equals-form), а ручной arg-парсер бинаря (`match arg { "--dir" => next() }`) `=`-форму НЕ
-  разбирает → «неизвестный флаг», exit 1. Хуже того, любая документированная команда вида
-  `docker compose run --rm journal-retention --mode apply` (README D6) APPEND'ит аргумент, а в
-  `docker compose run SERVICE ARG` этот ARG **ЗАМЕНЯЕТ** весь `command:`-блок ⇒ теряется
-  `--dir=/journal` ⇒ бинарь берёт `DEFAULT_DIR=./journal-data` (пустой каталог в контейнере), а
-  НЕ боевой `/journal`. **Работает ТОЛЬКО потому, что cron-скрипты** (`journal-{retention,
-  compaction}-cron.sh`) передают ПОЛНЫЙ раздельный argv (`--dir /journal … --mode compact`),
-  который заменяет блок целиком корректным набором — именно через cron-скрипт reviewer выполнил
-  §8-B успешно. Т.е. прод-путь (cron) работает, но задокументированные ad-hoc операторские команды
-  и bare-запуск сервиса СЛОМАНЫ (та же серия «текст в репо ≠ работает в проде», что весь TD-020;
-  гейт `verify_delivery` D5a/D7 гонял ТОЛЬКО cron-argv, а `command:`-блок compose против живого
-  бинаря не проверял). **Фикс (architect/engine-dev):** либо `command:` в раздельной форме
-  (`- --dir` / `- /journal` отдельными элементами списка), либо парсер принимает `--flag=value`
-  (`split_once('=')`); README-команды привести к форме, которая НЕ теряет `--dir`. Плюс гейт
-  `verify_delivery`: прогнать РЕАЛЬНЫЙ бинарь именно через `command:`-блок compose (bare service
-  run), а не только через cron-argv. Данные НЕ пострадали (бинарь падал на arg-парсинге ДО мутаций;
-  legacy цел). Severity: **MAJOR** (операторский интерфейс хрупкий/сломан вне точных cron-скриптов;
-  apply-команда из README целится в неверный каталог).
-  **✅ CLOSED 2026-07-15 (task 19 / rev11, `e31e23e`, §8 PROD GREEN).** Цепочка: architect
-  `475bbd5` RED `red_cli_argv.rs` (гоняет НАСТОЯЩИЙ бинарь `CARGO_BIN_EXE_journal-retention`:
-  equals-форма dry-run + compact + регресс раздельной формы) + гейт **D8** (`verify_delivery`
-  извлекает `command:`-блок ОБОИХ сервисов из compose, подставляет `${VAR:-default}`+sandbox
-  СОХРАНЯЯ форму флага, прогоняет реальным бинарём — прямо закрывает слепое пятно D5a/D7) →
-  engine-dev `935bc9b` фикс парсера (нормализация argv ДО цикла: `--flag=value` →
-  `split_once('=')` → `[--flag, value]`; раздельная форма без изменений — регрессии нет) +
-  `e31e23e` README §4 (Apply = ПОЛНЫЙ повтор argv, не «короткая» `--mode apply`, что теряла `--dir`).
-  **Анти-плацебо доказан reviewer'ом независимо:** оба equals-теста FAIL против `475bbd5` (без
-  фикса, exit=1 «equals-форма отвергнута»), раздельный проходит; GREEN на HEAD. Гейты: workspace
-  **185/0**, verify_M-08 PASS, verify_delivery PASS вкл. **D8 обоих сервисов**, crontab -n 0.
-  **§8 PROD (VPS `e31e23e`):** `docker compose --profile ops run --rm journal-compaction` (ровно
-  та equals-form команда, что падала до фикса) → **exit=0**, сжаты сегменты 6,7 (10.43×), диск
-  +1.94 GB; `docker compose --profile ops run --rm journal-retention` (dry-run) → **exit=0**,
-  0 prune, legacy/active/young корректно skipped, disk_pressure нет; **legacy-0 байт-в-байт цел**
-  (sha256 `234583c8…bdbdc72`, size+mtime не изменились), recorder healthy, restarts=0. Задокументи-
-  рованный операторский путь через compose теперь работает end-to-end. Data не пострадали.
 - **TD-018** `deploy-ci-gate-cannot-read-ci-status` (найдено reviewer'ом на §8 M-08, 2026-07-14).
   Гейт TD-017 (`deploy.yml` job `ci`, «Wait for CI success on this commit») **не работает**:
   `gh api repos/$REPO/actions/runs?head_sha=$SHA` возвращает **`HTTP 403 Resource not accessible
@@ -1469,6 +1381,108 @@
   **ДО провижининга Alertmanager (§O, founder ★) эти метрики ОБЯЗАНЫ быть живыми — иначе алерты театр.**
   Severity: **MAJOR** (цель milestone'а для 3 формирующих инцидентов не достигнута; регрессии нет —
   эндпоинт+каталог net-new и корректны).
+- **TD-024** `compose-service-command-uses-equals-form-binary-rejects` (найдено reviewer'ом на §8
+  M-08 rev10, 2026-07-15). §8 Step B: попытка запустить компакцию через ЗАДОКУМЕНТИРОВАННУЮ
+  операторскую команду `docker compose run --rm journal-compaction` упала:
+  `journal-retention: неизвестный флаг` — сервисы `journal-compaction` И `journal-retention` в
+  `docker-compose.yml` держат `command:` в форме `--dir=/journal`/`--mode=compact`/`--keep-raw=2`
+  (equals-form), а ручной arg-парсер бинаря (`match arg { "--dir" => next() }`) `=`-форму НЕ
+  разбирает → «неизвестный флаг», exit 1. Хуже того, любая документированная команда вида
+  `docker compose run --rm journal-retention --mode apply` (README D6) APPEND'ит аргумент, а в
+  `docker compose run SERVICE ARG` этот ARG **ЗАМЕНЯЕТ** весь `command:`-блок ⇒ теряется
+  `--dir=/journal` ⇒ бинарь берёт `DEFAULT_DIR=./journal-data` (пустой каталог в контейнере), а
+  НЕ боевой `/journal`. **Работает ТОЛЬКО потому, что cron-скрипты** (`journal-{retention,
+  compaction}-cron.sh`) передают ПОЛНЫЙ раздельный argv (`--dir /journal … --mode compact`),
+  который заменяет блок целиком корректным набором — именно через cron-скрипт reviewer выполнил
+  §8-B успешно. Т.е. прод-путь (cron) работает, но задокументированные ad-hoc операторские команды
+  и bare-запуск сервиса СЛОМАНЫ (та же серия «текст в репо ≠ работает в проде», что весь TD-020;
+  гейт `verify_delivery` D5a/D7 гонял ТОЛЬКО cron-argv, а `command:`-блок compose против живого
+  бинаря не проверял). **Фикс (architect/engine-dev):** либо `command:` в раздельной форме
+  (`- --dir` / `- /journal` отдельными элементами списка), либо парсер принимает `--flag=value`
+  (`split_once('=')`); README-команды привести к форме, которая НЕ теряет `--dir`. Плюс гейт
+  `verify_delivery`: прогнать РЕАЛЬНЫЙ бинарь именно через `command:`-блок compose (bare service
+  run), а не только через cron-argv. Данные НЕ пострадали (бинарь падал на arg-парсинге ДО мутаций;
+  legacy цел). Severity: **MAJOR** (операторский интерфейс хрупкий/сломан вне точных cron-скриптов;
+  apply-команда из README целится в неверный каталог).
+  **✅ CLOSED 2026-07-15 (task 19 / rev11, `e31e23e`, §8 PROD GREEN).** Цепочка: architect
+  `475bbd5` RED `red_cli_argv.rs` (гоняет НАСТОЯЩИЙ бинарь `CARGO_BIN_EXE_journal-retention`:
+  equals-форма dry-run + compact + регресс раздельной формы) + гейт **D8** (`verify_delivery`
+  извлекает `command:`-блок ОБОИХ сервисов из compose, подставляет `${VAR:-default}`+sandbox
+  СОХРАНЯЯ форму флага, прогоняет реальным бинарём — прямо закрывает слепое пятно D5a/D7) →
+  engine-dev `935bc9b` фикс парсера (нормализация argv ДО цикла: `--flag=value` →
+  `split_once('=')` → `[--flag, value]`; раздельная форма без изменений — регрессии нет) +
+  `e31e23e` README §4 (Apply = ПОЛНЫЙ повтор argv, не «короткая» `--mode apply`, что теряла `--dir`).
+  **Анти-плацебо доказан reviewer'ом независимо:** оба equals-теста FAIL против `475bbd5` (без
+  фикса, exit=1 «equals-форма отвергнута»), раздельный проходит; GREEN на HEAD. Гейты: workspace
+  **185/0**, verify_M-08 PASS, verify_delivery PASS вкл. **D8 обоих сервисов**, crontab -n 0.
+  **§8 PROD (VPS `e31e23e`):** `docker compose --profile ops run --rm journal-compaction` (ровно
+  та equals-form команда, что падала до фикса) → **exit=0**, сжаты сегменты 6,7 (10.43×), диск
+  +1.94 GB; `docker compose --profile ops run --rm journal-retention` (dry-run) → **exit=0**,
+  0 prune, legacy/active/young корректно skipped, disk_pressure нет; **legacy-0 байт-в-байт цел**
+  (sha256 `234583c8…bdbdc72`, size+mtime не изменились), recorder healthy, restarts=0. Задокументи-
+  рованный операторский путь через compose теперь работает end-to-end. Data не пострадали.
+  **✅ CLOSED (подтверждено повторно reviewer'ом 2026-07-29).** Оракул
+  `crates/journal/tests/red_cli_argv.rs` зелёный на текущем HEAD; equals-форма compose принимается
+  бинарём без регрессии. Запись переносится в CLOSED.
+- **TD-022** `closed-segment-compaction-not-delivered` (M-08 task 15, reviewer §8, 2026-07-14).
+  Компакция закрытых сегментов была реализована в стековой ветке (`d131519`, oracle fix `e4f23d1`)
+  и локально выглядела не-плацебо: C1-C6 FAIL против `76aadb2`, GREEN на `91f11aa`, C5 валит
+  наивную реализацию "распаковать .zst целиком в RAM". Но стек был откатан из-за красного task 14
+  на prod dry-run, поэтому **компакции нет ни на main, ни на проде**, закрытый сегмент не сжат,
+  свободное место и deadline disk-guard не отодвинуты. Следующий виток должен доставить
+  операторский/CLI-путь компакции или явную §8-команду, реально сжать закрытый сегмент на VPS,
+  доказать чтение `journal::stream` после сжатия и отсутствие потери событий. Severity: **MAJOR**.
+  - **rev 9 (reviewer §8, 2026-07-14) — REJECTED + REVERTED (`82b33db`).** Стек rev9
+    (`cb46e34`+`9cf5acf`+`1ff1b55`, задачи 15 crash-window self-heal + 16 оператор компакции)
+    прошёл ВСЕ локальные гейты на merge-коммите (`fmt`/`clippy`/**181 passed**/`verify_M-08` PASS/
+    `verify_delivery` PASS вкл. D5a+D7/`crontab -n` 0). Оба rev8-блокера reviewer'а закрыты и
+    подтверждены фактом: (1) D-COMP-1 — `segments()` (прод-путь `stream`) дедуплицирует raw+.zst
+    через общий `dedup_indexed_paths` (raw побеждает); репро крах-окна: было 3172 события → стало
+    3000; (2) D-COMP-2 — self-heal ветки `dst.exists()` со sha256-сверкой, битый `.zst` НЕ удаляет
+    оригинал. Анти-плацебо C7/C8/C9 падают против `cb46e34`, GREEN на HEAD.
+    **НО §8 eyes-on на VPS вскрыл НОВЫЙ, БОЛЕЕ ОПАСНЫЙ дефект (data-loss):** оператор
+    `--mode compact --keep-raw N` жмёт **старейшие** закрытые сегменты первыми, а `segment-0` на
+    проде — **15 GB LEGACY** (без v2-магии `HFTJRN02`, задекларирован в `journal.legacy.json`,
+    невосполнимая история 2026-07-10..14). `compact_segment` его СЖИМАЕТ (sha сырых == sha
+    распакованных → верификация проходит → оригинал УДАЛЯЕТСЯ), но обратное чтение `.zst` идёт
+    через `skip_v2_header_forward`, который ТРЕБУЕТ v2-магию → `CorruptHeader` → `segments()`/
+    `list_segments`/`stream` падают на первом же классифае ⇒ **ВЕСЬ ЖУРНАЛ НЕЧИТАЕМ, а оригинал
+    legacy стёрт.** Доказано фактом в песочнице (не на проде — prod-каталог НЕ тронут): раскладка
+    legacy-0(declared)+v2-1(closed)+v2-2(active), реальная `compact_closed_segments(keep_raw=1)` →
+    после неё `list_segments`/`stream` = `corrupt SegmentHeader`. Cron на VPS НЕ установлен
+    (`/etc/cron.d` пуст) ⇒ авто-порчи нет, prod цел (5 сырых сегментов); но код+runbook на main
+    инструктировали оператора установить cron, который уничтожил бы историю при первом запуске.
+    **Следующий виток (architect): компакция ОБЯЗАНА не трогать legacy-сегменты** (либо
+    `compact_segment` возвращает `Err` на сегмент без v2-магии — конструктивный барьер, RED-оракул;
+    либо `.zst` несёт восстановимый v2-заголовок и legacy читается после сжатия). RED-набор обязан
+    включать legacy-сегмент в каталоге (дефект фикстуры: C1-C9 строят ТОЛЬКО v2 через
+    `Journal::open_with` — прод-раскладка с legacy не покрыта). Severity: **CRITICAL** (потеря
+    невосполнимых первичных данных).
+  - **✅ CLOSED 2026-07-15 (reland `8a2e377`, reviewer §8 GREEN на РЕАЛЬНОМ проде).** Цепочка:
+    architect `4d92373` (чистый revert-of-revert `82b33db` — восстановил rev9-стек 1:1, reviewer
+    сверил tree(4d92373)==tree(2b2311f) побайтово) + `7754308` C10 RED + `0c7bef4` TD-023 +
+    `0cd4eca` D-COMP-4 (`compact_segment` → `Err` на сегменте без `SEGMENT_MAGIC` в первых байтах,
+    ДО любой мутации; `compact_closed_segments` тихо пропускает legacy) + `8a2e377` §8-план.
+    **D-COMP-4:** конструктивный барьер по первым 8 байтам файла (как «активный не сжимаем»).
+    **Анти-плацебо доказан reviewer'ом независимо:** C10 FAIL против `7754308` (без барьера,
+    `red_compaction.rs:562` «legacy стёрты»), GREEN на HEAD. Гейты (перепрогнаны на чистом
+    worktree): fmt/clippy clean, **workspace 182/0**, `red_compaction` **10/10** (C1-C10),
+    `red_book_bounded` 7/7, `verify_M-08.sh` PASS, `verify_delivery_M-08.sh` PASS (D1-D7 + deep
+    D1-deep/D2-deep). **§8 два шага (`--mode compact --dry-run` НЕ существует):**
+    (A) sandbox с доставленным бинарём (образ `hft-platform-recorder:local`) на faithful прод-
+    раскладке (no-magic declared legacy-0 + 35 v2): legacy байт-в-байт цел, `.zst` для legacy НЕ
+    создан, 32 v2 сжаты (14.5×), `journal::stream` = 3500 событий ДО и ПОСЛЕ (потерь нет).
+    (B) **РЕАЛЬНАЯ компакция боевого `/journal` через доставленный cron-скрипт** (`exit=0`, alert
+    не взведён): **боевой legacy-0 БАЙТ-В-БАЙТ ЦЕЛ** (полный sha256 `234583c8…bdbdc72` == эталон,
+    size=15188347171, mtime=1784018822 не изменились — барьер сработал на живом 15 GB legacy);
+    сегменты 1-5 → `.jrnl.zst`, `zstd -t` каждого = исходный raw-размер (данные целы, +D-COMP-2
+    sha-roundtrip до удаления raw); **свободно 111.20 → 115.88 GB (+4.69 GB) — диск двинулся**;
+    recorder healthy, restarts=0, next_seq растёт, heartbeat свежий (конкурентная компакция
+    закрытых не задела живого писателя). Legacy-безопасность компакции доказана на РЕАЛЬНОМ активе.
+  **✅ CLOSED 2026-07-29 (reviewer, прод-замер VPS).** Независимая повторная проверка: cron
+  `50 3 * * *` активен, `/var/lib/hft/compaction.last-success` свежий, боевой журнальный каталог
+  содержит **115 файлов `.jrnl.zst`** — компакция работает на регулярной основе, а не разовым
+  ручным прогоном reviewer'а из reland `8a2e377`. Запись переносится в CLOSED.
 - **TD-019** `storage-status-not-published-in-heartbeat` — **✅ CLOSED 2026-07-14** (M-08 task 12,
   `24d8e83`, merge `8882c1e`). heartbeat = JSON с состоянием; **доказано на проде**, а не тестами:
   `cat recorder.heartbeat` → `{"events":2736,"free_bytes":119134494720,"min_free_bytes":10737418240,
