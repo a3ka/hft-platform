@@ -1602,14 +1602,10 @@ pub fn retention_plan(
             // отфильтрованные уже исключены выше шагами (2)–(4)).
             let to_classify = std::mem::take(&mut final_candidates);
             for s in to_classify {
-                // last_seq(s) = segs_by_idx[index(s)+1].first_seq - 1, иначе None (активный).
-                let pos = segs_by_idx.iter().position(|x| x.index == s.index);
-                let last_seq_opt = match pos {
-                    Some(i) if i + 1 < segs_by_idx.len() => {
-                        Some(segs_by_idx[i + 1].header.first_seq.saturating_sub(1))
-                    }
-                    _ => None,
-                };
+                // last_seq(s) = next.first_seq - 1 only when the next header is
+                // trustworthy. A legacy declaration synthesizes first_seq=0, so the
+                // candidate's own tail is the source of truth in that case.
+                let last_seq_opt = last_seq_for_segment(&s, &segs_by_idx)?;
                 let covered_seg = match last_seq_opt {
                     Some(ls) => ls <= covered_seq,
                     None => false, // активный сегмент — last_seq неизвестен ⇒ не покрыт
@@ -1806,6 +1802,29 @@ fn event_data_ts(ev: &Event) -> i64 {
             | MdPayload::MarginInventory { ts_exch_ms, .. } => *ts_exch_ms,
         },
     }
+}
+
+fn last_seq_for_segment(
+    segment: &SegmentInfo,
+    sorted_segments: &[SegmentInfo],
+) -> io::Result<Option<u64>> {
+    let Some(pos) = sorted_segments
+        .iter()
+        .position(|candidate| candidate.index == segment.index)
+    else {
+        return Ok(None);
+    };
+    let Some(next) = sorted_segments.get(pos + 1) else {
+        return Ok(None);
+    };
+
+    if next.header.schema_version != contracts::SCHEMA_VERSION_PRE_HEADER {
+        return Ok(Some(next.header.first_seq.saturating_sub(1)));
+    }
+
+    // A legacy declaration has a synthetic first_seq. Establish the fact by reading
+    // the candidate's last event instead of trusting that synthetic zero.
+    tail_last_seq_of(&segment.path)
 }
 
 /// Выполнить план. В `DryRun` НИ ОДИН байт не копируется и не удаляется — только отчёт.
