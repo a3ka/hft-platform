@@ -149,6 +149,35 @@ impl std::fmt::Display for TruncatedLegacy {
 }
 impl std::error::Error for TruncatedLegacy {}
 
+/// M-49 (JR-I-8, TD-049): последний `seq` активного (хвостового) сегмента установить не
+/// удалось — сегмент СУЩЕСТВУЕТ и НЕ ПУСТ, но нечитаем (bit-rot, обрыв выкачки, битый
+/// заголовок). `open_with` обязан отказать, а не молча стартовать с `journal.meta`
+/// (при restore из холодного хранилища мета отсутствует ⇒ 0 ⇒ seq-reuse поверх истории).
+#[derive(Debug)]
+struct TailUnreadable {
+    /// Путь нечитаемого сегмента — нужен операторскому пути (карантин при декларации).
+    path: PathBuf,
+    why: String,
+}
+impl std::fmt::Display for TailUnreadable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = self
+            .path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .unwrap_or("<segment>");
+        write!(
+            f,
+            "journal tail unreadable: {name} — last seq could not be established ({}). \
+             Recorder refuses to start: starting from journal.meta would REUSE seq already \
+             present in the log. Action: re-fetch this segment from cold storage, or declare \
+             next_seq explicitly (runbook: docs/ops-journal-tail-unreadable)",
+            self.why
+        )
+    }
+}
+impl std::error::Error for TailUnreadable {}
+
 fn err_with<E: Into<Box<dyn std::error::Error + Send + Sync>>>(
     kind: io::ErrorKind,
     e: E,
@@ -169,6 +198,18 @@ fn truncated_err() -> io::Error {
     err_with(io::ErrorKind::Other, TruncatedLegacy)
 }
 
+/// M-49: диагностируемый отказ по нечитаемому хвосту (JR-I-8). Сообщение обязано называть
+/// файл + причину + действие (ti_5) — формулировка зафиксирована architect'ом в milestone.
+fn tail_unreadable_err(path: &Path, why: impl Into<String>) -> io::Error {
+    err_with(
+        io::ErrorKind::InvalidData,
+        TailUnreadable {
+            path: path.to_path_buf(),
+            why: why.into(),
+        },
+    )
+}
+
 /// Сегмент без магии и без валидной декларации (чужой/неизвестный).
 /// Читатель ОБЯЗАН вернуть такую ошибку, а не вменить `OwnCapture`.
 pub fn is_foreign_segment(e: &io::Error) -> bool {
@@ -178,6 +219,25 @@ pub fn is_foreign_segment(e: &io::Error) -> bool {
 /// Ошибка disk-guard (E4): свободного места меньше `min_free_bytes`.
 pub fn is_storage_guard(e: &io::Error) -> bool {
     matches!(e.get_ref(), Some(b) if b.is::<StorageGuard>())
+}
+
+/// M-49 (JR-I-8): хвост сегмента существует, но последний `seq` установить не удалось.
+pub(crate) fn is_tail_unreadable(e: &io::Error) -> bool {
+    matches!(e.get_ref(), Some(b) if b.is::<TailUnreadable>())
+}
+
+/// Путь нечитаемого хвостового сегмента (для операторского карантина при force-next-seq).
+fn tail_unreadable_segment_path(e: &io::Error) -> Option<PathBuf> {
+    e.get_ref()
+        .and_then(|b| b.downcast_ref::<TailUnreadable>())
+        .map(|t| t.path.clone())
+}
+
+/// M-49: header-класс ошибки классификации (магия есть, заголовок физически битый —
+/// bit-rot/truncation), НЕ governance-отказ (`ForeignSegment`/`TruncatedLegacy`, которые
+/// остаются fail-closed безусловно).
+fn is_corrupt_header(e: &io::Error) -> bool {
+    matches!(e.get_ref(), Some(b) if b.is::<CorruptHeader>())
 }
 
 // === Утилиты классификации сегмента ===
@@ -656,9 +716,41 @@ fn latest_segment(dir: &Path) -> io::Result<Option<(u32, PathBuf)>> {
 pub fn segments(dir: impl AsRef<Path>) -> io::Result<Vec<SegmentInfo>> {
     let dir = dir.as_ref();
     let manifest = load_manifest(dir)?;
-    let mut out = Vec::new();
-    for p in dedup_indexed_paths(dir)? {
-        out.push(classify_segment(&p, &manifest)?);
+    let paths = dedup_indexed_paths(dir)?;
+    // M-49 (JR-I-8): наибольший индекс — хвост. Нужен ЗАРАНЕЕ, чтобы отличить «хвостовой
+    // сегмент физически повреждён» (терпим — та же деградация, что закрывает
+    // `tail_last_seq_of`) от «где-то в СЕРЕДИНЕ истории битый/чужой файл» (fail-closed,
+    // как и раньше: один битый файл не смеет тихо стереть остальную историю в другую
+    // сторону — оставляем строгим).
+    let max_idx = paths
+        .iter()
+        .filter_map(|p| {
+            p.file_name()
+                .and_then(OsStr::to_str)
+                .and_then(parse_segment_index_any)
+        })
+        .max();
+    let mut out = Vec::with_capacity(paths.len());
+    for p in paths {
+        match classify_segment(&p, &manifest) {
+            Ok(info) => out.push(info),
+            Err(e)
+                if is_corrupt_header(&e)
+                    && p
+                        .file_name()
+                        .and_then(OsStr::to_str)
+                        .and_then(parse_segment_index_any)
+                        == max_idx =>
+            {
+                // Хвостовой сегмент физически битый (bit-rot/truncation заголовка):
+                // остальная история остаётся читаемой. Провенанс-отказы (ForeignSegment/
+                // TruncatedLegacy) под это исключение НЕ попадают — `is_corrupt_header`
+                // проверяет ИМЕННО header-класс, они остаются fail-closed безусловно
+                // (CT-RFC-02 не ослабляется этим тумблером).
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
     }
     // Стабильная сортировка по индексу — критично для сшивки по границе.
     out.sort_by_key(|s| s.index);
@@ -1142,6 +1234,16 @@ pub(crate) fn latest_segment_index(dir: &Path) -> io::Result<Option<u32>> {
 }
 
 /// Хвостовой скан КОНКРЕТНОГО сегмента (используется при `open_with` для next_seq).
+///
+/// M-49 (JR-I-8, TD-049): различает «нет/пусто/нет событий» (легитимный `Ok(None)`, ровно
+/// три случая — файла нет, файл нулевой длины, валидный заголовок + ноль событий) от
+/// «нечитаем» (`Err` с диагностикой: имя файла + причина + действие). Раньше ЛЮБАЯ порча
+/// хвоста (битый v2-заголовок сжатого сегмента, обрыв zstd-потока, невалидный хвост сырого
+/// сегмента) трактовалась как «сегментов нет» ⇒ `resolve_next_seq_with` стартовал с
+/// `meta_seq` ⇒ при restore из холодного хранилища (мета отсутствует ⇒ 0) — seq-reuse
+/// поверх существующей истории. Ресинхронизация сырого хвоста (побайтовый поиск последнего
+/// валидного фрейма) сохранена без изменений — она возвращает конкретный `seq`, reuse
+/// невозможен (`ti_4` п. «г»).
 pub(crate) fn tail_last_seq_of(path: &Path) -> io::Result<Option<u64>> {
     let is_zst = path
         .file_name()
@@ -1153,13 +1255,39 @@ pub(crate) fn tail_last_seq_of(path: &Path) -> io::Result<Option<u64>> {
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e),
         };
-        let mut decoder = open_compacted_reader(f)?;
-        if skip_v2_header_forward(&mut decoder).is_err() {
+        if f.metadata()?.len() == 0 {
             return Ok(None);
         }
+        let mut decoder = match open_compacted_reader(f) {
+            Ok(d) => d,
+            Err(e) => {
+                return Err(tail_unreadable_err(
+                    path,
+                    format!("zstd stream open failed: {e}"),
+                ))
+            }
+        };
+        if let Err(e) = skip_v2_header_forward(&mut decoder) {
+            return Err(tail_unreadable_err(
+                path,
+                format!("compressed segment header unreadable: {e}"),
+            ));
+        }
+        // Валидный заголовок; ноль или более событий. Ноль событий (`last_seq == None`)
+        // здесь ЛЕГИТИМНО — тот же случай, что «валидный заголовок, ноль событий» для
+        // сырого сегмента (ti_4 п. «д»): дальше просто нечего резать.
         let mut last_seq = None;
-        while let Some(event) = read_event_frame(&mut decoder)? {
-            last_seq = Some(event.seq);
+        loop {
+            match read_event_frame(&mut decoder) {
+                Ok(Some(event)) => last_seq = Some(event.seq),
+                Ok(None) => break,
+                Err(e) => {
+                    return Err(tail_unreadable_err(
+                        path,
+                        format!("compressed segment event stream unreadable: {e}"),
+                    ))
+                }
+            }
         }
         return Ok(last_seq);
     }
@@ -1180,26 +1308,44 @@ pub(crate) fn tail_last_seq_of(path: &Path) -> io::Result<Option<u64>> {
     file.read_exact(&mut buf)?;
     drop(file);
 
-    // Если есть magic — пропускаем магию + заголовок.
+    // Если есть magic (т.е. `buf` захватил файл с самого начала — `start_offset == 0`) —
+    // пропускаем магию + заголовок. Заголовок разбирается ТОЛЬКО в этом случае: у
+    // хвостового чтения большого файла (`start_offset > 0`) магии в буфере не будет, и
+    // ниже работает прежняя байт-ресинк логика без header-контекста (legacy/большие сегменты).
     let mut i = 0usize;
+    let mut had_header = false;
     if buf.starts_with(&SEGMENT_MAGIC) {
         // Найти конец header-фрейма в buf.
         let magic_len = SEGMENT_MAGIC.len();
         if magic_len + 4 > buf.len() {
-            return Ok(None);
+            return Err(tail_unreadable_err(
+                path,
+                "raw segment header frame truncated (not enough bytes for header length)",
+            ));
         }
         let h_len = u32::from_le_bytes(buf[magic_len..magic_len + 4].try_into().unwrap()) as usize;
         let frame_end = magic_len + 4 + h_len + 4;
         if frame_end > buf.len() {
-            return Ok(None);
+            return Err(tail_unreadable_err(
+                path,
+                "raw segment header frame truncated (declared header length exceeds file size)",
+            ));
         }
         let payload = &buf[magic_len + 4..magic_len + 4 + h_len];
         let crc = u32::from_le_bytes(buf[magic_len + 4 + h_len..frame_end].try_into().unwrap());
         if crc32fast::hash(payload) != crc {
-            // Битый заголовок — не trust, но и не паникуем: возвращаем None.
-            return Ok(None);
+            return Err(tail_unreadable_err(
+                path,
+                "raw segment header crc mismatch (header corrupt)",
+            ));
         }
         i = frame_end;
+        had_header = true;
+        if i == buf.len() {
+            // Валидный заголовок, ноль событий: recorder создал сегмент и упал до первой
+            // записи (`ti_4` п. «д») — легитимно, не «нечитаем».
+            return Ok(None);
+        }
     }
 
     let mut last_valid_seq: Option<u64> = None;
@@ -1238,6 +1384,15 @@ pub(crate) fn tail_last_seq_of(path: &Path) -> io::Result<Option<u64>> {
                 i += 1;
             }
         }
+    }
+    if last_valid_seq.is_none() && had_header {
+        // Заголовок валиден, байты после него ЕСТЬ, но ни один фрейм не распознан —
+        // это порча хвоста, не «нет событий» (тот случай уже возвращён выше при
+        // `i == buf.len()` сразу после заголовка).
+        return Err(tail_unreadable_err(
+            path,
+            "raw segment tail unreadable: no valid event frame found after header",
+        ));
     }
     Ok(last_valid_seq)
 }
