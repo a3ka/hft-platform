@@ -33,8 +33,8 @@ pub use segments::{
     LEGACY_MANIFEST,
 };
 pub use segments::{
-    retention_execute, retention_plan, RetentionMode, RetentionPlan, RetentionPolicy,
-    RetentionReport,
+    retention_execute, retention_plan, segment_decision_ts, RetentionMode, RetentionPlan,
+    RetentionPolicy, RetentionReport,
 };
 
 // Доступно из `crate` для engine-dev call-sites внутри lib.rs.

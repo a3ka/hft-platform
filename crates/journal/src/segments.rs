@@ -1833,14 +1833,14 @@ pub fn retention_plan(
 
     // (3) Возрастной фильтр: кандидаты старше retain_days.
     // Возраст = now_wall_ms − ts_exch_ms первого события сегмента (fallback на
-    // header.created_wall_ms, если первый фрейм нечитаем).
+    // header.created_wall_ms, если первый фрейм нечитаем). `segment_decision_ts` —
+    // ЕДИНЫЙ источник истины: используется И здесь для решения, И `print_plan`
+    // (journal-retention.rs) для отчёта — иначе отчёт может печатать значение,
+    // отличное от того, по которому реально принято решение (TD-051).
     let cutoff_ms = i64::from(policy.retain_days) * 86_400_000;
     let mut young_passed: Vec<SegmentInfo> = Vec::with_capacity(candidates.len());
     for s in candidates {
-        let seg_ts = first_event_data_ts(&s.path)
-            .ok()
-            .flatten()
-            .unwrap_or(s.header.created_wall_ms);
+        let seg_ts = segment_decision_ts(&s);
         let age_ms = now_wall_ms.saturating_sub(seg_ts);
         if age_ms < cutoff_ms {
             skipped.push((
@@ -2026,6 +2026,46 @@ fn enumerate_retention_segments(dir: &Path) -> io::Result<RetentionEnumeration> 
         }
     }
 
+    // M-49 (TD-050): `dedup_indexed_paths` молча пропускает `*.jrnl`/`*.jrnl.zst`-файлы,
+    // чьё имя НЕ распознаётся как `segment-NNNNNNNN.jrnl[.zst]` (опечатка, обрыв
+    // копирования с довеском в имени, чужой файл под похожим суффиксом) — они не попадают
+    // в `dedup_indexed_paths(dir)?` вообще (нет индекса → `continue` внутри неё), а значит
+    // раньше выпадали из операторского отчёта СОВСЕМ: оператор не узнавал об их
+    // существовании ниоткуда. Именуем их поимённо в `skipped`, той же дисциплиной, что
+    // classify-отказы выше (принцип M-38b: обход/аномалия обязана быть НАЗВАНА).
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let name = match path.file_name().and_then(OsStr::to_str) {
+            Some(s) => s,
+            None => continue,
+        };
+        if !name.ends_with(".jrnl") && !is_compacted_name(name) {
+            continue;
+        }
+        if parse_segment_index_any(name).is_some() {
+            continue; // штатный паттерн — уже обработан выше через dedup_indexed_paths
+        }
+        let size_bytes = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        let synthetic = SegmentInfo {
+            path,
+            index: u32::MAX,
+            header: SegmentHeader {
+                schema_version: 0, // sentinel: неизвестно (имя не распознано)
+                source: DataSource::Synthetic,
+                provenance: "<unrecognized segment file name>".to_string(),
+                epoch_id: String::new(),
+                created_wall_ms: 0,
+                first_seq: 0,
+            },
+            size_bytes,
+        };
+        foreign_skipped.push((
+            synthetic,
+            "unrecognized segment file name (expected segment-NNNNNNNN.jrnl[.zst])".to_string(),
+        ));
+    }
+
     // Стабильная сортировка по индексу — критична для воспроизводимости плана (R6)
     // и для определения «последних N» в keep_min.
     classified.sort_by_key(|s| s.index);
@@ -2055,6 +2095,20 @@ fn classify_failure_reason(e: &io::Error) -> String {
 ///
 /// На любую ошибку (нет файла, битый заголовок, нет событий) — `Ok(None)`:
 /// вызывающий использует fallback (header.created_wall_ms).
+///
+/// M-49 (TD-051): значение, по которому `retention_plan` РЕАЛЬНО принимает решение о
+/// возрасте сегмента — `first_event_data_ts(path)`, с fallback на `header.created_wall_ms`,
+/// если первый фрейм нечитаем. ЕДИНЫЙ источник истины для `retention_plan` (§3 выше) И
+/// операторского отчёта (`print_plan` в `journal-retention.rs`) — раньше отчёт печатал
+/// `header.created_wall_ms` под подписью `ts_exch/created=`, будто это была основа
+/// решения, хотя решение принималось по данным события (несоответствие TD-051).
+pub fn segment_decision_ts(s: &SegmentInfo) -> i64 {
+    first_event_data_ts(&s.path)
+        .ok()
+        .flatten()
+        .unwrap_or(s.header.created_wall_ms)
+}
+
 fn first_event_data_ts(path: &Path) -> io::Result<Option<i64>> {
     let is_zst = path
         .file_name()
