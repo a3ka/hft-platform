@@ -39,9 +39,10 @@ pub use segments::{
 
 // Доступно из `crate` для engine-dev call-sites внутри lib.rs.
 pub(crate) use segments::{
-    decide_open_segment, open_seg_for_write, resolve_next_seq_with, segment_path,
+    decide_open_segment, open_seg_for_write, resolve_next_seq_or_declared, segment_path,
     serialize_event_frame,
 };
+pub use segments::{FORCE_NEXT_SEQ_DECL, FORCE_NEXT_SEQ_DECL_APPLIED};
 
 const META: &str = "journal.meta";
 const SEGMENT: &str = "segment-00000000.jrnl";
@@ -126,10 +127,18 @@ impl Journal {
         let dir_buf = dir.to_path_buf();
 
         // next_seq — источник истины сегмент, а не (возможно отставшая) мета (TD-011).
-        let next_seq = resolve_next_seq_with(&dir_buf, &meta_path)?;
+        //
+        // M-49 (JR-I-8): если хвост нечитаем — `open_with` обязан отказать, а не молча
+        // стартовать с `meta_seq` (при restore из холодного хранилища мета отсутствует ⇒ 0 ⇒
+        // seq-reuse поверх истории). Операторский выход — файловая декларация
+        // `journal.force-next-seq.json` (`resolve_next_seq_or_declared` её учитывает; при
+        // читаемом хвосте декларация даже не читается — инертна).
+        let next_seq = resolve_next_seq_or_declared(&dir_buf, &meta_path)?;
 
-        // Решаем, какой сегмент открывать (reuse или новый).
-        let decision = decide_open_segment(&dir_buf, &cfg)?;
+        // Решаем, какой сегмент открывать (reuse или новый). `next_seq` передаётся явно —
+        // после операторского override он ОБЯЗАН совпасть с `SegmentHeader.first_seq` нового
+        // сегмента, а не быть заново (заниженно) пересчитан.
+        let decision = decide_open_segment(&dir_buf, &cfg, next_seq)?;
 
         // Строим заголовок для НЕ-reuse сегмента.
         let created_wall_ms = SystemTime::now()

@@ -1411,6 +1411,117 @@ pub(crate) fn resolve_next_seq_with(dir: &Path, meta_path: &Path) -> io::Result<
     }
 }
 
+// ── M-49 (JR-I-8 операторский выход, TD-049 tasks 3-5) ────────────────────────────────
+//
+// `resolve_next_seq_with` теперь честно отказывает (`is_tail_unreadable`), когда хвост
+// журнала повреждён. Fail-closed БЕЗ выхода означал бы вечно остановленный сбор данных:
+// оператор упёрся в отказ, и единственный доступный ему шаг — удалить каталог (то есть
+// потерять историю, ровно то, от чего защищаемся). Выход — файловая декларация
+// `journal.force-next-seq.json` в каталоге журнала (форма по образцу `journal.legacy.json`:
+// не расширяет публичный API крейта, остаётся в каталоге как след для аудита).
+
+/// Имя операторской декларации ручного переопределения `next_seq`.
+pub const FORCE_NEXT_SEQ_DECL: &str = "journal.force-next-seq.json";
+/// Имя, в которое декларация переименовывается ПОСЛЕ применения (одноразовость + аудит).
+pub const FORCE_NEXT_SEQ_DECL_APPLIED: &str = "journal.force-next-seq.applied.json";
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ForceNextSeqDecl {
+    next_seq: u64,
+    reason: String,
+    #[allow(dead_code)] // хранится/сохраняется для аудита, программно не читается.
+    declared_at_ms: i64,
+}
+
+/// Прочитать `journal.force-next-seq.json`, если он лежит в каталоге. `Ok(None)` — файла нет
+/// (это НЕ ошибка: декларация — опциональный операторский выход).
+fn load_force_next_seq_decl(dir: &Path) -> io::Result<Option<ForceNextSeqDecl>> {
+    let p = dir.join(FORCE_NEXT_SEQ_DECL);
+    if !p.exists() {
+        return Ok(None);
+    }
+    let bytes = fs::read(&p)?;
+    let decl: ForceNextSeqDecl = serde_json::from_slice(&bytes).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{FORCE_NEXT_SEQ_DECL} malformed: {e}"),
+        )
+    })?;
+    Ok(Some(decl))
+}
+
+/// Максимальный ЧИТАЕМЫЙ `seq` каталога — best-effort, используется ТОЛЬКО для валидации
+/// операторской декларации (не прод-путь чтения). Пропускает то, что `stream()` сам не смог
+/// прочитать (mid-content порча — редкий класс, не относящийся к хвосту); ЦЕЛЬ здесь —
+/// консервативная граница «что уже точно занято», а не полное честное чтение.
+fn readable_max_seq(dir: &Path) -> io::Result<Option<u64>> {
+    let s = stream(dir, EpochFilter::All)?;
+    Ok(s.filter_map(|e| e.ok()).map(|e| e.seq).max())
+}
+
+/// Переместить нечитаемый сегмент в `dir/quarantine/` — чтобы он не мешал последующим
+/// `stream()`/перезапускам (не «buried corruption» в середине индексов после того, как
+/// открыт новый сегмент с бОльшим индексом). Данные НЕ удаляются, только перемещаются —
+/// восстановимо, в отличие от `rm`.
+fn quarantine_segment(dir: &Path, path: &Path) -> io::Result<()> {
+    let q = dir.join("quarantine");
+    fs::create_dir_all(&q)?;
+    if let Some(name) = path.file_name() {
+        fs::rename(path, q.join(name))?;
+    }
+    Ok(())
+}
+
+/// Пометить декларацию применённой: переименование `journal.force-next-seq.json` →
+/// `journal.force-next-seq.applied.json` (одноразовость — забыть её в каталоге невозможно,
+/// повторный старт её не подхватит; аудит — `reason`/`declared_at_ms` сохраняются в теле).
+fn mark_force_next_seq_applied(dir: &Path) -> io::Result<()> {
+    fs::rename(
+        dir.join(FORCE_NEXT_SEQ_DECL),
+        dir.join(FORCE_NEXT_SEQ_DECL_APPLIED),
+    )
+}
+
+/// M-49 (JR-I-8 операторский выход): обёртка над `resolve_next_seq_with`. Если хвост читается
+/// — обычный путь, декларация даже не читается (`op_3`: неприменённая декларация ИНЕРТНА при
+/// читаемом хвосте, иначе забытый файл молча переопределял бы честный `next_seq`). Если хвост
+/// нечитаем:
+/// - декларации нет → пробрасываем исходный отказ как есть (fail-closed без деградации);
+/// - декларация есть, но `next_seq` ≤ максимального ЧИТАЕМОГО `seq` → `Err` (декларация НЕ
+///   может стать каналом seq-reuse — `op_2`);
+/// - декларация валидна → карантин нечитаемого сегмента + пометка применённой + объявленный
+///   `next_seq` (`op_1`).
+pub(crate) fn resolve_next_seq_or_declared(dir: &Path, meta_path: &Path) -> io::Result<u64> {
+    match resolve_next_seq_with(dir, meta_path) {
+        Ok(n) => Ok(n),
+        Err(e) if is_tail_unreadable(&e) => {
+            let decl = match load_force_next_seq_decl(dir)? {
+                Some(d) => d,
+                None => return Err(e),
+            };
+            let readable_max = readable_max_seq(dir)?;
+            if decl.next_seq <= readable_max.unwrap_or(0) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "{FORCE_NEXT_SEQ_DECL} rejected: next_seq={} must be strictly greater \
+                         than the maximum READABLE seq={} in this journal — otherwise the \
+                         declaration itself would reuse seq already present in the log",
+                        decl.next_seq,
+                        readable_max.unwrap_or(0)
+                    ),
+                ));
+            }
+            if let Some(bad) = tail_unreadable_segment_path(&e) {
+                quarantine_segment(dir, &bad)?;
+            }
+            mark_force_next_seq_applied(dir)?;
+            Ok(decl.next_seq)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// Создать `OpenOutcome`: какой сегмент выбран/создан, его first_seq, и куда писать.
 pub(crate) struct OpenDecision {
     pub seg_index: u32,
@@ -1423,9 +1534,19 @@ pub(crate) struct OpenDecision {
 /// - есть сегменты → ищем последний, чей заголовок совпадает с cfg (source/provenance/epoch_id);
 ///   совпал → reuse (append), иначе → создаём новый (index = последний + 1);
 /// - нет сегментов → создаём segment-00000000.jrnl.
-pub(crate) fn decide_open_segment(dir: &Path, cfg: &WriterConfig) -> io::Result<OpenDecision> {
+///
+/// `next_seq` передаётся ВЫЗЫВАЮЩИМ (уже разрешён через `resolve_next_seq_with` либо, при
+/// нечитаемом хвосте, через операторскую декларацию — `resolve_next_seq_or_declared`, M-49).
+/// Раньше эта функция пересчитывала `next_seq` САМА повторным вызовом
+/// `resolve_next_seq_with` — при операторском override это давало РАСХОЖДЕНИЕ: `Journal.next_seq`
+/// (из вызывающего) получал бы объявленное значение, а `SegmentHeader.first_seq` нового
+/// сегмента — заново пересчитанное (заниженное, не знающее о декларации).
+pub(crate) fn decide_open_segment(
+    dir: &Path,
+    cfg: &WriterConfig,
+    next_seq: u64,
+) -> io::Result<OpenDecision> {
     let latest = latest_segment(dir)?;
-    let next_seq = resolve_next_seq_with(dir, &dir.join(META))?;
 
     if let Some((idx, path)) = latest {
         // A compacted segment is immutable and cannot be opened for append. Start a
