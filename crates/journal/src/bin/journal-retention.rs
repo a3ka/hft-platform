@@ -426,21 +426,29 @@ fn print_plan(args: &Args, plan: &RetentionPlan) {
         plan.offload_and_prune.len()
     );
     for s in &plan.offload_and_prune {
+        // M-49 (TD-051): `seg_ts` — ФАКТИЧЕСКОЕ значение, по которому retention_plan принял
+        // решение о возрасте (ts_exch_ms первого события, fallback на header.created_wall_ms
+        // — journal::segment_decision_ts — ЕДИНЫЙ источник истины с retention_plan). Печатаем
+        // ОБА поля раздельно и честно подписанными: раньше здесь стоял ТОЛЬКО
+        // header.created_wall_ms под подписью «ts_exch/created=», выдавая его за основу
+        // решения, хотя решение принималось по данным события.
         println!(
-            "    - {} (index={}, size={} B, ts_exch/created={})",
+            "    - {} (index={}, size={} B, seg_ts={}, header.created_wall_ms={})",
             s.path.display(),
             s.index,
             s.size_bytes,
+            journal::segment_decision_ts(s),
             s.header.created_wall_ms,
         );
     }
     println!("  offload_only: {} сегмент(ов)", plan.offload_only.len());
     for s in &plan.offload_only {
         println!(
-            "    - {} (index={}, size={} B, ts_exch/created={})",
+            "    - {} (index={}, size={} B, seg_ts={}, header.created_wall_ms={})",
             s.path.display(),
             s.index,
             s.size_bytes,
+            journal::segment_decision_ts(s),
             s.header.created_wall_ms,
         );
     }
