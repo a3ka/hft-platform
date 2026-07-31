@@ -1,6 +1,10 @@
 # M-40 — ретеншен и писатель видят сжатые сегменты (R2 + R2b, ШАГ 0b)
 
-**Статус:** APPROVED plan-time — critic PASS (`research/critiques/C-039-M-40.md`, rev3 @ de4210b); готов к engine-dev.
+**Статус:** ✅ **DONE 2026-07-29** — смержен в main `984f6f9`, reviewer APPROVED, §8 eyes-on на проде ЗЕЛЁНЫЙ.
+Прод-замер после мержа (боевой каталог 115 `.zst` + 10 raw): dry-run назвал **122 упоминания `.jrnl.zst`**,
+сжатые перечислены в секции `offload_only`, всего 125 сегментов в отчёте — **до фикса план был ПУСТ**.
+`offload_and_prune: 0` — не дефект: 7 кандидатов ушли в `offload_only` по fail-closed причине «нет артефакта
+покрытия чекпоинтом», остальные защищены `retain_days`/`keep_min`/активностью.
 Путь гейта: REJECT `C-037` (B1 fail-open TD-030, B2 ложь аудита) → rev2 → REJECT `C-038` (B1-rev2: сентинел `u64::MAX` проходил оракул) → rev3 → **PASS `C-039`**.
 **Риск:** R2 CRITICAL (`docs/08`) + **R2b** — новый, найден при спеке M-40, тот же корень, цена выше.
 **Приоритет:** ВЫСОКИЙ — блокирует R1 (offsite-бэкап, ~2026-08-10). Оба дефекта проверены ЗАМЕРОМ на `origin/main` @ 30f5ab0, не по чтению кода.
@@ -105,15 +109,15 @@ fail-open в C-030. Возражение «legacy лежит только под
 
 | # | Задача | Оракул | Status |
 |---|---|---|---|
-| 1 | `retention_plan` перечисляет каталог через общий `dedup_indexed_paths`, а не своим `read_dir`; синтетический `SegmentInfo` для неклассифицируемого файла берёт индекс через `parse_segment_index_any` | `rt_z_1`, `rt_z_2`, `rt_z_6` | ⏳ OPEN |
-| 2 | Возраст `.zst` — по первому СОБЫТИЮ (потоковое декодирование), не по `created_wall_ms` | `rt_z_1`, `rt_z_5` | ⏳ OPEN |
-| 3 | Гейт покрытия чекпоинтом (C-030 R1) работает на `.zst` в обе стороны, граница на `last_seq`/`last_seq−1` | `rt_z_3`, `rt_z_5` | ⏳ OPEN |
-| 4 | `retention_execute(Apply)` физически выгружает и удаляет `.zst`; `freed_bytes` не лжёт. `retention_execute` берёт сегменты тем же перечислением, что и `plan` (сейчас `segments(_dir).unwrap_or_default()` — один чужой файл обнуляет список и весь prune числится «без покрытия») | `rt_z_4` | ⏳ OPEN |
-| 5 | Операторский вывод бинаря называет сжатые сегменты И печатает корзину `offload_only` (сегодня `print_plan` её не печатает вовсе: при fail-closed режиме оператор видит «offload_and_prune: 0» и заключает, что apply не сделает ничего) | `rt_z_7` (гоняет НАСТОЯЩИЙ бинарь) | ⏳ OPEN |
-| 6 | `latest_segment_index` — через общий энумератор; `decide_open_segment` не создаёт коллизию `segment-N.jrnl` + `.zst`, открывает `max+1` | `rs_1`, `rs_3`, `rs_4` | ⏳ OPEN |
-| 7 | `resolve_next_seq_with` продолжает `seq` поверх сжатой истории (forward-only чтение хвоста `.zst`, память O(фрейм) — zstd не Seek) | `rs_2`, `rs_5` | ⏳ OPEN |
-| 8 | **(C-037 B1 + C-038)** `last_seq` УСТАНАВЛИВАЕТСЯ фактически: заголовок соседа только при `schema_version != SCHEMA_VERSION_PRE_HEADER`, иначе чтение хвоста кандидата. Ни синтетический `0`, ни сентинел `u64::MAX` не допускаются. Правило применяется В ОБОИХ местах — `retention_plan` И `retention_execute` (последний пересчитывает покрытие своим кодом для аудита override) | `rt_z_8` (точная граница + execute-side) | ⏳ OPEN |
-| 9 | **(C-037 B2)** `retention_execute` перечисляет сегменты терпимо к чужим файлам (без `segments(_dir).unwrap_or_default()`): один посторонний файл не имеет права делать `pruned_without_checkpoint_coverage` лживым | `rt_z_9` | ⏳ OPEN |
+| 1 | `retention_plan` перечисляет каталог через общий `dedup_indexed_paths`, а не своим `read_dir`; синтетический `SegmentInfo` для неклассифицируемого файла берёт индекс через `parse_segment_index_any` | `rt_z_1`, `rt_z_2`, `rt_z_6` | ✅ DONE |
+| 2 | Возраст `.zst` — по первому СОБЫТИЮ (потоковое декодирование), не по `created_wall_ms` | `rt_z_1`, `rt_z_5` | ✅ DONE |
+| 3 | Гейт покрытия чекпоинтом (C-030 R1) работает на `.zst` в обе стороны, граница на `last_seq`/`last_seq−1` | `rt_z_3`, `rt_z_5` | ✅ DONE |
+| 4 | `retention_execute(Apply)` физически выгружает и удаляет `.zst`; `freed_bytes` не лжёт. `retention_execute` берёт сегменты тем же перечислением, что и `plan` (сейчас `segments(_dir).unwrap_or_default()` — один чужой файл обнуляет список и весь prune числится «без покрытия») | `rt_z_4` | ✅ DONE |
+| 5 | Операторский вывод бинаря называет сжатые сегменты И печатает корзину `offload_only` (сегодня `print_plan` её не печатает вовсе: при fail-closed режиме оператор видит «offload_and_prune: 0» и заключает, что apply не сделает ничего) | `rt_z_7` (гоняет НАСТОЯЩИЙ бинарь) | ✅ DONE |
+| 6 | `latest_segment_index` — через общий энумератор; `decide_open_segment` не создаёт коллизию `segment-N.jrnl` + `.zst`, открывает `max+1` | `rs_1`, `rs_3`, `rs_4` | ✅ DONE |
+| 7 | `resolve_next_seq_with` продолжает `seq` поверх сжатой истории (forward-only чтение хвоста `.zst`, память O(фрейм) — zstd не Seek) | `rs_2`, `rs_5` | ✅ DONE |
+| 8 | **(C-037 B1 + C-038)** `last_seq` УСТАНАВЛИВАЕТСЯ фактически: заголовок соседа только при `schema_version != SCHEMA_VERSION_PRE_HEADER`, иначе чтение хвоста кандидата. Ни синтетический `0`, ни сентинел `u64::MAX` не допускаются. Правило применяется В ОБОИХ местах — `retention_plan` И `retention_execute` (последний пересчитывает покрытие своим кодом для аудита override) | `rt_z_8` (точная граница + execute-side) | ✅ DONE |
+| 9 | **(C-037 B2)** `retention_execute` перечисляет сегменты терпимо к чужим файлам (без `segments(_dir).unwrap_or_default()`): один посторонний файл не имеет права делать `pruned_without_checkpoint_coverage` лживым | `rt_z_9` | ✅ DONE |
 
 ## RED-набор (sacred, architect-only)
 
