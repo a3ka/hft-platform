@@ -1415,31 +1415,54 @@ fn load_force_next_seq_decl(dir: &Path) -> io::Result<Option<ForceNextSeqDecl>> 
     Ok(Some(decl))
 }
 
-/// Максимальный ЧИТАЕМЫЙ `seq` каталога — best-effort, используется ТОЛЬКО для валидации
-/// операторской декларации (не прод-путь чтения). Терпимый обход (не `stream`/`segments()`
-/// — те строгие и наружу отдают данные потребителям, здесь только внутренняя оценка
-/// границы «что уже точно занято»): сегменты, которые не удаётся прочитать вообще
-/// (включая сам хвост, из-за которого декларация и понадобилась), сознательно
-/// пропускаются, а не приводят к отказу всей функции.
+/// M-49 rev5 (R-002, блокер): пол защиты операторской декларации — ТРИ состояния вместо
+/// `Option<u64>`. Имена вариантов КОНТРАКТНЫЕ (milestone rev5, таблица состояний) — на них
+/// стоит канарейка `verify_M-49.sh` и оракулы `op_6`/`op_7`.
 ///
-/// M-49 rev4 (R-001 NOTE 2, TD-011-класс): раньше грузила ВСЕ события ВСЕХ сегментов через
-/// `read_segment_events` (`Vec<Event>` на каждый сегмент, для `.zst` — ещё и весь
-/// распакованный поток в память) — на проде (1 GiB сегменты) это неограниченная память ровно
-/// в момент, когда оператор разбирает инцидент. Идём с КОНЦА (сегменты монотонны по `seq`:
-/// последний по индексу несёт максимальный `seq`, если он читается) и берём хвост ПЕРВОГО
-/// читаемого сегмента через `tail_last_seq_of` — тот же bounded-скан (≤`TAIL_SCAN_CHUNK` для
-/// raw, потоково без буферизации в `Vec` для `.zst`), что уже используется на пути отказа.
-/// Останавливаемся на первом сегменте, для которого `tail_last_seq_of` вернул `Ok(Some(_))`
-/// — более ранние сегменты по построению несут меньший `seq`, читать их не нужно.
-fn readable_max_seq(dir: &Path) -> io::Result<Option<u64>> {
-    let mut max_seq: Option<u64> = None;
+/// `Option<u64>` не различал «сегментов нет» и «сегменты есть, но максимум установить не
+/// удалось», а `unwrap_or(0)` схлопывал второе в первое: отсутствие знания трактовалось как
+/// разрешение — это противоречит fail-closed всего milestone'а (блокер R-002, Находка 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReadableFloor {
+    /// Максимальный ЧИТАЕМЫЙ `seq` установлен — в т.ч. по ЧИТАЕМОМУ ПРЕФИКСУ повреждённого
+    /// сегмента. Декларация валидна, только если `next_seq` строго больше этого значения.
+    Known(u64),
+    /// Сегментов нет либо все нулевой длины — легитимный restore с нуля, пол = 0.
+    NoSegments,
+    /// Сегменты ЕСТЬ и непусты, но ни в одном не нашлось ни одного валидного фрейма нигде в
+    /// каталоге. Пол НЕИЗВЕСТЕН — декларация непроверяема, единственный fail-closed ответ —
+    /// отказ (не «пол = 0»: см. `op_6`).
+    Unknown,
+}
+
+/// Пол защиты каталога — best-effort, используется ТОЛЬКО для валидации операторской
+/// декларации (не прод-путь чтения). Терпимый обход (не `stream`/`segments()` — те строгие и
+/// наружу отдают данные потребителям, здесь только внутренняя оценка границы «что уже точно
+/// занято»).
+///
+/// M-49 rev5 (R-002, задача 5a): идём с КОНЦА (сегменты монотонны по `seq` — TD-030) и берём
+/// хвост ПЕРВОГО читаемого сегмента через `tail_last_seq_of` — тот же bounded-скан, что уже
+/// используется на пути отказа (задача 5b расширит это до терпимого скана читаемого ПРЕФИКСА
+/// повреждённого сегмента — R-002, Находка 1; сейчас, до 5b, сегмент с нечитаемым хвостом
+/// по-прежнему пропускается целиком). Если ни в одном непустом сегменте не нашлось ни одного
+/// валидного фрейма — `Unknown`, не `0` (задача 5a: устраняет `unwrap_or(0)`).
+fn readable_floor(dir: &Path) -> io::Result<ReadableFloor> {
+    let mut saw_nonempty = false;
     for p in iter_segments_sorted(dir)?.into_iter().rev() {
+        let len = fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+        if len == 0 {
+            continue;
+        }
+        saw_nonempty = true;
         if let Ok(Some(m)) = tail_last_seq_of(&p) {
-            max_seq = Some(max_seq.map_or(m, |cur: u64| cur.max(m)));
-            break;
+            return Ok(ReadableFloor::Known(m));
         }
     }
-    Ok(max_seq)
+    if saw_nonempty {
+        Ok(ReadableFloor::Unknown)
+    } else {
+        Ok(ReadableFloor::NoSegments)
+    }
 }
 
 /// Пометить декларацию применённой: переименование `journal.force-next-seq.json` →
@@ -1470,16 +1493,35 @@ pub(crate) fn resolve_next_seq_or_declared(dir: &Path, meta_path: &Path) -> io::
                 Some(d) => d,
                 None => return Err(e),
             };
-            let readable_max = readable_max_seq(dir)?;
-            if decl.next_seq <= readable_max.unwrap_or(0) {
+            // M-49 rev5 (R-002, задача 5a): три состояния, не `Option<u64>`. Отсутствие
+            // знания о поле (`Unknown`) НЕ является разрешением — единственный fail-closed
+            // ответ на непроверяемую декларацию есть отказ, а не `next_seq >= 1` без разбора.
+            let readable_max = match readable_floor(dir)? {
+                ReadableFloor::Known(max) => max,
+                ReadableFloor::NoSegments => 0,
+                ReadableFloor::Unknown => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "{FORCE_NEXT_SEQ_DECL} rejected: readable seq floor is UNKNOWN — no \
+                             valid event frame could be read anywhere in this journal directory, \
+                             so declaration next_seq={} cannot be verified against anything. \
+                             Restore the affected segment(s) from a cold copy, or move them to \
+                             manual quarantine, then retry — see \
+                             docs/ops-journal-tail-unreadable.md.",
+                            decl.next_seq
+                        ),
+                    ));
+                }
+            };
+            if decl.next_seq <= readable_max {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
                         "{FORCE_NEXT_SEQ_DECL} rejected: next_seq={} must be strictly greater \
                          than the maximum READABLE seq={} in this journal — otherwise the \
                          declaration itself would reuse seq already present in the log",
-                        decl.next_seq,
-                        readable_max.unwrap_or(0)
+                        decl.next_seq, readable_max
                     ),
                 ));
             }
