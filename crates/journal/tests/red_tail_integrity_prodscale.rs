@@ -86,7 +86,7 @@ fn ti_7_jr_i_8_holds_for_segment_larger_than_tail_scan_window() {
         loop {
             j.append(trade(n)).expect("append");
             n += 1;
-            if n % 20_000 == 0 {
+            if n.is_multiple_of(20_000) {
                 j.flush().expect("flush");
                 let sz: u64 = ls(dir.path())
                     .iter()
@@ -184,7 +184,7 @@ fn ti_8_large_healthy_segment_starts_and_continues_seq() {
         loop {
             j.append(trade(n)).expect("append");
             n += 1;
-            if n % 20_000 == 0 {
+            if n.is_multiple_of(20_000) {
                 j.flush().expect("flush");
                 let sz: u64 = ls(dir.path())
                     .iter()
