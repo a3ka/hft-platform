@@ -1412,12 +1412,21 @@ fn load_force_next_seq_decl(dir: &Path) -> io::Result<Option<ForceNextSeqDecl>> 
 }
 
 /// Максимальный ЧИТАЕМЫЙ `seq` каталога — best-effort, используется ТОЛЬКО для валидации
-/// операторской декларации (не прод-путь чтения). Пропускает то, что `stream()` сам не смог
-/// прочитать (mid-content порча — редкий класс, не относящийся к хвосту); ЦЕЛЬ здесь —
-/// консервативная граница «что уже точно занято», а не полное честное чтение.
+/// операторской декларации (не прод-путь чтения). Терпимый обход (не `stream`/`segments()`
+/// — те строгие и наружу отдают данные потребителям, здесь только внутренняя оценка
+/// границы «что уже точно занято»): сегменты, которые не удаётся прочитать вообще
+/// (включая сам хвост, из-за которого декларация и понадобилась), сознательно
+/// пропускаются, а не приводят к отказу всей функции.
 fn readable_max_seq(dir: &Path) -> io::Result<Option<u64>> {
-    let s = stream(dir, EpochFilter::All)?;
-    Ok(s.filter_map(|e| e.ok()).map(|e| e.seq).max())
+    let mut max_seq: Option<u64> = None;
+    for p in iter_segments_sorted(dir)? {
+        if let Ok(events) = read_segment_events(&p, false) {
+            if let Some(m) = events.iter().map(|e| e.seq).max() {
+                max_seq = Some(max_seq.map_or(m, |cur| cur.max(m)));
+            }
+        }
+    }
+    Ok(max_seq)
 }
 
 /// Переместить нечитаемый сегмент в `dir/quarantine/` — чтобы он не мешал последующим
