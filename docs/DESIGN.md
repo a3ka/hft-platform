@@ -272,43 +272,66 @@ mean-reversion. Первая гипотеза `H-20260710-obi-asym` обкаты
 
 ## §10. Фазовый роадмап (acceptance = исполняемые ворота; ★ = подпись founder'а)
 
+**Статус (обновлено 2026-07-31, решение founder'а от 2026-07-29 — см. шапку и §0).**
+Роадмап v1 (P0–P5, торговля своим капиталом) заменён **на месте** роадмапом AlphaQuant
+(фазы Ф0–Ф6, SaaS-терминал данных/аналитики/AI). P0–P2 реально пройдены и остаются
+фундаментом, на котором стоят фазы ниже — они НЕ выбрасываются. P3–P5 (`risk`/
+`killswitch`/`oms`, live-трейдинг) не отменены, а **отложены** на execution-фазу (§21,
+таблица DEFERRED ниже) — возобновляются отдельным founder-решением после GA. Канон
+структуры фаз — этот раздел; `docs/09-roadmap-v2.md` — рабочая декомпозиция
+(предусловия, объём в milestone'ах, cross-refs), обновляется чаще и подробнее.
+
+### Пройденный фундамент (✅ DONE — не пересчитывается)
+
 | Фаза | Содержимое | Acceptance-ворота | founder |
 |---|---|---|---|
-| **P0 Журнал** | journal + replay + state_hash + recorder HL-фида | 24ч записи; replay ×3 бит-идентичен (DET-I-1) | — |
-| **P1 Data plane** | venue-hyperliquid MD, book+честный ресинк, recorder-демон, замеры δ-латентностей | 7 дней данных; gap-статистика; целостность книги green; δ-распределения собраны | — |
-| **P2 Research core** | sim fill-model, research-cli (grid/walk-forward/metrics.json), OBI №1 формализован | OBI-отчёт по пре-регистрированным критериям; paper-режим работает | ★ (принять/убить OBI) |
-| **P2.5 Data safety net** ⟵ *PROPOSED 2026-07-14 (doc-гейт §9)* | ops-слой: cold-copy журнала offsite + restore-drill; **recon локальной книги с REST-снапшотом биржи**; `/metrics` + алерты P0/P1/P2 (`docs/fa/ops.md`) | бэкап ВОССТАНАВЛИВАЕТСЯ (drill), не просто существует; инъецированная порча книги (`ε_test`) ловится recon'ом и алертит; recon не даёт rate-limit-инцидентов (`OPS-I-9`, урок TD-013); двусторонний паритет «инцидент → алерт → метрика» | **★** (принять фазу и её место в очереди) |
-| **P3 Risk+OMS** | gate, killswitch, oms; торговля на **HL testnet** | RED-suite RK-I-1..10 + INTG-I-* GREEN (падали на заглушках); 48ч testnet-MM чисто; disconnect-drill: заявок нет | — |
-| **P4 Live-micro** | 1 пара, профиль лимитов §4 ($500–2k), 2–4 недели | recon mismatch = 0; каждый цент PnL объясняется реплеем; sim-vs-live в допуске | ★★ (paper→live; вес сигнала) |
-| **P5 Scale** | Binance-адаптер + lead-lag №3; рабочие лимиты; квант-деск на полном цикле; корреляции/portfolio | по отдельному плану | ★ |
-| **P-COCKPIT Виз-бэкенд + AI** ⟵ *ПИВОТ 2026-07-22 (`docs/07`)* | Слои 8-9: heatmap/footprint/CVD/VP/VWAP/TPP + Read Gateway (WS) + AI-копилот; фронт — founder (`code2alpha`) | MVP-1 (heatmap/bubbles/COB/VP/CVD/VWAP на BTCUSDT) отдаёт данные фронту через WS; live==replay; TPP COIN с data-quality caveat; AI-Context+audit | ★ (приём фазы) |
+| **P0 Журнал** ✅ | journal + replay + state_hash + recorder HL-фида | 24ч записи; replay ×3 бит-идентичен (DET-I-1) — ЗЕЛЁНЫЙ | — |
+| **P1 Data plane** ✅ | venue-hyperliquid + venue-binance(-futures) MD, book+честный ресинк, recorder-демон, δ-латентности | 7 дней данных; gap-статистика; целостность книги green — ЗЕЛЁНЫЙ; прод — 137+ млн событий журнала (§0) | — |
+| **P2 Research core** ✅ | sim fill-model, research-cli (grid/walk-forward/metrics.json), OBI №1 формализован | OBI-отчёт по пре-регистрированным критериям; paper-режим работает — ПРИНЯТО | ★ принято |
+| **P2.5 Data safety net** ✅ (в основном; хвост докатывается в Ф0) | ops-слой: cold-copy журнала offsite, recon локальной книги с REST-снапшотом биржи, `/metrics`+алерты P0/P1/P2 (`docs/fa/ops.md`, `OPS-I-1..8`) | backup restore-drill проходит; инъецированная порча книги (`ε_test`) ловится recon'ом и алертит; двусторонний паритет «инцидент→алерт→метрика» | ★ принято |
+| **P-COCKPIT Виз-бэкенд** ✅ (MVP-1 сдан; докатка формата данных/UI — в Ф1/Ф4) | Bookmap-подобный виз-бэкенд: heatmap/COB/CVD/Volume Profile/VWAP/footprint + Read Gateway (WS) поверх L2Delta-реконструированной книги (M-18/20/22/23/24/29 — все ✅ CLOSED, детали `PROJECT-STATE.md`) | MVP-1 (heatmap/bubbles/COB/VP/CVD/VWAP на BTCUSDT) отдаёт данные через WS; live==replay — ЗЕЛЁНЫЙ на проде (§8 eyes-on) | ★ принято (пивот 2026-07-22) |
 
-**ПИВОТ P-COCKPIT (амендмент 2026-07-22).** Founder перенаправил ближний фокус: **не торговый стек, а
-ДАННЫЕ + виз-бэкенд + AI-копилот** для Bookmap-подобного кокпита (Order Flow Intelligence Terminal) на
-Binance+HL; фронт — founder'а (`code2alpha`), мы даём бэкенд+экспорт. **P3 (risk/oms), P4 (live), сигналы
-(M-10 стек) — ОТЛОЖЕНЫ, НЕ отменены** — возобновляются ПОСЛЕ кокпита (торговля строится на готовых
-данных+виз; спеки/RED сохранены). Полный контекст, решения и milestone-порядок —
-`docs/07-cockpit-backend-roadmap.md`; FA — `docs/fa/{viz-backend,ai-copilot}.md`. Инвариант «LLM не в
-горячем цикле» сохранён (слой 9 вне детерминизма).
+**Почему P2.5 вставлена перед торговым путём (сохранённый урок, амендмент 2026-07-14,
+после пяти инцидентов подряд).** TD-011 (OOM recorder'а), TD-013 (IP-бан 418), TD-014
+(0 Funding в журнале), TD-016 (лик памяти) и C1/M-08 (эвикция стирала живые уровни
+книги) — **все пять найдены глазами человека** (ssh/code-review), ни один — автоматикой.
+Контейнер везде был `healthy`, heartbeat свежий, CI зелёный: healthcheck проверяет, что
+процесс жив, а не что он делает то, что должен. Урок остаётся в силе для SaaS-пути:
+`docs/fa/ops.md` (`OPS-I-1..8`) и §8 eyes-on (`.claude/rules/gates.md`) — обязательны
+для всех фаз ниже, не только для бывшего торгового стека.
+
+### Продолжение — роадмап AlphaQuant (Ф0–Ф6, SaaS)
+
+Обоснование пивота — §0/§13–§23 (multi-tenancy, SaaS-тезис, десятки тысяч
+пользователей — требование к первой версии, а не отдалённая цель). Полная
+декомпозиция (предусловия, объём в milestone'ах, DEFERRED-обоснование) —
+`docs/09-roadmap-v2.md`; здесь — сжатая карта верхнего уровня.
+
+| Фаза | Содержимое | Acceptance-ворота | founder |
+|---|---|---|---|
+| **Ф0 Необратимость данных** 🚧 в работе | retention/compaction dedup (M-40 ✅), offsite-бэкап+restore-drill (R1), push-алертинг вне машины + ребут-дрилл (M-43), venue-hyperliquid RED-суита (M-41 ✅), doc-governance sync (M-42) | restore-drill проходит поверх восстановленного журнала; алерт доставлен ВНЕ машины при инъецированном отказе; ребут VPS → само поднялось; venue-hl suite GREEN | ★ приём restore-drill'а |
+| **Ф1 Данные продукта (L2Delta)** | persist-L2Delta для всех символов кокпита (M-45), order-flow indicators (M-46), book-hardening (M-44), перемер объёмов после инверсии формата | book из (якорь+диффы) ≡ book из снапшотов (byte-identity); malformed diff → fail-closed; провенанс net-level сохранён; замер объёма/сут обновлён | — (подпись M-45 уже дана 2026-07-27) |
+| **Ф2 Read-path под SaaS** | shared-tailer+HOT-проекция (один проход журнала на процесс), cap'ы/квоты соединений fail-closed, JWT-claims тарифа в gateway-serve, `BookView<Fresh\|Stale>` (PL-I-7), нагрузочный стенд | X тыс. соединений/узел при O(1) сканах журнала; p95 snapshot-on-connect ≤ порога; деградационная лестница §16 продемонстрирована | — |
+| **Ф3 App-плоскость (Postgres+Next.js)** | Postgres (managed, PITR) + Auth.js→JWT-мост + CRUD (Profile/Workspace/decision-journal/alerts) + RLS + каркас биллинга (без включения) | e2e: регистрация→Workspace сохранён→JWT открывает WS-подписку по claims; PITR restore-drill пройден; RLS-тест (чужой tenant недоступен) | ★ выбор провайдеров |
+| **Ф4 Терминал (MVP кокпита)** | Next.js-оболочка (topbar/region-layout/Widget Registry), Workspace Scalper(аналитический, без ордеров)/Custom, виджеты на данных Ф1/Ф2, Replay-режим | MVP-набор (heatmap/COB/tape/CVD/VP/VWAP) живьём+replay на BTC(Binance)+HL-символе; переключение Live/Replay без смены кода редьюсеров; layout сохраняется | ★ приём UX |
+| **Ф5 AI Tutor + Agent Runtime v0** | Event Engine (детерминированный, Rust) — семантические события микроструктуры; Agent Runtime (Node/TS) — Market Observer+AI Tutor; AI Event-контракт; Tutor Workspace; INTG-I «агенты пользователей» + PL-I-3 | учебный цикл end-to-end на replay (событие→гипотеза→evidence→paper decision→decision-journal); audit-trail полон; бюджет LLM per-user срабатывает; INTG-оракулы GREEN | ★ LLM-провайдер/модель; ★ приём wedge |
+| **Ф6 Монетизация / GA** ★★ | тарифы Free/Trader/Pro/Quant + серверный enforce квот (PL-I-5) по всем поверхностям; права на данные — исполнение решения (`LIC-I-1..3`, при смене источника `SRC-I-1..3`); SLA/наблюдаемость GA; юридические формулировки | платящий пользователь e2e (оплата→tier-claims→лимиты работают); LIC-гейт блокирует internal-only событие платному клиенту; SLA-дашборд+алерт-паритет по всем инцидент-классам | ★★ модель прав на данные (с юристом); ★ цены/тарифы; ★ GA |
+
+**DEFERRED, не отменено (execution-фаза, бывшие P3–P5).** `risk`/`killswitch`/`oms`
+крейты, testnet/live-ордера, лестница read-only→testnet→confirmed→automation — шов
+предусмотрен архитектурой (§21: место в онионе, типовой барьер `RiskApproved`,
+отдельный KS-процесс, `PL-I-6` front-running-proof), `RK-I-1..10` остаются
+источником канона в §4, sim [ЕСТЬ]. Копи-трейдинг/чужие ключи убраны решением
+founder'а полностью (не откладываются, а закрыты). Опционы, B2A, research-swarms/
+marketplace, Quant-в-продукте (NL→spec, paper agent для пользователей) — более
+поздние продуктовые этапы, после GA. Полная таблица и обоснование каждой строки —
+`docs/09-roadmap-v2.md` §DEFERRED.
 
 **Read-path латентность (TD-044) и сквозной арх-аудит — отдельные долговечные роадмапы:**
 `milestones/M-38-roadmap.md` (чекпоинт+live-seek+shared-tailer, M-38a→b→M-39) и
-`docs/08-arch-improvement-roadmap.md` (сквозной аудит 2026-07-27: риски R1-R10 → milestone'ы M-40..M-44,
-системные паттерны). Свежая сессия читает их как источник по декомпозиции.
-
-Квант-деск (§7) работает параллельно с P0–P2 на записанных данных; первые подписи
-founder'а — на воротах P2 и P4.
-
-**Почему P2.5 вставлена перед P3 (амендмент 2026-07-14, после пяти инцидентов подряд).**
-TD-011 (OOM recorder'а), TD-013 (IP-бан 418), TD-014 (0 Funding в журнале), TD-016 (лик
-памяти) и C1/M-08 (эвикция стирала живые уровни книги) — **все пять найдены глазами человека**
-(ssh / code-review), ни один — нашей автоматикой. Во всех случаях контейнер был `healthy`,
-heartbeat свежий, CI зелёный, Deploy success: **healthcheck проверяет, что процесс жив, а не
-что он делает то, что должен.** Пока цена — испорченный датасет; с появлением `oms` та же
-слепота стоит денег. Плюс: боевой журнал (15 GB на 2026-07-14) существует **в одном
-экземпляре** — потеря диска = потеря проекта. Поэтому сеть безопасности данных строится ДО
-торгового стека, а не после. Детали и инварианты `OPS-I-1..8` — `docs/fa/ops.md`; очередь
-milestone'ов — `milestones/BACKLOG.md`.
+`docs/08-arch-improvement-roadmap.md` (сквозной аудит 2026-07-27: риски R1-R10 →
+milestone'ы; Ф0 закрывает R1/R2/R4/R9/R10, Ф2 — R5/R7, Ф1 — R6). Свежая сессия читает
+их как источник по декомпозиции.
 
 ## §11. Открытые вопросы (решаются до/во время реализации)
 
