@@ -233,13 +233,6 @@ fn tail_unreadable_segment_path(e: &io::Error) -> Option<PathBuf> {
         .map(|t| t.path.clone())
 }
 
-/// M-49: header-класс ошибки классификации (магия есть, заголовок физически битый —
-/// bit-rot/truncation), НЕ governance-отказ (`ForeignSegment`/`TruncatedLegacy`, которые
-/// остаются fail-closed безусловно).
-fn is_corrupt_header(e: &io::Error) -> bool {
-    matches!(e.get_ref(), Some(b) if b.is::<CorruptHeader>())
-}
-
 // === Утилиты классификации сегмента ===
 
 /// Имя сегмента по индексу: `segment-NNNNNNNN.jrnl`.
@@ -716,41 +709,9 @@ fn latest_segment(dir: &Path) -> io::Result<Option<(u32, PathBuf)>> {
 pub fn segments(dir: impl AsRef<Path>) -> io::Result<Vec<SegmentInfo>> {
     let dir = dir.as_ref();
     let manifest = load_manifest(dir)?;
-    let paths = dedup_indexed_paths(dir)?;
-    // M-49 (JR-I-8): наибольший индекс — хвост. Нужен ЗАРАНЕЕ, чтобы отличить «хвостовой
-    // сегмент физически повреждён» (терпим — та же деградация, что закрывает
-    // `tail_last_seq_of`) от «где-то в СЕРЕДИНЕ истории битый/чужой файл» (fail-closed,
-    // как и раньше: один битый файл не смеет тихо стереть остальную историю в другую
-    // сторону — оставляем строгим).
-    let max_idx = paths
-        .iter()
-        .filter_map(|p| {
-            p.file_name()
-                .and_then(OsStr::to_str)
-                .and_then(parse_segment_index_any)
-        })
-        .max();
-    let mut out = Vec::with_capacity(paths.len());
-    for p in paths {
-        match classify_segment(&p, &manifest) {
-            Ok(info) => out.push(info),
-            Err(e)
-                if is_corrupt_header(&e)
-                    && p
-                        .file_name()
-                        .and_then(OsStr::to_str)
-                        .and_then(parse_segment_index_any)
-                        == max_idx =>
-            {
-                // Хвостовой сегмент физически битый (bit-rot/truncation заголовка):
-                // остальная история остаётся читаемой. Провенанс-отказы (ForeignSegment/
-                // TruncatedLegacy) под это исключение НЕ попадают — `is_corrupt_header`
-                // проверяет ИМЕННО header-класс, они остаются fail-closed безусловно
-                // (CT-RFC-02 не ослабляется этим тумблером).
-                continue;
-            }
-            Err(e) => return Err(e),
-        }
+    let mut out = Vec::new();
+    for p in dedup_indexed_paths(dir)? {
+        out.push(classify_segment(&p, &manifest)?);
     }
     // Стабильная сортировка по индексу — критично для сшивки по границе.
     out.sort_by_key(|s| s.index);
