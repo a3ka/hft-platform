@@ -226,13 +226,6 @@ pub(crate) fn is_tail_unreadable(e: &io::Error) -> bool {
     matches!(e.get_ref(), Some(b) if b.is::<TailUnreadable>())
 }
 
-/// Путь нечитаемого хвостового сегмента (для операторского карантина при force-next-seq).
-fn tail_unreadable_segment_path(e: &io::Error) -> Option<PathBuf> {
-    e.get_ref()
-        .and_then(|b| b.downcast_ref::<TailUnreadable>())
-        .map(|t| t.path.clone())
-}
-
 // === Утилиты классификации сегмента ===
 
 /// Имя сегмента по индексу: `segment-NNNNNNNN.jrnl`.
@@ -1429,19 +1422,6 @@ fn readable_max_seq(dir: &Path) -> io::Result<Option<u64>> {
     Ok(max_seq)
 }
 
-/// Переместить нечитаемый сегмент в `dir/quarantine/` — чтобы он не мешал последующим
-/// `stream()`/перезапускам (не «buried corruption» в середине индексов после того, как
-/// открыт новый сегмент с бОльшим индексом). Данные НЕ удаляются, только перемещаются —
-/// восстановимо, в отличие от `rm`.
-fn quarantine_segment(dir: &Path, path: &Path) -> io::Result<()> {
-    let q = dir.join("quarantine");
-    fs::create_dir_all(&q)?;
-    if let Some(name) = path.file_name() {
-        fs::rename(path, q.join(name))?;
-    }
-    Ok(())
-}
-
 /// Пометить декларацию применённой: переименование `journal.force-next-seq.json` →
 /// `journal.force-next-seq.applied.json` (одноразовость — забыть её в каталоге невозможно,
 /// повторный старт её не подхватит; аудит — `reason`/`declared_at_ms` сохраняются в теле).
@@ -1459,8 +1439,9 @@ fn mark_force_next_seq_applied(dir: &Path) -> io::Result<()> {
 /// - декларации нет → пробрасываем исходный отказ как есть (fail-closed без деградации);
 /// - декларация есть, но `next_seq` ≤ максимального ЧИТАЕМОГО `seq` → `Err` (декларация НЕ
 ///   может стать каналом seq-reuse — `op_2`);
-/// - декларация валидна → карантин нечитаемого сегмента + пометка применённой + объявленный
-///   `next_seq` (`op_1`).
+/// - декларация валидна → пометка применённой + объявленный `next_seq` (`op_1`). Карантин
+///   нечитаемого сегмента файлами данных НЕ занимается — это ручное действие оператора по
+///   runbook (rev3: `open_with` не имеет побочных эффектов на данных, `op_4`).
 pub(crate) fn resolve_next_seq_or_declared(dir: &Path, meta_path: &Path) -> io::Result<u64> {
     match resolve_next_seq_with(dir, meta_path) {
         Ok(n) => Ok(n),
@@ -1481,9 +1462,6 @@ pub(crate) fn resolve_next_seq_or_declared(dir: &Path, meta_path: &Path) -> io::
                         readable_max.unwrap_or(0)
                     ),
                 ));
-            }
-            if let Some(bad) = tail_unreadable_segment_path(&e) {
-                quarantine_segment(dir, &bad)?;
             }
             mark_force_next_seq_applied(dir)?;
             Ok(decl.next_seq)
