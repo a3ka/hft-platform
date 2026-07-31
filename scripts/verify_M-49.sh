@@ -62,7 +62,8 @@ fi
 
 # ── Sacred-оракулы на месте и не выпотрошены ─────────────────────────────────────────
 for f in crates/journal/tests/red_tail_integrity.rs \
-         crates/journal/tests/red_tail_integrity_operator.rs; do
+         crates/journal/tests/red_tail_integrity_operator.rs \
+         crates/journal/tests/red_tail_integrity_prodscale.rs; do
   if [ -s "$f" ]; then
     ok "sacred-оракул на месте: $f"
   else
@@ -109,6 +110,36 @@ if printf '%s' "$REG" | grep -qE 'test result: FAILED'; then
 else
   N_OK=$(printf '%s' "$REG" | grep -cE 'test result: ok')
   ok "регресс: все блоки journal зелёные ($N_OK блоков) — recover/prod-migration/open-bounded/restore целы"
+fi
+
+# ── Прод-масштаб (блокер rev3, R-001 находка 1) ──────────────────────────────────────
+# Все остальные фикстуры набора — 8 KiB, то есть проверяют ТОЛЬКО ветку had_header==true.
+# Прод пишет сегментами до 1 GiB при окне хвостового скана 4 MiB. Оракул обязателен по
+# `.claude/rules/testing.md` §«Прод-масштаб для sacred I/O-путей» (урок TD-011).
+# --release: фикстура пишет >4 MiB, в debug это неоправданно долго.
+echo
+echo "--- прод-масштаб: JR-I-8 на сегменте больше окна скана ---"
+if cargo test -p journal --test red_tail_integrity_prodscale --release \
+     -- --test-threads=1 2>&1 | tail -20 | grep -qE 'test result: ok'; then
+  ok "T-PS ti_7/ti_8: страж держится на сегменте > TAIL_SCAN_CHUNK, здоровый большой стартует"
+else
+  bad "T-PS прод-масштабный оракул не зелёный — JR-I-8 не держится для файлов прод-размера
+      (буфер скана не достаёт до начала файла ⇒ had_header=false ⇒ страж молчит ⇒ seq-reuse)"
+fi
+
+# ── CI-паритет (R-001 находка 4): verify ⊇ терминальные гейты CI (gates.md §3) ───────
+echo
+if cargo fmt --all -- --check > /tmp/m49_fmt.log 2>&1; then
+  ok "CI-паритет: cargo fmt --all --check чист"
+else
+  bad "CI-паритет: cargo fmt --all --check не чист (main покраснеет)"
+  tail -8 /tmp/m49_fmt.log | sed 's/^/      /'
+fi
+if cargo clippy --workspace --all-targets -- -D warnings > /tmp/m49_ws_clippy.log 2>&1; then
+  ok "CI-паритет: clippy --workspace --all-targets чист"
+else
+  bad "CI-паритет: workspace-clippy не чист (main покраснеет)"
+  tail -10 /tmp/m49_ws_clippy.log | sed 's/^/      /'
 fi
 
 # ── Клиппи ───────────────────────────────────────────────────────────────────────────
