@@ -225,7 +225,7 @@ fn op_1_valid_declaration_unblocks_start_and_is_marked_applied() {
 /// Требование: `next_seq` строго больше максимального ЧИТАЕМОГО `seq`, иначе отказ.
 #[test]
 fn op_2_declaration_below_readable_max_is_rejected() {
-    let (dir, readable_max, victim) = restored_with_unreadable_tail();
+    let (dir, readable_max, _victim) = restored_with_unreadable_tail();
     assert!(
         readable_max > 0,
         "фикстура: часть истории обязана читаться (иначе нечего сравнивать)"
@@ -338,7 +338,7 @@ fn op_3_declaration_is_inert_when_tail_is_readable() {
 /// сама декларация: `journal.force-next-seq.json` → `.applied.json` (одноразовость, OP-1).
 #[test]
 fn op_4_open_with_never_moves_data_files() {
-    let (dir, readable_max, victim) = restored_with_unreadable_tail();
+    let (dir, readable_max, _victim) = restored_with_unreadable_tail();
 
     let before: Vec<String> = ls(dir.path());
     let segments_before: Vec<String> = before
