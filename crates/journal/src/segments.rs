@@ -1433,11 +1433,10 @@ fn load_force_next_seq_decl(dir: &Path) -> io::Result<Option<ForceNextSeqDecl>> 
 /// — более ранние сегменты по построению несут меньший `seq`, читать их не нужно.
 fn readable_max_seq(dir: &Path) -> io::Result<Option<u64>> {
     let mut max_seq: Option<u64> = None;
-    for p in iter_segments_sorted(dir)? {
-        if let Ok(events) = read_segment_events(&p, false) {
-            if let Some(m) = events.iter().map(|e| e.seq).max() {
-                max_seq = Some(max_seq.map_or(m, |cur| cur.max(m)));
-            }
+    for p in iter_segments_sorted(dir)?.into_iter().rev() {
+        if let Ok(Some(m)) = tail_last_seq_of(&p) {
+            max_seq = Some(max_seq.map_or(m, |cur: u64| cur.max(m)));
+            break;
         }
     }
     Ok(max_seq)
