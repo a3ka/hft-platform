@@ -60,10 +60,36 @@ else
       данных (единственный шаг оператора — удалить каталог)"
 fi
 
+# ── rev5 задача 5a: три состояния пола, `unwrap_or(0)` устранён ──────────────────────
+# Корень блокера R-002 глубже потери префикса: `Option<u64>` не различает «сегментов нет»
+# и «сегменты есть, но пол установить не удалось», а `unwrap_or(0)` схлопывает второе в
+# первое — то есть трактует ОТСУТСТВИЕ ЗНАНИЯ как РАЗРЕШЕНИЕ. Пока эта строка жива,
+# декларация с любым next_seq >= 1 проходит на полностью нечитаемом каталоге.
+BODY_DECL="$(fn_body 'pub(crate) fn resolve_next_seq_or_declared(')"
+if [ -z "$BODY_DECL" ]; then
+  bad "T5a канарейка не смогла извлечь тело resolve_next_seq_or_declared (переименована?).
+      Гейт НЕ проверен — правь канарейку, а не игнорируй."
+elif printf '%s' "$BODY_DECL" | grep -q 'unwrap_or(0)'; then
+  bad "T5a в валидации декларации остался unwrap_or(0): отсутствие знания о поле трактуется
+      как разрешение (пол=0) ⇒ проходит ЛЮБОЙ next_seq >= 1 ⇒ escape-hatch выдаёт seq-reuse
+      с формальным одобрением оператора (R-002, задача 5a)"
+else
+  ok "T5a unwrap_or(0) устранён из валидации операторской декларации"
+fi
+if grep -q 'NoSegments' "$SEG" && grep -q 'Unknown' "$SEG"; then
+  ok "T5a пол различает три состояния (Known/NoSegments/Unknown)"
+else
+  bad "T5a три состояния пола не заведены: ожидаются варианты NoSegments и Unknown в $SEG.
+      Имена контрактные (milestone rev5, таблица состояний) — оракулы op_6/op_7 стоят на них"
+fi
+
 # ── Sacred-оракулы на месте и не выпотрошены ─────────────────────────────────────────
 for f in crates/journal/tests/red_tail_integrity.rs \
          crates/journal/tests/red_tail_integrity_operator.rs \
-         crates/journal/tests/red_tail_integrity_prodscale.rs; do
+         crates/journal/tests/red_tail_integrity_prodscale.rs \
+         crates/journal/tests/red_tail_integrity_operator_prodscale.rs \
+         crates/journal/tests/red_tail_integrity_bounded.rs \
+         crates/journal/tests/common/mod.rs; do
   if [ -s "$f" ]; then
     ok "sacred-оракул на месте: $f"
   else
@@ -71,7 +97,9 @@ for f in crates/journal/tests/red_tail_integrity.rs \
   fi
 done
 if grep -qE '#\[(ignore|should_panic)' crates/journal/tests/red_tail_integrity.rs \
-     crates/journal/tests/red_tail_integrity_operator.rs 2>/dev/null; then
+     crates/journal/tests/red_tail_integrity_operator.rs \
+     crates/journal/tests/red_tail_integrity_operator_prodscale.rs \
+     crates/journal/tests/red_tail_integrity_bounded.rs 2>/dev/null; then
   bad "в sacred-оракулах M-49 появился #[ignore]/#[should_panic] — гейт отключён молча"
 else
   ok "в sacred-оракулах M-49 нет #[ignore]/#[should_panic]"
@@ -125,6 +153,33 @@ if cargo test -p journal --test red_tail_integrity_prodscale --release \
 else
   bad "T-PS прод-масштабный оракул не зелёный — JR-I-8 не держится для файлов прод-размера
       (буфер скана не достаёт до начала файла ⇒ had_header=false ⇒ страж молчит ⇒ seq-reuse)"
+fi
+
+# ── rev5 задача 5b: ПУТЬ ДЕКЛАРАЦИИ на прод-масштабном СЫРОМ сегменте (блокер R-002) ──
+# ti_7/ti_8 проверяют путь resolve_next_seq, а не путь декларации; комбинация «сырой
+# сегмент > окна скана + декларация» не покрывалась НИ ОДНИМ оракулом — и именно там
+# защита op_2 обнулилась. Прод-форма: активный сегмент сырой, 868 MB → 1 GiB.
+echo
+echo "--- прод-масштаб: путь операторской декларации на СЫРОМ сегменте (op_5) ---"
+if cargo test -p journal --test red_tail_integrity_operator_prodscale --release \
+     -- --test-threads=1 2>&1 | tail -20 | grep -qE 'test result: ok'; then
+  ok "T-OP5 пол защиты учитывает читаемый ПРЕФИКС повреждённого прод-масштабного сегмента"
+else
+  bad "T-OP5 op_5 не зелёный — декларация проходит внутрь занятого диапазона seq на
+      прод-форме (сырой сегмент больше окна скана): escape-hatch стал каналом seq-reuse"
+fi
+
+# ── rev5 задача 5b: терпимость НЕ ценой памяти (иначе чиним один дефект другим) ───────
+# Наивный фикс блокера — «вернуть read_segment_events» — даёт 1 GiB в RAM в момент разбора
+# инцидента (класс TD-011). Оба свойства проверяются ОДНИМ тестом и не подлежат размену.
+echo
+echo "--- граница ресурса: пол честен И стоит O(1) памяти (op_8) ---"
+if cargo test -p journal --test red_tail_integrity_bounded --release \
+     -- --test-threads=1 2>&1 | tail -20 | grep -qE 'test result: ok'; then
+  ok "T-OP8 пол вычисляется терпимо И при ограниченной, не растущей с размером памяти"
+else
+  bad "T-OP8 op_8 не зелёный — либо пол нечестен (декларация внутри занятого диапазона
+      принята), либо куплен памятью (загрузка сегмента целиком, класс TD-011)"
 fi
 
 # ── CI-паритет (R-001 находка 4): verify ⊇ терминальные гейты CI (gates.md §3) ───────
