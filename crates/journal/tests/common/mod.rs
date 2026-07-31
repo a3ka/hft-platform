@@ -22,7 +22,7 @@ use std::io::Read;
 use std::path::Path;
 
 use contracts::{DataSource, Event, EventKind, Level, MdPayload, Side, Venue, SEGMENT_MAGIC};
-use journal::WriterConfig;
+use journal::{Journal, WriterConfig};
 
 pub const T0: i64 = 1_752_000_000_000;
 pub const DECL: &str = "journal.force-next-seq.json";
@@ -223,4 +223,183 @@ pub fn corrupt_body_after_header(path: &Path) {
         *b = 0x5A;
     }
     std::fs::write(path, &bytes).expect("write");
+}
+
+// ═════════════════════════════════════════════════════════════════════════════════════
+// M-50 (TD-053) — помощники оракулов «крупное событие и скан пола»
+// ═════════════════════════════════════════════════════════════════════════════════════
+
+/// Кап переноса незавершённого фрейма в скане пола (`journal::READABLE_SCAN_MAX_CARRY`,
+/// приватная константа крейта). Дублируется СОЗНАТЕЛЬНО (как `TAIL_SCAN_CHUNK`): оракулы
+/// границы обязаны пережить её изменение и падать, если граница видимости сдвинулась
+/// молча. Валидный фрейм в 65 536 B (кап включительно) обязан быть видим ВСЕГДА; фрейм
+/// в кап+1 — предмет TD-053.
+pub const FLOOR_SCAN_CARRY_CAP: usize = 64 * 1024;
+
+/// Санити-кап длины фрейма штатного ридера (`read_frame_payload`, 64 MiB). Дублируется
+/// сознательно: выше этого предела валидных фреймов не существует ДЛЯ ВСЕГО крейта.
+pub const FRAME_LEN_SANITY_CAP: usize = 64 * 1024 * 1024;
+
+/// Максимальный фрейм `L2Snapshot` по архитектурному потолку bucket-cap venue-binance
+/// (3000 уровней/сторона): 66 032 B = 100.8% от 64 KiB. Форма прода, СНЯТА ЗАМЕРОМ
+/// (`research/measurements/td-053-event-size.md` §2.3/§synthetic), не выдумана.
+pub const PROD_L2SNAPSHOT_MAX_FRAME: usize = 66_032;
+
+/// Константный `ts_mono_ns` для ручных фреймов (величина класса прод-значений).
+pub const TS_MONO: u64 = 1 << 60;
+
+/// i64-значение, чей postcard-varint (zigzag) занимает РОВНО `l` байт (1..=10).
+/// Нужен для побайтовой подгонки размера события в `event_of_frame_size`.
+pub fn val_of_varint_len(l: u32) -> i64 {
+    assert!((1..=10).contains(&l), "varint i64: 1..=10 байт");
+    if l == 1 {
+        1
+    } else {
+        1i64 << (7 * (l as i64) - 8)
+    }
+}
+
+/// Собрать ВАЛИДНОЕ событие (`L2Snapshot`, реальные типы контракта) с фреймом
+/// (`4B len + payload + 4B crc`) РОВНО `target_frame` байт. Грубая подгонка — числом
+/// уровней (14 B/уровень), тонкая — varint-классом значений последнего уровня.
+/// Setup-guard: если точный размер недостижим (форма postcard изменилась) — паника,
+/// а не молчаливо «примерно тот» размер (оракул границы обязан давить на границу).
+pub fn event_of_frame_size(seq: u64, target_frame: usize) -> Event {
+    let payload_target = target_frame
+        .checked_sub(8)
+        .expect("setup-guard: фрейм не меньше 8 байт");
+    let base: i64 = val_of_varint_len(7); // 7-байтовый varint — класс реальных цен ×1e8
+    let build = |n: usize, c1: u32, c2: u32| -> Event {
+        let mut bids: Vec<Level> = vec![
+            Level {
+                price: base,
+                size: base,
+            };
+            n
+        ];
+        if let Some(l) = bids.last_mut() {
+            l.price = val_of_varint_len(c1);
+            l.size = val_of_varint_len(c2);
+        }
+        Event {
+            seq,
+            ts_mono_ns: TS_MONO,
+            ts_wall_ms: T0,
+            kind: EventKind::md(
+                Venue::Binance,
+                "BTCUSDT",
+                MdPayload::L2Snapshot {
+                    bids,
+                    asks: Vec::new(),
+                    ts_exch_ms: T0,
+                },
+            ),
+        }
+    };
+    let probe = postcard::to_stdvec(&build(16, 7, 7)).expect("ser").len();
+    let est = 16 + payload_target.saturating_sub(probe) / 14;
+    for n in est.saturating_sub(6)..=est + 6 {
+        if n == 0 {
+            continue;
+        }
+        for c1 in 1..=10u32 {
+            for c2 in 1..=10u32 {
+                let ev = build(n, c1, c2);
+                if postcard::to_stdvec(&ev).expect("ser").len() == payload_target {
+                    return ev;
+                }
+            }
+        }
+    }
+    panic!(
+        "setup-guard: не удалось собрать событие с фреймом РОВНО {target_frame} B — \
+         форма postcard изменилась, подгонку в event_of_frame_size нужно перекалибровать"
+    );
+}
+
+/// ВАЛИДНЫЙ `L2Delta` (архитектурно неограниченный вариант, M-18) с фреймом ~`approx_frame`
+/// байт. Точность не нужна — используется bounded-оракулом границы ПАМЯТИ.
+pub fn l2delta_event_of_approx(seq: u64, approx_frame: usize) -> Event {
+    let base: i64 = val_of_varint_len(7);
+    let n = approx_frame / 14;
+    Event {
+        seq,
+        ts_mono_ns: TS_MONO,
+        ts_wall_ms: T0,
+        kind: EventKind::md(
+            Venue::Binance,
+            "BTCUSDT",
+            MdPayload::L2Delta {
+                bids: vec![
+                    Level {
+                        price: base,
+                        size: base,
+                    };
+                    n
+                ],
+                asks: Vec::new(),
+                first_update_id: 1,
+                final_update_id: 2,
+                prev_final_update_id: None,
+                ts_exch_ms: T0,
+            },
+        ),
+    }
+}
+
+/// Сериализовать событие в on-disk фрейм `[u32 LE len][payload][u32 LE crc32]` — тот же
+/// формат, что дублирует весь модуль (см. док-коммент вверху: оракул не имеет права
+/// опираться на функцию крейта, которую проверяет).
+pub fn frame_of(ev: &Event) -> Vec<u8> {
+    let p = postcard::to_stdvec(ev).expect("ser");
+    let mut out = Vec::with_capacity(p.len() + 8);
+    out.extend_from_slice(&(p.len() as u32).to_le_bytes());
+    out.extend_from_slice(&p);
+    out.extend_from_slice(&crc32fast::hash(&p).to_le_bytes());
+    out
+}
+
+/// Дописать сырые байты В КОНЕЦ файла (ручной валидный фрейм либо мусорный хвост).
+pub fn append_bytes(path: &Path, bytes: &[u8]) {
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .expect("open append");
+    f.write_all(bytes).expect("append bytes");
+}
+
+/// Общий assert оракулов M-50: декларация `next_seq` ВНУТРИ занятого диапазона обязана
+/// быть ОТВЕРГНУТА. Контракт JR-I-9 допускает ДВЕ формы отказа — «строго больше
+/// читаемого максимума» (`Known`) ИЛИ «пол непроверяем» (`Unknown`) — но не приём.
+/// После проверки декларация убирается (housekeeping для следующей фазы фикстуры).
+pub fn assert_decl_rejected(dir: &Path, cfg: WriterConfig, next_seq: u64, ctx: &str) {
+    write_decl(
+        dir,
+        next_seq,
+        "ошибка оператора: seq внутри занятого диапазона",
+    );
+    match Journal::open_with(dir, cfg) {
+        Err(e) => {
+            let msg = e.to_string().to_lowercase();
+            assert!(
+                msg.contains("seq"),
+                "{ctx}: отказ обязан объяснить причину (ожидается упоминание seq): «{e}»"
+            );
+            assert!(
+                !ls(dir).iter().any(|n| n == DECL_APPLIED),
+                "{ctx}: отвергнутая декларация не должна помечаться применённой"
+            );
+            let _ = std::fs::remove_file(dir.join(DECL));
+        }
+        Ok(_) => panic!(
+            "JR-I-9 НАРУШЕН ({ctx}): декларация next_seq={next_seq} ВНУТРИ занятого \
+             диапазона ПРИНЯТА → запись пойдёт поверх существующих seq (seq-reuse, \
+             необратимая порча append-only журнала).\n\
+             Скан пола обязан ВИДЕТЬ валидный крупный фрейм (CRC верифицируем потоково, \
+             seq — ведущий varint payload) либо отказать как Unknown — но НЕ молча \
+             трактовать размер как порчу (TD-053: кап carry 64 KiB против санити-капа \
+             ридера 64 MiB; архитектурный потолок L2Snapshot уже 66 032 B = 100.8% капа)."
+        ),
+    }
 }
