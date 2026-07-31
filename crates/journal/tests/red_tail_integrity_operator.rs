@@ -87,7 +87,7 @@ fn readable_max_seq(dir: &std::path::Path) -> Option<u64> {
 /// Восстановленный из холодного хранилища каталог (только `.zst`, без `journal.meta`)
 /// с УСЕЧЁННЫМ сегментом максимального индекса — то есть в состоянии, когда по
 /// `red_tail_integrity.rs` старт обязан быть отказан.
-fn restored_with_unreadable_tail() -> (tempfile::TempDir, u64) {
+fn restored_with_unreadable_tail() -> (tempfile::TempDir, u64, String) {
     let src = tempfile::tempdir().expect("src");
     {
         let mut j = Journal::open_with(src.path(), cfg()).expect("open_with");
@@ -131,7 +131,7 @@ fn restored_with_unreadable_tail() -> (tempfile::TempDir, u64) {
     let bytes = std::fs::read(&p).expect("read");
     std::fs::write(&p, &bytes[..bytes.len() * 2 / 3]).expect("truncate");
 
-    (dst, healthy_max)
+    (dst, healthy_max, victim)
 }
 
 fn write_decl(dir: &std::path::Path, next_seq: u64, reason: &str) {
@@ -147,7 +147,7 @@ fn write_decl(dir: &std::path::Path, next_seq: u64, reason: &str) {
 
 #[test]
 fn op_1_valid_declaration_unblocks_start_and_is_marked_applied() {
-    let (dir, readable_max) = restored_with_unreadable_tail();
+    let (dir, readable_max, victim) = restored_with_unreadable_tail();
 
     // Предусловие: без декларации старт ОБЯЗАН быть отказан (контракт red_tail_integrity).
     assert!(
@@ -176,8 +176,18 @@ fn op_1_valid_declaration_unblocks_start_and_is_marked_applied() {
     j.flush().expect("flush");
     drop(j);
 
-    // Новый seq обязан продолжать объявленную позицию, а не занятый диапазон.
-    let after = readable_max_seq(dir.path()).expect("что-то читается");
+    // ВАЖНО (rev3): каталог всё ещё содержит ПОВРЕЖДЁННЫЙ сегмент, и строгий путь чтения
+    // (`stream`) на нём обязан падать — это контракт `ti_6`, и `op_4` запрещает `open_with`
+    // убирать файл самостоятельно. Поэтому дальше тест ЭМУЛИРУЕТ РУЧНОЙ КАРАНТИН оператора
+    // (`docs/ops-journal-tail-unreadable.md` §1) и только затем читает журнал. Это и есть
+    // полный операторский сценарий: декларация → recorder пишет → оператор убирает битый
+    // сегмент → журнал снова читается строгим путём.
+    let q = dir.path().join("quarantine");
+    std::fs::create_dir_all(&q).expect("mkdir quarantine");
+    std::fs::rename(dir.path().join(&victim), q.join(&victim)).expect("ручной карантин");
+
+    let after = readable_max_seq(dir.path())
+        .expect("после ручного карантина журнал обязан читаться строгим путём");
     assert!(
         after >= declared,
         "запись обязана идти с объявленного next_seq={declared}, получено max_seq={after}"
@@ -185,6 +195,8 @@ fn op_1_valid_declaration_unblocks_start_and_is_marked_applied() {
 
     // Одноразовость + аудит: декларация помечена применённой, reason сохранён.
     let files = ls(dir.path());
+    // (quarantine/ здесь создан САМИМ ТЕСТОМ выше — эмуляция оператора; что `open_with` его
+    // не создаёт, проверяет отдельный оракул `op_4`.)
     assert!(
         !files.iter().any(|n| n == DECL),
         "декларация обязана быть помечена применённой (одноразовость): {DECL} всё ещё \
@@ -213,7 +225,7 @@ fn op_1_valid_declaration_unblocks_start_and_is_marked_applied() {
 /// Требование: `next_seq` строго больше максимального ЧИТАЕМОГО `seq`, иначе отказ.
 #[test]
 fn op_2_declaration_below_readable_max_is_rejected() {
-    let (dir, readable_max) = restored_with_unreadable_tail();
+    let (dir, readable_max, victim) = restored_with_unreadable_tail();
     assert!(
         readable_max > 0,
         "фикстура: часть истории обязана читаться (иначе нечего сравнивать)"
@@ -326,7 +338,7 @@ fn op_3_declaration_is_inert_when_tail_is_readable() {
 /// сама декларация: `journal.force-next-seq.json` → `.applied.json` (одноразовость, OP-1).
 #[test]
 fn op_4_open_with_never_moves_data_files() {
-    let (dir, readable_max) = restored_with_unreadable_tail();
+    let (dir, readable_max, victim) = restored_with_unreadable_tail();
 
     let before: Vec<String> = ls(dir.path());
     let segments_before: Vec<String> = before
