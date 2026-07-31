@@ -23,8 +23,8 @@
 //! 1. **Декларация действует ТОЛЬКО при нечитаемом хвосте.** Если хвост читается, она не
 //!    имеет силы — иначе забытый файл молча переопределял бы честный `next_seq`.
 //! 2. **`next_seq` обязан быть СТРОГО БОЛЬШЕ** максимального `seq`, который удалось
-//!    прочитать из ЧИТАЕМЫХ сегментов. Иначе escape-hatch сам становится каналом
-//!    seq-reuse — то есть дырой в защите, которую он обслуживает.
+//!    прочитать из журнала — включая ЧИТАЕМЫЙ ПРЕФИКС повреждённого сегмента. Иначе
+//!    escape-hatch сам становится каналом seq-reuse — дырой в защите, которую он обслуживает.
 //! 3. **Одноразовость.** После успешного применения декларация помечается применённой
 //!    (переименование в `journal.force-next-seq.applied.json`) — забыть её в каталоге
 //!    невозможно, повторный старт не подхватит её снова.
@@ -32,51 +32,58 @@
 //!
 //! Это тот же принцип, что `pruned_without_checkpoint_coverage` в M-38b: обход разрешён,
 //! но обязан быть НАЗВАН и не может быть тихим.
+//!
+//! ## rev5 — три состояния пола вместо `Option` (блокер R-002)
+//!
+//! `Option<u64>` не различал «сегментов нет» и «сегменты есть, но максимум установить не
+//! удалось», а `unwrap_or(0)` схлопывал второе в первое: отсутствие знания трактовалось как
+//! разрешение. Контракт rev5 — ТРИ состояния, и валидация обязана их различать:
+//!
+//! | Состояние | Когда | Валидация декларации |
+//! |---|---|---|
+//! | `Known(max)` | максимум установлен, в т.ч. по ЧИТАЕМОМУ ПРЕФИКСУ повреждённого сегмента | принять только `next_seq > max` |
+//! | `NoSegments` | сегментов нет / все нулевой длины | пол = 0, законный restore с нуля (`op_7`) |
+//! | `Unknown` | сегменты ЕСТЬ и непусты, но валидных фреймов не найдено нигде | **ОТКАЗ** с диагностикой (`op_6`) |
+//!
+//! ## Дефект ЭТОГО ФАЙЛА, вскрытый R-002 (исправлен в rev5)
+//!
+//! `restored_with_unreadable_tail()` вычисляла эталон как `first_seq(жертвы) − 1`, то есть
+//! **по построению исключала читаемый префикс жертвы** — и потому не могла поймать регресс
+//! 4b, который ровно этот префикс и потерял. Эталон теперь ИЗМЕРЯЕТСЯ терпимым проходом по
+//! каталогу ПОСЛЕ внесения порчи (`common::tolerant_readable_max`), а фикстура усилена так,
+//! чтобы читаемый префикс жертвы РЕАЛЬНО существовал: сжатый сегмент собирается из
+//! НЕСКОЛЬКИХ zstd-блоков (одноблочный .zst после усечения не отдаёт ничего — измерено).
+//! Setup-guard ниже падает, если фикстура выродилась обратно в rev4-форму.
 
-use contracts::{DataSource, EventKind, MdPayload, Side, Venue};
+mod common;
+
+use common::{
+    cfg_with, corrupt_body_after_header, is_segment_name, ls, snap, tolerant_readable_max, trade,
+    write_decl, DECL, DECL_APPLIED,
+};
 use journal::{EpochFilter, Journal, WriterConfig};
 
-const T0: i64 = 1_752_000_000_000;
-const N: u64 = 400;
-const DECL: &str = "journal.force-next-seq.json";
-const DECL_APPLIED: &str = "journal.force-next-seq.applied.json";
-
+/// Фикстура холодного restore: сегменты по 1 MiB крупными событиями ⇒ сжатый сегмент
+/// состоит из НЕСКОЛЬКИХ zstd-блоков ⇒ у усечённого файла есть читаемый ПРЕФИКС.
 fn cfg() -> WriterConfig {
-    WriterConfig {
-        max_segment_bytes: 8 * 1024,
-        min_free_bytes: 0,
-        source: DataSource::OwnCapture,
-        provenance: "tail-integrity operator fixture".to_string(),
-        epoch_id: "own-test".to_string(),
-    }
+    cfg_with(1024 * 1024, "tail-integrity operator fixture")
 }
 
-fn trade(i: u64) -> EventKind {
-    EventKind::md(
-        Venue::Binance,
-        "BTCUSDT",
-        MdPayload::Trade {
-            price: contracts::to_fixed(65_000.0) + i as i64,
-            size: contracts::to_fixed(0.01),
-            side: Side::Buy,
-            ts_exch_ms: T0 + i as i64,
-        },
-    )
+/// Фикстура мелких сегментов (8 KiB) — там, где важно ЧИСЛО сегментов, а не их объём.
+fn cfg_small() -> WriterConfig {
+    cfg_with(8 * 1024, "tail-integrity operator fixture")
 }
 
-fn ls(dir: &std::path::Path) -> Vec<String> {
-    let mut v: Vec<String> = std::fs::read_dir(dir)
-        .expect("read_dir")
-        .map(|e| e.expect("entry").file_name().to_string_lossy().to_string())
-        .collect();
-    v.sort();
-    v
-}
+/// Столько крупных событий нужно, чтобы закрылось ≥3 сегмента по 1 MiB (значит ≥2 из них
+/// компактятся в .zst, и жертвой становится НЕ первый сегмент).
+const N_BIG: u64 = 2200;
+const N_SMALL: u64 = 400;
 
-/// Максимальный `seq` каталога. Применяется ТОЛЬКО к ЗДОРОВЫМ каталогам: строгий путь
-/// чтения (`stream`) обязан оставаться fail-closed, и оракул не имеет права требовать от
-/// него терпимости (урок rev1: именно это требование вынудило ослабить `segments()`).
-fn readable_max_seq(dir: &std::path::Path) -> Option<u64> {
+/// Максимальный `seq` каталога СТРОГИМ путём. Применяется ТОЛЬКО к ЗДОРОВЫМ каталогам:
+/// строгий путь чтения (`stream`) обязан оставаться fail-closed, и оракул не имеет права
+/// требовать от него терпимости (урок rev1: именно это требование вынудило ослабить
+/// `segments()`).
+fn strict_max_seq(dir: &std::path::Path) -> Option<u64> {
     journal::stream(dir, EpochFilter::All)
         .ok()?
         .filter_map(|e| e.ok())
@@ -87,12 +94,14 @@ fn readable_max_seq(dir: &std::path::Path) -> Option<u64> {
 /// Восстановленный из холодного хранилища каталог (только `.zst`, без `journal.meta`)
 /// с УСЕЧЁННЫМ сегментом максимального индекса — то есть в состоянии, когда по
 /// `red_tail_integrity.rs` старт обязан быть отказан.
+///
+/// Возвращает `(каталог, ФАКТИЧЕСКИ читаемый максимум seq, имя жертвы)`.
 fn restored_with_unreadable_tail() -> (tempfile::TempDir, u64, String) {
     let src = tempfile::tempdir().expect("src");
     {
         let mut j = Journal::open_with(src.path(), cfg()).expect("open_with");
-        for i in 0..N {
-            j.append(trade(i)).expect("append");
+        for i in 0..N_BIG {
+            j.append(snap(i)).expect("append");
         }
         j.flush().expect("flush");
     }
@@ -109,36 +118,56 @@ fn restored_with_unreadable_tail() -> (tempfile::TempDir, u64, String) {
         .rfind(|n| n.ends_with(".zst"))
         .expect("есть .zst");
 
-    // ВАЖНО (rev2): эталон «максимального читаемого seq» снимается ДО внесения порчи.
-    // Первая редакция считала его ПОСЛЕ усечения и тем самым требовала от `stream`
-    // (строгий прод-путь) терпимости к битому каталогу — реализация могла пройти оракул
-    // только ослабив `segments()`, что и случилось (REJECT на PR-гейте M-49 rev1).
-    // Здоровые сегменты кроме жертвы дают тот же максимум: жертва — последняя по индексу.
-    let healthy_max = {
+    // Прежний (ДЕФЕКТНЫЙ) эталон rev4 — считается только ради setup-guard'а ниже.
+    let rev4_reference = {
         let mut segs = journal::list_segments(dst.path()).expect("segments до порчи");
         segs.sort_by_key(|s| s.index);
-        let victim_idx = segs
-            .iter()
-            .position(|s| s.path.file_name().is_some_and(|n| n == victim.as_str()))
-            .expect("жертва в списке");
-        // last_seq предпоследнего = first_seq жертвы − 1
-        segs.get(victim_idx)
-            .map(|v| v.header.first_seq.saturating_sub(1))
-            .expect("first_seq жертвы")
+        segs.iter()
+            .find(|s| s.path.file_name().is_some_and(|n| n == victim.as_str()))
+            .map(|s| s.header.first_seq.saturating_sub(1))
+            .expect("жертва в списке")
     };
 
+    // Порча — bit-rot ПОСЛЕДНЕЙ ТРЕТИ байт, а НЕ усечение файла.
+    //
+    // Измерено architect'ом (rev5) на трёх формах, и разница принципиальна:
+    //  • одноблочный .zst, усечён      → поток не открывается вовсе, читаемого префикса НЕТ
+    //    (эталон вырождается в first_seq−1 — то есть в дефектный rev4-эталон);
+    //  • МНОГОблочный .zst, усечён     → декодер трактует обрыв как штатный конец потока,
+    //    `open_with` возвращает **Ok** с корректным next_seq — это НЕ состояние «хвост
+    //    нечитаем», путь декларации вообще не входится (отдельный, более тонкий класс —
+    //    «тихо короче», зафиксирован в §«Известное ограничение» milestone'а);
+    //  • МНОГОблочный .zst, ИСПОРЧЕН   → ранние блоки распаковываются, на повреждённом
+    //    декодер отказывает ⇒ `Err` (путь декларации входится) И у жертвы ЕСТЬ читаемый
+    //    префикс. Ровно этот случай описывает runbook («bit-rot, холодной копии нет»).
     let p = dst.path().join(&victim);
-    let bytes = std::fs::read(&p).expect("read");
-    std::fs::write(&p, &bytes[..bytes.len() * 2 / 3]).expect("truncate");
+    let mut bytes = std::fs::read(&p).expect("read");
+    let from = bytes.len() * 2 / 3;
+    for b in bytes[from..].iter_mut() {
+        *b = 0x5A;
+    }
+    std::fs::write(&p, &bytes).expect("bit-rot");
 
-    (dst, healthy_max, victim)
-}
+    // ЭТАЛОН rev5: ИЗМЕРЕННЫЙ максимум читаемого — уже ПОСЛЕ порчи, с учётом читаемого
+    // префикса самой жертвы. Именно этот пол обязана знать реализация (`Known`).
+    let readable_max = tolerant_readable_max(dst.path())
+        .expect("фикстура: в каталоге обязано читаться хоть что-то");
 
-fn write_decl(dir: &std::path::Path, next_seq: u64, reason: &str) {
-    let json = format!(
-        r#"{{"next_seq": {next_seq}, "reason": "{reason}", "declared_at_ms": 1785362203969}}"#
+    // ── Setup-guard (R-002): фикстура ОБЯЗАНА давить на инвариант ────────────────────
+    // Если читаемый максимум совпал с rev4-эталоном, значит префикс жертвы не читается и
+    // оракул снова проверяет НЕ ТО — тот самый дефект, из-за которого регресс 4b прошёл
+    // все зелёные гейты. Это FAIL фикстуры, а не «повезло».
+    assert!(
+        readable_max > rev4_reference,
+        "ФИКСТУРА ВЫРОДИЛАСЬ в rev4-форму: измеренный читаемый максимум {readable_max} не \
+         превышает арифметический эталон first_seq(жертвы)−1 = {rev4_reference}. Значит у \
+         усечённой жертвы {victim} НЕТ читаемого префикса, и `op_2` снова не может поймать \
+         потерю префикса повреждённого сегмента (блокер R-002). Проверь: сжатый сегмент \
+         обязан состоять из НЕСКОЛЬКИХ zstd-блоков (крупные события + max_segment_bytes \
+         ≥ 1 MiB), иначе усечение убивает поток целиком."
     );
-    std::fs::write(dir.join(DECL), json).expect("write decl");
+
+    (dst, readable_max, victim)
 }
 
 // ═════════════════════════════════════════════════════════════════════════════════════
@@ -186,7 +215,7 @@ fn op_1_valid_declaration_unblocks_start_and_is_marked_applied() {
     std::fs::create_dir_all(&q).expect("mkdir quarantine");
     std::fs::rename(dir.path().join(&victim), q.join(&victim)).expect("ручной карантин");
 
-    let after = readable_max_seq(dir.path())
+    let after = strict_max_seq(dir.path())
         .expect("после ручного карантина журнал обязан читаться строгим путём");
     assert!(
         after >= declared,
@@ -223,6 +252,9 @@ fn op_1_valid_declaration_unblocks_start_and_is_marked_applied() {
 /// Escape-hatch, позволяющий объявить `next_seq` НИЖЕ уже записанного, — это дыра в той
 /// самой защите, которую он обслуживает (оператор ошибётся под давлением инцидента).
 /// Требование: `next_seq` строго больше максимального ЧИТАЕМОГО `seq`, иначе отказ.
+///
+/// **rev5:** «читаемый» = ИЗМЕРЕННЫЙ, включая префикс усечённой жертвы. На rev4-эталоне
+/// (`first_seq(жертвы) − 1`) этот оракул был слеп к потере префикса — блокер R-002.
 #[test]
 fn op_2_declaration_below_readable_max_is_rejected() {
     let (dir, readable_max, _victim) = restored_with_unreadable_tail();
@@ -231,7 +263,8 @@ fn op_2_declaration_below_readable_max_is_rejected() {
         "фикстура: часть истории обязана читаться (иначе нечего сравнивать)"
     );
 
-    // Оператор ошибся: объявил позицию ВНУТРИ уже записанного диапазона.
+    // Оператор ошибся: объявил позицию ВНУТРИ уже записанного диапазона (граница —
+    // РОВНО максимальный читаемый seq: правило «строго больше», значит отказ).
     write_decl(
         dir.path(),
         readable_max,
@@ -242,9 +275,14 @@ fn op_2_declaration_below_readable_max_is_rejected() {
         .err()
         .unwrap_or_else(|| {
             panic!(
-                "декларация next_seq={readable_max} ≤ читаемого максимума {readable_max} обязана \
-             быть ОТВЕРГНУТА: иначе escape-hatch сам переиспользует seq и порча уходит в \
-             журнал с формальным одобрением оператора."
+                "декларация next_seq={readable_max} ≤ ЧИТАЕМОГО максимума {readable_max} обязана \
+                 быть ОТВЕРГНУТА: иначе escape-hatch сам переиспользует seq и порча уходит в \
+                 журнал с формальным одобрением оператора.\n\
+                 Читаемый максимум ИЗМЕРЕН терпимым проходом по каталогу и включает читаемый \
+                 ПРЕФИКС усечённого сегмента. Если реализация отбрасывает повреждённый сегмент \
+                 целиком (`Err` от хвостового скана ⇒ сегмент не участвует в поле), пол падает \
+                 до максимума предыдущего сегмента — и защита исчезает ровно там, где нужна \
+                 (R-002, Находка 1)."
             )
         });
     let msg = err.to_string();
@@ -271,8 +309,8 @@ fn op_3_declaration_is_inert_when_tail_is_readable() {
     // Здоровый каталог: сжатая история БЕЗ порчи.
     let src = tempfile::tempdir().expect("src");
     {
-        let mut j = Journal::open_with(src.path(), cfg()).expect("open_with");
-        for i in 0..N {
+        let mut j = Journal::open_with(src.path(), cfg_small()).expect("open_with");
+        for i in 0..N_SMALL {
             j.append(trade(i)).expect("append");
         }
         j.flush().expect("flush");
@@ -284,7 +322,7 @@ fn op_3_declaration_is_inert_when_tail_is_readable() {
             std::fs::copy(src.path().join(&n), dir.path().join(&n)).expect("copy");
         }
     }
-    let history_max = readable_max_seq(dir.path()).expect("история читается");
+    let history_max = strict_max_seq(dir.path()).expect("история читается");
 
     // Забытая декларация с абсурдно большим значением.
     write_decl(
@@ -293,13 +331,13 @@ fn op_3_declaration_is_inert_when_tail_is_readable() {
         "забытый файл прошлого инцидента",
     );
 
-    let mut j = Journal::open_with(dir.path(), cfg())
+    let mut j = Journal::open_with(dir.path(), cfg_small())
         .expect("здоровый каталог обязан стартовать (хвост читается)");
     j.append(trade(9_999)).expect("append");
     j.flush().expect("flush");
     drop(j);
 
-    let after = readable_max_seq(dir.path()).expect("читается");
+    let after = strict_max_seq(dir.path()).expect("читается");
     assert!(
         after <= history_max + 10,
         "декларация НЕ должна иметь силы при читаемом хвосте: честный next_seq был бы \
@@ -399,4 +437,186 @@ fn op_4_open_with_never_moves_data_files() {
         after.iter().any(|n| n == DECL_APPLIED),
         "декларация обязана быть помечена применённой: {after:?}"
     );
+}
+
+// ═════════════════════════════════════════════════════════════════════════════════════
+// OP-6 (rev5) — `Unknown`: пол НЕИЗВЕСТЕН ⇒ декларация НЕ ПРОВЕРЯЕМА ⇒ ОТКАЗ
+// ═════════════════════════════════════════════════════════════════════════════════════
+
+/// Сегменты ЕСТЬ и непусты, но ни в одном не удалось прочитать ни одного валидного фрейма.
+/// Пол защиты неизвестен — значит проверить декларацию НЕЧЕМ.
+///
+/// **Почему отказ, а не «пол = 0».** `unwrap_or(0)` трактует отсутствие знания как
+/// разрешение: проходит ЛЮБОЙ `next_seq >= 1`, то есть escape-hatch выдаёт seq-reuse с
+/// формальным одобрением оператора — ровно то, от чего защищает весь M-49. Отказ не тупик:
+/// runbook требует восстановить сегмент из холодной копии либо отправить его в карантин
+/// РУКАМИ; после этого каталог переходит в `NoSegments`/`Known` и декларация проверяема.
+///
+/// **Деградированный вход (чек-лист `.claude/rules/testing.md`):** каталог смешанного
+/// формата — два усечённых `.zst` И один сырой сегмент с целым заголовком, но полностью
+/// забитым мусором телом. Реализация не имеет права «увидеть» пол ни по одному из них.
+#[test]
+fn op_6_unknown_floor_rejects_declaration_fail_closed() {
+    let src = tempfile::tempdir().expect("src");
+    {
+        let mut j = Journal::open_with(src.path(), cfg_small()).expect("open_with");
+        for i in 0..N_SMALL {
+            j.append(trade(i)).expect("append");
+        }
+        j.flush().expect("flush");
+    }
+    journal::compact_closed_segments(src.path(), 0, 3).expect("compact");
+
+    // Холодный restore: сжатая история + последний СЫРОЙ (активный) сегмент, меты нет.
+    let dir = tempfile::tempdir().expect("dst");
+    for n in ls(src.path()) {
+        if n.ends_with(".zst") || n.ends_with(".jrnl") {
+            std::fs::copy(src.path().join(&n), dir.path().join(&n)).expect("copy");
+        }
+    }
+
+    // Порча ВСЕГО каталога, двумя разными способами (асимметрия форматов):
+    // .zst — усечение потока; сырой — целый заголовок + мусор вместо тела.
+    let mut n_zst = 0;
+    let mut n_raw = 0;
+    for n in ls(dir.path()) {
+        if !is_segment_name(&n) {
+            continue;
+        }
+        let p = dir.path().join(&n);
+        if n.ends_with(".zst") {
+            let bytes = std::fs::read(&p).expect("read");
+            std::fs::write(&p, &bytes[..bytes.len() / 3]).expect("truncate");
+            n_zst += 1;
+        } else {
+            corrupt_body_after_header(&p);
+            n_raw += 1;
+        }
+    }
+
+    // ── Setup-guard'ы: фикстура обязана быть именно `Unknown`, а не «пусто» ──────────
+    let segs: Vec<String> = ls(dir.path())
+        .into_iter()
+        .filter(|n| is_segment_name(n))
+        .collect();
+    assert!(
+        segs.len() >= 2 && n_zst >= 1 && n_raw >= 1,
+        "фикстура: нужно ≥2 сегмента ОБОИХ форматов (zst={n_zst}, raw={n_raw}): {segs:?}"
+    );
+    for n in &segs {
+        let len = std::fs::metadata(dir.path().join(n)).expect("meta").len();
+        assert!(
+            len > 0,
+            "фикстура: сегмент {n} обязан быть НЕПУСТ (иначе это NoSegments)"
+        );
+    }
+    assert!(
+        tolerant_readable_max(dir.path()).is_none(),
+        "фикстура: в каталоге не должно читаться НИ ОДНОГО валидного фрейма — иначе это \
+         состояние Known, а не Unknown, и оракул проверяет не тот контракт"
+    );
+    assert!(
+        !dir.path().join("journal.meta").exists(),
+        "фикстура: меты быть не должно (холодный restore)"
+    );
+
+    write_decl(dir.path(), 5_000, "весь каталог нечитаем, объявляю позицию");
+
+    let err = Journal::open_with(dir.path(), cfg_small())
+        .err()
+        .unwrap_or_else(|| {
+            panic!(
+                "пол защиты НЕИЗВЕСТЕН (ни одного валидного фрейма во всём каталоге), но \
+                 декларация next_seq=5000 ПРИНЯТА.\n\
+                 ДОЛЖНО БЫТЬ: open_with = Err — проверить декларацию нечем, отсутствие знания \
+                 НЕ является разрешением (fail-closed, контракт rev5 состояние `Unknown`).\n\
+                 ПОЛУЧЕНО: Ok — значит пол схлопнут в 0 (`unwrap_or(0)`) и проходит ЛЮБОЙ \
+                 next_seq >= 1: escape-hatch выдаёт seq-reuse с формальным одобрением оператора.\n\
+                 Выход для оператора существует и описан в runbook: восстановить сегмент из \
+                 холодной копии либо убрать его в карантин РУКАМИ — тогда каталог станет \
+                 NoSegments/Known и декларация станет проверяемой."
+            )
+        });
+    let msg = err.to_string();
+    let low = msg.to_lowercase();
+    assert!(
+        low.contains("unknown") || low.contains("неизвест"),
+        "отказ обязан НАЗВАТЬ причину — пол неизвестен (ожидается «unknown» в тексте), \
+         иначе оператор не отличит его от обычного «хвост нечитаем» и пойдёт не по той \
+         ветке runbook'а: «{msg}»"
+    );
+    assert!(
+        msg.contains(DECL) || low.contains("declaration") || low.contains("next_seq"),
+        "отказ обязан связать причину с ДЕКЛАРАЦИЕЙ (что именно нельзя проверить): «{msg}»"
+    );
+    assert!(
+        !ls(dir.path()).iter().any(|n| n == DECL_APPLIED),
+        "непроверенная декларация не имеет права быть помеченной применённой"
+    );
+}
+
+// ═════════════════════════════════════════════════════════════════════════════════════
+// OP-7 (rev5) — ПАРНЫЙ vantage к OP-6: `NoSegments` — законный restore с нуля
+// ═════════════════════════════════════════════════════════════════════════════════════
+
+/// Без этого оракула фикс 5a может «пройти» ТОТАЛЬНЫМ fail-closed: отказывать всегда, когда
+/// пол не установлен, — включая пустой каталог. Это убило бы штатный первый запуск recorder'а
+/// и любой законный restore с нуля, то есть остановило бы сбор данных на проде.
+///
+/// Контракт: сегментов нет (или все нулевой длины) ⇒ пол законно равен 0 ⇒ старт разрешён.
+/// Декларация при этом ИНЕРТНА (хвоста, который нельзя прочитать, не существует — тот же
+/// принцип, что `op_3`): забытый файл не имеет права двигать позицию записи.
+///
+/// **Деградированный вход:** две границы — каталог совсем пустой И каталог с сегментом
+/// НУЛЕВОЙ ДЛИНЫ (recorder создал файл и упал до первой записи).
+#[test]
+fn op_7_no_segments_is_a_legitimate_start_not_a_refusal() {
+    for case in ["пустой каталог", "сегмент нулевой длины"] {
+        let dir = tempfile::tempdir().expect("dir");
+        if case == "сегмент нулевой длины" {
+            std::fs::write(dir.path().join("segment-00000000.jrnl"), b"").expect("write empty");
+        }
+        write_decl(dir.path(), 5_000, "забытая декларация прошлого инцидента");
+
+        let mut j = Journal::open_with(dir.path(), cfg_small()).unwrap_or_else(|e| {
+            panic!(
+                "{case}: сегментов нет ⇒ пол законно равен 0 ⇒ старт обязан быть РАЗРЕШЁН.\n\
+                 ПОЛУЧЕНО: Err: {e}\n\
+                 Ужесточение rev5 обязано различать «сегменты есть, но пол неизвестен» \
+                 (Unknown ⇒ отказ, op_6) и «сегментов нет» (NoSegments ⇒ старт с нуля). \
+                 Тотальный fail-closed останавливает штатный первый запуск recorder'а и \
+                 любой законный restore с нуля — то есть сбор данных на проде."
+            )
+        });
+        assert_eq!(
+            j.next_seq(),
+            0,
+            "{case}: при отсутствии сегментов запись обязана начинаться с 0; декларация \
+             ИНЕРТНА — нечитаемого хвоста нет, и забытый файл не имеет права двигать позицию \
+             (тот же принцип, что op_3)"
+        );
+        j.append(trade(1)).expect("append");
+        j.flush().expect("flush");
+        drop(j);
+
+        let files = ls(dir.path());
+        assert!(
+            files.iter().any(|n| n == DECL) && !files.iter().any(|n| n == DECL_APPLIED),
+            "{case}: неприменённая декларация обязана остаться на месте и НЕ помечаться \
+             применённой (её не применяли): {files:?}"
+        );
+        // Читаем ТЕРПИМЫМ путём: в кейсе «сегмент нулевой длины» пустой файл остаётся в
+        // каталоге, и строгий путь (`stream`) на нём отказывает — это его законное
+        // поведение и НЕ предмет M-49. Предмет здесь один: запись состоялась и легла в 0.
+        let max = journal::recover(dir.path())
+            .expect("recover")
+            .iter()
+            .map(|e| e.seq)
+            .max();
+        assert_eq!(
+            max,
+            Some(0),
+            "{case}: событие обязано быть записано с seq=0 — законный restore с нуля"
+        );
+    }
 }
