@@ -1440,12 +1440,15 @@ pub(crate) enum ReadableFloor {
 /// наружу отдают данные потребителям, здесь только внутренняя оценка границы «что уже точно
 /// занято»).
 ///
-/// M-49 rev5 (R-002, задача 5a): идём с КОНЦА (сегменты монотонны по `seq` — TD-030) и берём
-/// хвост ПЕРВОГО читаемого сегмента через `tail_last_seq_of` — тот же bounded-скан, что уже
-/// используется на пути отказа (задача 5b расширит это до терпимого скана читаемого ПРЕФИКСА
-/// повреждённого сегмента — R-002, Находка 1; сейчас, до 5b, сегмент с нечитаемым хвостом
-/// по-прежнему пропускается целиком). Если ни в одном непустом сегменте не нашлось ни одного
-/// валидного фрейма — `Unknown`, не `0` (задача 5a: устраняет `unwrap_or(0)`).
+/// M-49 rev5 (R-002, задача 5a/5b): идём с КОНЦА (сегменты монотонны по `seq` — TD-030); для
+/// КАЖДОГО непустого сегмента, начиная с последнего, пытаемся установить его максимальный
+/// ЧИТАЕМЫЙ `seq` потоковым терпимым сканом С НАЧАЛА файла (`tolerant_max_seq_from_start`,
+/// задача 5b) — а не отбрасываем сегмент целиком, если хвостовой `tail_last_seq_of` вернул
+/// `Err` (это и было блокером R-002: терпимый путь читал префикс, bounded-путь 4b — нет).
+/// Останавливаемся на первом сегменте, где скан нашёл ХОТЬ ОДИН валидный фрейм — более ранние
+/// сегменты по построению несут меньший `seq` (та же монотонность, что и раньше, отложена в
+/// TD-030). Если ни в одном непустом сегменте не нашлось ни одного валидного фрейма —
+/// `Unknown`, не `0`.
 fn readable_floor(dir: &Path) -> io::Result<ReadableFloor> {
     let mut saw_nonempty = false;
     for p in iter_segments_sorted(dir)?.into_iter().rev() {
@@ -1454,7 +1457,7 @@ fn readable_floor(dir: &Path) -> io::Result<ReadableFloor> {
             continue;
         }
         saw_nonempty = true;
-        if let Ok(Some(m)) = tail_last_seq_of(&p) {
+        if let Some(m) = tolerant_max_seq_from_start(&p)? {
             return Ok(ReadableFloor::Known(m));
         }
     }
@@ -1463,6 +1466,154 @@ fn readable_floor(dir: &Path) -> io::Result<ReadableFloor> {
     } else {
         Ok(ReadableFloor::NoSegments)
     }
+}
+
+/// M-49 rev5 (задача 5b): размер чанка потокового терпимого скана «с начала файла».
+/// Константа, НЕ зависит от размера сегмента — обязательное условие ограниченной памяти
+/// (`op_8`: пик НЕ растёт с размером сегмента).
+///
+/// Размер запроса ВАЖЕН для `.zst`, не только для памяти: на bit-rot внутри сжатого
+/// потока один `read()`-вызов декодера либо целиком успевает, либо целиком проваливается —
+/// байты, которые он декодировал бы ДО повреждённого блока внутри ЭТОГО ЖЕ вызова, наружу
+/// не возвращаются (стандартное поведение `zstd::Decoder`: партиального успеха внутри
+/// проваленного вызова не бывает). Чем МЕНЬШЕ запрашиваемый кусок, тем ближе граница отказа
+/// подходит к фактической границе порчи и тем ПОЛНЕЕ читаемый префикс. Измерено: 256 KiB
+/// терял ~130 KiB декодируемых данных относительно 64 KiB на одной и той же фикстуре
+/// (терялись реальные события, `op_2` регрессировал). 64 KiB — тот же размер, что
+/// `common::tolerant_bytes` (эталон оракулов) использует для decode-цикла; совпадение НЕ
+/// случайное — обе стороны обязаны сходиться к одному и тому же измеримому пределу.
+const READABLE_SCAN_CHUNK: usize = 64 * 1024;
+
+/// Максимальный «перенос» незавершённого фрейма через границу чтения. С запасом больше
+/// самого крупного реального события в системе (~2.4 KiB, `snap`-фикстура), но остаётся
+/// константой — не растёт с файлом. Значение крупнее этого порога трактуется как порча
+/// (абсурдная заявленная длина), а не как валидный фрейм, разрезанный чтением чанками.
+const READABLE_SCAN_MAX_CARRY: usize = 64 * 1024;
+
+/// Терпимый потоковый байт-ресинк-скан УЖЕ ОТКРЫТОГО источника событий (после заголовка):
+/// та же логика, что у `parse_event_frames`/хвостового скана в `tail_last_seq_of` (CRC-ошибка
+/// / оборванный фрейм / ошибка постpost-декодирования → сдвиг на 1 байт вперёд), но при
+/// ПОСТОЯННОЙ памяти — данные читаются и обрабатываются чанками
+/// (`READABLE_SCAN_CHUNK` + ≤`READABLE_SCAN_MAX_CARRY` НЕЗАВИСИМО от объёма источника, а не
+/// весь файл разом (`read_to_end`/`Vec<Event>`, класс TD-011).
+///
+/// Ошибка чтения источника (напр. обрыв zstd-потока на bit-rot) трактуется как конец
+/// доступных данных — то, что уже распознано ДО неё, остаётся в результате (читаемый
+/// ПРЕФИКС), это и есть терпимость 5b.
+fn resync_max_seq<R: Read>(mut r: R) -> Option<u64> {
+    let mut carry: Vec<u8> = Vec::new();
+    let mut max_seq: Option<u64> = None;
+    let mut chunk = vec![0u8; READABLE_SCAN_CHUNK];
+    loop {
+        // Обрыв потока (напр. bit-rot в zstd-стриме) трактуется как конец доступных данных.
+        let n = r.read(&mut chunk).unwrap_or_default();
+        let at_eof = n == 0;
+        if n > 0 {
+            carry.extend_from_slice(&chunk[..n]);
+        }
+
+        let mut i = 0usize;
+        loop {
+            if i + 8 > carry.len() {
+                break; // недостаточно байт даже на len+crc
+            }
+            let len = u32::from_le_bytes(carry[i..i + 4].try_into().unwrap()) as usize;
+            let frame_end = match i
+                .checked_add(4)
+                .and_then(|x| x.checked_add(len))
+                .and_then(|x| x.checked_add(4))
+            {
+                Some(e) => e,
+                None => {
+                    i += 1;
+                    continue;
+                }
+            };
+            if frame_end > carry.len() {
+                if at_eof || frame_end - i > READABLE_SCAN_MAX_CARRY {
+                    // Либо данных больше не будет (истинный EOF), либо заявленная длина
+                    // абсурдна для валидного события (заведомо порча, а не фрейм, разрезанный
+                    // границей чанка) — в обоих случаях ждать бессмысленно, ресинк на 1 байт.
+                    i += 1;
+                    continue;
+                }
+                // Возможно валидный фрейм, разрезанный чтением на чанки — дождаться ещё байт.
+                break;
+            }
+            let payload = &carry[i + 4..i + 4 + len];
+            let stored_crc = u32::from_le_bytes(carry[i + 4 + len..frame_end].try_into().unwrap());
+            if crc32fast::hash(payload) != stored_crc {
+                i += 1;
+                continue;
+            }
+            match postcard::from_bytes::<Event>(payload) {
+                Ok(ev) => {
+                    max_seq = Some(max_seq.map_or(ev.seq, |m: u64| m.max(ev.seq)));
+                    i = frame_end;
+                }
+                Err(_) => {
+                    i += 1;
+                }
+            }
+        }
+        if i > 0 {
+            carry.drain(0..i);
+        }
+        if at_eof {
+            break;
+        }
+    }
+    max_seq
+}
+
+/// M-49 rev5 (задача 5b): максимальный ЧИТАЕМЫЙ `seq` ОДНОГО сегмента — потоковый скан С
+/// НАЧАЛА файла при ПОСТОЯННОЙ памяти (без `Vec<Event>` на весь сегмент, без полной
+/// распаковки `.zst` — `resync_max_seq`). Терпимый: порча (битый CRC, оборванный фрейм, обрыв
+/// zstd-потока) останавливает скан НА МЕСТЕ порчи и возвращает максимум, накопленный ДО неё
+/// (читаемый ПРЕФИКС), а не `Err` — в отличие от `tail_last_seq_of` (хвостовое окно, прод-путь
+/// отказа `open_with`, НЕ меняется). Битый ЗАГОЛОВОК сегмента трактуется как «читаемого
+/// префикса нет» (`Ok(None)`) — без валидного заголовка формат фреймов ниже не установить
+/// достоверно.
+fn tolerant_max_seq_from_start(path: &Path) -> io::Result<Option<u64>> {
+    let is_zst = path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .is_some_and(is_compacted_name);
+
+    if is_zst {
+        let f = match File::open(path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        if f.metadata()?.len() == 0 {
+            return Ok(None);
+        }
+        let mut decoder = match zstd::Decoder::new(f) {
+            Ok(d) => d,
+            Err(_) => return Ok(None), // поток не открылся — читаемого префикса нет
+        };
+        if skip_v2_header_forward(&mut decoder).is_err() {
+            return Ok(None); // заголовок битый — читаемого префикса нет
+        }
+        return Ok(resync_max_seq(decoder));
+    }
+
+    let mut file = match File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    if file.metadata()?.len() == 0 {
+        return Ok(None);
+    }
+    if read_v2_header_and_skip(&mut file).is_err() {
+        return Ok(None); // заголовок битый — читаемого префикса нет
+    }
+    // Позиция файла — сразу после заголовка (магия+header) либо 0 (legacy, без магии):
+    // `read_v2_header_and_skip` уже это гарантирует (`Ok(Some(_))` либо `Ok(None)` с откатом).
+    let reader = BufReader::with_capacity(64 * 1024, file);
+    Ok(resync_max_seq(reader))
 }
 
 /// Пометить декларацию применённой: переименование `journal.force-next-seq.json` →
