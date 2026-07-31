@@ -73,6 +73,9 @@ fn ls(dir: &std::path::Path) -> Vec<String> {
     v
 }
 
+/// Максимальный `seq` каталога. Применяется ТОЛЬКО к ЗДОРОВЫМ каталогам: строгий путь
+/// чтения (`stream`) обязан оставаться fail-closed, и оракул не имеет права требовать от
+/// него терпимости (урок rev1: именно это требование вынудило ослабить `segments()`).
 fn readable_max_seq(dir: &std::path::Path) -> Option<u64> {
     journal::stream(dir, EpochFilter::All)
         .ok()?
@@ -105,13 +108,30 @@ fn restored_with_unreadable_tail() -> (tempfile::TempDir, u64) {
         .into_iter()
         .rfind(|n| n.ends_with(".zst"))
         .expect("есть .zst");
+
+    // ВАЖНО (rev2): эталон «максимального читаемого seq» снимается ДО внесения порчи.
+    // Первая редакция считала его ПОСЛЕ усечения и тем самым требовала от `stream`
+    // (строгий прод-путь) терпимости к битому каталогу — реализация могла пройти оракул
+    // только ослабив `segments()`, что и случилось (REJECT на PR-гейте M-49 rev1).
+    // Здоровые сегменты кроме жертвы дают тот же максимум: жертва — последняя по индексу.
+    let healthy_max = {
+        let mut segs = journal::list_segments(dst.path()).expect("segments до порчи");
+        segs.sort_by_key(|s| s.index);
+        let victim_idx = segs
+            .iter()
+            .position(|s| s.path.file_name().is_some_and(|n| n == victim.as_str()))
+            .expect("жертва в списке");
+        // last_seq предпоследнего = first_seq жертвы − 1
+        segs.get(victim_idx)
+            .map(|v| v.header.first_seq.saturating_sub(1))
+            .expect("first_seq жертвы")
+    };
+
     let p = dst.path().join(&victim);
     let bytes = std::fs::read(&p).expect("read");
     std::fs::write(&p, &bytes[..bytes.len() * 2 / 3]).expect("truncate");
 
-    // Максимум по ЧИТАЕМЫМ сегментам (усечённый не читается).
-    let readable = readable_max_seq(dst.path()).unwrap_or(0);
-    (dst, readable)
+    (dst, healthy_max)
 }
 
 fn write_decl(dir: &std::path::Path, next_seq: u64, reason: &str) {
