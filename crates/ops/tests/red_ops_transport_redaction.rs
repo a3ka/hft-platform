@@ -47,6 +47,9 @@ use std::net::TcpListener;
 
 use ops::transport::{TelegramTransport, Transport, TransportError, DEFAULT_TELEGRAM_API_BASE};
 
+mod common;
+use common::{raw_response, request_line, ProbeServer};
+
 /// Реалистичная форма токена Telegram (`<bot_id>:<base64url>`), с маркером внутри — чтобы
 /// «редакция», спрятавшая только числовой bot_id, не прошла.
 const TOKEN: &str = "7891234567:AAG-ORACLE-MARKER-SECRET-DO-NOT-LOG";
@@ -251,4 +254,259 @@ fn f2_watchdog_binary_never_prints_the_token_into_the_cron_log() {
         "вывод бинаря ops-watchdog (stdout+stderr, cron-лог)",
         &combined,
     );
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════
+// F-9 (BLOCKER, R-009) — редакция ТЕЛА неуспешного HTTP-ответа
+// ══════════════════════════════════════════════════════════════════════════════════════════
+//
+// Находка R-008 («токен течёт в теле не-2xx ответа») была починена коммитом `5d55914`, но
+// пришла БЕЗ оракула: reviewer в R-009 откатил фикс (мутация A — вернул `{status}: {body}` в
+// `TransportError`) и получил `passed=146 failed=0`, `verify → VERDICT: PASS`. То есть блокер
+// переоткрывается, и весь набор гейтов к этому слеп. Ниже — оракулы, закрывающие ровно это.
+//
+// # Почему прошлый набор промахнулся
+//
+// Все шесть оракулов выше бьют либо в МЁРТВЫЙ эндпоинт (connection refused → путь
+// `redact_reqwest_error`), либо в сервер, отдающий `200 OK`. Целое семейство «сервер ответил,
+// но не 2xx» — вне фикстуры. Это дословно «фикстура счастливого пути — дефект оракула»
+// (`.claude/rules/testing.md`): покрыт счастливый путь и ОДИН путь ошибки, а тот, в котором
+// блокер находили ДВАЖДЫ, — не покрыт.
+//
+// # Инвариант, который задают оракулы (спецификация)
+//
+// Ничто из полученного от удалённой стороны (тело ответа, его заголовки) не попадает в
+// `TransportError` ни в каком виде — ни целиком, ни усечённо. Наружу идёт ТОЛЬКО статус
+// (код + каноническая reason-phrase генерируются локально крейтом `http` по таблице RFC —
+// это не эхо удалённого текста) и статические строки. Причина: `TELEGRAM_BOT_TOKEN` вшит в
+// путь URL (требование Telegram Bot API), а прокси/CDN/captive-portal штатно возвращают эхо
+// строки запроса в теле ошибки — секрет живёт в ЗНАЧЕНИИ, а не в конкретном форматтере.
+//
+// # Чек-лист деградированного входа (`.claude/rules/testing.md`)
+// - **Множественность**: три кода (401/429/500) × два представления (`Display`/`Debug`);
+//   маркер И в теле, И в заголовке ответа; сквозной прогон бинаря шлёт несколько алертов.
+// - **Асимметрия**: маркер приходит ТОЛЬКО в теле/заголовке — статус при этом безобиден и
+//   обязан остаться в сообщении (иначе «редакция» = потеря диагностики).
+// - **Отсутствие**: не-2xx с ПУСТЫМ телом — не повод считать доставку удавшейся.
+// - **Границы**: тело в 1 МиБ, где эхо URL стоит В НАЧАЛЕ, а маркер — В КОНЦЕ: усечение с
+//   любой стороны («возьмём первые 200 байт для диагностики») всё равно течёт.
+// - **Прод-масштаб**: сквозной прогон настоящего бинаря `ops-watchdog` (stdout+stderr, как их
+//   сливает `scripts/watchdog_cron.sh`) + проверка файла состояния на диске.
+
+/// Маркер, который «удалённая сторона» кладёт в тело ответа.
+const BODY_MARKER: &str = "BODY-MARKER-FROM-REMOTE-DO-NOT-LOG";
+/// Маркер в ЗАГОЛОВКЕ ответа — заголовки тоже недоверенный вход.
+const HEADER_MARKER: &str = "HEADER-MARKER-FROM-REMOTE-DO-NOT-LOG";
+
+/// Тело, которое реально отдают прокси/captive-portal: собственный маркер + ЭХО строки
+/// запроса, в которой вшит `TELEGRAM_BOT_TOKEN` (`POST /bot<token>/sendMessage HTTP/1.1`).
+fn hostile_body(raw_request: &str) -> String {
+    format!(
+        "{{\"ok\":false,\"error_code\":401,\"description\":\"{BODY_MARKER}; request was: {}\"}}",
+        request_line(raw_request)
+    )
+}
+
+fn assert_no_remote_content(where_: &str, text: &str) {
+    assert_no_secret(where_, text);
+    assert!(
+        !text.contains(BODY_MARKER),
+        "{where_} содержит содержимое ТЕЛА ответа удалённой стороны (R-009 F-9): {text}"
+    );
+    assert!(
+        !text.contains(HEADER_MARKER),
+        "{where_} содержит содержимое ЗАГОЛОВКА ответа удалённой стороны (R-009 F-9): {text}"
+    );
+}
+
+/// ГЛАВНЫЙ оракул F-9. Мутация A из R-009 (`Err(Http(format!("...{status}: {body}")))`)
+/// обязана его валить.
+#[test]
+fn f9_non_2xx_response_body_never_reaches_the_transport_error() {
+    for (code, reason) in [
+        (401, "Unauthorized"),
+        (429, "Too Many Requests"),
+        (500, "Internal Server Error"),
+    ] {
+        let server = ProbeServer::start(move |req| {
+            raw_response(
+                &format!("{code} {reason}"),
+                &[("X-Probe-Marker", HEADER_MARKER)],
+                &hostile_body(req),
+            )
+        });
+        let transport = TelegramTransport::with_credentials_and_endpoint(
+            Some((TOKEN.to_string(), CHAT_ID.to_string())),
+            &server.url(),
+        );
+
+        let err = transport
+            .send("[CRITICAL] WD-HB-STALE — оракул F-9")
+            .expect_err("не-2xx ответ обязан быть ошибкой доставки, а не тихим успехом");
+
+        // (1) Анти-плацебо: пройден именно путь «сервер ОТВЕТИЛ не-2xx», а не connect-error.
+        assert_eq!(
+            server.hits(),
+            1,
+            "запрос не доехал до сервера — оракул проверяет не тот путь"
+        );
+        let display = err.to_string();
+        assert!(
+            display.contains(&code.to_string()),
+            "в ошибке нет статуса {code} — значит сработала другая ветка, оракул недействителен: {display}"
+        );
+
+        // (2) Собственно инвариант — оба представления ошибки.
+        assert_no_remote_content(
+            &format!("TransportError::Display (статус {code})"),
+            &display,
+        );
+        assert_no_remote_content(
+            &format!("TransportError::Debug (статус {code})"),
+            &format!("{err:?}"),
+        );
+    }
+}
+
+/// Границы + прод-масштаб: тело в 1 МиБ, эхо URL в НАЧАЛЕ, маркер в КОНЦЕ. «Редакция»,
+/// сводящаяся к усечению («первые/последние N байт для диагностики»), течёт в обе стороны.
+/// Плюс ограничение размера самого сообщения об ошибке — иначе мегабайт недоверенного текста
+/// уезжает в cron-лог даже без секрета.
+#[test]
+fn f9_huge_hostile_body_is_not_read_into_the_error_even_truncated() {
+    let server = ProbeServer::start(|req| {
+        let head = format!("request was: {}", request_line(req));
+        let body = format!("{head}{}{BODY_MARKER}", "x".repeat(1_000_000));
+        raw_response("502 Bad Gateway", &[], &body)
+    });
+    let transport = TelegramTransport::with_credentials_and_endpoint(
+        Some((TOKEN.to_string(), CHAT_ID.to_string())),
+        &server.url(),
+    );
+
+    let err = transport
+        .send("[CRITICAL] WD-HB-STALE — оракул F-9")
+        .unwrap_err();
+    assert_eq!(server.hits(), 1, "запрос не доехал — оракул недействителен");
+    let display = err.to_string();
+    assert!(display.contains("502"), "не та ветка ошибки: {display}");
+    assert_no_remote_content("TransportError::Display (тело 1 МиБ)", &display);
+    assert_no_remote_content("TransportError::Debug (тело 1 МиБ)", &format!("{err:?}"));
+    assert!(
+        display.len() < 500,
+        "сообщение об ошибке несёт {} байт — в него затянуто тело ответа удалённой стороны",
+        display.len()
+    );
+}
+
+/// Отсутствие (`testing.md` п.3): у не-2xx ответа НЕТ тела. Это не повод считать доставку
+/// удавшейся и не повод выродить ошибку в заглушку — статус обязан остаться в сообщении.
+#[test]
+fn f9_non_2xx_with_empty_body_is_still_a_diagnosable_failure() {
+    let server = ProbeServer::start(|_| raw_response("403 Forbidden", &[], ""));
+    let transport = TelegramTransport::with_credentials_and_endpoint(
+        Some((TOKEN.to_string(), CHAT_ID.to_string())),
+        &server.url(),
+    );
+
+    let err = transport
+        .send("[CRITICAL] WD-HB-STALE — оракул F-9")
+        .expect_err("403 с пустым телом — всё ещё провал доставки");
+    assert_eq!(server.hits(), 1);
+    let display = err.to_string();
+    assert!(display.contains("403"), "статус потерян: {display}");
+    assert!(
+        display.to_lowercase().contains("telegram"),
+        "по ошибке не видно, какой транспорт упал: {display}"
+    );
+    assert_no_remote_content("TransportError (пустое тело)", &display);
+}
+
+/// ПАРНЫЙ VANTAGE: тот же враждебный контент в теле, но статус 2xx — доставка удалась,
+/// ошибки нет. Ловит «фикс» вида «считать любой ответ провалом».
+#[test]
+fn f9_hostile_body_on_success_status_is_still_a_successful_delivery() {
+    let server = ProbeServer::start(|req| {
+        raw_response(
+            "200 OK",
+            &[("X-Probe-Marker", HEADER_MARKER)],
+            &hostile_body(req),
+        )
+    });
+    let transport = TelegramTransport::with_credentials_and_endpoint(
+        Some((TOKEN.to_string(), CHAT_ID.to_string())),
+        &server.url(),
+    );
+    transport
+        .send("[CRITICAL] WD-SEQ-STALLED — оракул F-9, успешная доставка")
+        .expect("2xx обязан оставаться успехом, что бы ни лежало в теле");
+    assert_eq!(server.hits(), 1);
+}
+
+/// СКВОЗНОЙ оракул F-9 — дыра R-008 была именно в том, что библиотечная половина проходила,
+/// а путь целиком — нет. Гоняется НАСТОЯЩИЙ бинарь `ops-watchdog` против сервера, который
+/// отдаёт 401 с враждебным телом и заголовком; проверяются ОБА потока (cron сливает их в один
+/// файл) И файл состояния на диске.
+#[test]
+fn f9_watchdog_binary_never_logs_the_non_2xx_response_body() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let heartbeat_path = dir.path().join("recorder.heartbeat");
+    let state_path = dir.path().join("watchdog.state.json");
+    // Прод-форма heartbeat'а (замер VPS 2026-07-31); ts_wall_ms — эпоха, т.е. заведомо протух.
+    std::fs::write(
+        &heartbeat_path,
+        r#"{"events":3456495,"free_bytes":83116052480,"min_free_bytes":10737418240,"next_seq":140762639,"segment_index":145,"ts_wall_ms":1,"writable":true}"#,
+    )
+    .expect("write heartbeat");
+
+    let server = ProbeServer::start(move |req| {
+        raw_response(
+            "401 Unauthorized",
+            &[("X-Probe-Marker", HEADER_MARKER)],
+            &hostile_body(req),
+        )
+    });
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_ops-watchdog"))
+        .env("WATCHDOG_HEARTBEAT_PATH", &heartbeat_path)
+        .env("WATCHDOG_CRON_DIR", dir.path())
+        .env("WATCHDOG_STATE_PATH", &state_path)
+        .env("WATCHDOG_CONTAINERS", "")
+        .env("WATCHDOG_HOST_LABEL", "oracle-f9")
+        .env("TELEGRAM_BOT_TOKEN", TOKEN)
+        .env("TELEGRAM_CHAT_ID", CHAT_ID)
+        .env("TELEGRAM_API_BASE", server.url())
+        .output()
+        .expect("бинарь ops-watchdog обязан запускаться");
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    server.settle();
+
+    // (1) Анти-плацебо: алерт сформирован, запрос ушёл, сервер ответил НЕ-2xx и это видно.
+    assert!(
+        combined.contains("WD-HB-STALE"),
+        "протухший heartbeat не дал алерта — сквозной путь не пройден:\n{combined}"
+    );
+    assert!(
+        server.hits() >= 1,
+        "бинарь не обратился к Telegram API — путь доставки не пройден:\n{combined}"
+    );
+    assert!(
+        combined.contains("401"),
+        "в выводе нет следа неуспешного СТАТУСА — пройдена другая ветка ошибки (connect?), \
+         оракул недействителен:\n{combined}"
+    );
+
+    // (2) Инвариант — вывод бинаря.
+    assert_no_remote_content(
+        "вывод бинаря ops-watchdog (stdout+stderr, cron-лог)",
+        &combined,
+    );
+    // (3) Инвариант — файл состояния (живёт на диске рядом с cron-маркерами и переживает прогон).
+    let state = std::fs::read_to_string(&state_path).expect("файл состояния обязан быть записан");
+    assert_no_remote_content("watchdog.state.json", &state);
 }
