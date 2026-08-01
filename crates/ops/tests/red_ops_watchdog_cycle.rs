@@ -1156,3 +1156,272 @@ fn state_file_stays_bounded_over_a_week_of_cron_runs() {
         "файл состояния вырос до {len} байт за неделю запусков — история не ограничена"
     );
 }
+
+// ══════════════════════════════════════════════════════════════════════════════════════════
+// F-10 (BLOCKER, R-009) — регрессия `next_seq` как ОТДЕЛЬНОЕ событие + сброс якоря
+// ══════════════════════════════════════════════════════════════════════════════════════════
+//
+// Находка R-008 F-8 («уменьшение `next_seq` стопорит `WD-SEQ-STALLED` навечно») починена
+// коммитом `62f56cd` — но БЕЗ оракула. Reviewer в R-009 это показал двумя мутациями:
+//   * **B** — ветка регрессии удалена целиком: `passed=146 failed=0`, `verify` упал ТОЛЬКО на
+//     clippy (неиспользованный импорт). Линтер — не поведенческий гейт.
+//   * **B2** — ветка на месте, убраны ДВЕ строки сброса якоря (`seq_progress_heartbeat`/
+//     `seq_progress_check_ms` на текущее значение), то есть ровно ядро фикса: линтер доволен,
+//     `passed=146 failed=0`, `verify → VERDICT: PASS`.
+//
+// Оракулы ниже обязаны падать на ОБЕИХ мутациях, поэтому смотрят на ДВА разных наблюдаемых
+// следствия:
+//   1. на такте регрессии обязан прийти ИМЕННО `WD-SEQ-REGRESSED` (мутация B убирает его);
+//   2. регрессия — СОБЫТИЕ, а не состояние: на последующих тактах нормального роста от нового
+//      (низкого) значения не должно быть НИ повторных `WD-SEQ-REGRESSED`, НИ `WD-SEQ-STALLED`.
+//      Мутация B2 даёт бесконечный поток `WD-SEQ-REGRESSED` (якорь остался на старом высоком
+//      значении, каждый следующий сэмпл «меньше якоря»); удаление ветки даёт бесконечный
+//      `WD-SEQ-STALLED`. На проде `next_seq ≈ 1.4e8` при 96 ev/s — догонять старое значение
+//      ~17 суток, то есть ~17 суток непрерывного ложного CRITICAL. Сторож, который так себя
+//      ведёт, выключают — а выключенный сторож равен отсутствующему.
+//
+// Почему это тревога, а не тихая нормализация: уменьшение `next_seq` — признак seq-reuse
+// (пересозданный/восстановленный из бэкапа том, откат сегмента), та же категория риска, что
+// закрывали M-49/M-50.
+//
+// # Чек-лист деградированного входа (`.claude/rules/testing.md`)
+// - **Асимметрия**: регрессия наступает ПОСЛЕ нормального роста, а не с первого такта;
+//   меняется только `next_seq` (heartbeat свежий, диск ровный, контейнеры healthy).
+// - **Множественность**: ДВЕ независимые регрессии внутри одного 30-минутного дедуп-окна —
+//   обе обязаны быть доставлены (это разные факты, а не повтор одного).
+// - **Отсутствие**: нечитаемый heartbeat между тактами не создаёт ложной регрессии и не
+//   стирает якорь — регрессия за ним всё равно детектируется.
+// - **Границы**: `next_seq` РАВЕН якорю — это застой (`WD-SEQ-STALLED`), а не регрессия;
+//   реализация через `<=` вместо `<` заглушила бы детектор застоя целиком.
+// - **Прод-масштаб**: 24 часа (288 запусков cron'а) после регрессии на прод-числах и
+//   прод-темпе; состояние проходит через JSON на каждом такте (`CronSim::tick` = путь `main()`).
+
+/// Значение `next_seq` сразу после пересоздания тома журнала: сбор стартует почти с нуля,
+/// а старый якорь стоит на прод-масштабе (1.4e8).
+const RECREATED_VOLUME_SEQ: u64 = 1_024;
+
+/// Прогресс `next_seq` за один 5-минутный такт при прод-темпе 96 ev/s.
+const SEQ_PER_TICK: u64 = EVENTS_PER_SEC * (TICK_5MIN as u64) / 1000;
+
+/// Прогнать `ticks` тактов нормального роста от `start_seq`, вернуть (время следующего такта,
+/// достигнутый `next_seq`, суммарные счётчики сработавших seq-инцидентов).
+fn run_growth(sim: &CronSim, mut now: i64, mut seq: u64, ticks: usize) -> (i64, u64, usize, usize) {
+    let (mut regressed, mut stalled) = (0usize, 0usize);
+    for _ in 0..ticks {
+        let out = sim.tick(&inputs_with_hb(fresh_hb(now, seq, PROD_FREE), now), now);
+        regressed += fired(&out, Incident::SeqRegressed).len();
+        stalled += fired(&out, Incident::SeqStalled).len();
+        now += TICK_5MIN;
+        seq += SEQ_PER_TICK;
+    }
+    (now, seq, regressed, stalled)
+}
+
+/// ГЛАВНЫЙ оракул F-10 (часть 1): уменьшение `next_seq` распознаётся как СОБСТВЕННЫЙ
+/// инцидент `WD-SEQ-REGRESSED` уровня CRITICAL — не как застой и не как «всё хорошо».
+/// Мутация B (удаление ветки) валит этот тест.
+#[test]
+fn f10_next_seq_regression_fires_its_own_critical_incident_not_a_stall() {
+    let sim = CronSim::new();
+    let (now, seq_before, _, _) = run_growth(&sim, START_02_UTC, PROD_SEQ, 3);
+
+    // Том журнала пересоздан/восстановлен из бэкапа — `next_seq` стартовал заново.
+    let out = sim.tick(
+        &inputs_with_hb(fresh_hb(now, RECREATED_VOLUME_SEQ, PROD_FREE), now),
+        now,
+    );
+
+    let regressed = delivered(&out, Incident::SeqRegressed);
+    assert_eq!(
+        regressed.len(),
+        1,
+        "уменьшение next_seq ({} → {RECREATED_VOLUME_SEQ}) не дало WD-SEQ-REGRESSED — признак \
+         seq-reuse проглочен (R-008 F-8 / R-009 F-10)",
+        seq_before - SEQ_PER_TICK
+    );
+    assert_eq!(
+        regressed[0].level,
+        Level::Critical,
+        "регрессия next_seq — это CRITICAL (та же категория риска, что M-49/M-50 seq-reuse)"
+    );
+    assert!(
+        fired(&out, Incident::SeqStalled).is_empty(),
+        "такт регрессии переинтерпретирован как застой — это разные факты о мире: {:?}",
+        fired(&out, Incident::SeqStalled)
+    );
+    let msg = &regressed[0].message;
+    assert!(
+        msg.contains(&(seq_before - SEQ_PER_TICK).to_string())
+            && msg.contains(&RECREATED_VOLUME_SEQ.to_string()),
+        "сообщение не называет ОБА значения (было → стало), разбирать инцидент нечем: {msg}"
+    );
+}
+
+/// ГЛАВНЫЙ оракул F-10 (часть 2) — ЯДРО фикса, ровно мутация B2 reviewer'а.
+///
+/// После регрессии якорь прогресса обязан немедленно переехать на новое (меньшее) значение.
+/// Тогда нормальный рост от нового старта — это ТИШИНА. Без сброса якоря каждый следующий
+/// сэмпл «меньше якоря» → бесконечный поток CRITICAL (мутация B2); при удалённой ветке →
+/// бесконечный ложный `WD-SEQ-STALLED` (мутация B). Прод-масштаб: 24 часа, 288 запусков cron'а.
+#[test]
+fn f10_after_regression_normal_growth_from_the_new_baseline_stays_silent_for_a_day() {
+    let sim = CronSim::new();
+    let (now, _, _, _) = run_growth(&sim, START_02_UTC, PROD_SEQ, 3);
+
+    // Такт регрессии — здесь тревога законна и проверена тестом выше.
+    let out = sim.tick(
+        &inputs_with_hb(fresh_hb(now, RECREATED_VOLUME_SEQ, PROD_FREE), now),
+        now,
+    );
+    assert_eq!(
+        delivered(&out, Incident::SeqRegressed).len(),
+        1,
+        "предусловие оракула не выполнено: регрессия не сработала — см. \
+         f10_next_seq_regression_fires_its_own_critical_incident_not_a_stall"
+    );
+
+    // 24 часа нормального роста от НОВОГО (низкого) значения — 288 запусков cron'а.
+    let ticks_per_day = (24 * 3_600_000) / TICK_5MIN as usize;
+    let (_, seq_end, regressed_after, stalled_after) = run_growth(
+        &sim,
+        now + TICK_5MIN,
+        RECREATED_VOLUME_SEQ + SEQ_PER_TICK,
+        ticks_per_day,
+    );
+
+    assert_eq!(
+        regressed_after, 0,
+        "WD-SEQ-REGRESSED повторился {regressed_after} раз за сутки нормального роста — якорь не \
+         сброшен на текущее значение (R-009 F-10, мутация B2): регрессия превращена из СОБЫТИЯ в \
+         вечное состояние"
+    );
+    assert_eq!(
+        stalled_after, 0,
+        "WD-SEQ-STALLED сработал {stalled_after} раз за сутки РАСТУЩЕГО сбора — детектор гонится \
+         за недостижимым старым значением (на проде это ~17 суток ложного CRITICAL)"
+    );
+    assert!(
+        seq_end < PROD_SEQ,
+        "сценарий выродился: сбор догнал старое значение ({seq_end} ≥ {PROD_SEQ}) — оракул \
+         перестал давить на инвариант, увеличьте разрыв"
+    );
+}
+
+/// Границы (`testing.md` п.4): `next_seq` РАВЕН якорю — это застой, а НЕ регрессия. Ловит
+/// «фикс» через `<=` вместо `<`: он бы объявлял регрессией любой застой и тем самым глушил
+/// `WD-SEQ-STALLED` — то есть чинил бы F-8 ценой возврата F-1.
+#[test]
+fn f10_flat_next_seq_is_a_stall_not_a_regression() {
+    let sim = CronSim::new();
+    let (mut now, seq, _, _) = run_growth(&sim, START_02_UTC, PROD_SEQ, 3);
+    let frozen = seq - SEQ_PER_TICK; // сбор встал ровно на достигнутом значении
+
+    let (mut stalled, mut regressed) = (0usize, 0usize);
+    for _ in 0..6 {
+        // 30 минут заморозки
+        let out = sim.tick(&inputs_with_hb(fresh_hb(now, frozen, PROD_FREE), now), now);
+        stalled += fired(&out, Incident::SeqStalled).len();
+        regressed += fired(&out, Incident::SeqRegressed).len();
+        now += TICK_5MIN;
+    }
+
+    assert!(
+        stalled > 0,
+        "замороженный next_seq не дал WD-SEQ-STALLED — детектор застоя выключен (регресс к F-1)"
+    );
+    assert_eq!(
+        regressed, 0,
+        "застой (next_seq РАВЕН якорю) объявлен регрессией {regressed} раз — реализация \
+         использует `<=` вместо `<`"
+    );
+}
+
+/// Множественность (`testing.md` п.2): ДВЕ независимые регрессии внутри ОДНОГО 30-минутного
+/// дедуп-окна. Это два разных факта (второе уменьшение — уже относительно сброшенного якоря),
+/// обе обязаны быть ДОСТАВЛЕНЫ. Ловит «фикс», который сбрасывает якорь, но глушит второе
+/// событие остаточным окном подавления (та же ловушка, что F-7 с рестартами).
+#[test]
+fn f10_two_independent_regressions_within_one_dedup_window_are_both_delivered() {
+    let sim = CronSim::new();
+    let (mut now, _, _, _) = run_growth(&sim, START_02_UTC, PROD_SEQ, 3);
+    let mut delivered_total = 0usize;
+
+    // Регрессия №1.
+    let out = sim.tick(
+        &inputs_with_hb(fresh_hb(now, RECREATED_VOLUME_SEQ, PROD_FREE), now),
+        now,
+    );
+    delivered_total += delivered(&out, Incident::SeqRegressed).len();
+    now += TICK_5MIN;
+
+    // 15 минут нормального роста — тишина (внутри дедуп-окна 30 мин).
+    let (next_now, seq, regressed_between, _) =
+        run_growth(&sim, now, RECREATED_VOLUME_SEQ + SEQ_PER_TICK, 3);
+    assert_eq!(
+        regressed_between, 0,
+        "между регрессиями сторож шумел — якорь не сброшен (мутация B2)"
+    );
+
+    // Регрессия №2 — том пересоздан ВТОРОЙ раз, всё ещё внутри 30-минутного окна.
+    let out = sim.tick(
+        &inputs_with_hb(fresh_hb(next_now, 512, PROD_FREE), next_now),
+        next_now,
+    );
+    delivered_total += delivered(&out, Incident::SeqRegressed).len();
+    assert!(
+        seq > 512,
+        "сценарий выродился: второе значение не меньше достигнутого ({seq})"
+    );
+
+    assert_eq!(
+        delivered_total, 2,
+        "две независимые регрессии дали {delivered_total} доставленных алертов — второе \
+         (актуальное!) событие проглочено дедуп-окном первого"
+    );
+}
+
+/// Отсутствие (`testing.md` п.3): на одном такте heartbeat нечитаем (файл читается в момент
+/// записи / том отвалился). Это «не смог прочитать», а не «мир изменился»: якорь обязан
+/// пережить такой такт, и регрессия ЗА НИМ обязана быть замечена.
+#[test]
+fn f10_unreadable_heartbeat_tick_neither_fakes_nor_hides_a_regression() {
+    let sim = CronSim::new();
+    let (mut now, seq_before, _, _) = run_growth(&sim, START_02_UTC, PROD_SEQ, 3);
+
+    // Такт без heartbeat'а: сам по себе не регрессия.
+    let out = sim.tick(&inputs_with_hb(None, now), now);
+    assert!(
+        fired(&out, Incident::SeqRegressed).is_empty(),
+        "нечитаемый heartbeat выдан за регрессию next_seq — додумывание за источник"
+    );
+    now += TICK_5MIN;
+
+    // Регрессия сразу после пропуска — якорь обязан быть цел.
+    let out = sim.tick(
+        &inputs_with_hb(fresh_hb(now, RECREATED_VOLUME_SEQ, PROD_FREE), now),
+        now,
+    );
+    assert_eq!(
+        delivered(&out, Incident::SeqRegressed).len(),
+        1,
+        "регрессия после нечитаемого такта не замечена — якорь потерян на пропуске \
+         (было {} → стало {RECREATED_VOLUME_SEQ})",
+        seq_before - SEQ_PER_TICK
+    );
+}
+
+/// ПАРНЫЙ VANTAGE: здоровый растущий сбор НИКОГДА не даёт `WD-SEQ-REGRESSED`. Ловит «фикс»
+/// вида «слать регрессию всегда» и любую путаницу знака сравнения.
+#[test]
+fn f10_healthy_growth_never_fires_seq_regressed() {
+    let sim = CronSim::new();
+    let (_, _, regressed, stalled) = run_growth(&sim, START_02_UTC, PROD_SEQ, 24); // 2 часа
+    assert_eq!(
+        regressed, 0,
+        "здоровый растущий сбор дал {regressed} ложных WD-SEQ-REGRESSED"
+    );
+    assert_eq!(
+        stalled, 0,
+        "здоровый растущий сбор дал {stalled} ложных WD-SEQ-STALLED"
+    );
+}
