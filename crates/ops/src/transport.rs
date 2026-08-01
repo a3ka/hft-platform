@@ -46,24 +46,50 @@ impl Transport for StdoutTransport {
     }
 }
 
+/// Дефолтный (продовый) базовый URL Telegram Bot API. Подменяемость (см.
+/// `with_credentials_and_endpoint`) нужна ТОЛЬКО тестам — прод обязан остаться на этом
+/// адресе (R-005 F-2, `f2_default_endpoint_is_production_telegram`).
+pub const DEFAULT_TELEGRAM_API_BASE: &str = "https://api.telegram.org";
+
 /// Учётные данные Telegram Bot API. `None` — транспорт не сконфигурирован (нет токена).
 pub struct TelegramTransport {
     credentials: Option<(String, String)>,
+    api_base: String,
     client: reqwest::blocking::Client,
 }
 
 impl TelegramTransport {
     /// Читает `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` из окружения процесса. Обе переменные
-    /// обязаны быть непустыми, иначе транспорт считается НЕ сконфигурированным.
+    /// обязаны быть непустыми, иначе транспорт считается НЕ сконфигурированным. Также читает
+    /// необязательный `TELEGRAM_API_BASE` (по умолчанию — прод-адрес Telegram) — это то, что
+    /// делает сквозной оракул F-2 (`red_ops_transport_redaction.rs`) проверяемым: он
+    /// подставляет сюда мёртвый эндпоинт и гоняет РЕАЛЬНЫЙ бинарь `ops-watchdog`, а не только
+    /// библиотечную половину.
     pub fn from_env() -> Self {
-        Self::with_credentials(read_env_credentials())
+        let api_base = std::env::var("TELEGRAM_API_BASE")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| DEFAULT_TELEGRAM_API_BASE.to_string());
+        Self::with_credentials_and_endpoint(read_env_credentials(), &api_base)
     }
 
     /// Явный конструктор — основной путь тестирования (не зависит от того, стоит ли токен
     /// в env машины, на которой гоняются тесты; `from_env` — тонкая обёртка над этим).
+    /// Эндпоинт — продовый (`DEFAULT_TELEGRAM_API_BASE`); для подмены см.
+    /// `with_credentials_and_endpoint`.
     pub fn with_credentials(credentials: Option<(String, String)>) -> Self {
+        Self::with_credentials_and_endpoint(credentials, DEFAULT_TELEGRAM_API_BASE)
+    }
+
+    /// Полный конструктор с подменяемым базовым URL Telegram Bot API. Без него путь доставки
+    /// (и путь его сетевой ошибки — R-005 F-2) непроверяем офлайн.
+    pub fn with_credentials_and_endpoint(
+        credentials: Option<(String, String)>,
+        api_base: &str,
+    ) -> Self {
         Self {
             credentials,
+            api_base: api_base.to_string(),
             client: reqwest::blocking::Client::builder()
                 .timeout(Duration::from_secs(10))
                 .build()
@@ -99,13 +125,13 @@ impl Transport for TelegramTransport {
             );
             return Ok(());
         };
-        let url = format!("https://api.telegram.org/bot{token}/sendMessage");
+        let url = format!("{}/bot{token}/sendMessage", self.api_base);
         let resp = self
             .client
             .post(&url)
             .form(&[("chat_id", chat_id.as_str()), ("text", message)])
             .send()
-            .map_err(|e| TransportError::Http(e.to_string()))?;
+            .map_err(|e| TransportError::Http(redact_reqwest_error(&e)))?;
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().unwrap_or_default();
@@ -115,4 +141,38 @@ impl Transport for TelegramTransport {
         }
         Ok(())
     }
+}
+
+/// R-005 F-2: `reqwest::Error::to_string()`/`{:?}` дописывают URL целиком (`" for url (...)"`,
+/// `reqwest-0.12.28/src/error.rs:267-269`) — а URL здесь несёт `TELEGRAM_BOT_TOKEN` вшитым в
+/// путь (`/bot<token>/sendMessage`, требование самого Telegram Bot API). Значит НИКАКОЙ путь
+/// печати `reqwest::Error` (ни `{e}`, ни `{e:?}`, ни любой будущий) не безопасен — секрет
+/// живёт в значении ошибки, а не в конкретном форматтере.
+///
+/// Поэтому эта функция вообще НЕ читает содержимое `e` (ни `Display`, ни `Debug`, ни `source()`
+/// — источник у `reqwest::Error` тоже может нести URL на некоторых бэкендах, доверять нельзя):
+/// секрет технически не может утечь через классификатор, который построен целиком из
+/// статических строк. Диагностическая ценность — категория сбоя (`timeout`/`connect`/...),
+/// этого достаточно, чтобы отличить "DNS/сеть недоступны" от "бот API вернул ошибку" —
+/// последнее в редакции не нуждается (`Telegram API вернул {status}: {body}` не содержит URL).
+fn redact_reqwest_error(e: &reqwest::Error) -> String {
+    let kind = if e.is_timeout() {
+        "timeout"
+    } else if e.is_connect() {
+        "connect"
+    } else if e.is_request() {
+        "request"
+    } else if e.is_body() {
+        "body"
+    } else if e.is_decode() {
+        "decode"
+    } else if e.is_redirect() {
+        "redirect"
+    } else {
+        "unknown"
+    };
+    format!(
+        "telegram transport error ({kind}): не удалось доставить сообщение в Telegram Bot API \
+         (детали редактированы — R-005 F-2, секрет живёт в URL значения ошибки)"
+    )
 }
