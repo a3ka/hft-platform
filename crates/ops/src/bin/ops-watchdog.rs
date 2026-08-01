@@ -1,12 +1,14 @@
 //! `ops-watchdog` — одноразовый cron-бинарь (founder-задача 2026-07-31, мост к M-43 task#3
 //! "минимальный cron-watchdog→Telegram"). Читает `recorder.heartbeat` + cron-маркеры
-//! (`/var/lib/hft/*.last-success`) + `docker ps`/`docker inspect`, прогоняет их через чистые
-//! детекторы `ops::watchdog`, дедуплицирует через `ops::state::WatchdogState`, форматирует
-//! (`ops::format`) и шлёт в оба транспорта (`StdoutTransport` — всегда, лог cron'а;
-//! `TelegramTransport` — если сконфигурирован).
+//! (`/var/lib/hft/*.last-success` + `*.alert`, R-005 F-6) + `docker ps`/`docker inspect`,
+//! собирает их в `ops::watchdog_cycle::CycleInputs` и зовёт `ops::watchdog_cycle::run_cycle` —
+//! ВСЯ диагностическая логика живёт там (юнит-тестируема сценарно, `red_ops_watchdog_cycle.rs`
+//! — R-005 F-10: старая версия держала склейку прямо в бинаре, что делало её недостижимой
+//! для `tests/`).
 //!
-//! ВСЁ I/O (файлы, `docker`, HTTP) — ЗДЕСЬ. Библиотечные модули `ops::watchdog`/`ops::format`
-//! остаются чистыми и юнит-тестируемыми без реальной машины (см. их doc-комментарии).
+//! ВСЁ I/O (файлы, `docker`, HTTP) — ЗДЕСЬ. Библиотечные модули `ops::watchdog`/
+//! `ops::watchdog_cycle`/`ops::format` остаются чистыми и юнит-тестируемыми без реальной
+//! машины (см. их doc-комментарии).
 //!
 //! Установка в cron/`/var/lib/hft` — задача reviewer/founder после ревью (границы задачи);
 //! этот бинарь и `scripts/watchdog_cron.sh` — готовый к установке артефакт, но НЕ
@@ -16,13 +18,15 @@
 //! `docs/SESSION-HANDOFF.md §7`):
 //!   - `WATCHDOG_HEARTBEAT_PATH` (default
 //!     `/var/lib/docker/volumes/hft-platform_journal-data/_data/recorder.heartbeat`)
-//!   - `WATCHDOG_CRON_DIR` (default `/var/lib/hft`) — сканирует
-//!     `compaction.last-success`, `gateway-checkpoint.last-success`, `retention.last-success`
+//!   - `WATCHDOG_CRON_DIR` (default `/var/lib/hft`) — сканирует пары
+//!     `<job>.last-success`/`<job>.alert` для `compaction`/`gateway-checkpoint`/`retention`
+//!     (R-005 F-6: оба маркера, не только позитивный).
 //!   - `WATCHDOG_STATE_PATH` (default `/var/lib/hft/watchdog.state.json`)
 //!   - `WATCHDOG_CONTAINERS` (default `hft-recorder,hft-gateway-serve`, запятая-разделитель)
 //!   - `WATCHDOG_HOST_LABEL` (default `hft-platform-vps`)
 //!   - `WATCHDOG_DEDUP_WINDOW_MS` (default `ops::state::DEFAULT_DEDUP_WINDOW_MS` = 30 мин)
-//!   - `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` — см. `ops::transport::TelegramTransport`.
+//!   - `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` / `TELEGRAM_API_BASE` — см.
+//!     `ops::transport::TelegramTransport`.
 //!
 //! Exit-код: 0 всегда, ЕСЛИ детекторы отработали (сам факт найденных CRITICAL-алертов —
 //! это НЕ ошибка процесса watchdog'а, это его штатный результат). Ненулевой — только если
@@ -36,12 +40,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use ops::format::format_alert;
 use ops::state::{WatchdogState, DEFAULT_DEDUP_WINDOW_MS};
 use ops::transport::{StdoutTransport, TelegramTransport, Transport};
-use ops::watchdog::{
-    check_container_missing, check_container_restarted, check_container_unhealthy,
-    check_cron_marker_missing, check_cron_marker_stale, check_disk, check_heartbeat_missing,
-    check_heartbeat_stale, check_seq_stalled, check_writable, parse_docker_status_healthy, Alert,
-    ContainerStatus, CronMarker, HeartbeatSample, Incident, Thresholds,
-};
+use ops::watchdog::{parse_docker_status_healthy, ContainerStatus, Thresholds};
+use ops::watchdog_cycle::{run_cycle, CronFailureMarker, CronJobObservation, CycleInputs};
+
+/// Задачи обслуживания журнала, за которыми следит watchdog (имена БЕЗ суффикса — см.
+/// `CronJobObservation::name`; у каждой два независимых маркера: `<name>.last-success` и
+/// `<name>.alert`, R-005 F-6).
+const CRON_JOBS: &[&str] = &["compaction", "gateway-checkpoint", "retention"];
 
 fn main() -> anyhow::Result<()> {
     let heartbeat_path = env_path(
@@ -61,11 +66,9 @@ fn main() -> anyhow::Result<()> {
     let now_ms = now_ms();
     let thr = Thresholds::default();
     let mut state = WatchdogState::load_or_default(&state_path);
-    let mut alerts: Vec<Alert> = Vec::new();
 
-    run_heartbeat_checks(&heartbeat_path, now_ms, &thr, &mut state, &mut alerts);
-    run_container_checks(&container_names, &mut state, &mut alerts);
-    run_cron_marker_checks(&cron_dir, now_ms, &thr, &mut state, &mut alerts);
+    let inputs = gather_inputs(&heartbeat_path, &cron_dir, &container_names);
+    let outcome = run_cycle(&inputs, now_ms, &thr, dedup_window_ms, &mut state);
 
     let stdout_transport = StdoutTransport;
     let telegram_transport = TelegramTransport::from_env();
@@ -77,32 +80,24 @@ fn main() -> anyhow::Result<()> {
         );
     }
 
-    let mut sent = 0usize;
-    let mut suppressed = 0usize;
-    for alert in &alerts {
-        let key = dedup_key(alert);
-        if !state.should_fire(&key, now_ms, dedup_window_ms) {
-            suppressed += 1;
-            continue;
-        }
+    for alert in &outcome.delivered {
         let message = format_alert(alert, &host_label, now_ms);
         // stdout — всегда (лог cron'а — свидетельство работы watchdog'а само по себе).
         let _ = stdout_transport.send(&message);
         if let Err(e) = telegram_transport.send(&message) {
             eprintln!("[ops-watchdog] TelegramTransport::send failed: {e}");
         }
-        sent += 1;
     }
 
-    if alerts.is_empty() {
+    if outcome.fired.is_empty() {
         println!("[ops-watchdog] {now_ms} — норма, ни одно условие не сработало");
     } else {
         println!(
             "[ops-watchdog] {now_ms} — обнаружено {} алертов ({} отправлено, {} подавлено \
              дедупликацией)",
-            alerts.len(),
-            sent,
-            suppressed
+            outcome.fired.len(),
+            outcome.delivered.len(),
+            outcome.suppressed
         );
     }
 
@@ -113,178 +108,38 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Ключ дедупликации/дедуп-состояния: код инцидента (+ `:<цель>` для условий с
-/// множественностью — несколько контейнеров/cron-маркеров могут одновременно ловить один и
-/// тот же `Incident`, и это РАЗНЫЕ инциденты — см. `watchdog::Alert::target`). ОДНА функция
-/// для "слать" (`dedup_key`, из готового `Alert`) и "снять дедуп-запись, раз условие
-/// здорово" (`push_or_clear`, до того как `Alert` мог не случиться) — иначе они бы могли
-/// разойтись по формату ключа незаметно.
-fn state_key(incident: Incident, target: Option<&str>) -> String {
-    match target {
-        Some(t) => format!("{}:{}", incident.code(), t),
-        None => incident.code().to_string(),
-    }
-}
-
-fn dedup_key(alert: &Alert) -> String {
-    state_key(alert.incident, alert.target.as_deref())
-}
-
-fn run_heartbeat_checks(
+/// Собрать `CycleInputs` из реального окружения машины — единственное место в бинаре, где
+/// происходит I/O для входа цикла (отправка `CycleOutcome::delivered` — отдельно, в `main`).
+fn gather_inputs(
     heartbeat_path: &Path,
-    now_ms: i64,
-    thr: &Thresholds,
-    state: &mut WatchdogState,
-    alerts: &mut Vec<Alert>,
-) {
-    let hb = read_heartbeat(heartbeat_path);
-
-    if let Some(a) = check_heartbeat_missing(hb.as_ref()) {
-        alerts.push(a);
-    } else {
-        state.clear(Incident::HeartbeatMissing.code());
-    }
-
-    let Some(hb) = hb else {
-        // Без сэмпла остальные heartbeat-производные проверки бессмысленны в этом цикле;
-        // prev_* НЕ обновляем (следующий цикл сравнит с последним ИЗВЕСТНЫМ хорошим сэмплом).
-        return;
-    };
-
-    push_or_clear(
-        alerts,
-        state,
-        Incident::HeartbeatStale,
-        None,
-        check_heartbeat_stale(now_ms, &hb, thr),
-    );
-    push_or_clear(
-        alerts,
-        state,
-        Incident::NotWritable,
-        None,
-        check_writable(&hb),
-    );
-
-    match (state.prev_heartbeat, state.prev_check_ms) {
-        (Some(prev_hb), Some(prev_ms)) => {
-            push_or_clear(
-                alerts,
-                state,
-                Incident::SeqStalled,
-                None,
-                check_seq_stalled(&prev_hb, prev_ms, &hb, now_ms, thr),
-            );
-            push_or_clear(
-                alerts,
-                state,
-                Incident::DiskLow,
-                None,
-                check_disk(&hb, Some((&prev_hb, prev_ms)), now_ms, thr),
-            );
-        }
-        _ => {
-            push_or_clear(
-                alerts,
-                state,
-                Incident::DiskLow,
-                None,
-                check_disk(&hb, None, now_ms, thr),
-            );
-        }
-    }
-
-    state.prev_heartbeat = Some(hb);
-    state.prev_check_ms = Some(now_ms);
-}
-
-/// `target` — цель для дедуп-ключа (см. `state_key`); ДОЛЖЕН совпадать с тем, что кладёт в
-/// `Alert::target` соответствующий `check_*` (проверено параллельно `Alert::with_target` в
-/// `watchdog.rs` — если они разойдутся, `should_fire`/`clear` перестанут совпадать по ключу,
-/// но тест `red_ops_watchdog.rs` этого не поймает — это wiring-риск, покрыт комментарием).
-fn push_or_clear(
-    alerts: &mut Vec<Alert>,
-    state: &mut WatchdogState,
-    incident: Incident,
-    target: Option<&str>,
-    outcome: Option<Alert>,
-) {
-    match outcome {
-        Some(a) => alerts.push(a),
-        None => state.clear(&state_key(incident, target)),
-    }
-}
-
-fn run_container_checks(
-    container_names: &[String],
-    state: &mut WatchdogState,
-    alerts: &mut Vec<Alert>,
-) {
-    let ps_output = run_docker_ps();
-    for name in container_names {
-        let status = container_status(name, ps_output.as_deref());
-
-        push_or_clear(
-            alerts,
-            state,
-            Incident::ContainerMissing,
-            Some(name),
-            check_container_missing(&status),
-        );
-        push_or_clear(
-            alerts,
-            state,
-            Incident::ContainerUnhealthy,
-            Some(name),
-            check_container_unhealthy(&status),
-        );
-
-        let prev_restart = state.prev_restart_counts.get(name).copied();
-        if let Some(a) = check_container_restarted(&status, prev_restart) {
-            alerts.push(a);
-        }
-        if let Some(cur) = status.restart_count {
-            state.prev_restart_counts.insert(name.clone(), cur);
-        }
-    }
-}
-
-fn run_cron_marker_checks(
     cron_dir: &Path,
-    now_ms: i64,
-    thr: &Thresholds,
-    state: &mut WatchdogState,
-    alerts: &mut Vec<Alert>,
-) {
-    const MARKERS: &[&str] = &[
-        "compaction.last-success",
-        "gateway-checkpoint.last-success",
-        "retention.last-success",
-    ];
-    for name in MARKERS {
-        let last_success_ms = read_cron_marker(&cron_dir.join(name));
-        let marker = CronMarker {
-            name,
-            last_success_ms,
-        };
-        push_or_clear(
-            alerts,
-            state,
-            Incident::CronMarkerMissing,
-            Some(name),
-            check_cron_marker_missing(&marker),
-        );
-        push_or_clear(
-            alerts,
-            state,
-            Incident::CronMarkerStale,
-            Some(name),
-            check_cron_marker_stale(&marker, now_ms, thr),
-        );
+    container_names: &[String],
+) -> CycleInputs {
+    let heartbeat = read_heartbeat(heartbeat_path);
+
+    let ps_output = run_docker_ps();
+    let containers = container_names
+        .iter()
+        .map(|name| container_status(name, ps_output.as_deref()))
+        .collect();
+
+    let cron_jobs = CRON_JOBS
+        .iter()
+        .map(|name| CronJobObservation {
+            name: name.to_string(),
+            last_success_ms: read_cron_marker(&cron_dir.join(format!("{name}.last-success"))),
+            failure: read_cron_failure_marker(&cron_dir.join(format!("{name}.alert"))),
+        })
+        .collect();
+
+    CycleInputs {
+        heartbeat,
+        containers,
+        cron_jobs,
     }
 }
 
-fn read_heartbeat(path: &Path) -> Option<HeartbeatSample> {
+fn read_heartbeat(path: &Path) -> Option<ops::watchdog::HeartbeatSample> {
     let body = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&body).ok()
 }
@@ -295,6 +150,27 @@ fn read_heartbeat(path: &Path) -> Option<HeartbeatSample> {
 fn read_cron_marker(path: &Path) -> Option<i64> {
     let body = std::fs::read_to_string(path).ok()?;
     parse_utc_iso8601(body.trim())
+}
+
+/// R-005 F-6: `<job>.alert` — та же двухстрочная конвенция, что пишет `alert()` в
+/// `deploy/bin/journal-retention-cron.sh`/`journal-compaction-cron.sh`/`scripts/watchdog_cron.sh`
+/// сам про себя: первая строка — UTC ISO-8601, вторая+ — текст сбоя. Присутствие файла = факт
+/// сбоя ДАЖЕ если первая строка не распарсилась (fail-closed, `f6_failure_marker_with_unparseable_timestamp_still_alerts`).
+fn read_cron_failure_marker(path: &Path) -> Option<CronFailureMarker> {
+    let body = std::fs::read_to_string(path).ok()?;
+    let mut lines = body.lines();
+    let first = lines.next().unwrap_or("").trim();
+    let reported_at_ms = parse_utc_iso8601(first);
+    let rest: String = lines.collect::<Vec<_>>().join("\n").trim().to_string();
+    let detail = if rest.is_empty() {
+        first.to_string()
+    } else {
+        rest
+    };
+    Some(CronFailureMarker {
+        reported_at_ms,
+        detail,
+    })
 }
 
 fn parse_utc_iso8601(s: &str) -> Option<i64> {
@@ -436,20 +312,36 @@ mod tests {
     }
 
     #[test]
-    fn state_key_matches_dedup_key_for_targeted_alert() {
-        // wiring-инвариант, упомянутый в doc-комментарии `push_or_clear`: ключ, под которым
-        // клирится дедуп-запись, ОБЯЗАН совпадать с ключом, под которым она была установлена
-        // через `dedup_key(&alert)`.
-        use ops::watchdog::{Alert, Incident, Level};
-        let alert = Alert {
-            incident: Incident::ContainerUnhealthy,
-            level: Level::Critical,
-            message: "x".to_string(),
-            target: Some("hft-recorder".to_string()),
-        };
+    fn cron_failure_marker_splits_timestamp_and_detail() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("retention.alert");
+        std::fs::write(
+            &path,
+            "2026-07-31T23:43:00Z\ndry-run exit=2 (2=failed_cold_verify)",
+        )
+        .unwrap();
+        let marker = read_cron_failure_marker(&path).expect("marker must be read");
         assert_eq!(
-            dedup_key(&alert),
-            state_key(Incident::ContainerUnhealthy, Some("hft-recorder"))
+            marker.reported_at_ms,
+            parse_utc_iso8601("2026-07-31T23:43:00Z")
         );
+        assert!(marker.detail.contains("exit=2"));
+    }
+
+    #[test]
+    fn cron_failure_marker_with_unparseable_first_line_still_returns_some() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("compaction.alert");
+        std::fs::write(&path, "not-a-timestamp\ncompact exit=1").unwrap();
+        let marker = read_cron_failure_marker(&path).expect("marker must be read");
+        assert_eq!(marker.reported_at_ms, None);
+        assert!(marker.detail.contains("exit=1"));
+    }
+
+    #[test]
+    fn cron_failure_marker_missing_file_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("does-not-exist.alert");
+        assert!(read_cron_failure_marker(&path).is_none());
     }
 }

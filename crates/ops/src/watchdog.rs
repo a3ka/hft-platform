@@ -31,6 +31,12 @@ pub enum Incident {
     ContainerRestarted,
     CronMarkerMissing,
     CronMarkerStale,
+    /// `<job>.alert` маркер присутствует — последний прогон cron-задачи упал (R-005 F-6).
+    /// Отдельно от `CronMarkerStale`/`CronMarkerMissing` (те читают ТОЛЬКО позитивный
+    /// `.last-success` и молчат до 26ч) — этот код виден НЕМЕДЛЕННО, на первом же такте
+    /// после сбоя. Детектируется в слое склейки (`watchdog_cycle::run_cycle`), не здесь —
+    /// вход (`CronJobObservation`/`CronFailureMarker`) специфичен для этого слоя.
+    CronFailed,
 }
 
 impl Incident {
@@ -46,6 +52,7 @@ impl Incident {
             Incident::ContainerRestarted => "WD-CONTAINER-RESTARTED",
             Incident::CronMarkerMissing => "WD-CRON-MISSING",
             Incident::CronMarkerStale => "WD-CRON-STALE",
+            Incident::CronFailed => "WD-CRON-FAILED",
         }
     }
 }

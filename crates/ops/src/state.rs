@@ -21,6 +21,18 @@ use crate::watchdog::HeartbeatSample;
 /// достаточно редко, чтобы не превратиться в шум, который выключат.
 pub const DEFAULT_DEDUP_WINDOW_MS: i64 = 30 * 60_000;
 
+/// Один сэмпл `free_bytes` с моментом наблюдения — история для тренда диска (R-005 F-3).
+/// Хранится ОТДЕЛЬНО от `prev_heartbeat` (который несёт полный снэпшот последнего цикла и
+/// живёт для обратной совместимости roundtrip-теста `red_ops_state.rs`): история диска
+/// обрезается по горизонту обслуживания (`watchdog_cycle::DISK_TREND_HORIZON_MS`), а не по
+/// одному предыдущему циклу — иначе всплеск компакции/ретеншена в один такт масштабируется
+/// на сутки прогноза (см. `watchdog_cycle.rs`).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct DiskSample {
+    pub check_ms: i64,
+    pub free_bytes: i64,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct WatchdogState {
     #[serde(default)]
@@ -31,6 +43,19 @@ pub struct WatchdogState {
     pub prev_check_ms: Option<i64>,
     #[serde(default)]
     pub prev_restart_counts: HashMap<String, u64>,
+    /// Якорь ПОСЛЕДНЕГО НАБЛЮДАВШЕГОСЯ ПРОГРЕССА `next_seq` (R-005 F-1) — обновляется ТОЛЬКО
+    /// когда `next_seq` реально вырос, а не на каждом цикле. Это то, что отличает "застой
+    /// длится N минут реального времени" от "застой длится N интервалов cron'а" — старая
+    /// склейка использовала `prev_heartbeat`/`prev_check_ms` (двигались КАЖДЫЙ цикл) для той
+    /// же цели, из-за чего детектор выключался интервалом cron'а короче 60с.
+    #[serde(default)]
+    pub seq_progress_heartbeat: Option<HeartbeatSample>,
+    #[serde(default)]
+    pub seq_progress_check_ms: Option<i64>,
+    /// История `free_bytes` для тренда диска, обрезаемая по горизонту (R-005 F-3). Не путать
+    /// с `prev_heartbeat` — та же причина разделения, что у `seq_progress_*`.
+    #[serde(default)]
+    pub disk_history: Vec<DiskSample>,
 }
 
 impl WatchdogState {

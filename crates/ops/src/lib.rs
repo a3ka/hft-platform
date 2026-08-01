@@ -16,3 +16,4 @@ pub mod sink;
 pub mod state;
 pub mod transport;
 pub mod watchdog;
+pub mod watchdog_cycle;
