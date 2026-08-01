@@ -92,6 +92,15 @@ impl TelegramTransport {
             api_base: api_base.to_string(),
             client: reqwest::blocking::Client::builder()
                 .timeout(Duration::from_secs(10))
+                // R-009 F-11: НИКОГДА не следовать редиректам. `TELEGRAM_BOT_TOKEN` вшит в путь
+                // URL (требование Telegram Bot API); дефолтная политика reqwest
+                // (`Policy::limited(10)`) при следовании 3xx проставляет заголовок `Referer` с
+                // ПОЛНЫМ исходным URL — секрет уезжает на хост, указанный удалённой стороной
+                // в `Location` (недоверенный вход той же категории, что тело ответа — F-9).
+                // С `Policy::none()` 3xx возвращается как обычный `Response` вызывающему коду
+                // и падает в уже редактированную ветку "не-2xx" ниже (F-9/R-008 F-2) — второй
+                // запрос не отправляется, `Referer` неоткуда взяться.
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .expect("reqwest::blocking::Client::build — TLS backend недоступен"),
         }
