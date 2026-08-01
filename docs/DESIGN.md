@@ -285,14 +285,14 @@ mean-reversion. Первая гипотеза `H-20260710-obi-asym` обкаты
 структуры фаз — этот раздел; `docs/09-roadmap-v2.md` — рабочая декомпозиция
 (предусловия, объём в milestone'ах, cross-refs), обновляется чаще и подробнее.
 
-### Пройденный фундамент (✅ DONE — не пересчитывается)
+### Пройденный фундамент (✅ DONE — не пересчитывается; кроме строк, явно помеченных 🚧 частично)
 
 | Фаза | Содержимое | Acceptance-ворота | founder |
 |---|---|---|---|
 | **P0 Журнал** ✅ | journal + replay + state_hash + recorder HL-фида | 24ч записи; replay ×3 бит-идентичен (DET-I-1) — ЗЕЛЁНЫЙ | — |
 | **P1 Data plane** ✅ | venue-hyperliquid + venue-binance(-futures) MD, book+честный ресинк, recorder-демон, δ-латентности | 7 дней данных; gap-статистика; целостность книги green — ЗЕЛЁНЫЙ; прод — 137+ млн событий журнала (§0) | — |
 | **P2 Research core** ✅ | sim fill-model, research-cli (grid/walk-forward/metrics.json), OBI №1 формализован | OBI-отчёт по пре-регистрированным критериям; paper-режим работает — ПРИНЯТО | ★ принято |
-| **P2.5 Data safety net** ✅ (в основном; хвост докатывается в Ф0) | ops-слой: cold-copy журнала offsite, recon локальной книги с REST-снапшотом биржи, `/metrics`+алерты P0/P1/P2 (`docs/fa/ops.md`, `OPS-I-1..8`) | backup restore-drill проходит; инъецированная порча книги (`ε_test`) ловится recon'ом и алертит; двусторонний паритет «инцидент→алерт→метрика» | ★ принято |
+| **P2.5 Data safety net** 🚧 частично (recon + `/metrics` закрыты и не пересчитываются; offsite-копия + restore-drill — открытый хвост, ведётся под Ф0, R1) | ops-слой: recon локальной книги с REST-снапшотом биржи + живая эмиссия `/metrics` (`docs/fa/ops.md`, `OPS-I-1..8`; M-09 tasks 1/2/4 MERGED, `PROJECT-STATE.md` «Data safety net») — СДЕЛАНО; cold-copy журнала offsite — НЕ СДЕЛАНО (Storage Box не заведён, `/mnt/*` пуст, `TECH-DEBT.md` TD-020 OPEN) | recon: инъецированная порча книги (`ε_test`) ловится и алертит — ЗЕЛЁНЫЙ (`crates/ops/tests/red_ops_recon.rs`, `scripts/verify_M-09.sh` T2 OPS-I-1 PASS); паритет «алерт↔метрика» внутри PromQL-правил — ЗЕЛЁНЫЙ (`verify_M-09.sh` OPS-I-5); backup restore-drill — **НЕ ПРОВОДИЛСЯ НИ РАЗУ** (M-09 task 3, заблокирован Storage Box `founder ★`, план ~2026-08-10, `TECH-DEBT.md` TD-020) | — (частично: recon+`/metrics` без отдельной подписи; offsite+restore-drill ждут ★ приёма вместе с Ф0 — см. строку ниже) |
 | **P-COCKPIT Виз-бэкенд** ✅ (MVP-1 сдан; докатка формата данных/UI — в Ф1/Ф4) | Bookmap-подобный виз-бэкенд: heatmap/COB/CVD/Volume Profile/VWAP/footprint + Read Gateway (WS) поверх L2Delta-реконструированной книги (M-18/20/22/23/24/29 — все ✅ CLOSED, детали `PROJECT-STATE.md`) | MVP-1 (heatmap/bubbles/COB/VP/CVD/VWAP на BTCUSDT) отдаёт данные через WS; live==replay — ЗЕЛЁНЫЙ на проде (§8 eyes-on) | ★ принято (пивот 2026-07-22) |
 
 **Почему P2.5 вставлена перед торговым путём (сохранённый урок, амендмент 2026-07-14,
