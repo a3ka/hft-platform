@@ -42,8 +42,8 @@ use crate::state::{DiskSample, WatchdogState};
 use crate::watchdog::{
     check_container_missing, check_container_restarted, check_container_unhealthy,
     check_cron_marker_missing, check_cron_marker_stale, check_disk, check_heartbeat_missing,
-    check_heartbeat_stale, check_seq_stalled, check_writable, Alert, ContainerStatus, CronMarker,
-    HeartbeatSample, Incident, Level, Thresholds,
+    check_heartbeat_stale, check_seq_regressed, check_seq_stalled, check_writable, Alert,
+    ContainerStatus, CronMarker, HeartbeatSample, Incident, Level, Thresholds,
 };
 
 /// Горизонт истории `free_bytes`, используемой для тренда (R-005 F-3): обязан покрывать окно
@@ -218,11 +218,44 @@ fn run_heartbeat_checks(cycle: &mut Cycle, hb: Option<&HeartbeatSample>, thr: &T
 
 /// R-005 F-1: якорь — момент ПОСЛЕДНЕГО НАБЛЮДАВШЕГОСЯ ПРОГРЕССА `next_seq`, а не момент
 /// прошлой проверки. Двигается ТОЛЬКО когда `next_seq` реально вырос.
+///
+/// R-008 F-8: регрессия (`next_seq` УМЕНЬШИЛСЯ относительно якоря) обрабатывается ДО обычной
+/// проверки застоя, отдельной веткой — см. [`Incident::SeqRegressed`] выше по модулю
+/// `watchdog.rs`. Без неё якорь роста никогда не переезжает (условие `next_seq >
+/// anchor.next_seq` не выполняется, пока сбор не догонит прежнее значение) — при проде
+/// `next_seq ≈ 1.4e8` и темпе ~96 ev/s это недели непрерывного ложного `WD-SEQ-STALLED`
+/// поверх реально растущего сбора.
 fn run_seq_stalled_check(cycle: &mut Cycle, hb: &HeartbeatSample, thr: &Thresholds) {
     let now_ms = cycle.now_ms;
+
+    if let Some(anchor_hb) = cycle.state.seq_progress_heartbeat {
+        if let Some(alert) = check_seq_regressed(&anchor_hb, hb) {
+            // Регрессия — ОТДЕЛЬНЫЙ инцидент, не "продолжение застоя". Якорь сбрасывается на
+            // текущее значение НЕМЕДЛЕННО (та же дисциплина, что и для реального прогресса
+            // выше), чтобы обычный детектор застоя начинал отсчёт заново от нового состояния
+            // мира, а не гнался за значением, которое сбор физически не может снова достичь
+            // (новый том/сегмент стартует с меньшего `next_seq`).
+            cycle.state.seq_progress_heartbeat = Some(*hb);
+            cycle.state.seq_progress_check_ms = Some(now_ms);
+            // Обходит дедуп-окно целиком — тот же аргумент, что у F-7
+            // (`Cycle::record_always_delivered`): по построению эта ветка срабатывает ТОЛЬКО
+            // когда `next_seq` реально уменьшился относительно ТЕКУЩЕГО якоря, а якорь после
+            // срабатывания сразу переезжает на новое значение — то есть повторное срабатывание
+            // возможно ТОЛЬКО на действительно НОВОЙ регрессии (ещё одно уменьшение относительно
+            // уже сброшенного якоря), а не на повторе того же факта. Дедуп по времени здесь
+            // подавлял бы независимые события, как подавлял независимые рестарты в F-7.
+            cycle.record_always_delivered(alert);
+            // На такте регрессии о "застое" ещё нечего сказать — якорь только что сброшен,
+            // возраст с него равен нулю. Не "здорово" (дедуп-память не снимаем на случай, если
+            // реальный застой сохранится и после нормализации якоря) и не "тревога" — та же
+            // семантика, что у первого-когда-либо сэмпла ниже.
+            cycle.record(Incident::SeqStalled, None, Verdict::Unknown);
+            return;
+        }
+    }
+
     let anchor = cycle.state.seq_progress_heartbeat;
     let anchor_ms = cycle.state.seq_progress_check_ms;
-
     let verdict = match (anchor, anchor_ms) {
         (Some(anchor_hb), Some(_)) if hb.next_seq > anchor_hb.next_seq => {
             // Прогресс — якорь переезжает на этот такт, условие определённо здорово.

@@ -25,6 +25,13 @@ pub enum Incident {
     HeartbeatStale,
     NotWritable,
     SeqStalled,
+    /// `next_seq` УМЕНЬШИЛСЯ относительно якоря прогресса (R-008 F-8) — том журнала
+    /// пересоздан/восстановлен из бэкапа/сегмент откатили. Отдельно от `SeqStalled`: без
+    /// собственного кода регрессия НИКОГДА не даёт якорю переехать (условие роста не
+    /// выполняется, пока сбор не догонит старое значение) — застой светился бы CRITICAL
+    /// неделями при живом, реально растущем сборе. Само по себе тоже тревожный признак —
+    /// та же категория риска (seq-reuse), что закрывали M-49/M-50.
+    SeqRegressed,
     DiskLow,
     ContainerMissing,
     ContainerUnhealthy,
@@ -46,6 +53,7 @@ impl Incident {
             Incident::HeartbeatStale => "WD-HB-STALE",
             Incident::NotWritable => "WD-NOT-WRITABLE",
             Incident::SeqStalled => "WD-SEQ-STALLED",
+            Incident::SeqRegressed => "WD-SEQ-REGRESSED",
             Incident::DiskLow => "WD-DISK-LOW",
             Incident::ContainerMissing => "WD-CONTAINER-MISSING",
             Incident::ContainerUnhealthy => "WD-CONTAINER-UNHEALTHY",
@@ -249,6 +257,28 @@ pub fn check_writable(hb: &HeartbeatSample) -> Option<Alert> {
             "recorder.heartbeat сообщает writable=false — журнал перестал принимать записи \
              (disk-guard/fs ошибка)"
                 .to_string(),
+        ))
+    } else {
+        None
+    }
+}
+
+/// R-008 F-8: `next_seq` УМЕНЬШИЛСЯ относительно якоря прогресса (`watchdog_cycle`) —
+/// признак seq-reuse (пересозданный/восстановленный том журнала, откат сегмента). Отдельный
+/// инцидент от `check_seq_stalled`: регрессия и застой — разные факты о мире, требуют разной
+/// реакции (застой ждёт, регрессия — тревога прямо сейчас, независимо от того, сколько времени
+/// прошло с прошлой проверки).
+pub fn check_seq_regressed(prev: &HeartbeatSample, cur: &HeartbeatSample) -> Option<Alert> {
+    if cur.next_seq < prev.next_seq {
+        Some(Alert::new(
+            Incident::SeqRegressed,
+            Level::Critical,
+            format!(
+                "next_seq УМЕНЬШИЛСЯ ({} → {}) — признак seq-reuse (пересозданный/\
+                 восстановленный том журнала, откат сегмента); якорь застоя сброшен на \
+                 текущее значение, дальнейший застой будет отсчитан заново от него",
+                prev.next_seq, cur.next_seq
+            ),
         ))
     } else {
         None
