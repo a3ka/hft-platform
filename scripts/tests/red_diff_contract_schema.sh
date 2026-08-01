@@ -219,6 +219,54 @@ scenario_ref_retarget_array_items_no_bump() {
   rm -rf "${d}"
 }
 
+# ── R-012 F-4 РЕГРЕССИЯ-ГВАРД: неразобранный ключ узла (allOf/constraint-keyword), ─────
+#    ИЗОЛИРОВАННО — до фикса ловился только файловым safety-net (пустой file_changes),
+#    после фикса ловится ТАКЖЕ узловым fallback'ом независимо от соседей ──────────────
+scenario_f4_allof_retarget_isolated() {
+  local d base
+  d=$(new_base_repo)
+  # setup: добавляем allOf-узел (типовая schemars-форма для doc-commented $ref, R-012 F-4)
+  # КАК ЧАСТЬ БАЗЫ — сравниваемый диф содержит только последующую мутацию.
+  mutate_schema "${d}" 'd["definitions"]["Widget"]["properties"]["note"] = {"description": "d", "allOf": [{"$ref": "#/definitions/PayloadA"}]}'
+  commit_change "${d}" "setup: allOf-узел (schemars doc-comment форма)"
+  base=$(git -C "${d}" rev-parse HEAD)
+  mutate_schema "${d}" 'd["definitions"]["Widget"]["properties"]["note"]["allOf"][0]["$ref"] = "#/definitions/PayloadB"'
+  commit_change "${d}" "breaking: allOf[0].\$ref PayloadA->PayloadB (изолированно), без бампа"
+  run_barrier "${d}" "${base}"
+  expect_class_verdict "F-4 РЕГРЕССИЯ-ГВАРД: allOf \$ref retarget изолированно — CLASS=breaking, FAIL" "breaking" "FAIL" "deny"
+  rm -rf "${d}"
+}
+
+# ── R-012 F-4 ГЛАВНАЯ РЕГРЕССИЯ: неразобранный allOf-диф МАСКИРУЕТСЯ соседним additive- ─
+#    дифом В ТОМ ЖЕ ФАЙЛЕ — до фикса файловый safety-net не срабатывал (file_changes НЕ
+#    пуст — там уже лежит additive-Change от нового поля), классификатор молча терял
+#    breaking-изменение и печатал CLASS=additive/PASS. Ядро находки reviewer'а ──────────
+scenario_f4_allof_retarget_masked_by_additive() {
+  local d base
+  d=$(new_base_repo)
+  mutate_schema "${d}" 'd["definitions"]["Widget"]["properties"]["note"] = {"description": "d", "allOf": [{"$ref": "#/definitions/PayloadA"}]}'
+  commit_change "${d}" "setup: allOf-узел (schemars doc-comment форма)"
+  base=$(git -C "${d}" rev-parse HEAD)
+  mutate_schema "${d}" 'd["definitions"]["Widget"]["properties"]["note"]["allOf"][0]["$ref"] = "#/definitions/PayloadB"; d["definitions"]["Widget"]["properties"]["extra_additive"] = {"type": "string"}'
+  commit_change "${d}" "R-012 F-4: allOf \$ref retarget (неразобранный) + additive-поле (разобранный) в одном файле, без бампа"
+  run_barrier "${d}" "${base}"
+  expect_class_verdict "F-4 ГЛАВНАЯ РЕГРЕССИЯ: неразобранный allOf-диф НЕ маскируется соседним additive — CLASS=breaking (НЕ additive!), FAIL" "breaking" "FAIL" "deny"
+  rm -rf "${d}"
+}
+
+# ── R-012 F-4: тот же класс маскировки, но на ОГРАНИЧИВАЮЩЕМ ключевом слове (maxLength, ──
+#    не структурном allOf) — другой подкласс неразобранных ключей из находки reviewer'а ──
+scenario_f4_maxlength_narrow_masked_by_additive() {
+  local d base
+  d=$(new_base_repo)
+  base=$(git -C "${d}" rev-parse HEAD)
+  mutate_schema "${d}" 'd["definitions"]["Widget"]["properties"]["name"]["maxLength"] = 1; d["definitions"]["Widget"]["properties"]["extra_additive2"] = {"type": "string"}'
+  commit_change "${d}" "R-012 F-4: maxLength-сужение (неразобранное) + additive-поле в одном файле, без бампа"
+  run_barrier "${d}" "${base}"
+  expect_class_verdict "F-4 maxLength-сужение НЕ маскируется соседним additive — CLASS=breaking (НЕ additive!), FAIL" "breaking" "FAIL" "deny"
+  rm -rf "${d}"
+}
+
 # ── D5: setup-guard — несуществующий base-ref → FAIL, не молчаливый пропуск ───────────
 scenario_bad_base_ref() {
   local d; d=$(new_base_repo)
@@ -261,6 +309,9 @@ scenario_breaking_oneof_removed_no_bump
 scenario_breaking_file_removed
 scenario_ref_retarget_property_no_bump
 scenario_ref_retarget_array_items_no_bump
+scenario_f4_allof_retarget_isolated
+scenario_f4_allof_retarget_masked_by_additive
+scenario_f4_maxlength_narrow_masked_by_additive
 scenario_bad_base_ref
 scenario_missing_classifier
 

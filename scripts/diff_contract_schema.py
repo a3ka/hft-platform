@@ -9,7 +9,9 @@ docs/plans/contracts-einhard-inventory.md §1.5.2/§3 П2).
   - сужение enum (значение убрано)                → BREAKING
   - удалённый вариант `oneOf` (enum-вариант T1)   → BREAKING
   - смена `type` существующего поля               → BREAKING
-  - `additionalProperties`: true/отсутствует → false → BREAKING
+  - `additionalProperties`: ЛЮБОЕ изменение (не только true/отсутствует → false) → BREAKING
+    (расширено R-012 F-4 — раньше сужалось только до `false`, `additionalProperties`-как-схема
+    и переход `false → true` проходили мимо правила)
   - новое ОПЦИОНАЛЬНОЕ поле                       → ADDITIVE
   - новый вариант enum / `oneOf`                  → ADDITIVE
   - новый файл схемы (новый T1-тип)               → ADDITIVE
@@ -17,6 +19,13 @@ docs/plans/contracts-einhard-inventory.md §1.5.2/§3 П2).
   - `$ref` цель ссылки изменена (не разыменовывается) → BREAKING (консервативно, R-006 F-1)
   - файл изменился побайтово, но правила выше ничего не нашли → BREAKING (fail-closed
     safety-net; гейт никогда не утверждает "не изменилась" на изменённом файле, R-006 F-1)
+  - УЗЕЛ изменился, но ни один из ключей выше не объясняет разницу (`allOf`/`anyOf`/`not`/
+    `patternProperties`/ограничивающие ключевые слова типа `maxLength`/`pattern`/`minimum`/
+    `format`/... и любой другой неразобранный ключ) → BREAKING (fail-closed safety-net на
+    уровне УЗЛА, не только файла целиком — R-012 F-4: до фикса такой узел молча получал
+    CLASS=none и при наличии ЛЮБОГО распознанного изменения В ТОМ ЖЕ ФАЙЛЕ, например нового
+    опционального поля, файловый safety-net не срабатывал — неразобранный breaking-диф
+    маскировался соседним additive-дифом)
 
 Не переносим доменные §4d правила einhard (lat/lon/heading — не наша предметная область,
 docs/plans/contracts-einhard-inventory.md §4). Это ЧИСТАЯ функция над двумя JSON-документами
@@ -54,6 +63,32 @@ def _oneof_variant_key(variant: dict) -> str | None:
     if "enum" in variant and isinstance(variant["enum"], list) and len(variant["enum"]) == 1:
         return f"enum:{variant['enum'][0]}"
     return None
+
+
+# Ключи узла, для которых ЕСТЬ конкретное правило classify_node ниже (каждый — свой Change
+# с точным сообщением), ЛИБО которые разбираются ОТДЕЛЬНО вызывающим кодом (`definitions`/
+# `$defs` — рекурсируются по имени типа в classify_schema_file, а не как обычное значение
+# узла; без этого исключения ЛЮБОЕ изменение ЛЮБОГО типа в схеме давало бы ложный
+# "$.definitions — неразобранный ключ" на корневом узле поверх точного per-type сообщения).
+# Всё, что НЕ в этом множестве и не в _DOC_ONLY_KEYS, но при этом отличается между base/head
+# того же узла, уходит в общий fail-closed fallback в конце classify_node (R-012 F-4).
+_HANDLED_KEYS = frozenset(
+    {
+        "$ref",
+        "properties",
+        "required",
+        "enum",
+        "type",
+        "additionalProperties",
+        "items",
+        "oneOf",
+        "definitions",
+        "$defs",
+    }
+)
+# Ключи, которые НЕ влияют на wire-совместимость (чистая документация/метаданные) — их
+# изменение осознанно игнорируется fallback'ом, а не считается неразобранным breaking.
+_DOC_ONLY_KEYS = frozenset({"description", "title", "$comment", "examples"})
 
 
 def classify_node(base: object, head: object, path: str) -> list[Change]:
@@ -125,11 +160,17 @@ def classify_node(base: object, head: object, path: str) -> list[Change]:
             Change("breaking", f"{path}.type — сменился {base['type']!r} → {head['type']!r}")
         )
 
-    # additionalProperties: true/отсутствует → false (сужение формы)
+    # additionalProperties: ЛЮБОЕ изменение — BREAKING (R-012 F-4, расширено). Раньше правило
+    # ловило только сужение true/отсутствует → false; форма "additionalProperties как схема"
+    # (dict, не bool) и переход false → true проходили мимо НИ ОДНОГО правила и попадали под
+    # общий fallback ниже с менее точным сообщением — здесь сообщение конкретнее, поэтому ключ
+    # явно выведен из-под fallback (см. _HANDLED_KEYS).
     base_ap = base.get("additionalProperties", True)
     head_ap = head.get("additionalProperties", True)
-    if base_ap is not False and head_ap is False:
-        changes.append(Change("breaking", f"{path}.additionalProperties — сужено до false"))
+    if base_ap != head_ap:
+        changes.append(
+            Change("breaking", f"{path}.additionalProperties — изменилось: {base_ap!r} → {head_ap!r}")
+        )
 
     # items — элемент массива (R-006 F-1: до фикса `items: {"$ref": ...}` — типовая форма
     # schemars для `Vec<T>`, напр. L2Snapshot.bids/asks — не рекурсировался вовсе, поэтому
@@ -159,6 +200,32 @@ def classify_node(base: object, head: object, path: str) -> list[Change]:
         for k in head_variants:
             if k not in base_variants:
                 changes.append(Change("additive", f"{path}.oneOf — вариант '{k}' добавлен"))
+
+    # Fail-closed safety-net НА УРОВНЕ УЗЛА (R-012 F-4). Правила выше явно понимают только
+    # ключи из _HANDLED_KEYS; всё прочее — `allOf`/`anyOf`/`not`/`patternProperties`/
+    # ограничивающие ключевые слова (`maxLength`/`minLength`/`pattern`/`minimum`/`maximum`/
+    # `minItems`/`maxItems`/`format`/`const`/`multipleOf`/`uniqueItems`/`dependentRequired`/
+    # `prefixItems`/`additionalItems`/...) и любые будущие ключи draft'а — не разбирается.
+    # До этого fallback'а safety-net существовал только НА УРОВНЕ ФАЙЛА (см. classify_repo):
+    # срабатывал, только если для ВСЕГО файла список Change оказывался пустым. Одного
+    # распознанного изменения ГДЕ УГОДНО в том же файле (например, соседнего нового
+    # опционального поля) было достаточно, чтобы файловый fallback не сработал и
+    # неразобранный breaking-диф на ЭТОМ узле молча посчитался несуществующим. Проверяем
+    # КАЖДЫЙ узел независимо от соседей: если по ключам вне _HANDLED_KEYS/_DOC_ONLY_KEYS
+    # узел реально отличается — трактуем консервативно как BREAKING (тот же принцип, что
+    # $ref-retarget, R-006 F-1: не можем доказать безопасность — не утверждаем совместимость).
+    unrecognized_keys = (set(base) | set(head)) - _HANDLED_KEYS - _DOC_ONLY_KEYS
+    for key in sorted(unrecognized_keys):
+        if base.get(key) != head.get(key):
+            changes.append(
+                Change(
+                    "breaking",
+                    f"{path}.{key} — узел изменился, но для ключа '{key}' нет правила "
+                    "классификатора (allOf/anyOf/not/patternProperties/ограничивающие "
+                    "ключевые слова и т.п.); консервативно BREAKING — гейт не утверждает "
+                    "совместимость на неразобранном ключе (R-012 F-4)",
+                )
+            )
 
     return changes
 
