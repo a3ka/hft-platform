@@ -1,0 +1,320 @@
+#!/usr/bin/env bash
+# RED-проба для scripts/verify_design_claims.sh — анти-плацебо self-test.
+#
+# ЗАЧЕМ. Задача verify_design_claims.sh — ловить ровно ЧЕТЫРЕ класса лжи, которые
+# docs/DESIGN.md уже допустил за одни сутки (docs/ORCHESTRATION-STATE.md): [ЕСТЬ] на
+# несуществующий путь, покрытие инвариантов завышено, покрытие занижено, битая ссылка на
+# раздел, ссылка на удалённый файл. Гейт, не проверенный на срабатывание на КАЖДОМ из этих
+# классов, — сам заглушка (testing.md «Анти-плацебо»). Плюс контрольный PASS на корректном
+# документе — гейт, который падает всегда, так же бесполезен, как гейт, который не падает
+# никогда.
+#
+# Каждый сценарий строит СИНТЕТИЧЕСКУЮ копию мини-репозитория во временном каталоге (НЕ
+# трогает реальный docs/DESIGN.md) и зовёт РЕАЛЬНЫЙ scripts/verify_design_claims.sh с этим
+# каталогом как ROOT — тот же вызов, каким его гоняет reviewer/CI.
+set -uo pipefail
+
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+BARRIER="${BARRIER:-${ROOT}/scripts/verify_design_claims.sh}"
+
+FAILED=0
+pass() { echo "PASS  $*"; }
+fail() { echo "FAIL  $*"; FAILED=$((FAILED + 1)); }
+
+TMP_BASE="$(mktemp -d)"
+cleanup() { rm -rf "${TMP_BASE}"; }
+trap cleanup EXIT
+
+# ---------------------------------------------------------------------------
+# Общий каркас фикстуры: минимальный "хороший" мини-репозиторий, который сам по себе
+# обязан давать VERDICT: PASS. Каждый BAD-сценарий начинается с копии этого каркаса и
+# портит РОВНО ОДНУ вещь.
+# ---------------------------------------------------------------------------
+build_good_fixture() { # $1 = каталог назначения
+  local d="$1"
+  mkdir -p "${d}/docs" "${d}/crates/foo/tests" "${d}/crates/xx/tests" "${d}/milestones"
+
+  cat > "${d}/docs/OTHER.md" <<'EOF'
+# Другой документ
+Существует, на него можно ссылаться.
+EOF
+
+  cat > "${d}/crates/xx/tests/red_xx.rs" <<'EOF'
+//! RED-оракулы XX-I-1 и XX-I-2 (sacred).
+#[test]
+fn xx_i_1_something_holds() {
+    assert!(true, "XX-I-1: инвариант держится");
+}
+
+#[test]
+fn xx_i_2_something_else_holds() {
+    assert!(true, "XX-I-2: инвариант держится");
+}
+EOF
+
+  cat > "${d}/docs/DESIGN.md" <<'EOF'
+# Test Design Doc
+
+## §0. Тезис
+Вводный раздел, ссылается на `docs/OTHER.md` для деталей.
+
+## §1. Компонент foo
+Компонент `crates/foo` реализован и работает [ЕСТЬ].
+
+## §10. Фазовый роадмап
+
+| Фаза | Содержимое | Ворота | founder |
+|---|---|---|---|
+| P0 тест | заглушка | — | — |
+
+## §22. Инварианты платформы
+
+| Семейство | Зона | Заявлено | В оракулах | Статус |
+|---|---|---|---|---|
+| XX-I | тестовая зона | 2 | 2 | [ЧАСТИЧНО] |
+
+См. `DESIGN.md §0` и `DESIGN.md §1` выше.
+EOF
+
+  git -C "${d}" init -q 2>/dev/null || true
+}
+
+run_verify() { # $1 = fixture dir → печатает stdout, возвращает exit-код в $?
+  bash "${BARRIER}" "$1"
+}
+
+# ---------------------------------------------------------------------------
+# Сценарий 0 — корректный документ → PASS (контроль против «гейт падает всегда»)
+# ---------------------------------------------------------------------------
+scenario_good() {
+  local d="${TMP_BASE}/good"
+  build_good_fixture "${d}"
+  local out rc
+  out="$(run_verify "${d}")"; rc=$?
+  if [ "${rc}" -eq 0 ] && echo "${out}" | grep -q '^VERDICT: PASS'; then
+    pass "сценарий 0 (корректный документ): гейт даёт VERDICT: PASS, exit=0"
+  else
+    fail "сценарий 0 (корректный документ): ОЖИДАЛСЯ PASS, получено (exit=${rc}):"
+    echo "${out}" | sed 's/^/      /'
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Сценарий 1 — [ЕСТЬ] с несуществующим путём → FAIL [1-ЕСТЬ]
+# ---------------------------------------------------------------------------
+scenario_bad_est_missing_path() {
+  local d="${TMP_BASE}/bad1"
+  build_good_fixture "${d}"
+  sed -i 's#Компонент `crates/foo` реализован и работает \[ЕСТЬ\]\.#Компонент `crates/does-not-exist` реализован и работает [ЕСТЬ].#' "${d}/docs/DESIGN.md"
+  local out rc
+  out="$(run_verify "${d}")"; rc=$?
+  if [ "${rc}" -ne 0 ] && echo "${out}" | grep -q 'FAIL  \[1-ЕСТЬ\].*does-not-exist.*ОТСУТСТВУЕТ'; then
+    pass "сценарий 1 ([ЕСТЬ] на несуществующий путь): гейт даёт FAIL [1-ЕСТЬ], exit=${rc}"
+  else
+    fail "сценарий 1 ([ЕСТЬ] на несуществующий путь): ОЖИДАЛСЯ FAIL [1-ЕСТЬ], получено (exit=${rc}):"
+    echo "${out}" | sed 's/^/      /'
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Сценарий 1b — [ЕСТЬ] вовсе без пути рядом → FAIL [1-ЕСТЬ] «не проверяемо»
+# ---------------------------------------------------------------------------
+scenario_bad_est_no_path() {
+  local d="${TMP_BASE}/bad1b"
+  build_good_fixture "${d}"
+  sed -i 's#Компонент `crates/foo` реализован и работает \[ЕСТЬ\]\.#Компонент реализован и работает [ЕСТЬ], без ссылки на код.#' "${d}/docs/DESIGN.md"
+  local out rc
+  out="$(run_verify "${d}")"; rc=$?
+  if [ "${rc}" -ne 0 ] && echo "${out}" | grep -q 'FAIL  \[1-ЕСТЬ\].*без пути.*не проверяемо'; then
+    pass "сценарий 1b ([ЕСТЬ] без пути вовсе): гейт даёт FAIL [1-ЕСТЬ] «не проверяемо», exit=${rc}"
+  else
+    fail "сценарий 1b ([ЕСТЬ] без пути вовсе): ОЖИДАЛСЯ FAIL [1-ЕСТЬ], получено (exit=${rc}):"
+    echo "${out}" | sed 's/^/      /'
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Сценарий 2 — покрытие ЗАВЫШЕНО против грепа → FAIL [2-ПОКРЫТИЕ]
+# ---------------------------------------------------------------------------
+scenario_bad_coverage_overstated() {
+  local d="${TMP_BASE}/bad2"
+  build_good_fixture "${d}"
+  # в тестах реально 2 (XX-I-1, XX-I-2); документ заявит 3 — завышение (класс C-042 F-1)
+  sed -i 's#| XX-I | тестовая зона | 2 | 2 | \[ЧАСТИЧНО\] |#| XX-I | тестовая зона | 3 | 3 | [ЧАСТИЧНО] |#' "${d}/docs/DESIGN.md"
+  local out rc
+  out="$(run_verify "${d}")"; rc=$?
+  if [ "${rc}" -ne 0 ] && echo "${out}" | grep -q "FAIL  \[2-ПОКРЫТИЕ\].*XX-I.*заявляет 'в оракулах'=3.*strict=2"; then
+    pass "сценарий 2 (покрытие завышено): гейт даёт FAIL [2-ПОКРЫТИЕ], exit=${rc}"
+  else
+    fail "сценарий 2 (покрытие завышено): ОЖИДАЛСЯ FAIL [2-ПОКРЫТИЕ] заявлено=3/реально=2, получено (exit=${rc}):"
+    echo "${out}" | sed 's/^/      /'
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Сценарий 3 — покрытие ЗАНИЖЕНО против грепа → FAIL [2-ПОКРЫТИЕ] (класс C-041 Ф1)
+# ---------------------------------------------------------------------------
+scenario_bad_coverage_understated() {
+  local d="${TMP_BASE}/bad3"
+  build_good_fixture "${d}"
+  # добавляем ТРЕТИЙ реально привязанный тест XX-I-3, но документ по-прежнему пишет "2"
+  cat >> "${d}/crates/xx/tests/red_xx.rs" <<'EOF'
+
+#[test]
+fn xx_i_3_third_invariant_holds() {
+    assert!(true, "XX-I-3: инвариант держится");
+}
+EOF
+  local out rc
+  out="$(run_verify "${d}")"; rc=$?
+  if [ "${rc}" -ne 0 ] && echo "${out}" | grep -q "FAIL  \[2-ПОКРЫТИЕ\].*XX-I.*заявляет 'в оракулах'=2.*strict=3"; then
+    pass "сценарий 3 (покрытие занижено): гейт даёт FAIL [2-ПОКРЫТИЕ], exit=${rc}"
+  else
+    fail "сценарий 3 (покрытие занижено): ОЖИДАЛСЯ FAIL [2-ПОКРЫТИЕ] заявлено=2/реально=3, получено (exit=${rc}):"
+    echo "${out}" | sed 's/^/      /'
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Сценарий 3b — анти-плацебо C-042 F-1: упоминание в ЧУЖОМ (не домашнем) крейте не считается
+# оракулом для RK-I, даже без слова-маркера аналогии.
+# ---------------------------------------------------------------------------
+scenario_bad_rk_foreign_crate_not_counted() {
+  local d="${TMP_BASE}/bad3b"
+  build_good_fixture "${d}"
+  mkdir -p "${d}/crates/foreign/tests"
+  cat > "${d}/crates/foreign/tests/red_foreign.rs" <<'EOF'
+//! Комментарий-аналогия в ЧУЖОМ крейте: упоминает RK-I-1, но это НЕ risk/killswitch.
+#[test]
+fn foreign_test_mentions_rk_i_1_by_analogy() {
+    assert!(true, "прямой предок будущего RK-I-1, но это не тот крейт");
+}
+EOF
+  cat >> "${d}/docs/DESIGN.md" <<'EOF'
+
+| RK-I | риск (execution) | 10 | 0 | PENDING |
+EOF
+  # вставляем строку RK-I в таблицу §22 (после заголовка/разделителя таблицы уже есть XX-I —
+  # добавляем через sed, чтобы остаться внутри той же markdown-таблицы)
+  python3 - "${d}/docs/DESIGN.md" <<'PYEOF'
+import sys
+p = sys.argv[1]
+text = open(p, encoding="utf-8").read()
+text = text.replace(
+    "| XX-I | тестовая зона | 2 | 2 | [ЧАСТИЧНО] |\n\nСм.",
+    "| XX-I | тестовая зона | 2 | 2 | [ЧАСТИЧНО] |\n| RK-I | риск (execution) | 10 | 0 | PENDING |\n\nСм.",
+)
+open(p, "w", encoding="utf-8").write(text)
+PYEOF
+  local out rc
+  out="$(run_verify "${d}")"; rc=$?
+  # RK-I: документ заявляет 0, реальных оракулов в crates/risk|killswitch тоже 0 (крейтов
+  # нет вовсе) — упоминание в crates/foreign НЕ должно засчитаться → PASS для RK-I,
+  # и это ДОЛЖНО оставаться PASS (иначе анти-плацебо C-042 F-1 не работает).
+  if [ "${rc}" -eq 0 ] && echo "${out}" | grep -q "PASS  \[2-ПОКРЫТИЕ\].*RK-I.*в оракулах=0"; then
+    pass "сценарий 3b (анти-плацебо C-042: чужой крейт не считается оракулом RK-I): гейт корректно НЕ засчитал упоминание, exit=${rc}"
+  else
+    fail "сценарий 3b (анти-плацебо C-042): ОЖИДАЛСЯ PASS [2-ПОКРЫТИЕ] RK-I в оракулах=0 (упоминание в чужом крейте не считается), получено (exit=${rc}):"
+    echo "${out}" | sed 's/^/      /'
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Сценарий 4 — ссылка §99 на несуществующий раздел → FAIL [3-ССЫЛКИ]
+# ---------------------------------------------------------------------------
+scenario_bad_broken_section_ref() {
+  local d="${TMP_BASE}/bad4"
+  build_good_fixture "${d}"
+  # ВАЖНО: ссылка строится через printf из отдельных кусков (не литеральным текстом
+  # "DESIGN.md" + "§" + номер подряд нигде в этом файле) — иначе CHECK 3 самого
+  # verify_design_claims.sh, сканируя РЕАЛЬНЫЙ репозиторий (в котором лежит этот .sh-файл
+  # как обычный committed-файл), нашёл бы этот пример как настоящую битую ссылку на
+  # несуществующий раздел (self-referential ложный FAIL при прогоне гейта на самом себе).
+  # Тот же приём применён и здесь, в комментарии, — намеренно не пишем магическую строку
+  # рядом друг с другом.
+  local fake_section="99"
+  printf 'Ссылка на несуществующий раздел: DESIGN.md §%s.\n' "${fake_section}" >> "${d}/milestones/M-01-fake.md"
+  local out rc
+  out="$(run_verify "${d}")"; rc=$?
+  if [ "${rc}" -ne 0 ] && echo "${out}" | grep -q 'FAIL  \[3-ССЫЛКИ\].*§99.*нет в оглавлении'; then
+    pass "сценарий 4 (битая ссылка §99): гейт даёт FAIL [3-ССЫЛКИ], exit=${rc}"
+  else
+    fail "сценарий 4 (битая ссылка §99): ОЖИДАЛСЯ FAIL [3-ССЫЛКИ], получено (exit=${rc}):"
+    echo "${out}" | sed 's/^/      /'
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Сценарий 5 — ссылка на удалённый файл docs/*.md → FAIL [4-МЁРТВЫЕ-ФАЙЛЫ]
+# ---------------------------------------------------------------------------
+scenario_bad_dead_file_ref() {
+  local d="${TMP_BASE}/bad5"
+  build_good_fixture "${d}"
+  cat >> "${d}/docs/DESIGN.md" <<'EOF'
+
+Подробности были в `docs/GHOST.md` (файл удалён при миграции, ссылка осталась).
+EOF
+  local out rc
+  out="$(run_verify "${d}")"; rc=$?
+  if [ "${rc}" -ne 0 ] && echo "${out}" | grep -q 'FAIL  \[4-МЁРТВЫЕ-ФАЙЛЫ\].*docs/GHOST\.md.*не существует'; then
+    pass "сценарий 5 (ссылка на удалённый файл): гейт даёт FAIL [4-МЁРТВЫЕ-ФАЙЛЫ], exit=${rc}"
+  else
+    fail "сценарий 5 (ссылка на удалённый файл): ОЖИДАЛСЯ FAIL [4-МЁРТВЫЕ-ФАЙЛЫ], получено (exit=${rc}):"
+    echo "${out}" | sed 's/^/      /'
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Сценарий 6 — §10 объявляет фазу пройденной, а её milestone отсутствует → FAIL [5-ФАЗЫ]
+# (класс R-011 Б-1: фаза объявлена пройденной, а её ворота — нет)
+# ---------------------------------------------------------------------------
+scenario_bad_phase_milestone_missing() {
+  local d="${TMP_BASE}/bad6"
+  build_good_fixture "${d}"
+  sed -i 's#| P0 тест | заглушка | — | — |#| P0 тест ✅ | заглушка, цитирует M-77 | пройдено | — |#' "${d}/docs/DESIGN.md"
+  local out rc
+  out="$(run_verify "${d}")"; rc=$?
+  if [ "${rc}" -ne 0 ] && echo "${out}" | grep -q 'FAIL  \[5-ФАЗЫ\].*M-77.*отсутствует'; then
+    pass "сценарий 6 (фаза пройдена, milestone отсутствует): гейт даёт FAIL [5-ФАЗЫ], exit=${rc}"
+  else
+    fail "сценарий 6 (фаза пройдена, milestone отсутствует): ОЖИДАЛСЯ FAIL [5-ФАЗЫ], получено (exit=${rc}):"
+    echo "${out}" | sed 's/^/      /'
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Сценарий 7 — setup-guard: docs/DESIGN.md отсутствует вовсе → FAIL [SETUP], не тихий PASS
+# ---------------------------------------------------------------------------
+scenario_bad_setup_guard_missing_design() {
+  local d="${TMP_BASE}/bad7"
+  mkdir -p "${d}/docs"
+  local out rc
+  out="$(run_verify "${d}")"; rc=$?
+  if [ "${rc}" -ne 0 ] && echo "${out}" | grep -q 'FAIL  \[SETUP\].*docs/DESIGN.md не найден'; then
+    pass "сценарий 7 (setup-guard: DESIGN.md отсутствует): гейт даёт FAIL [SETUP], exit=${rc}"
+  else
+    fail "сценарий 7 (setup-guard: DESIGN.md отсутствует): ОЖИДАЛСЯ FAIL [SETUP], получено (exit=${rc}):"
+    echo "${out}" | sed 's/^/      /'
+  fi
+}
+
+echo "=== RED self-test: scripts/verify_design_claims.sh (BARRIER=${BARRIER}) ==="
+scenario_good
+scenario_bad_est_missing_path
+scenario_bad_est_no_path
+scenario_bad_coverage_overstated
+scenario_bad_coverage_understated
+scenario_bad_rk_foreign_crate_not_counted
+scenario_bad_broken_section_ref
+scenario_bad_dead_file_ref
+scenario_bad_phase_milestone_missing
+scenario_bad_setup_guard_missing_design
+
+echo
+if [ "${FAILED}" -eq 0 ]; then
+  echo "VERDICT: PASS"
+  exit 0
+else
+  echo "VERDICT: FAIL (${FAILED} нарушений)"
+  exit 1
+fi
