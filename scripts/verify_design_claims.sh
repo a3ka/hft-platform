@@ -17,9 +17,17 @@
 #
 # ПЯТЬ проверок (каждая — PASS/FAIL/INFO с причиной; INFO = не применимо/не проверяется
 # машинно на этой редакции документа — НЕ считается ни PASS, ни FAIL):
-#   1. Каждое `[ЕСТЬ]` в docs/DESIGN.md сопровождено путём к файлу/каталогу/тесту, и путь
-#      СУЩЕСТВУЕТ. Нет пути рядом → FAIL «не проверяемо». Путь есть, но не существует →
-#      FAIL «заявлено существующим, отсутствует».
+#   1. Каждое `[ЕСТЬ]`, стоящее в ОТДЕЛЬНОЙ ЯЧЕЙКЕ-СТОЛБЦЕ СОСТОЯНИЯ markdown-таблицы
+#      (нормативное утверждение о готовности), сопровождено пруфом, и пруф СУЩЕСТВУЕТ.
+#      Пруф — любая из равноправных форм: путь к файлу/каталогу/тесту, ссылка на milestone
+#      (`M-NN` → `milestones/M-NN-*.md`), ссылка на вердикт (`C-NNN` → `research/critiques/
+#      C-NNN-*.md`, `R-NNN` → `research/reviews/R-NNN-*.md`), голая ссылка на документ
+#      (`` `NN-name.md` ``). Нет пруфа рядом → FAIL «не проверяемо». Пруф есть, но не
+#      существует → FAIL «заявлено существующим, отсутствует». Уточнено 2026-08-01
+#      (docs/design-evolution дал 12 FAIL, большинство ложные): `[ЕСТЬ]` внутри
+#      ASCII-схемы (блок с `│┌└─` или внутри ``` ``` ```-фенса) или в прозе/списке —
+#      это картинка/отсылка к уже описанному, а не отдельное нормативное утверждение;
+#      пруф там НЕ требуется и не проверяется вовсе.
 #   2. Таблица покрытия инвариантов §22 (колонки «Заявлено»/«В оракулах») сверяется с
 #      РЕАЛЬНЫМ подсчётом уникальных идентификаторов `XX-I-N`, привязанных к тестам в
 #      `crates/**/tests/**`. Анти-плацебо (урок C-042 F-1): упоминание в комментарии
@@ -99,7 +107,16 @@ def read(path):
 
 
 # ---------------------------------------------------------------------------
-# CHECK 1 — `[ЕСТЬ]` сопровождён существующим путём
+# CHECK 1 — `[ЕСТЬ]` в ТАБЛИЦЕ СТАТУСОВ сопровождён существующим пруфом.
+#
+# Контекст решает, требуется ли пруф (уточнено 2026-08-01, см. комментарий сверху файла):
+#   - строка markdown-таблицы, где `[ЕСТЬ]` стоит В ОТДЕЛЬНОЙ ЯЧЕЙКЕ-СТОЛБЦЕ состояния
+#     (нормативное утверждение о готовности) → пруф ОБЯЗАТЕЛЕН;
+#   - ASCII-схема (внутри ``` ```-фенса — независимо от синтаксиса внутри) и проза/списки
+#     → пруф НЕ требуется и не проверяется вовсе (это картинка или отсылка к уже описанному,
+#     а не отдельное утверждение).
+# Формы пруфа — равноправны: путь/каталог/rust-path (как раньше), голая ссылка на документ
+# (`NN-name.md`), ссылка на milestone (`M-NN`), ссылка на вердикт (`C-NNN`/`R-NNN`).
 # ---------------------------------------------------------------------------
 
 PATH_TOKEN_RE = re.compile(
@@ -107,7 +124,12 @@ PATH_TOKEN_RE = re.compile(
     r"|`((?:crates|docs|scripts|research|milestones|contracts|\.claude)/[^`]*)`"  # `crates/...`, `docs/...`
     r"|`([A-Za-z_][A-Za-z0-9_:]*::[A-Za-z0-9_:]+)`"                              # `journal::stream`
 )
+BARE_DOC_RE = re.compile(r"`([A-Za-z0-9_.\-]+\.md)`")                            # `NN-name.md` (без слэша)
+MILESTONE_TOKEN_RE = re.compile(r"\bM-(\d+)\b")                                  # M-NN (голым текстом)
+CRITIQUE_TOKEN_RE = re.compile(r"\bC-(\d+)\b")                                   # C-NNN (research/critiques)
+REVIEW_TOKEN_RE = re.compile(r"\bR-(\d+)\b")                                     # R-NNN (research/reviews)
 MARKER_RE = re.compile(r"\[ЕСТЬ\]")
+CELL_STATUS_RE = re.compile(r"^[*_\s]*\[ЕСТЬ\]")                                 # маркер — начало ячейки
 
 
 def resolve_candidate(root, token):
@@ -123,30 +145,126 @@ def resolve_candidate(root, token):
     return False, token
 
 
+def resolve_bare_doc(root, name):
+    if os.path.exists(os.path.join(root, "docs", name)):
+        return True
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in (".git", "target", "node_modules")]
+        if name in filenames:
+            return True
+    return False
+
+
+def resolve_ref(root, subdir, prefix, num):
+    d = os.path.join(root, subdir)
+    if os.path.isdir(d):
+        rx = re.compile(rf"^{prefix}-{re.escape(num)}(?!\d).*\.md$")
+        for fn in os.listdir(d):
+            if rx.match(fn):
+                return True
+    return False
+
+
+def gather_proofs(root, line):
+    """Все равноправные формы пруфа, найденные в СТРОКЕ таблицы (может включать
+    несколько ячеек одной строки): (exists: bool, human_label: str) для каждой."""
+    proofs = []
+    for grp in PATH_TOKEN_RE.findall(line):
+        for tok in grp:
+            if tok:
+                exists, resolved = resolve_candidate(root, tok)
+                proofs.append((exists, f"путь `{resolved}`"))
+    for m in BARE_DOC_RE.finditer(line):
+        name = m.group(1)
+        proofs.append((resolve_bare_doc(root, name), f"документ `{name}`"))
+    for m in MILESTONE_TOKEN_RE.finditer(line):
+        num = m.group(1)
+        proofs.append((resolve_ref(root, "milestones", "M", num), f"milestone M-{num}"))
+    for m in CRITIQUE_TOKEN_RE.finditer(line):
+        num = m.group(1)
+        proofs.append((resolve_ref(root, os.path.join("research", "critiques"), "C", num), f"вердикт C-{num}"))
+    for m in REVIEW_TOKEN_RE.finditer(line):
+        num = m.group(1)
+        proofs.append((resolve_ref(root, os.path.join("research", "reviews"), "R", num), f"вердикт R-{num}"))
+    return proofs
+
+
+def compute_fence_lines(lines):
+    """Строки (1-based) внутри ``` ```-фенсов, включая маркеры фенса — исключаются из
+    поиска markdown-таблиц (пример синтаксиса таблицы в коде — не нормативная таблица)."""
+    fence = set()
+    in_fence = False
+    for idx, line in enumerate(lines, start=1):
+        if line.strip().startswith("```"):
+            fence.add(idx)
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            fence.add(idx)
+    return fence
+
+
+def parse_table_status_lines(lines, fence_lines):
+    """{line_no: cells} для строк-ДАННЫХ markdown-таблиц (не заголовков, не
+    разделителей), вне ``` ```-фенсов."""
+    table_line_no = {}
+    n = len(lines)
+
+    def is_row(ln):
+        return 1 <= ln <= n and ln not in fence_lines and TABLE_ROW_RE.match(lines[ln - 1])
+
+    def is_sep(ln):
+        return 1 <= ln <= n and ln not in fence_lines and TABLE_SEP_RE.match(lines[ln - 1])
+
+    i = 1
+    while i <= n:
+        if is_row(i) and is_sep(i + 1):
+            i += 2
+            while is_row(i):
+                cells = [c.strip() for c in lines[i - 1].strip().strip("|").split("|")]
+                table_line_no[i] = cells
+                i += 1
+        else:
+            i += 1
+    return table_line_no
+
+
 def check1(root, design_path, design_lines):
-    n_markers = n_without_path = n_broken_path = n_ok = 0
     rel_design = os.path.relpath(design_path, root)
+    fence_lines = compute_fence_lines(design_lines)
+    table_line_no = parse_table_status_lines(design_lines, fence_lines)
+
+    n_markers = n_table = n_exempt = n_without_proof = n_broken_proof = n_ok = 0
+
     for i, line in enumerate(design_lines, start=1):
         for _m in MARKER_RE.finditer(line):
             n_markers += 1
-            tokens = [g for grp in PATH_TOKEN_RE.findall(line) for g in grp if g]
-            if not tokens:
-                n_without_path += 1
+            cells = table_line_no.get(i)
+            in_status_cell = cells is not None and any(CELL_STATUS_RE.match(c) for c in cells)
+            if not in_status_cell:
+                # ASCII-схема (внутри ```-фенса) или проза/список — пруф не требуется.
+                n_exempt += 1
+                continue
+
+            n_table += 1
+            proofs = gather_proofs(root, line)
+            if not proofs:
+                n_without_proof += 1
                 fail(
                     "1-ЕСТЬ",
-                    f"{rel_design}:{i}: `[ЕСТЬ]` без пути к файлу/каталогу/тесту рядом — "
-                    f"утверждение не проверяемо. Строка: {line.strip()[:160]}",
+                    f"{rel_design}:{i}: `[ЕСТЬ]` в таблице статусов без пруфа "
+                    f"(путь/milestone/вердикт/документ) рядом — утверждение не проверяемо. "
+                    f"Строка: {line.strip()[:160]}",
                 )
                 continue
             line_ok = True
-            for tok in tokens:
-                exists, resolved = resolve_candidate(root, tok)
+            for exists, label in proofs:
                 if not exists:
                     line_ok = False
-                    n_broken_path += 1
+                    n_broken_proof += 1
                     fail(
                         "1-ЕСТЬ",
-                        f"{rel_design}:{i}: `[ЕСТЬ]` заявляет путь `{resolved}`, "
+                        f"{rel_design}:{i}: `[ЕСТЬ]` в таблице статусов заявляет {label}, "
                         f"он ОТСУТСТВУЕТ в дереве репозитория",
                     )
             if line_ok:
@@ -154,13 +272,24 @@ def check1(root, design_path, design_lines):
 
     if n_markers == 0:
         info("1-ЕСТЬ", "маркеров [ЕСТЬ] в docs/DESIGN.md не найдено — проверка неприменима на этой редакции документа")
-    elif n_without_path == 0 and n_broken_path == 0:
-        pass_("1-ЕСТЬ", f"все {n_markers} маркеров [ЕСТЬ] сопровождены существующим путём")
+    elif n_table == 0:
+        info(
+            "1-ЕСТЬ",
+            f"{n_markers} маркеров [ЕСТЬ], все вне таблиц статусов (ASCII-схемы/проза) — "
+            f"пруф не требуется, проверка неприменима",
+        )
+    elif n_without_proof == 0 and n_broken_proof == 0:
+        pass_(
+            "1-ЕСТЬ",
+            f"все {n_table} маркеров [ЕСТЬ] в таблицах статусов сопровождены существующим "
+            f"пруфом ({n_exempt} вне таблиц — ASCII-схемы/проза, не проверялись)",
+        )
     else:
         fail(
             "1-ЕСТЬ",
-            f"итог: {n_markers} маркеров, {n_ok} с валидным путём, "
-            f"{n_without_path} без пути рядом, {n_broken_path} путей не существуют",
+            f"итог по таблицам статусов: {n_table} маркеров, {n_ok} с валидным пруфом, "
+            f"{n_without_proof} без пруфа, {n_broken_proof} пруфов не существуют "
+            f"({n_exempt} маркеров вне таблиц — не проверялись)",
         )
 
 
