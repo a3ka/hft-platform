@@ -134,9 +134,17 @@ impl Transport for TelegramTransport {
             .map_err(|e| TransportError::Http(redact_reqwest_error(&e)))?;
         if !resp.status().is_success() {
             let status = resp.status();
-            let body = resp.text().unwrap_or_default();
+            // R-008 F-2 (rev2 находка): тело НЕ читается в сообщение. Оно получено от
+            // удалённой стороны — той же категории недоверенных данных, что и `reqwest::Error`
+            // выше (`redact_reqwest_error`): прокси/CDN/captive-portal/неверно настроенный
+            // `TELEGRAM_API_BASE` может эхом вернуть URI запроса, в котором вшит
+            // `TELEGRAM_BOT_TOKEN`. Инвариант тот же — "секрет живёт в значении, а не в
+            // конкретном форматтере", поэтому значение просто не попадает в `TransportError`.
+            // `status` безопасен: код + каноническая reason-phrase генерируются локально
+            // крейтом `http` по фиксированной таблице (RFC), это не эхо удалённого текста.
             return Err(TransportError::Http(format!(
-                "Telegram API вернул {status}: {body}"
+                "Telegram API вернул неуспешный статус {status} (тело ответа намеренно не \
+                 печатается — R-008 F-2, может нести секрет из URL запроса)"
             )));
         }
         Ok(())
