@@ -300,3 +300,92 @@ $ diff -u <(git show $MB:docs/DESIGN.md | awk '/^## §1\. /,/^## §9\. /') \
 `docs/DESIGN.md` переведён `STATUS: PROPOSED → ACTIVE`; `PROJECT-STATE.md` и
 `docs/PENDING-SIGNATURE.md` (П-001 → ЗАКРЫТО) обновлены. Пруфы CI/Deploy и повторного
 прогона `--merge-preview` — в дополнении ниже.
+
+---
+
+# Дополнение — исполнение merge и гейт §8 (reviewer, 2026-08-01)
+
+## Merge
+
+```
+$ git merge --no-ff origin/docs/design-evolution   # в worktree на origin/main (d6ff609)
+$ git log --oneline -3
+bebc405 docs(state): Блок 1 смержен — DESIGN.md ACTIVE в редакции AlphaQuant (R-014 APPROVED); П-001 ЗАКРЫТО (merge 22be1d9); TD-058/TD-059 заведены
+22be1d9 merge(docs): Блок 1 — эволюция DESIGN.md в редакцию AlphaQuant (R-014 APPROVED, подпись П-001)
+281713a docs(design): STATUS PROPOSED → ACTIVE — DOC-гейт класса A пройден (C-041/C-042/R-014 APPROVED), подпись founder'а П-001 от 2026-08-01
+
+$ git push origin HEAD:main
+   d6ff609..bebc405  HEAD -> main
+```
+
+- **Merge-коммит:** `22be1d9` (`--no-ff`), слияние чистое, конфликтов нет.
+- **`main` после push:** `bebc405`.
+- `docs/DESIGN.md` — `STATUS: **ACTIVE** (2026-08-01)`.
+
+## Барьер защищённых артефактов
+
+```
+$ bash scripts/check_protected_artifacts.sh $(git merge-base origin/main HEAD)
+OK: защищённые артефакты целы на HEAD (d6ff609..HEAD; проверка по РЕЗУЛЬТАТУ, не по способу)
+```
+
+## Повторный прогон гейта ПОСЛЕ merge — слияние не породило нового расхождения
+
+```
+$ git rev-parse --short origin/main HEAD     # bebc405 / bebc405
+$ bash scripts/verify_design_claims.sh --merge-preview origin/main; echo "exit=$?"
+PASS  [1-ЕСТЬ] все 3 маркеров [ЕСТЬ] в таблицах статусов сопровождены существующим пруфом (17 вне таблиц — ASCII-схемы/проза, не проверялись)
+PASS  [2-ПОКРЫТИЕ] §22: JR-I — заявлено=7, в оракулах=4 — подтверждено замером (loose=4)
+PASS  [3-ССЫЛКИ] все 6 ссылок `DESIGN.md §N` указывают на существующие разделы
+PASS  [4-МЁРТВЫЕ-ФАЙЛЫ] все 111 ссылок вида docs/*.md указывают на существующие файлы
+PASS  [5-ФАЗЫ] 4 строк(и) фаз, помеченных пройденными, не противоречат цитируемым milestone'ам (грубая проверка)
+
+VERDICT: PASS (0 нарушений)
+exit=0
+```
+
+(вывод сокращён до ключевых строк; все 12 строк `[2-ПОКРЫТИЕ]` — PASS, 0 нарушений)
+
+**Прогноз из основной части вердикта подтверждён фактом:** красное состояние ветки не
+пережило merge — на `main` гейт зелёный и в обычном режиме, и в режиме merge-превью.
+
+## Гейт §8 — CI + прод
+
+```
+$ gh run watch 30722574033 --exit-status
+✓ All checks passed in 4s (ID 91429126900)
+  ✓ Protected artifacts (gate trail)
+  ✓ fmt + clippy + test
+  ✓ cargo audit
+watch exit=0
+
+$ gh run list --limit 2
+completed  success  docs(state): Блок 1 смержен — DESIGN.md ACTIVE в редакции AlphaQuant …  CI  main  push  30722574033  5m52s
+completed  success  docs(rules): документ класса A проверяется на дереве слияния, а не на…  CI  main  push  30721766191  4m52s
+```
+
+**Deploy НЕ запускался — и это корректно, а не пропущенный гейт.** `.github/workflows/deploy.yml`
+триггерится по путям кода (`crates/**`, `Cargo.toml`, `Cargo.lock`, `Dockerfile`,
+`docker-compose.yml`, `.github/workflows/deploy.yml`). Merge — docs-only (проверено в
+Block-scope: ни одного касания `crates/**`), поэтому образ не пересобирался и прод не
+переразвёртывался. Утверждать «Deploy success» здесь было бы ложным пруфом.
+
+Прод проверен глазами независимо от этого (§8 п.2) — состояние ДО и ПОСЛЕ merge одно и то же:
+
+```
+$ ssh -i /home/nous/.ssh/hft_deploy -o IdentitiesOnly=yes root@167.233.192.131 \
+    'docker ps --format "{{.Names}} {{.Status}}"; cat .../recorder.heartbeat'
+hft-gateway-serve Up 19 hours (healthy)
+hft-recorder Up 19 hours (healthy)
+{"events":4375579,"free_bytes":84806402048,"min_free_bytes":10737418240,"next_seq":145952869,
+ "segment_index":153,"ts_wall_ms":1785625783817,"writable":true}
+```
+
+Контейнеры `(healthy)`, аптайм 19 часов (merge их не трогал — ожидаемо для docs-only),
+heartbeat свежий (`ts_wall_ms` отстаёт от текущего времени на ~7 с), `writable: true`,
+свободно 84.8 ГБ при пороге 10.7 ГБ.
+
+## Итог
+
+Блок 1 закрыт: `docs/DESIGN.md` — **ACTIVE** в редакции AlphaQuant на `main` (`bebc405`).
+П-001 снят с очереди подписи. Открыты `TD-058` (NOTE-1) и `TD-059` (NOTE-2) — зона architect.
