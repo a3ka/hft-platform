@@ -9,6 +9,16 @@
 > Volume Profile, VWAP) + **TPP-метрики** (Bid/Ask, Delta по %-полосам) + **встроенный AI-копилот**,
 > который в реальном времени по выбранной стратегии (напр. Fabio-style) говорит «что делаем и почему».
 > Рабочее имя: **Order Flow Intelligence Terminal** (бриф UX/UI — у founderّа).
+>
+> **Модель владения фронтом обновлена (2026-07-31, решение founder'а `DESIGN.md` §0/§13–§23).**
+> `code2alpha`/Next.js — БОЛЬШЕ НЕ личный проект founder'а вне продукта: терминал —
+> часть SaaS-продукта AlphaQuant (Ф4 `09-roadmap-v2.md`, MVP кокпита на Next.js).
+> Решения ниже (D1–D6, §5), где фронт трактуется как «зона founder'а» вне бэкенд-роадмапа,
+> сохранены как исторический decision-log (что было решено и когда), но актуальная модель
+> ответственности — продуктовая: терминал разрабатывается и владеется как часть платформы,
+> founder сохраняет ★-приёмку UX (`DESIGN.md` §10, Ф4). Техническое содержание про транспорт
+> (D1/D6 — `gateway-serve`, WS, JWT-мост) НЕ меняется — оно и есть та граница, на которой
+> Next.js-фронт (чей бы он ни был) стыкуется с Rust-ядром.
 
 ---
 
@@ -21,7 +31,10 @@
 - **Источники:** оставляем изначальные **Binance + Hyperliquid**. **OKX убран** (ранее рассматривался —
   отменён). Новые venue добавляем постепенно ПОТОМ.
 - **Фронт — founder** (`a3ka/code2alpha`, Next15 + lightweight-charts v5). **Мы — бэкенд +
-  стабильный экспорт-контракт.** M-19 (frontend cockpit) — зона founder'а. *(Транспорт уточнён 2026-07-23,
+  стабильный экспорт-контракт.** M-19 (frontend cockpit) — зона founder'а. **⟵ модель владения
+  пересмотрена 2026-07-31: фронт — часть продукта AlphaQuant (`DESIGN.md` §0/§13–§23, Ф4
+  `09-roadmap-v2.md`), не отдельный проект founder'а вне роадмапа; ★-приёмка UX за founder'ом
+  сохраняется.** *(Транспорт уточнён 2026-07-23,
   D1/D6: горячий WS держит Rust `gateway-serve` напрямую; Fastify как обязательный middle-tier ОТМЕНЁН —
   app-плоскость (auth/БД) = Next.js+Postgres.)*
 - Визуально: смесь **Bookmap + Trading Platform Pro (TPP)**. Референсы: `tmp/design_screens/`
@@ -65,7 +78,7 @@
 | **D3 AI размещение** | **Отдельный бэкенд-сервис `ai-copilot`** вне детерминированного ядра, зовёт внешний **мультимодальный LLM-API**, стримит на фронт через WS + пишет Audit-Log. Работает непрерывно без открытого UI. Модель-агностичен. | ✅ принято (провайдер — ждёт founder) |
 | **D4 MVP** | **MVP-1 (без блокеров, строим сейчас):** Read Gateway + heatmap + volume bubbles + COB + Volume Profile (SVP/CVP/FRVP) + CVD (session-reset 00:00 UTC) + VWAP. Цель — **Binance BTCUSDT**. **MVP-2:** TPP COIN→TOTAL, Event Engine, AI. | ✅ принято |
 | **D5 История** | **Tardis.dev** для истории с 2019 (Binance Spot BTCUSDT `incremental_book_L2` с 2019-12-01; futures с 2020-02). HL в 2019 НЕ существовал. Replay-окно (raw локально) — TBD; Storage Box — когда окно перерастёт диск. Бэкфил — отдельно (M-16-класс). | ✅ направление (бюджет — ждёт founder) |
-| **D6 App-плоскость** (2026-07-23) | **Две плоскости по природе данных, НЕ один Fastify-блоб.** (1) **Market-плоскость** — Rust `gateway-serve`: журнал → snapshot/frames/replay, **read-only, детерминированная, stateless по юзеру**. (2) **Application-плоскость** — **Next.js сам** (full-stack): auth (Auth.js/провайдер) + **Postgres** (Neon/Supabase/VPS) для `users/strategies/ai_chats/settings/audit_log`. **Fastify лишний** — Next.js нативно делает всё, что он делал бы. **Мост auth:** Next.js выпускает короткоживущий подписанный **JWT** (HS256 или **Ed25519** — как `INTG-I` founder-подписи); Rust ТОЛЬКО верифицирует подпись (крейт `jsonwebtoken`), в user-БД НЕ ходит. **Инвариант:** user-данные (стратегии/чаты/настройки) — в Postgres, **НЕ в market-журнале** (бережём `DET-I-1`, тот же класс, что `AI-I-1` «AI-выводы вне журнала»). Границы ответственности: app-стек (Next+Postgres+Auth) = founder; ядро (gateway-serve transport + verify-JWT, read-only) = architect. | ✅ принято (Path 1) |
+| **D6 App-плоскость** (2026-07-23) | **Две плоскости по природе данных, НЕ один Fastify-блоб.** (1) **Market-плоскость** — Rust `gateway-serve`: журнал → snapshot/frames/replay, **read-only, детерминированная, stateless по юзеру**. (2) **Application-плоскость** — **Next.js сам** (full-stack): auth (Auth.js/провайдер) + **Postgres** (Neon/Supabase/VPS) для `users/strategies/ai_chats/settings/audit_log`. **Fastify лишний** — Next.js нативно делает всё, что он делал бы. **Мост auth:** Next.js выпускает короткоживущий подписанный **JWT** (HS256 или **Ed25519** — как `INTG-I` founder-подписи); Rust ТОЛЬКО верифицирует подпись (крейт `jsonwebtoken`), в user-БД НЕ ходит. **Инвариант:** user-данные (стратегии/чаты/настройки) — в Postgres, **НЕ в market-журнале** (бережём `DET-I-1`, тот же класс, что `AI-I-1` «AI-выводы вне журнала»). Границы ответственности (2026-07-23, историческая запись): app-стек (Next+Postgres+Auth) = founder; ядро (gateway-serve transport + verify-JWT, read-only) = architect. **⟵ 2026-07-31: обе плоскости — части продукта AlphaQuant** (app-плоскость = Ф3, market-плоскость = ядро/гейтвей уже сегодня); техническая граница (Rust read-only ядро ↔ Next.js+Postgres app-плоскость, JWT-мост) не меняется, меняется только то, что app-плоскость — не личный проект founder'а вне роадмапа, а Ф3/Ф4 `09-roadmap-v2.md`. | ✅ принято (Path 1) |
 
 ## §6. Данные — открытый узел (depth-probe + TD-016)
 
@@ -135,7 +148,7 @@
 - **M-26 — Event Engine** (семантические события → UI + AI + alerts).
 - **M-27 — AI-Context Service + Audit Log** (+ внешний `ai-copilot` LLM-сервис).
 
-**Сходятся → M-19 Frontend cockpit** (founder).
+**Сходятся → M-19 Frontend cockpit** (Ф4 продукта; ★-приёмка UX за founder'ом — см. STATUS-примечание вверху).
 
 **Отложено целиком:** M-11 (risk/ks/oms), M-12 (runner/подпись), M-13 (HL depth), M-14 (DET-I-1 полный),
 M-10 стек-фиксы (сигналы), funding-стратегия.

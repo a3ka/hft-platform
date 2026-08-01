@@ -4,6 +4,13 @@
 5 параллельных аудит-агентов + разбор DESIGN/TECH-DEBT/PROJECT-STATE). Read-only анализ. Read-path
 (латентность/чекпоинт) НЕ здесь — он в `milestones/M-38-roadmap.md`. HEAD аудита: origin/main @ 1a31136.
 
+**Обновление 2026-07-31 (SaaS-решение founder'а, `DESIGN.md` §0/§13–§23).** Приоритизация ниже
+писалась под однопользовательский/кокпит-для-founder'а продукт. При многопользовательском SaaS
+на десятки тысяч пользователей меняется статус ровно одного пункта — **R7** (см. таблицу):
+из «HIGH, латентный долг» в «CRIT, блокер существования продукта» (`DESIGN.md` §16). Остальные
+риски (R1-R6, R8-R10) по существу не переоценены этим решением — асимметрия цены ошибки на
+их путях (данные/journal/quant) не зависит от числа пользователей.
+
 ## Executive summary
 Фундамент (журнал + контракты T1 + детерминизм + governance) — **крепкий и честный, выше типичного
 проекта такого масштаба**. Активной порчи данных на main НЕ найдено. Риски — по КРАЯМ (эксплуатация,
@@ -25,7 +32,7 @@
 | **R4** | HIGH | venue-hyperliquid/src/lib.rs, `tests/` НЕТ | 0 тестов на единственный парсер нормализации HL→Event (parse_l2book/trade/message). Не покрыто: объектный формат {px,sz,n} (код сам «CRITICAL»), malformed (VN-I-7 неверифиц.), MID-фильтр, snapshot-семантика. HL — первая венью (DESIGN §0), в проде, пишет данные. Регрессия уйдёт в журнал тихо/необратимо. | RED-суита паритетно venue-binance. Дёшево, высокий ROI. |
 | **R5** | HIGH | book/src/lib.rs | Staleness НЕ в типе (BK-I-3 не материализован). `depth_within`/`microprice`/`best_bid` — геттеры, не проверяют `self.stale`; `is_stale()` надо НЕ забыть вызвать. Кокпит покажет мёртвую ликвидность как живую (класс тихой лжи hft-core-rs). | Тип-барьер `BookView<Fresh\|Stale>` (как RiskApproved/ColdCopyProof), не bool. |
 | **R6** | HIGH | venue-binance-futures/src/lib.rs:229 | TD-016 фикс (эвикция distance-window + backstop-кап) НЕ портирован из spot. Внутренняя книга фьючерсов на непрерывном diff растёт unbounded. `bucket_levels` скопирован 1:1, общего venue-common нет. | Портировать эвикцию+backstop + RED; вынести общий книжный код в venue-common. |
-| **R7** | HIGH | gateway-serve/src/lib.rs:195, :528 | Неограниченные WS-соединения (spawn/коннект без cap → N клиентов = N полных сканов). + `GATEWAY_WINDOW_MS` parse-error ТИХО → None=unbounded (OOM-режим, разваливший прод). Единственное отступление от fail-closed. Noisy-neighbor с recorder (общий journal_dir). | (а) невалидный env → Err при старте; (б) cap соединений + rate-limit. В M-39 shared-tailer. |
+| **R7** | ~~HIGH~~ → **CRIT при SaaS** (повышен 2026-07-31, решение founder'а `DESIGN.md` §0/§13–§23) | gateway-serve/src/lib.rs:195, :528 | Неограниченные WS-соединения (spawn/коннект без cap → N клиентов = N полных сканов). + `GATEWAY_WINDOW_MS` parse-error ТИХО → None=unbounded (OOM-режим, разваливший прод). Единственное отступление от fail-closed. Noisy-neighbor с recorder (общий journal_dir). **При однопользовательском кокпите — эксплуатационный риск (мало клиентов); при SaaS на десятки тысяч пользователей — блокер существования продукта** (`DESIGN.md` §16 «Read-path под десятки тысяч пользователей»: N клиентов = N полных сканов журнала не масштабируется в принципе, не «пока не оптимизировано»). | (а) невалидный env → Err при старте; (б) cap соединений + rate-limit. Раньше — «в M-39 shared-tailer» (латентный долг); теперь — предусловие Ф2 `09-roadmap-v2.md` (shared-tailer + HOT-проекция + cap'ы/квоты, PL-I-4/PL-I-5), не опциональный рефакторинг. |
 | **R8** | HIGH | strategy/src/lib.rs:223 | `in_flight` перезаписывается, не аккумулируется: повторный интент до филла ПЕРЕЗАПИСЫВАЕТ → effective_pos недосчитывает → избыточный интент (сам ST-I-3 называет «двойная позиция в live», покрыл половину). Pre-risk сейчас; долг до P3. | RED (смена target до филла) + `in_flight += `. До P3 (oms). |
 | **R9** | HIGH | docs/03 §6, testing.md, CT-RFC | Заявленные sacred: INTG-I-1..7 (границы A/B/C) — 0 реальных тестов; CT-I-5 (Python-консюмер) — фикция (Python-кода нет). CT-RFC-02/03/04 STATUS: PROPOSED хотя MERGED. Читатель testing.md думает, что защита действует. | (1) синхр. RFC-статусы (PROPOSED→ADOPTED); (2) пометить INTG/CT-I-5 как «PENDING P3 — оракул не написан»; (3) INTG-оракулы RED-first перед safety-слоем. |
 | **R10** | HIGH | docker-compose, ops | (а) 0 ресурс-лимитов → OOM gateway-serve уводит ВЕСЬ хост + роняет recorder (нет cgroup-изоляции). (б) gateway-serve на loopback, нет `ports:`/reverse-proxy → WS-эндпоинт кокпита НЕДОСТИЖИМ (блокирует P-COCKPIT). (в) push-алертинг не задеплоен → слепота между ssh-проверками. | (а) `mem_limit` на сервис (recorder приоритетно); (б) проброс порта + reverse-proxy runbook; (в) минимальный cron-watchdog→Telegram. |
@@ -52,7 +59,7 @@
 | 1a | R4 | `M-41-venue-hyperliquid-tests` | PLANNED |
 | 1b | R9 + докс-дрейф | `M-42-docs-governance-sync` | PLANNED |
 | 1c | R10 | `M-43-ops-hardening` | PLANNED |
-| 2 | R5, R7 | встроены в `M-38b`/`M-39` (M-38-roadmap) | — |
+| 2 | R5, R7 | встроены в `M-38b`/`M-39` (M-38-roadmap); R7 теперь также = предусловие Ф2 `09-roadmap-v2.md` (см. R7 выше) | — |
 | 3 | R6 + TD-029/030/032/033 | `M-44-book-hardening` | PLANNED |
 | 5 | R3, R8, INTG-I-* | отложено до quant/P3 | DEFERRED |
 

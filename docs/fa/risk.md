@@ -1,3 +1,11 @@
+> **STATUS: DEFERRED — крейта не существует.** Документ описывает ШОВ будущего execution-слоя
+> (`docs/DESIGN.md` §21), а не реализацию. Execution и копи-трейдинг отложены на поздние фазы
+> (`docs/DESIGN.md` §10). Проверка: `ls crates/` — каталога `risk` там нет.
+>
+> **Источник канона `RK-I-1..10`.** `DESIGN.md` §4 определяет риск-инварианты и остаётся их
+> источником; этот документ — детализация. При старте фазы execution оба обновляются вместе
+> с T1-типами границы (contract-RFC).
+
 # risk — Functional Architecture (FA)
 
 > CORNERSTONE FA (safety spine). Authored by architect (Fable) 2026-07-10 как эталон

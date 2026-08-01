@@ -1,3 +1,7 @@
+> **STATUS: DEFERRED — крейта не существует.** Документ описывает ШОВ будущего execution-слоя
+> (`docs/DESIGN.md` §21), а не реализацию. Execution и копи-трейдинг отложены на поздние фазы
+> (`docs/DESIGN.md` §10). Проверка: `ls crates/` — каталога `killswitch` там нет.
+
 # killswitch — Functional Architecture (FA)
 
 > CORNERSTONE FA (independent safety cutoff, Layer 5). Authored by architect (Fable)

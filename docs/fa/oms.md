@@ -1,3 +1,7 @@
+> **STATUS: DEFERRED — крейта не существует.** Документ описывает ШОВ будущего execution-слоя
+> (`docs/DESIGN.md` §21), а не реализацию. Execution и копи-трейдинг отложены на поздние фазы
+> (`docs/DESIGN.md` §10). Проверка: `ls crates/` — каталога `oms` там нет.
+
 # oms — Functional Architecture (FA)
 
 > Authored by architect (Fable) 2026-07-10. STABLE/APPEND-ONLY. Исполнительный слой между
