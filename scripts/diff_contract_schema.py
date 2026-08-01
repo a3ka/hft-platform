@@ -14,6 +14,9 @@ docs/plans/contracts-einhard-inventory.md §1.5.2/§3 П2).
   - новый вариант enum / `oneOf`                  → ADDITIVE
   - новый файл схемы (новый T1-тип)               → ADDITIVE
   - удалённый файл схемы (T1-тип убран целиком)   → BREAKING
+  - `$ref` цель ссылки изменена (не разыменовывается) → BREAKING (консервативно, R-006 F-1)
+  - файл изменился побайтово, но правила выше ничего не нашли → BREAKING (fail-closed
+    safety-net; гейт никогда не утверждает "не изменилась" на изменённом файле, R-006 F-1)
 
 Не переносим доменные §4d правила einhard (lat/lon/heading — не наша предметная область,
 docs/plans/contracts-einhard-inventory.md §4). Это ЧИСТАЯ функция над двумя JSON-документами
@@ -58,6 +61,29 @@ def classify_node(base: object, head: object, path: str) -> list[Change]:
 
     if not isinstance(base, dict) or not isinstance(head, dict):
         return changes
+
+    # $ref (R-006 F-1): узел, представленный (полностью или частично) как {"$ref": "..."},
+    # не имеет ни одного из ключей ниже (properties/type/enum/...), поэтому до фикса
+    # перенацеливание $ref на другой существующий тип не давало НИ ОДНОГО Change → CLASS=none
+    # → скрипт печатал ФАКТИЧЕСКИ ЛОЖНОЕ "схема не изменилась". Мы не разыменовываем ссылку
+    # (чистая функция без каталога определений на этом уровне рекурсии) — трактуем ЛЮБОЕ
+    # изменение цели ссылки КОНСЕРВАТИВНО как BREAKING: доказать безопасность retarget'а без
+    # разыменования нельзя, а тихий "none" на реально изменённом узле хуже ложного breaking.
+    base_ref = base.get("$ref") if isinstance(base.get("$ref"), str) else None
+    head_ref = head.get("$ref") if isinstance(head.get("$ref"), str) else None
+    if base_ref != head_ref:
+        if base_ref is not None and head_ref is not None:
+            changes.append(
+                Change("breaking", f"{path}.$ref — цель ссылки изменена: '{base_ref}' → '{head_ref}' (не разыменовывается, трактуется консервативно)")
+            )
+        elif head_ref is not None:
+            changes.append(
+                Change("breaking", f"{path}.$ref — узел заменён ссылкой '{head_ref}' (было встроенное определение; трактуется консервативно)")
+            )
+        else:
+            changes.append(
+                Change("breaking", f"{path}.$ref — ссылка '{base_ref}' заменена встроенным определением (трактуется консервативно)")
+            )
 
     # properties
     base_props = base.get("properties", {}) if isinstance(base.get("properties"), dict) else {}
@@ -104,6 +130,14 @@ def classify_node(base: object, head: object, path: str) -> list[Change]:
     head_ap = head.get("additionalProperties", True)
     if base_ap is not False and head_ap is False:
         changes.append(Change("breaking", f"{path}.additionalProperties — сужено до false"))
+
+    # items — элемент массива (R-006 F-1: до фикса `items: {"$ref": ...}` — типовая форма
+    # schemars для `Vec<T>`, напр. L2Snapshot.bids/asks — не рекурсировался вовсе, поэтому
+    # смена элемента массива на несовместимый тип тоже проходила как CLASS=none).
+    base_items = base.get("items") if isinstance(base.get("items"), dict) else None
+    head_items = head.get("items") if isinstance(head.get("items"), dict) else None
+    if base_items is not None or head_items is not None:
+        changes.extend(classify_node(base_items or {}, head_items or {}, f"{path}.items"))
 
     # oneOf — T1 enum-варианты (Venue/MdPayload/EventKind/... — все закрытые enum'ы contracts)
     if "oneOf" in base or "oneOf" in head:
@@ -167,7 +201,24 @@ def classify_repo(base_files: dict[str, dict | None], head_files: dict[str, dict
         elif b is not None and h is None:
             all_changes.append(Change("breaking", f"{name} — файл схемы удалён (T1-тип убран)"))
         elif b is not None and h is not None:
-            all_changes.extend(classify_schema_file(b, h))
+            file_changes = classify_schema_file(b, h)
+            if not file_changes and json.dumps(b, sort_keys=True) != json.dumps(h, sort_keys=True):
+                # R-006 F-1, часть 2 (ложное утверждение в выводе): классификатор нигде не
+                # сравнивал СЫРОЕ содержимое файлов — "none" выводился из пустого списка
+                # Change, а не из факта равенства. Если JSON-содержимое файла реально
+                # отличается, а НИ ОДНО известное правило classify_node/classify_schema_file
+                # не сработало — это пробел в правилах классификатора, а не "схема не
+                # изменилась". Консервативно помечаем BREAKING (fail-closed): гейт никогда
+                # не должен утверждать "не изменилась" на демонстрируемо изменённом файле.
+                file_changes = [
+                    Change(
+                        "breaking",
+                        f"{name} — содержимое файла изменилось, но ни одно правило классификатора "
+                        "не распознало разницу (пробел в правилах); консервативно BREAKING, "
+                        "гейт не утверждает 'не изменилась' на изменённом файле (R-006 F-1)",
+                    )
+                ]
+            all_changes.extend(file_changes)
         # b is None and h is None — невозможно (name пришло из объединения ключей)
 
     if any(c.cls == "breaking" for c in all_changes):
