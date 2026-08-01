@@ -67,14 +67,72 @@ jobs:
       - name: Проба барьера (анти-плацебо)
         run: bash scripts/tests/red_protected_artifacts.sh
 
+  contracts:
+    name: Contracts gate (паритет + атомарный CT-RFC + additive/breaking)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: Swatinem/rust-cache@v2
+      - name: python3 jsonschema (S2 verify_contracts.sh — фикстуры против РЕАЛЬНОГО валидатора)
+        run: pip install --quiet jsonschema
+
+      # S0-S4: схема ↔ типы regen-diff (CT-I-4), фикстуры ↔ схема, CT-I-1 EventKind
+      # канарейка, roundtrip (обещан docs/05-contract-layer.md §5, дыра Д3 — файла не было).
+      - name: Гейт паритета Rust↔Schema↔фикстуры (verify_contracts.sh)
+        run: bash scripts/verify_contracts.sh
+
+      # Тот же fail-closed паттерн, что job `protected-artifacts` выше (блокер B1, 2026-07-11):
+      # на push-событии origin/main = только что запушенный коммит ⇒ диапазон пуст, если брать
+      # символическую ветку. База берётся ИЗ СОБЫТИЯ.
+      - name: Определить базу события (push=before, PR=base.sha; fail-closed)
+        id: base
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          case "${EVENT_NAME}" in
+            push)         raw="${PUSH_BEFORE}" ;;
+            pull_request) raw="${PR_BASE_SHA}" ;;
+            *) echo "неизвестное событие '${EVENT_NAME}'"; exit 1 ;;
+          esac
+          case "${raw}" in
+            *[!0]*) : ;;  # есть ненулевой символ — не zero-SHA
+            *) echo "база = zero-SHA/пусто (создание ветки/force-push) — контрактные гейты не могут определить дифф"; exit 1 ;;
+          esac
+          echo "sha=${raw}" >> "$GITHUB_OUTPUT"
+
+      # Атомарность изменения T1 (docs/05 §4) — машинный аналог того, что нашло CT-RFC-05 без
+      # RFC-документа (docs/plans/contracts-current-state.md, дыра Д2).
+      - name: Атомарность CT-RFC пакета (verify_ct_rfc_atomic.sh)
+        run: bash scripts/verify_ct_rfc_atomic.sh "${{ steps.base.outputs.sha }}"
+
+      # Сам барьер обязан быть проверен ТОЙ ЖЕ проводкой (анти-плацебо, .claude/rules/testing.md).
+      - name: Проба атомарного CT-RFC гейта (анти-плацебо, good/bad синтетические диффы)
+        run: bash scripts/tests/red_ct_rfc_atomic.sh
+
+      # Классификатор additive/breaking + связь breaking ⇒ обязательный bump SCHEMA_VERSION.
+      - name: Классификатор additive/breaking схемы (diff_contract_schema.sh)
+        run: bash scripts/diff_contract_schema.sh "${{ steps.base.outputs.sha }}"
+
+      # Сам классификатор обязан быть проверен ТОЙ ЖЕ проводкой (анти-плацебо, R-006 F-3):
+      # до этой пробы у самого сложного компонента набора (214 строк логики классификации)
+      # не было self-test'а вовсе — CI видел его только на реальном дифе, почти всегда пустом.
+      - name: Проба классификатора схемы (анти-плацебо, включая регресс-гварды $ref, R-006 F-1)
+        run: bash scripts/tests/red_diff_contract_schema.sh
+
   status-check:
     name: All checks passed
     runs-on: ubuntu-latest
-    needs: [build-test, security, delivery, protected-artifacts]
+    needs: [build-test, security, delivery, protected-artifacts, contracts]
     if: always()
     steps:
       - run: |
-          if [[ "${{ needs.build-test.result }}" != "success" || "${{ needs.security.result }}" != "success" || "${{ needs.delivery.result }}" != "success" || "${{ needs.protected-artifacts.result }}" != "success" ]]; then
+          if [[ "${{ needs.build-test.result }}" != "success" || "${{ needs.security.result }}" != "success" || "${{ needs.delivery.result }}" != "success" || "${{ needs.protected-artifacts.result }}" != "success" || "${{ needs.contracts.result }}" != "success" ]]; then
             echo "One or more checks failed"; exit 1
           fi
           echo "All checks passed"
