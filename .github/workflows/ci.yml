@@ -119,6 +119,12 @@ jobs:
       - name: Классификатор additive/breaking схемы (diff_contract_schema.sh)
         run: bash scripts/diff_contract_schema.sh "${{ steps.base.outputs.sha }}"
 
+      # Сам классификатор обязан быть проверен ТОЙ ЖЕ проводкой (анти-плацебо, R-006 F-3):
+      # до этой пробы у самого сложного компонента набора (214 строк логики классификации)
+      # не было self-test'а вовсе — CI видел его только на реальном дифе, почти всегда пустом.
+      - name: Проба классификатора схемы (анти-плацебо, включая регресс-гварды $ref, R-006 F-1)
+        run: bash scripts/tests/red_diff_contract_schema.sh
+
   status-check:
     name: All checks passed
     runs-on: ubuntu-latest
