@@ -9,7 +9,11 @@
 #   C-041 Ф1  — §22 заявляла VN-I = 0 тестов, фактически RED-суита из 40 тестов;
 #   R-004 Б3  — §18 описывал механизм изоляции как СУЩЕСТВУЮЩИЙ, в коде — пусто;
 #   R-011 Б-1 — §10 объявил фазу P2.5 пройденной, а её ворота выполненными; неверно ни то,
-#               ни другое.
+#               ни другое;
+#   R-013 Б-2/Б-3 — ПЯТЫЙ класс, другой: гейт прогнан на ветке (PASS), но `main` ушёл
+#               вперёд за те же сутки (M-50 добавил оракул JR-I-9, алертинг смержен) — на
+#               merge-цели ТЕ ЖЕ числа стали ложными. Документ был правдив на ветке и стал
+#               ложью в момент слияния; прогон на ветке необходим, но не достаточен.
 # Ошибки разнонаправленные (завышение/занижение/ложное существование/ложное «пройдено») —
 # значит дело не в невнимательности к конкретной строке, а в ОТСУТСТВИИ проверки как класса.
 # Правило «сверять замером, а не переносить из прежних текстов» (testing.md) само нарушалось
@@ -57,6 +61,21 @@
 #   (scripts/tests/red_verify_design_claims.sh), который гоняет синтетические копии
 #   документа во временных каталогах, НЕ трогая реальный docs/DESIGN.md.
 #
+#   scripts/verify_design_claims.sh --merge-preview <base-ref> [ROOT]
+#   Режим слияния (R-013): проверяет НЕ текущее дерево ROOT, а результат
+#   `<base-ref>` + HEAD(ROOT) — то дерево, куда документ реально попадёт после merge.
+#   Механика: временный `git worktree add --detach` из <base-ref>, затем
+#   `git merge --no-commit --no-ff <HEAD ROOT'а>` внутри него; движок читает получившийся
+#   каталог. ROOT ОБЯЗАН быть git-репозиторием с разрешимым HEAD; <base-ref> — любой
+#   git-ref, разрешимый из ROOT (`origin/main`, ветка, SHA). Временный worktree удаляется
+#   по выходу (успех/провал/сигнал — trap EXIT), реальный ROOT не трогается: ни коммитов,
+#   ни смены HEAD/ветки в нём не происходит.
+#   Setup-guard: ROOT не git-репозиторий, <base-ref> не резолвится, HEAD не резолвится,
+#   worktree не собрался, слияние КОНФЛИКТУЕТ — каждый из этих случаев даёт явный
+#   `FAIL [SETUP]` с описанием причины и завершает выполнение; молчаливого PASS при
+#   несобранном превью не бывает (тот же принцип setup-guard, что и у остальных проверок
+#   ниже — гейт обязан ЗНАТЬ, когда не смог проверить, и это FAIL, а не пустой отчёт).
+#
 # Никакого `cmd && echo PASS || echo FAIL` — вся агрегация (FAIL-счётчик, VERDICT,
 # exit-код) сделана явно внутри движка (Python — надёжнее POSIX-awk на markdown-таблицах
 # и Юникод-регулярках; сам движок ниже — единственное тело проверки, без промежуточных
@@ -66,7 +85,71 @@
 set -uo pipefail
 
 SCRIPT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-TARGET_ROOT="${1:-${SCRIPT_ROOT}}"
+
+MERGE_PREVIEW=0
+BASE_REF=""
+if [ "${1:-}" = "--merge-preview" ]; then
+  MERGE_PREVIEW=1
+  BASE_REF="${2:-}"
+  if [ -z "${BASE_REF}" ]; then
+    echo "FAIL  [SETUP] --merge-preview требует <base-ref> вторым аргументом (пример: --merge-preview origin/main)"
+    echo
+    echo "VERDICT: FAIL (1 нарушений)"
+    exit 1
+  fi
+  shift 2
+fi
+
+SOURCE_ROOT="${1:-${SCRIPT_ROOT}}"
+
+if [ "${MERGE_PREVIEW}" -eq 1 ]; then
+  if ! git -C "${SOURCE_ROOT}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    echo "FAIL  [SETUP] --merge-preview: '${SOURCE_ROOT}' — не git-репозиторий (или git недоступен), превью слияния собрать нельзя"
+    echo
+    echo "VERDICT: FAIL (1 нарушений)"
+    exit 1
+  fi
+  HEAD_SHA="$(git -C "${SOURCE_ROOT}" rev-parse HEAD 2>/dev/null)"
+  if [ -z "${HEAD_SHA}" ]; then
+    echo "FAIL  [SETUP] --merge-preview: не удалось определить HEAD в '${SOURCE_ROOT}' (пустой репозиторий/нет коммитов?)"
+    echo
+    echo "VERDICT: FAIL (1 нарушений)"
+    exit 1
+  fi
+  if ! git -C "${SOURCE_ROOT}" rev-parse --verify "${BASE_REF}^{commit}" >/dev/null 2>&1; then
+    echo "FAIL  [SETUP] --merge-preview: base-ref '${BASE_REF}' не резолвится в '${SOURCE_ROOT}' — превью собрать не из чего"
+    echo
+    echo "VERDICT: FAIL (1 нарушений)"
+    exit 1
+  fi
+
+  PREVIEW_DIR="$(mktemp -d "${TMPDIR:-/tmp}/verify-design-merge-preview.XXXXXX")"
+  cleanup_merge_preview() {
+    git -C "${SOURCE_ROOT}" worktree remove --force "${PREVIEW_DIR}" >/dev/null 2>&1
+    rm -rf "${PREVIEW_DIR}" 2>/dev/null
+  }
+  trap cleanup_merge_preview EXIT
+
+  if ! git -C "${SOURCE_ROOT}" worktree add --detach "${PREVIEW_DIR}" "${BASE_REF}" >/dev/null 2>&1; then
+    echo "FAIL  [SETUP] --merge-preview: не удалось создать временный worktree из base-ref '${BASE_REF}' — превью слияния не собрано"
+    echo
+    echo "VERDICT: FAIL (1 нарушений)"
+    exit 1
+  fi
+
+  if ! git -C "${PREVIEW_DIR}" -c user.name=verify-design-claims -c user.email=verify-design-claims@noreply.local \
+        merge --no-commit --no-ff "${HEAD_SHA}" >/dev/null 2>&1; then
+    git -C "${PREVIEW_DIR}" merge --abort >/dev/null 2>&1
+    echo "FAIL  [SETUP] --merge-preview: слияние base-ref '${BASE_REF}' + HEAD (${HEAD_SHA}) КОНФЛИКТУЕТ — merge-цель не собирается автоматически, документ на ней не проверяем; разреши конфликт вручную и прогони обычный режим на результате"
+    echo
+    echo "VERDICT: FAIL (1 нарушений)"
+    exit 1
+  fi
+
+  TARGET_ROOT="${PREVIEW_DIR}"
+else
+  TARGET_ROOT="${SOURCE_ROOT}"
+fi
 
 if ! command -v python3 >/dev/null 2>&1; then
   echo "FAIL  [SETUP] python3 не найден в PATH — гейт не может выполниться"
@@ -75,7 +158,12 @@ if ! command -v python3 >/dev/null 2>&1; then
   exit 1
 fi
 
-exec python3 - "${TARGET_ROOT}" <<'PYEOF'
+# ВАЖНО: без `exec` (в отличие от прежней версии) — `--merge-preview` регистрирует
+# cleanup-trap на EXIT (удаление временного worktree), а `exec` заменяет процесс bash и
+# уносит с собой все trap'ы, не дав им сработать. Без merge-preview trap не зарегистрирован
+# — поведение (stdout/exit-код) не меняется, просто shell-процесс на мгновение переживает
+# python3 вместо замены им.
+python3 - "${TARGET_ROOT}" <<'PYEOF'
 #!/usr/bin/env python3
 """Движок verify_design_claims.sh. Читает docs/DESIGN.md под ROOT (argv[1]) и репозиторий
 вокруг него, печатает PASS/FAIL/INFO построчно + финальный VERDICT, выходит с 0 (PASS)
@@ -629,3 +717,5 @@ def main():
 
 main()
 PYEOF
+py_rc=$?
+exit "${py_rc}"

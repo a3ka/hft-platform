@@ -430,6 +430,142 @@ scenario_bad_setup_guard_missing_design() {
   fi
 }
 
+# ---------------------------------------------------------------------------
+# Сценарий 8 — --merge-preview (R-013): документ ПРАВДИВ на ветке (HEAD) и ЛОЖЕН после
+# слияния с base-ref, потому что новый оракул приземлился в base ПОКА ветка отделялась.
+# Класс ровно тот, что поймал R-013 на JR-I (M-50 добавил JR-I-9 в main, пока
+# docs/design-evolution ждала гейтов): счётчик покрытия, верный для ветки, стал ложным
+# в дереве, куда документ реально едет.
+#
+# Анти-плацебо (testing.md): линии ОБЯЗАНЫ по-настоящему РАСХОДИТЬСЯ, иначе тест не отличит
+# реальное слияние от суррогата «--merge-preview втихую смотрит только на одну сторону».
+# Общий предок — ПОЧТИ пустой репозиторий (только .gitkeep, БЕЗ docs/DESIGN.md и БЕЗ
+# оракулов). От него — два независимых потомка:
+#   HEAD (branch-tip)  — полная good-фикстура (build_good_fixture): DESIGN.md ЕСТЬ,
+#                         XX-I: заявлено=2, оракулов=2 — ПРАВДА для ЭТОЙ ветки.
+#   base_main          — НЕ содержит DESIGN.md вовсе, добавляет ТОЛЬКО новый файл-оракул
+#                         XX-I-3 (имитация main, ушедшего вперёд независимо).
+# Три возможных исхода различимы:
+#   • обычный режим (родное рабочее дерево = HEAD)              → VERDICT: PASS
+#   • плацебо «--merge-preview смотрит только на base, не мержит HEAD» → FAIL [SETUP]
+#     «docs/DESIGN.md не найден» (в base его вообще нет) — ДРУГОЙ класс ошибки
+#   • настоящее слияние (--merge-preview base_main)              → FAIL [2-ПОКРЫТИЕ]
+#     claimed=2/strict=3 — оракул XX-I-3 из base ВМЕСТЕ с XX-I-1/2 и DESIGN.md из HEAD.
+# Тест проверяет ИМЕННО третий исход — если реализация врёт и даёт один из первых двух,
+# сценарий обязан упасть.
+# ---------------------------------------------------------------------------
+scenario_merge_preview_catches_branch_vs_merge_drift() {
+  local d="${TMP_BASE}/mergeprev8"
+  mkdir -p "${d}"
+  git -C "${d}" init -q
+  : > "${d}/.gitkeep"
+  git -C "${d}" add -A
+  git -C "${d}" -c user.name=test -c user.email=test@test.local commit -q -m "общий предок: почти пусто, без DESIGN.md и без оракулов"
+  local ancestor
+  ancestor="$(git -C "${d}" rev-parse HEAD)"
+
+  # HEAD (branch-tip): полная good-фикстура поверх предка.
+  build_good_fixture "${d}"
+  git -C "${d}" add -A
+  git -C "${d}" -c user.name=test -c user.email=test@test.local commit -q -m "branch tip: XX-I=2, правда здесь"
+  local branch_tip
+  branch_tip="$(git -C "${d}" rev-parse HEAD)"
+
+  # base_main: НЕЗАВИСИМАЯ ветка от ТОГО ЖЕ предка (не от branch_tip!) — не содержит
+  # DESIGN.md вовсе, добавляет только новый оракул. Реальная divergence, не suffix-commit.
+  git -C "${d}" checkout -q -b base_main "${ancestor}"
+  mkdir -p "${d}/crates/xx/tests"
+  cat > "${d}/crates/xx/tests/red_xx_extra.rs" <<'EOF'
+//! Прилетело в base (main) отдельным файлом, ПОКА ветка проходила круги гейтов —
+//! ровно класс M-50/JR-I-9 из R-013 (новый оракул в домашнем крейте, ветка о нём не знает).
+#[test]
+fn xx_i_3_landed_in_base_while_branch_was_in_review() {
+    assert!(true, "XX-I-3: третий оракул семейства, появился в base");
+}
+EOF
+  git -C "${d}" add -A
+  git -C "${d}" -c user.name=test -c user.email=test@test.local commit -q -m "base moved on: новый оракул XX-I-3, DESIGN.md здесь вообще нет"
+
+  # вернуться на исходный branch-tip (рабочее дерево = ровно то, что было в build_good_fixture)
+  git -C "${d}" checkout -q "${branch_tip}"
+
+  local out_branch rc_branch out_preview rc_preview
+  out_branch="$(run_verify "${d}")"; rc_branch=$?
+  out_preview="$(bash "${BARRIER}" --merge-preview base_main "${d}")"; rc_preview=$?
+
+  if [ "${rc_branch}" -eq 0 ] && echo "${out_branch}" | grep -q '^VERDICT: PASS' \
+     && [ "${rc_preview}" -ne 0 ] \
+     && echo "${out_preview}" | grep -q "FAIL  \[2-ПОКРЫТИЕ\].*XX-I.*заявляет 'в оракулах'=2.*strict=3" \
+     && ! echo "${out_preview}" | grep -q 'FAIL  \[SETUP\].*docs/DESIGN.md не найден'; then
+    pass "сценарий 8 (--merge-preview ловит дрейф ветка↔слияние, дерево РЕАЛЬНО расходится): ветка PASS (exit=${rc_branch}), --merge-preview FAIL [2-ПОКРЫТИЕ] (exit=${rc_preview})"
+  else
+    fail "сценарий 8 (--merge-preview): ОЖИДАЛСЯ ветка=PASS(0) + merge-preview=FAIL[2-ПОКРЫТИЕ] claimed=2/strict=3 (НЕ setup-guard «DESIGN.md не найден» — иначе слияние не настоящее), получено:"
+    echo "      --- обычный режим (exit=${rc_branch}) ---"
+    echo "${out_branch}" | sed 's/^/      /'
+    echo "      --- --merge-preview base_main (exit=${rc_preview}) ---"
+    echo "${out_preview}" | sed 's/^/      /'
+  fi
+
+  local wt_count
+  wt_count="$(git -C "${d}" worktree list --porcelain | grep -c '^worktree ')"
+  if [ "${wt_count}" -eq 1 ]; then
+    pass "сценарий 8b (--merge-preview): временный preview-worktree убран после прогона (worktree list = 1, нет утечки)"
+  else
+    fail "сценарий 8b (--merge-preview): временный preview-worktree НЕ убран после прогона (worktree list = ${wt_count}, ожидался 1):"
+    git -C "${d}" worktree list | sed 's/^/      /'
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Сценарий 9 — --merge-preview: слияние КОНФЛИКТУЕТ → FAIL [SETUP] с объяснением, НЕ
+# молчаливый PASS. Обе линии правят ОДНУ И ТУ ЖЕ строку docs/DESIGN.md по-разному.
+# ---------------------------------------------------------------------------
+scenario_merge_preview_conflict_is_setup_guard_fail() {
+  local d="${TMP_BASE}/mergeprev9"
+  build_good_fixture "${d}"
+  git -C "${d}" add -A
+  git -C "${d}" -c user.name=test -c user.email=test@test.local commit -q -m "branch tip"
+  local branch_tip
+  branch_tip="$(git -C "${d}" rev-parse HEAD)"
+
+  git -C "${d}" checkout -q -b base_main_conflict "${branch_tip}"
+  sed -i 's#Компонент foo реализован и работает#Компонент foo НЕ реализован, работа не начата#' "${d}/docs/DESIGN.md"
+  git -C "${d}" commit -qam "base: правит ту же строку §1"
+
+  git -C "${d}" checkout -q "${branch_tip}"
+  sed -i 's#Компонент foo реализован и работает#Компонент foo реализован и полностью протестирован#' "${d}/docs/DESIGN.md"
+  git -C "${d}" commit -qam "branch: правит ту же строку §1 иначе"
+
+  local out rc
+  out="$(bash "${BARRIER}" --merge-preview base_main_conflict "${d}")"; rc=$?
+  if [ "${rc}" -ne 0 ] && echo "${out}" | grep -q 'FAIL  \[SETUP\].*КОНФЛИКТУЕТ' \
+     && echo "${out}" | grep -q '^VERDICT: FAIL'; then
+    pass "сценарий 9 (--merge-preview: конфликт слияния): гейт даёт FAIL [SETUP] с объяснением, exit=${rc}"
+  else
+    fail "сценарий 9 (--merge-preview: конфликт слияния): ОЖИДАЛСЯ FAIL [SETUP] «КОНФЛИКТУЕТ», получено (exit=${rc}):"
+    echo "${out}" | sed 's/^/      /'
+  fi
+  git -C "${d}" merge --abort >/dev/null 2>&1 || true
+}
+
+# ---------------------------------------------------------------------------
+# Сценарий 10 — --merge-preview: base-ref не резолвится → FAIL [SETUP], не PASS/крэш
+# ---------------------------------------------------------------------------
+scenario_merge_preview_bad_base_ref_fails() {
+  local d="${TMP_BASE}/mergeprev10"
+  build_good_fixture "${d}"
+  git -C "${d}" add -A
+  git -C "${d}" -c user.name=test -c user.email=test@test.local commit -q -m "only commit"
+  local out rc
+  out="$(bash "${BARRIER}" --merge-preview no-such-ref-anywhere "${d}")"; rc=$?
+  if [ "${rc}" -ne 0 ] && echo "${out}" | grep -q 'FAIL  \[SETUP\].*base-ref .no-such-ref-anywhere. не резолвится'; then
+    pass "сценарий 10 (--merge-preview: base-ref не резолвится): гейт даёт FAIL [SETUP], exit=${rc}"
+  else
+    fail "сценарий 10 (--merge-preview: base-ref не резолвится): ОЖИДАЛСЯ FAIL [SETUP], получено (exit=${rc}):"
+    echo "${out}" | sed 's/^/      /'
+  fi
+}
+
 echo "=== RED self-test: scripts/verify_design_claims.sh (BARRIER=${BARRIER}) ==="
 scenario_good
 scenario_bad_est_missing_path
@@ -446,6 +582,9 @@ scenario_bad_broken_section_ref
 scenario_bad_dead_file_ref
 scenario_bad_phase_milestone_missing
 scenario_bad_setup_guard_missing_design
+scenario_merge_preview_catches_branch_vs_merge_drift
+scenario_merge_preview_conflict_is_setup_guard_fail
+scenario_merge_preview_bad_base_ref_fails
 
 echo
 if [ "${FAILED}" -eq 0 ]; then
