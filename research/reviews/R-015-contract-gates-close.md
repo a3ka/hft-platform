@@ -225,3 +225,26 @@ verify_ct_rfc_atomic → его self-test → diff_contract_schema → его se
 
 **APPROVED** → merge в `main` (`--no-ff`) + `PROJECT-STATE.md`/`TECH-DEBT.md` + пост-мерж
 деплой-гейт `gates.md` §8.
+
+## §8 post-merge деплой-гейт (`gates.md` §8) — ✅
+
+Merge в `main`: `295ec73` (`feat/contract-gates`, `--no-ff`), итоговый push `904ad2d`.
+
+```
+$ gh run view 30722874954 --json conclusion,jobs
+CI conclusion: success
+  fmt + clippy + test: success
+  Delivery gate (бинарь В ПРОД-ОБРАЗЕ, TD-020): success
+  Contracts gate (паритет + атомарный CT-RFC + additive/breaking): success   ← НОВЫЙ джоб
+  Protected artifacts (gate trail): success
+  cargo audit: success
+  All checks passed: success
+```
+
+Новый джоб `contracts` отработал в РЕАЛЬНОМ CI на merge-коммите и включён в `status-check`
+(условие джоба перечисляет 5 зависимостей — все `success`).
+
+Deploy-workflow на этом SHA **не запускался, и это корректно**: `deploy.yml` фильтрует пути
+(`crates/**`, `Cargo.toml`, `Cargo.lock`, `Dockerfile`, `docker-compose.yml`,
+`.github/workflows/deploy.yml`) — merge не тронул ни один, прод-бинарь не менялся.
+Проверка живого прода (eyes-on) — общая с `R-016`, см. там.

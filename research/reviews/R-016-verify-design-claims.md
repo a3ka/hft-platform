@@ -291,3 +291,31 @@ FAIL  [3-ССЫЛКИ] research/reviews/R-016-verify-design-claims.md:89: ссы
 
 **APPROVED** → merge в `main` (`--no-ff`) первым (до `feat/contract-gates`) +
 `PROJECT-STATE.md`/`TECH-DEBT.md` + пост-мерж деплой-гейт `gates.md` §8.
+
+## §8 post-merge деплой-гейт (`gates.md` §8) — ✅
+
+Merge в `main`: `465ccdf` (`feat/verify-design-claims`, `--no-ff`, первым), итоговый push
+`904ad2d` (`bc72282..904ad2d`).
+
+```
+$ gh run list --limit 1
+30722874954 CI 904ad2d completed success
+$ gh run view 30722874954 -q .conclusion
+success   (6/6 джобов, включая новый Contracts gate)
+```
+
+Deploy не триггерился (path-filter `deploy.yml`; merge — только `scripts/**` + вердикты +
+`PROJECT-STATE`/`TECH-DEBT`), поэтому прод-образ не пересобирался. Eyes-on живого прода
+после push (VPS `167.233.192.131`, 2026-08-01T23:18:43Z):
+
+```
+hft-gateway-serve Up 20 hours (healthy)
+hft-recorder      Up 20 hours (healthy)
+recorder.heartbeat: {"events":4404400,"free_bytes":84742017024,"min_free_bytes":10737418240,
+                     "next_seq":145981743,"segment_index":153,"ts_wall_ms":1785626313819,"writable":true}
+VPS HEAD cc5197c merge(alerting): feat/alerting rev4 ...
+```
+
+Heartbeat свежий (10 с), `writable=true`, `next_seq` растёт, свободно 84.7 GB; `VPS HEAD`
+остался на последнем КОДОВОМ деплое `cc5197c` — подтверждение, что инструментальный merge
+прод не двигал.
