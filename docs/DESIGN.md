@@ -269,7 +269,7 @@ mean-reversion. Первая гипотеза `H-20260710-obi-asym` обкаты
 
 | Урок | Их цена | Наше состояние |
 |---|---|---|
-| Алертинг вне машины | 14 дней 4 часа тишины, 335 млн тиков потеряно — при работающих Prometheus/Grafana | алертинга НЕТ вовсе (R10в); restart-policy ок — но это лишь половина их RCA |
+| Алертинг вне машины | 14 дней 4 часа тишины, 335 млн тиков потеряно — при работающих Prometheus/Grafana | код построен и смержен (`crates/ops` ops-watchdog, merge `cc5197c`, `R-010` APPROVED) — НЕ включён: ждёт `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` + строки cron от founder'а (`docs/PENDING-SIGNATURE.md` П-003); до включения транспорт — штатный no-op; restart-policy ок |
 | Offsite-копия данных | — (у них терялось иначе) | журнал в ЕДИНСТВЕННОЙ копии; ретеншен-apply ни разу не выполнялся (R1) |
 | Точный лимит у производителя | их октябрьский Redis-инцидент | наш производитель НЕ ограничен (полный снапшот 1 Гц = 96% объёма), уборщик в dry-run: мы в предаварийной точке их инцидента, только на диске вместо RAM. Выход: M-45 (§17) + M-40/R1 |
 | Ребут-дрилл после смены деплоя | их RCA прямо это предписывает | не проводился ни разу [ПЛАН §23.1] |
@@ -313,7 +313,7 @@ mean-reversion. Первая гипотеза `H-20260710-obi-asym` обкаты
 
 | Фаза | Содержимое | Acceptance-ворота | founder |
 |---|---|---|---|
-| **Ф0 Необратимость данных** 🚧 в работе | retention/compaction dedup (M-40 ✅), offsite-бэкап+restore-drill (R1), push-алертинг вне машины + ребут-дрилл (M-43), venue-hyperliquid RED-суита (M-41 ✅), doc-governance sync (M-42) | restore-drill проходит поверх восстановленного журнала; алерт доставлен ВНЕ машины при инъецированном отказе; ребут VPS → само поднялось; venue-hl suite GREEN | ★ приём restore-drill'а |
+| **Ф0 Необратимость данных** 🚧 в работе | retention/compaction dedup (M-40 ✅), offsite-бэкап+restore-drill (R1), push-алертинг вне машины (код [ЕСТЬ] — `crates/ops` ops-watchdog, `cc5197c`, `R-010`; включение ждёт токена founder'а — П-003) + ребут-дрилл (M-43, не проводился), venue-hyperliquid RED-суита (M-41 ✅), doc-governance sync (M-42) | restore-drill проходит поверх восстановленного журнала; алерт доставлен ВНЕ машины при инъецированном отказе; ребут VPS → само поднялось; venue-hl suite GREEN | ★ приём restore-drill'а |
 | **Ф1 Данные продукта (L2Delta)** | persist-L2Delta для всех символов кокпита (M-45), order-flow indicators (M-46), book-hardening (M-44), перемер объёмов после инверсии формата | book из (якорь+диффы) ≡ book из снапшотов (byte-identity); malformed diff → fail-closed; провенанс net-level сохранён; замер объёма/сут обновлён | — (подпись M-45 уже дана 2026-07-27) |
 | **Ф2 Read-path под SaaS** | shared-tailer+HOT-проекция (один проход журнала на процесс), cap'ы/квоты соединений fail-closed, JWT-claims тарифа в gateway-serve, `BookView<Fresh\|Stale>` (PL-I-7), нагрузочный стенд | X тыс. соединений/узел при O(1) сканах журнала; p95 snapshot-on-connect ≤ порога; деградационная лестница §16 продемонстрирована | — |
 | **Ф3 App-плоскость (Postgres+Next.js)** | Postgres (managed, PITR) + Auth.js→JWT-мост + CRUD (Profile/Workspace/decision-journal/alerts) + RLS + каркас биллинга (без включения) | e2e: регистрация→Workspace сохранён→JWT открывает WS-подписку по claims; PITR restore-drill пройден; RLS-тест (чужой tenant недоступен) | ★ выбор провайдеров |
@@ -835,7 +835,7 @@ Execution Agent (позже, §21).
 | ST-I | strategy | 10 | 8 | [ЧАСТИЧНО] |
 | CT-I | контрактный слой | 6 | 5 | [ЧАСТИЧНО] (CT-I-5 Python-консюмер — фикция, R9) |
 | GW-I | gateway-serve | 0 | 12 | обратный дрейф: оракулы есть, докс-семейство не заведено |
-| JR-I | event-store | 7 | 3 | [ЧАСТИЧНО] |
+| JR-I | event-store | 7 | 4 | [ЧАСТИЧНО] (`JR-I-9` — M-50, `crates/journal/tests/red_floor_scan*.rs`) |
 | RK-I | риск (execution) | 10 | **0** | PENDING execution-фазы |
 | INTG-I | границы A/B/C | 7 | **0** | **ЗАЯВЛЕНО БЕЗ ОРАКУЛОВ** — писать RED до Agent Runtime |
 | BK-I | book | 8 | **0** | ЗАЯВЛЕНО БЕЗ ОРАКУЛОВ (R5 staleness-тип — сюда) |
@@ -875,12 +875,19 @@ LIC-I — этап монетизации данных):
 Инцидент-обоснование: у hft-core-rs ребут 2025-11-03 + systemd `disabled` + Docker
 `RestartPolicy=no` + ненастроенные алерты = **14 дней 4 часа тишины, 335 млн потерянных
 тиков** — при работающих Prometheus/Grafana (RCA_REPORT_15DAY_DOWNTIME). У нас
-restart-policy в порядке (проверено: docker enabled, unless-stopped), но **push-алертинга
-нет вовсе** (R10в): слепота между ручными ssh-проверками. Для платного продукта 14 дней
-тишины = конец продукта; даже 14 часов ломают SLA подписки.
+restart-policy в порядке (проверено: docker enabled, unless-stopped). **Push-алертинг вне
+машины [ЕСТЬ]**: `crates/ops` (`ops-watchdog`, cron-бинарь + `TelegramTransport`), смержен
+в `main` (`cc5197c`, вердикт `R-010` APPROVED, четыре круга ревью), прод после деплоя
+проверен (контейнеры healthy, heartbeat свежий) — но канал **НЕ включён**: нужны
+`TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` в окружении VPS и строка в cron (готовая обёртка
+`scripts/watchdog_cron.sh`, инструкция `docs/runbooks/alerting.md`) — оба действия
+founder'а, открытая запись `docs/PENDING-SIGNATURE.md` П-003; до этого транспорт —
+штатный no-op, не падает. До включения слепота между ручными ssh-проверками сохраняется
+фактически (код готов, канал молчит). Для платного продукта 14 дней тишины = конец
+продукта; даже 14 часов ломают SLA подписки.
 
 Требования (фаза-предусловие GA, см. roadmap):
-1. **Push-алертинг вне машины** [ПЛАН, первым шагом — cron-watchdog → Telegram]:
+1. **Push-алертинг вне машины** [ЕСТЬ, код; ждёт токена founder'а — П-003]:
    heartbeat recorder'а, свежесть последнего события per venue×symbol, disk_free,
    RSS/CPU, watermark-лаг проекций, ошибки деплоя. Канал алерта живёт НЕ на
    наблюдаемой машине.
