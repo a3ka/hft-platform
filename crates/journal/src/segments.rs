@@ -421,6 +421,15 @@ fn parse_event_frames(data: &[u8]) -> io::Result<Vec<Event>> {
     Ok(out)
 }
 
+/// Санити-кап длины фрейма (T-CAP, M-50/TD-053 задача 1) — ОДНО имя, используемое И
+/// штатным ридером (`read_frame_payload`), И терпимым сканом пола (`resync_max_seq`).
+/// Раньше это были ДВЕ независимые константы (санити-кап ридера здесь = 64 MiB против
+/// капа carry скана пола = 64 KiB), дрейфующие врозь, — корень TD-053: валидный фрейм,
+/// который штатный ридер принимает, скан пола молча трактовал как порчу. Значение НЕ
+/// изменилось (то же 64 MiB, что было раньше) — изменилось то, что скан пола теперь
+/// СРАВНИВАЕТ крупного кандидата с ЭТИМ же числом, а не с капом памяти carry.
+const FRAME_LEN_SANITY_CAP: usize = 64 * 1024 * 1024;
+
 /// Прочитать payload одного frame'а (без десериализации). `Ok(None)` означает чистый
 /// EOF (нет даже 4 байт на длину). Resync через рваный фрейм — `journal::recover()`
 /// (M-05 J3), НЕ прод-путь.
@@ -440,7 +449,7 @@ fn read_frame_payload<R: Read>(mut r: R) -> io::Result<Option<Vec<u8>>> {
     let len = u32::from_le_bytes(len_buf) as usize;
 
     // Защита: гигантский len = почти наверняка мусор (crc на пустом payload не совпадёт).
-    if len > 64 * 1024 * 1024 {
+    if len > FRAME_LEN_SANITY_CAP {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("frame length absurd: {len}"),
@@ -1490,6 +1499,113 @@ const READABLE_SCAN_CHUNK: usize = 64 * 1024;
 /// (абсурдная заявленная длина), а не как валидный фрейм, разрезанный чтением чанками.
 const READABLE_SCAN_MAX_CARRY: usize = 64 * 1024;
 
+/// Источник side-верификации крупного кандидата (JR-I-9, M-50/TD-053): свежий,
+/// НЕЗАВИСИМЫЙ от основного скана поток, спозиционированный на абсолютное смещение
+/// `payload_offset` байт от начала потока событий (сразу ПОСЛЕ header). Отдельный
+/// дескриптор/декодер — иначе состояние основного скана (`r` в `resync_max_seq`) было бы
+/// испорчено попыткой заглянуть вперёд по тому же потоку. `None` — источник не
+/// переоткрылся (напр. файл исчез между шагами скана) — кандидат остаётся непроверенным
+/// (byte-resync, как и для любого другого мусора).
+trait LargeFrameVerifier {
+    fn open_at(&self, payload_offset: u64) -> Option<Box<dyn Read>>;
+}
+
+/// Сырой (несжатый) сегмент: side-источник — независимый файловый дескриптор,
+/// позиционированный `seek`'ом. `header_end` — смещение начала потока событий В ФАЙЛЕ
+/// (после magic+header; 0 для legacy-сегмента без магии).
+struct RawFrameVerifier<'a> {
+    path: &'a Path,
+    header_end: u64,
+}
+
+impl LargeFrameVerifier for RawFrameVerifier<'_> {
+    fn open_at(&self, payload_offset: u64) -> Option<Box<dyn Read>> {
+        let mut f = File::open(self.path).ok()?;
+        f.seek(SeekFrom::Start(
+            self.header_end.checked_add(payload_offset)?,
+        ))
+        .ok()?;
+        Some(Box::new(f))
+    }
+}
+
+/// Компактированный (`.zst`) сегмент: `zstd::Decoder` не `Seek` — side-источник
+/// переоткрывает поток С НАЧАЛА (свежий декодер, header пропускается заново) и
+/// потоково ОТБРАСЫВАЕТ `payload_offset` байт (чанками ограниченного размера, БЕЗ
+/// буферизации отброшенного префикса) — тот же принцип «повторная распаковка до
+/// offset'а», что описан в референс-дизайне milestone'а.
+struct ZstFrameVerifier<'a> {
+    path: &'a Path,
+}
+
+impl LargeFrameVerifier for ZstFrameVerifier<'_> {
+    fn open_at(&self, payload_offset: u64) -> Option<Box<dyn Read>> {
+        let f = File::open(self.path).ok()?;
+        let mut dec = zstd::Decoder::new(f).ok()?;
+        skip_v2_header_forward(&mut dec).ok()?;
+        skip_forward(&mut dec, payload_offset).ok()?;
+        Some(Box::new(dec))
+    }
+}
+
+/// Прочитать-и-отбросить РОВНО `n` байт из `r`, чанками фиксированного размера
+/// (`READABLE_SCAN_CHUNK`) — буфер НЕ растёт с `n`. `Err` — источник кончился раньше
+/// ожидаемого (расхождение с side-верификацией, которая уже подтвердила эти байты
+/// существующими; caller обязан трактовать это как останов, не как «данных нет»).
+fn skip_forward<R: Read>(r: &mut R, mut n: u64) -> io::Result<()> {
+    let mut buf = [0u8; READABLE_SCAN_CHUNK];
+    while n > 0 {
+        let take = n.min(buf.len() as u64) as usize;
+        r.read_exact(&mut buf[..take])?;
+        n -= take as u64;
+    }
+    Ok(())
+}
+
+/// Максимум байт удержанного префикса payload'а для декодирования ведущего varint `seq`
+/// (первое поле `Event` — `u64`, postcard LEB128 ≤ 10 B, см. milestone «Разбор проектных
+/// вопросов» п.2).
+const SEQ_PREFIX_CAP: usize = 10;
+
+/// Side-верификация ОДНОГО крупного кандидата (JR-I-9): CRC считается ПОТОКОВО через
+/// `verifier` (не через основной скан) чанками `READABLE_SCAN_CHUNK` — тело фрейма НЕ
+/// буферизуется ни целиком, ни долей (`fs_8`: пик памяти не растёт с `len`). Держим
+/// только удержанный префикс ≤`SEQ_PREFIX_CAP` байт для декодирования `seq`.
+///
+/// `Some(seq)` — CRC совпал И `seq` декодировался: фрейм валиден, тот же критерий, что и
+/// штатный ридер (сначала CRC, потом декод, см. milestone п.2). `None` — ЛЮБОЙ отказ (CRC
+/// не совпал, декодирование `seq` не удалось, источник кончился раньше ожидаемого) —
+/// кандидат трактуется как мусор, ресинк на 1 байт продолжается ровно как сегодня.
+fn verify_large_frame(
+    verifier: &dyn LargeFrameVerifier,
+    payload_offset: u64,
+    len: usize,
+) -> Option<u64> {
+    let mut src = verifier.open_at(payload_offset)?;
+    let mut hasher = crc32fast::Hasher::new();
+    let mut prefix: Vec<u8> = Vec::with_capacity(SEQ_PREFIX_CAP);
+    let mut remaining = len;
+    let mut chunk = [0u8; READABLE_SCAN_CHUNK];
+    while remaining > 0 {
+        let take = remaining.min(chunk.len());
+        src.read_exact(&mut chunk[..take]).ok()?;
+        if prefix.len() < SEQ_PREFIX_CAP {
+            let want = (SEQ_PREFIX_CAP - prefix.len()).min(take);
+            prefix.extend_from_slice(&chunk[..want]);
+        }
+        hasher.update(&chunk[..take]);
+        remaining -= take;
+    }
+    let mut crc_buf = [0u8; 4];
+    src.read_exact(&mut crc_buf).ok()?;
+    if hasher.finalize() != u32::from_le_bytes(crc_buf) {
+        return None;
+    }
+    postcard::take_from_bytes::<u64>(&prefix)
+        .ok()
+        .map(|(seq, _rest)| seq)
+}
+
 /// Терпимый потоковый байт-ресинк-скан УЖЕ ОТКРЫТОГО источника событий (после заголовка):
 /// та же логика, что у `parse_event_frames`/хвостового скана в `tail_last_seq_of` (CRC-ошибка
 /// / оборванный фрейм / ошибка постpost-декодирования → сдвиг на 1 байт вперёд), но при
@@ -1500,16 +1616,30 @@ const READABLE_SCAN_MAX_CARRY: usize = 64 * 1024;
 /// Ошибка чтения источника (напр. обрыв zstd-потока на bit-rot) трактуется как конец
 /// доступных данных — то, что уже распознано ДО неё, остаётся в результате (читаемый
 /// ПРЕФИКС), это и есть терпимость 5b.
-fn resync_max_seq<R: Read>(mut r: R) -> Option<u64> {
+///
+/// JR-I-9 (M-50/TD-053): кандидат, чей заявленный размер превышает `READABLE_SCAN_MAX_CARRY`
+/// (не помещается в удержанный carry), БОЛЬШЕ не трактуется как порча автоматически. Пока
+/// его полный размер (`len+8`) не превышает `FRAME_LEN_SANITY_CAP` — тот же санити-кап, что
+/// применяет штатный ридер (`read_frame_payload`) — он верифицируется ВТОРЫМ, независимым
+/// источником (`verifier`, `verify_large_frame`) потоково, без буферизации тела. Успех →
+/// `seq` входит в пол, основной скан перескакивает фрейм БЕЗ повторного чтения его тела.
+/// Провал (CRC не совпал / seq не декодировался / источник кончился раньше) → байт-ресинк
+/// `i+1`, ровно как для любого другого мусора — терпимость к порче не меняется.
+fn resync_max_seq<R: Read>(mut r: R, verifier: &dyn LargeFrameVerifier) -> Option<u64> {
     let mut carry: Vec<u8> = Vec::new();
     let mut max_seq: Option<u64> = None;
     let mut chunk = vec![0u8; READABLE_SCAN_CHUNK];
+    // Байт, прочитанных из `r` с начала потока событий — нужно, чтобы вычислить
+    // АБСОЛЮТНОЕ смещение крупного кандидата для side-верификации и для точного
+    // перескока основного потока за его пределы (без повторного чтения тела).
+    let mut total_read: u64 = 0;
     loop {
         // Обрыв потока (напр. bit-rot в zstd-стриме) трактуется как конец доступных данных.
         let n = r.read(&mut chunk).unwrap_or_default();
         let at_eof = n == 0;
         if n > 0 {
             carry.extend_from_slice(&chunk[..n]);
+            total_read += n as u64;
         }
 
         let mut i = 0usize;
@@ -1530,15 +1660,55 @@ fn resync_max_seq<R: Read>(mut r: R) -> Option<u64> {
                 }
             };
             if frame_end > carry.len() {
-                if at_eof || frame_end - i > READABLE_SCAN_MAX_CARRY {
-                    // Либо данных больше не будет (истинный EOF), либо заявленная длина
-                    // абсурдна для валидного события (заведомо порча, а не фрейм, разрезанный
-                    // границей чанка) — в обоих случаях ждать бессмысленно, ресинк на 1 байт.
+                let total_len = frame_end - i; // 4 (len) + payload + 4 (crc)
+                if total_len > FRAME_LEN_SANITY_CAP {
+                    // Абсурдная заявленная длина — мусор ПО ОПРЕДЕЛЕНИЮ ОБОИХ путей: такой
+                    // фрейм не прочитал бы и штатный ридер (`read_frame_payload`). Резинк на
+                    // 1 байт, как раньше (`fs_6`: правдоподобная-но-абсурдная длина).
                     i += 1;
                     continue;
                 }
-                // Возможно валидный фрейм, разрезанный чтением на чанки — дождаться ещё байт.
-                break;
+                if total_len <= READABLE_SCAN_MAX_CARRY {
+                    if at_eof {
+                        // Данных больше не будет — фрейм действительно оборван (не крупный
+                        // кандидат: помещается в кап carry, но так и не дочитался).
+                        i += 1;
+                        continue;
+                    }
+                    // Возможно валидный фрейм, разрезанный границей чтения — ждать ещё байт.
+                    break;
+                }
+                // JR-I-9: total_len между капом carry и санити-капом ридера — штатный ридер
+                // принял бы такую длину, значит скан пола не имеет права молча счесть её
+                // порчей. Side-верификация вторым источником (CRC потоково + seq-префикс).
+                let stream_pos = total_read - carry.len() as u64;
+                let frame_start_abs = stream_pos + i as u64;
+                let payload_off = frame_start_abs + 4;
+                match verify_large_frame(verifier, payload_off, len) {
+                    Some(seq) => {
+                        max_seq = Some(max_seq.map_or(seq, |m: u64| m.max(seq)));
+                        // Догнать основной поток до конца принятого фрейма и продолжить с
+                        // чистого carry — тело уже провалидировано вторым путём, повторно
+                        // буферизовать его в carry незачем (и это сломало бы границу памяти).
+                        let frame_end_abs = frame_start_abs + total_len as u64;
+                        let to_skip = frame_end_abs.saturating_sub(total_read);
+                        if skip_forward(&mut r, to_skip).is_err() {
+                            // Основной поток разошёлся с side-источником одного и того же
+                            // файла — не должно происходить штатно; fail-closed: то, что уже
+                            // накоплено (включая этот фрейм), остаётся результатом, скан
+                            // останавливается, а не рискует неверной позицией.
+                            return max_seq;
+                        }
+                        total_read += to_skip;
+                        carry.clear();
+                        i = 0;
+                        continue;
+                    }
+                    None => {
+                        i += 1;
+                        continue;
+                    }
+                }
             }
             let payload = &carry[i + 4..i + 4 + len];
             let stored_crc = u32::from_le_bytes(carry[i + 4 + len..frame_end].try_into().unwrap());
@@ -1596,7 +1766,10 @@ fn tolerant_max_seq_from_start(path: &Path) -> io::Result<Option<u64>> {
         if skip_v2_header_forward(&mut decoder).is_err() {
             return Ok(None); // заголовок битый — читаемого префикса нет
         }
-        return Ok(resync_max_seq(decoder));
+        // JR-I-9 (M-50): side-источник для крупных кандидатов — свежий декодер,
+        // переоткрытый С НАЧАЛА файла на каждую верификацию (`.zst` не Seek).
+        let verifier = ZstFrameVerifier { path };
+        return Ok(resync_max_seq(decoder, &verifier));
     }
 
     let mut file = match File::open(path) {
@@ -1612,8 +1785,12 @@ fn tolerant_max_seq_from_start(path: &Path) -> io::Result<Option<u64>> {
     }
     // Позиция файла — сразу после заголовка (магия+header) либо 0 (legacy, без магии):
     // `read_v2_header_and_skip` уже это гарантирует (`Ok(Some(_))` либо `Ok(None)` с откатом).
+    let header_end = file.stream_position()?;
     let reader = BufReader::with_capacity(64 * 1024, file);
-    Ok(resync_max_seq(reader))
+    // JR-I-9 (M-50): side-источник для крупных кандидатов — независимый файловый
+    // дескриптор, позиционируемый `seek`'ом (сырой формат — Seek доступен).
+    let verifier = RawFrameVerifier { path, header_end };
+    Ok(resync_max_seq(reader, &verifier))
 }
 
 /// Пометить декларацию применённой: переименование `journal.force-next-seq.json` →
