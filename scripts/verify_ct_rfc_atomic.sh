@@ -23,10 +23,18 @@
 # диффы — good обязан PASS, каждый bad, недостающий РОВНО один артефакт, обязан FAIL).
 set -uo pipefail
 
-# НЕ cd в каталог скрипта (в отличие от verify_M-NN.sh) — гейт обязан оперировать ТЕКУЩИМ
-# рабочим деревом вызывающего (как scripts/check_protected_artifacts.sh), иначе self-test
+# НЕ cd в каталог СКРИПТА (в отличие от verify_M-NN.sh) — гейт обязан оперировать ТЕКУЩИМ
+# git-репозиторием вызывающего (как scripts/check_protected_artifacts.sh), иначе self-test
 # (scripts/tests/red_ct_rfc_atomic.sh), гоняющий барьер против синтетических repo-песочниц
 # в /tmp, молча проверял бы СОБСТВЕННЫЙ репозиторий скрипта вместо песочницы.
+#
+# НО (R-006 F-2): дифф обязан покрывать ВЕСЬ репозиторий, а не текущий каталог вызывающего.
+# До фикса `git diff ... -- .` ограничивал pathspec ТЕКУЩИМ КАТАЛОГОМ — из любого подкаталога,
+# кроме корня, правка crates/contracts/src/** становилась невидимой diff'у, "нечего проверять"
+# → PASS. Это молчаливый fail-open, ровно класс M-40. Якорим на корень репозитория ТЕКУЩЕГО
+# репо явно (`git rev-parse --show-toplevel`) и используем `git -C <root>` без ограничивающего
+# pathspec — так self-test-песочницы (которые cd'ят в свой собственный корень перед вызовом,
+# scripts/tests/red_ct_rfc_atomic.sh:49) по-прежнему видят СВОЙ репозиторий, а не хост-репо.
 
 BASE_REF="${1:-origin/main}"
 
@@ -34,8 +42,19 @@ FAILED=0
 pass() { echo "PASS  $*"; }
 fail() { echo "FAIL  $*"; FAILED=$((FAILED + 1)); }
 
+# ── setup-guard (fail-closed): корень репозитория обязан резолвиться из ТЕКУЩЕГО cwd ──
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+if [ -z "${REPO_ROOT}" ]; then
+  echo "FAIL  setup-guard: не удалось определить корень репозитория (git rev-parse"
+  echo "      --show-toplevel) — вне git-репозитория? Гейт не может достоверно определить"
+  echo "      дифф, это FAIL, не молчаливый пропуск (R-006 F-2)"
+  echo
+  echo "VERDICT: FAIL"
+  exit 1
+fi
+
 # ── setup-guard (fail-closed): база обязана существовать и иметь общего предка с HEAD ──
-if ! git rev-parse -q --verify "${BASE_REF}^{commit}" >/dev/null 2>&1; then
+if ! git -C "${REPO_ROOT}" rev-parse -q --verify "${BASE_REF}^{commit}" >/dev/null 2>&1; then
   echo "FAIL  setup-guard: база '${BASE_REF}' не найдена (fetch? опечатка?) — гейт не может"
   echo "      определить дифф, это FAIL, не молчаливый пропуск"
   echo
@@ -43,7 +62,7 @@ if ! git rev-parse -q --verify "${BASE_REF}^{commit}" >/dev/null 2>&1; then
   exit 1
 fi
 
-MERGE_BASE="$(git merge-base "${BASE_REF}" HEAD 2>/dev/null || true)"
+MERGE_BASE="$(git -C "${REPO_ROOT}" merge-base "${BASE_REF}" HEAD 2>/dev/null || true)"
 if [ -z "${MERGE_BASE}" ]; then
   echo "FAIL  setup-guard: нет общего предка между '${BASE_REF}' и HEAD — история разошлась"
   echo
@@ -51,9 +70,11 @@ if [ -z "${MERGE_BASE}" ]; then
   exit 1
 fi
 
-# Дифф = merge-base..рабочее дерево (коммиты этой ветки + незакоммиченные правки — гейт
-# полезен и ДО коммита, как самопроверка перед push, не только как CI-джоб постфактум).
-mapfile -t CHANGED_PATHS < <(git diff --name-only "${MERGE_BASE}" -- . 2>/dev/null || true)
+# Дифф = merge-base..рабочее дерево ВСЕГО репозитория (не текущего каталога вызывающего;
+# коммиты этой ветки + незакоммиченные правки — гейт полезен и ДО коммита, как самопроверка
+# перед push, не только как CI-джоб постфактум). `-C ${REPO_ROOT}` без pathspec гарантирует
+# полный дифф с путями, относительными к корню репо, независимо от cwd вызывающего (F-2).
+mapfile -t CHANGED_PATHS < <(git -C "${REPO_ROOT}" diff --name-only "${MERGE_BASE}" 2>/dev/null || true)
 
 touched_contracts_src=0
 for p in "${CHANGED_PATHS[@]:-}"; do
