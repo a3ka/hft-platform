@@ -122,7 +122,7 @@ next_seq = max( hwm_tail,  max_i(tail_last_seq_of(shard_i)) + 1,  meta_seq )
 Каждый шард ведёт `manifest.json`: на сегмент — `{index, first_seq, last_seq, event_count,
 digest}`, обновляется при ротации (то есть редко, как и HWM).
 
-**Инвариант полноты (`JR-I-9`, новый):**
+**Инвариант полноты (`JR-I-13`, новый — `JR-I-9` ЗАНЯТ M-50, замер `C-053` G-11):**
 ```
 Σ event_count(живые шарды) + Σ event_count(записи мета-журнала удалений)
     == max_seq − min_seq + 1
