@@ -724,10 +724,18 @@ EOF
   fi
 }
 
-# --- B-1 (закрытый список причин, п.1 SKIP-DIGITS; закрывает N-3 R-020): чисто цифровой
-# токен в параграфе СО словом «коммит» — это НЕ SHA (fixed-point ×1e8 константа), ложный FAIL
-# недопустим. Но и молчания недопустимо: токен обязан быть ПЕРЕЧИСЛЕН как SKIP-DIGITS.
-scenario_rfc_sha_digits_token_skipped_and_listed() {
+# --- N-3 (R-020) закрывается НЕ безусловным пропуском цифровых токенов, а явным маркером.
+#
+# ПОЧЕМУ НЕ SKIP-DIGITS. Правило «чисто цифровой токен не проверяется» выводит из-под гейта
+# канонические выдуманные SHA `0000000` и `1111111` — ровно те, которыми пользуется и
+# существующий сценарий RFC-SHA-fake, и репро самого R-020. То есть закрытый список причин
+# заново открыл бы дыру, ради которой B-1 и заведён (fail-open в fail-closed гейте).
+# Замер на реальном корпусе (merge-цель origin/main): чисто цифровой токен ровно ОДИН —
+# `0999929`, и это НАСТОЯЩИЙ коммит; ни одной fixed-point константы в backtick'ах в
+# docs/DESIGN.md + docs/rfc/ нет. Значит fail-closed на цифрах не стоит ничего, а ложный FAIL
+# на будущую константу закрывается тем же машинным маркером, что и любой другой не-коммит:
+# <!-- not-a-commit: 100000000 -->. Ambiguity разрешается В ПОЛЬЗУ ПРОВЕРКИ.
+scenario_rfc_sha_digits_token_is_fail_closed() {
   local d="${TMP_BASE}/rfc_sha_digits"
   local real_sha
   real_sha="$(build_rfc_fixture_base "${d}")"
@@ -739,12 +747,31 @@ scenario_rfc_sha_digits_token_skipped_and_listed() {
 EOF
   local out rc
   out="$(run_verify "${d}")"; rc=$?
-  if [ "${rc}" -eq 0 ] && ! echo "${out}" | grep -q 'FAIL  \[6-RFC-SHA\]' \
-     && echo "${out}" | grep -q '\[6-RFC-SHA\] SKIP-DIGITS.*100000000'; then
-    pass "сценарий RFC-SHA-digits (чисто цифровой токен): ложного FAIL нет И токен перечислен как SKIP-DIGITS, exit=${rc}"
+  if [ "${rc}" -ne 0 ] && echo "${out}" | grep -q 'FAIL  \[6-RFC-SHA\].*`100000000`'; then
+    pass "сценарий RFC-SHA-digits-failclosed (цифровой токен БЕЗ маркера): гейт fail-closed → FAIL [6-RFC-SHA], exit=${rc}"
   else
-    fail "сценарий RFC-SHA-digits: ОЖИДАЛОСЬ отсутствие FAIL [6-RFC-SHA] И строка SKIP-DIGITS с токеном 100000000 (остаток обязан быть виден), получено (exit=${rc}):"
+    fail "сценарий RFC-SHA-digits-failclosed: ОЖИДАЛСЯ FAIL [6-RFC-SHA] на 100000000 — неизвестная форма ПРОВЕРЯЕТСЯ, а не пропускается (иначе выдуманные 0000000/1111111 уходят из-под гейта), получено (exit=${rc}):"
     echo "${out}" | sed 's/^/      /'
+  fi
+
+  # Тот же токен, объявленный маркером, — не FAIL, но ОБЯЗАН быть перечислен (N-3 закрыт).
+  local d2="${TMP_BASE}/rfc_sha_digits_declared"
+  local real_sha2
+  real_sha2="$(build_rfc_fixture_base "${d2}")"
+  cat > "${d2}/docs/rfc/CT-RFC-TEST-sha-digits-declared.md" <<EOF
+# CT-RFC-TEST — тот же литерал, объявленный маркером
+
+<!-- not-a-commit: 100000000 -->
+Коммит \`${real_sha2}\` ввёл fixed-point ×1e8: множитель \`100000000\` — константа.
+EOF
+  local out2 rc2
+  out2="$(run_verify "${d2}")"; rc2=$?
+  if [ "${rc2}" -eq 0 ] && ! echo "${out2}" | grep -q 'FAIL  \[6-RFC-SHA\]' \
+     && echo "${out2}" | grep -q '\[6-RFC-SHA\] SKIP-DECLARED.*100000000'; then
+    pass "сценарий RFC-SHA-digits-declared (N-3: маркер not-a-commit): ложного FAIL нет И токен перечислен как SKIP-DECLARED, exit=${rc2}"
+  else
+    fail "сценарий RFC-SHA-digits-declared (N-3): ОЖИДАЛОСЬ отсутствие FAIL [6-RFC-SHA] И строка SKIP-DECLARED с токеном 100000000, получено (exit=${rc2}):"
+    echo "${out2}" | sed 's/^/      /'
   fi
 }
 
@@ -842,20 +869,19 @@ EOF
     fail "сценарий RFC-SHA-no-inapplicable/второй токен: ОЖИДАЛСЯ FAIL [6-RFC-SHA] и на 1111111f (соседний параграф — не оправдание пропуска), получено (exit=${rc}):"
     echo "${out}" | sed 's/^/      /'
   fi
-  # ЯВНО зафиксированный ОСТАТОК правила SKIP-DIGITS: чисто цифровой выдуманный токен
-  # (`1111111`) по закрытому списку причин НЕ проверяется — но обязан быть НАЗВАН в выводе,
-  # а не исчезнуть. Это цена закрытия N-3 (fixed-point `100000000` не должен давать
-  # ложный FAIL), и она обязана быть видимой, а не молчаливой.
-  if echo "${out}" | grep -q '\[6-RFC-SHA\] SKIP-DIGITS.*`1111111`'; then
-    pass "сценарий RFC-SHA-no-inapplicable/остаток SKIP-DIGITS: цифровой выдуманный токен не проверен, НО назван в выводе, exit=${rc}"
+  # Третий токен — чисто цифровой выдуманный `1111111` (форма из репро R-020). Он ОБЯЗАН
+  # падать так же, как hex-форма: «цифровой» не является причиной пропуска (см. обоснование
+  # у сценария RFC-SHA-digits-failclosed).
+  if [ "${rc}" -ne 0 ] && echo "${out}" | grep -q 'FAIL  \[6-RFC-SHA\].*`1111111`'; then
+    pass "сценарий RFC-SHA-no-inapplicable/цифровой выдуманный: 1111111 тоже проверен → FAIL, exit=${rc}"
   else
-    fail "сценарий RFC-SHA-no-inapplicable/остаток SKIP-DIGITS: ОЖИДАЛАСЬ строка SKIP-DIGITS с токеном 1111111 (остаток правила обязан быть виден), получено (exit=${rc}):"
+    fail "сценарий RFC-SHA-no-inapplicable/цифровой выдуманный: ОЖИДАЛСЯ FAIL [6-RFC-SHA] на 1111111 (цифровая форма — не причина пропуска), получено (exit=${rc}):"
     echo "${out}" | sed 's/^/      /'
   fi
 }
 
 # --- B-1: баланс печатается ВСЕГДА и СХОДИТСЯ: всего=N проверено=K пропущено=M, K+M==N.
-# Фикстура смешанная: 1 реальный SHA (проверяется), 1 цифровой (SKIP-DIGITS),
+# Фикстура смешанная: 1 реальный SHA (проверяется), 1 sha256-дайджест (SKIP-LEN64),
 # 1 объявленный маркером (SKIP-DECLARED) → всего=3 проверено=1 пропущено=2.
 scenario_rfc_sha_balance_line_reconciles() {
   local d="${TMP_BASE}/rfc_sha_balance"
@@ -865,7 +891,8 @@ scenario_rfc_sha_balance_line_reconciles() {
 # CT-RFC-TEST — баланс
 
 <!-- not-a-commit: abc1234def -->
-Изменение внесено коммитом \`${real_sha}\`; множитель \`100000000\`; партия \`abc1234def\`.
+Изменение внесено коммитом \`${real_sha}\`; sha256 сегмента
+\`e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\`; партия \`abc1234def\`.
 EOF
   local out rc line total checked skipped
   out="$(run_verify "${d}")"; rc=$?
@@ -1103,7 +1130,7 @@ scenario_rfc_sha_fake_fails
 scenario_rfc_sha_orphan_exists_but_not_ancestor_fails
 scenario_rfc_sha_fake_without_marker_word_fails
 scenario_rfc_sha_orphan_without_marker_word_fails
-scenario_rfc_sha_digits_token_skipped_and_listed
+scenario_rfc_sha_digits_token_is_fail_closed
 scenario_rfc_sha_len64_skipped_and_listed
 scenario_rfc_sha_declared_not_commit_skipped_and_listed
 scenario_rfc_sha_never_inapplicable_when_tokens_exist
