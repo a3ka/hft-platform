@@ -64,6 +64,23 @@ risk-critic**, если milestone попадает в любой из двух �
 - `set -euo pipefail` ИЛИ явный агрегатор с FAIL-счётчиком + `exit 1` при FAIL>0.
 - **Никакого** `cmd && echo PASS || echo FAIL` (маскирует провал).
 - Минимум 1 проверка на задачу из §Tasks milestone'а.
+- **ПАРИТЕТ С CI: verify обязан гонять ВСЕ проверки из `.github/workflows/ci.yml` (закреплено
+  2026-08-02, находка tester'а на M-45).** CI-job `fmt + clippy + test` — базовый, он бежит на
+  ЛЮБОМ изменении кода и гоняет три команды: `cargo fmt --all -- --check` ·
+  `cargo clippy --all-targets --all-features -- -D warnings` · `cargo test --all`. Паритет
+  verify с ЭТИМИ тремя обязателен всегда. (Остальные job'ы `ci.yml` — `cargo audit`,
+  `verify_contracts.sh`, `verify_ct_rfc_atomic.sh`, `diff_contract_schema.sh`,
+  `check_protected_artifacts.sh` и их red-канарейки — специализированные; verify милестоуна
+  дублирует их только если milestone бьёт в их зону.)
+  `verify_M-45.sh` проверял build+clippy+целевые тесты, но **не fmt** —
+  локальный гейт был зелёным (`VERDICT: PASS`), а merge в main дал бы красный CI на 18
+  fmt-блоках. Гейт, который зеленее CI, — не гейт, а его имитация.
+  Это ТОТ ЖЕ класс, ради которого `rust-toolchain.toml` пинует версию (TD-035: «green local ≠
+  green CI», инцидент M-23 — clippy 1.97 поймал то, чего не знал локальный 1.94), только дыра
+  была не в ВЕРСИИ инструмента, а в СОСТАВЕ проверок.
+  **Проверка при написании verify:** `grep -E "run:" .github/workflows/ci.yml` — каждая
+  команда оттуда обязана иметь соответствующий пункт в verify. Расширили CI → расширили
+  шаблон verify (иначе дыра вернётся на следующем milestone).
 - **T1-enum-вариант ⇒ `cargo build --workspace` в verify + ревизия ВСЕХ match (закреплено 2026-07-25,
   M-35 CT-RFC-05, класс RN-8).** Новый вариант `MdPayload`/`EventKind`/любого T1-enum ломает исчерпывающие
   `match` БЕЗ `_=>` в других крейтах (E0004: journal/sim/research-cli). Скоуп `-p <крейт>` в verify СЛЕП к
