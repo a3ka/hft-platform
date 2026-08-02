@@ -241,8 +241,15 @@ fn wb_2_budget_exhaustion_never_yields_a_lowered_floor() {
 
     // Декларация ВНУТРИ занятого диапазона: выше дешёвого префикса, но ниже скрытых seq.
     let bad_next = HIDDEN_FIRST - 1_000;
-    assert!(bad_next > PREFIX, "setup-guard: декларация обязана быть выше дешёвого префикса");
-    write_decl(dir.path(), bad_next, "ошибка оператора: seq внутри занятого диапазона");
+    assert!(
+        bad_next > PREFIX,
+        "setup-guard: декларация обязана быть выше дешёвого префикса"
+    );
+    write_decl(
+        dir.path(),
+        bad_next,
+        "ошибка оператора: seq внутри занятого диапазона",
+    );
 
     let outcome = open_with_deadline(dir.path(), cfg(), CEILING_SECS).unwrap_or_else(|| {
         panic!(
@@ -301,7 +308,11 @@ fn wb_3_honest_declaration_on_cheap_corruption_still_starts() {
     append_bytes(&seg, &vec![0x5A_u8; CHEAP_TAIL]);
     let _ = std::fs::remove_file(dir.path().join("journal.meta"));
 
-    write_decl(dir.path(), max + 1, "хвост невосстановим: холодной копии нет");
+    write_decl(
+        dir.path(),
+        max + 1,
+        "хвост невосстановим: холодной копии нет",
+    );
     let outcome = open_with_deadline(dir.path(), cfg(), CEILING_SECS)
         .expect("дешёвая порча обязана разбираться заведомо внутри бюджета");
 
@@ -315,7 +326,11 @@ fn wb_3_honest_declaration_on_cheap_corruption_still_starts() {
             max + 1
         )
     });
-    assert_eq!(next, max + 1, "запись обязана идти РОВНО с объявленной позиции");
+    assert_eq!(
+        next,
+        max + 1,
+        "запись обязана идти РОВНО с объявленной позиции"
+    );
     assert!(
         ls(dir.path()).iter().any(|n| n == DECL_APPLIED),
         "применённая декларация обязана быть помечена (одноразовость + аудит)"
@@ -345,7 +360,11 @@ fn wb_4_healthy_restart_is_unaffected_by_the_budget() {
         expect_next = j.next_seq();
     }
     assert!(
-        ls(dir.path()).iter().filter(|n| n.ends_with(".jrnl")).count() >= 3,
+        ls(dir.path())
+            .iter()
+            .filter(|n| n.ends_with(".jrnl"))
+            .count()
+            >= 3,
         "setup-guard: фикстура обязана состоять из НЕСКОЛЬКИХ сегментов"
     );
 

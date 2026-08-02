@@ -47,7 +47,10 @@ const CEILING_SECS: u64 = 60;
 /// Потолок операторского прогона дайджеста на подвыборке — с запасом на медленный CI.
 const DIGEST_CEILING_SECS: u64 = 120;
 
-const _: () = assert!(CHEAP_TAIL as u64 > TAIL_SCAN_CHUNK, "фикстура: см. red_floor_work_budget");
+const _: () = assert!(
+    CHEAP_TAIL as u64 > TAIL_SCAN_CHUNK,
+    "фикстура: см. red_floor_work_budget"
+);
 
 fn cfg() -> WriterConfig {
     cfg_with(256 * 1024, "M-52 prodscale fixture")
@@ -112,7 +115,10 @@ fn ps_1_floor_scan_over_a_prod_shaped_catalogue_is_bounded() {
         let bytes = std::fs::read(&last_path).expect("read");
         bytes[..common::header_end(&bytes)].to_vec()
     };
-    assert!(!head.is_empty(), "setup-guard: у хвостового сегмента обязан быть заголовок");
+    assert!(
+        !head.is_empty(),
+        "setup-guard: у хвостового сегмента обязан быть заголовок"
+    );
     std::fs::write(&last_path, &head).expect("truncate to header");
     append_bytes(&last_path, &lcg_garbage(LCG_TAIL, 0x5EED));
     append_bytes(&last_path, &vec![0x5A_u8; CHEAP_TAIL]);

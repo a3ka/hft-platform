@@ -416,11 +416,7 @@ pub fn lcg_garbage(n: usize, seed: u64) -> Vec<u8> {
 /// интеграционный тест `pub(crate)` не видит). Наблюдаемо ровно то, что чувствует оператор
 /// под инцидентом, — время. Запас берётся кратный (замер 384.94 s против потолка 60 s),
 /// чтобы разброс машины CI не превращал ресурсный оракул в измеритель окружения.
-pub fn open_with_deadline(
-    dir: &Path,
-    cfg: WriterConfig,
-    secs: u64,
-) -> Option<Result<u64, String>> {
+pub fn open_with_deadline(dir: &Path, cfg: WriterConfig, secs: u64) -> Option<Result<u64, String>> {
     let d = dir.to_path_buf();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -443,12 +439,79 @@ pub fn swap_segment_files(dir: &Path, a: &str, b: &str) {
     std::fs::rename(&tmp, dir.join(b)).expect("rename tmp->b");
 }
 
-/// `first_seq` из заголовков всех сегментов каталога, по возрастанию индекса — ИЗМЕРЕНИЕ
+/// Начало потока событий сегмента, декодированное СВОИМ кодом (до 64 KiB — заголовку
+/// хватает с запасом). `.zst` распаковывается потоково и ограниченно.
+fn segment_head_bytes(path: &Path) -> Vec<u8> {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    if !name.ends_with(".zst") {
+        let mut f = match std::fs::File::open(path) {
+            Ok(f) => f,
+            Err(_) => return Vec::new(),
+        };
+        let mut buf = vec![0u8; 64 * 1024];
+        let n = f.read(&mut buf).unwrap_or(0);
+        buf.truncate(n);
+        return buf;
+    }
+    let f = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return Vec::new(),
+    };
+    let mut dec = match zstd::Decoder::new(f) {
+        Ok(d) => d,
+        Err(_) => return Vec::new(),
+    };
+    let mut out = vec![0u8; 64 * 1024];
+    let mut filled = 0usize;
+    while filled < out.len() {
+        match dec.read(&mut out[filled..]) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => filled += n,
+        }
+    }
+    out.truncate(filled);
+    out
+}
+
+/// `first_seq` заголовков всех сегментов каталога, по возрастанию индекса — ИЗМЕРЕНИЕ
 /// формы фикстуры (setup-guard оракулов TD-030), а не проверяемое свойство.
+///
+/// Читает заголовок СВОИМ кодом, НЕ через `journal::list_segments`: измерять форму
+/// фикстуры функцией, на которую ставится проверяемый guard, нельзя — как только guard
+/// появится, измерение начнёт возвращать пустоту и setup-guard замаскирует настоящий
+/// результат (поймано прогоном прототипа M-52).
+///
+/// Безголовый (legacy) сегмент даёт `0` — ТОТ ЖЕ сентинел, что синтезирует крейт
+/// (`segments.rs`: «first_seq legacy: неизвестен без чтения сегмента, безопасный дефолт 0»).
 pub fn first_seqs(dir: &Path) -> Vec<u64> {
-    journal::list_segments(dir)
-        .map(|v| v.into_iter().map(|s| s.header.first_seq).collect())
-        .unwrap_or_default()
+    let mut out = Vec::new();
+    for name in ls(dir) {
+        if !is_segment_name(&name) {
+            continue;
+        }
+        let bytes = segment_head_bytes(&dir.join(&name));
+        if !bytes.starts_with(&SEGMENT_MAGIC) {
+            out.push(0); // legacy-сентинел
+            continue;
+        }
+        let m = SEGMENT_MAGIC.len();
+        if bytes.len() < m + 4 {
+            out.push(0);
+            continue;
+        }
+        let len = u32::from_le_bytes(bytes[m..m + 4].try_into().unwrap()) as usize;
+        let end = m + 4 + len;
+        let h = if end <= bytes.len() {
+            postcard::from_bytes::<contracts::SegmentHeader>(&bytes[m + 4..end]).ok()
+        } else {
+            None
+        };
+        out.push(h.map(|h| h.first_seq).unwrap_or(0));
+    }
+    out
 }
 
 /// sha256 всех файлов каталога (имя → хэш) — доказательство, что операция была

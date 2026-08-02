@@ -19,9 +19,17 @@
 //! ## Контракт JR-I-11 (см. `milestones/M-52-journal-hardening.md`)
 //!
 //! **Ни один путь чтения журнала не имеет права молча сшить каталог, чьи СРАВНИМЫЕ
-//! `first_seq` не строго возрастают по возрастанию индекса сегмента.** Обнаружив
-//! немонотонность, путь обязан вернуть `Err` с диагностикой, называющей ОБА файла и их
-//! `first_seq`. Покрываются `read_all`, `stream`/`stream_from` и `readable_floor`.
+//! `first_seq` не возрастают по возрастанию индекса сегмента.** Обнаружив нарушение, путь
+//! обязан вернуть `Err` с диагностикой, называющей ОБА файла и их `first_seq`. Покрываются
+//! `read_all`, `stream`/`stream_from` и `readable_floor`.
+//!
+//! Точная форма — с ДВУМЯ обязательными carve-out'ами (оба найдены не рассуждением, а
+//! прогоном: первый предупреждён TECH-DEBT, второй вскрыт прототипом на `crates/gateway`):
+//!  1. **legacy исключается по `schema_version`** (`mn_5`);
+//!  2. **равенство законно, если ЛЕВЫЙ сегмент не несёт ни одного события** (`mn_8`) —
+//!     `first_seq` пустого сегмента есть обещание, а не факт (`JR-I-8`, легитимный случай 3:
+//!     «валидный заголовок, ноль событий»). Итог: `first_seq` НЕ УБЫВАЕТ, равенство —
+//!     только для пустого левого.
 //!
 //! **Сравнимость — по `schema_version`, НЕ по значению `first_seq`.** Сегмент, чей
 //! `schema_version == SCHEMA_VERSION_PRE_HEADER` (legacy, до CT-RFC-02), несёт
@@ -209,8 +217,15 @@ fn mn_3_readable_floor_refuses_non_monotonic_catalogue() {
 
     // Декларация ВНУТРИ занятого диапазона: выше заниженного пола, но внутри high-сегмента.
     let bad_next = high_first + 1;
-    assert!(bad_next > low_max, "setup-guard: декларация обязана быть выше заниженного пола");
-    write_decl(dir.path(), bad_next, "ошибка оператора: архив вернули в живой каталог");
+    assert!(
+        bad_next > low_max,
+        "setup-guard: декларация обязана быть выше заниженного пола"
+    );
+    write_decl(
+        dir.path(),
+        bad_next,
+        "ошибка оператора: архив вернули в живой каталог",
+    );
 
     match Journal::open_with(dir.path(), cfg()) {
         Err(e) => {
@@ -351,6 +366,13 @@ fn mn_5_legacy_sentinel_first_seq_is_not_a_violation() {
     };
     journal::declare_legacy(dir.path(), decl).expect("declare_legacy");
 
+    assert!(
+        !std::fs::read(&legacy_path)
+            .expect("read legacy")
+            .starts_with(&contracts::SEGMENT_MAGIC),
+        "setup-guard: legacy-сегмент обязан быть БЕЗ магии — только тогда крейт синтезирует \
+         сентинел first_seq=0, и фикстура давит на инвариант"
+    );
     let fs = first_seqs(dir.path());
     assert_eq!(
         fs.last().copied(),
@@ -428,8 +450,15 @@ fn mn_6_index_gaps_single_and_empty_catalogues_are_fine() {
         }
         j.flush().expect("flush");
     }
-    assert_eq!(seg_names(one.path()).len(), 1, "setup-guard: ровно один сегмент");
-    assert!(journal::read_all(one.path()).is_ok(), "один сегмент — не нарушение");
+    assert_eq!(
+        seg_names(one.path()).len(),
+        1,
+        "setup-guard: ровно один сегмент"
+    );
+    assert!(
+        journal::read_all(one.path()).is_ok(),
+        "один сегмент — не нарушение"
+    );
     assert!(
         journal::stream(one.path(), EpochFilter::All).is_ok(),
         "один сегмент — не нарушение"
@@ -437,11 +466,69 @@ fn mn_6_index_gaps_single_and_empty_catalogues_are_fine() {
 
     // (в) пустой каталог.
     let empty = tempfile::tempdir().expect("dir");
-    assert!(journal::read_all(empty.path()).is_ok(), "пустой каталог — не нарушение");
+    assert!(
+        journal::read_all(empty.path()).is_ok(),
+        "пустой каталог — не нарушение"
+    );
     assert!(
         journal::stream(empty.path(), EpochFilter::All).is_ok(),
         "пустой каталог — не нарушение"
     );
+}
+
+// ═════════════════════════════════════════════════════════════════════════════════════
+// MN-8 — ПАРНЫЙ VANTAGE / ПУСТОЙ СЕГМЕНТ: РАВНЫЕ first_seq бывают ЗАКОННО
+// ═════════════════════════════════════════════════════════════════════════════════════
+
+/// Второй сентинел, о который спотыкается наивный guard (найдено ПРОГОНОМ прототипа M-52
+/// по всему workspace: `crates/gateway/tests/red_gateway_live_eq_replay.rs` — 6 падений).
+///
+/// `first_seq` сегмента — seq его ПЕРВОГО события; у сегмента, в котором событий НЕТ, это
+/// обещание, а не факт, и оно СОВПАДАЕТ с `first_seq` следующего. Ситуация не выдуманная:
+/// M-49 (`JR-I-8`) явно называет её одним из ТРЁХ легитимных случаев — «валидный заголовок,
+/// ноль событий: recorder создал сегмент и упал до первой записи». Она же возникает при
+/// малом `max_segment_bytes`, когда заголовок уже переполняет сегмент.
+///
+/// Контракт: `first_seq` НЕ УБЫВАЕТ, а РАВЕНСТВО допустимо ТОЛЬКО когда левый сегмент не
+/// несёт ни одного события. Проверка «несёт ли события» стоит один фрейм и вызывается лишь
+/// при равенстве — на здоровом каталоге не вызывается никогда.
+///
+/// Оракул ЗЕЛЁНЫЙ сегодня и обязан остаться зелёным.
+#[test]
+fn mn_8_empty_segment_may_share_first_seq_with_the_next() {
+    let dir = tempfile::tempdir().expect("dir");
+    {
+        // Заголовок сам по себе переполняет сегмент ⇒ ротация до первой записи ⇒
+        // сегменты с нулём событий. Ровно форма фикстуры gateway (M-22).
+        let mut j = Journal::open_with(dir.path(), cfg_with(200, "empty-segment fixture"))
+            .expect("open_with");
+        for i in 0..8 {
+            j.append(common::snap(i)).expect("append");
+        }
+        j.flush().expect("flush");
+    }
+    let fs = first_seqs(dir.path());
+    assert!(
+        fs.windows(2).any(|w| w[0] == w[1]),
+        "setup-guard: фикстура обязана содержать сегмент с НУЛЁМ событий, чей first_seq \
+         РАВЕН следующему — иначе она не давит на инвариант; получено {fs:?}"
+    );
+
+    let evs = journal::read_all(dir.path()).unwrap_or_else(|e| {
+        panic!(
+            "КЛАСС TD-011 (вторая форма): guard монотонности сработал на ПУСТОМ сегменте. \
+             `first_seq` сегмента без событий — обещание, а не факт, и законно совпадает со \
+             следующим (M-49 JR-I-8, легитимный случай 3: «валидный заголовок, ноль \
+             событий»). Требуется «не убывает + равенство только для ПУСТОГО левого», а не \
+             голое «строго возрастает». Ошибка: {e}"
+        )
+    });
+    assert_eq!(evs.len(), 8, "все события обязаны читаться");
+    let n = journal::stream(dir.path(), EpochFilter::All)
+        .unwrap_or_else(|e| panic!("КЛАСС TD-011 (вторая форма): прод-путь чтения упал: {e}"))
+        .filter_map(|e| e.ok())
+        .count();
+    assert_eq!(n, 8, "stream обязан отдать все события");
 }
 
 // ═════════════════════════════════════════════════════════════════════════════════════

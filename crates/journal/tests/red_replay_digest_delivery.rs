@@ -55,7 +55,10 @@ const RECORD: &str = "journal.replay-digest.json";
 const EXIT_DIGEST_MISMATCH: i32 = 4;
 
 fn run(args: &[String]) -> (i32, String) {
-    let out = Command::new(BIN).args(args).output().expect("запуск journal-retention");
+    let out = Command::new(BIN)
+        .args(args)
+        .output()
+        .expect("запуск journal-retention");
     let code = out.status.code().unwrap_or(-1);
     let mut s = String::from_utf8_lossy(&out.stderr).into_owned();
     s.push_str(&String::from_utf8_lossy(&out.stdout));
@@ -77,7 +80,11 @@ fn dir_with_journal(n: u64) -> (tempfile::TempDir, journal::ReplayDigest) {
         j.flush().expect("flush");
     }
     assert!(
-        ls(dir.path()).iter().filter(|s| s.ends_with(".jrnl")).count() >= 3,
+        ls(dir.path())
+            .iter()
+            .filter(|s| s.ends_with(".jrnl"))
+            .count()
+            >= 3,
         "setup-guard: фикстуре нужно ≥3 сегмента (сшивка — часть того, что мерит дайджест)"
     );
     let d = journal::replay_digest(dir.path(), EpochFilter::All, None, None).expect("digest");
@@ -204,7 +211,10 @@ fn rd_4_closed_window_matches_library_and_is_reproducible() {
          прод меряет не то, что доказано оракулами M-51: «{out}»",
         lib.events
     );
-    assert_eq!(lib.events, 300, "setup-guard: окно [100,399] — ровно 300 событий");
+    assert_eq!(
+        lib.events, 300,
+        "setup-guard: окно [100,399] — ровно 300 событий"
+    );
 
     // Два прогона подряд на закрытом окне — идентичны (это и есть первый прод-прогон
     // из TD-067: «два запуска подряд с предъявлением совпавшего state_hash»).
