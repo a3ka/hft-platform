@@ -238,3 +238,47 @@ exit=0
 ```
 
 Post-merge §8 (CI + прод) — дописывается ПРУФОМ ниже после push в `main`.
+
+---
+
+## §8 Post-merge деплой-гейт (`gates.md` §8) — GREEN
+
+Merge в `main`: **`c4caddb`** (`--no-ff`). Обновление PROJECT-STATE/TECH-DEBT: **`51e4023`**.
+
+```
+$ gh run list --limit 5 --json databaseId,headSha,status,conclusion
+30748376879 51e4023 completed success     <- PROJECT-STATE/TECH-DEBT
+30748255553 d8e622a completed success     <- чужой коммит между моими push'ами
+30748188508 c4caddb completed success     <- merge CT-RFC-05
+30748010089 a8fc91a completed success
+30747915683 d4af3ea completed success
+```
+
+**Deploy НЕ триггерился — и это ожидаемо, не пропущенный гейт.** Дифф docs-only, `deploy.yml`
+отфильтрован по путям; последний деплой — `32a44f4` (2026-08-02T10:02Z, success), т.е. прод
+живёт на коде, не тронутом этим merge'ем:
+
+```
+$ gh run list --workflow deploy.yml --limit 4
+32a44f4 completed success 2026-08-02T10:02:03Z
+cc5197c completed success 2026-08-01T03:33:28Z
+163939a completed success 2026-08-01T01:04:19Z
+091ece1 completed success 2026-07-31T14:05:21Z
+```
+
+Eyes-on на VPS всё равно сделан (дёшево, а «Deploy success» и так ничего бы не сказал —
+урок TD-011):
+
+```
+$ ssh -i /home/nous/.ssh/hft_deploy root@167.233.192.131 'docker ps ...; cat .../recorder.heartbeat; date +%s%3N'
+hft-gateway-serve Up 3 hours (healthy)
+hft-recorder      Up 3 hours (healthy)
+{"events":654805,"free_bytes":85346893824,"min_free_bytes":10737418240,"next_seq":149194491,
+ "segment_index":158,"ts_wall_ms":1785674915573,"writable":true}
+now = 1785674917330  ->  heartbeat свежий (отставание ~1.8 с)
+```
+
+Оба контейнера `(healthy)`, `writable: true`, `next_seq` 149 194 491, сегмент 158, свободно
+79.5 GiB при пороге 10 GiB. Прод не деградировал.
+
+**Финальный вердикт: APPROVED, MERGED `c4caddb`, §8 GREEN.**
