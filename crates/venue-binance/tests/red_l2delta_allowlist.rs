@@ -393,3 +393,156 @@ fn o7_malformed_depth_payload_is_fail_closed() {
         );
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────────────────
+// O-8 — РЕШАЮЩИЙ оракул спота: поведение РЕАЛЬНОЙ точки входа (D-1, C-049/C-050).
+//
+// Зеркало перп-версии. Сегодня спот такой точки НЕ ИМЕЕТ: обработка живёт в async
+// `handle_text_message` с `reqwest::Client` и `FuturesUnordered`, эмиссия — прямой
+// `tx.send(...)`. Поэтому поведение спота проверить нечем, и любая проверка сводится к
+// грепу — а греп обходится сдвигом хардкода на уровень выше (C-049 §1.2 (A)).
+//
+// Задача 3c milestone'а: привести спот к паттерну, который в перп-крейте существует с
+// TD-014 — публичная sync-машина без сети и каналов:
+//
+// ```ignore
+// pub enum SessionEffect { Emit(MdEvent), FetchSnapshot { symbol: String, after: Duration } }
+// pub struct SpotSession { .. }
+// impl SpotSession {
+//     pub fn new_with_l2delta(subs: &[String], l2delta_allow: &[String]) -> Self;
+//     pub fn on_ws_text(&mut self, text: &str) -> Vec<SessionEffect>;
+// }
+// ```
+// async-обёртка остаётся тонкой: исполняет эффекты (шлёт в mpsc, ходит за снапшотом).
+// Это не рефакторинг ради красоты — без тестируемой точки входа гарантии нет вообще.
+// ─────────────────────────────────────────────────────────────────────────────────────────
+
+/// Сырой текст спот-сообщения — ровно та форма, что приходит по WS в прод.
+/// СПОТ: поля `pu` НЕТ (континуити по `U == prev.u + 1`), в отличие от перпа.
+fn ws_depth_text(sym_lower: &str) -> String {
+    format!(
+        r#"{{"stream":"{sym_lower}@depth@100ms","data":{{"e":"depthUpdate","E":1752000000499,"s":"{}","U":101,"u":103,"b":[["65000.5","0.3"],["65000.4","0"]],"a":[]}}}}"#,
+        sym_lower.to_uppercase()
+    )
+}
+
+fn count_l2delta_emits(effects: &[venue_binance::SessionEffect], symbol: &str) -> usize {
+    use contracts::MdPayload;
+    use venue_binance::SessionEffect;
+    effects
+        .iter()
+        .filter(|e| match e {
+            SessionEffect::Emit(md) => {
+                md.symbol == symbol && matches!(md.payload, MdPayload::L2Delta { .. })
+            }
+            _ => false,
+        })
+        .count()
+}
+
+#[test]
+fn o8_allowed_symbol_emits_l2delta_from_real_entry_point() {
+    let mut s = venue_binance::SpotSession::new_with_l2delta(
+        &["ETHUSDT".to_string()],
+        &["ETHUSDT".to_string()],
+    );
+    let effects = s.on_ws_text(&ws_depth_text("ethusdt"));
+    assert_eq!(
+        count_l2delta_emits(&effects, "ETHUSDT"),
+        1,
+        "символ разрешён allow-list'ом ⇒ реальная обработка сообщения обязана дать ровно \
+         один Emit(L2Delta). Ноль означает хардкод-условие по символу где-то на пути — \
+         раскатка после founder-подписи не заработает (C-049 §1.2)"
+    );
+}
+
+#[test]
+fn o8_disallowed_symbol_emits_nothing_from_real_entry_point() {
+    // Символ подписан для книги, но НЕ в L2Delta-allow-list: книга ведётся, дельты
+    // в журнал не идут. Реализация «эмитить всем подписанным» падает здесь.
+    let mut s = venue_binance::SpotSession::new_with_l2delta(
+        &["ETHUSDT".to_string()],
+        &["BTCUSDT".to_string()],
+    );
+    let effects = s.on_ws_text(&ws_depth_text("ethusdt"));
+    assert_eq!(
+        count_l2delta_emits(&effects, "ETHUSDT"),
+        0,
+        "символ НЕ в L2Delta-allow-list ⇒ дельта не имеет права попасть в журнал"
+    );
+}
+
+#[test]
+fn o8_default_allowlist_emits_btc_and_only_btc() {
+    let subs = vec!["BTCUSDT".to_string(), "ETHUSDT".to_string()];
+    let dflt = parse_capture_symbols(None);
+    let mut s = venue_binance::SpotSession::new_with_l2delta(&subs, &dflt);
+
+    let btc = s.on_ws_text(&ws_depth_text("btcusdt"));
+    assert_eq!(
+        count_l2delta_emits(&btc, "BTCUSDT"),
+        1,
+        "дефолт обязан продолжать писать BTC — иначе merge ТЕРЯЕТ данные, которые прод \
+         пишет с 2026-07-21 (forward-only, невосстановимо)"
+    );
+
+    let eth = s.on_ws_text(&ws_depth_text("ethusdt"));
+    assert_eq!(
+        count_l2delta_emits(&eth, "ETHUSDT"),
+        0,
+        "дефолт не имеет права расширять состав эмиссии (Граница C)"
+    );
+}
+
+#[test]
+fn o8_lowercase_config_works_through_real_entry_point() {
+    let mut s = venue_binance::SpotSession::new_with_l2delta(
+        &["ETHUSDT".to_string()],
+        &parse_capture_symbols(Some("ethusdt")),
+    );
+    assert_eq!(
+        count_l2delta_emits(&s.on_ws_text(&ws_depth_text("ethusdt")), "ETHUSDT"),
+        1,
+        "конфигурация в нижнем регистре обязана работать на реальном пути"
+    );
+}
+
+#[test]
+fn o8_multiple_allowed_symbols_all_emit() {
+    let syms = parse_capture_symbols(Some("ETHUSDT,SOLUSDT"));
+    let subs = vec!["ETHUSDT".to_string(), "SOLUSDT".to_string()];
+    let mut s = venue_binance::SpotSession::new_with_l2delta(&subs, &syms);
+    assert_eq!(count_l2delta_emits(&s.on_ws_text(&ws_depth_text("ethusdt")), "ETHUSDT"), 1);
+    assert_eq!(count_l2delta_emits(&s.on_ws_text(&ws_depth_text("solusdt")), "SOLUSDT"), 1);
+}
+
+#[test]
+fn o8_emitted_payload_is_intact_and_spot_semantics_preserved() {
+    // СПОТ: `prev_final_update_id` обязан быть None. Перп-семантика сюда не протекает
+    // (урок TD-014: путаница `pu`/`U` ломает gap-детекцию).
+    use contracts::MdPayload;
+    use venue_binance::SessionEffect;
+
+    let mut s = venue_binance::SpotSession::new_with_l2delta(
+        &["ETHUSDT".to_string()],
+        &["ETHUSDT".to_string()],
+    );
+    let effects = s.on_ws_text(&ws_depth_text("ethusdt"));
+    let md = effects
+        .iter()
+        .find_map(|e| match e {
+            SessionEffect::Emit(md) if matches!(md.payload, MdPayload::L2Delta { .. }) => Some(md),
+            _ => None,
+        })
+        .expect("разрешённый символ обязан дать Emit(L2Delta)");
+
+    let MdPayload::L2Delta { prev_final_update_id, first_update_id, final_update_id, bids, asks, .. } =
+        &md.payload
+    else {
+        unreachable!("отфильтровано выше");
+    };
+    assert_eq!(*prev_final_update_id, None, "СПОТ: `pu` в wire нет ⇒ None");
+    assert_eq!((*first_update_id, *final_update_id), (101, 103), "U/u сохранены");
+    assert_eq!(bids.len(), 2, "оба бид-уровня, включая size==0 remove");
+    assert!(asks.is_empty(), "пустая сторона остаётся пустой");
+}

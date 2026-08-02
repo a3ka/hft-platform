@@ -100,7 +100,7 @@ founder'а». Значит правка константы = совершени�
 | 2 | То же в `venue-binance-futures`; семантика `pu` НЕ трогается | venue-dev | ⏳ OPEN | T3, T4, T6 |
 | 3 | `l2delta_emission_for` в обоих крейтах; обработчик ДЕЛЕГИРУЕТ ей, своего сравнения символов не имеет; хардкод-список удалён под любым именем | venue-dev | ⏳ OPEN | T5, O-7 |
 | 3b | **`FuturesSession::new_with_l2delta(subs, l2delta_allow)`** — allow-list явным параметром; `on_ws_text` решает об эмиссии только по нему | venue-dev | ⏳ OPEN | **T5b, O-8** |
-| 3c | Спот приведён к тому же паттерну: публичная sync-точка входа `on_ws_text -> Vec<SessionEffect>` без сети/каналов; async-обёртка исполняет эффекты (см. D-1) | venue-dev | ⏳ OPEN | **T5b, O-8** |
+| 3c | Спот: `pub enum SessionEffect` + `pub struct SpotSession` с `new_with_l2delta(subs, l2delta_allow)` и `on_ws_text(&mut self, &str) -> Vec<SessionEffect>` (sync, без сети/каналов); async `handle_text_message` становится тонкой обёрткой, исполняющей эффекты | venue-dev | ⏳ OPEN | **T5b, O-8** |
 | 4 | Фикстура `L2Delta` в оракул `DET-I-1` — закрытие R-019 F6 / TD-072 | **architect** (sacred) | ✅ DONE (`det_9`) | T8 |
 | 5 | `scripts/verify_M-45.sh` | **architect** (sacred) | ✅ DONE | — |
 | 6 | Запись эпохи в `docs/data-epochs.md` — ТОЛЬКО при раскатке (Граница C), не при merge | architect | ⛔ ждёт подписи | T9 |
