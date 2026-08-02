@@ -46,6 +46,18 @@ else
   fail "T2 clippy — см. /tmp/m45-clippy.log"; tail -20 /tmp/m45-clippy.log
 fi
 
+echo "--- T2b: fmt — ТА ЖЕ проверка, что в CI (иначе green local ≠ green CI) ---"
+# Находка tester'а 2026-08-02: гейт проверял build+clippy, а CI (`.github/workflows/ci.yml:20`)
+# гоняет ЕЩЁ и `cargo fmt --all -- --check`. Локальный гейт был зелёным при красном CI —
+# тот же класс, ради которого TD-035 пинует toolchain (green local ≠ green CI), только
+# дыра была не в ВЕРСИИ, а в СОСТАВЕ проверок. Merge поверх этого дал бы красный main.
+if cargo fmt --all -- --check >/tmp/m45-fmt.log 2>&1; then
+  pass "T2b cargo fmt --all --check (совпадает с ci.yml)"
+else
+  fail "T2b fmt — CI упадёт на merge; файлы ниже"
+  grep -E "^Diff in" /tmp/m45-fmt.log | sed 's|.*/crates/|crates/|' | sort -u
+fi
+
 echo "--- T3: ДЕФОЛТ НЕИЗМЕНЕН — merge не является раскаткой (главный пункт гейта) ---"
 # Проверяется ИСПОЛНЯЕМЫМ тестом, а не грепом: греп поймал бы удаление строки, но не
 # реализацию, которая строку сохранила и вернула другой список.
