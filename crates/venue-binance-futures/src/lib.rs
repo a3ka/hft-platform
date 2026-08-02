@@ -481,7 +481,7 @@ pub fn parse_capture_symbols(raw: Option<&str>) -> Vec<String> {
 /// подстроке — `BTC`/`BTCUSDT_PERP` не совпадают с `BTCUSDT`.
 pub fn should_capture_l2delta(symbols: &[String], symbol: &str) -> bool {
     let up = symbol.to_uppercase();
-    symbols.iter().any(|s| *s == up)
+    symbols.contains(&up)
 }
 
 /// ЕДИНСТВЕННАЯ точка решения об эмиссии `L2Delta` на РЕАЛЬНОМ пути (M-45, вердикт
@@ -700,10 +700,8 @@ impl FuturesSession {
                 // КАЖДЫЙ распарсенный diff как сырое L2Delta-событие независимо от
                 // book-sync FSM (ground-truth рыночное событие, не свойство нашего
                 // sync-автомата), но только если символ разрешён `l2delta_allow`.
-                if let Some(event) = l2delta_emission_for(stream, data, &self.l2delta_allow) {
-                    if let EventKind::Md(md) = event {
-                        effects.push(SessionEffect::Emit(md));
-                    }
+                if let Some(EventKind::Md(md)) = l2delta_emission_for(stream, data, &self.l2delta_allow) {
+                    effects.push(SessionEffect::Emit(md));
                 }
                 // Сначала вычислить action (immutable borrow), потом мутировать.
                 let state = self
