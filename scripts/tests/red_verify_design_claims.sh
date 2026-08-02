@@ -566,6 +566,198 @@ scenario_merge_preview_bad_base_ref_fails() {
   fi
 }
 
+# ---------------------------------------------------------------------------
+# RFC-gate self-test (C-044): docs/rfc/**.md SHA-цитаты и path-цитаты проверяются
+# машинно против РЕАЛЬНОГО git (объекты коммитов) и РЕАЛЬНОГО дерева фикстуры — не
+# гипотетически. Каждый сценарий строит good-фикстуру, коммитит её (чтобы иметь
+# существующий SHA под рукой), затем добавляет ОДИН docs/rfc/*.md файл, портящий/
+# подтверждающий ровно одну вещь.
+# ---------------------------------------------------------------------------
+build_rfc_fixture_base() { # $1=dir → коммитит good-фикстуру, печатает SHA коммита в stdout
+  local d="$1"
+  build_good_fixture "${d}"
+  mkdir -p "${d}/docs/rfc"
+  git -C "${d}" add -A
+  git -C "${d}" -c user.name=test -c user.email=test@test.local commit -q -m "rfc-gate self-test base"
+  git -C "${d}" rev-parse HEAD
+}
+
+# --- сценарий: RFC цитирует РЕАЛЬНЫЙ SHA (существующий коммит фикстуры) → PASS [6-RFC-SHA] ---
+scenario_rfc_sha_real_passes() {
+  local d="${TMP_BASE}/rfc_sha_real"
+  local real_sha
+  real_sha="$(build_rfc_fixture_base "${d}")"
+  cat > "${d}/docs/rfc/CT-RFC-TEST-sha-real.md" <<EOF
+# CT-RFC-TEST — реальный SHA
+Изменение подтверждено коммитом \`${real_sha}\`.
+EOF
+  local out rc
+  out="$(run_verify "${d}")"; rc=$?
+  if [ "${rc}" -eq 0 ] && echo "${out}" | grep -q '^VERDICT: PASS' \
+     && echo "${out}" | grep -q 'PASS  \[6-RFC-SHA\]'; then
+    pass "сценарий RFC-SHA-real (реальный SHA в docs/rfc/, C-044): гейт даёт PASS [6-RFC-SHA], VERDICT: PASS, exit=${rc}"
+  else
+    fail "сценарий RFC-SHA-real: ОЖИДАЛСЯ PASS [6-RFC-SHA] + VERDICT: PASS, получено (exit=${rc}):"
+    echo "${out}" | sed 's/^/      /'
+  fi
+}
+
+# --- сценарий: RFC цитирует ВЫДУМАННЫЙ SHA (0000000, не существует) → FAIL [6-RFC-SHA] ---
+# Класс C-044 F1: §4 CT-RFC-05-margin-inventory.md процитировал 3 из 4 SHA, не входящих в
+# ancestry origin/main (орфаны с другого прохода той же задачи на feat-ветке).
+scenario_rfc_sha_fake_fails() {
+  local d="${TMP_BASE}/rfc_sha_fake"
+  build_rfc_fixture_base "${d}" >/dev/null
+  cat > "${d}/docs/rfc/CT-RFC-TEST-sha-fake.md" <<'EOF'
+# CT-RFC-TEST — выдуманный SHA
+Изменение подтверждено коммитом `0000000`.
+EOF
+  local out rc
+  out="$(run_verify "${d}")"; rc=$?
+  if [ "${rc}" -ne 0 ] && echo "${out}" | grep -q 'FAIL  \[6-RFC-SHA\].*`0000000`.*не найден в git-объектах'; then
+    pass "сценарий RFC-SHA-fake (выдуманный SHA 0000000 в docs/rfc/, C-044 F1): гейт даёт FAIL [6-RFC-SHA], exit=${rc}"
+  else
+    fail "сценарий RFC-SHA-fake: ОЖИДАЛСЯ FAIL [6-RFC-SHA] на 0000000, получено (exit=${rc}):"
+    echo "${out}" | sed 's/^/      /'
+  fi
+}
+
+# --- анти-плацебо (C-044 F1, РЕАЛЬНЫЙ инцидент): SHA СУЩЕСТВУЕТ как git-объект (коммит на
+# отдельной, никогда не смёрженной ветке), но НЕ входит в историю HEAD — ровно класс
+# `ffedc10`/`6a2c331`/`67b6159`, реальных объектов на заброшенной ветке `engine/M-35-arms`,
+# которые `git cat-file -e` находил, а критик поймал только `git merge-base --is-ancestor`.
+# Если бы check6 проверял только существование объекта (как в первой, неверной реализации
+# этого файла), этот сценарий давал бы ложный PASS — регресс-тест на именно эту ошибку.
+scenario_rfc_sha_orphan_exists_but_not_ancestor_fails() {
+  local d="${TMP_BASE}/rfc_sha_orphan"
+  local main_sha orphan_sha
+  main_sha="$(build_rfc_fixture_base "${d}")"
+
+  git -C "${d}" checkout -q -b orphan-branch
+  echo "orphan work, never merged" > "${d}/orphan.txt"
+  git -C "${d}" add -A
+  git -C "${d}" -c user.name=test -c user.email=test@test.local commit -q -m "orphan branch commit, never merged into main"
+  orphan_sha="$(git -C "${d}" rev-parse HEAD)"
+  git -C "${d}" checkout -q "${main_sha}"
+
+  cat > "${d}/docs/rfc/CT-RFC-TEST-sha-orphan.md" <<EOF
+# CT-RFC-TEST — orphan SHA (объект существует, HEAD не содержит)
+Изменение подтверждено коммитом \`${orphan_sha}\`.
+EOF
+  local out rc
+  out="$(run_verify "${d}")"; rc=$?
+  if [ "${rc}" -ne 0 ] && echo "${out}" | grep -q "FAIL  \[6-RFC-SHA\].*\`${orphan_sha}\`.*НЕ входит в историю"; then
+    pass "сценарий RFC-SHA-orphan (SHA — реальный git-объект вне ancestry HEAD, C-044 F1 класс): гейт даёт FAIL [6-RFC-SHA], exit=${rc}"
+  else
+    fail "сценарий RFC-SHA-orphan: ОЖИДАЛСЯ FAIL [6-RFC-SHA] «НЕ входит в историю» (анти-плацебо C-044 F1 — SHA существует, но не ancestor HEAD), получено (exit=${rc}):"
+    echo "${out}" | sed 's/^/      /'
+  fi
+}
+
+# --- анти-плацебо: hex-токен БЕЗ слова-маркера контекста коммита рядом → НЕ проверяется,
+# гейт не должен падать на произвольный hex-похожий текст без заявления "это коммит".
+scenario_rfc_sha_no_context_not_checked() {
+  local d="${TMP_BASE}/rfc_sha_nocontext"
+  build_rfc_fixture_base "${d}" >/dev/null
+  cat > "${d}/docs/rfc/CT-RFC-TEST-sha-nocontext.md" <<'EOF'
+# CT-RFC-TEST — hex без слова-маркера рядом
+
+Идентификатор партии: `abc1234` (просто похожий на hex текст, для другой цели).
+EOF
+  local out rc
+  out="$(run_verify "${d}")"; rc=$?
+  if [ "${rc}" -eq 0 ] && echo "${out}" | grep -q '^VERDICT: PASS' \
+     && ! echo "${out}" | grep -q 'FAIL  \[6-RFC-SHA\]'; then
+    pass "сценарий RFC-SHA-no-context (hex-токен без слова-маркера коммита): гейт НЕ падает, exit=${rc}"
+  else
+    fail "сценарий RFC-SHA-no-context: ОЖИДАЛСЯ PASS (без контекста не проверяется), получено (exit=${rc}):"
+    echo "${out}" | sed 's/^/      /'
+  fi
+}
+
+# --- сценарий: RFC цитирует РЕАЛЬНЫЙ путь (существующий в дереве фикстуры) → PASS [7-RFC-PATH] ---
+scenario_rfc_path_real_passes() {
+  local d="${TMP_BASE}/rfc_path_real"
+  build_rfc_fixture_base "${d}" >/dev/null
+  cat > "${d}/docs/rfc/CT-RFC-TEST-path-real.md" <<'EOF'
+# CT-RFC-TEST — реальный путь
+Затронутый файл: `crates/xx/tests/red_xx.rs`.
+EOF
+  local out rc
+  out="$(run_verify "${d}")"; rc=$?
+  if [ "${rc}" -eq 0 ] && echo "${out}" | grep -q '^VERDICT: PASS' \
+     && echo "${out}" | grep -q 'PASS  \[7-RFC-PATH\]'; then
+    pass "сценарий RFC-PATH-real (реальный путь в docs/rfc/): гейт даёт PASS [7-RFC-PATH], VERDICT: PASS, exit=${rc}"
+  else
+    fail "сценарий RFC-PATH-real: ОЖИДАЛСЯ PASS [7-RFC-PATH] + VERDICT: PASS, получено (exit=${rc}):"
+    echo "${out}" | sed 's/^/      /'
+  fi
+}
+
+# --- анти-плацебо: путь с ХВОСТОМ внутри ТОЙ ЖЕ пары backtick'ов (` path.md §9 `,
+# `path.rs:301-315`, `path.rs::func_name`) — хвост отбрасывается, путь резолвится по
+# файлу. Реальный ложный FAIL, пойманный при прогоне check7 на CT-RFC-05: токен
+# `research/data-quality/margin-source-survey.md §9` (пробел+секция ВНУТРИ backtick'ов)
+# резолвился как несуществующий литеральный путь до этого фикса.
+scenario_rfc_path_trailing_section_ref_stripped() {
+  local d="${TMP_BASE}/rfc_path_section_tail"
+  build_rfc_fixture_base "${d}" >/dev/null
+  cat > "${d}/docs/rfc/CT-RFC-TEST-path-section-tail.md" <<'EOF'
+# CT-RFC-TEST — путь с хвостом-секцией внутри backtick'ов
+Мотивация зафиксирована в `crates/xx/tests/red_xx.rs §9`; тот же файл ещё раз через
+Rust-путь `crates/xx/tests/red_xx.rs::xx_i_1_something_holds` и через диапазон строк
+`crates/xx/tests/red_xx.rs:1-5`.
+EOF
+  local out rc
+  out="$(run_verify "${d}")"; rc=$?
+  if [ "${rc}" -eq 0 ] && echo "${out}" | grep -q '^VERDICT: PASS' \
+     && echo "${out}" | grep -q 'PASS  \[7-RFC-PATH\]'; then
+    pass "сценарий RFC-PATH-section-tail (хвост §N/::func/:NNN внутри backtick'ов отброшен): гейт даёт PASS [7-RFC-PATH], exit=${rc}"
+  else
+    fail "сценарий RFC-PATH-section-tail: ОЖИДАЛСЯ PASS [7-RFC-PATH] (хвост отброшен, путь резолвится), получено (exit=${rc}):"
+    echo "${out}" | sed 's/^/      /'
+  fi
+}
+
+# --- сценарий: RFC ссылается на НЕСУЩЕСТВУЮЩИЙ путь → FAIL [7-RFC-PATH] (класс C-044 F2:
+# документ занижает/искажает список мест правки — опечатка/несуществующий путь та же ложь) ---
+scenario_rfc_path_missing_fails() {
+  local d="${TMP_BASE}/rfc_path_fake"
+  build_rfc_fixture_base "${d}" >/dev/null
+  cat > "${d}/docs/rfc/CT-RFC-TEST-path-fake.md" <<'EOF'
+# CT-RFC-TEST — несуществующий путь
+Затронутый файл: `crates/xx/tests/does-not-exist.rs`.
+EOF
+  local out rc
+  out="$(run_verify "${d}")"; rc=$?
+  if [ "${rc}" -ne 0 ] && echo "${out}" | grep -q 'FAIL  \[7-RFC-PATH\].*does-not-exist\.rs.*не существует'; then
+    pass "сценарий RFC-PATH-fake (несуществующий путь в docs/rfc/, C-044 F2 класс): гейт даёт FAIL [7-RFC-PATH], exit=${rc}"
+  else
+    fail "сценарий RFC-PATH-fake: ОЖИДАЛСЯ FAIL [7-RFC-PATH], получено (exit=${rc}):"
+    echo "${out}" | sed 's/^/      /'
+  fi
+}
+
+# --- анти-плацебо: glob/brace-паттерн (`crates/xx/**`, `crates/xx/fixtures/{valid,invalid}`)
+# — НЕ литеральный путь, не должен считаться отсутствующим файлом.
+scenario_rfc_path_glob_pattern_skipped() {
+  local d="${TMP_BASE}/rfc_path_glob"
+  build_rfc_fixture_base "${d}" >/dev/null
+  cat > "${d}/docs/rfc/CT-RFC-TEST-path-glob.md" <<'EOF'
+# CT-RFC-TEST — glob-паттерн, не литеральный путь
+Затрагивает `crates/xx/**` и `crates/xx/fixtures/{valid,invalid}` — примеры паттерна, не файлы.
+EOF
+  local out rc
+  out="$(run_verify "${d}")"; rc=$?
+  if [ "${rc}" -eq 0 ] && echo "${out}" | grep -q '^VERDICT: PASS' \
+     && ! echo "${out}" | grep -q 'FAIL  \[7-RFC-PATH\]'; then
+    pass "сценарий RFC-PATH-glob (glob/brace-паттерн — не литеральный путь): гейт НЕ падает, exit=${rc}"
+  else
+    fail "сценарий RFC-PATH-glob: ОЖИДАЛСЯ PASS (glob-паттерн пропущен), получено (exit=${rc}):"
+    echo "${out}" | sed 's/^/      /'
+  fi
+}
+
 echo "=== RED self-test: scripts/verify_design_claims.sh (BARRIER=${BARRIER}) ==="
 scenario_good
 scenario_bad_est_missing_path
@@ -585,6 +777,14 @@ scenario_bad_setup_guard_missing_design
 scenario_merge_preview_catches_branch_vs_merge_drift
 scenario_merge_preview_conflict_is_setup_guard_fail
 scenario_merge_preview_bad_base_ref_fails
+scenario_rfc_sha_real_passes
+scenario_rfc_sha_fake_fails
+scenario_rfc_sha_orphan_exists_but_not_ancestor_fails
+scenario_rfc_sha_no_context_not_checked
+scenario_rfc_path_real_passes
+scenario_rfc_path_trailing_section_ref_stripped
+scenario_rfc_path_missing_fails
+scenario_rfc_path_glob_pattern_skipped
 
 echo
 if [ "${FAILED}" -eq 0 ]; then
