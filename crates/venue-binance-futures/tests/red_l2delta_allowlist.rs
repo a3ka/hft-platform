@@ -24,7 +24,10 @@ const PROD_DEFAULT: &[&str] = &["BTCUSDT"];
 fn o3_default_when_config_absent_equals_current_prod_behaviour() {
     assert_eq!(
         parse_capture_symbols(None),
-        PROD_DEFAULT.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        PROD_DEFAULT
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>(),
         "БЕЗ конфигурации перп-адаптер обязан эмитить ровно сегодняшний состав ({PROD_DEFAULT:?}) \
          — условие, при котором merge M-45 не является раскаткой"
     );
@@ -35,7 +38,10 @@ fn o3_empty_config_is_default_not_all_and_not_nothing() {
     for raw in ["", "   ", ",", " , , "] {
         assert_eq!(
             parse_capture_symbols(Some(raw)),
-            PROD_DEFAULT.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            PROD_DEFAULT
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>(),
             "вырожденная конфигурация {raw:?} обязана означать ДЕФОЛТ, не «всё» и не «ничего»"
         );
     }
@@ -154,7 +160,11 @@ fn allowlist_does_not_alter_perp_continuity_semantics() {
          в None (это спот-семантика; путаница ломает gap-детекцию, урок TD-014)"
     );
     assert_eq!((first_update_id, final_update_id), (101, 103));
-    assert_eq!(bids.len(), 2, "оба бид-уровня сохранены, включая size==0 remove");
+    assert_eq!(
+        bids.len(),
+        2,
+        "оба бид-уровня сохранены, включая size==0 remove"
+    );
     assert_eq!(bids[1].size, 0, "remove-маркер не схлопнут");
     assert!(
         asks.is_empty(),
@@ -240,7 +250,13 @@ fn o7_real_path_preserves_perp_continuity_chain() {
     let ev = venue_binance_futures::l2delta_emission_for(&stream, &data, &syms)
         .expect("разрешённый символ обязан дать событие");
     let EventKind::Md(MdEvent {
-        payload: MdPayload::L2Delta { prev_final_update_id, bids, asks, .. },
+        payload:
+            MdPayload::L2Delta {
+                prev_final_update_id,
+                bids,
+                asks,
+                ..
+            },
         ..
     }) = ev
     else {
@@ -401,8 +417,16 @@ fn o8_multiple_allowed_symbols_all_emit() {
 
     let e1 = s.on_ws_text(&ws_depth_text("ethusdt"));
     let e2 = s.on_ws_text(&ws_depth_text("solusdt"));
-    assert_eq!(count_l2delta_emits(&e1, "ETHUSDT"), 1, "ETHUSDT обязан эмитить");
-    assert_eq!(count_l2delta_emits(&e2, "SOLUSDT"), 1, "SOLUSDT обязан эмитить");
+    assert_eq!(
+        count_l2delta_emits(&e1, "ETHUSDT"),
+        1,
+        "ETHUSDT обязан эмитить"
+    );
+    assert_eq!(
+        count_l2delta_emits(&e2, "SOLUSDT"),
+        1,
+        "SOLUSDT обязан эмитить"
+    );
 }
 
 #[test]
@@ -437,7 +461,11 @@ fn o8_emitted_payload_is_intact_through_real_entry_point() {
         unreachable!("отфильтровано выше");
     };
     assert_eq!(*prev_final_update_id, Some(100), "`pu` сохранён (TD-014)");
-    assert_eq!((*first_update_id, *final_update_id), (101, 103), "U/u сохранены");
+    assert_eq!(
+        (*first_update_id, *final_update_id),
+        (101, 103),
+        "U/u сохранены"
+    );
     assert_eq!(bids.len(), 2, "оба бид-уровня, включая size==0 remove");
     assert!(asks.is_empty(), "пустая сторона остаётся пустой");
 }

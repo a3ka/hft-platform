@@ -54,7 +54,10 @@ fn o3_default_when_config_absent_equals_current_prod_behaviour() {
     let got = parse_capture_symbols(None);
     assert_eq!(
         got,
-        PROD_DEFAULT.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        PROD_DEFAULT
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>(),
         "БЕЗ конфигурации состав эмиссии обязан остаться ровно сегодняшним ({PROD_DEFAULT:?}). \
          Это условие, при котором merge M-45 не является раскаткой: прод после деплоя пишет \
          то же, что писал до него. Если этот тест красный — milestone нельзя мержить без \
@@ -72,7 +75,10 @@ fn o3_empty_config_is_default_not_all_and_not_nothing() {
         let got = parse_capture_symbols(Some(raw));
         assert_eq!(
             got,
-            PROD_DEFAULT.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            PROD_DEFAULT
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>(),
             "пустая/вырожденная конфигурация {raw:?} обязана означать ДЕФОЛТ, \
              не «эмитить всё» и не «эмитить ничего»"
         );
@@ -203,7 +209,10 @@ fn o6_parse_is_deterministic_and_order_preserving() {
     let a = parse_capture_symbols(raw);
     let b = parse_capture_symbols(raw);
     let c = parse_capture_symbols(raw);
-    assert_eq!(a, b, "повторный разбор той же строки обязан дать тот же результат");
+    assert_eq!(
+        a, b,
+        "повторный разбор той же строки обязан дать тот же результат"
+    );
     assert_eq!(a, c, "третий разбор разошёлся");
     assert_eq!(
         a.len(),
@@ -352,7 +361,11 @@ fn o7_emitted_event_is_lossless_and_not_altered_by_allowlist() {
     };
 
     assert_eq!(symbol, "ETHUSDT", "символ нормализован в верхний регистр");
-    assert_eq!((first_update_id, final_update_id), (101, 103), "U/u сохранены");
+    assert_eq!(
+        (first_update_id, final_update_id),
+        (101, 103),
+        "U/u сохранены"
+    );
     assert_eq!(
         prev_final_update_id, None,
         "СПОТ: `pu` в wire отсутствует ⇒ None (перп-семантика сюда не протекает — урок TD-014)"
@@ -512,8 +525,14 @@ fn o8_multiple_allowed_symbols_all_emit() {
     let syms = parse_capture_symbols(Some("ETHUSDT,SOLUSDT"));
     let subs = vec!["ETHUSDT".to_string(), "SOLUSDT".to_string()];
     let mut s = venue_binance::SpotSession::new_with_l2delta(&subs, &syms);
-    assert_eq!(count_l2delta_emits(&s.on_ws_text(&ws_depth_text("ethusdt")), "ETHUSDT"), 1);
-    assert_eq!(count_l2delta_emits(&s.on_ws_text(&ws_depth_text("solusdt")), "SOLUSDT"), 1);
+    assert_eq!(
+        count_l2delta_emits(&s.on_ws_text(&ws_depth_text("ethusdt")), "ETHUSDT"),
+        1
+    );
+    assert_eq!(
+        count_l2delta_emits(&s.on_ws_text(&ws_depth_text("solusdt")), "SOLUSDT"),
+        1
+    );
 }
 
 #[test]
@@ -536,13 +555,23 @@ fn o8_emitted_payload_is_intact_and_spot_semantics_preserved() {
         })
         .expect("разрешённый символ обязан дать Emit(L2Delta)");
 
-    let MdPayload::L2Delta { prev_final_update_id, first_update_id, final_update_id, bids, asks, .. } =
-        &md.payload
+    let MdPayload::L2Delta {
+        prev_final_update_id,
+        first_update_id,
+        final_update_id,
+        bids,
+        asks,
+        ..
+    } = &md.payload
     else {
         unreachable!("отфильтровано выше");
     };
     assert_eq!(*prev_final_update_id, None, "СПОТ: `pu` в wire нет ⇒ None");
-    assert_eq!((*first_update_id, *final_update_id), (101, 103), "U/u сохранены");
+    assert_eq!(
+        (*first_update_id, *final_update_id),
+        (101, 103),
+        "U/u сохранены"
+    );
     assert_eq!(bids.len(), 2, "оба бид-уровня, включая size==0 remove");
     assert!(asks.is_empty(), "пустая сторона остаётся пустой");
 }
