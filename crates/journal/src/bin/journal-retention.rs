@@ -61,9 +61,30 @@ use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use journal::{
-    compact_closed_segments, retention_execute, retention_plan, CompactionReport, RetentionMode,
-    RetentionPlan, RetentionPolicy, RetentionReport, DEFAULT_COMPACT_LEVEL,
+    compact_closed_segments, retention_execute, retention_plan, CompactionReport, EpochFilter,
+    RetentionMode, RetentionPlan, RetentionPolicy, RetentionReport, DEFAULT_COMPACT_LEVEL,
 };
+
+/// Имя машинной записи дайджеста (JR-I-12, M-52/TD-067) — КОНТРАКТНОЕ: канарейка
+/// `verify_M-52.sh` стоит на этой строке.
+const REPLAY_DIGEST_RECORD: &str = "journal.replay-digest.json";
+
+/// Exit-код расхождения дайджеста с `--expect` (1/2/3 уже заняты аргументами/сверкой
+/// холодной копии/disk_pressure — см. док-шапку файла).
+const EXIT_DIGEST_MISMATCH: u8 = 4;
+
+/// Режим исполнения CLI. Отдельный от `journal::RetentionMode`: `ReplayDigest` — не операция
+/// ретеншена, а самостоятельный операторский прогон дайджеста (JR-I-12); заводить под него
+/// вариант в БИБЛИОТЕЧНОМ `RetentionMode` означало бы новую публичную поверхность крейта
+/// сверх режима CLI (запрещено milestone M-52) и ломало бы исчерпывающие матчи
+/// `retention_plan`/`retention_execute`, которые про дайджест ничего не знают.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    DryRun,
+    Apply,
+    Compact,
+    ReplayDigest,
+}
 
 const DEFAULT_RETAIN_DAYS: u32 = 14;
 const DEFAULT_KEEP_MIN: u32 = 4;
@@ -81,7 +102,14 @@ struct Args {
     /// `--mode compact` — последние N закрытых сегментов остаются сырыми (D-COMP-3).
     keep_raw: u32,
     now_wall_ms: Option<i64>,
-    mode: RetentionMode,
+    mode: Mode,
+    /// `--mode replay-digest`: нижняя граница окна (включительно), JR-I-12.
+    from_seq: Option<u64>,
+    /// `--mode replay-digest`: верхняя граница окна (включительно), JR-I-12.
+    to_seq: Option<u64>,
+    /// `--mode replay-digest`: ожидаемый `state_hash` (hex) — расхождение даёт
+    /// `EXIT_DIGEST_MISMATCH` (JR-I-12).
+    expect: Option<String>,
     /// M-38b (C-030 R1): путь к артефакту покрытия `covered_through_seq`, публикуемому
     /// `gateway-checkpoint` (минимум по всем сконфигурированным селекторам).
     /// None = «нет артефакта» = fail-closed (никаких prune, даже с override).
@@ -101,7 +129,10 @@ fn parse_args() -> Result<Args, String> {
     let mut min_free_gb: Option<u64> = None;
     let mut keep_raw: Option<u32> = None;
     let mut now_wall_ms: Option<i64> = None;
-    let mut mode: Option<RetentionMode> = None;
+    let mut mode: Option<Mode> = None;
+    let mut from_seq: Option<u64> = None;
+    let mut to_seq: Option<u64> = None;
+    let mut expect: Option<String> = None;
     let mut checkpoint_coverage: Option<PathBuf> = None;
     let mut allow_prune_without_checkpoint: bool = false;
 
@@ -169,17 +200,29 @@ fn parse_args() -> Result<Args, String> {
             }
             "--mode" => {
                 mode = Some(match next()? {
-                    "dry-run" | "dryrun" | "dry" => RetentionMode::DryRun,
-                    "apply" => RetentionMode::Apply,
+                    "dry-run" | "dryrun" | "dry" => Mode::DryRun,
+                    "apply" => Mode::Apply,
                     // D-COMP-3: третий режим — компакция закрытых сегментов (zstd).
-                    "compact" | "compaction" => RetentionMode::Compact,
+                    "compact" | "compaction" => Mode::Compact,
+                    // JR-I-12 (M-52/TD-067): четвёртый режим — дайджест реплея боевого
+                    // журнала уже доставленным бинарём (на VPS нет Rust toolchain).
+                    "replay-digest" | "replay_digest" => Mode::ReplayDigest,
                     other => {
                         return Err(format!(
                             "--mode: неизвестное значение `{other}` \
-                             (ожидается dry-run|apply|compact)"
+                             (ожидается dry-run|apply|compact|replay-digest)"
                         ));
                     }
                 });
+            }
+            "--from" => {
+                from_seq = Some(next()?.parse::<u64>().map_err(|e| format!("--from: {e}"))?);
+            }
+            "--to" => {
+                to_seq = Some(next()?.parse::<u64>().map_err(|e| format!("--to: {e}"))?);
+            }
+            "--expect" => {
+                expect = Some(next()?.to_string());
             }
             // M-38b (C-030 R1): путь к артефакту покрытия `covered_through_seq`. Если
             // файла нет или он не парсится в u64 — `covered = None` (fail-closed).
@@ -210,7 +253,10 @@ fn parse_args() -> Result<Args, String> {
             .saturating_mul(1024 * 1024 * 1024),
         keep_raw: keep_raw.unwrap_or(DEFAULT_KEEP_RAW),
         now_wall_ms,
-        mode: mode.unwrap_or(RetentionMode::DryRun),
+        mode: mode.unwrap_or(Mode::DryRun),
+        from_seq,
+        to_seq,
+        expect,
         checkpoint_coverage,
         allow_prune_without_checkpoint,
     })
@@ -218,12 +264,14 @@ fn parse_args() -> Result<Args, String> {
 
 fn print_help() {
     println!(
-        "journal-retention — операторский путь ретеншена И компакции (M-08 TD-020+TD-022)\n\
+        "journal-retention — операторский путь ретеншена, компакции И дайджеста реплея \
+         (M-08 TD-020+TD-022, M-52 TD-067)\n\
          \n\
          Использование:\n  \
            journal-retention [--dir DIR] [--cold COLD] [--retain-days N] [--keep-min N]\n  \
                               [--min-free-gb N] [--keep-raw N] [--now-wall-ms MS]\n  \
-                              [--mode dry-run|apply|compact]\n\
+                              [--mode dry-run|apply|compact|replay-digest]\n  \
+                              [--from SEQ] [--to SEQ] [--expect HEX]\n\
          \n\
          Дефолты:\n  \
            --dir={DEFAULT_DIR}  --cold={DEFAULT_COLD}\n  \
@@ -231,11 +279,21 @@ fn print_help() {
            --min-free-gb={DEFAULT_MIN_FREE_GB}  --keep-raw={DEFAULT_KEEP_RAW}\n  \
            --mode=dry-run  (Apply — ТОЛЬКО после успешного DryRun на проде; Compact безопасен по дизайну)\n\
          \n\
+         --mode replay-digest (JR-I-12, TD-067): считает `journal::replay_digest` ПОТОКОВО\n  \
+           (не read_all/recover — 26 GB/148M событий в RAM недопустимо), печатает\n  \
+           events/first_seq/last_seq/state_hash, пишет {REPLAY_DIGEST_RECORD} рядом с\n  \
+           журналом (атомарно). Read-only по данным журнала — recorder дайджест не считает\n  \
+           никогда. `--from`/`--to` — ЗАКРЫТОЕ окно (включительно) — единственная форма,\n  \
+           воспроизводимая на живом журнале; без них окно ОТКРЫТОЕ и растёт под сканом.\n  \
+           `--expect HEX` — сверка со state_hash: расхождение даёт exit {EXIT_DIGEST_MISMATCH}\n  \
+           и печатает ОБЕ величины.\n\
+         \n\
          Exit-коды:\n  \
            0 — успех\n  \
            1 — неверные аргументы / I/O\n  \
            2 — failed-сегменты при Apply/Compact (сверка холодной копии / sha256 .zst не прошла)\n  \
-           3 — disk_pressure (мало места, уборка не помогает — только retention)\n"
+           3 — disk_pressure (мало места, уборка не помогает — только retention)\n  \
+           {EXIT_DIGEST_MISMATCH} — replay-digest: state_hash разошёлся с --expect\n"
     );
 }
 
@@ -262,9 +320,21 @@ fn main() -> ExitCode {
     // (--dir, --keep-raw, --mode compact). Никакого retention_plan/cold — компакция
     // безопасна по дизайну (D-COMP-2 самоизлечение), и шов с cold-storage тут не нужен.
     // Сужаем поведение до понятного cron'у подмножества.
-    if args.mode == RetentionMode::Compact {
+    if args.mode == Mode::Compact {
         return run_compact(&args);
     }
+
+    // JR-I-12 (M-52/TD-067): дайджест реплея — ОТДЕЛЬНЫЙ режим, не операция ретеншена.
+    // Read-only по данным журнала, не проходит через retention_plan/execute/cold.
+    if args.mode == Mode::ReplayDigest {
+        return run_replay_digest(&args);
+    }
+
+    let rmode = match args.mode {
+        Mode::DryRun => RetentionMode::DryRun,
+        Mode::Apply => RetentionMode::Apply,
+        Mode::Compact | Mode::ReplayDigest => unreachable!("обработаны выше"),
+    };
 
     let now_wall_ms = args.now_wall_ms.unwrap_or_else(default_now_wall_ms);
     // M-38b (C-030 R1): артефакт покрытия чекпоинта `--checkpoint-coverage <path>` —
@@ -301,7 +371,7 @@ fn main() -> ExitCode {
     // увидит, ЧТО планировалось сделать.
     print_plan(&args, &plan);
 
-    let report = match retention_execute(&args.dir, &plan, &policy, args.mode) {
+    let report = match retention_execute(&args.dir, &plan, &policy, rmode) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("journal-retention: не удалось выполнить план: {e}");
@@ -374,6 +444,89 @@ fn run_compact(args: &Args) -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+/// Hex-кодировка `state_hash` (32 байта → 64 hex-символа, lowercase).
+fn hex32(h: &[u8; 32]) -> String {
+    h.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// `--mode replay-digest` (JR-I-12, M-52/TD-067): `DET-I-1` обязан быть наблюдаем на боевом
+/// журнале средствами, УЖЕ доставленными в прод (на VPS нет Rust toolchain — до сих пор
+/// единственной проверкой был sha256 ФАЙЛА, что доказывает неизменность байт, а НЕ
+/// воспроизводимость реплея).
+///
+/// Считает `journal::replay_digest` ПОТОКОВО (не `read_all`/`recover` — прод 26 GB/148M
+/// событий в RAM недопустимо, класс TD-011), печатает окно+хэш, пишет машинную запись
+/// атомарно рядом с журналом, при `--expect` сверяет и возвращает `EXIT_DIGEST_MISMATCH` на
+/// расхождении. Read-only по данным журнала — recorder дайджест не считает НИКОГДА (отдельный
+/// операторский прогон, не горячий путь сбора).
+fn run_replay_digest(args: &Args) -> ExitCode {
+    let digest =
+        match journal::replay_digest(&args.dir, EpochFilter::All, args.from_seq, args.to_seq) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("journal-retention[replay-digest]: не удалось посчитать дайджест: {e}");
+                return ExitCode::from(1);
+            }
+        };
+
+    let hash = hex32(&digest.state_hash);
+    // Честность окна (JR-I-12): дайджест ОТКРЫТОГО окна на живом журнале невоспроизводим по
+    // построению (recorder дописывает события, пока идёт скан) — запись обязана называть
+    // РЕАЛЬНО покрытое окно, а не молчать `none` как «ноль», когда событий не было вовсе.
+    let first = digest
+        .first_seq
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    let last = digest
+        .last_seq
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    println!(
+        "events={} first_seq={} last_seq={} state_hash={}",
+        digest.events, first, last, hash
+    );
+
+    let record = serde_json::json!({
+        "events": digest.events,
+        "first_seq": digest.first_seq,
+        "last_seq": digest.last_seq,
+        "state_hash": hash,
+    });
+    if let Err(e) = write_replay_digest_record(&args.dir, &record) {
+        eprintln!(
+            "journal-retention[replay-digest]: не удалось записать {REPLAY_DIGEST_RECORD}: {e}"
+        );
+        return ExitCode::from(1);
+    }
+
+    if let Some(expect) = &args.expect {
+        let expect_norm = expect.to_lowercase();
+        if expect_norm != hash {
+            eprintln!(
+                "journal-retention[replay-digest]: JR-I-12 РАСХОЖДЕНИЕ state_hash — DET-I-1 \
+                 НАРУШЕН на боевом журнале: expect={expect_norm} actual={hash}"
+            );
+            println!("expect={expect_norm} actual={hash}");
+            return ExitCode::from(EXIT_DIGEST_MISMATCH);
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+/// Атомарная запись машинной записи дайджеста (tmp + rename в том же каталоге — не
+/// оставляет `.tmp`-хвостов ни при первом, ни при повторном прогоне).
+fn write_replay_digest_record(
+    dir: &std::path::Path,
+    record: &serde_json::Value,
+) -> std::io::Result<()> {
+    let path = dir.join(REPLAY_DIGEST_RECORD);
+    let tmp = dir.join(format!("{REPLAY_DIGEST_RECORD}.tmp"));
+    let bytes = serde_json::to_vec_pretty(record).map_err(std::io::Error::other)?;
+    std::fs::write(&tmp, &bytes)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
 }
 
 /// Печать итогов компакции (отдельная, чтобы не перегружать print_plan/print_report).
