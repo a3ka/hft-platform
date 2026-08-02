@@ -37,5 +37,10 @@ model: sonnet
 ## Handoff
 - REJECT → `architect` (правит milestone, re-цикл критика).
 - NOTE/ESCALATE(→approved) → architect делает mechanical appendix (verdict в milestone-файл), затем dev-агент назначенный по §1 ролевой таблице (`engine-dev`/`venue-dev`/`signal-engineer`/`research-dev`).
-- ESCALATE (не решено) → founder (человек решает).
+- **ESCALATE (не решено) → АРБИТР** (сильная модель, свежий контекст — `.claude/rules/gates.md` §0),
+  НЕ founder. Исключение — Граница C (`gates.md` §0.1: состав записываемых данных, промоушен,
+  веса/лимиты, фазы, live): она идёт founder'у и не делегируется никому.
+- **Второй REJECT подряд по ОДНОЙ причине → арбитр, не третий круг.** Повтор причины означает,
+  что стороны не понимают друг друга, а не что правка недоделана (урок M-45: три REJECT по
+  одному предмету). Critic вправе созвать арбитра сам, назвав его в §D Handoff'а.
 - Формат — Handoff-блок; §D называет конкретного следующего агента + paste-ready промпт, НЕ предлагает architect self-fix loop на NOTE/ESCALATE.
