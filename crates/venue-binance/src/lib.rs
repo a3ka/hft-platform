@@ -118,10 +118,329 @@ enum DiffAction {
 
 type SnapshotFuture = Pin<Box<dyn Future<Output = (String, anyhow::Result<OrderBook>)> + Send>>;
 
+/// Эффект sync-state-машины `SpotSession` (M-45, паттерн TD-014 из
+/// `venue-binance-futures::FuturesSession`): то, что она «хочет» эмитить во внешний мир
+/// или запросить у I/O-слоя. `run()` ОБЯЗАН делегировать в `SpotSession` — иначе
+/// allow-list не гарантирован на живом пути (D-1, C-049).
+///
+/// * `Emit(MdEvent)` — нормализованное событие для журнала (Trade/L2Delta/L2Snapshot).
+/// * `FetchSnapshot { symbol, after }` — запросить REST-снапшот. Спот НЕ имеет backoff
+///   (TD-013 — futures-специфика, вне объёма M-45): `after` всегда `Duration::ZERO`,
+///   байт-в-байт сегодняшнее поведение (fire immediately).
+#[derive(Debug, Clone)]
+pub enum SessionEffect {
+    Emit(MdEvent),
+    FetchSnapshot { symbol: String, after: Duration },
+}
+
+/// Тестируемая sync-state-машина `venue-binance` (СПОТ) БЕЗ сети/каналов (M-45 task 3c,
+/// паттерн TD-014 из `venue-binance-futures::FuturesSession`). Инкапсулирует per-symbol
+/// `SymbolState` (буфер diff'ов + book) и allow-list эмиссии `L2Delta`. Никогда не ходит
+/// в сеть и не шлёт в mpsc — только накапливает состояние и возвращает
+/// `Vec<SessionEffect>`; `run()` — тонкая I/O-обёртка, исполняющая эффекты.
+pub struct SpotSession {
+    states: HashMap<String, SymbolState>,
+    /// M-45: allow-list эмиссии `L2Delta` (явный параметр, независимый от книг символов
+    /// — символ может вестись в книге и НЕ капчиться в журнал сырых дельт).
+    l2delta_allow: Vec<String>,
+}
+
+impl SpotSession {
+    /// Новая сессия для подписки `subs`. Per-symbol состояние заводится СРАЗУ с
+    /// `resyncing = true` (байт-в-байт прежний bootstrap `run()`'а) — `bootstrap()`
+    /// возвращает соответствующие `FetchSnapshot`-эффекты. `l2delta_allow` — allow-list
+    /// эмиссии `L2Delta`, задаётся ЯВНЫМ параметром (M-45 API-контракт).
+    pub fn new_with_l2delta(subs: &[String], l2delta_allow: &[String]) -> Self {
+        let mut states = HashMap::new();
+        for s in subs {
+            let symbol = s.to_uppercase();
+            let mut state = SymbolState::new();
+            state.resyncing = true;
+            states.insert(symbol, state);
+        }
+        Self {
+            states,
+            l2delta_allow: l2delta_allow.to_vec(),
+        }
+    }
+
+    /// Эффекты стартовой синхронизации: REST snapshot-фетч для каждого символа из
+    /// `subs` (состояние уже помечено `resyncing` конструктором — здесь только запрос).
+    pub fn bootstrap(&self) -> Vec<SessionEffect> {
+        let mut symbols: Vec<&String> = self.states.keys().collect();
+        symbols.sort(); // JR-I/детерминизм: без сортировки порядок эффектов зависел бы
+                        // от итерации HashMap (недетерминизм, CLAUDE.md).
+        symbols
+            .into_iter()
+            .map(|symbol| SessionEffect::FetchSnapshot {
+                symbol: symbol.clone(),
+                after: Duration::ZERO,
+            })
+            .collect()
+    }
+
+    /// Обработать одно combined-stream текстовое сообщение спота. Возвращает эффекты —
+    /// I/O-обёртка (`run`) их применяет: эмитит в `tx` / запрашивает REST-снапшот.
+    /// Sync, БЕЗ сети/каналов (M-45 D-1, C-049): решающий оракул O-8 дёргает эту функцию
+    /// сырым wire-текстом напрямую, проверяя РЕАЛЬНОЕ поведение, а не структуру кода.
+    pub fn on_ws_text(&mut self, text: &str) -> Vec<SessionEffect> {
+        let mut effects = Vec::new();
+        let value: serde_json::Value = match serde_json::from_str(text) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::debug!(error = %e, raw = %text, "venue-binance: malformed JSON, skipping");
+                return effects;
+            }
+        };
+
+        let stream = match value.get("stream").and_then(|v| v.as_str()) {
+            Some(s) => s,
+            None => {
+                tracing::debug!(raw = %text, "venue-binance: message without 'stream', skipping");
+                return effects;
+            }
+        };
+        let data = match value.get("data") {
+            Some(d) => d,
+            None => {
+                tracing::debug!(raw = %text, "venue-binance: message without 'data', skipping");
+                return effects;
+            }
+        };
+
+        if stream.ends_with("@trade") {
+            if let Some(EventKind::Md(md)) = parse_trade(data) {
+                effects.push(SessionEffect::Emit(md));
+            }
+        } else if stream.contains("@depth") {
+            // M-45: решение об эмиссии L2Delta делегировано ЕДИНСТВЕННОЙ точке
+            // `l2delta_emission_for` (allow-list из конфига, не хардкод) — капчим
+            // КАЖДЫЙ распарсенный diff как сырое L2Delta-событие независимо от
+            // book-sync FSM (ground-truth рыночное событие), но только если символ
+            // разрешён `l2delta_allow`.
+            if let Some(EventKind::Md(md)) = l2delta_emission_for(stream, data, &self.l2delta_allow)
+            {
+                effects.push(SessionEffect::Emit(md));
+            }
+            if let Some((symbol, diff)) = parse_depth_diff(stream, data) {
+                let state = self
+                    .states
+                    .entry(symbol.clone())
+                    .or_insert_with(SymbolState::new);
+                let action = match &state.book {
+                    None => DiffAction::Buffer,
+                    Some(book) => {
+                        if diff.u_final <= book.last_update_id {
+                            DiffAction::Skip
+                        } else if diff.u_first != book.last_update_id + 1 {
+                            DiffAction::Gap
+                        } else {
+                            DiffAction::Apply
+                        }
+                    }
+                };
+                match action {
+                    DiffAction::Skip => {}
+                    DiffAction::Buffer => {
+                        state.pending.push_back(diff);
+                        if !state.resyncing {
+                            state.resyncing = true;
+                            effects.push(SessionEffect::FetchSnapshot {
+                                symbol: symbol.clone(),
+                                after: Duration::ZERO,
+                            });
+                        }
+                    }
+                    DiffAction::Gap => {
+                        tracing::warn!(
+                            symbol = %symbol,
+                            "venue-binance: depth continuity gap detected, resyncing book"
+                        );
+                        state.book = None;
+                        state.pending.clear();
+                        state.pending.push_back(diff);
+                        state.resyncing = true;
+                        effects.push(SessionEffect::FetchSnapshot {
+                            symbol: symbol.clone(),
+                            after: Duration::ZERO,
+                        });
+                    }
+                    DiffAction::Apply => {
+                        if let Some(book) = state.book.as_mut() {
+                            apply_diff_to_book(book, &diff);
+                        }
+                    }
+                }
+            } else {
+                tracing::debug!(stream = %stream, "venue-binance: unparseable depth frame");
+            }
+        } else {
+            tracing::debug!(stream = %stream, "venue-binance: unrecognized stream, skipping");
+        }
+
+        effects
+    }
+
+    /// REST snapshot завершился (успешно или нет) — реконcилировать с буфером `pending`
+    /// (эквивалент прежнего свободного `handle_snapshot`, теперь метод сессии). Парсинг
+    /// HTTP-ответа остаётся в I/O-обёртке (`fetch_snapshot`) — сессия работает с уже
+    /// распарсенным `OrderBook`, никакого HTTP/JSON внутри seam'а.
+    pub fn on_snapshot_result(
+        &mut self,
+        symbol: &str,
+        result: Result<OrderBook, ()>,
+    ) -> Vec<SessionEffect> {
+        let mut effects = Vec::new();
+        let Some(state) = self.states.get_mut(symbol) else {
+            return effects;
+        };
+
+        let mut book = match result {
+            Ok(book) => book,
+            Err(()) => {
+                tracing::warn!(symbol = %symbol, "venue-binance: snapshot fetch failed, retrying");
+                effects.push(SessionEffect::FetchSnapshot {
+                    symbol: symbol.to_string(),
+                    after: Duration::ZERO,
+                });
+                return effects;
+            }
+        };
+
+        loop {
+            let front = state.pending.front().map(|d| (d.u_final, d.u_first));
+            let Some((u_final, u_first)) = front else {
+                state.book = Some(book);
+                state.resyncing = false;
+                return effects;
+            };
+
+            if u_final <= book.last_update_id {
+                // Stale relative to the snapshot — discard and keep reconciling.
+                state.pending.pop_front();
+                continue;
+            }
+
+            if u_first > book.last_update_id + 1 {
+                // Snapshot (or last-applied diff) is stale relative to the buffer — the gap
+                // means we cannot bridge lastUpdateId -> this diff; refetch. Keep buffered
+                // diffs — a fresher snapshot may cover them.
+                tracing::warn!(
+                    symbol = %symbol,
+                    "venue-binance: snapshot stale vs buffered diffs, refetching"
+                );
+                state.resyncing = true;
+                effects.push(SessionEffect::FetchSnapshot {
+                    symbol: symbol.to_string(),
+                    after: Duration::ZERO,
+                });
+                return effects;
+            }
+
+            // u_first <= last_update_id+1 <= u_final: applicable (first application) or
+            // exactly continuous (subsequent applications from the buffer).
+            let diff = state
+                .pending
+                .pop_front()
+                .expect("front() just returned Some");
+            apply_diff_to_book(&mut book, &diff);
+        }
+    }
+
+    /// Периодический тик: эмитит по одному `L2Snapshot` на синхронизированный символ
+    /// (эквивалент прежней свободной `emit_book_snapshots`, теперь метод сессии —
+    /// возвращает эффекты вместо прямого `tx.send`). Делегирует в
+    /// `compute_book_snapshot_effects` — тот же хелпер использует legacy-обёртка
+    /// `emit_book_snapshots` (сохранена для SACRED-теста `ts_exch_tests` ниже).
+    pub fn tick(&self) -> Vec<SessionEffect> {
+        compute_book_snapshot_effects(&self.states)
+    }
+}
+
+/// Чистое вычисление `L2Snapshot`-эффектов из states (без I/O): полный стакан сжат в
+/// 0.02%-от-mid бакеты, обрезан на ±60% от mid; символ без применённого WS diff'а
+/// (только REST-бутстрап, биржевого времени нет) не эмитится. Общий хелпер для
+/// `SpotSession::tick` и legacy free-fn `emit_book_snapshots` (SACRED-тест
+/// `ts_exch_tests` дёргает последнюю напрямую сигнатурой `states: &HashMap<...>` —
+/// не трогать тест, поэтому обёртка сохранена byte-for-byte).
+fn compute_book_snapshot_effects(states: &HashMap<String, SymbolState>) -> Vec<SessionEffect> {
+    let mut effects = Vec::new();
+    for (symbol, state) in states.iter() {
+        let Some(book) = &state.book else {
+            continue;
+        };
+
+        // D (контракт эвикции v2): наблюдаемость per (venue,symbol) — число in-band
+        // уровней логируется не реже 1/мин. §8 обязан измерять УРОВНИ, а не только RSS:
+        // атрибуция лика TD-016 к книге сделана по коду и на проде НЕ доказана; без этого
+        // метрика не отделить лик книги от лика HL-адаптера / tracing-буферов.
+        maybe_log_book_levels(symbol, book.bids.len(), book.asks.len());
+
+        // Биржевое время последнего применённого diff'а. Символ, синхронизированный
+        // ТОЛЬКО через REST-бутстрап (ни одного WS diff ещё не применялось), биржевого
+        // времени не несёт — не выдумываем его через now_ms(), просто не эмитим символ.
+        let ts_exch_ms = book.last_event_time_ms;
+        if ts_exch_ms == 0 {
+            continue;
+        }
+        let Some((&best_bid, _)) = book.bids.iter().next_back() else {
+            continue;
+        };
+        let Some((&best_ask, _)) = book.asks.iter().next() else {
+            continue;
+        };
+
+        let mid = (best_bid + best_ask) / 2;
+        if mid <= 0 {
+            continue;
+        }
+
+        let bids = bucket_levels(book.bids.iter().rev(), mid);
+        let asks = bucket_levels(book.asks.iter(), mid);
+
+        effects.push(SessionEffect::Emit(MdEvent {
+            venue: Venue::Binance,
+            symbol: symbol.clone(),
+            payload: MdPayload::L2Snapshot {
+                bids,
+                asks,
+                ts_exch_ms,
+            },
+        }));
+    }
+    effects
+}
+
+/// Legacy free-fn обёртка вокруг `compute_book_snapshot_effects` (SACRED-тест
+/// `ts_exch_tests` внизу файла дёргает ЭТУ сигнатуру напрямую с
+/// `states: HashMap<String, SymbolState>` — не трогать тест, поэтому сигнатура
+/// сохранена byte-for-byte; `run()`/`SpotSession` этой функцией больше не пользуются).
+/// `#[cfg(test)]` — вне тестовой сборки эта обёртка dead-code (прод-путь идёт через
+/// `SpotSession::tick`), компилируется только вместе с sacred-тестом, который её зовёт.
+#[cfg(test)]
+async fn emit_book_snapshots(
+    states: &HashMap<String, SymbolState>,
+    tx: &mpsc::Sender<EventKind>,
+) -> bool {
+    for eff in compute_book_snapshot_effects(states) {
+        if let SessionEffect::Emit(md) = eff {
+            if tx.send(EventKind::Md(md)).await.is_err() {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// Запустить приём рыночных данных Binance для одной WS-сессии. Шлёт `EventKind::Md(..)`
 /// в `tx`; `ConnUp` — сразу после успешного коннекта. Возвращает `Ok(())` при штатном
 /// закрытии/дисконнекте/остановке получателя; `Err` — при ошибке коннекта. Reconnect —
 /// забота вызывающего.
+///
+/// M-45: `run()` — ТОНКАЯ I/O-обёртка (async, ws/REST/mpsc), делегирующая в
+/// `SpotSession` (sync-state-машина БЕЗ сети/каналов, паттерн TD-014). Вся логика
+/// allow-list/book-sync живёт в seam'е и покрыта RED-оракулом `tests/red_l2delta_allowlist.rs`
+/// (O-8: реальная точка входа, не структура кода).
 pub async fn run(tx: mpsc::Sender<EventKind>, symbols: Vec<String>) -> anyhow::Result<()> {
     let mut streams = Vec::with_capacity(symbols.len() * 2);
     for s in &symbols {
@@ -143,19 +462,18 @@ pub async fn run(tx: mpsc::Sender<EventKind>, symbols: Vec<String>) -> anyhow::R
     }
 
     let client = reqwest::Client::new();
-    let mut states: HashMap<String, SymbolState> = HashMap::new();
+    // M-45 task 6: env читается ОДНОЙ строкой на самом верху точки входа; дальше вниз
+    // передаётся уже разобранным параметром (env НЕ читается внутри разбора/обработки).
+    let l2delta_allow =
+        parse_capture_symbols(std::env::var("L2DELTA_CAPTURE_SYMBOLS").ok().as_deref());
+    let mut session = SpotSession::new_with_l2delta(&symbols, &l2delta_allow);
     let mut pending_snapshots: FuturesUnordered<SnapshotFuture> = FuturesUnordered::new();
 
-    // Стартовая синхронизация: для каждого символа сразу заводим REST snapshot-фетч и
-    // помечаем состояние как "resyncing" — любые diff-апдейты, пришедшие по WS ДО того,
-    // как фетч завершится, буферизуются (per `handle_diff` DiffAction::Buffer), а не
-    // теряются.
-    for s in &symbols {
-        let symbol = s.to_uppercase();
-        let mut state = SymbolState::new();
-        state.resyncing = true;
-        pending_snapshots.push(make_snapshot_future(client.clone(), symbol.clone()));
-        states.insert(symbol, state);
+    // Стартовая синхронизация: REST snapshot-фетч для каждого символа (состояние уже
+    // помечено `resyncing` конструктором `SpotSession` — любые diff-апдейты, пришедшие
+    // по WS ДО того, как фетч завершится, буферизуются, а не теряются).
+    for eff in session.bootstrap() {
+        apply_session_effect(eff, &tx, &client, &mut pending_snapshots).await;
     }
 
     let mut emit_interval = tokio::time::interval(EMIT_PERIOD);
@@ -177,8 +495,10 @@ pub async fn run(tx: mpsc::Sender<EventKind>, symbols: Vec<String>) -> anyhow::R
 
                 match msg {
                     Message::Text(text) => {
-                        if !handle_text_message(&text, &tx, &mut states, &client, &mut pending_snapshots).await {
-                            return Ok(());
+                        for eff in session.on_ws_text(&text) {
+                            if !apply_session_effect(eff, &tx, &client, &mut pending_snapshots).await {
+                                return Ok(());
+                            }
                         }
                     }
                     Message::Ping(payload) => {
@@ -191,79 +511,48 @@ pub async fn run(tx: mpsc::Sender<EventKind>, symbols: Vec<String>) -> anyhow::R
                 }
             }
             Some((symbol, result)) = pending_snapshots.next(), if !pending_snapshots.is_empty() => {
-                handle_snapshot(&mut states, symbol, result, &client, &mut pending_snapshots);
+                let session_result: Result<OrderBook, ()> = match result {
+                    Ok(book) => Ok(book),
+                    Err(e) => {
+                        tracing::warn!(symbol = %symbol, error = %e, "venue-binance: snapshot fetch failed");
+                        Err(())
+                    }
+                };
+                for eff in session.on_snapshot_result(&symbol, session_result) {
+                    if !apply_session_effect(eff, &tx, &client, &mut pending_snapshots).await {
+                        return Ok(());
+                    }
+                }
             }
             _ = emit_interval.tick() => {
-                if !emit_book_snapshots(&states, &tx).await {
-                    return Ok(());
+                for eff in session.tick() {
+                    if let SessionEffect::Emit(md) = eff {
+                        if tx.send(EventKind::Md(md)).await.is_err() {
+                            return Ok(());
+                        }
+                    }
                 }
             }
         }
     }
 }
 
-/// Разобрать одно combined-stream текстовое сообщение и применить эффект: trade —
-/// немедленная эмиссия в `tx`; depth diff — прогон через sync-автомат символа. Возвращает
-/// `false`, если `tx` закрыт (получатель ушёл) — вызывающий должен завершить сессию.
-async fn handle_text_message(
-    text: &str,
+/// Применить `SessionEffect` к I/O: `Emit` → `tx.send`; `FetchSnapshot` → пушнуть future
+/// с пред-calculated задержкой (спот: всегда `Duration::ZERO`). `false`, если `tx`
+/// закрыт (получатель ушёл) — `run` обязан вернуть `Ok(())`.
+async fn apply_session_effect(
+    eff: SessionEffect,
     tx: &mpsc::Sender<EventKind>,
-    states: &mut HashMap<String, SymbolState>,
     client: &reqwest::Client,
     pending_snapshots: &mut FuturesUnordered<SnapshotFuture>,
 ) -> bool {
-    let value: serde_json::Value = match serde_json::from_str(text) {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::debug!(error = %e, raw = %text, "venue-binance: malformed JSON, skipping");
-            return true;
+    match eff {
+        SessionEffect::Emit(md) => tx.send(EventKind::Md(md)).await.is_ok(),
+        SessionEffect::FetchSnapshot { symbol, after } => {
+            pending_snapshots.push(make_snapshot_future(client.clone(), symbol, after));
+            true
         }
-    };
-
-    let stream = match value.get("stream").and_then(|v| v.as_str()) {
-        Some(s) => s,
-        None => {
-            tracing::debug!(raw = %text, "venue-binance: message without 'stream', skipping");
-            return true;
-        }
-    };
-    let data = match value.get("data") {
-        Some(d) => d,
-        None => {
-            tracing::debug!(raw = %text, "venue-binance: message without 'data', skipping");
-            return true;
-        }
-    };
-
-    if stream.ends_with("@trade") {
-        if let Some(event) = parse_trade(data) {
-            if tx.send(event).await.is_err() {
-                return false;
-            }
-        }
-    } else if stream.contains("@depth") {
-        if let Some((symbol, diff)) = parse_depth_diff(stream, data) {
-            // CT-RFC-04 (L2D-I-2): капчим КАЖДЫЙ распарсенный diff как сырое
-            // L2Delta-событие независимо от book-sync FSM (ground-truth рыночное
-            // событие, не свойство нашего sync-автомата). Founder ★ (а): только
-            // символы из allow-list — не-BTC не эмитит L2Delta, остаётся на
-            // L2Snapshot.
-            if L2DELTA_CAPTURE_SYMBOLS.contains(&symbol.as_str()) {
-                let event = l2delta_event(&symbol, &diff);
-                if tx.send(event).await.is_err() {
-                    return false;
-                }
-            }
-            let state = states
-                .entry(symbol.clone())
-                .or_insert_with(SymbolState::new);
-            handle_diff(state, &symbol, diff, client, pending_snapshots);
-        }
-    } else {
-        tracing::debug!(stream = %stream, "venue-binance: unrecognized stream, skipping");
     }
-
-    true
 }
 
 /// `data`: `{"s":"BTCUSDT","p":"<price>","q":"<qty>","m":<bool is_buyer_maker>,"T":<ms>}`.
@@ -477,12 +766,58 @@ fn evict_backstop(side: &mut BTreeMap<i64, i64>, mid: i64, is_bids: bool) {
     }
 }
 
-/// Символ, для которого включена эмиссия сырых book-дельт `MdPayload::L2Delta`
-/// (CT-RFC-04, founder ★ вариант (а) 2026-07-21): захват ограничен самым ликвидным
-/// инструментом, пока ретеншен (TD-020) не доставлен в прод. Остальные символы
-/// остаются на прежнем бакетированном `L2Snapshot` без изменений — расширение набора
-/// требует отдельного решения founder'а (RFC §5).
-const L2DELTA_CAPTURE_SYMBOLS: &[&str] = &["BTCUSDT"];
+/// M-45 (CT-RFC-06 §1): разбор allow-list эмиссии `L2Delta` из СЫРОЙ строки конфигурации
+/// (env `L2DELTA_CAPTURE_SYMBOLS`, через запятую). ЧИСТАЯ функция — env читается ОДНОЙ
+/// строкой на верху `run` и передаётся сюда параметром (`env` — глобальное состояние
+/// процесса, `cargo test` гоняет тесты параллельно; парсер обязан быть детерминирован).
+///
+/// Дефолт при `None`/пустой/вырожденной строке (`""`, `"   "`, `","`, `" , , "`) —
+/// `["BTCUSDT"]`, БАЙТ-В-БАЙТ сегодняшнее прод-поведение: расширение состава — решение
+/// founder'а (Граница C), не инженерное. Пустые элементы отбрасываются, пробелы
+/// обрезаются, порядок сохраняется, регистр нормализуется в ВЕРХНИЙ.
+pub fn parse_capture_symbols(raw: Option<&str>) -> Vec<String> {
+    const PROD_DEFAULT: &str = "BTCUSDT";
+    let parsed: Vec<String> = raw
+        .unwrap_or("")
+        .split(',')
+        .map(|s| s.trim().to_uppercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if parsed.is_empty() {
+        vec![PROD_DEFAULT.to_string()]
+    } else {
+        parsed
+    }
+}
+
+/// Решение об эмиссии `L2Delta`: wire-символ против разобранного allow-list'а.
+/// Регистронезависимо (обе стороны нормализуются в верхний регистр), но НЕ по
+/// подстроке — `BTC`/`BTCUSDT_PERP` не совпадают с `BTCUSDT`.
+pub fn should_capture_l2delta(symbols: &[String], symbol: &str) -> bool {
+    let up = symbol.to_uppercase();
+    symbols.contains(&up)
+}
+
+/// ЕДИНСТВЕННАЯ точка решения об эмиссии `L2Delta` на РЕАЛЬНОМ пути (M-45, вердикт
+/// критика `C-048`): разбор `stream`/`data` → символ → allow-list → событие. Чистая:
+/// без I/O, без env, без async. `Some(event)` ⇔ сообщение — валидный depth-diff И
+/// символ разрешён `symbols`. `SpotSession::on_ws_text` ОБЯЗАН делегировать сюда, а не
+/// дублировать сравнение символов у себя — T5/T5b-канарейки `verify_M-45.sh` проверяют
+/// именно это (единственный call site `l2delta_event(` — внутри этой функции).
+pub fn l2delta_emission_for(
+    stream: &str,
+    data: &serde_json::Value,
+    symbols: &[String],
+) -> Option<EventKind> {
+    if !stream.contains("@depth") {
+        return None;
+    }
+    let (symbol, diff) = parse_depth_diff(stream, data)?;
+    if !should_capture_l2delta(symbols, &symbol) {
+        return None;
+    }
+    Some(l2delta_event(&symbol, &diff))
+}
 
 /// Чистый транслятор СЫРОГО `@depth` diff в канонический `EventKind::Md(L2Delta)`
 /// (CT-RFC-04, L2D-I-2/3). Персистит diff БЕЗ ПОТЕРЬ, независимо от book-sync FSM —
@@ -512,119 +847,6 @@ pub fn l2delta_event(symbol: &str, diff: &DepthDiff) -> EventKind {
             ts_exch_ms: diff.event_time_ms,
         },
     )
-}
-
-/// Прогнать входящий diff через sync-автомат символа per Binance snapshot+diff-sync
-/// algorithm: пока книга не синхронизирована — буферизовать; при разрыве непрерывности —
-/// инвалидировать книгу и пере-синхронизироваться.
-fn handle_diff(
-    state: &mut SymbolState,
-    symbol: &str,
-    diff: DepthDiff,
-    client: &reqwest::Client,
-    pending_snapshots: &mut FuturesUnordered<SnapshotFuture>,
-) {
-    let action = match &state.book {
-        None => DiffAction::Buffer,
-        Some(book) => {
-            if diff.u_final <= book.last_update_id {
-                DiffAction::Skip
-            } else if diff.u_first != book.last_update_id + 1 {
-                DiffAction::Gap
-            } else {
-                DiffAction::Apply
-            }
-        }
-    };
-
-    match action {
-        DiffAction::Skip => {}
-        DiffAction::Buffer => {
-            state.pending.push_back(diff);
-            if !state.resyncing {
-                state.resyncing = true;
-                pending_snapshots.push(make_snapshot_future(client.clone(), symbol.to_string()));
-            }
-        }
-        DiffAction::Gap => {
-            tracing::warn!(
-                symbol = %symbol,
-                "venue-binance: depth continuity gap detected, resyncing book"
-            );
-            state.book = None;
-            state.pending.clear();
-            state.pending.push_back(diff);
-            state.resyncing = true;
-            pending_snapshots.push(make_snapshot_future(client.clone(), symbol.to_string()));
-        }
-        DiffAction::Apply => {
-            if let Some(book) = state.book.as_mut() {
-                apply_diff_to_book(book, &diff);
-            }
-        }
-    }
-}
-
-/// REST snapshot-фетч завершился (успешно или нет) — реконcилировать с буфером
-/// `pending` diff-апдейтов, накопленным за время фетча, per Binance algorithm:
-/// отбросить устаревшие (`u_final <= lastUpdateId`), проверить, что первый применимый
-/// diff покрывает `lastUpdateId+1` (`U <= lastUpdateId+1 <= u`) — иначе снапшот устарел,
-/// refetch; иначе применить буфер последовательно и пометить символ синхронизированным.
-fn handle_snapshot(
-    states: &mut HashMap<String, SymbolState>,
-    symbol: String,
-    result: anyhow::Result<OrderBook>,
-    client: &reqwest::Client,
-    pending_snapshots: &mut FuturesUnordered<SnapshotFuture>,
-) {
-    let Some(state) = states.get_mut(&symbol) else {
-        return;
-    };
-
-    let mut book = match result {
-        Ok(book) => book,
-        Err(e) => {
-            tracing::warn!(symbol = %symbol, error = %e, "venue-binance: snapshot fetch failed, retrying");
-            pending_snapshots.push(make_snapshot_future(client.clone(), symbol.clone()));
-            return;
-        }
-    };
-
-    loop {
-        let front = state.pending.front().map(|d| (d.u_final, d.u_first));
-        let Some((u_final, u_first)) = front else {
-            state.book = Some(book);
-            state.resyncing = false;
-            return;
-        };
-
-        if u_final <= book.last_update_id {
-            // Stale relative to the snapshot — discard and keep reconciling.
-            state.pending.pop_front();
-            continue;
-        }
-
-        if u_first > book.last_update_id + 1 {
-            // Snapshot (or last-applied diff) is stale relative to the buffer — the gap
-            // means we cannot bridge lastUpdateId -> this diff; refetch. Keep buffered
-            // diffs — a fresher snapshot may cover them.
-            tracing::warn!(
-                symbol = %symbol,
-                "venue-binance: snapshot stale vs buffered diffs, refetching"
-            );
-            state.resyncing = true;
-            pending_snapshots.push(make_snapshot_future(client.clone(), symbol.clone()));
-            return;
-        }
-
-        // u_first <= last_update_id+1 <= u_final: applicable (first application) or
-        // exactly continuous (subsequent applications from the buffer).
-        let diff = state
-            .pending
-            .pop_front()
-            .expect("front() just returned Some");
-        apply_diff_to_book(&mut book, &diff);
-    }
 }
 
 /// Запросить REST snapshot полного стакана для символа (`limit=5000`).
@@ -673,9 +895,19 @@ struct DepthSnapshotResponse {
 }
 
 /// Обернуть REST snapshot-фетч в boxed future, помеченный символом, для вставки в
-/// `FuturesUnordered` рядом с WS read loop.
-fn make_snapshot_future(client: reqwest::Client, symbol: String) -> SnapshotFuture {
+/// `FuturesUnordered` рядом с WS read loop. `after` — задержка перед фетчем (спот не
+/// имеет backoff-политики — `SpotSession` всегда просит `Duration::ZERO`, но поле
+/// части `SessionEffect::FetchSnapshot` по контракту M-45, тот же паттерн, что у
+/// `venue-binance-futures`).
+fn make_snapshot_future(
+    client: reqwest::Client,
+    symbol: String,
+    after: Duration,
+) -> SnapshotFuture {
     Box::pin(async move {
+        if !after.is_zero() {
+            tokio::time::sleep(after).await;
+        }
         let result = fetch_snapshot(&client, &symbol).await;
         (symbol, result)
     })
@@ -706,63 +938,6 @@ fn maybe_log_book_levels(symbol: &str, bids: usize, asks: usize) {
         tracing::info!(symbol, bids, asks, "book levels");
         map.insert(symbol.to_string(), now);
     }
-}
-
-/// Эмитировать по одному `L2Snapshot` на синхронизированный символ: полный стакан сжат в
-/// 0.02%-от-mid бакеты, обрезан на ±60% от mid. Возвращает `false`, если `tx` закрыт.
-async fn emit_book_snapshots(
-    states: &HashMap<String, SymbolState>,
-    tx: &mpsc::Sender<EventKind>,
-) -> bool {
-    for (symbol, state) in states.iter() {
-        let Some(book) = &state.book else {
-            continue;
-        };
-
-        // D (контракт эвикции v2): наблюдаемость per (venue,symbol) — число in-band
-        // уровней логируется не реже 1/мин. §8 обязан измерять УРОВНИ, а не только RSS:
-        // атрибуция лика TD-016 к книге сделана по коду и на проде НЕ доказана; без этого
-        // метрика не отделить лик книги от лика HL-адаптера / tracing-буферов.
-        maybe_log_book_levels(symbol, book.bids.len(), book.asks.len());
-
-        // Биржевое время последнего применённого diff'а. Символ, синхронизированный
-        // ТОЛЬКО через REST-бутстрап (ни одного WS diff ещё не применялось), биржевого
-        // времени не несёт — не выдумываем его через now_ms(), просто не эмитим символ.
-        let ts_exch_ms = book.last_event_time_ms;
-        if ts_exch_ms == 0 {
-            continue;
-        }
-        let Some((&best_bid, _)) = book.bids.iter().next_back() else {
-            continue;
-        };
-        let Some((&best_ask, _)) = book.asks.iter().next() else {
-            continue;
-        };
-
-        let mid = (best_bid + best_ask) / 2;
-        if mid <= 0 {
-            continue;
-        }
-
-        let bids = bucket_levels(book.bids.iter().rev(), mid);
-        let asks = bucket_levels(book.asks.iter(), mid);
-
-        let event = EventKind::md(
-            Venue::Binance,
-            symbol.clone(),
-            MdPayload::L2Snapshot {
-                bids,
-                asks,
-                ts_exch_ms,
-            },
-        );
-
-        if tx.send(event).await.is_err() {
-            return false;
-        }
-    }
-
-    true
 }
 
 /// Сжать одну сторону книги в бакеты по relative-distance от `mid` (ширина

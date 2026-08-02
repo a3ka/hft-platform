@@ -452,12 +452,54 @@ enum DiffAction {
     Apply,
 }
 
-/// Символ, для которого включена эмиссия сырых book-дельт `MdPayload::L2Delta`
-/// (CT-RFC-04, founder ★ вариант (а) 2026-07-21): захват ограничен самым ликвидным
-/// инструментом, пока ретеншен (TD-020) не доставлен в прод. Остальные символы
-/// остаются на прежнем бакетированном `L2Snapshot` без изменений — расширение набора
-/// требует отдельного решения founder'а (RFC §5).
-const L2DELTA_CAPTURE_SYMBOLS: &[&str] = &["BTCUSDT"];
+/// M-45 (CT-RFC-06 §1): разбор allow-list эмиссии `L2Delta` из СЫРОЙ строки конфигурации
+/// (env `L2DELTA_CAPTURE_SYMBOLS`, через запятую). ЧИСТАЯ функция — env читается ОДНОЙ
+/// строкой на верху `run` и передаётся сюда параметром (`env` — глобальное состояние
+/// процесса, `cargo test` гоняет тесты параллельно; парсер обязан быть детерминирован).
+///
+/// Дефолт при `None`/пустой/вырожденной строке (`""`, `"   "`, `","`, `" , , "`) —
+/// `["BTCUSDT"]`, БАЙТ-В-БАЙТ сегодняшнее прод-поведение: расширение состава — решение
+/// founder'а (Граница C), не инженерное. Пустые элементы отбрасываются, пробелы
+/// обрезаются, порядок сохраняется, регистр нормализуется в ВЕРХНИЙ.
+pub fn parse_capture_symbols(raw: Option<&str>) -> Vec<String> {
+    const PROD_DEFAULT: &str = "BTCUSDT";
+    let parsed: Vec<String> = raw
+        .unwrap_or("")
+        .split(',')
+        .map(|s| s.trim().to_uppercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if parsed.is_empty() {
+        vec![PROD_DEFAULT.to_string()]
+    } else {
+        parsed
+    }
+}
+
+/// Решение об эмиссии `L2Delta`: wire-символ против разобранного allow-list'а.
+/// Регистронезависимо (обе стороны нормализуются в верхний регистр), но НЕ по
+/// подстроке — `BTC`/`BTCUSDT_PERP` не совпадают с `BTCUSDT`.
+pub fn should_capture_l2delta(symbols: &[String], symbol: &str) -> bool {
+    let up = symbol.to_uppercase();
+    symbols.contains(&up)
+}
+
+/// ЕДИНСТВЕННАЯ точка решения об эмиссии `L2Delta` на РЕАЛЬНОМ пути (M-45, вердикт
+/// критика `C-048`): разбор `stream`/`data` → символ → allow-list → событие. Чистая:
+/// без I/O, без env, без async. `Some(event)` ⇔ сообщение — валидный depth-diff И
+/// символ разрешён `symbols`. `FuturesSession::on_ws_text` ОБЯЗАН делегировать сюда,
+/// а не дублировать сравнение символов у себя — T5/T5b-канарейки `verify_M-45.sh`
+/// проверяют именно это (единственный call site `l2delta_event(` — внутри этой функции).
+pub fn l2delta_emission_for(stream: &str, data: &Value, symbols: &[String]) -> Option<EventKind> {
+    if !stream.contains("@depth") {
+        return None;
+    }
+    let (symbol, diff) = parse_depth_diff(stream, data)?;
+    if !should_capture_l2delta(symbols, &symbol) {
+        return None;
+    }
+    Some(l2delta_event(&symbol, &diff))
+}
 
 /// Чистый транслятор СЫРОГО fstream `@depth` diff в канонический `EventKind::Md(L2Delta)`
 /// (CT-RFC-04, L2D-I-2/4). Персистит diff БЕЗ ПОТЕРЬ, независимо от book-sync FSM —
@@ -525,6 +567,9 @@ pub enum SessionEffect {
 pub struct FuturesSession {
     symbol_set: HashSet<String>,
     states: HashMap<String, SymbolState>,
+    /// M-45: allow-list эмиссии `L2Delta` (явный параметр, независимый от `symbol_set`
+    /// подписки на книгу — подписка ≠ разрешение капчить сырые дельты в журнал).
+    l2delta_allow: Vec<String>,
 }
 
 impl FuturesSession {
@@ -532,11 +577,23 @@ impl FuturesSession {
     /// `!markPrice@arr` (Binance агрегирует mark-prices по всем перпам; нас интересуют
     /// только символы нашей выборки). States — пустой; per-symbol `SymbolState` создаётся
     /// lazily при первом depth-diff'е (через `entry().or_insert_with`).
+    ///
+    /// L2Delta allow-list — ДЕФОЛТНЫЙ (`parse_capture_symbols(None)` == `["BTCUSDT"]`,
+    /// сегодняшнее прод-поведение). Явная конфигурация — `new_with_l2delta`.
     pub fn new(symbols: &[String]) -> Self {
+        Self::new_with_l2delta(symbols, &parse_capture_symbols(None))
+    }
+
+    /// M-45: та же сессия, но с ЯВНЫМ allow-list'ом эмиссии `L2Delta` (рядом с
+    /// `symbol_set` подписки на книгу). `on_ws_text` решает об эмиссии `L2Delta`
+    /// ТОЛЬКО по `l2delta_allow` — `symbol_set` управляет книгой/markPrice-фильтром,
+    /// не журналом сырых дельт.
+    pub fn new_with_l2delta(symbols: &[String], l2delta_allow: &[String]) -> Self {
         let symbol_set: HashSet<String> = symbols.iter().map(|s| s.to_uppercase()).collect();
         Self {
             symbol_set,
             states: HashMap::new(),
+            l2delta_allow: l2delta_allow.to_vec(),
         }
     }
 
@@ -634,15 +691,15 @@ impl FuturesSession {
             }
         } else if stream.contains("@depth") {
             if let Some((symbol, diff)) = parse_depth_diff(stream, data) {
-                // CT-RFC-04 (L2D-I-2/4): капчим КАЖДЫЙ распарсенный diff как сырое
-                // L2Delta-событие независимо от book-sync FSM (ground-truth рыночное
-                // событие, не свойство нашего sync-автомата). Founder ★ (а): только
-                // символы из allow-list — не-BTC не эмитит L2Delta, остаётся на
-                // L2Snapshot.
-                if L2DELTA_CAPTURE_SYMBOLS.contains(&symbol.as_str()) {
-                    if let EventKind::Md(md) = l2delta_event(&symbol, &diff) {
-                        effects.push(SessionEffect::Emit(md));
-                    }
+                // M-45: решение об эмиссии L2Delta делегировано ЕДИНСТВЕННОЙ точке
+                // `l2delta_emission_for` (allow-list из конфига, не хардкод) — капчим
+                // КАЖДЫЙ распарсенный diff как сырое L2Delta-событие независимо от
+                // book-sync FSM (ground-truth рыночное событие, не свойство нашего
+                // sync-автомата), но только если символ разрешён `l2delta_allow`.
+                if let Some(EventKind::Md(md)) =
+                    l2delta_emission_for(stream, data, &self.l2delta_allow)
+                {
+                    effects.push(SessionEffect::Emit(md));
                 }
                 // Сначала вычислить action (immutable borrow), потом мутировать.
                 let state = self
@@ -1065,7 +1122,11 @@ pub async fn run(tx: mpsc::Sender<EventKind>, symbols: Vec<String>) -> anyhow::R
     }
 
     let client = reqwest::Client::new();
-    let mut session = FuturesSession::new(&symbols);
+    // M-45 task 6: чтение env — ОДНА строка на самом верху точки входа; дальше вниз
+    // передаётся уже разобранным параметром (env НЕ читается внутри разбора/обработки).
+    let l2delta_allow =
+        parse_capture_symbols(std::env::var("L2DELTA_CAPTURE_SYMBOLS").ok().as_deref());
+    let mut session = FuturesSession::new_with_l2delta(&symbols, &l2delta_allow);
     let mut pending_snapshots: FuturesUnordered<SnapshotFuture> = FuturesUnordered::new();
 
     // Стартовая синхронизация depth по каждому символу (REST snapshot — не ждём первого
