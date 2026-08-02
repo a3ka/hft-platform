@@ -23,6 +23,28 @@
 **ЕДИНСТВЕННАЯ незакрытая работа — M-45**, ветка `feat/M-45`. Подробности и точка
 продолжения — `docs/ORCHESTRATION-STATE.md`, раздел «🔴 M-45 — В РАБОТЕ».
 
+### ⚠️ ПЕРЕД ЗАПУСКОМ ЧЕГО-ЛИБО (обновлено 2026-08-02, конец сессии)
+
+`C-051` = **NOTE, dev разблокирован**, и **venue-dev УЖЕ ЗАПУЩЕН** на `feat/M-45`
+(задачи 1, 2, 3, 3b, 3c). Он мог оборваться вместе с сессией — но его работа НЕ теряется.
+Проверь ФАКТАМИ, прежде чем запускать второго:
+
+```
+git fetch origin && git log --oneline origin/feat/M-45 -5
+git -C /tmp/hft-dev-m45 log --oneline -3 ; git -C /tmp/hft-dev-m45 status --porcelain
+bash scripts/verify_M-45.sh 2>&1 | grep -E "^(PASS|FAIL|VERDICT)"; echo exit=$?
+```
+
+- гейт `VERDICT: PASS` → реализация готова, зови **tester**, затем **reviewer** → merge → §8;
+- есть коммиты в worktree, но не на origin → **запушь сам**
+  (`git -C /tmp/hft-dev-m45 push origin HEAD:feat/M-45`; RN-19: push не меняет авторство);
+- дерево грязное, коммитов нет → посмотри диф; осмысленную работу закоммить от имени
+  `venue-dev` (`git -c user.name=venue-dev …`), потом продолжай;
+- worktree пуст/нет → dev не стартовал, запускай заново по §Tasks и D-1.
+
+Страховочный приём для чужого рабочего дерева (не трогает его):
+`SNAP=$(git -C <wt> stash create) && git -C <wt> tag -f wip/<role>-snapshot "$SNAP"`.
+
 ### Что делать первым делом
 
 1. `git fetch origin && git log --oneline origin/feat/M-45 -3` — посмотреть последний вердикт
