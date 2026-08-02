@@ -837,7 +837,7 @@ Execution Agent (позже, §21).
 | ST-I | strategy | 10 | 8 | [ЧАСТИЧНО] |
 | CT-I | контрактный слой | 6 | 5 | [ЧАСТИЧНО] (CT-I-5 Python-консюмер — фикция, R9) |
 | GW-I | gateway-serve | 0 | 12 | обратный дрейф: оракулы есть, докс-семейство не заведено |
-| JR-I | event-store | 7 | 4 | [ЧАСТИЧНО] (`JR-I-9` — M-50, `crates/journal/tests/red_floor_scan*.rs`) |
+| JR-I | event-store | 12 | 7 | [ЧАСТИЧНО] (M-50 — `JR-I-9`; M-52 — `JR-I-10` бюджет работы пола, `JR-I-11` guard монотонности, `JR-I-12` replay-digest в проде. Замер: `JR-I-1,4,8,9,10,11,12` в `crates/journal/tests/`) |
 | RK-I | риск (execution) | 10 | **0** | PENDING execution-фазы |
 | INTG-I | границы A/B/C | 7 | **0** | **ЗАЯВЛЕНО БЕЗ ОРАКУЛОВ** — писать RED до Agent Runtime |
 | BK-I | book | 8 | **0** | ЗАЯВЛЕНО БЕЗ ОРАКУЛОВ (R5 staleness-тип — сюда) |
