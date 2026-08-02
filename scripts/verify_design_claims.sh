@@ -19,7 +19,7 @@
 # Правило «сверять замером, а не переносить из прежних текстов» (testing.md) само нарушалось
 # четыре раза подряд автором правила — правило, держащееся на добросовестности, не работает.
 #
-# ПЯТЬ проверок (каждая — PASS/FAIL/INFO с причиной; INFO = не применимо/не проверяется
+# СЕМЬ проверок (каждая — PASS/FAIL/INFO с причиной; INFO = не применимо/не проверяется
 # машинно на этой редакции документа — НЕ считается ни PASS, ни FAIL):
 #   1. Каждое `[ЕСТЬ]`, стоящее в ОТДЕЛЬНОЙ ЯЧЕЙКЕ-СТОЛБЦЕ СОСТОЯНИЯ markdown-таблицы
 #      (нормативное утверждение о готовности), сопровождено пруфом, и пруф СУЩЕСТВУЕТ.
@@ -47,6 +47,30 @@
 #   5. Статусы фаз §10, помеченные как пройденные (✅/ПРИНЯТО/...), не противоречат грубо
 #      цитируемым milestone'ам (файл отсутствует ИЛИ STATUS явно открытый). Не полная
 #      автоматизация — что не проверяется машинно, помечается INFO, не выдаётся за PASS.
+#   6. Инцидент C-044 (ретро-документ docs/rfc/CT-RFC-05-*.md процитировал 3 из 4
+#      несуществующих в main SHA как «подтверждено коммитами») — machинная проверка: КАЖДЫЙ
+#      hex-токен в backtick'ах (7-40 символов) в docs/DESIGN.md И docs/rfc/**.md, стоящий в
+#      ТОМ ЖЕ markdown-параграфе (блок строк без пустой строки внутри — переживает перенос
+#      строки внутри одного предложения), что и слово-маркер контекста коммита («коммит...»,
+#      «merge», «мёрж...»/«мерж...», «sha»), обязан (а) существовать как git-объект
+#      (`git cat-file -e <sha>^{commit}`) И (б) входить в историю HEAD (или MERGE_HEAD внутри
+#      --merge-preview) — `git merge-base --is-ancestor`. Анти-плацебо (C-044 F1, реальный
+#      случай): (а) без (б) — плацебо, орфан-коммит с заброшенной/несмёрженной ветки
+#      (`ffedc10`/`6a2c331`/`67b6159` реально существовали как git-объекты на ветке
+#      `engine/M-35-arms`, `git cat-file -e` проходил, но они не входили в ancestry
+#      `origin/main` — только `--is-ancestor` это ловит). Внутри ``` ```-фенсов не
+#      проверяется (пример кода, не нормативная ссылка). Нет пруфа-контекста рядом → токен
+#      не трогается вовсе (это не обязательно SHA — не выдаём ложных FAIL на произвольный
+#      hex-текст).
+#   7. Пути вида `crates/...`/`docs/...`/`scripts/...`/`research/...`/`milestones/...`/
+#      `.claude/...` в backtick'ах внутри docs/rfc/**.md — каждый обязан существовать в
+#      дереве репозитория (`test -e`). Glob/brace-паттерны в тексте (содержат `*`/`?`/`{`/`}`
+#      — например `crates/contracts/**`, `crates/venue-*`,
+#      `crates/contracts/fixtures/{valid,invalid}`) — НЕ литеральные пути, пропускаются.
+#      Проверки 3 (ссылки `DESIGN.md §N`) и 4 (мёртвые `docs/*.md`-ссылки) уже репо-/
+#      docs-шире (полный `os.walk` вне docs/archive/**, docs/plans/**) и потому УЖЕ
+#      покрывают docs/rfc/** без отдельного кода — проверено: обе проверки реально ходят по
+#      docs/rfc/*.md наравне с остальными *.md/*.rs/*.sh.
 #
 # Setup-guard: docs/DESIGN.md не найден/пуст/оглавление не парсится/грепа не может быть
 # пустым (§22-таблица найдена, но 0 строк-семейств; docs/** без единой docs/*.md ссылки) →
@@ -170,6 +194,7 @@ python3 - "${TARGET_ROOT}" <<'PYEOF'
 или 1 (FAIL). Ничего не пишет, только читает."""
 import os
 import re
+import subprocess
 import sys
 
 FAILED = 0
@@ -690,6 +715,257 @@ def check5(root, design_text):
         pass_("5-ФАЗЫ", f"{n_phase_rows} строк(и) фаз, помеченных пройденными, не противоречат цитируемым milestone'ам (грубая проверка)")
 
 
+# ---------------------------------------------------------------------------
+# CHECK 6 — цитируемые SHA (docs/DESIGN.md + docs/rfc/**.md) существуют в git-истории
+# (C-044: 3 из 4 SHA в §4 CT-RFC-05-margin-inventory.md — орфаны вне ancestry origin/main)
+# ---------------------------------------------------------------------------
+
+SHA_TOKEN_RE = re.compile(r"`([0-9a-f]{7,40})`")
+SHA_CONTEXT_RE = re.compile(r"коммит\w*|merge\b|мёрж\w*|мерж\w*|\bsha\b", re.IGNORECASE)
+
+
+def compute_paragraphs(lines):
+    """Блок-и (start,end), 1-based inclusive, строк без пустой строки внутри — markdown
+    "параграф", переживает перенос предложения на следующую физическую строку."""
+    paragraphs = []
+    start = None
+    for i, line in enumerate(lines, start=1):
+        if line.strip() == "":
+            if start is not None:
+                paragraphs.append((start, i - 1))
+                start = None
+        else:
+            if start is None:
+                start = i
+    if start is not None:
+        paragraphs.append((start, len(lines)))
+    return paragraphs
+
+
+def git_commit_exists(root, sha):
+    try:
+        r = subprocess.run(
+            ["git", "-C", root, "cat-file", "-e", f"{sha}^{{commit}}"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return r.returncode == 0
+    except OSError:
+        return False
+
+
+def canonical_refs(root):
+    """Ref-имена, ancestor которых у SHA достаточно, чтобы считать его 'реально попавшим
+    в дерево ROOT', а не просто существующим где-то в локальной object-database. Обычный
+    режим — HEAD. Внутри --merge-preview (git merge --no-commit --no-ff паузит слияние)
+    добавляется MERGE_HEAD — второй родитель незакоммиченного слияния, иначе коммиты,
+    реально входящие в merge через сторону исходного HEAD (не base-ref), дали бы ложный
+    FAIL против одного лишь base-ref."""
+    refs = ["HEAD"]
+    r = subprocess.run(
+        ["git", "-C", root, "rev-parse", "--verify", "-q", "MERGE_HEAD"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    if r.returncode == 0:
+        refs.append("MERGE_HEAD")
+    return refs
+
+
+def git_commit_is_ancestor_of_any(root, sha, refs):
+    for ref in refs:
+        r = subprocess.run(
+            ["git", "-C", root, "merge-base", "--is-ancestor", sha, ref],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        if r.returncode == 0:
+            return True
+    return False
+
+
+def gather_sha_refs(root, path):
+    """[(relpath, lineno, sha), ...] — токены-SHA в параграфах с контекстным маркером,
+    вне ``` ```-фенсов."""
+    try:
+        text = read(path)
+    except OSError:
+        return []
+    relpath = os.path.relpath(path, root)
+    lines = text.splitlines()
+    fence_lines = compute_fence_lines(lines)
+    paragraphs = compute_paragraphs(lines)
+    para_has_ctx = {}
+    for (s, e) in paragraphs:
+        para_text = "\n".join(lines[s - 1:e])
+        has_ctx = bool(SHA_CONTEXT_RE.search(para_text))
+        for ln in range(s, e + 1):
+            para_has_ctx[ln] = has_ctx
+
+    refs = []
+    for i, line in enumerate(lines, start=1):
+        if i in fence_lines or not para_has_ctx.get(i, False):
+            continue
+        for m in SHA_TOKEN_RE.finditer(line):
+            refs.append((relpath, i, m.group(1)))
+    return refs
+
+
+def check6(root):
+    targets = []
+    design_path = os.path.join(root, "docs", "DESIGN.md")
+    if os.path.isfile(design_path):
+        targets.append(design_path)
+    rfc_dir = os.path.join(root, "docs", "rfc")
+    if os.path.isdir(rfc_dir):
+        for fn in sorted(os.listdir(rfc_dir)):
+            if fn.endswith(".md"):
+                targets.append(os.path.join(rfc_dir, fn))
+
+    all_refs = []
+    for path in targets:
+        all_refs.extend(gather_sha_refs(root, path))
+
+    if not all_refs:
+        info(
+            "6-RFC-SHA",
+            "в docs/DESIGN.md и docs/rfc/**.md не найдено цитат коммитов (SHA в контексте "
+            "«коммит»/«merge»/«мёрж...») — проверка неприменима",
+        )
+        return
+
+    try:
+        r = subprocess.run(
+            ["git", "-C", root, "rev-parse", "--is-inside-work-tree"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        git_ok = r.returncode == 0 and r.stdout.strip() == b"true"
+    except OSError:
+        git_ok = False
+
+    if not git_ok:
+        fail(
+            "6-RFC-SHA",
+            f"найдено {len(all_refs)} цитат коммитов в docs/DESIGN.md/docs/rfc/**.md, но "
+            f"'{root}' не git-репозиторий (или git недоступен) — существование SHA "
+            f"проверить нельзя (setup-guard)",
+        )
+        return
+
+    refs = canonical_refs(root)
+    n_bad = 0
+    for relpath, lineno, sha in all_refs:
+        # Анти-плацебо (C-044 F1): `git cat-file -e` ОДНОЙ проверкой не ловит орфан-SHA —
+        # объект может реально существовать (коммит с заброшенной/несмёрженной ветки,
+        # напр. `engine/M-35-arms` — ffedc10/6a2c331/67b6159 в реальном инциденте), просто
+        # не входить в историю HEAD. Существование — необходимо, НЕ достаточно; ancestry —
+        # решающая проверка.
+        if not git_commit_exists(root, sha):
+            n_bad += 1
+            fail(
+                "6-RFC-SHA",
+                f"{relpath}:{lineno}: цитируется коммит `{sha}` — не найден в "
+                f"git-объектах репозитория вовсе (`git cat-file -e {sha}^{{commit}}` провалился)",
+            )
+            continue
+        if not git_commit_is_ancestor_of_any(root, sha, refs):
+            n_bad += 1
+            fail(
+                "6-RFC-SHA",
+                f"{relpath}:{lineno}: цитируется коммит `{sha}` — существует как "
+                f"git-объект, но НЕ входит в историю {'/'.join(refs)} (орфан/несмёрженная "
+                f"ветка — `git merge-base --is-ancestor {sha} {refs[0]}` провалился)",
+            )
+
+    if n_bad == 0:
+        pass_(
+            "6-RFC-SHA",
+            f"все {len(all_refs)} цитат коммитов (docs/DESIGN.md + docs/rfc/**.md) "
+            f"существуют И входят в историю {'/'.join(refs)}",
+        )
+
+
+# ---------------------------------------------------------------------------
+# CHECK 7 — пути, процитированные в docs/rfc/**.md, существуют в дереве репозитория
+# (C-044 F2: список мест правки занижен, но опечатка/несуществующий путь — тот же класс лжи)
+# ---------------------------------------------------------------------------
+
+RFC_PATH_TOKEN_RE = re.compile(
+    r"`((?:crates|docs|scripts|research|milestones|\.claude)/[^`]*)`"
+)
+# НЕ заякорен на конец строки ($) — намеренно: реальный документ кладёт внутрь ОДНОЙ пары
+# backtick'ов путь + произвольный "хвост" разных форм (`path.rs:301-315` — диапазон строк,
+# `path.rs::func_name` — Rust-путь, `path.md §9` — секция того же документа через ПРОБЕЛ).
+# Правило простое и надёжное: как только встретилась распознанная РАСШИРЕНИЕМ граница файла
+# (первая `.rs`/`.md`/`.sh`/`.toml`/`.json`/`.yml`/`.yaml` слева направо), путь на этом
+# заканчивается — всё после неё, ЛЮБОЙ формы, отбрасывается без попытки его разобрать.
+RFC_PATH_EXT_RE = re.compile(r"^(.*?\.(?:rs|md|sh|toml|json|yml|yaml))")
+RFC_PATH_LINEREF_TAIL_RE = re.compile(r":\d+(?:-\d+)?$")
+
+
+def clean_rfc_path_token(raw):
+    """`crates/x/y.rs:301-315` → `crates/x/y.rs`; `crates/x/y.rs::func` → `crates/x/y.rs`;
+    `docs/x.md §9` → `docs/x.md`; путь без расширения (`crates/ops`, `research/data/`) —
+    как есть, за вычетом висящего `:NNN` и пунктуации."""
+    m = RFC_PATH_EXT_RE.match(raw)
+    if m:
+        return m.group(1).rstrip(".,;:)")
+    token = RFC_PATH_LINEREF_TAIL_RE.sub("", raw)
+    return token.rstrip(".,;:)")
+
+
+def check7(root):
+    rfc_dir = os.path.join(root, "docs", "rfc")
+    if not os.path.isdir(rfc_dir):
+        info("7-RFC-PATH", "docs/rfc/ отсутствует — проверка неприменима")
+        return
+
+    n_refs = n_bad = 0
+    for fn in sorted(os.listdir(rfc_dir)):
+        if not fn.endswith(".md"):
+            continue
+        path = os.path.join(rfc_dir, fn)
+        relpath = os.path.relpath(path, root)
+        try:
+            text = read(path)
+        except OSError:
+            continue
+        lines = text.splitlines()
+        fence_lines = compute_fence_lines(lines)
+        for i, line in enumerate(lines, start=1):
+            if i in fence_lines:
+                continue
+            for m in RFC_PATH_TOKEN_RE.finditer(line):
+                raw = m.group(1)
+                if any(ch in raw for ch in "*?{}"):
+                    continue  # glob/brace-паттерн в прозе (crates/contracts/**, crates/venue-*,
+                    # crates/contracts/fixtures/{valid,invalid}) — не литеральный путь
+                token = clean_rfc_path_token(raw)
+                if not token:
+                    continue
+                n_refs += 1
+                candidate = os.path.join(root, token)
+                if not os.path.exists(candidate):
+                    n_bad += 1
+                    fail(
+                        "7-RFC-PATH",
+                        f"{relpath}:{i}: путь `{token}` — не существует в дереве репозитория",
+                    )
+
+    if n_refs == 0:
+        info(
+            "7-RFC-PATH",
+            "в docs/rfc/**.md путей вида crates/docs/scripts/research/milestones/.claude "
+            "не найдено — проверка неприменима",
+        )
+    elif n_bad == 0:
+        pass_(
+            "7-RFC-PATH",
+            f"все {n_refs} путей, процитированных в docs/rfc/**.md, существуют в дереве репозитория",
+        )
+
+
 def main():
     root = sys.argv[1]
     design_path = os.path.join(root, "docs", "DESIGN.md")
@@ -709,6 +985,8 @@ def main():
     check3(root, design_text)
     check4(root)
     check5(root, design_text)
+    check6(root)
+    check7(root)
 
     verdict = "PASS" if FAILED == 0 else "FAIL"
     print(f"\nVERDICT: {verdict} ({FAILED} нарушений)")
