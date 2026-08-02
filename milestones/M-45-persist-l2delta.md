@@ -98,7 +98,7 @@ founder'а». Значит правка константы = совершени�
 |---|---|---|---|---|
 | 1 | `parse_capture_symbols` + `should_capture_l2delta` в `venue-binance` (дефолт `["BTCUSDT"]`, нормализация регистра) | venue-dev | ⏳ OPEN | T3, T4 |
 | 2 | То же в `venue-binance-futures`; семантика `pu` НЕ трогается | venue-dev | ⏳ OPEN | T3, T4, T6 |
-| 3 | Emit-путь обоих крейтов зовёт `should_capture_l2delta` вместо `const … .contains()`; хардкод-`const` со списком удалён | venue-dev | ⏳ OPEN | T5 |
+| 3 | `l2delta_emission_for` в обоих крейтах; обработчик ДЕЛЕГИРУЕТ ей, своего сравнения символов не имеет; хардкод-список удалён под любым именем | venue-dev | ⏳ OPEN | T5, O-7 |
 | 4 | Фикстура `L2Delta` в оракул `DET-I-1` — закрытие R-019 F6 / TD-072 | **architect** (sacred) | ✅ DONE (`det_9`) | T8 |
 | 5 | `scripts/verify_M-45.sh` | **architect** (sacred) | ✅ DONE | — |
 | 6 | Запись эпохи в `docs/data-epochs.md` — ТОЛЬКО при раскатке (Граница C), не при merge | architect | ⛔ ждёт подписи | T9 |
@@ -107,7 +107,7 @@ founder'а». Значит правка константы = совершени�
 `.claude/rules/scope-guard.md`). Задачи 1–3 — venue-dev, **строго по RED-оракулам**; тесты и
 verify-скрипт dev НЕ правит (странный тест → `!!! SCOPE VIOLATION REQUEST !!!`).
 
-### API-контракт (задачи 1–2) — форма зафиксирована оракулом, не свободна
+### API-контракт (задачи 1–3) — форма зафиксирована оракулом, не свободна
 
 ```rust
 /// Разбор allow-list из СЫРОЙ строки конфигурации. ЧИСТАЯ функция.
@@ -115,7 +115,32 @@ pub fn parse_capture_symbols(raw: Option<&str>) -> Vec<String>;
 
 /// Решение об эмиссии: wire-символ против разобранного списка.
 pub fn should_capture_l2delta(symbols: &[String], symbol: &str) -> bool;
+
+/// ЕДИНСТВЕННАЯ точка решения об эмиссии на реальном пути. Чистая: без I/O, без env,
+/// без async. `Some(event)` ⇔ сообщение — валидный depth-diff И символ разрешён списком.
+pub fn l2delta_emission_for(
+    stream: &str,
+    data: &serde_json::Value,
+    symbols: &[String],
+) -> Option<EventKind>;
 ```
+
+**Третья функция появилась по вердикту `C-048` (REJECT) и является ГЛАВНОЙ.** Критик
+предъявил реализацию, проходящую весь прежний набор и при этом нерабочую: dev выполняет
+контракт двух чистых функций дословно, оставляет их экспортированными — и **не подключает к
+реальной точке решения** (обработчик WS-сообщения), переименовав константу или заинлайнив
+список литералом. Тогда:
+
+- O-1..O-6 зелёные — они дёргают чистые функции напрямую, минуя обработчик;
+- прежний T5 зелёный — греп искал БУКВАЛЬНОЕ имя `L2DELTA_CAPTURE_SYMBOLS`;
+- §8 eyes-on зелёный — дефолт совпадает со старым поведением байт-в-байт.
+
+Дефект всплыл бы **только после founder-подписи**, когда оператор выставит env — то есть
+позже всех гейтов. Поэтому предмет проверки смещён с «существуют ли функции» на «проходит
+ли реальное wire-сообщение через allow-list»: `l2delta_emission_for` покрывает весь путь
+(разбор `stream`/`data` → символ → allow-list → событие), обработчик обязан ей
+**делегировать**, а не дублировать сравнение символов у себя. Чтение `env` схлопывается в
+однострочную обёртку на самом верху (`connect`/`main`), проверяемую глазами.
 
 **Разбор обязан быть чистой функцией, а чтение `env` — тонкой обёрткой над ним.** Причина не
 стилистическая: `env` — глобальное состояние процесса, а `cargo test` гоняет тесты
@@ -133,7 +158,10 @@ pub fn should_capture_l2delta(symbols: &[String], symbol: &str) -> bool;
 
 ### Оракулы (написаны, GREEN только после задач 1–3)
 
-- `crates/venue-binance/tests/red_l2delta_allowlist.rs` — O-1..O-4, O-6;
+- `crates/venue-binance/tests/red_l2delta_allowlist.rs` — O-1..O-4, O-6 (чистые функции)
+  **и O-7 — реальный путь**: разрешённый/запрещённый символ сквозь разбор wire-сообщения,
+  дефолт пишет BTC и только BTC, регистр, целостность события, не-depth поток, malformed
+  fail-closed;
 - `crates/venue-binance-futures/tests/red_l2delta_allowlist.rs` — то же + перп-специфика
   (allow-list не имеет права ронять `prev_final_update_id` в `None` — урок TD-014);
 - `crates/journal/tests/red_det_replay_digest.rs::det_9` — DET-I-1 на смешанном журнале.
@@ -144,8 +172,9 @@ pub fn should_capture_l2delta(symbols: &[String], symbol: &str) -> bool;
 
 ### RED-статус на момент коммита набора (анти-плацебо)
 
-`bash scripts/verify_M-45.sh` → **VERDICT: FAIL (7 нарушений)**, exit=1 — падает по существу
-(нет `parse_capture_symbols`/`should_capture_l2delta`, жив хардкод-`const`), а не по setup.
+`bash scripts/verify_M-45.sh` → **VERDICT: FAIL**, exit=1 — падает по существу (нет
+`parse_capture_symbols`/`should_capture_l2delta`/`l2delta_emission_for`, жив хардкод-список),
+а не по setup.
 Зелёные T0/T1/T6/T7/T9 — это проверки «ничего не сломано», они и обязаны быть зелёными до
 реализации.
 

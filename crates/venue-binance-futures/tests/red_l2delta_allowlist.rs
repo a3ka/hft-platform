@@ -161,3 +161,113 @@ fn allowlist_does_not_alter_perp_continuity_semantics() {
         "пустая сторона остаётся пустой — «не упомянуто» не значит «очистить»"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────────────────
+// O-7 — ВЫЗОВ НА РЕАЛЬНОМ ПУТИ (C-048 REJECT), перп-зеркало.
+//
+// Тот же обходной путь существует и здесь: `l2delta_event(&symbol, &diff)` зовётся из
+// обработчика (`crates/venue-binance-futures/src/lib.rs:643`) под хардкод-условием.
+// Реализация может выполнить контракт чистых функций и не подключить их к обработчику —
+// оракулы O-1..O-6 останутся зелёными, потому что дёргают функции напрямую.
+//
+// Контракт (зеркало спота; перп различается ТОЛЬКО наличием `pu` в wire):
+// ```ignore
+// pub fn l2delta_emission_for(stream: &str, data: &serde_json::Value, symbols: &[String])
+//     -> Option<EventKind>;
+// ```
+// ─────────────────────────────────────────────────────────────────────────────────────────
+
+/// Синтетическое wire-сообщение fstream `@depth` (перп: присутствует `pu`).
+fn depth_data(sym_lower: &str) -> (String, serde_json::Value) {
+    let stream = format!("{sym_lower}@depth@100ms");
+    let data = serde_json::json!({
+        "e": "depthUpdate",
+        "E": 1_752_000_000_499i64,
+        "s": sym_lower.to_uppercase(),
+        "pu": 100,
+        "U": 101,
+        "u": 103,
+        "b": [["65000.5", "0.3"], ["65000.4", "0"]],
+        "a": []
+    });
+    (stream, data)
+}
+
+#[test]
+fn o7_allowed_symbol_emits_through_real_message_path() {
+    let syms = parse_capture_symbols(Some("ETHUSDT"));
+    let (stream, data) = depth_data("ethusdt");
+    assert!(
+        venue_binance_futures::l2delta_emission_for(&stream, &data, &syms).is_some(),
+        "разрешённый символ обязан дать L2Delta на реальном пути перп-адаптера"
+    );
+}
+
+#[test]
+fn o7_disallowed_symbol_does_not_emit_through_real_message_path() {
+    let syms = parse_capture_symbols(Some("ETHUSDT"));
+    let (stream, data) = depth_data("solusdt");
+    assert!(
+        venue_binance_futures::l2delta_emission_for(&stream, &data, &syms).is_none(),
+        "SOLUSDT НЕ в allow-list ⇒ на реальном пути эмиссии быть не должно"
+    );
+}
+
+#[test]
+fn o7_default_config_still_emits_btc_and_only_btc_on_real_path() {
+    let syms = parse_capture_symbols(None);
+    let (s_btc, d_btc) = depth_data("btcusdt");
+    assert!(
+        venue_binance_futures::l2delta_emission_for(&s_btc, &d_btc, &syms).is_some(),
+        "дефолт обязан продолжать писать BTC-перп — иначе merge теряет данные (forward-only)"
+    );
+    let (s_eth, d_eth) = depth_data("ethusdt");
+    assert!(
+        venue_binance_futures::l2delta_emission_for(&s_eth, &d_eth, &syms).is_none(),
+        "дефолт не имеет права расширять состав эмиссии (Граница C)"
+    );
+}
+
+#[test]
+fn o7_real_path_preserves_perp_continuity_chain() {
+    // Перп-специфика СКВОЗЬ реальный разбор: `pu` обязан доехать до события.
+    // Реализация, скопированная со спота (где `pu` нет), уронит его в None и сломает
+    // gap-детекцию перп-книги — урок TD-014.
+    use contracts::{EventKind, MdEvent, MdPayload};
+
+    let syms = parse_capture_symbols(Some("ETHUSDT"));
+    let (stream, data) = depth_data("ethusdt");
+    let ev = venue_binance_futures::l2delta_emission_for(&stream, &data, &syms)
+        .expect("разрешённый символ обязан дать событие");
+    let EventKind::Md(MdEvent {
+        payload: MdPayload::L2Delta { prev_final_update_id, bids, asks, .. },
+        ..
+    }) = ev
+    else {
+        panic!("обязан быть EventKind::Md(L2Delta)");
+    };
+    assert_eq!(
+        prev_final_update_id,
+        Some(100),
+        "перп чейнится по `pu` — на реальном пути он обязан сохраниться (TD-014)"
+    );
+    assert_eq!(bids.len(), 2, "оба бид-уровня, включая size==0 remove");
+    assert!(asks.is_empty(), "пустая сторона остаётся пустой");
+}
+
+#[test]
+fn o7_malformed_depth_payload_is_fail_closed() {
+    let syms = parse_capture_symbols(Some("ETHUSDT"));
+    for bad in [
+        serde_json::json!({"e": "depthUpdate"}),
+        // `pu` отсутствует — для перпа это порча континуити, а не «ноль»
+        serde_json::json!({"e": "depthUpdate", "U": 101, "u": 103, "b": [], "a": []}),
+        serde_json::json!({"e": "depthUpdate", "pu": 100, "U": "нет", "u": 103, "b": [], "a": []}),
+    ] {
+        assert!(
+            venue_binance_futures::l2delta_emission_for("ethusdt@depth@100ms", &bad, &syms)
+                .is_none(),
+            "malformed перп-дифф обязан быть fail-closed (None): {bad}"
+        );
+    }
+}

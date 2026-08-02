@@ -211,3 +211,185 @@ fn o6_parse_is_deterministic_and_order_preserving() {
         "порядок и состав стабильны; никакой итерации по HashMap в решении о составе журнала"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────────────────
+// O-7 — ВЫЗОВ НА РЕАЛЬНОМ ПУТИ, а не только существование функций (C-048 REJECT).
+//
+// Находка critic'а C-048 §1: оракулов O-1..O-6 НЕДОСТАТОЧНО. Реализация может выполнить
+// контракт `parse_capture_symbols`/`should_capture_l2delta` дословно, оставить их
+// экспортированными — и НЕ подключить к реальной точке решения (обработчик WS-сообщения,
+// `crates/venue-binance/src/lib.rs`, ветка `stream.contains("@depth")`). Достаточно
+// переименовать константу или заинлайнить список литералом, и:
+//   • O-1..O-6 зелёные   — они дёргают чистые функции напрямую, минуя обработчик;
+//   • T5 зелёный         — греп искал БУКВАЛЬНОЕ имя `L2DELTA_CAPTURE_SYMBOLS`;
+//   • §8 eyes-on зелёный — дефолт совпадает со старым поведением байт-в-байт.
+// Дефект всплыл бы ТОЛЬКО когда founder подпишет состав и оператор выставит env —
+// максимально поздно, после прохождения всех гейтов. Худший класс тихой деградации.
+//
+// Поэтому предмет проверки смещается: не «существуют ли функции», а «проходит ли РЕАЛЬНОЕ
+// wire-сообщение через allow-list». Реализация обязана свести решение об эмиссии в ОДНУ
+// чистую функцию, покрывающую весь путь (разбор stream/data → символ → allow-list → событие):
+//
+// ```ignore
+// /// ЕДИНСТВЕННАЯ точка решения об эмиссии L2Delta. Чистая: без I/O, без env, без async.
+// /// `Some(event)` ⇔ сообщение — валидный depth-diff И символ разрешён списком.
+// pub fn l2delta_emission_for(
+//     stream: &str,
+//     data: &serde_json::Value,
+//     symbols: &[String],
+// ) -> Option<EventKind>;
+// ```
+//
+// Обработчик обязан ДЕЛЕГИРОВАТЬ ей, а не дублировать сравнение символов у себя. Список
+// приходит явным параметром — чтение `env` схлопывается в однострочную обёртку на самом
+// верху (`connect`/`main`), проверяемую глазами. Отсутствие обходного пути закрепляет
+// канарейка T5 в `scripts/verify_M-45.sh` (`l2delta_event(` вызывается в `src/` ровно
+// один раз — внутри `l2delta_emission_for`), по образцу INTG-I: тест подтверждает
+// ОТСУТСТВИЕ альтернативного пути, а не наличие проверки.
+// ─────────────────────────────────────────────────────────────────────────────────────────
+
+/// Синтетическое wire-сообщение Binance `@depth` для произвольного символа.
+/// Форма — как в проде: `data` содержит `U`/`u`/`b`/`a`, цены/размеры строками.
+fn depth_data(sym_lower: &str) -> (String, serde_json::Value) {
+    let stream = format!("{sym_lower}@depth@100ms");
+    let data = serde_json::json!({
+        "e": "depthUpdate",
+        "E": 1_752_000_000_499i64,
+        "s": sym_lower.to_uppercase(),
+        "U": 101,
+        "u": 103,
+        // асимметрия: только биды; из них один — remove (size "0")
+        "b": [["65000.5", "0.3"], ["65000.4", "0"]],
+        "a": []
+    });
+    (stream, data)
+}
+
+#[test]
+fn o7_allowed_symbol_emits_through_real_message_path() {
+    let syms = parse_capture_symbols(Some("ETHUSDT"));
+    let (stream, data) = depth_data("ethusdt");
+    let got = venue_binance::l2delta_emission_for(&stream, &data, &syms);
+    assert!(
+        got.is_some(),
+        "символ ETHUSDT разрешён конфигурацией ⇒ РЕАЛЬНЫЙ путь разбора wire-сообщения обязан \
+         дать L2Delta-событие. Если здесь None — allow-list не подключён к обработчику, \
+         и раскатка не заработает (C-048 §1)"
+    );
+}
+
+#[test]
+fn o7_disallowed_symbol_does_not_emit_through_real_message_path() {
+    // Главная половина: конфигурация обязана УМЕТЬ не пускать. Реализация с захардкоженным
+    // списком на реальном call site вернёт Some (BTC-хардкод) или Some всегда — и упадёт тут.
+    let syms = parse_capture_symbols(Some("ETHUSDT"));
+    let (stream, data) = depth_data("solusdt");
+    assert!(
+        venue_binance::l2delta_emission_for(&stream, &data, &syms).is_none(),
+        "SOLUSDT НЕ в allow-list ⇒ на реальном пути эмиссии быть не должно"
+    );
+}
+
+#[test]
+fn o7_default_config_still_emits_btc_and_only_btc_on_real_path() {
+    // Прод-инвариант merge'а, проверенный через реальный разбор, а не через чистый фильтр.
+    let syms = parse_capture_symbols(None);
+
+    let (s_btc, d_btc) = depth_data("btcusdt");
+    assert!(
+        venue_binance::l2delta_emission_for(&s_btc, &d_btc, &syms).is_some(),
+        "дефолтная конфигурация обязана продолжать писать BTC — иначе merge ТЕРЯЕТ данные, \
+         которые прод пишет с 2026-07-21 (forward-only, невосстановимо)"
+    );
+    for other in ["ethusdt", "solusdt"] {
+        let (s, d) = depth_data(other);
+        assert!(
+            venue_binance::l2delta_emission_for(&s, &d, &syms).is_none(),
+            "дефолт не имеет права расширять состав эмиссии на {other} — это раскатка без \
+             решения founder'а (Граница C)"
+        );
+    }
+}
+
+#[test]
+fn o7_case_insensitive_config_works_on_real_path() {
+    // Регистр, проверенный СКВОЗЬ реальный разбор: wire даёт "ETHUSDT", конфиг — "ethusdt".
+    let syms = parse_capture_symbols(Some("ethusdt"));
+    let (stream, data) = depth_data("ethusdt");
+    assert!(
+        venue_binance::l2delta_emission_for(&stream, &data, &syms).is_some(),
+        "конфигурация в нижнем регистре обязана работать на реальном пути — иначе запись \
+         молча выключается при операторской опечатке"
+    );
+}
+
+#[test]
+fn o7_emitted_event_is_lossless_and_not_altered_by_allowlist() {
+    // Allow-list решает «эмитить ли», а не «что эмитить»: содержимое обязано остаться
+    // тем же, что даёт сырой транслятор M-18 (CT-RFC-04, L2D-I-2).
+    use contracts::{EventKind, MdEvent, MdPayload};
+
+    let syms = parse_capture_symbols(Some("ETHUSDT"));
+    let (stream, data) = depth_data("ethusdt");
+    let ev = venue_binance::l2delta_emission_for(&stream, &data, &syms)
+        .expect("разрешённый символ обязан дать событие");
+
+    let EventKind::Md(MdEvent {
+        symbol,
+        payload:
+            MdPayload::L2Delta {
+                bids,
+                asks,
+                first_update_id,
+                final_update_id,
+                prev_final_update_id,
+                ..
+            },
+        ..
+    }) = ev
+    else {
+        panic!("обязан быть EventKind::Md(L2Delta)");
+    };
+
+    assert_eq!(symbol, "ETHUSDT", "символ нормализован в верхний регистр");
+    assert_eq!((first_update_id, final_update_id), (101, 103), "U/u сохранены");
+    assert_eq!(
+        prev_final_update_id, None,
+        "СПОТ: `pu` в wire отсутствует ⇒ None (перп-семантика сюда не протекает — урок TD-014)"
+    );
+    assert_eq!(bids.len(), 2, "оба бид-уровня сохранены (множественность)");
+    assert_eq!(bids[1].size, 0, "size==0 remove сохранён как явный маркер");
+    assert!(
+        asks.is_empty(),
+        "пустая сторона остаётся пустой — «не упомянуто» не значит «очистить»"
+    );
+}
+
+#[test]
+fn o7_non_depth_stream_never_emits_regardless_of_allowlist() {
+    // Граница: даже если символ разрешён, НЕ-depth поток не имеет права давать L2Delta.
+    let syms = parse_capture_symbols(Some("ETHUSDT"));
+    let data = serde_json::json!({"e": "trade", "s": "ETHUSDT", "p": "65000.5", "q": "0.3"});
+    assert!(
+        venue_binance::l2delta_emission_for("ethusdt@trade", &data, &syms).is_none(),
+        "поток @trade не является depth-диффом — L2Delta из него не строится"
+    );
+}
+
+#[test]
+fn o7_malformed_depth_payload_is_fail_closed() {
+    // Отсутствие/порча полей ⇒ None (не эмитим мусор), а не паника и не «додумать».
+    let syms = parse_capture_symbols(Some("ETHUSDT"));
+    for bad in [
+        serde_json::json!({"e": "depthUpdate"}),
+        serde_json::json!({"e": "depthUpdate", "U": 101}),
+        serde_json::json!({"e": "depthUpdate", "U": "не число", "u": 103, "b": [], "a": []}),
+        serde_json::json!({"e": "depthUpdate", "U": 101, "u": 103, "b": [["дичь", "0.3"]], "a": []}),
+    ] {
+        let got = venue_binance::l2delta_emission_for("ethusdt@depth@100ms", &bad, &syms);
+        assert!(
+            got.is_none(),
+            "malformed depth-diff обязан быть fail-closed (None), а не эмиссией мусора: {bad}"
+        );
+    }
+}

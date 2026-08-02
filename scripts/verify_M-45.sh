@@ -82,14 +82,47 @@ for crate in venue-binance venue-binance-futures; do
   fi
 done
 
-echo "--- T5: хардкод-константа со списком символов устранена (задачи 1-2 сделаны целиком) ---"
-# Канарейка: если const со СПИСКОМ символов остался, конфигурация введена наполовину —
-# один путь читает env, другой продолжает жить на хардкоде.
-if grep -rnE 'const L2DELTA_CAPTURE_SYMBOLS: *&\[&str\] *= *&\[' crates/ --include=*.rs \
-     >/tmp/m45-const.log 2>&1; then
-  fail "T5 хардкод-const со списком символов ещё жив:"; cat /tmp/m45-const.log
+echo "--- T5: НЕТ ОБХОДНОГО ПУТИ эмиссии мимо allow-list (C-048 §1) ---"
+# Урок C-048 REJECT: греп по ИМЕНИ константы — негодная канарейка. Реализация могла
+# переименовать константу или заинлайнить список литералом, оставив чистые функции
+# осиротевшими (экспортированы, зовутся только из тестов), и весь гейт был бы зелёным,
+# а раскатка не работала бы. Дефект всплыл бы только после founder-подписи — позже всех
+# гейтов.
+#
+# Поэтому проверяется ОТСУТСТВИЕ альтернативного пути (образец INTG-I: тест подтверждает
+# отсутствие обхода, а не наличие проверки): сырой транслятор `l2delta_event(` имеет право
+# вызываться в прод-коде РОВНО из одного места — из `l2delta_emission_for`, единственной
+# точки решения. Любой второй call site = путь в обход allow-list.
+for crate in venue-binance venue-binance-futures; do
+  calls=$(grep -rn 'l2delta_event(' "crates/$crate/src/" --include=*.rs 2>/dev/null \
+          | grep -vE 'fn l2delta_event|///|//!|^\s*//' | wc -l)
+  if [ "$calls" -eq 1 ]; then
+    if grep -rn 'l2delta_event(' "crates/$crate/src/" --include=*.rs 2>/dev/null \
+         | grep -vE 'fn l2delta_event|///|//!|^\s*//' \
+         | grep -q 'l2delta_emission_for\|emission_for' \
+       || awk '/fn l2delta_emission_for/,/^}/' "crates/$crate/src/lib.rs" 2>/dev/null \
+            | grep -q 'l2delta_event('; then
+      pass "T5 $crate: единственный вызов l2delta_event — внутри l2delta_emission_for"
+    else
+      fail "T5 $crate: единственный вызов l2delta_event НЕ внутри l2delta_emission_for — \
+решение об эмиссии принимается мимо allow-list"
+    fi
+  else
+    fail "T5 $crate: вызовов l2delta_event в src = $calls (ожидается ровно 1, внутри \
+l2delta_emission_for). Каждый лишний call site — путь эмиссии в обход allow-list"
+    grep -rn 'l2delta_event(' "crates/$crate/src/" --include=*.rs | grep -vE 'fn l2delta_event'
+  fi
+done
+
+# Хардкод-список символов не имеет права остаться ни под каким именем: ищем массив
+# строковых литералов, похожих на тикеры, в venue-крейтах вне тестов.
+if grep -rnE '&\[ *"[A-Z]{2,}USD[TC]?" *(, *"[A-Z]{2,}USD[TC]?" *)*\]' \
+     crates/venue-binance/src/ crates/venue-binance-futures/src/ --include=*.rs \
+     >/tmp/m45-hardcode.log 2>&1; then
+  fail "T5 хардкод-список тикеров ещё жив в прод-коде (переименование константы не считается фиксом):"
+  cat /tmp/m45-hardcode.log
 else
-  pass "T5 хардкод-const со списком символов отсутствует"
+  pass "T5 хардкод-списка тикеров в venue-src нет"
 fi
 
 echo "--- T6: сырой L2Delta-транслятор не задет (T1-форма и семантика pu/U/u) ---"
