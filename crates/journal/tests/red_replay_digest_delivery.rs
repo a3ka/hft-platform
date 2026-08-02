@@ -63,7 +63,7 @@ fn run(args: &[String]) -> (i32, String) {
 }
 
 fn cfg() -> WriterConfig {
-    cfg_with(64 * 1024, "replay-digest delivery fixture")
+    cfg_with(8 * 1024, "replay-digest delivery fixture")
 }
 
 /// Журнал из НЕСКОЛЬКИХ сегментов + эталонный дайджест, посчитанный БИБЛИОТЕКОЙ.

@@ -249,7 +249,10 @@ fn mn_3_readable_floor_refuses_non_monotonic_catalogue() {
 fn mn_4_duplicate_segment_under_new_index_is_refused() {
     let dir = healthy_dir(400);
     let names = seg_names(dir.path());
-    let src = names[names.len() - 2].clone();
+    // Копируем именно ПОСЛЕДНИЙ сегмент: тогда дубль встаёт СРАЗУ ЗА оригиналом и даёт
+    // РАВНЫЕ соседние `first_seq` — форму, которую ловит «строго возрастает» и не ловит
+    // «не убывает». Копия более раннего сегмента дала бы обычное убывание (форма MN-1..3).
+    let src = names.last().expect("есть сегменты").clone();
     let last_idx: u32 = names
         .last()
         .and_then(|n| n.strip_prefix("segment-"))
@@ -336,6 +339,18 @@ fn mn_5_legacy_sentinel_first_seq_is_not_a_violation() {
     }
     std::fs::write(&legacy_path, &raw).expect("write legacy");
 
+    // Декларация ДО измерения формы: незадекларированный безголовый сегмент — `ForeignSegment`
+    // для `list_segments`, и `first_seqs` вернул бы пустоту (форма фикстуры не проверена бы).
+    let decl = LegacySegmentDecl {
+        file_name: legacy_name.clone(),
+        fingerprint_sha256: journal::fingerprint(&legacy_path).expect("fingerprint"),
+        size_bytes_at_decl: std::fs::metadata(&legacy_path).expect("meta").len(),
+        source: DataSource::OwnCapture,
+        provenance: "pre-RFC02 capture re-attached under a higher index".to_string(),
+        epoch_id: contracts::LEGACY_EPOCH_ID.to_string(),
+    };
+    journal::declare_legacy(dir.path(), decl).expect("declare_legacy");
+
     let fs = first_seqs(dir.path());
     assert_eq!(
         fs.last().copied(),
@@ -365,16 +380,7 @@ fn mn_5_legacy_sentinel_first_seq_is_not_a_violation() {
         "legacy-события обязаны читаться наравне с v2 (400 + 5)"
     );
 
-    // (2) stream — прод-путь: после декларации legacy обязан отдавать данные.
-    let decl = LegacySegmentDecl {
-        file_name: legacy_name.clone(),
-        fingerprint_sha256: journal::fingerprint(&legacy_path).expect("fingerprint"),
-        size_bytes_at_decl: std::fs::metadata(&legacy_path).expect("meta").len(),
-        source: DataSource::OwnCapture,
-        provenance: "pre-RFC02 capture re-attached under a higher index".to_string(),
-        epoch_id: contracts::LEGACY_EPOCH_ID.to_string(),
-    };
-    journal::declare_legacy(dir.path(), decl).expect("declare_legacy");
+    // (2) stream — прод-путь: задекларированный legacy обязан отдавать данные.
     let n = journal::stream(dir.path(), EpochFilter::All)
         .unwrap_or_else(|e| {
             panic!(

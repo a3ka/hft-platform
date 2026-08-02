@@ -334,7 +334,7 @@ fn wb_3_honest_declaration_on_cheap_corruption_still_starts() {
 #[test]
 fn wb_4_healthy_restart_is_unaffected_by_the_budget() {
     let dir = tempfile::tempdir().expect("dir");
-    let cfg_small = cfg_with(64 * 1024, "floor work-budget healthy fixture");
+    let cfg_small = cfg_with(8 * 1024, "floor work-budget healthy fixture");
     let expect_next;
     {
         let mut j = Journal::open_with(dir.path(), cfg_small.clone()).expect("open_with");
