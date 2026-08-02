@@ -439,6 +439,10 @@ fn scan_tail_for_last_seq(seg_path: &Path) -> io::Result<Option<u64>> {
 pub fn read_all(dir: impl AsRef<Path>) -> io::Result<Vec<Event>> {
     let dir = dir.as_ref();
     let segs = segments::iter_segments_sorted(dir)?;
+    // JR-I-11 (M-52, TD-030): guard монотонности — офлайн-диагностика (`read_all`) обязана
+    // отказать на re-stitch'нутом каталоге так же, как прод-путь `stream`, а не молча
+    // отдать тихий беспорядок seq. Дёшево: только заголовки, не тело сегментов.
+    segments::check_monotonic_paths(dir, &segs)?;
     let mut out = Vec::new();
     for seg in segs {
         out.extend(segments::read_segment_events(&seg, true)?);

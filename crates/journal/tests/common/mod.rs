@@ -369,6 +369,170 @@ pub fn append_bytes(path: &Path, bytes: &[u8]) {
     f.write_all(bytes).expect("append bytes");
 }
 
+// ═════════════════════════════════════════════════════════════════════════════════════
+// M-52 (TD-052 / TD-030 / TD-067) — помощники оракулов «journal hardening»
+// ═════════════════════════════════════════════════════════════════════════════════════
+
+/// **Псевдослучайный мусор (LCG, детерминированный по seed).**
+///
+/// Форма порчи, на которой цена скана пола ВЗРЫВАЕТСЯ. Замер reviewer'а на PR-гейте M-50
+/// (out-of-tree probe, идентичная фикстура на обеих ветках): хвост 16 MiB — `0.182 s` до
+/// M-50 против `384.94 s` после, **×2114** (TD-054); рост ×4.2–5.1 на удвоение.
+///
+/// Заливка `0x5A`, на которой построены ВСЕ фикстуры M-49/M-50, этот класс НЕ ловит:
+/// `0x5A5A5A5A` ≈ 1.4 GiB > санити-капа ⇒ мгновенный ресинк на 1 байт. Ровно поэтому
+/// «заявление M-50 §Известные ограничения 4 ФАКТИЧЕСКИ ОПРОВЕРГНУТО» (TECH-DEBT TD-054):
+/// ни один оракул M-50 не давил на время, потому что мусор во всех был счастливой формы.
+/// Оракул ресурсной границы обязан брать РАВНОМЕРНЫЙ мусор — иначе это «фикстура
+/// счастливого пути» (`.claude/rules/testing.md`).
+///
+/// Детерминирован: тот же seed ⇒ те же байты на любой машине (в т.ч. в CI и в replay).
+pub fn lcg_garbage(n: usize, seed: u64) -> Vec<u8> {
+    let mut s = seed | 1;
+    let mut out = Vec::with_capacity(n + 8);
+    while out.len() < n {
+        s = s
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        // Берём СТАРШИЕ биты: младшие у LCG заметно менее случайны, а нам важно, чтобы
+        // 4-байтовые окна `len` покрывали диапазон u32 равномерно (иначе доля кандидатов
+        // в окне (carry_cap, sanity_cap] окажется не той, что на реальном мусоре).
+        out.extend_from_slice(&(s >> 24).to_le_bytes());
+    }
+    out.truncate(n);
+    out
+}
+
+/// `Journal::open_with` с КРАЙНИМ СРОКОМ (TD-052: у операторского пути есть цена по
+/// ВРЕМЕНИ, и она сегодня ничем не ограничена).
+///
+/// `Some(Ok(next_seq))` — старт разрешён; `Some(Err(диагностика))` — fail-closed отказ;
+/// `None` — **не уложился в срок** (рабочий поток остаётся висеть до конца процесса —
+/// сознательно: альтернатива, ждать 385 s ради каждого прогона, делает RED-состояние
+/// непригодным для итерации dev'а).
+///
+/// Почему оракул смотрит на ВРЕМЯ, хотя контракт бюджета выражен в БАЙТАХ РАБОТЫ: байты —
+/// детерминированная величина, но снаружи крейта она не наблюдаема (константа приватна,
+/// интеграционный тест `pub(crate)` не видит). Наблюдаемо ровно то, что чувствует оператор
+/// под инцидентом, — время. Запас берётся кратный (замер 384.94 s против потолка 60 s),
+/// чтобы разброс машины CI не превращал ресурсный оракул в измеритель окружения.
+pub fn open_with_deadline(dir: &Path, cfg: WriterConfig, secs: u64) -> Option<Result<u64, String>> {
+    let d = dir.to_path_buf();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let r = Journal::open_with(&d, cfg)
+            .map(|j| j.next_seq())
+            .map_err(|e| e.to_string());
+        let _ = tx.send(r);
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(secs)).ok()
+}
+
+/// Поменять местами СОДЕРЖИМОЕ двух сегментов каталога (через временное имя).
+/// Моделирует ровно тот операторский промах, ради которого заведён TD-030: архивный
+/// (терминальный) сегмент вернули в живой каталог под чужим индексом. `first_seq` в
+/// заголовках при этом остаются РОДНЫМИ — именно поэтому немонотонность обнаружима.
+pub fn swap_segment_files(dir: &Path, a: &str, b: &str) {
+    let tmp = dir.join("swap.tmp");
+    std::fs::rename(dir.join(a), &tmp).expect("rename a->tmp");
+    std::fs::rename(dir.join(b), dir.join(a)).expect("rename b->a");
+    std::fs::rename(&tmp, dir.join(b)).expect("rename tmp->b");
+}
+
+/// Начало потока событий сегмента, декодированное СВОИМ кодом (до 64 KiB — заголовку
+/// хватает с запасом). `.zst` распаковывается потоково и ограниченно.
+fn segment_head_bytes(path: &Path) -> Vec<u8> {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    if !name.ends_with(".zst") {
+        let mut f = match std::fs::File::open(path) {
+            Ok(f) => f,
+            Err(_) => return Vec::new(),
+        };
+        let mut buf = vec![0u8; 64 * 1024];
+        let n = f.read(&mut buf).unwrap_or(0);
+        buf.truncate(n);
+        return buf;
+    }
+    let f = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return Vec::new(),
+    };
+    let mut dec = match zstd::Decoder::new(f) {
+        Ok(d) => d,
+        Err(_) => return Vec::new(),
+    };
+    let mut out = vec![0u8; 64 * 1024];
+    let mut filled = 0usize;
+    while filled < out.len() {
+        match dec.read(&mut out[filled..]) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => filled += n,
+        }
+    }
+    out.truncate(filled);
+    out
+}
+
+/// `first_seq` заголовков всех сегментов каталога, по возрастанию индекса — ИЗМЕРЕНИЕ
+/// формы фикстуры (setup-guard оракулов TD-030), а не проверяемое свойство.
+///
+/// Читает заголовок СВОИМ кодом, НЕ через `journal::list_segments`: измерять форму
+/// фикстуры функцией, на которую ставится проверяемый guard, нельзя — как только guard
+/// появится, измерение начнёт возвращать пустоту и setup-guard замаскирует настоящий
+/// результат (поймано прогоном прототипа M-52).
+///
+/// Безголовый (legacy) сегмент даёт `0` — ТОТ ЖЕ сентинел, что синтезирует крейт
+/// (`segments.rs`: «first_seq legacy: неизвестен без чтения сегмента, безопасный дефолт 0»).
+pub fn first_seqs(dir: &Path) -> Vec<u64> {
+    let mut out = Vec::new();
+    for name in ls(dir) {
+        if !is_segment_name(&name) {
+            continue;
+        }
+        let bytes = segment_head_bytes(&dir.join(&name));
+        if !bytes.starts_with(&SEGMENT_MAGIC) {
+            out.push(0); // legacy-сентинел
+            continue;
+        }
+        let m = SEGMENT_MAGIC.len();
+        if bytes.len() < m + 4 {
+            out.push(0);
+            continue;
+        }
+        let len = u32::from_le_bytes(bytes[m..m + 4].try_into().unwrap()) as usize;
+        let end = m + 4 + len;
+        let h = if end <= bytes.len() {
+            postcard::from_bytes::<contracts::SegmentHeader>(&bytes[m + 4..end]).ok()
+        } else {
+            None
+        };
+        out.push(h.map(|h| h.first_seq).unwrap_or(0));
+    }
+    out
+}
+
+/// sha256 всех файлов каталога (имя → хэш) — доказательство, что операция была
+/// READ-ONLY по данным (TD-067: расчёт дайджеста не имеет права трогать журнал).
+pub fn dir_digest(dir: &Path) -> Vec<(String, String)> {
+    use sha2::{Digest, Sha256};
+    let mut v: Vec<(String, String)> = Vec::new();
+    for name in ls(dir) {
+        let p = dir.join(&name);
+        if !p.is_file() {
+            continue;
+        }
+        let bytes = std::fs::read(&p).unwrap_or_default();
+        let mut h = Sha256::new();
+        h.update(&bytes);
+        v.push((name, format!("{:x}", h.finalize())));
+    }
+    v.sort();
+    v
+}
+
 /// Общий assert оракулов M-50: декларация `next_seq` ВНУТРИ занятого диапазона обязана
 /// быть ОТВЕРГНУТА. Контракт JR-I-9 допускает ДВЕ формы отказа — «строго больше
 /// читаемого максимума» (`Known`) ИЛИ «пол непроверяем» (`Unknown`) — но не приём.

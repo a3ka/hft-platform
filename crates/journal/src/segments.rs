@@ -720,6 +720,28 @@ pub fn segments(dir: impl AsRef<Path>) -> io::Result<Vec<SegmentInfo>> {
     }
     // Стабильная сортировка по индексу — критично для сшивки по границе.
     out.sort_by_key(|s| s.index);
+
+    // JR-I-11 (M-52, TD-030): guard монотонности `first_seq` — ДО выдачи наружу. Это
+    // ЕДИНСТВЕННЫЙ публичный вход `list_segments`, от которого наследуют `stream`/
+    // `stream_from` (см. `check_first_seq_monotonic` — общий хелпер на все три пути).
+    let candidates: Vec<(String, u32, u64)> = out
+        .iter()
+        .map(|s| {
+            (
+                s.path
+                    .file_name()
+                    .and_then(OsStr::to_str)
+                    .unwrap_or("")
+                    .to_string(),
+                s.header.schema_version,
+                s.header.first_seq,
+            )
+        })
+        .collect();
+    check_first_seq_monotonic(&candidates, |name| {
+        segment_carries_any_event(&dir.join(name))
+    })?;
+
     Ok(out)
 }
 
@@ -1512,6 +1534,59 @@ pub(crate) enum ReadableFloor {
     Unknown,
 }
 
+/// JR-I-10 (M-52, TD-052 + TD-054). Скан пола раньше читал/раздекодировал ВЕСЬ каталог в
+/// худшем случае (прод: 158 сегментов ≈ 140 GiB сырых) без границы по ВРЕМЕНИ/РАБОТЕ — только
+/// память была ограничена (`op_8`, rev5 M-49). Бюджет — счётчик ОСТАВШЕЙСЯ работы в байтах,
+/// протянутый через ВЕСЬ скан пола (все сегменты одного вызова `readable_floor` + side-
+/// верификация крупных кандидатов JR-I-9 внутри них). НЕ функция размера каталога/сегмента —
+/// одна именованная константа (T1, канарейка `verify_M-52.sh`).
+struct WorkBudget {
+    remaining: u64,
+}
+
+impl WorkBudget {
+    fn new(total: u64) -> Self {
+        Self { remaining: total }
+    }
+
+    /// Списать `n` байт работы. `false` — бюджет ИСЧЕРПАН: вызывающий обязан НЕМЕДЛЕННО
+    /// прекратить скан (в т.ч. отбросить уже накопленный частичный результат) и вернуть
+    /// `Unknown` — частичный `Known` по недосмотренному каталогу есть заниженный пол, то
+    /// есть seq-reuse (JR-I-10). Дальнейшие вызовы после исчерпания продолжают отдавать
+    /// `false` (бюджет не восстанавливается).
+    #[must_use]
+    fn spend(&mut self, n: u64) -> bool {
+        match self.remaining.checked_sub(n) {
+            Some(r) => {
+                self.remaining = r;
+                true
+            }
+            None => {
+                self.remaining = 0;
+                false
+            }
+        }
+    }
+}
+
+/// Бюджет РАБОТЫ одного вызова `readable_floor` (JR-I-10). Обязан быть ЗАМЕТНО больше одного
+/// прод-сегмента (`DEFAULT_MAX_SEGMENT_BYTES` = 1 GiB) — иначе честная декларация на здоровом
+/// restore (единственный, но крупный сегмент с валидным содержимым до самого хвоста) перестаёт
+/// проходить (`wb_3`). Восьмикратный запас: достаточно, чтобы дочитать легитимный prod-размера
+/// сегмент целиком практически бесплатно, но исчерпывается за доли секунды на сверхлинейной
+/// side-верификации равномерного мусора (TD-054) — деградация в `Unknown` наступает быстро, а
+/// не после нескольких минут «медленно, но верно».
+const READABLE_FLOOR_WORK_BUDGET_BYTES: u64 = 8 * DEFAULT_MAX_SEGMENT_BYTES;
+
+/// Итог терпимого скана: либо честно завершённый (в т.ч. `None` — валидных фреймов не нашлось
+/// нигде в источнике), либо оборванный исчерпанием бюджета (JR-I-10). В случае исчерпания
+/// накопленный `max_seq` НЕ возвращается вызывающему ни в каком виде — вызывающий обязан
+/// трактовать это как «пол неизвестен», а не как промежуточный ответ.
+enum ScanOutcome {
+    Done(Option<u64>),
+    BudgetExhausted,
+}
+
 /// Пол защиты каталога — best-effort, используется ТОЛЬКО для валидации операторской
 /// декларации (не прод-путь чтения). Терпимый обход (не `stream`/`segments()` — те строгие и
 /// наружу отдают данные потребителям, здесь только внутренняя оценка границы «что уже точно
@@ -1526,16 +1601,34 @@ pub(crate) enum ReadableFloor {
 /// сегменты по построению несут меньший `seq` (та же монотонность, что и раньше, отложена в
 /// TD-030). Если ни в одном непустом сегменте не нашлось ни одного валидного фрейма —
 /// `Unknown`, не `0`.
+///
+/// M-52 (JR-I-11, TD-030): guard монотонности `first_seq` идёт ПЕРВЫМ, до бюджетного скана —
+/// он дешёвый (только заголовки) и, обнаружив re-stitch архива под чужим индексом, обязан
+/// отказать раньше, чем скан пола успеет опереться на ложную монотонность и занизить пол
+/// (условие закрытия TD-030 из `R-002`/`R-003`).
+///
+/// M-52 (JR-I-10, TD-052/TD-054): бюджет РАБОТЫ единый на ВЕСЬ вызов (все сегменты одного
+/// прохода). Исчерпание в ЛЮБОЙ момент — включая продолжение после уже честно досмотренных
+/// более новых сегментов — немедленно превращает результат ВСЕГО вызова в `Unknown`: то, что
+/// какой-то более старый сегмент мог бы дать `Known`, не имеет значения — сегмент, чей скан
+/// оборван бюджетом, мог нести валидные фреймы с БОЛЕЕ ВЫСОКИМ `seq` за точкой обрыва, и
+/// пропуск к более старому сегменту дал бы ровно тот заниженный пол, от которого защищаемся.
 fn readable_floor(dir: &Path) -> io::Result<ReadableFloor> {
+    let segs = iter_segments_sorted(dir)?;
+    check_monotonic_paths(dir, &segs)?;
+
+    let mut budget = WorkBudget::new(READABLE_FLOOR_WORK_BUDGET_BYTES);
     let mut saw_nonempty = false;
-    for p in iter_segments_sorted(dir)?.into_iter().rev() {
+    for p in segs.into_iter().rev() {
         let len = fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
         if len == 0 {
             continue;
         }
         saw_nonempty = true;
-        if let Some(m) = tolerant_max_seq_from_start(&p)? {
-            return Ok(ReadableFloor::Known(m));
+        match tolerant_max_seq_from_start(&p, &mut budget)? {
+            ScanOutcome::Done(Some(m)) => return Ok(ReadableFloor::Known(m)),
+            ScanOutcome::Done(None) => continue,
+            ScanOutcome::BudgetExhausted => return Ok(ReadableFloor::Unknown),
         }
     }
     if saw_nonempty {
@@ -1543,6 +1636,143 @@ fn readable_floor(dir: &Path) -> io::Result<ReadableFloor> {
     } else {
         Ok(ReadableFloor::NoSegments)
     }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════════════
+// M-52 (JR-I-11, TD-030) — guard монотонности сшивки сегментов
+// ═════════════════════════════════════════════════════════════════════════════════════
+
+/// Best-effort идентичность сегмента (`schema_version`, `first_seq`) для guard'а
+/// `read_all`/`readable_floor` — путей, которые (в отличие от `segments()`) не требуют
+/// строгой классификации/манифеста. `None` — заголовок прочитать не удалось (магия есть, но
+/// битая): сегмент исключается из guard'а, штатное чтение (`read_segment_events`/скан пола)
+/// откажет на нём отдельно со своей диагностикой — дублировать её здесь незачем.
+fn peek_segment_identity(path: &Path) -> Option<(u32, u64)> {
+    let is_zst = path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .is_some_and(is_compacted_name);
+    if is_zst {
+        let f = File::open(path).ok()?;
+        let mut decoder = open_compacted_reader(f).ok()?;
+        let header = skip_v2_header_forward(&mut decoder).ok()?;
+        return Some((header.schema_version, header.first_seq));
+    }
+    let mut f = File::open(path).ok()?;
+    match read_v2_header_and_skip(&mut f) {
+        Ok(Some(h)) => Some((h.schema_version, h.first_seq)),
+        // Магии нет: legacy (до CT-RFC-02) — сентинел, а не факт (JR-I-11 carve-out 1).
+        Ok(None) => Some((contracts::SCHEMA_VERSION_PRE_HEADER, 0)),
+        Err(_) => None,
+    }
+}
+
+/// Несёт ли сегмент хотя бы одно событие — JR-I-11 carve-out 2 (`mn_8`, JR-I-8 случай 3:
+/// «валидный заголовок, ноль событий»). Стоит ОДИН фрейм; вызывается guard'ом ТОЛЬКО при
+/// равенстве соседних `first_seq` — на здоровом каталоге не вызывается никогда.
+/// `Ok(true)` — предохранительный дефолт, когда прочитать не удалось: пустота — это то, что
+/// обязано быть ДОКАЗАНО, отсутствие доказательства не даёт carve-out.
+fn segment_carries_any_event(path: &Path) -> io::Result<bool> {
+    let is_zst = path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .is_some_and(is_compacted_name);
+    if is_zst {
+        let f = match File::open(path) {
+            Ok(f) => f,
+            Err(_) => return Ok(true),
+        };
+        let mut decoder = match open_compacted_reader(f) {
+            Ok(d) => d,
+            Err(_) => return Ok(true),
+        };
+        if skip_v2_header_forward(&mut decoder).is_err() {
+            return Ok(true);
+        }
+        return Ok(matches!(read_event_frame(&mut decoder), Ok(Some(_))));
+    }
+    let mut f = match File::open(path) {
+        Ok(f) => f,
+        Err(_) => return Ok(true),
+    };
+    match read_v2_header_and_skip(&mut f) {
+        Ok(Some(_)) => {}
+        // Не должно происходить (вызывается только на сравнимых, т.е. НЕ-legacy сегментах) —
+        // безопасный дефолт: не подтверждена пустота, carve-out не даём.
+        Ok(None) => return Ok(true),
+        Err(_) => return Ok(true),
+    }
+    let mut r = BufReader::with_capacity(4096, f);
+    Ok(matches!(read_event_frame(&mut r), Ok(Some(_))))
+}
+
+/// JR-I-11 (M-52, TD-030): guard монотонности `first_seq` по возрастанию индекса сегмента —
+/// ОДИН общий хелпер для ТРЁХ прод-путей чтения (`segments()` ⇒ `stream`/`stream_from`,
+/// `read_all`, `readable_floor`); тот же принцип, что `dedup_indexed_paths` (D-COMP-1) — одна
+/// проверка, а не три копии, дрейфующие врозь.
+///
+/// Правило: СРАВНИМЫЕ `first_seq` НЕ УБЫВАЮТ по возрастанию индекса (не «строго возрастают» —
+/// `mn_8`). Два обязательных carve-out'а:
+///  1. legacy (`schema_version == SCHEMA_VERSION_PRE_HEADER`) исключается из сравнения — ни
+///     как левый, ни как правый операнд: его `first_seq` — синтезированный сентинел
+///     «неизвестно», не факт (`mn_5`, класс TD-011);
+///  2. равенство законно, если ЛЕВЫЙ (более ранний по индексу) сегмент не несёт ни одного
+///     события — его `first_seq` тогда обещание, совпадающее с `first_seq` следующего
+///     (`mn_8`, JR-I-8 случай 3). `carries_events` вызывается ЛЕНИВО, только при равенстве.
+///
+/// `candidates` уже отсортированы по возрастанию индекса сегмента (инвариант вызывающих).
+fn check_first_seq_monotonic(
+    candidates: &[(String, u32, u64)],
+    mut carries_events: impl FnMut(&str) -> io::Result<bool>,
+) -> io::Result<()> {
+    let comparable: Vec<&(String, u32, u64)> = candidates
+        .iter()
+        .filter(|(_, schema_version, _)| *schema_version != contracts::SCHEMA_VERSION_PRE_HEADER)
+        .collect();
+    for w in comparable.windows(2) {
+        let (name_a, _, first_a) = w[0];
+        let (name_b, _, first_b) = w[1];
+        if first_a < first_b {
+            continue;
+        }
+        if first_a == first_b && !carries_events(name_a.as_str())? {
+            // Пустой ЛЕВЫЙ сегмент — легитимное равенство (carve-out 2), не нарушение.
+            continue;
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "journal catalogue is not monotonic in first_seq: {name_a} (first_seq={first_a}) \
+                 precedes {name_b} (first_seq={first_b}) in segment-index order, but its \
+                 first_seq does not stay below it — this looks like an archived/quarantined \
+                 segment re-attached under the wrong index (TD-030). Move the misplaced \
+                 segment back to quarantine and re-verify (see \
+                 docs/ops-journal-tail-unreadable.md)."
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Guard монотонности над СПИСКОМ ПУТЕЙ (уже отсортированных по индексу) — общая точка входа
+/// для `read_all` (lib.rs) и `readable_floor`: обе тропы идут по best-effort заголовкам без
+/// требования манифеста/строгой классификации (в отличие от `segments()`, у которой заголовки
+/// уже есть из `classify_segment`, и guard встроен инлайн).
+pub(crate) fn check_monotonic_paths(dir: &Path, paths: &[PathBuf]) -> io::Result<()> {
+    let mut candidates: Vec<(String, u32, u64)> = Vec::with_capacity(paths.len());
+    for p in paths {
+        if let Some((schema_version, first_seq)) = peek_segment_identity(p) {
+            let name = p
+                .file_name()
+                .and_then(OsStr::to_str)
+                .unwrap_or("")
+                .to_string();
+            candidates.push((name, schema_version, first_seq));
+        }
+    }
+    check_first_seq_monotonic(&candidates, |name| {
+        segment_carries_any_event(&dir.join(name))
+    })
 }
 
 /// M-49 rev5 (задача 5b): размер чанка потокового терпимого скана «с начала файла».
@@ -1640,23 +1870,46 @@ const SEQ_PREFIX_CAP: usize = 10;
 /// буферизуется ни целиком, ни долей (`fs_8`: пик памяти не растёт с `len`). Держим
 /// только удержанный префикс ≤`SEQ_PREFIX_CAP` байт для декодирования `seq`.
 ///
-/// `Some(seq)` — CRC совпал И `seq` декодировался: фрейм валиден, тот же критерий, что и
-/// штатный ридер (сначала CRC, потом декод, см. milestone п.2). `None` — ЛЮБОЙ отказ (CRC
+/// `Accepted(seq)` — CRC совпал И `seq` декодировался: фрейм валиден, тот же критерий, что и
+/// штатный ридер (сначала CRC, потом декод, см. milestone п.2). `Rejected` — ЛЮБОЙ отказ (CRC
 /// не совпал, декодирование `seq` не удалось, источник кончился раньше ожидаемого) —
 /// кандидат трактуется как мусор, ресинк на 1 байт продолжается ровно как сегодня.
+/// `BudgetExhausted` (M-52, JR-I-10/TD-054) — бюджет РАБОТЫ кончился ВНУТРИ этой
+/// side-верификации: результат кандидата остаётся неопределённым, вызывающий обязан
+/// прекратить весь скан пола (частичный ответ = заниженный пол = seq-reuse), а не
+/// трактовать это как «кандидат — мусор» (та ветка продолжила бы резинк, пряча исчерпание).
+enum VerifyOutcome {
+    Accepted(u64),
+    Rejected,
+    BudgetExhausted,
+}
+
 fn verify_large_frame(
     verifier: &dyn LargeFrameVerifier,
     payload_offset: u64,
     len: usize,
-) -> Option<u64> {
-    let mut src = verifier.open_at(payload_offset)?;
+    budget: &mut WorkBudget,
+) -> VerifyOutcome {
+    let mut src = match verifier.open_at(payload_offset) {
+        Some(s) => s,
+        None => return VerifyOutcome::Rejected,
+    };
     let mut hasher = crc32fast::Hasher::new();
     let mut prefix: Vec<u8> = Vec::with_capacity(SEQ_PREFIX_CAP);
     let mut remaining = len;
     let mut chunk = [0u8; READABLE_SCAN_CHUNK];
     while remaining > 0 {
         let take = remaining.min(chunk.len());
-        src.read_exact(&mut chunk[..take]).ok()?;
+        // JR-I-10: списываем бюджет ПЕРЕД попыткой чтения — каждый кандидат обязан стоить
+        // хотя бы `take` байт независимо от того, доживёт ли источник до конца чтения
+        // (near-EOF кандидаты не должны становиться «бесплатными» просто потому что читать
+        // оказалось нечего).
+        if !budget.spend(take as u64) {
+            return VerifyOutcome::BudgetExhausted;
+        }
+        if src.read_exact(&mut chunk[..take]).is_err() {
+            return VerifyOutcome::Rejected;
+        }
         if prefix.len() < SEQ_PREFIX_CAP {
             let want = (SEQ_PREFIX_CAP - prefix.len()).min(take);
             prefix.extend_from_slice(&chunk[..want]);
@@ -1664,14 +1917,20 @@ fn verify_large_frame(
         hasher.update(&chunk[..take]);
         remaining -= take;
     }
-    let mut crc_buf = [0u8; 4];
-    src.read_exact(&mut crc_buf).ok()?;
-    if hasher.finalize() != u32::from_le_bytes(crc_buf) {
-        return None;
+    if !budget.spend(4) {
+        return VerifyOutcome::BudgetExhausted;
     }
-    postcard::take_from_bytes::<u64>(&prefix)
-        .ok()
-        .map(|(seq, _rest)| seq)
+    let mut crc_buf = [0u8; 4];
+    if src.read_exact(&mut crc_buf).is_err() {
+        return VerifyOutcome::Rejected;
+    }
+    if hasher.finalize() != u32::from_le_bytes(crc_buf) {
+        return VerifyOutcome::Rejected;
+    }
+    match postcard::take_from_bytes::<u64>(&prefix) {
+        Ok((seq, _rest)) => VerifyOutcome::Accepted(seq),
+        Err(_) => VerifyOutcome::Rejected,
+    }
 }
 
 /// Терпимый потоковый байт-ресинк-скан УЖЕ ОТКРЫТОГО источника событий (после заголовка):
@@ -1693,7 +1952,11 @@ fn verify_large_frame(
 /// `seq` входит в пол, основной скан перескакивает фрейм БЕЗ повторного чтения его тела.
 /// Провал (CRC не совпал / seq не декодировался / источник кончился раньше) → байт-ресинк
 /// `i+1`, ровно как для любого другого мусора — терпимость к порче не меняется.
-fn resync_max_seq<R: Read>(mut r: R, verifier: &dyn LargeFrameVerifier) -> Option<u64> {
+fn resync_max_seq<R: Read>(
+    mut r: R,
+    verifier: &dyn LargeFrameVerifier,
+    budget: &mut WorkBudget,
+) -> ScanOutcome {
     let mut carry: Vec<u8> = Vec::new();
     let mut max_seq: Option<u64> = None;
     let mut chunk = vec![0u8; READABLE_SCAN_CHUNK];
@@ -1706,6 +1969,11 @@ fn resync_max_seq<R: Read>(mut r: R, verifier: &dyn LargeFrameVerifier) -> Optio
         let n = r.read(&mut chunk).unwrap_or_default();
         let at_eof = n == 0;
         if n > 0 {
+            // JR-I-10 (TD-052): основной скан тоже списывает бюджет — граница работы
+            // покрывает ВЕСЬ обход, не только side-верификацию (TD-054).
+            if !budget.spend(n as u64) {
+                return ScanOutcome::BudgetExhausted;
+            }
             carry.extend_from_slice(&chunk[..n]);
             total_read += n as u64;
         }
@@ -1752,8 +2020,8 @@ fn resync_max_seq<R: Read>(mut r: R, verifier: &dyn LargeFrameVerifier) -> Optio
                 let stream_pos = total_read - carry.len() as u64;
                 let frame_start_abs = stream_pos + i as u64;
                 let payload_off = frame_start_abs + 4;
-                match verify_large_frame(verifier, payload_off, len) {
-                    Some(seq) => {
+                match verify_large_frame(verifier, payload_off, len, budget) {
+                    VerifyOutcome::Accepted(seq) => {
                         max_seq = Some(max_seq.map_or(seq, |m: u64| m.max(seq)));
                         // Догнать основной поток до конца принятого фрейма и продолжить с
                         // чистого carry — тело уже провалидировано вторым путём, повторно
@@ -1765,16 +2033,22 @@ fn resync_max_seq<R: Read>(mut r: R, verifier: &dyn LargeFrameVerifier) -> Optio
                             // файла — не должно происходить штатно; fail-closed: то, что уже
                             // накоплено (включая этот фрейм), остаётся результатом, скан
                             // останавливается, а не рискует неверной позицией.
-                            return max_seq;
+                            return ScanOutcome::Done(max_seq);
                         }
                         total_read += to_skip;
                         carry.clear();
                         i = 0;
                         continue;
                     }
-                    None => {
+                    VerifyOutcome::Rejected => {
                         i += 1;
                         continue;
+                    }
+                    VerifyOutcome::BudgetExhausted => {
+                        // JR-I-10: НЕ трактовать как «кандидат — мусор» (это продолжило бы
+                        // резинк, пряча исчерпание) и НЕ возвращать накопленный `max_seq` —
+                        // единственный допустимый исход есть прекращение всего скана.
+                        return ScanOutcome::BudgetExhausted;
                     }
                 }
             }
@@ -1801,7 +2075,7 @@ fn resync_max_seq<R: Read>(mut r: R, verifier: &dyn LargeFrameVerifier) -> Optio
             break;
         }
     }
-    max_seq
+    ScanOutcome::Done(max_seq)
 }
 
 /// M-49 rev5 (задача 5b): максимальный ЧИТАЕМЫЙ `seq` ОДНОГО сегмента — потоковый скан С
@@ -1812,7 +2086,7 @@ fn resync_max_seq<R: Read>(mut r: R, verifier: &dyn LargeFrameVerifier) -> Optio
 /// отказа `open_with`, НЕ меняется). Битый ЗАГОЛОВОК сегмента трактуется как «читаемого
 /// префикса нет» (`Ok(None)`) — без валидного заголовка формат фреймов ниже не установить
 /// достоверно.
-fn tolerant_max_seq_from_start(path: &Path) -> io::Result<Option<u64>> {
+fn tolerant_max_seq_from_start(path: &Path, budget: &mut WorkBudget) -> io::Result<ScanOutcome> {
     let is_zst = path
         .file_name()
         .and_then(OsStr::to_str)
@@ -1821,35 +2095,35 @@ fn tolerant_max_seq_from_start(path: &Path) -> io::Result<Option<u64>> {
     if is_zst {
         let f = match File::open(path) {
             Ok(f) => f,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(ScanOutcome::Done(None)),
             Err(e) => return Err(e),
         };
         if f.metadata()?.len() == 0 {
-            return Ok(None);
+            return Ok(ScanOutcome::Done(None));
         }
         let mut decoder = match zstd::Decoder::new(f) {
             Ok(d) => d,
-            Err(_) => return Ok(None), // поток не открылся — читаемого префикса нет
+            Err(_) => return Ok(ScanOutcome::Done(None)), // поток не открылся — читаемого префикса нет
         };
         if skip_v2_header_forward(&mut decoder).is_err() {
-            return Ok(None); // заголовок битый — читаемого префикса нет
+            return Ok(ScanOutcome::Done(None)); // заголовок битый — читаемого префикса нет
         }
         // JR-I-9 (M-50): side-источник для крупных кандидатов — свежий декодер,
         // переоткрытый С НАЧАЛА файла на каждую верификацию (`.zst` не Seek).
         let verifier = ZstFrameVerifier { path };
-        return Ok(resync_max_seq(decoder, &verifier));
+        return Ok(resync_max_seq(decoder, &verifier, budget));
     }
 
     let mut file = match File::open(path) {
         Ok(f) => f,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(ScanOutcome::Done(None)),
         Err(e) => return Err(e),
     };
     if file.metadata()?.len() == 0 {
-        return Ok(None);
+        return Ok(ScanOutcome::Done(None));
     }
     if read_v2_header_and_skip(&mut file).is_err() {
-        return Ok(None); // заголовок битый — читаемого префикса нет
+        return Ok(ScanOutcome::Done(None)); // заголовок битый — читаемого префикса нет
     }
     // Позиция файла — сразу после заголовка (магия+header) либо 0 (legacy, без магии):
     // `read_v2_header_and_skip` уже это гарантирует (`Ok(Some(_))` либо `Ok(None)` с откатом).
@@ -1858,7 +2132,7 @@ fn tolerant_max_seq_from_start(path: &Path) -> io::Result<Option<u64>> {
     // JR-I-9 (M-50): side-источник для крупных кандидатов — независимый файловый
     // дескриптор, позиционируемый `seek`'ом (сырой формат — Seek доступен).
     let verifier = RawFrameVerifier { path, header_end };
-    Ok(resync_max_seq(reader, &verifier))
+    Ok(resync_max_seq(reader, &verifier, budget))
 }
 
 /// Пометить декларацию применённой: переименование `journal.force-next-seq.json` →
