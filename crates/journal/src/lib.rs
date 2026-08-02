@@ -28,9 +28,9 @@ pub use segments::{
 };
 pub use segments::{
     declare_legacy, fingerprint, free_bytes, is_foreign_segment, is_storage_guard, prune_segment,
-    segments as list_segments, storage_status, stream, stream_from, verify_cold_copy,
-    ColdCopyProof, EpochFilter, EventStream, SegmentInfo, StorageStatus, WriterConfig,
-    LEGACY_MANIFEST,
+    replay_digest, segments as list_segments, storage_status, stream, stream_from,
+    verify_cold_copy, ColdCopyProof, EpochFilter, EventStream, ReplayDigest, SegmentInfo,
+    StorageStatus, WriterConfig, LEGACY_MANIFEST,
 };
 pub use segments::{
     retention_execute, retention_plan, segment_decision_ts, RetentionMode, RetentionPlan,

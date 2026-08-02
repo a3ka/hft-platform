@@ -649,6 +649,9 @@ pub(crate) fn iter_segments_sorted(dir: &Path) -> io::Result<Vec<PathBuf>> {
 /// по своим правилам): иначе воспроизводится rev 9-блокер.
 fn dedup_indexed_paths(dir: &Path) -> io::Result<Vec<PathBuf>> {
     let mut by_index: std::collections::BTreeMap<u32, PathBuf> = std::collections::BTreeMap::new();
+    // Каждая запись вставляется в BTreeMap<u32, PathBuf> по индексу сегмента (данные из
+    // имени файла), а итоговый Vec собирается из into_values() по возрастанию индекса.
+    // DET-OK: порядок fs::read_dir не протекает наружу — нормализован BTreeMap-ом выше.
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let p = entry.path();
@@ -1028,6 +1031,71 @@ pub fn stream_from(
         events_decoded: 0,
         segments_opened: 0,
         after_seq,
+    })
+}
+
+/// M-51 (DET-I-1, TD-007): дайджест реплея окна `[from_seq, to_seq]` журнала (границы
+/// ВКЛЮЧИТЕЛЬНЫ; `None` — без ограничения снизу/сверху). `state_hash` — свёртка ПОТОКА
+/// СОБЫТИЙ (не файлов на диске): для каждого события в порядке возрастания `seq` в SHA-256
+/// подаётся `u32 LE (длина postcard-payload) ‖ postcard(Event)`. Длина в префиксе несущая —
+/// без неё конкатенация неоднозначна. Компакция (`raw` ↔ `.zst`), иная нарезка на сегменты,
+/// порядок файлов каталога — не влияют (свёртка не видит байты файлов, только события).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplayDigest {
+    pub events: u64,
+    pub first_seq: Option<u64>,
+    pub last_seq: Option<u64>,
+    pub state_hash: [u8; 32],
+}
+
+/// Посчитать `ReplayDigest` окна `[from_seq, to_seq]` (включительно) — ПОТОКОВО, память не
+/// растёт с размером журнала (DET-I-1, TD-011: `read_all` на проде 27 GB/146M событий
+/// неработоспособен).
+///
+/// Нижняя граница транслируется в `stream_from`'s исключительный `after_seq` через
+/// `checked_sub(1)`, НЕ `saturating_sub`: при `from_seq == Some(0)` `saturating_sub` дал бы
+/// `Some(0)` (= «после seq 0», теряя первое событие), тогда как `checked_sub` корректно даёт
+/// `None` (= «без нижней границы», включает seq 0). Верхняя граница проверяется здесь же —
+/// первое событие `seq > to_seq` останавливает свёртку (даёт и «перевёрнутое окно»
+/// `from > to` ⇒ пусто, без специального случая).
+pub fn replay_digest(
+    dir: impl AsRef<Path>,
+    filter: EpochFilter,
+    from_seq: Option<u64>,
+    to_seq: Option<u64>,
+) -> io::Result<ReplayDigest> {
+    let dir = dir.as_ref();
+    let after = from_seq.and_then(|f| f.checked_sub(1));
+
+    let mut hasher = Sha256::new();
+    let mut events = 0u64;
+    let mut first_seq: Option<u64> = None;
+    let mut last_seq: Option<u64> = None;
+
+    for ev in stream_from(dir, filter, after)? {
+        let ev = ev?;
+        if let Some(to) = to_seq {
+            if ev.seq > to {
+                break;
+            }
+        }
+        let payload =
+            postcard::to_stdvec(&ev).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        hasher.update((payload.len() as u32).to_le_bytes());
+        hasher.update(&payload);
+
+        events += 1;
+        if first_seq.is_none() {
+            first_seq = Some(ev.seq);
+        }
+        last_seq = Some(ev.seq);
+    }
+
+    Ok(ReplayDigest {
+        events,
+        first_seq,
+        last_seq,
+        state_hash: hasher.finalize().into(),
     })
 }
 
@@ -2371,6 +2439,9 @@ fn enumerate_retention_segments(dir: &Path) -> io::Result<RetentionEnumeration> 
     // раньше выпадали из операторского отчёта СОВСЕМ: оператор не узнавал об их
     // существовании ниоткуда. Именуем их поимённо в `skipped`, той же дисциплиной, что
     // classify-отказы выше (принцип M-38b: обход/аномалия обязана быть НАЗВАНА).
+    // Здесь порядок обхода каталога не имеет значения — записи просто добавляются в
+    // foreign_skipped; наружу протекает только ПОСЛЕ сортировки по (index, path) ниже (det_25).
+    // DET-OK: итоговый порядок foreign_skipped задаётся sort_by((index, path)), не read_dir.
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
@@ -2407,7 +2478,13 @@ fn enumerate_retention_segments(dir: &Path) -> io::Result<RetentionEnumeration> 
     // Стабильная сортировка по индексу — критична для воспроизводимости плана (R6)
     // и для определения «последних N» в keep_min.
     classified.sort_by_key(|s| s.index);
-    foreign_skipped.sort_by_key(|(s, _)| s.index);
+    // DET-I-3 (det_25): группа с нераспознанным именем синтезирует ОДИНАКОВЫЙ index
+    // (u32::MAX) — сортировка ТОЛЬКО по index её не упорядочивает; стабильность
+    // sort_by_key тогда сохраняет порядок fs::read_dir (порядок ФС), то есть план
+    // недетерминирован между запусками. Вторичный ключ — путь (тотальный порядок,
+    // не зависящий от ФС) — разрешает коллизию однозначно.
+    foreign_skipped
+        .sort_by(|(a, _), (b, _)| a.index.cmp(&b.index).then_with(|| a.path.cmp(&b.path)));
     Ok((classified, foreign_skipped))
 }
 
