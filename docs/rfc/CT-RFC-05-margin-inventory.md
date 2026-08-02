@@ -98,11 +98,15 @@ epoch-tripwire 3→4 — CT-RFC-05 bump — L2Delta-эпоха историче�
   `red_rfc04`, а не отдельным сегмент-reuse-тестом для дискриминанта 7.
 - **Исчерпывающий match.** Добавление варианта enum ломает компиляцию любого `match
   &MdPayload` без wildcard (source-level breaking, не wire-level). Milestone
-  `milestones/M-35-margin-inventory.md` §Tasks 2b/2c/2d перечисляет ровно 4 места правки:
-  `crates/journal/src/segments.rs` (несёт `ts_exch_ms`), `crates/sim/src/exchange.rs`
-  (игнор — не входит в бэктест-fill), `crates/research-cli/src/bin/latency_probe.rs`
+  `milestones/M-35-margin-inventory.md` §Tasks 2b/2c/2d перечисляет **пять** мест правки
+  (task 2b называет три файла в одной задаче, не два): `crates/journal/src/segments.rs`
+  (несёт `ts_exch_ms`), `crates/sim/src/exchange.rs` (игнор — не входит в бэктест-fill),
+  `crates/journal/examples/dump.rs` (dev-дампер; вне `src/**`, но `examples/` блокирует
+  `cargo test -p journal` на E0004 без арма), `crates/research-cli/src/bin/latency_probe.rs`
   (игнор — не latency-релевантно), `crates/recorder/src/lib.rs::md_kind_label` (метка
-  `"margin_inventory"`); подтверждено коммитами `f2d1edb`/`ffedc10`/`6a2c331`/`67b6159`.
+  `"margin_inventory"`); подтверждено коммитами `f2d1edb` (task 2b: `segments.rs` +
+  `exchange.rs` + `dump.rs`, все три файла в одном коммите — `git show --stat f2d1edb`),
+  `ab6e222` (task 2c: `latency_probe.rs`) и `988afff` (task 2d: `recorder/src/lib.rs`).
   Компилируемость всего workspace — гейт `cargo build --workspace` (по milestone-тексту).
 
 ## §5. Чем закреплено
@@ -193,7 +197,9 @@ CI коммитом `b3b42d2`) при правке `crates/contracts/src/**` т�
 ## §8. Чего этот документ НЕ делает
 
 - Не проектирует и не предлагает изменений T1 — CT-RFC-05 уже реализован и задеплоен
-  (`ba61c62`, `41d3526`); это ретро-фиксация факта.
+  (тип+match-армы смёржены `ba61c62`; рабочий коллектор на проде — после спавн-фикса task 2e,
+  `1f342b8`; reviewer close-out `41d3526` подтверждает §8 GREEN и явно называет `1f342b8`
+  merge SHA); это ретро-фиксация факта.
 - Не восстанавливает никакую мотивацию, не зафиксированную в истории. Всё изложенное в §6 —
   дословная реконструкция из `milestones/M-35-margin-inventory.md` и
   `research/data-quality/margin-source-survey.md §9`; за пределами этих источников мотивация
