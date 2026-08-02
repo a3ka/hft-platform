@@ -19,7 +19,7 @@
 # Правило «сверять замером, а не переносить из прежних текстов» (testing.md) само нарушалось
 # четыре раза подряд автором правила — правило, держащееся на добросовестности, не работает.
 #
-# ПЯТЬ проверок (каждая — PASS/FAIL/INFO с причиной; INFO = не применимо/не проверяется
+# СЕМЬ проверок (каждая — PASS/FAIL/INFO с причиной; INFO = не применимо/не проверяется
 # машинно на этой редакции документа — НЕ считается ни PASS, ни FAIL):
 #   1. Каждое `[ЕСТЬ]`, стоящее в ОТДЕЛЬНОЙ ЯЧЕЙКЕ-СТОЛБЦЕ СОСТОЯНИЯ markdown-таблицы
 #      (нормативное утверждение о готовности), сопровождено пруфом, и пруф СУЩЕСТВУЕТ.
@@ -47,6 +47,58 @@
 #   5. Статусы фаз §10, помеченные как пройденные (✅/ПРИНЯТО/...), не противоречат грубо
 #      цитируемым milestone'ам (файл отсутствует ИЛИ STATUS явно открытый). Не полная
 #      автоматизация — что не проверяется машинно, помечается INFO, не выдаётся за PASS.
+#   6. Инцидент C-044 (ретро-документ docs/rfc/CT-RFC-05-*.md процитировал 3 из 4
+#      несуществующих в main SHA как «подтверждено коммитами») — машинная проверка: КАЖДЫЙ
+#      hex-токен SHA-формы в backtick'ах (7-64 символа) в docs/DESIGN.md И docs/rfc/**.md
+#      (рекурсивно) вне ``` ```-фенсов обязан (а) существовать как git-объект
+#      (`git cat-file -e <sha>^{commit}`) И (б) входить в историю HEAD (или MERGE_HEAD внутри
+#      --merge-preview) — `git merge-base --is-ancestor`. Анти-плацебо (C-044 F1, реальный
+#      случай): (а) без (б) — плацебо, орфан-коммит с заброшенной/несмёрженной ветки
+#      (`ffedc10`/`6a2c331`/`67b6159` реально существовали как git-объекты на ветке
+#      `engine/M-35-arms`, `git cat-file -e` проходил, но они не входили в ancestry
+#      `origin/main` — только `--is-ancestor` это ловит).
+#      КОНТЕКСТ НЕ ФИЛЬТРУЕТ (исправлено по R-020 B-1). Прежняя редакция смотрела токен
+#      только если в том же параграфе стояло слово из рукописного списка синонимов
+#      («коммит»/«merge»/«мёрж»/«sha»), а остальные НЕ проверяла И НЕ СЧИТАЛА. Замер на
+#      merge-цели: 20 токенов, проверялось 17, молча пропускалось 3, из них два —
+#      нормативные утверждения о коммитах («подтверждено отдельным ИСПРАВЛЕНИЕМ `b3a5a95`»,
+#      «reviewer close-out (`41d3526`)»); на документе из одних выдуманных SHA гейт печатал
+#      «проверка неприменима». Это fail-open внутри fail-closed гейта, и обходился он
+#      обычным русским синонимом. Теперь: кандидат — КАЖДЫЙ токен; список причин пропуска
+#      ЗАКРЫТ (SKIP-LEN64 — 64 символа, sha256-дайджест; SKIP-DECLARED — явный маркер, см.
+#      ниже); неизвестная форма → ПРОВЕРЯЕТСЯ. Цифровые токены проверяются наравне с
+#      остальными: правило «цифровое — не SHA» вывело бы из-под гейта `0000000`/`1111111`.
+#      Каждый непроверенный токен ПЕЧАТАЕТСЯ строкой `SKIP-<ПРИЧИНА> <файл>:<строка>`,
+#      и итог всегда несёт баланс `всего=N проверено=K пропущено=M` (K+M==N).
+#      «Проверка неприменима» допустима ТОЛЬКО при всего=0.
+#
+#      МАРКЕР not-a-commit (единственный способ объявить токен не-коммитом):
+#          <!-- not-a-commit: <token> -->
+#      HTML-комментарий в ТОМ ЖЕ .md-файле; действует на все вхождения этого токена в этом
+#      файле; регистр не важен. Применение — hex-подобные идентификаторы, которые коммитами
+#      не являются (партии данных, fixed-point константы вида `100000000`). Смысл формы:
+#      исключение живёт В ДОКУМЕНТЕ и видно в дифе, а не в молчаливом правиле скрипта.
+#   7. Пути, процитированные в docs/rfc/**.md (рекурсивно), существуют в дереве репозитория.
+#      Кандидат — КАЖДЫЙ backtick-токен, содержащий `/`, вне ``` ```-фенсов (исправлено по
+#      R-020 N-1: прежний whitelist префиксов crates|docs|scripts|research|milestones|.claude
+#      РЕШАЛ, смотреть ли токен, и молча пропускал крейт-относительные формы, которыми RFC
+#      пользуются свободно — `contracts/src/lib.rs:46`, `recorder/src/main.rs:58`,
+#      `journal/src/segments.rs`, `tests/red_schema.rs`; замер: проверялось 67, молча
+#      пропускалось 49). Резолв — три равноправные попытки: прямо от корня; крейт-
+#      относительно (`journal/src/x.rs` → `crates/journal/src/x.rs`); как суффикс
+#      существующего пути дерева (`tests/red_schema.rs`, база названа в прозе рядом).
+#      Не резолвится и ЯКОРИТСЯ в дерево (первый сегмент — существующая запись верхнего
+#      уровня ИЛИ имя крейта, либо токен называет файл распознанным расширением) → FAIL.
+#      Не резолвится и НЕ якорится → SKIP-NOTREPO (имя ветки `feat/M-08`, перечисление
+#      `Ord/Risk/Ctl`). Прочие причины пропуска: SKIP-GLOB (`*`/`?`/`{`/`}`), SKIP-URL,
+#      SKIP-ABS (эндпоинт вида `/sapi/v1/...`), SKIP-PROSE (фрагмент текста между соседними
+#      inline-code вставками — артефакт разметки, не путь). КАЖДЫЙ пропуск печатается
+#      строкой с файлом/строкой/токеном/причиной; итог несёт тот же баланс
+#      `всего=N проверено=K пропущено=M`.
+#      Проверки 3 (ссылки `DESIGN.md §N`) и 4 (мёртвые `docs/*.md`-ссылки) уже репо-/
+#      docs-шире (полный `os.walk` вне docs/archive/**, docs/plans/**) и потому УЖЕ
+#      покрывают docs/rfc/** без отдельного кода — проверено: обе проверки реально ходят по
+#      docs/rfc/*.md наравне с остальными *.md/*.rs/*.sh.
 #
 # Setup-guard: docs/DESIGN.md не найден/пуст/оглавление не парсится/грепа не может быть
 # пустым (§22-таблица найдена, но 0 строк-семейств; docs/** без единой docs/*.md ссылки) →
@@ -170,6 +222,7 @@ python3 - "${TARGET_ROOT}" <<'PYEOF'
 или 1 (FAIL). Ничего не пишет, только читает."""
 import os
 import re
+import subprocess
 import sys
 
 FAILED = 0
@@ -690,6 +743,419 @@ def check5(root, design_text):
         pass_("5-ФАЗЫ", f"{n_phase_rows} строк(и) фаз, помеченных пройденными, не противоречат цитируемым milestone'ам (грубая проверка)")
 
 
+# ---------------------------------------------------------------------------
+# CHECK 6 — цитируемые SHA (docs/DESIGN.md + docs/rfc/**.md) существуют в git-истории
+# (C-044: 3 из 4 SHA в §4 CT-RFC-05-margin-inventory.md — орфаны вне ancestry origin/main)
+# ---------------------------------------------------------------------------
+
+# R-020 B-1: НЕ контекстные слова решают, проверять ли токен. Кандидат — КАЖДЫЙ hex-токен
+# SHA-формы в backtick'ах вне фенсов. Прежний `SHA_CONTEXT_RE` (рукописный список русских
+# синонимов) удалён как ФИЛЬТР: он давал fail-open — «подтверждено отдельным ИСПРАВЛЕНИЕМ
+# `b3a5a95`» проходило мимо гейта молча, потому что автор выбрал синоним. Замер на реальном
+# корпусе (merge-цель origin/main): 20 токенов, проверялось 17, молча пропускалось 3, из них
+# два — нормативные утверждения о коммитах.
+SHA_TOKEN_RE = re.compile(r"`([0-9a-f]{7,64})`")
+
+# Единственный способ вывести токен из-под проверки ЯВНО: машинный маркер в том же файле.
+# Форма (документирована здесь и только здесь):  <!-- not-a-commit: <token> -->
+# Ставится в том же .md-файле, где стоит токен; действует на ВСЕ вхождения этого токена в
+# ЭТОМ файле. Всё, что не объявлено маркером и не попало в закрытый список причин ниже,
+# ПРОВЕРЯЕТСЯ (fail-closed): неизвестная форма → проверка, а не пропуск.
+NOT_A_COMMIT_DECL_RE = re.compile(r"<!--\s*not-a-commit:\s*([0-9a-fA-F]{7,64})\s*-->")
+
+
+def compute_paragraphs(lines):
+    """Блок-и (start,end), 1-based inclusive, строк без пустой строки внутри — markdown
+    "параграф", переживает перенос предложения на следующую физическую строку."""
+    paragraphs = []
+    start = None
+    for i, line in enumerate(lines, start=1):
+        if line.strip() == "":
+            if start is not None:
+                paragraphs.append((start, i - 1))
+                start = None
+        else:
+            if start is None:
+                start = i
+    if start is not None:
+        paragraphs.append((start, len(lines)))
+    return paragraphs
+
+
+def git_commit_exists(root, sha):
+    try:
+        r = subprocess.run(
+            ["git", "-C", root, "cat-file", "-e", f"{sha}^{{commit}}"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return r.returncode == 0
+    except OSError:
+        return False
+
+
+def canonical_refs(root):
+    """Ref-имена, ancestor которых у SHA достаточно, чтобы считать его 'реально попавшим
+    в дерево ROOT', а не просто существующим где-то в локальной object-database. Обычный
+    режим — HEAD. Внутри --merge-preview (git merge --no-commit --no-ff паузит слияние)
+    добавляется MERGE_HEAD — второй родитель незакоммиченного слияния, иначе коммиты,
+    реально входящие в merge через сторону исходного HEAD (не base-ref), дали бы ложный
+    FAIL против одного лишь base-ref."""
+    refs = ["HEAD"]
+    r = subprocess.run(
+        ["git", "-C", root, "rev-parse", "--verify", "-q", "MERGE_HEAD"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    if r.returncode == 0:
+        refs.append("MERGE_HEAD")
+    return refs
+
+
+def git_commit_is_ancestor_of_any(root, sha, refs):
+    for ref in refs:
+        r = subprocess.run(
+            ["git", "-C", root, "merge-base", "--is-ancestor", sha, ref],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        if r.returncode == 0:
+            return True
+    return False
+
+
+def rfc_md_files(root):
+    """docs/rfc/**.md — РЕКУРСИВНО (R-020 N-2: шапка обещает `**`, прежний код читал
+    только верхний уровень через os.listdir; подкаталогов сегодня нет, но расхождение
+    «документ говорит не то, что делает код» — ровно тот класс, ради которого гейт написан)."""
+    rfc_dir = os.path.join(root, "docs", "rfc")
+    out = []
+    if not os.path.isdir(rfc_dir):
+        return out
+    for dirpath, dirnames, filenames in os.walk(rfc_dir):
+        dirnames[:] = sorted(d for d in dirnames if d != ".git")
+        for fn in sorted(filenames):
+            if fn.endswith(".md"):
+                out.append(os.path.join(dirpath, fn))
+    return out
+
+
+# Закрытый список причин, по которым SHA-подобный токен допустимо НЕ проверять.
+# Всё, что сюда не попало, — проверяется (fail-closed). Каждый пропуск ПЕЧАТАЕТСЯ.
+SHA_SKIP_REASONS = {
+    "SKIP-LEN64": "длина 64 — sha256-дайджест содержимого; репозиторий на sha1, коммитом "
+                  "такой токен быть не может",
+    "SKIP-DECLARED": "документ ЯВНО объявил токен не-коммитом маркером "
+                     "<!-- not-a-commit: <token> --> в том же файле",
+}
+# ПРО ЦИФРОВЫЕ ТОКЕНЫ (R-020 N-3). Соблазнительное правило «чисто цифровой токен —
+# десятичный литерал, не проверяем» ОТВЕРГНУТО: оно выводит из-под гейта `0000000` и
+# `1111111` — канонические выдуманные SHA (ими пользуются и self-тест, и репро R-020), то
+# есть заново открывает дыру B-1. Замер на merge-цели origin/main: чисто цифровой токен в
+# docs/DESIGN.md+docs/rfc/ РОВНО ОДИН (`0999929`) и это НАСТОЯЩИЙ коммит; ни одной
+# fixed-point константы в backtick'ах нет. Ambiguity «литерал или SHA» разрешается В ПОЛЬЗУ
+# ПРОВЕРКИ; ложный FAIL на будущую константу снимается тем же явным маркером
+# <!-- not-a-commit: 100000000 -->, что и любой другой не-коммит — то есть ФАЙЛОМ, который
+# видно в дифе, а не молчаливым правилом.
+
+
+def classify_sha_token(tok, declared):
+    """Причина пропуска (ключ SHA_SKIP_REASONS) либо None → токен ПРОВЕРЯЕТСЯ.
+    Список ЗАКРЫТ: неизвестная форма → проверка, а не пропуск (fail-closed)."""
+    if tok.lower() in declared:
+        return "SKIP-DECLARED"
+    if len(tok) == 64:
+        return "SKIP-LEN64"
+    return None
+
+
+def gather_sha_tokens(root, path):
+    """[(relpath, lineno, sha, skip_reason|None), ...] — КАЖДЫЙ hex-токен SHA-формы в
+    backtick'ах вне ``` ```-фенсов. Контекстные слова больше не фильтруют (B-1)."""
+    try:
+        text = read(path)
+    except OSError:
+        return []
+    relpath = os.path.relpath(path, root)
+    lines = text.splitlines()
+    fence_lines = compute_fence_lines(lines)
+    declared = {m.group(1).lower() for m in NOT_A_COMMIT_DECL_RE.finditer(text)}
+
+    out = []
+    for i, line in enumerate(lines, start=1):
+        if i in fence_lines:
+            continue
+        for m in SHA_TOKEN_RE.finditer(line):
+            tok = m.group(1)
+            out.append((relpath, i, tok, classify_sha_token(tok, declared)))
+    return out
+
+
+def check6(root):
+    targets = []
+    design_path = os.path.join(root, "docs", "DESIGN.md")
+    if os.path.isfile(design_path):
+        targets.append(design_path)
+    targets.extend(rfc_md_files(root))
+
+    all_tokens = []
+    for path in targets:
+        all_tokens.extend(gather_sha_tokens(root, path))
+
+    total = len(all_tokens)
+    skipped = [t for t in all_tokens if t[3] is not None]
+    all_refs = [t for t in all_tokens if t[3] is None]
+
+    # Остаток печатается ПЕРВЫМ и построчно: файл, строка, токен, причина. Проверка обязана
+    # ЗНАТЬ и СООБЩАТЬ, чего она не проверила (тот же принцип setup-guard, урок M-40).
+    for relpath, lineno, tok, reason in skipped:
+        info("6-RFC-SHA", f"{reason} {relpath}:{lineno} `{tok}` — {SHA_SKIP_REASONS[reason]}")
+
+    if total == 0:
+        # Единственный случай, когда «неприменима» допустимо: SHA-подобных токенов НОЛЬ.
+        info(
+            "6-RFC-SHA",
+            "SHA-подобных токенов в docs/DESIGN.md и docs/rfc/**.md: всего=0 проверено=0 "
+            "пропущено=0 — проверять нечего, проверка неприменима",
+        )
+        return
+
+    balance = (
+        f"SHA-подобных токенов (docs/DESIGN.md + docs/rfc/**.md): всего={total} "
+        f"проверено={len(all_refs)} пропущено={len(skipped)}"
+    )
+
+    try:
+        r = subprocess.run(
+            ["git", "-C", root, "rev-parse", "--is-inside-work-tree"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        git_ok = r.returncode == 0 and r.stdout.strip() == b"true"
+    except OSError:
+        git_ok = False
+
+    if not git_ok:
+        fail(
+            "6-RFC-SHA",
+            f"{balance}; но '{root}' не git-репозиторий (или git недоступен) — "
+            f"существование SHA проверить нельзя (setup-guard)",
+        )
+        return
+
+    refs = canonical_refs(root)
+    n_bad = 0
+    for relpath, lineno, sha, _reason in all_refs:
+        # Анти-плацебо (C-044 F1): `git cat-file -e` ОДНОЙ проверкой не ловит орфан-SHA —
+        # объект может реально существовать (коммит с заброшенной/несмёрженной ветки,
+        # напр. `engine/M-35-arms` — ffedc10/6a2c331/67b6159 в реальном инциденте), просто
+        # не входить в историю HEAD. Существование — необходимо, НЕ достаточно; ancestry —
+        # решающая проверка.
+        if not git_commit_exists(root, sha):
+            n_bad += 1
+            fail(
+                "6-RFC-SHA",
+                f"{relpath}:{lineno}: цитируется коммит `{sha}` — не найден в "
+                f"git-объектах репозитория вовсе (`git cat-file -e {sha}^{{commit}}` провалился)",
+            )
+            continue
+        if not git_commit_is_ancestor_of_any(root, sha, refs):
+            n_bad += 1
+            fail(
+                "6-RFC-SHA",
+                f"{relpath}:{lineno}: цитируется коммит `{sha}` — существует как "
+                f"git-объект, но НЕ входит в историю {'/'.join(refs)} (орфан/несмёрженная "
+                f"ветка — `git merge-base --is-ancestor {sha} {refs[0]}` провалился)",
+            )
+
+    # Баланс печатается ВСЕГДА — и на PASS, и на FAIL: «все N проверены» без знаменателя
+    # цитировалось бы в close-out'ах как «все SHA документа проверены» (R-020 B-1, п.3).
+    if n_bad == 0:
+        pass_(
+            "6-RFC-SHA",
+            f"{balance} — все {len(all_refs)} проверенных существуют И входят в историю "
+            f"{'/'.join(refs)}",
+        )
+    else:
+        info("6-RFC-SHA", f"{balance} — из них {n_bad} нарушений (перечислены выше)")
+
+
+# ---------------------------------------------------------------------------
+# CHECK 7 — пути, процитированные в docs/rfc/**.md, существуют в дереве репозитория
+# (C-044 F2: список мест правки занижен, но опечатка/несуществующий путь — тот же класс лжи)
+# ---------------------------------------------------------------------------
+
+# R-020 N-1: тот же принцип, что и в check6 — whitelist префиксов
+# (crates|docs|scripts|research|milestones|.claude) РЕШАЛ, смотреть ли токен, и потому молча
+# пропускал крейт-относительные формы, которыми реальные RFC пользуются свободно
+# (`contracts/src/lib.rs:46`, `recorder/src/main.rs:58`, `journal/src/segments.rs`,
+# `tests/red_schema.rs`). Замер reviewer'а: проверялось 67 путей, молча пропускалось 49.
+# Теперь КАНДИДАТ — каждый backtick-токен, содержащий `/`, вне фенсов; непроверенный обязан
+# быть перечислен с ПОИМЕНОВАННОЙ причиной из закрытого списка ниже.
+RFC_PATH_TOKEN_RE = re.compile(r"`([^`\n]*/[^`\n]*)`")
+
+PATH_SKIP_REASONS = {
+    "SKIP-GLOB": "glob/brace-паттерн (`*`/`?`/`{`/`}`) — не литеральный путь",
+    "SKIP-URL": "URL — ресурс вне дерева репозитория",
+    "SKIP-ABS": "абсолютный путь/эндпоинт API (начинается с `/`) — не путь в дереве репозитория",
+    "SKIP-PROSE": "фрагмент прозы между соседними inline-code вставками (пробелы/скобки/"
+                  "кириллица вокруг слэша), а не путь",
+    "SKIP-NOTREPO": "не резолвится в дереве и ничем не якорится в него (первый сегмент — не "
+                    "каталог репозитория и не имя крейта, расширения файла нет): имя ветки, "
+                    "перечисление типов через `/` и т.п.",
+}
+PATH_PROSE_CHARS = set(" \t()[]<>«»→…;,")
+# НЕ заякорен на конец строки ($) — намеренно: реальный документ кладёт внутрь ОДНОЙ пары
+# backtick'ов путь + произвольный "хвост" разных форм (`path.rs:301-315` — диапазон строк,
+# `path.rs::func_name` — Rust-путь, `path.md §9` — секция того же документа через ПРОБЕЛ).
+# Правило простое и надёжное: как только встретилась распознанная РАСШИРЕНИЕМ граница файла
+# (первая `.rs`/`.md`/`.sh`/`.toml`/`.json`/`.yml`/`.yaml` слева направо), путь на этом
+# заканчивается — всё после неё, ЛЮБОЙ формы, отбрасывается без попытки его разобрать.
+RFC_PATH_EXT_RE = re.compile(r"^(.*?\.(?:rs|md|sh|toml|json|yml|yaml))")
+RFC_PATH_LINEREF_TAIL_RE = re.compile(r":\d+(?:-\d+)?$")
+
+
+def clean_rfc_path_token(raw):
+    """`crates/x/y.rs:301-315` → `crates/x/y.rs`; `crates/x/y.rs::func` → `crates/x/y.rs`;
+    `docs/x.md §9` → `docs/x.md`; путь без расширения (`crates/ops`, `research/data/`) —
+    как есть, за вычетом висящего `:NNN` и пунктуации."""
+    m = RFC_PATH_EXT_RE.match(raw)
+    if m:
+        return m.group(1).rstrip(".,;:)")
+    token = RFC_PATH_LINEREF_TAIL_RE.sub("", raw)
+    return token.rstrip(".,;:)")
+
+
+def build_path_suffix_index(root):
+    """Множество ВСЕХ хвостовых суффиксов путей дерева (файлов и каталогов), нормализованных
+    через `/`. Нужно, чтобы честно резолвить формы, база которых названа в прозе рядом, а не
+    внутри backtick'ов: `tests/red_schema.rs` → crates/contracts/tests/red_schema.rs,
+    `fixtures/invalid/x.json` → crates/contracts/fixtures/invalid/x.json. Это РАСШИРЯЕТ
+    множество резолвимого (fail-closed сохраняется: то, что не резолвится нигде и якорится
+    в дерево, — FAIL)."""
+    index = set()
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in (".git", "target", "node_modules")]
+        rel_dir = os.path.relpath(dirpath, root)
+        base = "" if rel_dir == "." else rel_dir.replace(os.sep, "/")
+        entries = list(dirnames) + list(filenames)
+        for name in entries:
+            rel = f"{base}/{name}" if base else name
+            parts = rel.split("/")
+            for i in range(len(parts)):
+                index.add("/".join(parts[i:]))
+    return index
+
+
+def resolve_rfc_path(root, token, suffix_index):
+    """(resolved: bool, как_именно: str). Три равноправные попытки — прямая, крейт-
+    относительная (`journal/src/x.rs` → `crates/journal/src/x.rs`) и суффиксная."""
+    if os.path.exists(os.path.join(root, token)):
+        return True, "прямо от корня репозитория"
+    if os.path.exists(os.path.join(root, "crates", token)):
+        return True, "крейт-относительно (crates/<name>/...)"
+    if token in suffix_index:
+        return True, "как суффикс существующего пути дерева"
+    return False, ""
+
+
+def path_token_is_anchored(root, token):
+    """Токен ЗАЯВЛЯЕТ путь в дереве репозитория (и потому его отсутствие — ложь документа),
+    если хотя бы одно: первый сегмент — существующая запись верхнего уровня; первый сегмент —
+    имя существующего крейта; токен называет файл распознанным расширением."""
+    first = token.split("/")[0]
+    if first and os.path.exists(os.path.join(root, first)):
+        return True
+    if first and os.path.isdir(os.path.join(root, "crates", first)):
+        return True
+    return bool(re.search(r"\.(?:rs|md|sh|toml|json|yml|yaml)$", token))
+
+
+def classify_rfc_path_token(root, raw, suffix_index):
+    """(skip_reason|None, token, how). skip_reason=None → токен ПРОВЕРЕН (резолвится) либо
+    ЯКОРЕН и обязан дать FAIL (how == "")."""
+    token = clean_rfc_path_token(raw).rstrip("/")
+    if not token or "/" not in raw:
+        return "SKIP-PROSE", raw, ""
+    low = token.lower()
+    if low.startswith("http://") or low.startswith("https://"):
+        return "SKIP-URL", token, ""
+    if token.startswith("/"):
+        return "SKIP-ABS", token, ""
+    if any(ch in token for ch in "*?{}"):
+        return "SKIP-GLOB", token, ""
+    if any(ch in PATH_PROSE_CHARS for ch in token) or any(ord(ch) > 127 for ch in token):
+        return "SKIP-PROSE", token, ""
+    resolved, how = resolve_rfc_path(root, token, suffix_index)
+    if resolved:
+        return None, token, how
+    if path_token_is_anchored(root, token):
+        return None, token, ""   # якорен и не резолвится → нарушение (FAIL у вызывающего)
+    return "SKIP-NOTREPO", token, ""
+
+
+def check7(root):
+    rfc_files = rfc_md_files(root)
+    if not os.path.isdir(os.path.join(root, "docs", "rfc")):
+        info("7-RFC-PATH", "docs/rfc/ отсутствует — проверка неприменима")
+        return
+
+    suffix_index = build_path_suffix_index(root)
+    total = n_checked = n_skipped = n_bad = 0
+    skips = []
+    bads = []
+    for path in rfc_files:
+        relpath = os.path.relpath(path, root)
+        try:
+            text = read(path)
+        except OSError:
+            continue
+        lines = text.splitlines()
+        fence_lines = compute_fence_lines(lines)
+        for i, line in enumerate(lines, start=1):
+            if i in fence_lines:
+                continue
+            for m in RFC_PATH_TOKEN_RE.finditer(line):
+                raw = m.group(1)
+                total += 1
+                reason, token, how = classify_rfc_path_token(root, raw, suffix_index)
+                if reason is not None:
+                    n_skipped += 1
+                    skips.append((reason, relpath, i, token))
+                    continue
+                n_checked += 1
+                if not how:
+                    n_bad += 1
+                    bads.append((relpath, i, token))
+
+    # Остаток — построчно, с ПОИМЕНОВАННОЙ причиной; молчаливых пропусков не бывает.
+    for reason, relpath, i, token in skips:
+        info("7-RFC-PATH", f"{reason} {relpath}:{i} `{token}` — {PATH_SKIP_REASONS[reason]}")
+    for relpath, i, token in bads:
+        fail(
+            "7-RFC-PATH",
+            f"{relpath}:{i}: путь `{token}` — не существует в дереве репозитория "
+            f"(не найден ни прямо, ни как crates/{token}, ни суффиксом существующего пути)",
+        )
+
+    if total == 0:
+        info(
+            "7-RFC-PATH",
+            "путей-кандидатов (токены со слэшем в backtick'ах) в docs/rfc/**.md: всего=0 "
+            "проверено=0 пропущено=0 — проверять нечего, проверка неприменима",
+        )
+        return
+
+    balance = (
+        f"путей-кандидатов (токены со слэшем в backtick'ах, docs/rfc/**.md): всего={total} "
+        f"проверено={n_checked} пропущено={n_skipped}"
+    )
+    if n_bad == 0:
+        pass_("7-RFC-PATH", f"{balance} — все {n_checked} проверенных существуют в дереве репозитория")
+    else:
+        info("7-RFC-PATH", f"{balance} — из них {n_bad} нарушений (перечислены выше)")
+
+
 def main():
     root = sys.argv[1]
     design_path = os.path.join(root, "docs", "DESIGN.md")
@@ -709,6 +1175,8 @@ def main():
     check3(root, design_text)
     check4(root)
     check5(root, design_text)
+    check6(root)
+    check7(root)
 
     verdict = "PASS" if FAILED == 0 else "FAIL"
     print(f"\nVERDICT: {verdict} ({FAILED} нарушений)")
