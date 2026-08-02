@@ -304,8 +304,65 @@ $ git status --porcelain
 (пусто, кроме этого вердикта до коммита)
 ```
 
-## Merge
+## Merge — ВЫПОЛНЕН
 
-Выполняется этим вердиктом: `git merge --no-ff` ветки в `main` + обновление
-`PROJECT-STATE.md`/`TECH-DEBT.md` + post-merge деплой-гейт (`gates.md` §8). Пруф CI/деплоя и
-ssh-проверки прода — дописан ниже после merge.
+```
+$ git merge --no-ff 854746c   (в worktree /tmp/hft-rev-main-r021 от origin/main@db219d6)
+ 6 files changed, 1898 insertions(+)
+$ git push origin HEAD:main
+   db219d6..0e72aec  HEAD -> main
+```
+
+- `c019ba9` — merge-коммит (`--no-ff`), 6 файлов, только добавления.
+- `0e72aec` — `PROJECT-STATE.md` + `TECH-DEBT.md`: TD-069 **CLOSED**, заведены **TD-071**
+  (ложное обвинение замера в `NEXT-SESSION-PROMPT.md:149`) и **TD-072** (у оракула `DET-I-1`
+  нет фикстур с `L2Delta`).
+- Push-scope перед push: `git log origin/main..HEAD` — 14 коммитов, все из цепочки этого
+  milestone'а (architect: RFC §0-§9 + 2 merge-якоря + фикс F3-F6; critic: `C-045`; reviewer:
+  `R-019`, `R-021`, обновление state). Чужих коммитов нет.
+- Гейт после merge, на итоговом дереве `main`: `verify_design_claims.sh` → `VERDICT: PASS
+  (0 нарушений)`, exit=0 (26 SHA / 104 пути).
+- **STATUS документа НЕ тронут** — остаётся `PROPOSED` (см. N1).
+
+## §8 post-merge деплой-гейт — GREEN
+
+```
+$ gh run watch 30748906304 --exit-status; echo exit=$?
+  ✓ Complete job
+exit=0
+
+$ gh run list --limit 4 --branch main
+completed  success  docs(reviewer): CT-RFC-06 приземлён (R-021 APPROVED) — TD-069 CLOSED;…  CI  main  push  30748906304  5m58s
+
+$ gh run list --workflow deploy.yml --limit 1
+completed  success  docs(reviewer): M-51 merged — TD-007 CLOSED …  Deploy to VPS  main  push  30742936236
+```
+
+Deploy на мой push **не триггерился** — дифф docs/research-only, `deploy.yml` фильтрует пути;
+прод остаётся на `32a44f4` (M-51). Это ожидаемо и совпадает с прецедентом `R-018`. Eyes-on
+всё равно выполнен — §8 требует глаз, а не только зелёного workflow (гейт ловит и чужой
+соседний merge):
+
+```
+$ ssh ... 'docker ps --format "{{.Names}} {{.Status}}"; cat .../recorder.heartbeat'
+hft-gateway-serve Up 3 hours (healthy)
+hft-recorder      Up 3 hours (healthy)
+{"events":686460,"free_bytes":85308907520,"min_free_bytes":10737418240,
+ "next_seq":149226200,"segment_index":158,"ts_wall_ms":1785675455573,"writable":true}
+(wall на VPS в тот же момент: 1785675458750 → heartbeat свежий, Δ≈3.2 с)
+$ cd /root/hft-platform && git log --oneline -1
+32a44f4 docs(reviewer): M-51 merged — TD-007 CLOSED ...
+
+# второй замер через ~350 с — журнал РАСТЁТ, не только «контейнер жив»:
+{"events":706605,"free_bytes":85283979264,"next_seq":149246380,"segment_index":158,
+ "ts_wall_ms":1785675805573,"writable":true}
+Δnext_seq = +20 180, Δevents = +20 145 (расхождение 35 — неатомарное чтение двух счётчиков
+heartbeat, не пропуск), segment_index не прыгнул (158), writable=true, свободно 85 GB.
+```
+
+Прод здоров, запись идёт, тихой деградации не видно.
+
+## Handoff
+
+Следующий шаг — **founder**: ратификация CT-RFC-06 (§9 п.1-4), включая решение по
+самозаявленному risk-critic (N1). Долги TD-071/TD-072 — в зону architect'а.
