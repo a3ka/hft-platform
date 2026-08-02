@@ -10,7 +10,7 @@
 //!
 //! Реализация — engine-dev (M-04 task 2).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use book::OrderBook;
 use contracts::{Event, EventKind, MdPayload, Venue};
@@ -48,7 +48,11 @@ pub struct BacktestExchange {
     books: HashMap<(Venue, String), OrderBook>,
     pending: Vec<PendingOrder>,
     pending_cancels: Vec<PendingCancel>,
-    active: HashMap<u64, SimOrder>,
+    /// M-51 (DET-I-3, TD-007 §3.1): `BTreeMap`, НЕ `HashMap` — исполнения одного
+    /// traded-тика (`on_event` ниже) обязаны идти по возрастанию `order_id`, тотального
+    /// порядка постановки. `HashMap::iter_mut()` брало порядок из хэш-сида процесса:
+    /// реплей одного журнала дважды давал РАЗНЫЙ ответ на «какой ордер исполнился первым».
+    active: BTreeMap<u64, SimOrder>,
     next_id: u64,
     /// Часы последнего обработанного события (None до первого on_event → submit=NoMarketData).
     last_seq: Option<u64>,
@@ -66,7 +70,7 @@ impl BacktestExchange {
             books: HashMap::new(),
             pending: Vec::new(),
             pending_cancels: Vec::new(),
-            active: HashMap::new(),
+            active: BTreeMap::new(),
             next_id: 1,
             last_seq: None,
             last_ts_mono_ns: 0,
