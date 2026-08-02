@@ -271,3 +271,173 @@ fn o7_malformed_depth_payload_is_fail_closed() {
         );
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────────────────
+// O-8 — РЕШАЮЩИЙ оракул: поведение РЕАЛЬНОЙ точки входа, а не структура кода (C-049).
+//
+// Два круга критика подряд отвергли структурные проверки, и по одной причине: гейт,
+// проверяющий ФОРМУ кода, обходится сдвигом хардкода на уровень выше. C-049 §1.2 (A)
+// показал это в одну строку — `if symbol == "BTCUSDT" { … }` ПЕРЕД вызовом
+// `l2delta_emission_for`: вызовов `l2delta_event` по-прежнему один, slice-литерала нет,
+// весь verify зелёный, а раскатка после founder-подписи молча не работает никогда.
+//
+// Поэтому предмет проверки — ЭФФЕКТЫ реальной точки входа. `FuturesSession::on_ws_text` — sync,
+// без сети и каналов (док-комментарий машины: «только накапливает состояние и возвращает
+// Vec<SessionEffect>»), поэтому её можно звать прямо из оракула сырым wire-текстом.
+// Любое хардкод-условие по символу НА ЛЮБОМ УРОВНЕ внутри обработки проявится здесь как
+// отсутствие ожидаемого `Emit` — обходить нечего, проверяется поведение.
+//
+// Контракт: `FuturesSession` конфигурируется allow-list'ом L2Delta ЯВНЫМ параметром (рядом с
+// существующим `symbol_set`), и `on_ws_text` решает об эмиссии `L2Delta` только по нему.
+// ─────────────────────────────────────────────────────────────────────────────────────────
+
+/// Сырой текст fstream-сообщения — ровно та форма, что приходит по WS в прод.
+fn ws_depth_text(sym_lower: &str) -> String {
+    format!(
+        r#"{{"stream":"{sym_lower}@depth@100ms","data":{{"e":"depthUpdate","E":1752000000499,"T":1752000000490,"s":"{}","pu":100,"U":101,"u":103,"b":[["65000.5","0.3"],["65000.4","0"]],"a":[]}}}}"#,
+        sym_lower.to_uppercase()
+    )
+}
+
+/// Сколько `Emit`-эффектов с payload `L2Delta` по данному символу.
+fn count_l2delta_emits(effects: &[venue_binance_futures::SessionEffect], symbol: &str) -> usize {
+    use contracts::MdPayload;
+    use venue_binance_futures::SessionEffect;
+    effects
+        .iter()
+        .filter(|e| match e {
+            SessionEffect::Emit(md) => {
+                md.symbol == symbol && matches!(md.payload, MdPayload::L2Delta { .. })
+            }
+            _ => false,
+        })
+        .count()
+}
+
+#[test]
+fn o8_allowed_symbol_emits_l2delta_from_real_entry_point() {
+    // ETHUSDT разрешён allow-list'ом ⇒ реальная обработка сообщения обязана дать Emit(L2Delta).
+    // Обход (A) из C-049 (внешний `if symbol == "BTCUSDT"`) даёт здесь НОЛЬ эмиссий и падает.
+    let mut s = venue_binance_futures::FuturesSession::new_with_l2delta(
+        &["ETHUSDT".to_string()],
+        &["ETHUSDT".to_string()],
+    );
+    let effects = s.on_ws_text(&ws_depth_text("ethusdt"));
+    assert_eq!(
+        count_l2delta_emits(&effects, "ETHUSDT"),
+        1,
+        "символ разрешён allow-list'ом ⇒ РЕАЛЬНАЯ точка входа обязана дать ровно один \
+         Emit(L2Delta). Ноль здесь означает хардкод-условие по символу где-то на пути \
+         эмиссии — раскатка после founder-подписи не заработает (C-049 §1.2)"
+    );
+}
+
+#[test]
+fn o8_disallowed_symbol_emits_nothing_from_real_entry_point() {
+    // Подписка на символ есть (он в symbol_set), но в L2Delta-allow-list его НЕТ:
+    // книга ведётся, дельты в журнал не пишутся. Реализация «эмитить всем подписанным»
+    // падает здесь.
+    let mut s = venue_binance_futures::FuturesSession::new_with_l2delta(
+        &["ETHUSDT".to_string()],
+        &["BTCUSDT".to_string()],
+    );
+    let effects = s.on_ws_text(&ws_depth_text("ethusdt"));
+    assert_eq!(
+        count_l2delta_emits(&effects, "ETHUSDT"),
+        0,
+        "символ НЕ в L2Delta-allow-list ⇒ дельта не имеет права попасть в журнал, \
+         даже если символ подписан для книги"
+    );
+}
+
+#[test]
+fn o8_default_allowlist_emits_btc_and_only_btc() {
+    // Прод-инвариант merge'а, проверенный на реальной точке входа: без конфигурации
+    // пишется BTC и только BTC.
+    let subs = vec!["BTCUSDT".to_string(), "ETHUSDT".to_string()];
+    let dflt = parse_capture_symbols(None);
+    let mut s = venue_binance_futures::FuturesSession::new_with_l2delta(&subs, &dflt);
+
+    let btc = s.on_ws_text(&ws_depth_text("btcusdt"));
+    assert_eq!(
+        count_l2delta_emits(&btc, "BTCUSDT"),
+        1,
+        "дефолт обязан продолжать писать BTC — иначе merge ТЕРЯЕТ данные, которые прод \
+         пишет с 2026-07-21 (forward-only, невосстановимо)"
+    );
+
+    let eth = s.on_ws_text(&ws_depth_text("ethusdt"));
+    assert_eq!(
+        count_l2delta_emits(&eth, "ETHUSDT"),
+        0,
+        "дефолт не имеет права расширять состав эмиссии — это раскатка без решения \
+         founder'а (Граница C)"
+    );
+}
+
+#[test]
+fn o8_lowercase_config_works_through_real_entry_point() {
+    // Регистр — сквозь всю реальную обработку, а не только через чистый разбор.
+    let mut s = venue_binance_futures::FuturesSession::new_with_l2delta(
+        &["ETHUSDT".to_string()],
+        &parse_capture_symbols(Some("ethusdt")),
+    );
+    let effects = s.on_ws_text(&ws_depth_text("ethusdt"));
+    assert_eq!(
+        count_l2delta_emits(&effects, "ETHUSDT"),
+        1,
+        "конфигурация в нижнем регистре обязана работать на реальном пути — иначе \
+         операторская опечатка молча выключает запись"
+    );
+}
+
+#[test]
+fn o8_multiple_allowed_symbols_all_emit() {
+    // Множественность на реальной точке входа: реализация, учитывающая только первый
+    // элемент allow-list'а, падает здесь.
+    let syms = parse_capture_symbols(Some("ETHUSDT,SOLUSDT"));
+    let subs = vec!["ETHUSDT".to_string(), "SOLUSDT".to_string()];
+    let mut s = venue_binance_futures::FuturesSession::new_with_l2delta(&subs, &syms);
+
+    let e1 = s.on_ws_text(&ws_depth_text("ethusdt"));
+    let e2 = s.on_ws_text(&ws_depth_text("solusdt"));
+    assert_eq!(count_l2delta_emits(&e1, "ETHUSDT"), 1, "ETHUSDT обязан эмитить");
+    assert_eq!(count_l2delta_emits(&e2, "SOLUSDT"), 1, "SOLUSDT обязан эмитить");
+}
+
+#[test]
+fn o8_emitted_payload_is_intact_through_real_entry_point() {
+    // Allow-list решает «эмитить ли», а не «что эмитить»: перп-континуити `pu` обязан
+    // доехать целым сквозь реальную обработку (TD-014).
+    use contracts::MdPayload;
+    use venue_binance_futures::SessionEffect;
+
+    let mut s = venue_binance_futures::FuturesSession::new_with_l2delta(
+        &["ETHUSDT".to_string()],
+        &["ETHUSDT".to_string()],
+    );
+    let effects = s.on_ws_text(&ws_depth_text("ethusdt"));
+    let md = effects
+        .iter()
+        .find_map(|e| match e {
+            SessionEffect::Emit(md) if matches!(md.payload, MdPayload::L2Delta { .. }) => Some(md),
+            _ => None,
+        })
+        .expect("разрешённый символ обязан дать Emit(L2Delta)");
+
+    let MdPayload::L2Delta {
+        prev_final_update_id,
+        first_update_id,
+        final_update_id,
+        bids,
+        asks,
+        ..
+    } = &md.payload
+    else {
+        unreachable!("отфильтровано выше");
+    };
+    assert_eq!(*prev_final_update_id, Some(100), "`pu` сохранён (TD-014)");
+    assert_eq!((*first_update_id, *final_update_id), (101, 103), "U/u сохранены");
+    assert_eq!(bids.len(), 2, "оба бид-уровня, включая size==0 remove");
+    assert!(asks.is_empty(), "пустая сторона остаётся пустой");
+}

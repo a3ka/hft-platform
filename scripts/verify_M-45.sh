@@ -125,6 +125,22 @@ else
   pass "T5 хардкод-списка тикеров в venue-src нет"
 fi
 
+echo "--- T5b: РЕШАЮЩАЯ проверка — поведение реальной точки входа (O-8, C-049) ---"
+# Структурные грепы T5 обходятся сдвигом хардкода на уровень выше (C-049 §1.2). Здесь
+# проверяется ПОВЕДЕНИЕ: Session::on_ws_text скармливается сырой wire-текст, проверяется
+# состав Vec<SessionEffect>. Любое хардкод-условие по символу на любом уровне внутри
+# обработки проявится как отсутствие ожидаемого Emit.
+for crate in venue-binance venue-binance-futures; do
+  if cargo test -p "$crate" --test red_l2delta_allowlist o8_ >/tmp/m45-o8-$crate.log 2>&1 \
+     && grep -qE "^test result: ok\. [1-9]" /tmp/m45-o8-$crate.log; then
+    n=$(grep -cE "^test .* \.\.\. ok" /tmp/m45-o8-$crate.log)
+    pass "T5b $crate: O-8 GREEN ($n тестов через реальную точку входа)"
+  else
+    fail "T5b $crate: O-8 КРАСНЫЙ — allow-list не управляет эмиссией на реальном пути"
+    tail -25 /tmp/m45-o8-$crate.log
+  fi
+done
+
 echo "--- T6: сырой L2Delta-транслятор не задет (T1-форма и семантика pu/U/u) ---"
 for crate in venue-binance venue-binance-futures; do
   if cargo test -p "$crate" --test red_l2delta_capture >/tmp/m45-capture-$crate.log 2>&1 \
