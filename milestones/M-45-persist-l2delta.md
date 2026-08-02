@@ -94,17 +94,60 @@ founder'а». Значит правка константы = совершени�
 
 ## 3. §Tasks
 
-| # | Задача | Зона | Оракул |
-|---|---|---|---|
-| 1 | Разбор `L2DELTA_CAPTURE_SYMBOLS` из env с дефолтом `["BTCUSDT"]` + нормализация регистра — `venue-binance` | venue-dev | O-1, O-3, O-4 |
-| 2 | То же для `venue-binance-futures` (семантика `pu` не трогается) | venue-dev | O-1, O-3, O-4 |
-| 3 | Негативный путь: символ вне списка НЕ эмитит `L2Delta` и остаётся на `L2Snapshot` | venue-dev | O-2 |
-| 4 | Фикстура `L2Delta` в оракул `DET-I-1` (`crates/journal/tests/red_det_replay_digest.rs`) — закрытие R-019 F6 | **architect** (sacred) | O-5 |
-| 5 | `scripts/verify_M-45.sh` — гейт, включая проверку записи эпохи в `docs/data-epochs.md` | **architect** (sacred) | — |
-| 6 | Запись эпохи в `docs/data-epochs.md` + деплой-чеклист (шаг «выставить `EPOCH_ID`») | architect | — |
+| # | Задача | Зона | Статус | Оракул / гейт |
+|---|---|---|---|---|
+| 1 | `parse_capture_symbols` + `should_capture_l2delta` в `venue-binance` (дефолт `["BTCUSDT"]`, нормализация регистра) | venue-dev | ⏳ OPEN | T3, T4 |
+| 2 | То же в `venue-binance-futures`; семантика `pu` НЕ трогается | venue-dev | ⏳ OPEN | T3, T4, T6 |
+| 3 | Emit-путь обоих крейтов зовёт `should_capture_l2delta` вместо `const … .contains()`; хардкод-`const` со списком удалён | venue-dev | ⏳ OPEN | T5 |
+| 4 | Фикстура `L2Delta` в оракул `DET-I-1` — закрытие R-019 F6 / TD-072 | **architect** (sacred) | ✅ DONE (`det_9`) | T8 |
+| 5 | `scripts/verify_M-45.sh` | **architect** (sacred) | ✅ DONE | — |
+| 6 | Запись эпохи в `docs/data-epochs.md` — ТОЛЬКО при раскатке (Граница C), не при merge | architect | ⛔ ждёт подписи | T9 |
 
-Задачи 4 и 5 — architect-only (`*/tests/**` и `scripts/verify_*.sh` — sacred,
-`.claude/rules/scope-guard.md`). Задачи 1–3 — venue-dev, **строго по RED-оракулам**, тесты не правит.
+Задачи 4–6 — architect-only (`*/tests/**` и `scripts/verify_*.sh` — sacred,
+`.claude/rules/scope-guard.md`). Задачи 1–3 — venue-dev, **строго по RED-оракулам**; тесты и
+verify-скрипт dev НЕ правит (странный тест → `!!! SCOPE VIOLATION REQUEST !!!`).
+
+### API-контракт (задачи 1–2) — форма зафиксирована оракулом, не свободна
+
+```rust
+/// Разбор allow-list из СЫРОЙ строки конфигурации. ЧИСТАЯ функция.
+pub fn parse_capture_symbols(raw: Option<&str>) -> Vec<String>;
+
+/// Решение об эмиссии: wire-символ против разобранного списка.
+pub fn should_capture_l2delta(symbols: &[String], symbol: &str) -> bool;
+```
+
+**Разбор обязан быть чистой функцией, а чтение `env` — тонкой обёрткой над ним.** Причина не
+стилистическая: `env` — глобальное состояние процесса, а `cargo test` гоняет тесты
+параллельно в потоках. Оракул, дёргающий `set_var`, стал бы гонкой и давал бы разный
+результат при разном порядке запуска — прямое нарушение принципа «в доменном коде нет
+недетерминизма» (`CLAUDE.md`). Поэтому оракулы бьют в чистое ядро.
+
+Семантика, закреплённая оракулами (отклонение = красный гейт):
+- `None` и пустая/вырожденная строка (`""`, `"   "`, `","`) → **дефолт `["BTCUSDT"]`**;
+  ни «эмитить всё» (взрыв объёма + необъявленная эпоха), ни «не эмитить ничего»
+  (тихая потеря forward-only данных);
+- пустые элементы отбрасываются, пробелы обрезаются, порядок сохраняется;
+- сравнение регистронезависимое, но **не подстрочное**: `BTC` и `BTCUSDT_PERP` не совпадают
+  с `BTCUSDT`.
+
+### Оракулы (написаны, GREEN только после задач 1–3)
+
+- `crates/venue-binance/tests/red_l2delta_allowlist.rs` — O-1..O-4, O-6;
+- `crates/venue-binance-futures/tests/red_l2delta_allowlist.rs` — то же + перп-специфика
+  (allow-list не имеет права ронять `prev_final_update_id` в `None` — урок TD-014);
+- `crates/journal/tests/red_det_replay_digest.rs::det_9` — DET-I-1 на смешанном журнале.
+
+Дублирование спот/перп намеренно: `L2DELTA_CAPTURE_SYMBOLS` объявлена в двух крейтах
+независимо, тесты крейт-локальны, и оракул только на споте пропустил бы половину дефекта
+(«в споте регистр нормализовали, в перпах забыли»).
+
+### RED-статус на момент коммита набора (анти-плацебо)
+
+`bash scripts/verify_M-45.sh` → **VERDICT: FAIL (7 нарушений)**, exit=1 — падает по существу
+(нет `parse_capture_symbols`/`should_capture_l2delta`, жив хардкод-`const`), а не по setup.
+Зелёные T0/T1/T6/T7/T9 — это проверки «ничего не сломано», они и обязаны быть зелёными до
+реализации.
 
 ## 4. RED-оракулы — спецификация (architect пишет ДО кода)
 
