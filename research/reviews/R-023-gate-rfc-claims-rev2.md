@@ -282,4 +282,51 @@ exit=1
 баланс сходится, «неприменимо» невозможно при непустом корпусе, моё репро круга 1 даёт FAIL
 на обеих формах, старый движок на том же входе молчал. N-1/N-2/N-3/N-4 закрыты.
 Отклонение `SKIP-DIGITS` проверено независимо и поддержано замером.
-Merge в `main` выполнен; §8 деплой-гейт — ниже (дописывается после прогона).
+
+## 11. Merge и §8 деплой-гейт (`gates.md` §8)
+
+`main` двинулся под ревью (`3e78a80` → `1c040e0`, параллельная сессия). Гейт перепрогнан на
+НОВОЙ merge-цели до merge'а: `VERDICT: PASS (0 нарушений)` exit=0, числа те же (30/30/0 и
+188/124/64). Merge `--no-ff` без конфликтов; на СМЁРЖЕННОМ дереве гейт и self-test прогнаны
+повторно (PASS/exit=0, 41/41), в том числе ПОСЛЕ моих правок `PROJECT-STATE.md`/`TECH-DEBT.md`.
+
+```
+$ git log --format='%h %an <%ae> %s' -3       # состояние main после push
+ae9e049 reviewer <reviewer@noreply.local> docs(reviewer): R-023 close-out — проверки 6/7 гейта документа в main; TD-073/TD-074 заведены, TD-062/TD-063 уточнены
+4b762ef reviewer <reviewer@noreply.local> merge(docs-gate): R-023 APPROVED — гейт docs/rfc SHA/путей rev2 (B-1 закрыт: остаток виден, баланс сходится; N-1/N-2/N-3/N-4)
+08cfdb1 reviewer <reviewer@noreply.local> docs(reviewer): R-023 APPROVED — гейт docs/rfc SHA/путей rev2 ...
+
+$ git push origin HEAD:main
+   1c040e0..ae9e049  HEAD -> main
+
+$ gh run watch 30750098092 --exit-status ; echo watch_rc=$?
+✓ All checks passed in 4s (ID 91503059411)
+watch_rc=0
+
+$ gh run list --limit 2
+completed  success  docs(reviewer): R-023 close-out — проверки 6/7 гейта документа в main…  CI  main  push  30750098092  6m0s  2026-08-02T13:31:06Z
+completed  success  merge(docs): R-021 — синхронизация номеров TD-071/TD-072 в вердикте (…  CI  main  push  30749918288  5m49s  2026-08-02T13:26:09Z
+```
+
+**Deploy НЕ триггерился — и это корректно, проверено фактом, а не предположением.**
+`.github/workflows/deploy.yml` слушает `paths: crates/** · Cargo.toml · Cargo.lock ·
+Dockerfile · docker-compose.yml · .github/workflows/deploy.yml`; содержимое push'а —
+`PROJECT-STATE.md`, `TECH-DEBT.md`, `research/notes/**`, `research/reviews/**`,
+`scripts/verify_design_claims.sh`, `scripts/tests/red_verify_design_claims.sh`. Ни одного
+пути из триггера. Прод в этом заходе не пересобирался.
+
+**Eyes-on на VPS (обязателен независимо от того, был ли деплой):**
+
+```
+$ ssh -i /home/nous/.ssh/hft_deploy -o IdentitiesOnly=yes root@167.233.192.131 \
+    'docker ps --format "{{.Names}} {{.Status}}"; cat /var/lib/docker/volumes/hft-platform_journal-data/_data/recorder.heartbeat'
+hft-gateway-serve Up 3 hours (healthy)
+hft-recorder Up 3 hours (healthy)
+{"events":831593,"free_bytes":85134544896,"min_free_bytes":10737418240,"next_seq":149371571,
+ "segment_index":158,"ts_wall_ms":1785677835571,"writable":true}
+```
+
+Оба контейнера `(healthy)`; heartbeat свежий — `ts_wall_ms=1785677835571` против локального
+времени замера `1785677838414` (лаг ≈ 2.8 с); `writable=true`, `next_seq=149371571` растёт,
+свободного места 85 GiB при пороге 10 GiB. Прод здоров, милестоун закрывается не поверх
+красного.
