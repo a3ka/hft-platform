@@ -361,6 +361,47 @@ oms/venue, не код).
 - **Следующий шаг (architect):** принять решение по M-35 (§E research-dev: reject / reformulate-proxy /
   on-chain / private) на основании этого memo. НЕ специфицировать volume-коллектор под rate-данные без caveat.
 
+## Governance контрактного слоя: CT-RFC-05 ретро-документ (✅ MERGED `c4caddb`, reviewer APPROVED 2026-08-02; docs-only) + CT-RFC-06 НЕ принят
+**CT-RFC-05 — дыра ЗАКРЫТА.** `docs/rfc/CT-RFC-05-margin-inventory.md` приземлён в `main`: изменение
+T1 (`MdPayload::MarginInventory`, `SCHEMA_VERSION` 3→4), жившее с 2026-07-25 в коде и на проде
+**без формального RFC-документа**, теперь имеет его ретроспективно. Дыра Д2
+(`docs/plans/contracts-current-state.md`) и TD-061 — CLOSED. Документ ничего не переигрывает:
+T1-форма уже на проде (§8 «не переигрывает изменение»), это ретро-фиксация факта.
+- **Цепочка гейтов:** critic `C-044` **REJECT** (3 из 4 цитируемых SHA не существовали в `main`;
+  список мест правки занижен 4 вместо 5) → фикс architect'а `03815dd` → `C-046` **PASS** →
+  reviewer `R-018` **APPROVED** → merge `c4caddb`.
+- **Reviewer перепроверил независимо** (не по вердиктам критика — первый круг сорвался именно на
+  непроверенных цитатах): 12/12 SHA существуют И входят в `origin/main`; карта мест правки = **5**,
+  собственный греп с `examples/**` и `src/bin/**`; форма T1, порядок вариантов 0..7,
+  `SCHEMA_VERSION=4`, JSON Schema, фикстуры valid+invalid, CHANGELOG, три теста `ct_rfc05.rs` —
+  всё на месте; мотивация §6 дословно возводится к M-35 и `margin-source-survey` §9.
+- **Гейты:** `verify_ct_rfc_atomic.sh` PASS exit=0 · `verify_design_claims.sh --merge-preview
+  origin/main` PASS (0 нарушений) exit=0 — прогон на MERGE-ЦЕЛИ, не только на ветке (урок R-013).
+- **Что теперь машинно защищено от повтора:** `scripts/verify_ct_rfc_atomic.sh` (`557be33`,
+  подключён к CI `b3b42d2`) при правке `crates/contracts/src/**` требует В ТОМ ЖЕ диффе наличия
+  `docs/rfc/CT-RFC-NNN-*.md`. Правило §4 больше не держится на добросовестности.
+- **Остатки:** TD-070 (нет прямого оракула на reuse-барьер эпохи 3→4 — документ фиксирует честно),
+  TD-068 (карта влияния T1-варианта составлялась по памяти, а не грепом — дважды за два дня).
+
+**CT-RFC-06 (`L2Delta`) — НЕ принят, `main` не тронут.** Ветка `docs/ct-rfc-06-l2delta` @ `22715b7`,
+вердикт `research/reviews/R-019-ct-rfc-06-l2delta.md` — **CHANGES REQUESTED**.
+- **Содержательно документ ПРАВ, и это подтверждено дважды независимо** (critic `C-045` + reviewer
+  своим грепом): посылка мандата «нужен contract-RFC на НОВЫЙ вариант» **опровергнута** — вариант
+  `MdPayload::L2Delta` (дискр. 6) уже в T1 с `CT-RFC-04`/M-18 (`lib.rs:293`, merge `f635bd2`);
+  вводить нечего ⇒ **M-45 сводится к расширению allow-list `L2DELTA_CAPTURE_SYMBOLS`, без
+  contract-пакета `05-contract-layer.md` §4, без бампа `SCHEMA_VERSION` и без RISK-BLOCK.**
+  Карта exhaustive-`match` — **ПЯТЬ** мест, не три (см. TD-068); механизм эпох `epoch_id`
+  существует end-to-end (T1-поле `SegmentHeader` → reuse-условие `decide_open_segment` → env
+  `EPOCH_ID` в recorder); `DET-I-1..3` (M-51, `d896b98`) смешанным журналом НЕ ломаются —
+  смешанный вход уже под оракулом `book/tests/red_det_projection.rs`.
+- **Блокирует не содержание, а пруф-база:** документ не проходит `verify_design_claims.sh`
+  (5 нарушений, exit=1, в т.ч. на `--merge-preview origin/main`). Два из них — TD-069: §0.2/§6/§8.2
+  стоят на артефактах `research/measurements/**`, которых в `main` нет (живут на ветках); ещё
+  три — усечённый путь `docs/07` и те же два пути. Плюс NOTE F4–F6 (что механизм эпох НЕ решает;
+  `JR-I-10` вакуумен без определения «читаемого хранилища»; у оракула DET-I-1 фикстур с `L2Delta` нет).
+- **Дальше:** architect правит (объём — один коммит), повторный прогон гейта на merge-цели;
+  повторный critic не требуется — содержательная часть проверена дважды.
+
 ## Margin-inventory collector (M-35 «available-inventory» + CT-RFC-05 — ✅ MERGED `1f342b8`, reviewer APPROVED 2026-07-25; §8 деплой-гейт GREEN, MarginInventory ЖИВА на проде)
 Architect выбрал вариант (2) из survey §6.3 (reformulate как proxy-collector). Собирается **СЫРОЙ
 supply-пул** `/sapi/v1/margin/available-inventory?type=MARGIN` (market-wide доступный к займу объём
