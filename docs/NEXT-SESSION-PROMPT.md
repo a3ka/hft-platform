@@ -41,6 +41,49 @@ git log --oneline origin/docs/ct-rfc-06-l2delta -1
 
 **Поток B — reviewer на двух RFC.** `CT-RFC-05` (ретро) и `CT-RFC-06` (`L2Delta`), оба прошли critic с PASS. Reviewer должен был смержить в `main`. Проверь, смержено ли; если REJECT — читай `research/reviews/R-018-*`, `R-019-*`.
 
+## 3b. Если потоки оборвались (сессия была очищена) — как забрать работу
+
+Субагенты привязаны к сессии и при её очистке обрываются. **Их результат при этом НЕ теряется** —
+он либо на origin, либо в worktree. Порядок восстановления:
+
+### Шаг 1 — что уже на origin
+```bash
+git fetch origin
+git log --oneline origin/feat/M-52-journal-hardening -3
+git log --oneline origin/main -6
+git log --oneline origin/docs/ct-rfc-05-retro -1
+git log --oneline origin/docs/ct-rfc-06-l2delta -1
+git branch -r | grep -E "gate-rfc|M-52|ct-rfc"
+```
+Есть нужные коммиты — работа доехала, продолжай с неё.
+
+### Шаг 2 — что застряло в worktree (не запушено)
+```bash
+for w in /tmp/hft-dev-m52 /tmp/hft-rev-rfc05 /tmp/hft-rev-rfc06 /tmp/hft-gate-rfc /tmp/hft-c044-fix; do
+  [ -d "$w" ] || continue
+  echo "=== $w"
+  git -C "$w" log --oneline -2
+  git -C "$w" status --porcelain | head -3
+done
+```
+Есть коммиты, которых нет на origin → **пушь сам** (RN-19: `git push` не меняет автора,
+аудит-трейл сохраняется):
+```bash
+git -C <worktree> push origin HEAD:<ветка>
+```
+Незакоммиченные изменения в грязном дереве — **не коммить вслепую**: посмотри диф, реши,
+осмысленны ли они, и только тогда коммить от имени той роли, что их делала.
+
+### Шаг 3 — что придётся перезапустить
+Если worktree пуст или его нет — задача не начиналась. Постановки сохранены:
+- **M-52 (реализация)** — `milestones/M-52-journal-hardening.md`, контракты `JR-I-10/11/12`,
+  оракулы в `crates/journal/tests/`, гейт `scripts/verify_M-52.sh` (был 10 FAIL / 2 PASS);
+- **ревью двух RFC** — `research/critiques/C-045-*` и `C-046-*` (оба PASS), ветки готовы к merge;
+- **M-45** — постановка в `CT-RFC-06` §8 + поправка про пять `match` (см. §5 ниже).
+
+**Правило при перезапуске:** мандат обязан требовать инкрементальных коммитов (скелет сразу,
+потом по частям) — именно это отличало провальный заход от успешного на одной и той же модели.
+
 ## 4. Что осталось до конца Фазы 3
 
 | Работа | Состояние |
