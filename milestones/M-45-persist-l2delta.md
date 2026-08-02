@@ -96,11 +96,11 @@ founder'а». Значит правка константы = совершени�
 
 | # | Задача | Зона | Статус | Оракул / гейт |
 |---|---|---|---|---|
-| 1 | `parse_capture_symbols` + `should_capture_l2delta` в `venue-binance` (дефолт `["BTCUSDT"]`, нормализация регистра) | venue-dev | ⏳ OPEN | T3, T4 |
-| 2 | То же в `venue-binance-futures`; семантика `pu` НЕ трогается | venue-dev | ⏳ OPEN | T3, T4, T6 |
-| 3 | `l2delta_emission_for` в обоих крейтах; обработчик ДЕЛЕГИРУЕТ ей, своего сравнения символов не имеет; хардкод-список удалён под любым именем | venue-dev | ⏳ OPEN | T5, O-7 |
-| 3b | **`FuturesSession::new_with_l2delta(subs, l2delta_allow)`** — allow-list явным параметром; `on_ws_text` решает об эмиссии только по нему | venue-dev | ⏳ OPEN | **T5b, O-8** |
-| 3c | Спот: `pub enum SessionEffect` + `pub struct SpotSession` с `new_with_l2delta(subs, l2delta_allow)` и `on_ws_text(&mut self, &str) -> Vec<SessionEffect>` (sync, без сети/каналов); async `handle_text_message` становится тонкой обёрткой, исполняющей эффекты | venue-dev | ⏳ OPEN | **T5b, O-8** |
+| 1 | `parse_capture_symbols` + `should_capture_l2delta` в `venue-binance` (дефолт `["BTCUSDT"]`, нормализация регистра) | venue-dev | ✅ DONE (`c3b997c`) | T3, T4 |
+| 2 | То же в `venue-binance-futures`; семантика `pu` НЕ трогается | venue-dev | ✅ DONE (`23d921b`) | T3, T4, T6 |
+| 3 | `l2delta_emission_for` в обоих крейтах; обработчик ДЕЛЕГИРУЕТ ей, своего сравнения символов не имеет; хардкод-список удалён под любым именем | venue-dev | ✅ DONE (`23d921b`+`c3b997c`) | T5, O-7 |
+| 3b | **`FuturesSession::new_with_l2delta(subs, l2delta_allow)`** — allow-list явным параметром; `on_ws_text` решает об эмиссии только по нему | venue-dev | ✅ DONE (`23d921b`) | **T5b, O-8** |
+| 3c | Спот: `pub enum SessionEffect` + `pub struct SpotSession` с `new_with_l2delta(subs, l2delta_allow)` и `on_ws_text(&mut self, &str) -> Vec<SessionEffect>` (sync, без сети/каналов); async `handle_text_message` становится тонкой обёрткой, исполняющей эффекты | venue-dev | ✅ DONE (`c3b997c`) | **T5b, O-8** |
 | 4 | Фикстура `L2Delta` в оракул `DET-I-1` — закрытие R-019 F6 / TD-072 | **architect** (sacred) | ✅ DONE (`det_9`) | T8 |
 | 5 | `scripts/verify_M-45.sh` | **architect** (sacred) | ✅ DONE | — |
 | 6 | Запись эпохи в `docs/data-epochs.md` — ТОЛЬКО при раскатке (Граница C), не при merge | architect | ⛔ ждёт подписи | T9 |
@@ -232,6 +232,24 @@ pub fn l2delta_emission_for(
 а не по setup.
 Зелёные T0/T1/T6/T7/T9 — это проверки «ничего не сломано», они и обязаны быть зелёными до
 реализации.
+
+### GREEN после реализации + обратная мутация (architect, 2026-08-02T16:30Z)
+
+Переход RED→GREEN зафиксирован на реальных коммитах: `d75a1b7` (до реализации) →
+`VERDICT: FAIL (10 нарушений)`; `7a292f4` (после) → `VERDICT: PASS`, exit=0, 21 проверка.
+
+Дисциплина «оракул, зелёный с первого запуска, ничего не доказывает» требует ОБРАТНОЙ
+мутации. Прогнано лично на ФИНАЛЬНОЙ реализации (не на заглушке, в отличие от проб
+критика в `C-051`); обе мутации откачены, `git status` чист:
+
+| мутация | что имитирует | результат |
+|---|---|---|
+| `PROD_DEFAULT = "BTCUSDT,ETHUSDT"` в `parse_capture_symbols` (спот) | тихое расширение состава записи = совершение решения Границы C кодом | **T3 КРАСНЫЙ** — `o3_default_when_config_absent_equals_current_prod_behaviour`: `0 passed; 1 failed` |
+| `l2delta_allow: vec!["BTCUSDT"]` в `SpotSession::new_with_l2delta` — параметр принят и ПРОИГНОРИРОВАН | главный дефект M-45 (`C-048`): allow-list подключён формально, раскатка молча не работает | **O-8 КРАСНЫЙ** — `2 passed; 4 failed` (падают `o8_allowed_symbol_emits…`, `…lowercase_config…`, `…multiple_allowed…`, `…payload_is_intact…`) |
+
+Вторая мутация воспроизводит на готовом коде ровно тот результат, что критик получал на
+заглушке (`C-051` §0, проба #2) — то есть D-1 держится не только против пустой реализации,
+но и против правдоподобной.
 
 ## 4. RED-оракулы — спецификация (architect пишет ДО кода)
 
