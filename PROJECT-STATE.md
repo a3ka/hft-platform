@@ -361,7 +361,7 @@ oms/venue, не код).
 - **Следующий шаг (architect):** принять решение по M-35 (§E research-dev: reject / reformulate-proxy /
   on-chain / private) на основании этого memo. НЕ специфицировать volume-коллектор под rate-данные без caveat.
 
-## Governance контрактного слоя: CT-RFC-05 ретро-документ (✅ MERGED `c4caddb`, reviewer APPROVED 2026-08-02; docs-only) + CT-RFC-06 НЕ принят
+## Governance контрактного слоя: CT-RFC-05 ретро-документ (✅ MERGED `c4caddb`, reviewer APPROVED 2026-08-02; docs-only) + CT-RFC-06 приземлён (✅ MERGED `c019ba9`, `R-021` APPROVED; STATUS документа — PROPOSED, ратификация за founder'ом)
 **CT-RFC-05 — дыра ЗАКРЫТА.** `docs/rfc/CT-RFC-05-margin-inventory.md` приземлён в `main`: изменение
 T1 (`MdPayload::MarginInventory`, `SCHEMA_VERSION` 3→4), жившее с 2026-07-25 в коде и на проде
 **без формального RFC-документа**, теперь имеет его ретроспективно. Дыра Д2
@@ -383,7 +383,43 @@ T1-форма уже на проде (§8 «не переигрывает изм
 - **Остатки:** TD-070 (нет прямого оракула на reuse-барьер эпохи 3→4 — документ фиксирует честно),
   TD-068 (карта влияния T1-варианта составлялась по памяти, а не грепом — дважды за два дня).
 
-**CT-RFC-06 (`L2Delta`) — НЕ принят, `main` не тронут.** Ветка `docs/ct-rfc-06-l2delta` @ `22715b7`,
+**CT-RFC-06 (`L2Delta`) — ✅ ПРИЗЕМЛЁН в `main` (merge `c019ba9`, reviewer `R-021` APPROVED,
+2026-08-02, круг 2; docs/research-only). `STATUS документа — PROPOSED, НЕ ратифицирован.`**
+- **Что означает merge:** документ и его пруф-база живут в `main` как аудит-трейл. Merge **НЕ**
+  ратифицирует RFC: §9 перечисляет 4 пункта под подпись founder'а (первый — «ратификация
+  CT-RFC-06 как whole»), `gates.md` §7 запрещает любому агенту подставлять approve. Более того,
+  документ САМ объявляет впереди risk-critic (шапка + §0.3 «`contracts`-тематика = RISK-BLOCK»);
+  по `gates.md` §5 на ЭТОМ диффе триггер не срабатывает (ни строки кода, ни `crates/contracts/**`),
+  поэтому merge законен без risk-critic — но **самозаявленная цепочка документа НЕ считается
+  пройденной**, и трактовать APPROVED как «risk-critic пройден» нельзя (`R-021` N1).
+- **Что приземлено:** `docs/rfc/CT-RFC-06-l2delta.md` (421 стр.) + пруф-якоря
+  `research/measurements/{td-053-event-size,m-45-l2delta-impact}.md` + вердикты `C-045`,
+  `R-019`, `R-021`. Каталог `research/measurements/` появился в `main` впервые — TD-069 CLOSED.
+- **Круг 1 (`R-019`, `22715b7`) — CHANGES REQUESTED:** содержательно документ прав (подтверждено
+  дважды независимо), но 5 нарушений `verify_design_claims.sh`. **Круг 2 (`R-021`) — все закрыты:**
+  F1/F2 (пруфы приземлены merge-коммитами `87181b4`/`df03366`), F3 (путь
+  `docs/07-cockpit-backend-roadmap.md` развёрнут), F4/F5/F6 закрыты ПО СУЩЕСТВУ — названы
+  остаточные классы эпох (незамеченный семантический сдвиг + забытый `EPOCH_ID`, машинного
+  fail-closed нет), условие невакуумности `JR-I-10` (COLD читаем только при фактическом
+  монтировании; сегодня Storage Box не заведён ⇒ инвариант держится на HOT/WARM), фактическое
+  покрытие `DET-I-1` (фикстур с `L2Delta` — ноль, замер reviewer'а подтвердил → TD-072).
+- **Гейт на MERGE-ЦЕЛИ:** `verify_design_claims.sh --merge-preview origin/main` → `VERDICT: PASS
+  (0 нарушений)`, exit=0 (26 SHA / 104 пути); версия из `main` (без RFC-проверок) на той же
+  merge-цели — тоже PASS exit=0. Прогон reviewer'а, не перенос из отчёта.
+- **Карта exhaustive-`match` = ПЯТЬ — подтверждена ТРЕТЬИМ независимым методом** (`R-021` §2):
+  греп по 8-му варианту `MdPayload::MarginInventory` даёт те же 5 файлов (+ `venue-binance`,
+  где это конструирование, не `match`). В `segments.rs` — РОВНО ОДИН exhaustive `match` по
+  `MdPayload` (`event_data_ts`, стр. 2566-2580), остальные `match` в файле имеют другой
+  scrutinee. Побочно: утверждение `docs/NEXT-SESSION-PROMPT.md:149` о «неполноте» замера —
+  **ложно** (замер называет пять и перечисляет те же пять) → TD-071.
+- **Содержательный вывод документа (в силе):** посылка «нужен contract-RFC на НОВЫЙ вариант»
+  **опровергнута** — `MdPayload::L2Delta` (дискр. 6) уже в T1 с `CT-RFC-04`/M-18 (`lib.rs:293`,
+  merge `f635bd2`) ⇒ **M-45 = расширение allow-list `L2DELTA_CAPTURE_SYMBOLS`, без
+  contract-пакета, без бампа `SCHEMA_VERSION`, без RISK-BLOCK** (для M-45-реализации MD-only
+  carve-out подтверждает reviewer M-45 отдельно). Механизм эпох `epoch_id` существует
+  end-to-end; `DET-I-1..3` (M-51) смешанным журналом не ломаются.
+
+**История круга 1 (для аудита):** ветка `docs/ct-rfc-06-l2delta` @ `22715b7`,
 вердикт `research/reviews/R-019-ct-rfc-06-l2delta.md` — **CHANGES REQUESTED**.
 - **Содержательно документ ПРАВ, и это подтверждено дважды независимо** (critic `C-045` + reviewer
   своим грепом): посылка мандата «нужен contract-RFC на НОВЫЙ вариант» **опровергнута** — вариант
