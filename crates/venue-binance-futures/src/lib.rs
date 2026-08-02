@@ -490,11 +490,7 @@ pub fn should_capture_l2delta(symbols: &[String], symbol: &str) -> bool {
 /// символ разрешён `symbols`. `FuturesSession::on_ws_text` ОБЯЗАН делегировать сюда,
 /// а не дублировать сравнение символов у себя — T5/T5b-канарейки `verify_M-45.sh`
 /// проверяют именно это (единственный call site `l2delta_event(` — внутри этой функции).
-pub fn l2delta_emission_for(
-    stream: &str,
-    data: &Value,
-    symbols: &[String],
-) -> Option<EventKind> {
+pub fn l2delta_emission_for(stream: &str, data: &Value, symbols: &[String]) -> Option<EventKind> {
     if !stream.contains("@depth") {
         return None;
     }
@@ -700,7 +696,9 @@ impl FuturesSession {
                 // КАЖДЫЙ распарсенный diff как сырое L2Delta-событие независимо от
                 // book-sync FSM (ground-truth рыночное событие, не свойство нашего
                 // sync-автомата), но только если символ разрешён `l2delta_allow`.
-                if let Some(EventKind::Md(md)) = l2delta_emission_for(stream, data, &self.l2delta_allow) {
+                if let Some(EventKind::Md(md)) =
+                    l2delta_emission_for(stream, data, &self.l2delta_allow)
+                {
                     effects.push(SessionEffect::Emit(md));
                 }
                 // Сначала вычислить action (immutable borrow), потом мутировать.

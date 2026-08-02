@@ -169,7 +169,7 @@ impl SpotSession {
     pub fn bootstrap(&self) -> Vec<SessionEffect> {
         let mut symbols: Vec<&String> = self.states.keys().collect();
         symbols.sort(); // JR-I/детерминизм: без сортировки порядок эффектов зависел бы
-                         // от итерации HashMap (недетерминизм, CLAUDE.md).
+                        // от итерации HashMap (недетерминизм, CLAUDE.md).
         symbols
             .into_iter()
             .map(|symbol| SessionEffect::FetchSnapshot {
@@ -218,7 +218,8 @@ impl SpotSession {
             // КАЖДЫЙ распарсенный diff как сырое L2Delta-событие независимо от
             // book-sync FSM (ground-truth рыночное событие), но только если символ
             // разрешён `l2delta_allow`.
-            if let Some(EventKind::Md(md)) = l2delta_emission_for(stream, data, &self.l2delta_allow) {
+            if let Some(EventKind::Md(md)) = l2delta_emission_for(stream, data, &self.l2delta_allow)
+            {
                 effects.push(SessionEffect::Emit(md));
             }
             if let Some((symbol, diff)) = parse_depth_diff(stream, data) {
@@ -898,7 +899,11 @@ struct DepthSnapshotResponse {
 /// имеет backoff-политики — `SpotSession` всегда просит `Duration::ZERO`, но поле
 /// части `SessionEffect::FetchSnapshot` по контракту M-45, тот же паттерн, что у
 /// `venue-binance-futures`).
-fn make_snapshot_future(client: reqwest::Client, symbol: String, after: Duration) -> SnapshotFuture {
+fn make_snapshot_future(
+    client: reqwest::Client,
+    symbol: String,
+    after: Duration,
+) -> SnapshotFuture {
     Box::pin(async move {
         if !after.is_zero() {
             tokio::time::sleep(after).await;
