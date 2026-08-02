@@ -2624,6 +2624,70 @@ Read-only file system (os error 30)`, `EXIT=1`; плюс переопредел�
 runbook, ни `deploy/README.md`. Работает только обходная команда через сервис `recorder`.
 
 
+## M-45 — allow-list эмиссии `L2Delta` из хардкода в конфиг (✅ CLOSED 2026-08-02, merge `2ad502e`, reviewer `R-024` APPROVED)
+
+**Что приземлено (код).** Набор символов, для которых эмитится `MdPayload::L2Delta`, перестал
+быть хардкод-константой `L2DELTA_CAPTURE_SYMBOLS` и стал конфигурацией:
+env `L2DELTA_CAPTURE_SYMBOLS` (список через запятую) → чистая `parse_capture_symbols` →
+`*Session::new_with_l2delta(symbols, l2delta_allow)`. В обоих крейтах
+(`crates/venue-binance`, `crates/venue-binance-futures`) три публичные функции —
+`parse_capture_symbols` / `should_capture_l2delta` / `l2delta_emission_for` — и
+`l2delta_emission_for` является ЕДИНСТВЕННОЙ точкой решения об эмиссии на реальном пути.
+Задача 3c дополнительно привела спот к паттерну TD-014: `pub enum SessionEffect` +
+`pub struct SpotSession` с sync-точкой входа `on_ws_text(&str) -> Vec<SessionEffect>`;
+async `run()` стал тонкой I/O-обёрткой (`apply_session_effect`).
+
+**Merge НЕ является раскаткой — это главное свойство milestone'а.** Без выставленного env
+состав эмиссии = ровно `["BTCUSDT"]`, байт-в-байт прежнее прод-поведение. Проверено
+ИСПОЛНЯЕМЫМ тестом (`o3_default_when_config_absent_equals_current_prod_behaviour`, гейт T3),
+не грепом, и подтверждено на проде после деплоя (§8 ниже: `L2DELTA_CAPTURE_SYMBOLS` в env
+контейнера отсутствует, `epoch_id` не менялся). **Раскатка остаётся за Границей C** —
+`docs/PENDING-SIGNATURE.md` П-004: founder называет состав и порядок относительно Storage Box;
+оператор выставляет env + **новый `EPOCH_ID`** + рестарт. Ни один агент этого не делает.
+
+**Контрактов не тронуто.** `MdPayload::L2Delta` живёт в T1 с `CT-RFC-04`/M-18 — вводить нечего:
+contract-пакет не собирался, `SCHEMA_VERSION` НЕ бампался (остался 4), `crates/contracts/**`
+не изменён (машинно, гейт T7). risk-critic не требовался — **MD-only carve-out** (`gates.md` §5),
+reviewer подтвердил отсутствие order-egress в диффе пофайлово (`R-024` Block-risk).
+
+**Гейт milestone'а стоил четырёх кругов критика — и это его главный урок.** Три REJECT подряд
+(`C-048`/`C-049`/`C-050`) по ОДНОЙ причине: оракул проверял ФОРМУ кода грепом, а такой гейт
+всегда обходится сдвигом хардкода на уровень выше (переименование константы; `if symbol ==
+"BTCUSDT"` ПЕРЕД вызовом — вызов по-прежнему один, греп зелёный, раскатка молча не работает).
+Решение D-1: оракул `O-8` дёргает РЕАЛЬНУЮ точку входа (`on_ws_text` сырым wire-текстом) и
+проверяет состав `Vec<SessionEffect>`. Обратная мутация на ФИНАЛЬНОЙ реализации (architect):
+дефолт `"BTCUSDT,ETHUSDT"` ⇒ T3 красный; `l2delta_allow` принят и проигнорирован в
+конструкторе ⇒ O-8 красный (`2 passed; 4 failed`). Гейт ловит и тихое расширение состава, и
+формальное подключение allow-list.
+
+**Дыра гейта, найденная tester'ом и закрытая внутри milestone'а:** CI гоняет
+`cargo fmt --all -- --check` (`ci.yml:20`), а `verify_M-45.sh` — нет; локальный гейт был
+зеленее CI, merge поверх этого дал бы красный `main`. Закрыто: проверка **T2b** в verify
+(`3bf52c8`) + fmt-фиксы (`f55ae55` оракулы — architect, `338b7e6` src — venue-dev, оба
+проверены reviewer'ом токен-в-токен как чисто-форматные). Правило паритета verify↔CI
+закреплено в `.claude/rules/gates.md` §3.
+
+- Гейты: critic `C-051` **NOTE** (4-й круг) → venue-dev (`23d921b`, `c3b997c`, `7a292f4`) →
+  tester **PASS** (`research/reports/M-45-tester-report.md`: 766 тестов, verify 21/21) →
+  reviewer **APPROVED** (`research/reviews/R-024-M-45.md`). Прогон reviewer'а на merged-дереве:
+  `verify_M-45.sh` **21/21 PASS, exit=0**; `cargo test --workspace` **766 passed / 0 failed**;
+  `cargo fmt --all --check` exit=0.
+- **TD-072 CLOSED** тем же merge'ем: оракул `DET-I-1` получил смешанную фикстуру
+  `det_9_mixed_snapshot_delta_journal_is_bit_identical_and_delta_sensitive` (`36cd5c3`),
+  `grep -c L2Delta` 0 → 6, гейт T8 GREEN.
+
+**§8 деплой-гейт GREEN, и он подтвердил ОТСУТСТВИЕ изменения, а не наличие фичи.**
+CI `30757897478` + Deploy `30757897452` — оба `completed success` на `2ad502e`; VPS HEAD
+`061d1fa` (содержит `2ad502e`), `hft-recorder` и `hft-gateway-serve` — `healthy`, heartbeat
+свежий (отставание ~9.5 s), журнал растёт (`next_seq` 150 211 293 → 150 211 594 за 10 s,
+`segment_index=159` не прыгнул, `writable=true`, 83 GB свободно). Проверка неизменности —
+двумя способами: (а) env `L2DELTA_CAPTURE_SYMBOLS` в контейнере ОТСУТСТВУЕТ
+(`docker inspect`); (б) живой scrape `/metrics` (через netns, `127.0.0.1:9101`) — **все**
+строки `kind="l2delta"` это `BTCUSDT` на `binance` и `binance_futures` и больше ничего, при
+том что **ETHUSDT ведётся в книге и эмитит `l2snapshot`, но `l2delta` для него не эмитится**.
+Наблюдение отсутствия, а не наличия: конфигурируемый allow-list реально фильтрует прод-путь,
+и его дефолт совпадает с прежним хардкодом байт-в-байт.
+
 ## Пока НЕ реализовано (следующие фазы)
 - Крейты `risk`/`killswitch`/`oms`, `runner` — пофазно per DESIGN §10 (M-08: fail-closed риск-гейт
   между `strategy` и `oms`). MM-котирование, wiring весов из `signals.json` (граница B),
