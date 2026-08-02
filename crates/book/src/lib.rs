@@ -353,6 +353,28 @@ impl Books {
     pub fn get(&self, venue: Venue, symbol: &str) -> Option<&OrderBook> {
         self.map.get(&(venue, symbol.to_string()))
     }
+
+    /// M-51 (DET-I-2/PL-I-1): детерминированный обход проекции — инструменты в
+    /// возрастающем порядке `(venue, symbol)`. Без него состояние проекции невозможно
+    /// снять целиком, не положившись на порядок `HashMap` (недетерминирован между
+    /// процессами/прогонами). `Venue` (T1, `crates/contracts`) не несёт `Ord` — вне зоны
+    /// engine-dev расширять контракт ради этого — поэтому порядок задаётся тем же
+    /// представлением, в котором `Venue` уже уходит наружу (`{venue:?}`), а не памятью.
+    pub fn iter_sorted(&self) -> Vec<((Venue, &str), &OrderBook)> {
+        // DET-OK: обход HashMap сразу пересортировывается ниже по (venue Debug, symbol) —
+        // итоговый порядок определяется данными, а не хэш-сидом процесса (DET-I-2/PL-I-1).
+        let mut out: Vec<((Venue, &str), &OrderBook)> = self
+            .map
+            .iter()
+            .map(|((v, s), b)| ((*v, s.as_str()), b))
+            .collect();
+        out.sort_by(|a, b| {
+            let ka = (format!("{:?}", (a.0).0), (a.0).1);
+            let kb = (format!("{:?}", (b.0).0), (b.0).1);
+            ka.cmp(&kb)
+        });
+        out
+    }
 }
 
 #[cfg(test)]
