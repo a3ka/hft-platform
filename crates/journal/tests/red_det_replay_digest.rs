@@ -591,3 +591,189 @@ fn det_8_digest_agrees_with_both_reader_paths_and_window_composition() {
          продублировано на стыке окон"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────────────────
+// det_9 — TD-072: DET-I-1 на СМЕШАННОМ журнале (снапшот + дельта).
+//
+// Почему оракул понадобился (R-019 F6 → TD-072). До этого теста все входы DET-I-*
+// в этом файле были снапшот-/sys-только: `grep -c L2Delta` по файлу → 0. Довод
+// «`replay_digest` тип-агностичен, значит смешанный поток безопасен» верен ПО СУЩЕСТВУ,
+// но это рассуждение, а не оракул: CT-RFC-06 §5 сам называет его аргументом. Прод пишет
+// смешанный поток для BTC с 2026-07-21 (M-18), а M-45 расширяет состав символов —
+// то есть под оракулом обязан быть тот поток, который реально лежит в журнале.
+//
+// Анти-плацебо — САМОЕ ВАЖНОЕ здесь. Реализация, которая молча ПРОПУСКАЕТ `L2Delta`
+// (например `_ => continue` в обходе payload'ов), пройдёт проверку «реплей ×3 бит-идентичен»
+// с блеском: она стабильно игнорирует одно и то же. Поэтому одной стабильности мало —
+// §2 ниже требует, чтобы дайджест РАЗЛИЧАЛ два журнала, отличающиеся ТОЛЬКО содержимым
+// дельты. Тест, состоящий из одного лишь §1, был бы фикстурой счастливого пути
+// (`.claude/rules/testing.md`).
+//
+// Чек-лист деградированного входа пройден намеренно:
+//   • асимметрия     — дельта, где обновлена ТОЛЬКО одна сторона (asks пуст) — штатная форма
+//                      диффа, а не экзотика; симметричный вход скрыл бы зависимость от стороны;
+//   • отсутствие     — уровень, которого в дельте НЕТ, не значит «удалить» (семантика §1
+//                      CT-RFC-06); поток фиксируется как есть, реплей не додумывает;
+//   • множественность— несколько дельт подряд между двумя якорями, а не одна;
+//   • границы        — `size == 0` (явный remove от биржи) и ПУСТАЯ дельта (обе стороны
+//                      пусты) — вырожденные, но легальные формы;
+//   • обе рыночные   — `prev_final_update_id: None` (спот) и `Some(..)` (перп, чейн по `pu`).
+//     семантики
+// ─────────────────────────────────────────────────────────────────────────────────────────
+
+/// Дельта с управляемым содержимым. `bid_size == 0` → явный remove-уровень (wire-семантика
+/// Binance `@depth`: qty="0"), пустые векторы → вырожденная, но легальная дельта.
+fn delta(i: u64, bid_size: i64, with_asks: bool, pu: Option<u64>) -> EventKind {
+    let bids = if bid_size < 0 {
+        Vec::new()
+    } else {
+        vec![contracts::Level {
+            price: 6_400_000_000_000 + i as i64,
+            size: bid_size,
+        }]
+    };
+    let asks = if with_asks {
+        vec![contracts::Level {
+            price: 6_400_100_000_000 + i as i64,
+            size: 500 + i as i64,
+        }]
+    } else {
+        Vec::new()
+    };
+    EventKind::md(
+        contracts::Venue::Binance,
+        "BTCUSDT",
+        MdPayload::L2Delta {
+            bids,
+            asks,
+            first_update_id: 1_000 + i,
+            final_update_id: 1_000 + i,
+            prev_final_update_id: pu,
+            ts_exch_ms: common::T0 + i as i64,
+        },
+    )
+}
+
+/// Смешанный журнал: якорь-снапшот, затем НЕСКОЛЬКО дельт разной формы, затем сделка.
+/// `delta_size` управляет содержимым ОДНОЙ дельты — на этом строится §2 (дискриминация).
+fn build_mixed(delta_size: i64) -> (tempfile::TempDir, Vec<u64>) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut seqs = Vec::new();
+    {
+        let mut j = Journal::open_with(dir.path(), cfg_with(16 * 1024, "det-test")).expect("open");
+        for blk in 0..6u64 {
+            // якорь
+            seqs.push(j.append(snap(blk)).expect("append").seq);
+            // дельта, обновляющая ТОЛЬКО bid — АСИММЕТРИЯ (asks не упомянут ⇒ не изменился)
+            seqs.push(
+                j.append(delta(blk * 10, delta_size, false, None))
+                    .expect("append")
+                    .seq,
+            );
+            // дельта-remove: size == 0 — граница, а не "пустое поле"
+            seqs.push(
+                j.append(delta(blk * 10 + 1, 0, false, None))
+                    .expect("append")
+                    .seq,
+            );
+            // перп-форма: чейн по `pu` (Some) + обе стороны — МНОЖЕСТВЕННОСТЬ форм
+            seqs.push(
+                j.append(delta(blk * 10 + 2, 700, true, Some(1_000 + blk * 10 + 1)))
+                    .expect("append")
+                    .seq,
+            );
+            // вырожденная: обе стороны пусты — легальна, дайджест обязан её УЧЕСТЬ
+            seqs.push(
+                j.append(delta(blk * 10 + 3, -1, false, None))
+                    .expect("append")
+                    .seq,
+            );
+            seqs.push(j.append(trade(blk)).expect("append").seq);
+        }
+        j.flush().expect("flush");
+    }
+    (dir, seqs)
+}
+
+#[test]
+fn det_9_mixed_snapshot_delta_journal_is_bit_identical_and_delta_sensitive() {
+    let (dir, seqs) = build_mixed(1_234);
+
+    // Смешанность — предусловие теста, а не побочный факт: если фикстура перестанет
+    // содержать дельты (например, изменится helper), тест обязан упасть ЗДЕСЬ, а не
+    // молча выродиться в ещё один снапшот-only прогон (это и был дефект TD-072).
+    let evs = all_events(dir.path(), EpochFilter::All);
+    let n_delta = evs
+        .iter()
+        .filter(|e| {
+            matches!(&e.kind, EventKind::Md(md) if matches!(md.payload, MdPayload::L2Delta { .. }))
+        })
+        .count();
+    let n_snap = evs
+        .iter()
+        .filter(|e| {
+            matches!(&e.kind, EventKind::Md(md) if matches!(md.payload, MdPayload::L2Snapshot { .. }))
+        })
+        .count();
+    assert!(
+        n_delta >= 20 && n_snap >= 6,
+        "фикстура перестала быть СМЕШАННОЙ (дельт={n_delta}, снапшотов={n_snap}) — \
+         оракул TD-072 потерял предмет проверки"
+    );
+
+    // ─── §1. Бит-идентичность ×3 на смешанном потоке ───────────────────────────────────
+    let lo = seqs[0];
+    let hi = *seqs.last().expect("seqs");
+    let a =
+        journal::replay_digest(dir.path(), EpochFilter::All, Some(lo), Some(hi)).expect("digest a");
+    let b =
+        journal::replay_digest(dir.path(), EpochFilter::All, Some(lo), Some(hi)).expect("digest b");
+    let c =
+        journal::replay_digest(dir.path(), EpochFilter::All, Some(lo), Some(hi)).expect("digest c");
+    assert_eq!(
+        a.state_hash, b.state_hash,
+        "DET-I-1: два реплея СМЕШАННОГО журнала (снапшот+дельта) дали разный state_hash"
+    );
+    assert_eq!(
+        a.state_hash, c.state_hash,
+        "DET-I-1: третий реплей разошёлся"
+    );
+    assert_eq!(a.events, b.events, "DET-I-1: счётчик событий нестабилен");
+
+    // ─── §1b. Совпадение с НЕЗАВИСИМЫМ эталоном ────────────────────────────────────────
+    // Ловит реализацию, которая стабильно, но НЕВЕРНО сворачивает поток с дельтами.
+    assert_eq!(
+        a.state_hash,
+        reference_state_hash(&evs),
+        "DET-I-1: дайджест смешанного журнала разошёлся с независимым эталоном — \
+         поток свёрнут не как «каждое событие ровно один раз»"
+    );
+    assert_eq!(
+        a.events as usize,
+        evs.len(),
+        "DET-I-1: часть событий смешанного потока не попала в дайджест"
+    );
+
+    // ─── §2. АНТИ-ПЛАЦЕБО: дайджест обязан РАЗЛИЧАТЬ содержимое дельты ─────────────────
+    // Два журнала отличаются ТОЛЬКО полем `size` внутри L2Delta. Реализация, молча
+    // пропускающая дельты (`_ => continue`), даст одинаковый хэш и упадёт здесь —
+    // при том что §1 она проходит.
+    let (dir2, seqs2) = build_mixed(9_999);
+    let d2 = journal::replay_digest(
+        dir2.path(),
+        EpochFilter::All,
+        Some(seqs2[0]),
+        Some(*seqs2.last().expect("seqs2")),
+    )
+    .expect("digest2");
+    assert_eq!(
+        a.events, d2.events,
+        "фикстуры обязаны совпадать по числу событий — иначе §2 сравнивает не то"
+    );
+    assert_ne!(
+        a.state_hash, d2.state_hash,
+        "DET-I-1/TD-072: два журнала, отличающиеся ТОЛЬКО содержимым L2Delta, дали \
+         ОДИНАКОВЫЙ state_hash — значит реплей игнорирует дельты. Это тот самый дефект, \
+         ради которого TD-072 заведён: снапшот-only фикстуры его не видят"
+    );
+}
