@@ -41,6 +41,52 @@ git log --oneline origin/docs/ct-rfc-06-l2delta -1
 
 **Поток B — reviewer на двух RFC.** `CT-RFC-05` (ретро) и `CT-RFC-06` (`L2Delta`), оба прошли critic с PASS. Reviewer должен был смержить в `main`. Проверь, смержено ли; если REJECT — читай `research/reviews/R-018-*`, `R-019-*`.
 
+## 3a. ЧТО ДЕЛАТЬ ПРЯМО СЕЙЧАС — план на первые часы
+
+**Цель:** закрыть Фазу 3. Осталось четыре шага, порядок важен.
+
+### Шаг 1 (5 минут) — забрать прерванную работу
+Выполни раздел **3b** ниже: `git fetch`, проверь `origin`, обойди worktree, дозабери
+незапушенные коммиты. **Только после этого** решай, что запускать.
+
+### Шаг 2 — M-52 (реализация), если не доехала
+Проверка: `bash scripts/verify_M-52.sh` на ветке `feat/M-52-journal-hardening`.
+Было **10 FAIL / 2 PASS** (2 зелёных — парные vantage, обязаны остаться).
+
+Если гейт красный — запускай **engine-dev** (sonnet). Мандат обязан содержать:
+- startup-протокол блоком (`CLAUDE.md`, `scope-guard`, `testing`, `commit-discipline`, `gates` §8, профиль роли);
+- bootstrap: `git worktree add /tmp/hft-dev-m52b --detach origin/feat/M-52-journal-hardening`;
+- **тесты sacred — dev их НЕ правит**;
+- три задачи: `TD-052` (бюджет работы `READABLE_FLOOR_WORK_BUDGET_BYTES`, при исчерпании → `Unknown`, НЕ частичный пол) · `TD-030` (guard монотонности, звать из **всех трёх** путей: `segments()`, `read_all`, `readable_floor`; не сломать legacy `first_seq=0` — класс TD-011) · `TD-067` (режим `replay-digest` в `journal-retention.rs` + запись `journal.replay-digest.json`; **на VPS нет Rust toolchain** — считает бинарь из образа);
+- запретный список: частичный пол вместо `Unknown` · слом legacy-пути · ослабление `ti_*`/`op_*`/`fs_*`/`det_*` · `crates/contracts/**` · выход за `crates/journal/src/**`;
+- мутационный контроль (два вопроса) + Done Block + **push обязателен** + инкрементальные коммиты.
+
+Дальше: **reviewer** (opus) → merge → **§8** (`gh run list` + ssh-проверка прода).
+
+### Шаг 3 — два RFC, если не смержены
+Ветки `docs/ct-rfc-05-retro` (@ `30b75eb`) и `docs/ct-rfc-06-l2delta` (@ `2852fae`), оба прошли
+critic с **PASS** (`C-046`, `C-045`).
+Запускай **reviewer** (opus) на обе. Ключевое требование мандата: **перепроверить своим грепом**
+опровержение посылки в `CT-RFC-06` (что `L2Delta` уже в T1) и число `match`-мест (пять, не три) —
+на этом держится пересмотр объёма M-45. Плюс каждый SHA через `git cat-file -e`.
+Порядок merge: сначала `ct-rfc-05-retro`, потом `ct-rfc-06-l2delta`.
+
+### Шаг 4 — гейт документов
+Ветка `feat/gate-rfc-claims` (проверка существования цитируемых SHA в `docs/rfc/**` + self-test).
+**reviewer** → merge. После merge прогони `bash scripts/verify_design_claims.sh` по `main`.
+
+### Шаг 5 — M-45 (после шага 3)
+Пиши milestone **сам** (architect): расширение allow-list, БЕЗ contract-пакета и БЕЗ risk-critic —
+обоснование в `CT-RFC-06` §0.2 и §8.1. Учти §5 этого промпта: пять `match`, `cargo build --workspace`
+в verify, `epoch_id`, `JR-I-10`.
+Затем: critic → engine-dev → reviewer → merge → §8.
+
+### Порядок запуска агентов
+Шаги 2, 3, 4 **независимы** — можно вести параллельно (разные ветки, разные файлы).
+Шаг 5 зависит от шага 3 (RFC должен быть в `main`).
+⚠️ Не больше 3-4 компилирующих агентов одновременно — диск. Перед запуском:
+`df -h /home`; при нехватке `rm -rf /tmp/hft-<чужой-завершённый>/target`.
+
 ## 3b. Если потоки оборвались (сессия была очищена) — как забрать работу
 
 Субагенты привязаны к сессии и при её очистке обрываются. **Их результат при этом НЕ теряется** —
