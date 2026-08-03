@@ -97,6 +97,34 @@ request-line, сервер (`httparse` внутри `tungstenite`) отверг�
 format`, клиент видит `Handshake not finished`. Пофикшено нормализацией пути в `wsprobe.rs`
 (добавляет `/` если после authority нет `/`) — уже в закоммиченной версии.
 
+### Находка 3 (СРОЧНАЯ, НЕ моя, обнаружена ПОСЛЕ push моих коммитов) — `main` красный на `cargo clippy --workspace`
+
+После `git rebase origin/main` для push'а close-out коммита обнаружилось, что
+`cargo clippy --workspace --all-targets -- -D warnings` (T2 в `verify_M-46.sh`, и, судя по
+`ci.yml`, тот же гейт в CI) стал **FAIL** — но НЕ из-за моих файлов. Причина —
+`c6b4f3b test(TD-078): потолок wall-clock масштабируется под режим сборки` (автор
+`architect`, приземлился на `main` МЕЖДУ моими пушами task#5a и close-out-доксом):
+
+```
+error: empty line after doc comment
+  --> crates/journal/tests/red_floor_work_budget.rs:83:1
+   |
+83 | / /// отличал бы «ограничено» от «неограниченно» (прод — 158 сегментов, не один).
+84 | |
+   | |_^
+...
+   = note: `-D clippy::empty-line-after-doc-comments` implied by `-D warnings`
+error: could not compile `journal` (test "red_floor_work_budget") due to 1 previous error
+```
+
+`crates/journal/tests/**` — sacred, architect-owned, вне моей зоны и вне зоны engine-dev в
+принципе (`crates/journal/src/**` — моя зона по мандату, `tests/**` — никогда). Подтверждено:
+на моих трёх коммитах (`57a5b08`/`69d63a5`/`691ff77`, ДО `c6b4f3b`) `cargo clippy --workspace`
+был чист (см. Done Block §4 — тот прогон делался ДО этого ребейза). Это отдельная от M-46
+регрессия чужого коммита. Не правил, не буду — сообщаю явно, т.к. она красит `main` для ВСЕХ,
+включая CI по моим же пушам, которые в момент этого отчёта ещё `in_progress`
+(`gh run list --branch main`).
+
 ## 3. Как запускать
 
 ```bash
