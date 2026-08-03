@@ -377,6 +377,31 @@ if setup_file_content_changed "$r" research/critiques/C-001.md "$before" "P17"; 
     "$(run_barrier "$r" push "$before")"
 fi
 
+# ── P18 (rev9, ЛОЖНОЕ СРАБАТЫВАНИЕ — main реально покраснел 2026-08-03) ───────────────
+# ПЕРЕИМЕНОВАНИЕ артефакта в ДРУГОЙ защищённый путь, сделанное коммитом ВНУТРИ feat-ветки
+# и влитое merge'ем, обязано проходить: это легитимная миграция, а не удаление.
+#
+# Почему сценарий появился только на девятом витке: `git log -- <path>` по умолчанию применяет
+# **history simplification** — на merge-коммите идёт лишь по тому родителю, который объясняет
+# итоговое состояние, и коммит переименования из side-ветки в вывод не попадает. Барьер видел
+# «файла нет на HEAD, и никто его не удалял» ⇒ обвинял evil merge и валил CI на КОРРЕКТНОЙ
+# работе. Отличие от P13: там артефакт пришёл мержем и остался ЦЕЛ; здесь он мержем пришёл и
+# ПЕРЕЕХАЛ — то есть проверяется именно ветка «(а) переезд в другой защищённый путь».
+# Лечится `--full-history` в `removed_by`.
+r=$(new_repo); before=$(git -C "$r" rev-parse HEAD)
+git -C "$r" checkout -qb side5
+echo "вердикт критика" > "$r/research/critiques/C-005.md"
+git -C "$r" add research/critiques/C-005.md >/dev/null
+git -C "$r" commit -qm "critic: вердикт C-005"
+git -C "$r" mv research/critiques/C-005.md research/critiques/C-006-renamed.md
+git -C "$r" commit -qm "docs: C-005 -> C-006-renamed (коллизия номеров)"
+git -C "$r" checkout -q -; git -C "$r" merge -q --no-ff -m "merge: side5" side5
+if setup_has_merge "$r" "$before" "P18" \
+   && setup_is "$r" research/critiques/C-006-renamed.md 100644 "P18"; then
+  expect "P18 переименование артефакта внутри влитой ветки пропускается (нет ложных срабатываний)" ok \
+    "$(run_barrier "$r" push "$before")"
+fi
+
 echo
 if [ "${FAILED}" -gt 0 ]; then
   echo "VERDICT: FAIL (${FAILED})"
@@ -384,4 +409,4 @@ if [ "${FAILED}" -gt 0 ]; then
   echo "чего в пайплайне нет — а это хуже отсутствия правила."
   exit 1
 fi
-echo "VERDICT: PASS (17/17) — барьер держит при ТОЙ ЖЕ проводке, какой его зовёт CI"
+echo "VERDICT: PASS (18/18) — барьер держит при ТОЙ ЖЕ проводке, какой его зовёт CI"
