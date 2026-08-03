@@ -47,11 +47,26 @@ NEXT=$(python3 -c "import json;print(json.load(open(\"/var/lib/docker/volumes/hf
 echo "covered=$COV next_seq=$NEXT backlog=$((NEXT-COV)) событий; чекпоинт: $(cat /var/lib/hft/gateway-checkpoint.last-success 2>/dev/null)"
 
 echo "--- прогоны ---"
+# ⚠️ CPU ПЕРЕД КАЖДЫМ ПРОГОНОМ — без этого число бессмысленно (инцидент 2026-08-03).
+# gateway-serve на current_thread-рантайме: пока он обслуживает одного клиента, следующий
+# ЖДЁТ. Прогоны подряд (--seconds 25 каждый) не давали серверу освободиться, и замер
+# показывал 9-14 s вместо реальных 0.25 s — мерилась конкуренция за поток, а не стоимость
+# подключения. Вывод «backlog не влияет» был сделан именно на этих грязных данных и оказался
+# неверным.
 for i in $(seq 1 '"$RUNS"'); do
+  for w in 1 2 3 4 5 6 7 8 9 10; do
+    CPU=$(docker stats --no-stream --format "{{.CPUPerc}}" hft-gateway-serve | tr -d "%")
+    BUSY=$(awk -v c="${CPU:-0}" "BEGIN{print (c>10)?1:0}")
+    [ "$BUSY" -eq 0 ] && break
+    echo "    ждём освобождения сервера (CPU=${CPU}%), попытка $w"
+    sleep 6
+  done
+  printf "CPU_до=%s%% " "${CPU:-?}"
   docker exec hft-gateway-serve /usr/local/bin/wsprobe \
       --url ws://127.0.0.1:8080 --token "$T" --frames 5 --seconds 25 --out /tmp/m54-$i 2>&1 \
     | grep -oE "latency_first_snapshot_ms=[0-9]+|frames_received=[0-9]+|error.*" | tr "\n" " "
   echo
+  sleep 8   # дать серверу закрыть сессию до следующего прогона
 done
 
 echo "--- состояние сервера ПОСЛЕ прогонов (тихая деградация ловится здесь) ---"
