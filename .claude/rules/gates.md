@@ -187,6 +187,12 @@ tech-debt правок. Блоки:
   contract-RFC → авто-REJECT (`docs/05-contract-layer.md` §4).
 - **Риск-инварианты** — если milestone трогал `risk`/`killswitch`/`oms`/`venue-*`,
   reviewer проверяет наличие GREEN RED-suite `RK-I-1..10` + `INTG-I-*` в Done Block.
+- **Механизм на пути (DoD; аудит 2026-08-03, случай `LiveReducer` M-38b→M-53)** — milestone,
+  вводящий механизм несущего пути (код, исполняемый прод-процессом: recorder / gateway-serve /
+  ops-cron / venue-ingest), мержится ТОЛЬКО с подключением механизма к этому пути, доказанным
+  оракулом точки входа (`testing.md` §«Канарейка ops-пути…»). Подключение осознанно отложено →
+  merge сопровождается TD-записью «built-not-wired» severity MAJOR — долг виден, а не
+  подразумевается.
 
 **Вердикт reviewer'а — АРТЕФАКТ, а не сообщение (закреплено 2026-07-31, инцидент M-49).**
 Reviewer обязан записать вердикт в `research/reviews/R-NNN.md` и **закоммитить+запушить его на
