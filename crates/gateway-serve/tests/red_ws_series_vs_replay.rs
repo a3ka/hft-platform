@@ -391,3 +391,121 @@ async fn o2_empty_journal_ws_equals_replay() {
         "O-2: пустой журнал НЕ является усечённым (первое свёрнутое событие отсутствует)"
     );
 }
+
+// ─────────────────── O-2w (закрытие слепой зоны C-055 §2) ───────────────────
+
+/// **O-2w.** То же сравнение WS↔реплей, но в **windowed-режиме** — том, в котором работает
+/// ПРОД (`GATEWAY_WINDOW_MS=60000`, `docker-compose.yml:128`).
+///
+/// **Зачем отдельный тест (находка critic'а `C-055` §2).** `cvd_session_base` публикуется
+/// ТОЛЬКО когда `session.base != 0` (`gateway/src/lib.rs:983-985`), а `base` становится
+/// ненулевым ТОЛЬКО после эвикции внутрисессионных бакетов под окном. Обе фикстуры выше
+/// используют `window_ms: None` ⇒ поле в них ВСЕГДА пусто ⇒ ассерт `a.cvd_session_base ==
+/// b.cvd_session_base` математически сравнивал `[] == []` и не давил ничего. Критик
+/// продемонстрировал это мутацией: `snap.series.cvd_session_base.clear()` на WS-пути
+/// оставлял все оракулы зелёными.
+///
+/// Здесь окно узкое, событий заведомо больше окна ⇒ эвикция происходит, `base` ненулевой.
+/// Ассерт «поле непусто» стоит ПЕРЕД сравнением: без него тест снова выродился бы в `[]==[]`,
+/// и слепая зона вернулась бы молча.
+#[tokio::test]
+async fn o2w_windowed_mode_ws_equals_replay_incl_cvd_base() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    {
+        let mut j = Journal::open_with(dir.path(), writer_cfg()).expect("open_with");
+        j.append(EventKind::md(
+            Venue::Binance,
+            "BTCUSDT",
+            MdPayload::L2Snapshot {
+                bids: vec![lvl(65_000.0, 2.0)],
+                asks: vec![lvl(65_010.0, 1.5)],
+                ts_exch_ms: D1_NOON_MS,
+            },
+        ))
+        .expect("append snap");
+        // 40 секунд сделок при окне 5 s ⇒ ранние бакеты гарантированно эвиктятся,
+        // и `session.base` становится ненулевым.
+        for i in 0..40i64 {
+            let side = if i % 3 == 0 { Side::Sell } else { Side::Buy };
+            j.append(EventKind::md(
+                Venue::Binance,
+                "BTCUSDT",
+                MdPayload::Trade {
+                    price: to_fixed(65_000.0 + (i % 7) as f64),
+                    size: to_fixed(1.0),
+                    side,
+                    ts_exch_ms: D1_NOON_MS + i * 1_000,
+                },
+            ))
+            .expect("append trade");
+        }
+        j.flush().expect("flush");
+    }
+
+    let windowed = Selector {
+        window_ms: Some(5_000),
+        ..sel()
+    };
+
+    let server = bind(ServeConfig {
+        addr: "127.0.0.1:0".to_string(),
+        journal_dir: dir.path().to_path_buf(),
+        filter: EpochFilter::OwnCaptureOnly,
+        selector: windowed.clone(),
+        decoding_key: DecodingKey::from_secret(SECRET),
+        checkpoint_dir: None,
+    })
+    .await
+    .expect("bind");
+    let addr = server.local_addr();
+    tokio::spawn(async move {
+        let _ = server.serve().await;
+    });
+
+    let token = sign(SECRET, FUTURE);
+    let url = format!("ws://{addr}/?token={token}");
+    let (mut ws, _) = tokio_tungstenite::connect_async(url)
+        .await
+        .expect("connect windowed");
+    let m = ws.next().await.expect("msg").expect("ok");
+    let got = match serde_json::from_slice::<ServeMsg>(m.into_data().as_ref()).expect("parse") {
+        ServeMsg::Snapshot(s) => s,
+        other => panic!("ожидался Snapshot, получено {other:?}"),
+    };
+
+    let replay = gateway::snapshot(
+        dir.path(),
+        EpochFilter::OwnCaptureOnly,
+        &windowed,
+        Cursor::LATEST,
+    )
+    .expect("реплей в windowed-режиме");
+
+    // Анти-вырождение: без этого ассерта тест снова сравнивал бы пустые векторы.
+    assert!(
+        !replay.series.cvd_session_base.is_empty(),
+        "O-2w: cvd_session_base ПУСТ даже под окном 5 s — фикстура не вызывает эвикцию, \
+         тест выродился в сравнение пустых векторов (ровно слепая зона C-055 §2)"
+    );
+
+    assert_eq!(
+        got.series.cvd_session_base, replay.series.cvd_session_base,
+        "O-2w: cvd_session_base WS != реплей в windowed-режиме (режим ПРОДА)"
+    );
+    assert_eq!(
+        got.series.cumulative_delta, replay.series.cumulative_delta,
+        "O-2w: cumulative_delta WS != реплей в windowed-режиме"
+    );
+    assert_eq!(
+        got.series.vp_session_max_time_s, replay.series.vp_session_max_time_s,
+        "O-2w: vp_session_max_time_s WS != реплей в windowed-режиме"
+    );
+    assert_eq!(
+        got.series, replay.series,
+        "O-2w: bundle WS != реплей под окном"
+    );
+    assert_eq!(
+        got.cursor, replay.cursor,
+        "O-2w: cursor WS != реплей под окном"
+    );
+}
