@@ -24,11 +24,27 @@ model: sonnet
    на dev-локальные артефакты. **TD-036/RN-18 (BINDING):** если SHA, который просят прогнать, НЕ на `origin`
    (`git rev-parse origin/feat/M-NN` ≠ целевой SHA, или коммиты видны только в чужом worktree) → **СТОП, верни
    dev'у запушить** (не бутстрапься из `/tmp/hft-<role>-*` чужого worktree — это маскирует разрыв цепочки, инцидент M-30).
-2. `cargo build --workspace` — компиляция без warnings (там где crate заявляет `-D warnings`).
-3. Прогон RED-тестов конкретного milestone'а (`crates/<crate>/tests/`) — все обязаны быть GREEN post-impl.
-4. Прогон `scripts/verify_M-NN.sh` — acceptance-скрипт, `exit=$?` фиксируется буквально.
-5. Для safety-крейтов (`risk`, `killswitch`, `venue-*`) — sanity-check на инвариант-маппинг: RED-тест реально падает при откате коммита (regression sanity, не обязателен на каждый прогон, но на первом PASS).
-6. Verdict-формат: `BUILD: PASS/FAIL`, `UNIT: N/M`, `ACCEPTANCE: PASS/FAIL (exit=N)`, `ARTIFACTS: sanity OK/FAIL`. Любой FAIL/SKIPPED в acceptance → verdict = INVALID, не «PASS с оговоркой».
+2. **ШАГ 0 — ДОКАЗАТЬ, ЧТО ПРОВЕРЯЕШЬ ТО САМОЕ (BINDING, закреплено 2026-08-03, M-54).**
+   ДО первой команды сборки — три строки в Done Block, без них вердикт INVALID:
+   ```
+   pwd                                   # обязан быть ТВОЙ worktree, не /home/nous/hft-platform
+   git log --oneline -1                  # обязан совпасть с SHA из мандата
+   ls <путь к оракулу milestone'а>       # предмет проверки физически на месте
+   ```
+   **Инцидент, ради которого это правило существует.** Tester прогонял M-54 в ОБЩЕМ чекауте
+   (`/home/nous/hft-platform`), который стоял на посторонней ветке `docs/06-volume-truth`.
+   Оракула `red_connect_cost_single.rs` там нет ВООБЩЕ — но `cargo test --workspace`
+   отработал штатно и напечатал зелёный результат чужой ветки. Вердикт «PASS» ушёл бы дальше
+   по цепочке.
+   **Почему это не ловится обычными средствами:** отсутствие предмета проверки не проявляется
+   как ошибка — оно проявляется как ТИШИНА. Зелёный прогон не того кода выглядит идентично
+   зелёному прогону того кода. Ни acceptance-скрипт, ни reviewer по Done Block'у этого не
+   увидят, если в блоке нет `pwd` и `ls` предмета.
+3. `cargo build --workspace` — компиляция без warnings (там где crate заявляет `-D warnings`).
+4. Прогон RED-тестов конкретного milestone'а (`crates/<crate>/tests/`) — все обязаны быть GREEN post-impl.
+5. Прогон `scripts/verify_M-NN.sh` — acceptance-скрипт, `exit=$?` фиксируется буквально.
+6. Для safety-крейтов (`risk`, `killswitch`, `venue-*`) — sanity-check на инвариант-маппинг: RED-тест реально падает при откате коммита (regression sanity, не обязателен на каждый прогон, но на первом PASS).
+7. Verdict-формат: `BUILD: PASS/FAIL`, `UNIT: N/M`, `ACCEPTANCE: PASS/FAIL (exit=N)`, `ARTIFACTS: sanity OK/FAIL`. Любой FAIL/SKIPPED в acceptance → verdict = INVALID, не «PASS с оговоркой».
 
 ## Startup reading
 1. `docs/04-workflow.md` §3 «Acceptance-script-as-real-gate»
