@@ -23,7 +23,8 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 BARRIER="${BARRIER:-${ROOT}/scripts/check_protected_artifacts.sh}"
 
 FAILED=0
-pass() { echo "PASS  $*"; }
+PASSED=0
+pass() { echo "PASS  $*"; PASSED=$((PASSED + 1)); }
 fail() { echo "FAIL  $*"; FAILED=$((FAILED + 1)); }
 
 # Песочница: настоящий git-репозиторий, где мы воспроизводим семантику GitHub-события.
@@ -33,8 +34,11 @@ new_repo() {
   git -C "${d}" init -q
   git -C "${d}" config user.email t@t.local
   git -C "${d}" config user.name t
-  mkdir -p "${d}/research/critiques" "${d}/milestones" "${d}/docs/rfc"
-  echo "вердикт критика" > "${d}/research/critiques/C-001.md"
+  mkdir -p "${d}/research/critiques" "${d}/research/reviews" "${d}/research/arbitration" \
+           "${d}/milestones" "${d}/docs/rfc"
+  echo "вердикт критика"   > "${d}/research/critiques/C-001.md"
+  echo "вердикт reviewer'а" > "${d}/research/reviews/R-001.md"
+  echo "решение арбитра"    > "${d}/research/arbitration/A-001.md"
   echo "спека" > "${d}/milestones/M-01.md"
   echo "контракт" > "${d}/docs/rfc/CT-RFC-01.md"
   echo "код" > "${d}/src.rs"
@@ -175,7 +179,8 @@ setup_base_not_ancestor() { # $1=repo $2=аргумент-базы $3=имя →
 # (замер 2026-08-04: `bash -c 'is_protected x'` → `command not found`, код 127).
 is_protected() {
   case "$1" in
-    research/critiques/*.md|milestones/*.md|docs/rfc/*|docs/contract-rfc/*) return 0 ;;
+    research/critiques/*.md|research/reviews/*.md|research/arbitration/*.md) return 0 ;;
+    milestones/*.md|docs/rfc/*|docs/contract-rfc/*) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -389,6 +394,20 @@ if setup_file_content_changed "$r" research/critiques/C-001.md "$before" "P17"; 
     "$(run_barrier "$r" push "$before")"
 fi
 
+# ── P19 (R-032 F-10): вердикт REVIEWER'а снесён — барьер обязан ВАЛИТЬ ────────────────
+# research/reviews/R-NNN.md — условие merge по gates.md §4 (R-031: три milestone'а уехали в
+# прод без него). До R-032 путь в is_protected НЕ входил: удаление проходило молча, exit=0.
+r=$(new_repo); before=$(git -C "$r" rev-parse HEAD)
+git -C "$r" rm -q research/reviews/R-001.md; git -C "$r" commit -qm "docs: правки (и вердикт reviewer'а уехал)"
+expect "P19 удаление вердикта reviewer'а ВАЛИТ гейт" deny "$(run_barrier "$r" push "$before")"
+
+# ── P20 (R-032 F-10): решение АРБИТРА снесено — барьер обязан ВАЛИТЬ ──────────────────
+# Решение арбитра обязательно к исполнению обеими сторонами (gates.md §0); стереть его молча
+# означает отменить гейт задним числом.
+r=$(new_repo); before=$(git -C "$r" rev-parse HEAD)
+git -C "$r" rm -q research/arbitration/A-001.md; git -C "$r" commit -qm "docs: чистка (и решение арбитра уехало)"
+expect "P20 удаление решения арбитра ВАЛИТ гейт" deny "$(run_barrier "$r" push "$before")"
+
 # ── P18 (rev9, ЛОЖНОЕ СРАБАТЫВАНИЕ — main реально покраснел 2026-08-03) ───────────────
 # ПЕРЕИМЕНОВАНИЕ артефакта в ДРУГОЙ защищённый путь, сделанное коммитом ВНУТРИ feat-ветки
 # и влитое merge'ем, обязано проходить: это легитимная миграция, а не удаление.
@@ -421,4 +440,6 @@ if [ "${FAILED}" -gt 0 ]; then
   echo "чего в пайплайне нет — а это хуже отсутствия правила."
   exit 1
 fi
-echo "VERDICT: PASS (18/18) — барьер держит при ТОЙ ЖЕ проводке, какой его зовёт CI"
+# Число СЧИТАЕТСЯ, а не заявляется: литерал «18/18» пережил добавление сценариев и
+# врал бы о покрытии — тот же класс, что «17 сценариев» в gates.md (R-032).
+echo "VERDICT: PASS (${PASSED}/${PASSED}) — барьер держит при ТОЙ ЖЕ проводке, какой его зовёт CI"

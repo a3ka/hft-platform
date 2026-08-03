@@ -326,9 +326,10 @@ milestone-цепочки, бэкстопом; отдельного маршру�
 документу, унаследует послабление молча.
 
 **Механический барьер (не церемония):** `scripts/check_protected_artifacts.sh` — коммит не
-имеет права удалять `research/critiques/*`, `milestones/*`, `docs/rfc/*` без явного
-`ALLOW-ARTIFACT-DELETE` в теле. Барьер сам под пробой: `scripts/tests/red_protected_artifacts.sh`
-(18 сценариев, fail-closed setup у каждого), зовётся из CI той же проводкой.
+имеет права удалять `research/critiques/*`, `research/reviews/*`, `research/arbitration/*`,
+`milestones/*`, `docs/rfc/*`, `docs/contract-rfc/*` без явного `ALLOW-ARTIFACT-DELETE` в теле.
+Барьер сам под пробой: `scripts/tests/red_protected_artifacts.sh` (20 сценариев, fail-closed
+setup у каждого; число в вердикте пробы СЧИТАЕТСЯ, не заявляется), зовётся из CI той же проводкой.
 
 ## 10. Изоляция ролей в общем чекауте (добавлено 2026-07-13)
 
