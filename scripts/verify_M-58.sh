@@ -51,7 +51,7 @@ fi
 
 # ── Регресс — DV-I-1..9 остаются GREEN ────────────────────────────────────────────────────
 say
-for t in red_depth_lifetime red_depth_band_3060; do
+for t in red_depth_lifetime red_depth_band_3060 red_depth_scale; do
   if cargo test -p research-cli --test "$t" 2>&1 | tee "/tmp/m58_$t.log" \
      | grep -qE '^test result: ok\.'; then
     pass "регресс — $t GREEN"
@@ -76,6 +76,25 @@ if grep -qE 'pub (born|cancelled|frozen|censored):\s*u64' "$IMPL"; then
   fail "задача 1 — остались СТАРЫЕ поля born/cancelled/frozen/censored: имя означает другую величину"
 else
   pass "задача 1 — старых полей не осталось"
+fi
+
+# ── ПАРИТЕТ С CI (gates.md §3) — гейт не имеет права быть зеленее CI ──────────────────────
+# Добавлено по R-033 F-4: без этих двух проверок fmt-расхождение (F-3) прошло сквозь зелёный
+# verify и покраснело бы уже на main. Базовый CI-job гоняет ровно три команды —
+# fmt --check, clippy -D warnings, test --all; ниже присутствуют все три.
+say
+if cargo fmt --all -- --check > /tmp/m58_fmt.log 2>&1; then
+  pass "паритет CI — cargo fmt --all -- --check чист"
+else
+  fail "паритет CI — cargo fmt --all -- --check ругается (CI на main покраснеет):"
+  head -20 /tmp/m58_fmt.log
+fi
+
+if cargo test --all > /tmp/m58_all.log 2>&1; then
+  pass "паритет CI — cargo test --all зелёный ($(grep -cE '^test result: ok' /tmp/m58_all.log) блоков)"
+else
+  fail "паритет CI — cargo test --all красный:"
+  grep -E "^test result: FAILED|^---- .* stdout|^error" /tmp/m58_all.log | head -20
 fi
 
 # ── Задача 2 — сборка всех целей крейта и чистый clippy ───────────────────────────────────
