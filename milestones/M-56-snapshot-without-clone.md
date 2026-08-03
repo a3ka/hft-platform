@@ -46,8 +46,8 @@ pub fn snapshot(&self) -> Snapshot {
 
 | # | Задача | Зона | Статус | Оракул |
 |---|---|---|---|---|
-| 1 | `Reducer::finish_ref(&self) -> SeriesBundle` — построение серий **из ссылок**, без потребления и без клонирования. Существующий `finish(self)` остаётся (на нём стоят вызовы, потребляющие редьюсер) и обязан быть выражен через общий код, а не продублирован | engine-dev | ⏳ OPEN | O-2 |
-| 2 | `LiveReducer::snapshot(&self)` использует `finish_ref` — клон исчезает | engine-dev | ⏳ OPEN | O-1, O-2 |
+| 1 | `Reducer::finish_ref(&self) -> SeriesBundle` — построение серий **из ссылок**, без потребления и без клонирования. Существующий `finish(self)` остаётся (на нём стоят вызовы, потребляющие редьюсер) и обязан быть выражен через общий код, а не продублирован | engine-dev | ✅ DONE | O-2 |
+| 2 | `LiveReducer::snapshot(&self)` использует `finish_ref` — клон исчезает | engine-dev | ✅ DONE | O-1, O-2 |
 | 3 | RED-оракулы O-1..O-3 | **architect** (sacred) | ✅ DONE | — |
 | 4 | `scripts/verify_M-56.sh` | **architect** (sacred) | ✅ DONE | — |
 
