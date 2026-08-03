@@ -89,8 +89,14 @@ fn dv_i_1_explicit_cancel_is_live() {
     let far = r
         .band(Side::Buy, FAR_LO)
         .expect("дальняя полоса должна присутствовать");
-    assert!(far.lives_cancelled >= 1, "явный size=0 ⇒ cancelled≥1 (живой)");
-    assert_eq!(far.lives_frozen, 0, "отменённый уровень не может быть frozen");
+    assert!(
+        far.lives_cancelled >= 1,
+        "явный size=0 ⇒ cancelled≥1 (живой)"
+    );
+    assert_eq!(
+        far.lives_frozen, 0,
+        "отменённый уровень не может быть frozen"
+    );
 }
 
 // ── DV-I-2: born, никогда не size=0 до конца окна = FROZEN (фантом-кандидат) ─────────────────────
@@ -268,10 +274,16 @@ fn dv_i_checklist_asymmetry_and_multiplicity() {
     );
     let far_ask = r.band(Side::Sell, FAR_LO).expect("дальняя ask-полоса");
     // Асимметрия: ask молчал ⇒ его дальний уровень frozen (жив), НЕ censored/cancelled.
-    assert_eq!(far_ask.lives_cancelled, 0, "ask-сторона молчала ⇒ не отменена");
+    assert_eq!(
+        far_ask.lives_cancelled, 0,
+        "ask-сторона молчала ⇒ не отменена"
+    );
     assert_eq!(
         far_ask.lives_censored, 0,
         "односторонний bid-тик не роняет ask в censored"
     );
-    assert!(far_ask.lives_frozen >= 1, "молчащий ask-уровень жив ⇒ frozen≥1");
+    assert!(
+        far_ask.lives_frozen >= 1,
+        "молчащий ask-уровень жив ⇒ frozen≥1"
+    );
 }

@@ -71,7 +71,10 @@ fn dv_i_9_band_3060_distinct() {
     let b3060 = r
         .band(Side::Buy, B3060_LO)
         .expect("полоса [3000,6000) должна существовать (impl клампит 4500→1500 → None → FAIL)");
-    assert!(b3060.lives_born >= 1, "45%-уровень рождён в [3000,6000) ⇒ born≥1");
+    assert!(
+        b3060.lives_born >= 1,
+        "45%-уровень рождён в [3000,6000) ⇒ born≥1"
+    );
     assert_eq!(
         b3060.hi_bps, 6000,
         "верхняя граница полосы = 6000 bps (60%)"

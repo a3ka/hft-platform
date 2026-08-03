@@ -164,15 +164,24 @@ fn dv_i_11_metric_does_not_saturate_with_window_length() {
     let bs = short.band(Side::Buy, FAR_LO_BPS).expect("полоса short");
     let bl = long.band(Side::Buy, FAR_LO_BPS).expect("полоса long");
 
-    assert_eq!((bs.lives_born, bs.lives_cancelled, bs.lives_frozen), (2, 1, 1));
-    assert_eq!((bl.lives_born, bl.lives_cancelled, bl.lives_frozen), (4, 3, 1));
+    assert_eq!(
+        (bs.lives_born, bs.lives_cancelled, bs.lives_frozen),
+        (2, 1, 1)
+    );
+    assert_eq!(
+        (bl.lives_born, bl.lives_cancelled, bl.lives_frozen),
+        (4, 3, 1)
+    );
 
     assert_eq!(bs.cancel_fraction(), Some(0.5), "1 из 2 эпизодов");
     assert_eq!(bl.cancel_fraction(), Some(0.75), "3 из 4 эпизодов");
 
     // Суть инварианта: незавершённая жизнь ОСТАЁТСЯ видимой сколько бы циклов ни было.
     // Насыщающаяся метрика теряет её (frozen=0) и уходит в 1.0 — здесь это запрещено.
-    assert_eq!(bl.lives_frozen, 1, "живая на конце окна жизнь не должна исчезать");
+    assert_eq!(
+        bl.lives_frozen, 1,
+        "живая на конце окна жизнь не должна исчезать"
+    );
     assert!(
         bl.cancel_fraction() < Some(1.0),
         "величина не имеет права насыщаться до 1.0 при живом уровне на конце окна"
@@ -203,10 +212,15 @@ fn dv_i_12_censored_life_does_not_poison_later_lives() {
     ];
 
     let rep = analyze(&ticks);
-    let b = rep.band(Side::Buy, FAR_LO_BPS).expect("полоса [500,800) bid");
+    let b = rep
+        .band(Side::Buy, FAR_LO_BPS)
+        .expect("полоса [500,800) bid");
 
     assert_eq!(rep.gaps, 1, "ровно один разрыв непрерывности");
-    assert_eq!(b.lives_censored, 1, "жизнь 1 оборвана gap'ом — fate неизвестен");
+    assert_eq!(
+        b.lives_censored, 1,
+        "жизнь 1 оборвана gap'ом — fate неизвестен"
+    );
     assert_eq!(
         b.lives_born, 2,
         "после восстановления потока цена родилась заново — это вторая жизнь"
@@ -280,7 +294,9 @@ fn dv_i_13_lives_balance_on_degraded_input() {
     // (у цены ровно одна судьба), что подтверждено мутационным прогоном — с одним лишь балансом
     // этот тест был ЗЕЛЁНЫМ против фиктивной реализации. Поэтому требуем точные числа там, где
     // одна цена проживает ДВЕ полные жизни: per-price даст (1,1), per-life обязана дать (2,2).
-    let far_bid = rep.band(Side::Buy, FAR_LO_BPS).expect("полоса [500,800) bid");
+    let far_bid = rep
+        .band(Side::Buy, FAR_LO_BPS)
+        .expect("полоса [500,800) bid");
     assert_eq!(
         (far_bid.lives_born, far_bid.lives_cancelled),
         (2, 2),
