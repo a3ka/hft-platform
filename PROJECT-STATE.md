@@ -2765,6 +2765,71 @@ reviewer'ом `docker restart hft-gateway-serve` (перезапуск серв�
 (по образцу `crates/journal/tests/red_open_bounded.rs`, через `ReadStats`, не wall-clock), затем
 дизайн фикса `TD-083`/`TD-084`. Milestone остаётся `IN_PROGRESS`.
 
+## M-53 «`TD-083` (P0): push-цикл на `LiveReducer`» — КОД MERGED в `main` (`af2ee7b`), reviewer APPROVED 2026-08-03 (`research/reviews/R-026-M-53.md`)
+
+**Что чинили.** Прод-read-path был функционально мёртв: ровно одно WS-подключение к
+`hft-gateway-serve` оставляло процесс на 100% CPU навсегда, `CLOSE_WAIT` копились, accept-loop
+переставал исполняться (следующий клиент — connect-timeout), кадров не приходило ни одного,
+а Docker рапортовал `(healthy)`. Найдено НЕ гейтом, а прогоном M-46 против живого прода
+(`R-025`, задача #5) — на фикстурах дефект не воспроизводится в принципе.
+
+**Что смержено (`crates/gateway/src/lib.rs`, `crates/gateway-serve/src/lib.rs` — engine-dev).**
+- **`LiveReducer::pump` строит кадр ИЗ СВОЕГО состояния** (task #2a). Раньше `pump` буквально
+  возвращал результат `frames_since`, то есть каждый тик всё равно читал журнал с головы.
+  Теперь — один проход `journal::stream_from(cursor)` на свежем `Reducer`, чей vwap-аккумулятор
+  засеян из персистентного `self.vwap` (O(1)). Между тиками переносится ТОЛЬКО
+  `VwapAcc.sum_pv/sum_v` — единственное since-genesis состояние без per-тик сброса; остальные
+  ряды дельта-only, как и у `frames_since`.
+- **`ReadStats` учитывает ВСЮ работу тика** (task #2b) — раньше статы снимались с другого,
+  bounded-прохода, и оракул бюджета мерил половину.
+- **Push-цикл `gateway-serve` подключён к `LiveReducer`** (`resume` при подключении, `pump` на
+  тике; task #2c). До этого механизм существовал, был покрыт оракулами и **не стоял на пути** —
+  тот же класс, что M-45.
+- **`spawn_blocking` вокруг journal-read** (task #3) — на прод-рантайме `current_thread`
+  (`/proc/1/task` = 1) синхронный read монополизировал единственный поток и замораживал
+  accept-loop; **уход клиента детектируется независимо от наличия кадров** (task #4) — ветка
+  `stream.next()` поллится на каждой итерации `select!`, а не только когда есть что послать.
+- **Снапшот и live строятся от ОДНОГО курсора** (`live.cursor()` после догона хвоста) — фоновый
+  чекпоинтер не может продвинуться между шагами и задвоить клиенту данные снапшота.
+- `frames_since` **оставлена как есть** — честный эталон полного реплея, на ней стоят оракулы
+  M-46; `serve::frames_msgs` больше не на прод-пути, но не удалена (на неё завязан sacred
+  `red_serve_passthrough.rs`).
+
+**Оракулы (architect, sacred).** Ключевое содержание milestone'а — не только фикс, но и
+**замена ДВУХ ТАВТОЛОГИЧНЫХ проверок**, из-за которых механизм выглядел рабочим при мёртвом
+проде: byte-identity сравнивала `pump` с `frames_since`, тогда как `pump` возвращал её же
+результат; boundedness мерила `stats` только второй фазы работы. Новые:
+`crates/gateway/tests/red_frames_seek_bound.rs::td083_pumped_frames_fold_into_full_replay_snapshot`
+(эталон — НЕЗАВИСИМЫЙ полный реплей: `snapshot(START)` + кадры `pump` ≡ `snapshot(LATEST)`;
+удовлетворить, вернув чужой результат, невозможно) + `td083_tick_wallclock_does_not_grow_with_history`
+(внешняя мера цены тика) + `crates/gateway/tests/red_push_seek_bounded.rs` (O-1/O-2 —
+`ReadStats.segments_opened`, работа, а не время) + `crates/gateway-serve/tests/red_ws_liveness_under_load.rs`
+(O-3, три сценария живости, включая ДЕГРАДИРОВАННЫЙ вход — грубый обрыв без close-handshake).
+Гейт `scripts/verify_M-53.sh` (12 проверок, включая T4 «нетавтологичность» и канарейку T6
+«push-цикл действительно ВЫЗЫВАЕТ `LiveReducer`»).
+
+**Гейты (три независимых прогона, расхождений нет).** `verify_M-53.sh` → **PASS 12/12**
+(architect, tester на чистом чекауте, reviewer в своём worktree); `verify_M-46.sh` → **PASS**
+(регресса нет — сверка WS↔реплей по всем 10 сериям цела); `cargo test --workspace` →
+**785 passed / 0 failed**; fmt/clippy exit=0. RED-first порядок соблюдён в обоих заходах;
+`*/tests/**` и `scripts/` тронуты ТОЛЬКО architect'ом (проверено `%an`).
+RISK-BLOCK не применяется — диф целиком read-path, order-egress отсутствует.
+
+**Цена ошибки, которую milestone показал.** Первый дизайн фикса (наивный seek в `frames_since`)
+был НЕВЕРЕН: VWAP — all-time cumulative, сегментный skip даёт быстрый, но НЕЧЕСТНЫЙ VWAP.
+Dev реализовал, поймал регрессию тремя sacred-оракулами, откатил и передал вопрос architect'у,
+не решая единолично на correctness-пути — образцовое поведение на границе зон.
+
+**Открытый долг milestone'а:** `TD-093` (гонка снапшот↔live устранена конструкцией, но БЕЗ
+оракула; двойная стоимость коннекта), `TD-092` (барьер `protected-artifacts` ложно объявил
+evil merge на легитимном rename — уронил CI merge-коммита и заблокировал Deploy), `TD-088`
+(второй экземпляр: канарейка T6 ловит текст, а не вызов). Поправка к `TD-085`: cron чекпоинта
+СУЩЕСТВУЕТ (`/etc/cron.d/hft-journal-retention:68`) — проблема в суточной частоте, а не в
+отсутствии автоматизации.
+
+**Статус закрытия:** см. `R-026` §7 — милестоун не закрывается по зелёным гейтам, требуется
+подтверждение прогоном против живого прода (чек-лист §11 milestone'а).
+
 ## Пока НЕ реализовано (следующие фазы)
 - Крейты `risk`/`killswitch`/`oms`, `runner` — пофазно per DESIGN §10 (M-08: fail-closed риск-гейт
   между `strategy` и `oms`). MM-котирование, wiring весов из `signals.json` (граница B),
