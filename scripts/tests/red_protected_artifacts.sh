@@ -168,6 +168,18 @@ setup_base_not_ancestor() { # $1=repo $2=аргумент-базы $3=имя →
   fi
   return 0
 }
+# Зеркало `is_protected` из `scripts/check_protected_artifacts.sh` (список путей обязан
+# совпадать). Функция ЖИВЁТ ЗДЕСЬ намеренно: тот скрипт не источаемый (при `source` он
+# исполняет проверку и завершает процесс), а без определения вызов ниже возвращал 127, и
+# `if is_protected ...` был тождественно ложен — setup-guard P1 не срабатывал НИКОГДА
+# (замер 2026-08-04: `bash -c 'is_protected x'` → `command not found`, код 127).
+is_protected() {
+  case "$1" in
+    research/critiques/*.md|milestones/*.md|docs/rfc/*|docs/contract-rfc/*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 setup_source_only_commit() { # $1=repo $2=before $3=имя → 0, если диапазон непуст и изменён ТОЛЬКО незащищённый
   if [ "$(git -C "$1" rev-parse HEAD)" = "$2" ]; then
     fail "$3 — SETUP НЕ СОСТОЯЛСЯ: диапазон ПУСТ (коммит не случился) — барьер тривиально \
