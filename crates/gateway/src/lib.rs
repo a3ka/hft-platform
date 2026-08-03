@@ -2840,9 +2840,10 @@ pub mod checkpoint {
 // (`td083_pumped_frames_fold_into_full_replay_snapshot`).
 
 /// Резюмируемый живой редьюсер. Персистентно между `pump`-вызовами живёт ТОЛЬКО
-/// vwap-аккумулятор (`sum_pv`/`sum_v`, since-genesis, GW-I-11/TD-083). Каждый `pump`
-/// строит кадр на СВЕЖЕМ `Reducer` (как `frames_since`) — стоимость пропорциональна
-/// ПРИРАЩЕНИЮ (`journal::stream_from(cursor)`, сегментный пропуск), а не длине журнала.
+/// vwap-аккумулятор (`sum_pv`/`sum_v`, since-genesis, GW-I-11/TD-083) — это то, что
+/// докармливает КАЖДЫЙ следующий batch-кадр. Каждый `pump` строит кадр на СВЕЖЕМ
+/// `Reducer` (как `frames_since`) — стоимость пропорциональна ПРИРАЩЕНИЮ
+/// (`journal::stream_from(cursor)`, сегментный пропуск), а не длине журнала.
 pub struct LiveReducer {
     /// since-genesis `Σ(price·size)`/`Σ(size)` — единственное состояние без per-тик
     /// сброса. `values`-карта НЕ переносится между тиками (остаётся пустой на старте
@@ -2853,6 +2854,26 @@ pub struct LiveReducer {
     cursor: Cursor,
     /// Селектор (для построения кадров `frames_since`-стиля в `pump` без sel-параметра).
     selector: Selector,
+    /// M-54 (`TD-093(б)`): полное накопленное состояние, источник `snapshot()`.
+    /// Роль ОТДЕЛЬНАЯ от batch-`Reducer'а в `pump()` (тот остаётся СВЕЖИМ на каждый
+    /// batch — не трогается, sacred `red_frames_seek_bound.rs` требует именно такой
+    /// семантики для кадров wire-протокола). `full` — ПЕРСИСТЕНТНЫЙ `Reducer`, который
+    /// `pump()` кормит КАЖДЫМ событием напрямую (`full.apply(event)`), в ТОМ ЖЕ порядке
+    /// и с ТОЙ ЖЕ per-event оконной эвикцией (`evict_window_state`), какую делает
+    /// `snapshot_from_checkpoint`'s хвостовой цикл — то есть побайтово та же арифметика,
+    /// что и независимый реплей, только растянутая по нескольким `pump()`-вызовам вместо
+    /// одного прохода. Смежный вариант («мёржить уже посчитанные Frame-дельты через
+    /// `Snapshot::apply` раз в batch») ОТБРОШЕН: эвикция окна там срабатывала бы раз на
+    /// ~`max_events` (batch), а не раз на событие — на несимметричном по времени хвосте
+    /// (в частности, при событии с более ранним `ts_exch_ms`, чем у соседей — не
+    /// придуманный случай, реальный urgent-фикс задним числом) это оставляет лишние
+    /// записи, не эвиктнутые вовремя (эмпирически поймано оракулом O-2 на кандидате).
+    full: Reducer,
+    /// Провенанс истории `full` — берётся ОДИН раз из чекпоинта в `resume()` (или из
+    /// первого свёрнутого события на no-checkpoint пути) и не меняется `pump()`: хвост
+    /// не может расширить или сузить то, что уже спрунено ДО чекпоинта.
+    full_history_start_seq: u64,
+    full_history_truncated: bool,
 }
 
 impl LiveReducer {
@@ -2871,21 +2892,31 @@ impl LiveReducer {
         let dir = dir.as_ref();
         let ckpt_dir = ckpt_dir.as_ref();
 
-        if let Some((r, cursor, _header)) =
+        if let Some((r, cursor, header)) =
             checkpoint::read_checkpoint(dir, ckpt_dir, sel, filter.clone())?
         {
             // Чекпоинт валиден: `r.vwap.sum_pv`/`sum_v` — уже честная since-genesis сумма
             // (advance_to накопил её реальным `Reducer::apply` от START). `values` чекпоинта
             // — окно прошлых эмитов, НЕ переносим (см. doc-комментарий `LiveReducer`).
+            let sum_pv = r.vwap.sum_pv;
+            let sum_v = r.vwap.sum_v;
+            // M-54: `full` — САМ восстановленный `Reducer` (уже полное состояние всех
+            // серий на `cursor`, не только vwap) — O(1) здесь, второго чтения журнала
+            // нет. Хвост докормит его `pump()` тем же `apply()`, каким `advance_to`
+            // построил его исходно.
+            let full = r;
             return Ok((
                 Self {
                     vwap: VwapAcc {
-                        sum_pv: r.vwap.sum_pv,
-                        sum_v: r.vwap.sum_v,
+                        sum_pv,
+                        sum_v,
                         values: BTreeMap::new(),
                     },
                     cursor,
                     selector: sel.clone(),
+                    full,
+                    full_history_start_seq: header.history_start_seq,
+                    full_history_truncated: header.history_truncated,
                 },
                 ReadStats::default(),
             ));
@@ -2910,6 +2941,14 @@ impl LiveReducer {
                 vwap: VwapAcc::default(),
                 cursor: Cursor::START,
                 selector: sel.clone(),
+                // M-54: без чекпоинта ничего ещё не свёрнуто в `full` (курсор START,
+                // ничего не эвиктнуто) — согласовано с `cursor: Cursor::START` выше;
+                // sacred `red_frames_seek_bound.rs` требует, чтобы РАБОТУ по наполнению
+                // сделал последующий `pump()`, не `resume()` (см. doc-комментарий
+                // `LiveReducer`, rev2 M-54 оракулов).
+                full: Reducer::new(sel),
+                full_history_start_seq: 0,
+                full_history_truncated: false,
             },
             stats,
         ))
@@ -2974,6 +3013,13 @@ impl LiveReducer {
                 batch_consumed = 0;
             }
             batch.apply(&event);
+            // M-54: `full` кормится КАЖДЫМ событием НАПРЯМУЮ, в том же порядке, что и
+            // `batch` — та же per-event оконная эвикция (`Reducer::apply` →
+            // `evict_window_state`), что у независимого реплея. Никакого чтения журнала:
+            // событие уже декодировано этой же итерацией `stream` (та единственная
+            // работа, которую меряет `ReadStats`/O-1) — здесь только CPU-применение
+            // ко ВТОРОМУ in-memory аккумулятору, не второй проход по диску.
+            self.full.apply(&event);
             cursor = Cursor::at(event.seq);
             batch_consumed += 1;
             // Персистентный аккумулятор обновляется СРАЗУ (не только в конце вызова) — так
@@ -2995,5 +3041,25 @@ impl LiveReducer {
     /// Текущий курсор (последний свёрнутый seq, либо `Cursor::START` если ни одного).
     pub fn cursor(&self) -> Cursor {
         self.cursor
+    }
+
+    /// M-54 (`TD-093(б)`, task #1): отдать ТЕКУЩЕЕ накопленное состояние как `Snapshot`,
+    /// БЕЗ чтения журнала. Сигнатура строго `(&self) -> Snapshot` — ни `dir`, ни `filter`:
+    /// у метода физически нет доступа к журналу, поэтому второй проход по хвосту
+    /// невозможен по построению (тот же типовой приём, что `RK-I-1`: барьер держит
+    /// компилятор, не соглашение). `full` наполняется `resume()` (чекпоинт-ветка, O(1) —
+    /// уже восстановленный `Reducer`) и каждым `pump()` (`full.apply(event)` per-event) —
+    /// здесь только `finish_with_at()` (свёртка накопленного состояния в `SeriesBundle`,
+    /// БЕЗ обращения к диску) над клоном, чтобы не потреблять персистентный `self.full`.
+    pub fn snapshot(&self) -> Snapshot {
+        let (series, _at_ms) = self.full.clone().finish_with_at();
+        Snapshot {
+            schema_version: GATEWAY_SCHEMA_VERSION,
+            selector: self.selector.clone(),
+            cursor: self.cursor,
+            series,
+            history_start_seq: self.full_history_start_seq,
+            history_truncated: self.full_history_truncated,
+        }
     }
 }
