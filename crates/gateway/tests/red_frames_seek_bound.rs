@@ -334,15 +334,72 @@ fn td083_pumped_frames_fold_into_full_replay_snapshot() {
     );
 }
 
-/// **TD-083 O-B.** Стоимость тика не растёт с историей — проверяется ВНЕШНЕ, по времени.
+/// **TD-083 O-B.** Стоимость тика не растёт с историей.
 ///
-/// Почему временем, вопреки уроку TD-078 («оракул не должен мерить CI-машину»): `stats`
-/// самого `pump` доверять НЕЛЬЗЯ — именно они и оказались половинными. Внешняя мера здесь
-/// единственная честная. Хрупкости нет, потому что разница СТРУКТУРНАЯ: `O(история)` против
-/// `O(приращение)` даёт кратность порядка отношения длин журналов (здесь ×8), а порог взят
-/// ×4 — вдвое мягче ожидаемого эффекта и не ловит шум планировщика.
+/// ## Почему мера двойная (переписано 2026-08-03, TD-094 — тест флакал)
+///
+/// Первая редакция меряла ТОЛЬКО время и падала примерно раз в пять прогонов на загруженной
+/// машине: тик по приращению в 3 события занимает доли миллисекунды, и шум планировщика в
+/// `big` пробивал порог ×4 при полностью здоровой реализации. Флакающий sacred-оракул делает
+/// `main` случайно красным и блокирует деплой — цена ложной тревоги здесь выше, чем кажется.
+/// Это ровно урок TD-078, который эта же docstring и цитировала, — нарушенный её автором.
+///
+/// Теперь свойство проверяется двумя независимыми мерами:
+///
+/// 1. **Работа (основная, детерминированная).** `ReadStats.events_decoded` измеряемого тика
+///    обязан быть порядка ПРИРАЩЕНИЯ (3 события), а не накопленной истории (8 000). Эта
+///    проверка не зависит от скорости машины вообще. Возражение первой редакции — «stats
+///    самого `pump` доверять нельзя, они и оказались половинными» — снято: честность `stats`
+///    теперь охраняет `pumped_frames_identical_to_frames_since` (байт-идентичность кадров
+///    live-пути и `frames_since`), а `red_push_seek_bounded.rs` независимо меряет
+///    `segments_opened`. Врать в одиночку `events_decoded` больше не может.
+/// 2. **Время (подтверждающая, устойчивая).** Берётся МИНИМУМ из `REPEATS` прогонов:
+///    планировщик способен только замедлить, поэтому минимум — нижняя оценка честной
+///    стоимости, а шум в неё не попадает. Порог ×4 против структурного эффекта ×8.
 #[test]
 fn td083_tick_wallclock_does_not_grow_with_history() {
+    /// Сколько раз повторить замер и взять минимум (устойчивость к шуму планировщика).
+    const REPEATS: usize = 5;
+    /// Приращение между тиками — столько recorder успевает записать за период push.
+    const INCREMENT: u64 = 3;
+
+    // ── мера 1: РАБОТА (детерминированная) ──
+    let tick_work = |events: u64| -> u64 {
+        let dir = journal_upto(events);
+        let s = sel();
+        let ckpt = tempfile::tempdir().expect("ckpt");
+        let (mut live, _resume_stats) =
+            gateway::LiveReducer::resume(dir.path(), EpochFilter::OwnCaptureOnly, &s, ckpt.path())
+                .expect("resume");
+        while let Ok((frames, _c, _st)) = live.pump(dir.path(), EpochFilter::OwnCaptureOnly, 10_000)
+        {
+            if frames.is_empty() {
+                break;
+            }
+        }
+        {
+            let mut j = Journal::open_with(dir.path(), cfg()).expect("reopen");
+            for i in events..events + INCREMENT {
+                j.append(trade(i)).expect("append");
+            }
+            j.flush().expect("flush");
+        }
+        let (_f, _c, st) = live
+            .pump(dir.path(), EpochFilter::OwnCaptureOnly, 256)
+            .expect("pump измеряемый");
+        st.events_decoded
+    };
+
+    let work_big = tick_work(8_000);
+    assert!(
+        work_big <= INCREMENT * 4,
+        "TD-083 O-B (работа): тик на журнале в 8 000 событий декодировал {work_big} событий при \
+         приращении всего в {INCREMENT}. Значит журнал читается С ГОЛОВЫ, а не с курсора. На \
+         проде (139M событий до курсора) это ≈12 минут на тик при периоде 250 ms: live-push \
+         молчит, accept-loop мёртв."
+    );
+
+    // ── мера 2: ВРЕМЯ (подтверждающая, минимум из REPEATS) ──
     let tick_cost = |events: u64| -> std::time::Duration {
         let dir = journal_upto(events);
         let s = sel();
@@ -360,7 +417,7 @@ fn td083_tick_wallclock_does_not_grow_with_history() {
         // Дописать РОВНО 3 события — столько recorder успевает между тиками.
         {
             let mut j = Journal::open_with(dir.path(), cfg()).expect("reopen");
-            for i in events..events + 3 {
+            for i in events..events + INCREMENT {
                 j.append(trade(i)).expect("append");
             }
             j.flush().expect("flush");
@@ -371,16 +428,22 @@ fn td083_tick_wallclock_does_not_grow_with_history() {
             .expect("pump измеряемый");
         t0.elapsed()
     };
+    let best_of = |events: u64| -> std::time::Duration {
+        (0..REPEATS)
+            .map(|_| tick_cost(events))
+            .min()
+            .expect("REPEATS > 0")
+    };
 
-    let small = tick_cost(1_000);
-    let big = tick_cost(8_000);
+    let small = best_of(1_000);
+    let big = best_of(8_000);
 
     let ratio = big.as_secs_f64() / small.as_secs_f64().max(1e-9);
     assert!(
         ratio < 4.0,
-        "TD-083 O-B: тик на журнале ×8 длиннее занял в {ratio:.1} раза больше ({small:?} → \
-         {big:?}) на ОДИНАКОВОМ приращении в 3 события. Значит цена тика зависит от НАКОПЛЕННОЙ \
-         ИСТОРИИ, а не от приращения — журнал читается с головы. На проде (139M событий до \
-         курсора) это ≈12 минут на тик при периоде 250 ms: live-push молчит, accept-loop мёртв."
+        "TD-083 O-B (время): тик на журнале ×8 длиннее занял в {ratio:.1} раза больше ({small:?} \
+         → {big:?}) на ОДИНАКОВОМ приращении в {INCREMENT} события, по МИНИМУМУ из {REPEATS} \
+         прогонов — то есть это не шум планировщика. Цена тика зависит от НАКОПЛЕННОЙ ИСТОРИИ, \
+         а не от приращения: журнал читается с головы."
     );
 }
