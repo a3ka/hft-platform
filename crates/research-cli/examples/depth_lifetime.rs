@@ -137,57 +137,57 @@ fn main() {
             "{:<8} {:<10} {:<8} {:<10} {:<10} {:<10} {:<10} {:<10}",
             side_str,
             format!("[{},{})", band.lo_bps, band.hi_bps),
-            band.born,
-            band.cancelled,
-            band.frozen,
-            band.censored,
+            band.lives_born,
+            band.lives_cancelled,
+            band.lives_frozen,
+            band.lives_censored,
             frac_str,
             near_far,
         );
     }
 
     // ── Сводка near vs far (ключевой вывод M-32) ──
-    let mut near_born = 0u64;
-    let mut near_cancelled = 0u64;
-    let mut near_frozen = 0u64;
-    let mut near_censored = 0u64;
-    let mut far_born = 0u64;
-    let mut far_cancelled = 0u64;
-    let mut far_frozen = 0u64;
-    let mut far_censored = 0u64;
+    let mut near_lives_born = 0u64;
+    let mut near_lives_cancelled = 0u64;
+    let mut near_lives_frozen = 0u64;
+    let mut near_lives_censored = 0u64;
+    let mut far_lives_born = 0u64;
+    let mut far_lives_cancelled = 0u64;
+    let mut far_lives_frozen = 0u64;
+    let mut far_lives_censored = 0u64;
     for band in &report.bands {
         if band.lo_bps < 150 {
-            near_born += band.born;
-            near_cancelled += band.cancelled;
-            near_frozen += band.frozen;
-            near_censored += band.censored;
+            near_lives_born += band.lives_born;
+            near_lives_cancelled += band.lives_cancelled;
+            near_lives_frozen += band.lives_frozen;
+            near_lives_censored += band.lives_censored;
         } else if band.lo_bps >= 500 {
-            far_born += band.born;
-            far_cancelled += band.cancelled;
-            far_frozen += band.frozen;
-            far_censored += band.censored;
+            far_lives_born += band.lives_born;
+            far_lives_cancelled += band.lives_cancelled;
+            far_lives_frozen += band.lives_frozen;
+            far_lives_censored += band.lives_censored;
         }
     }
-    let near_frac = if near_cancelled + near_frozen > 0 {
-        near_cancelled as f64 / (near_cancelled + near_frozen) as f64
+    let near_frac = if near_lives_cancelled + near_lives_frozen > 0 {
+        near_lives_cancelled as f64 / (near_lives_cancelled + near_lives_frozen) as f64
     } else {
         f64::NAN
     };
-    let far_frac = if far_cancelled + far_frozen > 0 {
-        far_cancelled as f64 / (far_cancelled + far_frozen) as f64
+    let far_frac = if far_lives_cancelled + far_lives_frozen > 0 {
+        far_lives_cancelled as f64 / (far_lives_cancelled + far_lives_frozen) as f64
     } else {
         f64::NAN
     };
     println!("\n=== Сводка NEAR (≤150bps) vs FAR (≥500bps) ===");
     println!(
-        "NEAR: born={near_born} cancelled={near_cancelled} frozen={near_frozen} censored={near_censored} \
+        "NEAR: born={near_lives_born} cancelled={near_lives_cancelled} frozen={near_lives_frozen} censored={near_lives_censored} \
          cancel_fraction={near_frac:.3}"
     );
     println!(
-        "FAR : born={far_born} cancelled={far_cancelled} frozen={far_frozen} censored={far_censored} \
+        "FAR : born={far_lives_born} cancelled={far_lives_cancelled} frozen={far_lives_frozen} censored={far_lives_censored} \
          cancel_fraction={far_frac:.3}"
     );
-    if far_cancelled + far_frozen == 0 {
+    if far_lives_cancelled + far_lives_frozen == 0 {
         println!("(FAR cancel_fraction=N/A — все уровни либо censored, либо окно пустое)");
     }
 
@@ -251,7 +251,7 @@ fn print_summary_json(
         bands_out.push_str(&format!(
             "{{\"side\":\"{side}\",\"lo_bps\":{},\"hi_bps\":{},\"born\":{},\"cancelled\":{},\
              \"frozen\":{},\"censored\":{},\"cancel_fraction\":{frac}}}",
-            b.lo_bps, b.hi_bps, b.born, b.cancelled, b.frozen, b.censored,
+            b.lo_bps, b.hi_bps, b.lives_born, b.lives_cancelled, b.lives_frozen, b.lives_censored,
         ));
     }
     let epoch_json = format!(
