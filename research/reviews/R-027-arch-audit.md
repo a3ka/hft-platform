@@ -507,3 +507,52 @@ exit=0
 
 *Reviewer, 2026-08-03, круг 2. Тронут только этот файл + `PROJECT-STATE.md`/`TECH-DEBT.md`
 после merge.*
+
+---
+
+## §14. Пруф пост-merge деплой-гейта (`gates.md` §8) — GREEN
+
+Merge: `7b8756b` (`--no-ff`), плюс `15f7860` (`PROJECT-STATE`/`TECH-DEBT`). Push
+`cb07126..15f7860 HEAD -> main`, push-scope перед push проверен — 14 коммитов, все из цепочки
+этой ветки (architect / critic / reviewer), чужих нет.
+
+```
+$ gh run list --limit 4
+30837805844 CI            completed success 15f7860 push
+30834284355 Deploy to VPS completed success cb07126 push
+30834283821 CI            completed success cb07126 push
+30833652802 CI            completed success 5bc3b9a push
+$ gh run watch 30837805844 --exit-status; echo watch_exit=$?
+watch_exit=0
+```
+
+**Deploy на `15f7860` НЕ запускался — и это корректно, а не пропуск гейта.** Диф чисто
+документный, а `deploy.yml` с `cb07126` фильтрует пути (`crates/**`, `Cargo.*`, `Dockerfile`,
+`docker-compose.yml`, `deploy/**`) — то есть П-008 п.3 отработал ровно как задуман: запись
+данных не рвётся ради правки документа. Прод обязан остаться на `cb07126` — проверено ниже.
+`CI` при этом гоняется на КАЖДЫЙ push в `main` без фильтра путей (`ci.yml:6-7`), поэтому
+подтверждение зелёного `cargo test --all` получено. Отдельно отмечаю: `TD-094` на этом
+прогоне не выстрелил (флак 1 из 3), что долг не отменяет.
+
+**Eyes-on VPS (read-only, 2026-08-03T17:48:59Z / 17:49:11Z):**
+```
+hft-gateway-serve Up 43 minutes (healthy)
+hft-recorder      Up 43 minutes (healthy)
+{"events":233105,…,"next_seq":158495874,"segment_index":166,"ts_wall_ms":1785779335142,"writable":true}
+{"events":233806,…,"next_seq":158496576,"segment_index":166,"ts_wall_ms":1785779345141,"writable":true}
+$ git -C /root/hft-platform log --oneline -1
+cb07126 ops(TD-086): concurrency deploy-main без отмены + push тестов не деплоит прод …
+/hft-recorder restarts=0
+/hft-gateway-serve restarts=0
+hft-gateway-serve CPU=0.00% MEM=31.08MiB
+hft-recorder      CPU=2.06% MEM=24.57MiB
+```
+`next_seq` растёт (+702 события за 12 s), heartbeat отстаёт ~6 s, `writable=true`,
+`free_bytes` 78.5 GB, `restarts=0`, HEAD прода **не сдвинулся** (`cb07126`) — деплоя не было,
+как и требовалось. `gateway-serve` `CPU=0.00%` уже ПОСЛЕ моего WS-подключения (§10) ⇒ `TD-083`
+не воскрес.
+
+**§8 — GREEN.** Milestone-объект здесь отсутствует (ветка документная), поэтому close-out
+сводится к этому пруфу + записям в `PROJECT-STATE.md`/`TECH-DEBT.md`.
+
+*Reviewer, 2026-08-03. Пруф §8 добавлен в уже принятый документ — `gates.md` §9 класс B.*
