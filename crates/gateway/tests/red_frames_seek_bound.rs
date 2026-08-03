@@ -387,7 +387,7 @@ fn td083_tick_wallclock_does_not_grow_with_history() {
         let (_f, _c, st) = live
             .pump(dir.path(), EpochFilter::OwnCaptureOnly, 256)
             .expect("pump измеряемый");
-        st.events_decoded as u64
+        st.events_decoded
     };
 
     let work_big = tick_work(8_000);

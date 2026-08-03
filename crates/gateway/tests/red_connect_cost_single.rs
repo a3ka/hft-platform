@@ -149,7 +149,7 @@ fn pump_to_tail(live: &mut gateway::LiveReducer, dir: &std::path::Path) -> u64 {
         let (frames, _cursor, stats) = live
             .pump(dir, EpochFilter::OwnCaptureOnly, 128)
             .expect("pump");
-        decoded += stats.events_decoded as u64;
+        decoded += stats.events_decoded;
         if frames.is_empty() {
             break;
         }

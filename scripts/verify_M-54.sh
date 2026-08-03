@@ -50,16 +50,30 @@ echo "--- T4b: ВТОРОЙ ПРОХОД УБРАН с пути подключе
 # snapshot_from_checkpoint, состояние по-прежнему считается дважды, а T3/T4 этого не видят —
 # они живут в крейте gateway. Канарейка «механизм на пути» (тот же приём, что T6 в M-53).
 SESSION_SRC=crates/gateway-serve/src/lib.rs
-if grep -qE "snapshot_from_checkpoint" "$SESSION_SRC"; then
-  fail "T4b gateway-serve всё ещё вызывает snapshot_from_checkpoint — второй проход на месте"
-  grep -nE "snapshot_from_checkpoint" "$SESSION_SRC" | head -5
+# ВАЖНО про область поиска (исправлено после первого прогона — канарейка была слишком грубой).
+# Грепать ВЕСЬ файл нельзя: `snapshot_from_checkpoint` обязан остаться в крейте — на нём
+# стоит passthrough-адаптер `serve::snapshot_msg`, который оракулы M-46
+# (`red_ws_series_vs_replay`) используют как НЕЗАВИСИМЫЙ эталон. Удалить его = лишить
+# сверку WS↔реплей второго, честного пути. Проверять надо ПУТЬ ПОДКЛЮЧЕНИЯ, то есть тело
+# `run_authorized_session`, а не факт присутствия символа в файле.
+SESSION_BODY=$(awk '/fn run_authorized_session/,/^\}/' "$SESSION_SRC" | grep -v '^\s*//')
+if printf '%s' "$SESSION_BODY" | grep -qE "snapshot_from_checkpoint|snapshot_msg\("; then
+  fail "T4b путь подключения всё ещё считает состояние вторым проходом"
+  printf '%s' "$SESSION_BODY" | grep -nE "snapshot_from_checkpoint|snapshot_msg\(" | head -5
 else
-  pass "T4b на пути подключения нет snapshot_from_checkpoint"
+  pass "T4b в run_authorized_session нет второго прохода по журналу"
 fi
-if grep -qE "\.snapshot\(\)" "$SESSION_SRC"; then
-  pass "T4b снапшот клиента берётся из живого состояния"
+if printf '%s' "$SESSION_BODY" | grep -qE "live\.snapshot\(\)"; then
+  pass "T4b снапшот клиента берётся из живого состояния (live.snapshot())"
 else
-  fail "T4b LiveReducer::snapshot() не используется в gateway-serve — задача 2 не сделана"
+  fail "T4b live.snapshot() не на пути подключения — задача 2 не сделана"
+fi
+# Обратная канарейка: эталон M-46 обязан ОСТАТЬСЯ в крейте. Если кто-то «почистит» его
+# заодно с оптимизацией, сверка WS↔реплей потеряет независимый путь и станет тавтологией.
+if grep -qE "snapshot_from_checkpoint" "$SESSION_SRC"; then
+  pass "T4b эталон snapshot_from_checkpoint сохранён для оракулов M-46"
+else
+  fail "T4b snapshot_from_checkpoint УДАЛЁН из крейта — сверка WS↔реплей лишилась эталона"
 fi
 
 echo "--- T5: РЕГРЕСС — наборы M-46 и M-53 остаются зелёными ---"
