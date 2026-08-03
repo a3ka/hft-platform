@@ -46,8 +46,8 @@ reviewer → §8 + **прогон против прода**.
 
 | # | Задача | Зона | Статус | Оракул |
 |---|---|---|---|---|
-| 1 | **`LiveReducer::snapshot(&self) -> Snapshot`** — отдать текущее состояние как `Snapshot` без повторного чтения журнала. Аддитивно; существующие методы не меняются | engine-dev | ⏳ OPEN | O-1, O-2 |
-| 2 | Push-цикл `gateway-serve` берёт первый снапшот из `LiveReducer`, а НЕ из `snapshot_from_checkpoint` | engine-dev | ⏳ OPEN | **O-1** |
+| 1 | **`LiveReducer::snapshot(&self) -> Snapshot`** — отдать текущее состояние как `Snapshot` без повторного чтения журнала. Аддитивно; существующие методы не меняются | engine-dev | 🚧 IN_PROGRESS — BLOCKED, см. `research/reports/M-54-engine-dev-report.md` | O-1, O-2 |
+| 2 | Push-цикл `gateway-serve` берёт первый снапшот из `LiveReducer`, а НЕ из `snapshot_from_checkpoint` | engine-dev | ⏳ OPEN — зависит от задачи 1 | **O-1** |
 | 3 | RED-оракулы O-1..O-3 | **architect** (sacred) | ⏳ OPEN | — |
 | 4 | `scripts/verify_M-54.sh` | **architect** (sacred) | ⏳ OPEN | — |
 
