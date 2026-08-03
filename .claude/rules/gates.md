@@ -262,8 +262,14 @@ rollback). **Push — не конец цикла.** Агент, сделавши
    ssh -i /home/nous/.ssh/hft_deploy -o IdentitiesOnly=yes root@167.233.192.131 \
      'docker ps --format "{{.Names}} {{.Status}}"; cat /var/lib/docker/volumes/hft-platform_journal-data/_data/recorder.heartbeat'
    ```
-   Ожидание: контейнеры `(healthy)`, heartbeat свежий, журнал растёт. Rollback ловит падение
-   healthcheck, но НЕ тихую деградацию (контейнер жив, данные испорчены).
+   Ожидание: контейнеры `(healthy)`, heartbeat свежий, журнал растёт, **CPU/MEM в норме**.
+   **Если деплой менял поведение данных (парсеры/форматы) — sanity свежих событий по мере
+   возможности.** Rollback ловит падение healthcheck, но НЕ тихую деградацию (контейнер жив,
+   данные испорчены). Три liveness-проверки (`healthy` / heartbeat / рост журнала) верны и
+   при испорченном содержимом событий, и при утечке памяти — именно поэтому ресурсный и
+   содержательный пункты обязательны, а не факультативны: TD-011 (`Journal::open` читал
+   сегмент целиком в RAM) поймал ТОЛЬКО CPU/MEM-взгляд на VPS, TD-031 (recorder смешивал
+   L2Delta в чужой сегмент) — ТОЛЬКО sanity свежих событий после смены формата.
 3. **Пруф в close-out:** сырые строки `gh run list` + вывод ssh — в Done Block.
 4. **Worktree-GC:** после merge feat→main reviewer запускает `bash scripts/gc_worktrees.sh`.
 
