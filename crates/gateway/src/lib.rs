@@ -1761,6 +1761,9 @@ pub fn snapshot(
 /// fold'а `Snapshot(C) + frames_since(C..) == snapshot(LATEST)` под окном (`apply()` использует
 /// `at_ms` для эвикции existing под финальное окно — иначе existing держит бакеты `[C−W, C]`,
 /// а финальное окно — `[LATEST−W, LATEST]`).
+///
+/// Тонкая обёртка над [`frames_since_with_stats`] — совместимость сигнатуры сохранена
+/// (M-47/TD-083 task #1), `ReadStats` отбрасывается.
 pub fn frames_since(
     dir: impl AsRef<Path>,
     filter: EpochFilter,
@@ -1768,14 +1771,55 @@ pub fn frames_since(
     after: Cursor,
     max_events: usize,
 ) -> io::Result<(Vec<Frame>, Cursor)> {
+    let (frames, cursor, _stats) = frames_since_with_stats(dir, filter, sel, after, max_events)?;
+    Ok((frames, cursor))
+}
+
+/// M-47 (TD-083, GW-I-11): live-push версия `frames_since` c SEEK вместо чтения журнала с
+/// головы на каждом тике.
+///
+/// **Причина.** Прежняя реализация открывала `journal::stream(dir, filter)` — от НАЧАЛА
+/// журнала — и лишь потом отбрасывала всё до курсора внутри `reduce_event_stream`. Snapshot-путь
+/// (`snapshot_from_checkpoint`) уже чинили этим же способом в M-38b (`GW-I-11`): live-push-путь
+/// фикс не получил. На проде это стоило ≈12 минут на ОДИН тик (≈139M событий истории при
+/// ≈190k событий/с), планируемый каждые 250 ms — live-push молчал навсегда, а однопоточный
+/// рантайм `gateway-serve` (без `spawn_blocking`, см. `serve::frames_msgs`/`server::
+/// run_authorized_session`) при этом простаивал целиком на одном блокирующем вызове.
+///
+/// **Фикс.** `journal::stream_from(dir, filter, after.upto_seq)` — сегментный skip (те же
+/// гарантии, что и у `snapshot_from_checkpoint`). `stream_from` может начать НЕМНОГО раньше
+/// `after` (пропускает сегмент целиком только если ВЕСЬ он `<= after`) — семантика при этом не
+/// меняется: `reduce_event_stream` уже умеет `seed_vwap`-обрабатывать события `seq <= after`
+/// внутри стрима (та же ветка, что используется `snapshot_from_checkpoint`'ом при досчёте
+/// хвоста от чекпоинта) и отбрасывать их из дельты. Кадры остаются байт-идентичными версии
+/// «с головы» — разница только в объёме прочитанного (`ReadStats.segments_opened`).
+///
+/// Возвращает честные `ReadStats` — симметрично `snapshot_from_checkpoint`, для §8 eyes-on и
+/// для RED-оракула `red_push_seek_bounded.rs` (`crates/gateway/tests/`), который меряет РАБОТУ
+/// (число открытых сегментов), а не время (урок TD-078: потолок wall-clock — измеритель
+/// CI-машины, не инварианта).
+pub fn frames_since_with_stats(
+    dir: impl AsRef<Path>,
+    filter: EpochFilter,
+    sel: &Selector,
+    after: Cursor,
+    max_events: usize,
+) -> io::Result<(Vec<Frame>, Cursor, ReadStats)> {
     validate_selector(sel)?;
-    let mut stream = journal::stream(dir, filter)?;
+    let mut stream = journal::stream_from(dir, filter, after.upto_seq)?;
     let (delta, cursor, consumed, at_ms, _first_folded_seq) =
         reduce_event_stream(&mut stream, sel, after, Cursor::LATEST, max_events)?;
+    // Stats ПОСЛЕ итерации (счётчики инкрементируются в `next()`, зеркалит
+    // `snapshot_from_checkpoint`/`read_stats_from_stream`).
+    let stats = read_stats_from_stream(&stream);
     if consumed == 0 {
-        return Ok((Vec::new(), after));
+        return Ok((Vec::new(), after, stats));
     }
-    Ok((vec![Frame::versioned(after, cursor, delta, at_ms)], cursor))
+    Ok((
+        vec![Frame::versioned(after, cursor, delta, at_ms)],
+        cursor,
+        stats,
+    ))
 }
 
 /// Детерминированный replay окна `(from .. to]` тем же редьюсером, что live (VB-I-2/GW-I-3).
