@@ -1762,8 +1762,16 @@ pub fn snapshot(
 /// `at_ms` для эвикции existing под финальное окно — иначе existing держит бакеты `[C−W, C]`,
 /// а финальное окно — `[LATEST−W, LATEST]`).
 ///
-/// Тонкая обёртка над [`frames_since_with_stats`] — совместимость сигнатуры сохранена
-/// (M-47/TD-083 task #1), `ReadStats` отбрасывается.
+/// **M-47/TD-083 (task #1): НЕ делегирует в [`frames_since_with_stats`].** См. doc-комментарий
+/// той функции — seek (`journal::stream_from`) структурно ломает `seed_vwap`-семантику
+/// (`VwapAcc` — since-genesis аккумулятор, `Snapshot::apply` мёржит `vwap`-ряд через
+/// `BTreeMap::extend`, т.е. ЗАМЕНОЙ по ключу `time_s`, не инкрементом — значению кадра ОБЯЗАНО
+/// быть абсолютно корректным, не локальным). Эмпирически подтверждено регрессией на sacred
+/// `red_gateway_live_eq_replay.rs::mid_stream_snapshot_completeness_merges_same_bucket`,
+/// `red_gateway_window.rs::windowed_live_eq_replay*`,
+/// `red_ws_protocol.rs::o3_frames_converge_to_latest` — все три ловят разошедшийся `vwap` при
+/// сегментном skip. `frames_since` остаётся ИСХОДНОЙ (полное чтение с головы) реализацией —
+/// совместимость и корректность не ломаем.
 pub fn frames_since(
     dir: impl AsRef<Path>,
     filter: EpochFilter,
@@ -1771,33 +1779,49 @@ pub fn frames_since(
     after: Cursor,
     max_events: usize,
 ) -> io::Result<(Vec<Frame>, Cursor)> {
-    let (frames, cursor, _stats) = frames_since_with_stats(dir, filter, sel, after, max_events)?;
-    Ok((frames, cursor))
+    validate_selector(sel)?;
+    let mut stream = journal::stream(dir, filter)?;
+    let (delta, cursor, consumed, at_ms, _first_folded_seq) =
+        reduce_event_stream(&mut stream, sel, after, Cursor::LATEST, max_events)?;
+    if consumed == 0 {
+        return Ok((Vec::new(), after));
+    }
+    Ok((vec![Frame::versioned(after, cursor, delta, at_ms)], cursor))
 }
 
-/// M-47 (TD-083, GW-I-11): live-push версия `frames_since` c SEEK вместо чтения журнала с
-/// головы на каждом тике.
+/// M-47 (TD-083, GW-I-11, task #1): **аддитивная**, seek-bound (`journal::stream_from`) версия
+/// `frames_since`, для RED-оракула `red_push_seek_bounded.rs` (`crates/gateway/tests/`), который
+/// меряет РАБОТУ одного тика (`ReadStats.segments_opened`), а не время (урок TD-078).
 ///
-/// **Причина.** Прежняя реализация открывала `journal::stream(dir, filter)` — от НАЧАЛА
-/// журнала — и лишь потом отбрасывала всё до курсора внутри `reduce_event_stream`. Snapshot-путь
-/// (`snapshot_from_checkpoint`) уже чинили этим же способом в M-38b (`GW-I-11`): live-push-путь
-/// фикс не получил. На проде это стоило ≈12 минут на ОДИН тик (≈139M событий истории при
-/// ≈190k событий/с), планируемый каждые 250 ms — live-push молчал навсегда, а однопоточный
-/// рантайм `gateway-serve` (без `spawn_blocking`, см. `serve::frames_msgs`/`server::
-/// run_authorized_session`) при этом простаивал целиком на одном блокирующем вызове.
+/// # ⚠ Известное ограничение (НЕ используется `frames_since`/`gateway-serve` — см. ниже)
 ///
-/// **Фикс.** `journal::stream_from(dir, filter, after.upto_seq)` — сегментный skip (те же
-/// гарантии, что и у `snapshot_from_checkpoint`). `stream_from` может начать НЕМНОГО раньше
-/// `after` (пропускает сегмент целиком только если ВЕСЬ он `<= after`) — семантика при этом не
-/// меняется: `reduce_event_stream` уже умеет `seed_vwap`-обрабатывать события `seq <= after`
-/// внутри стрима (та же ветка, что используется `snapshot_from_checkpoint`'ом при досчёте
-/// хвоста от чекпоинта) и отбрасывать их из дельты. Кадры остаются байт-идентичными версии
-/// «с головы» — разница только в объёме прочитанного (`ReadStats.segments_opened`).
+/// `journal::stream_from(after.upto_seq)` делает сегментный skip: сегменты, ЦЕЛИКОМ лежащие
+/// `<= after`, никогда не попадают в стрим. Это корректно для ДЕЛЬТЫ (`reduce_event_stream`
+/// отфильтрует остаток по `seq <= after` через `seed_vwap`-ветку), но `seed_vwap` в этом случае
+/// видит ТОЛЬКО хвостовые (не пропущенные) события — не всю историю от START. Для полей,
+/// которые `Reducer` накапливает как SINCE-GENESIS аккумулятор без per-тик сброса (`VwapAcc`:
+/// `self.vwap.apply_trade(.., emit=false)` в `seed_vwap`) это ломает абсолютное значение в
+/// возвращаемом `Frame.delta.vwap` — а `Snapshot::apply` мёржит `vwap`-ряд ЗАМЕНОЙ по ключу
+/// (`BTreeMap::extend`, не инкрементом), т.е. требует АБСОЛЮТНО корректного значения кадра.
 ///
-/// Возвращает честные `ReadStats` — симметрично `snapshot_from_checkpoint`, для §8 eyes-on и
-/// для RED-оракула `red_push_seek_bounded.rs` (`crates/gateway/tests/`), который меряет РАБОТУ
-/// (число открытых сегментов), а не время (урок TD-078: потолок wall-clock — измеритель
-/// CI-машины, не инварианта).
+/// Эмпирически: подмена `journal::stream` → `journal::stream_from` ВНУТРИ `frames_since`
+/// (как в первой версии этого коммита) ломает GW-I-4/VB-I-2 — три sacred-оракула
+/// (`red_gateway_live_eq_replay.rs`, `red_gateway_window.rs`, `red_ws_protocol.rs`) поймали
+/// расхождение `vwap` при первом же прогоне. Поэтому:
+///
+/// - `frames_since` (стабильный публичный API, каждый caller полагается на since-genesis
+///   корректность VWAP) — НЕ делегирует сюда, остаётся полным чтением с головы;
+/// - `gateway-serve`'s push-loop (task #3/#4, `crates/gateway-serve/src/lib.rs`) продолжает
+///   звать `frames_since` (обёрнуто в `spawn_blocking` — фикс потока рантайма, root cause 2 из
+///   `R-025`), а НЕ эту функцию — иначе прод получил бы БЫСТРЫЙ, но НЕЧЕСТНЫЙ VWAP (хуже, чем
+///   текущий «молчит», см. `docs/DESIGN.md` анти-плацебо принцип).
+/// - эта функция существует АДДИТИВНО (только для O-1/O-2), и представляет реальный открытый
+///   архитектурный вопрос — см. `research/reports/M-47-engine-dev-report.md` §Находка
+///   (рекомендация: `gateway::LiveReducer`, `crates/gateway/src/lib.rs:2802`, персистентный
+///   между тиками аккумулятор, устраняет саму нужду в reseed, но требует redesign
+///   `LiveReducer::pump`, которая СЕЙЧАС САМА зовёт `frames_since` внутри и потому НЕ даёт
+///   реального ограничения по чтению несмотря на GREEN `pump_at_tail_is_bounded` — архитектурная
+///   находка, не в периметре моих allowed paths/задач).
 pub fn frames_since_with_stats(
     dir: impl AsRef<Path>,
     filter: EpochFilter,
