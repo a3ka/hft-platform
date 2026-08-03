@@ -261,7 +261,7 @@ multi-tenancy, read-path, L2Delta, Source Adapter, Agent Runtime, права н�
    founder»), `docs/08` R7 — синхронизация с SaaS-тезисом.
 3. `docs/fa/risk.md`, `fa/killswitch.md`, `fa/oms.md` — шапка `STATUS: DEFERRED — крейта не
    существует` (проверено: `ls crates/` их не содержит; 19 файлов ссылаются на них как на реальность).
-4. **DOC-гейт (`gates.md` §9, класс A):** critic → **risk-critic** (обязателен: трогаем
+4. **DOC-гейт (`gates.md` §9, критик по триггерам формы):** critic → **risk-critic** (обязателен: трогаем
    `fa/risk`/`killswitch`/`oms` и `INTG-I-*`) → reviewer (`PROPOSED → ACTIVE`, merge, push) →
    **founder ★** (меняются фазы/приоритеты).
 
