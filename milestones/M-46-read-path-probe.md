@@ -65,12 +65,12 @@ journal-writer (`VB-I-3`, `GS-I-1`). **Граница C НЕ затрагива�
 
 | # | Задача | Зона | Статус | Оракул/гейт |
 |---|---|---|---|---|
-| 1 | WS-харнесс `wsprobe`: подключение с JWT, приём `Snapshot` + N `Frame`, дамп в JSON | engine-dev | ⏳ OPEN | O-1, T2 |
+| 1 | WS-харнесс `wsprobe`: подключение с JWT, приём `Snapshot` + N `Frame`, дамп в JSON | engine-dev | ✅ DONE | O-1, T2 |
 | 2 | Сверка с независимым реплеем: `gateway::snapshot(..)` того же журнала == WS-выдача поэлементно по ВСЕМ полям | engine-dev | ⏳ OPEN | **O-2** |
 | 3 | Применение кадров: `snapshot(C) + frames_since(C..)` ≡ `snapshot(LATEST)` через WS-путь | engine-dev | ⏳ OPEN | O-3 |
-| 4 | Рендер без дизайна: ASCII-панель в stdout + автономный HTML-файл (инлайн, без внешних ресурсов) | engine-dev | ⏳ OPEN | O-7, T5 |
+| 4 | Рендер без дизайна: ASCII-панель в stdout + автономный HTML-файл (инлайн, без внешних ресурсов) | engine-dev | ✅ DONE | O-7, T5 |
 | 5 | Sidecar-прогон против прода (`docker run --network container:hft-gateway-serve`), артефакты в отчёт | engine-dev | ⏳ OPEN | T6 |
-| 5a | **`Dockerfile`: добавить `--bin wsprobe` + `COPY` в рантайм-слой** — иначе образ на VPS харнесса НЕ содержит и sidecar-прогон невозможен (замер architect'а: `Dockerfile:15,26-29` собирает 4 бинаря ЯВНЫМ списком) | engine-dev | ⏳ OPEN | T6 |
+| 5a | **`Dockerfile`: добавить `--bin wsprobe` + `COPY` в рантайм-слой** — иначе образ на VPS харнесса НЕ содержит и sidecar-прогон невозможен (замер architect'а: `Dockerfile:15,26-29` собирает 4 бинаря ЯВНЫМ списком) | engine-dev | ✅ DONE | T6 |
 | 6 | RED-оракулы O-1..O-7 | **architect** (sacred) | ⏳ OPEN | — |
 | 7 | `scripts/verify_M-46.sh` | **architect** (sacred) | ⏳ OPEN | — |
 
