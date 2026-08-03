@@ -259,3 +259,128 @@ fn resume_without_checkpoint_reports_full_replay() {
         stats.events_decoded
     );
 }
+
+// ═══════════════════ TD-083 rev2: замена ТАВТОЛОГИЧНЫХ проверок ═══════════════════
+//
+// Найдено architect'ом 2026-08-03 при разборе TD-083 (P0, прод-read-path был мёртв).
+// Оба теста выше ЗЕЛЁНЫЕ и при этом не давят ни на что:
+//
+// 1. `pumped_frames_identical_to_frames_since` сравнивает кадры `pump` с `frames_since`.
+//    Но `pump` (`gateway/src/lib.rs:2941`) БУКВАЛЬНО ВОЗВРАЩАЕТ результат `frames_since` —
+//    комментарий в коде признаётся: «Используем frames_since для byte-identity с эталоном…
+//    Это компромисс». ⇒ функция сравнивается сама с собой, зелено всегда.
+// 2. `pump_at_tail_is_bounded` проверяет `events_decoded <= 64`, но `stats` берутся из
+//    `read_stats_from_stream(&stream)` — потока `stream_from`, то есть ТОЛЬКО второй фазы.
+//    Работа, потраченная внутри `frames_since` (чтение журнала с ГОЛОВЫ), в `stats` не
+//    попадает. ⇒ измеряется половина, подтверждается ограниченность, которой нет.
+//
+// Это ровно класс `C-055` §2: «сравнение технически присутствует, но математически
+// сравнивает пустое с пустым». Ниже — проверки, которые ПАДАЮТ против такой конструкции.
+
+/// **TD-083 O-A.** Byte-identity против НЕЗАВИСИМОГО эталона.
+///
+/// Эталон — не `frames_since` (тогда сравнение тавтологично), а **полный реплей**:
+/// `snapshot(START) + все кадры pump ≡ snapshot(LATEST)`. Это свойство нельзя удовлетворить,
+/// вернув чужой результат: оно связывает кадры с независимо посчитанным состоянием журнала.
+#[test]
+fn td083_pumped_frames_fold_into_full_replay_snapshot() {
+    let dir = journal_upto(N);
+    let s = sel();
+
+    let ckpt = tempfile::tempdir().expect("ckpt");
+    let (mut live, _resume_stats) =
+        gateway::LiveReducer::resume(dir.path(), EpochFilter::OwnCaptureOnly, &s, ckpt.path())
+            .expect("resume");
+
+    // Стартовое состояние — независимый реплей до курсора, с которого начал LiveReducer.
+    let mut folded = gateway::snapshot(
+        dir.path(),
+        EpochFilter::OwnCaptureOnly,
+        &s,
+        gateway::Cursor::START,
+    )
+    .expect("snapshot(START)");
+
+    // Цепочка тиков — ровно то, что крутится в соединении.
+    for _ in 0..8 {
+        let (frames, _cursor, _stats) = live
+            .pump(dir.path(), EpochFilter::OwnCaptureOnly, 100)
+            .expect("pump");
+        if frames.is_empty() {
+            break;
+        }
+        for f in &frames {
+            folded.apply(f);
+        }
+    }
+
+    let full = gateway::snapshot(
+        dir.path(),
+        EpochFilter::OwnCaptureOnly,
+        &s,
+        gateway::Cursor::LATEST,
+    )
+    .expect("snapshot(LATEST)");
+
+    assert_eq!(
+        folded.cursor, full.cursor,
+        "TD-083 O-A: свёртка кадров pump не дошла до конца журнала"
+    );
+    assert_eq!(
+        folded.series, full.series,
+        "TD-083 O-A: snapshot(START) + кадры pump ≠ snapshot(LATEST) — live-путь расходится \
+         с независимым полным реплеем. Сравнение с `frames_since` этого НЕ поймало бы: pump \
+         возвращает её же результат"
+    );
+}
+
+/// **TD-083 O-B.** Стоимость тика не растёт с историей — проверяется ВНЕШНЕ, по времени.
+///
+/// Почему временем, вопреки уроку TD-078 («оракул не должен мерить CI-машину»): `stats`
+/// самого `pump` доверять НЕЛЬЗЯ — именно они и оказались половинными. Внешняя мера здесь
+/// единственная честная. Хрупкости нет, потому что разница СТРУКТУРНАЯ: `O(история)` против
+/// `O(приращение)` даёт кратность порядка отношения длин журналов (здесь ×8), а порог взят
+/// ×4 — вдвое мягче ожидаемого эффекта и не ловит шум планировщика.
+#[test]
+fn td083_tick_wallclock_does_not_grow_with_history() {
+    let tick_cost = |events: u64| -> std::time::Duration {
+        let dir = journal_upto(events);
+        let s = sel();
+        let ckpt = tempfile::tempdir().expect("ckpt");
+        let (mut live, _resume_stats) =
+            gateway::LiveReducer::resume(dir.path(), EpochFilter::OwnCaptureOnly, &s, ckpt.path())
+                .expect("resume");
+        // Догнать хвост, чтобы следующий тик был «живым» — по приращению.
+        while let Ok((frames, _c, _st)) = live.pump(dir.path(), EpochFilter::OwnCaptureOnly, 10_000)
+        {
+            if frames.is_empty() {
+                break;
+            }
+        }
+        // Дописать РОВНО 3 события — столько recorder успевает между тиками.
+        {
+            let mut j = Journal::open_with(dir.path(), cfg()).expect("reopen");
+            for i in events..events + 3 {
+                j.append(trade(i)).expect("append");
+            }
+            j.flush().expect("flush");
+        }
+        let t0 = std::time::Instant::now();
+        let _ = live
+            .pump(dir.path(), EpochFilter::OwnCaptureOnly, 256)
+            .expect("pump измеряемый");
+        t0.elapsed()
+    };
+
+    let small = tick_cost(1_000);
+    let big = tick_cost(8_000);
+
+    let ratio = big.as_secs_f64() / small.as_secs_f64().max(1e-9);
+    assert!(
+        ratio < 4.0,
+        "TD-083 O-B: тик на журнале ×8 длиннее занял в {ratio:.1} раза больше ({small:?} → \
+         {big:?}) на ОДИНАКОВОМ приращении в 3 события. Значит цена тика зависит от НАКОПЛЕННОЙ \
+         ИСТОРИИ, а не от приращения — журнал читается с головы. На проде (139M событий до \
+         курсора) это ≈12 минут на тик при периоде 250 ms: live-push молчит, accept-loop мёртв."
+    );
+}

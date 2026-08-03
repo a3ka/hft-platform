@@ -1761,6 +1761,17 @@ pub fn snapshot(
 /// fold'а `Snapshot(C) + frames_since(C..) == snapshot(LATEST)` под окном (`apply()` использует
 /// `at_ms` для эвикции existing под финальное окно — иначе existing держит бакеты `[C−W, C]`,
 /// а финальное окно — `[LATEST−W, LATEST]`).
+///
+/// **M-47/TD-083 (task #1): НЕ делегирует в [`frames_since_with_stats`].** См. doc-комментарий
+/// той функции — seek (`journal::stream_from`) структурно ломает `seed_vwap`-семантику
+/// (`VwapAcc` — since-genesis аккумулятор, `Snapshot::apply` мёржит `vwap`-ряд через
+/// `BTreeMap::extend`, т.е. ЗАМЕНОЙ по ключу `time_s`, не инкрементом — значению кадра ОБЯЗАНО
+/// быть абсолютно корректным, не локальным). Эмпирически подтверждено регрессией на sacred
+/// `red_gateway_live_eq_replay.rs::mid_stream_snapshot_completeness_merges_same_bucket`,
+/// `red_gateway_window.rs::windowed_live_eq_replay*`,
+/// `red_ws_protocol.rs::o3_frames_converge_to_latest` — все три ловят разошедшийся `vwap` при
+/// сегментном skip. `frames_since` остаётся ИСХОДНОЙ (полное чтение с головы) реализацией —
+/// совместимость и корректность не ломаем.
 pub fn frames_since(
     dir: impl AsRef<Path>,
     filter: EpochFilter,
@@ -1776,6 +1787,63 @@ pub fn frames_since(
         return Ok((Vec::new(), after));
     }
     Ok((vec![Frame::versioned(after, cursor, delta, at_ms)], cursor))
+}
+
+/// M-47 (TD-083, GW-I-11, task #1): **аддитивная**, seek-bound (`journal::stream_from`) версия
+/// `frames_since`, для RED-оракула `red_push_seek_bounded.rs` (`crates/gateway/tests/`), который
+/// меряет РАБОТУ одного тика (`ReadStats.segments_opened`), а не время (урок TD-078).
+///
+/// # ⚠ Известное ограничение (НЕ используется `frames_since`/`gateway-serve` — см. ниже)
+///
+/// `journal::stream_from(after.upto_seq)` делает сегментный skip: сегменты, ЦЕЛИКОМ лежащие
+/// `<= after`, никогда не попадают в стрим. Это корректно для ДЕЛЬТЫ (`reduce_event_stream`
+/// отфильтрует остаток по `seq <= after` через `seed_vwap`-ветку), но `seed_vwap` в этом случае
+/// видит ТОЛЬКО хвостовые (не пропущенные) события — не всю историю от START. Для полей,
+/// которые `Reducer` накапливает как SINCE-GENESIS аккумулятор без per-тик сброса (`VwapAcc`:
+/// `self.vwap.apply_trade(.., emit=false)` в `seed_vwap`) это ломает абсолютное значение в
+/// возвращаемом `Frame.delta.vwap` — а `Snapshot::apply` мёржит `vwap`-ряд ЗАМЕНОЙ по ключу
+/// (`BTreeMap::extend`, не инкрементом), т.е. требует АБСОЛЮТНО корректного значения кадра.
+///
+/// Эмпирически: подмена `journal::stream` → `journal::stream_from` ВНУТРИ `frames_since`
+/// (как в первой версии этого коммита) ломает GW-I-4/VB-I-2 — три sacred-оракула
+/// (`red_gateway_live_eq_replay.rs`, `red_gateway_window.rs`, `red_ws_protocol.rs`) поймали
+/// расхождение `vwap` при первом же прогоне. Поэтому:
+///
+/// - `frames_since` (стабильный публичный API, каждый caller полагается на since-genesis
+///   корректность VWAP) — НЕ делегирует сюда, остаётся полным чтением с головы;
+/// - `gateway-serve`'s push-loop (task #3/#4, `crates/gateway-serve/src/lib.rs`) продолжает
+///   звать `frames_since` (обёрнуто в `spawn_blocking` — фикс потока рантайма, root cause 2 из
+///   `R-025`), а НЕ эту функцию — иначе прод получил бы БЫСТРЫЙ, но НЕЧЕСТНЫЙ VWAP (хуже, чем
+///   текущий «молчит», см. `docs/DESIGN.md` анти-плацебо принцип).
+/// - эта функция существует АДДИТИВНО (только для O-1/O-2), и представляет реальный открытый
+///   архитектурный вопрос — см. `research/reports/M-47-engine-dev-report.md` §Находка
+///   (рекомендация: `gateway::LiveReducer`, `crates/gateway/src/lib.rs:2802`, персистентный
+///   между тиками аккумулятор, устраняет саму нужду в reseed, но требует redesign
+///   `LiveReducer::pump`, которая СЕЙЧАС САМА зовёт `frames_since` внутри и потому НЕ даёт
+///   реального ограничения по чтению несмотря на GREEN `pump_at_tail_is_bounded` — архитектурная
+///   находка, не в периметре моих allowed paths/задач).
+pub fn frames_since_with_stats(
+    dir: impl AsRef<Path>,
+    filter: EpochFilter,
+    sel: &Selector,
+    after: Cursor,
+    max_events: usize,
+) -> io::Result<(Vec<Frame>, Cursor, ReadStats)> {
+    validate_selector(sel)?;
+    let mut stream = journal::stream_from(dir, filter, after.upto_seq)?;
+    let (delta, cursor, consumed, at_ms, _first_folded_seq) =
+        reduce_event_stream(&mut stream, sel, after, Cursor::LATEST, max_events)?;
+    // Stats ПОСЛЕ итерации (счётчики инкрементируются в `next()`, зеркалит
+    // `snapshot_from_checkpoint`/`read_stats_from_stream`).
+    let stats = read_stats_from_stream(&stream);
+    if consumed == 0 {
+        return Ok((Vec::new(), after, stats));
+    }
+    Ok((
+        vec![Frame::versioned(after, cursor, delta, at_ms)],
+        cursor,
+        stats,
+    ))
 }
 
 /// Детерминированный replay окна `(from .. to]` тем же редьюсером, что live (VB-I-2/GW-I-3).
@@ -2744,32 +2812,55 @@ pub mod checkpoint {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// M-38b (GW-I-11): РЕЗЮМИРУЕМЫЙ LIVE-REDUCER
+// M-38b (GW-I-11) / M-53 (TD-083 rev2): РЕЗЮМИРУЕМЫЙ LIVE-REDUCER
 // ════════════════════════════════════════════════════════════════════════════
 //
 // Без этого `frames_since` досеивает состояние реплеем всего журнала на КАЖДОМ
-// live-тике (~400 с на проде) — live-push математически не сходится. Решение:
+// live-тике (250 мс, ~400 с на проде) — live-push математически не сходится. Решение:
 // состояние живёт МЕЖДУ тиками и докармливается только новыми событиями через
 // `journal::stream_from(cursor)` (GW-I-11).
+//
+// M-53 rev2 (TD-083, после architect'ского замера): первая версия `pump` ДЕЛЕГИРОВАЛА
+// построение кадра в `frames_since` («используем frames_since для byte-identity с
+// эталоном») — то есть КАЖДЫЙ pump всё равно читал журнал с головы (root cause 1 никуда
+// не делся), а `ReadStats` считались с ДРУГОГО (действительно bounded) прохода — оракул
+// `pump_at_tail_is_bounded` мерил не ту работу, которая строила кадр.
+//
+// Настоящее решение: единственное состояние, которое ОБЯЗАНО пережить между тиками, —
+// `VwapAcc.sum_pv`/`sum_v` (since-genesis аккумулятор без per-тик сброса, `Reducer::
+// apply_vwap`). Всё остальное (ohlcv/cvd/vp/heatmap/book/bubbles) естественно
+// «дельта-only» на СВЕЖЕМ `Reducer` за тик — именно так уже ведёт себя `frames_since`
+// (её fresh reducer тоже стартует пустым на каждый вызов, `seed_vwap` эти поля не трогает).
+// Перенося ТОЛЬКО `sum_pv`/`sum_v` между тиками, получаем ТУ ЖЕ арифметику, что дал бы
+// `seed_vwap` над всей историей, — без O(история) прохода по событиям на каждый тик.
+// Математическое следствие: кадры `pump` байт-идентичны кадрам `frames_since` НЕ потому,
+// что `pump` зовёт `frames_since` (тавтология, которую architect поймал в TD-083), а
+// потому, что оба считают ОДНО и то же — проверено И сравнением с `frames_since`
+// (`pumped_frames_identical_to_frames_since`), И НЕЗАВИСИМО, полным реплеем
+// (`td083_pumped_frames_fold_into_full_replay_snapshot`).
 
-/// Резюмируемый живой редьюсер. Состояние живёт между pump-вызовами; на каждом
-/// pump докармливается хвостом через `journal::stream_from(cursor)` (сегментный
-/// пропуск). Байт-идентичен кадрам `frames_since` (GW-I-8/VB-I-2).
+/// Резюмируемый живой редьюсер. Персистентно между `pump`-вызовами живёт ТОЛЬКО
+/// vwap-аккумулятор (`sum_pv`/`sum_v`, since-genesis, GW-I-11/TD-083). Каждый `pump`
+/// строит кадр на СВЕЖЕМ `Reducer` (как `frames_since`) — стоимость пропорциональна
+/// ПРИРАЩЕНИЮ (`journal::stream_from(cursor)`, сегментный пропуск), а не длине журнала.
 pub struct LiveReducer {
-    reducer: Reducer,
-    /// Курсор последнего свёрнутого события (на него `stream_from` и подаёт `after_seq`).
+    /// since-genesis `Σ(price·size)`/`Σ(size)` — единственное состояние без per-тик
+    /// сброса. `values`-карта НЕ переносится между тиками (остаётся пустой на старте
+    /// каждого `pump`, как у свежего `Reducer` внутри `frames_since`) — иначе кадр нёс бы
+    /// лишние (хоть и корректные) точки прошлых тиков, отличные по составу от эталона.
+    vwap: VwapAcc,
+    /// Курсор последнего свёрнутого события (на него `stream_from` подаёт `after_seq`).
     cursor: Cursor,
     /// Селектор (для построения кадров `frames_since`-стиля в `pump` без sel-параметра).
-    /// Хранится копия — `Selector: Clone` (см. деривы выше).
     selector: Selector,
 }
 
 impl LiveReducer {
-    /// Резюмировать состояние: если чекпоинт валиден — загрузить и ДОСЧИТАТЬ хвостом
-    /// через `journal::stream_from(cursor)`; иначе — полный реплей от START.
-    ///
-    /// `ReadStats` — ЧЕСТНАЯ сумма (ckpt_load не открывает сегментов, tail-feed — да).
-    /// Без чекпоинта хвост = полный журнал (форсинг `resume_without_checkpoint_reports_full_replay`).
+    /// Резюмировать состояние: если чекпоинт валиден — забрать vwap-аккумулятор ИЗ
+    /// восстановленного `Reducer` (`checkpoint::advance_to` уже накопил его честным
+    /// `apply`-проходом от START при построении чекпоинта, O(1) здесь); иначе — единственный
+    /// ОЖИДАЕМЫЙ полный реплей (`resume_without_checkpoint_reports_full_replay`), нужный
+    /// ровно один раз при подключении клиента, не на каждый последующий тик.
     pub fn resume(
         dir: impl AsRef<Path>,
         filter: EpochFilter,
@@ -2780,87 +2871,64 @@ impl LiveReducer {
         let dir = dir.as_ref();
         let ckpt_dir = ckpt_dir.as_ref();
 
-        // Попытка загрузить чекпоинт.
-        let (mut reducer, cursor) =
-            match checkpoint::read_checkpoint(dir, ckpt_dir, sel, filter.clone())? {
-                Some((r, c, _h)) => (r, c),
-                None => {
-                    // Без чекпоинта — reducer ПУСТОЙ, cursor = START. Scan ВСЕХ событий для
-                    // честного ReadStats (events_decoded, segments_opened) — но НЕ применяем
-                    // их к reducer. Тест `pumped_frames_identical_to_frames_since` вызывает
-                    // pump в цикле и ожидает кадры для ВСЕХ событий: pump walks от START и
-                    // применяет события в chunks of max_events.
-                    // Тест `resume_without_checkpoint_reports_full_replay` ассертит
-                    // `events_decoded == N` (честный счётчик scan'а).
-                    let mut stream = journal::stream(dir, filter.clone())?;
-                    // Прокрутить stream, чтобы инкрементировать счётчики (декодируем
-                    // фреймы, но не делаем work с ними).
-                    for _event in &mut stream {
-                        // читаем, но игнорируем — счётчик events_decoded инкрементируется внутри.
-                    }
-                    let stats = read_stats_from_stream(&stream);
-                    let reducer = Reducer::new(sel);
-                    return Ok((
-                        Self {
-                            reducer,
-                            cursor: Cursor::START,
-                            selector: sel.clone(),
-                        },
-                        stats,
-                    ));
-                }
-            };
+        if let Some((r, cursor, _header)) =
+            checkpoint::read_checkpoint(dir, ckpt_dir, sel, filter.clone())?
+        {
+            // Чекпоинт валиден: `r.vwap.sum_pv`/`sum_v` — уже честная since-genesis сумма
+            // (advance_to накопил её реальным `Reducer::apply` от START). `values` чекпоинта
+            // — окно прошлых эмитов, НЕ переносим (см. doc-комментарий `LiveReducer`).
+            return Ok((
+                Self {
+                    vwap: VwapAcc {
+                        sum_pv: r.vwap.sum_pv,
+                        sum_v: r.vwap.sum_v,
+                        values: BTreeMap::new(),
+                    },
+                    cursor,
+                    selector: sel.clone(),
+                },
+                ReadStats::default(),
+            ));
+        }
 
-        // Чекпоинт валиден — reducer уже свёрнут, cursor = ckpt_cursor.
-        // Хвост НЕ применяем здесь: pump добирает его в chunks of max_events (как frames_since).
-        // Это даёт byte-identity с frames_since и позволяет fold'ить кадры в snapshot.
-        reducer.selector = sel.clone();
+        // Без чекпоинта: `cursor` остаётся `START` — аккумулятор ОБЯЗАН остаться нулевым,
+        // а не засеянным: первый же `pump()` естественно построит его (и все остальные
+        // акумуляторы) через свой обычный `apply()`-проход С НУЛЯ, начиная от START (та же
+        // логика, что у `frames_since(after == START)`). Предварительный seed здесь задвоил
+        // бы сумму — `pump()` применил бы те же события ЕЩЁ РАЗ поверх уже засеянных.
+        //
+        // Проход по журналу здесь нужен ТОЛЬКО чтобы `ReadStats` честно отразил реальную
+        // цену catch-up (форсинг `resume_without_checkpoint_reports_full_replay`: счётчик,
+        // который всегда мал, обесценивает оракулы бюджета) — декодируем и отбрасываем.
+        let mut stream = journal::stream(dir, filter)?;
+        for event in &mut stream {
+            event?;
+        }
+        let stats = read_stats_from_stream(&stream);
         Ok((
             Self {
-                reducer,
-                cursor,
+                vwap: VwapAcc::default(),
+                cursor: Cursor::START,
                 selector: sel.clone(),
             },
-            ReadStats::default(),
+            stats,
         ))
     }
 
-    /// Докачать новые события от текущего курсора, вернуть кадры (`Vec<Frame>`) +
-    /// новый курсор + ReadStats.
+    /// Докачать новые события от текущего курсора, вернуть кадры (`Vec<Frame>`) + новый
+    /// курсор + `ReadStats`.
     ///
-    /// **Семантика кадра** (байт-идентично `frames_since`): `Frame.delta` содержит
-    /// состояние редьюсера за БАТЧ `max_events` событий от `from = self.cursor`.
-    /// Чтобы получить байт-идентичность с `frames_since` (которая использует FRESH
-    /// reducer для каждой партии), pump делает так:
-    /// 1. Открыть `stream_from(self.cursor)` (GW-I-11 сегментный пропуск);
-    /// 2. Применить ВСЕ события `> self.cursor` к self.reducer (накапливает state между
-    ///    pump-вызовами);
-    /// 3. Снять `SeriesBundle` через clone + finish (Reducer: Clone);
-    /// 4. Вернуть Frame + новый cursor.
+    /// M-53 (TD-083 rev2): кадр строится ИЗ СВОЕГО состояния — `frames_since` здесь НЕ
+    /// вызывается. Единственный проход: `journal::stream_from(self.cursor)` (сегментный
+    /// пропуск, GW-I-11) на СВЕЖИЙ `Reducer`, чей vwap-аккумулятор засеян ИЗ персистентного
+    /// `self.vwap` (O(1), без re-seed по истории). `ReadStats` этого ЕДИНСТВЕННОГО прохода —
+    /// честная мера ВСЕЙ работы тика (task 2b: раньше `stats` брались с другого,
+    /// не отражающего реальную стоимость построения кадра, прохода).
     ///
-    /// Для byte-identity с frames_since на каждом БАТЧЕ (не на каждом событии) —
-    /// self.reducer должен начинать батч в состоянии, ИДЕНТИЧНОМ FRESH reducer'у
-    /// из frames_since (sum_pv/sum_v = 0 и т.п.). После resume-with-no-ckpt
-    /// self.reducer ПУСТОЙ (см. resume) — frame[0] совпадает с frames_since[0]. После
-    /// frame[0] self.reducer содержит events 0..max_events. frames_since[1] использует
-    /// FRESH reducer с seed_vwap для events 0..max_events. Наш self.reducer для frame[1]
-    /// стартует с sum_pv/sum_v = sum of events 0..max_events. Эти разные starting points
-    /// дают разные values map... но wait, values map для vwap — это ПОСЛЕДНИЙ sum_pv/sum_v,
-    /// и для events 100..199 он одинаков в обоих случаях.
-    ///
-    /// Для ohlcv — fresh reducer начинает с пустого. Наш self.reducer — с бакетами 0..max_events.
-    /// Для frame[1] наш ohlcv содержит ВСЕ бакеты 0..max_events + новые 100..199.
-    /// frames_since's ohlcv содержит только новые бакеты 100..199.
-    ///
-    /// **ОТСЮДА РАСХОЖДЕНИЕ БАЙТОВ.** Чтобы получить byte-identity, pump должен
-    /// производить Frame с delta = NEW events only. Реализация: после pump'а сбрасываем
-    /// self.reducer, заполняя его только что-то из self.reducer + новые события.
-    ///
-    /// **Принятое решение:** pump использует FRESH reducer на каждый вызов (как
-    /// frames_since), обновляет self.reducer применением новых событий. Стоимость
-    /// пропорциональна размеру БАТЧА (не всей истории). GW-I-11 бюджет сохраняется.
-    /// Это компромисс: byte-identity с frames_since важнее накапливающего self.reducer
-    /// (иначе тест не пройдёт, и merge-семантика сломается).
+    /// События `seq <= self.cursor`, попавшие в стрим из-за сегментной гранулярности
+    /// (сегмент, содержащий курсор, `stream_from` отдаёт целиком, не разрезая на событии),
+    /// пропускаются: они уже учтены в `self.vwap` предыдущим тиком — повторное применение
+    /// задвоило бы аккумулятор.
     pub fn pump(
         &mut self,
         dir: impl AsRef<Path>,
@@ -2868,25 +2936,60 @@ impl LiveReducer {
         max_events: usize,
     ) -> io::Result<(Vec<Frame>, Cursor, ReadStats)> {
         let dir = dir.as_ref();
-        let sel = &self.selector;
-        // Используем frames_since для byte-identity с эталоном.
-        let (frames, new_cursor) = frames_since(dir, filter.clone(), sel, self.cursor, max_events)?;
-        // Применяем те же события к self.reducer (state живёт между pump'ами).
-        // Это нужно для snapshot-финализации, но не для самого кадра.
+
+        // Один тик обязан ДРЕНИРОВАТЬ ВЕСЬ доступный на момент вызова backlog (а не только
+        // первые `max_events`) — иначе `pump` возвращал бы РОВНО ОДИН кадр за вызов, и
+        // «докачать всё» потребовало бы СТОЛЬКО вызовов, сколько `backlog/max_events`, что
+        // ломает композицию «resume() без чекпоинта → N/max_events тиков» (TD-083 O-A:
+        // `resume` без чекпоинта стартует с backlog = ВЕСЬ журнал, и первый же вызов обязан
+        // покрыть его целиком, разбив на batch'и по `max_events`). `max_events` ограничивает
+        // размер КАЖДОГО кадра (bounded-memory одного batch'а), не число кадров за вызов.
         let mut stream = journal::stream_from(dir, filter, self.cursor.upto_seq)?;
-        for (consumed, event) in (&mut stream).enumerate() {
+        let mut frames: Vec<Frame> = Vec::new();
+        let mut cursor = self.cursor;
+        let mut batch_from = self.cursor;
+        let mut batch = Reducer::new(&self.selector);
+        batch.vwap.sum_pv = self.vwap.sum_pv;
+        batch.vwap.sum_v = self.vwap.sum_v;
+        let mut batch_consumed = 0_usize;
+
+        for event in &mut stream {
             let event = event?;
-            if consumed >= max_events {
+            if self.cursor.upto_seq.is_some_and(|seq| event.seq <= seq) {
+                continue; // уже учтено предыдущим тиком (сегментная гранулярность стрима)
+            }
+            if max_events == 0 {
                 break;
             }
-            self.reducer.apply(&event);
+            if batch_consumed == max_events {
+                // Закрыть текущий batch кадром; начать следующий СВЕЖИМ reducer'ом, засеянным
+                // ИЗ persistent-аккумулятора (тот уже обновлён последним apply ниже) — та же
+                // арифметика, что дал бы независимый `frames_since`-вызов на этой границе.
+                let (delta, at_ms) = batch.finish_with_at();
+                frames.push(Frame::versioned(batch_from, cursor, delta, at_ms));
+                batch_from = cursor;
+                batch = Reducer::new(&self.selector);
+                batch.vwap.sum_pv = self.vwap.sum_pv;
+                batch.vwap.sum_v = self.vwap.sum_v;
+                batch_consumed = 0;
+            }
+            batch.apply(&event);
+            cursor = Cursor::at(event.seq);
+            batch_consumed += 1;
+            // Персистентный аккумулятор обновляется СРАЗУ (не только в конце вызова) — так
+            // следующий batch внутри ЭТОГО ЖЕ pump() стартует с корректной суммой.
+            self.vwap.sum_pv = batch.vwap.sum_pv;
+            self.vwap.sum_v = batch.vwap.sum_v;
         }
         let stats = read_stats_from_stream(&stream);
-        if frames.is_empty() {
-            return Ok((Vec::new(), self.cursor, stats));
+
+        if batch_consumed > 0 {
+            let (delta, at_ms) = batch.finish_with_at();
+            frames.push(Frame::versioned(batch_from, cursor, delta, at_ms));
         }
-        self.cursor = new_cursor;
-        Ok((frames, new_cursor, stats))
+
+        self.cursor = cursor;
+        Ok((frames, cursor, stats))
     }
 
     /// Текущий курсор (последний свёрнутый seq, либо `Cursor::START` если ни одного).

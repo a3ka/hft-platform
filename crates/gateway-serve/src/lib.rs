@@ -355,17 +355,65 @@ pub mod server {
     {
         let (mut sink, mut stream) = ws.split();
 
-        // (6a) Snapshot-при-подключении. Snapshot идёт целиком (M-22 deterministic).
-        // M-38b (B3): если в конфиге есть чекпоинт — `snapshot_from_checkpoint` потребляет
-        // его, иначе прозрачно rebuilds от START. `ReadStats` логируются: §8 eyes-on видит
-        // «полегчало, читается хвост» через кривую latency или ручной grep.
-        let (snap_msg, stats) = super::serve::snapshot_msg(
-            cfg.journal_dir.as_path(),
-            cfg.filter.clone(),
-            &cfg.selector,
-            crate::_gw::Cursor::LATEST,
-            cfg.checkpoint_dir.as_deref(),
-        )?;
+        // (6a) Snapshot-при-подключении + резюмируемый `LiveReducer` для push-цикла
+        // (M-53/TD-083 task #2c). Оба строятся ОТ ОДНОГО курсора: `live` сначала догоняется
+        // до текущего хвоста журнала, и РОВНО этот курсор (а не отдельно вычисленный
+        // `Cursor::LATEST`) используется для построения снапшота. Без этого фоновый
+        // чекпоинтер мог бы продвинуться МЕЖДУ построением снапшота и резюмом `live` —
+        // снапшот и live-редьюсер получили бы РАЗНЫЕ курсоры, и первый же push-тик задвоил
+        // бы клиенту данные, которые уже пришли в снапшоте.
+        //
+        // Вся блокирующая работа (чекпоинт + journal-read) — в ОДНОМ `spawn_blocking`:
+        // однопоточный (`current_thread`) рантайм прода не должен стоять, пока это читается
+        // (root cause 2, `R-025`) — тот же принцип, что и в push-цикле ниже (task #3/#4).
+        let cfg1 = Arc::clone(&cfg);
+        let setup = tokio::task::spawn_blocking(move || -> std::io::Result<(
+            ServeMsg,
+            crate::_gw::ReadStats,
+            crate::_gw::LiveReducer,
+            crate::_gw::Cursor,
+        )> {
+            let ckpt_dir: &std::path::Path = cfg1
+                .checkpoint_dir
+                .as_deref()
+                .unwrap_or_else(|| std::path::Path::new(""));
+            let (mut live, _resume_stats) = crate::_gw::LiveReducer::resume(
+                cfg1.journal_dir.as_path(),
+                cfg1.filter.clone(),
+                &cfg1.selector,
+                ckpt_dir,
+            )?;
+            // Догнать до текущего хвоста журнала — курсор ПОСЛЕ этого цикла и есть точка,
+            // на которой строится снапшот (см. doc выше). Кадры здесь не нужны клиенту:
+            // он получит эквивалентное состояние целиком через Snapshot ниже.
+            loop {
+                let (frames, _c, _stats) =
+                    live.pump(cfg1.journal_dir.as_path(), cfg1.filter.clone(), usize::MAX)?;
+                if frames.is_empty() {
+                    break;
+                }
+            }
+            let at = live.cursor();
+            let (snap_msg, stats) = super::serve::snapshot_msg(
+                cfg1.journal_dir.as_path(),
+                cfg1.filter.clone(),
+                &cfg1.selector,
+                at,
+                cfg1.checkpoint_dir.as_deref(),
+            )?;
+            Ok((snap_msg, stats, live, at))
+        })
+        .await;
+
+        let (snap_msg, stats, live, mut cursor) = match setup {
+            Ok(Ok(tuple)) => tuple,
+            Ok(Err(e)) => return Err(e),
+            Err(join_err) => {
+                return Err(std::io::Error::other(format!(
+                    "gateway-serve: snapshot/resume blocking task join failed: {join_err}"
+                )));
+            }
+        };
         // M-38b (rev4, B3): ReadStats логируются. §8 eyes-on ловит «полегчало, читает
         // хвост» по latency. Сейчас эмитим на debug — не спамим прод при норме, а §8
         // и глазастый оператор видят одной строкой вывод.
@@ -383,21 +431,56 @@ pub mod server {
             .await
             .map_err(|e| std::io::Error::other(format!("ws send snapshot: {e}")))?;
 
-        // (6b) Push-loop: периодически опрашиваем `frames_since` от последнего курсора.
-        // Bounded: `max_events = 256` за вызов (GW-I-2 — лимит на пак, клиент догоняет курсор).
+        // (6b) Push-loop: `LiveReducer::pump` от последнего курсора (M-53/TD-083 — вместо
+        // `frames_since`, читающего журнал с головы на КАЖДЫЙ тик). Bounded: `max_events =
+        // 256` за batch (GW-I-2 — лимит на пак, клиент догоняет курсор чанками).
         const PUSH_INTERVAL_MS: u64 = 250;
         const PUSH_MAX_EVENTS: usize = 256;
 
-        let mut cursor = match &snap_msg {
-            super::wire::ServeMsg::Snapshot(s) => s.cursor,
-            _ => crate::_gw::Cursor::START,
-        };
         let mut push_tick = tokio::time::interval(Duration::from_millis(PUSH_INTERVAL_MS));
         push_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+        // M-47 (TD-083 task #3/#4): journal-read блокирующий (файловый I/O), поэтому ВСЕГДА
+        // идёт через `spawn_blocking` — иначе он монополизирует единственный поток
+        // `current_thread`-рантайма (прод: `/proc/1/task=1`), и accept-loop / другие сессии
+        // не исполняются вовсе, пока чтение не закончится (root cause 2, `R-025`).
+        //
+        // `pending_read` держит JoinHandle текущего в-полёте чтения МЕЖДУ итерациями `select!`.
+        // Критично для task #4: ветка `stream.next()` — ОТДЕЛЬНАЯ ветка select! на КАЖДОЙ
+        // итерации независимо от того, идёт ли сейчас блокирующее чтение — уход клиента
+        // детектируется НЕМЕДЛЕННО, а не только после завершения текущего чтения (раньше
+        // единственная ветка выхода — `sink.send(..).is_err()` — была достижима только когда
+        // чтение уже вернуло кадры). Новый тик НЕ планируется, пока предыдущее чтение не
+        // завершилось (`if pending_read.is_none()`) — backpressure, не очередь чтений.
+        //
+        // M-53 (TD-083 task #2c): `LiveReducer` — состояние МЕЖДУ тиками, поэтому его нельзя
+        // просто заимствовать в spawn_blocking-замыкание (`'static`-требование) — владение
+        // ПЕРЕДАЁТСЯ внутрь на время вызова (`live.take()`) и ВСЕГДА возвращается назад
+        // (в Ok- И в Err-ветке `pump`) — иначе следующий тик остался бы без `live`.
+        // Восстановить `live` невозможно ТОЛЬКО если сам blocking-таск запаниковал (unwind
+        // забирает владение с собой) — этот путь закрывает соединение явно, а не продолжает
+        // с потерянным состоянием.
+        // `Err`-вариант боксирован (`clippy::result_large_err`): `LiveReducer` несёт
+        // `Selector` (Vec<f64>/String) — вариант без Box раздувает размер `Result` целиком.
+        type PumpOutcome = Result<
+            (
+                crate::_gw::LiveReducer,
+                Vec<super::wire::ServeMsg>,
+                crate::_gw::Cursor,
+                crate::_gw::ReadStats,
+            ),
+            Box<(crate::_gw::LiveReducer, std::io::Error)>,
+        >;
+        type PendingRead = tokio::task::JoinHandle<PumpOutcome>;
+        let mut pending_read: Option<PendingRead> = None;
+        let mut live: Option<crate::_gw::LiveReducer> = Some(live);
+
         loop {
             tokio::select! {
-                // Клиент отключился / ошибка приёма → выходим.
+                // Клиент отключился / ошибка приёма → выходим НЕМЕДЛЕННО (не дожидаясь
+                // текущего pending_read — если он есть, JoinHandle просто дропается; сама
+                // blocking-задача на пуле не отменяется, но досчитает вхолостую и это
+                // безвредно: результат никто не читает, соединение уже закрыто).
                 msg = stream.next() => {
                     match msg {
                         None => return Ok(()),
@@ -420,33 +503,73 @@ pub mod server {
                         Some(Ok(Message::Pong(_))) | Some(Ok(Message::Frame(_))) => {}
                     }
                 }
-                // Периодический push: инкрементальные кадры от последнего курсора.
-                _ = push_tick.tick() => {
-                    let (msgs, new_cursor) = match super::serve::frames_msgs(
-                        cfg.journal_dir.as_path(),
-                        cfg.filter.clone(),
-                        &cfg.selector,
-                        cursor,
-                        PUSH_MAX_EVENTS,
-                    ) {
-                        Ok(pair) => pair,
-                        Err(e) => {
-                            // RN-21 (reviewer, M-47 PR-гейт): в проде отказ
-                            // `frames_msgs` — это NEW live-push канал (M-38b задача #6
-                            // вводит резюмируемый `LiveReducer`). Раньше был debug — молча
-                            // проглатывали, и §8 не видел проблему. Поведение соединения
-                            // (молча продолжаем, НЕ закрываем WS) сохраняем — НО поднимаем
-                            // до `error!` с курсором/селектором в контексте, чтобы §8 eyes-on
-                            // обнаружил «чекпоинтер/reducer сломался» по логу, а не по жалобе
-                            // оператора в 3 AM.
+                // Периодический тик: запускаем НОВОЕ блокирующее чтение, только если
+                // предыдущее уже завершилось (иначе копили бы конкурирующие чтения журнала).
+                // M-53 (TD-083 task #2c): `live` передаём во владение замыканию (`take()`) —
+                // `LiveReducer` возвращается назад ПОСЛЕ вызова (см. doc у `PumpOutcome` выше).
+                _ = push_tick.tick(), if pending_read.is_none() => {
+                    let cfg2 = Arc::clone(&cfg);
+                    let mut live_for_task = live
+                        .take()
+                        .expect("live присутствует, когда pending_read.is_none() (инвариант select!)");
+                    pending_read = Some(tokio::task::spawn_blocking(move || {
+                        match live_for_task.pump(
+                            cfg2.journal_dir.as_path(),
+                            cfg2.filter.clone(),
+                            PUSH_MAX_EVENTS,
+                        ) {
+                            Ok((frames, new_cursor, stats)) => {
+                                let msgs: Vec<super::wire::ServeMsg> =
+                                    frames.into_iter().map(super::wire::ServeMsg::Frame).collect();
+                                Ok((live_for_task, msgs, new_cursor, stats))
+                            }
+                            Err(e) => Err(Box::new((live_for_task, e))),
+                        }
+                    }));
+                }
+                // Завершение в-полёте чтения (если есть). Гонка со `stream.next()` выше —
+                // уход клиента детектируется НЕЗАВИСИМО от того, сколько ещё осталось читать.
+                result = async { pending_read.as_mut().expect("guarded by is_some() below").await },
+                    if pending_read.is_some() =>
+                {
+                    pending_read = None;
+                    let (msgs, new_cursor) = match result {
+                        Ok(Ok((returned_live, msgs, new_cursor, _stats))) => {
+                            live = Some(returned_live);
+                            (msgs, new_cursor)
+                        }
+                        Ok(Err(boxed)) => {
+                            let (returned_live, e) = *boxed;
+                            // RN-21 (reviewer, M-47 PR-гейт): в проде отказ `pump` — это
+                            // live-push канал (M-53 задача #2c). Поведение соединения (молча
+                            // продолжаем, НЕ закрываем WS) сохраняем — НО поднимаем до
+                            // `error!` с курсором/селектором в контексте, чтобы §8 eyes-on
+                            // обнаружил «чекпоинтер/journal сломался» по логу. `live`
+                            // ОБЯЗАН вернуться назад — иначе следующий тик запаникует.
+                            live = Some(returned_live);
                             tracing::error!(
                                 error = %e,
                                 cursor = ?cursor,
                                 symbol = %cfg.selector.symbol,
                                 venue = ?cfg.selector.venue,
-                                "frames_msgs failed (журнал/чекпоинтер недоступен) — соединение продолжается, но live-push молчит"
+                                "LiveReducer::pump failed (журнал недоступен) — соединение продолжается, но live-push молчит"
                             );
                             continue;
+                        }
+                        Err(join_err) => {
+                            // spawn_blocking-таск запаниковал/отменён — не должно случаться
+                            // в норме (pump не паникует), но `live` в этом случае НЕВОССТАНОВИМ
+                            // (unwind забрал его вместе с паникой) — продолжать с несуществующим
+                            // `live` означало бы гарантированную панику на следующем тике.
+                            // Закрываем соединение явно (клиент переподключится с чистым resume()).
+                            tracing::error!(
+                                error = %join_err,
+                                cursor = ?cursor,
+                                symbol = %cfg.selector.symbol,
+                                venue = ?cfg.selector.venue,
+                                "LiveReducer::pump blocking task panicked — live-состояние потеряно, закрываем соединение"
+                            );
+                            return Ok(());
                         }
                     };
                     cursor = new_cursor;
@@ -497,8 +620,8 @@ pub mod server {
 #[doc(hidden)]
 pub mod _gw {
     pub use gateway::{
-        frames_since, snapshot, snapshot_from_checkpoint, Cursor, Frame, ReadStats, Selector,
-        Snapshot,
+        frames_since, snapshot, snapshot_from_checkpoint, Cursor, Frame, LiveReducer, ReadStats,
+        Selector, Snapshot,
     };
 }
 
