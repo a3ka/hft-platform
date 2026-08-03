@@ -12,7 +12,10 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 # D1: ОБА бинаря собираются и копируются в runtime-образ.
-RUN cargo build --release --bin recorder --bin journal-retention --bin gateway-serve --bin gateway-checkpoint
+# M-46 task #5a (engine-dev): `wsprobe` — read-only WS-харнесс для sidecar-прогона против
+# прода (M-46 §7: `docker run --rm --network container:hft-gateway-serve <образ> wsprobe ...`).
+# Без этой строки образ не получает бинарь и sidecar-прогон невыполним (находка architect'а).
+RUN cargo build --release --bin recorder --bin journal-retention --bin gateway-serve --bin gateway-checkpoint --bin wsprobe
 
 FROM debian:stable-slim
 # journal-том монтируется сюда; переживает редеплой контейнера (docs/06 §3, §7).
@@ -27,5 +30,8 @@ COPY --from=builder /build/target/release/recorder /usr/local/bin/recorder
 COPY --from=builder /build/target/release/journal-retention /usr/local/bin/journal-retention
 COPY --from=builder /build/target/release/gateway-serve /usr/local/bin/gateway-serve
 COPY --from=builder /build/target/release/gateway-checkpoint /usr/local/bin/gateway-checkpoint
+# M-46 task #5a: wsprobe — read-only, никогда не ENTRYPOINT; вызывается явно через
+# `docker run --network container:hft-gateway-serve <образ> wsprobe ...` (sidecar, M-46 §7).
+COPY --from=builder /build/target/release/wsprobe /usr/local/bin/wsprobe
 # M-00: работаем root'ом (заглушка). Hardening (non-root + права тома) — TODO при реальном recorder.
 ENTRYPOINT ["/usr/local/bin/recorder"]
