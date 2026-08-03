@@ -3,20 +3,35 @@
 //! ## Замер, из-за которого milestone существует
 //!
 //! Подключение к `gateway-serve` на проде стоило **28.5 / 142.5 / 66.3 s**
-//! (`research/reviews/R-026-M-53.md` §7). Слагаемых два:
-//! backlog от суточного чекпоинта (закрыто — чекпоинт теперь каждые 15 минут) и **двойной
-//! расчёт состояния**, предмет этого файла.
+//! (`research/reviews/R-026-M-53.md` §7). Слагаемых два, и первое уже закрыто: чекпоинт
+//! теперь строится каждые 15 минут (`14017a4`), после чего замер дал **5.1 / 6.5 / 10.3 s**
+//! (прод, 2026-08-03T17:2xZ). Предмет этого файла — второе слагаемое: **состояние
+//! считается ДВАЖДЫ за подключение**.
 //!
-//! `run_authorized_session` сегодня: `LiveReducer::resume()` поднимает состояние и догоняет
-//! хвост, затем `snapshot_from_checkpoint()` делает **ровно то же самое второй раз**, чтобы
-//! получить `Snapshot` для клиента. Причина не в небрежности: у `LiveReducer` нет способа
-//! отдать своё состояние наружу — публичный API это `resume`/`pump`/`cursor`.
+//! `run_authorized_session` сегодня: `LiveReducer::resume()` поднимает состояние из
+//! чекпоинта и догоняет хвост, затем `snapshot_from_checkpoint()` делает **ровно то же
+//! самое второй раз**, чтобы получить `Snapshot` для клиента. Причина не в небрежности:
+//! у `LiveReducer` нет способа отдать своё состояние наружу — публичный API это
+//! `resume`/`pump`/`cursor`.
 //!
-//! ## Что меряется
+//! ## Почему фикстура идёт через чекпоинт (переписано после находки engine-dev'а)
 //!
-//! **РАБОТА (`ReadStats.events_decoded`), а не время** — сознательно, урок TD-078: оракул с
-//! потолком wall-clock превращается в измеритель CI-машины. Двойной проход виден как
-//! удвоенное число декодированных событий и от скорости раннера не зависит.
+//! Первая редакция этих оракулов требовала, чтобы `snapshot()` был полным состоянием
+//! **сразу после `resume()`, без единого `pump()`**. Это оказалось несовместимо с sacred
+//! `red_frames_seek_bound.rs::pumped_frames_identical_to_frames_since`: тот проверяет, что
+//! в no-checkpoint ветке работу делает именно `pump()` побатчево, а значит `resume()`
+//! обязан оставить курсор на `Cursor::START`. Оба требования тянут ОДНО поле —
+//! `LiveReducer::cursor()` — в разные стороны (разбор: `research/reports/M-54-engine-dev-report.md`).
+//!
+//! Прав оказался sacred-тест, а не я. `LiveReducer` **инкрементален по конструкции**, и три
+//! его роли разделены: `resume` поднимает базу из чекпоинта, `pump` догоняет хвост, `snapshot`
+//! отдаёт накопленное. Требовать от `resume` полноты — значит требовать, чтобы он сам
+//! прочитал весь хвост; тогда первый `pump()` прочитал бы его ВТОРОЙ раз, и двойная
+//! стоимость просто переехала бы в другое место (это dev проверил кандидат-реализацией).
+//!
+//! Поэтому фикстура здесь — **прод-путь**: чекпоинт в середине истории (на проде он отстаёт
+//! на ≤15 минут), `resume` с чекпоинта, догон `pump`'ом, затем `snapshot()`. No-checkpoint
+//! путь остаётся за M-53 и не трогается.
 //!
 //! COMPILE-RED: `LiveReducer::snapshot()` ещё не существует (задача 1 milestone'а).
 
@@ -107,6 +122,41 @@ fn journal_mixed(trades: i64) -> tempfile::TempDir {
     dir
 }
 
+/// Прод-подобная подготовка: чекпоинт покрывает ПЕРВУЮ половину истории, хвост остаётся
+/// на догон — ровно то, что делает cron каждые 15 минут (`deploy/cron.d/journal-retention`).
+fn journal_with_midpoint_checkpoint(trades: i64) -> (tempfile::TempDir, tempfile::TempDir, Cursor) {
+    let dir = journal_mixed(trades);
+    let ckpt = tempfile::tempdir().expect("ckpt");
+    let mid = Cursor {
+        upto_seq: Some((trades / 2) as u64),
+    };
+    gateway::checkpoint::advance_to(
+        dir.path(),
+        ckpt.path(),
+        &sel(),
+        EpochFilter::OwnCaptureOnly,
+        mid,
+    )
+    .expect("advance_to");
+    (dir, ckpt, mid)
+}
+
+/// Догоняет хвост `pump`'ом до исчерпания. Возвращает суммарную работу догона.
+/// `cap` намеренно мал — на проде тик ограничен, и оракул обязан работать в том же режиме.
+fn pump_to_tail(live: &mut gateway::LiveReducer, dir: &std::path::Path) -> u64 {
+    let mut decoded = 0u64;
+    for _ in 0..1_000 {
+        let (frames, _cursor, stats) = live
+            .pump(dir, EpochFilter::OwnCaptureOnly, 128)
+            .expect("pump");
+        decoded += stats.events_decoded as u64;
+        if frames.is_empty() {
+            break;
+        }
+    }
+    decoded
+}
+
 /// **O-1 (главный).** Снапшот для клиента берётся из УЖЕ ПОСТРОЕННОГО состояния —
 /// физически без повторного чтения журнала.
 ///
@@ -116,39 +166,35 @@ fn journal_mixed(trades: i64) -> tempfile::TempDir {
 /// приём, что `RK-I-1`: «venue-адаптер принимает ТОЛЬКО `RiskApproved<Order>`»).
 ///
 /// Почему не счётчиком: первая редакция этого оракула сравнивала `resume_stats.events_decoded`
-/// саму с собой — тавтология ровно того класса, который M-53 и разбирал (`pump` возвращал
-/// результат `frames_since`, и byte-identity сравнивала функцию с собой). Замерить полную
-/// стоимость подключения на уровне `gateway` нельзя: второй проход живёт в `gateway-serve`.
-/// Поэтому здесь фиксируется НЕВОЗМОЖНОСТЬ второго прохода, а фактическая экономия
-/// проверяется прогоном против прода (§6 milestone'а: было 28-142 s).
+/// саму с собой — тавтология ровно того класса, который M-53 и разбирал. Замерить полную
+/// стоимость подключения на уровне `gateway` нельзя: второй проход живёт в `gateway-serve`,
+/// и его отсутствие проверяется канарейкой в `scripts/verify_M-54.sh`.
 ///
 /// Тест падает компиляцией, пока метода нет; и упадёт снова, если кто-то добавит в него
 /// параметр пути — то есть вернёт возможность читать журнал.
 #[test]
 fn o1_snapshot_comes_from_state_not_from_journal() {
-    let dir = journal_mixed(600);
-    let ckpt = tempfile::tempdir().expect("ckpt");
+    let (dir, ckpt, _mid) = journal_with_midpoint_checkpoint(600);
 
-    let (live, resume_stats): (_, ReadStats) =
+    let (mut live, resume_stats): (_, ReadStats) =
         gateway::LiveReducer::resume(dir.path(), EpochFilter::OwnCaptureOnly, &sel(), ckpt.path())
             .expect("resume");
-
-    assert!(
-        resume_stats.events_decoded > 0,
-        "O-1: резюме не прочитало НИ ОДНОГО события — фикстура не давит, тест бесполезен"
-    );
+    let _ = resume_stats;
+    pump_to_tail(&mut live, dir.path());
 
     // Ключ: вызов БЕЗ пути к журналу. Если сигнатура потребует `dir`, тест не скомпилируется.
     let snapshot = live.snapshot();
 
     assert!(
         !snapshot.series.ohlcv.is_empty(),
-        "O-1: снапшот из живого состояния пуст — «не читать журнал» удовлетворено тривиально,          отдачей пустоты. Содержательность проверяется в O-2, но пустой снапшот отсекаем здесь"
+        "O-1: снапшот из живого состояния пуст — «не читать журнал» удовлетворено тривиально, \
+         отдачей пустоты. Содержательность проверяется в O-2, но пустой снапшот отсекаем здесь"
     );
     assert_eq!(
         snapshot.cursor,
         live.cursor(),
-        "O-1: снапшот свёрнут не до того курсора, на котором стоит живое состояние"
+        "O-1: снапшот свёрнут не до того курсора, на котором стоит живое состояние — \
+         клиент получит состояние, не совпадающее с точкой продолжения push"
     );
 }
 
@@ -156,14 +202,17 @@ fn o1_snapshot_comes_from_state_not_from_journal() {
 ///
 /// Без этого O-1 удовлетворялся бы тривиально: «не читать журнал» легко, если отдавать
 /// пустой снапшот. Здесь проверяется, что дешевле — не значит неправильнее.
+///
+/// Эталон строится ДРУГИМ путём (`gateway::snapshot` от `START` до `LATEST`, без чекпоинта
+/// и без `LiveReducer`), поэтому сверка нетавтологична.
 #[test]
 fn o2_livereducer_snapshot_equals_independent_replay() {
-    let dir = journal_mixed(600);
-    let ckpt = tempfile::tempdir().expect("ckpt");
+    let (dir, ckpt, mid) = journal_with_midpoint_checkpoint(600);
 
-    let (live, _stats) =
+    let (mut live, _stats) =
         gateway::LiveReducer::resume(dir.path(), EpochFilter::OwnCaptureOnly, &sel(), ckpt.path())
             .expect("resume");
+    let tail_work = pump_to_tail(&mut live, dir.path());
     let from_live = live.snapshot();
 
     let replay = gateway::snapshot(
@@ -174,7 +223,15 @@ fn o2_livereducer_snapshot_equals_independent_replay() {
     )
     .expect("independent replay");
 
-    // Анти-вырождение: под окном `cvd_session_base` обязан быть НЕпуст, иначе сравнение
+    // Анти-вырождение №1: догон обязан быть НЕпустым, иначе чекпоинт покрыл всё и оракул
+    // проверяет только путь «состояние целиком из чекпоинта» — половину предмета.
+    assert!(
+        tail_work > 0,
+        "O-2: догон не прочитал ни одного события — чекпоинт на {:?} покрыл весь журнал, \
+         хвостовая ветка не проверена",
+        mid
+    );
+    // Анти-вырождение №2: под окном `cvd_session_base` обязан быть НЕпуст, иначе сравнение
     // этого поля превратится в `[] == []` (слепая зона C-055 §2).
     assert!(
         !replay.series.cvd_session_base.is_empty(),
@@ -201,17 +258,18 @@ fn o2_livereducer_snapshot_equals_independent_replay() {
 ///
 /// Сегодня свойство держится «по построению» (оба берут курсор из одного `live.cursor()`),
 /// но не проверено ничем. Конструкция может быть переписана — тест переживёт.
-/// Деградированный вход: журнал РАСТЁТ между резюме и отправкой снапшота.
+/// Деградированный вход: журнал РАСТЁТ между догоном и отправкой снапшота — ровно то,
+/// что делает recorder в проде, пока клиент подключается.
 #[test]
 fn o3_no_gap_between_snapshot_and_push() {
-    let dir = journal_mixed(400);
-    let ckpt = tempfile::tempdir().expect("ckpt");
+    let (dir, ckpt, _mid) = journal_with_midpoint_checkpoint(400);
 
     let (mut live, _stats) =
         gateway::LiveReducer::resume(dir.path(), EpochFilter::OwnCaptureOnly, &sel(), ckpt.path())
             .expect("resume");
+    pump_to_tail(&mut live, dir.path());
 
-    // Журнал растёт ПОСЛЕ резюме — ровно то, что делает recorder в проде.
+    // Журнал растёт ПОСЛЕ догона — гонка, которую обязан пережить контракт снапшота.
     {
         let mut j = Journal::open_with(dir.path(), writer_cfg()).expect("reopen");
         for i in 0..5i64 {

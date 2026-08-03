@@ -44,6 +44,24 @@ else
   fail "T4 сигнатура snapshot() не найдена или принимает путь — второй проход снова возможен"
 fi
 
+echo "--- T4b: ВТОРОЙ ПРОХОД УБРАН с пути подключения (задача 2) ---"
+# Сигнатура (T4) доказывает, что snapshot() не может читать журнал. Но она НЕ доказывает,
+# что gateway-serve действительно ею пользуется: пока на пути подключения остаётся вызов
+# snapshot_from_checkpoint, состояние по-прежнему считается дважды, а T3/T4 этого не видят —
+# они живут в крейте gateway. Канарейка «механизм на пути» (тот же приём, что T6 в M-53).
+SESSION_SRC=crates/gateway-serve/src/lib.rs
+if grep -qE "snapshot_from_checkpoint" "$SESSION_SRC"; then
+  fail "T4b gateway-serve всё ещё вызывает snapshot_from_checkpoint — второй проход на месте"
+  grep -nE "snapshot_from_checkpoint" "$SESSION_SRC" | head -5
+else
+  pass "T4b на пути подключения нет snapshot_from_checkpoint"
+fi
+if grep -qE "\.snapshot\(\)" "$SESSION_SRC"; then
+  pass "T4b снапшот клиента берётся из живого состояния"
+else
+  fail "T4b LiveReducer::snapshot() не используется в gateway-serve — задача 2 не сделана"
+fi
+
 echo "--- T5: РЕГРЕСС — наборы M-46 и M-53 остаются зелёными ---"
 if cargo test -p gateway-serve >/tmp/m54-m46.log 2>&1 \
    && ! grep -qE "^test result: FAILED" /tmp/m54-m46.log; then
