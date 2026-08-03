@@ -354,3 +354,26 @@ p50 reach 54–58%): спрос/предложение за потолком р�
 **Воспроизведение:** `cargo run --release -p research-cli --example depth_lifetime -- /tmp/m33-journal`
 (или VPS: `/var/lib/docker/volumes/hft-platform_journal-data/_data/`).
 **END of M-33 follow-up. — research-dev, 2026-07-24 UTC**
+
+## M-58 — per-life пересъёмка segment 78
+
+**УСЛОВИЯ ПРОГОНА M-58:**
+- сегмент: `segment-00000078.jrnl` из `/tmp/m33-journal` (epoch `own-2026-07`);
+- окно: весь gap-free segment 78, `first_ts_ms=1784871617235`, `last_ts_ms=1784883768642`;
+- число дельт: `121241`; `gaps=0`.
+
+Результат per-life анализатора (bid/ask раздельно):
+
+| side | band_bps | lives_born | lives_cancelled | lives_frozen | lives_censored | cancel_fraction |
+|---|---:|---:|---:|---:|---:|---:|
+| bid | 0–150 | 315200 | 312693 | 2507 | 0 | 0.992046 |
+| bid | 500–800 | 1669 | 1473 | 196 | 0 | 0.882564 |
+| bid | 3000–6000 | 463 | 404 | 59 | 0 | 0.872570 |
+| ask | 0–150 | 293010 | 290085 | 2925 | 0 | 0.990017 |
+| ask | 500–800 | 184 | 114 | 70 | 0 | 0.619565 |
+| ask | 3000–6000 | 67 | 27 | 40 | 0 | 0.402985 |
+
+Полный вывод сохранён в stdout прогона; баланс `lives_born == lives_cancelled + lives_frozen + lives_censored` проверяется per-band.
+
+**END of M-58 пересъёмка.**
+
