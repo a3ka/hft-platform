@@ -64,10 +64,10 @@ I/O-пути (урок TD-011, `crates/journal/tests/red_open_bounded.rs`) — *
 
 | # | Задача | Зона | Статус | Оракул |
 |---|---|---|---|---|
-| 1 | `gateway::frames_since_with_stats(dir, filter, sel, after, max) -> io::Result<(Vec<Frame>, Cursor, ReadStats)>` — аддитивно, симметрично `snapshot_from_checkpoint`; `frames_since` остаётся тонкой обёрткой (совместимость) | engine-dev | ⏳ OPEN | компиляция O-1/O-2 |
-| 2 | **SEEK вместо чтения с головы:** `journal::stream_from(dir, filter, after.upto_seq)` в обеих функциях | engine-dev | ⏳ OPEN | **O-1, O-2** |
-| 3 | Блокирующий journal-read вынести из async-таска: `tokio::task::spawn_blocking` вокруг `frames_msgs` в push-цикле (`gateway-serve/src/lib.rs:424-431`) | engine-dev | ⏳ OPEN | O-3 |
-| 4 | Таск обязан завершаться при уходе клиента ДАЖЕ когда кадров нет (сейчас единственная ветка выхода достижима только при наличии кадров) | engine-dev | ⏳ OPEN | O-3 |
+| 1 | `gateway::frames_since_with_stats(dir, filter, sel, after, max) -> io::Result<(Vec<Frame>, Cursor, ReadStats)>` — аддитивно, симметрично `snapshot_from_checkpoint`; `frames_since` остаётся тонкой обёрткой (совместимость) | engine-dev | ⚠️ DONE (rev2, см. report §2) | компиляция O-1/O-2 |
+| 2 | **SEEK вместо чтения с головы:** `journal::stream_from(dir, filter, after.upto_seq)` в обеих функциях | engine-dev | ⚠️ ЧАСТИЧНО (см. report §2 — VWAP-регрессия, `frames_since` НЕ seek-based) | **O-1, O-2** |
+| 3 | Блокирующий journal-read вынести из async-таска: `tokio::task::spawn_blocking` вокруг `frames_msgs` в push-цикле (`gateway-serve/src/lib.rs:424-431`) | engine-dev | ✅ DONE | O-3 |
+| 4 | Таск обязан завершаться при уходе клиента ДАЖЕ когда кадров нет (сейчас единственная ветка выхода достижима только при наличии кадров) | engine-dev | ✅ DONE | O-3 |
 | 5 | RED-оракулы O-1/O-2 | **architect** (sacred) | ✅ DONE | — |
 | 6 | Оракул O-3 на утечку таска/accept-loop | **architect** (sacred) | ⏳ OPEN | — |
 | 7 | `scripts/verify_M-47.sh` | **architect** (sacred) | ⏳ OPEN | — |
