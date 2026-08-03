@@ -89,8 +89,8 @@ fn dv_i_1_explicit_cancel_is_live() {
     let far = r
         .band(Side::Buy, FAR_LO)
         .expect("дальняя полоса должна присутствовать");
-    assert!(far.cancelled >= 1, "явный size=0 ⇒ cancelled≥1 (живой)");
-    assert_eq!(far.frozen, 0, "отменённый уровень не может быть frozen");
+    assert!(far.lives_cancelled >= 1, "явный size=0 ⇒ cancelled≥1 (живой)");
+    assert_eq!(far.lives_frozen, 0, "отменённый уровень не может быть frozen");
 }
 
 // ── DV-I-2: born, никогда не size=0 до конца окна = FROZEN (фантом-кандидат) ─────────────────────
@@ -115,11 +115,11 @@ fn dv_i_2_never_cancelled_is_frozen() {
     let r = analyze(&ticks);
     let far = r.band(Side::Buy, FAR_LO).expect("дальняя полоса");
     assert!(
-        far.frozen >= 1,
+        far.lives_frozen >= 1,
         "жив на конце окна, ни разу size=0 ⇒ frozen≥1"
     );
-    assert_eq!(far.cancelled, 0, "не было явной отмены ⇒ cancelled=0");
-    assert_eq!(far.censored, 0, "gap'а не было ⇒ censored=0");
+    assert_eq!(far.lives_cancelled, 0, "не было явной отмены ⇒ cancelled=0");
+    assert_eq!(far.lives_censored, 0, "gap'а не было ⇒ censored=0");
 }
 
 // ── DV-I-3 (ЯДРО): исчезновение через seq-GAP = CENSORED, НЕ отмена и НЕ заморозка ───────────────
@@ -145,15 +145,15 @@ fn dv_i_3_gap_vanish_is_censored_not_cancel() {
     assert!(r.gaps >= 1, "скачок update-id ⇒ gap задетектирован");
     let far = r.band(Side::Buy, FAR_LO).expect("дальняя полоса");
     assert!(
-        far.censored >= 1,
+        far.lives_censored >= 1,
         "исчез через gap ⇒ censored≥1 (fate неизвестен)"
     );
     assert_eq!(
-        far.cancelled, 0,
+        far.lives_cancelled, 0,
         "gap-исчезновение НЕ отмена (наивный анализатор соврал бы 'живой')"
     );
     assert_eq!(
-        far.frozen, 0,
+        far.lives_frozen, 0,
         "gap-исчезновение НЕ заморозка (уровень не дожил до конца окна валидно)"
     );
 }
@@ -184,11 +184,11 @@ fn dv_i_4_absence_is_not_deletion() {
     let far = r.band(Side::Buy, FAR_LO).expect("дальняя полоса");
     // «истекает после N молчаливых тиков» пометил бы уровень frozen ДО отмены → провал.
     assert!(
-        far.cancelled >= 1,
+        far.lives_cancelled >= 1,
         "уровень дожил до явной size=0 ⇒ cancelled≥1"
     );
     assert_eq!(
-        far.frozen, 0,
+        far.lives_frozen, 0,
         "молчание не должно преждевременно замораживать"
     );
 }
@@ -263,15 +263,15 @@ fn dv_i_checklist_asymmetry_and_multiplicity() {
     let r = analyze(&ticks);
     let far_bid = r.band(Side::Buy, FAR_LO).expect("дальняя bid-полоса");
     assert!(
-        far_bid.cancelled >= 2,
+        far_bid.lives_cancelled >= 2,
         "две отмены в одном тике ⇒ cancelled≥2 (наивный 'один' падает)"
     );
     let far_ask = r.band(Side::Sell, FAR_LO).expect("дальняя ask-полоса");
     // Асимметрия: ask молчал ⇒ его дальний уровень frozen (жив), НЕ censored/cancelled.
-    assert_eq!(far_ask.cancelled, 0, "ask-сторона молчала ⇒ не отменена");
+    assert_eq!(far_ask.lives_cancelled, 0, "ask-сторона молчала ⇒ не отменена");
     assert_eq!(
-        far_ask.censored, 0,
+        far_ask.lives_censored, 0,
         "односторонний bid-тик не роняет ask в censored"
     );
-    assert!(far_ask.frozen >= 1, "молчащий ask-уровень жив ⇒ frozen≥1");
+    assert!(far_ask.lives_frozen >= 1, "молчащий ask-уровень жив ⇒ frozen≥1");
 }
