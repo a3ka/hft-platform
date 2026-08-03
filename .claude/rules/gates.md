@@ -312,6 +312,13 @@ bash scripts/verify_design_claims.sh --merge-preview origin/main
 автора**. Reviewer остаётся там, где он стоит по `docs/04-workflow.md` §2: в конце
 milestone-цепочки, бэкстопом; отдельного маршрута architect → reviewer на doc-правку нет.
 
+**risk-critic обязателен дополнительно, если документ трогает safety-путь:** `docs/fa/risk.md`,
+`docs/fa/killswitch.md`, `docs/fa/oms.md`, `RK-I-*`/`INTG-I-*`, анти-оверфит гейт (§6). Это НЕ
+дубль §5: тот привязан к путям `crates/risk|killswitch|oms|venue-*`, которых пока не
+существует, — сегодня риск-инварианты живут ИСКЛЮЧИТЕЛЬНО как текст в `docs/fa/*`, и правка
+этого текста есть единственный способ их ослабить. Крейт, написанный позже по ослабленному
+документу, унаследует послабление молча.
+
 **Механический барьер (не церемония):** `scripts/check_protected_artifacts.sh` — коммит не
 имеет права удалять `research/critiques/*`, `milestones/*`, `docs/rfc/*` без явного
 `ALLOW-ARTIFACT-DELETE` в теле. Барьер сам под пробой: `scripts/tests/red_protected_artifacts.sh`
