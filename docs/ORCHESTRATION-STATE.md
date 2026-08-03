@@ -23,7 +23,7 @@
 | 1 | **M-54** (единая стоимость коннекта) | close-out | `research/reviews/R-029-M-54.md` ✅ | **close-out FAIL** — reviewer нашёл: наклон ×3.9 лучше, но константа +404 ms; породил M-56 |
 | 2 | **M-56** (снапшот без клонирования) | merge сделан `c714d0f` | `R-030-*` ❌ **НЕТ** | ⚠️ **merge раньше артефакта** — reviewer дописывает отчёт + замер на проде (запрошено) |
 | 3 | **M-57** (пересканирование активного сегмента) | critic круг 2 | `C-059-M-57.md` ✅ (REJECT) | оракулы rev2 готовы (`c8e0a6d`), обе находки закрыты; **нужен re-critic** |
-| 4 | **M-58** (метрика `cancel_fraction`) | спека | — | пишется architect'ом; дефект в проде (`R-031` A.1) |
+| 4 | **M-58** (метрика `cancel_fraction`) | арбитраж пройден, пометки внесены | `docs/plans/depth-metric-tpp-question.md` ✅ · `research/arbitration/A-002-depth-metric-tpp.md` ✅ (ЗАМОРОЗИТЬ) · пометки в 4 документах ✅ | ветка `feat/M-58-depth-metric`; **дальше:** правки reviewer-owned файлов + переспека метрики per-life + RED |
 | 5 | ретро-аудит M-32/33/34 | завершён | `research/reviews/R-031-retro-audit.md` ✅ | ветка `docs/retro-audit`, **не смержена** |
 | 6 | правило «артефакт, а не роль» | готово | `CLAUDE.md` + `gates.md` §10 + handoff §00 | ветка `docs/artifact-over-role`, **не смержена** |
 
