@@ -17,6 +17,17 @@ services:
     restart: unless-stopped
     environment:
       JOURNAL_DIR: /journal
+      # П-008 п.1 (санкция founder'а 2026-08-03) — СОСТАВ ЗАПИСИ КАК ЯВНАЯ КОНФИГУРАЦИЯ.
+      # До этой правки переменные состава НЕ пробрасывались вовсе: в контейнере был только
+      # JOURNAL_DIR, а состав жил в дефолтах бинаря (`crates/recorder/src/main.rs:374,381,388`).
+      # То есть правка дефолта в КОДЕ тихо сменила бы эпоху данных, минуя founder'а — при том
+      # что состав записываемых данных это Граница C (`docs/DESIGN.md` §6).
+      # Значения ниже РАВНЫ дефолтам кода символ-в-символ: правка не меняет данные ни на байт,
+      # она делает состав видимым и управляемым через `.env`, а не пересборкой.
+      # Смена состава = новая эпоха: требует нового EPOCH_ID (`docs/rfc/CT-RFC-06-l2delta.md` §3).
+      BINANCE_SYMBOLS: ${BINANCE_SYMBOLS:-BTCUSDT,ETHUSDT}
+      BINANCE_FUTURES_SYMBOLS: ${BINANCE_FUTURES_SYMBOLS:-BTCUSDT,ETHUSDT}
+      HL_COINS: ${HL_COINS:-BTC,ETH}
     volumes:
       - journal-data:/journal
     healthcheck:
