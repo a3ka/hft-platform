@@ -70,6 +70,7 @@ journal-writer (`VB-I-3`, `GS-I-1`). **Граница C НЕ затрагива�
 | 3 | Применение кадров: `snapshot(C) + frames_since(C..)` ≡ `snapshot(LATEST)` через WS-путь | engine-dev | ⏳ OPEN | O-3 |
 | 4 | Рендер без дизайна: ASCII-панель в stdout + автономный HTML-файл (инлайн, без внешних ресурсов) | engine-dev | ⏳ OPEN | O-7, T5 |
 | 5 | Sidecar-прогон против прода (`docker run --network container:hft-gateway-serve`), артефакты в отчёт | engine-dev | ⏳ OPEN | T6 |
+| 5a | **`Dockerfile`: добавить `--bin wsprobe` + `COPY` в рантайм-слой** — иначе образ на VPS харнесса НЕ содержит и sidecar-прогон невозможен (замер architect'а: `Dockerfile:15,26-29` собирает 4 бинаря ЯВНЫМ списком) | engine-dev | ⏳ OPEN | T6 |
 | 6 | RED-оракулы O-1..O-7 | **architect** (sacred) | ⏳ OPEN | — |
 | 7 | `scripts/verify_M-46.sh` | **architect** (sacred) | ⏳ OPEN | — |
 
@@ -95,6 +96,7 @@ journal-writer (`VB-I-3`, `GS-I-1`). **Граница C НЕ затрагива�
 
 **Разрешено:**
 - `crates/gateway-serve/src/**` (харнесс, рендер, сверка) — engine-dev;
+- `Dockerfile` — ТОЛЬКО добавление `wsprobe` в сборку и `COPY` (задача 5a); прочие правки образа вне периметра;
 - `crates/gateway-serve/tests/**` — **architect only** (sacred);
 - `scripts/verify_M-46.sh` — **architect only**;
 - `research/reports/M-46-*.md` + артефакты прогона — dev/tester;
