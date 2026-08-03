@@ -332,3 +332,61 @@ TD-002 (скомпрометированный ключ) · TD-015 (эпохи l
 **Сверка «заявлено / в оракулах»** (замер, R9): `SM-I` 10/10 · `VB-I` 11/9 · `OPS-I` 10/8 ·
 `ST-I` 10/8 · `CT-I` 6/5 · `JR-I` 7/2 · `RK-I` 10/3 · **`INTG-I` 7/0** · **`BK-I` 8/0** ·
 **`VN-I` 9/0** · `GW-I` 0/12 (обратный дрейф: оракулы есть, семейство в доках не заведено).
+
+---
+
+## §9. Гигиена репозитория — уборка 2026-08-03 и что НЕ удалено
+
+**Сделано:** worktree **146 → 12**, локальные ветки **284 → 33**. Удалялось только
+доказуемо безопасное: рабочая копия чистая ИЛИ её правки старее `main`; ветка слита в `main`
+ИЛИ её содержимое уже там по `git cherry` (сравнение по patch-id — ловит попадание через
+rebase/cherry-pick, чего обычный `--merged` не видит).
+
+**Проверка, а не доверие.** Двадцать одна «грязная» копия выглядела как несохранённая работа,
+но каждая оказалась УСТАРЕВШЕЙ: в `hft-docmerge` лежал документ на 238 строк с опечаткой,
+тогда как в `main` — 252 строки с исправленной. Семь копий имели коммиты, не запушенные
+никуда (M-28, M-37, M-38b) — содержимое проверено пофайлово и найдено в `main` (крейт
+`gateway-serve`, `window_ms`, чекпоинт-механизм, вердикты `C-030`/`C-031`).
+
+### ⚠️ 25 веток НЕ удалены — в них работа, которой в `main` НЕТ
+
+Это не мусор, и решение не моё. Возможны три случая: работа отброшена намеренно (например
+`feat/M-10-rebased` содержит KILL по OBI Track A — тогда ветку можно снести), работа забыта,
+работа ждала своего часа. Удалить чужую работу дешевле, чем восстановить, поэтому список
+зафиксирован здесь, а не в моей памяти.
+
+| ветка | коммитов не в main | дата | что там |
+|---|---|---|---|
+| `feat/M-10-rebased` | 12 | 2026-07-22 | docs(D-001): метод подписи → git-attested (Ed25519 pending… |
+| `research-dev-M10-tasks3-4` | 9 | 2026-07-21 | feat(M-10): R-001 Track A real own-capture report [researc… |
+| `feat/M-54-connect-cost` | 5 | 2026-08-03 | docs(decisions): П-010 ПОДПИСАНО — архитектура масштаба re… |
+| `tester-hft-tester-1785076115` | 3 | 2026-07-26 | feat(M-37): task #7 — GATEWAY_WINDOW_MS wired to прод-бина… |
+| `docs/doc-gate` | 2 | 2026-07-14 | docs(critic): C-006 re-audit rev2 — REJECT |
+| `venue-dev-hft-venue-dev-1783809243` | 2 | 2026-07-11 | feat(M-06): N2 FuturesDepthBook seam (REPLACE/diff/notiona… |
+| `venue-dev/m-09-task2-v2` | 2 | 2026-07-16 | feat(M-09): task 2 — venue REST recon snapshot fetcher + R… |
+| `docs/branch-hygiene-gc` | 1 | 2026-07-17 | docs(rules): branch-hygiene — worktree GC/рекультивация (P… |
+| `docs/margin-reprobe` | 1 | 2026-07-25 | docs(margin): §9 re-probe с read-only ключом — вердикт ПЕР… |
+| `engine-dev-hft-engine-dev-1784210369` | 1 | 2026-07-16 | feat(M-09): task #2 GREEN — crates/ops impl (recon/budget/… |
+| `engine-dev-hft-engine-dev-1784287997` | 1 | 2026-07-17 | feat(M-09): task 2 books-feeder — apply_md_to_books impl +… |
+| `engine-dev/M-35-2b` | 1 | 2026-07-25 | feat(M-35): task 2b — exhaustive-match arms for MdPayload:… |
+| `engine-dev/feat-M-09-task2-books-feeder` | 1 | 2026-07-16 | feat(M-09): task 2 books-feeder — Tee+feeder наполняют liv… |
+| `engine/M-35-match` | 1 | 2026-07-25 | feat(M-35): task 2b — exhaustive-match arms for MdPayload:… |
+| `feat/M-09` | 1 | 2026-07-16 | contract(CT-RFC-03): SysEvent::ReconDivergence — аудит све… |
+| `feat/M-10-r001-obi` | 1 | 2026-07-20 | test(M-10): R-001 OBI kill-screen — milestone + KS-I-* RED… |
+| `feat/M-28-gateway-serve` | 1 | 2026-07-23 | feat(M-28): r2 — server API + bin + WS smoke-тест (C-024 #… |
+| `feat/M-31-book-eviction` | 1 | 2026-07-24 | docs+test(M-31): book eviction (TD-016) — bound+recon-near… |
+| `research/M-32-impl` | 1 | 2026-07-24 | chore(M-32): cargo fmt --all привёл RED-тесты к каноничном… |
+| `research/M-32-q1` | 1 | 2026-07-24 | docs(M-32): task 1 Q1 depth-source survey [research-dev] |
+| `research/M-35-match` | 1 | 2026-07-25 | feat(M-35): task 2c — MarginInventory arm в latency_probe … |
+| `research/depth-probe` | 1 | 2026-07-22 | research(depth-probe): measurement of Binance L2 supportab… |
+| `research/td-007-determinism-coverage` | 1 | 2026-07-31 | research(TD-007): аудит покрытия DET-I-1 — что реально гар… |
+| `venue-dev-hft-venue-dev-1783801266` | 1 | 2026-07-11 | feat(M-06): venue-binance-futures парсеры + async WS/REST-… |
+| `venue-dev/m-09-task2` | 1 | 2026-07-16 | feat(M-09): task 2 — venue REST snapshot fetch for recon (… |
+
+**Как разбирать:** `git log origin/main..<ветка>` — что там; `git cherry origin/main <ветка>` —
+что именно отсутствует (строки с `+`). После решения: либо merge через reviewer, либо
+`git branch -D` с записью причины в этом разделе.
+
+`feat/M-54-connect-cost` и `feat/scale-architecture` в списке — они уже сведены в
+`docs/scale-consolidation` и уйдут в `main` вместе с ней; после merge их можно удалить.
+
