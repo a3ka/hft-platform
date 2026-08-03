@@ -377,7 +377,7 @@ pub mod server {
                 .checkpoint_dir
                 .as_deref()
                 .unwrap_or_else(|| std::path::Path::new(""));
-            let (mut live, _resume_stats) = crate::_gw::LiveReducer::resume(
+            let (mut live, resume_stats) = crate::_gw::LiveReducer::resume(
                 cfg1.journal_dir.as_path(),
                 cfg1.filter.clone(),
                 &cfg1.selector,
@@ -386,21 +386,29 @@ pub mod server {
             // Догнать до текущего хвоста журнала — курсор ПОСЛЕ этого цикла и есть точка,
             // на которой строится снапшот (см. doc выше). Кадры здесь не нужны клиенту:
             // он получит эквивалентное состояние целиком через Snapshot ниже.
+            //
+            // M-54 (`TD-093(б)`, task #2): снапшот клиенту берётся ИЗ ЭТОГО ЖЕ прогретого
+            // `live` (`live.snapshot()`), а НЕ вторым независимым чтением через
+            // `snapshot_from_checkpoint` — тот читал ровно этот же хвост ВТОРОЙ раз
+            // (`research/reports/M-54-engine-dev-report.md`). `stats` теперь честно
+            // накапливает работу ЭТОГО единственного прохода (resume + догон) — то, что
+            // реально стоило подключения, а не работу отдельного второго прохода, который
+            // выполнялся раньше.
+            let mut stats = resume_stats;
             loop {
-                let (frames, _c, _stats) =
+                let (frames, _c, pump_stats) =
                     live.pump(cfg1.journal_dir.as_path(), cfg1.filter.clone(), usize::MAX)?;
+                stats = stats + pump_stats;
                 if frames.is_empty() {
                     break;
                 }
             }
             let at = live.cursor();
-            let (snap_msg, stats) = super::serve::snapshot_msg(
-                cfg1.journal_dir.as_path(),
-                cfg1.filter.clone(),
-                &cfg1.selector,
-                at,
-                cfg1.checkpoint_dir.as_deref(),
-            )?;
+            // Без чтения журнала (сигнатура `snapshot(&self) -> Snapshot` не принимает
+            // `dir`/`filter` — второй проход невозможен по построению). Между догоном
+            // (цикл выше) и снятием снапшота ничего не читается — O-3: курсор снапшота
+            // совпадает с курсором, от которого начнётся push ниже.
+            let snap_msg = ServeMsg::Snapshot(live.snapshot());
             Ok((snap_msg, stats, live, at))
         })
         .await;

@@ -2931,11 +2931,22 @@ impl LiveReducer {
         // Проход по журналу здесь нужен ТОЛЬКО чтобы `ReadStats` честно отразил реальную
         // цену catch-up (форсинг `resume_without_checkpoint_reports_full_replay`: счётчик,
         // который всегда мал, обесценивает оракулы бюджета) — декодируем и отбрасываем.
+        // M-54 (TD-093(б)): ОДНО поле НЕ отбрасываем — seq первого ВИДИМОГО события
+        // (провенанс истории, VB-I-11). Без чекпоинта `resume()` — единственное место,
+        // где `snapshot()` мог бы узнать, что журналу спрунен префикс: жёсткий
+        // `0`/`false` соврал бы о честности (регрессия поймана `o6_pruned_journal_
+        // is_honestly_marked`, `crates/gateway-serve/tests/red_ws_honesty_sessions.rs` —
+        // сценарий БЕЗ чекпоинта на журнале с удалённым первым сегментом).
         let mut stream = journal::stream(dir, filter)?;
+        let mut first_seq: Option<u64> = None;
         for event in &mut stream {
-            event?;
+            let event = event?;
+            if first_seq.is_none() {
+                first_seq = Some(event.seq);
+            }
         }
         let stats = read_stats_from_stream(&stream);
+        let history_start_seq = first_seq.unwrap_or(0);
         Ok((
             Self {
                 vwap: VwapAcc::default(),
@@ -2947,8 +2958,8 @@ impl LiveReducer {
                 // сделал последующий `pump()`, не `resume()` (см. doc-комментарий
                 // `LiveReducer`, rev2 M-54 оракулов).
                 full: Reducer::new(sel),
-                full_history_start_seq: 0,
-                full_history_truncated: false,
+                full_history_start_seq: history_start_seq,
+                full_history_truncated: history_start_seq > 0,
             },
             stats,
         ))
