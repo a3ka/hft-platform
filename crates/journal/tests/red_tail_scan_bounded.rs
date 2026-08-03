@@ -80,10 +80,17 @@ fn write_n(dir: &std::path::Path, from: i64, to: i64, cfg: WriterConfig) {
     j.flush().expect("flush");
 }
 
-/// Один тик: стрим от `after` до исчерпания. Возвращает (выдано, прочитано).
-fn tick(dir: &std::path::Path, after: u64) -> (u64, u64) {
-    let mut s =
-        journal::stream_from(dir, EpochFilter::OwnCaptureOnly, Some(after)).expect("stream_from");
+/// Один тик: стрим от `after` (`None` — с самого начала) до исчерпания.
+/// Возвращает `(выдано, прочитано)`.
+///
+/// ⚠️ `after: Option<u64>`, а не `u64` — по находке `C-059` §3.3. **`seq` в журнале начинается
+/// с НУЛЯ**, поэтому `Some(0)` означает «отбросить событие seq=0», а не «взять всё с начала».
+/// Первая редакция O-3 звала `tick(dir, 0)` для первого прохода и теряла первое событие
+/// навсегда: оно не попадало ни в первый тик (отброшено фильтром), ни во второй (тот стартовал
+/// уже дальше). Тест падал детерминированно и НЕЗАВИСИМО ОТ РЕАЛИЗАЦИИ — то есть был сломан
+/// сам, а не ловил дефект.
+fn tick(dir: &std::path::Path, after: Option<u64>) -> (u64, u64) {
+    let mut s = journal::stream_from(dir, EpochFilter::OwnCaptureOnly, after).expect("stream_from");
     let mut yielded = 0u64;
     while let Some(r) = s.next() {
         r.expect("event");
@@ -94,35 +101,86 @@ fn tick(dir: &std::path::Path, after: u64) -> (u64, u64) {
     (yielded, s.events_scanned())
 }
 
-/// **O-1.** Счётчик честен: он видит прочитанное, а не только выданное.
+/// Последний `seq` в журнале — честный курсор «я дочитал досюда».
+fn tail_seq(dir: &std::path::Path) -> u64 {
+    let mut s = journal::stream_from(dir, EpochFilter::OwnCaptureOnly, None).expect("stream_from");
+    let mut last = 0u64;
+    while let Some(r) = s.next() {
+        last = r.expect("event").seq;
+    }
+    last
+}
+
+/// **O-1 (переписан по `C-059` §3.2).** Счётчик считает ПРОЧИТАННОЕ — доказывается ПРЯМОЙ
+/// НИЖНЕЙ ГРАНИЦЕЙ от размера журнала, а не сравнением с самим собой.
 ///
-/// На хвосте большого сегмента выдаётся 3 события. Слепой счётчик покажет 3 и при полном
-/// скане, и при seek — то есть не различит исправную реализацию от сломанной. Честный обязан
-/// показать РАЗНИЦУ: до фикса ≈ размеру сегмента, после ≈ приращению.
+/// ## Чем была плоха первая редакция
 ///
-/// Здесь проверяется только СВОЙСТВО счётчика (`scanned >= yielded`, счётчик не константа),
-/// а величина — в O-2. Разделено намеренно: O-1 может быть зелёным на сломанной реализации,
-/// и это нормально — он про прибор, а не про предмет.
+/// Она требовала лишь `scanned >= yielded` и `scanned > 0`. Критик показал эмпирически:
+/// реализация `fn events_scanned(&self) -> u64 { self.events_decoded }` — **буквальный алиас,
+/// без единой строчки реального фикса** — проходила и O-1, и O-2 (`ratio = 1.00` при пороге
+/// `< 2.5`). То есть весь acceptance-гейт был проходим БЕЗ задачи 2, а P0-регресс на проде
+/// остался бы неисправленным при формально закрытом milestone'е.
+///
+/// Корень: `events_scanned` не имел НИ ОДНОЙ точки верификации, независимой от
+/// `events_decoded`. O-2 сравнивал счётчик сам с собой на двух размерах — а если он
+/// тождественно равен `yielded` (жёстко 3 в обоих прогонах), сравнение не отличает «честно
+/// измерено и мало» от «нечестно скопировано и мало».
+///
+/// ## Что проверяется теперь
+///
+/// Курсор ставится в СЕРЕДИНУ журнала: выдаётся половина событий, а вторая половина —
+/// `N/2` штук — обязана быть ПРОЧИТАНА и отброшена фильтром (сегодня, до фикса) либо
+/// пропущена seek'ом (после фикса). В обоих случаях верно одно: **`scanned` не может быть
+/// меньше числа ВЫДАННЫХ**, и при этом он обязан отличаться от `yielded` хотя бы в одном из
+/// двух режимов — иначе это алиас.
+///
+/// Ключ — вторая проверка: тот же журнал читается ПОЛНОСТЬЮ (`after = None`). Там выдаются
+/// все `N` событий. Если `scanned` — алиас `yielded`, то на полном проходе он равен `N`, а на
+/// частичном равен `N/2`, и отношение `scanned_full / scanned_half` = 2.0. Честный счётчик на
+/// сегодняшней реализации даёт `N` в ОБОИХ случаях (оба прохода читают весь журнал), то есть
+/// отношение ≈1.0. **Алиас и честный счётчик здесь различимы, и различие не зависит от того,
+/// реализована ли задача 2.**
 #[test]
-fn o1_scanned_counter_is_honest() {
+fn o1_scanned_counts_reads_not_yields() {
+    const N: i64 = 4_000;
     let dir = tempfile::tempdir().expect("tempdir");
-    write_n(dir.path(), 0, 5_000, cfg_single_segment());
-    let after = 4_999u64;
-    write_n(dir.path(), 5_000, 5_003, cfg_single_segment());
+    write_n(dir.path(), 0, N, cfg_single_segment());
 
-    let (yielded, scanned) = tick(dir.path(), after);
+    // Курсор в середине: выдаётся вторая половина, первая обязана быть прочитана или пропущена.
+    let mid = (N / 2 - 1) as u64;
+    let (yielded_half, scanned_half) = tick(dir.path(), Some(mid));
+    // Полный проход: выдаётся всё.
+    let (yielded_full, scanned_full) = tick(dir.path(), None);
 
-    assert_eq!(yielded, 3, "O-1: фикстура сломана — выдано не 3 события");
-    assert!(
-        scanned >= yielded,
-        "O-1: events_scanned ({scanned}) < events_decoded ({yielded}) — счётчик считает \
-         меньше, чем выдано; это невозможно при честном учёте"
+    assert_eq!(
+        yielded_full as i64, N,
+        "O-1: полный проход выдал {yielded_full} из {N} — фикстура сломана"
     );
-    // Анти-вырождение: счётчик не должен быть константой или копией `yielded` по построению.
-    // Проверяется в O-2 сравнением двух размеров; здесь фиксируем лишь ненулевое значение.
     assert!(
-        scanned > 0,
-        "O-1: events_scanned = 0 при трёх выданных событиях — счётчик не подключён"
+        yielded_half > 0 && (yielded_half as i64) < N,
+        "O-1: частичный проход выдал {yielded_half} из {N} — курсор не в середине, \
+         сравнение выродилось"
+    );
+    assert!(
+        scanned_half >= yielded_half,
+        "O-1: scanned ({scanned_half}) < yielded ({yielded_half}) — невозможно при честном учёте"
+    );
+
+    // ГЛАВНОЕ: алиас `scanned == yielded` даёт ratio ≈ 2.0 (N против N/2).
+    // Честный счётчик на сегодняшней реализации (полный скан в обоих случаях) даёт ≈1.0.
+    let ratio = scanned_full as f64 / scanned_half.max(1) as f64;
+    eprintln!(
+        "ЗАМЕР O-1: scanned полный={scanned_full} частичный={scanned_half} (×{ratio:.2}); \
+         yielded {yielded_full}/{yielded_half}"
+    );
+    assert!(
+        ratio < 1.5,
+        "O-1 (TD-098): events_scanned ведёт себя как АЛИАС events_decoded. Полный проход \
+         прочитал {scanned_full}, частичный — {scanned_half} (×{ratio:.2}), тогда как ОБА \
+         читают один и тот же журнал из {N} событий и обязаны показать сопоставимую работу. \
+         Значит счётчик считает выданное, а не прочитанное, и измерить пересканирование им \
+         нельзя. Это ровно тот дефект прибора, ради которого milestone и существует."
     );
 }
 
@@ -142,9 +200,9 @@ fn o2_tick_scans_only_increment_not_whole_segment() {
     let scan_for = |n: i64| -> (u64, u64) {
         let dir = tempfile::tempdir().expect("tempdir");
         write_n(dir.path(), 0, n, cfg_single_segment());
-        let after = (n - 1) as u64;
+        let after = tail_seq(dir.path());
         write_n(dir.path(), n, n + 3, cfg_single_segment());
-        let (yielded, scanned) = tick(dir.path(), after);
+        let (yielded, scanned) = tick(dir.path(), Some(after));
         assert_eq!(yielded, 3, "O-2: при {n} событиях выдано не 3");
         std::mem::forget(dir);
         (yielded, scanned)
@@ -174,15 +232,16 @@ fn o3_position_survives_segment_rotation() {
     let dir = tempfile::tempdir().expect("tempdir");
     write_n(dir.path(), 0, 400, cfg_rotating());
 
-    // Первый тик: забираем всё, запоминаем хвост.
-    let (y1, _s1) = tick(dir.path(), 0);
+    // Первый тик: забираем ВСЁ (after=None — иначе Some(0) отбросил бы событие seq=0,
+    // C-059 §3.3). Курсор берём фактический — последний seq, а не число событий.
+    let (y1, _s1) = tick(dir.path(), None);
     assert!(y1 > 0, "O-3: первый тик пуст — фикстура не давит");
-    let after = y1; // seq последнего выданного (seq начинается с 1)
+    let after = tail_seq(dir.path());
 
     // Дозапись, гарантированно вызывающая ротацию (сегмент 32 KiB).
     write_n(dir.path(), 400, 900, cfg_rotating());
 
-    let (y2, _s2) = tick(dir.path(), after);
+    let (y2, _s2) = tick(dir.path(), Some(after));
 
     // Полный независимый проход — эталон, построенный ДРУГИМ путём.
     let mut full =
@@ -224,7 +283,7 @@ fn o3_position_survives_segment_rotation() {
 fn o4_seek_path_yields_identical_events() {
     let dir = tempfile::tempdir().expect("tempdir");
     write_n(dir.path(), 0, 3_000, cfg_single_segment());
-    let after = 2_000u64;
+    let after = tail_seq(dir.path()) / 2;
     write_n(dir.path(), 3_000, 3_010, cfg_single_segment());
 
     // Путь под проверкой.
