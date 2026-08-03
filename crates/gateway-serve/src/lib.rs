@@ -395,9 +395,29 @@ pub mod server {
         let mut push_tick = tokio::time::interval(Duration::from_millis(PUSH_INTERVAL_MS));
         push_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+        // M-47 (TD-083 task #3/#4): journal-read блокирующий (файловый I/O), поэтому ВСЕГДА
+        // идёт через `spawn_blocking` — иначе он монополизирует единственный поток
+        // `current_thread`-рантайма (прод: `/proc/1/task=1`), и accept-loop / другие сессии
+        // не исполняются вовсе, пока чтение не закончится (root cause 2, `R-025`).
+        //
+        // `pending_read` держит JoinHandle текущего в-полёте чтения МЕЖДУ итерациями `select!`.
+        // Критично для task #4: ветка `stream.next()` — ОТДЕЛЬНАЯ ветка select! на КАЖДОЙ
+        // итерации независимо от того, идёт ли сейчас блокирующее чтение — уход клиента
+        // детектируется НЕМЕДЛЕННО, а не только после завершения текущего чтения (раньше
+        // единственная ветка выхода — `sink.send(..).is_err()` — была достижима только когда
+        // чтение уже вернуло кадры). Новый тик НЕ планируется, пока предыдущее чтение не
+        // завершилось (`if pending_read.is_none()`) — backpressure, не очередь чтений.
+        type PendingRead = tokio::task::JoinHandle<
+            std::io::Result<(Vec<super::wire::ServeMsg>, crate::_gw::Cursor)>,
+        >;
+        let mut pending_read: Option<PendingRead> = None;
+
         loop {
             tokio::select! {
-                // Клиент отключился / ошибка приёма → выходим.
+                // Клиент отключился / ошибка приёма → выходим НЕМЕДЛЕННО (не дожидаясь
+                // текущего pending_read — если он есть, JoinHandle просто дропается; сама
+                // blocking-задача на пуле не отменяется, но досчитает вхолостую и это
+                // безвредно: результат никто не читает, соединение уже закрыто).
                 msg = stream.next() => {
                     match msg {
                         None => return Ok(()),
@@ -420,17 +440,30 @@ pub mod server {
                         Some(Ok(Message::Pong(_))) | Some(Ok(Message::Frame(_))) => {}
                     }
                 }
-                // Периодический push: инкрементальные кадры от последнего курсора.
-                _ = push_tick.tick() => {
-                    let (msgs, new_cursor) = match super::serve::frames_msgs(
-                        cfg.journal_dir.as_path(),
-                        cfg.filter.clone(),
-                        &cfg.selector,
-                        cursor,
-                        PUSH_MAX_EVENTS,
-                    ) {
-                        Ok(pair) => pair,
-                        Err(e) => {
+                // Периодический тик: запускаем НОВОЕ блокирующее чтение, только если
+                // предыдущее уже завершилось (иначе копили бы конкурирующие чтения журнала).
+                _ = push_tick.tick(), if pending_read.is_none() => {
+                    let cfg2 = Arc::clone(&cfg);
+                    let after = cursor;
+                    pending_read = Some(tokio::task::spawn_blocking(move || {
+                        super::serve::frames_msgs(
+                            cfg2.journal_dir.as_path(),
+                            cfg2.filter.clone(),
+                            &cfg2.selector,
+                            after,
+                            PUSH_MAX_EVENTS,
+                        )
+                    }));
+                }
+                // Завершение в-полёте чтения (если есть). Гонка со `stream.next()` выше —
+                // уход клиента детектируется НЕЗАВИСИМО от того, сколько ещё осталось читать.
+                result = async { pending_read.as_mut().expect("guarded by is_some() below").await },
+                    if pending_read.is_some() =>
+                {
+                    pending_read = None;
+                    let (msgs, new_cursor) = match result {
+                        Ok(Ok(pair)) => pair,
+                        Ok(Err(e)) => {
                             // RN-21 (reviewer, M-47 PR-гейт): в проде отказ
                             // `frames_msgs` — это NEW live-push канал (M-38b задача #6
                             // вводит резюмируемый `LiveReducer`). Раньше был debug — молча
@@ -445,6 +478,18 @@ pub mod server {
                                 symbol = %cfg.selector.symbol,
                                 venue = ?cfg.selector.venue,
                                 "frames_msgs failed (журнал/чекпоинтер недоступен) — соединение продолжается, но live-push молчит"
+                            );
+                            continue;
+                        }
+                        Err(join_err) => {
+                            // spawn_blocking-таск запаниковал/отменён — не должно случаться
+                            // в норме (frames_msgs не паникует), но не валим соединение молча.
+                            tracing::error!(
+                                error = %join_err,
+                                cursor = ?cursor,
+                                symbol = %cfg.selector.symbol,
+                                venue = ?cfg.selector.venue,
+                                "frames_msgs blocking task join failed — соединение продолжается, live-push молчит"
                             );
                             continue;
                         }
