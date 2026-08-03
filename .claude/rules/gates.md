@@ -270,6 +270,8 @@ rollback). **Push — не конец цикла.** Агент, сделавши
    содержательный пункты обязательны, а не факультативны: TD-011 (`Journal::open` читал
    сегмент целиком в RAM) поймал ТОЛЬКО CPU/MEM-взгляд на VPS, TD-031 (recorder смешивал
    L2Delta в чужой сегмент) — ТОЛЬКО sanity свежих событий после смены формата.
+   **Память меряется как `RssAnon`, а не `docker stats`** (TD-021: в `docker stats` входит
+   page cache журнала, и «лик» находится там, где его нет). Полный разбор — `testing.md`.
 3. **Пруф в close-out:** сырые строки `gh run list` + вывод ssh — в Done Block.
 4. **Worktree-GC:** после merge feat→main reviewer запускает `bash scripts/gc_worktrees.sh`.
 

@@ -67,7 +67,7 @@
 | architect (Fable) | дорогая — экономно | архитектура, `contracts` T1, RED-тесты, verify, sacred |
 | **risk-critic** | сильная (не экономим) | safety-путь + отчёты стратегий (асимметричная цена ошибки) |
 | reviewer | сильная | PR-гейт: scope, Done Block, contract Block-C, риск-инварианты |
-| critic | средняя — **но сильная** на raw-гейте (см. ниже) | plan-time гейт (триггеры в `.claude/rules/gates.md`) |
+| critic | средняя — **но сильная** на RAW-гейте (`.claude/rules/gates.md` §1) | plan-time гейт (триггеры в `.claude/rules/gates.md`) |
 | engine/venue/signal/research-dev | кодовая дешёвая/средняя | impl по milestone + RED |
 | explore/tester | дешёвая | разведка / прогон тестов |
 
