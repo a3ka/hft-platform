@@ -24,11 +24,21 @@ tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 futures-util = { version = "0.3", features = ["sink"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# M-46 task #1 (engine-dev): `wsprobe --self-test` builds an ephemeral fixture journal
+# in-process (no network) so the render gate (T9) can run without a live prod WS. This
+# needs the journal *writer* API at BIN-build time (not just `cargo test`), so `tempfile`
+# moves from dev- to real dependency; it's still only exercised by `--self-test`, never by
+# the `gateway-serve` server bin itself (GS-I-3 concerns the server, not this probe tool —
+# see M-46 engine-dev report for the verify_M-28.sh canary-scope finding).
+tempfile = "3"
 
 [dev-dependencies]
-tempfile = "3"
 futures-util = { version = "0.3", features = ["sink"] }
 
 [[bin]]
 name = "gateway-serve"
 path = "src/main.rs"
+
+[[bin]]
+name = "wsprobe"
+path = "src/bin/wsprobe.rs"
