@@ -1,4 +1,6 @@
-# M-47 — `TD-083` (P0): push-цикл читает журнал с головы и заклинивает прод-gateway
+<!-- ВНИМАНИЕ: номер M-47 БЫЛ ЗАНЯТ (GW-I-10/TD-046, verify_M-47.sh существует с 02.08).
+     Переименовано в M-53 — первый свободный, проверено замером по milestones/ и scripts/. -->
+# M-53 — `TD-083` (P0): push-цикл читает журнал с головы и заклинивает прод-gateway
 
 **Статус:** СПЕКА ГОТОВА · **Дата:** 2026-08-03 · **Приоритет: P0** — прод-read-path
 функционально мёртв при зелёном healthcheck.
@@ -70,7 +72,7 @@ I/O-пути (урок TD-011, `crates/journal/tests/red_open_bounded.rs`) — *
 | 4 | Таск обязан завершаться при уходе клиента ДАЖЕ когда кадров нет (сейчас единственная ветка выхода достижима только при наличии кадров) | engine-dev | ✅ DONE | O-3 |
 | 5 | RED-оракулы O-1/O-2 | **architect** (sacred) | ✅ DONE | — |
 | 6 | Оракул O-3 на утечку таска/accept-loop | **architect** (sacred) | ⏳ OPEN | — |
-| 7 | `scripts/verify_M-47.sh` | **architect** (sacred) | ⏳ OPEN | — |
+| 7 | `scripts/verify_M-53.sh` | **architect** (sacred) | ⏳ OPEN | — |
 
 ## 4. RED-оракулы
 
@@ -92,13 +94,13 @@ I/O-пути (урок TD-011, `crates/journal/tests/red_open_bounded.rs`) — *
 ## 5. Allowed paths
 
 **Разрешено:** `crates/gateway/src/**`, `crates/gateway-serve/src/**` (engine-dev) ·
-`crates/gateway/tests/**`, `crates/gateway-serve/tests/**`, `scripts/verify_M-47.sh`
-(**architect only**) · `research/reports/M-47-*.md`.
+`crates/gateway/tests/**`, `crates/gateway-serve/tests/**`, `scripts/verify_M-53.sh`
+(**architect only**) · `research/reports/M-53-*.md`.
 
 **Запрещено:** `crates/contracts/**` · `crates/journal/src/**` (используем существующий
 `stream_from`, менять журнал не требуется) · прод-конфиг (`docker-compose.yml`, env на VPS).
 
-## 6. Acceptance — `scripts/verify_M-47.sh`
+## 6. Acceptance — `scripts/verify_M-53.sh`
 
 Паритет с CI-job `fmt+clippy+test` (`gates.md` §3) + O-1/O-2/O-3 GREEN + весь набор M-46
 остаётся GREEN (регресс-защита: фикс push-пути не имеет права сломать сверку с реплеем).
@@ -111,7 +113,7 @@ I/O-пути (урок TD-011, `crates/journal/tests/red_open_bounded.rs`) — *
 
 ## 8. Отдельно — `TD-084`: healthcheck подтверждает жизнь мёртвого сервиса
 
-TCP-connect удовлетворяется listen-backlog'ом ядра. Это НЕ входит в периметр M-47 (чиним
+TCP-connect удовлетворяется listen-backlog'ом ядра. Это НЕ входит в периметр M-53 (чиним
 причину, а не индикатор), но обязано быть заведено: индикатор, который зелен при мёртвом
 сервисе, хуже отсутствующего — он гасит тревогу. Зона правки — `docker-compose.yml`
 (engine-dev/deploy), кандидат: healthcheck, выполняющий реальный WS-handshake.

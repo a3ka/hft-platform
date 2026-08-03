@@ -98,7 +98,9 @@ fn journal_many_segments(events: i64) -> (tempfile::TempDir, usize, u64) {
         }
         j.flush().expect("flush");
     }
-    let segs = journal::list_segments(dir.path()).expect("list_segments").len();
+    let segs = journal::list_segments(dir.path())
+        .expect("list_segments")
+        .len();
     (dir, segs, last_seq)
 }
 
@@ -121,9 +123,14 @@ fn td083_push_tick_seeks_instead_of_reading_from_head() {
     // и дальше живёт кадрами. Именно этот сценарий заклинивал прод.
     let after = Cursor::at(last_seq.saturating_sub(1));
 
-    let (_frames, _cursor, stats): (_, _, ReadStats) =
-        gateway::frames_since_with_stats(dir.path(), EpochFilter::OwnCaptureOnly, &sel(), after, 256)
-            .expect("frames_since_with_stats");
+    let (_frames, _cursor, stats): (_, _, ReadStats) = gateway::frames_since_with_stats(
+        dir.path(),
+        EpochFilter::OwnCaptureOnly,
+        &sel(),
+        after,
+        256,
+    )
+    .expect("frames_since_with_stats");
 
     // Порог: seek обязан уложиться в ЕДИНИЦЫ сегментов независимо от длины журнала.
     // 3 = запас на границу сегмента (курсор может стоять в предпоследнем) + активный.
