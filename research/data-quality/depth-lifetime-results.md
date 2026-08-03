@@ -8,6 +8,19 @@ GREEN DV-I-1..5 + DV-I-7/8 bounded-work) + расширение `crates/research
 (FaithEvent + consistency, GREEN DV-I-6 + DV-I-8 bounded-work).
 **Тесты:** все GREEN (`cargo test -p research-cli` → DV-I-1..8 pass).
 
+> ## ⛔ КАК ЧИТАТЬ ВСЕ `cancel_fraction` В ЭТОМ ФАЙЛЕ (пометка 2026-08-03)
+>
+> Любое число `cancel_fraction` ниже читать как **«доля distinct-ЦЕН, получивших хотя бы один
+> `size=0` за окно»** — НЕ как долю жизней уровня, закончившихся отменой. Реализация
+> (`depth_lifetime.rs:155-196`) фиксирует `fate` на первом `size=0` и не видит перерождения
+> цены; величина насыщается с ростом окна и с плотностью сетки, поэтому сравнение полос между
+> собой сравнивает насыщение, а не живость.
+>
+> Следствие: числа НЕ доказывают живость дальних полос. Статус — `verification pending`
+> (TD-098 → M-58); действует замок `research/arbitration/A-002-depth-metric-tpp.md`.
+> Прогон как таковой корректен и воспроизводим — непригодна ИНТЕРПРЕТАЦИЯ величины.
+> `order-flow consistency_rate = 0.950` и `gaps/censored = 0` дефектом НЕ затронуты.
+
 ## АВТОРИТЕТНЫЙ ЭТАЛОН (для вердикта M-32 task 5) — ТОЛЬКО gap-free segment 78
 
 > Финальные числа (reviewer/founder-подтверждённые, gap-free `segment-00000078.jrnl`, `gaps=0`):
