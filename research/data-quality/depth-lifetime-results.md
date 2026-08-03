@@ -17,7 +17,7 @@ GREEN DV-I-1..5 + DV-I-7/8 bounded-work) + расширение `crates/research
 > собой сравнивает насыщение, а не живость.
 >
 > Следствие: числа НЕ доказывают живость дальних полос. Статус — `verification pending`
-> (TD-098 → M-58); действует замок `research/arbitration/A-002-depth-metric-tpp.md`.
+> (дефект метрики `R-031` §A.1 → M-58); действует замок `research/arbitration/A-002-depth-metric-tpp.md`.
 > Прогон как таковой корректен и воспроизводим — непригодна ИНТЕРПРЕТАЦИЯ величины.
 > `order-flow consistency_rate = 0.950` и `gaps/censored = 0` дефектом НЕ затронуты.
 
