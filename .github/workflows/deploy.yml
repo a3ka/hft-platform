@@ -16,11 +16,30 @@ permissions:
   actions: read
   contents: read
 
+# TD-086 (2026-08-03, санкция founder'а — П-008 п.3). ДВА наблюдавшихся следствия отсутствия
+# этой секции:
+#  1) ГОНКА ДЕПЛОЕВ. Частые пуши запускали деплои внахлёст; они одновременно пересоздавали одни
+#     и те же контейнеры и падали: `Error when allocating new name: Conflict. The container name
+#     "/hft-gateway-serve"...`. Замер 2026-08-03: четыре Deploy подряд `failure` (09:02-09:16).
+#  2) `cancel-in-progress: false` — НАМЕРЕННО. Деплой, начавший пересоздавать контейнеры, обязан
+#     доработать: отмена на полпути оставила бы прод в промежуточном состоянии. Очередь, не отмена.
+concurrency:
+  group: deploy-main
+  cancel-in-progress: false
+
 on:
   push:
     branches: [main]
     paths:
       - 'crates/**'
+      # TD-086: push ТЕСТОВ не должен передеплоивать прод. Тесты в рантайм-бинарь не входят —
+      # `Dockerfile` собирает бинари явным списком (`--bin recorder|journal-retention|
+      # gateway-serve|gateway-checkpoint|wsprobe`), тестовые цели не участвуют. При этом КАЖДЫЙ
+      # редеплой = рестарт `hft-recorder` = ГЭП в forward-only записи (замер: три пуша оракулов
+      # дали три редеплоя за 20 минут). Семантика GitHub Actions: последний совпавший паттерн
+      # выигрывает, поэтому смешанный коммит (`src` + `tests`) деплой ВСЁ ЕЩЁ триггерит —
+      # изменение в `src` проходит фильтр.
+      - '!crates/*/tests/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'Dockerfile'
