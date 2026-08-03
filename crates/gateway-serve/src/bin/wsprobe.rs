@@ -1,4 +1,4 @@
-//! `wsprobe` — M-46 task #1: WS read-path harness client (подключение, snapshot+frames, дамп).
+//! `wsprobe` — M-46 tasks #1/#4: WS read-path harness client + render "for eyes" без дизайна.
 //!
 //! Read-only клиент для `gateway-serve` (никогда не пишет боевой журнал — единственный
 //! writer-путь в этом бинаре существует ТОЛЬКО под `--self-test`, и пишет он в ЭФЕМЕРНЫЙ
@@ -17,9 +17,10 @@
 //! истечения `--seconds` (что раньше — push-цикл сервера `PUSH_INTERVAL_MS=250`, `docs/plans/
 //! gateway-ws-contract.md` §3). Пишет `snapshot.json` (сырой wire-JSON), `frames.jsonl` (по
 //! кадру на строку, сырой wire-JSON), `summary.json` (длины всех 10 серий SeriesBundle,
-//! латентность до первого Snapshot, cursor, schema_version, history_truncated/history_start_seq).
+//! латентность до первого Snapshot, cursor, schema_version, history_truncated/history_start_seq)
+//! и `panel.html` (автономный рендер — heatmap/candles+vwap/cvd/volume-profile/cob).
 //!
-//! Рендер "для глаз" (ASCII-панель + `panel.html`) — task #4, следующий коммит.
+//! Печатает в stdout короткую сводку + ASCII-панель — НЕ весь дамп (упирается в лимиты).
 
 use std::io::Write as _;
 use std::path::PathBuf;
@@ -523,12 +524,458 @@ async fn run(args: Args) -> ProbeResult<()> {
         summary.series_lengths.volume_bubbles,
     );
     println!();
+    println!("{}", render_ascii(&snap, n_frames));
+
+    let html = render_html(&snap, &summary);
+    std::fs::write(args.out.join("panel.html"), html)
+        .map_err(|e| format!("write panel.html: {e}"))?;
     println!(
-        "wrote {} (snapshot.json, frames.jsonl, summary.json) — render (task #4) не реализован\n",
+        "wrote {} (snapshot.json, frames.jsonl, summary.json, panel.html)",
         args.out.display()
     );
 
     Ok(())
+}
+
+// ─────────────────────────── render: ASCII (stdout) ───────────────────────────
+
+const DENSITY: &[char] = &[' ', '.', ':', '-', '=', '+', '*', '#', '%', '@'];
+
+fn density_char(frac: f64) -> char {
+    let idx = ((frac.clamp(0.0, 1.0)) * (DENSITY.len() - 1) as f64).round() as usize;
+    DENSITY[idx.min(DENSITY.len() - 1)]
+}
+
+fn e8(v: i64) -> f64 {
+    v as f64 / 100_000_000.0
+}
+
+fn bucket(value: f64, lo: f64, hi: f64, n: usize) -> usize {
+    if hi <= lo || n == 0 {
+        return 0;
+    }
+    let frac = ((value - lo) / (hi - lo)).clamp(0.0, 0.999_999);
+    ((frac * n as f64) as usize).min(n - 1)
+}
+
+fn sparkline(vals: &[f64]) -> String {
+    const BARS: &[char] = &['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    if vals.is_empty() {
+        return "(нет данных)".to_string();
+    }
+    let lo = vals.iter().cloned().fold(f64::INFINITY, f64::min);
+    let hi = vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    vals.iter()
+        .map(|&v| {
+            let frac = if hi > lo { (v - lo) / (hi - lo) } else { 0.5 };
+            let idx = (frac.clamp(0.0, 1.0) * (BARS.len() - 1) as f64).round() as usize;
+            BARS[idx.min(BARS.len() - 1)]
+        })
+        .collect()
+}
+
+/// ASCII-панель ≤100 столбцов: heatmap-сетка плотности, VWAP-спарклайн, знак CVD, топ COB.
+fn render_ascii(snap: &Snapshot, frames_received: usize) -> String {
+    let s = &snap.series;
+    let mut out = String::new();
+
+    out.push_str(&format!(
+        "=== wsprobe panel — schema_version={} cursor={:?} frames_received={} ===\n",
+        snap.schema_version, snap.cursor.upto_seq, frames_received
+    ));
+
+    // --- heatmap grid ---
+    const W: usize = 60;
+    const H: usize = 14;
+    if s.heatmap.is_empty() {
+        out.push_str("heatmap: (пусто — нет L2Snapshot/L2Delta в окне)\n");
+    } else {
+        let prices: Vec<f64> = s.heatmap.iter().map(|c| e8(c.price_e8)).collect();
+        let times: Vec<i64> = s.heatmap.iter().map(|c| c.time_s).collect();
+        let pmin = prices.iter().cloned().fold(f64::INFINITY, f64::min);
+        let pmax = prices.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let tmin = *times.iter().min().unwrap();
+        let tmax = *times.iter().max().unwrap();
+
+        let mut grid = vec![vec![0f64; W]; H];
+        for c in &s.heatmap {
+            let price = e8(c.price_e8);
+            let row = H - 1 - bucket(price, pmin, pmax, H);
+            let col = bucket(c.time_s as f64, tmin as f64, tmax as f64, W);
+            grid[row][col] += e8(c.size_e8);
+        }
+        let maxv = grid
+            .iter()
+            .flatten()
+            .cloned()
+            .fold(0.0_f64, f64::max)
+            .max(1e-9);
+
+        out.push_str(&format!(
+            "heatmap ({} cells, price [{:.2}..{:.2}], time [{tmin}..{tmax}]s):\n",
+            s.heatmap.len(),
+            pmin,
+            pmax
+        ));
+        for (i, row) in grid.iter().enumerate() {
+            let price_label = pmax - (i as f64 + 0.5) * (pmax - pmin) / H as f64;
+            let line: String = row.iter().map(|&v| density_char(v / maxv)).collect();
+            out.push_str(&format!("{price_label:>10.2} |{line}\n"));
+        }
+    }
+
+    // --- vwap / cvd ---
+    let vwap_vals: Vec<f64> = s.vwap.iter().map(|(_, p)| e8(*p)).collect();
+    let last_vwap = vwap_vals.last().copied();
+    out.push_str(&format!(
+        "vwap  (n={:>4}, last={}) {}\n",
+        s.vwap.len(),
+        last_vwap
+            .map(|v| format!("{v:.2}"))
+            .unwrap_or_else(|| "-".to_string()),
+        sparkline(&vwap_vals[vwap_vals.len().saturating_sub(W)..])
+    ));
+
+    let cvd_vals: Vec<f64> = s.cumulative_delta.iter().map(|(_, v)| e8(*v)).collect();
+    let last_cvd = cvd_vals.last().copied();
+    let sign = last_cvd
+        .map(|v| if v >= 0.0 { '+' } else { '-' })
+        .unwrap_or('?');
+    out.push_str(&format!(
+        "cvd   (n={:>4}, last={sign}{}) {}\n",
+        s.cumulative_delta.len(),
+        last_cvd
+            .map(|v| format!("{:.4}", v.abs()))
+            .unwrap_or_else(|| "-".to_string()),
+        sparkline(&cvd_vals[cvd_vals.len().saturating_sub(W)..])
+    ));
+
+    // --- COB top levels ---
+    let mut bids: Vec<&gateway::CobLevel> = s.cob.iter().filter(|l| l.side == "bid").collect();
+    let mut asks: Vec<&gateway::CobLevel> = s.cob.iter().filter(|l| l.side == "ask").collect();
+    bids.sort_by_key(|l| std::cmp::Reverse(l.price_e8));
+    asks.sort_by_key(|l| l.price_e8);
+    out.push_str(&format!("cob (n={}, top 5 each side):\n", s.cob.len()));
+    out.push_str("  BID price      size   |   ASK price      size\n");
+    for i in 0..5.min(bids.len().max(asks.len())) {
+        let b = bids
+            .get(i)
+            .map(|l| format!("{:>10.2} {:>8.4}", e8(l.price_e8), e8(l.size_e8)))
+            .unwrap_or_else(|| " ".repeat(19));
+        let a = asks
+            .get(i)
+            .map(|l| format!("{:>10.2} {:>8.4}", e8(l.price_e8), e8(l.size_e8)))
+            .unwrap_or_else(|| " ".repeat(19));
+        out.push_str(&format!("  {b}   |   {a}\n"));
+    }
+
+    out
+}
+
+// ─────────────────────────── render: HTML (panel.html) ───────────────────────────
+
+#[derive(serde::Serialize)]
+struct RenderCandle {
+    time_s: i64,
+    open: f64,
+    high: f64,
+    low: f64,
+    close: f64,
+    volume: f64,
+}
+
+#[derive(serde::Serialize)]
+struct RenderHeatCell {
+    time_s: i64,
+    side: String,
+    price: f64,
+    size: f64,
+}
+
+#[derive(serde::Serialize)]
+struct RenderCob {
+    side: String,
+    price: f64,
+    size: f64,
+}
+
+#[derive(serde::Serialize)]
+struct RenderVp {
+    session_id: i64,
+    poc: f64,
+    vah: f64,
+    val: f64,
+    bins: Vec<(f64, f64)>,
+}
+
+#[derive(serde::Serialize)]
+struct RenderData {
+    ohlcv: Vec<RenderCandle>,
+    vwap: Vec<(i64, f64)>,
+    cvd: Vec<(i64, f64)>,
+    heatmap: Vec<RenderHeatCell>,
+    cob: Vec<RenderCob>,
+    volume_profile: Vec<RenderVp>,
+}
+
+fn to_render_data(s: &gateway::SeriesBundle) -> RenderData {
+    RenderData {
+        ohlcv: s
+            .ohlcv
+            .iter()
+            .map(|r| RenderCandle {
+                time_s: r.time_s,
+                open: e8(r.open),
+                high: e8(r.high),
+                low: e8(r.low),
+                close: e8(r.close),
+                volume: e8(r.volume),
+            })
+            .collect(),
+        vwap: s.vwap.iter().map(|(t, p)| (*t, e8(*p))).collect(),
+        cvd: s
+            .cumulative_delta
+            .iter()
+            .map(|(t, v)| (*t, e8(*v)))
+            .collect(),
+        heatmap: s
+            .heatmap
+            .iter()
+            .map(|c| RenderHeatCell {
+                time_s: c.time_s,
+                side: c.side.clone(),
+                price: e8(c.price_e8),
+                size: e8(c.size_e8),
+            })
+            .collect(),
+        cob: s
+            .cob
+            .iter()
+            .map(|l| RenderCob {
+                side: l.side.clone(),
+                price: e8(l.price_e8),
+                size: e8(l.size_e8),
+            })
+            .collect(),
+        volume_profile: s
+            .volume_profile
+            .iter()
+            .map(|vp| RenderVp {
+                session_id: vp.session_id,
+                poc: e8(vp.poc_e8),
+                vah: e8(vp.vah_e8),
+                val: e8(vp.val_e8),
+                bins: vp.bins.iter().map(|(p, v)| (e8(*p), e8(*v))).collect(),
+            })
+            .collect(),
+    }
+}
+
+fn cob_table_rows(cob: &[gateway::CobLevel]) -> String {
+    let mut bids: Vec<&gateway::CobLevel> = cob.iter().filter(|l| l.side == "bid").collect();
+    let mut asks: Vec<&gateway::CobLevel> = cob.iter().filter(|l| l.side == "ask").collect();
+    bids.sort_by_key(|l| std::cmp::Reverse(l.price_e8));
+    asks.sort_by_key(|l| l.price_e8);
+    let mut rows = String::new();
+    for i in 0..10.min(bids.len().max(asks.len())) {
+        let (bp, bs) = bids
+            .get(i)
+            .map(|l| (e8(l.price_e8), e8(l.size_e8)))
+            .unwrap_or((0.0, 0.0));
+        let (ap, as_) = asks
+            .get(i)
+            .map(|l| (e8(l.price_e8), e8(l.size_e8)))
+            .unwrap_or((0.0, 0.0));
+        let bid_cell = if i < bids.len() {
+            format!("<td class=\"bid\">{bp:.2}</td><td class=\"bid\">{bs:.4}</td>")
+        } else {
+            "<td></td><td></td>".to_string()
+        };
+        let ask_cell = if i < asks.len() {
+            format!("<td class=\"ask\">{ap:.2}</td><td class=\"ask\">{as_:.4}</td>")
+        } else {
+            "<td></td><td></td>".to_string()
+        };
+        rows.push_str(&format!("<tr>{bid_cell}{ask_cell}</tr>\n"));
+    }
+    rows
+}
+
+fn render_html(snap: &Snapshot, summary: &Summary) -> String {
+    let data = to_render_data(&snap.series);
+    let data_json = serde_json::to_string(&data).unwrap_or_else(|_| "{}".to_string());
+    let cob_rows = cob_table_rows(&snap.series.cob);
+
+    format!(
+        r##"<!doctype html>
+<title>wsprobe panel — M-46</title>
+<meta charset="utf-8">
+<style>
+  :root {{ color-scheme: dark light; }}
+  body {{
+    background: #0b0f14; color: #d7dee6; font: 13px/1.4 ui-monospace, monospace;
+    margin: 0; padding: 16px;
+  }}
+  h1 {{ font-size: 16px; margin: 0 0 4px; }}
+  h2 {{ font-size: 13px; margin: 12px 0 4px; color: #9fb0bf; text-transform: uppercase; letter-spacing: .04em; }}
+  .meta {{ color: #7c8a97; margin-bottom: 12px; }}
+  .grid {{ display: grid; grid-template-columns: 3fr 1fr; gap: 12px; align-items: start; }}
+  .panel {{ background: #121821; border: 1px solid #223; border-radius: 6px; padding: 8px; }}
+  canvas {{ display: block; width: 100%; background: #0e131a; border-radius: 4px; }}
+  table {{ border-collapse: collapse; width: 100%; font-size: 12px; }}
+  td {{ padding: 1px 4px; text-align: right; }}
+  td.bid {{ color: #3ecf8e; }}
+  td.ask {{ color: #e5534b; }}
+  .full {{ grid-column: 1 / -1; }}
+</style>
+<h1>wsprobe panel — read-path без фронта (M-46)</h1>
+<div class="meta">
+  schema_version={sv} · cursor={cur:?} · history_start_seq={hss} · history_truncated={ht} ·
+  latency_first_snapshot_ms={lat} · frames_received={fr}
+</div>
+<div class="grid">
+  <div class="panel full">
+    <h2>Heatmap</h2>
+    <canvas id="heatmap" width="1000" height="360"></canvas>
+  </div>
+  <div class="panel">
+    <h2>Candles + VWAP</h2>
+    <canvas id="candles" width="720" height="220"></canvas>
+  </div>
+  <div class="panel">
+    <h2>Volume Profile</h2>
+    <canvas id="vp" width="220" height="220"></canvas>
+  </div>
+  <div class="panel full">
+    <h2>CVD</h2>
+    <canvas id="cvd" width="1000" height="120"></canvas>
+  </div>
+  <div class="panel full">
+    <h2>COB (top 10 each side)</h2>
+    <table>
+      <thead><tr><th colspan="2">BID</th><th colspan="2">ASK</th></tr></thead>
+      <tbody>
+{cob_rows}
+      </tbody>
+    </table>
+  </div>
+</div>
+<script>
+const DATA = {data_json};
+
+function ctxOf(id) {{
+  const c = document.getElementById(id);
+  return [c.getContext('2d'), c.width, c.height];
+}}
+
+function drawHeatmap() {{
+  const [ctx, w, h] = ctxOf('heatmap');
+  ctx.clearRect(0, 0, w, h);
+  const cells = DATA.heatmap;
+  if (!cells.length) {{ ctx.fillStyle = '#889'; ctx.fillText('heatmap: no data', 10, 20); return; }}
+  const times = [...new Set(cells.map(c => c.time_s))].sort((a, b) => a - b);
+  const tIdx = new Map(times.map((t, i) => [t, i]));
+  const cols = Math.max(times.length, 1);
+  const colW = w / cols;
+  const prices = cells.map(c => c.price);
+  const pmin = Math.min(...prices), pmax = Math.max(...prices) || pmin + 1;
+  const maxSize = Math.max(...cells.map(c => c.size), 1e-9);
+  for (const c of cells) {{
+    const x = tIdx.get(c.time_s) * colW;
+    const frac = (c.price - pmin) / ((pmax - pmin) || 1);
+    const y = h - frac * h;
+    const inten = Math.min(1, c.size / maxSize);
+    const hue = c.side === 'bid' ? 140 : 0;
+    ctx.fillStyle = `hsla(${{hue}},80%,45%,${{0.12 + 0.85 * inten}})`;
+    ctx.fillRect(x, y - 2, Math.max(colW, 2), 4);
+  }}
+}}
+
+function drawCandles() {{
+  const [ctx, w, h] = ctxOf('candles');
+  ctx.clearRect(0, 0, w, h);
+  const rows = DATA.ohlcv, vwap = DATA.vwap;
+  if (!rows.length) {{ ctx.fillStyle = '#889'; ctx.fillText('ohlcv: no data', 10, 20); return; }}
+  let lo = Math.min(...rows.map(r => r.low));
+  let hi = Math.max(...rows.map(r => r.high));
+  if (vwap.length) {{
+    lo = Math.min(lo, ...vwap.map(v => v[1]));
+    hi = Math.max(hi, ...vwap.map(v => v[1]));
+  }}
+  if (hi === lo) hi = lo + 1;
+  const y = p => h - ((p - lo) / (hi - lo)) * h;
+  const cw = w / rows.length;
+  rows.forEach((r, i) => {{
+    const x = i * cw + cw / 2;
+    ctx.strokeStyle = r.close >= r.open ? '#3ecf8e' : '#e5534b';
+    ctx.beginPath(); ctx.moveTo(x, y(r.high)); ctx.lineTo(x, y(r.low)); ctx.stroke();
+    ctx.fillStyle = ctx.strokeStyle;
+    const bw = Math.max(cw * 0.6, 1);
+    const top = y(Math.max(r.open, r.close));
+    const bot = y(Math.min(r.open, r.close));
+    ctx.fillRect(x - bw / 2, top, bw, Math.max(bot - top, 1));
+  }});
+  if (vwap.length) {{
+    const tmin = rows[0].time_s, tmax = rows[rows.length - 1].time_s;
+    ctx.strokeStyle = '#f2c94c'; ctx.lineWidth = 1.5; ctx.beginPath();
+    vwap.forEach(([t, p], i) => {{
+      const frac = tmax > tmin ? (t - tmin) / (tmax - tmin) : 0;
+      const x = frac * w, yy = y(p);
+      if (i === 0) ctx.moveTo(x, yy); else ctx.lineTo(x, yy);
+    }});
+    ctx.stroke();
+  }}
+}}
+
+function drawCvd() {{
+  const [ctx, w, h] = ctxOf('cvd');
+  ctx.clearRect(0, 0, w, h);
+  const cvd = DATA.cvd;
+  if (!cvd.length) {{ ctx.fillStyle = '#889'; ctx.fillText('cvd: no data', 10, 20); return; }}
+  const vmin = Math.min(0, ...cvd.map(c => c[1]));
+  const vmax = Math.max(0, ...cvd.map(c => c[1])) || vmin + 1;
+  const y = v => h - ((v - vmin) / ((vmax - vmin) || 1)) * h;
+  const y0 = y(0);
+  ctx.strokeStyle = '#445'; ctx.beginPath(); ctx.moveTo(0, y0); ctx.lineTo(w, y0); ctx.stroke();
+  const cw = w / cvd.length;
+  cvd.forEach(([t, v], i) => {{
+    const x = i * cw;
+    ctx.fillStyle = v >= 0 ? '#3ecf8e' : '#e5534b';
+    const yy = y(v);
+    ctx.fillRect(x, Math.min(y0, yy), Math.max(cw * 0.8, 1), Math.max(Math.abs(yy - y0), 1));
+  }});
+}}
+
+function drawVp() {{
+  const [ctx, w, h] = ctxOf('vp');
+  ctx.clearRect(0, 0, w, h);
+  const vp = DATA.volume_profile;
+  if (!vp.length) {{ ctx.fillStyle = '#889'; ctx.fillText('volume_profile: no data', 10, 20); return; }}
+  const last = vp[vp.length - 1];
+  const bins = last.bins;
+  if (!bins.length) {{ ctx.fillStyle = '#889'; ctx.fillText('volume_profile: empty session', 10, 20); return; }}
+  const maxVol = Math.max(...bins.map(b => b[1]), 1e-9);
+  const rowH = h / bins.length;
+  bins.forEach((b, i) => {{
+    const frac = b[1] / maxVol;
+    ctx.fillStyle = Math.abs(b[0] - last.poc) < 1e-6 ? '#f2c94c' : '#5b8def';
+    ctx.fillRect(0, i * rowH, frac * w, Math.max(rowH * 0.8, 1));
+  }});
+}}
+
+drawHeatmap();
+drawCandles();
+drawCvd();
+drawVp();
+</script>
+"##,
+        sv = summary.schema_version,
+        cur = summary.cursor_upto_seq,
+        hss = summary.history_start_seq,
+        ht = summary.history_truncated,
+        lat = summary.latency_first_snapshot_ms,
+        fr = summary.frames_received,
+    )
 }
 
 // ─────────────────────────── main ───────────────────────────
