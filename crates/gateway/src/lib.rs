@@ -439,11 +439,18 @@ impl VolumeProfileAcc {
     /// Свернуть per-session гистограммы в `Vec<VolumeProfileRow>` (сортировка по `session_id`
     /// возрастанию). Для каждой сессии — POC (argmax объёма, тай → низшая цена) + Value Area
     /// (VAH/VAL/va_pct) по §Design milestone'а M-24 (BINDING, детерминированный, i128 без f64).
-    fn into_rows(self) -> Vec<VolumeProfileRow> {
+    ///
+    /// M-56 (`TD-097`): построение **из ссылки** — без потребления `self.bins`. И
+    /// `Reducer::finish(self)`, и `Reducer::finish_ref(&self)` теперь идут через ОДНУ формулу
+    /// (`Reducer::finish` выражен через `finish_ref`, см. там) — владеющий вариант этого метода
+    /// больше никому не нужен и был удалён (иначе — мёртвый код, две копии одной формулы).
+    /// Названо не `into_rows_ref`, чтобы не нарушать clippy `wrong_self_convention`
+    /// (`into_*` обязан брать `self` по значению).
+    fn vp_rows(&self) -> Vec<VolumeProfileRow> {
         let mut rows: Vec<VolumeProfileRow> = self
             .bins
-            .into_iter()
-            .map(|(session_id, hist)| compute_vp_row(session_id, hist))
+            .iter()
+            .map(|(&session_id, hist)| compute_vp_row(session_id, hist))
             .collect();
         rows.sort_by_key(|r| r.session_id);
         rows
@@ -452,9 +459,13 @@ impl VolumeProfileAcc {
 
 /// M-24: per-session `VolumeProfileRow` (POC + Value Area по §Design). bins сортируется
 /// по price возр., bins[i].1 = volume (i128 на этапе вычисления, итоговый `i64` ×1e8 в row).
-fn compute_vp_row(session_id: i64, hist: BTreeMap<i64, i128>) -> VolumeProfileRow {
+///
+/// M-56 (TD-097): принимает гистограмму ПО ССЫЛКЕ — оба вызывающих (`VolumeProfileAcc::vp_rows`,
+/// `merge_volume_profile`) уже держат `hist` локально после собственного `.iter()`, поэтому
+/// потери владения нет ни у одного из них.
+fn compute_vp_row(session_id: i64, hist: &BTreeMap<i64, i128>) -> VolumeProfileRow {
     // bins сорт по price возр.
-    let mut sorted_bins: Vec<(i64, i128)> = hist.into_iter().collect();
+    let mut sorted_bins: Vec<(i64, i128)> = hist.iter().map(|(&p, &v)| (p, v)).collect();
     sorted_bins.sort_by_key(|&(p, _)| p);
 
     // total = Σ volume (i128).
@@ -535,8 +546,8 @@ fn merge_volume_profile(
         }
     }
     let mut rows: Vec<VolumeProfileRow> = hist
-        .into_iter()
-        .map(|(session_id, bins)| compute_vp_row(session_id, bins))
+        .iter()
+        .map(|(&session_id, bins)| compute_vp_row(session_id, bins))
         .collect();
     rows.sort_by_key(|r| r.session_id);
     rows
@@ -956,11 +967,30 @@ impl Reducer {
         entry.refresh(bids, asks);
     }
 
+    /// M-56 (`TD-097`, task #1): `finish(self)` теперь ТОЛЬКО обёртка над `finish_ref(&self)` —
+    /// вся формула (OHLCV/CVD/depth/VWAP/VP/heatmap-COB/bubbles) живёт в ОДНОМ месте
+    /// (`finish_ref`), выраженном через ссылки на `self`. Ownership `self` здесь больше не
+    /// нужен телу расчёта: он был нужен только для `.into_iter()`-стиля старой реализации,
+    /// не для алгоритма. `self` молча дропается после вызова — двух копий формулы нет и не
+    /// может разойтись при правке.
     fn finish(self) -> SeriesBundle {
+        self.finish_ref()
+    }
+
+    /// M-56 (`TD-097`, task #1): построение `SeriesBundle` **из ссылок**, без потребления и
+    /// без клонирования состояния `Reducer`. Не трогает `self.book` вообще (самое дорогое
+    /// поле, O(глубина книги) — `finish` никогда не читал книгу напрямую, только через уже
+    /// построенные оконные `heatmap_buckets`/`depth`). Остальные поля — уже оконно-урезаны
+    /// `evict_window_state` на каждом `apply()`, поэтому их размер O(окно), не O(история)/
+    /// O(глубина книги); там, где выходная точка — `Copy`-скаляр (i64/i128), копируется
+    /// значение, не аллоцируется клон структуры (`heatmap_buckets`/`bubbles`/VP-гистограмма
+    /// читаются буквально по ссылке через `build_heatmap_and_cob`/`build_volume_bubbles`/
+    /// `compute_vp_row`, перевод их сигнатур на `&BTreeMap` — часть этой же задачи).
+    fn finish_ref(&self) -> SeriesBundle {
         let ohlcv = self
             .ohlcv
-            .into_iter()
-            .map(|(time_s, bar)| OhlcvRow {
+            .iter()
+            .map(|(&time_s, bar)| OhlcvRow {
                 time_s,
                 open: bar.open,
                 high: bar.high,
@@ -980,12 +1010,12 @@ impl Reducer {
         // running предыдущей сессии (TD-043 fix — M-37 бага единой суммы через все дни).
         let mut cumulative_delta: Vec<(i64, i64)> = Vec::new();
         let mut cvd_session_base: Vec<(i64, i64)> = Vec::new();
-        for (sid, session) in self.cvd {
+        for (&sid, session) in &self.cvd {
             if session.base != 0 {
                 cvd_session_base.push((sid, session.base));
             }
             let mut running = session.base;
-            for (time_s, delta) in session.bucket_delta {
+            for (&time_s, &delta) in &session.bucket_delta {
                 running += delta;
                 cumulative_delta.push((time_s, running));
             }
@@ -993,7 +1023,7 @@ impl Reducer {
 
         let depth_series = self
             .depth
-            .into_iter()
+            .iter()
             .map(|row| DepthRow {
                 side: match row.side {
                     Side::Buy => "bid",
@@ -1001,15 +1031,15 @@ impl Reducer {
                 }
                 .to_string(),
                 band_pct_e8: row.band_pct_e8,
-                series: row.values.into_iter().collect(),
+                series: row.values.iter().map(|(&t, &v)| (t, v)).collect(),
                 depth_band_provenance: (row.band_pct_e8 > 1_300_000)
                     .then(|| "diff-reconstructed, validated<=1.3%".to_string()),
             })
             .collect();
 
-        let vwap = self.vwap.values.into_iter().collect();
+        let vwap = self.vwap.values.iter().map(|(&t, &v)| (t, v)).collect();
 
-        let volume_profile = self.vp.into_rows();
+        let volume_profile = self.vp.vp_rows();
 
         // M-38a (TD-045, task #11): per-session VP `max_time_s` экспортируется в bundle для
         // применения ИДЕНТИЧНОГО редьюсеру whole-session drop-критерия на пути merge
@@ -1026,8 +1056,10 @@ impl Reducer {
 
         // M-23: heatmap + COB + bubbles. `build_heatmap_cob` использует сохранённые снимки
         // книги из `heatmap_buckets` (close-семантика) + bubbles из `bubbles` (Trade-аккумулятор).
-        let (heatmap, cob) = build_heatmap_and_cob(&self.selector, self.heatmap_buckets);
-        let volume_bubbles = build_volume_bubbles(self.bubbles);
+        // M-56: обе функции принимают `&BTreeMap` — `heatmap_buckets` (per-bucket ПОЛНЫЙ снимок
+        // книги, самое дорогое после `book` поле) читается по ссылке, не клонируется.
+        let (heatmap, cob) = build_heatmap_and_cob(&self.selector, &self.heatmap_buckets);
+        let volume_bubbles = build_volume_bubbles(&self.bubbles);
 
         // M-38a task #7: `cvd_session_base` (Vec, per-session — собран выше в цикле по
         // `self.cvd`) экспортируется в SeriesBundle для merge-логики `Snapshot::apply()`. При
@@ -1059,6 +1091,13 @@ impl Reducer {
         let at_ms = self.at_ms;
         (self.finish(), at_ms)
     }
+
+    /// M-56 (`TD-097`): парный `finish_ref` — `&self`, без потребления/клонирования. Нужен
+    /// `LiveReducer::snapshot(&self)`, у которого физически нет владения `full: Reducer`
+    /// (`self.full` — персистентное состояние, докармливаемое КАЖДЫМ `pump()`).
+    fn finish_ref_with_at(&self) -> (SeriesBundle, i64) {
+        (self.finish_ref(), self.at_ms)
+    }
 }
 
 /// M-23: построить `Vec<HeatmapCell>` + `Vec<CobLevel>` из per-bucket снимков книги.
@@ -1070,9 +1109,14 @@ impl Reducer {
 /// price_e8)` / `(side, price_e8)` — СОВПАДАЕТ с BTreeMap-порядком `merge_heatmap`/`merge_cob`,
 /// благодаря чему `snapshot(C) + frames_since(C)` БАЙТ-идентичен `snapshot(LATEST)` (любой
 /// путь fold'а выдаёт тот же вектор, что и полная свёртка).
+/// M-56 (TD-097): `heatmap_buckets` ПО ССЫЛКЕ — тело уже работало исключительно через
+/// `.iter()`/`.clone()` отдельных ячеек, владение картой никогда не требовалось. Перевод на
+/// `&BTreeMap` убирает необходимость перемещать (и тем более клонировать) карту у ОБОИХ
+/// вызывающих (`finish`/`finish_ref`) — единственная причина, по которой `heatmap_buckets`
+/// вообще стоило бы клонировать, это ошибочная сигнатура, не алгоритм.
 fn build_heatmap_and_cob(
     selector: &Selector,
-    heatmap_buckets: BTreeMap<i64, HeatmapBucketState>,
+    heatmap_buckets: &BTreeMap<i64, HeatmapBucketState>,
 ) -> (Vec<HeatmapCell>, Vec<CobLevel>) {
     let w = selector.bands.iter().copied().fold(0.0_f64, f64::max);
     let mut heatmap_out: Vec<HeatmapCell> = Vec::new();
@@ -1180,11 +1224,11 @@ fn build_heatmap_and_cob(
 
 /// M-23: построить `Vec<BubbleCell>` из `bubbles: BTreeMap<(time_s, price), (buy, sell)>`.
 /// Сортировка: `(time_s, price_e8)` возрастание — стабильная (HM-I-5 детерминизм).
-fn build_volume_bubbles(bubbles: BTreeMap<(i64, i64), (i64, i64)>) -> Vec<BubbleCell> {
+fn build_volume_bubbles(bubbles: &BTreeMap<(i64, i64), (i64, i64)>) -> Vec<BubbleCell> {
     bubbles
-        .into_iter()
+        .iter()
         .map(
-            |((time_s, price_e8), (buy_vol_e8, sell_vol_e8))| BubbleCell {
+            |(&(time_s, price_e8), &(buy_vol_e8, sell_vol_e8))| BubbleCell {
                 time_s,
                 price_e8,
                 buy_vol_e8,
@@ -3060,10 +3104,13 @@ impl LiveReducer {
     /// невозможен по построению (тот же типовой приём, что `RK-I-1`: барьер держит
     /// компилятор, не соглашение). `full` наполняется `resume()` (чекпоинт-ветка, O(1) —
     /// уже восстановленный `Reducer`) и каждым `pump()` (`full.apply(event)` per-event) —
-    /// здесь только `finish_with_at()` (свёртка накопленного состояния в `SeriesBundle`,
-    /// БЕЗ обращения к диску) над клоном, чтобы не потреблять персистентный `self.full`.
+    /// здесь только `finish_ref_with_at()` (M-56, `TD-097`) — свёртка накопленного состояния
+    /// в `SeriesBundle`, БЕЗ обращения к диску И без клонирования `self.full` (клон целого
+    /// редьюсера — включая книгу целиком, ≈20 MiB на проде — дал +404 ms константы на каждом
+    /// подключении при ЛЮБОМ backlog'е, R-029 §C / TD-097). `finish_ref_with_at(&self)` строит
+    /// серии из ссылок на персистентный `self.full`, не потребляя и не мутируя его.
     pub fn snapshot(&self) -> Snapshot {
-        let (series, _at_ms) = self.full.clone().finish_with_at();
+        let (series, _at_ms) = self.full.finish_ref_with_at();
         Snapshot {
             schema_version: GATEWAY_SCHEMA_VERSION,
             selector: self.selector.clone(),
