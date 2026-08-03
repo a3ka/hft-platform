@@ -58,6 +58,17 @@ else
   fail "T4 проверок против независимого эталона НЕТ — тавтология вернулась"
 fi
 
+echo "--- T4b: ЖИВОСТЬ сервиса (O-3) — accept-loop не умирает от одного клиента ---"
+# Прод-симптом: после ОДНОГО подключения CPU 100%, CLOSE_WAIT растёт, следующий клиент
+# получает connect-timeout, а docker ps показывает (healthy).
+if cargo test -p gateway-serve --test red_ws_liveness_under_load >/tmp/m53-live3.log 2>&1 \
+   && grep -qE "^test result: ok\. [1-9]" /tmp/m53-live3.log; then
+  pass "T4b оракулы живости GREEN (3 сценария: при живом клиенте / после ухода / после обрыва)"
+else
+  fail "T4b СЕРВИС ЗАКЛИНИВАЕТ — accept-loop не переживает клиента"
+  grep -E "TD-083|panicked|test result" /tmp/m53-live3.log | head -10
+fi
+
 echo "--- T5: РЕГРЕСС — весь набор M-46 остаётся зелёным ---"
 # Фикс push-пути не имеет права сломать сверку WS↔реплей: иначе экран покажет
 # «быстро, но неправду» — хуже, чем нынешнее «молчит».
