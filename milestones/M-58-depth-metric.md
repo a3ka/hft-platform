@@ -68,11 +68,11 @@ distinct-цен, получивших хотя бы один `size=0` за ок�
 
 | # | Status | задача | агент | verify |
 |---|---|---|---|---|
-| 1 | ⏳ OPEN | Переспека счётчиков на per-life в `depth_lifetime.rs`: `alive`-множество ведёт текущие жизни; рождение/отмена/цензура/заморозка инкрементируют счётчики полосы, определённой при рождении ЭТОЙ жизни | research-dev | DV-I-10..14 GREEN; DV-I-1..9 остаются GREEN |
-| 2 | ⏳ OPEN | Обновить call-sites переименованных полей (`examples/depth_lifetime.rs`, `src/lib.rs`/`main.rs`, если печатают отчёт) | research-dev | `cargo build -p research-cli --all-targets` без ошибок; `cargo clippy -p research-cli -- -D warnings` чист |
-| 3 | ⏳ OPEN | Переснять **gap-free segment 78** новой метрикой; дописать `research/data-quality/depth-lifetime-results.md` §M-58: per-band `lives_*` + `cancel_fraction`, bid и ask раздельно, рядом — условия прогона (сегмент, окно, число дельт) | research-dev | числа в файле; прогон на том же сегменте, что M-32/M-33 — иначе сравнение невалидно |
-| 4 | ⏳ OPEN | Обновить вердикт `research/data-quality/depth-verdict.md` по новым числам: живость подтверждена → замок `A-002` снят автоматически; опровергнута → вопрос уходит founder'у с честными числами | architect | вердикт называет новые числа и явно говорит, снят замок или нет |
-| 5 | ⏳ OPEN | Named limitation: пре-регистрированный founder-флаг M-33 требует падения ПО ОБЕ стороны (конъюнкция) ⇒ слеп к ОДНОСТОРОННЕЙ заморозке (`R-031` RETRO-NOTE). Зафиксировать в вердикте как ограничение, не чинить в этом milestone | architect | ограничение названо в §Risks вердикта |
+| 1 | ✅ DONE | Переспека счётчиков на per-life в `depth_lifetime.rs`: `alive`-множество ведёт текущие жизни; рождение/отмена/цензура/заморозка инкрементируют счётчики полосы, определённой при рождении ЭТОЙ жизни | research-dev | DV-I-10..14 GREEN; DV-I-1..9 остаются GREEN |
+| 2 | ✅ DONE | Обновить call-sites переименованных полей (`examples/depth_lifetime.rs`, `src/lib.rs`/`main.rs`, если печатают отчёт) | research-dev | `cargo build -p research-cli --all-targets` без ошибок; `cargo clippy -p research-cli -- -D warnings` чист |
+| 3 | 🚧 IN_PROGRESS | Переснять **gap-free segment 78** новой метрикой; дописать `research/data-quality/depth-lifetime-results.md` §M-58: per-band `lives_*` + `cancel_fraction`, bid и ask раздельно, рядом — условия прогона (сегмент, окно, число дельт) | research-dev | числа в файле; прогон на том же сегменте, что M-32/M-33 — иначе сравнение невалидно |
+| 4 | ✅ DONE | Обновить вердикт `research/data-quality/depth-verdict.md` по новым числам: живость подтверждена → замок `A-002` снят автоматически; опровергнута → вопрос уходит founder'у с честными числами | architect | вердикт называет новые числа и явно говорит, снят замок или нет |
+| 5 | ✅ DONE | Named limitation: пре-регистрированный founder-флаг M-33 требует падения ПО ОБЕ стороны (конъюнкция) ⇒ слеп к ОДНОСТОРОННЕЙ заморозке (`R-031` RETRO-NOTE). Зафиксировать в вердикте как ограничение, не чинить в этом milestone | architect | ограничение названо в §Risks вердикта |
 
 ## RED-тесты (написаны ДО impl, sacred)
 
