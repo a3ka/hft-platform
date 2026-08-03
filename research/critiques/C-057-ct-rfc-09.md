@@ -1,4 +1,4 @@
-# C-056 — аудит CT-RFC-09 (контракт WS-сессии: подписка как параметр сессии)
+# C-057 — аудит CT-RFC-09 (контракт WS-сессии: подписка как параметр сессии)
 
 **Critic** · **Дата (UTC):** 2026-08-03 · **Предмет:** `docs/rfc/CT-RFC-09-ws-session.md`
 (`5bf2b4b`, PROPOSED) · **Worktree:** `/tmp/hft-critic-rfc09` (detached, `origin/feat/ws-session-contract`)
@@ -313,7 +313,7 @@ $ wc -l docs/rfc/CT-RFC-09-ws-session.md docs/plans/gateway-ws-contract.md \
 $ ssh ... sidecar wsprobe --frames 2 --seconds 20 (read-only, gates.md §8)
 schema_version=8 heatmap=3982 depth_series=2 snapshot=2508685B — см. §0.3/§2
 $ grep -rn "2316" . --include=*.md → только сама строка RFC (не найден источник)
-$ ls research/critiques/ | tail -3 → C-055 последний ⇒ этот вердикт C-056 (не C-057)
+$ ls research/critiques/ | tail -3 → C-055 последний ⇒ этот вердикт получил номер C-057: C-056 параллельно занят аудитом арх-ревью на ветке feat/arch-audit (коллизия параллельных веток, переименовано architect'ом при сведении)
 VERDICT: NOTE
 ```
 
