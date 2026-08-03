@@ -756,6 +756,24 @@ def check5(root, design_text):
 # два — нормативные утверждения о коммитах.
 SHA_TOKEN_RE = re.compile(r"`([0-9a-f]{7,64})`")
 
+# TD-074 (закрыто 2026-08-03): SHA вне backtick'ов раньше был гейту НЕВИДИМ — «подтверждено
+# коммитом b3a5a95» без кавычек не попадало даже в баланс `всего=N`. Тот же класс, что B-1:
+# решала форма разметки, а не смысл.
+#
+# Почему не расширили кандидата «в лоб» на любой голый hex: замер reviewer'а (R-023 §8) —
+# 5 таких токенов в docs/rfc/, ВСЕ являются числовыми литералами fixed-point/timestamp
+# (`6500050000000`, `1752000000123`, …). Fail-closed на них дал бы 5 ложных FAIL, и гейт
+# начали бы глушить маркерами — то есть лечение хуже болезни.
+#
+# Правило: голый токен становится кандидатом ТОЛЬКО в контексте цитирования коммита —
+# рядом (в той же строке) стоит слово commit/коммит/SHA/merge/мерж/HEAD. Числовой литерал
+# такого соседства не имеет, а ложь вида «подтверждено коммитом X» — имеет по определению:
+# без этого слова утверждение перестаёт быть утверждением о коммите.
+BARE_SHA_RE = re.compile(r"(?<![`0-9a-zA-Z])([0-9a-f]{7,40})(?![`0-9a-zA-Z])")
+COMMIT_CONTEXT_RE = re.compile(
+    r"(?i)(commit|коммит|мерж|merge\b|HEAD\b|SHA\b|ревизи)"
+)
+
 # Единственный способ вывести токен из-под проверки ЯВНО: машинный маркер в том же файле.
 # Форма (документирована здесь и только здесь):  <!-- not-a-commit: <token> -->
 # Ставится в том же .md-файле, где стоит токен; действует на ВСЕ вхождения этого токена в
@@ -859,10 +877,20 @@ SHA_SKIP_REASONS = {
 # видно в дифе, а не молчаливым правилом.
 
 
-def classify_sha_token(tok, declared):
+def classify_sha_token(tok, declared, root=None):
     """Причина пропуска (ключ SHA_SKIP_REASONS) либо None → токен ПРОВЕРЯЕТСЯ.
-    Список ЗАКРЫТ: неизвестная форма → проверка, а не пропуск (fail-closed)."""
-    if tok.lower() in declared:
+    Список ЗАКРЫТ: неизвестная форма → проверка, а не пропуск (fail-closed).
+
+    TD-073 (закрыто 2026-08-03): маркер `<!-- not-a-commit: X -->` БОЛЬШЕ НЕ
+    самообслуживаемый. Объявление проверяется машиной: если X на самом деле ЯВЛЯЕТСЯ
+    коммитом репозитория, то маркер лжёт — и это FAIL ("LIAR-DECL"), а не пропуск.
+    Раньше автор мог заглушить провал на выдуманном SHA одной строкой вместо того,
+    чтобы исправить пруф; барьер стоял на внимательности reviewer'а, а не на машине.
+    Логика: объявить не-коммитом можно ТОЛЬКО то, что не-коммит."""
+    low = tok.lower()
+    if low in declared:
+        if root is not None and git_commit_exists(root, low):
+            return "LIAR-DECL"
         return "SKIP-DECLARED"
     if len(tok) == 64:
         return "SKIP-LEN64"
@@ -885,9 +913,18 @@ def gather_sha_tokens(root, path):
     for i, line in enumerate(lines, start=1):
         if i in fence_lines:
             continue
+        seen_spans = []
         for m in SHA_TOKEN_RE.finditer(line):
             tok = m.group(1)
-            out.append((relpath, i, tok, classify_sha_token(tok, declared)))
+            seen_spans.append(m.span(1))
+            out.append((relpath, i, tok, classify_sha_token(tok, declared, root)))
+        # TD-074: голый (без backtick'ов) токен — кандидат ТОЛЬКО в контексте цитаты коммита.
+        if COMMIT_CONTEXT_RE.search(line):
+            for m in BARE_SHA_RE.finditer(line):
+                if any(a <= m.start(1) < b for a, b in seen_spans):
+                    continue  # уже учтён как backtick-токен
+                tok = m.group(1)
+                out.append((relpath, i, tok, classify_sha_token(tok, declared, root)))
     return out
 
 
@@ -903,7 +940,17 @@ def check6(root):
         all_tokens.extend(gather_sha_tokens(root, path))
 
     total = len(all_tokens)
-    skipped = [t for t in all_tokens if t[3] is not None]
+    # TD-073: ЛЖИВОЕ объявление — не пропуск, а нарушение. Обрабатывается ДО остальных,
+    # иначе оно попало бы в `skipped` и выглядело бы как легальное исключение.
+    liars = [t for t in all_tokens if t[3] == "LIAR-DECL"]
+    for relpath, lineno, tok, _ in liars:
+        fail(
+            "6-RFC-SHA",
+            f"{relpath}:{lineno} `{tok}` объявлен маркером <!-- not-a-commit: {tok} -->, "
+            f"но ЯВЛЯЕТСЯ коммитом репозитория — маркер лжёт (TD-073). Объявить не-коммитом "
+            f"можно только то, что действительно не коммит; уберите маркер или исправьте токен",
+        )
+    skipped = [t for t in all_tokens if t[3] is not None and t[3] != "LIAR-DECL"]
     all_refs = [t for t in all_tokens if t[3] is None]
 
     # Остаток печатается ПЕРВЫМ и построчно: файл, строка, токен, причина. Проверка обязана
