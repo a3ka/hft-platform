@@ -107,6 +107,67 @@ impl EpochFilter {
 /// Имя манифеста легаси-деклараций (CT-RFC-02 rev 2).
 pub const LEGACY_MANIFEST: &str = "journal.legacy.json";
 
+// === M-57 (TD-098), задача 2: sidecar byte-offset курсора в активном сегменте ===
+
+/// Файл с курсором последнего чтения в активном сегменте.
+///
+/// Формат: 20 байт
+///   `[u32 LE seg_idx][u64 LE last_decoded_seq][u64 LE byte_offset]`
+///
+/// - `seg_idx` — индекс активного сегмента, в котором шло чтение.
+/// - `last_decoded_seq` — `seq` ПОСЛЕДНЕГО декодированного события. Используется
+///   для решения «использовать ли курсор»: только если запрошенный `after_seq >=
+///   last_decoded_seq` (то есть пользователь хочет события, которых мы ещё не видели).
+///   При `after_seq < last_decoded_seq` sidecar бесполезен (юзер хочет события из
+///   прочитанной зоны) — выполняется обычный forward-scan от начала активного сегмента.
+/// - `byte_offset` — позиция в файле сегмента СРАЗУ ПОСЛЕ фрейма последнего события.
+///
+/// Sidecar НЕ является источником истины — это оптимизация. Если его нет / он
+/// повреждён / не подходит по `seg_idx`/`after_seq`, `stream_from` спокойно делает
+/// forward-scan. Сравнение byte-идентичности кадров (O-4) гарантирует, что мы
+/// получаем тот же поток событий, что и полный проход.
+pub const TAIL_OFFSET_FILE: &str = "journal.tail-offset";
+
+/// Прочитать sidecar `(seg_idx, last_decoded_seq, offset)`. `None` если файла нет
+/// или он короче 20 байт (частичная запись / устаревший формат).
+pub(crate) fn read_tail_offset(dir: &Path) -> io::Result<Option<(u32, u64, u64)>> {
+    let path = dir.join(TAIL_OFFSET_FILE);
+    match std::fs::read(&path) {
+        Ok(bytes) if bytes.len() >= 20 => {
+            let seg_idx = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+            let last_decoded_seq = u64::from_le_bytes(bytes[4..12].try_into().unwrap());
+            let offset = u64::from_le_bytes(bytes[12..20].try_into().unwrap());
+            Ok(Some((seg_idx, last_decoded_seq, offset)))
+        }
+        Ok(_) => Ok(None),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Записать sidecar атомарно (tmp + rename). В `.tmp` дописываем суффикс явно —
+/// `Path::with_extension` на `journal.tail-offset` дал бы `journal.tail.tmp`,
+/// что не то.
+pub(crate) fn write_tail_offset(
+    dir: &Path,
+    seg_idx: u32,
+    last_decoded_seq: u64,
+    offset: u64,
+) -> io::Result<()> {
+    let path = dir.join(TAIL_OFFSET_FILE);
+    let mut bytes = [0u8; 20];
+    bytes[0..4].copy_from_slice(&seg_idx.to_le_bytes());
+    bytes[4..12].copy_from_slice(&last_decoded_seq.to_le_bytes());
+    bytes[12..20].copy_from_slice(&offset.to_le_bytes());
+
+    let mut tmp_name = path.as_os_str().to_owned();
+    tmp_name.push(".tmp");
+    let tmp = PathBuf::from(tmp_name);
+    fs::write(&tmp, bytes)?;
+    fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
 // === Маркеры ошибок (для type-based проверок в тестах и проде) ===
 
 /// Ошибка: сегмент без магии и без валидной декларации (чужой/неизвестный).
@@ -842,20 +903,24 @@ pub struct StorageStatus {
 /// инкрементируются в `next()`/`open_next_segment` — НЕ аллокатор, НЕ wall-time
 /// (урок TD-040: аллокатор-оракул M-37 флакал на параллельных прогонах).
 ///
-/// M-57 (TD-098), задача 1: добавлен честный счётчик `events_scanned` — счётчик
-/// ПРОЧИТАННЫХ парсером событий ВКЛЮЧАЯ отфильтрованные. Прежний `events_decoded`
-/// считал ВЫДАННЫЕ, и при полном forward-чтении активного сегмента (zstd не Seek)
-/// показывал «3» — измеритель был слеп к работе машины. Без `events_scanned`
-/// оракулы M-53/«работа не растёт с историей» ловят свойство только на словах.
+/// M-57 (TD-098):
+/// - задача 1: добавлен честный счётчик `events_scanned` (прочитанные ВКЛЮЧАЯ
+///   отфильтрованные) — см. комментарий на поле.
+/// - задача 2: `reader` стал `Option<StreamReader>`, где `Active` — позиция-
+///   трекающий reader для АКТИВНОГО raw-сегмента (M-57 byte-offset seek); `Passive`
+///   — тот же `Box<dyn Read>`, что и до M-57 (zst, closed raw). На Drop sidecar
+///   `journal.tail-offset` обновляется, чтобы следующий `stream_from` применил
+///   `SeekFrom::Start(offset)` вместо forward-скана всего сегмента.
 pub struct EventStream {
     segments: Vec<SegmentInfo>,
     selected_headers: Vec<SegmentHeader>,
     cursor: usize,
-    /// Унифицированный reader для raw и compacted сегментов. `Box<dyn Read>` (а не
-    /// `BufReader<File>` как раньше) — потому что zstd::Decoder не импл Seek, а единый
-    /// тип позволяет общую обработку через `read_event_frame` (которой Seek не нужен —
-    /// только forward-чтение).
-    reader: Option<Box<dyn Read>>,
+    /// Reader текущего сегмента. `StreamReader::Active` — для АКТИВНОГО raw-сегмента
+    /// (с трекингом позиции для M-57 seek); `Passive` — для всего остального (zst,
+    /// closed raw), forward-only через `Box<dyn Read>`. `Box<dyn Read>` остался
+    /// для неактивных сегментов — там Seek не нужен (zstd не Seek, а закрытые raw
+    /// либо скипаются целиком по `first_seq`, либо читаются полностью).
+    reader: Option<StreamReader>,
     finished: bool,
     /// M-38b (GW-I-11): счётчик ВЫДАННЫХ событий (после фильтра `after_seq`).
     /// Смысл сохранён: на нём стоят `red_stream_from::counters_report_full_pass_honestly`
@@ -877,6 +942,67 @@ pub struct EventStream {
     /// (эквивалентно `stream`). Внутрисегментный forward-фильтр `seq > after` тоже
     /// активен (zstd не Seek).
     after_seq: Option<u64>,
+    /// M-57, задача 2: `seq` последнего декодированного события — для sidecar.
+    last_decoded_seq: Option<u64>,
+    /// M-57, задача 2: позиция в активном raw-сегменте сразу ПОСЛЕ последнего
+    /// декодированного события — для sidecar. None если активный сегмент не
+    /// открывался или в нём ничего не декодировали.
+    active_tail_pos: Option<u64>,
+    /// M-57, задача 2: каталог журнала — нужен `Drop` для sidecar-записи.
+    dir: PathBuf,
+}
+
+/// Внутренний reader [`EventStream`]'а: активный (с трекингом pos для seek) или
+/// пассивный (forward-only, тип-стёрт через `Box<dyn Read>`).
+enum StreamReader {
+    /// Активный raw-сегмент: трекает байтовую позицию, поддерживает seek.
+    /// Только этот вариант видит byte-offset оптимизацию (M-57).
+    Active(PositionedBufReader),
+    /// Всё остальное (zst, закрытый raw): forward-only, тип-стёрт.
+    Passive(Box<dyn Read>),
+}
+
+/// Raw segment reader с явным трекингом байтовой позиции. Нужен M-57 для seek в
+/// активный сегмент: `BufReader<File>` не отдаёт позицию без Seek, а мы хотим
+/// обновлять `pos` инкрементально (на каждый `read_exact` внутри `read_event_frame`),
+/// не дёргая `seek(Current(0))`.
+struct PositionedBufReader {
+    inner: BufReader<File>,
+    /// Позиция следующего байта для чтения (обновляется в `Read::read`).
+    pos: u64,
+}
+
+impl PositionedBufReader {
+    /// Открыть `path`, пропустить magic+header, спозиционироваться на
+    /// `start_offset` (не ниже конца заголовка — `header_end`).
+    fn open(path: &Path, start_offset: u64) -> io::Result<Self> {
+        let mut file = BufReader::with_capacity(64 * 1024, File::open(path)?);
+        let header_end = match read_v2_header_and_skip(&mut file)? {
+            Some(_) => file.stream_position()?,
+            None => 0,
+        };
+        let actual = start_offset.max(header_end);
+        file.seek(SeekFrom::Start(actual))?;
+        Ok(Self {
+            inner: file,
+            pos: actual,
+        })
+    }
+
+    /// Текущая байтовая позиция (start of next byte to read).
+    fn position(&self) -> u64 {
+        self.pos
+    }
+}
+
+impl Read for PositionedBufReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        // Каждый байт, прочитанный из BufReader, продвигает логическую позицию
+        // ровно настолько же — буферизация BufReader учтена внутри.
+        self.pos += n as u64;
+        Ok(n)
+    }
 }
 
 impl EventStream {
@@ -922,33 +1048,124 @@ impl EventStream {
     /// реально открыт (не пропущен). Пропуск сегмента определяется в `stream_from` ДО
     /// первого вызова `next()` — сегменты с `last_seq <= after_seq` (last = `first_seq`
     /// следующего − 1) удаляются из self.segments до перехода сюда.
+    ///
+    /// **M-57 (TD-098), задача 2:** для АКТИВНОГО raw-сегмента (последний в `self.segments`)
+    /// открываем через [`PositionedBufReader`] и применяем byte-offset seek, если
+    /// sidecar валиден: `seg_idx` совпадает с активным И `after >= last_decoded_seq`.
+    /// В остальных случаях (zst / closed raw / первый запуск / ротация / `after <
+    /// last_decoded_seq`) — обычный forward-scan с начала сегмента, как раньше.
     fn open_next_segment(&mut self) -> io::Result<bool> {
         if self.cursor >= self.segments.len() {
             self.reader = None;
             return Ok(false);
         }
-        let seg = &self.segments[self.cursor];
+        let seg = self.segments[self.cursor].clone();
         self.cursor += 1;
+        let is_last = self.cursor == self.segments.len();
         let is_zst = seg
             .path
             .file_name()
             .and_then(OsStr::to_str)
             .is_some_and(is_compacted_name);
+
         if is_zst {
             let f = File::open(&seg.path)?;
             let mut decoder = open_compacted_reader(f)?;
             skip_v2_header_forward(&mut decoder)?;
-            self.reader = Some(Box::new(decoder));
+            self.reader = Some(StreamReader::Passive(Box::new(decoder)));
+        } else if is_last {
+            // M-57, задача 2: активный raw-сегмент. Решаем, с какого байта начинать чтение.
+            let start_offset = self.resolve_active_start_offset(&seg.path)?;
+            let positioned = PositionedBufReader::open(&seg.path, start_offset)?;
+            self.reader = Some(StreamReader::Active(positioned));
         } else {
+            // Закрытый raw: forward-scan с самого начала, тип-стёрт. Старое поведение.
             let f = File::open(&seg.path)?;
             let mut r = BufReader::with_capacity(64 * 1024, f);
             if read_v2_header_and_skip(&mut r).ok().flatten().is_none() {
                 // noop: legacy-сегмент (без магии)
             }
-            self.reader = Some(Box::new(r));
+            self.reader = Some(StreamReader::Passive(Box::new(r)));
         }
         self.segments_opened += 1;
         Ok(true)
+    }
+
+    /// M-57, задача 2: с каким байтовым смещением открывать активный raw-сегмент.
+    ///
+    /// Возвращает абсолютное смещение в файле (`>= header_end`).
+    ///
+    /// Применяем sidecar только если ВСЁ из следующего:
+    /// 1. sidecar существует и валиден (≥20 байт);
+    /// 2. `saved_seg_idx == индекс активного сегмента` (иначе — ротация,
+    ///    sidecar относится к уже закрытому сегменту; пользоваться им нельзя);
+    /// 3. `after_seq >= saved_last_decoded_seq` — иначе юзер просит события,
+    ///    которые мы уже прочитали; seek к сохранённому смещению их пропустит.
+    ///    Чтобы корректно их выдать, нужен forward-scan от начала сегмента
+    ///    (см. O-4 в `red_tail_scan_bounded`).
+    /// 4. `after_seq != None` (при `None` это `stream`/полный проход — семантика
+    ///    «выдать ВСЕ события», sidecar тут только мешает).
+    ///
+    /// Иначе возвращаем `header_end` — обычное начало чтения.
+    fn resolve_active_start_offset(&self, path: &Path) -> io::Result<u64> {
+        // Вычислить header_end (позиция сразу после magic+SegmentHeader, либо 0 для legacy).
+        let mut probe = File::open(path)?;
+        let header_end = match read_v2_header_and_skip(&mut probe)? {
+            Some(_) => probe.stream_position()?,
+            None => 0,
+        };
+        drop(probe);
+
+        let after = match self.after_seq {
+            Some(a) => a,
+            None => return Ok(header_end),
+        };
+
+        let sidecar = match read_tail_offset(&self.dir)? {
+            Some(s) => s,
+            None => return Ok(header_end),
+        };
+        let (saved_seg_idx, saved_last_seq, saved_offset) = sidecar;
+
+        let active_idx =
+            parse_segment_index_any(path.file_name().and_then(OsStr::to_str).unwrap_or(""))
+                .unwrap_or(0);
+
+        if saved_seg_idx != active_idx {
+            return Ok(header_end);
+        }
+        if saved_offset < header_end {
+            // Sidecar повреждён / указывает внутрь заголовка — игнор.
+            return Ok(header_end);
+        }
+        if after < saved_last_seq {
+            return Ok(header_end);
+        }
+        Ok(saved_offset)
+    }
+}
+
+impl Drop for EventStream {
+    /// M-57, задача 2: на каждом drop'е сохраняем sidecar с текущей позицией
+    /// в активном сегменте. «Ленивая» фиксация: пишем только если был хоть
+    /// один декодированный event в активном сегменте, иначе sidecar остаётся
+    /// прежним.
+    ///
+    /// Запись НАМЕРЕННО НЕ критична: на отказе sidecar просто остаётся старым,
+    /// и следующий `stream_from` сделает forward-scan. Источник истины — сам
+    /// сегмент, а не sidecar.
+    fn drop(&mut self) {
+        let (Some(pos), Some(last_seq)) = (self.active_tail_pos, self.last_decoded_seq) else {
+            return;
+        };
+        let seg_idx = self
+            .segments
+            .last()
+            .and_then(|s| s.path.file_name())
+            .and_then(OsStr::to_str)
+            .and_then(parse_segment_index_any)
+            .unwrap_or(0);
+        let _ = write_tail_offset(&self.dir, seg_idx, last_seq, pos);
     }
 }
 
@@ -957,8 +1174,16 @@ impl Iterator for EventStream {
 
     fn next(&mut self) -> Option<io::Result<Event>> {
         loop {
-            if let Some(reader) = self.reader.as_mut() {
-                match read_event_frame(reader.as_mut()) {
+            if self.reader.is_some() {
+                // Делаем чтение, пока self.reader заимствован. После возврата из
+                // `read_event_frame` все заимствования внутри `r` отпущены —
+                // можно снова обращаться к `self.reader` для sidecar-апдейта.
+                let read_outcome = match self.reader.as_mut() {
+                    Some(StreamReader::Active(r)) => read_event_frame(r),
+                    Some(StreamReader::Passive(r)) => read_event_frame(r.as_mut()),
+                    None => unreachable!("checked is_some above"),
+                };
+                match read_outcome {
                     Ok(Some(ev)) => {
                         // M-57 (TD-098), задача 1: `events_scanned` — честный счётчик
                         // ПРОЧИТАННЫХ парсером событий. Растёт ДО фильтра `after_seq`,
@@ -968,6 +1193,13 @@ impl Iterator for EventStream {
                         // «3» при скане гигабайта — ровно тот дефект прибора, который
                         // этот milestone и устраняет.
                         self.events_scanned += 1;
+                        self.last_decoded_seq = Some(ev.seq);
+                        // M-57, задача 2: для активного сегмента сохраняем позицию ПОСЛЕ
+                        // фрейма — на Drop запишем её в sidecar. Без этого следующий
+                        // `stream_from` снова отсканирует всё с начала.
+                        if let Some(StreamReader::Active(r)) = self.reader.as_ref() {
+                            self.active_tail_pos = Some(r.position());
+                        }
 
                         // M-38b (GW-I-11): внутрисегментный forward-фильтр — zstd не Seek,
                         // читаем с начала сегмента, пропускаем события `seq <= after` без
@@ -1087,6 +1319,9 @@ pub fn stream_from(
         events_scanned: 0,
         segments_opened: 0,
         after_seq,
+        last_decoded_seq: None,
+        active_tail_pos: None,
+        dir: dir.as_ref().to_path_buf(),
     })
 }
 
