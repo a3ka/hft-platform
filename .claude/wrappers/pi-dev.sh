@@ -89,11 +89,11 @@ if [ "$OWNED_WORKTREE" -eq 1 ]; then
   git checkout -B "${ROLE}-$(basename "$WORKTREE_PATH")" --quiet 2>/dev/null || true
 fi
 
-# Идентичность роли per-worktree (04-workflow §4: идентичность коммиттера = роль;
-# --worktree иммунна к клобберу общего .git/config соседними сессиями)
-git config extensions.worktreeConfig true
-git config --worktree user.email "${ROLE}@noreply.local"
-git config --worktree user.name  "${ROLE}"
+# Личность НЕ переустанавливается (branch-hygiene.md п.6, commit-discipline).
+# Автор коммитов — владелец репозитория; роль указывается меткой в конце subject'а:
+#   feat(M-NN): task #k — <...> [${ROLE}]
+# Прежний блок ставил ролевой user.name/email per-worktree; замером установлено, что как
+# признак роли git-личность не работает (все worktree несли подпись предыдущей роли).
 [ -d "$PROJECT_DIR/.githooks" ] && git config core.hooksPath .githooks
 
 IDENT_EMAIL="$(git config user.email)"
@@ -101,7 +101,7 @@ IDENT_EMAIL="$(git config user.email)"
 # ── --dry-run смоук ──
 if [ "$DRY_RUN" -eq 1 ]; then
   FAIL=0
-  [ "$IDENT_EMAIL" = "${ROLE}@noreply.local" ] || { echo "DRY-RUN FAIL: identity=$IDENT_EMAIL"; FAIL=1; }
+  [ -n "$IDENT_EMAIL" ] || { echo "DRY-RUN FAIL: git identity не настроена"; FAIL=1; }
   git status --porcelain | grep -q . && { echo "DRY-RUN FAIL: worktree не чистый"; FAIL=1; }
   [ -f "$PROJECT_DIR/.claude/wrappers/dispatch-mandate.md" ] || { echo "DRY-RUN FAIL: dispatch-mandate.md отсутствует"; FAIL=1; }
   echo "DRY-RUN: role=$ROLE worktree=$WORKTREE_PATH identity=$IDENT_EMAIL"
@@ -134,7 +134,8 @@ AGENT IDENTITY: $ROLE (hft-platform)
 Ты — $ROLE. Идентичность ФИКСИРОВАНА на сессию.
 Обвязка уже подготовила рабочую копию:
   CWD:          $WORKTREE_PATH  (свежий чекаут origin/$BRANCH, если не переопределено)
-  git identity: ${ROLE}@noreply.local  (per-worktree; уже установлена)
+  git identity: $IDENT_EMAIL  (личность владельца — НЕ переустанавливай)
+  роль в коммите: метка в конце subject'а — [${ROLE}]
 НЕ переходи в $PROJECT_DIR (основной чекаут founder'а).
 Первым делом проверь: git status -sb && git log --oneline -3
 ═══════════════════════════════════════════════════════════════

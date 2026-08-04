@@ -3,6 +3,8 @@
 #
 # Защищено:
 #   research/critiques/*.md   — вердикты critic/risk-critic (аудит-трейл гейтов)
+#   research/reviews/*.md     — вердикты reviewer'а (условие merge, gates.md §4)
+#   research/arbitration/*.md — решения арбитра (обязательны к исполнению, gates.md §0)
 #   milestones/*.md           — спеки, по которым исполняют dev-агенты
 #   docs/rfc/**               — contract-RFC (КАНОН); docs/contract-rfc/** — исторический путь
 #
@@ -65,7 +67,8 @@ base=$(git rev-parse "${raw}^{commit}")
 
 is_protected() {
   case "$1" in
-    research/critiques/*.md|milestones/*.md|docs/rfc/*|docs/contract-rfc/*) return 0 ;;
+    research/critiques/*.md|research/reviews/*.md|research/arbitration/*.md) return 0 ;;
+    milestones/*.md|docs/rfc/*|docs/contract-rfc/*) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -85,10 +88,12 @@ is_protected() {
 # слеп к способу по построению — ни один новый трюк с мержем сюда не пролезет.
 existed=$(
   { git ls-tree -r --name-only "${base}" -- \
-      research/critiques milestones docs/rfc docs/contract-rfc 2>/dev/null
+      research/critiques research/reviews research/arbitration \
+      milestones docs/rfc docs/contract-rfc 2>/dev/null
     for c in $(git rev-list "${base}..HEAD"); do
       git ls-tree -r --name-only "${c}" -- \
-        research/critiques milestones docs/rfc docs/contract-rfc 2>/dev/null
+        research/critiques research/reviews research/arbitration \
+        milestones docs/rfc docs/contract-rfc 2>/dev/null
     done
   } | sort -u | grep -vE '^$' || true
 )

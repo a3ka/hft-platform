@@ -67,16 +67,9 @@
 | architect (Fable) | дорогая — экономно | архитектура, `contracts` T1, RED-тесты, verify, sacred |
 | **risk-critic** | сильная (не экономим) | safety-путь + отчёты стратегий (асимметричная цена ошибки) |
 | reviewer | сильная | PR-гейт: scope, Done Block, contract Block-C, риск-инварианты |
-| critic | средняя — **но сильная** на raw-гейте (см. ниже) | plan-time гейт (триггеры в `.claude/rules/gates.md`) |
+| critic | средняя — **но сильная** на RAW-гейте (`.claude/rules/gates.md` §1) | plan-time гейт (триггеры в `.claude/rules/gates.md`) |
 | engine/venue/signal/research-dev | кодовая дешёвая/средняя | impl по milestone + RED |
 | explore/tester | дешёвая | разведка / прогон тестов |
-
-**RAW-гейт — critic на сильной модели (решение founder'а 2026-08-02).** Если milestone меняет
-**раскладку/формат журнала** (шардирование, схема сегментов, `seq`-пространство, эпохи) ИЛИ
-`contracts` T1 — critic поднимается на сильную модель, как risk-critic. Причина та же
-асимметрия: ошибка в safety-пути стоит депозита, ошибка в раскладке журнала обнаруживается
-через месяцы и стоит переписывания всего накопленного (`docs/PENDING-SIGNATURE.md` П-005).
-Детали и формулировка триггера — `.claude/rules/gates.md` §1.
 
 ## Scope-guard (кратко; полное — `.claude/rules/scope-guard.md`)
 
