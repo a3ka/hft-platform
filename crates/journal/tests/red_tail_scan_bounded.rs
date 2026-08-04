@@ -89,23 +89,27 @@ fn write_n(dir: &std::path::Path, from: i64, to: i64, cfg: WriterConfig) {
 /// навсегда: оно не попадало ни в первый тик (отброшено фильтром), ни во второй (тот стартовал
 /// уже дальше). Тест падал детерминированно и НЕЗАВИСИМО ОТ РЕАЛИЗАЦИИ — то есть был сломан
 /// сам, а не ловил дефект.
-fn tick(dir: &std::path::Path, after: Option<u64>) -> (u64, u64) {
+/// Возвращает СПИСОК выданных `seq` (а не только их число) и `events_scanned`.
+/// Список нужен O-3: сверять надо тождество потоков, а не совпадение счётчиков —
+/// одинаковое ЧИСЛО событий совместимо с потерей одного и дублированием другого
+/// (`C-060` N1).
+fn tick(dir: &std::path::Path, after: Option<u64>) -> (Vec<u64>, u64) {
     let mut s = journal::stream_from(dir, EpochFilter::OwnCaptureOnly, after).expect("stream_from");
-    let mut yielded = 0u64;
-    while let Some(r) = s.next() {
-        r.expect("event");
-        yielded += 1;
+    let mut seqs = Vec::new();
+    // `by_ref()`: итератор нужен ПОСЛЕ цикла — с него снимается `events_scanned()`.
+    for r in s.by_ref() {
+        seqs.push(r.expect("event").seq);
     }
     // `events_scanned` — задача 1: сколько событий РЕАЛЬНО прочитано и декодировано,
     // включая отброшенные фильтром. Без него измерить пересканирование нечем.
-    (yielded, s.events_scanned())
+    (seqs, s.events_scanned())
 }
 
 /// Последний `seq` в журнале — честный курсор «я дочитал досюда».
 fn tail_seq(dir: &std::path::Path) -> u64 {
-    let mut s = journal::stream_from(dir, EpochFilter::OwnCaptureOnly, None).expect("stream_from");
+    let s = journal::stream_from(dir, EpochFilter::OwnCaptureOnly, None).expect("stream_from");
     let mut last = 0u64;
-    while let Some(r) = s.next() {
+    for r in s {
         last = r.expect("event").seq;
     }
     last
@@ -149,9 +153,11 @@ fn o1_scanned_counts_reads_not_yields() {
 
     // Курсор в середине: выдаётся вторая половина, первая обязана быть прочитана или пропущена.
     let mid = (N / 2 - 1) as u64;
-    let (yielded_half, scanned_half) = tick(dir.path(), Some(mid));
+    let (seqs_half, scanned_half) = tick(dir.path(), Some(mid));
+    let yielded_half = seqs_half.len() as u64;
     // Полный проход: выдаётся всё.
-    let (yielded_full, scanned_full) = tick(dir.path(), None);
+    let (seqs_full, scanned_full) = tick(dir.path(), None);
+    let yielded_full = seqs_full.len() as u64;
 
     assert_eq!(
         yielded_full as i64, N,
@@ -202,7 +208,8 @@ fn o2_tick_scans_only_increment_not_whole_segment() {
         write_n(dir.path(), 0, n, cfg_single_segment());
         let after = tail_seq(dir.path());
         write_n(dir.path(), n, n + 3, cfg_single_segment());
-        let (yielded, scanned) = tick(dir.path(), Some(after));
+        let (seqs, scanned) = tick(dir.path(), Some(after));
+        let yielded = seqs.len() as u64;
         assert_eq!(yielded, 3, "O-2: при {n} событиях выдано не 3");
         std::mem::forget(dir);
         (yielded, scanned)
@@ -234,25 +241,25 @@ fn o3_position_survives_segment_rotation() {
 
     // Первый тик: забираем ВСЁ (after=None — иначе Some(0) отбросил бы событие seq=0,
     // C-059 §3.3). Курсор берём фактический — последний seq, а не число событий.
-    let (y1, _s1) = tick(dir.path(), None);
+    let (seqs1, _s1) = tick(dir.path(), None);
+    let y1 = seqs1.len() as u64;
     assert!(y1 > 0, "O-3: первый тик пуст — фикстура не давит");
     let after = tail_seq(dir.path());
 
     // Дозапись, гарантированно вызывающая ротацию (сегмент 32 KiB).
     write_n(dir.path(), 400, 900, cfg_rotating());
 
-    let (y2, _s2) = tick(dir.path(), Some(after));
+    let (seqs2, _s2) = tick(dir.path(), Some(after));
+    let y2 = seqs2.len() as u64;
 
     // Полный независимый проход — эталон, построенный ДРУГИМ путём.
-    let mut full =
+    let full =
         journal::stream_from(dir.path(), EpochFilter::OwnCaptureOnly, None).expect("full stream");
-    let mut total = 0u64;
     let mut seqs = Vec::new();
-    while let Some(r) = full.next() {
-        let ev = r.expect("event");
-        seqs.push(ev.seq);
-        total += 1;
+    for r in full {
+        seqs.push(r.expect("event").seq);
     }
+    let total = seqs.len() as u64;
 
     assert_eq!(
         y1 + y2,
@@ -273,6 +280,20 @@ fn o3_position_survives_segment_rotation() {
         seqs.len(),
         "O-3: в полном проходе есть ДУБЛИКАТЫ seq — журнал или чтение нарушают порядок"
     );
+
+    // ТОЖДЕСТВО ПОТОКОВ, а не совпадение счётчиков (`C-060` N1). Равенство сумм совместимо
+    // с потерей одного события и дублированием другого — оракул обязан называть то свойство,
+    // которое заявляет в имени: позиция ПЕРЕЖИВАЕТ ротацию, то есть склейка двух тиков есть
+    // ровно тот же поток, что независимый полный проход.
+    let mut via_ticks: Vec<u64> = seqs1.iter().chain(seqs2.iter()).copied().collect();
+    via_ticks.sort_unstable();
+    let mut via_full = seqs.clone();
+    via_full.sort_unstable();
+    assert_eq!(
+        via_ticks, via_full,
+        "O-3: склейка тиков != полному проходу ПОСОБЫТИЙНО. Счётчики могли совпасть при \
+         одновременной потере и дублировании — здесь сверяются сами seq"
+    );
 }
 
 /// **O-4.** Ускорение не смеет менять ДАННЫЕ: события seek-пути идентичны полному проходу.
@@ -287,17 +308,17 @@ fn o4_seek_path_yields_identical_events() {
     write_n(dir.path(), 3_000, 3_010, cfg_single_segment());
 
     // Путь под проверкой.
-    let mut s = journal::stream_from(dir.path(), EpochFilter::OwnCaptureOnly, Some(after))
+    let s = journal::stream_from(dir.path(), EpochFilter::OwnCaptureOnly, Some(after))
         .expect("stream_from");
     let mut via_seek = Vec::new();
-    while let Some(r) = s.next() {
+    for r in s {
         via_seek.push(r.expect("event"));
     }
 
     // Независимый эталон: полный проход + фильтрация вручную.
-    let mut f = journal::stream_from(dir.path(), EpochFilter::OwnCaptureOnly, None).expect("full");
+    let f = journal::stream_from(dir.path(), EpochFilter::OwnCaptureOnly, None).expect("full");
     let mut via_full = Vec::new();
-    while let Some(r) = f.next() {
+    for r in f {
         let ev = r.expect("event");
         if ev.seq > after {
             via_full.push(ev);
