@@ -841,6 +841,12 @@ pub struct StorageStatus {
 /// M-38b (TD-044, GW-I-11): детерминированные счётчики `events_decoded`/`segments_opened`
 /// инкрементируются в `next()`/`open_next_segment` — НЕ аллокатор, НЕ wall-time
 /// (урок TD-040: аллокатор-оракул M-37 флакал на параллельных прогонах).
+///
+/// M-57 (TD-098), задача 1: добавлен честный счётчик `events_scanned` — счётчик
+/// ПРОЧИТАННЫХ парсером событий ВКЛЮЧАЯ отфильтрованные. Прежний `events_decoded`
+/// считал ВЫДАННЫЕ, и при полном forward-чтении активного сегмента (zstd не Seek)
+/// показывал «3» — измеритель был слеп к работе машины. Без `events_scanned`
+/// оракулы M-53/«работа не растёт с историей» ловят свойство только на словах.
 pub struct EventStream {
     segments: Vec<SegmentInfo>,
     selected_headers: Vec<SegmentHeader>,
@@ -851,10 +857,19 @@ pub struct EventStream {
     /// только forward-чтение).
     reader: Option<Box<dyn Read>>,
     finished: bool,
-    /// M-38b (GW-I-11): счётчик реально декодированных событий (включая те, что были
-    /// отфильтрованы по `after_seq`). ЧЕСТНЫЙ: при `stream(.., None)` или при полном
-    /// rebuild равен общему числу событий в журнале.
+    /// M-38b (GW-I-11): счётчик ВЫДАННЫХ событий (после фильтра `after_seq`).
+    /// Смысл сохранён: на нём стоят `red_stream_from::counters_report_full_pass_honestly`
+    /// (`== N` для полного прохода) и `red_checkpoint_resource_bound::without_checkpoint_full_replay_is_reported`.
+    /// Этот счётчик НЕ видит пересканирование — и НЕ ДОЛЖЕН: он меряет «работу редьюсера»,
+    /// а не «работу парсера».
     events_decoded: u64,
+    /// M-57 (TD-098), задача 1: счётчик РЕАЛЬНО ПРОЧИТАННЫХ парсером событий —
+    /// ВКЛЮЧАЯ отфильтрованные по `after_seq`. Инкрементируется в `next()` СРАЗУ после
+    /// `read_event_frame` возвращает Some(event), ДО фильтрации. Без него невозможно
+    /// измерить пересканирование активного сегмента (прежний `events_decoded` показывал
+    /// «3» при скане гигабайта — ровно тот дефект прибора, ради которого milestone
+    /// и существует). См. `red_tail_scan_bounded::o1_scanned_counts_reads_not_yields`.
+    events_scanned: u64,
     /// M-38b (GW-I-11): счётчик реально открытых сегментов (включая активный). При seek
     /// у хвоста ОБЯЗАН быть существенно меньше общего числа сегментов.
     segments_opened: u32,
@@ -875,6 +890,15 @@ impl EventStream {
     /// Не зависит от того, какие события попали в `next()`. ДЕТЕРМИНИРОВАННЫЙ счётчик.
     pub fn events_decoded(&self) -> u64 {
         self.events_decoded
+    }
+
+    /// M-57 (TD-098), задача 1: честный счётчик ПРОЧИТАННЫХ парсером событий —
+    /// ВКЛЮЧАЯ события, отброшенные фильтром `after_seq`. Декремент невозможен,
+    /// только инкремент. На полном проходе (`stream(.., None)`) равен общему числу
+    /// событий в журнале. Это основная мера «работы тика» для оракулов
+    /// M-53/M-57 — заменяет слепой `events_decoded` в их анализе (TD-098).
+    pub fn events_scanned(&self) -> u64 {
+        self.events_scanned
     }
 
     /// M-38b (GW-I-11): число сегментов, чей reader был открыт. Включает активный
@@ -936,6 +960,15 @@ impl Iterator for EventStream {
             if let Some(reader) = self.reader.as_mut() {
                 match read_event_frame(reader.as_mut()) {
                     Ok(Some(ev)) => {
+                        // M-57 (TD-098), задача 1: `events_scanned` — честный счётчик
+                        // ПРОЧИТАННЫХ парсером событий. Растёт ДО фильтра `after_seq`,
+                        // чтобы измеритель видел пересканирование активного сегмента
+                        // (при forward-чтении ВСЕХ его событий ради отсева по фильтру).
+                        // Раньше эквивалентный счётчик (= `events_decoded`) показывал
+                        // «3» при скане гигабайта — ровно тот дефект прибора, который
+                        // этот milestone и устраняет.
+                        self.events_scanned += 1;
+
                         // M-38b (GW-I-11): внутрисегментный forward-фильтр — zstd не Seek,
                         // читаем с начала сегмента, пропускаем события `seq <= after` без
                         // эмита. Сегмент уже подобран по `first_seq` next-сегмента выше
@@ -1051,6 +1084,7 @@ pub fn stream_from(
         reader: None,
         finished: false,
         events_decoded: 0,
+        events_scanned: 0,
         segments_opened: 0,
         after_seq,
     })
