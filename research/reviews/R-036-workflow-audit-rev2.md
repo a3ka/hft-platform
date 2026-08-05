@@ -342,3 +342,75 @@ $ stat -c '%y' docs/plans/workflow-audit-2026-08-einhard-vs-hft.md
 merge закрепит производную ошибку как проверенную; (3) цена реджекта близка к нулю: amend
 обязателен из-за `F-036-3` в любом случае. При таком раскладе merge покупает один круг
 времени ценой ложного утверждения о собственном коде в `main` — обмен невыгодный.
+
+---
+
+## §J — Close-out круга (что reviewer сделал ПОМИМО вердикта)
+
+Merge'а нет (REJECT), поэтому `PROJECT-STATE.md` не трогался и `gc_worktrees.sh` не гонялся —
+оба привязаны к close-out'у merge'а (`gates.md` §8 п.4). Сделано одно смежное касание в своей
+зоне и один гейт по нему.
+
+**`TECH-DEBT.md` / TD-106 приведён к факту** (`0f4892e`, в `main`). Долг утверждал «`main`
+красен по `verify_design_claims.sh`, `VERDICT: FAIL (6 нарушений)`» — на момент этого гейта
+утверждение ЛОЖНО: симптом закрыт architect'ом (`cf24aac docs(TD-106): висячие ссылки после
+переноса ORCHESTRATION-STATE — main зелёный`). Оставить это в `TECH-DEBT` значило бы держать
+в собственном файле ровно тот дефект, за который реджектится этот круг. Записано: симптом
+ЗАКРЫТ с перезамером, корень (**гейт вне CI**) — **OPEN**, лечится `G2` спеки M-60.
+
+```
+$ bash scripts/verify_design_claims.sh   # origin/main = 7728d2d, до моего коммита
+VERDICT: PASS (0 нарушений)                                   exit=0
+$ grep -rn "docs/ORCHESTRATION-STATE.md" docs/*.md docs/rfc/*.md
+(пусто)
+$ git show --numstat --format='%h %s' 0f4892e
+0f4892e docs(debt): TD-106 — симптом закрыт (cf24aac), корень OPEN; main зелёный по перезамеру [reviewer]
+11	1	TECH-DEBT.md
+$ git log origin/main..HEAD --format='%h %an %s'      # push-scope: только мой коммит
+0f4892e Alex Kurz docs(debt): TD-106 …
+$ EVENT_NAME=push PUSH_BEFORE=7728d2d bash scripts/check_protected_artifacts.sh; echo exit=$?
+OK: защищённые артефакты целы на HEAD (7728d2d..HEAD)         exit=0
+$ git push origin main
+   7728d2d..0f4892e  main -> main                             exit=0
+```
+
+**Деплой-гейт `gates.md` §8 по этому push'у — GREEN.**
+```
+$ gh run list --limit 2 --json workflowName,status,conclusion,headSha,databaseId
+CI completed success 0f4892e 31054572965
+CI completed success 7728d2d 31053657896
+
+$ gh run watch 31054572965 --exit-status; echo watch_exit=$?
+✓ All checks passed …                                          watch_exit=0
+# первый прогон был сделан с несуществующим флагом `--compact`: gh напечатал usage и вышел 0.
+# Зелёный exit несостоявшейся команды — не пруф; перезапущено прод-формой (testing.md,
+# «целостность гейта», свойство 1).
+
+$ gh run list --workflow=deploy.yml --limit 1
+completed success docs(state): close-out M-58 … 2026-08-05T22:17:31Z
+# Deploy на мой коммит НЕ триггерился — path-фильтр (crates/**, Cargo.*), диф чисто документный.
+# Значит рестарта не было; ниже это подтверждается uptime, а не верой.
+
+$ ssh -i /home/nous/.ssh/hft_deploy … 'docker ps …; cat …/recorder.heartbeat; date -u +%s'
+hft-gateway-serve Up 33 minutes (healthy)
+hft-recorder      Up 33 minutes (healthy)
+{"events":155908,"free_bytes":67378872320,"min_free_bytes":10737418240,
+ "next_seq":176431103,"segment_index":189,"ts_wall_ms":1785971027500,"writable":true}
+1785971037
+RssAnon: recorder 19284 kB · прочие 272/328 kB
+```
+**Чтение пруфа:** `Up 33 minutes` соответствует деплою M-58 в 22:17Z, а не моему push'у ·
+heartbeat свежий на **9.5 с** (`1785971037 − 1785971027.5`) · журнал растёт: `next_seq`
+175 768 396 → **176 431 103**, сегмент 188 → **189** относительно замера `R-034` ·
+`writable: true`, свободно 67.4 GB при пороге 10 GB · `RssAnon` recorder'а 19 MB — норма.
+Содержательный sanity событий не требуется: деплой не выполнялся, форматы/парсеры не менялись
+(диф пуст по `crates/`) — условие §8 п.2 не наступило.
+
+**Гигиена веток.** Вердикт положен на ветку предмета push'ем `b16a0dd..08a021b`. Ветка
+`docs/workflow-audit` занята worktree `/tmp/hft-arch-wfaudit` (architect); перед push'ем
+доказано МОЛЧАНИЕ, а не пустота (`branch-hygiene.md` п.8): два снимка в 22:51Z и 22:54Z —
+HEAD не двигался (`b16a0dd`), дерево чисто, mtime предмета `22:25:55`. По п.10 факт push'а в
+чужую рабочую ветку объявляется явно: **добавлен ровно один файл**,
+`research/reviews/R-036-workflow-audit-rev2.md` (+344/−0); ничего существующего не тронуто.
+Локальный `docs/workflow-audit` в том worktree отстаёт на этот коммит — перед работой
+`git pull --ff-only`.
