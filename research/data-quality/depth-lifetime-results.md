@@ -8,6 +8,19 @@ GREEN DV-I-1..5 + DV-I-7/8 bounded-work) + расширение `crates/research
 (FaithEvent + consistency, GREEN DV-I-6 + DV-I-8 bounded-work).
 **Тесты:** все GREEN (`cargo test -p research-cli` → DV-I-1..8 pass).
 
+> ## ⛔ КАК ЧИТАТЬ ВСЕ `cancel_fraction` В ЭТОМ ФАЙЛЕ (пометка 2026-08-03)
+>
+> Любое число `cancel_fraction` ниже читать как **«доля distinct-ЦЕН, получивших хотя бы один
+> `size=0` за окно»** — НЕ как долю жизней уровня, закончившихся отменой. Реализация
+> (`depth_lifetime.rs:155-196`) фиксирует `fate` на первом `size=0` и не видит перерождения
+> цены; величина насыщается с ростом окна и с плотностью сетки, поэтому сравнение полос между
+> собой сравнивает насыщение, а не живость.
+>
+> Следствие: числа НЕ доказывают живость дальних полос. Статус — `verification pending`
+> (дефект метрики `R-031` §A.1 → M-58); действует замок `research/arbitration/A-002-depth-metric-tpp.md`.
+> Прогон как таковой корректен и воспроизводим — непригодна ИНТЕРПРЕТАЦИЯ величины.
+> `order-flow consistency_rate = 0.950` и `gaps/censored = 0` дефектом НЕ затронуты.
+
 ## АВТОРИТЕТНЫЙ ЭТАЛОН (для вердикта M-32 task 5) — ТОЛЬКО gap-free segment 78
 
 > Финальные числа (reviewer/founder-подтверждённые, gap-free `segment-00000078.jrnl`, `gaps=0`):
@@ -341,3 +354,45 @@ p50 reach 54–58%): спрос/предложение за потолком р�
 **Воспроизведение:** `cargo run --release -p research-cli --example depth_lifetime -- /tmp/m33-journal`
 (или VPS: `/var/lib/docker/volumes/hft-platform_journal-data/_data/`).
 **END of M-33 follow-up. — research-dev, 2026-07-24 UTC**
+
+## M-58 — per-life пересъёмка segment 78
+
+**УСЛОВИЯ ПРОГОНА M-58:**
+- сегмент: `segment-00000078.jrnl` из `/tmp/m33-journal` (epoch `own-2026-07`);
+- окно: весь gap-free segment 78, `first_ts_ms=1784871617235`, `last_ts_ms=1784883768642`;
+- число дельт: `121241`; `gaps=0`.
+
+Результат per-life анализатора (bid/ask раздельно; 7 полос × 2 стороны = 14 строк, **без отбора** — analyze пре-инициализирует все 7 полос, `examples/depth_lifetime.rs` печатает все без фильтра):
+
+| side | band_bps | lives_born | lives_cancelled | lives_frozen | lives_censored | cancel_fraction |
+|---|---:|---:|---:|---:|---:|---:|
+| bid | 0–150      | 315200 | 312693 | 2507 | 0 | 0.992046 |
+| bid | 150–300    |   4012 |   3480 |  532 | 0 | 0.867398 |
+| bid | 300–500    |    652 |    465 |  187 | 0 | 0.713190 |
+| bid | 500–800    |   1669 |   1473 |  196 | 0 | 0.882564 |
+| bid | 800–1500   |  14457 |  13937 |  520 | 0 | 0.964031 |
+| bid | 1500–3000  |  23945 |  23501 |  444 | 0 | 0.981458 |
+| bid | 3000–6000  |    463 |    404 |   59 | 0 | 0.872570 |
+| ask | 0–150      | 293010 | 290085 | 2925 | 0 | 0.990017 |
+| ask | 150–300    |   2009 |   1772 |  237 | 0 | 0.882031 |
+| ask | 300–500    |    167 |     70 |   97 | 0 | 0.419162 |
+| ask | 500–800    |    184 |    114 |   70 | 0 | 0.619565 |
+| ask | 800–1500   |     85 |     21 |   64 | 0 | 0.247059 |
+| ask | 1500–3000  |   1292 |   1205 |   87 | 0 | 0.932663 |
+| ask | 3000–6000  |     67 |     27 |   40 | 0 | 0.402985 |
+
+Баланс `lives_born == lives_cancelled + lives_frozen + lives_censored` проверяется per-band (все
+14 строк — да, в т.ч. наиболее шумные ask `[300,500)` и ask `[800,1500)` с `n(born)=167/85`).
+
+Сводка NEAR vs FAR (для контекста, по полной таблице):
+- **NEAR** (`[0,150)`): `born=608210, cancelled=602778, frozen=5432, censored=0, cancel_fraction=0.991`
+- **FAR**  (`[500,800) ∪ [800,1500) ∪ [1500,3000) ∪ [3000,6000)`): `born=42162, cancelled=40682, frozen=1480, censored=0, cancel_fraction=0.965`
+
+**Источник:** `research/data-quality/m58-rerun-segment78.txt`, прогон 2026-08-04 UTC
+(`./target/release/examples/depth_lifetime /tmp/m33-journal`, сегмент байт-идентичен M-33
+`md5=a8c480f6efddc68765c9a0af643e2a28`). Сырой вывод — полный stdout+stderr бинаря (31 строка),
+включая JSON-сводку и Q2б `consistency_rate=0.950`. Числа таблицы сверены с JSON-полем
+`bands[*]` до 6-го знака.
+
+**END of M-58 пересъёмка.**
+
