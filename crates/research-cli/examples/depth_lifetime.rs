@@ -1,11 +1,19 @@
-//! depth_lifetime — прод-анализатор M-32 Q2а/Q2б на BTCUSDT L2Delta.
+//! depth_lifetime — прод-анализатор M-58 (life-level метрика жизненного цикла уровня,
+//! TD-103) на BTCUSDT L2Delta.
 //!
-//! Прогоняет `analyze` (DV-I-1..5, staleness/lifetime) и `consistency` (DV-I-6, order-flow
-//! faithfulness) через `journal::stream` (EpochFilter НАЗВАН, `OwnCaptureOnly` per
-//! CT-RFC02-2). Фильтрует BTCUSDT (venue=Binance + symbol="BTCUSDT") — спот, не фьючерс.
+//! До M-58 единица учёта была ЦЕНА (`size==0` для цены = single lifetime cancel/freeze).
+//! С M-58 единица учёта — ЖИЗНЬ: одна цена может родиться/умереть/родиться снова, и
+//! каждое такое рождение теперь считается отдельно. Поля BandReport переименованы:
+//! `born`→`lives_born`, `cancelled`→`lives_cancelled`, `frozen`→`lives_frozen`,
+//! `censored`→`lives_censored`; `cancel_fraction()` сохранил семантику (M-32 §Инварианты).
 //!
-//! Вывод: per-band born/cancelled/frozen/censored + cancel_fraction near vs far; доля
-//! consistent/inconsistent trades.
+//! Прогоняет `analyze` (DV-I-1..14, staleness/lifetime per-life) и `consistency`
+//! (DV-I-6, order-flow faithfulness) через `journal::stream` (EpochFilter НАЗВАН,
+//! `OwnCaptureOnly` per CT-RFC02-2). Фильтрует BTCUSDT (venue=Binance + symbol="BTCUSDT")
+//! — спот, не фьючерс.
+//!
+//! Вывод: per-band lives_born/lives_cancelled/lives_frozen/lives_censored + cancel_fraction
+//! near vs far; доля consistent/inconsistent trades.
 //!
 //! Запуск:
 //!   cargo run --release -p research-cli --example depth_lifetime -- /var/lib/docker/volumes/hft-platform_journal-data/_data/
@@ -27,7 +35,7 @@ fn main() {
         .iter()
         .map(|h| h.epoch_id.clone())
         .collect();
-    eprintln!("[M-32] reading journal dir={dir} epochs={epoch_ids:?}");
+    eprintln!("[M-58] reading journal dir={dir} epochs={epoch_ids:?}");
 
     let mut delta_ticks: Vec<DeltaTick> = Vec::new();
     let mut faith_events: Vec<FaithEvent> = Vec::new();
@@ -40,7 +48,7 @@ fn main() {
         let event = match result {
             Ok(e) => e,
             Err(err) => {
-                eprintln!("[M-32] stream error: {err}");
+                eprintln!("[M-58] stream error: {err}");
                 continue;
             }
         };
@@ -104,18 +112,25 @@ fn main() {
     }
 
     eprintln!(
-        "[M-32] window: first_ts_ms={first_ts_ms} last_ts_ms={last_ts_ms} span_ms={} \
+        "[M-58] window: first_ts_ms={first_ts_ms} last_ts_ms={last_ts_ms} span_ms={} \
          l2delta={l2delta_count} trades={trade_count}",
         last_ts_ms - first_ts_ms,
     );
 
-    // ── Q2а: analyze() — staleness/lifetime per band ──
+    // ── M-58 (бывш. M-32 Q2а): analyze() — staleness/lifetime per-life (DV-I-1..14) ──
     let report = analyze(&delta_ticks);
-    println!("\n=== M-32 Q2а — depth_lifetime::analyze (DV-I-1..5) ===");
+    println!("\n=== M-58 — depth_lifetime::analyze (DV-I-1..14, lives_* per band) ===");
     println!("gaps: {} (sequence-разрывы continuity)", report.gaps);
     println!(
-        "{:<8} {:<10} {:<8} {:<10} {:<10} {:<10} {:<10} {:<10}",
-        "side", "band_bps", "born", "cancelled", "frozen", "censored", "cancel_frac", "near_vs_far"
+        "{:<8} {:<10} {:<10} {:<14} {:<10} {:<10} {:<10} {:<10}",
+        "side",
+        "band_bps",
+        "lives_born",
+        "lives_cancelled",
+        "lives_frozen",
+        "lives_censored",
+        "cancel_frac",
+        "near_vs_far",
     );
     for band in &report.bands {
         let side_str = match band.side {
@@ -146,7 +161,7 @@ fn main() {
         );
     }
 
-    // ── Сводка near vs far (ключевой вывод M-32) ──
+    // ── Сводка near vs far (ключевой вывод M-58) ──
     let mut near_lives_born = 0u64;
     let mut near_lives_cancelled = 0u64;
     let mut near_lives_frozen = 0u64;
@@ -178,26 +193,28 @@ fn main() {
     } else {
         f64::NAN
     };
-    println!("\n=== Сводка NEAR (≤150bps) vs FAR (≥500bps) ===");
+    println!("\n=== Сводка NEAR (≤150bps) vs FAR (≥500bps) — lives_* (M-58) ===");
     println!(
-        "NEAR: born={near_lives_born} cancelled={near_lives_cancelled} frozen={near_lives_frozen} censored={near_lives_censored} \
+        "NEAR: lives_born={near_lives_born} lives_cancelled={near_lives_cancelled} \
+         lives_frozen={near_lives_frozen} lives_censored={near_lives_censored} \
          cancel_fraction={near_frac:.3}"
     );
     println!(
-        "FAR : born={far_lives_born} cancelled={far_lives_cancelled} frozen={far_lives_frozen} censored={far_lives_censored} \
+        "FAR : lives_born={far_lives_born} lives_cancelled={far_lives_cancelled} \
+         lives_frozen={far_lives_frozen} lives_censored={far_lives_censored} \
          cancel_fraction={far_frac:.3}"
     );
     if far_lives_cancelled + far_lives_frozen == 0 {
         println!("(FAR cancel_fraction=N/A — все уровни либо censored, либо окно пустое)");
     }
 
-    // ── Q2б: consistency() — order-flow faithfulness ──
+    // ── Q2б (DV-I-6): consistency() — order-flow faithfulness ──
     eprintln!(
-        "[M-32] running consistency over {} events...",
+        "[M-58] running consistency over {} events...",
         faith_events.len()
     );
     let faith = consistency(&faith_events, 1_000);
-    println!("\n=== M-32 Q2б — orderflow::consistency (DV-I-6) ===");
+    println!("\n=== orderflow::consistency (DV-I-6) ===");
     println!(
         "checked={} consistent={} inconsistent={} \
          consistency_rate={:.3}",
@@ -249,8 +266,8 @@ fn print_summary_json(
             bands_out.push(',');
         }
         bands_out.push_str(&format!(
-            "{{\"side\":\"{side}\",\"lo_bps\":{},\"hi_bps\":{},\"born\":{},\"cancelled\":{},\
-             \"frozen\":{},\"censored\":{},\"cancel_fraction\":{frac}}}",
+            "{{\"side\":\"{side}\",\"lo_bps\":{},\"hi_bps\":{},\"lives_born\":{},\"lives_cancelled\":{},\
+             \"lives_frozen\":{},\"lives_censored\":{},\"cancel_fraction\":{frac}}}",
             b.lo_bps, b.hi_bps, b.lives_born, b.lives_cancelled, b.lives_frozen, b.lives_censored,
         ));
     }
