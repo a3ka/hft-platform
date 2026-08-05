@@ -21,6 +21,28 @@
 > merge'е (`R-034` §B-2); ссылки внутри `R-031` и `PROJECT-STATE.md` приведены к новым
 > номерам тем же коммитом. Предмет долгов не менялся.
 
+- **TD-106** `main-красен-по-verify_design_claims-и-это-ненаблюдаемо-гейт-вне-CI`
+  (заведено reviewer'ом на PR-гейте `docs/retro-audit`, 2026-08-05, `R-034` §C.1;
+  **замер на чистом `origin/main` = `7a163f7`, не гипотеза**). **Severity: MAJOR.**
+  **Что.** `bash scripts/verify_design_claims.sh` на `main` даёт `VERDICT: FAIL (6 нарушений)`,
+  exit=1. Пять из шести — висячие ссылки на перемещённый файл: `0bd8b45` переименовал
+  `docs/ORCHESTRATION-STATE.md` → `docs/archive/orchestration-log-2026-07-08.md` (rename 100 %),
+  но входящие ссылки не переписаны — `docs/NEXT-SESSION-PROMPT.md:12,69,132` и
+  `docs/rfc/CT-RFC-06-l2delta.md:51` (последняя падает дважды: проверки 4 и 7).
+  Шестое — `docs/SESSION-HANDOFF.md:21` ссылается на
+  `docs/plans/workflow-audit-2026-08-einhard-vs-hft.md`, который лежит на невлитой ветке
+  `docs/workflow-audit` (реджект `R-034` §A) — это же класс, что инцидент C-062: индекс §0
+  называет артефактом файл вне `main`.
+  **Почему не поймали.** Гейт НЕ подключён к CI — предмет `Г3` аудита воркфлоу и его
+  рекомендации `6-3`; красное состояние видно только тому, кто вручную запустит скрипт.
+  Это ровно тот класс «гейт зеленее CI», который `gates.md` §3 называет не-гейтом.
+  **Смежное.** `TD-062` («`verify_design_claims.sh` не подключён к CI») — тот же корень;
+  TD-106 фиксирует, что корень уже дал плод, а не остаётся теоретическим.
+  **Зона правки — architect** (`docs/NEXT-SESSION-PROMPT.md`, `docs/rfc/CT-RFC-06-l2delta.md`
+  вне зоны записи reviewer'а). Ссылки в `PROJECT-STATE.md`/`TECH-DEBT.md` reviewer поправил
+  сам (`R-034` §C.2); в исторических вердиктах `research/**` ссылки НЕ трогались — они
+  правдивы для своего времени. **OPEN.**
+
 - **TD-103** `cancel_fraction-слепа-к-перерождению-уровня-метрика-смещена-в-сторону-вывода`
   (заведено reviewer'ом на ретро-аудите M-32/M-33, 2026-08-03, `R-031` §A.1; **проверено пробой
   на модуле, взятом вербатим из main**, не гипотеза).
@@ -1031,7 +1053,8 @@
   `--merge-preview origin/main` → `6-RFC-SHA` PASS (26 цитат), `7-RFC-PATH` PASS (104 пути),
   `VERDICT: PASS (0 нарушений)`, exit=0. **Побочный эффект шире, чем виделось при заведении:** на
   эти пути ссылались ПЯТЬ документов уже смёрженных в `main` (`PROJECT-STATE.md`, `TECH-DEBT.md`,
-  `docs/NEXT-SESSION-PROMPT.md`, `docs/ORCHESTRATION-STATE.md`,
+  `docs/NEXT-SESSION-PROMPT.md`, `docs/archive/orchestration-log-2026-07-08.md`
+  (тогда — `docs/ORCHESTRATION-STATE.md`, перемещён `0bd8b45`),
   `milestones/M-50-floor-scan-large-events.md`) — все висячие ссылки починены одним merge'ем.
   Ниже — исходная формулировка долга.
   (заведено reviewer'ом, `R-019` F1/F2, 2026-08-02; блокировало merge CT-RFC-06).
@@ -1921,7 +1944,9 @@
   `cargo clippy --workspace --all-targets -- -D warnings` — гейт, который поймал бы это за 10 секунд,
   **уже существовал и был написан тем же автором сутки назад** (`.claude/rules/gates.md` §3).
   Это не пробел инструмента, а пропуск прогона гейта перед push'ем; долг, который нечем «выплатить»
-  кодом. Достаточно разбора в `docs/ORCHESTRATION-STATE.md` + фиксации здесь.
+  кодом. Достаточно разбора в `docs/archive/orchestration-log-2026-07-08.md` (тогда —
+  `docs/ORCHESTRATION-STATE.md`, перемещён `0bd8b45`, rename 100 % — номера строк сохранены)
+  + фиксации здесь.
   **Что сработало и подлежит закреплению:** цепочка ролей поймала дефект за один шаг — dev не полез
   в чужой sacred-файл, tester не подменил красный прогон зелёным. Ровно то поведение, ради которого
   заведены `scope-guard.md` и Done Block.
