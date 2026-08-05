@@ -1933,6 +1933,10 @@ pub fn replay(
 pub struct ReadStats {
     pub events_decoded: u64,
     pub segments_opened: u32,
+    /// M-57 (TD-098), задача 5: честный счётчик ПРОЧИТАННЫХ событий (включая
+    /// отброшенные фильтром `after_seq`), проброшен из `journal::EventStream::events_scanned()`.
+    /// Аддитивен к `events_decoded` — не заменяет его, оба сохраняют свой смысл.
+    pub events_scanned: u64,
 }
 
 impl std::ops::Add for ReadStats {
@@ -1941,6 +1945,7 @@ impl std::ops::Add for ReadStats {
         Self {
             events_decoded: self.events_decoded + rhs.events_decoded,
             segments_opened: self.segments_opened + rhs.segments_opened,
+            events_scanned: self.events_scanned + rhs.events_scanned,
         }
     }
 }
@@ -1956,6 +1961,7 @@ fn read_stats_from_stream(stream: &journal::EventStream) -> ReadStats {
     ReadStats {
         events_decoded: stream.events_decoded(),
         segments_opened: stream.segments_opened(),
+        events_scanned: stream.events_scanned(),
     }
 }
 
