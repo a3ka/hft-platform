@@ -67,14 +67,13 @@ pub struct BandReport {
     pub side: Side,
     pub lo_bps: i64,
     pub hi_bps: i64,
-    /// Число уровней, рождённых в полосе за окно (size>0 хотя бы раз в contiguous-окне).
-    pub born: u64,
-    /// Из них: явно отменены биржей (size=0) до конца contiguous-окна.
-    pub cancelled: u64,
-    /// Из них: дожили до конца contiguous-окна без явного size=0 (= фантом-кандидат).
-    pub frozen: u64,
-    /// Из них: исчезли через sequence-GAP (= fate неизвестен; не отмена, не заморозка).
-    pub censored: u64,
+    pub lives_born: u64,
+    /// Из них: явно отменены биржей.
+    pub lives_cancelled: u64,
+    /// Из них: дожили до конца окна.
+    pub lives_frozen: u64,
+    /// Из них: исчезли через sequence-GAP.
+    pub lives_censored: u64,
 }
 
 impl BandReport {
@@ -82,11 +81,11 @@ impl BandReport {
     /// (M-32 §Инварианты). Если знаменатель 0 — возвращаем `None` (вся полоса — censored
     /// или пустая; долю считать бессмысленно).
     pub fn cancel_fraction(&self) -> Option<f64> {
-        let denom = self.cancelled.saturating_add(self.frozen);
+        let denom = self.lives_cancelled.saturating_add(self.lives_frozen);
         if denom == 0 {
             None
         } else {
-            Some(self.cancelled as f64 / denom as f64)
+            Some(self.lives_cancelled as f64 / denom as f64)
         }
     }
 }
@@ -141,6 +140,7 @@ struct LevelState {
 struct SideBook {
     book: BTreeMap<i64, i64>,
     states: BTreeMap<i64, LevelState>,
+    finished: Vec<(Option<i64>, Fate)>,
     /// Только ещё не атрибутированные новорождённые цены. В отличие от `states`, эта
     /// очередь не сканируется целиком каждый тик и обычно опустошается на том же тике.
     unattributed: VecDeque<i64>,
@@ -156,21 +156,37 @@ impl SideBook {
         for l in side_levels {
             if l.size == 0 {
                 self.book.remove(&l.price);
-                let was_alive = self.states.get_mut(&l.price).is_some_and(|state| {
-                    if state.fate == Fate::Alive {
-                        state.fate = Fate::Cancelled;
-                        true
-                    } else {
-                        false
+                if self
+                    .states
+                    .get(&l.price)
+                    .is_some_and(|state| state.fate == Fate::Alive)
+                {
+                    if let Some(state) = self.states.remove(&l.price) {
+                        if state.born_band_lo_bps.is_some() {
+                            self.finished
+                                .push((state.born_band_lo_bps, Fate::Cancelled));
+                        } else {
+                            self.states.insert(
+                                l.price,
+                                LevelState {
+                                    fate: Fate::Cancelled,
+                                    ..state
+                                },
+                            );
+                        }
                     }
-                });
-                if was_alive {
                     self.alive.remove(&l.price);
                 }
             } else if l.size > 0 {
-                let new_birth = !self.states.contains_key(&l.price);
                 self.book.insert(l.price, l.size);
+                let new_birth = self
+                    .states
+                    .get(&l.price)
+                    .is_none_or(|state| state.fate != Fate::Alive);
                 if new_birth {
+                    if let Some(old) = self.states.remove(&l.price) {
+                        self.finished.push((old.born_band_lo_bps, old.fate));
+                    }
                     self.states.insert(
                         l.price,
                         LevelState {
@@ -199,8 +215,8 @@ impl SideBook {
     /// fail-closed разрыва — O(1), поскольку `alive` уже пуст.
     fn apply_gap_censor(&mut self) {
         for price in std::mem::take(&mut self.alive) {
-            if let Some(state) = self.states.get_mut(&price) {
-                state.fate = Fate::Censored;
+            if let Some(state) = self.states.remove(&price) {
+                self.finished.push((state.born_band_lo_bps, Fate::Censored));
             }
         }
     }
@@ -208,8 +224,8 @@ impl SideBook {
     /// Конец окна: только всё ещё живые уровни → Frozen.
     fn freeze_remaining(&mut self) {
         for price in std::mem::take(&mut self.alive) {
-            if let Some(state) = self.states.get_mut(&price) {
-                state.fate = Fate::Frozen;
+            if let Some(state) = self.states.remove(&price) {
+                self.finished.push((state.born_band_lo_bps, Fate::Frozen));
             }
         }
     }
@@ -324,6 +340,16 @@ pub fn analyze(ticks: &[DeltaTick]) -> LifetimeReport {
         }
     }
 
+    for &(lo, fate) in &bids.finished {
+        let lo = lo.unwrap_or(BANDS_BPS[0].0);
+        bump_fate_with_side(
+            aggregates
+                .get_mut(&(side_rank(Side::Buy), lo))
+                .expect("полоса pre-init"),
+            Side::Buy,
+            fate,
+        );
+    }
     for state in bids.states.values() {
         // Вырожденный односторонний поток может так и не получить mid; такие рождения
         // детерминированно попадают в первую полосу.
@@ -332,6 +358,16 @@ pub fn analyze(ticks: &[DeltaTick]) -> LifetimeReport {
             .get_mut(&(side_rank(Side::Buy), lo))
             .expect("полоса pre-init");
         bump_fate_with_side(entry, Side::Buy, state.fate);
+    }
+    for &(lo, fate) in &asks.finished {
+        let lo = lo.unwrap_or(BANDS_BPS[0].0);
+        bump_fate_with_side(
+            aggregates
+                .get_mut(&(side_rank(Side::Sell), lo))
+                .expect("полоса pre-init"),
+            Side::Sell,
+            fate,
+        );
     }
     for state in asks.states.values() {
         let lo = state.born_band_lo_bps.unwrap_or(BANDS_BPS[0].0);
@@ -355,10 +391,10 @@ pub fn analyze(ticks: &[DeltaTick]) -> LifetimeReport {
                 side,
                 lo_bps: lo,
                 hi_bps: hi,
-                born,
-                cancelled,
-                frozen,
-                censored,
+                lives_born: born,
+                lives_cancelled: cancelled,
+                lives_frozen: frozen,
+                lives_censored: censored,
             }
         })
         .collect();
