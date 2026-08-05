@@ -20,24 +20,39 @@ FAILED=0
 pass() { echo "PASS  $*"; }
 fail() { echo "FAIL  $*"; FAILED=$((FAILED + 1)); }
 
-# run_tests <лог> <мин-число-исполненных> <описание> -- <команда...>
-# Зелёный ⇔ (а) команда вернула 0, (б) исполнено НЕ МЕНЬШЕ ожидаемого, (в) ни одного failed.
-run_tests() {
-  local log="$1" min="$2" what="$3"; shift 4
-  "$@" >"${log}" 2>&1
+# declared_tests <файл теста> — сколько #[test] объявлено в файле.
+# Порог берётся ИЗ КОДА, а не из головы: первая редакция этого гейта требовала «>=9»
+# в red_depth_lifetime.rs, где тестов 6, и давала ЛОЖНЫЙ КРАСНЫЙ. Страж, введённый
+# против ложных зелёных, сам нёс невымеренное число — та же болезнь этажом выше.
+declared_tests() { grep -c '^#\[test\]' "$1" 2>/dev/null || echo 0; }
+
+# run_oracle <имя-теста-без-.rs> <описание>
+# Зелёный ⇔ (а) команда вернула 0, (б) исполнено РОВНО столько, сколько объявлено в
+# файле, (в) ни одного failed. Равенство, а не «не меньше»: «>=» пропускает и пустой
+# прогон при нулевом пороге, и удаление тестов; равенство ловит и промах фильтра
+# («test result: ok. 0 passed» — ложный зелёный, стоивший пяти пустых прогонов
+# 2026-08-05), и молчаливую пропажу оракула.
+run_oracle() {
+  local name="$1" what="$2"
+  local file="crates/research-cli/tests/${name}.rs"
+  local log="/tmp/m59-${name}.log"
+  if [ ! -f "${file}" ]; then fail "${what} — файла ${file} нет"; return 1; fi
+  local want; want=$(declared_tests "${file}")
+  if [ "${want}" -lt 1 ]; then fail "${what} — в ${file} не объявлено ни одного #[test]"; return 1; fi
+  cargo test -p research-cli --test "${name}" >"${log}" 2>&1
   local rc=$? p f
   p=$(grep -hoE '^test result: [a-zA-Z]+\. [0-9]+ passed' "${log}" | awk '{s+=$4} END{print s+0}')
   f=$(grep -hoE '[0-9]+ failed' "${log}" | awk '{s+=$1} END{print s+0}')
   if [ "${rc}" -ne 0 ] || [ "${f}" -ne 0 ]; then
-    fail "${what} — исполнено ${p}, упало ${f}, exit=${rc}"
-    grep -E '^(test .* FAILED|thread .* panicked|DV-I-|error)' "${log}" | head -6 | sed 's/^/      ↳ /'
+    fail "${what} — исполнено ${p}/${want}, упало ${f}, exit=${rc}"
+    grep -E '^(test .* FAILED|thread .* panicked|DV-I-|error)' "${log}" | head -5 | sed 's/^/      ↳ /'
     return 1
   fi
-  if [ "${p}" -lt "${min}" ]; then
-    fail "${what} — исполнено ${p} тестов при ожидаемых ≥${min}: фильтр не совпал, прогон НЕДЕЙСТВИТЕЛЕН"
+  if [ "${p}" -ne "${want}" ]; then
+    fail "${what} — исполнено ${p}, объявлено ${want}: прогон НЕДЕЙСТВИТЕЛЕН (промах фильтра или пропажа теста)"
     return 1
   fi
-  pass "${what} — исполнено ${p}, упало 0"
+  pass "${what} — исполнено ${p}/${want}, упало 0"
   return 0
 }
 
@@ -60,15 +75,20 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings >/tmp/m59-c
 cargo fmt --all -- --check >/dev/null 2>&1 && pass "T2b fmt --check" || fail "T2b fmt --check"
 
 echo "--- T3: ГЛАВНОЕ — DV-I-15, память не растёт с числом ЖИЗНЕЙ ---"
-run_tests /tmp/m59-dv15.log 1 "T3 DV-I-15" -- \
-  cargo test -p research-cli --test red_lifetime_memory_bounded -- --nocapture
-grep -hoE 'DV-I-15: .*' /tmp/m59-dv15.log | head -1 | sed 's/^/      ЗАМЕР: /'
+run_oracle red_lifetime_memory_bounded "T3 DV-I-15"
+grep -hoE 'DV-I-15: .*' /tmp/m59-red_lifetime_memory_bounded.log 2>/dev/null | head -1 | sed 's/^/      ЗАМЕР: /'
 
 echo "--- T4: РЕГРЕСС — DV-I-1..14 остаются зелёными ---"
-run_tests /tmp/m59-perlife.log 5 "T4 per-life оракулы (DV-I-10..14)" -- \
-  cargo test -p research-cli --test red_depth_lifetime_perlife
-run_tests /tmp/m59-lifetime.log 9 "T4 базовые оракулы (DV-I-1..9)" -- \
-  cargo test -p research-cli --test red_depth_lifetime
+# Состав ИЗМЕРЕН грепом по tests/, а не взят по памяти: первая редакция гоняла один
+# файл и заявляла в тексте «DV-I-1..9», тогда как DV-I-6 живёт в red_orderflow_faith,
+# DV-I-7/8 — в red_depth_scale, DV-I-9 — в red_depth_band_3060. Шаг ВРАЛ о том, что
+# меряет: три оракула из девяти не запускались вовсе (testing.md «оракул обязан мерить
+# ТО, ЧТО ОБЕЩАЕТ»).
+run_oracle red_depth_lifetime          "T4 DV-I-1..5 (жизненный цикл)"
+run_oracle red_depth_lifetime_perlife  "T4 DV-I-10..14 (per-life)"
+run_oracle red_orderflow_faith         "T4 DV-I-6 (достоверность потока)"
+run_oracle red_depth_scale             "T4 DV-I-7,8 (масштаб/время)"
+run_oracle red_depth_band_3060         "T4 DV-I-9 (полоса 30-60%)"
 
 echo "--- T5: ЧИСЛА прогона не поехали (публичный контракт и артефакт замера) ---"
 # Фикс обязан менять РАСХОД, а не РЕЗУЛЬТАТ. Артефакт под founder-решением П-011 —
@@ -84,12 +104,19 @@ elif [ -z "${M59_JOURNAL:-}" ]; then
 else
   cargo run --release -p research-cli --example depth_lifetime -- "${M59_JOURNAL}" \
     >/tmp/m59-rerun.txt 2>/dev/null
-  if diff <(grep -oE '[0-9]+' "${ART}" | tr '\n' ' ') \
-          <(grep -oE '[0-9]+' /tmp/m59-rerun.txt | tr '\n' ' ') >/dev/null 2>&1; then
+  # Сравниваются ЧИСЛА СТРОК ДАННЫХ, а не все числа файла. Первая редакция грепала
+  # все цифры подряд и потому сравнивала ПОДПИСИ: артефакт снят под префиксом [M-32]
+  # и путём /tmp/m33-journal, откуда в него попали числа 32, 33, 2026, 07. После
+  # TD-108 подписи стали [M-58], эти числа исчезли — и гейт объявил «семантика
+  # изменилась», хотя изменились ярлыки. Оракул обязан мерить предмет, а не оформление.
+  data_nums() { grep -E '^(bid|ask|NEAR|FAR|orderflow)' "$1" | grep -oE '[0-9]+(\.[0-9]+)?' | tr '\n' ' '; }
+  if [ -z "$(data_nums "${ART}")" ]; then
+    fail "T5 в артефакте ${ART} не нашлось строк данных (bid/ask/NEAR/FAR/orderflow) — сверять нечего"
+  elif diff <(data_nums "${ART}") <(data_nums /tmp/m59-rerun.txt) >/dev/null 2>&1; then
     pass "T5 числа пересъёмки идентичны артефакту (изменился расход, не результат)"
   else
     fail "T5 ЧИСЛА РАЗОШЛИСЬ с ${ART} — фикс изменил семантику, а не только память"
-    diff <(grep -oE '[0-9]+' "${ART}") <(grep -oE '[0-9]+' /tmp/m59-rerun.txt) | head -6 | sed 's/^/      ↳ /'
+    diff <(data_nums "${ART}" | tr ' ' '\n') <(data_nums /tmp/m59-rerun.txt | tr ' ' '\n') | head -8 | sed 's/^/      ↳ /'
   fi
 fi
 
