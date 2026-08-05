@@ -335,3 +335,76 @@ $ git diff --stat origin/main...HEAD
 `pi-dev.sh`); `R-036` — 3 находки, включая регрессию того же класса в абзаце-исправлении;
 `R-037` — чисто. Документ уходит в `main` с корпусом замеров, каждый пункт которого предъявлен
 командой и exit-кодом.
+
+---
+
+## §K — Close-out: merge, деплой-гейт `gates.md` §8, GC — **выполнено**
+
+**Merge и ledger'ы:**
+
+```
+$ git log --oneline -3 origin/main
+a00c8de docs(state): close-out docs/workflow-audit — аудит в main (R-037 APPROVED), TD-106 …
+60aef9e merge(docs/workflow-audit): аудит воркфлоу einhard vs hft-platform — APPROVED R-037 …
+0f4892e docs(debt): TD-106 — симптом закрыт (cf24aac), корень OPEN; main зелёный …
+
+$ git show --numstat --format='' a00c8de
+32	13	PROJECT-STATE.md
+8	0	TECH-DEBT.md
+```
+
+**CI — оба коммита зелёные до терминального статуса:**
+
+```
+$ gh run watch 31056122871 --exit-status; echo exit=$?   # merge-коммит
+exit=0
+$ gh run watch 31056233111 --exit-status; echo exit=$?   # close-out ledger'ов
+exit=0
+
+$ gh run list --limit 3
+completed  success  docs(state): close-out docs/workflow-audit …   CI  main  push  31056233111  10m43s
+completed  success  merge(docs/workflow-audit): аудит воркфлоу …   CI  main  push  31056122871  10m52s
+completed  success  docs(debt): TD-106 — симптом закрыт …          CI  main  push  31054572965   7m47s
+```
+
+**Deploy НЕ запускался — и это корректно, а не пропуск гейта.** `deploy.yml` триггерится
+«пуш в main **по путям кода**»; оба коммита — `docs/plans/**`, `research/reviews/**`,
+`PROJECT-STATE.md`, `TECH-DEBT.md`. Развёртываемого не менялось, прод остаётся на `dca889a`
+(последний Deploy — `31052175517`, success).
+
+**Прод глазами (§8 п.2) — два замера с интервалом ~11 минут:**
+
+```
+$ ssh … 'docker ps --format "{{.Names}} {{.Status}}"; cat …/recorder.heartbeat'
+hft-gateway-serve Up About an hour (healthy)
+hft-recorder      Up About an hour (healthy)
+
+t1: {"events":235097,"next_seq":176510415,"segment_index":189,"ts_wall_ms":1785972257499,"writable":true}
+t2: {"events":279825,"next_seq":176555208,"segment_index":189,"ts_wall_ms":1785972907500,"writable":true}
+     Δt = 650.0 s · Δevents = +44 728 · Δseq = +44 793 — журнал растёт, heartbeat отстаёт на 9 s
+
+$ for p in $(pgrep -f recorder); do grep RssAnon /proc/$p/status; done
+RssAnon:  19616 kB          # норма; замер по RssAnon, не docker stats (TD-021)
+$ du -sh …/journal-data/_data → 37G · free_bytes 67.3 GB при min_free 10.7 GB
+```
+
+Содержательный sanity свежих событий не требуется: деплой не выполнялся, парсеры/форматы
+merge'ем не затронуты (0 строк кода).
+
+**Worktree-GC:**
+
+```
+$ bash scripts/gc_worktrees.sh; echo exit=$?
+REMOVED  hft-arch-wfaudit          # ветка предмета влита
+REMOVED  hft-rev-wfaudit3          # мой ревью-worktree
+REMOVED  hft-research-dev-1785969863
+worktree'ов осталось: 15
+VERDICT: GC DONE
+exit=0
+```
+
+Осталось у architect'а: удалить страховочную ветку `safety-r036` (локальная, на прежнем
+`d7f773c`) — её назначение исчерпано, целостность подтверждена §A.
+
+**Что merge разблокировал:** **M-60** (`C-064` F-064-1 — спека больше не опирается на замеры
+вне проверяемой цепочки) и пункт **6-3** как спроектированное лечение корня `TD-106`/`TD-062`.
