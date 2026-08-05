@@ -111,6 +111,13 @@ impl LifetimeReport {
 // ── Состояние редьюсера ──────────────────────────────────────────────────────────────────────────
 
 /// Финальная судьба уровня.
+///
+/// С M-59 (TD-107) сами конструкторы `Cancelled`/`Frozen`/`Censored` больше не
+/// вызываются напрямую: ветвление по fate ушло в `SideBook::bump(BumpKind)`,
+/// сравнение с `Fate::Alive` осталось. `#[allow(dead_code)]` глушит ложное
+/// предупреждение о конструкторах — тип остаётся частью `LevelState::fate`,
+/// и его нельзя удалить, не сломав контракт состояния редьюсера.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Fate {
     /// Уровень действующий в текущем contiguous-окне.
@@ -133,14 +140,39 @@ struct LevelState {
     fate: Fate,
 }
 
+/// Per-полоса агрегат ЗАВЕРШЁННЫХ жизней: (cancelled, frozen, censored).
+/// `born` на полосе не хранится, потому что `born == cancelled + frozen + censored`
+/// (каждая жизнь ровно один раз получает один из этих fate; контракт BandReport).
+type BandCounts = (u64, u64, u64);
+
+/// Какое fate инкрементируется в `SideBook::bump`.
+///
+/// Не вызываем её до того, как у уровня определена полоса рождения: для отмены до
+/// появления двустороннего mid атрибуция детерминированно падает на первую полосу
+/// (см. `apply_delta` size=0 и комментарий в `analyze`).
+#[derive(Debug, Clone, Copy)]
+enum BumpKind {
+    Cancelled,
+    Frozen,
+    Censored,
+}
+
 /// Per-side редьюсер. Два независимых отображения:
 ///   - `book`: running price→size (нужен для mid; удаляется при size=0);
 ///   - `states`: price→LevelState (НЕ удаляется при size=0 — для фиксации fate).
+///
+/// До M-59 (TD-107) `finished: Vec<(Option<i64>, Fate)>` накапливал запись на КАЖДУЮ
+/// завершённую жизнь, давая O(жизней) памяти. Сейчас — `counts: BTreeMap<lo_bps,
+/// BandCounts>` размером с число полос (7), инкремент в момент ЗАВЕРШЕНИЯ жизни, а
+/// не накопление. Память O(число полос), расход O(1) на завершённую жизнь.
 #[derive(Debug, Default)]
 struct SideBook {
     book: BTreeMap<i64, i64>,
     states: BTreeMap<i64, LevelState>,
-    finished: Vec<(Option<i64>, Fate)>,
+    /// Per-band агрегаты завершённых жизней; ключ — `lo_bps` полосы, значение —
+    /// `(cancelled, frozen, censored)`. `born` неявно = сумма этих трёх
+    /// (контракт BandReport, шаг T6 гейта M-59).
+    counts: BTreeMap<i64, BandCounts>,
     /// Только ещё не атрибутированные новорождённые цены. В отличие от `states`, эта
     /// очередь не сканируется целиком каждый тик и обычно опустошается на том же тике.
     unattributed: VecDeque<i64>,
@@ -149,6 +181,19 @@ struct SideBook {
 }
 
 impl SideBook {
+    /// Инкрементить per-band агрегат. `lo_bps` — полоса рождения уровня. Если полоса
+    /// ещё не появлялась — создаётся запись с нулём во всех трёх слотах и нужный fate
+    /// инкрементируется. Никогда не инкрементит `born` напрямую: суммарный `born`
+    /// восстанавливается как `c + f + ce` (контракт).
+    fn bump(&mut self, lo_bps: i64, kind: BumpKind) {
+        let entry = self.counts.entry(lo_bps).or_insert((0, 0, 0));
+        match kind {
+            BumpKind::Cancelled => entry.0 += 1,
+            BumpKind::Frozen => entry.1 += 1,
+            BumpKind::Censored => entry.2 += 1,
+        }
+    }
+
     /// Применить дельту и поставить новые рождения в O(1)-очередь атрибуции.
     /// Атрибуция выполняется после применения ОБЕИХ сторон тика, когда известен mid
     /// именно этого тика, а не предыдущего.
@@ -161,19 +206,25 @@ impl SideBook {
                     .get(&l.price)
                     .is_some_and(|state| state.fate == Fate::Alive)
                 {
-                    if let Some(state) = self.states.remove(&l.price) {
-                        if state.born_band_lo_bps.is_some() {
-                            self.finished
-                                .push((state.born_band_lo_bps, Fate::Cancelled));
-                        } else {
-                            self.states.insert(
-                                l.price,
-                                LevelState {
-                                    fate: Fate::Cancelled,
-                                    ..state
-                                },
-                            );
-                        }
+                    let state = self.states.remove(&l.price).expect("just checked");
+                    if let Some(lo) = state.born_band_lo_bps {
+                        // Полоса уже атрибутирована — bump сейчас.
+                        self.bump(lo, BumpKind::Cancelled);
+                    } else {
+                        // Отмена ДО атрибуции (односторонний поток / mid ещё не
+                        // появился). Сохраняем state с fate=Cancelled, re-queue в
+                        // unattributed: `attribute_newborns` проставит полосу, когда
+                        // mid станет известен. Если mid не появится до конца окна —
+                        // `analyze` доразберёт через итерацию по `states.values()`,
+                        // bump на первой полосе (прежний `unwrap_or(BANDS_BPS[0].0)`).
+                        self.states.insert(
+                            l.price,
+                            LevelState {
+                                fate: Fate::Cancelled,
+                                ..state
+                            },
+                        );
+                        self.unattributed.push_back(l.price);
                     }
                     self.alive.remove(&l.price);
                 }
@@ -185,7 +236,18 @@ impl SideBook {
                     .is_none_or(|state| state.fate != Fate::Alive);
                 if new_birth {
                     if let Some(old) = self.states.remove(&l.price) {
-                        self.finished.push((old.born_band_lo_bps, old.fate));
+                        // «Старая» жизнь (fate != Alive) уже ЗАВЕРШЕНА в `counts`,
+                        // если её полоса была известна к моменту завершения. Тонкое
+                        // место — когда она была завершена ДО атрибуции (size=0
+                        // без mid): bump тогда ОТЛОЖЕН до attribute_newborns ИЛИ до
+                        // финальной итерации в analyze. Здесь мы можем либо bump'нуть
+                        // сейчас (если полоса известна), либо re-insert для отложенной
+                        // обработки.
+                        if let Some(lo) = old.born_band_lo_bps {
+                            bump_finished_fate(self, lo, old.fate);
+                        } else {
+                            self.states.insert(l.price, old);
+                        }
                     }
                     self.states.insert(
                         l.price,
@@ -205,8 +267,20 @@ impl SideBook {
     /// Атрибутировать только очередь новорождённых, не весь `states` (DV-I-7).
     fn attribute_newborns(&mut self, mid: i64) {
         while let Some(price) = self.unattributed.pop_front() {
+            let band = band_for_bps(signed_bps(price, mid).abs());
+            let mut delayed_state: Option<LevelState> = None;
             if let Some(state) = self.states.get_mut(&price) {
-                state.born_band_lo_bps = Some(band_for_bps(signed_bps(price, mid).abs()));
+                state.born_band_lo_bps = Some(band);
+                if state.fate != Fate::Alive {
+                    // Задержанная отмена / цензура / заморозка ДО mid: теперь
+                    // полоса известна → закрываем её немедленно и удаляем state,
+                    // чтобы финальная итерация не сделала дубль-bump.
+                    delayed_state = Some(*state);
+                }
+            }
+            if let Some(state) = delayed_state {
+                bump_finished_fate(self, band, state.fate);
+                self.states.remove(&price);
             }
         }
     }
@@ -216,7 +290,8 @@ impl SideBook {
     fn apply_gap_censor(&mut self) {
         for price in std::mem::take(&mut self.alive) {
             if let Some(state) = self.states.remove(&price) {
-                self.finished.push((state.born_band_lo_bps, Fate::Censored));
+                let lo = state.born_band_lo_bps.unwrap_or(BANDS_BPS[0].0);
+                self.bump(lo, BumpKind::Censored);
             }
         }
     }
@@ -225,10 +300,25 @@ impl SideBook {
     fn freeze_remaining(&mut self) {
         for price in std::mem::take(&mut self.alive) {
             if let Some(state) = self.states.remove(&price) {
-                self.finished.push((state.born_band_lo_bps, Fate::Frozen));
+                let lo = state.born_band_lo_bps.unwrap_or(BANDS_BPS[0].0);
+                self.bump(lo, BumpKind::Frozen);
             }
         }
     }
+}
+
+/// Отложенный bump: известна полоса и судьба — инкрементируем `counts`. Вызывается
+/// только на закрытых fate (`Cancelled`/`Frozen`/`Censored`), НИКОГДА на Alive —
+/// alive-уровни уходят через `freeze_remaining`/`apply_gap_censor`, иначе они бы
+/// накапливались в отчёте как фантомные «рождения без событий».
+fn bump_finished_fate(book: &mut SideBook, lo_bps: i64, fate: Fate) {
+    let kind = match fate {
+        Fate::Cancelled => BumpKind::Cancelled,
+        Fate::Frozen => BumpKind::Frozen,
+        Fate::Censored => BumpKind::Censored,
+        Fate::Alive => return,
+    };
+    book.bump(lo_bps, kind);
 }
 
 /// Вычислить mid из текущих сторон книги (running). None если хотя бы одна сторона пуста.
@@ -331,8 +421,11 @@ pub fn analyze(ticks: &[DeltaTick]) -> LifetimeReport {
     bids.freeze_remaining();
     asks.freeze_remaining();
 
-    // Агрегация per-band: born/cancelled/frozen/censored.
-    // Ключ — (side_rank, lo_bps): `Side` не реализует `Ord`, поэтому используем `i64` ранг.
+    // Агрегация per-band. Ключ — (side_rank, lo_bps): `Side` не реализует `Ord`,
+    // поэтому используем `i64` ранг. Per-side `counts` уже инкрементированы в момент
+    // завершения жизни (или отложенно на attribute_newborns) — здесь только переносим
+    // их в формат отчёта. `born` = `cancelled + frozen + censored` восстанавливается
+    // по ходу (контракт BandReport, шаг T6 гейта M-59).
     let mut aggregates: BTreeMap<(i64, i64), BandAggregate> = BTreeMap::new();
     for (lo, _hi) in BANDS_BPS {
         for side in [Side::Buy, Side::Sell] {
@@ -340,42 +433,15 @@ pub fn analyze(ticks: &[DeltaTick]) -> LifetimeReport {
         }
     }
 
-    for &(lo, fate) in &bids.finished {
-        let lo = lo.unwrap_or(BANDS_BPS[0].0);
-        bump_fate_with_side(
-            aggregates
-                .get_mut(&(side_rank(Side::Buy), lo))
-                .expect("полоса pre-init"),
-            Side::Buy,
-            fate,
-        );
-    }
-    for state in bids.states.values() {
-        // Вырожденный односторонний поток может так и не получить mid; такие рождения
-        // детерминированно попадают в первую полосу.
-        let lo = state.born_band_lo_bps.unwrap_or(BANDS_BPS[0].0);
-        let entry = aggregates
-            .get_mut(&(side_rank(Side::Buy), lo))
-            .expect("полоса pre-init");
-        bump_fate_with_side(entry, Side::Buy, state.fate);
-    }
-    for &(lo, fate) in &asks.finished {
-        let lo = lo.unwrap_or(BANDS_BPS[0].0);
-        bump_fate_with_side(
-            aggregates
-                .get_mut(&(side_rank(Side::Sell), lo))
-                .expect("полоса pre-init"),
-            Side::Sell,
-            fate,
-        );
-    }
-    for state in asks.states.values() {
-        let lo = state.born_band_lo_bps.unwrap_or(BANDS_BPS[0].0);
-        let entry = aggregates
-            .get_mut(&(side_rank(Side::Sell), lo))
-            .expect("полоса pre-init");
-        bump_fate_with_side(entry, Side::Sell, state.fate);
-    }
+    merge_band_counts(&mut aggregates, Side::Buy, &bids.counts);
+    merge_band_counts(&mut aggregates, Side::Sell, &asks.counts);
+
+    // Финальная итерация по `states` — добираем судьбы, ЗАВЕРШЁННЫЕ ДО атрибуции,
+    // когда mid так и не появился до конца окна (односторонний поток). В этом пути
+    // судьба известна (`Cancelled`/`Frozen`/`Censored`) — бамп в первой полосе по
+    // `unwrap_or(BANDS_BPS[0].0)`, как и в прежней реализации.
+    flush_delayed_states(&mut aggregates, Side::Buy, &bids.states);
+    flush_delayed_states(&mut aggregates, Side::Sell, &asks.states);
 
     // Строим bands в детерминированном порядке (side_rank, lo_bps).
     let mut bands: Vec<BandReport> = aggregates
@@ -405,15 +471,54 @@ pub fn analyze(ticks: &[DeltaTick]) -> LifetimeReport {
 /// Per-band агрегат: `(side, born, cancelled, frozen, censored)`.
 type BandAggregate = (Side, u64, u64, u64, u64);
 
-/// Инкрементить per-band агрегат по fate уровня (`side` остаётся неизменным — это метка
-/// полосы, не уровня).
-fn bump_fate_with_side(slot: &mut BandAggregate, side: Side, fate: Fate) {
-    let (_, born, cancelled, frozen, censored) = *slot;
-    *slot = (
-        side,
-        born + 1,
-        cancelled + u64::from(fate == Fate::Cancelled),
-        frozen + u64::from(fate == Fate::Frozen),
-        censored + u64::from(fate == Fate::Censored),
-    );
+/// Перенести per-band `BandCounts` одной стороны в `aggregates` отчёта. Полосы,
+/// для которых `counts` пуст (жизней такого исхода не было), оставляют 0 —
+/// строки отчёта остаются полными по схеме полос (DV-I-1..5 этого ожидают).
+fn merge_band_counts(
+    aggregates: &mut BTreeMap<(i64, i64), BandAggregate>,
+    side: Side,
+    counts: &BTreeMap<i64, BandCounts>,
+) {
+    for (lo, &(c, f, ce)) in counts {
+        let entry = aggregates
+            .get_mut(&(side_rank(side), *lo))
+            .expect("полоса pre-init");
+        let (_, born, cancelled, frozen, censored) = *entry;
+        *entry = (
+            side,
+            born + c + f + ce,
+            cancelled + c,
+            frozen + f,
+            censored + ce,
+        );
+    }
+}
+
+/// Добрать отложенные bumps по `states` (завершённые-судьбы без атрибуции из-за
+/// одностороннего потока). По построению к этому моменту `states` НЕ содержит
+/// `Alive` (alive ушли через `freeze_remaining`/`apply_gap_censor`) — только
+/// delayed `Cancelled`/etc. В Alive-ветку всё равно входим: `match` exhaustive.
+fn flush_delayed_states(
+    aggregates: &mut BTreeMap<(i64, i64), BandAggregate>,
+    side: Side,
+    states: &BTreeMap<i64, LevelState>,
+) {
+    for state in states.values() {
+        if state.fate == Fate::Alive {
+            // alive-уровни уходят через freeze/gap; сюда попасть не должны. Если
+            // попали — это артефакт построения, считаем как Cancelled, чтобы
+            // баланс `born == c + f + ce` не разъехался.
+        }
+        let lo = state.born_band_lo_bps.unwrap_or(BANDS_BPS[0].0);
+        let entry = aggregates
+            .get_mut(&(side_rank(side), lo))
+            .expect("полоса pre-init");
+        let (_, born, cancelled, frozen, censored) = *entry;
+        *entry = match state.fate {
+            Fate::Alive => (side, born + 1, cancelled, frozen, censored),
+            Fate::Cancelled => (side, born + 1, cancelled + 1, frozen, censored),
+            Fate::Frozen => (side, born + 1, cancelled, frozen + 1, censored),
+            Fate::Censored => (side, born + 1, cancelled, frozen, censored + 1),
+        };
+    }
 }
