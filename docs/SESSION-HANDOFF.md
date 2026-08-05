@@ -18,7 +18,7 @@
 | **M-57** — пересканирование активного сегмента | dev отработал задачи 1/2/5; **гейт прогнан architect'ом**; следующий — tester | `C-059` + `C-060` (оба REJECT, закрыты) | `feat/M-57-tail-follower` (12) |
 | **M-58** — метрика на ЖИЗНЬ, не на цену | круг 2 после REJECT; следующий — **re-review** | `R-033-M-58.md` | `feat/M-58-depth-metric` (20) |
 | ретро-аудит M-32/33/34 | завершён | `R-031-retro-audit.md` | `docs/retro-audit` (1) |
-| **аудит воркфлоу einhard vs наш** | завершён | `docs/plans/workflow-audit-2026-08-einhard-vs-hft.md` | `docs/workflow-audit` (1) |
+| **аудит воркфлоу einhard vs наш** | REJECT на PR-гейте (`R-034`), круг 2 | файл `workflow-audit-2026-08-einhard-vs-hft.md` — **на ветке, НЕ в `main`** | `docs/workflow-audit` |
 | **M-60** — механизм вместо прозы | спека переписывается под выводы аудита | `C-062` (ветка `feat/M-60-mechanisms`, НЕ в `main`; статус: консультация, не гейт) | — |
 
 **Очередь (founder, 2026-08-04):** M-57 → внедрение пунктов аудита 6-1/6-3 (механизмы в CI)
