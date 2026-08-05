@@ -394,9 +394,49 @@ CI на push всё равно прогонит их целиком; пруф �
 
 ---
 
-# §E — Пост-merge (§8) и статус push
+# §E — Пост-merge деплой-гейт (`gates.md` §8)
 
-Заполняется по факту в том же ответе — см. Handoff §C.
+**Push:** `7a163f7..55e8189 HEAD -> main` (exit=0). Отдельно вердикт положен на ветку
+предмета реджекта: `08ef175..1af58cc HEAD -> docs/workflow-audit` — чтобы следующий круг
+читал находки на своей ветке, а не искал их в переписке (`gates.md` §4, урок M-49).
+
+Перед push'ем на `docs/workflow-audit` доказана МОЛЧАНИЕ автора, а не пустота
+(`branch-hygiene.md` п.8): worktree `/tmp/hft-audit-wf` чист, HEAD не двигался с
+`2026-08-05T00:02Z`, mtime предмета — `00:02:18`, замер в `20:47Z` ⇒ сессия аудитора
+завершена ~20 ч назад.
+
+```
+$ gh run list --limit 3
+completed  success  docs(review): R-034 — PR-гейт двух doc-веток; retro-audit APPROVED, w…  CI  main  push  31045724018  10m51s  2026-08-05T20:47:12Z
+completed  success  docs(handoff): §0 — C-062 значился в main, фактически на невлитой вет…  CI  main  push  31000261420   9m53s  2026-08-05T11:08:32Z
+completed  success  docs(audit 6-2): ORCHESTRATION-STATE убран из startup-протокола, журн…  CI  main  push  30962905160  10m57s  2026-08-05T00:19:15Z
+
+$ gh run watch 31045724018 --exit-status
+✓ All checks passed
+watch_exit=0
+
+$ gh run list --workflow=deploy.yml --limit 1
+completed  success  merge(M-56): снапшот без клонирования состояния …  Deploy to VPS  main  push  30850551377  2026-08-03T20:31:02Z
+# Deploy НЕ триггерился — path-фильтр (crates/**, Cargo.*), диф merge'а чисто документный.
+# Значит рестарта recorder'а нет; проверка ниже подтверждает это по uptime, а не по вере.
+
+$ ssh -i /home/nous/.ssh/hft_deploy -o IdentitiesOnly=yes root@167.233.192.131 \
+    'docker ps --format "{{.Names}} {{.Status}}"; cat .../recorder.heartbeat; date -u +%s'
+hft-gateway-serve Up 2 days (healthy)
+hft-recorder      Up 2 days (healthy)
+{"events":16398646,"free_bytes":68840169472,"min_free_bytes":10737418240,
+ "next_seq":175768396,"segment_index":188,"ts_wall_ms":1785963496420,"writable":true}
+1785963500
+```
+
+**Чтение пруфа:** `Up 2 days` у обоих контейнеров = рестарта не было (ожидаемо: deploy не
+запускался) · heartbeat свежий на **4 секунды** (`1785963500 − 1785963496`) · журнал растёт:
+`next_seq` 159 121 674 → **175 768 396**, сегмент 167 → **188** относительно замера
+2026-08-03 · `writable: true`, свободно 68.8 GB при пороге 10 GB.
+
+Содержательный sanity свежих событий не требуется: деплой не выполнялся, поведение данных
+merge не менял (диф пуст по `crates/`) — то есть условие «деплой менял парсеры/форматы»
+из §8 п.2 не наступило.
 
 # §F — Вердикт
 
