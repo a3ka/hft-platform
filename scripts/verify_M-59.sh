@@ -73,6 +73,12 @@ cargo build --workspace >/dev/null 2>&1 && pass "T1 build --workspace" || fail "
 cargo clippy --workspace --all-targets --all-features -- -D warnings >/tmp/m59-clippy.log 2>&1 \
   && pass "T2 clippy" || { fail "T2 clippy"; tail -5 /tmp/m59-clippy.log | sed 's/^/      ↳ /'; }
 cargo fmt --all -- --check >/dev/null 2>&1 && pass "T2b fmt --check" || fail "T2b fmt --check"
+# F-3 (R-038): заголовок шага ЗАЯВЛЯЛ паритет с CI-job «fmt+clippy+test», а `cargo test --all`
+# в скрипте отсутствовал. Гейт, который зеленее CI, — не гейт (gates.md §3). Повтор R-033 F-4:
+# ту же дыру уже находили на M-58, и она воспроизвелась здесь.
+cargo test --all >/tmp/m59-testall.log 2>&1 \
+  && pass "T2c cargo test --all" \
+  || { fail "T2c cargo test --all"; grep -E "^test .* FAILED|^error" /tmp/m59-testall.log | head -5 | sed "s/^/      ↳ /"; }
 
 echo "--- T3: ГЛАВНОЕ — DV-I-15, память не растёт с числом ЖИЗНЕЙ ---"
 run_oracle red_lifetime_memory_bounded "T3 DV-I-15"
