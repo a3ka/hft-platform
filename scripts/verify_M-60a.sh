@@ -64,7 +64,12 @@ else
   fail "S замка нет — самореференцию проверять нечем"
 fi
 
-echo "--- W: ПОДКЛЮЧЁННОСТЬ к CI (разбором workflow, не грепом) ---"
+echo "--- W: ПРЕДУСЛОВИЯ блокировки со стороны репозитория (решение §3ter — б) ---"
+# Гейт НЕ доказывает, что красное блокирует merge: этого факта в репозитории НЕТ.
+# Блокировку включает branch protection GitHub — настройка, а не файл. Четыре круга
+# критика ужесточали доказательство недоказуемого. Здесь проверяются ТРИ предусловия,
+# которые содержимое репо подтвердить может; их отсутствие означает, что блокировки
+# точно нет. Вторая половина вынесена долгом (спека §3ter).
 if [ ! -f "${CI}" ]; then
   fail "W ${CI} отсутствует"
 else
@@ -138,10 +143,10 @@ else:
         cmp_re = r'needs\.' + re.escape(j) + r'\.result[^\n]{0,60}?(!=|==)'
         in_guard = (re.search(cmp_re, guard) is not None) and (re.search(r'exit\s+1', guard) is not None)
         if in_needs and in_guard:
-            print("PASS  W %s: в needs И в сверке needs.%s.result — красное блокирует merge" % (j, j))
+            print("PASS  W %s: в needs И в сверке needs.%s.result — предусловия 2-3 выполнены" % (j, j))
         elif in_needs and always and not in_guard:
             print("FAIL  W %s в needs, но status-check с `if: always()` НЕ сверяет needs.%s.result "
-                  "— результат лишь упоминается/логируется, красное НЕ блокирует merge" % (j, j)); ok = False
+                  "— результат лишь упоминается/логируется: предусловие 3 НЕ выполнено" % (j, j)); ok = False
         elif not in_needs:
             print("FAIL  W %s отсутствует в status-check.needs" % j); ok = False
         else:
