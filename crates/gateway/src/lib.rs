@@ -1874,6 +1874,15 @@ pub fn frames_since_with_stats(
     max_events: usize,
 ) -> io::Result<(Vec<Frame>, Cursor, ReadStats)> {
     validate_selector(sel)?;
+    // M-57 (круг 2, задача 9): используем `stream_from` (без hint). Это STATELESS-
+    // функция: `after` приходит от вызывающего, и у вызывающего нет места, где
+    // держать `TailHint` (единственное per-session состояние для M-57 круг 2 —
+    // `LiveReducer::tail_hint`, и там уже используется `stream_from_at` в hot
+    // live-push пути). После удаления sidecar этот вызов делает полный forward-
+    // скан активного сегмента — идентично `main` до M-57, не регресс. См. §8
+    // milestone'а: путь НЕ покрыт M-57; если станет горячим — отдельная задача
+    // (перевод сигнатуры `frames_since` на `Option<TailHint>` или расширение
+    // `Cursor`, оба — scope-expansion за пределы engine-dev).
     let mut stream = journal::stream_from(dir, filter, after.upto_seq)?;
     let (delta, cursor, consumed, at_ms, _first_folded_seq) =
         reduce_event_stream(&mut stream, sel, after, Cursor::LATEST, max_events)?;
@@ -2000,6 +2009,14 @@ pub fn snapshot_from_checkpoint(
             // skip). Редусер инициализируется восстановленным состоянием, и на нём
             // прогоняются ТОЛЬКО НОВЫЕ события — байт-идентично полному реплею.
             state.selector = sel.clone();
+            // M-57 (круг 2, задача 9): используем `stream_from` (без hint).
+            // Это STATELESS-функция: `ckpt_cursor` приходит из восстановленного
+            // чекпоинта, и per-session `TailHint` здесь негде держать (для hot
+            // live-push пути он в `LiveReducer::tail_hint` + `stream_from_at`).
+            // После удаления sidecar этот вызов делает полный forward-скан
+            // активного сегмента — идентично `main` до M-57, не регресс. Путь
+            // НЕ покрыт M-57 — см. §8 milestone'а; отдельная задача, если станет
+            // узким местом (scope-expansion сигнатуры `snapshot_from_checkpoint`).
             let mut stream = journal::stream_from(dir, filter.clone(), ckpt_cursor.upto_seq)?;
             let mut cursor = ckpt_cursor;
             for event in &mut stream {
@@ -2523,6 +2540,15 @@ pub mod checkpoint {
         // (3) Докорм хвостом: только `seq > base_cursor.upto_seq` (A) или всё (B).
         // Используем `stream_from` (GW-I-11 сегментный skip — НЕ читаем уже
         // покрытый префикс).
+        //
+        // M-57 (круг 2, задача 9): `stream_from` без hint — этот вызов STATELESS
+        // (`base_cursor` из чекпоинта, per-session `TailHint` негде держать —
+        // он живёт в `LiveReducer::tail_hint`, а это `checkpoint::advance_to`,
+        // вызываемый из `gateway-checkpoint` периодически раз в 5–15 мин, не
+        // hot live-push). После удаления sidecar вызов делает полный forward-
+        // скан активного сегмента — идентично `main` до M-57, не регресс.
+        // Путь НЕ покрыт M-57 — см. §8 milestone'а; отдельная задача при
+        // необходимости (scope-expansion сигнатуры `advance_to`).
         let mut final_cursor = base_cursor;
         let mut first_folded_seq: u64 = history_start_seq; // None-ветка: остаётся 0; Some: уже выставлен
         let mut consumed = 0_usize;

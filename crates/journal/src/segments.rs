@@ -107,24 +107,19 @@ impl EpochFilter {
 /// Имя манифеста легаси-деклараций (CT-RFC-02 rev 2).
 pub const LEGACY_MANIFEST: &str = "journal.legacy.json";
 
-// === M-57 (TD-109), задача 2: sidecar byte-offset курсора в активном сегменте ===
+// === M-57 (TD-109), круг 2: in-memory курсор хвоста активного сегмента ===
 
-/// Файл с курсором последнего чтения в активном сегменте.
+/// КУРСОР ХВОСТА активного сегмента, передаваемый через API.
 ///
-/// Формат: 20 байт
-///   `[u32 LE seg_idx][u64 LE last_decoded_seq][u64 LE byte_offset]`
+/// Прежняя (M-57 задача 2) реализация хранила эту же тройку полей в файловом
+/// sidecar `journal.tail-offset` ВНУТРИ каталога журнала и обновляла его в
+/// `EventStream::drop`. Это не работало на проде (`R-035` F-035-1: `gateway-serve`
+/// монтирует журнал `:ro`, запись sidecar молча проваливалась, активный сегмент
+/// пересканировался каждый тик) и приводило к драке сессий за общий курсор
+/// (F-035-2). С кругом 2 sidecar удалён целиком (задача 9); курсор живёт только
+/// в `LiveReducer::tail_hint` и передаётся через [`stream_from_at`]. Семантика
+/// полей сохранена:
 ///
-/// - `seg_idx` — индекс активного сегмента, в котором шло чтение.
-/// - `last_decoded_seq` — `seq` ПОСЛЕДНЕГО декодированного события. Используется
-///   для решения «использовать ли курсор»: только если запрошенный `after_seq >=
-///   last_decoded_seq` (то есть пользователь хочет события, которых мы ещё не видели).
-///   При `after_seq < last_decoded_seq` sidecar бесполезен (юзер хочет события из
-///   прочитанной зоны) — выполняется обычный forward-scan от начала активного сегмента.
-/// - `byte_offset` — позиция в файле сегмента СРАЗУ ПОСЛЕ фрейма последнего события.
-///
-/// TailHint — это КУРСОР ХВОСТА активного сегмента, передаваемый через API.
-/// Это ТО ЖЕ САМОЕ, что прежде хранил файловый sidecar (`TAIL_OFFSET_FILE`),
-/// но в форме, пригодной для in-memory передачи между `pump()`-ами. Семантика:
 /// - `seg_idx`: индекс активного сегмента, в котором шло чтение.
 /// - `last_seq`: `seq` ПОСЛЕДНЕГО декодированного события (не yielded — а
 ///   именно декодированного; для хвоста после приращения это даёт истинную
@@ -140,52 +135,6 @@ pub struct TailHint {
     pub seg_idx: u32,
     pub last_seq: u64,
     pub pos: u64,
-}
-
-/// Sidecar НЕ является источником истины — это оптимизация. Если его нет / он
-/// повреждён / не подходит по `seg_idx`/`after_seq`, `stream_from` спокойно делает
-/// forward-scan. Сравнение byte-идентичности кадров (O-4) гарантирует, что мы
-/// получаем тот же поток событий, что и полный проход.
-pub const TAIL_OFFSET_FILE: &str = "journal.tail-offset";
-
-/// Прочитать sidecar `(seg_idx, last_decoded_seq, offset)`. `None` если файла нет
-/// или он короче 20 байт (частичная запись / устаревший формат).
-pub(crate) fn read_tail_offset(dir: &Path) -> io::Result<Option<(u32, u64, u64)>> {
-    let path = dir.join(TAIL_OFFSET_FILE);
-    match std::fs::read(&path) {
-        Ok(bytes) if bytes.len() >= 20 => {
-            let seg_idx = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
-            let last_decoded_seq = u64::from_le_bytes(bytes[4..12].try_into().unwrap());
-            let offset = u64::from_le_bytes(bytes[12..20].try_into().unwrap());
-            Ok(Some((seg_idx, last_decoded_seq, offset)))
-        }
-        Ok(_) => Ok(None),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e),
-    }
-}
-
-/// Записать sidecar атомарно (tmp + rename). В `.tmp` дописываем суффикс явно —
-/// `Path::with_extension` на `journal.tail-offset` дал бы `journal.tail.tmp`,
-/// что не то.
-pub(crate) fn write_tail_offset(
-    dir: &Path,
-    seg_idx: u32,
-    last_decoded_seq: u64,
-    offset: u64,
-) -> io::Result<()> {
-    let path = dir.join(TAIL_OFFSET_FILE);
-    let mut bytes = [0u8; 20];
-    bytes[0..4].copy_from_slice(&seg_idx.to_le_bytes());
-    bytes[4..12].copy_from_slice(&last_decoded_seq.to_le_bytes());
-    bytes[12..20].copy_from_slice(&offset.to_le_bytes());
-
-    let mut tmp_name = path.as_os_str().to_owned();
-    tmp_name.push(".tmp");
-    let tmp = PathBuf::from(tmp_name);
-    fs::write(&tmp, bytes)?;
-    fs::rename(&tmp, &path)?;
-    Ok(())
 }
 
 // === Маркеры ошибок (для type-based проверок в тестах и проде) ===
@@ -928,9 +877,15 @@ pub struct StorageStatus {
 ///   отфильтрованные) — см. комментарий на поле.
 /// - задача 2: `reader` стал `Option<StreamReader>`, где `Active` — позиция-
 ///   трекающий reader для АКТИВНОГО raw-сегмента (M-57 byte-offset seek); `Passive`
-///   — тот же `Box<dyn Read>`, что и до M-57 (zst, closed raw). На Drop sidecar
-///   `journal.tail-offset` обновляется, чтобы следующий `stream_from` применил
-///   `SeekFrom::Start(offset)` вместо forward-скана всего сегмента.
+///   — тот же `Box<dyn Read>`, что и до M-57 (zst, closed raw). Следующий
+///   `stream_from_at` с hint'ом из `tail_hint()` применит `SeekFrom::Start(pos)`
+///   вместо forward-скана всего активного сегмента.
+/// - круг 2, задача 9: sidecar `journal.tail-offset` УДАЛЁН целиком. Курсор
+///   хранится ТОЛЬКО в `LiveReducer` (`TailHint`), передаётся через
+///   `stream_from_at(..., hint)` и обновляется через `EventStream::tail_hint()`.
+///   Решает `F-035-1` (запись sidecar на `:ro`-каталоге прода молча проваливалась)
+///   и `F-035-2` (один курсор на каталог дрался у N сессий). Старый API
+///   `stream_from` теперь ВСЕГДА делает полный forward-скан активного сегмента.
 pub struct EventStream {
     segments: Vec<SegmentInfo>,
     selected_headers: Vec<SegmentHeader>,
@@ -962,12 +917,6 @@ pub struct EventStream {
     /// (эквивалентно `stream`). Внутрисегментный forward-фильтр `seq > after` тоже
     /// активен (zstd не Seek).
     after_seq: Option<u64>,
-    /// M-57, задача 2: `seq` последнего декодированного события — для sidecar.
-    last_decoded_seq: Option<u64>,
-    /// M-57, задача 2: позиция в активном raw-сегменте сразу ПОСЛЕ последнего
-    /// декодированного события — для sidecar. None если активный сегмент не
-    /// открывался или в нём ничего не декодировали.
-    active_tail_pos: Option<u64>,
     /// M-57 (круг 2, TD-109): `TailHint`, переданный в `stream_from_at` из
     /// предыдущего `pump()`. Используется для seek'а в активный сегмент
     /// БЕЗ sidecar-файла — состояние СЕССИИ, а не каталога. `None` — впервые
@@ -978,8 +927,6 @@ pub struct EventStream {
     /// в `None` при EOF сегмента. Через этот метод `LiveReducer::pump` забирает hint
     /// и сохраняет в `self.tail_hint` для следующего тика.
     active_tail_hint: Option<TailHint>,
-    /// M-57, задача 2: каталог журнала — нужен `Drop` для sidecar-записи.
-    dir: PathBuf,
 }
 
 /// Внутренний reader [`EventStream`]'а: активный (с трекингом pos для seek) или
@@ -1089,11 +1036,12 @@ impl EventStream {
     /// первого вызова `next()` — сегменты с `last_seq <= after_seq` (last = `first_seq`
     /// следующего − 1) удаляются из self.segments до перехода сюда.
     ///
-    /// **M-57 (TD-109), задача 2:** для АКТИВНОГО raw-сегмента (последний в `self.segments`)
-    /// открываем через [`PositionedBufReader`] и применяем byte-offset seek, если
-    /// sidecar валиден: `seg_idx` совпадает с активным И `after >= last_decoded_seq`.
-    /// В остальных случаях (zst / closed raw / первый запуск / ротация / `after <
-    /// last_decoded_seq`) — обычный forward-scan с начала сегмента, как раньше.
+    /// **M-57 (TD-109), задача 2 + круг 2 задача 9:** для АКТИВНОГО raw-сегмента
+    /// (последний в `self.segments`) открываем через [`PositionedBufReader`] и
+    /// применяем byte-offset seek из `self.hint` (`TailHint`), если ВСЕ условия
+    /// валидации в [`Self::resolve_active_start_offset`] выполнены. В остальных
+    /// случаях (zst / closed raw / первый запуск / ротация / `after < hint.last_seq`)
+    /// — обычный forward-scan с начала сегмента, как раньше.
     fn open_next_segment(&mut self) -> io::Result<bool> {
         if self.cursor >= self.segments.len() {
             self.reader = None;
@@ -1136,8 +1084,8 @@ impl EventStream {
     /// Возвращает абсолютное смещение в файле (`>= header_end`).
     ///
     /// Применяем hint ТОЛЬКО если ВСЁ из следующего:
-    /// 1. `self.hint` задан (либо передан в `stream_from_at`, либо прочитан из sidecar
-    ///    внутри `stream_from` для backward-compat);
+    /// 1. `self.hint` задан (передан в `stream_from_at` из `LiveReducer::tail_hint`
+    ///    предыдущего `pump()`);
     /// 2. `hint.seg_idx == индекс активного сегмента` (иначе — ротация, hint относится
     ///    к уже закрытому сегменту; пользоваться им нельзя);
     /// 3. `hint.pos >= header_end` (защита от повреждённого/обнулённого смещения);
@@ -1185,30 +1133,6 @@ impl EventStream {
     }
 }
 
-impl Drop for EventStream {
-    /// M-57, задача 2: на каждом drop'е сохраняем sidecar с текущей позицией
-    /// в активном сегменте. «Ленивая» фиксация: пишем только если был хоть
-    /// один декодированный event в активном сегменте, иначе sidecar остаётся
-    /// прежним.
-    ///
-    /// Запись НАМЕРЕННО НЕ критична: на отказе sidecar просто остаётся старым,
-    /// и следующий `stream_from` сделает forward-scan. Источник истины — сам
-    /// сегмент, а не sidecar.
-    fn drop(&mut self) {
-        let (Some(pos), Some(last_seq)) = (self.active_tail_pos, self.last_decoded_seq) else {
-            return;
-        };
-        let seg_idx = self
-            .segments
-            .last()
-            .and_then(|s| s.path.file_name())
-            .and_then(OsStr::to_str)
-            .and_then(parse_segment_index_any)
-            .unwrap_or(0);
-        let _ = write_tail_offset(&self.dir, seg_idx, last_seq, pos);
-    }
-}
-
 impl Iterator for EventStream {
     type Item = io::Result<Event>;
 
@@ -1217,7 +1141,7 @@ impl Iterator for EventStream {
             if self.reader.is_some() {
                 // Делаем чтение, пока self.reader заимствован. После возврата из
                 // `read_event_frame` все заимствования внутри `r` отпущены —
-                // можно снова обращаться к `self.reader` для sidecar-апдейта.
+                // можно снова обращаться к `self.reader` для обновления `active_tail_hint`.
                 let read_outcome = match self.reader.as_mut() {
                     Some(StreamReader::Active(r)) => read_event_frame(r),
                     Some(StreamReader::Passive(r)) => read_event_frame(r.as_mut()),
@@ -1233,15 +1157,12 @@ impl Iterator for EventStream {
                         // «3» при скане гигабайта — ровно тот дефект прибора, который
                         // этот milestone и устраняет.
                         self.events_scanned += 1;
-                        self.last_decoded_seq = Some(ev.seq);
                         // M-57 (круг 2, TD-109): для активного raw-сегмента обновляем
-                        // ОБА места: `active_tail_pos` (для sidecar-записи в Drop,
-                        // backward-compat) и `active_tail_hint` (новый прод-путь через
-                        // `EventStream::tail_hint()`). Без этого следующий `pump()` не
+                        // `active_tail_hint` — новый прод-путь через
+                        // `EventStream::tail_hint()`. Без этого следующий `pump()` не
                         // сможет seek'нуть на нужную позицию в активном сегменте.
                         if let Some(StreamReader::Active(r)) = self.reader.as_ref() {
                             let pos = r.position();
-                            self.active_tail_pos = Some(pos);
                             // seg_idx активного сегмента — последний в self.segments.
                             if let Some(seg) = self.segments.last() {
                                 let seg_idx = seg
@@ -1376,21 +1297,12 @@ pub fn stream_from(
         events_scanned: 0,
         segments_opened: 0,
         after_seq,
-        last_decoded_seq: None,
-        active_tail_pos: None,
-        // M-57 (круг 2, TD-109): backward-compat для существующих RED-тестов.
-        // `stream_from` (старый API) читает sidecar и использует его как hint.
-        // Прод-путь `stream_from_at` задаёт hint напрямую из in-memory `LiveReducer`.
-        hint: read_tail_offset(dir.as_ref())
-            .ok()
-            .flatten()
-            .map(|(idx, last, pos)| TailHint {
-                seg_idx: idx,
-                last_seq: last,
-                pos,
-            }),
+        // M-57 (круг 2, TD-109): hint живёт ТОЛЬКО в вызывающем (`LiveReducer` через
+        // `stream_from_at`). `stream_from` (старый API) больше не читает hint из sidecar:
+        // sidecar-файл удалён (M-57 задача 9), и попытка записи на RO-каталоге прода
+        // молча проваливалась, оставляя активный сегмент пересканируемым каждый тик.
+        hint: None,
         active_tail_hint: None,
-        dir: dir.as_ref().to_path_buf(),
     })
 }
 
@@ -1475,13 +1387,10 @@ pub fn stream_from_at(
         events_scanned: 0,
         segments_opened: 0,
         after_seq,
-        last_decoded_seq: None,
-        active_tail_pos: None,
         // M-57 (круг 2, TD-109): hint передан извне, in-memory. Без записи на диск,
         // без зависимости от прав доступа к каталогу.
         hint,
         active_tail_hint: None,
-        dir: dir.to_path_buf(),
     })
 }
 
