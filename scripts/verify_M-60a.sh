@@ -41,10 +41,10 @@ fi
 echo "--- F: RED-проба замка (число сценариев СЧИТАЕТСЯ пробой) ---"
 if bash "${PROBE}" >/tmp/m60a-probe.log 2>&1; then
   N=$(grep -oE 'VERDICT: PASS \(([0-9]+)/' /tmp/m60a-probe.log | grep -oE '[0-9]+' | head -1)
-  if [ "${N:-0}" -ge 9 ]; then
+  if [ "${N:-0}" -ge 11 ]; then
     pass "F проба: ${N} сценариев зелёных"
   else
-    fail "F проба сообщила ${N:-0} сценариев при ожидаемых ≥9 — покрытие усохло"
+    fail "F проба сообщила ${N:-0} сценариев при ожидаемых ≥11 — покрытие усохло"
   fi
 else
   fail "F проба КРАСНАЯ — $(grep -E '^(VERDICT|SETUP)' /tmp/m60a-probe.log | head -1)"
@@ -70,12 +70,14 @@ echo "--- W: ПОДКЛЮЧЁННОСТЬ к CI (разбором workflow, не
 if [ ! -f "${CI}" ]; then
   fail "W ${CI} отсутствует"
 else
-  python3 - "$CI" <<'PY' || FAILED=$((FAILED + 1))
+  python3 - "$CI" <<'PYW' || FAILED=$((FAILED + 1))
 import re, sys
 src = open(sys.argv[1], encoding='utf-8').read().split('\n')
-# джобы — ключи с отступом РОВНО 2 пробела внутри верхнеуровневого jobs:
-jobs, cur = {}, None
-in_jobs = False
+
+# Разбор джобов. ИСПОЛНЕНИЕМ считается только тело `run:` — своё или блочное.
+# Первая редакция принимала любую строку списка, поэтому `- name: scripts/check_x.sh`
+# засчитывался как запуск (C-065, блокер 2). Имя шага — не запуск.
+jobs, cur, in_jobs = {}, None, False
 for line in src:
     if re.match(r'^jobs:\s*$', line):
         in_jobs = True; continue
@@ -86,36 +88,64 @@ for line in src:
     m = re.match(r'^  ([A-Za-z0-9_-]+):\s*$', line)
     if m:
         cur = m.group(1); jobs[cur] = []
-    elif cur:
+    elif cur is not None:
         jobs[cur].append(line)
 
-def job_running(substr):
-    return [j for j, body in jobs.items()
-            if any(substr in l and re.search(r'run:|^\s+bash|^\s+-\s', l) for l in body)]
+def run_lines(body):
+    out, block = [], None
+    for l in body:
+        if block is not None:
+            if l.strip() == '' or (len(l) - len(l.lstrip())) > block:
+                out.append(l); continue
+            block = None
+        m = re.match(r'^(\s*)(?:-\s+)?run:\s*[|>]\s*$', l)
+        if m:
+            block = len(m.group(1)); continue
+        m2 = re.match(r'^\s*(?:-\s+)?run:\s*(.+)$', l)
+        if m2:
+            out.append(m2.group(1))
+    return out
+
+def job_running(sub):
+    return [j for j, b in jobs.items() if any(sub in l for l in run_lines(b))]
 
 ok = True
 for what in ('scripts/check_docs_freeze.sh', 'scripts/tests/red_docs_freeze.sh'):
     owners = job_running(what)
     if owners:
-        print(f"PASS  W {what} исполняется джобом(ами): {', '.join(owners)}")
+        print("PASS  W %s ИСПОЛНЯЕТСЯ джобом(ами): %s" % (what, ', '.join(owners)))
     else:
-        print(f"FAIL  W {what} НЕ исполняется ни одним джобом — механизм построен, но не подключён")
+        print("FAIL  W %s не встречается ни в одном `run:` — построен, но не подключён" % what)
         ok = False
 
-# status-check.needs обязан содержать джоб(ы), исполняющие замок
-needs_txt = ' '.join(jobs.get('status-check', []))
-needed = set(job_running('scripts/check_docs_freeze.sh')) | set(job_running('scripts/tests/red_docs_freeze.sh'))
-missing = [j for j in needed if j not in needs_txt]
-if not needed:
-    print("FAIL  W некого включать в status-check.needs — джоба замка нет")
-    ok = False
-elif missing:
-    print(f"FAIL  W вне блокирующего status-check.needs: {', '.join(missing)} — красное не блокирует merge")
-    ok = False
+# Блокирует ли красное merge. Членства в `needs` НЕДОСТАТОЧНО: status-check стоит с
+# `if: always()`, исполняется всегда и падает только если ЯВНО сверяет
+# `needs.<job>.result` внутри своего `run:` (C-065, блокер 2, вторая половина).
+sc = jobs.get('status-check')
+needed = sorted(set(job_running('scripts/check_docs_freeze.sh')) |
+                set(job_running('scripts/tests/red_docs_freeze.sh')))
+if sc is None:
+    print("FAIL  W джоба status-check нет — блокировать merge нечем"); ok = False
+elif not needed:
+    print("FAIL  W некого включать в блокирующую проверку — джоба замка нет"); ok = False
 else:
-    print(f"PASS  W все джобы замка в status-check.needs: {', '.join(sorted(needed))}")
+    needs_decl = ' '.join(l for l in sc if 'needs' in l)
+    guard = ' '.join(run_lines(sc))
+    always = any(re.search(r'if:\s*always\(\)', l) for l in sc)
+    for j in needed:
+        in_needs = j in needs_decl
+        in_guard = re.search(r'needs\.' + re.escape(j) + r'\.result', guard) is not None
+        if in_needs and in_guard:
+            print("PASS  W %s: в needs И в сверке needs.%s.result — красное блокирует merge" % (j, j))
+        elif in_needs and always and not in_guard:
+            print("FAIL  W %s в needs, но status-check с `if: always()` НЕ сверяет needs.%s.result "
+                  "— красное НЕ блокирует merge" % (j, j)); ok = False
+        elif not in_needs:
+            print("FAIL  W %s отсутствует в status-check.needs" % j); ok = False
+        else:
+            print("FAIL  W %s: нет сверки needs.%s.result" % (j, j)); ok = False
 sys.exit(0 if ok else 1)
-PY
+PYW
 fi
 
 echo "--- P: РЕГРЕСС — соседний барьер артефактов цел ---"

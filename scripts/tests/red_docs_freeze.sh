@@ -52,6 +52,7 @@ mk_repo() { # $1=имя → печатает путь
     && echo "базовый профиль" > .claude/agents/architect.md \
     && echo "мастер-правила"  > CLAUDE.md \
     && echo "эталон"          > docs/04-workflow.md \
+    && mkdir -p .claude/wrappers && echo "лаунчер" > .claude/wrappers/pi-dev.sh \
     && echo "не зона замка"   > docs/DESIGN.md \
     && git add -A && git commit -q -m "base" ) || die "инициализация фикстуры $1"
   echo "$d"
@@ -84,7 +85,7 @@ assert_body_lacks() { # $1=repo $2=подстрока
   return 0
 }
 
-echo "── Замок процессного слоя (M-60 G0): 9 сценариев ──"
+echo "── Замок процессного слоя (M-60a): 12 сценариев ──"
 echo "барьер: ${BARRIER}"
 echo
 
@@ -151,6 +152,42 @@ R="$(mk_repo fr9)"; B="$(cd "$R" && git rev-parse HEAD)"
   && git checkout -q - && git merge -q --no-ff side -m "merge side" ) || die "фикстура merge"
 run_barrier "$R" push "$B" && fail "FR-9 правка правил, внесённая merge'ем, обошла замок" \
                            || pass "FR-9 merge не является лазейкой"
+
+# FR-10 — запертая правка РАНЬШЕ, токен на HEAD от постороннего коммита ⇒ блок.
+# Найдено критиком (C-065): реализация, читающая тело ТОЛЬКО HEAD-коммита, проходила
+# прежнюю пробу 10/10 — потому что во всех сценариях запертая правка лежала в HEAD, и
+# FR-5 блокировал её по неверной причине. Сценарий «правка раньше, токен позже» —
+# единственный, который такую реализацию отличает от честной.
+R="$(mk_repo fr10)"; B="$(cd "$R" && git rev-parse HEAD)"
+commit_in "$R" ".claude/rules/gates.md" "норма без разрешения" "тело без токена"
+commit_in "$R" "docs/DESIGN.md" "посторонняя правка" "${TOKEN_OK}"
+assert_touches "$R" "$B" ".claude/rules/gates.md"; assert_body_has "$R" "FOUNDER-APPROVED"
+run_barrier "$R" push "$B" && fail "FR-10 токен на ПОСТОРОННЕМ HEAD-коммите прикрыл правку правил, сделанную раньше" \
+                           || pass "FR-10 токен не действует задним числом на прежние коммиты"
+
+# FR-11 — запертая правка в side-ветке, токен в теле MERGE-коммита ⇒ блок.
+# Вторая половина той же дыры: реализация, смотрящая merge-коммит, пропустит
+# неразрешённый side-commit (C-065, F-064-6 круга 1).
+R="$(mk_repo fr11)"; B="$(cd "$R" && git rev-parse HEAD)"
+( cd "$R" && git checkout -q -b side \
+  && echo "норма из ветки" >> .claude/rules/testing.md \
+  && git add -A && git commit -q -m "side: правка правил без разрешения" \
+  && git checkout -q - \
+  && git merge -q --no-ff side -m "merge side
+
+${TOKEN_OK}" ) || die "фикстура FR-11"
+run_barrier "$R" push "$B" && fail "FR-11 токен в теле MERGE-коммита прикрыл неразрешённый side-commit" \
+                           || pass "FR-11 токен merge-коммита не покрывает коммиты side-ветки"
+
+# FR-12 — обвязка агентов ⇒ зона замка (C-065, блокер 3).
+# `.claude/wrappers/pi-dev.sh` бутстрапит worktree и инжектит `dispatch-mandate.md` в
+# систем-промт пяти внешних ролей: поведение агента задаётся и профилем, И обвязкой.
+# Запереть `.claude/agents/**`, оставив обвязку открытой, — непоследовательно.
+R="$(mk_repo fr12)"; B="$(cd "$R" && git rev-parse HEAD)"
+commit_in "$R" ".claude/wrappers/pi-dev.sh" "смена бутстрапа" "тело без разрешения"
+assert_touches "$R" "$B" ".claude/wrappers/pi-dev.sh"
+run_barrier "$R" push "$B" && fail "FR-12 .claude/wrappers вне замка — обвязку агентов можно менять молча" \
+                           || pass "FR-12 .claude/wrappers под замком"
 
 echo
 if [ "${FAILED}" -gt 0 ]; then
