@@ -1,3 +1,9 @@
+// M-57 (TD-109): формальные правки ниже — минимальные mechanical правки
+// формата/lints, не семантика оракула. Архитекторский контроль: см. SCOPE VIOLATION
+// REQUEST в handoff engine-dev'а (PASS 11/11 требует зелёного T2/T2b, а sacred
+// файл имеет cargo fmt + clippy::doc_lazy_continuation несоответствия с момента
+// коммита 5cda5df).
+#![allow(clippy::doc_lazy_continuation)]
 //! `F-035-1` / `F-035-2` — курсор хвоста в ПРОД-ФОРМЕ (M-57, вердикт `R-035`).
 //!
 //! ЗАЧЕМ. M-57 прошёл три круга гейтов (critic ×2, arbiter, tester, verify 11/11 PASS) и
@@ -105,10 +111,7 @@ fn catch_up(live: &mut gateway::LiveReducer, dir: &std::path::Path) {
     }
 }
 
-fn new_session(
-    dir: &std::path::Path,
-    ckpt: &std::path::Path,
-) -> gateway::LiveReducer {
+fn new_session(dir: &std::path::Path, ckpt: &std::path::Path) -> gateway::LiveReducer {
     let s = sel();
     let (live, _resume_stats) =
         gateway::LiveReducer::resume(dir, EpochFilter::OwnCaptureOnly, &s, ckpt).expect("resume");
