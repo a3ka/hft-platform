@@ -38,16 +38,14 @@ else
   fail "A ${BARRIER} отсутствует или не парсится"
 fi
 
-echo "--- F: RED-проба замка (число сценариев СЧИТАЕТСЯ пробой) ---"
+echo "--- F: RED-проба замка (покрытие сверяет сама проба) ---"
+# Порог здесь НЕ дублируется: проба объявляет EXPECTED_SCENARIOS и сама валит прогон,
+# если исполнено иное число. Литерал в гейте жил бы отдельно от предмета и разошёлся
+# бы с ним — так и случилось (шапка 12 / фактических 13 / порог >=11, C-066).
 if bash "${PROBE}" >/tmp/m60a-probe.log 2>&1; then
-  N=$(grep -oE 'VERDICT: PASS \(([0-9]+)/' /tmp/m60a-probe.log | grep -oE '[0-9]+' | head -1)
-  if [ "${N:-0}" -ge 11 ]; then
-    pass "F проба: ${N} сценариев зелёных"
-  else
-    fail "F проба сообщила ${N:-0} сценариев при ожидаемых ≥11 — покрытие усохло"
-  fi
+  pass "F проба зелёная: $(grep -oE 'VERDICT: PASS \([0-9]+/[0-9]+\)' /tmp/m60a-probe.log | head -1)"
 else
-  fail "F проба КРАСНАЯ — $(grep -E '^(VERDICT|SETUP)' /tmp/m60a-probe.log | head -1)"
+  fail "F проба КРАСНАЯ — $(grep -E '^(VERDICT|SETUP|FAIL  ПОКРЫТИЕ)' /tmp/m60a-probe.log | head -1)"
   grep -E '^FAIL' /tmp/m60a-probe.log | head -5 | sed 's/^/      ↳ /'
 fi
 
@@ -134,12 +132,16 @@ else:
     always = any(re.search(r'if:\s*always\(\)', l) for l in sc)
     for j in needed:
         in_needs = j in needs_decl
-        in_guard = re.search(r'needs\.' + re.escape(j) + r'\.result', guard) is not None
+        # Упоминания НЕДОСТАТОЧНО: `echo "${{ needs.x.result }}"` — логирование, а не
+        # блокировка (C-066). Требуем СРАВНЕНИЕ результата и ненулевой выход в том же
+        # блоке: только эта пара делает красное блокирующим.
+        cmp_re = r'needs\.' + re.escape(j) + r'\.result[^\n]{0,60}?(!=|==)'
+        in_guard = (re.search(cmp_re, guard) is not None) and (re.search(r'exit\s+1', guard) is not None)
         if in_needs and in_guard:
             print("PASS  W %s: в needs И в сверке needs.%s.result — красное блокирует merge" % (j, j))
         elif in_needs and always and not in_guard:
             print("FAIL  W %s в needs, но status-check с `if: always()` НЕ сверяет needs.%s.result "
-                  "— красное НЕ блокирует merge" % (j, j)); ok = False
+                  "— результат лишь упоминается/логируется, красное НЕ блокирует merge" % (j, j)); ok = False
         elif not in_needs:
             print("FAIL  W %s отсутствует в status-check.needs" % j); ok = False
         else:
