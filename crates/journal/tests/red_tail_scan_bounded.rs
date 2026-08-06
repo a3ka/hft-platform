@@ -93,6 +93,30 @@ fn write_n(dir: &std::path::Path, from: i64, to: i64, cfg: WriterConfig) {
 /// Список нужен O-3: сверять надо тождество потоков, а не совпадение счётчиков —
 /// одинаковое ЧИСЛО событий совместимо с потерей одного и дублированием другого
 /// (`C-060` N1).
+/// Тик в ПРОД-ФОРМЕ: курсор приходит от вызывающего и возвращается ему же.
+///
+/// ПЕРЕПИСАНО (M-57 круг 2, TD-109). Прежняя редакция звала `journal::stream_from`, то есть
+/// восстанавливала позицию из файла `journal.tail-offset`. Замер показал, что O-2 был зелёным
+/// ПО АРТЕФАКТУ ФИКСТУРЫ: `tail_seq()` открывает полный стрим и на закрытии пишет sidecar на
+/// хвосте, а следующий `tick()` его читал. На проде эту роль не играет никто — `gateway-serve`
+/// монтирует журнал `:ro` (`docker-compose.yml:150`), sidecar не появляется никогда, и
+/// активный сегмент пересканируется каждый тик (`R-035` F-035-1: 8003 события вместо 3).
+/// То есть главный оракул milestone'а подтверждал механизм в форме, которую прод воспроизвести
+/// не может. Теперь он меряет то же, что делает прод: `stream_from_at` с курсором СЕССИИ.
+fn tick_at(
+    dir: &std::path::Path,
+    after: Option<u64>,
+    hint: Option<journal::TailHint>,
+) -> (Vec<u64>, u64, Option<journal::TailHint>) {
+    let mut s = journal::stream_from_at(dir, EpochFilter::OwnCaptureOnly, after, hint)
+        .expect("stream_from_at");
+    let mut seqs = Vec::new();
+    for r in s.by_ref() {
+        seqs.push(r.expect("event").seq);
+    }
+    (seqs, s.events_scanned(), s.tail_hint())
+}
+
 fn tick(dir: &std::path::Path, after: Option<u64>) -> (Vec<u64>, u64) {
     let mut s = journal::stream_from(dir, EpochFilter::OwnCaptureOnly, after).expect("stream_from");
     let mut seqs = Vec::new();
@@ -206,9 +230,17 @@ fn o2_tick_scans_only_increment_not_whole_segment() {
     let scan_for = |n: i64| -> (u64, u64) {
         let dir = tempfile::tempdir().expect("tempdir");
         write_n(dir.path(), 0, n, cfg_single_segment());
-        let after = tail_seq(dir.path());
+        // Догоняющий тик — как первое подключение сессии: курсора ещё нет, читаем всё.
+        // Он же ОТДАЁТ курсор, который сессия держит В ПАМЯТИ (на проде — LiveReducer).
+        let (seen, _, hint) = tick_at(dir.path(), None, None);
+        let after = *seen.last().expect("журнал не пуст");
+        // Sidecar удаляется перед замером: на проде каталог `:ro` и файла НЕТ НИКОГДА.
+        // Без этой строки оракул снова мерил бы лабораторию (см. док к `tick_at`).
+        // Литерал намеренно: оракул прод-формы не должен зависеть от константы,
+        // которую этот же milestone удаляет (задача 9).
+        let _ = std::fs::remove_file(dir.path().join("journal.tail-offset"));
         write_n(dir.path(), n, n + 3, cfg_single_segment());
-        let (seqs, scanned) = tick(dir.path(), Some(after));
+        let (seqs, scanned, _) = tick_at(dir.path(), Some(after), hint);
         let yielded = seqs.len() as u64;
         assert_eq!(yielded, 3, "O-2: при {n} событиях выдано не 3");
         std::mem::forget(dir);
