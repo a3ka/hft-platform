@@ -88,9 +88,9 @@ tok() {
 # Оба направления ловятся единственной проверкой `in_zone` на каждой строке --name-only.
 touches() {
   local f
-  while IFS= read -r f; do
+  while IFS= read -r -d '' f; do
     [ -n "$f" ] && in_zone "$f" && return 0
-  done < <(git show --cc --name-only --no-renames --format= "$1")
+  done < <(git show --cc --name-only --no-renames -z --format= "$1")
   return 1
 }
 
