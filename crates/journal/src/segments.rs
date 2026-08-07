@@ -107,6 +107,36 @@ impl EpochFilter {
 /// Имя манифеста легаси-деклараций (CT-RFC-02 rev 2).
 pub const LEGACY_MANIFEST: &str = "journal.legacy.json";
 
+// === M-57 (TD-109), круг 2: in-memory курсор хвоста активного сегмента ===
+
+/// КУРСОР ХВОСТА активного сегмента, передаваемый через API.
+///
+/// Прежняя (M-57 задача 2) реализация хранила эту же тройку полей в файловом
+/// sidecar `journal.tail-offset` ВНУТРИ каталога журнала и обновляла его в
+/// `EventStream::drop`. Это не работало на проде (`R-035` F-035-1: `gateway-serve`
+/// монтирует журнал `:ro`, запись sidecar молча проваливалась, активный сегмент
+/// пересканировался каждый тик) и приводило к драке сессий за общий курсор
+/// (F-035-2). С кругом 2 sidecar удалён целиком (задача 9); курсор живёт только
+/// в `LiveReducer::tail_hint` и передаётся через [`stream_from_at`]. Семантика
+/// полей сохранена:
+///
+/// - `seg_idx`: индекс активного сегмента, в котором шло чтение.
+/// - `last_seq`: `seq` ПОСЛЕДНЕГО декодированного события (не yielded — а
+///   именно декодированного; для хвоста после приращения это даёт истинную
+///   верхнюю границу прочитанной зоны).
+/// - `pos`: байтовая позиция в файле активного сегмента СРАЗУ ПОСЛЕ фрейма
+///   последнего декодированного события.
+///
+/// **Источник истины — сам сегмент, не hint.** Если hint не подходит (ротация,
+/// юзер хочет события из уже прочитанной зоны), валидация в `stream_from_at`
+/// откатывается к полному скану активного сегмента с начала.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TailHint {
+    pub seg_idx: u32,
+    pub last_seq: u64,
+    pub pos: u64,
+}
+
 // === Маркеры ошибок (для type-based проверок в тестах и проде) ===
 
 /// Ошибка: сегмент без магии и без валидной декларации (чужой/неизвестный).
@@ -841,20 +871,45 @@ pub struct StorageStatus {
 /// M-38b (TD-044, GW-I-11): детерминированные счётчики `events_decoded`/`segments_opened`
 /// инкрементируются в `next()`/`open_next_segment` — НЕ аллокатор, НЕ wall-time
 /// (урок TD-040: аллокатор-оракул M-37 флакал на параллельных прогонах).
+///
+/// M-57 (TD-109):
+/// - задача 1: добавлен честный счётчик `events_scanned` (прочитанные ВКЛЮЧАЯ
+///   отфильтрованные) — см. комментарий на поле.
+/// - задача 2: `reader` стал `Option<StreamReader>`, где `Active` — позиция-
+///   трекающий reader для АКТИВНОГО raw-сегмента (M-57 byte-offset seek); `Passive`
+///   — тот же `Box<dyn Read>`, что и до M-57 (zst, closed raw). Следующий
+///   `stream_from_at` с hint'ом из `tail_hint()` применит `SeekFrom::Start(pos)`
+///   вместо forward-скана всего активного сегмента.
+/// - круг 2, задача 9: sidecar `journal.tail-offset` УДАЛЁН целиком. Курсор
+///   хранится ТОЛЬКО в `LiveReducer` (`TailHint`), передаётся через
+///   `stream_from_at(..., hint)` и обновляется через `EventStream::tail_hint()`.
+///   Решает `F-035-1` (запись sidecar на `:ro`-каталоге прода молча проваливалась)
+///   и `F-035-2` (один курсор на каталог дрался у N сессий). Старый API
+///   `stream_from` теперь ВСЕГДА делает полный forward-скан активного сегмента.
 pub struct EventStream {
     segments: Vec<SegmentInfo>,
     selected_headers: Vec<SegmentHeader>,
     cursor: usize,
-    /// Унифицированный reader для raw и compacted сегментов. `Box<dyn Read>` (а не
-    /// `BufReader<File>` как раньше) — потому что zstd::Decoder не импл Seek, а единый
-    /// тип позволяет общую обработку через `read_event_frame` (которой Seek не нужен —
-    /// только forward-чтение).
-    reader: Option<Box<dyn Read>>,
+    /// Reader текущего сегмента. `StreamReader::Active` — для АКТИВНОГО raw-сегмента
+    /// (с трекингом позиции для M-57 seek); `Passive` — для всего остального (zst,
+    /// closed raw), forward-only через `Box<dyn Read>`. `Box<dyn Read>` остался
+    /// для неактивных сегментов — там Seek не нужен (zstd не Seek, а закрытые raw
+    /// либо скипаются целиком по `first_seq`, либо читаются полностью).
+    reader: Option<StreamReader>,
     finished: bool,
-    /// M-38b (GW-I-11): счётчик реально декодированных событий (включая те, что были
-    /// отфильтрованы по `after_seq`). ЧЕСТНЫЙ: при `stream(.., None)` или при полном
-    /// rebuild равен общему числу событий в журнале.
+    /// M-38b (GW-I-11): счётчик ВЫДАННЫХ событий (после фильтра `after_seq`).
+    /// Смысл сохранён: на нём стоят `red_stream_from::counters_report_full_pass_honestly`
+    /// (`== N` для полного прохода) и `red_checkpoint_resource_bound::without_checkpoint_full_replay_is_reported`.
+    /// Этот счётчик НЕ видит пересканирование — и НЕ ДОЛЖЕН: он меряет «работу редьюсера»,
+    /// а не «работу парсера».
     events_decoded: u64,
+    /// M-57 (TD-109), задача 1: счётчик РЕАЛЬНО ПРОЧИТАННЫХ парсером событий —
+    /// ВКЛЮЧАЯ отфильтрованные по `after_seq`. Инкрементируется в `next()` СРАЗУ после
+    /// `read_event_frame` возвращает Some(event), ДО фильтрации. Без него невозможно
+    /// измерить пересканирование активного сегмента (прежний `events_decoded` показывал
+    /// «3» при скане гигабайта — ровно тот дефект прибора, ради которого milestone
+    /// и существует). См. `red_tail_scan_bounded::o1_scanned_counts_reads_not_yields`.
+    events_scanned: u64,
     /// M-38b (GW-I-11): счётчик реально открытых сегментов (включая активный). При seek
     /// у хвоста ОБЯЗАН быть существенно меньше общего числа сегментов.
     segments_opened: u32,
@@ -862,6 +917,69 @@ pub struct EventStream {
     /// (эквивалентно `stream`). Внутрисегментный forward-фильтр `seq > after` тоже
     /// активен (zstd не Seek).
     after_seq: Option<u64>,
+    /// M-57 (круг 2, TD-109): `TailHint`, переданный в `stream_from_at` из
+    /// предыдущего `pump()`. Используется для seek'а в активный сегмент
+    /// БЕЗ sidecar-файла — состояние СЕССИИ, а не каталога. `None` — впервые
+    /// или после валидационного отката (ротация, устаревший last_seq).
+    hint: Option<TailHint>,
+    /// M-57 (круг 2, TD-109): последний `TailHint`, выданный `EventStream::tail_hint()`.
+    /// Обновляется на каждом декодированном событии в активном сегменте и сбрасывается
+    /// в `None` при EOF сегмента. Через этот метод `LiveReducer::pump` забирает hint
+    /// и сохраняет в `self.tail_hint` для следующего тика.
+    active_tail_hint: Option<TailHint>,
+}
+
+/// Внутренний reader [`EventStream`]'а: активный (с трекингом pos для seek) или
+/// пассивный (forward-only, тип-стёрт через `Box<dyn Read>`).
+enum StreamReader {
+    /// Активный raw-сегмент: трекает байтовую позицию, поддерживает seek.
+    /// Только этот вариант видит byte-offset оптимизацию (M-57).
+    Active(PositionedBufReader),
+    /// Всё остальное (zst, закрытый raw): forward-only, тип-стёрт.
+    Passive(Box<dyn Read>),
+}
+
+/// Raw segment reader с явным трекингом байтовой позиции. Нужен M-57 для seek в
+/// активный сегмент: `BufReader<File>` не отдаёт позицию без Seek, а мы хотим
+/// обновлять `pos` инкрементально (на каждый `read_exact` внутри `read_event_frame`),
+/// не дёргая `seek(Current(0))`.
+struct PositionedBufReader {
+    inner: BufReader<File>,
+    /// Позиция следующего байта для чтения (обновляется в `Read::read`).
+    pos: u64,
+}
+
+impl PositionedBufReader {
+    /// Открыть `path`, пропустить magic+header, спозиционироваться на
+    /// `start_offset` (не ниже конца заголовка — `header_end`).
+    fn open(path: &Path, start_offset: u64) -> io::Result<Self> {
+        let mut file = BufReader::with_capacity(64 * 1024, File::open(path)?);
+        let header_end = match read_v2_header_and_skip(&mut file)? {
+            Some(_) => file.stream_position()?,
+            None => 0,
+        };
+        let actual = start_offset.max(header_end);
+        file.seek(SeekFrom::Start(actual))?;
+        Ok(Self {
+            inner: file,
+            pos: actual,
+        })
+    }
+
+    /// Текущая байтовая позиция (start of next byte to read).
+    fn position(&self) -> u64 {
+        self.pos
+    }
+}
+
+impl Read for PositionedBufReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        // Каждый байт, прочитанный из BufReader, продвигает логическую позицию
+        // ровно настолько же — буферизация BufReader учтена внутри.
+        self.pos += n as u64;
+        Ok(n)
+    }
 }
 
 impl EventStream {
@@ -870,17 +988,39 @@ impl EventStream {
         &self.selected_headers
     }
 
-    /// M-38b (GW-I-11): число событий, реально декодированных парсером из фреймов.
-    /// Включает события, отфильтрованные по `after_seq` (внутрисегментный forward-скан).
-    /// Не зависит от того, какие события попали в `next()`. ДЕТЕРМИНИРОВАННЫЙ счётчик.
+    /// M-38b (GW-I-11): число событий, реально ВЫДАННЫХ через `next()` (т.е. попавших в
+    /// кадры). НЕ включает события, отфильтрованные по `after_seq` (внутрисегментный
+    /// forward-скан): инкремент стоит ПОСЛЕ `continue` фильтра — отфильтрованные
+    /// события учитывает отдельный `events_scanned` (`events_scanned += 1` стоит ДО
+    /// фильтра). На полном проходе (`stream(.., None)`) оба счётчика равны полному
+    /// числу событий в журнале. ДЕТЕРМИНИРОВАННЫЙ счётчик.
     pub fn events_decoded(&self) -> u64 {
         self.events_decoded
+    }
+
+    /// M-57 (TD-109), задача 1: честный счётчик ПРОЧИТАННЫХ парсером событий —
+    /// ВКЛЮЧАЯ события, отброшенные фильтром `after_seq`. Декремент невозможен,
+    /// только инкремент. На полном проходе (`stream(.., None)`) равен общему числу
+    /// событий в журнале. Это основная мера «работы тика» для оракулов
+    /// M-53/M-57 — заменяет слепой `events_decoded` в их анализе (TD-109).
+    pub fn events_scanned(&self) -> u64 {
+        self.events_scanned
     }
 
     /// M-38b (GW-I-11): число сегментов, чей reader был открыт. Включает активный
     /// сегмент. Сегменты, пропущенные целиком по `first_seq` next-сегмента, НЕ учитываются.
     pub fn segments_opened(&self) -> u32 {
         self.segments_opened
+    }
+
+    /// M-57 (круг 2, TD-109): текущий `TailHint` хвоста активного сегмента.
+    /// `Some(hint)` только пока reader активного raw-сегмента открыт И в нём
+    /// уже было декодировано хотя бы одно событие. После EOF сегмента (ротация
+    /// или close) сбрасывается в `None` — следующий `stream_from_at` обязан
+    /// либо найти новый сегмент и стартовать с его начала, либо использовать
+    /// новый hint, выданный предыдущим `pump()`.
+    pub fn tail_hint(&self) -> Option<TailHint> {
+        self.active_tail_hint
     }
 }
 
@@ -898,33 +1038,101 @@ impl EventStream {
     /// реально открыт (не пропущен). Пропуск сегмента определяется в `stream_from` ДО
     /// первого вызова `next()` — сегменты с `last_seq <= after_seq` (last = `first_seq`
     /// следующего − 1) удаляются из self.segments до перехода сюда.
+    ///
+    /// **M-57 (TD-109), задача 2 + круг 2 задача 9:** для АКТИВНОГО raw-сегмента
+    /// (последний в `self.segments`) открываем через [`PositionedBufReader`] и
+    /// применяем byte-offset seek из `self.hint` (`TailHint`), если ВСЕ условия
+    /// валидации в [`Self::resolve_active_start_offset`] выполнены. В остальных
+    /// случаях (zst / closed raw / первый запуск / ротация / `after < hint.last_seq`)
+    /// — обычный forward-scan с начала сегмента, как раньше.
     fn open_next_segment(&mut self) -> io::Result<bool> {
         if self.cursor >= self.segments.len() {
             self.reader = None;
             return Ok(false);
         }
-        let seg = &self.segments[self.cursor];
+        let seg = self.segments[self.cursor].clone();
         self.cursor += 1;
+        let is_last = self.cursor == self.segments.len();
         let is_zst = seg
             .path
             .file_name()
             .and_then(OsStr::to_str)
             .is_some_and(is_compacted_name);
+
         if is_zst {
             let f = File::open(&seg.path)?;
             let mut decoder = open_compacted_reader(f)?;
             skip_v2_header_forward(&mut decoder)?;
-            self.reader = Some(Box::new(decoder));
+            self.reader = Some(StreamReader::Passive(Box::new(decoder)));
+        } else if is_last {
+            // M-57, задача 2: активный raw-сегмент. Решаем, с какого байта начинать чтение.
+            let start_offset = self.resolve_active_start_offset(&seg.path)?;
+            let positioned = PositionedBufReader::open(&seg.path, start_offset)?;
+            self.reader = Some(StreamReader::Active(positioned));
         } else {
+            // Закрытый raw: forward-scan с самого начала, тип-стёрт. Старое поведение.
             let f = File::open(&seg.path)?;
             let mut r = BufReader::with_capacity(64 * 1024, f);
             if read_v2_header_and_skip(&mut r).ok().flatten().is_none() {
                 // noop: legacy-сегмент (без магии)
             }
-            self.reader = Some(Box::new(r));
+            self.reader = Some(StreamReader::Passive(Box::new(r)));
         }
         self.segments_opened += 1;
         Ok(true)
+    }
+
+    /// M-57 (круг 2, TD-109): с каким байтовым смещением открывать активный raw-сегмент.
+    ///
+    /// Возвращает абсолютное смещение в файле (`>= header_end`).
+    ///
+    /// Применяем hint ТОЛЬКО если ВСЁ из следующего:
+    /// 1. `self.hint` задан (передан в `stream_from_at` из `LiveReducer::tail_hint`
+    ///    предыдущего `pump()`);
+    /// 2. `hint.seg_idx == индекс активного сегмента` (иначе — ротация, hint относится
+    ///    к уже закрытому сегменту; пользоваться им нельзя);
+    /// 3. `hint.pos >= header_end` (защита от повреждённого/обнулённого смещения);
+    /// 4. `after_seq >= hint.last_seq` — иначе юзер просит события, которые мы уже
+    ///    прочитали; seek к сохранённому смещению их пропустит, а чтобы корректно их
+    ///    выдать, нужен forward-scan от начала сегмента (см. O-4 в `red_tail_scan_bounded`);
+    /// 5. `after_seq != None` (при `None` это `stream`/полный проход — семантика «выдать
+    ///    ВСЕ события», hint тут только мешает).
+    ///
+    /// Иначе возвращаем `header_end` — обычное начало чтения.
+    fn resolve_active_start_offset(&self, path: &Path) -> io::Result<u64> {
+        // Вычислить header_end (позиция сразу после magic+SegmentHeader, либо 0 для legacy).
+        let mut probe = File::open(path)?;
+        let header_end = match read_v2_header_and_skip(&mut probe)? {
+            Some(_) => probe.stream_position()?,
+            None => 0,
+        };
+        drop(probe);
+
+        let after = match self.after_seq {
+            Some(a) => a,
+            None => return Ok(header_end),
+        };
+
+        let hint = match self.hint {
+            Some(h) => h,
+            None => return Ok(header_end),
+        };
+
+        let active_idx =
+            parse_segment_index_any(path.file_name().and_then(OsStr::to_str).unwrap_or(""))
+                .unwrap_or(0);
+
+        if hint.seg_idx != active_idx {
+            return Ok(header_end);
+        }
+        if hint.pos < header_end {
+            // Hint повреждён / указывает внутрь заголовка — игнор.
+            return Ok(header_end);
+        }
+        if after < hint.last_seq {
+            return Ok(header_end);
+        }
+        Ok(hint.pos)
     }
 }
 
@@ -933,9 +1141,47 @@ impl Iterator for EventStream {
 
     fn next(&mut self) -> Option<io::Result<Event>> {
         loop {
-            if let Some(reader) = self.reader.as_mut() {
-                match read_event_frame(reader.as_mut()) {
+            if self.reader.is_some() {
+                // Делаем чтение, пока self.reader заимствован. После возврата из
+                // `read_event_frame` все заимствования внутри `r` отпущены —
+                // можно снова обращаться к `self.reader` для обновления `active_tail_hint`.
+                let read_outcome = match self.reader.as_mut() {
+                    Some(StreamReader::Active(r)) => read_event_frame(r),
+                    Some(StreamReader::Passive(r)) => read_event_frame(r.as_mut()),
+                    None => unreachable!("checked is_some above"),
+                };
+                match read_outcome {
                     Ok(Some(ev)) => {
+                        // M-57 (TD-109), задача 1: `events_scanned` — честный счётчик
+                        // ПРОЧИТАННЫХ парсером событий. Растёт ДО фильтра `after_seq`,
+                        // чтобы измеритель видел пересканирование активного сегмента
+                        // (при forward-чтении ВСЕХ его событий ради отсева по фильтру).
+                        // Раньше эквивалентный счётчик (= `events_decoded`) показывал
+                        // «3» при скане гигабайта — ровно тот дефект прибора, который
+                        // этот milestone и устраняет.
+                        self.events_scanned += 1;
+                        // M-57 (круг 2, TD-109): для активного raw-сегмента обновляем
+                        // `active_tail_hint` — новый прод-путь через
+                        // `EventStream::tail_hint()`. Без этого следующий `pump()` не
+                        // сможет seek'нуть на нужную позицию в активном сегменте.
+                        if let Some(StreamReader::Active(r)) = self.reader.as_ref() {
+                            let pos = r.position();
+                            // seg_idx активного сегмента — последний в self.segments.
+                            if let Some(seg) = self.segments.last() {
+                                let seg_idx = seg
+                                    .path
+                                    .file_name()
+                                    .and_then(OsStr::to_str)
+                                    .and_then(parse_segment_index_any)
+                                    .unwrap_or(0);
+                                self.active_tail_hint = Some(TailHint {
+                                    seg_idx,
+                                    last_seq: ev.seq,
+                                    pos,
+                                });
+                            }
+                        }
+
                         // M-38b (GW-I-11): внутрисегментный forward-фильтр — zstd не Seek,
                         // читаем с начала сегмента, пропускаем события `seq <= after` без
                         // эмита. Сегмент уже подобран по `first_seq` next-сегмента выше
@@ -1051,8 +1297,15 @@ pub fn stream_from(
         reader: None,
         finished: false,
         events_decoded: 0,
+        events_scanned: 0,
         segments_opened: 0,
         after_seq,
+        // M-57 (круг 2, TD-109): hint живёт ТОЛЬКО в вызывающем (`LiveReducer` через
+        // `stream_from_at`). `stream_from` (старый API) больше не читает hint из sidecar:
+        // sidecar-файл удалён (M-57 задача 9), и попытка записи на RO-каталоге прода
+        // молча проваливалась, оставляя активный сегмент пересканируемым каждый тик.
+        hint: None,
+        active_tail_hint: None,
     })
 }
 
@@ -1068,6 +1321,80 @@ pub struct ReplayDigest {
     pub first_seq: Option<u64>,
     pub last_seq: Option<u64>,
     pub state_hash: [u8; 32],
+}
+
+/// M-57 (круг 2, TD-109): live-seek с СЕГМЕНТНЫМ ПРОПУСКОМ и IN-MEMORY hint'ом.
+///
+/// В отличие от [`stream_from`], курсор хвоста передаётся ЧЕРЕЗ ПАРАМЕТР (`hint`),
+/// а не читается из файлового sidecar'а внутри каталога. Это решает обе находки
+/// PR-гейта `R-035` (`F-035-1` и `F-035-2`):
+///
+/// - `F-035-1` (catalog `:ro`): файловый sidecar невозможно создать из `gateway-serve`,
+///   чей том журнала смонтирован read-only. `LiveReducer` хранит hint В ПАМЯТИ СВОЕЙ
+///   сессии, и запись не требуется.
+/// - `F-035-2` (мультисессия): sidecar — файл на КАТАЛОГ, и любая вторая сессия
+///   сдвигала его, обнуляя выигрыш у первой. Hint — состояние КАЖДОЙ сессии отдельно.
+///
+/// Валидация прежняя (как у sidecar-пути):
+/// - `hint.seg_idx == индекс активного сегмента` (иначе — ротация);
+/// - `hint.pos >= header_end` (защита от повреждения);
+/// - `after_seq >= hint.last_seq` (юзер не запрашивает уже прочитанное).
+///
+/// При нарушении ЛЮБОГО условия — откат к полному скану активного сегмента
+/// (forward-чтение от `header_end`), как у `stream_from` без hint'а.
+///
+/// `hint = None` ≡ `stream_from(.., after_seq)` (full scan), без sidecar.
+pub fn stream_from_at(
+    dir: impl AsRef<Path>,
+    filter: EpochFilter,
+    after_seq: Option<u64>,
+    hint: Option<TailHint>,
+) -> io::Result<EventStream> {
+    let dir = dir.as_ref();
+    let all = segments(dir)?;
+    let mut selected: Vec<SegmentInfo> = Vec::with_capacity(all.len());
+    let mut headers: Vec<SegmentHeader> = Vec::with_capacity(all.len());
+    for s in all {
+        if filter.accepts(&s.header) {
+            headers.push(s.header.clone());
+            selected.push(s);
+        }
+    }
+    // selected уже отсортирован по индексу (см. `segments`); сохраняем это для расчёта
+    // `last_seq = next_seg.first_seq - 1`.
+    if let Some(after) = after_seq {
+        let mut kept: Vec<SegmentInfo> = Vec::with_capacity(selected.len());
+        for i in 0..selected.len() {
+            let seg = &selected[i];
+            if seg.header.schema_version == contracts::SCHEMA_VERSION_PRE_HEADER {
+                kept.push(seg.clone());
+                continue;
+            }
+            if i + 1 < selected.len() {
+                let next_first = selected[i + 1].header.first_seq;
+                if next_first > 0 && next_first - 1 <= after {
+                    continue;
+                }
+            }
+            kept.push(seg.clone());
+        }
+        selected = kept;
+    }
+    Ok(EventStream {
+        segments: selected,
+        selected_headers: headers,
+        cursor: 0,
+        reader: None,
+        finished: false,
+        events_decoded: 0,
+        events_scanned: 0,
+        segments_opened: 0,
+        after_seq,
+        // M-57 (круг 2, TD-109): hint передан извне, in-memory. Без записи на диск,
+        // без зависимости от прав доступа к каталогу.
+        hint,
+        active_tail_hint: None,
+    })
 }
 
 /// Посчитать `ReplayDigest` окна `[from_seq, to_seq]` (включительно) — ПОТОКОВО, память не
