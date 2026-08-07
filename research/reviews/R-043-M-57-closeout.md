@@ -114,9 +114,159 @@ M-57 бьёт ровно в `c`. Приращение (≈150–235 соб/с н
 **Milestone НЕ закрывается фактом merge.** Три круга гейтов были зелёными при неработающем
 на проде механизме — закрывает только замер «после» против таблицы выше.
 
-## §D — Статус close-out (заполняется после merge)
+## §D — Merge: выполнен, гейт прогнан НА ДЕРЕВЕ СЛИЯНИЯ
 
-См. §E–§G ниже (дописаны вторым коммитом после merge).
+`main` `085c920` → `3e2a1ac` (предсказание) → **`710b1ad`** (merge `--no-ff`).
+
+Гейт прогнан не на ветке, а на самом дереве слияния — потому что `main` ушёл вперёд за время
+кругов, и `gates.md` §8 требует проверять предмет на дереве слияния. Дополнительно это была
+НЕОБХОДИМОСТЬ, а не перестраховка: CI гейт исполнить не может (§E).
+
+```
+$ bash scripts/verify_M-57.sh        # /tmp/hft-rev-m57-merge @ 1342075 (main + ветка)
+PASS  T0 crates/journal/tests/red_tail_scan_bounded.rs
+PASS  T1 build --workspace
+PASS  T2 clippy --workspace --all-targets --all-features -D warnings
+PASS  T2b fmt --check
+PASS  T3 O-1..O-4 GREEN
+PASS  T3b f035_1/f035_2/f035_3 GREEN (прод-форма + проброс измерителя), блоков ok: 2/2
+PASS  T4 events_scanned есть в segments.rs
+PASS  T4 events_decoded СОХРАНЁН (на нём стоят прежние оракулы)
+PASS  T5 journal GREEN (счётчики и чекпоинт-ресурс целы)
+PASS  T5 M-53/M-54/M-56 GREEN
+PASS  T5 gateway-serve GREEN (сверка WS↔реплей цела)
+PASS  T5d cargo test --all: passed=803 failed=0 (блоков: 196)
+PASS  T6 crates/contracts/** не тронут
+VERDICT: PASS
+VERIFY_EXIT=0
+
+$ git diff --name-only 1342075 HEAD -- crates/ scripts/ | wc -l
+0        # дерево прогона и дерево merge по коду ИДЕНТИЧНЫ ⇒ прогон переносится
+
+$ git merge-base --is-ancestor 3e2a1ac HEAD && echo ok
+ok       # предсказание §C — предок merge-коммита
+```
+
+## §E — Деплой-гейт `gates.md` §8: **НЕ ПРОЙДЕН, и это блокер close-out'а**
+
+```
+$ gh run list --limit 3
+31192176373 710b1ad Deploy to VPS  completed  failure
+31192172682 710b1ad CI             completed  failure
+31192132514 3e2a1ac CI             completed  failure
+
+$ gh run view 31192172682 --json jobs      # CI
+  Delivery gate (бинарь В ПРОД-ОБРАЗЕ, TD-020)   failure  steps=0
+  cargo audit                                    failure  steps=0
+  Protected artifacts (gate trail)               failure  steps=0
+  Contracts gate                                 failure  steps=0
+  fmt + clippy + test                            failure  steps=0
+  All checks passed                              failure  steps=0
+
+$ gh run view 31192176373 --json jobs      # Deploy
+  Gate on CI (fail-closed)                       failure  steps=0
+  Deploy (build on VPS)                          SKIPPED
+```
+
+**`steps=0` у ВСЕХ джобов — они не стартовали.** Это `TD-114` (исчерпана квота GitHub
+Actions), и с прошлого замера картина УХУДШИЛАСЬ: в `TD-114` пять содержательных джобов были
+ещё зелёными и падал только агрегирующий guard; сегодня не стартует ни один.
+
+**Deploy отработал ПРАВИЛЬНО.** `Gate on CI (fail-closed)` не пустил деплой поверх красного
+CI, `Deploy (build on VPS)` пропущен. Это то поведение, ради которого гейт fail-closed и
+писался (`TD-018`). Прод не тронут — проверено:
+
+```
+$ ssh root@167.233.192.131
+HEAD прода: dca889a docs(state): close-out M-58 ...
+grep -c stream_from_at crates/journal/src/segments.rs  ->  0     # M-57 на проде НЕТ
+hft-gateway-serve Up 41 hours (healthy)
+hft-recorder      Up 41 hours (healthy)
+{"events":13061320,"next_seq":189351026,"segment_index":207,
+ "ts_wall_ms":1786116137500,"writable":true}      # свежесть 8 с, журнал растёт
+CPU=0.0% load1=0.22 RssAnon=370972kB probes=0 threads=1
+```
+
+Eyes-on `gates.md` §8 п.2 выполнен и ЗЕЛЁНЫЙ — но он относится к прошлому коду. Ресурсный и
+содержательный пункты по M-57 неприменимы: механизма на проде нет.
+
+## §F — Вердикт close-out: **MILESTONE НЕ ЗАКРЫТ**
+
+| пункт close-out | статус |
+|---|---|
+| merge в `main` | ✅ `710b1ad`, гейт PASS на дереве слияния |
+| предсказание зарегистрировано ДО merge | ✅ `3e2a1ac`, доказано `merge-base` |
+| база «до» снята начисто | ✅ §B |
+| CI + Deploy до терминального статуса | ⚠️ терминальный, но **красный** — `TD-114` |
+| прод eyes-on | ✅ healthy, не тронут |
+| **замер «после» против предсказания** | ❌ **НЕВОЗМОЖЕН — M-57 не на проде** |
+| долги заведены | ✅ `TD-109`, `TD-115`–`TD-121` |
+| `gc_worktrees.sh` | ✅ прогнан, см. §G |
+
+**M-57 остаётся OPEN.** Merge — не close-out. Milestone закрывает только сверка с таблицей
+§C, и она станет возможной лишь после восстановления квоты и первого деплоя.
+
+**Что обязано произойти, в порядке (границa C — решает founder):**
+1. Восстановить billing GitHub Actions (`TD-114`, founder — деньги).
+2. **Первый же Deploy после этого сопроводить `gates.md` §8 ГЛАЗАМИ** (`TD-115`): он
+   понесёт первое кодовое расхождение прода и `main` за всё время — до M-57 в `main`
+   копились только docs (проверено: `git diff dca889a origin/main -- crates/ scripts/` пусто).
+3. Снять замер «после» по методике §B и свести с §C — в `R-044` либо дописав сюда.
+4. До восстановления квоты **код в `main` не мержить**: расхождение будет расти, и разбор
+   «что из накопленного сломало прод» подорожает с каждым milestone'ом.
+
+## §G — Done Block close-out'а
+
+```
+$ git log --oneline -3 origin/main
+710b1ad Merge branch 'feat/M-57-task5' — M-57 tail-follower
+3e2a1ac docs(review): R-043 — ПРЕДСКАЗАНИЕ зарегистрировано ДО merge
+085c920 docs(debt): TD-114 — CI исчерпал квоту GitHub Actions
+
+$ git status --porcelain
+?? .omc/                                  # чужой untracked, не мой (branch-hygiene п.7)
+
+$ bash scripts/gc_worktrees.sh            # см. §G.1
+```
+
+### §G.1 — Worktree-GC и находка о нём
+
+`gc_worktrees.sh` прогнан. Он безопасен по конструкции и потому почти ничего не удаляет:
+из **37** worktree `--dry-run` предложил снести **ОДИН** — остальные удерживаются как «не
+смержен в `origin/main`». Замер диска: **370 GB занято, 46 GB свободно (90 %)**. После merge
+M-57 деревья его цепочки стали merged и подпадают под GC — повторный прогон в §G.2.
+
+Это ровно `NOTE-4` круга 3, где `FAIL T5d` был вызван заполненным на 98 % диском, а не кодом.
+Заведено `TD-119`: гейт не отличает «код красный» от «диск кончился», а GC до merge'а был
+консервативен настолько, что не решал задачу, ради которой существует.
+
+### §G.2 — GC после merge: 13 деревьев, 17 GB
+
+```
+$ bash scripts/gc_worktrees.sh
+REMOVED  hft-arch-m57       REMOVED  hft-critic-m57b    REMOVED  hft-critic-m57c
+REMOVED  hft-dev-m57        REMOVED  hft-dev-m57-f6     REMOVED  hft-dev-m57-task5
+REMOVED  hft-rev-m57        REMOVED  hft-rev-m57t3      REMOVED  hft-rev-m57t5
+REMOVED  hft-test-m57       REMOVED  hft-test-m57b      REMOVED  hft-tester-m57r2
+REMOVED  hft-tester-1786113356
+VERDICT: GC DONE
+
+$ df -h /                       # было 370G/46G свободно (90 %)
+/dev/md2  437G  353G  63G  86 %      # освобождено ≈17 GB
+$ git worktree list | wc -l     # было 37
+27
+```
+
+**Наблюдение, уточняющее `TD-119`.** До merge'а GC предлагал снести один worktree из 37;
+сразу после merge'а — тринадцать. Причина не в самом GC, а в его критерии «смержен в
+`origin/main`»: деревья цепочки milestone'а становятся собираемыми ТОЛЬКО после merge. То
+есть дисковое давление максимально ровно в тот момент, когда идут финальные прогоны гейтов —
+и именно тогда ENOSPC ломает `cargo test --all`, выглядя как красный код. Это делает `TD-119`
+не гигиенической заметкой, а объяснением, почему круг 3 покраснел на пустом месте.
+
+---
+
+*Артефакт гейта. `gates.md` §4: этап пройден, только когда предъявлен ФАЙЛ.*
 
 ---
 
