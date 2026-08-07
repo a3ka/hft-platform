@@ -61,7 +61,7 @@ echo "--- T3b: ПРОД-ФОРМА круга 2 + проброс измерит�
 #   f035_3        — сам ИЗМЕРИТЕЛЬ: `ReadStats.events_scanned` обязан равняться журнальному
 #                   счётчику, а не `events_decoded`. Без него подмена одной строки слепит
 #                   разом все оракулы уровня gateway, включая два верхних (R-039 §C.2).
-cargo test -p gateway --test red_tail_cursor_prod_form --test red_read_stats_passthrough \
+cargo test -p gateway --no-fail-fast --test red_tail_cursor_prod_form --test red_read_stats_passthrough \
   >/tmp/m57-pf.log 2>&1; PF=$?
 # Число зелёных блоков СЧИТАЕТСЯ: `test result: ok. 0 passed` — зелёная строка, не
 # исполнившая ничего. Таргетов ровно два, в каждом обязан пройти минимум один тест.
