@@ -34,7 +34,7 @@
 # находка другого рода: пересматривается критерий, а не латается проба.
 #
 # АНТИ-ПЛАЦЕБО — БАТАРЕЯ В РЕПОЗИТОРИИ: `bash scripts/tests/red_docs_freeze.sh --battery`
-# строит эталонный барьер и восемь дырявых и проверяет, что проба зелёная против эталона и
+# строит эталонный барьер и дырявые (состав — спека §4.1) и проверяет, что проба зелёная против эталона и
 # красная против каждого мутанта. Батарея лежит здесь, а не в /tmp сессии, по причине из
 # `A-005` §6.5: сырые прогоны круга 1 были сняты пробой, не существовавшей ни в одной
 # ревизии этого репозитория, и четыре круга этого никто не заметил. Заявление «проба ловит
@@ -75,6 +75,7 @@ A4G|4|V|.claude/agents/**
 A4W|4|V|.claude/wrappers/**
 A4C|4|V|CLAUDE.md
 A4F|4|V|docs/04-workflow.md
+A4Z|4|V|квотируемое имя члена зоны
 A5S|5|V|subject
 A5C|5|V|содержимое файла
 A5P|5|V|путь файла
@@ -141,7 +142,7 @@ expect_block() { mark "$1"
 expect_allow() { mark "$1"
   if run_barrier "$2" push "$3"; then pass "$1 $4 — пропущено"; else fail "$1 $4 — ложное срабатывание"; fi; }
 
-# ═══ БАТАРЕЯ (--battery): эталон + восемь дырявых ═══════════════════════════════════
+# ═══ БАТАРЕЯ (--battery): эталон + дырявые реализации ══════════════════════════════
 # Барьеры собираются из ЧАСТЕЙ: каждый мутант отличается от эталона ровно одной частью,
 # названной в таблице ожиданий. Отличие проверяется `cmp` — sed, не нашедший якоря, дал бы
 # копию эталона, и «мутант» молча тестировал бы не то (страж setup'а для самой батареи).
@@ -172,7 +173,15 @@ PART_TOK_BODY='tok() { git log -1 --format="%b" "$1" | grep -qE "^FOUNDER-APPROV
 PART_TOK_SUBJ='tok() { git log -1 --format="%s%n%b" "$1" | grep -qE "^FOUNDER-APPROVED: .{12,}"; }'
 PART_TOK_SHOW='tok() { git show "$1" | grep -qE "FOUNDER-APPROVED: .{12,}"; }'
 
+# `-z` обязателен: без него git ЭКРАНИРУЕТ имена (кавычка/обратный слэш — всегда, не-ASCII —
+# при дефолтном core.quotePath), и построчное сравнение с зоной не узнаёт члена зоны.
+# До rev7 эталон читал построчно и был дырявым — проба сертифицировала его 26/26.
 PART_TOUCH_SHOWCC='touches() { local f
+  while IFS= read -r -d "" f; do
+    [ -n "$f" ] && in_zone "$f" && return 0
+  done < <(git show --cc --name-only --no-renames -z --format= "$1")
+  return 1; }'
+PART_TOUCH_QUOTED='touches() { local f
   while IFS= read -r f; do
     [ -n "$f" ] && in_zone "$f" && return 0
   done < <(git show --cc --name-only --no-renames --format= "$1")
@@ -211,12 +220,13 @@ run_battery() {
   emit_barrier "$d/existsbase.sh" "${PART_ANCESTOR_NONE}" "${PART_ZONE_EXACT}" "${PART_TOK_BODY}" "${PART_TOUCH_SHOWCC}"   "${PART_LOOP_PERCOMMIT}"
   emit_barrier "$d/treediff.sh"   "${PART_ANCESTOR}"      "${PART_ZONE_EXACT}" "${PART_TOK_BODY}" "${PART_TOUCH_TREEDIFF}" "${PART_LOOP_PERCOMMIT}"
   emit_barrier "$d/overbroad.sh"  "${PART_ANCESTOR}"      "${PART_ZONE_BROAD}" "${PART_TOK_BODY}" "${PART_TOUCH_SHOWCC}"   "${PART_LOOP_PERCOMMIT}"
+  emit_barrier "$d/quotedpath.sh" "${PART_ANCESTOR}"      "${PART_ZONE_EXACT}" "${PART_TOK_BODY}" "${PART_TOUCH_QUOTED}"   "${PART_LOOP_PERCOMMIT}"
   printf '#!/usr/bin/env bash\nexit 0\n' > "$d/always0.sh"
   printf '#!/usr/bin/env bash\nexit 1\n' > "$d/always1.sh"
 
   # Страж батареи: мутант, совпавший с эталоном, тестировал бы эталон под чужим именем.
   local m
-  for m in showgrep subjtok earlytok existsbase treediff overbroad; do
+  for m in showgrep subjtok earlytok existsbase treediff overbroad quotedpath; do
     cmp -s "$d/ref.sh" "$d/$m.sh" && die "мутант $m НЕ ПОСТРОЕН — совпал с эталоном"
   done
 
@@ -234,6 +244,7 @@ run_battery() {
   for m in "showgrep:ось 5 / содержимое файла" "subjtok:ось 5 / subject" \
            "earlytok:ось 3 / токен раньше" "existsbase:ось 3 / база не-предок" \
            "treediff:ось 3 / evil merge" "overbroad:ось 4 / нет легитимного сценария" \
+           "quotedpath:ось 4 / квотируемое имя члена зоны" \
            "always0:вырожденный — пропускает всё" "always1:вырожденный — блокирует всё"; do
     local name="${m%%:*}" why="${m##*:}"
     BARRIER="$d/$name.sh" bash "${SELF}" > "$d/$name.log" 2>&1; rc=$?
@@ -390,6 +401,24 @@ for member in ".claude/agents/architect.md:A4G" ".claude/wrappers/pi-dev.sh:A4W"
   commit_in "$R" "${path}" "правка" "без разрешения"
   expect_block "${name}" "$R" "$B" "правка ${path} без токена"
 done
+
+# A4Z — имя члена зоны, которое git КВОТИРУЕТ в текстовом выводе: кавычка или обратный слэш
+# в имени — всегда, не-ASCII — при дефолтном `core.quotePath`. Реализация, читающая
+# порселейн-вывод ПОСТРОЧНО, сравнивает с зоной уже экранированную строку вида
+# «".claude/rules/a\"\320\261.md"» и члена зоны в ней не узнаёт. Класс ровно тот же, что у
+# A5C: барьер парсит текст, который git сам экранирует.
+#
+# Найдено адверсарным прогоном rev6 — и найдено против ЭТАЛОНА, то есть дырявой оказалась та
+# самая реализация, которую батарея предъявляла как честную (проба была зелёной 26/26 против
+# барьера, пропускающего правку `.claude/rules/*` без токена). Лечится не сценарием, а СМЕНОЙ
+# КАНАЛА: `-z` даёт NUL-разделитель и экранирования не применяет. Фикстура намеренно несёт И
+# кавычку, И кириллицу: кавычка квотируется независимо от `core.quotePath`, поэтому исход
+# сценария не зависит от настройки ХОСТА (testing.md: оракул меряет свой инвариант, не среду),
+# а кириллица держит прод-релевантность — весь проект пишется по-русски.
+R="$(mk_repo a4z)"; B="$(cd "$R" && git rev-parse HEAD)"
+( cd "$R" && echo "правило" > '.claude/rules/a"б.md' && git add -A \
+  && git commit -q -m "добавление правила с квотируемым именем" ) || die a4z
+expect_block A4Z "$R" "$B" "квотируемое имя — это член зоны, а не посторонний путь"
 
 # Легитимный случай оси 4 (нарушение §3bis.3(2), найдено A-005 §4 #6): без него набор
 # проходила реализация с зоной, расширенной до всего `.claude/**`, краснея на файле,
