@@ -218,3 +218,34 @@ origin/feat/M-57-task5
 Кода, контрактов и `crates/**` работа не касается: удалялись ссылки, `main` не менялся ни на
 байт (кроме этого вердикт-файла). RISK-BLOCK (`gates.md` §5) не применим — ни один путь
 `risk`/`killswitch`/`oms`/`venue-*`/`contracts` в `main` не тронут.
+
+## §J — Close-out: деплой-гейт `gates.md` §8
+
+```
+$ EVENT_NAME=push PUSH_BEFORE=$(git rev-parse origin/main) bash scripts/check_protected_artifacts.sh
+OK: защищённые артефакты целы на HEAD (28a6ee3..HEAD; проверка по РЕЗУЛЬТАТУ, не по способу)
+barrier_exit=0
+
+$ git push origin main
+   28a6ee3..5894cf0  main -> main
+
+$ gh run watch 31166819371 --exit-status; echo ci_exit=$?
+ci_exit=0
+31166819371 CI 5894cf0 completed success
+
+$ gh run list --workflow=deploy.yml --limit 3
+dca889a completed success        # Deploy на 5894cf0 НЕ триггерился — docs-only push
+c714d0f completed success        # (фильтр путей crates/**, Cargo.toml, Cargo.lock)
+aeb409b completed success
+
+$ ssh … root@167.233.192.131 'docker ps; cat …/recorder.heartbeat; df -h'
+hft-gateway-serve Up 35 hours (healthy)
+hft-recorder      Up 35 hours (healthy)
+{"events":10627050,"free_bytes":71771959296,"min_free_bytes":10737418240,
+ "next_seq":186914761,"segment_index":204,"ts_wall_ms":1786096187500,"writable":true}
+heartbeat = 2026-08-07T09:49:47Z, now 09:50:03Z ⇒ отставание 16 с
+/dev/sda1  150G  77G  67G  54% /
+```
+
+Uptime 35 часов подтверждает ожидаемое: раскатки не было, контейнеры не перезапускались.
+Журнал пишется (`next_seq` 186 914 761, сегмент 204, `writable: true`), свободно 67 GB.
