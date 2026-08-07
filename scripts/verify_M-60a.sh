@@ -67,8 +67,24 @@ echo "--- S: САМОРЕФЕРЕНЦИЯ — M-60a обязан пройти с
 # Механизм, не выполняющий сам себя, не готов (C-062 §d). Диапазон — вся ветка над main.
 if [ -f "${BARRIER}" ]; then
   BASE=$(git merge-base origin/main HEAD 2>/dev/null || echo "")
+  # СТРАЖ SETUP'А (R-041 F-3 → TD-113). Барьер возвращает 0 и тогда, когда в диапазоне
+  # НЕТ НИ ОДНОГО коммита, трогающего зону: судить не о чем, значит нарушений нет. Шаг при
+  # этом печатал «токен founder'а на месте» — утверждение, которого он не проверял.
+  # Замер reviewer'а на b3ba11a: 0 коммитов зоны, 0 токенов, exit=0, шаг ЗЕЛЁНЫЙ.
+  # Это тот же класс, против которого в T3b стоит счётчик блоков, и в соседнем шаге его
+  # не было. Самореференция без предмета — не PASS, а несостоявшийся setup.
+  ZONE_N=0
+  if [ -n "${BASE}" ]; then
+    ZONE_N=$(for c in $(git rev-list "${BASE}..HEAD" 2>/dev/null); do
+      git show --cc --name-only --no-renames -z --format= "$c" 2>/dev/null | tr '\0' '\n' \
+        | grep -qE '^(\.claude/(rules|agents|wrappers)/|CLAUDE\.md$|docs/04-workflow\.md$)' \
+        && echo "$c"
+    done | grep -c .)
+  fi
   if [ -z "${BASE}" ]; then
     fail "S не удалось установить базу (origin/main недоступен) — самореференцию не проверить"
+  elif [ "${ZONE_N}" -eq 0 ]; then
+    fail "S SETUP НЕ СОСТОЯЛСЯ: в диапазоне ${BASE}..HEAD нет ни одного коммита, трогающего зону замка — самореференцию проверять НЕ НА ЧЁМ (барьер вернул бы 0 просто потому, что судить нечего)"
   elif EVENT_NAME=push PUSH_BEFORE="${BASE}" PR_BASE_SHA="${BASE}" bash "${BARRIER}" >/dev/null 2>&1; then
     pass "S собственный диф проходит замок (токен founder'а на месте)"
   else
