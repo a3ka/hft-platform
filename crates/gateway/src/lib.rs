@@ -3086,12 +3086,13 @@ impl LiveReducer {
         // размер КАЖДОГО кадра (bounded-memory одного batch'а), не число кадров за вызов.
         //
         // M-57 (круг 2, TD-109): используем `stream_from_at` с in-memory hint'ом, а не
-        // `stream_from`. `stream_from` читает hint из файлового sidecar'а `journal.tail-offset`
-        // ВНУТРИ каталога журнала — на проде (gateway-serve, том `:ro`) этот файл
-        // НИКОГДА не появляется, и `stream_from` всегда делает full scan (`F-035-1`).
-        // In-memory hint живёт в `self.tail_hint` (`None` на первом тике), обновляется
-        // после каждого прохода через `EventStream::tail_hint()` и естественно per-session
-        // (`F-035-2`).
+        // `stream_from`. `stream_from` (старый API, см. `segments.rs:1301`) НЕ принимает
+        // hint вообще — sidecar-файл `journal.tail-offset` удалён задачей 9, и
+        // `stream_from` каждый вызов декодирует активный сегмент с начала, даже если
+        // в нём уже миллионы событий (на проде к ротации сегмента ~10.7 млн — см. §0
+        // M-57, `F-035-1`). In-memory hint живёт в `self.tail_hint` (`None` на первом
+        // тике), обновляется после каждого прохода через `EventStream::tail_hint()` и
+        // естественно per-session (`F-035-2`).
         let mut stream =
             journal::stream_from_at(dir, filter, self.cursor.upto_seq, self.tail_hint)?;
         let mut frames: Vec<Frame> = Vec::new();
@@ -3138,11 +3139,6 @@ impl LiveReducer {
             self.vwap.sum_v = batch.vwap.sum_v;
         }
         let stats = read_stats_from_stream(&stream);
-        // M-57 (TD-109): забираем hint СВОЕЙ сессии из стрима. Если за тик НЕ было
-        // ни одного декодированного события в активном сегменте (backlog пуст,
-        // `finished` сразу), `tail_hint()` вернёт `None` — корректно, следующий
-        // тик либо найдёт новые события и заполнит hint, либо увидит ротацию
-        // (старый hint не подойдёт по seg_idx — откат к full scan + новый hint).
         // M-57 (TD-109): забираем hint СВОЕЙ сессии из стрима. Если за тик НЕ было
         // ни одного декодированного события в активном сегменте (backlog пуст,
         // `stream.tail_hint()` вернёт `None`), НЕ сбрасываем старый hint — он всё ещё
