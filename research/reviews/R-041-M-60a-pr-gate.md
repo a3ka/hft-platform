@@ -305,3 +305,64 @@ $ bash scripts/tests/red_gate_meta.sh              → SETUP НЕ СОСТОЯЛ
 ```
 
 **Итог: механизм M-60a — APPROVED. Push ветки — BLOCKED (F-1, F-2).**
+
+---
+
+## §J — Close-out reviewer'а и находка пост-merge гейта (`gates.md` §8)
+
+Merge ветки не делался (F-1/F-2). В `main` ушли ТОЛЬКО артефакты моей зоны — `TECH-DEBT.md`:
+
+```
+12fd4ce docs(debt): TD-112 + TD-113 по R-041; TD-098 += радиус поражения; TD-111 стал блокером
+085c920 docs(debt): TD-114 — CI исчерпал квоту GitHub Actions, guard-джоб НЕ СТАРТУЕТ
+```
+
+### F-7 · CRITICAL для контура · CI не КРАСНЕЕТ, а НЕ ЗАПУСКАЕТСЯ (→ TD-114, founder)
+
+Пост-merge проверка `12fd4ce` дала `conclusion: failure` при пяти ЗЕЛЁНЫХ содержательных
+джобах. Упал агрегатор `All checks passed`: `steps=0`, 2 секунды, логов нет. Аннотация:
+
+> `The job was not started because recent account payments have failed or your spending
+> limit needs to be increased.`
+
+Перезапуск — тот же исход (`steps=0`, 10 с). Не флак. Сверка с историей того же джоба:
+`31170554746 / 31168772071 / 31167670027 / 31167620164 / 31166819371` — все `success`,
+`steps=3`. Квота кончилась именно на моём прогоне.
+
+Это **третий режим отказа контура**, которого не было ни в одном документе проекта:
+
+| режим | кто ловит |
+|---|---|
+| гейт красный | CI |
+| гейт не БЛОКИРУЕТ merge (branch protection 403, private+free) | известно, §3ter.1 |
+| **гейт не ЗАПУСКАЕТСЯ (квота)** | **никто** |
+
+И он ровно тот, против которого написано свойство 4 целостности гейта: «монитор, сигналящий
+„упало“, но не „никогда не запускалось“, слеп к молчанию». Здесь молчит сам исполнитель.
+После merge M-60a это накрывает и `check_docs_freeze.sh` — замок, который milestone
+проверял семью ревизиями, при исчерпанной квоте просто не исполнится, и в UI это выглядит
+неотличимо от «ещё идёт».
+
+**Корень общий с задачей #5 M-60a** (бесплатный план), поэтому founder'у обе половины
+предъявляются одним решением. Граница C — reviewer констатирует, не выбирает.
+
+### Прод (`gates.md` §8, eyes-on)
+
+```
+$ ssh … root@167.233.192.131 'docker ps --format "{{.Names}} {{.Status}}"; cat …/recorder.heartbeat'
+hft-gateway-serve Up 38 hours (healthy)
+hft-recorder      Up 38 hours (healthy)
+{"events":11453395,"free_bytes":70273425408,"next_seq":187742066,"segment_index":205,
+ "ts_wall_ms":1786105787500,"writable":true}
+возраст heartbeat: 14 сек
+```
+
+`Deploy` не триггерился — правка docs-only (последний деплой `dca889a`, 2026-08-05). Журнал
+растёт (`next_seq` 159 121 674 → 187 742 066 с 08-03), место есть, `writable: true`.
+**Красный `main` — про контур наблюдения, не про работающую систему.**
+
+### Рекультивация
+
+`git worktree remove /tmp/rev-M60a`, `/tmp/rev-M60a-b3`, `/tmp/rev-M60a-j` — выполнено.
+Полный `gc_worktrees.sh` не запускался: он часть close-out ПОСЛЕ merge feat→main
+(`branch-hygiene.md`), а merge'а нет. В дереве 33 worktree — предмет отдельной гигиены.
