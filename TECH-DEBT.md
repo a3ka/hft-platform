@@ -21,6 +21,26 @@
 > merge'е (`R-034` §B-2); ссылки внутри `R-031` и `PROJECT-STATE.md` приведены к новым
 > номерам тем же коммитом. Предмет долгов не менялся.
 
+- **TD-109** `два-research-документа-655-строк-живут-вне-main-а-handoff-считает-их-влитыми`
+  (заведено reviewer'ом на гигиене веток 2026-08-07, `R-038` §G; **замер по git, не гипотеза**).
+  **Severity: MAJOR** (единственная копия + ложная запись в носителе межсессионного контекста).
+  **Что.** Две ветки несут по одному файлу, которого в `main` НЕТ ни под каким именем:
+  `research/depth-probe` (`a99c917`, 22.07) → `research/data-quality/depth-probe-binance.md`,
+  **287 строк**; `research/td-007-determinism-coverage` (`b5fc0ca`, 31.07) →
+  `research/measurements/td-007-determinism-coverage.md`, **368 строк**. Обе сливаются чисто
+  (`git merge-tree --write-tree origin/main origin/<b>` exit=0).
+  **Почему долг, а не задача.** `docs/SESSION-HANDOFF.md` §9 утверждает обратное: по
+  `depth-probe` — «результаты в `main`», по `td-007` — «TD-007 CLOSED … ветка устарела». Верно
+  лишь то, что в `main` есть результаты СМЕЖНЫХ работ (M-32/M-33 — `depth-sources-survey.md`,
+  `depth-verdict.md`, `depth-lifetime-results.md`) и что TD-007 закрыт по существу в M-51.
+  Сами документы — замер полос Binance L2 и аудит покрытия `DET-I-1` — существуют в ОДНОМ
+  экземпляре, вне `main`, а файл, который каждая роль читает первым, называет их влитыми ⇒
+  следующая инвентаризация снесёт их как «уже разобранные», не проверяя.
+  **Что закрывает долг.** Либо merge обеих через гейт architect'а (docs-only; утверждения о
+  коде проверяются на дереве слияния — `verify_design_claims.sh --merge-preview origin/main`),
+  либо явное списание с основанием, записанным в `SESSION-HANDOFF` §9 вместо нынешней
+  формулировки. **Зона — architect** (`docs/SESSION-HANDOFF.md` + merge). **OPEN.**
+
 - **TD-106** `main-красен-по-verify_design_claims-и-это-ненаблюдаемо-гейт-вне-CI`
   (заведено reviewer'ом на PR-гейте `docs/retro-audit`, 2026-08-05, `R-034` §C.1;
   **замер на чистом `origin/main` = `7a163f7`, не гипотеза**). **Severity: MAJOR.**
