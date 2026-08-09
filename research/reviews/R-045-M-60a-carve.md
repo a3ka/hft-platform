@@ -552,3 +552,78 @@ research-dev'а.
 владельца, который worktree создаёт и снимает), либо снос только по явной команде владельца.
 Это дизайн, а не вердикт (`gates.md` §4: reviewer описывает, architect проектирует).
 Дописываю замер и вывод в **TD-119**; отдельного номера не завожу — предмет тот же.
+
+---
+
+## §M — Пост-merge деплой-гейт (`gates.md` §8) — сырые пруфы
+
+Merge: `71611d0` · close-out: `871dc59` · push `f2f269d..871dc59 main -> main`.
+
+**1. CI — ЗЕЛЁНЫЙ, и гейт РЕАЛЬНО ИСПОЛНИЛСЯ (не режим TD-114):**
+
+```
+$ gh run view 31339639523 --json conclusion,status
+conclusion=success status=completed
+
+success  fmt + clippy + test          success  Contracts gate
+success  cargo audit                  success  Protected artifacts (gate trail)
+success  Delivery gate                success  Docs-freeze (M-60a — замок процессного слоя)
+success  All checks passed
+```
+
+Джоб замка отработал ШЕСТЬЮ шагами — при исчерпанной квоте было бы `steps=0` за 2 с:
+
+```
+$ gh run view 31339639523 --json jobs   # job=Docs-freeze, conclusion=success
+   success  Set up job
+   success  Run actions/checkout@v4
+   success  Барьер замка процессного слоя
+   success  Проба барьера (26 сценариев + сверка со спекой §3bis.2)   <- F-8 виден в UI: их 27
+   success  Post Run actions/checkout@v4
+   success  Complete job
+```
+
+**Замок теперь действует на `main` — предъявлено исполнением, а не намерением.** Заодно
+находка F-8 подтвердилась ровно там, где я и предсказал её видимость: имя шага в UI GitHub
+говорит «26 сценариев», джоб печатает 27.
+
+**2. `Deploy` НЕ триггерился — подтверждено ФАКТОМ, а не только фильтром:**
+
+```
+$ gh run list --workflow="Deploy to VPS" --limit 3
+completed success  Deploy to VPS   main  workflow_dispatch  31283309383  1m59s  2026-08-08
+completed failure  Merge …M-57     main  push               31192176373  4s     2026-08-07
+completed success  docs(state): close-out M-58 …  push      31052175517  13m1s  2026-08-05
+⇒ на 871dc59 запуска НЕТ
+```
+
+Причина названа механизмом, а не наблюдением: `deploy.yml` фильтрует push по путям
+(`crates/**`, `Cargo.toml`, `Cargo.lock`, `Dockerfile`, `docker-compose.yml`,
+`.github/workflows/deploy.yml`). Проверка состава merge'а:
+
+```
+$ git diff --name-only f2f269d..871dc59 | grep -E '^(crates/|Cargo\.(toml|lock))'
+(пусто) ⇒ ни один путь фильтра не затронут
+```
+
+Это ожидаемо и ЖЕЛАТЕЛЬНО: каждый редеплой = рестарт `hft-recorder` = гэп в forward-only
+записи (TD-086). Milestone docs/scripts-only прод перезапускать не должен.
+
+**3. Прод глазами (eyes-on), замер 2026-08-09T22:3xZ:**
+
+```
+$ ssh … root@167.233.192.131
+hft-gateway-serve  Up 23 hours (healthy)
+hft-recorder       Up 23 hours (healthy)
+heartbeat: {"events":4709721,"free_bytes":65422704640,"next_seq":200855067,
+            "segment_index":226,"ts_wall_ms":1786314748830,"writable":true}
+возраст heartbeat: 9 сек
+docker stats: hft-recorder CPU=2.57% MEM=131MiB/7.559GiB · gateway-serve CPU=0.00%
+RssAnon (TD-021 — НЕ docker stats): recorder 23 460 kB
+```
+
+Журнал растёт: `next_seq` 187 742 066 (`R-041`, 08-07) → **200 855 067**, сегмент 205 → 226,
+свободно 65 GB, `writable: true`. CPU/MEM в норме. Содержательного sanity свежих событий не
+требуется: деплоя не было, формат данных milestone не трогал.
+
+**Итог §8: CI зелёный · Deploy корректно не запускался · прод здоров и не тронут.**
