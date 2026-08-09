@@ -164,7 +164,17 @@ enum BumpKind {
 /// До M-59 (TD-107) `finished: Vec<(Option<i64>, Fate)>` накапливал запись на КАЖДУЮ
 /// завершённую жизнь, давая O(жизней) памяти. Сейчас — `counts: BTreeMap<lo_bps,
 /// BandCounts>` размером с число полос (7), инкремент в момент ЗАВЕРШЕНИЯ жизни, а
-/// не накопление. Память O(число полос), расход O(1) на завершённую жизнь.
+/// не накопление.
+///
+/// **ГРАНИЦА ПАМЯТИ — УСЛОВНАЯ (R-038 F-1, долг TD-122).** Безусловное «O(число полос)»
+/// верно **ТОЛЬКО после определения двустороннего `mid`**: с этого момента каждое
+/// завершение жизни либо бампится напрямую (полоса известна), либо закрывается
+/// `attribute_newborns` для той же цены. **ДО появления `mid`** (односторонний поток)
+/// `pending_bumps` растёт линейно по числу завершённых жизней — тот же класс расхода,
+/// что и `finished` до M-59, изменилась константа, не класс. Длительность этого окна
+/// на реальных данных НЕ ИЗМЕРЕНА; `DV-I-15` пиннит границу ПОСЛЕ `mid` и не различает
+/// этот случай. Долг остаётся открытым, чтобы заявленная граница не разошлась с
+/// действительностью.
 #[derive(Debug, Default)]
 struct SideBook {
     book: BTreeMap<i64, i64>,
@@ -178,6 +188,15 @@ struct SideBook {
     unattributed: VecDeque<i64>,
     /// Только живые уровни: gap/finalization не сканируют ever-growing `states`.
     alive: BTreeSet<i64>,
+    /// Завершённые жизни (`Cancelled`/`Frozen`/`Censored`) с НЕ известной полосой —
+    /// `size=0` пришёл до того, как `mid` стал двусторонним. Хранится ВНЕ `states`,
+    /// чтобы перерождение той же цены (size>0) на этом же тике НЕ затёрло
+    /// завершённую жизнь (R-038 F-2 / DV-I-16: старая жизнь безусловно
+    /// перезаписывалась новорождённой, бамп никогда не случался). Закрытие — либо в
+    /// `attribute_newborns` (полоса известна по этой же цене), либо в
+    /// `flush_delayed_states` (если `mid` не появился до конца окна — bump на первой
+    /// полосе, как и прежняя логика через итерацию `states.values()`).
+    pending_bumps: BTreeMap<i64, Vec<Fate>>,
 }
 
 impl SideBook {
@@ -212,19 +231,17 @@ impl SideBook {
                         self.bump(lo, BumpKind::Cancelled);
                     } else {
                         // Отмена ДО атрибуции (односторонний поток / mid ещё не
-                        // появился). Сохраняем state с fate=Cancelled, re-queue в
-                        // unattributed: `attribute_newborns` проставит полосу, когда
-                        // mid станет известен. Если mid не появится до конца окна —
-                        // `analyze` доразберёт через итерацию по `states.values()`,
-                        // bump на первой полосе (прежний `unwrap_or(BANDS_BPS[0].0)`).
-                        self.states.insert(
-                            l.price,
-                            LevelState {
-                                fate: Fate::Cancelled,
-                                ..state
-                            },
-                        );
-                        self.unattributed.push_back(l.price);
+                        // появился). Полоса неизвестна; bump ОТЛОЖЕН в
+                        // `pending_bumps`, иначе size>0 на этой же цене в том же
+                        // тике перезапишет завершённую жизнь новорождённой и бамп
+                        // никогда не случится (R-038 F-2 / DV-I-16). Закрытие:
+                        // `attribute_newborns` — когда mid появится (полоса той же
+                        // цены), либо `flush_delayed_states` на первой полосе,
+                        // если mid не появится до конца окна.
+                        self.pending_bumps
+                            .entry(l.price)
+                            .or_default()
+                            .push(Fate::Cancelled);
                     }
                     self.alive.remove(&l.price);
                 }
@@ -235,20 +252,13 @@ impl SideBook {
                     .get(&l.price)
                     .is_none_or(|state| state.fate != Fate::Alive);
                 if new_birth {
-                    if let Some(old) = self.states.remove(&l.price) {
-                        // «Старая» жизнь (fate != Alive) уже ЗАВЕРШЕНА в `counts`,
-                        // если её полоса была известна к моменту завершения. Тонкое
-                        // место — когда она была завершена ДО атрибуции (size=0
-                        // без mid): bump тогда ОТЛОЖЕН до attribute_newborns ИЛИ до
-                        // финальной итерации в analyze. Здесь мы можем либо bump'нуть
-                        // сейчас (если полоса известна), либо re-insert для отложенной
-                        // обработки.
-                        if let Some(lo) = old.born_band_lo_bps {
-                            bump_finished_fate(self, lo, old.fate);
-                        } else {
-                            self.states.insert(l.price, old);
-                        }
-                    }
+                    // `states` хранит ТОЛЬКО Alive (после фикса R-038 F-2:
+                    // отменённые с неизвестной полосой перенесены в
+                    // `pending_bumps`, иначе перерождение затирало бы их).
+                    // Ветка `if let Some(old) = self.states.remove(...)` здесь
+                    // не срабатывает — старая жизнь (если была) уже ушла через
+                    // size=0 либо ещё не жила. Вставка новорождённого остаётся
+                    // единственной операцией над `states` в этой ветке.
                     self.states.insert(
                         l.price,
                         LevelState {
@@ -265,22 +275,45 @@ impl SideBook {
     }
 
     /// Атрибутировать только очередь новорождённых, не весь `states` (DV-I-7).
+    ///
+    /// Заодно закрывает ВСЕ `pending_bumps` для этой же цены — бампит их с той же
+    /// полосой (она детерминирована из price vs mid и одинакова для всех записей
+    /// по одной цене). Это и есть закрытие долга R-038 F-2 / DV-I-16.
     fn attribute_newborns(&mut self, mid: i64) {
         while let Some(price) = self.unattributed.pop_front() {
             let band = band_for_bps(signed_bps(price, mid).abs());
-            let mut delayed_state: Option<LevelState> = None;
+            // Сначала снимем `pending_bumps` для этой цены (Vec<fate> или None).
+            // Без этого шага borrow checker запрещает одновременно
+            // `self.states.get_mut` и `bump_finished_fate(self, ...)` в той же
+            // области видимости — оба берут `&mut self`.
+            let pending_fates: Option<Vec<Fate>> = self.pending_bumps.remove(&price);
             if let Some(state) = self.states.get_mut(&price) {
                 state.born_band_lo_bps = Some(band);
                 if state.fate != Fate::Alive {
-                    // Задержанная отмена / цензура / заморозка ДО mid: теперь
-                    // полоса известна → закрываем её немедленно и удаляем state,
-                    // чтобы финальная итерация не сделала дубль-bump.
-                    delayed_state = Some(*state);
+                    // До M-59 (R-038 F-2) здесь срабатывал путь «state с не-Alive
+                    // fate ДО атрибуции, полоса неизвестна — bump в
+                    // attribute_newborns». После фикса такое состояние в `states`
+                    // не лежит (унесено в `pending_bumps`), но `match` exhaustive
+                    // по Fate оставлен как страховка: если что-то привело сюда
+                    // state с отложенным fate, бампнем сейчас и удалим, чтобы
+                    // финальная итерация не задублировала.
+                    let bump_kind = match state.fate {
+                        Fate::Cancelled => BumpKind::Cancelled,
+                        Fate::Frozen => BumpKind::Frozen,
+                        Fate::Censored => BumpKind::Censored,
+                        Fate::Alive => BumpKind::Cancelled, // недостижимо, обход typeck
+                    };
+                    self.bump(band, bump_kind);
+                    self.states.remove(&price);
                 }
             }
-            if let Some(state) = delayed_state {
-                bump_finished_fate(self, band, state.fate);
-                self.states.remove(&price);
+            // Дополнительно: все `pending_bumps` для этой цены бампятся той же
+            // полосой — она одинакова для всех записей по одной цене (band
+            // определяется через price vs mid).
+            if let Some(fates) = pending_fates {
+                for fate in fates {
+                    bump_finished_fate(self, band, fate);
+                }
             }
         }
     }
@@ -440,8 +473,18 @@ pub fn analyze(ticks: &[DeltaTick]) -> LifetimeReport {
     // когда mid так и не появился до конца окна (односторонний поток). В этом пути
     // судьба известна (`Cancelled`/`Frozen`/`Censored`) — бамп в первой полосе по
     // `unwrap_or(BANDS_BPS[0].0)`, как и в прежней реализации.
-    flush_delayed_states(&mut aggregates, Side::Buy, &bids.states);
-    flush_delayed_states(&mut aggregates, Side::Sell, &asks.states);
+    flush_delayed_states(
+        &mut aggregates,
+        Side::Buy,
+        &bids.states,
+        &mut bids.pending_bumps,
+    );
+    flush_delayed_states(
+        &mut aggregates,
+        Side::Sell,
+        &asks.states,
+        &mut asks.pending_bumps,
+    );
 
     // Строим bands в детерминированном порядке (side_rank, lo_bps).
     let mut bands: Vec<BandReport> = aggregates
@@ -494,31 +537,53 @@ fn merge_band_counts(
     }
 }
 
-/// Добрать отложенные bumps по `states` (завершённые-судьбы без атрибуции из-за
-/// одностороннего потока). По построению к этому моменту `states` НЕ содержит
-/// `Alive` (alive ушли через `freeze_remaining`/`apply_gap_censor`) — только
-/// delayed `Cancelled`/etc. В Alive-ветку всё равно входим: `match` exhaustive.
+/// Добрать отложенные bumps по `states` (завершённые судьбы без атрибуции из-за
+/// одностороннего потока, когда mid так и не появился до конца окна) и по
+/// `pending_bumps` (R-038 F-2 — закрытие через отдельную очередь вместо хранения
+/// в `states`, чтобы перерождение цены не затирало завершённую жизнь).
+///
+/// По построению к этому моменту `states` НЕ содержит `Alive` (alive ушли через
+/// `freeze_remaining`/`apply_gap_censor`) — только delayed `Cancelled`/etc. Если
+/// попал Alive (артефакт построения), считаем как Alive+1: баланс
+/// `born == c + f + ce` сходится, fate остаётся семантически отличимым от
+/// Cancelled. И `pending_bumps`, и `states`-delayed бампятся на первой полосе —
+/// полоса НЕИЗВЕСТНА (mid не появился), прежняя логика `unwrap_or(BANDS_BPS[0].0)`.
 fn flush_delayed_states(
     aggregates: &mut BTreeMap<(i64, i64), BandAggregate>,
     side: Side,
     states: &BTreeMap<i64, LevelState>,
+    pending_bumps: &mut BTreeMap<i64, Vec<Fate>>,
 ) {
-    for state in states.values() {
-        if state.fate == Fate::Alive {
-            // alive-уровни уходят через freeze/gap; сюда попасть не должны. Если
-            // попали — это артефакт построения, считаем как Cancelled, чтобы
-            // баланс `born == c + f + ce` не разъехался.
-        }
-        let lo = state.born_band_lo_bps.unwrap_or(BANDS_BPS[0].0);
-        let entry = aggregates
-            .get_mut(&(side_rank(side), lo))
-            .expect("полоса pre-init");
-        let (_, born, cancelled, frozen, censored) = *entry;
-        *entry = match state.fate {
-            Fate::Alive => (side, born + 1, cancelled, frozen, censored),
-            Fate::Cancelled => (side, born + 1, cancelled + 1, frozen, censored),
-            Fate::Frozen => (side, born + 1, cancelled, frozen + 1, censored),
-            Fate::Censored => (side, born + 1, cancelled, frozen, censored + 1),
+    let first_band = BANDS_BPS[0].0;
+    let bump_to = |agg: &mut BandAggregate, fate: Fate| {
+        let (side_s, born, cancelled, frozen, censored) = *agg;
+        *agg = match fate {
+            Fate::Alive => (side_s, born + 1, cancelled, frozen, censored),
+            Fate::Cancelled => (side_s, born + 1, cancelled + 1, frozen, censored),
+            Fate::Frozen => (side_s, born + 1, cancelled, frozen + 1, censored),
+            Fate::Censored => (side_s, born + 1, cancelled, frozen, censored + 1),
         };
+    };
+
+    for state in states.values() {
+        let entry = aggregates
+            .get_mut(&(side_rank(side), first_band))
+            .expect("полоса pre-init");
+        bump_to(entry, state.fate);
     }
+
+    // pending_bumps: всё, что не закрыла attribute_newborns (mid не появился) —
+    // бампится на первой полосе. Полоса для всех записей по одной цене одна и та
+    // же, поэтому независимо от числа отложенных жизней на цену — все идут в
+    // один band.
+    let pending: Vec<Vec<Fate>> = pending_bumps.values().cloned().collect();
+    for fates in pending {
+        for fate in fates {
+            let entry = aggregates
+                .get_mut(&(side_rank(side), first_band))
+                .expect("полоса pre-init");
+            bump_to(entry, fate);
+        }
+    }
+    pending_bumps.clear();
 }
