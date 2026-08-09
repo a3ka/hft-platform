@@ -36,7 +36,20 @@
 ## 2. Allowed / Forbidden paths
 
 **architect:** `milestones/M-61-*.md` · `scripts/tests/red_artifact_ids.sh` · `scripts/verify_M-61.sh`.
-**dev:** `scripts/next_artifact_id.sh` · `scripts/check_artifact_ids.sh` · `.github/workflows/ci.yml` (джоб + `status-check.needs`).
+**engine-dev** (роль названа явно, не «dev»): `scripts/next_artifact_id.sh` ·
+`scripts/check_artifact_ids.sh` · `.github/workflows/ci.yml` (джоб + `status-check.needs`).
+
+> **Это CARVE-OUT относительно `scope-guard`, и он назван явно.** Глобальная таблица
+> закрепляет за engine-dev `crates/{…}/src/**` и `deploy/**`; каталога `scripts/` там нет.
+> Милестоун вправе выдать путь через Allowed paths — так уже сделано в `M-60a` §2 для
+> `scripts/check_docs_freeze.sh`, и механизм тот же. Но безымянное «dev» ставит исполнителя
+> перед выбором между спекой и таблицей, и правильным поведением становится ОСТАНОВКА:
+> engine-dev так и поступил (`SCOPE VIOLATION REQUEST`, 2026-08-09) — правило сработало, а
+> дефект был мой. Роль теперь названа, границы перечислены пофайлово.
+>
+> Что в этот carve-out НЕ входит и остаётся запретным для engine-dev: любой другой файл в
+> `scripts/`, `scripts/tests/**` и `scripts/verify_M-61.sh` (sacred, architect),
+> `research/**`, `milestones/**`, `crates/**`.
 **Forbidden:** переименование СУЩЕСТВУЮЩИХ артефактов (см. §5) · `crates/**` · `research/{critiques,reviews,arbitration}/*` · `TECH-DEBT.md` (reviewer).
 
 **Contract impact:** нет.
