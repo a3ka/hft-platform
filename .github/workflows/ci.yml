@@ -125,14 +125,38 @@ jobs:
       - name: Проба классификатора схемы (анти-плацебо, включая регресс-гварды $ref, R-006 F-1)
         run: bash scripts/tests/red_diff_contract_schema.sh
 
+  artifact-ids:
+    name: Artifact IDs (механический аллокатор, TD-111)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # Та же проводка, что у protected-artifacts: база — из СОБЫТИЯ (push.before / PR.base.sha),
+      # недостоверная база (zero / force-push / не-предок) — fail-closed. Спека §5: АДДИТИВНО,
+      # старые джобы и их членство в needs не трогаем.
+      - name: Коммит диапазона не вводит второй предмет под занятым номером (TD-111)
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: bash scripts/check_artifact_ids.sh
+
+      # Анти-плацебо: барьер обязан быть проверен ТОЙ ЖЕ проводкой, какой его зовёт CI —
+      # иначе «зелёный барьер» не отличим от «барьер пропускает всё» (testing.md).
+      - name: Проба барьера + аллокатора + батарея (анти-плацебо, 25 + 8 сценариев)
+        run: |
+          bash scripts/tests/red_artifact_ids.sh
+          bash scripts/tests/red_artifact_ids.sh --battery
+
   status-check:
     name: All checks passed
     runs-on: ubuntu-latest
-    needs: [build-test, security, delivery, protected-artifacts, contracts]
+    needs: [build-test, security, delivery, protected-artifacts, contracts, artifact-ids]
     if: always()
     steps:
       - run: |
-          if [[ "${{ needs.build-test.result }}" != "success" || "${{ needs.security.result }}" != "success" || "${{ needs.delivery.result }}" != "success" || "${{ needs.protected-artifacts.result }}" != "success" || "${{ needs.contracts.result }}" != "success" ]]; then
+          if [[ "${{ needs.build-test.result }}" != "success" || "${{ needs.security.result }}" != "success" || "${{ needs.delivery.result }}" != "success" || "${{ needs.protected-artifacts.result }}" != "success" || "${{ needs.contracts.result }}" != "success" || "${{ needs.artifact-ids.result }}" != "success" ]]; then
             echo "One or more checks failed"; exit 1
           fi
           echo "All checks passed"
