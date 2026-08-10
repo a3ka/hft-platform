@@ -101,13 +101,17 @@ subject_of() {
 universe() {
   local ref f cn subj
   for ref in $(all_refs); do
-    while IFS= read -r f; do
+    # КАНАЛ -z (закрывает ось 4 «имя, требующее квотирования»): текстовый `git ls-tree
+    # --name-only` квотирует имена с не-ASCII и спецсимволами (дефолт core.quotePath=true),
+    # а параметр-расширение `\320\260` не декодирует. С `-z` имя идёт как сырой UTF-8,
+    # разделитель — NUL, и читается `read -r -d ''`. Тот же ход закрыл M-60a (commit b3ba11a).
+    while IFS= read -r -d '' f; do
       [[ "${f}" =~ ${CLASS_RE} ]] || continue
       cn=$(cls_num "${f}") || continue
       subj=$(subject_of "${ref}:${f}")
       [ -n "${subj}" ] || continue
       printf '%s %s\n' "${cn}" "${subj}"
-    done < <(git ls-tree -r --name-only "${ref}" 2>/dev/null)
+    done < <(git ls-tree -r --name-only -z "${ref}" 2>/dev/null)
   done
   # TD — записью в TECH-DEBT.md, не файлом (правило 2). Слаг — в обратных кавычках.
   for ref in $(all_refs); do
@@ -123,14 +127,18 @@ universe() {
 introduced() {
   local c f cn subj
   for c in $(git rev-list "${raw}..HEAD" 2>/dev/null); do
-    while IFS= read -r f; do
+    # КАНАЛ -z + read -r -d '' (как в `universe()` и как в M-60a b3ba11a): без этого
+    # `git show --name-only` для не-ASCII имён выдаёт квотированный путь, и CLASS_RE
+    # (`^milestones/...`) не матчит — коллизия проходит молча. `tr '\0' '\n'` под -
+    # было КОНТР-продуктивным ходом: оно съедало то, ради чего `-z` ставился.
+    while IFS= read -r -d '' f; do
+      [[ -z "${f}" ]] && continue
       [[ "${f}" =~ ${CLASS_RE} ]] || continue
       cn=$(cls_num "${f}") || continue
       subj=$(subject_of "${c}:${f}")
       [ -n "${subj}" ] || continue
       printf '%s %s\n' "${cn}" "${subj}"
-    done < <(git show --name-only --no-renames --diff-filter=AM --format= -z "${c}" 2>/dev/null \
-             | tr '\0' '\n' | grep -v '^$' || true)
+    done < <(git show --name-only --no-renames --diff-filter=AM --format= -z "${c}" 2>/dev/null || true)
     # Новая запись в TECH-DEBT.md (TD — носитель §3.1 правило 2)
     git show "${c}" -- TECH-DEBT.md 2>/dev/null \
       | sed -nE 's/^\+- \*\*TD-0*([0-9]+)\*\* `([^`]+)`.*/TD \1 \2/p'
