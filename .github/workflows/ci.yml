@@ -67,6 +67,38 @@ jobs:
       - name: Проба барьера (анти-плацебо)
         run: bash scripts/tests/red_protected_artifacts.sh
 
+  docs-freeze:
+    name: Docs-freeze (M-60a — замок процессного слоя)
+    runs-on: ubuntu-latest
+    steps:
+      # fetch-depth: 0 ОБЯЗАТЕЛЬНО: барьер строит диапазон `$BASE..HEAD` через `git rev-list`,
+      # которому нужна ЛОКАЛЬНАЯ история. По умолчанию checkout даёт depth=1 (один коммит),
+      # и `rev-list` упрётся в `fatal: bad revision` — гейт закроется пустым диапазоном, то
+      # есть зелёным ВСЕГДА. Тот же класс дыры, что блокер B1 в `protected-artifacts`, и
+      # лечится той же ручкой.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Барьер замка процессного слоя (M-60a). База — ИЗ СОБЫТИЯ: тот же fail-closed паттерн,
+      # что в `protected-artifacts` (см. шапку комментария там). push → `github.event.before`;
+      # PR → `github.event.pull_request.base.sha`. Любая форма недостоверной базы (пустая /
+      # zero-SHA при создании ветки / force-push / база отсутствует в истории / база не предок
+      # HEAD) → FAIL, а не пропуск: «базы нет» не значит «проверять нечего».
+      - name: Барьер замка процессного слоя
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: bash scripts/check_docs_freeze.sh
+
+      # Проба барьера: ТОЙ ЖЕ проводкой, какой барьер зовёт CI (testing.md §«Целостность гейта»).
+      # Без этого шага «барьер зелёный» означает лишь, что скрипт существует и парсится, а
+      # не что инвариант защищён. 26 сценариев — 5 осей × все значения + легитимный сценарий
+      # на каждой; батарея --battery прогоняет эталон + 8 дырявых (милестоун §4.1).
+      - name: Проба барьера (26 сценариев + сверка со спекой §3bis.2)
+        run: bash scripts/tests/red_docs_freeze.sh
+
   contracts:
     name: Contracts gate (паритет + атомарный CT-RFC + additive/breaking)
     runs-on: ubuntu-latest
@@ -152,11 +184,11 @@ jobs:
   status-check:
     name: All checks passed
     runs-on: ubuntu-latest
-    needs: [build-test, security, delivery, protected-artifacts, contracts, artifact-ids]
+    needs: [build-test, security, delivery, protected-artifacts, contracts, docs-freeze, artifact-ids]
     if: always()
     steps:
       - run: |
-          if [[ "${{ needs.build-test.result }}" != "success" || "${{ needs.security.result }}" != "success" || "${{ needs.delivery.result }}" != "success" || "${{ needs.protected-artifacts.result }}" != "success" || "${{ needs.contracts.result }}" != "success" || "${{ needs.artifact-ids.result }}" != "success" ]]; then
+          if [[ "${{ needs.build-test.result }}" != "success" || "${{ needs.security.result }}" != "success" || "${{ needs.delivery.result }}" != "success" || "${{ needs.protected-artifacts.result }}" != "success" || "${{ needs.contracts.result }}" != "success" || "${{ needs.docs-freeze.result }}" != "success" || "${{ needs.artifact-ids.result }}" != "success" ]]; then
             echo "One or more checks failed"; exit 1
           fi
           echo "All checks passed"

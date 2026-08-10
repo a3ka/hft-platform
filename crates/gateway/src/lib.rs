@@ -1874,6 +1874,15 @@ pub fn frames_since_with_stats(
     max_events: usize,
 ) -> io::Result<(Vec<Frame>, Cursor, ReadStats)> {
     validate_selector(sel)?;
+    // M-57 (круг 2, задача 9): используем `stream_from` (без hint). Это STATELESS-
+    // функция: `after` приходит от вызывающего, и у вызывающего нет места, где
+    // держать `TailHint` (единственное per-session состояние для M-57 круг 2 —
+    // `LiveReducer::tail_hint`, и там уже используется `stream_from_at` в hot
+    // live-push пути). После удаления sidecar этот вызов делает полный forward-
+    // скан активного сегмента — идентично `main` до M-57, не регресс. См. §8
+    // milestone'а: путь НЕ покрыт M-57; если станет горячим — отдельная задача
+    // (перевод сигнатуры `frames_since` на `Option<TailHint>` или расширение
+    // `Cursor`, оба — scope-expansion за пределы engine-dev).
     let mut stream = journal::stream_from(dir, filter, after.upto_seq)?;
     let (delta, cursor, consumed, at_ms, _first_folded_seq) =
         reduce_event_stream(&mut stream, sel, after, Cursor::LATEST, max_events)?;
@@ -1933,6 +1942,10 @@ pub fn replay(
 pub struct ReadStats {
     pub events_decoded: u64,
     pub segments_opened: u32,
+    /// M-57 (TD-109), задача 5: честный счётчик ПРОЧИТАННЫХ событий (включая
+    /// отброшенные фильтром `after_seq`), проброшен из `journal::EventStream::events_scanned()`.
+    /// Аддитивен к `events_decoded` — не заменяет его, оба сохраняют свой смысл.
+    pub events_scanned: u64,
 }
 
 impl std::ops::Add for ReadStats {
@@ -1941,6 +1954,7 @@ impl std::ops::Add for ReadStats {
         Self {
             events_decoded: self.events_decoded + rhs.events_decoded,
             segments_opened: self.segments_opened + rhs.segments_opened,
+            events_scanned: self.events_scanned + rhs.events_scanned,
         }
     }
 }
@@ -1956,6 +1970,7 @@ fn read_stats_from_stream(stream: &journal::EventStream) -> ReadStats {
     ReadStats {
         events_decoded: stream.events_decoded(),
         segments_opened: stream.segments_opened(),
+        events_scanned: stream.events_scanned(),
     }
 }
 
@@ -1994,6 +2009,14 @@ pub fn snapshot_from_checkpoint(
             // skip). Редусер инициализируется восстановленным состоянием, и на нём
             // прогоняются ТОЛЬКО НОВЫЕ события — байт-идентично полному реплею.
             state.selector = sel.clone();
+            // M-57 (круг 2, задача 9): используем `stream_from` (без hint).
+            // Это STATELESS-функция: `ckpt_cursor` приходит из восстановленного
+            // чекпоинта, и per-session `TailHint` здесь негде держать (для hot
+            // live-push пути он в `LiveReducer::tail_hint` + `stream_from_at`).
+            // После удаления sidecar этот вызов делает полный forward-скан
+            // активного сегмента — идентично `main` до M-57, не регресс. Путь
+            // НЕ покрыт M-57 — см. §8 milestone'а; отдельная задача, если станет
+            // узким местом (scope-expansion сигнатуры `snapshot_from_checkpoint`).
             let mut stream = journal::stream_from(dir, filter.clone(), ckpt_cursor.upto_seq)?;
             let mut cursor = ckpt_cursor;
             for event in &mut stream {
@@ -2517,6 +2540,15 @@ pub mod checkpoint {
         // (3) Докорм хвостом: только `seq > base_cursor.upto_seq` (A) или всё (B).
         // Используем `stream_from` (GW-I-11 сегментный skip — НЕ читаем уже
         // покрытый префикс).
+        //
+        // M-57 (круг 2, задача 9): `stream_from` без hint — этот вызов STATELESS
+        // (`base_cursor` из чекпоинта, per-session `TailHint` негде держать —
+        // он живёт в `LiveReducer::tail_hint`, а это `checkpoint::advance_to`,
+        // вызываемый из `gateway-checkpoint` периодически раз в 5–15 мин, не
+        // hot live-push). После удаления sidecar вызов делает полный forward-
+        // скан активного сегмента — идентично `main` до M-57, не регресс.
+        // Путь НЕ покрыт M-57 — см. §8 milestone'а; отдельная задача при
+        // необходимости (scope-expansion сигнатуры `advance_to`).
         let mut final_cursor = base_cursor;
         let mut first_folded_seq: u64 = history_start_seq; // None-ветка: остаётся 0; Some: уже выставлен
         let mut consumed = 0_usize;
@@ -2918,6 +2950,14 @@ pub struct LiveReducer {
     /// не может расширить или сузить то, что уже спрунено ДО чекпоинта.
     full_history_start_seq: u64,
     full_history_truncated: bool,
+    /// M-57 (круг 2, TD-109): курсор хвоста активного сегмента в ПАМЯТИ сессии —
+    /// `seg_idx`/`last_seq`/`pos`. Передаётся в `journal::stream_from_at` при каждом
+    /// `pump()` и обновляется по `EventStream::tail_hint()` после прохода. Решает
+    /// обе находки PR-гейта `R-035`: (`F-035-1`) hint не зависит от записываемой
+    /// поверхности каталога, (`F-035-2`) hint — per-session, а не per-catalog.
+    /// `None` — первый `pump()` или после валидационного отката (ротация / запрошены
+    /// события из уже прочитанной зоны).
+    tail_hint: Option<journal::TailHint>,
 }
 
 impl LiveReducer {
@@ -2961,6 +3001,10 @@ impl LiveReducer {
                     full,
                     full_history_start_seq: header.history_start_seq,
                     full_history_truncated: header.history_truncated,
+                    // M-57 (TD-109): `cursor` уже на хвосте — hint обязан быть
+                    // заполнен ПЕРВЫМ ЖЕ pump'ом через `EventStream::tail_hint()`.
+                    // Прямо здесь его вычислить нельзя: `EventStream` ещё не построен.
+                    tail_hint: None,
                 },
                 ReadStats::default(),
             ));
@@ -3004,6 +3048,8 @@ impl LiveReducer {
                 full: Reducer::new(sel),
                 full_history_start_seq: history_start_seq,
                 full_history_truncated: history_start_seq > 0,
+                // M-57 (TD-109): первый `pump()` заполнит hint из `EventStream::tail_hint()`.
+                tail_hint: None,
             },
             stats,
         ))
@@ -3033,12 +3079,22 @@ impl LiveReducer {
 
         // Один тик обязан ДРЕНИРОВАТЬ ВЕСЬ доступный на момент вызова backlog (а не только
         // первые `max_events`) — иначе `pump` возвращал бы РОВНО ОДИН кадр за вызов, и
-        // «докачать всё» потребовало бы СТОЛЬКО вызовов, сколько `backlog/max_events`, что
+        // «докачать всё» потребовалось бы СТОЛЬКО вызовов, сколько `backlog/max_events`, что
         // ломает композицию «resume() без чекпоинта → N/max_events тиков» (TD-083 O-A:
         // `resume` без чекпоинта стартует с backlog = ВЕСЬ журнал, и первый же вызов обязан
         // покрыть его целиком, разбив на batch'и по `max_events`). `max_events` ограничивает
         // размер КАЖДОГО кадра (bounded-memory одного batch'а), не число кадров за вызов.
-        let mut stream = journal::stream_from(dir, filter, self.cursor.upto_seq)?;
+        //
+        // M-57 (круг 2, TD-109): используем `stream_from_at` с in-memory hint'ом, а не
+        // `stream_from`. `stream_from` (старый API, см. `segments.rs:1301`) НЕ принимает
+        // hint вообще — sidecar-файл `journal.tail-offset` удалён задачей 9, и
+        // `stream_from` каждый вызов декодирует активный сегмент с начала, даже если
+        // в нём уже миллионы событий (на проде к ротации сегмента ~10.7 млн — см. §0
+        // M-57, `F-035-1`). In-memory hint живёт в `self.tail_hint` (`None` на первом
+        // тике), обновляется после каждого прохода через `EventStream::tail_hint()` и
+        // естественно per-session (`F-035-2`).
+        let mut stream =
+            journal::stream_from_at(dir, filter, self.cursor.upto_seq, self.tail_hint)?;
         let mut frames: Vec<Frame> = Vec::new();
         let mut cursor = self.cursor;
         let mut batch_from = self.cursor;
@@ -3083,6 +3139,14 @@ impl LiveReducer {
             self.vwap.sum_v = batch.vwap.sum_v;
         }
         let stats = read_stats_from_stream(&stream);
+        // M-57 (TD-109): забираем hint СВОЕЙ сессии из стрима. Если за тик НЕ было
+        // ни одного декодированного события в активном сегменте (backlog пуст,
+        // `stream.tail_hint()` вернёт `None`), НЕ сбрасываем старый hint — он всё ещё
+        // указывает на корректную байтовую позицию активного сегмента и валиден,
+        // пока активный сегмент тот же (т.е. не было ротации). При ротации
+        // `resolve_active_start_offset` отбросит старый hint (несовпадение `seg_idx`)
+        // и сделает full scan + новый hint из обновлённого стрима — естественно.
+        self.tail_hint = stream.tail_hint().or(self.tail_hint);
 
         if batch_consumed > 0 {
             let (delta, at_ms) = batch.finish_with_at();
