@@ -126,6 +126,13 @@ universe() {
 # в занятый номер превращается в D + A → краснеет как «новый файл» (ось 4).
 # `-z` + `read -r -d ''` — единообразно с universe() выше: см. комментарий там
 # (R-046 Б-3: «приведи обе половины к одному приёму»).
+#
+# `--diff-filter=A` (только Added) — НЕ `--diff-filter=AM`. Правка существующего файла
+# (M) предмет не вводит: инвариант §4.1 сформулирован от ВВЕДЕНИЯ. Буква M считала
+# «введением» коммит, который лишь редактирует файл — барьер блокировал ОБСЛУЖИВАНИЕ
+# предсуществующих коллизий (9 файлов в main: R-035, R-038, M-46, C-018, C-024), работая
+# против собственного §4.1 (R-046 Б-2; architect commit 04de69c перевёл на это эталон
+# и добавил сценарий L4MOD — проба краснела до закрытия дыры в барьере).
 introduced() {
   local c f cn subj
   for c in $(git rev-list "${raw}..HEAD" 2>/dev/null); do
@@ -135,7 +142,7 @@ introduced() {
       subj=$(subject_of "${c}:${f}")
       [ -n "${subj}" ] || continue
       printf '%s %s\n' "${cn}" "${subj}"
-    done < <(git show --name-only --no-renames --diff-filter=AM --format= -z "${c}" 2>/dev/null || true)
+    done < <(git show --name-only --no-renames --diff-filter=A --format= -z "${c}" 2>/dev/null || true)
     # Новая запись в TECH-DEBT.md (TD — носитель §3.1 правило 2)
     git show "${c}" -- TECH-DEBT.md 2>/dev/null \
       | sed -nE 's/^\+- \*\*TD-0*([0-9]+)\*\* `([^`]+)`.*/TD \1 \2/p'
