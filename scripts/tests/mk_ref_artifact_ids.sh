@@ -78,11 +78,11 @@ git merge-base --is-ancestor "$BASE" HEAD 2>/dev/null || exit 1
 universe() {
   local ref f cn
   for ref in $(refs_all); do
-    while IFS= read -r f; do
+    while IFS= read -r -d '' f; do
       [[ "$f" =~ $CLASS_RE ]] || continue
       cn="$(cls_num "$f")" || continue
       printf '%s %s\n' "$cn" "$(subject_of "$ref:$f")"
-    done < <(git ls-tree -r --name-only "$ref" 2>/dev/null)
+    done < <(git ls-tree -r --name-only -z "$ref" 2>/dev/null)
   done
   # записи TECH-DEBT.md всех ref'ов
   for ref in $(refs_all); do
@@ -93,11 +93,11 @@ universe() {
 introduced() {
   local c f cn
   for c in $(git rev-list "$BASE..HEAD"); do
-    while IFS= read -r f; do
+    while IFS= read -r -d '' f; do
       [[ "$f" =~ $CLASS_RE ]] || continue
       cn="$(cls_num "$f")" || continue
       printf '%s %s\n' "$cn" "$(subject_of "$c:$f")"
-    done < <(git show --cc --name-only --no-renames --diff-filter=AM --format= "$c" 2>/dev/null)
+    done < <(git show --cc --name-only --no-renames --diff-filter=AM -z --format= "$c" 2>/dev/null)
     # новые записи TECH-DEBT.md этого коммита
     git show "$c" -- TECH-DEBT.md 2>/dev/null \
       | sed -nE 's/^\+- \*\*TD-0*([0-9]+)\*\* `([^`]+)`.*/TD \1 \2/p'
@@ -124,11 +124,11 @@ git cat-file -e "$BASE" 2>/dev/null || exit 1
 universe() {
   local ref f cn
   for ref in $(refs_all); do
-    while IFS= read -r f; do
+    while IFS= read -r -d '' f; do
       [[ "$f" =~ $CLASS_RE ]] || continue
       cn="$(cls_num "$f")" || continue
       printf '%s %s\n' "$cn" "$(subject_of "$ref:$f")"
-    done < <(git ls-tree -r --name-only "$ref" 2>/dev/null)
+    done < <(git ls-tree -r --name-only -z "$ref" 2>/dev/null)
   done
   for ref in $(refs_all); do
     git show "$ref:TECH-DEBT.md" 2>/dev/null | sed -nE 's/^- \*\*TD-0*([0-9]+)\*\* `([^`]+)`.*/TD \1 \2/p'
@@ -142,6 +142,10 @@ EOF
 
 # Мутант renameblind: не смотрит переименования (ось 4).
 BODY_RENAMEBLIND="${BODY_CHECK//--no-renames --diff-filter=AM/--diff-filter=A}"
+
+# Мутант quotedname: построчное чтение вместо `-z` (ось 4 / имя, требующее квотирования).
+BODY_QUOTEDNAME="${BODY_CHECK//-z /}"
+BODY_QUOTEDNAME="${BODY_QUOTEDNAME//read -r -d \'\' f/read -r f}"
 
 # ─── аллокаторы ─────────────────────────────────────────────────────────────────────
 read -r -d '' NEXT_REF <<'EOF'
@@ -182,13 +186,14 @@ emit slugonly-check.sh     "$SUBJ_SLUGONLY"   "$BODY_CHECK"
 emit contextblind-check.sh "$SUBJ_CTXBLIND"   "$BODY_CHECK"
 emit splitonly-check.sh    "$SUBJ_SPLITONLY"  "$BODY_CHECK"
 emit localmax-check.sh     "$SUBJ_FULL"       "$BODY_CHECK"
-for v in ref showall renameblind slugonly contextblind splitonly; do
+emit quotedname-check.sh   "$SUBJ_FULL"       "$BODY_QUOTEDNAME"
+for v in ref showall renameblind slugonly contextblind splitonly quotedname; do
   printf '%s\n%s\n' "$HEAD_COMMON" "$NEXT_REF" > "$D/$v-next.sh"; bash -n "$D/$v-next.sh" || exit 1
 done
 printf '%s\n%s\n' "$HEAD_COMMON" "$NEXT_LOCALMAX" > "$D/localmax-next.sh"; bash -n "$D/localmax-next.sh" || exit 1
 
 # Страж генератора: мутант, совпавший с эталоном, тестировал бы эталон под чужим именем.
-for m in showall renameblind slugonly contextblind splitonly; do
+for m in showall renameblind slugonly contextblind splitonly quotedname; do
   cmp -s "$D/ref-check.sh" "$D/$m-check.sh" && { echo "мутант $m НЕ ПОСТРОЕН — совпал с эталоном" >&2; exit 1; }
 done
 cmp -s "$D/ref-next.sh" "$D/localmax-next.sh" && { echo "мутант localmax НЕ ПОСТРОЕН" >&2; exit 1; }

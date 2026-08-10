@@ -59,6 +59,7 @@ N3HEAD|3|V|только origin, локальный head пропущен
 N3NOORIG|3|V|origin недоступен
 L3OK|3|L|origin ∪ refs/heads
 B4REN|4|V|переименование в занятый номер
+B4Q|4|V|имя, требующее квотирования
 L4DEL|4|L|удаление артефакта
 B5THIRD|5|V|усиление существующей коллизии
 B5BASE|5|V|недостоверная база
@@ -131,7 +132,7 @@ run_battery() {
     || die "эталон не собран: нет ${ROOT}/scripts/tests/mk_ref_artifact_ids.sh
   Батарея требует генератор эталона и мутантов — он часть набора (спека §4.5)."
   echo "══ БАТАРЕЯ (спека §4.5): эталон зелён, каждый мутант красный ══"
-  for v in ref showall localmax renameblind slugonly contextblind splitonly; do
+  for v in ref showall localmax renameblind slugonly contextblind splitonly quotedname; do
     [ -f "$d/$v-check.sh" ] || continue
     BARRIER="$d/$v-check.sh" ALLOC="$d/$v-next.sh" bash "${SELF}" > "$d/$v.log" 2>&1; rc=$?
     n=$((n + 1))
@@ -199,6 +200,18 @@ R="$(mk_repo b4ren)"; art "$R" research/reviews/R-220-alpha.md ""; art "$R" rese
 commit_all "$R" base2; B="$(cd "$R" && git rev-parse HEAD)"
 ( cd "$R" && git mv research/reviews/R-999-other.md research/reviews/R-220-other.md ) && commit_all "$R" "увод в занятый номер"
 expect_block B4REN "$R" "$B" "переименование в ЗАНЯТЫЙ номер"
+
+# B4Q — имя артефакта, которое git КВОТИРУЕТ в текстовом выводе (не-ASCII, кавычка,
+# обратный слэш). Реализация, читающая `ls-tree`/`show` ПОСТРОЧНО, получает имя уже
+# экранированным (`"research/reviews/R-940-\320\260.md"`) и не узнаёт ни класс, ни номер —
+# коллизия проходит молча. Тот же класс, что закрыт в M-60a значением `квотируемое имя члена
+# зоны` (мутант quotedpath); в M-61 ось 4 унаследована БЕЗ него, и потому ДВЕ независимые
+# реализации engine-dev прошли 25/25, обе пропуская эту коллизию (замер architect'а 2026-08-10).
+# Лечится сменой КАНАЛА на `-z`, а не доработкой разбора кавычек.
+R="$(mk_repo b4q)"; art "$R" 'research/reviews/R-940-альфа.md' ""; commit_all "$R" base2
+B="$(cd "$R" && git rev-parse HEAD)"
+art "$R" 'research/reviews/R-940-бета.md' ""; commit_all "$R" "второй R-940 с не-ASCII именем"
+expect_block B4Q "$R" "$B" "коллизия под именами, требующими квотирования"
 
 R="$(mk_repo l4del)"; art "$R" research/reviews/R-230-alpha.md ""; commit_all "$R" base2
 B="$(cd "$R" && git rev-parse HEAD)"; ( cd "$R" && git rm -q research/reviews/R-230-alpha.md ) && commit_all "$R" "удаление"
