@@ -38,6 +38,7 @@ all_refs() { git for-each-ref --format='%(refname)' refs/remotes/origin refs/hea
 
 max=0
 for ref in $(all_refs); do
+  n=""                                              # сбрасываем на каждом ref — `n` глобальная, и `n="${n}…"` иначе копит
   case "${CLS}" in
     TD)
       # TD живёт записью в TECH-DE-B.md, а не файлом; берём слаг из строки `- **TD-NNN** \`слаг\``,
@@ -47,9 +48,14 @@ for ref in $(all_refs); do
     M|R|C|A)
       # Номера — в именах файлов. Классы раскладываются по каталогам согласно архитектуре:
       # M → milestones/, R → research/reviews/, C → research/critiques/, A → research/arbitration/.
-      n=$(git ls-tree -r --name-only "${ref}" 2>/dev/null \
-          | grep -oE "(^|/)(${CLS})-[0-9]+" \
-          | grep -oE '[0-9]+' || true)
+      # `-z` + `read -r -d ''` ОБЯЗАТЕЛЬНАЯ пара: в текстовом режиме git КВОТИРУЕТ не-ASCII имена
+      # (`"research/reviews/R-940-\320\260.md"`), grep не узнал бы ни класс, ни номер — артефакт
+      # выпал бы из подсчёта, и аллокатор выдал бы уже занятый номер. Тот же приём в
+      # check_artifact_ids.sh (`R-046` Б-3: «приведи обе половины к одному приёму»).
+      while IFS= read -r -d '' f; do
+        n="${n} $(printf '%s\n' "$f" | grep -oE "(^|/)(${CLS})-[0-9]+" | grep -oE '[0-9]+')"
+      done < <(git ls-tree -r -z --name-only "${ref}" 2>/dev/null || true)
+      n="${n# }"                                  # снять ведущий пробел, если строка накопилась
       ;;
   esac
   for x in ${n}; do

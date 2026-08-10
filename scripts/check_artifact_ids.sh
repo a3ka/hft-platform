@@ -98,16 +98,20 @@ subject_of() {
 
 # ── universe: всё, что ЗАНИМАЕТ номер в объединении ref'ов ────────────────────────
 # Поток строк «класс номер subject», отсортированных и уникальных.
+# `-z` + `read -r -d ''` — ОБЯЗАТЕЛЬНАЯ пара: в текстовом режиме git КВОТИРУЕТ не-ASCII имена
+# (`"research/reviews/R-940-\320\260.md"`), CLASS_RE не совпал бы, и артефакт под русским
+# именем выпал бы из подсчёта занятости — коллизия проходит молча. Тот же приём ниже в
+# introduced() — обе половины единообразны (`R-046` Б-3).
 universe() {
   local ref f cn subj
   for ref in $(all_refs); do
-    while IFS= read -r f; do
+    while IFS= read -r -d '' f; do
       [[ "${f}" =~ ${CLASS_RE} ]] || continue
       cn=$(cls_num "${f}") || continue
       subj=$(subject_of "${ref}:${f}")
       [ -n "${subj}" ] || continue
       printf '%s %s\n' "${cn}" "${subj}"
-    done < <(git ls-tree -r --name-only "${ref}" 2>/dev/null)
+    done < <(git ls-tree -r -z --name-only "${ref}" 2>/dev/null)
   done
   # TD — записью в TECH-DEBT.md, не файлом (правило 2). Слаг — в обратных кавычках.
   for ref in $(all_refs); do
@@ -120,17 +124,18 @@ universe() {
 # ── introduced: что ВВЕДЕНО коммитами проверяемого диапазона ───────────────────────
 # Идём по `git rev-list BASE..HEAD`. `--no-renames` ломает rename-детект: переименование
 # в занятый номер превращается в D + A → краснеет как «новый файл» (ось 4).
+# `-z` + `read -r -d ''` — единообразно с universe() выше: см. комментарий там
+# (R-046 Б-3: «приведи обе половины к одному приёму»).
 introduced() {
   local c f cn subj
   for c in $(git rev-list "${raw}..HEAD" 2>/dev/null); do
-    while IFS= read -r f; do
+    while IFS= read -r -d '' f; do
       [[ "${f}" =~ ${CLASS_RE} ]] || continue
       cn=$(cls_num "${f}") || continue
       subj=$(subject_of "${c}:${f}")
       [ -n "${subj}" ] || continue
       printf '%s %s\n' "${cn}" "${subj}"
-    done < <(git show --name-only --no-renames --diff-filter=AM --format= -z "${c}" 2>/dev/null \
-             | tr '\0' '\n' | grep -v '^$' || true)
+    done < <(git show --name-only --no-renames --diff-filter=AM --format= -z "${c}" 2>/dev/null || true)
     # Новая запись в TECH-DEBT.md (TD — носитель §3.1 правило 2)
     git show "${c}" -- TECH-DEBT.md 2>/dev/null \
       | sed -nE 's/^\+- \*\*TD-0*([0-9]+)\*\* `([^`]+)`.*/TD \1 \2/p'
