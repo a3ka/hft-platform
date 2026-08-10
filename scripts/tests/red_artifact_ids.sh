@@ -61,6 +61,7 @@ L3OK|3|L|origin ∪ refs/heads
 B4REN|4|V|переименование в занятый номер
 B4Q|4|V|имя, требующее квотирования
 L4DEL|4|L|удаление артефакта
+L4MOD|4|L|правка существующего артефакта
 B5THIRD|5|V|усиление существующей коллизии
 B5BASE|5|V|недостоверная база
 L5PRE|5|L|предсуществующая коллизия вне диапазона
@@ -132,7 +133,7 @@ run_battery() {
     || die "эталон не собран: нет ${ROOT}/scripts/tests/mk_ref_artifact_ids.sh
   Батарея требует генератор эталона и мутантов — он часть набора (спека §4.5)."
   echo "══ БАТАРЕЯ (спека §4.5): эталон зелён, каждый мутант красный ══"
-  for v in ref showall localmax renameblind slugonly contextblind splitonly quotedname; do
+  for v in ref showall localmax renameblind slugonly contextblind splitonly quotedname touchcounts; do
     [ -f "$d/$v-check.sh" ] || continue
     BARRIER="$d/$v-check.sh" ALLOC="$d/$v-next.sh" bash "${SELF}" > "$d/$v.log" 2>&1; rc=$?
     n=$((n + 1))
@@ -216,6 +217,16 @@ expect_block B4Q "$R" "$B" "коллизия под именами, требую
 R="$(mk_repo l4del)"; art "$R" research/reviews/R-230-alpha.md ""; commit_all "$R" base2
 B="$(cd "$R" && git rev-parse HEAD)"; ( cd "$R" && git rm -q research/reviews/R-230-alpha.md ) && commit_all "$R" "удаление"
 expect_allow L4DEL "$R" "$B" "удаление артефакта номер не занимает"
+
+# L4MOD — ПРАВКА существующего артефакта предмета не вводит (R-046 Б-2). Реализация,
+# собирающая введённое через `--diff-filter=AM`, считает буквой M «введением» коммит, который
+# лишь редактирует файл. Радиус — девять предсуществующих коллизий в main (R-035, R-038, M-46,
+# C-018, C-024), которые §5 ЗАПРЕЩАЕТ переименовывать: барьер начинал блокировать их
+# обслуживание вместо ввода новых, то есть работал против §4.1.
+R="$(mk_repo l4mod)"; art "$R" research/reviews/R-950-alpha.md ""; art "$R" research/reviews/R-950-beta.md ""
+commit_all "$R" "предсуществующая коллизия"; B="$(cd "$R" && git rev-parse HEAD)"
+( cd "$R" && echo дополнение >> research/reviews/R-950-alpha.md ) && commit_all "$R" "правка существующего"
+expect_allow L4MOD "$R" "$B" "правка существующего артефакта под коллизионным номером"
 
 R="$(mk_repo b5third)"; art "$R" research/reviews/R-300-alpha.md ""; art "$R" research/reviews/R-300-beta.md ""
 commit_all "$R" "предсуществующая коллизия"; B="$(cd "$R" && git rev-parse HEAD)"

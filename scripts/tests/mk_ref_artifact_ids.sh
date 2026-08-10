@@ -97,7 +97,7 @@ introduced() {
       [[ "$f" =~ $CLASS_RE ]] || continue
       cn="$(cls_num "$f")" || continue
       printf '%s %s\n' "$cn" "$(subject_of "$c:$f")"
-    done < <(git show --cc --name-only --no-renames --diff-filter=AM -z --format= "$c" 2>/dev/null)
+    done < <(git show --cc --name-only --no-renames --diff-filter=A -z --format= "$c" 2>/dev/null)
     # новые записи TECH-DEBT.md этого коммита
     git show "$c" -- TECH-DEBT.md 2>/dev/null \
       | sed -nE 's/^\+- \*\*TD-0*([0-9]+)\*\* `([^`]+)`.*/TD \1 \2/p'
@@ -141,7 +141,11 @@ exit 0
 EOF
 
 # Мутант renameblind: не смотрит переименования (ось 4).
-BODY_RENAMEBLIND="${BODY_CHECK//--no-renames --diff-filter=AM/--diff-filter=A}"
+# Мутант renameblind: детекция переименований ВКЛЮЧЕНА, поэтому увод показывается как R и
+# фильтром A не ловится — слеп именно к переименованию, а не сломан целиком.
+BODY_RENAMEBLIND="${BODY_CHECK//--no-renames /}"
+# Мутант touchcounts: правка (M) считается введением предмета (ось 4 / правка существующего).
+BODY_TOUCHCOUNTS="${BODY_CHECK//--diff-filter=A /--diff-filter=AM }"
 
 # Мутант quotedname: построчное чтение вместо `-z` (ось 4 / имя, требующее квотирования).
 BODY_QUOTEDNAME="${BODY_CHECK//-z /}"
@@ -187,13 +191,14 @@ emit contextblind-check.sh "$SUBJ_CTXBLIND"   "$BODY_CHECK"
 emit splitonly-check.sh    "$SUBJ_SPLITONLY"  "$BODY_CHECK"
 emit localmax-check.sh     "$SUBJ_FULL"       "$BODY_CHECK"
 emit quotedname-check.sh   "$SUBJ_FULL"       "$BODY_QUOTEDNAME"
-for v in ref showall renameblind slugonly contextblind splitonly quotedname; do
+emit touchcounts-check.sh  "$SUBJ_FULL"       "$BODY_TOUCHCOUNTS"
+for v in ref showall renameblind slugonly contextblind splitonly quotedname touchcounts; do
   printf '%s\n%s\n' "$HEAD_COMMON" "$NEXT_REF" > "$D/$v-next.sh"; bash -n "$D/$v-next.sh" || exit 1
 done
 printf '%s\n%s\n' "$HEAD_COMMON" "$NEXT_LOCALMAX" > "$D/localmax-next.sh"; bash -n "$D/localmax-next.sh" || exit 1
 
 # Страж генератора: мутант, совпавший с эталоном, тестировал бы эталон под чужим именем.
-for m in showall renameblind slugonly contextblind splitonly quotedname; do
+for m in showall renameblind slugonly contextblind splitonly quotedname touchcounts; do
   cmp -s "$D/ref-check.sh" "$D/$m-check.sh" && { echo "мутант $m НЕ ПОСТРОЕН — совпал с эталоном" >&2; exit 1; }
 done
 cmp -s "$D/ref-next.sh" "$D/localmax-next.sh" && { echo "мутант localmax НЕ ПОСТРОЕН" >&2; exit 1; }
