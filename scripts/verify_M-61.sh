@@ -247,6 +247,52 @@ sys.exit(0 if ok else 1)
 PYW
 fi
 
+echo "--- W2: АДДИТИВНОСТЬ проводки относительно origin/main (R-046 Б-1) ---"
+# Шаг W проверяет предусловия относительно базы ДИАПАЗОНА — и потому слеп к джобу, которого
+# в базе не существовало. Замер reviewer'а: ветка отведена от main ДО M-60a, разрешение
+# конфликта «версией ветки» удаляло docs-freeze целиком, а W давал 5×PASS, exit=0.
+# Лечится сверкой с origin/main: ни один джоб, входящий в блокирующую проверку ТАМ, не смеет
+# исчезнуть ЗДЕСЬ. Класс тот же, что C-073 F-5, применённый к джобу из чужого milestone'а.
+if git rev-parse --verify -q origin/main >/dev/null; then
+  python3 - <<'PYW2' || FAILED=$((FAILED + 1))
+import subprocess, sys
+try:
+    import yaml
+except Exception:
+    print("FAIL  W2 PyYAML недоступен — аддитивность не проверить"); sys.exit(1)
+def needs_of(text):
+    d = yaml.safe_load(text) or {}
+    sc = (d.get('jobs') or {}).get('status-check') or {}
+    n = sc.get('needs')
+    return set([] if n is None else ([n] if isinstance(n, str) else [str(x) for x in n]))
+def guard_of(text):
+    d = yaml.safe_load(text) or {}
+    sc = (d.get('jobs') or {}).get('status-check') or {}
+    return " ".join(s.get('run','') for s in (sc.get('steps') or []) if isinstance(s, dict))
+here = open('.github/workflows/ci.yml', encoding='utf-8').read()
+main = subprocess.run(['git','show','origin/main:.github/workflows/ci.yml'],
+                      capture_output=True, text=True).stdout
+if not main.strip():
+    print("FAIL  W2 SETUP НЕ СОСТОЯЛСЯ: ci.yml из origin/main не прочитан — сравнивать не с чем")
+    sys.exit(1)
+lost = needs_of(main) - needs_of(here)
+g = guard_of(here)
+unguarded = sorted(j for j in needs_of(main) if j not in lost and j not in g)
+ok = True
+if lost:
+    print("FAIL  W2 джобы ИСЧЕЗЛИ из status-check.needs относительно origin/main: %s" % ", ".join(sorted(lost)))
+    print("      ↳ проводка не аддитивна: разрешение конфликта выбросило чужой барьер")
+    ok = False
+if unguarded:
+    print("FAIL  W2 джобы в needs, но НЕ в сверке result: %s" % ", ".join(unguarded)); ok = False
+if ok:
+    print("PASS  W2 аддитивность: все %d джоба origin/main на месте и в сверке" % len(needs_of(main)))
+sys.exit(0 if ok else 1)
+PYW2
+else
+  fail "W2 origin/main недоступен — аддитивность не проверить"
+fi
+
 echo "--- P: РЕГРЕСС — соседний барьер артефактов цел ---"
 if bash scripts/tests/red_protected_artifacts.sh >/tmp/m61-prot.log 2>&1; then
   pass "P $(grep -oE 'VERDICT: PASS \([0-9]+/[0-9]+\)' /tmp/m61-prot.log | head -1)"
