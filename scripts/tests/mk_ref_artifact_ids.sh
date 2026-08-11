@@ -211,7 +211,7 @@ emit_h() { printf '%s\n%s\n%s\n' "$2" "$3" "$4" > "$D/$1"; bash -n "$D/$1" || ex
 # из-за чего мутант пропускал ЛЮБУЮ коллизию и краснел на всех 12 сценариях — то есть был
 # сломан целиком, а не слеп к квотированию. Теперь трогаются ровно три места: два git-вызова
 # теряют `-z` (git начинает КВОТИРОВАТЬ не-ASCII имена), читатель переходит на построчный.
-BODY_QUOTEDNAME="$(mutate 's|ls-tree -r -z --name-only|ls-tree -r --name-only|; s|--format= -z |--format= |; s|read -r -d '"'"''"'"' f|read -r f|')"
+BODY_QUOTEDNAME="$(mutate 's|--name-only -z |--name-only |; s|--diff-filter=A -z |--diff-filter=A |; s|read -r -d '"'"''"'"' f|read -r f|')"
 # originonly — перечисление refs теряет локальные головы (ось 3)
 # namesonly — записи в TECH-DEBT.md не читаются вовсе (ось 2)
 BODY_NAMESONLY="$(mutate 's|:TECH-DEBT\.md|:TECH-DEBT.НЕТ.md|')"
