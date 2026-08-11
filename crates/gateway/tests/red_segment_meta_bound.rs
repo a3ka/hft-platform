@@ -553,12 +553,18 @@ fn sm5_compaction_is_noticed_and_quiet_dir_is_not_rescanned() {
     // Мера — СОБЫТИЯ, а не кадры: кадр несёт несколько событий, и сравнение `frames.len()`
     // с длиной `reference_seqs` сравнивало бы разные величины (замер: 101 против 806).
     let mut seen = s_first.events_decoded as usize;
-    let raw2_before = fs::read_dir(dir.path()).expect("rd").filter_map(|e| e.ok())
-        .filter(|e| e.file_name().to_string_lossy().ends_with(".jrnl")).count();
+    let raw2_before = fs::read_dir(dir.path())
+        .expect("rd")
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".jrnl"))
+        .count();
     journal::compact_closed_segments(dir.path(), 1, journal::DEFAULT_COMPACT_LEVEL)
         .expect("compact 2");
-    let raw2_after = fs::read_dir(dir.path()).expect("rd").filter_map(|e| e.ok())
-        .filter(|e| e.file_name().to_string_lossy().ends_with(".jrnl")).count();
+    let raw2_after = fs::read_dir(dir.path())
+        .expect("rd")
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".jrnl"))
+        .count();
     assert!(
         raw2_after < raw2_before,
         "SETUP НЕ СОСТОЯЛСЯ: вторая компакция не удалила ни одного `.jrnl` ({raw2_before} -> \
