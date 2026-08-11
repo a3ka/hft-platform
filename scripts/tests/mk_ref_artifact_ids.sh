@@ -201,10 +201,9 @@ emit() { printf '%s\n%s\n%s\n' "$HEAD_COMMON" "$2" "$3" > "$D/$1"; bash -n "$D/$
 # из-за которого понадобился круг 3. `sed` с одинарными кавычками предсказуем, а страж
 # «мутант обязан отличаться» ниже ловит несработавшую подстановку немедленно.
 mutate() { printf '%s\n' "${BODY_CHECK}" | sed "$1"; }
-# originonly мутирует ШАПКУ: `refs_all()` объявлена в HEAD_COMMON, а не в теле.
+# originonly мутирует ШАПКУ АЛЛОКАТОРА: `refs_all()` объявлена в HEAD_COMMON, а не в теле.
 HEAD_ORIGINONLY="$(printf '%s\n' "${HEAD_COMMON}" | sed 's|refs/remotes/origin refs/heads|refs/remotes/origin|')"
-# emit со СВОЕЙ шапкой — иначе мутант шапки невыразим.
-emit_h() { printf '%s\n%s\n%s\n' "$2" "$3" "$4" > "$D/$1"; bash -n "$D/$1" || exit 1; }
+[ "$HEAD_ORIGINONLY" != "$HEAD_COMMON" ] || { echo "originonly: подстановка шапки НЕ СРАБОТАЛА" >&2; exit 1; }
 
 # quotedname — Б-4 (R-052): мутант обязан отличаться от эталона ТОЛЬКО КАНАЛОМ ЧТЕНИЯ ИМЁН.
 # Прежняя сплошная подстановка срезала `-z` и у shell-тестов (`[ -z "$IN" ]` → `[ "$IN" ]`),
@@ -219,8 +218,19 @@ BODY_NAMESONLY="$(mutate 's|:TECH-DEBT\.md|:TECH-DEBT.НЕТ.md|')"
 BODY_ABSOLUTE="$(mutate 's|git rev-list "\$BASE\.\.HEAD"|git rev-list HEAD|')"
 # rangeblind — смотрит только вершину диапазона, а не каждый коммит (ось 5)
 BODY_RANGEBLIND="$(mutate 's|git rev-list "\$BASE\.\.HEAD"|git rev-list -n 1 "$BASE..HEAD"|')"
-# slugskip — файл без слага пропускается вместо sentinel (ось 6)
-SUBJ_SLUGSKIP="$(printf '%s\n' "${SUBJ_FULL}" | sed "s|\[ -z \"\$s\" \] && s='<без-слага>'|[ -z \"\$s\" ] \&\& return|")"
+
+# slugskip — файл без слага ПРОПУСКАЕТСЯ вместо участия в сравнении (ось 6).
+# A-006 §2.3: прежняя мутация правила `subject_of` (ранний `return` вместо sentinel) слепоты
+# НЕ РЕАЛИЗОВЫВАЛА — пустой subject всё равно печатался вызывающим и всё равно участвовал в
+# сравнении, поэтому мутант вёл себя как эталон и проба была ЗЕЛЕНА против него. Пропуск
+# возможен только в ВЫЗЫВАЮЩЕМ: `subject_of` печатает, решение «участвовать или нет»
+# принимает цикл. Поэтому мутирует ТЕЛО (две точки эмиссии), а `subject_of` остаётся
+# эталонным — мутант отличается ровно одним свойством: судьбой slugless-артефакта.
+read -r -d '' SED_SLUGSKIP <<'EOF'
+s|printf '%s %s\\n' "$cn" "$(subject_of "$ref:$f")"|sb="$(subject_of "$ref:$f")"; [ "$sb" = "<без-слага>" ] \&\& continue; printf '%s %s\\n' "$cn" "$sb"|
+s|printf '%s %s\\n' "$cn" "$(subject_of "$c:$f")"|sb="$(subject_of "$c:$f")"; [ "$sb" = "<без-слага>" ] \&\& continue; printf '%s %s\\n' "$cn" "$sb"|
+EOF
+BODY_SLUGSKIP="$(mutate "$SED_SLUGSKIP")"
 
 # вариант : check(subject, body) + next
 emit ref-check.sh          "$SUBJ_FULL"       "$BODY_CHECK"
@@ -232,20 +242,43 @@ emit splitonly-check.sh    "$SUBJ_SPLITONLY"  "$BODY_CHECK"
 emit localmax-check.sh     "$SUBJ_FULL"       "$BODY_CHECK"
 emit quotedname-check.sh   "$SUBJ_FULL"       "$BODY_QUOTEDNAME"
 emit touchcounts-check.sh  "$SUBJ_FULL"       "$BODY_TOUCHCOUNTS"
-emit_h originonly-check.sh "$HEAD_ORIGINONLY" "$SUBJ_FULL" "$BODY_CHECK"
+# originonly — БАРЬЕР эталонный: ось 3 «область поиска занятости» — предмет АЛЛОКАТОРА
+# (`next_artifact_id.sh`), а не барьера; мутант строится ниже, на аллокаторе, как localmax.
+# A-006 §2.3 признал точечный профиль originonly структурно недостижимым — это верно ТОЛЬКО
+# для мутанта, построенного на барьере: `universe()` фикстур не несёт origin-ref'ов, поэтому
+# барьер без `refs/heads` слеп ко ВСЕМУ и краснеет на всех 12 блокирующих сценариях. Замер
+# круга 4: тот же дефект, внесённый в АЛЛОКАТОР, даёт ровно N3LOCAL+N3HEAD — обе оси 3, и
+# N3HEAD есть дословно объявленное значение «только origin, локальный head пропущен».
+# Клапан (в) `R-052` усл. 3 (вывод мутанта из §4.5) поэтому НЕ применяется: он был бы платой
+# за дефект построения, а не за структурное свойство фикстур.
+emit originonly-check.sh   "$SUBJ_FULL"       "$BODY_CHECK"
 emit namesonly-check.sh    "$SUBJ_FULL"       "$BODY_NAMESONLY"
 emit absolute-check.sh     "$SUBJ_FULL"       "$BODY_ABSOLUTE"
 emit rangeblind-check.sh   "$SUBJ_FULL"       "$BODY_RANGEBLIND"
-emit slugskip-check.sh     "$SUBJ_SLUGSKIP"   "$BODY_CHECK"
-for v in ref showall renameblind slugonly contextblind splitonly quotedname touchcounts \
-         originonly namesonly absolute rangeblind slugskip; do
+emit slugskip-check.sh     "$SUBJ_FULL"       "$BODY_SLUGSKIP"
+
+# Аллокаторы. Список ВЫВОДИТСЯ из построенных барьеров, а не дублируется руками: прежний
+# захардкоженный перечень — то же ручное соответствие, что дрейфовало везде (A-006 §2.5).
+for f in "$D"/*-check.sh; do
+  v="$(basename "$f" -check.sh)"
   printf '%s\n%s\n' "$HEAD_COMMON" "$NEXT_REF" > "$D/$v-next.sh"; bash -n "$D/$v-next.sh" || exit 1
 done
-printf '%s\n%s\n' "$HEAD_COMMON" "$NEXT_LOCALMAX" > "$D/localmax-next.sh"; bash -n "$D/localmax-next.sh" || exit 1
+# Два мутанта ОСИ 3 живут в аллокаторе: localmax — максимум своего дерева; originonly —
+# перечисление ref'ов теряет `refs/heads` (номер, занятый локальной веткой, не виден).
+printf '%s\n%s\n' "$HEAD_COMMON"     "$NEXT_LOCALMAX" > "$D/localmax-next.sh";   bash -n "$D/localmax-next.sh"   || exit 1
+printf '%s\n%s\n' "$HEAD_ORIGINONLY" "$NEXT_REF"      > "$D/originonly-next.sh"; bash -n "$D/originonly-next.sh" || exit 1
 
-# Страж генератора: мутант, совпавший с эталоном, тестировал бы эталон под чужим именем.
-for m in showall renameblind slugonly contextblind splitonly quotedname touchcounts; do
-  cmp -s "$D/ref-check.sh" "$D/$m-check.sh" && { echo "мутант $m НЕ ПОСТРОЕН — совпал с эталоном" >&2; exit 1; }
+# Страж генератора: мутант, совпавший с эталоном, тестировал бы эталон под чужим именем —
+# ровно то, чем оборачивается ТИХО НЕ СРАБОТАВШАЯ подстановка. Перебираются ВСЕ построенные:
+# прежний список был захардкожен (7 имён при 13 мутантах) и сам являлся ручным соответствием,
+# то есть стражем, не стерегущим половину состава (A-006 §2.5 — механизируй, а не сверяй глазом).
+built=0
+for f in "$D"/*-check.sh; do
+  m="$(basename "$f" -check.sh)"
+  [ "$m" = ref ] && continue
+  built=$((built + 1))
+  if cmp -s "$D/ref-check.sh" "$D/$m-check.sh" && cmp -s "$D/ref-next.sh" "$D/$m-next.sh"; then
+    echo "мутант $m НЕ ПОСТРОЕН — совпал с эталоном И по барьеру, И по аллокатору" >&2; exit 1
+  fi
 done
-cmp -s "$D/ref-next.sh" "$D/localmax-next.sh" && { echo "мутант localmax НЕ ПОСТРОЕН" >&2; exit 1; }
-echo "эталон и 6 мутантов собраны в $D"
+echo "эталон и $built мутантов собраны в $D"
