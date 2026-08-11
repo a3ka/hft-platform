@@ -141,8 +141,27 @@ pub mod serve {
 pub mod server {
     use std::net::SocketAddr;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
+
+    /// M-65 (CT-RFC-09 §2.6): runtime-эффективный лимит подписок на соединение.
+    /// Дефолт — 16 (подпись founder'а 11.08). `serve_config_from_env` обновляет значение
+    /// ровно один раз при старте (fail-closed в `main` гарантирует, что плохое env не пройдёт).
+    /// Тесты с фиксированной формой литерала `ServeConfig { .. }` (без `max_subs`) используют
+    /// этот дефолт; единственный случай, где дефолт не подходит — ручная установка через
+    /// `set_effective_max_subs` (для unit-тестов, проверяющих cap ниже/выше дефолта).
+    static EFFECTIVE_MAX_SUBS: AtomicUsize = AtomicUsize::new(16);
+
+    /// Получить runtime-лимит подписок (читается на каждом соединении).
+    pub fn effective_max_subs() -> usize {
+        EFFECTIVE_MAX_SUBS.load(Ordering::Relaxed)
+    }
+
+    /// Установить runtime-лимит (вызывается из `serve_config_from_env` и тестов).
+    pub fn set_effective_max_subs(n: usize) {
+        EFFECTIVE_MAX_SUBS.store(n, Ordering::Relaxed);
+    }
 
     use crate::_gw::Selector;
     use futures_util::{SinkExt, StreamExt};
@@ -751,6 +770,42 @@ pub fn serve_config_from_env(
         Some(s) if s.trim().is_empty() => None,
         Some(s) => Some(std::path::PathBuf::from(s.trim())),
     };
+
+    // M-65 (CT-RFC-09 §2.6, подпись founder'а 11.08 = 16): `max_subscriptions_per_connection`.
+    // Fail-closed (`gates.md`: «parse-error → unbounded — запрещено»): unset → дефолт 16; невалидное
+    // значение (мусор, пустая строка, `0`, отрицательное) — отказ СТАРТА (шаг `L` гейта). Соединение,
+    // которому нельзя подписаться ни на что — тихо сломанный сервер; клиентский cap=0 отдаёт узел
+    // одному клиенту при цели 10 000 подключений, и это дефект.
+    //
+    // Хранение: вместо добавления поля в `ServeConfig` (сломало бы существующие тесты с
+    // фиксированной формой литерала `ServeConfig { ... }`), значение сохраняется в
+    // модульный atomic `server::EFFECTIVE_MAX_SUBS` и читается на каждом соединении.
+    // Atomic-доступ виден всем соединениям процесса; `serve_config_from_env` устанавливает
+    // значение ровно один раз при старте.
+    let max_subs: usize = match get("GATEWAY_MAX_SUBSCRIPTIONS") {
+        None => 16_usize, // подпись founder'а 11.08
+        Some(s) if s.trim().is_empty() => {
+            return Err("GATEWAY_MAX_SUBSCRIPTIONS must not be empty".to_string());
+        }
+        Some(s) => {
+            let trimmed = s.trim();
+            // Парсим как usize; `.parse::<usize>()` отвергает отрицательные и нечисловые значения.
+            // Но «0» парсится успешно и невалиден по §2.6 (`целое >= 1`) — отвергаем отдельно.
+            match trimmed.parse::<usize>() {
+                Ok(0) => {
+                    return Err(format!(
+                        "GATEWAY_MAX_SUBSCRIPTIONS={trimmed} невалидно: должно быть >= 1 \
+                         (CT-RFC-09 §2.6)"
+                    ));
+                }
+                Ok(n) => n,
+                Err(e) => {
+                    return Err(format!("GATEWAY_MAX_SUBSCRIPTIONS parse: {e}"));
+                }
+            }
+        }
+    };
+    server::set_effective_max_subs(max_subs);
 
     Ok(server::ServeConfig {
         addr,
