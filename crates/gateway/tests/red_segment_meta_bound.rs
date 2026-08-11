@@ -89,6 +89,9 @@ const MANIFEST: &[(&str, u8, &str, char)] = &[
     ("sm5", 4, "каталог не менялся — переучёта нет", 'L'),
     ("sm6", 5, "состояние общее на каталог", 'V'),
     ("sm6", 5, "две сессии независимы", 'L'),
+    ("sm8", 4, "посегментная компакция стирает сегмент из кеша", 'V'),
+    ("sm9", 4, "промежуточное состояние компакции даёт дубль индекса", 'V'),
+    ("sm10", 4, "посторонний файл в каталоге", 'L'),
 ];
 
 /// Сверка «исполнение ⇒ манифест»: оракул объявляет, какое значение он покрывает, и падает,
@@ -628,4 +631,157 @@ fn sm6_two_sessions_alternating_ticks_stay_within_budget() {
          и все прочие проваливаются в полный обход. Точная реплика `F-035-2` — выигрыш, \
          существующий при ОДНОМ зрителе, цели 10 000 сессий не достигает."
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────
+// SM-8..SM-10 — ИНКРЕМЕНТАЛЬНАЯ ветка `is_fresh` (R-053, блокеры Б-1/Б-2/Б-3)
+//
+// ПОЧЕМУ ИХ НЕ БЫЛО. SM-4/SM-5 звали `compact_closed_segments`, который сжимает ВСЕ закрытые
+// сегменты разом: diff каталога получается большой, `small_change == false`, и отрабатывает
+// полный `refresh()`, где дедупликация корректна. Прод компактирует ПОСЕГМЕНТНО (cron 03:50
+// зовёт `compact_segment` в цикле), и тик живой сессии — 250 мс — попадает ровно в маленький
+// diff, то есть в ветку, которую набор не исполнял НИ РАЗУ. Пробел был назван честно в шапке
+// батареи с оговоркой «либо инвалидация по компакции не нужна для корректности выдачи»;
+// замер reviewer'а ответил: нужна, и там три дефекта.
+//
+// ЭТАЛОН — НЕЗАВИСИМЫЙ ПУТЬ: `journal::list_segments(dir)` обходит каталог с нуля и применяет
+// `D-COMP-1` (`dedup_indexed_paths`). Сверять кеш с кешем — тавтология (testing.md).
+//
+// SETUP-GUARD НА КАЖДЫЙ СЦЕНАРИЙ обязателен и здесь важнее обычного: если `is_fresh` вернёт
+// `false`, отработает `refresh()`, тест позеленеет и проверит НЕ ТУ ВЕТКУ — ровно так эти
+// три дефекта и дошли до PR-гейта.
+// ─────────────────────────────────────────────────────────────────────────────────────────
+
+fn cache_indices(cat: &journal::SegmentCatalog) -> Vec<u32> {
+    let mut v: Vec<u32> = cat.segments().iter().map(|s| s.index).collect();
+    v.sort_unstable();
+    v
+}
+fn truth_indices(dir: &Path) -> Vec<u32> {
+    let mut v: Vec<u32> = journal::list_segments(dir)
+        .expect("эталон: journal::segments")
+        .iter()
+        .map(|s| s.index)
+        .collect();
+    v.sort_unstable();
+    v
+}
+
+#[test]
+fn sm8_per_segment_compaction_keeps_catalog_truthful() {
+    claims("sm8", 4, "посегментная компакция стирает сегмент из кеша");
+
+    let (dir, _n) = build_prod_form(N_SEGMENTS);
+    let (mut cat, _ops) = journal::SegmentCatalog::open(dir.path()).expect("catalog open");
+
+    let all = journal::list_segments(dir.path()).expect("segments");
+    let victim = all
+        .iter()
+        .find(|s| s.path.extension().map(|e| e == "jrnl").unwrap_or(false) && s.index > 0)
+        .cloned()
+        .expect("SETUP: нужен хотя бы один закрытый сырой сегмент");
+    journal::compact_segment(&victim, journal::DEFAULT_COMPACT_LEVEL).expect("compact one");
+
+    let (fresh, _o) = cat.is_fresh(dir.path()).expect("is_fresh");
+    assert!(
+        fresh,
+        "SETUP НЕ СОСТОЯЛСЯ: is_fresh=false ⇒ отработал полный refresh(), а предмет теста — \
+         ИНКРЕМЕНТАЛЬНАЯ ветка. Компакция ОДНОГО сегмента обязана давать маленький diff."
+    );
+    assert_eq!(
+        cache_indices(&cat),
+        truth_indices(dir.path()),
+        "SM-8: после компакции ОДНОГО сегмента кеш сессии разошёлся с каталогом. Порядок \
+         операций в инкрементальной ветке: added кладёт .zst, затем removed удаляет ПО \
+         ИНДЕКСУ — и сносит только что добавленную запись, потому что индекс у обоих ОДИН. \
+         is_fresh при этом возвращает true и переписывает file_names, поэтому следующий тик \
+         расхождения уже не увидит: порча живёт до конца сессии. Отставшая сессия \
+         недосчитается всех событий сегмента при зелёном healthcheck — класс TD-031."
+    );
+}
+
+#[test]
+fn sm9_compaction_midstate_does_not_duplicate_index() {
+    claims("sm9", 4, "промежуточное состояние компакции даёт дубль индекса");
+
+    let (dir, _n) = build_prod_form(N_SEGMENTS);
+    let (mut cat, _ops) = journal::SegmentCatalog::open(dir.path()).expect("catalog open");
+
+    let all = journal::list_segments(dir.path()).expect("segments");
+    let victim = all
+        .iter()
+        .find(|s| s.path.extension().map(|e| e == "jrnl").unwrap_or(false) && s.index > 0)
+        .cloned()
+        .expect("SETUP: нужен закрытый сырой сегмент");
+    // Промежуточное состояние `compact_segment`: rename .tmp→.zst сделан (шаг 6), remove
+    // оригинала (шаг 7) ЕЩЁ НЕ сделан. По комментарию segments.rs:3964-3972 оба файла лежат
+    // рядом «минуты». Воспроизводим возвратом сырого файла после компакции.
+    let raw_bytes = fs::read(&victim.path).expect("read raw");
+    journal::compact_segment(&victim, journal::DEFAULT_COMPACT_LEVEL).expect("compact");
+    fs::write(&victim.path, &raw_bytes).expect("вернуть сырой рядом с .zst");
+
+    let both = fs::read_dir(dir.path())
+        .expect("rd")
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            let n = e.file_name().to_string_lossy().into_owned();
+            n.contains(&format!("{:08}", victim.index))
+        })
+        .count();
+    assert!(
+        both >= 2,
+        "SETUP НЕ СОСТОЯЛСЯ: рядом с индексом {} лежит {both} файл(ов) — промежуточное \
+         состояние компакции не воспроизведено, и тест проверял бы не то",
+        victim.index
+    );
+
+    let (fresh, _o) = cat.is_fresh(dir.path()).expect("is_fresh");
+    assert!(
+        fresh,
+        "SETUP НЕ СОСТОЯЛСЯ: is_fresh=false ⇒ полный refresh(), а предмет — инкрементальная ветка"
+    );
+    assert_eq!(
+        cache_indices(&cat),
+        truth_indices(dir.path()),
+        "SM-9: в кеше появился ДУБЛЬ индекса. Инкрементальная ветка кладёт .zst рядом с уже \
+         лежащим .jrnl того же индекса, минуя dedup_indexed_paths — единственный путь, \
+         обходящий общий хелпер. Правило D-COMP-1 (при коллизии побеждает СЫРОЙ) не \
+         применяется, и сессия получит события сегмента ДВАЖДЫ. Это дословно блокер PR-гейта \
+         M-08: «3000 событий читалось как 3172, DET-I-1 молча нарушался»."
+    );
+}
+
+#[test]
+fn sm10_foreign_file_does_not_break_session() {
+    claims("sm10", 4, "посторонний файл в каталоге");
+
+    let (dir, _n) = build_prod_form(N_SEGMENTS);
+    let (mut cat, _ops) = journal::SegmentCatalog::open(dir.path()).expect("catalog open");
+
+    // Файлы, которые пишет САМ проект в тот же каталог: journal.meta.tmp — каждые 64 события
+    // recorder'а (journal/src/lib.rs:350-353 ← flush() :305); segment-*.jrnl.zst.tmp — живёт
+    // МИНУТЫ при компакции (segments.rs:3886); replay-digest.tmp — cron 04:07.
+    for foreign in ["journal.meta.tmp", "segment-00000002.jrnl.zst.tmp", "replay-digest.tmp"] {
+        fs::write(dir.path().join(foreign), b"x").expect("создать посторонний файл");
+        let before = truth_indices(dir.path());
+        let res = cat.is_fresh(dir.path());
+        assert!(
+            res.is_ok(),
+            "SM-10: появление файла «{foreign}» уронило is_fresh ⇒ pump() сессии вернёт Err. \
+             classify_segment зовётся на КАЖДОЕ новое имя без фильтра parse_segment_index_any \
+             и на не-сегментном имени даёт Err. До M-62 такие файлы были безвредны: \
+             dedup_indexed_paths их просто не выбирал. Эти файлы пишет сам проект, и при цели \
+             10k сессий × 4 тика/с попадание неизбежно: ошибка = {:?}",
+            res.as_ref().err()
+        );
+        let _ = res;
+        assert_eq!(
+            cache_indices(&cat),
+            before,
+            "SM-10: посторонний файл «{foreign}» изменил состав кеша — он не сегмент и не \
+             обязан ни на что влиять"
+        );
+        fs::remove_file(dir.path().join(foreign)).expect("убрать посторонний файл");
+        let (_f, _o) = cat.is_fresh(dir.path()).expect("is_fresh после уборки");
+    }
 }
