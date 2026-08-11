@@ -38,10 +38,19 @@ echo "--- N: аллокатор совпадает с НЕЗАВИСИМО вы�
 # Ожидаемых чисел здесь НЕТ намеренно. Эталон считается вторым путём — прямым
 # перечислением ref'ов, — а не берётся из константы и не из проверяемого скрипта.
 if [ -f "${ALLOC}" ]; then
-  for CLS in M R C A; do
+  # TD в перечне обязателен: этот класс живёт ЗАПИСЬЮ в `TECH-DEBT.md`, а не именем файла, и
+  # обслуживается ОТДЕЛЬНОЙ веткой кода аллокатора. Пока шаг гонял только M/R/C/A, дефект,
+  # внесённый в TD-ветку, не ловился ничем — ни здесь, ни пробой (адверсарная проверка круга 4).
+  for CLS in M R C A TD; do
+    if [ "${CLS}" = TD ]; then
+      exp_max=$(for r in $(git for-each-ref --format='%(refname)' refs/remotes/origin refs/heads 2>/dev/null); do
+                  git show "$r:TECH-DEBT.md" 2>/dev/null | grep -oE 'TD-[0-9]+' | grep -oE '[0-9]+'
+                done | sed 's/^0*//' | sort -n | tail -1)
+    else
     exp_max=$(for r in $(git for-each-ref --format='%(refname)' refs/remotes/origin refs/heads 2>/dev/null); do
                 git ls-tree -r --name-only "$r" 2>/dev/null | grep -oE "(^|/)${CLS}-[0-9]+" | grep -oE '[0-9]+'
               done | sed 's/^0*//' | sort -n | tail -1)
+    fi
     if [ -z "${exp_max}" ]; then
       fail "N SETUP НЕ СОСТОЯЛСЯ: класс ${CLS} не найден ни в одном ref'е — сравнивать не с чем"
       continue
@@ -313,13 +322,28 @@ else
   else
     pass "G §12 на месте, тело ${G_BODY} строк (предел 8)"
   fi
-  for form in 'Предмет:' 'Контекст'; do
-    if printf '%s\n' "${G_SEC}" | grep -q "${form}"; then
-      pass "G §12 называет форму шапки «${form}»"
+  # Формы шапки берутся ИЗ КОДА барьера, а не из литерала в гейте. Иначе шаг мерит не то, что
+  # обещает: грep голого слова «Контекст» зеленел бы и для формы `**Контекст:**`, которую
+  # парсер НЕ принимает (его альтернатива — `Контекст\*\*` / `Контекст\.\*\*`). Норма и код
+  # обязаны называть ОДИН И ТОТ ЖЕ набор; расхождение — ложный красный на законной
+  # множественности, то есть ровно то, что milestone обязан предотвращать.
+  G_FORMS="$(grep -oE "\^\\\\\*\\\\\*\([^)]*\)" "${BARRIER}" | head -1 | sed -E 's/^[^(]*\(//; s/\)$//')"
+  if [ -z "${G_FORMS}" ]; then
+    fail "G SETUP НЕ СОСТОЯЛСЯ: из ${BARRIER} не извлечён перечень форм шапки — сверять нечего"
+  else
+    G_MISS=""
+    IFS='|' read -r -a G_ARR <<< "${G_FORMS}"
+    for form in "${G_ARR[@]}"; do
+      form="${form//\\/}"
+      [ -z "${form}" ] && continue
+      printf '%s\n' "${G_SEC}" | grep -qF "${form}" || G_MISS="${G_MISS}«${form}» "
+    done
+    if [ -z "${G_MISS// /}" ]; then
+      pass "G §12 называет ВСЕ формы шапки, принимаемые барьером: ${G_FORMS//\\/}"
     else
-      fail "G §12 НЕ называет форму шапки «${form}» — C-071 NOTE-1: барьер принимает обе"
+      fail "G §12 не называет форм, которые барьер ПРИНИМАЕТ: ${G_MISS}— норма разошлась с кодом"
     fi
-  done
+  fi
   if printf '%s\n' "${G_SEC}" | grep -q 'next_artifact_id\.sh'; then
     pass "G §12 называет аллокатор поимённо"
   else
