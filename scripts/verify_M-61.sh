@@ -15,6 +15,15 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "${ROOT}" || exit 1
 FAILED=0
+# Логи прогона — в СВОЁМ каталоге, а не по фиксированным путям /tmp. Причина поведенческая:
+# при одновременных прогонах (сегодня их было пять) соседний процесс переписывает файл между
+# запуском и разбором, и пруф в Done Block принадлежит чужому прогону. Шаги F/F2/P решают по
+# КОДУ ВОЗВРАТА и потому безопасны, но шаг T СЧИТАЕТ число исполненных тестов ИЗ ФАЙЛА —
+# и переворачивался с красного на зелёное: прогон-пустышка (0 тестов) в одиночку давал FAIL,
+# а одновременно с соседом — «PASS T cargo test --all: passed=77». Побеждён ровно тот
+# анти-плацебо-страж, ради которого шаг T написан (урок 1 в шапке этого файла).
+LOGD="$(mktemp -d /tmp/m61-verify-XXXXXX)" || { echo "не создан каталог логов" >&2; exit 1; }
+trap 'rm -rf "${LOGD}"' EXIT
 pass() { echo "PASS  $*"; }
 fail() { echo "FAIL  $*"; FAILED=$((FAILED + 1)); }
 
@@ -65,19 +74,19 @@ else
 fi
 
 echo "--- F: RED-проба (состав сверяет сама проба — с исполнением и со спекой §4.2) ---"
-if bash "${PROBE}" >/tmp/m61-probe.log 2>&1; then
-  pass "F проба зелёная: $(grep -oE 'VERDICT: PASS \([0-9]+/[0-9]+\)' /tmp/m61-probe.log | head -1)"
+if bash "${PROBE}" >${LOGD}/probe.log 2>&1; then
+  pass "F проба зелёная: $(grep -oE 'VERDICT: PASS \([0-9]+/[0-9]+\)' ${LOGD}/probe.log | head -1)"
 else
-  fail "F проба КРАСНАЯ — $(grep -E '^(VERDICT|SETUP)' /tmp/m61-probe.log | head -1)"
-  grep -E '^(FAIL|SETUP)' /tmp/m61-probe.log | head -8 | sed 's/^/      ↳ /'
+  fail "F проба КРАСНАЯ — $(grep -E '^(VERDICT|SETUP)' ${LOGD}/probe.log | head -1)"
+  grep -E '^(FAIL|SETUP)' ${LOGD}/probe.log | head -8 | sed 's/^/      ↳ /'
 fi
 
 echo "--- F2: АНТИ-ПЛАЦЕБО — батарея эталон + мутанты (спека §4.5) ---"
-if bash "${PROBE}" --battery >/tmp/m61-battery.log 2>&1; then
-  pass "F2 $(grep -oE 'BATTERY: PASS \([0-9]+/[0-9]+\)' /tmp/m61-battery.log | head -1)"
+if bash "${PROBE}" --battery >${LOGD}/battery.log 2>&1; then
+  pass "F2 $(grep -oE 'BATTERY: PASS \([0-9]+/[0-9]+\)' ${LOGD}/battery.log | head -1)"
 else
-  fail "F2 батарея КРАСНАЯ — $(grep -E '^BATTERY' /tmp/m61-battery.log | head -1)"
-  grep -E '^(FAIL|SETUP)' /tmp/m61-battery.log | head -8 | sed 's/^/      ↳ /'
+  fail "F2 батарея КРАСНАЯ — $(grep -E '^BATTERY' ${LOGD}/battery.log | head -1)"
+  grep -E '^(FAIL|SETUP)' ${LOGD}/battery.log | head -8 | sed 's/^/      ↳ /'
 fi
 
 echo "--- S: САМОРЕФЕРЕНЦИЯ + негативный контроль ---"
@@ -352,20 +361,20 @@ else
 fi
 
 echo "--- P: РЕГРЕСС — соседний барьер артефактов цел ---"
-if bash scripts/tests/red_protected_artifacts.sh >/tmp/m61-prot.log 2>&1; then
-  pass "P $(grep -oE 'VERDICT: PASS \([0-9]+/[0-9]+\)' /tmp/m61-prot.log | head -1)"
+if bash scripts/tests/red_protected_artifacts.sh >${LOGD}/prot.log 2>&1; then
+  pass "P $(grep -oE 'VERDICT: PASS \([0-9]+/[0-9]+\)' ${LOGD}/prot.log | head -1)"
 else fail "P барьер артефактов сломан этим milestone'ом"; fi
 
 echo "--- T: паритет с CI + НЕНУЛЕВОЕ число исполненных тестов ---"
 cargo fmt --all -- --check >/dev/null 2>&1 && pass "T fmt" || fail "T fmt --check"
-cargo clippy --workspace --all-targets --all-features -- -D warnings >/tmp/m61-clippy.log 2>&1 \
-  && pass "T clippy" || { fail "T clippy"; tail -5 /tmp/m61-clippy.log | sed 's/^/      ↳ /'; }
-if cargo test --all >/tmp/m61-test.log 2>&1; then
+cargo clippy --workspace --all-targets --all-features -- -D warnings >${LOGD}/clippy.log 2>&1 \
+  && pass "T clippy" || { fail "T clippy"; tail -5 ${LOGD}/clippy.log | sed 's/^/      ↳ /'; }
+if cargo test --all >${LOGD}/test.log 2>&1; then
   # «0 passed» — зелёная строка, не исполнившая ничего: считаем, а не верим exit-коду.
-  N=$(grep -E '^test result' /tmp/m61-test.log | awk '{p+=$4} END {print p+0}')
+  N=$(grep -E '^test result' ${LOGD}/test.log | awk '{p+=$4} END {print p+0}')
   if [ "${N:-0}" -gt 0 ]; then pass "T cargo test --all: passed=${N}"
   else fail "T cargo test --all вернул 0, но исполнил 0 тестов — прогон не состоялся"; fi
-else fail "T cargo test --all"; grep -E '^test .* FAILED' /tmp/m61-test.log | head -5 | sed 's/^/      ↳ /'; fi
+else fail "T cargo test --all"; grep -E '^test .* FAILED' ${LOGD}/test.log | head -5 | sed 's/^/      ↳ /'; fi
 
 echo
 if [ "${FAILED}" -gt 0 ]; then echo "VERDICT: FAIL (${FAILED} нарушений)"; exit 1; fi

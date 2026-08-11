@@ -136,7 +136,7 @@ run_check() { ( cd "$1" && EVENT_NAME="${3:-push}" PUSH_BEFORE="$2" PR_BASE_SHA=
                 bash "${BARRIER}" >/dev/null 2>&1 ); }
 run_alloc() { ( cd "$1" && bash "${ALLOC}" "$2" 2>/dev/null ); }
 
-# Setup-guard НА КАЖДЫЙ сценарий (`testing.md`, целостность гейта, свойство 3: «проба, молча
+# Setup-guard НА КАЖДЫЙ сценарий — на все 31 (`testing.md`, целостность гейта, свойство 3: «проба, молча
 # тестирующая не тот сценарий, — плацебо самой себя»). Фикстуры строятся цепочками вида
 # `( cd … && … ) && commit_all`: если подоболочка молча откажет, коммита не будет, диапазон
 # окажется ПУСТ, барьер выйдет нулём по раннему `[ -z "$IN" ]`, и expect_allow напечатает
@@ -147,6 +147,17 @@ range_guard() {
   local n; n="$( ( cd "$2" && git rev-list --count "$3..HEAD" 2>/dev/null ) || echo 0 )"
   [ "${n:-0}" -ge 1 ] || die "$1: диапазон ПУСТ — фикстура не в задуманном состоянии,
   сценарий проверил бы пустоту вместо предмета"
+}
+# Для сценариев АЛЛОКАТОРА диапазона нет, и range_guard к ним неприменим — но предмет у них
+# тоже может исчезнуть при молчаливом отказе setup'а. Замер: если сломать построение фикстуры
+# N3HEAD, номер C-505 остаётся на main, ожидание C-506 становится достижимым ОБОИМИ путями, и
+# сценарий печатает PASS против ЗАВЕДОМО дефектного аллокатора. Поэтому каждая alloc-фикстура
+# заявляет условие, которое делает её сценарием, — и умирает, если оно не выполнено.
+# Условие — КОНЪЮНКЦИЯ «предмет ЕСТЬ там, где должен» И «его НЕТ там, где не должен»: одно
+# лишь отрицание выполняется ВАКУУМНО, когда фикстура не построилась вовсе, и страж молчит
+# ровно тогда, когда обязан кричать (проверено: первая редакция этих стражей не сработала).
+setup_assert() {  # $1=имя $2=repo $3=почему $4=условие (shell, обязано вернуть 0)
+  ( cd "$2" && eval "$4" ) >/dev/null 2>&1 || die "$1: SETUP не состоялся — $3"
 }
 expect_block() { mark "$1"; range_guard "$1" "$2" "$3"
   if run_check "$2" "$3"; then fail "$1 $4 — ПРОШЛО"; else pass "$1 $4 — заблокировано"; fi; }
@@ -373,6 +384,7 @@ expect_block B5BASE "$R" "$ZERO" "недостоверная база (zero-SHA)
 R="$(mk_repo n3local)"; art "$R" research/reviews/R-400-a.md ""; commit_all "$R" base2
 ( cd "$R" && git checkout -q -b side && : ) && art "$R" research/reviews/R-407-side.md "" && commit_all "$R" "на соседней"
 ( cd "$R" && git checkout -q main )
+setup_assert N3LOCAL "$R" "номер 407 обязан жить ТОЛЬКО в соседней ветке — иначе сценарий не про объединение" '[ "$(for h in $(git for-each-ref --format="%(refname)" refs/heads); do git ls-tree -r --name-only "$h"; done | grep -c R-407)" -ge 1 ] && [ "$(git ls-tree -r --name-only main | grep -c R-407)" -eq 0 ]'
 expect_alloc N3LOCAL "$R" R "R-408" "максимум по ОБЪЕДИНЕНИЮ, а не по своему дереву"
 
 # Номер занят ТОЛЬКО локальным head'ом (в origin его нет).
@@ -380,11 +392,13 @@ R="$(mk_repo n3head)"; art "$R" research/critiques/C-500-a.md ""; commit_all "$R
 ( cd "$R" && git update-ref refs/remotes/origin/main HEAD && git checkout -q -b local-only )
 art "$R" research/critiques/C-505-local.md ""; commit_all "$R" "только локально"
 ( cd "$R" && git checkout -q main )
+setup_assert N3HEAD "$R" "C-505 обязан жить ТОЛЬКО в локальной ветке, вне origin/main — иначе ожидание достижимо обоими путями" '[ -n "$(git rev-parse -q --verify refs/remotes/origin/main)" ] && [ "$(for h in $(git for-each-ref --format="%(refname)" refs/heads); do git ls-tree -r --name-only "$h"; done | grep -c C-505)" -ge 1 ] && [ "$(git ls-tree -r --name-only refs/remotes/origin/main | grep -c C-505)" -eq 0 ]'
 expect_alloc N3HEAD "$R" C "C-506" "локальный head участвует в подсчёте занятости"
 
 # Origin сконфигурирован, но ref'ов нет — перечислить занятость невозможно.
 R="$(mk_repo n3noorig)"; art "$R" research/reviews/R-600-a.md ""; commit_all "$R" base2
 ( cd "$R" && git remote add origin /nonexistent-remote-path )
+setup_assert N3NOORIG "$R" "origin обязан быть СКОНФИГУРИРОВАН и без единого ref\047а — иначе проверяется не fail-closed" 'git remote get-url origin && [ -z "$(git for-each-ref --format="%(refname)" refs/remotes/origin)" ]'
 expect_alloc_fails N3NOORIG "$R" R "origin сконфигурирован, но недоступен ⇒ fail-closed"
 
 # N3ORIG — ЗЕРКАЛО N3HEAD: номер занят ТОЛЬКО в origin-ref'е, локальных голов с ним нет.
@@ -395,6 +409,7 @@ expect_alloc_fails N3NOORIG "$R" R "origin сконфигурирован, но 
 R="$(mk_repo n3orig)"; art "$R" research/reviews/R-600-a.md ""; commit_all "$R" base2
 ( cd "$R" && git checkout -q -b tmp ) && art "$R" research/reviews/R-650-orig.md "" && commit_all "$R" "номер, живущий только в origin"
 ( cd "$R" && git update-ref refs/remotes/origin/tmp "$(git rev-parse HEAD)" && git checkout -q main && git branch -qD tmp ) || die "n3orig setup"
+setup_assert N3ORIG "$R" "R-650 обязан быть НЕДОСТИЖИМ из локальных голов — иначе сценарий не про origin" '[ "$(git ls-tree -r --name-only refs/remotes/origin/tmp | grep -c R-650)" -ge 1 ] && [ "$(for h in $(git for-each-ref --format="%(refname)" refs/heads); do git ls-tree -r --name-only "$h"; done | grep -c R-650)" -eq 0 ]'
 expect_alloc N3ORIG "$R" R "R-651" "номер занят ТОЛЬКО origin-ref'ом — локальной головы с ним нет"
 
 # N3TD — та же ось 3, но КЛАСС TD: он живёт записью в `TECH-DEBT.md`, а не именем файла, и
@@ -405,10 +420,12 @@ expect_alloc N3ORIG "$R" R "R-651" "номер занят ТОЛЬКО origin-re
 R="$(mk_repo n3td)"; td_entry "$R" TD-300 "первый-предмет"; commit_all "$R" base2
 ( cd "$R" && git checkout -q -b side ) && td_entry "$R" TD-307 "долг соседней ветки" && commit_all "$R" "TD на соседней ветке"
 ( cd "$R" && git checkout -q main ) || die "n3td setup"
+setup_assert N3TD "$R" "TD-307 обязан отсутствовать в TECH-DEBT.md своего дерева — иначе сценарий не про объединение" '[ "$(git show side:TECH-DEBT.md | grep -c TD-307)" -ge 1 ] && [ "$(grep -c TD-307 TECH-DEBT.md)" -eq 0 ]'
 expect_alloc N3TD "$R" TD "TD-308" "класс TD: занятость по объединению, а не по своему дереву"
 
 R="$(mk_repo l3ok)"; art "$R" milestones/M-90-a.md ""; commit_all "$R" base2
 ( cd "$R" && git update-ref refs/remotes/origin/main HEAD )
+setup_assert L3OK "$R" "origin-ref обязан существовать — иначе штатный случай не воспроизводится" '[ -n "$(git for-each-ref --format="%(refname)" refs/remotes/origin)" ]'
 expect_alloc L3OK "$R" M "M-91" "штатный случай: максимум по origin ∪ refs/heads"
 
 # ─── ОСЬ 6: носитель идентичности предмета ──────────────────────────────────────────
