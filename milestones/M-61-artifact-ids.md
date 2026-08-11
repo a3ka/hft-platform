@@ -1,6 +1,6 @@
 # M-61 — номер артефакта выдаётся МЕХАНИЗМОМ, а не памятью
 
-**Статус:** PROPOSED · **Дата:** 2026-08-07 · **Автор:** architect
+**Статус:** PR-гейт, круг 4 (задачи 1-6 реализованы) · **Дата:** 2026-08-07 · **Автор:** architect
 **Ветка:** `docs/M-61-artifact-ids` · **Долг:** `TD-111` (заведён reviewer'ом, `R-038` §G)
 **Гейты:** critic (`gates.md` §9 — новая milestone-спека) → dev → tester → reviewer
 
@@ -58,12 +58,12 @@
 
 | # | Задача | Зона | Статус | Оракул |
 |---|---|---|---|---|
-| 1 | `scripts/next_artifact_id.sh <TD\|R\|C\|A\|M>` — печатает следующий свободный номер, считая максимум по ОБЪЕДИНЕНИЮ всех `refs/remotes/origin`, а не по своему дереву; fail-closed при недоступном origin | dev | ⏳ OPEN | `red_artifact_ids.sh`, ось 3 |
-| 2 | `scripts/check_artifact_ids.sh` — барьер: ни один коммит ДИАПАЗОНА не вводит второй предмет под занятым номером; законная множественность (§4.2, ось 6) пропускается | dev | ⏳ OPEN | `red_artifact_ids.sh`, оси 1/2/4/5/6 |
-| 3 | Джоб в `ci.yml` той же проводкой, что `protected-artifacts` (база из СОБЫТИЯ), + `status-check.needs` + сверка `needs.<job>.result`; guard-шаг БЕЗУСЛОВНЫЙ | dev | ⏳ OPEN | шаг W (исполнением, по образцу `M-60a` §6.1) |
-| 4 | RED-набор `scripts/tests/red_artifact_ids.sh` | **architect** | ⏳ OPEN | сам себе |
-| 5 | `scripts/verify_M-61.sh` | **architect** | ⏳ OPEN | — |
-| 6 | Норма в `gates.md` §12 (≤8 строк): номер берётся ТОЛЬКО скриптом; **новый артефакт обязан нести в шапке поле `Предмет:`** | **architect** | ⏳ OPEN — **зона под замком founder'а**, требует `FOUNDER-APPROVED` | шаг S (самореференция) |
+| 1 | `scripts/next_artifact_id.sh <TD\|R\|C\|A\|M>` — печатает следующий свободный номер, считая максимум по ОБЪЕДИНЕНИЮ всех `refs/remotes/origin`, а не по своему дереву; fail-closed при недоступном origin | dev | ✅ DONE | `red_artifact_ids.sh`, ось 3 |
+| 2 | `scripts/check_artifact_ids.sh` — барьер: ни один коммит ДИАПАЗОНА не вводит второй предмет под занятым номером; законная множественность (§4.2, ось 6) пропускается | dev | ✅ DONE | `red_artifact_ids.sh`, оси 1/2/4/5/6 |
+| 3 | Джоб в `ci.yml` той же проводкой, что `protected-artifacts` (база из СОБЫТИЯ), + `status-check.needs` + сверка `needs.<job>.result`; guard-шаг БЕЗУСЛОВНЫЙ | dev | ✅ DONE | шаг W (исполнением, по образцу `M-60a` §6.1) |
+| 4 | RED-набор `scripts/tests/red_artifact_ids.sh` | **architect** | ✅ DONE | сам себе |
+| 5 | `scripts/verify_M-61.sh` | **architect** | ✅ DONE | — |
+| 6 | Норма в `gates.md` §12 (≤8 строк): номер берётся ТОЛЬКО скриптом; **новый артефакт обязан нести в шапке поле `Предмет:`** | **architect** | ✅ DONE — токен выдан founder'ом (круг 4), норма в `gates.md` §12 | шаг S (самореференция) |
 
 ### 3.1 Два определения, без которых dev и проба разойдутся
 
