@@ -148,8 +148,11 @@ BODY_RENAMEBLIND="${BODY_CHECK//--no-renames /}"
 BODY_TOUCHCOUNTS="${BODY_CHECK//--diff-filter=A /--diff-filter=AM }"
 
 # Мутант quotedname: построчное чтение вместо `-z` (ось 4 / имя, требующее квотирования).
-BODY_QUOTEDNAME="${BODY_CHECK//-z /}"
-BODY_QUOTEDNAME="${BODY_QUOTEDNAME//read -r -d \'\' f/read -r f}"
+# Б-4 (R-052): сплошная подстановка `${BODY_CHECK//-z /}` срезала `-z` НЕ ТОЛЬКО у git, но и
+# у shell-тестов — `[ -z "$IN" ] && exit 0` превращалось в `[ "$IN" ] && exit 0`, то есть
+# «что-то введено ⇒ выйти успехом». Мутант пропускал ЛЮБУЮ коллизию, включая чисто ASCII, и
+# краснел на всех 12 блокирующих сценариях — то есть был сломан целиком, а не слеп к
+# квотированию. Мутант обязан отличаться от эталона ТОЛЬКО каналом чтения имён.
 
 # ─── аллокаторы ─────────────────────────────────────────────────────────────────────
 read -r -d '' NEXT_REF <<'EOF'
@@ -182,6 +185,43 @@ case "$CLS" in M) printf 'M-%02d\n' $((max+1));; *) printf '%s-%03d\n' "$CLS" $(
 EOF
 
 emit() { printf '%s\n%s\n%s\n' "$HEAD_COMMON" "$2" "$3" > "$D/$1"; bash -n "$D/$1" || exit 1; }
+# Б-5 (R-052): пять мутантов были ОБЪЯВЛЕНЫ в §4.5 и не построены; батарея пропускала их
+# молча и печатала PASS по знаменателю исполненного. Каждый — одна точка барьера.
+#   originonly — перечисление refs теряет `refs/heads` (ось 3)
+#   namesonly  — записи в TECH-DEBT.md не читаются вовсе (ось 2)
+#   absolute   — судит всю историю, а не диапазон (ось 5)
+#   rangeblind — смотрит только вершину диапазона, а не каждый коммит (ось 5)
+#   slugskip   — файл без слага пропускается вместо sentinel (ось 6)
+
+
+# ── Мутанты строятся SED'ом, а не подстановкой ${//} (правка круга 3) ────────────────────
+# Причина не стилистическая: `${BODY//pat/repl}` с кавычками и слэшами внутри шаблона молча
+# НЕ СРАБАТЫВАЕТ (originonly дал 0 изменений и совпал с эталоном) либо портит тело
+# (absolute вклеивал остаток шаблона в текст скрипта). Оба отказа тихие — ровно тот класс,
+# из-за которого понадобился круг 3. `sed` с одинарными кавычками предсказуем, а страж
+# «мутант обязан отличаться» ниже ловит несработавшую подстановку немедленно.
+mutate() { printf '%s\n' "${BODY_CHECK}" | sed "$1"; }
+# originonly мутирует ШАПКУ: `refs_all()` объявлена в HEAD_COMMON, а не в теле.
+HEAD_ORIGINONLY="$(printf '%s\n' "${HEAD_COMMON}" | sed 's|refs/remotes/origin refs/heads|refs/remotes/origin|')"
+# emit со СВОЕЙ шапкой — иначе мутант шапки невыразим.
+emit_h() { printf '%s\n%s\n%s\n' "$2" "$3" "$4" > "$D/$1"; bash -n "$D/$1" || exit 1; }
+
+# quotedname — Б-4 (R-052): мутант обязан отличаться от эталона ТОЛЬКО КАНАЛОМ ЧТЕНИЯ ИМЁН.
+# Прежняя сплошная подстановка срезала `-z` и у shell-тестов (`[ -z "$IN" ]` → `[ "$IN" ]`),
+# из-за чего мутант пропускал ЛЮБУЮ коллизию и краснел на всех 12 сценариях — то есть был
+# сломан целиком, а не слеп к квотированию. Теперь трогаются ровно три места: два git-вызова
+# теряют `-z` (git начинает КВОТИРОВАТЬ не-ASCII имена), читатель переходит на построчный.
+BODY_QUOTEDNAME="$(mutate 's|ls-tree -r -z --name-only|ls-tree -r --name-only|; s|--format= -z |--format= |; s|read -r -d '"'"''"'"' f|read -r f|')"
+# originonly — перечисление refs теряет локальные головы (ось 3)
+# namesonly — записи в TECH-DEBT.md не читаются вовсе (ось 2)
+BODY_NAMESONLY="$(mutate 's|:TECH-DEBT\.md|:TECH-DEBT.НЕТ.md|')"
+# absolute — судит всю историю вместо диапазона (ось 5)
+BODY_ABSOLUTE="$(mutate 's|git rev-list "\$BASE\.\.HEAD"|git rev-list HEAD|')"
+# rangeblind — смотрит только вершину диапазона, а не каждый коммит (ось 5)
+BODY_RANGEBLIND="$(mutate 's|git rev-list "\$BASE\.\.HEAD"|git rev-list -n 1 "$BASE..HEAD"|')"
+# slugskip — файл без слага пропускается вместо sentinel (ось 6)
+SUBJ_SLUGSKIP="$(printf '%s\n' "${SUBJ_FULL}" | sed "s|\[ -z \"\$s\" \] && s='<без-слага>'|[ -z \"\$s\" ] \&\& return|")"
+
 # вариант : check(subject, body) + next
 emit ref-check.sh          "$SUBJ_FULL"       "$BODY_CHECK"
 emit showall-check.sh      "$SUBJ_FULL"       "$BODY_SHOWALL"
@@ -192,7 +232,13 @@ emit splitonly-check.sh    "$SUBJ_SPLITONLY"  "$BODY_CHECK"
 emit localmax-check.sh     "$SUBJ_FULL"       "$BODY_CHECK"
 emit quotedname-check.sh   "$SUBJ_FULL"       "$BODY_QUOTEDNAME"
 emit touchcounts-check.sh  "$SUBJ_FULL"       "$BODY_TOUCHCOUNTS"
-for v in ref showall renameblind slugonly contextblind splitonly quotedname touchcounts; do
+emit_h originonly-check.sh "$HEAD_ORIGINONLY" "$SUBJ_FULL" "$BODY_CHECK"
+emit namesonly-check.sh    "$SUBJ_FULL"       "$BODY_NAMESONLY"
+emit absolute-check.sh     "$SUBJ_FULL"       "$BODY_ABSOLUTE"
+emit rangeblind-check.sh   "$SUBJ_FULL"       "$BODY_RANGEBLIND"
+emit slugskip-check.sh     "$SUBJ_SLUGSKIP"   "$BODY_CHECK"
+for v in ref showall renameblind slugonly contextblind splitonly quotedname touchcounts \
+         originonly namesonly absolute rangeblind slugskip; do
   printf '%s\n%s\n' "$HEAD_COMMON" "$NEXT_REF" > "$D/$v-next.sh"; bash -n "$D/$v-next.sh" || exit 1
 done
 printf '%s\n%s\n' "$HEAD_COMMON" "$NEXT_LOCALMAX" > "$D/localmax-next.sh"; bash -n "$D/localmax-next.sh" || exit 1
