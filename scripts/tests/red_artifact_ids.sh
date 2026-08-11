@@ -68,6 +68,7 @@ L2TXT|2|L|упоминание в тексте
 N3LOCAL|3|V|только своё дерево
 N3HEAD|3|V|только origin, локальный head пропущен
 N3ORIG|3|V|только refs/heads, origin пропущен
+B3ORIG|3|V|только refs/heads, origin пропущен
 N3TD|3|V|только своё дерево
 N3TD|1|V|TD
 N3NOORIG|3|V|origin недоступен
@@ -180,9 +181,12 @@ expect_block() { mark "$1"; range_guard "$1" "$2" "$3"
   if run_check "$2" "$3" "${5:-push}"; then fail "$1 $4 — ПРОШЛО"; else pass "$1 $4 — заблокировано"; fi; }
 expect_allow() { mark "$1"; range_guard "$1" "$2" "$3"
   if run_check "$2" "$3" "${5:-push}"; then pass "$1 $4 — пропущено"; else fail "$1 $4 — ложное срабатывание"; fi; }
-expect_alloc() { mark "$1"; local got; got="$(run_alloc "$2" "$3")"
-  if [ "$got" = "$4" ]; then pass "$1 $5 — выдал $got"
-  else fail "$1 $5 — выдал '${got}' при ожидании '$4'"; fi; }
+# КОД ВОЗВРАТА — часть контракта аллокатора, а не только stdout: он обязан быть fail-closed,
+# и «напечатал верный номер, но умер ненулём» — это отказ, который прежняя редакция засчитывала
+# как успех на всех шести сценариях оси 3.
+expect_alloc() { mark "$1"; local got rc; got="$(run_alloc "$2" "$3")"; rc=$?
+  if [ "$got" = "$4" ] && [ "$rc" -eq 0 ]; then pass "$1 $5 — выдал $got"
+  else fail "$1 $5 — выдал '${got}' (exit=$rc) при ожидании '$4' (exit=0)"; fi; }
 expect_alloc_fails() { mark "$1"
   if run_alloc "$2" "$3" >/dev/null 2>&1; then fail "$1 $4 — ВЫДАЛ номер вместо отказа"
   else pass "$1 $4 — fail-closed"; fi; }
@@ -422,6 +426,22 @@ FOREIGN="$(cd "$R" && git rev-parse HEAD)"; ( cd "$R" && git checkout -q main ) 
 setup_assert B5NOTANC "$R" "база обязана быть НЕ предком HEAD, а диапазон — БЕЗ коллизии" \
   "! git merge-base --is-ancestor $FOREIGN HEAD && [ \"\$(git ls-tree -r --name-only HEAD | grep -c R-830)\" -eq 1 ]"
 expect_block B5NOTANC "$R" "$FOREIGN" "база НЕ предок HEAD ⇒ fail-closed (коллизии в диапазоне нет)"
+
+# B3ORIG — ось 3 у БАРЬЕРА, а не у аллокатора. rev2 закрыл origin-направление только для
+# аллокатора, и это оказалось половиной работы: `universe()` барьера перечисляет ТЕ ЖЕ ref'ы,
+# и барьер, потерявший `refs/remotes/origin`, не видит номера, занятого чужой УДАЛЁННОЙ веткой,
+# — то есть пропускает ровно тот дефект, ради которого milestone написан (§1). Ни один сценарий
+# и ни один мутант этого не пиннили: фикстуры барьера жили на локальных ветках, где потеря
+# origin ничего не меняет. Проверено: снятие origin из all_refs() барьера оставляло пробу
+# зелёной по всем барьерным сценариям.
+R="$(mk_repo b3orig)"
+( cd "$R" && git checkout -q -b tmp ) && art "$R" research/reviews/R-860-alpha.md "" && commit_all "$R" "занято в origin"
+( cd "$R" && git update-ref refs/remotes/origin/tmp "$(git rev-parse HEAD)" && git checkout -q main && git branch -qD tmp ) || die "b3orig setup"
+B="$(cd "$R" && git rev-parse HEAD)"
+art "$R" research/reviews/R-860-beta.md ""; commit_all "$R" "второй R-860 — занят только в origin"
+setup_assert B3ORIG "$R" "R-860 обязан быть занят ТОЛЬКО origin-ref'ом, вне локальных голов" \
+  '[ "$(git ls-tree -r --name-only refs/remotes/origin/tmp | grep -c R-860)" -ge 1 ] && [ "$(git ls-tree -r --name-only main | grep -c R-860-alpha)" -eq 0 ]'
+expect_block B3ORIG "$R" "$B" "номер занят ТОЛЬКО удалённой веткой — барьер обязан её видеть"
 
 # ─── ОСЬ 3: область поиска занятости (предмет — АЛЛОКАТОР) ───────────────────────────
 # Номер занят в СОСЕДНЕЙ ветке: свободен локально, занят в объединении.

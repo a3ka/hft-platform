@@ -52,9 +52,13 @@ if [ -f "${ALLOC}" ]; then
   # внесённый в TD-ветку, не ловился ничем — ни здесь, ни пробой (адверсарная проверка круга 4).
   for CLS in M R C A TD; do
     if [ "${CLS}" = TD ]; then
+      # ЭТАЛОН БЕРЁТСЯ ВТОРЫМ ПУТЁМ. Первая редакция копировала конвейер самого аллокатора
+      # (`git show <ref>:TECH-DEBT.md | grep -oE 'TD-[0-9]+'`) — зависимый эталон, который
+      # `testing.md` прямо запрещает: сломай обе стороны одинаково, и оракул не покраснеет.
+      # `git grep` по ref'у — другой механизм чтения и другое извлечение.
       exp_max=$(for r in $(git for-each-ref --format='%(refname)' refs/remotes/origin refs/heads 2>/dev/null); do
-                  git show "$r:TECH-DEBT.md" 2>/dev/null | grep -oE 'TD-[0-9]+' | grep -oE '[0-9]+'
-                done | sed 's/^0*//' | sort -n | tail -1)
+                  git grep -h -oE '^- \*\*TD-[0-9]+' "$r" -- TECH-DEBT.md 2>/dev/null
+                done | grep -oE '[0-9]+' | sed 's/^0*//' | sort -n | tail -1)
     else
     exp_max=$(for r in $(git for-each-ref --format='%(refname)' refs/remotes/origin refs/heads 2>/dev/null); do
                 git ls-tree -r --name-only "$r" 2>/dev/null | grep -oE "(^|/)${CLS}-[0-9]+" | grep -oE '[0-9]+'

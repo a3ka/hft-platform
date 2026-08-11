@@ -196,6 +196,7 @@ case "$CLS" in M) printf 'M-%02d\n' $((max+1));; *) printf '%s-%03d\n' "$CLS" $(
 EOF
 
 emit() { printf '%s\n%s\n%s\n' "$HEAD_COMMON" "$2" "$3" > "$D/$1"; bash -n "$D/$1" || exit 1; }
+emit_h() { printf '%s\n%s\n%s\n' "$2" "$3" "$4" > "$D/$1"; bash -n "$D/$1" || exit 1; }
 # Б-5 (R-052): пять мутантов были ОБЪЯВЛЕНЫ в §4.5 и не построены; батарея пропускала их
 # молча и печатала PASS по знаменателю исполненного. Каждый — одна точка ОДНОГО из двух
 # предметов пробы: барьера либо (для оси 3) аллокатора.
@@ -270,6 +271,8 @@ emit touchcounts-check.sh  "$SUBJ_FULL"       "$BODY_TOUCHCOUNTS"
 # за дефект построения, а не за структурное свойство фикстур.
 emit originonly-check.sh   "$SUBJ_FULL"       "$BODY_CHECK"
 emit headsonly-check.sh    "$SUBJ_FULL"       "$BODY_CHECK"
+# bheadsonly — то же, что headsonly, но у БАРЬЕРА: перечисление ref'ов теряет origin.
+emit_h bheadsonly-check.sh "$HEAD_HEADSONLY" "$SUBJ_FULL" "$BODY_CHECK"
 emit namesonly-check.sh    "$SUBJ_FULL"       "$BODY_NAMESONLY"
 emit absolute-check.sh     "$SUBJ_FULL"       "$BODY_ABSOLUTE"
 emit rangeblind-check.sh   "$SUBJ_FULL"       "$BODY_RANGEBLIND"
