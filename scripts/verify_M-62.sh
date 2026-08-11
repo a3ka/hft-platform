@@ -1,0 +1,210 @@
+#!/usr/bin/env bash
+# verify_M-62.sh — acceptance-гейт M-62 «цена тика не зависит от ЧИСЛА СЕГМЕНТОВ».
+#
+# Решение принимается по КОДУ ВОЗВРАТА (`gates.md` §3), не по тексту. `set -e` НЕ ставится
+# намеренно: скрипт — агрегатор, он обязан пройти ВСЕ шаги и посчитать нарушения, а не
+# умереть на первом. Выход ненулевой при FAILED>0.
+#
+# СОСТОЯНИЕ: гейт КРАСНЫЙ до выполнения задач 1-4 (engine-dev) — так и задумано.
+# RED-набор написан раньше кода (`gates.md` §2), и гейт обязан это показывать, а не молчать.
+set -uo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "${ROOT}" || exit 1
+
+SPEC="milestones/M-62-segment-metadata.md"
+ORACLE_META="crates/gateway/tests/red_segment_meta_bound.rs"
+ORACLE_GUARD="crates/gateway/tests/red_hint_pos_guard.rs"
+
+FAILED=0
+pass() { echo "PASS  $*"; }
+fail() {
+  echo "FAIL  $*"
+  FAILED=$((FAILED + 1))
+}
+die() {
+  echo "SETUP НЕ СОСТОЯЛСЯ: $*"
+  echo
+  echo "VERDICT: FAIL (setup)"
+  exit 2
+}
+
+# ── страж окружения (TD-119/TD-126): гейт обязан отличать «код красный» от «кончился диск» ──
+# `/` и `/tmp` — один том; логи шагов пишутся в `/tmp`, поэтому при настоящем ENOSPC не
+# запишется даже диагностика. Проверка стоит ДО первого cargo и печатает ДО попытки записи.
+FREE_MB=$(df -Pm . | awk 'NR==2 {print $4}')
+[ "${FREE_MB:-0}" -ge 3000 ] || die "свободно ${FREE_MB} MB (<3000). Прогон cargo упрётся в ENOSPC, и его вывод будет неотличим от красного кода"
+[ -d "${ROOT}" ] || die "рабочий каталог исчез из-под прогона (третий режим отказа TD-119)"
+[ -f "${SPEC}" ] || die "нет спеки ${SPEC}"
+
+# ── A: оракулы на месте и парсятся ──────────────────────────────────────────────────────
+echo "--- A: оракулы на месте ---"
+for f in "${ORACLE_META}" "${ORACLE_GUARD}"; do
+  if [ -f "${f}" ]; then pass "A ${f}"; else fail "A НЕТ файла ${f}"; fi
+done
+if rustfmt --edition 2021 --check "${ORACLE_META}" "${ORACLE_GUARD}" >/dev/null 2>&1; then
+  pass "A оба файла форматированы (паритет с CI-шагом fmt)"
+else
+  fail "A rustfmt --check красный на файлах набора"
+fi
+
+# ── N: манифест ⇄ таблица §4.2 спеки, В ОБЕ СТОРОНЫ ─────────────────────────────────────
+# Приём и его обоснование — `red_docs_freeze.sh` (M-60a): перечень осей, объявленный в
+# спеке, обязан машинно совпадать с тем, что реально покрыто оракулами. Иначе таблица осей
+# становится декларацией: «полнота заявлена относительно перечня», а перечень никто не сверял.
+# Числа НЕ пишутся литералом — считаются (урок TD-125: «ci.yml называет 26 при 27»).
+echo "--- N: манифест набора ⇄ таблица осей §4.2 ---"
+
+SPEC_PAIRS="$(awk '
+  function emit(a, kind, cell,   n, p, i) {
+    n = split(cell, p, "`")
+    for (i = 2; i <= n; i += 2) if (p[i] != "") print a "|" kind "|" p[i]
+  }
+  # Сброс на ЛЮБОМ заголовке, а не только на `###`: иначе таблица следующего раздела
+  # уровня `##` продолжила бы разбираться как своя. Якорь на точный номер: `4.2bis`
+  # префиксом не проходит (проверено мутацией — прежняя форма её не замечала).
+  /^#/ { inside = ($0 ~ /^### 4\.2[[:space:]]/); next }
+  inside && /^\|[[:space:]]*\*\*[0-9]+\./ {
+    if (!match($2, /\*\*[0-9]+\./)) next
+    axis = substr($2, RSTART + 2, RLENGTH - 3)
+    emit(axis, "V", $3)
+    emit(axis, "L", $4)
+  }
+' FS='|' "${SPEC}" | sort -u)"
+
+# `("sm1", 1, "значение", 'V'),` → `1|V|значение`
+MANIFEST_PAIRS="$(grep -hoE '\("[a-z0-9_]+", *[0-9]+, *"[^"]+", *.[VL].\)' "${ORACLE_META}" "${ORACLE_GUARD}" |
+  sed -E "s/\(\"[a-z0-9_]+\", *([0-9]+), *\"([^\"]+)\", *.([VL]).\)/\1|\3|\2/" | sort -u)"
+
+[ -n "${SPEC_PAIRS}" ] || die "разбор таблицы §4.2 дал ПУСТО — парсер сломан либо раздел переименован; молчаливый зелёный здесь недопустим"
+[ -n "${MANIFEST_PAIRS}" ] || die "манифест набора не извлёкся — форма записи изменилась"
+
+MISS="$(comm -23 <(printf '%s\n' "${SPEC_PAIRS}") <(printf '%s\n' "${MANIFEST_PAIRS}") | tr '\n' ' ')"
+EXTRA="$(comm -13 <(printf '%s\n' "${SPEC_PAIRS}") <(printf '%s\n' "${MANIFEST_PAIRS}") | tr '\n' ' ')"
+N_SPEC=$(printf '%s\n' "${SPEC_PAIRS}" | grep -c .)
+N_MAN=$(printf '%s\n' "${MANIFEST_PAIRS}" | grep -c .)
+
+if [ -z "${MISS}" ] && [ -z "${EXTRA}" ]; then
+  pass "N манифест ⇄ спека: ${N_SPEC} пар (ось,вид,значение) совпали в обе стороны"
+else
+  [ -n "${MISS}" ] && fail "N в спеке есть, в наборе НЕТ: ${MISS}"
+  [ -n "${EXTRA}" ] && fail "N в наборе есть, в спеке НЕТ: ${EXTRA}"
+  echo "      ↳ спека ${N_SPEC} пар, набор ${N_MAN}"
+fi
+
+# Легитимный сценарий на КАЖДОЙ оси: без него набор проходит реализация «запретить всё».
+SPEC_AXES="$(printf '%s\n' "${SPEC_PAIRS}" | cut -d'|' -f1 | sort -u)"
+LEGIT_MISS=""
+for ax in ${SPEC_AXES}; do
+  printf '%s\n' "${MANIFEST_PAIRS}" | grep -q "^${ax}|L|" || LEGIT_MISS="${LEGIT_MISS}${ax} "
+done
+if [ -z "${LEGIT_MISS}" ]; then
+  pass "N легитимное значение есть на каждой из осей: $(printf '%s\n' "${SPEC_AXES}" | tr '\n' ' ')"
+else
+  fail "N НЕТ легитимного значения на осях: ${LEGIT_MISS}— набор пройдёт реализация «запретить всё» (для оси 3 это «вообще не смотреть на каталог»)"
+fi
+
+# ── G: guard `hint.pos` (задача 4) ──────────────────────────────────────────────────────
+# Отдельным шагом и отдельным файлом: не зависит от счётчика и обязан быть исполнимым до
+# задачи 1. Сегодня КРАСЕН — два оракула падают, и это ожидаемое состояние RED.
+echo "--- G: guard hint.pos (SM-7) ---"
+if cargo test -p gateway --test red_hint_pos_guard >/tmp/m62-guard.log 2>&1; then
+  G_OK=$(grep -cE '^test result: ok\. [1-9]' /tmp/m62-guard.log)
+  if [ "${G_OK}" -ge 1 ]; then
+    pass "G SM-7 GREEN ($(grep -E '^test result' /tmp/m62-guard.log | head -1))"
+  else
+    fail "G прогон exit=0, но НИ ОДНОГО исполненного теста — зелёный не заслужен"
+  fi
+else
+  fail "G SM-7 КРАСЕН — guard hint.pos не реализован (задача 4)"
+  grep -E '^(test .* FAILED|SM-7)' /tmp/m62-guard.log | head -6 | sed 's/^/      ↳ /'
+fi
+
+# ── F: счётчик метаданных-пути (задачи 1-3) ─────────────────────────────────────────────
+echo "--- F: SM-0..SM-6 (счётчик и кеш) ---"
+if cargo test -p gateway --test red_segment_meta_bound >/tmp/m62-meta.log 2>&1; then
+  F_OK=$(grep -cE '^test result: ok\. [1-9]' /tmp/m62-meta.log)
+  if [ "${F_OK}" -ge 1 ]; then
+    pass "F SM-0..SM-6 GREEN ($(grep -E '^test result' /tmp/m62-meta.log | head -1))"
+  else
+    fail "F прогон exit=0, но ноль исполненных тестов"
+  fi
+else
+  fail "F SM-0..SM-6 КРАСНЫ"
+  if grep -q 'no field `segment_meta_ops`' /tmp/m62-meta.log; then
+    echo "      ↳ причина: счётчик segment_meta_ops не существует (задача 1 не сделана) — ОЖИДАЕМОЕ состояние RED"
+  else
+    grep -E '^(error|test .* FAILED)' /tmp/m62-meta.log | head -6 | sed 's/^/      ↳ /'
+  fi
+fi
+
+# ── F2: батарея мутантов §4.4 — FAIL-CLOSED до появления ────────────────────────────────
+# Мутанты (`nocache`, `staleforever`, `dirshared`, `countfake`) суть правки РЕАЛИЗАЦИИ,
+# которой ещё нет: батарею физически нельзя написать раньше задач 1-3. Готового каркаса
+# мутации для Rust в репозитории тоже нет (замер: ни одного `[features]`, ни одного
+# `env::var("HFT_*")` в `crates/*/src`; батарея M-60a мутирует shell-барьер).
+# Шаг объявлен ЯВНО КРАСНЫМ, а не пропущенным: «ещё не написано» обязано быть видно гейту,
+# иначе milestone закроется без анти-плацебо — ровно то, что дважды случалось в линии M-57.
+echo "--- F2: батарея мутантов §4.4 ---"
+BATTERY="scripts/tests/red_segment_meta_battery.sh"
+if [ -f "${BATTERY}" ]; then
+  if bash "${BATTERY}" --battery >/tmp/m62-batt.log 2>&1; then
+    pass "F2 $(grep -oE 'BATTERY: PASS \([0-9]+/[0-9]+\)' /tmp/m62-batt.log | head -1)"
+  else
+    fail "F2 батарея КРАСНАЯ"
+    grep -E '^(FAIL|SETUP)' /tmp/m62-batt.log | head -6 | sed 's/^/      ↳ /'
+  fi
+else
+  fail "F2 батареи ${BATTERY} НЕТ — анти-плацебо не предъявлено (пишется architect'ом ПОСЛЕ задач 1-3, когда есть что мутировать)"
+fi
+
+# ── M: регресс M-57 — цена M-62 не уплачена соседним инвариантом ────────────────────────
+# Кеш перечня сегментов способен уронить именно эти оракулы: ротация между тиками (o3),
+# корректность выдачи при stale-кеше (o4, td083-свёртка), RO-каталог (f035_1), общий
+# указатель (f035_2). Список — из разведки 11.08, §4.5 спеки.
+echo "--- M: регресс M-57 ---"
+if cargo test -p journal --no-fail-fast --test red_tail_scan_bounded >/tmp/m62-j.log 2>&1 &&
+  cargo test -p gateway --no-fail-fast --test red_tail_cursor_prod_form \
+    --test red_read_stats_passthrough --test red_push_seek_bounded \
+    --test red_frames_seek_bound >/tmp/m62-g.log 2>&1; then
+  M_OK=$(grep -chE '^test result: ok\. [1-9]' /tmp/m62-j.log /tmp/m62-g.log | paste -sd+ | bc)
+  if [ "${M_OK:-0}" -ge 5 ]; then
+    pass "M оракулы M-57 GREEN, зелёных блоков: ${M_OK}"
+  else
+    fail "M exit=0, но зелёных блоков ${M_OK} (<5) — часть наборов не исполнилась"
+  fi
+else
+  fail "M оракулы M-57 КРАСНЫ — цена M-62 уплачена соседним инвариантом (§5 запретного списка)"
+  grep -hE '^test .* FAILED' /tmp/m62-j.log /tmp/m62-g.log | head -6 | sed 's/^/      ↳ /'
+fi
+
+# ── T: паритет с CI ─────────────────────────────────────────────────────────────────────
+# Каждая команда CI-джоба build-test имеет здесь пункт (`gates.md` §3: гейт, который зеленее
+# CI, — не гейт). Вывод СОХРАНЯЕТСЯ и печатается хвостом при падении (TD-126: «сохранено и
+# не прочитано» — тот же дефект, что выброшенный вывод).
+echo "--- T: паритет с CI ---"
+cargo fmt --all -- --check >/tmp/m62-fmt.log 2>&1 && pass "T fmt" || {
+  fail "T fmt"
+  tail -5 /tmp/m62-fmt.log | sed 's/^/      ↳ /'
+}
+cargo clippy --all-targets --all-features -- -D warnings >/tmp/m62-cl.log 2>&1 && pass "T clippy" || {
+  fail "T clippy"
+  tail -8 /tmp/m62-cl.log | sed 's/^/      ↳ /'
+}
+if cargo test --all >/tmp/m62-all.log 2>&1; then
+  N_PASS=$(grep -E '^test result' /tmp/m62-all.log | awk '{p += $4} END {print p + 0}')
+  if [ "${N_PASS:-0}" -gt 0 ]; then
+    pass "T cargo test --all: passed=${N_PASS}"
+  else
+    fail "T cargo test --all вернул 0, исполнив НОЛЬ тестов — exit 0 не заслужен"
+  fi
+else
+  fail "T cargo test --all КРАСНЫЙ"
+  grep -E '^(error(\[E[0-9]+\])?:|test .* FAILED)' /tmp/m62-all.log | head -8 | sed 's/^/      ↳ /'
+fi
+
+echo
+if [ "${FAILED}" -gt 0 ]; then
+  echo "VERDICT: FAIL (${FAILED} нарушений)"
+  exit 1
+fi
+echo "VERDICT: PASS"
