@@ -137,6 +137,198 @@ pub struct TailHint {
     pub pos: u64,
 }
 
+// === M-62 (TD-120): счётчик операций с метаданными сегментов + per-session кеш перечня ===
+
+/// Счётчик операций с метаданными сегментов за проход.
+///
+/// `M-62 (TD-120)`, задача 1: детерминированный счётчик операций (`stat`, `File::open`
+/// ради заголовка, `read_dir`), инкрементируемый в местах РЕАЛЬНЫХ операций, а не раз за
+/// вызов `segments()` — иначе верхний порог проходит мутант `countfake` (раз за вызов).
+/// Аддитивен к `events_scanned`/`events_decoded` (те не трогает — sacred M-57).
+///
+/// Передаётся как `&mut u64` через все `fn`-ы, исполняющие классификацию сегментов; нулевая
+/// стоимость в release (`&mut u64` — одно машинное слово, JIT'ом оптимизируется в
+/// прямую запись). Используется только `stream_from_at` (прод-путь) — другие прод-пути
+/// (`stream`, `read_all`) не интересуются метрикой и зовут общий хелпер `segments()`
+/// через собственные внутренние обёртки с собственным `&mut u64`.
+///
+/// Поле публичное (не `cell`-обёртка): это счётчик, не состояние — потребитель сам решает,
+/// как его использовать (положить в `EventStream`, добавить в `ReadStats`, напечатать).
+pub type SegmentOps = u64;
+
+/// Per-session кеш перечня сегментов каталога. Решает M-62 (TD-120), задачи 2+3:
+/// установившийся тик больше НЕ обходит каталог заново — кеш переиспользует
+/// `SegmentInfo` между тиками, инвалидируясь по дешёвому сигналу (один `stat` хвоста +
+/// один `read_dir` сравнение имён файлов).
+///
+/// **СОСТОЯНИЕ PER-SESSION, не per-catalog (`§5` запретного списка).** Живёт в
+/// `LiveReducer` рядом с `tail_hint`. Никаких файлов в каталоге журнала (`:ro`-том
+/// прода не выдержит записи; M-57 провалил три круга гейтов на sidecar'е
+/// `journal.tail-offset`), никаких общих указателей (`F-035-2`: одна сессия
+/// обесценивает кеш у соседа).
+///
+/// **Инвалидация — дешёвая, без полного перечисления:**
+/// 1. `stat(latest_path)` → если размер изменился, кеш протух (active-сегмент растёт
+///    между тиками — это НОРМА и НЕ инвалидирует кеш; НЕ совпадение пути ⇒ ротация);
+/// 2. одно `read_dir` каталога + сравнение отсортированных имён файлов с кешированными →
+///    если различаются, кеш протух (появился новый сегмент / исчез `.jrnl` при
+///    компакции закрытого сегмента).
+///
+/// Оба сигнала ОБЯЗАНЫ проверяться: `stat` ловит ротацию, `read_dir` ловит компакцию
+/// закрытого сегмента, при которой `latest_path` остаётся прежним.
+pub struct SegmentCatalog {
+    /// Отсортированный по `index` список сегментов (тот же порядок, что выдаёт `segments()`).
+    segments: Vec<SegmentInfo>,
+    /// Отсортированный список имён ВСЕХ файлов каталога на момент построения кеша.
+    /// Сравнение имён — дешёвый O(|files|) тест инвалидации без `metadata` на каждом.
+    file_names: Vec<String>,
+    /// Путь сегмента с МАКСИМАЛЬНЫМ индексом (None если каталог пуст). По нему
+    /// `is_fresh` делает один `stat` — `stat` дешевле `metadata()`.
+    latest_path: Option<PathBuf>,
+    /// Размер `latest_path` на момент кеширования.
+    latest_size: u64,
+}
+
+impl SegmentCatalog {
+    /// Построить кеш, обойдя каталог. Возвращает `(каталог, ops_done)`.
+    ///
+    /// `ops_done` отражает РЕАЛЬНЫЕ syscall'ы построения (≈ `1 (manifest) + 1 (read_dir)
+    /// + N × ~2.5 (per segment)`); см. §1.1 спеки.
+    pub fn open(dir: &Path) -> io::Result<(Self, SegmentOps)> {
+        let mut ops: SegmentOps = 0;
+        let segments = segments_counted(dir, &mut ops)?;
+        let (file_names, latest_path, latest_size) = scan_dir_layout(dir, &mut ops)?;
+        Ok((
+            Self {
+                segments,
+                file_names,
+                latest_path,
+                latest_size,
+            },
+            ops,
+        ))
+    }
+
+    /// Дешёвая проверка свежести кеша. Возвращает `(fresh, ops_done)`.
+    ///
+    /// Стоимость — 1 `stat` + 1 `read_dir` независимо от N (по §1.1 спеки: 410+
+    /// syscall'ов сегодня, ≤2 при кеше).
+    ///
+    /// Правила инвалидации:
+    /// - `latest_path` исчез (ротация) ⇒ stale;
+    /// - `latest_path.len()` УМЕНЬШИЛОСЬ (truncate/компакция активного) ⇒ stale;
+    /// - `latest_path.len()` ВОЗРОСЛО (нормальный append между тиками) ⇒ FRESH —
+    ///   состав сегментов не изменился, только последний вырос, и `catalog.segments()`
+    ///   остаётся корректным (его позиция на НЕ-зависит от текущей длины файла);
+    /// - состав имён файлов изменился ⇒ stale (ротация создала новый файл, или
+    ///   компакция закрытого сегмента удалила `.jrnl`).
+    ///
+    /// Дешёвая проверка свежести кеша. Возвращает `(fresh, ops_done)`.
+    ///
+    /// Стоимость — 1 `stat` + 1 `read_dir` независимо от N (по §1.1 спеки: 410+
+    /// syscall'ов сегодня, ≤2 при кеше в чистом случае).
+    ///
+    /// **Инкрементальная инвалидация для типовых между-тиковых изменений:**
+    /// при ротации (1 новый файл, 0 удалённых) или компакции закрытого сегмента
+    /// (1 файл удалён `.jrnl`, 1 добавлен `.jrnl.zst`) кеш обновляется ЧАСТИЧНО:
+    /// классифицируется только изменённый файл, остальные 199 не трогаются. Стоимость
+    /// остаётся ≤8 операций — в бюджете `BUDGET_META`. Без этого каждый пустой тик
+    /// платил бы O(сегмента) за ротацию, и M-62 отменял бы сам себя.
+    ///
+    /// БОЛЬШОЕ расхождение (mass rotation, multi-сегмент compaction) ⇒ возврат `false`:
+    /// caller обязан вызвать `refresh()` для полного перестроения (полная цена ~N×2.5).
+    /// Это редкий случай и происходит только при долгом простаивании сессии.
+    pub fn is_fresh(&mut self, dir: &Path) -> io::Result<(bool, SegmentOps)> {
+        let mut ops: SegmentOps = 0;
+        // (1) stat хвоста: путь исчез ⇒ точно ротация, нужен refresh.
+        if let Some(latest) = self.latest_path.as_ref() {
+            match fs::metadata(latest) {
+                Ok(m) => {
+                    ops += 1;
+                    if m.len() < self.latest_size {
+                        // Truncate активного — редкий случай, refresh.
+                        return Ok((false, ops));
+                    }
+                }
+                Err(_) => {
+                    // Файл исчез — ротация, нужно полное обновление.
+                    ops += 1;
+                    return Ok((false, ops));
+                }
+            }
+        }
+        // (2) Сравнение состава файлов: вычисляем diff и обновляем инкрементально
+        //     если изменение «маленькое».
+        let (cur_names, cur_latest_path, cur_latest_size) = scan_dir_layout(dir, &mut ops)?;
+        if cur_names == self.file_names {
+            return Ok((true, ops));
+        }
+        // diff: что добавлено и что удалено относительно кеша.
+        let added: Vec<&String> = cur_names
+            .iter()
+            .filter(|n| !self.file_names.contains(n))
+            .collect();
+        let removed: Vec<&String> = self
+            .file_names
+            .iter()
+            .filter(|n| !cur_names.contains(n))
+            .collect();
+        // Типовая между-тиковая ситуация: ротация (+1, 0) или компакция закрытого
+        // сегмента (−1 .jrnl, +1 .zst). Оба укладываются в «маленький» diff.
+        let small_change = added.len() <= 2 && removed.len() <= 2;
+        if !small_change {
+            return Ok((false, ops));
+        }
+        // Инкрементальное обновление: применяем diff к кешу. На каждый добавленный
+        // файл — `classify_segment` (~3 операции); на удалённый — убираем из
+        // `self.segments`. На КАЖДЫЙ добавленный — ops учитывается внутри.
+        let manifest = load_manifest(dir, &mut ops)?;
+        for added_name in &added {
+            let p = dir.join(added_name.as_str());
+            let info = classify_segment(&p, &manifest, &mut ops)?;
+            // Поддерживаем порядок по индексу (вставка в конец корректна, т.к. новые
+            // сегменты всегда имеют индекс больше существующих при ротации; при
+            // компакции индекс добавленного .zst совпадает с удалённым .jrnl).
+            self.segments.push(info);
+        }
+        for removed_name in &removed {
+            // Находим запись с тем же индексом и удаляем.
+            if let Some(idx) = parse_segment_index_any(removed_name) {
+                self.segments.retain(|s| s.index != idx);
+            }
+        }
+        // Сортируем на случай, если порядок был нарушен (защита).
+        self.segments.sort_by_key(|s| s.index);
+        self.file_names = cur_names;
+        self.latest_path = cur_latest_path;
+        self.latest_size = cur_latest_size;
+        Ok((true, ops))
+    }
+
+    /// Принудительное обновление кеша. Возвращает `ops_done` (полная цена обхода).
+    pub fn refresh(&mut self, dir: &Path) -> io::Result<SegmentOps> {
+        let mut ops: SegmentOps = 0;
+        let segments = segments_counted(dir, &mut ops)?;
+        let (file_names, latest_path, latest_size) = scan_dir_layout(dir, &mut ops)?;
+        self.segments = segments;
+        self.file_names = file_names;
+        self.latest_path = latest_path;
+        self.latest_size = latest_size;
+        Ok(ops)
+    }
+
+    /// Список сегментов, попавших в кеш (отсортирован по индексу).
+    pub fn segments(&self) -> &[SegmentInfo] {
+        &self.segments
+    }
+
+    /// `true`, если кеш пуст (`segments.is_empty()`). Пустой кеш — легитимное
+    /// состояние (каталог ещё не получил ни одного сегмента).
+    pub fn is_empty(&self) -> bool {
+        self.segments.is_empty()
+    }
+}
+
 // === Маркеры ошибок (для type-based проверок в тестах и проде) ===
 
 /// Ошибка: сегмент без магии и без валидной декларации (чужой/неизвестный).
@@ -269,14 +461,60 @@ pub fn legacy_meta_path(dir: &Path) -> PathBuf {
 }
 
 /// Прочитать существующий манифест легаси-деклараций (или пустой, если файла нет).
-fn load_manifest(dir: &Path) -> io::Result<LegacyManifest> {
+///
+/// M-62 (TD-120): инкрементирует `ops` за каждый syscall (`p.exists()` + `fs::read`),
+/// чтобы счётчик `segment_meta_ops` на `EventStream` считал РЕАЛЬНЫЕ операции.
+fn load_manifest(dir: &Path, ops: &mut SegmentOps) -> io::Result<LegacyManifest> {
     let p = dir.join(LEGACY_MANIFEST);
     if !p.exists() {
+        *ops += 1;
         return Ok(LegacyManifest::default());
     }
+    *ops += 2;
     let bytes = std::fs::read(&p)?;
     serde_json::from_slice(&bytes)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("legacy manifest: {e}")))
+}
+
+/// Дешёвый скан каталога: имена файлов + путь/размер сегмента с максимальным индексом.
+/// Не открывает файлы — только `read_dir` + `metadata` на хвосте. Используется
+/// `SegmentCatalog` для построения fingerprint'а и его дешёвой проверки свежести.
+fn scan_dir_layout(
+    dir: &Path,
+    ops: &mut SegmentOps,
+) -> io::Result<(Vec<String>, Option<PathBuf>, u64)> {
+    *ops += 1; // read_dir
+               // DET-OK: порядок fs::read_dir не протекает наружу — names.sort() нормализует имена; latest_path/latest_size — индекс максимального сегмента, не позиция обхода.
+    let entries = fs::read_dir(dir)?;
+    let mut names: Vec<String> = Vec::new();
+    let mut latest_idx: Option<u32> = None;
+    let mut latest_path: Option<PathBuf> = None;
+    for entry in entries {
+        let entry = entry?;
+        let p = entry.path();
+        let name = match p.file_name().and_then(OsStr::to_str) {
+            Some(s) => s.to_string(),
+            None => continue,
+        };
+        // Не фильтруем по суффиксу здесь — нам интересны ВСЕ имена для сравнения
+        // (compaction переименовывает .jrnl → .jrnl.zst, и оба варианта должны попасть
+        // в список, иначе инвалидация бы не сработала).
+        if let Some(idx) = parse_segment_index_any(&name) {
+            if latest_idx.is_none_or(|cur| idx > cur) {
+                latest_idx = Some(idx);
+                latest_path = Some(p);
+            }
+        }
+        names.push(name);
+    }
+    names.sort();
+    let latest_size = if let Some(ref p) = latest_path {
+        *ops += 1;
+        fs::metadata(p).map(|m| m.len()).unwrap_or(0)
+    } else {
+        0
+    };
+    Ok((names, latest_path, latest_size))
 }
 
 /// Попытка прочитать `SegmentHeader` с текущей позиции файла.
@@ -511,8 +749,15 @@ fn read_frame_payload<R: Read>(mut r: R) -> io::Result<Option<Vec<u8>>> {
 
 /// Прочитать первые 8 байт файла (без потребления: используется для классификации).
 /// `Ok(None)` если файл меньше 8 байт.
-fn read_magic_prefix(path: &Path) -> io::Result<Option<[u8; SEGMENT_MAGIC.len()]>> {
+///
+/// M-62 (TD-120): инкрементирует `ops` за `File::open` ради первых 8 B (`§1.1` спеки —
+/// «read_magic_prefix (`File::open`+read 8 B)`).
+fn read_magic_prefix(
+    path: &Path,
+    ops: &mut SegmentOps,
+) -> io::Result<Option<[u8; SEGMENT_MAGIC.len()]>> {
     let mut f = File::open(path)?;
+    *ops += 1;
     let mut buf = [0u8; SEGMENT_MAGIC.len()];
     let n = f.read(&mut buf)?;
     if n < SEGMENT_MAGIC.len() {
@@ -532,7 +777,11 @@ fn read_magic_prefix(path: &Path) -> io::Result<Option<[u8; SEGMENT_MAGIC.len()]
 /// Аргумент `size_at_open` нужен для расчёта `first_seq` legacy-сегмента: после замены
 /// `Journal` (закрытия-переоткрытия с `open_with`) legacy-сегмент, открытый на запись,
 /// остаётся таковым — а мета уже могла отставать.
-fn classify_segment(path: &Path, manifest: &LegacyManifest) -> io::Result<SegmentInfo> {
+fn classify_segment(
+    path: &Path,
+    manifest: &LegacyManifest,
+    ops: &mut SegmentOps,
+) -> io::Result<SegmentInfo> {
     let file_name = path
         .file_name()
         .and_then(OsStr::to_str)
@@ -542,15 +791,16 @@ fn classify_segment(path: &Path, manifest: &LegacyManifest) -> io::Result<Segmen
     let index = parse_segment_index_any(&file_name)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "not a segment file"))?;
 
+    *ops += 1; // fs::metadata (size_bytes)
     let size_bytes = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
 
     // M-08 task 15 (TD-022): сжатый сегмент — другой формат, другая схема классификации
     // (нет legacy-пути: zstd-обёртка всегда поверх v2, иначе компакция бы не создала файл).
     if is_compacted_name(&file_name) {
-        return classify_compacted_segment(path, index, size_bytes);
+        return classify_compacted_segment(path, index, size_bytes, ops);
     }
 
-    let has_magic = matches!(read_magic_prefix(path)?, Some(m) if m == SEGMENT_MAGIC);
+    let has_magic = matches!(read_magic_prefix(path, ops)?, Some(m) if m == SEGMENT_MAGIC);
 
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -558,6 +808,7 @@ fn classify_segment(path: &Path, manifest: &LegacyManifest) -> io::Result<Segmen
         .unwrap_or(0);
 
     if has_magic {
+        *ops += 1; // File::open для повторного header-read (магия уже прочитана, теперь body)
         let mut f = File::open(path)?;
         let header = match read_v2_header_and_skip(&mut f)? {
             Some(h) => h,
@@ -581,7 +832,7 @@ fn classify_segment(path: &Path, manifest: &LegacyManifest) -> io::Result<Segmen
         // лимит остаётся прежним (это та же горячая копия). Если файл усечён ниже
         // decl.size — лимит ограничен текущим размером (см. fingerprint_limited).
         let limit = decl.size_bytes_at_decl.min(LEGACY_FINGERPRINT_BYTES);
-        let fp = fingerprint_limited(path, limit)?;
+        let fp = fingerprint_limited(path, limit, ops)?;
         if fp != decl.fingerprint_sha256 {
             return Err(err_with(
                 io::ErrorKind::InvalidData,
@@ -611,8 +862,14 @@ fn classify_segment(path: &Path, manifest: &LegacyManifest) -> io::Result<Segmen
 /// Ошибки декодирования → `Err(CorruptHeader)` или `Err(InvalidData)`. Порченый .zst
 /// НИКОГДА не вменяется в v2 с припиской «наш» — тот же fail-closed, что для raw
 /// (CT-RFC-02 rev 2 находка C2).
-fn classify_compacted_segment(path: &Path, index: u32, size_bytes: u64) -> io::Result<SegmentInfo> {
+fn classify_compacted_segment(
+    path: &Path,
+    index: u32,
+    size_bytes: u64,
+    ops: &mut SegmentOps,
+) -> io::Result<SegmentInfo> {
     let f = File::open(path)?;
+    *ops += 1; // File::open + zstd init считаем одной «операцией метаданных»
     let mut decoder = open_compacted_reader(f)?;
     let header = skip_v2_header_forward(&mut decoder).map_err(|e| match e.kind() {
         io::ErrorKind::UnexpectedEof => corrupt_header_err(),
@@ -669,7 +926,9 @@ fn parse_segment_index_any(name: &str) -> Option<u32> {
 /// в отличие от прод-пути, который через `segments()` отвергает чужие/незадекларированные
 /// файлы.
 pub(crate) fn iter_segments_sorted(dir: &Path) -> io::Result<Vec<PathBuf>> {
-    dedup_indexed_paths(dir)
+    let mut ops: SegmentOps = 0;
+    let paths = dedup_indexed_paths(dir, &mut ops)?;
+    Ok(paths)
 }
 
 /// Дедуплицировать `segment-*.jrnl` и `segment-*.jrnl.zst` каталога по индексу.
@@ -677,7 +936,11 @@ pub(crate) fn iter_segments_sorted(dir: &Path) -> io::Result<Vec<PathBuf>> {
 ///
 /// Публичные пути ОБЯЗАНЫ использовать ЭТОТ хелпер (а не собирать индексы параллельно
 /// по своим правилам): иначе воспроизводится rev 9-блокер.
-fn dedup_indexed_paths(dir: &Path) -> io::Result<Vec<PathBuf>> {
+///
+/// M-62 (TD-120): инкрементирует `ops` за ОДИН `read_dir` (все записи возвращаются
+/// одним syscall'ом; per-entry обход — без syscall'ов).
+fn dedup_indexed_paths(dir: &Path, ops: &mut SegmentOps) -> io::Result<Vec<PathBuf>> {
+    *ops += 1; // fs::read_dir
     let mut by_index: std::collections::BTreeMap<u32, PathBuf> = std::collections::BTreeMap::new();
     // Каждая запись вставляется в BTreeMap<u32, PathBuf> по индексу сегмента (данные из
     // имени файла), а итоговый Vec собирается из into_values() по возрастанию индекса.
@@ -720,7 +983,9 @@ fn dedup_indexed_paths(dir: &Path) -> io::Result<Vec<PathBuf>> {
 }
 
 fn latest_segment(dir: &Path) -> io::Result<Option<(u32, PathBuf)>> {
-    Ok(dedup_indexed_paths(dir)?
+    let mut ops: SegmentOps = 0;
+    let paths = dedup_indexed_paths(dir, &mut ops)?;
+    Ok(paths
         .into_iter()
         .filter_map(|path| {
             let name = path.file_name().and_then(OsStr::to_str)?;
@@ -742,11 +1007,19 @@ fn latest_segment(dir: &Path) -> io::Result<Option<(u32, PathBuf)>> {
 /// `.jrnl` + `.jrnl.zst` НЕ дедуплицировал — сегмент читался дважды, 3000 событий
 /// превращались в 3172, DET-I-1 нарушался. Теперь это правило одно на оба пути.
 pub fn segments(dir: impl AsRef<Path>) -> io::Result<Vec<SegmentInfo>> {
-    let dir = dir.as_ref();
-    let manifest = load_manifest(dir)?;
-    let mut out = Vec::new();
-    for p in dedup_indexed_paths(dir)? {
-        out.push(classify_segment(&p, &manifest)?);
+    let mut ops: SegmentOps = 0;
+    segments_counted(dir.as_ref(), &mut ops)
+}
+
+/// M-62 (TD-120): то же, что `segments()`, но возвращает `Vec<SegmentInfo>` и пишет
+/// количество операций с метаданными сегментов в `ops`. Используется прод-путем
+/// `stream_from_at` для построения `EventStream::segment_meta_ops`.
+pub(crate) fn segments_counted(dir: &Path, ops: &mut SegmentOps) -> io::Result<Vec<SegmentInfo>> {
+    let manifest = load_manifest(dir, ops)?;
+    let paths = dedup_indexed_paths(dir, ops)?;
+    let mut out = Vec::with_capacity(paths.len());
+    for p in paths {
+        out.push(classify_segment(&p, &manifest, ops)?);
     }
     // Стабильная сортировка по индексу — критично для сшивки по границе.
     out.sort_by_key(|s| s.index);
@@ -769,7 +1042,7 @@ pub fn segments(dir: impl AsRef<Path>) -> io::Result<Vec<SegmentInfo>> {
         })
         .collect();
     check_first_seq_monotonic(&candidates, |name| {
-        segment_carries_any_event(&dir.join(name))
+        segment_carries_any_event(&dir.join(name), ops)
     })?;
 
     Ok(out)
@@ -778,7 +1051,8 @@ pub fn segments(dir: impl AsRef<Path>) -> io::Result<Vec<SegmentInfo>> {
 /// Отпечаток первых `LEGACY_FINGERPRINT_BYTES` байт файла (sha256, hex).
 /// Используется для построения legacy-декларации: защита от подмены файла под знакомым именем.
 pub fn fingerprint(path: &Path) -> io::Result<String> {
-    fingerprint_limited(path, LEGACY_FINGERPRINT_BYTES)
+    let mut ops: SegmentOps = 0;
+    fingerprint_limited(path, LEGACY_FINGERPRINT_BYTES, &mut ops)
 }
 
 /// Хеш первых `min(file_size, limit)` байт файла.
@@ -789,10 +1063,11 @@ pub fn fingerprint(path: &Path) -> io::Result<String> {
 /// (если файл вырос — лимит остаётся прежним, и мы хешируем ровно те байты, которые
 /// видели при декларации; если файл усечён ниже `decl.size` — лимит ограничен размером
 /// текущего файла, hash другой, отказ).
-fn fingerprint_limited(path: &Path, limit: u64) -> io::Result<String> {
+fn fingerprint_limited(path: &Path, limit: u64, ops: &mut SegmentOps) -> io::Result<String> {
     let file_size = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
     let to_hash = file_size.min(limit) as usize;
     let mut f = File::open(path)?;
+    *ops += 1; // File::open ради чтения отпечатка
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 64 * 1024];
     let mut remaining = to_hash;
@@ -816,7 +1091,8 @@ fn fingerprint_limited(path: &Path, limit: u64) -> io::Result<String> {
 /// заменяется). Отпечаток считается ЗДЕСЬ, чтобы операторская команда была атомарна.
 pub fn declare_legacy(dir: impl AsRef<Path>, decl: LegacySegmentDecl) -> io::Result<()> {
     let dir = dir.as_ref();
-    let mut manifest = load_manifest(dir)?;
+    let mut ops: SegmentOps = 0;
+    let mut manifest = load_manifest(dir, &mut ops)?;
 
     let fp = fingerprint(&dir.join(&decl.file_name))?;
     let size = fs::metadata(dir.join(&decl.file_name))?.len();
@@ -927,6 +1203,23 @@ pub struct EventStream {
     /// в `None` при EOF сегмента. Через этот метод `LiveReducer::pump` забирает hint
     /// и сохраняет в `self.tail_hint` для следующего тика.
     active_tail_hint: Option<TailHint>,
+    /// M-62 (TD-120), задача 1: детерминированный счётчик операций с МЕТАДАННЫМИ
+    /// сегментов за проход (`stat`, `File::open` ради заголовка, `read_dir`,
+    /// `metadata` для проверки свежести кеша). Аддитивен к `events_scanned`/`events_decoded`
+    /// (те не трогает — sacred M-57/M-38b).
+    ///
+    /// Источник: счётчик `SegmentOps`, накопленный ВНУТРИ `stream_from_at` на этапе
+    /// `segments_counted` (прод-путь через `stream_from_at` единственный, кто
+    /// инструментирует ops; `stream`/`stream_from` старого API оставлены нетронутыми и
+    /// дают `segment_meta_ops = 0`).
+    ///
+    /// Семантика:
+    /// - Первый тик сессии (нет кеша): `≥ N` (полный обход каталога, ~N×2.5 операций).
+    /// - Установившийся тик (hit кеша): `≤ 8` (`stat` хвоста + `read_dir` для свежести).
+    ///
+    /// Подробный бюджет и форма — `crates/gateway/tests/red_segment_meta_bound.rs::SM-1..SM-6`
+    /// и спека `milestones/M-62-segment-metadata.md` §4.1, §4.5(а).
+    segment_meta_ops: u64,
 }
 
 /// Внутренний reader [`EventStream`]'а: активный (с трекингом pos для seek) или
@@ -1022,6 +1315,17 @@ impl EventStream {
     pub fn tail_hint(&self) -> Option<TailHint> {
         self.active_tail_hint
     }
+
+    /// M-62 (TD-120), задача 1: число операций с метаданными сегментов за проход —
+    /// `stat`, `File::open` ради заголовка, `read_dir`. Не растёт с числом сегментов
+    /// в установившемся режиме (hit кеша); растёт на первом тике сессии и при
+    /// инвалидации кеша (ротация, компакция, truncate).
+    ///
+    /// См. `docs/04-workflow.md` §4.5(а) и спеку `milestones/M-62-segment-metadata.md` §4.1:
+    /// «установившийся тик обязан быть O(1)».
+    pub fn segment_meta_ops(&self) -> u64 {
+        self.segment_meta_ops
+    }
 }
 
 impl EventStream {
@@ -1082,7 +1386,8 @@ impl EventStream {
         Ok(true)
     }
 
-    /// M-57 (круг 2, TD-109): с каким байтовым смещением открывать активный raw-сегмент.
+    /// M-57 (круг 2, TD-109) + M-62 §7: с каким байтовым смещением открывать активный
+    /// raw-сегмент.
     ///
     /// Возвращает абсолютное смещение в файле (`>= header_end`).
     ///
@@ -1141,7 +1446,7 @@ impl EventStream {
         }
         // M-62 §7, условие 6: hint.pos против длины файла.
         if hint.pos > file_len {
-            // Усечение / компакция активного при неизменном индексе ⇒ seek за EOF.
+            // Усечение / компакция активного при неизменном индексе → seek за EOF.
             // Fail-safe откат: тик пройдёт с начала сегмента (forward-scan).
             return Ok(header_end);
         }
@@ -1152,7 +1457,7 @@ impl EventStream {
             return Ok(hint.pos);
         }
         // M-62 §7, условие 6b: hint.pos должен указывать на границу кадра.
-        // Пробуем прочитать ОДИН frame с этой позиции; провал ⇒ fail-safe `header_end`.
+        // Пробуем прочитать ОДИН frame с этой позиции; провал → fail-safe `header_end`.
         if !self.probe_frame_boundary(path, hint.pos) {
             return Ok(header_end);
         }
@@ -1349,6 +1654,10 @@ pub fn stream_from(
         // молча проваливалась, оставляя активный сегмент пересканируемым каждый тик.
         hint: None,
         active_tail_hint: None,
+        // M-62 (TD-120): старый API `stream_from` НЕ инструментирует ops (он остался
+        // для обратной совместимости; прод-путь `LiveReducer` зовёт `stream_from_at`,
+        // который учитывает ops в `SegmentCatalog`/segments_counted).
+        segment_meta_ops: 0,
     })
 }
 
@@ -1387,14 +1696,77 @@ pub struct ReplayDigest {
 /// (forward-чтение от `header_end`), как у `stream_from` без hint'а.
 ///
 /// `hint = None` ≡ `stream_from(.., after_seq)` (full scan), без sidecar.
+///
+/// **M-62 (TD-120) backward-compat:** `stream_from_at` — унаследованная сигнатура без
+/// кеша, оставлена для существующих call-sites (test-набор M-57 и т.п.). Делегирует в
+/// [`stream_from_at_with_catalog`] с `catalog = None`. Прод-путь `LiveReducer` обязан
+/// звать именно новую функцию, чтобы получить O(1) на установившемся тике.
 pub fn stream_from_at(
     dir: impl AsRef<Path>,
     filter: EpochFilter,
     after_seq: Option<u64>,
     hint: Option<TailHint>,
 ) -> io::Result<EventStream> {
+    let (stream, _catalog) = stream_from_at_with_catalog(dir, filter, after_seq, hint, None)?;
+    // Каталог, построенный внутри, отбрасываем: backward-compat обёртка не имеет
+    // кому его хранить. Это ЗАКОМПРОМЕТИРОВАННЫЙ путь — прод зовёт новую функцию и
+    // получает каталог обратно. Старые call-sites (test-набор M-57 и т.п.) получают
+    // корректный `EventStream`, но `segment_meta_ops` отражает ПОЛНУЮ цену обхода
+    // (без кеша), что и является их ожиданием.
+    Ok(stream)
+}
+
+/// M-62 (TD-120), задачи 2+3: прод-путь с per-session `SegmentCatalog`.
+///
+/// Всё то же, что [`stream_from_at`], плюс параметр `catalog_in: Option<SegmentCatalog>`
+/// — per-session кеш перечня сегментов (`LiveReducer` хранит ОДИН такой на сессию).
+/// Возвращает `(EventStream, Option<SegmentCatalog>)`: stream для чтения + (возможно
+/// обновлённый) каталог, который caller кладёт в `self.segment_catalog` для следующего
+/// тика.
+///
+/// Логика построения/переиспользования:
+/// - `catalog_in == None` (первый тик сессии) — `SegmentCatalog::open(dir)` строит кеш
+///   полным обходом; ops попадают в `EventStream.segment_meta_ops`. Новый кеш возвращается
+///   в `Some(catalog)` — caller сохраняет.
+/// - `catalog_in == Some(c)`:
+///   1. `c.is_fresh(dir)` — дешёвая проверка (1 `stat` + 1 `read_dir` независимо от N);
+///   2. Если свежий — используем `c.segments()` (цена тика не растёт с N);
+///   3. Иначе — `c.refresh(dir)` обновит кеш (полная цена обхода ~N×2.5 syscall'ов
+///      записывается в ops). Освежённый кеш возвращается.
+///
+/// На первом тике сессии `segment_meta_ops ≥ N` (это «позитивный контроль» SM-3:
+/// первый тик ОБЯЗАН обойти каталог, иначе оптимизация перестаёт замечать новые сегменты).
+/// На установившемся — `segment_meta_ops ≤ 8` (1 stat + 1 read_dir). Подробный бюджет —
+/// `crates/gateway/tests/red_segment_meta_bound.rs::SM-1..SM-6`.
+pub fn stream_from_at_with_catalog(
+    dir: impl AsRef<Path>,
+    filter: EpochFilter,
+    after_seq: Option<u64>,
+    hint: Option<TailHint>,
+    catalog_in: Option<SegmentCatalog>,
+) -> io::Result<(EventStream, Option<SegmentCatalog>)> {
     let dir = dir.as_ref();
-    let all = segments(dir)?;
+    let mut ops: SegmentOps = 0;
+    let (all, catalog_out) = match catalog_in {
+        Some(mut cat) => {
+            // Дешёвая проверка свежести кеша: 1 stat + 1 read_dir независимо от N.
+            let (is_fresh, fresh_ops) = cat.is_fresh(dir)?;
+            ops += fresh_ops;
+            if !is_fresh {
+                let refresh_ops = cat.refresh(dir)?;
+                ops += refresh_ops;
+            }
+            (cat.segments().to_vec(), Some(cat))
+        }
+        None => {
+            // Первый тик сессии: строим кеш с нуля (полная цена обхода в ops).
+            let (new_catalog, build_ops) = SegmentCatalog::open(dir)?;
+            ops += build_ops;
+            // ops НЕ включает дополнительный `segments_counted` — мы используем сегменты
+            // прямо из построенного каталога, не делая второй обход.
+            (new_catalog.segments().to_vec(), Some(new_catalog))
+        }
+    };
     let mut selected: Vec<SegmentInfo> = Vec::with_capacity(all.len());
     let mut headers: Vec<SegmentHeader> = Vec::with_capacity(all.len());
     for s in all {
@@ -1423,21 +1795,25 @@ pub fn stream_from_at(
         }
         selected = kept;
     }
-    Ok(EventStream {
-        segments: selected,
-        selected_headers: headers,
-        cursor: 0,
-        reader: None,
-        finished: false,
-        events_decoded: 0,
-        events_scanned: 0,
-        segments_opened: 0,
-        after_seq,
-        // M-57 (круг 2, TD-109): hint передан извне, in-memory. Без записи на диск,
-        // без зависимости от прав доступа к каталогу.
-        hint,
-        active_tail_hint: None,
-    })
+    Ok((
+        EventStream {
+            segments: selected,
+            selected_headers: headers,
+            cursor: 0,
+            reader: None,
+            finished: false,
+            events_decoded: 0,
+            events_scanned: 0,
+            segments_opened: 0,
+            after_seq,
+            // M-57 (круг 2, TD-109): hint передан извне, in-memory. Без записи на диск,
+            // без зависимости от прав доступа к каталогу.
+            hint,
+            active_tail_hint: None,
+            segment_meta_ops: ops,
+        },
+        catalog_out,
+    ))
 }
 
 /// Посчитать `ReplayDigest` окна `[from_seq, to_seq]` (включительно) — ПОТОКОВО, память не
@@ -1984,8 +2360,9 @@ enum ScanOutcome {
 /// оборван бюджетом, мог нести валидные фреймы с БОЛЕЕ ВЫСОКИМ `seq` за точкой обрыва, и
 /// пропуск к более старому сегменту дал бы ровно тот заниженный пол, от которого защищаемся.
 fn readable_floor(dir: &Path) -> io::Result<ReadableFloor> {
+    let mut ops: SegmentOps = 0;
     let segs = iter_segments_sorted(dir)?;
-    check_monotonic_paths(dir, &segs)?;
+    check_monotonic_paths(dir, &segs, &mut ops)?;
 
     let mut budget = WorkBudget::new(READABLE_FLOOR_WORK_BUDGET_BYTES);
     let mut saw_nonempty = false;
@@ -2017,18 +2394,20 @@ fn readable_floor(dir: &Path) -> io::Result<ReadableFloor> {
 /// строгой классификации/манифеста. `None` — заголовок прочитать не удалось (магия есть, но
 /// битая): сегмент исключается из guard'а, штатное чтение (`read_segment_events`/скан пола)
 /// откажет на нём отдельно со своей диагностикой — дублировать её здесь незачем.
-fn peek_segment_identity(path: &Path) -> Option<(u32, u64)> {
+fn peek_segment_identity(path: &Path, ops: &mut SegmentOps) -> Option<(u32, u64)> {
     let is_zst = path
         .file_name()
         .and_then(OsStr::to_str)
         .is_some_and(is_compacted_name);
     if is_zst {
         let f = File::open(path).ok()?;
+        *ops += 1;
         let mut decoder = open_compacted_reader(f).ok()?;
         let header = skip_v2_header_forward(&mut decoder).ok()?;
         return Some((header.schema_version, header.first_seq));
     }
     let mut f = File::open(path).ok()?;
+    *ops += 1;
     match read_v2_header_and_skip(&mut f) {
         Ok(Some(h)) => Some((h.schema_version, h.first_seq)),
         // Магии нет: legacy (до CT-RFC-02) — сентинел, а не факт (JR-I-11 carve-out 1).
@@ -2042,7 +2421,7 @@ fn peek_segment_identity(path: &Path) -> Option<(u32, u64)> {
 /// равенстве соседних `first_seq` — на здоровом каталоге не вызывается никогда.
 /// `Ok(true)` — предохранительный дефолт, когда прочитать не удалось: пустота — это то, что
 /// обязано быть ДОКАЗАНО, отсутствие доказательства не даёт carve-out.
-fn segment_carries_any_event(path: &Path) -> io::Result<bool> {
+fn segment_carries_any_event(path: &Path, ops: &mut SegmentOps) -> io::Result<bool> {
     let is_zst = path
         .file_name()
         .and_then(OsStr::to_str)
@@ -2052,6 +2431,7 @@ fn segment_carries_any_event(path: &Path) -> io::Result<bool> {
             Ok(f) => f,
             Err(_) => return Ok(true),
         };
+        *ops += 1;
         let mut decoder = match open_compacted_reader(f) {
             Ok(d) => d,
             Err(_) => return Ok(true),
@@ -2065,6 +2445,7 @@ fn segment_carries_any_event(path: &Path) -> io::Result<bool> {
         Ok(f) => f,
         Err(_) => return Ok(true),
     };
+    *ops += 1;
     match read_v2_header_and_skip(&mut f) {
         Ok(Some(_)) => {}
         // Не должно происходить (вызывается только на сравнимых, т.е. НЕ-legacy сегментах) —
@@ -2128,10 +2509,14 @@ fn check_first_seq_monotonic(
 /// для `read_all` (lib.rs) и `readable_floor`: обе тропы идут по best-effort заголовкам без
 /// требования манифеста/строгой классификации (в отличие от `segments()`, у которой заголовки
 /// уже есть из `classify_segment`, и guard встроен инлайн).
-pub(crate) fn check_monotonic_paths(dir: &Path, paths: &[PathBuf]) -> io::Result<()> {
+pub(crate) fn check_monotonic_paths(
+    dir: &Path,
+    paths: &[PathBuf],
+    ops: &mut SegmentOps,
+) -> io::Result<()> {
     let mut candidates: Vec<(String, u32, u64)> = Vec::with_capacity(paths.len());
     for p in paths {
-        if let Some((schema_version, first_seq)) = peek_segment_identity(p) {
+        if let Some((schema_version, first_seq)) = peek_segment_identity(p, ops) {
             let name = p
                 .file_name()
                 .and_then(OsStr::to_str)
@@ -2141,7 +2526,7 @@ pub(crate) fn check_monotonic_paths(dir: &Path, paths: &[PathBuf]) -> io::Result
         }
     }
     check_first_seq_monotonic(&candidates, |name| {
-        segment_carries_any_event(&dir.join(name))
+        segment_carries_any_event(&dir.join(name), ops)
     })
 }
 
@@ -3040,12 +3425,13 @@ pub fn retention_plan(
 type RetentionEnumeration = (Vec<SegmentInfo>, Vec<(SegmentInfo, String)>);
 
 fn enumerate_retention_segments(dir: &Path) -> io::Result<RetentionEnumeration> {
-    let manifest = load_manifest(dir)?;
+    let mut ops: SegmentOps = 0;
+    let manifest = load_manifest(dir, &mut ops)?;
     let mut classified = Vec::new();
     let mut foreign_skipped = Vec::new();
 
-    for path in dedup_indexed_paths(dir)? {
-        match classify_segment(&path, &manifest) {
+    for path in dedup_indexed_paths(dir, &mut ops)? {
+        match classify_segment(&path, &manifest, &mut ops) {
             Ok(info) => classified.push(info),
             Err(e) => {
                 // Foreign / corrupt / truncated. Синтезируем info для skipped — оператор
@@ -3470,7 +3856,7 @@ pub fn compact_segment(seg: &SegmentInfo, level: i32) -> io::Result<CompactionRe
     // Legacy читается как есть (через манифест + fingerprint — см. `classify_segment`),
     // но сжатие legacy архитектурно запрещено: обратного декодера для legacy-в-zstd
     // не существует, и не должен существовать (CT-RFC-02 rev 2 fail-closed находка C2).
-    match read_magic_prefix(src)? {
+    match read_magic_prefix(src, &mut 0)? {
         Some(m) if m == SEGMENT_MAGIC => {} // ok: v2-сегмент, можно сжимать
         _ => {
             return Err(io::Error::new(
