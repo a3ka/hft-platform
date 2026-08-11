@@ -26,9 +26,9 @@ Fastify как middle-tier отменён, Next.js держит только aut
 | **корень того, что фронт парсит ПЕРВЫМ** | **`ServeMsg{Snapshot,Frame,Error}`** — `crates/gateway-serve/src/lib.rs`, модуль `wire`; `SeriesBundle` лежит внутри него | `sed -n '55,70p' crates/gateway-serve/src/lib.rs` |
 | версия формы | константа стоит на **8**; в комментарии к ней задокументированы бампы 4→5, 5→6, 6→7, 7→8 | `sed -n '36,66p' crates/gateway/src/lib.rs` |
 | вторая шкала версий | `research-cli::EXPORT_SCHEMA_VERSION = 1`; комментарий gateway объявляет себя «аддитивно поверх» неё | `grep -rn EXPORT_SCHEMA_VERSION crates/research-cli/src/` |
-| машиночитаемая схема в репозитории | **нет** | `git ls-tree -r --name-only HEAD \| grep -c 'export.*schema'` → 0 |
-| гейт паритета «типы ↔ схема» | **нет** (у журнала есть: `scripts/verify_contracts.sh`) | `ls scripts/verify_contracts.sh scripts/*export*` |
-| классификатор additive/breaking | **нет** (у журнала есть: `scripts/diff_contract_schema.sh` + одноимённый `.py`) | то же |
+| машиночитаемая схема в репозитории | **нет** | `git ls-tree -r --name-only HEAD \| grep -c 'export.*schema'` → `0`, **exit=1 ОЖИДАЕМ** (`grep -c` без совпадений) |
+| гейт паритета «типы ↔ схема» | **нет** (у журнала есть: `scripts/verify_contracts.sh`) | `ls scripts/check_export_contract.sh` → `No such file`, **exit=2 ОЖИДАЕМ**; контроль наличия аналога: `ls scripts/verify_contracts.sh` → exit=0 |
+| классификатор additive/breaking | **нет** (у журнала есть: `scripts/diff_contract_schema.sh` + одноимённый `.py`) | `ls scripts/diff_export_schema.sh` → **exit=2 ОЖИДАЕМ**; контроль: `ls scripts/diff_contract_schema.sh scripts/diff_contract_schema.py` → exit=0 |
 | правило «ломающее ⇒ RFC + bump» | **норма ЕСТЬ, МЕХАНИЗМА нет.** `VB-I-4`/`VB-I-6` и комментарий к константе требуют bump; исполняет их только внимательность автора | `grep -n 'VB-I-4\|VB-I-6' docs/fa/viz-backend.md` |
 | `schemars` у `gateway` | **отсутствует**; у `crates/contracts` есть + `examples/gen_schema.rs`. У `gateway` нет и каталога `examples/` | `grep -c schemars crates/*/Cargo.toml` |
 
@@ -41,12 +41,16 @@ Fastify как middle-tier отменён, Next.js держит только aut
 
 Считать надо **природу** бампов, и она сильнее счётчика:
 
-| бамп | что изменилось | форма | для фронта |
-|---|---|---|---|
-| 4→5 (M-23) | `+ heatmap/cob/volume_bubbles` | аддитивно | безопасно |
-| **5→6 (M-36)** | **`vwap` перестал быть session-anchored, стал journal-cumulative** | **`Vec<(i64,i64)>` не изменилась** | **ломающее и невидимое** |
-| **6→7 (M-38a)** | CVD обнуляется на границе 00:00 UTC; `cvd_session_base` `i64` → `Vec<(id,base)>` | изменилась НЕ аддитивно | ломающее, видимое |
-| 7→8 (M-48) | `+ history_start_seq`, `history_truncated` под `serde(default)` | аддитивно | безопасно |
+Пруф на каждую строку (`C-075` B1): все четыре бампа задокументированы в комментарии к самой
+константе, перечень строк — `grep -n '^/// [0-9]:' crates/gateway/src/lib.rs` → `41, 44, 50, 55`
+(exit=0); текст каждой — командой в последней колонке.
+
+| бамп | что изменилось | форма | для фронта | команда (exit=0) |
+|---|---|---|---|---|
+| 4→5 (M-23) | `+ heatmap/cob/volume_bubbles` | аддитивно | безопасно | `sed -n '41,43p' crates/gateway/src/lib.rs` |
+| **5→6 (M-36)** | **`vwap` перестал быть session-anchored, стал journal-cumulative** | **`Vec<(i64,i64)>` не изменилась** | **ломающее и невидимое** | `sed -n '44,49p' crates/gateway/src/lib.rs` |
+| **6→7 (M-38a)** | CVD обнуляется на границе 00:00 UTC; `cvd_session_base` `i64` → `Vec<(id,base)>` | изменилась НЕ аддитивно | ломающее, видимое | `sed -n '50,54p' crates/gateway/src/lib.rs` |
+| 7→8 (M-48) | `+ history_start_seq`, `history_truncated` под `serde(default)` | аддитивно | безопасно | `sed -n '55,65p' crates/gateway/src/lib.rs` |
 
 **Половина документированных бампов ломала фронт, и один — при неизменной форме.** То же
 зафиксировано в `main` независимо от этой спеки: `docs/plans/plan-design-migration.md`, строка
@@ -60,11 +64,12 @@ RFC и без миграционной заметки». Девятое изме
 Прежняя редакция утверждала: «`red_serve_passthrough` сверяет WS с реплеем; **снапшот в эту
 сверку не входит**». Снято как неверное — проверено чтением оракулов:
 
-| что уже запиннено сегодня | где |
-|---|---|
-| `snapshot(C) + frames_since(C)` == полный пересчёт с нуля (`GW-I-4`), live == replay (`GW-I-3`) | `crates/gateway/tests/red_gateway_live_eq_replay.rs` |
-| `snapshot_msg` оборачивает РОВНО `gateway::snapshot` (`GS-I-5`) | `crates/gateway-serve/tests/red_serve_passthrough.rs:91` |
-| `ServeMsg` переживает JSON-roundtrip и несёт `schema_version` (`GS-I-4`) | там же, ниже по тесту |
+| что уже запиннено сегодня | где | команда (exit=0) |
+|---|---|---|
+| `snapshot(C) + frames_since(C)` == полный пересчёт с нуля (`GW-I-4`), live == replay (`GW-I-3`) | `crates/gateway/tests/red_gateway_live_eq_replay.rs` | `grep -n 'GW-I-4\|snapshot(C)' crates/gateway/tests/red_gateway_live_eq_replay.rs` |
+| `snapshot_msg` оборачивает РОВНО `gateway::snapshot` (`GS-I-5`) | `crates/gateway-serve/tests/red_serve_passthrough.rs` | `grep -n 'GS-I-5\|snapshot_msg обязан обернуть' crates/gateway-serve/tests/red_serve_passthrough.rs` |
+| `ServeMsg` переживает JSON-roundtrip и несёт `schema_version` (`GS-I-4`) | там же | `grep -n 'GS-I-4\|wire-roundtrip\|schema_version' crates/gateway-serve/tests/red_serve_passthrough.rs` |
+| **тавтологичность `GS-I-4`**: обе стороны roundtrip'а — один тип, переименование поля переживёт зелёным | там же | `sed -n '112,116p' crates/gateway-serve/tests/red_serve_passthrough.rs` — `to_string(&msg)` и `from_str::<ServeMsg>` |
 
 Структурное единство поверхностей — закрытая тема, и милестоун, продающий её ещё раз, был бы
 плацебо. Настоящая дыра тоньше:
@@ -282,7 +287,13 @@ Architect предлагал обратный порядок; предложен
 > doc-only и изменений в них не видит в принципе. Пока носитель не спроектирован, **шаг `S`
 > (§6) не считается исполнимым, и милестоун не вправе утверждать, что ловит смену семантики.**
 > Проектирование носителя идёт вместе с миграцией (§2.1): аннотации переезжают с типами, и
-> делать их дважды — расточительство. Кандидат вынесен в `BACKLOG` (реестр находок 11.08).
+> делать их дважды — расточительство.
+>
+> **Где живёт tracking носителя — точный адрес (`C-075` M1).** Запись `Н-7.3` реестра находок
+> в `milestones/BACKLOG.md`, коммит `791df27` ветки `main`. ⚠️ **На момент написания rev3 этот
+> коммит НЕ ЗАПУШЕН**, поэтому ни на этой ветке, ни в `origin/main` записи нет, и проверяющий
+> её не найдёт — что критик и предъявил. Ссылка станет разрешимой на дереве слияния только
+> после push `791df27`; до тех пор она — обещание, а не адрес, и названа здесь именно так.
 
 ## 5. Запретный список
 
@@ -320,7 +331,9 @@ Architect предлагал обратный порядок; предложен
 ## 6bis. Что найдено в rev3, но СОЗНАТЕЛЬНО не внесено (решение founder'а 11.08 — «урезать до вынужденного»)
 
 Адверсарная проверка rev2 нашла больше, чем требовал `C-074`. Founder решил не тащить это в
-M-64; находки живут в `milestones/BACKLOG.md` (реестр 11.08) и ждут отдельного решения.
+M-64; находки живут записями `Н-7.1`…`Н-7.5` реестра в `milestones/BACKLOG.md` — коммит
+`791df27` ветки `main`, **на момент написания не запушенный** (тот же адресный разрыв, что
+описан в §4.4: до push ссылка неразрешима для проверяющего).
 Перечислены здесь, чтобы следующий круг критика не принял их отсутствие за незнание:
 
 | находка | почему не внесена сейчас |
