@@ -528,6 +528,56 @@ fn sm5_compaction_is_noticed_and_quiet_dir_is_not_rescanned() {
         !expect.is_empty(),
         "SM-5: после компакции независимый эталон пуст — журнал стал нечитаем"
     );
+
+    // (3) «ЗАМЕЧЕНА» проверяется ПОВЕДЕНИЕМ, а не тем, что тик не упал.
+    //
+    // Батарея мутантов (задача 7) предъявила: до этой половины `staleforever` — кеш,
+    // НИКОГДА не инвалидирующийся, — проходил SM-5 целиком. Причина в том, что сессия
+    // `live` к моменту компакции уже ушла в хвост: закрытые сегменты ей больше не нужны,
+    // и устаревший перечень её не задевает. Тест обещал «компакция замечена», а мерил
+    // «тик не паникует» — ровно класс «оракул обязан мерить ТО, ЧТО ОБЕЩАЕТ».
+    //
+    // Наблюдаемой компакция становится для ОТСТАВШЕЙ сессии: ей закрытые сегменты ещё
+    // предстоит прочитать. Её кеш построен ДО компакции и указывает на `.jrnl`, которых
+    // больше нет; без инвалидации она недосчитается событий — тихая деградация при
+    // зелёном healthcheck, тот же класс, что `TD-031`.
+    let ck_lag = tempfile::tempdir().expect("ckpt lagging");
+    let mut lagging = new_session(dir.path(), ck_lag.path());
+    let (first, _c, s_first) = lagging
+        .pump(dir.path(), EpochFilter::OwnCaptureOnly, 8)
+        .expect("SM-5: первый тик отставшей сессии");
+    assert!(
+        !first.is_empty(),
+        "SETUP НЕ СОСТОЯЛСЯ: отставшая сессия не прочитала ни одного кадра ДО компакции —          её кеш не построен, и проверять инвалидацию не на чем"
+    );
+    // Мера — СОБЫТИЯ, а не кадры: кадр несёт несколько событий, и сравнение `frames.len()`
+    // с длиной `reference_seqs` сравнивало бы разные величины (замер: 101 против 806).
+    let mut seen = s_first.events_decoded as usize;
+    let raw2_before = fs::read_dir(dir.path()).expect("rd").filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".jrnl")).count();
+    journal::compact_closed_segments(dir.path(), 1, journal::DEFAULT_COMPACT_LEVEL)
+        .expect("compact 2");
+    let raw2_after = fs::read_dir(dir.path()).expect("rd").filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".jrnl")).count();
+    assert!(
+        raw2_after < raw2_before,
+        "SETUP НЕ СОСТОЯЛСЯ: вторая компакция не удалила ни одного `.jrnl` ({raw2_before} -> \
+         {raw2_after}) — событие оси 4 для ОТСТАВШЕЙ сессии не воспроизведено (§4.5(б))"
+    );
+    for _ in 0..64 {
+        let (frames, _c, s_tick) = lagging
+            .pump(dir.path(), EpochFilter::OwnCaptureOnly, 4_096)
+            .expect("SM-5: тик отставшей сессии после компакции");
+        if frames.is_empty() {
+            break;
+        }
+        seen += s_tick.events_decoded as usize;
+    }
+    let total = reference_seqs(dir.path(), None).len();
+    assert!(
+        seen >= total,
+        "SM-5: отставшая сессия после компакции получила {seen} событий из {total}. Её кеш          перечня сегментов построен ДО компакции и указывает на `.jrnl`, которых больше          нет: компакция НЕ ЗАМЕЧЕНА. Сессия молча недоотдаёт данные при зелёном          healthcheck — мутант `staleforever`."
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────────────
