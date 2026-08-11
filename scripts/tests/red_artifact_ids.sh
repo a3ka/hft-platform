@@ -42,16 +42,16 @@ ZERO=0000000000000000000000000000000000000000
 # Значения совпадают ПОСИМВОЛЬНО с атомами таблицы §4.2 спеки (сверка 2).
 # Одна фикстура вправе нести несколько claim'ов — каждый отдельной строкой.
 #
-# МНОГОКЛАЙМОВОСТЬ — свойство ФИКСТУРЫ, а не мутанта (решение круга 4, спека §4.5).
-# `L4MOD` объявлен и по оси 5: его фикстура ФАКТИЧЕСКИ несёт предсуществующую коллизию вне
-# диапазона (два R-950 в базовом коммите — иначе «правку под коллизионным номером» не
-# изобразить), то есть исполняет легитимный атом оси 5 наравне с L5PRE. Мутант `absolute`,
-# судящий всю историю, краснеет на ней ПО СВОЕЙ причине — по свойству оси 5, а не оси 4;
-# страж атрибуции обязан это видеть, иначе он требует от мутанта невозможного. Обратный
-# ход — разрешить МУТАНТУ объявлять несколько осей — отвергнут: мутант по построению есть
-# ОДНА точка слепоты (§4.5), и право назвать вторую ось дало бы сломанному мутанту
-# отмывать своё падение расширением декларации, то есть сняло бы ровно тот контроль, ради
-# которого страж поставлен (Б-4: `quotedname` был красен на 11 сценариях пяти осей).
+# АТРИБУЦИЯ МУТАНТА — по ОБЪЯВЛЕННОМУ KILL-SET'у, а не по принадлежности оси (круг 4, ревизия
+# после адверсарной проверки). Первая редакция стража требовала «нет падений на сценариях ЧУЖИХ
+# осей» и была ослаблена собственным лекарством: чтобы оправдать `absolute`, фикстуре `L4MOD`
+# добавили claim по оси 5 — и тем открыли всю ось 5 всякому мутанту, сломанному сверх своей оси
+# (проверено: `rangeblind` с добавленным дефектом оси 4 проходил батарею). Кроме того у условия
+# не было НИЖНЕЙ границы: мутант, не уронивший НИ ОДНОГО сценария (например, уронивший setup
+# пробы), проходил как «красен по своей оси» — то есть страж не отличал «дыра закреплена» от
+# «проба не запустилась». Обе щели закрывает РАВЕНСТВО множеств: §4.5 объявляет поимённо, какие
+# сценарии мутант обязан уронить, и наблюдаемое множество обязано совпасть с объявленным —
+# ни больше (сломан сверх своей оси), ни меньше (дыра не закреплена).
 MANIFEST="
 B1TD|1|V|TD
 B1TD|2|V|запись в TECH-DEBT.md
@@ -67,13 +67,15 @@ L1X|1|L|неизвестный префикс вне зоны
 L2TXT|2|L|упоминание в тексте
 N3LOCAL|3|V|только своё дерево
 N3HEAD|3|V|только origin, локальный head пропущен
+N3ORIG|3|V|только refs/heads, origin пропущен
+N3TD|3|V|только своё дерево
+N3TD|1|V|TD
 N3NOORIG|3|V|origin недоступен
 L3OK|3|L|origin ∪ refs/heads
 B4REN|4|V|переименование в занятый номер
 B4Q|4|V|имя, требующее квотирования
 L4DEL|4|L|удаление артефакта
 L4MOD|4|L|правка существующего артефакта
-L4MOD|5|L|предсуществующая коллизия вне диапазона
 B5THIRD|5|V|усиление существующей коллизии
 B5MID|5|V|коллизия в не-вершинном коммите диапазона
 B5BASE|5|V|недостоверная база
@@ -89,7 +91,14 @@ L6SPLIT|6|L|split-суффикс с совпавшим предметом
 L6REV|6|L|ревизия того же предмета
 "
 
-FAILED=0; PASSED=0; EXECUTED=""; FIXTURES=""
+FAILED=0; PASSED=0; EXECUTED=""
+# Реестр фикстур — ФАЙЛ, а не переменная. Причина поведенческая, не стилистическая:
+# `R="$(mk_repo …)"` исполняет функцию в ПОДОБОЛОЧКЕ, поэтому присваивание `FIXTURES=…`
+# внутри неё в родителя не возвращается — `cleanup()` перебирал пустую строку и не удалял
+# НИЧЕГО. Механизм был объявлен (`cleanup` + `trap` + ручка `KEEP_FIXTURES`) и мёртв: замер
+# 2026-08-11 — 37 547 каталогов `/tmp/red-ids-*` при диске 88 %, накопленных с 08.08. Запись
+# в файл переживает подоболочку, поэтому реестр ведётся дескриптором, а не переменной.
+FIXTURES_REG="$(mktemp /tmp/red-ids-reg-XXXXXX)" || { echo "не создан реестр фикстур" >&2; exit 1; }
 pass() { echo "PASS  $*"; PASSED=$((PASSED + 1)); }
 fail() { echo "FAIL  $*"; FAILED=$((FAILED + 1)); }
 die()  { echo "SETUP НЕ СОСТОЯЛСЯ: $*" >&2; exit 1; }
@@ -97,17 +106,18 @@ mark() { EXECUTED="${EXECUTED}$1
 "; }
 
 cleanup() {
-  [ "${KEEP_FIXTURES:-0}" = "1" ] && { echo "фикстуры сохранены" >&2; return; }
-  local d; while IFS= read -r d; do
+  [ "${KEEP_FIXTURES:-0}" = "1" ] && { echo "фикстуры сохранены: ${FIXTURES_REG}" >&2; return; }
+  local d
+  while IFS= read -r d; do
     [ -n "$d" ] && [ -d "$d" ] && case "$d" in /tmp/red-ids-*) rm -rf "$d";; esac
-  done <<< "${FIXTURES}"
+  done < "${FIXTURES_REG}"
+  rm -f "${FIXTURES_REG}"
 }
 trap cleanup EXIT
 
 mk_repo() {
   local d; d="$(mktemp -d "/tmp/red-ids-$1-XXXXXX")" || die mktemp
-  FIXTURES="${FIXTURES}${d}
-"
+  printf '%s\n' "$d" >> "${FIXTURES_REG}"
   ( cd "$d" && git init -q -b main && git config user.email a@b.c && git config user.name t \
     && mkdir -p research/reviews research/critiques research/arbitration milestones docs \
     && printf '# TECH-DEBT\n\n' > TECH-DEBT.md \
@@ -125,9 +135,21 @@ run_check() { ( cd "$1" && EVENT_NAME="${3:-push}" PUSH_BEFORE="$2" PR_BASE_SHA=
                 bash "${BARRIER}" >/dev/null 2>&1 ); }
 run_alloc() { ( cd "$1" && bash "${ALLOC}" "$2" 2>/dev/null ); }
 
-expect_block() { mark "$1"
+# Setup-guard НА КАЖДЫЙ сценарий (`testing.md`, целостность гейта, свойство 3: «проба, молча
+# тестирующая не тот сценарий, — плацебо самой себя»). Фикстуры строятся цепочками вида
+# `( cd … && … ) && commit_all`: если подоболочка молча откажет, коммита не будет, диапазон
+# окажется ПУСТ, барьер выйдет нулём по раннему `[ -z "$IN" ]`, и expect_allow напечатает
+# PASS, не проверив ничего. Диапазон обязан содержать хотя бы один коммит — кроме сценария с
+# заведомо недостоверной базой (zero-SHA), где пустота и есть предмет проверки.
+range_guard() {
+  [ "$3" = "${ZERO}" ] && return 0
+  local n; n="$( ( cd "$2" && git rev-list --count "$3..HEAD" 2>/dev/null ) || echo 0 )"
+  [ "${n:-0}" -ge 1 ] || die "$1: диапазон ПУСТ — фикстура не в задуманном состоянии,
+  сценарий проверил бы пустоту вместо предмета"
+}
+expect_block() { mark "$1"; range_guard "$1" "$2" "$3"
   if run_check "$2" "$3"; then fail "$1 $4 — ПРОШЛО"; else pass "$1 $4 — заблокировано"; fi; }
-expect_allow() { mark "$1"
+expect_allow() { mark "$1"; range_guard "$1" "$2" "$3"
   if run_check "$2" "$3"; then pass "$1 $4 — пропущено"; else fail "$1 $4 — ложное срабатывание"; fi; }
 expect_alloc() { mark "$1"; local got; got="$(run_alloc "$2" "$3")"
   if [ "$got" = "$4" ]; then pass "$1 $5 — выдал $got"
@@ -140,8 +162,7 @@ expect_alloc_fails() { mark "$1"
 run_battery() {
   local d rc bad=0 n=0
   d="$(mktemp -d /tmp/red-ids-battery-XXXXXX)" || die mktemp
-  FIXTURES="${FIXTURES}${d}
-"
+  printf '%s\n' "$d" >> "${FIXTURES_REG}"
   bash "${ROOT}/scripts/tests/mk_ref_artifact_ids.sh" "$d" 2>/dev/null \
     || die "эталон не собран: нет ${ROOT}/scripts/tests/mk_ref_artifact_ids.sh
   Батарея требует генератор эталона и мутантов — он часть набора (спека §4.5)."
@@ -155,10 +176,16 @@ run_battery() {
   local spec="${ROOT}/milestones/M-61-artifact-ids.md"
   [ -f "$spec" ] || die "нет спеки $spec — состав батареи сверять не с чем"
   local DECL AXIS_OF BUILT
-  DECL="$(awk '/^### 4\.5/{i=1;next} /^## /{i=0} i && /^\| `/{
-            match($0,/`[a-z]+`/); m=substr($0,RSTART+1,RLENGTH-2)
-            if (match($0,/\| [0-9]+ \//)) { a=substr($0,RSTART+2,RLENGTH-4); gsub(/ /,"",a); print m "|" a }
-          }' "$spec" | sort -u)"
+  # Строка §4.5 = имя | ось | KILL-SET. Колонки берутся ПОЗИЦИОННО (-F'|'), а не поиском по
+  # всей строке: kill-set обязан читаться только из своей колонки, иначе `C-058` из колонки
+  # «значение» попал бы в множество сценариев.
+  DECL="$(awk -F'|' '/^### 4\.5/{i=1;next} /^## /{i=0}
+            i && $2 ~ /^ *`[a-z]+`/ {
+              name=$2; sub(/^[^`]*`/,"",name); sub(/`.*/,"",name)
+              ax=$3;   sub(/^[^0-9]*/,"",ax);  sub(/[^0-9].*/,"",ax)
+              ks=$4;   gsub(/[^A-Z0-9]/," ",ks); gsub(/  +/," ",ks); sub(/^ +/,"",ks); sub(/ +$/,"",ks)
+              print name "|" ax "|" ks
+            }' "$spec" | sort -u)"
   [ -n "$DECL" ] || die "разбор §4.5 дал ПУСТО — парсер сломан либо раздел переименован"
   BUILT="$(ls "$d" | sed -n 's/-check\.sh$//p' | grep -v '^ref$' | sort -u)"
   local decl_names miss_built miss_decl
@@ -188,28 +215,27 @@ run_battery() {
   # падал на 11 сценариях, включая чисто-ASCII. Мутант, красный не по своей причине,
   # доказывает не ту дыру, ради которой построен. Ось мутанта берётся из §4.5, ось
   # сценария — из MANIFEST пробы (сценарий может нести несколько осей).
-  local m axis fails s_ax alien
+  local m axis want got
   for m in $(printf '%s\n' "$decl_names"); do
     n=$((n + 1))
     axis="$(printf '%s\n' "$DECL" | grep "^${m}|" | cut -d'|' -f2 | head -1)"
+    want="$(printf '%s\n' "$DECL" | grep "^${m}|" | cut -d'|' -f3 | head -1 | tr ' ' '\n' | grep . | sort -u | tr '\n' ' ')"
+    [ -n "${want// /}" ] || die "мутант $m объявлен в §4.5 БЕЗ kill-set'а — сверять не с чем.
+  Колонка «ОБЯЗАН уронить» обязательна: без неё страж вырождается в «мутант хоть как-то красен»."
     if [ ! -f "$d/$m-check.sh" ]; then
       echo "FAIL  $m ОБЪЯВЛЕН в §4.5, но не построен — молчаливый пропуск запрещён"; bad=$((bad+1)); continue
     fi
     BARRIER="$d/$m-check.sh" ALLOC="$d/$m-next.sh" bash "${SELF}" > "$d/$m.log" 2>&1; rc=$?
-    fails="$(grep -oE '^FAIL +[A-Z0-9]+' "$d/$m.log" | awk '{print $2}' | sort -u | tr '\n' ' ')"
-    if [ $rc -eq 0 ]; then
-      echo "FAIL  $m ПРОШЁЛ пробу (exit=0) — дыра не закреплена, §4.5 нарушен"; bad=$((bad+1)); continue
-    fi
-    alien=""
-    for s_ax in $fails; do
-      printf '%s\n' "${MANIFEST}" | grep -q "^${s_ax}|${axis}|" || alien="${alien}${s_ax} "
-    done
-    if [ -z "$alien" ]; then
-      echo "PASS  $m → exit=$rc, ось $axis, падения: ${fails:-—}"
+    got="$(grep -oE '^FAIL +[A-Z0-9]+' "$d/$m.log" | awk '{print $2}' | sort -u | tr '\n' ' ')"
+    if [ "$got" = "$want" ] && [ $rc -ne 0 ]; then
+      echo "PASS  $m → exit=$rc, ось $axis, уронил ровно объявленное: ${got}"
     else
-      echo "FAIL  $m красен НЕ ПО СВОЕЙ причине: ось $axis, но упал на сценариях чужих осей: $alien"
-      echo "      ↳ мутант обязан отличаться от эталона ровно тем, ради чего построен;"
-      echo "      ↳ падение на чужой оси означает сломанную реализацию мутанта, а не дыру"
+      echo "FAIL  $m: kill-set РАЗОШЁЛСЯ с §4.5 (exit=$rc)"
+      echo "      ↳ объявлено:  ${want:-—}"
+      echo "      ↳ наблюдается: ${got:-— (ни одного сценария)}"
+      [ -z "${got// /}" ] && echo "      ↳ пусто ⇒ мутант ничего не пиннит: дыра не закреплена либо упал SETUP пробы"
+      echo "      ↳ БОЛЬШЕ объявленного ⇒ мутант сломан сверх своей оси и доказывает не ту дыру;"
+      echo "      ↳ МЕНЬШЕ объявленного ⇒ сценарий перестал ловить дефект, ради которого стоит"
       bad=$((bad+1))
     fi
   done
@@ -342,6 +368,26 @@ expect_alloc N3HEAD "$R" C "C-506" "локальный head участвует �
 R="$(mk_repo n3noorig)"; art "$R" research/reviews/R-600-a.md ""; commit_all "$R" base2
 ( cd "$R" && git remote add origin /nonexistent-remote-path )
 expect_alloc_fails N3NOORIG "$R" R "origin сконфигурирован, но недоступен ⇒ fail-closed"
+
+# N3ORIG — ЗЕРКАЛО N3HEAD: номер занят ТОЛЬКО в origin-ref'е, локальных голов с ним нет.
+# Без этого сценария ось 3 была покрыта в ОДНУ сторону: реализация, у которой из перечисления
+# выпал `refs/remotes/origin`, оставляла пробу зелёной (28/28) — то есть корневой дефект §1
+# («номер, свободный локально, занят в соседней ветке») не пиннился ничем. Найдено адверсарной
+# проверкой круга 4; категория (i) §4.4 — новое значение известной оси.
+R="$(mk_repo n3orig)"; art "$R" research/reviews/R-600-a.md ""; commit_all "$R" base2
+( cd "$R" && git checkout -q -b tmp ) && art "$R" research/reviews/R-650-orig.md "" && commit_all "$R" "номер, живущий только в origin"
+( cd "$R" && git update-ref refs/remotes/origin/tmp "$(git rev-parse HEAD)" && git checkout -q main && git branch -qD tmp ) || die "n3orig setup"
+expect_alloc N3ORIG "$R" R "R-651" "номер занят ТОЛЬКО origin-ref'ом — локальной головы с ним нет"
+
+# N3TD — та же ось 3, но КЛАСС TD: он живёт записью в `TECH-DEBT.md`, а не именем файла, и
+# потому ходит отдельной веткой кода аллокатора. Эта ветка не пиннилась ничем: шаг N гейта
+# перебирал только M/R/C/A, а сценариев на неё не было вовсе — дефект «только своё дерево»,
+# внесённый в TD-ветку, оставлял пробу 28/28 и батарею зелёными, при том что аллокатор выдавал
+# номер, уже занятый соседней веткой. Найдено адверсарной проверкой круга 4.
+R="$(mk_repo n3td)"; td_entry "$R" TD-300 "первый-предмет"; commit_all "$R" base2
+( cd "$R" && git checkout -q -b side ) && td_entry "$R" TD-307 "долг соседней ветки" && commit_all "$R" "TD на соседней ветке"
+( cd "$R" && git checkout -q main ) || die "n3td setup"
+expect_alloc N3TD "$R" TD "TD-308" "класс TD: занятость по объединению, а не по своему дереву"
 
 R="$(mk_repo l3ok)"; art "$R" milestones/M-90-a.md ""; commit_all "$R" base2
 ( cd "$R" && git update-ref refs/remotes/origin/main HEAD )
