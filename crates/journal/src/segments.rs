@@ -282,20 +282,59 @@ impl SegmentCatalog {
         // Инкрементальное обновление: применяем diff к кешу. На каждый добавленный
         // файл — `classify_segment` (~3 операции); на удалённый — убираем из
         // `self.segments`. На КАЖДЫЙ добавленный — ops учитывается внутри.
+        //
+        // ПОРЯДОК ИМЕЕТ ЗНАЧЕНИЕ (R-053 §Б-1, задача 10). При компакции одного
+        // сегмента `.jrnl` → `.jrnl.zst` индекс у добавленного и удалённого ОДИН.
+        // Если сперва добавить `.zst`, а потом по индексу снести ВСЕ записи с этим
+        // индексом — снесётся и только что добавленная: сегмент ПРОПАДЕТ из кеша, и
+        // `is_fresh` тут же перепишет `file_names`, поэтому следующий тик расхождения
+        // уже не увидит. Поэтому: сперва REMOVE, потом ADD.
         let manifest = load_manifest(dir, &mut ops)?;
-        for added_name in &added {
-            let p = dir.join(added_name.as_str());
-            let info = classify_segment(&p, &manifest, &mut ops)?;
-            // Поддерживаем порядок по индексу (вставка в конец корректна, т.к. новые
-            // сегменты всегда имеют индекс больше существующих при ротации; при
-            // компакции индекс добавленного .zst совпадает с удалённым .jrnl).
-            self.segments.push(info);
-        }
         for removed_name in &removed {
             // Находим запись с тем же индексом и удаляем.
             if let Some(idx) = parse_segment_index_any(removed_name) {
                 self.segments.retain(|s| s.index != idx);
             }
+        }
+        for added_name in &added {
+            // R-053 §Б-3: в каталоге могут появляться посторонние файлы
+            // (`journal.meta.tmp`, `segment-*.jrnl.zst.tmp`, `replay-digest.tmp`).
+            // `classify_segment` на них вернёт `Err("not a segment file")`, и
+            // ошибка пробрасывается в `pump()` сессии. До M-62 такие файлы были
+            // безвредны — `dedup_indexed_paths` их просто не выбирает. Повторяем
+            // ту же дисциплину и здесь: имя ОБЯЗАНО иметь суффикс `.jrnl` или
+            // `.jrnl.zst` и парситься в индекс, иначе — пропускаем.
+            if !added_name.ends_with(".jrnl") && !is_compacted_name(added_name) {
+                continue;
+            }
+            if parse_segment_index_any(added_name).is_none() {
+                continue;
+            }
+            let p = dir.join(added_name.as_str());
+            let info = classify_segment(&p, &manifest, &mut ops)?;
+            // R-053 §Б-2 — D-COMP-1 (общий хелпер `dedup_indexed_paths`, §907-923):
+            // при коллизии по индексу побеждает СЫРОЙ `.jrnl`, `.zst` игнорируется.
+            // Промежуточное состояние компакции (шаг 6 сделан, шаг 7 ещё нет) даёт
+            // на диске ОБА файла; если в кеше уже лежит `.jrnl` для этого индекса —
+            // пропускаем вновь прибывший `.zst`. Если в кеше лежит `.zst`, а на
+            // диске появился `.jrnl` (например, возвращённый из бэкапа) — заменяем.
+            let new_is_zst = is_compacted_name(added_name);
+            let existing_is_raw = self.segments.iter().any(|s| {
+                s.index == info.index
+                    && !s
+                        .path
+                        .file_name()
+                        .and_then(OsStr::to_str)
+                        .is_some_and(is_compacted_name)
+            });
+            if existing_is_raw && new_is_zst {
+                // D-COMP-1: в кеше уже сырой сегмент этого индекса — оставляем его.
+                continue;
+            }
+            // Иначе (existing zst+new raw, existing отсутствует, или того же типа) —
+            // сносим прежнюю запись с этим индексом и кладём новую.
+            self.segments.retain(|s| s.index != info.index);
+            self.segments.push(info);
         }
         // Сортируем на случай, если порядок был нарушен (защита).
         self.segments.sort_by_key(|s| s.index);
