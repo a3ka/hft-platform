@@ -205,6 +205,11 @@ mutate() { printf '%s\n' "${BODY_CHECK}" | sed "$1"; }
 # originonly мутирует ШАПКУ АЛЛОКАТОРА: `refs_all()` объявлена в HEAD_COMMON, а не в теле.
 HEAD_ORIGINONLY="$(printf '%s\n' "${HEAD_COMMON}" | sed 's|refs/remotes/origin refs/heads|refs/remotes/origin|')"
 [ "$HEAD_ORIGINONLY" != "$HEAD_COMMON" ] || { echo "originonly: подстановка шапки НЕ СРАБОТАЛА" >&2; exit 1; }
+# headsonly — ЗЕРКАЛО originonly: из перечисления выпал `refs/remotes/origin`. Это корневой
+# дефект §1 («номер, свободный локально, занят в соседней ветке»), и до круга 4 его не пиннил
+# ни один мутант: ось 3 была покрыта только в сторону refs/heads.
+HEAD_HEADSONLY="$(printf '%s\n' "${HEAD_COMMON}" | sed 's|refs/remotes/origin refs/heads|refs/heads|')"
+[ "$HEAD_HEADSONLY" != "$HEAD_COMMON" ] || { echo "headsonly: подстановка шапки НЕ СРАБОТАЛА" >&2; exit 1; }
 
 # quotedname — Б-4 (R-052): мутант обязан отличаться от эталона ТОЛЬКО КАНАЛОМ ЧТЕНИЯ ИМЁН.
 # Прежняя сплошная подстановка срезала `-z` и у shell-тестов (`[ -z "$IN" ]` → `[ "$IN" ]`),
@@ -253,6 +258,7 @@ emit touchcounts-check.sh  "$SUBJ_FULL"       "$BODY_TOUCHCOUNTS"
 # Клапан (в) `R-052` усл. 3 (вывод мутанта из §4.5) поэтому НЕ применяется: он был бы платой
 # за дефект построения, а не за структурное свойство фикстур.
 emit originonly-check.sh   "$SUBJ_FULL"       "$BODY_CHECK"
+emit headsonly-check.sh    "$SUBJ_FULL"       "$BODY_CHECK"
 emit namesonly-check.sh    "$SUBJ_FULL"       "$BODY_NAMESONLY"
 emit absolute-check.sh     "$SUBJ_FULL"       "$BODY_ABSOLUTE"
 emit rangeblind-check.sh   "$SUBJ_FULL"       "$BODY_RANGEBLIND"
@@ -268,6 +274,7 @@ done
 # перечисление ref'ов теряет `refs/heads` (номер, занятый локальной веткой, не виден).
 printf '%s\n%s\n' "$HEAD_COMMON"     "$NEXT_LOCALMAX" > "$D/localmax-next.sh";   bash -n "$D/localmax-next.sh"   || exit 1
 printf '%s\n%s\n' "$HEAD_ORIGINONLY" "$NEXT_REF"      > "$D/originonly-next.sh"; bash -n "$D/originonly-next.sh" || exit 1
+printf '%s\n%s\n' "$HEAD_HEADSONLY"  "$NEXT_REF"      > "$D/headsonly-next.sh";   bash -n "$D/headsonly-next.sh"   || exit 1
 
 # Страж генератора: мутант, совпавший с эталоном, тестировал бы эталон под чужим именем —
 # ровно то, чем оборачивается ТИХО НЕ СРАБОТАВШАЯ подстановка. Перебираются ВСЕ построенные:
