@@ -132,19 +132,76 @@ run_battery() {
   bash "${ROOT}/scripts/tests/mk_ref_artifact_ids.sh" "$d" 2>/dev/null \
     || die "эталон не собран: нет ${ROOT}/scripts/tests/mk_ref_artifact_ids.sh
   Батарея требует генератор эталона и мутантов — он часть набора (спека §4.5)."
-  echo "══ БАТАРЕЯ (спека §4.5): эталон зелён, каждый мутант красный ══"
-  for v in ref showall localmax renameblind slugonly contextblind splitonly quotedname touchcounts; do
-    [ -f "$d/$v-check.sh" ] || continue
-    BARRIER="$d/$v-check.sh" ALLOC="$d/$v-next.sh" bash "${SELF}" > "$d/$v.log" 2>&1; rc=$?
+  echo "══ БАТАРЕЯ (спека §4.5): эталон зелён, каждый мутант красный ПО СВОЕЙ ОСИ ══"
+
+  # ── СВЕРКА СОСТАВА: §4.5 ⇄ генератор ⇄ исполняемый список ────────────────────────────
+  # Б-5 (R-052) + A-006 §2.4: раньше список был захардкожен, недостающие пропускались
+  # молчаливым `[ -f … ] || continue`, а знаменатель считал ИСПОЛНЕННОЕ — печаталось
+  # BATTERY: PASS (10/10) при 7 объявленных из 12. Теперь исполняемый список ВЫВОДИТСЯ из
+  # спеки, знаменатель считает ОБЪЯВЛЕННОЕ, а любое расхождение — отказ, не строка в логе.
+  local spec="${ROOT}/milestones/M-61-artifact-ids.md"
+  [ -f "$spec" ] || die "нет спеки $spec — состав батареи сверять не с чем"
+  local DECL AXIS_OF BUILT
+  DECL="$(awk '/^### 4\.5/{i=1;next} /^## /{i=0} i && /^\| `/{
+            match($0,/`[a-z]+`/); m=substr($0,RSTART+1,RLENGTH-2)
+            if (match($0,/\| [0-9]+ \//)) { a=substr($0,RSTART+2,RLENGTH-4); gsub(/ /,"",a); print m "|" a }
+          }' "$spec" | sort -u)"
+  [ -n "$DECL" ] || die "разбор §4.5 дал ПУСТО — парсер сломан либо раздел переименован"
+  BUILT="$(ls "$d" | sed -n 's/-check\.sh$//p' | grep -v '^ref$' | sort -u)"
+  local decl_names miss_built miss_decl
+  decl_names="$(printf '%s\n' "$DECL" | cut -d'|' -f1 | sort -u)"
+  miss_built="$(comm -23 <(printf '%s\n' "$decl_names") <(printf '%s\n' "$BUILT") | tr '\n' ' ')"
+  miss_decl="$(comm -13 <(printf '%s\n' "$decl_names") <(printf '%s\n' "$BUILT") | tr '\n' ' ')"
+  if [ -z "$miss_built" ] && [ -z "$miss_decl" ]; then
+    echo "PASS  состав: §4.5 ⇄ генератор совпали, $(printf '%s\n' "$decl_names" | grep -c .) мутантов"
+  else
+    [ -n "$miss_built" ] && { echo "FAIL  состав: объявлены в §4.5 и НЕ ПОСТРОЕНЫ: $miss_built"; bad=$((bad+1)); }
+    [ -n "$miss_decl" ]  && { echo "FAIL  состав: построены и НЕ ОБЪЯВЛЕНЫ в §4.5: $miss_decl"; bad=$((bad+1)); }
+  fi
+
+  # ── ЭТАЛОН ──────────────────────────────────────────────────────────────────────────
+  BARRIER="$d/ref-check.sh" ALLOC="$d/ref-next.sh" bash "${SELF}" > "$d/ref.log" 2>&1; rc=$?
+  n=$((n + 1))
+  if [ $rc -eq 0 ]; then
+    echo "PASS  эталон → exit=0 $(grep -oE 'VERDICT: PASS \([0-9]+/[0-9]+\)' "$d/ref.log"|head -1)"
+  else
+    echo "FAIL  эталон → exit=$rc (позитивный контроль сломан)"; bad=$((bad+1))
+    grep -E '^(FAIL|SETUP)' "$d/ref.log"|head -6|sed 's/^/      ↳ /'
+  fi
+
+  # ── МУТАНТЫ: красен + КРАСЕН ПО СВОЕЙ ОСИ ───────────────────────────────────────────
+  # Б-4bis (R-052) + A-006 §2.2-2.3: прежний страж проверял лишь «мутант отличается от
+  # эталона». Этого мало: quotedname отличался, был красен и при этом СЛОМАН ЦЕЛИКОМ —
+  # падал на 11 сценариях, включая чисто-ASCII. Мутант, красный не по своей причине,
+  # доказывает не ту дыру, ради которой построен. Ось мутанта берётся из §4.5, ось
+  # сценария — из MANIFEST пробы (сценарий может нести несколько осей).
+  local m axis fails s_ax alien
+  for m in $(printf '%s\n' "$decl_names"); do
     n=$((n + 1))
-    if [ "$v" = ref ]; then
-      [ $rc -eq 0 ] && echo "PASS  эталон → exit=0 $(grep -oE 'VERDICT: PASS \([0-9]+/[0-9]+\)' "$d/$v.log"|head -1)" \
-        || { echo "FAIL  эталон → exit=$rc (позитивный контроль сломан)"; grep -E '^(FAIL|SETUP)' "$d/$v.log"|head -6|sed 's/^/      ↳ /'; bad=$((bad+1)); }
+    axis="$(printf '%s\n' "$DECL" | grep "^${m}|" | cut -d'|' -f2 | head -1)"
+    if [ ! -f "$d/$m-check.sh" ]; then
+      echo "FAIL  $m ОБЪЯВЛЕН в §4.5, но не построен — молчаливый пропуск запрещён"; bad=$((bad+1)); continue
+    fi
+    BARRIER="$d/$m-check.sh" ALLOC="$d/$m-next.sh" bash "${SELF}" > "$d/$m.log" 2>&1; rc=$?
+    fails="$(grep -oE '^FAIL +[A-Z0-9]+' "$d/$m.log" | awk '{print $2}' | sort -u | tr '\n' ' ')"
+    if [ $rc -eq 0 ]; then
+      echo "FAIL  $m ПРОШЁЛ пробу (exit=0) — дыра не закреплена, §4.5 нарушен"; bad=$((bad+1)); continue
+    fi
+    alien=""
+    for s_ax in $fails; do
+      printf '%s\n' "${MANIFEST}" | grep -q "^${s_ax}|${axis}|" || alien="${alien}${s_ax} "
+    done
+    if [ -z "$alien" ]; then
+      echo "PASS  $m → exit=$rc, ось $axis, падения: ${fails:-—}"
     else
-      [ $rc -ne 0 ] && echo "PASS  $v → exit=$rc $(grep -oE 'VERDICT: FAIL \([0-9]+\)' "$d/$v.log"|head -1)" \
-        || { echo "FAIL  $v ПРОШЁЛ пробу (exit=0) — дыра"; bad=$((bad+1)); }
+      echo "FAIL  $m красен НЕ ПО СВОЕЙ причине: ось $axis, но упал на сценариях чужих осей: $alien"
+      echo "      ↳ мутант обязан отличаться от эталона ровно тем, ради чего построен;"
+      echo "      ↳ падение на чужой оси означает сломанную реализацию мутанта, а не дыру"
+      bad=$((bad+1))
     fi
   done
+
+  # ── страж «нет барьера» ─────────────────────────────────────────────────────────────
   BARRIER="$d/НЕТ.sh" ALLOC="$d/НЕТ.sh" bash "${SELF}" > "$d/nobar.log" 2>&1; rc=$?
   n=$((n + 1))
   if [ $rc -ne 0 ] && grep -q 'SETUP НЕ СОСТОЯЛСЯ' "$d/nobar.log"; then
