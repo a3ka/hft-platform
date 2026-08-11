@@ -79,6 +79,9 @@ L4MOD|4|L|правка существующего артефакта
 B5THIRD|5|V|усиление существующей коллизии
 B5MID|5|V|коллизия в не-вершинном коммите диапазона
 B5BASE|5|V|недостоверная база
+B5PR|5|V|срез, заданный событием pull_request
+B5NOBASE|5|V|база отсутствует в истории
+B5NOTANC|5|V|база не предок HEAD
 L5PRE|5|L|предсуществующая коллизия вне диапазона
 L5FIX|5|L|ошибка исправлена перенумерацией внутри диапазона
 B6SLUG|6|V|разные слаги под одним номером
@@ -132,8 +135,20 @@ art() { ( cd "$1" && mkdir -p "$(dirname "$2")" && { printf '# %s\n\n' "$(basena
 commit_all() { ( cd "$1" && git add -A && git commit -q -m "${2:-правка}" ) || die "commit $2"; }
 td_entry() { ( cd "$1" && printf -- '- **%s** `%s`\n' "$2" "$3" >> TECH-DEBT.md ) || die td; }
 
-run_check() { ( cd "$1" && EVENT_NAME="${3:-push}" PUSH_BEFORE="$2" PR_BASE_SHA="$2" \
-                bash "${BARRIER}" >/dev/null 2>&1 ); }
+# ПРОД-ФОРМА ВЫЗОВА, а не удобная (testing.md, целостность гейта, свойство 1: «гейт,
+# проверенный не тем вызовом, каким его зовёт прод, не проверен»). CI триггерится ДВУМЯ
+# событиями (ci.yml: on.pull_request и on.push) и передаёт базу РАЗНЫМИ переменными:
+# PUSH_BEFORE=github.event.before либо PR_BASE_SHA=github.event.pull_request.base.sha.
+# Прежняя редакция клала одно значение в ОБЕ переменные и всегда звала с EVENT_NAME=push —
+# то есть не могла различить, из какой переменной барьер читает базу: реализация, целиком
+# выключенная на pull_request, проходила пробу 30/30. Теперь каждое событие подставляет
+# ТОЛЬКО свою переменную, а чужую оставляет пустой.
+run_check() {  # $1=repo $2=база $3=событие (push|pull_request)
+  if [ "${3:-push}" = pull_request ]; then
+    ( cd "$1" && EVENT_NAME=pull_request PUSH_BEFORE="" PR_BASE_SHA="$2" bash "${BARRIER}" >/dev/null 2>&1 )
+  else
+    ( cd "$1" && EVENT_NAME=push PUSH_BEFORE="$2" PR_BASE_SHA="" bash "${BARRIER}" >/dev/null 2>&1 )
+  fi; }
 run_alloc() { ( cd "$1" && bash "${ALLOC}" "$2" 2>/dev/null ); }
 
 # Setup-guard НА КАЖДЫЙ сценарий — на все 31 (`testing.md`, целостность гейта, свойство 3: «проба, молча
@@ -144,6 +159,8 @@ run_alloc() { ( cd "$1" && bash "${ALLOC}" "$2" 2>/dev/null ); }
 # заведомо недостоверной базой (zero-SHA), где пустота и есть предмет проверки.
 range_guard() {
   [ "$3" = "${ZERO}" ] && return 0
+  # База, заведомо недостоверная, — ПРЕДМЕТ fail-closed-сценариев, а не отказ фикстуры.
+  ( cd "$2" && git cat-file -e "$3" 2>/dev/null ) || return 0
   local n; n="$( ( cd "$2" && git rev-list --count "$3..HEAD" 2>/dev/null ) || echo 0 )"
   [ "${n:-0}" -ge 1 ] || die "$1: диапазон ПУСТ — фикстура не в задуманном состоянии,
   сценарий проверил бы пустоту вместо предмета"
@@ -160,9 +177,9 @@ setup_assert() {  # $1=имя $2=repo $3=почему $4=условие (shell, 
   ( cd "$2" && eval "$4" ) >/dev/null 2>&1 || die "$1: SETUP не состоялся — $3"
 }
 expect_block() { mark "$1"; range_guard "$1" "$2" "$3"
-  if run_check "$2" "$3"; then fail "$1 $4 — ПРОШЛО"; else pass "$1 $4 — заблокировано"; fi; }
+  if run_check "$2" "$3" "${5:-push}"; then fail "$1 $4 — ПРОШЛО"; else pass "$1 $4 — заблокировано"; fi; }
 expect_allow() { mark "$1"; range_guard "$1" "$2" "$3"
-  if run_check "$2" "$3"; then pass "$1 $4 — пропущено"; else fail "$1 $4 — ложное срабатывание"; fi; }
+  if run_check "$2" "$3" "${5:-push}"; then pass "$1 $4 — пропущено"; else fail "$1 $4 — ложное срабатывание"; fi; }
 expect_alloc() { mark "$1"; local got; got="$(run_alloc "$2" "$3")"
   if [ "$got" = "$4" ]; then pass "$1 $5 — выдал $got"
   else fail "$1 $5 — выдал '${got}' при ожидании '$4'"; fi; }
@@ -378,6 +395,33 @@ expect_allow L5FIX "$R" "$B" "ошибка исправлена перенуме
 R="$(mk_repo b5base)"; art "$R" research/reviews/R-320-alpha.md ""; commit_all "$R" base2
 art "$R" research/reviews/R-320-beta.md ""; commit_all "$R" "второй"
 expect_block B5BASE "$R" "$ZERO" "недостоверная база (zero-SHA) ⇒ fail-closed"
+
+# B5PR / B5NOBASE / B5NOTANC — прод-формы вызова, которых проба не знала.
+# Барьер разбирает ТРИ fail-closed-ветки (`cat-file -e`, `merge-base --is-ancestor`) и ДВА
+# события. Пиннилась одна: zero-SHA на push. Сегодня прод-код на этих путях ВЕРЕН — дефекта
+# нет; отсутствовал ОРАКУЛ, то есть будущее ослабление уехало бы молча при всех зелёных гейтах.
+R="$(mk_repo b5pr)"; art "$R" research/reviews/R-810-alpha.md ""; commit_all "$R" base2
+B="$(cd "$R" && git rev-parse HEAD)"; art "$R" research/reviews/R-810-beta.md ""; commit_all "$R" "второй R-810"
+expect_block B5PR "$R" "$B" "коллизия на событии pull_request — база живёт в PR_BASE_SHA, не в PUSH_BEFORE" pull_request
+
+# B5NOBASE пиннит ПАРУ guard'"'"'ов (существование базы И «база — предок»), а не строку: снятие
+# одной из них подстраховывает вторая, и сценарий краснеет только когда сняты ОБЕ. Названо
+# здесь прямо — оракул не вправе обещать разрешающую силу, которой у него нет.
+R="$(mk_repo b5nobase)"; art "$R" research/reviews/R-820-alpha.md ""; commit_all "$R" base2
+art "$R" research/reviews/R-820-beta.md ""; commit_all "$R" "второй R-820"
+expect_block B5NOBASE "$R" "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef" "база отсутствует в истории ⇒ fail-closed"
+
+# ВАЖНО: в диапазоне НЕТ коллизии. Иначе барьер заблокировал бы «за компанию» — по находке
+# основной логики, а не по проверке предка, и сценарий не различал бы её снятие (проверено:
+# первая редакция этой фикстуры несла коллизию и мутацию НЕ ловила). Отказ обязан приходить
+# ровно от недостоверности базы.
+R="$(mk_repo b5notanc)"; art "$R" research/reviews/R-830-alpha.md ""; commit_all "$R" base2
+( cd "$R" && git checkout -q -b divergent ) && art "$R" docs/side.md "" && commit_all "$R" "чужая ветка"
+FOREIGN="$(cd "$R" && git rev-parse HEAD)"; ( cd "$R" && git checkout -q main ) || die "b5notanc setup"
+( cd "$R" && echo x >> docs/base.md ) && commit_all "$R" "постороннее на main"
+setup_assert B5NOTANC "$R" "база обязана быть НЕ предком HEAD, а диапазон — БЕЗ коллизии" \
+  "! git merge-base --is-ancestor $FOREIGN HEAD && [ \"\$(git ls-tree -r --name-only HEAD | grep -c R-830)\" -eq 1 ]"
+expect_block B5NOTANC "$R" "$FOREIGN" "база НЕ предок HEAD ⇒ fail-closed (коллизии в диапазоне нет)"
 
 # ─── ОСЬ 3: область поиска занятости (предмет — АЛЛОКАТОР) ───────────────────────────
 # Номер занят в СОСЕДНЕЙ ветке: свободен локально, занят в объединении.
