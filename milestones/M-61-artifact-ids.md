@@ -35,7 +35,10 @@
 
 ## 2. Allowed / Forbidden paths
 
-**architect:** `milestones/M-61-*.md` · `scripts/tests/red_artifact_ids.sh` · `scripts/verify_M-61.sh`.
+**architect:** `milestones/M-61-*.md` · `scripts/tests/red_artifact_ids.sh` ·
+`scripts/tests/mk_ref_artifact_ids.sh` (генератор эталона и мутантов — часть RED-набора,
+§4.5) · `scripts/verify_M-61.sh` · `.claude/rules/gates.md` §12 (задача 6; зона под замком
+§11 — коммит обязан нести `FOUNDER-APPROVED`, и правка подпадает под перепроверку §9).
 **engine-dev** (роль названа явно, не «dev»): `scripts/next_artifact_id.sh` ·
 `scripts/check_artifact_ids.sh` · `.github/workflows/ci.yml` (джоб + `status-check.needs`).
 
