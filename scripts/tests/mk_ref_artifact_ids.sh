@@ -89,18 +89,29 @@ universe() {
     git show "$ref:TECH-DEBT.md" 2>/dev/null | sed -nE 's/^- \*\*TD-0*([0-9]+)\*\* `([^`]+)`.*/TD \1 \2/p'
   done
 }
-# Что ВВЕДЕНО диапазоном
+# Что ВВЕДЕНО диапазоном. «Введён» = появился в диапазоне И ПРИСУТСТВУЕТ В РЕЗУЛЬТАТЕ:
+# инвариант §4.1 сформулирован ОТ РЕЗУЛЬТАТА, а покоммитный обход без сверки с HEAD судит
+# промежуточные состояния. Цена конкретна: ветка, исправившая СВОЮ ЖЕ ошибку перенумерацией
+# (реальный коммит `f0e915b`: R-038-M-60a → R-042), блокировалась, хотя в результате коллизии
+# нет. Проверка `cat-file -e HEAD:$f` снимает ложный красный, НЕ ослабляя ни одного
+# нарушения: и переименование В занятый номер, и коллизия в не-вершинном коммите оставляют
+# файл в HEAD. Предмет тоже читается из HEAD — в результате живёт именно его редакция.
 introduced() {
   local c f cn
   for c in $(git rev-list "$BASE..HEAD"); do
     while IFS= read -r -d '' f; do
       [[ "$f" =~ $CLASS_RE ]] || continue
       cn="$(cls_num "$f")" || continue
-      printf '%s %s\n' "$cn" "$(subject_of "$c:$f")"
+      git cat-file -e "HEAD:$f" 2>/dev/null || continue
+      printf '%s %s\n' "$cn" "$(subject_of "HEAD:$f")"
     done < <(git show --cc --name-only --no-renames --diff-filter=A -z --format= "$c" 2>/dev/null)
-    # новые записи TECH-DEBT.md этого коммита
+    # новые записи TECH-DEBT.md этого коммита — и только те, что дожили до HEAD
     git show "$c" -- TECH-DEBT.md 2>/dev/null \
-      | sed -nE 's/^\+- \*\*TD-0*([0-9]+)\*\* `([^`]+)`.*/TD \1 \2/p'
+      | sed -nE 's/^\+- \*\*TD-0*([0-9]+)\*\* `([^`]+)`.*/TD \1 \2/p' \
+      | while read -r tcls tnum tsubj; do
+          git show "HEAD:TECH-DEBT.md" 2>/dev/null \
+            | grep -qE "^- \*\*TD-0*${tnum}\*\* \`${tsubj}\`" && printf '%s %s %s\n' "$tcls" "$tnum" "$tsubj"
+        done
   done
 }
 U="$(universe | sort -u)"
