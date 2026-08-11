@@ -76,8 +76,10 @@ const BUDGET_SCANNED: u64 = INCREMENT * 4;
 /// `L` — легитимный случай (обязан зеленеть).
 const MANIFEST: &[(&str, u8, &str, char)] = &[
     ("sm1", 1, "счётчик считает не то", 'V'),
+    ("sm1", 1, "meta-ops растут с N", 'V'),
     ("sm1", 1, "meta-ops постоянны", 'L'),
     ("sm2", 2, "N прод-масштаба (200+)", 'V'),
+    ("sm2", 2, "N после роста втрое", 'V'),
     ("sm2", 3, "установившийся тик платит за все сегменты", 'V'),
     ("sm3", 3, "первый тик сессии платит полную цену", 'L'),
     ("sm3", 2, "N мал (2-3)", 'L'),
@@ -252,6 +254,7 @@ fn reference_seqs(dir: &Path, after: Option<u64>) -> Vec<u64> {
 #[test]
 fn sm1_counter_measures_operations_not_calls() {
     claims("sm1", 1, "счётчик считает не то");
+    claims("sm1", 1, "meta-ops растут с N");
     claims("sm1", 1, "meta-ops постоянны");
 
     let (big, _n_big) = build_prod_form(N_SEGMENTS);
@@ -306,6 +309,7 @@ fn sm1_counter_measures_operations_not_calls() {
 #[test]
 fn sm2_steady_tick_is_independent_of_segment_count() {
     claims("sm2", 2, "N прод-масштаба (200+)");
+    claims("sm2", 2, "N после роста втрое");
     claims("sm2", 3, "установившийся тик платит за все сегменты");
 
     let (dir, n) = build_prod_form(N_SEGMENTS);
@@ -341,6 +345,49 @@ fn sm2_steady_tick_is_independent_of_segment_count() {
          M-57, а не только метаданные-путь. Цена M-62 не имеет права быть уплачена соседним \
          инвариантом (§5 запретного списка).",
         st.events_scanned
+    );
+
+    // ── ось 2, второе значение: N ВЫРОС ВТРОЕ ────────────────────────────────────────────
+    // Абсолютный бюджет проверяет «не больше X». Он не отличает O(1) от O(N) с крошечным
+    // коэффициентом, попавшим под порог. Отличает только СРАВНЕНИЕ двух N: цена
+    // установившегося тика не имеет права вырасти вместе с каталогом.
+    let n_before = n_segments(dir.path()) as u64;
+    let mut m = n + INCREMENT;
+    while (n_segments(dir.path()) as u64) < n_before * 3 {
+        append_range(dir.path(), m, m + 64);
+        m += 64;
+    }
+    let n_after = n_segments(dir.path()) as u64;
+    assert!(
+        n_after >= n_before * 3,
+        "SETUP НЕ СОСТОЯЛСЯ: сегментов {n_after} при цели {}",
+        n_before * 3
+    );
+    catch_up(&mut live, dir.path());
+    append_range(dir.path(), m, m + INCREMENT);
+    let (_f, _c, grown) = live
+        .pump(dir.path(), EpochFilter::OwnCaptureOnly, 256)
+        .expect("pump grown");
+
+    eprintln!(
+        "SM-2: N {n_before} -> {n_after}; meta_ops {} -> {}",
+        st.segment_meta_ops, grown.segment_meta_ops
+    );
+    assert!(
+        grown.segment_meta_ops <= BUDGET_META,
+        "SM-2: после роста каталога втрое ({n_before} -> {n_after}) установившийся тик \
+         выполнил {} операций при бюджете {BUDGET_META}. Журнал append-only: N растёт \
+         НАВСЕГДА, и реализация, зависящая от него, откладывает отказ, а не устраняет.",
+        grown.segment_meta_ops
+    );
+    assert!(
+        grown.segment_meta_ops <= st.segment_meta_ops,
+        "SM-2: цена установившегося тика ВЫРОСЛА вместе с каталогом ({} при N={n_before} -> \
+         {} при N={n_after}), пусть и в пределах бюджета. Это O(N) с малым коэффициентом: \
+         сегодня проходит порог, через месяц роста — нет. Инвариант §4.1 требует ЧИСЛА, НЕ \
+         ЗАВИСЯЩЕГО от N, а не «пока помещается».",
+        st.segment_meta_ops,
+        grown.segment_meta_ops
     );
 }
 
