@@ -1096,7 +1096,13 @@ impl EventStream {
     ///    прочитали; seek к сохранённому смещению их пропустит, а чтобы корректно их
     ///    выдать, нужен forward-scan от начала сегмента (см. O-4 в `red_tail_scan_bounded`);
     /// 5. `after_seq != None` (при `None` это `stream`/полный проход — семантика «выдать
-    ///    ВСЕ события», hint тут только мешает).
+    ///    ВСЕ события», hint тут только мешает);
+    /// 6. **M-62 §7: `hint.pos <= длина файла` и `hint.pos` указывает на границу кадра**
+    ///    (валидный `[u32 len][payload][u32 crc32]` — единственный валидатор границы,
+    ///    per-frame magic не существует; см. §7 спеки). Иначе — fail-safe откат в
+    ///    `header_end`. УСЛОВИЕ: `pos == len` (ровно хвост без приращения) — ЛЕГИТИМНЫЙ
+    ///    пустой тик, наивное `pos >= len ⇒ откат` сломало бы его и сделало M-62
+    ///    отменяющим сам себя.
     ///
     /// Иначе возвращаем `header_end` — обычное начало чтения.
     fn resolve_active_start_offset(&self, path: &Path) -> io::Result<u64> {
@@ -1106,6 +1112,7 @@ impl EventStream {
             Some(_) => probe.stream_position()?,
             None => 0,
         };
+        let file_len = probe.metadata()?.len();
         drop(probe);
 
         let after = match self.after_seq {
@@ -1132,7 +1139,43 @@ impl EventStream {
         if after < hint.last_seq {
             return Ok(header_end);
         }
+        // M-62 §7, условие 6: hint.pos против длины файла.
+        if hint.pos > file_len {
+            // Усечение / компакция активного при неизменном индексе ⇒ seek за EOF.
+            // Fail-safe откат: тик пройдёт с начала сегмента (forward-scan).
+            return Ok(header_end);
+        }
+        if hint.pos == file_len {
+            // ЛЕГИТИМНЫЙ случай: пустой тик у хвоста, приращения с прошлого pump нет.
+            // Возвращаем hint.pos как есть — `PositionedBufReader` корректно отдаст EOF
+            // и `next()` пойдёт дальше по `selected_segments`/закроет поток.
+            return Ok(hint.pos);
+        }
+        // M-62 §7, условие 6b: hint.pos должен указывать на границу кадра.
+        // Пробуем прочитать ОДИН frame с этой позиции; провал ⇒ fail-safe `header_end`.
+        if !self.probe_frame_boundary(path, hint.pos) {
+            return Ok(header_end);
+        }
         Ok(hint.pos)
+    }
+
+    /// Проверить, что `pos` указывает на начало валидного фрейма.
+    ///
+    /// M-62 §7: per-frame magic не существует (`segments.rs:17-19`), единственный
+    /// валидатор границы — CRC. Делаем ОДИН независимый `File::open` ради probe'а
+    /// (нельзя использовать уже открытый reader — он позиционирован в `hint.pos` и
+    /// любая попытка «посмотреть» с этой же позиции через тот же handle спутала бы
+    /// границу). Если `read_frame_payload` вернул `Err` (CRC mismatch / `length absurd`)
+    /// или `Ok(None)` (EOF раньше фрейма) — граница НЕ валидна ⇒ false.
+    fn probe_frame_boundary(&self, path: &Path, pos: u64) -> bool {
+        let mut f = match File::open(path) {
+            Ok(f) => f,
+            Err(_) => return false,
+        };
+        if f.seek(SeekFrom::Start(pos)).is_err() {
+            return false;
+        }
+        matches!(read_frame_payload(&mut f), Ok(Some(_)))
     }
 }
 
