@@ -68,7 +68,13 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 IMPL_REL="crates/journal/src/segments.rs"
 ORACLE="red_segment_meta_bound"
-TREE="${M62_BATT_TREE:-/tmp/m62-batt-tree}"
+# Каталог дерева-копии — СВОЙ на прогон. Фиксированный путь означал, что два одновременных
+# прогона (а они здесь norm: гейт зовут и tester, и reviewer, и architect) топчут одно дерево:
+# один восстанавливает `.orig` ровно тогда, когда другой применил мутацию. Это тот же класс,
+# что фиксированные пути логов `verify`, из-за которых на M-61 шаг T переворачивался с красного
+# на зелёное. Переопределяется через `M62_BATT_TREE` — переиспользовать прогретый target/
+# по-прежнему можно, но ЯВНО и на свой страх.
+TREE="${M62_BATT_TREE:-$(mktemp -d /tmp/m62-batt-XXXXXX)}"
 
 pass() { echo "PASS  $*"; }
 die()  { echo "SETUP НЕ СОСТОЯЛСЯ: $*" >&2; exit 1; }
