@@ -19,22 +19,69 @@
 # Отсюда режим `--reclaim`: он забирает КЭШ, не трогая работу, и не зависит ни от merge,
 # ни от чистоты дерева — `target/` не работа ни при каком состоянии ветки.
 #
-# Usage:
-#   scripts/gc_worktrees.sh                 # удалить все безопасно-рекультивируемые деревья
-#   scripts/gc_worktrees.sh --dry-run       # только показать, что было бы удалено
-#   scripts/gc_worktrees.sh --reclaim [Ч]   # снести target/ у деревьев, молчащих дольше Ч часов
-#                                           # (по умолчанию 2), затем обычный безопасный GC
-#   scripts/gc_worktrees.sh --reclaim-dry [Ч]
+# ЧЕГО ЭТОТ СКРИПТ НЕ ДЕЛАЕТ (названо явно, чтобы не подразумевалось):
+#   • не трогает `target/` каталогов, не числящихся в `git worktree list` (осиротевшие после
+#     `worktree remove`/`prune` деревья). Замер 2026-08-12: 19 таких каталогов, 13.9 GB —
+#     видимого механизма для них нет, убираются руками;
+#   • не убирает СВОЙ кэш агента в момент сдачи работы: свежий кэш по определению не «молчит»
+#     (см. `branch-hygiene.md` §Worktree lifecycle п.3 — там это отдельная команда).
 set -uo pipefail
 
+usage() {
+  cat <<'EOF'
+Usage:
+  scripts/gc_worktrees.sh                  # удалить все безопасно-рекультивируемые деревья
+  scripts/gc_worktrees.sh --dry-run        # только показать, что было бы удалено
+  scripts/gc_worktrees.sh --reclaim [N]    # снести target/ у деревьев, молчащих дольше N часов,
+                                           # затем обычный безопасный GC
+  scripts/gc_worktrees.sh --reclaim-dry [N]
+  N — целое число часов, ТОЛЬКО цифры (0, 2, 24); по умолчанию 2.
+EOF
+}
+
+# ─── РАЗБОР АРГУМЕНТОВ: fail-CLOSED ──────────────────────────────────────────────────────
+# Почему это не формальность (R-055 Б-1, воспроизведено на живом репозитории). Страж режима
+# reclaim стоит на `[ "$idle_h" -lt "$IDLE_H" ]`. Нечисловой порог роняет САМО сравнение: `[`
+# возвращает не-ноль, ветка KEEP-CACHE не берётся, управление уходит прямо в `rm -rf`. То
+# есть при опечатке страж не ужесточается, а ОТКЛЮЧАЕТСЯ — вместе с деревьями, где сборка
+# шла минуту назад. Прежняя шапка сама печатала параметр как `[Ч]`, приглашая набрать `3ч`.
+# Отрицательный порог даёт тот же исход без всякой ошибки: `[ 0 -lt -1 ]` просто ложно.
+# Прежний `case "${1:-}"` разбирал ТОЛЬКО первый аргумент: `--dryrun` не совпадал ни с чем и
+# молча означал БОЕВОЙ прогон, а `--dry-run --reclaim` терял reclaim. Оба — опечатки, ценой
+# которых чужая работа. Отсюда: полный цикл по аргументам, неизвестное — отказ.
+# Оракул — `scripts/tests/red_gc_reclaim_args.sh` (8 сценариев, в CI).
 DRY=0
 MODE=gc
 IDLE_H=2
-case "${1:-}" in
-  --dry-run)    DRY=1 ;;
-  --reclaim)    MODE=reclaim; IDLE_H="${2:-2}" ;;
-  --reclaim-dry) MODE=reclaim; DRY=1; IDLE_H="${2:-2}" ;;
-esac
+IDLE_SET=0
+
+refuse() {
+  echo "ОТКАЗ: $*" >&2
+  usage >&2
+  echo "VERDICT: GC REFUSED (аргументы)" >&2
+  exit 2
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dry-run)     DRY=1 ;;
+    --reclaim)     MODE=reclaim ;;
+    --reclaim-dry) MODE=reclaim; DRY=1 ;;
+    -h|--help)     usage; exit 0 ;;
+    *)
+      # Единственный допустимый позиционный аргумент — порог часов, и только в режиме reclaim.
+      [ "$MODE" = "reclaim" ] || refuse "неизвестный аргумент «$1»"
+      [ "$IDLE_SET" = "0" ] || refuse "порог задан дважды («$IDLE_H» и «$1»)"
+      case "$1" in
+        '' | *[!0-9]*)
+          refuse "порог «$1» — не целое число часов. Ожидаются ТОЛЬКО цифры (0, 2, 24).
+       Нечисловой или отрицательный порог не делает страж строже — он его выключает,
+       и rm -rf уходит по кэшу деревьев, где сборка шла минуту назад." ;;
+      esac
+      IDLE_H="$1"; IDLE_SET=1 ;;
+  esac
+  shift
+done
 
 ROOT="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null | sed 's#/\.git$##')"
 git fetch origin --quiet 2>/dev/null || true
@@ -53,12 +100,17 @@ if [ "$MODE" = "reclaim" ]; then
     echo "VERDICT: GC REFUSED (активная сборка)"
     exit 1
   fi
-  now=$(date +%s); freed=0; touched=0
+  # Счётчиков «освобождено всего» здесь нет НАМЕРЕННО: цикл живёт в подоболочке пайпа, и
+  # любая сумма, накопленная внутри, снаружи теряется. Итог показывает `df -h` ниже — он
+  # меряет диск, а не наши намерения.
+  now=$(date +%s)
   git worktree list --porcelain | awk '/^worktree /{print $2}' | while read -r wt; do
     [ "$wt" = "$MAIN_CHECKOUT" ] && continue
     [ -d "$wt/target" ] || continue
     m=$(stat -c %Y "$wt/target" 2>/dev/null || echo "$now")
     idle_h=$(( (now - m) / 3600 ))
+    # `du` считается и для KEEP-CACHE сознательно: строка «оставил 9 GB» — единственное, что
+    # объясняет, куда делся диск, когда порог никого не отпустил.
     sz=$(du -sm "$wt/target" 2>/dev/null | cut -f1)
     if [ "$idle_h" -lt "$IDLE_H" ]; then
       echo "KEEP-CACHE  $(basename "$wt") — молчит ${idle_h}ч (порог ${IDLE_H}ч), ${sz}MB"
@@ -75,7 +127,7 @@ if [ "$MODE" = "reclaim" ]; then
   echo
 fi
 
-removed=0; kept=0
+# Счётчиков нет по той же причине, что и в блоке reclaim: цикл — подоболочка пайпа.
 # Список путей worktree'ов (кроме основного чекаута).
 git worktree list --porcelain | awk '/^worktree /{print $2}' | while read -r wt; do
   [ "$wt" = "$MAIN_CHECKOUT" ] && continue
