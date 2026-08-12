@@ -791,8 +791,7 @@ pub mod server {
                     // unsubscribe) не ловил наш error как «поток по этой подписке
                     // продолжился». Совпадает с §2.7 (сессионные ошибки не
                     // привязаны к конкретному id).
-                    send_v1_error(sink, None, "unknown_id", "no such subscription id")
-                        .await;
+                    send_v1_error(sink, None, "unknown_id", "no such subscription id").await;
                     return Err(format!("unknown id {id_str}"));
                 }
                 inner.subs_count = inner.subs_count.saturating_sub(1);
