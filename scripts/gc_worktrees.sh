@@ -49,7 +49,7 @@ EOF
 # Прежний `case "${1:-}"` разбирал ТОЛЬКО первый аргумент: `--dryrun` не совпадал ни с чем и
 # молча означал БОЕВОЙ прогон, а `--dry-run --reclaim` терял reclaim. Оба — опечатки, ценой
 # которых чужая работа. Отсюда: полный цикл по аргументам, неизвестное — отказ.
-# Оракул — `scripts/tests/red_gc_reclaim_args.sh` (8 сценариев, в CI).
+# Оракул — `scripts/tests/red_gc_reclaim_args.sh` (13 сценариев, в CI).
 DRY=0
 MODE=gc
 IDLE_H=2
@@ -94,7 +94,16 @@ done
 ROOT="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null | sed 's#/\.git$##')"
 git fetch origin --quiet 2>/dev/null || true
 
-MAIN_CHECKOUT="$(git worktree list --porcelain | awk '/^worktree /{print $2; exit}')"
+# Путь берётся ЦЕЛИКОМ, а не первым полем (A-008 §1.1). `awk '{print $2}'` резал путь по
+# первому ПРОБЕЛЬНОМУ символу, и дальше `rm -rf` уходил по УСЕЧЁННОМУ префиксу — то есть по
+# каталогу, которого в списке worktree'ов нет вовсе. Два круга держали это как NOTE на
+# основании «практически прикрыто `[ -d "$wt/target" ]`»; арбитр основание опроверг: условию
+# `[ -d ]` удовлетворяет ЛЮБОЙ каталог, случайно оказавшийся по усечённому пути.
+# Здесь, в MAIN_CHECKOUT, парсинг чинится ЗА КОМПАНИЮ и ради консистентности: сравнение
+# `[ "$wt" = "$MAIN_CHECKOUT" ]` усекает обе стороны ОДИНАКОВО, поэтому иммунитет главного
+# чекаута усечением не терялся. Утверждать обратное было бы переобещанием.
+# Пути с `\n` вне модели угроз: git таких worktree'ов не создаёт.
+MAIN_CHECKOUT="$(git worktree list --porcelain | sed -n 's/^worktree //p' | head -1)"
 
 # ─── РЕЖИМ RECLAIM: забрать кэш сборки, работу не трогать ────────────────────────────────
 if [ "$MODE" = "reclaim" ]; then
@@ -112,7 +121,7 @@ if [ "$MODE" = "reclaim" ]; then
   # любая сумма, накопленная внутри, снаружи теряется. Итог показывает `df -h` ниже — он
   # меряет диск, а не наши намерения.
   now=$(date +%s)
-  git worktree list --porcelain | awk '/^worktree /{print $2}' | while read -r wt; do
+  git worktree list --porcelain | sed -n 's/^worktree //p' | while IFS= read -r wt; do
     [ "$wt" = "$MAIN_CHECKOUT" ] && continue
     [ -d "$wt/target" ] || continue
     m=$(stat -c %Y "$wt/target" 2>/dev/null || echo "$now")
@@ -149,7 +158,7 @@ fi
 
 # Счётчиков нет по той же причине, что и в блоке reclaim: цикл — подоболочка пайпа.
 # Список путей worktree'ов (кроме основного чекаута).
-git worktree list --porcelain | awk '/^worktree /{print $2}' | while read -r wt; do
+git worktree list --porcelain | sed -n 's/^worktree //p' | while IFS= read -r wt; do
   [ "$wt" = "$MAIN_CHECKOUT" ] && continue
   name="$(basename "$wt")"
 

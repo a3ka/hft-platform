@@ -33,7 +33,7 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 GC="${GC_UNDER_TEST:-${ROOT}/scripts/gc_worktrees.sh}"
 FAILED=0
 RAN=0
-EXPECT_SCENARIOS=11
+EXPECT_SCENARIOS=13
 
 pass() { echo "PASS  $*"; }
 fail() { echo "FAIL  $*"; FAILED=$((FAILED + 1)); }
@@ -222,6 +222,71 @@ else
   fi
 fi
 rm -rf "$S"
+
+# ─── ПУТЬ С ПРОБЕЛЬНЫМ СИМВОЛОМ: rm -rf не смеет уходить МИМО списка worktree'ов ─────────
+# A-008 §1.1. `awk '/^worktree /{print $2}'` резал путь по первому пробельному символу, и
+# удаление уходило по УСЕЧЁННОМУ префиксу — по каталогу, которого в списке нет. Два круга
+# держали это как NOTE, считая, что «практически прикрыто `[ -d "$wt/target" ]`»; арбитр
+# опроверг основание децоем: условию `[ -d ]` удовлетворяет любой каталог, оказавшийся по
+# усечённому пути.
+#
+# Фикстура держит ОБЕ стороны одним прогоном: децой (не worktree, кэш состарен) обязан
+# УЦЕЛЕТЬ, настоящий состаренный кэш дерева с пробелом — быть ЗАБРАННЫМ. Проверять только
+# «децой цел» нельзя: это зелено и против скрипта, который вообще перестал что-либо удалять.
+#
+# Второй сценарий — ТАБУЛЯЦИЯ вместо пробела — за пределами перечня вердикта НАМЕРЕННО:
+# арбитр вменил architect'у обязанность (A-008 §3) добавлять к фиксу-по-вердикту минимум
+# один сценарий за границей названного рецензентом перечня. `awk` по умолчанию режет по
+# ЛЮБОМУ пробельному символу, значит перечень «пробел» был уже границей, а не классом.
+mk_sandbox_sep() {
+  local sep="$1" s
+  s="$(mktemp -d /tmp/red-gcsep-XXXXXX)" || return 1
+  git init -q --bare "$s/origin.git" >/dev/null 2>&1 || return 1
+  git -c init.defaultBranch=main clone -q "$s/origin.git" "$s/repo" >/dev/null 2>&1 || return 1
+  (
+    cd "$s/repo" || exit 1
+    git -c user.email=probe@local -c user.name=probe commit -q --allow-empty -m init
+    git branch -M main >/dev/null 2>&1
+    git push -q origin main >/dev/null 2>&1
+    git worktree add -q -b b-sep "$s/wt${sep}name" >/dev/null 2>&1
+    git -C "$s/wt${sep}name" -c user.email=probe@local -c user.name=probe \
+      commit -q --allow-empty -m local-only
+    mkdir -p "$s/wt${sep}name/target"
+    : >"$s/wt${sep}name/target/marker"
+    touch -d '10 hours ago' "$s/wt${sep}name/target"
+  ) || return 1
+  # ДЕЦОЙ по усечённому пути: обычный каталог, НЕ worktree, кэш состарен — чтобы он проходил
+  # проверку порога и был бы удалён любым, кто судит по усечённой строке.
+  mkdir -p "$s/wt/target"
+  : >"$s/wt/target/marker"
+  touch -d '10 hours ago' "$s/wt/target"
+  mkdir -p "$s/bin"
+  printf '#!/bin/sh\nexit 1\n' >"$s/bin/pgrep"
+  chmod +x "$s/bin/pgrep"
+  printf '%s\n' "$s"
+}
+
+for sep_name in ПРОБЕЛ ТАБУЛЯЦИЯ; do
+  RAN=$((RAN + 1))
+  if [ "$sep_name" = "ПРОБЕЛ" ]; then SEP=' '; else SEP="$(printf '\t')"; fi
+  S="$(mk_sandbox_sep "$SEP")" || { setup_fail "песочница SEP-PATH «$sep_name»"; continue; }
+  # setup-guard: обе стороны фикстуры обязаны существовать ДО прогона, иначе сценарий
+  # проверял бы отсутствие, созданное им самим.
+  if [ ! -e "$S/wt/target/marker" ] || [ ! -e "$S/wt${SEP}name/target/marker" ]; then
+    setup_fail "SEP-PATH «$sep_name»: фикстура не собралась (децой или рабочий кэш отсутствует)"
+    rm -rf "$S"; continue
+  fi
+  OUT="$(run_gc "$S" --reclaim 3)"; RC=$?
+  if [ -e "$S/wt/target/marker" ] && [ ! -e "$S/wt${SEP}name/target/marker" ]; then
+    pass "SEP-PATH «$sep_name»: децой вне списка УЦЕЛЕЛ, настоящий состаренный кэш забран (exit=$RC)"
+  else
+    fail "SEP-PATH «$sep_name»: децой=$([ -e "$S/wt/target/marker" ] && echo цел || echo СНЕСЁН), \
+рабочий кэш=$([ -e "$S/wt${SEP}name/target/marker" ] && echo ЦЕЛ || echo забран). Путь режется по \
+пробельному символу — rm -rf уходит по каталогу, которого нет в списке worktree'ов"
+    printf '%s\n' "$OUT" | grep -E '^(RECLAIMED|KEEP-CACHE)' | head -3 | sed 's/^/      ↳ /'
+  fi
+  rm -rf "$S"
+done
 
 # ─── число исполненного СЧИТАЕТСЯ, а не заявляется ───────────────────────────────────────
 echo
