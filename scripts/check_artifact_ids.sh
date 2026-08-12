@@ -154,11 +154,26 @@ introduced() {
     done < <(git show --name-only --no-renames --diff-filter=A --format= -z "${c}" 2>/dev/null || true)
     # Новая запись в TECH-DEBT.md (TD — носитель §3.1 правило 2) — засчитывается, только
     # если присутствует в HEAD:TECH-DEBT.md (та же логика «от результата», что и для файлов).
+    #
+    # СРАВНИВАЮТСЯ ДАННЫЕ, А НЕ ШАБЛОН (Б-6, `R-054`). Прежняя редакция подставляла слаг
+    # долга в ERE: `grep -qE "…\`${tsubj}\`"`. Слаг с метасимволом переставал совпадать САМ
+    # С СОБОЙ, grep возвращал не-0, кандидат МОЛЧА выпадал — и барьер печатал «ни один
+    # артефакт не введён», exit 0, на настоящей коллизии. Замер reviewer'а: 6 слагов из 111
+    # в `origin/main` (5.4 %) уже несут метасимволы, а на реальном `TD-3` (`[verify-at-impl]`)
+    # grep падает с «Invalid range end» — и падение игнорируется, потому что различались
+    # только «нашёл / не нашёл». Направление отказа было выбрано ПРОТИВОПОЛОЖНО смыслу
+    # барьера, вся ценность которого в fail-closed.
+    #
+    # Обе стороны теперь проходят ОДИН И ТОТ ЖЕ разбор, сверка — по точной строке (`-qxF`).
+    # `IFS= read -r` сохраняет краевые пробелы: прежний `read -r tcls tnum tsubj` их срезал,
+    # и строка, которая в файле ЕСТЬ, не находилась (третье воспроизведение Б-6).
+    head_td="$(git show "HEAD:TECH-DEBT.md" 2>/dev/null \
+      | sed -nE 's/^- \*\*TD-0*([0-9]+)\*\* `([^`]+)`.*/\1 \2/p')"
     git show "${c}" -- TECH-DEBT.md 2>/dev/null \
-      | sed -nE 's/^\+- \*\*TD-0*([0-9]+)\*\* `([^`]+)`.*/TD \1 \2/p' \
-      | while read -r tcls tnum tsubj; do
-          git show "HEAD:TECH-DEBT.md" 2>/dev/null \
-            | grep -qE "^- \*\*TD-0*${tnum}\*\* \`${tsubj}\`" && printf '%s %s %s\n' "$tcls" "$tnum" "$tsubj"
+      | sed -nE 's/^\+- \*\*TD-0*([0-9]+)\*\* `([^`]+)`.*/\1 \2/p' \
+      | while IFS= read -r td_line; do
+          [ -n "${td_line}" ] || continue
+          printf '%s\n' "${head_td}" | grep -qxF -- "${td_line}" && printf 'TD %s\n' "${td_line}"
         done
   done
   return 0
