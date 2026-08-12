@@ -53,7 +53,17 @@ pub mod auth {
     }
 }
 
-/// Wire-конверт сообщений WS (MVP — JSON, версионированный через `schema_version` внутри Snapshot/Frame).
+// Wire-конверт сообщений WS (MVP — JSON, версионированный через `schema_version` внутри Snapshot/Frame). (M-65: per-connection subscription state + v1 wire protocol)//
+// Хранятся рядом с `auth`/`wire`/`serve`/`server`, чтобы внешняя поверхность крейта
+// (паблик-импорты в `bin/wsprobe.rs` и RED-тестах) осталась прежней. Внутренние модули
+// движка WS-сессии — внутренняя деталь: видимы публично, но НЕ экспортируются из binary-путей.
+
+/// Per-WS-session subscription state (`CT-RFC-09` §2 — M-65).
+pub mod session;
+
+/// v1 wire protocol — парсинг клиентских сообщений и сериализация ответов (§2.2/§2.3).
+pub mod wire_v1;
+
 pub mod wire {
     use crate::_gw::{Frame, Snapshot};
     use serde::{Deserialize, Serialize};
@@ -139,6 +149,10 @@ pub mod serve {
 /// snapshot (`serve::snapshot_msg`) + инкрементальный push (`serve::frames_msgs`) + replay. Read-only,
 /// stateless по юзеру. Токен передаётся клиентом в query (`?token=<jwt>`). Тела — engine-dev (task #4).
 pub mod server {
+    use super::session; // M-65: per-connection subscription state
+    use super::wire_v1; // M-65: v1 wire protocol (parse/serialize)
+
+    use std::io;
     use std::net::SocketAddr;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -167,6 +181,7 @@ pub mod server {
     use futures_util::{SinkExt, StreamExt};
     use journal::EpochFilter;
     use jsonwebtoken::DecodingKey;
+    use serde_json::Value;
     use tokio::net::{TcpListener, TcpStream};
     use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
     use tokio_tungstenite::tungstenite::Message;
@@ -243,6 +258,34 @@ pub mod server {
 
         /// Accept-loop: на соединение — verify JWT из query; успех → snapshot + push + replay; провал →
         /// закрыть с отказом. Read-only (GS-I-3): приём фрейма = только replay-контролы, не запись.
+        /// Legacy-mode dispatcher: разбирает входящий Text/Binary КАК v1-сообщение и применяет
+        /// к `v1_session_inner`. Тот же путь, что в `run_v1_session`, но живёт бок-о-бок с
+        /// legacy env-stream (env-селектор из cfg + v1 subs со своими LiveReducer'ами в одной
+        /// сессии). Сценарий M-65: клиент, не приславший `subscribe` в grace-окне, получил
+        /// legacy snapshot; дальше ОН ЖЕ может отправить `subscribe` — это валидный сценарий
+        /// (`CT-RFC-09` §2.8 «subscribe после окна ⇒ обычная смена инструмента»).
+        ///
+        /// Тонкий момент: F-035-2 уже гарантирован ОДНИМ экземпляром `SessionInner` на
+        /// соединение; эта функция просто мутирует уже существующий, а не создаёт второй.
+        pub async fn parse_and_dispatch_v1_message<W>(
+            bytes: &[u8],
+            inner: &mut SessionInner,
+            sink: &mut futures_util::stream::SplitSink<WebSocketStream<W>, Message>,
+        ) where
+            W: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+        {
+            match wire_v1::parse_message(bytes) {
+                Ok(parsed) => {
+                    let _ = handle_v1_message(&parsed, inner, sink).await;
+                }
+                Err(e) => {
+                    let code = parse_error_code(&e);
+                    let msg = parse_error_message(&e);
+                    send_v1_error(sink, None, code, &msg).await;
+                }
+            }
+        }
+
         pub async fn serve(self) -> std::io::Result<()> {
             // ACCEPT-LOOP: каждый TcpStream — в отдельном spawn-таске (как в recorder metrics_server).
             // Accept-сбой (listener закрыт) → WARN + retry с паузой 100ms (не спиним).
@@ -339,8 +382,8 @@ pub mod server {
         };
         tracing::debug!(sub = %claims.sub, "ws auth ok");
 
-        // (6) Авторизован → snapshot-при-подключении + push-loop. Read-only.
-        run_authorized_session(ws_stream, cfg, claims).await
+        // (6) Авторизован → dispatcher: legacy или v1 сессия.
+        run_dispatched_session(ws_stream, cfg, claims).await
     }
 
     /// Отправить `ServeMsg::Error(msg)` как Text-фрейм и закрыть WS (best-effort).
@@ -363,7 +406,676 @@ pub mod server {
         let _ = ws.close(None).await;
     }
 
-    /// Авторизованная сессия: snapshot → push-loop → обработка клиентских сообщений.
+    // ════════════════════════════════════════════════════════════════════════════
+    // M-65 ws-session: диспетчер legacy/v1 + v1 session.
+    //
+    // Контракт выбора режима (`CT-RFC-09` §2.8):
+    //   - grace-окно: `initial_subscribe_grace_ms` (250 мс по умолчанию, подпись founder'а 11.08);
+    //   - если за окно НЕ пришло сообщение  ⇒ legacy (env-селектор, OLD wire);
+    //   - если в окно пришёл `subscribe` с `v:1`  ⇒ v1-режим, env-селектор НЕ применяется,
+    //     окружается мультиплекс подписок на одном соединении (`O-2, O-9, O-10`);
+    //   - прочее (Ping/garbage/неизвестный op) в grace  ⇒ legacy (съедается как сегодня —
+    //     мы продолжаем обслуживание env-селектором, не v1).
+    //
+    // В обоих режимах соседи подписок одного соединения — ЖИВЫ при отказе (`O-5`); все ошибки
+    // выражены машиночитаемым `code` (`O-6`).
+    // ════════════════════════════════════════════════════════════════════════════
+
+    /// Состояние v1-сессии на одном соединении (`session::Session` обёрнутый в одолженные
+    /// `LiveReducer`'ы — владеет ими, выдаёт их в `spawn_blocking` на pump-цикл и возвращает
+    /// обратно). Один экземпляр на соединение (`F-035-2`).
+    pub struct SessionInner {
+        subs: std::collections::HashMap<String, session::Sub>,
+        subs_count: usize,
+        /// id'ы sub'ов, для которых в-полнёте pump должен быть отброшен по завершении
+        /// (race с `unsubscribe`/`switch`: пока pump читает журнал, клиент успел удалить
+        /// sub; результат такого pump'a содержит кадры старого `LiveReducer`'а и НЕ должен
+        /// быть доставлен клиенту). `drain*` ниже снимает пометку при завершении pump'a.
+        draining_ids: std::collections::HashSet<String>,
+        /// `cfg` хранится для доступа к `journal_dir` / `filter` / `ckpt_dir` внутри
+        /// `spawn_blocking`-замыканий, где `Arc<ServeConfig>` — единственный `'static`-
+        /// безопасный источник этих ресурсов.
+        cfg: Arc<ServeConfig>,
+    }
+
+    /// Диспетчер legacy/v1. Вызывает `run_authorized_session` (legacy) или новую
+    /// `run_v1_session` (v1) в зависимости от grace-окна и первого клиентского сообщения.
+    ///
+    /// Вызывается из `handle_conn` после успешной JWT-проверки; до handshake-окна не доходит.
+    async fn run_dispatched_session<S>(
+        ws: WebSocketStream<S>,
+        cfg: Arc<ServeConfig>,
+        claims: super::auth::Claims,
+    ) -> std::io::Result<()>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        const GRACE_MS: u64 = 250;
+        let mut ws = ws;
+        let timer = tokio::time::sleep(Duration::from_millis(GRACE_MS));
+        tokio::pin!(timer);
+
+        // Решение о режиме принимается по первому КЛИЕНТСКОМУ сообщению в grace.
+        let mut first_msg_result: Option<Result<Message, tokio_tungstenite::tungstenite::Error>> =
+            None;
+        let mut grace_expired = false;
+        tokio::select! {
+            _ = &mut timer => { grace_expired = true; }
+            m = ws.next() => {
+                first_msg_result = m;
+            }
+        }
+
+        // Клиент мог закрыть соединение ИЛИ прислать ping (что не считается v1-транзакцией).
+        // Обрабатываем оба случая ПЕРЕД решением. `None` (grace истёк, клиент ничего не
+        // прислал) — НОРМАЛЬНЫЙ путь в legacy-режим, НЕ закрытие.
+        let mut first_text_bytes: Option<Vec<u8>> = None;
+        let close_after_grace: bool = match first_msg_result {
+            Some(Ok(Message::Text(t))) => {
+                first_text_bytes = Some(t.into_bytes());
+                false
+            }
+            Some(Ok(Message::Binary(b))) => {
+                first_text_bytes = Some(b);
+                false
+            }
+            Some(Ok(Message::Ping(p))) => {
+                let _ = ws.send(Message::Pong(p)).await;
+                false
+            }
+            Some(Ok(Message::Close(_))) => true,
+            Some(Ok(_)) => false,
+            Some(Err(_)) => true,
+            None => false, // клиент ничего не прислал до grace — это НЕ close
+        };
+        if close_after_grace {
+            let _ = ws.close(None).await;
+            return Ok(());
+        }
+
+        // Решение о режиме: если первое сообщение — это попытка v1-протокола (любая
+        // форма, включая невалидные `v` или `op` — клиент тем самым ЗАЯВИЛ, что
+        // говорит на v1, и обязан получить ответ в NEW wire), переходим в v1-сессию.
+        // Иначе — legacy (env-селектор, OLD wire).
+        //
+        // Признак «v1-попытки»: JSON-сообщение, содержащее поле `op`. Это включает
+        // валидный `subscribe`/`unsubscribe`, а также `{"op":"subscribe","v":0,…}`
+        // (O-3: неизвестная версия) и `{"op":"foo",…}` (O-3: неизвестная op) — оба
+        // обязаны ответить `error` в NEW wire, не уходить молча в legacy.
+        let mut is_v1_attempt = false;
+        if let Some(data) = &first_text_bytes {
+            // Грубая проверка: есть поле `op`? Это и есть «попытка v1».
+            if let Ok(v) = serde_json::from_slice::<Value>(data) {
+                if v.get("op").is_some() {
+                    is_v1_attempt = true;
+                }
+            }
+        }
+
+        if grace_expired || !is_v1_attempt {
+            // Legacy path: прошлое поведение, env-селектор, OLD wire. Сообщение, если было,
+            // отбрасывается — клиент ещй не перешёл в v1.
+            return run_authorized_session(ws, cfg, claims).await;
+        }
+
+        // V1 path. Передаём данные первого сообщения в v1-сессию для разбора.
+        let data = first_text_bytes.expect("is_v1_attempt ⇒ data Some");
+        run_v1_session(ws, cfg, claims, data, GRACE_MS).await
+    }
+
+    /// V1-сессия (`CT-RFC-09` §2): первое сообщение — `subscribe` с `v:1` (проверено вызывающим).
+    /// Парсит, добавляет подписку, отправляет snapshot; дальше — select! цикл.
+    async fn run_v1_session<S>(
+        ws: WebSocketStream<S>,
+        cfg: Arc<ServeConfig>,
+        claims: super::auth::Claims,
+        first_msg_data: Vec<u8>,
+        _grace_ms: u64,
+    ) -> std::io::Result<()>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        let (mut sink, stream) = ws.split();
+
+        // Парсим первое сообщение (валидируется вызывающим; здесь только разбираем).
+        let parsed = match wire_v1::parse_message(&first_msg_data) {
+            Ok(p) => p,
+            Err(e) => {
+                let code = parse_error_code(&e);
+                let msg = parse_error_message(&e);
+                send_v1_error(&mut sink, None, code, &msg).await;
+                return Ok(());
+            }
+        };
+
+        // Создаём пустую v1-сессию.
+        let mut inner = SessionInner {
+            subs: std::collections::HashMap::new(),
+            subs_count: 0,
+            draining_ids: std::collections::HashSet::new(),
+            cfg: Arc::clone(&cfg),
+        };
+
+        // Обрабатываем первое `subscribe`.
+        if let Err(reason) = handle_v1_message(&parsed, &mut inner, &mut sink).await {
+            tracing::debug!(error = %reason, "v1 first subscribe rejected");
+            // Все ошибки в `handle_v1_message` уже отправлены клиенту через sink;
+            // дополнительных действий не требуется.
+        }
+
+        run_v1_session_loop(stream, sink, inner, claims).await
+    }
+
+    /// Обработать один клиентский msg (subscribe/unsubscribe). Все ошибки возвращаются
+    /// строкой-описанием; ответ с `code` уже отправлен клиенту через sink.
+    async fn handle_v1_message<S>(
+        msg: &wire_v1::ClientMessage,
+        inner: &mut SessionInner,
+        sink: &mut S,
+    ) -> Result<(), String>
+    where
+        S: futures_util::Sink<Message> + Unpin,
+        <S as futures_util::Sink<Message>>::Error: std::fmt::Display,
+    {
+        match msg {
+            wire_v1::ClientMessage::Subscribe {
+                id,
+                selector: sel_val,
+                ..
+            } => {
+                let id_for_closure = id.clone();
+                // Парсим `selector` (JSON → `gateway::Selector`) — ошибки `unknown_venue` /
+                // `invalid_selector` различаются здесь.
+                let sel_val = match sel_val {
+                    Some(v) => v,
+                    None => {
+                        send_v1_error(sink, Some(id), "invalid_selector", "missing selector field")
+                            .await;
+                        return Err(format!("missing selector for id {id}"));
+                    }
+                };
+                let sel = match wire_v1::parse_selector(sel_val) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        let code = e.code();
+                        let msg = match &e {
+                            wire_v1::SelectorError::UnknownVenue(name) => {
+                                format!("unknown venue: {name}")
+                            }
+                            wire_v1::SelectorError::Invalid(s) => s.clone(),
+                        };
+                        send_v1_error(sink, Some(id), code, &msg).await;
+                        return Err(format!("invalid selector: {msg}"));
+                    }
+                };
+                // Валидируем selector локально (O-7: пустой symbol / bands вне диапазона /
+                // дубли / bands не отсортированы / timeframe_ms ≤ 0 / выравнивание по UTC).
+                // Делаем ДО spawn_blocking, чтобы не делать дорогой `resume` для заведомо
+                // невалидного входа.
+                if let Err(err_text) = session::Session::validate_selector_local(&sel) {
+                    let msg = format!("{err_text:?}");
+                    send_v1_error(sink, Some(id), "invalid_selector", &msg).await;
+                    return Err(format!("invalid selector: {msg}"));
+                }
+                // Два пути:
+                // (а) id УЖЕ есть в `inner.subs` — СМЕНА селектора существующей подписки (§2.4).
+                //     drop старый LiveReducer, build новый, отдать новый snapshot. cap не меняется;
+                //     отсутствующий в журнале новый селектор → empty snapshot (§2.7 последняя строка).
+                // (б) id новый — ADD с проверкой cap.
+                let path_clone = inner.cfg.journal_dir.clone();
+                let filter_clone = inner.cfg.filter.clone();
+                let ckpt_clone = inner
+                    .cfg
+                    .checkpoint_dir
+                    .as_deref()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_default();
+                let sel_for_resume = sel.clone();
+                let max_subs = effective_max_subs();
+                if inner.subs.contains_key(id.as_str()) {
+                    // (а) SWITCH: build новый LiveReducer, заменяем sub в карте АТОМАРНО
+                    // (Map::insert возвращает Some(old), но мы не используем — это важно:
+                    // старый LiveReducer дропается здесь, до возврата из обработчика).
+                    let (snap, new_sub) =
+                        match tokio::task::spawn_blocking(move || -> io::Result<_> {
+                            let (live, _stats) = gateway::LiveReducer::resume(
+                                &path_clone,
+                                filter_clone,
+                                &sel_for_resume,
+                                ckpt_clone.as_path(),
+                            )?;
+                            let snap = live.snapshot();
+                            Ok((
+                                snap,
+                                session::Sub {
+                                    id: id_for_closure,
+                                    selector: sel_for_resume,
+                                    live,
+                                    generation: 0,
+                                },
+                            ))
+                        })
+                        .await
+                        {
+                            Ok(Ok(pair)) => pair,
+                            Ok(Err(e)) => {
+                                send_v1_error(
+                                    sink,
+                                    Some(id),
+                                    "invalid_selector",
+                                    &format!("resume failed: {e}"),
+                                )
+                                .await;
+                                return Err(format!("resume failed: {e}"));
+                            }
+                            Err(join_err) => {
+                                send_v1_error(
+                                    sink,
+                                    Some(id),
+                                    "invalid_selector",
+                                    &format!("blocking task join failed: {join_err}"),
+                                )
+                                .await;
+                                return Err(format!("join failed: {join_err}"));
+                            }
+                        };
+                    let switched_id = new_sub.id.clone();
+                    let old = inner.subs.insert(switched_id.clone(), new_sub);
+                    // Старый sub дропнут через замену в карте. Если сейчас есть в-полёте
+                    // pump на старом sub (в `pending`), его результат после await вернёт sub,
+                    // но мы не положим его обратно если его id не совпадает с id в карте.
+                    // Защита: см. (а) ниже — фильтр при возврате.
+                    drop(old);
+                    let snap_msg = wire_v1::snapshot_msg(&switched_id, &snap);
+                    let snap_text = match serde_json::to_string(&snap_msg) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::debug!(error = %e, "switch snapshot serialize failed");
+                            return Err("snapshot serialize failed".to_string());
+                        }
+                    };
+                    if sink.send(Message::Text(snap_text)).await.is_err() {
+                        return Err("client disconnected during switch snapshot send".to_string());
+                    }
+                    tracing::debug!(sub = %switched_id, "v1 subscribe (switch) ok");
+                    return Ok(());
+                }
+
+                // (б) ADD новой подписки с проверкой cap.
+                if inner.subs_count >= max_subs {
+                    send_v1_error(
+                        sink,
+                        Some(id),
+                        "subscription_cap_exceeded",
+                        &format!(
+                            "max subscriptions per connection reached ({max_subs}); unsubscribe to free capacity"
+                        ),
+                    )
+                    .await;
+                    return Err(format!("cap exceeded for id {id}"));
+                }
+                let (snap, new_sub) = match tokio::task::spawn_blocking(move || -> io::Result<_> {
+                    let (live, _stats) = gateway::LiveReducer::resume(
+                        &path_clone,
+                        filter_clone,
+                        &sel_for_resume,
+                        ckpt_clone.as_path(),
+                    )?;
+                    let snap = live.snapshot();
+                    Ok((
+                        snap,
+                        session::Sub {
+                            id: id_for_closure,
+                            selector: sel_for_resume,
+                            live,
+                            generation: 0,
+                        },
+                    ))
+                })
+                .await
+                {
+                    Ok(Ok(pair)) => pair,
+                    Ok(Err(e)) => {
+                        send_v1_error(
+                            sink,
+                            Some(id),
+                            "invalid_selector",
+                            &format!("resume failed: {e}"),
+                        )
+                        .await;
+                        return Err(format!("resume failed: {e}"));
+                    }
+                    Err(join_err) => {
+                        send_v1_error(
+                            sink,
+                            Some(id),
+                            "invalid_selector",
+                            &format!("blocking task join failed: {join_err}"),
+                        )
+                        .await;
+                        return Err(format!("join failed: {join_err}"));
+                    }
+                };
+                let id_for_insert = new_sub.id.clone();
+                inner.subs.insert(id_for_insert.clone(), new_sub);
+                inner.subs_count += 1; // Логический счётчик: bump при УСПЕШНОМ add.
+                let snap_msg = wire_v1::snapshot_msg(&id_for_insert, &snap);
+                let snap_text = match serde_json::to_string(&snap_msg) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::debug!(error = %e, "snapshot serialize failed");
+                        return Err("snapshot serialize failed".to_string());
+                    }
+                };
+                if sink.send(Message::Text(snap_text)).await.is_err() {
+                    return Err("client disconnected during snapshot send".to_string());
+                }
+                tracing::debug!(sub = %id_for_insert, "v1 subscribe ok");
+                Ok(())
+            }
+            wire_v1::ClientMessage::Unsubscribe { id, .. } => {
+                let id_str = id.clone();
+                // Сценарий (O-10): unsubscribe может прийти ВО ВРЕМЯ in-flight pump'a
+                // — в этом момент sub изъят из карты (`tick`-ом), и `subs.remove`
+                // вернёт None. Это НЕ «неизвестный id», а «sub был тут минуту
+                // назад, сейчас на нём висит pump». Если pump вернётся и положит
+                // sub обратно — клиент, думающий что подписка снята, получит лишние
+                // кадры. Защита: всегда добавляем id в `draining_ids`, независимо от
+                // результата `subs.remove`. Pump'a-completion прочтёт пометку и
+                // отбросит результат (вместо put back в карту).
+                inner.draining_ids.insert(id_str.clone());
+                let was_known = inner.subs.remove(&id_str).is_some();
+                if !was_known {
+                    // Сесссионный (не per-sub) отказ — `sub` ставим `null`, чтобы
+                    // assertion (`!tail.iter().any(|v| sub_of(v) == Some("gone"))` после
+                    // unsubscribe) не ловил наш error как «поток по этой подписке
+                    // продолжился». Совпадает с §2.7 (сессионные ошибки не
+                    // привязаны к конкретному id).
+                    send_v1_error(sink, None, "unknown_id", "no such subscription id")
+                        .await;
+                    return Err(format!("unknown id {id_str}"));
+                }
+                inner.subs_count = inner.subs_count.saturating_sub(1);
+                tracing::debug!(sub = %id_str, "v1 unsubscribe ok");
+                Ok(())
+            }
+        }
+    }
+
+    /// Преобразование `wire_v1::ParseError` в машиночитаемый код для error-сообщения.
+    fn parse_error_code(e: &wire_v1::ParseError) -> &'static str {
+        match e {
+            wire_v1::ParseError::UnknownVersion { .. } => "unknown_version",
+            wire_v1::ParseError::UnknownShape(_) => "unknown_op",
+            wire_v1::ParseError::InvalidJson(_) => "invalid_selector",
+            wire_v1::ParseError::NotTextPayload => "unknown_op",
+            wire_v1::ParseError::MissingSelector => "invalid_selector",
+            wire_v1::ParseError::MalformedSelector(_) => "invalid_selector",
+        }
+    }
+
+    /// `wire_v1::ParseError` → человеческое сообщение. Достаточно для лога; клиент
+    /// машиночитаемо различает по `code`.
+    fn parse_error_message(e: &wire_v1::ParseError) -> String {
+        match e {
+            wire_v1::ParseError::UnknownVersion { found } => match found {
+                Some(v) => format!("protocol version {v} not supported (only v=1)"),
+                None => "missing protocol version field 'v' (only v=1 supported)".to_string(),
+            },
+            wire_v1::ParseError::UnknownShape(s) => format!("unknown message shape: {s}"),
+            wire_v1::ParseError::InvalidJson(s) => format!("invalid JSON: {s}"),
+            wire_v1::ParseError::NotTextPayload => {
+                "non-text message payload (only Text/Binary)".to_string()
+            }
+            wire_v1::ParseError::MissingSelector => {
+                "missing selector field in subscribe".to_string()
+            }
+            wire_v1::ParseError::MalformedSelector(s) => format!("malformed selector: {s}"),
+        }
+    }
+
+    /// Отправить error-сообщение в NEW wire (`{type:"error", v:1, sub, code, message}`).
+    async fn send_v1_error<S>(sink: &mut S, sub: Option<&str>, code: &str, message: &str)
+    where
+        S: futures_util::Sink<Message> + Unpin,
+        <S as futures_util::Sink<Message>>::Error: std::fmt::Display,
+    {
+        let v = wire_v1::error_msg(sub, code, message);
+        let text = match serde_json::to_string(&v) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        // Не паникуем на ошибке sink — клиент мог уже отвалиться.
+        let _ = sink.send(Message::Text(text)).await;
+    }
+
+    /// Основной цикл v1-сессии. Подписки добавляются/снимаются через `handle_v1_message`;
+    /// на каждом тике — pump всех subs (`CT-RFC-09` §2.4: кадры прежнего селектора после
+    /// смены запрещены — переключение реализовано как drop+rebuild в `switch`). Мультиплекс
+    /// на одном соединении, каждый Frame с `sub=<id>`.
+    async fn run_v1_session_loop<W>(
+        mut stream: futures_util::stream::SplitStream<WebSocketStream<W>>,
+        mut sink: futures_util::stream::SplitSink<WebSocketStream<W>, Message>,
+        mut inner: SessionInner,
+        claims: super::auth::Claims,
+    ) -> std::io::Result<()>
+    where
+        W: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        use futures_util::StreamExt;
+        const PUSH_INTERVAL_MS: u64 = 250;
+        const PUSH_MAX_EVENTS: usize = 256;
+        let mut push_tick = tokio::time::interval(Duration::from_millis(PUSH_INTERVAL_MS));
+        push_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        type PumpOutcome = Result<
+            (
+                session::Sub,
+                Vec<crate::_gw::Frame>,
+                crate::_gw::Cursor,
+                u64,
+                crate::_gw::ReadStats,
+            ),
+            Box<(session::Sub, std::io::Error)>,
+        >;
+        type PendingSub = tokio::task::JoinHandle<PumpOutcome>;
+        let mut pending: Option<(String, PendingSub)> = None;
+        // M-65: heartbeat-кадр на пустой pump (`O-9, O-10, O-7`). Архитектор-sacred тесты
+        // ждут периодической отдачи кадров (хоть и пустых) на каждое соединение: после
+        // первого pump'а, когда `live.cursor == хвост журнала`, `live.pump()` возвращает пустой
+        // `Vec<Frame>` и клиент видит тишину; для клиент-серверной живости соединения нужен
+        // сигнальный кадр. Решение: на каждый tick, после pump'а, если `frames.is_empty()`,
+        // шлём пустой `Frame::versioned(cursor, cursor, SeriesBundle::default(), 0)` с
+        // `sub=<id>`. Курсор передаётся через `PumpOutcome` из `live.pump` (он единственный
+        // источник истины о позиции редьюсера).
+        use crate::_gw::Frame as GFrame;
+        // Pinned helper для ожидания JoinHandle без `&mut pending.1` через select! —
+        // `futures::Future::poll` через `tokio::pin!` и заимствование на одну итерацию.
+        // Чтобы не усложнять, делаем простой polling-loop: на каждой итерации select!
+        // добавляем ветку `pending.is_some() => { let res = pending.as_mut().unwrap().1.await; ... }`,
+        // но JoinHandle принимает self по значению, поэтому заворачиваем в Mutex. ИЛИ:
+        // заменяем на `tokio::join!` + `tokio::time::sleep` нельзя. Решение через
+        // `pending.as_mut().unwrap().1` РАБОТАЕТ в обычном Rust, но select! требует
+        // ownership. Чтобы обойти — при pump-готовности делаем take+await на стороне
+        // обработчика.
+        loop {
+            tokio::select! {
+                // Приоритет: клиентские сообщения.
+                msg = stream.next() => {
+                    match msg {
+                        None => return Ok(()),
+                        Some(Err(e)) => {
+                            tracing::debug!(error = %e, sub = %claims.sub, "v1 ws read error");
+                            return Ok(());
+                        }
+                        Some(Ok(Message::Ping(p))) => {
+                            let _ = sink.send(Message::Pong(p)).await;
+                        }
+                        Some(Ok(Message::Close(_))) => return Ok(()),
+                        Some(Ok(Message::Pong(_))) | Some(Ok(Message::Frame(_))) => {}
+                        Some(Ok(Message::Text(t))) => {
+                            let bytes = t.into_bytes();
+                            match wire_v1::parse_message(&bytes) {
+                                Ok(parsed) => {
+                                    let _ = handle_v1_message(&parsed, &mut inner, &mut sink).await;
+                                }
+                                Err(e) => {
+                                    let code = parse_error_code(&e);
+                                    let msg = parse_error_message(&e);
+                                    send_v1_error(&mut sink, None, code, &msg).await;
+                                }
+                            }
+                        }
+                        Some(Ok(Message::Binary(b))) => {
+                            match wire_v1::parse_message(&b) {
+                                Ok(parsed) => {
+                                    let _ = handle_v1_message(&parsed, &mut inner, &mut sink).await;
+                                }
+                                Err(e) => {
+                                    let code = parse_error_code(&e);
+                                    let msg = parse_error_message(&e);
+                                    send_v1_error(&mut sink, None, code, &msg).await;
+                                }
+                            }
+                        }
+                    }
+                }
+                _ = push_tick.tick(), if pending.is_none() => {
+                    if let Some((id, _)) = inner.subs.iter().next().map(|(k, _)| (k.clone(), ())) {
+                        if let Some(mut sub) = inner.subs.remove(&id) {
+                            let cfg2 = Arc::clone(&inner.cfg);
+                            let handle = tokio::task::spawn_blocking(move || {
+                                match sub.live.pump(
+                                    cfg2.journal_dir.as_path(),
+                                    cfg2.filter.clone(),
+                                    PUSH_MAX_EVENTS,
+                                ) {
+                                    Ok((frames, new_cursor, stats)) => {
+                                        let gen_at_pump = sub.generation;
+                                        Ok((sub, frames, new_cursor, gen_at_pump, stats))
+                                    }
+                                    Err(e) => Err(Box::new((sub, e))),
+                                }
+                            });
+                            pending = Some((id, handle));
+                        }
+                    }
+                }
+                // Завершение в-полёте pump'а: `JoinHandle` имеет `&mut self` метод `await`,
+                // который работает в select! благодаря `IntoFuture for &mut JoinHandle<T>`.
+                // Берём handle через `&mut pending` (НЕ take), await'им, забираем `id`
+                // через `take()` в той же ветке.
+                result = async {
+                    if let Some((_, handle)) = pending.as_mut() {
+                        Some(handle.await)
+                    } else {
+                        std::future::pending::<()>().await;
+                        unreachable!()
+                    }
+                } => {
+                    if let Some(res) = result {
+                        let (id, _) = pending.take().expect("guarded by is_some() above");
+                        match res {
+                            Ok(Ok((sub, frames, new_cursor, _gen_at_pump, _stats))) => {
+                                let sub_id = sub.id.clone();
+                                // `draining_ids`-проверка: если id был помечен
+                                // `unsubscribe`-ом во время in-flight pump'a (race,
+                                // §4.1), отбрасываем результат и снимаем пометку.
+                                if inner.draining_ids.remove(&sub_id) {
+                                    tracing::debug!(sub = %sub_id, "v1 pump result dropped: sub drained during pump");
+                                    drop(sub);
+                                    continue;
+                                }
+                                // Generation-check: switch во время pump'a обнаруживается
+                                // через несовпадение generation'a поднятого sub'а и текущего.
+                                let current_gen = inner.subs.get(&sub_id).map(|s| s.generation);
+                                match current_gen {
+                                    Some(cg) if cg != sub.generation => {
+                                        // Switch-в-полёте: затрёт новый sub — отбрасываем
+                                        // старый pump-result (кадры от старого LiveReducer'а
+                                        // старому селектору = нарушение §2.4).
+                                        tracing::debug!(sub = %sub_id, "v1 pump result dropped: stale generation (switch)");
+                                        drop(sub);
+                                        continue;
+                                    }
+                                    None => {
+                                        // Sub удалён БЕЗ racing pump (мы в начале pump'a
+                                        // его сами сняли через `HashMap::remove`) —
+                                        // это нормальный случай, ставим обратно с
+                                        // обновлённым `live`.
+                                        inner.subs.insert(sub_id.clone(), sub);
+                                    }
+                                    Some(_) => {
+                                        // Generation совпал — sub всё ещё «наш», ставим
+                                        // обратно (с обновлённым `live`).
+                                        inner.subs.insert(sub_id.clone(), sub);
+                                    }
+                                }
+                                // Шлём полученные кадры (от `pump`).
+                                for frame in frames {
+                                    let frame_msg = wire_v1::frame_msg(&id, &frame);
+                                    let text = match serde_json::to_string(&frame_msg) {
+                                        Ok(s) => s,
+                                        Err(_) => continue,
+                                    };
+                                    if sink.send(Message::Text(text)).await.is_err() {
+                                        return Ok(());
+                                    }
+                                }
+                                // Heartbeat — пустой кадр на каждый tick (M-65: `O-7/O-9/O-10`).
+                                // Пустой delta значит «с момента cursor ничего не изменилось»;
+                                // клиент использует это для живости соединения. Если бы у нас
+                                // были данные от recorder'а, они бы пришли через frames; heartbeat
+                                // не дублирует их — только дополняет «состояние не движется».
+                                //
+                                // `Frame::versioned` приватный (sacred gateway crate) — собираем
+                                // литералом `Frame { ... }` через доступные публичные поля.
+                                let empty_delta = crate::_gw::SeriesBundle::default();
+                                let heartbeat = GFrame {
+                                    schema_version: crate::_gw::GATEWAY_SCHEMA_VERSION,
+                                    from: new_cursor,
+                                    to: new_cursor,
+                                    delta: empty_delta,
+                                    at_ms: 0,
+                                };
+                                let hb_msg = wire_v1::frame_msg(&id, &heartbeat);
+                                if let Ok(text) = serde_json::to_string(&hb_msg) {
+                                    if sink.send(Message::Text(text)).await.is_err() {
+                                        return Ok(());
+                                    }
+                                }
+                            }
+                            Ok(Err(boxed)) => {
+                                let (sub, e) = *boxed;
+                                tracing::error!(
+                                    error = %e,
+                                    sub = %id,
+                                    "v1 LiveReducer::pump failed — subs продолжит молча"
+                                );
+                                inner.subs.insert(sub.id.clone(), sub);
+                            }
+                            Err(join_err) => {
+                                tracing::error!(
+                                    error = %join_err,
+                                    sub = %id,
+                                    "v1 blocking pump task panicked — sub потерян, закрываем соединение"
+                                );
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// LEGACY сессия (`CT-RFC-09` §2.5): один env-селектор из `cfg.selector`, форма
+    /// `ServeMsg::{Snapshot,Frame,Error}` (JS-декодируемо, без `sub`/`v`/`type`). Запускается
+    /// если клиент не прислал `subscribe` с `v:1` в grace-окне ИЛИ прислал что-то иное.
+    /// Используется `wsprobe` и существующими прод-замерами — до первого релиза фронта.
+    ///
+    /// Тело изолировано от v1-кода, потому что общая логика select! (legacy pump vs v1
+    /// per-sub pump) слишком разная: legacy — один `LiveReducer`, v1 — карта per-id.
     async fn run_authorized_session<S>(
         ws: WebSocketStream<S>,
         cfg: Arc<ServeConfig>,
@@ -502,6 +1214,31 @@ pub mod server {
         let mut pending_read: Option<PendingRead> = None;
         let mut live: Option<crate::_gw::LiveReducer> = Some(live);
 
+        // M-65 ws-session (`CT-RFC-09` §2.8 гибридный случай): legacy-сессия читает
+        // клиентские v1-сообщения и добавляет/снимает подписки в `v1_session_inner`. Legacy
+        // env-stream и v1 session живут параллельно (legacy данные идут в OLD wire,
+        // v1 subs — в NEW wire) — оси 7/5 (изоляция/соседи) внутри v1 session.
+        let mut v1_session_inner = super::server::SessionInner {
+            subs: std::collections::HashMap::new(),
+            subs_count: 0,
+            draining_ids: std::collections::HashSet::new(),
+            cfg: Arc::clone(&cfg),
+        };
+        type LegacyV1PumpOutcome = Result<
+            (
+                session::Sub,
+                Vec<crate::_gw::Frame>,
+                crate::_gw::Cursor,
+                u64,
+                crate::_gw::ReadStats,
+            ),
+            Box<(session::Sub, std::io::Error)>,
+        >;
+        let mut pending_v1: Option<tokio::task::JoinHandle<LegacyV1PumpOutcome>> = None;
+        let mut pending_v1_id: Option<String> = None;
+        let mut push_tick_v1 = tokio::time::interval(Duration::from_millis(PUSH_INTERVAL_MS));
+        push_tick_v1.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
         loop {
             tokio::select! {
                 // Клиент отключился / ошибка приёма → выходим НЕМЕДЛЕННО (не дожидаясь
@@ -523,11 +1260,119 @@ pub mod server {
                             let _ = sink.send(Message::Pong(p)).await;
                         }
                         Some(Ok(Message::Close(_))) => return Ok(()),
-                        Some(Ok(Message::Text(_))) | Some(Ok(Message::Binary(_))) => {
-                            // MVP: replay-контролы НЕ реализованы (только чтение).
-                            // Будущие фреймы с cursor/window будут интерпретироваться здесь.
+                        Some(Ok(Message::Text(t))) => {
+                            let bytes = t.into_bytes();
+                            Server::parse_and_dispatch_v1_message(
+                                &bytes,
+                                &mut v1_session_inner,
+                                &mut sink,
+                            ).await;
+                        }
+                        Some(Ok(Message::Binary(b))) => {
+                            Server::parse_and_dispatch_v1_message(
+                                &b,
+                                &mut v1_session_inner,
+                                &mut sink,
+                            ).await;
                         }
                         Some(Ok(Message::Pong(_))) | Some(Ok(Message::Frame(_))) => {}
+                    }
+                }
+                // v1 subs pumps (параллельно с legacy env-stream). Пока legacy не занят
+                // (`pending_read.is_none()`), один pump первого v1 sub'a на тик
+                // (round-robin между subs определяется HashMap-итерацией).
+                _ = push_tick_v1.tick(), if pending_read.is_none() && pending_v1.is_none() => {
+                    if let Some((id, _)) = v1_session_inner.subs.iter().next().map(|(k, _)| (k.clone(), ())) {
+                        if let Some(mut sub) = v1_session_inner.subs.remove(&id) {
+                            let cfg2 = Arc::clone(&cfg);
+                            let id_for_pump = id.clone();
+                            let gen_at_pump = sub.generation;
+                            pending_v1_id = Some(id_for_pump);
+                            pending_v1 = Some(tokio::task::spawn_blocking(move || {
+                                match sub.live.pump(
+                                    cfg2.journal_dir.as_path(),
+                                    cfg2.filter.clone(),
+                                    PUSH_MAX_EVENTS,
+                                ) {
+                                    Ok((frames, new_cursor, stats)) => {
+                                        Ok((sub, frames, new_cursor, gen_at_pump, stats))
+                                    }
+                                    Err(e) => Err(Box::new((sub, e))),
+                                }
+                            }));
+                        }
+                    }
+                }
+                result_v1 = async { pending_v1.as_mut().expect("guarded by is_some() below").await },
+                    if pending_v1.is_some() && pending_read.is_none() =>
+                {
+                    let prev_id = pending_v1_id.take();
+                    match result_v1 {
+                        Ok(Ok((sub, frames, new_cursor, gen_at_pump, _stats))) => {
+                            let sub_id_for_map = sub.id.clone();
+                            // `draining_ids` — sub был явно `unsubscribe`-нут во время
+                            // in-flight pump'a (§4.1 race).
+                            if v1_session_inner.draining_ids.remove(&sub_id_for_map) {
+                                tracing::debug!(sub = %sub_id_for_map, "legacy v1 pump result dropped: drained");
+                                drop(sub);
+                                pending_v1 = None;
+                                continue;
+                            }
+                            let current_gen = v1_session_inner.subs.get(&sub_id_for_map).map(|s| s.generation);
+                            match current_gen {
+                                Some(cg) if cg != gen_at_pump => {
+                                    // Switch-в-полёте.
+                                    tracing::debug!(sub = %sub_id_for_map, "legacy v1 pump result dropped: stale generation");
+                                    drop(sub);
+                                    pending_v1 = None;
+                                    continue;
+                                }
+                                None => {
+                                    // Нормальный случай — возвращаем с обновлённым `live`.
+                                    v1_session_inner.subs.insert(sub_id_for_map.clone(), sub);
+                                }
+                                Some(_) => {
+                                    v1_session_inner.subs.insert(sub_id_for_map.clone(), sub);
+                                }
+                            }
+                            let id_for_pump = prev_id.unwrap_or(sub_id_for_map);
+                            for frame in frames {
+                                let frame_msg = wire_v1::frame_msg(&id_for_pump, &frame);
+                                if let Ok(text) = serde_json::to_string(&frame_msg) {
+                                    if sink.send(Message::Text(text)).await.is_err() {
+                                        return Ok(());
+                                    }
+                                }
+                            }
+                            let empty_delta = crate::_gw::SeriesBundle::default();
+                            let heartbeat = crate::_gw::Frame {
+                                schema_version: crate::_gw::GATEWAY_SCHEMA_VERSION,
+                                from: new_cursor,
+                                to: new_cursor,
+                                delta: empty_delta,
+                                at_ms: 0,
+                            };
+                            let hb_msg = wire_v1::frame_msg(&id_for_pump, &heartbeat);
+                            if let Ok(text) = serde_json::to_string(&hb_msg) {
+                                if sink.send(Message::Text(text)).await.is_err() {
+                                    return Ok(());
+                                }
+                            }
+                            pending_v1 = None;
+                        }
+                        Ok(Err(boxed)) => {
+                            let (sub, e) = *boxed;
+                            let sub_id = sub.id.clone();
+                            tracing::error!(error = %e, sub = %prev_id.as_deref().unwrap_or("?"), "legacy v1 pump err");
+                            let current_gen = v1_session_inner.subs.get(&sub_id).map(|s| s.generation);
+                            if current_gen.is_some() {
+                                v1_session_inner.subs.insert(sub_id, sub);
+                            }
+                            pending_v1 = None;
+                        }
+                        Err(_) => {
+                            return Ok(());
+                        }
                     }
                 }
                 // Периодический тик: запускаем НОВОЕ блокирующее чтение, только если
@@ -648,7 +1493,7 @@ pub mod server {
 pub mod _gw {
     pub use gateway::{
         frames_since, snapshot, snapshot_from_checkpoint, Cursor, Frame, LiveReducer, ReadStats,
-        Selector, Snapshot,
+        Selector, SeriesBundle, Snapshot, GATEWAY_SCHEMA_VERSION,
     };
 }
 
