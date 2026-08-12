@@ -32,7 +32,7 @@
 
 use contracts::{to_fixed, DataSource, EventKind, Level, MdPayload, Side, Venue};
 use futures_util::{SinkExt, StreamExt};
-use gateway::Selector;
+use gateway::{Cursor, Selector};
 use gateway_serve::auth::Claims;
 use gateway_serve::server::{bind, ServeConfig};
 use journal::{EpochFilter, Journal, WriterConfig};
@@ -128,6 +128,17 @@ const MANIFEST: &[(&str, u8, &str, char)] = &[
         "место под лимитом освобождено и переиспользуемо",
         'L',
     ),
+    (
+        "o2",
+        2,
+        "кадры идут только одной подписке из нескольких",
+        'V',
+    ),
+    ("o10", 8, "снятый id не подписывается повторно", 'V'),
+    ("o11", 9, "кадр синтезирован сервером, а не журналом", 'V'),
+    ("o11", 9, "кадр не отличим клиентом от настоящего", 'V'),
+    ("o11", 9, "кадр отражает события журнала", 'L'),
+    ("o11", 9, "молчание при отсутствии событий", 'L'),
 ];
 
 fn claims(id: &str, axis: u8, value: &str) {
@@ -219,6 +230,47 @@ fn seed(dir: &Path) {
     j.flush().expect("flush");
 }
 
+/// Дозапись событий в УЖЕ ОТКРЫТЫЙ журнал — то, чего в наборе не было и из-за чего он был
+/// неудовлетворим (`R-052` Б-3, разбор независимого Fable). `seed()` пишет всё ДО старта
+/// сервера, после подписки журнал не рос НИКОГДА, и в окнах, где оракул требовал сообщение,
+/// законным поведением было МОЛЧАНИЕ. Реализация, шлющая кадры только при наличии событий,
+/// пройти набор не могла ПО ПОСТРОЕНИЮ — и изобрела синтетический кадр вне `CT-RFC-09` §2.3.
+/// Оракул, вынуждающий подделать контракт, есть дефект ОРАКУЛА, а не реализации.
+fn append_more(dir: &Path, symbol: &str, n: i64, from_ms: i64) {
+    let mut j = Journal::open_with(dir, writer_cfg()).expect("reopen journal");
+    for i in 0..n {
+        j.append(EventKind::md(
+            Venue::Binance,
+            symbol,
+            MdPayload::Trade {
+                price: to_fixed(100.0 + i as f64),
+                size: to_fixed(0.5),
+                side: Side::Sell,
+                ts_exch_ms: from_ms + i,
+            },
+        ))
+        .expect("append more");
+    }
+    j.flush().expect("flush more");
+}
+
+/// ЭТАЛОН §4.6 — НЕЗАВИСИМЫЙ путь: `gateway::snapshot` строит состояние с нуля, не касаясь
+/// push-конвейера. До этой правки эталона в наборе не было ВООБЩЕ (`grep gateway::` давал
+/// единственную строку `use gateway::Selector`), поэтому ни один ассерт не проверял
+/// СОДЕРЖИМОЕ — только присутствие идентификаторов и типов, и пустой кадр с
+/// `SeriesBundle::default()` удовлетворял весь набор. §4.3 усл. 4 требовал эталон, а
+/// механизма не было: норма без механизма — это ноль, а не «частично сделано».
+fn reference_bars(dir: &Path, symbol: &str) -> usize {
+    let snap = gateway::snapshot(
+        dir,
+        EpochFilter::OwnCaptureOnly,
+        &sel_of(symbol),
+        Cursor { upto_seq: None },
+    )
+    .expect("эталон: gateway::snapshot");
+    snap.series.ohlcv.len()
+}
+
 async fn serve(dir: &Path, env_symbol: &str) -> String {
     let server = bind(config(dir, sel_of(env_symbol))).await.expect("bind");
     let addr = server.local_addr().to_string();
@@ -270,6 +322,21 @@ fn subscribe(id: &str, symbol: &str) -> Value {
 fn unsubscribe(id: &str) -> Value {
     json!({"op":"unsubscribe","v":1,"id":id})
 }
+/// Есть ли в сообщении ХОТЬ ЧТО-ТО, кроме пустых серий. Синтетический кадр отличается от
+/// настоящего ровно этим: у него все массивы пусты (`SeriesBundle::default()`), и до оси 9
+/// такой кадр удовлетворял ВЕСЬ набор — ассерты проверяли присутствие идентификаторов, а не
+/// содержимое. Проверка идёт по ПРОВОДНОЙ форме: клиент видит именно её.
+fn has_content(v: &Value) -> bool {
+    fn walk(v: &Value) -> bool {
+        match v {
+            Value::Array(a) => !a.is_empty() && a.iter().any(|x| !x.is_null()),
+            Value::Object(m) => m.values().any(walk),
+            _ => false,
+        }
+    }
+    v.get("data").map(walk).unwrap_or(false)
+}
+
 /// `sub` конверта (`CT-RFC-09` §2.3). Отсутствие поля — уже нарушение формы.
 fn sub_of(v: &Value) -> Option<&str> {
     v.get("sub").and_then(|s| s.as_str())
@@ -420,6 +487,29 @@ async fn o2_multiplex_subscriptions_are_independent() {
 
     send(&mut ws, subscribe("a", "BTCUSDT")).await;
     send(&mut ws, subscribe("b", "ETHUSDT")).await;
+
+    claims("o2", 2, "кадры идут только одной подписке из нескольких");
+    let _ = drain(&mut ws, 1_000).await; // снапшоты обеих подписок
+
+    // ПОТОКИ, а не присутствие идентификаторов. До этой правки O-2 считал, что `a` и `b`
+    // встретились среди сообщений, — но снапшот приходит ОБЕИМ подпискам мгновенно, ещё до
+    // вопроса о кадрах, поэтому реализация, пампящая на тик РОВНО ОДНУ подписку (`R-052` Б-1),
+    // проходила оракул. Событие пишется ОБОИМ инструментам, и кадры с содержимым обязаны
+    // прийти ОБЕИМ подпискам.
+    append_more(dir.path(), "BTCUSDT", 6, BASE_MS + 5_000);
+    append_more(dir.path(), "ETHUSDT", 6, BASE_MS + 5_000);
+    let live = drain(&mut ws, 4 * GRACE_MS + 2_000).await;
+    for id in ["a", "b"] {
+        assert!(
+            live.iter()
+                .any(|v| sub_of(v) == Some(id) && type_of(v) == Some("frame") && has_content(v)),
+            "O-2: подписка «{id}» не получила НИ ОДНОГО кадра с содержимым, хотя в её инструмент \
+             дописаны события. Мультиплекс — это независимые ПОТОКИ, а не два идентификатора в \
+             логе: реализация, отдающая на тик одну подписку, оставляет остальные жить одним \
+             снапшотом, и виджет пользователя замирает навсегда. Пришло: {:?}",
+            live.iter().filter_map(sub_of).collect::<Vec<_>>()
+        );
+    }
 
     let msgs = drain(&mut ws, 2_000).await;
     let subs: Vec<&str> = msgs.iter().filter_map(sub_of).collect();
@@ -648,6 +738,9 @@ async fn o7_selector_validation_keeps_connection_and_neighbours_alive() {
         );
     }
 
+    // События ПОСЛЕ подписки: без них «соседняя подписка продолжает поток» непроверяемо —
+    // молчание было бы законным, и оракул вынуждал бы синтезировать кадр (Б-3).
+    append_more(dir.path(), "BTCUSDT", 6, BASE_MS + 1_000);
     // Соседняя подписка жива после серии отказов.
     let neighbour = drain(&mut ws, 2_000).await;
     assert!(
@@ -753,6 +846,7 @@ async fn o9_connections_are_isolated() {
     send(&mut b, subscribe("w", "ETHUSDT")).await;
     let _ = drain(&mut b, 1_000).await;
 
+    append_more(dir.path(), "BTCUSDT", 6, BASE_MS + 2_000);
     let a_tail = drain(&mut a, 2_500).await;
     assert!(
         !a_tail.is_empty(),
@@ -788,6 +882,8 @@ async fn o10_unsubscribe_stops_sub_and_frees_capacity() {
     send(&mut ws, subscribe("stay", "ETHUSDT")).await;
     let _ = drain(&mut ws, 1_500).await;
 
+    append_more(dir.path(), "BTCUSDT", 6, BASE_MS + 3_000);
+    append_more(dir.path(), "ETHUSDT", 6, BASE_MS + 3_000);
     send(&mut ws, unsubscribe("gone")).await;
     let tail = drain(&mut ws, 2_500).await;
     assert!(
@@ -820,6 +916,25 @@ async fn o10_unsubscribe_stops_sub_and_frees_capacity() {
             .collect::<Vec<_>>()
     );
 
+    // Снятый id обязан ПОДПИСЫВАТЬСЯ ПОВТОРНО. Без этого O-10 проверял освобождение места
+    // ЧУЖИМИ идентификаторами и пропускал «вечное надгробие» (`R-052` Б-2): помеченный id
+    // глушит любую будущую подписку с тем же именем, а клиент назначает id сам (§2.2) и
+    // законно переиспользует их при перерисовке виджета.
+    claims("o10", 8, "снятый id не подписывается повторно");
+    send(&mut ws, subscribe("gone", "BTCUSDT")).await;
+    let _ = drain(&mut ws, 1_000).await;
+    append_more(dir.path(), "BTCUSDT", 6, BASE_MS + 20_000);
+    let revived = drain(&mut ws, 4 * GRACE_MS + 2_000).await;
+    assert!(
+        revived
+            .iter()
+            .any(|v| sub_of(v) == Some("gone") && type_of(v) == Some("frame") && has_content(v)),
+        "O-10: подписка с ранее снятым id «gone» не получила кадров с содержимым — id отравлен \
+         до конца соединения. Клиент назначает идентификаторы сам и переиспользует их; \
+         одноразовый id означает, что перерисовка виджета молча перестаёт работать. Пришло: {:?}",
+        revived.iter().filter_map(sub_of).collect::<Vec<_>>()
+    );
+
     // Повторный/неизвестный `unsubscribe` — `error` с кодом (решение спеки §4.2): «успех» на
     // снятии того, чего нет, сделал бы клиентскую бухгалтерию подписок недоказуемой.
     send(&mut ws, unsubscribe("gone")).await;
@@ -829,5 +944,62 @@ async fn o10_unsubscribe_stops_sub_and_frees_capacity() {
         "O-10: повторный `unsubscribe` уже снятой подписки прошёл молча. Решение спеки §4.2 — \
          `error` с кодом: клиент обязан отличать «снял» от «не было», иначе его учёт подписок \
          недоказуем. Пришло: {repeat:?}"
+    );
+}
+
+// ─── O-11: происхождение содержимого кадра (ось 9, `R-052` Б-3) ─────────────────────────
+#[tokio::test]
+async fn o11_frames_come_from_journal_not_synthesis() {
+    claims("o11", 9, "кадр синтезирован сервером, а не журналом");
+    claims("o11", 9, "кадр не отличим клиентом от настоящего");
+    claims("o11", 9, "кадр отражает события журнала");
+    claims("o11", 9, "молчание при отсутствии событий");
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    seed(dir.path());
+    let addr = serve(dir.path(), "BTCUSDT").await;
+    let mut ws = connect(&addr).await;
+
+    send(&mut ws, subscribe("w", "BTCUSDT")).await;
+    let _snap = recv(&mut ws).await.expect("snapshot подписки");
+    let _ = drain(&mut ws, 1_000).await; // добираем засеянный бэклог
+
+    // (1) МОЛЧАНИЕ — законное поведение: журнал не растёт, отдавать нечего.
+    let quiet = drain(&mut ws, 3 * GRACE_MS + 1_200).await;
+    let fabricated: Vec<&Value> = quiet
+        .iter()
+        .filter(|v| type_of(v) == Some("frame") && !has_content(v))
+        .collect();
+    assert!(
+        fabricated.is_empty(),
+        "O-11: сервер прислал {} кадр(ов) с ПУСТЫМ содержимым, хотя в журнале не произошло \
+         ничего. Кадр, синтезированный сервером, клиент не отличит от настоящего: у него нет \
+         ни одного признака, и он перерисует виджет по пустоте. Цена не только семантическая \
+         — 311 байт × 4/с × 10 000 соединений ≈ 100 Мбит/с чистой пустоты, нижняя граница \
+         всего бюджета egress по DESIGN §16 на РЕАЛЬНЫЕ данные со сжатием. Примеры: {:?}",
+        fabricated.len(),
+        fabricated.iter().take(2).collect::<Vec<_>>()
+    );
+
+    // (2) Появились события — обязан прийти кадр, и его содержимое обязано их отражать.
+    let before = reference_bars(dir.path(), "BTCUSDT");
+    append_more(dir.path(), "BTCUSDT", 8, BASE_MS + 10_000);
+    let after = reference_bars(dir.path(), "BTCUSDT");
+    assert!(
+        after > before,
+        "SETUP НЕ СОСТОЯЛСЯ: независимый эталон не вырос ({before} → {after}) — дозапись не \
+         дошла до журнала, и проверять происхождение кадра не на чем"
+    );
+
+    let live = drain(&mut ws, 4 * GRACE_MS + 1_500).await;
+    let real: Vec<&Value> = live
+        .iter()
+        .filter(|v| type_of(v) == Some("frame") && sub_of(v) == Some("w") && has_content(v))
+        .collect();
+    assert!(
+        !real.is_empty(),
+        "O-11: журнал вырос ({before} → {after} баров по НЕЗАВИСИМОМУ эталону \
+         gateway::snapshot), а подписка не получила ни одного кадра с содержимым. Пришло: {:?}",
+        live.iter().take(3).collect::<Vec<_>>()
     );
 }
