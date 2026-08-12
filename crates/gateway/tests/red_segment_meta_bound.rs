@@ -89,8 +89,18 @@ const MANIFEST: &[(&str, u8, &str, char)] = &[
     ("sm5", 4, "каталог не менялся — переучёта нет", 'L'),
     ("sm6", 5, "состояние общее на каталог", 'V'),
     ("sm6", 5, "две сессии независимы", 'L'),
-    ("sm8", 4, "посегментная компакция стирает сегмент из кеша", 'V'),
-    ("sm9", 4, "промежуточное состояние компакции даёт дубль индекса", 'V'),
+    (
+        "sm8",
+        4,
+        "посегментная компакция стирает сегмент из кеша",
+        'V',
+    ),
+    (
+        "sm9",
+        4,
+        "промежуточное состояние компакции даёт дубль индекса",
+        'V',
+    ),
     ("sm10", 4, "посторонний файл в каталоге", 'L'),
 ];
 
@@ -702,7 +712,11 @@ fn sm8_per_segment_compaction_keeps_catalog_truthful() {
 
 #[test]
 fn sm9_compaction_midstate_does_not_duplicate_index() {
-    claims("sm9", 4, "промежуточное состояние компакции даёт дубль индекса");
+    claims(
+        "sm9",
+        4,
+        "промежуточное состояние компакции даёт дубль индекса",
+    );
 
     let (dir, _n) = build_prod_form(N_SEGMENTS);
     let (mut cat, _ops) = journal::SegmentCatalog::open(dir.path()).expect("catalog open");
@@ -761,7 +775,11 @@ fn sm10_foreign_file_does_not_break_session() {
     // Файлы, которые пишет САМ проект в тот же каталог: journal.meta.tmp — каждые 64 события
     // recorder'а (journal/src/lib.rs:350-353 ← flush() :305); segment-*.jrnl.zst.tmp — живёт
     // МИНУТЫ при компакции (segments.rs:3886); replay-digest.tmp — cron 04:07.
-    for foreign in ["journal.meta.tmp", "segment-00000002.jrnl.zst.tmp", "replay-digest.tmp"] {
+    for foreign in [
+        "journal.meta.tmp",
+        "segment-00000002.jrnl.zst.tmp",
+        "replay-digest.tmp",
+    ] {
         fs::write(dir.path().join(foreign), b"x").expect("создать посторонний файл");
         let before = truth_indices(dir.path());
         let res = cat.is_fresh(dir.path());

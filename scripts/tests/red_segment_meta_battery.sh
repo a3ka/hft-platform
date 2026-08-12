@@ -14,6 +14,15 @@
 # рабочее: прод-исходники не трогаются ни на одну секунду. Копия одна и переиспользуется —
 # иначе каждый мутант тянул бы полную компиляцию зависимостей.
 #
+# РАЗЛИЧИЕ, КОТОРОГО МЕХАНИЗМ НЕ ВИДИТ, И ПОТОМУ ОНО НАЗВАНО ЗДЕСЬ. Сценарий может попасть в
+# kill-set ДВУМЯ разными способами: (а) он проверил инвариант и тот нарушен — настоящий «kill»;
+# (б) он умер на SETUP-GUARD'е, потому что мутант сделал предпосылку сценария недостижимой.
+# Второе — случай `nocache` против `sm8`/`sm9`: эти сценарии стерегут ИНКРЕМЕНТАЛЬНУЮ ветку и
+# требуют `is_fresh == true`, а `nocache` по определению форсит `false`. Под ним они не могут
+# не упасть по построению. Включать их в kill-set правильно (иначе батарея краснеет на честном
+# мутанте), но записью «пиннит дыру» это НЕ является: инвариант там не проверялся. Равенство
+# множеств различить (а) от (б) не умеет — предел конструкции, а не недосмотр.
+#
 # АТРИБУЦИЯ ПО KILL-SET'У (урок M-61, `R-052` Б-4bis + адверсарный круг 11.08). Мутант обязан
 # уронить РОВНО объявленные тесты — ни больше, ни меньше:
 #   больше ⇒ мутант сломан сверх своей оси и доказывает не ту дыру (класс `quotedname`);
@@ -67,7 +76,7 @@ die()  { echo "SETUP НЕ СОСТОЯЛСЯ: $*" >&2; exit 1; }
 # ─── МАНИФЕСТ: мутант|ось/значение|ОБЯЗАН уронить (kill-set) ─────────────────────────
 # Оси — из §4.2 спеки; kill-set — имена тестов `red_segment_meta_bound`.
 MANIFEST="
-nocache|1 O(N) на каждом тике|sm2_steady_tick_is_independent_of_segment_count sm5_compaction_is_noticed_and_quiet_dir_is_not_rescanned sm6_two_sessions_alternating_ticks_stay_within_budget
+nocache|1 O(N) на каждом тике|sm2_steady_tick_is_independent_of_segment_count sm5_compaction_is_noticed_and_quiet_dir_is_not_rescanned sm6_two_sessions_alternating_ticks_stay_within_budget sm8_per_segment_compaction_keeps_catalog_truthful sm9_compaction_midstate_does_not_duplicate_index
 staleforever|4 кеш без инвалидации|sm4_new_segment_between_ticks_is_noticed
 countfake|3 счётчик считает вызовы, а не операции|sm1_counter_measures_operations_not_calls sm3_first_tick_legitimately_pays_full_price
 "
