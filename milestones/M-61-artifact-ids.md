@@ -191,7 +191,7 @@ F-1).** Абсолютная формулировка неисполнима н�
 | `originonly` — аллокатор перечисляет ref'ы без `refs/heads` | 3 / `только origin, локальный head пропущен` | N3LOCAL N3HEAD N3TD |
 | `headsonly` — аллокатор перечисляет ref'ы без `refs/remotes/origin` | 3 / `только refs/heads, origin пропущен` | N3ORIG |
 | `bheadsonly` — БАРЬЕР перечисляет ref'ы без `refs/remotes/origin` | 3 / `только refs/heads, origin пропущен` | B3ORIG |
-| `namesonly` — слеп к записям `TECH-DEBT.md` | 2 / `запись в TECH-DEBT.md` | B1TD |
+| `namesonly` — слеп к записям `TECH-DEBT.md` | 2 / `запись в TECH-DEBT.md` | B1TD B2BRACKET B2ERE B2WS |
 | `renameblind` — не видит переименования в занятый номер | 4 / `переименование в занятый номер` | B4REN |
 | `quotedname` — читает пути построчно вместо `-z` | 4 / `имя, требующее квотирования` | B4Q |
 | `touchcounts` — считает `M` (правку) введением предмета | 4 / `правка существующего артефакта` | L4MOD |
