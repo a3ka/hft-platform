@@ -56,6 +56,12 @@ MANIFEST="
 B1TD|1|V|TD
 B1TD|2|V|запись в TECH-DEBT.md
 B1TD|4|V|новая запись в TECH-DEBT.md
+B2ERE|2|V|запись в TECH-DEBT.md
+B2ERE|4|V|новая запись в TECH-DEBT.md
+B2BRACKET|2|V|запись в TECH-DEBT.md
+B2BRACKET|4|V|новая запись в TECH-DEBT.md
+B2WS|2|V|запись в TECH-DEBT.md
+B2WS|4|V|новая запись в TECH-DEBT.md
 B1R|1|V|R
 B1R|2|V|имя файла
 B1R|4|V|новый файл
@@ -300,6 +306,35 @@ echo "барьер: ${BARRIER}"; echo "аллокатор: ${ALLOC}"; echo "сп
 R="$(mk_repo b1td)"; td_entry "$R" TD-200 "первый-предмет"; commit_all "$R" base2
 B="$(cd "$R" && git rev-parse HEAD)"; td_entry "$R" TD-200 "совсем-другой-предмет"; commit_all "$R" "второй TD-200"
 expect_block B1TD "$R" "$B" "TD-200 второй записью в TECH-DEBT.md (класс TD · носитель — запись)"
+
+# B2ERE / B2BRACKET / B2WS — ФОРМА ДАННЫХ слага долга (Б-6, `R-054`; категория (i) §4.4:
+# новые значения известных осей 2 и 4, перечень осей не пересматривается).
+#
+# Сценарий `B1TD` покрывал ось 2 слагом `совсем-другой-предмет` — формой «счастливого пути»
+# без единого метасимвола, и потому был слеп к тому, что канал сравнения интерпретирует
+# ДАННЫЕ как ШАБЛОН. Замер reviewer'а по `origin/main`: 6 слагов из 111 (5.4 %) уже несут
+# ERE-метасимволы, а на реальном `TD-3` (`[verify-at-impl]`) grep падает с «Invalid range end»,
+# и падение игнорируется — различались только «нашёл / не нашёл». Барьер печатал
+# affirmative-«OK», exit 0, НА НАСТОЯЩЕЙ КОЛЛИЗИИ: направление отказа противоположно смыслу
+# механизма, вся ценность которого в fail-closed.
+#
+# Третья форма — краевой пробел: `read -r` без `IFS=` срезает хвостовой пробел, и строка,
+# которая в файле ЕСТЬ, не находится. Дефект другой, поэтому и сценарий отдельный, и мутант
+# отдельный (`tdtrim` против `tdregex`).
+R="$(mk_repo b2ere)"; td_entry "$R" TD-210 "предмет-соседней-ветки"; commit_all "$R" base2
+B="$(cd "$R" && git rev-parse HEAD)"
+td_entry "$R" TD-210 "метаданные-путь-O(число-сегментов)-на-тик"; commit_all "$R" "второй TD-210 со скобками"
+expect_block B2ERE "$R" "$B" "слаг долга с круглыми скобками — данные, а не шаблон"
+
+R="$(mk_repo b2bracket)"; td_entry "$R" TD-220 "предмет-соседней-ветки"; commit_all "$R" base2
+B="$(cd "$R" && git rev-parse HEAD)"
+td_entry "$R" TD-220 "[verify-at-impl]"; commit_all "$R" "второй TD-220 — реальный слаг TD-3 из main"
+expect_block B2BRACKET "$R" "$B" "слаг долга в квадратных скобках (реальная форма из main)"
+
+R="$(mk_repo b2ws)"; td_entry "$R" TD-230 "предмет-соседней-ветки"; commit_all "$R" base2
+B="$(cd "$R" && git rev-parse HEAD)"
+td_entry "$R" TD-230 "мой-предмет "; commit_all "$R" "второй TD-230 с хвостовым пробелом"
+expect_block B2WS "$R" "$B" "слаг долга с краевым пробелом — read без IFS= его срезает"
 
 R="$(mk_repo b1r)"; art "$R" research/reviews/R-200-alpha.md ""; commit_all "$R" base2
 B="$(cd "$R" && git rev-parse HEAD)"; art "$R" research/reviews/R-200-beta.md ""; commit_all "$R" "второй R-200"

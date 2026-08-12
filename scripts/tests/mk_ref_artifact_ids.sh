@@ -105,12 +105,27 @@ introduced() {
       git cat-file -e "HEAD:$f" 2>/dev/null || continue
       printf '%s %s\n' "$cn" "$(subject_of "HEAD:$f")"
     done < <(git show --cc --name-only --no-renames --diff-filter=A -z --format= "$c" 2>/dev/null)
-    # новые записи TECH-DEBT.md этого коммита — и только те, что дожили до HEAD
+    # Новые записи TECH-DEBT.md этого коммита — и только те, что дожили до HEAD.
+    #
+    # СРАВНИВАЮТСЯ ДАННЫЕ, А НЕ ШАБЛОНЫ (Б-6, `R-054`). Прежняя редакция подставляла слаг
+    # долга в ERE: `grep -qE "…\`${tsubj}\`"`. Слаг с метасимволом переставал совпадать САМ
+    # С СОБОЙ, grep возвращал не-0, кандидат МОЛЧА выпадал — и барьер печатал «ни один
+    # артефакт не введён», exit 0, на настоящей коллизии. Замер reviewer'а: 6 слагов из 111
+    # в `origin/main` (5.4 %) уже несут метасимволы, а на реальном `TD-3` (`[verify-at-impl]`)
+    # grep падает с «Invalid range end» — и падение игнорируется, потому что различались
+    # только «нашёл / не нашёл». Направление отказа было выбрано ПРОТИВОПОЛОЖНО смыслу
+    # барьера, вся ценность которого в fail-closed.
+    #
+    # Обе стороны теперь проходят ОДИН И ТОТ ЖЕ разбор, сверка — по точной строке (`-qxF`).
+    # `IFS= read -r` сохраняет краевые пробелы: прежний `read -r tcls tnum tsubj` их срезал,
+    # и строка, которая в файле ЕСТЬ, не находилась (третье воспроизведение Б-6).
+    head_td="$(git show "HEAD:TECH-DEBT.md" 2>/dev/null \
+      | sed -nE 's/^- \*\*TD-0*([0-9]+)\*\* `([^`]+)`.*/\1 \2/p')"
     git show "$c" -- TECH-DEBT.md 2>/dev/null \
-      | sed -nE 's/^\+- \*\*TD-0*([0-9]+)\*\* `([^`]+)`.*/TD \1 \2/p' \
-      | while read -r tcls tnum tsubj; do
-          git show "HEAD:TECH-DEBT.md" 2>/dev/null \
-            | grep -qE "^- \*\*TD-0*${tnum}\*\* \`${tsubj}\`" && printf '%s %s %s\n' "$tcls" "$tnum" "$tsubj"
+      | sed -nE 's/^\+- \*\*TD-0*([0-9]+)\*\* `([^`]+)`.*/\1 \2/p' \
+      | while IFS= read -r td_line; do
+          [ -n "$td_line" ] || continue
+          printf '%s\n' "$head_td" | grep -qxF -- "$td_line" && printf 'TD %s\n' "$td_line"
         done
   done
 }
@@ -250,6 +265,14 @@ s|printf '%s %s\\n' "$cn" "$(subject_of "$c:$f")"|sb="$(subject_of "$c:$f")"; [ 
 EOF
 BODY_SLUGSKIP="$(mutate "$SED_SLUGSKIP")"
 
+# tdregex — ДАННЫЕ слага интерпретируются как ШАБЛОН (Б-6, `R-054`). Это дословно прежняя
+# редакция: одна замена `-qxF` на `-qE` возвращает fail-open, при котором барьер печатал
+# «OK» на настоящей коллизии. Мутант закрепляет дыру, чтобы её нельзя было починить «один раз».
+BODY_TDREGEX="$(mutate 's|grep -qxF -- "\$td_line"|grep -qE -- "$td_line"|')"
+# tdtrim — краевой пробел слага срезается чтением (третье воспроизведение Б-6): дефект ДРУГОЙ,
+# поэтому и мутант отдельный — иначе один kill-set покрывал бы два разных класса.
+BODY_TDTRIM="$(mutate 's|while IFS= read -r td_line|while read -r td_line|')"
+
 # вариант : check(subject, body) + next
 emit ref-check.sh          "$SUBJ_FULL"       "$BODY_CHECK"
 emit showall-check.sh      "$SUBJ_FULL"       "$BODY_SHOWALL"
@@ -277,6 +300,8 @@ emit namesonly-check.sh    "$SUBJ_FULL"       "$BODY_NAMESONLY"
 emit absolute-check.sh     "$SUBJ_FULL"       "$BODY_ABSOLUTE"
 emit rangeblind-check.sh   "$SUBJ_FULL"       "$BODY_RANGEBLIND"
 emit slugskip-check.sh     "$SUBJ_FULL"       "$BODY_SLUGSKIP"
+emit tdregex-check.sh      "$SUBJ_FULL"       "$BODY_TDREGEX"
+emit tdtrim-check.sh       "$SUBJ_FULL"       "$BODY_TDTRIM"
 
 # Аллокаторы. Список ВЫВОДИТСЯ из построенных барьеров, а не дублируется руками: прежний
 # захардкоженный перечень — то же ручное соответствие, что дрейфовало везде (A-006 §2.5).
