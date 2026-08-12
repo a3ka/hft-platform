@@ -33,7 +33,7 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 GC="${GC_UNDER_TEST:-${ROOT}/scripts/gc_worktrees.sh}"
 FAILED=0
 RAN=0
-EXPECT_SCENARIOS=8
+EXPECT_SCENARIOS=11
 
 pass() { echo "PASS  $*"; }
 fail() { echo "FAIL  $*"; FAILED=$((FAILED + 1)); }
@@ -71,10 +71,15 @@ mk_sandbox() {
   printf '%s\n' "$s"
 }
 
-# run_gc <sandbox> <args...> → печатает вывод, возвращает exit-код скрипта
+# run_gc_with <скрипт> <sandbox> <args...> → печатает вывод, возвращает exit-код скрипта
+run_gc_with() {
+  local script="$1" s="$2"; shift 2
+  ( cd "$s/repo" && PATH="$s/bin:$PATH" timeout 60 bash "$script" "$@" 2>&1 )
+}
+# run_gc <sandbox> <args...> — то же для скрипта под тестом
 run_gc() {
   local s="$1"; shift
-  ( cd "$s/repo" && PATH="$s/bin:$PATH" timeout 60 bash "$GC" "$@" 2>&1 )
+  run_gc_with "$GC" "$s" "$@"
 }
 
 # Проверка обеих сторон порога после ГОДНОГО прогона.
@@ -158,6 +163,63 @@ if [ "$RC" -eq 0 ] && printf '%s' "$OUT" | grep -qE '^WOULD-RECLAIM' \
 else
   fail "DRY-PLUS-RECLAIM: exit=$RC, WOULD-RECLAIM в выводе=$(printf '%s' "$OUT" | grep -cE '^WOULD-RECLAIM') \
 — порядок флагов не смеет молча отменять режим"
+fi
+rm -rf "$S"
+
+# ─── ПЕРЕПОЛНЕНИЕ: валидация обязана совпадать со СВОИМ ПОТРЕБИТЕЛЕМ ─────────────────────
+# R-058 Б-1rev2. Текстовая проверка «только цифры» пропускает любую строку цифр, а `[ -lt ]`
+# парсит лишь до intmax — за границей `[` возвращает 2, и управление проваливается в rm -rf.
+# Ровно диагноз первого круга, сдвинутый на одну границу правее.
+RAN=$((RAN + 1))
+S="$(mk_sandbox)" || setup_fail "песочница OVERFLOW"
+OUT="$(run_gc "$S" --reclaim 99999999999999999999)"; RC=$?
+if [ "$RC" -ne 0 ] && alive "$S/wt-fresh" && alive "$S/wt-idle"; then
+  pass "OVERFLOW «20 цифр»: отказ (exit=$RC), кэш цел"
+else
+  fail "OVERFLOW «20 цифр»: exit=$RC, свежий=$(alive "$S/wt-fresh" && echo цел || echo СНЕСЁН) — \
+цифровой порог за intmax роняет сравнение так же, как «3ч»"
+fi
+rm -rf "$S"
+
+# Граница снимается ТОЧНО, а не «где-то там»: ровно intmax обязан РАБОТАТЬ, иначе фикс
+# ужесточён мимо цели и мы получили бы отказ на легитимном входе.
+RAN=$((RAN + 1))
+S="$(mk_sandbox)" || setup_fail "песочница INTMAX"
+OUT="$(run_gc "$S" --reclaim 9223372036854775807)"; RC=$?
+if [ "$RC" -eq 0 ] && alive "$S/wt-fresh" && alive "$S/wt-idle"; then
+  pass "INTMAX «9223372036854775807»: принят, оба дерева KEEP-CACHE (граница не съехала внутрь)"
+else
+  fail "INTMAX: exit=$RC — ровно intmax обязан парситься; отказ здесь значит, что валидация \
+строже своего потребителя, то есть ошибка в другую сторону"
+fi
+rm -rf "$S"
+
+# ─── КЛАСС, А НЕ ЭКЗЕМПЛЯР: второй барьер держит САМ, без валидации ──────────────────────
+# Два круга подряд закрывались добавлением ещё одной проверки ВХОДА — и оба раза находился
+# вход, который проверку обходит. Форм входа бесконечно много; поэтому предмет этого
+# сценария не форма, а КОНСТРУКЦИЯ: удаление требует утвердительного «да» (`-ge` истинно),
+# а не отсутствия «нет». Мутант с ВЫКЛЮЧЕННОЙ валидацией обязан всё равно не удалять на
+# входе, который роняет сравнение. Это и есть проверка того, что барьеров ДВА и они
+# независимы: если сценарий краснеет, значит валидация — единственный несущий страж,
+# и любая будущая правка, ослабившая её, снова откроет rm -rf.
+RAN=$((RAN + 1))
+S="$(mk_sandbox)" || setup_fail "песочница CLASS-SECOND-BARRIER"
+MUT="$S/gc-novalidate.sh"
+sed 's/^validate_threshold() {/validate_threshold() { return 0;/' "$GC" >"$MUT"
+if ! grep -q 'validate_threshold() { return 0;' "$MUT"; then
+  setup_fail "CLASS-SECOND-BARRIER: мутация НЕ применилась — сценарий проверял бы \
+неизменённый скрипт и был бы зелёным по построению (плацебо самого себя)"
+else
+  OUT="$(run_gc_with "$MUT" "$S" --reclaim 3ч)"; RC=$?
+  if alive "$S/wt-fresh" && alive "$S/wt-idle" \
+     && ! printf '%s' "$OUT" | grep -qE '^RECLAIMED'; then
+    pass "CLASS-SECOND-BARRIER: при выключенной валидации негодный порог НЕ удаляет (exit=$RC) \
+— несущих стража два, и они независимы"
+  else
+    fail "CLASS-SECOND-BARRIER: свежий=$(alive "$S/wt-fresh" && echo цел || echo СНЕСЁН), \
+состаренный=$(alive "$S/wt-idle" && echo цел || echo СНЕСЁН). Валидация — ЕДИНСТВЕННЫЙ страж \
+разрушительного пути: класс не закрыт, закрыты лишь перечисленные формы входа"
+  fi
 fi
 rm -rf "$S"
 
