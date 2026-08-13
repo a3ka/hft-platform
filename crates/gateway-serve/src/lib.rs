@@ -440,6 +440,28 @@ pub mod server {
     /// итерации гуляет, и при выборе `iter().next()` (как в реализации до M-65 round 2)
     /// только ОДНА из подписок получала кадры (`R-057` Б-1: «за 5 c кадров: a=21, b=0»).
     /// См. `gates.md` §8 — «доменный код не итерирует HashMap без сортировки в редьюсерах».
+    /// Тип JoinHandle для v1-выполнения pump'a (`Б-1` мультиплекс, `R-057`). Каждый pump —
+    /// `spawn_blocking`-future, возвращающая `(sub_id, Result<...>)`; `FuturesUnordered`
+    /// собирает их в одну очередь завершения для `select!` без per-id веток.
+    pub type V1PumpJoin =
+        tokio::task::JoinHandle<(String, V1PumpResult)>;
+    /// Результат v1-pump'a: ok = (sub, frames, cursor, gen_at_pump, stats); err = боксированный
+    /// sub с ошибкой (нужен для восстановления состояния при pump-ошибке).
+    pub type V1PumpResult = Result<
+        (
+            session::Sub,
+            Vec<crate::_gw::Frame>,
+            crate::_gw::Cursor,
+            u64,
+            crate::_gw::ReadStats,
+        ),
+        Box<(session::Sub, std::io::Error)>,
+    >;
+    /// Тип FuturesUnordered, агрегирующий in-flight pump'ы. `BTreeSet<String>` отдельно
+    /// (поле `pending_ids`) — id'ы в полёте; используется для дешёвой проверки «уже качается»
+    /// перед новым spawn_blocking.
+    pub type V1PumpFutures = futures_util::stream::FuturesUnordered<V1PumpJoin>;
+
     pub struct SessionInner {
         /// Подписки на соединении. `BTreeMap` — детерминированный обход и тест «выбор на тик»
         /// (DET-I-1, `R-057` Б-1).
@@ -458,21 +480,7 @@ pub mod server {
         /// без него пришлось бы держать фиксированный массив `pending: [Option<JoinHandle>; 16]`
         /// (`max_subscriptions_per_connection`), и каждое соединение получило бы
         /// `select!` с 16 ветвями.
-        pending: futures_util::stream::FuturesUnordered<
-            tokio::task::JoinHandle<(
-                String,
-                Result<
-                    (
-                        session::Sub,
-                        Vec<crate::_gw::Frame>,
-                        crate::_gw::Cursor,
-                        u64,
-                        crate::_gw::ReadStats,
-                    ),
-                    Box<(session::Sub, std::io::Error)>,
-                >,
-            )>,
-        >,
+        pending: V1PumpFutures,
         /// id'ы, у которых сейчас есть in-flight pump — для дешёвой проверки «качать на тик»
         /// (задача #2 / `O-2` / `R-057` Б-1: «выбор подписки на тик ДЕТЕРМИНИРОВАН»). На тик
         /// pump'ятся ВСЕ подписки без in-flight pump'а. `BTreeSet` — детерминированный обход.
@@ -940,18 +948,10 @@ pub mod server {
         let mut push_tick = tokio::time::interval(Duration::from_millis(PUSH_INTERVAL_MS));
         push_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-        type V1PumpOutcome = Result<
-            (
-                session::Sub,
-                Vec<crate::_gw::Frame>,
-                crate::_gw::Cursor,
-                u64,
-                crate::_gw::ReadStats,
-            ),
-            Box<(session::Sub, std::io::Error)>,
-        >;
-        type V1PumpHandle = tokio::task::JoinHandle<(String, V1PumpOutcome)>;
-        type V1PumpBody = (String, V1PumpOutcome);
+        // M-65 round 2 Б-1 (`R-057`): типы вынесены в module-level псевдонимы
+        // (`V1PumpJoin`/`V1PumpResult` выше), чтобы удовлетворить `clippy::type_complexity`
+        // (один JoinHandle<Result<5-tuple>> в сигнатуре структуры — порог комплексности).
+        type V1PumpBody = (String, V1PumpResult);
         // M-65 round 2 Б-1 (`R-057`): мультиплекс на одном соединении. ОДНА in-flight pump
         // на соединение (как раньше) давала только одной подписке кадры на тик, остальные
         // жили одним снапшотом. Теперь pump'ятся ВСЕ подписки без in-flight pump'а на КАЖДОМ
@@ -1029,8 +1029,8 @@ pub mod server {
                         let cfg2 = Arc::clone(&inner.cfg);
                         let id_for_pump = id.clone();
                         let gen_at_pump = sub.generation;
-                        let handle: V1PumpHandle = tokio::task::spawn_blocking(move || {
-                            let outcome: V1PumpOutcome = match sub.live.pump(
+                        let handle: V1PumpJoin = tokio::task::spawn_blocking(move || {
+                            let outcome: V1PumpResult = match sub.live.pump(
                                 cfg2.journal_dir.as_path(),
                                 cfg2.filter.clone(),
                                 PUSH_MAX_EVENTS,
@@ -1292,22 +1292,14 @@ pub mod server {
             pending_ids: std::collections::BTreeSet::new(),
             cfg: Arc::clone(&cfg),
         };
-        type LegacyV1PumpOutcome = Result<
-            (
-                session::Sub,
-                Vec<crate::_gw::Frame>,
-                crate::_gw::Cursor,
-                u64,
-                crate::_gw::ReadStats,
-            ),
-            Box<(session::Sub, std::io::Error)>,
-        >;
-        type LegacyV1PumpBody = (String, LegacyV1PumpOutcome);
-        type LegacyV1PumpHandle = tokio::task::JoinHandle<LegacyV1PumpBody>;
+        // M-65 round 2 Б-1 (`R-057`): legacy-путь (v1 subs внутри legacy сессии) использует
+        // ТЕ ЖЕ типы, что и v1-путь (`V1PumpJoin`/`V1PumpResult`) — никакой разницы в форме
+        // pump'а между режимами, только в канале отправки (legacy `Sink<...>` общий).
+        type LegacyV1PumpBody = (String, V1PumpResult);
         // M-65 round 2 Б-1 (`R-057`): см. `run_v1_session_loop`. На тик — pump ВСЕХ v1-подписок
         // без in-flight pump'а; параллельно с legacy env-stream (тот по-прежнему один на тик).
         use futures_util::stream::FuturesUnordered;
-        let mut pending_v1: FuturesUnordered<LegacyV1PumpHandle> = FuturesUnordered::new();
+        let mut pending_v1: FuturesUnordered<V1PumpJoin> = FuturesUnordered::new();
         let mut push_tick_v1 = tokio::time::interval(Duration::from_millis(PUSH_INTERVAL_MS));
         push_tick_v1.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -1366,8 +1358,8 @@ pub mod server {
                         let cfg2 = Arc::clone(&cfg);
                         let id_for_pump = id.clone();
                         let gen_at_pump = sub.generation;
-                        let handle: LegacyV1PumpHandle = tokio::task::spawn_blocking(move || {
-                            let outcome: LegacyV1PumpOutcome =
+                        let handle: V1PumpJoin = tokio::task::spawn_blocking(move || {
+                            let outcome: V1PumpResult =
                                 match sub.live.pump(
                                     cfg2.journal_dir.as_path(),
                                     cfg2.filter.clone(),
