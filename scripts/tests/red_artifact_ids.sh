@@ -48,7 +48,7 @@
 #
 # ЧЕТЫРЕ МЕСТА СРАВНЕНИЯ (спека §4.6; §4.3 усл. 5 требует, чтобы шапка называла и их, а не
 # только оси) — полнота набора объявляется ОТНОСИТЕЛЬНО этого перечня, он конечен:
-#   P1 путь → класс-носитель (карта каталогов)      — B1DIR L1REPORT B4Q L7QUOT
+#   P1 путь → класс-носитель (карта каталогов)      — B1DIR L1REPORT L1JSON B4Q L7QUOT
 #   P2 basename → КЛАСС НОМЕР БУКВА (`id_of`)       — B6DASH B6ZERO B6NOSLUG B6LETTERDUP
 #                                                     L6LETTERC L6LETTERM L6FAM L6ONELETTER
 #   P3 строка TECH-DEBT.md → носитель номера        — B1TD B2SLUGLESS B2ORIG B2MULTI L2CLOSEOUT
@@ -107,6 +107,7 @@ B1TD|2|V|запись в TECH-DEBT.md
 B1TD|4|V|новая запись в TECH-DEBT.md
 B1DIR|1|V|известный класс в чужом каталоге
 L1REPORT|1|L|упоминание номера в имени отчёта
+L1JSON|1|L|файл-спутник не-.md в каталоге-носителе
 B2SLUGLESS|2|V|неканоническая форма записи держит номер
 B2ORIG|2|V|неканоническая форма записи держит номер
 B2MULTI|2|V|неканоническая форма записи держит номер
@@ -248,7 +249,7 @@ run_check() {  # $1=repo $2=база $3=событие (push|pull_request)
   fi; }
 run_alloc() { ( cd "$1" && bash "${ALLOC}" "$2" 2>/dev/null ); }
 
-# Setup-guard НА КАЖДЫЙ сценарий — на все 47 (`testing.md`, целостность гейта, свойство 3: «проба, молча
+# Setup-guard НА КАЖДЫЙ сценарий — на все 48 (`testing.md`, целостность гейта, свойство 3: «проба, молча
 # тестирующая не тот сценарий, — плацебо самой себя»). Фикстуры строятся цепочками вида
 # `( cd … && … ) && commit_all`: если подоболочка молча откажет, коммита не будет, диапазон
 # окажется ПУСТ, барьер выйдет нулём по раннему `[ -z "$IN" ]`, и expect_allow напечатает
@@ -516,6 +517,22 @@ art "$R" research/reports/M-66-tester-report.md ""; commit_all "$R" "отчёт 
 setup_assert L1REPORT "$R" "класс M обязан жить в milestones/, а имя отчёта — НАЧИНАТЬСЯ с M-66 в чужом каталоге" \
   '[ "$(git ls-tree -r --name-only HEAD | grep -c "^milestones/M-66-")" -eq 1 ] && [ "$(git ls-tree -r --name-only HEAD | grep -c "^research/reports/M-66-")" -eq 1 ] && [ "$(git ls-tree -r --name-only HEAD | grep -c "^milestones/M-66-tester")" -eq 0 ]'
 expect_allow L1REPORT "$R" "$B" "research/reports/M-66-*-report.md номер лишь УПОМИНАЕТ — носитель класса M живёт в milestones/"
+
+# L1JSON — файл-спутник не-`.md` в каталоге-носителе (NOTE-1 `R-063`, круг 5-fix). Носитель —
+# ТОЛЬКО `.md` (спека §0 отклонение 2, §3.1 правило 4, объявлено дважды): `docs/fa/research-cli.md`
+# §7 предписывает backtest-отчёту идти ПАРОЙ `metrics.json` + `R-NNN.md`, значит `.json` под
+# занятым номером — ШТАТНАЯ форма прода, а не коллизия (пара `R-001-obi-trackA.{md,json}` уже
+# живёт на `feat/M-10-rebased`, замер `R-063`). Реализация, потерявшая привязку к `.md`, красит
+# первый же новый отчёт ЛОЖНЫМ КРАСНЫМ. До этого сценария привязку не пиннило НИЧЕГО: мутация
+# реального барьера (снятие `.md` из case-шаблонов `id_of`) оставляла набор зелёным 47/47 —
+# воспроизведено reviewer'ом и повторено при постановке сценария. Мутант-убийца — `mdblind`.
+R="$(mk_repo l1json)"; art "$R" research/reviews/R-070-json-pair.md ""; commit_all "$R" base2
+B="$(cd "$R" && git rev-parse HEAD)"
+( cd "$R" && mkdir -p research/reports && printf '{"sharpe":0}\n' > research/reports/R-070-obi-metrics.json ) || die "l1json setup"
+commit_all "$R" "json-спутник отчёта под занятым R-070"
+setup_assert L1JSON "$R" ".md-носитель обязан занимать R-070 ВНЕ диапазона, а диапазон — вводить ТОЛЬКО не-.md спутник того же номера" \
+  '[ "$(git ls-tree -r --name-only HEAD~1 | grep -c "^research/reviews/R-070-.*\.md$")" -eq 1 ] && [ "$(git ls-tree -r --name-only HEAD | grep -c "^research/reports/R-070-.*\.json$")" -eq 1 ] && [ "$(git ls-tree -r --name-only HEAD | grep -cE "^research/reports/R-070-.*\.md$")" -eq 0 ]'
+expect_allow L1JSON "$R" "$B" "R-070-….json рядом с R-070-….md — не-.md файл номер лишь СОПРОВОЖДАЕТ, носителем не является"
 
 R="$(mk_repo l2txt)"; art "$R" research/reviews/R-210-alpha.md ""; commit_all "$R" base2
 B="$(cd "$R" && git rev-parse HEAD)"

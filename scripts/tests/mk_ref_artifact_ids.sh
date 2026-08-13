@@ -25,7 +25,8 @@
 #     ЧЕТЫРЕ — `C-18`, `C-58`, `M-46`, `R-1`.
 #
 # ═══ ЧЕТЫРЕ МЕСТА СРАВНЕНИЯ (план §5) — по одному на каждое есть мутант ══════════════
-#   P1  путь → класс-носитель      `id_of` (карта каталогов)  → `dirblind`, `reviewsonly`
+#   P1  путь → класс-носитель      `id_of` (карта каталогов)  → `dirblind`, `reviewsonly`,
+#                                                                `mdblind`
 #   P2  basename → КЛАСС НОМЕР БУКВА `ID_RE`/`ID_SUB`         → `letterblind`, `dashoptional`,
 #                                                                `slugletter`, `nameskip`,
 #                                                                `letterarith`
@@ -66,9 +67,14 @@ ID_RE='^([MRCA])-([0-9]+)([a-z])?(-.*)?$'
 ID_SUB="\\1${SEP}\\2${SEP}\\3"
 # ── P1: путь → класс-носитель. Файл, чей префикс не совпадает с классом СВОЕГО каталога
 # (`research/reports/M-53-tester-report.md`), номер лишь УПОМИНАЕТ и носителем не является.
+# Привязка к `.md` ОБЯЗАТЕЛЬНА (спека §0 отклонение 2, §3.1 правило 4) — как в прод-барьере:
+# `docs/fa/research-cli.md` §7 предписывает отчёту идти ПАРОЙ `metrics.json + R-NNN.md`, и без
+# `.md` спутник `R-001-obi-trackA.json` разбирается как второй носитель `R-001` (замер NOTE-1
+# `R-063`: первая редакция ЭТАЛОНА несла шаблоны без `.md` и красила бы `L1JSON` — то есть
+# дыра сидела не только в наборе, но и в эталоне батареи). Мутант — `mdblind`.
 id_of() {
   case "$1" in
-    milestones/M-*|research/reviews/R-*|research/reports/R-*|research/critiques/C-*|research/arbitration/A-*) :;;
+    milestones/M-*.md|research/reviews/R-*.md|research/reports/R-*.md|research/critiques/C-*.md|research/arbitration/A-*.md) :;;
     *) return 1;;
   esac
   basename "$1" .md | sed -nE "s|${ID_RE}|${ID_SUB}|p"
@@ -378,18 +384,34 @@ guard nameskip "$HEAD_NAMESKIP" "$HEAD_COMMON"
 # dirblind — карта каталогов забыта, класс берётся из префикса ИМЕНИ: отчёт тестера
 # `research/reports/M-53-tester-report.md` начинает ДЕРЖАТЬ номер M-53 вместо того, чтобы его
 # упоминать. В корпусе таких файлов восемь, и все выданы штатным воркфлоу (`M-53` §Allowed paths).
+# Замена — `*.md)`, а НЕ `*)`: привязка к `.md` — ОТДЕЛЬНОЕ свойство со своим мутантом
+# (`mdblind`); catch-all снёс бы оба разом, и kill-set dirblind перестал бы быть точечным
+# (замер: `*)` роняет ещё и L1JSON — `.json` начинает читаться носителем).
 read -r -d '' SED_DIRBLIND <<'EOF'
-s|^ *milestones/M-.*$|    *) :;;|
+s|^ *milestones/M-.*$|    *.md) :;;|
 EOF
 HEAD_DIRBLIND="$(mutate_head "$SED_DIRBLIND")"
 guard dirblind "$HEAD_DIRBLIND" "$HEAD_COMMON"
 # reviewsonly — зеркало dirblind: из карты выпал ВТОРОЙ реестр класса R (`gates.md` §6,
 # backtest-отчёты `research/reports/R-NNN`). Номер, занятый вердиктом, тихо переиспользуется отчётом.
 read -r -d '' SED_REVIEWSONLY <<'EOF'
-s|research/reports/R-\*[|]||
+s|research/reports/R-\*\.md[|]||
 EOF
 HEAD_REVIEWSONLY="$(mutate_head "$SED_REVIEWSONLY")"
 guard reviewsonly "$HEAD_REVIEWSONLY" "$HEAD_COMMON"
+# mdblind — привязка носителя к `.md` СНЯТА из карты каталогов (NOTE-1 `R-063`): любой файл
+# каталога-носителя читается носителем, и штатный `.json`-спутник backtest-отчёта
+# (`docs/fa/research-cli.md` §7 — пара `metrics.json + R-NNN.md`) начинает ДЕРЖАТЬ номер.
+# Направление отказа — ложное КРАСНОЕ на форме прода (пара `R-001-obi-trackA.{md,json}` на
+# `feat/M-10-rebased`, единственный не-`.md` в каталогах-носителях корпуса). До круга 5-fix
+# привязку не пиннило НИЧЕГО: та же мутация РЕАЛЬНОГО барьера оставляла набор зелёным 47/47.
+# Делимитер — `@`, не `|`: замена НЕСЁТ литеральные `|` (альтернация case-шаблона), и с
+# делимитером `|` sed падает на собственном скрипте — ровно класс, который ловит guard.
+read -r -d '' SED_MDBLIND <<'EOF'
+s@^ *milestones/M-\*\.md.*$@    milestones/M-*|research/reviews/R-*|research/reports/R-*|research/critiques/C-*|research/arbitration/A-*) :;;@
+EOF
+HEAD_MDBLIND="$(mutate_head "$SED_MDBLIND")"
+guard mdblind "$HEAD_MDBLIND" "$HEAD_COMMON"
 # tdcanonical — ЗАНЯТОСТЬ сужена до канонической карточки: 15 номеров из 126 в прод-корпусе
 # становятся «свободными», и повторное использование TD-007/TD-103 проходит affirmative-«OK».
 read -r -d '' SED_TDCANONICAL <<'EOF'
@@ -467,6 +489,7 @@ emit dirblind-check.sh      "$HEAD_DIRBLIND"     ""              "$BODY_CHECK"
 emit reviewsonly-check.sh   "$HEAD_REVIEWSONLY"  ""              "$BODY_CHECK"
 emit tdcanonical-check.sh   "$HEAD_TDCANONICAL"  ""              "$BODY_CHECK"
 emit tdanyline-check.sh     "$HEAD_TDANYLINE"    ""              "$BODY_CHECK"
+emit mdblind-check.sh       "$HEAD_MDBLIND"      ""              "$BODY_CHECK"
 # bheadsonly — то же, что headsonly, но у БАРЬЕРА: перечисление ref'ов теряет origin.
 emit bheadsonly-check.sh    "$HEAD_HEADSONLY"    ""              "$BODY_CHECK"
 # localmax / originonly / headsonly — мутанты АЛЛОКАТОРА (ось 3): барьер у них эталонный.
