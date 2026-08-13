@@ -14,6 +14,10 @@ cd "${ROOT}" || exit 1
 SPEC="milestones/M-62-segment-metadata.md"
 ORACLE_META="crates/gateway/tests/red_segment_meta_bound.rs"
 ORACLE_GUARD="crates/gateway/tests/red_hint_pos_guard.rs"
+# Круг 3: оракул инварианта `I2` (§4.1bis спеки). Перечисляется ЯВНО и участвует в шаге `N`
+# наравне с прочими: манифест, невидимый гейту, возвращает «полноту относительно перечня,
+# который никто не сверял» — тот самый дефект, ради которого шаг `N` и заведён.
+ORACLE_EQUIV="crates/gateway/tests/red_catalog_equivalence.rs"
 
 FAILED=0
 pass() { echo "PASS  $*"; }
@@ -38,11 +42,11 @@ FREE_MB=$(df -Pm . | awk 'NR==2 {print $4}')
 
 # ── A: оракулы на месте и парсятся ──────────────────────────────────────────────────────
 echo "--- A: оракулы на месте ---"
-for f in "${ORACLE_META}" "${ORACLE_GUARD}"; do
+for f in "${ORACLE_META}" "${ORACLE_GUARD}" "${ORACLE_EQUIV}"; do
   if [ -f "${f}" ]; then pass "A ${f}"; else fail "A НЕТ файла ${f}"; fi
 done
-if rustfmt --edition 2021 --check "${ORACLE_META}" "${ORACLE_GUARD}" >/dev/null 2>&1; then
-  pass "A оба файла форматированы (паритет с CI-шагом fmt)"
+if rustfmt --edition 2021 --check "${ORACLE_META}" "${ORACLE_GUARD}" "${ORACLE_EQUIV}" >/dev/null 2>&1; then
+  pass "A все три файла набора форматированы (паритет с CI-шагом fmt)"
 else
   fail "A rustfmt --check красный на файлах набора"
 fi
@@ -77,9 +81,9 @@ SPEC_PAIRS="$(awk '
 # краснел «в спеке есть, в наборе НЕТ» на значениях, которые в наборе ЕСТЬ. Гейт мерил ФОРМУ
 # ЗАПИСИ, а не содержание, — и деградировал ЧАСТИЧНО, что хуже полного отказа: страж
 # «манифест не извлёкся» молчал, потому что короткие кортежи извлекались по-прежнему.
-MANIFEST_PAIRS="$(cat "${ORACLE_META}" "${ORACLE_GUARD}" | tr '\n' ' ' | tr -s ' ' \
-  | grep -oE '\( *"[a-z0-9_]+", *[0-9]+, *"[^"]+", *.[VL].,? *\)' |
-  sed -E "s/\( *\"[a-z0-9_]+\", *([0-9]+), *\"([^\"]+)\", *.([VL]).,? *\)/\1|\3|\2/" | sort -u)"
+MANIFEST_PAIRS="$(cat "${ORACLE_META}" "${ORACLE_GUARD}" "${ORACLE_EQUIV}" | tr '\n' ' ' | tr -s ' ' \
+  | grep -oE '\( *"[a-z0-9_-]+", *[0-9]+, *"[^"]+", *.[VL].,? *\)' |
+  sed -E "s/\( *\"[a-z0-9_-]+\", *([0-9]+), *\"([^\"]+)\", *.([VL]).,? *\)/\1|\3|\2/" | sort -u)"
 
 [ -n "${SPEC_PAIRS}" ] || die "разбор таблицы §4.2 дал ПУСТО — парсер сломан либо раздел переименован; молчаливый зелёный здесь недопустим"
 [ -n "${MANIFEST_PAIRS}" ] || die "манифест набора не извлёкся — форма записи изменилась"
@@ -93,7 +97,7 @@ MANIFEST_PAIRS="$(cat "${ORACLE_META}" "${ORACLE_GUARD}" | tr '\n' ' ' | tr -s '
 # файлу и дала 22 против 20 — мера была невалидна, а не набор неполон. Вычислять «независимый
 # эталон» по величине, которая включает постороннее, — тот же класс, что мерить прокси вместо
 # ресурса (`testing.md`).
-N_MARK="$(cat "${ORACLE_META}" "${ORACLE_GUARD}" \
+N_MARK="$(cat "${ORACLE_META}" "${ORACLE_GUARD}" "${ORACLE_EQUIV}" \
   | awk '/const MANIFEST/{inside=1} inside{print} inside&&/^\];/{inside=0}' \
   | grep -oE "'[VL]'" | wc -l)"
 # Считаются КОРТЕЖИ ДО дедупликации: `MANIFEST_PAIRS` схлопнут `sort -u`, потому что несколько
@@ -106,8 +110,8 @@ N_MARK="$(cat "${ORACLE_META}" "${ORACLE_GUARD}" \
 # оболочке `grep` — это `ugrep`, который с `-c -o` считает СОВПАДЕНИЯ. То есть исход зависел от
 # того, какая реализация grep оказалась в PATH, — гейт мерил ОКРУЖЕНИЕ, а не свой инвариант
 # (`testing.md`, целостность гейта, свойство 2).
-N_TUPLES="$(cat "${ORACLE_META}" "${ORACLE_GUARD}" | tr '\n' ' ' | tr -s ' ' \
-  | grep -oE '\( *"[a-z0-9_]+", *[0-9]+, *"[^"]+", *.[VL].,? *\)' | wc -l)"
+N_TUPLES="$(cat "${ORACLE_META}" "${ORACLE_GUARD}" "${ORACLE_EQUIV}" | tr '\n' ' ' | tr -s ' ' \
+  | grep -oE '\( *"[a-z0-9_-]+", *[0-9]+, *"[^"]+", *.[VL].,? *\)' | wc -l)"
 [ "${N_TUPLES}" -eq "${N_MARK}" ] || die "разбор манифеста НЕПОЛОН: извлечено ${N_TUPLES} кортежей при ${N_MARK} маркерах.
   Частичный разбор опаснее полного отказа: шаг сообщает о несуществующем расхождении, и правят
   не то. Причина почти всегда в форме записи (перенос строки, висячая запятая), а не в составе."
@@ -169,6 +173,31 @@ else
   else
     grep -E '^(error|test .* FAILED)' /tmp/m62-meta.log | head -6 | sed 's/^/      ↳ /'
   fi
+fi
+
+# ── E: инвариант `I2` — тёплый каталог ЭКВИВАЛЕНТЕН холодному (круг 3, §4.1bis) ─────────
+# ОТДЕЛЬНЫМ ИМЕНОВАННЫМ ШАГОМ, а не «заодно под `cargo test --all`». Оракул, попадающий
+# только под зонтичный прогон, отдаёт красное строкой «шаг T красный»: атрибуция теряется, и
+# следующий агент ищет дефект не там. Это ровно `gates.md` §4 «механизм на пути»: файл в
+# репозитории, который гейт не зовёт ПОИМЕННО, для гейта не существует.
+# Ожидаемое состояние ДО задач 14-15: КРАСНЫЙ (`sm11` — класс A, `sm11c` — класс B).
+echo "--- E: SM-11 эквивалентность тёплого и холодного наблюдения ---"
+if cargo test -p gateway --no-fail-fast --test red_catalog_equivalence >/tmp/m62-equiv.log 2>&1; then
+  E_OK=$(grep -cE '^test result: ok\. [1-9]' /tmp/m62-equiv.log)
+  if [ "${E_OK}" -ge 1 ]; then
+    pass "E SM-11 GREEN ($(grep -E '^test result' /tmp/m62-equiv.log | head -1))"
+  else
+    fail "E прогон exit=0, но НИ ОДНОГО исполненного теста — зелёный не заслужен"
+  fi
+else
+  fail "E SM-11 КРАСЕН — тёплый каталог расходится с холодным наблюдением"
+  # Класс называется отдельно: развязки класса A не чинят класс B и наоборот, и «1 passed;
+  # 1 failed» читается с ходу как провал фикса, хотя означает «один класс закрыт».
+  grep -q 'sm11_warm_catalog_stays_equivalent .* FAILED' /tmp/m62-equiv.log &&
+    echo "      ↳ КЛАСС A (диф ИМЁН выдан за наблюдение СОСТОЯНИЯ) — задача 14"
+  grep -q 'sm11c_warm_verdict_inherits .* FAILED' /tmp/m62-equiv.log &&
+    echo "      ↳ КЛАСС B (проверки полного пути не унаследованы) — задача 15"
+  grep -E '^test .* FAILED' /tmp/m62-equiv.log | head -4 | sed 's/^/      ↳ /'
 fi
 
 # ── F2: батарея мутантов §4.4 — FAIL-CLOSED до появления ────────────────────────────────
