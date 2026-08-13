@@ -657,9 +657,24 @@ fn sm6_two_sessions_alternating_ticks_stay_within_budget() {
 // ЭТАЛОН — НЕЗАВИСИМЫЙ ПУТЬ: `journal::list_segments(dir)` обходит каталог с нуля и применяет
 // `D-COMP-1` (`dedup_indexed_paths`). Сверять кеш с кешем — тавтология (testing.md).
 //
-// SETUP-GUARD НА КАЖДЫЙ СЦЕНАРИЙ обязателен и здесь важнее обычного: если `is_fresh` вернёт
-// `false`, отработает `refresh()`, тест позеленеет и проверит НЕ ТУ ВЕТКУ — ровно так эти
-// три дефекта и дошли до PR-гейта.
+// SETUP-GUARD НА КАЖДЫЙ СЦЕНАРИЙ обязателен, НО СТЕРЕЖЁТ ОН ДИСК, А НЕ ВЕТКУ (круг 3).
+// Прежняя редакция требовала `assert!(fresh, "SETUP НЕ СОСТОЯЛСЯ: is_fresh=false ⇒ отработал
+// полный refresh()")`. Замер круга 3 показал, что этот страж пиннил ВЕТКУ ИСПОЛНЕНИЯ:
+// развязка «при коллизии индекса уходить в refresh()», прямо разрешённая вердиктом `R-056`
+// (Условие APPROVED п.1) и корректная end-to-end, роняла SM-8 не на предмете, а на самом
+// страже. Инвариант милестоуна — «каталог ПРАВДИВ и цена УСТАНОВИВШЕГОСЯ такта не зависит от
+// N»; какой веткой это достигнуто, инвариантом не является.
+//
+// Ветку заменяют ДВА фикс-агностичных наблюдения:
+//   (1) состояние ДИСКА до такта (`files_of_index`) — сценарий воспроизведён, проба меряет то,
+//       что обещает; это и есть настоящее содержание «setup состоялся»;
+//   (2) БЮДЖЕТ такта (`tick` + `BUDGET_META`) — то, что прежний страж защищал КОСВЕННО:
+//       «уходить в refresh() всегда» есть лазейка к O(N) на каждом тике, и её обязан ловить
+//       ЯВНЫЙ сторож бюджета, а не побочный эффект требования `fresh == true`.
+// Замер, подтверждающий, что замена не ослабила набор: мутант «всегда refresh» роняет
+// переделанные SM-8/SM-9 по бюджету с названным числом (411 против 8), тогда как прежняя
+// редакция умирала на setup-guard'е — случай (б) из шапки `red_segment_meta_battery.sh`,
+// который батарея сама называет «записью "пиннит дыру" НЕ является».
 // ─────────────────────────────────────────────────────────────────────────────────────────
 
 fn cache_indices(cat: &journal::SegmentCatalog) -> Vec<u32> {
@@ -677,36 +692,227 @@ fn truth_indices(dir: &Path) -> Vec<u32> {
     v
 }
 
+/// ПУТИ, а не только индексы. Развязка «не удалять запись, пока индекс есть в `cur_names`»
+/// оставляет в кеше `SegmentInfo` с путём на УДАЛЁННЫЙ файл: множества ИНДЕКСОВ при этом
+/// совпадают, а `pump()` умирает `Os { code: 2, NotFound }`. Сверка одних индексов пропускает
+/// такой фикс целиком (замер разведки: все 10 SM зелены).
+fn cache_paths(cat: &journal::SegmentCatalog) -> Vec<String> {
+    let mut v: Vec<String> = cat
+        .segments()
+        .iter()
+        .map(|s| s.path.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    v.sort();
+    v
+}
+fn truth_paths(dir: &Path) -> Vec<String> {
+    let mut v: Vec<String> = journal::list_segments(dir)
+        .expect("эталон: journal::segments")
+        .iter()
+        .map(|s| s.path.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    v.sort();
+    v
+}
+
+/// Сколько файлов каталога принадлежат этому индексу (`.jrnl` + `.jrnl.zst`).
+/// Это НАБЛЮДЕНИЕ ДИСКА — годится в setup-guard, в отличие от наблюдения ветки реализации.
+fn files_of_index(dir: &Path, index: u32) -> usize {
+    let pat = format!("{index:08}");
+    fs::read_dir(dir)
+        .expect("read_dir")
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().contains(&pat))
+        .count()
+}
+
+/// Полная цена обхода ЭТОГО каталога — ЗАМЕР, а не литерал: `SegmentCatalog::open` исполняет
+/// ровно то же, что `refresh()`. Служит потолком для такта, несущего событие каталога.
+fn full_scan_cost(dir: &Path) -> u64 {
+    let (_c, ops) = journal::SegmentCatalog::open(dir).expect("эталон цены: catalog open");
+    ops
+}
+
+/// Такт сессии в ПРОД-ФОРМЕ вызывающего (`stream_from_at_with_catalog`,
+/// `crates/journal/src/segments.rs:1789-1799`): `is_fresh`, и при `false` — `refresh()`.
+/// Возвращает `(ops такта, ушла ли реализация в полный refresh)`.
+///
+/// ПОЧЕМУ ИМЕННО ТАК, А НЕ `assert!(fresh)`. Инвариант милестоуна — «каталог правдив И цена
+/// установившегося тика не зависит от N»; КАКОЙ веткой это достигнуто, инвариантом не
+/// является. Прежний setup-guard `assert!(fresh, "SETUP НЕ СОСТОЯЛСЯ …")` пиннил ВЕТКУ и тем
+/// запрещал развязку «при коллизии индекса уходить в refresh()», санкционированную вердиктом
+/// `R-056` (замер разведки: она корректна end-to-end, но роняла SM-8 на его собственном
+/// страже). Ветку заменяют ДВА наблюдения, оба фикс-агностичные: состояние ДИСКА (setup
+/// состоялся) и БЮДЖЕТ такта (корректность не куплена ценой O(N) на каждом тике).
+fn tick(cat: &mut journal::SegmentCatalog, dir: &Path) -> (u64, bool) {
+    let (fresh, mut ops) = cat.is_fresh(dir).expect("is_fresh");
+    if !fresh {
+        ops += cat.refresh(dir).expect("refresh");
+    }
+    (ops, !fresh)
+}
+
+/// Правдивость каталога сессии против НЕЗАВИСИМОГО пути (`journal::list_segments` — обход с
+/// нуля). Три сверки, потому что у потребителя ровно три наблюдаемых различия: существование
+/// файла, состав индексов и адресация. Порядок сверок — от самого жёсткого симптома к самому
+/// мягкому: несуществующий путь = ENOENT в `pump()`, состав = недоотдача событий, адресация =
+/// чтение не того представления.
+///
+/// Расхождение печатается РАЗНИЦЕЙ, а не двумя списками по 200 имён: вердикт гейта читают
+/// люди.
+fn assert_catalog_truthful(cat: &journal::SegmentCatalog, dir: &Path, stage: &str) {
+    // (1) СУЩЕСТВОВАНИЕ: кеш не смеет адресовать файл, которого нет.
+    let dangling: Vec<String> = cat
+        .segments()
+        .iter()
+        .filter(|s| !s.path.exists())
+        .map(|s| s.path.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        dangling.is_empty(),
+        "{stage}: кеш держит пути на НЕСУЩЕСТВУЮЩИЕ файлы {dangling:?}. Это не расхождение \
+         учёта, а жёсткий Err на прод-пути: `pump()` откроет такой путь и вернёт \
+         `Os {{ code: 2, kind: NotFound }}` — сессия перестанет отдавать кадры вовсе. Ровно \
+         сюда приводит развязка «не удалять запись, пока индекс есть в cur_names»: множества \
+         ИНДЕКСОВ при ней совпадают, и сверка одних индексов её пропускает."
+    );
+    // (2) СОСТАВ: те же индексы, что у независимого обхода.
+    let (ci, ti) = (cache_indices(cat), truth_indices(dir));
+    let lost: Vec<u32> = ti.iter().filter(|i| !ci.contains(i)).copied().collect();
+    let extra: Vec<u32> = ci.iter().filter(|i| !ti.contains(i)).copied().collect();
+    assert!(
+        lost.is_empty() && extra.is_empty(),
+        "{stage}: СОСТАВ кеша разошёлся с каталогом (эталон — `journal::list_segments`, \
+         независимый обход с нуля). ПОТЕРЯНЫ индексы {lost:?}; ЛИШНИЕ {extra:?}. \
+         Инкрементальная ветка правит кеш по разнице ИМЁН, тогда как истина есть функция \
+         СОДЕРЖИМОГО каталога, а `self.file_names = cur_names` коммитится безусловно — \
+         расхождение больше НИКОГДА не наблюдаемо изнутри: ни ротация, ни посегментная \
+         компакция refresh не зовут (diff ≤2, `segments.rs:278`). Отставшая сессия \
+         недосчитается всех событий сегмента при зелёном healthcheck — класс TD-031."
+    );
+    // (3) АДРЕСАЦИЯ: тот же файл на индекс, что выбрал бы независимый обход (D-COMP-1).
+    let (cp, tp) = (cache_paths(cat), truth_paths(dir));
+    let wrong: Vec<&String> = cp.iter().filter(|n| !tp.contains(n)).collect();
+    assert!(
+        wrong.is_empty(),
+        "{stage}: индексы совпали, а ПУТИ разошлись: кеш адресует {wrong:?}, независимый \
+         обход — другое представление тех же сегментов. Правило D-COMP-1 (при коллизии \
+         побеждает СЫРОЙ) применяется только на полном пути; кеш, разошедшийся с ним по \
+         выбору файла, читает не то, что читает всякий другой потребитель."
+    );
+}
+
 #[test]
 fn sm8_per_segment_compaction_keeps_catalog_truthful() {
     claims("sm8", 4, "посегментная компакция стирает сегмент из кеша");
 
-    let (dir, _n) = build_prod_form(N_SEGMENTS);
+    let (dir, n) = build_prod_form(N_SEGMENTS);
     let (mut cat, _ops) = journal::SegmentCatalog::open(dir.path()).expect("catalog open");
 
+    // Потолок цены такта — ЗАМЕР этого каталога, не литерал.
+    let full = full_scan_cost(dir.path());
+    assert!(
+        full > BUDGET_META * 2,
+        "SETUP НЕ СОСТОЯЛСЯ: полный обход стоит {full} при бюджете {BUDGET_META} — на таком \
+         каталоге бюджетный сторож не отличает кеш от его отсутствия"
+    );
+
     let all = journal::list_segments(dir.path()).expect("segments");
+    let max_idx = all.iter().map(|s| s.index).max().expect("непустой каталог");
+    // Жертва — закрытый СЫРОЙ сегмент, НЕ последний по индексу: исчезновение `latest_path`
+    // ловится отдельным `stat`ом (segments.rs:241-258) и уводит в refresh само по себе,
+    // то есть на последнем индексе сценарий подменяется другим.
     let victim = all
         .iter()
-        .find(|s| s.path.extension().map(|e| e == "jrnl").unwrap_or(false) && s.index > 0)
+        .find(|s| {
+            s.path.extension().map(|e| e == "jrnl").unwrap_or(false)
+                && s.index > 0
+                && s.index < max_idx
+        })
         .cloned()
-        .expect("SETUP: нужен хотя бы один закрытый сырой сегмент");
-    journal::compact_segment(&victim, journal::DEFAULT_COMPACT_LEVEL).expect("compact one");
+        .expect("SETUP: нужен закрытый сырой сегмент НЕ последнего индекса");
 
-    let (fresh, _o) = cat.is_fresh(dir.path()).expect("is_fresh");
-    assert!(
-        fresh,
-        "SETUP НЕ СОСТОЯЛСЯ: is_fresh=false ⇒ отработал полный refresh(), а предмет теста — \
-         ИНКРЕМЕНТАЛЬНАЯ ветка. Компакция ОДНОГО сегмента обязана давать маленький diff."
-    );
+    // ── ТАКТ 1 — шаг 6 компакции: `.zst` опубликован, оригинал `.jrnl` ЕЩЁ НА МЕСТЕ ────────
+    // Прод компактирует ДВУМЯ файловыми событиями (segments.rs:4003 rename, :4011 remove), а
+    // тик сессии — 250 мс: попадание МЕЖДУ ними на проде ~13 раз в сутки (замер ширины окна
+    // unlink 1 GiB: 254/261/728 мс). Однотактовая форма (compact_segment целиком между двумя
+    // тиками) от дефекта Б-4 слепа: она даёт added+removed в ОДНОМ diff'е, где порядок
+    // remove→add уже верен.
+    let raw_bytes = fs::read(&victim.path).expect("read raw");
+    journal::compact_segment(&victim, journal::DEFAULT_COMPACT_LEVEL).expect("compact one");
+    fs::write(&victim.path, &raw_bytes).expect("вернуть .jrnl рядом с .zst — шаг 7 ещё не сделан");
     assert_eq!(
-        cache_indices(&cat),
-        truth_indices(dir.path()),
-        "SM-8: после компакции ОДНОГО сегмента кеш сессии разошёлся с каталогом. Порядок \
-         операций в инкрементальной ветке: added кладёт .zst, затем removed удаляет ПО \
-         ИНДЕКСУ — и сносит только что добавленную запись, потому что индекс у обоих ОДИН. \
-         is_fresh при этом возвращает true и переписывает file_names, поэтому следующий тик \
-         расхождения уже не увидит: порча живёт до конца сессии. Отставшая сессия \
-         недосчитается всех событий сегмента при зелёном healthcheck — класс TD-031."
+        files_of_index(dir.path(), victim.index),
+        2,
+        "SETUP НЕ СОСТОЯЛСЯ: у индекса {} на диске не ДВА файла — промежуточное состояние \
+         компакции (шаг 6 сделан, шаг 7 нет) не воспроизведено, и такт 1 проверял бы не то",
+        victim.index
+    );
+    let (ops1, refreshed1) = tick(&mut cat, dir.path());
+    assert_catalog_truthful(&cat, dir.path(), "SM-8 такт 1 (шаг 6: .zst рядом с .jrnl)");
+
+    // ── ТАКТ 2 — шаг 7 компакции: оригинал удалён ─────────────────────────────────────────
+    fs::remove_file(&victim.path).expect("шаг 7: remove(src)");
+    assert_eq!(
+        files_of_index(dir.path(), victim.index),
+        1,
+        "SETUP НЕ СОСТОЯЛСЯ: у индекса {} на диске не РОВНО ОДИН файл после шага 7",
+        victim.index
+    );
+    let (ops2, refreshed2) = tick(&mut cat, dir.path());
+    assert_catalog_truthful(&cat, dir.path(), "SM-8 такт 2 (шаг 7: .jrnl удалён)");
+
+    // ── ТАКТЫ 3-4 — УСТАНОВИВШИЙСЯ режим: состав каталога больше не меняется ──────────────
+    // Здесь и стоит настоящий предмет прежнего `assert!(fresh)`: корректность не имеет права
+    // быть куплена ценой «уходить в refresh() всегда». Такт БЕЗ события каталога обязан быть
+    // дешёвым независимо от того, какой веткой реализация закрыла такты 1-2.
+    append_range(dir.path(), n, n + INCREMENT);
+    let (ops3, _r3) = tick(&mut cat, dir.path());
+    assert_catalog_truthful(&cat, dir.path(), "SM-8 такт 3 (append в активный)");
+    let (ops4, refreshed4) = tick(&mut cat, dir.path());
+    assert_catalog_truthful(&cat, dir.path(), "SM-8 такт 4 (каталог не менялся)");
+
+    eprintln!(
+        "SM-8: full_scan={full} ops1={ops1}(refresh={refreshed1}) ops2={ops2}(refresh={refreshed2}) \
+         ops3={ops3} ops4={ops4}(refresh={refreshed4})"
+    );
+
+    assert!(
+        ops4 <= BUDGET_META,
+        "SM-8: такт БЕЗ единого изменения состава каталога стоил {ops4} операций при бюджете \
+         {BUDGET_META} (полный обход этого каталога — {full}). Корректность куплена ценой \
+         «refresh() на каждом тике»: при цели 10 000 сессий и периоде 250 мс это возвращает \
+         ровно ту цену, ради устранения которой заведён M-62. Прежний setup-guard \
+         `assert!(fresh)` защищал это КОСВЕННО — и заодно запрещал верную развязку; предмет \
+         его защиты живёт здесь, в бюджете установившегося такта."
+    );
+    assert!(
+        ops3 <= BUDGET_META,
+        "SM-8: такт с одним лишь append'ом в АКТИВНЫЙ сегмент стоил {ops3} операций при \
+         бюджете {BUDGET_META}. Рост активного файла — норма между тиками, а не событие \
+         каталога, и переучёта не требует (§4.1)."
+    );
+    // Потолок такта-с-событием = дешёвая проба (≤ BUDGET_META) + ОДИН полный обход. Развязка
+    // «уходить в refresh()» платит ровно столько (замер: 3 + 409 = 412); двойной обход даёт
+    // ≥ 2×full и здесь краснеет.
+    let ceiling = full + BUDGET_META;
+    assert!(
+        ops1 <= ceiling && ops2 <= ceiling,
+        "SM-8: такт, несущий событие каталога, стоил больше ПОЛНОГО обхода (ops1={ops1}, \
+         ops2={ops2} при потолке {ceiling} = полный обход {full} + проба {BUDGET_META}) — \
+         реализация обходит каталог ДВАЖДЫ за такт. Дороже одного честного холодного пути \
+         платить не за что."
+    );
+    let expensive = [ops1, ops2, ops3, ops4]
+        .iter()
+        .filter(|o| **o > BUDGET_META)
+        .count();
+    assert!(
+        expensive <= 2,
+        "SM-8: дорогих тактов {expensive} при ДВУХ событиях каталога в серии из четырёх \
+         тактов. Полную цену законно платит такт, НЕСУЩИЙ событие (это легитимное значение \
+         оси 3, `sm4`); такт после него обязан вернуться в бюджет. Больше дорогих тактов, чем \
+         событий, — признак того, что кеш не восстанавливается и переучёт стал постоянным."
     );
 }
 
@@ -720,13 +926,19 @@ fn sm9_compaction_midstate_does_not_duplicate_index() {
 
     let (dir, _n) = build_prod_form(N_SEGMENTS);
     let (mut cat, _ops) = journal::SegmentCatalog::open(dir.path()).expect("catalog open");
+    let full = full_scan_cost(dir.path());
 
     let all = journal::list_segments(dir.path()).expect("segments");
+    let max_idx = all.iter().map(|s| s.index).max().expect("непустой каталог");
     let victim = all
         .iter()
-        .find(|s| s.path.extension().map(|e| e == "jrnl").unwrap_or(false) && s.index > 0)
+        .find(|s| {
+            s.path.extension().map(|e| e == "jrnl").unwrap_or(false)
+                && s.index > 0
+                && s.index < max_idx
+        })
         .cloned()
-        .expect("SETUP: нужен закрытый сырой сегмент");
+        .expect("SETUP: нужен закрытый сырой сегмент НЕ последнего индекса");
     // Промежуточное состояние `compact_segment`: rename .tmp→.zst сделан (шаг 6), remove
     // оригинала (шаг 7) ЕЩЁ НЕ сделан. По комментарию segments.rs:3964-3972 оба файла лежат
     // рядом «минуты». Воспроизводим возвратом сырого файла после компакции.
@@ -749,11 +961,7 @@ fn sm9_compaction_midstate_does_not_duplicate_index() {
         victim.index
     );
 
-    let (fresh, _o) = cat.is_fresh(dir.path()).expect("is_fresh");
-    assert!(
-        fresh,
-        "SETUP НЕ СОСТОЯЛСЯ: is_fresh=false ⇒ полный refresh(), а предмет — инкрементальная ветка"
-    );
+    let (ops_mid, refreshed) = tick(&mut cat, dir.path());
     assert_eq!(
         cache_indices(&cat),
         truth_indices(dir.path()),
@@ -762,6 +970,31 @@ fn sm9_compaction_midstate_does_not_duplicate_index() {
          обходящий общий хелпер. Правило D-COMP-1 (при коллизии побеждает СЫРОЙ) не \
          применяется, и сессия получит события сегмента ДВАЖДЫ. Это дословно блокер PR-гейта \
          M-08: «3000 событий читалось как 3172, DET-I-1 молча нарушался»."
+    );
+    assert_catalog_truthful(&cat, dir.path(), "SM-9 такт промежуточного состояния");
+
+    // Бюджет вместо `assert!(fresh)`: такт, несущий событие каталога, вправе заплатить полную
+    // цену (легитимное значение оси 3, `sm4`) — но СЛЕДУЮЩИЙ, без события, обязан вернуться в
+    // бюджет. Прежний страж требовал КОНКРЕТНОЙ ветки и тем запрещал развязку «уходить в
+    // refresh() при коллизии индекса», которую вердикт `R-056` разрешает явно.
+    let (ops_quiet, refreshed_quiet) = tick(&mut cat, dir.path());
+    assert_catalog_truthful(&cat, dir.path(), "SM-9 такт без события каталога");
+    eprintln!(
+        "SM-9: full_scan={full} ops_mid={ops_mid}(refresh={refreshed}) \
+         ops_quiet={ops_quiet}(refresh={refreshed_quiet})"
+    );
+    assert!(
+        ops_mid <= full + BUDGET_META,
+        "SM-9: такт промежуточного состояния стоил {ops_mid} при потолке {} = полный обход \
+         {full} + дешёвая проба {BUDGET_META}: реализация обходит каталог ДВАЖДЫ за такт",
+        full + BUDGET_META
+    );
+    assert!(
+        ops_quiet <= BUDGET_META,
+        "SM-9: такт БЕЗ изменения состава каталога стоил {ops_quiet} при бюджете \
+         {BUDGET_META}. Пара `.jrnl`+`.jrnl.zst` живёт на диске часами (крах компакции между \
+         шагами 6 и 7, возврат сырого из бэкапа); реализация, которая на такой раскладке \
+         уходит в полный обход КАЖДЫЙ тик, платит O(N) всё это время — цена M-62 отменена."
     );
 }
 
