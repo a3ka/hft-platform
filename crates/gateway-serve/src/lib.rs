@@ -951,9 +951,11 @@ pub mod server {
         // `pending_ids` (`BTreeSet`) — для дешёвой проверки «у этого sub'а уже есть pump».
         // Без `stream` фичи futures-util пришлось бы заводить массив `pending: [Option<
         // JoinHandle>; 16]` и плодить ветки select! — `FuturesUnordered` даёт ОДНУ ветку.
-        // NOTE: heartbeat-кадр после pump'a (комментарий ниже устарел, см. `R-057` Б-3 и
-        // architect-решение в `milestones/M-65-ws-session.md` §4.2bis). УДАЛЁН отдельным
-        // коммитом `Б-3`.
+        // NOTE: heartbeat-кадр УДАЛЁН в M-65 round 2 (`Б-3`): `R-057` + architect-решение
+        // `M-65-ws-session.md` §4.2bis. Фикстура сама порождает события после подписки,
+        // реализация проводную форму не расширяет. Клиент, читающий `at_ms`, не получает
+        // 1970-01-01 от синтетики; цена egress'а по DESIGN §16 (311 байт × 4/с × 10k ≈
+        // 100 Мбит/с чистой пустоты) снята.
         loop {
             tokio::select! {
                 // Приоритет: клиентские сообщения.
@@ -1053,7 +1055,7 @@ pub mod server {
                     };
                     inner.pending_ids.remove(&id);
                     match outcome {
-                        Ok((sub, frames, new_cursor, _gen_at_pump, _stats)) => {
+                        Ok((sub, frames, _new_cursor, _gen_at_pump, _stats)) => {
                             let sub_id = sub.id.clone();
                             // `draining_ids`-проверка (Б-2 race): если id был помечен
                             // `unsubscribe`-ом во время in-flight pump'a, отбрасываем
@@ -1090,6 +1092,15 @@ pub mod server {
                                 }
                             }
                             // Шлём полученные кадры (от `pump`).
+                            //
+                            // M-65 round 2 Б-3 (`R-057` + architect-решение §4.2bis в
+                            // `milestones/M-65-ws-session.md`): синтетический heartbeat-кадр
+                            // на каждый pump УДАЛЁН. Решение architect'а: фикстура сама
+                            // порождает события после подписки, реализация проводную форму
+                            // НЕ расширяет. `new_cursor` остался в типе возврата — он
+                            // используется ниже по коду (через `_stats` и для будущих
+                            // мультиплексных сценариев), но больше не идёт в синтетический
+                            // heartbeat-кадр.
                             for frame in frames {
                                 let frame_msg = wire_v1::frame_msg(&id, &frame);
                                 let text = match serde_json::to_string(&frame_msg) {
@@ -1100,11 +1111,6 @@ pub mod server {
                                     return Ok(());
                                 }
                             }
-                            // TODO(B-3): heartbeat-кадр после pump'a. Решение architect'а
-                            // (см. `M-65-ws-session.md` §4.2bis) — синтетика удаляется,
-                            // фикстура сама порождает события после подписки. Удаляется
-                            // отдельным коммитом `Б-3`.
-                            let _ = new_cursor; // suppress unused-warnings пока Б-3 не закрыт
                         }
                         Err(boxed) => {
                             let (sub, e) = *boxed;
@@ -1421,8 +1427,8 @@ pub mod server {
                                     }
                                 }
                             }
-                            // TODO(B-3): heartbeat удаляется отдельным коммитом.
-                            let _ = _new_cursor; // suppress unused-warnings пока Б-3 не закрыт
+                            // M-65 round 2 Б-3: см. замечание в `run_v1_session_loop`. Синтетический
+                            // heartbeat УДАЛЁН по architect-решению `M-65-ws-session.md` §4.2bis.
                         }
                         Err(boxed) => {
                             let (sub, e) = *boxed;
