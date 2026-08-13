@@ -47,8 +47,14 @@ untracked, незапушенный коммит dev'а живёт только 
 
 ## Запрет `commit -a` / `add -A` в общем чекауте
 
-1. **Никогда `git commit -a` / `git add -A` в общем чекауте.** Только явные пути:
-   `git commit -- PROJECT-STATE.md TECH-DEBT.md`.
+1. **Коммит называет пути ЯВНО — в ЛЮБОМ дереве, не только в общем чекауте.** `git commit` без
+   путей берёт ВЕСЬ индекс, и `git add <файл>` его не сужает, а лишь дополняет. Для НОВОГО файла
+   `add` обязателен (`commit -- <новый>` без него падает: pathspec не совпадает). Форма:
+   `git add <новый>` при необходимости, затем `git commit -- <путь>…`; `commit -a` запрещён.
+   Барьер — `.githooks/pre-commit` (ставится `scripts/install_hooks.sh`, проба
+   `scripts/tests/red_commit_paths.sh`, 8 сценариев в CI); merge и `--amend` сообщения он не
+   задевает. Контур ПРЕДУПРЕЖДАЮЩИЙ: `--no-verify` обходит, на непроставленном клоне не
+   действует.
 2. **Коммит НЕ ИМЕЕТ ПРАВА удалять** `research/critiques/*`, `research/reviews/*`,
    `research/arbitration/*`, `milestones/*`, `docs/rfc/*`. `git status` показывает их
    удаление → СТОП, ты не на своей ветке. Механический барьер —
