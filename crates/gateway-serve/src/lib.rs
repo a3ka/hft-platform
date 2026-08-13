@@ -796,6 +796,14 @@ pub mod server {
                     }
                 };
                 let id_for_insert = new_sub.id.clone();
+                // M-65 round 2 Б-2 (`R-057`): снимаем `draining_ids`-пометку на этот id
+                // ВСЕГДА при успешной подписке. Иначе «вечное надгробие» (`R-057`: «помеченный
+                // id глушит любую будущую подписку с тем же именем») сохраняется от предыдущего
+                // `unsubscribe`, и клиент, законно переиспользующий id при перерисовке виджета
+                // (§2.2 «id назначает клиент»), получает sub, который тут же отбрасывается при
+                // первом завершении in-flight pump'а. Симметрия с unsubscribe (там пометка
+                // ВСЕГДА ставится — см. ниже).
+                inner.draining_ids.remove(&id_for_insert);
                 inner.subs.insert(id_for_insert.clone(), new_sub);
                 inner.subs_count += 1; // Логический счётчик: bump при УСПЕШНОМ add.
                 let snap_msg = wire_v1::snapshot_msg(&id_for_insert, &snap);
@@ -815,23 +823,41 @@ pub mod server {
             wire_v1::ClientMessage::Unsubscribe { id, .. } => {
                 let id_str = id.clone();
                 // Сценарий (O-10): unsubscribe может прийти ВО ВРЕМЯ in-flight pump'a
-                // — в этом момент sub изъят из карты (`tick`-ом), и `subs.remove`
+                // — в этот момент sub изъят из карты (`tick`-ом), и `subs.remove`
                 // вернёт None. Это НЕ «неизвестный id», а «sub был тут минуту
                 // назад, сейчас на нём висит pump». Если pump вернётся и положит
                 // sub обратно — клиент, думающий что подписка снята, получит лишние
                 // кадры. Защита: всегда добавляем id в `draining_ids`, независимо от
-                // результата `subs.remove`. Pump'a-completion прочтёт пометку и
+                // того, известен sub или нет. Pump'a-completion прочтёт пометку и
                 // отбросит результат (вместо put back в карту).
                 inner.draining_ids.insert(id_str.clone());
-                let was_known = inner.subs.remove(&id_str).is_some();
+                let in_subs = inner.subs.remove(&id_str).is_some();
+                let in_flight = inner.pending_ids.contains(&id_str);
+                let was_known = in_subs || in_flight;
                 if !was_known {
                     // Сесссионный (не per-sub) отказ — `sub` ставим `null`, чтобы
                     // assertion (`!tail.iter().any(|v| sub_of(v) == Some("gone"))` после
                     // unsubscribe) не ловил наш error как «поток по этой подписке
                     // продолжился». Совпадает с §2.7 (сессионные ошибки не
                     // привязаны к конкретному id).
+                    //
+                    // M-65 round 2 Б-2 (`R-057`): для НЕизвестного id пометка снимается —
+                    // пометка обещала «in-flight pump сейчас завершится и должен быть
+                    // отброшен», а при `!was_known` такого pump'а НЕ существует. Без
+                    // снятия пометка осталась бы до конца соединения ненужным state'ом.
+                    inner.draining_ids.remove(&id_str);
                     send_v1_error(sink, None, "unknown_id", "no such subscription id").await;
                     return Err(format!("unknown id {id_str}"));
+                }
+                // M-65 round 2 Б-2 (`R-057`): если in-flight pump'a на этот id НЕТ, пометка
+                // снимается СРАЗУ — иначе она остаётся до завершения pump'a (которого нет)
+                // и при будущей подписке с тем же id глушит её. На in-flight пути пометка
+                // остаётся: pump'a-completion прочтёт её и отбросит результат. Без этого
+                // разделения `draining_ids` превращается в «вечное надгробие» — id, помеченный
+                // при unsubscribe, больше никогда не подпишется полноценно (R-057: «помеченный
+                // id глушит любую будущую подписку с тем же именем»).
+                if !in_flight {
+                    inner.draining_ids.remove(&id_str);
                 }
                 inner.subs_count = inner.subs_count.saturating_sub(1);
                 tracing::debug!(sub = %id_str, "v1 unsubscribe ok");
