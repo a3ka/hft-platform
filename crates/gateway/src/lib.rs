@@ -1946,6 +1946,15 @@ pub struct ReadStats {
     /// отброшенные фильтром `after_seq`), проброшен из `journal::EventStream::events_scanned()`.
     /// Аддитивен к `events_decoded` — не заменяет его, оба сохраняют свой смысл.
     pub events_scanned: u64,
+    /// M-62 (TD-120), задача 1: число операций с МЕТАДАННЫМИ сегментов за проход
+    /// (`stat`, `File::open` ради заголовка, `read_dir`). Проброшен из
+    /// `journal::EventStream::segment_meta_ops()`. Аддитивен к двум предыдущим.
+    ///
+    /// На ПЕРВОМ тике сессии — `≥ N` (полный обход каталога, цена растёт с числом
+    /// сегментов). На УСТАНОВИВШЕМСЯ тике — `≤ BUDGET_META` (hit per-session кеша;
+    /// 1 stat + 1 read_dir независимо от N). Подробный бюджет — `SM-1..SM-6` в
+    /// `crates/gateway/tests/red_segment_meta_bound.rs` и спека §4.1.
+    pub segment_meta_ops: u64,
 }
 
 impl std::ops::Add for ReadStats {
@@ -1955,6 +1964,7 @@ impl std::ops::Add for ReadStats {
             events_decoded: self.events_decoded + rhs.events_decoded,
             segments_opened: self.segments_opened + rhs.segments_opened,
             events_scanned: self.events_scanned + rhs.events_scanned,
+            segment_meta_ops: self.segment_meta_ops + rhs.segment_meta_ops,
         }
     }
 }
@@ -1971,6 +1981,7 @@ fn read_stats_from_stream(stream: &journal::EventStream) -> ReadStats {
         events_decoded: stream.events_decoded(),
         segments_opened: stream.segments_opened(),
         events_scanned: stream.events_scanned(),
+        segment_meta_ops: stream.segment_meta_ops(),
     }
 }
 
@@ -2958,6 +2969,20 @@ pub struct LiveReducer {
     /// `None` — первый `pump()` или после валидационного отката (ротация / запрошены
     /// события из уже прочитанной зоны).
     tail_hint: Option<journal::TailHint>,
+    /// M-62 (TD-120), задачи 2+3: per-session кеш перечня сегментов каталога —
+    /// рядом с `tail_hint`, в той же in-memory памяти сессии. Решает M-62 (цена
+    /// тика не зависит от N). Передаётся в `journal::stream_from_at_with_catalog`
+    /// при каждом `pump()` и обновляется им же по результату `is_fresh`/`refresh`.
+    ///
+    /// Инвалидация — дешёвая (1 `stat` хвоста + 1 `read_dir` сравнение имён файлов
+    /// независимо от N): ловит и ротацию (`stat` покажет иной размер или отсутствие
+    /// пути), и компакцию закрытого сегмента (`read_dir` увидит иной состав имён
+    /// при неизменённом active).
+    ///
+    /// `None` — кеша ещё нет (до первого `pump()` после `resume()`); первый же
+    /// `pump()` строит кеш через `SegmentCatalog::open(dir)`, последующие —
+    /// проверяют свежесть и переиспользуют.
+    segment_catalog: Option<journal::SegmentCatalog>,
 }
 
 impl LiveReducer {
@@ -3005,6 +3030,11 @@ impl LiveReducer {
                     // заполнен ПЕРВЫМ ЖЕ pump'ом через `EventStream::tail_hint()`.
                     // Прямо здесь его вычислить нельзя: `EventStream` ещё не построен.
                     tail_hint: None,
+                    // M-62 (TD-120): кеш перечня сегментов строится первым же `pump()` —
+                    // он зовёт `SegmentCatalog::open(dir)`, который вернёт построенный кеш
+                    // обратно; здесь его вычислять нельзя, т.к. `dir` доступен caller'у,
+                    // а здесь мы НЕ читаем журнал (см. sacred `red_frames_seek_bound`).
+                    segment_catalog: None,
                 },
                 ReadStats::default(),
             ));
@@ -3050,6 +3080,11 @@ impl LiveReducer {
                 full_history_truncated: history_start_seq > 0,
                 // M-57 (TD-109): первый `pump()` заполнит hint из `EventStream::tail_hint()`.
                 tail_hint: None,
+                // M-62 (TD-120): кеш строится в первом же `pump()` через
+                // `SegmentCatalog::open(dir)`; здесь, на no-checkpoint ветке, `dir`
+                // уже был использован для catch-up прохода (для честного `ReadStats`),
+                // но мы НЕ сохраняем кеш — это работа следующего `pump()`.
+                segment_catalog: None,
             },
             stats,
         ))
@@ -3085,16 +3120,41 @@ impl LiveReducer {
         // покрыть его целиком, разбив на batch'и по `max_events`). `max_events` ограничивает
         // размер КАЖДОГО кадра (bounded-memory одного batch'а), не число кадров за вызов.
         //
-        // M-57 (круг 2, TD-109): используем `stream_from_at` с in-memory hint'ом, а не
-        // `stream_from`. `stream_from` (старый API, см. `segments.rs:1301`) НЕ принимает
-        // hint вообще — sidecar-файл `journal.tail-offset` удалён задачей 9, и
-        // `stream_from` каждый вызов декодирует активный сегмент с начала, даже если
-        // в нём уже миллионы событий (на проде к ротации сегмента ~10.7 млн — см. §0
-        // M-57, `F-035-1`). In-memory hint живёт в `self.tail_hint` (`None` на первом
-        // тике), обновляется после каждого прохода через `EventStream::tail_hint()` и
-        // естественно per-session (`F-035-2`).
-        let mut stream =
-            journal::stream_from_at(dir, filter, self.cursor.upto_seq, self.tail_hint)?;
+        // M-57 (круг 2, TD-109) + M-62 (TD-120): используем `stream_from_at_with_catalog`
+        // с in-memory hint'ом И per-session кешем перечня сегментов.
+        //
+        // - `stream_from` (старый API, см. `segments.rs:1301`) НЕ принимает hint вообще —
+        //   sidecar-файл `journal.tail-offset` удалён задачей M-57 №9, и `stream_from`
+        //   каждый вызов декодирует активный сегмент с начала, даже если в нём уже миллионы
+        //   событий (на проде к ротации сегмента ~10.7 млн — см. §0 M-57, `F-035-1`).
+        //   In-memory hint живёт в `self.tail_hint` (`None` на первом тике), обновляется
+        //   после каждого прохода через `EventStream::tail_hint()` и естественно
+        //   per-session (`F-035-2`).
+        // - `stream_from_at` (без каталога, см. `segments.rs:1599`) делает полный обход
+        //   `segments(dir)` на КАЖДОМ вызове: ~410 syscall'ов на проде (205 сегментов),
+        //   и число растёт НАВСЕГДА. M-62: per-session `SegmentCatalog` хранит результат
+        //   обхода в памяти и инвалидирует его дешёво (1 `stat` хвоста + 1 `read_dir`
+        //   независимо от N).
+        //
+        // Логика построения/переиспользования кеша:
+        //   - Первый тик сессии (`segment_catalog == None`) — `stream_from_at_with_catalog`
+        //     делает полный обход и возвращает ops в `EventStream.segment_meta_ops`. Сам
+        //     каталог возвращается в `Some(catalog)` ПОСЛЕ вызова (см. ниже).
+        //   - Установившийся тик — дешёвая проверка свежести (catalog.is_fresh);
+        //     hit ⇒ переиспользуем `catalog.segments()`, miss ⇒ `catalog.refresh()`.
+        //
+        // Заимствование `&mut self` + `&mut self.segment_catalog` нельзя совместить с
+        // вызовом, берущим `&mut` каталога — `take()`-аем каталог, передаём владением,
+        // получаем обратно (возможно освежённый).
+        let catalog_in = self.segment_catalog.take();
+        let (mut stream, catalog_out) = journal::stream_from_at_with_catalog(
+            dir,
+            filter,
+            self.cursor.upto_seq,
+            self.tail_hint,
+            catalog_in,
+        )?;
+        self.segment_catalog = catalog_out;
         let mut frames: Vec<Frame> = Vec::new();
         let mut cursor = self.cursor;
         let mut batch_from = self.cursor;
