@@ -196,9 +196,32 @@ $ diff <(awk '/══ TD-PARSER-BLOCK/,/КОНЕЦ TD-PARSER-BLOCK/' scripts/che
 `main`, дальше строка приводится к факту при close-out.
 
 **F2. Close-out (мой, после merge):** `TD-127` вносится ДОСЛОВНО из §6.2 спеки (номер
-подтверждён шагом N: `N TD: TD-127`); `TD-111` закрывается; статусы задач 2 и 6 в §Tasks
-приводятся к факту (`R-061` Н-4 — обе всё ещё `🚧`); `PROJECT-STATE.md` пополняется;
+подтверждён шагом N: `N TD: TD-127`); `TD-111` закрывается; ~~статусы задач 2 и 6 в §Tasks
+приводятся к факту (`R-061` Н-4 — обе всё ещё `🚧`)~~; `PROJECT-STATE.md` пополняется;
 `gc_worktrees.sh` по `branch-hygiene` §Worktree lifecycle п.5.
+
+> **Поправка reviewer'а к собственному §F2 (2026-08-13, после merge'а).** Вычеркнутый пункт
+> был ошибкой ЗОНЫ: `milestones/**` — не reviewer'ская область (`scope-guard` §Таблица
+> владения: reviewer пишет `PROJECT-STATE.md`, `TECH-DEBT.md`, PR-комменты; carve-out на
+> колонку Status выдан DEV-агенту активного milestone'а, не мне). Статусы задач 2 и 6, как и
+> строка M-61 в `SESSION-HANDOFF` §0, приводятся к факту **architect'ом** — вместе с тремя
+> NOTE выше. Я их не трогал: ни один из четырёх close-out-коммитов
+> (`add48a7`, `16cec80`, `5fba303` и этот) не касается `milestones/**`.
+>
+> **Что фактически исполнено по §F2:** `TD-111` ✅ CLOSED и `TD-127` внесён (`add48a7`);
+> `TD-128` заведён на находку PR-гейта (`16cec80`, номер выдан аллокатором — `TD-128` после
+> введения `TD-127`, то есть механизмом, который этот же merge и внёс); `PROJECT-STATE.md`
+> пополнен (`5fba303`); `gc_worktrees.sh` отработал (осталось 32 worktree, ни один
+> dirty/несмерженный не тронут), общий кэш сборки цепочки `/tmp/m61-shared-target` (11 GB)
+> снесён — диск 84 % → 82 %.
+>
+> **§8 деплой-гейт.** Deploy-рана нет ПО УСТРОЙСТВУ: `deploy.yml` фильтрован по
+> `crates/** · Cargo.toml · Cargo.lock · Dockerfile · docker-compose.yml · deploy.yml`, merge
+> не тронул ни одного пути — и это верно, редеплой стоил бы гэпа в forward-only записи
+> recorder'а. Eyes-on VPS после merge'а: `hft-recorder` и `hft-gateway-serve` — `Up 4 days
+> (healthy)`; heartbeat `ts_wall_ms=1786652568830` против `date +%s = 1786652574` ⇒ свежесть
+> 6 секунд; `writable=true`, `free_bytes=56.6 GB` при пороге 10 GB; журнал растёт
+> (`segment-00000273.jrnl`, 45 G суммарно). Терминальный статус CI — в Done Block ниже.
 
 ## §E — о перепроверке `gates.md` §9
 
