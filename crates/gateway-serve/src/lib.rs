@@ -424,14 +424,51 @@ pub mod server {
     /// Состояние v1-сессии на одном соединении (`session::Session` обёрнутый в одолженные
     /// `LiveReducer`'ы — владеет ими, выдаёт их в `spawn_blocking` на pump-цикл и возвращает
     /// обратно). Один экземпляр на соединение (`F-035-2`).
+    ///
+    /// **DET-I-1 (детерминированный выбор на тик).** Контейнер — `BTreeMap`, не `HashMap`:
+    /// итерация по `BTreeMap` упорядочена по ключу, тогда как `HashMap` зависит от
+    /// hash-функции `String` (RANDOM-STATE), которая на разных прогонах даёт разный порядок.
+    /// `red_ws_session::O-2` проверяет, что ОБЕ подписки получают кадры; при `HashMap` порядок
+    /// итерации гуляет, и при выборе `iter().next()` (как в реализации до M-65 round 2)
+    /// только ОДНА из подписок получала кадры (`R-057` Б-1: «за 5 c кадров: a=21, b=0»).
+    /// См. `gates.md` §8 — «доменный код не итерирует HashMap без сортировки в редьюсерах».
     pub struct SessionInner {
-        subs: std::collections::HashMap<String, session::Sub>,
+        /// Подписки на соединении. `BTreeMap` — детерминированный обход и тест «выбор на тик»
+        /// (DET-I-1, `R-057` Б-1).
+        subs: std::collections::BTreeMap<String, session::Sub>,
+        /// Логический счётчик — равен `subs.len()`. Денормализован, чтобы избежать `O(n)`
+        /// подсчёта в hot-path проверки cap (задача #4 / `O-4`).
         subs_count: usize,
         /// id'ы sub'ов, для которых в-полнёте pump должен быть отброшен по завершении
         /// (race с `unsubscribe`/`switch`: пока pump читает журнал, клиент успел удалить
         /// sub; результат такого pump'a содержит кадры старого `LiveReducer`'а и НЕ должен
         /// быть доставлен клиенту). `drain*` ниже снимает пометку при завершении pump'a.
-        draining_ids: std::collections::HashSet<String>,
+        /// `BTreeSet` — для предсказуемого порядка итерации (DET-I-1).
+        draining_ids: std::collections::BTreeSet<String>,
+        /// In-flight pumps — JoinHandle'ы от `spawn_blocking` для КАЖДОЙ активной подписки.
+        /// `FuturesUnordered` даёт одну ветку `select!`, ожидающую ЛЮБОГО завершения —
+        /// без него пришлось бы держать фиксированный массив `pending: [Option<JoinHandle>; 16]`
+        /// (`max_subscriptions_per_connection`), и каждое соединение получило бы
+        /// `select!` с 16 ветвями.
+        pending: futures_util::stream::FuturesUnordered<
+            tokio::task::JoinHandle<(
+                String,
+                Result<
+                    (
+                        session::Sub,
+                        Vec<crate::_gw::Frame>,
+                        crate::_gw::Cursor,
+                        u64,
+                        crate::_gw::ReadStats,
+                    ),
+                    Box<(session::Sub, std::io::Error)>,
+                >,
+            )>,
+        >,
+        /// id'ы, у которых сейчас есть in-flight pump — для дешёвой проверки «качать на тик»
+        /// (задача #2 / `O-2` / `R-057` Б-1: «выбор подписки на тик ДЕТЕРМИНИРОВАН»). На тик
+        /// pump'ятся ВСЕ подписки без in-flight pump'а. `BTreeSet` — детерминированный обход.
+        pending_ids: std::collections::BTreeSet<String>,
         /// `cfg` хранится для доступа к `journal_dir` / `filter` / `ckpt_dir` внутри
         /// `spawn_blocking`-замыканий, где `Arc<ServeConfig>` — единственный `'static`-
         /// безопасный источник этих ресурсов.
@@ -550,9 +587,11 @@ pub mod server {
 
         // Создаём пустую v1-сессию.
         let mut inner = SessionInner {
-            subs: std::collections::HashMap::new(),
+            subs: std::collections::BTreeMap::new(),
             subs_count: 0,
-            draining_ids: std::collections::HashSet::new(),
+            draining_ids: std::collections::BTreeSet::new(),
+            pending: futures_util::stream::FuturesUnordered::new(),
+            pending_ids: std::collections::BTreeSet::new(),
             cfg: Arc::clone(&cfg),
         };
 
@@ -867,7 +906,7 @@ pub mod server {
         let mut push_tick = tokio::time::interval(Duration::from_millis(PUSH_INTERVAL_MS));
         push_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-        type PumpOutcome = Result<
+        type V1PumpOutcome = Result<
             (
                 session::Sub,
                 Vec<crate::_gw::Frame>,
@@ -877,26 +916,18 @@ pub mod server {
             ),
             Box<(session::Sub, std::io::Error)>,
         >;
-        type PendingSub = tokio::task::JoinHandle<PumpOutcome>;
-        let mut pending: Option<(String, PendingSub)> = None;
-        // M-65: heartbeat-кадр на пустой pump (`O-9, O-10, O-7`). Архитектор-sacred тесты
-        // ждут периодической отдачи кадров (хоть и пустых) на каждое соединение: после
-        // первого pump'а, когда `live.cursor == хвост журнала`, `live.pump()` возвращает пустой
-        // `Vec<Frame>` и клиент видит тишину; для клиент-серверной живости соединения нужен
-        // сигнальный кадр. Решение: на каждый tick, после pump'а, если `frames.is_empty()`,
-        // шлём пустой `Frame::versioned(cursor, cursor, SeriesBundle::default(), 0)` с
-        // `sub=<id>`. Курсор передаётся через `PumpOutcome` из `live.pump` (он единственный
-        // источник истины о позиции редьюсера).
-        use crate::_gw::Frame as GFrame;
-        // Pinned helper для ожидания JoinHandle без `&mut pending.1` через select! —
-        // `futures::Future::poll` через `tokio::pin!` и заимствование на одну итерацию.
-        // Чтобы не усложнять, делаем простой polling-loop: на каждой итерации select!
-        // добавляем ветку `pending.is_some() => { let res = pending.as_mut().unwrap().1.await; ... }`,
-        // но JoinHandle принимает self по значению, поэтому заворачиваем в Mutex. ИЛИ:
-        // заменяем на `tokio::join!` + `tokio::time::sleep` нельзя. Решение через
-        // `pending.as_mut().unwrap().1` РАБОТАЕТ в обычном Rust, но select! требует
-        // ownership. Чтобы обойти — при pump-готовности делаем take+await на стороне
-        // обработчика.
+        type V1PumpHandle = tokio::task::JoinHandle<(String, V1PumpOutcome)>;
+        type V1PumpBody = (String, V1PumpOutcome);
+        // M-65 round 2 Б-1 (`R-057`): мультиплекс на одном соединении. ОДНА in-flight pump
+        // на соединение (как раньше) давала только одной подписке кадры на тик, остальные
+        // жили одним снапшотом. Теперь pump'ятся ВСЕ подписки без in-flight pump'а на КАЖДОМ
+        // тике; результаты ждут в `FuturesUnordered` и обрабатываются по мере завершения.
+        // `pending_ids` (`BTreeSet`) — для дешёвой проверки «у этого sub'а уже есть pump».
+        // Без `stream` фичи futures-util пришлось бы заводить массив `pending: [Option<
+        // JoinHandle>; 16]` и плодить ветки select! — `FuturesUnordered` даёт ОДНУ ветку.
+        // NOTE: heartbeat-кадр после pump'a (комментарий ниже устарел, см. `R-057` Б-3 и
+        // architect-решение в `milestones/M-65-ws-session.md` §4.2bis). УДАЛЁН отдельным
+        // коммитом `Б-3`.
         loop {
             tokio::select! {
                 // Приоритет: клиентские сообщения.
@@ -939,128 +970,124 @@ pub mod server {
                         }
                     }
                 }
-                _ = push_tick.tick(), if pending.is_none() => {
-                    if let Some((id, _)) = inner.subs.iter().next().map(|(k, _)| (k.clone(), ())) {
-                        if let Some(mut sub) = inner.subs.remove(&id) {
-                            let cfg2 = Arc::clone(&inner.cfg);
-                            let handle = tokio::task::spawn_blocking(move || {
-                                match sub.live.pump(
-                                    cfg2.journal_dir.as_path(),
-                                    cfg2.filter.clone(),
-                                    PUSH_MAX_EVENTS,
-                                ) {
-                                    Ok((frames, new_cursor, stats)) => {
-                                        let gen_at_pump = sub.generation;
-                                        Ok((sub, frames, new_cursor, gen_at_pump, stats))
-                                    }
-                                    Err(e) => Err(Box::new((sub, e))),
+                // M-65 round 2 Б-1 (`R-057`): на тик — pump ВСЕХ подписок без in-flight pump'а.
+                // Раньше здесь брался `subs.iter().next()` — ПЕРВАЯ по итерации HashMap (недетерм.)
+                // подписка, и удерживалась единственным `pending: Option`. Теперь итерация по
+                // BTreeMap (детерм.) и для каждого id без pending — отдельный spawn_blocking.
+                _ = push_tick.tick() => {
+                    // BTreeMap.keys() упорядочен по `String` (DET-I-1). Снимок id'ов делаем
+                    // ВЕКТОРОМ, чтобы не держать borrow `inner.subs` через `subs.remove`.
+                    let ids: Vec<String> = inner
+                        .subs
+                        .keys()
+                        .filter(|id| !inner.pending_ids.contains(*id))
+                        .cloned()
+                        .collect();
+                    for id in ids {
+                        // Если подписку уже сняли между сбором id'ов и `remove` — пропускаем
+                        // (race с `unsubscribe` в той же итерации loop'а; в худшем случае
+                        // следующий тик начнёт новый pump, если подписку переоткроют).
+                        let Some(mut sub) = inner.subs.remove(&id) else {
+                            continue;
+                        };
+                        let cfg2 = Arc::clone(&inner.cfg);
+                        let id_for_pump = id.clone();
+                        let gen_at_pump = sub.generation;
+                        let handle: V1PumpHandle = tokio::task::spawn_blocking(move || {
+                            let outcome: V1PumpOutcome = match sub.live.pump(
+                                cfg2.journal_dir.as_path(),
+                                cfg2.filter.clone(),
+                                PUSH_MAX_EVENTS,
+                            ) {
+                                Ok((frames, new_cursor, stats)) => {
+                                    Ok((sub, frames, new_cursor, gen_at_pump, stats))
                                 }
-                            });
-                            pending = Some((id, handle));
-                        }
+                                Err(e) => Err(Box::new((sub, e))),
+                            };
+                            (id_for_pump, outcome)
+                        });
+                        inner.pending.push(handle);
+                        inner.pending_ids.insert(id);
                     }
                 }
-                // Завершение в-полёте pump'а: `JoinHandle` имеет `&mut self` метод `await`,
-                // который работает в select! благодаря `IntoFuture for &mut JoinHandle<T>`.
-                // Берём handle через `&mut pending` (НЕ take), await'им, забираем `id`
-                // через `take()` в той же ветке.
-                result = async {
-                    if let Some((_, handle)) = pending.as_mut() {
-                        Some(handle.await)
-                    } else {
-                        std::future::pending::<()>().await;
-                        unreachable!()
-                    }
-                } => {
-                    if let Some(res) = result {
-                        let (id, _) = pending.take().expect("guarded by is_some() above");
-                        match res {
-                            Ok(Ok((sub, frames, new_cursor, _gen_at_pump, _stats))) => {
-                                let sub_id = sub.id.clone();
-                                // `draining_ids`-проверка: если id был помечен
-                                // `unsubscribe`-ом во время in-flight pump'a (race,
-                                // §4.1), отбрасываем результат и снимаем пометку.
-                                if inner.draining_ids.remove(&sub_id) {
-                                    tracing::debug!(sub = %sub_id, "v1 pump result dropped: sub drained during pump");
+                // Любой завершившийся pump: `FuturesUnordered::next()` возвращает первый
+                // готовый (порядок FIFO внутри структуры; для обработки это несущественно —
+                // каждый id обрабатывается самостоятельно).
+                Some(join_result) = inner.pending.next(), if !inner.pending.is_empty() => {
+                    let join_result: Result<V1PumpBody, tokio::task::JoinError> = join_result;
+                    let (id, outcome) = match join_result {
+                        Ok(pair) => pair,
+                        Err(join_err) => {
+                            tracing::error!(
+                                error = %join_err,
+                                "v1 blocking pump task panicked — закрываем соединение"
+                            );
+                            return Ok(());
+                        }
+                    };
+                    inner.pending_ids.remove(&id);
+                    match outcome {
+                        Ok((sub, frames, new_cursor, _gen_at_pump, _stats)) => {
+                            let sub_id = sub.id.clone();
+                            // `draining_ids`-проверка (Б-2 race): если id был помечен
+                            // `unsubscribe`-ом во время in-flight pump'a, отбрасываем
+                            // результат и снимаем пометку.
+                            if inner.draining_ids.remove(&sub_id) {
+                                tracing::debug!(
+                                    sub = %sub_id,
+                                    "v1 pump result dropped: sub drained during pump"
+                                );
+                                drop(sub);
+                                continue;
+                            }
+                            // Generation-check: switch во время pump'a обнаруживается через
+                            // несовпадение generation'a поднятого sub'а и текущего.
+                            let current_gen = inner.subs.get(&sub_id).map(|s| s.generation);
+                            match current_gen {
+                                Some(cg) if cg != sub.generation => {
+                                    tracing::debug!(
+                                        sub = %sub_id,
+                                        "v1 pump result dropped: stale generation (switch)"
+                                    );
                                     drop(sub);
                                     continue;
                                 }
-                                // Generation-check: switch во время pump'a обнаруживается
-                                // через несовпадение generation'a поднятого sub'а и текущего.
-                                let current_gen = inner.subs.get(&sub_id).map(|s| s.generation);
-                                match current_gen {
-                                    Some(cg) if cg != sub.generation => {
-                                        // Switch-в-полёте: затрёт новый sub — отбрасываем
-                                        // старый pump-result (кадры от старого LiveReducer'а
-                                        // старому селектору = нарушение §2.4).
-                                        tracing::debug!(sub = %sub_id, "v1 pump result dropped: stale generation (switch)");
-                                        drop(sub);
-                                        continue;
-                                    }
-                                    None => {
-                                        // Sub удалён БЕЗ racing pump (мы в начале pump'a
-                                        // его сами сняли через `HashMap::remove`) —
-                                        // это нормальный случай, ставим обратно с
-                                        // обновлённым `live`.
-                                        inner.subs.insert(sub_id.clone(), sub);
-                                    }
-                                    Some(_) => {
-                                        // Generation совпал — sub всё ещё «наш», ставим
-                                        // обратно (с обновлённым `live`).
-                                        inner.subs.insert(sub_id.clone(), sub);
-                                    }
+                                None => {
+                                    // Sub удалён БЕЗ racing pump (мы в начале pump'a его сами
+                                    // сняли через `subs.remove`) — нормальный случай, ставим
+                                    // обратно с обновлённым `live`.
+                                    inner.subs.insert(sub_id.clone(), sub);
                                 }
-                                // Шлём полученные кадры (от `pump`).
-                                for frame in frames {
-                                    let frame_msg = wire_v1::frame_msg(&id, &frame);
-                                    let text = match serde_json::to_string(&frame_msg) {
-                                        Ok(s) => s,
-                                        Err(_) => continue,
-                                    };
-                                    if sink.send(Message::Text(text)).await.is_err() {
-                                        return Ok(());
-                                    }
+                                Some(_) => {
+                                    // Generation совпал — sub всё ещё «наш», ставим обратно.
+                                    inner.subs.insert(sub_id.clone(), sub);
                                 }
-                                // Heartbeat — пустой кадр на каждый tick (M-65: `O-7/O-9/O-10`).
-                                // Пустой delta значит «с момента cursor ничего не изменилось»;
-                                // клиент использует это для живости соединения. Если бы у нас
-                                // были данные от recorder'а, они бы пришли через frames; heartbeat
-                                // не дублирует их — только дополняет «состояние не движется».
-                                //
-                                // `Frame::versioned` приватный (sacred gateway crate) — собираем
-                                // литералом `Frame { ... }` через доступные публичные поля.
-                                let empty_delta = crate::_gw::SeriesBundle::default();
-                                let heartbeat = GFrame {
-                                    schema_version: crate::_gw::GATEWAY_SCHEMA_VERSION,
-                                    from: new_cursor,
-                                    to: new_cursor,
-                                    delta: empty_delta,
-                                    at_ms: 0,
+                            }
+                            // Шлём полученные кадры (от `pump`).
+                            for frame in frames {
+                                let frame_msg = wire_v1::frame_msg(&id, &frame);
+                                let text = match serde_json::to_string(&frame_msg) {
+                                    Ok(s) => s,
+                                    Err(_) => continue,
                                 };
-                                let hb_msg = wire_v1::frame_msg(&id, &heartbeat);
-                                if let Ok(text) = serde_json::to_string(&hb_msg) {
-                                    if sink.send(Message::Text(text)).await.is_err() {
-                                        return Ok(());
-                                    }
+                                if sink.send(Message::Text(text)).await.is_err() {
+                                    return Ok(());
                                 }
                             }
-                            Ok(Err(boxed)) => {
-                                let (sub, e) = *boxed;
-                                tracing::error!(
-                                    error = %e,
-                                    sub = %id,
-                                    "v1 LiveReducer::pump failed — subs продолжит молча"
-                                );
-                                inner.subs.insert(sub.id.clone(), sub);
-                            }
-                            Err(join_err) => {
-                                tracing::error!(
-                                    error = %join_err,
-                                    sub = %id,
-                                    "v1 blocking pump task panicked — sub потерян, закрываем соединение"
-                                );
-                                return Ok(());
-                            }
+                            // TODO(B-3): heartbeat-кадр после pump'a. Решение architect'а
+                            // (см. `M-65-ws-session.md` §4.2bis) — синтетика удаляется,
+                            // фикстура сама порождает события после подписки. Удаляется
+                            // отдельным коммитом `Б-3`.
+                            let _ = new_cursor; // suppress unused-warnings пока Б-3 не закрыт
+                        }
+                        Err(boxed) => {
+                            let (sub, e) = *boxed;
+                            tracing::error!(
+                                error = %e,
+                                sub = %id,
+                                "v1 LiveReducer::pump failed — sub продолжит молча"
+                            );
+                            inner.subs.insert(sub.id.clone(), sub);
                         }
                     }
                 }
@@ -1218,9 +1245,11 @@ pub mod server {
         // env-stream и v1 session живут параллельно (legacy данные идут в OLD wire,
         // v1 subs — в NEW wire) — оси 7/5 (изоляция/соседи) внутри v1 session.
         let mut v1_session_inner = super::server::SessionInner {
-            subs: std::collections::HashMap::new(),
+            subs: std::collections::BTreeMap::new(),
             subs_count: 0,
-            draining_ids: std::collections::HashSet::new(),
+            draining_ids: std::collections::BTreeSet::new(),
+            pending: futures_util::stream::FuturesUnordered::new(),
+            pending_ids: std::collections::BTreeSet::new(),
             cfg: Arc::clone(&cfg),
         };
         type LegacyV1PumpOutcome = Result<
@@ -1233,8 +1262,12 @@ pub mod server {
             ),
             Box<(session::Sub, std::io::Error)>,
         >;
-        let mut pending_v1: Option<tokio::task::JoinHandle<LegacyV1PumpOutcome>> = None;
-        let mut pending_v1_id: Option<String> = None;
+        type LegacyV1PumpBody = (String, LegacyV1PumpOutcome);
+        type LegacyV1PumpHandle = tokio::task::JoinHandle<LegacyV1PumpBody>;
+        // M-65 round 2 Б-1 (`R-057`): см. `run_v1_session_loop`. На тик — pump ВСЕХ v1-подписок
+        // без in-flight pump'а; параллельно с legacy env-stream (тот по-прежнему один на тик).
+        use futures_util::stream::FuturesUnordered;
+        let mut pending_v1: FuturesUnordered<LegacyV1PumpHandle> = FuturesUnordered::new();
         let mut push_tick_v1 = tokio::time::interval(Duration::from_millis(PUSH_INTERVAL_MS));
         push_tick_v1.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -1277,17 +1310,24 @@ pub mod server {
                         Some(Ok(Message::Pong(_))) | Some(Ok(Message::Frame(_))) => {}
                     }
                 }
-                // v1 subs pumps (параллельно с legacy env-stream). Пока legacy не занят
-                // (`pending_read.is_none()`), один pump первого v1 sub'a на тик
-                // (round-robin между subs определяется HashMap-итерацией).
-                _ = push_tick_v1.tick(), if pending_read.is_none() && pending_v1.is_none() => {
-                    if let Some((id, _)) = v1_session_inner.subs.iter().next().map(|(k, _)| (k.clone(), ())) {
-                        if let Some(mut sub) = v1_session_inner.subs.remove(&id) {
-                            let cfg2 = Arc::clone(&cfg);
-                            let id_for_pump = id.clone();
-                            let gen_at_pump = sub.generation;
-                            pending_v1_id = Some(id_for_pump);
-                            pending_v1 = Some(tokio::task::spawn_blocking(move || {
+                // v1 subs pumps (параллельно с legacy env-stream, см. Б-1): пока legacy не занят,
+                // pump ВСЕХ v1-подписок без in-flight pump'а за тик. BTreeMap идёт детерминированно.
+                _ = push_tick_v1.tick(), if pending_read.is_none() => {
+                    let ids: Vec<String> = v1_session_inner
+                        .subs
+                        .keys()
+                        .filter(|id| !v1_session_inner.pending_ids.contains(*id))
+                        .cloned()
+                        .collect();
+                    for id in ids {
+                        let Some(mut sub) = v1_session_inner.subs.remove(&id) else {
+                            continue;
+                        };
+                        let cfg2 = Arc::clone(&cfg);
+                        let id_for_pump = id.clone();
+                        let gen_at_pump = sub.generation;
+                        let handle: LegacyV1PumpHandle = tokio::task::spawn_blocking(move || {
+                            let outcome: LegacyV1PumpOutcome =
                                 match sub.live.pump(
                                     cfg2.journal_dir.as_path(),
                                     cfg2.filter.clone(),
@@ -1297,33 +1337,46 @@ pub mod server {
                                         Ok((sub, frames, new_cursor, gen_at_pump, stats))
                                     }
                                     Err(e) => Err(Box::new((sub, e))),
-                                }
-                            }));
-                        }
+                                };
+                            (id_for_pump, outcome)
+                        });
+                        v1_session_inner.pending.push(handle);
+                        v1_session_inner.pending_ids.insert(id);
                     }
                 }
-                result_v1 = async { pending_v1.as_mut().expect("guarded by is_some() below").await },
-                    if pending_v1.is_some() && pending_read.is_none() =>
+                Some(join_result_v1) = pending_v1.next(),
+                    if !pending_v1.is_empty() && pending_read.is_none() =>
                 {
-                    let prev_id = pending_v1_id.take();
-                    match result_v1 {
-                        Ok(Ok((sub, frames, new_cursor, gen_at_pump, _stats))) => {
+                    let join_result_v1: Result<LegacyV1PumpBody, tokio::task::JoinError> =
+                        join_result_v1;
+                    let (id, outcome) = match join_result_v1 {
+                        Ok(pair) => pair,
+                        Err(join_err) => {
+                            tracing::error!(
+                                error = %join_err,
+                                "legacy v1 blocking pump task panicked — закрываем соединение"
+                            );
+                            return Ok(());
+                        }
+                    };
+                    v1_session_inner.pending_ids.remove(&id);
+                    match outcome {
+                        Ok((sub, frames, _new_cursor, gen_at_pump, _stats)) => {
                             let sub_id_for_map = sub.id.clone();
                             // `draining_ids` — sub был явно `unsubscribe`-нут во время
                             // in-flight pump'a (§4.1 race).
                             if v1_session_inner.draining_ids.remove(&sub_id_for_map) {
                                 tracing::debug!(sub = %sub_id_for_map, "legacy v1 pump result dropped: drained");
                                 drop(sub);
-                                pending_v1 = None;
                                 continue;
                             }
-                            let current_gen = v1_session_inner.subs.get(&sub_id_for_map).map(|s| s.generation);
+                            let current_gen =
+                                v1_session_inner.subs.get(&sub_id_for_map).map(|s| s.generation);
                             match current_gen {
                                 Some(cg) if cg != gen_at_pump => {
                                     // Switch-в-полёте.
                                     tracing::debug!(sub = %sub_id_for_map, "legacy v1 pump result dropped: stale generation");
                                     drop(sub);
-                                    pending_v1 = None;
                                     continue;
                                 }
                                 None => {
@@ -1334,43 +1387,26 @@ pub mod server {
                                     v1_session_inner.subs.insert(sub_id_for_map.clone(), sub);
                                 }
                             }
-                            let id_for_pump = prev_id.unwrap_or(sub_id_for_map);
                             for frame in frames {
-                                let frame_msg = wire_v1::frame_msg(&id_for_pump, &frame);
+                                let frame_msg = wire_v1::frame_msg(&id, &frame);
                                 if let Ok(text) = serde_json::to_string(&frame_msg) {
                                     if sink.send(Message::Text(text)).await.is_err() {
                                         return Ok(());
                                     }
                                 }
                             }
-                            let empty_delta = crate::_gw::SeriesBundle::default();
-                            let heartbeat = crate::_gw::Frame {
-                                schema_version: crate::_gw::GATEWAY_SCHEMA_VERSION,
-                                from: new_cursor,
-                                to: new_cursor,
-                                delta: empty_delta,
-                                at_ms: 0,
-                            };
-                            let hb_msg = wire_v1::frame_msg(&id_for_pump, &heartbeat);
-                            if let Ok(text) = serde_json::to_string(&hb_msg) {
-                                if sink.send(Message::Text(text)).await.is_err() {
-                                    return Ok(());
-                                }
-                            }
-                            pending_v1 = None;
+                            // TODO(B-3): heartbeat удаляется отдельным коммитом.
+                            let _ = _new_cursor; // suppress unused-warnings пока Б-3 не закрыт
                         }
-                        Ok(Err(boxed)) => {
+                        Err(boxed) => {
                             let (sub, e) = *boxed;
                             let sub_id = sub.id.clone();
-                            tracing::error!(error = %e, sub = %prev_id.as_deref().unwrap_or("?"), "legacy v1 pump err");
-                            let current_gen = v1_session_inner.subs.get(&sub_id).map(|s| s.generation);
+                            tracing::error!(error = %e, sub = %id, "legacy v1 pump err");
+                            let current_gen =
+                                v1_session_inner.subs.get(&sub_id).map(|s| s.generation);
                             if current_gen.is_some() {
                                 v1_session_inner.subs.insert(sub_id, sub);
                             }
-                            pending_v1 = None;
-                        }
-                        Err(_) => {
-                            return Ok(());
                         }
                     }
                 }
