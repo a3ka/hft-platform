@@ -913,6 +913,14 @@ def gather_sha_tokens(root, path):
     for i, line in enumerate(lines, start=1):
         if i in fence_lines:
             continue
+        # G2 (M-60 §0): токен ВНУТРИ маркера <!-- not-a-commit: X --> — метаданные ОБ
+        # утверждении, а не утверждение о коммите; вхождением НЕ считается, иначе баланс
+        # `всего=N` раздувается и перестаёт отвечать на вопрос «сколько утверждений о
+        # коммитах делает документ». Без этого исключения строка маркера сама проходит
+        # COMMIT_CONTEXT_RE (слово `commit` внутри `not-a-commit`) и BARE_SHA_RE считал
+        # токен объявления лишним вхождением (замер: RFC-SHA-balance давал всего=4 при 3).
+        # Токен, стоящий на той же строке ВНЕ маркера, по-прежнему считается.
+        decl_spans = [m.span() for m in NOT_A_COMMIT_DECL_RE.finditer(line)]
         seen_spans = []
         for m in SHA_TOKEN_RE.finditer(line):
             tok = m.group(1)
@@ -923,6 +931,8 @@ def gather_sha_tokens(root, path):
             for m in BARE_SHA_RE.finditer(line):
                 if any(a <= m.start(1) < b for a, b in seen_spans):
                     continue  # уже учтён как backtick-токен
+                if any(a <= m.start(1) < b for a, b in decl_spans):
+                    continue  # стоит внутри маркера объявления — не вхождение (G2)
                 tok = m.group(1)
                 out.append((relpath, i, tok, classify_sha_token(tok, declared, root)))
     return out
