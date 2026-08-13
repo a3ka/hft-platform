@@ -443,8 +443,7 @@ pub mod server {
     /// Тип JoinHandle для v1-выполнения pump'a (`Б-1` мультиплекс, `R-057`). Каждый pump —
     /// `spawn_blocking`-future, возвращающая `(sub_id, Result<...>)`; `FuturesUnordered`
     /// собирает их в одну очередь завершения для `select!` без per-id веток.
-    pub type V1PumpJoin =
-        tokio::task::JoinHandle<(String, V1PumpResult)>;
+    pub type V1PumpJoin = tokio::task::JoinHandle<(String, V1PumpResult)>;
     /// Результат v1-pump'a: ok = (sub, frames, cursor, gen_at_pump, stats); err = боксированный
     /// sub с ошибкой (нужен для восстановления состояния при pump-ошибке).
     pub type V1PumpResult = Result<
