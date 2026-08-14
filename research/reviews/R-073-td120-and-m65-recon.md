@@ -475,6 +475,30 @@ completed  success  fix(TD-135): R-069 N-1 …                     CI  main  pus
 их не ловит; прод при этом проверен глазами независимо (§2.5) — оба контейнера `(healthy)`,
 heartbeat свежий, журнал растёт.
 
+**§8 close-out — CI на `main` ПОСЛЕ merge'а и eyes-on прода:**
+
+```
+$ gh run list --branch main --limit 2
+completed  success  docs(review): R-073 — livelock разомкнут…  CI  main  push  31815145728  10m53s
+completed  success  fix(TD-150): перенумерация ×4 …           CI  main  push  31814136010  10m47s
+
+$ ssh … 'docker ps; cat …/recorder.heartbeat; RssAnon'        # 2026-08-14T15:45:16Z
+hft-gateway-serve Up 3 hours (healthy)
+hft-recorder      Up 3 hours (healthy)
+{"events":1556791,"free_bytes":56999985152,"next_seq":235206284,"segment_index":282,"writable":true}
+recorder RssAnon: 21636 kB   gateway-serve RssAnon: 32896 kB
+```
+
+Мой merge — **CI success**. Деплой не триггерится (docs-only, path-фильтр `deploy.yml`), прод
+проверен независимо: оба контейнера `(healthy)`, heartbeat свежий, журнал растёт
+(`next_seq` +1.23 млн с момента замера, `segment_index` 281 → 282), диск 57.0 GB.
+
+**Побочная находка close-out'а, зачтённая в `TD-149`:** `RssAnon` `gateway-serve` через
+2.5 часа простоя — **32 896 kB, байт в байт то же число**, что сразу после teardown. Роста
+нет ⇒ различение сдвинуто к плато/удержанию аллокатора, но запись НЕ закрывается: не
+проверен повторный цикл сессий (ставит ли каждый цикл новую полку). Ветки предметов после
+входа в `main` удалены (`gates.md` §9).
+
 **Тесты не прогонялись, и это осознанно:** ни один предмет не трогает `crates/**` — оба
 дифа состоят из одного `.md` каждый (§1). Прогон `cargo test --all` здесь ничего бы не
 подтвердил о предмете; вместо него предъявлено то, что предмету релевантно: воспроизведение
