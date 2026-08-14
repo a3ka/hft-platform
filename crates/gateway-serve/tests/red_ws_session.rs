@@ -32,7 +32,7 @@
 
 use contracts::{to_fixed, DataSource, EventKind, Level, MdPayload, Side, Venue};
 use futures_util::{SinkExt, StreamExt};
-use gateway::{Cursor, Selector};
+use gateway::{Cursor, Frame, Selector, Snapshot};
 use gateway_serve::auth::Claims;
 use gateway_serve::server::{bind, ServeConfig};
 use journal::{EpochFilter, Journal, WriterConfig};
@@ -300,6 +300,36 @@ async fn connect(addr: &str) -> Ws {
         .expect("connect");
     ws
 }
+async fn connect_subscribed(
+    addr: &str,
+    sub: &str,
+    symbol: &str,
+    selector: &Selector,
+) -> (Ws, Snapshot) {
+    let mut last_seen: Option<Value> = None;
+    for attempt in 1..=8 {
+        let mut ws = connect(addr).await;
+        send(&mut ws, subscribe(sub, symbol)).await;
+        match recv(&mut ws).await {
+            Some(v) if type_of(&v) == Some("snapshot") && sub_of(&v) == Some(sub) => {
+                let snap = wire_snapshot(&v, sub, selector);
+                return (ws, snap);
+            }
+            Some(v) => {
+                last_seen = Some(v);
+                let _ = ws.close(None).await;
+            }
+            None => {
+                let _ = ws.close(None).await;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10 * attempt)).await;
+    }
+    panic!(
+        "v1 subscribe не попал в grace-window за 8 попыток; последний ответ: {:?}",
+        last_seen
+    );
+}
 async fn send(ws: &mut Ws, v: Value) {
     ws.send(Message::Text(v.to_string())).await.expect("send");
 }
@@ -356,6 +386,68 @@ fn sub_of(v: &Value) -> Option<&str> {
 }
 fn type_of(v: &Value) -> Option<&str> {
     v.get("type").and_then(|s| s.as_str())
+}
+fn wire_snapshot(v: &Value, sub: &str, client_selector: &Selector) -> Snapshot {
+    assert_eq!(
+        type_of(v),
+        Some("snapshot"),
+        "ожидался snapshot для подписки «{sub}», пришло: {v}"
+    );
+    assert_eq!(
+        sub_of(v),
+        Some(sub),
+        "snapshot пришёл не той подписке: ожидали «{sub}», пришло: {v}"
+    );
+    let data = v
+        .get("data")
+        .cloned()
+        .unwrap_or_else(|| panic!("snapshot без data: {v}"));
+    let mut snap: Snapshot = serde_json::from_value(data)
+        .unwrap_or_else(|e| panic!("snapshot data не разбирается как gateway::Snapshot: {e}; {v}"));
+    // Якорь Р-Б — selector, который КЛИЕНТ послал в subscribe, а не Snapshot.selector:
+    // поле в снапшоте проставляет тот же сервер, чьё смешение подписок мы проверяем.
+    snap.selector = client_selector.clone();
+    snap
+}
+fn wire_frames(msgs: &[Value], sub: &str) -> Vec<Frame> {
+    msgs.iter()
+        .filter(|v| type_of(v) == Some("frame") && sub_of(v) == Some(sub))
+        .map(|v| {
+            let data = v
+                .get("data")
+                .cloned()
+                .unwrap_or_else(|| panic!("frame без data для подписки «{sub}»: {v}"));
+            serde_json::from_value(data).unwrap_or_else(|e| {
+                panic!("frame data не разбирается как gateway::Frame: {e}; {v}")
+            })
+        })
+        .collect()
+}
+fn cursor_at_to(frame: &Frame) -> Cursor {
+    let seq = frame
+        .to
+        .upto_seq
+        .expect("frame.to обязан быть Cursor::at(seq), а не START/LATEST");
+    Cursor::at(seq)
+}
+fn apply_frames(mut acc: Snapshot, frames: &[Frame], label: &str) -> Snapshot {
+    assert!(
+        !frames.is_empty(),
+        "{label}: SETUP НЕ СОСТОЯЛСЯ — кадров нет; оракул сходимости зеленел бы вакуумно"
+    );
+    for frame in frames {
+        assert_eq!(
+            frame.from, acc.cursor,
+            "{label}: кадр не продолжает текущий курсор снапшота. from={:?}, acc.cursor={:?}, to={:?}",
+            frame.from, acc.cursor, frame.to
+        );
+        acc.apply(frame);
+    }
+    acc
+}
+fn reference_at(dir: &Path, selector: &Selector, cursor: Cursor) -> Snapshot {
+    gateway::snapshot(dir, EpochFilter::OwnCaptureOnly, selector, cursor)
+        .expect("независимый эталон gateway::snapshot")
 }
 
 // ─── O-0: манифест ⇄ таблица осей §4.2 спеки, в ОБЕ стороны ─────────────────────────────
@@ -871,31 +963,67 @@ async fn o9_connections_are_isolated() {
     let dir = tempfile::tempdir().expect("tempdir");
     seed(dir.path());
     let addr = serve(dir.path(), "BTCUSDT").await;
+    let sel_a = sel_of("BTCUSDT");
+    let sel_b = sel_of("ETHUSDT");
 
     // ОДИНАКОВЫЙ `sub id` в двух соединениях — это РАЗНЫЕ подписки: `id` назначает клиент
     // (§2.2), и пространство идентификаторов у каждого соединения СВОЁ.
-    let mut a = connect(&addr).await;
-    let mut b = connect(&addr).await;
-    send(&mut a, subscribe("w", "BTCUSDT")).await;
-    let _ = drain(&mut a, 1_000).await;
-    send(&mut b, subscribe("w", "ETHUSDT")).await;
-    let _ = drain(&mut b, 1_000).await;
-
-    append_more(dir.path(), "BTCUSDT", 6, BASE_MS + 2_000);
-    let a_tail = drain(&mut a, 2_500).await;
-    assert!(
-        !a_tail.is_empty(),
-        "O-9: соединение A замолчало после того, как B подписалось тем же `id` — состояние \
-         подписок общее на процесс, а не на соединение. При цели 10 000 подключений это значит, \
-         что любой клиент способен погасить экран любого другого, просто выбрав тот же id."
+    let (mut a, snap_a) = connect_subscribed(&addr, "w", "BTCUSDT", &sel_a).await;
+    let mut a_msgs = drain(&mut a, 1_500).await;
+    let (mut b, snap_b) = connect_subscribed(&addr, "w", "ETHUSDT", &sel_b).await;
+    assert_eq!(
+        snap_b.cursor, snap_a.cursor,
+        "O-9 SETUP: A и B должны стартовать с одного курсора до live-дозаписи; иначе негатив \
+         может разойтись курсором, а не содержимым"
     );
-    let a_body = serde_json::to_string(&a_tail).unwrap_or_default();
-    assert!(
-        !a_body.contains("ETHUSDT"),
-        "O-9: в поток соединения A попали данные инструмента, который просило соединение B. \
-         Это cross-talk: подписка ЧУЖОГО соединения изменила выдачу текущего клиента, что \
-         инвариант §4.1 запрещает прямо. Односоединительный набор к этому классу слеп по \
-         построению — потому ось 7 и заведена."
+    let mut b_msgs = drain(&mut b, 1_500).await;
+
+    // Kill-фикстура растит ОБА инструмента. При дозаписи только A мутант crosstalk умирает
+    // молчанием чужого селектора; это падение по неверной причине, а не проверка Р-Б.
+    append_more(dir.path(), "BTCUSDT", 6, BASE_MS + 2_000);
+    append_more(dir.path(), "ETHUSDT", 6, BASE_MS + 2_000);
+    a_msgs.extend(drain(&mut a, 2_500).await);
+    b_msgs.extend(drain(&mut b, 2_500).await);
+    let a_frames = wire_frames(&a_msgs, "w");
+    let b_frames = wire_frames(&b_msgs, "w");
+
+    let acc_a = apply_frames(snap_a.clone(), &a_frames, "O-9 positive/A");
+    let ref_a = reference_at(
+        dir.path(),
+        &sel_a,
+        cursor_at_to(a_frames.last().expect("A frames not empty")),
+    );
+    assert_eq!(
+        acc_a,
+        ref_a,
+        "O-9: кадры соединения A НЕ продолжают снапшот selector'а, который клиент A послал \
+         в subscribe. Это Р-Б: snapshot(A) ⊕ frames(A) обязан бит-в-бит сходиться с \
+         независимым gateway::snapshot(dir, filter, selector_A, Cursor::at(to)). Пришло: {:?}",
+        a_msgs.iter().take(3).collect::<Vec<_>>()
+    );
+
+    // Негатив на ТОЙ ЖЕ фикстуре: если A получит кадры B, курсорная цепочка выглядит
+    // законной, но содержимое обязано разойтись с эталоном selector'а A.
+    assert_eq!(
+        b_frames.first().map(|f| f.from),
+        Some(snap_a.cursor),
+        "O-9 SETUP: чужие кадры должны продолжать курсор A; иначе негатив ловит не Р-Б, а \
+         разрыв цепочки курсоров"
+    );
+    let alien = apply_frames(snap_a, &b_frames, "O-9 negative/B-as-A");
+    let ref_alien = reference_at(
+        dir.path(),
+        &sel_a,
+        cursor_at_to(b_frames.last().expect("B frames not empty")),
+    );
+    assert_eq!(
+        alien.cursor, ref_alien.cursor,
+        "O-9 SETUP: негатив обязан расходиться содержимым при одинаковом курсоре"
+    );
+    assert_ne!(
+        alien.series, ref_alien.series,
+        "O-9 NEGATIVE: чужие кадры B, применённые к снапшоту A, сошлись с эталоном A. \
+         Оракул снова слеп к cross-talk по содержимому."
     );
 }
 
