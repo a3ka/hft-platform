@@ -131,7 +131,7 @@ done
 echo "--- C: проба бюджета CB-1..CB-10b (задачи 1-2) ---"
 run_probe "C" "${CB_PROBE}" "red_context_budgets"
 
-echo "--- G: проба GATE-META GM-1..GM-24 (задачи 3-6) ---"
+echo "--- G: проба GATE-META GM-1..GM-27 (задачи 3-6) ---"
 run_probe "G" "${GM_PROBE}" "red_gate_meta"
 # GM-16 СОЖЖЁН (спека §4, отступление от C-064 F-064-3 — названо в шапке пробы):
 # сценария с этим номером быть НЕ ДОЛЖНО; упоминание в шапке-обосновании — законно.
@@ -140,7 +140,7 @@ if grep -qE '(pass|fail) +"GM-16' "${GM_PROBE}"; then
 else
   pass "G GM-16 сожжён: сценария нет (упоминание только в шапке-обосновании)"
 fi
-for gm in GM-17 GM-18 GM-19 GM-20 GM-21 GM-22 GM-23 GM-24; do
+for gm in GM-17 GM-18 GM-19 GM-20 GM-21 GM-22 GM-23 GM-24 GM-25 GM-26 GM-27; do
   if grep -qE "(pass|fail) +\"${gm}" "${GM_PROBE}"; then
     pass "G сценарий ${gm} присутствует"
   else
@@ -172,6 +172,19 @@ if [ -f "${CB_BARRIER}" ]; then
   CORE_FILES=(.claude/rules/branch-hygiene.md .claude/rules/commit-discipline.md \
               .claude/rules/gates.md .claude/rules/handoff-block.md \
               .claude/rules/scope-guard.md .claude/rules/testing.md CLAUDE.md)
+  # D3-setup: ПОЛНАЯ копия обязана быть ЗЕЛЁНОЙ. Без этого контроля D3 — плацебо самого себя:
+  # если копирование сломано (или барьер красен на любой копии), каждый шаг цикла напечатает
+  # «исчезновение поймано», не поймав ничего. Setup-guard на КАЖДЫЙ сценарий — `testing.md`,
+  # свойство 3 целостности гейта: проба обязана падать и против несостоявшегося setup'а.
+  FULL="$(mktemp -d /tmp/verify-m60b-full-XXXXXX)"
+  mkdir -p "${FULL}/.claude/rules"
+  cp .claude/rules/*.md "${FULL}/.claude/rules/" && cp CLAUDE.md "${FULL}/"
+  if ( ROOT="${FULL}" bash "${CB_BARRIER}" >/dev/null 2>&1 ); then
+    pass "D3-setup полная копия корпуса зелёная — цикл ниже судит ИСЧЕЗНОВЕНИЕ, а не сломанный setup"
+  else
+    fail "D3-setup полная копия корпуса КРАСНАЯ — весь цикл D3 ниже недостоверен (ловил бы не исчезновение)"
+  fi
+  rm -rf "${FULL}"
   for f in "${CORE_FILES[@]}"; do
     T="$(mktemp -d /tmp/verify-m60b-minus-XXXXXX)"
     mkdir -p "${T}/.claude/rules"

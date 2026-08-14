@@ -78,6 +78,16 @@ run_timed_cmd() {
 echo "--- B: БЮДЖЕТ обязательного чтения (первая половина проверки чистки) ---"
 RULES_LINES=$(cat .claude/rules/*.md 2>/dev/null | wc -l)
 CLAUDE_LINES=$(wc -l < CLAUDE.md 2>/dev/null || echo 99999)
+# Страж ПРЕДМЕТА: исчезновение корпуса даёт 0 строк, а ноль «укладывается в бюджет» — гейт
+# позеленел бы ровно от того, что защищает. Гейт, зеленеющий от исчезновения предмета, — не
+# гейт. Состав ядра фиксирован (6 файлов правил + CLAUDE.md); сокращение ЧИСЛА файлов — это
+# не чистка, а снос носителя, и оно обязано краснеть здесь, а не проходить как экономия строк.
+RULES_FILES=$(ls -1 .claude/rules/*.md 2>/dev/null | wc -l)
+if [ "${RULES_FILES}" -eq 6 ] && [ "${RULES_LINES}" -ge 1 ] && [ -s CLAUDE.md ]; then
+  pass "B-setup предмет на месте: 6 файлов правил + непустой CLAUDE.md"
+else
+  fail "B-setup предмет ИСЧЕЗ или урезан по составу (файлов правил ${RULES_FILES}, ожидалось 6; строк ${RULES_LINES}) — бюджетная арифметика ниже недостоверна"
+fi
 if [ "${RULES_LINES}" -le "${RULES_BUDGET}" ]; then
   pass "B .claude/rules = ${RULES_LINES} строк (бюджет ${RULES_BUDGET})"
 else
