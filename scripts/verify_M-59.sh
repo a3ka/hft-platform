@@ -82,7 +82,22 @@ cargo test --all >/tmp/m59-testall.log 2>&1 \
 
 echo "--- T3: ГЛАВНОЕ — DV-I-15, память не растёт с числом ЖИЗНЕЙ ---"
 run_oracle red_lifetime_memory_bounded "T3 DV-I-15"
-grep -hoE 'DV-I-15: .*' /tmp/m59-red_lifetime_memory_bounded.log 2>/dev/null | head -1 | sed 's/^/      ЗАМЕР: /'
+# ЗАМЕР ПЕЧАТАЕТСЯ ИЛИ ШАГ КРАСНЕЕТ (`R-076` N-4). Прежняя редакция грепала лог `run_oracle`,
+# но тот зовёт `cargo test` БЕЗ `--nocapture`, а харнесс отдаёт stdout только у УПАВШИХ
+# тестов. В зелёном прогоне грепу нечего было найти, и строка печаталась ПУСТОЙ — шаг
+# выглядел исполненным, не исполнившись. Замер `R-076`: `grep -c 'DV-I-15:'` = 0.
+# Молчащая строка хуже отсутствующей: она создаёт видимость измерения. Поэтому отдельный
+# прогон с `--nocapture` и fail-closed на отсутствие числа.
+cargo test -p research-cli --test red_lifetime_memory_bounded -- --nocapture \
+  > /tmp/m59-dvi15-measure.log 2>&1 || true
+M59_MEASURE=$(grep -hoE 'DV-I-15: .*' /tmp/m59-dvi15-measure.log 2>/dev/null | head -1)
+if [ -n "${M59_MEASURE}" ]; then
+  echo "      ЗАМЕР: ${M59_MEASURE}"
+else
+  fail "T3 ЗАМЕР DV-I-15 НЕ ПОЛУЧЕН — оракул не напечатал число. Шаг обязан предъявлять \
+величину, на которой стоит граница памяти, а не молчать: пустая строка неотличима от \
+исполненного замера (R-076 N-4)"
+fi
 
 echo "--- T4: РЕГРЕСС — DV-I-1..14 остаются зелёными ---"
 # Состав ИЗМЕРЕН грепом по tests/, а не взят по памяти: первая редакция гоняла один
