@@ -10,6 +10,38 @@
 #
 # Решение по КОДУ ВОЗВРАТА (gates.md §3). Агрегатор со счётчиком: печатаем все нарушения
 # разом, exit 1 при FAIL>0 — первый красный шаг не должен скрывать остальные.
+#
+# CI-паритет rev3 (`gates.md` §3): базовый CI-job включён целиком:
+# `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`,
+# `cargo test --all`. Замер 2026-08-14 UTC на этом дереве:
+# `CARGO_TARGET_DIR=/tmp/cx-m60-cargo-test-target-20260814 /usr/bin/time -p cargo test --all`
+# → exit=0, real 1531.74s (25m31.74s), user 984.33s, sys 108.20s. Cargo-шаги НЕ
+# удаляются; они обёрнуты timeout'ами, чтобы зависший прогон стал `VERDICT: FAIL`, а не
+# оборванным гейтом без вердикта.
+#
+# Специализированные CI-команды включены только по зоне M-60b: mechanism-barriers и их
+# RED-пробы (`red_context_budgets.sh`, `red_gate_meta.sh`, `red_disk_budget.sh`), разбор
+# CI-проводки новых барьеров, GATE-META-шаблон, защита изменяемых mechanism-артефактов.
+# НЕ включено: `cargo install cargo-audit --locked` — идёт в CI на том же push'е, зона milestone'ом не тронута.
+# НЕ включено: `cargo audit` — идёт в CI на том же push'е, зона milestone'ом не тронута.
+# НЕ включено: `bash scripts/verify_delivery_M-08.sh` — идёт в CI на том же push'е, зона milestone'ом не тронута.
+# ВКЛЮЧЕНО: `bash scripts/check_docs_freeze.sh` — зона замка §11 milestone'ом ТРОНУТА:
+#   задача 7 (§3) правит `.claude/rules/gates.md` (шаблон GATE-META), а шаг T требует его
+#   наличия. Прежняя редакция исключала барьер с формулировкой «зона не тронута» — она была
+#   ЛОЖНА: гейт не может позеленеть иначе как правкой файла из зоны замка, барьер которой
+#   из него же исключён.
+# НЕ включено: `bash scripts/tests/red_gc_reclaim_args.sh` — идёт в CI на том же push'е, зона milestone'ом не тронута.
+# НЕ включено: `pip install --quiet jsonschema` — идёт в CI на том же push'е, зона milestone'ом не тронута.
+# НЕ включено: `bash scripts/verify_contracts.sh` — идёт в CI на том же push'е, зона milestone'ом не тронута.
+# НЕ включено: contracts base-resolution heredoc — идёт в CI на том же push'е, зона milestone'ом не тронута.
+# НЕ включено: `bash scripts/verify_ct_rfc_atomic.sh` — идёт в CI на том же push'е, зона milestone'ом не тронута.
+# НЕ включено: `bash scripts/tests/red_ct_rfc_atomic.sh` — идёт в CI на том же push'е, зона milestone'ом не тронута.
+# НЕ включено: `bash scripts/diff_contract_schema.sh` — идёт в CI на том же push'е, зона milestone'ом не тронута.
+# НЕ включено: `bash scripts/tests/red_diff_contract_schema.sh` — идёт в CI на том же push'е, зона milestone'ом не тронута.
+# НЕ включено: `red_artifact_ids.sh --battery` heredoc — идёт в CI на том же push'е, зона milestone'ом не тронута.
+# НЕ включено: `bash scripts/verify_design_claims.sh` — идёт в CI на том же push'е, зона milestone'ом не тронута.
+# НЕ включено: `bash scripts/tests/red_verify_design_claims.sh` — идёт в CI на том же push'е, зона milestone'ом не тронута.
+# НЕ включено: status-check heredoc — агрегатор результатов CI; локальный verify принимает по собственному exit-коду.
 
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -18,6 +50,10 @@ cd "${ROOT}" || exit 1
 FAILED=0
 pass() { echo "PASS  $*"; }
 fail() { echo "FAIL  $*"; FAILED=$((FAILED + 1)); }
+CARGO_FMT_TIMEOUT_SECONDS="${CARGO_FMT_TIMEOUT_SECONDS:-600}"
+CARGO_CLIPPY_TIMEOUT_SECONDS="${CARGO_CLIPPY_TIMEOUT_SECONDS:-1200}"
+CARGO_TEST_TIMEOUT_SECONDS="${CARGO_TEST_TIMEOUT_SECONDS:-2400}"
+MB="$(git merge-base origin/main HEAD 2>/dev/null || true)"
 
 CB_BARRIER=scripts/check_context_budgets.sh
 GM_BARRIER=scripts/check_gate_meta.sh
@@ -32,6 +68,24 @@ CI=.github/workflows/ci.yml
 # пробы; executed — из VERDICT-строки, которую проба печатает от своего счётчика.
 declared_of() { grep -cE '^(if )?run_barrier ' "$1"; }
 executed_of() { grep -oE 'VERDICT: PASS \(([0-9]+)/' "$1" | grep -oE '[0-9]+' | head -1; }
+
+run_timed_cmd() {
+  local label="$1" seconds="$2" log rc
+  shift 2
+  log="$(mktemp /tmp/verify-m60b-cmd-XXXXXX.log)"
+  if timeout "${seconds}" "$@" >"${log}" 2>&1; then
+    pass "${label}"
+  else
+    rc=$?
+    if [ "${rc}" -eq 124 ]; then
+      fail "${label} timeout ${seconds}s"
+    else
+      fail "${label} exit=${rc}"
+    fi
+    tail -30 "${log}" | sed 's/^/      ↳ /'
+  fi
+  rm -f "${log}"
+}
 
 run_probe() { # $1=шаг $2=проба $3=описание
   local step="$1" probe="$2" what="$3" log declared executed
@@ -74,10 +128,10 @@ for b in "${CB_BARRIER}" "${GM_BARRIER}" "${DB_BARRIER}"; do
   fi
 done
 
-echo "--- C: проба бюджета CB-1..CB-6b (задачи 1-2) ---"
+echo "--- C: проба бюджета CB-1..CB-10b (задачи 1-2) ---"
 run_probe "C" "${CB_PROBE}" "red_context_budgets"
 
-echo "--- G: проба GATE-META GM-1..GM-19 (задачи 3-6) ---"
+echo "--- G: проба GATE-META GM-1..GM-24 (задачи 3-6) ---"
 run_probe "G" "${GM_PROBE}" "red_gate_meta"
 # GM-16 СОЖЖЁН (спека §4, отступление от C-064 F-064-3 — названо в шапке пробы):
 # сценария с этим номером быть НЕ ДОЛЖНО; упоминание в шапке-обосновании — законно.
@@ -86,15 +140,15 @@ if grep -qE '(pass|fail) +"GM-16' "${GM_PROBE}"; then
 else
   pass "G GM-16 сожжён: сценария нет (упоминание только в шапке-обосновании)"
 fi
-for gm in GM-17 GM-18 GM-19; do
+for gm in GM-17 GM-18 GM-19 GM-20 GM-21 GM-22 GM-23 GM-24; do
   if grep -qE "(pass|fail) +\"${gm}" "${GM_PROBE}"; then
-    pass "G сценарий ${gm} (отсутствие вердикта, К-4) присутствует"
+    pass "G сценарий ${gm} присутствует"
   else
-    fail "G сценария ${gm} нет — проверка ОТСУТСТВИЯ выпала, «закрывает TD-105» стало ложью"
+    fail "G сценария ${gm} нет — kill-set GATE-META неполон"
   fi
 done
 
-echo "--- B: проба диск-преамбулы DB-1..DB-6 (задачи 8-9) ---"
+echo "--- B: проба диск-преамбулы DB-1..DB-8 (задачи 8-9) ---"
 run_probe "B" "${DB_PROBE}" "red_disk_budget"
 
 echo "--- D: default-режим бюджета на КОРНЕ репо (F-064-4; задача 2) ---"
@@ -215,13 +269,37 @@ for p in red_protected_artifacts red_docs_freeze red_artifact_ids red_commit_pat
   rm -f "${LOG}"
 done
 
+echo "--- S: замок §11 на диапазоне ветки (зона тронута задачей 7 — шаблон в gates.md) ---"
+if [ -n "${MB}" ]; then
+  if ( EVENT_NAME=push PUSH_BEFORE="${MB}" bash scripts/check_docs_freeze.sh >/dev/null 2>&1 ); then
+    pass "S замок §11 зелёный на диапазоне ${MB:0:7}..HEAD (токены на месте)"
+  else
+    fail "S замок §11 КРАСНЫЙ на диапазоне ${MB:0:7}..HEAD — коммит в зоне без FOUNDER-APPROVED"
+  fi
+else
+  fail "S merge-base с origin/main не вычислился — замок §11 не запущен"
+fi
+
+echo "--- Q: защита артефактов по диапазону ветки (зона M-60b: механизм-артефакты) ---"
+if [ -n "${MB}" ]; then
+  if ( EVENT_NAME=push PUSH_BEFORE="${MB}" bash scripts/check_protected_artifacts.sh >/dev/null 2>&1 ); then
+    pass "Q check_protected_artifacts.sh зелёный на диапазоне ${MB:0:7}..HEAD"
+  else
+    fail "Q check_protected_artifacts.sh красный на диапазоне ${MB:0:7}..HEAD"
+  fi
+  if ( EVENT_NAME=push PUSH_BEFORE="${MB}" bash scripts/check_artifact_ids.sh >/dev/null 2>&1 ); then
+    pass "Q check_artifact_ids.sh зелёный на диапазоне ${MB:0:7}..HEAD"
+  else
+    fail "Q check_artifact_ids.sh красный на диапазоне ${MB:0:7}..HEAD"
+  fi
+else
+  fail "Q merge-base с origin/main не вычислился — artifact protection не запущен"
+fi
+
 echo "--- CI-паритет: базовый джоб целиком (gates.md §3 — гейт не смеет быть зеленее CI) ---"
-cargo fmt --all -- --check >/dev/null 2>&1 \
-  && pass "CI cargo fmt --check" || fail "CI cargo fmt --check"
-cargo clippy --all-targets --all-features -- -D warnings >/dev/null 2>&1 \
-  && pass "CI cargo clippy -D warnings" || fail "CI cargo clippy -D warnings"
-cargo test --all >/dev/null 2>&1 \
-  && pass "CI cargo test --all" || fail "CI cargo test --all"
+run_timed_cmd "CI cargo fmt --check" "${CARGO_FMT_TIMEOUT_SECONDS}" cargo fmt --all -- --check
+run_timed_cmd "CI cargo clippy -D warnings" "${CARGO_CLIPPY_TIMEOUT_SECONDS}" cargo clippy --all-targets --all-features -- -D warnings
+run_timed_cmd "CI cargo test --all (замер rev3 1531.74s)" "${CARGO_TEST_TIMEOUT_SECONDS}" cargo test --all
 
 echo
 if [ "${FAILED}" -gt 0 ]; then

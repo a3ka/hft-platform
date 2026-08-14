@@ -16,6 +16,32 @@
 # По отдельности каждая половина ложна: пройти B можно, снеся требования, а пройти D —
 # не сократив ничего (R-032 поймал ровно первое: с таксономией §9 выпало требование
 # risk-critic на документы safety-пути).
+#
+# CI-паритет rev3 (`gates.md` §3): базовый CI-job включён целиком:
+# `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`,
+# `cargo test --all`. Замер 2026-08-14 UTC на этом дереве:
+# `CARGO_TARGET_DIR=/tmp/cx-m60-cargo-test-target-20260814 /usr/bin/time -p cargo test --all`
+# → exit=0, real 1531.74s (25m31.74s), user 984.33s, sys 108.20s. Cargo-шаги НЕ
+# удаляются; они обёрнуты timeout'ами, чтобы зависший прогон стал `VERDICT: FAIL`, а не
+# оборванным гейтом без вердикта.
+#
+# Специализированные CI-команды включены только по зоне M-60c: корпус правил и защита
+# артефактов (`check_docs_freeze.sh`, `check_protected_artifacts.sh`, `check_artifact_ids.sh`,
+# `red_protected_artifacts.sh`, `red_docs_freeze.sh`, `red_artifact_ids.sh --battery`).
+# НЕ включено: `cargo install cargo-audit --locked` — идёт в CI на том же push'е, зона milestone'ом не тронута.
+# НЕ включено: `cargo audit` — идёт в CI на том же push'е, зона milestone'ом не тронута.
+# НЕ включено: `bash scripts/verify_delivery_M-08.sh` — идёт в CI на том же push'е, зона milestone'ом не тронута.
+# НЕ включено: `bash scripts/tests/red_gc_reclaim_args.sh` — идёт в CI на том же push'е, зона milestone'ом не тронута.
+# НЕ включено: `pip install --quiet jsonschema` — идёт в CI на том же push'е, зона milestone'ом не тронута.
+# НЕ включено: `bash scripts/verify_contracts.sh` — идёт в CI на том же push'е, зона milestone'ом не тронута.
+# НЕ включено: contracts base-resolution heredoc — идёт в CI на том же push'е, зона milestone'ом не тронута.
+# НЕ включено: `bash scripts/verify_ct_rfc_atomic.sh` — идёт в CI на том же push'е, зона milestone'ом не тронута.
+# НЕ включено: `bash scripts/tests/red_ct_rfc_atomic.sh` — идёт в CI на том же push'е, зона milestone'ом не тронута.
+# НЕ включено: `bash scripts/diff_contract_schema.sh` — идёт в CI на том же push'е, зона milestone'ом не тронута.
+# НЕ включено: `bash scripts/tests/red_diff_contract_schema.sh` — идёт в CI на том же push'е, зона milestone'ом не тронута.
+# НЕ включено: `bash scripts/verify_design_claims.sh` — идёт в CI на том же push'е, зона milestone'ом не тронута.
+# НЕ включено: `bash scripts/tests/red_verify_design_claims.sh` — идёт в CI на том же push'е, зона milestone'ом не тронута.
+# НЕ включено: status-check heredoc — агрегатор результатов CI; локальный verify принимает по собственному exit-коду.
 
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -24,9 +50,30 @@ cd "${ROOT}" || exit 1
 FAILED=0
 pass() { echo "PASS  $*"; }
 fail() { echo "FAIL  $*"; FAILED=$((FAILED + 1)); }
+CARGO_FMT_TIMEOUT_SECONDS="${CARGO_FMT_TIMEOUT_SECONDS:-600}"
+CARGO_CLIPPY_TIMEOUT_SECONDS="${CARGO_CLIPPY_TIMEOUT_SECONDS:-1200}"
+CARGO_TEST_TIMEOUT_SECONDS="${CARGO_TEST_TIMEOUT_SECONDS:-2400}"
 
 RULES_BUDGET=725      # цель A-003; спека §1
 CLAUDE_BUDGET=70
+
+run_timed_cmd() {
+  local label="$1" seconds="$2" log rc
+  shift 2
+  log="$(mktemp /tmp/verify-m60c-cmd-XXXXXX.log)"
+  if timeout "${seconds}" "$@" >"${log}" 2>&1; then
+    pass "${label}"
+  else
+    rc=$?
+    if [ "${rc}" -eq 124 ]; then
+      fail "${label} timeout ${seconds}s"
+    else
+      fail "${label} exit=${rc}"
+    fi
+    tail -30 "${log}" | sed 's/^/      ↳ /'
+  fi
+  rm -f "${log}"
+}
 
 echo "--- B: БЮДЖЕТ обязательного чтения (первая половина проверки чистки) ---"
 RULES_LINES=$(cat .claude/rules/*.md 2>/dev/null | wc -l)
@@ -189,7 +236,7 @@ else
 fi
 
 echo "--- P: регресс соседних барьеров (счёт — из счётчика самой пробы, не из шапки) ---"
-for p in red_protected_artifacts red_docs_freeze red_commit_paths; do
+for p in red_protected_artifacts red_docs_freeze red_commit_paths red_artifact_ids; do
   LOG="$(mktemp /tmp/verify-m60c-XXXXXX.log)"
   if bash "scripts/tests/${p}.sh" >"${LOG}" 2>&1; then
     N="$(grep -oE 'VERDICT: PASS \(([0-9]+)/' "${LOG}" | grep -oE '[0-9]+' | head -1 || true)"
@@ -204,14 +251,45 @@ for p in red_protected_artifacts red_docs_freeze red_commit_paths; do
   fi
   rm -f "${LOG}"
 done
+LOG="$(mktemp /tmp/verify-m60c-XXXXXX.log)"
+if bash scripts/tests/red_artifact_ids.sh --battery >"${LOG}" 2>&1; then
+  # Счёт берётся из строки BATTERY, а НЕ из VERDICT: под `--battery` проба печатает и
+  # `VERDICT: PASS (48/48)` эталонного прогона внутри батареи, и `BATTERY: PASS (n/n)` —
+  # число МУТАНТОВ. Прежняя редакция брала первое вхождение VERDICT и рапортовала 48 там,
+  # где батарея исполнила 28: усохни батарея до 3 мутантов, шаг остался бы зелёным с тем же
+  # числом. Шаг обязан мерить то, что обещает (`testing.md` «оракул мерит ТО, ЧТО ОБЕЩАЕТ»).
+  N="$(grep -oE 'BATTERY: PASS \(([0-9]+)/' "${LOG}" | grep -oE '[0-9]+' | head -1 || true)"
+  if [ -n "${N}" ] && [ "${N}" -ge 1 ]; then
+    pass "P red_artifact_ids --battery: зелёная (${N} мутантов исполнено)"
+  else
+    fail "P red_artifact_ids --battery: зелёная, но строки BATTERY со счётом нет — счёт не предъявлен"
+  fi
+else
+  fail "P red_artifact_ids --battery: КРАСНАЯ — защита идентификаторов сломана"
+  grep -E '^(FAIL|SETUP)' "${LOG}" | head -4 | sed 's/^/      ↳ /'
+fi
+rm -f "${LOG}"
+
+echo "--- Q: защита артефактов по диапазону ветки (зона M-60c) ---"
+if [ -n "${MB:-}" ]; then
+  if ( EVENT_NAME=push PUSH_BEFORE="${MB}" bash scripts/check_protected_artifacts.sh >/dev/null 2>&1 ); then
+    pass "Q check_protected_artifacts.sh зелёный на диапазоне ${MB:0:7}..HEAD"
+  else
+    fail "Q check_protected_artifacts.sh красный на диапазоне ${MB:0:7}..HEAD"
+  fi
+  if ( EVENT_NAME=push PUSH_BEFORE="${MB}" bash scripts/check_artifact_ids.sh >/dev/null 2>&1 ); then
+    pass "Q check_artifact_ids.sh зелёный на диапазоне ${MB:0:7}..HEAD"
+  else
+    fail "Q check_artifact_ids.sh красный на диапазоне ${MB:0:7}..HEAD"
+  fi
+else
+  fail "Q merge-base с origin/main не вычислился — artifact protection не запущен"
+fi
 
 echo "--- CI-паритет: базовый джоб целиком (gates.md §3) ---"
-cargo fmt --all -- --check >/dev/null 2>&1 \
-  && pass "CI cargo fmt --check" || fail "CI cargo fmt --check"
-cargo clippy --all-targets --all-features -- -D warnings >/dev/null 2>&1 \
-  && pass "CI cargo clippy -D warnings" || fail "CI cargo clippy -D warnings"
-cargo test --all >/dev/null 2>&1 \
-  && pass "CI cargo test --all" || fail "CI cargo test --all"
+run_timed_cmd "CI cargo fmt --check" "${CARGO_FMT_TIMEOUT_SECONDS}" cargo fmt --all -- --check
+run_timed_cmd "CI cargo clippy -D warnings" "${CARGO_CLIPPY_TIMEOUT_SECONDS}" cargo clippy --all-targets --all-features -- -D warnings
+run_timed_cmd "CI cargo test --all (замер rev3 1531.74s)" "${CARGO_TEST_TIMEOUT_SECONDS}" cargo test --all
 
 echo
 if [ "${FAILED}" -gt 0 ]; then
