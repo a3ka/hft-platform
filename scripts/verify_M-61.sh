@@ -140,7 +140,8 @@ if [ -f "${BARRIER}" ]; then
       done < <(git ls-tree -r --name-only HEAD | grep -E "${CARRIER_RE}" | sort)
       if [ -n "${DONOR}" ]; then
         ( cd "$T" && printf '# дубль\n\nтело\n' > "${DUP}" \
-          && git add -A && git commit -q -m "синтетический дубль идентификатора" ) || true
+          && git add -A && git -c user.name=verify-m61 -c user.email=verify-m61@noreply.local \
+               commit -q -m "синтетический дубль идентификатора" ) || true
         if ( cd "$T" && EVENT_NAME=push PUSH_BEFORE="${BASE}" PR_BASE_SHA="${BASE}" bash "${ROOT}/${BARRIER}" >/dev/null 2>&1 ); then
           fail "S негативный контроль: второй носитель ${DUP} под идентификатором донора ${DONOR} ПРОШЁЛ — барьер пропускает всё"
         else pass "S негативный контроль: второй носитель под идентификатором ${DONOR##*/} заблокирован"; fi
@@ -175,7 +176,8 @@ if [ -f "${BARRIER}" ]; then
           if git clone -q --no-hardlinks . "$T2" 2>/dev/null; then
             ( cd "$T2" \
               && printf -- '- **TD-%s** `дубль-с-метасимволом-O(x)-[y]`\n' "${TDNUM}" >> TECH-DEBT.md \
-              && git add -A && git commit -q -m "синтетический дубль записи TD" ) || true
+              && git add -A && git -c user.name=verify-m61 -c user.email=verify-m61@noreply.local \
+                   commit -q -m "синтетический дубль записи TD" ) || true
             if ( cd "$T2" && EVENT_NAME=push PUSH_BEFORE="${BASE}" PR_BASE_SHA="${BASE}" \
                  bash "${ROOT}/${BARRIER}" >/dev/null 2>&1 ); then
               fail "S негативный контроль TD: заводящая карточка TD-${TDNUM} под номером, который держит ${TDKIND}, ПРОШЛА. \
