@@ -77,7 +77,7 @@ M-28): привязка к событию, а не к дате, действит
 | 6bis | `unsubscribe`: поток по этому `sub` прекращается, место под лимитом освобождается; повторный или неизвестный `id` ⇒ `error` с кодом (решение §4.2) | **engine-dev** | ✅ DONE (`eb0b450` Б-2 fix) | `O-10` |
 | 7 | RED-набор `crates/gateway-serve/tests/red_ws_session.rs` (O-1..O-10) | **architect** | ✅ DONE `540d86b` | сам себе |
 | 8 | `scripts/verify_M-65.sh` | **architect** | ✅ DONE | базовая линия §6bis |
-| 9 | Батарея мутантов `scripts/tests/red_ws_session_battery.sh` (§4.5). Пишется ПОСЛЕ задач 1-6: мутанты суть правки реализации, которой ещё нет | **architect** | ⏳ OPEN — после 1-6 | шаг `F2` |
+| 9 | Батарея мутантов `scripts/tests/red_ws_session_battery.sh` (§4.5). Пишется ПОСЛЕ задач 1-6: мутанты суть правки реализации, которой ещё нет | **architect** | ✅ DONE (task #9: батарея, measured 13/13) | шаг `F2` |
 
 ### 3.1 Оракулы набора — O-1..O-8 из `CT-RFC-09` §5 плюс два заведённых здесь
 
@@ -214,19 +214,19 @@ B-2 — выбор обязан быть явным): `error` с машиноч�
 
 | мутант | ось / значение | ОБЯЗАН уронить (kill-set) |
 |---|---|---|
-| `envwins` — env-селектор побеждает клиентский `subscribe` | 1 / `env побеждает клиентский subscribe` | заполняется ЗАМЕРОМ в задаче 9 |
-| `stalefeed` — после смены продолжают идти кадры прежнего селектора | 1 / `выдача старого селектора после смены` | — « — |
-| `submerge` — подписки делят одно состояние, серии смешиваются | 2 / `вторая подписка смешивается с первой` | — « — |
-| `capopen` — лимит не проверяется | 2 / `превышение лимита проходит` | — « — |
-| `versionmute` — неизвестная `v` игнорируется молча | 3 / `неизвестная версия v молча игнорируется` | — « — |
-| `harshdrop` — невалидный селектор рвёт соединение | 3 / `невалидный селектор рвёт соединение` · 5 / `отказ одной подписки убивает соединение` | — « — |
-| `lateignore` — `subscribe` после grace-окна не меняет инструмент | 4 / `subscribe после grace-окна не меняет инструмент` | — « — |
-| `prosaicerr` — отказ выражен прозой без `code` | 6 / `отказ выражен прозой без code` | — « — |
-| `connshare` — состояние подписок в process-global карте по `sub id` | 7 / `одинаковый sub id в двух соединениях делит состояние` | — « — |
-| `crosstalk` — смена селектора в одном соединении меняет выдачу другого | 7 / `подписка другого соединения меняет выдачу текущего` | — « — |
-| `unsubmute` — `unsubscribe` разбирается и игнорируется | 8 / `unsubscribe не прекращает поток` | — « — |
-| `capleak` — `unsubscribe` прекращает поток, но не освобождает место под лимитом | 8 / `unsubscribe не освобождает место под лимитом` | — « — |
-| `emptyframe` — сервер синтезирует кадр с пустой дельтой вместо молчания | 9 / `кадр синтезирован сервером, а не журналом` | — « — |
+| `envwins` — env-селектор побеждает клиентский `subscribe` | 1 / `env побеждает клиентский subscribe` | `o1_subscribe_switches_instrument_and_old_frames_stop` · `o8_grace_window_decides_v1_or_legacy` · `o9_connections_are_isolated` |
+| `stalefeed` — после смены продолжают идти кадры прежнего селектора | 1 / `выдача старого селектора после смены` | `o1_subscribe_switches_instrument_and_old_frames_stop` |
+| `submerge` — подписки делят одно состояние, серии смешиваются | 2 / `вторая подписка смешивается с первой` | `o10_unsubscribe_stops_sub_and_frees_capacity` · `o2_multiplex_subscriptions_are_independent` |
+| `capopen` — лимит не проверяется | 2 / `превышение лимита проходит` | `o4_subscription_cap_is_fail_closed` |
+| `versionmute` — неизвестная `v` игнорируется молча | 3 / `неизвестная версия v молча игнорируется` | `o3_unknown_version_and_unknown_op_are_errors` |
+| `harshdrop` — невалидный селектор рвёт соединение | 3 / `невалидный селектор рвёт соединение` · 5 / `отказ одной подписки убивает соединение` | `o7_selector_validation_keeps_connection_and_neighbours_alive` |
+| `lateignore` — `subscribe` после grace-окна не меняет инструмент | 4 / `subscribe после grace-окна не меняет инструмент` | `o8_grace_window_decides_v1_or_legacy` |
+| `prosaicerr` — отказ выражен прозой без `code` | 6 / `отказ выражен прозой без code` | `o4_subscription_cap_is_fail_closed` · `o6_errors_carry_machine_readable_code` · `o7_selector_validation_keeps_connection_and_neighbours_alive` |
+| `connshare` — состояние подписок в process-global карте по `sub id` | 7 / `одинаковый sub id в двух соединениях делит состояние` | `o1_subscribe_switches_instrument_and_old_frames_stop` · `o9_connections_are_isolated` |
+| `crosstalk` — смена селектора в одном соединении меняет выдачу другого | 7 / `подписка другого соединения меняет выдачу текущего` | `o9_connections_are_isolated` |
+| `unsubmute` — `unsubscribe` разбирается и игнорируется | 8 / `unsubscribe не прекращает поток` | `o10_unsubscribe_stops_sub_and_frees_capacity` |
+| `capleak` — `unsubscribe` прекращает поток, но не освобождает место под лимитом | 8 / `unsubscribe не освобождает место под лимитом` | `o10_unsubscribe_stops_sub_and_frees_capacity` |
+| `emptyframe` — сервер синтезирует кадр с пустой дельтой вместо молчания | 9 / `кадр синтезирован сервером, а не журналом` | `o11_frames_come_from_journal_not_synthesis` |
 
 **Предел покрытия, названный явно:** мутант заводится не на КАЖДОЕ значение оси. Значение
 оси 8 `unsubscribe неизвестного id молчит` мутантом не покрыто — его стережёт `O-10` прямым

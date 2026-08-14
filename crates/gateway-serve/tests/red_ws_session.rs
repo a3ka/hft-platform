@@ -404,6 +404,11 @@ fn wire_snapshot(v: &Value, sub: &str, client_selector: &Selector) -> Snapshot {
         .unwrap_or_else(|| panic!("snapshot без data: {v}"));
     let mut snap: Snapshot = serde_json::from_value(data)
         .unwrap_or_else(|e| panic!("snapshot data не разбирается как gateway::Snapshot: {e}; {v}"));
+    assert_eq!(
+        &snap.selector, client_selector,
+        "snapshot data.selector обязан совпадать с selector'ом, который клиент послал в \
+         subscribe. Иначе фронт получает правильное содержимое под чужой подписью инструмента."
+    );
     // Якорь Р-Б — selector, который КЛИЕНТ послал в subscribe, а не Snapshot.selector:
     // поле в снапшоте проставляет тот же сервер, чьё смешение подписок мы проверяем.
     snap.selector = client_selector.clone();
@@ -549,6 +554,7 @@ async fn o1_subscribe_switches_instrument_and_old_frames_stop() {
         Some("snapshot"),
         "первым обязан прийти snapshot: {first}"
     );
+    let _settle_before_switch = drain(&mut ws, 2 * GRACE_MS + 600).await;
 
     // Смена селектора тем же `id` (§2.2: «смена параметров = subscribe с ТЕМ ЖЕ id»).
     send(&mut ws, subscribe("w1", "ETHUSDT")).await;
@@ -558,10 +564,14 @@ async fn o1_subscribe_switches_instrument_and_old_frames_stop() {
         Some("snapshot"),
         "смена селектора обязана начинаться с НОВОГО snapshot (§2.4), пришло: {after}"
     );
+    let sel_eth = sel_of("ETHUSDT");
+    let snap_eth = wire_snapshot(&after, "w1", &sel_eth);
 
     // Ни одного кадра прежнего селектора после нового снапшота. Кадр «в полёте» — это
     // деградированный вход оси 4: он уже был отправлен push-циклом в момент смены.
-    let tail = drain(&mut ws, 3 * GRACE_MS + 600).await;
+    append_more(dir.path(), "BTCUSDT", 4, BASE_MS + 6_000);
+    append_more(dir.path(), "ETHUSDT", 4, BASE_MS + 6_000);
+    let tail = drain(&mut ws, 3 * GRACE_MS + 1_200).await;
     let stale: Vec<&Value> = tail
         .iter()
         .filter(|v| {
@@ -576,6 +586,21 @@ async fn o1_subscribe_switches_instrument_and_old_frames_stop() {
          неотличимы для него от новых. Примеры: {:?}",
         stale.len(),
         stale.iter().take(2).collect::<Vec<_>>()
+    );
+
+    let frames = wire_frames(&tail, "w1");
+    let acc = apply_frames(snap_eth, &frames, "O-1 switch");
+    let ref_eth = reference_at(
+        dir.path(),
+        &sel_eth,
+        cursor_at_to(frames.last().expect("O-1 frames not empty")),
+    );
+    assert_eq!(
+        acc, ref_eth,
+        "O-1: после switch кадры подписки `w1` не продолжают ETH snapshot до независимого \
+         эталона. Оракул обязан ловить не только буквальный BTCUSDT в проводной форме, но и \
+         старый reducer, который продолжает присылать содержимое прежнего инструмента под тем \
+         же id."
     );
 }
 
@@ -1000,6 +1025,18 @@ async fn o9_connections_are_isolated() {
          в subscribe. Это Р-Б: snapshot(A) ⊕ frames(A) обязан бит-в-бит сходиться с \
          независимым gateway::snapshot(dir, filter, selector_A, Cursor::at(to)). Пришло: {:?}",
         a_msgs.iter().take(3).collect::<Vec<_>>()
+    );
+    let acc_b = apply_frames(snap_b, &b_frames, "O-9 positive/B");
+    let ref_b = reference_at(
+        dir.path(),
+        &sel_b,
+        cursor_at_to(b_frames.last().expect("B frames not empty")),
+    );
+    assert_eq!(
+        acc_b, ref_b,
+        "O-9: кадры соединения B НЕ продолжают снапшот selector'а, который клиент B послал \
+         в subscribe. Изоляция соединений обязана доказываться с ОБЕИХ сторон, а не только \
+         как «B не равно эталону A»."
     );
 
     // Негатив на ТОЙ ЖЕ фикстуре: если A получит кадры B, курсорная цепочка выглядит
