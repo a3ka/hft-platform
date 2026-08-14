@@ -146,10 +146,10 @@ EOF
   ) || die "коммит правки $2"
 }
 
-run_barrier() { # $1=repo $2=before-sha
+run_barrier() { # $1=repo $2=before-sha [$3=EVENT_NAME] [$4=PR_BASE_SHA]
   need_fixture "$1" run_barrier
-  local st
-  ( cd "$1" && EVENT_NAME=push PUSH_BEFORE="$2" PR_BASE_SHA="$2" bash "${BARRIER}" >/dev/null 2>&1 )
+  local st ev="${3:-push}" pb="${4-$2}"
+  ( cd "$1" && EVENT_NAME="$ev" PUSH_BEFORE="$2" PR_BASE_SHA="$pb" bash "${BARRIER}" >/dev/null 2>&1 )
   st=$?
   # 126/127 — отказ СРЕДЫ, а не вердикт гейта (`positive_control` этот класс НЕ ловит:
   # он проверяет лишь годную ветку, а падать может ОТКАЗНАЯ — например, барьер зовёт
@@ -393,6 +393,48 @@ R=""; mk_repo R "https://github.com/other-org/other-repo.git"; B="$(head_of "$R"
 add_verdict "$R" "APPROVE" "other-org/other-repo" "$B" "$B"
 run_barrier "$R" "$B" && pass "GM-24 audited_repo сверяется с ORIGIN репозитория, а не с зашитым слагом" \
                      || fail "GM-24 вердикт, называющий origin СВОЕГО репозитория, отвергнут — сверка идёт с литералом (класс C-062)"
+
+# GM-25 — `milestone:` ПУСТ ⇒ FAIL. Шапка обещает «поля непусты», но на пустоту давилось
+# единственное поле `audited_head`: мутация «убрать ms из проверки» оставляла набор зелёным
+# (24/24). Обещание без сценария — не проверка.
+mk_repo R; B="$(head_of "$R")"
+{ echo "<!-- GATE-META"
+  echo "milestone: "
+  echo "audited_repo: a3ka/hft-platform"
+  echo "audited_base: $B"
+  echo "audited_head: $B"
+  echo "verdict: APPROVE"
+  echo "-->"
+  echo
+  echo "вердикт с пустым milestone"
+} > "$R/research/critiques/C-102-empty-ms.md" || die "GM-25 запись"
+( cd "$R" && git add -A && git commit -q -m "docs(critic): вердикт с пустым milestone" ) || die "GM-25 commit"
+run_barrier "$R" "$B" && fail "GM-25 пустой milestone: ПРОШЁЛ — «поля непусты» не проверяется ни для одного поля, кроме audited_head" \
+                     || pass "GM-25 пустой milestone заблокирован"
+
+# GM-26 — `verdict` ВНЕ перечня ⇒ FAIL. В наборе жили 4 значения из 8 контракта, и ни один
+# сценарий не давил на само членство в перечне: реализация, вообще не сверяющая перечень,
+# брала 24/24. Не-проходным доказан был только REJECT.
+mk_repo R; B="$(head_of "$R")"
+add_verdict "$R" "MAYBE" "a3ka/hft-platform" "$B" "$B" "C-103-bad-verdict.md"
+run_barrier "$R" "$B" && fail "GM-26 verdict «MAYBE» вне перечня ПРОШЁЛ — перечень допустимых исходов не сверяется" \
+                     || pass "GM-26 verdict вне перечня заблокирован"
+
+# GM-27 — ПРОД-ФОРМА pull_request. Все сценарии выше зовут барьер только как `EVENT_NAME=push`
+# и подают PUSH_BEFORE и PR_BASE_SHA ОДНИМ значением, поэтому мутанты «читаю только
+# PUSH_BEFORE» и «читаю только PR_BASE_SHA» оба давали 24/24. CI триггерится и на
+# `pull_request`, где `github.event.before` ПУСТ, а база приходит из `PR_BASE_SHA`
+# (проводка-образец — `protected-artifacts`). Гейт, проверенный не тем вызовом, каким его
+# зовёт прод, не проверен (`gates.md` §0bis, урок цены семи красных прогонов).
+mk_repo R; B="$(head_of "$R")"
+add_verdict "$R" "APPROVE" "a3ka/hft-platform" "$B" "$B" "C-104-pr-form.md"
+# Зовётся ТОЙ ЖЕ функцией, что остальные сценарии: иначе вызов не попадает в `declared`,
+# которое verify сверяет с числом исполненных, и шаг G краснеет «счёт не сошёлся».
+if run_barrier "$R" "" pull_request "$B"; then
+  pass "GM-27 прод-форма pull_request: база берётся из PR_BASE_SHA при пустом PUSH_BEFORE"
+else
+  fail "GM-27 на pull_request (PUSH_BEFORE пуст, база в PR_BASE_SHA) барьер отказал — читается только push-переменная"
+fi
 
 echo
 if [ "${FAILED}" -gt 0 ]; then
