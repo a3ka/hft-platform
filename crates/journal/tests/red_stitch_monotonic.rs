@@ -186,6 +186,108 @@ fn mn_2_stream_refuses_non_monotonic_catalogue() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════════════
+// MN-9 — recover: offline-восстановление тоже не имеет права молча сшить каталог
+// ═════════════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn mn_9_recover_refuses_non_monotonic_catalogue() {
+    let (dir, a, b) = restitched_dir(400);
+
+    match journal::recover(dir.path()) {
+        Err(e) => {
+            let msg = e.to_string();
+            assert!(
+                msg.contains("first_seq"),
+                "диагностика обязана назвать нарушенное свойство (`first_seq`): «{msg}»"
+            );
+            assert!(
+                err_names_both(&msg, &a, &b),
+                "диагностика обязана назвать ОБА файла ({a}, {b}) — иначе оператор не \
+                 знает, какой сегмент вернуть в карантин: «{msg}»"
+            );
+        }
+        Ok(evs) => {
+            let seqs: Vec<u64> = evs.iter().map(|e| e.seq).collect();
+            let bad_seam = seqs
+                .windows(2)
+                .find(|w| w[0] >= w[1])
+                .map(|w| (w[0], w[1]))
+                .expect(
+                    "setup-guard: recover вернул события без немонотонного стыка, хотя \
+                     first_seq каталога был сломан",
+                );
+            panic!(
+                "JR-I-11 НАРУШЕН: `recover` СШИЛ немонотонный каталог молча и вернул {} \
+                 событий. Первый немонотонный стык seq: {bad_seam:?}. Толерантность \
+                 `recover` к CRC/torn-фреймам ВНУТРИ сегмента не разрешает менять порядок \
+                 МЕЖДУ сегментами.",
+                evs.len()
+            );
+        }
+    }
+}
+
+#[test]
+fn mn_10_recover_reads_monotonic_catalogue() {
+    let dir = healthy_dir(400);
+
+    let evs = journal::recover(dir.path()).unwrap_or_else(|e| {
+        panic!("монотонный многосегментный каталог обязан проходить через recover: {e}")
+    });
+    assert_eq!(evs.len(), 400, "recover обязан отдать все события");
+    assert!(
+        evs.windows(2).all(|w| w[0].seq + 1 == w[1].seq),
+        "setup/control: здоровый каталог обязан читаться в порядке seq"
+    );
+}
+
+#[test]
+fn mn_11_recover_boundary_catalogues_are_not_monotonicity_violations() {
+    // (а) дыра в индексах сегментов после ретеншена: это не нарушение first_seq-порядка.
+    let dir = healthy_dir(400);
+    let names = seg_names(dir.path());
+    std::fs::remove_file(dir.path().join(&names[1])).expect("remove middle");
+    let evs = journal::recover(dir.path()).unwrap_or_else(|e| {
+        panic!("разрыв индексов после ретеншена — НЕ немонотонность для recover: {e}")
+    });
+    assert!(
+        evs.windows(2).all(|w| w[0].seq < w[1].seq),
+        "оставшиеся события обязаны идти в возрастающем порядке seq"
+    );
+
+    // (б) один сегмент: соседних first_seq нет, сравнивать нечего.
+    let one = tempfile::tempdir().expect("dir");
+    {
+        let mut j = Journal::open_with(one.path(), cfg_with(64 * 1024 * 1024, "recover-single"))
+            .expect("open");
+        for i in 0..10 {
+            j.append(common::trade(i)).expect("append");
+        }
+        j.flush().expect("flush");
+    }
+    assert_eq!(
+        seg_names(one.path()).len(),
+        1,
+        "setup-guard: ровно один сегмент"
+    );
+    assert_eq!(
+        journal::recover(one.path())
+            .expect("один сегмент — не нарушение")
+            .len(),
+        10
+    );
+
+    // (в) пустой каталог: соседних first_seq нет, recover обязан вернуть пустой набор.
+    let empty = tempfile::tempdir().expect("dir");
+    assert!(
+        journal::recover(empty.path())
+            .expect("пустой каталог — не нарушение")
+            .is_empty(),
+        "пустой каталог обязан дать пустой recover"
+    );
+}
+
+// ═════════════════════════════════════════════════════════════════════════════════════
 // MN-3 — readable_floor: немонотонность даёт ЗАНИЖЕННЫЙ пол (условие закрытия R-002/R-003)
 // ═════════════════════════════════════════════════════════════════════════════════════
 
