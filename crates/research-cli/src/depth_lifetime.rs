@@ -237,7 +237,7 @@ impl SideBook {
                         // на той же цене (до атрибуции) сотрёт его и судьба потеряется
                         // (`R-038` F-2, `DV-I-16`). Кладём `(price, Cancelled)` в
                         // `pending_completed` — `attribute_newborns` при появлении mid
-                        // (или `flush_delayed_states` в конце окна) закроет судьбу.
+                        // (или `flush_pending_completed` в конце окна) закроет судьбу.
                         self.pending_completed.push_back((l.price, Fate::Cancelled));
                     }
                     self.alive.remove(&l.price);
@@ -444,10 +444,9 @@ pub fn analyze(ticks: &[DeltaTick]) -> LifetimeReport {
     merge_band_counts(&mut aggregates, Side::Buy, &bids.counts);
     merge_band_counts(&mut aggregates, Side::Sell, &asks.counts);
 
-    // Финальная итерация по `states` — добираем судьбы, ЗАВЕРШЁННЫЕ ДО атрибуции,
-    // когда mid так и не появился до конца окна (односторонний поток). В этом пути
-    // судьба известна (`Cancelled`/`Frozen`/`Censored`) — бамп в первой полосе по
-    // `unwrap_or(BANDS_BPS[0].0)`, как и в прежней реализации.
+    // `states` штатно пуст после `freeze_remaining`: завершённые до mid судьбы идут через
+    // `pending_completed` и доразбираются ниже. Этот вызов оставлен защитным fallback'ом
+    // для будущего/нестандартного состояния, чтобы остаток `states` не потерялся молча.
     flush_delayed_states(&mut aggregates, Side::Buy, &bids.states);
     flush_delayed_states(&mut aggregates, Side::Sell, &asks.states);
 
@@ -509,28 +508,25 @@ fn merge_band_counts(
     }
 }
 
-/// Добрать отложенные bumps по `states` (завершённые-судьбы без атрибуции из-за
-/// одностороннего потока). По построению к этому моменту `states` НЕ содержит
-/// `Alive` (alive ушли через `freeze_remaining`/`apply_gap_censor`) — только
-/// delayed `Cancelled`/etc. В Alive-ветку всё равно входим: `match` exhaustive.
+/// Защитный fallback по `states`. Текущий путь завершённых до mid жизней идёт через
+/// `pending_completed`; alive-уровни перед агрегацией закрываются `freeze_remaining`.
+/// Если будущая правка всё же оставит запись в `states`, переносим её в первую полосу.
 fn flush_delayed_states(
     aggregates: &mut BTreeMap<(i64, i64), BandAggregate>,
     side: Side,
     states: &BTreeMap<i64, LevelState>,
 ) {
     for state in states.values() {
-        if state.fate == Fate::Alive {
-            // alive-уровни уходят через freeze/gap; сюда попасть не должны. Если
-            // попали — это артефакт построения, считаем как Cancelled, чтобы
-            // баланс `born == c + f + ce` не разъехался.
-        }
         let lo = state.born_band_lo_bps.unwrap_or(BANDS_BPS[0].0);
         let entry = aggregates
             .get_mut(&(side_rank(side), lo))
             .expect("полоса pre-init");
         let (_, born, cancelled, frozen, censored) = *entry;
         *entry = match state.fate {
-            Fate::Alive => (side, born + 1, cancelled, frozen, censored),
+            // Сюда штатно не попадаем: alive закрываются `freeze_remaining`. Если
+            // fallback всё же увидел Alive, выполняем прежнее обещание комментария —
+            // считаем как Cancelled, чтобы `born == c + f + ce` не разъехался.
+            Fate::Alive => (side, born + 1, cancelled + 1, frozen, censored),
             Fate::Cancelled => (side, born + 1, cancelled + 1, frozen, censored),
             Fate::Frozen => (side, born + 1, cancelled, frozen + 1, censored),
             Fate::Censored => (side, born + 1, cancelled, frozen, censored + 1),
