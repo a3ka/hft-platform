@@ -228,14 +228,52 @@ jobs:
       - name: Проба гейта (41 проверка, анти-плацебо)
         run: bash scripts/tests/red_verify_design_claims.sh
 
+  review-fa:
+    name: Review FA echo attestation (M-66 — reviewer verdict несёт живое эхо)
+    runs-on: ubuntu-latest
+    steps:
+      # fetch-depth: 0 ОБЯЗАТЕЛЬНО: барьер строит диапазон `$BASE..HEAD` через
+      # `git rev-list`, `git log`, и `git diff --name-only` — всем нужна ЛОКАЛЬНАЯ
+      # история. Дефолтный depth=1 оставил бы один коммит, диапазон был бы пустым,
+      # и барьер выдал бы либо ложный SKIP (если бы diff не зацепил crates), либо
+      # ложный S=∅ (если бы введённый R-файл был на HEAD, но не в истории). Тот же
+      # класс дыры, что блокер B1 в `protected-artifacts` и `docs-freeze`.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Барьер M-66. База — ИЗ СОБЫТИЯ: тот же fail-closed паттерн, что в
+      # `protected-artifacts` / `docs-freeze` / `artifact-ids` (см. шапку комментария
+      # в `protected-artifacts`). push → `github.event.before`, PR →
+      # `github.event.pull_request.base.sha`. Любая форма недостоверной базы (пустая /
+      # zero-SHA при создании ветки / force-push / база отсутствует в истории / база не
+      # предок HEAD) → FAIL, а не пропуск: «базы нет» не значит «проверять нечего».
+      # Семантика per-range (§3.1): диф суммарно BASE..HEAD; реверт-пара внутри
+      # диапазона (код внесён и снят) даёт чистый net-diff → барьер молчит.
+      - name: Барьер живое FA-эхо reviewer-вердикта
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: bash scripts/check_review_fa.sh
+
+      # Проба барьера ТОЙ ЖЕ проводкой, какой барьер зовёт CI (testing.md
+      # §«Целостность гейта»). 35 сценариев из таблицы §4 — 8 осей × значения + легитимный
+      # сценарий на каждой. Батарея --battery прогоняет эталонный барьер + 11 дырявых
+      # (состав — спека §4): anyid / synonly / anymodule / nomap / nod / ghostok / nobase /
+      # emptyfaok / vacuousok / anywaiver / echoexcuse. Без этого шага «барьер зелёный»
+      # означал бы лишь, что скрипт существует и парсится, а не что инвариант защищён.
+      - name: Проба барьера (35 сценариев + сверка со спекой §4)
+        run: bash scripts/tests/red_review_fa.sh
+
   status-check:
     name: All checks passed
     runs-on: ubuntu-latest
-    needs: [build-test, security, delivery, protected-artifacts, contracts, docs-freeze, artifact-ids, design-claims]
+    needs: [build-test, security, delivery, protected-artifacts, contracts, docs-freeze, artifact-ids, design-claims, review-fa]
     if: always()
     steps:
       - run: |
-          if [[ "${{ needs.build-test.result }}" != "success" || "${{ needs.security.result }}" != "success" || "${{ needs.delivery.result }}" != "success" || "${{ needs.protected-artifacts.result }}" != "success" || "${{ needs.contracts.result }}" != "success" || "${{ needs.docs-freeze.result }}" != "success" || "${{ needs.artifact-ids.result }}" != "success" || "${{ needs.design-claims.result }}" != "success" ]]; then
+          if [[ "${{ needs.build-test.result }}" != "success" || "${{ needs.security.result }}" != "success" || "${{ needs.delivery.result }}" != "success" || "${{ needs.protected-artifacts.result }}" != "success" || "${{ needs.contracts.result }}" != "success" || "${{ needs.docs-freeze.result }}" != "success" || "${{ needs.artifact-ids.result }}" != "success" || "${{ needs.design-claims.result }}" != "success" || "${{ needs.review-fa.result }}" != "success" ]]; then
             echo "One or more checks failed"; exit 1
           fi
           echo "All checks passed"
