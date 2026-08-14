@@ -227,5 +227,95 @@ $ bash scripts/next_artifact_id.sh R
 R-079
 ```
 
-Пруф деплой-гейта `gates.md` §8 (CI + Deploy + eyes-on прода) дописывается в §10 этого файла
-после push'а в `main`.
+Пруф деплой-гейта `gates.md` §8 (CI + Deploy + eyes-on прода) — §10 ниже, дописан после push'а.
+
+## §10 — Пруф деплой-гейта (`gates.md` §8): push ≠ конец цикла
+
+**Что вошло в `main`:** merge `e2d634c` (предмет + `R-078` + `R-079`) и close-out `0e4023e`
+(`PROJECT-STATE.md` + `TECH-DEBT.md`).
+
+### п.1 — CI до терминального статуса
+
+```
+$ gh run watch 31849941830 --exit-status   # merge e2d634c
+CI_MERGE_EXIT=0
+
+$ gh run watch 31850084315 --exit-status   # close-out 0e4023e
+CI_CLOSEOUT_EXIT=0
+
+$ gh run list --branch main --limit 4
+completed	success	docs(state+debt): close-out TD-141 …	CI	main	push	31850084315	10m16s
+completed	success	Merge branch 'docs/TD-141-fa-sync' …	CI	main	push	31849941830	10m51s
+completed	success	docs(handoff): §0bis …	CI	main	push	31847518441	11m0s
+completed	success	docs(review): R-077 §10 …	CI	main	push	31843157253	9m22s
+```
+
+### Deploy НЕ триггерился — и это проверено фильтром, а не предположено
+
+`Deploy to VPS` на оба коммита не запускался. Причина названа кодом, а не догадкой —
+`.github/workflows/deploy.yml:30-47` фильтрует push по путям: `crates/**` (минус
+`crates/*/tests/**`), `Cargo.toml`, `Cargo.lock`, `Dockerfile`, `docker-compose.yml`,
+`.github/workflows/deploy.yml`. Ни `docs/**`, ни `research/**`, ни `PROJECT-STATE.md`/
+`TECH-DEBT.md` в фильтр не входят.
+
+```
+$ gh run list --branch main --workflow "Deploy to VPS" --limit 3
+completed	success	Merge branch 'docs/TD-141-recover-red' …	Deploy to VPS	main	push	31841876372
+completed	success	Deploy to VPS	Deploy to VPS	main	workflow_dispatch	31799412762
+completed	failure	Merge M-62 …	Deploy to VPS	main	push	31753421380
+```
+
+Вершина списка — деплой КОДОВОЙ половины `TD-141` (`362784a`, success 21:18 UTC). То есть
+guard `recover`, о котором теперь говорит FA, на проде УЖЕ стоит; документная половина
+прод не меняет по построению.
+
+### п.2 — прод глазами (не выводится из «CI зелёный»)
+
+```
+$ ssh … 'docker ps --format "{{.Names}} {{.Status}}"'
+hft-gateway-serve Up 2 hours (healthy)
+hft-recorder Up 2 hours (healthy)
+
+$ ssh … 'cat …/recorder.heartbeat; date -u +%s'
+{"events":489670,"free_bytes":53877448704,"min_free_bytes":10737418240,"next_seq":237420807,
+ "segment_index":284,"ts_wall_ms":1786750318112,"writable":true}
+1786750327
+```
+
+**Свежесть heartbeat'а — 9 секунд** (`1786750327 − 1786750318`), а не «файл существует»:
+`gates.md` §8 требует наблюдать МОЛЧАНИЕ, а не только сбой. `writable: true`, свободно
+53.9 GB при пороге 10.7 GB.
+
+Журнал растёт — активный сегмент недописан, значит запись идёт:
+```
+$ ssh … 'ls -la …/_data | tail -4'
+-rw-r--r-- 1 root root 1073729638 Aug 14 14:12 segment-00000281.jrnl
+-rw-r--r-- 1 root root 1073741409 Aug 14 17:20 segment-00000282.jrnl
+-rw-r--r-- 1 root root 1073727302 Aug 14 20:15 segment-00000283.jrnl
+-rw-r--r-- 1 root root  767132274 Aug 14 23:32 segment-00000284.jrnl
+```
+
+Память — `RssAnon`, а не `docker stats` (`TD-021`: в `docker stats` входит page cache журнала,
+и «лик» находится там, где его нет):
+```
+$ ssh … 'for c in hft-recorder hft-gateway-serve; do p=$(docker inspect -f "{{.State.Pid}}" $c); …'
+hft-recorder      pid=2152704  RssAnon:  20988 kB
+hft-gateway-serve pid=2152863  RssAnon:    336 kB
+ 23:32:16 up 35 days, 8:51, load average: 0.14, 0.18, 0.18
+```
+
+**Sanity содержимого не требуется:** §8 п.2 предписывает его, «если деплой менял поведение
+данных (парсеры/форматы)». Деплоя не было вовсе, формат не тронут — диф не содержит ни строки
+кода. Пункт назван, а не опущен молча.
+
+### п.4 — worktree-GC
+
+Выполнен; отчёт — в Handoff. Диск перед close-out'ом — 92 % (порог `branch-hygiene.md` §5 —
+85 %), поэтому запускался и `--reclaim`, а не только снос своего дерева.
+
+## Итог
+
+`TD-141` закрыт ЦЕЛИКОМ: кодовая половина — `362784a`/`R-077`, документная — `e2d634c`/`R-079`.
+`PROJECT-STATE.md` и `TECH-DEBT.md` обновлены коммитом `0e4023e`. Открытым по итогу круга
+остаётся один предмет, и он НЕ этой карточки: `R-079` NOTE-2 — механизма синхронизации
+таблицы §I.12 с кодом нет, зона architect'а.
