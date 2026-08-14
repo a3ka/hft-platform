@@ -297,6 +297,67 @@ Merge разрешён без условий. После merge (пруфы до�
 
 ---
 
-## §10. Close-out (дописано после merge)
+## §10. Close-out — пруф деплой-гейта (`gates.md` §8), дописано после merge
 
-_(заполняется reviewer'ом при закрытии — сырые строки `gh run list` и вывод ssh)_
+**Merge:** `362784a` (`--no-ff`, ветка `docs/TD-141-recover-red` @ `80fff89`), push в `main`
+2026-08-14T21:18Z. Барьеры перед push'ом прогнаны в ПРОД-ФОРМЕ на merge-коммите
+(`EVENT_NAME=push PUSH_BEFORE=8657fb2`): `check_protected_artifacts.sh` exit=0,
+`check_docs_freeze.sh` exit=0, `check_artifact_ids.sh` exit=0 (после перенумерации — NOTE-3).
+
+### 1. CI + Deploy до терминального статуса
+
+```
+$ gh run list --limit 3
+completed  success  Merge branch 'docs/TD-141-recover-red' …  Deploy to VPS  main  push  31841876372  12m49s  2026-08-14T21:18:52Z
+completed  success  Merge branch 'docs/TD-141-recover-red' …  CI            main  push  31841876307  10m47s  2026-08-14T21:18:52Z
+completed  success  docs(debt): TD-151 …                      CI            main  push  31836162358  11m29s  2026-08-14T20:04:11Z
+
+$ gh run watch 31841876307 --exit-status ; echo CI exit=$?
+CI exit=0
+$ gh run watch 31841876372 --exit-status ; echo DEPLOY exit=$?
+DEPLOY exit=0
+```
+
+### 2. Eyes-on VPS — ДВА замера с интервалом 110 s (одиночный снимок роста не доказывает)
+
+```
+=== containers ===                       === через 110 s ===
+hft-gateway-serve Up 22 seconds (healthy)   hft-gateway-serve Up 2 minutes (healthy)
+hft-recorder      Up 28 seconds (healthy)   hft-recorder      Up 2 minutes (healthy)
+
+=== heartbeat ===
+{"events":1483,"free_bytes":54186856448,"next_seq":236931899,"segment_index":284,
+ "ts_wall_ms":1786743108112,"writable":true}          host date -u +%s = 1786743116  (лаг 8 s)
+{"events":5796,"free_bytes":54185082880,"next_seq":236936223,"segment_index":284,
+ "ts_wall_ms":1786743218112,"writable":true}          host date -u +%s = 1786743221  (лаг 3 s)
+
+=== журнал растёт ===
+segment-00000284.jrnl  467 898 171 B (21:31)  →  469 498 097 B (21:33)   +1.6 MB
+next_seq  236 931 899 → 236 936 223  (+4 324 события за 110 s)
+
+=== RssAnon (TD-021: память меряется так, а не docker stats) ===
+recorder 10 416 kB → 15 576 kB (прогрев после рестарта; долгоживущий recorder сегодня
+                                держался 19 928 kB — на утечку не похоже)
+gateway-serve 336 kB
+=== диск VPS ===  /dev/sda1 150G 94G 51G 65% /
+```
+
+Все три liveness-признака положительны: контейнеры `healthy`, heartbeat свежий (лаг 3–8 s),
+журнал растёт.
+
+**Содержательная санити (`gates.md` §8 п.2) — рассмотрена и НЕ требуется, обоснование
+предъявляю:** пункт обязателен, «если деплой менял поведение данных (парсеры/форматы)».
+Этот деплой не менял ни того, ни другого — диф не касается `segments.rs`, формата фрейма,
+схемы сегмента и пути ЗАПИСИ; единственная изменённая функция (`recover`) прод-процессом не
+вызывается вовсе (замер §5). Пишу это явно, а не молчу: пропуск пункта без названной причины
+неотличим от забывчивости.
+
+### 3. Уборка (`branch-hygiene.md` §Worktree lifecycle)
+
+`bash scripts/gc_worktrees.sh` + снос собственного кэша `/tmp/hft-rev-td141/target` — см.
+Handoff §D. Диск локальной машины на момент вердикта — 87 %.
+
+### 4. Что остаётся открытым после close-out
+
+- `TD-141` — **OPEN**, закрыта кодовая половина (Н-1); документная передана architect'у.
+- `TD-150` — подтверждён повторно (NOTE-3), развязка `Р-1` ждёт токена founder'а.
