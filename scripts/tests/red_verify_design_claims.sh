@@ -553,11 +553,11 @@ scenario_merge_preview_conflict_is_setup_guard_fail() {
 
   git -C "${d}" checkout -q -b base_main_conflict "${branch_tip}"
   sed -i 's#Компонент foo реализован и работает#Компонент foo НЕ реализован, работа не начата#' "${d}/docs/DESIGN.md"
-  git -C "${d}" commit -qam "base: правит ту же строку §1"
+  git -C "${d}" -c user.name=test -c user.email=test@test.local commit -qam "base: правит ту же строку §1"
 
   git -C "${d}" checkout -q "${branch_tip}"
   sed -i 's#Компонент foo реализован и работает#Компонент foo реализован и полностью протестирован#' "${d}/docs/DESIGN.md"
-  git -C "${d}" commit -qam "branch: правит ту же строку §1 иначе"
+  git -C "${d}" -c user.name=test -c user.email=test@test.local commit -qam "branch: правит ту же строку §1 иначе"
 
   local out rc
   out="$(bash "${BARRIER}" --merge-preview base_main_conflict "${d}")"; rc=$?
