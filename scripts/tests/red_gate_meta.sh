@@ -42,8 +42,10 @@
 #     -->
 # Проверки: поля непусты; verdict — из перечня; audited_repo == origin ЭТОГО репо;
 # audited_base и audited_head существуют в ЭТОЙ истории; audited_head — предок HEAD; для
-# проходных исходов — subject-lock. Выход из лока: `ALLOW-SUBJECT-CHANGE: <причина>` в теле
-# коммита диапазона. База — ИЗ СОБЫТИЯ; пустая/zero/не-предок ⇒ FAIL (блокер B1, C-006).
+# проходных исходов — subject-lock на классы `.claude/rules/**`, `.github/workflows/**`,
+# `scripts/verify_*.sh`, `scripts/check_*.sh`, `scripts/tests/red_*.sh`. Выход из лока:
+# `ALLOW-SUBJECT-CHANGE: <причина>` в теле коммита диапазона. База — ИЗ СОБЫТИЯ;
+# пустая/zero/не-предок ⇒ FAIL (блокер B1, C-006).
 # ОТСУТСТВИЕ (К-4): для каждого MERGE-коммита диапазона, subject которого называет `M-NN`,
 # в дереве этого merge обязан существовать research/reviews/R-*.md, содержащий тот же
 # литерал `M-NN`, — иначе FAIL. Не-merge коммиты проверкой отсутствия не судятся (GM-19:
@@ -57,9 +59,26 @@ ROOT_REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 BARRIER="${BARRIER:-${ROOT_REPO}/scripts/check_gate_meta.sh}"
 ZERO=0000000000000000000000000000000000000000
 GATE_CLASS_FILE="scripts/verify_M-99.sh"
+CHECK_CLASS_FILE="scripts/check_m99.sh"
+RED_CLASS_FILE="scripts/tests/red_m99.sh"
 
 FAILED=0
 PASSED=0
+
+# Реестр фикстур ведётся в ФАЙЛЕ, а не в переменной: часть фикстур рождается в подоболочках,
+# где присваивание переменной теряется (тот же класс, что дал 10 400 каталогов /tmp у
+# red_docs_freeze; эталон починки — scripts/tests/red_artifact_ids.sh).
+FIXTURE_REG="$(mktemp /tmp/red-gatemeta-reg-XXXXXX)"
+reg_fixture() { printf '%s\n' "$1" >> "${FIXTURE_REG}"; }
+cleanup_fixtures() {
+  [ -n "${KEEP_FIXTURES:-}" ] && { echo "фикстуры оставлены (KEEP_FIXTURES): ${FIXTURE_REG}"; return 0; }
+  while IFS= read -r d; do
+    [ -n "$d" ] || continue
+    case "$d" in /tmp/red-gatemeta-*) chmod -R u+rwX "$d" 2>/dev/null; rm -rf "$d" ;; esac
+  done < "${FIXTURE_REG}" 2>/dev/null
+  rm -f "${FIXTURE_REG}"
+}
+trap cleanup_fixtures EXIT
 pass() { echo "PASS  $*"; PASSED=$((PASSED + 1)); }
 fail() { echo "FAIL  $*"; FAILED=$((FAILED + 1)); }
 die()  { echo "SETUP НЕ СОСТОЯЛСЯ: $*" >&2; exit 1; }
@@ -68,21 +87,42 @@ die()  { echo "SETUP НЕ СОСТОЯЛСЯ: $*" >&2; exit 1; }
 bash -n "${BARRIER}" 2>/dev/null || die "барьер не парсится — сценарии мерили бы ошибку интерпретатора."
 
 # ── Фикстура ──────────────────────────────────────────────────────────────────────────
-mk_repo() {
-  local d; d="$(mktemp -d /tmp/red-gatemeta-XXXXXX)" || die mktemp
-  ( cd "$d" && git init -q \
+# Результат отдаётся ЧЕРЕЗ ИМЯ ПЕРЕМЕННОЙ ($1), а не через stdout. Причина структурная:
+# при форме `mk_repo R` тело функции исполняется в ПОДОБОЛОЧКЕ, и `die` внутри неё
+# завершает только её — проба продолжается с ПУСТЫМ $R. Дальше `( cd "$R" && git add -A )`
+# исполняется в РАБОЧЕМ дереве (`cd ""` возвращает 0 и никуда не переходит), а сценарии
+# печатают PASS против несозданной фикстуры. Присваивание по имени возвращает `die`
+# в основную оболочку, где он и обязан останавливать прогон.
+# Внутренние локальные названы `__fx_*` НАМЕРЕННО: в bash динамическая область видимости, и
+# `local d` внутри функции ЗАТЕНЯЕТ переменную с тем же именем у вызывающего — `printf -v "$1"`
+# записал бы в локальную копию. Префикс исключает класс, а не случай.
+mk_repo() { # $1=имя переменной для результата, $2=origin URL (по умолчанию — наш)
+  local __fx_d __fx_origin="${2:-https://github.com/a3ka/hft-platform.git}"
+  __fx_d="$(mktemp -d /tmp/red-gatemeta-XXXXXX)" || die mktemp
+  ( cd "$__fx_d" && git init -q \
     && git config user.email a@b.c && git config user.name t \
-    && git remote add origin https://github.com/a3ka/hft-platform.git \
-    && mkdir -p research/critiques research/reviews scripts .claude/rules docs .github/workflows \
+    && git remote add origin "$__fx_origin" \
+    && mkdir -p research/critiques research/reviews scripts/tests .claude/rules docs .github/workflows \
     && echo base > docs/DESIGN.md && echo base > scripts/verify_M-99.sh \
+    && echo base > scripts/check_m99.sh && echo base > scripts/tests/red_m99.sh \
     && echo base > .claude/rules/gates.md && echo base > .github/workflows/ci.yml \
     && git add -A && git commit -q -m base ) || die "инициализация фикстуры"
-  echo "$d"
+  reg_fixture "$__fx_d"
+  printf -v "$1" '%s' "$__fx_d"
+}
+
+# Второй рубеж к тому же классу: даже если фикстура не создалась, ни одна функция не
+# исполнит git-команду с пустым путём. `cd ""` возвращает 0 и остаётся в ТЕКУЩЕМ каталоге —
+# то есть в рабочем дереве репозитория, где `git add -A && git commit` снёс бы чужую работу.
+need_fixture() { # $1=путь $2=имя вызывающего
+  [ -n "${1:-}" ] && [ -d "${1:-}" ] \
+    || die "СЕТАП НЕ СОСТОЯЛСЯ: ${2} получил пустой/несуществующий путь фикстуры «${1:-}» — без этой проверки команда ушла бы в РАБОЧЕЕ дерево"
 }
 
 # $1=repo $2=verdict-строка $3=audited_repo $4=audited_base $5=audited_head [$6=имя] [$7=каталог]
 add_verdict() {
   local r="$1" name="${6:-C-999-test.md}" dir="${7:-research/critiques}"
+  need_fixture "$r" add_verdict
   { echo "<!-- GATE-META"
     echo "milestone: M-99"
     echo "audited_repo: $3"
@@ -97,6 +137,7 @@ add_verdict() {
 }
 
 touch_file() { # $1=repo $2=путь $3=тело-коммита
+  need_fixture "$1" touch_file
   ( cd "$1" && echo "правка" >> "$2" && git add -A && git commit -q -F - <<EOF
 правка $2
 
@@ -106,50 +147,72 @@ EOF
 }
 
 run_barrier() { # $1=repo $2=before-sha
+  need_fixture "$1" run_barrier
+  local st
   ( cd "$1" && EVENT_NAME=push PUSH_BEFORE="$2" PR_BASE_SHA="$2" bash "${BARRIER}" >/dev/null 2>&1 )
+  st=$?
+  # 126/127 — отказ СРЕДЫ, а не вердикт гейта (`positive_control` этот класс НЕ ловит:
+  # он проверяет лишь годную ветку, а падать может ОТКАЗНАЯ — например, барьер зовёт
+  # отсутствующий в CI `jq`/`gh`. Тогда все сценарии «гейт отказал» зеленеют против
+  # механизма, который не отказывает, а падает. C-086 F-086-1 требовал именно этого различения).
+  case $st in
+    126|127) die "барьер вернул ${st} (не найден / не исполняется) — это отказ СРЕДЫ, а не отказ гейта; сценарий засчитал бы падение за срабатывание" ;;
+  esac
+  return $st
 }
-head_of() { ( cd "$1" && git rev-parse HEAD ); }
+head_of() { need_fixture "$1" head_of; ( cd "$1" && git rev-parse HEAD ); }
+positive_control() {
+  local r b
+  mk_repo r
+  b="$(head_of "$r")"
+  add_verdict "$r" "APPROVE" "a3ka/hft-platform" "$b" "$b"
+  ( cd "$r" && EVENT_NAME=push PUSH_BEFORE="$b" PR_BASE_SHA="$b" bash "${BARRIER}" >/dev/null 2>&1 ) \
+    || die "барьер не проходит заведомо годную фикстуру (валидная GATE-META, audited_head предок HEAD); setup не состоялся"
+}
 
 echo "── Привязка вердикта к предмету + subject-lock + отсутствие (M-60b G3) ──"
-echo "── сценарии GM-1..GM-19; GM-16 СОЖЖЁН (спека M-60b §4, шапка выше) ──"
+echo "── сценарии GM-1..GM-23; GM-16 СОЖЖЁН (спека M-60b §4, шапка выше) ──"
 echo "барьер: ${BARRIER}"
+echo
+positive_control
+echo "SETUP positive-control: барьер принимает заведомо годную GATE-META-фикстуру"
 echo
 
 # ── Блок 1: форма и принадлежность предмету ──────────────────────────────────────────
 
 # GM-1 — вердикт без шапки
-R="$(mk_repo)"; B="$(head_of "$R")"
+mk_repo R; B="$(head_of "$R")"
 echo "вердикт без метаданных" > "$R/research/critiques/C-001.md"
 ( cd "$R" && git add -A && git commit -q -m "вердикт без шапки" ) || die "GM-1"
 run_barrier "$R" "$B" && fail "GM-1 вердикт БЕЗ шапки прошёл — привязки к предмету нет" \
                       || pass "GM-1 вердикт без GATE-META заблокирован"
 
 # GM-2 — поле пустое
-R="$(mk_repo)"; B="$(head_of "$R")"; H="$B"
+mk_repo R; B="$(head_of "$R")"; H="$B"
 add_verdict "$R" "REJECT" "a3ka/hft-platform" "$B" ""
 run_barrier "$R" "$B" && fail "GM-2 пустой audited_head прошёл — шапка стала ритуалом" \
                       || pass "GM-2 пустое поле шапки отвергнуто"
 
 # GM-3 — ЧУЖОЙ репозиторий (реплей C-062)
-R="$(mk_repo)"; B="$(head_of "$R")"
+mk_repo R; B="$(head_of "$R")"
 add_verdict "$R" "REJECT" "einhardsystems/einhard-runtime" "$B" "$B"
 run_barrier "$R" "$B" && fail "GM-3 вердикт по ЧУЖОМУ репозиторию прошёл — C-062 повторим" \
                       || pass "GM-3 чужой audited_repo заблокирован (реплей C-062)"
 
 # GM-4 — audited_head, которого в нашей истории НЕТ (реплей C-062: 9a0e48f0)
-R="$(mk_repo)"; B="$(head_of "$R")"
+mk_repo R; B="$(head_of "$R")"
 add_verdict "$R" "REJECT" "a3ka/hft-platform" "$B" "9a0e48f09a0e48f09a0e48f09a0e48f09a0e48f0"
 run_barrier "$R" "$B" && fail "GM-4 несуществующая ревизия прошла — вердикт судил чужую историю" \
                       || pass "GM-4 несуществующий audited_head заблокирован (реплей C-062)"
 
 # GM-5 — audited_base, которого нет
-R="$(mk_repo)"; B="$(head_of "$R")"
+mk_repo R; B="$(head_of "$R")"
 add_verdict "$R" "REJECT" "a3ka/hft-platform" "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef" "$B"
 run_barrier "$R" "$B" && fail "GM-5 несуществующий audited_base прошёл" \
                       || pass "GM-5 несуществующий audited_base заблокирован"
 
 # GM-6 — audited_head существует, но НЕ предок HEAD (side-ветка)
-R="$(mk_repo)"; B="$(head_of "$R")"
+mk_repo R; B="$(head_of "$R")"
 ( cd "$R" && git checkout -q -b side && echo x >> docs/DESIGN.md \
   && git add -A && git commit -q -m side ) || die "GM-6 side"
 SIDE="$(cd "$R" && git rev-parse HEAD)"
@@ -159,13 +222,13 @@ run_barrier "$R" "$B" && fail "GM-6 audited_head не из этой линии �
                       || pass "GM-6 audited_head вне линии истории заблокирован"
 
 # GM-7 — всё корректно, после вердикта ничего не менялось
-R="$(mk_repo)"; B="$(head_of "$R")"
+mk_repo R; B="$(head_of "$R")"
 add_verdict "$R" "APPROVE" "a3ka/hft-platform" "$B" "$B"
 run_barrier "$R" "$B" && pass "GM-7 корректный вердикт проходит" \
                       || fail "GM-7 ложное срабатывание на корректной шапке"
 
 # GM-8 — старый вердикт, не тронутый в диапазоне ⇒ требований нет
-R="$(mk_repo)"
+mk_repo R
 echo "старый вердикт без шапки" > "$R/research/critiques/C-000-old.md"
 ( cd "$R" && git add -A && git commit -q -m "старый вердикт" ) || die "GM-8"
 B="$(head_of "$R")"
@@ -174,7 +237,7 @@ run_barrier "$R" "$B" && pass "GM-8 старые вердикты вне диа�
                       || fail "GM-8 гейт требует шапку ретроспективно — правка защищённых артефактов"
 
 # GM-9 — база не установлена достоверно ⇒ fail-closed
-R="$(mk_repo)"; B="$(head_of "$R")"
+mk_repo R; B="$(head_of "$R")"
 add_verdict "$R" "REJECT" "einhardsystems/einhard-runtime" "$B" "$B"
 run_barrier "$R" "$ZERO" && fail "GM-9 zero-SHA база дала ПРОПУСК" || pass "GM-9 zero-SHA: fail-closed"
 run_barrier "$R" ""      && fail "GM-9b пустая база дала ПРОПУСК" || pass "GM-9b пустая база: fail-closed"
@@ -182,42 +245,42 @@ run_barrier "$R" ""      && fail "GM-9b пустая база дала ПРОП�
 # ── Блок 2: subject-lock ─────────────────────────────────────────────────────────────
 
 # GM-10 — APPROVE, после него тронут verify-скрипт ⇒ блок
-R="$(mk_repo)"; B="$(head_of "$R")"
+mk_repo R; B="$(head_of "$R")"
 add_verdict "$R" "APPROVE" "a3ka/hft-platform" "$B" "$(head_of "$R")"
 touch_file "$R" "${GATE_CLASS_FILE}" "правка гейта после одобрения"
 run_barrier "$R" "$B" && fail "GM-10 гейт правился ПОСЛЕ APPROVE — вердикт прикрыл другой предмет" \
                       || pass "GM-10 subject-lock: правка гейта после APPROVE заблокирована"
 
 # GM-11 — REJECT, та же правка ⇒ ПРОХОД (после REJECT правки штатны)
-R="$(mk_repo)"; B="$(head_of "$R")"
+mk_repo R; B="$(head_of "$R")"
 add_verdict "$R" "REJECT" "a3ka/hft-platform" "$B" "$(head_of "$R")"
 touch_file "$R" "${GATE_CLASS_FILE}" "исправление по вердикту"
 run_barrier "$R" "$B" && pass "GM-11 после REJECT правки не блокируются (штатный круг)" \
                       || fail "GM-11 лок красит нормальный круг исправлений — вреднее отсутствия лока"
 
 # GM-12 — APPROVE, тронута зона правил ⇒ блок
-R="$(mk_repo)"; B="$(head_of "$R")"
+mk_repo R; B="$(head_of "$R")"
 add_verdict "$R" "PASS" "a3ka/hft-platform" "$B" "$(head_of "$R")"
 touch_file "$R" ".claude/rules/gates.md" "правка правил после одобрения"
 run_barrier "$R" "$B" && fail "GM-12 правила менялись после PASS — скоуп подменён" \
                       || pass "GM-12 subject-lock накрывает .claude/rules"
 
 # GM-13 — APPROVE + явный ALLOW-SUBJECT-CHANGE ⇒ проход со следом
-R="$(mk_repo)"; B="$(head_of "$R")"
+mk_repo R; B="$(head_of "$R")"
 add_verdict "$R" "APPROVE" "a3ka/hft-platform" "$B" "$(head_of "$R")"
 touch_file "$R" "${GATE_CLASS_FILE}" "ALLOW-SUBJECT-CHANGE: правка гейта согласована с founder'ом"
 run_barrier "$R" "$B" && pass "GM-13 явный ALLOW-SUBJECT-CHANGE открывает лок (след в истории)" \
                       || fail "GM-13 легального выхода из лока нет — гейт станет обходиться силой"
 
 # GM-14 — APPROVE, тронут файл ВНЕ класса «гейт» ⇒ проход (анти-ложноположительный)
-R="$(mk_repo)"; B="$(head_of "$R")"
+mk_repo R; B="$(head_of "$R")"
 add_verdict "$R" "APPROVE" "a3ka/hft-platform" "$B" "$(head_of "$R")"
 touch_file "$R" "docs/DESIGN.md" "обычная правка документа"
 run_barrier "$R" "$B" && pass "GM-14 правка вне класса «гейт» не блокируется" \
                       || fail "GM-14 лок вышел за свой класс — красит обычные правки"
 
 # GM-15 — NOTE, тронута проводка CI ⇒ блок
-R="$(mk_repo)"; B="$(head_of "$R")"
+mk_repo R; B="$(head_of "$R")"
 add_verdict "$R" "NOTE" "a3ka/hft-platform" "$B" "$(head_of "$R")"
 touch_file "$R" ".github/workflows/ci.yml" "правка проводки после NOTE"
 run_barrier "$R" "$B" && fail "GM-15 проводка CI менялась после NOTE — аудировался другой пайплайн" \
@@ -228,7 +291,7 @@ run_barrier "$R" "$B" && fail "GM-15 проводка CI менялась пос
 # ── Блок 3: ОТСУТСТВИЕ вердикта (К-4; testing.md свойство 4 — «наблюдать отсутствие») ──
 
 # GM-17 — merge, называющий M-NN, БЕЗ research/reviews/R-* в дереве слияния ⇒ блок
-R="$(mk_repo)"; B="$(head_of "$R")"
+mk_repo R; B="$(head_of "$R")"
 ( cd "$R" && git checkout -q -b feat-m42 && echo work >> docs/DESIGN.md \
   && git add -A && git commit -q -m "feat(M-42): task #1 — работа" \
   && git checkout -q - \
@@ -242,7 +305,7 @@ run_barrier "$R" "$B" && fail "GM-17 merge M-42 БЕЗ R-* прошёл — мо
 # GM-18 — тот же merge, R-файл с литералом M-42 в дереве слияния ЕСТЬ ⇒ проход
 # (анти-ложноположительный). R-файл добавлен В ДИАПАЗОНЕ ⇒ сам несёт валидную GATE-META —
 # иначе сценарий краснел бы по чужой причине (форма шапки, а не отсутствие).
-R="$(mk_repo)"; B="$(head_of "$R")"
+mk_repo R; B="$(head_of "$R")"
 add_verdict "$R" "APPROVE" "a3ka/hft-platform" "$B" "$B" "R-100-M-42.md" "research/reviews"
 ( cd "$R" && git show HEAD:research/reviews/R-100-M-42.md | grep -q "M-99" ) \
   || die "GM-18: R-файл не читается из дерева"
@@ -260,12 +323,76 @@ run_barrier "$R" "$B" && pass "GM-18 merge с R-файлом, называющи
 
 # GM-19 — НЕ-merge коммит, называющий M-NN, без R-* ⇒ проход (судятся только merge:
 # иначе каждый рабочий коммит потребует вердикта — лок вреднее отсутствующего)
-R="$(mk_repo)"; B="$(head_of "$R")"
+mk_repo R; B="$(head_of "$R")"
 ( cd "$R" && echo work >> docs/DESIGN.md && git add -A \
   && git commit -q -m "feat(M-43): task #1 — обычная работа" ) || die "GM-19"
 ( cd "$R" && ! git rev-parse -q --verify HEAD^2 >/dev/null ) || die "GM-19: HEAD внезапно merge"
 run_barrier "$R" "$B" && pass "GM-19 рабочий не-merge коммит с M-NN не требует вердикта" \
                       || fail "GM-19 проверка отсутствия вышла за merge-класс — красит каждый коммит"
+
+# ── Блок 4: множественность и полный subject-lock класса «гейт» ───────────────────────
+
+# GM-20 — два изменённых verdict-артефакта: первый валиден, второй нет ⇒ блок.
+# Реализация, проверяющая только первый путь/первый коммит диапазона, обязана покраснеть.
+mk_repo R; B="$(head_of "$R")"
+add_verdict "$R" "APPROVE" "a3ka/hft-platform" "$B" "$B" "C-100-valid.md"
+{ echo "<!-- GATE-META"
+  echo "milestone: M-99"
+  echo "audited_repo: a3ka/hft-platform"
+  echo "audited_base: $B"
+  echo "audited_head: "
+  echo "verdict: APPROVE"
+  echo "-->"
+  echo
+  echo "второй вердикт невалиден"
+} > "$R/research/critiques/C-101-invalid.md" || die "GM-20 invalid verdict"
+( cd "$R" && git add -A && git commit -q -m "docs(critic): второй вердикт без audited_head" ) \
+  || die "GM-20 commit"
+run_barrier "$R" "$B" && fail "GM-20 два verdict-артефакта, второй невалиден, ПРОШЛИ — проверен только первый" \
+                      || pass "GM-20 множественность verdict-артефактов: второй невалидный пойман"
+
+# GM-21 — два merge-коммита: у первого R-файл есть, у второго нет ⇒ блок.
+# Реализация, проверяющая только первый merge диапазона, обязана покраснеть.
+mk_repo R; B="$(head_of "$R")"
+add_verdict "$R" "APPROVE" "a3ka/hft-platform" "$B" "$B" "R-144-M-44.md" "research/reviews"
+( cd "$R" && echo "reviewer verdict for M-44" >> research/reviews/R-144-M-44.md \
+  && git add -A && git commit -q --amend --no-edit ) || die "GM-21 R-file M-44"
+( cd "$R" && git checkout -q -b feat-m44 && echo work44 >> docs/DESIGN.md \
+  && git add -A && git commit -q -m "feat(M-44): task #1 — работа" \
+  && git checkout -q - \
+  && git merge -q --no-ff -m "merge M-44: milestone в main" feat-m44 ) || die "GM-21 merge M-44"
+( cd "$R" && git checkout -q -b feat-m45 && echo work45 >> docs/DESIGN.md \
+  && git add -A && git commit -q -m "feat(M-45): task #1 — работа" \
+  && git checkout -q - \
+  && git merge -q --no-ff -m "merge M-45: milestone в main" feat-m45 ) || die "GM-21 merge M-45"
+( cd "$R" && git rev-parse -q --verify HEAD^2 >/dev/null ) \
+  || die "GM-21: HEAD не второй merge-коммит — сценарий тестировал бы не то"
+run_barrier "$R" "$B" && fail "GM-21 два merge-коммита, второй без R-* ПРОШЁЛ — проверен только первый merge" \
+                      || pass "GM-21 множественность merge-коммитов: второй без verdict пойман"
+
+# GM-22 — APPROVE, после него тронут scripts/check_*.sh ⇒ блок.
+mk_repo R; B="$(head_of "$R")"
+add_verdict "$R" "APPROVE" "a3ka/hft-platform" "$B" "$(head_of "$R")"
+touch_file "$R" "${CHECK_CLASS_FILE}" "правка check-барьера после одобрения"
+run_barrier "$R" "$B" && fail "GM-22 scripts/check_*.sh правился ПОСЛЕ APPROVE — механизм-гейт выпал из subject-lock" \
+                      || pass "GM-22 subject-lock накрывает scripts/check_*.sh"
+
+# GM-23 — APPROVE, после него тронут scripts/tests/red_*.sh ⇒ блок.
+mk_repo R; B="$(head_of "$R")"
+add_verdict "$R" "APPROVE" "a3ka/hft-platform" "$B" "$(head_of "$R")"
+touch_file "$R" "${RED_CLASS_FILE}" "правка red-пробы после одобрения"
+run_barrier "$R" "$B" && fail "GM-23 scripts/tests/red_*.sh правился ПОСЛЕ APPROVE — RED-оракул выпал из subject-lock" \
+                      || pass "GM-23 subject-lock накрывает scripts/tests/red_*.sh"
+
+# GM-24 — предмет живёт в ДРУГОМ репозитории, и вердикт называет ИМЕННО его ⇒ ПРОХОД.
+# Контракт (шапка): `audited_repo == origin ЭТОГО репо`, а не равенство литералу
+# `a3ka/hft-platform`. Барьер с зашитым слагом проходит все остальные сценарии и при этом
+# НЕ СПРАШИВАЕТ origin — то есть воспроизводит ровно C-062 («критик аудировал чужой
+# репозиторий»), ради которого проверка и заводилась. Этот сценарий его убивает.
+R=""; mk_repo R "https://github.com/other-org/other-repo.git"; B="$(head_of "$R")"
+add_verdict "$R" "APPROVE" "other-org/other-repo" "$B" "$B"
+run_barrier "$R" "$B" && pass "GM-24 audited_repo сверяется с ORIGIN репозитория, а не с зашитым слагом" \
+                     || fail "GM-24 вердикт, называющий origin СВОЕГО репозитория, отвергнут — сверка идёт с литералом (класс C-062)"
 
 echo
 if [ "${FAILED}" -gt 0 ]; then
