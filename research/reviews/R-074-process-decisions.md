@@ -332,3 +332,44 @@ next_artifact_id.sh TD → TD-150   → зелено, опубликовано
 Это иллюстрация предела, честно названного в `gates.md` §11: контур предупреждающий, merge он
 не блокирует. Механическое усиление (завязать push на код возврата в обёртке, а не в
 дисциплине) — кандидат в ту же очередь, что и Р-1/Р-4.
+
+---
+
+## §8. Close-out — пруф деплой-гейта (`gates.md` §8 п.1-3)
+
+```text
+$ gh run list --branch main   (терминальные статусы после моих пушей)
+2026-08-14T15:22:09Z CI push completed success 62252f0   ← финальная вершина, 9/9 джобов
+2026-08-14T13:49:47Z CI push completed success cbe98a6
+2026-08-14T13:46:35Z CI push completed success 785d0de
+джобы 62252f0: Contracts gate · Docs-freeze · Protected artifacts · Artifact IDs ·
+               Delivery gate · cargo audit · fmt+clippy+test · Design claims — все success
+
+$ gh run list --workflow=deploy.yml --limit 2
+2026-08-14T12:13:25Z workflow_dispatch success c6c62b8   ← последний деплой, ДО этого merge'а
+2026-08-13T23:19:59Z push              failure d564617
+```
+
+**Новых Deploy-ранов нет, и это ОЖИДАЕМОЕ состояние, а не пропуск:** ни один путь дифа
+(`docs/plans/**`, `research/{critiques,reviews}/**`, `PROJECT-STATE.md`, `TECH-DEBT.md`) не
+входит в `paths` `deploy.yml`, поэтому merge прод не пересобирает и гэпа записи не вносит.
+Ровно этот механизм Р-4 и обсуждает: здесь его поведение ЖЕЛАЕМОЕ (документы не деплоятся),
+а дырой он становится, когда вне кодовых путей лежит фикс, зеленящий CI.
+
+**Eyes-on прода (§8 п.2), выполнен несмотря на отсутствие деплоя — состояние подтверждается,
+а не предполагается:**
+
+```text
+$ ssh … 'docker ps --format "{{.Names}} {{.Status}}"; cat …/recorder.heartbeat'
+hft-gateway-serve Up 3 hours (healthy)
+hft-recorder      Up 3 hours (healthy)
+{"events":1327870,"free_bytes":57152106496,"min_free_bytes":10737418240,
+ "next_seq":234977211,"segment_index":282,"ts_wall_ms":1786720788414,"writable":true}
+время замера 2026-08-14T15:19:54Z ⇒ свежесть heartbeat ≈ 6 с; writable=true; free 57.2 GB
+```
+
+**Worktree-GC (§8 п.4):** `bash scripts/gc_worktrees.sh` → `VERDICT: GC DONE`, убраны
+`hft-rev-procdec-1` (мой) и `hft-tester-1786714576`; осталось 32, диск 75 %.
+
+**Ветка предмета удалена** после входа в `main` (`gates.md` §9: ветка — носитель предмета на
+время гейта, не архив): `git push origin --delete docs/process-decisions-2026-08-14` → deleted.
