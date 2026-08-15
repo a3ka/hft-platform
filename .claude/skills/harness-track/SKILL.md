@@ -73,14 +73,28 @@ Architect НЕ запускает codex сам — он отдаёт founder'у 
 `.claude/wrappers/codex-critic.sh`.
 
 ```
-HFT_BRANCH=<ветка предмета> \
-HFT_CODEX_MODEL=<модель Terra> \
-bash /home/nous/hft-platform/.claude/wrappers/codex-critic.sh
+HFT_BRANCH=<ветка предмета> bash /home/nous/hft-platform/.claude/wrappers/codex-critic.sh
 ```
 
+Модель по умолчанию — **`gpt-5.6-terra`**: критик и есть та роль, ради которой не экономят
+(асимметричная цена ошибки). Переопределяется `HFT_CODEX_MODEL=<имя>`.
+
 Обёртка сама делает `fetch`, разворачивает worktree от `origin/$HFT_BRANCH`, поднимает codex
-с bootstrap'ом роли критика и убирает дерево, если оно чистое. Модель передаётся `-m`; без
-`HFT_CODEX_MODEL` берётся дефолт из `~/.codex/config.toml`.
+с bootstrap'ом роли критика и убирает дерево, если оно чистое и всё запушено.
+
+**Требование к CLI:** Terra доступна с `codex-cli >= 0.147.0`. Системный `/usr/bin/codex`
+на этой машине — `0.142.5` и отвечает отказом `400 invalid_request_error: requires a newer
+version of Codex`; обновить его нельзя без root. Свежий CLI ставится в пользовательский
+префикс и обёртка предпочитает именно его:
+
+```
+npm install -g --prefix "$HOME/.local" @openai/codex@latest
+```
+
+Обёртка проверяет версию ДО запуска и отказывается fail-closed с инструкцией, если бинарь
+старый (иначе критик молча уехал бы на слабой модели). Осторожно при диагностике: рядом с
+отказом codex печатает warning «Model metadata … not found» — по нему легко заключить, что
+модели не существует. Это неверно: решение принимается по телу ошибки, а не по warning'у.
 
 Handoff-блок (`.claude/rules/handoff-block.md`) обязан нести в §D:
 
