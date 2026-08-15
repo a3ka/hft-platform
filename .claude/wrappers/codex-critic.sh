@@ -84,7 +84,8 @@ Adopt the hft-platform critic persona by reading these files in order:
 After completing the reads above, reply with EXACTLY:
 
   Bootstrap complete. Acting as hft critic.
-  Model: <model actually in use>
+  Model: ${CODEX_MODEL} (передана обёрткой через -m; собственную догадку НЕ подставляй —
+         модель не обязана знать свой идентификатор, и её ответ фактом не является)
   Scope: plan-time gate AFTER architect commits artifacts
   Output: research/critiques/C-NNN-<topic>.md  (committed and pushed to the subject branch)
   Verdict tiers: REJECT / NOTE / ESCALATE
