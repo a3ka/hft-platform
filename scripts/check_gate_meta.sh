@@ -12,6 +12,31 @@
 #      НЕНАБЛЮДАЕМО. Проверка того, что ПОПАЛО в диапазон, слепа к ОТСУТСТВИЮ (`testing.md`,
 #      целостность гейта, свойство 4).
 #
+# ── ДО-НОРМАТИВНЫЙ АРТЕФАКТ: `ARCHIVED-VERDICT` (F-089-1) ─────────────────────────────
+# Предмет барьера — вердикты, ДОБАВЛЕННЫЕ ИЛИ ИЗМЕНЁННЫЕ диапазоном события (GM-8: лежащие
+# в дереве, но не тронутые, не судятся; мутация «судить весь `git ls-files`» роняет GM-8).
+# Ретроактивным барьер не является — но у него не было пути ПРИЗЕМЛИТЬ артефакт, НАПИСАННЫЙ
+# до введения нормы. Класс реален и повторится: `C-062` и `C-083` спасены с брошенной ветки
+# коммитами `fda1a68`/`f87afdb` — в диапазоне они ДОБАВЛЕНЫ, шапки у них нет и быть не может.
+# Для `C-062` она невозможна ПО СУЩЕСТВУ: его база `9a0e48f0` в нашей истории отсутствует
+# (в том и был инцидент — критик работал в ЧУЖОМ репозитории), барьер такую шапку отвергнет
+# сам, а выдуманная превратила бы аудит-трейл инцидента в ложную запись. Спека M-60b §8
+# запрещает требовать GATE-META от до-нормативных вердиктов, §2 держит существующие вердикты
+# в Forbidden.
+# Путь: строка `ARCHIVED-VERDICT: <путь> — <причина>` в теле ЛЮБОГО коммита диапазона.
+#   • ПОФАЙЛОВО: токен обязан НАЗЫВАТЬ путь. Бланкетного «всё в этом диапазоне» нет — иначе
+#     первый артефакт закрывал бы собой остальные (класс GM-20).
+#   • ТОЛЬКО для статуса `A` (приземление). ИЗМЕНЕНИЕ вердикта (`M`) — действие СЕГОДНЯШНЕЕ,
+#     норма применяется полностью; исключения нет (GM-30).
+#   • Причина ≥12 символов помимо пути — тот же порог, что у `FOUNDER-APPROVED`
+#     (`check_docs_freeze.sh`): токен-ритуал не отличим от отсутствия токена (GM-31).
+#   • Срабатывание ГРОМКОЕ: печатается `NOTE` с путём и коммитом-носителем.
+# Предел назван честно: токен ПОДДЕЛЫВАЕМ — это аудит-след, а не доказательство древности
+# артефакта (та же оговорка, что у `ALLOW-SUBJECT-CHANGE` и `FOUNDER-APPROVED`, `gates.md`
+# §11). Альтернатива «grandfathering по дате/коммиту» ХУЖЕ: дата живёт ВНУТРИ файла, то есть
+# такая же декларация, но невидимая в `git log` и растущая молча со временем; токен виден
+# `git log --grep`, привязан к пушу и печатается барьером на каждом прогоне.
+#
 # ── ЧЕГО БАРЬЕР НЕ ДЕЛАЕТ (граница, спека §4) ─────────────────────────────────────────
 # Он читает ДЕКЛАРАЦИИ автора (шапку GATE-META, литерал `M-NN` в subject'е merge) и сверяет
 # их с ФАКТАМИ git: существует ли ревизия, предок ли она HEAD, какие пути тронуты, есть ли
@@ -124,20 +149,51 @@ is_gate_class() {
   esac
 }
 
-verdict_files="$(git diff --name-only --diff-filter=AM "${BASE}" HEAD -- \
+# Токен до-нормативного приземления: ищем в телах коммитов диапазона строку, НАЗЫВАЮЩУЮ этот
+# путь. Тело читается `git log -1 --format='%B'`, а не `git show`: последний отдал бы и текст
+# ДИФФА, и файл, ЦИТИРУЮЩИЙ токен, открывал бы лок сам себе (класс, названный в
+# `check_docs_freeze.sh`).
+archived_token_for() { # $1=путь → SHA коммита-носителя; 1, если токена нет
+  local c line rest reason
+  while IFS= read -r c; do
+    [ -n "${c}" ] || continue
+    while IFS= read -r line; do
+      case "${line}" in "ARCHIVED-VERDICT: "*) : ;; *) continue ;; esac
+      rest="${line#ARCHIVED-VERDICT: }"
+      case "${rest}" in *"$1"*) : ;; *) continue ;; esac
+      reason="${rest//"$1"/}"
+      # причина — то, что осталось помимо пути; пробелы не считаются (порог 12 — как у
+      # FOUNDER-APPROVED в check_docs_freeze.sh)
+      printf '%s' "${reason}" | sed 's/[[:space:]]//g' | grep -qE '.{12,}' || continue
+      printf '%s' "${c}"
+      return 0
+    done < <(git log -1 --format='%B' "${c}" 2>/dev/null || true)
+  done < <(git rev-list "${BASE}..HEAD" 2>/dev/null || true)
+  return 1
+}
+
+verdict_changes="$(git diff --name-status --diff-filter=AM "${BASE}" HEAD -- \
   research/critiques research/reviews research/arbitration 2>/dev/null || true)"
 
 checked=0
-while IFS= read -r f; do
+exempt=0
+while IFS="$(printf '\t')" read -r st f; do
   [ -n "${f}" ] || continue
   case "${f}" in *.md) ;; *) continue ;; esac
-  checked=$((checked + 1))
 
   body="$(git show "HEAD:${f}" 2>/dev/null || true)"
   if ! printf '%s\n' "${body}" | grep -q '<!-- GATE-META'; then
+    if [ "${st}" = "A" ] && tok="$(archived_token_for "${f}")"; then
+      echo "NOTE  ${f}: до-нормативный артефакт приземлён явным ARCHIVED-VERDICT в ${tok:0:8} (аудит-след, НЕ доказательство — F-089-1)"
+      exempt=$((exempt + 1))
+      continue
+    fi
+    checked=$((checked + 1))
     bad "${f}: нет шапки GATE-META — вердикт ничем не привязан к предмету"
+    [ "${st}" = "A" ] || echo "      статус ${st}: вердикт ИЗМЕНЁН этим диапазоном — приземление до-нормативного артефакта (ARCHIVED-VERDICT) сюда не относится"
     continue
   fi
+  checked=$((checked + 1))
   meta="$(meta_of "${body}")"
   ms="$(field_of milestone "${meta}")"
   ar="$(field_of audited_repo "${meta}")"
@@ -202,7 +258,7 @@ while IFS= read -r f; do
     fi
   fi
 done <<EOF
-${verdict_files}
+${verdict_changes}
 EOF
 
 # ── 4. ОТСУТСТВИЕ вердикта (К-4): merge, называющий M-NN, обязан нести R-* в СВОЁМ дереве ─
@@ -240,4 +296,4 @@ if [ "${FAILED}" -gt 0 ]; then
   echo "Шаблон шапки — .claude/rules/gates.md §4; проба контракта — scripts/tests/red_gate_meta.sh."
   exit 1
 fi
-echo "VERDICT: PASS — вердиктов проверено: ${checked}, merge'ей с milestone в subject'е: ${merges}"
+echo "VERDICT: PASS — вердиктов проверено: ${checked}, до-нормативных приземлений: ${exempt}, merge'ей с milestone в subject'е: ${merges}"
