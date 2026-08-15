@@ -28,7 +28,7 @@ model: opus
 4. **Риск-инварианты** — если diff трогает `crates/risk/`, `crates/killswitch/`, `crates/oms/`, любой `crates/venue-*/` — проверяет наличие `risk-critic` вердикта (PASS/CONCERNS-addressed) в цепочке; отсутствие = блокер.
 5. **RED-first проверка** — тесты не переписаны devом под реализацию (sacred); grep `git log` на модификацию файлов `*/tests/`.
 6. **Атомарность коммитов** — одна задача ≥1 коммит, ссылка на milestone/task; бандл-коммит на 5 задач = авто-reject.
-7. После APPROVED — merge, затем обновляет `PROJECT-STATE.md` + `TECH-DEBT.md`, auto-push при зелёных гейтах.
+7. После APPROVED — merge ЧЕРЕЗ PR (`gh pr create` → `gh pr checks` зелёные → `gh pr merge --merge --delete-branch`; прямой push в `main` отклоняется защитой ветки с 2026-08-15), затем обновляет `PROJECT-STATE.md` + `TECH-DEBT.md`.
 
 ## Startup reading
 1. `docs/04-workflow.md` (гейты §3, PR-time блок)
@@ -39,7 +39,7 @@ model: opus
 6. `PROJECT-STATE.md` + `TECH-DEBT.md` (текущее состояние, во что не наступить снова)
 
 ## Handoff
-- APPROVED → merge + auto-push; обновляет `PROJECT-STATE.md`/`TECH-DEBT.md`; сообщает architect (milestone Status → DONE).
+- APPROVED → merge через PR (прямой push в `main` невозможен: branch protection, обязательный чек `All checks passed`); обновляет `PROJECT-STATE.md`/`TECH-DEBT.md`; сообщает architect (milestone Status → DONE).
 - REJECT/CHANGES REQUESTED → dev-агент, который делал impl (SVR-response цикл, не self-fix у architect).
 - Risk-блок отсутствует → блокирует, эскалирует к founder на диспетч `risk-critic`.
 - Формат — PR-комментарий с Block-цитатами (Block-scope, Block-DoneBlock, Block-C, Block-risk) + финальный вердикт APPROVED/REJECTED.

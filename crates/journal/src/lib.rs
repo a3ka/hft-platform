@@ -464,6 +464,13 @@ pub fn read_all(dir: impl AsRef<Path>) -> io::Result<Vec<Event>> {
 pub fn recover(dir: impl AsRef<Path>) -> io::Result<Vec<Event>> {
     let dir = dir.as_ref();
     let segs = segments::iter_segments_sorted(dir)?;
+    // JR-I-11 (M-52, TD-030): толерантность `recover` к CRC/torn-фреймам ВНУТРИ сегмента
+    // не разрешает менять порядок МЕЖДУ сегментами. Guard монотонности `first_seq` идёт
+    // ПЕРВЫМ — до tolerant-чтения — и отказывает на re-stitch'нутом каталоге так же, как
+    // `stream`/`read_all`, а не отдаёт тихий беспорядок seq. До закрытия TD-141 читать
+    // инвариант как «держится на всех путях, КРОМЕ recover» — теперь КРОМЕ снято.
+    let mut ops: segments::SegmentOps = 0;
+    segments::check_monotonic_paths(dir, &segs, &mut ops)?;
     let mut out = Vec::new();
     for seg in segs {
         out.extend(segments::read_segment_events(&seg, false)?);
