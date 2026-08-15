@@ -119,6 +119,32 @@ else
   fail "Pre ${DB_BARRIER} не существует (RED-стадия: задача 9 не сделана)"
 fi
 
+echo "--- R: ПРОД-ФОРМА check_gate_meta.sh на СОБСТВЕННОМ диапазоне ветки (C-089 F-089-1) ---"
+# Гейт, проверенный не тем вызовом, каким его зовёт прод, НЕ ПРОВЕРЕН. Шаг G гоняет только
+# синтетическую пробу на фикстурах — и она была зелёной, когда РЕАЛЬНЫЙ джоб `gate-meta`
+# на этом же диапазоне возвращал exit=1 (C-089: два вердикта без шапки). Расхождение
+# «проба зелёная / CI красный» — ровно то, ради чего заведён паритет с CI (`gates.md` §3).
+# Обе прод-формы: push (база из `github.event.before`) и pull_request (база из
+# `event.pull_request.base.sha`) — CI триггерится обеими, и джоб подаёт обе переменные.
+if [ -n "${MB}" ]; then
+  GM_LOG="$(mktemp /tmp/verify-m60b-gatemeta-XXXXXX.log)"
+  if ( EVENT_NAME=push PUSH_BEFORE="${MB}" PR_BASE_SHA='' bash "${GM_BARRIER}" >"${GM_LOG}" 2>&1 ); then
+    pass "R прод-форма push: ${GM_BARRIER} зелён на ${MB:0:7}..HEAD (то же, что джоб gate-meta)"
+  else
+    fail "R прод-форма push: ${GM_BARRIER} КРАСЕН на ${MB:0:7}..HEAD — джоб gate-meta провалится на этом же push'е"
+    grep -E '^(FAIL|VERDICT)' "${GM_LOG}" | head -6 | sed 's/^/      ↳ /'
+  fi
+  if ( EVENT_NAME=pull_request PUSH_BEFORE='' PR_BASE_SHA="${MB}" bash "${GM_BARRIER}" >"${GM_LOG}" 2>&1 ); then
+    pass "R прод-форма pull_request: ${GM_BARRIER} зелён на ${MB:0:7}..HEAD"
+  else
+    fail "R прод-форма pull_request: ${GM_BARRIER} КРАСЕН на ${MB:0:7}..HEAD"
+    grep -E '^(FAIL|VERDICT)' "${GM_LOG}" | head -6 | sed 's/^/      ↳ /'
+  fi
+  rm -f "${GM_LOG}"
+else
+  fail "R merge-base с origin/main не вычислился — прод-форма gate-meta не запущена"
+fi
+
 echo "--- A: барьеры существуют и парсятся (задачи 2, 4-6, 9) ---"
 for b in "${CB_BARRIER}" "${GM_BARRIER}" "${DB_BARRIER}"; do
   if [ -f "${b}" ] && bash -n "${b}" 2>/dev/null; then
@@ -140,7 +166,8 @@ if grep -qE '(pass|fail) +"GM-16' "${GM_PROBE}"; then
 else
   pass "G GM-16 сожжён: сценария нет (упоминание только в шапке-обосновании)"
 fi
-for gm in GM-17 GM-18 GM-19 GM-20 GM-21 GM-22 GM-23 GM-24 GM-25 GM-26 GM-27; do
+for gm in GM-17 GM-18 GM-19 GM-20 GM-21 GM-22 GM-23 GM-24 GM-25 GM-26 GM-27 \
+          GM-28 GM-29 GM-30 GM-31; do
   if grep -qE "(pass|fail) +\"${gm}" "${GM_PROBE}"; then
     pass "G сценарий ${gm} присутствует"
   else
@@ -148,8 +175,58 @@ for gm in GM-17 GM-18 GM-19 GM-20 GM-21 GM-22 GM-23 GM-24 GM-25 GM-26 GM-27; do
   fi
 done
 
-echo "--- B: проба диск-преамбулы DB-1..DB-8 (задачи 8-9) ---"
+echo "--- B: проба диск-преамбулы DB-1..DB-12 (задачи 8-9) ---"
 run_probe "B" "${DB_PROBE}" "red_disk_budget"
+
+echo "--- N: диск-барьер — адверсарий DEFAULT-режима и symlink-побега (C-089 F-089-2/F-089-3) ---"
+# Зеркало шага D, но для диска: проба ходила ТОЛЬКО с заданным MIN_FREE_KB, поэтому
+# «проб-образный» барьер (работает лишь когда переменная задана) брал 13/13, а в проде не
+# мерил НИЧЕГО. Здесь — вызовы, независимые от файла пробы: если пробу ослабят, эти три
+# останутся. Конфаундер (реальное свободное место хоста) исключён df-shim'ом.
+if [ -f "${DB_BARRIER}" ]; then
+  N_TREE="$(mktemp -d /tmp/verify-m60b-disk-tree-XXXXXX)"
+  N_OUT="$(mktemp -d /tmp/verify-m60b-disk-out-XXXXXX)"
+  N_SHIM_LOW="${N_TREE}/.shim-low"; N_SHIM_HIGH="${N_TREE}/.shim-high"
+  mkdir -p "${N_SHIM_LOW}" "${N_SHIM_HIGH}"
+  printf '#!/usr/bin/env bash\necho "Filesystem 1024-blocks Used Available Capacity Mounted on"\necho "fixture 100000 95758 4242 96%%%% ."\n' > "${N_SHIM_LOW}/df"
+  printf '#!/usr/bin/env bash\necho "Filesystem 1024-blocks Used Available Capacity Mounted on"\necho "fixture 2000000000 1000000000 999999999 50%%%% ."\n' > "${N_SHIM_HIGH}/df"
+  chmod +x "${N_SHIM_LOW}/df" "${N_SHIM_HIGH}/df"
+  N_LOG="$(mktemp /tmp/verify-m60b-disk-XXXXXX.log)"
+  # N1 — DEFAULT-вызов (MIN_FREE_KB не задан вовсе) обязан РЕАЛЬНО померить диск
+  if ( cd "${N_TREE}" && env -u MIN_FREE_KB -u CARGO_TARGET_DIR PATH="${N_SHIM_LOW}:${PATH}" \
+         bash "${ROOT}/${DB_BARRIER}" >"${N_LOG}" 2>&1 ); then
+    fail "N1 DEFAULT-режим при подставных 4242 KB ПРОШЁЛ — в проде барьер не мерит диск (F-089-3)"
+  elif head -1 "${N_LOG}" | grep -q "диск:"; then
+    pass "N1 DEFAULT-режим реально мерит диск (4242 KB против дефолтного порога названы диском)"
+  else
+    fail "N1 отказ есть, но первая строка не называет диск: «$(head -1 "${N_LOG}")»"
+  fi
+  # N2 — DEFAULT-вызов при заведомо достаточном месте обязан проверить CARGO_TARGET_DIR
+  if ( cd "${N_TREE}" && env -u MIN_FREE_KB CARGO_TARGET_DIR="${N_OUT}" PATH="${N_SHIM_HIGH}:${PATH}" \
+         bash "${ROOT}/${DB_BARRIER}" >"${N_LOG}" 2>&1 ); then
+    fail "N2 DEFAULT-режим с target ВНЕ дерева ПРОШЁЛ — в проде CARGO_TARGET_DIR не проверяется (F-089-3)"
+  elif head -1 "${N_LOG}" | grep -q "CARGO_TARGET_DIR"; then
+    pass "N2 DEFAULT-режим реально проверяет target (место есть, target вне дерева назван)"
+  else
+    fail "N2 отказ есть, но первая строка не называет CARGO_TARGET_DIR: «$(head -1 "${N_LOG}")»"
+  fi
+  # N3 — symlink-побег: путь текстуально внутри дерева, физически снаружи
+  ln -s "${N_OUT}" "${N_TREE}/target-escape"
+  if [ ! -L "${N_TREE}/target-escape" ]; then
+    fail "N3 setup не состоялся: симлинк не создан — сценарий судил бы обычный каталог"
+  elif ( cd "${N_TREE}" && env -u MIN_FREE_KB CARGO_TARGET_DIR="${N_TREE}/target-escape" \
+           PATH="${N_SHIM_HIGH}:${PATH}" bash "${ROOT}/${DB_BARRIER}" >"${N_LOG}" 2>&1 ); then
+    fail "N3 симлинк внутри дерева, ведущий НАРУЖУ, ПРОШЁЛ — инвариант обходится физически (F-089-2)"
+  elif head -1 "${N_LOG}" | grep -q "CARGO_TARGET_DIR"; then
+    pass "N3 symlink-побег пойман по физическому пути, первая строка называет CARGO_TARGET_DIR"
+  else
+    fail "N3 отказ есть, но первая строка не называет CARGO_TARGET_DIR: «$(head -1 "${N_LOG}")»"
+  fi
+  rm -f "${N_LOG}"
+  rm -rf "${N_TREE}" "${N_OUT}"
+else
+  fail "N ${DB_BARRIER} не существует — адверсарий default-режима запускать не на чем (RED-стадия)"
+fi
 
 echo "--- D: default-режим бюджета на КОРНЕ репо (F-064-4; задача 2) ---"
 # Проба ходит только через BUDGET_TABLE — пустая ВСТРОЕННАЯ таблица прошла бы все сценарии.
