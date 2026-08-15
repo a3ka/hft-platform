@@ -228,14 +228,65 @@ jobs:
       - name: Проба гейта (41 проверка, анти-плацебо)
         run: bash scripts/tests/red_verify_design_claims.sh
 
+  context-budgets:
+    name: Context budgets (G1 — бюджет обязательного чтения)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Барьер в ПРОД-ФОРМЕ: default-режим, без переменных проб. Именно этим вызовом он
+      # судит корпус, и именно он должен краснеть, когда впрыскиваемое ядро выходит за
+      # бюджет A-003 или когда файл ядра исчезает (исчезновение даёт нулевой размер, то
+      # есть бесконечный запас — гейт, зеленеющий от пропажи предмета, не гейт).
+      - name: Бюджет обязательного чтения (прод-форма)
+        run: bash scripts/check_context_budgets.sh
+
+      # Проба ТОЙ ЖЕ проводкой (testing.md «целостность гейта»): 13 сценариев — превышение,
+      # ровно граница, +1 байт, отсутствие файла, пустая/отсутствующая таблица, нечитаемые
+      # файл и таблица, конфликтующие дубли строк с обеих сторон, лимит ИЗ ТАБЛИЦЫ.
+      - name: Проба барьера (13 сценариев)
+        run: bash scripts/tests/red_context_budgets.sh
+
+  gate-meta:
+    name: GATE-META (G3 — вердикт привязан к предмету)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # fetch-depth: 0 обязателен — барьер резолвит audited_base/audited_head в ЭТОЙ истории
+      # и проверяет, что head предок HEAD; при depth=1 каждый настоящий SHA стал бы ложным
+      # FAIL. База приходит ИЗ СОБЫТИЯ той же проводкой, что у protected-artifacts.
+      - name: Вердикт гейта привязан к предмету
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: bash scripts/check_gate_meta.sh
+
+      # Сценарии GM-*: форма и принадлежность предмету (реплей C-062 — чужой repo и
+      # несуществующая ревизия), subject-lock, проверка ОТСУТСТВИЯ вердикта при merge,
+      # множественность (все артефакты и все merge, не первый), сверка с ORIGIN вместо
+      # литерала, непустота полей, перечень verdict, прод-форма pull_request, приземление
+      # до-нормативного артефакта (ARCHIVED-VERDICT, C-089 F-089-1).
+      # ЧИСЛО сценариев здесь НЕ пишется: литерал, живущий отдельно от предмета, врёт —
+      # он уже соврал («27» против фактических 31). Счёт печатает сама проба, и его
+      # сверяет verify (declared по файлу против исполненного).
+      - name: Проба барьера (счёт печатает сама проба)
+        run: bash scripts/tests/red_gate_meta.sh
+
+      # Диск-преамбула (G6.2) живёт здесь же: отдельный джоб ради секунд не заводим.
+      # Сценарии DB-*, включая symlink-побег и адверсарий DEFAULT-режима (C-089 F-089-2/3).
+      - name: Проба диск-преамбулы (счёт печатает сама проба)
+        run: bash scripts/tests/red_disk_budget.sh
+
   status-check:
     name: All checks passed
     runs-on: ubuntu-latest
-    needs: [build-test, security, delivery, protected-artifacts, contracts, docs-freeze, artifact-ids, design-claims]
+    needs: [build-test, security, delivery, protected-artifacts, contracts, docs-freeze, artifact-ids, design-claims, context-budgets, gate-meta]
     if: always()
     steps:
       - run: |
-          if [[ "${{ needs.build-test.result }}" != "success" || "${{ needs.security.result }}" != "success" || "${{ needs.delivery.result }}" != "success" || "${{ needs.protected-artifacts.result }}" != "success" || "${{ needs.contracts.result }}" != "success" || "${{ needs.docs-freeze.result }}" != "success" || "${{ needs.artifact-ids.result }}" != "success" || "${{ needs.design-claims.result }}" != "success" ]]; then
+          if [[ "${{ needs.build-test.result }}" != "success" || "${{ needs.security.result }}" != "success" || "${{ needs.delivery.result }}" != "success" || "${{ needs.protected-artifacts.result }}" != "success" || "${{ needs.contracts.result }}" != "success" || "${{ needs.docs-freeze.result }}" != "success" || "${{ needs.artifact-ids.result }}" != "success" || "${{ needs.design-claims.result }}" != "success" || "${{ needs.context-budgets.result }}" != "success" || "${{ needs.gate-meta.result }}" != "success" ]]; then
             echo "One or more checks failed"; exit 1
           fi
           echo "All checks passed"
