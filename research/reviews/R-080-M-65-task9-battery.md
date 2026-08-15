@@ -145,7 +145,8 @@ $ git status --porcelain      # после verify_M-65.sh с шагом F2 вн�
 | `capleak` | 8 / место не освобождается | `o10` | `o10` ✅ |
 | `emptyframe` | 9 / кадр синтезирован сервером | `o11` | `o11` ✅ |
 
-Совпадение 13 из 13. Это и есть содержательный результат задачи 9: перечень осей §4.2 не
+Совпадение 13 из 13, и оно устойчиво: два полных независимых прогона батареи дали побитово те
+же множества (§9.6). Это и есть содержательный результат задачи 9: перечень осей §4.2 не
 декларация — за каждым его значением из этой таблицы стоит оракул, чья власть предъявлена
 падением.
 
@@ -438,7 +439,39 @@ A (сломана первая, цела вторая):  replacement count=0 →
 B (цела первая, сломана вторая):  replacement count=0 → apply_mutant rc=7
 ```
 
-### 9.6 Цена прогона (Н-5)
+### 9.6 ВТОРАЯ независимая репродукция батареи — по-мутантный сырой вывод
+
+Гейт таймингозависим (13 мутантов × 12 асинхронных оракулов с drain-окнами), а §E handoff'а
+честно перечислил четыре калибровочных расхождения. Поэтому одного прогона мало: стабильность
+kill-set'ов — отдельное утверждение, и его надо предъявлять повтором, а не рассуждением.
+Второй прогон, отдельным вызовом батареи (не через `verify`), дал ПОБИТОВО ТЕ ЖЕ множества:
+
+```
+$ bash scripts/tests/red_ws_session_battery.sh --battery
+PASS  эталон GREEN: 12/12 оракулов, CARGO_TARGET_DIR=/tmp/m65-ws-battery-Y6Fe4n/target-reference
+PASS  envwins: kill-set совпал: `o1_subscribe_switches_instrument_and_old_frames_stop` · `o8_grace_window_decides_v1_or_legacy` · `o9_connections_are_isolated`
+PASS  stalefeed: kill-set совпал: `o1_subscribe_switches_instrument_and_old_frames_stop`
+PASS  submerge: kill-set совпал: `o10_unsubscribe_stops_sub_and_frees_capacity` · `o2_multiplex_subscriptions_are_independent`
+PASS  capopen: kill-set совпал: `o4_subscription_cap_is_fail_closed`
+PASS  versionmute: kill-set совпал: `o3_unknown_version_and_unknown_op_are_errors`
+PASS  harshdrop: kill-set совпал: `o7_selector_validation_keeps_connection_and_neighbours_alive`
+PASS  lateignore: kill-set совпал: `o8_grace_window_decides_v1_or_legacy`
+PASS  prosaicerr: kill-set совпал: `o4_subscription_cap_is_fail_closed` · `o6_errors_carry_machine_readable_code` · `o7_selector_validation_keeps_connection_and_neighbours_alive`
+PASS  connshare: kill-set совпал: `o1_subscribe_switches_instrument_and_old_frames_stop` · `o9_connections_are_isolated`
+PASS  crosstalk: kill-set совпал: `o9_connections_are_isolated`
+PASS  unsubmute: kill-set совпал: `o10_unsubscribe_stops_sub_and_frees_capacity`
+PASS  capleak: kill-set совпал: `o10_unsubscribe_stops_sub_and_frees_capacity`
+PASS  emptyframe: kill-set совпал: `o11_frames_come_from_journal_not_synthesis`
+BATTERY: PASS (13/13)
+exit=0
+```
+
+Два полных независимых прогона (через `verify_M-65.sh` и напрямую), 26 сверок множеств, ноль
+расхождений. Это не доказывает отсутствие флака в принципе, но снимает подозрение, ради
+которого прогон делался: калибровка, о которой сообщил architect, доведена до устойчивого
+состояния, а не подогнана под один удачный запуск.
+
+### 9.7 Цена прогона (Н-5)
 
 ```
 пик следа батареи: 15 449 547 474 байт ≈ 15.45 ГБ (14 каталогов сборки одновременно)
