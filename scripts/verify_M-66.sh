@@ -94,7 +94,15 @@ path = Path(sys.argv[1])
 if not path.exists():
     print("workflow missing")
     sys.exit(1)
-text = path.read_text(encoding="utf-8")
+# Иглы ищутся ТОЛЬКО по исполняемым строкам: строка-комментарий YAML выбрасывается целиком.
+# `R-081` §5 N-5, мутант D: игла `fetch-depth: 0` живёт и в комментарии джоба `review-fa`,
+# поэтому снятие самих строк `with:`/`fetch-depth: 0` давало exit=0 при джобе, идущем с
+# depth=1. Проверка по ТЕКСТУ блока ловила комментарий — класс `testing.md` §«Механизм
+# несущего пути»: «grep по имени ловит и лог-строки».
+text = "\n".join(
+    line for line in path.read_text(encoding="utf-8").splitlines()
+    if not line.lstrip().startswith("#")
+)
 jobs = {}
 current = None
 buf = []
