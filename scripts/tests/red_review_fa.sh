@@ -68,6 +68,9 @@ B4CROSSCUT|4|только сквозной ID, цитируемый в FA (`DET-
 B4FOREIGN|4|ID чужой FA (`VB-I-*` при дифе только `journal`)|B4FOREIGN|FAIL
 B4DEAD|4|синтаксически валидный, но МЁРТВЫЙ ID (`JR-I-999`)|B4DEAD|FAIL
 B4UNION|4|несколько крейтов, живой ID ОДНОГО из них|B4UNION|PASS (запиннено R-040, §0 стр. 7/9/12)
+B4DEADPFX|4|мёртвый ID, содержащий ЖИВОЙ как префикс (`JR-I-14` при живых `JR-I-1..13`)|B4DEADPFX|FAIL (эхо словоцелое; `grep -F` даёт ложное PASS — R-079 Б-1)
+B4LIVETAIL|4|живой ID-хвост набора (`JR-I-13`), сам содержащий живой `JR-I-1`|B4LIVETAIL|PASS (анти-плацебо к слишком строгой реализации)
+B4EMPTYU|4|FA-файл есть, но НЕ несёт ни одного ID своего префикса (U=∅ при непустом LIVE_CRA)|B4EMPTYU|FAIL (тихий отказ гейта — R-079 Б-2)
 E5EVENT|5 событие/база|`EVENT_NAME` пуст · неизвестен|E5EMPTY · E5ALIEN|FAIL каждый
 E5BASE|5|база пуста · zero-SHA · не в истории · не предок HEAD|E5BASE0 · E5ZERO · E5LOST · E5NONANC|FAIL каждый
 E5OK|5|легитимный push и легитимный PR|E5PUSH · E5PR|PASS (та же фикстура B4LIVE двумя событиями)
@@ -81,10 +84,12 @@ W7MIXW|7|то же + `FA-WAIVER: crates/recorder`|W7MIXW|PASS (эхо B + пре
 W7EMPTY|7|waiver с ПУСТОЙ причиной: `FA-WAIVER: crates/recorder — `|W7EMPTY|**FAIL** (`C-085` B-1: порог был объявлен и не запиннен)
 W7SHORT|7|причина на ОДИН символ короче порога (11)|W7SHORT|**FAIL** (нижняя сторона границы)
 W7EXACT|7|причина РОВНО в порог (12)|W7EXACT|**PASS** (верхняя сторона границы)
+W7PFX|7|waiver называет крейт-суффикс тронутого (`crates/recorder2` при дифе `recorder`)|W7PFX|FAIL (предикат W якорный, а не подстрочный)
 W8NONEEDS|8 проводка CI|джоб `review-fa` отсутствует в `needs` `status-check`|W8NONEEDS|wiring-секция пробы FAIL
 W8NOIF|8|джоб есть в `needs`, но нет в условии `if` шага агрегата|W8NOIF|FAIL (вторая рукописная копия списка — §0 стр. 21)
 W8NOCALL|8|джоб не зовёт барьер или не зовёт пробу|W8NOCALL|FAIL
 W8OK|8|полная проводка (реальный `ci.yml` чекаута)|W8OK|PASS — легитимный, гоняется КАЖДЫМ прогоном пробы в CI
+W8CMTONLY|8|`fetch-depth: 0` остался ТОЛЬКО в комментарии, исполняемая директива снята|W8CMTONLY|FAIL (игла по тексту ловилась на комментарии — R-081 N-5)
 EOF_MANIFEST
 )"
 
@@ -145,7 +150,17 @@ mk_repo() {
     git init -q -b main
     mkdir -p docs/fa research/reviews crates/journal/src crates/gateway/src \
       crates/venue-xyz/src crates/recorder/src docs
-    printf '# journal FA\n\nJR-I-1\nDET-I-1\n' > docs/fa/journal.md
+    # ПРОД-ФОРМА живого множества (`testing.md` §«Форма прода снимается ЗАМЕРОМ»).
+    # Замер: `git show 710b1ad:docs/fa/journal.md | grep -oE 'JR-I-[0-9]+'` → JR-I-1..13
+    # (спека §0 стр. 12). Суффикс-НЕПУСТОЙ набор обязателен: одиночный `JR-I-1` из
+    # первой редакции был суффикс-свободен, и сценарий B4DEAD зеленел СЛУЧАЙНОСТЬЮ
+    # состава — фикс R-079 Б-1 (`\b` вместо `-F`) не пиннился ничем (`R-081` Б-1).
+    # Здесь живой `JR-I-1` — ПРЕФИКС живых `JR-I-10..13` и мёртвого `JR-I-14`.
+    printf '# journal FA\n\n' > docs/fa/journal.md
+    for n in 1 2 3 4 5 6 7 8 9 10 11 12 13; do
+      printf 'JR-I-%s — инвариант журнала\n' "${n}" >> docs/fa/journal.md
+    done
+    printf '\nDET-I-1\n' >> docs/fa/journal.md
     printf '# viz FA\n\nVB-I-1\nGS-I-1\n' > docs/fa/viz-backend.md
     printf '# venues FA\n\nVN-I-1\n' > docs/fa/venues.md
     printf '# reviews holder\n' > research/reviews/.keep
@@ -498,6 +513,43 @@ scenario_B4UNION() {
   expect_allow B4UNION "${r}" "${b}" "union-B: живой ID одного из тронутых крейтов достаточен" push 'JR-I-1'
 }
 
+scenario_B4DEADPFX() {
+  local r b
+  r="$(mk_repo b4deadpfx)"; b="$(base_sha "${r}")"
+  touch_crate "${r}" journal "pub fn b4deadpfx() {}"
+  add_review "${r}" research/reviews/R-120-b4deadpfx.md "JR-I-14"
+  commit_all "${r}" "B4DEADPFX: dead id whose prefix is a live id"
+  # Setup-guard давит на САМ инвариант: JR-I-14 обязан быть мёртвым, а живой JR-I-1
+  # обязан быть его ПОДСТРОКОЙ — иначе сценарий проверяет не тот класс (`testing.md`
+  # §«Целостность гейта» св-во 3: проба, молча тестирующая не тот сценарий, — плацебо).
+  setup_assert B4DEADPFX "${r}" "JR-I-14 мёртв, JR-I-1 жив и является его префиксом" \
+    "! grep -qE '\\bJR-I-14\\b' docs/fa/journal.md && grep -qE '\\bJR-I-1\\b' docs/fa/journal.md && case JR-I-14 in JR-I-1*) true ;; *) false ;; esac"
+  expect_block B4DEADPFX "${r}" "${b}" "мёртвый ID, содержащий живой как префикс"
+}
+
+scenario_B4LIVETAIL() {
+  local r b
+  r="$(mk_repo b4livetail)"; b="$(base_sha "${r}")"
+  touch_crate "${r}" journal "pub fn b4livetail() {}"
+  add_review "${r}" research/reviews/R-121-b4livetail.md "JR-I-13"
+  commit_all "${r}" "B4LIVETAIL: live tail id only"
+  setup_assert B4LIVETAIL "${r}" "JR-I-13 жив, в вердикте НЕТ голого JR-I-1" \
+    "grep -qE '\\bJR-I-13\\b' docs/fa/journal.md && ! grep -qE '\\bJR-I-1\\b' research/reviews/R-121-b4livetail.md"
+  expect_allow B4LIVETAIL "${r}" "${b}" "живой ID-хвост набора" push 'JR-I-13'
+}
+
+scenario_B4EMPTYU() {
+  local r b
+  r="$(mk_repo b4emptyu)"; b="$(base_sha "${r}")"
+  printf '# journal FA\n\nDET-I-1\n' > "${r}/docs/fa/journal.md"
+  touch_crate "${r}" journal "pub fn b4emptyu() {}"
+  add_review "${r}" research/reviews/R-122-b4emptyu.md "JR-I-1"
+  commit_all "${r}" "B4EMPTYU: FA file present but carries no own-prefix id"
+  setup_assert B4EMPTYU "${r}" "docs/fa/journal.md существует и НЕ несёт ни одного JR-I-*" \
+    "test -f docs/fa/journal.md && ! grep -qE '\\bJR-I-[0-9]+\\b' docs/fa/journal.md && git diff --name-only '${b}' HEAD | grep -q '^crates/journal/'"
+  expect_block B4EMPTYU "${r}" "${b}" "U=∅ при непустом LIVE_CRA — тихий отказ гейта"
+}
+
 scenario_E5EVENT() {
   local pair r b ok=1
   mark E5EVENT
@@ -672,6 +724,17 @@ scenario_W7EXACT() {
   expect_allow W7EXACT "${r}" "${b}" "причина ровно в порог" push 'WAIVED'
 }
 
+scenario_W7PFX() {
+  local r b
+  r="$(mk_repo w7pfx)"; b="$(base_sha "${r}")"
+  touch_crate "${r}" recorder "pub fn w7pfx() {}"
+  add_review "${r}" research/reviews/R-123-w7pfx.md "FA-WAIVER: crates/recorder2 — 123456789012"
+  commit_all "${r}" "W7PFX: waiver names a crate whose name extends the touched one"
+  setup_assert W7PFX "${r}" "waiver обязан называть recorder2 и НЕ называть recorder как отдельное слово" \
+    "grep -q 'FA-WAIVER: crates/recorder2 — ' research/reviews/R-123-w7pfx.md && ! grep -qE '^FA-WAIVER: crates/recorder — ' research/reviews/R-123-w7pfx.md"
+  expect_block W7PFX "${r}" "${b}" "waiver называет крейт-суффикс тронутого"
+}
+
 write_workflow() {
   local file="$1" mode="$2"
   mkdir -p "$(dirname "${file}")"
@@ -729,6 +792,23 @@ s = s.replace(' || "${{ needs.review-fa.result }}" != "success"', '')
 p.write_text(s)
 PY
       ;;
+    cmtonly)
+      # Мутант D вердикта `R-081` §5 N-5: исполняемые строки `with:`/`fetch-depth: 0`
+      # СНЯТЫ, а комментарий с тем же текстом оставлен. Джоб реально идёт с depth=1;
+      # оракул, ищущий иглу по всему тексту блока, зеленеет на комментарии.
+      write_workflow "${file}" good
+      python3 - "${file}" <<'PY'
+from pathlib import Path
+p = Path(__import__("sys").argv[1])
+s = p.read_text()
+s = s.replace(
+    "      - uses: actions/checkout@v4\n        with:\n          fetch-depth: 0\n",
+    "      # fetch-depth: 0 ОБЯЗАТЕЛЬНО: барьер строит диапазон $BASE..HEAD\n"
+    "      - uses: actions/checkout@v4\n",
+)
+p.write_text(s)
+PY
+      ;;
     nocall)
       write_workflow "${file}" good
       python3 - "${file}" <<'PY'
@@ -753,7 +833,13 @@ path = Path(sys.argv[1])
 if not path.exists():
     print(f"workflow missing: {path}")
     sys.exit(1)
-text = path.read_text(encoding="utf-8")
+# Иглы ищутся по ИСПОЛНЯЕМЫМ строкам: строка-комментарий YAML выбрасывается целиком.
+# Без этого `fetch-depth: 0` находится в комментарии джоба, и снятие самой директивы
+# даёт ложный зелёный (`R-081` §5 N-5, мутант D).
+text = "\n".join(
+    line for line in path.read_text(encoding="utf-8").splitlines()
+    if not line.lstrip().startswith("#")
+)
 
 def job_block(name: str) -> str:
     m = re.search(rf"(?ms)^  {re.escape(name)}:\n(.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)", text)
@@ -828,6 +914,15 @@ scenario_W8OK() {
   expect_wiring W8OK "${CI}" pass "реальный ci.yml чекаута несёт полную проводку"
 }
 
+scenario_W8CMTONLY() {
+  local d f
+  d="$(mktemp -d /tmp/red-review-fa-w8cmtonly-XXXXXX)" || die W8CMTONLY
+  register_dir "${d}"; f="${d}/ci.yml"; write_workflow "${f}" cmtonly
+  setup_assert W8CMTONLY "${d}" "директива снята, а комментарий с иглой оставлен" \
+    "grep -qE '^ *# .*fetch-depth: 0' ci.yml && ! grep -qE '^ *fetch-depth: 0 *$' ci.yml"
+  expect_wiring W8CMTONLY "${f}" fail "fetch-depth: 0 остался только в комментарии"
+}
+
 emit_ref_barrier() {
   local file="$1"
   cat > "${file}" <<'EOF_REF'
@@ -861,7 +956,8 @@ crates="$(git diff --name-only "${BASE}" HEAD 2>/dev/null | awk -F/ '$1=="crates
 
 tmp="$(mktemp -d /tmp/ref-review-fa-XXXXXX)" || exit 1
 trap 'rm -rf "${tmp}"' EXIT
-ids="${tmp}/ids"; nofa="${tmp}/nofa"; : >"${ids}"; : >"${nofa}"
+ids="${tmp}/ids"; nofa="${tmp}/nofa"; live="${tmp}/live"
+: >"${ids}"; : >"${nofa}"; : >"${live}"
 
 for c in ${crates}; do
   fa=""; pfx=""
@@ -885,10 +981,13 @@ for c in ${crates}; do
     echo "FAIL missing FA ${fa}" >&2
     exit 1
   fi
+  printf '%s\n' "${c}" >> "${live}"
   if [ "${M}" = anymodule ]; then
     grep -RhoE '\b[A-Z]{2,4}-I-[0-9]+\b' docs/fa/*.md 2>/dev/null >> "${ids}" || true
   elif [ "${M}" = anyid ]; then
     grep -hoE '\b[A-Z]{2,4}-I-[0-9]+\b' "${fa}" >> "${ids}" || true
+  elif [ "${M}" = firstidonly ]; then
+    grep -hoE "\b${pfx}-I-[0-9]+\b" "${fa}" 2>/dev/null | head -1 >> "${ids}" || true
   else
     grep -hoE "\b${pfx}-I-[0-9]+\b" "${fa}" >> "${ids}" || true
   fi
@@ -920,6 +1019,8 @@ while IFS= read -r c; do
     if [ -f "${f}" ]; then
       if [ "${M}" = anywaiver ]; then
         grep -qE '^FA-WAIVER: crates/[^ ]+ — .{12,}$' "${f}" && hit=0
+      elif [ "${M}" = substrwaiver ]; then
+        grep -qF "FA-WAIVER: crates/${c}" "${f}" && hit=0
       else
         grep -qE "^FA-WAIVER: crates/${c} — .{12,}$" "${f}" && hit=0
       fi
@@ -939,10 +1040,14 @@ if [ -s "${ids}" ]; then
   while IFS= read -r id; do
     [ -z "${id}" ] && continue
     while IFS= read -r f; do
-      if [ -f "${f}" ] && grep -qF "${id}" "${f}"; then
-        echo "${f}: ${id}"
-        echo_seen=0
-      elif [ ! -f "${f}" ] && [ "${M}" = ghostok ]; then
+      if [ -f "${f}" ]; then
+        if [ "${M}" = substr ]; then
+          grep -qF "${id}" "${f}" && { echo "${f}: ${id}"; echo_seen=0; }
+        elif grep -qE "\b${id}\b" "${f}"; then
+          echo "${f}: ${id}"
+          echo_seen=0
+        fi
+      elif [ "${M}" = ghostok ]; then
         echo "${f}: ${id} (ghost mutant)"
         echo_seen=0
       fi
@@ -954,6 +1059,10 @@ if [ -s "${ids}" ]; then
     done < "${reviews}"
   fi
 else
+  if [ -s "${live}" ] && [ "${M}" != vacuousecho ]; then
+    echo "FAIL U = empty with non-empty live crates" >&2
+    exit 1
+  fi
   echo_ok=0
 fi
 if [ -s "${ids}" ] && [ "${echo_seen}" -ne 0 ]; then
@@ -994,30 +1103,76 @@ run_battery() {
     bad=$((bad + 1))
   fi
 
-  for entry in \
-    "anyid:B4CROSSCUT" \
-    "synonly:B4DEAD" \
-    "anymodule:B4FOREIGN" \
-    "nomap:M2UNKNOWN" \
-    "nod:D1NOREV" \
-    "ghostok:S3GHOST" \
-    "nobase:E5BASE" \
-    "emptyfaok:F6NOFAFILE" \
-    "vacuousok:D1NOFA" \
-    "anywaiver:W7WRONG" \
-    "echoexcuse:W7MIXGAP"; do
+  BATTERY_ENTRIES="anyid:B4CROSSCUT
+synonly:B4DEAD
+substr:B4DEADPFX
+firstidonly:B4LIVETAIL
+vacuousecho:B4EMPTYU
+anymodule:B4FOREIGN
+nomap:M2UNKNOWN
+nod:D1NOREV
+ghostok:S3GHOST
+nobase:E5BASE
+emptyfaok:F6NOFAFILE
+vacuousok:D1NOFA
+anywaiver:W7WRONG
+substrwaiver:W7PFX
+echoexcuse:W7MIXGAP"
+
+  # Состав батареи сверяется со спекой §4 ПО ИМЕНАМ — иначе фраза «сверяется с этим
+  # перечнем» в спеке остаётся обещанием, и мутант можно молча выбросить.
+  if BATTERY_ENTRIES="${BATTERY_ENTRIES}" python3 - "${SPEC}" <<'PY'
+import os, re, sys
+from pathlib import Path
+
+lines = Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
+para, grab = [], False
+for line in lines:
+    if line.startswith("**Батарея"):
+        grab = True
+    if grab:
+        if not line.strip():
+            break
+        para.append(line)
+if not para:
+    print("абзац «Батарея» в §4 не найден")
+    sys.exit(1)
+spec_names = set(re.findall(r"`([a-z]+)` \(", "\n".join(para)))
+code_names = {e.split(":", 1)[0] for e in os.environ["BATTERY_ENTRIES"].splitlines() if e.strip()}
+if spec_names != code_names:
+    print(f"ONLY_SPEC {sorted(spec_names - code_names)}")
+    print(f"ONLY_CODE {sorted(code_names - spec_names)}")
+    sys.exit(1)
+print(f"BATTERY_SPEC_NAMES={len(spec_names)}")
+PY
+  then
+    echo "PASS  СПЕКА⇄БАТАРЕЯ: состав мутантов совпал по именам"
+  else
+    echo "FAIL  СПЕКА⇄БАТАРЕЯ: состав мутантов §4 расходится с кодом батареи"
+    bad=$((bad + 1))
+  fi
+  total=$((total + 1))
+
+  while IFS= read -r entry; do
+    [ -n "${entry}" ] || continue
     name="${entry%%:*}"; scen="${entry##*:}"
     env -u FIXTURES_REG REVIEW_FA_MUTANT="${name}" BARRIER="${ref}" CI="${wf}" bash "${SELF}" > "${d}/${name}.log" 2>&1
     rc=$?
     total=$((total + 1))
-    if [ "${rc}" -ne 0 ] && grep -q "${scen}" "${d}/${name}.log"; then
+    # Ловля должна быть ИМЕННО названным сценарием: `grep -q "${scen}"` по всему логу
+    # зеленел от строки `PASS  <scen>` — имя сценария печатается при ЛЮБОМ исходе.
+    # Якорь `^FAIL  <scen> ` требует, чтобы красным стал именно он; хвостовой разделитель
+    # обязателен, иначе `B4DEAD` матчит `B4DEADPFX` — тот же подстрочный класс, что Б-1.
+    if [ "${rc}" -ne 0 ] && grep -qE "^FAIL  ${scen}( |\$)" "${d}/${name}.log"; then
       echo "PASS  ${name} → пойман сценарием ${scen} (exit=${rc})"
     else
       echo "FAIL  ${name} → exit=${rc}, ожидался красный ${scen}"
       grep -E '^(FAIL|VERDICT|SETUP)' "${d}/${name}.log" | head -10 | sed 's/^/      ↳ /'
       bad=$((bad + 1))
     fi
-  done
+  done <<EOF_BATTERY
+${BATTERY_ENTRIES}
+EOF_BATTERY
 
   if [ "${bad}" -gt 0 ]; then
     echo "BATTERY: FAIL (${bad} из ${total})"
@@ -1064,6 +1219,9 @@ scenario_B4CROSSCUT
 scenario_B4FOREIGN
 scenario_B4DEAD
 scenario_B4UNION
+scenario_B4DEADPFX
+scenario_B4LIVETAIL
+scenario_B4EMPTYU
 scenario_E5EVENT
 scenario_E5BASE
 scenario_E5OK
@@ -1077,10 +1235,12 @@ scenario_W7MIXW
 scenario_W7EMPTY
 scenario_W7SHORT
 scenario_W7EXACT
+scenario_W7PFX
 scenario_W8NONEEDS
 scenario_W8NOIF
 scenario_W8NOCALL
 scenario_W8OK
+scenario_W8CMTONLY
 
 echo
 DECL_NAMES="$(printf '%s\n' "${MANIFEST}" | grep '|' | cut -d'|' -f1 | sort -u)"
