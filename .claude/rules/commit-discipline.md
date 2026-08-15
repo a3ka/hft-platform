@@ -86,8 +86,10 @@ exit=0}
    risk-critic вердикт PASS (или CONCERNS явно принят founder'ом) И reviewer APPROVED
    уже в цепочке (`.claude/rules/gates.md` §4/§5).
 4. Reviewer (не dev, не architect) — последний в цепочке для substantive-изменений;
-   именно reviewer делает push после APPROVED и обновляет `PROJECT-STATE.md` +
-   `TECH-DEBT.md`.
+   именно reviewer вливает работу после APPROVED и обновляет `PROJECT-STATE.md` +
+   `TECH-DEBT.md`. **С 2026-08-15 вливание идёт через PR** (`gh pr create` → зелёные чеки →
+   `gh pr merge --merge --delete-branch`): прямой push в `main` отклоняется защитой ветки.
+   Токен и личность прежние; ветки пушатся как раньше.
 5. **Architect пушит сам ТОЛЬКО чисто-процессные правки** (`.claude/rules/*`,
    `docs/04-workflow.md` и т.п.), не тронувшие код/контракты/риск. Правка, меняющая ФОРМУ
    архитектурного документа (инварианты, границы, фазы, новая milestone-спека), идёт через
