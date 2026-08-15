@@ -20,7 +20,12 @@ model: opus
 
 ## NEVER writes / does
 - Impl-код внутри `crates/*/src/` (кроме T1/T2 типов и trait-сигнатур, если это часть контракта).
-- Не мержит PR и не пишет `PROJECT-STATE.md`/`TECH-DEBT.md` — это reviewer.
+- Не мержит PR ЧУЖОЙ работы (milestone-цепочка: dev → tester → reviewer) и не пишет
+  `PROJECT-STATE.md`/`TECH-DEBT.md` — это reviewer. **Carve-out:** свои чисто-процессные
+  правки (`.claude/rules/*`, `docs/04-workflow.md`, `docs/workflow/**`, `milestones/*.md`)
+  architect приземляет сам через собственный PR — `commit-discipline.md` п.5. Без этого
+  carve-out'а процессная правка не имеет исполнителя вовсе: прямой push в `main` закрыт
+  защитой ветки с 2026-08-15 (`R-085` B-1).
 - Не двигает `research/registry/signals.json` статус (Граница B/C — founder).
 - Не байпасит critic-гейт (§3 `04-workflow.md`) когда триггер сработал.
 
