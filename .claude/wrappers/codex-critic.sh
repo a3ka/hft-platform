@@ -9,10 +9,30 @@ set -euo pipefail
 
 REPO="${HFT_REPO:-/home/nous/hft-platform}"
 BRANCH="${HFT_BRANCH:-main}"
-# Модель называется ЯВНО и передаётся в codex через -m. Пусто ⇒ берётся дефолт из
-# ~/.codex/config.toml. Для харнесс-трека founder указывает сильную модель (Terra):
-#   HFT_CODEX_MODEL=<имя> bash .claude/wrappers/codex-critic.sh
-CODEX_MODEL="${HFT_CODEX_MODEL:-}"
+# Модель называется ЯВНО и передаётся в codex через -m. Дефолт — Terra: критик и есть та
+# роль, ради которой не экономят (асимметричная цена ошибки, CLAUDE.md «Делегирование и
+# маршрутизация моделей»). Переопределяется переменной: HFT_CODEX_MODEL=<имя>.
+CODEX_MODEL="${HFT_CODEX_MODEL:-gpt-5.6-terra}"
+
+# Бинарь codex выбирается ПО ВЕРСИИ, а не по PATH. Замер 2026-08-15: системный
+# /usr/bin/codex — 0.142.5, и он отвечает на Terra отказом
+#   400 invalid_request_error: The 'gpt-5.6-terra' model requires a newer version of Codex
+# (внимание: рядом печатается warning «Model metadata … not found», из-за которого отказ
+# легко принять за «модели не существует» — принимать решение по нему нельзя).
+# Свежий CLI ставится без root: npm install -g --prefix "$HOME/.local" @openai/codex@latest
+CODEX_BIN="${HFT_CODEX_BIN:-}"
+if [[ -z "$CODEX_BIN" ]]; then
+  if [[ -x "$HOME/.local/bin/codex" ]]; then CODEX_BIN="$HOME/.local/bin/codex"; else CODEX_BIN="codex"; fi
+fi
+command -v "$CODEX_BIN" >/dev/null 2>&1 || { echo "codex не найден: $CODEX_BIN" >&2; exit 1; }
+CODEX_VER="$("$CODEX_BIN" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+CODEX_MINOR="${CODEX_VER#*.}"; CODEX_MINOR="${CODEX_MINOR%%.*}"
+if [[ "$CODEX_MODEL" == *terra* && -n "$CODEX_MINOR" && "$CODEX_MINOR" -lt 147 ]]; then
+  echo "ОТКАЗ: $CODEX_BIN — версия $CODEX_VER, а $CODEX_MODEL требует >= 0.147.0." >&2
+  echo "       Поставь свежий CLI:  npm install -g --prefix \"\$HOME/.local\" @openai/codex@latest" >&2
+  echo "       Либо назови модель явно: HFT_CODEX_MODEL=gpt-5.5 $0" >&2
+  exit 1
+fi
 
 if [[ ! -d "$REPO/.git" ]]; then
   echo "hft-platform repo not found at $REPO" >&2
@@ -107,17 +127,13 @@ echo ""
 echo "═══════════════════════════════════════════════════════════════"
 echo "                  AGENT: hft critic (Codex)"
 echo "═══════════════════════════════════════════════════════════════"
-echo "Model: ${CODEX_MODEL:-<default from ~/.codex/config.toml>}"
+echo "Model: ${CODEX_MODEL}   (codex $CODEX_VER at $CODEX_BIN)"
 echo "CWD:   $WORKTREE_PATH"
 echo "Branch:$BRANCH"
 echo ""
 
 CODEX_EXIT=0
-if [[ -n "$CODEX_MODEL" ]]; then
-  codex -m "$CODEX_MODEL" --dangerously-bypass-approvals-and-sandbox "$BOOTSTRAP" || CODEX_EXIT=$?
-else
-  codex --dangerously-bypass-approvals-and-sandbox "$BOOTSTRAP" || CODEX_EXIT=$?
-fi
+"$CODEX_BIN" -m "$CODEX_MODEL" --dangerously-bypass-approvals-and-sandbox "$BOOTSTRAP" || CODEX_EXIT=$?
 
 if [[ "$OWNED_WORKTREE" -eq 1 ]]; then
   cd /
