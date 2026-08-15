@@ -177,6 +177,24 @@ Reviewer обязан записать вердикт в `research/reviews/R-NNN
 Merge в `main` без файла `research/reviews/R-NNN.md`, называющего milestone, — нарушение
 независимо от того, насколько диф очевиден.
 
+**Шапка `GATE-META` — машинная привязка вердикта к ПРЕДМЕТУ.** Вердикт любого гейта
+(`C-NNN`/`R-NNN`/`A-NNN`) открывается блоком:
+
+<!-- GATE-META
+milestone: M-NN
+audited_repo: <owner/repo — origin ЭТОГО репозитория>
+audited_base: <полный SHA базы аудита>
+audited_head: <полный SHA вершины, которую судили>
+verdict: REJECT | NOTE | ESCALATE | APPROVE | PASS | CONCERNS | KILL | DECISION
+-->
+
+Зачем машинная форма, если те же сведения есть в прозе: прозу нельзя проверить барьером.
+`C-062` — вердикт, вынесенный над историей, которой в этом репозитории НЕТ; поймали его
+человеком и случайно. Поля — декларации, и это названный предел: ложная, но СУЩЕСТВУЮЩАЯ
+ревизия проходит. Проверяемо машинно: поля непусты, `audited_repo` совпадает с origin, обе
+ревизии есть в истории, `audited_head` — предок `HEAD`. Барьер — `scripts/check_gate_meta.sh`
+(M-60b), проба — `scripts/tests/red_gate_meta.sh`.
+
 Reviewer не пропускается НИКОГДА для substantive-изменений. После APPROVED reviewer
 обновляет `PROJECT-STATE.md` + `TECH-DEBT.md` и делает push (аналог EINHARD F-032 J5).
 
