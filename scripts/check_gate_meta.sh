@@ -135,7 +135,7 @@ meta_of() { # $1=содержимое файла → строки ВНУТРИ �
 field_of() { # $1=имя поля $2=блок шапки
   printf '%s\n' "$2" \
     | sed -n "s/^[[:space:]]*$1:[[:space:]]*//p" \
-    | head -1 | sed 's/[[:space:]]*$//'
+    | sed -n '1p' | sed 's/[[:space:]]*$//'
 }
 # Классы путей, запираемые проходным вердиктом (спека §10 — предел: только эти классы).
 is_gate_class() {
@@ -164,7 +164,8 @@ archived_token_for() { # $1=путь → SHA коммита-носителя; 1,
       reason="${rest//"$1"/}"
       # причина — то, что осталось помимо пути; пробелы не считаются (порог 12 — как у
       # FOUNDER-APPROVED в check_docs_freeze.sh)
-      printf '%s' "${reason}" | sed 's/[[:space:]]//g' | grep -qE '.{12,}' || continue
+      __r="${reason//[[:space:]]/}"
+      [ "${#__r}" -ge 12 ] || continue
       printf '%s' "${c}"
       return 0
     done < <(git log -1 --format='%B' "${c}" 2>/dev/null || true)
@@ -182,7 +183,7 @@ while IFS="$(printf '\t')" read -r st f; do
   case "${f}" in *.md) ;; *) continue ;; esac
 
   body="$(git show "HEAD:${f}" 2>/dev/null || true)"
-  if ! printf '%s\n' "${body}" | grep -q '<!-- GATE-META'; then
+  if ! grep -q '<!-- GATE-META' <<<"${body}"; then
     if [ "${st}" = "A" ] && tok="$(archived_token_for "${f}")"; then
       echo "NOTE  ${f}: до-нормативный артефакт приземлён явным ARCHIVED-VERDICT в ${tok:0:8} (аудит-след, НЕ доказательство — F-089-1)"
       exempt=$((exempt + 1))
@@ -219,7 +220,7 @@ while IFS="$(printf '\t')" read -r st f; do
   # красный там, где предмет назван честно. Отступление названо, а не сделано молча.
   case "${ms}" in
     [A-Za-z]*-[0-9]*)
-      printf '%s' "${ms}" | grep -qE '^[A-Za-z]+-[0-9]+[a-z]?$' \
+      grep -qE '^[A-Za-z]+-[0-9]+[a-z]?$' <<<"${ms}" \
         || bad "${f}: milestone «${ms}» не похож на идентификатор артефакта (КЛАСС-НОМЕР[буква])"
       ;;
     *) bad "${f}: milestone «${ms}» не похож на идентификатор артефакта (КЛАСС-НОМЕР[буква])" ;;
@@ -249,7 +250,7 @@ while IFS="$(printf '\t')" read -r st f; do
       is_gate_class "${t}" && touched="${touched} ${t}"
     done < <(git diff --name-only "${ah}" HEAD 2>/dev/null || true)
     if [ -n "${touched}" ]; then
-      if git log --format='%B' "${ah}..HEAD" 2>/dev/null | grep -q 'ALLOW-SUBJECT-CHANGE:'; then
+      if grep -q 'ALLOW-SUBJECT-CHANGE:' <<<"$(git log --format='%B' "${ah}..HEAD" 2>/dev/null || true)"; then
         echo "NOTE  ${f}: subject-lock открыт явным ALLOW-SUBJECT-CHANGE (аудит-след, НЕ доказательство — F-064-6):${touched}"
       else
         bad "${f}: subject-lock — после проходного вердикта (${vd}) тронут класс «гейт»:${touched}"
@@ -271,13 +272,13 @@ while IFS= read -r c; do
   [ -n "${c}" ] || continue
   git rev-parse -q --verify "${c}^2" >/dev/null 2>&1 || continue
   subj="$(git log -1 --format='%s' "${c}")"
-  mid="$(printf '%s' "${subj}" | grep -oE 'M-[0-9]+[a-z]?' | head -1 || true)"
+  mid="$(grep -oE 'M-[0-9]+[a-z]?' <<<"${subj}" | sed -n '1p' || true)"
   [ -n "${mid}" ] || continue
   merges=$((merges + 1))
   found=""
   while IFS= read -r rf; do
     [ -n "${rf}" ] || continue
-    if git show "${c}:${rf}" 2>/dev/null | grep -qE -- "${mid}([^0-9a-z]|$)"; then
+    if grep -qE -- "${mid}([^0-9a-z]|$)" <<<"$(git show "${c}:${rf}" 2>/dev/null || true)"; then
       found="${rf}"
       break
     fi
