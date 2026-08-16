@@ -250,7 +250,7 @@ while IFS="$(printf '\t')" read -r st f; do
       is_gate_class "${t}" && touched="${touched} ${t}"
     done < <(git diff --name-only "${ah}" HEAD 2>/dev/null || true)
     if [ -n "${touched}" ]; then
-      if git log --format='%B' "${ah}..HEAD" 2>/dev/null | grep -q 'ALLOW-SUBJECT-CHANGE:'; then
+      if grep -q 'ALLOW-SUBJECT-CHANGE:' <<<"$(git log --format='%B' "${ah}..HEAD" 2>/dev/null || true)"; then
         echo "NOTE  ${f}: subject-lock открыт явным ALLOW-SUBJECT-CHANGE (аудит-след, НЕ доказательство — F-064-6):${touched}"
       else
         bad "${f}: subject-lock — после проходного вердикта (${vd}) тронут класс «гейт»:${touched}"
@@ -278,7 +278,7 @@ while IFS= read -r c; do
   found=""
   while IFS= read -r rf; do
     [ -n "${rf}" ] || continue
-    if git show "${c}:${rf}" 2>/dev/null | grep -qE -- "${mid}([^0-9a-z]|$)"; then
+    if grep -qE -- "${mid}([^0-9a-z]|$)" <<<"$(git show "${c}:${rf}" 2>/dev/null || true)"; then
       found="${rf}"
       break
     fi

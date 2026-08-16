@@ -148,7 +148,7 @@ for path in ${existed}; do
   for c in ${removed_by}; do
     # (а) переезд в ДРУГОЙ защищённый путь — легитимная миграция (docs/contract-rfc → docs/rfc)
     newp=$(git show -M --name-status --format='' "${c}" \
-             | awk -v p="${path}" '$1 ~ /^R/ && $2 == p {print $3}' | head -1)
+             | awk -v p="${path}" '$1 ~ /^R/ && $2 == p {print $3}' | sed -n '1p')
     # Достаточно, чтобы новый путь тоже был ЗАЩИЩЁН: он сам проверяется этим же циклом
     # (цепочка переименований A→B→C внутри защиты легитимна; требовать существования B на
     # HEAD нельзя — он мог переехать дальше).
@@ -156,7 +156,7 @@ for path in ${existed}; do
       ok=1; reason="переехал в ${newp} (остался под защитой)"; break
     fi
     # (б) осознанное удаление — override в ТЕЛЕ ЭТОГО коммита
-    if git log -1 --format='%B' "${c}" | grep -q '^ALLOW-ARTIFACT-DELETE:'; then
+    if grep -q '^ALLOW-ARTIFACT-DELETE:' <<<"$(git log -1 --format='%B' "${c}" 2>/dev/null || true)"; then
       ok=1; reason="ALLOW-ARTIFACT-DELETE в $(git log -1 --format='%h' "${c}")"; break
     fi
   done
