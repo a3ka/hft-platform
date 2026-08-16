@@ -189,7 +189,7 @@ introduced() {
       | sed -nE "s|^\+${TD_PAT}\$|\\1 \\2|p" \
       | while IFS= read -r td_line; do
           [ -n "${td_line}" ] || continue
-          if printf '%s\n' "$head_td" | grep -qxF -- "$td_line"; then
+          if grep -qxF -- "$td_line" <<<"$head_td"; then
             # 4 поля «TD NUM LT CARRIER» через SEP. LT у TD всегда пустой; bash'евый printf
             # с `X%s%s%s%s%s\n` СЪЕДАЕТ пустой аргумент между двумя `printf SEP` (замер прямо
             # на этом файле, см. Н-фикс в логе работы). Подстановка `${SEP}${SEP}` — ДВА
