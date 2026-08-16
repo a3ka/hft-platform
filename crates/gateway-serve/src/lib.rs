@@ -64,6 +64,19 @@ pub mod session;
 /// v1 wire protocol — парсинг клиентских сообщений и сериализация ответов (§2.2/§2.3).
 pub mod wire_v1;
 
+/// M-65 round 3 (R-086 §10.3): rendezvous-точка синхронизации для оракула на гонку
+/// «switch × in-flight pump». В ТЕСТОВОЙ сборке pump (внутри `spawn_blocking`)
+/// СИГНАЛИТ «вошёл» и ЖДЁТ разрешения; в прод-пути (compile без `--test`) модуль
+/// НЕ компилируется и на семантику пути не влияет — строгая граница через
+/// `#[cfg(test)]` на уровне `pub mod rendezvous`.
+///
+/// Сводный контракт и cleanup-политика — в шапке `test_sync.rs`. Тест, использующий
+/// `rendezvous`, вызывает `arm(id)` перед сценарием, `test_wait_for_pump(id, ..)`
+/// для синхронизации, `test_release(id)` чтобы pump продолжил, и `test_remove(id)`
+/// после сценария.
+#[cfg(test)]
+pub mod test_sync;
+
 pub mod wire {
     use crate::_gw::{Frame, Snapshot};
     use serde::{Deserialize, Serialize};
@@ -444,17 +457,20 @@ pub mod server {
     /// `spawn_blocking`-future, возвращающая `(sub_id, Result<...>)`; `FuturesUnordered`
     /// собирает их в одну очередь завершения для `select!` без per-id веток.
     pub type V1PumpJoin = tokio::task::JoinHandle<(String, V1PumpResult)>;
-    /// Результат v1-pump'a: ok = (sub, frames, cursor, gen_at_pump, stats); err = боксированный
-    /// sub с ошибкой (нужен для восстановления состояния при pump-ошибке).
+    /// Результат v1-pump'a: ok = (live, frames, cursor, stats, gen_at_pump); err = боксированный
+    /// (live, ошибка, gen_at_pump). `gen_at_pump` проброшен ОБОИМИ ветками — возвращающий код
+    /// сравнивает его с текущим `gens[id]` и при расхождении ОТБРАСЫВАЕТ результат.
+    /// `live` пробрасывается как `gateway::LiveReducer`, а не как `session::Sub` (развязка А
+    /// §10.2: pump не владеет `Sub` — только `LiveReducer`, временно вынутый из карты).
     pub type V1PumpResult = Result<
         (
-            session::Sub,
+            gateway::LiveReducer,
             Vec<crate::_gw::Frame>,
             crate::_gw::Cursor,
-            u64,
             crate::_gw::ReadStats,
+            u64,
         ),
-        Box<(session::Sub, std::io::Error)>,
+        Box<(gateway::LiveReducer, std::io::Error, u64)>,
     >;
     /// Тип FuturesUnordered, агрегирующий in-flight pump'ы. `BTreeSet<String>` отдельно
     /// (поле `pending_ids`) — id'ы в полёте; используется для дешёвой проверки «уже качается»
@@ -464,13 +480,16 @@ pub mod server {
     pub struct SessionInner {
         /// Подписки на соединении. `BTreeMap` — детерминированный обход и тест «выбор на тик»
         /// (DET-I-1, `R-057` Б-1).
+        ///
+        /// M-65 round 3 (R-086 §10.2 развязка А): подписка НЕ изымается из карты на
+        /// время pump'а. `Sub::live` берётся ОПЦИОНАЛЬНО (`Option::take`) и возвращается
+        /// обратно на завершении pump'а — сам же `Sub` остаётся в карте всё время жизни.
+        /// Тем самым `contains_key(id) == true` всегда (кроме момента между `unsubscribe`
+        /// и возвратом in-flight pump'а), и клиентский `subscribe` идёт по SWITCH, а не ADD.
         subs: std::collections::BTreeMap<String, session::Sub>,
-        /// Логический счётчик — равен `subs.len()`. Денормализован, чтобы избежать `O(n)`
-        /// подсчёта в hot-path проверки cap (задача #4 / `O-4`).
-        subs_count: usize,
         /// id'ы sub'ов, для которых в-полнёте pump должен быть отброшен по завершении
-        /// (race с `unsubscribe`/`switch`: пока pump читает журнал, клиент успел удалить
-        /// sub; результат такого pump'a содержит кадры старого `LiveReducer`'а и НЕ должен
+        /// (race с `unsubscribe`: пока pump читает журнал, клиент успел снять sub;
+        /// результат такого pump'a содержит кадры старого `LiveReducer`'a и НЕ должен
         /// быть доставлен клиенту). `drain*` ниже снимает пометку при завершении pump'a.
         /// `BTreeSet` — для предсказуемого порядка итерации (DET-I-1).
         draining_ids: std::collections::BTreeSet<String>,
@@ -484,6 +503,22 @@ pub mod server {
         /// (задача #2 / `O-2` / `R-057` Б-1: «выбор подписки на тик ДЕТЕРМИНИРОВАН»). На тик
         /// pump'ятся ВСЕ подписки без in-flight pump'а. `BTreeSet` — детерминированный обход.
         pending_ids: std::collections::BTreeSet<String>,
+        /// BINDING (M-65 §10.2 развязка Б): `generation` живёт ВНЕ `Sub` — отдельная
+        /// карта `id → gen`. Инкрементируется при switch (sub заменён), удаляется при
+        /// `unsubscribe`. pump фиксирует `gen_at_pump` при старте, сверяет с текущим
+        /// `gens[id]` на возврате — расхождение = sub был switch/remove во время блокирующего
+        /// чтения, результат ОТБРАСЫВАЕТСЯ.
+        ///
+        /// Запрет §10.2 ЯВНЫЙ: «починка инкрементом `generation` внутри `Sub`» лечит симптом
+        /// (сравнение копии с самой собой — `sub.generation` перемещён в замыкание и при
+        /// возврате сравнивается сам с собой) и НЕ лечит корень (ADD вместо SWITCH из-за
+        /// `subs.remove` на время pump'а). Развязка А устраняет корень (sub не изымается);
+        /// развязка Б — дополнение-страж, ловящий расхождение состояния.
+        ///
+        /// **Лимит считается по `subs.len()`, а НЕ по отдельному счётчику** (§10.2 явно):
+        /// рассинхрон двух величин, одна из которых производная, и есть источник N-1
+        /// findings такого рода (`:823` +=1 без парного декремента при pump'е in-flight).
+        gens: std::collections::BTreeMap<String, u64>,
         /// `cfg` хранится для доступа к `journal_dir` / `filter` / `ckpt_dir` внутри
         /// `spawn_blocking`-замыканий, где `Arc<ServeConfig>` — единственный `'static`-
         /// безопасный источник этих ресурсов.
@@ -603,10 +638,10 @@ pub mod server {
         // Создаём пустую v1-сессию.
         let mut inner = SessionInner {
             subs: std::collections::BTreeMap::new(),
-            subs_count: 0,
             draining_ids: std::collections::BTreeSet::new(),
             pending: futures_util::stream::FuturesUnordered::new(),
             pending_ids: std::collections::BTreeSet::new(),
+            gens: std::collections::BTreeMap::new(),
             cfg: Arc::clone(&cfg),
         };
 
@@ -687,9 +722,17 @@ pub mod server {
                 let sel_for_resume = sel.clone();
                 let max_subs = effective_max_subs();
                 if inner.subs.contains_key(id.as_str()) {
-                    // (а) SWITCH: build новый LiveReducer, заменяем sub в карте АТОМАРНО
-                    // (Map::insert возвращает Some(old), но мы не используем — это важно:
-                    // старый LiveReducer дропается здесь, до возврата из обработчика).
+                    // (а) SWITCH: build новый LiveReducer, заменяем sub в карте АТОМАРНО.
+                    //
+                    // M-65 round 3 (R-086 §10.2 развязка А): до этой правки sub ИЗЫМАЛСЯ из
+                    // карты на время pump'а (`tick`-ом) и `contains_key` здесь возвращал
+                    // `false` ⇒ код уходил по ветке ADD вместо SWITCH, нарушая §2.4
+                    // буквально. С развязкой А sub остаётся в карте с `live: None` на время
+                    // pump'а, и `contains_key` корректно возвращает `true` ⇒ ветка SWITCH
+                    // исполняется по назначению. «Вставлять обратно» уже нечего — новый sub
+                    // замещает старый на ту же запись карты, а in-flight pump (если есть)
+                    // обнаружит расхождение generation'а на возврате и ОТБРОСИТ свой `live`,
+                    // а не затрёт новый.
                     let (snap, new_sub) =
                         match tokio::task::spawn_blocking(move || -> io::Result<_> {
                             let (live, _stats) = gateway::LiveReducer::resume(
@@ -704,8 +747,7 @@ pub mod server {
                                 session::Sub {
                                     id: id_for_closure,
                                     selector: sel_for_resume,
-                                    live,
-                                    generation: 0,
+                                    live: Some(live),
                                 },
                             ))
                         })
@@ -736,10 +778,22 @@ pub mod server {
                     let switched_id = new_sub.id.clone();
                     let old = inner.subs.insert(switched_id.clone(), new_sub);
                     // Старый sub дропнут через замену в карте. Если сейчас есть в-полёте
-                    // pump на старом sub (в `pending`), его результат после await вернёт sub,
-                    // но мы не положим его обратно если его id не совпадает с id в карте.
-                    // Защита: см. (а) ниже — фильтр при возврате.
+                    // pump на старом sub (в `pending`), его результат после await вернёт
+                    // `LiveReducer` старого селектора; проверка generation'а на возврате
+                    // (`gens[id]` инкрементирован НИЖЕ) отбросит его, а не затрёт новый.
                     drop(old);
+                    // BINDING (§10.2 развязка Б): инкремент `gens[id]` АТОМАРЕН с заменой
+                    // sub в карте — оба происходят в одном плече `select!`, между ними
+                    // не может вклиниться ни pump-completion (он ждёт `inner`), ни новый
+                    // `subscribe`. Поведение: pump в полёте (с захваченным `gen_at_pump`)
+                    // видит на возврате `current_gen = gens[id]+1 ≠ gen_at_pump` ⇒ ОТБРАСЫВАЕТ
+                    // свой `live`, а не замещает новый.
+                    let next_gen = inner
+                        .gens
+                        .entry(switched_id.clone())
+                        .and_modify(|g| *g += 1)
+                        .or_insert(1);
+                    debug_assert!(*next_gen >= 1, "generation must be ≥ 1 after switch");
                     let snap_msg = wire_v1::snapshot_msg(&switched_id, &snap);
                     let snap_text = match serde_json::to_string(&snap_msg) {
                         Ok(s) => s,
@@ -756,7 +810,9 @@ pub mod server {
                 }
 
                 // (б) ADD новой подписки с проверкой cap.
-                if inner.subs_count >= max_subs {
+                // M-65 §10.2: лимит считается по `subs.len()` — НЕ по отдельному счётчику
+                // (`:823` +=1 без парного декремента при ADD-в-полёте был источником N-1).
+                if inner.subs.len() >= max_subs {
                     send_v1_error(
                         sink,
                         Some(id),
@@ -781,8 +837,7 @@ pub mod server {
                         session::Sub {
                             id: id_for_closure,
                             selector: sel_for_resume,
-                            live,
-                            generation: 0,
+                            live: Some(live),
                         },
                     ))
                 })
@@ -820,7 +875,11 @@ pub mod server {
                 // ВСЕГДА ставится — см. ниже).
                 inner.draining_ids.remove(&id_for_insert);
                 inner.subs.insert(id_for_insert.clone(), new_sub);
-                inner.subs_count += 1; // Логический счётчик: bump при УСПЕШНОМ add.
+                // M-65 §10.2 развязка Б: `gens[id]` заводится здесь (0 для нового), инкремент
+                // для switch'а, удаление для unsubscribe — см. ниже. Лимит считается по
+                // `subs.len()`; этот счётчик — отдельная величина, рассинхрон с `subs` запрещён
+                // и при switch'е ловится сравнением `current_gen == gen_at_pump` на возврате pump'а.
+                inner.gens.entry(id_for_insert.clone()).or_insert(0);
                 let snap_msg = wire_v1::snapshot_msg(&id_for_insert, &snap);
                 let snap_text = match serde_json::to_string(&snap_msg) {
                     Ok(s) => s,
@@ -874,7 +933,13 @@ pub mod server {
                 if !in_flight {
                     inner.draining_ids.remove(&id_str);
                 }
-                inner.subs_count = inner.subs_count.saturating_sub(1);
+                // M-65 §10.2 развязка Б: удаление записи `gens[id_str]` гарантирует, что любой
+                // in-flight pump (с захваченным `gen_at_pump`) видит `current_gen == None` —
+                // расхождение, результат отбрасывается. Альтернатива «инкремент + оставить»
+                // функционально эквивалентна, но удаление чище (нет накопления мёртвых gens).
+                // Лимит при этом считается по `subs.len()` — отдельный счётчик не ведём
+                // (§10.2 явно; рассинхрон — источник N-1).
+                inner.gens.remove(&id_str);
                 tracing::debug!(sub = %id_str, "v1 unsubscribe ok");
                 Ok(())
             }
@@ -1009,9 +1074,14 @@ pub mod server {
                 // Раньше здесь брался `subs.iter().next()` — ПЕРВАЯ по итерации HashMap (недетерм.)
                 // подписка, и удерживалась единственным `pending: Option`. Теперь итерация по
                 // BTreeMap (детерм.) и для каждого id без pending — отдельный spawn_blocking.
+                //
+                // M-65 round 3 (R-086 §10.2 развязка А): pump НЕ ИЗЫМАЕТ `Sub` из карты —
+                // берётся только `live` (`Option::take`). Сам `Sub` остаётся в карте с
+                // `live: None` на время pump'а. `contains_key` возвращает `true` всё
+                // время ⇒ клиентский `subscribe` идёт по SWITCH, а не ADD (см. блокер §2
+                // R-086). На возврате `live` кладётся обратно в тот же `Sub`, если
+                // `gens[id]` не изменился (т.е. не было switch/remove в-полёте).
                 _ = push_tick.tick() => {
-                    // BTreeMap.keys() упорядочен по `String` (DET-I-1). Снимок id'ов делаем
-                    // ВЕКТОРОМ, чтобы не держать borrow `inner.subs` через `subs.remove`.
                     let ids: Vec<String> = inner
                         .subs
                         .keys()
@@ -1019,25 +1089,48 @@ pub mod server {
                         .cloned()
                         .collect();
                     for id in ids {
-                        // Если подписку уже сняли между сбором id'ов и `remove` — пропускаем
-                        // (race с `unsubscribe` в той же итерации loop'а; в худшем случае
-                        // следующий тик начнёт новый pump, если подписку переоткроют).
-                        let Some(mut sub) = inner.subs.remove(&id) else {
+                        // Берём `live` ОПЦИОНАЛЬНО. Если уже pump в полёте (после
+                        // `pending_ids.contains` гонки с предыдущим `pending.insert`
+                        // между фильтром и `take`) — пропуск; следующий тик подхватит.
+                        let Some(mut live) =
+                            inner.subs.get_mut(&id).and_then(|s| s.live.take())
+                        else {
                             continue;
                         };
+                        // Генерация фиксируется ДО `pending_ids.insert`. Если между этим
+                        // моментом и завершением pump'а придёт `unsubscribe` — gens[id]
+                        // удалится (`current_gen = None ≠ gen_at_pump`).
+                        let gen_at_pump = inner.gens.get(&id).copied().unwrap_or(0);
                         let cfg2 = Arc::clone(&inner.cfg);
                         let id_for_pump = id.clone();
-                        let gen_at_pump = sub.generation;
                         let handle: V1PumpJoin = tokio::task::spawn_blocking(move || {
-                            let outcome: V1PumpResult = match sub.live.pump(
+                            // M-65 §10.3: точка синхронизации для оракула на гонку
+                            // «switch × in-flight pump». В тестовой сборке pump СИГНАЛИТ
+                            // «вошёл» и ЖДЁТ разрешения; на прод-путь не влияет
+                            // (compile без #[cfg(test)] ⇒ блок пуст, JIT не видит).
+                            //
+                            // BINDING: вызов из `spawn_blocking`. Condvar-вариант
+                            // (см. `crates/gateway-serve/src/test_sync.rs`) специально
+                            // выбран БЛОКИРУЮЩИМ, чтобы не вешать tokio-worker
+                            // `block_on`-ожиданием.
+                            #[cfg(test)]
+                            {
+                                let id_for_sync = id_for_pump.clone();
+                                crate::test_sync::rendezvous::pump_signal_and_wait(&id_for_sync);
+                            }
+                            let outcome: V1PumpResult = match live.pump(
                                 cfg2.journal_dir.as_path(),
                                 cfg2.filter.clone(),
                                 PUSH_MAX_EVENTS,
                             ) {
-                                Ok((frames, new_cursor, stats)) => {
-                                    Ok((sub, frames, new_cursor, gen_at_pump, stats))
-                                }
-                                Err(e) => Err(Box::new((sub, e))),
+                                Ok((frames, new_cursor, stats)) => Ok((
+                                    live,
+                                    frames,
+                                    new_cursor,
+                                    stats,
+                                    gen_at_pump,
+                                )),
+                                Err(e) => Err(Box::new((live, e, gen_at_pump))),
                             };
                             (id_for_pump, outcome)
                         });
@@ -1062,41 +1155,68 @@ pub mod server {
                     };
                     inner.pending_ids.remove(&id);
                     match outcome {
-                        Ok((sub, frames, _new_cursor, _gen_at_pump, _stats)) => {
-                            let sub_id = sub.id.clone();
-                            // `draining_ids`-проверка (Б-2 race): если id был помечен
-                            // `unsubscribe`-ом во время in-flight pump'a, отбрасываем
-                            // результат и снимаем пометку.
-                            if inner.draining_ids.remove(&sub_id) {
-                                tracing::debug!(
-                                    sub = %sub_id,
-                                    "v1 pump result dropped: sub drained during pump"
-                                );
-                                drop(sub);
-                                continue;
+                        Ok((live, frames, _new_cursor, _stats, gen_at_pump)) => {
+                            // ═════ РЕШАЮЩИЙ INVARIANT: «OLD PUMP НЕ ЗАТИРАЕТ NEW SUB» ═════
+                            //
+                            // ДО фикса (R-086 блокер §2) следующий сценарий воспроизводился:
+                            //   1. tick: `subs.remove("w1")` ⇒ содержимое `w1` изъято из карты;
+                            //   2. клиент: `subscribe(w1, ETH)` ⇒ `contains_key("w1") == false`
+                            //      ⇒ ветка ADD, а не SWITCH;
+                            //   3. `inner.subs_count += 1` БЕЗ парного декремента на step 1;
+                            //   4. pump (BTC) возвращается: generation внутри Sub ТОЖЕ РАВНА 0
+                            //      (поле унесено в замыкание, сверка `0 != 0` ложна);
+                            //   5. `inner.subs.insert("w1", old_btc_sub)` ⇒ НОВЫЙ ETH-sub
+                            //      ЗАТЁРТ старым BTC, и `subs_count` БОЛЬШЕ НЕ равен `subs.len()`.
+                            //
+                            // ПОСЛЕ фикса (этот код, R-086 §10.2 развязки А+Б):
+                            //   1. tick: `subs.get_mut("w1").live.take()` ⇒ sub остаётся в карте
+                            //      с `live: None`;
+                            //   2. клиент: `subscribe(w1, ETH)` ⇒ `contains_key("w1") == true`
+                            //      ⇒ ветка SWITCH, `gens["w1"] += 1` (было 0, стало 1);
+                            //   3. pump возвращается: `gen_at_pump = 0` (захвачен на старте),
+                            //      `current_gen = Some(1)`;
+                            //   4. `live_keeps = !drained && current_gen == Some(gen_at_pump)`
+                            //      = `false` ⇒ `drop(live)`, новый ETH-Sub НЕ ТРОНУТ;
+                            //   5. лимит считается по `subs.len()`, отдельный счётчик не ведётся.
+                            //
+                            // Конструкция обладает СВОЙСТВОМ, которого оракулы и мутанты не
+                            // пиннили: злонамеренный или гончный pump НЕ МОЖЕТ поместить свой
+                            // live обратно в sub, чьё состояние изменилось после старта pump'а.
+                            // Это структурное свойство, а не эвристика.
+                            //
+                            // `draining_ids`-проверка: `unsubscribe` в-полёте ⇒ отбрасываем.
+                            // `gens` уже удалён в `unsubscribe`, проверка `current_gen` ниже
+                            // дала бы то же; раздельные флаги — для симметрии с `R-057` Б-2
+                            // (пометка снимается СРАЗУ, если in-flight pump'а нет).
+                            let drained = inner.draining_ids.remove(&id);
+                            let current_gen = inner.gens.get(&id).copied();
+                            // Sub всё ещё «наш» (=не удалён, не switch'нут) ТОЛЬКО если
+                            // generation at-pump равен текущему. Это одновременно ловит
+                            // (а) switch в-полёте — `gens[id] += 1`, (б) unsubscribe в-полёте
+                            // — `gens[id]` удалён, `current_gen == None ≠ Some(gen_at_pump)`.
+                            let live_keeps = !drained && current_gen == Some(gen_at_pump);
+                            if let Some(sub) = inner.subs.get_mut(&id) {
+                                if live_keeps {
+                                    sub.live = Some(live);
+                                } else {
+                                    drop(live);
+                                }
+                            } else {
+                                // Sub окончательно удалён между pump-completion и нашим
+                                // возвратом (теоретическая гонка). Кадры не шлём, live
+                                // дропаем.
+                                drop(live);
                             }
-                            // Generation-check: switch во время pump'a обнаруживается через
-                            // несовпадение generation'a поднятого sub'а и текущего.
-                            let current_gen = inner.subs.get(&sub_id).map(|s| s.generation);
-                            match current_gen {
-                                Some(cg) if cg != sub.generation => {
+                            if !live_keeps {
+                                if drained {
+                                    tracing::debug!(sub = %id, "v1 pump result dropped: sub drained");
+                                } else {
                                     tracing::debug!(
-                                        sub = %sub_id,
-                                        "v1 pump result dropped: stale generation (switch)"
+                                        sub = %id,
+                                        "v1 pump result dropped: stale generation (switch/remove)"
                                     );
-                                    drop(sub);
-                                    continue;
                                 }
-                                None => {
-                                    // Sub удалён БЕЗ racing pump (мы в начале pump'a его сами
-                                    // сняли через `subs.remove`) — нормальный случай, ставим
-                                    // обратно с обновлённым `live`.
-                                    inner.subs.insert(sub_id.clone(), sub);
-                                }
-                                Some(_) => {
-                                    // Generation совпал — sub всё ещё «наш», ставим обратно.
-                                    inner.subs.insert(sub_id.clone(), sub);
-                                }
+                                continue;
                             }
                             // Шлём полученные кадры (от `pump`).
                             //
@@ -1120,13 +1240,26 @@ pub mod server {
                             }
                         }
                         Err(boxed) => {
-                            let (sub, e) = *boxed;
+                            let (live, e, gen_at_pump) = *boxed;
                             tracing::error!(
                                 error = %e,
                                 sub = %id,
                                 "v1 LiveReducer::pump failed — sub продолжит молча"
                             );
-                            inner.subs.insert(sub.id.clone(), sub);
+                            // Даже на pump-ошибке пробуем вернуть `live` в карту, если sub
+                            // всё ещё наш по generation. Иначе просто дропаем.
+                            let drained = inner.draining_ids.remove(&id);
+                            let current_gen = inner.gens.get(&id).copied();
+                            let live_keeps = !drained && current_gen == Some(gen_at_pump);
+                            if let Some(sub) = inner.subs.get_mut(&id) {
+                                if live_keeps {
+                                    sub.live = Some(live);
+                                } else {
+                                    drop(live);
+                                }
+                            } else {
+                                drop(live);
+                            }
                         }
                     }
                 }
@@ -1285,10 +1418,10 @@ pub mod server {
         // v1 subs — в NEW wire) — оси 7/5 (изоляция/соседи) внутри v1 session.
         let mut v1_session_inner = super::server::SessionInner {
             subs: std::collections::BTreeMap::new(),
-            subs_count: 0,
             draining_ids: std::collections::BTreeSet::new(),
             pending: futures_util::stream::FuturesUnordered::new(),
             pending_ids: std::collections::BTreeSet::new(),
+            gens: std::collections::BTreeMap::new(),
             cfg: Arc::clone(&cfg),
         };
         // M-65 round 2 Б-1 (`R-057`): legacy-путь (v1 subs внутри legacy сессии) использует
@@ -1343,6 +1476,11 @@ pub mod server {
                 }
                 // v1 subs pumps (параллельно с legacy env-stream, см. Б-1): пока legacy не занят,
                 // pump ВСЕХ v1-подписок без in-flight pump'а за тик. BTreeMap идёт детерминированно.
+                //
+                // M-65 round 3 (R-086 §10.2 развязка А): pump НЕ ИЗЫМАЕТ `Sub` из карты —
+                // берётся только `live` (`Option::take`); сам `Sub` остаётся в карте.
+                // Семантика generation — в `v1_session_inner.gens`. Тест rendezvous (§10.3)
+                // живёт в той же `cfg(test)`-точке, что и в `run_v1_session_loop`.
                 _ = push_tick_v1.tick(), if pending_read.is_none() => {
                     let ids: Vec<String> = v1_session_inner
                         .subs
@@ -1351,24 +1489,36 @@ pub mod server {
                         .cloned()
                         .collect();
                     for id in ids {
-                        let Some(mut sub) = v1_session_inner.subs.remove(&id) else {
+                        let Some(mut live) = v1_session_inner
+                            .subs
+                            .get_mut(&id)
+                            .and_then(|s| s.live.take())
+                        else {
                             continue;
                         };
+                        let gen_at_pump = v1_session_inner.gens.get(&id).copied().unwrap_or(0);
                         let cfg2 = Arc::clone(&cfg);
                         let id_for_pump = id.clone();
-                        let gen_at_pump = sub.generation;
                         let handle: V1PumpJoin = tokio::task::spawn_blocking(move || {
-                            let outcome: V1PumpResult =
-                                match sub.live.pump(
-                                    cfg2.journal_dir.as_path(),
-                                    cfg2.filter.clone(),
-                                    PUSH_MAX_EVENTS,
-                                ) {
-                                    Ok((frames, new_cursor, stats)) => {
-                                        Ok((sub, frames, new_cursor, gen_at_pump, stats))
-                                    }
-                                    Err(e) => Err(Box::new((sub, e))),
-                                };
+                            #[cfg(test)]
+                            {
+                                let id_for_sync = id_for_pump.clone();
+                                crate::test_sync::rendezvous::pump_signal_and_wait(&id_for_sync);
+                            }
+                            let outcome: V1PumpResult = match live.pump(
+                                cfg2.journal_dir.as_path(),
+                                cfg2.filter.clone(),
+                                PUSH_MAX_EVENTS,
+                            ) {
+                                Ok((frames, new_cursor, stats)) => Ok((
+                                    live,
+                                    frames,
+                                    new_cursor,
+                                    stats,
+                                    gen_at_pump,
+                                )),
+                                Err(e) => Err(Box::new((live, e, gen_at_pump))),
+                            };
                             (id_for_pump, outcome)
                         });
                         v1_session_inner.pending.push(handle);
@@ -1392,31 +1542,33 @@ pub mod server {
                     };
                     v1_session_inner.pending_ids.remove(&id);
                     match outcome {
-                        Ok((sub, frames, _new_cursor, gen_at_pump, _stats)) => {
-                            let sub_id_for_map = sub.id.clone();
-                            // `draining_ids` — sub был явно `unsubscribe`-нут во время
-                            // in-flight pump'a (§4.1 race).
-                            if v1_session_inner.draining_ids.remove(&sub_id_for_map) {
-                                tracing::debug!(sub = %sub_id_for_map, "legacy v1 pump result dropped: drained");
-                                drop(sub);
-                                continue;
+                        Ok((live, frames, _new_cursor, _stats, gen_at_pump)) => {
+                            // Аналогично v1-pump-completion в `run_v1_session_loop`: sub живёт,
+                            // кладём `live` обратно в sub.live по месту (`subs.get_mut`), ЕСЛИ
+                            // generation не разошёлся. Расхождение = switch/remove в-полёте ⇒
+                            // результат отбрасывается, `live` дропается, кадры не шлём.
+                            let drained = v1_session_inner.draining_ids.remove(&id);
+                            let current_gen = v1_session_inner.gens.get(&id).copied();
+                            let live_keeps = !drained && current_gen == Some(gen_at_pump);
+                            if let Some(sub) = v1_session_inner.subs.get_mut(&id) {
+                                if live_keeps {
+                                    sub.live = Some(live);
+                                } else {
+                                    drop(live);
+                                }
+                            } else {
+                                drop(live);
                             }
-                            let current_gen =
-                                v1_session_inner.subs.get(&sub_id_for_map).map(|s| s.generation);
-                            match current_gen {
-                                Some(cg) if cg != gen_at_pump => {
-                                    // Switch-в-полёте.
-                                    tracing::debug!(sub = %sub_id_for_map, "legacy v1 pump result dropped: stale generation");
-                                    drop(sub);
-                                    continue;
+                            if !live_keeps {
+                                if drained {
+                                    tracing::debug!(sub = %id, "legacy v1 pump result dropped: drained");
+                                } else {
+                                    tracing::debug!(
+                                        sub = %id,
+                                        "legacy v1 pump result dropped: stale generation"
+                                    );
                                 }
-                                None => {
-                                    // Нормальный случай — возвращаем с обновлённым `live`.
-                                    v1_session_inner.subs.insert(sub_id_for_map.clone(), sub);
-                                }
-                                Some(_) => {
-                                    v1_session_inner.subs.insert(sub_id_for_map.clone(), sub);
-                                }
+                                continue;
                             }
                             for frame in frames {
                                 let frame_msg = wire_v1::frame_msg(&id, &frame);
@@ -1430,13 +1582,19 @@ pub mod server {
                             // heartbeat УДАЛЁН по architect-решению `M-65-ws-session.md` §4.2bis.
                         }
                         Err(boxed) => {
-                            let (sub, e) = *boxed;
-                            let sub_id = sub.id.clone();
+                            let (live, e, gen_at_pump) = *boxed;
                             tracing::error!(error = %e, sub = %id, "legacy v1 pump err");
-                            let current_gen =
-                                v1_session_inner.subs.get(&sub_id).map(|s| s.generation);
-                            if current_gen.is_some() {
-                                v1_session_inner.subs.insert(sub_id, sub);
+                            let drained = v1_session_inner.draining_ids.remove(&id);
+                            let current_gen = v1_session_inner.gens.get(&id).copied();
+                            let live_keeps = !drained && current_gen == Some(gen_at_pump);
+                            if let Some(sub) = v1_session_inner.subs.get_mut(&id) {
+                                if live_keeps {
+                                    sub.live = Some(live);
+                                } else {
+                                    drop(live);
+                                }
+                            } else {
+                                drop(live);
                             }
                         }
                     }
