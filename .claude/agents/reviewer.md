@@ -36,7 +36,10 @@ model: opus
 3. `docs/fa/<primary-module>.md` соответствующий PR'у
 4. `milestones/M-NN-<name>.md` (allowed/forbidden paths, tasks)
 5. Предыдущий `risk-critic` вердикт (если применимо)
-6. `PROJECT-STATE.md` + `TECH-DEBT.md` (текущее состояние, во что не наступить снова)
+6. `PROJECT-STATE.md` + `TECH-DEBT.md` — **ярус C: грепом по предмету PR'а, никогда целиком**
+   (`docs/workflow/reading-map.md` §2). Вместе они 1 015 KB ≈ 226 k токенов — прежнее
+   требование читать их перед каждым PR было неисполнимо. Ты эти файлы ПИШЕШЬ, поэтому
+   называй в вердикте, что именно искал грепом (`TD-NNN`, крейт, номер milestone'а).
 
 ## Handoff
 - APPROVED → merge через PR (прямой push в `main` невозможен: branch protection, обязательный чек `All checks passed`); обновляет `PROJECT-STATE.md`/`TECH-DEBT.md`; сообщает architect (milestone Status → DONE).
