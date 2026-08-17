@@ -480,6 +480,32 @@ def cmd_check_wiring():
     if "TARGET_SHA" not in script:
         bad("W9", "в шагах `deploy` нет TARGET_SHA — выкатка не SHA-якорная (TD-150 п.1)")
 
+    # W10 — ЕДИНСТВЕННЫЙ канал эскалации HOLD снимается одной строкой (`C-096` B-1).
+    #
+    # `HOLD_RC=2` становится «красным раном» только через шаг `catchup.decide`. Добавьте ему
+    # `continue-on-error: true` — или допишите `|| true` к команде — и вернётся ровно то
+    # состояние, которое `C-093` R-2 назвал дефектом: decision=HOLD, джоб зелёный, ран
+    # терминально зелёный. «Временно снять блокировку» — самый частый регресс в CI-манифестах,
+    # и весь смысл W1-W9 в том, чтобы такие правки ловить.
+    catchup_job = jobs.get("catchup")
+    if not isinstance(catchup_job, dict):
+        bad("W10", "джоба `catchup` нет — сторож не проводится вовсе")
+    else:
+        why = _job_is_disarmed(catchup_job)
+        if why:
+            bad("W10", f"джоб `catchup` обезврежен ({why}): HOLD снова станет зелёным")
+        found_decide = False
+        for st in _steps(catchup_job):
+            run = st.get("run")
+            if isinstance(run, str) and "deploy_catchup.py" in run and " decide" in run:
+                found_decide = True
+                why = _step_is_disarmed(st)
+                if why:
+                    bad("W10", f"шаг решения о доборе обезврежен ({why}) — эскалация HOLD "
+                               f"снята, сторож молчит зелёным")
+        if not found_decide:
+            bad("W10", "в джобе `catchup` нет шага, зовущего `deploy_catchup.py decide`")
+
     if problems:
         for line in problems:
             print(f"FAIL {line}")
@@ -491,6 +517,83 @@ def cmd_check_wiring():
     )
     print("VERDICT: PASS")
     return 0
+
+
+
+# ---------------------------------------------------------------- разбор ШАГОВ, а не текста
+#
+# Класс дефекта, который эти хелперы закрывают (`C-096` B-1/B-2/B-3): барьер склеивал тела
+# `run:` в одну строку и искал в ней подстроку. Отсюда три дыры разом:
+#   · джоб из одного `echo`, упоминающего нужные имена, проходил проверку «зовёт предмет»;
+#   · `continue-on-error: true` и `if: false` на шаге не видны вовсе — они не в теле `run`;
+#   · `|| true` в конце команды превращает падение в успех, оставаясь «тем же текстом».
+# Барьер обязан мерить ИСХОД ШАГА, а не выражение внутри него (`testing.md`, «оракул обязан
+# мерить ТО, ЧТО ОБЕЩАЕТ»).
+
+_SWALLOW_SUFFIXES = ("|| true", "|| :", "; true", "; :", "|| exit 0")
+
+
+def _steps(job):
+    """Список шагов джоба; всегда список словарей."""
+    if not isinstance(job, dict):
+        return []
+    return [st for st in (job.get("steps") or []) if isinstance(st, dict)]
+
+
+def _step_is_disarmed(step):
+    """Шаг обезврежен: его падение не роняет джоб, либо он не исполняется вовсе.
+
+    Возвращает причину (str) или None. `if:` со ЗНАЧЕНИЕМ, а не только `false`: любое
+    статическое выражение, отключающее шаг, — тот же эффект.
+    """
+    if step.get("continue-on-error") in (True, "true"):
+        return "continue-on-error: true"
+    cond = step.get("if")
+    if isinstance(cond, (bool, str)):
+        c = str(cond).strip().lower()
+        if c in ("false", "${{ false }}", "0"):
+            return f"if: {cond!r} — шаг никогда не исполняется"
+    run = step.get("run")
+    if isinstance(run, str):
+        for line in run.splitlines():
+            t = line.split("#", 1)[0].strip()
+            if not t:
+                continue
+            for suf in _SWALLOW_SUFFIXES:
+                if t.endswith(suf):
+                    return f"команда глушит код возврата: {t!r}"
+    return None
+
+
+def _job_is_disarmed(job):
+    if isinstance(job, dict) and job.get("continue-on-error") in (True, "true"):
+        return "continue-on-error: true на самом джобе"
+    return None
+
+
+def _invokes(job, needle):
+    """Команда `needle` стоит В ПОЗИЦИИ КОМАНДЫ хотя бы в одном шаге.
+
+    Отличие от подстроки — принципиальное: `echo "deploy_catchup.py ок"` не считается
+    вызовом. Строка очищается от комментария, режется по разделителям команд (`&&`, `||`,
+    `;`, `|`), и `needle` обязан открывать один из сегментов. Предел назван честно: полного
+    разбора shell тут нет, поэтому `eval`/переменная в имени команды барьером не ловятся.
+    """
+    for st in _steps(job):
+        run = st.get("run")
+        if not isinstance(run, str):
+            continue
+        for line in run.splitlines():
+            body = line.split("#", 1)[0].strip()
+            if not body:
+                continue
+            for seg in re.split(r"&&|\|\||;|\|", body):
+                seg = seg.strip()
+                if seg.startswith(("sudo ", "env ")):
+                    seg = seg.split(None, 1)[1] if " " in seg else seg
+                if seg.startswith(needle):
+                    return True
+    return False
 
 
 # ---------------------------------------------------------------- check-aggregate
@@ -561,10 +664,26 @@ def cmd_check_aggregate():
         script = ""
     else:
         script = _agg_run_script(job)
-        if "deploy_catchup.py" not in script:
-            bad("A1", f"джоб `{AGG_JOB}` не зовёт `scripts/deploy_catchup.py` — джоб-пустышка")
-        if "red_deploy_catchup.sh" not in script:
-            bad("A1", f"джоб `{AGG_JOB}` не гоняет пробу `scripts/tests/red_deploy_catchup.sh`")
+        # ВЫЗОВ, а не вхождение подстроки (`C-096` B-3): джоб из одного `echo` с обоими
+        # именами проходил прежнюю проверку и всю пробу.
+        if not _invokes(job, "python3 scripts/deploy_catchup.py"):
+            bad("A1", f"джоб `{AGG_JOB}` не ЗОВЁТ `scripts/deploy_catchup.py` в позиции команды "
+                      f"(упоминание имени в `echo` вызовом не является)")
+        if not _invokes(job, "bash scripts/tests/red_deploy_catchup.sh"):
+            bad("A1", f"джоб `{AGG_JOB}` не ЗОВЁТ пробу `scripts/tests/red_deploy_catchup.sh` "
+                      f"в позиции команды")
+        # A6 — барьер обязан проверять, что ЕГО САМОГО зовут. Удаление собственного шага
+        # иначе ненаблюдаемо (`C-096` B-3 п.2; класс TD-106/TD-062 — «гейт есть, не гейтит»).
+        if not _invokes(job, "python3 scripts/deploy_catchup.py check-aggregate"):
+            bad("A6", f"`{AGG_JOB}` не зовёт `deploy_catchup.py check-aggregate` — барьер "
+                      f"CI-агрегата не исполняется, и его удаление ненаблюдаемо")
+        for st in _steps(job):
+            why = _step_is_disarmed(st)
+            if why:
+                bad("A6", f"шаг джоба `{AGG_JOB}` обезврежен ({why}) — красное не наблюдается")
+        why = _job_is_disarmed(job)
+        if why:
+            bad("A6", f"джоб `{AGG_JOB}` обезврежен ({why})")
 
     gate = jobs.get(AGG_GATE)
     if not isinstance(gate, dict):
@@ -583,6 +702,19 @@ def cmd_check_aggregate():
     # Две модели, и обе обязательны. Только «красный джоб ⇒ агрегат падает» прошёл бы
     # против условия `exit 1` без всяких условий («падать всегда»); только «всё зелено ⇒
     # агрегат проходит» прошёл бы против `exit 0` («не падать никогда»). Пара различает.
+    # A3bis — исход ДЖОБА, а не выражение внутри него (`C-096` B-2): `continue-on-error`
+    # или `if: false` на шаге агрегата оставляют `status-check` зелёным при красном стороже,
+    # то есть ровно «All checks passed» поверх неработающего механизма.
+    why = _job_is_disarmed(gate)
+    if why:
+        bad("A3", f"джоб-агрегат `{AGG_GATE}` обезврежен ({why}): его красное не блокирует merge")
+    for st in _steps(gate):
+        if isinstance(st.get("run"), str) and "needs." in st["run"]:
+            why = _step_is_disarmed(st)
+            if why:
+                bad("A3", f"шаг `{AGG_GATE}`, несущий fail-closed условие, обезврежен ({why}) — "
+                          f"агрегат станет success при красном джобе")
+
     gate_script = _agg_run_script(gate)
     if not gate_script:
         bad("A3", f"у `{AGG_GATE}` нет ни одного шага `run` — решать нечем")

@@ -42,6 +42,7 @@ FAILED_NAMES=()
 # --- уборка фикстур: РЕЕСТР В ФАЙЛЕ + trap EXIT (harness-track.md §5 п.5) ---------------
 # Класс, давший 10 400 каталогов в /tmp и диск на 100 %: фикстуры, о которых знал только
 # живой процесс. Реестр переживает падение процесса, поэтому уборка — файловая.
+TMP_BEFORE_PRE="$(find "${TMPDIR:-/tmp}" -maxdepth 1 -type d -name 'red-catchup-*' 2>/dev/null | wc -l)"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/red-catchup-XXXXXX")"
 REGISTRY="${WORK}/.fixtures"
 : > "${REGISTRY}"
@@ -54,7 +55,10 @@ REGISTRY="${WORK}/.fixtures"
 # течёт», на деле зависела от того, кто ещё работает на хосте. Тот же класс, что барьер
 # ресурсных оракулов: «мерит прокси вместо ресурса».
 own_dirs() { find "${TMPDIR:-/tmp}" -maxdepth 1 -type d -name 'red-catchup-*' 2>/dev/null | wc -l; }
-TMP_BEFORE="$(own_dirs)"
+# База снимается ДО создания своего каталога и сверяется ПОСЛЕ явной уборки — иначе
+# обе величины содержат `WORK` и разность нулевая при ЛЮБОМ поведении `cleanup()`
+# (`C-096` B-4: страж был вакуумен и не наблюдал собственную утечку).
+TMP_BEFORE="${TMP_BEFORE_PRE:-$(own_dirs)}"
 
 register() { printf '%s\n' "$1" >> "${REGISTRY}"; }
 
@@ -415,6 +419,34 @@ expect_aggregate A4-джоб-пустышка 1 \
 expect_aggregate A5-агрегат-падает-всегда 1 \
   "$(mutate_ci a5 'jobs["status-check"]["steps"][0]["run"]="echo forced; exit 1"')" mut
 
+
+# --- C-096: сценарии на семь пропущенных стабов ------------------------------------------
+# Каждый ловится ТОЛЬКО после фикса своего класса; до него все семь давали 45/45 PASS.
+# Класс общий: барьер мерил ТЕКСТ (склейку `run:`), а обещал ИСХОД ШАГА.
+
+# W17/W18 — единственный канал эскалации HOLD снимается одной строкой (`C-096` B-1).
+expect_wiring W17-decide-continue-on-error 1 \
+  "$(mutate_yml w17 'st=[x for x in jobs["catchup"]["steps"] if isinstance(x.get("run"),str) and "decide" in x["run"]][0]; st["continue-on-error"]=True')" mut
+expect_wiring W18-decide-глушит-код 1 \
+  "$(mutate_yml w18 'st=[x for x in jobs["catchup"]["steps"] if isinstance(x.get("run"),str) and "decide" in x["run"]][0]; st["run"]=st["run"].rstrip()+" || true"')" mut
+
+# A7/A8 — агрегат обезврежен модификатором шага: «All checks passed» поверх красного сторожа
+#         (`C-096` B-2). Барьер обязан мерить исход джоба, а не выражение внутри него.
+expect_aggregate A7-агрегат-continue-on-error 1 \
+  "$(mutate_ci a7 'jobs["status-check"]["steps"][0]["continue-on-error"]=True')" mut
+expect_aggregate A8-агрегат-отключён-if 1 \
+  "$(mutate_ci a8 'jobs["status-check"]["steps"][0]["if"]="false"')" mut
+
+# A9 — удалён шаг, зовущий САМ барьер: класс TD-106/TD-062 «гейт есть, но не гейтит»
+#      (`C-096` B-3 п.2). Барьер обязан проверять, что его самого вызывают.
+expect_aggregate A9-барьер-не-зовётся 1 \
+  "$(mutate_ci a9 'jobs["deploy-catchup"]["steps"]=[x for x in jobs["deploy-catchup"]["steps"] if not (isinstance(x.get("run"),str) and "check-aggregate" in x["run"])]')" mut
+
+# A10 — джоб-ПУСТЫШКА с ОБОИМИ именами в `echo` (`C-096` B-3 п.1). Прежний A4 ловился
+#       грепом лишь потому, что в его теле не было второго имени; допиши — и ловля исчезала.
+expect_aggregate A10-echo-с-обоими-именами 1 \
+  "$(mutate_ci a10 'jobs["deploy-catchup"]["steps"]=[{"run":"echo \"scripts/deploy_catchup.py и scripts/tests/red_deploy_catchup.sh ок\""}]')" mut
+
 # ========================================================================================
 # ЧАСТЬ 3 — МУТАЦИОННЫЙ КОНТРОЛЬ (--battery): равенство kill-set'ов
 # ========================================================================================
@@ -541,6 +573,7 @@ fi
 
 # ========================================================================================
 
+cleanup                      # ЯВНО, до замера: trap EXIT сработает позже вердикта
 TMP_AFTER="$(own_dirs)"
 echo
 echo "=============================================================================="
