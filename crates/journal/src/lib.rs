@@ -29,8 +29,9 @@ pub use segments::{
 pub use segments::{
     declare_legacy, fingerprint, free_bytes, is_foreign_segment, is_storage_guard, prune_segment,
     replay_digest, segments as list_segments, storage_status, stream, stream_from, stream_from_at,
-    verify_cold_copy, ColdCopyProof, EpochFilter, EventStream, ReplayDigest, SegmentInfo,
-    StorageStatus, TailHint, WriterConfig, LEGACY_MANIFEST,
+    stream_from_at_with_catalog, verify_cold_copy, ColdCopyProof, EpochFilter, EventStream,
+    ReplayDigest, SegmentCatalog, SegmentInfo, SegmentOps, StorageStatus, TailHint, WriterConfig,
+    LEGACY_MANIFEST,
 };
 pub use segments::{
     retention_execute, retention_plan, segment_decision_ts, RetentionMode, RetentionPlan,
@@ -442,7 +443,8 @@ pub fn read_all(dir: impl AsRef<Path>) -> io::Result<Vec<Event>> {
     // JR-I-11 (M-52, TD-030): guard монотонности — офлайн-диагностика (`read_all`) обязана
     // отказать на re-stitch'нутом каталоге так же, как прод-путь `stream`, а не молча
     // отдать тихий беспорядок seq. Дёшево: только заголовки, не тело сегментов.
-    segments::check_monotonic_paths(dir, &segs)?;
+    let mut ops: segments::SegmentOps = 0;
+    segments::check_monotonic_paths(dir, &segs, &mut ops)?;
     let mut out = Vec::new();
     for seg in segs {
         out.extend(segments::read_segment_events(&seg, true)?);
@@ -462,6 +464,13 @@ pub fn read_all(dir: impl AsRef<Path>) -> io::Result<Vec<Event>> {
 pub fn recover(dir: impl AsRef<Path>) -> io::Result<Vec<Event>> {
     let dir = dir.as_ref();
     let segs = segments::iter_segments_sorted(dir)?;
+    // JR-I-11 (M-52, TD-030): толерантность `recover` к CRC/torn-фреймам ВНУТРИ сегмента
+    // не разрешает менять порядок МЕЖДУ сегментами. Guard монотонности `first_seq` идёт
+    // ПЕРВЫМ — до tolerant-чтения — и отказывает на re-stitch'нутом каталоге так же, как
+    // `stream`/`read_all`, а не отдаёт тихий беспорядок seq. До закрытия TD-141 читать
+    // инвариант как «держится на всех путях, КРОМЕ recover» — теперь КРОМЕ снято.
+    let mut ops: segments::SegmentOps = 0;
+    segments::check_monotonic_paths(dir, &segs, &mut ops)?;
     let mut out = Vec::new();
     for seg in segs {
         out.extend(segments::read_segment_events(&seg, false)?);

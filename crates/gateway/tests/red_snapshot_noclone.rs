@@ -29,28 +29,53 @@
 //! COMPILE-RED: `Reducer::finish_ref(&self)` ещё не существует (задача 1 milestone'а).
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+use std::cell::Cell;
 
 use contracts::{to_fixed, DataSource, EventKind, Level, MdPayload, Side, Venue};
 use gateway::{Cursor, Selector};
 use journal::{EpochFilter, Journal, WriterConfig};
 
-static CUR: AtomicUsize = AtomicUsize::new(0);
-static PEAK: AtomicUsize = AtomicUsize::new(0);
+// УЧЁТ ПОТОКОВЫЙ, А НЕ ПРОЦЕССНЫЙ (флак required-чека `main`, 2026-08-16).
+//
+// Прежняя редакция вела `CUR`/`PEAK` в `AtomicUsize` на весь процесс, а `cargo test` гоняет
+// три теста этого бинаря (`o1`/`o2`/`o3`) ПАРАЛЛЕЛЬНЫМИ потоками. `PEAK.fetch_max` брал
+// максимум по ВСЕМУ процессу, поэтому аллокации соседа попадали прямо в замер `o1`, и
+// отношение `alloc_big/alloc_small` становилось подбрасыванием монеты. Наблюдалось на ОДНОМ
+// И ТОМ ЖЕ дереве: PR-прогон зелёный, прогон на `main` — красный (`f8f6ae2`).
+//
+// `testing.md` («Целостность гейта», свойство 2) требует ровно этого: ресурсный оракул на
+// глобальном счётчике обязан быть single-threaded-по-замеру, конфаундинг-величину держать
+// КОНСТАНТНОЙ, варьировать только измеряемую. Потоковый учёт делает конфаундер (соседний
+// тест) структурно недостижимым, вместо того чтобы удерживать его дисциплиной запуска.
+//
+// `const`-инициализатор обязателен: он исключает ленивую инициализацию TLS, а значит и
+// повторный вход в аллокатор из самого аллокатора. `try_with` — на время разрушения TLS,
+// когда доступ уже невозможен: такую аллокацию мы просто не считаем (она вне замера).
+thread_local! {
+    static T_CUR: Cell<usize> = const { Cell::new(0) };
+    static T_PEAK: Cell<usize> = const { Cell::new(0) };
+}
 
 struct Counting;
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, l: Layout) -> *mut u8 {
         let p = System.alloc(l);
         if !p.is_null() {
-            let c = CUR.fetch_add(l.size(), SeqCst) + l.size();
-            PEAK.fetch_max(c, SeqCst);
+            let _ = T_CUR.try_with(|cur| {
+                let c = cur.get().saturating_add(l.size());
+                cur.set(c);
+                let _ = T_PEAK.try_with(|pk| {
+                    if c > pk.get() {
+                        pk.set(c);
+                    }
+                });
+            });
         }
         p
     }
     unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
         System.dealloc(p, l);
-        CUR.fetch_sub(l.size(), SeqCst);
+        let _ = T_CUR.try_with(|cur| cur.set(cur.get().saturating_sub(l.size())));
     }
 }
 #[global_allocator]
@@ -58,10 +83,11 @@ static GA: Counting = Counting;
 
 /// Пиковая аллокация (дельта над базой) во время `f`.
 fn peak_delta<R>(f: impl FnOnce() -> R) -> (R, usize) {
-    let base = CUR.load(SeqCst);
-    PEAK.store(base, SeqCst);
+    let base = T_CUR.with(|c| c.get());
+    T_PEAK.with(|p| p.set(base));
     let r = f();
-    (r, PEAK.load(SeqCst).saturating_sub(base))
+    let peak = T_PEAK.with(|p| p.get());
+    (r, peak.saturating_sub(base))
 }
 
 const BASE_MS: i64 = 1_784_116_800_000;

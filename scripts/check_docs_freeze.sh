@@ -73,7 +73,7 @@ in_zone() {
 tok() {
   local body
   body=$(git log -1 --format='%b' "$1" 2>/dev/null) || return 1
-  printf '%s\n' "$body" | grep -qE '^FOUNDER-APPROVED: .{12,}'
+  grep -qE '^FOUNDER-APPROVED: .{12,}' <<<"$body"
 }
 
 # ─── ТРОГАЕТ ЛИ КОММИТ ЗОНУ ──────────────────────────────────────────────────────────

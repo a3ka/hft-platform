@@ -47,7 +47,7 @@ provenance-тегом (CT-RFC-02); детерминированный live-жу�
 | 2 | ⏳ | `verify_M-16.sh` | architect | exit=0 на GREEN |
 | 3 | ⏳ | Импортёр Binance (`data.binance.vision`: aggTrades + futures bookDepth) → MdEvent + provenance | research-dev | HI-I-1/2/3 GREEN |
 | 4 | ⏳ | Импортёр HL (CC0 l2Book снапшоты + fills) → MdEvent + provenance | research-dev | HI-I-1/2/5 GREEN |
-| 5 | ⏳ | Прогон OBI (M-10) на РАСШИРЕННОМ окне (own+imported, эпоха названа) → обновить R-001 достоверность | research-dev | окно шире; вердикт эпоху называет |
+| 5 | ⏳ | Прогон OBI (M-10) на РАСШИРЕННОМ окне (own+imported, эпоха названа) → обновить достоверность отчёта OBI (задача 8 `M-04`; номер артефакта — от `scripts/next_artifact_id.sh R` в момент создания, `TD-139` п.в) | research-dev | окно шире; вердикт эпоху называет |
 
 ## Гейты
 

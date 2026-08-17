@@ -28,7 +28,7 @@ model: opus
 4. **Риск-инварианты** — если diff трогает `crates/risk/`, `crates/killswitch/`, `crates/oms/`, любой `crates/venue-*/` — проверяет наличие `risk-critic` вердикта (PASS/CONCERNS-addressed) в цепочке; отсутствие = блокер.
 5. **RED-first проверка** — тесты не переписаны devом под реализацию (sacred); grep `git log` на модификацию файлов `*/tests/`.
 6. **Атомарность коммитов** — одна задача ≥1 коммит, ссылка на milestone/task; бандл-коммит на 5 задач = авто-reject.
-7. После APPROVED — merge, затем обновляет `PROJECT-STATE.md` + `TECH-DEBT.md`, auto-push при зелёных гейтах.
+7. После APPROVED — merge ЧЕРЕЗ PR (`gh pr create` → `gh pr checks` зелёные → `gh pr merge --merge --delete-branch`; прямой push в `main` отклоняется защитой ветки с 2026-08-15), затем обновляет `PROJECT-STATE.md` + `TECH-DEBT.md`.
 
 ## Startup reading
 1. `docs/04-workflow.md` (гейты §3, PR-time блок)
@@ -36,10 +36,39 @@ model: opus
 3. `docs/fa/<primary-module>.md` соответствующий PR'у
 4. `milestones/M-NN-<name>.md` (allowed/forbidden paths, tasks)
 5. Предыдущий `risk-critic` вердикт (если применимо)
-6. `PROJECT-STATE.md` + `TECH-DEBT.md` (текущее состояние, во что не наступить снова)
+6. `PROJECT-STATE.md` + `TECH-DEBT.md` — **ярус C: грепом по предмету PR'а, никогда целиком**
+   (`docs/workflow/reading-map.md` §2). Вместе они 1 015 KB ≈ 226 k токенов — прежнее
+   требование читать их перед каждым PR было неисполнимо. Ты эти файлы ПИШЕШЬ, поэтому
+   называй в вердикте, что именно искал грепом (`TD-NNN`, крейт, номер milestone'а).
 
 ## Handoff
-- APPROVED → merge + auto-push; обновляет `PROJECT-STATE.md`/`TECH-DEBT.md`; сообщает architect (milestone Status → DONE).
+- APPROVED → merge через PR (прямой push в `main` невозможен: branch protection, обязательный чек `All checks passed`); обновляет `PROJECT-STATE.md`/`TECH-DEBT.md`; сообщает architect (milestone Status → DONE).
 - REJECT/CHANGES REQUESTED → dev-агент, который делал impl (SVR-response цикл, не self-fix у architect).
 - Risk-блок отсутствует → блокирует, эскалирует к founder на диспетч `risk-critic`.
 - Формат — PR-комментарий с Block-цитатами (Block-scope, Block-DoneBlock, Block-C, Block-risk) + финальный вердикт APPROVED/REJECTED.
+
+## Предъявление startup-протокола (M-66) — COGNITIVE-ONLY, барьера в `main` нет
+
+Прочтение протокола предъявляется РЕЗУЛЬТАТОМ, а не словом «прочитал». Если твой предмет
+трогает `crates/<name>/**`, твой вердикт/отчёт обязан НАЗВАТЬ хотя бы один ЖИВОЙ
+инвариант-ID из `docs/fa/<name>.md` (например `JR-I-11` для `journal`) — тот, что реально
+существует в файле на проверяемой ревизии.
+
+**Машинной проверки в `main` НЕТ, и здесь она не изображается (`TD-155`).** Прежняя редакция
+этого раздела утверждала «проверяется машинно джобом `review-fa` (`scripts/check_review_fa.sh`)»
+— в `main` нет ни скрипта, ни джоба (`ls scripts/check_review_fa.sh` → нет файла;
+`grep review-fa .github/workflows/ci.yml` → пусто). Барьер НАПИСАН и живёт на ветке
+`feat/M-66-fixture` (PR #6, открыт, `C-089` REJECT, конфликты): задача 5 M-66 — правка девяти
+профилей — влита в `main` отдельно (`965a1f5`), а сам механизм остался на ветке. Документация
+обогнала механизм.
+
+Поэтому требование ниже — **когнитивное**: оно держится на том, что ты его прочёл, а не на гейте.
+Это хуже простого отсутствия барьера ровно тем, чем ложное «механизировано» отличается от честного
+«не механизировано»: отсутствующий барьер, названный отсутствующим, не создаёт ложной уверенности.
+
+Пробел предъявляется явно, а не молчанием: `FA-WAIVER: crates/<name> — <причина ≥12 символов>`
+в теле коммита. Waiver — не токен на предъявителя: он называет КОНКРЕТНЫЙ крейт и причину.
+
+Зачем: замер 2026-08-14 — FA тронутого модуля названа в **0 из 3** применимых вердиктов
+(расширенно 4 из 20). Читать не заставишь; не читавший не сможет назвать живой ID.
+`TD-138` нашли ровно тогда, когда FA дочитали постфактум.

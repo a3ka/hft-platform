@@ -1,9 +1,9 @@
-[M-32] reading journal dir=/tmp/m33-journal epochs=["own-2026-07"]
-[M-32] window: first_ts_ms=1784871617235 last_ts_ms=1784883768642 span_ms=12151407 l2delta=121241 trades=291623
+[M-58] reading journal dir=/home/nous/fixtures/m59-segment78 epochs=["own-2026-07"]
+[M-58] window: first_ts_ms=1784871617235 last_ts_ms=1784883768642 span_ms=12151407 l2delta=121241 trades=291623
 
-=== M-32 Q2а — depth_lifetime::analyze (DV-I-1..5) ===
+=== M-58 — depth_lifetime::analyze (DV-I-1..14, lives_* per band) ===
 gaps: 0 (sequence-разрывы continuity)
-side     band_bps   born     cancelled  frozen     censored   cancel_frac near_vs_far
+side     band_bps   lives_born lives_cancelled lives_frozen lives_censored cancel_frac near_vs_far
 bid      [0,150)    315200   312693     2507       0          0.992      NEAR      
 bid      [150,300)  4012     3480       532        0          0.867      MID       
 bid      [300,500)  652      465        187        0          0.713      MID       
@@ -19,13 +19,13 @@ ask      [800,1500) 85       21         64         0          0.247      FAR
 ask      [1500,3000) 1292     1205       87         0          0.933      FAR       
 ask      [3000,6000) 67       27         40         0          0.403      FAR       
 
-=== Сводка NEAR (≤150bps) vs FAR (≥500bps) ===
-NEAR: born=608210 cancelled=602778 frozen=5432 censored=0 cancel_fraction=0.991
-FAR : born=42162 cancelled=40682 frozen=1480 censored=0 cancel_fraction=0.965
-[M-32] running consistency over 412864 events...
+=== Сводка NEAR (≤150bps) vs FAR (≥500bps) — lives_* (M-58) ===
+NEAR: lives_born=608210 lives_cancelled=602778 lives_frozen=5432 lives_censored=0 cancel_fraction=0.991
+FAR : lives_born=42162 lives_cancelled=40682 lives_frozen=1480 lives_censored=0 cancel_fraction=0.965
+[M-58] running consistency over 412864 events...
 
-=== M-32 Q2б — orderflow::consistency (DV-I-6) ===
+=== orderflow::consistency (DV-I-6) ===
 checked=291623 consistent=276940 inconsistent=14683 consistency_rate=0.950
 
 === Сводный JSON ===
-{"epoch_ids":["own-2026-07"],"first_ts_ms":1784871617235,"last_ts_ms":1784883768642,"l2delta_count":121241,"trade_count":291623,"gaps":0,"bands":[{"side":"buy","lo_bps":0,"hi_bps":150,"born":315200,"cancelled":312693,"frozen":2507,"censored":0,"cancel_fraction":0.992046},{"side":"buy","lo_bps":150,"hi_bps":300,"born":4012,"cancelled":3480,"frozen":532,"censored":0,"cancel_fraction":0.867398},{"side":"buy","lo_bps":300,"hi_bps":500,"born":652,"cancelled":465,"frozen":187,"censored":0,"cancel_fraction":0.713190},{"side":"buy","lo_bps":500,"hi_bps":800,"born":1669,"cancelled":1473,"frozen":196,"censored":0,"cancel_fraction":0.882564},{"side":"buy","lo_bps":800,"hi_bps":1500,"born":14457,"cancelled":13937,"frozen":520,"censored":0,"cancel_fraction":0.964031},{"side":"buy","lo_bps":1500,"hi_bps":3000,"born":23945,"cancelled":23501,"frozen":444,"censored":0,"cancel_fraction":0.981458},{"side":"buy","lo_bps":3000,"hi_bps":6000,"born":463,"cancelled":404,"frozen":59,"censored":0,"cancel_fraction":0.872570},{"side":"sell","lo_bps":0,"hi_bps":150,"born":293010,"cancelled":290085,"frozen":2925,"censored":0,"cancel_fraction":0.990017},{"side":"sell","lo_bps":150,"hi_bps":300,"born":2009,"cancelled":1772,"frozen":237,"censored":0,"cancel_fraction":0.882031},{"side":"sell","lo_bps":300,"hi_bps":500,"born":167,"cancelled":70,"frozen":97,"censored":0,"cancel_fraction":0.419162},{"side":"sell","lo_bps":500,"hi_bps":800,"born":184,"cancelled":114,"frozen":70,"censored":0,"cancel_fraction":0.619565},{"side":"sell","lo_bps":800,"hi_bps":1500,"born":85,"cancelled":21,"frozen":64,"censored":0,"cancel_fraction":0.247059},{"side":"sell","lo_bps":1500,"hi_bps":3000,"born":1292,"cancelled":1205,"frozen":87,"censored":0,"cancel_fraction":0.932663},{"side":"sell","lo_bps":3000,"hi_bps":6000,"born":67,"cancelled":27,"frozen":40,"censored":0,"cancel_fraction":0.402985}],"faith":{"checked":291623,"consistent":276940,"inconsistent":14683}}
+{"epoch_ids":["own-2026-07"],"first_ts_ms":1784871617235,"last_ts_ms":1784883768642,"l2delta_count":121241,"trade_count":291623,"gaps":0,"bands":[{"side":"buy","lo_bps":0,"hi_bps":150,"lives_born":315200,"lives_cancelled":312693,"lives_frozen":2507,"lives_censored":0,"cancel_fraction":0.992046},{"side":"buy","lo_bps":150,"hi_bps":300,"lives_born":4012,"lives_cancelled":3480,"lives_frozen":532,"lives_censored":0,"cancel_fraction":0.867398},{"side":"buy","lo_bps":300,"hi_bps":500,"lives_born":652,"lives_cancelled":465,"lives_frozen":187,"lives_censored":0,"cancel_fraction":0.713190},{"side":"buy","lo_bps":500,"hi_bps":800,"lives_born":1669,"lives_cancelled":1473,"lives_frozen":196,"lives_censored":0,"cancel_fraction":0.882564},{"side":"buy","lo_bps":800,"hi_bps":1500,"lives_born":14457,"lives_cancelled":13937,"lives_frozen":520,"lives_censored":0,"cancel_fraction":0.964031},{"side":"buy","lo_bps":1500,"hi_bps":3000,"lives_born":23945,"lives_cancelled":23501,"lives_frozen":444,"lives_censored":0,"cancel_fraction":0.981458},{"side":"buy","lo_bps":3000,"hi_bps":6000,"lives_born":463,"lives_cancelled":404,"lives_frozen":59,"lives_censored":0,"cancel_fraction":0.872570},{"side":"sell","lo_bps":0,"hi_bps":150,"lives_born":293010,"lives_cancelled":290085,"lives_frozen":2925,"lives_censored":0,"cancel_fraction":0.990017},{"side":"sell","lo_bps":150,"hi_bps":300,"lives_born":2009,"lives_cancelled":1772,"lives_frozen":237,"lives_censored":0,"cancel_fraction":0.882031},{"side":"sell","lo_bps":300,"hi_bps":500,"lives_born":167,"lives_cancelled":70,"lives_frozen":97,"lives_censored":0,"cancel_fraction":0.419162},{"side":"sell","lo_bps":500,"hi_bps":800,"lives_born":184,"lives_cancelled":114,"lives_frozen":70,"lives_censored":0,"cancel_fraction":0.619565},{"side":"sell","lo_bps":800,"hi_bps":1500,"lives_born":85,"lives_cancelled":21,"lives_frozen":64,"lives_censored":0,"cancel_fraction":0.247059},{"side":"sell","lo_bps":1500,"hi_bps":3000,"lives_born":1292,"lives_cancelled":1205,"lives_frozen":87,"lives_censored":0,"cancel_fraction":0.932663},{"side":"sell","lo_bps":3000,"hi_bps":6000,"lives_born":67,"lives_cancelled":27,"lives_frozen":40,"lives_censored":0,"cancel_fraction":0.402985}],"faith":{"checked":291623,"consistent":276940,"inconsistent":14683}}
