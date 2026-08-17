@@ -26,6 +26,14 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SUT="${ROOT}/scripts/deploy_catchup.py"
 DEPLOY_YML="${ROOT}/.github/workflows/deploy.yml"
+CI_YML="${ROOT}/.github/workflows/ci.yml"
+
+# Код возврата, которым HOLD ЗОВЁТ ЧЕЛОВЕКА (`C-093` R-2). Ноль здесь означал бы, что
+# «сторож сработал» и «всё хорошо» — одно и то же состояние для GitHub Actions: job зелёный,
+# deploy skipped, ран терминально зелёный, то есть ВНЕШНЕ НЕОТЛИЧИМЫЙ от успешной доставки.
+# Единица занята отказом входа (`Fail`): сливать «зову человека» с «я сломался» нельзя —
+# это разные состояния с разными действиями оператора.
+HOLD_RC=2
 
 PASS=0
 FAIL=0
@@ -37,7 +45,16 @@ FAILED_NAMES=()
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/red-catchup-XXXXXX")"
 REGISTRY="${WORK}/.fixtures"
 : > "${REGISTRY}"
-TMP_BEFORE="$(find "${TMPDIR:-/tmp}" -maxdepth 1 -type d 2>/dev/null | wc -l)"
+# Замер уборки считает СВОИ каталоги по префиксу, а не всё содержимое TMPDIR.
+#
+# Прежняя редакция брала `find "${TMPDIR}" -maxdepth 1 -type d | wc -l` — то есть мерила
+# ОКРУЖЕНИЕ, а не собственный инвариант (`testing.md`, целостность гейта, свойство 2).
+# Замер 17.08 при параллельно работавшем агенте: «до 4539, после 4543» при НУЛЕ своих
+# каталогов — четыре `tmp.*` завёл чужой процесс. Величина, которую читают как «проба
+# течёт», на деле зависела от того, кто ещё работает на хосте. Тот же класс, что барьер
+# ресурсных оракулов: «мерит прокси вместо ресурса».
+own_dirs() { find "${TMPDIR:-/tmp}" -maxdepth 1 -type d -name 'red-catchup-*' 2>/dev/null | wc -l; }
+TMP_BEFORE="$(own_dirs)"
 
 register() { printf '%s\n' "$1" >> "${REGISTRY}"; }
 
@@ -84,8 +101,13 @@ expect_decision() {
   [ -f "${runs}" ] || { setup_fail "${name}" "фикстура ранов не создана: ${runs}"; return; }
   run_decide "${target}" "${deployed}" "${runs}"
   local got; got="$(printf '%s\n' "${OUT}" | sed -n 's/^decision=//p' | head -1)"
-  if [ "${RC}" -ne 0 ]; then
-    nok "${name}" "exit=${RC}, ожидалось решение ${want}; вывод: $(printf '%s' "${OUT}" | head -2 | tr '\n' ' ')"
+  # ЭСКАЛАЦИЯ — часть контракта решения, а не косметика вывода. HOLD обязан выйти
+  # НЕНУЛЕВЫМ (иначе он не наблюдаем человеком), DEPLOY/SKIP — нулевым (иначе «падать
+  # всегда» прошло бы проверку HOLD вакуумно, а рабочий добор был бы сломан).
+  local want_rc=0
+  [ "${want}" = "HOLD" ] && want_rc="${HOLD_RC}"
+  if [ "${RC}" -ne "${want_rc}" ]; then
+    nok "${name}" "exit=${RC}, ожидалось ${want_rc} при решении ${want}; вывод: $(printf '%s' "${OUT}" | head -2 | tr '\n' ' ')"
     return
   fi
   if [ "${got}" != "${want}" ]; then
@@ -317,6 +339,82 @@ expect_wiring W15-CI-гейт-не-fail-closed 1 "$(mutate_yml w15 'jobs["ci"]["
 #       и «работает», а на прод уезжает не та вершина, чей CI проверялся.
 expect_wiring W16-выкатка-по-ветке       1 "$(mutate_yml w16 'jobs["deploy"]["steps"][-1]["with"]["script"]=jobs["deploy"]["steps"][-1]["with"]["script"].replace("git reset --hard -q \"$TARGET_SHA\"","git reset --hard -q origin/main")')" mut
 
+
+# ========================================================================================
+# ЧАСТЬ 2bis — CI-АГРЕГАТ (`C-093` R-1): красный джоб обязан РОНЯТЬ «All checks passed»
+# ========================================================================================
+#
+# Дыра, ради которой эта часть существует, замерена критиком: `ci.yml` не была в универсуме
+# пробы ВООБЩЕ — она знала ровно предмет и `deploy.yml`. Поэтому два независимых стаба
+# («джоб выкинут из условия агрегата» и «выкинут и из `needs`, и из условия») сохраняли
+# полный зелёный прогон 39/39: для пробы стаб и честная проводка были НЕОТЛИЧИМЫ.
+#
+# Проверка идёт ПО ВЫЗОВУ: барьер извлекает условие агрегата, подставляет модель результатов
+# и ИСПОЛНЯЕТ полученный bash. `grep` по имени джоба здесь бесполезен — он зелен и против
+# закомментированной строки, и против упоминания в соседнем `echo`.
+
+mutate_ci() {                       # имя, python-выражение над `wf`/`jobs`
+  local tag="$1" expr="$2"
+  local out="${WORK}/ci-${tag}.yml"
+  CI_SRC="${CI_YML}" CI_OUT="${out}" MUT_EXPR="${expr}" python3 - <<'PY' || return 1
+import os, sys, yaml
+src, out, expr = os.environ["CI_SRC"], os.environ["CI_OUT"], os.environ["MUT_EXPR"]
+wf = yaml.safe_load(open(src, encoding="utf-8"))
+jobs = wf["jobs"]
+exec(expr)
+yaml.safe_dump(wf, open(out, "w", encoding="utf-8"), allow_unicode=True, sort_keys=False)
+PY
+  register "${out}"
+  printf '%s' "${out}"
+}
+
+expect_aggregate() {                # имя, ожидаемый rc, путь к ci.yml, guard?
+  local name="$1" want_rc="$2" yml="$3" guard="${4:-}"
+  [ -f "${yml}" ] || { setup_fail "${name}" "фикстура ci.yml не создана: ${yml}"; return; }
+  # setup-guard: мутация обязана ОТЛИЧАТЬСЯ от эталона. Проба, молча тестирующая не тот
+  # сценарий, — плацебо самой себя (`testing.md`, целостность гейта, свойство 3).
+  if [ -n "${guard}" ]; then
+    local a b
+    a="$(python3 -c 'import yaml,sys;print(yaml.safe_dump(yaml.safe_load(open(sys.argv[1],encoding="utf-8")),sort_keys=False,allow_unicode=True))' "${CI_YML}")"
+    b="$(cat "${yml}")"
+    if [ "${a}" = "${b}" ]; then
+      setup_fail "${name}" "мутация не состоялась — ci.yml совпал с эталоном (${guard})"
+      return
+    fi
+  fi
+  local out rc
+  out="$(CATCHUP_CI_YML="${yml}" CATCHUP_REPO_ROOT="${ROOT}" python3 "${SUT}" check-aggregate 2>&1)"; rc=$?
+  if [ "${rc}" -ne "${want_rc}" ]; then
+    nok "${name}" "exit=${rc}, ожидалось ${want_rc}; вывод: $(printf '%s' "${out}" | head -2 | tr '\n' ' ')"
+    return
+  fi
+  ok "${name}" "exit=${rc}"
+}
+
+# A0 — ПОЗИТИВНЫЙ КОНТРОЛЬ. Без него вся группа могла бы быть вечно-красной, и её «объявили
+#      бы шумом и выключили» (harness-track.md §5 п.2).
+expect_aggregate A0-честный-ci-агрегат 0 "${CI_YML}"
+
+# A1/A2 — ДВА СТАБА КРИТИКА, дословно из `C-093` R-1. Оба давали 39/39 PASS до этой части.
+expect_aggregate A1-джоб-вне-условия 1 \
+  "$(mutate_ci a1 'st=jobs["status-check"]["steps"][0]; st["run"]=st["run"].replace(" || \"${{ needs.deploy-catchup.result }}\" != \"success\"","")')" mut
+expect_aggregate A2-джоб-вне-needs-и-условия 1 \
+  "$(mutate_ci a2 'st=jobs["status-check"]["steps"][0]; st["run"]=st["run"].replace(" || \"${{ needs.deploy-catchup.result }}\" != \"success\"",""); jobs["status-check"]["needs"]=[n for n in jobs["status-check"]["needs"] if n!="deploy-catchup"]')" mut
+
+# A3 — джоба нет вовсе: сторож не проводится в CI.
+expect_aggregate A3-джоба-нет 1 \
+  "$(mutate_ci a3 'jobs.pop("deploy-catchup"); jobs["status-check"]["needs"]=[n for n in jobs["status-check"]["needs"] if n!="deploy-catchup"]')" mut
+
+# A4 — джоб-ПУСТЫШКА: имя на месте, в needs и в условии, но предмет не зовётся. Ровно тот
+#      случай, который grep по имени пропускает, а проверка по вызову обязана поймать.
+expect_aggregate A4-джоб-пустышка 1 \
+  "$(mutate_ci a4 'jobs["deploy-catchup"]["steps"]=[{"run":"echo deploy_catchup.py ок"}]')" mut
+
+# A5 — АНТИ-ПЛАЦЕБО С ДРУГОЙ СТОРОНЫ: условие «падать всегда» проходит A1-A4 вакуумно и
+#      обязано падать здесь — иначе барьер не различает fail-closed от вечно-красного.
+expect_aggregate A5-агрегат-падает-всегда 1 \
+  "$(mutate_ci a5 'jobs["status-check"]["steps"][0]["run"]="echo forced; exit 1"')" mut
+
 # ========================================================================================
 # ЧАСТЬ 3 — МУТАЦИОННЫЙ КОНТРОЛЬ (--battery): равенство kill-set'ов
 # ========================================================================================
@@ -345,6 +443,11 @@ battery() {
     "M8-равенство-вершин-не-проверяется|s/^    if target == deployed:/    if False:/|D2-уже-на-вершине"
     "M9-форма-SHA-не-проверяется|s/^    if not SHA_RE.match(raw):/    if False:/|D16-сокращённый-target-sha"
     "M10-джоб-по-имени-не-ищется|s/^        if not vps:/        if False:/|D9-VPS-джоба-нет"
+    # M11 — СТАБ, ради которого написана эскалация (`C-093` R-2): решение верное, причина
+    #       верная, добора нет — и всё же дефект. Сторож ЗОВЁТ человека нулевым кодом, то
+    #       есть не зовёт: job зелёный, ран зелёный, HOLD неотличим от успешной доставки.
+    #       Обязан уронить РОВНО шесть HOLD-сценариев и ни одного больше.
+    "M11-HOLD-молчит-зелёным|s/^        return HOLD_RC if verdict == HOLD else 0/        return 0/|D8-VPS-упал,D9-VPS-джоба-нет,D11-успех-но-VPS-не-там,D12-два-рана-второй-упал,D13-VPS-отменён,D14-список-джобов-негоден"
   )
 
   local orig="${WORK}/sut-orig.py"
@@ -405,7 +508,9 @@ run_decide_suite() {
       [ "${RC}" -ne 0 ] || killed="${killed} ${n}"
       return
     fi
-    if [ "${RC}" -ne 0 ] || [ "${got}" != "${want}" ]; then
+    local want_rc=0
+    [ "${want}" = "HOLD" ] && want_rc="${HOLD_RC}"
+    if [ "${RC}" -ne "${want_rc}" ] || [ "${got}" != "${want}" ]; then
       killed="${killed} ${n}"; return
     fi
     printf '%s' "${OUT}" | grep -qF -- "${why}" || killed="${killed} ${n}"
@@ -436,11 +541,18 @@ fi
 
 # ========================================================================================
 
-TMP_AFTER="$(find "${TMPDIR:-/tmp}" -maxdepth 1 -type d 2>/dev/null | wc -l)"
+TMP_AFTER="$(own_dirs)"
 echo
 echo "=============================================================================="
 echo "сценариев: $((PASS + FAIL))   PASS: ${PASS}   FAIL: ${FAIL}"
-echo "каталогов в ${TMPDIR:-/tmp}: до ${TMP_BEFORE}, после ${TMP_AFTER} (уборка — trap EXIT + реестр)"
+# Уборка — не примечание, а условие merge'"'"'а (harness-track.md §5 п.5): класс, давший
+# 10 400 каталогов в /tmp и диск на 100 %. Расхождение РОНЯЕТ прогон, а не печатается.
+echo "своих каталогов (red-catchup-*): до ${TMP_BEFORE}, после ${TMP_AFTER} (уборка — trap EXIT + реестр)"
+if [ "${TMP_AFTER}" -gt "${TMP_BEFORE}" ]; then
+  echo "УТЕЧКА ФИКСТУР: осталось $((TMP_AFTER - TMP_BEFORE)) своих каталогов — реестр/trap не отработали"
+  echo "VERDICT: FAIL"
+  exit 1
+fi
 if [ "${FAIL}" -ne 0 ]; then
   printf 'упали: %s\n' "${FAILED_NAMES[*]}"
   echo "VERDICT: FAIL"

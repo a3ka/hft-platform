@@ -56,6 +56,29 @@ DEPLOY = "DEPLOY"  # добор оправдан: вершина должна б
 SKIP = "SKIP"      # добирать нечего (уже там / нет кодовой дельты / ран в полёте)
 HOLD = "HOLD"      # человеку: VPS трогали и он упал, либо ран не классифицируется
 
+# Код возврата для HOLD — НЕНУЛЕВОЙ и ОТЛИЧИМЫЙ от отказа входа (`Fail` ⇒ 1).
+#
+# Почему не 0 (находка `C-093` R-2). `emit()` печатал решение и возвращал 0 на всех путях,
+# поэтому HOLD давал ЗЕЛЁНЫЙ job `catchup`, skipped `deploy` и терминально зелёный ран
+# «Deploy to VPS» — состояние, ВНЕШНЕ НЕОТЛИЧИМОЕ от успешной доставки. Автодобора при этом
+# верно не происходило (Р-4), но и человек не узнавал ничего: сторож наблюдал сбой и не
+# наблюдал ОТСУТСТВИЕ (`testing.md`, целостность гейта, свойство 4).
+#
+# Почему не 1. Единица уже занята `Fail` — «вход не разобран, решения нет вовсе». Слить их
+# значило бы сделать «сторож сработал и зовёт человека» неотличимым от «сторож сломался»,
+# а это разные состояния с разными действиями оператора.
+#
+# ПРЕДЕЛ ЭТОГО КАНАЛА НАЗВАН, А НЕ ЗАМАСКИРОВАН. `docs/plans/process-decisions-2026-08-14.md`
+# §Варианты(б) отверг сторож-алерт словами «красный джоб в Actions никто не смотрит — это та
+# же слепота, что сейчас; Telegram — no-op без токена». Здесь тот же класс канала, и он
+# выбран НЕ потому, что хорош, а потому, что это единственное, что доступно в периметре:
+# `issues: write` потребовало бы расширения прав `GITHUB_TOKEN`, прямо запрещённого запретным
+# списком Р-4 (замер: `deploy.yml` permissions = actions:read + contents:read). Достигнутое
+# улучшение назовём точно: переход из НЕНАБЛЮДАЕМОГО (зелёный ран = успех) в СЛАБО
+# НАБЛЮДАЕМОЕ (красный ран виден в `gh run list --workflow=deploy.yml`, который architect
+# снимает каждой сессией — ярус S startup-протокола). Доставляемый алерт остаётся за `П-003`.
+HOLD_RC = 2
+
 
 class Fail(Exception):
     """Вход не разобран. Любой такой случай — exit 1, и решение НЕ выдаётся вовсе."""
@@ -317,8 +340,11 @@ def cmd_decide():
 
     verdict, reason = classify_runs(runs, target, job_name)
     if verdict is not None:
+        # emit() ДО возврата и в обоих случаях: `decision` обязан доехать до GITHUB_OUTPUT
+        # даже когда шаг падает, иначе `deploy.if` читает пустой output. Пустой ≠ 'DEPLOY',
+        # то есть fail-closed сохраняется и при потере вывода — но терять его незачем.
         emit(verdict, reason)
-        return 0
+        return HOLD_RC if verdict == HOLD else 0
 
     emit(
         DEPLOY,
@@ -467,12 +493,140 @@ def cmd_check_wiring():
     return 0
 
 
+# ---------------------------------------------------------------- check-aggregate
+
+# Барьер CI-АГРЕГАТА. Закрывает `C-093` R-1.
+#
+# Дыра, которую он закрывает, замерена критиком: проба знала ровно два файла — предмет и
+# `deploy.yml` — а `ci.yml` не была в её универсуме ВООБЩЕ. Поэтому два независимых стаба
+# («джоб выкинут из условия агрегата» и «выкинут и из `needs`, и из условия») сохраняли
+# полный зелёный прогон 39/39: стаб и честная проводка были для пробы НЕОТЛИЧИМЫ.
+#
+# Класс известен и уже стоил семи красных прогонов `main`: джоб красен, а агрегат печатает
+# «All checks passed» (`C-082` B-3). Барьер обязан проверять И `needs`, И участие в
+# fail-closed условии — второе ПО ВЫЗОВУ, а не грепом: `grep` по имени джоба зелен и против
+# закомментированной строки, и против упоминания в соседнем эхо (`testing.md`: «проверка
+# должна быть по ВЫЗОВУ (исполнением/поведением), а не по тексту»).
+
+AGG_JOB = "deploy-catchup"
+AGG_GATE = "status-check"
+
+
+def _agg_run_script(job):
+    """Конкатенация всех `run` шагов джоба — то, что реально исполняет раннер."""
+    out = []
+    for step in job.get("steps") or []:
+        if isinstance(step, dict) and isinstance(step.get("run"), str):
+            out.append(step["run"])
+    return "\n".join(out)
+
+
+def _agg_expand(script, results):
+    """Подставить `${{ needs.<job>.result }}` фактическими значениями модели."""
+    def sub(m):
+        return results.get(m.group(1), "success")
+    return re.sub(r"\$\{\{\s*needs\.([A-Za-z0-9_-]+)\.result\s*\}\}", sub, script)
+
+
+def _agg_exec(script, results, root):
+    """ИСПОЛНИТЬ условие агрегата при заданной модели результатов. Возвращает (rc, stdout)."""
+    body = _agg_expand(script, results)
+    # Оставшиеся `${{ ... }}` (github.*, env.*) обнуляем: они не участвуют в решении
+    # fail-closed условия, но синтаксически ломают bash.
+    body = re.sub(r"\$\{\{[^}]*\}\}", "", body)
+    proc = subprocess.run(
+        ["bash", "-c", body], cwd=root, capture_output=True, text=True, timeout=60
+    )
+    return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+
+
+def cmd_check_aggregate():
+    root = os.environ.get("CATCHUP_REPO_ROOT") or "."
+    ci_path = os.environ.get("CATCHUP_CI_YML") or os.path.join(
+        root, ".github", "workflows", "ci.yml"
+    )
+    wf = load_workflow(ci_path)
+    jobs = wf.get("jobs")
+    if not isinstance(jobs, dict):
+        raise Fail(f"{ci_path}: секции `jobs` нет")
+    problems = []
+
+    def bad(code, msg):
+        problems.append(f"{code}: {msg}")
+
+    # A1 — джоб существует и РЕАЛЬНО зовёт предмет, а не назван похоже.
+    job = jobs.get(AGG_JOB)
+    if not isinstance(job, dict):
+        bad("A1", f"джоба `{AGG_JOB}` в {ci_path} нет — сторож не проводится в CI вовсе")
+        script = ""
+    else:
+        script = _agg_run_script(job)
+        if "deploy_catchup.py" not in script:
+            bad("A1", f"джоб `{AGG_JOB}` не зовёт `scripts/deploy_catchup.py` — джоб-пустышка")
+        if "red_deploy_catchup.sh" not in script:
+            bad("A1", f"джоб `{AGG_JOB}` не гоняет пробу `scripts/tests/red_deploy_catchup.sh`")
+
+    gate = jobs.get(AGG_GATE)
+    if not isinstance(gate, dict):
+        bad("A2", f"джоба-агрегата `{AGG_GATE}` в {ci_path} нет")
+        gate = {}
+
+    # A2 — зависимость закреплена: без `needs` агрегат стартует, не дождавшись джоба.
+    needs = gate.get("needs")
+    if isinstance(needs, str):
+        needs = [needs]
+    if not isinstance(needs, list) or AGG_JOB not in needs:
+        bad("A2", f"`{AGG_JOB}` отсутствует в `{AGG_GATE}.needs` = {needs!r}")
+
+    # A3 — УЧАСТИЕ В РЕШЕНИИ, проверенное ИСПОЛНЕНИЕМ.
+    #
+    # Две модели, и обе обязательны. Только «красный джоб ⇒ агрегат падает» прошёл бы
+    # против условия `exit 1` без всяких условий («падать всегда»); только «всё зелено ⇒
+    # агрегат проходит» прошёл бы против `exit 0` («не падать никогда»). Пара различает.
+    gate_script = _agg_run_script(gate)
+    if not gate_script:
+        bad("A3", f"у `{AGG_GATE}` нет ни одного шага `run` — решать нечем")
+    else:
+        rc_red, out_red = _agg_exec(gate_script, {AGG_JOB: "failure"}, root)
+        if rc_red == 0:
+            bad(
+                "A3",
+                f"МОДЕЛЬ «{AGG_JOB}=failure, остальные success»: агрегат вернул exit=0 "
+                f"({(out_red.strip().splitlines() or [''])[-1]!r}). Красный джоб не роняет "
+                f"`{AGG_GATE}` — ветка вливается с неработающим сторожем",
+            )
+        rc_green, out_green = _agg_exec(gate_script, {}, root)
+        if rc_green != 0:
+            bad(
+                "A3",
+                f"АНТИ-ПЛАЦЕБО: при всех success агрегат вернул exit={rc_green} "
+                f"({(out_green.strip().splitlines() or [''])[-1]!r}). Условие «падать всегда» "
+                f"прошло бы первую модель вакуумно",
+            )
+
+    if problems:
+        for line in problems:
+            print(f"FAIL {line}")
+        print(f"VERDICT: FAIL ({len(problems)} нарушени(й) CI-агрегата)")
+        return 1
+    print(
+        f"OK: джоб `{AGG_JOB}` зовёт предмет и пробу; он в `{AGG_GATE}.needs`; "
+        f"его красный результат РОНЯЕТ агрегат (проверено исполнением условия, не грепом)"
+    )
+    print("VERDICT: PASS")
+    return 0
+
+
 def main(argv):
-    if len(argv) != 2 or argv[1] not in ("decide", "check-wiring"):
-        print(f"usage: {argv[0]} decide|check-wiring", file=sys.stderr)
+    if len(argv) != 2 or argv[1] not in ("decide", "check-wiring", "check-aggregate"):
+        print(f"usage: {argv[0]} decide|check-wiring|check-aggregate", file=sys.stderr)
         return 2
     try:
-        return cmd_decide() if argv[1] == "decide" else cmd_check_wiring()
+        return {
+            "decide": cmd_decide,
+            "check-wiring": cmd_check_wiring,
+            "check-aggregate": cmd_check_aggregate,
+        }[argv[1]]()
     except Fail as exc:
         print(f"FAIL: {exc}", file=sys.stderr)
         print("decision=", file=sys.stdout)
