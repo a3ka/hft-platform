@@ -6,6 +6,18 @@
 # мутант был бы неотличим от `unsubmute` по наблюдаемому профилю. Полнота батареи
 # заявляется только относительно таблицы §4.5, а полнота набора — относительно §4.2.
 #
+# Перекалибровка round 3 (R-086 §10.2, развязки А+Б) — разбор в спеке §4.5bis.
+# Пять мутантов разошлись с новой формой кода, и причины у них РАЗНЫЕ; ни один не оказался
+# «невыразимым», то есть удалять было нечего:
+#   - `capopen`   — якорь мёртв (`inner.subs_count` → `inner.subs.len()`): перепривязка;
+#   - `capleak`   — якорь мёртв (отдельного счётчика нет как класса): перепривязка на
+#                   надгробие в карте `subs`, дефект оси 8 по-прежнему выразим;
+#   - `emptyframe`— якорь мёртв (сменилась форма кортежа pump-completion): перепривязка;
+#   - `crosstalk` — якорь ЖИВ, устарело вставляемое тело (E0425 `sub`): перепривязка тела;
+#   - `submerge`  — якорь ЖИВ, тело компилируется, дефект воспроизводится; изменился
+#                   KILL-SET (+`o4`), потому что лимит стал производной от `subs.len()`,
+#                   которую этот мутант и схлопывает. Патч не тронут, пересчитана таблица.
+#
 # Ключевые правила:
 # - kill-set берётся из §4.5 и сверяется РАВЕНСТВОМ множеств;
 # - мутанты применяются только в копии дерева;
@@ -187,9 +199,12 @@ apply_mutant() {
                 inner.subs.insert(merged_id, merged_sub);'
       ;;
     capopen)
+      # Перепривязка (round 3, R-086 §10.2 развязка А): счётчика `inner.subs_count` больше
+      # НЕТ — лимит считается по `subs.len()`. Дефект «лимит не проверяется» выражается
+      # ровно так же, поменялось только имя величины в условии.
       replace_once crates/gateway-serve/src/lib.rs \
-        '                if inner.subs_count >= max_subs {' \
-        '                if false && inner.subs_count >= max_subs {'
+        '                if inner.subs.len() >= max_subs {' \
+        '                if false && inner.subs.len() >= max_subs {'
       ;;
     versionmute)
       replace_once crates/gateway-serve/src/wire_v1.rs \
@@ -246,21 +261,38 @@ apply_mutant() {
                     CROSSTALK_TO_ETH.store(true, Ordering::Relaxed);
                 }
                 // Два пути:'
+      # Перепривязка (round 3): ЯКОРЬ жив (`let cfg2 = Arc::clone(&inner.cfg);` встречается
+      # ровно один раз и здесь же), устарело ВСТАВЛЯЕМОЕ тело. Прежняя редакция правила
+      # `sub.selector` / `sub.live`, потому что tick ИЗЫМАЛ `Sub` из карты и держал его
+      # локальной переменной. После развязки А `Sub` остаётся в карте, а наружу берётся
+      # только `live` (`Option::take`) — переменной `sub` в этой точке не существует, и
+      # мутант падал на E0425 «cannot find value `sub`», то есть на СБОРКЕ, а не на подмене.
       replace_once crates/gateway-serve/src/lib.rs \
         '                        let cfg2 = Arc::clone(&inner.cfg);' \
         '                        if CROSSTALK_TO_ETH.load(Ordering::Relaxed)
-                            && sub.id == "w"
-                            && sub.selector.symbol == "BTCUSDT"
+                            && id == "w"
+                            && inner.subs.get(&id).map(|s| s.selector.symbol.as_str())
+                                == Some("BTCUSDT")
                         {
-                            sub.selector.symbol = "ETHUSDT".to_string();
-                            let ckpt_dir = inner.cfg.checkpoint_dir.clone().unwrap_or_default();
-                            if let Ok((live, _)) = crate::_gw::LiveReducer::resume(
+                            let mut alien = inner
+                                .subs
+                                .get(&id)
+                                .expect("sub present")
+                                .selector
+                                .clone();
+                            alien.symbol = "ETHUSDT".to_string();
+                            let ckpt_dir =
+                                inner.cfg.checkpoint_dir.clone().unwrap_or_default();
+                            if let Ok((alien_live, _)) = crate::_gw::LiveReducer::resume(
                                 inner.cfg.journal_dir.as_path(),
                                 inner.cfg.filter.clone(),
-                                &sub.selector,
+                                &alien,
                                 ckpt_dir.as_path(),
                             ) {
-                                sub.live = live;
+                                live = alien_live;
+                                if let Some(s) = inner.subs.get_mut(&id) {
+                                    s.selector = alien;
+                                }
                             }
                         }
                         let cfg2 = Arc::clone(&inner.cfg);'
@@ -273,14 +305,52 @@ apply_mutant() {
                 return Ok(());'
       ;;
     capleak)
+      # Перепривязка (round 3), и она НЕ косметическая — разбор в §4.5bis спеки.
+      # Прежняя форма мутировала рассинхрон двух величин (`subs_count` против `subs.len()`);
+      # эта пара устранена конструкцией, отдельного счётчика больше нет. Но САМ дефект оси 8
+      # («место под лимитом не освобождается») выражается по-прежнему: `unsubscribe` убирает
+      # подписку из карты — а мутант оставляет вместо неё НАДГРОБИЕ под другим ключом.
+      # Профиль наблюдаемого поведения тот же, что у прежней формы: поток по снятому id
+      # прекращается (`live: None` ⇒ tick пропускает), повторный `unsubscribe` честно даёт
+      # `unknown_id`, соседняя подписка жива — а ёмкость лимита 16 съедена навсегда.
+      # Отсюда вывод, который стоило снять замером: «утечка ёмкости невозможна ПО
+      # ПОСТРОЕНИЮ» (§10.2) — переоценка. Невозможен рассинхрон ДВУХ величин; утечка
+      # единственной величины возможна и мутантом предъявлена.
       replace_once crates/gateway-serve/src/lib.rs \
-        '                inner.subs_count = inner.subs_count.saturating_sub(1);' \
-        '                inner.subs_count = inner.subs_count;'
+        '                let in_subs = inner.subs.remove(&id_str).is_some();' \
+        '                let in_subs = match inner.subs.remove(&id_str) {
+                    Some(gone) => {
+                        inner.subs.insert(
+                            format!("{id_str}#tomb"),
+                            session::Sub {
+                                id: format!("{id_str}#tomb"),
+                                selector: gone.selector,
+                                live: None,
+                            },
+                        );
+                        true
+                    }
+                    None => false,
+                };'
       ;;
     emptyframe)
+      # Перепривязка (round 3): форма кортежа pump-completion сменилась — pump возвращает
+      # `live`, а не `Sub` (развязка А), и порядок полей стал `(live, frames, new_cursor,
+      # stats, gen_at_pump)`. Сам дефект («сервер синтезирует кадр вместо молчания»)
+      # выражается прежней вставкой без изменений.
+      # Якорь ОБЯЗАН нести строку `inner.pending_ids.remove(&id);`: сам кортеж после развязки А
+      # встречается ДВАЖДЫ — блок pump-completion продублирован в `run_authorized_session`
+      # (legacy-путь, `v1_session_inner`). Голый кортеж давал `replacement count=2`, то есть
+      # мутировал ОБА пути разом, а `replace_once` по контракту требует ровно одного
+      # совпадения. Оракулы M-65 подписываются внутри grace-окна и идут через
+      # `run_v1_session_loop` — мутируем именно его.
       replace_once crates/gateway-serve/src/lib.rs \
-        '                        Ok((sub, frames, _new_cursor, _gen_at_pump, _stats)) => {' \
-        '                        Ok((sub, mut frames, new_cursor, _gen_at_pump, _stats)) => {'
+        '                    inner.pending_ids.remove(&id);
+                    match outcome {
+                        Ok((live, frames, _new_cursor, _stats, gen_at_pump)) => {' \
+        '                    inner.pending_ids.remove(&id);
+                    match outcome {
+                        Ok((live, mut frames, new_cursor, _stats, gen_at_pump)) => {'
       replace_once crates/gateway-serve/src/lib.rs \
         '                            // heartbeat-кадр.
                             for frame in frames {' \
