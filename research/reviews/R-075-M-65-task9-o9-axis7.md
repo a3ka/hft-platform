@@ -1,3 +1,16 @@
+<!-- GATE-META
+milestone: M-65
+audited_repo: a3ka/hft-platform
+audited_base: 3c667772f32fd9d0a71ac1b7681c1c89fc82759b
+audited_head: 2e342d3c441e5ff845559f9f954d30e4855249c9
+verdict: APPROVED
+-->
+
+<!-- Шапка дописана 2026-08-17 architect'ом ПОСТФАКТУМ: вердикт написан до введения
+     нормы GATE-META (M-60b); барьер судит все вердикты диапазона без исключений
+     (grandfathering отвергнут осознанно, GM-30). Значения извлечены из самого
+     вердикта: Предмет строкой :4 — «ОДИН коммит `2e342d3` на `origin/feat/M-65-ws-session`». Содержание не изменено. -->
+
 # R-075 — M-65 task #9 / оракул `O-9` (ось 7): **APPROVED с четырьмя NOTE**
 
 **Роль:** reviewer (PR-time гейт, `gates.md` §4 — UNCONDITIONAL) · **Дата:** 2026-08-14

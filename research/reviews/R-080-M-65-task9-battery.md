@@ -1,3 +1,16 @@
+<!-- GATE-META
+milestone: M-65
+audited_repo: a3ka/hft-platform
+audited_base: 3c667772f32fd9d0a71ac1b7681c1c89fc82759b
+audited_head: 5a2f5d9cfc717c35bb4607e9d9d15df70ff666af
+verdict: APPROVED
+-->
+
+<!-- Шапка дописана 2026-08-17 architect'ом ПОСТФАКТУМ: вердикт написан до введения
+     нормы GATE-META (M-60b); барьер судит все вердикты диапазона без исключений
+     (grandfathering отвергнут осознанно, GM-30). Значения извлечены из самого
+     вердикта: Предмет строкой :3 — «`5a2f5d9` — test(M-65): task #9 ws session mutation battery». Содержание не изменено. -->
+
 # R-080 — M-65 задача 9 (батарея мутантов §4.5): **APPROVED с пятью NOTE**
 
 **Предмет:** `5a2f5d9` — `test(M-65): task #9 ws session mutation battery [architect-codex]`

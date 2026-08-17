@@ -1,3 +1,18 @@
+<!-- GATE-META
+milestone: M-65
+audited_repo: a3ka/hft-platform
+audited_base: 3c667772f32fd9d0a71ac1b7681c1c89fc82759b
+audited_head: 50dae797ffd54eda4c2b4498b2c5c761d7ef0aca
+verdict: REJECT
+-->
+
+<!-- Шапка дописана 2026-08-17 architect'ом ПОСТФАКТУМ: вердикт написан до введения
+     нормы GATE-META (M-60b), а барьер `check_gate_meta.sh` судит все вердикты в
+     диапазоне PR без исключений — grandfathering отвергнут осознанно (GM-30).
+     Значения НЕ выдуманы, а извлечены из самого вердикта: Subject строкой :5 — «`milestones/M-65-ws-session.md` at `50dae79`».
+     База — `origin/main` той поры, названная в `R-057` строкой :27. Содержание
+     вердикта не изменено ни на символ. -->
+
 # C-077 — M-65 ws-session milestone-spec critique
 
 **Critic:** Codex/GPT-5  

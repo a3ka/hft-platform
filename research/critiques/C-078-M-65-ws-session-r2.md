@@ -1,3 +1,18 @@
+<!-- GATE-META
+milestone: M-65
+audited_repo: a3ka/hft-platform
+audited_base: 3c667772f32fd9d0a71ac1b7681c1c89fc82759b
+audited_head: 5a90baea1e2edc40c2dd796d152b624bf0ef80c1
+verdict: NOTE
+-->
+
+<!-- Шапка дописана 2026-08-17 architect'ом ПОСТФАКТУМ: вердикт написан до введения
+     нормы GATE-META (M-60b), а барьер `check_gate_meta.sh` судит все вердикты в
+     диапазоне PR без исключений — grandfathering отвергнут осознанно (GM-30).
+     Значения НЕ выдуманы, а извлечены из самого вердикта: Subject строкой :5 — «at `5a90bae`».
+     База — `origin/main` той поры, названная в `R-057` строкой :27. Содержание
+     вердикта не изменено ни на символ. -->
+
 # C-078 — M-65 ws-session round-2 critic re-check
 
 **Critic:** Codex/GPT-5  
