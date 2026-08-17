@@ -12,6 +12,18 @@ license.workspace = true
 # Тела auth/wire/serve-adapter + WS-сервер (tokio-tungstenite) — engine-dev (tasks 2-4), он же добавляет
 # tokio/tokio-tungstenite в [dependencies].
 
+# M-65 задача 12а (§10.3.1). Флаг ОБЪЯВЛЕН здесь architect'ом вместе с оракулом `O-12`, а не
+# оставлен engine-dev'у, по механической причине: без объявления `#[cfg(feature = "testing")]`
+# на тесте даёт `unexpected_cfgs`, а CI гоняет `clippy -D warnings` — то есть оракул уронил бы
+# ОБЩИЙ гейт вместо того, чтобы честно краснеть на своём предмете (замер: clippy exit=101).
+#
+# Объявление — не реализация. Тело развязки (снять `#[cfg(test)]` с `pub mod test_sync` и с
+# обеих точек вызова в `lib.rs`) остаётся за engine-dev: задача 12а. До неё оракул с флагом
+# НЕ СОБИРАЕТСЯ (`E0433: could not find test_sync`) — это и есть требуемое RED-состояние
+# набора; `cargo test` без флага при этом зелен, и CI цел.
+[features]
+testing = []
+
 [dependencies]
 contracts = { path = "../contracts" }
 gateway = { path = "../gateway" }

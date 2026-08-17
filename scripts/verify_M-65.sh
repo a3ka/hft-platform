@@ -146,6 +146,34 @@ else
   grep -E '^test .* FAILED' "${LOGD}/t.log" | head -8 | sed 's/^/      ↳ /'
 fi
 
+
+# ── Шаг O12 (задача 12в, `R-093` Н-1) — гейт обязан наблюдать ОТСУТСТВИЕ оракула ────────────
+#
+# Находка, породившая шаг: два круга подряд verify давал VERDICT: PASS, тогда как условие
+# `R-086` §5 п.1 (оракул на гонку switch × in-flight pump) НЕ выполнено. Гейт видел только то,
+# что прогнанные тесты зелены, и был слеп к тому, что нужного теста нет вовсе. Механизм,
+# наблюдающий сбой, но не ОТСУТСТВИЕ, — ровно та слепота, против которой он написан
+# (`testing.md`, целостность гейта, свойство 4).
+#
+# `O-12` живёт под `--features testing`, поэтому обычный `cargo test` его не исполняет: без
+# этого шага он молча отсутствовал бы, а гейт оставался зелёным.
+echo
+echo "── O12: оракул на гонку switch × in-flight pump (задача 12) ──"
+O12LOG="${LOGD}/o12.log"
+if cargo test -p gateway-serve --features testing --test red_ws_session \
+     o12_switch_during_inflight_pump >"${O12LOG}" 2>&1; then
+  O12_RAN="$(grep -cE '^test o12_switch_during_inflight_pump .* ok$' "${O12LOG}" || true)"
+  if [ "${O12_RAN}" -ge 1 ]; then
+    pass "O12 оракул на находку ИСПОЛНЕН и зелён (тестов: ${O12_RAN})"
+  else
+    fail "O12 прогон вернул 0, но оракул НЕ ИСПОЛНЕН (исполнено ${O12_RAN}) — тест отсутствует либо отфильтрован"
+    tail -5 "${O12LOG}" | sed 's/^/      ↳ /'
+  fi
+else
+  fail "O12 оракул на находку не собирается или падает — задача 12 НЕ ЗАКРЫТА (R-086 §5 п.1)"
+  grep -E '^error(\[|:)|^test .* FAILED' "${O12LOG}" | head -4 | sed 's/^/      ↳ /'
+fi
+
 echo
 if [ "${FAILED}" -gt 0 ]; then
   echo "VERDICT: FAIL (${FAILED} нарушений)"
