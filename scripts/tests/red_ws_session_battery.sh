@@ -174,6 +174,16 @@ replace_once() {
 
 apply_mutant() {
   local name="$1"
+  # `R-080` Н-3 (fail-closed setup). Статус возвращала только ПОСЛЕДНЯЯ подстановка ветки
+  # `case`: у `crosstalk` (три подстановки) и `emptyframe` (две) сломанная ПЕРВАЯ проходила
+  # как состоявшийся setup — замер R-080: «сломана первая ⇒ apply_mutant rc=0», при том что
+  # сломанная вторая давала rc=7. Правило §4.5 «несработавшая подстановка — отказ батареи, а
+  # не строка в логе» держалось не механизмом, а тем, что частичная подстановка случайно
+  # ловилась ниже, на шаге компиляции. Перекалибровка round 3 переписала тела ровно этих двух
+  # мутантов, поэтому дыра закрывается здесь, а не «потом».
+  # `set -e` обрывает ветку на первой же несработавшей `replace_once`; наружу режим не течёт —
+  # функция зовётся ТОЛЬКО из субшелла в `run_one_mutant`.
+  set -e
   case "${name}" in
     envwins)
       replace_once crates/gateway-serve/src/lib.rs \
@@ -406,7 +416,23 @@ build_test_list_and_reference() {
   return 1
 }
 
+# `R-080` Н-5 (цена и окружение гейта): каталоги сборки всех 14 прогонов жили ОДНОВРЕМЕННО —
+# замер reviewer'а: пик 15.45 ГБ, диск за прогон ушёл с 81 % на 87 %. Гейт, способный
+# покраснеть от нехватки места на хосте, где рядом работают другие роли, меряет окружение, а
+# не свой инвариант. Обёртка сносит `target-<name>` сразу после сверки множеств — изоляция
+# сборки (свой `CARGO_TARGET_DIR` на прогон) при этом сохраняется полностью, а пик падает с
+# четырнадцати каталогов до двух. `KEEP_M65_BATTERY=1` по-прежнему сохраняет всё для разбора.
 run_one_mutant() {
+  local name="$1" rc
+  run_one_mutant_body "$1"
+  rc=$?
+  if [ "${KEEP_M65_BATTERY:-0}" != "1" ]; then
+    rm -rf "${WORK}/target-${name}"
+  fi
+  return "${rc}"
+}
+
+run_one_mutant_body() {
   local name="$1"
   local tree="${WORK}/mutant-${name}"
   local target="${WORK}/target-${name}"
@@ -434,6 +460,15 @@ run_one_mutant() {
     log="${WORK}/${name}-${test_name}.log"
     (cd "${tree}" && CARGO_TARGET_DIR="${target}" timeout "${PER_TEST_TIMEOUT}" cargo test -p gateway-serve --test red_ws_session "${test_name}" -- --exact --test-threads=1 > "${log}" 2>&1)
     rc=$?
+    # `R-080` Н-3bis: `timeout` даёт rc=124, и такой «kill» попадал в множество наравне с
+    # честным падением ассерта — то есть kill-set пиннил бы ДЛИТЕЛЬНОСТЬ, а не инвариант
+    # (`testing.md` §«Целостность гейта» св. 2: гейт мерит свой инвариант, а не окружение).
+    # Отличаем явно: таймаут — отказ setup'а, а не доказательство власти оракула.
+    if [ "${rc}" -eq 124 ]; then
+      fail "${name}/${test_name}: ТАЙМАУТ ${PER_TEST_TIMEOUT}s — оракул НЕ ДОЖДАЛСЯ, а не отверг; в kill-set не засчитывается"
+      tail -20 "${log}" | sed 's/^/      ↳ /'
+      return 1
+    fi
     ran="$(grep -c '^running 1 test' "${log}" || true)"
     if [ "${ran}" -ne 1 ]; then
       fail "${name}/${test_name}: тест не был исполнен ровно один раз (rc=${rc})"
