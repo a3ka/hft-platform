@@ -192,4 +192,90 @@ if [ "${FAILED}" -gt 0 ]; then
   echo "лотереей, а правильной реакцией на красное объявляется «перезапусти»."
   exit 1
 fi
+# ── C-095 F-1: ветка OK на СОДЕРЖАТЕЛЬНЫХ формах, а не на вырожденных ────────────────────
+# Прежде КАЖДЫЙ сценарий, ждавший exit=0, кормил барьер файлом с НУЛЁМ или ОДНИМ тестом.
+# Комбинация «потоковый учёт + ДВА и более теста» — то есть ровно форма всех четырёх
+# правленых оракулов — не предъявлялась никогда. Поэтому стаб, судящий ТОЛЬКО по числу
+# `#[test]`, давал 11/11 и при этом ложно блокировал шесть честных оракулов на реальном
+# дереве. Три сценария ниже отличают ИНВАРИАНТ от ПРОКСИ.
+
+two_tests() { printf '#[test]\nfn t_one() {}\n#[test]\nfn t_two() {}\n' >> "$1"; }
+
+# RO-12 — честный thread_local + ДВА теста ⇒ ПРОХОД. Убивает стаб «блокирую всё, где тестов ≥2».
+mk D; honest_oracle "${D}/crates/x/tests/red_alloc.rs"; two_tests "${D}/crates/x/tests/red_alloc.rs"
+[ "$(grep -c '^#\[test\]' "${D}/crates/x/tests/red_alloc.rs")" -eq 2 ] || die "RO-12 фикстура не двухтестовая"
+ROOT="${D}" bash "${BARRIER}" > "${D}/out" 2>&1; RC=$?
+[ "${RC}" -eq 0 ] && pass "RO-12 потоковый учёт + два теста — не дефект" \
+  || { fail "RO-12 ложное срабатывание (exit=${RC}): барьер судит по ЧИСЛУ ТЕСТОВ, а не по учёту"; sed 's/^/      /' "${D}/out"; }
+
+# RO-13 — аллокатор БЕЗ единого счётчика + два теста ⇒ ПРОХОД. Убивает стаб, судящий по
+# наличию `thread_local!` как таковому: счётчиков здесь нет вовсе, портиться нечему.
+mk D; cat > "${D}/crates/x/tests/red_alloc.rs" <<'RS'
+use std::alloc::{GlobalAlloc, Layout, System};
+struct Passthrough;
+unsafe impl GlobalAlloc for Passthrough {
+    unsafe fn alloc(&self, l: Layout) -> *mut u8 { System.alloc(l) }
+    unsafe fn dealloc(&self, p: *mut u8, l: Layout) { System.dealloc(p, l) }
+}
+#[global_allocator]
+static GA: Passthrough = Passthrough;
+RS
+two_tests "${D}/crates/x/tests/red_alloc.rs"
+ROOT="${D}" bash "${BARRIER}" > "${D}/out" 2>&1; RC=$?
+[ "${RC}" -eq 0 ] && pass "RO-13 аллокатор без счётчиков + два теста — не дефект" \
+  || { fail "RO-13 ложное срабатывание (exit=${RC})"; sed 's/^/      /' "${D}/out"; }
+
+# RO-14 — thread_local со СВОИМ именем счётчика + служебный процессный атомик + два теста
+# ⇒ ПРОХОД. Убивает стаб, ищущий конкретный идентификатор (`T_CUR`) вместо потокового УЧЁТА.
+mk D; cat > "${D}/crates/x/tests/red_alloc.rs" <<'RS'
+use std::cell::Cell;
+use std::sync::atomic::AtomicBool;
+use std::alloc::{GlobalAlloc, Layout, System};
+thread_local! {
+    static MY_OWN_METER: Cell<usize> = const { Cell::new(0) };
+}
+static MEASURING: AtomicBool = AtomicBool::new(false);
+struct Counting;
+unsafe impl GlobalAlloc for Counting {
+    unsafe fn alloc(&self, l: Layout) -> *mut u8 { System.alloc(l) }
+    unsafe fn dealloc(&self, p: *mut u8, l: Layout) { System.dealloc(p, l) }
+}
+#[global_allocator]
+static GA: Counting = Counting;
+RS
+two_tests "${D}/crates/x/tests/red_alloc.rs"
+ROOT="${D}" bash "${BARRIER}" > "${D}/out" 2>&1; RC=$?
+[ "${RC}" -eq 0 ] && pass "RO-14 своё имя счётчика + служебный атомик — не дефект" \
+  || { fail "RO-14 ложное срабатывание (exit=${RC}): барьер пиннит ИМЯ, а не потоковый учёт"; sed 's/^/      /' "${D}/out"; }
+
+# RO-15 — F-2: `global_allocator` ТОЛЬКО в комментарии ⇒ файл НЕ оракул. Барьер обязан уйти
+# в fail-closed «оракулов не найдено» (exit=2), а не молча зачесть его и не заблокировать.
+mk D; cat > "${D}/crates/x/tests/red_fake.rs" <<'RS'
+// Упоминание global_allocator в комментарии оракулом файл не делает.
+// #[global_allocator]
+static CNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+RS
+two_tests "${D}/crates/x/tests/red_fake.rs"
+ROOT="${D}" bash "${BARRIER}" > "${D}/out" 2>&1; RC=$?
+[ "${RC}" -eq 2 ] && pass "RO-15 упоминание в комментарии не считается объявлением (fail-closed)" \
+  || { fail "RO-15 exit=${RC}, ожидалось 2: барьер путает УПОМИНАНИЕ с ОБЪЯВЛЕНИЕМ"; sed 's/^/      /' "${D}/out"; }
+
+# RO-16 — F-3: процессный счётчик, заданный ПОЛНЫМ путём типа, обязан ловиться.
+mk D; cat > "${D}/crates/x/tests/red_alloc.rs" <<'RS'
+use std::alloc::{GlobalAlloc, Layout, System};
+pub static CUR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+struct Counting;
+unsafe impl GlobalAlloc for Counting {
+    unsafe fn alloc(&self, l: Layout) -> *mut u8 { System.alloc(l) }
+    unsafe fn dealloc(&self, p: *mut u8, l: Layout) { System.dealloc(p, l) }
+}
+#[global_allocator]
+static GA: Counting = Counting;
+RS
+two_tests "${D}/crates/x/tests/red_alloc.rs"
+ROOT="${D}" bash "${BARRIER}" > "${D}/out" 2>&1; RC=$?
+[ "${RC}" -eq 1 ] && pass "RO-16 'pub static' с полным путём типа ловится" \
+  || { fail "RO-16 exit=${RC}, ожидалось 1: регулярка не знает 'pub static' / 'std::sync::atomic::'"; sed 's/^/      /' "${D}/out"; }
+
+
 echo "VERDICT: PASS (${PASSED}/${PASSED}) — барьер ловит процессный учёт, не ловит ложно, fail-closed на пустоте"
