@@ -3,7 +3,7 @@ milestone: M-65
 audited_repo: a3ka/hft-platform
 audited_base: 3c667772f32fd9d0a71ac1b7681c1c89fc82759b
 audited_head: 2e342d3c441e5ff845559f9f954d30e4855249c9
-verdict: APPROVED
+verdict: APPROVE
 -->
 
 <!-- Шапка дописана 2026-08-17 architect'ом ПОСТФАКТУМ: вердикт написан до введения
