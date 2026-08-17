@@ -300,14 +300,32 @@ jobs:
       - name: Проба диск-преамбулы (счёт печатает сама проба)
         run: bash scripts/tests/red_disk_budget.sh
 
+  resource-oracles:
+    name: Resource oracles (замер мерит инвариант, а не окружение)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Барьер в ПРОД-ФОРМЕ: default-режим, без переменных пробы. Ловит механизм, дважды
+      # уронивший обязательный чек `main` (TD-098/TD-129): ресурсный оракул вёл учёт
+      # аллокаций процессным счётчиком, а `cargo test` гоняет тесты одного бинаря
+      # параллельными потоками ⇒ замер включал соседей, и исход зависел от планировщика.
+      - name: Ресурсные оракулы (прод-форма)
+        run: bash scripts/check_resource_oracles.sh
+
+      # Проба ТОЙ ЖЕ проводкой (`testing.md` «целостность гейта»): 11 сценариев, среди них
+      # RO-10 (одиночный тест НЕ дефект — барьер не мерит прокси) и RO-11 (второй тест
+      # переводит файл в дефектные — латентная мина ловится в момент постановки).
+      - name: Проба барьера (RO-1..RO-11)
+        run: bash scripts/tests/red_resource_oracles.sh
+
   status-check:
     name: All checks passed
     runs-on: ubuntu-latest
-    needs: [build-test, security, delivery, protected-artifacts, contracts, docs-freeze, artifact-ids, reserve-ids, design-claims, context-budgets, gate-meta]
+    needs: [build-test, security, delivery, protected-artifacts, contracts, docs-freeze, artifact-ids, reserve-ids, design-claims, context-budgets, gate-meta, resource-oracles]
     if: always()
     steps:
       - run: |
-          if [[ "${{ needs.build-test.result }}" != "success" || "${{ needs.security.result }}" != "success" || "${{ needs.delivery.result }}" != "success" || "${{ needs.protected-artifacts.result }}" != "success" || "${{ needs.contracts.result }}" != "success" || "${{ needs.docs-freeze.result }}" != "success" || "${{ needs.artifact-ids.result }}" != "success" || "${{ needs.reserve-ids.result }}" != "success" || "${{ needs.design-claims.result }}" != "success" || "${{ needs.context-budgets.result }}" != "success" || "${{ needs.gate-meta.result }}" != "success" ]]; then
+          if [[ "${{ needs.build-test.result }}" != "success" || "${{ needs.security.result }}" != "success" || "${{ needs.delivery.result }}" != "success" || "${{ needs.protected-artifacts.result }}" != "success" || "${{ needs.contracts.result }}" != "success" || "${{ needs.docs-freeze.result }}" != "success" || "${{ needs.artifact-ids.result }}" != "success" || "${{ needs.reserve-ids.result }}" != "success" || "${{ needs.design-claims.result }}" != "success" || "${{ needs.context-budgets.result }}" != "success" || "${{ needs.gate-meta.result }}" != "success" || "${{ needs.resource-oracles.result }}" != "success" ]]; then
             echo "One or more checks failed"; exit 1
           fi
           echo "All checks passed"
