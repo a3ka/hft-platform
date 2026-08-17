@@ -181,19 +181,24 @@ apply_mutant() {
   # не строка в логе» держалось не механизмом, а тем, что частичная подстановка случайно
   # ловилась ниже, на шаге компиляции. Перекалибровка round 3 переписала тела ровно этих двух
   # мутантов, поэтому дыра закрывается здесь, а не «потом».
-  # `set -e` обрывает ветку на первой же несработавшей `replace_once`; наружу режим не течёт —
-  # функция зовётся ТОЛЬКО из субшелла в `run_one_mutant`.
-  set -e
+  #
+  # Форма фикса — `|| return $?` на КАЖДОЙ подстановке (как и предлагал R-080), и это не
+  # вкусовщина: первая редакция ставила `set -e` в теле функции, и она была ПЛАЦЕБО.
+  # Замер (bash 5, три формы отказа — `false`, `return 7`, внешняя команда с exit 7):
+  # `set -e`, включённый ВНУТРИ функции, не обрывает её собственное тело — исполнение
+  # доходит до конца и функция возвращает 0. Проба A/B/C на реальном коде батареи давала
+  # с `set -e` ровно прежний результат: сломана ПЕРВАЯ подстановка ⇒ rc=0. Фикс, не
+  # проверенный мутацией, чинит только отчёт о себе.
   case "${name}" in
     envwins)
       replace_once crates/gateway-serve/src/lib.rs \
         '                let sel_for_resume = sel.clone();' \
-        '                let sel_for_resume = inner.cfg.selector.clone();'
+        '                let sel_for_resume = inner.cfg.selector.clone();' || return $?
       ;;
     stalefeed)
       replace_once crates/gateway-serve/src/lib.rs \
         '                    let old = inner.subs.insert(switched_id.clone(), new_sub);' \
-        '                    let old = Some(new_sub);'
+        '                    let old = Some(new_sub);' || return $?
       ;;
     submerge)
       replace_once crates/gateway-serve/src/lib.rs \
@@ -206,7 +211,7 @@ apply_mutant() {
                     .unwrap_or_else(|| id_for_insert.clone());
                 let mut merged_sub = new_sub;
                 merged_sub.id = merged_id.clone();
-                inner.subs.insert(merged_id, merged_sub);'
+                inner.subs.insert(merged_id, merged_sub);' || return $?
       ;;
     capopen)
       # Перепривязка (round 3, R-086 §10.2 развязка А): счётчика `inner.subs_count` больше
@@ -214,29 +219,29 @@ apply_mutant() {
       # ровно так же, поменялось только имя величины в условии.
       replace_once crates/gateway-serve/src/lib.rs \
         '                if inner.subs.len() >= max_subs {' \
-        '                if false && inner.subs.len() >= max_subs {'
+        '                if false && inner.subs.len() >= max_subs {' || return $?
       ;;
     versionmute)
       replace_once crates/gateway-serve/src/wire_v1.rs \
         '    if ver_u64 != 1 {' \
-        '    if false && ver_u64 != 1 {'
+        '    if false && ver_u64 != 1 {' || return $?
       ;;
     harshdrop)
       replace_once crates/gateway-serve/src/lib.rs \
         '                    send_v1_error(sink, Some(id), "invalid_selector", &msg).await;
                     return Err(format!("invalid selector: {msg}"));' \
-        '                    panic!("harshdrop mutant closes on invalid selector: {msg}");'
+        '                    panic!("harshdrop mutant closes on invalid selector: {msg}");' || return $?
       ;;
     lateignore)
       replace_once crates/gateway-serve/src/lib.rs \
         '                    let _ = handle_v1_message(&parsed, inner, sink).await;' \
-        '                    let _ = parsed;'
+        '                    let _ = parsed;' || return $?
       ;;
     prosaicerr)
       replace_once crates/gateway-serve/src/wire_v1.rs \
         '        "code":code,
 ' \
-        ''
+        '' || return $?
       ;;
     connshare)
       replace_once crates/gateway-serve/src/lib.rs \
@@ -251,7 +256,7 @@ apply_mutant() {
                         .expect("connshare mutex poisoned");
                     shared.entry(id.clone()).or_insert_with(|| sel.clone()).clone()
                 };
-                // Два пути:'
+                // Два пути:' || return $?
       ;;
     crosstalk)
       replace_once crates/gateway-serve/src/lib.rs \
@@ -264,13 +269,13 @@ apply_mutant() {
     }
     static CROSSTALK_TO_ETH: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
-'
+' || return $?
       replace_once crates/gateway-serve/src/lib.rs \
         '                // Два пути:' \
         '                if id == "w" && sel.symbol == "ETHUSDT" {
                     CROSSTALK_TO_ETH.store(true, Ordering::Relaxed);
                 }
-                // Два пути:'
+                // Два пути:' || return $?
       # Перепривязка (round 3): ЯКОРЬ жив (`let cfg2 = Arc::clone(&inner.cfg);` встречается
       # ровно один раз и здесь же), устарело ВСТАВЛЯЕМОЕ тело. Прежняя редакция правила
       # `sub.selector` / `sub.live`, потому что tick ИЗЫМАЛ `Sub` из карты и держал его
@@ -305,14 +310,14 @@ apply_mutant() {
                                 }
                             }
                         }
-                        let cfg2 = Arc::clone(&inner.cfg);'
+                        let cfg2 = Arc::clone(&inner.cfg);' || return $?
       ;;
     unsubmute)
       replace_once crates/gateway-serve/src/lib.rs \
         '                let id_str = id.clone();' \
         '                let id_str = id.clone();
                 let _ = id_str;
-                return Ok(());'
+                return Ok(());' || return $?
       ;;
     capleak)
       # Перепривязка (round 3), и она НЕ косметическая — разбор в §4.5bis спеки.
@@ -341,7 +346,7 @@ apply_mutant() {
                         true
                     }
                     None => false,
-                };'
+                };' || return $?
       ;;
     emptyframe)
       # Перепривязка (round 3): форма кортежа pump-completion сменилась — pump возвращает
@@ -360,7 +365,7 @@ apply_mutant() {
                         Ok((live, frames, _new_cursor, _stats, gen_at_pump)) => {' \
         '                    inner.pending_ids.remove(&id);
                     match outcome {
-                        Ok((live, mut frames, new_cursor, _stats, gen_at_pump)) => {'
+                        Ok((live, mut frames, new_cursor, _stats, gen_at_pump)) => {' || return $?
       replace_once crates/gateway-serve/src/lib.rs \
         '                            // heartbeat-кадр.
                             for frame in frames {' \
@@ -374,7 +379,7 @@ apply_mutant() {
                                     at_ms: 0,
                                 });
                             }
-                            for frame in frames {'
+                            for frame in frames {' || return $?
       ;;
     *)
       return 2
