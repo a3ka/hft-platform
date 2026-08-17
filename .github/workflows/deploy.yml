@@ -47,6 +47,18 @@ on:
       - '.github/workflows/deploy.yml'
   workflow_dispatch:
 
+  # Р-4 (docs/plans/process-decisions-2026-08-14.md) — сторож «деплой не состоялся».
+  # Замер 17.08: прод 362784a (14.08), main 2c56a34 — 92 коммита и 2 кодовых файла позади.
+  # Класс дыры — «наблюдается сбой, НЕ наблюдается ОТСУТСТВИЕ» (testing.md, свойство 4):
+  # красный CI блокирует деплой верно, но фикс, зеленящий CI, кодовых путей не трогает
+  # (`scripts/tests/**` в `paths` выше не входит ВОВСЕ — TD-150 п.2), поэтому НИ ОДИН push
+  # в цепочке не обязан выпустить прод, а упавший ран сам себя не перезапускает.
+  # Развязка (в): выпуск привязан к факту ЗЕЛЁНОГО CI, а не к тому, какой push его позеленил.
+  workflow_run:
+    workflows: ["CI"]
+    branches: [main]
+    types: [completed]
+
 jobs:
   # M-08 E9 (находка reviewer'а 2026-07-13): Deploy зеленел, ПОКА CI ЕЩЁ ШЁЛ — красный CI
   # не останавливал выкатку в прод. `needs:` между workflow'ами не работает, поэтому гейт
@@ -54,6 +66,10 @@ jobs:
   # или таймаут → деплой НЕ идёт (прод дороже скорости выкатки).
   ci:
     name: Gate on CI (fail-closed)
+    # На workflow_run гейт не нужен и ВРЕДЕН: событие приходит уже по завершении CI, а
+    # `github.sha` на нём указывает не на ту вершину, чей CI проверялся. Ждать CI по чужому
+    # SHA — значит ждать вечно. Целевая вершина на этом пути приходит явно из `catchup`.
+    if: github.event_name != 'workflow_run'
     runs-on: ubuntu-latest
     steps:
       - name: Wait for CI success on this commit
@@ -80,12 +96,127 @@ jobs:
           echo "CI не дошёл до терминального статуса за 20 мин — деплой заблокирован (fail-closed)"
           exit 1
 
+  # Р-4: РЕШЕНИЕ о доборе. Читает три факта — что реально на VPS, что за вершина позеленела,
+  # что уже пробовали с этой вершиной — и выдаёт DEPLOY / SKIP / HOLD. Вся логика в
+  # `scripts/deploy_catchup.py`, чтобы она была проверяема ЛОКАЛЬНО пробой, а не только
+  # наблюдением прода (Р-4, строки 313-315).
+  catchup:
+    name: Catch-up decision (сторож «деплой не состоялся»)
+    # Добор только поверх ЗЕЛЁНОГО CI — fail-closed гейт не ослабляется (запретный список Р-4).
+    if: github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    outputs:
+      decision: ${{ steps.decide.outputs.decision }}
+      target_sha: ${{ github.event.workflow_run.head_sha }}
+    steps:
+      # fetch-depth: 0 ОБЯЗАТЕЛЕН: дельта считается между SHA НА VPS и целевой вершиной, и
+      # задеплоенный SHA может быть на сотню коммитов позади (замер 17.08: 92). При depth=1
+      # `git diff` упрётся в отсутствующий объект — и решение выродится в вечный отказ.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ЗАМЕР, а не прокси (testing.md: «оракул границы ресурса меряет ресурс, а не прокси»).
+      # «Последний успешный Deploy-ран» показал бы намерение пайплайна, а не состояние VPS:
+      # после отката `git reset --hard "$PREV"` ран числится failure, а VPS живёт на PREV.
+      - name: Снять SHA, реально живущий на VPS
+        id: vps
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "${VPS_SSH_KEY}" > ~/.ssh/catchup_key
+          chmod 600 ~/.ssh/catchup_key
+          ssh-keyscan -H "${VPS_HOST}" >> ~/.ssh/known_hosts 2>/dev/null
+          sha=$(ssh -i ~/.ssh/catchup_key -o IdentitiesOnly=yes -o BatchMode=yes \
+                    "${VPS_USER}@${VPS_HOST}" 'cd /root/hft-platform && git rev-parse HEAD')
+          # Мусор вместо SHA (пустой ответ, баннер, ошибка ssh) обязан ОСТАНОВИТЬ добор,
+          # а не проехать пустой строкой в сравнение.
+          if [ ${#sha} -ne 40 ] || case "$sha" in *[!0-9a-f]*) true ;; *) false ;; esac; then
+            echo "VPS вернул не SHA: '${sha}'"; exit 1
+          fi
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+          echo "на VPS: ${sha}"
+
+      # История Deploy-ранов ИМЕННО ЭТОЙ вершины — вход различителя «не стартовал / упал».
+      # `actions: read` для этого уже выдан (TD-018), расширять права не требуется.
+      - name: Собрать Deploy-раны целевой вершины (с джобами)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TARGET: ${{ github.event.workflow_run.head_sha }}
+          SELF_RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          # СВОЙ ран исключается явно. На workflow_run этот ран может нести ту же головную
+          # вершину; попав в выборку, он выглядел бы как «Deploy уже в полёте», и сторож
+          # МОЛЧАЛ БЫ ВСЕГДА — тот самый отказ, который он призван наблюдать.
+          gh api "repos/${REPO}/actions/runs?head_sha=${TARGET}&per_page=100" \
+            --jq "[.workflow_runs[]
+                   | select(.name==\"Deploy to VPS\")
+                   | select(.id != ${SELF_RUN_ID})
+                   | {databaseId: .id, status: .status, conclusion: .conclusion,
+                      headSha: .head_sha}]" > runs-raw.json
+          : > runs-parts.jsonl
+          for id in $(jq -r '.[].databaseId' runs-raw.json); do
+            jobs=$(gh api "repos/${REPO}/actions/runs/${id}/jobs" \
+                     --jq '[.jobs[] | {name: .name, status: .status, conclusion: .conclusion}]')
+            jq -c --argjson jobs "${jobs}" --arg id "${id}" \
+               '.[] | select(.databaseId == ($id|tonumber)) | . + {jobs: $jobs}' \
+               runs-raw.json >> runs-parts.jsonl
+          done
+          jq -s '.' runs-parts.jsonl > runs.json
+          echo "Deploy-ранов этой вершины (кроме своего): $(jq 'length' runs.json)"
+          cat runs.json
+
+      - name: Решение о доборе
+        id: decide
+        env:
+          CATCHUP_REPO_ROOT: .
+          CATCHUP_TARGET_SHA: ${{ github.event.workflow_run.head_sha }}
+          CATCHUP_DEPLOYED_SHA: ${{ steps.vps.outputs.sha }}
+          CATCHUP_RUNS_JSON: runs.json
+        run: python3 scripts/deploy_catchup.py decide
+
   deploy:
     name: Deploy (build on VPS)
     runs-on: ubuntu-latest
-    needs: ci
+    needs: [ci, catchup]
+    # Fail-closed в ОБЕ стороны и на каждом пути:
+    #  · push/dispatch — как было: только при зелёном гейте `ci` (M-08 E9);
+    #  · workflow_run  — только при явном DEPLOY от сторожа. Пустой выход (джоб `catchup`
+    #    упал, пропущен или не выдал решения) равен «не DEPLOY» ⇒ деплой не идёт.
+    if: >-
+      always()
+      && ((github.event_name != 'workflow_run' && needs.ci.result == 'success')
+          || (github.event_name == 'workflow_run' && needs.catchup.outputs.decision == 'DEPLOY'))
     # environment: production   # ← P4: включить + Required reviewers для live-торговли
     steps:
+      # SHA-ЯКОРНОСТЬ (TD-150 п.1, severity MAJOR «в момент написания спек»). Раньше VPS
+      # ресетился на `origin/main` — привязка к ВЕТКЕ: пока 20-минутный гейт ждал CI по
+      # `github.sha`, `main` уезжал вперёд (14.08 — 13 коммитов за день), и на прод уезжала
+      # НЕ ТА вершина, чей CI проверялся. Теперь выкатывается ровно решённый SHA.
+      - name: Определить целевую вершину
+        id: target
+        env:
+          EVENT: ${{ github.event_name }}
+          PUSH_SHA: ${{ github.sha }}
+          CATCHUP_SHA: ${{ needs.catchup.outputs.target_sha }}
+        run: |
+          set -euo pipefail
+          case "${EVENT}" in
+            workflow_run) sha="${CATCHUP_SHA}" ;;
+            *)            sha="${PUSH_SHA}" ;;
+          esac
+          if [ ${#sha} -ne 40 ] || case "$sha" in *[!0-9a-f]*) true ;; *) false ;; esac; then
+            echo "целевой SHA не 40-hex: '${sha}' — деплой остановлен"; exit 1
+          fi
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+          echo "целевая вершина: ${sha}"
+
       - name: Deploy via SSH
         uses: appleboy/ssh-action@v1
         with:
@@ -99,9 +230,16 @@ jobs:
             # деплой: workflow зелёный, на VPS — прежний код). Fail-closed:
             set -euo pipefail
             cd /root/hft-platform
+            # TD-150 п.1: выкатывается РЕШЁННАЯ вершина, а не «то, что сейчас на ветке».
+            # Значение проверено на форму на раннере, но проверяется и здесь: пустая строка
+            # в `git reset --hard` — это молчаливая выкатка чего попало, а не отказ.
+            TARGET_SHA="${{ steps.target.outputs.sha }}"
+            if [ ${#TARGET_SHA} -ne 40 ] || case "$TARGET_SHA" in *[!0-9a-f]*) true ;; *) false ;; esac; then
+              echo "=== TARGET_SHA негоден ('$TARGET_SHA') — деплой остановлен ==="; exit 1
+            fi
             PREV=$(git rev-parse HEAD)
             git fetch -q origin main
-            git reset --hard -q origin/main
+            git reset --hard -q "$TARGET_SHA"
             echo "=== deploy $(git rev-parse --short HEAD) (prev $(git rev-parse --short "$PREV")) ==="
             # M-48 (TD-048, B3): установить `deploy/cron.d/*` в `/etc/cron.d/`. Раньше файл в репо
             # был инертен на проде (B3 reviewer PR-гейта: `grep -c gateway-checkpoint = 0`),
