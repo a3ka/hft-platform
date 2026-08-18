@@ -342,14 +342,40 @@ jobs:
       - name: Батарея мутантов (равенство kill-set'ов)
         run: bash scripts/tests/red_deploy_catchup.sh --battery
 
+  branch-build-parity:
+    name: Branch build (ветка собирается тем же составом, что main)
+    runs-on: ubuntu-latest
+    steps:
+      # fetch-depth по умолчанию (1) достаточен: барьер судит ТЕКСТ трёх YAML-файлов рабочего
+      # дерева и в историю не ходит. Проба ГЕРМЕТИЧНА — строит фикстуры в /tmp и в сеть не
+      # ходит вовсе; ходила бы — мерила бы доступность GitHub, а не свой инвариант (TD-135).
+      - uses: actions/checkout@v4
+
+      # Барьер в ПРОД-ФОРМЕ — тем же вызовом, каким его зовёт человек, без аргументов.
+      # Предмет: `.github/workflows/branch-build.yml` даёт сборку КАЖДОЙ не-main ветки. До
+      # него ветка, на которой предмет живёт все круги гейта, не собиралась ни разу (замер:
+      # 130 push-прогонов, все по `main`, на ветках ноль), и M-69 прошёл ДВА круга критика,
+      # ни разу не собравшись. Барьер держит три вещи, которые тихо гниют: наличие сборщика,
+      # паритет его состава с `build-test` В ОБЕ СТОРОНЫ и невмешательство в агрегат/прод.
+      - name: Ветка собирается тем же составом, что main (check_branch_build.sh)
+        run: bash scripts/check_branch_build.sh
+
+      # Анти-плацебо: барьер обязан быть проверен ТОЙ ЖЕ проводкой, какой его зовёт CI —
+      # иначе «зелёный барьер» неотличим от «барьер пропускает всё» (testing.md, целостность
+      # гейта). Батарея требует, чтобы каждый мутант ронял РОВНО свой набор сценариев.
+      # Счёт сценариев печатает сама проба: литерал, живущий отдельно от предмета, врёт
+      # (замер `gate-meta` — заявленные «27» против фактических 31).
+      - name: Проба барьера + батарея мутантов (счёт печатает сама проба)
+        run: bash scripts/tests/red_branch_build.sh --battery
+
   status-check:
     name: All checks passed
     runs-on: ubuntu-latest
-    needs: [build-test, security, delivery, protected-artifacts, contracts, docs-freeze, artifact-ids, reserve-ids, design-claims, context-budgets, gate-meta, deploy-catchup]
+    needs: [build-test, security, delivery, protected-artifacts, contracts, docs-freeze, artifact-ids, reserve-ids, design-claims, context-budgets, gate-meta, deploy-catchup, branch-build-parity]
     if: always()
     steps:
       - run: |
-          if [[ "${{ needs.build-test.result }}" != "success" || "${{ needs.security.result }}" != "success" || "${{ needs.delivery.result }}" != "success" || "${{ needs.protected-artifacts.result }}" != "success" || "${{ needs.contracts.result }}" != "success" || "${{ needs.docs-freeze.result }}" != "success" || "${{ needs.artifact-ids.result }}" != "success" || "${{ needs.reserve-ids.result }}" != "success" || "${{ needs.design-claims.result }}" != "success" || "${{ needs.context-budgets.result }}" != "success" || "${{ needs.gate-meta.result }}" != "success" || "${{ needs.deploy-catchup.result }}" != "success" ]]; then
+          if [[ "${{ needs.build-test.result }}" != "success" || "${{ needs.security.result }}" != "success" || "${{ needs.delivery.result }}" != "success" || "${{ needs.protected-artifacts.result }}" != "success" || "${{ needs.contracts.result }}" != "success" || "${{ needs.docs-freeze.result }}" != "success" || "${{ needs.artifact-ids.result }}" != "success" || "${{ needs.reserve-ids.result }}" != "success" || "${{ needs.design-claims.result }}" != "success" || "${{ needs.context-budgets.result }}" != "success" || "${{ needs.gate-meta.result }}" != "success" || "${{ needs.deploy-catchup.result }}" != "success" || "${{ needs.branch-build-parity.result }}" != "success" ]]; then
             echo "One or more checks failed"; exit 1
           fi
           echo "All checks passed"

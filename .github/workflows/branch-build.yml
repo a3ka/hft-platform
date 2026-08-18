@@ -1,0 +1,80 @@
+name: Branch build
+
+# ЗАЧЕМ ЭТОТ WORKFLOW СУЩЕСТВУЕТ ОТДЕЛЬНО ОТ `ci.yml`
+#
+# Замер (`docs/plans/ci-branch-trigger-probe-2026-08-18.md`,
+# `docs/plans/plan-branches-and-ci-2026-08-19.md` §A): `ci.yml` триггерится только на
+# `pull_request` и `push` в `main` — и `branches: [main]` стоит там с первого коммита
+# репозитория `25fe2c8`. Эмпирика: 130 push-прогонов, ВСЕ по `main`; настоящих
+# push-прогонов на ветках — НОЛЬ. То есть ветка, на которой предмет живёт все круги
+# гейта, не собиралась ни разу.
+#
+# Цена этого, замеренная: M-69 прошёл ДВА круга критика, ни разу не собравшись, а один
+# draft-PR за 9 минут дал три красных джоба, два из которых не нашли оба критика
+# (коллизия `C-100` и врущая таблица `DESIGN` §22 — `A-010` §F). «Гейт, не собиравший
+# предмет, — не гейт.»
+#
+# ПОЧЕМУ НЕ ПРАВКА `ci.yml` НА `push.branches: ['**']`
+#
+# Это предписание (`A-010` §F, оба независимых Fable-агента) отклонено ИСПОЛНЕНИЕМ, а не
+# рассуждением: правка даёт ДЕТЕРМИНИРОВАННЫЙ красный набор, а не вероятностный.
+#   1. Первый push любой новой ветки: `github.event.before` = zero-SHA → fail-closed
+#      каскад роняет ПЯТЬ джобов (`protected-artifacts`, `docs-freeze`, `contracts`,
+#      `artifact-ids`, `gate-meta`).
+#   2. Любой force-push (rebase/amend — рутина агентов): `git merge-base --is-ancestor`
+#      не проходит → те же пять джобов.
+#   3. Процедура merge `gates.md` §8: push в ветку с открытым PR даёт два прогона на одном
+#      SHA → `gh pr checks --watch` вернёт ненулевой код → `gh pr merge` не выполнится
+#      НИКОГДА.
+# Это не дефект барьеров: их инвариант «база = состояние до события» осмыслен только для
+# входа в `main`; на ветке они честно говорят «гарантировать не могу». Чинить надо не их.
+#
+# КОНСТРУКЦИЯ, КОТОРАЯ РАБОТАЕТ ТАМ, ГДЕ ПРЕДПИСАНИЕ — НЕТ
+#
+#   · базу события не читает ВОВСЕ ⇒ zero-SHA и force-push безразличны (снимает 1 и 2);
+#   · НЕ входит в агрегат `All checks passed` (тот живёт в `ci.yml`, свой список `needs`)
+#     ⇒ merge не блокирует, процедура §8 цела (снимает 3);
+#   · воли автора не требует — событие рождает GitHub, забыть нечего.
+#
+# ЧЕГО ЭТОТ WORKFLOW НЕ ДАЁТ (названо явно)
+#
+# Push-триггер строит ВЕТКУ, а не дерево слияния: отставания от `main` он не покажет. За
+# это отвечает `bash scripts/verify_design_claims.sh --merge-preview origin/main`
+# (`gates.md` §8, где `strict: false` назван принятым пределом).
+#
+# ПАРИТЕТ СОСТАВА — НЕ НА ЧЕСТНОМ СЛОВЕ
+#
+# Состав джоба ниже дословно повторяет job `build-test` из `ci.yml`. Если он разойдётся,
+# «ветка собирается» станет означать МЕНЬШЕ, чем `main`, — и это тихо. Расхождение в ОБЕ
+# стороны ловит барьер `scripts/check_branch_build.sh`, заведённый в `ci.yml`
+# (job `branch-build-parity`); он же наблюдает ОТСУТСТВИЕ — удаление этого файла красит
+# `main` (`testing.md`, целостность гейта, свойство 4).
+on:
+  push:
+    branches-ignore: [main]
+
+# Серия push'ей в одну ветку — рутина (intra-chain push, `gates.md` §8). Без отмены
+# предыдущего прогона каждая правка оставляла бы за собой очередь мёртвых сборок.
+# Отличие от `deploy.yml`, где `cancel-in-progress: false` НАМЕРЕННО: там отмена на полпути
+# оставила бы прод в промежуточном состоянии. Здесь отменять безопасно — сборка ветки
+# ничего не публикует и ничего не трогает.
+concurrency:
+  group: branch-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    name: fmt + clippy + test (ветка)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.0
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: fmt
+        run: cargo fmt --all -- --check
+      - name: clippy (warnings = errors)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: test (RED/GREEN — наши инварианты)
+        run: cargo test --all
