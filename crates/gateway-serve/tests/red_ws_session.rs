@@ -82,6 +82,7 @@ const MANIFEST: &[(&str, u8, &str, char)] = &[
         "валидный селектор отсутствующего в журнале инструмента даёт пустой snapshot",
         'L',
     ),
+    ("o12", 4, "кадр в полёте приходит после смены", 'V'),
     ("o8", 1, "env побеждает клиентский subscribe", 'V'),
     (
         "o8",
@@ -1302,7 +1303,11 @@ async fn o12_switch_during_inflight_pump_does_not_restore_old_sub() {
 
     let stale: Vec<&Value> = tail
         .iter()
-        .filter(|v| serde_json::to_string(v).unwrap_or_default().contains("BTCUSDT"))
+        .filter(|v| {
+            serde_json::to_string(v)
+                .unwrap_or_default()
+                .contains("BTCUSDT")
+        })
         .collect();
     assert!(
         stale.is_empty(),
@@ -1312,6 +1317,64 @@ async fn o12_switch_during_inflight_pump_does_not_restore_old_sub() {
          кадры инструмента, который уже не показывает. Примеры: {:?}",
         stale.len(),
         stale.iter().take(2).collect::<Vec<_>>()
+    );
+
+    // ─── ПОЗИТИВНАЯ ПОЛОВИНА (C-098 B-1, четвёртый пункт) ────────────────────────────
+    // Одного «нет BTCUSDT» НЕДОСТАТОЧНО: `drain` вправе вернуть ПУСТОЙ вектор, и тогда
+    // ассерт выше истинен при сервере, который после смены селектора ЗАМОЛЧАЛ НАВСЕГДА.
+    // Оракул принимал бы худшую из возможных реализаций — ровно класс «зелёный против
+    // сломанного» (`testing.md`, целостность гейта, свойство 3). Поэтому ниже проверяется
+    // ДОСТАВКА нового селектора, а не только отсутствие старого.
+    let fresh: Vec<&Value> = tail
+        .iter()
+        .filter(|v| {
+            serde_json::to_string(v)
+                .unwrap_or_default()
+                .contains("ETHUSDT")
+        })
+        .collect();
+    assert!(
+        !fresh.is_empty(),
+        "O-12 НАРУШЕН (позитивная половина): после смены селектора не пришло НИ ОДНОГО \
+         сообщения нового инструмента за {} мс, хотя журнал докормлен ETHUSDT. Сервер, \
+         замолчавший после switch'а, проходит проверку «нет BTCUSDT» и потому обязан \
+         отсекаться здесь. Всего сообщений в хвосте: {}",
+        3 * GRACE_MS + 1_200,
+        tail.len()
+    );
+
+    // §10.3: весь поток после смены идёт под ОДНИМ идентификатором подписки. Протокольного
+    // запроса состава в `CT-RFC-09` §2.3 нет, поэтому состав наблюдается по конвертам —
+    // хелпером `sub_of`, а не выдуманным запросом: второй живой ключ выдал бы себя вторым
+    // значением `sub` в том же хвосте.
+    let mut ids: Vec<&str> = tail.iter().filter_map(sub_of).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(
+        ids,
+        vec!["w1"],
+        "O-12 НАРУШЕН (§10.3): после смены селектора в потоке присутствуют идентификаторы \
+         подписок {ids:?}, ожидался ровно один — «w1». Лишний ключ означает, что старая \
+         подписка не снята, а живёт рядом с новой."
+    );
+
+    // §10.3: детерминизм повтора — тот же вход даёт тот же исход, а не «повезло один раз».
+    append_more(dir.path(), "BTCUSDT", 4, BASE_MS + 15_000);
+    append_more(dir.path(), "ETHUSDT", 4, BASE_MS + 15_000);
+    let repeat = drain(&mut ws, 3 * GRACE_MS + 1_200).await;
+    let stale_repeat = repeat
+        .iter()
+        .filter(|v| {
+            serde_json::to_string(v)
+                .unwrap_or_default()
+                .contains("BTCUSDT")
+        })
+        .count();
+    assert_eq!(
+        stale_repeat, 0,
+        "O-12 НАРУШЕН (детерминизм повтора, §10.3): на ВТОРОМ такте после смены снова пришли \
+         кадры прежнего инструмента ({stale_repeat} шт.). Однократный успех первого такта не \
+         доказывает снятия подписки."
     );
 
     rendezvous::test_remove("w1");
