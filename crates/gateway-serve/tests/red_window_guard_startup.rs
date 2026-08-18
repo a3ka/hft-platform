@@ -191,6 +191,17 @@ fn offline_forms_still_start() {
                  состояться, но отвергнут: {e}"
             )
         });
+        // КАНОНИЗАЦИЯ (C-099 B-2): недостаточно совпадения наблюдаемого поведения — три формы
+        // offline обязаны давать ОДНО внутреннее представление. `Some(0)` даёт тот же
+        // `window_lo_time_s == None`, но ДРУГОЙ `selector_fingerprint`
+        // (crates/gateway/src/lib.rs:2268-2280) ⇒ два ключа чекпоинта для одного режима.
+        // Тот же аргумент, которым отвергается отрицательное значение.
+        assert_eq!(
+            cfg.selector.window_ms, None,
+            "«{name}» обязано канонизироваться в window_ms == None, а не в иное представление \
+             того же поведения: иначе selector_fingerprint расщепляет offline-режим на два \
+             ключа чекпоинта (M-38b)"
+        );
         assert_eq!(
             cfg.selector.window_lo_time_s(1_000_000),
             None,

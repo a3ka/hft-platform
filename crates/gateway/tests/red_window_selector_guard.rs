@@ -49,7 +49,7 @@
 //! `validate_selector` окно не проверяет, вход принимается.
 
 use contracts::{to_fixed, DataSource, EventKind, MdPayload, Side, Venue};
-use gateway::{Cursor, Selector};
+use gateway::{validate_selector, Cursor, Selector};
 use journal::{EpochFilter, Journal, WriterConfig};
 
 const DAY_MS: i64 = 86_400_000;
@@ -199,6 +199,61 @@ fn minus_one_window_rejected_not_panic() {
         Err(_) => {
             panic!("GW-I-14 НАРУШЕН: window_ms=-1 ПАНИКУЕТ вместо fail-closed Err(InvalidInput)")
         }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// RED 2 — precondition живёт ИМЕННО в `validate_selector` (C-099 B-4).
+//
+// Прежняя редакция доказывала это канарейкой verify: `awk` по телу функции + `grep window_ms`.
+// Критик предъявил мутанта, который её проходит: `let _ = &sel.window_ms;` при безусловном
+// `Ok(())` даёт exit 0. Проверка присутствия ИМЕНИ не есть проверка ПОВЕДЕНИЯ — ровно то, что
+// `testing.md` запрещает («проверка по ВЫЗОВУ, а не по тексту»). Канарейка снята, вместо неё —
+// прямой вызов централизованного предусловия, который этот мутант роняет.
+//
+// Функциональные тесты `snapshot`/`frames_since`/`replay` выше остаются отдельным
+// доказательством ПРОВОДКИ: они держат результат, но не говорят, ГДЕ стоит проверка.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn validate_selector_itself_rejects_negative_window() {
+    for w in [-1_i64, -60_000, i64::MIN + 1] {
+        let s = sel(Some(w));
+        match validate_selector(&s) {
+            Err(e) => {
+                assert_eq!(
+                    e.kind(),
+                    std::io::ErrorKind::InvalidInput,
+                    "validate_selector(window_ms={w}): отказ обязан быть InvalidInput, получено {e:?}"
+                );
+                assert!(
+                    e.to_string().contains("window_ms"),
+                    "validate_selector(window_ms={w}): сообщение обязано называть поле \
+                     `window_ms`, получено: {e}"
+                );
+            }
+            Ok(()) => panic!(
+                "GW-I-14 НАРУШЕН: централизованное предусловие `validate_selector` приняло \
+                 window_ms={w}. Проверка обязана жить ЗДЕСЬ, а не только в вызывающих: иначе \
+                 чекпоинтер (M-38b), shared-tailer (M-39) и research-cli собирают Selector \
+                 напрямую и проходят мимо гварда — класс TD-019/TD-020."
+            ),
+        }
+    }
+}
+
+/// Парный vantage к предыдущему: предусловие не перешироко. Валит и заглушку «всегда Err»,
+/// и попытку отвергнуть легитимный offline.
+#[test]
+fn validate_selector_itself_accepts_valid_windows() {
+    for w in [None, Some(0), Some(1), Some(60_000), Some(i64::MAX)] {
+        let s = sel(w);
+        assert!(
+            validate_selector(&s).is_ok(),
+            "GW-I-14 ПЕРЕШИРОК: validate_selector отверг валидный window_ms={w:?} \
+             (None и Some(0) — легитимный offline, положительное — bounded): {:?}",
+            validate_selector(&s).err()
+        );
     }
 }
 

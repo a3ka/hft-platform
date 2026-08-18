@@ -10,6 +10,13 @@
 - **Инвариант:** новый **GW-I-14** (семейство `GW-I` занято по `GW-I-13`; замер:
   `grep -rhoE 'GW-I-[0-9]+' crates/ docs/ | sort -u`).
 - **Прецедент-зеркало:** **M-47 / GW-I-10** — тот же файл, тот же класс, то же обоснование.
+- **Предшественник (найден по вердикту `C-099` B-3, а не мной):**
+  `docs/plans/gateway-ws-contract.md:350-355` (03.08) уже описывает ровно этот дефект и
+  заканчивается словами «асимметрия, которую **RED-оракул может атаковать**». Приглашение
+  написать этот оракул лежало в корпусе две недели. Я его не нашёл: грепал `docs/plans/`
+  по ключам процессных барьеров, но не по имени env-переменной, хотя `reading-map.md`
+  §ПРАВИЛО ПРЕДШЕСТВЕННИКА требует греп по ключевому слову ПРЕДМЕТА. Записано как факт, а не
+  как оправдание: это шестой случай того же класса за двое суток.
 
 ## Objective
 
@@ -134,6 +141,25 @@ argv-путём: `gateway-checkpoint.rs:162-163` — «M-37: bounded-window по
 | Менять дефолт прода (`60000`) | `docker-compose.yml:139`. Гвард обязан оставить рабочий прод рабочим |
 | Писать тесты на собственную реализацию | `testing.md`: оракулы sacred, их пишет architect. Dev делает GREEN по этим |
 
+## Allowed paths
+
+Разделение по ролям — закон для scope-гейта (`scope-guard.md`, `gates.md` §4 Block-scope).
+
+| путь | кто правит | что именно |
+|---|---|---|
+| `crates/gateway-serve/src/lib.rs` | **engine-dev** | задачи #1, #2, #4 — разбор env + док-комментарий |
+| `crates/gateway/src/lib.rs` | **engine-dev** | задача #3 — `validate_selector` |
+| `docs/plans/gateway-ws-contract.md` | **architect** (сделано в этом наборе) | задача #5 — синхронизация factual-документа |
+| `crates/gateway-serve/tests/**`, `crates/gateway/tests/**` | **architect only** (sacred) | RED-оракулы; dev не правит даже «неверный» тест |
+| `scripts/verify_M-69.sh` | **architect only** (sacred) | acceptance-гейт |
+| `milestones/M-69-window-guard.md` | **architect only** | dev правит ТОЛЬКО колонку Status в §Tasks |
+
+**Forbidden paths (сверх запретного списка ниже):** `crates/contracts/**` (T1 — только
+contract-RFC), `crates/gateway/src/bin/gateway-checkpoint.rs` (argv-путь уже fail-closed,
+трогать незачем), `docker-compose.yml` (прод-дефолт `60000` валиден и остаётся), любые
+`crates/*` вне двух названных файлов, `Cargo.toml` любого крейта (новых зависимостей задача
+не требует).
+
 ## Contract impact
 
 **T1 — НЕ затронут.** `Event`/`EventKind`/`SegmentHeader` не меняются; contract-RFC не требуется
@@ -149,6 +175,15 @@ argv-путём: `gateway-checkpoint.rs:162-163` — «M-37: bounded-window по
 | 2 | ⏳ OPEN | Тот же вход: отрицательное значение → `Err` (не «молчаливый unbounded») | тот же оракул | `crates/gateway-serve/src/lib.rs` |
 | 3 | ⏳ OPEN | `validate_selector`: расширить на `window_ms` — `Some(w<0)` → `Err` (анти-байпас для чекпоинтера/shared-tailer/research-cli); `None`/`Some(0)`/`Some(w>0)` проходят | `cargo test -p gateway --test red_window_selector_guard` | `crates/gateway/src/lib.rs` |
 | 4 | ⏳ OPEN | Док-комментарий `serve_config_from_env` приведён к факту: строка «не парсится → offline unbounded» (`lib.rs:676-678`) сегодня описывает дефект как норму | `bash scripts/verify_M-69.sh` шаг 6 | `crates/gateway-serve/src/lib.rs` |
+| 5 | ✅ DONE | **(architect, в этом наборе)** Синхронизирован factual-документ `docs/plans/gateway-ws-contract.md` — ТРИ записи, не две: `:132` (таблица env), `:341` (устаревшая ссылка `docker-compose.yml:128` → `:139`), `:350-355` (замечание для оракула). Документ не помечен историческим и назван «фактура для RED-оракулов» ⇒ после фикса стал бы ложью, тиражируемой в следующие оракулы (класс `TD-155`) | `bash scripts/verify_M-69.sh` шаг 7 | `docs/plans/gateway-ws-contract.md` |
+
+**Канонизация offline (уточнение к задаче #1 по `C-099` B-2).** Три формы — `unset`, пустая
+строка/пробелы, `"0"` — обязаны давать **ровно одно** внутреннее представление
+`selector.window_ms == None`. Недостаточно, чтобы совпадало наблюдаемое поведение
+`window_lo_time_s`: `Some(0)` даёт тот же `None` на выходе, но ДРУГОЙ
+`selector_fingerprint` (`crates/gateway/src/lib.rs:2268-2280`) ⇒ два разных ключа чекпоинта
+для одного и того же режима. Это тот же аргумент, которым отвергается отрицательное
+значение, — критик применил его к нулю, и он верен.
 
 ## RED-тесты (sacred, architect-only — dev их НЕ правит)
 

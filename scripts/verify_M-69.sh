@@ -29,14 +29,22 @@ chk cargo test -p gateway-serve --test red_window_guard_startup --quiet
 step "task #3 — GW-I-14 в БИБЛИОТЕКЕ: анти-байпас на snapshot/frames_since/replay"
 chk cargo test -p gateway --test red_window_selector_guard --quiet
 
-# Анти-байпас по КОДУ (класс TD-019/TD-020 «механизм есть, никто не зовёт»). Гвард обязан жить
-# в ТЕЛЕ `validate_selector` — единственной точке, через которую проходят все три публичных
-# входа библиотеки. Проверка по телу функции, а не по файлу: `window_ms` встречается в lib.rs
-# многократно (поле Selector, fingerprint, window_lo_time_s), и `grep` по файлу был бы зелёным
-# ещё до фикса — то есть вакуумной канарейкой.
-step "канарейка — гвард окна В ТЕЛЕ validate_selector (а не только в конфиге транспорта)"
-chk bash -c "awk '/pub fn validate_selector/,/^}/' crates/gateway/src/lib.rs \
-  | sed 's://.*::' | grep -q 'window_ms'"
+# Анти-байпас (класс TD-019/TD-020 «механизм есть, никто не зовёт») проверяется ПОВЕДЕНИЕМ —
+# тестами `validate_selector_itself_*` внутри шага task #3 выше, а НЕ присутствием имени в коде.
+# Прежняя редакция искала строку `window_ms` в теле `validate_selector` (`awk` + `grep`); критик
+# предъявил мутанта, который её проходит: `let _ = &sel.window_ms;` при безусловном `Ok(())` →
+# exit 0 (`C-099` B-4). Присутствие ИМЕНИ не есть проверка ПОВЕДЕНИЯ; `testing.md` требует
+# проверять по ВЫЗОВУ. Канарейка снята намеренно и не заменена другой текстовой.
+
+# task #5: factual-документ обязан перестать описывать parse-error как норму. Документ назван
+# «фактура для RED-оракулов» и не помечен историческим ⇒ ложь в нём тиражируется в следующие
+# оракулы (класс TD-155).
+# Проверка ПОЗИТИВНАЯ (действующая политика названа), плюс негативная на снятую формулировку.
+# Негативный grep по фразе сам по себе хрупок — переживает переформулировку дефекта; позитивный
+# держит утверждение, которое обязано присутствовать.
+step "task #5 — docs/plans/gateway-ws-contract.md синхронизирован с fail-closed политикой"
+chk bash -c "grep -qE '\`GATEWAY_WINDOW_MS\`.*fail-closed.*GW-I-14' docs/plans/gateway-ws-contract.md"
+chk bash -c "! grep -qE '\`GATEWAY_WINDOW_MS\`.*graceful, НЕ ошибка' docs/plans/gateway-ws-contract.md"
 
 # Регресс соседнего инварианта: M-47 (GW-I-10) — гвард таймфрейма в обеих своих точках.
 step "регресс — GW-I-10 (M-47) не ослаблен: библиотека + старт"
