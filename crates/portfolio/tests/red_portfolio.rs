@@ -151,3 +151,6 @@ fn pf_budget_validation_is_fail_closed() {
         "дубль лимита → Err (двусмысленный конфиг)"
     );
 }
+
+#[allow(dead_code)]
+fn   adversarial_lens3_probe_marker (  )  ->   i32 {  1  }
