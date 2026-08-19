@@ -485,3 +485,33 @@ bash /tmp/vdc.sh <корень>; echo exit=$?      →  VERDICT: FAIL (22 нар
 **Что этим НЕ лечится и объявлено честно (`COGNITIVE-ONLY`):** `файл:строка` не проверяется
 нигде и проверяться не будет; маркер превращает «молча ложно» в «явно датировано». Дрейф
 `gateway-ws-contract.md` — 598 коммитов с ревизии сбора — шапкой объявляется, а не устраняется.
+
+### Разбор невлитых веток — 2026-08-19 (замер и исполнение)
+
+Полный список и обоснования — `docs/plans/branch-inventory-2026-08-19.md`; независимая
+перепроверка перед необратимыми действиями — `research/reviews/R-095-branch-disposition-recheck.md`
+(NOTE при условиях У-1…У-6).
+
+**Веток в `origin` было 28 → стало 14.** Влиты: `docs/session-handover-2026-08-19` (унесла с
+собой `A-010`, план, оба замера и два fable-документа — четыре ветки одним merge'ем),
+`feat/harness-branch-build`, `docs/founder-decisions-2026-08-17` (PR #19), `docs/P-012-decision`
+(PR #18), `docs/M-60c-plan` (PR #40), вердикты `R-095`/инвентарь.
+
+**Удалены с доказательством нулевой потери** (ancestry либо побайтная идентичность,
+предъявлено ДО удаления): `feat/M-65-ws-session`, `feat/M-65-race-fix`, `docs/M-67-market-layer`,
+`test/depth-from-book`, `docs/A-010-arbitration-2026-08-18`, `docs/fable-open-questions-2026-08-18`,
+`docs/fable-e3-f2-2026-08-18`, `salvage/M-59-research-dev-uncommitted`, `feat/M-10-rebased`,
+`feat/M-60-mechanisms`.
+
+**Строки §0bis выше про `feat/M-60-mechanisms` (`:27`) и `feat/M-10-rebased` (`:28`, `:38`,
+`:101`) — ИСТОРИЧЕСКИЕ и намеренно не правились:** §0bis есть датированный снимок 14.08, а на
+его номера строк ссылаются чужие вердикты (`R-092`, `R-087`, `R-032`). Действующее состояние —
+этот абзац.
+
+**Где живёт содержимое удалённых веток:** `docs/archive/M-10-obi-killscreen-retired-2026-07/`
+(включая `crates-research-cli.patch` — применимость на сегодняшнем `main` проверена `R-095`
+исполнением, IDENTICAL ×8, и 276 записей `trials-ledger` с совпавшим md5);
+`docs/archive/M-60-mechanisms-umbrella-2026-08.md` + `docs/archive/verify_M-60-umbrella-2026-08.sh`;
+дельта роадмапа, которую `R-095` нашёл единственным непокрытым грузом, перенесена в
+`docs/09-roadmap-v2.md` §«Процессный трек» этим же коммитом. Работа M-59 влита в `main`
+(`61f452e`, `R-083` APPROVED), `TD-107`/`TD-108` закрыты — черновик из salvage превзойдён.
