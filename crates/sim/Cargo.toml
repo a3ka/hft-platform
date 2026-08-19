@@ -1,0 +1,28 @@
+[package]
+name = "sim"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+
+# Слой 6 (docs/fa/sim.md): честный исполнительный симулятор (backtest+paper).
+# СТРУКТУРНО не зависит от venue-* (SM-I-9): отсутствие live-write пути — факт
+# Cargo-графа, не политика. Никакого rand-крейта — собственный SplitMix64 (D10).
+
+[dependencies]
+contracts = { path = "../contracts" }
+book = { path = "../book" }
+# M-07 D1/carve-out A1: sim (Слой 6) зависит на strategy (Слой 4) — направление ВНИЗ,
+# онион не нарушен. Владелец формы OrderIntent — продюсер (strategy); sim её ре-экспортирует.
+strategy = { path = "../strategy" }
+alpha = { path = "../alpha" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
+journal = { path = "../journal" }
+# M-07: интеграционный RED ST-I-8 (crates/sim/tests/red_strategy_backtest.rs) собирает
+# настоящую стратегию (signals → alpha → portfolio → strategy) и гоняет её через
+# BacktestExchange. Только dev — в рантайм sim эти крейты не попадают сверх strategy/alpha.
+signals = { path = "../signals" }
+portfolio = { path = "../portfolio" }
