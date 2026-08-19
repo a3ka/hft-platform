@@ -246,4 +246,5 @@ contract/schema/RFC jobs, `verify_design_claims.sh`, `red_verify_design_claims.s
   **Условие ВЫПОЛНЕНО 2026-08-17** (`R-095` У-3): судьба зонта принята founder'ом — PR #12
   «Архивация: зонт M-60 и kill-screen M-10 как retired/defective». Уникальный груз перенесён
   в `main`: зонт и `verify_M-60.sh` — в `docs/archive/`, дельта роадмапа — в
-  `docs/09-roadmap-v2.md` §«Процессный трек». Ветка удалена 2026-08-19.
+  `docs/09-roadmap-v2.md` §«Процессный трек». Ветка ЖИВА (`f0e915b`): удаление ref'а —
+  предстоящий шаг под условиями `R-095` У-1…У-3.

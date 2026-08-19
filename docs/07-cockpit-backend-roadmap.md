@@ -191,8 +191,8 @@ M-10 стек-фиксы (сигналы), funding-стратегия.
 - `research/exports/format.md` — export-контракт v1.
 - `TECH-DEBT.md` TD-016 (фантом дальних полос), TD-004/010 (REST-глубина).
 - `docs/archive/M-10-obi-killscreen-retired-2026-07/` — замороженная RED-спека сигналов
-  (C-020 A/B/C/D) + D-001 (OBI KILL). Ветка `feat/M-10-rebased` удалена 2026-08-19 после
-  архивации (PR #12) и независимой перепроверки `R-095`.
+  (C-020 A/B/C/D) + D-001 (OBI KILL). Ветка `feat/M-10-rebased` ЖИВА (`51c21dc`): архивация выполнена (PR #12),
+  удаление ref'а — предстоящий шаг под условиями `R-095` У-1/У-2.
 - `tmp/design_screens/` — Bookmap/TPP референсы + брифы.
 - `milestones/{M-16,M-17,M-18,M-19,M-20,M-21}.md`.
 
