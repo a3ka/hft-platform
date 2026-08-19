@@ -81,25 +81,51 @@ if ! git rev-parse -q --verify origin/main >/dev/null 2>&1; then
 fi
 
 # ─── источник состояния PR ──────────────────────────────────────────────────────────────
+# FAIL-CLOSED НА ОТКАЗЕ ИСТОЧНИКА (`C-107` F-106-3 / `C-106`). Первая редакция глушила отказ
+# `gh pr list` через `|| true` — тогда «источник недоступен» превращалось в «открытых PR нет»,
+# и агрегат ВИСЯК молчал при полном PASS. Отдельно любой ненулевой код `gh pr checks`, кроме
+# pending, помечался `red` — то есть «не смогли спросить» было неотличимо от «чеки красные».
+# Оба состояния теперь РАЗДЕЛЕНЫ и оба краснеют: неизвестность — не наблюдение.
+#
+# Различитель `gh pr checks` (коды gh): 0 — все прошли; 8 — есть pending; 1 — есть упавшие,
+# НО этот же код приходит и при ошибке транспорта. Поэтому 1 засчитывается как `red` ТОЛЬКО
+# если на stdout пришли строки чеков (в них есть таб); иначе — `unknown`.
 PRS_FILE=""
+SRC_MODE="injected"
 if [ -n "${BRANCH_HEALTH_PRS:-}" ]; then
   [ -r "${BRANCH_HEALTH_PRS}" ] || { bad "SETUP: BRANCH_HEALTH_PRS='${BRANCH_HEALTH_PRS}' нечитаем"; echo; echo "VERDICT: FAIL (${FAILED})"; exit 1; }
   PRS_FILE="${BRANCH_HEALTH_PRS}"
 else
+  SRC_MODE="live"
   PRS_FILE="$(mktemp)"; trap 'rm -f "${PRS_FILE}"' EXIT
-  if command -v gh >/dev/null 2>&1; then
-    while IFS=$'\t' read -r br num; do
-      [ -n "${br:-}" ] || continue
-      if gh pr checks "${num}" >/dev/null 2>&1; then st=green
-      else case $? in 8) st=pending ;; *) st=red ;; esac; fi
-      printf '%s\t%s\t%s\n' "${br}" "${num}" "${st}" >> "${PRS_FILE}"
-    done < <(gh pr list --state open --json number,headRefName \
-               --jq '.[] | "\(.headRefName)\t\(.number)"' 2>/dev/null || true)
-  else
-    # `gh` нет — это НЕ «PR-ов нет». Различие названо, а не проглочено.
-    note "источник PR недоступен (нет gh): агрегат ВИСЯК в этом прогоне НЕ считался"
-    printf '' > "${PRS_FILE}"
-  fi
+  # Страж ОДНОСТРОЧНЫЙ намеренно: многострочный `bash`-конструкт нельзя нейтрализовать
+  # мутантом, не сломав синтаксис, — и тогда батарея мерила бы разбор, а не инвариант.
+  command -v gh >/dev/null 2>&1 || { bad "SETUP: живой источник PR недоступен — gh не найден; это НЕ «открытых PR нет», агрегат ВИСЯК посчитать нечем"; echo; echo "VERDICT: FAIL (${FAILED}) — источник наблюдения недостоверен"; exit 1; }
+  LIST_OUT="$(gh pr list --state open --json number,headRefName \
+                --jq '.[] | "\(.headRefName)\t\(.number)"' 2>/dev/null)"; LIST_RC=$?
+  [ "${LIST_RC}" -eq 0 ] || { bad "SETUP: gh pr list отказал (exit=${LIST_RC}) — список открытых PR не получен; пустой список от отказа неотличим, наблюдение НЕ состоялось"; echo; echo "VERDICT: FAIL (${FAILED}) — источник наблюдения недостоверен"; exit 1; }
+  while IFS=$'\t' read -r br num; do
+    [ -n "${br:-}" ] || continue
+    CHK_OUT="$(gh pr checks "${num}" 2>&1)"; CHK_RC=$?
+    case "${CHK_RC}" in
+      0) st=green ;;
+      8) st=pending ;;
+      1) # Под кодом 1 у gh живут ТРИ разных мира, и смешивать их нельзя:
+         #   · есть строки чеков (в них таб) ⇒ чеки реально красные;
+         #   · «no checks reported» ⇒ достоверный ответ «чеков НЕТ ВОВСЕ» — это наблюдение,
+         #     а не отказ, и для нас оно ценное: ветка с открытым PR и нулём прогонов есть
+         #     ровно та патология, ради которой строился сборщик веток;
+         #   · всё прочее ⇒ спросить не удалось.
+         # Разделение найдено ИСПОЛНЕНИЕМ: `gh pr checks 6` даёт exit=1 и «no checks reported
+         # on the 'feat/M-66-fixture' branch». Классификация без этой ветви пометила бы
+         # достоверный ответ как отказ источника — ложное красное.
+         if printf '%s' "${CHK_OUT}" | grep -q "$(printf '\t')"; then st=red
+         elif printf '%s' "${CHK_OUT}" | grep -qi 'no checks reported'; then st=nochecks
+         else st=unknown; fi ;;
+      *) st=unknown ;;
+    esac
+    printf '%s\t%s\t%s\n' "${br}" "${num}" "${st}" >> "${PRS_FILE}"
+  done <<< "${LIST_OUT}"
 fi
 
 pr_of() { awk -F'\t' -v b="$1" '$1==b {print $2"\t"$3; exit}' "${PRS_FILE}"; }
@@ -112,6 +138,8 @@ printf '%s\n' '─────────────────────�
 
 declare -A ID_SEEN=()
 STALE_GREEN=()
+UNKNOWN_PRS=()
+NOCHECK_PRS=()
 TOTAL=0
 
 for row in "${BRANCHES[@]}"; do
@@ -127,6 +155,16 @@ for row in "${BRANCHES[@]}"; do
     prcol="#${num}/${st}"
     if [ "${st}" = "green" ] && [ "${age}" -ge "${STALE_DAYS}" ]; then
       STALE_GREEN+=("${br} (PR #${num}, ${age} сут)")
+    fi
+    # `unknown` — состояние «спросить не удалось». Оно НЕ зелёное, НЕ красное и НЕ «PR нет»:
+    # про эту ветку наблюдение не состоялось, и прогон обязан быть красным (`C-107` F-106-3).
+    # Известные результаты соседних PR при этом СОХРАНЯЮТСЯ — частичный отказ не обнуляет
+    # то, что удалось узнать.
+    if [ "${st}" = "unknown" ]; then
+      UNKNOWN_PRS+=("${br} (PR #${num})")
+    fi
+    if [ "${st}" = "nochecks" ]; then
+      NOCHECK_PRS+=("${br} (PR #${num}, ${age} сут)")
     fi
   else
     prcol="—"
@@ -147,6 +185,26 @@ if [ ${#STALE_GREEN[@]} -gt 0 ]; then
   done
 else
   echo "ok    ВИСЯК: веток с зелёным PR и без merge'а не найдено"
+fi
+
+# ─── агрегат 1bis: НЕИЗВЕСТНО (fail-closed, `C-107` F-106-3) ───────────────────────────
+if [ ${#UNKNOWN_PRS[@]} -gt 0 ]; then
+  for u in "${UNKNOWN_PRS[@]}"; do
+    bad "НЕИЗВЕСТНО: ${u} — состояние чеков получить не удалось. Это не «зелено» и не «красно»: \
+наблюдение по этой ветке НЕ состоялось"
+  done
+else
+  echo "ok    НЕИЗВЕСТНО: состояние чеков получено по всем PR, о которых спрашивали"
+fi
+
+# ─── агрегат 1ter: PR БЕЗ ЕДИНОГО ЧЕКА ─────────────────────────────────────────────────
+# Это НЕ ошибка источника: ответ получен и он достоверен. Наблюдение полезное — открытый PR,
+# по которому не прогонялось ничего, ровно та слепота, из-за которой M-69 прошёл два круга
+# критика, ни разу не собравшись.
+if [ ${#NOCHECK_PRS[@]} -gt 0 ]; then
+  for n in "${NOCHECK_PRS[@]}"; do
+    note "БЕЗ ЧЕКОВ: ${n} — PR открыт, но не прогонялось НИ ОДНОГО чека"
+  done
 fi
 
 # ─── агрегат 2: ДУБЛЬ ───────────────────────────────────────────────────────────────────

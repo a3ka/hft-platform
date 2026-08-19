@@ -80,6 +80,63 @@ expect() {
   ok "${name}" "exit=${RC}"
 }
 
+
+# --- поддельный `gh` в PATH: прогоняем ЖИВОЙ путь барьера без сети ---------------------
+# Инъекция BRANCH_HEALTH_PRS обходит весь блок работы с gh — именно поэтому первая редакция
+# пробы не покрывала отказы источника (`C-107` F-106-3). Здесь подменяется САМ `gh`, значит
+# исполняется прод-ветка кода.
+#   mk_gh <каталог> <режим-list> <спец-checks>
+#     режим-list: ok:<ветка>:<num>[,<ветка>:<num>…] | fail
+#     спец-checks: строки вида <num>=green|pending|red|nochecks|boom, через запятую
+mk_gh() {
+  local d="$1" listmode="$2" chk="$3"
+  mkdir -p "${d}/bin" || return 1
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf 'if [ "$1" = "pr" ] && [ "$2" = "list" ]; then\n'
+    if [ "${listmode}" = "fail" ]; then
+      printf '  echo "could not resolve to a Repository" >&2; exit 1\n'
+    else
+      printf '  cat <<ROWS\n%s\nROWS\n  exit 0\n' "$(printf '%s' "${listmode#ok:}" | tr ',' '\n' | awk -F: 'NF==2{printf "%s\t%s\n",$1,$2}')"
+    fi
+    printf 'fi\n'
+    printf 'if [ "$1" = "pr" ] && [ "$2" = "checks" ]; then\n'
+    printf '  case "$3" in\n'
+    local pair
+    for pair in ${chk//,/ }; do
+      local num="${pair%%=*}" st="${pair##*=}"
+      case "${st}" in
+        green)    printf '    %s) printf "All checks passed\\tpass\\t3s\\turl\\n"; exit 0 ;;\n' "${num}" ;;
+        pending)  printf '    %s) printf "job\\tpending\\t0\\turl\\n"; exit 8 ;;\n' "${num}" ;;
+        red)      printf '    %s) printf "job\\tfail\\t5s\\turl\\n"; exit 1 ;;\n' "${num}" ;;
+        nochecks) printf '    %s) echo "no checks reported on the branch" >&2; exit 1 ;;\n' "${num}" ;;
+        boom)     printf '    %s) echo "HTTP 503 upstream" >&2; exit 1 ;;\n' "${num}" ;;
+      esac
+    done
+    printf '    *) echo "unexpected" >&2; exit 4 ;;\n'
+    printf '  esac\n'
+    printf 'fi\n'
+    printf 'exit 4\n'
+  } > "${d}/bin/gh"
+  chmod +x "${d}/bin/gh"
+}
+
+# run_live <корень> <каталог-с-gh> — БЕЗ BRANCH_HEALTH_PRS, то есть по живому пути
+run_live() {
+  OUT="$(PATH="$2/bin:${PATH}" BRANCH_HEALTH_ROOT="$1" BRANCH_HEALTH_STALE_DAYS=0 bash "${SUT_ACTIVE}" 2>&1)"; RC=$?
+}
+
+expect_live() {
+  local name="$1" root="$2" ghd="$3" wantrc="$4" must="$5" mustnot="$6"
+  run_live "${root}" "${ghd}"
+  if [ "${RC}" -ne "${wantrc}" ]; then
+    nok "${name}" "exit=${RC}, ожидался ${wantrc}: $(grep -m1 -E '^(FAIL|VERDICT)' <<<"${OUT}")"; return
+  fi
+  if [ "${must}" != "-" ] && ! grep -qF "${must}" <<<"${OUT}"; then nok "${name}" "нет «${must}»"; return; fi
+  if [ "${mustnot}" != "-" ] && grep -qF "${mustnot}" <<<"${OUT}"; then nok "${name}" "ЛОЖНОЕ: есть «${mustnot}»"; return; fi
+  ok "${name}" "exit=${RC}"
+}
+
 scenarios() {
 
 # --- позитивный контроль: две разные ветки, PR-ов нет ------------------------------------
@@ -114,11 +171,11 @@ expect "S6-без-ID-не-дубль" "${d}" /dev/null 0 "-" "NOTE  ДУБЛЬ"
 
 # --- FAIL-CLOSED на несостоявшемся setup'е -----------------------------------------------
 # Не-git каталог: «наблюдать нечего» ОБЯЗАНО краснеть, а не печатать пустой список.
-d="${WORK}/notgit"; mkdir -p "${d}"; register "${d}"
+d="$(mktemp -d "${WORK}/notgit-XXXXXX")"; register "${d}"
 expect "S7-не-репозиторий" "${d}" /dev/null 1 "SETUP" "VERDICT: PASS"
 
 # Репозиторий есть, origin/main нет — отставание считать не от чего.
-d="${WORK}/nomain"; mkdir -p "${d}"; register "${d}"
+d="$(mktemp -d "${WORK}/nomain-XXXXXX")"; register "${d}"
 ( cd "${d}" && git init -q . && git config user.email t@t && git config user.name t \
   && echo x > a && git add a && git commit -qm x ) || { sfail "S8-без-origin-main" "фикстура"; return; }
 expect "S8-без-origin-main" "${d}" /dev/null 1 "origin/main не существует" "VERDICT: PASS"
@@ -131,6 +188,42 @@ expect "S9-нечитаемый-PRS" "${d}" "${d}/no-such-file.tsv" 1 "нечи�
 d="$(mk_repo empty)" || { sfail "S10-ноль-веток" "фикстура"; return; }
 expect "S10-ноль-веток" "${d}" /dev/null 0 "веток кроме main: 0" "-"
 
+# --- ЖИВОЙ ПУТЬ gh: четыре состояния и частичный отказ (C-107 F-106-3) --------------------
+d="$(mk_repo ghfail feat/M-20-x)" || { sfail "S11-gh-list-отказ" "фикстура"; return; }
+mk_gh "${d}" fail "" || { sfail "S11-gh-list-отказ" "поддельный gh"; return; }
+expect_live "S11-gh-list-отказ" "${d}" "${d}" 1 "gh pr list отказал" "VERDICT: PASS"
+
+d="$(mk_repo ghboom feat/M-21-y)" || { sfail "S12-checks-отказ" "фикстура"; return; }
+mk_gh "${d}" "ok:feat/M-21-y:21" "21=boom" || { sfail "S12-checks-отказ" "gh"; return; }
+expect_live "S12-checks-отказ" "${d}" "${d}" 1 "НЕИЗВЕСТНО" "VERDICT: PASS"
+
+# ЧАСТИЧНЫЙ отказ — прямое требование C-107: известный результат обязан УЦЕЛЕТЬ,
+# неизвестный — быть назван, прогон — красным.
+d="$(mk_repo ghpartial feat/M-22-ok feat/M-23-bad)" || { sfail "S13-частичный-отказ" "фикстура"; return; }
+mk_gh "${d}" "ok:feat/M-22-ok:22,feat/M-23-bad:23" "22=green,23=boom" || { sfail "S13-частичный-отказ" "gh"; return; }
+run_live "${d}" "${d}"
+if [ "${RC}" -eq 0 ]; then nok "S13-частичный-отказ" "exit=0 — отказ проглочен"
+elif ! grep -qF "НЕИЗВЕСТНО: feat/M-23-bad" <<<"${OUT}"; then nok "S13-частичный-отказ" "не назван недоступный PR"
+elif ! grep -qF "ВИСЯК: feat/M-22-ok" <<<"${OUT}"; then nok "S13-частичный-отказ" "ПОТЕРЯН известный результат соседнего PR"
+else ok "S13-частичный-отказ" "известное уцелело, неизвестное названо, exit=${RC}"; fi
+
+# «чеков нет вовсе» — ДОСТОВЕРНЫЙ ответ, а не отказ: наблюдение состоялось.
+d="$(mk_repo ghnochecks feat/M-24-z)" || { sfail "S14-без-чеков" "фикстура"; return; }
+mk_gh "${d}" "ok:feat/M-24-z:24" "24=nochecks" || { sfail "S14-без-чеков" "gh"; return; }
+expect_live "S14-без-чеков" "${d}" "${d}" 0 "БЕЗ ЧЕКОВ: feat/M-24-z" "НЕИЗВЕСТНО: feat/M-24-z"
+
+# красное остаётся красным и висяком не считается
+d="$(mk_repo ghred feat/M-25-r)" || { sfail "S15-живой-red" "фикстура"; return; }
+mk_gh "${d}" "ok:feat/M-25-r:25" "25=red" || { sfail "S15-живой-red" "gh"; return; }
+expect_live "S15-живой-red" "${d}" "${d}" 0 "-" "NOTE  ВИСЯК"
+
+# gh отсутствует вовсе — сценарий СНЯТ, и причина названа, а не умолчана.
+# Замер: `gh` лежит СРАЗУ В ДВУХ каталогах PATH (/usr/bin и /bin). Убрать оба — значит унести
+# вместе с ним bash, git, grep и весь инструментарий, и сценарий начал бы мерить хирургию над
+# PATH вместо своего инварианта (`testing.md`: оракул обязан мерить ТО, ЧТО ОБЕЩАЕТ).
+# Класс «источник недоступен» при этом покрыт: S11 (отказ `gh pr list`) исполняет ту же ветку
+# fail-closed по тому же коду возврата. Отдельный мутант M4 пиннит именно её.
+
 }
 
 # ═══ Батарея мутантов ═══════════════════════════════════════════════════════════════════
@@ -140,8 +233,14 @@ battery() {
   # управляет только строкой «ни один предмет не живёт больше чем на одной ветке», а сама
   # находка печаталась по-прежнему. Мутант, не роняющий свой сценарий, ничего не пиннит.
   local mutants=(
-    "M1-ВИСЯК:STALE_GREEN+=:S1-висяк-зелёный"
+    # S13 принадлежит ДВУМ мутантам, и это не дефект: сценарий частичного отказа требует,
+    # чтобы известный результат соседнего PR УЦЕЛЕЛ (агрегат ВИСЯК) и одновременно чтобы
+    # недоступный был назван (агрегат НЕИЗВЕСТНО). Нейтрализация любого из двух его роняет.
+    # Заявляем обе принадлежности явно — иначе kill-set «сойдётся» по недосмотру.
+    "M1-ВИСЯК:STALE_GREEN+=:S1-висяк-зелёный S13-частичный-отказ"
     "M2-ДУБЛЬ:note \"ДУБЛЬ: предмет:S4-дубль"
+    "M3-НЕИЗВЕСТНО:UNKNOWN_PRS+=:S12-checks-отказ S13-частичный-отказ"
+    "M4-LIST-FAIL:LIST_RC}\" -eq 0 ]:S11-gh-list-отказ"
   )
   local bfail=0
   for spec in "${mutants[@]}"; do
