@@ -64,12 +64,20 @@
 
 set -uo pipefail
 
+# Разбор шапки — ОБЩИЙ (`scripts/lib/gate_meta.sh`), а не свой: второй потребитель формата
+# (`scripts/check_verdict_gate.sh`) обязан читать шапку ТЕМ ЖЕ кодом, иначе барьеры разойдутся
+# на первой же правке формата и разойдутся молча (`A-010` §G). Подключение fail-closed:
+# пропажа библиотеки не смеет превращаться в «шапок нет».
+__LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/gate_meta.sh"
+# shellcheck source=lib/gate_meta.sh
+. "${__LIB}" 2>/dev/null || { echo "FAIL  библиотека разбора шапки «${__LIB}» недоступна — читать GATE-META нечем"; exit 2; }
+
 ZERO=0000000000000000000000000000000000000000
-VERDICT_ENUM="REJECT NOTE APPROVE PASS CONCERNS KILL ESCALATE DECISION"
+VERDICT_ENUM="${GATE_META_VERDICT_ENUM}"
 # Проходные исходы — только они запирают предмет. После REJECT/KILL/CONCERNS/ESCALATE
 # правки ШТАТНЫ, и лок, красящий нормальный круг исправлений, вреднее отсутствующего
 # (GM-11; спека §8 «Запретный список»).
-PASSING_VERDICTS="NOTE APPROVE PASS DECISION"
+PASSING_VERDICTS="${GATE_META_PASSING_VERDICTS}"
 
 FAILED=0
 bad() { echo "FAIL  $*"; FAILED=$((FAILED + 1)); }
@@ -80,9 +88,7 @@ die() {
   exit 2
 }
 
-in_list() { # $1=игла $2=список через пробел
-  case " $2 " in *" $1 "*) return 0 ;; *) return 1 ;; esac
-}
+in_list() { gate_meta_in_list "$1" "$2"; }
 
 # ── 1. База диапазона ─────────────────────────────────────────────────────────────────
 raw="${1:-}"
@@ -126,17 +132,8 @@ ORIGIN_SLUG="$(slug_of "${ORIGIN_URL}")"
 echo "── GATE-META: диапазон ${BASE:0:8}..HEAD, origin=${ORIGIN_SLUG}"
 
 # ── 3. Форма шапки, принадлежность предмету, subject-lock ─────────────────────────────
-meta_of() { # $1=содержимое файла → строки ВНУТРИ блока GATE-META
-  printf '%s\n' "$1" | awk '
-    /<!-- GATE-META/ { inb = 1; next }
-    inb && /-->/     { exit }
-    inb              { print }'
-}
-field_of() { # $1=имя поля $2=блок шапки
-  printf '%s\n' "$2" \
-    | sed -n "s/^[[:space:]]*$1:[[:space:]]*//p" \
-    | sed -n '1p' | sed 's/[[:space:]]*$//'
-}
+meta_of()  { gate_meta_block "$1"; }        # → строки ВНУТРИ блока GATE-META
+field_of() { gate_meta_field "$1" "$2"; }   # $1=имя поля $2=блок шапки
 # Классы путей, запираемые проходным вердиктом (спека §10 — предел: только эти классы).
 is_gate_class() {
   case "$1" in
@@ -218,13 +215,8 @@ while IFS="$(printf '\t')" read -r st f; do
   # Форма НАМЕРЕННО шире буквального «M-NN[буква]» из спеки §4: вердикты пишутся и по
   # карточкам долга (`R-077` аудировал `TD-141`), и сузить её значило бы завести ложный
   # красный там, где предмет назван честно. Отступление названо, а не сделано молча.
-  case "${ms}" in
-    [A-Za-z]*-[0-9]*)
-      grep -qE '^[A-Za-z]+-[0-9]+[a-z]?$' <<<"${ms}" \
-        || bad "${f}: milestone «${ms}» не похож на идентификатор артефакта (КЛАСС-НОМЕР[буква])"
-      ;;
-    *) bad "${f}: milestone «${ms}» не похож на идентификатор артефакта (КЛАСС-НОМЕР[буква])" ;;
-  esac
+  gate_meta_is_artifact_id "${ms}" \
+    || bad "${f}: milestone «${ms}» не похож на идентификатор артефакта (КЛАСС-НОМЕР[буква])"
 
   if ! in_list "${vd}" "${VERDICT_ENUM}"; then
     bad "${f}: verdict «${vd}» вне перечня (${VERDICT_ENUM})"
