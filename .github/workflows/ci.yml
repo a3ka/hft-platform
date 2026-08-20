@@ -342,14 +342,54 @@ jobs:
       - name: Батарея мутантов (равенство kill-set'ов)
         run: bash scripts/tests/red_deploy_catchup.sh --battery
 
+  review-fa:
+    name: Review FA (вердикт называет живой инвариант тронутого модуля, M-66)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ЗАЧЕМ. `gates.md` §4: диф трогает `crates/<name>/**` ⇒ вердикт обязан назвать живой
+      # инвариант-ID из `docs/fa/<name>.md`, либо нести явный `FA-WAIVER`. Замер 2026-08-14,
+      # из-за которого требование появилось: FA тронутого модуля названа в 0 из 3 применимых
+      # вердиктов; `TD-138` нашли ровно тогда, когда FA дочитали постфактум.
+      #
+      # ПОЧЕМУ ТОЛЬКО СЕЙЧАС. Барьер и проба написаны в M-66 15.08, но жили на ветке
+      # `feat/M-66-fixture` и в `main` не попали — `TD-155`: `gates.md` и девять профилей
+      # объявляли `review-fa` машинным барьером, которого в `main` НЕ СУЩЕСТВУЕТ. Документация
+      # обогнала механизм. Пересборка от `main` предписана `A-010` §B п.3 — судить
+      # харнесс-предмет в дереве без `harness-track.md` нельзя.
+      #
+      # ПРОВОДКА — ЧАСТЬ ПРЕДМЕТА, А НЕ ДОБАВКА К НЕМУ. Сценарий `W8OK` пробы читает ИМЕННО
+      # ЭТОТ файл и требует в джобе `fetch-depth: 0`, три переменные события и оба вызова, а в
+      # `status-check` — членство в `needs` И в fail-closed условии. Соседи `W8NONEEDS`,
+      # `W8NOIF`, `W8NOCALL`, `W8CMTONLY` — анти-плацебо, каждый обязан краснеть. Набор M-66
+      # без этой проводки красен по СОБСТВЕННОЙ пробе: замер на пересобранной ветке — 39/40.
+      #
+      # База — ИЗ СОБЫТИЯ (блокер B1: на push-событии checkout ставит origin/main на только
+      # что запушенный коммит ⇒ диапазон пуст ⇒ барьер зеленел бы ВСЕГДА).
+      - name: Вердикт называет живой инвариант FA тронутого крейта
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: bash scripts/check_review_fa.sh
+
+      # Проба ТОЙ ЖЕ проводкой, какой барьер зовёт CI (`testing.md` §«Целостность гейта»):
+      # иначе «барьер зелёный» значит лишь, что скрипт парсится. Счёт печатает сама проба —
+      # литерал, живущий отдельно от предмета, врёт (замер `gate-meta`: «27» против 31).
+      - name: Проба барьера (счёт печатает сама проба)
+        run: bash scripts/tests/red_review_fa.sh
+
   status-check:
     name: All checks passed
     runs-on: ubuntu-latest
-    needs: [build-test, security, delivery, protected-artifacts, contracts, docs-freeze, artifact-ids, reserve-ids, design-claims, context-budgets, gate-meta, deploy-catchup]
+    needs: [build-test, security, delivery, protected-artifacts, contracts, docs-freeze, artifact-ids, reserve-ids, design-claims, context-budgets, gate-meta, deploy-catchup, review-fa]
     if: always()
     steps:
       - run: |
-          if [[ "${{ needs.build-test.result }}" != "success" || "${{ needs.security.result }}" != "success" || "${{ needs.delivery.result }}" != "success" || "${{ needs.protected-artifacts.result }}" != "success" || "${{ needs.contracts.result }}" != "success" || "${{ needs.docs-freeze.result }}" != "success" || "${{ needs.artifact-ids.result }}" != "success" || "${{ needs.reserve-ids.result }}" != "success" || "${{ needs.design-claims.result }}" != "success" || "${{ needs.context-budgets.result }}" != "success" || "${{ needs.gate-meta.result }}" != "success" || "${{ needs.deploy-catchup.result }}" != "success" ]]; then
+          if [[ "${{ needs.build-test.result }}" != "success" || "${{ needs.security.result }}" != "success" || "${{ needs.delivery.result }}" != "success" || "${{ needs.protected-artifacts.result }}" != "success" || "${{ needs.contracts.result }}" != "success" || "${{ needs.docs-freeze.result }}" != "success" || "${{ needs.artifact-ids.result }}" != "success" || "${{ needs.reserve-ids.result }}" != "success" || "${{ needs.design-claims.result }}" != "success" || "${{ needs.context-budgets.result }}" != "success" || "${{ needs.gate-meta.result }}" != "success" || "${{ needs.deploy-catchup.result }}" != "success" || "${{ needs.review-fa.result }}" != "success" ]]; then
             echo "One or more checks failed"; exit 1
           fi
           echo "All checks passed"
