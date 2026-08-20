@@ -25,7 +25,14 @@ SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 BARRIER="${BARRIER:-${ROOT}/scripts/check_review_fa.sh}"
 SPEC="${SPEC:-${ROOT}/milestones/M-66-protocol-attestation.md}"
-CI="${CI:-${ROOT}/.github/workflows/ci.yml}"
+# ИМЯ ПЕРЕМЕННОЙ НЕ `CI`. `CI` — стандартная переменная GitHub Actions, на раннере она
+# ВСЕГДА `true`, и прежнее `CI="${CI:-…}"` подставляло сюда строку `true` вместо пути.
+# Следствие: сценарий W8OK — единственный, доказывающий, что джоб РЕАЛЬНО проведён, —
+# не мог пройти в CI ни при каких условиях и был зелен только локально. Оракул мерил
+# ОКРУЖЕНИЕ, а не свой инвариант (`testing.md`, целостность гейта, свойство 2).
+# Воспроизведение дефекта: `CI=true bash scripts/tests/red_review_fa.sh` → W8OK FAIL,
+# «workflow missing: true». Поймано draft-PR #47, как и предписывал `A-010` §B-3.
+REVIEW_FA_CI="${REVIEW_FA_CI:-${ROOT}/.github/workflows/ci.yml}"
 ZERO=0000000000000000000000000000000000000000
 
 FAILED=0
@@ -911,7 +918,7 @@ scenario_W8NOCALL() {
 }
 
 scenario_W8OK() {
-  expect_wiring W8OK "${CI}" pass "реальный ci.yml чекаута несёт полную проводку"
+  expect_wiring W8OK "${REVIEW_FA_CI}" pass "реальный ci.yml чекаута несёт полную проводку"
 }
 
 scenario_W8CMTONLY() {
@@ -1093,7 +1100,7 @@ run_battery() {
   write_workflow "${wf}" good
 
   echo "══ БАТАРЕЯ M-66: эталон зелёный, мутанты красные по §4 ══"
-  env -u FIXTURES_REG BARRIER="${ref}" CI="${wf}" bash "${SELF}" > "${d}/ref.log" 2>&1; rc=$?
+  env -u FIXTURES_REG BARRIER="${ref}" REVIEW_FA_CI="${wf}" bash "${SELF}" > "${d}/ref.log" 2>&1; rc=$?
   total=$((total + 1))
   if [ "${rc}" -eq 0 ]; then
     echo "PASS  ref → $(grep -oE 'VERDICT: PASS \([0-9]+/[0-9]+\)' "${d}/ref.log" | head -1)"
@@ -1156,7 +1163,7 @@ PY
   while IFS= read -r entry; do
     [ -n "${entry}" ] || continue
     name="${entry%%:*}"; scen="${entry##*:}"
-    env -u FIXTURES_REG REVIEW_FA_MUTANT="${name}" BARRIER="${ref}" CI="${wf}" bash "${SELF}" > "${d}/${name}.log" 2>&1
+    env -u FIXTURES_REG REVIEW_FA_MUTANT="${name}" BARRIER="${ref}" REVIEW_FA_CI="${wf}" bash "${SELF}" > "${d}/${name}.log" 2>&1
     rc=$?
     total=$((total + 1))
     # Ловля должна быть ИМЕННО названным сценарием: `grep -q "${scen}"` по всему логу
@@ -1194,7 +1201,7 @@ bash -n "${BARRIER}" 2>/dev/null || die "барьер не парсится — 
 echo "── M-66 RED: review-fa FA echo attestation ──"
 echo "барьер: ${BARRIER}"
 echo "спека:  ${SPEC}"
-echo "ci:     ${CI}"
+echo "ci:     ${REVIEW_FA_CI}"
 echo
 
 positive_control
