@@ -61,6 +61,11 @@ D1DOC|1 состав диапазона|doc-only (без `crates/**`)|D1DOC|SKIP
 D1NOREV|1|`crates/**` тронут, S=∅|D1NOREV|FAIL (механизм D)
 B1TESTSONLY|1|тронуты ТОЛЬКО `crates/*/tests/**` (sacred RED-спеки)|B1TESTSONLY|SKIP, exit 0 — в прод-образ не входят (`C-115` B-1; граница унаследована от `deploy.yml` TD-086)
 B1SRCSTILLJUDGED|1|тронуты И `tests/`, И `src/` в одном диапазоне|B1SRCSTILLJUDGED|FAIL — наличие тестов не отменяет суда над прод-кодом (анти-плацебо к B1TESTSONLY)
+C1EXAMPLES|1|тронуты ТОЛЬКО `crates/*/examples/**`|C1EXAMPLES|SKIP, exit 0 — в прод-образ не входят (`C-118` C-1)
+C1BENCHES|1|тронуты ТОЛЬКО `crates/*/benches/**`|C1BENCHES|SKIP, exit 0 — в прод-образ не входят
+C1MANIFEST|1|тронут ТОЛЬКО `crates/*/Cargo.toml`|C1MANIFEST|FAIL — манифест определяет состав бинаря, судится
+C1BUILDRS|1|тронут ТОЛЬКО `crates/*/build.rs`|C1BUILDRS|FAIL — исполняется при сборке, судится
+C1MIXED|1|тронуты И `examples/`, И `src/`|C1MIXED|FAIL — не-прод путь рядом не отменяет суда (анти-плацебо)
 D1REVPAIR|1|реверт-пара, net-diff чист|D1REVPAIR|SKIP, exit 0 (per-range семантика §3.1)
 D1NOFA|1|только NO-FA крейт (`recorder`), R введён БЕЗ `FA-WAIVER`|D1NOFA|**FAIL** (пробел покрытия — §2 W; rev1 ставила PASS, опровергнуто C-082 B-1)
 D1NOFAW|1|только NO-FA крейт, R с `FA-WAIVER: crates/recorder — <причина>`|D1NOFAW|PASS + печать `WAIVED` (легитимный оси W)
@@ -364,6 +369,66 @@ scenario_B1TESTSONLY() {
   setup_assert B1TESTSONLY "${r}" "диф обязан трогать ТОЛЬКО crates/*/tests/**" \
     "git diff --name-only '${b}' HEAD | grep -q '^crates/[^/]*/tests/' && ! git diff --name-only '${b}' HEAD | grep -qE '^crates/[^/]+/(src|Cargo)'"
   expect_skip B1TESTSONLY "${r}" "${b}" "только crates/*/tests/** — в прод-образ не входят"
+}
+
+# `C-118` C-1 / `A-012` §1-Д п.5: каждая строка таблицы классификации пиннится сценарием.
+# Критерий — «входит ли путь в прод-образ» (`Dockerfile:18` собирает бинари явным списком).
+scenario_C1EXAMPLES() {
+  local r b
+  r="$(mk_repo c1examples)"; b="$(base_sha "${r}")"
+  mkdir -p "${r}/crates/gateway/examples"
+  printf 'fn main() {}\n' > "${r}/crates/gateway/examples/demo.rs"
+  commit_all "${r}" "C1EXAMPLES: только examples/"
+  setup_assert C1EXAMPLES "${r}" "диф обязан трогать ТОЛЬКО crates/*/examples/**" \
+    "git diff --name-only '${b}' HEAD | grep -q '^crates/[^/]*/examples/' && ! git diff --name-only '${b}' HEAD | grep -qE '^crates/[^/]+/(src|Cargo)'"
+  expect_skip C1EXAMPLES "${r}" "${b}" "examples в прод-образ не входят (ловит clippy --all-targets)"
+}
+
+scenario_C1BENCHES() {
+  local r b
+  r="$(mk_repo c1benches)"; b="$(base_sha "${r}")"
+  mkdir -p "${r}/crates/gateway/benches"
+  printf 'fn main() {}\n' > "${r}/crates/gateway/benches/bench.rs"
+  commit_all "${r}" "C1BENCHES: только benches/"
+  setup_assert C1BENCHES "${r}" "диф обязан трогать ТОЛЬКО crates/*/benches/**" \
+    "git diff --name-only '${b}' HEAD | grep -q '^crates/[^/]*/benches/'"
+  expect_skip C1BENCHES "${r}" "${b}" "benches в прод-образ не входят"
+}
+
+scenario_C1MANIFEST() {
+  local r b
+  r="$(mk_repo c1manifest)"; b="$(base_sha "${r}")"
+  printf '\n[features]\nprobe = []\n' >> "${r}/crates/journal/Cargo.toml"
+  commit_all "${r}" "C1MANIFEST: только Cargo.toml"
+  # Манифест определяет, ЧТО и КАК собрано в бинарь ⇒ судится наравне с src.
+  setup_assert C1MANIFEST "${r}" "диф обязан трогать ТОЛЬКО crates/*/Cargo.toml" \
+    "git diff --name-only '${b}' HEAD | grep -q '^crates/[^/]*/Cargo.toml' && ! git diff --name-only '${b}' HEAD | grep -q '^crates/[^/]*/src/'"
+  expect_block C1MANIFEST "${r}" "${b}" "Cargo.toml входит в прод-образ — судится"
+}
+
+scenario_C1BUILDRS() {
+  local r b
+  r="$(mk_repo c1buildrs)"; b="$(base_sha "${r}")"
+  printf 'fn main() {}\n' > "${r}/crates/journal/build.rs"
+  commit_all "${r}" "C1BUILDRS: только build.rs"
+  # build.rs исполняется при сборке бинаря ⇒ судится. В корпусе сейчас 0 шт. — сценарий
+  # заведён ДО появления первого, чтобы классификация не решалась впопыхах.
+  setup_assert C1BUILDRS "${r}" "диф обязан трогать ТОЛЬКО crates/*/build.rs" \
+    "git diff --name-only '${b}' HEAD | grep -q '^crates/[^/]*/build\\.rs$'"
+  expect_block C1BUILDRS "${r}" "${b}" "build.rs исполняется при сборке — судится"
+}
+
+scenario_C1MIXED() {
+  local r b
+  r="$(mk_repo c1mixed)"; b="$(base_sha "${r}")"
+  mkdir -p "${r}/crates/gateway/examples"
+  printf 'fn main() {}\n' > "${r}/crates/gateway/examples/demo.rs"
+  touch_crate "${r}" gateway "pub fn c1_mixed() {}"
+  commit_all "${r}" "C1MIXED: examples + src в одном диапазоне"
+  # Анти-плацебо ко всем SKIP-строкам: не-прод путь рядом НЕ отменяет суда над прод-кодом.
+  setup_assert C1MIXED "${r}" "диф обязан трогать И examples/, И src/" \
+    "git diff --name-only '${b}' HEAD | grep -q '^crates/[^/]*/examples/' && git diff --name-only '${b}' HEAD | grep -q '^crates/[^/]*/src/'"
+  expect_block C1MIXED "${r}" "${b}" "src/ рядом с examples/ — суд остаётся"
 }
 
 scenario_B1SRCSTILLJUDGED() {
@@ -997,7 +1062,7 @@ BASE="$(git rev-parse -q --verify "${raw}^{commit}" 2>/dev/null || printf '%s' "
 # правила обязана совпадать; независимость эталона — свойство КОДА, а не расхождения.
 crates_all="$(git diff --name-only "${BASE}" HEAD 2>/dev/null | awk -F/ '$1=="crates" && $2!="" {print $2}' | sort -u)"
 crates="$(git diff --name-only "${BASE}" HEAD 2>/dev/null \
-  | grep -vE '^crates/[^/]+/tests/' \
+  | grep -vE '^crates/[^/]+/(tests|examples|benches)/' \
   | awk -F/ '$1=="crates" && $2!="" {print $2}' | sort -u)"
 if [ -z "${crates}" ]; then
   if [ -n "${crates_all}" ]; then
@@ -1259,6 +1324,11 @@ scenario_D1DOC
 scenario_D1NOREV
 scenario_B1TESTSONLY
 scenario_B1SRCSTILLJUDGED
+scenario_C1EXAMPLES
+scenario_C1BENCHES
+scenario_C1MANIFEST
+scenario_C1BUILDRS
+scenario_C1MIXED
 scenario_D1REVPAIR
 scenario_D1NOFA
 scenario_D1NOFAW

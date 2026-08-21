@@ -270,6 +270,11 @@ A-005 §4 #6). Одна фикстура может нести нескольк�
 | 1 | `crates/**` тронут, S=∅ | D1NOREV | FAIL (механизм D) |
 | 1 | тронуты ТОЛЬКО `crates/*/tests/**` (sacred RED-спеки) | B1TESTSONLY | SKIP, exit 0 — в прод-образ не входят (`C-115` B-1; граница унаследована от `deploy.yml` TD-086) |
 | 1 | тронуты И `tests/`, И `src/` в одном диапазоне | B1SRCSTILLJUDGED | FAIL — наличие тестов не отменяет суда над прод-кодом (анти-плацебо к B1TESTSONLY) |
+| 1 | тронуты ТОЛЬКО `crates/*/examples/**` | C1EXAMPLES | SKIP, exit 0 — в прод-образ не входят (`C-118` C-1) |
+| 1 | тронуты ТОЛЬКО `crates/*/benches/**` | C1BENCHES | SKIP, exit 0 — в прод-образ не входят |
+| 1 | тронут ТОЛЬКО `crates/*/Cargo.toml` | C1MANIFEST | FAIL — манифест определяет состав бинаря, судится |
+| 1 | тронут ТОЛЬКО `crates/*/build.rs` | C1BUILDRS | FAIL — исполняется при сборке, судится |
+| 1 | тронуты И `examples/`, И `src/` | C1MIXED | FAIL — не-прод путь рядом не отменяет суда (анти-плацебо) |
 | 1 | реверт-пара, net-diff чист | D1REVPAIR | SKIP, exit 0 (per-range семантика §3.1) |
 | 1 | только NO-FA крейт (`recorder`), R введён БЕЗ `FA-WAIVER` | D1NOFA | **FAIL** (пробел покрытия — §2 W; rev1 ставила PASS, опровергнуто C-082 B-1) |
 | 1 | только NO-FA крейт, R с `FA-WAIVER: crates/recorder — <причина>` | D1NOFAW | PASS + печать `WAIVED` (легитимный оси W) |
@@ -426,6 +431,32 @@ T1 не трогается. `crates/**` не трогается. Новые ар
 6. [паритет] `cargo fmt --all -- --check` · `cargo clippy --all-targets --all-features -- -D warnings`
    · `cargo test --all` (шаблон verify; крейты не тронуты — проверка, что это ПРАВДА);
 7. финал: `VERDICT: PASS/FAIL` + exit-код.
+
+## 8bis. Классификация путей `crates/**` — что барьер судит, а что скипает
+
+Внесено по `C-118` C-1, исполнение решения арбитра `A-012` §1-Д п.5. Прежний нормативный
+текст говорил «все изменения `crates/**` судятся», а таблица §4 после `C-115` B-1 исключила
+test-only — **носители разошлись**, и это тот же класс, что уронил батарею (`C-118` B-1).
+
+Критерий ОДИН и он проверяем: **входит ли путь в прод-образ.** Замер 2026-08-21:
+`Dockerfile:18` — `cargo build --release --bin recorder --bin journal-retention --bin
+gateway-serve --bin gateway-checkpoint --bin wsprobe` — сборка идёт ЯВНЫМ списком бинарей;
+ни тестовые, ни example-, ни bench-цели в него не входят.
+`find crates -maxdepth 2 -name examples -type d` → 5 · `-name benches` → 0 · `build.rs` → 0.
+
+| путь | барьер | основание | сценарий §4 |
+|---|---|---|---|
+| `crates/*/src/**` | судит | исполняется прод-процессом | `D1NOREV`, `B1SRCSTILLJUDGED` |
+| `crates/*/Cargo.toml` | судит | определяет, ЧТО и КАК собрано в бинарь | `C1MANIFEST` |
+| `crates/*/build.rs` | судит | исполняется при сборке бинаря | `C1BUILDRS` |
+| `crates/*/tests/**` | SKIP | sacred RED-спеки, в образ не входят | `B1TESTSONLY` |
+| `crates/*/examples/**` | SKIP | в образ не входят; поломку ловит `clippy --all-targets` (`gates.md` §3) | `C1EXAMPLES` |
+| `crates/*/benches/**` | SKIP | то же основание | `C1BENCHES` |
+
+Анти-плацебо ко ВСЕМ SKIP-строкам: `C1MIXED` — не-прод путь рядом с `src/` суда не отменяет.
+
+`build.rs` и `benches/` в корпусе сегодня отсутствуют (0 шт.). Правило заведено ДО появления
+первого — чтобы классификация решалась замером, а не впопыхах в момент, когда путь появится.
 
 ## 9. Allowed / Forbidden paths
 

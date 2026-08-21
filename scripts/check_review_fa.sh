@@ -67,18 +67,37 @@ BASE=$(git rev-parse "${raw}^{commit}")
 # запускается на VPS или его результат попадает в журнал» — для тестов ложен.
 #
 # Защита НЕ ослаблена: диапазон, тронувший `crates/*/src/**`, судится как прежде (проверено
-# анти-плацебо на `61f452e` — exit=1). Диапазон, тронувший ТОЛЬКО тесты, объявляется
+# анти-плацебо на `61f452e` — exit=1). Диапазон, тронувший ТОЛЬКО не-прод пути, объявляется
 # неприменимым ЯВНО, с перечислением файлов — «наблюдение отсутствия» (`testing.md`,
 # целостность гейта, свойство 4), а не молчание.
+#
+# КЛАССИФИКАЦИЯ ПУТЕЙ (`C-118` C-1, `A-012` §1-Д п.5). Критерий один и он проверяем:
+# ВХОДИТ ЛИ ПУТЬ В ПРОД-ОБРАЗ. Замер 2026-08-21 на этом дереве:
+#   `Dockerfile:18` — `cargo build --release --bin recorder --bin journal-retention
+#   --bin gateway-serve --bin gateway-checkpoint --bin wsprobe` — сборка идёт ЯВНЫМ
+#   списком бинарей; ни тестовые, ни example-, ни bench-цели в него не входят.
+#   `find crates -maxdepth 2 -name examples -type d` → 5; `-name benches` → 0; `build.rs` → 0.
+#
+#   судится            | `crates/*/src/**`      — исполняется прод-процессом
+#   судится            | `crates/*/Cargo.toml`  — определяет, ЧТО и КАК собрано в бинарь
+#   судится            | `crates/*/build.rs`    — исполняется при сборке бинаря (сейчас 0 шт.,
+#                      |                          правило заведено до появления первого)
+#   SKIP               | `crates/*/tests/**`    — sacred RED-спеки, в образ не входят
+#   SKIP               | `crates/*/examples/**` — в образ не входят; их поломку ловит
+#                      |                          `clippy --all-targets` (`gates.md` §3)
+#   SKIP               | `crates/*/benches/**`  — то же основание (сейчас 0 шт.)
+#
+# Каждая строка этой таблицы пиннится сценарием пробы — иначе классификация есть намерение,
+# а не механизм.
 crates_all=$(git diff --name-only "${BASE}" HEAD 2>/dev/null \
   | awk -F/ '$1=="crates" && $2!="" {print $2}' | sort -u)
 crates=$(git diff --name-only "${BASE}" HEAD 2>/dev/null \
-  | grep -vE '^crates/[^/]+/tests/' \
+  | grep -vE '^crates/[^/]+/(tests|examples|benches)/' \
   | awk -F/ '$1=="crates" && $2!="" {print $2}' | sort -u)
 if [ -z "${crates}" ]; then
   if [ -n "${crates_all}" ]; then
-    echo "SKIP (диапазон трогает ТОЛЬКО crates/*/tests/** — sacred RED-спеки, в прод-образ не входят; C-115 B-1)"
-    git diff --name-only "${BASE}" HEAD 2>/dev/null | grep -E '^crates/[^/]+/tests/' | sed 's/^/      ↳ /'
+    echo "SKIP (диапазон трогает ТОЛЬКО не-прод пути крейтов — tests/examples/benches, в прод-образ не входят; C-115 B-1, классификация A-012 §1-Д п.5)"
+    git diff --name-only "${BASE}" HEAD 2>/dev/null | grep -E '^crates/[^/]+/(tests|examples|benches)/' | sed 's/^/      ↳ /'
   else
     echo "SKIP (диапазон не трогает crates/**)"
   fi
