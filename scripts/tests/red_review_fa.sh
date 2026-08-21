@@ -59,6 +59,8 @@ unset GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL EM
 MANIFEST="$(cat <<'EOF_MANIFEST'
 D1DOC|1 состав диапазона|doc-only (без `crates/**`)|D1DOC|SKIP, exit 0 — барьер МОЛЧИТ
 D1NOREV|1|`crates/**` тронут, S=∅|D1NOREV|FAIL (механизм D)
+B1TESTSONLY|1|тронуты ТОЛЬКО `crates/*/tests/**` (sacred RED-спеки)|B1TESTSONLY|SKIP, exit 0 — в прод-образ не входят (`C-115` B-1; граница унаследована от `deploy.yml` TD-086)
+B1SRCSTILLJUDGED|1|тронуты И `tests/`, И `src/` в одном диапазоне|B1SRCSTILLJUDGED|FAIL — наличие тестов не отменяет суда над прод-кодом (анти-плацебо к B1TESTSONLY)
 D1REVPAIR|1|реверт-пара, net-diff чист|D1REVPAIR|SKIP, exit 0 (per-range семантика §3.1)
 D1NOFA|1|только NO-FA крейт (`recorder`), R введён БЕЗ `FA-WAIVER`|D1NOFA|**FAIL** (пробел покрытия — §2 W; rev1 ставила PASS, опровергнуто C-082 B-1)
 D1NOFAW|1|только NO-FA крейт, R с `FA-WAIVER: crates/recorder — <причина>`|D1NOFAW|PASS + печать `WAIVED` (легитимный оси W)
@@ -346,6 +348,35 @@ scenario_D1DOC() {
   setup_assert D1DOC "${r}" "диф обязан быть doc-only, без crates/**" \
     "! git diff --name-only '${b}' HEAD | grep -q '^crates/'"
   expect_skip D1DOC "${r}" "${b}" "doc-only без crates/**"
+}
+
+# `C-115` B-1 — RED-регрессия на ПРОД-ФОРМУ, которой критик уронил барьер.
+# Прежнее правило брало любой путь под `crates/`, включая sacred RED-спеки. Замер на живой
+# истории: merge PR #15 (`2c56a34..de40f48`, форма `push`) трогал РОВНО ОДИН файл —
+# `crates/gateway/tests/red_snapshot_noclone.rs` — и барьер давал `FAIL … S=∅`.
+# Пара сценариев пиннит границу с ОБЕИХ сторон: только тесты → SKIP; прод-код → судится.
+scenario_B1TESTSONLY() {
+  local r b
+  r="$(mk_repo b1testsonly)"; b="$(base_sha "${r}")"
+  mkdir -p "${r}/crates/gateway/tests"
+  printf '#[test]\nfn red_oracle() {}\n' > "${r}/crates/gateway/tests/red_oracle.rs"
+  commit_all "${r}" "B1TESTSONLY: правка sacred RED-спеки без касания src"
+  setup_assert B1TESTSONLY "${r}" "диф обязан трогать ТОЛЬКО crates/*/tests/**" \
+    "git diff --name-only '${b}' HEAD | grep -q '^crates/[^/]*/tests/' && ! git diff --name-only '${b}' HEAD | grep -qE '^crates/[^/]+/(src|Cargo)'"
+  expect_skip B1TESTSONLY "${r}" "${b}" "только crates/*/tests/** — в прод-образ не входят"
+}
+
+scenario_B1SRCSTILLJUDGED() {
+  local r b
+  r="$(mk_repo b1srcstill)"; b="$(base_sha "${r}")"
+  mkdir -p "${r}/crates/gateway/tests"
+  printf '#[test]\nfn red_oracle() {}\n' > "${r}/crates/gateway/tests/red_oracle.rs"
+  touch_crate "${r}" gateway "pub fn b1_src_change() {}"
+  commit_all "${r}" "B1SRCSTILLJUDGED: тесты И прод-код в одном диапазоне"
+  # Анти-плацебо к предыдущему: наличие тестов НЕ отменяет суда над прод-кодом.
+  setup_assert B1SRCSTILLJUDGED "${r}" "диф обязан трогать И tests/, И src/" \
+    "git diff --name-only '${b}' HEAD | grep -q '^crates/[^/]*/tests/' && git diff --name-only '${b}' HEAD | grep -q '^crates/[^/]*/src/'"
+  expect_block B1SRCSTILLJUDGED "${r}" "${b}" "src/ тронут вместе с tests/ — суд остаётся"
 }
 
 scenario_D1NOREV() {
@@ -1210,6 +1241,8 @@ echo
 
 scenario_D1DOC
 scenario_D1NOREV
+scenario_B1TESTSONLY
+scenario_B1SRCSTILLJUDGED
 scenario_D1REVPAIR
 scenario_D1NOFA
 scenario_D1NOFAW

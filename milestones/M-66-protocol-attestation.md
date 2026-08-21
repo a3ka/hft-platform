@@ -268,6 +268,8 @@ A-005 §4 #6). Одна фикстура может нести нескольк�
 |---|---|---|---|
 | 1 состав диапазона | doc-only (без `crates/**`) | D1DOC | SKIP, exit 0 — барьер МОЛЧИТ |
 | 1 | `crates/**` тронут, S=∅ | D1NOREV | FAIL (механизм D) |
+| 1 | тронуты ТОЛЬКО `crates/*/tests/**` (sacred RED-спеки) | B1TESTSONLY | SKIP, exit 0 — в прод-образ не входят (`C-115` B-1; граница унаследована от `deploy.yml` TD-086) |
+| 1 | тронуты И `tests/`, И `src/` в одном диапазоне | B1SRCSTILLJUDGED | FAIL — наличие тестов не отменяет суда над прод-кодом (анти-плацебо к B1TESTSONLY) |
 | 1 | реверт-пара, net-diff чист | D1REVPAIR | SKIP, exit 0 (per-range семантика §3.1) |
 | 1 | только NO-FA крейт (`recorder`), R введён БЕЗ `FA-WAIVER` | D1NOFA | **FAIL** (пробел покрытия — §2 W; rev1 ставила PASS, опровергнуто C-082 B-1) |
 | 1 | только NO-FA крейт, R с `FA-WAIVER: crates/recorder — <причина>` | D1NOFAW | PASS + печать `WAIVED` (легитимный оси W) |
