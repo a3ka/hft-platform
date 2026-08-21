@@ -242,6 +242,10 @@ def info(check, msg):
     print(f"INFO  [{check}] {msg}")
 
 
+def note(check, msg):
+    print(f"NOTE  [{check}] {msg}")
+
+
 def read(path):
     with open(path, encoding="utf-8") as f:
         return f.read()
@@ -593,6 +597,53 @@ def check2(root, design_text):
 # CHECK 3 — ссылки DESIGN.md §N ведут на существующие разделы
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# МАРКЕР `FACTS:` — исполнение решения арбитра `A-010` §H (задачи H-1…H-5).
+#
+# Решение существовало с 18.08, маркер уже проставлялся ВРУЧНУЮ в живых документах — и не
+# читался НИЧЕМ (`grep -rln FACTS scripts/ .github/` → пусто). Класс «решено-не-построено»,
+# зеркальный к `TD-155` («построено-не-проведено»).
+#
+# ПРАВИЛО (`A-010` §H): `docs/plans/**` остаётся исключённым из check3/check4, КРОМЕ файлов,
+# несущих маркер. Документ, объявивший себя фактурой, отвечает за свои ссылки; документ без
+# маркера — рабочая записка, с неё спроса нет.
+#
+# МАРКЕР ЗАСЧИТЫВАЕТСЯ ТОЛЬКО В ГОЛОВЕ ФАЙЛА. Причина — замер, а не осторожность:
+# `docs/plans/fable-review-2026-08-18-open-questions.md` содержит `<!-- FACTS: … -->` на
+# строке 265 — внутри ПРОЗЫ, описывающей формат маркера. Наивный детектор включил бы этот
+# файл в проверку по документу О маркере. Тот же класс, что шапка `GATE-META`, процитированная
+# примером внутри код-фенса (найдено адверсарием 20.08).
+#
+# ПРЕДЕЛ, НАЗВАННЫЙ ЧЕСТНО (`A-010` H-5): `файл:строка` НЕ проверяется и проверяться не будет.
+# Маркер конвертирует «молча ложно» в «явно датировано» — не более. Дрейф содержимого он
+# ОБЪЯВЛЯЕТ, а не лечит.
+FACTS_MARKER_RE = re.compile(r"<!--\s*FACTS:.*?audited_head=([0-9a-fA-F]{7,40}).*?-->")
+FACTS_HEAD_LINES = 5          # сколько первых строк считаются «головой файла»
+FACTS_NOTE_THRESHOLD = 20     # порог утверждений `путь:строка`, при котором молчание заметно
+
+
+def _has_facts_marker(fpath):
+    try:
+        with open(fpath, encoding="utf-8") as f:
+            for i, line in enumerate(f):
+                if i >= FACTS_HEAD_LINES:
+                    return False
+                if FACTS_MARKER_RE.search(line):
+                    return True
+    except (UnicodeDecodeError, OSError):
+        return False
+    return False
+
+
+def is_excluded(relpath, fpath):
+    """Единое правило исключения для check3/check4 — один разбор на двоих (`A-010` §G)."""
+    if relpath.startswith("docs/archive/"):
+        return True
+    if relpath.startswith("docs/plans/"):
+        return not _has_facts_marker(fpath)
+    return False
+
+
 SECTION_HEADING_RE = re.compile(r"^#{2,3}\s+§?(\d+(?:\.\d+)?)\.?\s+\S")
 DESIGN_REF_RE = re.compile(r"DESIGN\.md\s*§(\d+(?:\.\d+)?)")
 
@@ -605,7 +656,7 @@ def check3(root, design_text):
         return
 
     exts = (".md", ".rs", ".sh")
-    excluded = ("docs/archive/", "docs/plans/")
+    # исключение — общее правило: `docs/plans/**` входит в проверку, если несёт `FACTS:`
     n_refs = n_bad = 0
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if d not in (".git", "target", "node_modules")]
@@ -614,7 +665,7 @@ def check3(root, design_text):
                 continue
             fpath = os.path.join(dirpath, fn)
             relpath = os.path.relpath(fpath, root)
-            if any(relpath.startswith(ex) for ex in excluded):
+            if is_excluded(relpath, fpath):
                 continue
             try:
                 with open(fpath, encoding="utf-8") as f:
@@ -641,12 +692,49 @@ def check3(root, design_text):
 DOC_FILE_REF_RE = re.compile(r"\bdocs/[A-Za-z0-9_.\-/]+\.md\b")
 
 
+# ---------------------------------------------------------------------------
+# NOTE-часть решения `A-010` §H: документ в `docs/plans/**`, несущий ≥20 утверждений вида
+# `путь:строка` и НЕ несущий маркера, объявляется молчащим о своей ревизии. Это NOTE, а не
+# FAIL: такой документ по-прежнему рабочая записка, и требовать от неё гарантий нельзя —
+# но её молчание перестаёт быть невидимым.
+# Разбор `путь:строка` ПЕРЕИСПОЛЬЗОВАН (`RFC_PATH_TOKEN_RE` + `RFC_PATH_LINEREF_TAIL_RE`),
+# третий парсер не заводится (`A-010` §G).
+# ---------------------------------------------------------------------------
+def check_facts_note(root):
+    plans = os.path.join(root, "docs", "plans")
+    if not os.path.isdir(plans):
+        return
+    silent = 0
+    for fn in sorted(os.listdir(plans)):
+        if not fn.endswith(".md"):
+            continue
+        fpath = os.path.join(plans, fn)
+        if _has_facts_marker(fpath):
+            continue
+        n = 0
+        try:
+            with open(fpath, encoding="utf-8") as f:
+                for line in f:
+                    for m in RFC_PATH_TOKEN_RE.finditer(line):
+                        if RFC_PATH_LINEREF_TAIL_RE.search(m.group(1)):
+                            n += 1
+        except (UnicodeDecodeError, OSError):
+            continue
+        if n >= FACTS_NOTE_THRESHOLD:
+            silent += 1
+            note("H-FACTS", f"docs/plans/{fn}: {n} утверждений `путь:строка` без маркера "
+                           f"`FACTS:` — документ не называет ревизию сбора, основанием для "
+                           f"спеки или оракула не является")
+    if silent == 0:
+        info("H-FACTS", "фактур без маркера с порогом утверждений не найдено")
+
+
 def check4(root):
     docs_dir = os.path.join(root, "docs")
     if not os.path.isdir(docs_dir):
         fail("4-МЁРТВЫЕ-ФАЙЛЫ", "каталог docs/ отсутствует — setup-guard")
         return
-    excluded = ("docs/archive/", "docs/plans/")
+    # исключение — общее правило: `docs/plans/**` входит в проверку, если несёт `FACTS:`
     n_refs = n_bad = 0
     for dirpath, dirnames, filenames in os.walk(docs_dir):
         dirnames[:] = [d for d in dirnames if d not in (".git",)]
@@ -655,7 +743,7 @@ def check4(root):
                 continue
             fpath = os.path.join(dirpath, fn)
             relpath = os.path.relpath(fpath, root)
-            if any(relpath.startswith(ex) for ex in excluded):
+            if is_excluded(relpath, fpath):
                 continue
             try:
                 with open(fpath, encoding="utf-8") as f:
@@ -1231,6 +1319,7 @@ def main():
     check2(root, design_text)
     check3(root, design_text)
     check4(root)
+    check_facts_note(root)
     check5(root, design_text)
     check6(root)
     check7(root)

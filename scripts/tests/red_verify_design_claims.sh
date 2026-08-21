@@ -408,6 +408,85 @@ scenario_bad_broken_section_ref() {
 # ---------------------------------------------------------------------------
 # Сценарий 5 — ссылка на удалённый файл docs/*.md → FAIL [4-МЁРТВЫЕ-ФАЙЛЫ]
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Сценарии H-FACTS — маркер `FACTS:` (исполнение `A-010` §H, задача H-1).
+# Анти-плацебо в ОБЕ стороны: с маркером документ судится, без маркера — нет.
+# Плюс ловушка, найденная замером: маркер, процитированный В ПРОЗЕ (не в голове файла),
+# включать документ НЕ ДОЛЖЕН — иначе документ О маркере опт-инится сам по себе. Тот же
+# класс, что шапка GATE-META внутри код-фенса.
+# ---------------------------------------------------------------------------
+mk_plan_with_dead_ref() {   # $1=каталог фикстуры $2=шапка файла (может быть пустой)
+  mkdir -p "$1/docs/plans"
+  { [ -n "$2" ] && printf '%s\n' "$2"
+    echo "# фактура"
+    echo "Ссылка на \`docs/GHOSTPLAN.md\` — файла нет."
+  } > "$1/docs/plans/facts.md"
+}
+
+scenario_facts_marked_plan_is_checked() {
+  local d="${TMP_BASE}/facts1"
+  build_good_fixture "${d}"
+  mk_plan_with_dead_ref "${d}" '<!-- FACTS: audited_head=0123456789abcdef0123456789abcdef01234567 collected=2026-08-02 -->'
+  local out rc
+  out="$(run_verify "${d}")"; rc=$?
+  if [ "${rc}" -ne 0 ] && echo "${out}" | grep -q 'FAIL  \[4-МЁРТВЫЕ-ФАЙЛЫ\].*docs/GHOSTPLAN\.md'; then
+    pass "H-FACTS-1 (план С маркером): судится, мёртвая ссылка поймана, exit=${rc}"
+  else
+    fail "H-FACTS-1 (план С маркером): ОЖИДАЛСЯ FAIL [4-МЁРТВЫЕ-ФАЙЛЫ], получено (exit=${rc}):"
+    echo "${out}" | sed 's/^/      /'
+  fi
+}
+
+scenario_facts_unmarked_plan_is_excluded() {
+  local d="${TMP_BASE}/facts2"
+  build_good_fixture "${d}"
+  mk_plan_with_dead_ref "${d}" ''
+  local out rc
+  out="$(run_verify "${d}")"; rc=$?
+  if [ "${rc}" -eq 0 ] && ! echo "${out}" | grep -q 'GHOSTPLAN'; then
+    pass "H-FACTS-2 (план БЕЗ маркера): исключён, ложного красного нет, exit=${rc}"
+  else
+    fail "H-FACTS-2 (план БЕЗ маркера): ОЖИДАЛСЯ PASS без упоминания GHOSTPLAN, получено (exit=${rc}):"
+    echo "${out}" | sed 's/^/      /'
+  fi
+}
+
+scenario_facts_marker_in_prose_ignored() {
+  local d="${TMP_BASE}/facts3"
+  build_good_fixture "${d}"
+  mkdir -p "${d}/docs/plans"
+  { echo "# документ О маркере"
+    for i in $(seq 1 12); do echo "строка прозы ${i}"; done
+    echo 'Формат: `<!-- FACTS: audited_head=<SHA> collected=<дата> -->`.'
+    echo "Ссылка на \`docs/GHOSTPLAN.md\` — файла нет."
+  } > "${d}/docs/plans/about-marker.md"
+  local out rc
+  out="$(run_verify "${d}")"; rc=$?
+  if [ "${rc}" -eq 0 ] && ! echo "${out}" | grep -q 'GHOSTPLAN'; then
+    pass "H-FACTS-3 (маркер в ПРОЗЕ, не в голове): документ не опт-инится, exit=${rc}"
+  else
+    fail "H-FACTS-3 (маркер в ПРОЗЕ): ОЖИДАЛСЯ PASS — документ О маркере не должен судиться (exit=${rc}):"
+    echo "${out}" | sed 's/^/      /'
+  fi
+}
+
+scenario_facts_note_on_silent_plan() {
+  local d="${TMP_BASE}/facts4"
+  build_good_fixture "${d}"
+  mkdir -p "${d}/docs/plans"
+  { echo "# молчащая фактура"
+    for i in $(seq 1 25); do echo "- см. \`crates/journal/src/lib.rs:${i}\`"; done
+  } > "${d}/docs/plans/silent.md"
+  local out rc
+  out="$(run_verify "${d}")"; rc=$?
+  if [ "${rc}" -eq 0 ] && echo "${out}" | grep -q 'NOTE  \[H-FACTS\].*silent\.md'; then
+    pass "H-FACTS-4 (фактура без маркера, ≥20 утверждений): NOTE напечатан, прогон не свален, exit=${rc}"
+  else
+    fail "H-FACTS-4: ОЖИДАЛСЯ NOTE [H-FACTS] про silent.md при exit=0, получено (exit=${rc}):"
+    echo "${out}" | sed 's/^/      /'
+  fi
+}
+
 scenario_bad_dead_file_ref() {
   local d="${TMP_BASE}/bad5"
   build_good_fixture "${d}"
@@ -1149,6 +1228,10 @@ scenario_bad_coverage_understated
 scenario_bad_rk_foreign_crate_not_counted
 scenario_bad_broken_section_ref
 scenario_bad_dead_file_ref
+scenario_facts_marked_plan_is_checked
+scenario_facts_unmarked_plan_is_excluded
+scenario_facts_marker_in_prose_ignored
+scenario_facts_note_on_silent_plan
 scenario_bad_phase_milestone_missing
 scenario_bad_setup_guard_missing_design
 scenario_merge_preview_catches_branch_vs_merge_drift
