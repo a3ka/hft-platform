@@ -51,10 +51,39 @@ git merge-base --is-ancestor "${raw}" HEAD 2>/dev/null \
 
 BASE=$(git rev-parse "${raw}^{commit}")
 
-# ─── ШАГ 1: SKIP, если crates/** не тронут (per-range семантика) ──────────────────
-crates=$(git diff --name-only "${BASE}" HEAD 2>/dev/null \
+# ─── ШАГ 1: SKIP, если ПРОД-КОД крейтов не тронут (per-range семантика) ───────────
+# `C-115` B-1: правило «любой путь под crates/» давало ЛОЖНОЕ КРАСНОЕ на реальном
+# прод-диапазоне. Замер: merge PR #15 в `main` (`2c56a34..de40f48`, форма `push`,
+# `PUSH_BEFORE=2c56a34`) → `FAIL … S=∅`, exit=1. Диапазон трогал РОВНО ОДИН файл —
+# `crates/gateway/tests/red_snapshot_noclone.rs`, sacred RED-спеку architect'а: фикс оракула
+# по вердикту гейта, идущий харнесс-треком, где вердикт reviewer'а по маршруту не требуется
+# (`docs/workflow/harness-track.md` §3). Барьер требовал его — и краснел на законной истории.
+#
+# Граница НЕ изобретается здесь: она уже проведена в проде и обоснована замером.
+# `.github/workflows/deploy.yml:34-38` (TD-086) исключает `crates/*/tests/**` из триггера
+# деплоя — «тесты в рантайм-бинарь не входят». Проверено исполнением: `Dockerfile:18`
+# собирает `--bin recorder|journal-retention|gateway-serve|gateway-checkpoint|wsprobe`
+# явным списком, тестовые цели не участвуют. Признак `harness-track.md` §4 — «если код
+# запускается на VPS или его результат попадает в журнал» — для тестов ложен.
+#
+# Защита НЕ ослаблена: диапазон, тронувший `crates/*/src/**`, судится как прежде (проверено
+# анти-плацебо на `61f452e` — exit=1). Диапазон, тронувший ТОЛЬКО тесты, объявляется
+# неприменимым ЯВНО, с перечислением файлов — «наблюдение отсутствия» (`testing.md`,
+# целостность гейта, свойство 4), а не молчание.
+crates_all=$(git diff --name-only "${BASE}" HEAD 2>/dev/null \
   | awk -F/ '$1=="crates" && $2!="" {print $2}' | sort -u)
-[ -z "${crates}" ] && { echo "SKIP (диапазон не трогает crates/**)"; exit 0; }
+crates=$(git diff --name-only "${BASE}" HEAD 2>/dev/null \
+  | grep -vE '^crates/[^/]+/tests/' \
+  | awk -F/ '$1=="crates" && $2!="" {print $2}' | sort -u)
+if [ -z "${crates}" ]; then
+  if [ -n "${crates_all}" ]; then
+    echo "SKIP (диапазон трогает ТОЛЬКО crates/*/tests/** — sacred RED-спеки, в прод-образ не входят; C-115 B-1)"
+    git diff --name-only "${BASE}" HEAD 2>/dev/null | grep -E '^crates/[^/]+/tests/' | sed 's/^/      ↳ /'
+  else
+    echo "SKIP (диапазон не трогает crates/**)"
+  fi
+  exit 0
+fi
 
 # ─── ШАГ 2: ТАБЛИЦА МАППИНГА (спека §3.2, нормативная, живёт в скрипте) ───────────
 # Каждый крейт имеет FA-файл и собственный префикс; NO-FA крейты (`recorder`, `derive`)

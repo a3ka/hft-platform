@@ -292,8 +292,33 @@ echo "--- G: guard задач 1-4 не должен лезть в замок и 
 if [ -n "$BASE" ]; then
   locked="$(git diff --name-only "${BASE}..HEAD" | grep -E '^(\.claude/|CLAUDE\.md$|docs/04-workflow\.md$)' || true)"
   fa_diff="$(git diff --name-only "${BASE}..HEAD" | grep -E '^docs/fa/' || true)"
-  if [ -z "$locked" ]; then pass "G locked process files не тронуты текущим диапазоном"
-  else fail "G текущий диапазон трогает process-lock файлы"; printf '%s\n' "$locked" | sed 's/^/      ↳ /'; fi
+  # `C-115` B-2: прежний guard отвергал ЛЮБОЕ касание замка — включая задачу 5 этого же
+  # милестоуна (правка девяти профилей), санкционированную founder'ом. Замер: коммит
+  # `7c89e5c` трогает 10 файлов зоны и НЕСЁТ токен `FOUNDER-APPROVED`, а guard всё равно
+  # инкрементировал FAILED ⇒ acceptance на HEAD = `VERDICT: FAIL` при отчётном `PASS 16/2/0`.
+  # Снести guard нельзя — это ослабило бы защиту, и критик сказал прямо. Поэтому он проверяет
+  # теперь не ФАКТ касания, а САНКЦИЮ, покоммитно, той же нормой `gates.md` §11, что и
+  # `check_docs_freeze.sh`. Второй механизм НЕ заводится: правило одно.
+  if [ -z "$locked" ]; then
+    pass "G process-lock файлы не тронуты текущим диапазоном"
+  else
+    unsanctioned=""
+    while IFS= read -r c; do
+      [ -n "$c" ] || continue
+      touched="$(git show --name-only --format='' "$c" | grep -cE '^(\.claude/|CLAUDE\.md$|docs/04-workflow\.md$)' || true)"
+      [ "$touched" -gt 0 ] || continue
+      if ! git show -s --format='%B' "$c" | grep -qE '^FOUNDER-APPROVED: .{12,}$'; then
+        unsanctioned="${unsanctioned}${c}"$'\n'
+      fi
+    done < <(git log --format='%H' "${BASE}..HEAD")
+    if [ -z "$unsanctioned" ]; then
+      pass "G касание process-lock санкционировано: каждый такой коммит несёт FOUNDER-APPROVED (§11)"
+      printf '%s\n' "$locked" | sed 's/^/      ↳ /'
+    else
+      fail "G диапазон трогает process-lock БЕЗ токена FOUNDER-APPROVED (§11) — покоммитно:"
+      while IFS= read -r c; do [ -n "$c" ] && git show -s --format='      ↳ %h %s' "$c"; done <<< "$unsanctioned"
+    fi
+  fi
   if [ -z "$fa_diff" ]; then pass "G docs/fa/** не тронуты в core-задачах 1-4"
   else fail "G текущий диапазон трогает docs/fa/**"; printf '%s\n' "$fa_diff" | sed 's/^/      ↳ /'; fi
 else
