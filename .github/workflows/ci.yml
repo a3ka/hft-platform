@@ -344,9 +344,6 @@ jobs:
 
   branch-health:
     name: Branch health (наблюдатель веток — НЕ блокирует)
-
-  review-fa:
-    name: Review FA (вердикт называет живой инвариант тронутого модуля, M-66)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -374,6 +371,14 @@ jobs:
       # означает дефект НАШЕГО кода, а не чужого сервиса.
       - name: Проба наблюдателя + батарея мутантов
         run: bash scripts/tests/red_branch_health.sh --battery
+
+  review-fa:
+    name: Review FA (вердикт называет живой инвариант тронутого модуля, M-66)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       # ЗАЧЕМ. `gates.md` §4: диф трогает `crates/<name>/**` ⇒ вердикт обязан назвать живой
       # инвариант-ID из `docs/fa/<name>.md`, либо нести явный `FA-WAIVER`. Замер 2026-08-14,

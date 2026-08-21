@@ -66,6 +66,8 @@ C1BENCHES|1|тронуты ТОЛЬКО `crates/*/benches/**`|C1BENCHES|SKIP, ex
 C1MANIFEST|1|тронут ТОЛЬКО `crates/*/Cargo.toml`|C1MANIFEST|FAIL — манифест определяет состав бинаря, судится
 C1BUILDRS|1|тронут ТОЛЬКО `crates/*/build.rs`|C1BUILDRS|FAIL — исполняется при сборке, судится
 C1MIXED|1|тронуты И `examples/`, И `src/`|C1MIXED|FAIL — не-прод путь рядом не отменяет суда (анти-плацебо)
+C1ANCHOR|1|прод-`src`-файл, чьё ИМЯ содержит подстроку `tests` (не сегмент)|C1ANCHOR|FAIL — якорь сегмента несущий (`C-119` B-B)
+C1SRCBIN|1|тронут ТОЛЬКО `crates/*/src/bin/**`|C1SRCBIN|FAIL — прод-бинарь, судится наравне с `src` (`C-119` B-C)
 D1REVPAIR|1|реверт-пара, net-diff чист|D1REVPAIR|SKIP, exit 0 (per-range семантика §3.1)
 D1NOFA|1|только NO-FA крейт (`recorder`), R введён БЕЗ `FA-WAIVER`|D1NOFA|**FAIL** (пробел покрытия — §2 W; rev1 ставила PASS, опровергнуто C-082 B-1)
 D1NOFAW|1|только NO-FA крейт, R с `FA-WAIVER: crates/recorder — <причина>`|D1NOFAW|PASS + печать `WAIVED` (легитимный оси W)
@@ -373,6 +375,33 @@ scenario_B1TESTSONLY() {
 
 # `C-118` C-1 / `A-012` §1-Д п.5: каждая строка таблицы классификации пиннится сценарием.
 # Критерий — «входит ли путь в прод-образ» (`Dockerfile:18` собирает бинари явным списком).
+# `C-119` B-B: якорь сегмента `^crates/[^/]+/(tests|examples|benches)/` — несущая часть
+# фильтра, и она не была запиннена ничем: все фикстуры клали пути ровно `.../tests/…`.
+# Стаб «снять якорь» (подстрочный фильтр) проходил пробу 47/47, а на живом дереве
+# `crates/journal/src/tests_util.rs` — ПРОД-код, компилируемый в бинарь, — обходил суд.
+scenario_C1ANCHOR() {
+  local r b
+  r="$(mk_repo c1anchor)"; b="$(base_sha "${r}")"
+  printf 'pub fn helper() {}\n' > "${r}/crates/journal/src/tests_util.rs"
+  commit_all "${r}" "C1ANCHOR: прод-src, чьё ИМЯ содержит подстроку tests"
+  setup_assert C1ANCHOR "${r}" "путь обязан содержать 'tests' НЕ как сегмент после имени крейта" \
+    "git diff --name-only '${b}' HEAD | grep -q '^crates/journal/src/tests_util\\.rs$' && ! git diff --name-only '${b}' HEAD | grep -qE '^crates/[^/]+/tests/'"
+  expect_block C1ANCHOR "${r}" "${b}" "подстрока в имени файла — не сегмент пути; прод-код судится"
+}
+
+# `C-119` B-C: `src/bin/**` — прод-бинарь (`Dockerfile` собирает `--bin`), но ни один сценарий
+# не утверждал, что он судится. Стаб, добавивший `src/bin` в SKIP-список, проходил 47/47.
+scenario_C1SRCBIN() {
+  local r b
+  r="$(mk_repo c1srcbin)"; b="$(base_sha "${r}")"
+  mkdir -p "${r}/crates/journal/src/bin"
+  printf 'fn main() {}\n' > "${r}/crates/journal/src/bin/tool.rs"
+  commit_all "${r}" "C1SRCBIN: только src/bin/"
+  setup_assert C1SRCBIN "${r}" "диф обязан трогать ТОЛЬКО crates/*/src/bin/**" \
+    "git diff --name-only '${b}' HEAD | grep -q '^crates/[^/]*/src/bin/'"
+  expect_block C1SRCBIN "${r}" "${b}" "src/bin — прод-бинарь, судится наравне с src"
+}
+
 scenario_C1EXAMPLES() {
   local r b
   r="$(mk_repo c1examples)"; b="$(base_sha "${r}")"
@@ -1324,6 +1353,8 @@ scenario_D1DOC
 scenario_D1NOREV
 scenario_B1TESTSONLY
 scenario_B1SRCSTILLJUDGED
+scenario_C1ANCHOR
+scenario_C1SRCBIN
 scenario_C1EXAMPLES
 scenario_C1BENCHES
 scenario_C1MANIFEST
