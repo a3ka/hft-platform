@@ -851,6 +851,16 @@ scenario_facts_sha_merge_head_side() {
   # состояние merge-preview: слияние приостановлено, MERGE_HEAD существует
   git -C "${d}" checkout -q feature-side
   git -C "${d}" -c user.name=test -c user.email=test@test.local merge --no-commit --no-ff main-side >/dev/null 2>&1 || true
+  # `C-117` F-21: в merge-состоянии дизъюнкция refs ДВУСТОРОННЯЯ (HEAD ∪ MERGE_HEAD), а
+  # сценарий пиннил только MERGE_HEAD-край: стаб `canonical_refs(root)[-1:]` проходил все 60,
+  # в обычном режиме будучи неотличим от честного. Второй маркированный план называет ревизию
+  # СТОРОНЫ ВЕТКИ — живой кейс PR, который везёт и фактуру, и её ревизию.
+  local branch_sha
+  branch_sha="$(git -C "${d}" rev-parse HEAD)"
+  { echo "<!-- FACTS: audited_head=${branch_sha} collected=2026-08-02 -->"
+    echo "# фактура, собранная на стороне ветки"
+    echo "- см. \`crates/journal/src/lib.rs:2\`"
+  } > "${d}/docs/plans/on-branch.md"
   # setup-guard: сценарий обязан тестировать ИМЕННО merge-состояние, а не обычное дерево
   setup_ok=0
   git -C "${d}" rev-parse --verify -q MERGE_HEAD >/dev/null 2>&1 && setup_ok=1
@@ -866,7 +876,7 @@ scenario_facts_sha_merge_head_side() {
   local out rc
   out="$(run_verify "${d}")"; rc=$?
   if [ "${rc}" -eq 0 ] && ! echo "${out}" | grep -q 'FAIL  \[H-FACTS-SHA\]'; then
-    pass "H-FACTS-19 (ревизия входит только через MERGE_HEAD): ложного красного нет, exit=${rc}"
+    pass "H-FACTS-19 (ревизии с ОБЕИХ сторон слияния — HEAD и MERGE_HEAD): ложного красного нет, exit=${rc}"
   else
     fail "H-FACTS-19: ОЖИДАЛСЯ exit=0 без FAIL [H-FACTS-SHA] — MERGE_HEAD-проводка не работает (exit=${rc}):"
     echo "${out}" | sed 's/^/      /'
