@@ -45,7 +45,7 @@
 //! и потому явный: архитектор владеет оракулом, dev — механикой; не оставлять мёртвое
 //! состояние — часть контракта.
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 pub mod rendezvous {
     use std::collections::HashMap;
     use std::sync::{Arc, Condvar, Mutex, OnceLock};

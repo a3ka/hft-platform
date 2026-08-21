@@ -74,7 +74,7 @@ pub mod wire_v1;
 /// `rendezvous`, вызывает `arm(id)` перед сценарием, `test_wait_for_pump(id, ..)`
 /// для синхронизации, `test_release(id)` чтобы pump продолжил, и `test_remove(id)`
 /// после сценария.
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 pub mod test_sync;
 
 pub mod wire {
@@ -1107,13 +1107,13 @@ pub mod server {
                             // M-65 §10.3: точка синхронизации для оракула на гонку
                             // «switch × in-flight pump». В тестовой сборке pump СИГНАЛИТ
                             // «вошёл» и ЖДЁТ разрешения; на прод-путь не влияет
-                            // (compile без #[cfg(test)] ⇒ блок пуст, JIT не видит).
+                            // (compile без #[cfg(any(test, feature = "testing"))] ⇒ блок пуст, JIT не видит).
                             //
                             // BINDING: вызов из `spawn_blocking`. Condvar-вариант
                             // (см. `crates/gateway-serve/src/test_sync.rs`) специально
                             // выбран БЛОКИРУЮЩИМ, чтобы не вешать tokio-worker
                             // `block_on`-ожиданием.
-                            #[cfg(test)]
+                            #[cfg(any(test, feature = "testing"))]
                             {
                                 let id_for_sync = id_for_pump.clone();
                                 crate::test_sync::rendezvous::pump_signal_and_wait(&id_for_sync);
@@ -1500,7 +1500,7 @@ pub mod server {
                         let cfg2 = Arc::clone(&cfg);
                         let id_for_pump = id.clone();
                         let handle: V1PumpJoin = tokio::task::spawn_blocking(move || {
-                            #[cfg(test)]
+                            #[cfg(any(test, feature = "testing"))]
                             {
                                 let id_for_sync = id_for_pump.clone();
                                 crate::test_sync::rendezvous::pump_signal_and_wait(&id_for_sync);
