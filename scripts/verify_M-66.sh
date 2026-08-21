@@ -290,35 +290,42 @@ fi
 
 echo "--- G: guard задач 1-4 не должен лезть в замок и FA follow-up ---"
 if [ -n "$BASE" ]; then
-  locked="$(git diff --name-only "${BASE}..HEAD" | grep -E '^(\.claude/|CLAUDE\.md$|docs/04-workflow\.md$)' || true)"
   fa_diff="$(git diff --name-only "${BASE}..HEAD" | grep -E '^docs/fa/' || true)"
-  # `C-115` B-2: прежний guard отвергал ЛЮБОЕ касание замка — включая задачу 5 этого же
-  # милестоуна (правка девяти профилей), санкционированную founder'ом. Замер: коммит
-  # `7c89e5c` трогает 10 файлов зоны и НЕСЁТ токен `FOUNDER-APPROVED`, а guard всё равно
-  # инкрементировал FAILED ⇒ acceptance на HEAD = `VERDICT: FAIL` при отчётном `PASS 16/2/0`.
-  # Снести guard нельзя — это ослабило бы защиту, и критик сказал прямо. Поэтому он проверяет
-  # теперь не ФАКТ касания, а САНКЦИЮ, покоммитно, той же нормой `gates.md` §11, что и
-  # `check_docs_freeze.sh`. Второй механизм НЕ заводится: правило одно.
-  if [ -z "$locked" ]; then
-    pass "G process-lock файлы не тронуты текущим диапазоном"
-  else
-    unsanctioned=""
-    while IFS= read -r c; do
-      [ -n "$c" ] || continue
-      touched="$(git show --name-only --format='' "$c" | grep -cE '^(\.claude/|CLAUDE\.md$|docs/04-workflow\.md$)' || true)"
-      [ "$touched" -gt 0 ] || continue
-      if ! git show -s --format='%B' "$c" | grep -qE '^FOUNDER-APPROVED: .{12,}$'; then
-        unsanctioned="${unsanctioned}${c}"$'\n'
-      fi
-    done < <(git log --format='%H' "${BASE}..HEAD")
-    if [ -z "$unsanctioned" ]; then
-      pass "G касание process-lock санкционировано: каждый такой коммит несёт FOUNDER-APPROVED (§11)"
-      printf '%s\n' "$locked" | sed 's/^/      ↳ /'
-    else
-      fail "G диапазон трогает process-lock БЕЗ токена FOUNDER-APPROVED (§11) — покоммитно:"
-      while IFS= read -r c; do [ -n "$c" ] && git show -s --format='      ↳ %h %s' "$c"; done <<< "$unsanctioned"
+
+  # `C-118` B-2 + `A-012` §1-Д п.3: сканируем КАЖДЫЙ коммит диапазона независимо от NET-diff.
+  # Прежняя редакция решала по итоговому диффу — и реверт-пара (неавторизованная правка замка
+  # плюс её точный откат) давала пустой net, guard печатал PASS, покоммитный цикл был
+  # НЕДОСТИЖИМ. Это прямо противоречило норме, на которую guard сам ссылается
+  # (`gates.md` §11: «проверка ПОКОММИТНАЯ… реверт-пара тоже нарушение»).
+  #
+  # `C-118` B-3 + `A-012` §1-Г: guard заявляет РОВНО общую норму §11 и НЕ утверждает ничего
+  # о зоне задачи 5. Набор путей задачи 5 сюда не вносится: авторизацию замка уже
+  # механизирует `check_docs_freeze.sh` + джоб `docs-freeze` (блокирующий с 2026-08-15), а
+  # скоуп милестоуна судит PR-time reviewer по спеке. Acceptance-скрипт с собственным
+  # набором путей был бы вторым механизмом на чужое правило (`A-010` §G) — и с худшим
+  # свойством: набор путей умирает вместе с milestone'ом, а скрипт остаётся.
+  unsanctioned=""
+  locked_seen=""
+  while IFS= read -r c; do
+    [ -n "$c" ] || continue
+    touched="$(git show --name-only --format='' "$c" | grep -E '^(\.claude/|CLAUDE\.md$|docs/04-workflow\.md$)' || true)"
+    [ -n "$touched" ] || continue
+    locked_seen="${locked_seen}${c}"$'\n'
+    if ! git show -s --format='%B' "$c" | grep -qE '^FOUNDER-APPROVED: .{12,}$'; then
+      unsanctioned="${unsanctioned}${c}"$'\n'
     fi
+  done < <(git log --format='%H' "${BASE}..HEAD")
+
+  if [ -z "$locked_seen" ]; then
+    pass "G ни один коммит диапазона не трогает process-lock"
+  elif [ -z "$unsanctioned" ]; then
+    pass "G каждый коммит, тронувший process-lock, несёт FOUNDER-APPROVED — общая норма gates.md §11 (о зоне задачи 5 guard НЕ судит: это скоуп, его судит reviewer)"
+    while IFS= read -r c; do [ -n "$c" ] && git show -s --format='      ↳ %h %s' "$c"; done <<< "$locked_seen"
+  else
+    fail "G коммит(ы) диапазона трогают process-lock БЕЗ токена FOUNDER-APPROVED (gates.md §11, покоммитно — реверт-пара тоже нарушение):"
+    while IFS= read -r c; do [ -n "$c" ] && git show -s --format='      ↳ %h %s' "$c"; done <<< "$unsanctioned"
   fi
+
   if [ -z "$fa_diff" ]; then pass "G docs/fa/** не тронуты в core-задачах 1-4"
   else fail "G текущий диапазон трогает docs/fa/**"; printf '%s\n' "$fa_diff" | sed 's/^/      ↳ /'; fi
 else

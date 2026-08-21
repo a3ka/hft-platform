@@ -989,8 +989,24 @@ else
 fi
 BASE="$(git rev-parse -q --verify "${raw}^{commit}" 2>/dev/null || printf '%s' "${raw}")"
 
-crates="$(git diff --name-only "${BASE}" HEAD 2>/dev/null | awk -F/ '$1=="crates" && $2!="" {print $2}' | sort -u)"
-[ -n "${crates}" ] || { echo "SKIP (диапазон не трогает crates/**)"; exit 0; }
+# `C-118` B-1 / `A-012` §1-В: эталон обязан повторять правило применимости ПРОД-барьера.
+# Расхождение стоило красной батареи: барьер скипает tests-only диапазон (`C-115` B-1,
+# граница унаследована от `deploy.yml` TD-086 — тесты в прод-образ не входят), а эталон
+# судил ЛЮБОЙ путь под `crates/`. Правка по `C-115` обновила два носителя правила из трёх
+# (барьер, таблицу §4 спеки) и забыла третий — этот. Семантика двух реализаций одного
+# правила обязана совпадать; независимость эталона — свойство КОДА, а не расхождения.
+crates_all="$(git diff --name-only "${BASE}" HEAD 2>/dev/null | awk -F/ '$1=="crates" && $2!="" {print $2}' | sort -u)"
+crates="$(git diff --name-only "${BASE}" HEAD 2>/dev/null \
+  | grep -vE '^crates/[^/]+/tests/' \
+  | awk -F/ '$1=="crates" && $2!="" {print $2}' | sort -u)"
+if [ -z "${crates}" ]; then
+  if [ -n "${crates_all}" ]; then
+    echo "SKIP (диапазон трогает ТОЛЬКО crates/*/tests/**)"
+  else
+    echo "SKIP (диапазон не трогает crates/**)"
+  fi
+  exit 0
+fi
 
 tmp="$(mktemp -d /tmp/ref-review-fa-XXXXXX)" || exit 1
 trap 'rm -rf "${tmp}"' EXIT
