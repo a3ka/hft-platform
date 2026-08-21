@@ -457,7 +457,11 @@ scenario_facts_marker_in_prose_ignored() {
   mkdir -p "${d}/docs/plans"
   { echo "# документ О маркере"
     for i in $(seq 1 12); do echo "строка прозы ${i}"; done
-    echo 'Формат: `<!-- FACTS: audited_head=<SHA> collected=<дата> -->`.'
+    # F-2 (C-116): плейсхолдер `<SHA>` регэкспом НЕ матчится НИ ПРИ КАКОМ лимите головы —
+    # сценарий был зелен по неверной причине и лимит НЕ пиннил (стаб FACTS_HEAD_LINES=10**9
+    # его проходил). Здесь стоит РЕАЛЬНЫЙ hex: документ обязан не опт-иниться ИМЕННО потому,
+    # что маркер вне головы файла.
+    echo 'Формат: `<!-- FACTS: audited_head=0123456789abcdef0123456789abcdef01234567 collected=2026-08-02 -->`.'
     echo "Ссылка на \`docs/GHOSTPLAN.md\` — файла нет."
   } > "${d}/docs/plans/about-marker.md"
   local out rc
@@ -483,6 +487,108 @@ scenario_facts_note_on_silent_plan() {
     pass "H-FACTS-4 (фактура без маркера, ≥20 утверждений): NOTE напечатан, прогон не свален, exit=${rc}"
   else
     fail "H-FACTS-4: ОЖИДАЛСЯ NOTE [H-FACTS] про silent.md при exit=0, получено (exit=${rc}):"
+    echo "${out}" | sed 's/^/      /'
+  fi
+}
+
+# --- F-3 (C-116): порог NOTE не был запиннен снизу. Стаб FACTS_NOTE_THRESHOLD=0 проходил
+# пробу, а на живом корпусе давал 26 NOTE против 1 честного — флуд, хоронящий сигнал.
+scenario_facts_note_threshold_pinned_below() {
+  local d="${TMP_BASE}/facts5"
+  build_good_fixture "${d}"
+  mkdir -p "${d}/docs/plans"
+  { echo "# короткая записка"
+    for i in 1 2 3; do echo "- см. \`crates/journal/src/lib.rs:${i}\`"; done
+  } > "${d}/docs/plans/tiny-note.md"
+  local out rc
+  out="$(run_verify "${d}")"; rc=$?
+  if [ "${rc}" -eq 0 ] && ! echo "${out}" | grep -q 'NOTE  \[H-FACTS\].*tiny-note\.md'; then
+    pass "H-FACTS-5 (записка без маркера, 3 утверждения < порога): NOTE НЕ печатается, exit=${rc}"
+  else
+    fail "H-FACTS-5: ОЖИДАЛСЯ exit=0 БЕЗ NOTE про tiny-note.md — порог не держится снизу (exit=${rc}):"
+    echo "${out}" | sed 's/^/      /'
+  fi
+}
+
+# --- F-4 (C-116): маркер БЕЗ `audited_head` не обязан опт-инить документ. Весь смысл маркера
+# по A-010 §H — ИМЕНОВАННАЯ ревизия сбора; стаб с регэкспом без `audited_head` пробу проходил.
+scenario_facts_marker_without_head_not_opted_in() {
+  local d="${TMP_BASE}/facts6"
+  build_good_fixture "${d}"
+  mk_plan_with_dead_ref "${d}" '<!-- FACTS: collected=2026-08-02 -->'
+  local out rc
+  out="$(run_verify "${d}")"; rc=$?
+  if [ "${rc}" -eq 0 ] && ! echo "${out}" | grep -q 'GHOSTPLAN'; then
+    pass "H-FACTS-6 (маркер БЕЗ audited_head): документ НЕ опт-инится, exit=${rc}"
+  else
+    fail "H-FACTS-6: ОЖИДАЛСЯ exit=0 без GHOSTPLAN — маркер без ревизии опт-инить не должен (exit=${rc}):"
+    echo "${out}" | sed 's/^/      /'
+  fi
+}
+
+# --- F-5 (C-116): A-010 §H говорит про check3 И check4. H-FACTS-1 пиннил только check4;
+# подмена исключения в check3 на старый tuple не роняла ничего.
+# Литерал `DESIGN.md §<номер>` в тексте пробы НЕ пишется: сам гейт (check3) сканирует .sh и
+# счёл бы его битой ссылкой репозитория — ровно тот класс, что красит вердикты (Н-3 передачи).
+scenario_facts_marked_plan_checked_by_check3() {
+  local d="${TMP_BASE}/facts7"
+  build_good_fixture "${d}"
+  mkdir -p "${d}/docs/plans"
+  local bad_sec=97
+  { echo '<!-- FACTS: audited_head=0123456789abcdef0123456789abcdef01234567 collected=2026-08-02 -->'
+    echo "# фактура с битой секцией"
+    echo "Основание — \`DESIGN.md §${bad_sec}\`, раздела нет в оглавлении."
+  } > "${d}/docs/plans/facts-badsec.md"
+  local out rc
+  out="$(run_verify "${d}")"; rc=$?
+  if [ "${rc}" -ne 0 ] && echo "${out}" | grep -q "FAIL  \[3-ССЫЛКИ\].*facts-badsec\.md"; then
+    pass "H-FACTS-7 (маркированный план, битая §-ссылка): check3 судит его, exit=${rc}"
+  else
+    fail "H-FACTS-7: ОЖИДАЛСЯ FAIL [3-ССЫЛКИ] про facts-badsec.md — check3-проводка не запиннена (exit=${rc}):"
+    echo "${out}" | sed 's/^/      /'
+  fi
+}
+
+# --- F-6 (C-116): рефакторинг перенёс исключение `docs/archive/` из двух inline-tuple в общую
+# функцию, и владение строкой перешло к ней — а сценария на неё нет. Стаб с выключенной веткой
+# давал на живом корпусе 6 ложных FAIL: класс «ложное красное блокирует ВСЕ merge'и».
+scenario_archive_exclusion_still_holds() {
+  local d="${TMP_BASE}/facts8"
+  build_good_fixture "${d}"
+  mkdir -p "${d}/docs/archive"
+  { echo "# архивный документ"
+    echo "Ссылка на \`docs/GHOSTARCH.md\` — файла нет, и это НОРМА для архива."
+  } > "${d}/docs/archive/old-plan.md"
+  local out rc
+  out="$(run_verify "${d}")"; rc=$?
+  if [ "${rc}" -eq 0 ] && ! echo "${out}" | grep -q 'GHOSTARCH'; then
+    pass "H-FACTS-8 (docs/archive/ с мёртвой ссылкой): исключение держится, exit=${rc}"
+  else
+    fail "H-FACTS-8: ОЖИДАЛСЯ exit=0 без GHOSTARCH — исключение archive не запиннено (exit=${rc}):"
+    echo "${out}" | sed 's/^/      /'
+  fi
+}
+
+# --- граница головы файла пиннится с ОБЕИХ сторон (testing.md §«Дегенерированный вход», п.4).
+# H-FACTS-3 держит верх (маркер вне головы не считается); этот — низ: маркер НА последней
+# строке головы обязан считаться, иначе стаб FACTS_HEAD_LINES=1 проходит незамеченным.
+scenario_facts_marker_on_last_head_line_counts() {
+  local d="${TMP_BASE}/facts9"
+  build_good_fixture "${d}"
+  mkdir -p "${d}/docs/plans"
+  { echo "# заголовок"
+    echo ""
+    echo "вводная строка"
+    echo ""
+    echo '<!-- FACTS: audited_head=0123456789abcdef0123456789abcdef01234567 collected=2026-08-02 -->'
+    echo "Ссылка на \`docs/GHOSTPLAN.md\` — файла нет."
+  } > "${d}/docs/plans/marker-line5.md"
+  local out rc
+  out="$(run_verify "${d}")"; rc=$?
+  if [ "${rc}" -ne 0 ] && echo "${out}" | grep -q 'FAIL  \[4-МЁРТВЫЕ-ФАЙЛЫ\].*marker-line5\.md'; then
+    pass "H-FACTS-9 (маркер на 5-й строке — граница головы): засчитан, документ судится, exit=${rc}"
+  else
+    fail "H-FACTS-9: ОЖИДАЛСЯ FAIL про marker-line5.md — граница головы не держится снизу (exit=${rc}):"
     echo "${out}" | sed 's/^/      /'
   fi
 }
@@ -1232,6 +1338,11 @@ scenario_facts_marked_plan_is_checked
 scenario_facts_unmarked_plan_is_excluded
 scenario_facts_marker_in_prose_ignored
 scenario_facts_note_on_silent_plan
+scenario_facts_note_threshold_pinned_below
+scenario_facts_marker_without_head_not_opted_in
+scenario_facts_marked_plan_checked_by_check3
+scenario_archive_exclusion_still_holds
+scenario_facts_marker_on_last_head_line_counts
 scenario_bad_phase_milestone_missing
 scenario_bad_setup_guard_missing_design
 scenario_merge_preview_catches_branch_vs_merge_drift
