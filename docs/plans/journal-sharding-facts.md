@@ -1,4 +1,4 @@
-<!-- FACTS: audited_head=fe8445573cbe8113a77d313d512b6b28af83e694 collected=2026-08-02 -->
+<!-- FACTS: audited_head=8b422409473068154e9072842b4953ff19f28343 collected=2026-08-02 -->
 # Карта журнала hft-platform: что завязано на единый общий порядок
 
 **Разведка (read-only), собрана:** 2026-08-02

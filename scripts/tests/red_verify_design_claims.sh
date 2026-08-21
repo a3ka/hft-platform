@@ -686,6 +686,193 @@ scenario_facts_malformed_marker_is_not_silent() {
   fi
 }
 
+# --- `C-117` F-13 (REJECT, стаб S17): исключение МАРКИРОВАННЫХ документов из NOTE не было
+# запиннено ничем. Симметрия к F-3: H-FACTS-4 держит «немаркированный + много → NOTE есть»,
+# H-FACTS-5 — «мало → NOTE нет», и НИКТО не утверждал «маркированный + много → NOTE НЕТ».
+# Живой радиус немедленный, не латентный: стаб давал 3 NOTE вместо 1, и оба посева маркера
+# получали «документ не называет ревизию сбора», НАЗЫВАЯ её.
+scenario_facts_marked_plan_gets_no_note() {
+  local d="${TMP_BASE}/facts13"
+  build_good_fixture "${d}"
+  fixture_commit_base "${d}" >/dev/null
+  mkdir -p "${d}/docs/plans"
+  { echo "<!-- FACTS: audited_head=$(fixture_head_sha "${d}") collected=2026-08-02 -->"
+    echo "# честная фактура: маркер есть, утверждений много"
+    for i in $(seq 1 25); do echo "- см. \`crates/journal/src/lib.rs:${i}\`"; done
+  } > "${d}/docs/plans/marked-heavy.md"
+  local out rc
+  out="$(run_verify "${d}")"; rc=$?
+  if [ "${rc}" -eq 0 ] && ! echo "${out}" | grep -q 'NOTE  \[H-FACTS\].*marked-heavy\.md'; then
+    pass "H-FACTS-13 (маркер ЕСТЬ + 25 утверждений): NOTE не печатается, exit=${rc}"
+  else
+    fail "H-FACTS-13: ОЖИДАЛСЯ exit=0 БЕЗ NOTE — маркированный документ ревизию НАЗЫВАЕТ (exit=${rc}):"
+    echo "${out}" | sed 's/^/      /'
+  fi
+}
+
+# --- `C-117` F-14 (REJECT, стаб S18): fail-closed на не-git корне не был запиннен — все
+# фикстуры пробы были git-репозиториями. Радиус: tar-экспорт/копия без `.git` (класс `C-062`
+# — прогон не на том дереве) с фиктивной ревизией проходил бы МОЛЧА.
+# `testing.md` «Целостность гейта», свойство 3: гейт обязан падать против несостоявшегося setup.
+scenario_facts_sha_non_git_is_setup_guard() {
+  local d="${TMP_BASE}/facts14"
+  build_good_fixture "${d}"
+  mkdir -p "${d}/docs/plans"
+  { echo '<!-- FACTS: audited_head=1111111111111111111111111111111111111111 collected=2026-08-02 -->'
+    echo "# фактура в дереве без истории"
+    echo "- см. \`crates/journal/src/lib.rs:1\`"
+  } > "${d}/docs/plans/no-git-rev.md"
+  rm -rf "${d}/.git"
+  local out rc
+  out="$(run_verify "${d}")"; rc=$?
+  if [ "${rc}" -ne 0 ] && echo "${out}" | grep -q 'FAIL  \[H-FACTS-SHA\].*не git-репозиторий.*setup-guard'; then
+    pass "H-FACTS-14 (маркер в НЕ-git корне): setup-guard FAIL, не молчание, exit=${rc}"
+  else
+    fail "H-FACTS-14: ОЖИДАЛСЯ FAIL [H-FACTS-SHA] setup-guard — нечем проверить есть НАРУШЕНИЕ (exit=${rc}):"
+    echo "${out}" | sed 's/^/      /'
+  fi
+}
+
+# --- `C-117` F-16 (NOTE, стаб S20): граница порога `n == 20` не проверялась никем —
+# H-FACTS-4 кладёт 25, H-FACTS-5 — 3, а off-by-one (`>` вместо `>=`) проходил пробу, и
+# фактура РОВНО в 20 утверждений молча теряла NOTE.
+# `testing.md` «Дегенерированный вход» п.4: граница пиннится ОТДЕЛЬНЫМ входом.
+scenario_facts_note_exact_threshold() {
+  local d="${TMP_BASE}/facts16"
+  build_good_fixture "${d}"
+  mkdir -p "${d}/docs/plans"
+  { echo "# фактура ровно на пороге"
+    for i in $(seq 1 20); do echo "- см. \`crates/journal/src/lib.rs:${i}\`"; done
+  } > "${d}/docs/plans/exactly-twenty.md"
+  local out rc
+  out="$(run_verify "${d}")"; rc=$?
+  if [ "${rc}" -eq 0 ] && echo "${out}" | grep -q 'NOTE  \[H-FACTS\].*exactly-twenty\.md'; then
+    pass "H-FACTS-16 (ровно 20 утверждений — граница порога): NOTE есть, exit=${rc}"
+  else
+    fail "H-FACTS-16: ОЖИДАЛСЯ NOTE про exactly-twenty.md при exit=0 — граница порога не держится (exit=${rc}):"
+    echo "${out}" | sed 's/^/      /'
+  fi
+}
+
+# --- `C-117` F-15 (NOTE, стаб S19): обязательность хвоста `-->` не была запиннена.
+# Оба исхода громкие (незакрытый маркер даёт FAIL «НЕ распарсен» через FACTS_DECL_RE), но
+# поведение всё равно должно быть зафиксировано — иначе снятие хвоста молча меняет контракт.
+scenario_facts_marker_unterminated_is_named() {
+  local d="${TMP_BASE}/facts15"
+  build_good_fixture "${d}"
+  mk_plan_with_dead_ref "${d}" '<!-- FACTS: audited_head=1111111111111111111111111111111111111111 collected=2026-08-02'
+  local out rc
+  out="$(run_verify "${d}")"; rc=$?
+  if ! echo "${out}" | grep -q 'GHOSTPLAN' \
+     && echo "${out}" | grep -q 'FAIL  \[H-FACTS-SHA\].*facts\.md.*НЕ распарсен'; then
+    pass "H-FACTS-15 (маркер без закрывающего хвоста): опт-ина нет, названо явно, exit=${rc}"
+  else
+    fail "H-FACTS-15: ОЖИДАЛСЯ FAIL про нераспарсенный маркер и отсутствие опт-ина (exit=${rc}):"
+    echo "${out}" | sed 's/^/      /'
+  fi
+}
+
+# --- `C-117` F-17 (CONCERNS): дыра F-1 воспроизводилась ОДНИМ УРОВНЕМ ГЛУБЖЕ — обход
+# `check_facts_sha` шёл верхним уровнем, `is_excluded` и NOTE-проверка рекурсивны.
+scenario_facts_subdir_is_scanned() {
+  local d="${TMP_BASE}/facts17"
+  build_good_fixture "${d}"
+  fixture_commit_base "${d}" >/dev/null
+  mkdir -p "${d}/docs/plans/sub"
+  { echo '<!-- FACTS: audited_head=1111111111111111111111111111111111111111 collected=2026-08-02 -->'
+    echo "# фактура в подкаталоге с выдуманной ревизией"
+    echo "- см. \`crates/journal/src/lib.rs:1\`"
+  } > "${d}/docs/plans/sub/fake-rev.md"
+  local out rc
+  out="$(run_verify "${d}")"; rc=$?
+  if [ "${rc}" -ne 0 ] && echo "${out}" | grep -q 'FAIL  \[H-FACTS-SHA\].*sub/fake-rev\.md.*НЕТ вовсе'; then
+    pass "H-FACTS-17 (подкаталог + выдуманная ревизия): судится наравне с верхним уровнем, exit=${rc}"
+  else
+    fail "H-FACTS-17: ОЖИДАЛСЯ FAIL про sub/fake-rev.md — обход не рекурсивен (exit=${rc}):"
+    echo "${out}" | sed 's/^/      /'
+  fi
+}
+
+# --- `C-117` F-18 (CONCERNS): один байт cp1251 в голове — и документ с ВАЛИДНЫМ маркером
+# выпадал из ВСЕХ проверок молча. Python декодирует чанком: битый байт строки 2 валит
+# итерацию ДО отдачи строки 1. Ровно тот «молчаливый даунгрейд», устранение которого эта
+# ветка объявила своим достижением.
+scenario_facts_non_utf8_head_is_named() {
+  local d="${TMP_BASE}/facts18"
+  build_good_fixture "${d}"
+  fixture_commit_base "${d}" >/dev/null
+  mkdir -p "${d}/docs/plans"
+  { echo "<!-- FACTS: audited_head=$(fixture_head_sha "${d}") collected=2026-08-02 -->"
+    printf '# \x96 битый байт из cp1251-буфера\n'
+    echo "Ссылка на \`docs/GHOSTPLAN.md\` — файла нет."
+  } > "${d}/docs/plans/broken-encoding.md"
+  local out rc
+  out="$(run_verify "${d}")"; rc=$?
+  if [ "${rc}" -ne 0 ] && echo "${out}" | grep -q 'FAIL  \[H-FACTS-SHA\].*broken-encoding\.md.*не читается как UTF-8'; then
+    pass "H-FACTS-18 (не-UTF-8 байт в голове): назван, не молчание, exit=${rc}"
+  else
+    fail "H-FACTS-18: ОЖИДАЛСЯ FAIL [H-FACTS-SHA] про нечитаемую голову (exit=${rc}):"
+    echo "${out}" | sed 's/^/      /'
+  fi
+}
+
+# --- `C-117` F-12 (REJECT, стаб S16): комментарий барьера ОБЕЩАЕТ, что механика
+# переиспользована «включая MERGE_HEAD внутри --merge-preview», но ни один сценарий не
+# строил merge-состояние с маркером — стаб `refs = ["HEAD"]` проходил пробу целиком.
+# Радиус — ложное КРАСНОЕ в режиме, где джоб гоняет предмет чаще всего: ревизия, вошедшая
+# в дерево только через сторону слияния, объявлялась орфаном, и это блокировало бы ВСЕ
+# merge'и репозитория — класс, которым `A-010` §H мотивирует направление отказа.
+scenario_facts_sha_merge_head_side() {
+  # каталог именуется по СВОЕМУ номеру: `facts12` занят сценарием malformed-маркера, и
+  # переиспользование давало чужую фикстуру в прогоне — поймано первым же запуском.
+  local d="${TMP_BASE}/facts19"
+  build_good_fixture "${d}"
+  local base_sha main_sha
+  base_sha="$(fixture_commit_base "${d}")"
+  # ветка отстаёт от main; ревизия сбора появляется ТОЛЬКО на стороне main
+  git -C "${d}" checkout -q -b feature-side
+  echo "работа ветки" > "${d}/side.txt"
+  git -C "${d}" add side.txt
+  git -C "${d}" -c user.name=test -c user.email=test@test.local commit -q -m "ветка: своя работа"
+  git -C "${d}" checkout -q "${base_sha}"
+  git -C "${d}" checkout -q -B main-side
+  echo "работа main" > "${d}/on-main.txt"
+  mkdir -p "${d}/docs/plans"
+  git -C "${d}" add on-main.txt
+  git -C "${d}" -c user.name=test -c user.email=test@test.local commit -q -m "main: коммит, который станет ревизией сбора"
+  main_sha="$(git -C "${d}" rev-parse HEAD)"
+  { echo "<!-- FACTS: audited_head=${main_sha} collected=2026-08-02 -->"
+    echo "# фактура, собранная на стороне main"
+    echo "- см. \`crates/journal/src/lib.rs:1\`"
+  } > "${d}/docs/plans/on-main.md"
+  git -C "${d}" add docs/plans/on-main.md
+  git -C "${d}" -c user.name=test -c user.email=test@test.local commit -q -m "main: маркированный план"
+  main_sha="$(git -C "${d}" rev-parse HEAD)"
+  # состояние merge-preview: слияние приостановлено, MERGE_HEAD существует
+  git -C "${d}" checkout -q feature-side
+  git -C "${d}" -c user.name=test -c user.email=test@test.local merge --no-commit --no-ff main-side >/dev/null 2>&1 || true
+  # setup-guard: сценарий обязан тестировать ИМЕННО merge-состояние, а не обычное дерево
+  setup_ok=0
+  git -C "${d}" rev-parse --verify -q MERGE_HEAD >/dev/null 2>&1 && setup_ok=1
+  if [ "${setup_ok}" -ne 1 ]; then
+    fail "H-FACTS-19: setup не состоялся — MERGE_HEAD отсутствует, сценарий тестировал бы не то"
+    return
+  fi
+  # и ревизия обязана быть НЕдостижима от одного HEAD — иначе сценарий вакуумен
+  if git -C "${d}" merge-base --is-ancestor "${main_sha}" HEAD >/dev/null 2>&1; then
+    fail "H-FACTS-19: setup не состоялся — ревизия достижима от HEAD, стаб S16 такой вход не отличит"
+    return
+  fi
+  local out rc
+  out="$(run_verify "${d}")"; rc=$?
+  if [ "${rc}" -eq 0 ] && ! echo "${out}" | grep -q 'FAIL  \[H-FACTS-SHA\]'; then
+    pass "H-FACTS-19 (ревизия входит только через MERGE_HEAD): ложного красного нет, exit=${rc}"
+  else
+    fail "H-FACTS-19: ОЖИДАЛСЯ exit=0 без FAIL [H-FACTS-SHA] — MERGE_HEAD-проводка не работает (exit=${rc}):"
+    echo "${out}" | sed 's/^/      /'
+  fi
+}
+
 scenario_bad_dead_file_ref() {
   local d="${TMP_BASE}/bad5"
   build_good_fixture "${d}"
@@ -1439,6 +1626,13 @@ scenario_facts_marker_on_last_head_line_counts
 scenario_facts_sha_fake_fails
 scenario_facts_sha_orphan_fails
 scenario_facts_malformed_marker_is_not_silent
+scenario_facts_marked_plan_gets_no_note
+scenario_facts_sha_non_git_is_setup_guard
+scenario_facts_note_exact_threshold
+scenario_facts_marker_unterminated_is_named
+scenario_facts_subdir_is_scanned
+scenario_facts_non_utf8_head_is_named
+scenario_facts_sha_merge_head_side
 scenario_bad_phase_milestone_missing
 scenario_bad_setup_guard_missing_design
 scenario_merge_preview_catches_branch_vs_merge_drift

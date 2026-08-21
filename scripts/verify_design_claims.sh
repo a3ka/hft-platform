@@ -638,6 +638,25 @@ FACTS_NOTE_THRESHOLD = 20     # порог утверждений `путь:ст
 FACTS_DECL_RE = re.compile(r"<!--\s*FACTS:")
 
 
+# `C-117` F-18: `_facts_head_scan` глотал `UnicodeDecodeError` и возвращал (False, None) —
+# документ с ВАЛИДНЫМ маркером и одним байтом cp1251 во второй строке молча выпадал из ВСЕХ
+# проверок: ни опт-ина, ни FAIL «НЕ распарсен», ни NOTE. Python декодирует чтение чанком,
+# поэтому битый байт строки 2 валит итерацию ДО отдачи строки 1. Это тот самый «молчаливый
+# даунгрейд», устранение которого объявлено достижением этой ветки, — воспроизводимый одним
+# символом из чужого буфера. Различаем: нечитаемая голова — отдельный наблюдаемый исход.
+def _head_is_utf8(fpath):
+    try:
+        with open(fpath, encoding="utf-8") as f:
+            for i, _line in enumerate(f):
+                if i >= FACTS_HEAD_LINES:
+                    break
+        return True
+    except UnicodeDecodeError:
+        return False
+    except OSError:
+        return True   # недоступность файла — не наш предмет, её ловят соседние проверки
+
+
 def _facts_head_scan(fpath):
     """(declared, sha) по ГОЛОВЕ файла.
     declared — в голове есть строка, объявляющая документ фактурой;
@@ -737,23 +756,48 @@ DOC_FILE_REF_RE = re.compile(r"\bdocs/[A-Za-z0-9_.\-/]+\.md\b")
 # Механика переиспользована, не продублирована (`A-010` §G): те же `git_commit_exists` и
 # `git_commit_is_ancestor_of_any`, что у check6, включая MERGE_HEAD внутри --merge-preview.
 # ---------------------------------------------------------------------------
-def check_facts_sha(root):
+# `C-117` F-17: после F-11 в plans-зоне жили ТРИ обхода с ТРЕМЯ охватами — `is_excluded`
+# рекурсивен (startswith), NOTE-проверка рекурсивна (os.walk), SHA-проверка шла os.listdir
+# верхним уровнем. Дыра F-1 воспроизводилась одним уровнем глубже: в подкаталоге фиктивная
+# ревизия опт-инилась и не судилась, а малформ снова молчал. Обход теперь ОДИН на всех.
+def plans_md_files(root):
     plans = os.path.join(root, "docs", "plans")
     if not os.path.isdir(plans):
+        return []
+    out = []
+    for dirpath, dirnames, filenames in os.walk(plans):
+        dirnames[:] = [d for d in dirnames if d not in (".git",)]
+        for fn in filenames:
+            if fn.endswith(".md"):
+                out.append(os.path.join(dirpath, fn))
+    return sorted(out)
+
+
+def check_facts_sha(root):
+    plan_files = plans_md_files(root)
+    if not plan_files:
         return
 
     declared_bad = []   # объявил себя фактурой, маркер не распарсен
+    unreadable = []     # голова не читается как UTF-8 — проверка невозможна
     marked = []         # (relpath, sha)
-    for fn in sorted(os.listdir(plans)):
-        if not fn.endswith(".md"):
-            continue
-        fpath = os.path.join(plans, fn)
+    for fpath in plan_files:
         declared, sha = _facts_head_scan(fpath)
         relpath = os.path.relpath(fpath, root)
         if sha is not None:
             marked.append((relpath, sha))
         elif declared:
             declared_bad.append(relpath)
+        elif not _head_is_utf8(fpath):
+            unreadable.append(relpath)
+
+    # `C-117` F-18: нечитаемая голова — наблюдаемый исход, а не тишина.
+    for relpath in unreadable:
+        fail(
+            "H-FACTS-SHA",
+            f"{relpath}: голова файла не читается как UTF-8 — наличие маркера `FACTS:` "
+            f"проверить невозможно; документ молча выпал бы из проверки ссылок",
+        )
 
     # Молчаливый даунгрейд перестаёт быть молчаливым (C-116 F-1, вторая половина).
     for relpath in declared_bad:
@@ -765,7 +809,7 @@ def check_facts_sha(root):
         )
 
     if not marked:
-        if not declared_bad:
+        if not declared_bad and not unreadable:
             info("H-FACTS-SHA", "документов с маркером `FACTS:` в docs/plans/**: 0 — проверять нечего")
         return
 
@@ -824,13 +868,7 @@ def check_facts_note(root):
     # проверка шла `os.listdir` — верхним уровнем. Подкаталогов сегодня ноль, расхождение было
     # латентным: первый же подкаталог получил бы проверку ссылок, но не наблюдение молчания.
     silent = 0
-    plan_files = []
-    for dirpath, dirnames, filenames in os.walk(plans):
-        dirnames[:] = [d for d in dirnames if d not in (".git",)]
-        for fn in filenames:
-            if fn.endswith(".md"):
-                plan_files.append(os.path.join(dirpath, fn))
-    for fpath in sorted(plan_files):
+    for fpath in plans_md_files(root):
         fn = os.path.relpath(fpath, plans)
         if _has_facts_marker(fpath):
             continue
