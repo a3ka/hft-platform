@@ -68,6 +68,7 @@ C1BUILDRS|1|тронут ТОЛЬКО `crates/*/build.rs`|C1BUILDRS|FAIL — и�
 C1MIXED|1|тронуты И `examples/`, И `src/`|C1MIXED|FAIL — не-прод путь рядом не отменяет суда (анти-плацебо)
 C1ANCHOR|1|прод-`src`-файл, чьё ИМЯ содержит подстроку `tests` (не сегмент)|C1ANCHOR|FAIL — якорь сегмента несущий (`C-119` B-B)
 C1SRCBIN|1|тронут ТОЛЬКО `crates/*/src/bin/**`|C1SRCBIN|FAIL — прод-бинарь, судится наравне с `src` (`C-119` B-C)
+C1SRCTESTS|1|тронут ТОЛЬКО `crates/*/src/tests/**` (модуль, не тест-таргет)|C1SRCTESTS|FAIL — компилируется в бинарь; позиционный якорь несущий (`C-119` B-D)
 D1REVPAIR|1|реверт-пара, net-diff чист|D1REVPAIR|SKIP, exit 0 (per-range семантика §3.1)
 D1NOFA|1|только NO-FA крейт (`recorder`), R введён БЕЗ `FA-WAIVER`|D1NOFA|**FAIL** (пробел покрытия — §2 W; rev1 ставила PASS, опровергнуто C-082 B-1)
 D1NOFAW|1|только NO-FA крейт, R с `FA-WAIVER: crates/recorder — <причина>`|D1NOFAW|PASS + печать `WAIVED` (легитимный оси W)
@@ -391,6 +392,22 @@ scenario_C1ANCHOR() {
 
 # `C-119` B-C: `src/bin/**` — прод-бинарь (`Dockerfile` собирает `--bin`), но ни один сценарий
 # не утверждал, что он судится. Стаб, добавивший `src/bin` в SKIP-список, проходил 47/47.
+# `C-119` B-D: второй край того же якоря. `C1ANCHOR` пиннит подстрочную деградацию
+# (`tests` внутри ИМЕНИ файла); здесь — снятие ПОЗИЦИИ при сохранённой семантике сегмента.
+# `crates/<c>/src/tests/**` — обычный модуль (`mod tests;`), КОМПИЛИРУЕМЫЙ в прод-бинарь;
+# под мутантом `midseg` он уходил бы в SKIP. Путей такого вида в корпусе сегодня 0 — правило
+# заведено ДО появления первого, тем же основанием, что `C1BUILDRS`/`C1BENCHES`.
+scenario_C1SRCTESTS() {
+  local r b
+  r="$(mk_repo c1srctests)"; b="$(base_sha "${r}")"
+  mkdir -p "${r}/crates/journal/src/tests"
+  printf 'pub fn helper() {}\n' > "${r}/crates/journal/src/tests/mod.rs"
+  commit_all "${r}" "C1SRCTESTS: модуль src/tests/ — компилируется в бинарь"
+  setup_assert C1SRCTESTS "${r}" "путь обязан нести сегмент tests НЕ сразу после имени крейта" \
+    "git diff --name-only '${b}' HEAD | grep -q '^crates/journal/src/tests/' && ! git diff --name-only '${b}' HEAD | grep -qE '^crates/[^/]+/tests/'"
+  expect_block C1SRCTESTS "${r}" "${b}" "src/tests — модуль прод-крейта, судится"
+}
+
 scenario_C1SRCBIN() {
   local r b
   r="$(mk_repo c1srcbin)"; b="$(base_sha "${r}")"
@@ -1090,8 +1107,21 @@ BASE="$(git rev-parse -q --verify "${raw}^{commit}" 2>/dev/null || printf '%s' "
 # (барьер, таблицу §4 спеки) и забыла третий — этот. Семантика двух реализаций одного
 # правила обязана совпадать; независимость эталона — свойство КОДА, а не расхождения.
 crates_all="$(git diff --name-only "${BASE}" HEAD 2>/dev/null | awk -F/ '$1=="crates" && $2!="" {print $2}' | sort -u)"
+# `C-119` B-B/B-C/B-D: несущие элементы фильтра пиннятся МУТАНТАМИ БАТАРЕИ, а не разовым
+# прогоном стаба. Разовый прогон — демонстрация автора; мутант гоняется каждым CI-прогоном.
+# Множество элементов КОНЕЧНО и здесь исчерпано: альтернативы (tests|examples|benches),
+# подстрочность, позиционный якорь `^crates/[^/]+/`, состав SKIP-списка.
+if [ "${M}" = anchorless ]; then
+  FILT='tests|examples|benches'                         # снята подстрочность → ловит C1ANCHOR
+elif [ "${M}" = midseg ]; then
+  FILT='/(tests|examples|benches)/'                     # снят ПОЗИЦИОННЫЙ якорь → ловит C1SRCTESTS
+elif [ "${M}" = skipsrcbin ]; then
+  FILT='^crates/[^/]+/(tests|examples|benches|src/bin)/' # прод-бинарь в SKIP → ловит C1SRCBIN
+else
+  FILT='^crates/[^/]+/(tests|examples|benches)/'
+fi
 crates="$(git diff --name-only "${BASE}" HEAD 2>/dev/null \
-  | grep -vE '^crates/[^/]+/(tests|examples|benches)/' \
+  | grep -vE "${FILT}" \
   | awk -F/ '$1=="crates" && $2!="" {print $2}' | sort -u)"
 if [ -z "${crates}" ]; then
   if [ -n "${crates_all}" ]; then
@@ -1265,6 +1295,9 @@ emptyfaok:F6NOFAFILE
 vacuousok:D1NOFA
 anywaiver:W7WRONG
 substrwaiver:W7PFX
+anchorless:C1ANCHOR
+midseg:C1SRCTESTS
+skipsrcbin:C1SRCBIN
 echoexcuse:W7MIXGAP"
 
   # Состав батареи сверяется со спекой §4 ПО ИМЕНАМ — иначе фраза «сверяется с этим
@@ -1354,6 +1387,7 @@ scenario_D1NOREV
 scenario_B1TESTSONLY
 scenario_B1SRCSTILLJUDGED
 scenario_C1ANCHOR
+scenario_C1SRCTESTS
 scenario_C1SRCBIN
 scenario_C1EXAMPLES
 scenario_C1BENCHES
