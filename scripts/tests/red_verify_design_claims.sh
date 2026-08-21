@@ -151,6 +151,22 @@ EOF
   git -C "${d}" init -q 2>/dev/null || true
 }
 
+# F-1 (C-116): проверка ревизии сбора требует ЖИВОЙ истории — без коммита `HEAD` не
+# существует, и фикстура могла бы проверять только отрицательный случай.
+# Коммит делается ЯВНЫМ вызовом, а НЕ внутри `build_good_fixture`: та используется всеми
+# сценариями, и `build_rfc_fixture_base` коммитит сама. Первая редакция правила коммит прямо
+# в общую фикстуру — второй коммит становился пустым, ancestry менялась, и ЧЕТЫРЕ RFC-SHA
+# сценария падали. Ровно «что пришлось ослабить рядом» (`testing.md`, мутационный контроль,
+# второй вопрос): побочный эффект правки ловится соседним оракулом, а не рассуждением.
+fixture_commit_base() { # $1=dir → печатает SHA
+  git -C "$1" add -A >/dev/null 2>&1 || true
+  git -C "$1" -c user.name=test -c user.email=test@test.local \
+      commit -q -m "фикстура H-FACTS: базовое дерево" >/dev/null 2>&1 || true
+  git -C "$1" rev-parse HEAD 2>/dev/null
+}
+
+fixture_head_sha() { git -C "$1" rev-parse HEAD 2>/dev/null; }
+
 run_verify() { # $1 = fixture dir → печатает stdout, возвращает exit-код в $?
   bash "${BARRIER}" "$1"
 }
@@ -426,10 +442,12 @@ mk_plan_with_dead_ref() {   # $1=каталог фикстуры $2=шапка �
 scenario_facts_marked_plan_is_checked() {
   local d="${TMP_BASE}/facts1"
   build_good_fixture "${d}"
-  mk_plan_with_dead_ref "${d}" '<!-- FACTS: audited_head=0123456789abcdef0123456789abcdef01234567 collected=2026-08-02 -->'
+  fixture_commit_base "${d}" >/dev/null
+  mk_plan_with_dead_ref "${d}" "<!-- FACTS: audited_head=$(fixture_head_sha "${d}") collected=2026-08-02 -->"
   local out rc
   out="$(run_verify "${d}")"; rc=$?
-  if [ "${rc}" -ne 0 ] && echo "${out}" | grep -q 'FAIL  \[4-МЁРТВЫЕ-ФАЙЛЫ\].*docs/GHOSTPLAN\.md'; then
+  if [ "${rc}" -ne 0 ] && echo "${out}" | grep -q 'FAIL  \[4-МЁРТВЫЕ-ФАЙЛЫ\].*docs/GHOSTPLAN\.md' \
+     && ! echo "${out}" | grep -q 'FAIL  \[H-FACTS-SHA\]'; then
     pass "H-FACTS-1 (план С маркером): судится, мёртвая ссылка поймана, exit=${rc}"
   else
     fail "H-FACTS-1 (план С маркером): ОЖИДАЛСЯ FAIL [4-МЁРТВЫЕ-ФАЙЛЫ], получено (exit=${rc}):"
@@ -518,10 +536,14 @@ scenario_facts_marker_without_head_not_opted_in() {
   mk_plan_with_dead_ref "${d}" '<!-- FACTS: collected=2026-08-02 -->'
   local out rc
   out="$(run_verify "${d}")"; rc=$?
-  if [ "${rc}" -eq 0 ] && ! echo "${out}" | grep -q 'GHOSTPLAN'; then
-    pass "H-FACTS-6 (маркер БЕЗ audited_head): документ НЕ опт-инится, exit=${rc}"
+  # Два утверждения сразу: (1) опт-ина нет — мёртвая ссылка НЕ ловится; (2) молчания тоже
+  # нет — документ объявил себя фактурой негодной формой, и это названо (C-116 F-1, вторая
+  # половина: «молчаливый даунгрейд»).
+  if ! echo "${out}" | grep -q 'GHOSTPLAN' \
+     && echo "${out}" | grep -q 'FAIL  \[H-FACTS-SHA\].*facts\.md.*НЕ распарсен'; then
+    pass "H-FACTS-6 (маркер БЕЗ audited_head): опт-ина нет И молчания нет, exit=${rc}"
   else
-    fail "H-FACTS-6: ОЖИДАЛСЯ exit=0 без GHOSTPLAN — маркер без ревизии опт-инить не должен (exit=${rc}):"
+    fail "H-FACTS-6: ОЖИДАЛОСЬ отсутствие GHOSTPLAN И FAIL [H-FACTS-SHA] про нераспарсенный маркер (exit=${rc}):"
     echo "${out}" | sed 's/^/      /'
   fi
 }
@@ -533,6 +555,7 @@ scenario_facts_marker_without_head_not_opted_in() {
 scenario_facts_marked_plan_checked_by_check3() {
   local d="${TMP_BASE}/facts7"
   build_good_fixture "${d}"
+  fixture_commit_base "${d}" >/dev/null
   mkdir -p "${d}/docs/plans"
   local bad_sec=97
   { echo '<!-- FACTS: audited_head=0123456789abcdef0123456789abcdef01234567 collected=2026-08-02 -->'
@@ -575,12 +598,13 @@ scenario_archive_exclusion_still_holds() {
 scenario_facts_marker_on_last_head_line_counts() {
   local d="${TMP_BASE}/facts9"
   build_good_fixture "${d}"
+  fixture_commit_base "${d}" >/dev/null
   mkdir -p "${d}/docs/plans"
   { echo "# заголовок"
     echo ""
     echo "вводная строка"
     echo ""
-    echo '<!-- FACTS: audited_head=0123456789abcdef0123456789abcdef01234567 collected=2026-08-02 -->'
+    echo "<!-- FACTS: audited_head=$(fixture_head_sha "${d}") collected=2026-08-02 -->"
     echo "Ссылка на \`docs/GHOSTPLAN.md\` — файла нет."
   } > "${d}/docs/plans/marker-line5.md"
   local out rc
@@ -589,6 +613,75 @@ scenario_facts_marker_on_last_head_line_counts() {
     pass "H-FACTS-9 (маркер на 5-й строке — граница головы): засчитан, документ судится, exit=${rc}"
   else
     fail "H-FACTS-9: ОЖИДАЛСЯ FAIL про marker-line5.md — граница головы не держится снизу (exit=${rc}):"
+    echo "${out}" | sed 's/^/      /'
+  fi
+}
+
+# --- F-1 (C-116, ранг REJECT): решение арбитра `A-010` §H требовало «проверку SHA той же
+# механикой, что check6 (существует, предок HEAD)». Захват `audited_head=(…)` в регэкспе был
+# МЁРТВЫМ кодом — группа не потреблялась нигде, и документ с выдуманной ревизией опт-инился,
+# не будучи судим ничем. Три сценария ниже пиннят обе половины: саму проверку и наблюдение
+# отсутствия («молчаливый даунгрейд»).
+scenario_facts_sha_fake_fails() {
+  local d="${TMP_BASE}/facts10"
+  build_good_fixture "${d}"
+  mkdir -p "${d}/docs/plans"
+  local fake=1111111111111111111111111111111111111111
+  { echo "<!-- FACTS: audited_head=${fake} collected=2026-08-02 -->"
+    echo "# фактура на несуществующем дереве"
+    echo "- см. \`crates/journal/src/lib.rs:1\`"
+  } > "${d}/docs/plans/fake-rev.md"
+  local out rc
+  out="$(run_verify "${d}")"; rc=$?
+  if [ "${rc}" -ne 0 ] && echo "${out}" | grep -q "FAIL  \[H-FACTS-SHA\].*fake-rev\.md.*НЕТ вовсе"; then
+    pass "H-FACTS-10 (маркер с ВЫДУМАННОЙ ревизией): FAIL, документ не проходит опт-ином, exit=${rc}"
+  else
+    fail "H-FACTS-10: ОЖИДАЛСЯ FAIL [H-FACTS-SHA] про несуществующий коммит (exit=${rc}):"
+    echo "${out}" | sed 's/^/      /'
+  fi
+}
+
+scenario_facts_sha_orphan_fails() {
+  local d="${TMP_BASE}/facts11"
+  build_good_fixture "${d}"
+  local base_sha orphan_sha
+  base_sha="$(fixture_commit_base "${d}")"
+  git -C "${d}" checkout -q -b orphan-facts
+  echo "работа, которую никуда не влили" > "${d}/orphan-facts.txt"
+  git -C "${d}" add orphan-facts.txt
+  git -C "${d}" -c user.name=test -c user.email=test@test.local commit -q -m "орфан: ветка не влита"
+  orphan_sha="$(git -C "${d}" rev-parse HEAD)"
+  git -C "${d}" checkout -q "${base_sha}"
+  mkdir -p "${d}/docs/plans"
+  { echo "<!-- FACTS: audited_head=${orphan_sha} collected=2026-08-02 -->"
+    echo "# фактура, собранная на невлитой ветке"
+    echo "- см. \`crates/journal/src/lib.rs:1\`"
+  } > "${d}/docs/plans/orphan-rev.md"
+  local out rc
+  out="$(run_verify "${d}")"; rc=$?
+  # Анти-плацебо того же класса, что C-044 F1: существование НЕОБХОДИМО, но НЕ достаточно —
+  # ревизия сбора обязана входить в историю, иначе «датировано» ничего не значит.
+  if [ "${rc}" -ne 0 ] && echo "${out}" | grep -q "FAIL  \[H-FACTS-SHA\].*orphan-rev\.md.*НЕ входит в историю"; then
+    pass "H-FACTS-11 (ревизия существует, но вне ancestry): FAIL, exit=${rc}"
+  else
+    fail "H-FACTS-11: ОЖИДАЛСЯ FAIL [H-FACTS-SHA] «НЕ входит в историю» — существования мало (exit=${rc}):"
+    echo "${out}" | sed 's/^/      /'
+  fi
+}
+
+scenario_facts_malformed_marker_is_not_silent() {
+  local d="${TMP_BASE}/facts12"
+  build_good_fixture "${d}"
+  mk_plan_with_dead_ref "${d}" '<!-- FACTS: audited_head=012345 collected=2026-08-02 -->'
+  local out rc
+  out="$(run_verify "${d}")"; rc=$?
+  # 6 hex < минимума {7,40}: автор думает «документ под гейтом», механизм молчал бы.
+  # Обе половины: опт-ина нет И молчания нет.
+  if ! echo "${out}" | grep -q 'GHOSTPLAN' \
+     && echo "${out}" | grep -q 'FAIL  \[H-FACTS-SHA\].*facts\.md.*НЕ распарсен'; then
+    pass "H-FACTS-12 (короткий SHA, 6 hex): молчаливого даунгрейда нет — назван, exit=${rc}"
+  else
+    fail "H-FACTS-12: ОЖИДАЛСЯ FAIL [H-FACTS-SHA] про нераспарсенный маркер и отсутствие опт-ина (exit=${rc}):"
     echo "${out}" | sed 's/^/      /'
   fi
 }
@@ -1343,6 +1436,9 @@ scenario_facts_marker_without_head_not_opted_in
 scenario_facts_marked_plan_checked_by_check3
 scenario_archive_exclusion_still_holds
 scenario_facts_marker_on_last_head_line_counts
+scenario_facts_sha_fake_fails
+scenario_facts_sha_orphan_fails
+scenario_facts_malformed_marker_is_not_silent
 scenario_bad_phase_milestone_missing
 scenario_bad_setup_guard_missing_design
 scenario_merge_preview_catches_branch_vs_merge_drift

@@ -622,17 +622,36 @@ FACTS_HEAD_LINES = 5          # сколько первых строк счит�
 FACTS_NOTE_THRESHOLD = 20     # порог утверждений `путь:строка`, при котором молчание заметно
 
 
-def _has_facts_marker(fpath):
+# Объявление себя фактурой и ВАЛИДНЫЙ маркер — разные события, и их различение есть
+# половина находки `C-116` F-1 («молчаливый даунгрейд»): строка `FACTS:` с опечаткой или
+# коротким SHA не давала НИ FAIL, НИ NOTE — автор считал документ под гейтом, гейт молчал.
+# Это «наблюдение отсутствия» (`testing.md`, целостность гейта, свойство 4).
+FACTS_DECL_RE = re.compile(r"<!--\s*FACTS:")
+
+
+def _facts_head_scan(fpath):
+    """(declared, sha) по ГОЛОВЕ файла.
+    declared — в голове есть строка, объявляющая документ фактурой;
+    sha       — распарсенная ревизия сбора, либо None (объявление есть, форма негодна)."""
+    declared = False
     try:
         with open(fpath, encoding="utf-8") as f:
             for i, line in enumerate(f):
                 if i >= FACTS_HEAD_LINES:
-                    return False
-                if FACTS_MARKER_RE.search(line):
-                    return True
+                    break
+                m = FACTS_MARKER_RE.search(line)
+                if m:
+                    return True, m.group(1)
+                if FACTS_DECL_RE.search(line):
+                    declared = True
     except (UnicodeDecodeError, OSError):
-        return False
-    return False
+        return False, None
+    return declared, None
+
+
+def _has_facts_marker(fpath):
+    _declared, sha = _facts_head_scan(fpath)
+    return sha is not None
 
 
 def is_excluded(relpath, fpath):
@@ -700,6 +719,94 @@ DOC_FILE_REF_RE = re.compile(r"\bdocs/[A-Za-z0-9_.\-/]+\.md\b")
 # Разбор `путь:строка` ПЕРЕИСПОЛЬЗОВАН (`RFC_PATH_TOKEN_RE` + `RFC_PATH_LINEREF_TAIL_RE`),
 # третий парсер не заводится (`A-010` §G).
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# `A-010` §H, пункт решения, НЕ исполненный в первой редакции (`C-116` F-1, ранг REJECT):
+# «плюс проверка SHA той же механикой, что check6 (существует, предок HEAD)». Захват
+# `audited_head=(…)` в регэкспе был МЁРТВЫМ кодом: группа не потреблялась нигде, документ
+# с выдуманной ревизией опт-инился и не судился ничем. Весь смысл маркера по `A-010` §H —
+# ИМЕНОВАННАЯ ревизия сбора; ревизия, которой нет, не именует ничего.
+# Механика переиспользована, не продублирована (`A-010` §G): те же `git_commit_exists` и
+# `git_commit_is_ancestor_of_any`, что у check6, включая MERGE_HEAD внутри --merge-preview.
+# ---------------------------------------------------------------------------
+def check_facts_sha(root):
+    plans = os.path.join(root, "docs", "plans")
+    if not os.path.isdir(plans):
+        return
+
+    declared_bad = []   # объявил себя фактурой, маркер не распарсен
+    marked = []         # (relpath, sha)
+    for fn in sorted(os.listdir(plans)):
+        if not fn.endswith(".md"):
+            continue
+        fpath = os.path.join(plans, fn)
+        declared, sha = _facts_head_scan(fpath)
+        relpath = os.path.relpath(fpath, root)
+        if sha is not None:
+            marked.append((relpath, sha))
+        elif declared:
+            declared_bad.append(relpath)
+
+    # Молчаливый даунгрейд перестаёт быть молчаливым (C-116 F-1, вторая половина).
+    for relpath in declared_bad:
+        fail(
+            "H-FACTS-SHA",
+            f"{relpath}: в голове файла есть строка `FACTS:`, но маркер НЕ распарсен "
+            f"(нужен `audited_head=<7..40 hex>`) — документ объявил себя фактурой и молча "
+            f"выпал из проверки ссылок; исправьте маркер или уберите объявление",
+        )
+
+    if not marked:
+        if not declared_bad:
+            info("H-FACTS-SHA", "документов с маркером `FACTS:` в docs/plans/**: 0 — проверять нечего")
+        return
+
+    try:
+        r = subprocess.run(
+            ["git", "-C", root, "rev-parse", "--is-inside-work-tree"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        git_ok = r.returncode == 0 and r.stdout.strip() == b"true"
+    except OSError:
+        git_ok = False
+
+    # Fail-closed, как у check6: нечем проверить — это НАРУШЕНИЕ, а не молчаливый пропуск.
+    if not git_ok:
+        fail(
+            "H-FACTS-SHA",
+            f"маркеров `FACTS:` найдено {len(marked)}, но '{root}' не git-репозиторий "
+            f"(или git недоступен) — существование ревизии сбора проверить нельзя (setup-guard)",
+        )
+        return
+
+    refs = canonical_refs(root)
+    n_bad = 0
+    for relpath, sha in marked:
+        if not git_commit_exists(root, sha):
+            n_bad += 1
+            fail(
+                "H-FACTS-SHA",
+                f"{relpath}: маркер называет ревизию сбора `{sha}` — такого коммита в "
+                f"репозитории НЕТ вовсе; документ объявлен фактурой на несуществующем дереве",
+            )
+            continue
+        if not git_commit_is_ancestor_of_any(root, sha, refs):
+            n_bad += 1
+            fail(
+                "H-FACTS-SHA",
+                f"{relpath}: маркер называет ревизию сбора `{sha}` — коммит существует, но "
+                f"НЕ входит в историю {'/'.join(refs)} (орфан/несмёрженная ветка): факты "
+                f"собраны на дереве, которого в этой истории нет",
+            )
+
+    if n_bad == 0:
+        pass_(
+            "H-FACTS-SHA",
+            f"маркеров `FACTS:` проверено {len(marked)} — все ревизии сбора существуют и "
+            f"входят в историю {'/'.join(refs)}",
+        )
+
+
 def check_facts_note(root):
     plans = os.path.join(root, "docs", "plans")
     if not os.path.isdir(plans):
@@ -1319,6 +1426,7 @@ def main():
     check2(root, design_text)
     check3(root, design_text)
     check4(root)
+    check_facts_sha(root)
     check_facts_note(root)
     check5(root, design_text)
     check6(root)
