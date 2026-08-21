@@ -70,7 +70,7 @@
 | журнал, ретеншен, сегменты, формат записи | `fa/journal.md` · `06-data-layer-and-storage.md` · `CT-RFC-02` · `CT-RFC-07` · `A-001` |
 | рыночные данные, состав, venue-адаптеры | `fa/venues.md` · `CT-RFC-01` · `CT-RFC-04`/`CT-RFC-06` · `docs/data-epochs.md` |
 | книга, глубина, полосы | `fa/book.md` · `fa/viz-backend.md` §4 · `A-002` · `research/data-quality/depth-verdict.md` |
-| выдача, gateway, кокпит | `fa/viz-backend.md` · `07-cockpit-backend-roadmap.md` · `CT-RFC-09` |
+| выдача, `gateway`, `gateway-serve`, кокпит | `fa/viz-backend.md` (префиксы `VB-I-*` и `GS-I-*`) · `07-cockpit-backend-roadmap.md` · `CT-RFC-09` |
 | контракты T1 | `05-contract-layer.md` · `fa/contracts.md` · весь `docs/rfc/CT-RFC-*` по теме |
 | сигналы, research, анти-оверфит | `fa/signals.md` · `fa/research-cli.md` · `02-quant-desk.md` · `03-integration-contract.md` |
 | ops, алерты, деплой | `fa/ops.md` · `DESIGN` §23 |
@@ -79,7 +79,7 @@
 | alpha / portfolio / strategy | `fa/alpha.md` · `fa/portfolio.md` · `fa/strategy.md` · `fa/strategy-brain.md` · семейство `ST-I` |
 | runner, композиция режимов | `fa/runner.md` · `01-engine-architecture.md` §9 |
 | AI-слой, копилот | `fa/ai-copilot.md` · `DESIGN` §19 |
-| `derive` / `recorder` / `gateway-serve` | **FA не существует** — сам этот факт есть долг, назвать его в Handoff; опора: `fa/viz-backend.md` + `DESIGN` §22 (`GW-I` — 12 оракулов при нуле заявленных) |
+| `derive` / `recorder` | **FA не существует** — сам этот факт есть долг, назвать его в Handoff; опора: `fa/viz-backend.md` + `DESIGN` §22 (`GW-I` — 12 оракулов при нуле заявленных) |
 | фазы, приоритеты, роадмап | `09-roadmap-v2.md` · `DESIGN` §10 · `milestones/BACKLOG.md` |
 | харнесс (`scripts/**`, CI) | `docs/workflow/harness-track.md` |
 | процессный слой (`.claude/**`, `CLAUDE.md`, `04-workflow.md`) | `gates.md` §9/§11 · `04-workflow.md` · `docs/plans/process-layer-audit-2026-08-13.md` |
@@ -132,17 +132,30 @@ merge'а architect'а, а прод отставал от `main` на 92 комм
 зелёных liveness-сигналах. Ни один ярус документов этого не содержит и содержать не может:
 документы описывают, как ДОЛЖНО быть, а не как есть сейчас.
 
-Три команды — в начале сессии и перед каждым «готово»:
+ЧЕТЫРЕ команды — в начале сессии и перед каждым «готово»:
 
 ```
 gh run list --branch main --limit 5             # красен ли main ПРЯМО СЕЙЧАС
 gh run list --workflow=deploy.yml --limit 3     # доехало ли до прода
 ssh … 'cd /root/hft-platform && git rev-parse --short HEAD'   # какой SHA реально крутится
+bash scripts/check_branch_health.sh             # висяки, дубли предмета, состояние ВСЕХ веток
 ```
+
+**Четвёртая добавлена 2026-08-21 по замеру, а не для полноты.** До неё состояние веток
+выяснялось руками и называлось по памяти — за одну сессию architect дважды ошибся в нём
+вслух. Инструмент лежал в `main` и не был известен роли: класс «построено-не-известно», третий
+в семействе после «построено-не-проведено» (`TD-155`) и «решено-не-построено» (`A-010` §H).
+Он НАБЛЮДАТЕЛЬ: печатает ВИСЯК (зелёный PR без merge'а), ДУБЛЬ (один предмет на нескольких
+ветках) и краснеет, только если источник не ответил документом.
 
 Третья даёт ТОЧНЫЙ ответ, а не приблизительный: на VPS живой git-чекаут, деплой делает
 `git reset --hard origin/main`. По дате образа можно ошибиться на время сборки; `rev-parse`
 даёт истину без интерпретации.
+
+**Документ, называющий себя фактурой, обязан нести ревизию сбора** (`A-010` §H, задача H-4):
+`<!-- FACTS: audited_head=<полный SHA> collected=<YYYY-MM-DD> -->` первой строкой. Без шапки он
+не основание ни для спеки, ни для оракула — и `verify_design_claims.sh` печатает по нему `NOTE`.
+С шапкой документ входит в проверку ссылок наравне с остальными.
 
 ## 3. Правило цитаты (то, которое нарушалось пять раз)
 
