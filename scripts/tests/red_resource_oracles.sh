@@ -276,6 +276,59 @@ ROOT="${D}" bash "${BARRIER}" > "${D}/out" 2>&1; RC=$?
 # RO-12…RO-16, добавленные ПОСЛЕ раннего блока, печатали `FAIL` и не влияли ни на вердикт,
 # ни на код возврата: проба была зелёной против сломанного барьера. Это ровно то плацебо,
 # против которого барьер и написан, — и оно жило в самой пробе.
+# ── RO-20..RO-24 — стабы `C-097` §1.2 (номера 10-14 заняты выше — проверено грепом), ПРОПУСКАВШИЕСЯ прежней редакцией ──────────────────
+# Каждый — ложное ЗЕЛЁНОЕ: дефектный оракул проходил барьер. Направление опаснейшее:
+# барьер против флака сам пропускал флак.
+
+# RO-20 (`C-097` R2): атомик, обёрнутый в OnceLock — тот же процессный счётчик.
+mk D
+{ echo '#[global_allocator]'; echo 'static A: X = X;'
+  echo 'static CUR: OnceLock<AtomicUsize> = OnceLock::new();'
+  echo '#[test] fn a() {}'; echo '#[test] fn b() {}'; } > "${D}/crates/x/tests/red_alloc.rs"
+RC="$(run "${D}" "${D}/out")"
+[ "${RC}" -eq 1 ] && pass "RO-20 обёртка OnceLock<Atomic…> заблокирована" \
+                  || { fail "RO-20 обёрнутый атомик ПРОПУЩЕН (exit=${RC}) — C-097 R2"; sed 's/^/      /' "${D}/out"; }
+
+# RO-21 (`C-097` R3): форма `lazy_static! { static ref … }` — объявление НЕ в начале строки.
+mk D
+{ echo '#[global_allocator]'; echo 'static A: X = X;'
+  echo 'lazy_static! { static ref CUR: AtomicUsize = AtomicUsize::new(0); }'
+  echo '#[test] fn a() {}'; echo '#[test] fn b() {}'; } > "${D}/crates/x/tests/red_alloc.rs"
+RC="$(run "${D}" "${D}/out")"
+[ "${RC}" -eq 1 ] && pass "RO-21 lazy_static!/static ref заблокирован" \
+                  || { fail "RO-21 lazy_static ПРОПУЩЕН (exit=${RC}) — C-097 R3"; sed 's/^/      /' "${D}/out"; }
+
+# RO-22 (`C-097` R8): считались ТОЛЬКО `#[test]`; два `#[tokio::test]` давали «соседей нет».
+mk D
+{ echo '#[global_allocator]'; echo 'static A: X = X;'
+  echo 'static CUR: AtomicUsize = AtomicUsize::new(0);'
+  echo '#[tokio::test] async fn a() {}'; echo '#[tokio::test] async fn b() {}'; } > "${D}/crates/x/tests/red_alloc.rs"
+RC="$(run "${D}" "${D}/out")"
+[ "${RC}" -eq 1 ] && pass "RO-22 два #[tokio::test] считаются соседями" \
+                  || { fail "RO-22 async-тесты не сочтены (exit=${RC}) — C-097 R8"; sed 's/^/      /' "${D}/out"; }
+
+# RO-23 (`C-097` R10): `thread_local!` в КОММЕНТАРИИ засчитывался как потоковый учёт.
+# Тот же класс «упоминание против утверждения», что красит вердикты в design-claims.
+mk D
+{ echo '#[global_allocator]'; echo 'static A: X = X;'
+  echo 'static CUR: AtomicUsize = AtomicUsize::new(0);'
+  echo '// лечение: thread_local! с const-инициализатором'
+  echo '#[test] fn a() {}'; echo '#[test] fn b() {}'; } > "${D}/crates/x/tests/red_alloc.rs"
+RC="$(run "${D}" "${D}/out")"
+[ "${RC}" -eq 1 ] && pass "RO-23 thread_local! в комментарии не считается лечением" \
+                  || { fail "RO-23 комментарий сошёл за механизм (exit=${RC}) — C-097 R10"; sed 's/^/      /' "${D}/out"; }
+
+# RO-24 — АНТИ-ПЛАЦЕБО ко всем четырём: срезание комментариев не должно ломать ЧЕСТНЫЙ файл,
+# у которого `thread_local!` стоит в коде, а в комментарии — упоминание `static … Atomic`.
+mk D
+{ echo '#[global_allocator]'; echo 'static A: X = X;'
+  echo '// было: static CUR: AtomicUsize — заменено на потоковый учёт'
+  echo 'thread_local! { static CUR: Cell<usize> = const { Cell::new(0) }; }'
+  echo '#[test] fn a() {}'; echo '#[test] fn b() {}'; } > "${D}/crates/x/tests/red_alloc.rs"
+RC="$(run "${D}" "${D}/out")"
+[ "${RC}" -eq 0 ] && pass "RO-24 честный файл с упоминанием атомика в комментарии проходит" \
+                  || { fail "RO-24 ЛОЖНОЕ КРАСНОЕ на честном оракуле (exit=${RC})"; sed 's/^/      /' "${D}/out"; }
+
 echo
 echo "каталогов-фикстур в реестре: $(wc -l < "${REG}") (уборка — trap EXIT)"
 echo "сценариев: $((PASSED + FAILED))   PASS: ${PASSED}   FAIL: ${FAILED}"
