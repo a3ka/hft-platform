@@ -168,7 +168,7 @@ pub mod server {
     use std::io;
     use std::net::SocketAddr;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -188,6 +188,24 @@ pub mod server {
     /// Установить runtime-лимит (вызывается из `serve_config_from_env` и тестов).
     pub fn set_effective_max_subs(n: usize) {
         EFFECTIVE_MAX_SUBS.store(n, Ordering::Relaxed);
+    }
+
+    /// M-65 задача 13 N-3 (CT-RFC-09 §2.8): grace-окно (`initial_subscribe_grace_ms`) —
+    /// runtime-эффективное значение, дефолт 250 ms (подпись founder'а 11.08). Атомик, не поле
+    /// `ServeConfig`, по той же причине, что и `EFFECTIVE_MAX_SUBS` выше: добавление поля
+    /// сломало бы тесты с фиксированной формой литерала `ServeConfig { .. }` (комментарий
+    /// перед `EFFECTIVE_MAX_SUBS`). `serve_config_from_env` обновляет значение ровно один раз
+    /// при старте; fail-closed на невалидном значении окружения (задача 13 N-3).
+    static EFFECTIVE_GRACE_MS: AtomicU64 = AtomicU64::new(250);
+
+    /// Получить grace-окно в миллисекундах (читается на каждом соединении).
+    pub fn effective_grace_ms() -> u64 {
+        EFFECTIVE_GRACE_MS.load(Ordering::Relaxed)
+    }
+
+    /// Установить grace-окно (вызывается из `serve_config_from_env` и тестов).
+    pub fn set_effective_grace_ms(ms: u64) {
+        EFFECTIVE_GRACE_MS.store(ms, Ordering::Relaxed);
     }
 
     use crate::_gw::Selector;
@@ -537,9 +555,12 @@ pub mod server {
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
-        const GRACE_MS: u64 = 250;
+        // CT-RFC-09 §2.8: grace-окно — runtime-конфиг (`GATEWAY_INITIAL_SUBSCRIBE_GRACE_MS`,
+        // дефолт 250 мс). Читаем из атомика, выставленного `serve_config_from_env` при старте.
+        // Раньше жило в `const GRACE_MS: u64 = 250` здесь — задача 13 N-3 вынесла в env.
+        let grace_ms = effective_grace_ms();
         let mut ws = ws;
-        let timer = tokio::time::sleep(Duration::from_millis(GRACE_MS));
+        let timer = tokio::time::sleep(Duration::from_millis(grace_ms));
         tokio::pin!(timer);
 
         // Решение о режиме принимается по первому КЛИЕНТСКОМУ сообщению в grace.
@@ -607,7 +628,7 @@ pub mod server {
 
         // V1 path. Передаём данные первого сообщения в v1-сессию для разбора.
         let data = first_text_bytes.expect("is_v1_attempt ⇒ data Some");
-        run_v1_session(ws, cfg, claims, data, GRACE_MS).await
+        run_v1_session(ws, cfg, claims, data).await
     }
 
     /// V1-сессия (`CT-RFC-09` §2): первое сообщение — `subscribe` с `v:1` (проверено вызывающим).
@@ -617,7 +638,6 @@ pub mod server {
         cfg: Arc<ServeConfig>,
         claims: super::auth::Claims,
         first_msg_data: Vec<u8>,
-        _grace_ms: u64,
     ) -> std::io::Result<()>
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -1890,6 +1910,39 @@ pub fn serve_config_from_env(
         }
     };
     server::set_effective_max_subs(max_subs);
+
+    // CT-RFC-09 §2.8 (задача 13 N-3): `initial_subscribe_grace_ms` — конфиг. Дефолт 250 мс
+    // (подпись founder'а 11.08). ОТСУТСТВИЕ переменной ЗАКОННО (в отличие от N-2: §2.8 прямо
+    // называет дефолт, §2.6 — нет). Невалидное значение (`0`, мусор, пробелы) ⇒ отказ
+    // старта — тот же fail-closed, что и для остальных конфигов гейта («parse-error →
+    // unbounded запрещено»). Минимум — 1 мс: 0 обнулил бы окно, и v1-режим был бы
+    // недостижим ни при каких условиях.
+    let grace_ms: u64 = match get("GATEWAY_INITIAL_SUBSCRIBE_GRACE_MS") {
+        None => 250_u64,
+        Some(s) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                return Err(
+                    "GATEWAY_INITIAL_SUBSCRIBE_GRACE_MS must not be empty (CT-RFC-09 §2.8); \
+                     дефолт 250 живёт в коде, не в compose"
+                        .to_string(),
+                );
+            }
+            match trimmed.parse::<u64>() {
+                Ok(0) => {
+                    return Err(format!(
+                        "GATEWAY_INITIAL_SUBSCRIBE_GRACE_MS={trimmed} невалидно: должно быть >= 1 \
+                         (CT-RFC-09 §2.8; 0 обнулил бы окно)"
+                    ));
+                }
+                Ok(n) => n,
+                Err(e) => {
+                    return Err(format!("GATEWAY_INITIAL_SUBSCRIBE_GRACE_MS parse: {e}"));
+                }
+            }
+        }
+    };
+    server::set_effective_grace_ms(grace_ms);
 
     Ok(server::ServeConfig {
         addr,
