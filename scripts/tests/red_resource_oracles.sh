@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Проба барьера scripts/check_resource_oracles.sh (RO-1..RO-9).
+# Проба барьера scripts/check_resource_oracles.sh (сценарии RO-*; их число печатает
+# последняя строка прогона — в шапке оно не дублируется, иначе разойдётся).
 #
 # Барьер ловит механизм, давший ДВА флака обязательного чека `main` (TD-098/TD-129):
 # ресурсный оракул вёл учёт аллокаций процессным счётчиком, а `cargo test` гоняет тесты
@@ -377,6 +378,41 @@ RC="$(run "${D}" "${D}/out")"
                   || { fail "RO-27 тесты с отступом НЕ сосчитаны (exit=${RC}) — C-121 B-3 M3"; sed 's/^/      /' "${D}/out"; }
 
 echo
+# ── RO-28 (`C-122` H-1) — ПРОД-ФОРМА вызова. Свойство 1 «целостности гейта» к самой пробе
+# применено не было: все прежние сценарии зовут барьер с `ROOT=<фикстура>`, а CI зовёт его
+# `bash scripts/check_resource_oracles.sh` БЕЗ `ROOT` (`ci.yml:313`). Ось «форма вызова» не
+# варьировалась нигде, и потому проходили 24/24 два стаба:
+#   A  `[ -z "${ROOT:-}" ] && exit 0` — вечно-зелёный именно в прод-форме, то есть ровно
+#      там, где барьер и работает;
+#   M4 честная мутация дефолта `ROOT="${ROOT:-${REPO_ROOT}/crates}"` — молча сужает зону,
+#      которую шапка барьера ОБЕЩАЕТ (`scripts/tests` с inline-Rust), и ни проба, ни CI
+#      не краснеют.
+# Сценарий воспроизводит прод-вызов буквально: барьер КОПИРУЕТСЯ в `<фикстура>/scripts/`
+# (он берёт корень от своего пути, `REPO_ROOT="$(cd "${SELF_DIR}/.." && pwd)"`), зовётся
+# БЕЗ `ROOT`, а отрава кладётся В ОБЕ обещанные зоны сразу.
+mk D
+mkdir -p "${D}/scripts/tests"
+cp "${BARRIER}" "${D}/scripts/check_resource_oracles.sh"
+chmod +x "${D}/scripts/check_resource_oracles.sh"
+{ echo '#[global_allocator]'; echo 'static A: X = X;'
+  echo 'static CUR: AtomicUsize = AtomicUsize::new(0);'
+  echo '#[test] fn a() {}'; echo '#[test] fn b() {}'; } > "${D}/crates/x/tests/red_alloc.rs"
+{ echo '#[global_allocator]'; echo 'static A: X = X;'
+  echo 'static CUR: AtomicUsize = AtomicUsize::new(0);'
+  echo '#[test] fn c() {}'; echo '#[test] fn d() {}'; } > "${D}/scripts/tests/red_inline.rs"
+[ -s "${D}/scripts/check_resource_oracles.sh" ] || { fail "RO-28: барьер не скопирован — setup"; }
+PRODOUT="${D}/prod.out"
+( cd "${D}" && env -u ROOT bash scripts/check_resource_oracles.sh ) > "${PRODOUT}" 2>&1
+PRODRC=$?
+if [ "${PRODRC}" -eq 1 ] \
+   && grep -q 'crates/x/tests/red_alloc.rs' "${PRODOUT}" \
+   && grep -q 'scripts/tests/red_inline.rs' "${PRODOUT}"; then
+  pass "RO-28 прод-форма (без ROOT) ловит отраву в ОБЕИХ обещанных зонах"
+else
+  fail "RO-28 прод-форма: ОЖИДАЛСЯ exit=1 с обеими зонами в выводе (exit=${PRODRC}):"
+  sed 's/^/      /' "${PRODOUT}"
+fi
+
 # `C-121` B-4: считается ОСТАТОК, а не размер реестра. Уборка вызывается ЗДЕСЬ, до сводки,
 # чтобы её результат можно было предъявить числом; `trap EXIT` остаётся вторым рубежом на
 # случай досрочного выхода.
