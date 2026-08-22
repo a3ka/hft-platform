@@ -1890,6 +1890,21 @@ governance, отложенные фазы, либо гипотетика, не �
   `docs/*.md`-ссылки в проверке 4 и, потенциально, `M-NN` в проверке 1). **Что нужно:** исключить
   артефакты-вердикты из скана либо ввести явную форму цитирования. Зона: architect.
   Severity: **MINOR** (ложные красные на аудит-артефактах).
+  **СТАТУС 2026-08-22 (reviewer, `R-098` §6.1): исполнение ГОТОВО, но НЕ ВЛИТО — карточка
+  остаётся OPEN.** Предписанное («исключить артефакты-вердикты из скана») сделано архивным
+  классом вердиктов на ветке `origin/harness/verdict-archive-class` (`f814347`, PR #56):
+  `VERDICT_CLASS_DIRS = ("research/critiques/", "research/reviews/", "research/arbitration/")`
+  (`scripts/verify_design_claims.sh:700`, применяется `:707`), наблюдатель
+  `check_verdict_class`, проба `scripts/tests/red_verify_design_claims.sh` (+99 строк).
+  ```
+  $ gh pr view 56 --json state,mergeable -q '.state, .mergeable'   →  OPEN / MERGEABLE
+  $ gh pr view 56 --json statusCheckRollup … | grep -c SUCCESS      →  16 из 16 (вкл. «All checks passed»)
+  ```
+  **Почему не закрываю сейчас:** закрытая карточка по норме шапки этого файла ПЕРЕЕЗЖАЕТ в
+  архив, а откат/переработка неслитого PR оставила бы долг закрытым при живом дефекте.
+  Merge — не зона reviewer'а: это харнесс-трек, где по амендменту `П-017` B от 2026-08-22
+  вливает автор-architect (`docs/workflow/harness-track.md` §3). Закрывается первым же
+  заходом reviewer'а после появления `f814347` в `main`.
 
 - **TD-063** `«неприменимо»-вместо-«не-нашёл»-в-гейте-документа` (найдено reviewer'ом,
   `R-016` N-2/N-3, 2026-08-01; **НЕ блокер**). Проверки 1/2/5 `verify_design_claims.sh` при
