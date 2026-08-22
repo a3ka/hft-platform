@@ -98,6 +98,12 @@ fn sel() -> Selector {
 fn checkpoint_dir_env_flows_to_config() {
     let cfg = serve_config_from_env(getter(&[
         ("GATEWAY_JWT_SECRET", "test-secret"),
+        // `CT-RFC-09` §2.6: `max_subscriptions_per_connection` — конфиг, ОТСУТСТВИЕ
+        // либо невалидное значение ⇒ отказ старта (задача 13 N-2). Прод всегда его
+        // подаёт (`docker-compose.yml`, дефолт 16), поэтому фикстура БЕЗ переменной
+        // никогда не была прод-формой (`testing.md` §«Форма прода снимается ЗАМЕРОМ»).
+        // Ассерты ниже про лимит ничего не утверждают — добавление их не ослабляет.
+        ("GATEWAY_MAX_SUBSCRIPTIONS", "16"),
         ("GATEWAY_CHECKPOINT_DIR", "/ckpt"),
     ]))
     .expect("config собран");
@@ -113,8 +119,16 @@ fn checkpoint_dir_env_flows_to_config() {
 /// Парный vantage: без переменной сервис обязан работать (чекпоинт — кэш, а не предусловие).
 #[test]
 fn absent_checkpoint_dir_is_not_an_error() {
-    let cfg = serve_config_from_env(getter(&[("GATEWAY_JWT_SECRET", "test-secret")]))
-        .expect("config без GATEWAY_CHECKPOINT_DIR обязан собираться");
+    let cfg = serve_config_from_env(getter(&[
+        ("GATEWAY_JWT_SECRET", "test-secret"),
+        // `CT-RFC-09` §2.6: `max_subscriptions_per_connection` — конфиг, ОТСУТСТВИЕ
+        // либо невалидное значение ⇒ отказ старта (задача 13 N-2). Прод всегда его
+        // подаёт (`docker-compose.yml`, дефолт 16), поэтому фикстура БЕЗ переменной
+        // никогда не была прод-формой (`testing.md` §«Форма прода снимается ЗАМЕРОМ»).
+        // Ассерты ниже про лимит ничего не утверждают — добавление их не ослабляет.
+        ("GATEWAY_MAX_SUBSCRIPTIONS", "16"),
+    ]))
+    .expect("config без GATEWAY_CHECKPOINT_DIR обязан собираться");
     assert_eq!(
         cfg.checkpoint_dir, None,
         "без переменной — None (полный реплей), а не выдуманный путь"
