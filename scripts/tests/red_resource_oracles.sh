@@ -31,8 +31,19 @@ REG="$(mktemp)"
 cleanup() { while read -r d; do [ -n "${d}" ] && rm -rf "${d}"; done < "${REG}"; rm -f "${REG}"; }
 trap cleanup EXIT
 
+# `C-121` B-4: реестр говорит, сколько каталогов СОЗДАНО, а не сколько ОСТАЛОСЬ. Слом
+# `cleanup()` не ронял прогон ничем — то есть у пробы, требующей от других наблюдать
+# отсутствие, самой не было стража утечки (`harness-track.md` §5 п.5). Плюс голый
+# `mktemp -d` кладёт фикстуры под общий префикс `tmp.`, где живут тысячи чужих каталогов:
+# страж на нём мерил бы ОКРУЖЕНИЕ, а не свой инвариант (`testing.md`, целостность гейта,
+# свойство 2). Отсюда ИМЕННОВАННЫЙ префикс — считаем только своё. Образец — страж пробы A
+# (`red_deploy_catchup.sh`, `C-096` B-4).
+FIXPFX="ro-probe-$$-"
+leaked() { find "${TMPDIR:-/tmp}" -maxdepth 1 -name "${FIXPFX}*" 2>/dev/null | wc -l; }
+LEAK_BEFORE="$(leaked)"
+
 mk() { # $1=имя переменной для пути
-  local d; d="$(mktemp -d)"; echo "${d}" >> "${REG}"
+  local d; d="$(mktemp -d "${TMPDIR:-/tmp}/${FIXPFX}XXXXXX")"; echo "${d}" >> "${REG}"
   mkdir -p "${d}/crates/x/tests" "${d}/scripts"
   printf -v "$1" '%s' "${d}"
 }
@@ -329,8 +340,54 @@ RC="$(run "${D}" "${D}/out")"
 [ "${RC}" -eq 0 ] && pass "RO-24 честный файл с упоминанием атомика в комментарии проходит" \
                   || { fail "RO-24 ЛОЖНОЕ КРАСНОЕ на честном оракуле (exit=${RC})"; sed 's/^/      /' "${D}/out"; }
 
+# ── RO-25..RO-27 (`C-121` B-3) — ШИРИНА детектора, а не только его НАЛИЧИЕ.
+# Мутационный контроль трека держал наличие каждой проверки, но не её ширину: три мутации
+# барьера проходили пробу 21/21, потому что проба нигде не варьировала тип атомика на
+# FAIL-стороне, размещение оракула вне `crates/` и отступ тестового атрибута.
+
+# RO-25: тип атомика НЕ `AtomicUsize`. Мутация `Atomic[A-Za-z0-9]+` -> `AtomicUsize` проходила.
+mk D
+{ echo '#[global_allocator]'; echo 'static A: X = X;'
+  echo 'static CUR: AtomicU64 = AtomicU64::new(0);'
+  echo '#[test] fn a() {}'; echo '#[test] fn b() {}'; } > "${D}/crates/x/tests/red_alloc.rs"
+RC="$(run "${D}" "${D}/out")"
+[ "${RC}" -eq 1 ] && pass "RO-25 процессный счётчик типа AtomicU64 заблокирован (ширина типа)" \
+                  || { fail "RO-25 не-Usize атомик ПРОПУЩЕН (exit=${RC}) — C-121 B-3 M1"; sed 's/^/      /' "${D}/out"; }
+
+# RO-26: оракул ВНЕ `crates/`. Мутация корня поиска `"${ROOT}"` -> `"${ROOT}/crates"` проходила,
+# хотя шапка барьера обещает и `scripts/tests/**`.
+mk D
+mkdir -p "${D}/scripts/tests"
+{ echo '#[global_allocator]'; echo 'static A: X = X;'
+  echo 'static CUR: AtomicUsize = AtomicUsize::new(0);'
+  echo '#[test] fn a() {}'; echo '#[test] fn b() {}'; } > "${D}/scripts/tests/red_alloc.rs"
+RC="$(run "${D}" "${D}/out")"
+[ "${RC}" -eq 1 ] && pass "RO-26 дефектный оракул вне crates/ заблокирован (ширина зоны)" \
+                  || { fail "RO-26 оракул в scripts/tests ПРОПУЩЕН (exit=${RC}) — C-121 B-3 M2"; sed 's/^/      /' "${D}/out"; }
+
+# RO-27: тестовый атрибут С ОТСТУПОМ (внутри `mod tests {}`) — обычнейшая форма в корпусе.
+# Мутация `^[[:space:]]*#\[` -> `^#\[` проходила: соседи переставали считаться.
+mk D
+{ echo '#[global_allocator]'; echo 'static A: X = X;'
+  echo 'static CUR: AtomicUsize = AtomicUsize::new(0);'
+  echo 'mod tests {'; echo '    #[test] fn a() {}'; echo '    #[test] fn b() {}'; echo '}'
+} > "${D}/crates/x/tests/red_alloc.rs"
+RC="$(run "${D}" "${D}/out")"
+[ "${RC}" -eq 1 ] && pass "RO-27 соседи с отступом внутри mod tests сосчитаны (ширина отступа)" \
+                  || { fail "RO-27 тесты с отступом НЕ сосчитаны (exit=${RC}) — C-121 B-3 M3"; sed 's/^/      /' "${D}/out"; }
+
 echo
-echo "каталогов-фикстур в реестре: $(wc -l < "${REG}") (уборка — trap EXIT)"
+# `C-121` B-4: считается ОСТАТОК, а не размер реестра. Уборка вызывается ЗДЕСЬ, до сводки,
+# чтобы её результат можно было предъявить числом; `trap EXIT` остаётся вторым рубежом на
+# случай досрочного выхода.
+CREATED="$(wc -l < "${REG}")"
+cleanup; trap - EXIT
+LEAK_AFTER="$(leaked)"
+LEAKED=$((LEAK_AFTER - LEAK_BEFORE))
+echo "каталогов-фикстур создано: ${CREATED}; ОСТАЛОСЬ после уборки: ${LEAKED} (префикс ${FIXPFX}*)"
+if [ "${LEAKED}" -ne 0 ]; then
+  fail "УТЕЧКА ФИКСТУР: ${LEAKED} каталог(ов) пережили уборку — класс, давший 10 400 каталогов /tmp и диск на 100 %"
+fi
 echo "сценариев: $((PASSED + FAILED))   PASS: ${PASSED}   FAIL: ${FAILED}"
 if [ "${FAILED}" -gt 0 ]; then
   echo "VERDICT: FAIL (${FAILED} из $((PASSED + FAILED)))"
