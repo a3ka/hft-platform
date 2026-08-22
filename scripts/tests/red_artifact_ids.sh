@@ -117,6 +117,8 @@ B2BRACKET|7|V|слаг со скобкой
 B2WS|7|V|краевой пробел слага
 B4Q|7|V|имя, требующее квотирования
 L7QUOT|7|L|не-ASCII имя, единственное под своим ID
+MVOK|5|L|предмет переехал внутри диапазона — носитель ОДИН
+MVDUP|5|V|новая множественность внесена диапазоном
 B1R|1|V|R
 B1R|2|V|имя файла
 B1R|4|V|новый файл
@@ -470,6 +472,30 @@ commit_all "$R" "close-out к существующему долгу"
 setup_assert L2CLOSEOUT "$R" "к диапазону обязана добавиться ВТОРАЯ строка того же номера, и она НЕ заводящая карточка" \
   '[ "$(git show HEAD~1:TECH-DEBT.md | grep -c "TD-061")" -eq 1 ] && [ "$(grep -c "TD-061" TECH-DEBT.md)" -eq 2 ] && [ "$(grep -c "CLOSED" TECH-DEBT.md)" -eq 1 ]'
 expect_allow L2CLOSEOUT "$R" "$B" "close-out-строка к СУЩЕСТВУЮЩЕМУ долгу номера не вводит"
+
+# ── R-109 Б-3: ПЕРЕЕЗД одного предмета — НЕ коллизия, и зелёный путь у него обязан быть.
+# Слепота, из-за которой ловушку не поймали: сценария «переезд проходит» в пробе не было
+# ВООБЩЕ. Барьер строит универсум по всем refs, поэтому до merge'а старый носитель жив в
+# другом ref'е — и переезд краснел независимо от того, удалён ли старый путь на ветке.
+# Предусловие нормы Р-2 делало исполнение самой нормы через CI невозможным.
+R="$(mk_repo mvok)"; art "$R" milestones/M-901-synthetic.md ""; commit_all "$R" base-mv
+B="$(cd "$R" && git rev-parse HEAD)"
+( cd "$R" && mkdir -p docs/archive && git mv milestones/M-901-synthetic.md docs/archive/M-901-synthetic.md ) || die mv
+commit_all "$R" "переезд M-901 в архив"
+setup_assert MVOK "$R" "старый путь обязан ИСЧЕЗНУТЬ с HEAD, новый — появиться (иначе сценарий проверяет копию, а не переезд)" \
+  '[ ! -e milestones/M-901-synthetic.md ] && [ -e docs/archive/M-901-synthetic.md ]'
+expect_allow MVOK "$R" "$B" "переезд M-901 milestones/ → docs/archive/ (занявший исчез с HEAD — носитель ОДИН)"
+
+# АНТИ-ПЛАЦЕБО к MVOK: послабление обязано быть УЗКИМ. Тот же номер, но старый путь ОСТАЛСЯ
+# на HEAD — это настоящий дубль (ровно то, что натворил `d788abf`: 52 добавления, 0 удалений),
+# и он обязан блокироваться по-прежнему.
+R="$(mk_repo mvdup)"; art "$R" milestones/M-901-synthetic.md ""; commit_all "$R" base-dup
+B="$(cd "$R" && git rev-parse HEAD)"
+( cd "$R" && mkdir -p docs/archive && cp milestones/M-901-synthetic.md docs/archive/M-901-synthetic.md ) || die cp
+commit_all "$R" "КОПИЯ M-901 в архив, старый путь оставлен"
+setup_assert MVDUP "$R" "оба пути обязаны существовать на HEAD — иначе это переезд, а не дубль" \
+  '[ -e milestones/M-901-synthetic.md ] && [ -e docs/archive/M-901-synthetic.md ]'
+expect_block MVDUP "$R" "$B" "КОПИЯ M-901 при живом старом пути — настоящий дубль, послабление на него не распространяется"
 
 R="$(mk_repo b1r)"; art "$R" research/reviews/R-200-alpha.md ""; commit_all "$R" base2
 B="$(cd "$R" && git rev-parse HEAD)"; art "$R" research/reviews/R-200-beta.md ""; commit_all "$R" "второй R-200"
