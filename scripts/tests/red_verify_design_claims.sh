@@ -620,6 +620,9 @@ scenario_verdict_class_dead_doc_ref_excluded() {
   { echo "# C-99 — вердикт, цитирующий улику"
     echo "Гейт ругался на \`docs/GHOSTVERDICT.md\` — файла нет, и это НОРМА для вердикта."
   } > "${d}/research/critiques/C-99-cite.md"
+  # F-3 (`R-100`): ассерт НЕГАТИВНЫЙ («гейт не покраснел»), поэтому сорвавшаяся запись
+  # фикстуры оставила бы сценарий зелёным на пустоте. Свидетель setup обязателен.
+  [ -s "${d}/research/critiques/C-99-cite.md" ] || { fail "V-1: фикстура не создана — setup"; return; }
   local out rc
   out="$(run_verify "${d}")"; rc=$?
   if [ "${rc}" -eq 0 ] && ! echo "${out}" | grep -q 'FAIL.*GHOSTVERDICT'; then
@@ -637,6 +640,7 @@ scenario_verdict_class_broken_section_ref_excluded() {
   { echo "# R-99 — вердикт, цитирующий битую ссылку на раздел"
     printf 'Цитата вывода гейта: DESIGN.md §%s.\n' "${fake_section}"
   } > "${d}/research/reviews/R-99-cite.md"
+  [ -s "${d}/research/reviews/R-99-cite.md" ] || { fail "V-2: фикстура не создана — setup"; return; }
   local out rc
   out="$(run_verify "${d}")"; rc=$?
   if [ "${rc}" -eq 0 ] && ! echo "${out}" | grep -q '3-ССЫЛКИ.*97'; then
@@ -678,10 +682,88 @@ scenario_verdict_class_observer_counts_what_it_promises() {
   } > "${d}/research/arbitration/A-99-cite.md"
   local out rc
   out="$(run_verify "${d}")"; rc=$?
-  if [ "${rc}" -eq 0 ] && echo "${out}" | grep -qE 'V-АРХИВ.*мёртвых ссылок .* 2 '; then
-    pass "V-4 (наблюдатель считает): в INFO ровно 2 мёртвые ссылки, exit=${rc}"
+  if [ "${rc}" -eq 0 ] \
+     && echo "${out}" | grep -qE 'V-АРХИВ.*: 3 вердиктов' \
+     && echo "${out}" | grep -qE 'V-АРХИВ.*мёртвых ссылок .* 2 '; then
+    pass "V-4 (наблюдатель считает): 3 вердикта / 2 мёртвые ссылки, exit=${rc}"
   else
-    fail "V-4: ОЖИДАЛСЯ INFO [V-АРХИВ] с числом 2 (exit=${rc}):"
+    fail "V-4: ОЖИДАЛСЯ INFO [V-АРХИВ] с «3 вердиктов» и числом 2 (exit=${rc}):"
+    echo "${out}" | grep 'V-АРХИВ' | sed 's/^/      /'
+  fi
+}
+
+
+# --- F-2 (`R-100`, блокер): матрица КЛАСС × ПРОВЕРКА была не закрыта. Класс — три каталога,
+# но единственная проверка, которая СЕГОДНЯ реально доходит до `research/` (check3, обходит
+# весь root), была запиннена только для `reviews/` (V-2). Выпадение `critiques/` или
+# `arbitration/` из кортежа проходило всю пробу зелёным — и на реальном дереве тоже, потому
+# что битых `§`-ссылок там сегодня нет. Регресс обнаружился бы следующим красным на
+# аудит-артефакте, то есть ровно тем отложенным взрывом, который правка объявила снятым.
+scenario_verdict_class_critiques_pinned_for_check3() {
+  local d="${TMP_BASE}/vclass5"
+  build_good_fixture "${d}"
+  local fake_section="95"
+  { echo "# C-98 — вердикт в critiques, цитирующий битую ссылку на раздел"
+    printf 'Цитата вывода гейта: DESIGN.md §%s.\n' "${fake_section}"
+  } > "${d}/research/critiques/C-98-cite.md"
+  [ -s "${d}/research/critiques/C-98-cite.md" ] || { fail "V-5: фикстура не создана — setup"; return; }
+  local out rc
+  out="$(run_verify "${d}")"; rc=$?
+  if [ "${rc}" -eq 0 ] && ! echo "${out}" | grep -q '3-ССЫЛКИ.*95'; then
+    pass "V-5 (critiques × check3): каталог запиннен отдельно, exit=${rc}"
+  else
+    fail "V-5: ОЖИДАЛСЯ exit=0 без FAIL [3-ССЫЛКИ] §95 — critiques выпал из класса (exit=${rc}):"
+    echo "${out}" | sed 's/^/      /'
+  fi
+}
+
+scenario_verdict_class_arbitration_pinned_for_check3() {
+  local d="${TMP_BASE}/vclass6"
+  build_good_fixture "${d}"
+  mkdir -p "${d}/research/arbitration"
+  local fake_section="94"
+  { echo "# A-98 — арбитраж, цитирующий битую ссылку на раздел"
+    printf 'Цитата вывода гейта: DESIGN.md §%s.\n' "${fake_section}"
+  } > "${d}/research/arbitration/A-98-cite.md"
+  [ -s "${d}/research/arbitration/A-98-cite.md" ] || { fail "V-6: фикстура не создана — setup"; return; }
+  local out rc
+  out="$(run_verify "${d}")"; rc=$?
+  if [ "${rc}" -eq 0 ] && ! echo "${out}" | grep -q '3-ССЫЛКИ.*94'; then
+    pass "V-6 (arbitration × check3): каталог запиннен отдельно, exit=${rc}"
+  else
+    fail "V-6: ОЖИДАЛСЯ exit=0 без FAIL [3-ССЫЛКИ] §94 — arbitration выпал из класса (exit=${rc}):"
+    echo "${out}" | sed 's/^/      /'
+  fi
+}
+
+# --- F-1 (`R-100`, блокер): у наблюдателя была ОДНА счётная точка (V-4, число 2), и любой
+# стаб, печатающий константу 2, проходил пробу неотличимо от рабочего счёта. Одна точка не
+# отличает счёт от константы В ПРИНЦИПЕ — нужна ВТОРАЯ с ДРУГИМ числом: тогда константа
+# обязана провалить хотя бы одну. Пиннится и число файлов: иначе константа в `n_files`
+# остаётся такой же дырой, только в соседнем поле.
+scenario_verdict_class_observer_is_not_a_constant() {
+  local d="${TMP_BASE}/vclass7"
+  build_good_fixture "${d}"
+  mkdir -p "${d}/research/arbitration"
+  { echo "# A-97 — пять мёртвых ссылок, число ОТЛИЧНОЕ от сценария V-4"
+    echo "1 \`docs/GH1.md\` 2 \`docs/GH2.md\` 3 \`docs/GH3.md\` 4 \`docs/GH4.md\` 5 \`docs/GH5.md\`"
+  } > "${d}/research/arbitration/A-97-five.md"
+  # Второй файл — чтобы число ВЕРДИКТОВ тоже отличалось от V-4 (там 3, здесь 4). Без него
+  # обе счётные точки давали 3, и константа `n_files = 3` проходила пробу — та же дыра, что
+  # F-1, полем левее. Найдено собственным стабом MC3 при проверке фикса F-1.
+  echo "# A-96 — вердикт без мёртвых ссылок, нужен только для счёта файлов" \
+    > "${d}/research/arbitration/A-96-clean.md"
+  [ -s "${d}/research/arbitration/A-97-five.md" ] || { fail "V-7: фикстура не создана — setup"; return; }
+  [ -s "${d}/research/arbitration/A-96-clean.md" ] || { fail "V-7: второй файл не создан — setup"; return; }
+  local out rc
+  out="$(run_verify "${d}")"; rc=$?
+  # каркас несёт C-01 и R-01 => 2 вердикта; плюс два файла этого сценария => 4
+  if [ "${rc}" -eq 0 ] \
+     && echo "${out}" | grep -qE 'V-АРХИВ.*: 4 вердиктов' \
+     && echo "${out}" | grep -qE 'V-АРХИВ.*мёртвых ссылок .*: 5 '; then
+    pass "V-7 (наблюдатель — не константа): 4 вердикта / 5 ссылок — обе счётные точки иные, чем в V-4, exit=${rc}"
+  else
+    fail "V-7: ОЖИДАЛОСЬ INFO [V-АРХИВ] с «4 вердиктов» и «5» мёртвых ссылок (exit=${rc}):"
     echo "${out}" | grep 'V-АРХИВ' | sed 's/^/      /'
   fi
 }
@@ -1731,6 +1813,9 @@ scenario_verdict_class_dead_doc_ref_excluded
 scenario_verdict_class_broken_section_ref_excluded
 scenario_verdict_class_does_not_leak_to_reports
 scenario_verdict_class_observer_counts_what_it_promises
+scenario_verdict_class_critiques_pinned_for_check3
+scenario_verdict_class_arbitration_pinned_for_check3
+scenario_verdict_class_observer_is_not_a_constant
 scenario_facts_marker_on_last_head_line_counts
 scenario_facts_sha_fake_fails
 scenario_facts_sha_orphan_fails
