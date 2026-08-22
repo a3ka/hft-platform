@@ -45,6 +45,14 @@ use tokio_tungstenite::tungstenite::Message;
 const SECRET: &[u8] = b"m65-secret";
 const FUTURE: usize = 9_999_999_999;
 const BASE_MS: i64 = 1_700_000_000_000;
+
+/// Ценовые диапазоны, разводящие инструменты в кадрах (`o12`). `Frame` селектора не несёт —
+/// цена единственный признак, который доезжает до клиента через `ohlcv`/`volume_profile`.
+/// Разрыв на порядок делает признак устойчивым к округлению бакетов.
+#[cfg(feature = "testing")]
+const BTC_PRICE: f64 = 65_000.0;
+#[cfg(feature = "testing")]
+const ETH_PRICE: f64 = 3_000.0;
 /// Бюджет ожидания одного сообщения. Заведомо больше `PUSH_INTERVAL_MS = 250`
 /// (`gateway-serve/src/lib.rs:445`), чтобы медленная машина не давала флак.
 const BUDGET: Duration = Duration::from_secs(10);
@@ -237,6 +245,62 @@ fn seed(dir: &Path) {
 /// законным поведением было МОЛЧАНИЕ. Реализация, шлющая кадры только при наличии событий,
 /// пройти набор не могла ПО ПОСТРОЕНИЮ — и изобрела синтетический кадр вне `CT-RFC-09` §2.3.
 /// Оракул, вынуждающий подделать контракт, есть дефект ОРАКУЛА, а не реализации.
+/// Как `append_more`, но с ЯВНОЙ базовой ценой — чтобы кадры разных инструментов были
+/// РАЗЛИЧИМЫ по содержимому.
+///
+/// Зачем отдельный хелпер, а не параметр у общего: `append_more` зовут 19 раз; менять его
+/// сигнатуру значит трогать все оракулы M-65 ради одного. Правка общей фикстуры ради одного
+/// сценария уже стоила мне четырёх упавших соседей в другом предмете — здесь она не нужна.
+///
+/// ЗАЧЕМ ЭТО ВООБЩЕ. `Frame` НЕ несёт селектора (`crates/gateway/src/lib.rs`: `schema_version`,
+/// `from`, `to`, `delta`, `at_ms` — символа нет), а `append_more` кормит любой инструмент
+/// ценами `100.0 + i`. Значит кадры BTCUSDT и ETHUSDT после него неразличимы НИЧЕМ, и
+/// текстовый поиск по имени символа в сериализованном кадре не может найти ни одного —
+/// ни для «пришёл новый», ни для «пришёл старый». Оракул, различающий инструменты по имени
+/// в `frame`, меряет то, чего в предмете нет (`testing.md` §«Оракул обязан мерить ТО, ЧТО
+/// ОБЕЩАЕТ»). Разведение по цене даёт признак, который РЕАЛЬНО доезжает до клиента: он
+/// попадает в `ohlcv.open/high/low/close`, `volume_profile.bins` и `vwap`.
+#[cfg(feature = "testing")]
+fn append_more_priced(dir: &Path, symbol: &str, n: i64, from_ms: i64, base_price: f64) {
+    let mut j = Journal::open_with(dir, writer_cfg()).expect("reopen journal");
+    for i in 0..n {
+        j.append(EventKind::md(
+            Venue::Binance,
+            symbol,
+            MdPayload::Trade {
+                price: to_fixed(base_price + i as f64),
+                size: to_fixed(0.5),
+                side: Side::Sell,
+                ts_exch_ms: from_ms + i,
+            },
+        ))
+        .expect("append more priced");
+    }
+    j.flush().expect("flush more priced");
+}
+
+/// Максимальная цена, встреченная в сериях кадра (`ohlcv` + `volume_profile`). `None`, если
+/// кадр не несёт ценовых серий вовсе.
+///
+/// Признак независим от способа, которым сервер формирует кадр: он читает ЗНАЧЕНИЯ, попавшие
+/// в серию, а не поле, которое сервер мог бы проставить сам (`CT-RFC-09` §5.1 — эталон идёт
+/// независимым путём).
+#[cfg(feature = "testing")]
+fn max_price_in(v: &Value) -> Option<i64> {
+    let d = v.get("data")?;
+    let mut best: Option<i64> = None;
+    for row in d
+        .pointer("/delta/ohlcv")
+        .or_else(|| d.pointer("/series/ohlcv"))?
+        .as_array()?
+    {
+        if let Some(h) = row.get("high").and_then(|x| x.as_i64()) {
+            best = Some(best.map_or(h, |b: i64| b.max(h)));
+        }
+    }
+    best
+}
+
 fn append_more(dir: &Path, symbol: &str, n: i64, from_ms: i64) {
     let mut j = Journal::open_with(dir, writer_cfg()).expect("reopen journal");
     for i in 0..n {
@@ -1297,17 +1361,32 @@ async fn o12_switch_during_inflight_pump_does_not_restore_old_sub() {
     );
 
     // Развязка А+Б обязана удержать: завершившийся pump НЕ восстанавливает старую подписку.
-    append_more(dir.path(), "BTCUSDT", 4, BASE_MS + 9_000);
-    append_more(dir.path(), "ETHUSDT", 4, BASE_MS + 9_000);
+    // Инструменты кормятся РАЗЛИЧИМЫМИ ценовыми диапазонами: `Frame` не несёт селектора, и
+    // без этого кадры двух символов неотличимы ничем (см. `append_more_priced`). Разрыв на
+    // порядок — не косметика: он делает признак устойчивым к округлению бакетов.
+    append_more_priced(dir.path(), "BTCUSDT", 4, BASE_MS + 9_000, BTC_PRICE);
+    append_more_priced(dir.path(), "ETHUSDT", 4, BASE_MS + 9_000, ETH_PRICE);
     let tail = drain(&mut ws, 3 * GRACE_MS + 1_200).await;
 
+    // SETUP-GUARD (`testing.md`, целостность гейта, свойство 3): различение построено на
+    // ЦЕНЕ, поэтому сценарий обязан убедиться, что ценовые серии до клиента вообще доехали.
+    // Пустой хвост или кадры без `ohlcv` означают, что тест проверял бы не то — и это FAIL
+    // сценария, а не тихий пропуск.
+    let priced: Vec<&Value> = tail.iter().filter(|v| max_price_in(v).is_some()).collect();
+    assert!(
+        !priced.is_empty(),
+        "SETUP НЕ СОСТОЯЛСЯ: ни один кадр хвоста не несёт ценовых серий, а различение \
+         инструментов построено на цене. Всего в хвосте: {}. Чинить фикстуру, а не реализацию.",
+        tail.len()
+    );
+
+    // Прежняя редакция искала имя символа в сериализованном кадре — а `Frame` селектора не
+    // несёт, поэтому вектор был ПУСТ ВСЕГДА и ассерт истинен при любой реализации, включая
+    // ту, которую он обязан ловить. Вакуумность не наблюдалась, потому что до задачи 12а
+    // оракул не компилировался и не исполнялся ни разу.
     let stale: Vec<&Value> = tail
         .iter()
-        .filter(|v| {
-            serde_json::to_string(v)
-                .unwrap_or_default()
-                .contains("BTCUSDT")
-        })
+        .filter(|v| max_price_in(v).is_some_and(|p| p >= to_fixed(BTC_PRICE)))
         .collect();
     assert!(
         stale.is_empty(),
@@ -1327,11 +1406,7 @@ async fn o12_switch_during_inflight_pump_does_not_restore_old_sub() {
     // ДОСТАВКА нового селектора, а не только отсутствие старого.
     let fresh: Vec<&Value> = tail
         .iter()
-        .filter(|v| {
-            serde_json::to_string(v)
-                .unwrap_or_default()
-                .contains("ETHUSDT")
-        })
+        .filter(|v| max_price_in(v).is_some_and(|p| p < to_fixed(BTC_PRICE)))
         .collect();
     assert!(
         !fresh.is_empty(),
