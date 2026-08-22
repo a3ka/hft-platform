@@ -592,6 +592,101 @@ scenario_archive_exclusion_still_holds() {
   fi
 }
 
+# ---------------------------------------------------------------------------
+# Сценарии V-АРХИВ — архивный класс вердиктов (решение founder'а 2026-08-22, `TD-064`).
+# Анти-плацебо в ТРИ стороны, потому что у исключения три способа быть неверным:
+#   V-1  вердикт с мёртвой `docs/*.md` ссылкой не роняет гейт. ЧТО ИМЕННО он пиннит —
+#        названо точно, потому что первый прогон мутаций показал обратное ожидаемому:
+#        снятие исключения его НЕ роняет (check4 обходит только `docs/` и до вердиктов не
+#        доходит ни с исключением, ни без). Он пиннит ГРАНИЦУ ПРИ РАСШИРЕНИИ ОХВАТА —
+#        то есть ровно ту альтернативу, которую founder отверг: мутация «check4 обходит
+#        весь репозиторий» + исключение на месте → V-1 зелен; та же мутация со снятым
+#        исключением → V-1 краснеет. Вакуумным он не является, но и сегодняшнее поведение
+#        check4 он не доказывает;
+#   V-2  вердикт с битой ссылкой на раздел не роняет check3 (исключение симметрично —
+#        до решения check3 обходил весь репозиторий и вердикты СУДИЛ, а check4 ходил
+#        только по docs/ и не судил; асимметрия была случайной);
+#   V-3  ГРАНИЦА: `research/reports/**` — НЕ вердикт и остаётся под судом. Без этого
+#        сценария расширение исключения на весь `research/` прошло бы незамеченным;
+#   V-4  наблюдатель СЧИТАЕТ то, что обещает: два мёртвых линка → в INFO ровно 2.
+#        Исключение без наблюдения есть то самое «ложное зелёное», из-за которого
+#        решение и принималось.
+# Литерал `DESIGN.md` + `§` + номер подряд не пишется (см. сценарий 4): check3 сканирует
+# .sh, и проба нашла бы собственный пример как настоящую битую ссылку.
+# ---------------------------------------------------------------------------
+scenario_verdict_class_dead_doc_ref_excluded() {
+  local d="${TMP_BASE}/vclass1"
+  build_good_fixture "${d}"
+  { echo "# C-99 — вердикт, цитирующий улику"
+    echo "Гейт ругался на \`docs/GHOSTVERDICT.md\` — файла нет, и это НОРМА для вердикта."
+  } > "${d}/research/critiques/C-99-cite.md"
+  local out rc
+  out="$(run_verify "${d}")"; rc=$?
+  if [ "${rc}" -eq 0 ] && ! echo "${out}" | grep -q 'FAIL.*GHOSTVERDICT'; then
+    pass "V-1 (вердикт с мёртвой docs-ссылкой): исключение держится, exit=${rc}"
+  else
+    fail "V-1: ОЖИДАЛСЯ exit=0 без FAIL по GHOSTVERDICT (exit=${rc}):"
+    echo "${out}" | sed 's/^/      /'
+  fi
+}
+
+scenario_verdict_class_broken_section_ref_excluded() {
+  local d="${TMP_BASE}/vclass2"
+  build_good_fixture "${d}"
+  local fake_section="97"
+  { echo "# R-99 — вердикт, цитирующий битую ссылку на раздел"
+    printf 'Цитата вывода гейта: DESIGN.md §%s.\n' "${fake_section}"
+  } > "${d}/research/reviews/R-99-cite.md"
+  local out rc
+  out="$(run_verify "${d}")"; rc=$?
+  if [ "${rc}" -eq 0 ] && ! echo "${out}" | grep -q '3-ССЫЛКИ.*97'; then
+    pass "V-2 (вердикт с битой ссылкой на раздел): check3 его не судит, exit=${rc}"
+  else
+    fail "V-2: ОЖИДАЛСЯ exit=0 без FAIL [3-ССЫЛКИ] §97 (exit=${rc}):"
+    echo "${out}" | sed 's/^/      /'
+  fi
+}
+
+scenario_verdict_class_does_not_leak_to_reports() {
+  local d="${TMP_BASE}/vclass3"
+  build_good_fixture "${d}"
+  mkdir -p "${d}/research/reports"
+  local fake_section="96"
+  { echo "# отчёт — НЕ вердикт, судится наравне со всеми"
+    printf 'Утверждение отчёта: DESIGN.md §%s.\n' "${fake_section}"
+  } > "${d}/research/reports/R-99-report.md"
+  local out rc
+  out="$(run_verify "${d}")"; rc=$?
+  if [ "${rc}" -ne 0 ] && echo "${out}" | grep -q 'FAIL  \[3-ССЫЛКИ\].*§96'; then
+    pass "V-3 (research/reports вне класса): граница держится, гейт краснеет, exit=${rc}"
+  else
+    fail "V-3: ОЖИДАЛСЯ FAIL [3-ССЫЛКИ] §96 — исключение протекло на весь research/ (exit=${rc}):"
+    echo "${out}" | sed 's/^/      /'
+  fi
+}
+
+scenario_verdict_class_observer_counts_what_it_promises() {
+  local d="${TMP_BASE}/vclass4"
+  build_good_fixture "${d}"
+  # setup-guard: каркас фикстуры каталога арбитража не создаёт — без `mkdir` запись ушла бы
+  # в никуда, и сценарий проверял бы ПУСТОТУ вместо предмета (`testing.md` §«Целостность
+  # гейта», свойство 3: проба обязана падать и против несостоявшегося setup). Поймано
+  # первым же прогоном — сценарий покраснел до того, как успел соврать зелёным.
+  mkdir -p "${d}/research/arbitration"
+  { echo "# A-99 — арбитраж с двумя мёртвыми ссылками"
+    echo "Первая: \`docs/GHOSTA.md\`. Вторая: \`docs/GHOSTB.md\`."
+  } > "${d}/research/arbitration/A-99-cite.md"
+  local out rc
+  out="$(run_verify "${d}")"; rc=$?
+  if [ "${rc}" -eq 0 ] && echo "${out}" | grep -qE 'V-АРХИВ.*мёртвых ссылок .* 2 '; then
+    pass "V-4 (наблюдатель считает): в INFO ровно 2 мёртвые ссылки, exit=${rc}"
+  else
+    fail "V-4: ОЖИДАЛСЯ INFO [V-АРХИВ] с числом 2 (exit=${rc}):"
+    echo "${out}" | grep 'V-АРХИВ' | sed 's/^/      /'
+  fi
+}
+
+
 # --- граница головы файла пиннится с ОБЕИХ сторон (testing.md §«Дегенерированный вход», п.4).
 # H-FACTS-3 держит верх (маркер вне головы не считается); этот — низ: маркер НА последней
 # строке головы обязан считаться, иначе стаб FACTS_HEAD_LINES=1 проходит незамеченным.
@@ -1632,6 +1727,10 @@ scenario_facts_note_threshold_pinned_below
 scenario_facts_marker_without_head_not_opted_in
 scenario_facts_marked_plan_checked_by_check3
 scenario_archive_exclusion_still_holds
+scenario_verdict_class_dead_doc_ref_excluded
+scenario_verdict_class_broken_section_ref_excluded
+scenario_verdict_class_does_not_leak_to_reports
+scenario_verdict_class_observer_counts_what_it_promises
 scenario_facts_marker_on_last_head_line_counts
 scenario_facts_sha_fake_fails
 scenario_facts_sha_orphan_fails

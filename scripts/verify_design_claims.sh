@@ -687,9 +687,24 @@ def _has_facts_marker(fpath):
     return sha is not None
 
 
+# АРХИВНЫЙ КЛАСС ВЕРДИКТОВ (решение founder'а 2026-08-22; исполнение `TD-064`).
+# Вердикт гейта — ДАТИРОВАННЫЙ СНИМОК: он отвечает за ревизию, названную в его шапке
+# `GATE-META: audited_head`, а не за то, как выглядит дерево сегодня. Требовать от него
+# живых ссылок вечно — то же, что требовать от протокола собрания, чтобы упомянутые в нём
+# документы не исчезали. `TD-064` (заведено reviewer'ом 2026-08-01, `R-016` N-5) называет
+# и корень: гейт не отличает УТВЕРЖДЕНИЕ от ЦИТАТЫ утверждения, а вердикт цитирует чужой
+# вывод как улику — черновик `R-016`, приведший вывод гейта дословно, сделал гейт красным
+# на самом себе, и обходили это искажением улики в аудит-трейле.
+# Альтернатива (выровнять охват) отвергнута founder'ом: она требует править ссылки в 28
+# вердиктах и рецидивирует при каждом следующем удалённом файле.
+VERDICT_CLASS_DIRS = ("research/critiques/", "research/reviews/", "research/arbitration/")
+
+
 def is_excluded(relpath, fpath):
     """Единое правило исключения для check3/check4 — один разбор на двоих (`A-010` §G)."""
     if relpath.startswith("docs/archive/"):
+        return True
+    if relpath.startswith(VERDICT_CLASS_DIRS):
         return True
     if relpath.startswith("docs/plans/"):
         return not _has_facts_marker(fpath)
@@ -893,6 +908,49 @@ def check_facts_note(root):
                            f"спеки или оракула не является")
     if silent == 0:
         info("H-FACTS", "фактур без маркера с порогом утверждений не найдено")
+
+
+
+def check_verdict_class(root):
+    """Архивный класс объявляется, а не умалчивается.
+
+    Исключение без наблюдения — это ровно то «ложное зелёное», из-за которого решение и
+    принималось: 84 мёртвые ссылки жили в 28 вердиктах, и ни одна строка вывода об этом не
+    говорила. Здесь класс НАЗЫВАЕТСЯ числом. Это INFO, а не FAIL — по построению: вердикт
+    стареет законно (см. `VERDICT_CLASS_DIRS`). Маркер конвертирует «молча ложно» в «явно
+    датировано» — дрейф он ОБЪЯВЛЯЕТ, а не лечит, ровно как `FACTS:` в `A-010` §H.
+    """
+    n_files = n_dead = 0
+    present = False
+    for rel in VERDICT_CLASS_DIRS:
+        d = os.path.join(root, rel)
+        if not os.path.isdir(d):
+            continue
+        present = True
+        for dirpath, dirnames, filenames in os.walk(d):
+            dirnames[:] = [x for x in dirnames if x != ".git"]
+            for fn in filenames:
+                if not fn.endswith(".md"):
+                    continue
+                fpath = os.path.join(dirpath, fn)
+                n_files += 1
+                try:
+                    with open(fpath, encoding="utf-8") as f:
+                        for line in f:
+                            for m in DOC_FILE_REF_RE.finditer(line):
+                                if not os.path.isfile(os.path.join(root, m.group(0))):
+                                    n_dead += 1
+                except (UnicodeDecodeError, OSError):
+                    continue
+    if not present:
+        info("V-АРХИВ", "каталогов вердиктов нет — класс неприменим")
+        return
+    info(
+        "V-АРХИВ",
+        f"архивный класс: {n_files} вердиктов исключены из проверок ссылок как датированные "
+        f"снимки (решение 2026-08-22, `TD-064`); мёртвых ссылок `docs/*.md` внутри них: "
+        f"{n_dead} — это НЕ дефект дерева, а возраст вердикта",
+    )
 
 
 def check4(root):
@@ -1485,6 +1543,7 @@ def main():
     check2(root, design_text)
     check3(root, design_text)
     check4(root)
+    check_verdict_class(root)
     check_facts_sha(root)
     check_facts_note(root)
     check5(root, design_text)
