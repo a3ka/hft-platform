@@ -693,18 +693,27 @@ scenario_verdict_class_declaration_names_all_dirs() {
   echo "# A-99 — файл нужен, чтобы каталог существовал и попал в объявление" \
     > "${d}/research/arbitration/A-99-cite.md"
   [ -s "${d}/research/arbitration/A-99-cite.md" ] || { fail "V-4: фикстура не создана — setup"; return; }
-  local out rc line
+  local out rc got want
   out="$(run_verify "${d}")"; rc=$?
-  line="$(echo "${out}" | grep 'V-АРХИВ' || true)"
-  if [ "${rc}" -eq 0 ] \
-     && echo "${line}" | grep -q 'research/critiques/' \
-     && echo "${line}" | grep -q 'research/reviews/' \
-     && echo "${line}" | grep -q 'research/arbitration/'; then
-    pass "V-4 (объявление называет весь класс): три каталога в INFO, exit=${rc}"
+  got="$(declared_dirs "${out}")"
+  want="research/arbitration/ research/critiques/ research/reviews/"
+  if [ "${rc}" -eq 0 ] && [ "${got}" = "${want}" ]; then
+    pass "V-4 (объявление ≡ полный класс): «${got}», exit=${rc}"
   else
-    fail "V-4: ОЖИДАЛИСЬ все три каталога класса в INFO [V-АРХИВ] (exit=${rc}):"
-    echo "${line:-<строки V-АРХИВ нет>}" | sed 's/^/      /'
+    fail "V-4: объявление обязано быть РОВНО «${want}». Получено «${got}», exit=${rc}:"
+    echo "${out}" | grep 'V-АРХИВ' | sed 's/^/      /'
   fi
+}
+
+# Извлекает СПИСОК каталогов, объявленных наблюдателем, из строки INFO [V-АРХИВ].
+# Сравнение множеств вместо перечня грепов — исполнение условия `R-103`: перечисление
+# литералов закрывает только НАЗВАННЫЕ имена, а переобъявление ЛЮБЫМ третьим именем
+# (`R-103` NC1h: `research/hypotheses/`) проходит. Точное равенство закрывает оба
+# направления для любого имени в любом написании, и перечислять больше нечего.
+declared_dirs() {   # $1 = полный вывод гейта; печатает отсортированный список через пробел
+  echo "$1" | grep 'V-АРХИВ' \
+    | grep -oE 'research/[A-Za-z0-9_-]+/' \
+    | sort -u | tr '\n' ' ' | sed 's/ $//'
 }
 
 scenario_verdict_class_declaration_equals_tuple() {
@@ -730,19 +739,16 @@ scenario_verdict_class_declaration_equals_tuple() {
     > "${d}/research/reports/R-98-report.md"
   [ -s "${d}/research/reports/R-98-report.md" ] || { fail "V-7: фикстура не создана — setup"; return; }
   [ ! -d "${d}/research/arbitration" ] || { fail "V-7: каркас неожиданно создал arbitration/ — setup"; return; }
-  local out rc line
+  local out rc got want
   out="$(run_verify "${d}")"; rc=$?
-  line="$(echo "${out}" | grep 'V-АРХИВ' || true)"
-  if [ "${rc}" -eq 0 ] \
-     && echo "${line}" | grep -q 'research/critiques/' \
-     && echo "${line}" | grep -q 'research/reviews/' \
-     && ! echo "${line}" | grep -q 'research/arbitration/' \
-     && ! echo "${line}" | grep -q 'research/reports/'; then
-    pass "V-7 (объявление ≡ кортеж): назван ровно наличный класс, лишнего нет, exit=${rc}"
+  got="$(declared_dirs "${out}")"
+  want="research/critiques/ research/reviews/"
+  if [ "${rc}" -eq 0 ] && [ "${got}" = "${want}" ]; then
+    pass "V-7 (объявление ≡ наличный класс): «${got}», exit=${rc}"
   else
-    fail "V-7: объявление обязано назвать critiques+reviews и НЕ называть ни arbitration \
-(его нет), ни reports (он вне класса) (exit=${rc}):"
-    echo "${line:-<строки V-АРХИВ нет>}" | sed 's/^/      /'
+    fail "V-7: объявление обязано быть РОВНО «${want}» — ни меньше (недообъявление), ни \
+больше (переобъявление ЛЮБЫМ именем). Получено «${got}», exit=${rc}:"
+    echo "${out}" | grep 'V-АРХИВ' | sed 's/^/      /'
   fi
 }
 
