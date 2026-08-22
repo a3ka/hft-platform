@@ -1,0 +1,425 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  build-test:
+    name: fmt + clippy + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.0
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: fmt
+        run: cargo fmt --all -- --check
+      - name: clippy (warnings = errors)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: test (RED/GREEN — наши инварианты)
+        run: cargo test --all
+
+  security:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - name: install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: audit
+        run: cargo audit
+
+  delivery:
+    name: Delivery gate (бинарь В ПРОД-ОБРАЗЕ, TD-020)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Собрать прод-образ и ЗАПУСТИТЬ journal-retention внутри него
+        env:
+          HFT_DELIVERY_DEEP: "1"
+        run: bash scripts/verify_delivery_M-08.sh
+
+  protected-artifacts:
+    name: Protected artifacts (gate trail)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # База сравнения приходит ИЗ СОБЫТИЯ, а не из origin/main: на push-событии checkout
+      # ставит origin/main на только что запушенный коммит ⇒ диапазон пуст ⇒ гейт был бы
+      # зелёным ВСЕГДА (блокер B1). Пустая/zero/переписанная база → барьер fail-closed.
+      - name: Коммит не смеет удалять вердикты критика / милестоуны / RFC
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: bash scripts/check_protected_artifacts.sh
+
+      # Сам барьер обязан быть проверен ТОЙ ЖЕ проводкой, какой его зовёт CI (иначе гейт,
+      # проверенный не тем вызовом, — не проверен). 17 сценариев: удаление, rename-out,
+      # evil merge, merge-born, подмена типа (каталог/симлинк), усечение в 0 байт, fail-closed.
+      - name: Проба барьера (анти-плацебо)
+        run: bash scripts/tests/red_protected_artifacts.sh
+
+      # `git commit` без явных путей берёт ВЕСЬ индекс. 13.08 это унесло шесть файлов вместо
+      # одного и откатило работу другого агента в общей ветке — при том что запрещающий текст
+      # существовал 10 дней, а его автор и оказался нарушителем. Отсюда барьер вместо строки в
+      # правилах: `.githooks/pre-commit` различает форму вызова по `GIT_INDEX_FILE`. Проба
+      # держит обе стороны — запрещённая форма отвергнута, каждая законная (явный путь, новый
+      # файл, merge, `--amend` сообщения) проходит — и несёт анти-плацебо: без хука запрещённая
+      # форма обязана пройти, иначе набор зелен по чужой причине.
+      - name: Проба барьера явных путей коммита (8 сценариев)
+        run: bash scripts/tests/red_commit_paths.sh
+
+  docs-freeze:
+    name: Docs-freeze (M-60a — замок процессного слоя)
+    runs-on: ubuntu-latest
+    steps:
+      # fetch-depth: 0 ОБЯЗАТЕЛЬНО: барьер строит диапазон `$BASE..HEAD` через `git rev-list`,
+      # которому нужна ЛОКАЛЬНАЯ история. По умолчанию checkout даёт depth=1 (один коммит),
+      # и `rev-list` упрётся в `fatal: bad revision` — гейт закроется пустым диапазоном, то
+      # есть зелёным ВСЕГДА. Тот же класс дыры, что блокер B1 в `protected-artifacts`, и
+      # лечится той же ручкой.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Барьер замка процессного слоя (M-60a). База — ИЗ СОБЫТИЯ: тот же fail-closed паттерн,
+      # что в `protected-artifacts` (см. шапку комментария там). push → `github.event.before`;
+      # PR → `github.event.pull_request.base.sha`. Любая форма недостоверной базы (пустая /
+      # zero-SHA при создании ветки / force-push / база отсутствует в истории / база не предок
+      # HEAD) → FAIL, а не пропуск: «базы нет» не значит «проверять нечего».
+      - name: Барьер замка процессного слоя
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: bash scripts/check_docs_freeze.sh
+
+      # Проба барьера: ТОЙ ЖЕ проводкой, какой барьер зовёт CI (testing.md §«Целостность гейта»).
+      # Без этого шага «барьер зелёный» означает лишь, что скрипт существует и парсится, а
+      # не что инвариант защищён. 26 сценариев — 5 осей × все значения + легитимный сценарий
+      # на каждой; батарея --battery прогоняет эталон + 8 дырявых (милестоун §4.1).
+      - name: Проба барьера (26 сценариев + сверка со спекой §3bis.2)
+        run: bash scripts/tests/red_docs_freeze.sh
+
+      # `gc_worktrees.sh --reclaim` — единственный РАЗРУШИТЕЛЬНЫЙ путь, запускаемый вручную и
+      # по памяти. Его страж стоял на арифметическом сравнении и при нечисловом пороге не
+      # ужесточался, а ОТКЛЮЧАЛСЯ (R-055 Б-1: `--reclaim 3ч` предлагал снести 9 GB кэша у
+      # работавших в тот момент агентов). Проба держит обе стороны: негодный аргумент ⇒ отказ
+      # ДО удалений; годный ⇒ путь удаления реально достижим — иначе «ничего не снесено»
+      # зелено просто потому, что механизм мёртв.
+      - name: Проба разбора аргументов и путей gc_worktrees (13 сценариев, fail-closed)
+        run: bash scripts/tests/red_gc_reclaim_args.sh
+
+  contracts:
+    name: Contracts gate (паритет + атомарный CT-RFC + additive/breaking)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: Swatinem/rust-cache@v2
+      - name: python3 jsonschema (S2 verify_contracts.sh — фикстуры против РЕАЛЬНОГО валидатора)
+        run: pip install --quiet jsonschema
+
+      # S0-S4: схема ↔ типы regen-diff (CT-I-4), фикстуры ↔ схема, CT-I-1 EventKind
+      # канарейка, roundtrip (обещан docs/05-contract-layer.md §5, дыра Д3 — файла не было).
+      - name: Гейт паритета Rust↔Schema↔фикстуры (verify_contracts.sh)
+        run: bash scripts/verify_contracts.sh
+
+      # Тот же fail-closed паттерн, что job `protected-artifacts` выше (блокер B1, 2026-07-11):
+      # на push-событии origin/main = только что запушенный коммит ⇒ диапазон пуст, если брать
+      # символическую ветку. База берётся ИЗ СОБЫТИЯ.
+      - name: Определить базу события (push=before, PR=base.sha; fail-closed)
+        id: base
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          case "${EVENT_NAME}" in
+            push)         raw="${PUSH_BEFORE}" ;;
+            pull_request) raw="${PR_BASE_SHA}" ;;
+            *) echo "неизвестное событие '${EVENT_NAME}'"; exit 1 ;;
+          esac
+          case "${raw}" in
+            *[!0]*) : ;;  # есть ненулевой символ — не zero-SHA
+            *) echo "база = zero-SHA/пусто (создание ветки/force-push) — контрактные гейты не могут определить дифф"; exit 1 ;;
+          esac
+          echo "sha=${raw}" >> "$GITHUB_OUTPUT"
+
+      # Атомарность изменения T1 (docs/05 §4) — машинный аналог того, что нашло CT-RFC-05 без
+      # RFC-документа (docs/plans/contracts-current-state.md, дыра Д2).
+      - name: Атомарность CT-RFC пакета (verify_ct_rfc_atomic.sh)
+        run: bash scripts/verify_ct_rfc_atomic.sh "${{ steps.base.outputs.sha }}"
+
+      # Сам барьер обязан быть проверен ТОЙ ЖЕ проводкой (анти-плацебо, .claude/rules/testing.md).
+      - name: Проба атомарного CT-RFC гейта (анти-плацебо, good/bad синтетические диффы)
+        run: bash scripts/tests/red_ct_rfc_atomic.sh
+
+      # Классификатор additive/breaking + связь breaking ⇒ обязательный bump SCHEMA_VERSION.
+      - name: Классификатор additive/breaking схемы (diff_contract_schema.sh)
+        run: bash scripts/diff_contract_schema.sh "${{ steps.base.outputs.sha }}"
+
+      # Сам классификатор обязан быть проверен ТОЙ ЖЕ проводкой (анти-плацебо, R-006 F-3):
+      # до этой пробы у самого сложного компонента набора (214 строк логики классификации)
+      # не было self-test'а вовсе — CI видел его только на реальном дифе, почти всегда пустом.
+      - name: Проба классификатора схемы (анти-плацебо, включая регресс-гварды $ref, R-006 F-1)
+        run: bash scripts/tests/red_diff_contract_schema.sh
+
+  artifact-ids:
+    name: Artifact IDs (механический аллокатор, TD-111)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # Та же проводка, что у protected-artifacts: база — из СОБЫТИЯ (push.before / PR.base.sha),
+      # недостоверная база (zero / force-push / не-предок) — fail-closed. Спека §5: АДДИТИВНО,
+      # старые джобы и их членство в needs не трогаем.
+      - name: Коммит диапазона не вводит второй предмет под занятым номером (TD-111)
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: bash scripts/check_artifact_ids.sh
+
+      # Анти-плацебо: барьер обязан быть проверен ТОЙ ЖЕ проводкой, какой его зовёт CI —
+      # иначе «зелёный барьер» не отличим от «барьер пропускает всё» (testing.md).
+      - name: Проба барьера + аллокатора + батарея (анти-плацебо, 25 + 8 сценариев)
+        run: |
+          bash scripts/tests/red_artifact_ids.sh
+          bash scripts/tests/red_artifact_ids.sh --battery
+
+  reserve-ids:
+    name: Reserve IDs (CAS-резерв номеров, гонка параллельных сессий)
+    runs-on: ubuntu-latest
+    steps:
+      # fetch-depth по умолчанию (1) достаточен: проба ГЕРМЕТИЧНА — строит свой bare-origin
+      # в /tmp и в сеть не ходит вовсе. Ходила бы — мерила бы доступность GitHub, а не свой
+      # инвариант (класс `TD-135`), и краснела бы на чужих сбоях.
+      - uses: actions/checkout@v4
+
+      # Позитивный контроль: честная реализация обязана быть зелёной целиком.
+      - name: Сценарии резерва (15, локальный bare-origin)
+        run: bash scripts/tests/red_reserve_id.sh
+
+      # Анти-плацебо: механизм держится на ОДНОЙ идее (уникальный SHA на резервирующего),
+      # и наивная форма — push вершины main — отличается от честной ОДНОЙ строкой, при этом
+      # резервирует номер дважды (дыра E2). Батарея требует, чтобы каждый из 9 мутантов
+      # уронил РОВНО заявленное множество сценариев — ни больше (сломан сверх своей дыры),
+      # ни меньше (дыра не закреплена).
+      - name: Батарея мутантов резерва (9, равенство kill-set'ов)
+        run: bash scripts/tests/red_reserve_id.sh --battery
+
+  design-claims:
+    name: Design claims (документ не врёт о коде, TD-106/TD-062)
+    runs-on: ubuntu-latest
+    steps:
+      # fetch-depth: 0 ОБЯЗАТЕЛЬНО: проверка 6 [6-RFC-SHA] резолвит процитированные в
+      # docs/DESIGN.md + docs/rfc/**.md SHA через `git cat-file -e` и
+      # `git merge-base --is-ancestor` против ЛОКАЛЬНОЙ истории. Дефолтный depth=1
+      # оставил бы в object-db один коммит — каждый НАСТОЯЩИЙ исторический SHA стал бы
+      # ложным FAIL. Та же ручка, что в docs-freeze (там — ради rev-list диапазона).
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Гейт «документ не врёт о коде» — G2 плана M-60 (TD-106/TD-062: скрипт жил в main
+      # с 01.08, но CI его не звал — красный main по гейту документа был ненаблюдаем,
+      # R-034: FAIL(6) на чистом origin/main нашёл человек, а не машина).
+      # Форма вызова — ТА ЖЕ, какой пользуется человек: без аргументов, ROOT = корень.
+      # На pull_request checkout даёт МЕРЖ-коммит (refs/pull/N/merge) — проверяется
+      # дерево слияния, как требует TD-062 и gates.md §8; на push проверяется сам main.
+      - name: Гейт утверждений документов о коде (verify_design_claims.sh)
+        run: bash scripts/verify_design_claims.sh
+
+      # Проба гейта ТОЙ ЖЕ проводкой, какой его зовёт CI (testing.md §«Целостность
+      # гейта»): 41 проверка на синтетических git-фикстурах, анти-плацебо в обе стороны
+      # (гейт падает и против слишком мягкого движка, и против несостоявшегося setup).
+      - name: Проба гейта (счёт печатает сама проба)
+        run: bash scripts/tests/red_verify_design_claims.sh
+
+  context-budgets:
+    name: Context budgets (G1 — бюджет обязательного чтения)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Барьер в ПРОД-ФОРМЕ: default-режим, без переменных проб. Именно этим вызовом он
+      # судит корпус, и именно он должен краснеть, когда впрыскиваемое ядро выходит за
+      # бюджет A-003 или когда файл ядра исчезает (исчезновение даёт нулевой размер, то
+      # есть бесконечный запас — гейт, зеленеющий от пропажи предмета, не гейт).
+      - name: Бюджет обязательного чтения (прод-форма)
+        run: bash scripts/check_context_budgets.sh
+
+      # Проба ТОЙ ЖЕ проводкой (testing.md «целостность гейта»): 13 сценариев — превышение,
+      # ровно граница, +1 байт, отсутствие файла, пустая/отсутствующая таблица, нечитаемые
+      # файл и таблица, конфликтующие дубли строк с обеих сторон, лимит ИЗ ТАБЛИЦЫ.
+      - name: Проба барьера (13 сценариев)
+        run: bash scripts/tests/red_context_budgets.sh
+
+  gate-meta:
+    name: GATE-META (G3 — вердикт привязан к предмету)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # fetch-depth: 0 обязателен — барьер резолвит audited_base/audited_head в ЭТОЙ истории
+      # и проверяет, что head предок HEAD; при depth=1 каждый настоящий SHA стал бы ложным
+      # FAIL. База приходит ИЗ СОБЫТИЯ той же проводкой, что у protected-artifacts.
+      - name: Вердикт гейта привязан к предмету
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: bash scripts/check_gate_meta.sh
+
+      # Сценарии GM-*: форма и принадлежность предмету (реплей C-062 — чужой repo и
+      # несуществующая ревизия), subject-lock, проверка ОТСУТСТВИЯ вердикта при merge,
+      # множественность (все артефакты и все merge, не первый), сверка с ORIGIN вместо
+      # литерала, непустота полей, перечень verdict, прод-форма pull_request, приземление
+      # до-нормативного артефакта (ARCHIVED-VERDICT, C-089 F-089-1).
+      # ЧИСЛО сценариев здесь НЕ пишется: литерал, живущий отдельно от предмета, врёт —
+      # он уже соврал («27» против фактических 31). Счёт печатает сама проба, и его
+      # сверяет verify (declared по файлу против исполненного).
+      - name: Проба барьера (счёт печатает сама проба)
+        run: bash scripts/tests/red_gate_meta.sh
+
+      # Диск-преамбула (G6.2) живёт здесь же: отдельный джоб ради секунд не заводим.
+      # Сценарии DB-*, включая symlink-побег и адверсарий DEFAULT-режима (C-089 F-089-2/3).
+      - name: Проба диск-преамбулы (счёт печатает сама проба)
+        run: bash scripts/tests/red_disk_budget.sh
+
+  deploy-catchup:
+    name: Deploy catch-up (сторож «деплой не состоялся», Р-4)
+    runs-on: ubuntu-latest
+    steps:
+      # fetch-depth по умолчанию (1) достаточен: проба ГЕРМЕТИЧНА — строит свой git-репозиторий
+      # в /tmp и в сеть не ходит вовсе. Ходила бы — мерила бы доступность GitHub, а не свой
+      # инвариант (класс `TD-135`), и краснела бы на чужих сбоях.
+      - uses: actions/checkout@v4
+
+      # Барьер проводки в ПРОД-ФОРМЕ — тем же вызовом, каким его зовёт человек. Держит
+      # запретный список Р-4: rollback-ветка, fail-closed гейт на CI, `concurrency` (TD-086)
+      # и права `GITHUB_TOKEN` (TD-018) — плюс SHA-якорность выкатки (TD-150 п.1).
+      - name: Проводка deploy.yml не нарушает запретный список Р-4
+        run: python3 scripts/deploy_catchup.py check-wiring
+
+      # Структурный гейт M-08 (`needs: ci`, `permissions.actions: read`). Файл жил в `main`
+      # с M-08, но CI его НЕ ЗВАЛ — тот же класс, что `TD-106`/`TD-062` (гейт существует,
+      # его красное ненаблюдаемо). Зовётся здесь, рядом со своим предметом.
+      - name: Структурный гейт деплоя (M-08 E9/M6, TD-018)
+        run: python3 scripts/check_deploy_gate.py
+
+      # Барьер CI-АГРЕГАТА (`C-093` R-1). Проверяет ЭТОТ ЖЕ файл: джоб существует, зовёт
+      # предмет, стоит в `status-check.needs` И участвует в fail-closed условии. Последнее —
+      # ИСПОЛНЕНИЕМ условия с моделью «deploy-catchup=failure», а не грепом по имени: греп
+      # зелен и против закомментированной строки, и против упоминания в соседнем `echo`.
+      # Без этого барьера два стаба («джоб выкинут из условия», «выкинут и из needs, и из
+      # условия») давали полный зелёный прогон 39/39 — стаб был НЕОТЛИЧИМ от честной проводки.
+      - name: Красный сторож обязан ронять «All checks passed»
+        run: python3 scripts/deploy_catchup.py check-aggregate
+
+      # Позитивный контроль + анти-плацебо: честная реализация зелена, обманные манифесты и
+      # обманные раны — красные. Счёт печатает сама проба (литерал, живущий отдельно от
+      # предмета, врёт — замер `gate-meta`: «27» против фактических 31).
+      - name: Проба сторожа (решение + проводка)
+        run: bash scripts/tests/red_deploy_catchup.sh
+
+      # Батарея: каждый мутант обязан уронить РОВНО свой набор сценариев. Главный —
+      # «сторож молчит, когда деплоя не было»: механизм, наблюдающий сбой, но не ОТСУТСТВИЕ,
+      # внешне неотличим от рабочего (`testing.md`, целостность гейта, свойство 4).
+      - name: Батарея мутантов (равенство kill-set'ов)
+        run: bash scripts/tests/red_deploy_catchup.sh --battery
+
+  branch-health:
+    name: Branch health (наблюдатель веток — НЕ блокирует)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ПОЧЕМУ ЭТОТ ДЖОБ НЕ В АГРЕГАТЕ `All checks passed`. Он НАБЛЮДАТЕЛЬ, а не барьер
+      # (уровень 5 таблицы носителей, `docs/workflow/binding-requires-mechanism.md`). Его
+      # красное означает «источник не ответил документом», а не «предмет дефектен»: перебой
+      # на стороне GitHub блокировал бы тогда ВСЕ merge'и репозитория по причине, не
+      # связанной ни с одним предметом. Это ровно то направление отказа, которое `A-010` §H
+      # назвал негодным для чёрных списков — и оно негодно и здесь.
+      #
+      # ЗАЧЕМ ТОГДА ВООБЩЕ ПРОВОДИТЬ. Арбитраж `A-011` §1.6: механизм не был подключён НИ К
+      # ОДНОМУ раннеру, и три круга гейта спорили о классификации ответов инструмента,
+      # который никто не запускал (класс built-not-wired, `gates.md` §4). Наблюдение,
+      # которое никогда не исполняется, наблюдением не является.
+      - name: Наблюдение за ветками (висяки и дубликаты предмета)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/check_branch_health.sh || true
+
+      # Проба — ГЕРМЕТИЧНА (свой git-репозиторий в /tmp, поддельный `gh` в PATH, в сеть не
+      # ходит) и потому, в отличие от самого наблюдателя, обязана быть строгой: её красное
+      # означает дефект НАШЕГО кода, а не чужого сервиса.
+      - name: Проба наблюдателя + батарея мутантов
+        run: bash scripts/tests/red_branch_health.sh --battery
+
+  review-fa:
+    name: Review FA (вердикт называет живой инвариант тронутого модуля, M-66)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ЗАЧЕМ. `gates.md` §4: диф трогает `crates/<name>/**` ⇒ вердикт обязан назвать живой
+      # инвариант-ID из `docs/fa/<name>.md`, либо нести явный `FA-WAIVER`. Замер 2026-08-14,
+      # из-за которого требование появилось: FA тронутого модуля названа в 0 из 3 применимых
+      # вердиктов; `TD-138` нашли ровно тогда, когда FA дочитали постфактум.
+      #
+      # ПОЧЕМУ ТОЛЬКО СЕЙЧАС. Барьер и проба написаны в M-66 15.08, но жили на ветке
+      # `feat/M-66-fixture` и в `main` не попали — `TD-155`: `gates.md` и девять профилей
+      # объявляли `review-fa` машинным барьером, которого в `main` НЕ СУЩЕСТВУЕТ. Документация
+      # обогнала механизм. Пересборка от `main` предписана `A-010` §B п.3 — судить
+      # харнесс-предмет в дереве без `harness-track.md` нельзя.
+      #
+      # ПРОВОДКА — ЧАСТЬ ПРЕДМЕТА, А НЕ ДОБАВКА К НЕМУ. Сценарий `W8OK` пробы читает ИМЕННО
+      # ЭТОТ файл и требует в джобе `fetch-depth: 0`, три переменные события и оба вызова, а в
+      # `status-check` — членство в `needs` И в fail-closed условии. Соседи `W8NONEEDS`,
+      # `W8NOIF`, `W8NOCALL`, `W8CMTONLY` — анти-плацебо, каждый обязан краснеть. Набор M-66
+      # без этой проводки красен по СОБСТВЕННОЙ пробе: замер на пересобранной ветке — 39/40.
+      #
+      # База — ИЗ СОБЫТИЯ (блокер B1: на push-событии checkout ставит origin/main на только
+      # что запушенный коммит ⇒ диапазон пуст ⇒ барьер зеленел бы ВСЕГДА).
+      - name: Вердикт называет живой инвариант FA тронутого крейта
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: bash scripts/check_review_fa.sh
+
+      # Проба ТОЙ ЖЕ проводкой, какой барьер зовёт CI (`testing.md` §«Целостность гейта»):
+      # иначе «барьер зелёный» значит лишь, что скрипт парсится. Счёт печатает сама проба —
+      # литерал, живущий отдельно от предмета, врёт (замер `gate-meta`: «27» против 31).
+      - name: Проба барьера (счёт печатает сама проба)
+        run: bash scripts/tests/red_review_fa.sh
+
+  status-check:
+    name: All checks passed
+    runs-on: ubuntu-latest
+    needs: [build-test, security, delivery, protected-artifacts, contracts, docs-freeze, artifact-ids, reserve-ids, design-claims, context-budgets, gate-meta, deploy-catchup, review-fa]
+    if: always()
+    steps:
+      - run: |
+          if [[ "${{ needs.build-test.result }}" != "success" || "${{ needs.security.result }}" != "success" || "${{ needs.delivery.result }}" != "success" || "${{ needs.protected-artifacts.result }}" != "success" || "${{ needs.contracts.result }}" != "success" || "${{ needs.docs-freeze.result }}" != "success" || "${{ needs.artifact-ids.result }}" != "success" || "${{ needs.reserve-ids.result }}" != "success" || "${{ needs.design-claims.result }}" != "success" || "${{ needs.context-budgets.result }}" != "success" || "${{ needs.gate-meta.result }}" != "success" || "${{ needs.deploy-catchup.result }}" != "success" || "${{ needs.review-fa.result }}" != "success" ]]; then
+            echo "One or more checks failed"; exit 1
+          fi
+          echo "All checks passed"
