@@ -47,30 +47,21 @@ pub enum ClientMessage {
 }
 
 impl ClientMessage {
-    /// Извлечь версию протокола (`v`). Используется для диагностики в `error`-сообщениях.
-    pub fn version(&self) -> u64 {
-        match self {
-            Self::Subscribe { v, .. } => *v,
-            Self::Unsubscribe { v, .. } => *v,
-        }
-    }
-
-    /// Извлечь id подписки из subscribe/unsubscribe.
-    pub fn id(&self) -> &str {
-        match self {
-            Self::Subscribe { id, .. } => id,
-            Self::Unsubscribe { id, .. } => id,
-        }
-    }
+    // Задача 13 §12 N-6: методы `version()` и `id()` удалены — ноль вызовов в крэйтe
+    // (`grep -rnE 'msg\.version|msg\.id|parsed\.version|parsed\.id' crates/gateway-serve`
+    // пуст). Метод `version()` заявлялся «для диагностики в error-сообщениях», но
+    // `parse_error_code`/`parse_error_message` работают с `ParseError`, а не с
+    // `ClientMessage` — клиент прислал мусор, и версия неизвестна. Метод `id()` —
+    // то же: разбор идёт через `match` на конкретный вариант (`Subscribe { id, .. }`).
+    //
+    // Мёртвый публичный API — источник ложной уверенности: читающий код видит метод,
+    // которого на пути нет, и достраивает несуществующую гарантию. Ровно тот же класс,
+    // что `Sub::generation` до §10 (R-086), — дешевле.
 }
 
 /// Ошибка разбора клиентского сообщения (разбирается внутри `parse_message`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParseError {
-    /// Сообщение пришло не как `Text`/`Binary` (например, `Ping`/`Close`/`Pong`).
-    /// Вызывающий решает, считать ли это событием или просто игнорировать; здесь мы
-    /// не считаем это ошибкой протокола — `not_text_payload` его для удобства.
-    NotTextPayload,
     /// Невалидный JSON — клиент прислал мусор.
     InvalidJson(String),
     /// Структура JSON не соответствует ни subscribe, ни unsubscribe — `unknown_op`
@@ -82,10 +73,6 @@ pub enum ParseError {
     UnknownVersion { found: Option<Value> },
     /// `selector` отсутствует в subscribe (обязательное поле, §2.2).
     MissingSelector,
-    /// `selector` JSON присутствует, но не десеризуется в `gateway::Selector`
-    /// (неизвестная `venue`, плохие типы полей и т.п.). Это `unknown_venue` или
-    /// `invalid_selector` в зависимости от причины (вызывающий разбирает).
-    MalformedSelector(String),
 }
 
 /// Парсинг клиентского сообщения из сырых байт WS-сообщения (Text или Binary).

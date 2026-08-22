@@ -475,19 +475,20 @@ pub mod server {
     /// `spawn_blocking`-future, возвращающая `(sub_id, Result<...>)`; `FuturesUnordered`
     /// собирает их в одну очередь завершения для `select!` без per-id веток.
     pub type V1PumpJoin = tokio::task::JoinHandle<(String, V1PumpResult)>;
-    /// Результат v1-pump'a: ok = (live, frames, cursor, stats, gen_at_pump); err = боксированный
+    /// Результат v1-pump'a: ok = (live, frames, gen_at_pump); err = боксированный
     /// (live, ошибка, gen_at_pump). `gen_at_pump` проброшен ОБОИМИ ветками — возвращающий код
     /// сравнивает его с текущим `gens[id]` и при расхождении ОТБРАСЫВАЕТ результат.
     /// `live` пробрасывается как `gateway::LiveReducer`, а не как `session::Sub` (развязка А
     /// §10.2: pump не владеет `Sub` — только `LiveReducer`, временно вынутый из карты).
+    ///
+    /// Задача 13 §12 N-7: `new_cursor` и `stats` УДАЛЕНЫ из кортежа. v1-путь их не читает
+    /// (per-sub курсор живёт внутри `LiveReducer`, `stats` не surfасится клиенту) — раньше
+    /// они приходили как `_new_cursor` / `_stats` и тут же дропались. Комментарий
+    /// в `run_v1_session_loop`, оправдывающий их присутствие («остался в типе возврата...
+    /// используется ниже по коду (через `_stats` и для будущих мультиплексных сценариев)»),
+    /// врёт: `_stats` тоже дропается, а «будущие сценарии» в природе не появились.
     pub type V1PumpResult = Result<
-        (
-            gateway::LiveReducer,
-            Vec<crate::_gw::Frame>,
-            crate::_gw::Cursor,
-            crate::_gw::ReadStats,
-            u64,
-        ),
+        (gateway::LiveReducer, Vec<crate::_gw::Frame>, u64),
         Box<(gateway::LiveReducer, std::io::Error, u64)>,
     >;
     /// Тип FuturesUnordered, агрегирующий in-flight pump'ы. `BTreeSet<String>` отдельно
@@ -967,14 +968,16 @@ pub mod server {
     }
 
     /// Преобразование `wire_v1::ParseError` в машиночитаемый код для error-сообщения.
+    /// Задача 13 §12 N-5: варианты `NotTextPayload` и `MalformedSelector` удалены из
+    /// `ParseError` (не конструировались ни в одном месте — `grep -rnE "NotTextPayload\("
+    /// crates/gateway-serve/` пуст; `MalformedSelector(...)` тоже). Их ветки тут были
+    /// мёртвым кодом и источником ложной уверенности.
     fn parse_error_code(e: &wire_v1::ParseError) -> &'static str {
         match e {
             wire_v1::ParseError::UnknownVersion { .. } => "unknown_version",
             wire_v1::ParseError::UnknownShape(_) => "unknown_op",
             wire_v1::ParseError::InvalidJson(_) => "invalid_selector",
-            wire_v1::ParseError::NotTextPayload => "unknown_op",
             wire_v1::ParseError::MissingSelector => "invalid_selector",
-            wire_v1::ParseError::MalformedSelector(_) => "invalid_selector",
         }
     }
 
@@ -988,13 +991,9 @@ pub mod server {
             },
             wire_v1::ParseError::UnknownShape(s) => format!("unknown message shape: {s}"),
             wire_v1::ParseError::InvalidJson(s) => format!("invalid JSON: {s}"),
-            wire_v1::ParseError::NotTextPayload => {
-                "non-text message payload (only Text/Binary)".to_string()
-            }
             wire_v1::ParseError::MissingSelector => {
                 "missing selector field in subscribe".to_string()
             }
-            wire_v1::ParseError::MalformedSelector(s) => format!("malformed selector: {s}"),
         }
     }
 
@@ -1143,13 +1142,11 @@ pub mod server {
                                 cfg2.filter.clone(),
                                 PUSH_MAX_EVENTS,
                             ) {
-                                Ok((frames, new_cursor, stats)) => Ok((
-                                    live,
-                                    frames,
-                                    new_cursor,
-                                    stats,
-                                    gen_at_pump,
-                                )),
+                                // Задача 13 §12 N-7: `new_cursor` и `stats` из `pump()` больше
+                                // не пробрасываются — v1-путь их не использует (см. `V1PumpResult`).
+                                Ok((frames, _new_cursor, _stats)) => {
+                                    Ok((live, frames, gen_at_pump))
+                                }
                                 Err(e) => Err(Box::new((live, e, gen_at_pump))),
                             };
                             (id_for_pump, outcome)
@@ -1175,7 +1172,9 @@ pub mod server {
                     };
                     inner.pending_ids.remove(&id);
                     match outcome {
-                        Ok((live, frames, _new_cursor, _stats, gen_at_pump)) => {
+                        // Задача 13 §12 N-7: `_new_cursor` / `_stats` удалены из кортежа
+                        // (см. `V1PumpResult`).
+                        Ok((live, frames, gen_at_pump)) => {
                             // ═════ РЕШАЮЩИЙ INVARIANT: «OLD PUMP НЕ ЗАТИРАЕТ NEW SUB» ═════
                             //
                             // ДО фикса (R-086 блокер §2) следующий сценарий воспроизводился:
@@ -1244,10 +1243,10 @@ pub mod server {
                             // `milestones/M-65-ws-session.md`): синтетический heartbeat-кадр
                             // на каждый pump УДАЛЁН. Решение architect'а: фикстура сама
                             // порождает события после подписки, реализация проводную форму
-                            // НЕ расширяет. `new_cursor` остался в типе возврата — он
-                            // используется ниже по коду (через `_stats` и для будущих
-                            // мультиплексных сценариев), но больше не идёт в синтетический
-                            // heartbeat-кадр.
+                            // НЕ расширяет. Задача 13 §12 N-7: лживая ссылка на
+                            // "`new_cursor`... используется ниже по коду (через `_stats`)"
+                            // удалена — `new_cursor` и `stats` выкинуты из `V1PumpResult`,
+                            // v1-путь их не использует.
                             for frame in frames {
                                 let frame_msg = wire_v1::frame_msg(&id, &frame);
                                 let text = match serde_json::to_string(&frame_msg) {
@@ -1530,13 +1529,12 @@ pub mod server {
                                 cfg2.filter.clone(),
                                 PUSH_MAX_EVENTS,
                             ) {
-                                Ok((frames, new_cursor, stats)) => Ok((
-                                    live,
-                                    frames,
-                                    new_cursor,
-                                    stats,
-                                    gen_at_pump,
-                                )),
+                                // Задача 13 §12 N-7: `new_cursor` и `stats` из `pump()` больше
+                                // не пробрасываются — legacy_v1-путь их не использует
+                                // (см. `V1PumpResult`).
+                                Ok((frames, _new_cursor, _stats)) => {
+                                    Ok((live, frames, gen_at_pump))
+                                }
                                 Err(e) => Err(Box::new((live, e, gen_at_pump))),
                             };
                             (id_for_pump, outcome)
@@ -1561,8 +1559,10 @@ pub mod server {
                         }
                     };
                     v1_session_inner.pending_ids.remove(&id);
+                    // Задача 13 §12 N-7: `_new_cursor` / `_stats` удалены из кортежа
+                    // (см. `V1PumpResult`).
                     match outcome {
-                        Ok((live, frames, _new_cursor, _stats, gen_at_pump)) => {
+                        Ok((live, frames, gen_at_pump)) => {
                             // Аналогично v1-pump-completion в `run_v1_session_loop`: sub живёт,
                             // кладём `live` обратно в sub.live по месту (`subs.get_mut`), ЕСЛИ
                             // generation не разошёлся. Расхождение = switch/remove в-полёте ⇒
@@ -1600,6 +1600,9 @@ pub mod server {
                             }
                             // M-65 round 2 Б-3: см. замечание в `run_v1_session_loop`. Синтетический
                             // heartbeat УДАЛЁН по architect-решению `M-65-ws-session.md` §4.2bis.
+                            // Задача 13 §12 N-7: `new_cursor`/`stats` тут тоже дропались — теперь
+                            // их в `V1PumpResult` нет, этот комментарий остаётся только про
+                            // heartbeat.
                         }
                         Err(boxed) => {
                             let (live, e, gen_at_pump) = *boxed;
