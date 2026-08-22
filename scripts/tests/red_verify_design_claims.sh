@@ -608,9 +608,13 @@ scenario_archive_exclusion_still_holds() {
 #        только по docs/ и не судил; асимметрия была случайной);
 #   V-3  ГРАНИЦА: `research/reports/**` — НЕ вердикт и остаётся под судом. Без этого
 #        сценария расширение исключения на весь `research/` прошло бы незамеченным;
-#   V-4  наблюдатель СЧИТАЕТ то, что обещает: два мёртвых линка → в INFO ровно 2.
-#        Исключение без наблюдения есть то самое «ложное зелёное», из-за которого
-#        решение и принималось.
+#   V-4  объявление называет ВЕСЬ класс и берёт его из того же `VERDICT_CLASS_DIRS`,
+#        которым делается исключение. Прежняя редакция пиннила СЧЁТЧИК (число мёртвых
+#        ссылок); счётчик снят из наблюдателя после двух адверсарных кругов — `R-100` F-1
+#        и `R-101` F-1/F-2/F-3 нашли четыре обманных стаба, и все четыре были про число,
+#        ни один про исключение. Число фальсифицируемо по трём независимым осям (величина,
+#        каталог, множество файлов), пиннится дороже, чем стоит, и никем не используется:
+#        по решению founder'а вердикт стареет ЗАКОННО.
 # Литерал `DESIGN.md` + `§` + номер подряд не пишется (см. сценарий 4): check3 сканирует
 # .sh, и проба нашла бы собственный пример как настоящую битую ссылку.
 # ---------------------------------------------------------------------------
@@ -669,28 +673,6 @@ scenario_verdict_class_does_not_leak_to_reports() {
   fi
 }
 
-scenario_verdict_class_observer_counts_what_it_promises() {
-  local d="${TMP_BASE}/vclass4"
-  build_good_fixture "${d}"
-  # setup-guard: каркас фикстуры каталога арбитража не создаёт — без `mkdir` запись ушла бы
-  # в никуда, и сценарий проверял бы ПУСТОТУ вместо предмета (`testing.md` §«Целостность
-  # гейта», свойство 3: проба обязана падать и против несостоявшегося setup). Поймано
-  # первым же прогоном — сценарий покраснел до того, как успел соврать зелёным.
-  mkdir -p "${d}/research/arbitration"
-  { echo "# A-99 — арбитраж с двумя мёртвыми ссылками"
-    echo "Первая: \`docs/GHOSTA.md\`. Вторая: \`docs/GHOSTB.md\`."
-  } > "${d}/research/arbitration/A-99-cite.md"
-  local out rc
-  out="$(run_verify "${d}")"; rc=$?
-  if [ "${rc}" -eq 0 ] \
-     && echo "${out}" | grep -qE 'V-АРХИВ.*: 3 вердиктов' \
-     && echo "${out}" | grep -qE 'V-АРХИВ.*мёртвых ссылок .* 2 '; then
-    pass "V-4 (наблюдатель считает): 3 вердикта / 2 мёртвые ссылки, exit=${rc}"
-  else
-    fail "V-4: ОЖИДАЛСЯ INFO [V-АРХИВ] с «3 вердиктов» и числом 2 (exit=${rc}):"
-    echo "${out}" | grep 'V-АРХИВ' | sed 's/^/      /'
-  fi
-}
 
 
 # --- F-2 (`R-100`, блокер): матрица КЛАСС × ПРОВЕРКА была не закрыта. Класс — три каталога,
@@ -699,6 +681,32 @@ scenario_verdict_class_observer_counts_what_it_promises() {
 # `arbitration/` из кортежа проходило всю пробу зелёным — и на реальном дереве тоже, потому
 # что битых `§`-ссылок там сегодня нет. Регресс обнаружился бы следующим красным на
 # аудит-артефакте, то есть ровно тем отложенным взрывом, который правка объявила снятым.
+scenario_verdict_class_declaration_names_all_dirs() {
+  # Заменяет два прежних СЧЁТНЫХ сценария (V-4/V-7). Счётчик снят из наблюдателя после двух
+  # адверсарных кругов: `R-100` F-1 и `R-101` F-1/F-2/F-3 нашли четыре обманных стаба, и все
+  # четыре были про число, ни один — про исключение. Пиннить осталось одно: объявление
+  # называет ВЕСЬ класс и берёт его из того же `VERDICT_CLASS_DIRS`, которым исключение и
+  # делается. Один носитель ⇒ расходиться нечему.
+  local d="${TMP_BASE}/vclass4"
+  build_good_fixture "${d}"
+  mkdir -p "${d}/research/arbitration"
+  echo "# A-99 — файл нужен, чтобы каталог существовал и попал в объявление" \
+    > "${d}/research/arbitration/A-99-cite.md"
+  [ -s "${d}/research/arbitration/A-99-cite.md" ] || { fail "V-4: фикстура не создана — setup"; return; }
+  local out rc line
+  out="$(run_verify "${d}")"; rc=$?
+  line="$(echo "${out}" | grep 'V-АРХИВ' || true)"
+  if [ "${rc}" -eq 0 ] \
+     && echo "${line}" | grep -q 'research/critiques/' \
+     && echo "${line}" | grep -q 'research/reviews/' \
+     && echo "${line}" | grep -q 'research/arbitration/'; then
+    pass "V-4 (объявление называет весь класс): три каталога в INFO, exit=${rc}"
+  else
+    fail "V-4: ОЖИДАЛИСЬ все три каталога класса в INFO [V-АРХИВ] (exit=${rc}):"
+    echo "${line:-<строки V-АРХИВ нет>}" | sed 's/^/      /'
+  fi
+}
+
 scenario_verdict_class_critiques_pinned_for_check3() {
   local d="${TMP_BASE}/vclass5"
   build_good_fixture "${d}"
@@ -741,32 +749,6 @@ scenario_verdict_class_arbitration_pinned_for_check3() {
 # отличает счёт от константы В ПРИНЦИПЕ — нужна ВТОРАЯ с ДРУГИМ числом: тогда константа
 # обязана провалить хотя бы одну. Пиннится и число файлов: иначе константа в `n_files`
 # остаётся такой же дырой, только в соседнем поле.
-scenario_verdict_class_observer_is_not_a_constant() {
-  local d="${TMP_BASE}/vclass7"
-  build_good_fixture "${d}"
-  mkdir -p "${d}/research/arbitration"
-  { echo "# A-97 — пять мёртвых ссылок, число ОТЛИЧНОЕ от сценария V-4"
-    echo "1 \`docs/GH1.md\` 2 \`docs/GH2.md\` 3 \`docs/GH3.md\` 4 \`docs/GH4.md\` 5 \`docs/GH5.md\`"
-  } > "${d}/research/arbitration/A-97-five.md"
-  # Второй файл — чтобы число ВЕРДИКТОВ тоже отличалось от V-4 (там 3, здесь 4). Без него
-  # обе счётные точки давали 3, и константа `n_files = 3` проходила пробу — та же дыра, что
-  # F-1, полем левее. Найдено собственным стабом MC3 при проверке фикса F-1.
-  echo "# A-96 — вердикт без мёртвых ссылок, нужен только для счёта файлов" \
-    > "${d}/research/arbitration/A-96-clean.md"
-  [ -s "${d}/research/arbitration/A-97-five.md" ] || { fail "V-7: фикстура не создана — setup"; return; }
-  [ -s "${d}/research/arbitration/A-96-clean.md" ] || { fail "V-7: второй файл не создан — setup"; return; }
-  local out rc
-  out="$(run_verify "${d}")"; rc=$?
-  # каркас несёт C-01 и R-01 => 2 вердикта; плюс два файла этого сценария => 4
-  if [ "${rc}" -eq 0 ] \
-     && echo "${out}" | grep -qE 'V-АРХИВ.*: 4 вердиктов' \
-     && echo "${out}" | grep -qE 'V-АРХИВ.*мёртвых ссылок .*: 5 '; then
-    pass "V-7 (наблюдатель — не константа): 4 вердикта / 5 ссылок — обе счётные точки иные, чем в V-4, exit=${rc}"
-  else
-    fail "V-7: ОЖИДАЛОСЬ INFO [V-АРХИВ] с «4 вердиктов» и «5» мёртвых ссылок (exit=${rc}):"
-    echo "${out}" | grep 'V-АРХИВ' | sed 's/^/      /'
-  fi
-}
 
 
 # --- граница головы файла пиннится с ОБЕИХ сторон (testing.md §«Дегенерированный вход», п.4).
@@ -1812,10 +1794,9 @@ scenario_archive_exclusion_still_holds
 scenario_verdict_class_dead_doc_ref_excluded
 scenario_verdict_class_broken_section_ref_excluded
 scenario_verdict_class_does_not_leak_to_reports
-scenario_verdict_class_observer_counts_what_it_promises
+scenario_verdict_class_declaration_names_all_dirs
 scenario_verdict_class_critiques_pinned_for_check3
 scenario_verdict_class_arbitration_pinned_for_check3
-scenario_verdict_class_observer_is_not_a_constant
 scenario_facts_marker_on_last_head_line_counts
 scenario_facts_sha_fake_fails
 scenario_facts_sha_orphan_fails
