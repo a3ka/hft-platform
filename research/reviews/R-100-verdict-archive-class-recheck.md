@@ -1,5 +1,5 @@
 <!-- GATE-META
-milestone: harness-verdict-archive-class
+milestone: TD-064
 audited_repo: a3ka/hft-platform
 audited_base: d61904d71604f75cd1ccbd93ad0cd295ccd2e744
 audited_head: f8143479d1251bf5e2990a9d46fc76402fc6eadb
