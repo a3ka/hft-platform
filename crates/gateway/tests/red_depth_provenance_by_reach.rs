@@ -96,6 +96,26 @@ fn book_reaching(reach_pct: f64) -> EventKind {
     )
 }
 
+/// То же, что `book_reaching`, но с явной меткой времени — фикстуре ниже нужны ТРИ снимка
+/// книги в разных бакетах, иначе «жизни» схлопнутся в один.
+fn book_reaching_at(reach_pct: f64, ts: i64) -> EventKind {
+    let mut bids = vec![(MID - 1.0, 5.0)];
+    let mut asks = vec![(MID + 1.0, 5.0)];
+    for k in [0.5_f64, 1.0_f64] {
+        bids.push((MID * (1.0 - reach_pct * k), 1.0));
+        asks.push((MID * (1.0 + reach_pct * k), 1.0));
+    }
+    EventKind::md(
+        Venue::Binance,
+        "BTCUSDT",
+        MdPayload::L2Snapshot {
+            bids: lvls(&bids),
+            asks: lvls(&asks),
+            ts_exch_ms: ts,
+        },
+    )
+}
+
 fn journal_of(events: Vec<EventKind>) -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("tempdir");
     {
@@ -266,4 +286,105 @@ fn reach_is_per_side() {
          посчитанный по книге целиком, а не посторонне, даёт здесь ложное «наблюдалась». \
          Получено: {pa:?}"
     );
+}
+
+/// `GW-I-4`/`VB-I-2` НА МЕТКЕ: `snapshot(C) + frames ≡ full` при МЕНЯЮЩЕМСЯ охвате.
+///
+/// # Блокер `R-110` Б-1 — дефект, которого мой первый набор не видел
+///
+/// Пять оракулов выше судят ОДИН снапшот. Но метка стала функцией НАБЛЮДЁННОГО ОХВАТА, а
+/// охват меняется во времени — и merge-путь `Snapshot::apply`
+/// (`crates/gateway/src/lib.rs:1452-1454`) остался с правилом «первый непустой побеждает»:
+/// ```ignore
+/// if current.depth_band_provenance.is_none() {
+///     current.depth_band_provenance = incoming.depth_band_provenance.clone();
+/// }
+/// ```
+/// При старой семантике (метка = чистая функция ширины полосы) это было безвредно: значение
+/// не менялось никогда. При новой — метка ЗАЛИПАЕТ на первом значении.
+///
+/// **Прод-эффект, а не теория.** WS-клиент получает `Snapshot` ОДИН раз, дальше только
+/// `Frame`. После ресинка книга обрезана, полоса не наблюдается — а клиент до самого
+/// переподключения читает «liveness=confirmed» о полосе, которой в книге нет. Это ровно та
+/// тихая ложь, против которой `П-014` и требует метку.
+///
+/// # Почему существующий `GW-I-4` слеп
+///
+/// `red_gateway_live_eq_replay.rs` сравнивает снапшоты целиком, но его селектор несёт
+/// `bands=[0.001]` — полоса ≤ 1.3 %, метка там `None` ВСЕГДА, при любой реализации. Оракул
+/// равенства, у которого сравниваемое поле константно, равенства этого поля не проверяет.
+///
+/// # Фикстура — ТРИ ЖИЗНИ охвата, а не два состояния
+///
+/// `testing.md` §«Дегенерированный вход» п.2 требует нескольких ЖИЗНЕЙ одной сущности:
+/// охват ПАДАЕТ и ВОССТАНАВЛИВАЕТСЯ. Реализация, берущая минимум или максимум за окно,
+/// проходит фикстуру из двух состояний и валится на трёх.
+#[test]
+fn provenance_survives_merge_when_reach_changes() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    {
+        let mut j = Journal::open_with(dir.path(), cfg()).expect("open_with");
+        // ЧЕТЫРЕ жизни, и ПОСЛЕДНЯЯ отличается от ПЕРВОЙ — иначе залипание невидимо.
+        // Первая редакция этой фикстуры шла 5 % → 1 % → 5 % и была ЗЕЛЕНА против заведомо
+        // сломанного merge-пути: «первый непустой побеждает» давал тот же ответ, что реплей,
+        // просто потому что охват вернулся к исходному. Оракул, зелёный против дефекта,
+        // который он назван ловить, — вакуум; поймано собственным прогоном.
+        j.append(book_reaching_at(0.05, T)).expect("a1"); // наблюдается
+        j.append(book_reaching_at(0.01, T + 1_000)).expect("a2"); // ресинк: не наблюдается
+        j.append(book_reaching_at(0.05, T + 2_000)).expect("a3"); // восстановлен
+        j.append(book_reaching_at(0.01, T + 3_000)).expect("a4"); // снова обрезан — ИТОГ
+        j.flush().expect("flush");
+    }
+    let s = sel(vec![0.001, 0.03]);
+
+    let full = snap(dir.path(), &s);
+    let base = gateway::snapshot(dir.path(), EpochFilter::OwnCaptureOnly, &s, Cursor::START)
+        .expect("snapshot(START)");
+    // ДРЕНАЖ ПОБАТЧЕВО, по одному кадру. Первая редакция звала `frames_since(..., 64)` и
+    // получала ОДИН кадр, уже несущий финальную метку: merge-путь при этом не задействован
+    // вовсе (пустая база + один push), и оракул был ЗЕЛЕН против заведомо сломанного кода.
+    // Липкая ветка `Snapshot::apply` срабатывает, только когда строка приходит ВТОРОЙ раз —
+    // значит кадров обязано быть несколько, и каждый со своей меткой. Это и есть прод-форма:
+    // клиент получает поток кадров, а не один агрегат.
+    let mut merged = base;
+    let mut cur = Cursor::START;
+    let mut n_frames = 0_usize;
+    loop {
+        let (batch, next) =
+            gateway::frames_since(dir.path(), EpochFilter::OwnCaptureOnly, &s, cur, 1)
+                .expect("frames_since");
+        if batch.is_empty() {
+            break;
+        }
+        for f in &batch {
+            merged.apply(f);
+            n_frames += 1;
+        }
+        assert!(
+            next > cur,
+            "GW-I-8: курсор frames_since не монотонен ({next:?} <= {cur:?})"
+        );
+        cur = next;
+    }
+    assert!(
+        n_frames >= 2,
+        "SETUP НЕ СОСТОЯЛСЯ: кадров {n_frames} — merge-путь не задействован, и ассерт ниже \
+         был бы зелен на реализации с ЛЮБОЙ семантикой слияния"
+    );
+
+    for side in ["bid", "ask"] {
+        let want = row(&full.series.depth_series, side, 0.03)
+            .depth_band_provenance
+            .clone();
+        let got = row(&merged.series.depth_series, side, 0.03)
+            .depth_band_provenance
+            .clone();
+        assert_eq!(
+            got, want,
+            "GW-I-4/VB-I-2 НАРУШЕН на метке: snapshot(C)+frames расходится с полным реплеем. \
+             side={side}. Полный реплей: {want:?}; собранный клиентом: {got:?}. Merge-путь \
+             (`Snapshot::apply`) обязан отдавать метку, равную реплею, а не первую увиденную: \
+             клиент получает Snapshot однажды и дальше живёт на Frame'ах."
+        );
+    }
 }
