@@ -349,10 +349,29 @@ apply_mutant() {
                 };' || return $?
       ;;
     emptyframe)
-      # Перепривязка (round 3): форма кортежа pump-completion сменилась — pump возвращает
-      # `live`, а не `Sub` (развязка А), и порядок полей стал `(live, frames, new_cursor,
-      # stats, gen_at_pump)`. Сам дефект («сервер синтезирует кадр вместо молчания»)
-      # выражается прежней вставкой без изменений.
+      # Перепривязка (round 4, задача 13): N-7 выкинул `new_cursor`/`stats` из
+      # `V1PumpResult`, кортеж стал `(live, frames, gen_at_pump)`, и ОБА прежних якоря
+      # умерли разом. Поймано не глазами, а батареей: она отказалась применять мутацию и
+      # покраснела «setup fail-closed» — то есть механизм сработал как задуман, молча
+      # тестировать пустоту он не стал. Сам дефект («сервер синтезирует кадр вместо
+      # молчания») выражается прежней вставкой без изменений.
+      #
+      # КУРСОР СИНТЕТИЧЕСКОГО КАДРА обязан ПРОДОЛЖАТЬ цепочку, иначе мутант перестаёт
+      # быть одноосевым. Замерено: `Cursor { upto_seq: None }` (START) рвал цепочку и убивал
+      # `o9`, который судит именно её, а не факт синтеза — kill-set разъезжался на два
+      # лишних оракула. Прежний `new_cursor` из кортежа удалён задачей 13 N-7, поэтому курсор
+      # снимается с `live` — но СНИМАТЬ его надо в первой подстановке: ниже по коду `live`
+      # уже перемещён (`sub.live = Some(live)` / `drop(live)`), и обращение к нему в точке
+      # вставки — use-after-move, то есть НЕкомпилируемый мутант.
+      #
+      # ХРУПКОСТЬ НАЗВАНА, А НЕ ЗАМАЗАНА: якорь вынужденно захватывает КОММЕНТАРИЙ, потому
+      # что v1-путь и legacy-путь в этом месте посимвольно одинаковы (`Ok((live, frames,
+      # gen_at_pump)) => {` встречается дважды, `for frame in frames {` — тоже), и
+      # код-онли якоря, различающего их, не существует. Значит любая правка ЭТИХ
+      # комментариев снова убьёт мутацию — с честным красным, не с молчанием. Кандидат на
+      # устранение (не сделан, за А2-заморозкой): `replace_once` с диапазонным якорем
+      # «от уникальной строки до N-й следующей», тогда комментарии перестанут быть частью
+      # контракта мутации.
       # Якорь ОБЯЗАН нести строку `inner.pending_ids.remove(&id);`: сам кортеж после развязки А
       # встречается ДВАЖДЫ — блок pump-completion продублирован в `run_authorized_session`
       # (legacy-путь, `v1_session_inner`). Голый кортеж давал `replacement count=2`, то есть
@@ -360,21 +379,24 @@ apply_mutant() {
       # совпадения. Оракулы M-65 подписываются внутри grace-окна и идут через
       # `run_v1_session_loop` — мутируем именно его.
       replace_once crates/gateway-serve/src/lib.rs \
-        '                    inner.pending_ids.remove(&id);
-                    match outcome {
-                        Ok((live, frames, _new_cursor, _stats, gen_at_pump)) => {' \
-        '                    inner.pending_ids.remove(&id);
-                    match outcome {
-                        Ok((live, mut frames, new_cursor, _stats, gen_at_pump)) => {' || return $?
+        '                    match outcome {
+                        // Задача 13 §12 N-7: `_new_cursor` / `_stats` удалены из кортежа
+                        // (см. `V1PumpResult`).
+                        Ok((live, frames, gen_at_pump)) => {' \
+        '                    match outcome {
+                        // Задача 13 §12 N-7: `_new_cursor` / `_stats` удалены из кортежа
+                        // (см. `V1PumpResult`).
+                        Ok((live, mut frames, gen_at_pump)) => {
+                            let __synth_cursor = live.cursor();' || return $?
       replace_once crates/gateway-serve/src/lib.rs \
-        '                            // heartbeat-кадр.
+        '                            // v1-путь их не использует.
                             for frame in frames {' \
-        '                            // heartbeat-кадр.
+        '                            // v1-путь их не использует.
                             if frames.is_empty() {
                                 frames.push(crate::_gw::Frame {
                                     schema_version: crate::_gw::GATEWAY_SCHEMA_VERSION,
-                                    from: new_cursor,
-                                    to: new_cursor,
+                                    from: __synth_cursor,
+                                    to: __synth_cursor,
                                     delta: crate::_gw::SeriesBundle::default(),
                                     at_ms: 0,
                                 });
