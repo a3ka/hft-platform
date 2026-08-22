@@ -1021,19 +1021,44 @@ impl Reducer {
             }
         }
 
+        // П-014 / П-017: провенанс-метка `depth_band_provenance` — функция ТРЁХ величин
+        // (ширина полосы, сторона, наблюдённый охват этой стороны). Раньше метка зависела
+        // ТОЛЬКО от ширины полосы (`crates/gateway/src/lib.rs:1035`, прежняя редакция) — этого
+        // недостаточно ни для различия сторон (M-58: ask опровергнут на трёх из шести), ни
+        // для честности относительно фактического охвата книги после ресинка (`П-017`
+        // предусловие (а)).
+        //
+        // Охват считается ИЗ ТОЙ ЖЕ `self.book`, что и `heatmap_buckets` (см.
+        // `refresh_heatmap_bucket`), — без знания о ресинке, без отдельных источников
+        // (`П-014` явно: знание о ресинке НЕ ТРЕБУЕТСЯ и недоступно). Используем
+        // `OrderBook::max_reach_pct(Side)` — O(1) по размеру книги (один `keys().next()` /
+        // `next_back()` поверх BTreeMap), без клонирования уровней в `Vec`. Прямой вызов
+        // `self.book.levels(Side::*)` здесь был бы regression на O-1
+        // (`red_snapshot_noclone::o1_snapshot_allocation_does_not_grow_with_state`): он
+        // аллоцирует `Vec<(i64, i64)>` на ВСЮ книгу (×8 на фикстуре даёт ×8 аллокаций при
+        // неизменном окне), а нам нужен ровно один скаляр на сторону. Метод уже существует
+        // (`crates/book/src/lib.rs:286`, `max_reach_pct`), заводить соседний было бы дублем.
+        let reach_bid = self.book.max_reach_pct(Side::Buy).unwrap_or(0.0);
+        let reach_ask = self.book.max_reach_pct(Side::Sell).unwrap_or(0.0);
+
         let depth_series = self
             .depth
             .iter()
-            .map(|row| DepthRow {
-                side: match row.side {
-                    Side::Buy => "bid",
-                    Side::Sell => "ask",
+            .map(|row| {
+                let reach = match row.side {
+                    Side::Buy => reach_bid,
+                    Side::Sell => reach_ask,
+                };
+                DepthRow {
+                    side: match row.side {
+                        Side::Buy => "bid",
+                        Side::Sell => "ask",
+                    }
+                    .to_string(),
+                    band_pct_e8: row.band_pct_e8,
+                    series: row.values.iter().map(|(&t, &v)| (t, v)).collect(),
+                    depth_band_provenance: depth_provenance_label(row.band_pct_e8, row.side, reach),
                 }
-                .to_string(),
-                band_pct_e8: row.band_pct_e8,
-                series: row.values.iter().map(|(&t, &v)| (t, v)).collect(),
-                depth_band_provenance: (row.band_pct_e8 > 1_300_000)
-                    .then(|| "diff-reconstructed, validated<=1.3%".to_string()),
             })
             .collect();
 
@@ -1268,6 +1293,47 @@ fn depth_within(bids: &[Level], asks: &[Level], side: Side, band: f64) -> i64 {
                 .map(|level| level.size)
                 .sum()
         }
+    }
+}
+
+/// П-014 / GW-I-DP: провенанс-метка `depth_band_provenance` как функция ТРЁХ величин —
+/// ширины полосы, СТОРОНЫ и наблюдённого охвата этой стороны.
+///
+/// | полоса | охват стороны | метка |
+/// |---|---|---|
+/// | ≤ 1.3% | любой | `None` (прежний VB-I-5, валидированный эталон) |
+/// | > 1.3%, внутри охвата, bid | band ≤ reach | `diff-reconstructed, liveness=confirmed` |
+/// | > 1.3%, внутри охвата, ask | band ≤ reach | `diff-reconstructed, liveness=unconfirmed` |
+/// | > 1.3%, ЗА охватом (любая сторона) | band > reach | `not-observed band=… reach=…` |
+///
+/// Основание чисел — M-58 (`research/data-quality/depth-verdict.md:80-98`): bid подтверждён
+/// на всех семи полосах (cancel_fraction 0.713–0.992), ask опровергнут на трёх из шести
+/// глубже 1.3 % (`[300,500)` = 0.419, `[800,1500)` = 0.247, `[3000,6000)` = 0.403). Замок
+/// `A-002` З-2 (`cancel_fraction` меряет насыщение, а не живость) снимать нельзя, поэтому
+/// liveness по стороне остаётся обязательным.
+///
+/// Форма `DepthRow` (поле `depth_band_provenance: Option<String>`) не меняется (П-014 п.3: bump
+/// `GATEWAY_SCHEMA_VERSION` — решение architect'а). Меняется только СОДЕРЖИМОЕ строки.
+fn depth_provenance_label(band_pct_e8: i64, side: Side, reach: f64) -> Option<String> {
+    // VB-I-5 (прежний, не сдвинут): ≤ 1.3% — валидированный эталон, метки не несёт.
+    if band_pct_e8 <= 1_300_000 {
+        return None;
+    }
+    let band = band_pct_e8 as f64 / 1e8;
+    if band > reach {
+        // П-017 предусловие (а): полоса ЗА наблюдённым охватом стороны — НЕ наблюдалась вовсе,
+        // и ставить liveness тут нельзя: живость — это утверждение о наблюдённой стороне, а
+        // наблюдения нет. Сторона в этой ветке не входит в начало метки (`starts_with` —
+        // требование `band_beyond_reach_is_named_not_observed`), численные `band=`/`reach=`
+        // печатаются для отладки (видно, насколько полоса вышла за охват).
+        Some(format!("not-observed band={:.6} reach={:.6}", band, reach))
+    } else {
+        // П-014: внутри охвата — liveness зависит от стороны (M-58 + A-002 З-2).
+        let liveness = match side {
+            Side::Buy => "confirmed",    // bid подтверждён на всех полосах
+            Side::Sell => "unconfirmed", // ask опровергнут на трёх из шести глубже 1.3 %
+        };
+        Some(format!("diff-reconstructed, liveness={}", liveness))
     }
 }
 
