@@ -162,7 +162,14 @@ echo "── O12: оракул на гонку switch × in-flight pump (зад�
 O12LOG="${LOGD}/o12.log"
 if cargo test -p gateway-serve --features testing --test red_ws_session \
      o12_switch_during_inflight_pump >"${O12LOG}" 2>&1; then
-  O12_RAN="$(grep -cE '^test o12_switch_during_inflight_pump .* ok$' "${O12LOG}" || true)"
+  # ДЕФЕКТ, НАЙДЕННЫЙ НА ПРИЁМКЕ ЗАДАЧИ 13 (architect, 2026-08-22). Прежний паттерн
+  # `^test o12_switch_during_inflight_pump .* ok$` требовал ПРОБЕЛА сразу после `pump`, а
+  # тест зовётся `o12_switch_during_inflight_pump_does_not_restore_old_sub`. Совпасть он не
+  # мог НИКОГДА — и это хуже ложного красного: шаг написан, чтобы наблюдать ОТСУТСТВИЕ
+  # оракула, а говорил «НЕ ИСПОЛНЕН» одинаково и когда тест есть, и когда его нет. То есть
+  # сам шаг был вакуумен ровно тем способом, против которого написан (`testing.md`,
+  # целостность гейта, свойство 4). Суффикс имени теперь допускается явно.
+  O12_RAN="$(grep -cE '^test o12_switch_during_inflight_pump[A-Za-z0-9_]* \.\.\. ok$' "${O12LOG}" || true)"
   if [ "${O12_RAN}" -ge 1 ]; then
     pass "O12 оракул на находку ИСПОЛНЕН и зелён (тестов: ${O12_RAN})"
   else
