@@ -186,11 +186,22 @@ pub fn frame_msg(sub: &str, frame: &Frame) -> Value {
 /// Сериализация error-сообщения в NEW wire-форму.
 /// `sub` — id подписки, к которой относится ошибка (если применимо), `None` — для
 /// session-level ошибок (неизвестная op/version).
+///
+/// CT-RFC-09 §2.3: тип поля `sub` — `"<id>|null"`, то есть JSON-литерал `null` (НЕ строка
+/// `"null"`). Строка `"null"` делает подписку с `id == "null"` неотличимой от session-level
+/// ошибки, и клиент, разбирающий кадр по ТИПУ узла, не может их развести (задача 13 N-4).
 pub fn error_msg(sub: Option<&str>, code: &str, message: &str) -> Value {
+    // `Value::Null` — JSON `null`; `Value::String(..)` — строка. Совпадение ТИПОВ двух
+    // разных кадров и есть дефект N-4, который не ловил ни один старый оракул (хелпер
+    // `sub_of` читал `.as_str()`, и `null`/`"null"` давали ему `None`/`Some("null")`).
+    let sub_v = match sub {
+        Some(id) => Value::String(id.to_string()),
+        None => Value::Null,
+    };
     json!({
         "type":"error",
         "v":1,
-        "sub":sub.unwrap_or("null"),
+        "sub":sub_v,
         "code":code,
         "message":message,
     })
