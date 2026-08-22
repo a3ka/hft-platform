@@ -29,6 +29,12 @@ fn window_ms_env_flows_to_selector() {
     // GATEWAY_WINDOW_MS выставлен → прод-Selector обязан нести окно (иначе прод unbounded).
     let cfg = serve_config_from_env(getter(&[
         ("GATEWAY_JWT_SECRET", "test-secret"),
+        // `CT-RFC-09` §2.6: `max_subscriptions_per_connection` — конфиг, ОТСУТСТВИЕ
+        // либо невалидное значение ⇒ отказ старта (задача 13 N-2). Прод всегда его
+        // подаёт (`docker-compose.yml`, дефолт 16), поэтому фикстура БЕЗ переменной
+        // никогда не была прод-формой (`testing.md` §«Форма прода снимается ЗАМЕРОМ»).
+        // Ассерты ниже про лимит ничего не утверждают — добавление их не ослабляет.
+        ("GATEWAY_MAX_SUBSCRIPTIONS", "16"),
         ("GATEWAY_WINDOW_MS", "60000"),
     ]))
     .expect("config собран");
@@ -43,8 +49,16 @@ fn window_ms_env_flows_to_selector() {
 #[test]
 fn window_ms_absent_defaults_none() {
     // Без GATEWAY_WINDOW_MS → offline unbounded (None), прежнее поведение сохранено.
-    let cfg = serve_config_from_env(getter(&[("GATEWAY_JWT_SECRET", "test-secret")]))
-        .expect("config собран");
+    let cfg = serve_config_from_env(getter(&[
+        ("GATEWAY_JWT_SECRET", "test-secret"),
+        // `CT-RFC-09` §2.6: `max_subscriptions_per_connection` — конфиг, ОТСУТСТВИЕ
+        // либо невалидное значение ⇒ отказ старта (задача 13 N-2). Прод всегда его
+        // подаёт (`docker-compose.yml`, дефолт 16), поэтому фикстура БЕЗ переменной
+        // никогда не была прод-формой (`testing.md` §«Форма прода снимается ЗАМЕРОМ»).
+        // Ассерты ниже про лимит ничего не утверждают — добавление их не ослабляет.
+        ("GATEWAY_MAX_SUBSCRIPTIONS", "16"),
+    ]))
+    .expect("config собран");
     assert_eq!(
         cfg.selector.window_ms, None,
         "без GATEWAY_WINDOW_MS Selector.window_ms обязан быть None (offline)"

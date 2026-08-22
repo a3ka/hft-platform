@@ -53,7 +53,30 @@ pub mod auth {
     }
 }
 
-/// Wire-конверт сообщений WS (MVP — JSON, версионированный через `schema_version` внутри Snapshot/Frame).
+// Wire-конверт сообщений WS (MVP — JSON, версионированный через `schema_version` внутри Snapshot/Frame). (M-65: per-connection subscription state + v1 wire protocol)//
+// Хранятся рядом с `auth`/`wire`/`serve`/`server`, чтобы внешняя поверхность крейта
+// (паблик-импорты в `bin/wsprobe.rs` и RED-тестах) осталась прежней. Внутренние модули
+// движка WS-сессии — внутренняя деталь: видимы публично, но НЕ экспортируются из binary-путей.
+
+/// Per-WS-session subscription state (`CT-RFC-09` §2 — M-65).
+pub mod session;
+
+/// v1 wire protocol — парсинг клиентских сообщений и сериализация ответов (§2.2/§2.3).
+pub mod wire_v1;
+
+/// M-65 round 3 (R-086 §10.3): rendezvous-точка синхронизации для оракула на гонку
+/// «switch × in-flight pump». В ТЕСТОВОЙ сборке pump (внутри `spawn_blocking`)
+/// СИГНАЛИТ «вошёл» и ЖДЁТ разрешения; в прод-пути (compile без `--test`) модуль
+/// НЕ компилируется и на семантику пути не влияет — строгая граница через
+/// `#[cfg(test)]` на уровне `pub mod rendezvous`.
+///
+/// Сводный контракт и cleanup-политика — в шапке `test_sync.rs`. Тест, использующий
+/// `rendezvous`, вызывает `arm(id)` перед сценарием, `test_wait_for_pump(id, ..)`
+/// для синхронизации, `test_release(id)` чтобы pump продолжил, и `test_remove(id)`
+/// после сценария.
+#[cfg(any(test, feature = "testing"))]
+pub mod test_sync;
+
 pub mod wire {
     use crate::_gw::{Frame, Snapshot};
     use serde::{Deserialize, Serialize};
@@ -139,15 +162,57 @@ pub mod serve {
 /// snapshot (`serve::snapshot_msg`) + инкрементальный push (`serve::frames_msgs`) + replay. Read-only,
 /// stateless по юзеру. Токен передаётся клиентом в query (`?token=<jwt>`). Тела — engine-dev (task #4).
 pub mod server {
+    use super::session; // M-65: per-connection subscription state
+    use super::wire_v1; // M-65: v1 wire protocol (parse/serialize)
+
+    use std::io;
     use std::net::SocketAddr;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
+
+    /// M-65 (CT-RFC-09 §2.6): runtime-эффективный лимит подписок на соединение.
+    /// Дефолт — 16 (подпись founder'а 11.08). `serve_config_from_env` обновляет значение
+    /// ровно один раз при старте (fail-closed в `main` гарантирует, что плохое env не пройдёт).
+    /// Тесты с фиксированной формой литерала `ServeConfig { .. }` (без `max_subs`) используют
+    /// этот дефолт; единственный случай, где дефолт не подходит — ручная установка через
+    /// `set_effective_max_subs` (для unit-тестов, проверяющих cap ниже/выше дефолта).
+    static EFFECTIVE_MAX_SUBS: AtomicUsize = AtomicUsize::new(16);
+
+    /// Получить runtime-лимит подписок (читается на каждом соединении).
+    pub fn effective_max_subs() -> usize {
+        EFFECTIVE_MAX_SUBS.load(Ordering::Relaxed)
+    }
+
+    /// Установить runtime-лимит (вызывается из `serve_config_from_env` и тестов).
+    pub fn set_effective_max_subs(n: usize) {
+        EFFECTIVE_MAX_SUBS.store(n, Ordering::Relaxed);
+    }
+
+    /// M-65 задача 13 N-3 (CT-RFC-09 §2.8): grace-окно (`initial_subscribe_grace_ms`) —
+    /// runtime-эффективное значение, дефолт 250 ms (подпись founder'а 11.08). Атомик, не поле
+    /// `ServeConfig`, по той же причине, что и `EFFECTIVE_MAX_SUBS` выше: добавление поля
+    /// сломало бы тесты с фиксированной формой литерала `ServeConfig { .. }` (комментарий
+    /// перед `EFFECTIVE_MAX_SUBS`). `serve_config_from_env` обновляет значение ровно один раз
+    /// при старте; fail-closed на невалидном значении окружения (задача 13 N-3).
+    static EFFECTIVE_GRACE_MS: AtomicU64 = AtomicU64::new(250);
+
+    /// Получить grace-окно в миллисекундах (читается на каждом соединении).
+    pub fn effective_grace_ms() -> u64 {
+        EFFECTIVE_GRACE_MS.load(Ordering::Relaxed)
+    }
+
+    /// Установить grace-окно (вызывается из `serve_config_from_env` и тестов).
+    pub fn set_effective_grace_ms(ms: u64) {
+        EFFECTIVE_GRACE_MS.store(ms, Ordering::Relaxed);
+    }
 
     use crate::_gw::Selector;
     use futures_util::{SinkExt, StreamExt};
     use journal::EpochFilter;
     use jsonwebtoken::DecodingKey;
+    use serde_json::Value;
     use tokio::net::{TcpListener, TcpStream};
     use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
     use tokio_tungstenite::tungstenite::Message;
@@ -224,6 +289,34 @@ pub mod server {
 
         /// Accept-loop: на соединение — verify JWT из query; успех → snapshot + push + replay; провал →
         /// закрыть с отказом. Read-only (GS-I-3): приём фрейма = только replay-контролы, не запись.
+        /// Legacy-mode dispatcher: разбирает входящий Text/Binary КАК v1-сообщение и применяет
+        /// к `v1_session_inner`. Тот же путь, что в `run_v1_session`, но живёт бок-о-бок с
+        /// legacy env-stream (env-селектор из cfg + v1 subs со своими LiveReducer'ами в одной
+        /// сессии). Сценарий M-65: клиент, не приславший `subscribe` в grace-окне, получил
+        /// legacy snapshot; дальше ОН ЖЕ может отправить `subscribe` — это валидный сценарий
+        /// (`CT-RFC-09` §2.8 «subscribe после окна ⇒ обычная смена инструмента»).
+        ///
+        /// Тонкий момент: F-035-2 уже гарантирован ОДНИМ экземпляром `SessionInner` на
+        /// соединение; эта функция просто мутирует уже существующий, а не создаёт второй.
+        pub async fn parse_and_dispatch_v1_message<W>(
+            bytes: &[u8],
+            inner: &mut SessionInner,
+            sink: &mut futures_util::stream::SplitSink<WebSocketStream<W>, Message>,
+        ) where
+            W: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+        {
+            match wire_v1::parse_message(bytes) {
+                Ok(parsed) => {
+                    let _ = handle_v1_message(&parsed, inner, sink).await;
+                }
+                Err(e) => {
+                    let code = parse_error_code(&e);
+                    let msg = parse_error_message(&e);
+                    send_v1_error(sink, None, code, &msg).await;
+                }
+            }
+        }
+
         pub async fn serve(self) -> std::io::Result<()> {
             // ACCEPT-LOOP: каждый TcpStream — в отдельном spawn-таске (как в recorder metrics_server).
             // Accept-сбой (listener закрыт) → WARN + retry с паузой 100ms (не спиним).
@@ -320,8 +413,8 @@ pub mod server {
         };
         tracing::debug!(sub = %claims.sub, "ws auth ok");
 
-        // (6) Авторизован → snapshot-при-подключении + push-loop. Read-only.
-        run_authorized_session(ws_stream, cfg, claims).await
+        // (6) Авторизован → dispatcher: legacy или v1 сессия.
+        run_dispatched_session(ws_stream, cfg, claims).await
     }
 
     /// Отправить `ServeMsg::Error(msg)` как Text-фрейм и закрыть WS (best-effort).
@@ -344,7 +437,862 @@ pub mod server {
         let _ = ws.close(None).await;
     }
 
-    /// Авторизованная сессия: snapshot → push-loop → обработка клиентских сообщений.
+    // ════════════════════════════════════════════════════════════════════════════
+    // M-65 ws-session: диспетчер legacy/v1 + v1 session.
+    //
+    // Контракт выбора режима (`CT-RFC-09` §2.8):
+    //   - grace-окно: `initial_subscribe_grace_ms` (250 мс по умолчанию, подпись founder'а 11.08);
+    //   - если за окно НЕ пришло сообщение  ⇒ legacy (env-селектор, OLD wire);
+    //   - если в окно пришёл `subscribe` с `v:1`  ⇒ v1-режим, env-селектор НЕ применяется,
+    //     окружается мультиплекс подписок на одном соединении (`O-2, O-9, O-10`);
+    //   - прочее (Ping/garbage/неизвестный op) в grace  ⇒ legacy (съедается как сегодня —
+    //     мы продолжаем обслуживание env-селектором, не v1).
+    //
+    // В обоих режимах соседи подписок одного соединения — ЖИВЫ при отказе (`O-5`); все ошибки
+    // выражены машиночитаемым `code` (`O-6`).
+    // ════════════════════════════════════════════════════════════════════════════
+
+    /// Состояние v1-сессии на одном соединении: владеет `LiveReducer`'ами (по одному на
+    /// подписку), выдаёт их в `spawn_blocking` на pump-цикл и возвращает обратно.
+    /// Один экземпляр на соединение (`F-035-2`).
+    ///
+    /// **M-65 round 2 (М-1/М-2 по `R-057`):** Эта структура — единственный носитель
+    /// состояния подписок на WS-соединении. Раннее `session::Session` с методами
+    /// `add`/`switch`/`remove` было мёртвой половиной (его `Session::new` не вызывался
+    /// ни в одном месте, и инварианты шапки модуля дублировались здесь с тонкими
+    /// расхождениями — те самые, что составили `R-057` Б-2/М-1). Round 2 удалил
+    /// мёртвую структуру; модуль `session.rs` теперь содержит только тип `Sub` и
+    /// валидатор `validate_selector`, которые эта структура действительно использует.
+    ///
+    /// **DET-I-1 (детерминированный выбор на тик).** Контейнер — `BTreeMap`, не `HashMap`:
+    /// итерация по `BTreeMap` упорядочена по ключу, тогда как `HashMap` зависит от
+    /// hash-функции `String` (RANDOM-STATE), которая на разных прогонах даёт разный порядок.
+    /// `red_ws_session::O-2` проверяет, что ОБЕ подписки получают кадры; при `HashMap` порядок
+    /// итерации гуляет, и при выборе `iter().next()` (как в реализации до M-65 round 2)
+    /// только ОДНА из подписок получала кадры (`R-057` Б-1: «за 5 c кадров: a=21, b=0»).
+    /// См. `gates.md` §8 — «доменный код не итерирует HashMap без сортировки в редьюсерах».
+    /// Тип JoinHandle для v1-выполнения pump'a (`Б-1` мультиплекс, `R-057`). Каждый pump —
+    /// `spawn_blocking`-future, возвращающая `(sub_id, Result<...>)`; `FuturesUnordered`
+    /// собирает их в одну очередь завершения для `select!` без per-id веток.
+    pub type V1PumpJoin = tokio::task::JoinHandle<(String, V1PumpResult)>;
+    /// Результат v1-pump'a: ok = (live, frames, gen_at_pump); err = боксированный
+    /// (live, ошибка, gen_at_pump). `gen_at_pump` проброшен ОБОИМИ ветками — возвращающий код
+    /// сравнивает его с текущим `gens[id]` и при расхождении ОТБРАСЫВАЕТ результат.
+    /// `live` пробрасывается как `gateway::LiveReducer`, а не как `session::Sub` (развязка А
+    /// §10.2: pump не владеет `Sub` — только `LiveReducer`, временно вынутый из карты).
+    ///
+    /// Задача 13 §12 N-7: `new_cursor` и `stats` УДАЛЕНЫ из кортежа. v1-путь их не читает
+    /// (per-sub курсор живёт внутри `LiveReducer`, `stats` не surfасится клиенту) — раньше
+    /// они приходили как `_new_cursor` / `_stats` и тут же дропались. Комментарий
+    /// в `run_v1_session_loop`, оправдывающий их присутствие («остался в типе возврата...
+    /// используется ниже по коду (через `_stats` и для будущих мультиплексных сценариев)»),
+    /// врёт: `_stats` тоже дропается, а «будущие сценарии» в природе не появились.
+    pub type V1PumpResult = Result<
+        (gateway::LiveReducer, Vec<crate::_gw::Frame>, u64),
+        Box<(gateway::LiveReducer, std::io::Error, u64)>,
+    >;
+    /// Тип FuturesUnordered, агрегирующий in-flight pump'ы. `BTreeSet<String>` отдельно
+    /// (поле `pending_ids`) — id'ы в полёте; используется для дешёвой проверки «уже качается»
+    /// перед новым spawn_blocking.
+    pub type V1PumpFutures = futures_util::stream::FuturesUnordered<V1PumpJoin>;
+
+    pub struct SessionInner {
+        /// Подписки на соединении. `BTreeMap` — детерминированный обход и тест «выбор на тик»
+        /// (DET-I-1, `R-057` Б-1).
+        ///
+        /// M-65 round 3 (R-086 §10.2 развязка А): подписка НЕ изымается из карты на
+        /// время pump'а. `Sub::live` берётся ОПЦИОНАЛЬНО (`Option::take`) и возвращается
+        /// обратно на завершении pump'а — сам же `Sub` остаётся в карте всё время жизни.
+        /// Тем самым `contains_key(id) == true` всегда (кроме момента между `unsubscribe`
+        /// и возвратом in-flight pump'а), и клиентский `subscribe` идёт по SWITCH, а не ADD.
+        subs: std::collections::BTreeMap<String, session::Sub>,
+        /// id'ы sub'ов, для которых в-полнёте pump должен быть отброшен по завершении
+        /// (race с `unsubscribe`: пока pump читает журнал, клиент успел снять sub;
+        /// результат такого pump'a содержит кадры старого `LiveReducer`'a и НЕ должен
+        /// быть доставлен клиенту). `drain*` ниже снимает пометку при завершении pump'a.
+        /// `BTreeSet` — для предсказуемого порядка итерации (DET-I-1).
+        draining_ids: std::collections::BTreeSet<String>,
+        /// In-flight pumps — JoinHandle'ы от `spawn_blocking` для КАЖДОЙ активной подписки.
+        /// `FuturesUnordered` даёт одну ветку `select!`, ожидающую ЛЮБОГО завершения —
+        /// без него пришлось бы держать фиксированный массив `pending: [Option<JoinHandle>; 16]`
+        /// (`max_subscriptions_per_connection`), и каждое соединение получило бы
+        /// `select!` с 16 ветвями.
+        pending: V1PumpFutures,
+        /// id'ы, у которых сейчас есть in-flight pump — для дешёвой проверки «качать на тик»
+        /// (задача #2 / `O-2` / `R-057` Б-1: «выбор подписки на тик ДЕТЕРМИНИРОВАН»). На тик
+        /// pump'ятся ВСЕ подписки без in-flight pump'а. `BTreeSet` — детерминированный обход.
+        pending_ids: std::collections::BTreeSet<String>,
+        /// BINDING (M-65 §10.2 развязка Б): `generation` живёт ВНЕ `Sub` — отдельная
+        /// карта `id → gen`. Инкрементируется при switch (sub заменён), удаляется при
+        /// `unsubscribe`. pump фиксирует `gen_at_pump` при старте, сверяет с текущим
+        /// `gens[id]` на возврате — расхождение = sub был switch/remove во время блокирующего
+        /// чтения, результат ОТБРАСЫВАЕТСЯ.
+        ///
+        /// Запрет §10.2 ЯВНЫЙ: «починка инкрементом `generation` внутри `Sub`» лечит симптом
+        /// (сравнение копии с самой собой — `sub.generation` перемещён в замыкание и при
+        /// возврате сравнивается сам с собой) и НЕ лечит корень (ADD вместо SWITCH из-за
+        /// `subs.remove` на время pump'а). Развязка А устраняет корень (sub не изымается);
+        /// развязка Б — дополнение-страж, ловящий расхождение состояния.
+        ///
+        /// **Лимит считается по `subs.len()`, а НЕ по отдельному счётчику** (§10.2 явно):
+        /// рассинхрон двух величин, одна из которых производная, и есть источник N-1
+        /// findings такого рода (`:823` +=1 без парного декремента при pump'е in-flight).
+        gens: std::collections::BTreeMap<String, u64>,
+        /// `cfg` хранится для доступа к `journal_dir` / `filter` / `ckpt_dir` внутри
+        /// `spawn_blocking`-замыканий, где `Arc<ServeConfig>` — единственный `'static`-
+        /// безопасный источник этих ресурсов.
+        cfg: Arc<ServeConfig>,
+    }
+
+    /// Диспетчер legacy/v1. Вызывает `run_authorized_session` (legacy) или новую
+    /// `run_v1_session` (v1) в зависимости от grace-окна и первого клиентского сообщения.
+    ///
+    /// Вызывается из `handle_conn` после успешной JWT-проверки; до handshake-окна не доходит.
+    async fn run_dispatched_session<S>(
+        ws: WebSocketStream<S>,
+        cfg: Arc<ServeConfig>,
+        claims: super::auth::Claims,
+    ) -> std::io::Result<()>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        // CT-RFC-09 §2.8: grace-окно — runtime-конфиг (`GATEWAY_INITIAL_SUBSCRIBE_GRACE_MS`,
+        // дефолт 250 мс). Читаем из атомика, выставленного `serve_config_from_env` при старте.
+        // Раньше жило в `const GRACE_MS: u64 = 250` здесь — задача 13 N-3 вынесла в env.
+        let grace_ms = effective_grace_ms();
+        let mut ws = ws;
+        let timer = tokio::time::sleep(Duration::from_millis(grace_ms));
+        tokio::pin!(timer);
+
+        // Решение о режиме принимается по первому КЛИЕНТСКОМУ сообщению в grace.
+        let mut first_msg_result: Option<Result<Message, tokio_tungstenite::tungstenite::Error>> =
+            None;
+        let mut grace_expired = false;
+        tokio::select! {
+            _ = &mut timer => { grace_expired = true; }
+            m = ws.next() => {
+                first_msg_result = m;
+            }
+        }
+
+        // Клиент мог закрыть соединение ИЛИ прислать ping (что не считается v1-транзакцией).
+        // Обрабатываем оба случая ПЕРЕД решением. `None` (grace истёк, клиент ничего не
+        // прислал) — НОРМАЛЬНЫЙ путь в legacy-режим, НЕ закрытие.
+        let mut first_text_bytes: Option<Vec<u8>> = None;
+        let close_after_grace: bool = match first_msg_result {
+            Some(Ok(Message::Text(t))) => {
+                first_text_bytes = Some(t.into_bytes());
+                false
+            }
+            Some(Ok(Message::Binary(b))) => {
+                first_text_bytes = Some(b);
+                false
+            }
+            Some(Ok(Message::Ping(p))) => {
+                let _ = ws.send(Message::Pong(p)).await;
+                false
+            }
+            Some(Ok(Message::Close(_))) => true,
+            Some(Ok(_)) => false,
+            Some(Err(_)) => true,
+            None => false, // клиент ничего не прислал до grace — это НЕ close
+        };
+        if close_after_grace {
+            let _ = ws.close(None).await;
+            return Ok(());
+        }
+
+        // Решение о режиме: если первое сообщение — это попытка v1-протокола (любая
+        // форма, включая невалидные `v` или `op` — клиент тем самым ЗАЯВИЛ, что
+        // говорит на v1, и обязан получить ответ в NEW wire), переходим в v1-сессию.
+        // Иначе — legacy (env-селектор, OLD wire).
+        //
+        // Признак «v1-попытки»: JSON-сообщение, содержащее поле `op`. Это включает
+        // валидный `subscribe`/`unsubscribe`, а также `{"op":"subscribe","v":0,…}`
+        // (O-3: неизвестная версия) и `{"op":"foo",…}` (O-3: неизвестная op) — оба
+        // обязаны ответить `error` в NEW wire, не уходить молча в legacy.
+        let mut is_v1_attempt = false;
+        if let Some(data) = &first_text_bytes {
+            // Грубая проверка: есть поле `op`? Это и есть «попытка v1».
+            if let Ok(v) = serde_json::from_slice::<Value>(data) {
+                if v.get("op").is_some() {
+                    is_v1_attempt = true;
+                }
+            }
+        }
+
+        if grace_expired || !is_v1_attempt {
+            // Legacy path: прошлое поведение, env-селектор, OLD wire. Сообщение, если было,
+            // отбрасывается — клиент ещй не перешёл в v1.
+            return run_authorized_session(ws, cfg, claims).await;
+        }
+
+        // V1 path. Передаём данные первого сообщения в v1-сессию для разбора.
+        let data = first_text_bytes.expect("is_v1_attempt ⇒ data Some");
+        run_v1_session(ws, cfg, claims, data).await
+    }
+
+    /// V1-сессия (`CT-RFC-09` §2): первое сообщение — `subscribe` с `v:1` (проверено вызывающим).
+    /// Парсит, добавляет подписку, отправляет snapshot; дальше — select! цикл.
+    async fn run_v1_session<S>(
+        ws: WebSocketStream<S>,
+        cfg: Arc<ServeConfig>,
+        claims: super::auth::Claims,
+        first_msg_data: Vec<u8>,
+    ) -> std::io::Result<()>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        let (mut sink, stream) = ws.split();
+
+        // Парсим первое сообщение (валидируется вызывающим; здесь только разбираем).
+        let parsed = match wire_v1::parse_message(&first_msg_data) {
+            Ok(p) => p,
+            Err(e) => {
+                let code = parse_error_code(&e);
+                let msg = parse_error_message(&e);
+                send_v1_error(&mut sink, None, code, &msg).await;
+                return Ok(());
+            }
+        };
+
+        // Создаём пустую v1-сессию.
+        let mut inner = SessionInner {
+            subs: std::collections::BTreeMap::new(),
+            draining_ids: std::collections::BTreeSet::new(),
+            pending: futures_util::stream::FuturesUnordered::new(),
+            pending_ids: std::collections::BTreeSet::new(),
+            gens: std::collections::BTreeMap::new(),
+            cfg: Arc::clone(&cfg),
+        };
+
+        // Обрабатываем первое `subscribe`.
+        if let Err(reason) = handle_v1_message(&parsed, &mut inner, &mut sink).await {
+            tracing::debug!(error = %reason, "v1 first subscribe rejected");
+            // Все ошибки в `handle_v1_message` уже отправлены клиенту через sink;
+            // дополнительных действий не требуется.
+        }
+
+        run_v1_session_loop(stream, sink, inner, claims).await
+    }
+
+    /// Обработать один клиентский msg (subscribe/unsubscribe). Все ошибки возвращаются
+    /// строкой-описанием; ответ с `code` уже отправлен клиенту через sink.
+    async fn handle_v1_message<S>(
+        msg: &wire_v1::ClientMessage,
+        inner: &mut SessionInner,
+        sink: &mut S,
+    ) -> Result<(), String>
+    where
+        S: futures_util::Sink<Message> + Unpin,
+        <S as futures_util::Sink<Message>>::Error: std::fmt::Display,
+    {
+        match msg {
+            wire_v1::ClientMessage::Subscribe {
+                id,
+                selector: sel_val,
+                ..
+            } => {
+                let id_for_closure = id.clone();
+                // Парсим `selector` (JSON → `gateway::Selector`) — ошибки `unknown_venue` /
+                // `invalid_selector` различаются здесь.
+                let sel_val = match sel_val {
+                    Some(v) => v,
+                    None => {
+                        send_v1_error(sink, Some(id), "invalid_selector", "missing selector field")
+                            .await;
+                        return Err(format!("missing selector for id {id}"));
+                    }
+                };
+                let sel = match wire_v1::parse_selector(sel_val) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        let code = e.code();
+                        let msg = match &e {
+                            wire_v1::SelectorError::UnknownVenue(name) => {
+                                format!("unknown venue: {name}")
+                            }
+                            wire_v1::SelectorError::Invalid(s) => s.clone(),
+                        };
+                        send_v1_error(sink, Some(id), code, &msg).await;
+                        return Err(format!("invalid selector: {msg}"));
+                    }
+                };
+                // Валидируем selector локально (O-7: пустой symbol / bands вне диапазона /
+                // дубли / bands не отсортированы / timeframe_ms ≤ 0 / выравнивание по UTC).
+                // Делаем ДО spawn_blocking, чтобы не делать дорогой `resume` для заведомо
+                // невалидного входа.
+                if let Err(err_text) = session::validate_selector(&sel) {
+                    let msg = format!("{err_text:?}");
+                    send_v1_error(sink, Some(id), "invalid_selector", &msg).await;
+                    return Err(format!("invalid selector: {msg}"));
+                }
+                // Два пути:
+                // (а) id УЖЕ есть в `inner.subs` — СМЕНА селектора существующей подписки (§2.4).
+                //     drop старый LiveReducer, build новый, отдать новый snapshot. cap не меняется;
+                //     отсутствующий в журнале новый селектор → empty snapshot (§2.7 последняя строка).
+                // (б) id новый — ADD с проверкой cap.
+                let path_clone = inner.cfg.journal_dir.clone();
+                let filter_clone = inner.cfg.filter.clone();
+                let ckpt_clone = inner
+                    .cfg
+                    .checkpoint_dir
+                    .as_deref()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_default();
+                let sel_for_resume = sel.clone();
+                let max_subs = effective_max_subs();
+                if inner.subs.contains_key(id.as_str()) {
+                    // (а) SWITCH: build новый LiveReducer, заменяем sub в карте АТОМАРНО.
+                    //
+                    // M-65 round 3 (R-086 §10.2 развязка А): до этой правки sub ИЗЫМАЛСЯ из
+                    // карты на время pump'а (`tick`-ом) и `contains_key` здесь возвращал
+                    // `false` ⇒ код уходил по ветке ADD вместо SWITCH, нарушая §2.4
+                    // буквально. С развязкой А sub остаётся в карте с `live: None` на время
+                    // pump'а, и `contains_key` корректно возвращает `true` ⇒ ветка SWITCH
+                    // исполняется по назначению. «Вставлять обратно» уже нечего — новый sub
+                    // замещает старый на ту же запись карты, а in-flight pump (если есть)
+                    // обнаружит расхождение generation'а на возврате и ОТБРОСИТ свой `live`,
+                    // а не затрёт новый.
+                    let (snap, new_sub) =
+                        match tokio::task::spawn_blocking(move || -> io::Result<_> {
+                            let (live, _stats) = gateway::LiveReducer::resume(
+                                &path_clone,
+                                filter_clone,
+                                &sel_for_resume,
+                                ckpt_clone.as_path(),
+                            )?;
+                            let snap = live.snapshot();
+                            Ok((
+                                snap,
+                                session::Sub {
+                                    id: id_for_closure,
+                                    selector: sel_for_resume,
+                                    live: Some(live),
+                                },
+                            ))
+                        })
+                        .await
+                        {
+                            Ok(Ok(pair)) => pair,
+                            Ok(Err(e)) => {
+                                send_v1_error(
+                                    sink,
+                                    Some(id),
+                                    "invalid_selector",
+                                    &format!("resume failed: {e}"),
+                                )
+                                .await;
+                                return Err(format!("resume failed: {e}"));
+                            }
+                            Err(join_err) => {
+                                send_v1_error(
+                                    sink,
+                                    Some(id),
+                                    "invalid_selector",
+                                    &format!("blocking task join failed: {join_err}"),
+                                )
+                                .await;
+                                return Err(format!("join failed: {join_err}"));
+                            }
+                        };
+                    let switched_id = new_sub.id.clone();
+                    let old = inner.subs.insert(switched_id.clone(), new_sub);
+                    // Старый sub дропнут через замену в карте. Если сейчас есть в-полёте
+                    // pump на старом sub (в `pending`), его результат после await вернёт
+                    // `LiveReducer` старого селектора; проверка generation'а на возврате
+                    // (`gens[id]` инкрементирован НИЖЕ) отбросит его, а не затрёт новый.
+                    drop(old);
+                    // BINDING (§10.2 развязка Б): инкремент `gens[id]` АТОМАРЕН с заменой
+                    // sub в карте — оба происходят в одном плече `select!`, между ними
+                    // не может вклиниться ни pump-completion (он ждёт `inner`), ни новый
+                    // `subscribe`. Поведение: pump в полёте (с захваченным `gen_at_pump`)
+                    // видит на возврате `current_gen = gens[id]+1 ≠ gen_at_pump` ⇒ ОТБРАСЫВАЕТ
+                    // свой `live`, а не замещает новый.
+                    let next_gen = inner
+                        .gens
+                        .entry(switched_id.clone())
+                        .and_modify(|g| *g += 1)
+                        .or_insert(1);
+                    debug_assert!(*next_gen >= 1, "generation must be ≥ 1 after switch");
+                    let snap_msg = wire_v1::snapshot_msg(&switched_id, &snap);
+                    let snap_text = match serde_json::to_string(&snap_msg) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::debug!(error = %e, "switch snapshot serialize failed");
+                            return Err("snapshot serialize failed".to_string());
+                        }
+                    };
+                    if sink.send(Message::Text(snap_text)).await.is_err() {
+                        return Err("client disconnected during switch snapshot send".to_string());
+                    }
+                    tracing::debug!(sub = %switched_id, "v1 subscribe (switch) ok");
+                    return Ok(());
+                }
+
+                // (б) ADD новой подписки с проверкой cap.
+                // M-65 §10.2: лимит считается по `subs.len()` — НЕ по отдельному счётчику
+                // (`:823` +=1 без парного декремента при ADD-в-полёте был источником N-1).
+                if inner.subs.len() >= max_subs {
+                    send_v1_error(
+                        sink,
+                        Some(id),
+                        "subscription_cap_exceeded",
+                        &format!(
+                            "max subscriptions per connection reached ({max_subs}); unsubscribe to free capacity"
+                        ),
+                    )
+                    .await;
+                    return Err(format!("cap exceeded for id {id}"));
+                }
+                let (snap, new_sub) = match tokio::task::spawn_blocking(move || -> io::Result<_> {
+                    let (live, _stats) = gateway::LiveReducer::resume(
+                        &path_clone,
+                        filter_clone,
+                        &sel_for_resume,
+                        ckpt_clone.as_path(),
+                    )?;
+                    let snap = live.snapshot();
+                    Ok((
+                        snap,
+                        session::Sub {
+                            id: id_for_closure,
+                            selector: sel_for_resume,
+                            live: Some(live),
+                        },
+                    ))
+                })
+                .await
+                {
+                    Ok(Ok(pair)) => pair,
+                    Ok(Err(e)) => {
+                        send_v1_error(
+                            sink,
+                            Some(id),
+                            "invalid_selector",
+                            &format!("resume failed: {e}"),
+                        )
+                        .await;
+                        return Err(format!("resume failed: {e}"));
+                    }
+                    Err(join_err) => {
+                        send_v1_error(
+                            sink,
+                            Some(id),
+                            "invalid_selector",
+                            &format!("blocking task join failed: {join_err}"),
+                        )
+                        .await;
+                        return Err(format!("join failed: {join_err}"));
+                    }
+                };
+                let id_for_insert = new_sub.id.clone();
+                // M-65 round 2 Б-2 (`R-057`): снимаем `draining_ids`-пометку на этот id
+                // ВСЕГДА при успешной подписке. Иначе «вечное надгробие» (`R-057`: «помеченный
+                // id глушит любую будущую подписку с тем же именем») сохраняется от предыдущего
+                // `unsubscribe`, и клиент, законно переиспользующий id при перерисовке виджета
+                // (§2.2 «id назначает клиент»), получает sub, который тут же отбрасывается при
+                // первом завершении in-flight pump'а. Симметрия с unsubscribe (там пометка
+                // ВСЕГДА ставится — см. ниже).
+                inner.draining_ids.remove(&id_for_insert);
+                inner.subs.insert(id_for_insert.clone(), new_sub);
+                // M-65 §10.2 развязка Б: `gens[id]` заводится здесь (0 для нового), инкремент
+                // для switch'а, удаление для unsubscribe — см. ниже. Лимит считается по
+                // `subs.len()`; этот счётчик — отдельная величина, рассинхрон с `subs` запрещён
+                // и при switch'е ловится сравнением `current_gen == gen_at_pump` на возврате pump'а.
+                inner.gens.entry(id_for_insert.clone()).or_insert(0);
+                let snap_msg = wire_v1::snapshot_msg(&id_for_insert, &snap);
+                let snap_text = match serde_json::to_string(&snap_msg) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::debug!(error = %e, "snapshot serialize failed");
+                        return Err("snapshot serialize failed".to_string());
+                    }
+                };
+                if sink.send(Message::Text(snap_text)).await.is_err() {
+                    return Err("client disconnected during snapshot send".to_string());
+                }
+                tracing::debug!(sub = %id_for_insert, "v1 subscribe ok");
+                Ok(())
+            }
+            wire_v1::ClientMessage::Unsubscribe { id, .. } => {
+                let id_str = id.clone();
+                // Сценарий (O-10): unsubscribe может прийти ВО ВРЕМЯ in-flight pump'a
+                // — в этот момент sub изъят из карты (`tick`-ом), и `subs.remove`
+                // вернёт None. Это НЕ «неизвестный id», а «sub был тут минуту
+                // назад, сейчас на нём висит pump». Если pump вернётся и положит
+                // sub обратно — клиент, думающий что подписка снята, получит лишние
+                // кадры. Защита: всегда добавляем id в `draining_ids`, независимо от
+                // того, известен sub или нет. Pump'a-completion прочтёт пометку и
+                // отбросит результат (вместо put back в карту).
+                inner.draining_ids.insert(id_str.clone());
+                let in_subs = inner.subs.remove(&id_str).is_some();
+                let in_flight = inner.pending_ids.contains(&id_str);
+                let was_known = in_subs || in_flight;
+                if !was_known {
+                    // Сесссионный (не per-sub) отказ — `sub` ставим `null`, чтобы
+                    // assertion (`!tail.iter().any(|v| sub_of(v) == Some("gone"))` после
+                    // unsubscribe) не ловил наш error как «поток по этой подписке
+                    // продолжился». Совпадает с §2.7 (сессионные ошибки не
+                    // привязаны к конкретному id).
+                    //
+                    // M-65 round 2 Б-2 (`R-057`): для НЕизвестного id пометка снимается —
+                    // пометка обещала «in-flight pump сейчас завершится и должен быть
+                    // отброшен», а при `!was_known` такого pump'а НЕ существует. Без
+                    // снятия пометка осталась бы до конца соединения ненужным state'ом.
+                    inner.draining_ids.remove(&id_str);
+                    send_v1_error(sink, None, "unknown_id", "no such subscription id").await;
+                    return Err(format!("unknown id {id_str}"));
+                }
+                // M-65 round 2 Б-2 (`R-057`): если in-flight pump'a на этот id НЕТ, пометка
+                // снимается СРАЗУ — иначе она остаётся до завершения pump'a (которого нет)
+                // и при будущей подписке с тем же id глушит её. На in-flight пути пометка
+                // остаётся: pump'a-completion прочтёт её и отбросит результат. Без этого
+                // разделения `draining_ids` превращается в «вечное надгробие» — id, помеченный
+                // при unsubscribe, больше никогда не подпишется полноценно (R-057: «помеченный
+                // id глушит любую будущую подписку с тем же именем»).
+                if !in_flight {
+                    inner.draining_ids.remove(&id_str);
+                }
+                // M-65 §10.2 развязка Б: удаление записи `gens[id_str]` гарантирует, что любой
+                // in-flight pump (с захваченным `gen_at_pump`) видит `current_gen == None` —
+                // расхождение, результат отбрасывается. Альтернатива «инкремент + оставить»
+                // функционально эквивалентна, но удаление чище (нет накопления мёртвых gens).
+                // Лимит при этом считается по `subs.len()` — отдельный счётчик не ведём
+                // (§10.2 явно; рассинхрон — источник N-1).
+                inner.gens.remove(&id_str);
+                tracing::debug!(sub = %id_str, "v1 unsubscribe ok");
+                Ok(())
+            }
+        }
+    }
+
+    /// Преобразование `wire_v1::ParseError` в машиночитаемый код для error-сообщения.
+    /// Задача 13 §12 N-5: варианты `NotTextPayload` и `MalformedSelector` удалены из
+    /// `ParseError` (не конструировались ни в одном месте — `grep -rnE "NotTextPayload\("
+    /// crates/gateway-serve/` пуст; `MalformedSelector(...)` тоже). Их ветки тут были
+    /// мёртвым кодом и источником ложной уверенности.
+    fn parse_error_code(e: &wire_v1::ParseError) -> &'static str {
+        match e {
+            wire_v1::ParseError::UnknownVersion { .. } => "unknown_version",
+            wire_v1::ParseError::UnknownShape(_) => "unknown_op",
+            wire_v1::ParseError::InvalidJson(_) => "invalid_selector",
+            wire_v1::ParseError::MissingSelector => "invalid_selector",
+        }
+    }
+
+    /// `wire_v1::ParseError` → человеческое сообщение. Достаточно для лога; клиент
+    /// машиночитаемо различает по `code`.
+    fn parse_error_message(e: &wire_v1::ParseError) -> String {
+        match e {
+            wire_v1::ParseError::UnknownVersion { found } => match found {
+                Some(v) => format!("protocol version {v} not supported (only v=1)"),
+                None => "missing protocol version field 'v' (only v=1 supported)".to_string(),
+            },
+            wire_v1::ParseError::UnknownShape(s) => format!("unknown message shape: {s}"),
+            wire_v1::ParseError::InvalidJson(s) => format!("invalid JSON: {s}"),
+            wire_v1::ParseError::MissingSelector => {
+                "missing selector field in subscribe".to_string()
+            }
+        }
+    }
+
+    /// Отправить error-сообщение в NEW wire (`{type:"error", v:1, sub, code, message}`).
+    async fn send_v1_error<S>(sink: &mut S, sub: Option<&str>, code: &str, message: &str)
+    where
+        S: futures_util::Sink<Message> + Unpin,
+        <S as futures_util::Sink<Message>>::Error: std::fmt::Display,
+    {
+        let v = wire_v1::error_msg(sub, code, message);
+        let text = match serde_json::to_string(&v) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        // Не паникуем на ошибке sink — клиент мог уже отвалиться.
+        let _ = sink.send(Message::Text(text)).await;
+    }
+
+    /// Основной цикл v1-сессии. Подписки добавляются/снимаются через `handle_v1_message`;
+    /// на каждом тике — pump всех subs (`CT-RFC-09` §2.4: кадры прежнего селектора после
+    /// смены запрещены — переключение реализовано как drop+rebuild в `switch`). Мультиплекс
+    /// на одном соединении, каждый Frame с `sub=<id>`.
+    async fn run_v1_session_loop<W>(
+        mut stream: futures_util::stream::SplitStream<WebSocketStream<W>>,
+        mut sink: futures_util::stream::SplitSink<WebSocketStream<W>, Message>,
+        mut inner: SessionInner,
+        claims: super::auth::Claims,
+    ) -> std::io::Result<()>
+    where
+        W: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        use futures_util::StreamExt;
+        const PUSH_INTERVAL_MS: u64 = 250;
+        const PUSH_MAX_EVENTS: usize = 256;
+        let mut push_tick = tokio::time::interval(Duration::from_millis(PUSH_INTERVAL_MS));
+        push_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        // M-65 round 2 Б-1 (`R-057`): типы вынесены в module-level псевдонимы
+        // (`V1PumpJoin`/`V1PumpResult` выше), чтобы удовлетворить `clippy::type_complexity`
+        // (один JoinHandle<Result<5-tuple>> в сигнатуре структуры — порог комплексности).
+        type V1PumpBody = (String, V1PumpResult);
+        // M-65 round 2 Б-1 (`R-057`): мультиплекс на одном соединении. ОДНА in-flight pump
+        // на соединение (как раньше) давала только одной подписке кадры на тик, остальные
+        // жили одним снапшотом. Теперь pump'ятся ВСЕ подписки без in-flight pump'а на КАЖДОМ
+        // тике; результаты ждут в `FuturesUnordered` и обрабатываются по мере завершения.
+        // `pending_ids` (`BTreeSet`) — для дешёвой проверки «у этого sub'а уже есть pump».
+        // Без `stream` фичи futures-util пришлось бы заводить массив `pending: [Option<
+        // JoinHandle>; 16]` и плодить ветки select! — `FuturesUnordered` даёт ОДНУ ветку.
+        // NOTE: heartbeat-кадр УДАЛЁН в M-65 round 2 (`Б-3`): `R-057` + architect-решение
+        // `M-65-ws-session.md` §4.2bis. Фикстура сама порождает события после подписки,
+        // реализация проводную форму не расширяет. Клиент, читающий `at_ms`, не получает
+        // 1970-01-01 от синтетики; цена egress'а по DESIGN §16 (311 байт × 4/с × 10k ≈
+        // 100 Мбит/с чистой пустоты) снята.
+        loop {
+            tokio::select! {
+                // Приоритет: клиентские сообщения.
+                msg = stream.next() => {
+                    match msg {
+                        None => return Ok(()),
+                        Some(Err(e)) => {
+                            tracing::debug!(error = %e, sub = %claims.sub, "v1 ws read error");
+                            return Ok(());
+                        }
+                        Some(Ok(Message::Ping(p))) => {
+                            let _ = sink.send(Message::Pong(p)).await;
+                        }
+                        Some(Ok(Message::Close(_))) => return Ok(()),
+                        Some(Ok(Message::Pong(_))) | Some(Ok(Message::Frame(_))) => {}
+                        Some(Ok(Message::Text(t))) => {
+                            let bytes = t.into_bytes();
+                            match wire_v1::parse_message(&bytes) {
+                                Ok(parsed) => {
+                                    let _ = handle_v1_message(&parsed, &mut inner, &mut sink).await;
+                                }
+                                Err(e) => {
+                                    let code = parse_error_code(&e);
+                                    let msg = parse_error_message(&e);
+                                    send_v1_error(&mut sink, None, code, &msg).await;
+                                }
+                            }
+                        }
+                        Some(Ok(Message::Binary(b))) => {
+                            match wire_v1::parse_message(&b) {
+                                Ok(parsed) => {
+                                    let _ = handle_v1_message(&parsed, &mut inner, &mut sink).await;
+                                }
+                                Err(e) => {
+                                    let code = parse_error_code(&e);
+                                    let msg = parse_error_message(&e);
+                                    send_v1_error(&mut sink, None, code, &msg).await;
+                                }
+                            }
+                        }
+                    }
+                }
+                // M-65 round 2 Б-1 (`R-057`): на тик — pump ВСЕХ подписок без in-flight pump'а.
+                // Раньше здесь брался `subs.iter().next()` — ПЕРВАЯ по итерации HashMap (недетерм.)
+                // подписка, и удерживалась единственным `pending: Option`. Теперь итерация по
+                // BTreeMap (детерм.) и для каждого id без pending — отдельный spawn_blocking.
+                //
+                // M-65 round 3 (R-086 §10.2 развязка А): pump НЕ ИЗЫМАЕТ `Sub` из карты —
+                // берётся только `live` (`Option::take`). Сам `Sub` остаётся в карте с
+                // `live: None` на время pump'а. `contains_key` возвращает `true` всё
+                // время ⇒ клиентский `subscribe` идёт по SWITCH, а не ADD (см. блокер §2
+                // R-086). На возврате `live` кладётся обратно в тот же `Sub`, если
+                // `gens[id]` не изменился (т.е. не было switch/remove в-полёте).
+                _ = push_tick.tick() => {
+                    let ids: Vec<String> = inner
+                        .subs
+                        .keys()
+                        .filter(|id| !inner.pending_ids.contains(*id))
+                        .cloned()
+                        .collect();
+                    for id in ids {
+                        // Берём `live` ОПЦИОНАЛЬНО. Если уже pump в полёте (после
+                        // `pending_ids.contains` гонки с предыдущим `pending.insert`
+                        // между фильтром и `take`) — пропуск; следующий тик подхватит.
+                        let Some(mut live) =
+                            inner.subs.get_mut(&id).and_then(|s| s.live.take())
+                        else {
+                            continue;
+                        };
+                        // Генерация фиксируется ДО `pending_ids.insert`. Если между этим
+                        // моментом и завершением pump'а придёт `unsubscribe` — gens[id]
+                        // удалится (`current_gen = None ≠ gen_at_pump`).
+                        let gen_at_pump = inner.gens.get(&id).copied().unwrap_or(0);
+                        let cfg2 = Arc::clone(&inner.cfg);
+                        let id_for_pump = id.clone();
+                        let handle: V1PumpJoin = tokio::task::spawn_blocking(move || {
+                            // M-65 §10.3: точка синхронизации для оракула на гонку
+                            // «switch × in-flight pump». В тестовой сборке pump СИГНАЛИТ
+                            // «вошёл» и ЖДЁТ разрешения; на прод-путь не влияет
+                            // (compile без #[cfg(any(test, feature = "testing"))] ⇒ блок пуст, JIT не видит).
+                            //
+                            // BINDING: вызов из `spawn_blocking`. Condvar-вариант
+                            // (см. `crates/gateway-serve/src/test_sync.rs`) специально
+                            // выбран БЛОКИРУЮЩИМ, чтобы не вешать tokio-worker
+                            // `block_on`-ожиданием.
+                            #[cfg(any(test, feature = "testing"))]
+                            {
+                                let id_for_sync = id_for_pump.clone();
+                                crate::test_sync::rendezvous::pump_signal_and_wait(&id_for_sync);
+                            }
+                            let outcome: V1PumpResult = match live.pump(
+                                cfg2.journal_dir.as_path(),
+                                cfg2.filter.clone(),
+                                PUSH_MAX_EVENTS,
+                            ) {
+                                // Задача 13 §12 N-7: `new_cursor` и `stats` из `pump()` больше
+                                // не пробрасываются — v1-путь их не использует (см. `V1PumpResult`).
+                                Ok((frames, _new_cursor, _stats)) => {
+                                    Ok((live, frames, gen_at_pump))
+                                }
+                                Err(e) => Err(Box::new((live, e, gen_at_pump))),
+                            };
+                            (id_for_pump, outcome)
+                        });
+                        inner.pending.push(handle);
+                        inner.pending_ids.insert(id);
+                    }
+                }
+                // Любой завершившийся pump: `FuturesUnordered::next()` возвращает первый
+                // готовый (порядок FIFO внутри структуры; для обработки это несущественно —
+                // каждый id обрабатывается самостоятельно).
+                Some(join_result) = inner.pending.next(), if !inner.pending.is_empty() => {
+                    let join_result: Result<V1PumpBody, tokio::task::JoinError> = join_result;
+                    let (id, outcome) = match join_result {
+                        Ok(pair) => pair,
+                        Err(join_err) => {
+                            tracing::error!(
+                                error = %join_err,
+                                "v1 blocking pump task panicked — закрываем соединение"
+                            );
+                            return Ok(());
+                        }
+                    };
+                    inner.pending_ids.remove(&id);
+                    match outcome {
+                        // Задача 13 §12 N-7: `_new_cursor` / `_stats` удалены из кортежа
+                        // (см. `V1PumpResult`).
+                        Ok((live, frames, gen_at_pump)) => {
+                            // ═════ РЕШАЮЩИЙ INVARIANT: «OLD PUMP НЕ ЗАТИРАЕТ NEW SUB» ═════
+                            //
+                            // ДО фикса (R-086 блокер §2) следующий сценарий воспроизводился:
+                            //   1. tick: `subs.remove("w1")` ⇒ содержимое `w1` изъято из карты;
+                            //   2. клиент: `subscribe(w1, ETH)` ⇒ `contains_key("w1") == false`
+                            //      ⇒ ветка ADD, а не SWITCH;
+                            //   3. `inner.subs_count += 1` БЕЗ парного декремента на step 1;
+                            //   4. pump (BTC) возвращается: generation внутри Sub ТОЖЕ РАВНА 0
+                            //      (поле унесено в замыкание, сверка `0 != 0` ложна);
+                            //   5. `inner.subs.insert("w1", old_btc_sub)` ⇒ НОВЫЙ ETH-sub
+                            //      ЗАТЁРТ старым BTC, и `subs_count` БОЛЬШЕ НЕ равен `subs.len()`.
+                            //
+                            // ПОСЛЕ фикса (этот код, R-086 §10.2 развязки А+Б):
+                            //   1. tick: `subs.get_mut("w1").live.take()` ⇒ sub остаётся в карте
+                            //      с `live: None`;
+                            //   2. клиент: `subscribe(w1, ETH)` ⇒ `contains_key("w1") == true`
+                            //      ⇒ ветка SWITCH, `gens["w1"] += 1` (было 0, стало 1);
+                            //   3. pump возвращается: `gen_at_pump = 0` (захвачен на старте),
+                            //      `current_gen = Some(1)`;
+                            //   4. `live_keeps = !drained && current_gen == Some(gen_at_pump)`
+                            //      = `false` ⇒ `drop(live)`, новый ETH-Sub НЕ ТРОНУТ;
+                            //   5. лимит считается по `subs.len()`, отдельный счётчик не ведётся.
+                            //
+                            // Конструкция обладает СВОЙСТВОМ, которого оракулы и мутанты не
+                            // пиннили: злонамеренный или гончный pump НЕ МОЖЕТ поместить свой
+                            // live обратно в sub, чьё состояние изменилось после старта pump'а.
+                            // Это структурное свойство, а не эвристика.
+                            //
+                            // `draining_ids`-проверка: `unsubscribe` в-полёте ⇒ отбрасываем.
+                            // `gens` уже удалён в `unsubscribe`, проверка `current_gen` ниже
+                            // дала бы то же; раздельные флаги — для симметрии с `R-057` Б-2
+                            // (пометка снимается СРАЗУ, если in-flight pump'а нет).
+                            let drained = inner.draining_ids.remove(&id);
+                            let current_gen = inner.gens.get(&id).copied();
+                            // Sub всё ещё «наш» (=не удалён, не switch'нут) ТОЛЬКО если
+                            // generation at-pump равен текущему. Это одновременно ловит
+                            // (а) switch в-полёте — `gens[id] += 1`, (б) unsubscribe в-полёте
+                            // — `gens[id]` удалён, `current_gen == None ≠ Some(gen_at_pump)`.
+                            let live_keeps = !drained && current_gen == Some(gen_at_pump);
+                            if let Some(sub) = inner.subs.get_mut(&id) {
+                                if live_keeps {
+                                    sub.live = Some(live);
+                                } else {
+                                    drop(live);
+                                }
+                            } else {
+                                // Sub окончательно удалён между pump-completion и нашим
+                                // возвратом (теоретическая гонка). Кадры не шлём, live
+                                // дропаем.
+                                drop(live);
+                            }
+                            if !live_keeps {
+                                if drained {
+                                    tracing::debug!(sub = %id, "v1 pump result dropped: sub drained");
+                                } else {
+                                    tracing::debug!(
+                                        sub = %id,
+                                        "v1 pump result dropped: stale generation (switch/remove)"
+                                    );
+                                }
+                                continue;
+                            }
+                            // Шлём полученные кадры (от `pump`).
+                            //
+                            // M-65 round 2 Б-3 (`R-057` + architect-решение §4.2bis в
+                            // `milestones/M-65-ws-session.md`): синтетический heartbeat-кадр
+                            // на каждый pump УДАЛЁН. Решение architect'а: фикстура сама
+                            // порождает события после подписки, реализация проводную форму
+                            // НЕ расширяет. Задача 13 §12 N-7: лживая ссылка на
+                            // "`new_cursor`... используется ниже по коду (через `_stats`)"
+                            // удалена — `new_cursor` и `stats` выкинуты из `V1PumpResult`,
+                            // v1-путь их не использует.
+                            for frame in frames {
+                                let frame_msg = wire_v1::frame_msg(&id, &frame);
+                                let text = match serde_json::to_string(&frame_msg) {
+                                    Ok(s) => s,
+                                    Err(_) => continue,
+                                };
+                                if sink.send(Message::Text(text)).await.is_err() {
+                                    return Ok(());
+                                }
+                            }
+                        }
+                        Err(boxed) => {
+                            let (live, e, gen_at_pump) = *boxed;
+                            tracing::error!(
+                                error = %e,
+                                sub = %id,
+                                "v1 LiveReducer::pump failed — sub продолжит молча"
+                            );
+                            // Даже на pump-ошибке пробуем вернуть `live` в карту, если sub
+                            // всё ещё наш по generation. Иначе просто дропаем.
+                            let drained = inner.draining_ids.remove(&id);
+                            let current_gen = inner.gens.get(&id).copied();
+                            let live_keeps = !drained && current_gen == Some(gen_at_pump);
+                            if let Some(sub) = inner.subs.get_mut(&id) {
+                                if live_keeps {
+                                    sub.live = Some(live);
+                                } else {
+                                    drop(live);
+                                }
+                            } else {
+                                drop(live);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// LEGACY сессия (`CT-RFC-09` §2.5): один env-селектор из `cfg.selector`, форма
+    /// `ServeMsg::{Snapshot,Frame,Error}` (JS-декодируемо, без `sub`/`v`/`type`). Запускается
+    /// если клиент не прислал `subscribe` с `v:1` в grace-окне ИЛИ прислал что-то иное.
+    /// Используется `wsprobe` и существующими прод-замерами — до первого релиза фронта.
+    ///
+    /// Тело изолировано от v1-кода, потому что общая логика select! (legacy pump vs v1
+    /// per-sub pump) слишком разная: legacy — один `LiveReducer`, v1 — карта per-id.
     async fn run_authorized_session<S>(
         ws: WebSocketStream<S>,
         cfg: Arc<ServeConfig>,
@@ -483,6 +1431,29 @@ pub mod server {
         let mut pending_read: Option<PendingRead> = None;
         let mut live: Option<crate::_gw::LiveReducer> = Some(live);
 
+        // M-65 ws-session (`CT-RFC-09` §2.8 гибридный случай): legacy-сессия читает
+        // клиентские v1-сообщения и добавляет/снимает подписки в `v1_session_inner`. Legacy
+        // env-stream и v1 session живут параллельно (legacy данные идут в OLD wire,
+        // v1 subs — в NEW wire) — оси 7/5 (изоляция/соседи) внутри v1 session.
+        let mut v1_session_inner = super::server::SessionInner {
+            subs: std::collections::BTreeMap::new(),
+            draining_ids: std::collections::BTreeSet::new(),
+            pending: futures_util::stream::FuturesUnordered::new(),
+            pending_ids: std::collections::BTreeSet::new(),
+            gens: std::collections::BTreeMap::new(),
+            cfg: Arc::clone(&cfg),
+        };
+        // M-65 round 2 Б-1 (`R-057`): legacy-путь (v1 subs внутри legacy сессии) использует
+        // ТЕ ЖЕ типы, что и v1-путь (`V1PumpJoin`/`V1PumpResult`) — никакой разницы в форме
+        // pump'а между режимами, только в канале отправки (legacy `Sink<...>` общий).
+        type LegacyV1PumpBody = (String, V1PumpResult);
+        // M-65 round 2 Б-1 (`R-057`): см. `run_v1_session_loop`. На тик — pump ВСЕХ v1-подписок
+        // без in-flight pump'а; параллельно с legacy env-stream (тот по-прежнему один на тик).
+        use futures_util::stream::FuturesUnordered;
+        let mut pending_v1: FuturesUnordered<V1PumpJoin> = FuturesUnordered::new();
+        let mut push_tick_v1 = tokio::time::interval(Duration::from_millis(PUSH_INTERVAL_MS));
+        push_tick_v1.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
         loop {
             tokio::select! {
                 // Клиент отключился / ошибка приёма → выходим НЕМЕДЛЕННО (не дожидаясь
@@ -504,11 +1475,151 @@ pub mod server {
                             let _ = sink.send(Message::Pong(p)).await;
                         }
                         Some(Ok(Message::Close(_))) => return Ok(()),
-                        Some(Ok(Message::Text(_))) | Some(Ok(Message::Binary(_))) => {
-                            // MVP: replay-контролы НЕ реализованы (только чтение).
-                            // Будущие фреймы с cursor/window будут интерпретироваться здесь.
+                        Some(Ok(Message::Text(t))) => {
+                            let bytes = t.into_bytes();
+                            Server::parse_and_dispatch_v1_message(
+                                &bytes,
+                                &mut v1_session_inner,
+                                &mut sink,
+                            ).await;
+                        }
+                        Some(Ok(Message::Binary(b))) => {
+                            Server::parse_and_dispatch_v1_message(
+                                &b,
+                                &mut v1_session_inner,
+                                &mut sink,
+                            ).await;
                         }
                         Some(Ok(Message::Pong(_))) | Some(Ok(Message::Frame(_))) => {}
+                    }
+                }
+                // v1 subs pumps (параллельно с legacy env-stream, см. Б-1): пока legacy не занят,
+                // pump ВСЕХ v1-подписок без in-flight pump'а за тик. BTreeMap идёт детерминированно.
+                //
+                // M-65 round 3 (R-086 §10.2 развязка А): pump НЕ ИЗЫМАЕТ `Sub` из карты —
+                // берётся только `live` (`Option::take`); сам `Sub` остаётся в карте.
+                // Семантика generation — в `v1_session_inner.gens`. Тест rendezvous (§10.3)
+                // живёт в той же `cfg(test)`-точке, что и в `run_v1_session_loop`.
+                _ = push_tick_v1.tick(), if pending_read.is_none() => {
+                    let ids: Vec<String> = v1_session_inner
+                        .subs
+                        .keys()
+                        .filter(|id| !v1_session_inner.pending_ids.contains(*id))
+                        .cloned()
+                        .collect();
+                    for id in ids {
+                        let Some(mut live) = v1_session_inner
+                            .subs
+                            .get_mut(&id)
+                            .and_then(|s| s.live.take())
+                        else {
+                            continue;
+                        };
+                        let gen_at_pump = v1_session_inner.gens.get(&id).copied().unwrap_or(0);
+                        let cfg2 = Arc::clone(&cfg);
+                        let id_for_pump = id.clone();
+                        let handle: V1PumpJoin = tokio::task::spawn_blocking(move || {
+                            #[cfg(any(test, feature = "testing"))]
+                            {
+                                let id_for_sync = id_for_pump.clone();
+                                crate::test_sync::rendezvous::pump_signal_and_wait(&id_for_sync);
+                            }
+                            let outcome: V1PumpResult = match live.pump(
+                                cfg2.journal_dir.as_path(),
+                                cfg2.filter.clone(),
+                                PUSH_MAX_EVENTS,
+                            ) {
+                                // Задача 13 §12 N-7: `new_cursor` и `stats` из `pump()` больше
+                                // не пробрасываются — legacy_v1-путь их не использует
+                                // (см. `V1PumpResult`).
+                                Ok((frames, _new_cursor, _stats)) => {
+                                    Ok((live, frames, gen_at_pump))
+                                }
+                                Err(e) => Err(Box::new((live, e, gen_at_pump))),
+                            };
+                            (id_for_pump, outcome)
+                        });
+                        v1_session_inner.pending.push(handle);
+                        v1_session_inner.pending_ids.insert(id);
+                    }
+                }
+                Some(join_result_v1) = pending_v1.next(),
+                    if !pending_v1.is_empty() && pending_read.is_none() =>
+                {
+                    let join_result_v1: Result<LegacyV1PumpBody, tokio::task::JoinError> =
+                        join_result_v1;
+                    let (id, outcome) = match join_result_v1 {
+                        Ok(pair) => pair,
+                        Err(join_err) => {
+                            tracing::error!(
+                                error = %join_err,
+                                "legacy v1 blocking pump task panicked — закрываем соединение"
+                            );
+                            return Ok(());
+                        }
+                    };
+                    v1_session_inner.pending_ids.remove(&id);
+                    // Задача 13 §12 N-7: `_new_cursor` / `_stats` удалены из кортежа
+                    // (см. `V1PumpResult`).
+                    match outcome {
+                        Ok((live, frames, gen_at_pump)) => {
+                            // Аналогично v1-pump-completion в `run_v1_session_loop`: sub живёт,
+                            // кладём `live` обратно в sub.live по месту (`subs.get_mut`), ЕСЛИ
+                            // generation не разошёлся. Расхождение = switch/remove в-полёте ⇒
+                            // результат отбрасывается, `live` дропается, кадры не шлём.
+                            let drained = v1_session_inner.draining_ids.remove(&id);
+                            let current_gen = v1_session_inner.gens.get(&id).copied();
+                            let live_keeps = !drained && current_gen == Some(gen_at_pump);
+                            if let Some(sub) = v1_session_inner.subs.get_mut(&id) {
+                                if live_keeps {
+                                    sub.live = Some(live);
+                                } else {
+                                    drop(live);
+                                }
+                            } else {
+                                drop(live);
+                            }
+                            if !live_keeps {
+                                if drained {
+                                    tracing::debug!(sub = %id, "legacy v1 pump result dropped: drained");
+                                } else {
+                                    tracing::debug!(
+                                        sub = %id,
+                                        "legacy v1 pump result dropped: stale generation"
+                                    );
+                                }
+                                continue;
+                            }
+                            for frame in frames {
+                                let frame_msg = wire_v1::frame_msg(&id, &frame);
+                                if let Ok(text) = serde_json::to_string(&frame_msg) {
+                                    if sink.send(Message::Text(text)).await.is_err() {
+                                        return Ok(());
+                                    }
+                                }
+                            }
+                            // M-65 round 2 Б-3: см. замечание в `run_v1_session_loop`. Синтетический
+                            // heartbeat УДАЛЁН по architect-решению `M-65-ws-session.md` §4.2bis.
+                            // Задача 13 §12 N-7: `new_cursor`/`stats` тут тоже дропались — теперь
+                            // их в `V1PumpResult` нет, этот комментарий остаётся только про
+                            // heartbeat.
+                        }
+                        Err(boxed) => {
+                            let (live, e, gen_at_pump) = *boxed;
+                            tracing::error!(error = %e, sub = %id, "legacy v1 pump err");
+                            let drained = v1_session_inner.draining_ids.remove(&id);
+                            let current_gen = v1_session_inner.gens.get(&id).copied();
+                            let live_keeps = !drained && current_gen == Some(gen_at_pump);
+                            if let Some(sub) = v1_session_inner.subs.get_mut(&id) {
+                                if live_keeps {
+                                    sub.live = Some(live);
+                                } else {
+                                    drop(live);
+                                }
+                            } else {
+                                drop(live);
+                            }
+                        }
                     }
                 }
                 // Периодический тик: запускаем НОВОЕ блокирующее чтение, только если
@@ -629,7 +1740,7 @@ pub mod server {
 pub mod _gw {
     pub use gateway::{
         frames_since, snapshot, snapshot_from_checkpoint, Cursor, Frame, LiveReducer, ReadStats,
-        Selector, Snapshot,
+        Selector, SeriesBundle, Snapshot, GATEWAY_SCHEMA_VERSION,
     };
 }
 
@@ -751,6 +1862,90 @@ pub fn serve_config_from_env(
         Some(s) if s.trim().is_empty() => None,
         Some(s) => Some(std::path::PathBuf::from(s.trim())),
     };
+
+    // M-65 (CT-RFC-09 §2.6, подпись founder'а 11.08 = 16): `max_subscriptions_per_connection`.
+    // Fail-closed (`gates.md`: «parse-error → unbounded — запрещено»): unset → дефолт 16; невалидное
+    // значение (мусор, пустая строка, `0`, отрицательное) — отказ СТАРТА (шаг `L` гейта). Соединение,
+    // которому нельзя подписаться ни на что — тихо сломанный сервер; клиентский cap=0 отдаёт узел
+    // одному клиенту при цели 10 000 подключений, и это дефект.
+    //
+    // Хранение: вместо добавления поля в `ServeConfig` (сломало бы существующие тесты с
+    // фиксированной формой литерала `ServeConfig { ... }`), значение сохраняется в
+    // модульный atomic `server::EFFECTIVE_MAX_SUBS` и читается на каждом соединении.
+    // Atomic-доступ виден всем соединениям процесса; `serve_config_from_env` устанавливает
+    // значение ровно один раз при старте.
+    let max_subs: usize = match get("GATEWAY_MAX_SUBSCRIPTIONS") {
+        // CT-RFC-09 §2.6: переменная ОБЯЗАНА быть задана. Дефолт 16 живёт в docker-compose.yml
+        // (`:145`), а не в коде — спрятанный дефолт не видит тот, кто разворачивает, и проявляется
+        // не как поломка, а как «странно, почему потолок 16». Снятие «пусто ⇒ ошибка / отсутствует
+        // ⇒ дефолт» (задача 13 N-2): оба неполных состояния конфигурации ведут себя одинаково —
+        // «частично заданная конфигурация» не имеет двух законных форм.
+        None => {
+            return Err(
+                "GATEWAY_MAX_SUBSCRIPTIONS is required (CT-RFC-09 §2.6); дефолт 16 живёт в \
+                 docker-compose.yml:145 — задайте переменную явно"
+                    .to_string(),
+            );
+        }
+        Some(s) if s.trim().is_empty() => {
+            return Err(
+                "GATEWAY_MAX_SUBSCRIPTIONS is required (CT-RFC-09 §2.6); пустая строка — то же \
+                 отсутствие, что и None; дефолт 16 живёт в docker-compose.yml:145"
+                    .to_string(),
+            );
+        }
+        Some(s) => {
+            let trimmed = s.trim();
+            // Парсим как usize; `.parse::<usize>()` отвергает отрицательные и нечисловые значения.
+            // Но «0» парсится успешно и невалиден по §2.6 (`целое >= 1`) — отвергаем отдельно.
+            match trimmed.parse::<usize>() {
+                Ok(0) => {
+                    return Err(format!(
+                        "GATEWAY_MAX_SUBSCRIPTIONS={trimmed} невалидно: должно быть >= 1 \
+                         (CT-RFC-09 §2.6)"
+                    ));
+                }
+                Ok(n) => n,
+                Err(e) => {
+                    return Err(format!("GATEWAY_MAX_SUBSCRIPTIONS parse: {e}"));
+                }
+            }
+        }
+    };
+    server::set_effective_max_subs(max_subs);
+
+    // CT-RFC-09 §2.8 (задача 13 N-3): `initial_subscribe_grace_ms` — конфиг. Дефолт 250 мс
+    // (подпись founder'а 11.08). ОТСУТСТВИЕ переменной ЗАКОННО (в отличие от N-2: §2.8 прямо
+    // называет дефолт, §2.6 — нет). Невалидное значение (`0`, мусор, пробелы) ⇒ отказ
+    // старта — тот же fail-closed, что и для остальных конфигов гейта («parse-error →
+    // unbounded запрещено»). Минимум — 1 мс: 0 обнулил бы окно, и v1-режим был бы
+    // недостижим ни при каких условиях.
+    let grace_ms: u64 = match get("GATEWAY_INITIAL_SUBSCRIBE_GRACE_MS") {
+        None => 250_u64,
+        Some(s) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                return Err(
+                    "GATEWAY_INITIAL_SUBSCRIBE_GRACE_MS must not be empty (CT-RFC-09 §2.8); \
+                     дефолт 250 живёт в коде, не в compose"
+                        .to_string(),
+                );
+            }
+            match trimmed.parse::<u64>() {
+                Ok(0) => {
+                    return Err(format!(
+                        "GATEWAY_INITIAL_SUBSCRIBE_GRACE_MS={trimmed} невалидно: должно быть >= 1 \
+                         (CT-RFC-09 §2.8; 0 обнулил бы окно)"
+                    ));
+                }
+                Ok(n) => n,
+                Err(e) => {
+                    return Err(format!("GATEWAY_INITIAL_SUBSCRIBE_GRACE_MS parse: {e}"));
+                }
+            }
+        }
+    };
+    server::set_effective_grace_ms(grace_ms);
 
     Ok(server::ServeConfig {
         addr,
