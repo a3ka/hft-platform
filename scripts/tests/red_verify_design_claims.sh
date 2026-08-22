@@ -592,6 +592,204 @@ scenario_archive_exclusion_still_holds() {
   fi
 }
 
+# ---------------------------------------------------------------------------
+# Сценарии V-АРХИВ — архивный класс вердиктов (решение founder'а 2026-08-22, `TD-064`).
+# Анти-плацебо в ТРИ стороны, потому что у исключения три способа быть неверным:
+#   V-1  вердикт с мёртвой `docs/*.md` ссылкой не роняет гейт. ЧТО ИМЕННО он пиннит —
+#        названо точно, потому что первый прогон мутаций показал обратное ожидаемому:
+#        снятие исключения его НЕ роняет (check4 обходит только `docs/` и до вердиктов не
+#        доходит ни с исключением, ни без). Он пиннит ГРАНИЦУ ПРИ РАСШИРЕНИИ ОХВАТА —
+#        то есть ровно ту альтернативу, которую founder отверг: мутация «check4 обходит
+#        весь репозиторий» + исключение на месте → V-1 зелен; та же мутация со снятым
+#        исключением → V-1 краснеет. Вакуумным он не является, но и сегодняшнее поведение
+#        check4 он не доказывает;
+#   V-2  вердикт с битой ссылкой на раздел не роняет check3 (исключение симметрично —
+#        до решения check3 обходил весь репозиторий и вердикты СУДИЛ, а check4 ходил
+#        только по docs/ и не судил; асимметрия была случайной);
+#   V-3  ГРАНИЦА: `research/reports/**` — НЕ вердикт и остаётся под судом. Без этого
+#        сценария расширение исключения на весь `research/` прошло бы незамеченным;
+#   V-4  объявление называет ВЕСЬ класс и берёт его из того же `VERDICT_CLASS_DIRS`,
+#        которым делается исключение. Прежняя редакция пиннила СЧЁТЧИК (число мёртвых
+#        ссылок); счётчик снят из наблюдателя после двух адверсарных кругов — `R-100` F-1
+#        и `R-101` F-1/F-2/F-3 нашли четыре обманных стаба, и все четыре были про число,
+#        ни один про исключение. Число фальсифицируемо по трём независимым осям (величина,
+#        каталог, множество файлов), пиннится дороже, чем стоит, и никем не используется:
+#        по решению founder'а вердикт стареет ЗАКОННО.
+# Литерал `DESIGN.md` + `§` + номер подряд не пишется (см. сценарий 4): check3 сканирует
+# .sh, и проба нашла бы собственный пример как настоящую битую ссылку.
+# ---------------------------------------------------------------------------
+scenario_verdict_class_dead_doc_ref_excluded() {
+  local d="${TMP_BASE}/vclass1"
+  build_good_fixture "${d}"
+  { echo "# C-99 — вердикт, цитирующий улику"
+    echo "Гейт ругался на \`docs/GHOSTVERDICT.md\` — файла нет, и это НОРМА для вердикта."
+  } > "${d}/research/critiques/C-99-cite.md"
+  # F-3 (`R-100`): ассерт НЕГАТИВНЫЙ («гейт не покраснел»), поэтому сорвавшаяся запись
+  # фикстуры оставила бы сценарий зелёным на пустоте. Свидетель setup обязателен.
+  [ -s "${d}/research/critiques/C-99-cite.md" ] || { fail "V-1: фикстура не создана — setup"; return; }
+  local out rc
+  out="$(run_verify "${d}")"; rc=$?
+  if [ "${rc}" -eq 0 ] && ! echo "${out}" | grep -q 'FAIL.*GHOSTVERDICT'; then
+    pass "V-1 (вердикт с мёртвой docs-ссылкой): исключение держится, exit=${rc}"
+  else
+    fail "V-1: ОЖИДАЛСЯ exit=0 без FAIL по GHOSTVERDICT (exit=${rc}):"
+    echo "${out}" | sed 's/^/      /'
+  fi
+}
+
+scenario_verdict_class_broken_section_ref_excluded() {
+  local d="${TMP_BASE}/vclass2"
+  build_good_fixture "${d}"
+  local fake_section="97"
+  { echo "# R-99 — вердикт, цитирующий битую ссылку на раздел"
+    printf 'Цитата вывода гейта: DESIGN.md §%s.\n' "${fake_section}"
+  } > "${d}/research/reviews/R-99-cite.md"
+  [ -s "${d}/research/reviews/R-99-cite.md" ] || { fail "V-2: фикстура не создана — setup"; return; }
+  local out rc
+  out="$(run_verify "${d}")"; rc=$?
+  if [ "${rc}" -eq 0 ] && ! echo "${out}" | grep -q '3-ССЫЛКИ.*97'; then
+    pass "V-2 (вердикт с битой ссылкой на раздел): check3 его не судит, exit=${rc}"
+  else
+    fail "V-2: ОЖИДАЛСЯ exit=0 без FAIL [3-ССЫЛКИ] §97 (exit=${rc}):"
+    echo "${out}" | sed 's/^/      /'
+  fi
+}
+
+scenario_verdict_class_does_not_leak_to_reports() {
+  local d="${TMP_BASE}/vclass3"
+  build_good_fixture "${d}"
+  mkdir -p "${d}/research/reports"
+  local fake_section="96"
+  { echo "# отчёт — НЕ вердикт, судится наравне со всеми"
+    printf 'Утверждение отчёта: DESIGN.md §%s.\n' "${fake_section}"
+  } > "${d}/research/reports/R-99-report.md"
+  local out rc
+  out="$(run_verify "${d}")"; rc=$?
+  if [ "${rc}" -ne 0 ] && echo "${out}" | grep -q 'FAIL  \[3-ССЫЛКИ\].*§96'; then
+    pass "V-3 (research/reports вне класса): граница держится, гейт краснеет, exit=${rc}"
+  else
+    fail "V-3: ОЖИДАЛСЯ FAIL [3-ССЫЛКИ] §96 — исключение протекло на весь research/ (exit=${rc}):"
+    echo "${out}" | sed 's/^/      /'
+  fi
+}
+
+
+
+# --- F-2 (`R-100`, блокер): матрица КЛАСС × ПРОВЕРКА была не закрыта. Класс — три каталога,
+# но единственная проверка, которая СЕГОДНЯ реально доходит до `research/` (check3, обходит
+# весь root), была запиннена только для `reviews/` (V-2). Выпадение `critiques/` или
+# `arbitration/` из кортежа проходило всю пробу зелёным — и на реальном дереве тоже, потому
+# что битых `§`-ссылок там сегодня нет. Регресс обнаружился бы следующим красным на
+# аудит-артефакте, то есть ровно тем отложенным взрывом, который правка объявила снятым.
+scenario_verdict_class_declaration_names_all_dirs() {
+  # Заменяет два прежних СЧЁТНЫХ сценария (V-4/V-7). Счётчик снят из наблюдателя после двух
+  # адверсарных кругов: `R-100` F-1 и `R-101` F-1/F-2/F-3 нашли четыре обманных стаба, и все
+  # четыре были про число, ни один — про исключение. Пиннить осталось одно: объявление
+  # называет ВЕСЬ класс и берёт его из того же `VERDICT_CLASS_DIRS`, которым исключение и
+  # делается. Один носитель ⇒ расходиться нечему.
+  local d="${TMP_BASE}/vclass4"
+  build_good_fixture "${d}"
+  mkdir -p "${d}/research/arbitration"
+  echo "# A-99 — файл нужен, чтобы каталог существовал и попал в объявление" \
+    > "${d}/research/arbitration/A-99-cite.md"
+  [ -s "${d}/research/arbitration/A-99-cite.md" ] || { fail "V-4: фикстура не создана — setup"; return; }
+  local out rc line
+  out="$(run_verify "${d}")"; rc=$?
+  line="$(echo "${out}" | grep 'V-АРХИВ' || true)"
+  if [ "${rc}" -eq 0 ] \
+     && echo "${line}" | grep -q 'research/critiques/' \
+     && echo "${line}" | grep -q 'research/reviews/' \
+     && echo "${line}" | grep -q 'research/arbitration/'; then
+    pass "V-4 (объявление называет весь класс): три каталога в INFO, exit=${rc}"
+  else
+    fail "V-4: ОЖИДАЛИСЬ все три каталога класса в INFO [V-АРХИВ] (exit=${rc}):"
+    echo "${line:-<строки V-АРХИВ нет>}" | sed 's/^/      /'
+  fi
+}
+
+scenario_verdict_class_declaration_equals_tuple() {
+  # `R-102` F-1/F-2 (блокеры). V-4 пиннил объявление СНИЗУ: «каждый из трёх назван».
+  # Инвариант конструкции сильнее — `объявление ≡ кортеж`, и верхней границы не было:
+  #   NC1  `present + ["research/reports/"]`      -> 0 FAIL: INFO ЛЖЁТ, что reports исключён;
+  #   mc8b печать заменена литералом трёх имён    -> 0 FAIL: объявление больше НЕ читает
+  #        константу, то есть возвращается второй носитель — невидимо для пробы.
+  # Мой собственный стаб MC8 (замена на `research/`) падал только потому, что терял имена
+  # со слэшами; в теле коммита `5939258` строка «MC8 объявление захардкожено -> V-4 FAILED»
+  # была сформулирована ШИРЕ того, что реально прогонялось, и адверсарий её фальсифицировал.
+  #
+  # Закрытие КОНЕЧНО и матрицу не растит: одна фикстура, в которой класс представлен
+  # НЕПОЛНО, а рядом лежит каталог ВНЕ класса. Объявление обязано назвать ровно то, что
+  # есть и входит в класс:
+  #   * нет `arbitration/`   => не назван  (валит и `present = list(VERDICT_CLASS_DIRS)`,
+  #                                         и литерал трёх имён);
+  #   * есть `reports/`      => не назван  (валит дописывание лишнего к `present`).
+  local d="${TMP_BASE}/vclass8"
+  build_good_fixture "${d}"          # каркас несёт critiques/ и reviews/, arbitration/ — НЕТ
+  mkdir -p "${d}/research/reports"
+  echo "# отчёт — НЕ вердикт, под судом, в объявлении класса ему не место" \
+    > "${d}/research/reports/R-98-report.md"
+  [ -s "${d}/research/reports/R-98-report.md" ] || { fail "V-7: фикстура не создана — setup"; return; }
+  [ ! -d "${d}/research/arbitration" ] || { fail "V-7: каркас неожиданно создал arbitration/ — setup"; return; }
+  local out rc line
+  out="$(run_verify "${d}")"; rc=$?
+  line="$(echo "${out}" | grep 'V-АРХИВ' || true)"
+  if [ "${rc}" -eq 0 ] \
+     && echo "${line}" | grep -q 'research/critiques/' \
+     && echo "${line}" | grep -q 'research/reviews/' \
+     && ! echo "${line}" | grep -q 'research/arbitration/' \
+     && ! echo "${line}" | grep -q 'research/reports/'; then
+    pass "V-7 (объявление ≡ кортеж): назван ровно наличный класс, лишнего нет, exit=${rc}"
+  else
+    fail "V-7: объявление обязано назвать critiques+reviews и НЕ называть ни arbitration \
+(его нет), ни reports (он вне класса) (exit=${rc}):"
+    echo "${line:-<строки V-АРХИВ нет>}" | sed 's/^/      /'
+  fi
+}
+
+scenario_verdict_class_critiques_pinned_for_check3() {
+  local d="${TMP_BASE}/vclass5"
+  build_good_fixture "${d}"
+  local fake_section="95"
+  { echo "# C-98 — вердикт в critiques, цитирующий битую ссылку на раздел"
+    printf 'Цитата вывода гейта: DESIGN.md §%s.\n' "${fake_section}"
+  } > "${d}/research/critiques/C-98-cite.md"
+  [ -s "${d}/research/critiques/C-98-cite.md" ] || { fail "V-5: фикстура не создана — setup"; return; }
+  local out rc
+  out="$(run_verify "${d}")"; rc=$?
+  if [ "${rc}" -eq 0 ] && ! echo "${out}" | grep -q '3-ССЫЛКИ.*95'; then
+    pass "V-5 (critiques × check3): каталог запиннен отдельно, exit=${rc}"
+  else
+    fail "V-5: ОЖИДАЛСЯ exit=0 без FAIL [3-ССЫЛКИ] §95 — critiques выпал из класса (exit=${rc}):"
+    echo "${out}" | sed 's/^/      /'
+  fi
+}
+
+scenario_verdict_class_arbitration_pinned_for_check3() {
+  local d="${TMP_BASE}/vclass6"
+  build_good_fixture "${d}"
+  mkdir -p "${d}/research/arbitration"
+  local fake_section="94"
+  { echo "# A-98 — арбитраж, цитирующий битую ссылку на раздел"
+    printf 'Цитата вывода гейта: DESIGN.md §%s.\n' "${fake_section}"
+  } > "${d}/research/arbitration/A-98-cite.md"
+  [ -s "${d}/research/arbitration/A-98-cite.md" ] || { fail "V-6: фикстура не создана — setup"; return; }
+  local out rc
+  out="$(run_verify "${d}")"; rc=$?
+  if [ "${rc}" -eq 0 ] && ! echo "${out}" | grep -q '3-ССЫЛКИ.*94'; then
+    pass "V-6 (arbitration × check3): каталог запиннен отдельно, exit=${rc}"
+  else
+    fail "V-6: ОЖИДАЛСЯ exit=0 без FAIL [3-ССЫЛКИ] §94 — arbitration выпал из класса (exit=${rc}):"
+    echo "${out}" | sed 's/^/      /'
+  fi
+}
+
+# --- F-1 (`R-100`, блокер): у наблюдателя была ОДНА счётная точка (V-4, число 2), и любой
+# стаб, печатающий константу 2, проходил пробу неотличимо от рабочего счёта. Одна точка не
+# отличает счёт от константы В ПРИНЦИПЕ — нужна ВТОРАЯ с ДРУГИМ числом: тогда константа
+# обязана провалить хотя бы одну. Пиннится и число файлов: иначе константа в `n_files`
+# остаётся такой же дырой, только в соседнем поле.
+
+
 # --- граница головы файла пиннится с ОБЕИХ сторон (testing.md §«Дегенерированный вход», п.4).
 # H-FACTS-3 держит верх (маркер вне головы не считается); этот — низ: маркер НА последней
 # строке головы обязан считаться, иначе стаб FACTS_HEAD_LINES=1 проходит незамеченным.
@@ -1632,6 +1830,13 @@ scenario_facts_note_threshold_pinned_below
 scenario_facts_marker_without_head_not_opted_in
 scenario_facts_marked_plan_checked_by_check3
 scenario_archive_exclusion_still_holds
+scenario_verdict_class_dead_doc_ref_excluded
+scenario_verdict_class_broken_section_ref_excluded
+scenario_verdict_class_does_not_leak_to_reports
+scenario_verdict_class_declaration_names_all_dirs
+scenario_verdict_class_declaration_equals_tuple
+scenario_verdict_class_critiques_pinned_for_check3
+scenario_verdict_class_arbitration_pinned_for_check3
 scenario_facts_marker_on_last_head_line_counts
 scenario_facts_sha_fake_fails
 scenario_facts_sha_orphan_fails
