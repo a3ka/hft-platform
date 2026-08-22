@@ -1,0 +1,208 @@
+# M-69 — GW-I-14: fail-closed разбор `GATEWAY_WINDOW_MS` (PL-I-5, риск R7)
+
+- **Статус:** 📝 **PROPOSED** 2026-08-18 — набор architect'а закоммичен, ждёт plan-time критика
+  (`gates.md` §9: новая milestone-спека).
+- **Автор спеки:** architect, 2026-08-18
+- **Базовый HEAD:** `origin/main @ 10bc072`
+- **Ветка:** `feat/M-69-window-guard`
+- **Зона:** read-path (`crates/gateway`, `crates/gateway-serve`). MD-only, ордер-пути нет ⇒
+  RISK-BLOCK (`gates.md` §5) не применяется, risk-critic не требуется.
+- **Инвариант:** новый **GW-I-14** (семейство `GW-I` занято по `GW-I-13`; замер:
+  `grep -rhoE 'GW-I-[0-9]+' crates/ docs/ | sort -u`).
+- **Прецедент-зеркало:** **M-47 / GW-I-10** — тот же файл, тот же класс, то же обоснование.
+- **Предшественник (найден по вердикту `C-099` B-3, а не мной):**
+  `docs/plans/gateway-ws-contract.md:350-355` (03.08) уже описывает ровно этот дефект и
+  заканчивается словами «асимметрия, которую **RED-оракул может атаковать**». Приглашение
+  написать этот оракул лежало в корпусе две недели. Я его не нашёл: грепал `docs/plans/`
+  по ключам процессных барьеров, но не по имени env-переменной, хотя `reading-map.md`
+  §ПРАВИЛО ПРЕДШЕСТВЕННИКА требует греп по ключевому слову ПРЕДМЕТА. Записано как факт, а не
+  как оправдание: это шестой случай того же класса за двое суток.
+
+## Objective
+
+`GATEWAY_WINDOW_MS` — единственная ручка, ограничивающая память свёртки live-кокпита. Сегодня
+её **невалидное значение молча даёт БЕЗГРАНИЧНОЕ окно** — режим, который уже разваливал прод
+(TD-020 / TD-039). Требование обратное и записано в `DESIGN.md:940`:
+
+> **PL-I-5** — «отсутствие/невалидность лимита = **отказ, не unbounded** (урок R7)».
+
+Дефект назван в корпусе и классифицирован **CRIT** (`docs/08-arch-improvement-roadmap.md:35`,
+риск R7): «`GATEWAY_WINDOW_MS` parse-error ТИХО → None=unbounded (OOM-режим, разваливший прод).
+**Единственное отступление от fail-closed**». Там же назван и фикс: «(а) невалидный env → `Err`
+при старте». Милстоун исполняет ровно эту строку — конструкция не изобретается заново.
+
+### Замер: четыре входа сходятся в один режим, легитимен один
+
+`crates/gateway/src/lib.rs:128-140` (`Selector::window_lo_time_s`):
+
+```rust
+let w = self.window_ms?;        // None      → None  (unbounded)
+if w <= 0 { return None; }      // Some(≤0)  → None  (unbounded)
+```
+
+`crates/gateway-serve/src/lib.rs:740-744` (`serve_config_from_env`):
+
+```rust
+Some(s) => s.trim().parse::<i64>().ok(),   // parse-error → None (unbounded)
+```
+
+| вход оператора | сегодня | должно быть |
+|---|---|---|
+| переменная не задана | `None` → unbounded | **сохранить** — легитимный offline (research-cli, replay) |
+| `""` / пробелы | `None` → unbounded | **сохранить** — явное «offline» |
+| `"0"` | `Some(0)` → unbounded | **сохранить**, но ЯВНО: `0` = offline (паритет с argv, см. Дизайн) |
+| **`"abc"`, `"60_000"`, `"60000ms"`** | **`None` → unbounded** | **`Err` на старте** |
+| **`"99999999999999999999"`** (overflow) | **`None` → unbounded** | **`Err` на старте** |
+| **`"-60000"`** | **`Some(-60000)` → unbounded** | **`Err` на старте** |
+
+### Почему это опаснее, чем «одна опечатка»
+
+1. **Инверсия намерения — худший случай.** Оператор, пишущий `99999999999999999999`, хочет
+   окно ПОБОЛЬШЕ. `parse::<i64>` переполняется, `.ok()` глотает ошибку, окна не остаётся
+   ВООБЩЕ. Намерение «больше» исполняется как «без границ» — то есть как OOM-режим.
+2. **Отравление ключа чекпоинта.** `window_ms` входит в `selector_fingerprint`
+   (`crates/gateway/src/lib.rs:2268-2280`, M-38b). `Some(-60000)` даёт ОТЛИЧНЫЙ отпечаток и
+   ведёт себя как unbounded ⇒ чекпоинт, валидный по CRC, снят под режимом, которого оператор
+   не заказывал. Это дословно аргумент срочности M-47 («чекпоинт под невалидным селектором —
+   мусор, выглядящий валидным»).
+3. **Байпас-поверхность полная.** `validate_selector` (`crates/gateway/src/lib.rs:1751-1764`)
+   проверяет ТОЛЬКО `timeframe_ms`; `window_ms` не смотрит ни одна проверка ни на одном входе.
+4. **`(healthy)` при мёртвом смысле.** Контейнер стартует, healthcheck зелёный (TCP-порт),
+   §8 eyes-on видит `(healthy)` — а свёртка растёт неограниченно. Ровно класс, ради которого
+   M-47 и вводил гвард на СТАРТЕ.
+
+### Три асимметрии, которые предъявляются как доказательство дефекта
+
+Все три — внутри одного дифа, поэтому спор «а может, так и задумано» закрывается замером:
+
+| вход | политика сегодня | где |
+|---|---|---|
+| `GATEWAY_TIMEFRAME_MS` | **fail-closed** (`map_err` → `Err` + гвард делимости) | `gateway-serve/src/lib.rs:709-728` |
+| `GATEWAY_BANDS` | **fail-closed** (`map_err` → `Err`) | `gateway-serve/src/lib.rs:730-735` |
+| `GATEWAY_JWT_SECRET` | **fail-closed** (пусто → `Err`); в compose ещё и `${...:?}` | `lib.rs:685-689`, `docker-compose.yml:146` |
+| `--window-ms` (argv чекпоинтера) | **fail-closed** (`map_err` → `Err`) | `gateway-checkpoint.rs:125-129` |
+| **`GATEWAY_WINDOW_MS` (env)** | **fail-open** (`.ok()`) | **`lib.rs:740-744`** |
+
+Тот же `Selector`, два входа — argv отвергает мусор, env проглатывает.
+
+### Форма прода — снята замером (`testing.md` §«Форма прода снимается ЗАМЕРОМ»)
+
+```
+$ ssh … docker inspect hft-gateway-serve --format '{{range .Config.Env}}…'
+GATEWAY_WINDOW_MS=60000        GATEWAY_TIMEFRAME_MS=1000      GATEWAY_VENUE=Binance
+GATEWAY_CHECKPOINT_DIR=/ckpt   GATEWAY_JOURNAL_DIR=/journal   GATEWAY_SYMBOL=BTCUSDT
+
+$ docker-compose.yml:139
+GATEWAY_WINDOW_MS: ${GATEWAY_WINDOW_MS:-60000}
+```
+
+Сегодня прод валиден (`60000`), дефект **латентный**. Но значение приходит из ВНЕШНЕГО env с
+подстановкой `:-`, то есть опечатка в `.env` на VPS попадает в переменную напрямую и не
+задерживается ничем. Для сравнения: `GATEWAY_JWT_SECRET` защищён на уровне compose формой
+`${...:?}` — окно не защищено ни там, ни в коде.
+
+## Дизайн
+
+### Развилка: считать ли `"0"` ошибкой — НЕТ, и это осознанно
+
+`"0"` мог бы отвергаться «для строгости», но это сломало бы паритет с уже существующим
+argv-путём: `gateway-checkpoint.rs:162-163` — «M-37: bounded-window по умолчанию = `Some(60_000)`.
+**`0` ⇒ `None` (offline unbounded)**». То есть `0` — уже принятый в этом коде способ СКАЗАТЬ
+«offline», а не опечатка.
+
+Решение: **offline выражается тремя эквивалентными формами — переменная не задана, пустая
+строка, `0`. Всё остальное обязано быть корректным положительным `i64`; иначе — отказ старта.**
+Так гвард отвергает ровно те входы, которые никто не может хотеть, и не ломает ни один режим,
+который сегодня работает.
+
+### Где живёт гвард — ДВЕ точки, обе обязательны (анти-байпас, урок M-47)
+
+1. **`serve_config_from_env`** — отказ на СТАРТЕ прод-бинаря, чтобы оператор с опечаткой не
+   поднял healthy-контейнер с испорченным смыслом.
+2. **`validate_selector`** — отказ в БИБЛИОТЕКЕ, потому что `Selector` — публичная структура с
+   публичными полями, и её собирают напрямую чекпоинтер (M-38b), будущий shared-tailer (M-39)
+   и research-cli. Гвард только в транспорте оставил бы им байпас — ровно дефект TD-019/TD-020
+   «механизм есть, никто не зовёт», который M-47 уже ловил на этом же файле.
+
+Гвард библиотеки формулируется как: `window_ms == Some(w) && w < 0` → `Err`. `None` и `Some(0)`
+проходят (легитимный offline). Отрицательное значение до `Selector` дойти больше не может.
+
+## Запретный список (`testing.md` §«Спека правки существующего кода»)
+
+| Запрещено | Почему |
+|---|---|
+| Менять семантику `None` → offline unbounded | Легитимный режим research-cli / replay-tutor / чекпоинтера (`lib.rs:99-101`). Его отмена сломает офлайн-инструменты, которые окна не имеют по построению |
+| Отвергать `Some(0)` | Паритет с argv-путём (`gateway-checkpoint.rs:162`), где `0` — принятый способ выразить offline |
+| Трогать `Selector::window_lo_time_s` | Оконная арифметика — предмет M-37/VB-I-10 и `red_gateway_window.rs`; здесь чинится ВХОД, а не поведение окна |
+| Менять `selector_fingerprint` (`lib.rs:2268-2280`) | Ключ чекпоинта M-38b. Смена отпечатка инвалидирует все снятые чекпоинты — цена несопоставима с предметом |
+| Менять форму `Selector` / `#[serde(default)]` | Часть контракта v7 с фронтом (`VB-I-6`, `GS-I-4`); поле уходит на провод. Смена формы = contract-путь, не этот milestone |
+| Трогать гвард `GATEWAY_TIMEFRAME_MS` (GW-I-10) | Соседний инвариант M-47. Регресс по нему обязан ловиться отдельным шагом verify |
+| Трогать `GATEWAY_JWT_SECRET` / `BANDS` / `VENUE` / `ADDR` / `CHECKPOINT_DIR` | Вне предмета; они уже fail-closed либо имеют осознанный дефолт |
+| Менять дефолт прода (`60000`) | `docker-compose.yml:139`. Гвард обязан оставить рабочий прод рабочим |
+| Писать тесты на собственную реализацию | `testing.md`: оракулы sacred, их пишет architect. Dev делает GREEN по этим |
+
+## Allowed paths
+
+Разделение по ролям — закон для scope-гейта (`scope-guard.md`, `gates.md` §4 Block-scope).
+
+| путь | кто правит | что именно |
+|---|---|---|
+| `crates/gateway-serve/src/lib.rs` | **engine-dev** | задачи #1, #2, #4 — разбор env + док-комментарий |
+| `crates/gateway/src/lib.rs` | **engine-dev** | задача #3 — `validate_selector` |
+| `docs/plans/gateway-ws-contract.md` | **architect** (сделано в этом наборе) | задача #5 — синхронизация factual-документа |
+| `crates/gateway-serve/tests/**`, `crates/gateway/tests/**` | **architect only** (sacred) | RED-оракулы; dev не правит даже «неверный» тест |
+| `scripts/verify_M-69.sh` | **architect only** (sacred) | acceptance-гейт |
+| `milestones/M-69-window-guard.md` | **architect only** | dev правит ТОЛЬКО колонку Status в §Tasks |
+
+**Forbidden paths (сверх запретного списка ниже):** `crates/contracts/**` (T1 — только
+contract-RFC), `crates/gateway/src/bin/gateway-checkpoint.rs` (argv-путь уже fail-closed,
+трогать незачем), `docker-compose.yml` (прод-дефолт `60000` валиден и остаётся), любые
+`crates/*` вне двух названных файлов, `Cargo.toml` любого крейта (новых зависимостей задача
+не требует).
+
+## Contract impact
+
+**T1 — НЕ затронут.** `Event`/`EventKind`/`SegmentHeader` не меняются; contract-RFC не требуется
+(`05-contract-layer.md` §4). `Selector` — T2, владеет крейт `gateway`, и его ФОРМА не меняется:
+правится только допустимое МНОЖЕСТВО значений уже существующего поля. Wire-схема
+(`GATEWAY_SCHEMA_VERSION`) не бампается — bump потребовался бы при смене формы, а её нет.
+
+## §Tasks
+
+| # | Status | Задача | Verify | Файлы |
+|---|---|---|---|---|
+| 1 | ⏳ OPEN | `serve_config_from_env`: `GATEWAY_WINDOW_MS` — parse-error и overflow → `Err`, сообщение НАЗЫВАЕТ переменную; `unset`/пусто/`0` → `None` (offline) | `cargo test -p gateway-serve --test red_window_guard_startup` | `crates/gateway-serve/src/lib.rs` |
+| 2 | ⏳ OPEN | Тот же вход: отрицательное значение → `Err` (не «молчаливый unbounded») | тот же оракул | `crates/gateway-serve/src/lib.rs` |
+| 3 | ⏳ OPEN | `validate_selector`: расширить на `window_ms` — `Some(w<0)` → `Err` (анти-байпас для чекпоинтера/shared-tailer/research-cli); `None`/`Some(0)`/`Some(w>0)` проходят | `cargo test -p gateway --test red_window_selector_guard` | `crates/gateway/src/lib.rs` |
+| 4 | ⏳ OPEN | Док-комментарий `serve_config_from_env` приведён к факту: строка «не парсится → offline unbounded» (`lib.rs:676-678`) сегодня описывает дефект как норму | `bash scripts/verify_M-69.sh` шаг 6 | `crates/gateway-serve/src/lib.rs` |
+| 5 | ✅ DONE | **(architect, в этом наборе)** Синхронизирован factual-документ `docs/plans/gateway-ws-contract.md` — ТРИ записи, не две: `:132` (таблица env), `:341` (устаревшая ссылка `docker-compose.yml:128` → `:139`), `:350-355` (замечание для оракула). Документ не помечен историческим и назван «фактура для RED-оракулов» ⇒ после фикса стал бы ложью, тиражируемой в следующие оракулы (класс `TD-155`) | `bash scripts/verify_M-69.sh` шаг 7 | `docs/plans/gateway-ws-contract.md` |
+
+**Канонизация offline (уточнение к задаче #1 по `C-099` B-2).** Три формы — `unset`, пустая
+строка/пробелы, `"0"` — обязаны давать **ровно одно** внутреннее представление
+`selector.window_ms == None`. Недостаточно, чтобы совпадало наблюдаемое поведение
+`window_lo_time_s`: `Some(0)` даёт тот же `None` на выходе, но ДРУГОЙ
+`selector_fingerprint` (`crates/gateway/src/lib.rs:2268-2280`) ⇒ два разных ключа чекпоинта
+для одного и того же режима. Это тот же аргумент, которым отвергается отрицательное
+значение, — критик применил его к нулю, и он верен.
+
+## RED-тесты (sacred, architect-only — dev их НЕ правит)
+
+- `crates/gateway-serve/tests/red_window_guard_startup.rs` — GW-I-14 на СТАРТЕ прод-бинаря.
+- `crates/gateway/tests/red_window_selector_guard.rs` — GW-I-14 в библиотеке (анти-байпас).
+
+Оба обязаны **падать на сегодняшнем коде** (честный RED) и **не падать против переширокой
+заглушки** — парный vantage по `testing.md` п.7: заглушка «всегда `Err`» валится кейсами
+`unset` / `""` / `"0"` / `"60000"`.
+
+## Acceptance
+
+`scripts/verify_M-69.sh` — `VERDICT: PASS` / exit 0. Паритет с CI (`gates.md` §3): `cargo fmt
+--all -- --check` · `cargo clippy --all-targets --all-features -- -D warnings` · `cargo test
+--all`. Минимум одна проверка на каждую задачу §Tasks + регресс-шаг на GW-I-10 (M-47) и на
+`red_serve_window_wiring` (M-37), которые правка обязана оставить зелёными.
+
+## Handoff
+
+Следующий — **critic** (plan-time, `gates.md` §9: новая milestone-спека). Модель — средняя;
+RAW-гейт §1 НЕ применяется: раскладка/формат журнала и `contracts` T1 не затронуты.
+После вердикта — `engine-dev` (зона `crates/gateway*/src/**`, тесты sacred).

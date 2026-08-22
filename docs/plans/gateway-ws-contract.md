@@ -130,7 +130,7 @@
 | `GATEWAY_SYMBOL` | `BTCUSDT` | строка as-is | `lib.rs:576` |
 | `GATEWAY_TIMEFRAME_MS` | `1000` | `i64`; **fail-closed гвард GW-I-10**: `<= 0` или `86_400_000 % tf != 0` → `Err` → exit 2 | `lib.rs:578-597` |
 | `GATEWAY_BANDS` | `0.001` | comma-separated `f64`, ошибка парса → `Err` | `lib.rs:599-604` |
-| `GATEWAY_WINDOW_MS` | `None` | unset/пусто/**не парсится** → `None` (graceful, НЕ ошибка); иначе `Some(i64)` | `lib.rs:609-613` |
+| `GATEWAY_WINDOW_MS` | `None` | `unset`/пусто/`"0"` → `None` (offline, канонизировано); **fail-closed гвард GW-I-14** (M-69): parse-error / переполнение `i64` / отрицательное → `Err` на старте; иначе `Some(положительное)` | `lib.rs:609-613` |
 | `GATEWAY_CHECKPOINT_DIR` | `None` | unset/пусто → `None` (не ошибка) | `lib.rs:618-622` |
 
 Не из env, захардкожено: **`filter: EpochFilter::OwnCaptureOnly`** (`crates/gateway-serve/src/lib.rs:627`).
@@ -339,7 +339,8 @@ pub struct ReadStats { pub events_decoded: u64, pub segments_opened: u32 }
   «иначе ломается VB-I-2 live==replay под нагрузкой»).
 - Эвикция вызывается в конце каждого `Reducer::apply` (`crates/gateway/src/lib.rs:943-945`).
 - `None` → unbounded (offline-режим); `Some(W)` → live-cockpit (`crates/gateway/src/lib.rs:100-104`).
-- Прод: `GATEWAY_WINDOW_MS=60000` (`docker-compose.yml:128`) ⇒ ~60 бакетов при `timeframe_ms=1000`.
+- Прод: `GATEWAY_WINDOW_MS=60000` (`docker-compose.yml:139`; замер на VPS 2026-08-18 подтверждает
+  то же значение в живом контейнере) ⇒ ~60 бакетов при `timeframe_ms=1000`.
 
 **След TD-039/TD-020 в коде** (класс «механизм есть, никто не зовёт»):
 - `crates/gateway-serve/tests/red_serve_window_wiring.rs:1-15` — прямая формулировка: reducer был
@@ -348,10 +349,15 @@ pub struct ReadStats { pub events_decoded: u64, pub segments_opened: u32 }
 - Лечение: `build_selector` с 5-м аргументом (`crates/gateway-serve/src/lib.rs:512-526`) +
   тестируемая `serve_config_from_env` с инжектируемым getter'ом (`lib.rs:548`), `main` — тонкий
   вызыватель (`crates/gateway-serve/src/main.rs:21`).
-- Замечание для оракула: `GATEWAY_WINDOW_MS` с **невалидным** числом молча даёт `None`
-  (`crates/gateway-serve/src/lib.rs:612` — `.parse::<i64>().ok()`), т.е. опечатка в env
-  возвращает прод в unbounded-режим БЕЗ отказа старта. В отличие от `GATEWAY_TIMEFRAME_MS`,
-  который fail-closed (`lib.rs:591-597`). Это асимметрия, которую RED-оракул может атаковать.
+- **Асимметрия, названная здесь 03.08, закрыта milestone'ом M-69 (`GW-I-14`).** Исторически
+  `GATEWAY_WINDOW_MS` с невалидным числом молча давал `None` (`.parse::<i64>().ok()`), то есть
+  опечатка в env возвращала прод в unbounded-режим БЕЗ отказа старта — в отличие от
+  `GATEWAY_TIMEFRAME_MS`, fail-closed с M-47. Приглашение «RED-оракул может атаковать» принято:
+  оракулы — `crates/gateway-serve/tests/red_window_guard_startup.rs` (старт прод-бинаря) и
+  `crates/gateway/tests/red_window_selector_guard.rs` (`validate_selector`, анти-байпас для
+  чекпоинтера/shared-tailer/research-cli). Действующая политика — строка `GATEWAY_WINDOW_MS`
+  в таблице §1: offline выражается тремя формами (`unset`/пусто/`"0"`), всё прочее обязано быть
+  корректным положительным `i64`, иначе отказ на старте (`PL-I-5`, `DESIGN.md:940`).
 
 ---
 
