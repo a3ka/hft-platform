@@ -1434,22 +1434,47 @@ async fn o12_switch_during_inflight_pump_does_not_restore_old_sub() {
     );
 
     // §10.3: детерминизм повтора — тот же вход даёт тот же исход, а не «повезло один раз».
-    append_more(dir.path(), "BTCUSDT", 4, BASE_MS + 15_000);
-    append_more(dir.path(), "ETHUSDT", 4, BASE_MS + 15_000);
+    //
+    // `R-106` Б-1 (блокер): эта половина различала инструменты ПОИСКОМ ПОДСТРОКИ `BTCUSDT`
+    // в сериализованном кадре — а `Frame` селектора НЕ НЕСЁТ (`wire_v1.rs`, `SeriesBundle`
+    // без `symbol`). Фильтр давал 0 при ЛЮБОЙ реализации, и ассерт был истинен всегда.
+    // Это ТОТ ЖЕ дефект, который `5121f1d` уже вычистил в ПЕРВОЙ половине этого же теста:
+    // починив одну, я оставил вторую с ровно тем же вакуумом. Доказано reviewer'ом
+    // изолирующей мутацией — при снятой развязке и нейтрализованной первой половине
+    // тест оставался ЗЕЛЁН.
+    //
+    // Развязка та же, что в первой половине: инструменты разведены ЦЕНОЙ
+    // (`append_more_priced` + `max_price_in`), а признак доезжает до клиента через
+    // `ohlcv`/`volume_profile`/`vwap`.
+    append_more_priced(dir.path(), "BTCUSDT", 4, BASE_MS + 15_000, BTC_PRICE);
+    append_more_priced(dir.path(), "ETHUSDT", 4, BASE_MS + 15_000, ETH_PRICE);
     let repeat = drain(&mut ws, 3 * GRACE_MS + 1_200).await;
-    let stale_repeat = repeat
+
+    // ПОЗИТИВНЫЙ СВИДЕТЕЛЬ SETUP. Без него негативный ассерт ниже зелен и на пустом
+    // потоке — то есть проверял бы отсутствие кадров вместо отсутствия ЧУЖИХ кадров
+    // (`testing.md`, целостность гейта, свойство 3). В первой половине такой свидетель
+    // есть (`priced`), во второй его не было.
+    let priced_repeat: Vec<&Value> = repeat
         .iter()
-        .filter(|v| {
-            serde_json::to_string(v)
-                .unwrap_or_default()
-                .contains("BTCUSDT")
-        })
-        .count();
-    assert_eq!(
-        stale_repeat, 0,
+        .filter(|v| max_price_in(v).is_some())
+        .collect();
+    assert!(
+        !priced_repeat.is_empty(),
+        "SETUP ВТОРОГО ТАКТА НЕ СОСТОЯЛСЯ: на повторе не пришло НИ ОДНОГО кадра с ценой. \
+         Негативный ассерт ниже был бы зелен на пустоте и не проверял бы ничего."
+    );
+
+    let stale_repeat: Vec<&Value> = repeat
+        .iter()
+        .filter(|v| max_price_in(v).is_some_and(|p| p >= to_fixed(BTC_PRICE)))
+        .collect();
+    assert!(
+        stale_repeat.is_empty(),
         "O-12 НАРУШЕН (детерминизм повтора, §10.3): на ВТОРОМ такте после смены снова пришли \
-         кадры прежнего инструмента ({stale_repeat} шт.). Однократный успех первого такта не \
-         доказывает снятия подписки."
+         кадры прежнего инструмента — {} шт. с ценой BTC-уровня: {:?}. Однократный успех \
+         первого такта не доказывает снятия подписки.",
+        stale_repeat.len(),
+        stale_repeat.iter().take(2).collect::<Vec<_>>()
     );
 
     rendezvous::test_remove("w1");
