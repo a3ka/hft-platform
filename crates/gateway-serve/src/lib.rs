@@ -1852,9 +1852,24 @@ pub fn serve_config_from_env(
     // Atomic-доступ виден всем соединениям процесса; `serve_config_from_env` устанавливает
     // значение ровно один раз при старте.
     let max_subs: usize = match get("GATEWAY_MAX_SUBSCRIPTIONS") {
-        None => 16_usize, // подпись founder'а 11.08
+        // CT-RFC-09 §2.6: переменная ОБЯЗАНА быть задана. Дефолт 16 живёт в docker-compose.yml
+        // (`:145`), а не в коде — спрятанный дефолт не видит тот, кто разворачивает, и проявляется
+        // не как поломка, а как «странно, почему потолок 16». Снятие «пусто ⇒ ошибка / отсутствует
+        // ⇒ дефолт» (задача 13 N-2): оба неполных состояния конфигурации ведут себя одинаково —
+        // «частично заданная конфигурация» не имеет двух законных форм.
+        None => {
+            return Err(
+                "GATEWAY_MAX_SUBSCRIPTIONS is required (CT-RFC-09 §2.6); дефолт 16 живёт в \
+                 docker-compose.yml:145 — задайте переменную явно"
+                    .to_string(),
+            );
+        }
         Some(s) if s.trim().is_empty() => {
-            return Err("GATEWAY_MAX_SUBSCRIPTIONS must not be empty".to_string());
+            return Err(
+                "GATEWAY_MAX_SUBSCRIPTIONS is required (CT-RFC-09 §2.6); пустая строка — то же \
+                 отсутствие, что и None; дефолт 16 живёт в docker-compose.yml:145"
+                    .to_string(),
+            );
         }
         Some(s) => {
             let trimmed = s.trim();
