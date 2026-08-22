@@ -707,6 +707,45 @@ scenario_verdict_class_declaration_names_all_dirs() {
   fi
 }
 
+scenario_verdict_class_declaration_equals_tuple() {
+  # `R-102` F-1/F-2 (блокеры). V-4 пиннил объявление СНИЗУ: «каждый из трёх назван».
+  # Инвариант конструкции сильнее — `объявление ≡ кортеж`, и верхней границы не было:
+  #   NC1  `present + ["research/reports/"]`      -> 0 FAIL: INFO ЛЖЁТ, что reports исключён;
+  #   mc8b печать заменена литералом трёх имён    -> 0 FAIL: объявление больше НЕ читает
+  #        константу, то есть возвращается второй носитель — невидимо для пробы.
+  # Мой собственный стаб MC8 (замена на `research/`) падал только потому, что терял имена
+  # со слэшами; в теле коммита `5939258` строка «MC8 объявление захардкожено -> V-4 FAILED»
+  # была сформулирована ШИРЕ того, что реально прогонялось, и адверсарий её фальсифицировал.
+  #
+  # Закрытие КОНЕЧНО и матрицу не растит: одна фикстура, в которой класс представлен
+  # НЕПОЛНО, а рядом лежит каталог ВНЕ класса. Объявление обязано назвать ровно то, что
+  # есть и входит в класс:
+  #   * нет `arbitration/`   => не назван  (валит и `present = list(VERDICT_CLASS_DIRS)`,
+  #                                         и литерал трёх имён);
+  #   * есть `reports/`      => не назван  (валит дописывание лишнего к `present`).
+  local d="${TMP_BASE}/vclass8"
+  build_good_fixture "${d}"          # каркас несёт critiques/ и reviews/, arbitration/ — НЕТ
+  mkdir -p "${d}/research/reports"
+  echo "# отчёт — НЕ вердикт, под судом, в объявлении класса ему не место" \
+    > "${d}/research/reports/R-98-report.md"
+  [ -s "${d}/research/reports/R-98-report.md" ] || { fail "V-7: фикстура не создана — setup"; return; }
+  [ ! -d "${d}/research/arbitration" ] || { fail "V-7: каркас неожиданно создал arbitration/ — setup"; return; }
+  local out rc line
+  out="$(run_verify "${d}")"; rc=$?
+  line="$(echo "${out}" | grep 'V-АРХИВ' || true)"
+  if [ "${rc}" -eq 0 ] \
+     && echo "${line}" | grep -q 'research/critiques/' \
+     && echo "${line}" | grep -q 'research/reviews/' \
+     && ! echo "${line}" | grep -q 'research/arbitration/' \
+     && ! echo "${line}" | grep -q 'research/reports/'; then
+    pass "V-7 (объявление ≡ кортеж): назван ровно наличный класс, лишнего нет, exit=${rc}"
+  else
+    fail "V-7: объявление обязано назвать critiques+reviews и НЕ называть ни arbitration \
+(его нет), ни reports (он вне класса) (exit=${rc}):"
+    echo "${line:-<строки V-АРХИВ нет>}" | sed 's/^/      /'
+  fi
+}
+
 scenario_verdict_class_critiques_pinned_for_check3() {
   local d="${TMP_BASE}/vclass5"
   build_good_fixture "${d}"
@@ -1795,6 +1834,7 @@ scenario_verdict_class_dead_doc_ref_excluded
 scenario_verdict_class_broken_section_ref_excluded
 scenario_verdict_class_does_not_leak_to_reports
 scenario_verdict_class_declaration_names_all_dirs
+scenario_verdict_class_declaration_equals_tuple
 scenario_verdict_class_critiques_pinned_for_check3
 scenario_verdict_class_arbitration_pinned_for_check3
 scenario_facts_marker_on_last_head_line_counts
