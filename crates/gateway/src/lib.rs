@@ -1449,9 +1449,24 @@ impl Snapshot {
                 let mut values: BTreeMap<i64, i64> = current.series.drain(..).collect();
                 values.extend(incoming.series.iter().copied());
                 current.series = values.into_iter().collect();
-                if current.depth_band_provenance.is_none() {
-                    current.depth_band_provenance = incoming.depth_band_provenance.clone();
-                }
+                // `П-014` / `R-110` Б-1: метка СЛЕДУЕТ ЗА incoming — та же close-семантика, что у
+                // ЗНАЧЕНИЙ полосы строкой выше (`values.extend` — последнее наблюдение бакета
+                // побеждает). Было `if current...is_none()` — «первый непустой побеждает», и пока
+                // метка была чистой функцией ШИРИНЫ полосы, это было тождеством: значение не менялось
+                // никогда. После `П-014` метка — функция наблюдённого ОХВАТА, а охват движется во
+                // времени (ресинк после гэпа урезает книгу до ~1.3 %) — и «первый побеждает»
+                // превратилось в ЗАЛИПАНИЕ: WS-клиент получает `Snapshot` ОДИН раз и дальше живёт
+                // на `Frame`'ах, то есть до переподключения читал бы `liveness=confirmed` о полосе,
+                // которой в книге больше нет (`PL-I-7`: деградация не выдаётся за норму). Обратная
+                // сторона тоже вредна: залипшее `not-observed` не снималось после восстановления.
+                //
+                // Почему БЕЗУСЛОВНО, а не «берём incoming, если он непуст»: метка — ЧИСТАЯ
+                // функция `(ширина, сторона, охват)` (`depth_provenance_label`), и для одного и того же
+                // `(side, band_pct_e8)` она `None` тогда и только тогда, когда полоса ≤ 1.3 % (`VB-I-5`) —
+                // то есть ОДИНАКОВО `None` в обоих операндах слияния. Значит «взять incoming» не может
+                // потерять непустую метку глубокой полосы, а условие вносило бы ту же асимметрию,
+                // из-за которой блокер и появился.
+                current.depth_band_provenance = incoming.depth_band_provenance.clone();
             } else {
                 self.series.depth_series.push(incoming.clone());
             }
