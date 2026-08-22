@@ -129,7 +129,7 @@
 | `GATEWAY_SYMBOL` | `BTCUSDT` | строка as-is | `lib.rs:576` |
 | `GATEWAY_TIMEFRAME_MS` | `1000` | `i64`; **fail-closed гвард GW-I-10**: `<= 0` или `86_400_000 % tf != 0` → `Err` → exit 2 | `lib.rs:578-597` |
 | `GATEWAY_BANDS` | `0.001` | comma-separated `f64`, ошибка парса → `Err` | `lib.rs:599-604` |
-| `GATEWAY_WINDOW_MS` | `None` | `unset`/пусто/`"0"` → `None` (offline, канонизировано); **fail-closed гвард GW-I-14** (M-69): parse-error / переполнение `i64` / отрицательное → `Err` на старте; иначе `Some(положительное)` | `lib.rs:609-613` |
+| `GATEWAY_WINDOW_MS` | `None` | **ДЕЙСТВУЮЩЕЕ (дефект R7):** `.parse::<i64>().ok()` — мусор молча даёт `None`, то есть опечатка возвращает прод в unbounded БЕЗ отказа старта. **ЦЕЛЕВАЯ политика M-69 — fail-closed гвард `GW-I-14`, задачи #1–#4, ещё НЕ реализована:** `unset`/пусто/`"0"` → `None` (offline, канонизировано); parse-error / переполнение `i64` / отрицательное → `Err` на старте; иначе `Some(положительное)` | `lib.rs:609-613` |
 | `GATEWAY_CHECKPOINT_DIR` | `None` | unset/пусто → `None` (не ошибка) | `lib.rs:618-622` |
 
 Не из env, захардкожено: **`filter: EpochFilter::OwnCaptureOnly`** (`crates/gateway-serve/src/lib.rs:627`).
@@ -348,15 +348,24 @@ pub struct ReadStats { pub events_decoded: u64, pub segments_opened: u32 }
 - Лечение: `build_selector` с 5-м аргументом (`crates/gateway-serve/src/lib.rs:512-526`) +
   тестируемая `serve_config_from_env` с инжектируемым getter'ом (`lib.rs:548`), `main` — тонкий
   вызыватель (`crates/gateway-serve/src/main.rs:21`).
-- **Асимметрия, названная здесь 03.08, закрыта milestone'ом M-69 (`GW-I-14`).** Исторически
-  `GATEWAY_WINDOW_MS` с невалидным числом молча давал `None` (`.parse::<i64>().ok()`), то есть
-  опечатка в env возвращала прод в unbounded-режим БЕЗ отказа старта — в отличие от
-  `GATEWAY_TIMEFRAME_MS`, fail-closed с M-47. Приглашение «RED-оракул может атаковать» принято:
-  оракулы — `crates/gateway-serve/tests/red_window_guard_startup.rs` (старт прод-бинаря) и
+- **Асимметрия, названная здесь 03.08, АДРЕСОВАНА milestone'ом M-69 (`GW-I-14`) и на этой
+  ревизии ЕЩЁ НЕ ЗАКРЫТА.** Формулировка правится по `A-014` B-7: документ назван фактурой для
+  RED-оракулов, историческим не помечен, поэтому прошедшее время в нём — тиражируемая ложь
+  (класс `TD-155`), а не стилистика.
+  **ДЕЙСТВУЮЩЕЕ поведение (дефект R7):** `GATEWAY_WINDOW_MS` с невалидным числом молча даёт
+  `None` — `crates/gateway-serve/src/lib.rs:740-744`, `.parse::<i64>().ok()`; опечатка в env
+  возвращает прод в unbounded-режим БЕЗ отказа старта, в отличие от `GATEWAY_TIMEFRAME_MS`,
+  fail-closed с M-47. Второй путь мимо гварда: `validate_selector`
+  (`crates/gateway/src/lib.rs:1751-1764`) не смотрит `window_ms` вовсе.
+  **ЦЕЛЕВАЯ политика M-69 (задачи #1–#4, dev не назначен):** offline выражается тремя формами
+  (`unset`/пусто/`"0"`), всё прочее обязано быть корректным положительным `i64`, иначе отказ
+  на старте (`PL-I-5`, `DESIGN.md:940`).
+  Приглашение «RED-оракул может атаковать» принято, оракулы написаны и КРАСНЫ:
+  `crates/gateway-serve/tests/red_window_guard_startup.rs` (старт прод-бинаря) и
   `crates/gateway/tests/red_window_selector_guard.rs` (`validate_selector`, анти-байпас для
-  чекпоинтера/shared-tailer/research-cli). Действующая политика — строка `GATEWAY_WINDOW_MS`
-  в таблице §1: offline выражается тремя формами (`unset`/пусто/`"0"`), всё прочее обязано быть
-  корректным положительным `i64`, иначе отказ на старте (`PL-I-5`, `DESIGN.md:940`).
+  чекпоинтера/shared-tailer/research-cli).
+  **Флип к свершившемуся факту делает architect ПОСЛЕ GREEN dev'а, до PR-time** (`A-014` §5 п.3);
+  правдивость на дереве слияния проверяет reviewer штатной нормой `gates.md` §8.
 
 ---
 

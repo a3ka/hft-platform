@@ -150,6 +150,7 @@ argv-путём: `gateway-checkpoint.rs:162-163` — «M-37: bounded-window по
 | `crates/gateway-serve/src/lib.rs` | **engine-dev** | задачи #1, #2, #4 — разбор env + док-комментарий |
 | `crates/gateway/src/lib.rs` | **engine-dev** | задача #3 — `validate_selector` |
 | `docs/plans/gateway-ws-contract.md` | **architect** (сделано в этом наборе) | задача #5 — синхронизация factual-документа |
+| `docs/DESIGN.md` §22 | **architect only** | строка `GW-I` «в оракулах»: счётчик, синхронизируемый механизмом `verify_design_claims.sh` check2. Два новых оракула M-69 подняли реальный замер 12→13, и до синхронизации джоб `design-claims` держит merge даже GREEN-реализации (`A-014` B-6) |
 | `crates/gateway-serve/tests/**`, `crates/gateway/tests/**` | **architect only** (sacred) | RED-оракулы; dev не правит даже «неверный» тест |
 | `scripts/verify_M-69.sh` | **architect only** (sacred) | acceptance-гейт |
 | `milestones/M-69-window-guard.md` | **architect only** | dev правит ТОЛЬКО колонку Status в §Tasks |
@@ -200,6 +201,28 @@ contract-RFC), `crates/gateway/src/bin/gateway-checkpoint.rs` (argv-путь у�
 --all -- --check` · `cargo clippy --all-targets --all-features -- -D warnings` · `cargo test
 --all`. Минимум одна проверка на каждую задачу §Tasks + регресс-шаг на GW-I-10 (M-47) и на
 `red_serve_window_wiring` (M-37), которые правка обязана оставить зелёными.
+
+### Ожидаемо-красные шаги на PLAN-TIME — исчерпывающий список (`A-014` B-8)
+
+Норма существует давно (`commit-discipline.md` §Done Block: «ожидаемые/известные FAIL
+перечисляются ЯВНО с обоснованием»), а мандат круга r3 объявил ТРИ шага при фактических
+ЧЕТЫРЁХ. Недосчитанный красный неотличим от незамеченного, поэтому список ниже
+исчерпывающий, и «прочее» в нём названо явно.
+
+| # | шаг `verify_M-69.sh` | почему красный сейчас |
+|---|---|---|
+| 1 | `cargo test -p gateway-serve --test red_window_guard_startup` | RED-оракул задачи #1/#2 — ждёт задач #1–#4 |
+| 2 | `cargo test -p gateway --test red_window_selector_guard` | RED-оракул задачи #3 (анти-байпас `validate_selector`) — ждёт задач #1–#4 |
+| 3 | `! grep -q 'пусто/не парсится' crates/gateway-serve/src/lib.rs` | задача #4 — док-комментарий описывает поведение, которое dev ещё не заменил; ждёт задач #1–#4 |
+| 4 | `cargo test --all` | ДУБЛИРУЕТ шаги 1–2: те же два оракула внутри общего прогона. Отдельным дефектом не является и исчезнет вместе с ними |
+
+**Всё прочее на plan-time обязано быть PASS**, включая оба грепа задачи #5 по
+`docs/plans/gateway-ws-contract.md` (позитивный — политика названа; негативный — старая
+формулировка снята) и оба регресс-шага (`GW-I-10` M-47, `red_serve_window_wiring` M-37).
+Любой красный СВЕРХ четырёх перечисленных — дефект набора, а не ожидаемое состояние.
+
+Verify-скрипт при этом НЕ меняется: он гейт GREEN-состояния, и его красная маска на
+plan-time — свойство спеки, а не кода (`A-014` B-8).
 
 ## Handoff
 
