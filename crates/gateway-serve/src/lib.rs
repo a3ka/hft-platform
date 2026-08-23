@@ -734,13 +734,31 @@ pub fn serve_config_from_env(
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| format!("GATEWAY_BANDS parse: {e}"))?;
 
-    // M-37 task #7a: GATEWAY_WINDOW_MS → Option<i64>. unset/пусто → None (offline).
-    // Невалидное число (parse-ошибка) → None (graceful fallback) — баг .env опечатки не
-    // блокирует запуск; прод-§8 E2E с явным W=60000 в docker-compose.
+    // M-69 task #1 (GW-I-14, R7/PL-I-5): `GATEWAY_WINDOW_MS` — fail-closed на parse-error
+    // и overflow. Невалидное значение больше НЕ даёт `None` тихо (поведение unbounded,
+    // развалившее прод — TD-020/TD-039): `.ok()` заменён на `match`, ошибка парсинга →
+    // `Err` на старте с сообщением, НАЗЫВАЮЩИМ переменную. Канарейка: `unset`, пусто,
+    // пробелы — легитимный offline (`None`); `"0"` канонизируется в `None` (а не
+    // `Some(0)`), чтобы `selector_fingerprint` (M-38b) не расщеплял offline-режим на два
+    // ключа чекпоинта (C-099 B-2).
     let window_ms: Option<i64> = match get("GATEWAY_WINDOW_MS") {
         None => None,
         Some(s) if s.trim().is_empty() => None,
-        Some(s) => s.trim().parse::<i64>().ok(),
+        Some(s) => {
+            let trimmed = s.trim();
+            match trimmed.parse::<i64>() {
+                Ok(0) => None,             // "0" — легитимный offline (паритет argv M-38b)
+                Ok(w) => Some(w),          // TODO(M-69 task #2): negative должно быть Err
+                Err(e) => {
+                    return Err(format!(
+                        "GATEWAY_WINDOW_MS={trimmed:?} не парсится как i64 ({e}) — это \
+                         опечатка в `.env` (мусор/суффикс/научная нотация/дробное/переполнение), \
+                         а не сигнал к unbounded-режиму; оператор обязан задать валидное \
+                         значение или unset/пусто/0 для offline"
+                    ));
+                }
+            }
+        }
     };
 
     // M-38b (rev4, B3): путь к каталогу чекпоинтов. unset/пусто → None — НЕ ошибка
