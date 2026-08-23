@@ -172,13 +172,25 @@ pub mod server {
     use std::sync::Arc;
     use std::time::Duration;
 
+    /// M-65 (CT-RFC-09 §2.6, амендмент `A-015` 2026-08-22): подписанная норма
+    /// `max_subscriptions_per_connection` — ЕДИНСТВЕННЫЙ источник истины для дефолта
+    /// (founder 2026-08-11). Все три места, где раньше стоял литерал `16`, теперь
+    /// читают ОДНУ константу: (а) этот `static` ниже; (б) ветка дефолта
+    /// `serve_config_from_env` (`None` / пустая строка — A-015 §3 п.1);
+    /// (в) test-оракул `red_max_subs_config::SIGNED_DEFAULT` ссылается на 16 как
+    /// литерал НАМЕРЕННО (см. комментарий в начале файла: assert против константы
+    /// реализации тавтологичен). Смена подписи требует синхронной правки всех
+    /// трёх, иначе оракул перестанет быть RED.
+    pub const DEFAULT_MAX_SUBSCRIPTIONS: usize = 16;
+
     /// M-65 (CT-RFC-09 §2.6): runtime-эффективный лимит подписок на соединение.
-    /// Дефолт — 16 (подпись founder'а 11.08). `serve_config_from_env` обновляет значение
-    /// ровно один раз при старте (fail-closed в `main` гарантирует, что плохое env не пройдёт).
-    /// Тесты с фиксированной формой литерала `ServeConfig { .. }` (без `max_subs`) используют
-    /// этот дефолт; единственный случай, где дефолт не подходит — ручная установка через
-    /// `set_effective_max_subs` (для unit-тестов, проверяющих cap ниже/выше дефолта).
-    static EFFECTIVE_MAX_SUBS: AtomicUsize = AtomicUsize::new(16);
+    /// Дефолт — `DEFAULT_MAX_SUBSCRIPTIONS` (founder, 2026-08-11). `serve_config_from_env`
+    /// обновляет значение ровно один раз при старте (fail-closed в `main` гарантирует, что
+    /// плохое env не пройдёт). Тесты с фиксированной формой литерала `ServeConfig { .. }`
+    /// (без `max_subs`) используют этот дефолт; единственный случай, где дефолт не
+    /// подходит — ручная установка через `set_effective_max_subs` (для unit-тестов,
+    /// проверяющих cap ниже/выше дефолта).
+    static EFFECTIVE_MAX_SUBS: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_SUBSCRIPTIONS);
 
     /// Получить runtime-лимит подписок (читается на каждом соединении).
     pub fn effective_max_subs() -> usize {
@@ -1863,45 +1875,42 @@ pub fn serve_config_from_env(
         Some(s) => Some(std::path::PathBuf::from(s.trim())),
     };
 
-    // M-65 (CT-RFC-09 §2.6, подпись founder'а 11.08 = 16): `max_subscriptions_per_connection`.
-    // Fail-closed (`gates.md`: «parse-error → unbounded — запрещено»): unset → дефолт 16; невалидное
-    // значение (мусор, пустая строка, `0`, отрицательное) — отказ СТАРТА (шаг `L` гейта). Соединение,
-    // которому нельзя подписаться ни на что — тихо сломанный сервер; клиентский cap=0 отдаёт узел
-    // одному клиенту при цели 10 000 подключений, и это дефект.
+    // M-65 (CT-RFC-09 §2.6, амендмент `A-015` 2026-08-22 — откат сути `d5a1cf5`):
+    // `max_subscriptions_per_connection`. Поведение по форме ЗНАЧЕНИЯ:
+    //   * отсутствие ИЛИ пустая строка ⇒ подписанная норма
+    //     `server::DEFAULT_MAX_SUBSCRIPTIONS` (founder, 2026-08-11) с `warn` —
+    //     оба неполных состояния конфигурации ведут себя ОДИНАКОВО (`A-015` §3 п.1).
+    //     Уход на дефолт НАЗВАН в логе старта (имя переменной + значение): оператор
+    //     читает лог, не исходники; «конфиг не доехал» наблюдаемо без отказа в
+    //     обслуживании (основание выбора дефолта вместо отказа — `A-015` §2.3 (iii));
+    //   * невалидное ЗНАЧЕНИЕ (мусор, `0`, отрицательное) ⇒ отказ СТАРТА — без изменений:
+    //     «parse-error → unbounded — запрещено» (урок R7) остаётся запрещённым, и
+    //     послабление, выданное ОТСУТСТВИЮ, на мусор не распространяется.
     //
     // Хранение: вместо добавления поля в `ServeConfig` (сломало бы существующие тесты с
     // фиксированной формой литерала `ServeConfig { ... }`), значение сохраняется в
     // модульный atomic `server::EFFECTIVE_MAX_SUBS` и читается на каждом соединении.
     // Atomic-доступ виден всем соединениям процесса; `serve_config_from_env` устанавливает
     // значение ровно один раз при старте.
-    let max_subs: usize = match get("GATEWAY_MAX_SUBSCRIPTIONS") {
-        // CT-RFC-09 §2.6: переменная ОБЯЗАНА быть задана. Дефолт 16 живёт в docker-compose.yml
-        // (`:145`), а не в коде — спрятанный дефолт не видит тот, кто разворачивает, и проявляется
-        // не как поломка, а как «странно, почему потолок 16». Снятие «пусто ⇒ ошибка / отсутствует
-        // ⇒ дефолт» (задача 13 N-2): оба неполных состояния конфигурации ведут себя одинаково —
-        // «частично заданная конфигурация» не имеет двух законных форм.
-        None => {
-            return Err(
-                "GATEWAY_MAX_SUBSCRIPTIONS is required (CT-RFC-09 §2.6); дефолт 16 живёт в \
-                 docker-compose.yml:145 — задайте переменную явно"
-                    .to_string(),
+    let raw = get("GATEWAY_MAX_SUBSCRIPTIONS");
+    let trimmed = raw.as_deref().map(str::trim);
+    let max_subs: usize = match trimmed {
+        // A-015 §3 п.1: оба неполных состояния ⇒ подписанная норма + warn.
+        None | Some("") => {
+            tracing::warn!(
+                "GATEWAY_MAX_SUBSCRIPTIONS not set (переменная отсутствует или пуста); \
+                 GATEWAY_MAX_SUBSCRIPTIONS=16 — подписанная норма (founder 2026-08-11, \
+                 CT-RFC-09 §2.6 / A-015 §3 п.1)"
             );
-        }
-        Some(s) if s.trim().is_empty() => {
-            return Err(
-                "GATEWAY_MAX_SUBSCRIPTIONS is required (CT-RFC-09 §2.6); пустая строка — то же \
-                 отсутствие, что и None; дефолт 16 живёт в docker-compose.yml:145"
-                    .to_string(),
-            );
+            server::DEFAULT_MAX_SUBSCRIPTIONS
         }
         Some(s) => {
-            let trimmed = s.trim();
             // Парсим как usize; `.parse::<usize>()` отвергает отрицательные и нечисловые значения.
             // Но «0» парсится успешно и невалиден по §2.6 (`целое >= 1`) — отвергаем отдельно.
-            match trimmed.parse::<usize>() {
+            match s.parse::<usize>() {
                 Ok(0) => {
                     return Err(format!(
-                        "GATEWAY_MAX_SUBSCRIPTIONS={trimmed} невалидно: должно быть >= 1 \
+                        "GATEWAY_MAX_SUBSCRIPTIONS={s} невалидно: должно быть >= 1 \
                          (CT-RFC-09 §2.6)"
                     ));
                 }
