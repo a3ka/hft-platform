@@ -295,3 +295,65 @@ VERDICT: PASS
 ```
 
 **Статус `TD-156`: ЗАКРЫТО как принятый остаточный риск** (не «разведено»).
+
+---
+
+## 7. Post-merge деплой-гейт (`gates.md` §8) — пруф, а не заявление
+
+Merge PR #71 → `351a6a2`. Правка docs-only (`TECH-DEBT.md` + этот вердикт), поведения
+данных не меняет — но гейт §8 обязателен независимо от этого, и ниже сырые строки.
+
+```
+$ gh run watch 32668201377 --exit-status >/dev/null 2>&1; echo "CI main exit=$?"
+CI main exit=0
+
+$ gh run list --branch main --limit 3
+completed  success  Merge pull request #71 …  CI              main  push          32668201377  9m32s
+completed  success  Deploy to VPS             Deploy to VPS   main  workflow_run  32668679548  15s
+completed  success  Merge pull request #70 …  CI              main  push          32662225178  9m39s
+```
+
+**Eyes-on VPS** (`167.233.192.131`), два замера подряд — рост, а не снимок мига:
+
+```
+$ ssh … 'docker ps --format "{{.Names}} {{.Status}}"'
+hft-gateway-serve Up 2 hours (healthy)
+hft-recorder      Up 2 hours (healthy)
+
+$ ssh … 'cat …/recorder.heartbeat; date -u +%FT%TZ'          # замер 1
+{"events":1059766,…,"next_seq":333788755,"segment_index":393,"ts_wall_ms":1787521790479,"writable":true}
+2026-08-23T21:49:52Z        ← heartbeat 21:49:50Z, возраст 2 с
+
+$ ssh … 'cat …/recorder.heartbeat; date -u +%FT%TZ'          # замер 2, +45 с
+{"events":1066133,…,"next_seq":333795127,"segment_index":393,"ts_wall_ms":1787521840479,"writable":true}
+2026-08-23T21:50:46Z        ← heartbeat свежий, возраст 6 с
+
+Δ events   1059766 → 1066133   (+6367)      ← журнал РАСТЁТ
+Δ next_seq 333788755 → 333795127 (+6372)
+writable: true · free_bytes 28.6 GB > min_free 10.7 GB
+
+$ ssh … 'du -sh …/_data'
+68G
+
+$ ssh … 'for p in $(pgrep -f recorder); do grep -H RssAnon /proc/$p/status; done'
+/proc/3387104/status:RssAnon:  21452 kB      ← anon-куча, НЕ docker stats (TD-021)
+/proc/3404458/status:RssAnon:    272 kB
+```
+
+Sanity содержимого событий не проводился и не изображается проведённым: диф не трогает ни
+парсеров, ни форматов (`gates.md` §8 п.2 требует его, «если деплой менял поведение данных»).
+
+**Worktree-GC** (§8 п.4, `branch-hygiene.md` §Worktree lifecycle п.5):
+```
+$ bash scripts/gc_worktrees.sh; echo exit=$?
+worktree'ов осталось: 107
+VERDICT: GC DONE
+exit=0
+$ df -h / | tail -1
+/dev/md2  437G  335G  81G  81% /        ← 81 % < порога 85 %, --reclaim не требуется
+```
+Ничего не снесено: все кандидаты — `KEEP` (dirty либо не смержены в `origin/main`), механизм
+fail-closed отработал верно.
+
+**Резерв снят** после приземления носителя: `bash scripts/reserve_artifact_id.sh --release
+R-117` → «резерв R-117 снят», exit=0.
