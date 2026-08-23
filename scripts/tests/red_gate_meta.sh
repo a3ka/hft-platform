@@ -11,7 +11,11 @@
 #
 # 2. Подмена предмета ПОСЛЕ вердикта. Проходной вердикт по одному HEAD прикрывает merge
 #    другого: «критик смотрел это» и «reviewer одобряет то же самое» перестают совпадать.
-#    Лечится subject-lock'ом: диф `audited_head..HEAD` не смеет трогать пути класса «гейт».
+#    Лечится subject-lock'ом: СОБСТВЕННАЯ РАБОТА ВЕТКИ после `audited_head` не смеет трогать
+#    пути класса «гейт». «Собственная» — это диапазон `BASE..HEAD ^audited_head`, из которого
+#    на merge-ref исключён первый родитель (main-сторона), с комбинированным дифом у merge'ей.
+#    Прежняя формулировка («диф `audited_head..HEAD`») описывала семантику, которой больше нет:
+#    на merge-ref она приписывала ветке работу `main`а (`C-128` Б-1/Б-2, N-4).
 #    Лок применяется ТОЛЬКО к проходным исходам — после REJECT правки штатны, и лок,
 #    красящий нормальный круг, был бы вреднее отсутствующего (GM-11).
 #
@@ -345,6 +349,90 @@ run_barrier "$R" "${MAIN_TIP}" pull_request "${MAIN_TIP}" \
   && fail "GM-16c ветка правила гейт ПОСЛЕ своего APPROVE, а лок промолчал — сужение зашло \
 слишком далеко и открыло лок вообще" \
   || pass "GM-16c анти-бланкет: правка гейта САМОЙ веткой по-прежнему блокируется"
+
+# GM-16d — БАЗА СОБЫТИЯ УСТАРЕЛА. `github.event.pull_request.base.sha` обновляется ЛЕНИВО и
+# расходится с main-стороной merge-ref (`C-128` Б-1, предъявлено реальными CI-прогонами
+# PR #60). Форма GM-16b, но барьеру подаётся база ФОРКА, а не текущая вершина базы: против
+# редакции, опирающейся ТОЛЬКО на `PR_BASE_SHA`, сценарий КРАСЕН — это и есть его RED.
+mk_repo R; B0="$(head_of "$R")"
+( cd "$R" && git checkout -q -b feat-stale ) || die "GM-16d: ветка не создана"
+add_verdict "$R" "APPROVE" "a3ka/hft-platform" "$B0" "$B0"
+AH_BR="$(head_of "$R")"
+( cd "$R" && git checkout -q - ) || die "GM-16d: возврат на базу"
+touch_file "$R" "${GATE_CLASS_FILE}" "правка гейта, приехавшая в БАЗУ после форка"
+( cd "$R" && git merge -q --no-ff feat-stale -m "merge-ref: слияние ветки в базу" ) \
+  || die "GM-16d: merge-ref не собран"
+setup_ok=1
+( cd "$R" && [ "$(git rev-parse HEAD^2)" = "${AH_BR}" ] ) || setup_ok=0
+( cd "$R" && git log --format='' --name-only "${B0}..HEAD^1" | grep -qx "${GATE_CLASS_FILE}" ) || setup_ok=0
+if [ "$setup_ok" -ne 1 ]; then
+  fail "GM-16d SETUP НЕ СОСТОЯЛСЯ: правка гейта не лежит на main-стороне между форком и \
+вершиной базы — устаревание базы не воспроизведено"
+else
+  run_barrier "$R" "${B0}" pull_request "${B0}" \
+    && pass "GM-16d устаревшая база события: якорь HEAD^1 держит, ложного красного нет" \
+    || fail "GM-16d барьер опёрся на УСТАРЕВШИЙ PR_BASE_SHA и снова приписал ветке работу \
+базы. У долгоживущего PR (шесть кругов гейта — норма) это возвращает ложный красный, и токен \
+чеканится снова: класс закрыт наполовину"
+fi
+
+# GM-16e — ЧУЖОЙ ТОКЕН ИЗ БАЗЫ НЕ ОТКРЫВАЕТ ЛОК. Диапазон поиска токена обязан совпадать с
+# диапазоном, в котором найдено нарушение (`C-128` Б-2). Канал боевой, а не теоретический:
+# токен, выданный одному PR, вливается в `main` и гасит локи соседних.
+mk_repo R; B0="$(head_of "$R")"
+( cd "$R" && git checkout -q -b feat-leak ) || die "GM-16e: ветка не создана"
+add_verdict "$R" "APPROVE" "a3ka/hft-platform" "$B0" "$B0"
+touch_file "$R" "${GATE_CLASS_FILE}" "правка гейта САМОЙ веткой, СВОЕГО токена нет"
+( cd "$R" && git checkout -q - ) || die "GM-16e: возврат на базу"
+touch_file "$R" "docs/DESIGN.md" "ALLOW-SUBJECT-CHANGE: чужой токен, выданный ДРУГОМУ предмету"
+MAIN_TIP="$(head_of "$R")"
+( cd "$R" && git merge -q --no-ff feat-leak -m "merge-ref: слияние ветки в базу" ) \
+  || die "GM-16e: merge-ref не собран"
+setup_ok=1
+( cd "$R" && git log --format='%B' "${B0}..HEAD^1" | grep -q 'ALLOW-SUBJECT-CHANGE' ) || setup_ok=0
+( cd "$R" && git log --format='%B' "${B0}..HEAD^2" | grep -q 'ALLOW-SUBJECT-CHANGE' ) && setup_ok=0
+if [ "$setup_ok" -ne 1 ]; then
+  fail "GM-16e SETUP НЕ СОСТОЯЛСЯ: токен обязан лежать ТОЛЬКО на стороне базы и отсутствовать \
+у ветки — иначе сценарий проверяет законный выход из лока, а не утечку"
+else
+  run_barrier "$R" "${MAIN_TIP}" pull_request "${MAIN_TIP}" \
+    && fail "GM-16e ЧУЖОЙ токен из базы открыл лок на РЕАЛЬНОЕ нарушение ветки: каждый ложный \
+красный чеканит токен, токен уезжает в main и гасит локи соседних PR — лок перестаёт нести \
+информацию в обе стороны" \
+    || pass "GM-16e чужой токен из базы лок НЕ открывает (диапазон токена = диапазону нарушения)"
+fi
+
+# GM-16f — EVIL MERGE. Правка гейт-класса, вложенная В САМ merge-коммит: `git merge --no-commit`
+# + правка + `commit`, две команды, конфликт не нужен. Прежняя редакция объявляла это «названным
+# пределом» и приписывала невидимость флагу `--no-merges`; на деле её давал молчаливый дефолт
+# `diff-merges=off` (`C-128` M-3). Комбинированный диф (`--diff-merges=cc`) печатает у merge'а
+# ровно то, что отличается от ВСЕХ родителей, — то есть контрабанду, и не печатает принесённого.
+mk_repo R; B0="$(head_of "$R")"
+( cd "$R" && git checkout -q -b feat-evil ) || die "GM-16f: ветка не создана"
+add_verdict "$R" "APPROVE" "a3ka/hft-platform" "$B0" "$B0"
+( cd "$R" && git checkout -q - ) || die "GM-16f: возврат на базу"
+touch_file "$R" "docs/DESIGN.md" "постороннее движение базы"
+MAIN_TIP="$(head_of "$R")"
+( cd "$R" && git checkout -q feat-evil \
+  && git merge --no-commit --no-ff "${MAIN_TIP}" >/dev/null 2>&1
+  echo "контрабанда" >> "${GATE_CLASS_FILE}" && git add -A \
+  && git commit -q -m "merge базы (с вложенной правкой гейта)" ) || die "GM-16f: evil merge не собран"
+EVIL_TIP="$(head_of "$R")"
+( cd "$R" && git checkout -q - ) || die "GM-16f: возврат на базу"
+( cd "$R" && git merge -q --no-ff feat-evil -m "merge-ref: слияние ветки в базу" ) \
+  || die "GM-16f: merge-ref не собран"
+setup_ok=1
+( cd "$R" && [ "$(git rev-parse HEAD^2)" = "${EVIL_TIP}" ] ) || setup_ok=0
+( cd "$R" && git show --format='' --name-only --diff-merges=cc "${EVIL_TIP}" | grep -qx "${GATE_CLASS_FILE}" ) || setup_ok=0
+if [ "$setup_ok" -ne 1 ]; then
+  fail "GM-16f SETUP НЕ СОСТОЯЛСЯ: правка гейта не вложена в merge-коммит ветки — предмет \
+сценария (контрабанда, невидимая обычному дифу merge'а) не воспроизведён"
+else
+  run_barrier "$R" "${MAIN_TIP}" pull_request "${MAIN_TIP}" \
+    && fail "GM-16f контрабанда в merge-коммите прошла: правка гейт-класса, вложенная в merge, \
+невидима барьеру — канал НАМЕРЕННОГО обхода в две команды, без всякого конфликта" \
+    || pass "GM-16f контрабанда в merge-коммите заблокирована (комбинированный диф её видит)"
+fi
 
 
 # ── Блок 3: ОТСУТСТВИЕ вердикта (К-4; testing.md свойство 4 — «наблюдать отсутствие») ──
