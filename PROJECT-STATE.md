@@ -1515,6 +1515,57 @@ M-46/M-53/M-54 зелёные.
 Долг круга: `TD-158` (каденция), `TD-159` (метка на ряд, блокирует п.4), `TD-160` (чекпоинт-путь
 слеп к провенансу), `TD-161` (рассогласованный словарь: heatmap + текст §4 FA).
 
+**Деплой-гейт `gates.md` §8 — ПРОЙДЕН, пруф сырой (reviewer, 2026-08-23):**
+
+```
+$ gh run list --branch main --limit 3
+completed success Deploy to VPS 686327f 32661602407
+completed success CI            686327f 32661252385
+completed success Deploy to VPS 686327f 32661252346
+
+$ ssh … 'docker ps --format "{{.Names}} {{.Status}}"'
+hft-gateway-serve Up 43 seconds (healthy)
+hft-recorder      Up 48 seconds (healthy)
+
+$ … 'cat …/recorder.heartbeat; date -u +%s'
+{"events":4153,…,"next_seq":332732337,"segment_index":393,"ts_wall_ms":1787513740479,"writable":true}
+1787513749                      # heartbeat свежий: 9 s
+
+$ … 'ls -la …/_data | tail -2'
+-rw-r--r-- 1 root root 1073720245 Aug 23 18:50 segment-00000392.jrnl
+-rw-r--r-- 1 root root  311943942 Aug 23 19:35 segment-00000393.jrnl      # журнал растёт
+
+$ … 'grep -E "^RssAnon" /proc/<pid>/status'
+gateway-serve RssAnon:   336 kB      recorder RssAnon:  11540 kB          # в норме
+```
+
+**Доставка предъявлена ПОВЕДЕНИЕМ БИНАРЯ В ОБРАЗЕ, а не фактом «Deploy success»**
+(`testing.md` §«Механизм несущего пути обязан иметь оракул точки входа»):
+
+```
+$ docker inspect hft-gateway-serve --format "{{.Config.Image}} created={{.Created}}"
+hft-platform-recorder:local created=2026-08-23T19:34:50Z
+
+$ docker exec hft-gateway-serve grep -a -o -m1 "not-observed band=" /usr/local/bin/gateway-serve
+not-observed band=          grep_exit=0      # НОВЫЙ литерал в проде
+
+$ docker exec hft-gateway-serve grep -a -c "validated<=1.3%" /usr/local/bin/gateway-serve
+0                           grep_exit=1      # СТАРЫЙ литерал снят
+```
+
+**Чекпоинт — состояние на момент close-out'а:** файл на проде снят ещё старым кодом и
+несёт версию 1, то есть будет отвергнут и пересобран при первом чтении (`GW-I-9б`):
+
+```
+$ … 'ls -la …/hft-platform_gateway-ckpt/_data/; xxd -s 8 -l 4 …/ckpt-2a00318f774d9689.bin'
+-rw-r--r-- 1 root root 2609498 Aug 23 19:30 ckpt-2a00318f774d9689.bin
+00000008: 0100 0000                                 ....      # ckpt_schema_version = 1
+```
+
+Это ОЖИДАЕМОЕ следствие bump'а 1→2, названное заранее в `R-113`, а не сбой: первое
+подключение WS-клиента после деплоя дороже обычного, дальше кэш живёт в версии 2.
+Рестарт рекордера при деплое даёт штатный гэп forward-only записи (`TD-086`).
+
 ## Пока НЕ реализовано (следующие фазы)
 - Крейты `risk`/`killswitch`/`oms`, `runner` — пофазно per DESIGN §10 (M-08: fail-closed риск-гейт
   между `strategy` и `oms`). MM-котирование, wiring весов из `signals.json` (граница B),
