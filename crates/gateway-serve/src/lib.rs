@@ -748,7 +748,20 @@ pub fn serve_config_from_env(
             let trimmed = s.trim();
             match trimmed.parse::<i64>() {
                 Ok(0) => None,             // "0" — легитимный offline (паритет argv M-38b)
-                Ok(w) => Some(w),          // TODO(M-69 task #2): negative должно быть Err
+                Ok(w) if w > 0 => Some(w), // валидное bounded окно
+                Ok(w) => {
+                    // M-69 task #2: отрицательное окно отвергается на старте, а не
+                    // молча проходит как unbounded. `Some(w<0)` в Selector ведёт себя
+                    // как `None` через `window_lo_time_s`, но ОТЛИЧАЕТСЯ от `None` в
+                    // `selector_fingerprint` ⇒ чекпоинт снимается под режимом, которого
+                    // оператор не заказывал, и остаётся валидным по CRC (класс TD-019/TD-020).
+                    return Err(format!(
+                        "GATEWAY_WINDOW_MS={w} отрицателен — окно должно быть либо unset \
+                         (offline), либо положительным числом миллисекунд; отрицательное \
+                         ведёт себя как unbounded при непустом поле ⇒ selector_fingerprint \
+                         расходится с offline ⇒ чекпоинт снимается под незаказанным режимом"
+                    ));
+                }
                 Err(e) => {
                     return Err(format!(
                         "GATEWAY_WINDOW_MS={trimmed:?} не парсится как i64 ({e}) — это \
