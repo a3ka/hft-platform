@@ -1,0 +1,211 @@
+# M-00 + M-08 rev 7 (TD-020 доставка): запуск recorder + ops-сервис ретеншена на VPS.
+#
+# recorder — 24/7 (сбор). journal-retention — отдельный сервис под profiles: ["ops"]
+# (D2): не поднимается вместе с recorder'ом (`docker compose up -d` без `--profile ops`
+# стартует ТОЛЬКО recorder), не может его уронить; запускается cron'ом или оператором
+# (`docker compose run --rm journal-retention …`).
+#
+# Журнал — в именованном томе journal-data (persistent, переживает редеплой — docs/06 §3/§7).
+# Холодное хранилище (Hetzner Storage Box через CIFS) — bind-mount на хосте → в контейнер.
+# Healthcheck recorder'а = свежесть heartbeat-файла (TD-019: JSON с storage_status).
+services:
+  recorder:
+    build:
+      context: .
+    image: hft-platform-recorder:local
+    container_name: hft-recorder
+    restart: unless-stopped
+    environment:
+      JOURNAL_DIR: /journal
+      # П-008 п.1 (санкция founder'а 2026-08-03) — СОСТАВ ЗАПИСИ КАК ЯВНАЯ КОНФИГУРАЦИЯ.
+      # До этой правки переменные состава НЕ пробрасывались вовсе: в контейнере был только
+      # JOURNAL_DIR, а состав жил в дефолтах бинаря (`crates/recorder/src/main.rs:374,381,388`).
+      # То есть правка дефолта в КОДЕ тихо сменила бы эпоху данных, минуя founder'а — при том
+      # что состав записываемых данных это Граница C (`docs/DESIGN.md` §6).
+      # Значения ниже РАВНЫ дефолтам кода символ-в-символ: правка не меняет данные ни на байт,
+      # она делает состав видимым и управляемым через `.env`, а не пересборкой.
+      # Смена состава = новая эпоха: требует нового EPOCH_ID (`docs/rfc/CT-RFC-06-l2delta.md` §3).
+      BINANCE_SYMBOLS: ${BINANCE_SYMBOLS:-BTCUSDT,ETHUSDT}
+      BINANCE_FUTURES_SYMBOLS: ${BINANCE_FUTURES_SYMBOLS:-BTCUSDT,ETHUSDT}
+      HL_COINS: ${HL_COINS:-BTC,ETH}
+    volumes:
+      - journal-data:/journal
+    healthcheck:
+      # heartbeat обновлён за последние 60с → healthy (recorder жив + том пишется).
+      # TD-019: heartbeat = JSON с ts_wall_ms/next_seq/segment_index/free_bytes/writable —
+      # одна только «свежесть» ещё не значит «пишет» (урок TD-011: healthcheck молчит).
+      test: ["CMD-SHELL", "test $(( $(date +%s) - $(stat -c %Y /journal/recorder.heartbeat 2>/dev/null || echo 0) )) -lt 60"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  # D2 + D3: ops-профиль. Не поднимается без `--profile ops`. Тег/образ — тот же
+  # (D1: один образ, чтобы wire-format всегда один). Том journal-data общий с recorder'ом
+  # (R/W не нужен для dry-run — достаточно RO; для apply нужно W на upload в /cold).
+  journal-retention:
+    image: hft-platform-recorder:local
+    container_name: hft-journal-retention
+    profiles: ["ops"]
+    # По умолчанию — dry-run (D4: первый прогон на проде = dry-run). Оператор переопределяет
+    # entrypoint/args при ручном запуске apply: `docker compose run --rm journal-retention
+    # --mode apply ...` (см. deploy/README.md).
+    entrypoint: ["/usr/local/bin/journal-retention"]
+    command:
+      - --dir=/journal
+      # D3: --cold пробрасывается через JOURNAL_COLD_DIR (host → /cold). Хранилище
+      # монтируется на ХОСТЕ в JOURNAL_COLD_DIR (по умолчанию /mnt/journal-cold) и
+      # bind-mount'ится сюда. На Storage Box обычно CIFS — fstab в deploy/README.md.
+      - "--cold=${JOURNAL_COLD_DIR:-/cold}"
+      - --retain-days=${RETENTION_RETAIN_DAYS:-14}
+      - --keep-min=${RETENTION_KEEP_MIN:-4}
+      - --min-free-gb=${RETENTION_MIN_FREE_GB:-10}
+      - --mode=dry-run
+    environment:
+      # JOURNAL_COLD_DIR задаётся в .env на хосте (или export'ится) — путь к bind-mount
+      # холодного хранилища. По умолчанию /mnt/journal-cold (CIFS Storage Box, см. D6).
+      JOURNAL_COLD_DIR: ${JOURNAL_COLD_DIR:-/mnt/journal-cold}
+    volumes:
+      # Тот же том, что у recorder'а: dry-run читает, apply читает+пишет в /cold.
+      # На проде том всегда RO для retention-сервиса, чтобы apply не словил гонку с
+      # recorder'ом (хотя mutex через сегменты обеспечивает и сама логика prune —
+      # только сегменты НЕ-активные).
+      - journal-data:/journal:ro
+      # D3: bind-mount холодного хранилища. Если JOURNAL_COLD_DIR не существует на
+      # хосте — `docker compose run` упадёт с ошибкой монтирования ДО старта бинаря
+      # (явный fail-closed: легче заметить, чем тихо получить exit 2 в логе cron).
+      - "${JOURNAL_COLD_DIR:-/mnt/journal-cold}:/cold"
+    # Контейнер одноразовый — без restart; запускается по cron или вручную оператором.
+
+  # D-COMP-3 (M-08 task 16, TD-022): компакция закрытых сегментов (zstd) — ОТДЕЛЬНЫЙ
+  # ops-сервис, а не пуш в recorder/retenшен. Тому три причины:
+  #  • режим `--mode compact` третьего бинаря требует RW на /journal (создаёт .zst,
+  #    после самоизлечения (D-COMP-2) удаляет .jrnl), а retention сидит на RO;
+  #  • неделимая операция — НЕ часть cron-задания ретеншена: разные env (нет cold,
+  #    есть --keep-raw), разные гейты, разные маркеры алертов;
+  #  • компакция безопаснее ретеншена по определению (orig удаляется ТОЛЬКО после
+  #    sha256-сверки .zst) — но изоляция процессов всё равно нужна, чтобы падение
+  #    одного не роняло другой (урок TD-011).
+  journal-compaction:
+    image: hft-platform-recorder:local
+    container_name: hft-journal-compaction
+    profiles: ["ops"]
+    entrypoint: ["/usr/local/bin/journal-retention"]
+    command:
+      - --dir=/journal
+      - "--keep-raw=${COMPACTION_KEEP_RAW:-2}"
+      - --mode=compact
+    # Без COLD — компакция работает ТОЛЬКО локально. cold_root у journal-retention
+    # неприменим.
+    environment:
+      # Объявлен для единообразия с retention-сервисом; в compact-режиме НЕ читается.
+      JOURNAL_COLD_DIR: ${JOURNAL_COLD_DIR:-/mnt/journal-cold}
+    volumes:
+      # RW — компакция пишет .zst и удаляет .jrnl после самоизлечения. Конкуренция
+      # с recorder'ом ИСКЛЮЧЕНА логикой: `compact_segment` отвергает сегмент с
+      # МАКСИМАЛЬНЫМ индексом (тот, куда пишет recorder), поэтому recorder ничего
+      # не замечает, а cron-задание — не мешает recorder'у.
+      - journal-data:/journal
+    # Без restart — операторский одноразовый процесс (cron или ручной запуск).
+
+# M-28 gateway-serve: WS-транспорт кокпита (market-плоскость, D1/D6). Тонкая IO-обёртка
+  # над `crates/gateway` (M-22, детерминированная read-only библиотека). Stateless JWT-verify
+  # (GS-I-2/VB-I-9): shared secret в env, БЕЗ user-БД (GS-I-1). Read-only к журналу
+  # (GS-I-3): тот же volume, что у recorder'а, но RO-bind.
+  #
+  # Отдельный сервис (не часть recorder'а) по двум причинам:
+  #  • recorder НЕ занимается транспортом (D1: один процесс — одна ответственность);
+  #  • деплой-rolling: gateway-serve можно перезапустить без остановки recorder'а.
+  #
+  # §8 деплой-гейт: healthy + WS принимает подключение с валидным JWT, отдаёт
+  # snapshot+frames; read-only подтверждён. Порт/TLS/rate-limit — инфра-слой (вне scope M-28).
+  gateway-serve:
+    image: hft-platform-recorder:local
+    container_name: hft-gateway-serve
+    restart: unless-stopped
+    environment:
+      # Loopback по умолчанию (deploy.MD §8: bind на loopback, внешний доступ через
+      # reverse-proxy / ssh-tunnel; безопасный дефолт для проды).
+      GATEWAY_ADDR: ${GATEWAY_ADDR:-127.0.0.1:8080}
+      GATEWAY_JOURNAL_DIR: /journal
+      GATEWAY_VENUE: ${GATEWAY_VENUE:-Binance}
+      GATEWAY_SYMBOL: ${GATEWAY_SYMBOL:-BTCUSDT}
+      GATEWAY_TIMEFRAME_MS: ${GATEWAY_TIMEFRAME_MS:-1000}
+      GATEWAY_BANDS: ${GATEWAY_BANDS:-0.001}
+      # M-37 task #7c (анти-TD-020): прод-окно ОКНОВОГО reducer'а. Без активного окна
+      # gateway-serve дефолтит в `window_ms = None` = unbounded → снапшот ООМ-ит (TD-039
+      # воспроизводится через §8 E2E). 60s = ~60 бакетов в окне при `timeframe_ms=1000`,
+      # достаточно для 60 секунд истории + память O(окно), не O(длина журнала).
+      GATEWAY_WINDOW_MS: ${GATEWAY_WINDOW_MS:-60000}
+      # M-38b (rev4, B3): путь к чекпоинт-тому на проде. unset → прямой rebuild
+      # (dev-сценарий). На проде ОБЯЗАТЕЛЬНО = /ckpt, чтобы snapshot-при-подключении
+      # не реплеил историю на 409 s (TD-044, ровно тот замер, который M-38b лечит).
+      GATEWAY_CHECKPOINT_DIR: /ckpt
+      # ОБЯЗАТЕЛЬНО задать в .env на хосте (deploy.MD §D: shared с Next.js-подписателем,
+      # D6 marketplace). Без секрета bin падает с exit 2 (config-error).
+      GATEWAY_JWT_SECRET: ${GATEWAY_JWT_SECRET:?GATEWAY_JWT_SECRET must be set}
+    volumes:
+      # RO-bind к журналу — gateway-serve только читает (GS-I-3: read-only). Recorder
+      # владеет журналом, gateway-serve его НЕ мутирует.
+      - journal-data:/journal:ro
+      # M-38b (rev4, B3): RO-bind к чекпоинт-тому. Монтируется именно `:ro` —
+      # ЕДИНСТВЕННЫЙ писатель чекпоинта = ops-сервис `gateway-checkpoint` (см. ниже).
+      # gateway-serve отсюда только читает через `snapshot_from_checkpoint`. RW-bind
+      # на чтении избыточен и дал бы привилегию удалить чекпоинт.
+      - gateway-ckpt:/ckpt:ro
+    entrypoint: ["/usr/local/bin/gateway-serve"]
+    healthcheck:
+      # WS-протокол: healthcheck = TCP-connect к bind-адресу. Полноценный JWT-handshake —
+      # в §8 глазами (E2E WS-смоук). Здесь — liveness: процесс жив + port открыт.
+      test: ["CMD-SHELL", "timeout 2 bash -c '</dev/tcp/127.0.0.1/${GATEWAY_PORT:-8080}' || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    depends_on:
+      recorder:
+        condition: service_healthy
+
+  # M-38b (TD-044, GW-I-9): ops-сервис чекпоинтера. Снимает чекпоинт `Reducer`
+  # (полное состояние селектора + lineage) в ОТДЕЛЬНЫЙ RW-том `gateway-ckpt`,
+  # публикует артефакт `covered_through_seq` для retention (C-030 R1). Запускается
+  # по cron'у ПЕРЕД `journal-retention` — порядок критичен (retention без покрытия
+  # не прунит). Аналог `journal-retention` / `journal-compaction` — `profiles: ["ops"]`,
+  # одноразовый контейнер.
+  #
+  # Безопасность:
+  # - journal-том смонтирован `:ro` — чекпоинтер не мутирует журнал (JR-I-1 цел,
+  #   единственный писатель — recorder).
+  # - `covered_through_seq` пишется ТОЛЬКО при успешном `advance_to`. Если
+  #   `advance_to` упал — артефакт остаётся СТАРЫМ, retention в следующем цикле
+  #   использует устаревший артефакт (= fail-closed).
+  # - Дефолт `WINDOW_MS=60000` (M-37 анти-TD-020): без активного окна прод-снапшот
+  #   ООМ-ит (TD-039 воспроизводится через §8 E2E). Деплойер переопределяет, если
+  #   нужна иная политика.
+  gateway-checkpoint:
+    image: hft-platform-recorder:local
+    container_name: hft-gateway-checkpoint
+    profiles: ["ops"]
+    entrypoint: ["/usr/local/bin/gateway-checkpoint"]
+    command:
+      - --dir=/journal
+      - --ckpt-dir=/ckpt
+      - --coverage-out=/ckpt/covered_through_seq
+      - --venue=${GATEWAY_VENUE:-Binance}
+      - --symbol=${GATEWAY_SYMBOL:-BTCUSDT}
+      - --timeframe-ms=${GATEWAY_TIMEFRAME_MS:-1000}
+      - --bands=${GATEWAY_BANDS:-0.001}
+      - --window-ms=${GATEWAY_WINDOW_MS:-60000}
+      # `--cursor LATEST` — снимаем чекпоинт ДО хвоста; усечённый прогон возможен
+      # через `--cursor <i64>` (задаётся в cron-обёртке для инкрементальных снапшотов).
+      - --cursor=LATEST
+    volumes:
+      # RO-bind к журналу (JR-I-1) + RW-bind к чекпоинт-тому.
+      - journal-data:/journal:ro
+      - gateway-ckpt:/ckpt
+    # Одноразовый (без restart) — вызывается cron'ом или оператором вручную.
+
+volumes:
+  journal-data:
+  # M-38b: RW-том для чекпоинтов (по аналогии с journal-cold для холодного бэкапа).
+  gateway-ckpt:
