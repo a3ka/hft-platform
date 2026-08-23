@@ -74,7 +74,7 @@ ID_SUB="\\1${SEP}\\2${SEP}\\3"
 # дыра сидела не только в наборе, но и в эталоне батареи). Мутант — `mdblind`.
 id_of() {
   case "$1" in
-    milestones/M-*.md|research/reviews/R-*.md|research/reports/R-*.md|research/critiques/C-*.md|research/arbitration/A-*.md) :;;
+    milestones/M-*.md|research/reviews/R-*.md|research/reports/R-*.md|research/critiques/C-*.md|research/arbitration/A-*.md|docs/archive/M-*.md) :;;
     *) return 1;;
   esac
   basename "$1" .md | sed -nE "s|${ID_RE}|${ID_SUB}|p"
@@ -207,7 +207,22 @@ while IFS="$SEP" read -r cls num lt car; do
   while IFS="$SEP" read -r c2 n2 l2 car2; do
     [ -n "${c2:-}" ] || continue
     n2=$((10#${n2}))
-    [ "$c2" = "$cls" ] && [ "$n2" = "$num" ] && [ "$l2" = "$lt" ] && [ "$car2" != "$car" ] && exit 1
+    if [ "$c2" = "$cls" ] && [ "$n2" = "$num" ] && [ "$l2" = "$lt" ] && [ "$car2" != "$car" ]; then
+      # ПЕРЕЕЗД — НЕ КОЛЛИЗИЯ (`R-109` Б-3). ЗЕРКАЛО прод-барьера `check_artifact_ids.sh`:
+      # эталон обязан описывать ЧЕСТНУЮ реализацию, а честная — это та, что в проде. Условие
+      # переносится ЦЕЛИКОМ, включая обе точности, каждая из которых уже стоила регрессии:
+      #   · `!= TD` — у долгов носитель СТРОКА `TECH-DEBT.md`, `cat-file -e HEAD:<строка>`
+      #     падает всегда, и без сужения послабление пропускало бы ВСЕ коллизии долгов;
+      #   · «БЫЛ в базе» — иначе захватывается носитель, живущий только в чужом ref'е (`B3ORIG`).
+      # Узость проверяется сценарием `MVDUP`: КОПИЯ при ЖИВОМ старом пути — настоящий дубль,
+      # `HEAD:$car2` существует, послабление не срабатывает.
+      if [ "$cls" != TD ] \
+         && git cat-file -e "$BASE:$car2" 2>/dev/null \
+         && ! git cat-file -e "HEAD:$car2" 2>/dev/null; then
+        continue
+      fi
+      exit 1
+    fi
   done <<< "$U"
 done <<< "$IN"
 exit 0
@@ -309,10 +324,15 @@ guard letterexempt "$BODY_LETTEREXEMPT" "$BODY_CHECK"
 BODY_LETTERARITH="$(mutate 's|num=\$((10#\${num}))|num=$((10#${num}${lt}))|; s|n2=\$((10#\${n2}))|n2=$((10#${n2}${l2}))|')"
 guard letterarith "$BODY_LETTERARITH" "$BODY_CHECK"
 
+# `.md` ВОЗВРАЩАЕТСЯ хвостом (`${c}.md`), и это не косметика. Без него мутант срезал бы у
+# носителя ещё и расширение — то есть калечил бы СТРОКУ ПУТИ, а не правило ревизий, и попутно
+# ломал послабление переезда (`git cat-file -e "$BASE:$car2"` не находит путь без `.md`).
+# Замер: до возврата `.md` revstrip ронял `B7REV MVOK` при объявленном `B7REV` — мутант
+# доказывал не ту дыру (`§4.5`: «БОЛЬШЕ объявленного ⇒ сломан сверх своей оси»).
 # revstrip — регресс к удалённому правилу 4 §3.1: `-rev<N>`/`-addendum` считаются «той же
 # вещью», то есть ОДНИМ носителем. Под Б ревизия обязана брать свой идентификатор.
 read -r -d '' SED_REVSTRIP <<'EOF'
-s|printf '%s%s%s\\n' "$id" "$SEP" "$f"|c="${f%.md}"; c="${c%-rev*}"; c="${c%-addendum*}"; printf '%s%s%s\\n' "$id" "$SEP" "$c"|
+s|printf '%s%s%s\\n' "$id" "$SEP" "$f"|c="${f%.md}"; c="${c%-rev*}"; c="${c%-addendum*}"; printf '%s%s%s\\n' "$id" "$SEP" "${c}.md"|
 EOF
 BODY_REVSTRIP="$(mutate "$SED_REVSTRIP")"
 guard revstrip "$BODY_REVSTRIP" "$BODY_CHECK"
@@ -408,7 +428,7 @@ guard reviewsonly "$HEAD_REVIEWSONLY" "$HEAD_COMMON"
 # Делимитер — `@`, не `|`: замена НЕСЁТ литеральные `|` (альтернация case-шаблона), и с
 # делимитером `|` sed падает на собственном скрипте — ровно класс, который ловит guard.
 read -r -d '' SED_MDBLIND <<'EOF'
-s@^ *milestones/M-\*\.md.*$@    milestones/M-*|research/reviews/R-*|research/reports/R-*|research/critiques/C-*|research/arbitration/A-*) :;;@
+s@^ *milestones/M-\*\.md.*$@    milestones/M-*|research/reviews/R-*|research/reports/R-*|research/critiques/C-*|research/arbitration/A-*|docs/archive/M-*) :;;@
 EOF
 HEAD_MDBLIND="$(mutate_head "$SED_MDBLIND")"
 guard mdblind "$HEAD_MDBLIND" "$HEAD_COMMON"

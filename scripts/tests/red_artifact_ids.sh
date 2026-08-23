@@ -480,10 +480,20 @@ expect_allow L2CLOSEOUT "$R" "$B" "close-out-строка к СУЩЕСТВУЮ�
 # Предусловие нормы Р-2 делало исполнение самой нормы через CI невозможным.
 R="$(mk_repo mvok)"; art "$R" milestones/M-901-synthetic.md ""; commit_all "$R" base-mv
 B="$(cd "$R" && git rev-parse HEAD)"
+# ПРОД-ФОРМА (`testing.md` §«Целостность гейта», свойство 1). Старый носитель обязан быть ЖИВ
+# В ДРУГОМ REF'е — именно так выглядит переезд до merge'а: ветка удалила путь, а `origin/main`
+# его ещё держит. Без второго ref'а универсум (`refs/remotes/origin` ∪ `refs/heads`) старого
+# носителя НЕ ВИДИТ, коллизия не возникает ВООБЩЕ — и сценарий зелен при ЛЮБОЙ реализации.
+# Замер, из-за которого строка появилась: снятие послабления из ПРОД-БАРЬЕРА оставляло набор
+# `VERDICT: PASS (50/50)`, то есть `R-109` Б-3 — весь предмет коммита `e181a04` — не пиннился
+# НИЧЕМ. Тот же класс, что `R-086` §2 и `R-106` Б-1: оракул, зелёный против кода, из которого
+# удалено проверяемое, — вакуум.
+( cd "$R" && git branch keeper ) || die "mvok: второй ref не создан"
 ( cd "$R" && mkdir -p docs/archive && git mv milestones/M-901-synthetic.md docs/archive/M-901-synthetic.md ) || die mv
 commit_all "$R" "переезд M-901 в архив"
-setup_assert MVOK "$R" "старый путь обязан ИСЧЕЗНУТЬ с HEAD, новый — появиться (иначе сценарий проверяет копию, а не переезд)" \
-  '[ ! -e milestones/M-901-synthetic.md ] && [ -e docs/archive/M-901-synthetic.md ]'
+setup_assert MVOK "$R" "старый путь исчез с HEAD, новый появился, И старый ЖИВ в ref'е keeper (иначе коллизии нет и проверять нечего)" \
+  '[ ! -e milestones/M-901-synthetic.md ] && [ -e docs/archive/M-901-synthetic.md ] \
+   && git cat-file -e keeper:milestones/M-901-synthetic.md'
 expect_allow MVOK "$R" "$B" "переезд M-901 milestones/ → docs/archive/ (занявший исчез с HEAD — носитель ОДИН)"
 
 # АНТИ-ПЛАЦЕБО к MVOK: послабление обязано быть УЗКИМ. Тот же номер, но старый путь ОСТАЛСЯ
