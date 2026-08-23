@@ -6,7 +6,7 @@ audited_head: 7886f6aa8a42e0a4a1d176620eaabb02f4aca9e1
 verdict: REJECT
 -->
 
-# R-110 — M-65 ws-session, PR-гейт круг 3 (после `R-093`): **REJECT**
+# R-111 — M-65 ws-session, PR-гейт круг 3 (после `R-093`): **REJECT**
 
 **Роль:** reviewer (PR-time гейт, `gates.md` §4 — UNCONDITIONAL) · **Дата (UTC):** 2026-08-22
 **Предмет:** ветка `fix/M-65-battery-recalibration`, вершина `7886f6a`; диапазон
