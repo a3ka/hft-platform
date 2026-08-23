@@ -243,12 +243,32 @@ while IFS="$(printf '\t')" read -r st f; do
   git merge-base --is-ancestor "${ah}" HEAD 2>/dev/null \
     || { bad "${f}: audited_head «${ah}» НЕ предок HEAD — аудировалась другая линия истории"; continue; }
 
+  # ЧТО СДЕЛАЛА ВЕТКА ПОСЛЕ ВЕРДИКТА — а не «что изменилось в дереве». Разница практическая.
+  # На событии `pull_request` CI берёт `HEAD`ом MERGE-REF (`refs/pull/N/merge`) — слияние ветки
+  # с ТЕКУЩИМ `main`. Прежний двухточечный `git diff "${ah}" HEAD` включал в «тронутое» и всё,
+  # что приехало в `main` за время кругов гейта, и приписывал это ВЕТКЕ.
+  #
+  # Замер 2026-08-23, ДВА ложных красных за одну сессию: PR #28 заперт на
+  # `scripts/verify_design_claims.sh` (файлы PR #56, влитого часом ранее), PR #60 — по вердикту
+  # `R-108`, принадлежащему тому же ЧУЖОМУ влитому предмету. Оба раза merge держался и обходился
+  # токеном `ALLOW-SUBJECT-CHANGE`; барьер, обходимый на каждом PR, барьером быть перестаёт.
+  #
+  # Диапазон `"${BASE}..HEAD" "^${ah}"` — коммиты, достижимые из HEAD, но НЕ из базы события и
+  # НЕ из аудированной вершины: ровно собственная работа ветки после вердикта. `--no-merges`
+  # снимает merge-of-main, который иначе внёс бы чужое дерево через диф к первому родителю.
+  #
+  # НАЗВАННЫЙ ПРЕДЕЛ: разрешение конфликта, выполненное В САМОМ merge-коммите, `--no-merges`
+  # пропустит. Это принятый остаток, а не недосмотр: альтернатива (учитывать merge-коммиты)
+  # возвращает ровно тот ложный красный, ради которого правка сделана. Пробы формы —
+  # `scripts/tests/red_gate_meta.sh` GM-16b (база двигалась ⇒ проход) и GM-16c (ветка правила
+  # гейт сама ⇒ блок; анти-бланкет: «не считать чужое» не смеет выродиться в «не считать ничего»).
   if in_list "${vd}" "${PASSING_VERDICTS}"; then
     touched=""
     while IFS= read -r t; do
       [ -n "${t}" ] || continue
       is_gate_class "${t}" && touched="${touched} ${t}"
-    done < <(git diff --name-only "${ah}" HEAD 2>/dev/null || true)
+    done < <(git log --format='' --name-only --no-merges "${BASE}..HEAD" "^${ah}" 2>/dev/null \
+             | sort -u || true)
     if [ -n "${touched}" ]; then
       if grep -q 'ALLOW-SUBJECT-CHANGE:' <<<"$(git log --format='%B' "${ah}..HEAD" 2>/dev/null || true)"; then
         echo "NOTE  ${f}: subject-lock открыт явным ALLOW-SUBJECT-CHANGE (аудит-след, НЕ доказательство — F-064-6):${touched}"
