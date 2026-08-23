@@ -144,6 +144,28 @@ fmt чисты. **Дальше — tester**, промпт у founder'а.
    `next_artifact_id.sh` и уронили CI. `reserve_artifact_id.sh` существует ровно против
    этого и не был ни в одном мандате. **Резерв — обязательная строка мандата.**
 
+## 7. ГДЕ ЛЕЖИТ КАКОЙ ВЕРДИКТ — ни один не в `main`
+
+Проверено командой: все восемь вердиктов этой сессии живут на ветках своих предметов, а не
+в `main`. Ссылка по одному идентификатору следующую сессию НЕ приведёт к файлу — отсюда
+таблица. Читать так: `git show <ветка>:<путь>`.
+
+| ID | ветка | путь |
+|---|---|---|
+| `A-014` | `feat/M-69-window-guard` | `research/arbitration/A-014-m69-window-guard.md` |
+| `A-015` | `fix/M-65-battery-recalibration` | `research/arbitration/A-015-m65-n2-absent-config.md` |
+| `C-121` `C-122` `C-123` | `fix/resource-oracle-barrier` | `research/critiques/C-12{1,2,3}-*.md` |
+| `C-125` `C-126` | `fix/M-65-battery-recalibration` | `research/critiques/C-12{5,6}-*.md` |
+| `R-100`…`R-103`, `R-107`, `R-108` | `harness/verdict-archive-class` | `research/reviews/R-1*.md` |
+| `R-109` | `harness/archive-id-universe` | `research/reviews/R-109-pr60-archive-recheck.md` |
+| `R-110` (M-65, вердикт reviewer'а) | `fix/M-65-battery-recalibration` | `research/reviews/R-110-M-65-impl-rev3.md` |
+| `R-110` (П-014, вердикт reviewer'а) | `feat/p014-depth-provenance` | `research/reviews/R-110-p014-depth-provenance.md` |
+
+**Осторожно: номер `R-110` занят ДВАЖДЫ** — это остаток гонки аллокатора 22.08. Один занят
+переномерованным вердиктом M-65, второй выдан клоном на ветке `П-014`. Пара разойдётся при
+merge'е и уронит `artifact-ids`; развести ДО вливания любой из двух веток. Это восьмая пара
+класса `TD-156`, и она наша собственная, свежая.
+
 ## Cross-references
 - `research/arbitration/A-014` (M-69), `A-015` (M-65 N-2)
 - `research/reviews/R-098` `R-099` `R-103` `R-106` `R-107` `R-108` `R-109` `R-110`
