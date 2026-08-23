@@ -180,7 +180,7 @@ positive_control() {
 }
 
 echo "── Привязка вердикта к предмету + subject-lock + отсутствие (M-60b G3) ──"
-echo "── сценарии GM-1..GM-37; GM-16 СОЖЖЁН (спека M-60b §4, шапка выше) ──"
+echo "── сценарии GM-1..GM-39; GM-16 СОЖЖЁН (спека M-60b §4, шапка выше) ──"
 echo "барьер: ${BARRIER}"
 echo
 positive_control
@@ -860,6 +860,70 @@ else
     || fail "GM-37 ЛОЖНЫЙ КРАСНЫЙ: барьер судит сам merge-ref, и файл, который слияние СЛИЛО \
 из обеих сторон, засчитан правкой ветки. Ветка после своего вердикта гейт не трогала — \
 конечная точка обязана быть вершиной ВЕТКИ, а не синтезированным merge-ref'ом"
+fi
+
+# ── GM-38 / GM-39 — SYNC-MERGE ВНУТРИ ВЕТКИ ПРИ УСТАРЕВШЕЙ БАЗЕ ──────────────────────
+# Пара, названная `C-133` как минимально достаточная. Форма рутинная: долгоживущий PR
+# подтягивает `main` в себя (`git merge main`), и работа базы становится ДОСТИЖИМОЙ со стороны
+# ветки. При устаревшей базе события диапазон `BASE..HEAD^2` втягивает её целиком — спасает
+# ТОЛЬКО исключение `^HEAD^1`. Прежние сценарии этой формы не строили: у них ветка либо не
+# сливала базу в себя, либо база была свежей, и оба компонента (`^HEAD^1` и диапазон поиска
+# токена) оставались незапиннутыми — мутанты переживали пробу 44/44.
+
+# GM-38 — ЛОЖНЫЙ КРАСНЫЙ: правку гейта внесла БАЗА, ветка её лишь втянула sync-merge'ем.
+mk_repo R; B0="$(head_of "$R")"
+( cd "$R" && git checkout -q -b feat-sync2 ) || die "GM-38: ветка не создана"
+add_verdict "$R" "APPROVE" "a3ka/hft-platform" "$B0" "$B0"
+( cd "$R" && git checkout -q - ) || die "GM-38: возврат на базу"
+touch_file "$R" "${GATE_CLASS_FILE}" "правка гейта БАЗОЙ после форка (чужой влитый PR)"
+MAIN_TIP="$(head_of "$R")"
+( cd "$R" && git checkout -q feat-sync2 && git merge -q --no-ff "${MAIN_TIP}" \
+    -m "sync: git merge main в ветку — рутина долгоживущего PR" ) || die "GM-38: sync-merge"
+BRANCH_TIP="$(head_of "$R")"
+( cd "$R" && git checkout -q - && git merge -q --no-ff feat-sync2 -m "merge-ref: слияние ветки в базу" ) \
+  || die "GM-38: merge-ref не собран"
+setup_ok=1
+( cd "$R" && [ "$(git rev-parse HEAD^1)" = "${MAIN_TIP}" ] && [ "$(git rev-parse HEAD^2)" = "${BRANCH_TIP}" ] ) || setup_ok=0
+# ПРЕДМЕТ: правка базы ДОСТИЖИМА со стороны ветки — иначе исключать нечего и сценарий пуст.
+( cd "$R" && [ -n "$(git log --format='' --name-only "${B0}..HEAD^2" -- "${GATE_CLASS_FILE}")" ] ) || setup_ok=0
+if [ "$setup_ok" -ne 1 ]; then
+  fail "GM-38 SETUP НЕ СОСТОЯЛСЯ: sync-merge не втянул правку базы в сторону ветки — компонент \
+^HEAD^1 на этой фикстуре не несущий, и она ничего не пиннит"
+else
+  run_barrier "$R" "${B0}" pull_request "${B0}" mergeref \
+    && pass "GM-38 sync-merge при устаревшей базе: правка БАЗЫ не приписана ветке (^HEAD^1 несущий)" \
+    || fail "GM-38 ЛОЖНЫЙ КРАСНЫЙ: ветка втянула правку гейта из базы sync-merge'ем, и барьер \
+засчитал её работой ветки. Устаревшая база + sync-merge — рутина долгоживущего PR, а не экзотика"
+fi
+
+# GM-39 — ЛОЖНОЕ ЗЕЛЁНОЕ (направление хуже): чужой токен из базы, втянутый sync-merge'ем,
+# не смеет открывать лок на СОБСТВЕННОЕ нарушение ветки.
+mk_repo R; B0="$(head_of "$R")"
+( cd "$R" && git checkout -q -b feat-leak2 ) || die "GM-39: ветка не создана"
+add_verdict "$R" "APPROVE" "a3ka/hft-platform" "$B0" "$B0"
+touch_file "$R" "${GATE_CLASS_FILE}" "правка гейта ВЕТКОЙ после своего APPROVE, СВОЕГО токена нет"
+( cd "$R" && git checkout -q - ) || die "GM-39: возврат на базу"
+touch_file "$R" "docs/DESIGN.md" "ALLOW-SUBJECT-CHANGE: чужой токен, выданный ДРУГОМУ предмету"
+MAIN_TIP="$(head_of "$R")"
+( cd "$R" && git checkout -q feat-leak2 && git merge -q --no-ff "${MAIN_TIP}" \
+    -m "sync: git merge main в ветку" ) || die "GM-39: sync-merge"
+( cd "$R" && git checkout -q - && git merge -q --no-ff feat-leak2 -m "merge-ref: слияние ветки в базу" ) \
+  || die "GM-39: merge-ref не собран"
+setup_ok=1
+# ПРЕДМЕТ: чужой токен ДОСТИЖИМ со стороны ветки (втянут sync-merge'ем) — иначе фикстура
+# вырождается в GM-16e, где он лежит только на стороне базы.
+( cd "$R" && git log --format='%B' "${B0}..HEAD^2" | grep -q 'ALLOW-SUBJECT-CHANGE' ) || setup_ok=0
+# и при этом СОБСТВЕННЫХ токенов у ветки нет
+( cd "$R" && git log --format='%B' "${B0}..HEAD^2" "^${MAIN_TIP}" | grep -q 'ALLOW-SUBJECT-CHANGE' ) && setup_ok=0
+if [ "$setup_ok" -ne 1 ]; then
+  fail "GM-39 SETUP НЕ СОСТОЯЛСЯ: чужой токен обязан быть достижим со стороны ветки и \
+отсутствовать в её собственных коммитах — иначе сценарий повторяет GM-16e и ничего нового не пиннит"
+else
+  run_barrier "$R" "${B0}" pull_request "${B0}" mergeref \
+    && fail "GM-39 ЛОЖНОЕ ЗЕЛЁНОЕ: чужой ALLOW-SUBJECT-CHANGE, втянутый в ветку sync-merge'ем, \
+открыл лок на её СОБСТВЕННОЕ нарушение. Деградация самоусиливающаяся: токен уезжает в main и \
+гасит локи всех, кто потом подтянет main к себе" \
+    || pass "GM-39 чужой токен, втянутый sync-merge'ем, лок НЕ открывает (диапазон токена сужен тем же исключением)"
 fi
 
 echo
