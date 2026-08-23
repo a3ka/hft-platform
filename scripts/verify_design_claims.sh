@@ -1003,9 +1003,17 @@ def check5(root, design_text):
         fail("5-ФАЗЫ", "§10 найден, но ни одной таблицы фаз в нём не распознано — setup-guard")
         return
 
-    milestones_dir = os.path.join(root, "milestones")
+    # Норма Р-2 (`04-workflow.md` §2): спека закрытого милестоуна уезжает в `docs/archive/`
+    # вместе с гейтом. Милестоун при этом НЕ исчезает — он закрыт, и фаза вправе его
+    # цитировать. Без второго каталога здесь вынос 26 спек уронил бы check5 на пустом
+    # месте: «фаза объявлена пройденной, но milestones/M-NN-*.md отсутствует» — при том
+    # что отсутствует он ровно потому, что милестоун ПРОЙДЕН.
+    # Требование 1 нормы называло только аллокатор номеров; сцепленных барьеров ДВА, и
+    # этот второй не был назван ни автором нормы, ни тремя кругами её перепроверки.
+    milestones_dirs = [os.path.join(root, "milestones"), os.path.join(root, "docs", "archive")]
+    milestones_dir = milestones_dirs[0]
     milestone_status = {}
-    if os.path.isdir(milestones_dir):
+    for milestones_dir in [d for d in milestones_dirs if os.path.isdir(d)]:
         for fn in os.listdir(milestones_dir):
             mm = re.match(r"M-(\d+).*\.md$", fn)
             if not mm:

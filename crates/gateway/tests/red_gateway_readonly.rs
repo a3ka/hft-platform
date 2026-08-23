@@ -2,7 +2,8 @@
 //!
 //! Gateway НЕ пишет журнал. Функциональная проверка: байты ВСЕХ сегментов журнал-каталога
 //! до и после `snapshot`/`frames_since`/`replay` — идентичны. (Grep-канарейка «нет
-//! journal-writer импорта в gateway/src» — в `scripts/verify_M-22.sh`, дополняет этот тест.)
+//! journal-writer импорта в gateway/src» — была в гейте M-22, сданном в архив по норме Р-2
+//! (`docs/archive/verify_M-22.sh`); ЖИВЫМ сторожем инварианта остаётся этот тест.)
 //!
 //! Анти-плацебо: impl, который тронул бы журнал (append/ротация/компакция), изменит байты →
 //! падение. RED сейчас: `snapshot`/`frames_since`/`replay` = `unimplemented!()` (engine-dev).
