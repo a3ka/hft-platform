@@ -1760,6 +1760,27 @@ pub fn validate_selector(sel: &Selector) -> io::Result<()> {
             ),
         ));
     }
+    // M-69 (GW-I-14, R7/PL-I-5): отрицательное `window_ms` запрещено. `None` и `Some(0)`
+    // проходят — легитимный offline-режим (research-cli / replay-tutor / чекпоинтер M-38b,
+    // где `0` уже принят как явный offline через argv). `Some(w<0)` же ведёт себя как
+    // unbounded в `window_lo_time_s`, но ОТЛИЧАЕТСЯ от `None` в `selector_fingerprint` ⇒
+    // чекпоинт снимается под режимом, которого оператор не заказывал, и остаётся валидным
+    // по CRC (класс TD-019/TD-020 — мусор, выглядящий валидным). Гвард живёт ЗДЕСЬ, а не
+    // только в `gateway-serve::serve_config_from_env`: `Selector` собирают напрямую
+    // (M-38b, M-39, research-cli), гвард ТОЛЬКО в транспорте оставил бы байпас-поверхность.
+    if let Some(w) = sel.window_ms {
+        if w < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "GW-I-14: selector.window_ms={w} отрицателен — окно должно быть либо \
+                     None (offline), либо Some(W>0); Some(w<0) ведёт себя как unbounded \
+                     при непустом поле ⇒ selector_fingerprint расходится с offline ⇒ \
+                     чекпоинт снимается под незаказанным режимом"
+                ),
+            ));
+        }
+    }
     Ok(())
 }
 
