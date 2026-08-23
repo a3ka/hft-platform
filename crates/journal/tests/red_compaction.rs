@@ -12,38 +12,59 @@
 //! `ColdCopyProof`). Данные незаменимы; «сжали и удалили, а там мусор» недопустимо.
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
 use std::io::Write;
-use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 
 use contracts::{DataSource, EventKind, Level, MdPayload, Venue};
 use journal::{EpochFilter, Journal, WriterConfig, DEFAULT_COMPACT_LEVEL};
 
-static CUR: AtomicUsize = AtomicUsize::new(0);
-static PEAK: AtomicUsize = AtomicUsize::new(0);
+// УЧЁТ ПОТОКОВЫЙ, А НЕ ПРОЦЕССНЫЙ (TD-098/TD-129, барьер check_resource_oracles.sh).
+//
+// Прежняя редакция вела CUR/PEAK в `AtomicUsize` на весь процесс, а `cargo test` гоняет
+// `#[test]` одного бинаря ПАРАЛЛЕЛЬНЫМИ потоками: `PEAK.fetch_max` брал максимум по всему
+// процессу, и аллокации соседа попадали в замер. Исход зависел от планировщика — тот же
+// код давал зелёное на PR и красное на `main`. Обязательный чек становился лотереей, а
+// правильной реакцией на красное объявлялся перезапуск.
+//
+// `const`-инициализатор обязателен: он исключает ленивую инициализацию TLS, а с ней
+// повторный вход в аллокатор из самого аллокатора. `try_with` — на время разрушения TLS,
+// когда доступ уже невозможен: такая аллокация не считается, она вне замера.
+thread_local! {
+    static T_CUR: Cell<usize> = const { Cell::new(0) };
+    static T_PEAK: Cell<usize> = const { Cell::new(0) };
+}
 
 struct Counting;
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, l: Layout) -> *mut u8 {
         let p = System.alloc(l);
         if !p.is_null() {
-            let c = CUR.fetch_add(l.size(), SeqCst) + l.size();
-            PEAK.fetch_max(c, SeqCst);
+            let _ = T_CUR.try_with(|cur| {
+                let c = cur.get().saturating_add(l.size());
+                cur.set(c);
+                let _ = T_PEAK.try_with(|pk| {
+                    if c > pk.get() {
+                        pk.set(c);
+                    }
+                });
+            });
         }
         p
     }
     unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
         System.dealloc(p, l);
-        CUR.fetch_sub(l.size(), SeqCst);
+        let _ = T_CUR.try_with(|cur| cur.set(cur.get().saturating_sub(l.size())));
     }
 }
 #[global_allocator]
 static GA: Counting = Counting;
 
 fn peak_delta<R>(f: impl FnOnce() -> R) -> (R, usize) {
-    let base = CUR.load(SeqCst);
-    PEAK.store(base, SeqCst);
+    let base = T_CUR.with(|c| c.get());
+    T_PEAK.with(|p| p.set(base));
     let r = f();
-    (r, PEAK.load(SeqCst).saturating_sub(base))
+    let peak = T_PEAK.with(|p| p.get());
+    (r, peak.saturating_sub(base))
 }
 
 fn snapshot(i: u64) -> EventKind {
