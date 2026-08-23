@@ -172,10 +172,10 @@ contract-RFC), `crates/gateway/src/bin/gateway-checkpoint.rs` (argv-путь у�
 
 | # | Status | Задача | Verify | Файлы |
 |---|---|---|---|---|
-| 1 | ⏳ OPEN | `serve_config_from_env`: `GATEWAY_WINDOW_MS` — parse-error и overflow → `Err`, сообщение НАЗЫВАЕТ переменную; `unset`/пусто/`0` → `None` (offline) | `cargo test -p gateway-serve --test red_window_guard_startup` | `crates/gateway-serve/src/lib.rs` |
-| 2 | ⏳ OPEN | Тот же вход: отрицательное значение → `Err` (не «молчаливый unbounded») | тот же оракул | `crates/gateway-serve/src/lib.rs` |
-| 3 | ⏳ OPEN | `validate_selector`: расширить на `window_ms` — `Some(w<0)` → `Err` (анти-байпас для чекпоинтера/shared-tailer/research-cli); `None`/`Some(0)`/`Some(w>0)` проходят | `cargo test -p gateway --test red_window_selector_guard` | `crates/gateway/src/lib.rs` |
-| 4 | ⏳ OPEN | Док-комментарий `serve_config_from_env` приведён к факту: строка «не парсится → offline unbounded» (`lib.rs:676-678`) сегодня описывает дефект как норму | `bash scripts/verify_M-69.sh` шаг 6 | `crates/gateway-serve/src/lib.rs` |
+| 1 | ✅ DONE | `serve_config_from_env`: `GATEWAY_WINDOW_MS` — parse-error и overflow → `Err`, сообщение НАЗЫВАЕТ переменную; `unset`/пусто/`0` → `None` (offline) | `cargo test -p gateway-serve --test red_window_guard_startup` | `crates/gateway-serve/src/lib.rs` |
+| 2 | ✅ DONE | Тот же вход: отрицательное значение → `Err` (не «молчаливый unbounded») | тот же оракул | `crates/gateway-serve/src/lib.rs` |
+| 3 | ✅ DONE | `validate_selector`: расширить на `window_ms` — `Some(w<0)` → `Err` (анти-байпас для чекпоинтера/shared-tailer/research-cli); `None`/`Some(0)`/`Some(w>0)` проходят | `cargo test -p gateway --test red_window_selector_guard` | `crates/gateway/src/lib.rs` |
+| 4 | ✅ DONE | Док-комментарий `serve_config_from_env` приведён к факту: строка «не парсится → offline unbounded» (`lib.rs:676-678`) сегодня описывает дефект как норму | `bash scripts/verify_M-69.sh` шаг 6 | `crates/gateway-serve/src/lib.rs` |
 | 5 | ✅ DONE | **(architect, в этом наборе)** Синхронизирован factual-документ `docs/plans/gateway-ws-contract.md` — ТРИ записи, не две: `:132` (таблица env), `:341` (устаревшая ссылка `docker-compose.yml:128` → `:139`), `:350-355` (замечание для оракула). Документ не помечен историческим и назван «фактура для RED-оракулов» ⇒ после фикса стал бы ложью, тиражируемой в следующие оракулы (класс `TD-155`) | `bash scripts/verify_M-69.sh` шаг 7 | `docs/plans/gateway-ws-contract.md` |
 
 **Канонизация offline (уточнение к задаче #1 по `C-099` B-2).** Три формы — `unset`, пустая
