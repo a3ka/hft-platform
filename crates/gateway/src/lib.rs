@@ -71,7 +71,12 @@ pub const GATEWAY_SCHEMA_VERSION: u32 = 8;
 ///
 /// 1: первая версия (M-38b rev2): i128 в postcard поддержан (задача #0), serialize ВСЕ
 ///    поля Reducer кроме selector (C-030 N1).
-pub const CKPT_SCHEMA_VERSION: u32 = 1;
+/// 2: `П-014` / `R-110` Б-1: в состоянии `Reducer` появился НАБЛЮДЁННЫЙ ОХВАТ сторон на
+///    момент последнего наблюдения глубины (`depth_reach_bid`/`depth_reach_ask`). Форма
+///    postcard-состояния изменилась, а postcard НЕ self-describing: без bump'а файл, снятый
+///    v1-кодом, разбирался бы со сдвигом хвоста вместо честного отказа. Bump = тихий rebuild
+///    кэша (GW-I-9б: файл прошлой версии — КЭШ, не ошибка), миграции не требуются.
+pub const CKPT_SCHEMA_VERSION: u32 = 2;
 
 /// M-38b: магия чекпоинт-файла (8 байт). Не путать с `SEGMENT_MAGIC` журнала — это
 /// внутренний кэш редьюсера, не сегмент данных.
@@ -612,6 +617,29 @@ struct Reducer {
     /// как «at» для окна и попадает в `Frame.at_ms` (нужен `apply()` для эвикции existing под
     /// финальное окно при fold'е кадров live==replay под нагрузкой).
     at_ms: i64,
+    /// `П-014` / `R-110` Б-1: НАБЛЮДЁННЫЙ ОХВАТ bid'а (доля от mid) на момент ПОСЛЕДНЕГО
+    /// НАБЛЮДЕНИЯ ГЛУБИНЫ — то есть последнего `L2Snapshot`, чьи числа реально легли в
+    /// `depth[].values`. `0.0` = глубина ещё не наблюдалась либо mid невычислим (односторонняя
+    /// книга) → полоса глубже 1.3 % честно помечается `not-observed`, а не выдаётся за факт.
+    ///
+    /// **Почему охват СНИМАЕТСЯ там, а не читается из живой `self.book` здесь.** Метка обязана
+    /// описывать ТЕ ЖЕ данные, из которых посчитаны числа полосы, а числа полосы snapshot-only:
+    /// `L2Delta` двигает книгу и heatmap, но `depth_series` НЕ пересчитывает (M-22 семантика,
+    /// см. ветку `MdPayload::L2Delta` в `apply`).
+    ///
+    /// Отсюда прямое следствие для `GW-I-4`/`VB-I-2` на ПРОД-ФОРМЕ (снимки 1 Гц против дельт
+    /// 100 мс, то есть ПОСЛЕДНИЙ кадр почти всегда delta-only): кадр без снимка не несёт строк
+    /// `depth_series` вовсе (их заводит только `L2Snapshot`), поэтому склейка
+    /// `snapshot(C)+frames` про сдвиг охвата после последнего снимка узнать НЕ МОЖЕТ ни при
+    /// какой семантике слияния, а полный реплей, читая живую книгу, его бы увидел — и пути
+    /// расходились. Замер до этой правки (снимок 5 % → дельта снимает дальние уровни, охват
+    /// 2.5 %, полоса 3 %): full = `not-observed … reach=0.025000`, merge =
+    /// `diff-reconstructed, liveness=confirmed`. Снятый охват делает метку функцией ТОГО ЖЕ
+    /// наблюдения, что и значения полосы, и оба пути сходятся тождественно.
+    depth_reach_bid: f64,
+    /// Пара к `depth_reach_bid` для `Side::Sell`: охват считается ПОСТОРОННЕ (`П-014`: bid и
+    /// ask расходятся; M-58 опроверг ask на трёх полосах из шести глубже 1.3 %).
+    depth_reach_ask: f64,
 }
 
 /// M-23: per-bucket book snapshot для heatmap. Хранит bids/asks отдельно (Vec<(price,size)>) +
@@ -666,6 +694,11 @@ impl Reducer {
             // M-37: timestamp (ms) последнего event; финальное «at» для `Frame.at_ms` и
             // для вычисления нижней границы окна `[at-W, at]` в `evict_window_state`.
             at_ms: 0,
+            // `П-014` / `R-110` Б-1: глубина ещё не наблюдалась — охват 0.0 по обеим сторонам;
+            // любая полоса глубже 1.3 % будет помечена `not-observed` (честное значение по
+            // умолчанию: до первого снимка мы действительно ничего не наблюдали).
+            depth_reach_bid: 0.0,
+            depth_reach_ask: 0.0,
         }
     }
 
@@ -928,6 +961,19 @@ impl Reducer {
                     row.values
                         .insert(time_s, depth_within(bids, asks, row.side, row.band));
                 }
+                // `П-014` / `R-110` Б-1: ОХВАТ СНИМАЕТСЯ РОВНО ЗДЕСЬ — в той же точке, где
+                // считаются САМИ ЧИСЛА полосы, и из того же наблюдения. `self.book` уже
+                // ЗАМЕЩЁН этим снимком (`apply_snapshot` — полная замена, ресинк), поэтому
+                // `max_reach_pct` даёт охват ИМЕННО `bids`/`asks` этого события, без
+                // дублирования арифметики mid и без аллокаций: O(1) по глубине книги (один
+                // `keys().next()` / `next_back()` поверх BTreeMap, `crates/book/src/lib.rs`
+                // `max_reach_pct`). Сторож горячего пути при этом УСИЛЕН, а не ослаблен:
+                // `snapshot()`/`finish_ref` книгу больше не трогает вовсе
+                // (`red_snapshot_noclone::o1_snapshot_allocation_does_not_grow_with_state`,
+                // потолок ×2.5), а цена здесь — два скаляра на СОБЫТИЕ снимка (1 Гц), не на
+                // каждую дельту (100 мс) и не на каждый вызов `finish_ref`.
+                self.depth_reach_bid = self.book.max_reach_pct(Side::Buy).unwrap_or(0.0);
+                self.depth_reach_ask = self.book.max_reach_pct(Side::Sell).unwrap_or(0.0);
             }
             MdPayload::L2Delta {
                 bids,
@@ -1021,19 +1067,44 @@ impl Reducer {
             }
         }
 
+        // П-014 / П-017: провенанс-метка `depth_band_provenance` — функция ТРЁХ величин
+        // (ширина полосы, сторона, наблюдённый охват этой стороны). Раньше метка зависела
+        // ТОЛЬКО от ширины полосы (`crates/gateway/src/lib.rs:1035`, прежняя редакция) — этого
+        // недостаточно ни для различия сторон (M-58: ask опровергнут на трёх из шести), ни
+        // для честности относительно фактического охвата книги после ресинка (`П-017`
+        // предусловие (а)).
+        //
+        // Охват берётся из `depth_reach_bid`/`depth_reach_ask` — СНЯТОГО в момент последнего
+        // наблюдения глубины (ветка `L2Snapshot` в `apply`), а НЕ из живой `self.book` здесь.
+        // Знание о ресинке по-прежнему НЕ ТРЕБУЕТСЯ (`П-014` явно): охват считается из того же
+        // наблюдения, из которого считается сама глубина. Причина именно такой точки съёма —
+        // `GW-I-4`/`VB-I-2` (`R-110` Б-1) на журнале с дельтами: подробный разбор и замер
+        // расхождения — в доке поля `Reducer::depth_reach_bid`.
+        //
+        // `finish_ref` теперь НЕ читает `self.book` вообще — это же и есть дисциплина
+        // `red_snapshot_noclone::o1_snapshot_allocation_does_not_grow_with_state` (потолок
+        // ×2.5): самое дорогое поле состояния на пути построения ответа не участвует.
+        let reach_bid = self.depth_reach_bid;
+        let reach_ask = self.depth_reach_ask;
+
         let depth_series = self
             .depth
             .iter()
-            .map(|row| DepthRow {
-                side: match row.side {
-                    Side::Buy => "bid",
-                    Side::Sell => "ask",
+            .map(|row| {
+                let reach = match row.side {
+                    Side::Buy => reach_bid,
+                    Side::Sell => reach_ask,
+                };
+                DepthRow {
+                    side: match row.side {
+                        Side::Buy => "bid",
+                        Side::Sell => "ask",
+                    }
+                    .to_string(),
+                    band_pct_e8: row.band_pct_e8,
+                    series: row.values.iter().map(|(&t, &v)| (t, v)).collect(),
+                    depth_band_provenance: depth_provenance_label(row.band_pct_e8, row.side, reach),
                 }
-                .to_string(),
-                band_pct_e8: row.band_pct_e8,
-                series: row.values.iter().map(|(&t, &v)| (t, v)).collect(),
-                depth_band_provenance: (row.band_pct_e8 > 1_300_000)
-                    .then(|| "diff-reconstructed, validated<=1.3%".to_string()),
             })
             .collect();
 
@@ -1271,6 +1342,47 @@ fn depth_within(bids: &[Level], asks: &[Level], side: Side, band: f64) -> i64 {
     }
 }
 
+/// П-014 / GW-I-DP: провенанс-метка `depth_band_provenance` как функция ТРЁХ величин —
+/// ширины полосы, СТОРОНЫ и наблюдённого охвата этой стороны.
+///
+/// | полоса | охват стороны | метка |
+/// |---|---|---|
+/// | ≤ 1.3% | любой | `None` (прежний VB-I-5, валидированный эталон) |
+/// | > 1.3%, внутри охвата, bid | band ≤ reach | `diff-reconstructed, liveness=confirmed` |
+/// | > 1.3%, внутри охвата, ask | band ≤ reach | `diff-reconstructed, liveness=unconfirmed` |
+/// | > 1.3%, ЗА охватом (любая сторона) | band > reach | `not-observed band=… reach=…` |
+///
+/// Основание чисел — M-58 (`research/data-quality/depth-verdict.md:80-98`): bid подтверждён
+/// на всех семи полосах (cancel_fraction 0.713–0.992), ask опровергнут на трёх из шести
+/// глубже 1.3 % (`[300,500)` = 0.419, `[800,1500)` = 0.247, `[3000,6000)` = 0.403). Замок
+/// `A-002` З-2 (`cancel_fraction` меряет насыщение, а не живость) снимать нельзя, поэтому
+/// liveness по стороне остаётся обязательным.
+///
+/// Форма `DepthRow` (поле `depth_band_provenance: Option<String>`) не меняется (П-014 п.3: bump
+/// `GATEWAY_SCHEMA_VERSION` — решение architect'а). Меняется только СОДЕРЖИМОЕ строки.
+fn depth_provenance_label(band_pct_e8: i64, side: Side, reach: f64) -> Option<String> {
+    // VB-I-5 (прежний, не сдвинут): ≤ 1.3% — валидированный эталон, метки не несёт.
+    if band_pct_e8 <= 1_300_000 {
+        return None;
+    }
+    let band = band_pct_e8 as f64 / 1e8;
+    if band > reach {
+        // П-017 предусловие (а): полоса ЗА наблюдённым охватом стороны — НЕ наблюдалась вовсе,
+        // и ставить liveness тут нельзя: живость — это утверждение о наблюдённой стороне, а
+        // наблюдения нет. Сторона в этой ветке не входит в начало метки (`starts_with` —
+        // требование `band_beyond_reach_is_named_not_observed`), численные `band=`/`reach=`
+        // печатаются для отладки (видно, насколько полоса вышла за охват).
+        Some(format!("not-observed band={:.6} reach={:.6}", band, reach))
+    } else {
+        // П-014: внутри охвата — liveness зависит от стороны (M-58 + A-002 З-2).
+        let liveness = match side {
+            Side::Buy => "confirmed",    // bid подтверждён на всех полосах
+            Side::Sell => "unconfirmed", // ask опровергнут на трёх из шести глубже 1.3 %
+        };
+        Some(format!("diff-reconstructed, liveness={}", liveness))
+    }
+}
+
 fn reduce_event_stream(
     stream: &mut journal::EventStream,
     selector: &Selector,
@@ -1383,9 +1495,24 @@ impl Snapshot {
                 let mut values: BTreeMap<i64, i64> = current.series.drain(..).collect();
                 values.extend(incoming.series.iter().copied());
                 current.series = values.into_iter().collect();
-                if current.depth_band_provenance.is_none() {
-                    current.depth_band_provenance = incoming.depth_band_provenance.clone();
-                }
+                // `П-014` / `R-110` Б-1: метка СЛЕДУЕТ ЗА incoming — та же close-семантика, что у
+                // ЗНАЧЕНИЙ полосы строкой выше (`values.extend` — последнее наблюдение бакета
+                // побеждает). Было `if current...is_none()` — «первый непустой побеждает», и пока
+                // метка была чистой функцией ШИРИНЫ полосы, это было тождеством: значение не менялось
+                // никогда. После `П-014` метка — функция наблюдённого ОХВАТА, а охват движется во
+                // времени (ресинк после гэпа урезает книгу до ~1.3 %) — и «первый побеждает»
+                // превратилось в ЗАЛИПАНИЕ: WS-клиент получает `Snapshot` ОДИН раз и дальше живёт
+                // на `Frame`'ах, то есть до переподключения читал бы `liveness=confirmed` о полосе,
+                // которой в книге больше нет (`PL-I-7`: деградация не выдаётся за норму). Обратная
+                // сторона тоже вредна: залипшее `not-observed` не снималось после восстановления.
+                //
+                // Почему БЕЗУСЛОВНО, а не «берём incoming, если он непуст»: метка — ЧИСТАЯ
+                // функция `(ширина, сторона, охват)` (`depth_provenance_label`), и для одного и того же
+                // `(side, band_pct_e8)` она `None` тогда и только тогда, когда полоса ≤ 1.3 % (`VB-I-5`) —
+                // то есть ОДИНАКОВО `None` в обоих операндах слияния. Значит «взять incoming» не может
+                // потерять непустую метку глубокой полосы, а условие вносило бы ту же асимметрию,
+                // из-за которой блокер и появился.
+                current.depth_band_provenance = incoming.depth_band_provenance.clone();
             } else {
                 self.series.depth_series.push(incoming.clone());
             }
