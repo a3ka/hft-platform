@@ -673,9 +673,13 @@ pub fn build_selector(
 /// - `GATEWAY_SYMBOL`      — дефолт `"BTCUSDT"`.
 /// - `GATEWAY_TIMEFRAME_MS`— дефолт `1000` (i64, parse).
 /// - `GATEWAY_BANDS`       — comma-separated float'ы, дефолт `"0.001"`.
-/// - `GATEWAY_WINDOW_MS`   — M-37: `None` если отсутствует/пусто/не парсится → offline
-///   unbounded; `Some(W_ms)` → bounded-window reducer в проде (анти-TD-020: без активного W
-///   прод-снапшот ООМ-ит).
+/// - `GATEWAY_WINDOW_MS`   — M-69 (GW-I-14): fail-closed гвард на СТАРТЕ. `unset`/пусто/
+///   пробелы/`"0"` канонизируются в `None` (offline, без bounded-окна — research-cli /
+///   replay-tutor / чекпоинтер M-38b); парсинг оборачивается в `match` — parse-error,
+///   переполнение `i64`, отрицательное значение → `Err` на старте с сообщением,
+///   называющим `GATEWAY_WINDOW_MS` (PL-I-5 риск R7; урок TD-020/TD-039, прод-дефолт
+///   `60000` остаётся рабочим — `docker-compose.yml`). Иначе `Some(W_ms>0)` → bounded-
+///   window reducer (анти-TD-020: без активного W прод-снапшот ООМ-ит).
 pub fn serve_config_from_env(
     get: impl Fn(&str) -> Option<String>,
 ) -> Result<server::ServeConfig, String> {
