@@ -158,13 +158,16 @@ fmt чисты. **Дальше — tester**, промпт у founder'а.
 | `C-125` `C-126` | `fix/M-65-battery-recalibration` | `research/critiques/C-12{5,6}-*.md` |
 | `R-100`…`R-103`, `R-107`, `R-108` | `harness/verdict-archive-class` | `research/reviews/R-1*.md` |
 | `R-109` | `harness/archive-id-universe` | `research/reviews/R-109-pr60-archive-recheck.md` |
-| `R-110` (M-65, вердикт reviewer'а) | `fix/M-65-battery-recalibration` | `research/reviews/R-110-M-65-impl-rev3.md` |
+| `R-111` (M-65, вердикт reviewer'а) | `fix/M-65-battery-recalibration` | `research/reviews/R-111-M-65-impl-rev3.md` |
 | `R-110` (П-014, вердикт reviewer'а) | `feat/p014-depth-provenance` | `research/reviews/R-110-p014-depth-provenance.md` |
 
-**Осторожно: номер `R-110` занят ДВАЖДЫ** — это остаток гонки аллокатора 22.08. Один занят
-переномерованным вердиктом M-65, второй выдан клоном на ветке `П-014`. Пара разойдётся при
-merge'е и уронит `artifact-ids`; развести ДО вливания любой из двух веток. Это восьмая пара
-класса `TD-156`, и она наша собственная, свежая.
+**Гонка аллокатора сработала ВТОРОЙ раз за день и уже ЗАКРЫТА.** `R-110` оказался занят
+дважды: переномерованным вердиктом M-65 и вердиктом клона по `П-014`. Виновник второго
+случая — ведущий architect: взял номер через `next_artifact_id.sh`, о вреде которого сам же
+писал коммитом ранее. Разведено: M-65-вердикт → `R-111`, номер взят РЕЗЕРВОМ. Пара
+разошлась бы при merge'е и уронила `artifact-ids` уже в `main`.
+**Вывод для новой сессии: `next_artifact_id.sh` не звать вообще, только**
+**`reserve_artifact_id.sh` с последующим `--release`.**
 
 ## Cross-references
 - `research/arbitration/A-014` (M-69), `A-015` (M-65 N-2)
