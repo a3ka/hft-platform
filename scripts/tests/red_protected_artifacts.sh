@@ -504,6 +504,158 @@ else
   expect "P23 древний токен НЕ благословляет evil merge воссозданного пути" deny "$(run_barrier "$r" push "$before")"
 fi
 
+# ── P24 (`TD-163` круг 3) — ПУТЬ РОЖДЁН В ТЕЛЕ MERGE'А: дискриминатор круга 2 здесь СЛЕП ──
+# `P23` закрыл КЛЕТКУ, а не КЛАСС. Он воссоздавал путь обычным коммитом side-ветки — такое
+# рождение видно `git log --diff-filter=A`, на котором стоял дискриминатор круга 2. Способ
+# обхода — воссоздать путь ПРЯМО В ТЕЛЕ merge'а: `git log` по умолчанию не показывает диффы
+# merge-коммитов, а `--full-history` их НЕ включает (включает `--diff-merges`, которого там
+# не было). `born_here` оставался пуст, fallback включался, древний токен благословлял
+# сегодняшнюю потерю — то самое ложное зелёное, ради которого писан `C-136` Б-1.
+#
+# Замер, из-за которого сценарий появился (фикстура ниже, прод-форма вызова):
+#   барьер `origin/main` → exit=1 (ловил) · барьер круга 2 `3edb657` → NOTE + exit=0 (пропускал)
+#
+# Сценарий строится ТЕМ СПОСОБОМ, каким послабление будут обходить, а не первым пришедшим в
+# голову (`docs/workflow/session-handover-2026-08-24.md` §5 п.4). Guard №2 ниже это и
+# закрепляет: он ТРЕБУЕТ, чтобы диффовый вопрос круга 2 давал ПУСТО, — иначе фикстура
+# скатилась бы обратно в класс `P23` и проверяла бы уже закрытое.
+r=$(new_repo)
+git -C "$r" rm -q milestones/M-01.md
+git -C "$r" commit -qm "chore(archive): древнее удаление
+
+ALLOW-ARTIFACT-DELETE: объяснённое удаление далёкого прошлого" >/dev/null
+ancient=$(git -C "$r" rev-parse HEAD)
+before=$(git -C "$r" rev-parse HEAD)
+# merge №1 — путь РОЖДАЕТСЯ в теле мержа (ни у одного родителя его нет)
+git -C "$r" checkout -q -b feat24; echo "работа" >> "$r/src.rs"; git -C "$r" commit -qam "feat24: работа"
+git -C "$r" checkout -q -
+git -C "$r" merge -q --no-commit --no-ff feat24 >/dev/null 2>&1
+mkdir -p "$r/milestones"; echo "спека воссоздана В ТЕЛЕ МЕРЖА" > "$r/milestones/M-01.md"
+git -C "$r" add milestones/M-01.md
+git -C "$r" commit -qm "merge feat24 (спека воссоздана ПРЯМО в теле мержа)"
+born_merge=$(git -C "$r" rev-parse HEAD)
+# merge №2 — тот же приём наоборот: путь выброшен САМИМ мержем, без токена
+git -C "$r" checkout -q -b feat24b; echo "ещё" >> "$r/src.rs"; git -C "$r" commit -qam "feat24b: работа"
+git -C "$r" checkout -q -
+git -C "$r" merge -q --no-commit --no-ff feat24b >/dev/null 2>&1
+git -C "$r" rm -q -f milestones/M-01.md >/dev/null 2>&1
+git -C "$r" commit -qm "merge feat24b (путь выброшен САМИМ мержем — evil merge)"
+p24_ok=1
+git -C "$r" merge-base --is-ancestor "$ancient" "$before" || p24_ok=0                            # токен ДО базы
+[ -z "$(git -C "$r" log --full-history --diff-filter=A --format='%H' "${before}..HEAD" -- milestones/M-01.md)" ] || p24_ok=0   # ⚠ дискриминатор круга 2 обязан быть СЛЕП
+git -C "$r" cat-file -e "${born_merge}:milestones/M-01.md" 2>/dev/null || p24_ok=0               # но путь ЖИЛ в диапазоне
+[ -z "$(git -C "$r" log --full-history --diff-filter=DR --format='%H' "${before}..HEAD" -- milestones/M-01.md)" ] || p24_ok=0  # и НИ ОДИН коммит его не удалял
+git -C "$r" cat-file -e HEAD:milestones/M-01.md 2>/dev/null && p24_ok=0                          # на HEAD его нет
+if [ "$p24_ok" -ne 1 ]; then
+  fail "P24 SETUP НЕ СОСТОЯЛСЯ: нужен древний токен-предок базы, путь РОЖДЁННЫЙ В ТЕЛЕ МЕРЖА \
+(и потому невидимый для --diff-filter=A), диапазон БЕЗ D/R и отсутствие пути на HEAD — иначе \
+сценарий скатывается в уже закрытый класс P23 и не давит на предмет круга 3"
+else
+  expect "P24 древний токен НЕ благословляет evil merge пути, РОЖДЁННОГО В ТЕЛЕ МЕРЖА" deny "$(run_barrier "$r" push "$before")"
+fi
+
+# ── P25 — ПОЗИТИВНЫЙ КОНТРОЛЬ сужения P24: рождение в мерже НЕ должно красить легитимное ──
+# Обратный вопрос к P24 (`testing.md`, «что пришлось ослабить рядом»): ужесточение обязано
+# оставить зелёным путь, который РОДИЛСЯ в теле мержа и был удалён В ДИАПАЗОНЕ С ТОКЕНОМ.
+# Здесь fallback не нужен вовсе — удаление лежит в диапазоне и судится своим телом.
+# Без этого сценария «запретить fallback рождённым здесь» нельзя отличить от «валить всё,
+# что родилось в мерже».
+r=$(new_repo)
+before=$(git -C "$r" rev-parse HEAD)
+git -C "$r" checkout -q -b feat25; echo "работа" >> "$r/src.rs"; git -C "$r" commit -qam "feat25: работа"
+git -C "$r" checkout -q -
+git -C "$r" merge -q --no-commit --no-ff feat25 >/dev/null 2>&1
+mkdir -p "$r/research/critiques"; echo "новый вердикт круга" > "$r/research/critiques/C-777.md"
+git -C "$r" add research/critiques/C-777.md
+git -C "$r" commit -qm "merge feat25 (вердикт заведён в теле мержа)"
+born25=$(git -C "$r" rev-parse HEAD)
+git -C "$r" rm -q research/critiques/C-777.md
+git -C "$r" commit -qm "chore(archive): вердикт уезжает в архив
+
+ALLOW-ARTIFACT-DELETE: осознанный перенос вердикта, причина названа" >/dev/null
+p25_ok=1
+git -C "$r" cat-file -e "${born25}:research/critiques/C-777.md" 2>/dev/null || p25_ok=0          # путь родился в мерже
+[ -z "$(git -C "$r" log --full-history --diff-filter=A --format='%H' "${before}..HEAD" -- research/critiques/C-777.md)" ] || p25_ok=0  # рождение невидимо диффу
+[ -n "$(git -C "$r" log --full-history --diff-filter=DR --format='%H' "${before}..HEAD" -- research/critiques/C-777.md)" ] || p25_ok=0 # удаление В диапазоне
+git -C "$r" cat-file -e HEAD:research/critiques/C-777.md 2>/dev/null && p25_ok=0                  # на HEAD его нет
+if [ "$p25_ok" -ne 1 ]; then
+  fail "P25 SETUP НЕ СОСТОЯЛСЯ: нужен путь, рождённый В ТЕЛЕ МЕРЖА и удалённый В ДИАПАЗОНЕ \
+с токеном — иначе позитивный контроль не проверяет, что ужесточение P24 не бланкетно"
+else
+  expect "P25 позитивный контроль: рождённый в мерже, удалён с токеном В диапазоне ⇒ проход" ok "$(run_barrier "$r" push "$before")"
+fi
+
+# ── P26 (`TD-163` круг 3) — ПУТЬ ВЕРНУЛСЯ В МАГИСТРАЛЬ И БЫЛ ВЫБРОШЕН ────────────────
+# Класс, который «рождён ли здесь» НЕ ловит: ветка форкнута ДО архивного переезда, значит
+# путь она НАСЛЕДУЕТ, а не рождает. Первый merge возвращает путь в магистраль (разрешение
+# modify/delete в пользу ветки), второй — молча выбрасывает. Рождения нет ⇒ fallback круга 2
+# и первой редакции круга 3 включался и находил древний токен.
+# Замер: барьер `origin/main` → exit=1 (ловил), барьер круга 2 → exit=0 (ложное зелёное).
+r=$(new_repo)
+git -C "$r" rm -q milestones/M-01.md
+git -C "$r" commit -qm "chore(archive): древнее удаление
+
+ALLOW-ARTIFACT-DELETE: объяснённое удаление далёкого прошлого" >/dev/null
+ancient=$(git -C "$r" rev-parse HEAD)
+git -C "$r" branch -q feat26 "${ancient}~1"          # ФОРК ДО переезда ⇒ путь унаследован
+git -C "$r" checkout -q feat26; echo "работа" >> "$r/src.rs"; git -C "$r" commit -qam "feat26: работа ветки"
+git -C "$r" checkout -q -
+before=$(git -C "$r" rev-parse HEAD)
+git -C "$r" merge -q --no-commit --no-ff feat26 >/dev/null 2>&1
+git -C "$r" checkout -q feat26 -- milestones/M-01.md   # путь ВОЗВРАЩЁН в магистраль
+git -C "$r" add -A; git -C "$r" commit -qm "merge feat26 (путь возвращён в магистраль)"
+back=$(git -C "$r" rev-parse HEAD)
+git -C "$r" checkout -q -b feat26b; echo "ещё" >> "$r/src.rs"; git -C "$r" commit -qam "feat26b: работа"
+git -C "$r" checkout -q -
+git -C "$r" merge -q --no-commit --no-ff feat26b >/dev/null 2>&1
+git -C "$r" rm -q -f milestones/M-01.md >/dev/null 2>&1
+git -C "$r" commit -qm "merge feat26b (путь выброшен САМИМ мержем)"
+p26_ok=1
+git -C "$r" merge-base --is-ancestor "$ancient" "$before" || p26_ok=0                              # токен ДО базы
+git -C "$r" cat-file -e "${before}:milestones/M-01.md" 2>/dev/null && p26_ok=0                     # на базе пути НЕТ
+git -C "$r" cat-file -e "${back}:milestones/M-01.md" 2>/dev/null || p26_ok=0                       # но он ВЕРНУЛСЯ в магистраль
+[ -z "$(git -C "$r" log --full-history --diff-filter=A --format='%H' "${before}..HEAD" -- milestones/M-01.md)" ] || p26_ok=0   # рождения НЕТ
+[ -z "$(git -C "$r" log --full-history --diff-filter=DR --format='%H' "${before}..HEAD" -- milestones/M-01.md)" ] || p26_ok=0  # и удаления в диапазоне нет
+git -C "$r" cat-file -e HEAD:milestones/M-01.md 2>/dev/null && p26_ok=0                            # на HEAD его нет
+if [ "$p26_ok" -ne 1 ]; then
+  fail "P26 SETUP НЕ СОСТОЯЛСЯ: нужен токен-предок базы, путь ОТСУТСТВУЮЩИЙ на базе, ВЕРНУВШИЙСЯ \
+в магистраль без рождения, диапазон без D/R и отсутствие пути на HEAD — иначе сценарий не давит \
+на условие магистрали"
+else
+  expect "P26 древний токен НЕ объясняет потерю пути, ВЕРНУВШЕГОСЯ в магистраль" deny "$(run_barrier "$r" push "$before")"
+fi
+
+# ── P27 (`TD-163` круг 3) — ПУТЬ ЕСТЬ В САМОЙ БАЗЕ, evil merge его выбрасывает ────────
+# Самый грубый вид того же класса, и он тоже проходил: путь удалён с токеном, ЗАТЕМ воссоздан
+# в магистрали ДО базы. На базе он ЕСТЬ. Evil merge выбрасывает его — рождения в диапазоне нет,
+# fallback включается, древнее удаление объявляется объяснением. Это отказ барьера в его
+# собственном несущем случае: артефакт, живой на базе, исчез молча.
+r=$(new_repo)
+git -C "$r" rm -q research/reviews/R-001.md
+git -C "$r" commit -qm "chore(archive): древнее удаление вердикта
+
+ALLOW-ARTIFACT-DELETE: объяснённое удаление далёкого прошлого" >/dev/null
+ancient=$(git -C "$r" rev-parse HEAD)
+mkdir -p "$r/research/reviews"; echo "вердикт заведён заново" > "$r/research/reviews/R-001.md"
+git -C "$r" add -A; git -C "$r" commit -qm "docs: вердикт воссоздан в магистрали"
+before=$(git -C "$r" rev-parse HEAD)
+git -C "$r" checkout -q -b feat27; echo "работа" >> "$r/src.rs"; git -C "$r" commit -qam "feat27: работа"
+git -C "$r" checkout -q -
+git -C "$r" merge -q --no-commit --no-ff feat27 >/dev/null 2>&1
+git -C "$r" rm -q -f research/reviews/R-001.md >/dev/null 2>&1
+git -C "$r" commit -qm "merge feat27 (вердикт выброшен САМИМ мержем)"
+p27_ok=1
+git -C "$r" merge-base --is-ancestor "$ancient" "$before" || p27_ok=0                              # токен ДО базы
+git -C "$r" cat-file -e "${before}:research/reviews/R-001.md" 2>/dev/null || p27_ok=0              # на базе путь ЖИВ
+[ -z "$(git -C "$r" log --full-history --diff-filter=DR --format='%H' "${before}..HEAD" -- research/reviews/R-001.md)" ] || p27_ok=0
+git -C "$r" cat-file -e HEAD:research/reviews/R-001.md 2>/dev/null && p27_ok=0                      # на HEAD его нет
+if [ "$p27_ok" -ne 1 ]; then
+  fail "P27 SETUP НЕ СОСТОЯЛСЯ: нужен токен-предок базы, путь ЖИВОЙ НА БАЗЕ, диапазон без D/R \
+и отсутствие пути на HEAD — иначе сценарий не давит на несущий случай барьера"
+else
+  expect "P27 путь, живой НА БАЗЕ, не может исчезнуть под древний токен" deny "$(run_barrier "$r" push "$before")"
+fi
+
 # ── P18 (rev9, ЛОЖНОЕ СРАБАТЫВАНИЕ — main реально покраснел 2026-08-03) ───────────────
 # ПЕРЕИМЕНОВАНИЕ артефакта в ДРУГОЙ защищённый путь, сделанное коммитом ВНУТРИ feat-ветки
 # и влитое merge'ем, обязано проходить: это легитимная миграция, а не удаление.
