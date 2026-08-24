@@ -656,6 +656,211 @@ else
   expect "P27 путь, живой НА БАЗЕ, не может исчезнуть под древний токен" deny "$(run_barrier "$r" push "$before")"
 fi
 
+# ═══════════════════════════════════════════════════════════════════════════════════════
+# КРУГ 4 (`A-017` Р-3, кандидат B) — АВТО-ВОСПРОИЗВОДИМОСТЬ ДРОПА.
+#
+# Имя-уровневая семья предикатов НЕ сходится (четыре круга, пять дыр — `A-017` Р-4), и пятое
+# сужение по имени арбитражем ЗАПРЕЩЕНО. Кандидат B спрашивает САМО свойство: произвела бы
+# дроп авто-резолюция, или его изготовили руками. Ниже — пять ловушек его конструкции,
+# названные арбитром поимённо (Р-3(iii)), каждая отдельным сценарием.
+# ═══════════════════════════════════════════════════════════════════════════════════════
+
+# ── P28 (`C-137` Б-1 / `A-017` Р-2) — РЕБРО ПРЕДКА: дроп рукотворный ─────────────────
+# Путь въезжает в push вложенным мержем старой ветки: он НЕ рождён (есть у родителя) и НЕ в
+# магистрали (не на first-parent-цепочке). Оба имя-уровневых условия слепы. Кандидат B видит:
+# авто-резолюция финального мержа путь СОХРАНИЛА БЫ, значит дроп изготовлен руками.
+r=$(new_repo)
+git -C "$r" checkout -q -b old28
+echo "работа старой ветки" >> "$r/src.rs"; git -C "$r" commit -qam "old28: работа"
+git -C "$r" checkout -q -
+git -C "$r" rm -q milestones/M-01.md
+git -C "$r" commit -qm "chore(archive): древний переезд
+
+ALLOW-ARTIFACT-DELETE: объяснённое удаление далёкого прошлого" >/dev/null
+before=$(git -C "$r" rev-parse HEAD)
+git -C "$r" checkout -q -b feat28
+echo "работа" >> "$r/src.rs"; git -C "$r" commit -qam "feat28: работа"
+git -C "$r" merge -q --no-commit --no-ff old28 >/dev/null 2>&1
+git -C "$r" checkout old28 -- milestones/M-01.md          # путь СОХРАНЁН рукой
+git -C "$r" add -A; git -C "$r" commit -qm "merge old28 (путь сохранён рукой)"
+feat28=$(git -C "$r" rev-parse HEAD)
+git -C "$r" checkout -q -
+git -C "$r" merge -q --no-commit --no-ff feat28 >/dev/null 2>&1
+git -C "$r" rm -q -f milestones/M-01.md >/dev/null 2>&1
+git -C "$r" commit -qm "merge feat28 (путь выброшен рукой — evil merge)"
+p28_ok=1
+[ -n "$(git -C "$r" ls-tree -r --name-only "$(git -C "$r" merge-tree --write-tree "$before" "$feat28" | head -1)" -- milestones)" ] || p28_ok=0   # авто СОХРАНИЛА БЫ
+[ -z "$(git -C "$r" log --full-history --diff-filter=A --format='%H' "${before}..HEAD" -- milestones/M-01.md)" ] || p28_ok=0                     # не рождён
+git -C "$r" cat-file -e HEAD:milestones/M-01.md 2>/dev/null && p28_ok=0                                                                          # нет на HEAD
+if [ "$p28_ok" -ne 1 ]; then
+  fail "P28 SETUP НЕ СОСТОЯЛСЯ: нужен путь БЕЗ рождения в диапазоне, который авто-резолюция \
+СОХРАНИЛА БЫ, и которого нет на HEAD — иначе сценарий не давит на авто-воспроизводимость"
+else
+  expect "P28 ребро предка: авто-резолюция сохранила бы ⇒ дроп РУКОТВОРНЫЙ ⇒ deny" deny "$(run_barrier "$r" push "$before")"
+fi
+
+# ── P29 (`TD-163` — ПОЗИТИВНЫЙ КОНТРОЛЬ, важнее всех остальных) ──────────────────────
+# Ровно тот случай, ради которого fallback вводился: ветка форкнута ДО архивного переезда,
+# путь НАСЛЕДУЕТ и не трогает, авто-резолюция сама его удаляет. Барьер `origin/main` здесь
+# красен — это и есть `TD-163`, сорвавший деплой дважды. Если кандидат B покраснеет тут,
+# он вернул ложное красное, и всё лечение бессмысленно.
+r=$(new_repo)
+git -C "$r" checkout -q -b old29
+echo "работа" >> "$r/src.rs"; git -C "$r" commit -qam "old29: работа, путь НЕ тронут"
+git -C "$r" checkout -q -
+git -C "$r" rm -q milestones/M-01.md
+git -C "$r" commit -qm "chore(archive): переезд по норме Р-2
+
+ALLOW-ARTIFACT-DELETE: перенос закрытой спеки по норме Р-2" >/dev/null
+before=$(git -C "$r" rev-parse HEAD)
+git -C "$r" merge -q --no-ff -m "merge old29" old29 >/dev/null 2>&1
+p29_ok=1
+[ -z "$(git -C "$r" ls-tree -r --name-only "$(git -C "$r" merge-tree --write-tree "$before" old29 | head -1)" -- milestones)" ] || p29_ok=0  # авто УДАЛИЛА БЫ
+git -C "$r" cat-file -e "old29:milestones/M-01.md" 2>/dev/null || p29_ok=0            # ветка путь НЕСЁТ
+git -C "$r" cat-file -e HEAD:milestones/M-01.md 2>/dev/null && p29_ok=0               # на HEAD его нет
+if [ "$p29_ok" -ne 1 ]; then
+  fail "P29 SETUP НЕ СОСТОЯЛСЯ: нужна ветка, НЕСУЩАЯ путь, при авто-резолюции его удаляющей — \
+иначе позитивный контроль TD-163 не проверяет ничего"
+else
+  expect "P29 TD-163 легитимен: чистое наследование, авто-резолюция удаляет ⇒ проход" ok "$(run_barrier "$r" push "$before")"
+fi
+
+# ── P30 (ловушка 1) — КОНФЛИКТ ПО ЧУЖОМУ ПУТИ не смеет красить ───────────────────────
+# `git merge-tree` возвращает ≠0 при конфликте ГДЕ УГОДНО. Вердикт по защищённому пути обязан
+# браться из СПИСКА конфликтующих путей, а не из кода возврата. Без этого сценария наивная
+# реализация «rc≠0 ⇒ рукотворно» проходит P28/P29 и красит любой push с чужим конфликтом.
+r=$(new_repo)
+git -C "$r" checkout -q -b old30
+echo "ветка правит src" >> "$r/src.rs"; git -C "$r" commit -qam "old30"
+git -C "$r" checkout -q -
+git -C "$r" rm -q milestones/M-01.md
+git -C "$r" commit -qm "chore(archive): переезд
+
+ALLOW-ARTIFACT-DELETE: объяснённое удаление далёкого прошлого" >/dev/null
+echo "main правит src ИНАЧЕ" >> "$r/src.rs"; git -C "$r" commit -qam "main правит src"
+before=$(git -C "$r" rev-parse HEAD)
+git -C "$r" merge --no-ff --no-edit old30 >/dev/null 2>&1 || {
+  git -C "$r" checkout -q --ours src.rs 2>/dev/null; git -C "$r" add -A
+  git -C "$r" commit -qm "merge old30 (конфликт по src.rs разрешён)"; }
+p30_ok=1
+git -C "$r" merge-tree --write-tree "$before" old30 >/dev/null 2>&1 && p30_ok=0   # rc обязан быть ≠0
+git -C "$r" cat-file -e HEAD:milestones/M-01.md 2>/dev/null && p30_ok=0
+if [ "$p30_ok" -ne 1 ]; then
+  fail "P30 SETUP НЕ СОСТОЯЛСЯ: нужен конфликт ПО ЧУЖОМУ пути (rc≠0) при защищённом пути, \
+отсутствующем на HEAD — иначе ловушка 1 не проверяется"
+else
+  expect "P30 ловушка 1: конфликт по чужому пути ⇒ вердикт из списка путей, не из rc ⇒ проход" ok "$(run_barrier "$r" push "$before")"
+fi
+
+# ── P31 (ловушка 2) — ОТМЫВАНИЕ ЦЕПОЧКОЙ ────────────────────────────────────────────
+# Рукотворный дроп совершается на ВНУТРЕННЕМ мерже, финальный — авто-чист. Реализация,
+# смотрящая только на вершину, объявит push легитимным.
+#
+# ⚠ ВНУТРЕННИЙ ДРОП ОБЯЗАН БЫТЬ МЕРЖЕМ, а не `git rm`. Первая редакция сценария роняла путь
+# обычным коммитом — такой виден `git log --diff-filter=DR`, попадает в `removed_by`, и
+# сценарий отклонялся СТАРЫМ условием, ни разу не дойдя до кандидата B. Вскрыто мутацией
+# `L2` («смотреть только вершину»): она обязана была уронить P31 и не уронила. То есть проба
+# утверждала бы покрытие ловушки 2, не покрывая её.
+r=$(new_repo)
+base31=$(git -C "$r" rev-parse --abbrev-ref HEAD)   # ⚠ ИМЯ ветки, а не `checkout -`
+git -C "$r" checkout -q -b old31
+echo "работа старой ветки" >> "$r/src.rs"; git -C "$r" commit -qam "old31: работа"
+git -C "$r" checkout -q "$base31"
+git -C "$r" rm -q milestones/M-01.md
+git -C "$r" commit -qm "chore(archive): древний переезд
+
+ALLOW-ARTIFACT-DELETE: объяснённое удаление далёкого прошлого" >/dev/null
+before=$(git -C "$r" rev-parse HEAD)
+# mid31: путь ВОЗВРАЩЁН рукой, затем ВЫБРОШЕН рукой — оба акта внутри МЕРЖЕЙ
+git -C "$r" checkout -q -b mid31
+git -C "$r" merge -q --no-commit --no-ff old31 >/dev/null 2>&1
+git -C "$r" checkout old31 -- milestones/M-01.md; git -C "$r" add -A
+git -C "$r" commit -qm "mid31: merge old31, путь сохранён рукой"
+git -C "$r" checkout -q -b tmp31 old31
+echo "ещё" >> "$r/src.rs"; git -C "$r" commit -qam "tmp31: работа"
+git -C "$r" checkout -q mid31
+git -C "$r" merge -q --no-commit --no-ff tmp31 >/dev/null 2>&1
+git -C "$r" rm -q -f milestones/M-01.md >/dev/null 2>&1
+git -C "$r" commit -qm "mid31: merge tmp31 — путь выброшен рукой ВНУТРИ МЕРЖА"
+# ⚠ Возврат ПО ИМЕНИ. Первая редакция писала `checkout -`, и «предыдущей» оказывалась `tmp31`:
+# финальный мерж уходил не на ту ветку, диапазон получался другой, и сценарий проходил мимо
+# предмета. Guard'ы этого не ловили — они смотрели на HEAD, а он «выглядел правильно».
+git -C "$r" checkout -q "$base31"
+git -C "$r" merge -q --no-ff -m "финальный мерж — авто-чистый" mid31 >/dev/null 2>&1
+p31_ok=1
+git -C "$r" cat-file -e HEAD:milestones/M-01.md 2>/dev/null && p31_ok=0                        # нет на HEAD
+[ -z "$(git -C "$r" log --full-history --diff-filter=DR --format='%H' "${before}..HEAD" -- milestones/M-01.md)" ] || p31_ok=0  # ⚠ removed_by ПУСТ: дроп невиден git log
+[ -z "$(git -C "$r" log --full-history --diff-filter=A  --format='%H' "${before}..HEAD" -- milestones/M-01.md)" ] || p31_ok=0  # и не рождён
+[ "$(git -C "$r" rev-parse --abbrev-ref HEAD)" = "$base31" ] || p31_ok=0   # финальный мерж — на ИСХОДНОЙ ветке
+git -C "$r" merge-base --is-ancestor "$before" HEAD 2>/dev/null || p31_ok=0                                                    # база — предок
+if [ "$p31_ok" -ne 1 ]; then
+  fail "P31 SETUP НЕ СОСТОЯЛСЯ: дроп обязан быть НЕВИДИМ для git log (сделан ВНУТРИ мержа) и \
+путь не рождён в диапазоне — иначе сценарий отклонит СТАРОЕ условие, не дойдя до кандидата B"
+else
+  expect "P31 ловушка 2: рукотворный дроп на ВНУТРЕННЕМ мерже не отмывается финальным" deny "$(run_barrier "$r" push "$before")"
+fi
+
+# ── P32 (ловушка 5) — ЛЕГИТИМНАЯ ручная резолюция ПРЕДЪЯВЛЯЕТ ПРАВО токеном ─────────
+# До круга 4 `removed_by` мержи не видел вовсе, и у честного ручного удаления через merge не
+# было НИ ОДНОГО пути пройти барьер. Токен в теле САМОГО мержа — этот путь.
+r=$(new_repo)
+git -C "$r" checkout -q -b old32
+echo "работа" >> "$r/src.rs"; git -C "$r" commit -qam "old32"
+git -C "$r" checkout -q -
+git -C "$r" rm -q milestones/M-01.md
+git -C "$r" commit -qm "chore(archive): древний переезд
+
+ALLOW-ARTIFACT-DELETE: объяснённое удаление далёкого прошлого" >/dev/null
+before=$(git -C "$r" rev-parse HEAD)
+git -C "$r" checkout -q -b feat32
+git -C "$r" merge -q --no-commit --no-ff old32 >/dev/null 2>&1
+git -C "$r" checkout old32 -- milestones/M-01.md; git -C "$r" add -A
+git -C "$r" commit -qm "feat32: путь сохранён"
+f32=$(git -C "$r" rev-parse HEAD)
+git -C "$r" checkout -q -
+git -C "$r" merge -q --no-commit --no-ff "$f32" >/dev/null 2>&1
+git -C "$r" rm -q -f milestones/M-01.md >/dev/null 2>&1
+git -C "$r" commit -qm "merge feat32 — ручная резолюция, право предъявлено
+
+ALLOW-ARTIFACT-DELETE: спека воскресла ошибочно, снимаем осознанно" >/dev/null
+p32_ok=1
+git -C "$r" cat-file -e HEAD:milestones/M-01.md 2>/dev/null && p32_ok=0
+git -C "$r" log -1 --format='%B' HEAD | grep -q '^ALLOW-ARTIFACT-DELETE:' || p32_ok=0
+if [ "$p32_ok" -ne 1 ]; then
+  fail "P32 SETUP НЕ СОСТОЯЛСЯ: нужен МЕРЖ с токеном в СВОЁМ теле, выбросивший путь — \
+иначе ловушка 5 не проверяется"
+else
+  expect "P32 ловушка 5: токен в теле САМОГО мержа легитимирует ручную резолюцию" ok "$(run_barrier "$r" push "$before")"
+fi
+
+# ── P33 (ловушка 3) — OCTOPUS: merge-tree ПАРНЫЙ ⇒ fail-closed ──────────────────────
+# Три и более родителей проверить нечем. `testing.md`: «не могу гарантировать» обязано
+# означать отказ, а не пропуск — та же дисциплина, что у базы события.
+r=$(new_repo)
+git -C "$r" checkout -q -b oa; echo a >> "$r/src.rs"; git -C "$r" commit -qam oa; OA=$(git -C "$r" rev-parse HEAD)
+git -C "$r" checkout -q -; git -C "$r" checkout -q -b ob; echo b >> "$r/research/reviews/R-001.md"; git -C "$r" commit -qam ob; OB=$(git -C "$r" rev-parse HEAD)
+git -C "$r" checkout -q -
+git -C "$r" rm -q milestones/M-01.md
+git -C "$r" commit -qm "chore(archive): древний переезд
+
+ALLOW-ARTIFACT-DELETE: объяснённое удаление далёкого прошлого" >/dev/null
+before=$(git -C "$r" rev-parse HEAD)
+# Дерево берётся у `before` — в нём пути УЖЕ НЕТ (его снял архивный переезд). Первая
+# редакция брала дерево `OA`, ветки, форкнутой ДО переезда: путь там ЕСТЬ, и setup-guard
+# честно уронил сценарий. Оставлено записью: guard сработал ровно как задуман.
+BT=$(git -C "$r" rev-parse "${before}^{tree}")
+OCT=$(git -C "$r" commit-tree "$BT" -p "$before" -p "$OA" -p "$OB" -m "octopus: три родителя, путь выброшен")
+git -C "$r" reset -q --hard "$OCT"
+p33_ok=1
+[ "$(git -C "$r" rev-parse "${OCT}^@" | wc -l)" -ge 3 ] || p33_ok=0
+git -C "$r" cat-file -e HEAD:milestones/M-01.md 2>/dev/null && p33_ok=0
+if [ "$p33_ok" -ne 1 ]; then
+  fail "P33 SETUP НЕ СОСТОЯЛСЯ: нужен коммит с ≥3 родителями, потерявший путь — \
+иначе ловушка 3 не проверяется"
+else
+  expect "P33 ловушка 3: octopus не проверяем парной авто-резолюцией ⇒ fail-closed" deny "$(run_barrier "$r" push "$before")"
+fi
+
 # ── P18 (rev9, ЛОЖНОЕ СРАБАТЫВАНИЕ — main реально покраснел 2026-08-03) ───────────────
 # ПЕРЕИМЕНОВАНИЕ артефакта в ДРУГОЙ защищённый путь, сделанное коммитом ВНУТРИ feat-ветки
 # и влитое merge'ем, обязано проходить: это легитимная миграция, а не удаление.
