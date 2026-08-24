@@ -469,6 +469,41 @@ else
   expect "P22 анти-бланкет: старый токен НЕ оправдывает новое молчаливое удаление" deny "$(run_barrier "$r" push "$before")"
 fi
 
+# ── P23 (`C-136` Б-1) — ДРЕВНИЙ ТОКЕН НЕ БЛАГОСЛОВЛЯЕТ EVIL MERGE ВОССОЗДАННОГО ПУТИ ──
+# Класс, которого не видел ни `P22`, ни его автор. `P22` удаляет путь явным `git rm` — такое
+# удаление ПОПАДАЕТ в диапазон, fallback не включается, и дыра остаётся невидимой. Здесь путь
+# выбрасывает MERGE: удаления в диапазоне нет вовсе (`--diff-merges` по умолчанию выключен),
+# fallback включается и находит ДРЕВНИЙ токен, к нынешнему исчезновению отношения не имеющий.
+#
+# Сужение, которое сценарий пиннит: fallback не применяется к пути, ПОЯВИВШЕМУСЯ в диапазоне.
+# Появился здесь — значит и исчезновение здешнее.
+r=$(new_repo)
+git -C "$r" rm -q milestones/M-01.md
+git -C "$r" commit -qm "chore(archive): древнее удаление
+
+ALLOW-ARTIFACT-DELETE: объяснённое удаление далёкого прошлого" >/dev/null
+ancient=$(git -C "$r" rev-parse HEAD)
+before=$(git -C "$r" rev-parse HEAD)
+git -C "$r" checkout -q -b feat
+mkdir -p "$r/milestones"
+echo "спека заведена заново" > "$r/milestones/M-01.md"; git -C "$r" add -A
+git -C "$r" commit -qm "docs: спека воссоздана в диапазоне"
+git -C "$r" checkout -q -
+git -C "$r" merge -q --no-commit --no-ff feat >/dev/null 2>&1
+git -C "$r" rm -q -f milestones/M-01.md >/dev/null 2>&1
+git -C "$r" commit -qm "merge ветки (путь выброшен САМИМ merge'ем — evil merge)"
+p23_ok=1
+git -C "$r" merge-base --is-ancestor "$ancient" "$before" || p23_ok=0                 # токен ДО базы
+[ -n "$(git -C "$r" log --full-history --diff-filter=A --format='%H' "${before}..HEAD" -- milestones/M-01.md)" ] || p23_ok=0   # путь ПОЯВИЛСЯ в диапазоне
+[ -z "$(git -C "$r" log --full-history --diff-filter=DR --format='%H' "${before}..HEAD" -- milestones/M-01.md)" ] || p23_ok=0  # и НИ ОДИН коммит его не удалял
+git -C "$r" cat-file -e "HEAD:milestones/M-01.md" 2>/dev/null && p23_ok=0             # на HEAD его нет
+if [ "$p23_ok" -ne 1 ]; then
+  fail "P23 SETUP НЕ СОСТОЯЛСЯ: нужен древний токен-предок базы, путь ВОССОЗДАННЫЙ в диапазоне, \
+диапазон БЕЗ удалений и отсутствие пути на HEAD — иначе сценарий не давит на fallback"
+else
+  expect "P23 древний токен НЕ благословляет evil merge воссозданного пути" deny "$(run_barrier "$r" push "$before")"
+fi
+
 # ── P18 (rev9, ЛОЖНОЕ СРАБАТЫВАНИЕ — main реально покраснел 2026-08-03) ───────────────
 # ПЕРЕИМЕНОВАНИЕ артефакта в ДРУГОЙ защищённый путь, сделанное коммитом ВНУТРИ feat-ветки
 # и влитое merge'ем, обязано проходить: это легитимная миграция, а не удаление.
