@@ -47,17 +47,26 @@ else
   grep -E 'объявлено в §4.2|покрыто набором|усл\. 2' "${LOGD}/n.log" | head -6 | sed 's/^/      ↳ /'
 fi
 
-echo "--- F: RED-набор O-1..O-10 GREEN ---"
-# Диапазон назван числом НАМЕРЕННО (C-078 N-2): проверяется, что исполнены ВСЕ десять
-# оракулов плюс манифест-сверка, а не «сколько нашлось».
-EXPECT_TESTS=11
+echo "--- F: RED-набор O-1..O-11 GREEN ---"
+# Диапазон назван числом НАМЕРЕННО (C-078 N-2): проверяется, что исполнены ВСЕ оракулы
+# набора плюс манифест-сверка, а не «сколько нашлось».
+#
+# R-118 N-1: литерал отстал от состава на один оракул и тем ОСЛАБИЛ наблюдение отсутствия —
+# при `EXPECT_TESTS=11` потеря любого одного оракула из двенадцати оставляла шаг зелёным
+# (12→11 всё ещё `-ge 11`). Тот же класс, что TD-140 (спека M-61 §6 называла 25 мутантов
+# при 26). Число снято ЗАМЕРОМ, а не по памяти:
+#   grep -cE 'fn o[0-9]+' crates/gateway-serve/tests/red_ws_session.rs        → 13
+#   grep -nB2 'fn o12' …                                                     → #[cfg(feature = "testing")]
+# то есть обычным `cargo test` (без `--features testing`) исполняются o0..o11 = 12.
+# `o12` наблюдает ОТДЕЛЬНЫЙ шаг `O12` ниже — он и остаётся его единственным сторожем.
+EXPECT_TESTS=12
 if cargo test -p gateway-serve --test red_ws_session >"${LOGD}/f.log" 2>&1; then
   N_RUN=$(grep -cE '^test o[0-9]+' "${LOGD}/f.log")
   if [ "${N_RUN}" -ge "${EXPECT_TESTS}" ]; then
-    pass "F набор GREEN: исполнено ${N_RUN} оракулов (ожидалось ≥ ${EXPECT_TESTS}: o0 + O-1..O-10)"
+    pass "F набор GREEN: исполнено ${N_RUN} оракулов (ожидалось ≥ ${EXPECT_TESTS}: o0 + O-1..O-11; O-12 — шаг O12)"
   else
     fail "F набор зелёный, но исполнено ${N_RUN} оракулов при ожидаемых ${EXPECT_TESTS} — \
-часть O-1..O-10 отсутствует или отфильтрована; «зелено» здесь ничего не доказывает"
+часть O-1..O-11 отсутствует или отфильтрована; «зелено» здесь ничего не доказывает"
   fi
 else
   fail "F набор КРАСНЫЙ"
@@ -129,10 +138,17 @@ if cargo build -p gateway-serve --bin gateway-serve >"${LOGD}/build.log" 2>&1; t
     for case in absent empty; do
       OUT="${LOGD}/l-${case}.log"
       if [ "${case}" = absent ]; then
+        # R-118 N-4: сценарий называется «absent», но переменную НЕ СНИМАЛ — только не
+        # задавал. На runner'е CI она не экспортирована, поэтому проба сегодня проверяет то,
+        # что обещает; на машине, где она есть в окружении оболочки, шаг молча тестировал бы
+        # ДРУГОЙ сценарий и остался зелёным (`testing.md` §«Целостность гейта», свойство 3:
+        # проба, молча тестирующая не тот сценарий, — плацебо самой себя). `env -u` убирает
+        # ХОСТ ИЗ УРАВНЕНИЯ, а не поднимает допуск: отсутствие переменной перестаёт зависеть
+        # от того, кто запускает гейт.
         ( GATEWAY_ADDR="127.0.0.1:0" GATEWAY_JOURNAL_DIR="${JD}" \
           GATEWAY_VENUE="Binance" GATEWAY_SYMBOL="BTCUSDT" GATEWAY_TIMEFRAME_MS="1000" \
           GATEWAY_BANDS="0.001" GATEWAY_WINDOW_MS="60000" GATEWAY_JWT_SECRET="m65" \
-          timeout 5 "${BIN}" >"${OUT}" 2>&1 )
+          env -u GATEWAY_MAX_SUBSCRIPTIONS timeout 5 "${BIN}" >"${OUT}" 2>&1 )
       else
         ( GATEWAY_ADDR="127.0.0.1:0" GATEWAY_JOURNAL_DIR="${JD}" \
           GATEWAY_VENUE="Binance" GATEWAY_SYMBOL="BTCUSDT" GATEWAY_TIMEFRAME_MS="1000" \
