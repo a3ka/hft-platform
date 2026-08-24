@@ -243,3 +243,8 @@ contract/schema/RFC jobs, `verify_design_claims.sh`, `red_verify_design_claims.s
   founder'а) — `milestones/M-60b-gate-mechanisms.md` §12, сверка по нему, не по памяти.
   Предмет ЭТОГО milestone'а оттуда — приём нормализации `verify_M-60.sh:67-72`: уже
   приземлён в шаг D `scripts/verify_M-60c.sh` (эта ветка).
+  **Условие ВЫПОЛНЕНО 2026-08-17** (`R-095` У-3): судьба зонта принята founder'ом — PR #12
+  «Архивация: зонт M-60 и kill-screen M-10 как retired/defective». Уникальный груз перенесён
+  в `main`: зонт и `verify_M-60.sh` — в `docs/archive/`, дельта роадмапа — в
+  `docs/09-roadmap-v2.md` §«Процессный трек». Ветка ЖИВА (`f0e915b`): удаление ref'а —
+  предстоящий шаг под условиями `R-095` У-1…У-3.

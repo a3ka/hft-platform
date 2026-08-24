@@ -3,7 +3,7 @@
 STATUS: PROPOSED (architect, 2026-07-21). Атомарный contract-RFC per `docs/05-contract-layer.md`
 §4. Трогает `crates/contracts/**` (T1) → Block-C, **critic обязателен** (`gates.md` §1.1) +
 **risk-critic обязателен** (`gates.md` §5 — касание T1 И sacred live-path venue/recorder/journal).
-Ветка: `feat/M-18-l2delta`. Milestone: `milestones/M-18-l2delta-capture.md`.
+Ветка: `feat/M-18-l2delta`. Milestone: `docs/archive/M-18-l2delta-capture.md`.
 
 ## §1. Проблема (почему это TIME-SENSITIVE, а не «когда-нибудь»)
 

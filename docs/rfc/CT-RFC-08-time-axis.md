@@ -175,7 +175,7 @@ contract-RFC; `decide_open_segment` использует версию как м�
 - **strategy (ST-I-3):** TTL in-flight интентов — та же схема на `submitted_ts_wall_ms`;
   обратный ход wall → интент истекает немедленно (fail-closed: лучше пере-отменить, чем
   держать намерение неограниченно). **Пересматриваемое решение названо явно (`C-056`
-  N13):** M-07 D4 (`milestones/M-07-strategy-brain.md:53` — «истекает по event-time,
+  N13):** M-07 D4 (`docs/archive/M-07-strategy-brain.md:53` — «истекает по event-time,
   никакого wall-clock») НЕ нарушается, а уточняется: event-time ОСТАЁТСЯ (`ts_wall_ms` —
   записанное поле события, не чтение часов; `DET-I-1` цел), меняется ШКАЛА внутри события
   mono → wall. Комментарий `crates/strategy/src/lib.rs:99`, цитирующий D4, правится в том
@@ -209,7 +209,7 @@ contract-RFC; `decide_open_segment` использует версию как м�
 | AL-I-4r | фикстура «простой писателя» (wall-гэп при непрерывной оси): сэмплы прошлой сессии stale, форкаста нет. Инвариант — stale-expiry по `docs/fa/strategy-brain.md:131`; коллизия ID `AL-I-4` с `docs/fa/alpha.md:171` существовала до RFC, расчистка — отдельный пункт architect/reviewer, не этот RFC (`C-056` N14) | + отвод wall назад → stale (fail-closed) |
 | ST-I-3r | та же фикстура: in-flight интенты истекают по wall-TTL через границу простоя | + обратный ход wall → немедленное истечение |
 | SM-I-x | sim на журнале с сессионным разрывом: политика разрыва детерминирована, ×2 прогона бит-идентичны | разрыв ПОСРЕДИ пачки pending; разрыв без pending; **legacy-фикстура: журнал эпохи ≤4 с РЕГРЕССИЕЙ оси посреди прогона — прод-форма основного входа sim** (`C-056` B8; «форма прода снимается замером», `testing.md`) |
-| CT-канарейка | ШЕСТЬ носителей обещания синхронизированы с §2.1: `contracts/src/lib.rs:5`, `DESIGN.md` §3, `05-contract-layer.md:51`, `fa/journal.md:68`, `milestones/M-07-strategy-brain.md:53` (D4 — уточнение шкалы, N13), `crates/strategy/src/lib.rs:99` (комментарий-цитата D4) — «mono_ns для порядка» удалено (`C-056` N3+N16) | плюс переписать обоснования в `crates/journal/tests/red_det_replay_digest.rs:177-179` и `red_det_restart.rs:31` (ссылаются на `SystemTime::now()` как на конструкцию; сами оракулы остаются валидными) |
+| CT-канарейка | ШЕСТЬ носителей обещания синхронизированы с §2.1: `contracts/src/lib.rs:5`, `DESIGN.md` §3, `05-contract-layer.md:51`, `fa/journal.md:68`, `docs/archive/M-07-strategy-brain.md:53` (D4 — уточнение шкалы, N13), `crates/strategy/src/lib.rs:99` (комментарий-цитата D4) — «mono_ns для порядка» удалено (`C-056` N3+N16) | плюс переписать обоснования в `crates/journal/tests/red_det_replay_digest.rs:177-179` и `red_det_restart.rs:31` (ссылаются на `SystemTime::now()` как на конструкцию; сами оракулы остаются валидными) |
 
 Чек-лист деградированных фикстур (`testing.md`) поверх таблицы: регрессия/гэп посреди
 сегмента; два рестарта подряд; пустой журнал; каталог только из legacy-сегментов.

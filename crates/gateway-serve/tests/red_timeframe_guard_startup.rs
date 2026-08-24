@@ -32,6 +32,12 @@ fn getter(pairs: &[(&'static str, &'static str)]) -> impl Fn(&str) -> Option<Str
 fn assert_startup_rejected(timeframe: &'static str) {
     let res = serve_config_from_env(getter(&[
         ("GATEWAY_JWT_SECRET", "test-secret"),
+        // `CT-RFC-09` §2.6: `max_subscriptions_per_connection` — конфиг, ОТСУТСТВИЕ
+        // либо невалидное значение ⇒ отказ старта (задача 13 N-2). Прод всегда его
+        // подаёт (`docker-compose.yml`, дефолт 16), поэтому фикстура БЕЗ переменной
+        // никогда не была прод-формой (`testing.md` §«Форма прода снимается ЗАМЕРОМ»).
+        // Ассерты ниже про лимит ничего не утверждают — добавление их не ослабляет.
+        ("GATEWAY_MAX_SUBSCRIPTIONS", "16"),
         ("GATEWAY_TIMEFRAME_MS", timeframe),
     ]));
     match res {
@@ -78,6 +84,12 @@ fn aligned_timeframes_env_starts() {
     for tf in ["1", "1000", "60000", "3600000", "86400000"] {
         let cfg = serve_config_from_env(getter(&[
             ("GATEWAY_JWT_SECRET", "test-secret"),
+            // `CT-RFC-09` §2.6: `max_subscriptions_per_connection` — конфиг, ОТСУТСТВИЕ
+            // либо невалидное значение ⇒ отказ старта (задача 13 N-2). Прод всегда его
+            // подаёт (`docker-compose.yml`, дефолт 16), поэтому фикстура БЕЗ переменной
+            // никогда не была прод-формой (`testing.md` §«Форма прода снимается ЗАМЕРОМ»).
+            // Ассерты ниже про лимит ничего не утверждают — добавление их не ослабляет.
+            ("GATEWAY_MAX_SUBSCRIPTIONS", "16"),
             ("GATEWAY_TIMEFRAME_MS", tf),
         ]));
         let cfg = cfg.unwrap_or_else(|e| {
@@ -98,8 +110,16 @@ fn aligned_timeframes_env_starts() {
 /// гвард не должен требовать явного задания там, где раньше работал дефолт.
 #[test]
 fn default_timeframe_still_starts() {
-    let cfg = serve_config_from_env(getter(&[("GATEWAY_JWT_SECRET", "test-secret")]))
-        .expect("дефолтный конфиг (без GATEWAY_TIMEFRAME_MS) обязан стартовать");
+    let cfg = serve_config_from_env(getter(&[
+        ("GATEWAY_JWT_SECRET", "test-secret"),
+        // `CT-RFC-09` §2.6: `max_subscriptions_per_connection` — конфиг, ОТСУТСТВИЕ
+        // либо невалидное значение ⇒ отказ старта (задача 13 N-2). Прод всегда его
+        // подаёт (`docker-compose.yml`, дефолт 16), поэтому фикстура БЕЗ переменной
+        // никогда не была прод-формой (`testing.md` §«Форма прода снимается ЗАМЕРОМ»).
+        // Ассерты ниже про лимит ничего не утверждают — добавление их не ослабляет.
+        ("GATEWAY_MAX_SUBSCRIPTIONS", "16"),
+    ]))
+    .expect("дефолтный конфиг (без GATEWAY_TIMEFRAME_MS) обязан стартовать");
     assert_eq!(
         cfg.selector.timeframe_ms, 1_000,
         "прод-дефолт GATEWAY_TIMEFRAME_MS=1000 (docker-compose.yml) обязан сохраниться"

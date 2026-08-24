@@ -246,7 +246,7 @@ jobs:
       # Проба гейта ТОЙ ЖЕ проводкой, какой его зовёт CI (testing.md §«Целостность
       # гейта»): 41 проверка на синтетических git-фикстурах, анти-плацебо в обе стороны
       # (гейт падает и против слишком мягкого движка, и против несостоявшегося setup).
-      - name: Проба гейта (41 проверка, анти-плацебо)
+      - name: Проба гейта (счёт печатает сама проба)
         run: bash scripts/tests/red_verify_design_claims.sh
 
   context-budgets:
@@ -300,14 +300,145 @@ jobs:
       - name: Проба диск-преамбулы (счёт печатает сама проба)
         run: bash scripts/tests/red_disk_budget.sh
 
+  resource-oracles:
+    name: Resource oracles (замер мерит инвариант, а не окружение)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Барьер в ПРОД-ФОРМЕ: default-режим, без переменных пробы. Ловит механизм, дважды
+      # уронивший обязательный чек `main` (TD-098/TD-129): ресурсный оракул вёл учёт
+      # аллокаций процессным счётчиком, а `cargo test` гоняет тесты одного бинаря
+      # параллельными потоками ⇒ замер включал соседей, и исход зависел от планировщика.
+      - name: Ресурсные оракулы (прод-форма)
+        run: bash scripts/check_resource_oracles.sh
+
+      # Проба ТОЙ ЖЕ проводкой (`testing.md` «целостность гейта»). ЧИСЛО СЦЕНАРИЕВ ЗДЕСЬ НЕ
+      # ПОВТОРЯЕТСЯ: литерал «11 сценариев / RO-1..RO-11» был добавлен этим же PR и к концу
+      # его же кругов врал более чем вдвое (`C-122` H-3). Счётчик — у самой пробы, в её
+      # последней строке; второй носитель числа обязан разойтись и разошёлся.
+      - name: Проба барьера (все сценарии RO-*)
+        run: bash scripts/tests/red_resource_oracles.sh
+
+  deploy-catchup:
+    name: Deploy catch-up (сторож «деплой не состоялся», Р-4)
+    runs-on: ubuntu-latest
+    steps:
+      # fetch-depth по умолчанию (1) достаточен: проба ГЕРМЕТИЧНА — строит свой git-репозиторий
+      # в /tmp и в сеть не ходит вовсе. Ходила бы — мерила бы доступность GitHub, а не свой
+      # инвариант (класс `TD-135`), и краснела бы на чужих сбоях.
+      - uses: actions/checkout@v4
+
+      # Барьер проводки в ПРОД-ФОРМЕ — тем же вызовом, каким его зовёт человек. Держит
+      # запретный список Р-4: rollback-ветка, fail-closed гейт на CI, `concurrency` (TD-086)
+      # и права `GITHUB_TOKEN` (TD-018) — плюс SHA-якорность выкатки (TD-150 п.1).
+      - name: Проводка deploy.yml не нарушает запретный список Р-4
+        run: python3 scripts/deploy_catchup.py check-wiring
+
+      # Структурный гейт M-08 (`needs: ci`, `permissions.actions: read`). Файл жил в `main`
+      # с M-08, но CI его НЕ ЗВАЛ — тот же класс, что `TD-106`/`TD-062` (гейт существует,
+      # его красное ненаблюдаемо). Зовётся здесь, рядом со своим предметом.
+      - name: Структурный гейт деплоя (M-08 E9/M6, TD-018)
+        run: python3 scripts/check_deploy_gate.py
+
+      # Барьер CI-АГРЕГАТА (`C-093` R-1). Проверяет ЭТОТ ЖЕ файл: джоб существует, зовёт
+      # предмет, стоит в `status-check.needs` И участвует в fail-closed условии. Последнее —
+      # ИСПОЛНЕНИЕМ условия с моделью «deploy-catchup=failure», а не грепом по имени: греп
+      # зелен и против закомментированной строки, и против упоминания в соседнем `echo`.
+      # Без этого барьера два стаба («джоб выкинут из условия», «выкинут и из needs, и из
+      # условия») давали полный зелёный прогон 39/39 — стаб был НЕОТЛИЧИМ от честной проводки.
+      - name: Красный сторож обязан ронять «All checks passed»
+        run: python3 scripts/deploy_catchup.py check-aggregate
+
+      # Позитивный контроль + анти-плацебо: честная реализация зелена, обманные манифесты и
+      # обманные раны — красные. Счёт печатает сама проба (литерал, живущий отдельно от
+      # предмета, врёт — замер `gate-meta`: «27» против фактических 31).
+      - name: Проба сторожа (решение + проводка)
+        run: bash scripts/tests/red_deploy_catchup.sh
+
+      # Батарея: каждый мутант обязан уронить РОВНО свой набор сценариев. Главный —
+      # «сторож молчит, когда деплоя не было»: механизм, наблюдающий сбой, но не ОТСУТСТВИЕ,
+      # внешне неотличим от рабочего (`testing.md`, целостность гейта, свойство 4).
+      - name: Батарея мутантов (равенство kill-set'ов)
+        run: bash scripts/tests/red_deploy_catchup.sh --battery
+
+  branch-health:
+    name: Branch health (наблюдатель веток — НЕ блокирует)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ПОЧЕМУ ЭТОТ ДЖОБ НЕ В АГРЕГАТЕ `All checks passed`. Он НАБЛЮДАТЕЛЬ, а не барьер
+      # (уровень 5 таблицы носителей, `docs/workflow/binding-requires-mechanism.md`). Его
+      # красное означает «источник не ответил документом», а не «предмет дефектен»: перебой
+      # на стороне GitHub блокировал бы тогда ВСЕ merge'и репозитория по причине, не
+      # связанной ни с одним предметом. Это ровно то направление отказа, которое `A-010` §H
+      # назвал негодным для чёрных списков — и оно негодно и здесь.
+      #
+      # ЗАЧЕМ ТОГДА ВООБЩЕ ПРОВОДИТЬ. Арбитраж `A-011` §1.6: механизм не был подключён НИ К
+      # ОДНОМУ раннеру, и три круга гейта спорили о классификации ответов инструмента,
+      # который никто не запускал (класс built-not-wired, `gates.md` §4). Наблюдение,
+      # которое никогда не исполняется, наблюдением не является.
+      - name: Наблюдение за ветками (висяки и дубликаты предмета)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/check_branch_health.sh || true
+
+      # Проба — ГЕРМЕТИЧНА (свой git-репозиторий в /tmp, поддельный `gh` в PATH, в сеть не
+      # ходит) и потому, в отличие от самого наблюдателя, обязана быть строгой: её красное
+      # означает дефект НАШЕГО кода, а не чужого сервиса.
+      - name: Проба наблюдателя + батарея мутантов
+        run: bash scripts/tests/red_branch_health.sh --battery
+
+  review-fa:
+    name: Review FA (вердикт называет живой инвариант тронутого модуля, M-66)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ЗАЧЕМ. `gates.md` §4: диф трогает `crates/<name>/**` ⇒ вердикт обязан назвать живой
+      # инвариант-ID из `docs/fa/<name>.md`, либо нести явный `FA-WAIVER`. Замер 2026-08-14,
+      # из-за которого требование появилось: FA тронутого модуля названа в 0 из 3 применимых
+      # вердиктов; `TD-138` нашли ровно тогда, когда FA дочитали постфактум.
+      #
+      # ПОЧЕМУ ТОЛЬКО СЕЙЧАС. Барьер и проба написаны в M-66 15.08, но жили на ветке
+      # `feat/M-66-fixture` и в `main` не попали — `TD-155`: `gates.md` и девять профилей
+      # объявляли `review-fa` машинным барьером, которого в `main` НЕ СУЩЕСТВУЕТ. Документация
+      # обогнала механизм. Пересборка от `main` предписана `A-010` §B п.3 — судить
+      # харнесс-предмет в дереве без `harness-track.md` нельзя.
+      #
+      # ПРОВОДКА — ЧАСТЬ ПРЕДМЕТА, А НЕ ДОБАВКА К НЕМУ. Сценарий `W8OK` пробы читает ИМЕННО
+      # ЭТОТ файл и требует в джобе `fetch-depth: 0`, три переменные события и оба вызова, а в
+      # `status-check` — членство в `needs` И в fail-closed условии. Соседи `W8NONEEDS`,
+      # `W8NOIF`, `W8NOCALL`, `W8CMTONLY` — анти-плацебо, каждый обязан краснеть. Набор M-66
+      # без этой проводки красен по СОБСТВЕННОЙ пробе: замер на пересобранной ветке — 39/40.
+      #
+      # База — ИЗ СОБЫТИЯ (блокер B1: на push-событии checkout ставит origin/main на только
+      # что запушенный коммит ⇒ диапазон пуст ⇒ барьер зеленел бы ВСЕГДА).
+      - name: Вердикт называет живой инвариант FA тронутого крейта
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: bash scripts/check_review_fa.sh
+
+      # Проба ТОЙ ЖЕ проводкой, какой барьер зовёт CI (`testing.md` §«Целостность гейта»):
+      # иначе «барьер зелёный» значит лишь, что скрипт парсится. Счёт печатает сама проба —
+      # литерал, живущий отдельно от предмета, врёт (замер `gate-meta`: «27» против 31).
+      - name: Проба барьера (счёт печатает сама проба)
+        run: bash scripts/tests/red_review_fa.sh
+
   status-check:
     name: All checks passed
     runs-on: ubuntu-latest
-    needs: [build-test, security, delivery, protected-artifacts, contracts, docs-freeze, artifact-ids, reserve-ids, design-claims, context-budgets, gate-meta]
+    needs: [build-test, security, delivery, protected-artifacts, contracts, docs-freeze, artifact-ids, reserve-ids, design-claims, context-budgets, gate-meta, deploy-catchup, review-fa, resource-oracles]
     if: always()
     steps:
       - run: |
-          if [[ "${{ needs.build-test.result }}" != "success" || "${{ needs.security.result }}" != "success" || "${{ needs.delivery.result }}" != "success" || "${{ needs.protected-artifacts.result }}" != "success" || "${{ needs.contracts.result }}" != "success" || "${{ needs.docs-freeze.result }}" != "success" || "${{ needs.artifact-ids.result }}" != "success" || "${{ needs.reserve-ids.result }}" != "success" || "${{ needs.design-claims.result }}" != "success" || "${{ needs.context-budgets.result }}" != "success" || "${{ needs.gate-meta.result }}" != "success" ]]; then
+          if [[ "${{ needs.build-test.result }}" != "success" || "${{ needs.security.result }}" != "success" || "${{ needs.delivery.result }}" != "success" || "${{ needs.protected-artifacts.result }}" != "success" || "${{ needs.contracts.result }}" != "success" || "${{ needs.docs-freeze.result }}" != "success" || "${{ needs.artifact-ids.result }}" != "success" || "${{ needs.reserve-ids.result }}" != "success" || "${{ needs.design-claims.result }}" != "success" || "${{ needs.context-budgets.result }}" != "success" || "${{ needs.gate-meta.result }}" != "success" || "${{ needs.deploy-catchup.result }}" != "success" || "${{ needs.review-fa.result }}" != "success" || "${{ needs.resource-oracles.result }}" != "success" ]]; then
             echo "One or more checks failed"; exit 1
           fi
           echo "All checks passed"

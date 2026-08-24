@@ -1,3 +1,4 @@
+<!-- FACTS: audited_head=8b422409473068154e9072842b4953ff19f28343 collected=2026-08-02 -->
 # Карта журнала hft-platform: что завязано на единый общий порядок
 
 **Разведка (read-only), собрана:** 2026-08-02
@@ -433,7 +434,7 @@ fn matches(&self, md: &MdEvent) -> bool { md.venue == self.venue && md.symbol ==
   `const L2DELTA_CAPTURE_SYMBOLS: &[&str] = &["BTCUSDT"]`; применение — `venue-binance/src/lib.rs:251`,
   `venue-binance-futures/src/lib.rs:642`.
   (Работа M-45 по превращению этого в env-параметризуемый список в `origin/main` НЕ смёржена —
-  см. `docs/ORCHESTRATION-STATE.md:325-336`; факт подтверждён самим кодом на main выше.)
+  см. `docs/archive/orchestration-log-2026-07-08.md:360-366`; факт подтверждён самим кодом на main выше.)
 
 ---
 
@@ -555,7 +556,7 @@ fn matches(&self, md: &MdEvent) -> bool { md.venue == self.venue && md.symbol ==
    перекошенные файлы.
 
 3. **Целевая мощность набора инструментов.** «Топ-300» упоминается как намерение founder'а
-   (`docs/ORCHESTRATION-STATE.md:344-352`, `docs/PENDING-SIGNATURE.md:249-251`), но точного
+   (`docs/archive/orchestration-log-2026-07-08.md:780-783`, `docs/PENDING-SIGNATURE.md:249-251`), но точного
    числа шардов / политики группировки (шард на инструмент vs на группу vs на venue) в дереве
    не зафиксировано.
 
@@ -573,7 +574,7 @@ fn matches(&self, md: &MdEvent) -> bool { md.venue == self.venue && md.symbol ==
    отчёты, `research/reports/`, `research/trials-ledger.json`) зафиксированы конкретные seq —
    требует отдельной сверки с founder'ом.
 
-7. **Storage Box / cold-tier.** `docs/ORCHESTRATION-STATE.md:361` — ожидание ~09.08; политика
+7. **Storage Box / cold-tier.** `docs/archive/orchestration-log-2026-07-08.md:943` — ожидание ~09.08; политика
    выгрузки шардов в холодное хранилище (шард целиком vs посегментно) зависит от того, что
    реально будет смонтировано.
 

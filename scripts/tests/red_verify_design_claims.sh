@@ -151,6 +151,22 @@ EOF
   git -C "${d}" init -q 2>/dev/null || true
 }
 
+# F-1 (C-116): проверка ревизии сбора требует ЖИВОЙ истории — без коммита `HEAD` не
+# существует, и фикстура могла бы проверять только отрицательный случай.
+# Коммит делается ЯВНЫМ вызовом, а НЕ внутри `build_good_fixture`: та используется всеми
+# сценариями, и `build_rfc_fixture_base` коммитит сама. Первая редакция правила коммит прямо
+# в общую фикстуру — второй коммит становился пустым, ancestry менялась, и ЧЕТЫРЕ RFC-SHA
+# сценария падали. Ровно «что пришлось ослабить рядом» (`testing.md`, мутационный контроль,
+# второй вопрос): побочный эффект правки ловится соседним оракулом, а не рассуждением.
+fixture_commit_base() { # $1=dir → печатает SHA
+  git -C "$1" add -A >/dev/null 2>&1 || true
+  git -C "$1" -c user.name=test -c user.email=test@test.local \
+      commit -q -m "фикстура H-FACTS: базовое дерево" >/dev/null 2>&1 || true
+  git -C "$1" rev-parse HEAD 2>/dev/null
+}
+
+fixture_head_sha() { git -C "$1" rev-parse HEAD 2>/dev/null; }
+
 run_verify() { # $1 = fixture dir → печатает stdout, возвращает exit-код в $?
   bash "${BARRIER}" "$1"
 }
@@ -408,6 +424,674 @@ scenario_bad_broken_section_ref() {
 # ---------------------------------------------------------------------------
 # Сценарий 5 — ссылка на удалённый файл docs/*.md → FAIL [4-МЁРТВЫЕ-ФАЙЛЫ]
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Сценарии H-FACTS — маркер `FACTS:` (исполнение `A-010` §H, задача H-1).
+# Анти-плацебо в ОБЕ стороны: с маркером документ судится, без маркера — нет.
+# Плюс ловушка, найденная замером: маркер, процитированный В ПРОЗЕ (не в голове файла),
+# включать документ НЕ ДОЛЖЕН — иначе документ О маркере опт-инится сам по себе. Тот же
+# класс, что шапка GATE-META внутри код-фенса.
+# ---------------------------------------------------------------------------
+mk_plan_with_dead_ref() {   # $1=каталог фикстуры $2=шапка файла (может быть пустой)
+  mkdir -p "$1/docs/plans"
+  { [ -n "$2" ] && printf '%s\n' "$2"
+    echo "# фактура"
+    echo "Ссылка на \`docs/GHOSTPLAN.md\` — файла нет."
+  } > "$1/docs/plans/facts.md"
+}
+
+scenario_facts_marked_plan_is_checked() {
+  local d="${TMP_BASE}/facts1"
+  build_good_fixture "${d}"
+  fixture_commit_base "${d}" >/dev/null
+  mk_plan_with_dead_ref "${d}" "<!-- FACTS: audited_head=$(fixture_head_sha "${d}") collected=2026-08-02 -->"
+  local out rc
+  out="$(run_verify "${d}")"; rc=$?
+  if [ "${rc}" -ne 0 ] && echo "${out}" | grep -q 'FAIL  \[4-МЁРТВЫЕ-ФАЙЛЫ\].*docs/GHOSTPLAN\.md' \
+     && ! echo "${out}" | grep -q 'FAIL  \[H-FACTS-SHA\]'; then
+    pass "H-FACTS-1 (план С маркером): судится, мёртвая ссылка поймана, exit=${rc}"
+  else
+    fail "H-FACTS-1 (план С маркером): ОЖИДАЛСЯ FAIL [4-МЁРТВЫЕ-ФАЙЛЫ], получено (exit=${rc}):"
+    echo "${out}" | sed 's/^/      /'
+  fi
+}
+
+scenario_facts_unmarked_plan_is_excluded() {
+  local d="${TMP_BASE}/facts2"
+  build_good_fixture "${d}"
+  mk_plan_with_dead_ref "${d}" ''
+  local out rc
+  out="$(run_verify "${d}")"; rc=$?
+  if [ "${rc}" -eq 0 ] && ! echo "${out}" | grep -q 'GHOSTPLAN'; then
+    pass "H-FACTS-2 (план БЕЗ маркера): исключён, ложного красного нет, exit=${rc}"
+  else
+    fail "H-FACTS-2 (план БЕЗ маркера): ОЖИДАЛСЯ PASS без упоминания GHOSTPLAN, получено (exit=${rc}):"
+    echo "${out}" | sed 's/^/      /'
+  fi
+}
+
+scenario_facts_marker_in_prose_ignored() {
+  local d="${TMP_BASE}/facts3"
+  build_good_fixture "${d}"
+  mkdir -p "${d}/docs/plans"
+  { echo "# документ О маркере"
+    for i in $(seq 1 12); do echo "строка прозы ${i}"; done
+    # F-2 (C-116): плейсхолдер `<SHA>` регэкспом НЕ матчится НИ ПРИ КАКОМ лимите головы —
+    # сценарий был зелен по неверной причине и лимит НЕ пиннил (стаб FACTS_HEAD_LINES=10**9
+    # его проходил). Здесь стоит РЕАЛЬНЫЙ hex: документ обязан не опт-иниться ИМЕННО потому,
+    # что маркер вне головы файла.
+    echo 'Формат: `<!-- FACTS: audited_head=0123456789abcdef0123456789abcdef01234567 collected=2026-08-02 -->`.'
+    echo "Ссылка на \`docs/GHOSTPLAN.md\` — файла нет."
+  } > "${d}/docs/plans/about-marker.md"
+  local out rc
+  out="$(run_verify "${d}")"; rc=$?
+  if [ "${rc}" -eq 0 ] && ! echo "${out}" | grep -q 'GHOSTPLAN'; then
+    pass "H-FACTS-3 (маркер в ПРОЗЕ, не в голове): документ не опт-инится, exit=${rc}"
+  else
+    fail "H-FACTS-3 (маркер в ПРОЗЕ): ОЖИДАЛСЯ PASS — документ О маркере не должен судиться (exit=${rc}):"
+    echo "${out}" | sed 's/^/      /'
+  fi
+}
+
+scenario_facts_note_on_silent_plan() {
+  local d="${TMP_BASE}/facts4"
+  build_good_fixture "${d}"
+  mkdir -p "${d}/docs/plans"
+  { echo "# молчащая фактура"
+    for i in $(seq 1 25); do echo "- см. \`crates/journal/src/lib.rs:${i}\`"; done
+  } > "${d}/docs/plans/silent.md"
+  local out rc
+  out="$(run_verify "${d}")"; rc=$?
+  if [ "${rc}" -eq 0 ] && echo "${out}" | grep -q 'NOTE  \[H-FACTS\].*silent\.md'; then
+    pass "H-FACTS-4 (фактура без маркера, ≥20 утверждений): NOTE напечатан, прогон не свален, exit=${rc}"
+  else
+    fail "H-FACTS-4: ОЖИДАЛСЯ NOTE [H-FACTS] про silent.md при exit=0, получено (exit=${rc}):"
+    echo "${out}" | sed 's/^/      /'
+  fi
+}
+
+# --- F-3 (C-116): порог NOTE не был запиннен снизу. Стаб FACTS_NOTE_THRESHOLD=0 проходил
+# пробу, а на живом корпусе давал 26 NOTE против 1 честного — флуд, хоронящий сигнал.
+scenario_facts_note_threshold_pinned_below() {
+  local d="${TMP_BASE}/facts5"
+  build_good_fixture "${d}"
+  mkdir -p "${d}/docs/plans"
+  { echo "# короткая записка"
+    for i in 1 2 3; do echo "- см. \`crates/journal/src/lib.rs:${i}\`"; done
+  } > "${d}/docs/plans/tiny-note.md"
+  local out rc
+  out="$(run_verify "${d}")"; rc=$?
+  if [ "${rc}" -eq 0 ] && ! echo "${out}" | grep -q 'NOTE  \[H-FACTS\].*tiny-note\.md'; then
+    pass "H-FACTS-5 (записка без маркера, 3 утверждения < порога): NOTE НЕ печатается, exit=${rc}"
+  else
+    fail "H-FACTS-5: ОЖИДАЛСЯ exit=0 БЕЗ NOTE про tiny-note.md — порог не держится снизу (exit=${rc}):"
+    echo "${out}" | sed 's/^/      /'
+  fi
+}
+
+# --- F-4 (C-116): маркер БЕЗ `audited_head` не обязан опт-инить документ. Весь смысл маркера
+# по A-010 §H — ИМЕНОВАННАЯ ревизия сбора; стаб с регэкспом без `audited_head` пробу проходил.
+scenario_facts_marker_without_head_not_opted_in() {
+  local d="${TMP_BASE}/facts6"
+  build_good_fixture "${d}"
+  mk_plan_with_dead_ref "${d}" '<!-- FACTS: collected=2026-08-02 -->'
+  local out rc
+  out="$(run_verify "${d}")"; rc=$?
+  # Два утверждения сразу: (1) опт-ина нет — мёртвая ссылка НЕ ловится; (2) молчания тоже
+  # нет — документ объявил себя фактурой негодной формой, и это названо (C-116 F-1, вторая
+  # половина: «молчаливый даунгрейд»).
+  if ! echo "${out}" | grep -q 'GHOSTPLAN' \
+     && echo "${out}" | grep -q 'FAIL  \[H-FACTS-SHA\].*facts\.md.*НЕ распарсен'; then
+    pass "H-FACTS-6 (маркер БЕЗ audited_head): опт-ина нет И молчания нет, exit=${rc}"
+  else
+    fail "H-FACTS-6: ОЖИДАЛОСЬ отсутствие GHOSTPLAN И FAIL [H-FACTS-SHA] про нераспарсенный маркер (exit=${rc}):"
+    echo "${out}" | sed 's/^/      /'
+  fi
+}
+
+# --- F-5 (C-116): A-010 §H говорит про check3 И check4. H-FACTS-1 пиннил только check4;
+# подмена исключения в check3 на старый tuple не роняла ничего.
+# Литерал `DESIGN.md §<номер>` в тексте пробы НЕ пишется: сам гейт (check3) сканирует .sh и
+# счёл бы его битой ссылкой репозитория — ровно тот класс, что красит вердикты (Н-3 передачи).
+scenario_facts_marked_plan_checked_by_check3() {
+  local d="${TMP_BASE}/facts7"
+  build_good_fixture "${d}"
+  fixture_commit_base "${d}" >/dev/null
+  mkdir -p "${d}/docs/plans"
+  local bad_sec=97
+  { echo '<!-- FACTS: audited_head=0123456789abcdef0123456789abcdef01234567 collected=2026-08-02 -->'
+    echo "# фактура с битой секцией"
+    echo "Основание — \`DESIGN.md §${bad_sec}\`, раздела нет в оглавлении."
+  } > "${d}/docs/plans/facts-badsec.md"
+  local out rc
+  out="$(run_verify "${d}")"; rc=$?
+  if [ "${rc}" -ne 0 ] && echo "${out}" | grep -q "FAIL  \[3-ССЫЛКИ\].*facts-badsec\.md"; then
+    pass "H-FACTS-7 (маркированный план, битая §-ссылка): check3 судит его, exit=${rc}"
+  else
+    fail "H-FACTS-7: ОЖИДАЛСЯ FAIL [3-ССЫЛКИ] про facts-badsec.md — check3-проводка не запиннена (exit=${rc}):"
+    echo "${out}" | sed 's/^/      /'
+  fi
+}
+
+# --- F-6 (C-116): рефакторинг перенёс исключение `docs/archive/` из двух inline-tuple в общую
+# функцию, и владение строкой перешло к ней — а сценария на неё нет. Стаб с выключенной веткой
+# давал на живом корпусе 6 ложных FAIL: класс «ложное красное блокирует ВСЕ merge'и».
+scenario_archive_exclusion_still_holds() {
+  local d="${TMP_BASE}/facts8"
+  build_good_fixture "${d}"
+  mkdir -p "${d}/docs/archive"
+  { echo "# архивный документ"
+    echo "Ссылка на \`docs/GHOSTARCH.md\` — файла нет, и это НОРМА для архива."
+  } > "${d}/docs/archive/old-plan.md"
+  local out rc
+  out="$(run_verify "${d}")"; rc=$?
+  if [ "${rc}" -eq 0 ] && ! echo "${out}" | grep -q 'GHOSTARCH'; then
+    pass "H-FACTS-8 (docs/archive/ с мёртвой ссылкой): исключение держится, exit=${rc}"
+  else
+    fail "H-FACTS-8: ОЖИДАЛСЯ exit=0 без GHOSTARCH — исключение archive не запиннено (exit=${rc}):"
+    echo "${out}" | sed 's/^/      /'
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Сценарии V-АРХИВ — архивный класс вердиктов (решение founder'а 2026-08-22, `TD-064`).
+# Анти-плацебо в ТРИ стороны, потому что у исключения три способа быть неверным:
+#   V-1  вердикт с мёртвой `docs/*.md` ссылкой не роняет гейт. ЧТО ИМЕННО он пиннит —
+#        названо точно, потому что первый прогон мутаций показал обратное ожидаемому:
+#        снятие исключения его НЕ роняет (check4 обходит только `docs/` и до вердиктов не
+#        доходит ни с исключением, ни без). Он пиннит ГРАНИЦУ ПРИ РАСШИРЕНИИ ОХВАТА —
+#        то есть ровно ту альтернативу, которую founder отверг: мутация «check4 обходит
+#        весь репозиторий» + исключение на месте → V-1 зелен; та же мутация со снятым
+#        исключением → V-1 краснеет. Вакуумным он не является, но и сегодняшнее поведение
+#        check4 он не доказывает;
+#   V-2  вердикт с битой ссылкой на раздел не роняет check3 (исключение симметрично —
+#        до решения check3 обходил весь репозиторий и вердикты СУДИЛ, а check4 ходил
+#        только по docs/ и не судил; асимметрия была случайной);
+#   V-3  ГРАНИЦА: `research/reports/**` — НЕ вердикт и остаётся под судом. Без этого
+#        сценария расширение исключения на весь `research/` прошло бы незамеченным;
+#   V-4  объявление называет ВЕСЬ класс и берёт его из того же `VERDICT_CLASS_DIRS`,
+#        которым делается исключение. Прежняя редакция пиннила СЧЁТЧИК (число мёртвых
+#        ссылок); счётчик снят из наблюдателя после двух адверсарных кругов — `R-100` F-1
+#        и `R-101` F-1/F-2/F-3 нашли четыре обманных стаба, и все четыре были про число,
+#        ни один про исключение. Число фальсифицируемо по трём независимым осям (величина,
+#        каталог, множество файлов), пиннится дороже, чем стоит, и никем не используется:
+#        по решению founder'а вердикт стареет ЗАКОННО.
+# Литерал `DESIGN.md` + `§` + номер подряд не пишется (см. сценарий 4): check3 сканирует
+# .sh, и проба нашла бы собственный пример как настоящую битую ссылку.
+# ---------------------------------------------------------------------------
+scenario_verdict_class_dead_doc_ref_excluded() {
+  local d="${TMP_BASE}/vclass1"
+  build_good_fixture "${d}"
+  { echo "# C-99 — вердикт, цитирующий улику"
+    echo "Гейт ругался на \`docs/GHOSTVERDICT.md\` — файла нет, и это НОРМА для вердикта."
+  } > "${d}/research/critiques/C-99-cite.md"
+  # F-3 (`R-100`): ассерт НЕГАТИВНЫЙ («гейт не покраснел»), поэтому сорвавшаяся запись
+  # фикстуры оставила бы сценарий зелёным на пустоте. Свидетель setup обязателен.
+  [ -s "${d}/research/critiques/C-99-cite.md" ] || { fail "V-1: фикстура не создана — setup"; return; }
+  local out rc
+  out="$(run_verify "${d}")"; rc=$?
+  if [ "${rc}" -eq 0 ] && ! echo "${out}" | grep -q 'FAIL.*GHOSTVERDICT'; then
+    pass "V-1 (вердикт с мёртвой docs-ссылкой): исключение держится, exit=${rc}"
+  else
+    fail "V-1: ОЖИДАЛСЯ exit=0 без FAIL по GHOSTVERDICT (exit=${rc}):"
+    echo "${out}" | sed 's/^/      /'
+  fi
+}
+
+scenario_verdict_class_broken_section_ref_excluded() {
+  local d="${TMP_BASE}/vclass2"
+  build_good_fixture "${d}"
+  local fake_section="97"
+  { echo "# R-99 — вердикт, цитирующий битую ссылку на раздел"
+    printf 'Цитата вывода гейта: DESIGN.md §%s.\n' "${fake_section}"
+  } > "${d}/research/reviews/R-99-cite.md"
+  [ -s "${d}/research/reviews/R-99-cite.md" ] || { fail "V-2: фикстура не создана — setup"; return; }
+  local out rc
+  out="$(run_verify "${d}")"; rc=$?
+  if [ "${rc}" -eq 0 ] && ! echo "${out}" | grep -q '3-ССЫЛКИ.*97'; then
+    pass "V-2 (вердикт с битой ссылкой на раздел): check3 его не судит, exit=${rc}"
+  else
+    fail "V-2: ОЖИДАЛСЯ exit=0 без FAIL [3-ССЫЛКИ] §97 (exit=${rc}):"
+    echo "${out}" | sed 's/^/      /'
+  fi
+}
+
+scenario_verdict_class_does_not_leak_to_reports() {
+  local d="${TMP_BASE}/vclass3"
+  build_good_fixture "${d}"
+  mkdir -p "${d}/research/reports"
+  local fake_section="96"
+  { echo "# отчёт — НЕ вердикт, судится наравне со всеми"
+    printf 'Утверждение отчёта: DESIGN.md §%s.\n' "${fake_section}"
+  } > "${d}/research/reports/R-99-report.md"
+  local out rc
+  out="$(run_verify "${d}")"; rc=$?
+  if [ "${rc}" -ne 0 ] && echo "${out}" | grep -q 'FAIL  \[3-ССЫЛКИ\].*§96'; then
+    pass "V-3 (research/reports вне класса): граница держится, гейт краснеет, exit=${rc}"
+  else
+    fail "V-3: ОЖИДАЛСЯ FAIL [3-ССЫЛКИ] §96 — исключение протекло на весь research/ (exit=${rc}):"
+    echo "${out}" | sed 's/^/      /'
+  fi
+}
+
+
+
+# --- F-2 (`R-100`, блокер): матрица КЛАСС × ПРОВЕРКА была не закрыта. Класс — три каталога,
+# но единственная проверка, которая СЕГОДНЯ реально доходит до `research/` (check3, обходит
+# весь root), была запиннена только для `reviews/` (V-2). Выпадение `critiques/` или
+# `arbitration/` из кортежа проходило всю пробу зелёным — и на реальном дереве тоже, потому
+# что битых `§`-ссылок там сегодня нет. Регресс обнаружился бы следующим красным на
+# аудит-артефакте, то есть ровно тем отложенным взрывом, который правка объявила снятым.
+scenario_verdict_class_declaration_names_all_dirs() {
+  # Заменяет два прежних СЧЁТНЫХ сценария (V-4/V-7). Счётчик снят из наблюдателя после двух
+  # адверсарных кругов: `R-100` F-1 и `R-101` F-1/F-2/F-3 нашли четыре обманных стаба, и все
+  # четыре были про число, ни один — про исключение. Пиннить осталось одно: объявление
+  # называет ВЕСЬ класс и берёт его из того же `VERDICT_CLASS_DIRS`, которым исключение и
+  # делается. Один носитель ⇒ расходиться нечему.
+  local d="${TMP_BASE}/vclass4"
+  build_good_fixture "${d}"
+  mkdir -p "${d}/research/arbitration"
+  echo "# A-99 — файл нужен, чтобы каталог существовал и попал в объявление" \
+    > "${d}/research/arbitration/A-99-cite.md"
+  [ -s "${d}/research/arbitration/A-99-cite.md" ] || { fail "V-4: фикстура не создана — setup"; return; }
+  local out rc got want
+  out="$(run_verify "${d}")"; rc=$?
+  got="$(echo "${out}" | grep 'V-АРХИВ')"
+  want="$(expected_varhiv 'research/critiques/ research/reviews/ research/arbitration/')"
+  if [ "${rc}" -eq 0 ] && [ "${got}" = "${want}" ]; then
+    pass "V-4 (строка V-АРХИВ ≡ ожидаемой целиком, полный класс), exit=${rc}"
+  else
+    fail "V-4: строка V-АРХИВ обязана СОВПАСТЬ ЦЕЛИКОМ.\n      ОЖИДАЛОСЬ: ${want}\n      ПОЛУЧЕНО: ${got}\n      exit=${rc}"
+    echo "${out}" | grep 'V-АРХИВ' | sed 's/^/      /'
+  fi
+}
+
+# Ожидаемая строка `V-АРХИВ` ЦЕЛИКОМ. Сравнение — СТРОКОВОЕ РАВЕНСТВО всего наблюдаемого
+# вывода наблюдателя с этой строкой; никакого извлечения-прокси.
+#
+# Так — потому что пять кругов адверсария (`R-100`…`R-107`) были одной и той же ошибкой:
+# ассерт ставился на ПРОКСИ, прокси сужался, и каждый следующий круг находил, чего он не
+# видит. Счётчик -> перечень грепов -> образ регулярного извлечения: последний оказался
+# НЕИНЪЕКТИВЕН — молча ронял имя без завершающего слэша и с точкой, нормализовал вложенный
+# путь к родителю. Пять лгущих строк проходили 67/67 (`R-107` F-1).
+#
+# Равенство строки закрывает канал целиком: любое наблюдаемое отклонение — имя в любом
+# написании, слэш, точка, вложенность, дубль, ПОРЯДОК, проза, вторая строка — есть
+# неравенство. Остаток назван и недоступен чёрному ящику в принципе (`R-103` F-2/F-3):
+# экстенсионально тождественная копия носителя и пустой каталог класса.
+expected_varhiv() {   # $1 = список каталогов через пробел, В ПОРЯДКЕ печати наблюдателем
+  printf 'INFO  [V-АРХИВ] архивный класс выведен из проверок ссылок как датированные снимки (решение 2026-08-22, `TD-064`): %s — ссылки внутри них не судятся, вердикт отвечает за ревизию из своей шапки `GATE-META`, а не за сегодняшнее дерево' "$1"
+}
+
+scenario_verdict_class_declaration_equals_tuple() {
+  # `R-102` F-1/F-2 (блокеры). V-4 пиннил объявление СНИЗУ: «каждый из трёх назван».
+  # Инвариант конструкции сильнее — `объявление ≡ кортеж`, и верхней границы не было:
+  #   NC1  `present + ["research/reports/"]`      -> 0 FAIL: INFO ЛЖЁТ, что reports исключён;
+  #   mc8b печать заменена литералом трёх имён    -> 0 FAIL: объявление больше НЕ читает
+  #        константу, то есть возвращается второй носитель — невидимо для пробы.
+  # Мой собственный стаб MC8 (замена на `research/`) падал только потому, что терял имена
+  # со слэшами; в теле коммита `5939258` строка «MC8 объявление захардкожено -> V-4 FAILED»
+  # была сформулирована ШИРЕ того, что реально прогонялось, и адверсарий её фальсифицировал.
+  #
+  # Закрытие КОНЕЧНО и матрицу не растит: одна фикстура, в которой класс представлен
+  # НЕПОЛНО, а рядом лежит каталог ВНЕ класса. Объявление обязано назвать ровно то, что
+  # есть и входит в класс:
+  #   * нет `arbitration/`   => не назван  (валит и `present = list(VERDICT_CLASS_DIRS)`,
+  #                                         и литерал трёх имён);
+  #   * есть `reports/`      => не назван  (валит дописывание лишнего к `present`).
+  local d="${TMP_BASE}/vclass8"
+  build_good_fixture "${d}"          # каркас несёт critiques/ и reviews/, arbitration/ — НЕТ
+  mkdir -p "${d}/research/reports"
+  echo "# отчёт — НЕ вердикт, под судом, в объявлении класса ему не место" \
+    > "${d}/research/reports/R-98-report.md"
+  [ -s "${d}/research/reports/R-98-report.md" ] || { fail "V-7: фикстура не создана — setup"; return; }
+  [ ! -d "${d}/research/arbitration" ] || { fail "V-7: каркас неожиданно создал arbitration/ — setup"; return; }
+  local out rc got want
+  out="$(run_verify "${d}")"; rc=$?
+  got="$(echo "${out}" | grep 'V-АРХИВ')"
+  want="$(expected_varhiv 'research/critiques/ research/reviews/')"
+  if [ "${rc}" -eq 0 ] && [ "${got}" = "${want}" ]; then
+    pass "V-7 (строка V-АРХИВ ≡ ожидаемой целиком, наличный класс), exit=${rc}"
+  else
+    fail "V-7: строка V-АРХИВ обязана СОВПАСТЬ ЦЕЛИКОМ.\n      ОЖИДАЛОСЬ: ${want}\n      ПОЛУЧЕНО: ${got}\n      exit=${rc}"
+    echo "${out}" | grep 'V-АРХИВ' | sed 's/^/      /'
+  fi
+}
+
+scenario_verdict_class_critiques_pinned_for_check3() {
+  local d="${TMP_BASE}/vclass5"
+  build_good_fixture "${d}"
+  local fake_section="95"
+  { echo "# C-98 — вердикт в critiques, цитирующий битую ссылку на раздел"
+    printf 'Цитата вывода гейта: DESIGN.md §%s.\n' "${fake_section}"
+  } > "${d}/research/critiques/C-98-cite.md"
+  [ -s "${d}/research/critiques/C-98-cite.md" ] || { fail "V-5: фикстура не создана — setup"; return; }
+  local out rc
+  out="$(run_verify "${d}")"; rc=$?
+  if [ "${rc}" -eq 0 ] && ! echo "${out}" | grep -q '3-ССЫЛКИ.*95'; then
+    pass "V-5 (critiques × check3): каталог запиннен отдельно, exit=${rc}"
+  else
+    fail "V-5: ОЖИДАЛСЯ exit=0 без FAIL [3-ССЫЛКИ] §95 — critiques выпал из класса (exit=${rc}):"
+    echo "${out}" | sed 's/^/      /'
+  fi
+}
+
+scenario_verdict_class_arbitration_pinned_for_check3() {
+  local d="${TMP_BASE}/vclass6"
+  build_good_fixture "${d}"
+  mkdir -p "${d}/research/arbitration"
+  local fake_section="94"
+  { echo "# A-98 — арбитраж, цитирующий битую ссылку на раздел"
+    printf 'Цитата вывода гейта: DESIGN.md §%s.\n' "${fake_section}"
+  } > "${d}/research/arbitration/A-98-cite.md"
+  [ -s "${d}/research/arbitration/A-98-cite.md" ] || { fail "V-6: фикстура не создана — setup"; return; }
+  local out rc
+  out="$(run_verify "${d}")"; rc=$?
+  if [ "${rc}" -eq 0 ] && ! echo "${out}" | grep -q '3-ССЫЛКИ.*94'; then
+    pass "V-6 (arbitration × check3): каталог запиннен отдельно, exit=${rc}"
+  else
+    fail "V-6: ОЖИДАЛСЯ exit=0 без FAIL [3-ССЫЛКИ] §94 — arbitration выпал из класса (exit=${rc}):"
+    echo "${out}" | sed 's/^/      /'
+  fi
+}
+
+# --- F-1 (`R-100`, блокер): у наблюдателя была ОДНА счётная точка (V-4, число 2), и любой
+# стаб, печатающий константу 2, проходил пробу неотличимо от рабочего счёта. Одна точка не
+# отличает счёт от константы В ПРИНЦИПЕ — нужна ВТОРАЯ с ДРУГИМ числом: тогда константа
+# обязана провалить хотя бы одну. Пиннится и число файлов: иначе константа в `n_files`
+# остаётся такой же дырой, только в соседнем поле.
+
+
+# --- граница головы файла пиннится с ОБЕИХ сторон (testing.md §«Дегенерированный вход», п.4).
+# H-FACTS-3 держит верх (маркер вне головы не считается); этот — низ: маркер НА последней
+# строке головы обязан считаться, иначе стаб FACTS_HEAD_LINES=1 проходит незамеченным.
+scenario_facts_marker_on_last_head_line_counts() {
+  local d="${TMP_BASE}/facts9"
+  build_good_fixture "${d}"
+  fixture_commit_base "${d}" >/dev/null
+  mkdir -p "${d}/docs/plans"
+  { echo "# заголовок"
+    echo ""
+    echo "вводная строка"
+    echo ""
+    echo "<!-- FACTS: audited_head=$(fixture_head_sha "${d}") collected=2026-08-02 -->"
+    echo "Ссылка на \`docs/GHOSTPLAN.md\` — файла нет."
+  } > "${d}/docs/plans/marker-line5.md"
+  local out rc
+  out="$(run_verify "${d}")"; rc=$?
+  if [ "${rc}" -ne 0 ] && echo "${out}" | grep -q 'FAIL  \[4-МЁРТВЫЕ-ФАЙЛЫ\].*marker-line5\.md'; then
+    pass "H-FACTS-9 (маркер на 5-й строке — граница головы): засчитан, документ судится, exit=${rc}"
+  else
+    fail "H-FACTS-9: ОЖИДАЛСЯ FAIL про marker-line5.md — граница головы не держится снизу (exit=${rc}):"
+    echo "${out}" | sed 's/^/      /'
+  fi
+}
+
+# --- F-1 (C-116, ранг REJECT): решение арбитра `A-010` §H требовало «проверку SHA той же
+# механикой, что check6 (существует, предок HEAD)». Захват `audited_head=(…)` в регэкспе был
+# МЁРТВЫМ кодом — группа не потреблялась нигде, и документ с выдуманной ревизией опт-инился,
+# не будучи судим ничем. Три сценария ниже пиннят обе половины: саму проверку и наблюдение
+# отсутствия («молчаливый даунгрейд»).
+scenario_facts_sha_fake_fails() {
+  local d="${TMP_BASE}/facts10"
+  build_good_fixture "${d}"
+  mkdir -p "${d}/docs/plans"
+  local fake=1111111111111111111111111111111111111111
+  { echo "<!-- FACTS: audited_head=${fake} collected=2026-08-02 -->"
+    echo "# фактура на несуществующем дереве"
+    echo "- см. \`crates/journal/src/lib.rs:1\`"
+  } > "${d}/docs/plans/fake-rev.md"
+  local out rc
+  out="$(run_verify "${d}")"; rc=$?
+  if [ "${rc}" -ne 0 ] && echo "${out}" | grep -q "FAIL  \[H-FACTS-SHA\].*fake-rev\.md.*НЕТ вовсе"; then
+    pass "H-FACTS-10 (маркер с ВЫДУМАННОЙ ревизией): FAIL, документ не проходит опт-ином, exit=${rc}"
+  else
+    fail "H-FACTS-10: ОЖИДАЛСЯ FAIL [H-FACTS-SHA] про несуществующий коммит (exit=${rc}):"
+    echo "${out}" | sed 's/^/      /'
+  fi
+}
+
+scenario_facts_sha_orphan_fails() {
+  local d="${TMP_BASE}/facts11"
+  build_good_fixture "${d}"
+  local base_sha orphan_sha
+  base_sha="$(fixture_commit_base "${d}")"
+  git -C "${d}" checkout -q -b orphan-facts
+  echo "работа, которую никуда не влили" > "${d}/orphan-facts.txt"
+  git -C "${d}" add orphan-facts.txt
+  git -C "${d}" -c user.name=test -c user.email=test@test.local commit -q -m "орфан: ветка не влита"
+  orphan_sha="$(git -C "${d}" rev-parse HEAD)"
+  git -C "${d}" checkout -q "${base_sha}"
+  mkdir -p "${d}/docs/plans"
+  { echo "<!-- FACTS: audited_head=${orphan_sha} collected=2026-08-02 -->"
+    echo "# фактура, собранная на невлитой ветке"
+    echo "- см. \`crates/journal/src/lib.rs:1\`"
+  } > "${d}/docs/plans/orphan-rev.md"
+  local out rc
+  out="$(run_verify "${d}")"; rc=$?
+  # Анти-плацебо того же класса, что C-044 F1: существование НЕОБХОДИМО, но НЕ достаточно —
+  # ревизия сбора обязана входить в историю, иначе «датировано» ничего не значит.
+  if [ "${rc}" -ne 0 ] && echo "${out}" | grep -q "FAIL  \[H-FACTS-SHA\].*orphan-rev\.md.*НЕ входит в историю"; then
+    pass "H-FACTS-11 (ревизия существует, но вне ancestry): FAIL, exit=${rc}"
+  else
+    fail "H-FACTS-11: ОЖИДАЛСЯ FAIL [H-FACTS-SHA] «НЕ входит в историю» — существования мало (exit=${rc}):"
+    echo "${out}" | sed 's/^/      /'
+  fi
+}
+
+scenario_facts_malformed_marker_is_not_silent() {
+  local d="${TMP_BASE}/facts12"
+  build_good_fixture "${d}"
+  mk_plan_with_dead_ref "${d}" '<!-- FACTS: audited_head=012345 collected=2026-08-02 -->'
+  local out rc
+  out="$(run_verify "${d}")"; rc=$?
+  # 6 hex < минимума {7,40}: автор думает «документ под гейтом», механизм молчал бы.
+  # Обе половины: опт-ина нет И молчания нет.
+  if ! echo "${out}" | grep -q 'GHOSTPLAN' \
+     && echo "${out}" | grep -q 'FAIL  \[H-FACTS-SHA\].*facts\.md.*НЕ распарсен'; then
+    pass "H-FACTS-12 (короткий SHA, 6 hex): молчаливого даунгрейда нет — назван, exit=${rc}"
+  else
+    fail "H-FACTS-12: ОЖИДАЛСЯ FAIL [H-FACTS-SHA] про нераспарсенный маркер и отсутствие опт-ина (exit=${rc}):"
+    echo "${out}" | sed 's/^/      /'
+  fi
+}
+
+# --- `C-117` F-13 (REJECT, стаб S17): исключение МАРКИРОВАННЫХ документов из NOTE не было
+# запиннено ничем. Симметрия к F-3: H-FACTS-4 держит «немаркированный + много → NOTE есть»,
+# H-FACTS-5 — «мало → NOTE нет», и НИКТО не утверждал «маркированный + много → NOTE НЕТ».
+# Живой радиус немедленный, не латентный: стаб давал 3 NOTE вместо 1, и оба посева маркера
+# получали «документ не называет ревизию сбора», НАЗЫВАЯ её.
+scenario_facts_marked_plan_gets_no_note() {
+  local d="${TMP_BASE}/facts13"
+  build_good_fixture "${d}"
+  fixture_commit_base "${d}" >/dev/null
+  mkdir -p "${d}/docs/plans"
+  { echo "<!-- FACTS: audited_head=$(fixture_head_sha "${d}") collected=2026-08-02 -->"
+    echo "# честная фактура: маркер есть, утверждений много"
+    for i in $(seq 1 25); do echo "- см. \`crates/journal/src/lib.rs:${i}\`"; done
+  } > "${d}/docs/plans/marked-heavy.md"
+  local out rc
+  out="$(run_verify "${d}")"; rc=$?
+  if [ "${rc}" -eq 0 ] && ! echo "${out}" | grep -q 'NOTE  \[H-FACTS\].*marked-heavy\.md'; then
+    pass "H-FACTS-13 (маркер ЕСТЬ + 25 утверждений): NOTE не печатается, exit=${rc}"
+  else
+    fail "H-FACTS-13: ОЖИДАЛСЯ exit=0 БЕЗ NOTE — маркированный документ ревизию НАЗЫВАЕТ (exit=${rc}):"
+    echo "${out}" | sed 's/^/      /'
+  fi
+}
+
+# --- `C-117` F-14 (REJECT, стаб S18): fail-closed на не-git корне не был запиннен — все
+# фикстуры пробы были git-репозиториями. Радиус: tar-экспорт/копия без `.git` (класс `C-062`
+# — прогон не на том дереве) с фиктивной ревизией проходил бы МОЛЧА.
+# `testing.md` «Целостность гейта», свойство 3: гейт обязан падать против несостоявшегося setup.
+scenario_facts_sha_non_git_is_setup_guard() {
+  local d="${TMP_BASE}/facts14"
+  build_good_fixture "${d}"
+  mkdir -p "${d}/docs/plans"
+  { echo '<!-- FACTS: audited_head=1111111111111111111111111111111111111111 collected=2026-08-02 -->'
+    echo "# фактура в дереве без истории"
+    echo "- см. \`crates/journal/src/lib.rs:1\`"
+  } > "${d}/docs/plans/no-git-rev.md"
+  rm -rf "${d}/.git"
+  local out rc
+  out="$(run_verify "${d}")"; rc=$?
+  if [ "${rc}" -ne 0 ] && echo "${out}" | grep -q 'FAIL  \[H-FACTS-SHA\].*не git-репозиторий.*setup-guard'; then
+    pass "H-FACTS-14 (маркер в НЕ-git корне): setup-guard FAIL, не молчание, exit=${rc}"
+  else
+    fail "H-FACTS-14: ОЖИДАЛСЯ FAIL [H-FACTS-SHA] setup-guard — нечем проверить есть НАРУШЕНИЕ (exit=${rc}):"
+    echo "${out}" | sed 's/^/      /'
+  fi
+}
+
+# --- `C-117` F-16 (NOTE, стаб S20): граница порога `n == 20` не проверялась никем —
+# H-FACTS-4 кладёт 25, H-FACTS-5 — 3, а off-by-one (`>` вместо `>=`) проходил пробу, и
+# фактура РОВНО в 20 утверждений молча теряла NOTE.
+# `testing.md` «Дегенерированный вход» п.4: граница пиннится ОТДЕЛЬНЫМ входом.
+scenario_facts_note_exact_threshold() {
+  local d="${TMP_BASE}/facts16"
+  build_good_fixture "${d}"
+  mkdir -p "${d}/docs/plans"
+  { echo "# фактура ровно на пороге"
+    for i in $(seq 1 20); do echo "- см. \`crates/journal/src/lib.rs:${i}\`"; done
+  } > "${d}/docs/plans/exactly-twenty.md"
+  local out rc
+  out="$(run_verify "${d}")"; rc=$?
+  if [ "${rc}" -eq 0 ] && echo "${out}" | grep -q 'NOTE  \[H-FACTS\].*exactly-twenty\.md'; then
+    pass "H-FACTS-16 (ровно 20 утверждений — граница порога): NOTE есть, exit=${rc}"
+  else
+    fail "H-FACTS-16: ОЖИДАЛСЯ NOTE про exactly-twenty.md при exit=0 — граница порога не держится (exit=${rc}):"
+    echo "${out}" | sed 's/^/      /'
+  fi
+}
+
+# --- `C-117` F-15 (NOTE, стаб S19): обязательность хвоста `-->` не была запиннена.
+# Оба исхода громкие (незакрытый маркер даёт FAIL «НЕ распарсен» через FACTS_DECL_RE), но
+# поведение всё равно должно быть зафиксировано — иначе снятие хвоста молча меняет контракт.
+scenario_facts_marker_unterminated_is_named() {
+  local d="${TMP_BASE}/facts15"
+  build_good_fixture "${d}"
+  mk_plan_with_dead_ref "${d}" '<!-- FACTS: audited_head=1111111111111111111111111111111111111111 collected=2026-08-02'
+  local out rc
+  out="$(run_verify "${d}")"; rc=$?
+  if ! echo "${out}" | grep -q 'GHOSTPLAN' \
+     && echo "${out}" | grep -q 'FAIL  \[H-FACTS-SHA\].*facts\.md.*НЕ распарсен'; then
+    pass "H-FACTS-15 (маркер без закрывающего хвоста): опт-ина нет, названо явно, exit=${rc}"
+  else
+    fail "H-FACTS-15: ОЖИДАЛСЯ FAIL про нераспарсенный маркер и отсутствие опт-ина (exit=${rc}):"
+    echo "${out}" | sed 's/^/      /'
+  fi
+}
+
+# --- `C-117` F-17 (CONCERNS): дыра F-1 воспроизводилась ОДНИМ УРОВНЕМ ГЛУБЖЕ — обход
+# `check_facts_sha` шёл верхним уровнем, `is_excluded` и NOTE-проверка рекурсивны.
+scenario_facts_subdir_is_scanned() {
+  local d="${TMP_BASE}/facts17"
+  build_good_fixture "${d}"
+  fixture_commit_base "${d}" >/dev/null
+  mkdir -p "${d}/docs/plans/sub"
+  { echo '<!-- FACTS: audited_head=1111111111111111111111111111111111111111 collected=2026-08-02 -->'
+    echo "# фактура в подкаталоге с выдуманной ревизией"
+    echo "- см. \`crates/journal/src/lib.rs:1\`"
+  } > "${d}/docs/plans/sub/fake-rev.md"
+  local out rc
+  out="$(run_verify "${d}")"; rc=$?
+  if [ "${rc}" -ne 0 ] && echo "${out}" | grep -q 'FAIL  \[H-FACTS-SHA\].*sub/fake-rev\.md.*НЕТ вовсе'; then
+    pass "H-FACTS-17 (подкаталог + выдуманная ревизия): судится наравне с верхним уровнем, exit=${rc}"
+  else
+    fail "H-FACTS-17: ОЖИДАЛСЯ FAIL про sub/fake-rev.md — обход не рекурсивен (exit=${rc}):"
+    echo "${out}" | sed 's/^/      /'
+  fi
+}
+
+# --- `C-117` F-18 (CONCERNS): один байт cp1251 в голове — и документ с ВАЛИДНЫМ маркером
+# выпадал из ВСЕХ проверок молча. Python декодирует чанком: битый байт строки 2 валит
+# итерацию ДО отдачи строки 1. Ровно тот «молчаливый даунгрейд», устранение которого эта
+# ветка объявила своим достижением.
+scenario_facts_non_utf8_head_is_named() {
+  local d="${TMP_BASE}/facts18"
+  build_good_fixture "${d}"
+  fixture_commit_base "${d}" >/dev/null
+  mkdir -p "${d}/docs/plans"
+  { echo "<!-- FACTS: audited_head=$(fixture_head_sha "${d}") collected=2026-08-02 -->"
+    printf '# \x96 битый байт из cp1251-буфера\n'
+    echo "Ссылка на \`docs/GHOSTPLAN.md\` — файла нет."
+  } > "${d}/docs/plans/broken-encoding.md"
+  local out rc
+  out="$(run_verify "${d}")"; rc=$?
+  if [ "${rc}" -ne 0 ] && echo "${out}" | grep -q 'FAIL  \[H-FACTS-SHA\].*broken-encoding\.md.*не читается как UTF-8'; then
+    pass "H-FACTS-18 (не-UTF-8 байт в голове): назван, не молчание, exit=${rc}"
+  else
+    fail "H-FACTS-18: ОЖИДАЛСЯ FAIL [H-FACTS-SHA] про нечитаемую голову (exit=${rc}):"
+    echo "${out}" | sed 's/^/      /'
+  fi
+}
+
+# --- `C-117` F-12 (REJECT, стаб S16): комментарий барьера ОБЕЩАЕТ, что механика
+# переиспользована «включая MERGE_HEAD внутри --merge-preview», но ни один сценарий не
+# строил merge-состояние с маркером — стаб `refs = ["HEAD"]` проходил пробу целиком.
+# Радиус — ложное КРАСНОЕ в режиме, где джоб гоняет предмет чаще всего: ревизия, вошедшая
+# в дерево только через сторону слияния, объявлялась орфаном, и это блокировало бы ВСЕ
+# merge'и репозитория — класс, которым `A-010` §H мотивирует направление отказа.
+scenario_facts_sha_merge_head_side() {
+  # каталог именуется по СВОЕМУ номеру: `facts12` занят сценарием malformed-маркера, и
+  # переиспользование давало чужую фикстуру в прогоне — поймано первым же запуском.
+  local d="${TMP_BASE}/facts19"
+  build_good_fixture "${d}"
+  local base_sha main_sha
+  base_sha="$(fixture_commit_base "${d}")"
+  # ветка отстаёт от main; ревизия сбора появляется ТОЛЬКО на стороне main
+  git -C "${d}" checkout -q -b feature-side
+  echo "работа ветки" > "${d}/side.txt"
+  git -C "${d}" add side.txt
+  git -C "${d}" -c user.name=test -c user.email=test@test.local commit -q -m "ветка: своя работа"
+  git -C "${d}" checkout -q "${base_sha}"
+  git -C "${d}" checkout -q -B main-side
+  echo "работа main" > "${d}/on-main.txt"
+  mkdir -p "${d}/docs/plans"
+  git -C "${d}" add on-main.txt
+  git -C "${d}" -c user.name=test -c user.email=test@test.local commit -q -m "main: коммит, который станет ревизией сбора"
+  main_sha="$(git -C "${d}" rev-parse HEAD)"
+  { echo "<!-- FACTS: audited_head=${main_sha} collected=2026-08-02 -->"
+    echo "# фактура, собранная на стороне main"
+    echo "- см. \`crates/journal/src/lib.rs:1\`"
+  } > "${d}/docs/plans/on-main.md"
+  git -C "${d}" add docs/plans/on-main.md
+  git -C "${d}" -c user.name=test -c user.email=test@test.local commit -q -m "main: маркированный план"
+  main_sha="$(git -C "${d}" rev-parse HEAD)"
+  # состояние merge-preview: слияние приостановлено, MERGE_HEAD существует
+  git -C "${d}" checkout -q feature-side
+  git -C "${d}" -c user.name=test -c user.email=test@test.local merge --no-commit --no-ff main-side >/dev/null 2>&1 || true
+  # `C-117` F-21: в merge-состоянии дизъюнкция refs ДВУСТОРОННЯЯ (HEAD ∪ MERGE_HEAD), а
+  # сценарий пиннил только MERGE_HEAD-край: стаб `canonical_refs(root)[-1:]` проходил все 60,
+  # в обычном режиме будучи неотличим от честного. Второй маркированный план называет ревизию
+  # СТОРОНЫ ВЕТКИ — живой кейс PR, который везёт и фактуру, и её ревизию.
+  local branch_sha
+  branch_sha="$(git -C "${d}" rev-parse HEAD)"
+  { echo "<!-- FACTS: audited_head=${branch_sha} collected=2026-08-02 -->"
+    echo "# фактура, собранная на стороне ветки"
+    echo "- см. \`crates/journal/src/lib.rs:2\`"
+  } > "${d}/docs/plans/on-branch.md"
+  # setup-guard: сценарий обязан тестировать ИМЕННО merge-состояние, а не обычное дерево
+  setup_ok=0
+  git -C "${d}" rev-parse --verify -q MERGE_HEAD >/dev/null 2>&1 && setup_ok=1
+  if [ "${setup_ok}" -ne 1 ]; then
+    fail "H-FACTS-19: setup не состоялся — MERGE_HEAD отсутствует, сценарий тестировал бы не то"
+    return
+  fi
+  # и ревизия обязана быть НЕдостижима от одного HEAD — иначе сценарий вакуумен
+  if git -C "${d}" merge-base --is-ancestor "${main_sha}" HEAD >/dev/null 2>&1; then
+    fail "H-FACTS-19: setup не состоялся — ревизия достижима от HEAD, стаб S16 такой вход не отличит"
+    return
+  fi
+  local out rc
+  out="$(run_verify "${d}")"; rc=$?
+  if [ "${rc}" -eq 0 ] && ! echo "${out}" | grep -q 'FAIL  \[H-FACTS-SHA\]'; then
+    pass "H-FACTS-19 (ревизии с ОБЕИХ сторон слияния — HEAD и MERGE_HEAD): ложного красного нет, exit=${rc}"
+  else
+    fail "H-FACTS-19: ОЖИДАЛСЯ exit=0 без FAIL [H-FACTS-SHA] — MERGE_HEAD-проводка не работает (exit=${rc}):"
+    echo "${out}" | sed 's/^/      /'
+  fi
+}
+
 scenario_bad_dead_file_ref() {
   local d="${TMP_BASE}/bad5"
   build_good_fixture "${d}"
@@ -1149,6 +1833,32 @@ scenario_bad_coverage_understated
 scenario_bad_rk_foreign_crate_not_counted
 scenario_bad_broken_section_ref
 scenario_bad_dead_file_ref
+scenario_facts_marked_plan_is_checked
+scenario_facts_unmarked_plan_is_excluded
+scenario_facts_marker_in_prose_ignored
+scenario_facts_note_on_silent_plan
+scenario_facts_note_threshold_pinned_below
+scenario_facts_marker_without_head_not_opted_in
+scenario_facts_marked_plan_checked_by_check3
+scenario_archive_exclusion_still_holds
+scenario_verdict_class_dead_doc_ref_excluded
+scenario_verdict_class_broken_section_ref_excluded
+scenario_verdict_class_does_not_leak_to_reports
+scenario_verdict_class_declaration_names_all_dirs
+scenario_verdict_class_declaration_equals_tuple
+scenario_verdict_class_critiques_pinned_for_check3
+scenario_verdict_class_arbitration_pinned_for_check3
+scenario_facts_marker_on_last_head_line_counts
+scenario_facts_sha_fake_fails
+scenario_facts_sha_orphan_fails
+scenario_facts_malformed_marker_is_not_silent
+scenario_facts_marked_plan_gets_no_note
+scenario_facts_sha_non_git_is_setup_guard
+scenario_facts_note_exact_threshold
+scenario_facts_marker_unterminated_is_named
+scenario_facts_subdir_is_scanned
+scenario_facts_non_utf8_head_is_named
+scenario_facts_sha_merge_head_side
 scenario_bad_phase_milestone_missing
 scenario_bad_setup_guard_missing_design
 scenario_merge_preview_catches_branch_vs_merge_drift

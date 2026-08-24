@@ -38,7 +38,7 @@ merge(M-18): TD-031 schema-epoch isolation — reviewer APPROVED (...)
 ```
 
 `MdPayload::L2Delta` (postcard-дискриминант 6) введён **CT-RFC-04** и реализован
-**M-18** (STATUS: ✅ CLOSED 2026-07-21, `milestones/M-18-l2delta-capture.md`): venue-адаптеры
+**M-18** (STATUS: ✅ CLOSED 2026-07-21, `docs/archive/M-18-l2delta-capture.md`): venue-адаптеры
 эмитят его в прод для BTC (allow-list `L2DELTA_CAPTURE_SYMBOLS = &["BTCUSDT"]` —
 `crates/venue-binance/src/lib.rs:485`, `crates/venue-binance-futures/src/lib.rs:460`),
 recorder пишет, `book`/`sim`/`gateway`/`journal` читают. `docs/DESIGN.md` §17 п.1 и

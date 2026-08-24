@@ -1,6 +1,7 @@
 //! RED OF-I-4 PER-PRICE FOOTPRINT BINS (sacred, architect-only) — M-17. Закрывает C-016 blocker.
 //!
-//! C-016 (critic): verify_M-17 зеленел БЕЗ обещанных per-price footprint-bins. `footprint_delta`
+//! C-016 (critic): `docs/archive/verify_M-17.sh` (гейт M-17, сдан в архив по норме Р-2 —
+//! на приёмке зеленел БЕЗ обещанных per-price footprint-bins). `footprint_delta`
 //! (per-БАР скаляр) НЕ покрывает ПОЛНЫЙ footprint — матрицу `(price → {buy_vol, sell_vol, delta})`,
 //! которую рисует custom-series фронта (M-19 Тир2). Без этого impl мог не отдать bins → false-green.
 //!

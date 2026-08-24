@@ -1,3 +1,4 @@
+<!-- FACTS: audited_head=8dccd6283a8be47bb3e60d8cf34f5dc8495ab63f collected=2026-08-02 -->
 # WS-контракт `gateway-serve` — фактура для RED-оракулов
 
 Сбор: scout, 2026-08-02. Источник — detached worktree `/tmp/hft-scout-gw` на `origin/main`

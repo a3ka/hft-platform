@@ -242,6 +242,10 @@ def info(check, msg):
     print(f"INFO  [{check}] {msg}")
 
 
+def note(check, msg):
+    print(f"NOTE  [{check}] {msg}")
+
+
 def read(path):
     with open(path, encoding="utf-8") as f:
         return f.read()
@@ -593,6 +597,120 @@ def check2(root, design_text):
 # CHECK 3 — ссылки DESIGN.md §N ведут на существующие разделы
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# МАРКЕР `FACTS:` — исполнение решения арбитра `A-010` §H (задачи H-1…H-5).
+#
+# Решение существовало с 18.08, маркер уже проставлялся ВРУЧНУЮ в живых документах — и не
+# читался НИЧЕМ (`grep -rln FACTS scripts/ .github/` → пусто). Класс «решено-не-построено»,
+# зеркальный к `TD-155` («построено-не-проведено»).
+#
+# ПРАВИЛО (`A-010` §H): `docs/plans/**` остаётся исключённым из check3/check4, КРОМЕ файлов,
+# несущих маркер. Документ, объявивший себя фактурой, отвечает за свои ссылки; документ без
+# маркера — рабочая записка, с неё спроса нет.
+#
+# МАРКЕР ЗАСЧИТЫВАЕТСЯ ТОЛЬКО В ГОЛОВЕ ФАЙЛА — оборона от класса «документ О маркере судится
+# как документ С маркером»; тот же класс, что шапка `GATE-META`, процитированная примером
+# внутри код-фенса.
+# ЧЕСТНОЕ УТОЧНЕНИЕ (`C-116` F-2): прежняя редакция этого комментария ссылалась на
+# `fable-review-2026-08-18-open-questions.md:265` как на живой случай — замер её не
+# подтверждает: строка несёт ПЛЕЙСХОЛДЕР (`audited_head=<полный SHA>`), который регэксп не
+# матчит ни при каком лимите головы, к тому же внутри код-фенса. Оборона верна, но
+# обосновывающий её пример был неверен; сам лимит запиннен сценариями H-FACTS-3 (верх) и
+# H-FACTS-9 (низ), а не этим комментарием.
+#
+# ПРЕДЕЛ, НАЗВАННЫЙ ЧЕСТНО (`A-010` H-5): `файл:строка` НЕ проверяется и проверяться не будет.
+# Маркер конвертирует «молча ложно» в «явно датировано» — не более. Дрейф содержимого он
+# ОБЪЯВЛЯЕТ, а не лечит.
+FACTS_MARKER_RE = re.compile(r"<!--\s*FACTS:.*?audited_head=([0-9a-fA-F]{7,40}).*?-->")
+# СЕМАНТИКА `audited_head` (закреплена по `C-116` F-9): это ревизия ДЕРЕВА, НА КОТОРОМ
+# СНЯТЫ ФАКТЫ, а не коммит, которым документ создан. На первых же двух посевах она разошлась:
+# `gateway-ws-contract.md` нёс ревизию сбора, `journal-sharding-facts.md` — коммит создания
+# документа (родитель дерева сбора). Разница в один коммит вреда не дала, но поле, чья
+# семантика не закреплена, разъезжается тем быстрее, чем больше носителей.
+FACTS_HEAD_LINES = 5          # сколько первых строк считаются «головой файла»
+FACTS_NOTE_THRESHOLD = 20     # порог утверждений `путь:строка`, при котором молчание заметно
+
+
+# Объявление себя фактурой и ВАЛИДНЫЙ маркер — разные события, и их различение есть
+# половина находки `C-116` F-1 («молчаливый даунгрейд»): строка `FACTS:` с опечаткой или
+# коротким SHA не давала НИ FAIL, НИ NOTE — автор считал документ под гейтом, гейт молчал.
+# Это «наблюдение отсутствия» (`testing.md`, целостность гейта, свойство 4).
+FACTS_DECL_RE = re.compile(r"<!--\s*FACTS:")
+
+
+# `C-117` F-18: `_facts_head_scan` глотал `UnicodeDecodeError` и возвращал (False, None) —
+# документ с ВАЛИДНЫМ маркером и одним байтом cp1251 во второй строке молча выпадал из ВСЕХ
+# проверок: ни опт-ина, ни FAIL «НЕ распарсен», ни NOTE. Python декодирует чтение чанком,
+# поэтому битый байт строки 2 валит итерацию ДО отдачи строки 1. Это тот самый «молчаливый
+# даунгрейд», устранение которого объявлено достижением этой ветки, — воспроизводимый одним
+# символом из чужого буфера. Различаем: нечитаемая голова — отдельный наблюдаемый исход.
+def _head_is_utf8(fpath):
+    try:
+        with open(fpath, encoding="utf-8") as f:
+            for i, _line in enumerate(f):
+                if i >= FACTS_HEAD_LINES:
+                    break
+        return True
+    except UnicodeDecodeError:
+        return False
+    except OSError:
+        # `C-117` F-24: прежний комментарий утверждал «её ловят соседние проверки» — замер
+        # это опроверг: chmod 000 не ловит НИКТО (head-scan → (False, None) ⇒ исключён из
+        # ссылок; NOTE-проверка глотает тот же OSError). Принятый предел, а не покрытие:
+        # git режим 000 не хранит (`ls-files -s` → 100644), свежий чекаут кейс не
+        # воспроизводит — радиус ограничен локальными деревьями.
+        return True
+
+
+def _facts_head_scan(fpath):
+    """(declared, sha) по ГОЛОВЕ файла.
+    declared — в голове есть строка, объявляющая документ фактурой;
+    sha       — распарсенная ревизия сбора, либо None (объявление есть, форма негодна)."""
+    declared = False
+    try:
+        with open(fpath, encoding="utf-8") as f:
+            for i, line in enumerate(f):
+                if i >= FACTS_HEAD_LINES:
+                    break
+                m = FACTS_MARKER_RE.search(line)
+                if m:
+                    return True, m.group(1)
+                if FACTS_DECL_RE.search(line):
+                    declared = True
+    except (UnicodeDecodeError, OSError):
+        return False, None
+    return declared, None
+
+
+def _has_facts_marker(fpath):
+    _declared, sha = _facts_head_scan(fpath)
+    return sha is not None
+
+
+# АРХИВНЫЙ КЛАСС ВЕРДИКТОВ (решение founder'а 2026-08-22; исполнение `TD-064`).
+# Вердикт гейта — ДАТИРОВАННЫЙ СНИМОК: он отвечает за ревизию, названную в его шапке
+# `GATE-META: audited_head`, а не за то, как выглядит дерево сегодня. Требовать от него
+# живых ссылок вечно — то же, что требовать от протокола собрания, чтобы упомянутые в нём
+# документы не исчезали. `TD-064` (заведено reviewer'ом 2026-08-01, `R-016` N-5) называет
+# и корень: гейт не отличает УТВЕРЖДЕНИЕ от ЦИТАТЫ утверждения, а вердикт цитирует чужой
+# вывод как улику — черновик `R-016`, приведший вывод гейта дословно, сделал гейт красным
+# на самом себе, и обходили это искажением улики в аудит-трейле.
+# Альтернатива (выровнять охват) отвергнута founder'ом: она требует править ссылки в 28
+# вердиктах и рецидивирует при каждом следующем удалённом файле.
+VERDICT_CLASS_DIRS = ("research/critiques/", "research/reviews/", "research/arbitration/")
+
+
+def is_excluded(relpath, fpath):
+    """Единое правило исключения для check3/check4 — один разбор на двоих (`A-010` §G)."""
+    if relpath.startswith("docs/archive/"):
+        return True
+    if relpath.startswith(VERDICT_CLASS_DIRS):
+        return True
+    if relpath.startswith("docs/plans/"):
+        return not _has_facts_marker(fpath)
+    return False
+
+
 SECTION_HEADING_RE = re.compile(r"^#{2,3}\s+§?(\d+(?:\.\d+)?)\.?\s+\S")
 DESIGN_REF_RE = re.compile(r"DESIGN\.md\s*§(\d+(?:\.\d+)?)")
 
@@ -605,7 +723,7 @@ def check3(root, design_text):
         return
 
     exts = (".md", ".rs", ".sh")
-    excluded = ("docs/archive/", "docs/plans/")
+    # исключение — общее правило: `docs/plans/**` входит в проверку, если несёт `FACTS:`
     n_refs = n_bad = 0
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if d not in (".git", "target", "node_modules")]
@@ -614,7 +732,7 @@ def check3(root, design_text):
                 continue
             fpath = os.path.join(dirpath, fn)
             relpath = os.path.relpath(fpath, root)
-            if any(relpath.startswith(ex) for ex in excluded):
+            if is_excluded(relpath, fpath):
                 continue
             try:
                 with open(fpath, encoding="utf-8") as f:
@@ -641,12 +759,199 @@ def check3(root, design_text):
 DOC_FILE_REF_RE = re.compile(r"\bdocs/[A-Za-z0-9_.\-/]+\.md\b")
 
 
+# ---------------------------------------------------------------------------
+# NOTE-часть решения `A-010` §H: документ в `docs/plans/**`, несущий ≥20 утверждений вида
+# `путь:строка` и НЕ несущий маркера, объявляется молчащим о своей ревизии. Это NOTE, а не
+# FAIL: такой документ по-прежнему рабочая записка, и требовать от неё гарантий нельзя —
+# но её молчание перестаёт быть невидимым.
+# Разбор `путь:строка` ПЕРЕИСПОЛЬЗОВАН (`RFC_PATH_TOKEN_RE` + `RFC_PATH_LINEREF_TAIL_RE`),
+# третий парсер не заводится (`A-010` §G).
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# `A-010` §H, пункт решения, НЕ исполненный в первой редакции (`C-116` F-1, ранг REJECT):
+# «плюс проверка SHA той же механикой, что check6 (существует, предок HEAD)». Захват
+# `audited_head=(…)` в регэкспе был МЁРТВЫМ кодом: группа не потреблялась нигде, документ
+# с выдуманной ревизией опт-инился и не судился ничем. Весь смысл маркера по `A-010` §H —
+# ИМЕНОВАННАЯ ревизия сбора; ревизия, которой нет, не именует ничего.
+# Механика переиспользована, не продублирована (`A-010` §G): те же `git_commit_exists` и
+# `git_commit_is_ancestor_of_any`, что у check6, включая MERGE_HEAD внутри --merge-preview.
+# ---------------------------------------------------------------------------
+# `C-117` F-17: после F-11 в plans-зоне жили ТРИ обхода с ТРЕМЯ охватами — `is_excluded`
+# рекурсивен (startswith), NOTE-проверка рекурсивна (os.walk), SHA-проверка шла os.listdir
+# верхним уровнем. Дыра F-1 воспроизводилась одним уровнем глубже: в подкаталоге фиктивная
+# ревизия опт-инилась и не судилась, а малформ снова молчал. Обход теперь ОДИН на всех.
+def plans_md_files(root):
+    plans = os.path.join(root, "docs", "plans")
+    if not os.path.isdir(plans):
+        return []
+    out = []
+    for dirpath, dirnames, filenames in os.walk(plans):
+        dirnames[:] = [d for d in dirnames if d not in (".git",)]
+        for fn in filenames:
+            if fn.endswith(".md"):
+                out.append(os.path.join(dirpath, fn))
+    return sorted(out)
+
+
+def check_facts_sha(root):
+    plan_files = plans_md_files(root)
+    if not plan_files:
+        return
+
+    declared_bad = []   # объявил себя фактурой, маркер не распарсен
+    unreadable = []     # голова не читается как UTF-8 — проверка невозможна
+    marked = []         # (relpath, sha)
+    for fpath in plan_files:
+        declared, sha = _facts_head_scan(fpath)
+        relpath = os.path.relpath(fpath, root)
+        if sha is not None:
+            marked.append((relpath, sha))
+        elif declared:
+            declared_bad.append(relpath)
+        elif not _head_is_utf8(fpath):
+            unreadable.append(relpath)
+
+    # `C-117` F-18: нечитаемая голова — наблюдаемый исход, а не тишина.
+    for relpath in unreadable:
+        fail(
+            "H-FACTS-SHA",
+            f"{relpath}: голова файла не читается как UTF-8 — наличие маркера `FACTS:` "
+            f"проверить невозможно; документ молча выпал бы из проверки ссылок",
+        )
+
+    # Молчаливый даунгрейд перестаёт быть молчаливым (C-116 F-1, вторая половина).
+    for relpath in declared_bad:
+        fail(
+            "H-FACTS-SHA",
+            f"{relpath}: в голове файла есть строка `FACTS:`, но маркер НЕ распарсен "
+            f"(нужен `audited_head=<7..40 hex>`) — документ объявил себя фактурой и молча "
+            f"выпал из проверки ссылок; исправьте маркер или уберите объявление",
+        )
+
+    if not marked:
+        if not declared_bad and not unreadable:
+            info("H-FACTS-SHA", "документов с маркером `FACTS:` в docs/plans/**: 0 — проверять нечего")
+        return
+
+    try:
+        r = subprocess.run(
+            ["git", "-C", root, "rev-parse", "--is-inside-work-tree"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        git_ok = r.returncode == 0 and r.stdout.strip() == b"true"
+    except OSError:
+        git_ok = False
+
+    # Fail-closed, как у check6: нечем проверить — это НАРУШЕНИЕ, а не молчаливый пропуск.
+    if not git_ok:
+        fail(
+            "H-FACTS-SHA",
+            f"маркеров `FACTS:` найдено {len(marked)}, но '{root}' не git-репозиторий "
+            f"(или git недоступен) — существование ревизии сбора проверить нельзя (setup-guard)",
+        )
+        return
+
+    refs = canonical_refs(root)
+    n_bad = 0
+    for relpath, sha in marked:
+        if not git_commit_exists(root, sha):
+            n_bad += 1
+            fail(
+                "H-FACTS-SHA",
+                f"{relpath}: маркер называет ревизию сбора `{sha}` — такого коммита в "
+                f"репозитории НЕТ вовсе; документ объявлен фактурой на несуществующем дереве",
+            )
+            continue
+        if not git_commit_is_ancestor_of_any(root, sha, refs):
+            n_bad += 1
+            fail(
+                "H-FACTS-SHA",
+                f"{relpath}: маркер называет ревизию сбора `{sha}` — коммит существует, но "
+                f"НЕ входит в историю {'/'.join(refs)} (орфан/несмёрженная ветка): факты "
+                f"собраны на дереве, которого в этой истории нет",
+            )
+
+    if n_bad == 0:
+        pass_(
+            "H-FACTS-SHA",
+            f"маркеров `FACTS:` проверено {len(marked)} — все ревизии сбора существуют и "
+            f"входят в историю {'/'.join(refs)}",
+        )
+
+
+def check_facts_note(root):
+    plans = os.path.join(root, "docs", "plans")
+    if not os.path.isdir(plans):
+        return
+    # `C-116` F-11: `is_excluded` покрывает `docs/plans/**` рекурсивно (startswith), а эта
+    # проверка шла `os.listdir` — верхним уровнем. Подкаталогов сегодня ноль, расхождение было
+    # латентным: первый же подкаталог получил бы проверку ссылок, но не наблюдение молчания.
+    silent = 0
+    for fpath in plans_md_files(root):
+        fn = os.path.relpath(fpath, plans)
+        if _has_facts_marker(fpath):
+            continue
+        n = 0
+        try:
+            with open(fpath, encoding="utf-8") as f:
+                for line in f:
+                    for m in RFC_PATH_TOKEN_RE.finditer(line):
+                        if RFC_PATH_LINEREF_TAIL_RE.search(m.group(1)):
+                            n += 1
+        except (UnicodeDecodeError, OSError):
+            continue
+        if n >= FACTS_NOTE_THRESHOLD:
+            silent += 1
+            note("H-FACTS", f"docs/plans/{fn}: {n} утверждений `путь:строка` без маркера "
+                           f"`FACTS:` — документ не называет ревизию сбора, основанием для "
+                           f"спеки или оракула не является")
+    if silent == 0:
+        info("H-FACTS", "фактур без маркера с порогом утверждений не найдено")
+
+
+
+def check_verdict_class(root):
+    """Архивный класс ОБЪЯВЛЯЕТСЯ — списком каталогов, а НЕ счётчиком.
+
+    Первая редакция печатала числа: сколько вердиктов исключено и сколько мёртвых ссылок
+    внутри. Числа сняты после ДВУХ адверсарных кругов (`R-100` F-1, `R-101` F-1/F-2/F-3),
+    каждый из которых нашёл новый обманный стаб — и КАЖДЫЙ раз стаб был про счётчик, ни
+    разу про само исключение. Причина структурная, а не «недоработали пробу»: счётчик
+    фальсифицируем по трём независимым осям (величина, каталог, множество файлов), и каждая
+    ось требует своей пары фикстур с РАЗНЫМИ числами. Матрица растёт быстрее, чем пиннится.
+
+    Решающее — числа никому не нужны. Решение founder'а 22.08 гласит: вердикт стареет
+    ЗАКОННО. Значит «84 мёртвые ссылки» не действие, а декорация: по ней никто ничего не
+    делает, а фальшивое значение создаёт ложную уверенность. `TD-064` описывает инцидент
+    «гейт краснеет на ЦИТАТУ битой ссылки» — его закрывает ИСКЛЮЧЕНИЕ, не счёт.
+
+    Что осталось: строка называет, ЧТО именно выведено из-под проверок, и берёт список из
+    того же `VERDICT_CLASS_DIRS`, которым исключение и делается. Один носитель — расходиться
+    нечему; фальсифицировать нечего, кроме самого списка, а он запиннен V-5/V-6 и V-2.
+
+    Названный предел: сколько мёртвых ссылок накопилось в вердиктах, гейт больше не
+    сообщает. Это осознанный размен — наблюдение, которое нельзя защитить от подделки
+    дешевле двух кругов, хуже честного молчания о величине при явном объявлении класса.
+    """
+    present = [rel for rel in VERDICT_CLASS_DIRS if os.path.isdir(os.path.join(root, rel))]
+    if not present:
+        info("V-АРХИВ", "каталогов вердиктов нет — класс неприменим")
+        return
+    info(
+        "V-АРХИВ",
+        "архивный класс выведен из проверок ссылок как датированные снимки "
+        f"(решение 2026-08-22, `TD-064`): {' '.join(present)} — ссылки внутри них не судятся, "
+        "вердикт отвечает за ревизию из своей шапки `GATE-META`, а не за сегодняшнее дерево",
+    )
+
+
 def check4(root):
     docs_dir = os.path.join(root, "docs")
     if not os.path.isdir(docs_dir):
         fail("4-МЁРТВЫЕ-ФАЙЛЫ", "каталог docs/ отсутствует — setup-guard")
         return
-    excluded = ("docs/archive/", "docs/plans/")
+    # исключение — общее правило: `docs/plans/**` входит в проверку, если несёт `FACTS:`
     n_refs = n_bad = 0
     for dirpath, dirnames, filenames in os.walk(docs_dir):
         dirnames[:] = [d for d in dirnames if d not in (".git",)]
@@ -655,7 +960,7 @@ def check4(root):
                 continue
             fpath = os.path.join(dirpath, fn)
             relpath = os.path.relpath(fpath, root)
-            if any(relpath.startswith(ex) for ex in excluded):
+            if is_excluded(relpath, fpath):
                 continue
             try:
                 with open(fpath, encoding="utf-8") as f:
@@ -698,9 +1003,17 @@ def check5(root, design_text):
         fail("5-ФАЗЫ", "§10 найден, но ни одной таблицы фаз в нём не распознано — setup-guard")
         return
 
-    milestones_dir = os.path.join(root, "milestones")
+    # Норма Р-2 (`04-workflow.md` §2): спека закрытого милестоуна уезжает в `docs/archive/`
+    # вместе с гейтом. Милестоун при этом НЕ исчезает — он закрыт, и фаза вправе его
+    # цитировать. Без второго каталога здесь вынос 26 спек уронил бы check5 на пустом
+    # месте: «фаза объявлена пройденной, но milestones/M-NN-*.md отсутствует» — при том
+    # что отсутствует он ровно потому, что милестоун ПРОЙДЕН.
+    # Требование 1 нормы называло только аллокатор номеров; сцепленных барьеров ДВА, и
+    # этот второй не был назван ни автором нормы, ни тремя кругами её перепроверки.
+    milestones_dirs = [os.path.join(root, "milestones"), os.path.join(root, "docs", "archive")]
+    milestones_dir = milestones_dirs[0]
     milestone_status = {}
-    if os.path.isdir(milestones_dir):
+    for milestones_dir in [d for d in milestones_dirs if os.path.isdir(d)]:
         for fn in os.listdir(milestones_dir):
             mm = re.match(r"M-(\d+).*\.md$", fn)
             if not mm:
@@ -1231,6 +1544,9 @@ def main():
     check2(root, design_text)
     check3(root, design_text)
     check4(root)
+    check_verdict_class(root)
+    check_facts_sha(root)
+    check_facts_note(root)
     check5(root, design_text)
     check6(root)
     check7(root)
