@@ -65,6 +65,41 @@ origin/main   ffb1d02   CI success · Deploy success · прод обновлё�
 | профиль `a219fe4` (ветка `docs/architect-profile-facts-fix`) ждёт круга критика §9 | зона замка §11, токен founder'а получен | architect |
 | запись решения founder'а (а) — ветка `docs/founder-decision-a015-2026-08-23`, `R-116` APPROVE | стоит ЗА `#66`, ссылается на его документ | architect |
 
+## 2.4 ГДЕ ЧТО ЛЕЖИТ — читать ДО того, как искать
+
+**Три ветки несут готовую работу и НЕ ИМЕЮТ PR.** Без этой таблицы следующая сессия их не
+найдёт: `gh pr list` их не покажет.
+
+| ветка | вершина | что там | что с ней делать |
+|---|---|---|---|
+| `docs/architect-profile-facts-fix` | `a219fe4` | правка `.claude/agents/architect.md`: снято ложное «детектора FACTS нет в main». Токен founder'а в теле есть | нужен круг критика по §9 (зона замка §11), затем PR |
+| `docs/founder-decision-a015-2026-08-23` | `f920769` | запись решения founder'а (а) в `П-017` A2 + вердикт `R-116` **APPROVE** | стоит ЗА PR #66 (ссылается на его документ); после merge #66 — PR и merge |
+| `docs/pr65-assessment-2026-08-23` | `6d9a0dc` | независимая оценка семи кругов `#65` (`docs/plans/pr65-continuation-assessment…`) | приземлить своим PR либо оставить как справку |
+
+**Соответствие PR → ветка → предмет:**
+
+| PR | ветка | предмет |
+|---|---|---|
+| **#75** | `harness/td-163-protected-artifacts` | `TD-163`, блокирует доставку |
+| **#66** | `docs/two-barriers-step1-2026-08-23` | барьер A не строится + свидетель в оракуле; у reviewer'а по решению `A-016` |
+| **#32** | `feat/M-69-window-guard` | M-69 `GW-I-14`; impl готов, ждёт factual flip architect'а |
+| #76 | `docs/session-handover-2026-08-24` | эта передача |
+
+**ВЕРДИКТЫ, КОТОРЫХ НЕТ В `main`** — ссылка по идентификатору к файлу НЕ приведёт. Читать
+`git show <ветка>:<путь>`:
+
+| ID | ветка | путь |
+|---|---|---|
+| `C-136` | `harness/td-163-protected-artifacts` | `research/critiques/C-136-adversary-td-163-protected-artifacts.md` |
+| `A-016` | `docs/two-barriers-step1-2026-08-23` | `research/arbitration/A-016-pr66-routing.md` |
+| `R-116` | `docs/founder-decision-a015-2026-08-23` | `research/reviews/R-116-recheck-r2-founder-decision-a015.md` |
+
+`C-135`, `R-118`, `R-117`, `R-113` — уже в `main`, ищутся обычным грепом.
+
+**Мелочь, которую называю, а не молчу** (`branch-hygiene.md` п.7): в рабочем чекауте лежит
+untracked-каталог `.omc/` — оснастка oh-my-claudecode, появилась до начала сессии. Не мой
+артефакт; не удалял и не коммитил. Reviewer передавал его founder'у в `R-117` §E.
+
 ## 3. Решения founder'а этой сессии (BINDING)
 
 1. **«Ничего нового не вводить. Чинить то, что есть, и не лезть дальше.»** Действует на всё.
