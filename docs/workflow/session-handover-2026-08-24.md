@@ -83,7 +83,7 @@ origin/main   ffb1d02   CI success · Deploy success · прод обновлё�
 
 1. **`gates.md` §0 триггер 2 — «три круга по одному предмету → арбитр» — СРАБОТАЛ на круге 3
    `#65` и не был вызван никем.** Семь кругов, ~1.3 млн токенов. Правило написано; я считал
-   круги и не сделал вывода. Независимая оценка — `docs/plans/pr65-continuation-assessment-2026-08-23.md`
+   круги и не сделал вывода. Независимая оценка — pr65-continuation-assessment-2026-08-23.md (в docs/plans, ветка docs/pr65-assessment-2026-08-23 — в main ещё нет)
    (ветка `docs/pr65-assessment-2026-08-23`): настоящих дефектов ПОВЕДЕНИЯ — три, все в кругах
    1-2; круги 3-6 — шесть воспроизведений ОДНОГО класса.
 2. **Условие снятия формулируется ПО КЛАССУ, а не по клетке.** Круги 2-3 требовали по одному
@@ -99,5 +99,5 @@ origin/main   ffb1d02   CI success · Deploy success · прод обновлё�
 
 ## Cross-references
 - `research/critiques/C-127`…`C-136` · `research/reviews/R-113`…`R-118` · `research/arbitration/A-015`, `A-016`
-- `docs/plans/pr65-continuation-assessment-2026-08-23.md` (ветка `docs/pr65-assessment-2026-08-23`)
-- `docs/plans/two-barriers-step1-2026-08-23.md` (PR #66)
+- pr65-continuation-assessment-2026-08-23.md (в docs/plans, ветка docs/pr65-assessment-2026-08-23 — в main ещё нет) (ветка `docs/pr65-assessment-2026-08-23`)
+- two-barriers-step1-2026-08-23.md (в docs/plans, PR #66 — в main ещё нет)
