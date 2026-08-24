@@ -94,7 +94,6 @@ origin/main   ffb1d02   CI success · Deploy success · прод обновлё�
 | `A-016` | `docs/two-barriers-step1-2026-08-23` | `research/arbitration/A-016-pr66-routing.md` |
 | `R-116` | `docs/founder-decision-a015-2026-08-23` | `research/reviews/R-116-recheck-r2-founder-decision-a015.md` |
 | `A-014` | `feat/M-69-window-guard` | `research/arbitration/A-014-m69-window-guard.md` — **на него ссылается очередь** (factual flip §5 п.3), в `main` его НЕТ |
-| `C-132` | `feat/M-69-window-guard` | `research/critiques/C-132-M-69-window-guard-r4.md` (plan-time NOTE) |
 
 `C-135`, `R-118`, `R-117`, `R-113` — уже в `main`, ищутся обычным грепом.
 
