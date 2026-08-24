@@ -3,7 +3,7 @@ milestone: M-69
 audited_repo: a3ka/hft-platform
 audited_base: 10bc072c7e008bce3feee80013fb187e3436fd17
 audited_head: 00886e3b745ec7813c2114143137f18a1e420954
-verdict: APPROVED
+verdict: APPROVE
 -->
 
 # R-128 — M-69 window guard (`GW-I-14`): PR-time reviewer, **APPROVED**
