@@ -1566,7 +1566,7 @@ $ … 'ls -la …/hft-platform_gateway-ckpt/_data/; xxd -s 8 -l 4 …/ckpt-2a003
 подключение WS-клиента после деплоя дороже обычного, дальше кэш живёт в версии 2.
 Рестарт рекордера при деплое даёт штатный гэп forward-only записи (`TD-086`).
 
-## M-65 «подписка как параметр СЕССИИ» (ws-session, `CT-RFC-09`) — ⚠️ КОД В MAIN (merge `63c3866` 2026-08-23, `R-118` APPROVED), но **§8 NOT GREEN: прод НЕ обновлён, Deploy SKIPPED (`TD-163`)**; milestone **НЕ ЗАКРЫТ**
+## M-65 «подписка как параметр СЕССИИ» (ws-session, `CT-RFC-09`) — ✅ КОД В MAIN (merge `63c3866` 2026-08-23, `R-118` APPROVED) + **В ПРОДЕ, §8 PASSED 2026-08-24T00:11Z** (доставлен вторым push'ем `670954f` в обход `TD-163`); milestone **НЕ ЗАКРЫТ — close-out за architect'ом**
 
 **Что приземлилось.** `crates/gateway-serve` научился мультиплексировать подписки на одном
 WS-соединении по `CT-RFC-09`: `{"op":"subscribe"|"unsubscribe","v":1,"id":…,"selector":{…}}`
@@ -1624,20 +1624,55 @@ sacred-оракула источник истины другой и внешни
 конфигурации. `RISK-BLOCK` неприменим (`gates.md` §5): `gateway-serve` — read-only консюмер
 журнала market-плоскости, ордер-пути нет, `crates/{risk,killswitch,oms,venue-*}/**` не тронуты.
 
-**§8 ДЕПЛОЙ-ГЕЙТ НЕ ПРОЙДЕН — и не по вине M-65.** Push `63c3866` в `main` дал
-`Protected artifacts (gate trail)` **failure** → `All checks passed` **failure** →
-`Deploy to VPS` / `Gate on CI (fail-closed)` **failure** → `Deploy (build on VPS)` **skipped**.
-Причина — `TD-163`: барьер на push-форме не видит объясняющего коммита архивного переезда
-(`bd357df` — ПРЕДОК `PUSH_BEFORE`), потому что `existed` собирается по всему диапазону, а
-`removed_by` — только внутри него. Дефект срабатывает на ЛЮБОЙ ветке, форкнутой до `bd357df`;
-все три открытых PR такие. Revert M-65 его не лечит.
+**§8 ДЕПЛОЙ-ГЕЙТ: сорван первым push'ем, ПРОЙДЕН со второго — и это не формальность,
+а воспроизведение `TD-163` в обе стороны.**
 
-**Состояние прода (ssh eyes-on, 2026-08-23T23:48:13Z) — ЗДОРОВ, но на ПРЕЖНЕМ образе:**
-контейнеры `hft-recorder` / `hft-gateway-serve` — `Up 4 hours (healthy)` (рестарта не было,
-что и есть прямое доказательство несостоявшегося деплоя); heartbeat свежий
-(`events=2142706`, `next_seq=334872405`, `writable=true`); журнал растёт (73 233 176 221 →
-73 298 106 098 B за 9 минут); `RssAnon` recorder 22 412 kB, gateway-serve 336/272 kB;
-`load average: 0.17`. Сбор данных не пострадал — прод просто не получил эту работу.
+*Круг 1 (красный).* Push `63c3866` дал `Protected artifacts (gate trail)` **failure** →
+`All checks passed` **failure** → `Deploy to VPS` / `Gate on CI (fail-closed)` **failure** →
+`Deploy (build on VPS)` **skipped**. Причина — `TD-163`: барьер на push-форме не видит
+объясняющего коммита архивного переезда (`bd357df` — ПРЕДОК `PUSH_BEFORE`), потому что
+`existed` собирается по всему диапазону, а `removed_by` — только внутри него. Прод остался на
+прежнем образе; ssh 23:48:13Z: `Up 4 hours (healthy)` — рестарта не было.
+
+*Круг 2 (зелёный).* Merge close-out PR #73 (`670954f`) — ветка форкнута ОТ `63c3866`, то есть
+ПОСЛЕ `bd357df`, поэтому в диапазон push'а стародеревьев не попало. `CI` **success**,
+`Deploy to VPS` **success** (`Deploy (build on VPS)` success, `Gate on CI` skipped —
+сработала ветка `Catch-up decision`, сторож «деплой не состоялся», Р-4). M-65 доехал до VPS
+ЭТИМ push'ем, а не своим.
+
+**Это и есть эмпирическое доказательство механизма `TD-163` в обе стороны:** ветка СТАРШЕ
+`bd357df` красит `main`, ветка МОЛОЖЕ — нет. Одно дерево барьера, разный ответ по форме
+события и по возрасту базы.
+
+**§8 eyes-on на VPS — ДВА замера, чтобы предъявить РОСТ, а не снимок:**
+
+```
+00:11:05Z  hft-gateway-serve Up 20 seconds (healthy) | hft-recorder Up 25 seconds (healthy)
+           heartbeat {"events":2172,"next_seq":335068931,"segment_index":394,"writable":true,
+                      "ts_wall_ms":1787530259769}
+           RssAnon: recorder 11388 kB · gateway-serve 368 kB
+           journal 73 462 595 272 B · load average: 2.02, 1.11, 0.50
+
+00:11:44Z  hft-gateway-serve Up 59 seconds (healthy) | hft-recorder Up About a minute (healthy)
+           heartbeat {"events":10107,"next_seq":335076870,"segment_index":394,"writable":true,
+                      "ts_wall_ms":1787530299771}
+           RssAnon: recorder 14736 kB · gateway-serve 368 kB
+           journal 73 464 426 936 B · load average: 1.03, 0.97, 0.48
+```
+
+Прочтение: **рестарт состоялся** (`Up 20/25 s` против `Up 4 hours` до деплоя — прямая улика
+доставки); **heartbeat свежий** (`ts_wall_ms` отстаёт от снятия на 5-6 с и сдвинулся на +40 с
+между замерами); **журнал растёт** (+1.83 MB за 39 с; `next_seq` +7 939, непрерывно от
+дореплойного `334872405`); **память в норме** — `RssAnon` recorder 11.4 → 14.7 MB (прогрев
+после рестарта, четыре порядка от класса `TD-039` с его 7.3 GB), `gateway-serve` 368 kB
+неизменно; **CPU оседает** (`load` 2.02 → 1.03 — хвост сборки на VPS, не рабочая нагрузка).
+`events` обнулился на рестарте (счётчик с момента старта процесса) — ожидаемо и с потерей
+данных не связано: непрерывность несёт `next_seq`, а не он.
+
+**Форма данных деплоем не менялась:** M-65 трогает только `gateway-serve` (WS-транспорт и
+разбор конфигурации), парсеры/форматы recorder'а не тронуты, поэтому content-sanity свежих
+событий сверх трёх liveness-проверок не требовался. Штатный forward-only разрыв записи на
+рестарте recorder'а — цена деплоя, известная и принятая.
 
 **Почему milestone НЕ закрыт этим вердиктом.** `R-118` закрывает КРУГ ГЕЙТА по диапазону
 `a9f0bf5..87d9c87` — не milestone целиком. Close-out M-65 (сверка §Tasks 1-15 с фактом,
