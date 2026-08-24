@@ -142,6 +142,23 @@ benign_proc() {
   printf '%s' "${fp}"
 }
 
+# proc_of <главный> <pid> → фиктивный /proc, содержащий РОВНО один PID — симлинк на
+# НАСТОЯЩИЙ `/proc/<pid>`. Прод-форма сохраняется полностью: `readlink … /cwd` читает
+# настоящее ядро и отдаёт настоящую строку, включая суффикс `(deleted)`; `stat` отдаёт
+# настоящего владельца. Убирается ровно одно — ШУМ ЧУЖИХ ПРОЦЕССОВ.
+#
+# Зачем: на GitHub-раннере живут процессы нашего uid с нечитаемым `cwd`, и сторож законно
+# считает их держателями. Для сценариев это не находка, а КОНФАУНДИНГ: он не только ронял
+# L9, но и МАСКИРОВАЛ мутанта G3 — kill-set пришёл пустым, потому что удержание
+# обеспечивалось посторонним процессом, а не проверяемой строкой. Мутант, который «не
+# роняет», читается как «строка ничего не пиннит», и это был бы ложный вывод о предмете.
+proc_of() {
+  local main="$1" pid="$2" fp="$1/procof-${2}"
+  mkdir -p "${fp}" || return 1
+  ln -sfn "/proc/${pid}" "${fp}/${pid}" || return 1
+  printf '%s' "${fp}"
+}
+
 # expect_gc <имя> <главный> <ожидаемый-код> <обязательная|-> <запрещённая|-> [аргументы gc…]
 expect_gc() {
   local name="$1" main="$2" wantrc="$3" must="$4" mustnot="$5"; shift 5
@@ -166,8 +183,10 @@ unset GC_PROC_ROOT
 # --- L2 живой процесс, cwd == дерево -----------------------------------------------------
 read -r main wt < <(mk_case l2) || { sfail "L2-живой-в-дереве" "фикстура"; return; }
 q="$(spawn_in "${wt}")"
+GC_PROC_ROOT="$(proc_of "${main}" "${q}")"; export GC_PROC_ROOT
 expect_gc "L2-живой-в-дереве" "${main}" 0 "ЖИВОЙ процесс держит cwd" "REMOVED  wt"
 if [ -d "${wt}" ]; then ok "L2-каталог-уцелел"; else nok "L2-каталог-уцелел" "дерево снесено под живым процессом"; fi
+unset GC_PROC_ROOT
 kill "${q}" 2>/dev/null
 
 # --- L3 живой процесс, cwd в ПОДКАТАЛОГЕ -------------------------------------------------
@@ -175,7 +194,9 @@ kill "${q}" 2>/dev/null
 # пропускает всё, что глубже. Агент почти всегда сидит глубже корня дерева.
 read -r main wt < <(mk_case l3) || { sfail "L3-живой-в-подкаталоге" "фикстура"; return; }
 q="$(spawn_in "${wt}/sub")"
+GC_PROC_ROOT="$(proc_of "${main}" "${q}")"; export GC_PROC_ROOT
 expect_gc "L3-живой-в-подкаталоге" "${main}" 0 "ЖИВОЙ процесс держит cwd" "REMOVED  wt"
+unset GC_PROC_ROOT
 kill "${q}" 2>/dev/null
 
 # --- L4 АНТИ-ПЛАЦЕБО В ДРУГУЮ СТОРОНУ: процесс умер — дерево снова сносится --------------
@@ -198,8 +219,10 @@ unset GC_PROC_ROOT
 # ни с `"$wt"/*`. Поймано батареей: kill-set G3 пришёл пустым.
 read -r main wt < <(mk_case l5) || { sfail "L5-cwd-deleted" "фикстура"; return; }
 q="$(spawn_in "${wt}")"
+GC_PROC_ROOT="$(proc_of "${main}" "${q}")"; export GC_PROC_ROOT
 rm -rf "${wt}"
 expect_gc "L5-cwd-deleted" "${main}" 0 "ЖИВОЙ процесс держит cwd" "REMOVED  wt"
+unset GC_PROC_ROOT
 kill "${q}" 2>/dev/null
 
 # --- L6 FAIL-CLOSED: `/proc` отсутствует -------------------------------------------------
@@ -228,8 +251,10 @@ mkdir -p "${wt}/target"; echo x > "${wt}/target/x"; touch -d '2020-01-01' "${wt}
 mk_pgrep "${main}" 1 || { sfail "L8-reclaim-живой" "поддельный pgrep"; return; }
 FAKE_BIN="${main}/bin"
 q="$(spawn_in "${wt}")"
+GC_PROC_ROOT="$(proc_of "${main}" "${q}")"; export GC_PROC_ROOT
 expect_gc "L8-reclaim-живой" "${main}" 0 "ЖИВОЙ процесс держит cwd" "RECLAIMED" --reclaim 0
 if [ -f "${wt}/target/x" ]; then ok "L8-target-уцелел"; else nok "L8-target-уцелел" "кэш снесён под живой сборкой"; fi
+unset GC_PROC_ROOT
 kill "${q}" 2>/dev/null
 
 # --- L9 ПОЗИТИВНЫЙ КОНТРОЛЬ RECLAIM: без процесса `target/` забирается -------------------
