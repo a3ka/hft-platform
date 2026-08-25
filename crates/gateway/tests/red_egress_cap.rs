@@ -135,6 +135,29 @@ fn deep_book() -> tempfile::TempDir {
     journal_prod_shape((REACH / STEP) as usize, N_BUCKETS)
 }
 
+/// ПЛОТНЫЙ НЕ-heatmap ресурс: 25 000 сделок с РАЗНЫМИ ценами и НИ ОДНОГО L2-события.
+/// `heatmap = 0`, `cob = 0`, но `vp_bins = 25 000`, `bubbles = 25 000`, ответ ≈ 2.8 МБ.
+/// Ровно тот ресурс, который `C-158` R1 предъявил на непокрытых формах как 2 804 666 Б.
+fn dense_trades() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut j = Journal::open_with(dir.path(), cfg()).expect("open_with");
+    for i in 0..25_000i64 {
+        j.append(EventKind::md(
+            Venue::Binance,
+            "BTCUSDT",
+            MdPayload::Trade {
+                price: to_fixed(MID + i as f64 * 0.01),
+                size: to_fixed(1.0),
+                side: if i % 2 == 0 { Side::Buy } else { Side::Sell },
+                ts_exch_ms: T0 + i,
+            },
+        ))
+        .expect("append trade");
+    }
+    j.flush().expect("flush");
+    dir
+}
+
 /// Величина ресурса — ровно то, что уходит на провод (`serde_json::to_vec` в `gateway-serve`).
 fn response_bytes(s: &gateway::Snapshot) -> usize {
     serde_json::to_vec(s)
@@ -224,41 +247,6 @@ fn pl_i_5_e_prod_default_selector_is_served() {
     );
 }
 
-/// **E-3 — ЧЕСТНЫЙ МНОГОПОЛОСНЫЙ запрос обслуживается** (`C-157` R3).
-///
-/// Первая редакция звала нормальный (невырожденный) селектор ТОЛЬКО с одной полосой, и критик
-/// показал дыру: реализация, отвергающая любой ответ более чем с одной полосой, оставалась бы
-/// зелёной на всём наборе. Селектор ниже — тот самый, которым это предъявлено: семь валидных
-/// отсортированных полос, обслуживаемых сегодня и дающих ответ ЗАВЕДОМО ниже любого разумного
-/// предела.
-///
-/// Вторая половина — обещанное спекой сравнение «одна полоса против семи при равном объёме»:
-/// семь УЗКИХ полос не смеют быть отвергнуты за то, что их семь. Отвергать положено по
-/// ВЕЛИЧИНЕ ОТВЕТА, а не по числу полос.
-#[test]
-fn pl_i_5_e3_honest_multi_band_request_is_served() {
-    let dir = deep_book();
-    let seven = vec![0.0002, 0.0004, 0.0008, 0.0016, 0.0032, 0.0064, 0.0128];
-
-    let multi = snapshot(dir.path(), seven.clone()).expect(
-        "PL-I-5 E-3: семь валидных узких полос — честный рабочий запрос, он обслуживается \
-         сегодня и обязан обслуживаться после фикса. Реализация, отвергающая ответ за ЧИСЛО \
-         полос вместо его ВЕЛИЧИНЫ, ломает работу и остаётся зелёной на всех прочих оракулах",
-    );
-    let one = snapshot(dir.path(), vec![0.0128]).expect("одна полоса той же ширины обслуживается");
-
-    let (bm, bo) = (response_bytes(&multi), response_bytes(&one));
-    assert!(
-        bm < 4 * bo.max(1),
-        "PL-I-5 E-3: семь УЗКИХ полос дали {bm} Б против {bo} Б у одной полосы той же ширины. \
-         Окно выдачи задаёт САМАЯ ШИРОКАЯ полоса (`crates/gateway/src/lib.rs:1192`), поэтому \
-         разница обязана быть в разы, а не в порядки: цена берётся за ОБЪЁМ, а не за число \
-         полос. Состав: {} против {}",
-        entity_counts(&multi),
-        entity_counts(&one)
-    );
-}
-
 /// **E-2 — вырожденный вход не отвергается.** Пустая и односторонняя книга — легитимные
 /// состояния (старт процесса, ресинк, односторонний рынок). Реализация, отвергающая их
 /// «на всякий случай», ломает работу там, где ресурса не тратится вовсе.
@@ -286,6 +274,124 @@ fn pl_i_5_e2_degenerate_books_are_served() {
     }
     snapshot(dir.path(), vec![PROD_BAND])
         .expect("PL-I-5 E-2: односторонняя книга — штатное состояние, не повод для отказа");
+}
+
+/// Верхняя граница ОБЪЯВЛЕННОГО рабочего диапазона по числу полос (`A-021`, Вопрос 3).
+/// `CT-RFC-09` §2.7 максимума не задаёт; это НЕ новый предел протокола, а диапазон, который
+/// набор ДОКАЗЫВАЕТ. Восьмиполосный случай `C-158` входит сюда частным случаем.
+const N_MAX_BANDS: usize = 12;
+
+/// `n` узких полос, кратно растущих от `base`. Все внутри `base * 2^(n-1)`, то есть окно
+/// выдачи задаёт последняя — самая широкая.
+fn narrow_bands(n: usize, base: f64) -> Vec<f64> {
+    (0..n).map(|k| base * (1u64 << k) as f64).collect()
+}
+
+/// **E-3 — СЕМЕЙСТВО честных многополосных запросов, а не один экземпляр** (`A-021` Предл. 2).
+///
+/// # Почему семейство, а не ещё одна фикстура
+///
+/// Два круга подряд контроль честной нагрузки был ФИКСИРОВАННЫМ экземпляром, и каждый раз
+/// прокси на единицу шире его переживал: `C-157` — контроль на ОДНУ полосу, прокси
+/// «reject при >1» зелен; `C-158` — контроль на СЕМЬ, прокси `bands.len() <= 7` зелен, а
+/// валидный восьмиполосный запрос (152 588 Б, 13× запаса) отвергнут. Правило границы `A-020`
+/// запрещает девятую полосу как ответ: меняется КОНСТРУКЦИЯ.
+///
+/// # Форма, принятая арбитром — и его же поправка ко мне
+///
+/// Я утверждал, что парная проверка убивает «любой прокси независимо от порога». **Это
+/// неверно, и арбитр это назвал:** пара с кардинальностями (n, n+1) убивает прокси только с
+/// порогом < n+1; прокси с порогом выше любой конечной фикстуры не фальсифицируем конечным
+/// набором. Принятая форма — семейство по ОБЪЯВЛЕННОМУ диапазону `1..=N_MAX_BANDS`, а остаток
+/// назван честно: **прокси с порогом выше `N_MAX_BANDS` этот набор не ловит —
+/// `COGNITIVE-ONLY`.** Диапазон объявлен спекой; расширять его — правка спеки, не теста.
+#[test]
+fn pl_i_5_e3_family_of_honest_multi_band_requests_is_served() {
+    let dir = journal_prod_shape(400, 4);
+    let base = 0.0001_f64;
+
+    let widest = *narrow_bands(N_MAX_BANDS, base).last().expect("непусто");
+    let single = snapshot(dir.path(), vec![widest])
+        .expect("PL-I-5 E-3 SETUP: одна полоса максимальной ширины обязана обслуживаться");
+    let single_b = response_bytes(&single);
+
+    for n in 1..=N_MAX_BANDS {
+        let bands = narrow_bands(n, base);
+        let got = snapshot(dir.path(), bands.clone()).unwrap_or_else(|e| {
+            panic!(
+                "PL-I-5 E-3: запрос из {n} валидных полос ОТВЕРГНУТ ({e}). Полосы отсортированы, \
+                 без дублей, все в (0,1) — `CT-RFC-09` §2.7 их принимает, и окно выдачи задаёт \
+                 самая широкая из них ({widest}), то есть ресурс тот же, что у одной полосы. \
+                 Отвергать положено по ВЕЛИЧИНЕ ОТВЕТА, а не по ЧИСЛУ полос: прокси на \
+                 `bands.len()` — ровно дефект, который C-158 предъявил мутацией."
+            )
+        });
+        let b = response_bytes(&got);
+        assert!(
+            b < 4 * single_b.max(1),
+            "PL-I-5 E-3: {n} узких полос дали {b} Б против {single_b} Б у одной полосы той же \
+             максимальной ширины. Разница обязана быть в разы, а не в порядки — цена берётся \
+             за ОБЪЁМ. Состав: {}",
+            entity_counts(&got)
+        );
+    }
+}
+
+/// **E-4 — вторая ось семейства: РАВНЫЕ байты, ПРОТИВОПОЛОЖНЫЙ состав** (`A-021` Предл. 2 п.2).
+///
+/// Два запроса примерно равного веса, но собранные из разных частей ответа: один
+/// heatmap-тяжёлый (книга, без сделок), другой trades-тяжёлый (сделки, пустой heatmap).
+/// Вердикт обязан быть ОДИНАКОВЫМ. Прокси, ограничивающий одну часть ответа, разводит их — и
+/// краснеет здесь. Это анти-ложно-КРАСНАЯ пара к `A-2`: та требует ОТВЕРГАТЬ плотные сделки,
+/// эта — НЕ отвергать их, пока они дёшевы.
+#[test]
+fn pl_i_5_e4_equal_bytes_opposite_composition_get_the_same_verdict() {
+    // heatmap-тяжёлый: книга, ноль сделок
+    let hm = journal_prod_shape(300, 4);
+    // trades-тяжёлый: сделки, ноль L2-событий
+    let tr = tempfile::tempdir().expect("tempdir");
+    {
+        let mut j = Journal::open_with(tr.path(), cfg()).expect("open_with");
+        for i in 0..3_000i64 {
+            j.append(EventKind::md(
+                Venue::Binance,
+                "BTCUSDT",
+                MdPayload::Trade {
+                    price: to_fixed(MID + i as f64 * 0.01),
+                    size: to_fixed(1.0),
+                    side: if i % 2 == 0 { Side::Buy } else { Side::Sell },
+                    ts_exch_ms: T0 + i,
+                },
+            ))
+            .expect("append");
+        }
+        j.flush().expect("flush");
+    }
+
+    let a = snapshot(hm.path(), vec![ABUSIVE_BAND]);
+    let b = snapshot(tr.path(), vec![PROD_BAND]);
+
+    let (ba, bb) = (
+        a.as_ref().map(response_bytes).unwrap_or(0),
+        b.as_ref().map(response_bytes).unwrap_or(0),
+    );
+    // SETUP: пара имеет смысл, только если веса СОПОСТАВИМЫ. Иначе разные вердикты
+    // объясняются разным объёмом, а не разным составом.
+    if a.is_ok() && b.is_ok() {
+        assert!(
+            ba.max(bb) < 8 * ba.min(bb).max(1),
+            "PL-I-5 E-4 SETUP НЕ СОСТОЯЛСЯ: веса пары разошлись ({ba} Б против {bb} Б) — \
+             сравнивать вердикты нельзя, различие объяснимо объёмом"
+        );
+    }
+    assert_eq!(
+        a.is_ok(),
+        b.is_ok(),
+        "PL-I-5 E-4: ответы сопоставимого веса ({ba} Б heatmap-тяжёлый против {bb} Б \
+         trades-тяжёлый) получили РАЗНЫЕ вердикты. Значит предел судит не ВЕЛИЧИНУ, а одну \
+         часть ответа — тот самый прокси, из-за которого набор дважды пропускал обход \
+         (C-157 R1, C-158 R1)."
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════════════════
@@ -440,97 +546,108 @@ fn pl_i_5_b_no_silent_truncation_on_either_side() {
 /// (`crates/gateway/src/lib.rs:1893-1905`), а не в `serve_config_from_env`.
 #[test]
 fn pl_i_4_c_limit_has_no_bypass_across_entry_points() {
-    let dir = deep_book();
-    let s = sel(vec![ABUSIVE_BAND]);
+    // ДВА РАЗНЫХ РЕСУРСА через КАЖДУЮ дверь (`A-021`, обязательный набор п.1). Первая
+    // редакция гоняла только широкую книгу, и реализация, отвергающая её и пропускающая
+    // плотные сделки, оставалась зелёной — `C-158` R1 предъявил это исполнением.
+    let wide = deep_book();
+    let dense = dense_trades();
+    for (name, dir, bands) in [
+        ("широкая книга", wide.path(), vec![ABUSIVE_BAND]),
+        ("плотные сделки", dense.path(), vec![PROD_BAND]),
+    ] {
+        let s = sel(bands);
 
-    // (1) snapshot — покрыт оракулом A, здесь для полноты перечня
-    assert!(
-        gateway::snapshot(dir.path(), EpochFilter::OwnCaptureOnly, &s, Cursor::LATEST).is_err(),
-        "PL-I-4 C: `snapshot` обслужил раздувающий селектор"
-    );
+        // (1) snapshot
+        if let Ok(v) = gateway::snapshot(dir, EpochFilter::OwnCaptureOnly, &s, Cursor::LATEST) {
+            panic!(
+                "PL-I-4 C [{name}]: `snapshot` обслужил {} Б ({})",
+                response_bytes(&v),
+                entity_counts(&v)
+            );
+        }
 
-    // (2) frames_since — push-путь, которым живёт WS-клиент после первого снапшота
-    assert!(
-        gateway::frames_since(
-            dir.path(),
+        // (2) frames_since — судятся БАЙТЫ КАДРА, а не факт возврата: кадр уходит на провод
+        // целиком, и его величина есть тот же ресурс (`C-158` R1: 2 804 666 Б).
+        if let Ok((frames, _)) = gateway::frames_since(
+            dir,
             EpochFilter::OwnCaptureOnly,
             &s,
             Cursor::START,
             usize::MAX,
-        )
-        .is_err(),
-        "PL-I-4 C: `frames_since` обслужил раздувающий селектор. Предел, поставленный только в \
-         `snapshot`, оставляет открытым именно тот путь, которым идёт основной трафик."
-    );
+        ) {
+            let worst = frames
+                .iter()
+                .map(|f| serde_json::to_vec(f).expect("Frame сериализуем").len())
+                .max()
+                .unwrap_or(0);
+            panic!(
+                "PL-I-4 C [{name}]: `frames_since` отдал {} кадров, крупнейший — {worst} Б. \
+                 Push-путь — тот, которым идёт основной трафик после первого снапшота.",
+                frames.len()
+            );
+        }
 
-    // (3) frames_since_with_stats — та же форма, другой возврат; отдельная дверь
-    assert!(
-        gateway::frames_since_with_stats(
-            dir.path(),
-            EpochFilter::OwnCaptureOnly,
-            &s,
-            Cursor::START,
-            usize::MAX,
-        )
-        .is_err(),
-        "PL-I-4 C: `frames_since_with_stats` обслужил раздувающий селектор — вариант с \
-         возвратом статистики обязан быть закрыт так же, как базовый (`C-157` R2)"
-    );
+        // (3) frames_since_with_stats — отдельная дверь той же формы
+        assert!(
+            gateway::frames_since_with_stats(
+                dir,
+                EpochFilter::OwnCaptureOnly,
+                &s,
+                Cursor::START,
+                usize::MAX,
+            )
+            .is_err(),
+            "PL-I-4 C [{name}]: `frames_since_with_stats` обслужил раздувающий запрос"
+        );
 
-    // (4) replay
-    assert!(
-        gateway::replay(
-            dir.path(),
-            EpochFilter::OwnCaptureOnly,
-            &s,
-            Cursor::START,
-            Cursor::LATEST,
-        )
-        .is_err(),
-        "PL-I-4 C: `replay` обслужил раздувающий селектор"
-    );
+        // (4) replay
+        assert!(
+            gateway::replay(
+                dir,
+                EpochFilter::OwnCaptureOnly,
+                &s,
+                Cursor::START,
+                Cursor::LATEST,
+            )
+            .is_err(),
+            "PL-I-4 C [{name}]: `replay` обслужил раздувающий запрос"
+        );
 
-    // (5) warm-путь: чекпоинт снимается по расписанию, это обычный прод-путь
-    let ckpt = tempfile::tempdir().expect("ckpt tempdir");
-    assert!(
-        gateway::snapshot_from_checkpoint(
-            dir.path(),
-            EpochFilter::OwnCaptureOnly,
-            &s,
-            ckpt.path(),
-            Cursor::LATEST,
-        )
-        .is_err(),
-        "PL-I-4 C: `snapshot_from_checkpoint` обслужил раздувающий селектор"
-    );
+        // (5) warm-путь: чекпоинт снимается по расписанию — обычный прод-путь
+        let ckpt = tempfile::tempdir().expect("ckpt tempdir");
+        assert!(
+            gateway::snapshot_from_checkpoint(
+                dir,
+                EpochFilter::OwnCaptureOnly,
+                &s,
+                ckpt.path(),
+                Cursor::LATEST,
+            )
+            .is_err(),
+            "PL-I-4 C [{name}]: `snapshot_from_checkpoint` обслужил раздувающий запрос"
+        );
 
-    // (6) ЖИВОЙ WS-ПУТЬ — `C-157` R2, центральная находка круга. Именно им `gateway-serve`
-    // отвечает на `subscribe`. Отказ вправе случиться на `resume` ЛИБО на `pump` — где
-    // именно, решает реализация; недопустимо лишь пройти всю цепочку и отдать раздутый ответ.
-    let ckpt_live = tempfile::tempdir().expect("ckpt tempdir");
-    let live = gateway::LiveReducer::resume(
-        dir.path(),
-        EpochFilter::OwnCaptureOnly,
-        &s,
-        ckpt_live.path(),
-    );
-    match live {
-        Err(_) => {}
-        Ok((mut lr, _stats)) => {
-            match lr.pump(dir.path(), EpochFilter::OwnCaptureOnly, usize::MAX) {
-                Err(_) => {}
-                Ok(_) => {
-                    let snap = lr.snapshot();
-                    panic!(
-                        "PL-I-4 C НАРУШЕН на ЖИВОМ WS-ПУТИ: LiveReducer::resume → pump → snapshot \
-                     прошёл целиком и построил ответ {} Б ({}). Это ПРОД-путь: им \
-                     `gateway-serve` обслуживает `subscribe` и все последующие кадры. \
-                     Реализация, закрывшая библиотечные вызовы и оставившая живой путь \
-                     открытым, зеленит остальной набор и не чинит ничего (`C-157` R2).",
-                        response_bytes(&snap),
-                        entity_counts(&snap)
-                    );
-                }
+        // (6) ЖИВОЙ WS-ПУТЬ — им `gateway-serve` отвечает на `subscribe`. Отказ вправе
+        // случиться на `resume` ЛИБО на `pump`; недопустимо пройти цепочку целиком.
+        let ckpt_live = tempfile::tempdir().expect("ckpt tempdir");
+        if let Ok((mut lr, _)) =
+            gateway::LiveReducer::resume(dir, EpochFilter::OwnCaptureOnly, &s, ckpt_live.path())
+        {
+            if let Ok((frames, _, _)) = lr.pump(dir, EpochFilter::OwnCaptureOnly, usize::MAX) {
+                let worst = frames
+                    .iter()
+                    .map(|f| serde_json::to_vec(f).expect("Frame сериализуем").len())
+                    .max()
+                    .unwrap_or(0);
+                let snap = lr.snapshot();
+                panic!(
+                    "PL-I-4 C [{name}] НАРУШЕН на ЖИВОМ WS-ПУТИ: resume → pump → snapshot прошёл \
+                     целиком; крупнейший кадр {worst} Б, снапшот {} Б ({}). Это ПРОД-путь \
+                     подписки; реализация, закрывшая библиотечные вызовы и оставившая его \
+                     открытым, зеленит остальной набор и не чинит ничего.",
+                    response_bytes(&snap),
+                    entity_counts(&snap)
+                );
             }
         }
     }
