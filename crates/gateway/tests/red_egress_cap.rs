@@ -23,11 +23,21 @@
 //! бакетов): `bands=[0.001]` → 62 688 Б; `bands=[0.99]` → **45 242 536 Б (43.2 МБ)**.
 //! Усиление **×722** одним сообщением подписки, без смены прод-конфига.
 //!
-//! # Почему предел меряется РЕСУРСОМ, а не шириной полосы
+//! # Ресурс — ПОЛНЫЙ СЕРИАЛИЗОВАННЫЙ ОТВЕТ, и это правка по `C-157` R1
 //!
-//! Ширина — ПРОКСИ. При уплотнении книги тот же `0.013` даст другой объём, и оракул на ширине
-//! пропустит превышение (`testing.md`: «оракул границы ресурса меряет ресурс, а не прокси»).
-//! Поэтому оракулы ниже судят ВЕЛИЧИНУ ПОСТРОЕННОГО ОТВЕТА.
+//! Первая редакция судила `series.heatmap.len()`. Критик предъявил обход ИСПОЛНЕНИЕМ, и я
+//! воспроизвёл его сам: **25 000 сделок и НИ ОДНОГО L2-события** дают `heatmap = 0`,
+//! `cob = 0` — и при этом `volume_profile[0].bins = 25 000`, `volume_bubbles = 25 000`,
+//! ответ **2 804 765 Б (2.67 МБ)**. Предел на ячейки heatmap такой ответ не видит вовсе.
+//!
+//! Поэтому ресурс здесь — **байты сериализованного ответа**, а не одна его часть и не ширина
+//! полосы. Это не произвольный выбор единицы: `gateway-serve` кладёт на провод именно
+//! `serde_json::to_vec(&Snapshot)` целиком (`docs/fa/viz-backend.md` §5, `VB-I-6`), то есть
+//! байты и есть та величина, которой платит сеть.
+//!
+//! Ширина полосы — ПРОКСИ вдвойне: она не видит ни плотности книги, ни сделок вовсе
+//! (`testing.md`: «оракул границы ресурса меряет ресурс, а не прокси»). Реализация вправе
+//! ограничивать что угодно внутри — оракулы судят БАЙТЫ.
 //!
 //! # Числа предела в оракулах НЕТ, и это намеренно
 //!
@@ -38,7 +48,7 @@
 //! они не ссылаются на ещё не существующую константу, и потому предъявимы КРАСНЫМИ, а не
 //! «не собралось» (урок `M-68` rev2, `C-138` п.3).
 
-use contracts::{to_fixed, DataSource, EventKind, Level, MdPayload, Venue};
+use contracts::{to_fixed, DataSource, EventKind, Level, MdPayload, Side, Venue};
 use gateway::{Cursor, Selector};
 use journal::{EpochFilter, Journal, WriterConfig};
 
@@ -125,6 +135,28 @@ fn deep_book() -> tempfile::TempDir {
     journal_prod_shape((REACH / STEP) as usize, N_BUCKETS)
 }
 
+/// Величина ресурса — ровно то, что уходит на провод (`serde_json::to_vec` в `gateway-serve`).
+fn response_bytes(s: &gateway::Snapshot) -> usize {
+    serde_json::to_vec(s)
+        .expect("Snapshot сериализуем — иначе он не мог бы уйти клиенту")
+        .len()
+}
+
+/// Сумма ВСЕХ выдаваемых сущностей — для сообщений об ошибке: она называет, ЧЕМ именно
+/// раздут ответ, а байты одни этого не показывают.
+fn entity_counts(s: &gateway::Snapshot) -> String {
+    let vp_bins: usize = s.series.volume_profile.iter().map(|r| r.bins.len()).sum();
+    format!(
+        "heatmap={} cob={} vp_bins={} bubbles={} ohlcv={} depth_rows={}",
+        s.series.heatmap.len(),
+        s.series.cob.len(),
+        vp_bins,
+        s.series.volume_bubbles.len(),
+        s.series.ohlcv.len(),
+        s.series.depth_series.len()
+    )
+}
+
 fn snapshot(dir: &std::path::Path, bands: Vec<f64>) -> std::io::Result<gateway::Snapshot> {
     gateway::snapshot(
         dir,
@@ -180,12 +212,50 @@ fn pl_i_5_e_prod_default_selector_is_served() {
         "PL-I-5 E SETUP НЕ СОСТОЯЛСЯ: ответ пуст — фикстура не построила предмет, и «принят» \
          неотличимо от «пуст»"
     );
-    // Узкая полоса на порядки дешевле широкой — это и делает набор независимым от ЧИСЛА предела.
+    // Узкий ответ обязан быть на порядки дешевле широкого — это и делает набор независимым от
+    // ЧИСЛА предела (его назначает founder, спека §5.1).
+    let b = response_bytes(&s);
     assert!(
-        s.series.heatmap.len() < 1_000,
-        "PL-I-5 E SETUP НЕ СОСТОЯЛСЯ: узкий ответ дал {} ячеек — фикстура не разводит узкий и \
-         широкий случаи на порядки, и оракулы ниже начинают зависеть от точной величины предела",
-        s.series.heatmap.len()
+        b < 100_000,
+        "PL-I-5 E SETUP НЕ СОСТОЯЛСЯ: узкий ответ весит {b} Б — фикстура не разводит узкий и \
+         широкий случаи на порядки, и оракулы ниже начинают зависеть от точной величины \
+         предела. Состав: {}",
+        entity_counts(&s)
+    );
+}
+
+/// **E-3 — ЧЕСТНЫЙ МНОГОПОЛОСНЫЙ запрос обслуживается** (`C-157` R3).
+///
+/// Первая редакция звала нормальный (невырожденный) селектор ТОЛЬКО с одной полосой, и критик
+/// показал дыру: реализация, отвергающая любой ответ более чем с одной полосой, оставалась бы
+/// зелёной на всём наборе. Селектор ниже — тот самый, которым это предъявлено: семь валидных
+/// отсортированных полос, обслуживаемых сегодня и дающих ответ ЗАВЕДОМО ниже любого разумного
+/// предела.
+///
+/// Вторая половина — обещанное спекой сравнение «одна полоса против семи при равном объёме»:
+/// семь УЗКИХ полос не смеют быть отвергнуты за то, что их семь. Отвергать положено по
+/// ВЕЛИЧИНЕ ОТВЕТА, а не по числу полос.
+#[test]
+fn pl_i_5_e3_honest_multi_band_request_is_served() {
+    let dir = deep_book();
+    let seven = vec![0.0002, 0.0004, 0.0008, 0.0016, 0.0032, 0.0064, 0.0128];
+
+    let multi = snapshot(dir.path(), seven.clone()).expect(
+        "PL-I-5 E-3: семь валидных узких полос — честный рабочий запрос, он обслуживается \
+         сегодня и обязан обслуживаться после фикса. Реализация, отвергающая ответ за ЧИСЛО \
+         полос вместо его ВЕЛИЧИНЫ, ломает работу и остаётся зелёной на всех прочих оракулах",
+    );
+    let one = snapshot(dir.path(), vec![0.0128]).expect("одна полоса той же ширины обслуживается");
+
+    let (bm, bo) = (response_bytes(&multi), response_bytes(&one));
+    assert!(
+        bm < 4 * bo.max(1),
+        "PL-I-5 E-3: семь УЗКИХ полос дали {bm} Б против {bo} Б у одной полосы той же ширины. \
+         Окно выдачи задаёт САМАЯ ШИРОКАЯ полоса (`crates/gateway/src/lib.rs:1192`), поэтому \
+         разница обязана быть в разы, а не в порядки: цена берётся за ОБЪЁМ, а не за число \
+         полос. Состав: {} против {}",
+        entity_counts(&multi),
+        entity_counts(&one)
     );
 }
 
@@ -247,6 +317,53 @@ fn pl_i_5_a_oversized_response_is_refused_not_served() {
     }
 }
 
+/// **A-2 — ответ, раздутый НЕ heatmap'ом, тоже отвергается** (`C-157` R1).
+///
+/// Центральная находка круга 1, и она моя ошибка: первая редакция судила `heatmap.len()`, а
+/// `SeriesBundle` несёт на провод ещё `volume_profile[].bins`, `volume_bubbles`, `ohlcv`,
+/// `cob`, `depth_series`, CVD и VWAP. Замер (мой, воспроизводит предъявленный критиком):
+/// **25 000 сделок и НИ ОДНОГО L2-события** ⇒ `heatmap = 0`, `cob = 0`, но
+/// `vp_bins = 25 000`, `bubbles = 25 000`, ответ **2.67 МБ**.
+///
+/// Предел на одну часть ответа — не предел. Этот оракул краснеет против ЛЮБОЙ реализации,
+/// ограничившей heatmap и забывшей остальное.
+#[test]
+fn pl_i_5_a2_dense_non_heatmap_response_is_refused() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    {
+        let mut j = Journal::open_with(dir.path(), cfg()).expect("open_with");
+        // РАЗНЫЕ цены: каждая заводит свой bin профиля объёма и свой bubble. L2-событий нет
+        // вовсе, поэтому heatmap и COB останутся пустыми — предмет оракула именно в этом.
+        for i in 0..25_000i64 {
+            j.append(EventKind::md(
+                Venue::Binance,
+                "BTCUSDT",
+                MdPayload::Trade {
+                    price: to_fixed(MID + i as f64 * 0.01),
+                    size: to_fixed(1.0),
+                    side: if i % 2 == 0 { Side::Buy } else { Side::Sell },
+                    ts_exch_ms: T0 + i,
+                },
+            ))
+            .expect("append trade");
+        }
+        j.flush().expect("flush");
+    }
+
+    match snapshot(dir.path(), vec![PROD_BAND]) {
+        Err(_) => {}
+        Ok(s) => panic!(
+            "PL-I-5 A-2 НАРУШЕН: ответ {} Б обслужен при ПУСТОМ heatmap. Состав: {}. \
+             Предел, считающий только ячейки heatmap, этот ответ не видит вовсе — а на провод \
+             он уходит целиком (`serde_json::to_vec(&Snapshot)`). Ограничивать положено ПОЛНЫЙ \
+             ответ, а не одну его часть; селектор здесь прод-дефолтный, то есть путь достижим \
+             без всякого злоупотребления шириной полосы.",
+            response_bytes(&s),
+            entity_counts(&s)
+        ),
+    }
+}
+
 /// **B — отказ ЯВНЫЙ; принятый ответ ПОЛОН.**
 ///
 /// Соблазнительный «фикс» — усечь ответ до предела и отдать. Он зелен во всех liveness-
@@ -260,10 +377,11 @@ fn pl_i_5_b_no_silent_truncation_on_either_side() {
     // (1) превышение обязано быть ОШИБКОЙ, а не урезанным успехом
     if let Ok(s) = snapshot(dir.path(), vec![ABUSIVE_BAND]) {
         panic!(
-            "PL-I-5 B: превышение вернуло Ok с {} ячейками. Если это усечение — оно МОЛЧАЛИВОЕ: \
+            "PL-I-5 B: превышение вернуло Ok на {} Б ({}). Если это усечение — оно МОЛЧАЛИВОЕ: \
              клиент получил неполную книгу под видом полной (PL-I-7). Отказ обязан быть явным; \
              усечение, если оно вообще допускается, обязано быть ПОМЕЧЕНО в ответе.",
-            s.series.heatmap.len()
+            response_bytes(&s),
+            entity_counts(&s)
         );
     }
 
@@ -274,6 +392,15 @@ fn pl_i_5_b_no_silent_truncation_on_either_side() {
     let per_side = (PROD_BAND / STEP + 0.5).floor() as usize;
     let expected = per_side * 2 * N_BUCKETS as usize;
     let s = snapshot(dir.path(), vec![PROD_BAND]).expect("узкий обязан обслуживаться");
+    // Полнота проверяется по ВСЕМ частям ответа, а не по одной (`C-157` R1): реализация,
+    // подрезающая профиль объёма или пузыри «чтобы влезть», обязана краснеть здесь.
+    assert_eq!(
+        s.series.ohlcv.len(),
+        N_BUCKETS as usize,
+        "PL-I-5 B: OHLCV урезан — {} баров при {N_BUCKETS} бакетах фикстуры. Ответ, прошедший \
+         предел, обязан быть ПОЛНЫМ во всех своих частях",
+        s.series.ohlcv.len()
+    );
     assert_eq!(
         s.series.heatmap.len(),
         expected,
@@ -284,49 +411,129 @@ fn pl_i_5_b_no_silent_truncation_on_either_side() {
     );
 }
 
-/// **C (`PL-I-4`) — БАЙПАСА НЕТ: предел живёт в `gateway`, а не только в транспорте.**
+/// **C (`PL-I-4`) — БАЙПАСА НЕТ: предел действует на КАЖДОМ строителе ответа.**
 ///
-/// `Selector` собирают напрямую четыре потребителя мимо `gateway-serve`: чекпоинтер (M-38b),
-/// shared-tailer (M-39), `research-cli`, replay. Гвард, посаженный только в транспорт,
-/// оставил бы им открытую дверь — ровно тот довод, которым `GW-I-14` посажен в
-/// `gateway::validate_selector` (`crates/gateway/src/lib.rs:1893-1905`), а не в
-/// `serve_config_from_env`.
+/// # Что было неверно в первой редакции (`C-157` R2)
 ///
-/// Оракул бьёт по ДРУГИМ точкам входа, чем `A`: реализация, добавившая предел только в
-/// `snapshot`, красна здесь.
+/// Оракул звал только `frames_since` и `snapshot_from_checkpoint`. Критик предъявил
+/// исполнением, что **живой WS-путь** — `LiveReducer::resume → pump → snapshot` — принимает
+/// `bands=[0.99]` и строит больше 50 000 ячеек. Это не теоретическая дыра: именно этим путём
+/// `gateway-serve` обслуживает `subscribe` и все последующие кадры, то есть ПРОД-путь
+/// оставался открытым, а набор — зелёным.
+///
+/// # Перечень закрыт ГРЕПОМ, а не памятью
+///
+/// ```text
+/// $ grep -nE '^pub fn (snapshot|frames_since|frames_since_with_stats|replay)\(' src/lib.rs
+/// $ grep -nE '^    pub fn (resume|pump|snapshot)\(' src/lib.rs      # LiveReducer
+/// ```
+///
+/// Шесть публичных строителей, принимающих `Selector` прямо или через `LiveReducer`. Оракул
+/// бьёт по каждому. Появился седьмой — он обязан появиться и здесь; иначе перечень «по
+/// построению» покрывает лишь то, о чём вспомнил автор.
+///
+/// # Почему предел живёт в `gateway`, а не в транспорте
+///
+/// `Selector` собирают напрямую чекпоинтер (M-38b), shared-tailer (M-39), `research-cli` и
+/// replay. Гвард, посаженный только в `gateway-serve`, оставил бы им открытую дверь — тот же
+/// довод, которым `GW-I-14` посажен в `gateway::validate_selector`
+/// (`crates/gateway/src/lib.rs:1893-1905`), а не в `serve_config_from_env`.
 #[test]
 fn pl_i_4_c_limit_has_no_bypass_across_entry_points() {
     let dir = deep_book();
     let s = sel(vec![ABUSIVE_BAND]);
 
-    let frames = gateway::frames_since(
-        dir.path(),
-        EpochFilter::OwnCaptureOnly,
-        &s,
-        Cursor::START,
-        usize::MAX,
-    );
+    // (1) snapshot — покрыт оракулом A, здесь для полноты перечня
     assert!(
-        frames.is_err(),
-        "PL-I-4 C: `frames_since` обслужил раздувающий селектор. Предел, поставленный только \
-         в `snapshot`, оставляет открытым push-путь — а именно им живёт WS-клиент после \
-         первого снапшота."
+        gateway::snapshot(dir.path(), EpochFilter::OwnCaptureOnly, &s, Cursor::LATEST).is_err(),
+        "PL-I-4 C: `snapshot` обслужил раздувающий селектор"
     );
 
+    // (2) frames_since — push-путь, которым живёт WS-клиент после первого снапшота
+    assert!(
+        gateway::frames_since(
+            dir.path(),
+            EpochFilter::OwnCaptureOnly,
+            &s,
+            Cursor::START,
+            usize::MAX,
+        )
+        .is_err(),
+        "PL-I-4 C: `frames_since` обслужил раздувающий селектор. Предел, поставленный только в \
+         `snapshot`, оставляет открытым именно тот путь, которым идёт основной трафик."
+    );
+
+    // (3) frames_since_with_stats — та же форма, другой возврат; отдельная дверь
+    assert!(
+        gateway::frames_since_with_stats(
+            dir.path(),
+            EpochFilter::OwnCaptureOnly,
+            &s,
+            Cursor::START,
+            usize::MAX,
+        )
+        .is_err(),
+        "PL-I-4 C: `frames_since_with_stats` обслужил раздувающий селектор — вариант с \
+         возвратом статистики обязан быть закрыт так же, как базовый (`C-157` R2)"
+    );
+
+    // (4) replay
+    assert!(
+        gateway::replay(
+            dir.path(),
+            EpochFilter::OwnCaptureOnly,
+            &s,
+            Cursor::START,
+            Cursor::LATEST,
+        )
+        .is_err(),
+        "PL-I-4 C: `replay` обслужил раздувающий селектор"
+    );
+
+    // (5) warm-путь: чекпоинт снимается по расписанию, это обычный прод-путь
     let ckpt = tempfile::tempdir().expect("ckpt tempdir");
-    let warm = gateway::snapshot_from_checkpoint(
+    assert!(
+        gateway::snapshot_from_checkpoint(
+            dir.path(),
+            EpochFilter::OwnCaptureOnly,
+            &s,
+            ckpt.path(),
+            Cursor::LATEST,
+        )
+        .is_err(),
+        "PL-I-4 C: `snapshot_from_checkpoint` обслужил раздувающий селектор"
+    );
+
+    // (6) ЖИВОЙ WS-ПУТЬ — `C-157` R2, центральная находка круга. Именно им `gateway-serve`
+    // отвечает на `subscribe`. Отказ вправе случиться на `resume` ЛИБО на `pump` — где
+    // именно, решает реализация; недопустимо лишь пройти всю цепочку и отдать раздутый ответ.
+    let ckpt_live = tempfile::tempdir().expect("ckpt tempdir");
+    let live = gateway::LiveReducer::resume(
         dir.path(),
         EpochFilter::OwnCaptureOnly,
         &s,
-        ckpt.path(),
-        Cursor::LATEST,
+        ckpt_live.path(),
     );
-    assert!(
-        warm.is_err(),
-        "PL-I-4 C: `snapshot_from_checkpoint` обслужил раздувающий селектор. Warm-путь — \
-         обычный прод-путь (чекпоинт снимается по расписанию), и предел обязан действовать \
-         на нём тождественно."
-    );
+    match live {
+        Err(_) => {}
+        Ok((mut lr, _stats)) => {
+            match lr.pump(dir.path(), EpochFilter::OwnCaptureOnly, usize::MAX) {
+                Err(_) => {}
+                Ok(_) => {
+                    let snap = lr.snapshot();
+                    panic!(
+                        "PL-I-4 C НАРУШЕН на ЖИВОМ WS-ПУТИ: LiveReducer::resume → pump → snapshot \
+                     прошёл целиком и построил ответ {} Б ({}). Это ПРОД-путь: им \
+                     `gateway-serve` обслуживает `subscribe` и все последующие кадры. \
+                     Реализация, закрывшая библиотечные вызовы и оставившая живой путь \
+                     открытым, зеленит остальной набор и не чинит ничего (`C-157` R2).",
+                        response_bytes(&snap),
+                        entity_counts(&snap)
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// **F — отказ НАЗЫВАЕТ предел и полученную величину.**
