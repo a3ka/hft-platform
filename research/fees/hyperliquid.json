@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "venue": "Hyperliquid",
+  "provenance": "Hyperliquid perps, базовый тир Tier 0 (нулевой 14d weighted volume, БЕЗ staking-скидки): maker 0.015% / taker 0.045%. Источник: https://hyperliquid.gitbook.io/hyperliquid-docs/trading/fees (проверено 2026-07-10). rate ×1e8: 0.00015 → 15000; 0.00045 → 45000. Консервативно: скидки намеренно НЕ учтены (D7 пессимизм).",
+  "maker_rate_e8": 15000,
+  "taker_rate_e8": 45000
+}
