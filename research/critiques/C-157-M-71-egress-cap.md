@@ -14,7 +14,7 @@ Committed artifact chain `3b496208a64edbf00a66b93986ff8529d0c93aa9..5b017f960be8
 
 ## Verdict: REJECT
 
-The present RED set does reproduce the reachable hole, but it does not yet measure the complete response resource, does not protect all response-construction paths, and misses a legitimate multi-band request. Dev must not be dispatched until the oracle set is complete.
+The present RED set does reproduce the reachable hole, but it does not yet measure the complete response resource, does not protect all response-construction paths, misses a legitimate multi-band request, and lets its mutation step report a false green. Dev must not be dispatched until the oracle set is complete.
 
 ### R1 — resource oracle measures `heatmap.len()`, not the built response
 
@@ -37,6 +37,12 @@ Extend the anti-bypass RED oracle to every public response builder that accepts 
 The milestone requires a working range and explicitly names one band versus seven at equal total volume. The committed suite calls its normal non-degenerate selector only with one band (`[0.001]`); E-2 covers only empty `[0.99]` and one-sided `[0.001]` books. It has no exact-cap boundary and no seven-band control.
 
 Execution in a disposable copy showed that the valid sorted selector `[0.0002, 0.0004, 0.0008, 0.0016, 0.0032, 0.0064, 0.0128]` is served today and builds fewer than 20,000 heatmap cells. A faulty implementation that rejects every non-empty response with more than one band can keep A/B/C/E/E-2/F green yet reject this honest request. Add this control (or an equivalent documented working range) and the specified same-resource one-band/seven-band comparison.
+
+### R4 — C can print PASS for an anchor unrelated to the response limit
+
+The requested manual anchor check does not establish the claimed two-sided connection. In a disposable copy I inserted the exact `MUT-ANCHOR M-71-LIMIT` plus a private `enforce_response_limit(cells, limit)` function, but deliberately made no response builder call it. The verifier's C step then printed `PASS: C набор КРАСЕН без предела, а анти-ложное-КРАСНОЕ E остаётся ЗЕЛЁНЫМ`; every E neighbour was green. The four subject RED tests were already red before and after the mutation, so C merely observed their pre-existing redness, not a limit being neutralized. Clippy independently identified the inserted function as unused.
+
+Do not allow C to report PASS unless its target is mechanically tied to the complete-resource enforcement on each protected builder, and prove a suitable unmutated baseline before judging the mutation. At plan time C should remain an explicit not-ready condition; after implementation it must fail if an unused syntactic anchor can satisfy it.
 
 ## Assessment of the proposed 20,000-cell value
 
@@ -88,6 +94,17 @@ FAIL: D GATEWAY_MAX_RESPONSE_CELLS объявлен в docker-compose.yml
 VERDICT: FAIL (5)
 exit=1
 
+$ [disposable copy: insert only the exact MUT-ANCHOR + unused enforce_response_limit; then] bash scripts/verify_M-71.sh
+FAIL: cargo clippy --all-targets --all-features -- -D warnings
+PASS: C набор КРАСЕН без предела, а анти-ложное-КРАСНОЕ E остаётся ЗЕЛЁНЫМ
+PASS: cargo test -p gateway --test red_gateway_bounded --quiet
+PASS: cargo test -p gateway --test red_snapshot_noclone --quiet
+PASS: cargo test -p gateway --test red_gateway_live_eq_replay --quiet
+PASS: cargo test -p gateway-serve --test red_max_subs_config --quiet
+PASS: cargo test -p gateway-serve --test red_window_guard_startup --quiet
+VERDICT: FAIL (5)
+exit=1
+
 $ cargo test -p gateway --test red_egress_cap critic_adversarial_seven_valid_bands_are_served_below_proposed_cap -- --nocapture
 running 1 test
 test critic_adversarial_seven_valid_bands_are_served_below_proposed_cap ... ok
@@ -117,4 +134,4 @@ exit=0
 
 ## Handoff
 
-REJECT → architect. Add RED coverage for the complete serialized response resource, every Selector-bearing response builder (especially `LiveReducer`), and the valid multi-band/boundary controls. Commit the amended artifact set on `feat/M-71-egress-cap`; then request a fresh critic round. The proposed number remains founder-owned.
+REJECT → architect. Add RED coverage for the complete serialized response resource, every Selector-bearing response builder (especially `LiveReducer`), and the valid multi-band/boundary controls. Repair C so an unused syntactic anchor cannot produce its two-sided PASS. Commit the amended artifact set on `feat/M-71-egress-cap`; then request a fresh critic round. The proposed number remains founder-owned.
