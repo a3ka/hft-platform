@@ -1,3 +1,14 @@
+<!-- ПЕРЕНУМЕРОВАН architect'ом 2026-08-25: вынесен как `C-159`, но тот же номер в ту же
+     минуту занял вердикт по M-71 (`research/critiques/C-159-M-71-egress-cap-rev3.md`,
+     ветка `feat/M-71-egress-cap`, коммит на 69 секунд раньше). `gates.md` §12: идентификатор
+     УНИКАЛЕН — два файла под одним номером есть нарушение независимо от того, об одном они
+     предмете или о разных. Содержание вердикта не тронуто; изменены только идентификатор в
+     имени файла и четыре его вхождения в тексте.
+     ПРИЧИНА КОЛЛИЗИИ — МОЯ: я отправил два круга критика параллельно, дав обоим одинаковую
+     инструкцию «взять номер механизмом», и не развёл резервы ДО диспетчеризации. CAS-резерв
+     (`scripts/reserve_artifact_id.sh`) от этого защищает только пока носитель не приземлён;
+     обе роли освободили резерв, отчитавшись «резерв снят», и окно открылось заново. -->
+
 <!-- GATE-META
 milestone: M-68
 audited_repo: a3ka/hft-platform
@@ -6,7 +17,7 @@ audited_head: fa2ada921a4779f6a6a8f10751415b73a38c28eb
 verdict: REJECT
 -->
 
-# C-159 — M-68 rev3.1, круг 4: REJECT
+# C-160 — M-68 rev3.1, круг 4: REJECT
 
 ## Вердикт
 
@@ -157,7 +168,7 @@ cargo test --all; старый 8 обязан оставаться RED. Это a
     [exit=0]
 
     $ bash scripts/reserve_artifact_id.sh C
-    C-159
+    C-160
     [exit=0]
 
 === HANDOFF: CRITIC → ARCHITECT ===
@@ -166,7 +177,7 @@ cargo test --all; старый 8 обязан оставаться RED. Это a
 
 - Дата (UTC, ISO-8601): 2026-08-25T23:09Z
 - Milestone: M-68-depth-from-book
-- Статус: BLOCKED (REJECT C-159 F1)
+- Статус: BLOCKED (REJECT C-160 F1)
 - Audited HEAD: fa2ada921a4779f6a6a8f10751415b73a38c28eb
 
 ## §B — Что проверено
@@ -180,7 +191,7 @@ cargo test --all; старый 8 обязан оставаться RED. Это a
 - **Следующий агент:** architect
 - **Промпт:**
 
-    M-68 rev3.1 заблокирован C-159 F1. В новом committed architect artifact set
+    M-68 rev3.1 заблокирован C-160 F1. В новом committed architect artifact set
     обнови sacred crates/gateway/tests/red_gateway_schema_version.rs одновременно
     с Task 9: он должен нормативно требовать schema version 9 для константы,
     Snapshot и live Frame. Укажи этот RED в Task 9/acceptance, обнови baseline
