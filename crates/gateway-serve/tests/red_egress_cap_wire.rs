@@ -44,6 +44,7 @@ use contracts::{to_fixed, DataSource, EventKind, MdPayload, Side, Venue};
 use gateway::{Cursor, Selector};
 use gateway_serve::serve;
 use gateway_serve::wire::ServeMsg;
+use gateway_serve::wire_v1;
 use journal::{EpochFilter, Journal, WriterConfig};
 
 const MID: f64 = 65_000.0;
@@ -287,4 +288,98 @@ fn pl_i_5_w3_v1_envelope_is_capped_too() {
         bytes_of(&v1),
         bytes_of(&msg)
     );
+}
+
+/// **W4 — ТЕКСТ ОШИБКИ, УПРАВЛЯЕМЫЙ КЛИЕНТОМ, тоже подчинён пределу** (`C-159` R1).
+///
+/// # Новый класс, которого не видела ни одна прежняя редакция
+///
+/// Все оракулы — и уровня 1, и уровня 2 — судили УСПЕШНЫЕ ответы. Между тем клиент управляет
+/// исходящим текстом и через ОТКАЗ:
+///
+/// 1. `wire_v1::parse_selector` возвращает `SelectorError::UnknownVenue(other.to_string())` —
+///    произвольная строка ИЗ ЗАПРОСА (`wire_v1.rs:130`);
+/// 2. обработчик строит `format!("unknown venue: {name}")` (`lib.rs:731`);
+/// 3. `wire_v1::error_msg` сериализуется и уходит `Message::Text` (`lib.rs:1031`).
+///
+/// Критик предъявил исполнением: при `sub = "s1"` и venue длиной 2 100 000 символов наружу
+/// уходит **2 100 084 Б** — на 100 084 Б выше предложенного предела. `sub` здесь ДВА байта,
+/// то есть это НЕ именованный остаток «длина `sub`-id не ограничена» (`A-021`), а отдельный
+/// класс: **ошибка echo'ит поле запроса целиком**.
+///
+/// # Что оракул НЕ предписывает
+///
+/// Форму лечения он не выбирает: усечь эхо, не echo'ить вовсе, ограничить длину поля при
+/// разборе — решает реализация. Требование одно: **наружу не уходит текст сверх предела**,
+/// каким бы ни было содержимое запроса.
+#[test]
+fn pl_i_5_w4_client_controlled_error_text_is_capped() {
+    // Ровно тот вход, которым это предъявлено: имя площадки — гигантская строка из запроса.
+    let huge_venue = "V".repeat(2_100_000);
+    let value = serde_json::json!({
+        "venue": huge_venue,
+        "symbol": "BTCUSDT",
+        "timeframe_ms": 1000,
+        "bands": [PROD_BAND],
+    });
+    let err = wire_v1::parse_selector(&value)
+        .err()
+        .expect("W4 SETUP: неизвестная площадка обязана давать ошибку разбора");
+    let (code, message) = describe(&err);
+
+    let out = wire_v1::error_msg(Some(SHORT_SUB), code, &message);
+    let n = bytes_of(&out);
+    assert!(
+        n < 2_000_000,
+        "PL-I-5 W4 НАРУШЕН: наружу уходит {n} Б текста ОШИБКИ при `sub` длиной {} — почти весь \
+         объём принесён полем ЗАПРОСА, которое сообщение echo'ит целиком. Это `Message::Text` \
+         на проводе (`lib.rs:1031`), а не промежуточный объект. Пределы успешных ответов этого \
+         пути не видят: уровень 1 знает только `Snapshot`/`Frame`, уровень 2 звал только \
+         строители успеха. Порог в ассерте — предложенная величина (спека §5.1); она \
+         founder-owned, и оракул судит ПОВЕДЕНИЕ (текст сверх предела не уходит), а не число.",
+        SHORT_SUB.len()
+    );
+}
+
+/// **W-C3 — путь ошибки НЕ ломается на честном входе** (парный vantage к `W4`).
+///
+/// Лечение `W4` не смеет превратиться в «ошибок не отдаём». Клиент обязан получить внятный
+/// отказ с кодом и текстом — иначе он не узнает, что чинить. Прецедент требования — `GW-I-14`
+/// («отказ обязан НАЗЫВАТЬ переменную, оператор должен понять, что чинить»).
+#[test]
+fn pl_i_5_w_c3_honest_error_is_still_delivered() {
+    let value = serde_json::json!({
+        "venue": "NoSuchVenue",
+        "symbol": "BTCUSDT",
+        "timeframe_ms": 1000,
+        "bands": [PROD_BAND],
+    });
+    let err = wire_v1::parse_selector(&value)
+        .err()
+        .expect("W-C3 SETUP: неизвестная площадка обязана давать ошибку");
+    let (code, message) = describe(&err);
+    let out = wire_v1::error_msg(Some(SHORT_SUB), code, &message);
+    let text = serde_json::to_string(&out).expect("сериализуемо");
+
+    assert!(
+        text.contains(code),
+        "PL-I-5 W-C3: сообщение об ошибке обязано нести КОД ({code}); получено: {text}"
+    );
+    assert!(
+        text.len() > 20 && text.len() < 4_096,
+        "PL-I-5 W-C3: честная ошибка весит {} Б — она обязана быть и непустой, и небольшой. \
+         Пустой отказ оставляет клиента без причины; раздутый — тот же ресурс, что в W4.",
+        text.len()
+    );
+}
+
+/// Код и человеческий текст ошибки — тем же способом, каким их строит обработчик
+/// (`lib.rs:731`): именно эта склейка и уносит поле запроса наружу.
+fn describe(err: &wire_v1::SelectorError) -> (&'static str, String) {
+    match err {
+        wire_v1::SelectorError::UnknownVenue(name) => {
+            ("unknown_venue", format!("unknown venue: {name}"))
+        }
+        wire_v1::SelectorError::Invalid(m) => ("invalid_selector", m.clone()),
+    }
 }
