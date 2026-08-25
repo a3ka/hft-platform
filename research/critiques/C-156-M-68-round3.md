@@ -175,6 +175,10 @@ $ git show -s --format='%H%n%s' refs/reserved-cache/C-156
 a62e6f09fb50a5789ebefe8467d619e59b080078
 reserve C-156 nous 2026-08-25T16:31:54Z Ubuntu-2404-noble-amd64-base 1373125 1afa7089-ea7d-403e-814a-e9cbb0d1ed6d
 [exit=0]
+
+$ CARGO_TARGET_DIR=/tmp/hft-critic-m68-r3/target cargo clean
+Removed 23548 files, 10.9GiB total
+[exit=0]
 ```
 
 === HANDOFF: CRITIC → ARCHITECT ===
@@ -200,7 +204,7 @@ reserve C-156 nous 2026-08-25T16:31:54Z Ubuntu-2404-noble-amd64-base 1373125 1af
   M-68 rev3 заблокирован C-156 F1. Перепиши ТОЛЬКО plan artifact set так, чтобы ресурсный RED d6 задавал достижимый в Allowed paths контракт и различающим прогоном валидировал свою метрику; либо оформи расширение зоны через владельца. Не отправляй engine-dev выбирать между фиксированной `depth_within`-проводкой и невозможным budget. Добавь RED на саму находку, обнови verify/M-68 baseline и верни новый committed/pushed набор на fresh critic круг.
   ```
 - Push-статус: ⏸ verdict commit follows on `feat/M-68-rev3`; dev is blocked by C-156.
-- Кэш: ⏸ будет убран после commit/push verdict.
+- Кэш: ✅ `/tmp/hft-critic-m68-r3/target` убран (`cargo clean`: 10.9 GiB).
 
 ## §E — Риски / открытые вопросы
 - F1 — ложный resource gate способен либо вынудить невозможную реализацию, либо принять постоянный фиктивный счётчик.
