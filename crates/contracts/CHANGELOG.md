@@ -1,0 +1,115 @@
+# contracts (T1) — CHANGELOG
+
+Формат: одна секция на contract-RFC. Журнал бессмертен: старые записи обязаны читаться
+новым кодом всегда (CT-I-3). Правки T1 вне RFC → авто-REJECT (CT-I-2, Block-C).
+
+## schema_version 3 → 4 — CT-RFC-05 «MarginInventory» (2026-07-25)
+
+**Bump 3→4.** Аддитивно: `MdPayload::MarginInventory { available_e8, ts_exch_ms }` (postcard-дискриминант
+**7**, в КОНЕЦ enum'а). Старые сегменты (варианты 0..6) читаются байт-в-байт (CT-I-3) — доказано
+`tests/ct_rfc05.rs::mi_i_1_pre_rfc05_funding_still_decodes` (pre-change Funding-байты декодятся под schema-4).
+
+**Источник:** Binance `/sapi/v1/margin/available-inventory?type=MARGIN` (auth read-only, spot-домен).
+`symbol` = актив («USDT»/«USDC»); `available_e8` = СЫРОЙ market-wide доступный к займу пул ×1e8.
+
+**Граница (design-honesty, RC-I-10):** это supply-side СЫРОЙ пул, **НЕ** borrow/repay ledger и **НЕ**
+непогашенный объём. Утилизация/флоу (Δ available) — производная ПРОКСИ downstream (индикатор), с caveat
+`derived-from-available-inventory`. НЕ переиспользован `MarginRate` (тот — rate, этот — amount). Проба-факты:
+`research/data-quality/margin-source-survey.md §9`.
+
+**Эпоха:** `SCHEMA_VERSION` 3→4 ⇒ сегмент schema-3 не reuse'ится schema-4 бинарём (та же изоляция, что
+L2Delta/TD-031; guard `journal::segments` по равенству `schema_version`). Схема перегенерирована
+(`cargo run -p contracts --example gen_schema`); фикстуры `fixtures/{valid,invalid}/event-margin-inventory*`.
+
+## schema_version 2 → 3 — CT-RFC-04 rev2 «L2Delta segment-изоляция» (2026-07-21, TD-031)
+
+**Bump 2→3.** §8 нашёл: изоляция L2Delta (сегмент schema-эпохи) держалась на `provenance`
+(git-sha), но recorder считает git-sha В РАНТАЙМЕ, а контейнер без git → provenance = КОНСТАНТА на
+всех деплоях → `decide_open_segment` reuse'ил pre-M18 сегмент → L2Delta смешался в schema-2
+(segment-55). Fix: `SCHEMA_VERSION` = **эпоха эмитируемых вариантов** (2→3 для L2Delta); reuse
+требует `header.schema_version == SCHEMA_VERSION` → schema-2 сегмент не reuse'ится schema-3 бинарём
+(git-независимо). Правило: **новый эмитируемый вариант ⇒ bump SCHEMA_VERSION**. `SEGMENT_MAGIC`
+(framing) НЕ тронут — `HFTJRN02`; magic и schema_version отделены. `red_l2delta_rollback_boundary`
+переписан прод-реалистично (ИДЕНТИЧНЫЙ прод-провенанс, изоляция по schema-эпохе — падал на
+провенанс-only reuse). Старые сегменты читаются (CT-I-3; schema на чтении не валидируется).
+
+## schema_version 2 — CT-RFC-04 «L2Delta: персист сырых book-дельт» (2026-07-21)
+
+Аддитивно (версия НЕ меняется — вариант `MdPayload`, не формат сегмента; `SEGMENT_MAGIC`
+`HFTJRN02` неизменна — журнал идентифицирует сегменты по магии, `schema_version` на чтении
+не валидируется). Полный RFC: `docs/rfc/CT-RFC-04-l2delta.md`.
+
+**Добавлено:**
+- `MdPayload::L2Delta { bids, asks, first_update_id, final_update_id, prev_final_update_id,
+  ts_exch_ms }` — СЫРОЙ `@depth` diff (инкрементальная book-дельта), персистится ДО применения
+  к книге. **Строго в конец** enum (postcard-дискриминант **6**; Trade/L2Snapshot/Funding/
+  OpenInterest/Liquidation/MarginRate = 0..5 неизменны — RED-гвоздь + исторический байт-блоб).
+  Семантика уровней: `size==0` = remove; отсутствие ≠ удаление; пустая сторона = «не менялось».
+  `prev_final_update_id` = futures `pu` (`None` для spot). Разблокирует book-flow
+  (absorption/DOM, M-19 Тир-3).
+
+**НЕ изменено:** `Event`, `EventKind`, `MdEvent`, `Venue`, `Side`, `Level`, `SegmentHeader`,
+`SysEvent`, дискриминанты 0..5 `MdPayload` — старые сегменты читаются байт-в-байт (CT-I-3).
+
+**Схема:** `schema/event.schema.json` перегенерирована (`gen_schema`); `red_schema` гейтит
+согласованность. Фикстуры: `fixtures/valid/event-l2delta-{spot,futures}.json`,
+`fixtures/invalid/event-l2delta-missing-final-id.json`. Тест: `tests/red_rfc04.rs`.
+
+**Объём (см. RFC §5):** L2Delta аддитивен и частый (~×2 темп записи) → ускоряет disk-таймер
+(~40→~20 дней) ⇒ доставка ретеншена в прод (TD-020) становится СРОЧНОЙ. Данные MD-only,
+risk-инварианты не тронуты; disk-guard fail-closed остаётся страховкой.
+
+## schema_version 2 — CT-RFC-03 «Аудит сверки с биржей» (2026-07-16)
+
+Аддитивно (версия НЕ меняется — как CT-RFC-01, это вариант `EventKind`, не формат сегмента):
+- `SysEvent::ReconDivergence(ReconAudit)` — durable-след recon-расхождения (OPS-I-1, M-09):
+  `{venue, symbol, divergence_bps, best_price_diverged, action}`; **строго в конце** enum
+  (postcard-дискриминант 3; Heartbeat/ConnUp/ConnDown = 0/1/2 неизменны).
+- `ReconAction { AlertOnly, Resynced }` (0/1).
+
+**Мотив.** Recon (сверка локальной книги с REST-снапшотом биржи) — единственная проверка
+ПРАВИЛЬНОСТИ данных (эвикция C1 стирала best bid при зелёном healthcheck). Расхождение — факт
+о ДАННЫХ, обязан жить в том же журнале, что данные (не в логе/метрике), иначе нельзя ответить
+«каким сегментам верить». Метрики в журнал не пишутся (OPS-I-6) — поэтому нужен доменный вариант.
+
+**НЕ изменено:** `Event`, `EventKind`, `MdEvent`, `MdPayload`, `Venue`, `Side`, `Level`,
+`SegmentHeader`, `SysEvent::{Heartbeat,ConnUp,ConnDown}` — wire-формат прежний, старые сегменты
+читаются байт-в-байт (CT-I-3, RED `red_rfc03.rs`). `schema_version` остаётся 2.
+
+**Схема:** `event.schema.json` перегенерирована (`gen_schema`), гейт `red_schema.rs` (CT-I-4).
+Фикстуры: `valid/event-recon.json`, `invalid/event-recon-unknown-action.json`.
+
+## schema_version 2 — CT-RFC-02 «Provenance и эпохи журнала» (2026-07-13)
+
+**Мотив.** Founder докупает историю. Купленные данные обязаны входить через тот же журнал,
+но быть ОТЛИЧИМЫ от собственного захвата: у вендора другая глубина книги, другие часы,
+другие гэпы. Обучить альфу на смеси без пометки = обучить на реальности, которой у нас не
+было. Задним числом источник не проставить — форма вводится ДО первого чужого байта.
+
+**Добавлено (аддитивно):**
+- `DataSource` = `OwnCapture | Vendor | Synthetic` (расширение — строго в конец;
+  дискриминанты postcard зафиксированы RED-тестом).
+- `SegmentHeader { schema_version, source, provenance, epoch_id, created_wall_ms, first_seq }`
+  — первый фрейм каждого сегмента (закрывает CT-I-6, который фактически не выполнялся:
+  `journal.meta` нёс только `next_seq`).
+- `SEGMENT_MAGIC = b"HFTJRN02"` — префикс сегментов schema ≥ 2.
+- `LegacySegmentDecl` / `LegacyManifest` (`journal.legacy.json`) — ЯВНАЯ декларация
+  происхождения сегментов старого формата + отпечаток (sha256 первого MiB) и размер.
+
+**НЕ изменено:** `Event`, `EventKind`, `MdEvent`, `MdPayload`, `Venue`, `Side`, `Level` —
+wire-формат событий прежний, старые сегменты читаются байт-в-байт (CT-I-3).
+
+**Миграция (rev 2, после находки critic C-005 C2 — прежнее правило было FAIL-OPEN):**
+- Сегмент с магией → заголовок ОБЯЗАН разобраться; не разобрался → `Err` (не «наш»).
+- Сегмент без магии → legacy ТОЛЬКО если задекларирован в `journal.legacy.json` и отпечаток
+  совпал. Иначе → `Err` («чужой/неизвестный сегмент»). Никакого вменения по умолчанию.
+- Боевой сегмент (`segment-00000000.jrnl`, 8.3 GB, VPS) декларируется один раз, до деплоя;
+  переписывать его запрещено (единственная копия).
+
+**Схема:** `crates/contracts/schema/*.schema.json` — СГЕНЕРИРОВАНА
+(`cargo run -p contracts --example gen_schema`); гейт `tests/red_schema.rs` падает при
+расхождении с типами (CT-I-4). Фикстуры: `crates/contracts/fixtures/{valid,invalid}`.
+
+## schema_version 1 — CT-RFC-01 (2026-07-11)
+
+Аддитивно: `MdPayload::{OpenInterest, Liquidation, MarginRate}`, `Venue::BinanceFutures`.
