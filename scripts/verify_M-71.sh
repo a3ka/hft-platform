@@ -41,14 +41,31 @@ chk cargo test -p gateway --test red_egress_cap_boundary --quiet
 
 # Состав НАЗВАН ЛИТЕРАЛОМ, а не `-ge`: порог, отстающий от набора, есть ослабление наблюдения
 # ОТСУТСТВИЯ — потеря оракула оставила бы шаг зелёным (класс `R-118` N-1, `TD-140`).
-EXPECT_A=8
+EXPECT_A=9
 N_A=$(grep -cE '^fn pl_i_[45]_' crates/gateway/tests/red_egress_cap.rs || echo 0)
 if [ "${N_A}" -eq "${EXPECT_A}" ]; then
-  echo "PASS: A состав набора — ${N_A} оракулов (ожидалось ровно ${EXPECT_A}: A A-2 B C F E E-2 E-3)"
+  echo "PASS: A состав набора — ${N_A} оракулов (ожидалось ровно ${EXPECT_A}: A A-2 B C F E E-2 E-3 E-4)"
 else
   echo "FAIL: A состав набора — ${N_A} при ожидаемых ${EXPECT_A}; порог и набор разошлись"
   FAIL=$((FAIL + 1))
 fi
+
+step "A2 (уровень 2, A-021) — предел судит ПОЛНЫЙ исходящий текст в обеих wire-формах"
+chk cargo test -p gateway-serve --test red_egress_cap_wire --quiet
+EXPECT_W=5
+N_W=$(grep -cE '^fn pl_i_5_w' crates/gateway-serve/tests/red_egress_cap_wire.rs || echo 0)
+if [ "${N_W}" -eq "${EXPECT_W}" ]; then
+  echo "PASS: A2 состав набора — ${N_W} оракулов (ожидалось ровно ${EXPECT_W}: W1 W2 W3 W-C1 W-C2)"
+else
+  echo "FAIL: A2 состав набора — ${N_W} при ожидаемых ${EXPECT_W}; порог и набор разошлись"
+  FAIL=$((FAIL + 1))
+fi
+
+step "A3 (A-021 Правка B) — перечень дверей проверяет МАШИНА, а не память автора"
+# Два круга подряд находили дверь, которую оракул не звал (C-157 R2 — живой путь; C-158 R1 —
+# serve-обёртки и v1-конверт). Проба инвентаризирует поверхность грепом и падает, если дверь
+# существует, а оракул её не зовёт. Именованный остаток (макро/трейт-двери) — COGNITIVE-ONLY.
+chk bash scripts/tests/red_egress_doors.sh
 
 step "B (задача 4) — невалидный предел не даёт стартовать прод-бинарю"
 chk cargo test -p gateway-serve --test red_egress_cap_startup --quiet
@@ -90,6 +107,9 @@ ANCHOR='MUT-ANCHOR M-71-LIMIT'
 BASE_GREEN=0
 cargo test -p gateway --test red_egress_cap --quiet >/dev/null 2>&1 || BASE_GREEN=1
 cargo test -p gateway --test red_egress_cap_boundary --quiet >/dev/null 2>&1 || BASE_GREEN=1
+# `A-021` п.6: subject-set мутационного шага расширен на уровень 2 — иначе мутация судила бы
+# половину конструкции.
+cargo test -p gateway-serve --test red_egress_cap_wire --quiet >/dev/null 2>&1 || BASE_GREEN=1
 
 if [ "${BASE_GREEN}" -ne 0 ]; then
   echo "FAIL: C НЕ ГОТОВ — набор КРАСЕН и без мутации, судить нейтрализацию предела не по чему."
@@ -112,6 +132,7 @@ else
   else
     MUT_ALL=0; MUT_E=0
     (cd "${MUT}" && cargo test -p gateway --test red_egress_cap --quiet >/dev/null 2>&1) || MUT_ALL=1
+    (cd "${MUT}" && cargo test -p gateway-serve --test red_egress_cap_wire --quiet >/dev/null 2>&1) || MUT_ALL=1
     (cd "${MUT}" && cargo test -p gateway --test red_egress_cap pl_i_5_e --quiet >/dev/null 2>&1) || MUT_E=1
     if [ "${MUT_ALL}" -eq 1 ] && [ "${MUT_E}" -eq 0 ]; then
       echo "PASS: C база зелена, мутация роняет набор, честная нагрузка (E) цела"
