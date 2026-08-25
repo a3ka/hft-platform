@@ -131,6 +131,50 @@ fn journal_prod_shape(levels_per_side: usize, buckets: i64) -> tempfile::TempDir
     dir
 }
 
+/// Глубина книги, используемая оракулом полноты: столько же, сколько у `deep_book`.
+fn per_side_levels() -> usize {
+    (REACH / STEP) as usize
+}
+
+/// Та же прод-форма, но с ОДНОЙ сделкой в каждом временном бакете. Нужна оракулу `B`:
+/// полнота принятого ответа проверяется по ДВУМ разным частям (heatmap и OHLCV), а
+/// `journal_prod_shape` сделок не эмитит вовсе, и OHLCV в ней пуст по построению (`C-159` R2).
+fn journal_prod_shape_with_trades(levels_per_side: usize, buckets: i64) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut j = Journal::open_with(dir.path(), cfg()).expect("open_with");
+    let bids: Vec<Level> = (1..=levels_per_side)
+        .map(|k| lvl(MID * (1.0 - STEP * (k as f64 - 0.5)), 1.0))
+        .collect();
+    let asks: Vec<Level> = (1..=levels_per_side)
+        .map(|k| lvl(MID * (1.0 + STEP * (k as f64 - 0.5)), 1.0))
+        .collect();
+    for b in 0..buckets {
+        j.append(EventKind::md(
+            Venue::Binance,
+            "BTCUSDT",
+            MdPayload::L2Snapshot {
+                bids: bids.clone(),
+                asks: asks.clone(),
+                ts_exch_ms: T0 + b * 1_000,
+            },
+        ))
+        .expect("append snapshot");
+        j.append(EventKind::md(
+            Venue::Binance,
+            "BTCUSDT",
+            MdPayload::Trade {
+                price: to_fixed(MID),
+                size: to_fixed(1.0),
+                side: Side::Buy,
+                ts_exch_ms: T0 + b * 1_000 + 500,
+            },
+        ))
+        .expect("append trade");
+    }
+    j.flush().expect("flush");
+    dir
+}
+
 fn deep_book() -> tempfile::TempDir {
     journal_prod_shape((REACH / STEP) as usize, N_BUCKETS)
 }
@@ -497,14 +541,24 @@ fn pl_i_5_b_no_silent_truncation_on_either_side() {
     // ФИКСТУРЫ, а не из той же функции, что строит ответ (`testing.md`, «зависимый эталон»).
     let per_side = (PROD_BAND / STEP + 0.5).floor() as usize;
     let expected = per_side * 2 * N_BUCKETS as usize;
-    let s = snapshot(dir.path(), vec![PROD_BAND]).expect("узкий обязан обслуживаться");
-    // Полнота проверяется по ВСЕМ частям ответа, а не по одной (`C-157` R1): реализация,
-    // подрезающая профиль объёма или пузыри «чтобы влезть», обязана краснеть здесь.
+    // `C-159` R2 — МОЁ ложное КРАСНОЕ, найденное критиком. Прежняя редакция требовала здесь
+    // `ohlcv.len() == N_BUCKETS` от фикстуры `journal_prod_shape`, которая эмитит ТОЛЬКО
+    // `L2Snapshot` и ни одной сделки: OHLCV в ней ноль по построению. Сегодня ассерт не
+    // исполняется — тест падает раньше, на части (1). Но как только предел появится, часть (1)
+    // пройдёт, и набор станет НЕВОЗМОЖНО сделать зелёным честной реализацией: она упёрлась бы
+    // в неверный ОЖИДАЕМЫЙ ФАКТ, а не в поведение. Ровно тот класс, против которого написаны
+    // `E`/`E-2`/`E-3`/`E-4`, — и я внёс его сам.
+    //
+    // Лечение — фикстура, в которой полнота ЕСТЬ что проверять по двум разным частям ответа:
+    // те же L2-снимки ПЛЮС по одной сделке на бакет. Проверять полноту по одной части значило
+    // бы повторить исходный дефект `C-157` R1 в миниатюре.
+    let mixed = journal_prod_shape_with_trades(per_side_levels(), N_BUCKETS);
+    let s = snapshot(mixed.path(), vec![PROD_BAND]).expect("узкий обязан обслуживаться");
     assert_eq!(
         s.series.ohlcv.len(),
         N_BUCKETS as usize,
-        "PL-I-5 B: OHLCV урезан — {} баров при {N_BUCKETS} бакетах фикстуры. Ответ, прошедший \
-         предел, обязан быть ПОЛНЫМ во всех своих частях",
+        "PL-I-5 B: OHLCV урезан — {} баров при {N_BUCKETS} бакетах фикстуры, в каждом по сделке. \
+         Ответ, прошедший предел, обязан быть ПОЛНЫМ во всех своих частях",
         s.series.ohlcv.len()
     );
     assert_eq!(
