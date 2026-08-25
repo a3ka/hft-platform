@@ -109,6 +109,11 @@ step "D (задача 9) — смена СЕМАНТИКИ объявлена bu
 # не тот рычаг. Bump закрывает разом `C-094` B3 (явная инвалидация) и `П-014` п.3.
 chk_sh "test \"\$(grep -oE 'GATEWAY_SCHEMA_VERSION: u32 = [0-9]+' crates/gateway/src/lib.rs | grep -oE '[0-9]+\$')\" -ge 9" \
        "D GATEWAY_SCHEMA_VERSION >= 9 (на момент спеки было 8)"
+# `C-160` F1: bump обязан быть проведён ВМЕСТЕ с sacred-оракулом версии, иначе честная
+# реализация задачи 9 роняет `cargo test --all` — первый шаг этого же гейта. Оракул прибит к 9
+# в трёх публичных путях (константа, `Snapshot`, live `Frame`); шаг ниже требует его зелёным
+# ОТДЕЛЬНО от агрегата, чтобы причина падения читалась сразу, а не тонула в общем выводе.
+chk cargo test -p gateway --test red_gateway_schema_version --quiet
 
 step "E (задача 10) — VB-I-10 не ослаблен переходом на пересчёт по книге"
 chk cargo test -p gateway --test red_gateway_bounded --quiet
