@@ -36,7 +36,7 @@ use std::collections::HashMap;
 
 /// Имя ручки зафиксировано спекой (`M-71` §5): единообразно с `GATEWAY_WINDOW_MS` и
 /// `GATEWAY_MAX_SUBSCRIPTIONS` — тот же префикс, та же форма отказа.
-const VAR: &str = "GATEWAY_MAX_RESPONSE_CELLS";
+const VAR: &str = "GATEWAY_MAX_RESPONSE_BYTES";
 
 fn getter(pairs: &[(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
     let map: HashMap<&'static str, &'static str> = pairs.iter().copied().collect();
@@ -95,19 +95,19 @@ fn negative_limit_blocks_startup() {
 
 #[test]
 fn limit_with_unit_suffix_blocks_startup() {
-    assert_startup_rejected("20000cells", "число с суффиксом");
+    assert_startup_rejected("2000000bytes", "число с суффиксом");
 }
 
 #[test]
 fn limit_with_rust_separator_blocks_startup() {
     // Читается человеком как валидное, но `from_str` его не принимает — та же ловушка, что
     // поймал GW-I-14.
-    assert_startup_rejected("20_000", "Rust-разделитель разрядов не парсится");
+    assert_startup_rejected("2_000_000", "Rust-разделитель разрядов не парсится");
 }
 
 #[test]
 fn float_limit_blocks_startup() {
-    assert_startup_rejected("20000.0", "дробное значение не парсится");
+    assert_startup_rejected("2000000.0", "дробное значение не парсится");
 }
 
 #[test]
@@ -121,7 +121,7 @@ fn empty_limit_blocks_startup() {
 
 #[test]
 fn valid_limits_start() {
-    for v in ["1", "20000", "1000000"] {
+    for v in ["1", "2000000", "100000000"] {
         let pairs: Vec<(&'static str, &'static str)> = vec![
             ("GATEWAY_JWT_SECRET", "test-secret"),
             (VAR, Box::leak(v.to_string().into_boxed_str())),
