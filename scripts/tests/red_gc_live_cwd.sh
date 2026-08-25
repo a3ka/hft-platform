@@ -73,7 +73,12 @@ mk_case() {
     mkdir -p "${main}" && cd "${main}" || exit 1
     git init -q .
     git config user.email t@t; git config user.name t
-    echo base > f.txt; git add f.txt; git commit -qm base
+    # `.gitignore` с `target/` — как в НАСТОЯЩЕМ репозитории. Без него созданный сценарием
+    # кэш делает дерево ГРЯЗНЫМ, и сценарий падает на условии (1), не дойдя до сторожа:
+    # проверялась бы фикстура, а не предмет. Поймано перебором форм: reclaim-формы зелены
+    # (там `target/` уместен), а gc-формы падали «нет REMOVED» — при живом стороже.
+    printf 'target/\n' > .gitignore
+    echo base > f.txt; git add f.txt .gitignore; git commit -qm base
     git update-ref refs/remotes/origin/main HEAD
     git worktree add -q --detach "${wt}" HEAD
     mkdir -p "${wt}/sub"
@@ -310,45 +315,46 @@ elif grep -qF "ЖИВОЙ процесс держит cwd" <<<"${OUT}"; then nok
 elif ! grep -qF "REMOVED  wt" <<<"${OUT}"; then nok "L13-похожий-префикс-не-держит" "не снесено, хотя держателя нет"
 else ok "L13-похожий-префикс-не-держит" "exit=0"; fi
 
-# --- L14 ИСЧЕЗНУВШИЙ PID держателем НЕ является (C-141 R2-1) -----------------------------
-# Находка критика круга 2: ветка, отличающая исчезнувший PID от живого с нечитаемым cwd, не
-# была запиннена НИЧЕМ. Внешний мутант, превращающий мёртвый PID в держателя, проходил все
-# 18 сценариев и все шесть kill-set'ов — и при этом блокировал GC навсегда. Ложное зелёное:
-# регрессия сделала бы мёртвый PID УНИВЕРСАЛЬНЫМ держателем, выключив и обычный GC, и reclaim.
+# --- L14* ИСЧЕЗНУВШИЙ PID НЕ ДЕРЖИТ — ПО ВСЕМ ШЕСТИ ФОРМАМ ВЫЗОВА (C-141/C-145/C-146) ----
 #
-# ДЕТЕРМИНИЗМ ВМЕСТО ГОНКИ. Настоящая гонка «PID исчез между glob и readlink» невоспроизводима
-# по расписанию, а мигающий сценарий объявят шумом и выключат. Моделируется НАБЛЮДАЕМОЕ
-# состояние, а не тайминг: запись перечислима (`-e` истинно), но каталогом процесса НЕ
-# является — ровно то, что видит сторож на месте исчезнувшего PID. Предел назван: сценарий
-# пиннит РЕАКЦИЮ на это состояние, а не сам факт гонки.
-read -r main wt < <(mk_case l14) || { sfail "L14-мёртвый-PID-не-держит" "фикстура"; return; }
-fp="${main}/fakeproc-l14"; mkdir -p "${fp}"; register "${fp}"
-: > "${fp}/4242"          # перечислимо, но не каталог процесса
-OUT="$(cd "${main}" && GC_PROC_ROOT="${fp}" bash "${SUT_ACTIVE}" 2>&1)"; RC=$?
-if [ "${RC}" -ne 0 ]; then nok "L14-мёртвый-PID-не-держит" "exit=${RC}"
-elif grep -qF "ЖИВОЙ процесс держит cwd" <<<"${OUT}"; then nok "L14-мёртвый-PID-не-держит" "исчезнувший PID стал УНИВЕРСАЛЬНЫМ держателем — GC заблокирован навсегда"
-elif ! grep -qF "REMOVED  wt" <<<"${OUT}"; then nok "L14-мёртвый-PID-не-держит" "не снесено, хотя держателя нет"
-else ok "L14-мёртвый-PID-не-держит" "exit=0"; fi
-
-# --- L15 то же решение о мёртвом PID — В РЕЖИМЕ --reclaim (C-145 R3-1) -------------------
-# L14 зовёт предмет БЕЗ аргументов, то есть пиннит решение только для обычного GC. Но
-# `holder_pids` — предусловие И цикла reclaim (`gc_worktrees.sh:248`), и там же решается
-# судьба кэша. Критик круга 3 собрал мутанта, УСЛОВНОГО ПО РЕЖИМУ: снаружи reclaim он ведёт
-# себя честно, внутри — объявляет мёртвый PID держателем. Все семь заявленных мутантов
-# строились, их kill-set'ы совпадали, проба давала 19 ok / 0 FAIL — и пропускала его.
-# Урок тот же, что уже был дважды за сутки: сценарий проверяет ОДИН путь вызова, а инвариант
-# живёт на двух; «покрытие» заявлено шире замера.
-read -r main wt < <(mk_case l15) || { sfail "L15-мёртвый-PID-в-reclaim" "фикстура"; return; }
-mkdir -p "${wt}/target"; echo x > "${wt}/target/x"; touch -d '2020-01-01' "${wt}/target"
-mk_pgrep "${main}" 1 || { sfail "L15-мёртвый-PID-в-reclaim" "поддельный pgrep"; return; }
-fp="${main}/fakeproc-l15"; mkdir -p "${fp}"; register "${fp}"
-: > "${fp}/4343"          # перечислимо, но не каталог процесса — то же состояние, что в L14
-OUT="$(cd "${main}" && PATH="${main}/bin:${PATH}" GC_PROC_ROOT="${fp}" bash "${SUT_ACTIVE}" --reclaim 0 2>&1)"; RC=$?
-if [ "${RC}" -ne 0 ]; then nok "L15-мёртвый-PID-в-reclaim" "exit=${RC}"
-elif grep -qF "ЖИВОЙ процесс держит cwd" <<<"${OUT}"; then nok "L15-мёртвый-PID-в-reclaim" "мёртвый PID стал держателем В РЕЖИМЕ reclaim — кэш и дерево заперты навсегда"
-elif ! grep -qF "RECLAIMED" <<<"${OUT}"; then nok "L15-мёртвый-PID-в-reclaim" "кэш не забран, хотя держателя нет"
-else ok "L15-мёртвый-PID-в-reclaim" "exit=0"; fi
-if [ -f "${wt}/target/x" ]; then nok "L15-target-забран" "кэш остался — сторож переблокировал в reclaim"; else ok "L15-target-забран"; fi
+# ЧЕТЫРЕ КРУГА ОДНОГО КЛАССА, И ПОЭТОМУ ЗДЕСЬ ПЕРЕБОР, А НЕ ЕЩЁ ОДИН СЦЕНАРИЙ.
+#   C-141 R2-1: ветка мёртвого PID не пиннилась вовсе          → добавил ОДИН сценарий (gc, боевой)
+#   C-145 R3-1: не пиннилась в режиме --reclaim                 → добавил ВТОРОЙ (reclaim, боевой)
+#   C-146    : не пиннится при DRY=1 — --dry-run, --reclaim-dry и оба порядка флагов
+# Каждый раз я чинил ЭКЗЕМПЛЯР, и следующий круг находил соседний. Универсум при этом
+# конечен и виден в разборе аргументов (`gc_worktrees.sh`): состояние — ДВЕ переменные,
+# `MODE ∈ {gc, reclaim}` × `DRY ∈ {0,1}`, достижимые шестью формами argv. Перебираются ВСЕ.
+#
+# ИНВАРИАНТ ОДИН НА ВСЕ ФОРМЫ: исчезнувший PID не является держателем НИ ПРИ КАКОЙ форме
+# вызова. Позитивный маркер у каждой формы свой (боевой снос / сухой прогноз), и он тоже
+# проверяется — иначе «нет строки о держателе» было бы зелено на упавшем прогоне.
+#
+# Состояние моделируется НАБЛЮДАЕМОЕ, а не тайминг: запись перечислима (`-e` истинно), но
+# каталогом процесса не является — то же, что сторож видит на месте исчезнувшего PID.
+# Предел назван: пиннится РЕАКЦИЯ на состояние, а не сам факт гонки.
+while IFS='|' read -r lbl argv marker; do
+  [ -n "${lbl}" ] || continue
+  read -r main wt < <(mk_case "l14${lbl}") || { sfail "L14${lbl}" "фикстура"; return; }
+  mkdir -p "${wt}/target"; echo x > "${wt}/target/x"; touch -d '2020-01-01' "${wt}/target"
+  mk_pgrep "${main}" 1 || { sfail "L14${lbl}" "поддельный pgrep"; return; }
+  fp="${main}/fakeproc"; mkdir -p "${fp}"; register "${fp}"
+  : > "${fp}/4242"
+  # shellcheck disable=SC2086
+  OUT="$(cd "${main}" && PATH="${main}/bin:${PATH}" GC_PROC_ROOT="${fp}" bash "${SUT_ACTIVE}" ${argv} 2>&1)"; RC=$?
+  if [ "${RC}" -ne 0 ]; then nok "L14${lbl}" "exit=${RC} (argv: ${argv:-<пусто>})"
+  elif grep -qF "ЖИВОЙ процесс держит cwd" <<<"${OUT}"; then
+    nok "L14${lbl}" "исчезнувший PID стал держателем при argv «${argv:-<пусто>}» — путь заперт навсегда"
+  elif ! grep -qF "${marker}" <<<"${OUT}"; then
+    nok "L14${lbl}" "нет «${marker}» при argv «${argv:-<пусто>}» — форма не доехала до своего пути"
+  else ok "L14${lbl}" "argv: ${argv:-<пусто>}"; fi
+done <<'FORMS'
+a-gc-боевой||REMOVED  wt
+b-gc-сухой|--dry-run|WOULD-REMOVE  wt
+c-reclaim-боевой|--reclaim 0|RECLAIMED
+d-reclaim-сухой|--reclaim-dry 0|WOULD-RECLAIM
+e-dry-затем-reclaim|--dry-run --reclaim 0|WOULD-RECLAIM
+f-reclaim-затем-dry|--reclaim 0 --dry-run|WOULD-RECLAIM
+FORMS
 
 # --- L10 существующий страж «идёт сборка» НЕ ослаблен новым сторожем ---------------------
 # Обратная мутация (`testing.md`: «второй вопрос — что пришлось ослабить рядом»). Правка
@@ -391,10 +397,14 @@ battery() {
     'G6-скип-нечитаемого-cwd~|~echo "${pid}?"; found=1~|~:~|~L11-нечитаемый-cwd-свой'
     'G7-нет-сравнения-инода~|~[ -n "${cwdid}" ] && [ "${cwdid}" = "${wtid}" ]~|~false~|~L12-алиас-того-же-каталога'
     # G8 — ДОСЛОВНО мутант критика из C-141 R2-1: мёртвый PID объявляется держателем.
-    'G8-мёртвый-PID-держит~|~      [ -d "$p" ] || continue~|~      [ -d "$p" ] || { echo "${pid}?"; found=1; continue; }~|~L14-мёртвый-PID-не-держит L15-мёртвый-PID-в-reclaim L15-target-забран'
+    'G8-мёртвый-PID-держит~|~      [ -d "$p" ] || continue~|~      [ -d "$p" ] || { echo "${pid}?"; found=1; continue; }~|~L14a-gc-боевой L14b-gc-сухой L14c-reclaim-боевой L14d-reclaim-сухой L14e-dry-затем-reclaim L14f-reclaim-затем-dry'
     # G9 — мутант критика из C-145 R3-1 ДОСЛОВНО: условный по РЕЖИМУ. Снаружи reclaim честен,
     # внутри объявляет мёртвый PID держателем. Пережил все семь прежних мутантов и 19 сценариев.
-    'G9-мёртвый-PID-держит-в-reclaim~|~      [ -d "$p" ] || continue~|~      if [ "${MODE:-gc}" = "reclaim" ] && [ ! -d "$p" ]; then echo "${pid}?"; found=1; continue; fi\n      [ -d "$p" ] || continue~|~L15-мёртвый-PID-в-reclaim L15-target-забран'
+    # G10 — мутант критика из C-146 ДОСЛОВНО: держит только в СУХИХ прогонах. Пережил все
+    # 21 утверждение прошлой пробы и восемь мутантов, ложно запирая --dry-run/--reclaim-dry
+    # и оба порядка флагов. Ловится только перебором форм.
+    'G10-мёртвый-PID-держит-в-dry~|~      [ -d "$p" ] || continue~|~      if [ "${DRY:-0}" = "1" ] && [ ! -d "$p" ]; then echo "${pid}?"; found=1; continue; fi\n      [ -d "$p" ] || continue~|~L14b-gc-сухой L14d-reclaim-сухой L14e-dry-затем-reclaim L14f-reclaim-затем-dry'
+    'G9-мёртвый-PID-держит-в-reclaim~|~      [ -d "$p" ] || continue~|~      if [ "${MODE:-gc}" = "reclaim" ] && [ ! -d "$p" ]; then echo "${pid}?"; found=1; continue; fi\n      [ -d "$p" ] || continue~|~L14c-reclaim-боевой L14d-reclaim-сухой L14e-dry-затем-reclaim L14f-reclaim-затем-dry'
   )
   local bfail=0 spec
   for spec in "${mutants[@]}"; do
