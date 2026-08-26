@@ -53,9 +53,9 @@ fi
 step "A2 (уровень 2, A-021) — предел судит ПОЛНЫЙ исходящий текст в обеих wire-формах"
 chk cargo test -p gateway-serve --test red_egress_cap_wire --quiet
 EXPECT_W=7
-N_W=$(grep -cE '^fn pl_i_5_w' crates/gateway-serve/tests/red_egress_cap_wire.rs || echo 0)
+N_W=$(grep -cE "^async fn pl_i_5_w|^fn pl_i_5_w" crates/gateway-serve/tests/red_egress_cap_wire.rs || true); N_W=${N_W:-0}
 if [ "${N_W}" -eq "${EXPECT_W}" ]; then
-  echo "PASS: A2 состав набора — ${N_W} оракулов (ожидалось ровно ${EXPECT_W}: W1 W2 W3 W4 W-C1 W-C2 W-C3)"
+  echo "PASS: A2 состав набора — ${N_W} оракулов (ожидалось ровно ${EXPECT_W}: W1 W2 W3 W4 W5 W-C1 W-C3)"
 else
   echo "FAIL: A2 состав набора — ${N_W} при ожидаемых ${EXPECT_W}; порог и набор разошлись"
   FAIL=$((FAIL + 1))
