@@ -47,15 +47,6 @@ const SECRET: &[u8] = b"m71-egress-secret";
 const PROD_BAND: f64 = 0.001;
 const SHORT_SUB: &str = "s1";
 
-/// Предложенная величина предела (спека §5.1). Она **founder-owned**; оракулы судят
-/// ПОВЕДЕНИЕ (сообщение сверх предела наружу не уходит), а число здесь — рабочая отсечка,
-/// разведённая с фикстурами на порядки, чтобы набор не зависел от её точного значения.
-const PROPOSED_CAP: usize = 2_000_000;
-
-/// Плотный НЕ-heatmap ресурс: 25 000 сделок, ни одного L2-события. Именно он предъявлен
-/// критиком как 2 804 666 Б на формах, которых прежние оракулы не покрывали.
-const DENSE_TRADES: usize = 25_000;
-
 /// Щедрый бюджет ожидания. Истечение = НЕСОСТОЯВШИЙСЯ SETUP, не вердикт о пределе.
 const BUDGET: Duration = Duration::from_secs(20);
 
@@ -180,38 +171,6 @@ async fn recv(ws: &mut Ws) -> Option<(usize, Value)> {
         }
         _ => None,
     }
-}
-
-/// Подписка, ГАРАНТИРОВАННО попавшая в grace-окно, и первый v1-снапшот по ней.
-///
-/// Повтор обязателен: `subscribe`, опоздавший в grace-окно, сервер игнорирует и уходит в
-/// env-режим (`CT-RFC-09` §2.8). Без повтора оракул молча не получал бы v1-сообщений и был
-/// бы ЗЕЛЁН ПО ОТСУТСТВИЮ ПРЕДМЕТА — ровно тот класс, который закрывает `A-022`. Тот же
-/// приём применён в `red_ws_session.rs:383-405`.
-async fn subscribed_snapshot(addr: &str, venue: &str) -> (Ws, usize, Value) {
-    let mut last: Option<Value> = None;
-    for attempt in 1..=8u64 {
-        let mut ws = connect(addr).await;
-        send(&mut ws, subscribe(SHORT_SUB, venue)).await;
-        match recv(&mut ws).await {
-            Some((n, v)) if type_of(&v) == Some("snapshot") => return (ws, n, v),
-            Some((_, v)) => {
-                last = Some(v);
-                let _ = ws.close(None).await;
-            }
-            None => {
-                let _ = ws.close(None).await;
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(10 * attempt)).await;
-    }
-    setup_failed(&format!(
-        "v1-снапшот не получен за 8 попыток попасть в grace-окно; последнее сообщение: {last:?}"
-    ))
-}
-
-fn type_of(v: &Value) -> Option<&str> {
-    v.get("type").and_then(|t| t.as_str())
 }
 
 /// Диагностика несостоявшегося setup'а — отдельно от вердикта (`testing.md`, «Целостность
