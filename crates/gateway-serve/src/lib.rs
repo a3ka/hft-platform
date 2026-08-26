@@ -227,6 +227,28 @@ pub mod server {
         EFFECTIVE_GRACE_MS.store(ms, Ordering::Relaxed);
     }
 
+    /// M-71 (`milestones/M-71-egress-cap.md` §5): runtime-эффективный предел объёма
+    /// ответа в байтах сериализованной `SeriesBundle` (`serde_json::to_vec`).
+    /// Дефолт — `gateway::DEFAULT_MAX_RESPONSE_BYTES` (founder-owned; спека §5.1
+    /// предлагает 2 000 000). Хранение через atomic — а не поле `ServeConfig` — по
+    /// той же причине, что для `EFFECTIVE_MAX_SUBS`/`EFFECTIVE_GRACE_MS` выше: добавление
+    /// поля сломало бы существующие тесты с фиксированной формой литерала `ServeConfig
+    /// { .. }`. `serve_config_from_env` обновляет значение ровно один раз при старте;
+    /// fail-closed на невалидном env (через `Err`).
+    static EFFECTIVE_MAX_RESPONSE_BYTES: AtomicUsize =
+        AtomicUsize::new(gateway::DEFAULT_MAX_RESPONSE_BYTES);
+
+    /// Получить runtime-предел объёма ответа (читается на каждом `snapshot`/`frames_since`/
+    /// `pump`-вызове, см. `enforce_response_limit`).
+    pub fn effective_max_response_bytes() -> usize {
+        EFFECTIVE_MAX_RESPONSE_BYTES.load(Ordering::Relaxed)
+    }
+
+    /// Установить runtime-предел (вызывается из `serve_config_from_env` и тестов).
+    pub fn set_effective_max_response_bytes(n: usize) {
+        EFFECTIVE_MAX_RESPONSE_BYTES.store(n, Ordering::Relaxed);
+    }
+
     use crate::_gw::Selector;
     use futures_util::{SinkExt, StreamExt};
     use journal::EpochFilter;
@@ -2002,6 +2024,74 @@ pub fn serve_config_from_env(
         }
     };
     server::set_effective_grace_ms(grace_ms);
+
+    // M-71 (`milestones/M-71-egress-cap.md` §5): `GATEWAY_MAX_RESPONSE_BYTES` — fail-closed
+    // предел объёма ответа. Зеркалит `GATEWAY_MAX_SUBSCRIPTIONS` по форме (подпись/дефолт/
+    // поведение на unset/пусто vs невалид) и `GATEWAY_WINDOW_MS` по жёсткости (parse-error
+    // и overflow ⇒ отказ СТАРТА, не unbounded — `PL-I-5` дословно: «отсутствие/
+    // невалидность лимита = отказ, не unbounded»; `GW-I-14` для окна — тот же класс).
+    //
+    // Поведение по форме ЗНАЧЕНИЯ (восемь кейсов `red_egress_cap_startup.rs`):
+    //   * отсутствие ИЛИ пустая строка ⇒ `gateway::DEFAULT_MAX_RESPONSE_BYTES` + warn,
+    //     по той же асимметрии, что `A-015` для `MAX_SUBSCRIPTIONS` (дефолт не отказ);
+    //   * валидное положительное число в `usize` ⇒ записать в atomic;
+    //   * `0` — отказ (нулевой предел делает сервис неработоспособным);
+    //   * `-N`, `2000000.0`, `2_000_000`, `2000000bytes`, мусор, переполнение
+    //     (напр. `999999999999999999999`) — отказ СТАРТА с сообщением, называющим
+    //     переменную (`red_egress_cap_startup::assert_startup_rejected`).
+    let raw = get("GATEWAY_MAX_RESPONSE_BYTES");
+    let trimmed = raw.as_deref().map(str::trim);
+    let max_response_bytes: usize = match trimmed {
+        // ОТСУТСТВИЕ переменной — легитимный default (как `GATEWAY_WINDOW_MS`,
+        // `GATEWAY_MAX_SUBSCRIPTIONS`).
+        None => {
+            tracing::warn!(
+                "GATEWAY_MAX_RESPONSE_BYTES not set (переменная отсутствует); \
+                 GATEWAY_MAX_RESPONSE_BYTES={} — подписанная норма (founder 2026-08-26, \
+                 milestones/M-71-egress-cap.md §5.1), PL-I-5",
+                gateway::DEFAULT_MAX_RESPONSE_BYTES,
+            );
+            gateway::DEFAULT_MAX_RESPONSE_BYTES
+        }
+        // ПУСТАЯ строка — отличается от отсутствия (`red_egress_cap_startup
+        // ::empty_limit_blocks_startup`): это «переменная задана с пустым содержимым»,
+        // `PL-I-5` прямо требует отказ. Парсер `parse::<usize>()` пропустил бы пустую
+        // строку как ошибку парсинга, но явный отказ с понятным сообщением лучше —
+        // оператор видит, что именно не так.
+        Some("") => {
+            return Err(
+                "GATEWAY_MAX_RESPONSE_BYTES is set but empty — переменная задана с \
+                 невалидным содержимым (PL-I-5: отсутствие/невалидность лимита = \
+                 отказ, не unbounded). Удалите переменную для default или задайте \
+                 положительное целое число байтов."
+                    .to_string(),
+            );
+        }
+        Some(s) => {
+            // `parse::<usize>()` отвергает отрицательные и нечисловые значения. Но
+            // отдельные классы требуют явной проверки:
+            //   * `"2000000.0"` (дробное) — `parse::<usize>()` отвергнет (не i64-форма);
+            //   * `"2_000_000"` (Rust-разделитель) — `parse::<usize>()` отвергнет;
+            //   * `"2000000bytes"` (суффикс) — `parse::<usize>()` отвергнет;
+            //   * `"999999999999999999999"` (переполнение) — `parse::<usize>()` отвергнет.
+            // Парсер единый для всех случаев отказа; `0` отвергается отдельно — `usize`
+            // принимает `0` валидно, но семантически он делает сервис неработоспособным.
+            match s.parse::<usize>() {
+                Ok(0) => {
+                    return Err(format!(
+                        "GATEWAY_MAX_RESPONSE_BYTES={s} невалидно: должно быть >= 1 \
+                         (PL-I-5: нулевой предел делает сервис неработоспособным — \
+                         ни один ответ не уложится)"
+                    ));
+                }
+                Ok(n) => n,
+                Err(e) => {
+                    return Err(format!("GATEWAY_MAX_RESPONSE_BYTES={s:?} parse: {e}"));
+                }
+            }
+        }
+    };
+    server::set_effective_max_response_bytes(max_response_bytes);
 
     Ok(server::ServeConfig {
         addr,
