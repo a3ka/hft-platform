@@ -32,7 +32,7 @@
 //! и это честнее (`PL-I-7`).
 
 use contracts::{to_fixed, DataSource, EventKind, Level, MdPayload, Venue};
-use gateway::{Cursor, Selector};
+use gateway::{Cursor, LiveReducer, Selector};
 use journal::{EpochFilter, Journal, WriterConfig};
 
 const MID: f64 = 65_000.0;
@@ -154,5 +154,72 @@ fn md_i8_d9_one_sided_book_writes_no_point_not_a_zero() {
          интервала. Отсутствие точки не утверждает ничего — решение спеки rev4 §0quinquies.3. \
          Точки: {points:?}",
         points.len()
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+// d10 — честность счётчика на ЖИВОМ пути (задача 14, R-134 B-4)
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+
+/// Сколько L2-событий кладём в журнал. Достаточно, чтобы счётчик заведомо был > 0.
+const LIVE_EVENTS: usize = 8;
+
+/// Журнал из `n` двусторонних снимков в РАЗНЫХ секундных бакетах.
+fn journal_of_snapshots(n: usize) -> tempfile::TempDir {
+    journal_of(
+        (0..n as i64)
+            .map(|i| two_sided(T0 + i * 1_000))
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// Прод-путь живой сессии: `resume` + серия `pump`. Возвращает счётчик КАЖДОГО вызова.
+fn pump_counters(dir: &std::path::Path, calls: usize) -> Vec<u64> {
+    let ckpt = tempfile::tempdir().expect("SETUP: ckpt tempdir");
+    let (mut r, _) = LiveReducer::resume(dir, EpochFilter::OwnCaptureOnly, &sel(), ckpt.path())
+        .expect("SETUP: resume обязан собраться");
+    (0..calls)
+        .map(|k| {
+            let (_frames, _cur, st) = r
+                .pump(dir, EpochFilter::OwnCaptureOnly, usize::MAX)
+                .unwrap_or_else(|e| panic!("SETUP: pump #{k} отказал: {e}"));
+            st.depth_levels_visited
+        })
+        .collect()
+}
+
+/// **`d10` (задача 14, `R-134` B-4) — счётчик считает работу ВЫЗОВА, а не всей сессии.**
+///
+/// `ReadStats` объявлена СКЛАДЫВАЕМОЙ (`impl Add`, `ReadStats::sum`), и соседние поля
+/// (`events_decoded`, `segments_opened`, `events_scanned`, `segment_meta_ops`) берутся из
+/// потока, который создаётся заново на КАЖДЫЙ `pump`. Кумулятивное поле в складываемой
+/// структуре — дефект ПО ПОСТРОЕНИЮ: сумма тиков даёт перечёт, и потребитель, сложивший два
+/// отчёта, получит число, не означающее ничего.
+///
+/// # Форма проверки выбрана так, чтобы не зависеть от абсолютных величин
+///
+/// Второй `pump` не имеет НОВЫХ событий: работы нет, значит и счётчик обязан быть нулевым.
+/// При кумулятивной семантике он повторит накопленное. Оракулу не нужно знать, сколько именно
+/// уровней обходится — только что «нет работы ⇒ нет счёта».
+///
+/// Контроль внутри оракула: первый `pump` обязан дать НЕнулевой счёт, иначе фикстура не
+/// произвела предмета и сравнивать нечего (`testing.md`, «Целостность гейта» свойство 3).
+#[test]
+fn md_i8_d10_depth_levels_visited_counts_the_call_not_the_session() {
+    let dir = journal_of_snapshots(LIVE_EVENTS);
+    let counters = pump_counters(dir.path(), 2);
+
+    assert!(
+        counters[0] > 0,
+        "MD-I-8 d10 SETUP: первый pump посетил 0 уровней — фикстура не произвела работы, и \
+         судить честность счётчика не на чем. Счётчики: {counters:?}"
+    );
+    assert_eq!(
+        counters[1], 0,
+        "MD-I-8 d10 (B-4): второй pump НЕ ИМЕЛ новых событий, работы не делал — а счётчик \
+         показал {}. Значит поле кумулятивно с начала сессии, тогда как соседние поля той же \
+         ReadStats считаются ПО ВЫЗОВУ и структура объявлена складываемой (impl Add). \
+         Сложение двух таких отчётов даёт перечёт. Счётчики: {counters:?}",
+        counters[1]
     );
 }
