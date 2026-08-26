@@ -160,8 +160,8 @@ exit=0
   socket-visible response. The oracle must fail if the parsed value is discarded and the config
   receives the default. Refresh the verify baseline and re-submit the committed range for critic.
   ```
-- Push status: pending this critic verdict commit to `origin/feat/M-71-rev6`.
-- Cache: ⏸ left in `/tmp/hft-critic-m71-r6` while this worktree holds the verdict pending push.
+- Push status: ✅ pushed to `origin/feat/M-71-rev6` at `9a235cf`.
+- Cache: ✅ removed after the push.
 
 ## §E — Risks / open questions
 - The requested `usize::MAX` reachability mutation cannot be performed by critic without editing
