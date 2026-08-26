@@ -87,12 +87,37 @@ chk cargo test -p gateway-serve --test red_egress_cap_governed --quiet
 step "B (задача 4) — невалидный предел не даёт стартовать прод-бинарю"
 chk cargo test -p gateway-serve --test red_egress_cap_startup --quiet
 
+# `A-026` O-8/F14: ЧИСЛО не изменилось (было 10, стало 10), а КОМПОЗИЦИЯ — да. Прежний текст
+# «8 отказов + 2 vantage» стал ложью в тот момент, когда `empty_limit_blocks_startup` был
+# заменён оракулом равенства исходов `empty_and_blank_are_same_as_absent` (`A-026` §1).
+# Совпадение числа — случайность, и именно поэтому шаг проверяет ОБЕ величины: сверка только
+# по итогу здесь была бы зелена против подмены одного кейса другим.
 EXPECT_B=10
+EXPECT_B_REJECT=7
 N_B=$(grep -cE '^fn [a-z_]+\(\) \{' crates/gateway-serve/tests/red_egress_cap_startup.rs || echo 0)
-if [ "${N_B}" -eq "${EXPECT_B}" ]; then
-  echo "PASS: B состав набора — ${N_B} оракулов (ожидалось ровно ${EXPECT_B}: 8 отказов + 2 vantage)"
+N_B_REJECT=$(grep -cE '^fn [a-z_]+_blocks_startup\(\) \{' crates/gateway-serve/tests/red_egress_cap_startup.rs || echo 0)
+if [ "${N_B}" -eq "${EXPECT_B}" ] && [ "${N_B_REJECT}" -eq "${EXPECT_B_REJECT}" ]; then
+  echo "PASS: B состав набора — ${N_B} оракулов (ожидалось ${EXPECT_B}: ${EXPECT_B_REJECT} отказов + 1 равенство исходов + 2 vantage)"
 else
-  echo "FAIL: B состав набора — ${N_B} при ожидаемых ${EXPECT_B}; порог и набор разошлись"
+  echo "FAIL: B состав набора — ${N_B} оракулов / ${N_B_REJECT} отказов при ожидаемых ${EXPECT_B}/${EXPECT_B_REJECT}; порог и набор разошлись"
+  FAIL=$((FAIL + 1))
+fi
+
+# `A-026` O-2, вторая половина R1: равенство исходов обязано судиться и по ЭФФЕКТИВНОМУ
+# значению, а не только по `Result`. Носитель — `N1-D` в governed-наборе; шаг наблюдает его
+# ПРИСУТСТВИЕ, потому что удаление одного из двух парных оракулов иначе проходит молча.
+if grep -q 'pl_i_5_n1_d_empty_var_yields_same_effective_as_absent' crates/gateway-serve/tests/red_egress_cap_governed.rs; then
+  echo "PASS: B2 парный N1-D на месте — равенство «пусто ≡ отсутствие» судится по эффективному значению"
+else
+  echo "FAIL: B2 парного N1-D нет: равенство исходов судится только по Result, и реализация «пусто ⇒ Ok(другое значение)» проходит"
+  FAIL=$((FAIL + 1))
+fi
+
+# `A-026` O-6, часть «а» требования моста — единственная его safety-несущая половина.
+if grep -q 'pl_i_5_n1_e_parse_error_does_not_install_a_value' crates/gateway-serve/tests/red_egress_cap_governed.rs; then
+  echo "PASS: B3 N1-E на месте — при Err разбора эффективное значение не устанавливается"
+else
+  echo "FAIL: B3 N1-E отсутствует: класс GW-I-14/R7 (отвергнутая конфигурация всё равно управляет) не пиннится ничем"
   FAIL=$((FAIL + 1))
 fi
 
