@@ -749,11 +749,47 @@ pub mod server {
                     Ok(s) => s,
                     Err(e) => {
                         let code = e.code();
+                        // M-71 (`milestones/M-71-egress-cap.md` §0ter R1, `C-161`): клиент
+                        // управляет исходящим текстом и через отказ. До правки echo'ил
+                        // ПОЛНОЕ поле запроса: 2 100 084 Б при гигантском `venue` из двух
+                        // символов `sub` — `W4`. Троякая ловушка: (1) echo'ить строку
+                        // целиком — «масштабируемая» дыра, оператору уходит N байт на
+                        // каждый байт клиента; (2) НЕ echo'ить вовсе — теряется диагностика;
+                        // (3) ограничить длину при разборе — правка протокола, отдельный
+                        // маршрут (CT-RFC-09 §2.2, RAW-гейт). Лечение M-71: ограничить
+                        // длинный хвост на стороне отправителя (`MAX_VENUE_ECHO`), без
+                        // потери информации о причине и с сохранением формы `code` (`W-C3`).
+                        // Конкретное число — 256 символов: имя площадки короче в любой
+                        // разумной схеме (`Binance`, `Hyperliquid` — 8–11), 256 заведомо
+                        // достаточно для человека-оператора и заведомо не выводит текст
+                        // ошибки за предел (2 МБ) даже при сверхдлинной ерунде.
+                        const MAX_VENUE_ECHO: usize = 256;
                         let msg = match &e {
                             wire_v1::SelectorError::UnknownVenue(name) => {
-                                format!("unknown venue: {name}")
+                                if name.len() > MAX_VENUE_ECHO {
+                                    format!(
+                                        "unknown venue: {}… (truncated, original {} bytes)",
+                                        &name[..MAX_VENUE_ECHO],
+                                        name.len()
+                                    )
+                                } else {
+                                    format!("unknown venue: {name}")
+                                }
                             }
-                            wire_v1::SelectorError::Invalid(s) => s.clone(),
+                            wire_v1::SelectorError::Invalid(s) => {
+                                // Тот же предел на текст ошибки парсинга (редкий, но возможный
+                                // источник эха — `serde_json::from_value` иногда суёт в сообщение
+                                // фрагменты пользовательского ввода).
+                                if s.len() > MAX_VENUE_ECHO {
+                                    format!(
+                                        "{}… (truncated, original {} bytes)",
+                                        &s[..MAX_VENUE_ECHO],
+                                        s.len()
+                                    )
+                                } else {
+                                    s.clone()
+                                }
+                            }
                         };
                         send_v1_error(sink, Some(id), code, &msg).await;
                         return Err(format!("invalid selector: {msg}"));
@@ -803,7 +839,12 @@ pub mod server {
                                 &sel_for_resume,
                                 ckpt_clone.as_path(),
                             )?;
-                            let snap = live.snapshot();
+                            // M-71: снимок, ОТДАВАЕМЫЙ клиенту, ОБЯЗАН проходить предел.
+                            // `snapshot_checked` зовёт `enforce_response_limit` (`PL-I-5`,
+                            // `milestones/M-71-egress-cap.md` §5). На этом пути (switch)
+                            // ошибка предела превращается в `invalid_selector` — клиент
+                            // увидит `code:"invalid_selector"` и сообщение с величинами.
+                            let snap = live.snapshot_checked()?;
                             Ok((
                                 snap,
                                 session::Sub {
@@ -893,7 +934,9 @@ pub mod server {
                         &sel_for_resume,
                         ckpt_clone.as_path(),
                     )?;
-                    let snap = live.snapshot();
+                    // M-71: ADD-путь так же обязан enforce'ить предел — иначе первая же
+                    // подписка с раздувающим селектором ушла бы клиенту без проверки.
+                    let snap = live.snapshot_checked()?;
                     Ok((
                         snap,
                         session::Sub {
@@ -1342,6 +1385,17 @@ pub mod server {
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
+        // M-71 (`milestones/M-71-egress-cap.md` §5): размер batch'а дренажа `live` до
+        // хвоста. `usize::MAX` прокачивал бы ВСЕГО backlog одним delta-кадром — на
+        // плотном журнале (25k сделок = ~2.8 МБ delta) `pump` отверг бы вызов по
+        // `enforce_response_limit`. Здесь догон ОБЯЗАН пройти, поэтому batch ограничен —
+        // на каждой итерации обрабатывается ≤ `LEGACY_DRAIN_BATCH` событий, и delta-кадр
+        // гарантированно проходит предел. Кадры отбрасываются (нас интересует только
+        // состояние `live.full`). Число выбрано по тому же закону, что push-loop ниже
+        // (`PUSH_MAX_EVENTS = 256`): одна сделка — один bubble + один vp_bin ≈ 150 Б,
+        // 256 событий × 150 Б ≈ 38 КБ, на два порядка ниже предела в 2 МБ.
+        const LEGACY_DRAIN_BATCH: usize = 256;
+
         let (mut sink, mut stream) = ws.split();
 
         // (6a) Snapshot-при-подключении + резюмируемый `LiveReducer` для push-цикла
@@ -1385,8 +1439,19 @@ pub mod server {
             // выполнялся раньше.
             let mut stats = resume_stats;
             loop {
-                let (frames, _c, pump_stats) =
-                    live.pump(cfg1.journal_dir.as_path(), cfg1.filter.clone(), usize::MAX)?;
+                // M-71: pump обязан держать delta-кадр ≤ `DEFAULT_MAX_RESPONSE_BYTES`.
+                // `max_events = usize::MAX` бы прокачал ВЕСЬ backlog одним кадром — на
+                // плотном журнале это легко даёт delta > limit, и `pump` отверг бы
+                // вызов. Здесь догон до LATEST нужен ЛЮБОЙ ценой, поэтому размер batch'а
+                // ограничен константой `LEGACY_DRAIN_BATCH` — на каждой итерации
+                // обрабатывается ≤ N событий, и delta-кадр г гарантированно проходит предел.
+                // Суммарно до LATEST — серия таких batch'ей; кадры отбрасываются (нас
+                // интересует только догон `self.full`).
+                let (frames, _c, pump_stats) = live.pump(
+                    cfg1.journal_dir.as_path(),
+                    cfg1.filter.clone(),
+                    LEGACY_DRAIN_BATCH,
+                )?;
                 stats = stats + pump_stats;
                 if frames.is_empty() {
                     break;
@@ -1397,7 +1462,14 @@ pub mod server {
             // `dir`/`filter` — второй проход невозможен по построению). Между догоном
             // (цикл выше) и снятием снапшота ничего не читается — O-3: курсор снапшота
             // совпадает с курсором, от которого начнётся push ниже.
-            let snap_msg = ServeMsg::Snapshot(live.snapshot());
+            // M-71: legacy-путь использует `snapshot_checked` для помеченного усечения
+            // (PL-I-7): если снимок всё равно не укладывается после обрезки bubbles —
+            // возвращаем Err, и сессия абортится без отправки (как `W3` ожидает снимок
+            // ≤ 2 МБ именно отсюда).
+            let snap_msg = match live.snapshot_checked() {
+                Ok(snap) => ServeMsg::Snapshot(snap),
+                Err(e) => return Err(e),
+            };
             Ok((snap_msg, stats, live, at))
         })
         .await;
