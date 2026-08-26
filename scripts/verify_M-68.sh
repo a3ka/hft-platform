@@ -115,10 +115,10 @@ fi
 
 step "C3 (задачи 15,16 + C-167) — каденция управляет, объявлена, представима, инвалидирует чекпоинт"
 chk cargo test -p gateway --test red_depth_cadence --quiet
-EXPECT_C=4
-N_C=$(grep -cE "^fn md_i8_d1[2345]" crates/gateway/tests/red_depth_cadence.rs || true); N_C=${N_C:-0}
+EXPECT_C=5
+N_C=$(grep -cE "^fn md_i8_d1[23456]" crates/gateway/tests/red_depth_cadence.rs || true); N_C=${N_C:-0}
 if [ "${N_C}" -eq "${EXPECT_C}" ]; then
-  echo "PASS: C3 состав набора — ${N_C} оракулов (ожидалось ровно ${EXPECT_C}: d12 d13 d14 d15)"
+  echo "PASS: C3 состав набора — ${N_C} оракулов (ожидалось ровно ${EXPECT_C}: d12 d13 d14 d15 d16)"
 else
   echo "FAIL: C3 состав набора — ${N_C} при ожидаемых ${EXPECT_C}; порог и набор разошлись"
   FAIL=$((FAIL + 1))
@@ -138,6 +138,23 @@ if [ "${CLAIMS}" -gt 0 ] && [ "${OWN}" -gt 0 ]; then
 else
   echo "PASS: C4 самоописание согласовано (обещаний=${CLAIMS}, собственных материализаций=${OWN})"
 fi
+
+# A-024 O-5: ещё два ложных самоописания (R-134 B-2(i)/(iii)). Формы показа — по R-097 N-7:
+# `grep -c` при нуле печатает 0, а не молчит с exit=1, поэтому считаем ЧИСЛО, а не код возврата.
+for pair in \
+  'числа полосы snapshot-only|снятая snapshot-only семантика поля depth_reach_bid (lib.rs:636-658)' \
+  'кадр без снимка не несёт строк|то же, вторая половина того же комментария' \
+  'то же поведение, что прежний|ложное «как прежний depth_within с None mid» (lib.rs:1134-1136)'
+do
+  NEEDLE="${pair%%|*}"; WHY="${pair##*|}"
+  N=$(grep -c "${NEEDLE}" crates/gateway/src/lib.rs || true); N=${N:-0}
+  if [ "${N}" -eq 0 ]; then
+    echo "PASS: C4 ложное самоописание снято — ${WHY}"
+  else
+    echo "FAIL: C4 ложное самоописание ЖИВО (${N} упом.) — ${WHY}"
+    FAIL=$((FAIL + 1))
+  fi
+done
 
 step "D (задача 9) — смена СЕМАНТИКИ объявлена bump'ом GATEWAY_SCHEMA_VERSION"
 # ИМЕННО этот рычаг: `read_and_validate` шаг (3) отвергает чекпоинт при
