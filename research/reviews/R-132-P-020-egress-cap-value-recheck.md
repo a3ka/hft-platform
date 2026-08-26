@@ -1,5 +1,5 @@
 <!-- GATE-META
-milestone: П-020
+milestone: P-020
 audited_repo: a3ka/hft-platform
 audited_base: 1a91fe5a28eff43c47091a583af5d6025643e7f2
 audited_head: bd2042863de7835a3c08e37c0978709288aedcd6
