@@ -1,5 +1,5 @@
 <!-- GATE-META
-milestone: M-68-depth-from-book
+milestone: M-68
 audited_repo: a3ka/hft-platform
 audited_base: a5292aba59c476ba32f386a9747ce16c12acfcb7
 audited_head: 59ef731c6af6aad790441ca2dbe2ccf80c2d396b
