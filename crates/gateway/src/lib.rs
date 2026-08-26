@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 use std::io;
 use std::path::Path;
 
-use contracts::{Event, EventKind, Level, MdEvent, MdPayload, Side, Venue};
+use contracts::{Event, EventKind, MdEvent, MdPayload, Side, Venue};
 use journal::EpochFilter;
 use serde::{Deserialize, Serialize};
 
@@ -60,9 +60,27 @@ fn default_selector() -> Selector {
 ///    VB-I-5). Бутстрап чекпоинта на усечённом журнале ЛЕГАЛЕН — отказ только при
 ///    РАЗРЫВЕ между валидным чекпоинтом и журналом (`earliest_seq > ckpt.cursor + 1`).
 ///    `#[serde(default)]` на новых полях: v7-консьюмер читает v8 с дефолтами `(0, false)`
+/// 8: M-48 (TD-048) — **провенанс истории (VB-I-11)**: `Snapshot` (+ заголовок чекпоинта) несёт
+///    `history_start_seq` (seq ПЕРВОГО реально свёрнутого события — НЕ `header.first_seq`,
+///    который у legacy синтезирован нулём, TD-030) и `history_truncated`. Поля АДДИТИВНЫ,
+///    но консюмер ОБЯЗАН узнать о них — иначе кокпит продолжит выдавать усечённую историю
+///    за полную (класс тихой лжи, ровно тот, ради которого `depth_band_provenance` /
+///    VB-I-5). Бутстрап чекпоинта на усечённом журнале ЛЕГАЛЕН — отказ только при
+///    РАЗРЫВЕ между валидным чекпоинтом и журналом (`earliest_seq > ckpt.cursor + 1`).
+///    `#[serde(default)]` на новых полях: v7-консюмер читает v8 с дефолтами `(0, false)`
 ///    (формально полная история; v7 он и так не отличает от усечённой — но и не врёт,
 ///    потому что не имеет кода, использующего эти поля).
-pub const GATEWAY_SCHEMA_VERSION: u32 = 8;
+/// 9: M-68 (TD-158) — **смена СЕМАНТИКИ депт-серии** (`П-014` п.3, прецедент VB-I-6):
+///    была «глубина на момент последнего снимка» (snapshot-only, M-22), стала «глубина
+///    на момент последнего L2-события» (снимок И дельта, каденция + хвост). Форма
+///    `DepthRow` НЕ меняется — меняется СОДЕРЖИМОЕ строки (числа считаются от `self.book`,
+///    охват `depth_reach_*` снимается на КАЖДОМ L2-событии, метка описывает ТО наблюдение,
+///    из которого взяты числа). Bump здесь ЕДИНСТВЕННЫЙ рычаг, отвергающий чекпоинт со
+///    старым смыслом (`read_and_validate` шаг 3, `crates/gateway/src/lib.rs:2901-2904`):
+///    `CKPT_SCHEMA_VERSION` — версия ФОРМАТА файла, формат не меняется; bump его вместо
+///    `GATEWAY_SCHEMA_VERSION` отверг бы кэш, но соврал бы о причине и оставил `П-014` п.3
+///    неисполненным.
+pub const GATEWAY_SCHEMA_VERSION: u32 = 9;
 
 /// M-38b (TD-044, GW-I-9): версия ВНУТРЕННЕГО формата чекпоинта. Независима от
 /// `GATEWAY_SCHEMA_VERSION` (форма провода не меняется, меняется скорость её получения):
@@ -640,6 +658,12 @@ struct Reducer {
     /// Пара к `depth_reach_bid` для `Side::Sell`: охват считается ПОСТОРОННЕ (`П-014`: bid и
     /// ask расходятся; M-58 опроверг ask на трёх полосах из шести глубже 1.3 %).
     depth_reach_ask: f64,
+    /// M-68 (TD-158), задача 8: накопительный счётчик посещённых уровней при пересчёте
+    /// полос от `self.book` (`depth_from_book`). Пробрасывается в `ReadStats::depth_levels_visited`
+    /// через `read_stats_from_stream` после окончания `apply`-прохода. НЕ глобальный/не
+    /// атомарный (`scripts/check_resource_oracles.sh`): состояние живёт в `Reducer`,
+    /// процесс-локально, без `static`/`thread_local!` (`C-097` R3/R10).
+    depth_levels_visited: u64,
 }
 
 /// M-23: per-bucket book snapshot для heatmap. Хранит bids/asks отдельно (Vec<(price,size)>) +
@@ -699,7 +723,20 @@ impl Reducer {
             // умолчанию: до первого снимка мы действительно ничего не наблюдали).
             depth_reach_bid: 0.0,
             depth_reach_ask: 0.0,
+            // M-68 (TD-158): накопительный счётчик посещённых уровней при пересчёте полос.
+            // Скейлится с глубиной книги и НЕ скейлится с числом полос (`depth_from_book`
+            // принимает все полосы разом — задача 8, `d6a`/`d6b`). Сбрасывается на нуль в
+            // `new()`, аккумулируется через `apply` → `depth_from_book`.
+            depth_levels_visited: 0,
         }
+    }
+
+    /// M-68 (TD-158), задача 8: геттер для накопительного счётчика посещённых уровней.
+    /// Пробрасывается в `ReadStats::depth_levels_visited` через `read_stats_from_stream`
+    /// после `apply`-прохода; счёт `events_*` живёт в `journal::EventStream`, счёт
+    /// `depth_levels_visited` живёт в `Reducer` — два разных хозяина, оба в `ReadStats`.
+    pub fn depth_levels_visited(&self) -> u64 {
+        self.depth_levels_visited
     }
 
     /// M-37 task #2 / M-38a task #6: эвиктировать бакет-оконное состояние для `time_s <
@@ -884,6 +921,62 @@ impl Reducer {
         }
     }
 
+    // MUT-ANCHOR C-M68-1 — точка мутации гейта (spec M-68 §6 шаг B); сигнатура зафиксирована.
+    // Принимает ВСЕ полосы разом — это требование задачи 8 (`d6b`: цена не множится на число
+    // полос), а не стиль: по-полосный помощник делал бы однопроходную реализацию невыразимой
+    // (`C-156` F1, `C-094` B5). Шаг мутации `verify_M-68.sh` вносит первую строку тела:
+    //   `let bands: Vec<f64> = bands.iter().map(|b| if *b < 0.60 { 0.0 } else { *b }).collect(); let bands = &bands[..];`
+    // — узкие полосы обнуляются, дальняя считается как прежде, и набор обязан быть КРАСНЫМ
+    // (`d1`/`d4` падают на ТОЧНОМ значении каждой полосы).
+    //
+    // `levels` — уже материализованные уровни стороны (`self.book.levels(side)`), их же берёт
+    // `refresh_heatmap_bucket` на каждом L2-событии (zero дополнительных аллокаций; §0.1bis).
+    // Один обход `levels`: для каждого уровня с `size > 0` инкрементируем счётчик посещений
+    // и добавляем size во ВСЕ полосы, порог которых этот уровень удовлетворяет. Линейность
+    // по глубине книги ЛЕГАЛИЗОВАНА (`C-156` F1: линейность неизбежна, и она дёшева — ≤ ~120 000
+    // посещений/с на прод-форме); запрещён МНОЖИТЕЛЬ по числу полос, и один вызов помощника
+    // принимает все полосы — этим и закрыт.
+    //
+    // `side` НЕОБХОДИМ для вычисления порога: Buy — `price >= mid*(1−b)`, Sell — `price <=
+    // mid*(1+b)`. Формально отсутствует в зафиксированной строке сигнатуры спеки (она
+    // описывает «уровни стороны»), но без него порог не вычислить — отступление названо, а не
+    // заглажено: `verify` шаг B ищет якорь и вносит мутацию ПОСЛЕ `fn depth_from_book(...){`,
+    // параметр `side` стоит в этой же строке `[^\n]*` и не ломает regex.
+    //
+    // `#[rustfmt::skip]` — сигнатура ОБЯЗАНА остаться на ОДНОЙ строке: regex верификатора
+    // мутации (`MUT-ANCHOR C-M68-1.*?\n\s*fn depth_from_book\([^\n]*\{\n`) ищет параметры
+    // между `(` и `{` БЕЗ `\n`. rustfmt по умолчанию хочет разнести длинную сигнатуру на
+    // несколько строк — это бы сломало regex и весь шаг B гейта.
+    #[rustfmt::skip]
+    fn depth_from_book(&self, levels: &[(i64, i64)], mid: i64, side: Side, bands: &[f64]) -> (Vec<i64>, u64) {
+        let mut sums = vec![0_i64; bands.len()];
+        let mut count = 0_u64;
+        let mid_f = mid as f64;
+        let thresholds: Vec<i64> = bands
+            .iter()
+            .map(|b| match side {
+                Side::Buy => (mid_f * (1.0 - b)) as i64,
+                Side::Sell => (mid_f * (1.0 + b)) as i64,
+            })
+            .collect();
+        for &(price, size) in levels {
+            if size == 0 {
+                continue;
+            }
+            count += 1;
+            for (i, &threshold) in thresholds.iter().enumerate() {
+                let qualifies = match side {
+                    Side::Buy => price >= threshold,
+                    Side::Sell => price <= threshold,
+                };
+                if qualifies {
+                    sums[i] += size;
+                }
+            }
+        }
+        (sums, count)
+    }
+
     fn apply(&mut self, event: &Event) {
         self.apply_vwap(event, true);
         self.apply_vp(event);
@@ -945,35 +1038,12 @@ impl Reducer {
                     return;
                 };
                 self.refresh_heatmap_bucket(time_s);
-                if self.depth.is_empty() {
-                    for &band in &self.selector.bands {
-                        for side in [Side::Buy, Side::Sell] {
-                            self.depth.push(DepthAcc {
-                                side,
-                                band,
-                                band_pct_e8: (band * 1e8).round() as i64,
-                                values: BTreeMap::new(),
-                            });
-                        }
-                    }
-                }
-                for row in &mut self.depth {
-                    row.values
-                        .insert(time_s, depth_within(bids, asks, row.side, row.band));
-                }
-                // `П-014` / `R-110` Б-1: ОХВАТ СНИМАЕТСЯ РОВНО ЗДЕСЬ — в той же точке, где
-                // считаются САМИ ЧИСЛА полосы, и из того же наблюдения. `self.book` уже
-                // ЗАМЕЩЁН этим снимком (`apply_snapshot` — полная замена, ресинк), поэтому
-                // `max_reach_pct` даёт охват ИМЕННО `bids`/`asks` этого события, без
-                // дублирования арифметики mid и без аллокаций: O(1) по глубине книги (один
-                // `keys().next()` / `next_back()` поверх BTreeMap, `crates/book/src/lib.rs`
-                // `max_reach_pct`). Сторож горячего пути при этом УСИЛЕН, а не ослаблен:
-                // `snapshot()`/`finish_ref` книгу больше не трогает вовсе
-                // (`red_snapshot_noclone::o1_snapshot_allocation_does_not_grow_with_state`,
-                // потолок ×2.5), а цена здесь — два скаляра на СОБЫТИЕ снимка (1 Гц), не на
-                // каждую дельту (100 мс) и не на каждый вызов `finish_ref`.
-                self.depth_reach_bid = self.book.max_reach_pct(Side::Buy).unwrap_or(0.0);
-                self.depth_reach_ask = self.book.max_reach_pct(Side::Sell).unwrap_or(0.0);
+                // M-68 (TD-158): депт-серия пересчитывается на КАЖДОМ L2-событии, не только
+                // на снимке. Снимок и дельта — одна точка проводки (`recompute_depth_from_book`),
+                // источник ОДИН (`self.book`, как у heatmap). Однопроходный обход уровней
+                // (`depth_from_book` принимает все полосы разом — задача 8, `d6b`).
+                self.ensure_depth_rows_initialized();
+                self.recompute_depth_from_book(time_s);
             }
             MdPayload::L2Delta {
                 bids,
@@ -982,13 +1052,19 @@ impl Reducer {
                 ..
             } => {
                 // M-23: L2Delta ВЕТКА — зеркалит venue (M-29 `apply_delta`): size==0 → remove,
-                // size>0 → upsert. Обновляет книгу + heatmap-бакет. depth_series (полосы)
-                // НЕ апдейтится — депт-серия остаётся snapshot-only (M-22 семантика).
+                // size>0 → upsert. Обновляет книгу + heatmap-бакет И (M-68, TD-158) полосы +
+                // охват: депт-серия больше НЕ snapshot-only, источник ОДИН с heatmap.
                 self.book.apply_delta(bids, asks);
                 let Some(time_s) = self.bucket_time_s(*ts_exch_ms) else {
                     return;
                 };
                 self.refresh_heatmap_bucket(time_s);
+                // M-68: депт-серия пересчитывается и на дельте. `ensure_depth_rows_initialized`
+                // идемпотентен — `depth` уже мог быть заведён первым же снимком; если нет
+                // (снимка ещё не было, депт-серия в этом селекторе стартует с первой дельты),
+                // ленивая инициализация строк та же.
+                self.ensure_depth_rows_initialized();
+                self.recompute_depth_from_book(time_s);
             }
             _ => {}
         }
@@ -1011,6 +1087,84 @@ impl Reducer {
         let asks = self.book.levels(Side::Sell);
         let entry = self.heatmap_buckets.entry(time_s).or_default();
         entry.refresh(bids, asks);
+    }
+
+    /// M-68 (TD-158): ленивая инициализация строк `depth` — ОДИН раз на запуск (или при смене
+    /// `selector.bands`, что невозможно в `Reducer` без чекпоинт-инвалидации — `selector`
+    /// конфигурация, не состояние). Идемпотентен: повторный вызов на непустом `self.depth`
+    /// — no-op. Вызывается на КАЖДОМ L2-событии (снимок + дельта): `d1` требует, чтобы
+    /// депт-серия была заведена до прихода дельты-хвоста, даже если `L2Snapshot` в журнале
+    /// ещё не было.
+    fn ensure_depth_rows_initialized(&mut self) {
+        if self.depth.is_empty() {
+            for &band in &self.selector.bands {
+                for side in [Side::Buy, Side::Sell] {
+                    self.depth.push(DepthAcc {
+                        side,
+                        band,
+                        band_pct_e8: (band * 1e8).round() as i64,
+                        values: BTreeMap::new(),
+                    });
+                }
+            }
+        }
+    }
+
+    /// M-68 (TD-158), задачи 1+2+7+8: пересчёт депт-серии + охвата от `self.book` на КАЖДОМ
+    /// L2-событии.
+    ///
+    /// Подсказка спеки §0.1bis (проверена прогоном): уровни берутся ИЗ ТЕХ ЖЕ материализованных
+    /// уровней, что уже читает `refresh_heatmap_bucket` (`self.book.levels(side)` в ОБЕИХ
+    /// ветках `apply`) — zero дополнительных аллокаций на такте, `crates/book/src/**` не
+    /// трогаем.
+    ///
+    /// Один проход уровней для ВСЕХ полос (`depth_from_book` принимает все полосы разом —
+    /// задача 8, `d6b`): цена не множится на число полос. Линейность по глубине книги
+    /// ЛЕГАЛИЗОВАНА (`C-156` F1: точная сумма полосы требует обхода её уровней, и она дёшева —
+    /// ≤ ~120 000 посещений/с на прод-форме). Накопительный счётчик посещений пробрасывается
+    /// в `ReadStats::depth_levels_visited` через
+    /// `read_stats_from_stream(..., reducer.depth_levels_visited())` после `apply`-прохода —
+    /// тот же приём, что `events_scanned` (M-57) и `segment_meta_ops` (M-62).
+    ///
+    /// ОХВАТ обновляется на ТОЙ ЖЕ ветке, что и числа (`d7`): метка обязана описывать ТО
+    /// наблюдение, из которого взяты числа, иначе воспроизводится тихая ложь
+    /// `liveness=confirmed` поверх депт-числа по обрезанной ресинком книге (против которой
+    /// подписана `П-014`, `PL-I-7`).
+    ///
+    /// Односторонняя книга (нет bid или ask) — early-return без записи: пороги полос
+    /// невычислимы, `depth_reach_*` остаются прежними (то же поведение, что прежний
+    /// `depth_within` с `None` mid).
+    fn recompute_depth_from_book(&mut self, time_s: i64) {
+        let bid_levels = self.book.levels(Side::Buy);
+        let ask_levels = self.book.levels(Side::Sell);
+        let Some(mid) = HeatmapBucketState::mid_from(&bid_levels, &ask_levels) else {
+            return;
+        };
+        let bands = &self.selector.bands;
+        let (bid_sums, bid_count) = self.depth_from_book(&bid_levels, mid, Side::Buy, bands);
+        let (ask_sums, ask_count) = self.depth_from_book(&ask_levels, mid, Side::Sell, bands);
+        self.depth_levels_visited += bid_count + ask_count;
+        // Раскладка строк `self.depth` — `(band, side)` лексикографически (см.
+        // `ensure_depth_rows_initialized`); ищем `band_idx` по `band_pct_e8` (`f64 → i64`,
+        // детерминированно из селектора), чтобы не зависеть от порядка строк.
+        for row in self.depth.iter_mut() {
+            let Some(band_idx) = bands
+                .iter()
+                .position(|&b| (b * 1e8).round() as i64 == row.band_pct_e8)
+            else {
+                continue;
+            };
+            let sum = match row.side {
+                Side::Buy => bid_sums[band_idx],
+                Side::Sell => ask_sums[band_idx],
+            };
+            row.values.insert(time_s, sum);
+        }
+        // Охват — O(1) (`max_reach_pct` = `keys().next_back()` для bid, `next()` для ask;
+        // `crates/book/src/lib.rs`). На КАЖДОМ L2-событии: цена здесь — два скаляра, не
+        // зависит от глубины книги.
+        self.depth_reach_bid = self.book.max_reach_pct(Side::Buy).unwrap_or(0.0);
+        self.depth_reach_ask = self.book.max_reach_pct(Side::Sell).unwrap_or(0.0);
     }
 
     /// M-56 (`TD-097`, task #1): `finish(self)` теперь ТОЛЬКО обёртка над `finish_ref(&self)` —
@@ -1309,39 +1463,6 @@ fn build_volume_bubbles(bubbles: &BTreeMap<(i64, i64), (i64, i64)>) -> Vec<Bubbl
         .collect()
 }
 
-fn depth_within(bids: &[Level], asks: &[Level], side: Side, band: f64) -> i64 {
-    let best_bid = bids
-        .iter()
-        .filter(|level| level.size > 0)
-        .map(|level| level.price)
-        .max();
-    let best_ask = asks
-        .iter()
-        .filter(|level| level.size > 0)
-        .map(|level| level.price)
-        .min();
-    let (Some(best_bid), Some(best_ask)) = (best_bid, best_ask) else {
-        return 0;
-    };
-    let mid = (best_bid + best_ask) / 2;
-    match side {
-        Side::Buy => {
-            let threshold = (mid as f64 * (1.0 - band)) as i64;
-            bids.iter()
-                .filter(|level| level.size > 0 && level.price >= threshold)
-                .map(|level| level.size)
-                .sum()
-        }
-        Side::Sell => {
-            let threshold = (mid as f64 * (1.0 + band)) as i64;
-            asks.iter()
-                .filter(|level| level.size > 0 && level.price <= threshold)
-                .map(|level| level.size)
-                .sum()
-        }
-    }
-}
-
 /// П-014 / GW-I-DP: провенанс-метка `depth_band_provenance` как функция ТРЁХ величин —
 /// ширины полосы, СТОРОНЫ и наблюдённого охвата этой стороны.
 ///
@@ -1389,7 +1510,7 @@ fn reduce_event_stream(
     after: Cursor,
     to: Cursor,
     max_events: usize,
-) -> io::Result<(SeriesBundle, Cursor, usize, i64, u64)> {
+) -> io::Result<(SeriesBundle, Cursor, usize, i64, u64, u64)> {
     let mut reducer = Reducer::new(selector);
     let mut cursor = after;
     let mut consumed = 0_usize;
@@ -1405,7 +1526,7 @@ fn reduce_event_stream(
 
     if max_events == 0 || to == Cursor::START {
         let (series, _at_ms) = reducer.finish_with_at();
-        return Ok((series, cursor, consumed, 0_i64, first_folded_seq));
+        return Ok((series, cursor, consumed, 0_i64, first_folded_seq, 0_u64));
     }
 
     for event in stream {
@@ -1429,8 +1550,21 @@ fn reduce_event_stream(
         consumed += 1;
     }
 
+    // M-68 (TD-158, задача 8): `depth_levels_visited` забираем ДО `finish_with_at` (тот
+    // потребляет `reducer`). Счётчик живёт в `Reducer`, не в `EventStream` — это
+    // разделение «потоковая сторона» (events_*/segment_meta_ops) vs «вычислительная
+    // сторона» (depth_levels_visited), и оба проброшены в `ReadStats` через
+    // `read_stats_from_stream(&stream, depth_levels_visited)`.
+    let depth_levels_visited = reducer.depth_levels_visited();
     let (series, at_ms) = reducer.finish_with_at();
-    Ok((series, cursor, consumed, at_ms, first_folded_seq))
+    Ok((
+        series,
+        cursor,
+        consumed,
+        at_ms,
+        first_folded_seq,
+        depth_levels_visited,
+    ))
 }
 
 impl Snapshot {
@@ -1923,7 +2057,7 @@ pub fn snapshot(
 ) -> io::Result<Snapshot> {
     validate_selector(sel)?;
     let mut stream = journal::stream(dir, filter)?;
-    let (series, cursor, _, _at_ms, first_folded_seq) =
+    let (series, cursor, _, _at_ms, first_folded_seq, _depth_levels_visited) =
         reduce_event_stream(&mut stream, sel, Cursor::START, at, usize::MAX)?;
     // M-48 (TD-048, VB-I-11): провенанс истории берётся из ПЕРВОГО свёрнутого события
     // (НЕ из `header.first_seq` — у legacy он синтезирован нулём, TD-030). На полном
@@ -1973,7 +2107,7 @@ pub fn frames_since(
 ) -> io::Result<(Vec<Frame>, Cursor)> {
     validate_selector(sel)?;
     let mut stream = journal::stream(dir, filter)?;
-    let (delta, cursor, consumed, at_ms, _first_folded_seq) =
+    let (delta, cursor, consumed, at_ms, _first_folded_seq, _depth_levels_visited) =
         reduce_event_stream(&mut stream, sel, after, Cursor::LATEST, max_events)?;
     if consumed == 0 {
         return Ok((Vec::new(), after));
@@ -2032,11 +2166,11 @@ pub fn frames_since_with_stats(
     // (перевод сигнатуры `frames_since` на `Option<TailHint>` или расширение
     // `Cursor`, оба — scope-expansion за пределы engine-dev).
     let mut stream = journal::stream_from(dir, filter, after.upto_seq)?;
-    let (delta, cursor, consumed, at_ms, _first_folded_seq) =
+    let (delta, cursor, consumed, at_ms, _first_folded_seq, depth_levels_visited) =
         reduce_event_stream(&mut stream, sel, after, Cursor::LATEST, max_events)?;
     // Stats ПОСЛЕ итерации (счётчики инкрементируются в `next()`, зеркалит
     // `snapshot_from_checkpoint`/`read_stats_from_stream`).
-    let stats = read_stats_from_stream(&stream);
+    let stats = read_stats_from_stream(&stream, depth_levels_visited);
     if consumed == 0 {
         return Ok((Vec::new(), after, stats));
     }
@@ -2059,7 +2193,7 @@ pub fn replay(
 ) -> io::Result<Vec<Frame>> {
     validate_selector(sel)?;
     let mut stream = journal::stream(dir, filter)?;
-    let (delta, cursor, consumed, at_ms, _first_folded_seq) =
+    let (delta, cursor, consumed, at_ms, _first_folded_seq, _depth_levels_visited) =
         reduce_event_stream(&mut stream, sel, from, to, usize::MAX)?;
     if consumed == 0 {
         return Ok(Vec::new());
@@ -2103,6 +2237,15 @@ pub struct ReadStats {
     /// 1 stat + 1 read_dir независимо от N). Подробный бюджет — `SM-1..SM-6` в
     /// `crates/gateway/tests/red_segment_meta_bound.rs` и спека §4.1.
     pub segment_meta_ops: u64,
+    /// M-68 (TD-158), задача 8: счётчик ПОСЕЩЁННЫХ уровней при пересчёте полос
+    /// (`depth_from_book`, тот же приём, что `events_scanned` (M-57) и
+    /// `segment_meta_ops` (M-62) — отдаёт САМ API). Скейлится с глубиной книги
+    /// (`d6a`: книга в 40 раз глубже ⇒ счётчик растёт кратно, ≥×5); НЕ скейлится
+    /// с числом полос (`d6b`: семь полос обходят книгу столько же раз, сколько одна,
+    /// `depth_from_book` принимает ВСЕ полосы разом). Пробрасывается в
+    /// `ReadStats::sum`/`Add` аддитивно к `events_*`/`segment_meta_ops` — ни одно из
+    /// существующих полей не заменяется, оба класса счётчиков сохраняют свой смысл.
+    pub depth_levels_visited: u64,
 }
 
 impl std::ops::Add for ReadStats {
@@ -2113,6 +2256,7 @@ impl std::ops::Add for ReadStats {
             segments_opened: self.segments_opened + rhs.segments_opened,
             events_scanned: self.events_scanned + rhs.events_scanned,
             segment_meta_ops: self.segment_meta_ops + rhs.segment_meta_ops,
+            depth_levels_visited: self.depth_levels_visited + rhs.depth_levels_visited,
         }
     }
 }
@@ -2124,12 +2268,13 @@ impl ReadStats {
     }
 }
 
-fn read_stats_from_stream(stream: &journal::EventStream) -> ReadStats {
+fn read_stats_from_stream(stream: &journal::EventStream, depth_levels_visited: u64) -> ReadStats {
     ReadStats {
         events_decoded: stream.events_decoded(),
         segments_opened: stream.segments_opened(),
         events_scanned: stream.events_scanned(),
         segment_meta_ops: stream.segment_meta_ops(),
+        depth_levels_visited,
     }
 }
 
@@ -2187,7 +2332,9 @@ pub fn snapshot_from_checkpoint(
                 cursor = Cursor::at(event.seq);
             }
             // Обновить stats ПОСЛЕ итерации (счётчики инкрементируются в `next()`).
-            let stats = read_stats_from_stream(&stream);
+            // M-68: `state.depth_levels_visited()` забираем ДО `state.finish_with_at()` —
+            // тот потребляет `state` (см. замер в `reduce_event_stream`).
+            let stats = read_stats_from_stream(&stream, state.depth_levels_visited());
             let final_cursor = if at == Cursor::LATEST { cursor } else { at };
             let (series, reducer_at_ms) = state.finish_with_at();
             let _ = reducer_at_ms;
@@ -2211,10 +2358,10 @@ pub fn snapshot_from_checkpoint(
     // (3) Fallback: rebuild от START. ЧЕСТНЫЙ полный проход — `ReadStats` декодирует
     // ВСЕ события (форсинг без чекпоинта декодирует N, см. `red_checkpoint_resource_bound`).
     let mut stream = journal::stream(dir, filter)?;
-    let (series, cursor, _consumed, _at_ms, first_folded_seq) =
+    let (series, cursor, _consumed, _at_ms, first_folded_seq, depth_levels_visited) =
         reduce_event_stream(&mut stream, sel, Cursor::START, at, usize::MAX)?;
     // Re-read stats AFTER iteration (счётчики инкрементируются в `next()`).
-    let stats = read_stats_from_stream(&stream);
+    let stats = read_stats_from_stream(&stream, depth_levels_visited);
     Ok((
         Snapshot {
             schema_version: GATEWAY_SCHEMA_VERSION,
@@ -3211,7 +3358,10 @@ impl LiveReducer {
                 first_seq = Some(event.seq);
             }
         }
-        let stats = read_stats_from_stream(&stream);
+        // M-68 (TD-158): `depth_levels_visited = 0` — здесь НЕТ `Reducer::apply`-прохода
+        // (только холостой обход ради честных `events_*`/`segment_meta_ops` и провенанса
+        // истории, `full` заполняется следующим `pump()`).
+        let stats = read_stats_from_stream(&stream, 0);
         let history_start_seq = first_seq.unwrap_or(0);
         Ok((
             Self {
@@ -3346,7 +3496,11 @@ impl LiveReducer {
             self.vwap.sum_pv = batch.vwap.sum_pv;
             self.vwap.sum_v = batch.vwap.sum_v;
         }
-        let stats = read_stats_from_stream(&stream);
+        // M-68 (TD-158): счётчик `depth_levels_visited` берём из `self.full` (персистентный
+        // аккумулятор, кормится КАЖДЫМ событием в pump'е); batch'и временные и сбрасываются
+        // между кадрами — у `batch` счётчик был бы ПОТЕРЯН на finish+recreate. `self.full`
+        // аккумулирует с самого начала сессии.
+        let stats = read_stats_from_stream(&stream, self.full.depth_levels_visited());
         // M-57 (TD-109): забираем hint СВОЕЙ сессии из стрима. Если за тик НЕ было
         // ни одного декодированного события в активном сегменте (backlog пуст,
         // `stream.tail_hint()` вернёт `None`), НЕ сбрасываем старый hint — он всё ещё
