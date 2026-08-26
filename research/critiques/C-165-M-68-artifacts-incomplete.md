@@ -138,6 +138,18 @@ exit=1
 
 $ git diff --check a5292ab..59ef731
 exit=0
+
+$ bash scripts/check_artifact_ids.sh 59ef731c6af6aad790441ca2dbe2ccf80c2d396b
+OK: ни один коммит диапазона 59ef731..HEAD не ввёл второй носитель под занятым идентификатором
+exit=0
+
+$ bash scripts/check_gate_meta.sh 59ef731c6af6aad790441ca2dbe2ccf80c2d396b
+VERDICT: PASS — вердиктов проверено: 1, до-нормативных приземлений: 0, merge'ей с milestone в subject'е: 0
+exit=0
+
+$ bash scripts/check_review_fa.sh 59ef731c6af6aad790441ca2dbe2ccf80c2d396b
+SKIP (диапазон не трогает crates/**)
+exit=0
 ```
 
 === HANDOFF: CRITIC → ARCHITECT ===
