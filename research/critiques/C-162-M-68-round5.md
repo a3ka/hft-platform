@@ -188,7 +188,13 @@ Architect-only commit должен:
 - Найден F1: stale T2 запрещает обязательный Task-8 helper, а sacred RED оставляет
   ложную норму 7 рядом с исполнимой нормой 9.
 
-## §C — Следующий агент + paste-ready invocation
+## §C — Артефакты / результаты
+
+- `research/critiques/C-162-M-68-round5.md` — REJECT и полный Done Block.
+- `cargo test --all` честного кандидата задач 8--9: exit 0; две d6-мутации и
+  C-M68-1: различены; baseline verify: exit 1, `FAIL (8)`; design merge-preview: exit 0.
+
+## §D — Следующий агент + инвокация
 
 - **Следующий агент:** architect
 - **Промпт:**
@@ -203,14 +209,15 @@ Architect-only commit должен:
     честный кандидат задач 8--9 с cargo test --all=0. Не переоткрывай A-018 и не
     расширяй предмет на GW-I/GS-I, выдачу, TD-159/TD-161.
 
-## §D — Риск
+- Push-статус: ✅ C-162 опубликован в `origin/feat/M-68-rev3` начиная с `95c50e8`;
+  этот scope-only format fix отправляется следующим fast-forward commit.
+- Кэш: ✅ убран (`rm -r -- /tmp/hft-critic-m68-r5/target`,
+  `TARGET_CACHE_REMOVED=1`; требуемый `rm -rf` был отвергнут средой из-за `-f`).
+
+## §E — Риски / открытые вопросы
 
 - Пока §3 и §4 требуют взаимоисключающие реализации, dev не получает единого T-contract;
   а следующая смена версии снова начнётся с sacred файла, чья документация объявляет другое
   значение нормы. Это повторный fail-open процессного класса, хотя runtime assertions уже верны.
-- Кэш проверки удалён после прогона: требуемая запись
-  `rm -rf /tmp/hft-critic-m68-r5/target` была отклонена средой из-за `-f`; после
-  проверки точного выделенного пути выполнен эквивалентный
-  `rm -r -- /tmp/hft-critic-m68-r5/target`, `TARGET_CACHE_REMOVED=1`.
 
 === END HANDOFF ===
