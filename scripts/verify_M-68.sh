@@ -113,8 +113,31 @@ else
   FAIL=$((FAIL + 1))
 fi
 
-step "C3 (задачи 15,16 — решение founder'а о каденции на серию) — каденция управляет и объявлена"
+step "C3 (задачи 15,16 + C-167) — каденция управляет, объявлена, представима, инвалидирует чекпоинт"
 chk cargo test -p gateway --test red_depth_cadence --quiet
+EXPECT_C=4
+N_C=$(grep -cE "^fn md_i8_d1[2345]" crates/gateway/tests/red_depth_cadence.rs || true); N_C=${N_C:-0}
+if [ "${N_C}" -eq "${EXPECT_C}" ]; then
+  echo "PASS: C3 состав набора — ${N_C} оракулов (ожидалось ровно ${EXPECT_C}: d12 d13 d14 d15)"
+else
+  echo "FAIL: C3 состав набора — ${N_C} при ожидаемых ${EXPECT_C}; порог и набор разошлись"
+  FAIL=$((FAIL + 1))
+fi
+
+# ── Задача 12 (C-167): САМООПИСАНИЕ кода обязано быть правдой ──────────────────────────────
+# Проверка ТЕКСТОВАЯ, и это названо честно: предмет задачи 12 — утверждение кода о себе, а
+# утверждение есть текст. Барьер ловит КОНЪЮНКЦИЮ: комментарий обещает переиспользование
+# уровней И при этом recompute_depth_from_book по-прежнему материализует книгу сам. Любая из
+# двух развязок (реальное переиспользование ЛИБО снятие обещания) гасит шаг.
+step "C4 (задача 12 — R-134 B-2(ii)) — самоописание кода не расходится с кодом"
+CLAIMS=$(grep -c 'что уже читает `refresh_heatmap_bucket`' crates/gateway/src/lib.rs || true); CLAIMS=${CLAIMS:-0}
+OWN=$(sed -n '/fn recompute_depth_from_book/,/^    }/p' crates/gateway/src/lib.rs | grep -c 'self\.book\.levels(' || true); OWN=${OWN:-0}
+if [ "${CLAIMS}" -gt 0 ] && [ "${OWN}" -gt 0 ]; then
+  echo "FAIL: C4 комментарий обещает переиспользование уровней heatmap (${CLAIMS} упом.), а recompute_depth_from_book материализует книгу сам (${OWN} вызовов self.book.levels)"
+  FAIL=$((FAIL + 1))
+else
+  echo "PASS: C4 самоописание согласовано (обещаний=${CLAIMS}, собственных материализаций=${OWN})"
+fi
 
 step "D (задача 9) — смена СЕМАНТИКИ объявлена bump'ом GATEWAY_SCHEMA_VERSION"
 # ИМЕННО этот рычаг: `read_and_validate` шаг (3) отвергает чекпоинт при
