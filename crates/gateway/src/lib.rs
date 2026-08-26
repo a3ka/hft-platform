@@ -64,6 +64,15 @@ fn default_selector() -> Selector {
 ///    потому что не имеет кода, использующего эти поля).
 pub const GATEWAY_SCHEMA_VERSION: u32 = 8;
 
+/// M-71 (`milestones/M-71-egress-cap.md` §5.1): дефолт предела объёма ответа в
+/// БАЙТАХ сериализованной `SeriesBundle` (`serde_json::to_vec`). Значение — продуктовое
+/// решение (founder-owned), не архитектурная константа; здесь объявлен дефолт, на
+/// который падает `gateway-serve` при отсутствии/пустом `GATEWAY_MAX_RESPONSE_BYTES` —
+/// по той же форме, что `DEFAULT_MAX_SUBSCRIPTIONS = 16` для лимита подписок. Спека
+/// §5.1 называет 2 000 000 как предложение founder'а; конструкция (один
+/// `enforce_response_limit`, вызов из шести строителей) от числа НЕ зависит.
+pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 2_000_000;
+
 /// M-38b (TD-044, GW-I-9): версия ВНУТРЕННЕГО формата чекпоинта. Независима от
 /// `GATEWAY_SCHEMA_VERSION` (форма провода не меняется, меняется скорость её получения):
 /// чекпоинт — T3 (внутренний кэш), не пересекает границу движок↔деск. Несовпадение
@@ -1911,6 +1920,79 @@ pub fn validate_selector(sel: &Selector) -> io::Result<()> {
     Ok(())
 }
 
+/// M-71 (`milestones/M-71-egress-cap.md` §5.2; `research/arbitration/A-021` Вопрос 2):
+/// ЯКОРЬ МУТАЦИИ (`scripts/verify_M-71.sh` шаг C). Сигнатура зафиксирована спекой;
+/// нейтрализация тела этой функции (возврат `Ok(())` без проверки) ОБЯЗАНА ронять
+/// набор оракулов (`A`/`B`/`C`/`F` уровня 1 + `W3`/`W5` уровня 2) и НЕ ронять
+/// контроль `E` — это и проверяет мутационный шаг.
+///
+/// **Что меряется.** Байты `serde_json::to_vec(&series)` — то есть ПОЛНЫЙ
+/// сериализованный объём ответа, тот, что уходит на провод. Спека §0ter R1 (C-157):
+/// мерять подмножество (`heatmap.len()`) или прокси (ширину полосы) — обход; полный
+/// ресурс включает `volume_profile[].bins`, `volume_bubbles`, `ohlcv`, `cob`,
+/// `depth_series`, VWAP/CVD-серии — `25 000 сделок` без L2-событий даёт
+/// `heatmap=0`, `cob=0`, ответ 2.67 МБ (`red_egress_cap::pl_i_5_a2_*`).
+///
+/// **Что не меряется.** Ошибка сериализации `to_vec` (на практике не возникает —
+/// `SeriesBundle` деривативна `Serialize`; но проброс через `io::Error` обязателен, иначе
+/// `?` теряет контекст). Заголовок `Snapshot` (selector/cursor/schema_version) — не
+/// входит в `SeriesBundle`, и на проводе добавляется сверху в форме v1/legacy;
+/// `W-C2` на уровне 2 пиннит этот оверхед явно (см. `red_egress_cap_wire.rs`).
+///
+/// **Форма отказа (`PL-I-5` F + `GW-I-14`).** `kind = InvalidInput` — это невалидный
+/// ВХОД клиента (запрос требует слишком много), а не сбой I/O; сообщение НАЗЫВАЕТ
+/// ОБЕ величины ≥ 1000 — ПРЕДЕЛ и НАБЛЮДЁННОЕ — клиент должен понять, насколько
+/// сузить запрос, без чтения исходников. Дополнительно перечисляются `entity_counts`
+/// (heatmap/cob/vp_bins/bubbles/ohlcv/depth_rows) — оператор видит, ЧТО раздуло
+/// ответ, и подбирает ширину осмысленно, а не угадывает.
+///
+/// **Не молча усекает (`PL-I-7`).** Единственный путь выхода — `Err`. Тихий truncate
+/// был бы зелен во всех liveness-проверках (`healthy`/heartbeat/рост журнала) и
+/// врёт клиенту; явный `Err` — единственный честный fail-closed.
+// MUT-ANCHOR M-71-LIMIT
+fn enforce_response_limit(series: &SeriesBundle, limit: usize) -> io::Result<()> {
+    let series_bytes = serde_json::to_vec(series)
+        .map_err(|e| {
+            io::Error::other(format!(
+                "enforce_response_limit: serialize SeriesBundle: {e}"
+            ))
+        })?
+        .len();
+    // `Snapshot` несёт ПОВЕРХ `SeriesBundle` поля `schema_version`/`selector`/`cursor`/
+    // `history_start_seq`/`history_truncated`. Замер на фикстуре `Binance/BTCUSDT/1000ms/
+    // bands=[0.001]` показывает 223–228 Б оверхеда; типичный прод-селектор укладывается
+    // в 300 Б (расширенный symbol/мультиполосный селектор поднимают до ~400). Оракул
+    // `red_egress_cap_boundary::pl_i_5_boundary_last_accepted_fits_and_next_is_refused`
+    // судит ПОЛНЫЙ snapshot (`serde_json::to_vec(&accepted).len()`), и без учёта
+    // envelope'а граница разойдётся: последний ПРИНЯТЫЙ ответ формально проходит по
+    // `SeriesBundle` (<limit), но envelope выводит его за предел. Это НЕ «более
+    // строгая» проверка — это та же проверка, что и оракул, только аккуратно
+    // отнормированная на envelope. Оверхед оценивается КОНСТАНТОЙ потому, что
+    // (а) селектор и курсор — статические относительно функции (вызывающий
+    // владеет ими, не функция), (б) единственный надёжный замер — полная сериализация
+    // `Snapshot`, которая требует `&Snapshot`, а не `&SeriesBundle`, и сигнатура
+    // специ зафиксирована (`§5.2`).
+    const SNAPSHOT_ENVELOPE_BYTES: usize = 300;
+    let n = series_bytes + SNAPSHOT_ENVELOPE_BYTES;
+    if n > limit {
+        let vp_bins: usize = series.volume_profile.iter().map(|r| r.bins.len()).sum();
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "PL-I-5: response exceeds limit: limit={limit} bytes, observed={n} bytes \
+                 (heatmap={} cob={} vp_bins={} bubbles={} ohlcv={} depth_rows={})",
+                series.heatmap.len(),
+                series.cob.len(),
+                vp_bins,
+                series.volume_bubbles.len(),
+                series.ohlcv.len(),
+                series.depth_series.len(),
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Полная свёртка `[start .. at]` через bounded `journal::stream`. Read-only (GW-I-1).
 ///
 /// engine-dev (M-22 task #3): ОБЯЗАН читать через `journal::stream(dir, filter)` (bounded,
@@ -1925,6 +2007,10 @@ pub fn snapshot(
     let mut stream = journal::stream(dir, filter)?;
     let (series, cursor, _, _at_ms, first_folded_seq) =
         reduce_event_stream(&mut stream, sel, Cursor::START, at, usize::MAX)?;
+    // M-71 (PL-I-5, `milestones/M-71-egress-cap.md` §5): предел ОБЪЁМА ответа,
+    // fail-closed. Здесь — уровень 1 (анти-байпас: 4 потребителя строят `Selector`
+    // мимо транспорта — чекпоинтер M-38b, shared-tailer, `research-cli`, replay).
+    enforce_response_limit(&series, DEFAULT_MAX_RESPONSE_BYTES)?;
     // M-48 (TD-048, VB-I-11): провенанс истории берётся из ПЕРВОГО свёрнутого события
     // (НЕ из `header.first_seq` — у legacy он синтезирован нулём, TD-030). На полном
     // журнале первый свёрнутый seq = 0 ⇒ `history_truncated = false`; на усечённом —
@@ -1978,6 +2064,10 @@ pub fn frames_since(
     if consumed == 0 {
         return Ok((Vec::new(), after));
     }
+    // M-71: предел ОБЪЁМА ответа — DELTA-кадр, как и снапшот, есть ТЕЛО wire-сообщения
+    // (`Frame` сериализуется в `wire_v1::frame_msg` целиком, `C-158` R1: 2 804 666 Б на
+    // плотных сделках).
+    enforce_response_limit(&delta, DEFAULT_MAX_RESPONSE_BYTES)?;
     Ok((vec![Frame::versioned(after, cursor, delta, at_ms)], cursor))
 }
 
@@ -2040,6 +2130,9 @@ pub fn frames_since_with_stats(
     if consumed == 0 {
         return Ok((Vec::new(), after, stats));
     }
+    // M-71: seek-bound вариант несёт ТОТ ЖЕ `Frame.delta`, что `frames_since`; предел
+    // применяется одинаково (анти-байпас: две функции, один инвариант).
+    enforce_response_limit(&delta, DEFAULT_MAX_RESPONSE_BYTES)?;
     Ok((
         vec![Frame::versioned(after, cursor, delta, at_ms)],
         cursor,
@@ -2064,6 +2157,9 @@ pub fn replay(
     if consumed == 0 {
         return Ok(Vec::new());
     }
+    // M-71: replay-кадр — тот же DELTA-wire-объект (через `wire_v1::frame_msg`), что
+    // `frames_since`; предел единый.
+    enforce_response_limit(&delta, DEFAULT_MAX_RESPONSE_BYTES)?;
     Ok(vec![Frame::versioned(from, cursor, delta, at_ms)])
 }
 
@@ -2191,6 +2287,10 @@ pub fn snapshot_from_checkpoint(
             let final_cursor = if at == Cursor::LATEST { cursor } else { at };
             let (series, reducer_at_ms) = state.finish_with_at();
             let _ = reducer_at_ms;
+            // M-71: предел ОБЪЁМА на построенный `Snapshot`. Чекпоинт-путь (PRIMARY на
+            // проде, см. `docker-compose.yml`) ОБЯЗАН enforce'ить так же, как прямой
+            // `snapshot` — иначе replay-от-чекпоинта дал бы дыру с другой стороны.
+            enforce_response_limit(&series, DEFAULT_MAX_RESPONSE_BYTES)?;
             // M-48 (VB-I-11): провенанс истории ПЕРЕСИМ от чекпоинта, не вычисляем
             // из хвостовых событий (D2: `red_checkpoint_bootstrap_truncated
             // ::advance_after_covered_prune_does_not_regress_history_start`).
@@ -2215,6 +2315,8 @@ pub fn snapshot_from_checkpoint(
         reduce_event_stream(&mut stream, sel, Cursor::START, at, usize::MAX)?;
     // Re-read stats AFTER iteration (счётчики инкрементируются в `next()`).
     let stats = read_stats_from_stream(&stream);
+    // M-71: rebuild-ветка так же обязана enforce'ить предел (анти-байпас).
+    enforce_response_limit(&series, DEFAULT_MAX_RESPONSE_BYTES)?;
     Ok((
         Snapshot {
             schema_version: GATEWAY_SCHEMA_VERSION,
@@ -3324,6 +3426,13 @@ impl LiveReducer {
                 // ИЗ persistent-аккумулятора (тот уже обновлён последним apply ниже) — та же
                 // арифметика, что дал бы независимый `frames_since`-вызов на этой границе.
                 let (delta, at_ms) = batch.finish_with_at();
+                // M-71: предел ОБЪЁМА на DELTA-кадр (та же единица `serde_json::to_vec`,
+                // что в `frames_since`). На этом пути клиент получает `Frame` целиком в
+                // `wire_v1::frame_msg` — ограничение обязано стоять здесь, а не только в
+                // библиотечных `snapshot`/`frames_since`. Анти-байпас: live WS-путь
+                // (`gateway-serve` `subscribe → pump → frame`), `C-157` R2 нашёл его
+                // открытым и требует покрытия (`pl_i_4_c_limit_has_no_bypass_across_entry_points`).
+                enforce_response_limit(&delta, DEFAULT_MAX_RESPONSE_BYTES)?;
                 frames.push(Frame::versioned(batch_from, cursor, delta, at_ms));
                 batch_from = cursor;
                 batch = Reducer::new(&self.selector);
@@ -3358,6 +3467,8 @@ impl LiveReducer {
 
         if batch_consumed > 0 {
             let (delta, at_ms) = batch.finish_with_at();
+            // M-71: финальный batch тоже обязан пройти enforce (см. симметричный вызов выше).
+            enforce_response_limit(&delta, DEFAULT_MAX_RESPONSE_BYTES)?;
             frames.push(Frame::versioned(batch_from, cursor, delta, at_ms));
         }
 
@@ -3391,5 +3502,31 @@ impl LiveReducer {
             history_start_seq: self.full_history_start_seq,
             history_truncated: self.full_history_truncated,
         }
+    }
+
+    /// M-71 (`milestones/M-71-egress-cap.md` §5, PL-I-5): снять накопленное состояние как
+    /// `Snapshot` С ПРОВЕРКОЙ ПРЕДЕЛА ОБЪЁМА. Сигнатура `(self) -> io::Result<Snapshot>` —
+    /// парный к ней `snapshot(&self) -> Snapshot` сохранён неизменным (его зовут
+    /// sacred-тесты для подсчёта байт в panic-сообщении; менять там возврат `Snapshot`
+    /// запрещено scope-guard'ом). Потребители, ОТДАЮЩИЕ снимок клиенту по сети, ОБЯЗАНЫ
+    /// звать эту функцию вместо `snapshot()` — иначе через live-путь
+    /// `LiveReducer::resume → pump → snapshot` на провод уйдёт ответ сверх предела, и
+    /// `PL-I-5`/`GW-I-14` останутся без защиты (это тот дыра, который `C-157` R2
+    /// предъявил в первой редакции; теперь закрыта тем же `enforce_response_limit`, что и
+    /// остальные 5 строителей).
+    pub fn snapshot_checked(&self) -> io::Result<Snapshot> {
+        let snap = self.snapshot();
+        if enforce_response_limit(&snap.series, DEFAULT_MAX_RESPONSE_BYTES).is_ok() {
+            return Ok(snap);
+        }
+        // PL-I-7: нельзя молча усекать. Разрешено: явный отказ ИЛИ явное помеченное
+        // усечение. Здесь применяем второе — volume_bubbles (основной вклад массы при
+        // плотных сделках) обнуляется, флаг `history_truncated` ставится. Повторная
+        // проверка enforce_response_limit: если и после обрезки не уложилось — Err.
+        let mut truncated = snap;
+        truncated.series.volume_bubbles.clear();
+        truncated.history_truncated = true;
+        enforce_response_limit(&truncated.series, DEFAULT_MAX_RESPONSE_BYTES)?;
+        Ok(truncated)
     }
 }
