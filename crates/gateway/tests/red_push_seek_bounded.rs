@@ -72,6 +72,7 @@ fn sel() -> Selector {
         bands: vec![0.001],
         // Прод работает в windowed-режиме (GATEWAY_WINDOW_MS=60000) — держим тот же режим.
         window_ms: Some(60_000),
+        depth_cadence_ms: None,
     }
 }
 

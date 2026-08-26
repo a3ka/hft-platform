@@ -31,6 +31,7 @@ fn default_selector() -> Selector {
         timeframe_ms: 0,
         bands: Vec::new(),
         window_ms: None,
+        depth_cadence_ms: None,
     }
 }
 
@@ -139,6 +140,10 @@ pub struct Selector {
     /// unbounded (offline-режим). См. `VB-I-10` / TD-039 / `red_gateway_window.rs`.
     #[serde(default)]
     pub window_ms: Option<i64>,
+    /// M-68 задача 15 (`A-024` `O-1`): интервал пересчёта депт-серии, мс. `None` = пер-событийно
+    /// (сегодняшнее поведение бит-в-бит) — нейтрал. Ведётся ВРЕМЕНЕМ СОБЫТИЯ (`VB-I-2`).
+    #[serde(default)]
+    pub depth_cadence_ms: Option<i64>,
 }
 
 impl Selector {
@@ -324,6 +329,14 @@ pub struct SeriesBundle {
     /// M-23 Volume Bubbles (HM-I-4): торгованный объём `(time_s, price) → (buy, sell)` из `Trade`
     /// (side→buy/sell раздельно). Цены не выдуманы — только торгованные.
     pub volume_bubbles: Vec<BubbleCell>,
+    /// M-68 задача 16 (`П-014` п.2 дословно: «выдача обязана ЭТО НАЗЫВАТЬ»; `A-024` `O-1`):
+    /// объявленная каденция КАЖДОЙ серии — `(имя, интервал мс)`, где `None` = «на каждом
+    /// событии». Две серии в одном кадре имеют РАЗНУЮ частоту по решению продукта, и
+    /// потребитель обязан их различать, не догадываясь. Магическое `0` читалось бы как
+    /// особый случай по соглашению; `Option` называет особый случай типом.
+    /// Пусто — нейтрал, сохраняющий сегодняшнее поведение бит-в-бит.
+    #[serde(default)]
+    pub cadence_ms: Vec<(String, Option<i64>)>,
 }
 
 /// Полная детерминированная свёртка окна `[start .. cursor]`.
@@ -1306,6 +1319,7 @@ impl Reducer {
             heatmap,
             cob,
             volume_bubbles,
+            cadence_ms: Vec::new(),
         }
     }
 

@@ -87,6 +87,7 @@ fn sel() -> Selector {
         timeframe_ms: 1_000,
         bands: vec![0.001],
         window_ms: Some(60_000),
+        depth_cadence_ms: None,
     }
 }
 

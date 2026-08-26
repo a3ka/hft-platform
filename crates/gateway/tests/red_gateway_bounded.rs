@@ -155,6 +155,7 @@ fn sel_unbounded() -> Selector {
         timeframe_ms: 1_000,
         bands: vec![0.001],
         window_ms: None,
+        depth_cadence_ms: None,
     }
 }
 
@@ -258,6 +259,7 @@ fn sel_windowed() -> Selector {
         timeframe_ms: 1_000,
         bands: vec![0.001],
         window_ms: Some(WINDOW_MS),
+        depth_cadence_ms: None,
     }
 }
 

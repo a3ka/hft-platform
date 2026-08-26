@@ -1783,6 +1783,7 @@ pub fn build_selector(
         timeframe_ms,
         bands,
         window_ms,
+        depth_cadence_ms: None,
     }
 }
 

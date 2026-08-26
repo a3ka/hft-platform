@@ -63,6 +63,7 @@ fn sel() -> Selector {
         timeframe_ms: 1_000,
         bands: vec![NEAR_BAND],
         window_ms: None,
+        depth_cadence_ms: None,
     }
 }
 

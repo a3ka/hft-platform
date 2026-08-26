@@ -244,6 +244,7 @@ fn main() -> ExitCode {
         timeframe_ms: args.timeframe_ms,
         bands: args.bands,
         window_ms: args.window_ms,
+        depth_cadence_ms: None,
     };
 
     // NaN guard (M-38b): фингерпринт селектора использует `to_bits()`; NaN != NaN,
