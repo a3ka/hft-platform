@@ -1,63 +1,113 @@
-//! RED `PL-I-5` УРОВЕНЬ 2 (sacred, architect-only) — **ПРЕДЕЛ СУДИТ ПОЛНЫЙ ИСХОДЯЩИЙ ТЕКСТ.**
+//! RED `PL-I-5` УРОВЕНЬ 2 (sacred, architect-only) — **ПРЕДЕЛ СУДИТ БАЙТЫ, ПРИШЕДШИЕ В СОКЕТ.**
 //!
-//! Милестоун `milestones/M-71-egress-cap.md` rev3, исполнение решения арбитра
-//! `research/arbitration/A-021-m71-egress-resource-boundary.md` (Вопрос 2, Вопрос 3 Правка A).
+//! Милестоун `milestones/M-71-egress-cap.md` rev5. Исполнение второго арбитража по предмету —
+//! `research/arbitration/A-022-m71-oracle-judges-its-own-construction.md`.
 //!
-//! # Почему уровень ДВА и почему он в ЭТОМ крейте
+//! # Почему файл переписан ЦЕЛИКОМ, а не дополнен
 //!
-//! Два круга гейта (`C-157`, `C-158`) нашли экземпляры ОДНОГО класса: измеряемая величина
-//! оказывалась ПОДМНОЖЕСТВОМ настоящего ресурса. `heatmap` ⊂ `Snapshot` ⊂ wire-сообщение.
-//! Арбитр запретил третий экземпляр покрытия и потребовал смены конструкции: **два
-//! инварианта, у каждого свой объект и свой крейт.**
+//! Четыре круга гейта нашли ОДИН корень в трёх из них (`A-022` Вопрос 1): **величина в
+//! ассерте ВЫЧИСЛЯЛАСЬ самим тестом, а не СНИМАЛАСЬ с исполнения прод-границы.**
 //!
-//! * **Уровень 1** (`crates/gateway/tests/red_egress_cap.rs`) — байты СОБСТВЕННЫХ объектов
-//!   `gateway` (`Snapshot`, `Frame`). Там живёт анти-байпас: шесть строителей плюс прямые
-//!   сборщики `Selector` (чекпоинтер M-38b, shared-tailer M-39, `research-cli`, replay).
-//! * **Уровень 2 — здесь** — ПОЛНЫЙ исходящий текст сообщения, в ОБЕИХ wire-формах.
+//! * `C-157` R1 — судил `heatmap.len()`: тест сам выбрал, что считать ресурсом, и выбрал
+//!   подмножество; провод такой величины не знает;
+//! * `C-158` R1 — судил `serde_json::to_vec(&Snapshot)`: тест сам сериализовал, вместо
+//!   байтов, которые кладёт на провод сервер;
+//! * `C-161` — строил текст ошибки локальным `describe()`, дублируя трансформацию
+//!   обработчика. Честная реализация, выбравшая разрешённое лечение «не echo'ить venue»,
+//!   оставила бы оракул красным. Мутация обработчика показание не сдвигала НИКОГДА.
 //!
-//! Почему не одним оракулом в `gateway`: `ServeMsg` и v1-конверт живут в `gateway-serve`, а
-//! зависимость направлена `gateway-serve → gateway` (`crates/gateway-serve/Cargo.toml:29`;
-//! обратной нет). Арбитр проверил, что dev-dependency-цикл технически возможен, и **отверг
-//! его**: он сделал бы sacred-набор нижнего слоя компилируемо зависимым от его потребителя,
-//! то есть инвертировал бы в тестах ровно то слоение, ради которого анти-байпас и сажают вниз.
-//! Прецедент `M-69` устроен так же и правильно: библиотечный оракул — в `gateway/tests`,
-//! транспортный — в `gateway-serve/tests`.
+//! Правило границы `A-020` запрещает пятый экземпляр покрытия. Смена конструкции:
+//! **судимая величина — длина `Message`, ПОЛУЧЕННОГО реальным клиентом через реальный
+//! сокет.** Объемлющего множества ниже сокета на стороне сервера нет; строить объект самому
+//! здесь больше нечего, и класс закрыт ПО ПОСТРОЕНИЮ, а не ещё одной проверкой.
 //!
-//! # Две wire-формы, а не одна — поправка арбитра к `C-158`
+//! # Почему сокет достижим (и почему приватная функция — нет)
 //!
-//! `C-158` предписал мерить `ServeMsg`. Это конверт **только legacy-пути**
-//! (`crates/gateway-serve/src/lib.rs:1401`, `:1719`). Путь **v1** — единственный, которым
-//! клиентский селектор вообще попадает в систему (`subscribe`, `CT-RFC-09` §2.2), — шлёт
-//! другой конверт: `wire_v1::{snapshot_msg,frame_msg}`, `{"type","v","sub","data"}`
-//! (`:837`, `:923`, `:1270`, `:1613`). Исполнить `C-158` буквально значило бы получить
-//! законную находку следующего круга. Обе формы судятся здесь.
+//! `handle_v1_message` (`lib.rs:700`) и `send_v1_error` (`lib.rs:1020`) — приватные `async
+//! fn`. Публичная обёртка `parse_and_dispatch_v1_message` (`:320`) требует `&mut
+//! SessionInner`, а его поля приватны: конструирование только внутри крейта. Открывать
+//! конструктор ради теста значило бы судить полусобранную сессию — полушаг того же класса,
+//! и арбитр это отверг.
 //!
-//! # Именованный ОСТАТОК: длина клиентского `sub`-id
+//! Зато шесть наборов крейта уже поднимают НАСТОЯЩИЙ сервер (`bind("127.0.0.1:0")` →
+//! `local_addr()` → `spawn(serve())` → `connect_async`): `smoke_ws`, `red_ws_protocol`,
+//! `red_ws_session`, `red_ws_series_vs_replay`, `red_ws_honesty_sessions`,
+//! `red_ws_liveness_under_load`. Прод-граница достижима тем способом, каким её дёргает
+//! клиент, — это лучше вызова приватной функции, а не хуже.
 //!
-//! v1-конверт echo'ит `sub`-id клиента, и его длина сегодня не ограничена ничем
-//! (`grep 'id.len\|MAX_ID' crates/gateway-serve/src/` → 0). Накладные v1 поэтому НЕ
-//! константа: ≥45 Б + `|sub|`. Внутри `M-71` это закрыто тем, что уровень 2 судит ПОЛНЫЙ
-//! текст — echo попадает внутрь судимой величины. Ограничение самой длины id — правка
-//! протокола (`CT-RFC-09` §2.2), **отдельный маршрут, не предмет `M-71`** (`A-021`, Владельцы).
+//! # Цена размена названа (`A-022` Вопрос 2в)
+//!
+//! Сокетные тесты медленнее и уязвимее к таймингам. Но: судимая величина — ДЛИНА
+//! полученного сообщения, от хоста не зависит; тайминговых ассертов здесь нет вовсе;
+//! срабатывание таймаута оформляется как **НЕСОСТОЯВШИЙСЯ SETUP** с отдельной диагностикой,
+//! а не как вердикт о пределе. Риск флака спекулятивен, цена реконструкции — ИЗМЕРЕНА
+//! четырьмя кругами гейта.
+//!
+//! # ТАБЛИЦА «ДВЕРЬ → СЦЕНАРИЙ» (сверяется пробой `scripts/tests/red_egress_doors.sh`)
+//!
+//! | дверь исходящего текста | сценарий здесь |
+//! |---|---|
+//! | `wire_v1::snapshot_msg` | `W1` — v1-снапшот после `subscribe` |
+//! | `wire_v1::frame_msg`    | `W2` — v1-кадр после дописи в журнал |
+//! | `ServeMsg` (legacy)     | `W3` — снапшот по истечении grace-окна без `subscribe` |
+//! | `wire_v1::error_msg`    | `W4` — текст ошибки на гигантском `venue` · `W-C3` — честная ошибка |
+//! | `serve::snapshot_msg`   | `W5` — прокидывание отказа уровня 1 (объект: вердикт обёртки) |
+//! | `serve::frames_msgs`    | `W5` — то же |
+//!
+//! **Предел таблицы назван честно:** присутствие имени в ней ≠ истинность сопоставления.
+//! Зубы этому даёт МУТАЦИЯ НАБЛЮДАЕМОСТИ (`A-022` Вопрос 3), которую architect обязан
+//! прогнать ДО запроса критика и предъявить таблицей чувствительности в Done Block.
+//!
+//! # Что здесь НЕ судится
+//!
+//! Форма лечения не выбирается: усечь эхо, не echo'ить, ограничить поле при разборе —
+//! решает реализация. Требование одно: **наружу не уходит сообщение сверх предела**.
 
 use contracts::{to_fixed, DataSource, EventKind, MdPayload, Side, Venue};
-use gateway::{Cursor, Selector};
-use gateway_serve::serve;
-use gateway_serve::wire::ServeMsg;
-use gateway_serve::wire_v1;
+use futures_util::{SinkExt, StreamExt};
+use gateway::Selector;
+use gateway_serve::auth::Claims;
+use gateway_serve::server::{bind, ServeConfig};
 use journal::{EpochFilter, Journal, WriterConfig};
+use jsonwebtoken::{encode, DecodingKey, EncodingKey, Header};
+use serde_json::{json, Value};
+use std::path::Path;
+use std::time::Duration;
+use tokio_tungstenite::tungstenite::Message;
 
 const MID: f64 = 65_000.0;
 const T0: i64 = 1_752_000_000_000;
-
-/// Плотный НЕ-heatmap сценарий: ровно тот ресурс, который `C-158` R1 предъявил на непокрытых
-/// формах как 2 804 666 Б. Ни одного L2-события — heatmap и COB пусты.
-const DENSE_TRADES: usize = 25_000;
-/// Честная нагрузка — прод-дефолт `GATEWAY_BANDS` (`docker-compose.yml:134,203`).
+const SECRET: &[u8] = b"m71-egress-secret";
 const PROD_BAND: f64 = 0.001;
-/// Короткий фиксированный `sub`-id — для оракула-связки: он пиннит ПОСТОЯНСТВО ФОРМЫ
-/// конверта, а не глобальную константу накладных (её не существует, см. остаток выше).
 const SHORT_SUB: &str = "s1";
+
+/// Предложенная величина предела (спека §5.1). Она **founder-owned**; оракулы судят
+/// ПОВЕДЕНИЕ (сообщение сверх предела наружу не уходит), а число здесь — рабочая отсечка,
+/// разведённая с фикстурами на порядки, чтобы набор не зависел от её точного значения.
+const PROPOSED_CAP: usize = 2_000_000;
+
+/// Плотный НЕ-heatmap ресурс: 25 000 сделок, ни одного L2-события. Именно он предъявлен
+/// критиком как 2 804 666 Б на формах, которых прежние оракулы не покрывали.
+const DENSE_TRADES: usize = 25_000;
+
+/// Щедрый бюджет ожидания. Истечение = НЕСОСТОЯВШИЙСЯ SETUP, не вердикт о пределе.
+const BUDGET: Duration = Duration::from_secs(20);
+
+type Ws =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+fn sign() -> String {
+    let claims = Claims {
+        sub: "m71".to_string(),
+        exp: 9_999_999_999,
+    };
+    encode(
+        &Header::default(),
+        &claims,
+        &EncodingKey::from_secret(SECRET),
+    )
+    .expect("encode")
+}
 
 fn cfg() -> WriterConfig {
     WriterConfig {
@@ -79,307 +129,349 @@ fn sel() -> Selector {
     }
 }
 
+fn trade(i: i64) -> EventKind {
+    EventKind::md(
+        Venue::Binance,
+        "BTCUSDT",
+        MdPayload::Trade {
+            price: to_fixed(MID + i as f64 * 0.01),
+            size: to_fixed(1.0),
+            side: if i % 2 == 0 { Side::Buy } else { Side::Sell },
+            ts_exch_ms: T0 + i,
+        },
+    )
+}
+
 fn journal_of_trades(n: usize) -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut j = Journal::open_with(dir.path(), cfg()).expect("open_with");
     for i in 0..n as i64 {
-        j.append(EventKind::md(
-            Venue::Binance,
-            "BTCUSDT",
-            MdPayload::Trade {
-                price: to_fixed(MID + i as f64 * 0.01),
-                size: to_fixed(1.0),
-                side: if i % 2 == 0 { Side::Buy } else { Side::Sell },
-                ts_exch_ms: T0 + i,
-            },
-        ))
-        .expect("append");
+        j.append(trade(i)).expect("append");
     }
     j.flush().expect("flush");
     dir
 }
 
-fn bytes_of<T: serde::Serialize>(v: &T) -> usize {
-    serde_json::to_vec(v)
-        .expect("сообщение сериализуемо — иначе оно не ушло бы клиенту")
-        .len()
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════════════════
-// КОНТРОЛИ — идут первыми: страж, ломающий честную работу, будет выключен, и защиты не станет
-// ═══════════════════════════════════════════════════════════════════════════════════════════
-
-/// **W-C1 — честная нагрузка проходит ОБЕ wire-формы.**
-#[test]
-fn pl_i_5_w_c1_prod_default_passes_both_wire_forms() {
-    let dir = journal_of_trades(200);
-    let (msg, _stats) = serve::snapshot_msg(
-        dir.path(),
-        EpochFilter::OwnCaptureOnly,
-        &sel(),
-        Cursor::LATEST,
-        None,
-    )
-    .expect("PL-I-5 W-C1: обычная нагрузка обязана проходить serve-адаптер");
-
-    let legacy = bytes_of(&msg);
-    let ServeMsg::Snapshot(ref snap) = msg else {
-        panic!("W-C1 SETUP: serve::snapshot_msg вернул не Snapshot-конверт")
-    };
-    let v1 = bytes_of(&gateway_serve::wire_v1::snapshot_msg(SHORT_SUB, snap));
-
-    assert!(
-        legacy < 200_000 && v1 < 200_000,
-        "PL-I-5 W-C1 SETUP НЕ СОСТОЯЛСЯ: честный ответ весит legacy={legacy} v1={v1} Б — \
-         фикстура не разводит честный и плотный случаи на порядки, и оракулы ниже начинают \
-         зависеть от точной величины предела (её назначает founder, спека §5.1)"
-    );
-}
-
-/// **W-C2 (оракул-связка, `A-021` Правка A) — накладные конверта при ФИКСИРОВАННОМ коротком
-/// id постоянны и малы; глобальной константой они НЕ являются.**
-///
-/// Это ровно та правка, которой арбитр исправил моё предложение. Я утверждал «накладные
-/// конверта ограничены константой, поэтому предел на внутреннем объекте влечёт предел на
-/// внешнем». Для legacy это верно (13–15 Б), для **v1 — ЛОЖНО**: 45 Б + `|sub|`, а длина
-/// `sub` не ограничена ничем. Поэтому связка пиннит ПОСТОЯНСТВО ФОРМЫ при фиксированном id,
-/// а fail-closed обеспечивается тем, что уровень 2 судит ПОЛНЫЙ текст, — не этой оценкой.
-#[test]
-fn pl_i_5_w_c2_envelope_overhead_is_bounded_only_at_fixed_id() {
-    let dir = journal_of_trades(200);
-    let (msg, _) = serve::snapshot_msg(
-        dir.path(),
-        EpochFilter::OwnCaptureOnly,
-        &sel(),
-        Cursor::LATEST,
-        None,
-    )
-    .expect("snapshot_msg");
-    let ServeMsg::Snapshot(ref snap) = msg else {
-        panic!("W-C2 SETUP: не Snapshot-конверт")
-    };
-
-    let bare = bytes_of(snap);
-    let legacy = bytes_of(&msg);
-    let v1_short = bytes_of(&gateway_serve::wire_v1::snapshot_msg(SHORT_SUB, snap));
-    let long_id = "x".repeat(10_000);
-    let v1_long = bytes_of(&gateway_serve::wire_v1::snapshot_msg(&long_id, snap));
-
-    assert!(
-        legacy > bare && legacy - bare < 64,
-        "PL-I-5 W-C2: накладные legacy-конверта {} Б — форма изменилась",
-        legacy - bare
-    );
-    assert!(
-        v1_short > bare && v1_short - bare < 128,
-        "PL-I-5 W-C2: накладные v1-конверта при коротком id {} Б — форма изменилась",
-        v1_short - bare
-    );
-    // ГЛАВНОЕ утверждение оракула: накладные v1 РАСТУТ с длиной клиентского id, то есть
-    // константой не ограничены. Пока это так, «предел на внутреннем объекте» НЕ влечёт
-    // «предел на исходящем тексте», и судить обязан уровень 2.
-    assert!(
-        v1_long - v1_short >= 9_000,
-        "PL-I-5 W-C2: длинный `sub`-id не увеличил конверт ({} Б против {} Б). Если echo id \
-         перестал попадать в сообщение или его длина где-то ограничена — предпосылка \
-         конструкции изменилась, и спеку M-71 §0 надо перечитать, а не чинить этот ассерт.",
-        v1_long,
-        v1_short
-    );
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════════════════
-// ПРЕДМЕТ
-// ═══════════════════════════════════════════════════════════════════════════════════════════
-
-/// **W1 — плотный ответ отвергается на serve-адаптере `snapshot_msg`.**
-///
-/// `C-158` R1 дословно: тот же ресурс достигает форм, которых уровень 1 не покрывал, на
-/// 2 804 666 Б — 1.402× предложенного предела 2 МБ. Здесь он судится в точке, откуда уходит
-/// на провод.
-#[test]
-fn pl_i_5_w1_dense_response_is_refused_at_serve_snapshot() {
-    let dir = journal_of_trades(DENSE_TRADES);
-    match serve::snapshot_msg(
-        dir.path(),
-        EpochFilter::OwnCaptureOnly,
-        &sel(),
-        Cursor::LATEST,
-        None,
-    ) {
-        Err(_) => {}
-        Ok((msg, _)) => panic!(
-            "PL-I-5 W1 НАРУШЕН: serve::snapshot_msg отдал {} Б исходящего текста при пустом \
-             heatmap. Селектор прод-дефолтный — злоупотребления шириной полосы не требуется. \
-             Это точка, из которой сообщение уходит клиенту (`lib.rs:1401`).",
-            bytes_of(&msg)
-        ),
+fn config(dir: &Path) -> ServeConfig {
+    ServeConfig {
+        addr: "127.0.0.1:0".to_string(),
+        journal_dir: dir.to_path_buf(),
+        filter: EpochFilter::OwnCaptureOnly,
+        selector: sel(),
+        decoding_key: DecodingKey::from_secret(SECRET),
+        checkpoint_dir: None,
     }
 }
 
-/// **W2 — плотный ответ отвергается на serve-адаптере `frames_msgs`.**
-///
-/// Push-путь: им клиент живёт после первого снапшота. Отдельная дверь от `snapshot_msg`, и
-/// `C-158` предъявил ресурс именно на ней.
-#[test]
-fn pl_i_5_w2_dense_frames_are_refused_at_serve_frames() {
-    let dir = journal_of_trades(DENSE_TRADES);
-    match serve::frames_msgs(
-        dir.path(),
-        EpochFilter::OwnCaptureOnly,
-        &sel(),
-        Cursor::START,
-        usize::MAX,
-    ) {
-        Err(_) => {}
-        Ok((msgs, _)) => {
-            let worst = msgs.iter().map(bytes_of).max().unwrap_or(0);
-            // v1-КОНВЕРТ КАДРА — отдельная дверь, и её отсутствие в оракуле нашла
-            // проба-инвентаризация `scripts/tests/red_egress_doors.sh`, а не следующий круг
-            // критика. Ровно ради этого конструкция и менялась (`A-021` Правка B).
-            let worst_v1 = msgs
-                .iter()
-                .filter_map(|m| match m {
-                    ServeMsg::Frame(f) => {
-                        Some(bytes_of(&gateway_serve::wire_v1::frame_msg(SHORT_SUB, f)))
-                    }
-                    _ => None,
-                })
-                .max()
-                .unwrap_or(0);
-            panic!(
-                "PL-I-5 W2 НАРУШЕН: serve::frames_msgs отдал {} кадров, крупнейший — {worst} Б. \
-                 Кадр уходит на провод целиком (`lib.rs:1270`/`:1613` в v1-конверте, `:1719` в \
-                 legacy). В v1-конверте тот же кадр весит {worst_v1} Б. Предел, поставленный \
-                 только на снапшот, оставляет открытым именно тот путь, которым идёт основной \
-                 трафик.",
-                msgs.len()
-            )
+async fn serve_on(dir: &Path) -> String {
+    let server = bind(config(dir)).await.expect("bind");
+    let addr = server.local_addr().to_string();
+    tokio::spawn(async move {
+        let _ = server.serve().await;
+    });
+    addr
+}
+
+async fn connect(addr: &str) -> Ws {
+    let url = format!("ws://{addr}/?token={}", sign());
+    let (ws, _r) = tokio::time::timeout(BUDGET, tokio_tungstenite::connect_async(url))
+        .await
+        .expect("SETUP: бюджет коннекта истёк")
+        .expect("SETUP: connect");
+    ws
+}
+
+fn subscribe(sub: &str, venue: &str) -> Value {
+    json!({
+        "op": "subscribe",
+        "v": 1,
+        "id": sub,
+        "selector": {
+            "venue": venue,
+            "symbol": "BTCUSDT",
+            "timeframe_ms": 1000,
+            "bands": [PROD_BAND],
         }
+    })
+}
+
+async fn send(ws: &mut Ws, v: Value) {
+    ws.send(Message::Text(v.to_string()))
+        .await
+        .expect("SETUP: send");
+}
+
+/// ОДНО сообщение с сокета: его РАЗМЕР В БАЙТАХ и разобранное тело.
+/// `None` — сервер промолчал в пределах бюджета (несостоявшийся setup, не вердикт).
+async fn recv(ws: &mut Ws) -> Option<(usize, Value)> {
+    match tokio::time::timeout(BUDGET, ws.next()).await {
+        Ok(Some(Ok(m))) => {
+            let data = m.into_data();
+            let n = data.len();
+            serde_json::from_slice::<Value>(data.as_ref())
+                .ok()
+                .map(|v| (n, v))
+        }
+        _ => None,
     }
 }
 
-/// **W3 — v1-конверт судится тем же пределом, что legacy.**
+/// Подписка, ГАРАНТИРОВАННО попавшая в grace-окно, и первый v1-снапшот по ней.
 ///
-/// Путь v1 — единственный, которым клиентский селектор попадает в систему. Оракул строит
-/// плотный ответ и предъявляет, что в v1-форме он тоже уходит целиком: реализация,
-/// закрывшая legacy и забывшая v1, красна здесь.
-#[test]
-fn pl_i_5_w3_v1_envelope_is_capped_too() {
-    let dir = journal_of_trades(DENSE_TRADES);
-    // Если уровень 1/serve уже отвергли — предмет закрыт, оракул зелен: судить нечего.
-    let Ok((msg, _)) = serve::snapshot_msg(
-        dir.path(),
-        EpochFilter::OwnCaptureOnly,
-        &sel(),
-        Cursor::LATEST,
-        None,
-    ) else {
-        return;
-    };
-    let ServeMsg::Snapshot(ref snap) = msg else {
-        panic!("W3 SETUP: не Snapshot-конверт")
-    };
-    let v1 = gateway_serve::wire_v1::snapshot_msg(SHORT_SUB, snap);
+/// Повтор обязателен: `subscribe`, опоздавший в grace-окно, сервер игнорирует и уходит в
+/// env-режим (`CT-RFC-09` §2.8). Без повтора оракул молча не получал бы v1-сообщений и был
+/// бы ЗЕЛЁН ПО ОТСУТСТВИЮ ПРЕДМЕТА — ровно тот класс, который закрывает `A-022`. Тот же
+/// приём применён в `red_ws_session.rs:383-405`.
+async fn subscribed_snapshot(addr: &str, venue: &str) -> (Ws, usize, Value) {
+    let mut last: Option<Value> = None;
+    for attempt in 1..=8u64 {
+        let mut ws = connect(addr).await;
+        send(&mut ws, subscribe(SHORT_SUB, venue)).await;
+        match recv(&mut ws).await {
+            Some((n, v)) if type_of(&v) == Some("snapshot") => return (ws, n, v),
+            Some((_, v)) => {
+                last = Some(v);
+                let _ = ws.close(None).await;
+            }
+            None => {
+                let _ = ws.close(None).await;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10 * attempt)).await;
+    }
+    setup_failed(&format!(
+        "v1-снапшот не получен за 8 попыток попасть в grace-окно; последнее сообщение: {last:?}"
+    ))
+}
+
+fn type_of(v: &Value) -> Option<&str> {
+    v.get("type").and_then(|t| t.as_str())
+}
+
+/// Диагностика несостоявшегося setup'а — отдельно от вердикта о пределе
+/// (`testing.md`, «Целостность гейта» свойство 3).
+fn setup_failed(what: &str) -> ! {
     panic!(
-        "PL-I-5 W3 НАРУШЕН: v1-конверт построен и весит {} Б (legacy — {} Б). Обе формы уходят \
-         на провод и обе обязаны судиться одним пределом; `C-158` предписывал мерить только \
-         `ServeMsg`, и это конверт ЛИШЬ legacy-пути (`A-021` Вопрос 1).",
-        bytes_of(&v1),
-        bytes_of(&msg)
+        "SETUP НЕ СОСТОЯЛСЯ: {what}. Это НЕ вердикт о пределе: сервер не прислал ожидаемого \
+         сообщения в пределах бюджета {BUDGET:?}. Оракул судит длину ПОЛУЧЕННОГО сообщения; \
+         если получать нечего — судить нечего, и молчать об этом нельзя."
+    )
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+// КОНТРОЛИ — первыми: страж, ломающий честную работу, выключат, и защиты не станет
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+
+/// **W-C1 — честная нагрузка проходит через сокет.**
+#[tokio::test]
+async fn pl_i_5_w_c1_prod_default_is_served_over_the_socket() {
+    let dir = journal_of_trades(200);
+    let addr = serve_on(dir.path()).await;
+    let (_ws, n, _v) = subscribed_snapshot(&addr, "Binance").await;
+    assert!(
+        n < 200_000,
+        "PL-I-5 W-C1: обычный ответ весит {n} Б — фикстура не разводит честный и плотный \
+         случаи на порядки, и оракулы ниже начинают зависеть от точной величины предела"
     );
 }
 
-/// **W4 — ТЕКСТ ОШИБКИ, УПРАВЛЯЕМЫЙ КЛИЕНТОМ, тоже подчинён пределу** (`C-159` R1).
+/// **W-C3 — честная ошибка ДОСТАВЛЯЕТСЯ, с кодом и причиной** (парный vantage к `W4`).
 ///
-/// # Новый класс, которого не видела ни одна прежняя редакция
-///
-/// Все оракулы — и уровня 1, и уровня 2 — судили УСПЕШНЫЕ ответы. Между тем клиент управляет
-/// исходящим текстом и через ОТКАЗ:
-///
-/// 1. `wire_v1::parse_selector` возвращает `SelectorError::UnknownVenue(other.to_string())` —
-///    произвольная строка ИЗ ЗАПРОСА (`wire_v1.rs:130`);
-/// 2. обработчик строит `format!("unknown venue: {name}")` (`lib.rs:731`);
-/// 3. `wire_v1::error_msg` сериализуется и уходит `Message::Text` (`lib.rs:1031`).
-///
-/// Критик предъявил исполнением: при `sub = "s1"` и venue длиной 2 100 000 символов наружу
-/// уходит **2 100 084 Б** — на 100 084 Б выше предложенного предела. `sub` здесь ДВА байта,
-/// то есть это НЕ именованный остаток «длина `sub`-id не ограничена» (`A-021`), а отдельный
-/// класс: **ошибка echo'ит поле запроса целиком**.
-///
-/// # Что оракул НЕ предписывает
-///
-/// Форму лечения он не выбирает: усечь эхо, не echo'ить вовсе, ограничить длину поля при
-/// разборе — решает реализация. Требование одно: **наружу не уходит текст сверх предела**,
-/// каким бы ни было содержимое запроса.
-#[test]
-fn pl_i_5_w4_client_controlled_error_text_is_capped() {
-    // Ровно тот вход, которым это предъявлено: имя площадки — гигантская строка из запроса.
-    let huge_venue = "V".repeat(2_100_000);
-    let value = serde_json::json!({
-        "venue": huge_venue,
-        "symbol": "BTCUSDT",
-        "timeframe_ms": 1000,
-        "bands": [PROD_BAND],
-    });
-    let err = wire_v1::parse_selector(&value)
-        .err()
-        .expect("W4 SETUP: неизвестная площадка обязана давать ошибку разбора");
-    let (code, message) = describe(&err);
+/// Лечение `W4` не смеет выродиться в «ошибок не отдаём»: клиент обязан узнать, что чинить.
+/// Прецедент требования — `GW-I-14` («отказ обязан НАЗЫВАТЬ переменную»).
+#[tokio::test]
+async fn pl_i_5_w_c3_honest_error_is_delivered_over_the_socket() {
+    let dir = journal_of_trades(50);
+    let addr = serve_on(dir.path()).await;
+    let mut ws = connect(&addr).await;
+    send(&mut ws, subscribe(SHORT_SUB, "NoSuchVenue")).await;
 
-    let out = wire_v1::error_msg(Some(SHORT_SUB), code, &message);
-    let n = bytes_of(&out);
-    assert!(
-        n < 2_000_000,
-        "PL-I-5 W4 НАРУШЕН: наружу уходит {n} Б текста ОШИБКИ при `sub` длиной {} — почти весь \
-         объём принесён полем ЗАПРОСА, которое сообщение echo'ит целиком. Это `Message::Text` \
-         на проводе (`lib.rs:1031`), а не промежуточный объект. Пределы успешных ответов этого \
-         пути не видят: уровень 1 знает только `Snapshot`/`Frame`, уровень 2 звал только \
-         строители успеха. Порог в ассерте — предложенная величина (спека §5.1); она \
-         founder-owned, и оракул судит ПОВЕДЕНИЕ (текст сверх предела не уходит), а не число.",
-        SHORT_SUB.len()
-    );
-}
-
-/// **W-C3 — путь ошибки НЕ ломается на честном входе** (парный vantage к `W4`).
-///
-/// Лечение `W4` не смеет превратиться в «ошибок не отдаём». Клиент обязан получить внятный
-/// отказ с кодом и текстом — иначе он не узнает, что чинить. Прецедент требования — `GW-I-14`
-/// («отказ обязан НАЗЫВАТЬ переменную, оператор должен понять, что чинить»).
-#[test]
-fn pl_i_5_w_c3_honest_error_is_still_delivered() {
-    let value = serde_json::json!({
-        "venue": "NoSuchVenue",
-        "symbol": "BTCUSDT",
-        "timeframe_ms": 1000,
-        "bands": [PROD_BAND],
-    });
-    let err = wire_v1::parse_selector(&value)
-        .err()
-        .expect("W-C3 SETUP: неизвестная площадка обязана давать ошибку");
-    let (code, message) = describe(&err);
-    let out = wire_v1::error_msg(Some(SHORT_SUB), code, &message);
-    let text = serde_json::to_string(&out).expect("сериализуемо");
-
-    assert!(
-        text.contains(code),
-        "PL-I-5 W-C3: сообщение об ошибке обязано нести КОД ({code}); получено: {text}"
-    );
-    assert!(
-        text.len() > 20 && text.len() < 4_096,
-        "PL-I-5 W-C3: честная ошибка весит {} Б — она обязана быть и непустой, и небольшой. \
-         Пустой отказ оставляет клиента без причины; раздутый — тот же ресурс, что в W4.",
-        text.len()
-    );
-}
-
-/// Код и человеческий текст ошибки — тем же способом, каким их строит обработчик
-/// (`lib.rs:731`): именно эта склейка и уносит поле запроса наружу.
-fn describe(err: &wire_v1::SelectorError) -> (&'static str, String) {
-    match err {
-        wire_v1::SelectorError::UnknownVenue(name) => {
-            ("unknown_venue", format!("unknown venue: {name}"))
+    let mut err = None;
+    for _ in 0..4 {
+        match recv(&mut ws).await {
+            Some((n, v)) if type_of(&v) == Some("error") => {
+                err = Some((n, v));
+                break;
+            }
+            Some(_) => continue,
+            None => break,
         }
-        wire_v1::SelectorError::Invalid(m) => ("invalid_selector", m.clone()),
     }
+    let Some((n, v)) = err else {
+        setup_failed("сообщение об ошибке на неизвестную площадку не пришло")
+    };
+    assert_eq!(
+        v.get("code").and_then(|c| c.as_str()),
+        Some("unknown_venue"),
+        "PL-I-5 W-C3: ошибка обязана нести машиночитаемый код (`CT-RFC-09` §2.7); получено: {v}"
+    );
+    assert!(
+        n > 20 && n < 4_096,
+        "PL-I-5 W-C3: честная ошибка весит {n} Б — обязана быть и непустой, и небольшой"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+// ПРЕДМЕТ — судятся БАЙТЫ, ПРИШЕДШИЕ КЛИЕНТУ
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+
+/// **W1 — v1-СНАПШОТ: КОНТРОЛЬ, и почему именно контроль.**
+///
+/// # Замер, из-за которого оракул объявлен контролем, а не предметом
+///
+/// Прогон на плотной фикстуре (25 000 сделок): **v1-снапшот с сокета = 425 Б**. Плотный
+/// ресурс на этот путь НЕ ПОПАДАЕТ: подписка v1 начинает от текущей позиции, а не от начала
+/// журнала. Требовать здесь красноты значило бы завести ЛОЖНУЮ ТРЕВОГУ — тот самый класс,
+/// которым набор уже болел дважды (`C-159` R2, `C-161`).
+///
+/// Оракул остаётся, и не для симметрии: он держит границу СЕГОДНЯШНЕГО поведения. Реализация
+/// предела, которая заодно изменит стартовую позицию v1-подписки, обрушит сюда весь журнал —
+/// и покраснеет здесь. Отсутствие снапшота — тоже отказ (`subscribed_snapshot` объявит
+/// несостоявшийся setup), поэтому зелёным по молчанию он быть не может.
+#[tokio::test]
+async fn pl_i_5_w1_v1_snapshot_over_cap_is_not_delivered() {
+    let dir = journal_of_trades(DENSE_TRADES);
+    let addr = serve_on(dir.path()).await;
+    // Отсутствие v1-снапшота — НЕ зелёный исход: `subscribed_snapshot` объявит несостоявшийся
+    // setup. Зелёным этот оракул станет только когда снапшот ПРИДЁТ и уложится в отсечку,
+    // либо когда сервер откажет ЯВНО (ветка ниже недостижима — helper паникует раньше).
+    let (_ws, n, _v) = subscribed_snapshot(&addr, "Binance").await;
+    assert!(
+        n <= PROPOSED_CAP,
+        "PL-I-5 W1 НАРУШЕН: клиенту ПРИШЁЛ v1-снапшот {n} Б при отсечке {PROPOSED_CAP}. Это \
+         байты, снятые С СОКЕТА, а не собранные тестом. Селектор прод-дефолтный, heatmap пуст \
+         — объём принесли сделки; злоупотребления шириной полосы не требуется."
+    );
+}
+
+/// **W2 — v1-КАДР: КОНТРОЛЬ по тому же основанию.**
+///
+/// Замер: после дописи 25 000 сделок **крупнейший v1-кадр с сокета = 29 454 Б**. Размер
+/// кадра ограничен ПАКЕТИРОВАНИЕМ push-цикла, а не пределом: ресурс приходит размазанным по
+/// многим кадрам. Значит одиночный кадр сверх предела сегодня не воспроизводится, и красный
+/// ассерт здесь был бы ложной тревогой.
+///
+/// Контроль сторожит именно это свойство: реализация, увеличившая пакет или собравшая кадр
+/// целиком, покраснеет здесь. Отсутствие кадра — несостоявшийся setup, не зелёный исход.
+#[tokio::test]
+async fn pl_i_5_w2_v1_frame_over_cap_is_not_delivered() {
+    let dir = journal_of_trades(200);
+    let addr = serve_on(dir.path()).await;
+    let (mut ws, _n, _v) = subscribed_snapshot(&addr, "Binance").await;
+
+    {
+        let mut j = Journal::open_with(dir.path(), cfg()).expect("open_with");
+        for i in 1_000..(1_000 + DENSE_TRADES as i64) {
+            j.append(trade(i)).expect("append");
+        }
+        j.flush().expect("flush");
+    }
+
+    while let Some((n, v)) = recv(&mut ws).await {
+        if type_of(&v) == Some("frame") {
+            assert!(
+                n <= PROPOSED_CAP,
+                "PL-I-5 W2 НАРУШЕН: клиенту ПРИШЁЛ v1-кадр {n} Б при отсечке {PROPOSED_CAP}. \
+                 Предел, поставленный только на снапшот, оставляет открытым путь основного \
+                 трафика."
+            );
+            return;
+        }
+    }
+    // Кадра не было вовсе — предмет не воспроизведён, и молчать об этом нельзя.
+    setup_failed("v1-кадр после дописи в журнал не пришёл")
+}
+
+/// **W3 — LEGACY-форма: та же отсечка.**
+///
+/// Клиент, не приславший `subscribe`, по истечении grace-окна получает снапшот по
+/// env-селектору в legacy-конверте (`CT-RFC-09` §2.8). Другая форма — тот же предел.
+#[tokio::test]
+async fn pl_i_5_w3_legacy_snapshot_over_cap_is_not_delivered() {
+    let dir = journal_of_trades(DENSE_TRADES);
+    let addr = serve_on(dir.path()).await;
+    let mut ws = connect(&addr).await;
+    // намеренно НЕ подписываемся — ждём env-снапшот по истечении grace-окна
+
+    while let Some((n, v)) = recv(&mut ws).await {
+        let is_legacy_snapshot = v.get("Snapshot").is_some() || type_of(&v) == Some("snapshot");
+        if is_legacy_snapshot {
+            assert!(
+                n <= PROPOSED_CAP,
+                "PL-I-5 W3 НАРУШЕН: клиенту ПРИШЁЛ legacy-снапшот {n} Б при отсечке \
+                 {PROPOSED_CAP}. Форм две, предел обязан быть один."
+            );
+            return;
+        }
+    }
+    setup_failed("legacy-снапшот по истечении grace-окна не пришёл")
+}
+
+/// **W4 — ТЕКСТ ОШИБКИ, УПРАВЛЯЕМЫЙ КЛИЕНТОМ** (`C-161` F-161-1, `A-022`).
+///
+/// Прежняя редакция строила этот текст САМА, дублируя трансформацию обработчика, — и потому
+/// осталась бы красной против честного лечения. Теперь судятся байты, ПРИШЕДШИЕ клиенту:
+/// мутация обработчика показание сдвигает, реконструкции в тесте нет.
+///
+/// `sub` — два байта намеренно: это НЕ именованный остаток «длина `sub`-id не ограничена»
+/// (`A-021`), а отдельный класс — ошибка echo'ит поле ЗАПРОСА.
+#[tokio::test]
+async fn pl_i_5_w4_client_controlled_error_text_is_capped() {
+    let dir = journal_of_trades(50);
+    let addr = serve_on(dir.path()).await;
+    let mut ws = connect(&addr).await;
+    let huge_venue = "V".repeat(2_100_000);
+    send(&mut ws, subscribe(SHORT_SUB, &huge_venue)).await;
+
+    while let Some((n, v)) = recv(&mut ws).await {
+        if type_of(&v) == Some("error") {
+            assert!(
+                n <= PROPOSED_CAP,
+                "PL-I-5 W4 НАРУШЕН: клиенту ПРИШЁЛ текст ошибки {n} Б при `sub` из {} символов. \
+                 Почти весь объём принесён полем ЗАПРОСА, которое сообщение echo'ит целиком. \
+                 Форму лечения оракул не выбирает — усечь эхо, не echo'ить, ограничить поле при \
+                 разборе; требование одно: наружу не уходит сообщение сверх предела.",
+                SHORT_SUB.len()
+            );
+            return;
+        }
+    }
+    setup_failed("сообщение об ошибке на гигантскую площадку не пришло")
+}
+
+/// **W5 — serve-обёртки ПРОКИДЫВАЮТ отказ уровня 1.**
+///
+/// Объект этого оракула назван честно и он ДРУГОЙ: не «исходящий текст», а ВЕРДИКТ обёртки.
+/// Прод-сервер эти функции не зовёт (их зовут тесты), поэтому судить их байтами против
+/// предела было бы той же реконструкцией. Судится одно: `Err` уровня 1 не теряется.
+#[tokio::test]
+async fn pl_i_5_w5_serve_wrappers_propagate_level1_refusal() {
+    let dir = journal_of_trades(DENSE_TRADES);
+    let s = sel();
+
+    let snap = gateway_serve::serve::snapshot_msg(
+        dir.path(),
+        EpochFilter::OwnCaptureOnly,
+        &s,
+        gateway::Cursor::LATEST,
+        None,
+    );
+    assert!(
+        snap.is_err(),
+        "PL-I-5 W5: `serve::snapshot_msg` вернул Ok на ресурсе, который уровень 1 обязан \
+         отвергнуть. Обёртка объявлена ТОНКИМ passthrough (`GS-I-5`) — глотать отказ она не \
+         вправе."
+    );
+
+    let frames = gateway_serve::serve::frames_msgs(
+        dir.path(),
+        EpochFilter::OwnCaptureOnly,
+        &s,
+        gateway::Cursor::START,
+        usize::MAX,
+    );
+    assert!(
+        frames.is_err(),
+        "PL-I-5 W5: `serve::frames_msgs` вернул Ok на том же ресурсе — отказ уровня 1 потерян"
+    );
 }
