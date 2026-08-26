@@ -10,11 +10,18 @@
 //!
 //! C-028 K1: `red_gateway_export_v2` проверяет только `snap.schema_version == GATEWAY_SCHEMA_VERSION`
 //! (тавтология — зелёная при ЛЮБОМ значении константы). Она НЕ доказывает, что M-38a поднял версию
-//! до 7. engine-dev мог бы реализовать per-session CVD и оставить публичную схему на v6 — named-гейт
-//! Task 9 остался бы зелёным. Здесь версия ПРИБИТА к 7 явно, в трёх местах:
-//!   (1) сама константа `GATEWAY_SCHEMA_VERSION == 7`;
-//!   (2) `Snapshot.schema_version == 7` (то, что видит консюмер envelope через snapshot);
-//!   (3) `Frame.schema_version == 7` из `frames_since` (live-push путь).
+//! до нормы своего милестоуна. engine-dev мог бы реализовать поведение и оставить публичную
+//! схему на прежней версии — named-гейт задачи остался бы зелёным. Здесь версия ПРИБИТА к
+//! ДЕЙСТВУЮЩЕЙ НОРМЕ явно, в трёх местах:
+//!   (1) сама константа `GATEWAY_SCHEMA_VERSION == EXPECTED_SCHEMA_VERSION`;
+//!   (2) `Snapshot.schema_version` (то, что видит консюмер envelope через snapshot);
+//!   (3) `Frame.schema_version` из `frames_since` (live-push путь).
+//!
+//! **Норма названа ОДИН раз — в `EXPECTED_SCHEMA_VERSION`, и проза её не дублирует числом.**
+//! Прежняя редакция повторяла «7» в шапке и в комментариях трёх тестов, тогда как константа
+//! уже стояла на другом значении: `C-162` F1 предъявил это как нормативное противоречие
+//! внутри одного sacred-файла. Дублированное число протухает при каждом bump'е — теперь его
+//! просто нет.
 //!
 //! Анти-плацебо: RUNTIME-RED против текущего кода — все три assert'а падают по ЗНАЧЕНИЮ.
 //! GREEN только после bump'а. Форма v1-аддитивности и провенанс остаются в
@@ -97,7 +104,7 @@ fn sel() -> Selector {
     }
 }
 
-/// (1) Сама константа обязана быть ровно 7.
+/// (1) Сама константа обязана быть ровно `EXPECTED_SCHEMA_VERSION`.
 #[test]
 fn schema_version_constant_matches_expected() {
     assert_eq!(
@@ -107,7 +114,7 @@ fn schema_version_constant_matches_expected() {
     );
 }
 
-/// (2) Snapshot несёт версию 7 (то, что уходит консюмеру в envelope через snapshot).
+/// (2) Snapshot несёт `EXPECTED_SCHEMA_VERSION` (то, что уходит консюмеру в envelope через snapshot).
 #[test]
 fn snapshot_carries_expected_schema_version() {
     let t0 = 20_278_i64 * 86_400_000;
@@ -129,8 +136,9 @@ fn snapshot_carries_expected_schema_version() {
     );
 }
 
-/// (3) Frame из `frames_since` несёт версию 7 (live-push путь). frames обязаны быть НЕПУСТЫ,
-/// иначе `all(==7)` вырождается в vacuous-true (анти-плацебо: проверяем, что кадры реально есть).
+/// (3) Frame из `frames_since` несёт `EXPECTED_SCHEMA_VERSION` (live-push путь). frames обязаны
+/// быть НЕПУСТЫ, иначе `all(==…)` вырождается в vacuous-true (анти-плацебо: проверяем, что
+/// кадры реально есть).
 #[test]
 fn frame_carries_expected_schema_version() {
     let t0 = 20_278_i64 * 86_400_000;
@@ -149,7 +157,7 @@ fn frame_carries_expected_schema_version() {
     .expect("frames_since");
     assert!(
         !frames.is_empty(),
-        "предусловие: frames_since(START..) обязан вернуть ≥1 кадр (иначе all(==7) vacuous)"
+        "предусловие: frames_since(START..) обязан вернуть ≥1 кадр (иначе all(==норме) vacuous)"
     );
     assert!(
         frames
