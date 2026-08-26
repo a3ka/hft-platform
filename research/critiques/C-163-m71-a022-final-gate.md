@@ -182,7 +182,7 @@ socket-call removal: FAIL: L2 оракул не содержит 'connect_async'
 - Дата (UTC, ISO-8601): 2026-08-26T09:57Z
 - Milestone: M-71-egress-cap
 - Статус: DONE
-- HEAD: PLACEHOLDER — feat/M-71-egress-cap
+- HEAD: e0c02ac — audited subject feat/M-71-egress-cap
 
 ## §B — Что я сделал
 - Аудировал полный committed artifact set и финальную дельту после C-161 по рамкам A-021/A-022.
@@ -198,7 +198,7 @@ socket-call removal: FAIL: L2 оракул не содержит 'connect_async'
   ```
   На ветке feat/M-71-egress-cap прими C-163 как финальный NOTE plan-time gate M-71: внеси только mechanical appendix-ссылку на research/critiques/C-163-m71-a022-final-gate.md в milestones/M-71-egress-cap.md без изменения obligations, числа 2 MB или состава выдачи. Затем передай M-71 engine-dev для реализации существующих RED/oracle/verify artifacts. Не созывай новый арбитраж: A-022 Question 4 закрыл этот этап; Boundary C (величина лимита) остаётся founder-owned.
   ```
-- Push-статус: PLACEHOLDER
+- Push-статус: ✅ pushed to origin/feat/M-71-egress-cap at `43b9840` (C-163 record).
 - Кэш: ✅ убран (`rm -rf /tmp/hft-critic-m71-r5/target`; эквивалентно выполнен `git clean -fdX -- target`, вывод `Removing target/`).
 
 ## §E — Риски / открытые вопросы
