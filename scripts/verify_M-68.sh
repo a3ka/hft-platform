@@ -102,6 +102,20 @@ fi
 step "C (задача 8) — ресурсный оракул пути L2Delta → depth"
 chk cargo test -p gateway --test red_depth_recompute_cost --quiet
 
+step "C2 (задачи 13,14 — R-134 B-3/B-4) — вырожденный вход и честность счётчика"
+chk cargo test -p gateway --test red_depth_semantics --quiet
+EXPECT_S=3
+N_S=$(grep -cE "^fn md_i8_d(9|10)" crates/gateway/tests/red_depth_semantics.rs || true); N_S=${N_S:-0}
+if [ "${N_S}" -eq "${EXPECT_S}" ]; then
+  echo "PASS: C2 состав набора — ${N_S} оракулов (ожидалось ровно ${EXPECT_S}: d9 d9-C d10)"
+else
+  echo "FAIL: C2 состав набора — ${N_S} при ожидаемых ${EXPECT_S}; порог и набор разошлись"
+  FAIL=$((FAIL + 1))
+fi
+
+step "C3 (задачи 15,16 — решение founder'а о каденции на серию) — каденция управляет и объявлена"
+chk cargo test -p gateway --test red_depth_cadence --quiet
+
 step "D (задача 9) — смена СЕМАНТИКИ объявлена bump'ом GATEWAY_SCHEMA_VERSION"
 # ИМЕННО этот рычаг: `read_and_validate` шаг (3) отвергает чекпоинт при
 # `gw_v != GATEWAY_SCHEMA_VERSION` (`crates/gateway/src/lib.rs:2901-2904`).
