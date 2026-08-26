@@ -1,0 +1,291 @@
+//! RED `PL-I-5` / `VB-I-2` (sacred, architect-only) — **ПРЕДЕЛ ДЕЙСТВУЕТ ОДИНАКОВО НА ОБОИХ
+//! ПУТЯХ, И ПРИНЯТЫЙ ОТВЕТ ПОЛОН.**
+//!
+//! Милестоун `milestones/M-71-egress-cap.md`. Исполнение вердикта
+//! `research/reviews/R-133-M-71-egress-cap-impl.md` (PR-time REJECT, круг 1): блокеры
+//! **B-2** (живой путь усекает там, где библиотечный отказывает), **B-3** (флаг
+//! `history_truncated` захвачен под чужой смысл) и находка **N-3** (щель набора: уровень 1
+//! судит библиотечный `snapshot`, уровень 2 судит БАЙТЫ с сокета, а прод-путь
+//! `resume → pump → snapshot_checked` не судится на ПОЛНОТУ ничем).
+//!
+//! # Решение architect'а, которое эти оракулы пиннят
+//!
+//! Спека допускала два исхода при превышении: явный отказ ИЛИ явно помеченное усечение.
+//! **Выбран ОТКАЗ, одинаково на обоих путях.** Основания:
+//!
+//! 1. `VB-I-2` («живое == перепроигранное») — инвариант FA тронутого модуля
+//!    (`docs/fa/viz-backend.md:189`), и §4.1 спеки прямо запрещает его ослаблять. Усечение
+//!    на ОДНОМ пути ломает равенство немедленно.
+//! 2. Отказ fail-closed: клиент знает, что не получил ничего. Усечение fail-open по
+//!    существу: клиент получает часть, считая её целым. Для продукта, продающего
+//!    доказуемость, это хуже отказа (`PL-I-7`: деградация никогда не выдаётся за норму).
+//! 3. Честное помеченное усечение потребовало бы НОВОГО поля на проводе, а не захвата
+//!    чужого ⇒ смена формы выдачи ⇒ bump `GATEWAY_SCHEMA_VERSION`. Его в ту же версию
+//!    поднимает соседний милестоун `M-68` (8→9) — столкновение на ровном месте.
+//!
+//! # Анти-плацебо: набор красен ПРОТИВ ОБЕИХ крайностей
+//!
+//! `P1`/`P2` краснеют против заглушки «всегда `Ok`» (сегодняшнее усечение) и против
+//! заглушки «всегда `Err`» — последнюю валит КОНТРОЛЬ `P-C1`, идущий первым по той же
+//! причине, по какой контроли идут первыми в `red_egress_cap_wire.rs`: страж, ломающий
+//! честную работу, выключат, и защиты не станет.
+//!
+//! # Что здесь НЕ судится
+//!
+//! Байты, уходящие в сокет — это уровень 2 (`red_egress_cap_wire.rs`). Здесь объект
+//! ОБЪЯВЛЕН: собственные объекты крейта `gateway` на двух его путях. Смешивать единицы
+//! запрещено `A-022`, и здесь они не смешиваются.
+
+use contracts::{to_fixed, DataSource, EventKind, MdPayload, Side, Venue};
+use gateway::{Cursor, LiveReducer, Selector, Snapshot};
+use journal::{EpochFilter, Journal, WriterConfig};
+
+const MID: f64 = 65_000.0;
+const T0: i64 = 1_752_000_000_000;
+
+/// Заведомо ПОД пределом: контроль честной работы.
+const HONEST_TRADES: usize = 200;
+
+/// Заведомо СВЕРХ предела. `M-71` §0: 25 000 сделок дают 2 804 765 Б при пределе 2 000 000.
+const DENSE_TRADES: usize = 25_000;
+
+fn cfg() -> WriterConfig {
+    WriterConfig {
+        max_segment_bytes: 1 << 26,
+        min_free_bytes: 0,
+        source: DataSource::OwnCapture,
+        provenance: "PL-I-5 two-path fixture".to_string(),
+        epoch_id: "own-test".to_string(),
+    }
+}
+
+fn sel() -> Selector {
+    Selector {
+        venue: Venue::Binance,
+        symbol: "BTCUSDT".to_string(),
+        timeframe_ms: 1_000,
+        bands: vec![0.001],
+        window_ms: None,
+    }
+}
+
+/// Журнал из `n` сделок с РАЗНЫМИ ценами — каждая растит ответ предсказуемым шагом.
+/// Ни одного L2-события: heatmap пуст, и предмет — та часть ответа, которую предел
+/// первой редакции не видел вовсе (`C-157` R1).
+fn journal_of_trades(n: usize) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("SETUP: tempdir");
+    let mut j = Journal::open_with(dir.path(), cfg()).expect("SETUP: open_with");
+    for i in 0..n as i64 {
+        j.append(EventKind::md(
+            Venue::Binance,
+            "BTCUSDT",
+            MdPayload::Trade {
+                price: to_fixed(MID + i as f64 * 0.01),
+                size: to_fixed(1.0),
+                side: if i % 2 == 0 { Side::Buy } else { Side::Sell },
+                ts_exch_ms: T0 + i,
+            },
+        ))
+        .expect("SETUP: append");
+    }
+    j.flush().expect("SETUP: flush");
+    dir
+}
+
+/// Библиотечный путь — тот, которым ходят чекпоинтер, shared-tailer, `research-cli`, replay.
+fn lib_path(dir: &std::path::Path) -> std::io::Result<Snapshot> {
+    gateway::snapshot(dir, EpochFilter::OwnCaptureOnly, &sel(), Cursor::LATEST)
+}
+
+/// Размер партии догона. **Не украшение фикстуры, а условие достижимости предмета.**
+///
+/// Первая редакция этого файла качала весь журнал ОДНИМ `pump(usize::MAX)`. На переполненной
+/// фикстуре кадр целиком выходил за предел, `pump` возвращал `Err` — и ветка усечения в
+/// `snapshot_checked` НЕ ДОСТИГАЛАСЬ НИКОГДА. Все четыре оракула были зелены против дефектной
+/// реализации: `P1` проходил по неверной причине, `P2`/`P3` молча пропускали сценарий через
+/// `continue`. Замер, вскрывший это (`n=25 000`):
+///
+/// ```text
+/// lib  = Err(PL-I-5: limit=2000000 observed=2804856)
+/// live = PUMP-ERR(PL-I-5: limit=2000000 observed=2804856)   ← не snapshot_checked!
+/// ```
+///
+/// Мелкая партия делает КАДРЫ малыми, а СОСТОЯНИЕ — большим: ровно то состояние, в котором
+/// живёт дефект `B-2`. Оставляю след, потому что это класс «фикстура не давит на инвариант»,
+/// и поймал его прогон, а не рассуждение (`testing.md`, анти-плацебо).
+const PUMP_BATCH: usize = 256;
+
+/// Чем кончился ПРОД-путь живой сессии. Три исхода РАЗЛИЧАЮТСЯ намеренно: «отказал `pump`» и
+/// «отказал `snapshot_checked`» — разные события, и оракул, который их смешивает, зелен при
+/// недостигнутом предмете (`testing.md`, «Целостность гейта» свойство 3).
+#[derive(Debug)]
+enum Live {
+    PumpRefused(String),
+    SnapshotRefused(String),
+    Served(Box<Snapshot>),
+}
+
+/// ПРОД-путь живой сессии: `resume → pump* → snapshot_checked`. Именно он кладёт байты на
+/// провод в `gateway-serve`, и именно его не исполнял ни один оракул набора (`R-133` N-3).
+fn live_path(dir: &std::path::Path) -> Live {
+    let ckpt = tempfile::tempdir().expect("SETUP: ckpt tempdir");
+    let (mut r, _) = LiveReducer::resume(dir, EpochFilter::OwnCaptureOnly, &sel(), ckpt.path())
+        .unwrap_or_else(|e| setup_failed(&format!("resume не собрался: {e}")));
+    loop {
+        match r.pump(dir, EpochFilter::OwnCaptureOnly, PUMP_BATCH) {
+            Ok((frames, _, _)) if frames.is_empty() => break,
+            Ok(_) => continue,
+            Err(e) => return Live::PumpRefused(e.to_string()),
+        }
+    }
+    match r.snapshot_checked() {
+        Ok(s) => Live::Served(Box::new(s)),
+        Err(e) => Live::SnapshotRefused(e.to_string()),
+    }
+}
+
+/// Диагностика несостоявшегося setup'а — отдельно от вердикта (`testing.md`, «Целостность
+/// гейта» свойство 3: проба, молча тестирующая не тот сценарий, есть плацебо самой себя).
+fn setup_failed(what: &str) -> ! {
+    panic!(
+        "SETUP НЕ СОСТОЯЛСЯ: {what}. Это НЕ вердикт о пределе: фикстура не воспроизвела \
+         сценарий, ради которого оракул написан."
+    )
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+// КОНТРОЛЬ — первым: заглушка «всегда Err» обязана валиться здесь, иначе страж выключат
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+
+/// **P-C1 — честная нагрузка проходит ОБОИМИ путями и даёт ОДИНАКОВЫЙ результат.**
+///
+/// Ловит переширокую реализацию («всегда `Err`»), которая зелена во всех остальных
+/// оракулах этого файла. Ложное КРАСНОЕ дороже пропуска: набор уже болел им дважды
+/// (`M-71` §0ter R2).
+#[test]
+fn pl_i_5_p_c1_honest_load_passes_both_paths_identically() {
+    let dir = journal_of_trades(HONEST_TRADES);
+
+    let lib = lib_path(dir.path())
+        .unwrap_or_else(|e| setup_failed(&format!("честная нагрузка отвергнута lib-путём: {e}")));
+    let Live::Served(live) = live_path(dir.path()) else {
+        setup_failed("честная нагрузка отвергнута live-путём — контроль не на чем ставить")
+    };
+
+    assert_eq!(
+        lib.series.volume_bubbles.len(),
+        live.series.volume_bubbles.len(),
+        "PL-I-5/VB-I-2 P-C1: на ЧЕСТНОЙ нагрузке пути разошлись по составу — lib отдал {} \
+         пузырей, live {}. Живое и перепроигранное обязаны совпадать (VB-I-2, \
+         docs/fa/viz-backend.md:189)",
+        lib.series.volume_bubbles.len(),
+        live.series.volume_bubbles.len()
+    );
+    assert!(
+        !live.series.volume_bubbles.is_empty(),
+        "PL-I-5 P-C1 SETUP: фикстура не произвела ни одного пузыря — сравнивать нечего"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+// ПРЕДМЕТ
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+
+/// **P1 (`R-133` B-2) — ВЕРДИКТ путей совпадает: если lib отказал, live обязан отказать.**
+///
+/// Краснеет против сегодняшней реализации: `LiveReducer::snapshot_checked` при превышении
+/// чистит `volume_bubbles` и возвращает `Ok`, тогда как `gateway::snapshot` на том же
+/// ресурсе даёт `Err` (замер `R-133`: lib `Err(2 804 856 Б)` против live
+/// `Ok(654 765 Б, bubbles 25 000 → 0)`).
+#[test]
+fn pl_i_5_p1_over_cap_is_refused_on_both_paths() {
+    let dir = journal_of_trades(DENSE_TRADES);
+
+    let lib = lib_path(dir.path());
+    if lib.is_ok() {
+        setup_failed(&format!(
+            "{DENSE_TRADES} сделок обслужены lib-путём без отказа — предел недостижимо велик \
+             либо его нет, и сравнивать вердикты не на чем"
+        ));
+    }
+
+    let live = live_path(dir.path());
+    assert!(
+        matches!(live, Live::SnapshotRefused(_)),
+        "PL-I-5/VB-I-2 B-2: lib-путь ОТКАЗАЛ, а live-путь дал {live:?}. Предмет достигнут \
+         только при SnapshotRefused: PumpRefused означает, что кадр не поместился РАНЬШЕ, и \
+         ветка усечения в snapshot_checked не исполнялась (вакуумный оракул — см. PUMP_BATCH); \
+         Served означает молчаливое усечение живого пути, то есть ослабление VB-I-2, которое \
+         §4.1 спеки прямо запрещает"
+    );
+}
+
+/// **P2 (`R-133` B-3) — `history_truncated` означает РОВНО потерю префикса журнала.**
+///
+/// `VB-I-11` (`M-48`) объявляет эквивалентность `history_truncated == (history_start_seq > 0)`;
+/// она записана нормативным комментарием на самом поле (`crates/gateway/src/lib.rs:2490`) и
+/// читается потребителями (`wsprobe.rs:494,506`). Использовать флаг как метку усечения
+/// НАГРУЗКИ — захват чужого смысла: дежурный, увидев его, пойдёт искать несуществующую
+/// проблему с ретеншеном.
+///
+/// Краснеет против сегодняшней реализации: `history_truncated = true` при
+/// `history_start_seq = 0`.
+#[test]
+fn pl_i_5_p2_history_truncated_is_not_hijacked_by_the_cap() {
+    for n in [HONEST_TRADES, DENSE_TRADES] {
+        let dir = journal_of_trades(n);
+        let live_snap = match live_path(dir.path()) {
+            Live::Served(s) => Ok(*s),
+            other => Err(format!("{other:?}")),
+        };
+        for (name, got) in [
+            ("lib", lib_path(dir.path()).map_err(|e| e.to_string())),
+            ("live", live_snap),
+        ] {
+            let Ok(s) = got else { continue };
+            assert_eq!(
+                s.history_truncated,
+                s.history_start_seq > 0,
+                "VB-I-11 B-3 ({name}-путь, {n} сделок): history_truncated={} при \
+                 history_start_seq={}. Эквивалентность «true ⇔ префикс журнала потерян» \
+                 объявлена на самом поле (lib.rs:2490) и читается потребителями. Флаг занят \
+                 под усечение НАГРУЗКИ — это другой смысл, и он делает ответ противоречивым",
+                s.history_truncated,
+                s.history_start_seq
+            );
+        }
+    }
+}
+
+/// **P3 (`R-133` N-3, щель набора) — ПРИНЯТЫЙ ответ ПОЛОН, а не урезан молча.**
+///
+/// Уровень 1 судит библиотечный `snapshot`; уровень 2 судит БАЙТЫ, пришедшие в сокет — и
+/// усечённый ответ проходит его ПО ПОСТРОЕНИЮ, потому что он стал МЕНЬШЕ. Полнота не судится
+/// нигде, и это дало `B-2` прожить мимо зелёного гейта.
+///
+/// **Эталон взят из НЕЗАВИСИМОГО источника — из фикстуры, а не из соседнего пути**
+/// (`testing.md`: «зависимый эталон мутация ловит плохо»). Каждая сделка несёт СВОЮ цену,
+/// значит рождает свой пузырь: журнал из `n` сделок обязан дать ровно `n` пузырей. Замер,
+/// подтверждающий тождество на честной нагрузке: `n=200 → bubbles=200`.
+///
+/// Первая редакция сравнивала live с lib и требовала пары `Ok`/`Ok`. Такая пара при
+/// сегодняшнем дефекте НЕ ВОЗНИКАЕТ (lib отказывает, live отдаёт усечённое), и оракул был
+/// вакуумен — второй экземпляр того же класса в одном файле. След оставлен намеренно.
+#[test]
+fn pl_i_5_p3_accepted_response_is_complete_not_silently_truncated() {
+    for n in [HONEST_TRADES, DENSE_TRADES] {
+        let dir = journal_of_trades(n);
+        let Live::Served(live) = live_path(dir.path()) else {
+            continue; // отказ живого пути — предмет P1, не этого оракула
+        };
+        assert_eq!(
+            live.series.volume_bubbles.len(),
+            n,
+            "PL-I-5 N-3 ({n} сделок): живой путь ОТДАЛ ответ, но в нём {} пузырей вместо {n}. \
+             Значит ответ урезан и выдан за полный: клиент получил часть, считая её целым \
+             (PL-I-7 — деградация не выдаётся за норму). Предел обязан ОТКАЗЫВАТЬ, а не \
+             тихо выбрасывать сущности",
+            live.series.volume_bubbles.len()
+        );
+    }
+}
