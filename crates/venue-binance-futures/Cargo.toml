@@ -1,0 +1,22 @@
+[package]
+name = "venue-binance-futures"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+
+# Адаптер Binance USDT-M перп (fstream). Emitter-not-owner: WS/REST -> parse -> normalize
+# -> MdEvent (Venue::BinanceFutures). seq НЕ проставляет (журнал). M-06: чистые парс-функции
+# (RED-boundary) + async-runner (fstream @depth@100ms/@forceOrder + REST snapshot/OI poll).
+
+[dependencies]
+contracts = { path = "../contracts" }
+book = { path = "../book" }
+ops = { path = "../ops" }
+tokio = { version = "1", features = ["rt", "macros", "time", "sync", "net"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+tracing = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
