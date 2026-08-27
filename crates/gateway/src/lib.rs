@@ -3466,12 +3466,24 @@ impl LiveReducer {
                 // ИЗ persistent-аккумулятора (тот уже обновлён последним apply ниже) — та же
                 // арифметика, что дал бы независимый `frames_since`-вызов на этой границе.
                 let (delta, at_ms) = batch.finish_with_at();
-                // M-71: предел ОБЪЁМА на DELTA-кадр (та же единица `serde_json::to_vec`,
-                // что в `frames_since`). На этом пути клиент получает `Frame` целиком в
-                // `wire_v1::frame_msg` — ограничение обязано стоять здесь, а не только в
-                // библиотечных `snapshot`/`frames_since`. Анти-байпас: live WS-путь
-                // (`gateway-serve` `subscribe → pump → frame`), `C-157` R2 нашёл его
-                // открытым и требует покрытия (`pl_i_4_c_limit_has_no_bypass_across_entry_points`).
+                // M-71 задача 12 (R-139 B-1, VB-I-2): предел ОБЪЁМА на DELTA-кадр (та же
+                // единица `serde_json::to_vec`, что в `frames_since`). На этом пути клиент
+                // получает `Frame` целиком в `wire_v1::frame_msg` — ограничение обязано
+                // стоять здесь, а не только в библиотечных `snapshot`/`frames_since`.
+                // Анти-байпас: live WS-путь (`gateway-serve` `subscribe → pump → frame`),
+                // `C-157` R2 нашёл его открытым и требует покрытия
+                // (`pl_i_4_c_limit_has_no_bypass_across_entry_points`).
+                //
+                // Закладка двигается ВМЕСТЕ с состоянием (`M-71 §4bis.5`, вариант-минимум):
+                // persistent-аккумулятор `self.full`/`self.vwap` уже свёрнут этими
+                // `max_events` событиями в теле цикла — если `enforce_response_limit` ниже
+                // откажет, `self.cursor` обязан быть НА ТОМ ЖЕ seq, что и состояние, иначе
+                // следующий `pump` (все три прод-вызывателя возвращают `LiveReducer` ВНУТРЬ
+                // ветки ошибки: `gateway-serve/src/lib.rs:1240,1656,1764`) перечитает тот же
+                // диапазон и сложит события ПОВТОРНО — расхождение `volume_profile`/`vwap`/
+                // `volume_bubbles` при РАВНОЙ длине сериализации (замер `R-139`: ×4 кратность
+                // после трёх отказов).
+                self.cursor = cursor;
                 enforce_response_limit(&delta, effective_max_response_bytes())?;
                 frames.push(Frame::versioned(batch_from, cursor, delta, at_ms));
                 batch_from = cursor;
@@ -3508,12 +3520,16 @@ impl LiveReducer {
         if batch_consumed > 0 {
             let (delta, at_ms) = batch.finish_with_at();
             // M-71: финальный batch тоже обязан пройти enforce (см. симметричный вызов выше).
+            // Закладка двигается вместе с состоянием — симметрично с границей batch'а выше
+            // (см. комментарий `M-71 §4bis.5` там же): persistent-аккумулятор уже свёрнут,
+            // `self.cursor` обязан стоять на ТОМ ЖЕ seq, иначе отказ оставит состояние
+            // впереди курсора и повторный `pump` применит те же события ЗАНОВО (`R-139` B-1).
+            self.cursor = cursor;
             enforce_response_limit(&delta, effective_max_response_bytes())?;
             frames.push(Frame::versioned(batch_from, cursor, delta, at_ms));
         }
 
-        self.cursor = cursor;
-        Ok((frames, cursor, stats))
+        Ok((frames, self.cursor, stats))
     }
 
     /// Текущий курсор (последний свёрнутый seq, либо `Cursor::START` если ни одного).
