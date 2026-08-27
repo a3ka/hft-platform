@@ -113,6 +113,21 @@ else
   FAIL=$((FAIL + 1))
 fi
 
+step "C3bis (задача 22 — R-138 Б-3) — ручка каденции есть КОНФИГ: доходит, отказывает на мусоре, объявлена в compose"
+chk cargo test -p gateway-serve --test red_depth_cadence_from_env --quiet
+
+# Состав пиннится числом: оракул точки входа состоит из ЧЕТЫРЁХ проверок, и потеря любой
+# делает остальные вакуумными. Без композиции доставки (`knob_is_declared_in_compose`) ручка
+# зелена в юнитах и недоступна оператору — ровно класс, ради которого задача заведена.
+EXPECT_E=4
+N_E=$(grep -cE "^fn [a-z_]+\(\) \{" crates/gateway-serve/tests/red_depth_cadence_from_env.rs || true); N_E=${N_E:-0}
+if [ "${N_E}" -eq "${EXPECT_E}" ]; then
+  echo "PASS: C3bis состав набора — ${N_E} оракулов (ожидалось ровно ${EXPECT_E}: доходит, дефолт≡пусто≡отсутствие, отказ на мусоре, объявлена в compose)"
+else
+  echo "FAIL: C3bis состав набора — ${N_E} при ожидаемых ${EXPECT_E}; порог и набор разошлись"
+  FAIL=$((FAIL + 1))
+fi
+
 step "C3 (задачи 15,16 + C-167) — каденция управляет, объявлена, представима, инвалидирует чекпоинт"
 chk cargo test -p gateway --test red_depth_cadence --quiet
 EXPECT_C=6
