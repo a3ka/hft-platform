@@ -1350,10 +1350,18 @@ pub mod server {
                         }
                         Err(boxed) => {
                             let (live, e, gen_at_pump) = *boxed;
+                            // M-71 (rev6, задача 13 N-1 / `R-139` §4 п.3): не маскировать
+                            // программный отказ (предел объёма, `PL-I-5`) под «sub продолжит
+                            // молча» — это fail-open по существу. Различаем причину по `ErrorKind`,
+                            // чтобы §8 eyes-on видел правду, а не подмену.
+                            let kind = e.kind();
+                            let tag = matches!(kind, io::ErrorKind::Other);
                             tracing::error!(
                                 error = %e,
                                 sub = %id,
-                                "v1 LiveReducer::pump failed — sub продолжит молча"
+                                limit_kind = tag,
+                                "v1 LiveReducer::pump failed ({}) — sub продолжит молча",
+                                if tag { "предел объёма или программная причина" } else { "журнал/IO" }
                             );
                             // Даже на pump-ошибке пробуем вернуть `live` в карту, если sub
                             // всё ещё наш по generation. Иначе просто дропаем.
@@ -1785,12 +1793,26 @@ pub mod server {
                             // обнаружил «чекпоинтер/journal сломался» по логу. `live`
                             // ОБЯЗАН вернуться назад — иначе следующий тик запаникует.
                             live = Some(returned_live);
+                            // M-71 (rev6, задача 13 N-1 / `R-139` §4 п.3, исполнилось в rev6):
+                            // отказ `pump` может прийти как от journal-I/O (правда — журнал
+                            // недоступен), так и от ПРЕДЕЛА ОБЪЁМА ответа (`enforce_response_limit`,
+                            // `PL-I-5`). Прежний текст «журнал недоступен» для обоих случаев —
+                            // ложный диагноз: §8 eyes-on по этому логу искал бы несуществующую
+                            // проблему с журналом, тогда как реальная причина — конфиг предела.
+                            // Различаем по `io::ErrorKind`: предел возвращает `Other` (наша
+                            // `enforce_response_limit` строит `io::Error` без спецвида), journal
+                            // возвращает `io::Error` с реальным `ErrorKind` от ОС. Честный текст
+                            // делает диагноз по логу возможным без сниффикации самого `e`.
+                            let kind = e.kind();
+                            let tag = matches!(kind, io::ErrorKind::Other);
                             tracing::error!(
                                 error = %e,
                                 cursor = ?cursor,
                                 symbol = %cfg.selector.symbol,
                                 venue = ?cfg.selector.venue,
-                                "LiveReducer::pump failed (журнал недоступен) — соединение продолжается, но live-push молчит"
+                                limit_kind = tag,
+                                "LiveReducer::pump failed ({}) — соединение продолжается, но live-push молчит",
+                                if tag { "предел объёма ответа или другая программная причина" } else { "журнал/IO" }
                             );
                             continue;
                         }

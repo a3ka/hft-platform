@@ -3439,7 +3439,7 @@ impl LiveReducer {
         let catalog_in = self.segment_catalog.take();
         let (mut stream, catalog_out) = journal::stream_from_at_with_catalog(
             dir,
-            filter,
+            filter.clone(),
             self.cursor.upto_seq,
             self.tail_hint,
             catalog_in,
@@ -3453,6 +3453,59 @@ impl LiveReducer {
         batch.vwap.sum_v = self.vwap.sum_v;
         let mut batch_consumed = 0_usize;
 
+        // M-71 (rev6, задача 13 / §4bis.5 ПЕРЕПИСАН по `R-140`): ИНВАРИАНТ — после любого
+        // числа отказавших `pump` серия, собранная потребителем из ДОСТАВЛЕННЫХ кадров
+        // (`snapshot(C) + frames` через `Snapshot::apply`), бит-идентична серии из реплея
+        // того же окна журнала. Прежняя реализация (закладка двигалась вместе с
+        // состоянием, `c5bb27b`) ТЕРЯЛА кадры молча: `self.cursor` продвигался ДО
+        // `enforce_response_limit(..)?`, а `frames.push` стоял ПОСЛЕ; клиент получал
+        // часть, считая её целым (замер `R-140`: `25 000 − 24 232 = 768 = 3 × 256` сделок
+        // потеряны; `VB-I-2`/`GW-I-4` нарушены).
+        //
+        // Конструкция: ЧИСТАЯ ТРАНЗАКЦИОННОСТЬ. Per-event применяем только к `batch`;
+        // `self.full` обновляется ТОЛЬКО при успешном commit'е батча. На отказе — `batch`
+        // дискардится, `self.cursor` и `self.full` НЕ продвигаются, `Err` возвращается
+        // КАК ЕСТЬ (без частично собранных кадров). Следующий `pump` перечитывает ТЕ ЖЕ
+        // события из журнала (cursor не сдвинут) и пытается заново. Когда условия
+        // проходят (limit снят) — события коммитятся нормальным проходом.
+        //
+        // Чтобы применить события к `self.full` при commit'е (без хранения `Vec<Event>` —
+        // модульный комментарий крейта запрещает материализацию, `C-021 NOTE-2`),
+        // перечитываем батч из журнала: `journal::stream_from(dir, filter, batch_from)`
+        // отдаёт события с `seq > batch_from.upto_seq` в порядке seq; итерируем до
+        // `cursor.upto_seq` и применяем к `self.full`. Это ЧТЕНИЕ ВТОРОЙ РАЗ для
+        // батча, но `apply` чистая функция (`Reducer::apply` детерминирован,
+        // `GW-I-4`/`VB-I-2`), и коммит идёт с тем же результатом, что и оригинальный
+        // проход.
+        //
+        // Цена: один дополнительный `stream_from` на commit. На проде (256 событий/батч,
+        // журнал в горячем кеше ОС) это микросекунды; путь через ту же `journal::stream`
+        // с тем же фильтром, без нового `segments(...)`-обхода на каждый commit (на
+        // многобатовом прогоне это даёт сегментный skip, см. `stream_from`).
+        let commit_batch = |batch_from: Cursor,
+                            cursor: Cursor,
+                            dir: &Path,
+                            filter: &EpochFilter,
+                            full: &mut Reducer|
+         -> io::Result<()> {
+            if batch_from.upto_seq == cursor.upto_seq {
+                return Ok(());
+            }
+            let target = cursor.upto_seq;
+            let mut re_stream =
+                journal::stream_from(dir, filter.clone(), batch_from.upto_seq)?;
+            for event in &mut re_stream {
+                let event = event?;
+                if let Some(t) = target {
+                    if event.seq > t {
+                        break;
+                    }
+                }
+                full.apply(&event);
+            }
+            Ok(())
+        };
+
         for event in &mut stream {
             let event = event?;
             if self.cursor.upto_seq.is_some_and(|seq| event.seq <= seq) {
@@ -3462,29 +3515,28 @@ impl LiveReducer {
                 break;
             }
             if batch_consumed == max_events {
-                // Закрыть текущий batch кадром; начать следующий СВЕЖИМ reducer'ом, засеянным
-                // ИЗ persistent-аккумулятора (тот уже обновлён последним apply ниже) — та же
-                // арифметика, что дал бы независимый `frames_since`-вызов на этой границе.
-                let (delta, at_ms) = batch.finish_with_at();
-                // M-71 задача 12 (R-139 B-1, VB-I-2): предел ОБЪЁМА на DELTA-кадр (та же
-                // единица `serde_json::to_vec`, что в `frames_since`). На этом пути клиент
-                // получает `Frame` целиком в `wire_v1::frame_msg` — ограничение обязано
-                // стоять здесь, а не только в библиотечных `snapshot`/`frames_since`.
-                // Анти-байпас: live WS-путь (`gateway-serve` `subscribe → pump → frame`),
-                // `C-157` R2 нашёл его открытым и требует покрытия
-                // (`pl_i_4_c_limit_has_no_bypass_across_entry_points`).
+                // Закрыть текущий batch. M-71 (задача 12): предел ОБЪЁМА на DELTA-кадр (та же
+                // единица `serde_json::to_vec`, что в `frames_since`). Анти-байпас: live WS-путь
+                // (`gateway-serve` `subscribe → pump → frame`), `C-157` R2 нашёл его открытым и
+                // требует покрытия (`pl_i_4_c_limit_has_no_bypass_across_entry_points`).
                 //
-                // Закладка двигается ВМЕСТЕ с состоянием (`M-71 §4bis.5`, вариант-минимум):
-                // persistent-аккумулятор `self.full`/`self.vwap` уже свёрнут этими
-                // `max_events` событиями в теле цикла — если `enforce_response_limit` ниже
-                // откажет, `self.cursor` обязан быть НА ТОМ ЖЕ seq, что и состояние, иначе
-                // следующий `pump` (все три прод-вызывателя возвращают `LiveReducer` ВНУТРЬ
-                // ветки ошибки: `gateway-serve/src/lib.rs:1240,1656,1764`) перечитает тот же
-                // диапазон и сложит события ПОВТОРНО — расхождение `volume_profile`/`vwap`/
-                // `volume_bubbles` при РАВНОЙ длине сериализации (замер `R-139`: ×4 кратность
-                // после трёх отказов).
-                self.cursor = cursor;
+                // На границе батча — ТРАНЗАКЦИОННЫЙ commit: per-event `self.full.apply` НЕ
+                // вызывался в цикле (см. §4bis.5 переписан), поэтому commit = применить
+                // события к `self.full` через перечитку из журнала + продвинуть `self.cursor`
+                // + отдать кадр. На отказе — дискардим батч, НЕ продвигаем cursor и self.full,
+                // возвращаем `Err` без частично собранных кадров (потеря кадров есть fail-open,
+                // запрещена `PL-I-7`/`R-133` B-2/B-3 и `R-140`).
+                let (delta, at_ms) = batch.finish_with_at();
+                // Отказ: cursor и self.full не тронуты; следующий pump прочитает те же
+                // события с того же cursor и попытается заново (прозрачный `?`).
                 enforce_response_limit(&delta, effective_max_response_bytes())?;
+                commit_batch(batch_from, cursor, dir, &filter, &mut self.full)?;
+                self.cursor = cursor;
+                // Зеркалим self.full.vwap для следующего батча внутри pump() — иначе новый
+                // батч засеялся бы устаревшим sum_pv/sum_v и эмитил VWAP-точки от нуля, а
+                // не от since-genesis суммы (M-36).
+                self.vwap.sum_pv = self.full.vwap.sum_pv;
+                self.vwap.sum_v = self.full.vwap.sum_v;
                 frames.push(Frame::versioned(batch_from, cursor, delta, at_ms));
                 batch_from = cursor;
                 batch = Reducer::new(&self.selector);
@@ -3492,20 +3544,10 @@ impl LiveReducer {
                 batch.vwap.sum_v = self.vwap.sum_v;
                 batch_consumed = 0;
             }
+            // Per-event: ТОЛЬКО `batch` (НЕ `self.full`). `self.full` обновляется на commit'е.
             batch.apply(&event);
-            // M-54: `full` кормится КАЖДЫМ событием НАПРЯМУЮ, в том же порядке, что и
-            // `batch` — та же per-event оконная эвикция (`Reducer::apply` →
-            // `evict_window_state`), что у независимого реплея. Никакого чтения журнала:
-            // событие уже декодировано этой же итерацией `stream` (та единственная
-            // работа, которую меряет `ReadStats`/O-1) — здесь только CPU-применение
-            // ко ВТОРОМУ in-memory аккумулятору, не второй проход по диску.
-            self.full.apply(&event);
             cursor = Cursor::at(event.seq);
             batch_consumed += 1;
-            // Персистентный аккумулятор обновляется СРАЗУ (не только в конце вызова) — так
-            // следующий batch внутри ЭТОГО ЖЕ pump() стартует с корректной суммой.
-            self.vwap.sum_pv = batch.vwap.sum_pv;
-            self.vwap.sum_v = batch.vwap.sum_v;
         }
         let stats = read_stats_from_stream(&stream);
         // M-57 (TD-109): забираем hint СВОЕЙ сессии из стрима. Если за тик НЕ было
@@ -3519,13 +3561,11 @@ impl LiveReducer {
 
         if batch_consumed > 0 {
             let (delta, at_ms) = batch.finish_with_at();
-            // M-71: финальный batch тоже обязан пройти enforce (см. симметричный вызов выше).
-            // Закладка двигается вместе с состоянием — симметрично с границей batch'а выше
-            // (см. комментарий `M-71 §4bis.5` там же): persistent-аккумулятор уже свёрнут,
-            // `self.cursor` обязан стоять на ТОМ ЖЕ seq, иначе отказ оставит состояние
-            // впереди курсора и повторный `pump` применит те же события ЗАНОВО (`R-139` B-1).
-            self.cursor = cursor;
             enforce_response_limit(&delta, effective_max_response_bytes())?;
+            commit_batch(batch_from, cursor, dir, &filter, &mut self.full)?;
+            self.cursor = cursor;
+            self.vwap.sum_pv = self.full.vwap.sum_pv;
+            self.vwap.sum_v = self.full.vwap.sum_v;
             frames.push(Frame::versioned(batch_from, cursor, delta, at_ms));
         }
 
