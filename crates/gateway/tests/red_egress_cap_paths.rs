@@ -115,6 +115,22 @@ fn lib_path(dir: &std::path::Path) -> std::io::Result<Snapshot> {
 /// и поймал его прогон, а не рассуждение (`testing.md`, анти-плацебо).
 const PUMP_BATCH: usize = 256;
 
+/// Эффективный предел — ПРОЦЕССНОЕ значение (`gateway::set_effective_max_response_bytes`).
+/// Тесты этого файла его читают, а `P4` его ТРОГАЕТ, поэтому все они обязаны идти
+/// ПОСЛЕДОВАТЕЛЬНО — иначе меряют друг друга. Тот же приём и та же причина, что в
+/// `crates/gateway-serve/tests/red_egress_cap_governed.rs:66` и `red_max_subs_config.rs:70`.
+///
+/// **Внесено по ЗАМЕРУ, а не для порядка.** Первая редакция `P4` шла без guard'а, и прогон
+/// показал: `--test-threads=1` роняет ТОЛЬКО `P4` (настоящий дефект), а параллельный прогон
+/// роняет ЕЩЁ и `P1` — то есть новый оракул течёт глобальным состоянием в соседа. Оракул,
+/// роняющий соседей, хуже отсутствующего: он делает набор нечитаемым.
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
 /// Чем кончился ПРОД-путь живой сессии. Три исхода РАЗЛИЧАЮТСЯ намеренно: «отказал `pump`» и
 /// «отказал `snapshot_checked`» — разные события, и оракул, который их смешивает, зелен при
 /// недостигнутом предмете (`testing.md`, «Целостность гейта» свойство 3).
@@ -168,6 +184,7 @@ fn setup_failed(what: &str) -> ! {
 /// (`M-71` §0ter R2).
 #[test]
 fn pl_i_5_p_c1_honest_load_passes_both_paths_identically() {
+    let _g = serial();
     let dir = journal_of_trades(HONEST_TRADES);
 
     let lib = lib_path(dir.path())
@@ -203,6 +220,7 @@ fn pl_i_5_p_c1_honest_load_passes_both_paths_identically() {
 /// `Ok(654 765 Б, bubbles 25 000 → 0)`).
 #[test]
 fn pl_i_5_p1_over_cap_is_refused_on_both_paths() {
+    let _g = serial();
     let dir = journal_of_trades(DENSE_TRADES);
 
     let lib = lib_path(dir.path());
@@ -236,6 +254,7 @@ fn pl_i_5_p1_over_cap_is_refused_on_both_paths() {
 /// `history_start_seq = 0`.
 #[test]
 fn pl_i_5_p2_history_truncated_is_not_hijacked_by_the_cap() {
+    let _g = serial();
     for n in [HONEST_TRADES, DENSE_TRADES] {
         let dir = journal_of_trades(n);
         let live_snap = match live_path(dir.path()) {
@@ -277,6 +296,7 @@ fn pl_i_5_p2_history_truncated_is_not_hijacked_by_the_cap() {
 /// вакуумен — второй экземпляр того же класса в одном файле. След оставлен намеренно.
 #[test]
 fn pl_i_5_p3_accepted_response_is_complete_not_silently_truncated() {
+    let _g = serial();
     for n in [HONEST_TRADES, DENSE_TRADES] {
         let dir = journal_of_trades(n);
         let Live::Served(live) = live_path(dir.path()) else {
@@ -292,4 +312,137 @@ fn pl_i_5_p3_accepted_response_is_complete_not_silently_truncated() {
             live.series.volume_bubbles.len()
         );
     }
+}
+
+/// **P4 — ОТКАЗ НЕ СМЕЕТ ПОРТИТЬ СОСТОЯНИЕ: повторный `pump` не складывает события дважды**
+/// (`R-139` B-1).
+///
+/// # Дефект, ради которого оракул написан
+///
+/// `LiveReducer::pump` кормит ПЕРСИСТЕНТНЫЙ аккумулятор покадрово внутри цикла
+/// (`self.full.apply(&event)`, `self.vwap.sum_* = batch.vwap.sum_*`), а курсор двигает ОДИН
+/// раз в конце (`self.cursor = cursor`). `enforce_response_limit(..)?` стоит МЕЖДУ ними и
+/// выходит из функции. При отказе состояние уехало вперёд, закладка — нет.
+///
+/// Все три прод-вызывателя возвращают редьюсер ВНУТРЬ ветки ошибки
+/// (`gateway-serve/src/lib.rs:1240`, `:1656`, `:1764` — `Err(e) => Err(Box::new((live, e, ..)))`)
+/// и переиспользуют его. Значит следующий `pump` перечитывает те же события от старого
+/// курсора и складывает их ВТОРОЙ раз. Замер `R-139`: три отказа → `volume_profile`
+/// 400 000 000 против правильных 100 000 000, `vwap` разъехался, а ДЛИНА сериализации
+/// совпала до байта (224 646 Б обе) — поэтому набор, судивший длину, был зелен 44/0 два
+/// круга подряд при живом дефекте.
+///
+/// # Почему прежние оракулы этого не видели — щель названа, а не подразумевается
+///
+/// `live_path` (`:134-150`) выходит на ПЕРВОМ `Err` (`return Live::PumpRefused`). Оракул без
+/// повторного вызова слеп к порче по построению: он судит ИСХОД отказа и не судит СОСТОЯНИЕ
+/// после него. Ровно щель, названная `R-133` N-3 и не закрытая двумя кругами.
+///
+/// # Что судится и чем
+///
+/// ЗНАЧЕНИЯ, а не длина — длина при этом дефекте совпадает. Эталон НЕЗАВИСИМ: полный реплей
+/// тем же `gateway::snapshot`, которым живёт `VB-I-2` («живое == перепроигранное»), — другой
+/// путь, а не пересчёт того же состояния (`testing.md`: «зависимый эталон мутация ловит плохо»).
+///
+/// # Конструкцию оракул НЕ выбирает
+///
+/// Транзакционность `pump`, продвижение курсора по последнему состоявшемуся batch'у,
+/// терминальность отказа для сессии — решает реализация. Требование одно: **после отказов
+/// свёрнутое состояние равно тому, что даёт независимый реплей.**
+#[test]
+fn pl_i_5_p4_refused_pump_does_not_double_apply_on_retry() {
+    let _g = serial();
+    let dir = journal_of_trades(DENSE_TRADES);
+
+    // Эталон — НЕЗАВИСИМЫЙ путь, снят ДО всяких отказов и при заведомо достаточном пределе.
+    gateway::set_effective_max_response_bytes(usize::MAX);
+    let reference = lib_path(dir.path())
+        .unwrap_or_else(|e| setup_failed(&format!("эталонный реплей не собрался: {e}")));
+
+    // Крошечный предел — чтобы `pump` ОТКАЗЫВАЛ. Величина не «магическая»: она заведомо
+    // меньше любого delta-кадра на этой фикстуре и заведомо больше нуля (нулевой предел
+    // отвергается стартовым гвардом и судится оракулом D, не здесь).
+    const TINY: usize = 20_000;
+    const RETRIES: usize = 3;
+
+    let ckpt = tempfile::tempdir().expect("SETUP: ckpt tempdir");
+    gateway::set_effective_max_response_bytes(TINY);
+    let (mut r, _) =
+        LiveReducer::resume(dir.path(), EpochFilter::OwnCaptureOnly, &sel(), ckpt.path())
+            .unwrap_or_else(|e| setup_failed(&format!("resume не собрался: {e}")));
+
+    // ПОВТОРНЫЕ вызовы после отказа — то, чего не делал ни один прежний оракул.
+    let mut refusals = 0usize;
+    for _ in 0..RETRIES {
+        match r.pump(dir.path(), EpochFilter::OwnCaptureOnly, PUMP_BATCH) {
+            Err(_) => refusals += 1,
+            Ok(_) => break,
+        }
+    }
+    // SETUP-GUARD: без состоявшихся отказов предмет не воспроизведён, и зелёный тест был бы
+    // плацебо (`testing.md` «Целостность гейта» св. 3).
+    if refusals < RETRIES {
+        setup_failed(&format!(
+            "предмет не воспроизведён: из {RETRIES} попыток отказов {refusals}. Предел {TINY} Б \
+             обязан валить delta-кадр на фикстуре из {DENSE_TRADES} сделок; если он его \
+             пропускает, оракул судит не тот сценарий"
+        ));
+    }
+
+    // Предел поднимаем и ДОГОНЯЕМ ЖУРНАЛ ДО КОНЦА. Без догона сравнение было бы ложным:
+    // после трёх отказов при партии PUMP_BATCH свёрнута лишь часть журнала, и оракул мерил бы
+    // НЕПОЛНОТУ вместо ПОРЧИ. Поймано прогоном первой редакции: она дала 0.03× — состояние
+    // МЕНЬШЕ эталона, тогда как искомый дефект даёт БОЛЬШЕ. След оставлен намеренно: это
+    // ровно класс «оракул мерит не то, что обещает» (`testing.md`).
+    gateway::set_effective_max_response_bytes(usize::MAX);
+    loop {
+        match r.pump(dir.path(), EpochFilter::OwnCaptureOnly, PUMP_BATCH) {
+            Ok((frames, _, _)) if frames.is_empty() => break,
+            Ok(_) => continue,
+            Err(e) => setup_failed(&format!("догон при снятом пределе отказал: {e}")),
+        }
+    }
+    let after = r
+        .snapshot_checked()
+        .unwrap_or_else(|e| setup_failed(&format!("снимок при снятом пределе отвергнут: {e}")));
+
+    // ── ПРЕДМЕТ: значения, а не длина ────────────────────────────────────────────────
+    // Объём профиля — сумма по бинам `(price_e8, volume_e8)` ВСЕХ строк: `VolumeProfileRow`
+    // несёт `bins: Vec<(i64, i64)>`, отдельного поля объёма у строки нет. Форма подсказана
+    // компилятором (`E0609`), а не догадкой.
+    let sum_vp = |s: &gateway::SeriesBundle| -> i128 {
+        s.volume_profile
+            .iter()
+            .flat_map(|r| r.bins.iter())
+            .map(|(_, v)| *v as i128)
+            .sum()
+    };
+    let ref_vp = sum_vp(&reference.series);
+    let got_vp = sum_vp(&after.series);
+    assert_eq!(
+        got_vp,
+        ref_vp,
+        "PL-I-5 P4 (R-139 B-1): после {refusals} ОТКАЗАВШИХ pump суммарный объём профиля \
+         {got_vp} против {ref_vp} у независимого реплея — кратность {:.2}×. Отказ оставил \
+         состояние впереди курсора, и события свернулись повторно. ДЛИНА сериализации при \
+         этом совпадает, поэтому ни один оракул, судивший размер, этого не видит",
+        got_vp as f64 / ref_vp.max(1) as f64
+    );
+    assert_eq!(
+        after.series.vwap, reference.series.vwap,
+        "PL-I-5 P4 (R-139 B-1): VWAP после отказов разошёлся с независимым реплеем. \
+         `VB-I-2` («живое == перепроигранное») ломается не при стечении обстоятельств, \
+         а по построению: `self.vwap.sum_*` двигается покадрово, курсор — в конце"
+    );
+    assert_eq!(
+        after.series.volume_bubbles.len(),
+        reference.series.volume_bubbles.len(),
+        "PL-I-5 P4 (R-139 B-1): число пузырей после отказов не совпало с реплеем — события \
+         свёрнуты повторно"
+    );
+
+    // Возврат процессного значения к подписанной норме: guard защищает от параллельных
+    // тестов, но оставлять глобальное состояние сдвинутым после себя нельзя — следующий
+    // тест этого файла имеет право на чистое окружение.
+    gateway::set_effective_max_response_bytes(gateway::DEFAULT_MAX_RESPONSE_BYTES);
 }
