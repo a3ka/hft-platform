@@ -446,3 +446,138 @@ fn pl_i_5_p4_refused_pump_does_not_double_apply_on_retry() {
     // тест этого файла имеет право на чистое окружение.
     gateway::set_effective_max_response_bytes(gateway::DEFAULT_MAX_RESPONSE_BYTES);
 }
+
+/// **P5 — СЕРИЯ ПОТРЕБИТЕЛЯ, а не состояние сервера: отказ не смеет ТЕРЯТЬ кадры**
+/// (`R-140`, круг 3).
+///
+/// # Почему `P4` этого не ловит и почему одного его мало
+///
+/// `P4` судит `r.snapshot_checked()` — состояние СЕРВЕРА. Оно после круга 3 верно
+/// (`1.00×`), и `P4` зелен. Но клиент собирает свою серию из ДОСТАВЛЕННЫХ кадров, а кадр,
+/// на котором сработал предел, не доставляется НИКОГДА: `self.cursor` двигается ДО
+/// `enforce_response_limit(..)?` (`crates/gateway/src/lib.rs:3486`, `:3527`), а `frames.push`
+/// стоит ПОСЛЕ (`:3488`, `:3529`). События помечены потреблёнными, кадра нет.
+///
+/// Три прод-вызывателя кадры при отказе выбрасывают
+/// (`crates/gateway-serve/src/lib.rs:1240`, `:1656`, `:1764`), ресинка снапшотом на
+/// push-канале нет (`:1815`), а `Snapshot::apply` (`:1499`) непрерывность
+/// `frame.from ↔ frame.to` не проверяет — дыра проходит молча. Замер `R-140`:
+/// `25 000 − 24 232 = 768 = 3 × 256` сделок не придут никогда, клиентская серия `0.9693×`
+/// реплея ПРИ ИСПРАВНОМ СЕРВЕРЕ.
+///
+/// # Что судится
+///
+/// `VB-I-2` (`docs/fa/viz-backend.md:189`) — «серия, посчитанная на live-хвосте,
+/// **бит-идентична** серии из replay того же окна». Инвариант милестоуна (§4bis.5, переписан
+/// по `R-140`): **после любого числа отказавших `pump` серия, собранная из ДОСТАВЛЕННЫХ
+/// кадров, бит-идентична реплею того же окна.** Прежняя редакция инварианта говорила о
+/// серверном аккумуляторе — это сужение и есть корень находки круга 3.
+///
+/// # Анти-плацебо: `P5` ОДНОСТОРОНЕН, и это названо ЗАМЕРОМ, а не оценкой
+///
+/// Первая редакция этого комментария утверждала, что `P5` падает против ОБЕИХ поломок.
+/// **Замер опроверг:** против реализации круга 2 (двойная свёртка) `P5` — `ok`, красен
+/// только `P4`. Причина в конструкции самого оракула: цикл отказов выходит по первому `Ok`,
+/// поэтому повторная свёртка серверного аккумулятора до потребительских кадров в этой
+/// фикстуре не доезжает.
+///
+/// Двусторонность даёт ПАРА, и порознь ни один из двух не достаточен:
+/// · `P4` — состояние СЕРВЕРА: красен против двойной свёртки (круг 2), зелен против потери;
+/// · `P5` — серия ПОТРЕБИТЕЛЯ: красен против потери кадров (круг 3), зелен против двойной.
+/// Удаление любого из них снимает половину защиты молча. Шаг `A4` гейта пиннит состав
+/// числом именно поэтому.
+///
+/// # Конструкцию оракул НЕ выбирает
+///
+/// Дробление партии, терминальность подписки с ресинком снапшотом — решает реализация
+/// (§4bis.5). Требование одно: то, что СОБРАЛ клиент, равно реплею.
+#[test]
+fn pl_i_5_p5_delivered_frames_reconstruct_the_replay_series() {
+    let _g = serial();
+    let dir = journal_of_trades(DENSE_TRADES);
+
+    // Эталон — НЕЗАВИСИМЫЙ путь (полный реплей), снят при заведомо достаточном пределе.
+    gateway::set_effective_max_response_bytes(usize::MAX);
+    let reference = lib_path(dir.path())
+        .unwrap_or_else(|e| setup_failed(&format!("эталонный реплей не собрался: {e}")));
+
+    const TINY: usize = 20_000;
+    const RETRIES: usize = 3;
+
+    let ckpt = tempfile::tempdir().expect("SETUP: ckpt tempdir");
+    // Стартовый снапшот потребителя снимается ДО отказов и при достаточном пределе: это
+    // `snapshot(C)`, с которого клиент начинает и на который кладёт кадры.
+    let (mut r, _) =
+        LiveReducer::resume(dir.path(), EpochFilter::OwnCaptureOnly, &sel(), ckpt.path())
+            .unwrap_or_else(|e| setup_failed(&format!("resume не собрался: {e}")));
+    let mut consumer = r
+        .snapshot_checked()
+        .unwrap_or_else(|e| setup_failed(&format!("стартовый снимок потребителя отвергнут: {e}")));
+
+    // ── Фаза отказов: клиент получает ТОЛЬКО те кадры, что реально отданы ────────────
+    gateway::set_effective_max_response_bytes(TINY);
+    let mut refusals = 0usize;
+    for _ in 0..RETRIES {
+        match r.pump(dir.path(), EpochFilter::OwnCaptureOnly, PUMP_BATCH) {
+            Ok((frames, _, _)) => {
+                for f in &frames {
+                    consumer.apply(f);
+                }
+                break;
+            }
+            Err(_) => refusals += 1, // кадров НЕТ — клиенту не досталось ничего
+        }
+    }
+    if refusals < RETRIES {
+        setup_failed(&format!(
+            "предмет не воспроизведён: из {RETRIES} попыток отказов {refusals}. Предел \
+             {TINY} Б обязан валить delta-кадр на фикстуре из {DENSE_TRADES} сделок"
+        ));
+    }
+
+    // ── Фаза догона при снятом пределе: всё, что сервер ещё отдаст, клиент применяет ──
+    gateway::set_effective_max_response_bytes(usize::MAX);
+    loop {
+        match r.pump(dir.path(), EpochFilter::OwnCaptureOnly, PUMP_BATCH) {
+            Ok((frames, _, _)) if frames.is_empty() => break,
+            Ok((frames, _, _)) => {
+                for f in &frames {
+                    consumer.apply(f);
+                }
+            }
+            Err(e) => setup_failed(&format!("догон при снятом пределе отказал: {e}")),
+        }
+    }
+
+    // ── ПРЕДМЕТ: то, что СОБРАЛ клиент, равно реплею ─────────────────────────────────
+    let sum_vp = |s: &gateway::SeriesBundle| -> i128 {
+        s.volume_profile
+            .iter()
+            .flat_map(|r| r.bins.iter())
+            .map(|(_, v)| *v as i128)
+            .sum()
+    };
+    let ref_vp = sum_vp(&reference.series);
+    let got_vp = sum_vp(&consumer.series);
+    assert_eq!(
+        got_vp,
+        ref_vp,
+        "PL-I-5 P5 / VB-I-2 (R-140): серия, СОБРАННАЯ КЛИЕНТОМ из доставленных кадров, несёт \
+         объём {got_vp} против {ref_vp} у независимого реплея — {:.4}× при {refusals} \
+         отказавших pump. Сервер при этом может быть исправен (P4 зелен): предмет здесь — \
+         ПРОВОД. Меньше единицы — кадры потеряны безвозвратно (курсор двинулся, кадра нет); \
+         больше — события свёрнуты повторно. VB-I-2 требует БИТ-ИДЕНТИЧНОСТИ, а не «не хуже»",
+        got_vp as f64 / ref_vp.max(1) as f64
+    );
+    assert_eq!(
+        consumer.series.volume_bubbles.len(),
+        reference.series.volume_bubbles.len(),
+        "PL-I-5 P5 (R-140): клиент собрал {} пузырей против {} у реплея — разница {} \
+         событий, не доехавших до потребителя ни одним кадром",
+        consumer.series.volume_bubbles.len(),
+        reference.series.volume_bubbles.len(),
+        reference.series.volume_bubbles.len() as i64 - consumer.series.volume_bubbles.len() as i64
+    );
+
+    gateway::set_effective_max_response_bytes(gateway::DEFAULT_MAX_RESPONSE_BYTES);
+}
