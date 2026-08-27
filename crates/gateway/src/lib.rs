@@ -2056,6 +2056,38 @@ pub fn validate_selector(sel: &Selector) -> io::Result<()> {
             ));
         }
     }
+    // M-68 задача 17 (d14, C-167): невалидная каденция депт-серии отвергается, а не
+    // схлопывается молча. Проводная форма DepthRow.series/HeatmapCell ключуется секундами
+    // (DepthRow.series:Vec<(time_s, …)>, HeatmapCell.time_s, bucket_time_s делит на 1000
+    // целочисленно) — подсекундный интервал даёт ОДИН ключ в секунду без сообщения, и
+    // оператор получает вдесятеро меньше данных, чем просил (тот же класс, что GW-I-14
+    // закрыл для `GATEWAY_WINDOW_MS`). Требуется: ms > 0, ms >= 1000 (>= 1 с),
+    // 86_400_000 % ms == 0 (выравнивание на границу UTC-суток — та же норма, что GW-I-10
+    // для `timeframe_ms`).
+    if let Some(ms) = sel.depth_cadence_ms {
+        if ms < 1000 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "MD-I-8 d14 (C-167): selector.depth_cadence_ms={ms} подсекундная — \
+                     проводная форма ключуется секундами (DepthRow.series — time_s, \
+                     HeatmapCell.time_s, bucket_time_s делит на 1000), значит \
+                     подсекундный интервал даёт ОДИН ключ в секунду молча. Невалидная \
+                     конфигурация обязана быть ОТКАЗОМ — класс GW-I-14. Требуется >= 1000 \
+                     и 86_400_000 % ms == 0"
+                ),
+            ));
+        }
+        if 86_400_000 % ms != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "MD-I-8 d14: selector.depth_cadence_ms={ms} не выравнен на границу \
+                     UTC-суток (требуется > 0 и 86_400_000 % ms == 0)"
+                ),
+            ));
+        }
+    }
     Ok(())
 }
 
