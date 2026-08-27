@@ -15,6 +15,7 @@
 use std::collections::BTreeMap;
 use std::io;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use contracts::{Event, EventKind, Level, MdEvent, MdPayload, Side, Venue};
 use journal::EpochFilter;
@@ -72,6 +73,45 @@ pub const GATEWAY_SCHEMA_VERSION: u32 = 8;
 /// §5.1 называет 2 000 000 как предложение founder'а; конструкция (один
 /// `enforce_response_limit`, вызов из шести строителей) от числа НЕ зависит.
 pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 2_000_000;
+
+/// M-71 (`milestones/M-71-egress-cap.md` §4bis.2): эффективное значение предела,
+/// которое читают точки применения в `gateway` (`enforce_response_limit`). Заводится
+/// ЗДЕСЬ — в крейте, где предел ПРИМЕНЯЕТСЯ — по образцу `EFFECTIVE_MAX_SUBS` /
+/// `EFFECTIVE_GRACE_MS` (`crates/gateway-serve/src/lib.rs:194-210` / `:213-228`), но
+/// в ДРУГОМ крейте, потому что цикл зависимостей запрещает `gateway` звать
+/// `gateway-serve`. Поле `ServeConfig` не добавляется по той же причине, что и там:
+/// литерал `ServeConfig { .. }` живёт в девяти файлах `crates/gateway-serve/tests/**`
+/// (sacred-зона architect'а), и поле сломало бы их все.
+///
+/// **Семантика (`A-026` §2):** процессное эффективное значение, last-write-wins.
+/// Единственный ПРОД-вызыватель сеттера — `gateway_serve::serve_config_from_env`,
+/// один раз на старте, ПОСЛЕ успешного разбора env. Тесты — легитимные вызыватели
+/// (тот же приём, что у соседей: sacred-набор `red_egress_cap_governed.rs::N1a`,
+/// `N1b`, `N1-D`, `N1-E` переустанавливают значение под `serial()`). Внутрипроцессный
+/// запрет рантайм-смены типом (`OnceLock`/`Err` на второй вызов) в этой конструкции
+/// непинним — это часть «в» требования моста, вынесена долгом (`A-026` §3bis,
+/// `TECH-DEBT` пишет reviewer).
+///
+/// **Safety-несущая половина** (часть «а» по `A-026` §2): при `Err` разбора env
+/// значение НЕ устанавливается — пиннится оракулом `N1-E`. Класс «parse-error →
+/// чужое/сброшенное эффективное значение», тот же, что `GW-I-14` чинил для окна.
+static EFFECTIVE_MAX_RESPONSE_BYTES: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_RESPONSE_BYTES);
+
+/// Получить эффективный предел объёма ответа в байтах сериализованной `SeriesBundle`.
+/// Дефолт — `DEFAULT_MAX_RESPONSE_BYTES` (`П-020`).
+///
+/// Читается на каждом `snapshot`/`frames_since`/`pump`/`snapshot_checked`/
+/// `snapshot_from_checkpoint`-вызове через `enforce_response_limit`.
+pub fn effective_max_response_bytes() -> usize {
+    EFFECTIVE_MAX_RESPONSE_BYTES.load(Ordering::Relaxed)
+}
+
+/// Установить эффективный предел. Вызывается из `gateway_serve::serve_config_from_env`
+/// один раз после успешного разбора env (или из sacred-тестов под `serial()` —
+/// `red_egress_cap_governed.rs`). См. замечания на `EFFECTIVE_MAX_RESPONSE_BYTES`.
+pub fn set_effective_max_response_bytes(n: usize) {
+    EFFECTIVE_MAX_RESPONSE_BYTES.store(n, Ordering::Relaxed);
+}
 
 /// M-38b (TD-044, GW-I-9): версия ВНУТРЕННЕГО формата чекпоинта. Независима от
 /// `GATEWAY_SCHEMA_VERSION` (форма провода не меняется, меняется скорость её получения):
@@ -2010,7 +2050,7 @@ pub fn snapshot(
     // M-71 (PL-I-5, `milestones/M-71-egress-cap.md` §5): предел ОБЪЁМА ответа,
     // fail-closed. Здесь — уровень 1 (анти-байпас: 4 потребителя строят `Selector`
     // мимо транспорта — чекпоинтер M-38b, shared-tailer, `research-cli`, replay).
-    enforce_response_limit(&series, DEFAULT_MAX_RESPONSE_BYTES)?;
+    enforce_response_limit(&series, effective_max_response_bytes())?;
     // M-48 (TD-048, VB-I-11): провенанс истории берётся из ПЕРВОГО свёрнутого события
     // (НЕ из `header.first_seq` — у legacy он синтезирован нулём, TD-030). На полном
     // журнале первый свёрнутый seq = 0 ⇒ `history_truncated = false`; на усечённом —
@@ -2067,7 +2107,7 @@ pub fn frames_since(
     // M-71: предел ОБЪЁМА ответа — DELTA-кадр, как и снапшот, есть ТЕЛО wire-сообщения
     // (`Frame` сериализуется в `wire_v1::frame_msg` целиком, `C-158` R1: 2 804 666 Б на
     // плотных сделках).
-    enforce_response_limit(&delta, DEFAULT_MAX_RESPONSE_BYTES)?;
+    enforce_response_limit(&delta, effective_max_response_bytes())?;
     Ok((vec![Frame::versioned(after, cursor, delta, at_ms)], cursor))
 }
 
@@ -2132,7 +2172,7 @@ pub fn frames_since_with_stats(
     }
     // M-71: seek-bound вариант несёт ТОТ ЖЕ `Frame.delta`, что `frames_since`; предел
     // применяется одинаково (анти-байпас: две функции, один инвариант).
-    enforce_response_limit(&delta, DEFAULT_MAX_RESPONSE_BYTES)?;
+    enforce_response_limit(&delta, effective_max_response_bytes())?;
     Ok((
         vec![Frame::versioned(after, cursor, delta, at_ms)],
         cursor,
@@ -2159,7 +2199,7 @@ pub fn replay(
     }
     // M-71: replay-кадр — тот же DELTA-wire-объект (через `wire_v1::frame_msg`), что
     // `frames_since`; предел единый.
-    enforce_response_limit(&delta, DEFAULT_MAX_RESPONSE_BYTES)?;
+    enforce_response_limit(&delta, effective_max_response_bytes())?;
     Ok(vec![Frame::versioned(from, cursor, delta, at_ms)])
 }
 
@@ -2290,7 +2330,7 @@ pub fn snapshot_from_checkpoint(
             // M-71: предел ОБЪЁМА на построенный `Snapshot`. Чекпоинт-путь (PRIMARY на
             // проде, см. `docker-compose.yml`) ОБЯЗАН enforce'ить так же, как прямой
             // `snapshot` — иначе replay-от-чекпоинта дал бы дыру с другой стороны.
-            enforce_response_limit(&series, DEFAULT_MAX_RESPONSE_BYTES)?;
+            enforce_response_limit(&series, effective_max_response_bytes())?;
             // M-48 (VB-I-11): провенанс истории ПЕРЕСИМ от чекпоинта, не вычисляем
             // из хвостовых событий (D2: `red_checkpoint_bootstrap_truncated
             // ::advance_after_covered_prune_does_not_regress_history_start`).
@@ -2316,7 +2356,7 @@ pub fn snapshot_from_checkpoint(
     // Re-read stats AFTER iteration (счётчики инкрементируются в `next()`).
     let stats = read_stats_from_stream(&stream);
     // M-71: rebuild-ветка так же обязана enforce'ить предел (анти-байпас).
-    enforce_response_limit(&series, DEFAULT_MAX_RESPONSE_BYTES)?;
+    enforce_response_limit(&series, effective_max_response_bytes())?;
     Ok((
         Snapshot {
             schema_version: GATEWAY_SCHEMA_VERSION,
@@ -3432,7 +3472,7 @@ impl LiveReducer {
                 // библиотечных `snapshot`/`frames_since`. Анти-байпас: live WS-путь
                 // (`gateway-serve` `subscribe → pump → frame`), `C-157` R2 нашёл его
                 // открытым и требует покрытия (`pl_i_4_c_limit_has_no_bypass_across_entry_points`).
-                enforce_response_limit(&delta, DEFAULT_MAX_RESPONSE_BYTES)?;
+                enforce_response_limit(&delta, effective_max_response_bytes())?;
                 frames.push(Frame::versioned(batch_from, cursor, delta, at_ms));
                 batch_from = cursor;
                 batch = Reducer::new(&self.selector);
@@ -3468,7 +3508,7 @@ impl LiveReducer {
         if batch_consumed > 0 {
             let (delta, at_ms) = batch.finish_with_at();
             // M-71: финальный batch тоже обязан пройти enforce (см. симметричный вызов выше).
-            enforce_response_limit(&delta, DEFAULT_MAX_RESPONSE_BYTES)?;
+            enforce_response_limit(&delta, effective_max_response_bytes())?;
             frames.push(Frame::versioned(batch_from, cursor, delta, at_ms));
         }
 
@@ -3524,7 +3564,7 @@ impl LiveReducer {
     /// `M-48`) восстанавливается этим изменением: флаг никогда не трогается здесь.
     pub fn snapshot_checked(&self) -> io::Result<Snapshot> {
         let snap = self.snapshot();
-        enforce_response_limit(&snap.series, DEFAULT_MAX_RESPONSE_BYTES)?;
+        enforce_response_limit(&snap.series, effective_max_response_bytes())?;
         Ok(snap)
     }
 }

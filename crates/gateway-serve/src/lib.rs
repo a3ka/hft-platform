@@ -227,28 +227,22 @@ pub mod server {
         EFFECTIVE_GRACE_MS.store(ms, Ordering::Relaxed);
     }
 
-    /// M-71 (`milestones/M-71-egress-cap.md` §5): runtime-эффективный предел объёма
-    /// ответа в байтах сериализованной `SeriesBundle` (`serde_json::to_vec`).
-    /// Дефолт — `gateway::DEFAULT_MAX_RESPONSE_BYTES` (founder-owned; спека §5.1
-    /// предлагает 2 000 000). Хранение через atomic — а не поле `ServeConfig` — по
-    /// той же причине, что для `EFFECTIVE_MAX_SUBS`/`EFFECTIVE_GRACE_MS` выше: добавление
-    /// поля сломало бы существующие тесты с фиксированной формой литерала `ServeConfig
-    /// { .. }`. `serve_config_from_env` обновляет значение ровно один раз при старте;
-    /// fail-closed на невалидном env (через `Err`).
-    static EFFECTIVE_MAX_RESPONSE_BYTES: AtomicUsize =
-        AtomicUsize::new(gateway::DEFAULT_MAX_RESPONSE_BYTES);
-
-    /// Получить runtime-предел объёма ответа (читается на каждом `snapshot`/`frames_since`/
-    /// `pump`-вызове, см. `enforce_response_limit`).
-    pub fn effective_max_response_bytes() -> usize {
-        EFFECTIVE_MAX_RESPONSE_BYTES.load(Ordering::Relaxed)
-    }
-
-    /// Установить runtime-предел (вызывается из `serve_config_from_env` и тестов).
-    pub fn set_effective_max_response_bytes(n: usize) {
-        EFFECTIVE_MAX_RESPONSE_BYTES.store(n, Ordering::Relaxed);
-    }
-
+    /// M-71 (`milestones/M-71-egress-cap.md` §4bis.2 rev7): предел объёма ответа живёт в
+    /// `crates/gateway` (см. `gateway::effective_max_response_bytes` / геттер-сеттер
+    /// в `gateway`), там же, где он ПРИМЕНЯЕТСЯ (`enforce_response_limit` зовётся
+    /// шестью строителями). Здесь, в `gateway-serve`, хранить его НЕГДЕ —
+    /// `ServeConfig` конструируется литералом в девяти sacred-тестах
+    /// `crates/gateway-serve/tests/**`, и добавление поля сломало бы их все
+    /// (`C-166` B-1). Прежняя пара серверных функций для предела имела ноль читателей
+    /// (`R-133` B-1 built-not-wired) и док-строку, описывающую чтение на каждом вызове —
+    /// ложь того же класса, что чинит `C4` в `M-68`. СНЕСЕНА тем же коммитом, что
+    /// переехал значение в `gateway`.
+    ///
+    /// Прод-вызыватель — `serve_config_from_env` ниже, ОДИН раз после успешного разбора env.
+    /// При `Err` разбора сеттер НЕ зовётся — пиннится оракулом `N1-E`. Внутрипроцессный
+    /// запрет рантайм-смены типом в этой конструкции непинним (контрпример — сам sacred-набор
+    /// `N1-C`/`N1a`/`N1b`/`N1-D`/`N1-E`); часть «в» требования моста вынесена долгом
+    /// (`A-026` §3bis).
     use crate::_gw::Selector;
     use futures_util::{SinkExt, StreamExt};
     use journal::EpochFilter;
@@ -775,10 +769,8 @@ pub mod server {
                         let msg = match &e {
                             wire_v1::SelectorError::UnknownVenue(name) => {
                                 if name.chars().count() > MAX_VENUE_ECHO {
-                                    let truncated: String = name
-                                        .chars()
-                                        .take(MAX_VENUE_ECHO)
-                                        .collect();
+                                    let truncated: String =
+                                        name.chars().take(MAX_VENUE_ECHO).collect();
                                     format!(
                                         "unknown venue: {}… (truncated, original {} bytes)",
                                         truncated,
@@ -793,7 +785,8 @@ pub mod server {
                                 // источник эха — `serde_json::from_value` иногда суёт в сообщение
                                 // фрагменты пользовательского ввода).
                                 if s.chars().count() > MAX_VENUE_ECHO {
-                                    let truncated: String = s.chars().take(MAX_VENUE_ECHO).collect();
+                                    let truncated: String =
+                                        s.chars().take(MAX_VENUE_ECHO).collect();
                                     format!(
                                         "{}… (truncated, original {} bytes)",
                                         truncated,
@@ -2168,7 +2161,10 @@ pub fn serve_config_from_env(
             }
         }
     };
-    server::set_effective_max_response_bytes(max_response_bytes);
+    // M-71 §4bis.2: сеттер зовётся СТРОГО ПОСЛЕ успешного разбора — все ветки отказа
+    // выше делают `return Err(...)` ДО этой строки. Класс GW-I-14/R7: отвергнутая
+    // конфигурация не смеет управлять сервисом. Пиннится оракулом `N1-E`.
+    gateway::set_effective_max_response_bytes(max_response_bytes);
 
     Ok(server::ServeConfig {
         addr,
