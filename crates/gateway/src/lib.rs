@@ -3536,6 +3536,15 @@ impl LiveReducer {
         batch.vwap.sum_pv = self.vwap.sum_pv;
         batch.vwap.sum_v = self.vwap.sum_v;
         let mut batch_consumed = 0_usize;
+        // M-68 задача 14 (d10, R-134 B-4): `depth_levels_visited` — семантика ПО ВЫЗОВУ
+        // на ВСЕХ путях, включая `pump`. `self.full` — персистентный аккумулятор, его
+        // `depth_levels_visited` МОНОТОННО растёт с самого начала сессии (или с момента
+        // resume от чекпоинта). Без дельты здесь `ReadStats::depth_levels_visited` несёт
+        // кумулятив — суммирование двух таких отчётов (impl Add / ReadStats::sum) даёт
+        // перечёт, что ломает инвариант складываемости структуры. Снимаем счётчик ДО
+        // цикла apply и считаем дельту ПОСЛЕ — стандартный приём per-call метрики на
+        // персистентном аккумуляторе.
+        let depth_before = self.full.depth_levels_visited();
 
         for event in &mut stream {
             let event = event?;
@@ -3575,8 +3584,12 @@ impl LiveReducer {
         // M-68 (TD-158): счётчик `depth_levels_visited` берём из `self.full` (персистентный
         // аккумулятор, кормится КАЖДЫМ событием в pump'е); batch'и временные и сбрасываются
         // между кадрами — у `batch` счётчик был бы ПОТЕРЯН на finish+recreate. `self.full`
-        // аккумулирует с самого начала сессии.
-        let stats = read_stats_from_stream(&stream, self.full.depth_levels_visited());
+        // аккумулирует с самого начала сессии — для per-call семантики в `ReadStats`
+        // берём ДЕЛЬТУ за этот pump (см. `depth_before` в начале цикла; задача 14, d10,
+        // R-134 B-4): `ReadStats` объявлена складываемой (`impl Add`, `ReadStats::sum`),
+        // кумулятивное поле в ней давало бы квадратичный перечёт при сложении тиков.
+        let depth_after = self.full.depth_levels_visited();
+        let stats = read_stats_from_stream(&stream, depth_after - depth_before);
         // M-57 (TD-109): забираем hint СВОЕЙ сессии из стрима. Если за тик НЕ было
         // ни одного декодированного события в активном сегменте (backlog пуст,
         // `stream.tail_hint()` вернёт `None`), НЕ сбрасываем старый hint — он всё ещё
