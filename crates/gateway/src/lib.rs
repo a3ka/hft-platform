@@ -3492,8 +3492,7 @@ impl LiveReducer {
                 return Ok(());
             }
             let target = cursor.upto_seq;
-            let mut re_stream =
-                journal::stream_from(dir, filter.clone(), batch_from.upto_seq)?;
+            let mut re_stream = journal::stream_from(dir, filter.clone(), batch_from.upto_seq)?;
             for event in &mut re_stream {
                 let event = event?;
                 if let Some(t) = target {
