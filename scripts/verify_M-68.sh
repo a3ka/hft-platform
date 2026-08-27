@@ -115,10 +115,10 @@ fi
 
 step "C3 (задачи 15,16 + C-167) — каденция управляет, объявлена, представима, инвалидирует чекпоинт"
 chk cargo test -p gateway --test red_depth_cadence --quiet
-EXPECT_C=5
-N_C=$(grep -cE "^fn md_i8_d1[23456]" crates/gateway/tests/red_depth_cadence.rs || true); N_C=${N_C:-0}
+EXPECT_C=6
+N_C=$(grep -cE "^fn md_i8_d1[234567]" crates/gateway/tests/red_depth_cadence.rs || true); N_C=${N_C:-0}
 if [ "${N_C}" -eq "${EXPECT_C}" ]; then
-  echo "PASS: C3 состав набора — ${N_C} оракулов (ожидалось ровно ${EXPECT_C}: d12 d13 d14 d15 d16)"
+  echo "PASS: C3 состав набора — ${N_C} оракулов (ожидалось ровно ${EXPECT_C}: d12 d13 d14 d15 d16 d17)"
 else
   echo "FAIL: C3 состав набора — ${N_C} при ожидаемых ${EXPECT_C}; порог и набор разошлись"
   FAIL=$((FAIL + 1))
