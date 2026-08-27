@@ -2243,6 +2243,42 @@ pub fn validate_selector(sel: &Selector) -> io::Result<()> {
                 ),
             ));
         }
+        // M-68 rev6, задача 21 (R-138 Б-2): гвард ОТНОШЕНИЯ параметров каденции и таймфрейма.
+        // Фильтр каденции работает по `time_s`, УЖЕ выровненному на `timeframe_ms`
+        // (`recompute_depth_from_book`: `time_s % cadence_s != 0`); эффективная частота при
+        // `cadence_ms >= timeframe_ms` есть НОК(timeframe_s, cadence_s) — и если
+        // `cadence_ms % timeframe_ms != 0`, она РАСХОДИТСЯ с заявленной. Выдача объявляет
+        // `depth_cadence_ms` селектора, и расхождение читалось бы меткой как ложь
+        // (`П-014` п.2: «выдача обязана ЭТО НАЗЫВАТЬ, а не умалчивать»). Здесь — вариант А
+        // решения (рекомендация §0sexies.2quater): гвард отношения отвергает
+        // РАССОГЛАСОВАННУЮ пару (`GW-I-14`, тот же класс fail-closed, что у `GW-I-10`).
+        //
+        // При `cadence_ms < timeframe_ms` гвард НЕ применяется: фильтр становится
+        // вырожденным (cadence_s=0..timeframe_s-1, событий на бакет >= 1), и выдача
+        // фактически равна плотной серии — отдельный предмет, здесь не решается.
+        //
+        // Пара (timeframe=1000, cadence=10000) — VANTAGE `d17`, ОБЯЗАНА проходить:
+        // `10000 >= 1000`, `10000 % 1000 == 0` — guard_accept. Пара (3000, 10000) —
+        // SUBJECT `d17`, ОБЯЗАНА быть отвергнута: `10000 >= 3000`, `10000 % 3000 == 1000`
+        // — guard_reject. Суб-кейс `999` НЕ включён (он зелен по чужой причине,
+        // `86_400_000 % 999 != 0` — отвергается гвардом d14 выше): урок A-025 §3.
+        if ms >= sel.timeframe_ms && ms % sel.timeframe_ms != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "MD-I-8 d17 (R-138 Б-2): selector.depth_cadence_ms={ms} не выравнен на \
+                     timeframe_ms={} (cadence_ms % timeframe_ms = {} != 0). При \
+                     cadence_ms >= timeframe_ms эффективная частота есть \
+                     НОК(timeframe, cadence) — она РАСХОДИТСЯ с заявленной \
+                     depth_cadence_ms={ms}, и метка выдачи лжёт ровно на величину \
+                     расхождения (П-014 п.2: деградация не выдаётся за норму). Требуется \
+                     cadence_ms >= timeframe_ms && cadence_ms % timeframe_ms == 0 — тот \
+                     же класс fail-closed, что GW-I-14 для window_ms",
+                    sel.timeframe_ms,
+                    ms % sel.timeframe_ms
+                ),
+            ));
+        }
     }
     Ok(())
 }
