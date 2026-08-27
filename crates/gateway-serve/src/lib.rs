@@ -2104,8 +2104,13 @@ pub fn serve_config_from_env(
     // невалидность лимита = отказ, не unbounded»; `GW-I-14` для окна — тот же класс).
     //
     // Поведение по форме ЗНАЧЕНИЯ (восемь кейсов `red_egress_cap_startup.rs`):
-    //   * отсутствие ИЛИ пустая строка ⇒ `gateway::DEFAULT_MAX_RESPONSE_BYTES` + warn,
-    //     по той же асимметрии, что `A-015` для `MAX_SUBSCRIPTIONS` (дефолт не отказ);
+    //   * отсутствие ИЛИ пустое/пробельное (после `trim`) — ОДНО неполное состояние одной
+    //     конфигурации (`A-015` §3 п.1, `A-026` §1): `gateway::DEFAULT_MAX_RESPONSE_BYTES`
+    //     + warn. Основание тождества — `A-015` §3 п.1; прецеденты — оба соседа
+    //     (`red_max_subs_config.rs::empty_var_is_same_as_absent`,
+    //     `red_window_guard_startup.rs::offline_forms_still_start`). На проде ветка мертва
+    //     в обе стороны (`docker-compose.yml:150` несёт форму `${:-2000000}`, подставляющую
+    //     дефолт и на unset, и на пустое).
     //   * валидное положительное число в `usize` ⇒ записать в atomic;
     //   * `0` — отказ (нулевой предел делает сервис неработоспособным);
     //   * `-N`, `2000000.0`, `2_000_000`, `2000000bytes`, мусор, переполнение
@@ -2114,30 +2119,17 @@ pub fn serve_config_from_env(
     let raw = get("GATEWAY_MAX_RESPONSE_BYTES");
     let trimmed = raw.as_deref().map(str::trim);
     let max_response_bytes: usize = match trimmed {
-        // ОТСУТСТВИЕ переменной — легитимный default (как `GATEWAY_WINDOW_MS`,
-        // `GATEWAY_MAX_SUBSCRIPTIONS`).
-        None => {
+        // ОТСУТСТВИЕ переменной ИЛИ пустое/пробельное (после `trim`) — ОДНО неполное
+        // состояние одной конфигурации (`A-015` §3 п.1).
+        None | Some("") => {
             tracing::warn!(
-                "GATEWAY_MAX_RESPONSE_BYTES not set (переменная отсутствует); \
+                "GATEWAY_MAX_RESPONSE_BYTES is absent or blank (raw={:?}); \
                  GATEWAY_MAX_RESPONSE_BYTES={} — подписанная норма (founder 2026-08-26, \
-                 milestones/M-71-egress-cap.md §5.1), PL-I-5",
+                 П-020, milestones/M-71-egress-cap.md §5.1), PL-I-5",
+                raw,
                 gateway::DEFAULT_MAX_RESPONSE_BYTES,
             );
             gateway::DEFAULT_MAX_RESPONSE_BYTES
-        }
-        // ПУСТАЯ строка — отличается от отсутствия (`red_egress_cap_startup
-        // ::empty_limit_blocks_startup`): это «переменная задана с пустым содержимым»,
-        // `PL-I-5` прямо требует отказ. Парсер `parse::<usize>()` пропустил бы пустую
-        // строку как ошибку парсинга, но явный отказ с понятным сообщением лучше —
-        // оператор видит, что именно не так.
-        Some("") => {
-            return Err(
-                "GATEWAY_MAX_RESPONSE_BYTES is set but empty — переменная задана с \
-                 невалидным содержимым (PL-I-5: отсутствие/невалидность лимита = \
-                 отказ, не unbounded). Удалите переменную для default или задайте \
-                 положительное целое число байтов."
-                    .to_string(),
-            );
         }
         Some(s) => {
             // `parse::<usize>()` отвергает отрицательные и нечисловые значения. Но
