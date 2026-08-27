@@ -3514,19 +3514,17 @@ impl LiveReducer {
     /// `PL-I-5`/`GW-I-14` останутся без защиты (это тот дыра, который `C-157` R2
     /// предъявил в первой редакции; теперь закрыта тем же `enforce_response_limit`, что и
     /// остальные 5 строителей).
+    ///
+    /// **Fail-closed, одинаково на обоих путях** (`M-71` §4bis.1, `R-133` B-2/B-3, `VB-I-2`,
+    /// `VB-I-11`). Превышение предела — явный `Err`; молчаливое усечение
+    /// (`volume_bubbles.clear()` + `history_truncated = true`) СНЯТО: оно ломало
+    /// `VB-I-2` (live ≠ replay) и захватывало `history_truncated` под чужой смысл
+    /// (флаг означает потерю префикса журнала, не усечение полезной нагрузки). Эквивалентность
+    /// `history_truncated == (history_start_seq > 0)` (`crates/gateway/src/lib.rs:2490`,
+    /// `M-48`) восстанавливается этим изменением: флаг никогда не трогается здесь.
     pub fn snapshot_checked(&self) -> io::Result<Snapshot> {
         let snap = self.snapshot();
-        if enforce_response_limit(&snap.series, DEFAULT_MAX_RESPONSE_BYTES).is_ok() {
-            return Ok(snap);
-        }
-        // PL-I-7: нельзя молча усекать. Разрешено: явный отказ ИЛИ явное помеченное
-        // усечение. Здесь применяем второе — volume_bubbles (основной вклад массы при
-        // плотных сделках) обнуляется, флаг `history_truncated` ставится. Повторная
-        // проверка enforce_response_limit: если и после обрезки не уложилось — Err.
-        let mut truncated = snap;
-        truncated.series.volume_bubbles.clear();
-        truncated.history_truncated = true;
-        enforce_response_limit(&truncated.series, DEFAULT_MAX_RESPONSE_BYTES)?;
-        Ok(truncated)
+        enforce_response_limit(&snap.series, DEFAULT_MAX_RESPONSE_BYTES)?;
+        Ok(snap)
     }
 }
