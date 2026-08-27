@@ -1148,6 +1148,21 @@ impl Reducer {
     /// невычислимы, `depth_reach_*` остаются прежними (то же поведение, что прежний
     /// `depth_within` с `None` mid).
     fn recompute_depth_from_book(&mut self, time_s: i64) {
+        // M-68 задача 15 (d12): каденция депт-серии — СВОЙ интервал, ведомый ВРЕМЕНЕМ
+        // СОБЫТИЯ (не wall-clock — иначе VB-I-2 live==replay рушится). При
+        // `Some(ms)` числа и охват обновляются ТОЛЬКО когда `time_s % (ms/1000) == 0`
+        // (граница каденции). На остальных событиях — `return` ДО чтения книги: ни
+        // `depth[].values`, ни `depth_reach_*` не трогаем. Метка описывает то же
+        // наблюдение, что и числа (задача 7, §2bis — ранний возврат обязателен с обеих
+        // сторон, иначе reach и числа расходятся как наблюдения).
+        if let Some(ms) = self.selector.depth_cadence_ms {
+            // ms уже провалидирован в `validate_selector` (ms >= 1000, делит 86_400_000),
+            // значит деление целое и безопасно.
+            let cadence_s = ms / 1000;
+            if time_s % cadence_s != 0 {
+                return;
+            }
+        }
         let bid_levels = self.book.levels(Side::Buy);
         let ask_levels = self.book.levels(Side::Sell);
         let Some(mid) = HeatmapBucketState::mid_from(&bid_levels, &ask_levels) else {
