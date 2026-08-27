@@ -1811,6 +1811,16 @@ pub fn build_selector(
 ///   называющим `GATEWAY_WINDOW_MS` (PL-I-5 риск R7; урок TD-020/TD-039, прод-дефолт
 ///   `60000` остаётся рабочим — `docker-compose.yml`). Иначе `Some(W_ms>0)` → bounded-
 ///   window reducer (анти-TD-020: без активного W прод-снапшот ООМ-ит).
+/// - `GATEWAY_DEPTH_CADENCE_MS` — M-68 задача 22 (R-138 Б-3, решение founder'а
+///   2026-08-27: «против вшивания в код того, что потом может меняться; выносить
+///   наружу»). Политика пустого/пробельного/отсутствия ОДНА (`A-015` §3 п.1 +
+///   `A-026` §1 для соседней ручки) — подписанный дефолт 1000 мс. Поведение прода
+///   НЕ меняется: прод-таймфрейм 1000 мс, и `cadence = 1000` фильтрует ровно те же
+///   события, что сегодняшнее `None`. Невалидное (`abc`, `-1`, `0`, `1000.0`,
+///   `1_000`, `999`) ⇒ `Err` на старте с сообщением, называющим
+///   `GATEWAY_DEPTH_CADENCE_MS`. Переменная ОБЪЯВЛЕНА в `docker-compose.yml` —
+///   иначе ручка оператору недоступна, как бы юнит-оракулы ни были зелены
+///   (`red_depth_cadence_from_env::knob_is_declared_in_compose`).
 pub fn serve_config_from_env(
     get: impl Fn(&str) -> Option<String>,
 ) -> Result<server::ServeConfig, String> {
@@ -2004,11 +2014,95 @@ pub fn serve_config_from_env(
     };
     server::set_effective_grace_ms(grace_ms);
 
+    // M-68 rev6, задача 22 (R-138 Б-3, решение founder'а 2026-08-27): `GATEWAY_DEPTH_CADENCE_MS`
+    // — КОНФИГ, а не константа. Основание founder'а дословно: «против вшивания в код того, что
+    // потом может меняться; выносить наружу». Проводка env → селектор.
+    //
+    // Политика пустого/пробельного/отсутствия — ОДИН исход: подписанный дефолт
+    // `DEFAULT_CADENCE_MS` (1000 мс). Основание — `A-015` §3 п.1, подтверждено `A-026` §1 для
+    // соседней ручки того же сервиса: «поведение прода не имеет права зависеть от того, КАК
+    // её забыли задать». Пробельная форма (`" "`, `"	"`) берётся отдельно от пустой —
+    // `trim().is_empty()` против `is_empty()`; обе дают дефолт.
+    //
+    // Невалидное значение (мусор, `0`, `-1`, `1000.0`, `1_000`, `999`) ⇒ отказ СТАРТА с
+    // сообщением, называющим `GATEWAY_DEPTH_CADENCE_MS` (класс GW-I-14). Парс — `match`
+    // против `.ok()`, а не `.ok_or_else` — `999` отвергается порогом `>= 1000` гварда
+    // `validate_selector` (`ms < 1000`), `1000.0`/`1_000` отвергаются парсером i64;
+    // ошибки ОБОИХ классов названы и сводятся в один исход.
+    //
+    // Поведение прода НЕ меняется: прод-таймфрейм `GATEWAY_TIMEFRAME_MS:-1000`
+    // (`docker-compose.yml`); `cadence = 1000` фильтрует РОВНО те же события и даёт РОВНО
+    // те же ключи `time_s`, что сегодняшнее `depth_cadence_ms: None` (после РОЛЛОВЕРа из
+    // задачи 12, `time_s % 1 == 0` для всех time_s ⇒ фильтр пропускает всё, и каждое
+    // событие обновляет глубину — то же поведение, что было до).
+    //
+    // Сигнатуру `build_selector` НЕ расширяем — у неё три вызывателя, и один из них
+    // sacred-тест architect'а (`red_serve_window_wiring.rs`); правка ПОСЛЕ сборки селектора
+    // (`let mut selector = build_selector(...); selector.depth_cadence_ms = parsed;`) —
+    // путь, не задевающий сигнатуру.
+    const DEFAULT_CADENCE_MS: i64 = 1_000;
+    let raw_cadence = get("GATEWAY_DEPTH_CADENCE_MS");
+    let trimmed_cadence = raw_cadence.as_deref().map(str::trim);
+    let depth_cadence_ms: Option<i64> = match trimmed_cadence {
+        // A-015 §3 п.1: отсутствие И пустое И пробельное — ОДНО неполное состояние с
+        // ОДНИМ исходом. Пробельная форма отделена от `""` намеренно: реализация с
+        // `is_empty()` зелена против первой и красна против второй — `A-026` §1 постановил
+        // оба как ОДИН путь, и тест `absent_cadence_yields_signed_default` их судит вместе.
+        None => Some(DEFAULT_CADENCE_MS),
+        Some("") => Some(DEFAULT_CADENCE_MS),
+        Some(s) if s.trim().is_empty() => Some(DEFAULT_CADENCE_MS),
+        Some(s) => {
+            let trimmed = s.trim();
+            match trimmed.parse::<i64>() {
+                Ok(ms) if ms >= 1000 && 86_400_000 % ms == 0 => Some(ms),
+                Ok(ms) if ms >= 1000 && 86_400_000 % ms != 0 => {
+                    return Err(format!(
+                        "GATEWAY_DEPTH_CADENCE_MS={ms} не выравнен на границу UTC-суток \
+                         (требуется 86_400_000 % GATEWAY_DEPTH_CADENCE_MS == 0; иначе \
+                         подсекундные/нестандартные значения дают схлопывание ключей — \
+                         тот же класс, что GW-I-14 для window_ms; см. MD-I-8 d14)"
+                    ));
+                }
+                Ok(ms) if ms < 1000 => {
+                    return Err(format!(
+                        "GATEWAY_DEPTH_CADENCE_MS={ms} подсекундная — проводная форма \
+                         ключуется секундами (DepthRow.series — time_s), подсекундный \
+                         интервал даёт ОДИН ключ в секунду молча. Требуется >= 1000; \
+                         см. MD-I-8 d14 (C-167)"
+                    ));
+                }
+                Ok(ms) => {
+                    // ms == 0 или иное невалидное значение по общей семантике.
+                    return Err(format!(
+                        "GATEWAY_DEPTH_CADENCE_MS={ms} невалидно: должно быть >= 1000 \
+                         и выравнено на границу UTC-суток (86_400_000 % ms == 0); \
+                         получено {trimmed:?}"
+                    ));
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "GATEWAY_DEPTH_CADENCE_MS={trimmed:?} не парсится как i64 ({e}) — \
+                         опечатка в `.env` (мусор/суффикс/научная нотация/дробное/\
+                         переполнение), а не сигнал к дефолту; оператор обязан задать \
+                         валидное значение или unset/пусто/пробельное для дефолта"
+                    ));
+                }
+            }
+        }
+    };
+
+    // Селектор собирается `build_selector` БЕЗ `depth_cadence_ms` (поле `None`),
+    // затем дописывается ПОСЛЕ сборки — сигнатура `build_selector` не меняется
+    // (carve-out зоны, см. §0sexies.2quinquies). Поле публичное, тип T2 — менять
+    // структуру вне зоны engine-dev'а запрещено (A-024 O-1 его ввёл).
+    let mut selector = build_selector(venue, symbol, timeframe_ms, bands, window_ms);
+    selector.depth_cadence_ms = depth_cadence_ms;
+
     Ok(server::ServeConfig {
         addr,
         journal_dir,
         filter: EpochFilter::OwnCaptureOnly,
-        selector: build_selector(venue, symbol, timeframe_ms, bands, window_ms),
+        selector,
         decoding_key: DecodingKey::from_secret(secret.as_bytes()),
         checkpoint_dir,
     })
