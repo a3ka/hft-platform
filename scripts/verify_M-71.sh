@@ -162,8 +162,30 @@ if [ "${BASE_GREEN}" -ne 0 ]; then
 elif ! grep -q "${ANCHOR}" crates/gateway/src/lib.rs 2>/dev/null; then
   echo "FAIL: C SETUP НЕ СОСТОЯЛСЯ — якоря мутации '${ANCHOR}' в реализации НЕТ"
   FAIL=$((FAIL + 1))
-elif ! cp -a crates Cargo.toml Cargo.lock "${MUT}/" 2>/dev/null; then
+elif ! cp -a crates Cargo.toml Cargo.lock rust-toolchain.toml "${MUT}/" 2>/dev/null; then
   echo "FAIL: C SETUP НЕ СОСТОЯЛСЯ — копия дерева не собралась"
+  FAIL=$((FAIL + 1))
+elif [ "$(cd "${MUT}" && cargo --version 2>/dev/null)" != "$(cargo --version 2>/dev/null)" ]; then
+  # СТОРОЖ ТУЛЧЕЙНА (`C-171`, исполнение). Мало скопировать `rust-toolchain.toml` — надо
+  # НАБЛЮДАТЬ его отсутствие, иначе класс вернётся молча в следующем скрипте
+  # (`testing.md` §«Целостность гейта» св. 4: «Наблюдает ОТСУТСТВИЕ, не только сбой»).
+  #
+  # ЧТО БЫЛО. Строка выше (введена `5b017f9`, задача 7) копировала только
+  # `crates Cargo.toml Cargo.lock`. Копия без пина резолвит `cargo` по системному дефолту:
+  # замер `C-171`, воспроизведён architect'ом — 1.94.1 в копии против 1.97.0 в репозитории
+  # (`rust-toolchain.toml` channel = "1.97.0", `ci.yml` — dtolnay/rust-toolchain@1.97.0).
+  # То есть мутационный контроль — анти-плацебо ВСЕГО набора — судил ДРУГИМ компилятором,
+  # чем прод-гейт. Ровно класс `TD-035`: «green local ≠ green CI».
+  #
+  # ПОЧЕМУ СРАВНЕНИЕ, А НЕ `test -f`. Наличие файла не доказывает, что тулчейн ВЗВЁЛСЯ:
+  # он может быть не установлен, перекрыт `RUSTUP_TOOLCHAIN`, или `rustup` отсутствовать
+  # вовсе. Меряется РЕЗУЛЬТАТ (`cargo --version` в копии против репозитория), а не прокси
+  # (`testing.md`: «оракул границы ресурса меряет ресурс, а не прокси»).
+  echo "FAIL: C SETUP НЕ СОСТОЯЛСЯ — тулчейн копии РАСХОДИТСЯ с репозиторием."
+  echo "      в копии:        $(cd "${MUT}" && cargo --version 2>&1)"
+  echo "      в репозитории:  $(cargo --version 2>&1)"
+  echo "      Мутационный контроль обязан идти тем же компилятором, что CI (TD-035);"
+  echo "      иначе его вывод — свойство хоста, а не набора."
   FAIL=$((FAIL + 1))
 else
   perl -0pi -e 's/(MUT-ANCHOR M-71-LIMIT.*?\n\s*fn enforce_response_limit\([^\n]*\{\n)/$1        return Ok(());\n/s' \
