@@ -674,6 +674,20 @@ struct Reducer {
     /// атомарный (`scripts/check_resource_oracles.sh`): состояние живёт в `Reducer`,
     /// процесс-локально, без `static`/`thread_local!` (`C-097` R3/R10).
     depth_levels_visited: u64,
+    /// M-68 rev6, задача 12 (`R-138` Б-1): ключ (time_s / cadence_s) ПОСЛЕДНЕГО
+    /// обработанного L2-события с заданной каденцией. None до первого такого события;
+    /// Some(bucket) — после. Используется для детекта ЗАКРЫТИЯ каденс-интервала:
+    /// когда новый bucket отличается от этого, ПРЕДЫДУЩИЙ интервал только что закрылся,
+    /// и его CLOSE-значение пишется в `depth[].values` по состоянию книги ДО обновления
+    /// новым событием (см. `maybe_commit_depth_interval` в `apply()`).
+    ///
+    /// Конструкция — РОЛЛОВЕР (§0sexies.2ter): вычисление значения интервала происходит
+    /// ОДИН раз — когда каденс-ключ следующего события отличается от текущего (интервал
+    /// закрылся); незакрытый последний интервал сбрасывается на `finish_with_at`.
+    /// Стоимость — одно чтение книги на интервал (а не на каждое событие, как у наивного
+    /// пути «снять early-return и считать на каждом тике», который стирает экономию,
+    /// ради которой каденция заведена).
+    depth_cadence_current_bucket: Option<i64>,
 }
 
 /// M-23: per-bucket book snapshot для heatmap. Хранит bids/asks отдельно (Vec<(price,size)>) +
@@ -738,6 +752,11 @@ impl Reducer {
             // принимает все полосы разом — задача 8, `d6a`/`d6b`). Сбрасывается на нуль в
             // `new()`, аккумулируется через `apply` → `depth_from_book`.
             depth_levels_visited: 0,
+            // M-68 rev6, задача 12 (R-138 Б-1): РОЛЛОВЕР каденс-интервала. До первого
+            // L2-события с заданной каденцией ключ не задан; инициализируется в первом
+            // вызове `apply()` через `maybe_commit_depth_interval` (None → Some(bucket)
+            // без коммита — закрывать нечего).
+            depth_cadence_current_bucket: None,
         }
     }
 
@@ -1041,12 +1060,20 @@ impl Reducer {
                 asks,
                 ts_exch_ms,
             } => {
-                // M-23: применить к L2Delta-реконструированной книге (replace), обновить
-                // heatmap-бакет для close-семантики.
-                self.book.apply_snapshot(bids, asks);
                 let Some(time_s) = self.bucket_time_s(*ts_exch_ms) else {
                     return;
                 };
+                // M-68 rev6, задача 12 (R-138 Б-1): РОЛЛОВЕР каденс-интервала.
+                // ПЕРЕД обновлением книги проверяем, не сменился ли каденс-ключ. Если
+                // сменился — ПРЕДЫДУЩИЙ интервал закрылся, и его CLOSE-значение пишется
+                // по СОСТОЯНИЮ КНИГИ НА ТОТ МОМЕНТ (то есть последнему наблюдению
+                // ЗАКРЫВАЕМОГО интервала — новый снапшот ещё не применён, `apply_snapshot`
+                // ниже). Без этой строки фильтр бы взял ПЕРВОЕ событие интервала, и
+                // значение точки расходилось с heatmap close-семантикой (§0sexies.2bis).
+                self.maybe_commit_depth_interval(time_s);
+                // M-23: применить к L2Delta-реконструированной книге (replace), обновить
+                // heatmap-бакет для close-семантики.
+                self.book.apply_snapshot(bids, asks);
                 self.refresh_heatmap_bucket(time_s);
                 // M-68 (TD-158): депт-серия пересчитывается на КАЖДОМ L2-событии, не только
                 // на снимке. Снимок и дельта — одна точка проводки (`recompute_depth_from_book`),
@@ -1061,13 +1088,19 @@ impl Reducer {
                 ts_exch_ms,
                 ..
             } => {
+                let Some(time_s) = self.bucket_time_s(*ts_exch_ms) else {
+                    return;
+                };
+                // M-68 rev6, задача 12: РОЛЛОВЕР каденс-интервала для L2Delta — симметрично
+                // L2Snapshot. Дельта может сменить bucket раньше снимка; close-значение
+                // предыдущего интервала обязано лечь до `apply_delta` (иначе для дельты
+                // значения были бы последним состоянием delta-книги, а не последним
+                // состоянием ПРЕДЫДУЩЕГО интервала).
+                self.maybe_commit_depth_interval(time_s);
                 // M-23: L2Delta ВЕТКА — зеркалит venue (M-29 `apply_delta`): size==0 → remove,
                 // size>0 → upsert. Обновляет книгу + heatmap-бакет И (M-68, TD-158) полосы +
                 // охват: депт-серия больше НЕ snapshot-only, источник ОДИН с heatmap.
                 self.book.apply_delta(bids, asks);
-                let Some(time_s) = self.bucket_time_s(*ts_exch_ms) else {
-                    return;
-                };
                 self.refresh_heatmap_bucket(time_s);
                 // M-68: депт-серия пересчитывается и на дельте. `ensure_depth_rows_initialized`
                 // идемпотентен — `depth` уже мог быть заведён первым же снимком; если нет
@@ -1152,21 +1185,21 @@ impl Reducer {
     /// не измерение со значением `0` (значение `0` утверждало бы глубину внутри
     /// несуществующего интервала, смешивая "глубина пуста" и "мерить не от чего").
     fn recompute_depth_from_book(&mut self, time_s: i64) {
-        // M-68 задача 15 (d12): каденция депт-серии — СВОЙ интервал, ведомый ВРЕМЕНЕМ
-        // СОБЫТИЯ (не wall-clock — иначе VB-I-2 live==replay рушится). При
-        // `Some(ms)` числа и охват обновляются ТОЛЬКО когда `time_s % (ms/1000) == 0`
-        // (граница каденции). На остальных событиях — `return` ДО чтения книги: ни
-        // `depth[].values`, ни `depth_reach_*` не трогаем. Метка описывает то же
-        // наблюдение, что и числа (задача 7, §2bis — ранний возврат обязателен с обеих
-        // сторон, иначе reach и числа расходятся как наблюдения).
-        if let Some(ms) = self.selector.depth_cadence_ms {
-            // ms уже провалидирован в `validate_selector` (ms >= 1000, делит 86_400_000),
-            // значит деление целое и безопасно.
-            let cadence_s = ms / 1000;
-            if time_s % cadence_s != 0 {
-                return;
-            }
+        // M-68 rev6, задача 12 (R-138 Б-1): В режиме каденции числа и охват обновляются
+        // ТОЛЬКО на закрытии интервала (`maybe_commit_depth_interval` в `apply()`),
+        // конструкция РОЛЛОВЕРа. На остальных событиях — NO-OP: ни `depth[].values`,
+        // ни `depth_reach_*` НЕ трогаем. Стоимость — ОДНО чтение книги на интервал,
+        // а не на каждое событие (наивный путь «снять early-return и считать на каждом
+        // тике» стирал бы экономию, ради которой каденция заведена — проба достижимости
+        // architect'а: red_depth_cadence 5/0, red_depth_semantics 3/0 на обоих путях,
+        // свойство стоимости НЕ пиннит ни один оракул — пробел, названный открытым
+        // долгом №1 «свойство стоимости не пиннится»).
+        if self.selector.depth_cadence_ms.is_some() {
+            return;
         }
+        // Без каденции: legacy-путь — на КАЖДОМ L2-событии пересчёт и запись в
+        // `depth[].values[time_s]` плюс охват с того же наблюдения. `time_s` уже
+        // выровнен на `timeframe_ms` (`bucket_time_s`); точка пишется в бакет.
         let bid_levels = self.book.levels(Side::Buy);
         let ask_levels = self.book.levels(Side::Sell);
         let Some(mid) = HeatmapBucketState::mid_from(&bid_levels, &ask_levels) else {
@@ -1199,6 +1232,91 @@ impl Reducer {
         self.depth_reach_ask = self.book.max_reach_pct(Side::Sell).unwrap_or(0.0);
     }
 
+    /// M-68 rev6, задача 12 (R-138 Б-1): РОЛЛОВЕР каденс-интервала (§0sexies.2ter).
+    ///
+    /// Вызывается из `apply()` ПЕРЕД `self.book.apply_snapshot` / `apply_delta`. Если
+    /// каденс-ключ (`time_s / cadence_s`) текущего события отличается от ключа
+    /// предыдущего, значит ПРЕДЫДУЩИЙ интервал только что закрылся, и его CLOSE-значение
+    /// должно быть записано. Книга ещё хранит состояние ЗАКРЫВАЕМОГО интервала
+    /// (новое событие не применено) ⇒ читаем её и фиксируем значение.
+    ///
+    /// Вычисление значения происходит ОДИН раз на закрытии — стоимость прежняя,
+    /// одно чтение книги на интервал. Незакрытый последний интервал сбрасывается
+    /// в `flush_pending_depth_interval` (вызывается из `finish_with_at`).
+    ///
+    /// Первый вызов (после `None`) инициализирует ключ и НЕ коммитит — закрывать
+    /// нечего.
+    fn maybe_commit_depth_interval(&mut self, time_s: i64) {
+        let Some(ms) = self.selector.depth_cadence_ms else {
+            return;
+        };
+        // ms уже провалидирован в `validate_selector` (ms >= 1000, делит 86_400_000),
+        // значит деление целое и безопасно.
+        let cadence_s = ms / 1000;
+        let new_bucket = time_s / cadence_s;
+        if let Some(prev_bucket) = self.depth_cadence_current_bucket {
+            if new_bucket != prev_bucket {
+                self.commit_depth_at(prev_bucket * cadence_s);
+            }
+        }
+        self.depth_cadence_current_bucket = Some(new_bucket);
+    }
+
+    /// M-68 rev6, задача 12: записать CLOSE-значение каденс-интервала по состоянию книги
+    /// НА ТОТ МОМЕНТ (книга ещё не обновлена новым событием). Записывает суммы полос и
+    /// охват (`depth_reach_*`) от ОДНОГО наблюдения — иначе метка описывала бы не то,
+    /// из чего взяты числа (§2bis, d7).
+    ///
+    /// Односторонняя книга — early-return без записи: пороги полос невычислимы, и
+    /// отсутствие точки остаётся отсутствием (R-134 B-3).
+    fn commit_depth_at(&mut self, key_time_s: i64) {
+        let bid_levels = self.book.levels(Side::Buy);
+        let ask_levels = self.book.levels(Side::Sell);
+        let Some(mid) = HeatmapBucketState::mid_from(&bid_levels, &ask_levels) else {
+            return;
+        };
+        let bands = &self.selector.bands;
+        let (bid_sums, bid_count) = self.depth_from_book(&bid_levels, mid, Side::Buy, bands);
+        let (ask_sums, ask_count) = self.depth_from_book(&ask_levels, mid, Side::Sell, bands);
+        self.depth_levels_visited += bid_count + ask_count;
+        for row in self.depth.iter_mut() {
+            let Some(band_idx) = bands
+                .iter()
+                .position(|&b| (b * 1e8).round() as i64 == row.band_pct_e8)
+            else {
+                continue;
+            };
+            let sum = match row.side {
+                Side::Buy => bid_sums[band_idx],
+                Side::Sell => ask_sums[band_idx],
+            };
+            row.values.insert(key_time_s, sum);
+        }
+        // Охват — на ТОМ ЖЕ наблюдении, что и числа (§2bis, d7). `max_reach_pct` —
+        // O(1) (`keys().next_back()` для bid, `next()` для ask; `crates/book/src/lib.rs`).
+        self.depth_reach_bid = self.book.max_reach_pct(Side::Buy).unwrap_or(0.0);
+        self.depth_reach_ask = self.book.max_reach_pct(Side::Sell).unwrap_or(0.0);
+    }
+
+    /// M-68 rev6, задача 12: сбросить незакрытый последний каденс-интервал на `finish`
+    /// (§0sexies.2ter). Вызывается из `finish_with_at` (мутабельный путь владеет self).
+    /// Без этой строки последний интервал (тот, что не закрыт следующим событием)
+    /// пропадал бы из выдачи.
+    fn flush_pending_depth_interval(&mut self) {
+        let Some(bucket) = self.depth_cadence_current_bucket else {
+            return;
+        };
+        let Some(ms) = self.selector.depth_cadence_ms else {
+            return;
+        };
+        let cadence_s = ms / 1000;
+        self.commit_depth_at(bucket * cadence_s);
+        // После сброса ключ «не задан» — следующее `apply` инициализирует его заново.
+        // Защита от двойного коммита в этом же `finish` (на случай, если finish вызовут
+        // дважды — сейчас такого нет, но барьер дешёвый и страхует от регрессии).
+        self.depth_cadence_current_bucket = None;
+    }
+
     /// M-56 (`TD-097`, task #1): `finish(self)` теперь ТОЛЬКО обёртка над `finish_ref(&self)` —
     /// вся формула (OHLCV/CVD/depth/VWAP/VP/heatmap-COB/bubbles) живёт в ОДНОМ месте
     /// (`finish_ref`), выраженном через ссылки на `self`. Ownership `self` здесь больше не
@@ -1206,7 +1324,13 @@ impl Reducer {
     /// не для алгоритма. `self` молча дропается после вызова — двух копий формулы нет и не
     /// может разойтись при правке.
     fn finish(self) -> SeriesBundle {
-        self.finish_ref()
+        // M-68 rev6, задача 12 (R-138 Б-1): симметрично `finish_with_at` — сбросить
+        // незакрытый каденс-интервал ДО `finish_ref`. Конструкция РОЛЛОВЕРа: значение
+        // считается на закрытии; последний интервал без следующего события закрывается
+        // здесь, иначе выдача потеряет последнюю точку.
+        let mut me = self;
+        me.flush_pending_depth_interval();
+        me.finish_ref()
     }
 
     /// M-56 (`TD-097`, task #1): построение `SeriesBundle` **из ссылок**, без потребления и
@@ -1354,6 +1478,11 @@ impl Reducer {
     /// эвикция existing под финальное окно при fold'е). Разворачивает `self.finish()` +
     /// достаёт `at_ms` из редицированного состояния.
     fn finish_with_at(self) -> (SeriesBundle, i64) {
+        // M-68 rev6, задача 12 (R-138 Б-1): сброс незакрытого последнего
+        // каденс-интервала делегирован `finish` (он зовёт `flush_pending_depth_interval`
+        // перед `finish_ref`); здесь — только достать `at_ms`. Так обе двери — `finish`
+        // и `finish_with_at` — остаются эквивалентны по семантике (после `M-56` они
+        // делят одну формулу; до `M-68` `finish_with_at` делегировал `finish` буквально).
         let at_ms = self.at_ms;
         (self.finish(), at_ms)
     }
