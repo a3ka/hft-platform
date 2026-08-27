@@ -763,13 +763,25 @@ pub mod server {
                         // разумной схеме (`Binance`, `Hyperliquid` — 8–11), 256 заведомо
                         // достаточно для человека-оператора и заведомо не выводит текст
                         // ошибки за предел (2 МБ) даже при сверхдлинной ерунде.
+                        //
+                        // Срез по границе СИМВОЛА, а не байта (`R-133` B-4, `M-71` §4bis.3):
+                        // `&name[..256]` паникует на многобайтовом входе (`name.len()` в
+                        // байтах, и `256` в той же единице; символ может лежать через
+                        // границу `256`). Граница считается по `char_indices`: берём последний
+                        // индекс, для которого число символов ≤ MAX_VENUE_ECHO. `floor_char_boundary`
+                        // (Rust 1.81+) делает то же на байтах, но ПРЕДЪЯВЛЯЕТ поведение
+                        // в символах, а не байтах — поэтому здесь он.
                         const MAX_VENUE_ECHO: usize = 256;
                         let msg = match &e {
                             wire_v1::SelectorError::UnknownVenue(name) => {
-                                if name.len() > MAX_VENUE_ECHO {
+                                if name.chars().count() > MAX_VENUE_ECHO {
+                                    let truncated: String = name
+                                        .chars()
+                                        .take(MAX_VENUE_ECHO)
+                                        .collect();
                                     format!(
                                         "unknown venue: {}… (truncated, original {} bytes)",
-                                        &name[..MAX_VENUE_ECHO],
+                                        truncated,
                                         name.len()
                                     )
                                 } else {
@@ -780,10 +792,11 @@ pub mod server {
                                 // Тот же предел на текст ошибки парсинга (редкий, но возможный
                                 // источник эха — `serde_json::from_value` иногда суёт в сообщение
                                 // фрагменты пользовательского ввода).
-                                if s.len() > MAX_VENUE_ECHO {
+                                if s.chars().count() > MAX_VENUE_ECHO {
+                                    let truncated: String = s.chars().take(MAX_VENUE_ECHO).collect();
                                     format!(
                                         "{}… (truncated, original {} bytes)",
-                                        &s[..MAX_VENUE_ECHO],
+                                        truncated,
                                         s.len()
                                     )
                                 } else {
