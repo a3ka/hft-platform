@@ -1,9 +1,9 @@
 <!-- GATE-META
-milestone: M-67
+milestone: A-010
 audited_repo: a3ka/hft-platform
 audited_base: c4cfb8564fb5549060762c7056485065557afee0
-audited_head: e4566618cf20298a77d5343bfd005b8e7be316a3
-verdict: APPROVE
+audited_head: 078c18d2f006a51e2fbbd4e74f6a0a3ae170066f
+verdict: REJECT
 -->
 
 # R-144 — перепроверка §9: фенс GATE-META + reading-map GW-I (078c18d) · BACKLOG M-67/M-64/заморозка (e456661)
