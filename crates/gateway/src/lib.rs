@@ -15,6 +15,7 @@
 use std::collections::BTreeMap;
 use std::io;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use contracts::{Event, EventKind, Level, MdEvent, MdPayload, Side, Venue};
 use journal::EpochFilter;
@@ -63,6 +64,54 @@ fn default_selector() -> Selector {
 ///    (формально полная история; v7 он и так не отличает от усечённой — но и не врёт,
 ///    потому что не имеет кода, использующего эти поля).
 pub const GATEWAY_SCHEMA_VERSION: u32 = 8;
+
+/// M-71 (`milestones/M-71-egress-cap.md` §5.1): дефолт предела объёма ответа в
+/// БАЙТАХ сериализованной `SeriesBundle` (`serde_json::to_vec`). Значение — продуктовое
+/// решение (founder-owned), не архитектурная константа; здесь объявлен дефолт, на
+/// который падает `gateway-serve` при отсутствии/пустом `GATEWAY_MAX_RESPONSE_BYTES` —
+/// по той же форме, что `DEFAULT_MAX_SUBSCRIPTIONS = 16` для лимита подписок. Спека
+/// §5.1 называет 2 000 000 как предложение founder'а; конструкция (один
+/// `enforce_response_limit`, вызов из шести строителей) от числа НЕ зависит.
+pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 2_000_000;
+
+/// M-71 (`milestones/M-71-egress-cap.md` §4bis.2): эффективное значение предела,
+/// которое читают точки применения в `gateway` (`enforce_response_limit`). Заводится
+/// ЗДЕСЬ — в крейте, где предел ПРИМЕНЯЕТСЯ — по образцу `EFFECTIVE_MAX_SUBS` /
+/// `EFFECTIVE_GRACE_MS` (`crates/gateway-serve/src/lib.rs:194-210` / `:213-228`), но
+/// в ДРУГОМ крейте, потому что цикл зависимостей запрещает `gateway` звать
+/// `gateway-serve`. Поле `ServeConfig` не добавляется по той же причине, что и там:
+/// литерал `ServeConfig { .. }` живёт в девяти файлах `crates/gateway-serve/tests/**`
+/// (sacred-зона architect'а), и поле сломало бы их все.
+///
+/// **Семантика (`A-026` §2):** процессное эффективное значение, last-write-wins.
+/// Единственный ПРОД-вызыватель сеттера — `gateway_serve::serve_config_from_env`,
+/// один раз на старте, ПОСЛЕ успешного разбора env. Тесты — легитимные вызыватели
+/// (тот же приём, что у соседей: sacred-набор `red_egress_cap_governed.rs::N1a`,
+/// `N1b`, `N1-D`, `N1-E` переустанавливают значение под `serial()`). Внутрипроцессный
+/// запрет рантайм-смены типом (`OnceLock`/`Err` на второй вызов) в этой конструкции
+/// непинним — это часть «в» требования моста, вынесена долгом (`A-026` §3bis,
+/// `TECH-DEBT` пишет reviewer).
+///
+/// **Safety-несущая половина** (часть «а» по `A-026` §2): при `Err` разбора env
+/// значение НЕ устанавливается — пиннится оракулом `N1-E`. Класс «parse-error →
+/// чужое/сброшенное эффективное значение», тот же, что `GW-I-14` чинил для окна.
+static EFFECTIVE_MAX_RESPONSE_BYTES: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_RESPONSE_BYTES);
+
+/// Получить эффективный предел объёма ответа в байтах сериализованной `SeriesBundle`.
+/// Дефолт — `DEFAULT_MAX_RESPONSE_BYTES` (`П-020`).
+///
+/// Читается на каждом `snapshot`/`frames_since`/`pump`/`snapshot_checked`/
+/// `snapshot_from_checkpoint`-вызове через `enforce_response_limit`.
+pub fn effective_max_response_bytes() -> usize {
+    EFFECTIVE_MAX_RESPONSE_BYTES.load(Ordering::Relaxed)
+}
+
+/// Установить эффективный предел. Вызывается из `gateway_serve::serve_config_from_env`
+/// один раз после успешного разбора env (или из sacred-тестов под `serial()` —
+/// `red_egress_cap_governed.rs`). См. замечания на `EFFECTIVE_MAX_RESPONSE_BYTES`.
+pub fn set_effective_max_response_bytes(n: usize) {
+    EFFECTIVE_MAX_RESPONSE_BYTES.store(n, Ordering::Relaxed);
+}
 
 /// M-38b (TD-044, GW-I-9): версия ВНУТРЕННЕГО формата чекпоинта. Независима от
 /// `GATEWAY_SCHEMA_VERSION` (форма провода не меняется, меняется скорость её получения):
@@ -1911,6 +1960,79 @@ pub fn validate_selector(sel: &Selector) -> io::Result<()> {
     Ok(())
 }
 
+/// M-71 (`milestones/M-71-egress-cap.md` §5.2; `research/arbitration/A-021` Вопрос 2):
+/// ЯКОРЬ МУТАЦИИ (`scripts/verify_M-71.sh` шаг C). Сигнатура зафиксирована спекой;
+/// нейтрализация тела этой функции (возврат `Ok(())` без проверки) ОБЯЗАНА ронять
+/// набор оракулов (`A`/`B`/`C`/`F` уровня 1 + `W3`/`W5` уровня 2) и НЕ ронять
+/// контроль `E` — это и проверяет мутационный шаг.
+///
+/// **Что меряется.** Байты `serde_json::to_vec(&series)` — то есть ПОЛНЫЙ
+/// сериализованный объём ответа, тот, что уходит на провод. Спека §0ter R1 (C-157):
+/// мерять подмножество (`heatmap.len()`) или прокси (ширину полосы) — обход; полный
+/// ресурс включает `volume_profile[].bins`, `volume_bubbles`, `ohlcv`, `cob`,
+/// `depth_series`, VWAP/CVD-серии — `25 000 сделок` без L2-событий даёт
+/// `heatmap=0`, `cob=0`, ответ 2.67 МБ (`red_egress_cap::pl_i_5_a2_*`).
+///
+/// **Что не меряется.** Ошибка сериализации `to_vec` (на практике не возникает —
+/// `SeriesBundle` деривативна `Serialize`; но проброс через `io::Error` обязателен, иначе
+/// `?` теряет контекст). Заголовок `Snapshot` (selector/cursor/schema_version) — не
+/// входит в `SeriesBundle`, и на проводе добавляется сверху в форме v1/legacy;
+/// `W-C2` на уровне 2 пиннит этот оверхед явно (см. `red_egress_cap_wire.rs`).
+///
+/// **Форма отказа (`PL-I-5` F + `GW-I-14`).** `kind = InvalidInput` — это невалидный
+/// ВХОД клиента (запрос требует слишком много), а не сбой I/O; сообщение НАЗЫВАЕТ
+/// ОБЕ величины ≥ 1000 — ПРЕДЕЛ и НАБЛЮДЁННОЕ — клиент должен понять, насколько
+/// сузить запрос, без чтения исходников. Дополнительно перечисляются `entity_counts`
+/// (heatmap/cob/vp_bins/bubbles/ohlcv/depth_rows) — оператор видит, ЧТО раздуло
+/// ответ, и подбирает ширину осмысленно, а не угадывает.
+///
+/// **Не молча усекает (`PL-I-7`).** Единственный путь выхода — `Err`. Тихий truncate
+/// был бы зелен во всех liveness-проверках (`healthy`/heartbeat/рост журнала) и
+/// врёт клиенту; явный `Err` — единственный честный fail-closed.
+// MUT-ANCHOR M-71-LIMIT
+fn enforce_response_limit(series: &SeriesBundle, limit: usize) -> io::Result<()> {
+    let series_bytes = serde_json::to_vec(series)
+        .map_err(|e| {
+            io::Error::other(format!(
+                "enforce_response_limit: serialize SeriesBundle: {e}"
+            ))
+        })?
+        .len();
+    // `Snapshot` несёт ПОВЕРХ `SeriesBundle` поля `schema_version`/`selector`/`cursor`/
+    // `history_start_seq`/`history_truncated`. Замер на фикстуре `Binance/BTCUSDT/1000ms/
+    // bands=[0.001]` показывает 223–228 Б оверхеда; типичный прод-селектор укладывается
+    // в 300 Б (расширенный symbol/мультиполосный селектор поднимают до ~400). Оракул
+    // `red_egress_cap_boundary::pl_i_5_boundary_last_accepted_fits_and_next_is_refused`
+    // судит ПОЛНЫЙ snapshot (`serde_json::to_vec(&accepted).len()`), и без учёта
+    // envelope'а граница разойдётся: последний ПРИНЯТЫЙ ответ формально проходит по
+    // `SeriesBundle` (<limit), но envelope выводит его за предел. Это НЕ «более
+    // строгая» проверка — это та же проверка, что и оракул, только аккуратно
+    // отнормированная на envelope. Оверхед оценивается КОНСТАНТОЙ потому, что
+    // (а) селектор и курсор — статические относительно функции (вызывающий
+    // владеет ими, не функция), (б) единственный надёжный замер — полная сериализация
+    // `Snapshot`, которая требует `&Snapshot`, а не `&SeriesBundle`, и сигнатура
+    // специ зафиксирована (`§5.2`).
+    const SNAPSHOT_ENVELOPE_BYTES: usize = 300;
+    let n = series_bytes + SNAPSHOT_ENVELOPE_BYTES;
+    if n > limit {
+        let vp_bins: usize = series.volume_profile.iter().map(|r| r.bins.len()).sum();
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "PL-I-5: response exceeds limit: limit={limit} bytes, observed={n} bytes \
+                 (heatmap={} cob={} vp_bins={} bubbles={} ohlcv={} depth_rows={})",
+                series.heatmap.len(),
+                series.cob.len(),
+                vp_bins,
+                series.volume_bubbles.len(),
+                series.ohlcv.len(),
+                series.depth_series.len(),
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Полная свёртка `[start .. at]` через bounded `journal::stream`. Read-only (GW-I-1).
 ///
 /// engine-dev (M-22 task #3): ОБЯЗАН читать через `journal::stream(dir, filter)` (bounded,
@@ -1925,6 +2047,10 @@ pub fn snapshot(
     let mut stream = journal::stream(dir, filter)?;
     let (series, cursor, _, _at_ms, first_folded_seq) =
         reduce_event_stream(&mut stream, sel, Cursor::START, at, usize::MAX)?;
+    // M-71 (PL-I-5, `milestones/M-71-egress-cap.md` §5): предел ОБЪЁМА ответа,
+    // fail-closed. Здесь — уровень 1 (анти-байпас: 4 потребителя строят `Selector`
+    // мимо транспорта — чекпоинтер M-38b, shared-tailer, `research-cli`, replay).
+    enforce_response_limit(&series, effective_max_response_bytes())?;
     // M-48 (TD-048, VB-I-11): провенанс истории берётся из ПЕРВОГО свёрнутого события
     // (НЕ из `header.first_seq` — у legacy он синтезирован нулём, TD-030). На полном
     // журнале первый свёрнутый seq = 0 ⇒ `history_truncated = false`; на усечённом —
@@ -1978,6 +2104,10 @@ pub fn frames_since(
     if consumed == 0 {
         return Ok((Vec::new(), after));
     }
+    // M-71: предел ОБЪЁМА ответа — DELTA-кадр, как и снапшот, есть ТЕЛО wire-сообщения
+    // (`Frame` сериализуется в `wire_v1::frame_msg` целиком, `C-158` R1: 2 804 666 Б на
+    // плотных сделках).
+    enforce_response_limit(&delta, effective_max_response_bytes())?;
     Ok((vec![Frame::versioned(after, cursor, delta, at_ms)], cursor))
 }
 
@@ -2040,6 +2170,9 @@ pub fn frames_since_with_stats(
     if consumed == 0 {
         return Ok((Vec::new(), after, stats));
     }
+    // M-71: seek-bound вариант несёт ТОТ ЖЕ `Frame.delta`, что `frames_since`; предел
+    // применяется одинаково (анти-байпас: две функции, один инвариант).
+    enforce_response_limit(&delta, effective_max_response_bytes())?;
     Ok((
         vec![Frame::versioned(after, cursor, delta, at_ms)],
         cursor,
@@ -2064,6 +2197,9 @@ pub fn replay(
     if consumed == 0 {
         return Ok(Vec::new());
     }
+    // M-71: replay-кадр — тот же DELTA-wire-объект (через `wire_v1::frame_msg`), что
+    // `frames_since`; предел единый.
+    enforce_response_limit(&delta, effective_max_response_bytes())?;
     Ok(vec![Frame::versioned(from, cursor, delta, at_ms)])
 }
 
@@ -2191,6 +2327,10 @@ pub fn snapshot_from_checkpoint(
             let final_cursor = if at == Cursor::LATEST { cursor } else { at };
             let (series, reducer_at_ms) = state.finish_with_at();
             let _ = reducer_at_ms;
+            // M-71: предел ОБЪЁМА на построенный `Snapshot`. Чекпоинт-путь (PRIMARY на
+            // проде, см. `docker-compose.yml`) ОБЯЗАН enforce'ить так же, как прямой
+            // `snapshot` — иначе replay-от-чекпоинта дал бы дыру с другой стороны.
+            enforce_response_limit(&series, effective_max_response_bytes())?;
             // M-48 (VB-I-11): провенанс истории ПЕРЕСИМ от чекпоинта, не вычисляем
             // из хвостовых событий (D2: `red_checkpoint_bootstrap_truncated
             // ::advance_after_covered_prune_does_not_regress_history_start`).
@@ -2215,6 +2355,8 @@ pub fn snapshot_from_checkpoint(
         reduce_event_stream(&mut stream, sel, Cursor::START, at, usize::MAX)?;
     // Re-read stats AFTER iteration (счётчики инкрементируются в `next()`).
     let stats = read_stats_from_stream(&stream);
+    // M-71: rebuild-ветка так же обязана enforce'ить предел (анти-байпас).
+    enforce_response_limit(&series, effective_max_response_bytes())?;
     Ok((
         Snapshot {
             schema_version: GATEWAY_SCHEMA_VERSION,
@@ -3104,6 +3246,36 @@ pub struct LiveReducer {
     /// придуманный случай, реальный urgent-фикс задним числом) это оставляет лишние
     /// записи, не эвиктнутые вовремя (эмпирически поймано оракулом O-2 на кандидате).
     full: Reducer,
+    /// M-71 (`R-143` B-1, §4bis.5): seq ПОСЛЕДНЕГО события, свёрнутого в `full`.
+    /// Вторая позиция рядом с `cursor`, и они РАЗНЫЕ по смыслу: `cursor` — до какого
+    /// seq кадр УЖЕ ОТДАН потребителю, `full_applied_seq` — до какого seq СОСТОЯНИЕ
+    /// уже свёрнуто. Инвариант: `full_applied_seq >= cursor.upto_seq`; равенство —
+    /// установившийся режим, расхождение — окно «батч свёрнут, но отвергнут пределом
+    /// и потому не отдан» (см. `pump`).
+    ///
+    /// Зачем поле существует: оно заменяет ПЕРЕЧИТКУ БАТЧА ИЗ ЖУРНАЛА, которой
+    /// прежняя редакция добивалась транзакционности (`journal::stream_from` на каждый
+    /// commit — полный обход каталога + декод активного сегмента с начала, `R-143` B-1,
+    /// замер ×25.9 на 32 000 событий в сегменте). Память — один `u64` на сессию,
+    /// чтение — ни одного лишнего байта (`VB-I-10`, оракул `F-036`).
+    full_applied_seq: Option<u64>,
+    /// M-71 (`R-143` B-2, §4bis.5): число ПОДРЯД идущих отказов `pump` ПО ПРЕДЕЛУ
+    /// ОБЩЕГО ОБЪЁМА с момента последнего успешного commit'а. Обнуляется любым
+    /// состоявшимся commit'ом.
+    ///
+    /// Зачем: отказ по пределу НЕ САМОУСТРАНЯЕТСЯ: кадр, не влезший сейчас, не
+    /// влезет и на следующей попытке, пока предел стоит. Подписка, наткнувшаяся
+    /// на такой кадр, ОБЯЗАНА ЗАКОНЧИТЬСЯ явно, а клиент — пересобрать состояние
+    /// снапшотом (§4bis.5, единственный общий кандидат; штатная ступень `DESIGN` §16
+    /// «drop дельт → пересинхронизация снапшотом»). Счётчик — то, чем вызыватель
+    /// ОТЛИЧАЕТ первый терминальный отказ от повторного (то есть от собственного
+    /// неисполненного долга завершить подписку).
+    ///
+    /// ПРЕДЕЛ, НАЗВАННЫЙ ЧЕСТНО: сам редьюсер себя НЕ ЗАПИРАЕТ навсегда — время
+    /// жизни подписки решает вызыватель (`gateway-serve`), а не библиотека. Если
+    /// предел поднят оператором, следующий `pump` честно доставляет тот же кадр и
+    /// счётчик гаснет: терминальность — СИГНАЛ ВЫЗЫВАТЕЛЮ, а не самоубийство объекта.
+    cap_refusals: usize,
     /// Провенанс истории `full` — берётся ОДИН раз из чекпоинта в `resume()` (или из
     /// первого свёрнутого события на no-checkpoint пути) и не меняется `pump()`: хвост
     /// не может расширить или сузить то, что уже спрунено ДО чекпоинта.
@@ -3162,6 +3334,7 @@ impl LiveReducer {
             // нет. Хвост докормит его `pump()` тем же `apply()`, каким `advance_to`
             // построил его исходно.
             let full = r;
+            let full_applied_seq = cursor.upto_seq;
             return Ok((
                 Self {
                     vwap: VwapAcc {
@@ -3172,6 +3345,8 @@ impl LiveReducer {
                     cursor,
                     selector: sel.clone(),
                     full,
+                    full_applied_seq,
+                    cap_refusals: 0,
                     full_history_start_seq: header.history_start_seq,
                     full_history_truncated: header.history_truncated,
                     // M-57 (TD-109): `cursor` уже на хвосте — hint обязан быть
@@ -3224,6 +3399,9 @@ impl LiveReducer {
                 // сделал последующий `pump()`, не `resume()` (см. doc-комментарий
                 // `LiveReducer`, rev2 M-54 оракулов).
                 full: Reducer::new(sel),
+                // Ничего не свёрнуто — согласовано с `cursor: Cursor::START` (M-71 `R-143` B-1).
+                full_applied_seq: None,
+                cap_refusals: 0,
                 full_history_start_seq: history_start_seq,
                 full_history_truncated: history_start_seq > 0,
                 // M-57 (TD-109): первый `pump()` заполнит hint из `EventStream::tail_hint()`.
@@ -3297,7 +3475,7 @@ impl LiveReducer {
         let catalog_in = self.segment_catalog.take();
         let (mut stream, catalog_out) = journal::stream_from_at_with_catalog(
             dir,
-            filter,
+            filter.clone(),
             self.cursor.upto_seq,
             self.tail_hint,
             catalog_in,
@@ -3311,6 +3489,64 @@ impl LiveReducer {
         batch.vwap.sum_v = self.vwap.sum_v;
         let mut batch_consumed = 0_usize;
 
+        // M-71 (rev6, задача 13 / §4bis.5 ПЕРЕПИСАН по `R-140`): ИНВАРИАНТ — после любого
+        // числа отказавших `pump` серия, собранная потребителем из ДОСТАВЛЕННЫХ кадров
+        // (`snapshot(C) + frames` через `Snapshot::apply`), бит-идентична серии из реплея
+        // того же окна журнала. Прежняя реализация (закладка двигалась вместе с
+        // состоянием, `c5bb27b`) ТЕРЯЛА кадры молча: `self.cursor` продвигался ДО
+        // `enforce_response_limit(..)?`, а `frames.push` стоял ПОСЛЕ; клиент получал
+        // часть, считая её целым (замер `R-140`: `25 000 − 24 232 = 768 = 3 × 256` сделок
+        // потеряны; `VB-I-2`/`GW-I-4` нарушены).
+        //
+        // Конструкция (ПЕРЕПИСАНА по `R-143` B-1 — прежняя редакция куплена ценой
+        // ВТОРОГО ПРОХОДА ПО ЖУРНАЛУ НА ТИК, см. ниже): ДВЕ ПОЗИЦИИ ВМЕСТО ОДНОЙ.
+        //
+        //   `self.cursor`           — закладка ДОСТАВКИ: до какого seq потребителю ОТДАН
+        //                             кадр. Двигается ТОЛЬКО вместе с `frames.push`.
+        //   `self.full_applied_seq` — позиция СОСТОЯНИЯ: до какого seq события свёрнуты в
+        //                             персистентный `self.full`. Двигается per-event.
+        //
+        // Инвариант между ними: `full_applied_seq >= cursor.upto_seq` всегда; равенство —
+        // установившийся режим (каждый commit их сравнивает). Расхождение существует ровно
+        // в окне «батч свёрнут в состояние, но отвергнут пределом и потому не отдан».
+        //
+        // Что это даёт, и почему без этого не обойтись:
+        //  · кадр НЕ ТЕРЯЕТСЯ (`R-140`): закладка доставки стоит, следующий `pump` строит
+        //    тот же кадр заново от `batch_from` — потребительская серия равна реплею
+        //    (`VB-I-2`, оракул `P5`);
+        //  · событие НЕ СВОРАЧИВАЕТСЯ ДВАЖДЫ (`R-139` B-1): повторный проход применяет к
+        //    `self.full` только события `seq > full_applied_seq` — состояние сервера равно
+        //    независимому реплею (оракул `P4`);
+        //  · тик НЕ ЧИТАЕТ ЖУРНАЛ ВТОРОЙ РАЗ (`R-143` B-1) — см. абзац ниже.
+        //
+        // ПОЧЕМУ СНЕСЁН `commit_batch` С `journal::stream_from`. Прежняя редакция держала
+        // «чистую транзакционность» (в `self.full` — только на commit'е) и, не имея права
+        // материализовать `Vec<Event>` (`C-021 NOTE-2`, `GW-I-2`), ПЕРЕЧИТЫВАЛА батч из
+        // журнала вторым стримом. Цена, замеренная ревьюером на границе ПРОЦЕССА (`rchar`
+        // из `/proc/self/io`, а не счётчик участника): тик из ТРЁХ событий читал
+        // 1 703 434 Б при активном сегменте в 32 000 событий против 65 880 Б у родителя —
+        // ×25.9, и величина растёт ЛИНЕЙНО с длиной сегмента. `journal::stream_from`
+        // начинается с полного обхода каталога (`crates/journal/src/segments.rs:1851`) и
+        // hint не принимает вовсе (`:1898`), то есть декодирует активный сегмент от
+        // `header_end`. Это возврат P0-дефекта, ради устранения которого существовали
+        // M-57 (`TD-109`) и M-62 (`TD-120`), и он на ЧЕСТНОМ пути: `commit` зовётся на
+        // каждом закрытии батча, отказов для него не требуется. Оракул — `F-036`
+        // (`crates/gateway/tests/red_tick_read_cost.rs`), инвариант — `VB-I-10` («бюджет
+        // тика не зависит от длины активного сегмента», `PROJECT-STATE.md:1891`).
+        //
+        // Двухпозиционная конструкция не читает ничего сверх единственного прохода: она
+        // ПОМНИТ (одним `u64`), докуда состояние уже доведено.
+        //
+        // ОТКАЗ ТЕРМИНАЛЕН ДЛЯ ПОДПИСКИ (`R-143` B-2, §4bis.5 — «единственный общий
+        // кандидат: терминальность отказа для сессии + ресинк снапшотом»). Повторная попытка
+        // того же кадра сама по себе НИЧЕГО НЕ ЛЕЧИТ — он не станет меньше, пока предел
+        // стоит; восемь тиков без единого кадра — это livelock, а не fail-closed.
+        // Поэтому `refuse_by_cap` считает отказы подряд и ОБЪЯВЛЯЕТ подписку терминальной
+        // (`is_cap_terminal`), а вызыватель (`gateway-serve`) обязан её завершить и сказать
+        // клиенту, чтобы тот пересобрался СНАПШОТОМ (`DESIGN` §16). Состояние при этом
+        // НЕ ПОРТИТСЯ: если предел поднимет оператор, следующий `pump` честно доставляет
+        // тот же кадр и гасит счётчик — библиотека не решает за вызывателя время жизни
+        // его подписки.
         for event in &mut stream {
             let event = event?;
             if self.cursor.upto_seq.is_some_and(|seq| event.seq <= seq) {
@@ -3320,10 +3556,34 @@ impl LiveReducer {
                 break;
             }
             if batch_consumed == max_events {
-                // Закрыть текущий batch кадром; начать следующий СВЕЖИМ reducer'ом, засеянным
-                // ИЗ persistent-аккумулятора (тот уже обновлён последним apply ниже) — та же
-                // арифметика, что дал бы независимый `frames_since`-вызов на этой границе.
+                // Закрыть текущий batch. M-71 (задача 12): предел ОБЪЁМА на DELTA-кадр (та же
+                // единица `serde_json::to_vec`, что в `frames_since`). Анти-байпас: live WS-путь
+                // (`gateway-serve` `subscribe → pump → frame`), `C-157` R2 нашёл его открытым и
+                // требует покрытия (`pl_i_4_c_limit_has_no_bypass_across_entry_points`).
+                //
+                // На границе батча — commit ДОСТАВКИ: состояние уже свёрнуто per-event
+                // (двухпозиционная конструкция выше), поэтому commit = проверить предел,
+                // продвинуть ЗАКЛАДКУ ДОСТАВКИ и отдать кадр. На отказе закладка НЕ
+                // двигается и кадр не выбрасывается — он будет построен заново следующим
+                // `pump` от того же `batch_from` (потеря кадра есть fail-open, запрещена
+                // `PL-I-7`/`R-133` B-2/B-3 и `R-140`).
+                //
+                // Сумму vwap батча снимаем ДО `finish_with_at` — она потребляет `batch`.
+                let batch_sum_pv = batch.vwap.sum_pv;
+                let batch_sum_v = batch.vwap.sum_v;
                 let (delta, at_ms) = batch.finish_with_at();
+                if let Err(e) = enforce_response_limit(&delta, effective_max_response_bytes()) {
+                    return Err(self.refuse_by_cap(e));
+                }
+                self.cap_refusals = 0;
+                self.cursor = cursor;
+                // Зеркалим vwap ЗАКРЫТОГО БАТЧА (не `self.full.vwap`) — иначе новый батч
+                // засеялся бы суммой состояния, которое при отвергнутом батче ушло ВПЕРЁД
+                // закладки, и кадр повторной попытки нёс бы задвоенный VWAP. В
+                // установившемся режиме обе величины совпадают (батч засеян из `self.vwap`
+                // и применил ровно те же события, что `self.full`), M-36.
+                self.vwap.sum_pv = batch_sum_pv;
+                self.vwap.sum_v = batch_sum_v;
                 frames.push(Frame::versioned(batch_from, cursor, delta, at_ms));
                 batch_from = cursor;
                 batch = Reducer::new(&self.selector);
@@ -3332,19 +3592,18 @@ impl LiveReducer {
                 batch_consumed = 0;
             }
             batch.apply(&event);
-            // M-54: `full` кормится КАЖДЫМ событием НАПРЯМУЮ, в том же порядке, что и
-            // `batch` — та же per-event оконная эвикция (`Reducer::apply` →
-            // `evict_window_state`), что у независимого реплея. Никакого чтения журнала:
-            // событие уже декодировано этой же итерацией `stream` (та единственная
-            // работа, которую меряет `ReadStats`/O-1) — здесь только CPU-применение
-            // ко ВТОРОМУ in-memory аккумулятору, не второй проход по диску.
-            self.full.apply(&event);
+            // Per-event в `self.full` — но РОВНО ОДИН РАЗ на событие: повторный проход
+            // после отвергнутого батча читает те же seq, и без этой отсечки они свернулись
+            // бы дважды (`R-139` B-1, оракул `P4`).
+            if self
+                .full_applied_seq
+                .is_none_or(|applied| event.seq > applied)
+            {
+                self.full.apply(&event);
+                self.full_applied_seq = Some(event.seq);
+            }
             cursor = Cursor::at(event.seq);
             batch_consumed += 1;
-            // Персистентный аккумулятор обновляется СРАЗУ (не только в конце вызова) — так
-            // следующий batch внутри ЭТОГО ЖЕ pump() стартует с корректной суммой.
-            self.vwap.sum_pv = batch.vwap.sum_pv;
-            self.vwap.sum_v = batch.vwap.sum_v;
         }
         let stats = read_stats_from_stream(&stream);
         // M-57 (TD-109): забираем hint СВОЕЙ сессии из стрима. Если за тик НЕ было
@@ -3357,12 +3616,77 @@ impl LiveReducer {
         self.tail_hint = stream.tail_hint().or(self.tail_hint);
 
         if batch_consumed > 0 {
+            let batch_sum_pv = batch.vwap.sum_pv;
+            let batch_sum_v = batch.vwap.sum_v;
             let (delta, at_ms) = batch.finish_with_at();
+            if let Err(e) = enforce_response_limit(&delta, effective_max_response_bytes()) {
+                return Err(self.refuse_by_cap(e));
+            }
+            self.cap_refusals = 0;
+            self.cursor = cursor;
+            self.vwap.sum_pv = batch_sum_pv;
+            self.vwap.sum_v = batch_sum_v;
             frames.push(Frame::versioned(batch_from, cursor, delta, at_ms));
         }
 
-        self.cursor = cursor;
-        Ok((frames, cursor, stats))
+        Ok((frames, self.cursor, stats))
+    }
+
+    /// M-71 (`R-143` B-2, §4bis.5): зафиксировать отказ ПО ПРЕДЕЛУ и объявить подписку
+    /// ТЕРМИНАЛЬНОЙ: сверхлимитный кадр не станет меньше от повторной попытки, и
+    /// «pump ещё раз» — это livelock, а не восстановление (`R-143` B-2 предъявил его
+    /// восемью тиками без единого кадра; §4bis.5 вычеркнула чистую транзакционность
+    /// именно по этой причине).
+    ///
+    /// **Причина различается МЕСТОМ ВЫЗОВА, а не `ErrorKind`.** Сюда попадает только
+    /// отказ собственного гварда `enforce_response_limit`; журнальный I/O идёт другим
+    /// `?` и счётчик не трогает. Это существенно: `io::ErrorKind` различителем быть НЕ
+    /// МОЖЕТ — журнал отдаёт `Other` в четырёх местах
+    /// (`crates/journal/src/segments.rs:654,657,660,663`, `R-143` B-3).
+    fn refuse_by_cap(&mut self, e: io::Error) -> io::Error {
+        self.cap_refusals += 1;
+        let n = self.cap_refusals;
+        let kind = e.kind();
+        if n == 1 {
+            io::Error::new(
+                kind,
+                format!(
+                    "{e} | PL-I-5 TERMINAL: кадр не влезает в предел и не влезет ни на какой \
+                     следующей попытке, пока предел стоит: подписка ОБЯЗАНА быть ЗАВЕРШЕНА \
+                     вызывателем, а клиент — пересобрать состояние СНАПШОТОМ (ресинк, \
+                     DESIGN §16). Закладка доставки и уже отданные кадры НЕ тронуты \
+                     (VB-I-2 цел)"
+                ),
+            )
+        } else {
+            io::Error::new(
+                kind,
+                format!(
+                    "{e} | PL-I-5 TERMINAL, отказ №{n} ПОДРЯД: подписка НЕ ПРОДВИНУЛАСЬ с \
+                     прошлого тика и не продвинется — вызыватель не завершил её после первого \
+                     терминального отказа. Повторные pump'ы состояние не портят, но и не \
+                     доставят ничего: нужен ресинк СНАПШОТОМ либо более узкий селектор"
+                ),
+            )
+        }
+    }
+
+    /// M-71 (`R-143` B-2): подписка ОБЪЯВЛЕНА ТЕРМИНАЛЬНОЙ по пределу объёма — последний
+    /// `pump` отверг кадр своим же гвардом и ни один последующий не состоялся.
+    /// Вызыватель ОБЯЗАН завершить подписку явно и сказать это клиенту (молчание — тот
+    /// самый механизм, которым потеря остаётся невидимой, `R-139` N-1).
+    ///
+    /// Признак НЕ читает `io::ErrorKind` и потому не путает предел с повреждённым
+    /// журналом: он выставляется РОВНО в точке отказа гварда предела.
+    pub fn is_cap_terminal(&self) -> bool {
+        self.cap_refusals > 0
+    }
+
+    /// Сколько отказов по пределу подряд случилось с последнего успешного commit'а
+    /// (0 — подписка здорова). Различает «первый терминальный отказ» и «вызыватель его
+    /// проигнорировал» — второе есть дефект ВЫЗЫВАТЕЛЯ, и он обязан быть виден.
+    pub fn cap_refusals(&self) -> usize {
+        self.cap_refusals
     }
 
     /// Текущий курсор (последний свёрнутый seq, либо `Cursor::START` если ни одного).
@@ -3391,5 +3715,29 @@ impl LiveReducer {
             history_start_seq: self.full_history_start_seq,
             history_truncated: self.full_history_truncated,
         }
+    }
+
+    /// M-71 (`milestones/M-71-egress-cap.md` §5, PL-I-5): снять накопленное состояние как
+    /// `Snapshot` С ПРОВЕРКОЙ ПРЕДЕЛА ОБЪЁМА. Сигнатура `(self) -> io::Result<Snapshot>` —
+    /// парный к ней `snapshot(&self) -> Snapshot` сохранён неизменным (его зовут
+    /// sacred-тесты для подсчёта байт в panic-сообщении; менять там возврат `Snapshot`
+    /// запрещено scope-guard'ом). Потребители, ОТДАЮЩИЕ снимок клиенту по сети, ОБЯЗАНЫ
+    /// звать эту функцию вместо `snapshot()` — иначе через live-путь
+    /// `LiveReducer::resume → pump → snapshot` на провод уйдёт ответ сверх предела, и
+    /// `PL-I-5`/`GW-I-14` останутся без защиты (это тот дыра, который `C-157` R2
+    /// предъявил в первой редакции; теперь закрыта тем же `enforce_response_limit`, что и
+    /// остальные 5 строителей).
+    ///
+    /// **Fail-closed, одинаково на обоих путях** (`M-71` §4bis.1, `R-133` B-2/B-3, `VB-I-2`,
+    /// `VB-I-11`). Превышение предела — явный `Err`; молчаливое усечение
+    /// (`volume_bubbles.clear()` + `history_truncated = true`) СНЯТО: оно ломало
+    /// `VB-I-2` (live ≠ replay) и захватывало `history_truncated` под чужой смысл
+    /// (флаг означает потерю префикса журнала, не усечение полезной нагрузки). Эквивалентность
+    /// `history_truncated == (history_start_seq > 0)` (`crates/gateway/src/lib.rs:2490`,
+    /// `M-48`) восстанавливается этим изменением: флаг никогда не трогается здесь.
+    pub fn snapshot_checked(&self) -> io::Result<Snapshot> {
+        let snap = self.snapshot();
+        enforce_response_limit(&snap.series, effective_max_response_bytes())?;
+        Ok(snap)
     }
 }

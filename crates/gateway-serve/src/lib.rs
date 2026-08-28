@@ -227,6 +227,22 @@ pub mod server {
         EFFECTIVE_GRACE_MS.store(ms, Ordering::Relaxed);
     }
 
+    /// M-71 (`milestones/M-71-egress-cap.md` §4bis.2 rev7): предел объёма ответа живёт в
+    /// `crates/gateway` (см. `gateway::effective_max_response_bytes` / геттер-сеттер
+    /// в `gateway`), там же, где он ПРИМЕНЯЕТСЯ (`enforce_response_limit` зовётся
+    /// шестью строителями). Здесь, в `gateway-serve`, хранить его НЕГДЕ —
+    /// `ServeConfig` конструируется литералом в девяти sacred-тестах
+    /// `crates/gateway-serve/tests/**`, и добавление поля сломало бы их все
+    /// (`C-166` B-1). Прежняя пара серверных функций для предела имела ноль читателей
+    /// (`R-133` B-1 built-not-wired) и док-строку, описывающую чтение на каждом вызове —
+    /// ложь того же класса, что чинит `C4` в `M-68`. СНЕСЕНА тем же коммитом, что
+    /// переехал значение в `gateway`.
+    ///
+    /// Прод-вызыватель — `serve_config_from_env` ниже, ОДИН раз после успешного разбора env.
+    /// При `Err` разбора сеттер НЕ зовётся — пиннится оракулом `N1-E`. Внутрипроцессный
+    /// запрет рантайм-смены типом в этой конструкции непинним (контрпример — сам sacred-набор
+    /// `N1-C`/`N1a`/`N1b`/`N1-D`/`N1-E`); часть «в» требования моста вынесена долгом
+    /// (`A-026` §3bis).
     use crate::_gw::Selector;
     use futures_util::{SinkExt, StreamExt};
     use journal::EpochFilter;
@@ -727,11 +743,59 @@ pub mod server {
                     Ok(s) => s,
                     Err(e) => {
                         let code = e.code();
+                        // M-71 (`milestones/M-71-egress-cap.md` §0ter R1, `C-161`): клиент
+                        // управляет исходящим текстом и через отказ. До правки echo'ил
+                        // ПОЛНОЕ поле запроса: 2 100 084 Б при гигантском `venue` из двух
+                        // символов `sub` — `W4`. Троякая ловушка: (1) echo'ить строку
+                        // целиком — «масштабируемая» дыра, оператору уходит N байт на
+                        // каждый байт клиента; (2) НЕ echo'ить вовсе — теряется диагностика;
+                        // (3) ограничить длину при разборе — правка протокола, отдельный
+                        // маршрут (CT-RFC-09 §2.2, RAW-гейт). Лечение M-71: ограничить
+                        // длинный хвост на стороне отправителя (`MAX_VENUE_ECHO`), без
+                        // потери информации о причине и с сохранением формы `code` (`W-C3`).
+                        // Конкретное число — 256 символов: имя площадки короче в любой
+                        // разумной схеме (`Binance`, `Hyperliquid` — 8–11), 256 заведомо
+                        // достаточно для человека-оператора и заведомо не выводит текст
+                        // ошибки за предел (2 МБ) даже при сверхдлинной ерунде.
+                        //
+                        // Срез по границе СИМВОЛА, а не байта (`R-133` B-4, `M-71` §4bis.3):
+                        // `&name[..256]` паникует на многобайтовом входе (`name.len()` в
+                        // байтах, и `256` в той же единице; символ может лежать через
+                        // границу `256`). Код ниже использует `chars().take(MAX_VENUE_ECHO).collect()`
+                        // — итерация по char'ам даёт ровно `MAX_VENUE_ECHO` Unicode-скаляров,
+                        // что и требовалось от многобайтового входа; `char_indices`/
+                        // `floor_char_boundary` (Rust 1.81+) тут НЕ нужны и не вызываются.
+                        const MAX_VENUE_ECHO: usize = 256;
                         let msg = match &e {
                             wire_v1::SelectorError::UnknownVenue(name) => {
-                                format!("unknown venue: {name}")
+                                if name.chars().count() > MAX_VENUE_ECHO {
+                                    let truncated: String =
+                                        name.chars().take(MAX_VENUE_ECHO).collect();
+                                    format!(
+                                        "unknown venue: {}… (truncated, original {} bytes)",
+                                        truncated,
+                                        name.len()
+                                    )
+                                } else {
+                                    format!("unknown venue: {name}")
+                                }
                             }
-                            wire_v1::SelectorError::Invalid(s) => s.clone(),
+                            wire_v1::SelectorError::Invalid(s) => {
+                                // Тот же предел на текст ошибки парсинга (редкий, но возможный
+                                // источник эха — `serde_json::from_value` иногда суёт в сообщение
+                                // фрагменты пользовательского ввода).
+                                if s.chars().count() > MAX_VENUE_ECHO {
+                                    let truncated: String =
+                                        s.chars().take(MAX_VENUE_ECHO).collect();
+                                    format!(
+                                        "{}… (truncated, original {} bytes)",
+                                        truncated,
+                                        s.len()
+                                    )
+                                } else {
+                                    s.clone()
+                                }
+                            }
                         };
                         send_v1_error(sink, Some(id), code, &msg).await;
                         return Err(format!("invalid selector: {msg}"));
@@ -781,7 +845,12 @@ pub mod server {
                                 &sel_for_resume,
                                 ckpt_clone.as_path(),
                             )?;
-                            let snap = live.snapshot();
+                            // M-71: снимок, ОТДАВАЕМЫЙ клиенту, ОБЯЗАН проходить предел.
+                            // `snapshot_checked` зовёт `enforce_response_limit` (`PL-I-5`,
+                            // `milestones/M-71-egress-cap.md` §5). На этом пути (switch)
+                            // ошибка предела превращается в `invalid_selector` — клиент
+                            // увидит `code:"invalid_selector"` и сообщение с величинами.
+                            let snap = live.snapshot_checked()?;
                             Ok((
                                 snap,
                                 session::Sub {
@@ -871,7 +940,9 @@ pub mod server {
                         &sel_for_resume,
                         ckpt_clone.as_path(),
                     )?;
-                    let snap = live.snapshot();
+                    // M-71: ADD-путь так же обязан enforce'ить предел — иначе первая же
+                    // подписка с раздувающим селектором ушла бы клиенту без проверки.
+                    let snap = live.snapshot_checked()?;
                     Ok((
                         snap,
                         session::Sub {
@@ -1279,16 +1350,45 @@ pub mod server {
                         }
                         Err(boxed) => {
                             let (live, e, gen_at_pump) = *boxed;
-                            tracing::error!(
-                                error = %e,
-                                sub = %id,
-                                "v1 LiveReducer::pump failed — sub продолжит молча"
-                            );
+                            // M-71 (rev7, `R-143` B-2 + `R-139` N-1): отказ ПО ПРЕДЕЛУ
+                            // ТЕРМИНАЛЕН для подписки. Повторный `pump` того же кадра ничего
+                            // не лечит — кадр не станет меньше, пока предел стоит; это
+                            // livelock, ради которого §4bis.5 вычеркнула «чистую
+                            // транзакционность». Штатная развязка (`DESIGN` §16): подписка
+                            // ЗАВЕРШАЕТСЯ явно, клиент пересобирается СНАПШОТОМ (повторный
+                            // `subscribe` — снимок идёт через `snapshot_checked`, то есть
+                            // тоже под пределом: fail-closed сохранён).
+                            //
+                            // Причина различается ФЛАГОМ РЕДЬЮСЕРА, а не `io::ErrorKind`:
+                            // журнал отдаёт `Other` в четырёх местах
+                            // (`crates/journal/src/segments.rs:654,657,660,663`), и матч по
+                            // виду ошибки объявлял бы повреждение журнала «пределом объёма»
+                            // (`R-143` B-3). Флаг выставляется РОВНО в точке отказа гварда.
+                            let cap_terminal = live.is_cap_terminal();
+                            let refusals = live.cap_refusals();
+                            if cap_terminal {
+                                tracing::error!(
+                                    error = %e,
+                                    sub = %id,
+                                    refusals,
+                                    "v1 LiveReducer::pump отвергнут ПРЕДЕЛОМ ОБЪЁМА (PL-I-5) — \
+                                     подписка ЗАВЕРШАЕТСЯ, клиент извещён и обязан \
+                                     пересобраться снапшотом; журнал тут ни при чём"
+                                );
+                            } else {
+                                tracing::error!(
+                                    error = %e,
+                                    sub = %id,
+                                    "v1 LiveReducer::pump failed (журнал/IO либо программная \
+                                     причина) — sub продолжит молча"
+                                );
+                            }
                             // Даже на pump-ошибке пробуем вернуть `live` в карту, если sub
-                            // всё ещё наш по generation. Иначе просто дропаем.
+                            // всё ещё наш по generation И отказ НЕ терминален. Иначе дропаем.
                             let drained = inner.draining_ids.remove(&id);
                             let current_gen = inner.gens.get(&id).copied();
-                            let live_keeps = !drained && current_gen == Some(gen_at_pump);
+                            let live_keeps =
+                                !drained && current_gen == Some(gen_at_pump) && !cap_terminal;
                             if let Some(sub) = inner.subs.get_mut(&id) {
                                 if live_keeps {
                                     sub.live = Some(live);
@@ -1297,6 +1397,24 @@ pub mod server {
                                 }
                             } else {
                                 drop(live);
+                            }
+                            if cap_terminal {
+                                // Снятие подписки — та же пара действий, что у `unsubscribe`
+                                // (`subs` + `gens`): любой in-flight pump этого id увидит
+                                // `current_gen == None` и отбросит свой результат.
+                                inner.subs.remove(&id);
+                                inner.gens.remove(&id);
+                                // Форма ошибки протокола НЕ меняется (§4.1): переиспользуем
+                                // `invalid_selector` — тот же код, которым предел отвечает на
+                                // `subscribe`. Текст `e` называет предел и наблюдённую
+                                // величину (задача 6) плюс требование ресинка.
+                                send_v1_error(
+                                    &mut sink,
+                                    Some(&id),
+                                    "invalid_selector",
+                                    &e.to_string(),
+                                )
+                                .await;
                             }
                         }
                     }
@@ -1320,6 +1438,17 @@ pub mod server {
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
+        // M-71 (`milestones/M-71-egress-cap.md` §5): размер batch'а дренажа `live` до
+        // хвоста. `usize::MAX` прокачивал бы ВСЕГО backlog одним delta-кадром — на
+        // плотном журнале (25k сделок = ~2.8 МБ delta) `pump` отверг бы вызов по
+        // `enforce_response_limit`. Здесь догон ОБЯЗАН пройти, поэтому batch ограничен —
+        // на каждой итерации обрабатывается ≤ `LEGACY_DRAIN_BATCH` событий, и delta-кадр
+        // гарантированно проходит предел. Кадры отбрасываются (нас интересует только
+        // состояние `live.full`). Число выбрано по тому же закону, что push-loop ниже
+        // (`PUSH_MAX_EVENTS = 256`): одна сделка — один bubble + один vp_bin ≈ 150 Б,
+        // 256 событий × 150 Б ≈ 38 КБ, на два порядка ниже предела в 2 МБ.
+        const LEGACY_DRAIN_BATCH: usize = 256;
+
         let (mut sink, mut stream) = ws.split();
 
         // (6a) Snapshot-при-подключении + резюмируемый `LiveReducer` для push-цикла
@@ -1363,8 +1492,19 @@ pub mod server {
             // выполнялся раньше.
             let mut stats = resume_stats;
             loop {
-                let (frames, _c, pump_stats) =
-                    live.pump(cfg1.journal_dir.as_path(), cfg1.filter.clone(), usize::MAX)?;
+                // M-71: pump обязан держать delta-кадр ≤ `DEFAULT_MAX_RESPONSE_BYTES`.
+                // `max_events = usize::MAX` бы прокачал ВЕСЬ backlog одним кадром — на
+                // плотном журнале это легко даёт delta > limit, и `pump` отверг бы
+                // вызов. Здесь догон до LATEST нужен ЛЮБОЙ ценой, поэтому размер batch'а
+                // ограничен константой `LEGACY_DRAIN_BATCH` — на каждой итерации
+                // обрабатывается ≤ N событий, и delta-кадр г гарантированно проходит предел.
+                // Суммарно до LATEST — серия таких batch'ей; кадры отбрасываются (нас
+                // интересует только догон `self.full`).
+                let (frames, _c, pump_stats) = live.pump(
+                    cfg1.journal_dir.as_path(),
+                    cfg1.filter.clone(),
+                    LEGACY_DRAIN_BATCH,
+                )?;
                 stats = stats + pump_stats;
                 if frames.is_empty() {
                     break;
@@ -1375,7 +1515,16 @@ pub mod server {
             // `dir`/`filter` — второй проход невозможен по построению). Между догоном
             // (цикл выше) и снятием снапшота ничего не читается — O-3: курсор снапшота
             // совпадает с курсором, от которого начнётся push ниже.
-            let snap_msg = ServeMsg::Snapshot(live.snapshot());
+            // M-71 (`milestones/M-71-egress-cap.md` §4bis.1, `R-133` B-2/B-3): legacy-путь
+            // использует `snapshot_checked` для fail-closed: если снимок НЕ укладывается в
+            // предел — возвращаем `Err`, и сессия абортится БЕЗ отправки (`W3` rev6: пара
+            // «vantage на малом журнале + предмет на плотном», оба молчание/ошибка легитимны;
+            // подробнее — §4bis.1bis спеки). Никакого «помеченного усечения через обрезку
+            // bubbles» нет и не было с `f2ac1c8`.
+            let snap_msg = match live.snapshot_checked() {
+                Ok(snap) => ServeMsg::Snapshot(snap),
+                Err(e) => return Err(e),
+            };
             Ok((snap_msg, stats, live, at))
         })
         .await;
@@ -1625,10 +1774,26 @@ pub mod server {
                         }
                         Err(boxed) => {
                             let (live, e, gen_at_pump) = *boxed;
-                            tracing::error!(error = %e, sub = %id, "legacy v1 pump err");
+                            // M-71 (rev7, `R-143` B-2): та же терминальность, что в
+                            // `run_v1_session_loop` — предел ОБЪЁМА завершает подписку,
+                            // клиент извещается и пересобирается снапшотом. Признак —
+                            // флаг редьюсера, не `io::ErrorKind` (`R-143` B-3).
+                            let cap_terminal = live.is_cap_terminal();
+                            if cap_terminal {
+                                tracing::error!(
+                                    error = %e,
+                                    sub = %id,
+                                    refusals = live.cap_refusals(),
+                                    "legacy v1 pump отвергнут ПРЕДЕЛОМ ОБЪЁМА (PL-I-5) — \
+                                     подписка ЗАВЕРШАЕТСЯ, клиент извещён"
+                                );
+                            } else {
+                                tracing::error!(error = %e, sub = %id, "legacy v1 pump err");
+                            }
                             let drained = v1_session_inner.draining_ids.remove(&id);
                             let current_gen = v1_session_inner.gens.get(&id).copied();
-                            let live_keeps = !drained && current_gen == Some(gen_at_pump);
+                            let live_keeps =
+                                !drained && current_gen == Some(gen_at_pump) && !cap_terminal;
                             if let Some(sub) = v1_session_inner.subs.get_mut(&id) {
                                 if live_keeps {
                                     sub.live = Some(live);
@@ -1637,6 +1802,17 @@ pub mod server {
                                 }
                             } else {
                                 drop(live);
+                            }
+                            if cap_terminal {
+                                v1_session_inner.subs.remove(&id);
+                                v1_session_inner.gens.remove(&id);
+                                send_v1_error(
+                                    &mut sink,
+                                    Some(&id),
+                                    "invalid_selector",
+                                    &e.to_string(),
+                                )
+                                .await;
                             }
                         }
                     }
@@ -1680,17 +1856,45 @@ pub mod server {
                             let (returned_live, e) = *boxed;
                             // RN-21 (reviewer, M-47 PR-гейт): в проде отказ `pump` — это
                             // live-push канал (M-53 задача #2c). Поведение соединения (молча
-                            // продолжаем, НЕ закрываем WS) сохраняем — НО поднимаем до
-                            // `error!` с курсором/селектором в контексте, чтобы §8 eyes-on
-                            // обнаружил «чекпоинтер/journal сломался» по логу. `live`
-                            // ОБЯЗАН вернуться назад — иначе следующий тик запаникует.
+                            // продолжаем, НЕ закрываем WS) сохраняем для ЖУРНАЛЬНЫХ отказов
+                            // — НО поднимаем до `error!` с курсором/селектором в контексте,
+                            // чтобы §8 eyes-on обнаружил «чекпоинтер/journal сломался» по логу.
+                            // `live` ОБЯЗАН вернуться назад — иначе следующий тик запаникует.
+                            //
+                            // M-71 (rev7, `R-143` B-2 + `R-139` N-1): но отказ ПО ПРЕДЕЛУ
+                            // ОБЪЁМА — ДРУГОЙ класс: повторная попытка того же кадра не
+                            // состоится НИКОГДА, пока предел стоит (livelock, §4bis.5). На
+                            // legacy-пути подписка ОДНА и совпадает с соединением, поэтому
+                            // терминальность = отправить `ServeMsg::Error` и закрыть: клиент
+                            // переподключится и получит СНАПШОТ (ресинк, `DESIGN` §16), а не
+                            // останется висеть на молчащем push-канале.
+                            let cap_terminal = returned_live.is_cap_terminal();
+                            let refusals = returned_live.cap_refusals();
                             live = Some(returned_live);
+                            if cap_terminal {
+                                tracing::error!(
+                                    error = %e,
+                                    cursor = ?cursor,
+                                    symbol = %cfg.selector.symbol,
+                                    venue = ?cfg.selector.venue,
+                                    refusals,
+                                    "LiveReducer::pump отвергнут ПРЕДЕЛОМ ОБЪЁМА (PL-I-5) — \
+                                     legacy-сессия ЗАВЕРШАЕТСЯ явно, клиент пересоберётся \
+                                     снапшотом; журнал тут ни при чём"
+                                );
+                                let payload = ServeMsg::Error(e.to_string());
+                                if let Ok(text) = serde_json::to_string(&payload) {
+                                    let _ = sink.send(Message::Text(text)).await;
+                                }
+                                return Ok(());
+                            }
                             tracing::error!(
                                 error = %e,
                                 cursor = ?cursor,
                                 symbol = %cfg.selector.symbol,
                                 venue = ?cfg.selector.venue,
-                                "LiveReducer::pump failed (журнал недоступен) — соединение продолжается, но live-push молчит"
+                                "LiveReducer::pump failed (журнал/IO либо программная причина) \
+                                 — соединение продолжается, но live-push молчит"
                             );
                             continue;
                         }
@@ -2002,6 +2206,69 @@ pub fn serve_config_from_env(
         }
     };
     server::set_effective_grace_ms(grace_ms);
+
+    // M-71 (`milestones/M-71-egress-cap.md` §5): `GATEWAY_MAX_RESPONSE_BYTES` — fail-closed
+    // предел объёма ответа. Зеркалит `GATEWAY_MAX_SUBSCRIPTIONS` по форме (подпись/дефолт/
+    // поведение на unset/пусто vs невалид) и `GATEWAY_WINDOW_MS` по жёсткости (parse-error
+    // и overflow ⇒ отказ СТАРТА, не unbounded — `PL-I-5` дословно: «отсутствие/
+    // невалидность лимита = отказ, не unbounded»; `GW-I-14` для окна — тот же класс).
+    //
+    // Поведение по форме ЗНАЧЕНИЯ (восемь кейсов `red_egress_cap_startup.rs`):
+    //   * отсутствие ИЛИ пустое/пробельное (после `trim`) — ОДНО неполное состояние одной
+    //     конфигурации (`A-015` §3 п.1, `A-026` §1): `gateway::DEFAULT_MAX_RESPONSE_BYTES`
+    //     + warn. Основание тождества — `A-015` §3 п.1; прецеденты — оба соседа
+    //     (`red_max_subs_config.rs::empty_var_is_same_as_absent`,
+    //     `red_window_guard_startup.rs::offline_forms_still_start`). На проде ветка мертва
+    //     в обе стороны (`docker-compose.yml:150` несёт форму `${:-2000000}`, подставляющую
+    //     дефолт и на unset, и на пустое).
+    //   * валидное положительное число в `usize` ⇒ записать в atomic;
+    //   * `0` — отказ (нулевой предел делает сервис неработоспособным);
+    //   * `-N`, `2000000.0`, `2_000_000`, `2000000bytes`, мусор, переполнение
+    //     (напр. `999999999999999999999`) — отказ СТАРТА с сообщением, называющим
+    //     переменную (`red_egress_cap_startup::assert_startup_rejected`).
+    let raw = get("GATEWAY_MAX_RESPONSE_BYTES");
+    let trimmed = raw.as_deref().map(str::trim);
+    let max_response_bytes: usize = match trimmed {
+        // ОТСУТСТВИЕ переменной ИЛИ пустое/пробельное (после `trim`) — ОДНО неполное
+        // состояние одной конфигурации (`A-015` §3 п.1).
+        None | Some("") => {
+            tracing::warn!(
+                "GATEWAY_MAX_RESPONSE_BYTES is absent or blank (raw={:?}); \
+                 GATEWAY_MAX_RESPONSE_BYTES={} — подписанная норма (founder 2026-08-26, \
+                 П-020, milestones/M-71-egress-cap.md §5.1), PL-I-5",
+                raw,
+                gateway::DEFAULT_MAX_RESPONSE_BYTES,
+            );
+            gateway::DEFAULT_MAX_RESPONSE_BYTES
+        }
+        Some(s) => {
+            // `parse::<usize>()` отвергает отрицательные и нечисловые значения. Но
+            // отдельные классы требуют явной проверки:
+            //   * `"2000000.0"` (дробное) — `parse::<usize>()` отвергнет (не i64-форма);
+            //   * `"2_000_000"` (Rust-разделитель) — `parse::<usize>()` отвергнет;
+            //   * `"2000000bytes"` (суффикс) — `parse::<usize>()` отвергнет;
+            //   * `"999999999999999999999"` (переполнение) — `parse::<usize>()` отвергнет.
+            // Парсер единый для всех случаев отказа; `0` отвергается отдельно — `usize`
+            // принимает `0` валидно, но семантически он делает сервис неработоспособным.
+            match s.parse::<usize>() {
+                Ok(0) => {
+                    return Err(format!(
+                        "GATEWAY_MAX_RESPONSE_BYTES={s} невалидно: должно быть >= 1 \
+                         (PL-I-5: нулевой предел делает сервис неработоспособным — \
+                         ни один ответ не уложится)"
+                    ));
+                }
+                Ok(n) => n,
+                Err(e) => {
+                    return Err(format!("GATEWAY_MAX_RESPONSE_BYTES={s:?} parse: {e}"));
+                }
+            }
+        }
+    };
+    // M-71 §4bis.2: сеттер зовётся СТРОГО ПОСЛЕ успешного разбора — все ветки отказа
+    // выше делают `return Err(...)` ДО этой строки. Класс GW-I-14/R7: отвергнутая
+    // конфигурация не смеет управлять сервисом. Пиннится оракулом `N1-E`.
+    gateway::set_effective_max_response_bytes(max_response_bytes);
 
     Ok(server::ServeConfig {
         addr,

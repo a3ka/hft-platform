@@ -25,6 +25,11 @@ crc32fast = "1"
 # M-38b (gateway-checkpoint bin): tracing-subscriber для init_tracing (RUST_LOG).
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# M-71 (`milestones/M-71-egress-cap.md` §0ter): единица ресурса — байты
+# сериализованного ответа (`serde_json::to_vec(series)`), и `enforce_response_limit`
+# зовёт сериализатор на построенной `SeriesBundle` (anti-bypass: шесть строителей
+# gateway, см. `red_egress_cap.rs::pl_i_4_c_limit_has_no_bypass_across_entry_points`).
+serde_json = "1"
 # M-38b (RN-22): `flock` на ckpt-каталог для защиты от перекрывающихся cron-прогонов
 # (5-15 мин каденс, холодный прогон ~12 мин). Используется только из `checkpoint::advance`
 # через `libc::flock(LOCK_EX)` (POSIX, Linux/macOS). Windows-семантика не требуется
