@@ -22,6 +22,7 @@
 //! | `--bands <f64,f64,...>` | depth-полосы (×1, напр. `0.001,0.005`) | `0.001` |
 //! | `--window-ms <i64>` | bounded-window (M-37); `0` = offline unbounded | `60000` |
 //! | `--cursor <LATEST\|i64>` | курсор для advance_to. `LATEST` = до конца журнала | `LATEST` |
+//! | `--depth-cadence-ms <i64>` | каденция депт-серии (M-68); дефолт = `GATEWAY_DEPTH_CADENCE_MS` из env, иначе 1000 | env `GATEWAY_DEPTH_CADENCE_MS` или `1000` |
 //!
 //! Обе формы `--flag value` И `--flag=value` принимаются наравне: compose пишет
 //! `--flag=value`, cron-обёртка может писать через пробел. Соседний `journal-retention`
@@ -61,6 +62,12 @@ struct Args {
     bands: Vec<f64>,
     window_ms: Option<i64>,
     cursor: Cursor,
+    /// M-68 задача 23 (R-141 Б-1): каденция депт-серии, прочитанная из флага
+    /// `--depth-cadence-ms` или env `GATEWAY_DEPTH_CADENCE_MS` (тот же источник, что у
+    /// `gateway-serve::serve_config_from_env`, чтобы отпечаток селектора у писателя и
+    /// читателя чекпоинта СОВПАЛ). `None` означает «не задано ни флагом, ни env» —
+    /// дефолт 1000 мс подставляется ниже по тем же правилам, что и в `serve_config_from_env`.
+    depth_cadence_ms: Option<i64>,
 }
 
 fn parse_venue(s: &str) -> Result<contracts::Venue, String> {
@@ -84,6 +91,13 @@ fn parse_args() -> Result<Args, String> {
     let mut bands_str: Option<String> = None;
     let mut window_ms: Option<i64> = None;
     let mut cursor: Option<Cursor> = None;
+    // M-68 задача 23 (R-141 Б-1): CLI-флаг `--depth-cadence-ms`. Источник ЗНАЧЕНИЯ —
+    // `--depth-cadence-ms` (явный приоритет оператора в cron-обёртке), при отсутствии —
+    // env `GATEWAY_DEPTH_CADENCE_MS` (тот же источник, что у `gateway-serve`), при
+    // отсутствии — подписанный дефолт 1000 мс. Та же логика, что в
+    // `gateway-serve::serve_config_from_env` (A-015 §3 п.1: поведение прода не имеет
+    // права зависеть от того, КАК забыли задать).
+    let mut depth_cadence_ms: Option<i64> = None;
 
     // B1 (M-38b rev4): нормализовать argv ПЕРЕД разбором. `--flag=value` (equals-форма —
     // ровно то, что лежит в `docker-compose.yml command:`) раскладываем в два отдельных
@@ -137,6 +151,19 @@ fn parse_args() -> Result<Args, String> {
                 let s = next()?;
                 cursor = Some(parse_cursor_value(s, "--cursor")?);
             }
+            "--depth-cadence-ms" => {
+                // M-68 задача 23 (R-141 Б-1): CLI-флаг каденции. Парсим как i64,
+                // валидация (>= 1000, делит 86_400_000) — ниже, рядом с проверкой
+                // `timeframe_ms` (тот же класс fail-closed, что GW-I-14). Невалидное
+                // значение ⇒ exit 2 с именем флага (сообщение называет
+                // GATEWAY_DEPTH_CADENCE_MS, чтобы оператор видел, ГДЕ править).
+                let s = next()?;
+                let parsed = s
+                    .trim()
+                    .parse::<i64>()
+                    .map_err(|e| format!("--depth-cadence-ms: {e}"))?;
+                depth_cadence_ms = Some(parsed);
+            }
             "-h" | "--help" => {
                 print_help();
                 std::process::exit(0);
@@ -176,6 +203,7 @@ fn parse_args() -> Result<Args, String> {
         bands,
         window_ms,
         cursor: cursor.unwrap_or(Cursor::LATEST),
+        depth_cadence_ms,
     })
 }
 
@@ -202,15 +230,18 @@ fn print_help() {
          Использование:\n  \
            gateway-checkpoint [--dir DIR] [--ckpt-dir DIR] [--coverage-out PATH]\n  \
                               [--venue VENUE] [--symbol STR] [--timeframe-ms N]\n  \
-                              [--bands f,f,...] [--window-ms N] [--cursor LATEST|N]\n\
+                              [--bands f,f,...] [--window-ms N] [--cursor LATEST|N]\n  \
+                              [--depth-cadence-ms N]\n\
          \n\
          Обе формы `--flag value` и `--flag=value` принимаются.\n\
          Дефолты: --dir=./journal-data --ckpt-dir=./gateway-ckpt\n  \
                   --coverage-out=./gateway-ckpt/covered_through_seq\n  \
                   --venue=Binance --symbol=BTCUSDT --timeframe-ms=1000\n  \
-                  --bands=0.001 --window-ms=60000 --cursor=LATEST\n\
+                  --bands=0.001 --window-ms=60000 --cursor=LATEST\n  \
+                  --depth-cadence-ms=GATEWAY_DEPTH_CADENCE_MS или 1000\n\
          \n\
-         Exit-коды: 0=ok, 1=argv/IO, 2=validate_selector fail-closed (GW-I-10)."
+         Exit-коды: 0=ok, 1=argv/IO, 2=validate_selector fail-closed (GW-I-10) или \
+         невалидная каденция (MD-I-8 d14)."
     );
 }
 
@@ -238,13 +269,62 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     }
 
+    // M-68 задача 23 (R-141 Б-1): источник каденции — env GATEWAY_DEPTH_CADENCE_MS (тот же,
+    // что у `gateway-serve`), если флаг `--depth-cadence-ms` НЕ задан. Политика пустого/
+    // пробельного/отсутствия — ОДИН исход: подписанный дефолт 1000 мс. Основание —
+    // A-015 §3 п.1, подтверждённое A-026 §1 для соседней ручки `gateway-serve`.
+    //
+    // Приоритет: `--depth-cadence-ms` (явная команда оператора в cron-обёртке) →
+    // `GATEWAY_DEPTH_CADENCE_MS` (env, общее с `gateway-serve`) → дефолт 1000. При
+    // СОВПАДЕНИИ источников отпечаток селектора у писателя и читателя чекпоинта одинаков
+    // (та же логика, что и в `serve_config_from_env`), и чекпоинт читается тёплым
+    // стартом, а не реплеится целиком.
+    const DEFAULT_CADENCE_MS: i64 = 1_000;
+    let cadence_from_env: Option<i64> =
+        std::env::var("GATEWAY_DEPTH_CADENCE_MS")
+            .ok()
+            .and_then(|raw| {
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    Some(DEFAULT_CADENCE_MS)
+                } else {
+                    // Невалидное env обрабатывается ниже как fail-closed.
+                    trimmed.parse::<i64>().ok()
+                }
+            });
+    let cadence_raw: i64 = match args.depth_cadence_ms.or(cadence_from_env) {
+        Some(ms) => ms,
+        None => DEFAULT_CADENCE_MS,
+    };
+
+    // M-68 задача 23 (R-141 Б-1) + задача 17 (d14): валидация каденции по тем же
+    // правилам, что и в `gateway::validate_selector` (ms >= 1000, делит 86_400_000).
+    // Невалидное (мусор, 0, -1, 999, ...) ⇒ exit 2 с сообщением, называющим
+    // GATEWAY_DEPTH_CADENCE_MS (класс GW-I-14).
+    if cadence_raw < 1000 || 86_400_000 % cadence_raw != 0 {
+        eprintln!(
+            "gateway-checkpoint: GATEWAY_DEPTH_CADENCE_MS={cadence_raw} невалидно: требуется \
+             >= 1000 и выравнено на границу UTC-суток (86_400_000 % ms == 0); подсекундные \
+             или нестандартные значения дают схлопывание ключей (тот же класс, что GW-I-14 \
+             для window_ms; см. MD-I-8 d14, C-167)"
+        );
+        return ExitCode::from(2);
+    }
+
     let selector = Selector {
         venue: args.venue,
         symbol: args.symbol,
         timeframe_ms: args.timeframe_ms,
         bands: args.bands,
         window_ms: args.window_ms,
-        depth_cadence_ms: None,
+        // M-68 задача 23 (R-141 Б-1): здесь Some(cadence_raw), не None — иначе
+        // отпечаток селектора у писателя и читателя чекпоинта расходится, слепок не
+        // находится, журнал читается целиком при каждом подключении (TD-044/R-029:
+        // сотни секунд). `selector_fingerprint` (`crates/gateway/src/lib.rs:2825`)
+        // включает `depth_cadence_ms`, и `Some(1000)` ≠ `None` ⇒ разные имена
+        // файлов. Проводка ручки — задача 23; здесь только значение, прочитанное из
+        // того же env, что у `gateway-serve`.
+        depth_cadence_ms: Some(cadence_raw),
     };
 
     // NaN guard (M-38b): фингерпринт селектора использует `to_bits()`; NaN != NaN,
