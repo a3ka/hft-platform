@@ -67,7 +67,7 @@ step "A3 (A-021 Правка B) — перечень дверей проверя
 # существует, а оракул её не зовёт. Именованный остаток (макро/трейт-двери) — COGNITIVE-ONLY.
 chk bash scripts/tests/red_egress_doors.sh
 
-step "A4 (задачи 8,9 — R-133 B-2/B-3, N-3) — вердикт путей совпадает, флаг провенанса цел, принятый ответ полон"
+step "A4 (задачи 8,9,12,13 — R-133 B-2/B-3/N-3, R-139 B-1, R-140 B-1, R-143 B-2) — вердикт путей совпадает, флаг провенанса цел, ответ полон, подписка не livelock-ится"
 chk cargo test -p gateway --test red_egress_cap_paths --quiet
 EXPECT_P=7
 N_P=$(grep -cE "^fn pl_i_5_p" crates/gateway/tests/red_egress_cap_paths.rs || true); N_P=${N_P:-0}
