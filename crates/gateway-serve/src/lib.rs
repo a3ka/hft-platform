@@ -2098,6 +2098,36 @@ pub fn serve_config_from_env(
     let mut selector = build_selector(venue, symbol, timeframe_ms, bands, window_ms);
     selector.depth_cadence_ms = depth_cadence_ms;
 
+    // M-68 rev7, задача 24 (R-141 Б-3, MAJOR): старт-гейт ЗЕРКАЛИТ гвард отношения
+    // `cadence_ms % timeframe_ms`, иначе контейнер `healthy`, а каждое подключение
+    // отвергается `gateway::validate_selector` (класс TD-019/TD-020 — пара
+    // `timeframe_ms=3000, cadence_ms=10000` поднимает ЗДОРОВЫЙ контейнер, который
+    // отвергает КАЖДОГО клиента; §0sexies.2septies). Гвард уже стоит в
+    // `gateway::validate_selector` (задача 21), здесь — его ЗЕРКАЛО на СТАРТЕ.
+    // Дублирующая проверка на старте согласна с архитектурой гейта: «§8 eyes-on увидит
+    // (healthy), а кокпит будет пуст» — та самая деградация, которую fail-closed
+    // гвард СТАРТА должен ловить заранее.
+    //
+    // При `cadence_ms < timeframe_ms` гвард НЕ применяется (тот же контракт, что в
+    // `gateway::validate_selector`: фильтр становится вырожденным, отдельный предмет).
+    if let Some(cadence) = selector.depth_cadence_ms {
+        if cadence >= selector.timeframe_ms && cadence % selector.timeframe_ms != 0 {
+            return Err(format!(
+                "GATEWAY_DEPTH_CADENCE_MS={cadence} не выравнен на GATEWAY_TIMEFRAME_MS={} \
+                 (cadence_ms % timeframe_ms = {} != 0). При cadence_ms >= timeframe_ms \
+                 эффективная частота есть НОК(timeframe, cadence) и РАСХОДИТСЯ с \
+                 заявленной, а метка выдачи лжёт ровно на величину расхождения \
+                 (П-014 п.2: деградация не выдаётся за норму). Требуется \
+                 cadence_ms >= timeframe_ms && cadence_ms % timeframe_ms == 0 — \
+                 тот же класс fail-closed, что GW-I-14 для window_ms. Без этой \
+                 проверки контейнер поднимается ЗДОРОВЫМ, а validate_selector на \
+                 клиентском пути отвергает КАЖДОЕ подключение (R-141 Б-3, TD-019/TD-020)",
+                selector.timeframe_ms,
+                cadence % selector.timeframe_ms
+            ));
+        }
+    }
+
     Ok(server::ServeConfig {
         addr,
         journal_dir,
