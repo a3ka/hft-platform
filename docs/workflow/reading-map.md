@@ -79,7 +79,7 @@
 | alpha / portfolio / strategy | `fa/alpha.md` · `fa/portfolio.md` · `fa/strategy.md` · `fa/strategy-brain.md` · семейство `ST-I` |
 | runner, композиция режимов | `fa/runner.md` · `01-engine-architecture.md` §9 |
 | AI-слой, копилот | `fa/ai-copilot.md` · `DESIGN` §19 |
-| `derive` / `recorder` / `gateway-serve` | **FA не существует** — сам этот факт есть долг, назвать его в Handoff; опора: `fa/viz-backend.md` + `DESIGN` §22 (`GW-I` — 13 оракулов при нуле заявленных; замер `grep -rhoE '\bGW-I-[0-9]+\b' crates/ | sort -uV | wc -l`) |
+| `derive` / `recorder` / `gateway-serve` | **FA не существует** — сам этот факт есть долг, назвать его в Handoff; опора: `fa/viz-backend.md` + `DESIGN` §22 (`GW-I` — 13 оракулов при нуле заявленных; замер `grep -rhoE '\bGW-I-[0-9]+\b' crates/ \| sort -uV \| wc -l`) |
 | фазы, приоритеты, роадмап | `09-roadmap-v2.md` · `DESIGN` §10 · `milestones/BACKLOG.md` |
 | харнесс (`scripts/**`, CI) | `docs/workflow/harness-track.md` |
 | процессный слой (`.claude/**`, `CLAUDE.md`, `04-workflow.md`) | `gates.md` §9/§11 · `04-workflow.md` · `docs/plans/process-layer-audit-2026-08-13.md` |
