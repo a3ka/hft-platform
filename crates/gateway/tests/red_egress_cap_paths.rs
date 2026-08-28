@@ -698,3 +698,156 @@ fn pl_i_5_p6_standing_cap_must_not_livelock_the_subscription() {
         outcomes[0]
     );
 }
+
+/// **`P7` — ПРИЗНАК ТЕРМИНАЛЬНОСТИ НЕ ВРЁТ: он истинен ТОЛЬКО от предела объёма.**
+///
+/// Дыра названа самим `engine-dev` в Handoff'е круга 5, и названа верно: «признак читается
+/// тремя вызывателями — но что они читают его ПРАВИЛЬНО, машина сегодня не судит». Оракул
+/// закрывает половину, судимую в этом крейте: **носитель обязан быть правдив**. Что три
+/// вызывателя в `gateway-serve` его читают — предмет уровня 2, здесь не смешивается
+/// (`A-022`: единицы не смешивать).
+///
+/// # Почему это не педантизм, а прямое продолжение `R-143` `B-3`
+///
+/// `B-3` нашёл ровно этот класс: `matches!(kind, io::ErrorKind::Other)` был объявлен
+/// признаком «нашей» ошибки, тогда как журнал возвращает `Other` в ЧЕТЫРЁХ местах
+/// (`crates/journal/src/segments.rs:654,657,660,663` — чужой сегмент, storage-guard,
+/// повреждённый заголовок, усечённый legacy). Один ложный диагноз был заменён симметричным
+/// ложным. Круг 5 заменил вид ошибки на флаг редьюсера — конструкция верная, но НЕПРОВЕРЯЕМАЯ:
+/// если флаг взведётся и на журнальном отказе, все три вызывателя снимут живую подписку и
+/// объявят дежурному «предел объёма» там, где на самом деле ПОРЧА ЖУРНАЛА. Это худший из
+/// возможных обменов: повреждение журнала — единственный случай, где промедление дороже всего.
+///
+/// # Три свойства, и каждое своим сценарием
+///
+/// 1. **здоровая подписка молчит** — без отказов флаг ложен, счётчик ноль;
+/// 2. **отказ по пределу взводит** — флаг истинен, счётчик растёт;
+/// 3. **ЖУРНАЛЬНЫЙ отказ НЕ взводит** — предел при этом заведомо достижим, то есть
+///    единственная разница между (2) и (3) — ПРИЧИНА отказа, а не его наличие.
+///
+/// Сценарий 3 — тот, ради которого оракул написан: (1) и (2) зелены и у реализации,
+/// которая просто считает ЛЮБЫЕ отказы.
+///
+/// # Чего оракул НЕ предписывает
+///
+/// Семантику сброса (обнуляется ли счётчик на успешном commit'е, живёт ли флаг до
+/// пересоздания сессии) не пиннит: это конструкция, и вызыватели от неё не зависят —
+/// им нужен ответ на вопрос «этот отказ терминален», а не история.
+///
+/// # ПРЕДЕЛ ЧУВСТВИТЕЛЬНОСТИ — ЗАМЕРЕН, НЕ ОЦЕНЁН
+///
+/// Мутационный контроль дал ДВА разных исхода, и оба записаны:
+///
+/// | куда внесён `self.cap_refusals += 1` на журнальном отказе | `P7` |
+/// |---|---|
+/// | создание стрима (`stream_from_at_with_catalog(..)?`, начало `pump`) | **FAILED** — ловит |
+/// | середина цикла (`let event = event?;`) | ok — **НЕ ловит** |
+///
+/// Причина: фикстура портит сегмент ПОСЛЕ того, как сессия догнала хвост, поэтому следующий
+/// `pump` падает на ОТКРЫТИИ стрима и до тела цикла не доходит. Значит `P7` пиннит
+/// правдивость флага на пути «журнал не открылся», но НЕ на пути «журнал сломался в
+/// середине чтения». Вторая ветвь остаётся непокрытой, и это объявлено здесь, а не
+/// подразумевается: оракул, чей предел не назван, читается как более сильный, чем он есть
+/// (`П-022`: непокрытие обязано быть ВИДНО).
+///
+/// Достроить вторую ветвь можно фикстурой, портящей сегмент за границей уже прочитанного
+/// префикса; на этом круге не делается — `A-026` §4 п.5 закрывает круги по M-71.
+#[test]
+fn pl_i_5_p7_cap_terminal_flag_does_not_lie_about_journal_failures() {
+    let _g = serial();
+
+    // ── (1) здоровая подписка: отказов нет, флаг молчит ─────────────────────────────
+    let dir = journal_of_trades(HONEST_TRADES);
+    let ckpt = tempfile::tempdir().expect("SETUP: ckpt tempdir");
+    gateway::set_effective_max_response_bytes(usize::MAX);
+    let (mut r, _) =
+        LiveReducer::resume(dir.path(), EpochFilter::OwnCaptureOnly, &sel(), ckpt.path())
+            .unwrap_or_else(|e| setup_failed(&format!("resume не собрался: {e}")));
+    while let Ok((frames, _, _)) = r.pump(dir.path(), EpochFilter::OwnCaptureOnly, PUMP_BATCH) {
+        if frames.is_empty() {
+            break;
+        }
+    }
+    assert!(
+        !r.is_cap_terminal() && r.cap_refusals() == 0,
+        "PL-I-5 P7 (1): подписка без единого отказа объявлена терминальной \
+         (is_cap_terminal={}, cap_refusals={}). Вызыватель снимет ЖИВУЮ подписку",
+        r.is_cap_terminal(),
+        r.cap_refusals()
+    );
+
+    // ── (2) отказ ПО ПРЕДЕЛУ обязан взвести ─────────────────────────────────────────
+    let dense = journal_of_trades(DENSE_TRADES);
+    let ckpt2 = tempfile::tempdir().expect("SETUP: ckpt tempdir");
+    gateway::set_effective_max_response_bytes(usize::MAX);
+    let (mut r2, _) = LiveReducer::resume(
+        dense.path(),
+        EpochFilter::OwnCaptureOnly,
+        &sel(),
+        ckpt2.path(),
+    )
+    .unwrap_or_else(|e| setup_failed(&format!("resume(dense) не собрался: {e}")));
+    gateway::set_effective_max_response_bytes(20_000);
+    let capped = r2.pump(dense.path(), EpochFilter::OwnCaptureOnly, PUMP_BATCH);
+    gateway::set_effective_max_response_bytes(gateway::DEFAULT_MAX_RESPONSE_BYTES);
+    if capped.is_ok() {
+        setup_failed(
+            "предел 20 000 Б на плотной фикстуре не дал отказа — сценарий (2) не воспроизведён, \
+             и сравнивать (3) не с чем",
+        );
+    }
+    assert!(
+        r2.is_cap_terminal() && r2.cap_refusals() > 0,
+        "PL-I-5 P7 (2): отказ ПО ПРЕДЕЛУ не взвёл признак (is_cap_terminal={}, \
+         cap_refusals={}) — вызыватель оставит подписку висеть на молчащем канале, \
+         то есть вернётся livelock R-143 B-2 через незаведённый флаг",
+        r2.is_cap_terminal(),
+        r2.cap_refusals()
+    );
+
+    // ── (3) ЖУРНАЛЬНЫЙ отказ НЕ смеет взводить — предмет оракула ────────────────────
+    // Порча заголовка сегмента даёт `io::ErrorKind::Other` (segments.rs:660 CorruptHeader) —
+    // ровно тот вид, который `R-143` B-3 показал НЕОТЛИЧИМЫМ от отказа по пределу.
+    let broken = journal_of_trades(HONEST_TRADES);
+    let ckpt3 = tempfile::tempdir().expect("SETUP: ckpt tempdir");
+    gateway::set_effective_max_response_bytes(usize::MAX);
+    let (mut r3, _) = LiveReducer::resume(
+        broken.path(),
+        EpochFilter::OwnCaptureOnly,
+        &sel(),
+        ckpt3.path(),
+    )
+    .unwrap_or_else(|e| setup_failed(&format!("resume(broken) не собрался: {e}")));
+
+    let seg = std::fs::read_dir(broken.path())
+        .expect("SETUP: read_dir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| p.to_string_lossy().ends_with(".jrnl"))
+        .unwrap_or_else(|| setup_failed("в фикстуре нет сырого сегмента — портить нечего"));
+    std::fs::write(&seg, b"\xde\xad\xbe\xef NOT-A-SEGMENT-HEADER")
+        .unwrap_or_else(|e| setup_failed(&format!("не удалось испортить сегмент: {e}")));
+
+    let after_break = r3.pump(broken.path(), EpochFilter::OwnCaptureOnly, PUMP_BATCH);
+    // SETUP-GUARD: журнал ОБЯЗАН отказать. Если порча проглочена, сценарий не состоялся, и
+    // зелёный ассерт ниже не значил бы ничего (`testing.md` «Целостность гейта» св. 3).
+    let Err(journal_err) = after_break else {
+        setup_failed(
+            "порченый сегмент НЕ дал отказа чтения — сценарий (3) не воспроизведён; \
+             оракул судил бы здоровый путь и был бы зелен по неверной причине",
+        )
+    };
+
+    assert!(
+        !r3.is_cap_terminal(),
+        "PL-I-5 P7 (3) / R-143 B-3: ЖУРНАЛЬНЫЙ отказ «{journal_err}» взвёл признак \
+         терминальности по ПРЕДЕЛУ (cap_refusals={}). Все три вызывателя в gateway-serve \
+         читают этот флаг: они снимут подписку и объявят дежурному «предел объёма» там, где \
+         ПОВРЕЖДЁН ЖУРНАЛ. Один ложный диагноз заменён симметричным ложным — ровно то, что \
+         R-143 B-3 нашёл у matches!(kind, ErrorKind::Other). Повреждение журнала — случай, \
+         где промедление дороже всего",
+        r3.cap_refusals()
+    );
+
+    gateway::set_effective_max_response_bytes(gateway::DEFAULT_MAX_RESPONSE_BYTES);
+}
