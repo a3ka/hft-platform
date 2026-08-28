@@ -132,6 +132,43 @@ spec_mismatched_fence() {
 EOF
 }
 
+# `C-176` B-9: сырой HTML-блок. По CommonMark pre/script/style/textarea открывают блок до
+# СВОЕГО закрывающего тега; разметка внутри разметкой не является.
+spec_section_in_raw_html() {
+    tag="${1:-script}"
+    printf '%s\n' \
+      '# M-99 — тестовая спека' '## Objective' 'Цель.' '## §Tasks' '| # | Status |' \
+      '## Acceptance' '`scripts/verify_M-99.sh`' '' "<${tag}>" '## Allowed paths' "</${tag}>"
+}
+
+# `C-176` B-10: ИНОЙ заголовок, разделяющий требуемый ПРЕФИКС. Регексп без границы титула
+# принимал его за раздел.
+spec_title_prefix_only() {
+    name="${1:-Allowed paths}"
+    printf '%s\n' \
+      '# M-99 — тестовая спека' '## Objective' 'Цель.' '## Allowed paths' '| путь |' \
+      '## §Tasks' '| # |' '## Acceptance' '`v.sh`' \
+      | sed "s|^## ${name}\$|## ${name}NOT-A-SECTION|"
+}
+
+# `C-176` B-11: отступ. Объявленная грамматика — заголовок с КОЛОНКИ 0; всё отступленное
+# разделом не считается (сужение против CommonMark названо в шапке барьера).
+spec_indented_section() {
+    pad="${1:-    }"
+    printf '%s\n' \
+      '# M-99 — тестовая спека' '## Objective' 'Цель.' '## §Tasks' '| # | Status |' \
+      '## Acceptance' '`scripts/verify_M-99.sh`' "${pad}## Allowed paths"
+}
+
+# Позитивные контроли объявленной грамматики: закрывающая ATX-последовательность и хвостовые
+# пробелы — ВАЛИДНЫЙ заголовок, и барьер обязан его принять. Без них фикс «требовать конец
+# строки сразу после титула» был бы КРАСНЫМ против правильной спеки.
+spec_closing_atx_sequence() {
+    printf '%s\n' \
+      '# M-99 — тестовая спека' '## Objective' 'Цель.' '## Allowed paths ##' '| путь |' \
+      '## §Tasks' '| # |' '## Acceptance' '`v.sh`'
+}
+
 # `C-175` B-8.1: забор открыт ЧЕТЫРЬМЯ бэктиками, «закрыт» ТРЕМЯ. По CommonMark закрывающий
 # забор не может быть короче открывающего — блок не закрыт, раздел внутри него не раздел.
 spec_shorter_closing_run() {
@@ -306,6 +343,21 @@ scenario "#### Allowed paths (H4) → отказ"              1 "$(spec_h4_sect
 scenario "закрытие КОРОЧЕ открывающего не закрывает"  1 "$(spec_shorter_closing_run)"            add
 scenario "забор с текстом после маркера не закрывает" 1 "$(spec_closing_fence_with_trailing_text)" add
 
+echo "=== СЫРОЙ HTML-БЛОК НЕ ЕСТЬ ВИДИМОЕ ТЕЛО (C-176 B-9) ==="
+scenario "<script> прячет раздел → отказ"            1 "$(spec_section_in_raw_html script)"   add
+scenario "<pre> прячет раздел → отказ"               1 "$(spec_section_in_raw_html pre)"      add
+scenario "<textarea> прячет раздел → отказ"          1 "$(spec_section_in_raw_html textarea)" add
+
+echo "=== ТИТУЛ СУДИТСЯ ЦЕЛИКОМ, А НЕ ПРЕФИКСОМ (C-176 B-10) ==="
+scenario "Allowed pathsNOT-A-SECTION → отказ"        1 "$(spec_title_prefix_only 'Allowed paths')" add
+scenario "ObjectiveNOT-A-SECTION → отказ"            1 "$(spec_title_prefix_only 'Objective')"     add
+scenario "AcceptanceNOT-A-SECTION → отказ"           1 "$(spec_title_prefix_only 'Acceptance')"    add
+scenario "закрывающая ATX ## принимается"            0 "$(spec_closing_atx_sequence)"              add
+
+echo "=== ЗАГОЛОВОК С КОЛОНКИ 0 — ОБЪЯВЛЕННОЕ СУЖЕНИЕ (C-176 B-11) ==="
+scenario "отступ 4 пробела (indented code) → отказ"  1 "$(spec_indented_section '    ')" add
+scenario "отступ 1 пробел → отказ (сужение)"         1 "$(spec_indented_section ' ')"    add
+
 echo "=== СУДИТСЯ HEAD, А НЕ РАБОЧЕЕ ДЕРЕВО (C-173 B-7.1) ==="
 scenario "полная спека в дереве не спасает неполную в HEAD" 1 "$(full_spec)"              dirty
 
@@ -429,9 +481,19 @@ if [ -z "${MSHAPE_SELFTEST:-}" ]; then
   make_stub fencetail 's|c == fchar \&\& run >= flen \&\& tail_blank|c == fchar \&\& run >= flen|' \
     && try_stub "забор с хвостом снова закрывает" "$STUB_PATH"
 
+  # Ослабление 10 (`C-176` B-9) — сырой HTML-блок снова печатается как тело.
+  make_stub htmlblind 's|if (index(lower, "</" htag ">") == 0) { html = 1 }|if (0) { html = 1 }|' \
+    && try_stub "сырой HTML снова считается телом" "$STUB_PATH"
+  # Ослабление 11 (`C-176` B-10) — снята граница титула: префикс снова проходит.
+  make_stub titleprefix 's/\[ \\t\]\*#\*\[ \\t\]\*\$//g' \
+    && try_stub "префикс титула снова принимается" "$STUB_PATH"
+  # Ослабление 12 (`C-176` B-11) — допущен отступ: indented code снова считается заголовком.
+  make_stub indentwiden 's|\^#{2,3} +|^[ ]*#{2,3} +|g' \
+    && try_stub "отступленный заголовок снова принимается" "$STUB_PATH"
+
   echo "  батарея ослаблений: поймано ${BATTERY_OK} из ${BATTERY_N}"
-  if [ "$BATTERY_N" -lt 9 ]; then
-    bad "батарея неполна: ${BATTERY_N} ослаблений вместо 9 — стаб не собрался, значит не проверен"
+  if [ "$BATTERY_N" -lt 12 ]; then
+    bad "батарея неполна: ${BATTERY_N} ослаблений вместо 12 — стаб не собрался, значит не проверен"
   fi
 fi
 
