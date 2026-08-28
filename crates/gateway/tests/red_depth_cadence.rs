@@ -538,3 +538,79 @@ fn md_i8_d17_declared_cadence_matches_what_is_delivered() {
         actual_step_ms as f64 / declared.max(1) as f64
     );
 }
+
+/// **`d20` (Б-2, `R-141`) — `VB-I-2` ПРИ ЗАДАННОЙ КАДЕНЦИИ: живое == перепроигранное.**
+///
+/// # Дефект круга 3
+///
+/// Сброс незакрытого каденс-интервала висит на `finish(self)` → `flush_pending_depth_interval`
+/// (`crates/gateway/src/lib.rs:1332`), а живой путь идёт `LiveReducer::snapshot(&self)` →
+/// `finish_ref_with_at(&self)` → `finish_ref(&self)` и сбросить не может: `flush` требует
+/// `&mut self`, у живого пути его нет. Итог: живой снимок теряет САМУЮ СВЕЖУЮ точку глубины,
+/// реплей её отдаёт. Замер `R-141` на одной фикстуре: `None` — 240/240, `Some(1000)` — 240
+/// против 238, `Some(10000)` — 24 против 22, `Some(60000)` — 4 против 2 (на минуте теряется
+/// ПОЛОВИНА точек).
+///
+/// **Корень — в спеке.** §0sexies.2ter предписала «незакрытый последний интервал сбрасывается
+/// на `finish`». `finish` берёт `self` и живёт ТОЛЬКО на replay-пути; я назвал точку, которой
+/// у живого пути нет. Dev исполнил написанное буквально.
+///
+/// # Почему единственный существующий оракул `VB-I-2` этого не видит
+///
+/// `crates/gateway/tests/red_gateway_live_eq_replay.rs:120` задаёт `depth_cadence_ms: None` и
+/// к предмету слеп по построению: без каденции незакрытых интервалов не бывает. Оракул на
+/// инвариант обязан гонять РЕЖИМ, в котором инвариант может сломаться.
+///
+/// # Семантику оракул НЕ выбирает
+///
+/// Эмитить частичную точку на ОБОИХ путях либо не эмитить ни на одном — решает реализация
+/// (§0sexies.2ter, переписан). Требование одно: **живое равно перепроигранному ПРИ ЛЮБОЙ
+/// каденции.** Ассерт равенства ловит обе односторонние поломки; «не меньше» — только одну.
+#[test]
+fn md_i8_d20_live_equals_replay_under_cadence() {
+    let dir = journal();
+
+    for cadence in [1_000_i64, 10_000, 60_000] {
+        let selector = sel(Some(cadence));
+
+        // ЖИВОЙ путь: тот, которым ходит gateway-serve.
+        let ckpt = tempfile::tempdir().expect("SETUP: ckpt tempdir");
+        let (mut live, _) = gateway::LiveReducer::resume(
+            dir.path(),
+            EpochFilter::OwnCaptureOnly,
+            &selector,
+            ckpt.path(),
+        )
+        .unwrap_or_else(|e| setup_failed(&format!("resume при каденции {cadence}: {e}")));
+        loop {
+            match live.pump(dir.path(), EpochFilter::OwnCaptureOnly, 256) {
+                Ok((frames, _, _)) if frames.is_empty() => break,
+                Ok(_) => continue,
+                Err(e) => setup_failed(&format!("pump при каденции {cadence}: {e}")),
+            }
+        }
+        let live_series = live.snapshot().series.depth_series;
+
+        // ПЕРЕПРОИГРАННЫЙ путь: независимый полный реплей того же окна.
+        let replay_series = snap(dir.path(), Some(cadence)).series.depth_series;
+
+        // SETUP-GUARD: без точек сравнивать нечего, и зелёное было бы вакуумом.
+        let n_replay: usize = replay_series.iter().map(|r| r.series.len()).sum();
+        if n_replay == 0 {
+            setup_failed(&format!(
+                "при каденции {cadence} реплей не дал НИ ОДНОЙ точки — предмет не воспроизведён"
+            ));
+        }
+
+        let n_live: usize = live_series.iter().map(|r| r.series.len()).sum();
+        assert_eq!(
+            live_series, replay_series,
+            "MD-I-8 d20 / VB-I-2 (R-141 Б-2): при каденции {cadence} мс живая депт-серия \
+             НЕ РАВНА перепроигранной — точек {n_live} против {n_replay}. VB-I-2 \
+             (docs/fa/viz-backend.md:189) требует БИТ-ИДЕНТИЧНОСТИ, а не «не хуже». \
+             Сброс незакрытого каденс-интервала сделан только на пути, которым ходит \
+             РЕПЛЕЙ (finish(self)); живой путь идёт finish_ref(&self) и сбросить не может. \
+             Клиент кокпита теряет самую свежую точку глубины, а перепроигрывание её отдаёт"
+        );
+    }
+}
