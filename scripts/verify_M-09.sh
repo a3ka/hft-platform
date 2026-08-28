@@ -81,7 +81,7 @@ miss3=$(comm -23 <(echo "${names_code}") <(echo "${names_fa3}") | grep -v '^$' |
 # (в, C-009 M1) КАЖДЫЙ КАНОНИЧЕСКИЙ КЛАСС ИНЦИДЕНТА обязан иметь строку §7.1 (иначе целый класс
 # выпадает из паритета — ровно C-007 C1). Удаление, напр., строки `C1-M08` (порча книги, P0)
 # обязано ВАЛИТЬ гейт. Список — канон P0/P1-классов ops.md §7; расширяется вместе с §7.1.
-REQUIRED_INCIDENTS="TD-011 TD-013 TD-014 TD-016 C1-M08 TD-006 OPS-BKP OPS-SILENCE OPS-RESYNC OPS-GAP"
+REQUIRED_INCIDENTS="TD-011 TD-013 TD-014 TD-016 C1-M08 TD-006 OPS-BKP OPS-SILENCE OPS-RESYNC OPS-GAP OPS-RESTART"
 rows71=$(sed -n '/### §7.1/,/Правило паритета/p' "${FA}" | grep -oE '^\| `[A-Za-z0-9-]+`' | tr -d '`|' | tr -d ' ' | sort -u)
 miss_inc=""
 for id in ${REQUIRED_INCIDENTS}; do
