@@ -187,6 +187,7 @@ Merge в `main` без файла `research/reviews/R-NNN.md`, называющ�
 **Шапка `GATE-META` — машинная привязка вердикта к ПРЕДМЕТУ.** Вердикт любого гейта
 (`C-NNN`/`R-NNN`/`A-NNN`) открывается блоком:
 
+```text
 <!-- GATE-META
 milestone: M-NN
 audited_repo: <owner/repo — origin ЭТОГО репозитория>
@@ -194,6 +195,7 @@ audited_base: <полный SHA базы аудита>
 audited_head: <полный SHA вершины, которую судили>
 verdict: REJECT | NOTE | ESCALATE | APPROVE | PASS | CONCERNS | KILL | DECISION
 -->
+```
 
 Зачем машинная форма, если те же сведения есть в прозе: прозу нельзя проверить барьером.
 `C-062` — вердикт, вынесенный над историей, которой в этом репозитории НЕТ; поймали его
