@@ -173,8 +173,46 @@ fn invalid_cadence_is_rejected_naming_the_variable() {
 /// Предел проверки НАЗВАН: это ЛЕКСИЧЕСКИЙ поиск по compose. Он ловит отсутствие объявления
 /// и не доказывает, что переменная доедет до процесса при любой форме запуска —
 /// `COGNITIVE-ONLY` в этой части, и выдавать его за большее нельзя.
+/// Блок службы из `docker-compose.yml`: от строки `  <имя>:` до следующего ключа того же
+/// уровня. Наивный разбор достаточен и назван таковым: полный YAML-парсер сюда тащить незачем,
+/// а на этом файле форма стабильна.
+fn compose_service_block(text: &str, service: &str) -> Option<String> {
+    let head = format!("  {service}:");
+    let mut out: Vec<&str> = Vec::new();
+    let mut inside = false;
+    for line in text.lines() {
+        if line == head {
+            inside = true;
+            continue;
+        }
+        if inside {
+            // Ключ ТОГО ЖЕ уровня (ровно два пробела отступа) закрывает блок службы.
+            let two_space_key = line.starts_with("  ")
+                && !line.starts_with("   ")
+                && line.trim_start().starts_with(|c: char| c.is_alphanumeric());
+            if two_space_key {
+                break;
+            }
+            out.push(line);
+        }
+    }
+    if inside {
+        Some(out.join("\n"))
+    } else {
+        None
+    }
+}
+
+/// **КОМПОЗИЦИЯ ДОСТАВКИ — ПОСЛУЖЕБНО, А НЕ ПОДСТРОКОЙ ПО ФАЙЛУ (`R-145` Б-2).**
+///
+/// Прежняя редакция искала имя переменной по ВСЕМУ `docker-compose.yml`. Замер ревьюера:
+/// снятие ОБЕИХ строк каденции у службы `gateway-checkpoint` оставляло проверку ЗЕЛЁНОЙ,
+/// потому что переменная по-прежнему объявлена у `gateway-serve`. То есть страж доставки
+/// не различал две службы — а весь предмет задачи 23 в том и состоит, что ручка обязана
+/// дойти до ОБЕИХ: писатель чекпоинта и читатель обязаны договориться о каденции, иначе
+/// слепок не находится и журнал перечитывается целиком (`TD-044`).
 #[test]
-fn knob_is_declared_in_compose() {
+fn knob_is_declared_for_both_services_in_compose() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(|p| p.parent())
@@ -182,11 +220,73 @@ fn knob_is_declared_in_compose() {
     let compose = root.join("docker-compose.yml");
     let text = std::fs::read_to_string(&compose)
         .unwrap_or_else(|e| panic!("SETUP: {} не прочитан: {e}", compose.display()));
-    assert!(
-        text.contains(VAR),
-        "{VAR} не объявлена в {}. Ручка существует только в коде: юнит-оракулы выше зелены, \
-         а оператор на проде задать значение НЕ МОЖЕТ — деплой её не устанавливает. Образец \
-         объявления — соседняя GATEWAY_WINDOW_MS в том же файле",
-        compose.display()
-    );
+
+    for service in ["gateway-serve", "gateway-checkpoint"] {
+        let block = compose_service_block(&text, service).unwrap_or_else(|| {
+            panic!(
+                "SETUP НЕ СОСТОЯЛСЯ: службы `{service}` в {} нет — разбор ищет не то, и                  зелёный этой проверки не значил бы ничего",
+                compose.display()
+            )
+        });
+        assert!(
+            block.contains(VAR),
+            "{VAR} не объявлена у службы `{service}` в {}. Проверять подстроку по ВСЕМУ файлу              нельзя: снятие ручки у ОДНОЙ службы оставляло страж зелёным, пока она объявлена              у другой (замер `R-145` Б-2). Писатель чекпоинта и читатель обязаны получить ОДНО              значение каденции — иначе `selector_fingerprint` расходится, слепок не находится,              и каждое подключение реплеит журнал целиком (`TD-044`)",
+            compose.display()
+        );
+    }
+}
+
+/// **`d18e` — ЗАДАЧА 24: НЕВЫРАВНЕННАЯ ПАРА ОТВЕРГАЕТСЯ НА СТАРТЕ.**
+///
+/// `R-145` Б-1: задача 24 была реализована БЕЗ ЕДИНОГО ОРАКУЛА. Замер ревьюера — удаление
+/// гварда отношения целиком оставляло `gateway-serve` 76/0 и `gateway` 157/0 зелёными, а в
+/// `verify_M-68.sh` не было ни одного шага на эту задачу. Строка §Tasks объявляла оракулом
+/// «`d20` соседний», но `d20` живёт в другом крейте и судит `live == replay`, к
+/// `serve_config_from_env` не обращаясь вовсе.
+///
+/// Предмет: пара `timeframe_ms=3000, cadence_ms=10000` поднимает ЗДОРОВЫЙ контейнер, который
+/// отвергает КАЖДОЕ подключение через `gateway::validate_selector` — класс `TD-019`/`TD-020`.
+/// Старт обязан отказать ЗАРАНЕЕ, и сообщение обязано назвать ОБЕ переменные: дежурный по
+/// §8 eyes-on видит `healthy` и пустой кокпит, а причина — в паре, не в одной ручке.
+#[test]
+fn d18e_misaligned_pair_is_rejected_at_startup() {
+    let res = serve_config_from_env(getter(&[
+        ("GATEWAY_JWT_SECRET", "test-secret"),
+        ("GATEWAY_TIMEFRAME_MS", "3000"),
+        ("GATEWAY_MAX_SUBSCRIPTIONS", "16"),
+        (VAR, "10000"),
+    ]));
+    let Err(msg) = res else {
+        panic!(
+            "GATEWAY_TIMEFRAME_MS=3000 + {VAR}=10000 приняты СТАРТОМ. 10000 % 3000 = 1000 != 0:              эффективная частота есть НОК(3000, 10000) = 30000 и расходится с заявленной.              Контейнер поднимется ЗДОРОВЫМ, а validate_selector отвергнет КАЖДОГО клиента —              ровно класс TD-019/TD-020, ради которого задача 24 существует"
+        );
+    };
+    for needle in ["GATEWAY_TIMEFRAME_MS", VAR] {
+        assert!(
+            msg.contains(needle),
+            "отказ старта не называет `{needle}`: «{msg}». Дежурный видит healthy-контейнер и              пустой кокпит; причина — в ПАРЕ, и сообщение обязано назвать обе переменные,              иначе диагноз ложен (класс R-143 B-3)"
+        );
+    }
+}
+
+/// **`d18f` — ПАРНЫЙ VANTAGE: `cadence < timeframe` НЕ отвергается.**
+///
+/// Без него реализация «отвергать всё, что не делится» прошла бы `d18e` и сломала бы
+/// названный спекой carve-out: при `cadence_ms < timeframe_ms` гвард НЕ применяется
+/// (фильтр вырожден — отдельный предмет). Оракул, красный против ПРАВИЛЬНОЙ реализации,
+/// хуже отсутствующего: его выключают, и защиты не остаётся.
+#[test]
+fn d18f_cadence_below_timeframe_is_not_rejected() {
+    let cfg = serve_config_from_env(getter(&[
+        ("GATEWAY_JWT_SECRET", "test-secret"),
+        ("GATEWAY_TIMEFRAME_MS", "3000"),
+        ("GATEWAY_MAX_SUBSCRIPTIONS", "16"),
+        (VAR, "1000"),
+    ]))
+    .unwrap_or_else(|e| {
+        panic!(
+            "{VAR}=1000 при GATEWAY_TIMEFRAME_MS=3000 отвергнут стартом: {e}. Спека называет              этот случай carve-out'ом — при cadence < timeframe гвард отношения НЕ применяется.              Гвард стал шире собственного контракта"
+        )
+    });
+    assert_eq!(cfg.selector.depth_cadence_ms, Some(1_000));
 }

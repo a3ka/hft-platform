@@ -146,10 +146,10 @@ chk cargo test -p gateway-serve --test red_depth_cadence_from_env --quiet
 # Состав пиннится числом: оракул точки входа состоит из ЧЕТЫРЁХ проверок, и потеря любой
 # делает остальные вакуумными. Без композиции доставки (`knob_is_declared_in_compose`) ручка
 # зелена в юнитах и недоступна оператору — ровно класс, ради которого задача заведена.
-EXPECT_E=4
-N_E=$(grep -cE "^fn [a-z_]+\(\) \{" crates/gateway-serve/tests/red_depth_cadence_from_env.rs || true); N_E=${N_E:-0}
+EXPECT_E=6
+N_E=$(grep -cE "^fn [a-z0-9_]+\(\) \{" crates/gateway-serve/tests/red_depth_cadence_from_env.rs || true); N_E=${N_E:-0}
 if [ "${N_E}" -eq "${EXPECT_E}" ]; then
-  echo "PASS: C3bis состав набора — ${N_E} оракулов (ожидалось ровно ${EXPECT_E}: доходит, дефолт≡пусто≡отсутствие, отказ на мусоре, объявлена в compose)"
+  echo "PASS: C3bis состав набора — ${N_E} оракулов (ожидалось ровно ${EXPECT_E}: доходит, дефолт≡пусто≡отсутствие, отказ на мусоре, объявлена у ОБЕИХ служб, d18e невыравненная пара, d18f carve-out)"
 else
   echo "FAIL: C3bis состав набора — ${N_E} при ожидаемых ${EXPECT_E}; порог и набор разошлись"
   FAIL=$((FAIL + 1))
