@@ -26,6 +26,13 @@
 # правка одной строки в старой спеке заставляла бы дописывать четыре раздела и блокировала бы
 # работу, не связанную с формой.
 #
+# ЗАГОЛОВОК — ATX-ФОРМА, А НЕ ПРЕФИКС (`C-173` B-6, воспроизведено). Регексп требует
+# `#{2,3} +имя`: между решётками и именем ОБЯЗАН быть пробел. Прежняя редакция писала ` *`
+# (ноль и более), и `##Allowed paths` печаталось `OK` при exit=0 — а это не заголовок ATX и
+# не раздел по `docs/04-workflow.md` §6. Глубина `#{2,3}` при этом ЗНАЧИМА: `#### Allowed
+# paths` отвергается, потому что после первых двух-трёх решёток обязан идти пробел, а идёт
+# решётка.
+#
 # ЗАГОЛОВОК СЧИТАЕТСЯ ТОЛЬКО В ВИДИМОМ ТЕЛЕ (`C-101` B-1, воспроизведено). Строка
 # `## Allowed paths` внутри ```-фенса или внутри `<!-- -->` — ПРИМЕР или закомментированный
 # черновик, а не раздел этого документа. Прежняя редакция подавала весь Markdown в `grep` и
@@ -85,11 +92,23 @@ FAIL=0
 # Тело БЕЗ fenced-code и БЕЗ HTML-комментариев: заголовок засчитывается только здесь.
 visible_body() {
   git show "HEAD:$1" 2>/dev/null | awk '
-    BEGIN { fence = 0; comment = 0 }
+    BEGIN { fence = 0; marker = ""; comment = 0 }
     {
       line = $0
-      if (fence == 0 && comment == 0 && line ~ /^[ ]{0,3}(```|~~~)/) { fence = 1; next }
-      if (fence == 1) { if (line ~ /^[ ]{0,3}(```|~~~)/) fence = 0; next }
+      # C-173 B-5: фенс закрывается ТОЛЬКО ТЕМ ЖЕ маркером, которым открыт. Прежняя
+      # редакция помнила лишь факт «фенс открыт» и принимала ~~~ за закрытие ```-блока:
+      # следующий за ним `## Allowed paths` оставался ВНУТРИ фенса, но засчитывался как
+      # раздел. Это возврат обещания B-1 на непроверенной границе (CommonMark: закрывающий
+      # забор обязан быть того же символа и не короче открывающего).
+      if (fence == 0 && comment == 0 && line ~ /^[ ]{0,3}(```|~~~)/) {
+        marker = (line ~ /^[ ]{0,3}```/) ? "```" : "~~~"
+        fence = 1; next
+      }
+      if (fence == 1) {
+        if (marker == "```" && line ~ /^[ ]{0,3}```/) fence = 0
+        else if (marker == "~~~" && line ~ /^[ ]{0,3}~~~/) fence = 0
+        next
+      }
       if (comment == 1) { if (line ~ /-->/) comment = 0; next }
       if (line ~ /<!--/) { if (line !~ /-->/) comment = 1; next }
       print line
@@ -108,10 +127,10 @@ check_section() {
 for f in "${added[@]}"; do
   [ -n "$f" ] || continue
   echo "=== проверяю форму: $f ==="
-  check_section "$f" "Objective"     '^#{2,3} *Objective'
-  check_section "$f" "Allowed paths" '^#{2,3} *Allowed paths'
-  check_section "$f" "§Tasks"        '^#{2,3} *§?Tasks'
-  check_section "$f" "Acceptance"    '^#{2,3} *Acceptance'
+  check_section "$f" "Objective"     '^#{2,3} +Objective'
+  check_section "$f" "Allowed paths" '^#{2,3} +Allowed paths'
+  check_section "$f" "§Tasks"        '^#{2,3} +§?Tasks'
+  check_section "$f" "Acceptance"    '^#{2,3} +Acceptance'
 done
 
 if [ "$FAIL" -ne 0 ]; then

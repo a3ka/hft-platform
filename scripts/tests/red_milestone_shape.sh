@@ -113,6 +113,55 @@ Acceptance описан прозой в теле задач, отдельног�
 EOF
 }
 
+# `C-173` B-5: фенс ОТКРЫТ ```, а «закрыт» ~~~. По CommonMark забор закрывается тем же
+# символом, значит блок НЕ закрыт и `## Allowed paths` внутри него — не раздел документа.
+spec_mismatched_fence() {
+  cat <<'EOF'
+# M-99 — тестовая спека
+## Objective
+Цель.
+## §Tasks
+| # | Status |
+## Acceptance
+`scripts/verify_M-99.sh`
+
+```markdown
+~~~
+## Allowed paths
+| путь | кто |
+EOF
+}
+
+# `C-173` B-6: `##Allowed paths` без пробела — не ATX-заголовок, а обычная строка.
+spec_no_space_after_hashes() {
+  cat <<'EOF'
+# M-99 — тестовая спека
+## Objective
+Цель.
+##Allowed paths
+| путь | кто |
+## §Tasks
+| # | Status |
+## Acceptance
+`scripts/verify_M-99.sh`
+EOF
+}
+
+# `C-173` B-7.3: глубина заголовка ЗНАЧИМА — форма допускает `## X` и `### X`, не `#### X`.
+spec_h4_section() {
+  cat <<'EOF'
+# M-99 — тестовая спека
+## Objective
+Цель.
+#### Allowed paths
+| путь | кто |
+## §Tasks
+| # | Status |
+## Acceptance
+`scripts/verify_M-99.sh`
+EOF
+}
+
 # Позитивный контроль к фиксу B-1: ЗАКРЫТЫЙ фенс не должен скрывать разделы ПОСЛЕ себя.
 # Без этого сценария фикс «выкинуть всё после первого ```» прошёл бы пробу.
 spec_fence_then_real_sections() {
@@ -166,6 +215,17 @@ scenario() {  # $1=имя  $2=ожидаемый_код  $3=тело_спеки_
       git -C "$d" add -A >/dev/null; git -C "$d" commit -qm "seed old spec"
       echo "правка" >> "$d/milestones/M-98-old.md"
       git -C "$d" add -A >/dev/null; git -C "$d" commit -qm "modify spec" ;;
+    dirty)
+      # C-173 B-7.1: закоммичена НЕПОЛНАЯ спека, а в РАБОЧЕМ ДЕРЕВЕ лежит полная.
+      # Барьер обязан судить HEAD (предмет — закоммиченный диапазон), а не то, что под рукой.
+      printf '%s\n' "$(full_spec | grep -v 'Allowed paths')" > "$d/milestones/M-99-probe.md"
+      git -C "$d" add -A >/dev/null; git -C "$d" commit -qm "add incomplete spec"
+      printf '%s\n' "$body" > "$d/milestones/M-99-probe.md" ;;   # НЕ коммитим
+    unicode)
+      # C-173 B-7.2: имя файла вне ASCII. В текстовом режиме git КВОТИРУЕТ его, и
+      # обработка без `-z`/`mapfile -d ''` промахивается мимо файла молча.
+      printf '%s\n' "$body" > "$d/milestones/M-99-кириллица.md"
+      git -C "$d" add -A >/dev/null; git -C "$d" commit -qm "add unicode-named spec" ;;
     rename)
       printf '%s\n' "$body" > "$d/milestones/M-98-old.md"
       git -C "$d" add -A >/dev/null; git -C "$d" commit -qm "seed old spec"
@@ -179,6 +239,18 @@ scenario() {  # $1=имя  $2=ожидаемый_код  $3=тело_спеки_
   if [ "$mode" = add ]; then
     git -C "$d" diff --diff-filter=A --name-only HEAD~1 HEAD -- 'milestones/M-*.md' \
       | grep -q . || { bad "$name — SETUP НЕ СОСТОЯЛСЯ: файл не числится добавленным"; return; }
+  fi
+  # SETUP-GUARD для dirty: рабочее дерево ОБЯЗАНО расходиться с HEAD, иначе сценарий
+  # вырождается в обычный `add` и ничего не различает.
+  if [ "$mode" = dirty ]; then
+    git -C "$d" diff --quiet -- milestones/M-99-probe.md \
+      && { bad "$name — SETUP НЕ СОСТОЯЛСЯ: дерево не расходится с HEAD"; return; }
+  fi
+  # SETUP-GUARD для unicode: git ОБЯЗАН квотировать имя в текстовом режиме, иначе
+  # сценарий не давит на `-z` (на другой локали/конфиге quoting может быть выключен).
+  if [ "$mode" = unicode ]; then
+    git -C "$d" diff --diff-filter=AR --name-only HEAD~1 HEAD -- 'milestones/M-*.md' \
+      | grep -q '"' || { bad "$name — SETUP НЕ СОСТОЯЛСЯ: git не квотирует не-ASCII имя"; return; }
   fi
   # SETUP-GUARD для rename: git ОБЯЗАН числить правку статусом `R`, иначе проверяется не тот
   # сценарий (при слишком мелком файле детектор переименований может дать `A`+`D`).
@@ -207,6 +279,17 @@ scenario "раздел только в \`\`\`-фенсе → отказ"        
 scenario "раздел только в ~~~-фенсе → отказ"           1 "$(spec_section_in_fence '~~~')"                      add
 scenario "раздел только в HTML-комментарии → отказ"    1 "$(spec_section_in_comment)"                          add
 scenario "ЗАКРЫТЫЙ фенс не скрывает разделы после"     0 "$(spec_fence_then_real_sections)"                    add
+
+echo "=== ФОРМА ЗАГОЛОВКА И ГРАНИЦА ФЕНСА (C-173 B-5/B-6/B-7.3) ==="
+scenario "несовпадающий маркер фенса не закрывает блок" 1 "$(spec_mismatched_fence)"      add
+scenario "##Allowed paths без пробела → отказ"          1 "$(spec_no_space_after_hashes)" add
+scenario "#### Allowed paths (H4) → отказ"              1 "$(spec_h4_section)"            add
+
+echo "=== СУДИТСЯ HEAD, А НЕ РАБОЧЕЕ ДЕРЕВО (C-173 B-7.1) ==="
+scenario "полная спека в дереве не спасает неполную в HEAD" 1 "$(full_spec)"              dirty
+
+echo "=== НЕ-ASCII ИМЯ ФАЙЛА НЕ ТЕРЯЕТСЯ (C-173 B-7.2) ==="
+scenario "спека с кириллицей в имени принимается"       0 "$(full_spec)"                  unicode
 
 echo "=== ЗАГОЛОВОК, А НЕ ВХОЖДЕНИЕ СЛОВА (C-101 B-2) ==="
 scenario "имя раздела только в прозе → отказ"          1 "$(spec_name_in_prose_only)"                          add
@@ -308,9 +391,19 @@ if [ -z "${MSHAPE_SELFTEST:-}" ]; then
   make_stub renameblind 's|--diff-filter=AR|--diff-filter=A|' \
     && try_stub "rename снова невидим (--diff-filter=A)" "$STUB_PATH"
 
+  # Ослабление 4 (`C-173` B-7.1) — барьер читает РАБОЧЕЕ ДЕРЕВО вместо закоммиченного объекта.
+  make_stub worktree 's|git show "HEAD:$1" 2>/dev/null|cat "$1"|' \
+    && try_stub "рабочее дерево вместо HEAD" "$STUB_PATH"
+  # Ослабление 5 (`C-173` B-7.2) — потеряна NUL-безопасность: не-ASCII имя уходит квотированным.
+  make_stub nulunsafe 's|--name-only -z|--name-only|' \
+    && try_stub "не-ASCII имя теряется (без -z)" "$STUB_PATH"
+  # Ослабление 6 (`C-173` B-7.3) — расширена допустимая глубина заголовка.
+  make_stub h4depth 's|#{2,3} +|#{2,4} +|g' \
+    && try_stub "H4 принимается как раздел" "$STUB_PATH"
+
   echo "  батарея ослаблений: поймано ${BATTERY_OK} из ${BATTERY_N}"
-  if [ "$BATTERY_N" -lt 4 ]; then
-    bad "батарея неполна: ${BATTERY_N} ослаблений вместо 4 — стаб не собрался, значит не проверен"
+  if [ "$BATTERY_N" -lt 7 ]; then
+    bad "батарея неполна: ${BATTERY_N} ослаблений вместо 7 — стаб не собрался, значит не проверен"
   fi
 fi
 
