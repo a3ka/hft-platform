@@ -209,6 +209,30 @@ jobs:
           bash scripts/tests/red_artifact_ids.sh
           bash scripts/tests/red_artifact_ids.sh --battery
 
+  milestone-shape:
+    name: Milestone shape (форма спеки, C-099 B-1)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # Та же проводка базы, что у protected-artifacts / artifact-ids: база — из СОБЫТИЯ,
+      # недостоверная база (zero / force-push / не-предок) — fail-closed.
+      - name: Введённая milestone-спека несёт обязательные разделы формы (04-workflow §6)
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: bash scripts/check_milestone_shape.sh
+
+      # Анти-плацебо: барьер проверяется ТОЙ ЖЕ формой вызова, какой его зовёт прод-джоб выше.
+      # Самопроверка — прогон пробы против БАТАРЕИ из четырёх ослаблений, выведенных из живого
+      # барьера `sed`-подстановкой; каждое обязано её уронить, а несобравшийся стаб — FAIL,
+      # не пропуск. Число сценариев здесь — литерал: меняешь состав пробы, меняешь и его
+      # (`gates.md` §Целостность гейта; литерал «14» протух ровно этим коммитом).
+      - name: Проба барьера (24 сценария + батарея из 4 ослаблений)
+        run: bash scripts/tests/red_milestone_shape.sh
+
   reserve-ids:
     name: Reserve IDs (CAS-резерв номеров, гонка параллельных сессий)
     runs-on: ubuntu-latest
@@ -443,11 +467,11 @@ jobs:
   status-check:
     name: All checks passed
     runs-on: ubuntu-latest
-    needs: [build-test, security, delivery, protected-artifacts, contracts, docs-freeze, artifact-ids, reserve-ids, design-claims, context-budgets, gate-meta, deploy-catchup, review-fa, resource-oracles]
+    needs: [build-test, security, delivery, protected-artifacts, contracts, docs-freeze, artifact-ids, milestone-shape, reserve-ids, design-claims, context-budgets, gate-meta, deploy-catchup, review-fa, resource-oracles]
     if: always()
     steps:
       - run: |
-          if [[ "${{ needs.build-test.result }}" != "success" || "${{ needs.security.result }}" != "success" || "${{ needs.delivery.result }}" != "success" || "${{ needs.protected-artifacts.result }}" != "success" || "${{ needs.contracts.result }}" != "success" || "${{ needs.docs-freeze.result }}" != "success" || "${{ needs.artifact-ids.result }}" != "success" || "${{ needs.reserve-ids.result }}" != "success" || "${{ needs.design-claims.result }}" != "success" || "${{ needs.context-budgets.result }}" != "success" || "${{ needs.gate-meta.result }}" != "success" || "${{ needs.deploy-catchup.result }}" != "success" || "${{ needs.review-fa.result }}" != "success" || "${{ needs.resource-oracles.result }}" != "success" ]]; then
+          if [[ "${{ needs.build-test.result }}" != "success" || "${{ needs.security.result }}" != "success" || "${{ needs.delivery.result }}" != "success" || "${{ needs.protected-artifacts.result }}" != "success" || "${{ needs.contracts.result }}" != "success" || "${{ needs.docs-freeze.result }}" != "success" || "${{ needs.artifact-ids.result }}" != "success" || "${{ needs.milestone-shape.result }}" != "success" || "${{ needs.reserve-ids.result }}" != "success" || "${{ needs.design-claims.result }}" != "success" || "${{ needs.context-budgets.result }}" != "success" || "${{ needs.gate-meta.result }}" != "success" || "${{ needs.deploy-catchup.result }}" != "success" || "${{ needs.review-fa.result }}" != "success" || "${{ needs.resource-oracles.result }}" != "success" ]]; then
             echo "One or more checks failed"; exit 1
           fi
           echo "All checks passed"
