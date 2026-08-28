@@ -280,18 +280,44 @@ fn main() -> ExitCode {
     // (та же логика, что и в `serve_config_from_env`), и чекпоинт читается тёплым
     // стартом, а не реплеится целиком.
     const DEFAULT_CADENCE_MS: i64 = 1_000;
-    let cadence_from_env: Option<i64> =
-        std::env::var("GATEWAY_DEPTH_CADENCE_MS")
-            .ok()
-            .and_then(|raw| {
-                let trimmed = raw.trim();
-                if trimmed.is_empty() {
-                    Some(DEFAULT_CADENCE_MS)
-                } else {
-                    // Невалидное env обрабатывается ниже как fail-closed.
-                    trimmed.parse::<i64>().ok()
+    // R-147 N-1 (SYMMETRY OF BEHAVIOR): писатель чекпоинта и читатель
+    // (`gateway-serve`) делят ОДНУ переменную `GATEWAY_DEPTH_CADENCE_MS`, и её
+    // значение входит в `selector_fingerprint` — имя файла слепка. Оператор с
+    // опечаткой в compose ПОЛУЧАЛ ранее писателя на молчаливом дефолте 1000
+    // (parse через `.ok()` глотал ошибку) и читателя, отказавшегося стартовать
+    // (`serve_config_from_env` отвергает мусор). Расхождение ПОВЕДЕНИЯ на одном
+    // входе хуже обоих чистых исходов, и обе стороны обязаны мусор ОТВЕРГАТЬ.
+    //
+    // Поведение на ОТСУТСТВИИ и ПУСТОЙ строке (после `trim`) — НЕ ТРОГАЕМ: это
+    // `A-015` §3 п.1 (отдельное решение founder'а), один исход — подписанный
+    // дефолт 1000 мс. Меняется поведение ТОЛЬКО на невалидном ЗНАЧЕНИИ.
+    //
+    // Сообщение взято с соседней `serve_config_from_env` (crates/gateway-serve/
+    // src/lib.rs) ДОСЛОВНО — оператор видит ТАКУЮ ЖЕ формулировку от обоих
+    // процессов, и путь к фиксу не расходится по названию переменной.
+    let cadence_from_env: Option<i64> = match std::env::var("GATEWAY_DEPTH_CADENCE_MS") {
+        Err(_) => None,
+        Ok(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                Some(DEFAULT_CADENCE_MS)
+            } else {
+                match trimmed.parse::<i64>() {
+                    Ok(ms) => Some(ms),
+                    Err(e) => {
+                        eprintln!(
+                            "gateway-checkpoint: GATEWAY_DEPTH_CADENCE_MS={trimmed:?} \
+                             не парсится как i64 ({e}) — опечатка в `.env` (мусор/\
+                             суффикс/научная нотация/дробное/переполнение), а не \
+                             сигнал к дефолту; оператор обязан задать валидное \
+                             значение или unset/пусто/пробельное для дефолта"
+                        );
+                        return ExitCode::from(2);
+                    }
                 }
-            });
+            }
+        }
+    };
     let cadence_raw: i64 = match args.depth_cadence_ms.or(cadence_from_env) {
         Some(ms) => ms,
         None => DEFAULT_CADENCE_MS,
