@@ -6,7 +6,12 @@ audited_head: 679b114d3de59b8098785baf2b4825b4ef615c1d
 verdict: REJECT
 -->
 
-# C-172 — REJECT: adversary audit `harness-milestone-shape`, round 2
+# C-173 — REJECT: adversary audit `harness-milestone-shape`, round 2
+
+> Identifier correction: this verdict was initially committed as `C-172`, then
+> found to collide with the independently existing `C-172` on another remote
+> branch.  It is superseded by this reserved `C-173` artifact; the replacement
+> commit names the protected-file deletion explicitly.
 
 ## Subject and route
 
@@ -215,7 +220,7 @@ exit=0
 - **Next agent:** `architect`
 - **Paste-ready prompt:**
   ```
-  On feat/harness-milestone-shape, address REJECT C-172 before requesting another adversary pass. Preserve the harness-track scope. Extend the RED probe with setup-guarded cases for: a mismatched/invalid closing marker inside a fenced block; a non-heading `##Allowed paths`; a committed incomplete artifact whose dirty worktree is complete; a complete non-ASCII filename; and a forbidden H4 section heading. The probe must be red against the corresponding live-derived semantic stubs, then green against the honest barrier. Commit and push the corrected artifact set; provide its full SHA and base for a fresh critic audit.
+  On feat/harness-milestone-shape, address REJECT C-173 before requesting another adversary pass. Preserve the harness-track scope. Extend the RED probe with setup-guarded cases for: a mismatched/invalid closing marker inside a fenced block; a non-heading `##Allowed paths`; a committed incomplete artifact whose dirty worktree is complete; a complete non-ASCII filename; and a forbidden H4 section heading. The probe must be red against the corresponding live-derived semantic stubs, then green against the honest barrier. Commit and push the corrected artifact set; provide its full SHA and base for a fresh critic audit.
   ```
 - Push status: this REJECT verdict is committed and pushed to `origin/feat/harness-milestone-shape` before handoff.
 - Cache: no build cache created.
