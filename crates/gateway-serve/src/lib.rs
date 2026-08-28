@@ -1350,24 +1350,45 @@ pub mod server {
                         }
                         Err(boxed) => {
                             let (live, e, gen_at_pump) = *boxed;
-                            // M-71 (rev6, задача 13 N-1 / `R-139` §4 п.3): не маскировать
-                            // программный отказ (предел объёма, `PL-I-5`) под «sub продолжит
-                            // молча» — это fail-open по существу. Различаем причину по `ErrorKind`,
-                            // чтобы §8 eyes-on видел правду, а не подмену.
-                            let kind = e.kind();
-                            let tag = matches!(kind, io::ErrorKind::Other);
-                            tracing::error!(
-                                error = %e,
-                                sub = %id,
-                                limit_kind = tag,
-                                "v1 LiveReducer::pump failed ({}) — sub продолжит молча",
-                                if tag { "предел объёма или программная причина" } else { "журнал/IO" }
-                            );
+                            // M-71 (rev7, `R-143` B-2 + `R-139` N-1): отказ ПО ПРЕДЕЛУ
+                            // ТЕРМИНАЛЕН для подписки. Повторный `pump` того же кадра ничего
+                            // не лечит — кадр не станет меньше, пока предел стоит; это
+                            // livelock, ради которого §4bis.5 вычеркнула «чистую
+                            // транзакционность». Штатная развязка (`DESIGN` §16): подписка
+                            // ЗАВЕРШАЕТСЯ явно, клиент пересобирается СНАПШОТОМ (повторный
+                            // `subscribe` — снимок идёт через `snapshot_checked`, то есть
+                            // тоже под пределом: fail-closed сохранён).
+                            //
+                            // Причина различается ФЛАГОМ РЕДЬЮСЕРА, а не `io::ErrorKind`:
+                            // журнал отдаёт `Other` в четырёх местах
+                            // (`crates/journal/src/segments.rs:654,657,660,663`), и матч по
+                            // виду ошибки объявлял бы повреждение журнала «пределом объёма»
+                            // (`R-143` B-3). Флаг выставляется РОВНО в точке отказа гварда.
+                            let cap_terminal = live.is_cap_terminal();
+                            let refusals = live.cap_refusals();
+                            if cap_terminal {
+                                tracing::error!(
+                                    error = %e,
+                                    sub = %id,
+                                    refusals,
+                                    "v1 LiveReducer::pump отвергнут ПРЕДЕЛОМ ОБЪЁМА (PL-I-5) — \
+                                     подписка ЗАВЕРШАЕТСЯ, клиент извещён и обязан \
+                                     пересобраться снапшотом; журнал тут ни при чём"
+                                );
+                            } else {
+                                tracing::error!(
+                                    error = %e,
+                                    sub = %id,
+                                    "v1 LiveReducer::pump failed (журнал/IO либо программная \
+                                     причина) — sub продолжит молча"
+                                );
+                            }
                             // Даже на pump-ошибке пробуем вернуть `live` в карту, если sub
-                            // всё ещё наш по generation. Иначе просто дропаем.
+                            // всё ещё наш по generation И отказ НЕ терминален. Иначе дропаем.
                             let drained = inner.draining_ids.remove(&id);
                             let current_gen = inner.gens.get(&id).copied();
-                            let live_keeps = !drained && current_gen == Some(gen_at_pump);
+                            let live_keeps =
+                                !drained && current_gen == Some(gen_at_pump) && !cap_terminal;
                             if let Some(sub) = inner.subs.get_mut(&id) {
                                 if live_keeps {
                                     sub.live = Some(live);
@@ -1376,6 +1397,24 @@ pub mod server {
                                 }
                             } else {
                                 drop(live);
+                            }
+                            if cap_terminal {
+                                // Снятие подписки — та же пара действий, что у `unsubscribe`
+                                // (`subs` + `gens`): любой in-flight pump этого id увидит
+                                // `current_gen == None` и отбросит свой результат.
+                                inner.subs.remove(&id);
+                                inner.gens.remove(&id);
+                                // Форма ошибки протокола НЕ меняется (§4.1): переиспользуем
+                                // `invalid_selector` — тот же код, которым предел отвечает на
+                                // `subscribe`. Текст `e` называет предел и наблюдённую
+                                // величину (задача 6) плюс требование ресинка.
+                                send_v1_error(
+                                    &mut sink,
+                                    Some(&id),
+                                    "invalid_selector",
+                                    &e.to_string(),
+                                )
+                                .await;
                             }
                         }
                     }
@@ -1735,10 +1774,26 @@ pub mod server {
                         }
                         Err(boxed) => {
                             let (live, e, gen_at_pump) = *boxed;
-                            tracing::error!(error = %e, sub = %id, "legacy v1 pump err");
+                            // M-71 (rev7, `R-143` B-2): та же терминальность, что в
+                            // `run_v1_session_loop` — предел ОБЪЁМА завершает подписку,
+                            // клиент извещается и пересобирается снапшотом. Признак —
+                            // флаг редьюсера, не `io::ErrorKind` (`R-143` B-3).
+                            let cap_terminal = live.is_cap_terminal();
+                            if cap_terminal {
+                                tracing::error!(
+                                    error = %e,
+                                    sub = %id,
+                                    refusals = live.cap_refusals(),
+                                    "legacy v1 pump отвергнут ПРЕДЕЛОМ ОБЪЁМА (PL-I-5) — \
+                                     подписка ЗАВЕРШАЕТСЯ, клиент извещён"
+                                );
+                            } else {
+                                tracing::error!(error = %e, sub = %id, "legacy v1 pump err");
+                            }
                             let drained = v1_session_inner.draining_ids.remove(&id);
                             let current_gen = v1_session_inner.gens.get(&id).copied();
-                            let live_keeps = !drained && current_gen == Some(gen_at_pump);
+                            let live_keeps =
+                                !drained && current_gen == Some(gen_at_pump) && !cap_terminal;
                             if let Some(sub) = v1_session_inner.subs.get_mut(&id) {
                                 if live_keeps {
                                     sub.live = Some(live);
@@ -1747,6 +1802,17 @@ pub mod server {
                                 }
                             } else {
                                 drop(live);
+                            }
+                            if cap_terminal {
+                                v1_session_inner.subs.remove(&id);
+                                v1_session_inner.gens.remove(&id);
+                                send_v1_error(
+                                    &mut sink,
+                                    Some(&id),
+                                    "invalid_selector",
+                                    &e.to_string(),
+                                )
+                                .await;
                             }
                         }
                     }
@@ -1790,31 +1856,45 @@ pub mod server {
                             let (returned_live, e) = *boxed;
                             // RN-21 (reviewer, M-47 PR-гейт): в проде отказ `pump` — это
                             // live-push канал (M-53 задача #2c). Поведение соединения (молча
-                            // продолжаем, НЕ закрываем WS) сохраняем — НО поднимаем до
-                            // `error!` с курсором/селектором в контексте, чтобы §8 eyes-on
-                            // обнаружил «чекпоинтер/journal сломался» по логу. `live`
-                            // ОБЯЗАН вернуться назад — иначе следующий тик запаникует.
+                            // продолжаем, НЕ закрываем WS) сохраняем для ЖУРНАЛЬНЫХ отказов
+                            // — НО поднимаем до `error!` с курсором/селектором в контексте,
+                            // чтобы §8 eyes-on обнаружил «чекпоинтер/journal сломался» по логу.
+                            // `live` ОБЯЗАН вернуться назад — иначе следующий тик запаникует.
+                            //
+                            // M-71 (rev7, `R-143` B-2 + `R-139` N-1): но отказ ПО ПРЕДЕЛУ
+                            // ОБЪЁМА — ДРУГОЙ класс: повторная попытка того же кадра не
+                            // состоится НИКОГДА, пока предел стоит (livelock, §4bis.5). На
+                            // legacy-пути подписка ОДНА и совпадает с соединением, поэтому
+                            // терминальность = отправить `ServeMsg::Error` и закрыть: клиент
+                            // переподключится и получит СНАПШОТ (ресинк, `DESIGN` §16), а не
+                            // останется висеть на молчащем push-канале.
+                            let cap_terminal = returned_live.is_cap_terminal();
+                            let refusals = returned_live.cap_refusals();
                             live = Some(returned_live);
-                            // M-71 (rev6, задача 13 N-1 / `R-139` §4 п.3, исполнилось в rev6):
-                            // отказ `pump` может прийти как от journal-I/O (правда — журнал
-                            // недоступен), так и от ПРЕДЕЛА ОБЪЁМА ответа (`enforce_response_limit`,
-                            // `PL-I-5`). Прежний текст «журнал недоступен» для обоих случаев —
-                            // ложный диагноз: §8 eyes-on по этому логу искал бы несуществующую
-                            // проблему с журналом, тогда как реальная причина — конфиг предела.
-                            // Различаем по `io::ErrorKind`: предел возвращает `Other` (наша
-                            // `enforce_response_limit` строит `io::Error` без спецвида), journal
-                            // возвращает `io::Error` с реальным `ErrorKind` от ОС. Честный текст
-                            // делает диагноз по логу возможным без сниффикации самого `e`.
-                            let kind = e.kind();
-                            let tag = matches!(kind, io::ErrorKind::Other);
+                            if cap_terminal {
+                                tracing::error!(
+                                    error = %e,
+                                    cursor = ?cursor,
+                                    symbol = %cfg.selector.symbol,
+                                    venue = ?cfg.selector.venue,
+                                    refusals,
+                                    "LiveReducer::pump отвергнут ПРЕДЕЛОМ ОБЪЁМА (PL-I-5) — \
+                                     legacy-сессия ЗАВЕРШАЕТСЯ явно, клиент пересоберётся \
+                                     снапшотом; журнал тут ни при чём"
+                                );
+                                let payload = ServeMsg::Error(e.to_string());
+                                if let Ok(text) = serde_json::to_string(&payload) {
+                                    let _ = sink.send(Message::Text(text)).await;
+                                }
+                                return Ok(());
+                            }
                             tracing::error!(
                                 error = %e,
                                 cursor = ?cursor,
                                 symbol = %cfg.selector.symbol,
                                 venue = ?cfg.selector.venue,
-                                limit_kind = tag,
-                                "LiveReducer::pump failed ({}) — соединение продолжается, но live-push молчит",
-                                if tag { "предел объёма ответа или другая программная причина" } else { "журнал/IO" }
+                                "LiveReducer::pump failed (журнал/IO либо программная причина) \
+                                 — соединение продолжается, но live-push молчит"
                             );
                             continue;
                         }
