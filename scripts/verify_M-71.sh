@@ -78,6 +78,27 @@ else
   FAIL=$((FAIL + 1))
 fi
 
+step "A7 (R-143 B-1) — цена тика не зависит от длины активного сегмента; мера — rchar, не счётчик участника"
+chk cargo test -p gateway --test red_tick_read_cost --quiet
+# Состав набора СЧИТАЕТСЯ, а не заявляется: литерал без счётного регекспа даёт ложное
+# КРАСНОЕ на правильной правке и ложное ЗЕЛЁНОЕ на удалении оракула.
+EXPECT_T=1
+N_T=$(grep -cE "^fn f036_" crates/gateway/tests/red_tick_read_cost.rs || true); N_T=${N_T:-0}
+if [ "${N_T}" -eq "${EXPECT_T}" ]; then
+  echo "PASS: A7 состав набора — ${N_T} оракул (ожидалось ровно ${EXPECT_T}: F-036)"
+else
+  echo "FAIL: A7 состав набора — ${N_T} при ожидаемых ${EXPECT_T}; порог и набор разошлись"
+  FAIL=$((FAIL + 1))
+fi
+# Мера обязана быть ГРАНИЦЕЙ ПРОЦЕССА. Оракул, переписанный на ReadStats, слеп к добавленному
+# стриму по построению (TD-148) — и это ровно тот способ, каким B-1 проехал круг 4.
+if grep -q '/proc/self/io' crates/gateway/tests/red_tick_read_cost.rs; then
+  echo "PASS: A7 мера — rchar из /proc/self/io (граница процесса), а не счётчик участника"
+else
+  echo "FAIL: A7 мера подменена: /proc/self/io в оракуле нет — он снова мерит прокси"
+  FAIL=$((FAIL + 1))
+fi
+
 step "A5 (задача 11 — R-133 B-4) — многобайтовый venue не роняет обработчик"
 chk cargo test -p gateway-serve --test red_egress_cap_utf8 --quiet
 
