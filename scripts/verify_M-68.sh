@@ -138,10 +138,10 @@ step "C3ter (задача 23 — R-141 Б-1) — ОРАКУЛ ТОЧКИ ВХО�
 chk cargo test -p gateway --test red_checkpoint_bin_prod_argv --quiet
 
 # Состав пиннится числом: файл несёт прод-argv-канарейки задачи 23 И оракул композиции.
-EXPECT_T=7
+EXPECT_T=8
 N_T=$(grep -cE "^fn [a-z0-9_]+\(\) \{" crates/gateway/tests/red_checkpoint_bin_prod_argv.rs || true); N_T=${N_T:-0}
 if [ "${N_T}" -eq "${EXPECT_T}" ]; then
-  echo "PASS: C3ter состав набора — ${N_T} оракулов (ожидалось ровно ${EXPECT_T}, включая c3ter_writer_and_reader_agree_on_checkpoint)"
+  echo "PASS: C3ter состав набора — ${N_T} оракулов (ожидалось ровно ${EXPECT_T}, включая c3ter_writer_and_reader_agree_on_checkpoint и d18g_garbage_cadence_is_rejected_naming_the_variable)"
 else
   echo "FAIL: C3ter состав набора — ${N_T} при ожидаемых ${EXPECT_T}; порог и набор разошлись"
   FAIL=$((FAIL + 1))
