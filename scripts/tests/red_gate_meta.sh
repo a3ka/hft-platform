@@ -1048,6 +1048,42 @@ touch_file "$R" "${GATE_CLASS_FILE}" "TERMINAL-BRANCH-VERDICT: research/critique
 run_barrier "$R" "$B" && fail "GM-46 TERMINAL-BRANCH-VERDICT открыл SUBJECT-LOCK — токен вышел за свою проверку" \
                       || pass "GM-46 токен не трогает subject-lock: у каждой проверки свой выход"
 
+# GM-47 — АНТИ-БЛАНКЕТ ЧЕТВЁРТОГО РОДА: ЧУЖОЙ токен из БАЗЫ не открывает проверку.
+# Зеркало GM-16e для нового токена. Класс `C-128` Б-2: при устаревшей базе PR в диапазон
+# попадают чужие коммиты `main`, и токен, выданный ДРУГОМУ предмету, гасил бы проверку здесь.
+# На `ALLOW-SUBJECT-CHANGE` канал был боевым, а не теоретическим.
+mk_repo R; B0="$(head_of "$R")"
+( cd "$R" && git checkout -q -b feat-leak2 ) || die "GM-47: ветка не создана"
+( cd "$R" && git checkout -q -b side2 "$B0" && echo x >> docs/DESIGN.md \
+  && git add -A && git commit -q -m side2 ) || die "GM-47: side2"
+SIDE2="$(cd "$R" && git rev-parse HEAD)"
+( cd "$R" && git checkout -q feat-leak2 ) || die "GM-47: возврат на ветку"
+add_verdict "$R" "REJECT" "a3ka/hft-platform" "$B0" "$SIDE2"
+( cd "$R" && git checkout -q "$B0" -- . 2>/dev/null; git checkout -q - ) 2>/dev/null || true
+( cd "$R" && git checkout -q master 2>/dev/null || git checkout -q main 2>/dev/null ) || die "GM-47: база"
+touch_file "$R" "docs/DESIGN.md" "TERMINAL-BRANCH-VERDICT: research/critiques/C-999-test.md — чужой токен, выданный ДРУГОМУ предмету"
+MAIN_TIP2="$(head_of "$R")"
+( cd "$R" && git merge -q --no-ff feat-leak2 -m "merge-ref: слияние ветки в базу" ) \
+  || die "GM-47: merge-ref не собран"
+setup_ok=1
+( cd "$R" && git log --format='%B' "${B0}..HEAD^1" | grep -q 'TERMINAL-BRANCH-VERDICT' ) || setup_ok=0
+( cd "$R" && git log --format='%B' "${B0}..HEAD^2" | grep -q 'TERMINAL-BRANCH-VERDICT' ) && setup_ok=0
+if [ "$setup_ok" -ne 1 ]; then
+  fail "GM-47 SETUP НЕ СОСТОЯЛСЯ: токен обязан лежать ТОЛЬКО на стороне базы и отсутствовать \
+у ветки — иначе сценарий проверяет законный выход, а не утечку"
+else
+  # БАЗА СОБЫТИЯ УСТАРЕЛА (форма GM-16d): PR_BASE_SHA = B0, а `main` с тех пор уехал вперёд
+  # вместе с чужим токеном. ИМЕННО ЭТО делает сценарий различающим: при широком переборе
+  # `BASE..HEAD` чужой коммит В ДИАПАЗОНЕ и токен открыл бы проверку; при переборе
+  # собственного диапазона сторона `main` исключена. Первая редакция звала барьер с
+  # `MAIN_TIP2`, и токен не попадал в диапазон НИ ПРИ КАКОЙ реализации — сценарий был
+  # ВАКУУМНЫМ и мутацию «широкий диапазон» не ловил (поймано мутационным контролем автора).
+  run_barrier "$R" "${B0}" pull_request "${B0}" mergeref \
+    && fail "GM-47 ЧУЖОЙ токен из базы открыл проверку — токен, выданный одному предмету, \
+уезжает в main и гасит проверки соседних PR" \
+    || pass "GM-47 чужой токен из базы не открывает: перебор сужен до собственного диапазона"
+fi
+
 echo
 if [ "${FAILED}" -gt 0 ]; then
   echo "VERDICT: FAIL (${FAILED})"

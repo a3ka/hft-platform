@@ -232,6 +232,12 @@ own_touched() { # $1 = дополнительное исключение (`^<sha
   while IFS= read -r __x; do [ -n "${__x}" ] && __a+=("${__x}"); done < <(own_rev_args "${1:-}")
   git log --format='' --name-only --diff-merges=cc "${__a[@]}" 2>/dev/null | sort -u
 }
+own_revs() { # SHA коммитов СОБСТВЕННОГО диапазона ветки — тот же перебор, что own_bodies,
+             # но с сохранением коммита-носителя: он печатается в NOTE
+  local __a=()
+  while IFS= read -r __x; do [ -n "${__x}" ] && __a+=("${__x}"); done < <(own_rev_args "${1:-}")
+  git rev-list "${__a[@]}" 2>/dev/null || true
+}
 own_bodies() { # тела коммитов ТОГО ЖЕ диапазона — токен ищется там же, где найдено нарушение
   local __a=()
   while IFS= read -r __x; do [ -n "${__x}" ] && __a+=("${__x}"); done < <(own_rev_args "${1:-}")
@@ -334,7 +340,13 @@ terminal_token_for() { # $1=путь → SHA коммита-носителя; 1,
       printf '%s' "${c}"
       return 0
     done < <(git log -1 --format='%B' "${c}" 2>/dev/null || true)
-  done < <(git rev-list "${BASE}..HEAD" 2>/dev/null || true)
+    # ПЕРЕБИРАЕТСЯ СОБСТВЕННЫЙ ДИАПАЗОН ВЕТКИ, А НЕ `BASE..HEAD`, и это не стиль. Первая
+    # редакция копировала перебор у `archived_token_for` и наследовала вместе с ним класс
+    # `C-128` Б-2: при устаревшей базе PR в диапазон попадают ЧУЖИЕ коммиты из `main`, и
+    # токен, выданный другому предмету, открыл бы проверку здесь. Канал боевой — на
+    # `ALLOW-SUBJECT-CHANGE` он сработал дважды за сессию (`893ead1` → PR #60). Найдено
+    # автором в собственной правке ДО передачи адверсарию; сценарий `GM-47`.
+  done < <(own_revs '')
   return 1
 }
 
