@@ -136,7 +136,7 @@ print_argv() {
   echo "find \"\${SRC_DIR}\" -type f -mmin +\${MIN_AGE_MIN} ! -name 'recorder.heartbeat' -printf '%P\\0'"
   echo "RSYNC:"
   echo "nice -n \${NICE_LEVEL} ionice -c \${IONICE_CLASS} -n \${IONICE_LEVEL} rsync \\"
-  echo "  --archive --partial --human-readable --stats \\"
+  echo "  --archive --partial-dir=.rsync-partial --human-readable --stats \\"
   echo "  --bwlimit=\${BWLIMIT_MBPS}M \\"
   echo "  -e \"ssh -i \${SSH_KEY} -o IdentitiesOnly=yes -p 23 -o StrictHostKeyChecking=accept-new\" \\"
   echo "  --from0 --files-from=- \\"
@@ -200,8 +200,18 @@ fi
 #      соблюсти, чем оговаривать «у нас имён с пробелами не бывает»);
 #   - `--archive` — rlptgoD (recursive, links, perms, times, group, owner, devices),
 #      то есть rsync сохранит mtime/права — критично для crc-сверки при restore-drill;
-#   - `--partial` — НЕ удалять частично переданный файл (если связь оборвалась, докачка
-#      на следующем тике; иначе rsync удаляет частичный файл и начинает заново);
+#   - `--partial-dir=.rsync-partial` — частично переданный файл живёт В ПОДКАТАЛОГЕ
+#      относительно приёмника, а не под ФИНАЛЬНЫМ именем (R-151 Б-2). Без этого
+#      семантика `--partial` была бы: обрыв → файл-обрывок ЛЕЖИТ на приёмнике под
+#      `segment-XXXXXXX.jrnl` (выглядит целым) до следующего тика. Один-единственный
+#      битник на офсайте, снапшоты коробки ВЫКЛЮЧЕНЫ (П-023), restore-drill (П-023
+#      R1b) ещё не проводился → восстановление читало бы обрывок как валидный файл.
+#      `.rsync-partial` создаётся rsync'ом на ПРИЁМНИКЕ (Storage Box), прозрачен для
+#      будущего потребителя (restore-drill) — он берёт только `.jrnl` под финальным
+#      именем. Докачка на следующем тике доезжает и rsync ПЕРЕМЕЩАЕТ файл из
+#      `.rsync-partial/` под финальное имя; орёт, если источник изменился — это
+#      корректно: пока архив не закрыт, копия обязана догнать (мы копируем только
+#      файлы со стабильным mtime, см. mtime-фильтр ≥15 минут выше).
 #   - `--bwlimit=${BWLIMIT_MBPS}M` — полоса; см. шапку «ЧАСТОТА»;
 #   - `--stats` — пишет в конце «Total transferred file size» — единственный способ
 #      убедиться глазами, что прогон скопировал 0 файлов (идемпотентность), а не
@@ -219,7 +229,7 @@ fi
 start_ts=$(date -u +%s)
 if find "${SRC_DIR}" -type f -mmin +"${MIN_AGE_MIN}" ! -name 'recorder.heartbeat' -printf '%P\0' \
   | nice -n "${NICE_LEVEL}" ionice -c "${IONICE_CLASS}" -n "${IONICE_LEVEL}" rsync \
-      --archive --partial --human-readable --stats \
+      --archive --partial-dir=.rsync-partial --human-readable --stats \
       --bwlimit="${BWLIMIT_MBPS}M" \
       -e "ssh -i ${SSH_KEY} -o IdentitiesOnly=yes -p 23 -o StrictHostKeyChecking=accept-new" \
       --from0 --files-from=- \
