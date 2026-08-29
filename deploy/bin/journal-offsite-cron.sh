@@ -169,10 +169,12 @@ fi
 # 3) dry-run ssh — если субаккаунт недоступен, лучше узнать сейчас, чем в середине копии.
 # `BatchMode=yes` гарантирует, что ssh не спросит пароль интерактивно (если спросит —
 # значит ключ не подходит, и rsync тоже упадёт). `ConnectTimeout=10` не висит вечно
-# при сетевых проблемах.
+# при сетевых проблемах. Используем `pwd` (в restricted shell'е Storage Box'а НЕТ
+# `/usr/bin/true`; `pwd` — единственный «безобидный» builtin, доступный ВСЕГДА; см.
+# `help` при подключении к субаккаунту).
 if ! ssh -i "${SSH_KEY}" -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=10 \
      -p 23 -o StrictHostKeyChecking=accept-new \
-     u659392-sub1@u659392-sub1.your-storagebox.de true 2>/dev/null; then
+     u659392-sub1@u659392-sub1.your-storagebox.de pwd 2>/dev/null; then
   alert "ssh к ${DST_URL%:*} отказал (ключ ${SSH_KEY} или сеть/Storage Box)"
   exit 1
 fi
