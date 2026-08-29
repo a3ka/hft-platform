@@ -128,7 +128,7 @@ print_argv() {
   echo "IONICE_CLASS=${IONICE_CLASS}"
   echo "IONICE_LEVEL=${IONICE_LEVEL}"
   echo "FIND:"
-  echo "find \"\${SRC_DIR}\" -type f -mmin +\${MIN_AGE_MIN} ! -name 'recorder.heartbeat' -print0"
+  echo "find \"\${SRC_DIR}\" -type f -mmin +\${MIN_AGE_MIN} ! -name 'recorder.heartbeat' -printf '%P\\0'"
   echo "RSYNC:"
   echo "nice -n \${NICE_LEVEL} ionice -c \${IONICE_CLASS} -n \${IONICE_LEVEL} rsync \\"
   echo "  --archive --partial --human-readable --stats \\"
@@ -187,7 +187,10 @@ fi
 #   - `find -mmin +${MIN_AGE_MIN}` — mtime-фильтр по самой последней записи в файл;
 #   - `! -name 'recorder.heartbeat'` — явное исключение heartbeat'а (страховка от
 #      регрессии в recorder'е, см. шапку);
-#   - `find -print0` + `rsync --from0` — корректная обработка имён с пробелами/спецсимволами
+#   - `find -printf '%P\0'` + `rsync --from0` — ОТНОСИТЕЛЬНЫЕ пути (от `SRC_DIR`) в
+#      null-terminated форме; абсолютные пути от `find` ломают композицию
+#      (`rsync: link_stat "<SRC>/<полный-путь>" failed` — на проде зафиксировано в
+#      первом прогоне, 23.08.29 16:01Z); относительные пути склеиваются с SRC_DIR.
 #      (на проде их нет, но контракт на null-terminated — стандарт rsync, и его дешевле
 #      соблюсти, чем оговаривать «у нас имён с пробелами не бывает»);
 #   - `--archive` — rlptgoD (recursive, links, perms, times, group, owner, devices),
@@ -209,7 +212,7 @@ fi
 # Реальный сбой — это exit≠0 от rsync. find не возвращает данные об ошибках
 # отдельным каналом; все stderr уходят в LOG.
 start_ts=$(date -u +%s)
-if find "${SRC_DIR}" -type f -mmin +"${MIN_AGE_MIN}" ! -name 'recorder.heartbeat' -print0 \
+if find "${SRC_DIR}" -type f -mmin +"${MIN_AGE_MIN}" ! -name 'recorder.heartbeat' -printf '%P\0' \
   | nice -n "${NICE_LEVEL}" ionice -c "${IONICE_CLASS}" -n "${IONICE_LEVEL}" rsync \
       --archive --partial --human-readable --stats \
       --bwlimit="${BWLIMIT_MBPS}M" \
