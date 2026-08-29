@@ -34,6 +34,8 @@ BUILDER_PRUNE_ALERT_FILE=/var/lib/hft/builder-prune.alert
 BUILDER_PRUNE_LAST_SUCCESS=/var/lib/hft/builder-prune.last-success
 
 # m h dom mon dow user command
-# 04:30 UTC — после компакции (03:50), ретеншена (04:07) и офсайт-копии (:07
-# каждого часа, ближайший выше — 04:07). Не накладывается ни на что в проде.
+# 04:30 UTC — после компакции (03:50), ретеншена (04:07) и офсайт-копии (:22
+# каждого часа, ближайший выше — 04:22). Не накладывается ни на что в проде
+# (08 минут запаса до 04:22 — копия успеет даже за полный цикл ~27 с + setup,
+# типовой прогон идемпотентный и завершается за миллисекунды).
 30 4 * * * root /root/hft-platform/deploy/bin/builder-prune-cron.sh

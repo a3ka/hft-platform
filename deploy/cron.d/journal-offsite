@@ -47,8 +47,10 @@ JOURNAL_OFFSITE_LAST_SUCCESS=/var/lib/hft/journal-offsite.last-success
 JOURNAL_OFFSITE_LOCK=/var/lock/hft-journal-offsite.lock
 
 # m h dom mon dow user command
-# Раз в час, :07 — после ротации (ежесуточно в 03:50 UTC компакция по retention-cron,
-# 04:07 — retention dry-run), :07 каждого часа не накладывается на оба и не совпадает
-# с :50 компакции. Выбор :07 вместо :00 чтобы не приходиться на стандартные пики
-# прод-хоста (системный logrotate, log shipping и т.п.).
-7 * * * * root /root/hft-platform/deploy/bin/journal-offsite-cron.sh
+# Раз в час, :22 — после компакции (ежесуточно в 03:50 UTC), retention dry-run
+# (04:07), этой копии (:22) и builder-prune (04:30). :22 выбран разносом с
+# retention (:07 совпадает с 04:07 retention — запрещено, R-151 Б-1) и builder-prune
+# (04:30). Это ГАРАНТИЯ непересечения по времени, а не обещание: каждое суточное
+# задание идёт в своей минуте. Тот же мотив, что выбор не-:00 (стандартные пики
+# logrotate/log-shipping).
+22 * * * * root /root/hft-platform/deploy/bin/journal-offsite-cron.sh

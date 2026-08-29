@@ -94,10 +94,15 @@ IONICE_LEVEL="${JOURNAL_OFFSITE_IONICE_LEVEL:-7}"   # lowest within best-effort
 LOG="${JOURNAL_OFFSITE_LOG:-/var/log/hft/journal-offsite.log}"
 ALERT_FILE="${JOURNAL_OFFSITE_ALERT_FILE:-/var/lib/hft/journal-offsite.alert}"
 LAST_SUCCESS="${JOURNAL_OFFSITE_LAST_SUCCESS:-/var/lib/hft/journal-offsite.last-success}"
-# Lock — отдельный файл, чтобы cron-строки retention/compaction/offsite НЕ конкурировали
-# (offsite читает ТЕ ЖЕ файлы, что retention читает и compaction сжимает; rsync может
-# читать сжатый сегмент одновременно с compaction — flock обеспечивает сериализацию
-# на уровне всего скрипта).
+# Lock — отдельный файл для ОФСАЙТА ПРОТИВ САМОГО СЕБЯ: предыдущий тик ещё
+# работает → следующий пропускается (-n, non-blocking). Это НЕ cross-task
+# serialisation: flock сериализует только процессы на ОДНОМ файле, и retention/
+# compaction берут СВОИ lock-файлы (см. journal-retention-cron.sh и
+# journal-compaction-cron.sh). Что offsite действительно требует — непересечение
+# ПАРАЛЛЕЛЬНЫХ offsite-прогонов: SFTP-сессия хранит состояние, общее между
+# ними. С cross-task развязкой справляется РАЗНОЕ РАСПИСАНИЕ (cron.d/
+# journal-offsite:22 ≠ retention:04:07 ≠ compaction:03:50 ≠ builder-prune:04:30 —
+# R-151 Б-1).
 LOCK_FILE="${JOURNAL_OFFSITE_LOCK:-/var/lock/hft-journal-offsite.lock}"
 
 mkdir -p "$(dirname "${LOG}")" "$(dirname "${ALERT_FILE}")" "$(dirname "${LAST_SUCCESS}")" 2>/dev/null || true
