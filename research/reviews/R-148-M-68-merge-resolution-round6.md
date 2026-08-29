@@ -1,0 +1,525 @@
+<!-- GATE-META
+milestone: M-68
+audited_repo: a3ka/hft-platform
+audited_base: dcda67c9c5bcb415668e63d005c85f64465d0530
+audited_head: ebbd765f209983987fbf0eb87bf7f829428d4313
+verdict: REJECT
+-->
+
+# R-148 — M-68 круг 6 (резолюция слияния + `N-1`/`N-2`): PR-time reviewer, **REJECTED**
+
+**Роль:** reviewer (PR-time гейт, `gates.md` §4 — UNCONDITIONAL) · **Дата (UTC):** 2026-08-29T15:40Z
+**Предмет:** `dcda67c..ebbd765` на `origin/feat/M-68-rev4` — семь коммитов: резолюция слияния
+(`7ed83f1`), `N-1` (`eccceeb` + оракул `ebbd765`), `N-2` (`d2acd17`), снятие мёртвого кода
+(`3f6935e`), миграция литералов `Selector` (`cc487ac`), `cargo fmt` после слияния (`41e0b12`).
+**Дерево ревью:** `/tmp/hft-reviewer-m68-r6`, detached на `ebbd765`, чекаут из `origin`.
+**Дерево слияния:** `/tmp/hft-rev-m68-merge`, `79335c3` = `ebbd765` + `origin/main` (`d1221b1`).
+**Дерево мутаций:** `/tmp/hft-mut-m68-r6` — прод-код в дереве ревью не трогался.
+**Мандат:** судить РЕЗОЛЮЦИЮ СЛИЯНИЯ и исполнение четырёх условий `R-147`; круг 5 не
+переоткрывать.
+
+**Прочитано на этой ревизии:** `CLAUDE.md`, `.claude/rules/{gates,commit-discipline,scope-guard,
+branch-hygiene,testing,handoff-block}.md`, `.claude/agents/reviewer.md`, `docs/04-workflow.md`
+целиком, `docs/05-contract-layer.md` §1-§7, `docs/workflow/reading-map.md` §1/§2,
+`docs/fa/viz-backend.md` (таблица `VB-I-1..11`), `research/reviews/R-147-…` целиком
+(структура + §Б-1 + §Условие APPROVED), `milestones/M-68-depth-from-book.md` §3 Allowed/Forbidden
+paths и строки 830-852, `scripts/verify_M-68.sh` (заголовки 17 шагов),
+`scripts/check_gate_meta.sh` (шапка `:1-60`, §3 subject-lock `:295-400`),
+`scripts/check_review_fa.sh` (классификация путей + карта крейт→FA),
+`.github/workflows/ci.yml` (`gate-meta` `:279-294`, агрегат `status-check` `:443-453`),
+`crates/gateway-serve/src/lib.rs` (`serve_config_from_env` `:2028-2340`),
+`crates/gateway/src/bin/gateway-checkpoint.rs` (`:275-340`),
+`crates/gateway/tests/red_checkpoint_bin_prod_argv.rs` (`d18g` `:505-608`), `docker-compose.yml`
+(обе службы).
+**Ярус C — грепом по предмету, не целиком** (`reading-map.md` §2): `TECH-DEBT.md` по
+`TD-044|TD-158|TD-159|TD-161|TD-167|TD-168|TD-173|M-68|depth_cadence|GATEWAY_DEPTH_CADENCE`;
+`PROJECT-STATE.md` по `M-68|M-71|depth`. Оба файла вместе 1 015 KB — читать целиком нечем.
+
+**FA-предъявление (`gates.md` §4, M-66).** Диф трогает `crates/gateway/**` и
+`crates/gateway-serve/**` ⇒ карта `check_review_fa.sh:191,196` ведёт в `docs/fa/viz-backend.md`.
+Живой инвариант, названный по существу предмета: **`VB-I-2`** (`docs/fa/viz-backend.md:189`) —
+«live == replay: серия, посчитанная на live-хвосте, бит-идентична серии из replay того же окна
+журнала». Он пиннится шагом `F` гейта (`red_gateway_live_eq_replay`) и переходом на пересчёт
+депт-серии по книге НЕ ослаблен: шаг `F` зелен на дереве слияния (Done Block ниже).
+
+---
+
+## Block-scope — ЧИСТО
+
+`git diff --name-only origin/main...HEAD` → 74 файла. Разложение по зонам:
+
+| зона | файлов | вердикт |
+|---|---:|---|
+| `crates/gateway/tests/**`, `crates/gateway-serve/tests/**` | 48 | architect (RED-спеки) — в зоне |
+| `crates/gateway/src/lib.rs`, `crates/gateway/src/bin/gateway-checkpoint.rs` | 2 | engine-dev — в зоне |
+| `crates/gateway-serve/src/lib.rs` | 1 | carve-out §3 спеки (задачи 22/24) — назван явно |
+| `docker-compose.yml` | 1 | carve-out §3 спеки (задачи 22/23) — назван явно |
+| `scripts/verify_M-68.sh`, `milestones/M-68-*.md`, `milestones/BACKLOG.md` | 3 | architect |
+| `research/{critiques,reviews,arbitration}/**` | 19 | перенос артефактов гейта |
+
+- **`crates/contracts/**` — 0 файлов** (`git diff --name-only origin/main...HEAD | grep -c '^crates/contracts/'` → `0`). **Block-C не применяется.**
+- **`crates/{risk,killswitch,oms,venue-*}/**` — 0 файлов.** RISK-BLOCK (`gates.md` §5) не
+  применяется: предмет — read-only консюмер журнала (`VB-I-3`), order-egress отсутствует как класс.
+- **Запретный список §3 спеки соблюдён:** `GATEWAY_BANDS` в дифе `docker-compose.yml`
+  **0 совпадений**; `crates/book/**`, `crates/journal/**`, `crates/venue-*/**`, `docs/09-roadmap-v2.md`
+  не тронуты (шаг `K` гейта судит это машинно и зелен).
+
+## Block-commits — ЧИСТО по атомарности и RED-first
+
+- Семь коммитов диапазона — семь предметов, один к одному; бандлов нет.
+- **RED-first не нарушен:** ни один коммит с меткой `[engine-dev]` не тронул `*/tests/**`
+  (проверено покоммитно по метке в конце subject'а, не грепом по подстроке). Обе миграции
+  тестов (`cc487ac`, `ebbd765`) выполнены architect'ом по SCOPE VIOLATION REQUEST'ам dev'а —
+  dev остановился верно в обоих случаях.
+- `41e0b12` (`cargo fmt` в чужой зоне) — отступление НАЗВАНО в теле коммита с тремя причинами
+  и вынесено отдельным коммитом именно ради видимости ревьюеру. Принимаю: правка нулевая по
+  существу, внесена слиянием, `git diff -w` показывает `0 1` (одна пустая строка).
+- `3f6935e` (снятие мёртвой функции) без RED — обоснование в теле («контракт компилятора, а не
+  инвариант данных») принимаю: мутационный контроль здесь и есть `cargo build`.
+- Бандл-коммит `44d6aac` остаётся в истории по решению `A-025` §5 — пересборки истории не требую
+  (`M-68` §0sexies.9).
+
+## Block-DoneBlock — ВОСПРОИЗВЕДЁН СВОИМ ПРОГОНОМ, но отчёты цепочки содержат ЛОЖНЫЕ СТРОКИ
+
+Все гейты перепрогнаны мной на ДЕРЕВЕ СЛИЯНИЯ (`gates.md` §8: документ и код проверяются на
+дереве слияния, не на ветке). Сырой вывод — в Done Block ниже. Две ложные строки в чужих
+отчётах — `N-4` ниже.
+
+---
+
+## Условия `R-147` — что исполнено (замером, а не чтением)
+
+### Условие 1 — слияние выполнено, порядок «гвард ДО сеттера» соблюдён. **ИСПОЛНЕНО.**
+
+```
+$ git merge --no-ff origin/main            # в /tmp/hft-rev-m68-merge
+Merge made by the 'ort' strategy.
+ docs/PENDING-SIGNATURE.md                 |  85 ++++++++++++
+ milestones/M-70-depth-bands-enablement.md | 209 +++++++++++++++++++++++++++++
+MERGE_EXIT=0
+```
+
+Конфликтов нет: `main` после `7ed83f1` ушёл вперёд на четыре коммита, и все четыре — `docs/`
+и `milestones/`, зоны предмета не касаются.
+
+Порядок в `crates/gateway-serve/src/lib.rs` на дереве слияния:
+
+```
+$ grep -n "if let Some(cadence) = selector.depth_cadence_ms\|set_effective_max_response_bytes(max_response_bytes);"
+2278:    if let Some(cadence) = selector.depth_cadence_ms {      ← гвард M-68, return Err на :2280
+2328:    gateway::set_effective_max_response_bytes(max_response_bytes);   ← сеттер M-71
+```
+
+Порядок назван в теле `7ed83f1` дословно, как и требовало условие. Вторая половина резолюции
+(`crates/gateway/src/lib.rs`) тоже взята обеими сторонами: `read_stats_from_stream(&stream,
+depth_levels_visited)` (`:2533`, `:2737`) и `enforce_response_limit(&series,
+effective_max_response_bytes())?` на всех шести дверях (`:2417`, `:2474`, `:2539`, `:2566`,
+`:2710`, `:2735`) — `verify_M-71.sh` шаг инвентаризации дверей зелен.
+
+**Но сам порядок не пиннится НИЧЕМ — `N-1` ниже.** Условие исполнено; ожидание `R-147`, что его
+поймает оракул `N1-E`, опровергнуто замером.
+
+### Условие 2 — гейты на дереве слияния. **ИСПОЛНЕНО, все шесть exit=0.**
+
+`fmt` · `clippy --all-targets --all-features -D warnings` · `test --all` (948/0) ·
+`verify_M-68.sh` · `verify_M-71.sh` (47 PASS) · `verify_design_claims.sh --merge-preview` —
+сырой вывод в Done Block. Соседний милестоун `M-71`, купленный этим слиянием, не пострадал:
+47 PASS совпадает с числом, записанным в `PROJECT-STATE.md:1970` при его merge'е.
+
+### Условие 3 (`N-1`) — симметрия отказа. **ИСПОЛНЕНО, ЗАПИННЕНО МУТАЦИЕЙ.**
+
+Решение выбрано сильнее требуемого: `R-147` просил «комментарий к правде ЛИБО поведение к
+комментарию», dev привёл ПОВЕДЕНИЕ — писатель чекпоинта теперь отвергает мусор, как и читатель.
+
+```
+MUT-N1 (дерево /tmp/hft-mut-m68-r6): парсинг env возвращён к .ok() — состояние ДО фикса
+$ cargo test -p gateway --test red_checkpoint_bin_prod_argv
+test d18g_garbage_cadence_is_rejected_naming_the_variable ... FAILED
+  assertion `left == right` failed: GATEWAY_DEPTH_CADENCE_MS="abc" принято писателем (exit=Some(0))
+  left: Some(0)   right: Some(2)
+test result: FAILED. 7 passed; 1 failed
+```
+
+Оракул падает против СВОЕГО дефекта и только против него: семь соседей в том же файле зелены.
+Парный vantage (`None`/`""`/`"   "`/`"1000"` → exit 0) защищает подписанное `A-015` §3 п.1 —
+переширокая реализация «отвергать всё, что не число» этот набор не прошла бы.
+
+### Условие 4 (`N-2`) — заголовок шага `C3bis`. **ИСПОЛНЕНО.**
+
+```
+$ grep -nE "^step " scripts/verify_M-68.sh | sed -n '7p'
+150:step "C3bis (задачи 22 И 24 — R-138 Б-3, R-141 Б-3) — … невыравненная пара cadence/timeframe
+      отвергается на СТАРТЕ"
+```
+
+Правка ровно одна строка; состав набора и счётные литералы не тронуты (`EXPECT_E=6` цел, шаг зелен).
+
+---
+
+## Б-1 (БЛОКЕР, ЕДИНСТВЕННЫЙ) — `gate-meta` КРАСЕН на PR-диапазоне; `All checks passed` не соберётся
+
+**Это снова не дефект круга 6.** Четыре условия `R-147` исполнены, и три из четырёх запиннены
+мутацией или машинным прогоном. Блокер того же рода, что в `R-147`: предмет, который я обязан
+ВЛИТЬ по APPROVED, влить физически нельзя — только теперь упирается не в конфликт слияния, а в
+барьер репозитория.
+
+**Замер в ПРОД-ФОРМЕ вызова** (та же форма, какой барьер зовёт CI — `ci.yml:291-294`), на
+дереве слияния:
+
+```
+$ EVENT_NAME=pull_request PR_BASE_SHA=d1221b1ca932d0b8e95403c2849308ed6e7b9ce2 \
+    bash scripts/check_gate_meta.sh
+FAIL  research/arbitration/A-018-m68-cadence-not-reach.md: audited_head «532b1a44…» НЕ предок HEAD
+FAIL  research/arbitration/A-023-m68-artifact-self-consistency.md: subject-lock — после проходного
+      вердикта (DECISION) тронут класс «гейт»: scripts/verify_M-68.sh
+FAIL  research/arbitration/A-024-m68-cadence-construction.md: subject-lock … scripts/verify_M-68.sh
+FAIL  research/arbitration/A-025-m68-terminal-route.md:      subject-lock … scripts/verify_M-68.sh
+FAIL  research/critiques/C-094-M-68.md:                      audited_head «1b9e0c9c…» НЕ предок HEAD
+FAIL  research/critiques/C-138-M-68-round2-escalate.md:      audited_head «a3591016…» НЕ предок HEAD
+FAIL  research/reviews/R-130-M-68-a023-closing-commit.md:    subject-lock (APPROVE) … scripts/verify_M-68.sh
+VERDICT: FAIL (7)
+exit=1
+```
+
+**Почему это блокирует merge, а не является примечанием — предъявлено проводкой, не мнением:**
+
+```
+$ sed -n '443-450p' .github/workflows/ci.yml
+status-check:
+  name: All checks passed
+  needs: [build-test, security, delivery, protected-artifacts, contracts, docs-freeze,
+          artifact-ids, reserve-ids, design-claims, context-budgets, gate-meta, …]
+  if: [[ … || "${{ needs.gate-meta.result }}" != "success" || … ]]; then exit 1
+```
+
+`gate-meta` входит и в `needs`, и в fail-closed условие. `All checks passed` — обязательный чек
+защиты `main` (`gates.md` §8/§11). Красный `gate-meta` ⇒ merge физически невозможен.
+
+### Класс (i) — три вердикта судили ТЕРМИНАЛЬНУЮ ветку; выхода в контракте барьера НЕТ
+
+```
+$ git branch -a --contains 1b9e0c9c…  →  feat/M-68-depth-from-book
+$ git branch -a --contains a3591016…  →  feat/M-68-depth-from-book
+$ git branch -a --contains 532b1a44…  →  feat/M-68-depth-from-book
+```
+
+`A-018`, `C-094`, `C-138` объявляют `audited_head` на ветке `feat/M-68-depth-from-book`, которую
+`A-018` §2.2 САМ объявил терминальной и запретил к merge'у (она несёт `1b9e0c9` с неподписанным
+переходом фаз — граница C, `П-018`). Эти SHA не станут предками `main` никогда.
+
+**Токена под этот класс не существует, и это проверено чтением барьера, а не предположено.**
+`ARCHIVED-VERDICT` (`check_gate_meta.sh:15-38`) открывает ТОЛЬКО файлы БЕЗ шапки `GATE-META`
+(`:313-318` — ветка `if ! grep -q '<!-- GATE-META'`). У всех трёх шапка ЕСТЬ — барьер её
+разобрал и упал уже на проверке предка (`:371-372`), куда `ARCHIVED-VERDICT` структурно не
+достаёт. `ALLOW-SUBJECT-CHANGE` открывает другой замок и к этой ветке кода отношения не имеет.
+
+Три пути, которые я вижу, и все три — НЕ моя зона и НЕ зона одного исполнителя:
+
+1. **Правка шапок трёх вердиктов** — подстановка SHA, который является предком. Это ЛОЖНАЯ
+   декларация ровно того вида, против которого барьер и построен (`C-062`); называю путь, чтобы
+   его не выбрали молча, и рекомендую ПРОТИВ него.
+2. **Расширение барьера** — escape для «артефакт перенесён с терминальной ветки», по образцу
+   `ARCHIVED-VERDICT`, но для файлов С шапкой. Харнесс-трек (`docs/workflow/harness-track.md`),
+   architect + независимый критик.
+3. **Решение founder'а** — принять класс как известное ослабление и открыть его явно.
+
+Выбор между (2) и (3) — не инженерная правота, а воля владельца о том, чем платить; по
+`gates.md` §0.1 такой выбор арбитру не передаётся.
+
+### Класс (ii) — subject-lock: четыре проходных вердикта, тринадцать касаний гейта, ноль токенов
+
+```
+$ git log d1221b1..HEAD --format='%h %s%n%b' | grep -c 'ALLOW-SUBJECT-CHANGE'
+0
+$ git log origin/main..HEAD --format='%h %s' -- scripts/verify_M-68.sh | wc -l
+13
+```
+
+`A-023` (DECISION), `A-024` (DECISION), `A-025` (DECISION), `R-130` (APPROVE) — проходные
+вердикты; `scripts/verify_M-68.sh` тронут после каждого из них тринадцать раз. Замок сделал
+ровно то, для чего заведён: «критик смотрел это» и «reviewer одобряет то же самое» перестали
+совпадать — гейт после их вердиктов вырос на шесть шагов.
+
+**Здесь выход НАЗВАН самим барьером:** строка `ALLOW-SUBJECT-CHANGE: <причина>` в теле коммита
+диапазона. Зона — architect (`scripts/verify_*.sh` sacred, `research/{critiques,arbitration}/**`
+его же перенос). Причина обязана быть настоящей: гейт расширялся по предписаниям тех же
+вердиктов, и это ровно то, что строка должна сказать.
+
+**Почему разрешаю не я.** `scripts/verify_M-68.sh` — architect-only sacred (`scope-guard.md`);
+`research/**` мне закрыт профилем. Проставить токен, открывающий замок над чужими вердиктами, и
+самому же по нему влить — упразднить PR-гейт. `gates.md` §4 (граница reviewer↔architect): я
+ОПИСЫВАЮ дефект и не проектирую фикс.
+
+**Класс латентен с переноса артефактов на `feat/M-68-rev4` и не был пойман раньше по честной
+причине:** `R-147` до него не дошёл — merge-preview падал первым, и дальше судить было нечего.
+Ни один из шести кругов гейта эту проверку в прод-форме не гонял.
+
+---
+
+## `N-1` (MAJOR NOTE) — порядок «гвард ДО сеттера» не пиннится НИЧЕМ; ожидание `R-147` опровергнуто
+
+`R-147` §Б-1 писал: «Оракул `N1-E` живёт в `main` и, вероятно, это поймает — но проверить это
+можно только НА СОБРАННОМ ДЕРЕВЕ СЛИЯНИЯ, которого сейчас нет». Дерево собрано. Проверено.
+**Не поймает.**
+
+```
+MUT-ORDER (дерево /tmp/hft-mut-m68-r6): блок гварда M-68 (:2274-2294) целиком перенесён
+ПОСЛЕ строки gateway::set_effective_max_response_bytes(max_response_bytes)
+$ cargo build --all-targets   → BUILD_EXIT=0
+$ cargo test -p gateway-serve -p gateway
+passed=176 failed=0 (блоков: 40)
+```
+
+**Ноль красных.** Мутация вносит ровно тот дефект, о котором предупреждал `R-147`: конфигурация,
+отвергнутая гвардом каденции, успевает выставить процессный предел `set_effective_max_response_bytes`
+— «отвергнутая конфигурация управляет сервисом», класс `GW-I-14`/`PL-I-5`.
+
+**Почему `N1-E` слеп именно здесь** (`crates/gateway-serve/tests/red_egress_cap_governed.rs:261-310`):
+он судит ОДИН путь отказа — `Err` разбора самой `GATEWAY_MAX_RESPONSE_BYTES` (`lib.rs:2312-2320`).
+Этот путь лежит НИЖЕ гварда каденции и выше сеттера при любой перестановке, поэтому мутация его
+не задевает. Инвариант «ЛЮБАЯ ветка отказа старта предшествует сеттеру» ни одним оракулом не
+покрыт — покрыт один его экземпляр.
+
+**Почему NOTE, а не блокер.** Код на этой ревизии ПРАВИЛЕН: порядок соблюдён, назван в теле
+коммита и в комментарии на `:2274-2277` и `:2326-2327`. Дефекта в предмете нет — есть
+непокрытие, и оно того же класса, что уже объявлен долгом на `M-71` (`R-146`, четыре находки).
+Заводится карточкой `TECH-DEBT` в close-out: **«инвариант „ни одна ветка отказа старта не
+предшествует `set_effective_max_response_bytes`“ пиннится одним экземпляром вместо семейства;
+MUT-ORDER 176/0»**, severity MAJOR. Оракул-семейство проектирует architect (`gates.md` §4:
+reviewer не проектирует фикс).
+
+## `N-2` (NOTE) — «флаг имеет приоритет над env» ложно на пути ОТКАЗА; так говорят и код, и оракул
+
+`crates/gateway/src/bin/gateway-checkpoint.rs:277-278`: «Приоритет: `--depth-cadence-ms` → 
+`GATEWAY_DEPTH_CADENCE_MS` → дефолт 1000». `red_checkpoint_bin_prod_argv.rs:566-567` (setup-guard
+`d18g`): «прод-argv несёт `--depth-cadence-ms`, и ФЛАГ имеет приоритет над env … иначе env-путь
+не судился бы вовсе, а тест был бы зелен по неверной причине».
+
+Замер прод-бинарём (`/tmp/hft-mut-m68-r6`, чистое дерево, `target/debug/gateway-checkpoint`):
+
+```
+A) --depth-cadence-ms=2000  +  GATEWAY_DEPTH_CADENCE_MS=abc   → exit=2  (флаг НЕ выиграл)
+B) --depth-cadence-ms=2000  +  GATEWAY_DEPTH_CADENCE_MS=4000  → exit=0  (флаг выиграл)
+C) без флага                +  GATEWAY_DEPTH_CADENCE_MS=abc   → exit=2
+```
+
+Приоритет держится только на ВАЛИДНОМ значении (B). На мусоре env отвергается ДО того, как
+`args.depth_cadence_ms.or(cadence_from_env)` вообще спросит флаг — A и C неразличимы. Отсюда два
+следствия:
+
+1. Комментарий кода описывает приоритет без оговорки, которой требует его же поведение.
+2. Обоснование setup-guard'а `d18g` («без снятия флага env-путь не судился бы вовсе») верно для
+   ПРИНИМАЮЩЕЙ половины набора и неверно для ОТВЕРГАЮЩЕЙ: там снятие флага ничего не меняет
+   (A ≡ C). Оракул при этом корректен — неверна причина, которой он себя объясняет.
+
+**Прод не задет и поведение защитимо:** `docker-compose.yml:226,231` питает флаг и переменную
+ОДНИМ `${GATEWAY_DEPTH_CADENCE_MS}`, расхождение недостижимо, а исход fail-closed. Класс —
+`TD-167` (самоописание расходится с кодом), седьмое срабатывание на этом милестоуне. Правки не
+требую отдельным кругом: строка комментария и строка docstring'а — зона architect'а, стоит их
+приложить к тому же кругу, что и токены `Б-1`(ii).
+
+## `N-3` (NOTE) — спека предписывает reviewer'у правку, которую `scope-guard` ему запрещает
+
+`milestones/M-68-depth-from-book.md:841-842`: «Предусловие (б) §4 FA после закрытия M-68 станет
+неправдивым — снимает его **reviewer** в close-out по маршруту `gates.md` §9».
+
+`docs/fa/**` мне закрыт дважды: `scope-guard.md` §Таблица владения (reviewer: `PROJECT-STATE.md`,
+`TECH-DEBT.md`, PR-комменты — «всё остальное» запрещено) и `.claude/agents/reviewer.md`
+§NEVER writes («не пишет … `docs/**` (кроме двух файлов выше)»). Исполнить норму буквально
+значит открыть `!!! SCOPE VIOLATION REQUEST !!!` на собственном close-out'е.
+
+**Класс уже разобран в корпусе и назван ошибкой автора:** `docs/04-workflow.md` §2 про переезд
+гейта в архив — «Прежняя редакция этой нормы называла исполнителем переезда reviewer'а — ошибка
+автора… Норма, исполненная буквально, порождала бы `SCOPE VIOLATION` на каждом close-out».
+Здесь то же самое, только предмет другой. **Я этот пункт исполнять не буду**; правка `docs/fa/`
+— зона architect'а, и по `gates.md` §9 снятие предусловия из FA — изменение ФОРМЫ документа,
+то есть ещё и триггер критика. Строку спеки надо переадресовать architect'у.
+
+## `N-4` (NOTE) — две ложные строки в Done Block'ах цепочки
+
+1. **engine-dev, коммит `eccceeb`:** отчёт заявлял `cargo fmt --all -- --check → exit=0`.
+   Замер architect'а на ТОМ ЖЕ коммите — `exit=1`, `Diff in crates/gateway-serve/src/lib.rs:2218`
+   (записано в теле `41e0b12`). Находка чужая, подтверждаю её и фиксирую здесь, чтобы она
+   пережила сессию: гейт `task #0` был бы КРАСЕН, цепочка встала бы.
+2. **tester, отчёт круга 6:** строка Done Block'а
+   `bash scripts/verify_M-68.sh 2>&1 | grep -E "^(PASS|FAIL|VERDICT)"` → «26 PASS, 0 FAIL,
+   VERDICT: PASS». Такой строки скрипт не печатает — это ПЕРЕСКАЗ вывода grep'а, а не его вывод.
+   И число не воспроизводится: `grep -cE '^PASS'` на том же скрипте (байт-идентичном между
+   `ebbd765` и деревом слияния — `git diff --stat ebbd765 HEAD -- scripts/verify_M-68.sh` пуст)
+   даёт **29**. Итог гейта тот же (`VERDICT: PASS`, exit=0 — я перепрогнал сам), но
+   `commit-discipline.md` на этот счёт не оставляет выбора: «пересказ без сырого вывода =
+   NOT REVIEWED». Замечание фиксирую; переигрывать круг из-за него не требую — я воспроизвёл
+   все четыре команды своим прогоном.
+
+---
+
+## Что проверено и дефекта НЕ найдено — названо явно
+
+- **Соседний милестоун не куплен слиянием:** `verify_M-71.sh` → 47 PASS, `VERDICT: PASS`, exit=0.
+  Число совпало с записанным при его merge'е (`PROJECT-STATE.md:1970`).
+- **Все остальные барьеры агрегата зелены** в прод-форме вызова: `check_protected_artifacts.sh`
+  exit=0 (переезд `C-159`→`C-160` увиден и признан законным), `check_docs_freeze.sh` exit=0
+  (зона `.claude/**`/`CLAUDE.md`/`04-workflow.md` диапазоном не тронута — токен не требуется),
+  `check_artifact_ids.sh` exit=0, `check_context_budgets.sh` exit=0 (111 955 B из 114 900 B),
+  `verify_design_claims.sh --merge-preview origin/main` exit=0.
+- **Bump версии на месте:** шаг `D` гейта (`GATEWAY_SCHEMA_VERSION` 8→9) зелен.
+- **`selector_fingerprint` не подогнан под кэш** — шаг `J` зелен.
+- **`gc_worktrees.sh` в close-out не запускался** — close-out'а нет, merge'а нет. Свои три дерева
+  (`/tmp/hft-reviewer-m68-r6`, `/tmp/hft-rev-m68-merge`, `/tmp/hft-mut-m68-r6`) убираю сам, см. Handoff.
+
+---
+
+## ВЕРДИКТ: **REJECTED**
+
+**Один блокер, и он снова НЕ в предмете круга.** Резолюция слияния выполнена верно: порядок
+«гвард M-68 ДО сеттера M-71» соблюдён и назван в теле коммита, обе половины второго конфликта
+взяты, третий конфликт разрешён объявлением обеих переменных. Все четыре условия `R-147`
+исполнены: условие 3 запиннено мутацией MUT-N1 (оракул падает против своего дефекта и только
+против него), условие 2 — шестью прогонами на дереве слияния с exit=0 у каждого, условия 1 и 4 —
+замером по коду и по заголовку шага. Работа кругов 5 и 6 принята по существу и переоткрытию не
+подлежит.
+
+**Merge при этом невозможен физически.** Барьер `check_gate_meta.sh`, входящий в обязательный
+чек `All checks passed`, возвращает `FAIL (7)` на PR-диапазоне в прод-форме вызова. Четыре
+срабатывания (subject-lock) имеют названный барьером выход — токен в теле коммита architect'а.
+Три (`audited_head` на терминальной ветке) выхода в контракте барьера НЕ ИМЕЮТ: `ARCHIVED-VERDICT`
+структурно не достаёт до файлов с шапкой, а сами SHA не станут предками `main` никогда, потому
+что ветка запрещена к merge'у решением `A-018` §2.2. Это развилка «расширять барьер или принять
+ослабление» — воля владельца, не инженерная правота.
+
+`APPROVED` здесь означал бы «вливаю», а влить нечего: PR не соберёт зелёный чек.
+
+**Условие APPROVED (следующий круг):**
+
+1. **Класс (ii) `Б-1`** — коммит architect'а в диапазоне несёт `ALLOW-SUBJECT-CHANGE: <причина>`,
+   называющую, ЧЕМ гейт вырос после `A-023`/`A-024`/`A-025`/`R-130`.
+2. **Класс (i) `Б-1`** — решение founder'а: расширить барьер (харнесс-трек, `harness-track.md`) 
+   ЛИБО принять ослабление явной записью. Правку шапок трёх вердиктов рекомендую ПРОТИВ.
+3. **`N-2`** — комментарий `gateway-checkpoint.rs:277-278` и docstring setup-guard'а `d18g`
+   приведены к измеренному поведению (одна оговорка в каждом; зона architect'а).
+4. **`N-3`** — строка `M-68:841` переадресована с reviewer'а на architect'а.
+5. Прогон гейтов повторяется на дереве слияния и включает **`check_gate_meta.sh` в прод-форме
+   вызова** (`EVENT_NAME=pull_request PR_BASE_SHA=<tip main>`) — его отсутствие в Done Block'ах
+   шести кругов и есть причина, по которой класс дожил до сюда.
+
+**Маршрут.** `A-025` §5.5: круга критика по M-68 не существует ни при каком исходе, поэтому
+REJECT уводит предмет к **founder'у** на диспетч. Пункты 1, 3, 4 — architect; пункт 2 — решение
+founder'а; пункт 5 — тот, кто отдаёт предмет на следующий круг.
+
+**`PROJECT-STATE.md` и `TECH-DEBT.md` этим кругом не трогаю** — merge'а не было, close-out'а нет.
+Карточки `N-1` (MAJOR, непокрытие порядка), `N-2`, `N-3` и остаток `TD-158`/`TD-159`/`TD-167`/
+`TD-168`/`TD-173` завожу в close-out ПОСЛЕ merge'а, как предписано `gates.md` §4.
+
+---
+
+## Done Block (сырой stdout)
+
+```
+$ pwd
+/tmp/hft-reviewer-m68-r6
+$ git rev-parse HEAD
+ebbd765f209983987fbf0eb87bf7f829428d4313
+$ git log --format='%h %s' dcda67c..ebbd765
+ebbd765 test(M-68): RED d18g — мусор в env отвергается ОБОИМИ процессами (R-147 N-1) [architect]
+cc487ac test(M-68): миграция литералов Selector под новое поле — SVR engine-dev'а закрыт [architect]
+41e0b12 style(M-68): cargo fmt — отступ блока каденции после слияния [architect]
+eccceeb fix(M-68): R-147 N-1 — gateway-checkpoint отвергает мусор в env, как и gateway-serve [engine-dev]
+7ed83f1 merge(M-68): влить origin/main, три конфликта разрешены [engine-dev]
+3f6935e fix(M-68): N-5 — dead-code глушилка снята, функция удалена [engine-dev]
+d2acd17 fix(M-68): R-147 N-2 — заголовок шага C3bis называет задачу 24, а не только 22 [architect]
+
+── ДЕРЕВО СЛИЯНИЯ /tmp/hft-rev-m68-merge (79335c3 = ebbd765 + origin/main d1221b1) ──
+
+$ cargo fmt --all -- --check
+EXIT_FMT=0                       (пустой stdout)
+
+$ cargo clippy --all-targets --all-features -- -D warnings 2>&1 | tail -2
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 9.42s
+EXIT_CLIPPY=0
+
+$ cargo test --all 2>&1 | grep -E "^test result" | awk '{p+=$4; f+=$6} END {print "passed="p" failed="f" (блоков: "NR")"}'
+passed=948 failed=0 (блоков: 221)
+EXIT_TEST=0
+$ grep -nE "^(failures:|test result: FAILED|error\[)" <полный лог>
+(пусто)
+
+$ bash scripts/verify_M-68.sh; echo exit=$?
+… PASS: K book/venue/journal/роадмап не тронуты диапазоном
+VERDICT: PASS
+exit=0
+$ grep -cE '^PASS' <лог>   → 29        $ grep -cE '^FAIL' <лог>   → 0
+
+$ bash scripts/verify_M-71.sh; echo exit=$?
+VERDICT: PASS — все найденные двери названы в оракулах
+VERDICT: PASS
+exit=0
+$ grep -cE '^PASS' <лог>   → 47
+
+$ bash scripts/verify_design_claims.sh --merge-preview origin/main /tmp/hft-reviewer-m68-r6
+VERDICT: PASS (0 нарушений)
+exit=0
+
+── БАРЬЕРЫ АГРЕГАТА, прод-форма вызова (EVENT_NAME=pull_request PR_BASE_SHA=d1221b1) ──
+
+$ bash scripts/check_protected_artifacts.sh
+NOTE  research/critiques/C-159-M-68-round4.md: переехал в …/C-160-M-68-round4.md (остался под защитой)
+OK: защищённые артефакты целы на HEAD (d1221b1..HEAD)
+exit=0
+$ bash scripts/check_docs_freeze.sh        → exit=0
+$ bash scripts/check_artifact_ids.sh       → exit=0
+   OK: ни один коммит диапазона не ввёл второй носитель под занятым идентификатором
+$ bash scripts/check_context_budgets.sh    → exit=0
+   VERDICT: PASS — 7 файлов, 111955 B из 114900 B бюджета (запас 2945 B)
+$ bash scripts/check_gate_meta.sh          → exit=1   ← БЛОКЕР Б-1
+   FAIL  A-018-m68-cadence-not-reach.md: audited_head «532b1a44…» НЕ предок HEAD
+   FAIL  A-023-m68-artifact-self-consistency.md: subject-lock (DECISION) … scripts/verify_M-68.sh
+   FAIL  A-024-m68-cadence-construction.md:      subject-lock (DECISION) … scripts/verify_M-68.sh
+   FAIL  A-025-m68-terminal-route.md:            subject-lock (DECISION) … scripts/verify_M-68.sh
+   FAIL  C-094-M-68.md:                          audited_head «1b9e0c9c…» НЕ предок HEAD
+   FAIL  C-138-M-68-round2-escalate.md:          audited_head «a3591016…» НЕ предок HEAD
+   FAIL  R-130-M-68-a023-closing-commit.md:      subject-lock (APPROVE) … scripts/verify_M-68.sh
+   VERDICT: FAIL (7)
+
+$ git log d1221b1..HEAD --format='%h %s%n%b' | grep -c 'ALLOW-SUBJECT-CHANGE'
+0
+$ git branch -a --contains 1b9e0c9c206ee0238454fdd62b8d2d9229216c35
+  feat/M-68-depth-from-book
+```
+
+### Мутационный контроль (дерево `/tmp/hft-mut-m68-r6`; прод-код дерева ревью не трогался)
+
+```
+$ # MUT-N1 (условие 3 R-147): парсинг env в gateway-checkpoint возвращён к .ok()
+$ cargo test -p gateway --test red_checkpoint_bin_prod_argv
+test d18g_garbage_cadence_is_rejected_naming_the_variable ... FAILED
+  GATEWAY_DEPTH_CADENCE_MS="abc" принято писателем (exit=Some(0))
+  left: Some(0)   right: Some(2)
+test result: FAILED. 7 passed; 1 failed; 0 ignored
+   ⇒ оракул падает против СВОЕГО дефекта и только против него
+
+$ # MUT-ORDER (условие 1 R-147): гвард M-68 перенесён ПОСЛЕ set_effective_max_response_bytes
+$ cargo build --all-targets              → BUILD_EXIT=0
+$ cargo test -p gateway-serve -p gateway
+passed=176 failed=0 (блоков: 40)
+   ⇒ НОЛЬ красных: порядок не пиннится ничем (N-1); ожидание R-147 про N1-E опровергнуто
+
+$ # N-2: прод-бинарь, приоритет флага над env
+A) --depth-cadence-ms=2000 + GATEWAY_DEPTH_CADENCE_MS=abc   → exit=2
+B) --depth-cadence-ms=2000 + GATEWAY_DEPTH_CADENCE_MS=4000  → exit=0
+C) без флага               + GATEWAY_DEPTH_CADENCE_MS=abc   → exit=2
+   ⇒ A ≡ C: на пути ОТКАЗА флаг приоритета не имеет, вопреки коду и docstring'у d18g
+```
+
+---
+
+## Cross-references
+
+- `R-147` (круг 5 — блокер «ветка не сливается»; закрыт этим кругом, условия 1-4 исполнены)
+- `R-145` (`N-1`/`N-2`/`N-5` — все три закрыты диапазоном круга 6)
+- `A-018` §2.2 (терминальность `feat/M-68-depth-from-book` — корень класса (i) `Б-1`)
+- `A-025` §5.5 (маршрут REJECT'а: founder, не критик)
+- `gates.md` §4 (артефакт гейта, FA-предъявление, граница reviewer↔architect), §8 (merge-preview,
+  зелёный чек), §11 (`docs-freeze`), §12 (уникальность идентификатора)
+- `scripts/check_gate_meta.sh` `:15-38` (`ARCHIVED-VERDICT`), `:371-372` (проверка предка),
+  `:380-400` (subject-lock) · `.github/workflows/ci.yml` `:443-453` (агрегат)
+- `docs/fa/viz-backend.md:189` (`VB-I-2` — живой инвариант, названный по M-66)
