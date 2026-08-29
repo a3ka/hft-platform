@@ -2218,67 +2218,67 @@ pub fn serve_config_from_env(
     };
     server::set_effective_grace_ms(grace_ms);
 
-// ───────────────────────────────────────────────────────────────────────
-// M-68: GATEWAY_DEPTH_CADENCE_MS — КОНФИГ, а не константа.
-const DEFAULT_CADENCE_MS: i64 = 1_000;
-let raw_cadence = get("GATEWAY_DEPTH_CADENCE_MS");
-let trimmed_cadence = raw_cadence.as_deref().map(str::trim);
-let depth_cadence_ms: Option<i64> = match trimmed_cadence {
-    None => Some(DEFAULT_CADENCE_MS),
-    Some("") => Some(DEFAULT_CADENCE_MS),
-    Some(s) if s.trim().is_empty() => Some(DEFAULT_CADENCE_MS),
-    Some(s) => {
-        let trimmed = s.trim();
-        match trimmed.parse::<i64>() {
-            Ok(ms) if ms >= 1000 && 86_400_000 % ms == 0 => Some(ms),
-            Ok(ms) if ms >= 1000 && 86_400_000 % ms != 0 => {
-                return Err(format!(
-                    "GATEWAY_DEPTH_CADENCE_MS={ms} не выравнен на границу UTC-суток \
+    // ───────────────────────────────────────────────────────────────────────
+    // M-68: GATEWAY_DEPTH_CADENCE_MS — КОНФИГ, а не константа.
+    const DEFAULT_CADENCE_MS: i64 = 1_000;
+    let raw_cadence = get("GATEWAY_DEPTH_CADENCE_MS");
+    let trimmed_cadence = raw_cadence.as_deref().map(str::trim);
+    let depth_cadence_ms: Option<i64> = match trimmed_cadence {
+        None => Some(DEFAULT_CADENCE_MS),
+        Some("") => Some(DEFAULT_CADENCE_MS),
+        Some(s) if s.trim().is_empty() => Some(DEFAULT_CADENCE_MS),
+        Some(s) => {
+            let trimmed = s.trim();
+            match trimmed.parse::<i64>() {
+                Ok(ms) if ms >= 1000 && 86_400_000 % ms == 0 => Some(ms),
+                Ok(ms) if ms >= 1000 && 86_400_000 % ms != 0 => {
+                    return Err(format!(
+                        "GATEWAY_DEPTH_CADENCE_MS={ms} не выравнен на границу UTC-суток \
                      (требуется 86_400_000 % GATEWAY_DEPTH_CADENCE_MS == 0; иначе \
                      подсекундные/нестандартные значения дают схлопывание ключей — \
                      тот же класс, что GW-I-14 для window_ms; см. MD-I-8 d14)"
-                ));
-            }
-            Ok(ms) if ms < 1000 => {
-                return Err(format!(
-                    "GATEWAY_DEPTH_CADENCE_MS={ms} подсекундная — проводная форма \
+                    ));
+                }
+                Ok(ms) if ms < 1000 => {
+                    return Err(format!(
+                        "GATEWAY_DEPTH_CADENCE_MS={ms} подсекундная — проводная форма \
                      ключуется секундами (DepthRow.series — time_s), подсекундный \
                      интервал даёт ОДИН ключ в секунду молча. Требуется >= 1000; \
                      см. MD-I-8 d14 (C-167)"
-                ));
-            }
-            Ok(ms) => {
-                return Err(format!(
-                    "GATEWAY_DEPTH_CADENCE_MS={ms} невалидно: должно быть >= 1000 \
+                    ));
+                }
+                Ok(ms) => {
+                    return Err(format!(
+                        "GATEWAY_DEPTH_CADENCE_MS={ms} невалидно: должно быть >= 1000 \
                      и выравнено на границу UTC-суток (86_400_000 % ms == 0); \
                      получено {trimmed:?}"
-                ));
-            }
-            Err(e) => {
-                return Err(format!(
-                    "GATEWAY_DEPTH_CADENCE_MS={trimmed:?} не парсится как i64 ({e}) — \
+                    ));
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "GATEWAY_DEPTH_CADENCE_MS={trimmed:?} не парсится как i64 ({e}) — \
                      опечатка в `.env` (мусор/суффикс/научная нотация/дробное/\
                      переполнение), а не сигнал к дефолту; оператор обязан задать \
                      валидное значение или unset/пусто/пробельное для дефолта"
-                ));
+                    ));
+                }
             }
         }
-    }
-};
+    };
 
-// Селектор собирается `build_selector` БЕЗ `depth_cadence_ms` (поле `None`),
-// затем дописывается ПОСЛЕ сборки — сигнатура `build_selector` не меняется.
-let mut selector = build_selector(venue, symbol, timeframe_ms, bands, window_ms);
-selector.depth_cadence_ms = depth_cadence_ms;
+    // Селектор собирается `build_selector` БЕЗ `depth_cadence_ms` (поле `None`),
+    // затем дописывается ПОСЛЕ сборки — сигнатура `build_selector` не меняется.
+    let mut selector = build_selector(venue, symbol, timeframe_ms, bands, window_ms);
+    selector.depth_cadence_ms = depth_cadence_ms;
 
-// M-68 задача 24 (R-141 Б-3, MAJOR): старт-гейт ЗЕРКАЛИТ гвард отношения
-// `cadence_ms % timeframe_ms`. Стоит ОБЯЗАТЕЛЬНО ДО
-// `set_effective_max_response_bytes` ниже: иначе отвергнутая старт-конфигурация
-// успеет выставить глобальный предел, и `PL-I-5` M-71 ломается молча.
-if let Some(cadence) = selector.depth_cadence_ms {
-    if cadence >= selector.timeframe_ms && cadence % selector.timeframe_ms != 0 {
-        return Err(format!(
-            "GATEWAY_DEPTH_CADENCE_MS={cadence} не выравнен на GATEWAY_TIMEFRAME_MS={} \
+    // M-68 задача 24 (R-141 Б-3, MAJOR): старт-гейт ЗЕРКАЛИТ гвард отношения
+    // `cadence_ms % timeframe_ms`. Стоит ОБЯЗАТЕЛЬНО ДО
+    // `set_effective_max_response_bytes` ниже: иначе отвергнутая старт-конфигурация
+    // успеет выставить глобальный предел, и `PL-I-5` M-71 ломается молча.
+    if let Some(cadence) = selector.depth_cadence_ms {
+        if cadence >= selector.timeframe_ms && cadence % selector.timeframe_ms != 0 {
+            return Err(format!(
+                "GATEWAY_DEPTH_CADENCE_MS={cadence} не выравнен на GATEWAY_TIMEFRAME_MS={} \
              (cadence_ms % timeframe_ms = {} != 0). При cadence_ms >= timeframe_ms \
              эффективная частота есть НОК(timeframe, cadence) и РАСХОДИТСЯ с \
              заявленной, а метка выдачи лжёт ровно на величину расхождения \
@@ -2287,46 +2287,45 @@ if let Some(cadence) = selector.depth_cadence_ms {
              тот же класс fail-closed, что GW-I-14 для window_ms. Без этой \
              проверки контейнер поднимается ЗДОРОВЫМ, а validate_selector на \
              клиентском пути отвергает КАЖДОЕ подключение (R-141 Б-3, TD-019/TD-020)",
-            selector.timeframe_ms,
-            cadence % selector.timeframe_ms
-        ));
-    }
-}
-
-// M-71: GATEWAY_MAX_RESPONSE_BYTES — fail-closed предел объёма ответа.
-let raw = get("GATEWAY_MAX_RESPONSE_BYTES");
-let trimmed = raw.as_deref().map(str::trim);
-let max_response_bytes: usize = match trimmed {
-    None | Some("") => {
-        tracing::warn!(
-            "GATEWAY_MAX_RESPONSE_BYTES is absent or blank (raw={:?}); \
-             GATEWAY_MAX_RESPONSE_BYTES={} — подписанная норма (founder 2026-08-26, \
-             П-020, milestones/M-71-egress-cap.md §5.1), PL-I-5",
-            raw,
-            gateway::DEFAULT_MAX_RESPONSE_BYTES,
-        );
-        gateway::DEFAULT_MAX_RESPONSE_BYTES
-    }
-    Some(s) => match s.parse::<usize>() {
-        Ok(0) => {
-            return Err(format!(
-                "GATEWAY_MAX_RESPONSE_BYTES={s} невалидно: должно быть >= 1 \
-                 (PL-I-5: нулевой предел делает сервис неработоспособным — \
-                 ни один ответ не уложится)"
+                selector.timeframe_ms,
+                cadence % selector.timeframe_ms
             ));
         }
-        Ok(n) => n,
-        Err(e) => {
-            return Err(format!("GATEWAY_MAX_RESPONSE_BYTES={s:?} parse: {e}"));
+    }
+
+    // M-71: GATEWAY_MAX_RESPONSE_BYTES — fail-closed предел объёма ответа.
+    let raw = get("GATEWAY_MAX_RESPONSE_BYTES");
+    let trimmed = raw.as_deref().map(str::trim);
+    let max_response_bytes: usize = match trimmed {
+        None | Some("") => {
+            tracing::warn!(
+                "GATEWAY_MAX_RESPONSE_BYTES is absent or blank (raw={:?}); \
+             GATEWAY_MAX_RESPONSE_BYTES={} — подписанная норма (founder 2026-08-26, \
+             П-020, milestones/M-71-egress-cap.md §5.1), PL-I-5",
+                raw,
+                gateway::DEFAULT_MAX_RESPONSE_BYTES,
+            );
+            gateway::DEFAULT_MAX_RESPONSE_BYTES
         }
-    },
-};
+        Some(s) => match s.parse::<usize>() {
+            Ok(0) => {
+                return Err(format!(
+                    "GATEWAY_MAX_RESPONSE_BYTES={s} невалидно: должно быть >= 1 \
+                 (PL-I-5: нулевой предел делает сервис неработоспособным — \
+                 ни один ответ не уложится)"
+                ));
+            }
+            Ok(n) => n,
+            Err(e) => {
+                return Err(format!("GATEWAY_MAX_RESPONSE_BYTES={s:?} parse: {e}"));
+            }
+        },
+    };
 
-// M-71 §4bis.2: сеттер зовётся СТРОГО ПОСЛЕ успешного разбора — все ветки отказа
-// ВЫШЕ (включая M-68 гвард отношения) делают `return Err(...)` ДО этой строки.
-// Класс GW-I-14/R7: отвергнутая конфигурация не смеет управлять сервисом.
-gateway::set_effective_max_response_bytes(max_response_bytes);
-
+    // M-71 §4bis.2: сеттер зовётся СТРОГО ПОСЛЕ успешного разбора — все ветки отказа
+    // ВЫШЕ (включая M-68 гвард отношения) делают `return Err(...)` ДО этой строки.
+    // Класс GW-I-14/R7: отвергнутая конфигурация не смеет управлять сервисом.
+    gateway::set_effective_max_response_bytes(max_response_bytes);
 
     Ok(server::ServeConfig {
         addr,
