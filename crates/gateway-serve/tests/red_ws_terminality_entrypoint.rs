@@ -80,6 +80,21 @@ const TEST_CAP: usize = 10_000;
 /// иначе меряют друг друга. Тот же приём и та же причина, что `serial()` в
 /// `crates/gateway/tests/red_egress_cap_paths.rs:127`; здесь мьютекс асинхронный, потому что
 /// удержание `std`-мьютекса через `.await` — самостоятельный дефект (`clippy::await_holding_lock`).
+/// **ВОЗВРАТ ПРЕДЕЛА — ЧЕРЕЗ `Drop`, А НЕ ПОСЛЕДНЕЙ СТРОКОЙ ТЕСТА.** Первая редакция ставила
+/// восстановление дефолта в конец `E-2`: упавший ассерт до него не доезжает, и следующий тест
+/// этого бинаря унаследовал бы чужое значение процессного предела. Сегодня безвредно (тестов
+/// два, и `E-1` ставит предел сам), но третий добавленный поймал бы флак от глобального
+/// состояния — ровно тот класс, который набор `red_egress_cap_paths.rs` уже ловил замером
+/// («параллельный прогон роняет ЕЩЁ и `P1`»). Страж восстанавливает дефолт при ЛЮБОМ выходе,
+/// включая панику ассерта.
+struct CapGuard;
+
+impl Drop for CapGuard {
+    fn drop(&mut self) {
+        gateway::set_effective_max_response_bytes(gateway::DEFAULT_MAX_RESPONSE_BYTES);
+    }
+}
+
 async fn serial() -> tokio::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
@@ -276,6 +291,7 @@ async fn subscribed(addr: &str) -> Ws {
 #[tokio::test]
 async fn td_178_e1_push_path_delivers_frames_to_the_socket() {
     let _g = serial().await;
+    let _cap = CapGuard;
     gateway::set_effective_max_response_bytes(usize::MAX);
     let dir = journal_of_trades(200);
     let addr = serve_on(dir.path()).await;
@@ -325,6 +341,7 @@ async fn td_178_e1_push_path_delivers_frames_to_the_socket() {
 #[tokio::test]
 async fn td_178_e2_cap_terminal_refusal_notifies_client_and_ends_subscription() {
     let _g = serial().await;
+    let _cap = CapGuard;
     // Снапшот (425 Б) проходит, delta-кадр (~29 КБ) — нет. Предел ставится ДО `serve_on`,
     // чтобы сессия читала уже сниженное значение с первого тика.
     gateway::set_effective_max_response_bytes(TEST_CAP);
@@ -382,5 +399,4 @@ async fn td_178_e2_cap_terminal_refusal_notifies_client_and_ends_subscription() 
             None => break,
         }
     }
-    gateway::set_effective_max_response_bytes(gateway::DEFAULT_MAX_RESPONSE_BYTES);
 }
