@@ -1,8 +1,8 @@
 <!-- GATE-META
-milestone: П-024
+milestone: C-101
 audited_repo: a3ka/hft-platform
-audited_base: 8a2ad91887657460dbd7963a3081aacea6ceeb27
-audited_head: 328a356a0898f775a94596a2af10e4718504b013
+audited_base: 8a2ad9182a1b48f1a2034833d51657f8aebe6d15
+audited_head: 328a356ecaa0936c90cf08954bac1cd0613b48d7
 verdict: APPROVE
 -->
 
