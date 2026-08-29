@@ -69,10 +69,10 @@ chk bash scripts/tests/red_egress_doors.sh
 
 step "A4 (задачи 8,9,12,13 — R-133 B-2/B-3/N-3, R-139 B-1, R-140 B-1, R-143 B-2) — вердикт путей совпадает, флаг провенанса цел, ответ полон, подписка не livelock-ится"
 chk cargo test -p gateway --test red_egress_cap_paths --quiet
-EXPECT_P=7
+EXPECT_P=8
 N_P=$(grep -cE "^fn pl_i_5_p" crates/gateway/tests/red_egress_cap_paths.rs || true); N_P=${N_P:-0}
 if [ "${N_P}" -eq "${EXPECT_P}" ]; then
-  echo "PASS: A4 состав набора — ${N_P} оракулов (ожидалось ровно ${EXPECT_P}: P-C1 P1 P2 P3 P4 P5 P6)"
+  echo "PASS: A4 состав набора — ${N_P} оракулов (ожидалось ровно ${EXPECT_P}: P-C1 P1 P2 P3 P4 P5 P6 P7)"
 else
   echo "FAIL: A4 состав набора — ${N_P} при ожидаемых ${EXPECT_P}; порог и набор разошлись"
   FAIL=$((FAIL + 1))
