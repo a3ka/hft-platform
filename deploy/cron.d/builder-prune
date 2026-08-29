@@ -1,0 +1,39 @@
+# /etc/cron.d/hft-builder-prune
+# Сторож BuildKit-кэша. 29.08.2026: диск уехал 90 % из-за 43.85 ГБ кэша за 7 недель
+# (recorder пересобирается на каждом push'е в main, и НИКТО не подрезал). Без сторожа
+# возврат к 90 % — вопрос времени. Скрипт удаляет ТОЛЬКО кэш BuildKit'а (`builder prune`
+# с фильтром по возрасту), НЕ трогает образы (`docker image prune -a` ЗАПРЕЩЁН — rollback
+# в deploy.yml зависит от них) и НЕ трогает тома (`docker volume prune` ЗАПРЕЩЁН — в
+# томах живёт журнал). Полный список запретов — в шапке deploy/bin/builder-prune-cron.sh.
+#
+# ⚠ ОГРАНИЧЕНИЯ CRON-ПАРСЕРА (те же, что у journal-retention / compaction / offsite):
+#   - `\` не поддерживается (каждая физическая строка = запись);
+#   - `%` = перевод строки;
+#   - `${VAR}` в командной части не раскрывается.
+# Команда — ОДНА строка, вся логика в deploy/bin/builder-prune-cron.sh (bash -n +
+# HFT_CRON_PRINT_ARGV=1 контракт для оракула точки входа).
+#
+# ЧАСТОТА: раз в сутки. N (until=336h = 14 дней) — буквальные две недели; запас
+# к реальному потолку ≈ +24h на суточное окно расписания. Замер 29.08: 0.9 ГБ/день
+# прироста ⇒ потолок ≈ 12.6 ГБ (в 3.5× меньше исходных 43.85). Подробнее — в шапке
+# скрипта, секция «ВЫБОР until=336h».
+#
+# Установка (та же, что у соседей):
+#   sudo install -m 0755 deploy/bin/builder-prune-cron.sh /root/hft-platform/deploy/bin/
+#   sudo install -m 0644 deploy/cron.d/builder-prune     /etc/cron.d/hft-builder-prune
+# Проверка ДО установки (ровно это делает гейт D5):
+#   crontab -n deploy/cron.d/builder-prune   → exit 0
+
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+HFT_ROOT=/root/hft-platform
+BUILDER_PRUNE_UNTIL_HOURS=336
+BUILDER_PRUNE_FORCE=-f
+BUILDER_PRUNE_LOG=/var/log/hft/builder-prune.log
+BUILDER_PRUNE_ALERT_FILE=/var/lib/hft/builder-prune.alert
+BUILDER_PRUNE_LAST_SUCCESS=/var/lib/hft/builder-prune.last-success
+
+# m h dom mon dow user command
+# 04:30 UTC — после компакции (03:50), ретеншена (04:07) и офсайт-копии (:07
+# каждого часа, ближайший выше — 04:07). Не накладывается ни на что в проде.
+30 4 * * * root /root/hft-platform/deploy/bin/builder-prune-cron.sh
