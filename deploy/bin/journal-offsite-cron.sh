@@ -67,10 +67,13 @@ HFT_ROOT="${HFT_ROOT:-/root/hft-platform}"
 # Источник — прод-каталог НА ТОМ ЖЕ ХОСТЕ, что cron (rsync локальный по SSH не
 # запускает, файлы читаются с диска, ssh нужен ТОЛЬКО для отправки на Storage Box).
 SRC_DIR="${JOURNAL_OFFSITE_SRC:-/var/lib/docker/volumes/hft-platform_journal-data/_data}"
-# Цель — SSH-субаккаунт на Storage Box, порт 23 (SSH), путь /journal/ в его домашнем
+# Цель — SSH-субаккаунт на Storage Box, порт 23 (SSH), путь journal/ в его домашнем
 # каталоге (соответствует каталогу, в который положилась первая ручная офсайт-копия
-# 29.08: `journal/` — 465 файлов, 77 ГБ, RSYNC_EXIT=0).
-DST_URL="${JOURNAL_OFFSITE_DST:-ssh://u659392-sub1@u659392-sub1.your-storagebox.de:23/journal/}"
+# 29.08: `journal/` — 465 файлов, 77 ГБ, RSYNC_EXIT=0). Форма `user@host:path` (не
+# `ssh://user@host:port/path`): rsync при наличии `-e "ssh ..."` использует ровно ту
+# команду ssh, что мы задаём, и `ssh://`-URL в паре с `-e` даёт «ssh ssh://...»
+# (rsync 3.4.1, замер: `ssh: Could not resolve hostname ssh: Temporary failure`).
+DST_URL="${JOURNAL_OFFSITE_DST:-u659392-sub1@u659392-sub1.your-storagebox.de:journal/}"
 # Путь к ключу Storage Box (на проде — /root/.ssh/storagebox, права 600, проверено 29.08).
 SSH_KEY="${JOURNAL_OFFSITE_SSH_KEY:-/root/.ssh/storagebox}"
 # mtime-фильтр: ≥ 15 минут. Свежие файлы — потенциально активный сегмент (его mtime
@@ -175,7 +178,7 @@ fi
 if ! ssh -i "${SSH_KEY}" -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=10 \
      -p 23 -o StrictHostKeyChecking=accept-new \
      u659392-sub1@u659392-sub1.your-storagebox.de pwd 2>/dev/null; then
-  alert "ssh к ${DST_URL%:*} отказал (ключ ${SSH_KEY} или сеть/Storage Box)"
+  alert "ssh к субаккаунту storagebox отказал (ключ ${SSH_KEY} или сеть/Storage Box)"
   exit 1
 fi
 
