@@ -74,7 +74,7 @@
 # будущий consumer (restore-drill П-023). SRC_DIR совпадает с прод-каталогом,
 # который монтируется в recorder как journal-data:/var/lib/journal (одинаково в
 # проде и в будущем restore-drill'е).
-set -uo pipefail
+set -u  # pipefail снят: см. комментарий выше у find|rsync — он ловил 141 find'а на штатном SIGPIPE от rsync'а и алертил ложно (R-151 Н-3, П-024)
 
 # ── Конфигурация через env (как у соседей — паттерн, не изобретение) ────────────────
 HFT_ROOT="${HFT_ROOT:-/root/hft-platform}"
@@ -108,6 +108,12 @@ IONICE_LEVEL="${JOURNAL_OFFSITE_IONICE_LEVEL:-7}"   # lowest within best-effort
 LOG="${JOURNAL_OFFSITE_LOG:-/var/log/hft/journal-offsite.log}"
 ALERT_FILE="${JOURNAL_OFFSITE_ALERT_FILE:-/var/lib/hft/journal-offsite.alert}"
 LAST_SUCCESS="${JOURNAL_OFFSITE_LAST_SUCCESS:-/var/lib/hft/journal-offsite.last-success}"
+# SSH-порт для субаккаунта: 23 (стандарт Storage Box), переопределяется env
+# `JOURNAL_OFFSITE_SSH_PORT`. Порт НЕ парсится из DST_URL: документированная форма
+# `user@host:path` (deploy/README.md §1.4) не несёт порт в URL, и попытка угадать
+# «host:22:journal/» сломает скрипт при любой смене провайдера. Порт — параметр
+# сервиса, а не строка-цели.
+SSH_PORT="${JOURNAL_OFFSITE_SSH_PORT:-23}"
 # Lock — отдельный файл для ОФСАЙТА ПРОТИВ САМОГО СЕБЯ: предыдущий тик ещё
 # работает → следующий пропускается (-n, non-blocking). Это НЕ cross-task
 # serialisation: flock сериализует только процессы на ОДНОМ файле, и retention/
@@ -141,6 +147,7 @@ print_argv() {
   echo "SRC_DIR=${SRC_DIR}"
   echo "DST_URL=${DST_URL}"
   echo "SSH_KEY=${SSH_KEY}"
+  echo "SSH_PORT=${SSH_PORT}"
   echo "MIN_AGE_MIN=${MIN_AGE_MIN}"
   echo "BWLIMIT_MBPS=${BWLIMIT_MBPS}"
   echo "NICE_LEVEL=${NICE_LEVEL}"
@@ -152,7 +159,7 @@ print_argv() {
   echo "nice -n \${NICE_LEVEL} ionice -c \${IONICE_CLASS} -n \${IONICE_LEVEL} rsync \\"
   echo "  --archive --partial-dir=.rsync-partial --human-readable --stats \\"
   echo "  --bwlimit=\${BWLIMIT_MBPS}M \\"
-  echo "  -e \"ssh -i \${SSH_KEY} -o IdentitiesOnly=yes -p 23 -o StrictHostKeyChecking=accept-new\" \\"
+  echo "  -e \"ssh -i \${SSH_KEY} -o IdentitiesOnly=yes -p \${SSH_PORT} -o StrictHostKeyChecking=accept-new\" \\"
   echo "  --from0 --files-from=- \\"
   echo "  \"\${SRC_DIR}/\" \"\${DST_URL}\""
 }
@@ -189,15 +196,60 @@ if [ ! -f "${SSH_KEY}" ]; then
   exit 1
 fi
 # 3) dry-run ssh — если субаккаунт недоступен, лучше узнать сейчас, чем в середине копии.
+# Хост и user ВЫВОДЯТСЯ из DST_URL (форма `user@host:path` — задокументирована в
+# deploy/README.md §1.4). До Н-2 скрипт имел зашитый литерал хоста, что давало
+# зелёный pre-flight при переопределении DST_URL на другой субаккаунт/стенд
+# (recompose producer→consumer разрывалась; rsync уходил на новый хост уже
+# после этой проверки). Порт — из env `JOURNAL_OFFSITE_SSH_PORT` (default 23 —
+# Storage Box), он же идёт в реальный rsync через print_argv/`-p ${SSH_PORT}`.
 # `BatchMode=yes` гарантирует, что ssh не спросит пароль интерактивно (если спросит —
 # значит ключ не подходит, и rsync тоже упадёт). `ConnectTimeout=10` не висит вечно
 # при сетевых проблемах. Используем `pwd` (в restricted shell'е Storage Box'а НЕТ
 # `/usr/bin/true`; `pwd` — единственный «безобидный» builtin, доступный ВСЕГДА; см.
 # `help` при подключении к субаккаунту).
+parse_dst_target() {
+  # Разбирает DST_URL вида [USER@]HOST[:PATH] (документированная форма для offsite —
+  # см. deploy/README.md §1.4). ssh://-форма ЗАПРЕЩЕНА скриптом и runbook'ом: пара с
+  # `-e "ssh …"` даёт `ssh ssh://…` (rsync 3.4.1). Если формат не распознан — fail-loud
+  # через alert и exit, лучше отказаться от прогона, чем пройти pre-flight на ЧУЖОМ
+  # хосте и упасть в середине копии.
+  local url="${DST_URL}"
+  url="${url#ssh://}"               # отрезаем схему, если кто-то всё-таки её воткнул
+  url="${url%/}"                    # отрезаем замыкающий слэш пути
+  local user_part host_part
+  if [[ "${url}" == *@* ]]; then
+    user_part="${url%%@*}"
+    host_part="${url#*@}"
+  else
+    user_part=""
+    host_part="${url}"
+  fi
+  # host_part теперь `HOST[:PATH]`. Отрезаем путь: первое двоеточие ОТДЕЛЯЕТ хост от пути
+  # в форме `host:path`. Эвристика работает на документированной форме; для случая
+  # `host:port:path` (явный порт в URL — НЕ поддерживается документированной формой,
+  # порт задаётся через `JOURNAL_OFFSITE_SSH_PORT`) host_part останется с портом,
+  # и ssh отвергнет строку — fail-loud, что и требовалось.
+  host_part="${host_part%%:*}"
+  if [ -z "${host_part}" ]; then
+    return 1
+  fi
+  if [ -z "${user_part}" ]; then
+    # Форма без `@`: пусть ssh попробует текущего пользователя, но СНАЧАЛА
+    # вернём ошибку. Документированная форма `user@host:path` всегда несёт user.
+    return 2
+  fi
+  SSH_TARGET_USER="${user_part}"
+  SSH_TARGET_HOST="${host_part}"
+  return 0
+}
+if ! parse_dst_target; then
+  alert "DST_URL=${DST_URL} не парсится как user@host:path — проверь env JOURNAL_OFFSITE_DST и deploy/README.md §1.4"
+  exit 1
+fi
 if ! ssh -i "${SSH_KEY}" -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=10 \
-     -p 23 -o StrictHostKeyChecking=accept-new \
-     u659392-sub1@u659392-sub1.your-storagebox.de pwd 2>/dev/null; then
-  alert "ssh к субаккаунту storagebox отказал (ключ ${SSH_KEY} или сеть/Storage Box)"
+     -p "${SSH_PORT}" -o StrictHostKeyChecking=accept-new \
+     "${SSH_TARGET_USER}@${SSH_TARGET_HOST}" pwd 2>/dev/null; then
+  alert "ssh к ${SSH_TARGET_USER}@${SSH_TARGET_HOST}:${SSH_PORT} отказал (ключ ${SSH_KEY} или сеть/Storage Box)"
   exit 1
 fi
 
@@ -235,29 +287,60 @@ fi
 #   - `SRC_DIR/` с trailing slash — копировать СОДЕРЖИМОЕ каталога, а не сам каталог;
 #      иначе на Storage Box появится подкаталог `journal/_data/`, а не `journal/...`.
 #
-# Поток find → rsync запускается через pipe. В bash без pipefail (мы используем
-# `set -uo pipefail`, но pipefail не ловит SIGPIPE от rsync, который закрывает stdin
-# после прочтения списка — это штатное завершение find'а через SIGPIPE).
-# Реальный сбой — это exit≠0 от rsync. find не возвращает данные об ошибках
-# отдельным каналом; все stderr уходят в LOG.
+# Поток find → rsync запускается через pipe. Старый комментарий здесь был НЕВЕРЕН
+# (R-151 Н-3): «pipefail не ловит SIGPIPE от rsync». На самом деле ловит — и это
+# ИСТОЧНИК проблемы. Под `set -o pipefail` конвейер возвращает максимальный exit,
+# и find, получивший SIGPIPE (141) при штатном закрытии stdin со стороны rsync'а
+# (rsync прочитал список и завершил работу), поднимает exit всего конвейера в 141,
+# хотя rsync отработал чисто. С этим связан наблюдавшийся класс ложных
+# `journal-offsite.alert` на чистых прогонах (П-024, тот же класс в этом корпусе).
+#
+# Что делаем:
+#   1) `set -o pipefail` СНЯТ со скрипта (set -u оставлен): этот конвейер — единственное
+#      место, где pipefail мог что-то поймать, и он ловит его НЕ ТАК, как нам нужно;
+#      остальные команды (ssh, find без pipe, мkdir, flock, tail, mv, true/false)
+#      дают exit естественно, без pipefail.
+#   2) Реальный сбой — это exit rsync'а (PIPESTATUS[1]); find может получить 141 (find
+#      отдал весь список, rsync закрыл stdin — штатное завершение find'а, НЕ ошибка
+#      rsync'а). Алертуем по ${PIPESTATUS[1]}, не по exit конвейера.
+#   3) find, упавший ПО СВОЕЙ ПРИЧИНЕ (битый путь, ENOSPC, TOCTOU на удалении) до
+#      того, как rsync начал читать, — это отдельная диагностика; stderr find'а идёт в
+#      ${LOG}, и оператор увидит её в журнале. Дополнительный catch добавляет лов
+#      find-сбоя в alert, не дожидаясь: «find exit=N (источник/фильтр), rsync не
+#      запускался — см. ${LOG}».
 start_ts=$(date -u +%s)
-if find "${SRC_DIR}" -type f -mmin +"${MIN_AGE_MIN}" ! -name 'recorder.heartbeat' -printf '%P\0' \
+find "${SRC_DIR}" -type f -mmin +"${MIN_AGE_MIN}" ! -name 'recorder.heartbeat' -printf '%P\0' \
   | nice -n "${NICE_LEVEL}" ionice -c "${IONICE_CLASS}" -n "${IONICE_LEVEL}" rsync \
       --archive --partial-dir=.rsync-partial --human-readable --stats \
       --bwlimit="${BWLIMIT_MBPS}M" \
-      -e "ssh -i ${SSH_KEY} -o IdentitiesOnly=yes -p 23 -o StrictHostKeyChecking=accept-new" \
+      -e "ssh -i ${SSH_KEY} -o IdentitiesOnly=yes -p ${SSH_PORT} -o StrictHostKeyChecking=accept-new" \
       --from0 --files-from=- \
-      "${SRC_DIR}/" "${DST_URL}" >> "${LOG}" 2>&1; then
-  rc=0
-else
-  rc=$?
+      "${SRC_DIR}/" "${DST_URL}" >> "${LOG}" 2>&1
+rsync_rc=${PIPESTATUS[1]:-0}
+find_rc=${PIPESTATUS[0]:-0}
+# find exit=141 после штатного завершения rsync'а (SIGPIPE из закрытого stdin) — не сбой
+case "${find_rc}" in
+  0|141) find_rc=0 ;;
+esac
+# Если find упал РАНЬШЕ (до SIGPIPE от rsync), rsync мог и не запуститься.
+# Тогда PIPESTATUS[1] = 0 (rsync не запускался → не отработал); а сигнал даёт find.
+# Считаем это сбоем источника.
+if [ "${find_rc}" -ne 0 ] && [ "${rsync_rc}" -eq 0 ]; then
+  rsync_rc="${find_rc}"
+  rsync_failure_mode="find/source"
 fi
+rc=${rsync_rc}
 end_ts=$(date -u +%s)
 dur=$(( end_ts - start_ts ))
 
 if [ "${rc}" -ne 0 ]; then
-  alert "rsync exit=${rc} (1=IO/SSH; 12=connection; 23=protocol; 30=timeout в rsync). \
+  if [ "${rsync_failure_mode:-}" = "find/source" ]; then
+    alert "rsync не запускался: find exit=${rc} (фильтр/источник — битый путь или ENOENT на сегменте). \
+Проверь ${LOG} и состояние ${SRC_DIR}. Длительность ${dur}s."
+  else
+    alert "rsync exit=${rc} (1=IO/SSH; 12=connection; 23=protocol; 30=timeout в rsync). \
 Проверь ${LOG} и доступность ${DST_URL}. Длительность ${dur}s."
+  fi
   exit "${rc}"
 fi
 
