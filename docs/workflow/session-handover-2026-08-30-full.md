@@ -15,7 +15,7 @@ main                7518553   CI+Deploy success
 
 | ветка | SHA | отст | своих | состояние |
 |---|---|---:|---:|---|
-| `feat/gate-meta-terminal-token` | `3b3cdb0` | 0 | 4 | **круг 2 адверсария ИДЁТ.** Первое звено очереди |
+| `feat/gate-meta-terminal-token` | `ae19927` | 0 | 6 | **ГЕЙТ ПРОЙДЕН: `C-181` NOTE, блокеров нет.** `C-180` Б-1 закрыт, N-1/N-2 закрыты. **ГОТОВА К MERGE** — первое звено очереди |
 | `feat/M-68-rev4` | `c1f6649` | 22 | 77 | ждёт токена из ветки выше |
 | `docs/fa-viz-M-68-close` | `3a88f90` | 22 | 78 | стоит НА `M-68`; ждёт круга критика §9 |
 | `feat/M-72-subscription-terminality` | `d8c7654` | 18 | 6 | набор неполон |
@@ -29,7 +29,7 @@ main                7518553   CI+Deploy success
 ## 1. ЕДИНСТВЕННЫЙ ПОРЯДОК ВЛИВАНИЯ — он жёсткий
 
 ```
-круг 2 адверсария → merge feat/gate-meta-terminal-token
+merge feat/gate-meta-terminal-token  ← ГЕЙТ ПРОЙДЕН (C-181 NOTE), можно вливать
   → добавить TERMINAL-BRANCH-VERDICT в коммит feat/M-68-rev4 (три строки, см. §3)
   → merge M-68 → круг критика §9 по docs/fa-viz-M-68-close → merge его
 ```
@@ -123,4 +123,4 @@ TERMINAL-BRANCH-VERDICT: research/critiques/C-138-M-68-round2-escalate.md — т
 `docs/workflow/session-handover-2026-08-31.md` (в `main`) — подробная передача 29.08 ·
 `docs/archive/abandoned-gate-verdicts-2026-08-29/` — восемь кругов барьера формы спеки ·
 `docs/workflow/oracle-blindness-class-2026-08-28.md` — три правила конструкции оракула ·
-`research/reviews/R-149`, `R-151`, `R-152`, `R-154` · `research/critiques/C-179`, `C-180`.
+`research/reviews/R-149`, `R-151`, `R-152`, `R-154` · `research/critiques/C-179`, `C-180`, `C-181`.
