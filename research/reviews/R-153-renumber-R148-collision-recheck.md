@@ -2,7 +2,7 @@
 milestone: R-149
 audited_repo: a3ka/hft-platform
 audited_base: 37a6358adbb92879c081aea8db33e6c4bb910cbb
-audited_head: 0b705be6bff258293ba9425c8adcbfe33b357744
+audited_head: 0b705be69238c697c115c5df2be392acbd38088d
 verdict: APPROVE
 -->
 
