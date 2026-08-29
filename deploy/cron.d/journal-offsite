@@ -1,0 +1,54 @@
+# /etc/cron.d/hft-journal-offsite
+# П-023 (29.08.2026): первая офсайт-копия журнала сделана вручную (465 файлов / 77 ГБ /
+# RSYNC_EXIT=0, замерено и сверено). Скрипт `deploy/bin/journal-offsite-cron.sh` превращает
+# её в РАСПИСАНИЕ: раз в час, ТОЛЬКО файлы, не изменявшиеся ≥15 минут (активный сегмент
+# пишется прямо сейчас — копировать его = «выглядит как целый, но обрывок»).
+#
+# ⚠ ОГРАНИЧЕНИЯ CRON-ПАРСЕРА (те же, что у journal-retention / compaction, шапка того файла):
+#   - `\` не поддерживается: каждая физическая строка = отдельная запись;
+#   - `%` = перевод строки (спецсимвол cron);
+#   - `${VAR}` в командной части не раскрывается (env виден ТОЛЬКО процессу задания).
+# Команда — ОДНА строка, вся логика в deploy/bin/journal-offsite-cron.sh, где есть
+# `bash -n`, прогон со стабом и проверка argv ДО side-эффектов (`HFT_CRON_PRINT_ARGV=1`).
+#
+# ЧАСТОТА — раз в час. Обоснование числом в шапке скрипта (5 ГБ/сут чистыми,
+# 66 МБ/с канал, --bwlimit=40M, типовой прогон копирует 0 файлов; сегмент ≈ 1100 МБ
+# копируется за ≈ 27 с, при 1–2 закрытых за час).
+#
+# КЛЮЧЕВЫЕ СВОЙСТВА СКРИПТА (полный список — в его шапке):
+#   - rsync БЕЗ --delete (единственная защита от «команда создания = команда уничтожения»);
+#   - rsync С --partial (докачка при обрыве);
+#   - nice -n 10 / ionice -c2 -n7 (recorder не должен голодать);
+#   - flock -n (non-blocking; наложение невозможно);
+#   - exit≠0 → маркер-файл /var/lib/hft/journal-offsite.alert + syslog;
+#     успешный прогон гасит маркер и пишет *.last-success (deploy/README.md §5).
+#
+# Установка (та же, что у соседей):
+#   sudo install -m 0755 deploy/bin/journal-offsite-cron.sh /root/hft-platform/deploy/bin/
+#   sudo install -m 0644 deploy/cron.d/journal-offsite   /etc/cron.d/hft-journal-offsite
+#   sudo install -d /var/log/hft /var/lib/hft
+# Проверка ДО установки (ровно это делает гейт D5):
+#   crontab -n deploy/cron.d/journal-offsite   → exit 0
+
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+HFT_ROOT=/root/hft-platform
+JOURNAL_OFFSITE_SRC=/var/lib/docker/volumes/hft-platform_journal-data/_data
+JOURNAL_OFFSITE_DST=ssh://u659392-sub1@u659392-sub1.your-storagebox.de:23/journal/
+JOURNAL_OFFSITE_SSH_KEY=/root/.ssh/storagebox
+JOURNAL_OFFSITE_MIN_AGE_MIN=15
+JOURNAL_OFFSITE_BWLIMIT_MBPS=40
+JOURNAL_OFFSITE_NICE=10
+JOURNAL_OFFSITE_IONICE_CLASS=2
+JOURNAL_OFFSITE_IONICE_LEVEL=7
+JOURNAL_OFFSITE_LOG=/var/log/hft/journal-offsite.log
+JOURNAL_OFFSITE_ALERT_FILE=/var/lib/hft/journal-offsite.alert
+JOURNAL_OFFSITE_LAST_SUCCESS=/var/lib/hft/journal-offsite.last-success
+JOURNAL_OFFSITE_LOCK=/var/lock/hft-journal-offsite.lock
+
+# m h dom mon dow user command
+# Раз в час, :07 — после ротации (ежесуточно в 03:50 UTC компакция по retention-cron,
+# 04:07 — retention dry-run), :07 каждого часа не накладывается на оба и не совпадает
+# с :50 компакции. Выбор :07 вместо :00 чтобы не приходиться на стандартные пики
+# прод-хоста (системный logrotate, log shipping и т.п.).
+7 * * * * root /root/hft-platform/deploy/bin/journal-offsite-cron.sh
