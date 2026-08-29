@@ -986,6 +986,68 @@ else
 правки гейт-класса"
 fi
 
+# ── Блок 5: ТЕРМИНАЛЬНАЯ ВЕТКА — `TERMINAL-BRANCH-VERDICT` ────────────────────────────
+# Токен под случай `R-154` §E: вердикт вынесен над ревизией, которая СУЩЕСТВУЕТ, но лежит на
+# ветке, объявленной терминальной решением арбитра. Предком `main` она не станет никогда, и
+# `GM-6` держал бы merge предмета, у которого дефекта нет.
+#
+# ТРИ ИЗ ПЯТИ СЦЕНАРИЕВ — АНТИ-БЛАНКЕТНЫЕ, и в них весь смысл: токен обязан открывать РОВНО
+# одну проверку у РОВНО одного файла. `GM-6` выше остаётся без токена и обязан по-прежнему
+# краснеть — иначе новый выход превратился бы в отмену проверки.
+
+# GM-42 — та же side-ветка, что в GM-6, ПЛЮС явный токен ⇒ проход со следом.
+mk_repo R; B="$(head_of "$R")"
+( cd "$R" && git checkout -q -b side && echo x >> docs/DESIGN.md \
+  && git add -A && git commit -q -m side ) || die "GM-42 side"
+SIDE="$(cd "$R" && git rev-parse HEAD)"
+( cd "$R" && git checkout -q - ) || die "GM-42 back"
+add_verdict "$R" "REJECT" "a3ka/hft-platform" "$B" "$SIDE"
+touch_file "$R" "docs/DESIGN.md" "TERMINAL-BRANCH-VERDICT: research/critiques/C-999-test.md — ветка объявлена терминальной решением арбитра"
+run_barrier "$R" "$B" && pass "GM-42 явный TERMINAL-BRANCH-VERDICT открывает не-предковый audited_head" \
+                      || fail "GM-42 легального выхода нет — вердикты на терминальной ветке держат merge вечно"
+
+# GM-43 — АНТИ-БЛАНКЕТ: причина короче порога ⇒ токен НЕ засчитан.
+# Порог 12 символов — тот же, что у FOUNDER-APPROVED и ARCHIVED-VERDICT: токен-ритуал
+# неотличим от отсутствия токена.
+mk_repo R; B="$(head_of "$R")"
+( cd "$R" && git checkout -q -b side && echo x >> docs/DESIGN.md \
+  && git add -A && git commit -q -m side ) || die "GM-43 side"
+SIDE="$(cd "$R" && git rev-parse HEAD)"
+( cd "$R" && git checkout -q - ) || die "GM-43 back"
+add_verdict "$R" "REJECT" "a3ka/hft-platform" "$B" "$SIDE"
+touch_file "$R" "docs/DESIGN.md" "TERMINAL-BRANCH-VERDICT: research/critiques/C-999-test.md — ок"
+run_barrier "$R" "$B" && fail "GM-43 токен с причиной короче порога ОТКРЫЛ проверку — ритуал приравнен к обоснованию" \
+                      || pass "GM-43 короткая причина токен не засчитывает (порог 12, как у FOUNDER-APPROVED)"
+
+# GM-44 — АНТИ-БЛАНКЕТ: токен называет ДРУГОЙ путь ⇒ на этот файл не действует.
+mk_repo R; B="$(head_of "$R")"
+( cd "$R" && git checkout -q -b side && echo x >> docs/DESIGN.md \
+  && git add -A && git commit -q -m side ) || die "GM-44 side"
+SIDE="$(cd "$R" && git rev-parse HEAD)"
+( cd "$R" && git checkout -q - ) || die "GM-44 back"
+add_verdict "$R" "REJECT" "a3ka/hft-platform" "$B" "$SIDE"
+touch_file "$R" "docs/DESIGN.md" "TERMINAL-BRANCH-VERDICT: research/critiques/C-777-другой.md — ветка объявлена терминальной решением арбитра"
+run_barrier "$R" "$B" && fail "GM-44 токен на ЧУЖОЙ путь открыл лок — токен стал бланкетным" \
+                      || pass "GM-44 токен действует ПОФАЙЛОВО: чужой путь не открывает"
+
+# GM-45 — ГЛАВНЫЙ АНТИ-БЛАНКЕТ: ревизии НЕ СУЩЕСТВУЕТ вовсе (реплей C-062) + токен ⇒ БЛОК.
+# Различие принципиальное: «есть, но на мёртвой ветке» — факт истории; «нет вовсе» —
+# выдуманная ревизия, ровно то, ради чего барьер построен. Если токен откроет и это, он
+# вернёт дыру C-062 под видом послабления.
+mk_repo R; B="$(head_of "$R")"
+add_verdict "$R" "REJECT" "a3ka/hft-platform" "$B" "9a0e48f09a0e48f09a0e48f09a0e48f09a0e48f0"
+touch_file "$R" "docs/DESIGN.md" "TERMINAL-BRANCH-VERDICT: research/critiques/C-999-test.md — ветка объявлена терминальной решением арбитра"
+run_barrier "$R" "$B" && fail "GM-45 токен ОТКРЫЛ несуществующую ревизию — класс C-062 вернулся через новый выход" \
+                      || pass "GM-45 токен НЕ открывает несуществующий audited_head (C-062 закрыт)"
+
+# GM-46 — АНТИ-БЛАНКЕТ: токен не открывает subject-lock. Ревизия предковая, вердикт проходной,
+# после него тронут гейт-класс — блок обязан остаться, токен к этой проверке отношения не имеет.
+mk_repo R; B="$(head_of "$R")"
+add_verdict "$R" "APPROVE" "a3ka/hft-platform" "$B" "$(head_of "$R")"
+touch_file "$R" "${GATE_CLASS_FILE}" "TERMINAL-BRANCH-VERDICT: research/critiques/C-999-test.md — ветка объявлена терминальной решением арбитра"
+run_barrier "$R" "$B" && fail "GM-46 TERMINAL-BRANCH-VERDICT открыл SUBJECT-LOCK — токен вышел за свою проверку" \
+                      || pass "GM-46 токен не трогает subject-lock: у каждой проверки свой выход"
+
 echo
 if [ "${FAILED}" -gt 0 ]; then
   echo "VERDICT: FAIL (${FAILED})"
