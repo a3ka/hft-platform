@@ -81,7 +81,7 @@ STATUS: PROPOSED (2026-08-29, architect). Предмет — **шов завер
 | 3 | ⏳ OPEN | **Фикс `TD-177`**: снятие подписки сверяет generation теми же тремя условиями, что и сохранение (`!drained && current_gen == Some(gen_at_pump)`). ОБА пути: `crates/gateway-serve/src/lib.rs:1401` (v1) и `:1795`-класс (legacy). Комментарий `:1290-1306`, объявляющий свойство действующим, приводится к коду | engine-dev | задача 2 GREEN | `crates/gateway-serve/src/lib.rs` |
 | 4 | ✅ DONE | **RED на `TD-179`** (написан и КРАСЕН: `frame crc mismatch`, курсор `None → Some(767)` при нуле отданных кадров; позитивный контроль `M-1` зелёный): `Err` из середины `pump` (не по пределу) при ≥1 уже закрытом батче. Ожидание: собранные кадры НЕ теряются, серия потребителя равна реплею того же окна (`VB-I-2`), либо подписка терминируется с извещением. Сегодня падает: `self.cursor = cursor` на `:3579` уже продвинут, `frames` уносится `?` на `:3551` | architect | `cargo test -p gateway --test red_pump_midstream_failure` | `crates/gateway/tests/red_pump_midstream_failure.rs` |
 | 5 | ⏳ OPEN | **Решение формы извещения** (см. Contract impact) + фикс `TD-179` по выбранной форме | critic решает форму → engine-dev impl | задача 4 GREEN | `crates/gateway/src/lib.rs`, при (а) — `docs/rfc/CT-RFC-09-ws-session.md` |
-| 6 | ⏳ OPEN | **`TD-180`** (MINOR): `snapshot()` отдаёт `cursor: self.cursor` (`crates/gateway/src/lib.rs:3714`) в окне, где батч свёрнут в состояние, но отвергнут пределом. Решение формы + фикс | architect форма → engine-dev | `cargo test -p gateway --test red_snapshot_cursor_honesty` | `crates/gateway/tests/red_snapshot_cursor_honesty.rs` |
+| 6 | 🚧 RED ГОТОВ | **`TD-180`** (MINOR): `snapshot()` отдаёт `cursor: self.cursor` (`crates/gateway/src/lib.rs:3714`) в окне, где батч свёрнут в состояние, но отвергнут пределом. **Форма РЕШЕНА** (§«Форма задачи 6»), **оракул написан и КРАСЕН** (`S-1` ok, `S-2` FAILED: `None` против `Some(24999)`); выполнимость предъявлена — против фикса оба зелены, соседние оракулы не ломаются. Осталось: фикс | ~~architect форма~~ → engine-dev | `cargo test -p gateway --test red_snapshot_cursor_honesty` | `crates/gateway/tests/red_snapshot_cursor_honesty.rs` |
 | 7 | ✅ DONE | **Приземлён оракул `P7`** (`3c91816`; `red_egress_cap_paths` 8 passed, `EXPECT_P` 7→8) со спас-рефа `refs/salvage/2026-08-28-P7/m71-terminality-oracle` (`27e8a5f`) — правдивость признака терминальности. Мутационный контроль исполнен на прошлом круге, предел чувствительности назван внутри самого оракула | architect | `cargo test -p gateway --test red_egress_cap_paths` | `crates/gateway/tests/` |
 | 8 | ⏳ OPEN | **Снять ПУТЬ `scripts/verify_M-71.sh` из комментария** `crates/gateway/src/lib.rs:1964`. Якорь `MUT-ANCHOR M-71-LIMIT` функционален и ОСТАЁТСЯ — снимается только литеральный путь. Без этого гейт `M-71` не переезжает в `docs/archive/` (`04-workflow` §Close-out: гейт, на который ссылается ЧУЖАЯ зона, не выносится, пока ссылку не снял её владелец) | engine-dev | `git grep -c 'scripts/verify_M-71' crates/ deploy/` → 0 | `crates/gateway/src/lib.rs` |
 
@@ -209,6 +209,27 @@ architect'у, а не самостоятельный выбор тайминго
 снять `snapshot()` и утверждать, что его `cursor` равен `full_applied_seq`, а НЕ закладке
 доставки. Позитивный контроль обязателен: в установившемся режиме обе величины совпадают, и
 оракул, зелёный только там, ничего не пиннит.
+
+**`TD-179` и `TD-180` НЕ ПРОТИВОРЕЧАТ ДРУГ ДРУГУ — поверхности разные, и это сказано
+здесь, чтобы следующий круг не «примирял» их правкой.** Оракул `TD-179` (`M-2`) требует,
+чтобы ЗАКЛАДКА ДОСТАВКИ (`r.cursor()`) НЕ уходила вперёд при отказе. Решение `TD-180`
+меняет то, что объявляет `snapshot().cursor`, — другую поверхность. Закладка остаётся на
+месте; меняется только то, какую из двух позиций СНИМОК называет своей.
+
+Проверено прогоном, а не рассуждением (фикс внесён в изолированную копию, `cmp` подтверждён,
+копия удалена — impl-код architect не коммитит):
+
+```
+без фикса:  td_180_s1 ok · td_180_s2 FAILED (None против Some(24999))
+с фиксом:   td_180_s1 ok · td_180_s2 ok            → оракул выполним, не вечно-красный
+весь cargo test -p gateway С ФИКСОМ: единственный красный —
+  td_179_m2_failed_pump_must_not_leave_cursor_ahead_of_delivered
+и он красен ТОЧНО ТАК ЖЕ БЕЗ фикса: та же строка :268, то же
+  «закладка доставки ушла вперёд (None → Some(804))», отказ «frame length absurd»
+```
+
+То есть фикс `TD-180` не покупается ценой соседнего инварианта; `TD-179` остаётся открытым
+по СВОЕЙ причине (не-предельный отказ посреди `pump`), и закрывает его задача 5.
 
 **Предел решения назван:** оно чинит СНИМОК, а не расхождение. Расхождение штатно и остаётся —
 `M-71` §4bis.5 запретил его устранять откатом. Через прод-пути окно сегодня недостижимо
