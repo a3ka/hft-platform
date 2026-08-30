@@ -32,36 +32,91 @@
   оригинал остаётся ГОРЯЧИМ (`Err`, exit 2). Можно запускать без dry-run'а
   по расписанию, но первый ручной прогон всё равно рекомендуется (sanity).
 
-## 1. Монтирование Hetzner Storage Box (CIFS, /etc/fstab)
+## 1. Доступ к Hetzner Storage Box через SSH-субаккаунт (НЕ CIFS)
 
-> Storage Box даёт CIFS-шару. Аккаунт/креды — у founder'а/инфраструктуры
-> (см. §E диспетча: «Без Storage Box apply невозможен — fail-closed»).
+> Storage Box этой коробки работает ТОЛЬКО через SSH (порт 23) — SMB/CIFS,
+> WebDAV и External Reachability **намеренно ВЫКЛЮЧЕНЫ** в панели Hetzner'а
+> (конфигурация безопасности, документированная в `docs/PENDING-SIGNATURE.md`
+> и в переписке с провайдером). Никакого `/etc/fstab` и `/mnt/journal-cold`
+> на проде нет и быть не может: протокол отключён, монтирование НЕ сработает.
 
-Создать файл `/etc/samba/credentials-hetzner` (mode 0600, root:root):
+### 1.1. Параметры доступа (уже работают, проверено 29.08.2026)
 
-```
-username=u123456-sub1
-password=<от founder'а>
-```
+| Параметр | Значение |
+|---|---|
+| Цель (host) | `u659392-sub1.your-storagebox.de` |
+| Порт | `23` (SSH-сервер Storage Box'а) |
+| Логин | `u659392-sub1` (субаккаунт, домашний каталог — корень всех данных) |
+| Ключ | `/root/.ssh/storagebox` (mode `0600`, root:root) |
+| Каталог хранения | `journal/` (внутри домашнего каталога субаккаунта) |
 
-Добавить в `/etc/fstab`:
+Ключ создаётся один раз инфраструктурой (`ssh-keygen -t ed25519 -f
+/root/.ssh/storagebox`), публичная часть прописывается в панели Storage Box'а
+в настройках субаккаунта. Пароль субаккаунта для SSH НЕ используется —
+аутентификация строго по ключу. На проде это уже сделано.
 
-```
-//u123456-sub1.your-storagebox.de/backup /mnt/journal-cold cifs credentials=/etc/samba/credentials-hetzner,uid=root,gid=root,iocharset=utf8,vers=3.0,_netdev,x-systemd.automount,x-systemd.requires=network-online.target 0 0
-```
-
-`x-systemd.automount` — Storage Box монтируется по требованию, не блокирует загрузку
-хоста; `x-systemd.requires=network-online.target` — ждёт сеть. Подробнее по опциям —
-Hetzner Storage Box docs (CIFS/SMBv3).
-
-Применить:
+### 1.2. Проверка доступа (ручная; запускать от root'а)
 
 ```bash
-sudo systemctl daemon-reload
-sudo systemctl start mnt-journal-cold.automount
-sudo mount -a
-ls -la /mnt/journal-cold   # должна быть пустая (или ваша структура каталогов)
+# Должна сработать без запроса пароля (BatchMode + IdentitiesOnly).
+# ConnectTimeout=10 — не висеть на мёртвом канале.
+ssh -i /root/.ssh/storagebox \
+    -o IdentitiesOnly=yes \
+    -o BatchMode=yes \
+    -o ConnectTimeout=10 \
+    -p 23 \
+    -o StrictHostKeyChecking=accept-new \
+    u659392-sub1@u659392-sub1.your-storagebox.de \
+    'pwd; ls -la'
 ```
+
+Ожидаемый вывод: путь `~` (домашний каталог субаккаунта) и содержимое
+корня — пусто или уже существующие файлы (на проде там `journal/` с
+офсайт-копией).
+
+Если `ssh` запрашивает пароль — ключ не подходит, проверяй:
+
+1. Существует ли файл `/root/.ssh/storagebox` и его права ровно `600`
+   (`stat -c '%a' /root/.ssh/storagebox` ⇒ `600`; иначе ssh откажет).
+2. Публичная часть ключа совпадает с тем, что прописан в панели Storage Box'а
+   (раздел «SSH-ключи» настроек субаккаунта).
+3. Субаккаунт существует и активен (не удалён в панели).
+
+### 1.3. Где живут данные
+
+Домашний каталог субаккаунта (`pwd` в ssh-сессии выше) — это и есть корень
+всего Storage Box'а для данного субаккаунта. Внутри:
+
+* `journal/` — офсайт-копия журнала прод-хоста (см. §1.4);
+* `backup/` — другие данные (если когда-либо появятся; сейчас пусто).
+
+Никаких «монтирований», никаких CIFS-шар, никаких `x-systemd.automount`.
+Все обращения — через SSH (`ssh`, `scp`, `rsync ... -e "ssh ..."`).
+
+### 1.4. Офсайт-копия журнала (П-023)
+
+С 2026-08-29 офсайт-копия журнала делается по расписанию (`cron.d/journal-offsite`,
+раз в час, `deploy/bin/journal-offsite-cron.sh` — см. §0/§3): инкрементальный
+`rsync` локального `/var/lib/docker/volumes/hft-platform_journal-data/_data/`
+в `u659392-sub1@u659392-sub1.your-storagebox.de:journal/` (форма
+`user@host:path`, порт 23 указан через `-e "ssh -p 23 …"`; `ssh://URL`
+ЗАПРЕЩЕНА — пара с `-e` даёт «ssh ssh://…», rsync 3.4.1, R-151 Б-3 и
+commit `cf686af`). Файлы
+копируются ТОЛЬКО если их `mtime ≥ 15 минут` (активный сегмент пишется
+прямо сейчас — копировать его = обрывок, выглядящий как целый); `recorder.heartbeat`
+исключён явно (страховка от регрессии в recorder'е). Без `--delete`
+(единственная защита от «команда создания бэкапа = команда уничтожения
+бэкапа»). Полоса `--bwlimit=40M` (40 МБ/с из замерных 66 МБ/с канала)
+через `nice -n 10 ionice -c2 -n7` — recorder 24/7 не должен голодать.
+`flock -n` исключает наложение прогонов.
+
+> **ПРИМЕЧАНИЕ про retention/cold.** Бинарь `journal-retention` исторически
+> ожидает путь `/mnt/journal-cold` как `--cold` (CIFS-монтирование в старой
+> конфигурации). На текущем проде, с ВЫКЛЮЧЕННЫМ SMB, retention работает в
+> режиме `dry-run` (`RETENTION_MODE=dry-run` в `deploy/cron.d/journal-retention`)
+> и не пишет в cold. **Перевод retention на SSH-путь — отдельная задача**;
+> этот runbook не описывает её и не меняет retention-cron, чтобы не выйти
+> за рамки правки §1.
 
 ## 2. Установка cron-юнита
 
