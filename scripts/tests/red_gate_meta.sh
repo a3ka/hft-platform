@@ -180,7 +180,7 @@ positive_control() {
 }
 
 echo "── Привязка вердикта к предмету + subject-lock + отсутствие (M-60b G3) ──"
-echo "── сценарии GM-1..GM-41; GM-16 СОЖЖЁН (спека M-60b §4, шапка выше) ──"
+echo "── сценарии GM-1..GM-49; GM-16 СОЖЖЁН (спека M-60b §4, шапка выше) ──"
 echo "барьер: ${BARRIER}"
 echo
 positive_control
@@ -985,6 +985,143 @@ else
 то есть чужую историю. Это КАЖДЫЙ push после merge ветки, чей форк старше последней чужой \
 правки гейт-класса"
 fi
+
+# ── Блок 5: ТЕРМИНАЛЬНАЯ ВЕТКА — `TERMINAL-BRANCH-VERDICT` ────────────────────────────
+# Токен под случай `R-154` §E: вердикт вынесен над ревизией, которая СУЩЕСТВУЕТ, но лежит на
+# ветке, объявленной терминальной решением арбитра. Предком `main` она не станет никогда, и
+# `GM-6` держал бы merge предмета, у которого дефекта нет.
+#
+# СЕМЬ ИЗ ВОСЬМИ СЦЕНАРИЕВ — АНТИ-БЛАНКЕТНЫЕ, и в них весь смысл: токен обязан открывать РОВНО
+# одну проверку у РОВНО одного файла. `GM-6` выше остаётся без токена и обязан по-прежнему
+# краснеть — иначе новый выход превратился бы в отмену проверки.
+
+# GM-42 — та же side-ветка, что в GM-6, ПЛЮС явный токен ⇒ проход со следом.
+mk_repo R; B="$(head_of "$R")"
+( cd "$R" && git checkout -q -b side && echo x >> docs/DESIGN.md \
+  && git add -A && git commit -q -m side ) || die "GM-42 side"
+SIDE="$(cd "$R" && git rev-parse HEAD)"
+( cd "$R" && git checkout -q - ) || die "GM-42 back"
+add_verdict "$R" "REJECT" "a3ka/hft-platform" "$B" "$SIDE"
+touch_file "$R" "docs/DESIGN.md" "TERMINAL-BRANCH-VERDICT: research/critiques/C-999-test.md — ветка объявлена терминальной решением арбитра"
+run_barrier "$R" "$B" && pass "GM-42 явный TERMINAL-BRANCH-VERDICT открывает не-предковый audited_head" \
+                      || fail "GM-42 легального выхода нет — вердикты на терминальной ветке держат merge вечно"
+
+# GM-43 — АНТИ-БЛАНКЕТ: причина короче порога ⇒ токен НЕ засчитан.
+# Порог 12 символов — тот же, что у FOUNDER-APPROVED и ARCHIVED-VERDICT: токен-ритуал
+# неотличим от отсутствия токена.
+mk_repo R; B="$(head_of "$R")"
+( cd "$R" && git checkout -q -b side && echo x >> docs/DESIGN.md \
+  && git add -A && git commit -q -m side ) || die "GM-43 side"
+SIDE="$(cd "$R" && git rev-parse HEAD)"
+( cd "$R" && git checkout -q - ) || die "GM-43 back"
+add_verdict "$R" "REJECT" "a3ka/hft-platform" "$B" "$SIDE"
+touch_file "$R" "docs/DESIGN.md" "TERMINAL-BRANCH-VERDICT: research/critiques/C-999-test.md — ок"
+run_barrier "$R" "$B" && fail "GM-43 токен с причиной короче порога ОТКРЫЛ проверку — ритуал приравнен к обоснованию" \
+                      || pass "GM-43 короткая причина токен не засчитывает (порог 12, как у FOUNDER-APPROVED)"
+
+# GM-44 — АНТИ-БЛАНКЕТ: токен называет ДРУГОЙ путь ⇒ на этот файл не действует.
+mk_repo R; B="$(head_of "$R")"
+( cd "$R" && git checkout -q -b side && echo x >> docs/DESIGN.md \
+  && git add -A && git commit -q -m side ) || die "GM-44 side"
+SIDE="$(cd "$R" && git rev-parse HEAD)"
+( cd "$R" && git checkout -q - ) || die "GM-44 back"
+add_verdict "$R" "REJECT" "a3ka/hft-platform" "$B" "$SIDE"
+touch_file "$R" "docs/DESIGN.md" "TERMINAL-BRANCH-VERDICT: research/critiques/C-777-другой.md — ветка объявлена терминальной решением арбитра"
+run_barrier "$R" "$B" && fail "GM-44 токен на ЧУЖОЙ путь открыл лок — токен стал бланкетным" \
+                      || pass "GM-44 токен действует ПОФАЙЛОВО: чужой путь не открывает"
+
+# GM-45 — ГЛАВНЫЙ АНТИ-БЛАНКЕТ: ревизии НЕ СУЩЕСТВУЕТ вовсе (реплей C-062) + токен ⇒ БЛОК.
+# Различие принципиальное: «есть, но на мёртвой ветке» — факт истории; «нет вовсе» —
+# выдуманная ревизия, ровно то, ради чего барьер построен. Если токен откроет и это, он
+# вернёт дыру C-062 под видом послабления.
+mk_repo R; B="$(head_of "$R")"
+add_verdict "$R" "REJECT" "a3ka/hft-platform" "$B" "9a0e48f09a0e48f09a0e48f09a0e48f09a0e48f0"
+touch_file "$R" "docs/DESIGN.md" "TERMINAL-BRANCH-VERDICT: research/critiques/C-999-test.md — ветка объявлена терминальной решением арбитра"
+run_barrier "$R" "$B" && fail "GM-45 токен ОТКРЫЛ несуществующую ревизию — класс C-062 вернулся через новый выход" \
+                      || pass "GM-45 токен НЕ открывает несуществующий audited_head (C-062 закрыт)"
+
+# GM-46 — АНТИ-БЛАНКЕТ: токен не открывает subject-lock. Ревизия предковая, вердикт проходной,
+# после него тронут гейт-класс — блок обязан остаться, токен к этой проверке отношения не имеет.
+mk_repo R; B="$(head_of "$R")"
+add_verdict "$R" "APPROVE" "a3ka/hft-platform" "$B" "$(head_of "$R")"
+touch_file "$R" "${GATE_CLASS_FILE}" "TERMINAL-BRANCH-VERDICT: research/critiques/C-999-test.md — ветка объявлена терминальной решением арбитра"
+run_barrier "$R" "$B" && fail "GM-46 TERMINAL-BRANCH-VERDICT открыл SUBJECT-LOCK — токен вышел за свою проверку" \
+                      || pass "GM-46 токен не трогает subject-lock: у каждой проверки свой выход"
+
+# GM-47 — АНТИ-БЛАНКЕТ ЧЕТВЁРТОГО РОДА: ЧУЖОЙ токен из БАЗЫ не открывает проверку.
+# Зеркало GM-16e для нового токена. Класс `C-128` Б-2: при устаревшей базе PR в диапазон
+# попадают чужие коммиты `main`, и токен, выданный ДРУГОМУ предмету, гасил бы проверку здесь.
+# На `ALLOW-SUBJECT-CHANGE` канал был боевым, а не теоретическим.
+mk_repo R; B0="$(head_of "$R")"
+( cd "$R" && git checkout -q -b feat-leak2 ) || die "GM-47: ветка не создана"
+( cd "$R" && git checkout -q -b side2 "$B0" && echo x >> docs/DESIGN.md \
+  && git add -A && git commit -q -m side2 ) || die "GM-47: side2"
+SIDE2="$(cd "$R" && git rev-parse HEAD)"
+( cd "$R" && git checkout -q feat-leak2 ) || die "GM-47: возврат на ветку"
+add_verdict "$R" "REJECT" "a3ka/hft-platform" "$B0" "$SIDE2"
+( cd "$R" && git checkout -q "$B0" -- . 2>/dev/null; git checkout -q - ) 2>/dev/null || true
+( cd "$R" && git checkout -q master 2>/dev/null || git checkout -q main 2>/dev/null ) || die "GM-47: база"
+touch_file "$R" "docs/DESIGN.md" "TERMINAL-BRANCH-VERDICT: research/critiques/C-999-test.md — чужой токен, выданный ДРУГОМУ предмету"
+MAIN_TIP2="$(head_of "$R")"
+( cd "$R" && git merge -q --no-ff feat-leak2 -m "merge-ref: слияние ветки в базу" ) \
+  || die "GM-47: merge-ref не собран"
+setup_ok=1
+( cd "$R" && git log --format='%B' "${B0}..HEAD^1" | grep -q 'TERMINAL-BRANCH-VERDICT' ) || setup_ok=0
+( cd "$R" && git log --format='%B' "${B0}..HEAD^2" | grep -q 'TERMINAL-BRANCH-VERDICT' ) && setup_ok=0
+if [ "$setup_ok" -ne 1 ]; then
+  fail "GM-47 SETUP НЕ СОСТОЯЛСЯ: токен обязан лежать ТОЛЬКО на стороне базы и отсутствовать \
+у ветки — иначе сценарий проверяет законный выход, а не утечку"
+else
+  # БАЗА СОБЫТИЯ УСТАРЕЛА (форма GM-16d): PR_BASE_SHA = B0, а `main` с тех пор уехал вперёд
+  # вместе с чужим токеном. ИМЕННО ЭТО делает сценарий различающим: при широком переборе
+  # `BASE..HEAD` чужой коммит В ДИАПАЗОНЕ и токен открыл бы проверку; при переборе
+  # собственного диапазона сторона `main` исключена. Первая редакция звала барьер с
+  # `MAIN_TIP2`, и токен не попадал в диапазон НИ ПРИ КАКОЙ реализации — сценарий был
+  # ВАКУУМНЫМ и мутацию «широкий диапазон» не ловил (поймано мутационным контролем автора).
+  run_barrier "$R" "${B0}" pull_request "${B0}" mergeref \
+    && fail "GM-47 ЧУЖОЙ токен из базы открыл проверку — токен, выданный одному предмету, \
+уезжает в main и гасит проверки соседних PR" \
+    || pass "GM-47 чужой токен из базы не открывает: перебор сужен до собственного диапазона"
+fi
+
+# GM-48 — АНТИ-БЛАНКЕТ ПЯТОГО РОДА (`C-180` Б-1, воспроизведение Д-1): путь, процитированный
+# В ПРИЧИНЕ, НЕ открывает проверку файлу, которого токен не называет.
+# Канал не теоретический: подсказка самого барьера требует назвать решение арбитра, а файлы
+# арбитража судятся ЭТИМ ЖЕ барьером. До фикса такой честный токен молча открывал соседа и
+# печатал ЛОЖНЫЙ аудит-след «открыто явным токеном» для файла, который никто не называл.
+mk_repo R; B="$(head_of "$R")"
+( cd "$R" && git checkout -q -b side48 && echo x >> docs/DESIGN.md \
+  && git add -A && git commit -q -m side48 ) || die "GM-48 side"
+S48="$(cd "$R" && git rev-parse HEAD)"
+( cd "$R" && git checkout -q - ) || die "GM-48 back"
+# Каталоги вердиктов, которых базовая фикстура не создаёт. Без них `add_verdict` падает —
+# и падает ГРОМКО («SETUP НЕ СОСТОЯЛСЯ»), что и поймало первую редакцию этого сценария.
+( cd "$R" && mkdir -p research/arbitration research/reviews ) || die "GM-48 dirs"
+add_verdict "$R" "REJECT" "a3ka/hft-platform" "$B" "$S48" "C-100-a.md" "research/critiques"
+add_verdict "$R" "REJECT" "a3ka/hft-platform" "$B" "$S48" "A-018-m68.md" "research/arbitration"
+touch_file "$R" "docs/DESIGN.md" "TERMINAL-BRANCH-VERDICT: research/critiques/C-100-a.md — ветка терминальна по решению research/arbitration/A-018-m68.md"
+run_barrier "$R" "$B" && fail "GM-48 путь в ПРИЧИНЕ открыл проверку соседнему файлу — токен перестал быть пофайловым, а аудит-след стал ложным" \
+                      || pass "GM-48 путь в причине НЕ открывает соседа: сверка идёт равенством первого поля"
+
+# GM-49 — АНТИ-БЛАНКЕТ ШЕСТОГО РОДА (`C-180` Б-1, воспроизведение Д-2): строка из ДВУХ путей
+# без причины не проходит порог. До фикса остатком после вычитания своего пути был путь
+# СОСЕДА — длиннее двенадцати символов, — и нулевая причина удовлетворяла порог у обоих.
+mk_repo R; B="$(head_of "$R")"
+( cd "$R" && git checkout -q -b side49 && echo x >> docs/DESIGN.md \
+  && git add -A && git commit -q -m side49 ) || die "GM-49 side"
+S49="$(cd "$R" && git rev-parse HEAD)"
+( cd "$R" && git checkout -q - ) || die "GM-49 back"
+( cd "$R" && mkdir -p research/arbitration research/reviews ) || die "GM-49 dirs"
+add_verdict "$R" "REJECT" "a3ka/hft-platform" "$B" "$S49" "C-100-a.md" "research/critiques"
+add_verdict "$R" "REJECT" "a3ka/hft-platform" "$B" "$S49" "R-200-b.md" "research/reviews"
+touch_file "$R" "docs/DESIGN.md" "TERMINAL-BRANCH-VERDICT: research/critiques/C-100-a.md research/reviews/R-200-b.md"
+# ПРЕДЕЛ НАЗВАН, А НЕ ЗАМОЛЧАН (`C-181` N-1/N-2). Удаляются повторы ТОЛЬКО СВОЕГО пути:
+# причина, состоящая из повторов ЧУЖОГО пути, порог пройдёт. Это ГРАНИЦА, а не дыра —
+# чужой путь есть текст причины, и пофайловость от него не страдает: сверка идёт
+# равенством ПЕРВОГО поля. Отдельно: путь, содержащий пробел, разбором `%%[[:space:]]*`
+# не поддерживается — таких путей в корпусе нет, и требование к ним не заявляется.
+run_barrier "$R" "$B" && fail "GM-49 строка из двух путей БЕЗ причины прошла порог — путь соседа сработал как обоснование" \
+                      || pass "GM-49 два пути без причины порог не проходят: повторы СВОЕГО пути причиной не считаются"
 
 echo
 if [ "${FAILED}" -gt 0 ]; then
