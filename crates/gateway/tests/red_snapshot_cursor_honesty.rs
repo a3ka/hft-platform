@@ -167,7 +167,9 @@ fn td_180_s1_steady_state_snapshot_cursor_equals_delivery_bookmark() {
 
     let frontier = state_frontier_of(dir.path());
     if frontier.is_none() {
-        setup_failed("эталонный прогон не свернул НИ ОДНОГО события — журнал пуст либо селектор мимо");
+        setup_failed(
+            "эталонный прогон не свернул НИ ОДНОГО события — журнал пуст либо селектор мимо",
+        );
     }
 
     gateway::set_effective_max_response_bytes(usize::MAX);
