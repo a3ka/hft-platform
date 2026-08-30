@@ -17,7 +17,7 @@ use std::io;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use contracts::{Event, EventKind, Level, MdEvent, MdPayload, Side, Venue};
+use contracts::{Event, EventKind, MdEvent, MdPayload, Side, Venue};
 use journal::EpochFilter;
 use serde::{Deserialize, Serialize};
 
@@ -32,6 +32,7 @@ fn default_selector() -> Selector {
         timeframe_ms: 0,
         bands: Vec::new(),
         window_ms: None,
+        depth_cadence_ms: None,
     }
 }
 
@@ -61,9 +62,27 @@ fn default_selector() -> Selector {
 ///    VB-I-5). Бутстрап чекпоинта на усечённом журнале ЛЕГАЛЕН — отказ только при
 ///    РАЗРЫВЕ между валидным чекпоинтом и журналом (`earliest_seq > ckpt.cursor + 1`).
 ///    `#[serde(default)]` на новых полях: v7-консьюмер читает v8 с дефолтами `(0, false)`
+/// 8: M-48 (TD-048) — **провенанс истории (VB-I-11)**: `Snapshot` (+ заголовок чекпоинта) несёт
+///    `history_start_seq` (seq ПЕРВОГО реально свёрнутого события — НЕ `header.first_seq`,
+///    который у legacy синтезирован нулём, TD-030) и `history_truncated`. Поля АДДИТИВНЫ,
+///    но консюмер ОБЯЗАН узнать о них — иначе кокпит продолжит выдавать усечённую историю
+///    за полную (класс тихой лжи, ровно тот, ради которого `depth_band_provenance` /
+///    VB-I-5). Бутстрап чекпоинта на усечённом журнале ЛЕГАЛЕН — отказ только при
+///    РАЗРЫВЕ между валидным чекпоинтом и журналом (`earliest_seq > ckpt.cursor + 1`).
+///    `#[serde(default)]` на новых полях: v7-консюмер читает v8 с дефолтами `(0, false)`
 ///    (формально полная история; v7 он и так не отличает от усечённой — но и не врёт,
 ///    потому что не имеет кода, использующего эти поля).
-pub const GATEWAY_SCHEMA_VERSION: u32 = 8;
+/// 9: M-68 (TD-158) — **смена СЕМАНТИКИ депт-серии** (`П-014` п.3, прецедент VB-I-6):
+///    была «глубина на момент последнего снимка» (snapshot-only, M-22), стала «глубина
+///    на момент последнего L2-события» (снимок И дельта, каденция + хвост). Форма
+///    `DepthRow` НЕ меняется — меняется СОДЕРЖИМОЕ строки (числа считаются от `self.book`,
+///    охват `depth_reach_*` снимается на КАЖДОМ L2-событии, метка описывает ТО наблюдение,
+///    из которого взяты числа). Bump здесь ЕДИНСТВЕННЫЙ рычаг, отвергающий чекпоинт со
+///    старым смыслом (`read_and_validate` шаг 3, `crates/gateway/src/lib.rs:2901-2904`):
+///    `CKPT_SCHEMA_VERSION` — версия ФОРМАТА файла, формат не меняется; bump его вместо
+///    `GATEWAY_SCHEMA_VERSION` отверг бы кэш, но соврал бы о причине и оставил `П-014` п.3
+///    неисполненным.
+pub const GATEWAY_SCHEMA_VERSION: u32 = 9;
 
 /// M-71 (`milestones/M-71-egress-cap.md` §5.1): дефолт предела объёма ответа в
 /// БАЙТАХ сериализованной `SeriesBundle` (`serde_json::to_vec`). Значение — продуктовое
@@ -170,6 +189,10 @@ pub struct Selector {
     /// unbounded (offline-режим). См. `VB-I-10` / TD-039 / `red_gateway_window.rs`.
     #[serde(default)]
     pub window_ms: Option<i64>,
+    /// M-68 задача 15 (`A-024` `O-1`): интервал пересчёта депт-серии, мс. `None` = пер-событийно
+    /// (сегодняшнее поведение бит-в-бит) — нейтрал. Ведётся ВРЕМЕНЕМ СОБЫТИЯ (`VB-I-2`).
+    #[serde(default)]
+    pub depth_cadence_ms: Option<i64>,
 }
 
 impl Selector {
@@ -355,6 +378,14 @@ pub struct SeriesBundle {
     /// M-23 Volume Bubbles (HM-I-4): торгованный объём `(time_s, price) → (buy, sell)` из `Trade`
     /// (side→buy/sell раздельно). Цены не выдуманы — только торгованные.
     pub volume_bubbles: Vec<BubbleCell>,
+    /// M-68 задача 16 (`П-014` п.2 дословно: «выдача обязана ЭТО НАЗЫВАТЬ»; `A-024` `O-1`):
+    /// объявленная каденция КАЖДОЙ серии — `(имя, интервал мс)`, где `None` = «на каждом
+    /// событии». Две серии в одном кадре имеют РАЗНУЮ частоту по решению продукта, и
+    /// потребитель обязан их различать, не догадываясь. Магическое `0` читалось бы как
+    /// особый случай по соглашению; `Option` называет особый случай типом.
+    /// Пусто — нейтрал, сохраняющий сегодняшнее поведение бит-в-бит.
+    #[serde(default)]
+    pub cadence_ms: Vec<(String, Option<i64>)>,
 }
 
 /// Полная детерминированная свёртка окна `[start .. cursor]`.
@@ -667,28 +698,47 @@ struct Reducer {
     /// финальное окно при fold'е кадров live==replay под нагрузкой).
     at_ms: i64,
     /// `П-014` / `R-110` Б-1: НАБЛЮДЁННЫЙ ОХВАТ bid'а (доля от mid) на момент ПОСЛЕДНЕГО
-    /// НАБЛЮДЕНИЯ ГЛУБИНЫ — то есть последнего `L2Snapshot`, чьи числа реально легли в
-    /// `depth[].values`. `0.0` = глубина ещё не наблюдалась либо mid невычислим (односторонняя
-    /// книга) → полоса глубже 1.3 % честно помечается `not-observed`, а не выдаётся за факт.
+    /// НАБЛЮДЕНИЯ ГЛУБИНЫ — то есть последнего L2-события, чьи числа легли в
+    /// `depth[].values`. `0.0` = глубина ещё не наблюдалась либо mid невычислим
+    /// (односторонняя книга) — полоса глубже 1.3 % честно помечается `not-observed`,
+    /// а не выдаётся за факт.
     ///
-    /// **Почему охват СНИМАЕТСЯ там, а не читается из живой `self.book` здесь.** Метка обязана
-    /// описывать ТЕ ЖЕ данные, из которых посчитаны числа полосы, а числа полосы snapshot-only:
-    /// `L2Delta` двигает книгу и heatmap, но `depth_series` НЕ пересчитывает (M-22 семантика,
-    /// см. ветку `MdPayload::L2Delta` в `apply`).
-    ///
-    /// Отсюда прямое следствие для `GW-I-4`/`VB-I-2` на ПРОД-ФОРМЕ (снимки 1 Гц против дельт
-    /// 100 мс, то есть ПОСЛЕДНИЙ кадр почти всегда delta-only): кадр без снимка не несёт строк
-    /// `depth_series` вовсе (их заводит только `L2Snapshot`), поэтому склейка
-    /// `snapshot(C)+frames` про сдвиг охвата после последнего снимка узнать НЕ МОЖЕТ ни при
-    /// какой семантике слияния, а полный реплей, читая живую книгу, его бы увидел — и пути
-    /// расходились. Замер до этой правки (снимок 5 % → дельта снимает дальние уровни, охват
-    /// 2.5 %, полоса 3 %): full = `not-observed … reach=0.025000`, merge =
-    /// `diff-reconstructed, liveness=confirmed`. Снятый охват делает метку функцией ТОГО ЖЕ
-    /// наблюдения, что и значения полосы, и оба пути сходятся тождественно.
+    /// **Почему охват СНИМАЕТСЯ в `recompute_depth_from_book`, а не читается из живой
+    /// `self.book` здесь.** Метка обязана описывать ТЕ ЖЕ данные, из которых посчитаны числа
+    /// полосы. С M-68 обе ветки `apply` (`L2Snapshot`/`L2Delta`) пересчитывают И числа,
+    /// И охват от `self.book` — это и есть наблюдение, из которого берутся числа; до M-68
+    /// числа были snapshot-only, и метка была привязана к snapshot-окну. Теперь обе
+    /// величины — функция одного L2-события, и `GW-I-4`/`VB-I-2` сходятся тождественно
+    /// (свидетельство — замер до этой правки в истории милестоуна: снимок 5 % → дельта
+    /// снимает дальние уровни, охват 2.5 %, полоса 3 % — full = `not-observed …
+    /// reach=0.025000`, merge = `diff-reconstructed, liveness=confirmed` без снятого
+    /// охвата расходились бы).
     depth_reach_bid: f64,
     /// Пара к `depth_reach_bid` для `Side::Sell`: охват считается ПОСТОРОННЕ (`П-014`: bid и
     /// ask расходятся; M-58 опроверг ask на трёх полосах из шести глубже 1.3 %).
     depth_reach_ask: f64,
+    /// M-68 (TD-158), задача 8: накопительный счётчик посещённых уровней при пересчёте
+    /// полос от `self.book` (`depth_from_book`). Пробрасывается в `ReadStats::depth_levels_visited`
+    /// через `read_stats_from_stream` после окончания `apply`-прохода. НЕ глобальный/не
+    /// атомарный (`scripts/check_resource_oracles.sh`): состояние живёт в `Reducer`,
+    /// процесс-локально, без `static`/`thread_local!` (`C-097` R3/R10).
+    depth_levels_visited: u64,
+    /// M-68 rev6, задача 12 (`R-138` Б-1): ключ (time_s / cadence_s) ПОСЛЕДНЕГО
+    /// обработанного L2-события с заданной каденцией. None до первого такого события;
+    /// Some(bucket) — после. Используется для детекта ЗАКРЫТИЯ каденс-интервала:
+    /// когда новый bucket отличается от этого, ПРЕДЫДУЩИЙ интервал только что закрылся,
+    /// и его CLOSE-значение пишется в `depth[].values` по состоянию книги ДО обновления
+    /// новым событием (см. `maybe_commit_depth_interval` в `apply()`).
+    ///
+    /// Конструкция — РОЛЛОВЕР (§0sexies.2ter rev6, пересмотр rev7): вычисление значения
+    /// интервала происходит ОДИН раз — когда каденс-ключ следующего события отличается от
+    /// текущего (интервал закрылся). Незакрытый последний интервал НЕ эмитится — ни на
+    /// replay (`finish(self)`), ни на live (`finish_ref(&self)`): `&mut self` на live-пути
+    /// физически отсутствует (M-56, TD-097), и единственный согласованный выбор — НЕ
+    /// эмитить. Стоимость — одно чтение книги на интервал (а не на каждое событие, как у
+    /// наивного пути «снять early-return и считать на каждом тике», который стирает
+    /// экономию, ради которой каденция заведена).
+    depth_cadence_current_bucket: Option<i64>,
 }
 
 /// M-23: per-bucket book snapshot для heatmap. Хранит bids/asks отдельно (Vec<(price,size)>) +
@@ -748,7 +798,25 @@ impl Reducer {
             // умолчанию: до первого снимка мы действительно ничего не наблюдали).
             depth_reach_bid: 0.0,
             depth_reach_ask: 0.0,
+            // M-68 (TD-158): накопительный счётчик посещённых уровней при пересчёте полос.
+            // Скейлится с глубиной книги и НЕ скейлится с числом полос (`depth_from_book`
+            // принимает все полосы разом — задача 8, `d6a`/`d6b`). Сбрасывается на нуль в
+            // `new()`, аккумулируется через `apply` → `depth_from_book`.
+            depth_levels_visited: 0,
+            // M-68 rev6, задача 12 (R-138 Б-1): РОЛЛОВЕР каденс-интервала. До первого
+            // L2-события с заданной каденцией ключ не задан; инициализируется в первом
+            // вызове `apply()` через `maybe_commit_depth_interval` (None → Some(bucket)
+            // без коммита — закрывать нечего).
+            depth_cadence_current_bucket: None,
         }
+    }
+
+    /// M-68 (TD-158), задача 8: геттер для накопительного счётчика посещённых уровней.
+    /// Пробрасывается в `ReadStats::depth_levels_visited` через `read_stats_from_stream`
+    /// после `apply`-прохода; счёт `events_*` живёт в `journal::EventStream`, счёт
+    /// `depth_levels_visited` живёт в `Reducer` — два разных хозяина, оба в `ReadStats`.
+    pub fn depth_levels_visited(&self) -> u64 {
+        self.depth_levels_visited
     }
 
     /// M-37 task #2 / M-38a task #6: эвиктировать бакет-оконное состояние для `time_s <
@@ -933,6 +1001,62 @@ impl Reducer {
         }
     }
 
+    // MUT-ANCHOR C-M68-1 — точка мутации гейта (spec M-68 §6 шаг B); сигнатура зафиксирована.
+    // Принимает ВСЕ полосы разом — это требование задачи 8 (`d6b`: цена не множится на число
+    // полос), а не стиль: по-полосный помощник делал бы однопроходную реализацию невыразимой
+    // (`C-156` F1, `C-094` B5). Шаг мутации `verify_M-68.sh` вносит первую строку тела:
+    //   `let bands: Vec<f64> = bands.iter().map(|b| if *b < 0.60 { 0.0 } else { *b }).collect(); let bands = &bands[..];`
+    // — узкие полосы обнуляются, дальняя считается как прежде, и набор обязан быть КРАСНЫМ
+    // (`d1`/`d4` падают на ТОЧНОМ значении каждой полосы).
+    //
+    // `levels` — уже материализованные уровни стороны (`self.book.levels(side)`), их же берёт
+    // `refresh_heatmap_bucket` на каждом L2-событии (zero дополнительных аллокаций; §0.1bis).
+    // Один обход `levels`: для каждого уровня с `size > 0` инкрементируем счётчик посещений
+    // и добавляем size во ВСЕ полосы, порог которых этот уровень удовлетворяет. Линейность
+    // по глубине книги ЛЕГАЛИЗОВАНА (`C-156` F1: линейность неизбежна, и она дёшева — ≤ ~120 000
+    // посещений/с на прод-форме); запрещён МНОЖИТЕЛЬ по числу полос, и один вызов помощника
+    // принимает все полосы — этим и закрыт.
+    //
+    // `side` НЕОБХОДИМ для вычисления порога: Buy — `price >= mid*(1−b)`, Sell — `price <=
+    // mid*(1+b)`. Формально отсутствует в зафиксированной строке сигнатуры спеки (она
+    // описывает «уровни стороны»), но без него порог не вычислить — отступление названо, а не
+    // заглажено: `verify` шаг B ищет якорь и вносит мутацию ПОСЛЕ `fn depth_from_book(...){`,
+    // параметр `side` стоит в этой же строке `[^\n]*` и не ломает regex.
+    //
+    // `#[rustfmt::skip]` — сигнатура ОБЯЗАНА остаться на ОДНОЙ строке: regex верификатора
+    // мутации (`MUT-ANCHOR C-M68-1.*?\n\s*fn depth_from_book\([^\n]*\{\n`) ищет параметры
+    // между `(` и `{` БЕЗ `\n`. rustfmt по умолчанию хочет разнести длинную сигнатуру на
+    // несколько строк — это бы сломало regex и весь шаг B гейта.
+    #[rustfmt::skip]
+    fn depth_from_book(&self, levels: &[(i64, i64)], mid: i64, side: Side, bands: &[f64]) -> (Vec<i64>, u64) {
+        let mut sums = vec![0_i64; bands.len()];
+        let mut count = 0_u64;
+        let mid_f = mid as f64;
+        let thresholds: Vec<i64> = bands
+            .iter()
+            .map(|b| match side {
+                Side::Buy => (mid_f * (1.0 - b)) as i64,
+                Side::Sell => (mid_f * (1.0 + b)) as i64,
+            })
+            .collect();
+        for &(price, size) in levels {
+            if size == 0 {
+                continue;
+            }
+            count += 1;
+            for (i, &threshold) in thresholds.iter().enumerate() {
+                let qualifies = match side {
+                    Side::Buy => price >= threshold,
+                    Side::Sell => price <= threshold,
+                };
+                if qualifies {
+                    sums[i] += size;
+                }
+            }
+        }
+        (sums, count)
+    }
+
     fn apply(&mut self, event: &Event) {
         self.apply_vwap(event, true);
         self.apply_vp(event);
@@ -987,42 +1111,27 @@ impl Reducer {
                 asks,
                 ts_exch_ms,
             } => {
-                // M-23: применить к L2Delta-реконструированной книге (replace), обновить
-                // heatmap-бакет для close-семантики.
-                self.book.apply_snapshot(bids, asks);
                 let Some(time_s) = self.bucket_time_s(*ts_exch_ms) else {
                     return;
                 };
+                // M-68 rev6, задача 12 (R-138 Б-1): РОЛЛОВЕР каденс-интервала.
+                // ПЕРЕД обновлением книги проверяем, не сменился ли каденс-ключ. Если
+                // сменился — ПРЕДЫДУЩИЙ интервал закрылся, и его CLOSE-значение пишется
+                // по СОСТОЯНИЮ КНИГИ НА ТОТ МОМЕНТ (то есть последнему наблюдению
+                // ЗАКРЫВАЕМОГО интервала — новый снапшот ещё не применён, `apply_snapshot`
+                // ниже). Без этой строки фильтр бы взял ПЕРВОЕ событие интервала, и
+                // значение точки расходилось с heatmap close-семантикой (§0sexies.2bis).
+                self.maybe_commit_depth_interval(time_s);
+                // M-23: применить к L2Delta-реконструированной книге (replace), обновить
+                // heatmap-бакет для close-семантики.
+                self.book.apply_snapshot(bids, asks);
                 self.refresh_heatmap_bucket(time_s);
-                if self.depth.is_empty() {
-                    for &band in &self.selector.bands {
-                        for side in [Side::Buy, Side::Sell] {
-                            self.depth.push(DepthAcc {
-                                side,
-                                band,
-                                band_pct_e8: (band * 1e8).round() as i64,
-                                values: BTreeMap::new(),
-                            });
-                        }
-                    }
-                }
-                for row in &mut self.depth {
-                    row.values
-                        .insert(time_s, depth_within(bids, asks, row.side, row.band));
-                }
-                // `П-014` / `R-110` Б-1: ОХВАТ СНИМАЕТСЯ РОВНО ЗДЕСЬ — в той же точке, где
-                // считаются САМИ ЧИСЛА полосы, и из того же наблюдения. `self.book` уже
-                // ЗАМЕЩЁН этим снимком (`apply_snapshot` — полная замена, ресинк), поэтому
-                // `max_reach_pct` даёт охват ИМЕННО `bids`/`asks` этого события, без
-                // дублирования арифметики mid и без аллокаций: O(1) по глубине книги (один
-                // `keys().next()` / `next_back()` поверх BTreeMap, `crates/book/src/lib.rs`
-                // `max_reach_pct`). Сторож горячего пути при этом УСИЛЕН, а не ослаблен:
-                // `snapshot()`/`finish_ref` книгу больше не трогает вовсе
-                // (`red_snapshot_noclone::o1_snapshot_allocation_does_not_grow_with_state`,
-                // потолок ×2.5), а цена здесь — два скаляра на СОБЫТИЕ снимка (1 Гц), не на
-                // каждую дельту (100 мс) и не на каждый вызов `finish_ref`.
-                self.depth_reach_bid = self.book.max_reach_pct(Side::Buy).unwrap_or(0.0);
-                self.depth_reach_ask = self.book.max_reach_pct(Side::Sell).unwrap_or(0.0);
+                // M-68 (TD-158): депт-серия пересчитывается на КАЖДОМ L2-событии, не только
+                // на снимке. Снимок и дельта — одна точка проводки (`recompute_depth_from_book`),
+                // источник ОДИН (`self.book`, как у heatmap). Однопроходный обход уровней
+                // (`depth_from_book` принимает все полосы разом — задача 8, `d6b`).
+                self.ensure_depth_rows_initialized();
+                self.recompute_depth_from_book(time_s);
             }
             MdPayload::L2Delta {
                 bids,
@@ -1030,14 +1139,26 @@ impl Reducer {
                 ts_exch_ms,
                 ..
             } => {
-                // M-23: L2Delta ВЕТКА — зеркалит venue (M-29 `apply_delta`): size==0 → remove,
-                // size>0 → upsert. Обновляет книгу + heatmap-бакет. depth_series (полосы)
-                // НЕ апдейтится — депт-серия остаётся snapshot-only (M-22 семантика).
-                self.book.apply_delta(bids, asks);
                 let Some(time_s) = self.bucket_time_s(*ts_exch_ms) else {
                     return;
                 };
+                // M-68 rev6, задача 12: РОЛЛОВЕР каденс-интервала для L2Delta — симметрично
+                // L2Snapshot. Дельта может сменить bucket раньше снимка; close-значение
+                // предыдущего интервала обязано лечь до `apply_delta` (иначе для дельты
+                // значения были бы последним состоянием delta-книги, а не последним
+                // состоянием ПРЕДЫДУЩЕГО интервала).
+                self.maybe_commit_depth_interval(time_s);
+                // M-23: L2Delta ВЕТКА — зеркалит venue (M-29 `apply_delta`): size==0 → remove,
+                // size>0 → upsert. Обновляет книгу + heatmap-бакет И (M-68, TD-158) полосы +
+                // охват: депт-серия больше НЕ snapshot-only, источник ОДИН с heatmap.
+                self.book.apply_delta(bids, asks);
                 self.refresh_heatmap_bucket(time_s);
+                // M-68: депт-серия пересчитывается и на дельте. `ensure_depth_rows_initialized`
+                // идемпотентен — `depth` уже мог быть заведён первым же снимком; если нет
+                // (снимка ещё не было, депт-серия в этом селекторе стартует с первой дельты),
+                // ленивая инициализация строк та же.
+                self.ensure_depth_rows_initialized();
+                self.recompute_depth_from_book(time_s);
             }
             _ => {}
         }
@@ -1062,6 +1183,180 @@ impl Reducer {
         entry.refresh(bids, asks);
     }
 
+    /// M-68 (TD-158): ленивая инициализация строк `depth` — ОДИН раз на запуск (или при смене
+    /// `selector.bands`, что невозможно в `Reducer` без чекпоинт-инвалидации — `selector`
+    /// конфигурация, не состояние). Идемпотентен: повторный вызов на непустом `self.depth`
+    /// — no-op. Вызывается на КАЖДОМ L2-событии (снимок + дельта): `d1` требует, чтобы
+    /// депт-серия была заведена до прихода дельты-хвоста, даже если `L2Snapshot` в журнале
+    /// ещё не было.
+    fn ensure_depth_rows_initialized(&mut self) {
+        if self.depth.is_empty() {
+            for &band in &self.selector.bands {
+                for side in [Side::Buy, Side::Sell] {
+                    self.depth.push(DepthAcc {
+                        side,
+                        band,
+                        band_pct_e8: (band * 1e8).round() as i64,
+                        values: BTreeMap::new(),
+                    });
+                }
+            }
+        }
+    }
+
+    /// M-68 (TD-158), задачи 1+2+7+8+12: пересчёт депт-серии + охвата от `self.book` на КАЖДОМ
+    /// L2-событии.
+    ///
+    /// Уровни читаются из `self.book.levels(side)` — ТОТ ЖЕ источник, что у heatmap, но
+    /// ЭТА функция делает СВОИ два вызова materialisation (по одному на сторону). Они НЕ
+    /// переиспользуют векторы `refresh_heatmap_bucket`: те отдаются в `heatmap_buckets`
+    /// владением через `entry.refresh(bids, asks)` и не доступны к моменту recompute
+    /// (разные ветки apply). Заявление о "zero дополнительных аллокаций" прежней редакции
+    /// было ложным (R-134 B-2(ii), задача 12): счёт в `d6a/d6b` идёт по ПОСЕЩЁННЫМ
+    /// УРОВНЯМ, не по аллокациям, и судит работу, а не прокси (`testing.md`, "Оракул
+    /// границы ресурса меряет ресурс, а не прокси"). `crates/book/src/**` не трогаем —
+    /// нужна правка книги, это SCOPE VIOLATION.
+    ///
+    /// Один проход уровней для ВСЕХ полос (`depth_from_book` принимает все полосы разом —
+    /// задача 8, `d6b`): цена не множится на число полос. Линейность по глубине книги
+    /// ЛЕГАЛИЗОВАНА (`C-156` F1: точная сумма полосы требует обхода её уровней, и она дёшева —
+    /// ≤ ~120 000 посещений/с на прод-форме). Накопительный счётчик посещений пробрасывается
+    /// в `ReadStats::depth_levels_visited` через
+    /// `read_stats_from_stream(..., reducer.depth_levels_visited())` после `apply`-прохода —
+    /// тот же приём, что `events_scanned` (M-57) и `segment_meta_ops` (M-62).
+    ///
+    /// ОХВАТ обновляется на ТОЙ ЖЕ ветке, что и числа (`d7`): метка обязана описывать ТО
+    /// наблюдение, из которого взяты числа, иначе воспроизводится тихая ложь
+    /// `liveness=confirmed` поверх депт-числа по обрезанной ресинком книге (против которой
+    /// подписана `П-014`, `PL-I-7`).
+    ///
+    /// Односторонняя книга (нет bid или ask) — early-return без записи: пороги полос
+    /// невычислимы, ни `depth[].values`, ни `depth_reach_*` не обновляются. Точка в
+    /// серию НЕ пишется (R-134 B-3): отсутствие середины ⇒ отсутствие измерения, а
+    /// не измерение со значением `0` (значение `0` утверждало бы глубину внутри
+    /// несуществующего интервала, смешивая "глубина пуста" и "мерить не от чего").
+    fn recompute_depth_from_book(&mut self, time_s: i64) {
+        // M-68 rev6, задача 12 (R-138 Б-1): В режиме каденции числа и охват обновляются
+        // ТОЛЬКО на закрытии интервала (`maybe_commit_depth_interval` в `apply()`),
+        // конструкция РОЛЛОВЕРа. На остальных событиях — NO-OP: ни `depth[].values`,
+        // ни `depth_reach_*` НЕ трогаем. Стоимость — ОДНО чтение книги на интервал,
+        // а не на каждое событие (наивный путь «снять early-return и считать на каждом
+        // тике» стирал бы экономию, ради которой каденция заведена — проба достижимости
+        // architect'а: red_depth_cadence 5/0, red_depth_semantics 3/0 на обоих путях,
+        // свойство стоимости НЕ пиннит ни один оракул — пробел, названный открытым
+        // долгом №1 «свойство стоимости не пиннится»).
+        if self.selector.depth_cadence_ms.is_some() {
+            return;
+        }
+        // Без каденции: legacy-путь — на КАЖДОМ L2-событии пересчёт и запись в
+        // `depth[].values[time_s]` плюс охват с того же наблюдения. `time_s` уже
+        // выровнен на `timeframe_ms` (`bucket_time_s`); точка пишется в бакет.
+        let bid_levels = self.book.levels(Side::Buy);
+        let ask_levels = self.book.levels(Side::Sell);
+        let Some(mid) = HeatmapBucketState::mid_from(&bid_levels, &ask_levels) else {
+            return;
+        };
+        let bands = &self.selector.bands;
+        let (bid_sums, bid_count) = self.depth_from_book(&bid_levels, mid, Side::Buy, bands);
+        let (ask_sums, ask_count) = self.depth_from_book(&ask_levels, mid, Side::Sell, bands);
+        self.depth_levels_visited += bid_count + ask_count;
+        // Раскладка строк `self.depth` — `(band, side)` лексикографически (см.
+        // `ensure_depth_rows_initialized`); ищем `band_idx` по `band_pct_e8` (`f64 → i64`,
+        // детерминированно из селектора), чтобы не зависеть от порядка строк.
+        for row in self.depth.iter_mut() {
+            let Some(band_idx) = bands
+                .iter()
+                .position(|&b| (b * 1e8).round() as i64 == row.band_pct_e8)
+            else {
+                continue;
+            };
+            let sum = match row.side {
+                Side::Buy => bid_sums[band_idx],
+                Side::Sell => ask_sums[band_idx],
+            };
+            row.values.insert(time_s, sum);
+        }
+        // Охват — O(1) (`max_reach_pct` = `keys().next_back()` для bid, `next()` для ask;
+        // `crates/book/src/lib.rs`). На КАЖДОМ L2-событии: цена здесь — два скаляра, не
+        // зависит от глубины книги.
+        self.depth_reach_bid = self.book.max_reach_pct(Side::Buy).unwrap_or(0.0);
+        self.depth_reach_ask = self.book.max_reach_pct(Side::Sell).unwrap_or(0.0);
+    }
+
+    /// M-68 rev6, задача 12 (R-138 Б-1): РОЛЛОВЕР каденс-интервала (§0sexies.2ter).
+    ///
+    /// Вызывается из `apply()` ПЕРЕД `self.book.apply_snapshot` / `apply_delta`. Если
+    /// каденс-ключ (`time_s / cadence_s`) текущего события отличается от ключа
+    /// предыдущего, значит ПРЕДЫДУЩИЙ интервал только что закрылся, и его CLOSE-значение
+    /// должно быть записано. Книга ещё хранит состояние ЗАКРЫВАЕМОГО интервала
+    /// (новое событие не применено) ⇒ читаем её и фиксируем значение.
+    ///
+    /// Вычисление значения происходит ОДИН раз на закрытии — стоимость прежняя,
+    /// одно чтение книги на интервал. Незакрытый последний интервал НЕ сбрасывается
+    /// на `finish` — семантика live и replay обязана совпадать (`VB-I-2` `docs/fa/
+    /// viz-backend.md:189`), и единственный согласованный выбор для обоих путей —
+    /// НЕ эмитить незакрытый последний интервал (`R-141` Б-2, пересмотр §0sexies.2ter
+    /// rev7: «семантику выбирает реализация, запрещено ровно одно — эмитить на одном
+    /// и не эмитить на другом»). Альтернатива — эмитить на обоих — требует
+    /// `&mut self` от живого пути (см. дискуссию `M-68` §0sexies.2ter rev6), что
+    /// ломает `M-56` (`TD-097`): снапшот без клонирования состояния через `&self`.
+    /// Здесь выбран путь «не эмитить ни на одном»: счёт точек одинаков на live
+    /// и replay, и `d20` зеленеет на полном наборе каденций.
+    ///
+    /// Первый вызов (после `None`) инициализирует ключ и НЕ коммитит — закрывать
+    /// нечего.
+    fn maybe_commit_depth_interval(&mut self, time_s: i64) {
+        let Some(ms) = self.selector.depth_cadence_ms else {
+            return;
+        };
+        // ms уже провалидирован в `validate_selector` (ms >= 1000, делит 86_400_000),
+        // значит деление целое и безопасно.
+        let cadence_s = ms / 1000;
+        let new_bucket = time_s / cadence_s;
+        if let Some(prev_bucket) = self.depth_cadence_current_bucket {
+            if new_bucket != prev_bucket {
+                self.commit_depth_at(prev_bucket * cadence_s);
+            }
+        }
+        self.depth_cadence_current_bucket = Some(new_bucket);
+    }
+
+    /// M-68 rev6, задача 12: записать CLOSE-значение каденс-интервала по состоянию книги
+    /// НА ТОТ МОМЕНТ (книга ещё не обновлена новым событием). Записывает суммы полос и
+    /// охват (`depth_reach_*`) от ОДНОГО наблюдения — иначе метка описывала бы не то,
+    /// из чего взяты числа (§2bis, d7).
+    ///
+    /// Односторонняя книга — early-return без записи: пороги полос невычислимы, и
+    /// отсутствие точки остаётся отсутствием (R-134 B-3).
+    fn commit_depth_at(&mut self, key_time_s: i64) {
+        let bid_levels = self.book.levels(Side::Buy);
+        let ask_levels = self.book.levels(Side::Sell);
+        let Some(mid) = HeatmapBucketState::mid_from(&bid_levels, &ask_levels) else {
+            return;
+        };
+        let bands = &self.selector.bands;
+        let (bid_sums, bid_count) = self.depth_from_book(&bid_levels, mid, Side::Buy, bands);
+        let (ask_sums, ask_count) = self.depth_from_book(&ask_levels, mid, Side::Sell, bands);
+        self.depth_levels_visited += bid_count + ask_count;
+        for row in self.depth.iter_mut() {
+            let Some(band_idx) = bands
+                .iter()
+                .position(|&b| (b * 1e8).round() as i64 == row.band_pct_e8)
+            else {
+                continue;
+            };
+            let sum = match row.side {
+                Side::Buy => bid_sums[band_idx],
+                Side::Sell => ask_sums[band_idx],
+            };
+            row.values.insert(key_time_s, sum);
+        }
+        // Охват — на ТОМ ЖЕ наблюдении, что и числа (§2bis, d7). `max_reach_pct` —
+        // O(1) (`keys().next_back()` для bid, `next()` для ask; `crates/book/src/lib.rs`).
+        self.depth_reach_bid = self.book.max_reach_pct(Side::Buy).unwrap_or(0.0);
+        self.depth_reach_ask = self.book.max_reach_pct(Side::Sell).unwrap_or(0.0);
+    }
+
     /// M-56 (`TD-097`, task #1): `finish(self)` теперь ТОЛЬКО обёртка над `finish_ref(&self)` —
     /// вся формула (OHLCV/CVD/depth/VWAP/VP/heatmap-COB/bubbles) живёт в ОДНОМ месте
     /// (`finish_ref`), выраженном через ссылки на `self`. Ownership `self` здесь больше не
@@ -1069,7 +1364,14 @@ impl Reducer {
     /// не для алгоритма. `self` молча дропается после вызова — двух копий формулы нет и не
     /// может разойтись при правке.
     fn finish(self) -> SeriesBundle {
-        self.finish_ref()
+        // M-68 rev7 (R-141 Б-2): сброс незакрытого каденс-интервала УБРАН — иначе live
+        // путь (`finish_ref(&self)`) расходится с replay (`finish(self)`):
+        // см. `docs/fa/viz-backend.md:189` `VB-I-2`. Семантика выбрана «не эмитить на
+        // обоих» — единая для обоих путей, держит `&self` на live-пути
+        // (M-56/TD-097), не требует клонирования состояния. Альтернатива «эмитить на
+        // обоих» нарушила бы M-56.
+        let me = self;
+        me.finish_ref()
     }
 
     /// M-56 (`TD-097`, task #1): построение `SeriesBundle` **из ссылок**, без потребления и
@@ -1201,6 +1503,15 @@ impl Reducer {
             heatmap,
             cob,
             volume_bubbles,
+            // M-68 задача 16 (d13): выдача НАЗЫВАЕТ каденцию каждой серии (П-014 п.2,
+            // постоянное свойство — не затычка: heatmap пер-событийный, депт-серия — своя
+            // настройка селектора). Без метки потребитель, сравнивающий полосу с ячейкой
+            // heatmap в одном кадре, не различит две серии с РАЗНОЙ частотой по решению
+            // продукта.
+            cadence_ms: vec![
+                ("depth_series".to_string(), self.selector.depth_cadence_ms),
+                ("heatmap".to_string(), None),
+            ],
         }
     }
 
@@ -1208,6 +1519,11 @@ impl Reducer {
     /// эвикция existing под финальное окно при fold'е). Разворачивает `self.finish()` +
     /// достаёт `at_ms` из редицированного состояния.
     fn finish_with_at(self) -> (SeriesBundle, i64) {
+        // M-68 rev7 (R-141 Б-2): сброс незакрытого каденс-интервала УБРАН (см. `finish`).
+        // Здесь — только достать `at_ms`. Так обе двери — `finish` и `finish_with_at` —
+        // остаются эквивалентны по семантике: после `M-56` они делят одну формулу,
+        // после `M-68` rev7 — и одну политику относительно незакрытого интервала
+        // (НЕ эмитить).
         let at_ms = self.at_ms;
         (self.finish(), at_ms)
     }
@@ -1358,39 +1674,6 @@ fn build_volume_bubbles(bubbles: &BTreeMap<(i64, i64), (i64, i64)>) -> Vec<Bubbl
         .collect()
 }
 
-fn depth_within(bids: &[Level], asks: &[Level], side: Side, band: f64) -> i64 {
-    let best_bid = bids
-        .iter()
-        .filter(|level| level.size > 0)
-        .map(|level| level.price)
-        .max();
-    let best_ask = asks
-        .iter()
-        .filter(|level| level.size > 0)
-        .map(|level| level.price)
-        .min();
-    let (Some(best_bid), Some(best_ask)) = (best_bid, best_ask) else {
-        return 0;
-    };
-    let mid = (best_bid + best_ask) / 2;
-    match side {
-        Side::Buy => {
-            let threshold = (mid as f64 * (1.0 - band)) as i64;
-            bids.iter()
-                .filter(|level| level.size > 0 && level.price >= threshold)
-                .map(|level| level.size)
-                .sum()
-        }
-        Side::Sell => {
-            let threshold = (mid as f64 * (1.0 + band)) as i64;
-            asks.iter()
-                .filter(|level| level.size > 0 && level.price <= threshold)
-                .map(|level| level.size)
-                .sum()
-        }
-    }
-}
-
 /// П-014 / GW-I-DP: провенанс-метка `depth_band_provenance` как функция ТРЁХ величин —
 /// ширины полосы, СТОРОНЫ и наблюдённого охвата этой стороны.
 ///
@@ -1438,7 +1721,7 @@ fn reduce_event_stream(
     after: Cursor,
     to: Cursor,
     max_events: usize,
-) -> io::Result<(SeriesBundle, Cursor, usize, i64, u64)> {
+) -> io::Result<(SeriesBundle, Cursor, usize, i64, u64, u64)> {
     let mut reducer = Reducer::new(selector);
     let mut cursor = after;
     let mut consumed = 0_usize;
@@ -1454,7 +1737,7 @@ fn reduce_event_stream(
 
     if max_events == 0 || to == Cursor::START {
         let (series, _at_ms) = reducer.finish_with_at();
-        return Ok((series, cursor, consumed, 0_i64, first_folded_seq));
+        return Ok((series, cursor, consumed, 0_i64, first_folded_seq, 0_u64));
     }
 
     for event in stream {
@@ -1478,8 +1761,21 @@ fn reduce_event_stream(
         consumed += 1;
     }
 
+    // M-68 (TD-158, задача 8): `depth_levels_visited` забираем ДО `finish_with_at` (тот
+    // потребляет `reducer`). Счётчик живёт в `Reducer`, не в `EventStream` — это
+    // разделение «потоковая сторона» (events_*/segment_meta_ops) vs «вычислительная
+    // сторона» (depth_levels_visited), и оба проброшены в `ReadStats` через
+    // `read_stats_from_stream(&stream, depth_levels_visited)`.
+    let depth_levels_visited = reducer.depth_levels_visited();
     let (series, at_ms) = reducer.finish_with_at();
-    Ok((series, cursor, consumed, at_ms, first_folded_seq))
+    Ok((
+        series,
+        cursor,
+        consumed,
+        at_ms,
+        first_folded_seq,
+        depth_levels_visited,
+    ))
 }
 
 impl Snapshot {
@@ -1957,6 +2253,74 @@ pub fn validate_selector(sel: &Selector) -> io::Result<()> {
             ));
         }
     }
+    // M-68 задача 17 (d14, C-167): невалидная каденция депт-серии отвергается, а не
+    // схлопывается молча. Проводная форма DepthRow.series/HeatmapCell ключуется секундами
+    // (DepthRow.series:Vec<(time_s, …)>, HeatmapCell.time_s, bucket_time_s делит на 1000
+    // целочисленно) — подсекундный интервал даёт ОДИН ключ в секунду без сообщения, и
+    // оператор получает вдесятеро меньше данных, чем просил (тот же класс, что GW-I-14
+    // закрыл для `GATEWAY_WINDOW_MS`). Требуется: ms > 0, ms >= 1000 (>= 1 с),
+    // 86_400_000 % ms == 0 (выравнивание на границу UTC-суток — та же норма, что GW-I-10
+    // для `timeframe_ms`).
+    if let Some(ms) = sel.depth_cadence_ms {
+        if ms < 1000 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "MD-I-8 d14 (C-167): selector.depth_cadence_ms={ms} подсекундная — \
+                     проводная форма ключуется секундами (DepthRow.series — time_s, \
+                     HeatmapCell.time_s, bucket_time_s делит на 1000), значит \
+                     подсекундный интервал даёт ОДИН ключ в секунду молча. Невалидная \
+                     конфигурация обязана быть ОТКАЗОМ — класс GW-I-14. Требуется >= 1000 \
+                     и 86_400_000 % ms == 0"
+                ),
+            ));
+        }
+        if 86_400_000 % ms != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "MD-I-8 d14: selector.depth_cadence_ms={ms} не выравнен на границу \
+                     UTC-суток (требуется > 0 и 86_400_000 % ms == 0)"
+                ),
+            ));
+        }
+        // M-68 rev6, задача 21 (R-138 Б-2): гвард ОТНОШЕНИЯ параметров каденции и таймфрейма.
+        // Фильтр каденции работает по `time_s`, УЖЕ выровненному на `timeframe_ms`
+        // (`recompute_depth_from_book`: `time_s % cadence_s != 0`); эффективная частота при
+        // `cadence_ms >= timeframe_ms` есть НОК(timeframe_s, cadence_s) — и если
+        // `cadence_ms % timeframe_ms != 0`, она РАСХОДИТСЯ с заявленной. Выдача объявляет
+        // `depth_cadence_ms` селектора, и расхождение читалось бы меткой как ложь
+        // (`П-014` п.2: «выдача обязана ЭТО НАЗЫВАТЬ, а не умалчивать»). Здесь — вариант А
+        // решения (рекомендация §0sexies.2quater): гвард отношения отвергает
+        // РАССОГЛАСОВАННУЮ пару (`GW-I-14`, тот же класс fail-closed, что у `GW-I-10`).
+        //
+        // При `cadence_ms < timeframe_ms` гвард НЕ применяется: фильтр становится
+        // вырожденным (cadence_s=0..timeframe_s-1, событий на бакет >= 1), и выдача
+        // фактически равна плотной серии — отдельный предмет, здесь не решается.
+        //
+        // Пара (timeframe=1000, cadence=10000) — VANTAGE `d17`, ОБЯЗАНА проходить:
+        // `10000 >= 1000`, `10000 % 1000 == 0` — guard_accept. Пара (3000, 10000) —
+        // SUBJECT `d17`, ОБЯЗАНА быть отвергнута: `10000 >= 3000`, `10000 % 3000 == 1000`
+        // — guard_reject. Суб-кейс `999` НЕ включён (он зелен по чужой причине,
+        // `86_400_000 % 999 != 0` — отвергается гвардом d14 выше): урок A-025 §3.
+        if ms >= sel.timeframe_ms && ms % sel.timeframe_ms != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "MD-I-8 d17 (R-138 Б-2): selector.depth_cadence_ms={ms} не выравнен на \
+                     timeframe_ms={} (cadence_ms % timeframe_ms = {} != 0). При \
+                     cadence_ms >= timeframe_ms эффективная частота есть \
+                     НОК(timeframe, cadence) — она РАСХОДИТСЯ с заявленной \
+                     depth_cadence_ms={ms}, и метка выдачи лжёт ровно на величину \
+                     расхождения (П-014 п.2: деградация не выдаётся за норму). Требуется \
+                     cadence_ms >= timeframe_ms && cadence_ms % timeframe_ms == 0 — тот \
+                     же класс fail-closed, что GW-I-14 для window_ms",
+                    sel.timeframe_ms,
+                    ms % sel.timeframe_ms
+                ),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -2045,7 +2409,7 @@ pub fn snapshot(
 ) -> io::Result<Snapshot> {
     validate_selector(sel)?;
     let mut stream = journal::stream(dir, filter)?;
-    let (series, cursor, _, _at_ms, first_folded_seq) =
+    let (series, cursor, _, _at_ms, first_folded_seq, _depth_levels_visited) =
         reduce_event_stream(&mut stream, sel, Cursor::START, at, usize::MAX)?;
     // M-71 (PL-I-5, `milestones/M-71-egress-cap.md` §5): предел ОБЪЁМА ответа,
     // fail-closed. Здесь — уровень 1 (анти-байпас: 4 потребителя строят `Selector`
@@ -2099,7 +2463,7 @@ pub fn frames_since(
 ) -> io::Result<(Vec<Frame>, Cursor)> {
     validate_selector(sel)?;
     let mut stream = journal::stream(dir, filter)?;
-    let (delta, cursor, consumed, at_ms, _first_folded_seq) =
+    let (delta, cursor, consumed, at_ms, _first_folded_seq, _depth_levels_visited) =
         reduce_event_stream(&mut stream, sel, after, Cursor::LATEST, max_events)?;
     if consumed == 0 {
         return Ok((Vec::new(), after));
@@ -2162,11 +2526,11 @@ pub fn frames_since_with_stats(
     // (перевод сигнатуры `frames_since` на `Option<TailHint>` или расширение
     // `Cursor`, оба — scope-expansion за пределы engine-dev).
     let mut stream = journal::stream_from(dir, filter, after.upto_seq)?;
-    let (delta, cursor, consumed, at_ms, _first_folded_seq) =
+    let (delta, cursor, consumed, at_ms, _first_folded_seq, depth_levels_visited) =
         reduce_event_stream(&mut stream, sel, after, Cursor::LATEST, max_events)?;
     // Stats ПОСЛЕ итерации (счётчики инкрементируются в `next()`, зеркалит
     // `snapshot_from_checkpoint`/`read_stats_from_stream`).
-    let stats = read_stats_from_stream(&stream);
+    let stats = read_stats_from_stream(&stream, depth_levels_visited);
     if consumed == 0 {
         return Ok((Vec::new(), after, stats));
     }
@@ -2192,7 +2556,7 @@ pub fn replay(
 ) -> io::Result<Vec<Frame>> {
     validate_selector(sel)?;
     let mut stream = journal::stream(dir, filter)?;
-    let (delta, cursor, consumed, at_ms, _first_folded_seq) =
+    let (delta, cursor, consumed, at_ms, _first_folded_seq, _depth_levels_visited) =
         reduce_event_stream(&mut stream, sel, from, to, usize::MAX)?;
     if consumed == 0 {
         return Ok(Vec::new());
@@ -2239,6 +2603,15 @@ pub struct ReadStats {
     /// 1 stat + 1 read_dir независимо от N). Подробный бюджет — `SM-1..SM-6` в
     /// `crates/gateway/tests/red_segment_meta_bound.rs` и спека §4.1.
     pub segment_meta_ops: u64,
+    /// M-68 (TD-158), задача 8: счётчик ПОСЕЩЁННЫХ уровней при пересчёте полос
+    /// (`depth_from_book`, тот же приём, что `events_scanned` (M-57) и
+    /// `segment_meta_ops` (M-62) — отдаёт САМ API). Скейлится с глубиной книги
+    /// (`d6a`: книга в 40 раз глубже ⇒ счётчик растёт кратно, ≥×5); НЕ скейлится
+    /// с числом полос (`d6b`: семь полос обходят книгу столько же раз, сколько одна,
+    /// `depth_from_book` принимает ВСЕ полосы разом). Пробрасывается в
+    /// `ReadStats::sum`/`Add` аддитивно к `events_*`/`segment_meta_ops` — ни одно из
+    /// существующих полей не заменяется, оба класса счётчиков сохраняют свой смысл.
+    pub depth_levels_visited: u64,
 }
 
 impl std::ops::Add for ReadStats {
@@ -2249,6 +2622,7 @@ impl std::ops::Add for ReadStats {
             segments_opened: self.segments_opened + rhs.segments_opened,
             events_scanned: self.events_scanned + rhs.events_scanned,
             segment_meta_ops: self.segment_meta_ops + rhs.segment_meta_ops,
+            depth_levels_visited: self.depth_levels_visited + rhs.depth_levels_visited,
         }
     }
 }
@@ -2260,12 +2634,13 @@ impl ReadStats {
     }
 }
 
-fn read_stats_from_stream(stream: &journal::EventStream) -> ReadStats {
+fn read_stats_from_stream(stream: &journal::EventStream, depth_levels_visited: u64) -> ReadStats {
     ReadStats {
         events_decoded: stream.events_decoded(),
         segments_opened: stream.segments_opened(),
         events_scanned: stream.events_scanned(),
         segment_meta_ops: stream.segment_meta_ops(),
+        depth_levels_visited,
     }
 }
 
@@ -2323,7 +2698,9 @@ pub fn snapshot_from_checkpoint(
                 cursor = Cursor::at(event.seq);
             }
             // Обновить stats ПОСЛЕ итерации (счётчики инкрементируются в `next()`).
-            let stats = read_stats_from_stream(&stream);
+            // M-68: `state.depth_levels_visited()` забираем ДО `state.finish_with_at()` —
+            // тот потребляет `state` (см. замер в `reduce_event_stream`).
+            let stats = read_stats_from_stream(&stream, state.depth_levels_visited());
             let final_cursor = if at == Cursor::LATEST { cursor } else { at };
             let (series, reducer_at_ms) = state.finish_with_at();
             let _ = reducer_at_ms;
@@ -2351,12 +2728,13 @@ pub fn snapshot_from_checkpoint(
     // (3) Fallback: rebuild от START. ЧЕСТНЫЙ полный проход — `ReadStats` декодирует
     // ВСЕ события (форсинг без чекпоинта декодирует N, см. `red_checkpoint_resource_bound`).
     let mut stream = journal::stream(dir, filter)?;
-    let (series, cursor, _consumed, _at_ms, first_folded_seq) =
+    let (series, cursor, _consumed, _at_ms, first_folded_seq, depth_levels_visited) =
         reduce_event_stream(&mut stream, sel, Cursor::START, at, usize::MAX)?;
-    // Re-read stats AFTER iteration (счётчики инкрементируются в `next()`).
-    let stats = read_stats_from_stream(&stream);
-    // M-71: rebuild-ветка так же обязана enforce'ить предел (анти-байпас).
+    // M-71 (PL-I-5, `milestones/M-71-egress-cap.md` §5): rebuild-ветка тоже enforce'ит
+    // предел (анти-байпас).
     enforce_response_limit(&series, effective_max_response_bytes())?;
+    // Re-read stats AFTER iteration (счётчики инкрементируются в `next()`).
+    let stats = read_stats_from_stream(&stream, depth_levels_visited);
     Ok((
         Snapshot {
             schema_version: GATEWAY_SCHEMA_VERSION,
@@ -2573,6 +2951,13 @@ pub mod checkpoint {
         for b in &sel.bands {
             b.to_bits().hash(&mut h);
         }
+        // M-68 задача 18 (d15, C-167): каденция меняет СМЫСЛ редьюсера — та же история
+        // даёт другую депт-серию. Отпечаток ОБЯЗАН её различать, иначе чекпоинт,
+        // собранный при одной каденции, при другой описывает не то состояние и тёплый
+        // старт отдаст чужие числа. `C-094` B3: развязка через ЯВНУЮ инвалидацию
+        // (отпечаток включает поле), не через подгонку (отпечаток без поля). `None` и
+        // `Some(ms)` дают разные хеши — это требование теста d15 (1с vs 10с → ≠).
+        sel.depth_cadence_ms.hash(&mut h);
         h.finish()
     }
 
@@ -3386,7 +3771,10 @@ impl LiveReducer {
                 first_seq = Some(event.seq);
             }
         }
-        let stats = read_stats_from_stream(&stream);
+        // M-68 (TD-158): `depth_levels_visited = 0` — здесь НЕТ `Reducer::apply`-прохода
+        // (только холостой обход ради честных `events_*`/`segment_meta_ops` и провенанса
+        // истории, `full` заполняется следующим `pump()`).
+        let stats = read_stats_from_stream(&stream, 0);
         let history_start_seq = first_seq.unwrap_or(0);
         Ok((
             Self {
@@ -3488,6 +3876,15 @@ impl LiveReducer {
         batch.vwap.sum_pv = self.vwap.sum_pv;
         batch.vwap.sum_v = self.vwap.sum_v;
         let mut batch_consumed = 0_usize;
+        // M-68 задача 14 (d10, R-134 B-4): `depth_levels_visited` — семантика ПО ВЫЗОВУ
+        // на ВСЕХ путях, включая `pump`. `self.full` — персистентный аккумулятор, его
+        // `depth_levels_visited` МОНОТОННО растёт с самого начала сессии (или с момента
+        // resume от чекпоинта). Без дельты здесь `ReadStats::depth_levels_visited` несёт
+        // кумулятив — суммирование двух таких отчётов (impl Add / ReadStats::sum) даёт
+        // перечёт, что ломает инвариант складываемости структуры. Снимаем счётчик ДО
+        // цикла apply и считаем дельту ПОСЛЕ — стандартный приём per-call метрики на
+        // персистентном аккумуляторе.
+        let depth_before = self.full.depth_levels_visited();
 
         // M-71 (rev6, задача 13 / §4bis.5 ПЕРЕПИСАН по `R-140`): ИНВАРИАНТ — после любого
         // числа отказавших `pump` серия, собранная потребителем из ДОСТАВЛЕННЫХ кадров
@@ -3605,7 +4002,15 @@ impl LiveReducer {
             cursor = Cursor::at(event.seq);
             batch_consumed += 1;
         }
-        let stats = read_stats_from_stream(&stream);
+        // M-68 (TD-158): счётчик `depth_levels_visited` берём из `self.full` (персистентный
+        // аккумулятор, кормится КАЖДЫМ событием в pump'е); batch'и временные и сбрасываются
+        // между кадрами — у `batch` счётчик был бы ПОТЕРЯН на finish+recreate. `self.full`
+        // аккумулирует с самого начала сессии — для per-call семантики в `ReadStats`
+        // берём ДЕЛЬТУ за этот pump (см. `depth_before` в начале цикла; задача 14, d10,
+        // R-134 B-4): `ReadStats` объявлена складываемой (`impl Add`, `ReadStats::sum`),
+        // кумулятивное поле в ней давало бы квадратичный перечёт при сложении тиков.
+        let depth_after = self.full.depth_levels_visited();
+        let stats = read_stats_from_stream(&stream, depth_after - depth_before);
         // M-57 (TD-109): забираем hint СВОЕЙ сессии из стрима. Если за тик НЕ было
         // ни одного декодированного события в активном сегменте (backlog пуст,
         // `stream.tail_hint()` вернёт `None`), НЕ сбрасываем старый hint — он всё ещё

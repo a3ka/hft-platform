@@ -107,6 +107,7 @@ fn sel(window_ms: Option<i64>) -> Selector {
         timeframe_ms: 1_000,
         bands: vec![0.001],
         window_ms,
+        depth_cadence_ms: None,
     }
 }
 
@@ -290,6 +291,7 @@ fn timeframe_guard_untouched_by_window_guard() {
         timeframe_ms: 11_000, // не делит сутки — GW-I-10 обязан отвергнуть
         bands: vec![0.001],
         window_ms: Some(60_000), // окно валидно
+        depth_cadence_ms: None,
     };
     let got = gateway::snapshot(dir.path(), EpochFilter::OwnCaptureOnly, &s, Cursor::LATEST);
     match got {

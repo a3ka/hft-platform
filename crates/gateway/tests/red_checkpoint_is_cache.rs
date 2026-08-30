@@ -76,6 +76,7 @@ fn sel_with(symbol: &str, bands: Vec<f64>) -> Selector {
         timeframe_ms: 1_000,
         bands,
         window_ms: Some(10_000),
+        depth_cadence_ms: None,
     }
 }
 

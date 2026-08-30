@@ -76,6 +76,7 @@ fn sel() -> Selector {
         timeframe_ms: 1_000,
         bands: vec![0.001, 0.03], // 0.1% (≤1.3%) и 3% (deep → провенанс обязателен)
         window_ms: None,
+        depth_cadence_ms: None,
     }
 }
 
