@@ -116,13 +116,14 @@ LAST_SUCCESS="${JOURNAL_OFFSITE_LAST_SUCCESS:-/var/lib/hft/journal-offsite.last-
 SSH_PORT="${JOURNAL_OFFSITE_SSH_PORT:-23}"
 # Lock — отдельный файл для ОФСАЙТА ПРОТИВ САМОГО СЕБЯ: предыдущий тик ещё
 # работает → следующий пропускается (-n, non-blocking). Это НЕ cross-task
-# serialisation: flock сериализует только процессы на ОДНОМ файле, и retention/
-# compaction берут СВОИ lock-файлы (см. journal-retention-cron.sh и
-# journal-compaction-cron.sh). Что offsite действительно требует — непересечение
-# ПАРАЛЛЕЛЬНЫХ offsite-прогонов: SFTP-сессия хранит состояние, общее между
-# ними. С cross-task развязкой справляется РАЗНОЕ РАСПИСАНИЕ (cron.d/
-# journal-offsite:22 ≠ retention:04:07 ≠ compaction:03:50 ≠ builder-prune:04:30 —
-# R-151 Б-1).
+# serialisation: flock сериализует только процессы на ОДНОМ файле, и ни
+# retention, ни compaction НЕ БЕРУТ LOCK ВОВСЕ — `grep -ciE 'flock|lock'` в
+# их cron-скриптах возвращает 0 (замер R-155 Б-1, воспроизводится). Что
+# offsite действительно требует — непересечение ПАРАЛЛЕЛЬНЫХ offsite-прогонов:
+# SFTP-сессия хранит состояние, общее между ними. Cross-task развязка держится
+# ИСКЛЮЧИТЕЛЬНО на разнице минут расписания (cron.d/journal-offsite:22 ≠
+# retention:04:07 ≠ compaction:03:50 ≠ builder-prune:04:30 — R-151 Б-1):
+# общего lock-файла в проекте нет.
 LOCK_FILE="${JOURNAL_OFFSITE_LOCK:-/var/lock/hft-journal-offsite.lock}"
 
 mkdir -p "$(dirname "${LOG}")" "$(dirname "${ALERT_FILE}")" "$(dirname "${LAST_SUCCESS}")" 2>/dev/null || true
