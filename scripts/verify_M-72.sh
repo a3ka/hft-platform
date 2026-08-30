@@ -44,6 +44,38 @@ expect_count() { # $1=имя шага $2=факт $3=ожидание $4=рас�
   fi
 }
 
+# ПРОГОН ИМЕНОВАННОГО ОРАКУЛА. `cargo test <фильтр>` при НЕСОВПАДЕНИИ печатает
+# «running 0 tests» и возвращает 0 — то есть шаг «задача закрыта» ЗЕЛЕНЕЕТ, когда оракула
+# НЕ СУЩЕСТВУЕТ. Поймано на себе первым же полным прогоном этого гейта:
+#
+#   $ grep -c 'td177_stale_pump_does_not_kill_new_sub' <файл оракула>   → 0 (теста нет)
+#   $ cargo test … td177_stale_pump_does_not_kill_new_sub
+#     running 0 tests
+#     test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out
+#     exit=0                                   ← шаг задачи 2 был ЗЕЛЁН при пустоте
+#
+# Поэтому исход шага решает НЕ код возврата в одиночку, а ЧИСЛО ИСПОЛНЕННЫХ тестов:
+# ноль исполненных — FAIL с явным текстом «вакуум», а не «задача закрыта».
+# Это тот же класс, что `testing.md` называет свойством 3 целостности гейта (проба, молча
+# тестирующая не тот сценарий, есть плацебо самой себя) — здесь она не тестирует НИЧЕГО.
+chk_named_test() { # $1=имя шага, далее — команда cargo
+  local name="$1"; shift
+  local out st ran
+  out="$("$@" 2>&1)"; st=$?
+  ran=$(printf '%s\n' "${out}" | awk '/^test result:/ { p += $4; f += $6 } END { print p + f + 0 }')
+  if [ "${ran:-0}" -eq 0 ]; then
+    echo "FAIL: ${name} — НИ ОДИН тест не исполнился: фильтр не нашёл оракула. Зелёное здесь означало бы ВАКУУМ, а не закрытую задачу"
+    FAIL=$((FAIL + 1))
+    return
+  fi
+  if [ ${st} -eq 0 ]; then
+    echo "PASS: ${name} (исполнено тестов: ${ran})"
+  else
+    echo "FAIL: ${name} (исполнено тестов: ${ran}, exit=${st})"
+    FAIL=$((FAIL + 1))
+  fi
+}
+
 SERVE=crates/gateway-serve/src/lib.rs
 T1=crates/gateway-serve/tests/red_ws_terminality_entrypoint.rs
 T4=crates/gateway/tests/red_pump_midstream_failure.rs
@@ -70,8 +102,9 @@ chk_sh "grep -q 'connect_async\|TcpListener' ${T1}" \
 
 step "task #2 (TD-177) — RED: отставший pump не убивает НОВУЮ подписку"
 # Открыт. Красное здесь — ожидаемое состояние RED-first, а не поломка гейта.
-chk cargo test -p gateway-serve --features testing --test red_ws_terminality_entrypoint \
-    td177_stale_pump_does_not_kill_new_sub --quiet
+chk_named_test "2 RED td177_stale_pump_does_not_kill_new_sub" \
+    cargo test -p gateway-serve --features testing --test red_ws_terminality_entrypoint \
+    td177_stale_pump_does_not_kill_new_sub
 
 step "task #3 (TD-177) — фикс: снятие сверяет поколение теми же условиями, что и сохранение"
 # Носителей ДВА, и проверяются ОБА. Сверка по одному оставила бы второй молча дефектным —
@@ -110,7 +143,8 @@ chk_sh "cargo test -p gateway --test red_pump_midstream_failure --quiet >/dev/nu
 
 step "task #6 (TD-180) — честность курсора в snapshot()"
 chk_sh "test -f ${T6}" "6 оракул честности курсора существует"
-chk cargo test -p gateway --test red_snapshot_cursor_honesty --quiet
+chk_named_test "6 оракул честности курсора" \
+    cargo test -p gateway --test red_snapshot_cursor_honesty
 
 step "task #7 — приземлённый P7 цел, состав набора предела не тронут"
 chk cargo test -p gateway --test red_egress_cap_paths --quiet
