@@ -379,4 +379,97 @@ $ git -C /root/hft-platform rev-parse --short HEAD  → 1397b99
 **Чего я не делаю:** не проектирую фиксы `Н-13`/`Н-14`/`Н-16` — это граница reviewer↔architect
 (`gates.md` §4): я описываю дефект, защиту проектирует architect.
 
+---
+
+## ПОПРАВКА 2026-08-30T19:40Z — номера карточек долга были названы ЗАНЯТЫМИ
+
+Выше, в `Н-13`/`Н-14`/`Н-16` и в разделе «Условие APPROVED», я назвал карточки `TD-177`,
+`TD-178`, `TD-179`. **Все три уже заняты** другими предметами (`TD-177` — generation при
+снятии подписки, `TD-178` — оракул точки входа терминальности, `TD-179` — побатчевое
+продвижение курсора). Я взял номера по памяти вместо механизма — ровно то, что `gates.md` §12
+запрещает: «Номер берётся ТОЛЬКО механизмом».
+
+**Верные номера, выданные аллокатором** (`scripts/reserve_artifact_id.sh TD`, трижды):
+
+| в тексте выше | читать |
+|---|---|
+| `TD-177` (`Н-13`, README против `deploy.yml`) | **`TD-191`** |
+| `TD-178` (`Н-14`, гейт не зовёт `crontab -n`) | **`TD-192`** |
+| `TD-179` (`Н-16`, `OPS-I-3` restore-drill) | **`TD-193`** |
+
+Поправка дописана, а не внесена правкой по тексту, намеренно: вердикт — артефакт гейта, и
+след ошибки в нём ценнее аккуратного вида. Барьер `check_artifact_ids.sh` этого класса не
+ловит и по построению не может — он сторожит ДВА НОСИТЕЛЯ под одним идентификатором, а здесь
+носитель один и он завёлся под верными номерами; ложная ссылка живёт в прозе вердикта.
+Названо как предел, а не как оправдание.
+
+Заведённые карточки: `TD-191` (MAJOR), `TD-192` (MINOR), `TD-193` (MAJOR).
+Дополнительно этим же close-out'ом ЗАКРЫТЫ `TD-183` и `TD-184` — оба merge'ем M-73.
+
+## ПОСТ-MERGE (§8) — исполнено, сырые строки
+
+```
+merge: PR #129 → main 2026-08-30T19:17:54Z, вершина 7581f60
+$ gh pr checks 129 --watch >/dev/null 2>&1; echo CHECKS=$?     → CHECKS=0  (17/17 pass)
+$ gh run watch 33330478744 --exit-status >/dev/null 2>&1; echo → CI_exit=0
+$ gh run watch 33330478723 --exit-status >/dev/null 2>&1; echo → DEPLOY_exit=0
+$ ssh … 'git -C /root/hft-platform rev-parse HEAD'
+7581f603bddff2f18a4356f90e74e7f2f4eb70b0
+$ ssh … 'ls -la /etc/cron.d/'
+-rw-r--r-- 1 root root 3119 Aug 30 19:28 hft-builder-prune          ← НОВОЕ
+-rw-r--r-- 1 root root 5009 Aug 30 19:28 hft-journal-offsite        ← НОВОЕ
+-rw-r--r-- 1 root root 7063 Aug 30 19:28 hft-journal-retention
+$ ssh … 'ls -l /root/hft-platform/deploy/bin/{journal-offsite,builder-prune}-cron.sh'
+-rwxr-xr-x 1 root root 31832 Aug 30 19:28 …/journal-offsite-cron.sh
+-rwxr-xr-x 1 root root  8167 Aug 30 19:28 …/builder-prune-cron.sh
+$ ssh … 'sed -n "326p" …/journal-offsite-cron.sh'
+_st=("${PIPESTATUS[@]}")                          ← фикс Б-5 физически на проде
+$ ssh … 'docker ps --format "{{.Names}} {{.Status}}"; df -h /; ls /var/lib/hft/*.alert'
+hft-gateway-serve Up (healthy) · hft-recorder Up (healthy) · / 65 % · (alert-файлов нет)
+heartbeat: {"free_bytes":54431326208,"min_free_bytes":10737418240,"writable":true,…}
+```
+
+**Признание ошибки процедуры, не влияющей на исход.** Команду merge'а я выполнил как
+`gh pr merge … | tail -5; echo merge_exit=$?` — это ловит exit `tail`, а не `gh`, то есть
+буквально та форма, которую `gates.md` §3 запрещает («решение принимается по КОДУ ВОЗВРАТА, а
+не по тексту»). `gh` при этом напечатал `could not determine current branch` (я работал в
+detached-worktree), и «`merge_exit=0`» было ложным. Исход установлен фактом, а не отчётом —
+`gh pr view 129 --json state,mergedAt` → `MERGED 19:17:54Z`, `git log origin/main` содержит
+`7581f60`. Ветка `feat/R1-offsite-schedule` удалена отдельной командой. Записываю потому, что
+вердикт, скрывающий свою процедурную ошибку, воспроизводит класс, который сам же ловит.
+
+## EYES-ON ПЕРВОГО АВТО-ПРОГОНА — ПРОЙДЕН 2026-08-30T20:22Z
+
+Условие моего APPROVED исполнено полностью. Прогон именно АВТОМАТИЧЕСКИЙ — вызывателем
+выступил cron, а не рука; это предъявлено строкой syslog, а не выведено из свежести отметки:
+
+```
+$ ssh … 'grep journal-offsite /var/log/syslog | tail -1'
+2026-08-30T20:22:01 ubuntu-8gb-fsn1-2 CRON[561596]: (root) CMD (/root/hft-platform/deploy/bin/journal-offsite-cron.sh)
+$ ssh … 'cat /var/lib/hft/journal-offsite.last-success'
+2026-08-30T20:22:28Z
+$ ssh … 'tail -8 /var/log/hft/journal-offsite.log'
+Number of files: 479 (reg: 479)      Number of created files: 1 (reg: 1)
+Number of deleted files: 0           Total transferred file size: 1.07G bytes
+sent 1.07G bytes  received 33 bytes  40.53M bytes/sec
+2026-08-30T20:22:28Z OK duration=26s
+$ ssh … 'ls -l /var/lib/hft/journal-offsite.alert'   → (alert-файла нет)
+$ ssh … 'docker ps --format "{{.Names}} {{.Status}}"; df -h /'
+hft-gateway-serve Up 54 minutes (healthy) · hft-recorder Up 54 minutes (healthy) · / 65 %
+```
+
+Сверка с ЗАЯВЛЕННОЙ формой (шапка `deploy/cron.d/journal-offsite`: «сегмент ≈ 1100 МБ
+копируется за ≈ 27 с, при 1–2 закрытых за час»): один созданный файл, 1.07 ГБ, 26 с.
+Совпадает — то есть прогноз милестоуна был замером, а не оценкой. `Number of deleted files: 0`
+— положительное подтверждение отсутствия `--delete` на живом канале, а не только в argv.
+
+**Что этим НЕ доказано, и я это называю.** Что скопированные байты ЧИТАЮТСЯ. Копия
+существует и обновляется, `OPS-I-2` выполнен по букве; `OPS-I-3` (restore-drill) не
+проводился ни разу — `TD-193`. Пока drill не пройден, `RETENTION_MODE` обязан оставаться
+`dry-run`: порядок «копия → восстановление → удаление» необратим.
+
+**Итог гейта:** APPROVED исполнен целиком — merge, §8, подключение к проду и первый
+авто-прогон предъявлены. Милестоун НЕ закрыт: close-out (`§Tasks`, `docs/fa/ops.md:399`,
+restore-drill) — зона architect'а.
+
 === END R-158 ===
