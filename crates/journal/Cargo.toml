@@ -1,0 +1,26 @@
+[package]
+name = "journal"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+
+# Ядро №1 (docs/fa/journal.md): append-only журнал, единственный писатель, seq — тотальный
+# порядок. MVP: постокард-фреймы + crc32 в сегмент; seq персистится в сайдкар-мете.
+# Полный формат/снапшоты/state_hash/replay — пофазно.
+
+[dependencies]
+contracts = { path = "../contracts" }
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["use-std"] }
+crc32fast = "1"
+# M-08 / CT-RFC-02: манифест legacy-деклараций (journal.legacy.json) + отпечаток сегмента.
+serde_json = "1"
+sha2 = "0.10"
+# M-08 task 15: компакция закрытых сегментов (замер на боевых данных: 9.1× при -3).
+zstd = "0.13"
+# M-08 / E4 (fail-closed по диску): statvfs для реального свободного места.
+# std::os::unix::fs::MetadataExt даёт только blocks() (total), не bavail.
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

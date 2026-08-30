@@ -1,0 +1,79 @@
+# /etc/cron.d/hft-journal-retention
+# M-08 задача 14 (TD-020 доставка): планировщик В РЕПО, а не в голове оператора.
+#
+# ⚠ ОГРАНИЧЕНИЯ CRON-ПАРСЕРА — на них мы уже обожглись (reviewer, PR-гейт M-08):
+#   • перенос строки через `\` НЕ ПОДДЕРЖИВАЕТСЯ: каждая физическая строка — отдельная запись.
+#     Первая редакция держала здесь многострочную команду ⇒ `crontab -n` → «bad minute»,
+#     файл НЕ УСТАНАВЛИВАЛСЯ. Гейт D5 этого не поймал, потому что грепал слова (`dry-run`,
+#     `ALERT`), а не устанавливаемость — grep-green артефакт. Тот же класс, что весь TD-020:
+#     «текст в репо» ≠ «работает в проде».
+#   • `%` в команде = перевод строки (спецсимвол cron);
+#   • `${VAR}` в КОМАНДНОЙ части не раскрывается (env ниже виден только процессу задания).
+# Поэтому: команда — ОДНА строка, вся логика — в deploy/bin/journal-retention-cron.sh,
+# где её можно проверить (`bash -n`, прогон со стабом docker) и где нет ограничений парсера.
+#
+# Контракт:
+#   - dry-run ежедневно (дефолт бинаря — тоже dry-run; здесь продублировано ЯВНО:
+#     «по cron'у НИКОГДА apply» — автоматическое удаление без глаза оператора и есть TD-020);
+#   - лог: /var/log/hft/journal-retention.log (ротация — logrotate, см. deploy/README.md);
+#   - алерт на exit≠0: `logger -p user.err` (syslog/journald) + маркер-файл
+#     /var/lib/hft/retention.alert для внешнего монитора; успешный прогон маркер гасит.
+#
+# Apply — ВРУЧНУЮ, после визуального разбора отчёта dry-run'а:
+#     docker compose run --rm journal-retention --mode apply
+#
+# Установка:
+#   sudo install -m 0755 deploy/bin/journal-retention-cron.sh /root/hft-platform/deploy/bin/
+#   sudo install -m 0644 deploy/cron.d/journal-retention /etc/cron.d/hft-journal-retention
+#   sudo install -d /var/log/hft /var/lib/hft
+# Проверка ДО установки (ровно это делает гейт D5):
+#   crontab -n deploy/cron.d/journal-retention   → exit 0
+# Удаление (revoke):
+#   sudo rm /etc/cron.d/hft-journal-retention
+
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+HFT_ROOT=/root/hft-platform
+JOURNAL_COLD_DIR=/mnt/journal-cold
+RETENTION_RETAIN_DAYS=14
+RETENTION_KEEP_MIN=4
+RETENTION_MIN_FREE_GB=10
+RETENTION_MODE=dry-run
+RETENTION_LOG=/var/log/hft/journal-retention.log
+RETENTION_ALERT_FILE=/var/lib/hft/retention.alert
+# D-COMP-3 (M-08 task 16, TD-022): компакция закрытых сегментов — отдельное расписание,
+# НЕ коллидирующее по времени с ретеншеном (оба пишут в /journal; 03:50 UTC — за 17 минут
+# ДО ретеншена, чтобы fsync-волна компакции не наложилась на ретеншен-выгрузку).
+COMPACTION_KEEP_RAW=2
+COMPACTION_LOG=/var/log/hft/journal-compaction.log
+COMPACTION_ALERT_FILE=/var/lib/hft/compaction.alert
+
+# m h dom mon dow user command
+# РетеRтеншен: ежедневно 04:07 UTC (по cron'у НИКОГДА apply — конструктивный барьер,
+# иначе автоматическое удаление без глаза оператора = TD-020).
+7 4 * * * root /root/hft-platform/deploy/bin/journal-retention-cron.sh
+# Компакция: ежедневно 03:50 UTC. Безопасна по дизайну (D-COMP-2: оригинал удаляется
+# только после sha256-сверки .zst); dry-run-семантика НЕ размывается — компакция это
+# отдельный режим того же бинаря, не часть apply.
+50 3 * * * root /root/hft-platform/deploy/bin/journal-compaction-cron.sh
+# M-48 (TD-048, GW-I-12): чекпоинтер ДОЛЖЕН отработать ДО ретеншена, иначе покрытие
+# `covered_through_seq` — пустое/устаревшее и retention либо уходит в fail-closed
+# no-op (`offload_only` без prune), либо прунит по вчерашнему рубежу. 04:00 UTC —
+# за 7 минут ДО ретеншена (04:07). `gateway-checkpoint-cron.sh` ПИШЕТ артефакт
+# покрытия (`--coverage-out=/ckpt/covered_through_seq`), retention ЧИТАЕТ его
+# (`--checkpoint-coverage=/ckpt/covered_through_seq`); пути ОБЯЗАНЫ совпадать
+# (verify_M-48 канарейка КОМПОЗИЦИИ). При падении чекпоинтера — alert-файл
+# /var/lib/hft/gateway-checkpoint.alert, ретеншен в том же цикле всё равно
+# отработает (fail-closed no-op), но оператор увидит свежий алерт.
+# TD-085 (2026-08-03, санкция founder'а — П-008 п.2): частота поднята с суточной до
+# каждых 15 минут. ПРИЧИНА, которую нельзя потерять: чекпоинт покрывает `covered_through_seq`,
+# а `gateway-serve` при подключении клиента ДОГОНЯЕТ хвост от него до `next_seq`. При суточном
+# чекпоинте хвост к вечеру достигал 3.3M событий, и первый снапшот стоил 28-142 s (замер на
+# проде, `research/reviews/R-026-M-53.md` §7). Учащение возвращает первый экран в секунды.
+# Инвариант M-48/GW-I-12 СОХРАНЁН: запуск в 04:00 входит в сетку */15 и по-прежнему
+# предшествует ретеншену (04:07), который читает `covered_through_seq`.
+# `flock -n` обязателен: в самом `gateway-checkpoint-cron.sh` блокировки НЕТ (проверено
+# грепом), а без неё учащение даёт накладывающиеся запуски. Замер длительности: cron стартовал
+# 04:00:01, артефакты имеют mtime 04:00:27 => ~26 s, запас к 15 минутам ~34x. `-n` (non-blocking)
+# выбран намеренно: пропустить тик безопаснее, чем копить очередь процессов на журнале.
+*/15 * * * * root flock -n /var/lock/hft-gateway-checkpoint.lock /root/hft-platform/deploy/bin/gateway-checkpoint-cron.sh
