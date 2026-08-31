@@ -104,7 +104,8 @@ founder'а». Значит правка константы = совершени�
 | 3c | Спот: `pub enum SessionEffect` + `pub struct SpotSession` с `new_with_l2delta(subs, l2delta_allow)` и `on_ws_text(&mut self, &str) -> Vec<SessionEffect>` (sync, без сети/каналов); async `handle_text_message` становится тонкой обёрткой, исполняющей эффекты | venue-dev | ✅ DONE (`c3b997c`) | **T5b, O-8** |
 | 4 | Фикстура `L2Delta` в оракул `DET-I-1` — закрытие R-019 F6 / TD-072 | **architect** (sacred) | ✅ DONE (`det_9`) | T8 |
 | 5 | `scripts/verify_M-45.sh` | **architect** (sacred) | ✅ DONE | — |
-| 6 | Запись эпохи в `docs/data-epochs.md` — ТОЛЬКО при раскатке (Граница C), не при merge | architect | ⛔ ждёт подписи | T9 |
+| 6 | Запись эпохи в `docs/data-epochs.md` — ТОЛЬКО при раскатке (Граница C), не при merge | architect | ✅ DONE — `E-002` заведена, подпись получена (`П-026`, 2026-08-31) | T9 |
+| 7 | **Раскатка:** объявить `L2DELTA_CAPTURE_SYMBOLS` и `EPOCH_ID` в `docker-compose.yml` ОДНИМ коммитом, деплой-гейт `gates.md` §8 с sanity по КАЖДОЙ площадке отдельно | engine-dev | ⏳ OPEN | `П-026` §Порядок |
 
 Задачи 4–6 — architect-only (`*/tests/**` и `scripts/verify_*.sh` — sacred,
 `.claude/rules/scope-guard.md`). Задачи 1–3 — venue-dev, **строго по RED-оракулам**; тесты и
@@ -302,7 +303,9 @@ $ grep -c L2Delta crates/journal/tests/red_det_replay_digest.rs
 - `scripts/verify_M-45.sh` (**architect only**);
 - `docs/data-epochs.md`, этот файл;
 - **`docker-compose.yml` — в части `L2DELTA_CAPTURE_SYMBOLS` и `EPOCH_ID`** (engine-dev,
-  **задача 6**, раскатка). **Добавлено 2026-08-31.** Прежняя редакция §Allowed paths раскатку НЕ
+  **задача 7**, раскатка). **Добавлено 2026-08-31, уточнено по `R-160` Б-2:** раскатку несёт
+  задача 7, а задача 6 — запись эпохи, и это РАЗНЫЕ шаги. Первая редакция ссылки называла
+  задачу 6 и потому была ложной по существу, перестав быть висячей по форме. Прежняя редакция §Allowed paths раскатку НЕ
   ПОКРЫВАЛА: спека предписывала смену состава (задача 6), а путь, которым состав меняется,
   сама же не разрешала. Тот же класс, что `A-028` §3 п.1 на `M-74` — «спека не вправе
   называть шаг, чей путь сама не разрешает»; там он стоил REJECT'а.
