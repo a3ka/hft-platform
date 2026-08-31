@@ -44,10 +44,15 @@ $ grep -n 'selector.bands.iter().copied().fold' crates/gateway/src/lib.rs
 1557:    let w = selector.bands.iter().copied().fold(0.0_f64, f64::max);
         ← единственный источник окна для heatmap И COB (build_heatmap_and_cob)
 
-$ grep -n 'build_heatmap_and_cob' crates/gateway/src/lib.rs
+$ grep -n 'build_heatmap_and_cob' crates/gateway/src/lib.rs | grep -v '///'
 1483:        let (heatmap, cob) = build_heatmap_and_cob(&self.selector, &self.heatmap_buckets);
 1553:fn build_heatmap_and_cob(
         ← ОДИН вызыватель; депт-серия строится отдельно (:1441-1499) и связку не разделяет
+        ← фильтр `grep -v '///'` добавлен 2026-08-31: без него команда даёт ТРЕТЬЮ строку
+          `:1384` (doc-комментарий). Подпись «ОДИН вызыватель» от этого не менялась —
+          комментарий вызовом не является, — но выписка не производилась показанной
+          командой, а это тот же класс, что `R-164` Б-1 поймал на соседней ветке.
+          Найдено собственной сверкой до круга гейта, а не вердиктом.
 
 $ cargo test -p gateway --test red_heatmap_window_decoupled     (на прод-форменной фикстуре)
   PL-I-5: response exceeds limit: limit=2000000 bytes, observed=7882335 bytes
