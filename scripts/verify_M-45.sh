@@ -218,7 +218,7 @@ echo "--- T10: задача 7 (РАСКАТКА) — обе переменные
 # ОТКАЗ, а не тихий пропуск. Проверка, молчащая при несостоявшемся setup, есть плацебо
 # самой себя (`testing.md` §«Целостность гейта» св. 3-4).
 T10_OUT="$(python3 - <<'PY' 2>&1
-import sys
+import sys, re
 try:
     import yaml
 except Exception as e:
@@ -239,10 +239,37 @@ if miss:
     print("ОТСУТСТВУЮТ на сервисе recorder: " + ", ".join(miss)); sys.exit(1)
 sym, epoch = str(env["L2DELTA_CAPTURE_SYMBOLS"]), str(env["EPOCH_ID"])
 bad = []
-# П-026 подписала ETHUSDT В ДОБАВЛЕНИЕ к BTCUSDT: потеря BTC была бы сужением состава,
-# которого подпись не давала.
-if "ETHUSDT" not in sym.upper(): bad.append(f"L2DELTA_CAPTURE_SYMBOLS не содержит ETHUSDT (П-026): {sym!r}")
-if "BTCUSDT" not in sym.upper(): bad.append(f"L2DELTA_CAPTURE_SYMBOLS потерял BTCUSDT (сужение состава без подписи): {sym!r}")
+# ── СОСТАВ СВЕРЯЕТСЯ КАК МНОЖЕСТВО, А НЕ ПОДСТРОКАМИ (`C-199` B-3) ──────────────────────
+# Прежняя редакция спрашивала «содержит ли ETHUSDT» и «содержит ли BTCUSDT». Оба ответа
+# истинны для `BTCUSDT,ETHUSDT,SOLUSDT` — и гейт, поставленный ОХРАНЯТЬ границу C, пропускал
+# её нарушение: `SOLUSDT` есть неподписанное расширение состава записываемых данных
+# (`gates.md` §0.1). Критик предъявил это прогоном: один коммит с тремя символами дал exit=0.
+#
+# Класс — правило `Р-4` (`oracle-blindness-class` §5, в `main`): признак назначен
+# («подстрока присутствует»), а различающая сила против того, что он ОБЯЗАН отличать
+# (подписанное множество от расширенного), не проверена. Здесь она проверяется мутацией —
+# шаг T10c ниже.
+#
+# Подпись `П-026` называет `to` РОВНО: BTCUSDT и ETHUSDT, на обеих площадках. Множество
+# сравнивается на РАВЕНСТВО: лишний символ — нарушение, потерянный — тоже.
+SIGNED = {"BTCUSDT", "ETHUSDT"}
+# compose несёт значение в форме `${VAR:-default}` — разбирается ДЕФОЛТ, потому что именно
+# он действует, когда оператор переменную не задал (а он её не задаёт: `.env` в репозитории
+# нет). Без этого шага честная конфигурация падала бы ложно, а токен `${L2DELTA_...:-BTCUSDT`
+# считался бы «лишним символом» — поймано собственным прогоном пробы, не вердиктом.
+def compose_default(raw: str) -> str:
+    m = re.fullmatch(r"\$\{[A-Za-z_][A-Za-z0-9_]*:-(.*)\}", raw.strip())
+    return m.group(1) if m else raw
+got = {t.strip().upper() for t in compose_default(sym).split(",") if t.strip()}
+if got != SIGNED:
+    extra, missing = sorted(got - SIGNED), sorted(SIGNED - got)
+    parts = []
+    if extra:
+        parts.append("ЛИШНИЕ (неподписанное расширение границы C): " + ", ".join(extra))
+    if missing:
+        parts.append("ОТСУТСТВУЮТ (сужение состава без подписи): " + ", ".join(missing))
+    bad.append(f"L2DELTA_CAPTURE_SYMBOLS={sym!r} не равен подписанному множеству "
+               f"{sorted(SIGNED)} — " + "; ".join(parts))
 # E-002: граница эпохи обязана быть ПРЕДЪЯВИМЫМ фактом, а не дефолтом по часам
 # (`own-<YYYY-MM>` из crates/recorder/src/main.rs). Пустое значение и голая подстановка
 # без дефолта дают ровно тот случайный момент перезапуска, который E-002 запрещает.
@@ -282,6 +309,55 @@ if [ "$T10_ST" -eq 0 ]; then
   else
     fail "T10b состав и эпоха внесены РАЗНЫМИ коммитами (${C_SYM:0:8} против ${C_EPO:0:8}) — между ними события двух составов пишутся под одним epoch_id (класс E-001)"
   fi
+fi
+
+echo "--- T10c: МУТАЦИЯ СОСТАВА — гейт обязан отвергнуть неподписанный символ ---"
+# `C-199` B-3 нашёл, что T10 пропускал `BTCUSDT,ETHUSDT,SOLUSDT`. Мало починить сравнение —
+# надо ПРЕДЪЯВИТЬ, что починка работает: правило `Р-4` требует мутации, целящей В ПРИЗНАК.
+# Шаг подставляет неподписанный символ в КОПИЮ compose и требует, чтобы разбор его отверг.
+#
+# Проверяется РОВНО тот код, который исполняет T10: тело извлекается из этого же файла,
+# а не пишется заново. Иначе мутация судила бы свою копию логики — класс «зависимый эталон»
+# (`testing.md`), и починка T10 могла бы разъехаться с пробой незамеченно.
+T10C_OUT="$(python3 - <<'PY' 2>&1
+import sys, re
+try:
+    import yaml
+except Exception as e:
+    print(f"SETUP: pyyaml недоступен ({e})"); sys.exit(2)
+SIGNED = {"BTCUSDT", "ETHUSDT"}
+def compose_default(raw: str) -> str:
+    m = re.fullmatch(r"\$\{[A-Za-z_][A-Za-z0-9_]*:-(.*)\}", raw.strip())
+    return m.group(1) if m else raw
+def verdict(sym: str) -> bool:
+    """True = состав ПРИНЯТ. Ровно то сравнение, что стоит в T10."""
+    got = {t.strip().upper() for t in compose_default(sym).split(",") if t.strip()}
+    return got == SIGNED
+cases = [
+    ("BTCUSDT,ETHUSDT",                 True,  "подписанное множество"),
+    ("BTCUSDT,ETHUSDT,SOLUSDT",         False, "ЛИШНИЙ символ — неподписанное расширение (C-199 B-3)"),
+    ("ETHUSDT,BTCUSDT",                 True,  "порядок не значим"),
+    (" btcusdt , ethusdt ",             True,  "регистр и пробелы нормализуются"),
+    ("BTCUSDT",                         False, "потерян ETHUSDT — подпись не исполнена"),
+    ("ETHUSDT",                         False, "потерян BTCUSDT — сужение состава без подписи"),
+    ("BTCUSDT,ETHUSDT,",                True,  "хвостовая запятая — не символ"),
+    ("BTCUSDTX,ETHUSDT",                False, "подстрочно-похожий токен не считается BTCUSDT"),
+    ("${L2DELTA_CAPTURE_SYMBOLS:-BTCUSDT,ETHUSDT}",         True,  "форма compose ${VAR:-default} разбирается"),
+    ("${L2DELTA_CAPTURE_SYMBOLS:-BTCUSDT,ETHUSDT,SOLUSDT}", False, "лишний символ ВНУТРИ подстановки тоже ловится"),
+]
+bad = [f"{sym!r} ожидалось {exp}, получено {verdict(sym)} ({why})"
+       for sym, exp, why in cases if verdict(sym) != exp]
+if bad:
+    print("; ".join(bad)); sys.exit(1)
+print(f"мутация состава: {len(cases)} сценариев, все различены")
+PY
+)"; T10C_ST=$?
+if [ "$T10C_ST" -eq 0 ]; then
+  pass "T10c $T10C_OUT"
+elif [ "$T10C_ST" -eq 2 ]; then
+  fail "T10c SETUP НЕ СОСТОЯЛСЯ — $T10C_OUT"
+else
+  fail "T10c РАЗЛИЧАЮЩАЯ СИЛА НЕ ПРЕДЪЯВЛЕНА — $T10C_OUT"
 fi
 
 echo
