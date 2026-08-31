@@ -64,6 +64,7 @@ LIB=crates/gateway/src/lib.rs
 T1=crates/gateway/tests/red_heatmap_window_decoupled.rs
 T5=crates/gateway/tests/red_heatmap_window_server_owned.rs
 T2=crates/gateway-serve/tests/red_heatmap_window_env.rs
+T6=crates/gateway-serve/tests/red_heatmap_window_effective_setting.rs
 
 step "task #0 — паритет с CI: fmt + clippy(--all-targets --all-features) + test --all"
 chk "cargo fmt --all -- --check"
@@ -145,6 +146,19 @@ for t in malformed_heatmap_window_is_rejected \
          absent_heatmap_window_starts \
          heatmap_window_is_declared_in_compose; do
   chk "grep -q '^fn ${t}' ${T2}"
+done
+
+step "task #5b (RED) — СЕРВЕРНАЯ настройка управляет охватом карты"
+# Закрывает `C-194` B-2 (вторая половина) и `C-196` B-3. Отдельный шаг, потому что он судит
+# ТРЕТИЙ мир: «жёсткая константа в теле, конфиг игнорируется». Тот мир проходит ВСЕ
+# предыдущие оракулы — замер `C-196` B-3 воспроизведён architect'ом: `w = 0.001` даёт
+# 3/3 + 2/2 PASS. Ловится только сменой серверной настройки на прод-пути
+# `env → serve_config_from_env → выдача`.
+chk_named_test "оракул эффективной серверной настройки (H-6 · H-6b)" \
+  cargo test -p gateway-serve --test red_heatmap_window_effective_setting --quiet
+for t in hw_i_6_effective_server_setting_controls_map_extent \
+         hw_i_6b_both_settings_produce_a_nonempty_map; do
+  chk "grep -q '^fn ${t}' ${T6}"
 done
 
 step "task #4 — переменная объявлена в конфиге и РАВНА сегодняшнему эффективному"
