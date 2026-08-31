@@ -62,6 +62,8 @@ echo "PASS: самопроверка помощников — зелёное п�
 
 LIB=crates/gateway/src/lib.rs
 T1=crates/gateway/tests/red_heatmap_window_decoupled.rs
+T5=crates/gateway/tests/red_heatmap_window_server_owned.rs
+T2=crates/gateway-serve/tests/red_heatmap_window_env.rs
 
 step "task #0 — паритет с CI: fmt + clippy(--all-targets --all-features) + test --all"
 chk "cargo fmt --all -- --check"
@@ -77,6 +79,17 @@ for t in hw_i_1_heatmap_size_is_independent_of_bands \
          hw_i_3_canonical_bands_fit_under_signed_cap \
          hw_i_4_decoupling_does_not_empty_the_heatmap; do
   chk "grep -q '^async fn ${t}\|^fn ${t}' ${T1}"
+done
+
+step "task #1b (RED) — окно ПРИНАДЛЕЖИТ СЕРВЕРУ: полоса ниже конфига не сужает карту"
+# Закрывает `C-194` B-2. Отдельный шаг, а не расширение предыдущего: он судит ДРУГОЙ мир —
+# зажатую связку `min(max(bands), CONFIG)`, против которой ВЕСЬ набор задачи 1 зелен (замер
+# architect'а мутацией: 3 passed при живой связке). Правило `Р-4` (`A-029`).
+chk_named_test "оракул серверного владения окном (H-5 · H-5b)" \
+  cargo test -p gateway --test red_heatmap_window_server_owned --quiet
+for t in hw_i_5_below_config_band_cannot_shrink_the_map \
+         hw_i_5b_server_window_still_produces_a_map_for_a_below_config_band; do
+  chk "grep -q '^fn ${t}' ${T5}"
 done
 
 step "task #2 — связка снята СТРУКТУРНО: окно не выводится из селектора внутри функции"
@@ -98,9 +111,41 @@ fi
 chk "grep -q 'pub fn effective_heatmap_window_frac' ${LIB}"
 chk "grep -q 'DEFAULT_HEATMAP_WINDOW_FRAC' ${LIB}"
 
+# ── КАНАРЕЙКА МЕСТА ВЫЗОВА (`C-194` B-2, дословно: «pin the call-site/property that supplies
+# that effective value, not only the callee body»).
+#
+# Тела функции НЕ ДОСТАТОЧНО, и это доказано мутацией, а не предположено: зажатая связка
+# `min(max(selector.bands), CONFIG)`, посчитанная У ВЫЗЫВАЮЩЕГО и переданная в суженную
+# сигнатуру, оставляет тело чистым от `selector.bands` — все структурные проверки выше зелены,
+# а окном по-прежнему управляет клиент. Гейт обязан смотреть на ТОГО, КТО ПОСТАВЛЯЕТ значение.
+#
+# Предел назван честно: это структурная проверка, и её обходит сдвиг вычисления на уровень
+# выше (`M-45` §D-1 — тот же класс, уже стоивший двух REJECT). Она — не доказательство, а
+# дешёвый страж; доказательство несёт RED-оракул H-5 (шаг task #1b), а полное закрытие —
+# задача 5b, оракул смены серверной настройки.
+CALLS="$(grep -n 'build_heatmap_and_cob(' "${LIB}" 2>/dev/null | grep -v '///' | grep -vE '^[0-9]+:[[:space:]]*fn ')"
+NCALLS="$(printf '%s\n' "${CALLS}" | grep -c . || true)"
+if [ "${NCALLS:-0}" -lt 1 ]; then
+  echo "FAIL: место вызова build_heatmap_and_cob не найдено — функция переименована, встроена или удалена; канарейка call-site была бы ВАКУУМНО зелёной" >&2
+  FAIL=$((FAIL + 1))
+else
+  chk "printf '%s\n' \"\${CALLS}\" | grep -q 'effective_heatmap_window_frac'"
+  chk "printf '%s\n' \"\${CALLS}\" | grep -qE 'selector|bands' && exit 1 || exit 0"
+fi
+
 step "task #3 — разбор env FAIL-CLOSED: невалидное значение = отказ старта, не дефолт"
 chk_named_test "оракул fail-closed разбора GATEWAY_HEATMAP_WINDOW" \
   cargo test -p gateway-serve --test red_heatmap_window_env --quiet
+# Состав ПОИМЁННО (урок 2 шапки): обе половины ядра и оба парных vantage'а обязаны
+# существовать. Без vantage'ей требование удовлетворяется реализацией «всегда Err», то есть
+# ценой неработающего сервиса; без композиции — ручкой, не доехавшей до деплоя.
+for t in malformed_heatmap_window_is_rejected \
+         out_of_range_heatmap_window_is_rejected \
+         valid_heatmap_window_starts \
+         absent_heatmap_window_starts \
+         heatmap_window_is_declared_in_compose; do
+  chk "grep -q '^fn ${t}' ${T2}"
+done
 
 step "task #4 — переменная объявлена в конфиге и РАВНА сегодняшнему эффективному"
 chk "grep -q 'GATEWAY_HEATMAP_WINDOW' docker-compose.yml"
