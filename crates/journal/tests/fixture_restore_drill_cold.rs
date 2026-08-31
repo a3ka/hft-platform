@@ -89,7 +89,11 @@ fn ev(i: u64) -> EventKind {
         MdPayload::Trade {
             price: 6_400_000_000_000 + i as i64,
             size: 100 + (i as i64 % 7),
-            side: if i.is_multiple_of(2) { Side::Buy } else { Side::Sell },
+            side: if i.is_multiple_of(2) {
+                Side::Buy
+            } else {
+                Side::Sell
+            },
             ts_exch_ms: 1_752_000_000_000 + i as i64,
         },
     )
