@@ -2,8 +2,8 @@
 
 # M-72 — терминальность подписки: одно свойство, три носителя
 
-STATUS: PROPOSED (2026-08-29, architect; **rev 2 — 2026-08-31, закрытие `C-190` B-1/B-2/B-4**;
-`B-3` — в работе тем же кругом). Предмет — **шов завершения подписки на push-пути**
+STATUS: PROPOSED (2026-08-29, architect; **rev 2 — 2026-08-31, закрыты ВСЕ ЧЕТЫРЕ блокера
+`C-190`**: B-1, B-2, B-3, B-4). Предмет — **шов завершения подписки на push-пути**
 `gateway-serve`. Закрывает `TD-177`, `TD-178`, `TD-179` и решает форму `TD-180`.
 
 **Почему одним милестоуном, а не четырьмя задачами.** Шов ОДИН: «pump вернулся с отказом —
@@ -34,13 +34,15 @@ STATUS: PROPOSED (2026-08-29, architect; **rev 2 — 2026-08-31, закрыти�
 ## Contract impact
 
 - **T1 (`crates/contracts`) НЕ трогается.** Предмет — поведение транспорта, не форма события.
-- **Открытый вопрос к критику (задача 5).** Задача 4 требует сообщить клиенту причину
-  завершения, отличную от предела объёма. Сегодня обе причины ушли бы одним кодом
-  `invalid_selector` (`crates/gateway-serve/src/lib.rs:1409`), и это было бы ложью о причине —
-  тот же класс, что `TD-138`. Развилка: (а) новый код ошибки протокола ⇒ аддитивная правка
-  `docs/rfc/CT-RFC-09-ws-session.md` и bump `GATEWAY_SCHEMA_VERSION` 9→10; (б) тот же код с
-  различающим полем. **Выбор — за кругом критика, не за автором спеки.**
-- `GATEWAY_SCHEMA_VERSION` меняется ТОЛЬКО если победит (а).
+- **Развилка задачи 5 ЗАКРЫТА кругом критика (`C-190`), как спека и предписывала.** Выбран
+  вариант **(б)**: ОДИН родовой код `subscription_terminated` с ОБЯЗАТЕЛЬНЫМ полем `reason`
+  (`response_limit_exceeded` | `pump_failed`). Форма записана в `docs/rfc/CT-RFC-09-ws-session.md`
+  §2.10 этим же кругом.
+- **`GATEWAY_SCHEMA_VERSION` НЕ БАМПАЕТСЯ**, и это проверено замером, а не аналогией:
+  константа версионирует `gateway::Snapshot`/`Frame`, а конверт ошибки строится независимо
+  (`crates/gateway-serve/src/wire_v1.rs:180`, `error_msg(sub, code, message)`); в `origin/main`
+  стоит `9` после `M-68`. Второй бамп с отставшей ветки столкнулся бы с этой линией и объявил
+  бы недействительным то, что не менялось.
 
 ## Allowed paths
 
@@ -50,7 +52,7 @@ STATUS: PROPOSED (2026-08-29, architect; **rev 2 — 2026-08-31, закрыти�
 | `scripts/verify_M-72.sh` | **architect** |
 | `milestones/M-72-subscription-terminality.md` | **architect** (dev правит ТОЛЬКО колонку Status) |
 | `crates/gateway/src/lib.rs` · `crates/gateway-serve/src/lib.rs` | **engine-dev** (impl) |
-| `docs/rfc/CT-RFC-09-ws-session.md` | **architect**, и только при исходе (а) задачи 5 |
+| `docs/rfc/CT-RFC-09-ws-session.md` | **architect** — §2.10 внесён по решению `C-190` |
 
 ## Forbidden paths
 
@@ -81,7 +83,7 @@ STATUS: PROPOSED (2026-08-29, architect; **rev 2 — 2026-08-31, закрыти�
 | 2 | ✅ DONE (rev 2) | **RED на `TD-177` — ИСПОЛНИМ и КРАСЕН**, не COMPILE-RED. Переписан по `C-190` B-1 против СУЩЕСТВУЮЩЕГО шва `test_sync::rendezvous`; выдуманный `test_seam` снят. По `C-190` B-2 добавлена СВЕЖАЯ дописка ETH ПОСЛЕ switch+release и опознание кадра ПО ЦЕНЕ (`Frame` селектора не несёт), плюс страж «кадр старого инструмента под чужим id». Выполнимость предъявлена прогоном в ОБЕ стороны: против текущего кода `FAILED` с телом ошибки, против прототипа фикса — `3 passed`; `E-1`/`E-2` зелены в обеих конфигурациях | architect | `cargo test -p gateway-serve --features testing --test red_ws_terminality_entrypoint td177_stale_pump_does_not_kill_new_sub` | там же |
 | 3 | ⏳ OPEN | **Фикс `TD-177` — ТОЛЬКО сверка поколения.** Половина «внести тестовый шов» СНЯТА (`C-190` B-1): шов существует и подключён. Снятие подписки сверяет generation теми же тремя условиями, что и сохранение (`!drained && current_gen == Some(gen_at_pump)`). ОБА пути: `crates/gateway-serve/src/lib.rs:1401` (v1) и `:1806`-класс (legacy). Комментарий `:1290-1306`, объявляющий свойство действующим, приводится к коду. Форма фикса на v1-пути предъявлена прототипом architect'а и роняет красное в зелёное; legacy-путь dev закрывает сам, тем же условием | engine-dev | задача 2 GREEN под `--features testing` | `crates/gateway-serve/src/lib.rs` |
 | 4 | ✅ DONE | **RED на `TD-179`** (написан и КРАСЕН: `frame crc mismatch`, курсор `None → Some(767)` при нуле отданных кадров; позитивный контроль `M-1` зелёный): `Err` из середины `pump` (не по пределу) при ≥1 уже закрытом батче. Ожидание: собранные кадры НЕ теряются, серия потребителя равна реплею того же окна (`VB-I-2`), либо подписка терминируется с извещением. Сегодня падает: `self.cursor = cursor` на `:3579` уже продвинут, `frames` уносится `?` на `:3551` | architect | `cargo test -p gateway --test red_pump_midstream_failure` | `crates/gateway/tests/red_pump_midstream_failure.rs` |
-| 5 | ⏳ OPEN | **Решение формы извещения** (см. Contract impact) + фикс `TD-179` по выбранной форме | critic решает форму → engine-dev impl | задача 4 GREEN | `crates/gateway/src/lib.rs`, при (а) — `docs/rfc/CT-RFC-09-ws-session.md` |
+| 5 | 🚧 RED ГОТОВ | **Форма РЕШЕНА критиком** (`C-190`) и записана в `CT-RFC-09` §2.10; **оракулы на ПРОВОДЕ написаны и КРАСНЫ**: `E-3` (отказ чтения посреди догона ⇒ `subscription_terminated`/`pump_failed`, инъекция порчи CRC в тело последнего сегмента, независимый setup-guard) и усиленный `E-2` (1b) (тот же код с `reason: response_limit_exceeded` вместо нынешней лжи `invalid_selector`). Осталось: фикс. **ФИКС ТОТ ЖЕ, ЧТО У ЗАДАЧИ 3** — предъявлено прототипом: условие снятия `!drained && current_gen == Some(gen_at_pump)` закрывает `TD-177`, а ветка извещения внутри него закрывает `TD-179`; против прототипа `4 passed` | ~~critic форма~~ → engine-dev | `cargo test -p gateway-serve --test red_ws_terminality_entrypoint` | `crates/gateway/src/lib.rs`, `crates/gateway-serve/src/{lib.rs,wire_v1.rs}` |
 | 6 | 🚧 RED ГОТОВ | **`TD-180`** (MINOR): `snapshot()` отдаёт `cursor: self.cursor` (`crates/gateway/src/lib.rs:3714`) в окне, где батч свёрнут в состояние, но отвергнут пределом. **Форма РЕШЕНА** (§«Форма задачи 6»), **оракул написан и КРАСЕН** (`S-1` ok, `S-2` FAILED: `None` против `Some(24999)`); выполнимость предъявлена — против фикса оба зелены, соседние оракулы не ломаются. Осталось: фикс | ~~architect форма~~ → engine-dev | `cargo test -p gateway --test red_snapshot_cursor_honesty` | `crates/gateway/tests/red_snapshot_cursor_honesty.rs` |
 | 7 | ✅ DONE | **Приземлён оракул `P7`** (`3c91816`; `red_egress_cap_paths` 8 passed, `EXPECT_P` 7→8) со спас-рефа `refs/salvage/2026-08-28-P7/m71-terminality-oracle` (`27e8a5f`) — правдивость признака терминальности. Мутационный контроль исполнен на прошлом круге, предел чувствительности назван внутри самого оракула | architect | `cargo test -p gateway --test red_egress_cap_paths` | `crates/gateway/tests/` |
 | 8 | ⏳ OPEN | **Снять ЛИТЕРАЛЬНЫЙ путь `scripts/verify_M-71.sh`** из комментария `crates/gateway/src/lib.rs:1964`. Якорь `MUT-ANCHOR M-71-LIMIT` функционален и ОСТАЁТСЯ — снимается только литеральный путь. **Второй носитель СНЯТ architect'ом этим же кругом** (`C-190` B-4: обещание починить не является закоммиченным артефактом): в `crates/gateway-serve/tests/red_ws_terminality_entrypoint.rs` литерала больше нет, замер `grep -c` → 0. Критерий задачи теперь ДОСТИЖИМ исполнителем | engine-dev | `git grep -c 'scripts/verify_M-71' crates/ deploy/` → 0 | `crates/gateway/src/lib.rs` |
@@ -234,6 +236,9 @@ $ grep -n 'test_sync' crates/gateway-serve/tests/red_ws_session.rs
 - `crates/gateway-serve/tests/red_ws_terminality_entrypoint.rs` — задачи 1, 2
 - `crates/gateway/tests/red_pump_midstream_failure.rs` — задача 4
 - `crates/gateway/tests/red_snapshot_cursor_honesty.rs` — задача 6
+- `crates/gateway-serve/tests/red_ws_terminality_entrypoint.rs` — задача 5 на ПРОВОДЕ:
+  `e3_non_cap_midstream_failure_terminates_with_pump_failed_reason` (новый) и усиленный
+  `td_178_e2_*` (1b). Оба КРАСНЫ; выполнимость предъявлена прототипом (`4 passed`)
 
 **Достижимость харнесса предъявлена, а не предположена.** Живая WS-сессия уже гоняется
 девятнадцатью тестами в `crates/gateway-serve/tests/` (`red_ws_session.rs`,
