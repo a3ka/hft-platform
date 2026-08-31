@@ -302,7 +302,7 @@ $ grep -c L2Delta crates/journal/tests/red_det_replay_digest.rs
 - `scripts/verify_M-45.sh` (**architect only**);
 - `docs/data-epochs.md`, этот файл;
 - **`docker-compose.yml` — в части `L2DELTA_CAPTURE_SYMBOLS` и `EPOCH_ID`** (engine-dev,
-  задача 7). **Добавлено 2026-08-31.** Прежняя редакция §Allowed paths раскатку НЕ
+  **задача 6**, раскатка). **Добавлено 2026-08-31.** Прежняя редакция §Allowed paths раскатку НЕ
   ПОКРЫВАЛА: спека предписывала смену состава (задача 6), а путь, которым состав меняется,
   сама же не разрешала. Тот же класс, что `A-028` §3 п.1 на `M-74` — «спека не вправе
   называть шаг, чей путь сама не разрешает»; там он стоил REJECT'а.
