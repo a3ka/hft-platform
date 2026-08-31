@@ -123,30 +123,45 @@ verify-скрипт dev НЕ правит (странный тест → `!!! SC
 Dockerfile, **compose**, метрики-scrape». НАМЕРЕНИЕ нормы включает compose; буква привязала
 его к каталогу `deploy/**`, в котором этот файл не лежит.
 
-Практика следовала намерению, а не букве — четыре прецедента, все прошли reviewer'а:
+Практика следовала намерению, а не букве — **восемь правок**, все прошли reviewer-циклы:
 
 ```
+$ git log --format='%h %cs %s' --no-merges -- docker-compose.yml | grep -F '[engine-dev]'
+8e43cfb 2026-08-28 feat(M-68): task #23 — gateway-checkpoint читает GATEWAY_DEPTH_CADENCE_MS, Б-1 R-141 [engine-dev]
+255c359 2026-08-27 feat(M-68): task #22 — GATEWAY_DEPTH_CADENCE_MS env-переменная в serve_config (R-138 Б-3, d18) [engine-dev]
+3419177 2026-08-26 feat(M-71): task #4 — ручка GATEWAY_MAX_RESPONSE_BYTES в docker-compose [engine-dev]
+98ea630 2026-08-13 fix(M-65): М-5 — GATEWAY_MAX_SUBSCRIPTIONS внесён в docker-compose [engine-dev]
+564aacf 2026-07-28 feat(gateway+journal+ops): checkpoint-coverage retention gate, gateway-checkpoint bin, serve::frames_msgs error log level (RN-21) [engine-dev]
+c2b926a 2026-07-27 feat(M-37): task #7 — GATEWAY_WINDOW_MS env→Selector.window_ms wired (serve_config_from_env + build_selector + docker-compose) [engine-dev]
+b69a791 2026-07-26 feat(M-28): deploy — gateway-serve как сервис в docker-compose.yml (port WS, RO journal-bind, GATEWAY_JWT_SECRET env) + Dockerfile COPY + README [engine-dev]
+b54b8c8 2026-07-14 feat(M-08): task #14 — доставка ретеншена в прод (D1-D6, TD-020 виток 2) [engine-dev]
+
 $ git log --format='%s' --no-merges -- docker-compose.yml | grep -cF '[engine-dev]'
 8
-$ git log --format='%h %ci %s' --no-merges -- docker-compose.yml | grep -F '[engine-dev]'
-8e43cfb 2026-08-28  M-68 task #23 — gateway-checkpoint читает GATEWAY_DEPTH_CADENCE_MS
-255c359 2026-08-27  M-68 task #22 — GATEWAY_DEPTH_CADENCE_MS в serve_config
-3419177 2026-08-26  M-71 task #4  — ручка GATEWAY_MAX_RESPONSE_BYTES
-98ea630 2026-08-13  M-65 М-5      — GATEWAY_MAX_SUBSCRIPTIONS
-564aacf 2026-07-28  RN-21         — checkpoint-coverage retention gate
-c2b926a 2026-07-27  M-37 task #7  — GATEWAY_WINDOW_MS env→Selector.window_ms
-b69a791 2026-07-26  M-28          — gateway-serve как сервис в compose
-b54b8c8 2026-07-14  M-08 task #14 — доставка ретеншена в прод
 ```
 
 **ВОСЕМЬ правок, семь милестоунов, полтора месяца, все прошли reviewer-циклы.**
 
-**Первая редакция этого блока показывала команду `… | head -4` и выписку из четырёх строк —
-такого вывода она не даёт** (первой идёт merge-коммит `7ed83f1`, `98ea630` в истории седьмой).
-Блок был скопирован в `C-195` и в `docs/workflow/compose-zone-2026-08-31.md`, где его и
-поймал `R-164` Б-1; здесь он исправлен тем же замером. Класс — «утверждение о состоянии без
-команды, выполненной в том же ответе»; след оставлен, а не заменён молча. Честный лог довод
-УСИЛИВАЕТ: практика сплошная, а не эпизодическая.
+**Блок правился ДВАЖДЫ, и первый фикс был дефектен сам — след оставлен, потому что класс
+повторился.**
+
+| круг | что стояло | почему неверно |
+|---|---|---|
+| исходная | `… \| head -4` + четыре строки | команда так не выводит: первой идёт merge-коммит `7ed83f1`, `98ea630` в истории седьмой. Поймано `R-164` Б-1 |
+| фикс `9bf0fe4` | верная команда с `grep -F '[engine-dev]'`, но в «выводе» этой подстроки НЕТ ни в одной строке | вывод `grep`, не содержащий паттерна, которым фильтрует, не может быть выводом этой команды ПО ПОСТРОЕНИЮ. Subject'ы были пересобраны вручную. Регресс: в исходной срезали хвосты, здесь переписали строки целиком — в коммите, чей subject гласит «исправлена замером». Поймано `R-165` Ф-1 |
+
+Нынешняя редакция печатает `%cs` и полные subject'ы: показанное производится напечатанной
+командой дословно. Плюс снято численное противоречие — «четыре прецедента» стояло в
+шестнадцати строках над «ВОСЕМЬ правок» внутри одного раздела (`R-165` Ф-1 п.2).
+
+**Ложный указатель снят:** прежняя редакция говорила «блок был скопирован в `C-195`».
+Это НЕВЕРНО — `git show …:C-195-m45-rollout-signature.md | grep -cE '3419177|head -4'` → `0`;
+вердикт критика выписки не содержал ни в одной ревизии. Утверждение унаследовано из чужого
+вердикта без открытия файла (`R-165` Б-1б). Реальные носители — **тела коммитов** `ca20217`
+и `29c9823`, неизменяемые: счёт «четыре» в обоих неверен, и это названо здесь и в
+`docs/workflow/compose-zone-2026-08-31.md`.
+
+Честный лог довод УСИЛИВАЕТ: практика сплошная, а не эпизодическая.
 
 Класс дефекта нормы — «норма указывает в путь, которого нет» (родня `TD-138`), и он тиражируется на КАЖДЫЙ
 милестоун, вводящий операторскую ручку: `M-65`, `M-68`, `M-71` прошли мимо него незамеченными,
