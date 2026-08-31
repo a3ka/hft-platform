@@ -168,7 +168,7 @@ exit=0
 === HANDOFF: CRITIC → FOUNDER ===
 
 ## §A — Метаданные
-- Дата (UTC, ISO-8601): 2026-08-31T12:xxZ
+- Дата (UTC, ISO-8601): 2026-08-31T12:14Z
 - Milestone: M-74-restore-drill
 - Статус: BLOCKED — terminal round 4
 - HEAD: 68dc5b2 — spec(M-74): C-189 B-1 — вызов читателя становится КОНТРАКТОМ обёртки [architect]
