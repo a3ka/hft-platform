@@ -1,6 +1,7 @@
 # M-45 — расширение L2Delta-эмиссии: allow-list из хардкода в конфиг
 
-**Статус:** СПЕКА ГОТОВА; **раскатка блокирована Границей C** (две подписи founder'а — §Граница C).
+**Статус:** **РЕАЛИЗАЦИЯ ЗАКРЫТА И В `main`; раскатка ПОДПИСАНА 2026-08-31** (`П-026`) и ждёт
+исполнения. Оракулы: 53/53 зелены на `main` `d77398d` (23 spot + 21 futures + 9 `DET-I-1`).
 Реализация и merge — НЕ блокированы (см. «Ключевое решение» ниже).
 **Founder-подпись на сам milestone:** 2026-07-27 (объём — «расширить охват», механизм есть с M-18).
 **Основание объёма:** `docs/rfc/CT-RFC-06-l2delta.md` §8.1 (после critic `C-045` PASS и
@@ -299,7 +300,12 @@ $ grep -c L2Delta crates/journal/tests/red_det_replay_digest.rs
 - `crates/venue-binance/tests/**`, `crates/venue-binance-futures/tests/**`,
   `crates/journal/tests/red_det_replay_digest.rs` (**architect only**, задачи 4);
 - `scripts/verify_M-45.sh` (**architect only**);
-- `docs/data-epochs.md`, этот файл.
+- `docs/data-epochs.md`, этот файл;
+- **`docker-compose.yml` — в части `L2DELTA_CAPTURE_SYMBOLS` и `EPOCH_ID`** (engine-dev,
+  задача 7). **Добавлено 2026-08-31.** Прежняя редакция §Allowed paths раскатку НЕ
+  ПОКРЫВАЛА: спека предписывала смену состава (задача 6), а путь, которым состав меняется,
+  сама же не разрешала. Тот же класс, что `A-028` §3 п.1 на `M-74` — «спека не вправе
+  называть шаг, чей путь сама не разрешает»; там он стоил REJECT'а.
 
 **Запрещено безусловно:** `crates/contracts/**` (T1 — форма не меняется, §0) ·
 `crates/risk/**`, `crates/killswitch/**` (sacred) · любой order-path (submit/cancel/auth
