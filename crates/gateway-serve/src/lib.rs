@@ -2076,6 +2076,17 @@ pub fn serve_config_from_env(
         ));
     }
 
+    match get("GATEWAY_HEATMAP_WINDOW") {
+        None => gateway::set_effective_heatmap_window_frac(gateway::DEFAULT_HEATMAP_WINDOW_FRAC),
+        Some(raw) => {
+            let w: f64 = raw.trim().parse().map_err(|e| format!("GATEWAY_HEATMAP_WINDOW parse: {e}"))?;
+            if !(w.is_finite() && w > 0.0 && w < 1.0) {
+                return Err(format!("GATEWAY_HEATMAP_WINDOW={w} вне (0, 1) — окно есть доля от mid"));
+            }
+            gateway::set_effective_heatmap_window_frac(w);
+        }
+    }
+
     let bands: Vec<f64> = get("GATEWAY_BANDS")
         .unwrap_or_else(|| "0.001".to_string())
         .split(',')

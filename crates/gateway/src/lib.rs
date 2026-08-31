@@ -116,6 +116,18 @@ pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 2_000_000;
 /// чужое/сброшенное эффективное значение», тот же, что `GW-I-14` чинил для окна.
 static EFFECTIVE_MAX_RESPONSE_BYTES: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_RESPONSE_BYTES);
 
+/// ПРОТОТИП M-75 (B-5 инвентарь) — откатывается.
+pub const DEFAULT_HEATMAP_WINDOW_FRAC: f64 = 0.001;
+static EFFECTIVE_HEATMAP_WINDOW_BITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub fn effective_heatmap_window_frac() -> f64 {
+    let b = EFFECTIVE_HEATMAP_WINDOW_BITS.load(Ordering::Relaxed);
+    if b == 0 { DEFAULT_HEATMAP_WINDOW_FRAC } else { f64::from_bits(b) }
+}
+pub fn set_effective_heatmap_window_frac(w: f64) {
+    EFFECTIVE_HEATMAP_WINDOW_BITS.store(w.to_bits(), Ordering::Relaxed);
+}
+
 /// Получить эффективный предел объёма ответа в байтах сериализованной `SeriesBundle`.
 /// Дефолт — `DEFAULT_MAX_RESPONSE_BYTES` (`П-020`).
 ///
@@ -1554,7 +1566,7 @@ fn build_heatmap_and_cob(
     selector: &Selector,
     heatmap_buckets: &BTreeMap<i64, HeatmapBucketState>,
 ) -> (Vec<HeatmapCell>, Vec<CobLevel>) {
-    let w = selector.bands.iter().copied().fold(0.0_f64, f64::max);
+    let w = effective_heatmap_window_frac(); // ПРОТОТИП
     let mut heatmap_out: Vec<HeatmapCell> = Vec::new();
     let mut last_cob_bids: Vec<(i64, i64)> = Vec::new();
     let mut last_cob_asks: Vec<(i64, i64)> = Vec::new();

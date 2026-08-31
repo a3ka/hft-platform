@@ -73,6 +73,17 @@ fn journal_of(events: Vec<EventKind>) -> tempfile::TempDir {
 }
 
 fn sel(bands: Vec<f64>) -> Selector {
+    // M-75 (`C-198` B-5): окно heatmap/COB БОЛЬШЕ НЕ выводится из `Selector.bands` — оно
+    // серверное. Оракулы этого файла строились, когда окно было `max(bands)`, и их предмет
+    // (глубина карты/COB, объём ответа) от охвата ЗАВИСИТ. Приём восстановления предмета:
+    // ставим СЕРВЕРНОЕ окно равным тому, что прежде давал селектор, — смысл каждого теста
+    // сохраняется дословно, меняется лишь ИСТОЧНИК величины.
+    //
+    // Настройка процессно-глобальна ⇒ тесты, зависящие от охвата, идут под `serial()`.
+    let w = bands.iter().copied().fold(0.0_f64, f64::max);
+    if w > 0.0 {
+        gateway::set_effective_heatmap_window_frac(w);
+    }
     Selector {
         venue: Venue::Binance,
         symbol: "BTCUSDT".to_string(),
