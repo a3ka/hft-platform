@@ -204,6 +204,86 @@ else
   fi
 fi
 
+echo "--- T10: задача 7 (РАСКАТКА) — обе переменные на сервисе recorder, ОДНИМ коммитом ---"
+# Добавлено по `C-195` B-2: задача 7 была объявлена в §Tasks и НЕ ИМЕЛА проверки — гейт
+# проходил зелёным, пока обеих env-строк в compose нет вовсе. Ссылка задачи на `П-026`
+# §Порядок — инструкция, а не оракул: она ничего не делает красным до исполнения.
+#
+# Проверка судит КОНФИГУРАЦИЮ, а не текст документации: YAML разбирается, сервис ищется по
+# `container_name: hft-recorder` (тот, что реально пишет журнал), переменные читаются из его
+# `environment`. Греп по файлу целиком дал бы зелёное на упоминании в комментарии соседнего
+# сервиса — ровно класс `M-45` §D-1 («гейт по форме текста обходится сдвигом на уровень»).
+#
+# FAIL-CLOSED НА СОБСТВЕННУЮ ПРИМЕНИМОСТЬ: нет `pyyaml`, нет файла, не найден сервис —
+# ОТКАЗ, а не тихий пропуск. Проверка, молчащая при несостоявшемся setup, есть плацебо
+# самой себя (`testing.md` §«Целостность гейта» св. 3-4).
+T10_OUT="$(python3 - <<'PY' 2>&1
+import sys
+try:
+    import yaml
+except Exception as e:
+    print(f"SETUP: pyyaml недоступен ({e}) — проверка задачи 7 не может состояться"); sys.exit(2)
+try:
+    doc = yaml.safe_load(open("docker-compose.yml"))
+except Exception as e:
+    print(f"SETUP: docker-compose.yml не разобран: {e}"); sys.exit(2)
+svcs = (doc or {}).get("services") or {}
+rec = [v for v in svcs.values() if isinstance(v, dict) and v.get("container_name") == "hft-recorder"]
+if len(rec) != 1:
+    print(f"SETUP: сервис с container_name=hft-recorder найден {len(rec)} раз — судить нечего"); sys.exit(2)
+env = rec[0].get("environment") or {}
+if isinstance(env, list):  # форма ["K=V", ...]
+    env = dict(x.split("=", 1) for x in env if "=" in x)
+miss = [k for k in ("L2DELTA_CAPTURE_SYMBOLS", "EPOCH_ID") if k not in env]
+if miss:
+    print("ОТСУТСТВУЮТ на сервисе recorder: " + ", ".join(miss)); sys.exit(1)
+sym, epoch = str(env["L2DELTA_CAPTURE_SYMBOLS"]), str(env["EPOCH_ID"])
+bad = []
+# П-026 подписала ETHUSDT В ДОБАВЛЕНИЕ к BTCUSDT: потеря BTC была бы сужением состава,
+# которого подпись не давала.
+if "ETHUSDT" not in sym.upper(): bad.append(f"L2DELTA_CAPTURE_SYMBOLS не содержит ETHUSDT (П-026): {sym!r}")
+if "BTCUSDT" not in sym.upper(): bad.append(f"L2DELTA_CAPTURE_SYMBOLS потерял BTCUSDT (сужение состава без подписи): {sym!r}")
+# E-002: граница эпохи обязана быть ПРЕДЪЯВИМЫМ фактом, а не дефолтом по часам
+# (`own-<YYYY-MM>` из crates/recorder/src/main.rs). Пустое значение и голая подстановка
+# без дефолта дают ровно тот случайный момент перезапуска, который E-002 запрещает.
+e = epoch.strip()
+if not e or e in ("${EPOCH_ID}", "${EPOCH_ID:-}"): bad.append(f"EPOCH_ID не задан явным значением: {epoch!r}")
+if bad:
+    print("; ".join(bad)); sys.exit(1)
+print(f"OK L2DELTA_CAPTURE_SYMBOLS={sym} EPOCH_ID={epoch}")
+PY
+)"; T10_ST=$?
+if [ "$T10_ST" -eq 0 ]; then
+  pass "T10 обе переменные раскатки на сервисе recorder ($T10_OUT)"
+elif [ "$T10_ST" -eq 2 ]; then
+  fail "T10 SETUP НЕ СОСТОЯЛСЯ — $T10_OUT"
+else
+  fail "T10 задача 7 НЕ исполнена — $T10_OUT"
+fi
+
+# Вторая половина задачи 7: ОДНИМ коммитом. Раскатка в два шага оставляет окно, где состав
+# уже расширен, а эпоха ещё прежняя (или наоборот) — то есть события двух составов попадают
+# под один `epoch_id` и становятся машинно неразличимы. Это класс `E-001`, стоивший разбора
+# 123 млн событий, и `M-45` §2 называет его «остаточным классом» прямо.
+#
+# ПРИЗНАК ПРОВЕРЕН НА РАЗЛИЧАЮЩУЮ СИЛУ (`Р-4`), и первая редакция его НЕ ИМЕЛА. Замер:
+#   git log -S'EPOCH_ID'       -- docker-compose.yml  →  4aca3f6   ← КОММЕНТАРИЙ, не ключ
+#   git log -G'^\s*EPOCH_ID:'  -- docker-compose.yml  →  (пусто)   ← настоящий YAML-ключ
+# `-S` считает вхождения ПОДСТРОКИ и поймал фразу «требует нового EPOCH_ID» из комментария
+# соседней правки — то есть краснел на предмете, которого нет. Якорь `^\s*КЛЮЧ:` через `-G`
+# различает ОБЪЯВЛЕНИЕ от УПОМИНАНИЯ. Поймано прогоном пробы, а не рассуждением.
+if [ "$T10_ST" -eq 0 ]; then
+  C_SYM="$(git log -1 --format=%H -G'^\s*L2DELTA_CAPTURE_SYMBOLS:' -- docker-compose.yml 2>/dev/null)"
+  C_EPO="$(git log -1 --format=%H -G'^\s*EPOCH_ID:' -- docker-compose.yml 2>/dev/null)"
+  if [ -z "$C_SYM" ] || [ -z "$C_EPO" ]; then
+    fail "T10b переменные есть в рабочем дереве, но НЕ В ИСТОРИИ — раскатка не закоммичена, судить об одном коммите нечего (sym=${C_SYM:-нет} epoch=${C_EPO:-нет})"
+  elif [ "$C_SYM" = "$C_EPO" ]; then
+    pass "T10b состав и эпоха внесены ОДНИМ коммитом (${C_SYM:0:8})"
+  else
+    fail "T10b состав и эпоха внесены РАЗНЫМИ коммитами (${C_SYM:0:8} против ${C_EPO:0:8}) — между ними события двух составов пишутся под одним epoch_id (класс E-001)"
+  fi
+fi
+
 echo
 if [ "$FAILED" -gt 0 ]; then
   echo "VERDICT: FAIL ($FAILED нарушений)"
