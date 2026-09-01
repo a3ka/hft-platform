@@ -15,6 +15,34 @@
 # Форма гейта — .claude/rules/gates.md §3: явный FAIL-счётчик + exit 1 при FAIL>0,
 # никакого `cmd && echo PASS || echo FAIL` (маскирует провал).
 
+# ═══ ПЕРЕЧЕНЬ СТРАЖЕЙ ПРИСУТСТВИЯ — ВЫПИСАН НАМЕРЕННО (`A-031` §1 п.1) ═══
+#
+# Класс «страж проверяет ПРИЗНАК ШИРЕ, чем требование» сработал в этом гейте ВОСЕМЬ раз.
+# Разбор — `milestones/M-45-persist-l2delta.md` §3septies. Решающее уточнение арбитра:
+# закрывает класс не привязка названных стражей, а ВЫПИСАННАЯ ГРУППА — правило `Р-3`
+# (`docs/workflow/oracle-blindness-class-2026-08-28.md` §5) на уровне самих стражей:
+# «опасна ровно та группа, которая НЕ ВЫПИСАНА». Носители №5–№8 жили именно потому, что
+# перечня не существовало и каждый чинился по указанию вердикта.
+#
+# ПРАВИЛО ВЕДЕНИЯ: добавил страж присутствия — добавь строку сюда. Предмет наблюдения
+# обязан совпадать с предметом требования; не совпадает — чини либо назови предел строкой.
+#
+# | шаг  | требование                              | предмет наблюдения (чем пиннится)          |
+# |------|-----------------------------------------|--------------------------------------------|
+# | T0   | оракулы M-45 на месте                   | наличие файлов + их ИСПОЛНЕНИЕ в T3/T4/T5b |
+# | T3   | эталон PROD_DEFAULT не подменён          | `^const PROD_DEFAULT … = &["BTCUSDT"];`    |
+# | T4   | негативный путь и регистр живы           | `ok. [1-9]` + ДВА имени теста поимённо     |
+# | T5   | нет обходного пути эмиссии               | единственный call-site + поведенческий T5b |
+# | T6   | оракул сырого захвата жив                | СВОЙ таргет на крейт; нет файла = FAIL     |
+# | T8   | DET-I-1 несёт фикстуру L2Delta           | конструкция `MdPayload::L2Delta {` + имя   |
+# | T9   | эпоха названа ЗАПИСЬЮ E-002              | раздел E-002 И строка ячейки факта         |
+# | T10  | состав и эпоха на сервисе recorder       | разбор YAML через общий CLI                |
+# | T10b | внесены ОДНИМ коммитом                   | `git log -G` по якорю `^\s*КЛЮЧ:`          |
+# | T10c | различающая сила T10 предъявлена         | тот же CLI + setup-guard на каждый мир     |
+#
+# НАЗВАННЫЙ ПРЕДЕЛ: механизм пиннит ФОРМУ (заголовок раздела, строку ячейки, конструкцию,
+# имя теста). Что текст внутри ячейки ОСМЫСЛЕН — он не доказывает; это держит круг гейта.
+
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -26,6 +54,15 @@ fail() { echo "FAIL  $*"; FAILED=$((FAILED + 1)); }
 
 SPOT_ORACLE="crates/venue-binance/tests/red_l2delta_allowlist.rs"
 PERP_ORACLE="crates/venue-binance-futures/tests/red_l2delta_allowlist.rs"
+
+# Путь allow-list-оракула по имени крейта — нужен поимённым пинам `T4` (`A-031` П-3).
+oracle_of() {
+  case "$1" in
+    venue-binance)         printf '%s' "$SPOT_ORACLE" ;;
+    venue-binance-futures) printf '%s' "$PERP_ORACLE" ;;
+    *)                     printf '%s' "/несуществующий-крейт-$1" ;;
+  esac
+}
 
 echo "--- T0: оракулы M-45 на месте (sacred, architect-only) ---"
 for f in "$SPOT_ORACLE" "$PERP_ORACLE"; do
@@ -75,8 +112,12 @@ done
 
 # Анти-подлог: оракул обязан сравнивать с BTCUSDT, а не с чем угодно. Если константу
 # ожидания в самом оракуле подменят, T3 выше станет зелёным ложно.
+# `A-031` П-1 (носитель №6): якорь к НАЧАЛУ ОБЪЯВЛЕНИЯ. Прежний предикат искал литерал
+# ГДЕ УГОДНО в файле и обманывался комментарием: строка `// прежний вид: PROD_DEFAULT: …`
+# рядом с подменённой константой давала PASS. Та же форма, что носитель №5 (T8), — и фикс
+# №5 прошёл мимо неё, потому что перечень стражей нигде не был ВЫПИСАН (см. шапку).
 for f in "$SPOT_ORACLE" "$PERP_ORACLE"; do
-  if grep -qE 'PROD_DEFAULT: &\[&str\] = &\["BTCUSDT"\]' "$f"; then
+  if grep -qE '^[[:space:]]*const PROD_DEFAULT: &\[&str\] = &\["BTCUSDT"\];' "$f"; then
     pass "T3 ожидаемый дефолт в оракуле не подменён: $f"
   else
     fail "T3 в оракуле $f изменена эталонная константа PROD_DEFAULT — гейт потерял смысл"
@@ -85,12 +126,20 @@ done
 
 echo "--- T4: негативный путь и регистр (анти-плацебо: без них 'капчить всегда' проходит) ---"
 for crate in venue-binance venue-binance-futures; do
+  # `A-031` П-3 (носитель №8): предикат без `[1-9]` принимал «ok. 0 passed» (всё
+  # отфильтровано), а заявленные заголовком негативный путь и регистр не были запиннены
+  # НИ ОДНИМ именем — удаление именно их оставляло шаг зелёным.
   if cargo test -p "$crate" --test red_l2delta_allowlist >/tmp/m45-allow-$crate.log 2>&1 \
-     && grep -qE "^test result: ok\." /tmp/m45-allow-$crate.log; then
+     && grep -qE "^test result: ok\. [1-9]" /tmp/m45-allow-$crate.log \
+     && grep -q 'o2_symbol_outside_allowlist_is_not_captured' "$(oracle_of "$crate")" \
+     && grep -q 'o4_config_case_does_not_silently_disable_capture' "$(oracle_of "$crate")"; then
     n=$(grep -cE "^test .* \.\.\. ok" /tmp/m45-allow-$crate.log)
-    pass "T4 $crate: allow-list оракул GREEN ($n тестов)"
+    pass "T4 $crate: allow-list оракул GREEN ($n тестов; негативный и регистровый запиннены поимённо)"
   else
-    fail "T4 $crate: allow-list оракул КРАСНЫЙ"; tail -30 /tmp/m45-allow-$crate.log
+    fail "T4 $crate: allow-list оракул КРАСНЫЙ, либо прогнано НОЛЬ тестов, либо снят \
+поимённо запиннутый негативный (o2_symbol_outside_allowlist_is_not_captured) или \
+регистровый (o4_config_case_does_not_silently_disable_capture) сценарий"
+    tail -30 /tmp/m45-allow-$crate.log
   fi
 done
 
@@ -107,10 +156,10 @@ echo "--- T5: НЕТ ОБХОДНОГО ПУТИ эмиссии мимо allow-l
 # точки решения. Любой второй call site = путь в обход allow-list.
 for crate in venue-binance venue-binance-futures; do
   calls=$(grep -rn 'l2delta_event(' "crates/$crate/src/" --include=*.rs 2>/dev/null \
-          | grep -vE 'fn l2delta_event|///|//!|^\s*//' | wc -l)
+          | grep -vE 'fn l2delta_event|///|//!|:[0-9]+:[[:space:]]*//' | wc -l)
   if [ "$calls" -eq 1 ]; then
     if grep -rn 'l2delta_event(' "crates/$crate/src/" --include=*.rs 2>/dev/null \
-         | grep -vE 'fn l2delta_event|///|//!|^\s*//' \
+         | grep -vE 'fn l2delta_event|///|//!|:[0-9]+:[[:space:]]*//' \
          | grep -q 'l2delta_emission_for\|emission_for' \
        || awk '/fn l2delta_emission_for/,/^}/' "crates/$crate/src/lib.rs" 2>/dev/null \
             | grep -q 'l2delta_event('; then
@@ -154,19 +203,29 @@ for crate in venue-binance venue-binance-futures; do
 done
 
 echo "--- T6: сырой L2Delta-транслятор не задет (T1-форма и семантика pu/U/u) ---"
+# `A-031` П-2 (носитель №7) — САМЫЙ ТЯЖЁЛЫЙ из трёх. Прежняя редакция принимала
+# «no test target» ЗА УСПЕХ: удаление sacred-оракула `red_l2delta_capture.rs` оставляло
+# ВЕСЬ гейт зелёным (`VERDICT: PASS`, воспроизведено арбитром и мной). Это нарушение
+# `testing.md` §«Целостность гейта» св. 4 — наблюдать ОТСУТСТВИЕ, а не только сбой.
+# Обоснование пропуска вдобавок было ЛОЖНЫМ: «покрыт общим прогоном T7», тогда как `T7` —
+# diff-проверка `crates/contracts/**` и не исполняет ни одного теста. Комментарий, лгущий
+# о конструкции гейта, — класс `A-030` §3 п.4.
+# Теперь у каждого крейта НАЗВАН свой таргет, и отсутствие файла = FAIL.
 for crate in venue-binance venue-binance-futures; do
-  if cargo test -p "$crate" --test red_l2delta_capture >/tmp/m45-capture-$crate.log 2>&1 \
-     && grep -qE "^test result: ok\." /tmp/m45-capture-$crate.log; then
-    pass "T6 $crate: оракул сырого захвата (M-18/CT-RFC-04) остался GREEN"
+  case "$crate" in
+    venue-binance)         cap_target=red_l2delta_capture ;;
+    venue-binance-futures) cap_target=red_l2delta_futures ;;
+  esac
+  if [ ! -f "crates/$crate/tests/$cap_target.rs" ]; then
+    fail "T6 $crate: sacred-оракул сырого захвата crates/$crate/tests/$cap_target.rs \
+ОТСУТСТВУЕТ — удаление оракула не является успехом (testing.md св. 4)"
+  elif cargo test -p "$crate" --test "$cap_target" >/tmp/m45-capture-$crate.log 2>&1 \
+     && grep -qE "^test result: ok\. [1-9]" /tmp/m45-capture-$crate.log; then
+    pass "T6 $crate: оракул сырого захвата $cap_target (M-18/CT-RFC-04) GREEN"
   else
-    # У перп-крейта имя файла может отличаться — отсутствие таргета не является провалом,
-    # провалом является КРАСНЫЙ существующий оракул.
-    if grep -q "no test target" /tmp/m45-capture-$crate.log; then
-      pass "T6 $crate: отдельного red_l2delta_capture нет (покрыт общим прогоном T7)"
-    else
-      fail "T6 $crate: оракул сырого захвата СЛОМАН — задета T1-форма или семантика continuity"
-      tail -20 /tmp/m45-capture-$crate.log
-    fi
+    fail "T6 $crate: оракул сырого захвата $cap_target СЛОМАН либо прогнал НОЛЬ тестов — \
+задета T1-форма или семантика continuity"
+    tail -20 /tmp/m45-capture-$crate.log
   fi
 done
 
@@ -234,12 +293,16 @@ elif [ "$T9_EPOCH" = "<ОТСУТСТВУЕТ>" ]; then
     fail "T9 дефолт кода изменён (обход конфига) БЕЗ раскатки — состав правится кодом, \
 это совершение решения Границы C минуя подпись (M-45 §1)"
   fi
+# `A-031` П-5: двойная привязка — РАЗДЕЛ `E-002` И СТРОКА ЯЧЕЙКИ факта. Одного раздела мало:
+# арбитр выпотрошил ячейку `| `EPOCH_ID` после |`, вписал литерал проходной фразой в прозу
+# того же раздела — и шаг остался зелёным. Факт живёт в структурированной строке таблицы,
+# значит пиннить надо её (`A-030` §1: класс 1 предпочтителен всегда, когда достижим).
 elif awk '/^## E-002/{f=1} f&&/^## /&&!/^## E-002/{exit} f' docs/data-epochs.md 2>/dev/null \
-       | grep -qF "$T9_EPOCH"; then
-  pass "T9 раскатка исполнена И эпоха '$T9_EPOCH' названа В РАЗДЕЛЕ E-002"
+       | grep -E '^\| *`EPOCH_ID` после *\|' | grep -qF "$T9_EPOCH"; then
+  pass "T9 раскатка исполнена И эпоха '$T9_EPOCH' стоит В ЯЧЕЙКЕ ФАКТА (E-002)"
 else
-  fail "T9 раскатка исполнена (EPOCH_ID='$T9_EPOCH'), но этого значения НЕТ В РАЗДЕЛЕ E-002 \
-файла docs/data-epochs.md — merge ветки триггерит деплой (deploy.yml paths: \
+  fail "T9 раскатка исполнена (EPOCH_ID='$T9_EPOCH'), но этого значения НЕТ В ЯЧЕЙКЕ \
+факта раздела E-002 файла docs/data-epochs.md — merge ветки триггерит деплой (deploy.yml paths: \
 docker-compose.yml), то есть состав сменится на проде, а запись СВОЕЙ эпохи не назовёт, чем \
 помечена граница (E-001). Вхождение литерала в ДРУГОЙ раздел не засчитывается: требование \
 R-167 Б-1 — чтобы эпоху называла запись, к которой она относится (C-204)"
