@@ -45,7 +45,10 @@ make_world() {
     while [ "$i" -lt "$decl_n" ]; do
       echo "<!-- ACTIVE-COMPOSITION"; echo "epoch_id: $d_epoch"
       echo "l2delta_symbols: $d_syms"; echo "signature: $d_sign"
-      [ "${DECL_MODE:-normal}" = dupfield ] && echo "signature: П-999"
+      # DUP_FIELD называет, КАКОЙ член группы дублируется: страж — цикл по выписанному
+      # массиву из трёх полей, и по `Р-3` фикстура нужна на КАЖДОГО члена, иначе снятие
+      # одного из цикла проба не заметит (`C-206` резолюция, кандидат (а)).
+      [ "${DECL_MODE:-normal}" = dupfield ] && echo "${DUP_FIELD:-signature}: П-999"
       [ "${DECL_MODE:-normal}" = unclosed ] || echo "-->"
       i=$((i+1))
     done; echo "проза после блока"; } > "$d/epochs.md"
@@ -90,6 +93,8 @@ run_case "поле декларации ПУСТО" 2 "$D_EMPTY"
 echo "--- НОВЫЕ СТРАЖИ (C-206 Б-3, Н-1): форма декларации ---"
 DECL_MODE=unclosed run_case "блок НЕ ЗАКРЫТ '-->' (awk брал бы всё до EOF)"  2 "$(DECL_MODE=unclosed make_world w_unclosed 'BTCUSDT,ETHUSDT' own-e 'BTCUSDT,ETHUSDT' own-e П-026 yes)"
 DECL_MODE=dupfield run_case "поле signature ДВАЖДЫ (судился бы первый)"      2 "$(DECL_MODE=dupfield make_world w_dup 'BTCUSDT,ETHUSDT' own-e 'BTCUSDT,ETHUSDT' own-e П-026 yes)"
+DECL_MODE=dupfield DUP_FIELD=epoch_id        run_case "поле epoch_id ДВАЖДЫ"         2 "$(DECL_MODE=dupfield DUP_FIELD=epoch_id make_world w_dup2 'BTCUSDT,ETHUSDT' own-e 'BTCUSDT,ETHUSDT' own-e П-026 yes)"
+DECL_MODE=dupfield DUP_FIELD=l2delta_symbols run_case "поле l2delta_symbols ДВАЖДЫ"  2 "$(DECL_MODE=dupfield DUP_FIELD=l2delta_symbols make_world w_dup3 'BTCUSDT,ETHUSDT' own-e 'BTCUSDT,ETHUSDT' own-e П-026 yes)"
 DECL_MODE=crlf     run_case "CRLF в декларации — честный мир, ЛОЖНОГО красного быть не должно" 0 "$(DECL_MODE=crlf make_world w_crlf 'BTCUSDT,ETHUSDT' own-e 'BTCUSDT,ETHUSDT' own-e П-026 yes)"
 run_case "signature — ОБРАЗЕЦ '.*', а не идентификатор (инъекция в grep)"    1 "$(make_world w_inj 'BTCUSDT,ETHUSDT' own-e 'BTCUSDT,ETHUSDT' own-e '.*' yes)"
 run_case "signature не в форме П-<число>"                                    1 "$(make_world w_form 'BTCUSDT,ETHUSDT' own-e 'BTCUSDT,ETHUSDT' own-e 'П-абв' yes)"
@@ -105,11 +110,11 @@ link_world() {
     echo "    environment:"; echo "      L2DELTA_CAPTURE_SYMBOLS: BTCUSDT,ETHUSDT"; echo "      EPOCH_ID: own-base"; } > "$d/docker-compose.yml"
   printf '<!-- ACTIVE-COMPOSITION\nepoch_id: own-base\nl2delta_symbols: BTCUSDT,ETHUSDT\nsignature: П-026\n-->\n' > "$d/docs/e.md"
   printf '# sig\n## П-026 — ПОДПИСАНО\n## П-027 — ПОДПИСАНО\n' > "$d/docs/s.md"
-  git -C "$d" add -A >/dev/null; git -C "$d" commit -qm base >/dev/null
+  git -C "$d" add docker-compose.yml docs/e.md docs/s.md >/dev/null; git -C "$d" commit -qm base -- docker-compose.yml docs/e.md docs/s.md >/dev/null
   local base; base=$(git -C "$d" rev-parse HEAD)
   sed -i "s/L2DELTA_CAPTURE_SYMBOLS: .*/L2DELTA_CAPTURE_SYMBOLS: $syms2/; s/EPOCH_ID: .*/EPOCH_ID: $epoch2/" "$d/docker-compose.yml"
   printf '<!-- ACTIVE-COMPOSITION\nepoch_id: %s\nl2delta_symbols: %s\nsignature: %s\n-->\n' "$epoch2" "$syms2" "$sign2" > "$d/docs/e.md"
-  git -C "$d" add -A >/dev/null; git -C "$d" commit -qm head >/dev/null
+  git -C "$d" commit -qm head -- docker-compose.yml docs/e.md >/dev/null
   printf '%s|%s' "$d" "$base"
 }
 run_link() {

@@ -521,7 +521,14 @@ jobs:
     name: Rollout composition (состав записи = подписанному, TD-196)
     runs-on: ubuntu-latest
     steps:
+      # fetch-depth: 0 ОБЯЗАТЕЛЬНО (`C-206` N-5): барьер сверяет декларацию с её состоянием
+      # НА БАЗЕ через `git show $PR_BASE_SHA:…`. По умолчанию checkout даёт depth=1, и на
+      # pull_request в клоне лежит только merge-коммит — объекта базы НЕТ, барьер отказывает
+      # setup'ом (exit 2) и джоб краснеет на КАЖДОМ PR. Соседи, читающие PR_BASE_SHA
+      # (docs-freeze, gate-meta), несут эту строку по той же причине.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Установить pyyaml
         run: python3 -m pip install --quiet pyyaml
       # Барьер в ПРОД-ФОРМЕ, без переменных пробы. ЗАЧЕМ ЭТОТ ДЖОБ СУЩЕСТВУЕТ: состав
@@ -537,11 +544,11 @@ jobs:
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: bash scripts/check_rollout_composition.sh
 
-      # Проба ТОЙ ЖЕ проводкой (`testing.md` «целостность гейта»): 25 сценариев — позитивный
+      # Проба ТОЙ ЖЕ проводкой (`testing.md` «целостность гейта»): 27 сценариев — позитивный
       # контроль, расширение и сужение состава, обе формы подстановки (включая случай, где
       # равенство проходит и красное обязана дать проверка ФОРМЫ), разъезд эпохи, висячая
       # подпись, отсутствие ключей, и пять миров несостоявшегося setup'а с кодом 2.
-      - name: Проба барьера (25 сценариев)
+      - name: Проба барьера (27 сценариев)
         run: bash scripts/tests/red_rollout_composition.sh
 
   status-check:
