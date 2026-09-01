@@ -28,8 +28,6 @@ services:
       BINANCE_SYMBOLS: ${BINANCE_SYMBOLS:-BTCUSDT,ETHUSDT}
       BINANCE_FUTURES_SYMBOLS: ${BINANCE_FUTURES_SYMBOLS:-BTCUSDT,ETHUSDT}
       HL_COINS: ${HL_COINS:-BTC,ETH}
-      L2DELTA_CAPTURE_SYMBOLS: BTCUSDT,ETHUSDT
-      EPOCH_ID: own-2026-09-m45-ethusdt
     volumes:
       - journal-data:/journal
     healthcheck:
