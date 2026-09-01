@@ -178,16 +178,27 @@ else
 fi
 
 echo "--- T8: DET-I-1 на смешанном журнале (TD-072) ---"
-if grep -q "L2Delta" crates/journal/tests/red_det_replay_digest.rs 2>/dev/null; then
-  if cargo test -p journal --test red_det_replay_digest >/tmp/m45-det.log 2>&1 \
-     && grep -qE "^test result: ok\." /tmp/m45-det.log; then
-    pass "T8 DET-I-1 GREEN на смешанном журнале (снапшот+дельта)"
+# ТРЕТИЙ носитель класса «проверка присутствия ШИРЕ требования», найден грепом класса при
+# закрытии `C-204`, а не вердиктом. Прежний страж `grep -q "L2Delta"` совпадал с
+# КОММЕНТАРИЯМИ (`:599`, `:605`, `:758`, `:775` — четыре из шести вхождений): удали кто-нибудь
+# фикстуры, оставив прозу, и страж бы не заметил. Требование — «оракул СОДЕРЖИТ фикстуру
+# L2Delta», поэтому пиннится КОНСТРУКЦИЯ значения и ИМЯ теста, а не слово в файле.
+if grep -qE '^[[:space:]]*MdPayload::L2Delta \{' crates/journal/tests/red_det_replay_digest.rs \
+     2>/dev/null \
+   && grep -q 'fn det_9_mixed_snapshot_delta_journal_is_bit_identical_and_delta_sensitive' \
+     crates/journal/tests/red_det_replay_digest.rs 2>/dev/null; then
+  if cargo test -p journal --test red_det_replay_digest \
+       det_9_mixed_snapshot_delta_journal_is_bit_identical_and_delta_sensitive \
+       >/tmp/m45-det.log 2>&1 \
+     && grep -qE "^test result: ok\. [1-9]" /tmp/m45-det.log; then
+    pass "T8 DET-I-1 GREEN на смешанном журнале (снапшот+дельта; O-5 исполнен поимённо)"
   else
     fail "T8 DET-I-1 КРАСНЫЙ"; tail -20 /tmp/m45-det.log
   fi
 else
-  fail "T8 оракул DET-I-1 не содержит фикстур L2Delta (TD-072 не закрыт) — расширение \
-эмиссии уедет под оракулом, который расширенного потока не видел"
+  fail "T8 оракул DET-I-1 не содержит КОНСТРУКЦИИ фикстуры MdPayload::L2Delta либо теста \
+det_9_… (TD-072 не закрыт) — расширение эмиссии уехало бы под оракулом, который расширенного \
+потока не видел. Упоминание слова L2Delta в комментарии не засчитывается"
 fi
 
 echo "--- T9: эпоха ОБЪЯВЛЕНА в реестре, если раскатка исполнена (анти-E-001) ---"
@@ -223,12 +234,15 @@ elif [ "$T9_EPOCH" = "<ОТСУТСТВУЕТ>" ]; then
     fail "T9 дефолт кода изменён (обход конфига) БЕЗ раскатки — состав правится кодом, \
 это совершение решения Границы C минуя подпись (M-45 §1)"
   fi
-elif grep -qF "$T9_EPOCH" docs/data-epochs.md 2>/dev/null; then
-  pass "T9 раскатка исполнена И эпоха '$T9_EPOCH' названа в docs/data-epochs.md"
+elif awk '/^## E-002/{f=1} f&&/^## /&&!/^## E-002/{exit} f' docs/data-epochs.md 2>/dev/null \
+       | grep -qF "$T9_EPOCH"; then
+  pass "T9 раскатка исполнена И эпоха '$T9_EPOCH' названа В РАЗДЕЛЕ E-002"
 else
-  fail "T9 раскатка исполнена (EPOCH_ID='$T9_EPOCH'), но этого значения НЕТ в \
-docs/data-epochs.md — merge ветки триггерит деплой (deploy.yml paths: docker-compose.yml), \
-то есть состав сменится на проде, а реестр эпох не назовёт, чем помечена граница (E-001)"
+  fail "T9 раскатка исполнена (EPOCH_ID='$T9_EPOCH'), но этого значения НЕТ В РАЗДЕЛЕ E-002 \
+файла docs/data-epochs.md — merge ветки триггерит деплой (deploy.yml paths: \
+docker-compose.yml), то есть состав сменится на проде, а запись СВОЕЙ эпохи не назовёт, чем \
+помечена граница (E-001). Вхождение литерала в ДРУГОЙ раздел не засчитывается: требование \
+R-167 Б-1 — чтобы эпоху называла запись, к которой она относится (C-204)"
 fi
 
 echo "--- T10: задача 7 (РАСКАТКА) — обе переменные на сервисе recorder, ОДНИМ коммитом ---"
