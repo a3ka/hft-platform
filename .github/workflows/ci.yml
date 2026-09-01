@@ -517,14 +517,48 @@ jobs:
       - name: Проба барьера (счёт печатает сама проба)
         run: bash scripts/tests/red_review_fa.sh
 
+  rollout-composition:
+    name: Rollout composition (состав записи = подписанному, TD-196)
+    runs-on: ubuntu-latest
+    steps:
+      # fetch-depth: 0 ОБЯЗАТЕЛЬНО (`C-206` N-5): барьер сверяет декларацию с её состоянием
+      # НА БАЗЕ через `git show $PR_BASE_SHA:…`. По умолчанию checkout даёт depth=1, и на
+      # pull_request в клоне лежит только merge-коммит — объекта базы НЕТ, барьер отказывает
+      # setup'ом (exit 2) и джоб краснеет на КАЖДОМ PR. Соседи, читающие PR_BASE_SHA
+      # (docs-freeze, gate-meta), несут эту строку по той же причине.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Установить pyyaml
+        run: python3 -m pip install --quiet pyyaml
+      # Барьер в ПРОД-ФОРМЕ, без переменных пробы. ЗАЧЕМ ЭТОТ ДЖОБ СУЩЕСТВУЕТ: состав
+      # записываемых данных — граница C, и до `TD-196` его сторожил ТОЛЬКО milestone-гейт
+      # `verify_M-45.sh`, который CI не зовёт. Защита истекала в момент merge'а: следующий
+      # коммит, дописавший символ в `docker-compose.yml`, не встречал ни одного красного
+      # джоба. Здесь она становится постоянной и от милестоуна не зависит.
+      # База диапазона передаётся ЯВНО: без неё связка «состав↔эпоха↔подпись во времени»
+      # печатает громкий SKIP и не проверяется. Форма та же, что у соседних барьеров.
+      - name: Состав записи согласован с подписью (прод-форма)
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: bash scripts/check_rollout_composition.sh
+
+      # Проба ТОЙ ЖЕ проводкой (`testing.md` «целостность гейта»): 27 сценариев — позитивный
+      # контроль, расширение и сужение состава, обе формы подстановки (включая случай, где
+      # равенство проходит и красное обязана дать проверка ФОРМЫ), разъезд эпохи, висячая
+      # подпись, отсутствие ключей, и пять миров несостоявшегося setup'а с кодом 2.
+      - name: Проба барьера (27 сценариев)
+        run: bash scripts/tests/red_rollout_composition.sh
+
   status-check:
     name: All checks passed
     runs-on: ubuntu-latest
-    needs: [build-test, security, delivery, protected-artifacts, contracts, docs-freeze, artifact-ids, reserve-ids, design-claims, context-budgets, gate-meta, deploy-catchup, review-fa, resource-oracles]
+    needs: [build-test, security, delivery, protected-artifacts, contracts, docs-freeze, artifact-ids, reserve-ids, design-claims, context-budgets, gate-meta, deploy-catchup, review-fa, resource-oracles, rollout-composition]
     if: always()
     steps:
       - run: |
-          if [[ "${{ needs.build-test.result }}" != "success" || "${{ needs.security.result }}" != "success" || "${{ needs.delivery.result }}" != "success" || "${{ needs.protected-artifacts.result }}" != "success" || "${{ needs.contracts.result }}" != "success" || "${{ needs.docs-freeze.result }}" != "success" || "${{ needs.artifact-ids.result }}" != "success" || "${{ needs.reserve-ids.result }}" != "success" || "${{ needs.design-claims.result }}" != "success" || "${{ needs.context-budgets.result }}" != "success" || "${{ needs.gate-meta.result }}" != "success" || "${{ needs.deploy-catchup.result }}" != "success" || "${{ needs.review-fa.result }}" != "success" || "${{ needs.resource-oracles.result }}" != "success" ]]; then
+          if [[ "${{ needs.build-test.result }}" != "success" || "${{ needs.security.result }}" != "success" || "${{ needs.delivery.result }}" != "success" || "${{ needs.protected-artifacts.result }}" != "success" || "${{ needs.contracts.result }}" != "success" || "${{ needs.docs-freeze.result }}" != "success" || "${{ needs.artifact-ids.result }}" != "success" || "${{ needs.reserve-ids.result }}" != "success" || "${{ needs.design-claims.result }}" != "success" || "${{ needs.context-budgets.result }}" != "success" || "${{ needs.gate-meta.result }}" != "success" || "${{ needs.deploy-catchup.result }}" != "success" || "${{ needs.review-fa.result }}" != "success" || "${{ needs.resource-oracles.result }}" != "success" || "${{ needs.rollout-composition.result }}" != "success" ]]; then
             echo "One or more checks failed"; exit 1
           fi
           echo "All checks passed"

@@ -402,7 +402,7 @@ setup у каждого; число в вердикте пробы СЧИТАЕ�
 **Уставная правка перепроверяется НЕЗАВИСИМЫМ Fable-агентом (founder, 2026-08-11).**
 Зона: `CLAUDE.md` · `.claude/rules/**` · `.claude/agents/**` · `.claude/wrappers/**` ·
 `docs/04-workflow.md` · `docs/DESIGN.md` · `docs/0[0-9]-*.md` · `docs/fa/**` ·
-`milestones/BACKLOG.md` · `docs/PENDING-SIGNATURE.md`; харнесс — `scripts/check_*.sh` ·
+`milestones/BACKLOG.md` · `docs/PENDING-SIGNATURE.md`; харнесс — `scripts/{check_*.sh,lib/**}` ·
 `scripts/verify_*.sh` · `scripts/tests/**` · `.github/workflows/**`.
 Замер зоны (`R-047`): **110 из 625** файлов, **26** из последних 100 коммитов `main` — норма
 не накрывает «практически всё».
