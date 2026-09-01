@@ -172,3 +172,82 @@ $ bash scripts/next_artifact_id.sh C
 C-205
 allocator_exit=0
 ```
+
+## Резолюция доглядки
+
+**CLEARED — C-205 закрыт; передать M-45 тестеру.**
+
+Это доглядка единственного корректирующего диффа `dd3c4bf..8c3d4ec` по `A-031` §3 п.4,
+не новый круг. Дифф ограничен `milestones/M-45-persist-l2delta.md` и
+`scripts/verify_M-45.sh`. В T4 оба поимённых пина теперь требуют именно Rust-декларацию:
+`^[[:space:]]*fn ИМЯ\(`. Следовательно, имя в комментарии более не удовлетворяет
+предикату; это снимает ровно носитель C-205, не меняя предмет и не открывая новый класс.
+
+**FA:** `VN-I-3` жив в `docs/fa/venues.md` §I: core `venues` не ветвится по конкретному
+`venue_id`. Доглядка ограничена acceptance-скриптом и milestone-спекой; ни кода адаптеров,
+ни этого инварианта она не меняет.
+
+### Сырые замеры
+
+```text
+$ git ls-remote --heads origin docs/M-45-rollout-signature
+8c3d4ecb9b35057f01a06b65c2f7571c368e9158	refs/heads/docs/M-45-rollout-signature
+exit=0
+
+$ git diff --name-only dd3c4bf..8c3d4ec
+milestones/M-45-persist-l2delta.md
+scripts/verify_M-45.sh
+exit=0
+
+$ bash scripts/verify_M-45.sh
+PASS  T0 оракул присутствует: crates/venue-binance/tests/red_l2delta_allowlist.rs
+PASS  T0 оракул присутствует: crates/venue-binance-futures/tests/red_l2delta_allowlist.rs
+PASS  T1 cargo build --workspace
+PASS  T2 cargo clippy --workspace --all-targets -D warnings
+PASS  T2b cargo fmt --all --check (совпадает с ci.yml)
+PASS  T3 venue-binance: без конфигурации состав эмиссии = ["BTCUSDT"]
+PASS  T3 venue-binance-futures: без конфигурации состав эмиссии = ["BTCUSDT"]
+PASS  T3 ожидаемый дефолт в оракуле не подменён: crates/venue-binance/tests/red_l2delta_allowlist.rs
+PASS  T3 ожидаемый дефолт в оракуле не подменён: crates/venue-binance-futures/tests/red_l2delta_allowlist.rs
+PASS  T4 venue-binance: allow-list оракул GREEN (23 тестов; негативный и регистровый запиннены поимённо)
+PASS  T4 venue-binance-futures: allow-list оракул GREEN (21 тестов; негативный и регистровый запиннены поимённо)
+PASS  T5 venue-binance: единственный вызов l2delta_event — внутри l2delta_emission_for
+PASS  T5 venue-binance-futures: единственный вызов l2delta_event — внутри l2delta_emission_for
+PASS  T5 хардкод-списка тикеров в venue-src нет
+PASS  T5b venue-binance: O-8 GREEN (6 тестов через реальную точку входа)
+PASS  T5b venue-binance-futures: O-8 GREEN (6 тестов через реальную точку входа)
+PASS  T6 venue-binance: оракул сырого захвата red_l2delta_capture (M-18/CT-RFC-04) GREEN
+PASS  T6 venue-binance-futures: оракул сырого захвата red_l2delta_futures (M-18/CT-RFC-04) GREEN
+PASS  T7 crates/contracts/** не тронут
+PASS  T8 DET-I-1 GREEN на смешанном журнале (снапшот+дельта; O-5 исполнен поимённо)
+PASS  T9 раскатка исполнена И эпоха 'own-2026-09-m45-ethusdt' стоит В ЯЧЕЙКЕ ФАКТА (E-002)
+PASS  T10 обе переменные раскатки на сервисе recorder (OK L2DELTA_CAPTURE_SYMBOLS=BTCUSDT,ETHUSDT EPOCH_ID=own-2026-09-m45-ethusdt)
+PASS  T10b состав и эпоха внесены ОДНИМ коммитом (f3b84d41)
+PASS  T10c мутация состава: 9 миров compose (каждый под setup-guard'ом) + 7 сценариев значений через ТОТ ЖЕ CLI, что и T10
+VERDICT: PASS
+exit=0
+
+$ sed -n '177p' crates/venue-binance/tests/red_l2delta_allowlist.rs
+fn adversarial_renamed_negative_path() {
+
+$ bash scripts/verify_M-45.sh  # реальный o2 переименован; старое имя оставлено ТОЛЬКО комментарием
+FAIL  T4 venue-binance: allow-list оракул КРАСНЫЙ, либо прогнано НОЛЬ тестов, либо снят поимённо запиннутый негативный (o2_symbol_outside_allowlist_is_not_captured) или регистровый (o4_config_case_does_not_silently_disable_capture) сценарий
+VERDICT: FAIL (1 нарушений)
+t4_comment_anchor_mutation_exit=1
+
+$ git diff --quiet -- crates/venue-binance/tests/red_l2delta_allowlist.rs
+restore_diff_exit=0
+```
+
+The baseline proves the stricter anchors do not reject either honest oracle; the adversarial
+mutation proves the old comment-only escape fails. Per `A-031` §3 p.4, this is **CLEARED**,
+not a new critic round.
+
+## Done Block
+
+```text
+$ git status --porcelain
+
+$ git log -1 --oneline
+8c3d4ec gate(M-45): C-205 — носитель №9, рецидив №6 у автора его же фикса [architect]
+```
