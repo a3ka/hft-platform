@@ -128,6 +128,23 @@ fn journal_of(events: Vec<EventKind>) -> tempfile::TempDir {
     dir
 }
 
+/// **Гигиена процессно-глобального окна (`C-201` B-6).** Эффективное окно heatmap/COB —
+/// состояние ПРОЦЕССА, а тесты этого файла намеренно используют РАЗНЫЕ охваты. При
+/// параллельном исполнении сосед перезаписывает окно под ногами, и тест падает, НЕ БУДУЧИ
+/// сломанным.
+///
+/// **Это ФЛАК, и он был предъявлен прогоном, а не рассуждением:** три прогона подряд дали
+/// `FAILED`, `FAILED`, `ok`. Прежний замер «959 passed / 1 failed» попал на удачный прогон и
+/// доказательством не был — число, снятое ОДНИМ прогоном недетерминированного набора, ничего
+/// не доказывает. Приём и причина — те же, что в `red_egress_cap.rs` и
+/// `red_egress_cap_governed.rs:66`.
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
 fn sel(bands: Vec<f64>) -> Selector {
     // M-75 (`C-198` B-5): окно heatmap/COB БОЛЬШЕ НЕ выводится из `Selector.bands` — оно
     // серверное. Оракулы этого файла строились, когда окно было `max(bands)`, и их предмет
@@ -176,6 +193,7 @@ fn row<'a>(rows: &'a [DepthRow], side: &str, band: f64) -> &'a DepthRow {
 /// `row.band_pct_e8` и о стороне не знает — обе метки совпадают, тест красный.
 #[test]
 fn sides_are_distinguished_on_deep_band() {
+    let _g = serial(); // C-201 B-6: окно heatmap процессно-глобально
     let dir = journal_of(vec![book_reaching(0.05)]);
     let s = snap(dir.path(), &sel(vec![0.001, 0.03]));
     let bid = row(&s.series.depth_series, "bid", 0.03);
@@ -208,6 +226,7 @@ fn sides_are_distinguished_on_deep_band() {
 /// пятипроцентной книги под видом десятипроцентной и молчит об этом.
 #[test]
 fn band_beyond_reach_is_named_not_observed() {
+    let _g = serial(); // C-201 B-6: окно heatmap процессно-глобально
     let dir = journal_of(vec![book_reaching(0.05)]);
     let s = snap(dir.path(), &sel(vec![0.001, 0.10]));
     for side in ["bid", "ask"] {
@@ -228,6 +247,7 @@ fn band_beyond_reach_is_named_not_observed() {
 /// обесценивает метку.
 #[test]
 fn band_within_reach_is_not_falsely_marked() {
+    let _g = serial(); // C-201 B-6: окно heatmap процессно-глобально
     let dir = journal_of(vec![book_reaching(0.05)]);
     let s = snap(dir.path(), &sel(vec![0.001, 0.03]));
     for side in ["bid", "ask"] {
@@ -246,6 +266,7 @@ fn band_within_reach_is_not_falsely_marked() {
 /// Обратная мутация (`testing.md`): фикс не куплен ценой соседнего инварианта.
 #[test]
 fn shallow_band_carries_no_provenance() {
+    let _g = serial(); // C-201 B-6: окно heatmap процессно-глобально
     let dir = journal_of(vec![book_reaching(0.05)]);
     let s = snap(dir.path(), &sel(vec![0.001, 0.03]));
     for side in ["bid", "ask"] {
@@ -267,6 +288,7 @@ fn shallow_band_carries_no_provenance() {
 /// считающая охват по книге целиком (max по сторонам), обе пометит одинаково и упадёт.
 #[test]
 fn reach_is_per_side() {
+    let _g = serial(); // C-201 B-6: окно heatmap процессно-глобально
     let ev = EventKind::md(
         Venue::Binance,
         "BTCUSDT",
@@ -333,6 +355,7 @@ fn reach_is_per_side() {
 /// проходит фикстуру из двух состояний и валится на трёх.
 #[test]
 fn provenance_survives_merge_when_reach_changes() {
+    let _g = serial(); // C-201 B-6: окно heatmap процессно-глобально
     let dir = tempfile::tempdir().expect("tempdir");
     {
         let mut j = Journal::open_with(dir.path(), cfg()).expect("open_with");
@@ -544,6 +567,7 @@ fn points(rows: &[DepthRow], side: &str, band: f64) -> usize {
 /// в СВИДЕТЕЛЕ 2.
 #[test]
 fn label_follows_observation_when_delta_shrinks_the_book() {
+    let _g = serial(); // C-201 B-6: окно heatmap процессно-глобально
     let dir = journal_of(vec![
         book_reaching_at(0.05, T),
         // снять оба дальних уровня по обеим сторонам: size == 0 ⇒ remove
@@ -617,6 +641,7 @@ fn label_follows_observation_when_delta_shrinks_the_book() {
 /// там, где данных нет. Меняется не принцип, а то, какое наблюдение производит число.
 #[test]
 fn label_follows_observation_when_delta_grows_the_book() {
+    let _g = serial(); // C-201 B-6: окно heatmap процессно-глобально
     let dir = journal_of(vec![
         book_reaching_at(0.005, T),
         // добавить дальние уровни: size > 0 ⇒ upsert, живой охват растёт до 5 %
@@ -676,6 +701,7 @@ fn label_follows_observation_when_delta_grows_the_book() {
 /// сломанного кода.
 #[test]
 fn gw_i_4_holds_when_the_tail_frame_is_delta_only() {
+    let _g = serial(); // C-201 B-6: окно heatmap процессно-глобально
     let dir = tempfile::tempdir().expect("tempdir");
     {
         let mut j = Journal::open_with(dir.path(), cfg()).expect("open_with");

@@ -79,6 +79,23 @@ fn lvl(price: f64, size: f64) -> Level {
     }
 }
 
+/// **Гигиена процессно-глобального окна (`C-201` B-6).** Эффективное окно heatmap/COB —
+/// состояние ПРОЦЕССА, а тесты этого файла намеренно используют РАЗНЫЕ охваты. При
+/// параллельном исполнении сосед перезаписывает окно под ногами, и тест падает, НЕ БУДУЧИ
+/// сломанным.
+///
+/// **Это ФЛАК, и он был предъявлен прогоном, а не рассуждением:** три прогона подряд дали
+/// `FAILED`, `FAILED`, `ok`. Прежний замер «959 passed / 1 failed» попал на удачный прогон и
+/// доказательством не был — число, снятое ОДНИМ прогоном недетерминированного набора, ничего
+/// не доказывает. Приём и причина — те же, что в `red_egress_cap.rs` и
+/// `red_egress_cap_governed.rs:66`.
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
 fn sel(bands: Vec<f64>) -> Selector {
     // M-75 (`C-198` B-5): окно heatmap/COB БОЛЬШЕ НЕ выводится из `Selector.bands` — оно
     // серверное. Оракулы этого файла строились, когда окно было `max(bands)`, и их предмет
@@ -391,6 +408,7 @@ fn all_bands() -> Vec<f64> {
 /// (другая подсистема, другой код), а не из той же функции, что считает полосы.
 #[test]
 fn md_i8_d2_setup_heatmap_sees_the_tail_delta_level() {
+    let _g = serial(); // C-201 B-6: окно heatmap процессно-глобально
     let dir = build_prod_form();
     let s = snap_of(dir.path(), all_bands());
 
@@ -428,6 +446,7 @@ fn md_i8_d2_setup_heatmap_sees_the_tail_delta_level() {
 /// односторонняя фикстура прячет дефекты, где стороны расходятся.
 #[test]
 fn md_i8_d1_depth_series_follows_the_delta_tail_on_both_sides() {
+    let _g = serial(); // C-201 B-6: окно heatmap процессно-глобально
     let dir = build_prod_form();
     let s = snap_of(dir.path(), all_bands());
 
@@ -487,6 +506,7 @@ fn md_i8_d1_depth_series_follows_the_delta_tail_on_both_sides() {
 /// содержательным и при смене чисел фикстуры.
 #[test]
 fn md_i8_d3_narrow_band_does_not_swallow_the_far_levels() {
+    let _g = serial(); // C-201 B-6: окно heatmap процессно-глобально
     let dir = build_prod_form();
     let s = snap_of(dir.path(), all_bands());
 
@@ -523,6 +543,7 @@ fn md_i8_d3_narrow_band_does_not_swallow_the_far_levels() {
 /// Реализация, чинящая только live-ветку и не чинящая resume, красна здесь.
 #[test]
 fn md_i8_d4_every_band_moves_not_only_the_far_one() {
+    let _g = serial(); // C-201 B-6: окно heatmap процессно-глобально
     let dir = build_prod_form();
     let s = sel(all_bands());
 
@@ -572,6 +593,7 @@ fn md_i8_d4_every_band_moves_not_only_the_far_one() {
 /// после реализации ⇒ фикс куплен ценой соседнего инварианта.
 #[test]
 fn md_i8_d5_resync_snapshot_replaces_the_book_not_merges() {
+    let _g = serial(); // C-201 B-6: окно heatmap процессно-глобально
     let mut e = Emitter::new();
     e.delta(
         &[(bid(BEST_OFF), SZ_BEST)],
@@ -642,6 +664,7 @@ fn md_i8_d5_resync_snapshot_replaces_the_book_not_merges() {
 /// подписана `П-014` (`PL-I-7`: деградация не выдаётся за норму).
 #[test]
 fn md_i8_d7_reach_is_sampled_where_the_numbers_are_delta_shrinks_the_book() {
+    let _g = serial(); // C-201 B-6: окно heatmap процессно-глобально
     let mut e = Emitter::new();
     e.delta(
         &[(bid(BEST_OFF), SZ_BEST), (bid(0.05), SZ_FAR_A)],
@@ -690,6 +713,7 @@ fn md_i8_d7_reach_is_sampled_where_the_numbers_are_delta_shrinks_the_book() {
 /// `not-observed`.
 #[test]
 fn md_i8_d7b_reach_is_sampled_where_the_numbers_are_delta_grows_the_book() {
+    let _g = serial(); // C-201 B-6: окно heatmap процессно-глобально
     let mut e = Emitter::new();
     e.delta(
         &[(bid(BEST_OFF), SZ_BEST)],
@@ -752,6 +776,7 @@ fn md_i8_d7b_reach_is_sampled_where_the_numbers_are_delta_grows_the_book() {
 /// инвалидирует кэш, а не просто меняет число. `C-094` B3 требовал именно ЯВНОЙ инвалидации.
 #[test]
 fn md_i8_d8_semantics_bump_is_declared_and_invalidates_stale_checkpoint() {
+    let _g = serial(); // C-201 B-6: окно heatmap процессно-глобально
     let dir = build_prod_form();
     let s = sel(all_bands());
 
@@ -833,6 +858,7 @@ fn md_i8_d8_semantics_bump_is_declared_and_invalidates_stale_checkpoint() {
 /// 3. эталон берётся НЕЗАВИСИМЫМ путём — полный реплей от `START`, а не та же функция.
 #[test]
 fn md_i8_d8b_warm_resume_equals_full_replay_across_the_delta_tail() {
+    let _g = serial(); // C-201 B-6: окно heatmap процессно-глобально
     let dir = build_prod_form();
     let s = sel(all_bands());
 
