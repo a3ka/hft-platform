@@ -82,17 +82,69 @@ def check_epoch(raw: str) -> list[str]:
     return []
 
 
-def main() -> int:
-    """CLI для шага `T10c`: `<символы> <эпоха>` → печатает нарушения, код 1 при их наличии."""
-    if len(sys.argv) != 3:
-        print("usage: rollout_symbols_check.py <L2DELTA_CAPTURE_SYMBOLS> <EPOCH_ID>")
-        return 2
-    bad = check_symbols(sys.argv[1]) + check_epoch(sys.argv[2])
+def check_compose(path: str) -> tuple[int, str]:
+    """Суждение о ФАЙЛЕ compose целиком (`A-030` §3 п.1).
+
+    Сюда перенесена ВСЯ логика шага `T10`: разбор YAML, поиск сервиса, извлечение окружения,
+    проверка наличия ключей и самих значений. Вне пробы остаётся только маппинг кода возврата
+    на pass/fail — слой, общий для всех шагов `verify` и видимый одним экраном.
+
+    **Зачем перенос.** `A-030` §3 замер 4b: пока склейка жила в `verify_M-45.sh`, мутация
+    `bad = check_symbols(...) + check_epoch(...)` → `bad = []` пропускала литерал
+    `BTCUSDT,ETHUSDT,SOLUSDT` с `exit=0`, а проба `T10c` оставалась зелёной 13/13. Проба
+    мерила УЧАСТНИКА (компаратор), а не границу ПОТРЕБИТЕЛЯ (шаг, как его исполняет verify) —
+    правило `Р-1`. Тот же класс ловился трижды, каждый раз уровнем выше; здесь он закрыт на
+    последнем уровне, где выше только общий pass/fail-слой.
+
+    Возврат: `(0, отчёт)` — принято; `(1, нарушения)` — отвергнуто; `(2, причина)` — SETUP не
+    состоялся (fail-closed: молчать при несостоявшейся проверке нельзя).
+    """
+    try:
+        import yaml
+    except Exception as e:  # pragma: no cover — среда без pyyaml
+        return 2, f"SETUP: pyyaml недоступен ({e}) — проверка задачи 7 не может состояться"
+    try:
+        doc = yaml.safe_load(open(path))
+    except Exception as e:
+        return 2, f"SETUP: {path} не разобран: {e}"
+    svcs = (doc or {}).get("services") or {}
+    rec = [v for v in svcs.values()
+           if isinstance(v, dict) and v.get("container_name") == "hft-recorder"]
+    if len(rec) != 1:
+        return 2, (f"SETUP: сервис с container_name=hft-recorder найден {len(rec)} раз — "
+                   f"судить нечего")
+    env = rec[0].get("environment") or {}
+    if isinstance(env, list):
+        env = dict(x.split("=", 1) for x in env if "=" in x)
+    miss = [k for k in ("L2DELTA_CAPTURE_SYMBOLS", "EPOCH_ID") if k not in env]
+    if miss:
+        return 1, "ОТСУТСТВУЮТ на сервисе recorder: " + ", ".join(miss)
+    sym, epoch = str(env["L2DELTA_CAPTURE_SYMBOLS"]), str(env["EPOCH_ID"])
+    bad = check_symbols(sym) + check_epoch(epoch)
     if bad:
-        print("; ".join(bad))
-        return 1
-    print("OK")
-    return 0
+        return 1, "; ".join(bad)
+    return 0, f"OK L2DELTA_CAPTURE_SYMBOLS={sym} EPOCH_ID={epoch}"
+
+
+def main() -> int:
+    """Два режима, и оба ведут в ОДИН код суждения.
+
+      --compose <путь>            — режим шага `T10` и фикстурных копий в `T10c`
+      <символы> <эпоха>           — прямой режим для сценариев значений в `T10c`
+    """
+    if len(sys.argv) == 3 and sys.argv[1] == "--compose":
+        code, msg = check_compose(sys.argv[2])
+        print(msg)
+        return code
+    if len(sys.argv) == 3:
+        bad = check_symbols(sys.argv[1]) + check_epoch(sys.argv[2])
+        if bad:
+            print("; ".join(bad))
+            return 1
+        print("OK")
+        return 0
+    print("usage: rollout_symbols_check.py --compose <path> | <SYMBOLS> <EPOCH_ID>")
+    return 2
 
 
 if __name__ == "__main__":

@@ -217,38 +217,7 @@ echo "--- T10: задача 7 (РАСКАТКА) — обе переменные
 # FAIL-CLOSED НА СОБСТВЕННУЮ ПРИМЕНИМОСТЬ: нет `pyyaml`, нет файла, не найден сервис —
 # ОТКАЗ, а не тихий пропуск. Проверка, молчащая при несостоявшемся setup, есть плацебо
 # самой себя (`testing.md` §«Целостность гейта» св. 3-4).
-T10_OUT="$(python3 - <<'PY' 2>&1
-import sys
-sys.path.insert(0, "scripts/lib")
-try:
-    import yaml
-except Exception as e:
-    print(f"SETUP: pyyaml недоступен ({e}) — проверка задачи 7 не может состояться"); sys.exit(2)
-try:
-    from rollout_symbols_check import check_symbols, check_epoch
-except Exception as e:
-    print(f"SETUP: компаратор scripts/lib/rollout_symbols_check.py не импортируется ({e})"); sys.exit(2)
-try:
-    doc = yaml.safe_load(open("docker-compose.yml"))
-except Exception as e:
-    print(f"SETUP: docker-compose.yml не разобран: {e}"); sys.exit(2)
-svcs = (doc or {}).get("services") or {}
-rec = [v for v in svcs.values() if isinstance(v, dict) and v.get("container_name") == "hft-recorder"]
-if len(rec) != 1:
-    print(f"SETUP: сервис с container_name=hft-recorder найден {len(rec)} раз — судить нечего"); sys.exit(2)
-env = rec[0].get("environment") or {}
-if isinstance(env, list):
-    env = dict(x.split("=", 1) for x in env if "=" in x)
-miss = [k for k in ("L2DELTA_CAPTURE_SYMBOLS", "EPOCH_ID") if k not in env]
-if miss:
-    print("ОТСУТСТВУЮТ на сервисе recorder: " + ", ".join(miss)); sys.exit(1)
-sym, epoch = str(env["L2DELTA_CAPTURE_SYMBOLS"]), str(env["EPOCH_ID"])
-bad = check_symbols(sym) + check_epoch(epoch)
-if bad:
-    print("; ".join(bad)); sys.exit(1)
-print(f"OK L2DELTA_CAPTURE_SYMBOLS={sym} EPOCH_ID={epoch}")
-PY
-)"; T10_ST=$?
+T10_OUT="$(python3 scripts/lib/rollout_symbols_check.py --compose docker-compose.yml 2>&1)"; T10_ST=$?
 if [ "$T10_ST" -eq 0 ]; then
   pass "T10 обе переменные раскатки на сервисе recorder ($T10_OUT)"
 elif [ "$T10_ST" -eq 2 ]; then
@@ -285,40 +254,69 @@ echo "--- T10c: МУТАЦИЯ СОСТАВА — гейт обязан отве
 # надо ПРЕДЪЯВИТЬ, что починка работает: правило `Р-4` требует мутации, целящей В ПРИЗНАК.
 # Шаг подставляет неподписанный символ в КОПИЮ compose и требует, чтобы разбор его отверг.
 #
-# Проверяется РОВНО тот код, который исполняет T10: тело извлекается из этого же файла,
-# а не пишется заново. Иначе мутация судила бы свою копию логики — класс «зависимый эталон»
-# (`testing.md`), и починка T10 могла бы разъехаться с пробой незамеченно.
+# Проверяется РОВНО тот код, который исполняет T10: и шаг, и проба зовут ОДИН CLI
+# `scripts/lib/rollout_symbols_check.py`. Прежний комментарий здесь утверждал, что «тело
+# извлекается из этого же файла», — механизма с таким описанием не существовало
+# (`A-030` §3 п.4: комментарий, лгущий о конструкции гейта, отправляет следующего критика
+# проверять то, чего нет; родня «ложного якоря» правила `Р-3`).
 T10C_OUT="$(python3 - <<'PY' 2>&1
-import subprocess, sys
-# ИСПОЛНЯЕТСЯ РЕАЛЬНЫЙ КОМПАРАТОР, а не его копия (`C-202` B-2): каждый сценарий уходит в
-# `scripts/lib/rollout_symbols_check.py` через CLI. Ослабление компаратора роняет ЭТОТ шаг —
-# прежняя редакция редекларировала логику, и ослабление T10 оставляло пробу зелёной.
-CASES = [
-    ("BTCUSDT,ETHUSDT",                  "own-x", 0, "подписанное множество литералом"),
-    ("BTCUSDT,ETHUSDT,SOLUSDT",          "own-x", 1, "ЛИШНИЙ символ — неподписанное расширение (C-199 B-3)"),
-    ("ETHUSDT,BTCUSDT",                  "own-x", 0, "порядок не значим"),
-    (" btcusdt , ethusdt ",              "own-x", 0, "регистр и пробелы нормализуются"),
-    ("BTCUSDT",                          "own-x", 1, "потерян ETHUSDT — подпись не исполнена"),
-    ("ETHUSDT",                          "own-x", 1, "потерян BTCUSDT — сужение состава"),
-    ("BTCUSDT,ETHUSDT,",                 "own-x", 0, "хвостовая запятая — не символ"),
-    ("BTCUSDTX,ETHUSDT",                 "own-x", 1, "подстрочно-похожий токен не считается BTCUSDT"),
-    ("${L2DELTA_CAPTURE_SYMBOLS:-BTCUSDT,ETHUSDT}", "own-x", 1, "подстановка ЗАПРЕЩЕНА: переопределяема снаружи (C-202 B-1)"),
-    ("${L2DELTA_CAPTURE_SYMBOLS-BTCUSDT,ETHUSDT}",  "own-x", 1, "форма без двоеточия — тоже подстановка (C-202 B-3)"),
-    ("$L2DELTA_CAPTURE_SYMBOLS",         "own-x", 1, "краткая форма подстановки"),
-    ("BTCUSDT,ETHUSDT",                  "${EPOCH_ID:-own-x}", 1, "эпоха подстановкой — разъедется с составом"),
-    ("BTCUSDT,ETHUSDT",                  "", 1, "пустая эпоха — граница не предъявима"),
+import subprocess, sys, tempfile, os, shutil
+# `A-030` §3 п.2: проба гоняет ТОТ ЖЕ CLI, каким исполняется шаг T10 — и на фикстурных
+# КОПИЯХ compose, и прямыми значениями. Вне пробы остаётся только маппинг exit-кода на
+# pass/fail. Замер 4b арбитра показал, почему это существенно: пока склейка жила в этом
+# файле, её мутация (`bad = []`) пропускала неподписанный состав, а проба оставалась зелёной.
+CLI = ["python3", "scripts/lib/rollout_symbols_check.py"]
+BASE = open("docker-compose.yml").read()
+ANCHOR = "      HL_COINS: ${HL_COINS:-BTC,ETH}"
+
+def compose_with(sym=None, epoch=None, drop_service=False):
+    s = BASE
+    if drop_service:
+        return s.replace("    container_name: hft-recorder\n", "    container_name: hft-other\n", 1)
+    add = ""
+    if sym is not None:
+        add += f"\n      L2DELTA_CAPTURE_SYMBOLS: {sym}"
+    if epoch is not None:
+        add += f"\n      EPOCH_ID: {epoch}"
+    return s.replace(ANCHOR, ANCHOR + add, 1)
+
+# (описание, содержимое compose, ожидаемый код)
+COMPOSE_CASES = [
+    ("подписанный литерал",              compose_with("BTCUSDT,ETHUSDT", "own-x"), 0),
+    ("ЛИШНИЙ символ литералом",          compose_with("BTCUSDT,ETHUSDT,SOLUSDT", "own-x"), 1),
+    ("подстановка :- (обходима)",        compose_with("${L2DELTA_CAPTURE_SYMBOLS:-BTCUSDT,ETHUSDT}", "own-x"), 1),
+    ("подстановка без двоеточия",        compose_with("${L2DELTA_CAPTURE_SYMBOLS-BTCUSDT,ETHUSDT}", "own-x"), 1),
+    ("эпоха подстановкой",               compose_with("BTCUSDT,ETHUSDT", "${EPOCH_ID:-own-x}"), 1),
+    ("КЛЮЧИ ОТСУТСТВУЮТ",                compose_with(), 1),
+    ("сервис recorder НЕ НАЙДЕН",        compose_with(drop_service=True), 2),
+]
+VALUE_CASES = [
+    ("BTCUSDT,ETHUSDT",         "own-x", 0, "подписанное множество"),
+    ("ETHUSDT,BTCUSDT",         "own-x", 0, "порядок не значим"),
+    (" btcusdt , ethusdt ",     "own-x", 0, "регистр и пробелы"),
+    ("BTCUSDT",                 "own-x", 1, "потерян ETHUSDT"),
+    ("BTCUSDTX,ETHUSDT",        "own-x", 1, "подстрочно-похожий токен"),
+    ("BTCUSDT,ETHUSDT",         "",      1, "пустая эпоха"),
 ]
 bad = []
-for sym, epoch, want, why in CASES:
-    r = subprocess.run([sys.executable, "scripts/lib/rollout_symbols_check.py", sym, epoch],
-                       capture_output=True, text=True)
-    if r.returncode == 2:
-        print(f"SETUP: компаратор не исполнился на {sym!r}: {r.stdout.strip()}"); sys.exit(2)
-    if r.returncode != want:
-        bad.append(f"{sym!r}/{epoch!r} ожидался код {want}, получен {r.returncode} ({why})")
+tmp = tempfile.mkdtemp()
+try:
+    shutil.copytree("scripts", os.path.join(tmp, "scripts"))
+    for why, content, want in COMPOSE_CASES:
+        f = os.path.join(tmp, "docker-compose.yml")
+        open(f, "w").write(content)
+        r = subprocess.run(CLI + ["--compose", f], capture_output=True, text=True)
+        if r.returncode != want:
+            bad.append(f"compose «{why}»: ожидался код {want}, получен {r.returncode}")
+    for sym, epoch, want, why in VALUE_CASES:
+        r = subprocess.run(CLI + [sym, epoch], capture_output=True, text=True)
+        if r.returncode != want:
+            bad.append(f"значения {sym!r}/{epoch!r}: ожидался {want}, получен {r.returncode} ({why})")
+finally:
+    shutil.rmtree(tmp, ignore_errors=True)
 if bad:
     print("; ".join(bad)); sys.exit(1)
-print(f"мутация состава: {len(CASES)} сценариев через РЕАЛЬНЫЙ компаратор, все различены")
+print(f"мутация состава: {len(COMPOSE_CASES)} миров compose + {len(VALUE_CASES)} сценариев значений через ТОТ ЖЕ CLI, что и T10")
 PY
 )"; T10C_ST=$?
 if [ "$T10C_ST" -eq 0 ]; then
