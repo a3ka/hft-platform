@@ -268,9 +268,19 @@ import subprocess, sys, tempfile, os, shutil
 CLI = ["python3", "scripts/lib/rollout_symbols_check.py"]
 BASE = open("docker-compose.yml").read()
 ANCHOR = "      HL_COINS: ${HL_COINS:-BTC,ETH}"
+KEYS = ("L2DELTA_CAPTURE_SYMBOLS", "EPOCH_ID")
+
+# Фикстура строится ЗАМЕНОЙ, а не дописыванием. Прежняя редакция дописывала ключ ниже якоря
+# `HL_COINS`, и это было годно РОВНО до раскатки: как только задача 7 внесла те же ключи в
+# compose, дописка стала ДУБЛЕМ, а PyYAML применяет last-wins — побеждало реальное значение,
+# мутация исчезала, и проба краснела на пяти сценариях из семи. Оракул ломался в тот самый
+# момент, ради которого написан. Найдено engine-dev'ом на `f3b84d4`.
+def strip_keys(text):
+    return "".join(l for l in text.splitlines(keepends=True)
+                   if not any(l.strip().startswith(k + ":") for k in KEYS))
 
 def compose_with(sym=None, epoch=None, drop_service=False):
-    s = BASE
+    s = strip_keys(BASE)
     if drop_service:
         return s.replace("    container_name: hft-recorder\n", "    container_name: hft-other\n", 1)
     add = ""
@@ -280,15 +290,42 @@ def compose_with(sym=None, epoch=None, drop_service=False):
         add += f"\n      EPOCH_ID: {epoch}"
     return s.replace(ANCHOR, ANCHOR + add, 1)
 
+def setup_guard(path, sym, epoch, drop_service):
+    """Фикстура ОБЯЗАНА нести то, что задумал сценарий — иначе судится не тот мир.
+
+    `testing.md` §«Целостность гейта» св. 3: проба, молча тестирующая не тот сценарий, есть
+    плацебо самой себя. Guard снимается ТЕМ ЖЕ CLI, который фикстуру потом судит
+    (`--extract`), а не вторым разбором в пробе: редекларация разбора внутри пробы уже стоила
+    `C-202` B-2. Возврат: None — setup состоялся; строка — причина отказа (код 2).
+    """
+    r = subprocess.run(CLI + ["--extract", path], capture_output=True, text=True)
+    if drop_service:
+        return None if r.returncode == 2 else \
+            f"фикстура «сервис не найден» разобралась (код {r.returncode}) — мир не построен"
+    if r.returncode != 0:
+        return f"--extract вернул {r.returncode}: {r.stdout.strip()} {r.stderr.strip()}"
+    seen = dict(l.split("=", 1) for l in r.stdout.strip().splitlines() if "=" in l)
+    for key, want in (("L2DELTA_CAPTURE_SYMBOLS", sym), ("EPOCH_ID", epoch)):
+        exp = "<ОТСУТСТВУЕТ>" if want is None else str(want)
+        if seen.get(key) != exp:
+            return (f"{key}: CLI видит {seen.get(key)!r}, сценарий задумал {exp!r} — "
+                    f"фикстура не несёт мутации (дубль ключа? last-wins?)")
+    return None
+
 # (описание, содержимое compose, ожидаемый код)
+# (описание, содержимое compose, ожидаемый код, НАМЕРЕНИЕ сценария для setup-guard)
+_C = [
+    ("подписанный литерал",       ("BTCUSDT,ETHUSDT", "own-x", False), 0),
+    ("ЛИШНИЙ символ литералом",   ("BTCUSDT,ETHUSDT,SOLUSDT", "own-x", False), 1),
+    ("подстановка :- (обходима)", ("${L2DELTA_CAPTURE_SYMBOLS:-BTCUSDT,ETHUSDT}", "own-x", False), 1),
+    ("подстановка без двоеточия", ("${L2DELTA_CAPTURE_SYMBOLS-BTCUSDT,ETHUSDT}", "own-x", False), 1),
+    ("эпоха подстановкой",        ("BTCUSDT,ETHUSDT", "${EPOCH_ID:-own-x}", False), 1),
+    ("КЛЮЧИ ОТСУТСТВУЮТ",         (None, None, False), 1),
+    ("сервис recorder НЕ НАЙДЕН", (None, None, True), 2),
+]
 COMPOSE_CASES = [
-    ("подписанный литерал",              compose_with("BTCUSDT,ETHUSDT", "own-x"), 0),
-    ("ЛИШНИЙ символ литералом",          compose_with("BTCUSDT,ETHUSDT,SOLUSDT", "own-x"), 1),
-    ("подстановка :- (обходима)",        compose_with("${L2DELTA_CAPTURE_SYMBOLS:-BTCUSDT,ETHUSDT}", "own-x"), 1),
-    ("подстановка без двоеточия",        compose_with("${L2DELTA_CAPTURE_SYMBOLS-BTCUSDT,ETHUSDT}", "own-x"), 1),
-    ("эпоха подстановкой",               compose_with("BTCUSDT,ETHUSDT", "${EPOCH_ID:-own-x}"), 1),
-    ("КЛЮЧИ ОТСУТСТВУЮТ",                compose_with(), 1),
-    ("сервис recorder НЕ НАЙДЕН",        compose_with(drop_service=True), 2),
+    (why, compose_with(intent[0], intent[1], drop_service=intent[2]), want, intent)
+    for why, intent, want in _C
 ]
 VALUE_CASES = [
     ("BTCUSDT,ETHUSDT",         "own-x", 0, "подписанное множество"),
@@ -299,12 +336,16 @@ VALUE_CASES = [
     ("BTCUSDT,ETHUSDT",         "",      1, "пустая эпоха"),
 ]
 bad = []
+setup_failures = []
 tmp = tempfile.mkdtemp()
 try:
-    shutil.copytree("scripts", os.path.join(tmp, "scripts"))
-    for why, content, want in COMPOSE_CASES:
+    for why, content, want, intent in COMPOSE_CASES:
         f = os.path.join(tmp, "docker-compose.yml")
         open(f, "w").write(content)
+        why_setup = setup_guard(f, *intent)
+        if why_setup:
+            setup_failures.append(f"compose «{why}»: SETUP НЕ СОСТОЯЛСЯ — {why_setup}")
+            continue
         r = subprocess.run(CLI + ["--compose", f], capture_output=True, text=True)
         if r.returncode != want:
             bad.append(f"compose «{why}»: ожидался код {want}, получен {r.returncode}")
@@ -314,9 +355,14 @@ try:
             bad.append(f"значения {sym!r}/{epoch!r}: ожидался {want}, получен {r.returncode} ({why})")
 finally:
     shutil.rmtree(tmp, ignore_errors=True)
+if setup_failures:
+    # Несостоявшийся setup — ОТКАЗ (код 2), а не «различающая сила не предъявлена»:
+    # молчать о том, что судился не тот мир, нельзя.
+    print("; ".join(setup_failures)); sys.exit(2)
 if bad:
     print("; ".join(bad)); sys.exit(1)
-print(f"мутация состава: {len(COMPOSE_CASES)} миров compose + {len(VALUE_CASES)} сценариев значений через ТОТ ЖЕ CLI, что и T10")
+print(f"мутация состава: {len(COMPOSE_CASES)} миров compose (каждый под setup-guard'ом) "
+      f"+ {len(VALUE_CASES)} сценариев значений через ТОТ ЖЕ CLI, что и T10")
 PY
 )"; T10C_ST=$?
 if [ "$T10C_ST" -eq 0 ]; then

@@ -82,6 +82,45 @@ def check_epoch(raw: str) -> list[str]:
     return []
 
 
+def read_env(path: str) -> tuple[int, object]:
+    """Что видит в фикстуре ПОТРЕБИТЕЛЬ этого файла — то есть сам CLI.
+
+    Вынесено отдельно и предъявляется наружу режимом `--extract` РАДИ SETUP-GUARD'А ПРОБЫ
+    (`testing.md` §«Целостность гейта» св. 3: проба, молча тестирующая не тот сценарий, есть
+    плацебо самой себя). Пока этой функции не было, `T10c` строила фикстуру ДОПИСЫВАНИЕМ
+    ключа и никогда не проверяла, что дописанное вообще доехало до разбора.
+
+    Замер, стоивший красного гейта на первой же раскатке (найдено engine-dev'ом на
+    `f3b84d4`): после того как задача 7 внесла ключи в compose, дописка мутации ниже якоря
+    `HL_COINS` создавала ДУБЛЬ ключа, а PyYAML применяет last-wins — побеждало реальное
+    значение, мутация исчезала, и проба краснела на пяти сценариях из семи. То есть оракул
+    был годен ТОЛЬКО в мире до раскатки и ломался ровно в тот момент, ради которого написан.
+
+    Guard снимается ЭТИМ ЖЕ путём, каким читает судимый шаг (`Р-1`: мера на границе
+    потребителя, не редекларация разбора в пробе — та ошибка уже стоила `C-202` B-2).
+
+    Возврат: `(0, {ключ: сырое значение})` — разобрано; `(2, причина)` — setup не состоялся.
+    """
+    try:
+        import yaml
+    except Exception as e:  # pragma: no cover — среда без pyyaml
+        return 2, f"SETUP: pyyaml недоступен ({e})"
+    try:
+        doc = yaml.safe_load(open(path))
+    except Exception as e:
+        return 2, f"SETUP: {path} не разобран: {e}"
+    svcs = (doc or {}).get("services") or {}
+    rec = [v for v in svcs.values()
+           if isinstance(v, dict) and v.get("container_name") == "hft-recorder"]
+    if len(rec) != 1:
+        return 2, (f"SETUP: сервис с container_name=hft-recorder найден {len(rec)} раз — "
+                   f"судить нечего")
+    env = rec[0].get("environment") or {}
+    if isinstance(env, list):
+        env = dict(x.split("=", 1) for x in env if "=" in x)
+    return 0, {k: str(env[k]) for k in ("L2DELTA_CAPTURE_SYMBOLS", "EPOCH_ID") if k in env}
+
+
 def check_compose(path: str) -> tuple[int, str]:
     """Суждение о ФАЙЛЕ compose целиком (`A-030` §3 п.1).
 
@@ -99,23 +138,10 @@ def check_compose(path: str) -> tuple[int, str]:
     Возврат: `(0, отчёт)` — принято; `(1, нарушения)` — отвергнуто; `(2, причина)` — SETUP не
     состоялся (fail-closed: молчать при несостоявшейся проверке нельзя).
     """
-    try:
-        import yaml
-    except Exception as e:  # pragma: no cover — среда без pyyaml
-        return 2, f"SETUP: pyyaml недоступен ({e}) — проверка задачи 7 не может состояться"
-    try:
-        doc = yaml.safe_load(open(path))
-    except Exception as e:
-        return 2, f"SETUP: {path} не разобран: {e}"
-    svcs = (doc or {}).get("services") or {}
-    rec = [v for v in svcs.values()
-           if isinstance(v, dict) and v.get("container_name") == "hft-recorder"]
-    if len(rec) != 1:
-        return 2, (f"SETUP: сервис с container_name=hft-recorder найден {len(rec)} раз — "
-                   f"судить нечего")
-    env = rec[0].get("environment") or {}
-    if isinstance(env, list):
-        env = dict(x.split("=", 1) for x in env if "=" in x)
+    code, got = read_env(path)
+    if code != 0:
+        return code, str(got)
+    env = got
     miss = [k for k in ("L2DELTA_CAPTURE_SYMBOLS", "EPOCH_ID") if k not in env]
     if miss:
         return 1, "ОТСУТСТВУЮТ на сервисе recorder: " + ", ".join(miss)
@@ -130,12 +156,21 @@ def main() -> int:
     """Два режима, и оба ведут в ОДИН код суждения.
 
       --compose <путь>            — режим шага `T10` и фикстурных копий в `T10c`
+      --extract <путь>            — что CLI ВИДИТ в файле; setup-guard пробы
       <символы> <эпоха>           — прямой режим для сценариев значений в `T10c`
     """
     if len(sys.argv) == 3 and sys.argv[1] == "--compose":
         code, msg = check_compose(sys.argv[2])
         print(msg)
         return code
+    if len(sys.argv) == 3 and sys.argv[1] == "--extract":
+        code, got = read_env(sys.argv[2])
+        if code != 0:
+            print(got)
+            return code
+        for k in ("L2DELTA_CAPTURE_SYMBOLS", "EPOCH_ID"):
+            print(f"{k}={got[k]}" if k in got else f"{k}=<ОТСУТСТВУЕТ>")
+        return 0
     if len(sys.argv) == 3:
         bad = check_symbols(sys.argv[1]) + check_epoch(sys.argv[2])
         if bad:
@@ -143,7 +178,8 @@ def main() -> int:
             return 1
         print("OK")
         return 0
-    print("usage: rollout_symbols_check.py --compose <path> | <SYMBOLS> <EPOCH_ID>")
+    print("usage: rollout_symbols_check.py --compose <path> | --extract <path> "
+          "| <SYMBOLS> <EPOCH_ID>")
     return 2
 
 
