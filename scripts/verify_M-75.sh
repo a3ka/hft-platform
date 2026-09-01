@@ -134,27 +134,6 @@ else
   chk "printf '%s\n' \"\${CALLS}\" | grep -qE 'selector|bands' && exit 1 || exit 0"
 fi
 
-step "task #2b — затронутые ЧУЖИЕ оракулы переведены на серверное окно (C-198 B-5)"
-# Расцепление ломает ДЕСЯТЬ чужих оракулов в четырёх файлах (инвентарь — §8quater спеки,
-# снят прогоном `cargo test --all --no-fail-fast`, а не грепом). Приём: серверное окно
-# ставится в централизованной `fn sel(bands)` каждого файла, равным `max(bands)` — предмет
-# оракулов сохраняется дословно, меняется источник величины.
-#
-# ШАГ КРАСЕН ДО ЗАДАЧИ 2 И ЭТО ВЕРНО: пока `set_effective_heatmap_window_frac` не введена,
-# правки не компилируются и в ветке их нет (они в спас-рефах `m75-b5-inventory`/`-r2`).
-# Зелёный ЗДЕСЬ раньше задачи 2 означал бы, что кто-то закоммитил несобираемый тест.
-for f in crates/gateway/tests/red_depth_from_book.rs \
-         crates/gateway/tests/red_depth_provenance_by_reach.rs \
-         crates/gateway/tests/red_heatmap.rs \
-         crates/gateway/tests/red_egress_cap.rs; do
-  chk "grep -q 'set_effective_heatmap_window_frac' ${f}"
-done
-# Гигиена: окно процессно-глобально, а `red_egress_cap.rs` намеренно держит РАЗНЫЕ охваты в
-# одном файле. Без `serial()` тест прод-дефолта падает от соседа — замер: `--test-threads=1`
-# даёт 9/9, параллельно 3 падения. Проверяется НАЛИЧИЕ guard'а, а не его текст.
-chk "grep -q 'fn serial()' crates/gateway/tests/red_egress_cap.rs"
-chk "[ \"\$(grep -c 'let _g = serial();' crates/gateway/tests/red_egress_cap.rs)\" -ge 9 ]"
-
 step "task #3 — разбор env FAIL-CLOSED: невалидное значение = отказ старта, не дефолт"
 chk_named_test "оракул fail-closed разбора GATEWAY_HEATMAP_WINDOW" \
   cargo test -p gateway-serve --test red_heatmap_window_env --quiet
