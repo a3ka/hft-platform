@@ -39,14 +39,17 @@ $ git log --oneline -1 -S "L2Delta {" -- crates/contracts/src/lib.rs
 
 ## 1. Ключевое решение — allow-list из хардкода в конфиг (развязка merge от раскатки)
 
-**Проблема, которую оно решает.** Сегодня набор символов — хардкод-константа:
+**Проблема, которую оно решает.** До задач 1–3 набор символов был хардкод-константой.
+Факт снят в форме **класса 1** (`A-030` §1) — на ревизии, ПРЕДШЕСТВУЮЩЕЙ первой задаче, а не
+«сегодня»: реализация с тех пор закрыта, и настоящее время здесь стало бы ложью, а прежняя
+форма (`grep -rn … crates/`) на сегодняшнем дереве даёт семь строк вместо четырёх.
 
 ```text
-$ grep -rn "L2DELTA_CAPTURE_SYMBOLS" crates/ --include=*.rs
-crates/venue-binance/src/lib.rs:485:        const L2DELTA_CAPTURE_SYMBOLS: &[&str] = &["BTCUSDT"];
-crates/venue-binance/src/lib.rs:251:        if L2DELTA_CAPTURE_SYMBOLS.contains(&symbol.as_str()) {
-crates/venue-binance-futures/src/lib.rs:460:  const L2DELTA_CAPTURE_SYMBOLS: &[&str] = &["BTCUSDT"];
-crates/venue-binance-futures/src/lib.rs:642:  if L2DELTA_CAPTURE_SYMBOLS.contains(&symbol.as_str()) {
+$ git grep -n "L2DELTA_CAPTURE_SYMBOLS" d75a1b7 -- 'crates/*/src/lib.rs'
+d75a1b7:crates/venue-binance-futures/src/lib.rs:460:const L2DELTA_CAPTURE_SYMBOLS: &[&str] = &["BTCUSDT"];
+d75a1b7:crates/venue-binance-futures/src/lib.rs:642:                if L2DELTA_CAPTURE_SYMBOLS.contains(&symbol.as_str()) {
+d75a1b7:crates/venue-binance/src/lib.rs:251:            if L2DELTA_CAPTURE_SYMBOLS.contains(&symbol.as_str()) {
+d75a1b7:crates/venue-binance/src/lib.rs:485:const L2DELTA_CAPTURE_SYMBOLS: &[&str] = &["BTCUSDT"];
 ```
 
 Doc-comment у обеих констант говорит прямо: «расширение набора требует отдельного решения
@@ -146,8 +149,8 @@ verify-скрипт dev НЕ правит (странный тест → `!!! SC
 recorder**. Форма `${L2DELTA_CAPTURE_SYMBOLS:-BTCUSDT,ETHUSDT}` выглядит подписанной и
 переопределяется снаружи одной переменной. Замер воспроизведён мной:
 
-```
-$ GATEWAY_JWT_SECRET=x L2DELTA_CAPTURE_SYMBOLS=BTCUSDT,ETHUSDT,SOLUSDT docker compose config | grep L2DELTA
+```text
+$ printf 'services:\n  recorder:\n    image: x\n    container_name: hft-recorder\n    environment:\n      L2DELTA_CAPTURE_SYMBOLS: ${L2DELTA_CAPTURE_SYMBOLS:-BTCUSDT,ETHUSDT}\n' > /tmp/w-subst.yml; L2DELTA_CAPTURE_SYMBOLS=BTCUSDT,ETHUSDT,SOLUSDT docker compose -f /tmp/w-subst.yml config | grep L2DELTA
       L2DELTA_CAPTURE_SYMBOLS: BTCUSDT,ETHUSDT,SOLUSDT
 ```
 
@@ -155,10 +158,20 @@ $ GATEWAY_JWT_SECRET=x L2DELTA_CAPTURE_SYMBOLS=BTCUSDT,ETHUSDT,SOLUSDT docker co
 (`grep -c docker .github/workflows/ci.yml` → `0`). Развязка — запретить подстановку для
 величины под подписью. Литерал не переопределяется ни окружением, ни `.env`:
 
-```
-$ GATEWAY_JWT_SECRET=x L2DELTA_CAPTURE_SYMBOLS=BTCUSDT,ETHUSDT,SOLUSDT docker compose config | grep L2DELTA
+```text
+$ printf 'services:\n  recorder:\n    image: x\n    container_name: hft-recorder\n    environment:\n      L2DELTA_CAPTURE_SYMBOLS: BTCUSDT,ETHUSDT\n' > /tmp/w-lit.yml; L2DELTA_CAPTURE_SYMBOLS=BTCUSDT,ETHUSDT,SOLUSDT docker compose -f /tmp/w-lit.yml config | grep L2DELTA
       L2DELTA_CAPTURE_SYMBOLS: BTCUSDT,ETHUSDT
 ```
+
+**Форма этих двух блоков переснята (`A-030` §1).** Прежняя редакция показывала в обоих
+ОДНУ И ТУ ЖЕ команду `docker compose config` с ДВУМЯ разными выводами: мир (какой compose
+разбирается) жил в прозе, а не в команде, и на дереве репозитория ни один из двух выводов
+не воспроизводился — у сервиса `hft-recorder` этой переменной ещё нет вовсе, задача 7 не
+раскатана. Теперь каждый блок САМ создаёт свой мир и потому воспроизводим кем угодно —
+это перевод из класса 3 (свидетельство) в класс 1, который `A-030` §1 предписывает
+предпочитать всегда, когда он достижим. Исполнимый коррелят на реальном дереве —
+шаг `T10`, фикстурные миры — `T10c`.
+
 
 **Цена названа:** оператор больше не сменит СОСТАВ переменной окружения — только коммитом.
 Это не потеря операторского рычага, а требование границы C: состав данных меняет подпись, а
@@ -168,6 +181,14 @@ $ GATEWAY_JWT_SECRET=x L2DELTA_CAPTURE_SYMBOLS=BTCUSDT,ETHUSDT,SOLUSDT docker co
 **Это уточняет §1 п.2 спеки**, где раскатка названа «операторским шагом: оператор выставляет
 env». Уточнение, а не отмена: шаг остаётся операторским (значение выбирает founder, вносит
 engine-dev), но носителем становится коммит, а не окружение хоста.
+
+**Предел механизма назван, иначе «литерал = защита» прочтут шире, чем он есть**
+(`A-030` §2, предписание круга 5). Статический гейт видит ровно `docker-compose.yml` и НЕ
+видит трёх остаточных каналов: `docker-compose.override.yml`, `docker compose run -e` и
+ручной запуск контейнера с иным окружением на хосте. Литерал закрывает подстановку в
+СУДИМОМ файле — и только её. Остаточные каналы держит не `verify`, а деплой-гейт
+`gates.md` §8 (sanity свежих событий по КАЖДОЙ площадке — уже в `П-026` §Порядок п.3) и
+дисциплина доступа к хосту.
 
 **`C-202` B-3 закрыт тем же решением:** форма `${VAR-default}` без двоеточия честна и даёт
 подписанный набор при unset — но она ТОЖЕ подстановка, то есть переопределяема. Гейт
@@ -491,12 +512,15 @@ allow-list → эмитятся ДВА `L2Delta`. Анти-плацебо: ре�
 **O-5 (`DET-I-1` на смешанном потоке — закрытие R-019 F6).** Замер, а не предположение:
 
 ```text
-$ grep -c L2Delta crates/journal/tests/red_det_replay_digest.rs
+$ git show a1fc098:crates/journal/tests/red_det_replay_digest.rs | grep -c L2Delta
 0
 ```
 
-У оракула `DET-I-1` (`replay_digest`) фикстур с `L2Delta` **ноль** — детерминизм на смешанном
-журнале сегодня аргументирован (свёртка тип-агностична), но не проверен. Оракул: журнал из
+Форма — **класс 1** (`A-030` §1): ревизия названа, вывод неизменен по построению. Прежняя
+редакция снимала тот же счёт с РАБОЧЕГО дерева и утверждала «ноль» в настоящем времени —
+сегодня та же команда на дереве даёт `6`, потому что оракул O-5 написан и `T8` зелёный.
+На ревизии `a1fc098` (до O-5) фикстур с `L2Delta` у `DET-I-1` было **ноль** — детерминизм на
+смешанном журнале был аргументирован (свёртка тип-агностична), но не проверен. Оракул: журнал из
 чередующихся `L2Snapshot` + `L2Delta` (обе стороны, включая **асимметричный** дифф — обновлена
 одна сторона, и дифф с `size == 0` = remove), реплей ×3 бит-идентичен. Покрывает «асимметрию»
 и «отсутствие» (уровень, не упомянутый в диффе, НЕ удаляется).
@@ -525,15 +549,30 @@ $ grep -c L2Delta crates/journal/tests/red_det_replay_digest.rs
 
 ### 4bis.1 Где живёт снимок сегодня — замер
 
-```
-$ sed -n '350,366p' crates/venue-binance/src/lib.rs
-  SpotSession::tick → compute_book_snapshot_effects(&self.states)
-  «эмитит по одному L2Snapshot на синхронизированный символ»   ← БЕЗУСЛОВНО, каждый тик
-$ grep -rn 'SNAPSHOT_INTERVAL|snapshot_interval' crates/venue-binance/src/lib.rs docker-compose.yml
-  пусто                                                        ← ручки каденции НЕТ
+```text
+$ sed -n '350,356p' crates/venue-binance/src/lib.rs
+    /// Периодический тик: эмитит по одному `L2Snapshot` на синхронизированный символ
+    /// (эквивалент прежней свободной `emit_book_snapshots`, теперь метод сессии —
+    /// возвращает эффекты вместо прямого `tx.send`). Делегирует в
+    /// `compute_book_snapshot_effects` — тот же хелпер использует legacy-обёртка
+    /// `emit_book_snapshots` (сохранена для SACRED-теста `ts_exch_tests` ниже).
+    pub fn tick(&self) -> Vec<SessionEffect> {
+        compute_book_snapshot_effects(&self.states)
 ```
 
-Периодичность зашита в частоту вызова `tick`, регулятора не существует.
+```text
+$ grep -rnE 'SNAPSHOT_INTERVAL|snapshot_interval' crates/venue-binance/src/lib.rs docker-compose.yml; echo "exit=$?"
+exit=1
+```
+
+**Прочтение этих двух блоков** (вынесено НАРУЖУ — внутри блока живёт только то, что печатает
+команда, `A-030` §1): `tick` эмитит снимок БЕЗУСЛОВНО, каждым вызовом, делегируя в
+`compute_book_snapshot_effects`; ручки каденции нет ни в коде, ни в compose. Периодичность
+зашита в частоту вызова `tick`, регулятора не существует.
+
+Флаг `-E` во второй команде обязателен и не косметичен: без него `|` — литерал, альтернация
+не работает, и пустой вывод получился бы при ЛЮБОМ содержимом файлов. Ноль, произведённый
+негодным образцом, ничего не доказывает; прежняя редакция этого блока несла ровно такую форму.
 
 ### 4bis.2 Снимок имеет ДВА источника, и это решает конструкцию
 
@@ -556,17 +595,34 @@ $ grep -rn 'SNAPSHOT_INTERVAL|snapshot_interval' crates/venue-binance/src/lib.rs
 журнал, и на этом различии формулировка «ресинк-путь не тронут» вводит будущего исполнителя
 в заблуждение: отдельного пути ЭМИССИИ у ресинка сегодня НЕ СУЩЕСТВУЕТ.
 
-```
+```text
 $ grep -n 'MdPayload::L2Snapshot' crates/venue-binance/src/lib.rs
-404:            payload: MdPayload::L2Snapshot {          # периодический tick — ЕДИНСТВЕННАЯ
-1312:        let MdPayload::L2Snapshot { ts_exch_ms, .. }  # тест-ассерт
-$ grep -n 'MdPayload::L2Snapshot' crates/venue-binance-futures/src/lib.rs
-104:        payload: MdPayload::L2Snapshot {              # parse_depth_snapshot — REST-парсер
-925:                payload: MdPayload::L2Snapshot {      # периодический tick
-$ grep -rn 'parse_depth_snapshot' crates/ --include=*.rs | grep -v 'src/lib.rs:[19][0-9]*:'
-crates/venue-binance-futures/src/recon.rs:24,111   # recon (сверка с биржей), НЕ эмиссия
-crates/venue-binance-futures/tests/red_parse.rs    # тест
+404:            payload: MdPayload::L2Snapshot {
+1312:        let MdPayload::L2Snapshot { ts_exch_ms, .. } = &md.payload else {
 ```
+
+```text
+$ grep -n 'MdPayload::L2Snapshot' crates/venue-binance-futures/src/lib.rs
+104:        payload: MdPayload::L2Snapshot {
+925:                payload: MdPayload::L2Snapshot {
+```
+
+```text
+$ grep -rn 'parse_depth_snapshot' crates/ --include=*.rs | grep -v '/src/lib.rs:'
+crates/venue-binance-futures/tests/red_parse.rs:6:use venue_binance_futures::{parse_depth_snapshot, parse_force_order, parse_open_interest};
+crates/venue-binance-futures/tests/red_parse.rs:49:    let got = parse_depth_snapshot("BTCUSDT", json);
+crates/venue-binance-futures/src/recon.rs:6://! [`super::parse_depth_snapshot`] (pub).
+crates/venue-binance-futures/src/recon.rs:24:use super::parse_depth_snapshot;
+crates/venue-binance-futures/src/recon.rs:108:/// Чистая функция (без I/O). Переиспользует [`super::parse_depth_snapshot`]
+crates/venue-binance-futures/src/recon.rs:111:    let md = parse_depth_snapshot(symbol, json)
+```
+
+**Прочтение трёх блоков** (наружу, `A-030` §1 — прежняя редакция несла его пометками `#`
+ВНУТРИ блоков, из-за чего показанное не производилось показанной командой): у спота
+`:404` — периодический tick, ЕДИНСТВЕННАЯ точка эмиссии, `:1312` — тест-ассерт; у фьючерсов
+`:104` — REST-**парсер** `parse_depth_snapshot`, `:925` — периодический tick. Потребители
+парсера (третий блок) — `recon.rs` (сверка с биржей) и `red_parse.rs` (тест): ни один не
+пишет в журнал. Отдельного пути ЭМИССИИ у ресинка сегодня НЕ СУЩЕСТВУЕТ.
 
 `R-161` снимал этот замер по споту; здесь он расширен на фьючерсы, и вывод тот же, но
 основание точнее: вторая точка `futures:104` — REST-**парсер**, потребитель которого
