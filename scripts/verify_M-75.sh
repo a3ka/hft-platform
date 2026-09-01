@@ -134,6 +134,35 @@ else
   chk "printf '%s\n' \"\${CALLS}\" | grep -qE 'selector|bands' && exit 1 || exit 0"
 fi
 
+step "task #2b — затронутые ЧУЖИЕ оракулы восстановлены при серверном окне (C-198 B-5, C-201 B-7)"
+# ШАГ ИСПОЛНЯЕМЫЙ, А НЕ ТЕКСТОВЫЙ (`C-201` B-7). Прежняя редакция грепала имя функции — и
+# зеленела от ОДНОГО КОММЕНТАРИЯ с этим именем; предъявлено прогоном. Это разобранный класс
+# («grep по имени ловит и лог-строки», `testing.md`), повторённый автором.
+#
+# Три исхода различает `chk_named_test`: ВАКУУМ (тестов не нашлось) ≠ COMPILE-RED (сеттера
+# ещё нет, задача 2 не сделана) ≠ исполнено-и-упало (восстановление неверно). До задачи 2 шаг
+# КРАСЕН как COMPILE-RED — это правильное состояние, а не дефект гейта.
+for t in red_depth_from_book red_depth_provenance_by_reach red_heatmap red_egress_cap; do
+  chk_named_test "затронутый оракул ${t} зелен при серверном окне" \
+    cargo test -p gateway --test "${t}" --quiet
+done
+# Дешёвый страж поверх исполнения: вызов обязан быть ВЫЗОВОМ, а не упоминанием в комментарии.
+# Строка, начинающаяся с `//`, не считается — это и есть дыра, найденная `C-201` B-7.
+for f in crates/gateway/tests/red_depth_from_book.rs \
+         crates/gateway/tests/red_depth_provenance_by_reach.rs \
+         crates/gateway/tests/red_heatmap.rs \
+         crates/gateway/tests/red_egress_cap.rs; do
+  chk "grep -E '^[^/]*set_effective_heatmap_window_frac\\(' ${f} >/dev/null"
+done
+# Гигиена процессно-глобального окна во ВСЕХ четырёх файлах (`C-201` B-6: гонка в red_heatmap
+# была флаком — три прогона дали FAILED/FAILED/ok; serial стоял лишь в одном файле).
+for f in crates/gateway/tests/red_egress_cap.rs \
+         crates/gateway/tests/red_heatmap.rs \
+         crates/gateway/tests/red_depth_from_book.rs \
+         crates/gateway/tests/red_depth_provenance_by_reach.rs; do
+  chk "grep -q 'fn serial()' ${f}"
+done
+
 step "task #3 — разбор env FAIL-CLOSED: невалидное значение = отказ старта, не дефолт"
 chk_named_test "оракул fail-closed разбора GATEWAY_HEATMAP_WINDOW" \
   cargo test -p gateway-serve --test red_heatmap_window_env --quiet
