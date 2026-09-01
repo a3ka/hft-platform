@@ -126,9 +126,6 @@ fn sel() -> Selector {
         timeframe_ms: 1_000,
         bands: vec![PROD_BAND],
         window_ms: None,
-        // M-68 задача 22: поле добавлено в Selector; `None` = пер-событийно,
-        // то есть НЕЙТРАЛ — прежняя семантика этого теста сохранена бит-в-бит.
-        depth_cadence_ms: None,
     }
 }
 
