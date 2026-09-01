@@ -32,7 +32,6 @@ $ grep -n 'GATEWAY_MAX_RESPONSE_BYTES' crates/gateway-serve/src/lib.rs | head -1
 $ grep -rniE 'viewport|растр|пиксел|видимая область' docs/DESIGN.md docs/fa/*.md \
     docs/0*.md milestones/M-70-* milestones/M-71-* | wc -l
 15
-                        # укрупнения разрешения ПО ГЛУБИНЕ в корпусе НЕТ
 ```
 
 **Прочтение выводов — АВТОРСКАЯ интерпретация, вынесена из блока** (класс `C-199` B-4,
