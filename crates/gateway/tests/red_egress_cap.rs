@@ -85,7 +85,34 @@ fn lvl(price: f64, size: f64) -> Level {
     }
 }
 
+/// **Гигиена процессно-глобального окна (`C-198` B-5).** Эффективное окно heatmap/COB —
+/// состояние ПРОЦЕССА, а тесты этого файла намеренно используют РАЗНЫЕ охваты: одни строят
+/// заведомо огромный ответ, другой (`pl_i_5_e`) проверяет, что прод-дефолтный селектор
+/// обслуживается. При параллельном исполнении широкий сосед перезаписывал окно под ногами у
+/// узкого, и `pl_i_5_e` падал, НЕ БУДУЧИ сломанным.
+///
+/// Замер, доказавший, что это гонка, а не дефект: `cargo test --test red_egress_cap
+/// -- --test-threads=1` → `9 passed; 0 failed`, тогда как параллельный прогон давал три
+/// падения. Приём и причина — те же, что в `red_egress_cap_governed.rs:66`.
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
 fn sel(bands: Vec<f64>) -> Selector {
+    // M-75 (`C-198` B-5): окно heatmap/COB БОЛЬШЕ НЕ выводится из `Selector.bands` — оно
+    // серверное. Оракулы этого файла строились, когда окно было `max(bands)`, и их предмет
+    // (глубина карты/COB, объём ответа) от охвата ЗАВИСИТ. Приём восстановления предмета:
+    // ставим СЕРВЕРНОЕ окно равным тому, что прежде давал селектор, — смысл каждого теста
+    // сохраняется дословно, меняется лишь ИСТОЧНИК величины.
+    //
+    // Настройка процессно-глобальна ⇒ тесты, зависящие от охвата, идут под `serial()`.
+    let w = bands.iter().copied().fold(0.0_f64, f64::max);
+    if w > 0.0 {
+        gateway::set_effective_heatmap_window_frac(w);
+    }
     Selector {
         venue: Venue::Binance,
         symbol: "BTCUSDT".to_string(),
@@ -269,6 +296,7 @@ fn big_numbers(msg: &str) -> Vec<u64> {
 /// Без E набор был бы зелен против реализации, отвергающей вообще всё.
 #[test]
 fn pl_i_5_e_prod_default_selector_is_served() {
+    let _g = serial(); // C-198 B-5: окно heatmap процессно-глобально
     let dir = deep_book();
     let got = snapshot(dir.path(), vec![PROD_BAND]);
     let s = got.expect(
@@ -299,6 +327,7 @@ fn pl_i_5_e_prod_default_selector_is_served() {
 /// «на всякий случай», ломает работу там, где ресурса не тратится вовсе.
 #[test]
 fn pl_i_5_e2_degenerate_books_are_served() {
+    let _g = serial(); // C-198 B-5: окно heatmap процессно-глобально
     let empty = journal_prod_shape(0, N_BUCKETS);
     snapshot(empty.path(), vec![ABUSIVE_BAND])
         .expect("PL-I-5 E-2: пустая книга не тратит ресурса — отвергать её нечем и не за что");
@@ -354,6 +383,7 @@ fn narrow_bands(n: usize, base: f64) -> Vec<f64> {
 /// `COGNITIVE-ONLY`.** Диапазон объявлен спекой; расширять его — правка спеки, не теста.
 #[test]
 fn pl_i_5_e3_family_of_honest_multi_band_requests_is_served() {
+    let _g = serial(); // C-198 B-5: окно heatmap процессно-глобально
     let dir = journal_prod_shape(400, 4);
     let base = 0.0001_f64;
 
@@ -393,6 +423,8 @@ fn pl_i_5_e3_family_of_honest_multi_band_requests_is_served() {
 /// эта — НЕ отвергать их, пока они дёшевы.
 #[test]
 fn pl_i_5_e4_equal_bytes_opposite_composition_get_the_same_verdict() {
+    // C-198 B-5: окно heatmap процессно-глобально
+    let _g = serial();
     // heatmap-тяжёлый: книга, ноль сделок
     let hm = journal_prod_shape(300, 4);
     // trades-тяжёлый: сделки, ноль L2-событий
@@ -452,6 +484,7 @@ fn pl_i_5_e4_equal_bytes_opposite_composition_get_the_same_verdict() {
 /// одного сообщения подписки.
 #[test]
 fn pl_i_5_a_oversized_response_is_refused_not_served() {
+    let _g = serial(); // C-198 B-5: окно heatmap процессно-глобально
     let dir = deep_book();
     let narrow = snapshot(dir.path(), vec![PROD_BAND]).expect("узкий обязан обслуживаться");
 
@@ -482,6 +515,7 @@ fn pl_i_5_a_oversized_response_is_refused_not_served() {
 /// ограничившей heatmap и забывшей остальное.
 #[test]
 fn pl_i_5_a2_dense_non_heatmap_response_is_refused() {
+    let _g = serial(); // C-198 B-5: окно heatmap процессно-глобально
     let dir = tempfile::tempdir().expect("tempdir");
     {
         let mut j = Journal::open_with(dir.path(), cfg()).expect("open_with");
@@ -525,6 +559,7 @@ fn pl_i_5_a2_dense_non_heatmap_response_is_refused() {
 /// `Err`, а НЕ урезанный `Ok`; принятый запрос отдаёт ровно столько, сколько есть в книге.
 #[test]
 fn pl_i_5_b_no_silent_truncation_on_either_side() {
+    let _g = serial(); // C-198 B-5: окно heatmap процессно-глобально
     let dir = deep_book();
 
     // (1) превышение обязано быть ОШИБКОЙ, а не урезанным успехом
@@ -603,6 +638,8 @@ fn pl_i_5_b_no_silent_truncation_on_either_side() {
 /// (`crates/gateway/src/lib.rs:1893-1905`), а не в `serve_config_from_env`.
 #[test]
 fn pl_i_4_c_limit_has_no_bypass_across_entry_points() {
+    // C-198 B-5: окно heatmap процессно-глобально
+    let _g = serial();
     // ДВА РАЗНЫХ РЕСУРСА через КАЖДУЮ дверь (`A-021`, обязательный набор п.1). Первая
     // редакция гоняла только широкую книгу, и реализация, отвергающая её и пропускающая
     // плотные сделки, оставалась зелёной — `C-158` R1 предъявил это исполнением.
@@ -721,6 +758,7 @@ fn pl_i_4_c_limit_has_no_bypass_across_entry_points() {
 /// «too large», и сообщение, называющее только одну из двух величин.
 #[test]
 fn pl_i_5_f_refusal_names_the_limit_and_the_observed_value() {
+    let _g = serial(); // C-198 B-5: окно heatmap процессно-глобально
     let dir = deep_book();
     let err = match snapshot(dir.path(), vec![ABUSIVE_BAND]) {
         Err(e) => e,
