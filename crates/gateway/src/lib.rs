@@ -15,7 +15,7 @@
 use std::collections::BTreeMap;
 use std::io;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use contracts::{Event, EventKind, MdEvent, MdPayload, Side, Venue};
 use journal::EpochFilter;
@@ -92,6 +92,27 @@ pub const GATEWAY_SCHEMA_VERSION: u32 = 9;
 /// §5.1 называет 2 000 000 как предложение founder'а; конструкция (один
 /// `enforce_response_limit`, вызов из шести строителей) от числа НЕ зависит.
 pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 2_000_000;
+
+/// M-75 (`milestones/M-75-heatmap-window-decoupling.md` §5): прод-дефолт
+/// полуширины окна heatmap/COB как доля от mid. Равен сегодняшнему
+/// эффективному значению, чтобы расцепление не меняло данные при внедрении.
+pub const DEFAULT_HEATMAP_WINDOW_FRAC: f64 = 0.001;
+
+/// M-75: процессное эффективное значение полуширины окна heatmap/COB.
+/// Читается при каждом построении выдачи и устанавливается один раз при старте
+/// `gateway-serve` после успешного разбора `GATEWAY_HEATMAP_WINDOW`.
+static EFFECTIVE_HEATMAP_WINDOW_FRAC: AtomicU64 =
+    AtomicU64::new(DEFAULT_HEATMAP_WINDOW_FRAC.to_bits());
+
+/// Получить эффективную полуширину окна heatmap/COB как долю от mid.
+pub fn effective_heatmap_window_frac() -> f64 {
+    f64::from_bits(EFFECTIVE_HEATMAP_WINDOW_FRAC.load(Ordering::Relaxed))
+}
+
+/// Установить эффективную полуширину окна heatmap/COB.
+pub fn set_effective_heatmap_window_frac(w: f64) {
+    EFFECTIVE_HEATMAP_WINDOW_FRAC.store(w.to_bits(), Ordering::Relaxed);
+}
 
 /// M-71 (`milestones/M-71-egress-cap.md` §4bis.2): эффективное значение предела,
 /// которое читают точки применения в `gateway` (`enforce_response_limit`). Заводится
@@ -369,7 +390,8 @@ pub struct SeriesBundle {
     pub vp_session_max_time_s: Vec<(i64, i64)>,
     /// M-23 Heatmap (HM-I-1..2): per-бакет снимок L2Delta-реконструированной книги (M-29
     /// `apply_delta`). Close-семантика per бакет — перезапись при последнем апдейте.
-    /// Ячейки ТОЛЬКО в окне `[mid*(1−W), mid*(1+W)]`, W=max(`Selector.bands`). Провенанс
+    /// Ячейки ТОЛЬКО в окне `[mid*(1−W), mid*(1+W)]`, W=эффективная серверная
+    /// полуширина heatmap/COB. Провенанс
     /// обязателен на deep-ячейках (>1.3% от mid).
     pub heatmap: Vec<HeatmapCell>,
     /// M-23 COB (HM-I-3): уровни книги в окне на финальном курсоре snapshot'а.
@@ -1480,7 +1502,8 @@ impl Reducer {
         // книги из `heatmap_buckets` (close-семантика) + bubbles из `bubbles` (Trade-аккумулятор).
         // M-56: обе функции принимают `&BTreeMap` — `heatmap_buckets` (per-bucket ПОЛНЫЙ снимок
         // книги, самое дорогое после `book` поле) читается по ссылке, не клонируется.
-        let (heatmap, cob) = build_heatmap_and_cob(&self.selector, &self.heatmap_buckets);
+        let (heatmap, cob) =
+            build_heatmap_and_cob(effective_heatmap_window_frac(), &self.heatmap_buckets);
         let volume_bubbles = build_volume_bubbles(&self.bubbles);
 
         // M-38a task #7: `cvd_session_base` (Vec, per-session — собран выше в цикле по
@@ -1537,7 +1560,8 @@ impl Reducer {
 }
 
 /// M-23: построить `Vec<HeatmapCell>` + `Vec<CobLevel>` из per-bucket снимков книги.
-/// Heatmap: per бакет, ячейки в окне `[mid*(1−W), mid*(1+W)]`, W=max(bands). Провенанс на
+/// Heatmap: per бакет, ячейки в окне `[mid*(1−W), mid*(1+W)]`, W — эффективная
+/// полуширина окна, переданная вызывающим сервером. Провенанс на
 /// ячейках глубже 1.3% от mid (HM-I-2). COB: финальный стакан в том же окне, mid с fallback
 /// на последний известный.
 ///
@@ -1551,10 +1575,10 @@ impl Reducer {
 /// вызывающих (`finish`/`finish_ref`) — единственная причина, по которой `heatmap_buckets`
 /// вообще стоило бы клонировать, это ошибочная сигнатура, не алгоритм.
 fn build_heatmap_and_cob(
-    selector: &Selector,
+    window_frac: f64,
     heatmap_buckets: &BTreeMap<i64, HeatmapBucketState>,
 ) -> (Vec<HeatmapCell>, Vec<CobLevel>) {
-    let w = selector.bands.iter().copied().fold(0.0_f64, f64::max);
+    let w = window_frac;
     let mut heatmap_out: Vec<HeatmapCell> = Vec::new();
     let mut last_cob_bids: Vec<(i64, i64)> = Vec::new();
     let mut last_cob_asks: Vec<(i64, i64)> = Vec::new();
