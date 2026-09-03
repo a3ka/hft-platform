@@ -555,12 +555,27 @@ impl VwapAcc {
     }
 }
 
+/// M-70 §2bis.0 (DB-I-4, TD-159): точка депт-серии хранит пару `(depth, reach_at_obs)` —
+/// охват, снятый ТЕМ ЖЕ наблюдением книги, из которого взят `depth_e8`. Без per-point
+/// reach метку можно поставить ЛИШЬ задним числом, из последнего `depth_reach_*` —
+/// то есть не поставить вовсе (та самая тихая ложь `liveness=confirmed` поверх
+/// депт-числа по обрезанной ресинком книге, против которой стоит `П-014`).
+///
+/// `Serialize/Deserialize` на этой структуре — часть чекпоинта (`Reducer.depth: Vec<DepthAcc>`,
+/// M-38b). Смена формы `values` означает, что существующие на диске чекпоинты
+/// `postcard::from_bytes` НЕ ДЕКОДИРУЕТ (тип ключ-значения изменился). Это та же инвалидация,
+/// которую `task #6` (bump `GATEWAY_SCHEMA_VERSION` 9 → 10) вызовет и так — поэтому
+/// нерегистрируемое разрушение кэша архитектурно уже на столе, и остановить его может
+/// только bump, а не отказ от формы (это решение architect'а, см. §2bis.0).
 #[derive(Clone, Serialize, Deserialize)]
 struct DepthAcc {
     side: Side,
     band: f64,
     band_pct_e8: i64,
-    values: BTreeMap<i64, i64>,
+    /// `time_s → (depth_e8, reach_at_observation)`. Раньше — `BTreeMap<i64, i64>`,
+    /// только глубина: метку приходилось брать из `Reducer::depth_reach_*`, что описывало
+    /// ВСЕ точки одним значением. Теперь точка помнит охват СВОЕГО наблюдения.
+    values: BTreeMap<i64, (i64, f64)>,
 }
 
 /// M-24 Volume Profile accumulator (M-24 VP-аккумулятор). Per-session гистограмма
@@ -1323,6 +1338,13 @@ impl Reducer {
         let (bid_sums, bid_count) = self.depth_from_book(&bid_levels, mid, Side::Buy, bands);
         let (ask_sums, ask_count) = self.depth_from_book(&ask_levels, mid, Side::Sell, bands);
         self.depth_levels_visited += bid_count + ask_count;
+        // M-70 §2bis.0 (DB-I-4): охват снимается ПЕР-СТРОКЕ ОДНИМ наблюдением книги
+        // (то же, что у чисел `depth_e8`), и записывается В ТОЧКУ рядом с глубиной. Метка
+        // в `finish_ref` будет считаться из этой пары, а не из последнего `depth_reach_*` —
+        // иначе каждая точка ряда получает метку ПОСЛЕДНЕГО наблюдения, и `PL-I-7`
+        // срабатывает наоборот (точка из окна ресинка описана как `liveness=confirmed`).
+        let reach_bid = self.book.max_reach_pct(Side::Buy).unwrap_or(0.0);
+        let reach_ask = self.book.max_reach_pct(Side::Sell).unwrap_or(0.0);
         // Раскладка строк `self.depth` — `(band, side)` лексикографически (см.
         // `ensure_depth_rows_initialized`); ищем `band_idx` по `band_pct_e8` (`f64 → i64`,
         // детерминированно из селектора), чтобы не зависеть от порядка строк.
@@ -1333,17 +1355,19 @@ impl Reducer {
             else {
                 continue;
             };
-            let sum = match row.side {
-                Side::Buy => bid_sums[band_idx],
-                Side::Sell => ask_sums[band_idx],
+            let (sum, reach) = match row.side {
+                Side::Buy => (bid_sums[band_idx], reach_bid),
+                Side::Sell => (ask_sums[band_idx], reach_ask),
             };
-            row.values.insert(time_s, sum);
+            row.values.insert(time_s, (sum, reach));
         }
-        // Охват — O(1) (`max_reach_pct` = `keys().next_back()` для bid, `next()` для ask;
-        // `crates/book/src/lib.rs`). На КАЖДОМ L2-событии: цена здесь — два скаляра, не
-        // зависит от глубины книги.
-        self.depth_reach_bid = self.book.max_reach_pct(Side::Buy).unwrap_or(0.0);
-        self.depth_reach_ask = self.book.max_reach_pct(Side::Sell).unwrap_or(0.0);
+        // Охват обновляется и глобально (`depth_reach_bid`/`depth_reach_ask` — старый путь,
+        // сейчас не читается для метки, но поддерживается как часть state для обратной
+        // совместимости и диагностики; см. док на полях `Reducer::depth_reach_*`).
+        // Удаление полей — отдельное решение и требует bump `CKPT_SCHEMA_VERSION`, не
+        // входит в задачу 4.
+        self.depth_reach_bid = reach_bid;
+        self.depth_reach_ask = reach_ask;
     }
 
     /// M-68 rev6, задача 12 (R-138 Б-1): РОЛЛОВЕР каденс-интервала (§0sexies.2ter).
@@ -1401,6 +1425,11 @@ impl Reducer {
         let (bid_sums, bid_count) = self.depth_from_book(&bid_levels, mid, Side::Buy, bands);
         let (ask_sums, ask_count) = self.depth_from_book(&ask_levels, mid, Side::Sell, bands);
         self.depth_levels_visited += bid_count + ask_count;
+        // M-70 §2bis.0 (DB-I-4): охват пишется В ТОЧКУ рядом с глубиной (см. зеркальный
+        // комментарий в `recompute_depth_from_book`). Каденс-путь делает то же самое, что
+        // и legacy-путь, только раз в интервал вместо раз в событие.
+        let reach_bid = self.book.max_reach_pct(Side::Buy).unwrap_or(0.0);
+        let reach_ask = self.book.max_reach_pct(Side::Sell).unwrap_or(0.0);
         for row in self.depth.iter_mut() {
             let Some(band_idx) = bands
                 .iter()
@@ -1408,16 +1437,16 @@ impl Reducer {
             else {
                 continue;
             };
-            let sum = match row.side {
-                Side::Buy => bid_sums[band_idx],
-                Side::Sell => ask_sums[band_idx],
+            let (sum, reach) = match row.side {
+                Side::Buy => (bid_sums[band_idx], reach_bid),
+                Side::Sell => (ask_sums[band_idx], reach_ask),
             };
-            row.values.insert(key_time_s, sum);
+            row.values.insert(key_time_s, (sum, reach));
         }
         // Охват — на ТОМ ЖЕ наблюдении, что и числа (§2bis, d7). `max_reach_pct` —
         // O(1) (`keys().next_back()` для bid, `next()` для ask; `crates/book/src/lib.rs`).
-        self.depth_reach_bid = self.book.max_reach_pct(Side::Buy).unwrap_or(0.0);
-        self.depth_reach_ask = self.book.max_reach_pct(Side::Sell).unwrap_or(0.0);
+        self.depth_reach_bid = reach_bid;
+        self.depth_reach_ask = reach_ask;
     }
 
     /// M-56 (`TD-097`, task #1): `finish(self)` теперь ТОЛЬКО обёртка над `finish_ref(&self)` —
@@ -1488,33 +1517,25 @@ impl Reducer {
         // для честности относительно фактического охвата книги после ресинка (`П-017`
         // предусловие (а)).
         //
-        // Охват берётся из `depth_reach_bid`/`depth_reach_ask` — СНЯТОГО в момент последнего
-        // наблюдения глубины (ветка `L2Snapshot` в `apply`), а НЕ из живой `self.book` здесь.
-        // Знание о ресинке по-прежнему НЕ ТРЕБУЕТСЯ (`П-014` явно): охват считается из того же
-        // наблюдения, из которого считается сама глубина. Причина именно такой точки съёма —
-        // `GW-I-4`/`VB-I-2` (`R-110` Б-1) на журнале с дельтами: подробный разбор и замер
-        // расхождения — в доке поля `Reducer::depth_reach_bid`.
+        // Охват берётся из ПАРЫ `(depth_e8, reach)`, записанной ТОГДА ЖЕ, когда пишется число
+        // (ветка `L2Snapshot`/`L2Delta` в `apply`, через `recompute_depth_from_book`/
+        // `commit_depth_at`). Это снимает тихую ложь класса `PL-I-7`: точка из окна ресинка
+        // раньше описывалась меткой последнего наблюдения. `GW-I-4`/`VB-I-2` (`R-110` Б-1) —
+        // замер расхождения до этой правки — см. в истории милестоуна.
+        //
+        // Глобальные `depth_reach_bid`/`depth_reach_ask` ПО-ПРЕЖНЕМУ обновляются на каждом
+        // L2-событии (часть state, не читается для метки; см. док на полях полей). Удаление
+        // их — отдельное решение, требует bump `CKPT_SCHEMA_VERSION` (не входит в задачу 4:
+        // инвалидация кэша и так на столе у задачи 6).
         //
         // `finish_ref` теперь НЕ читает `self.book` вообще — это же и есть дисциплина
         // `red_snapshot_noclone::o1_snapshot_allocation_does_not_grow_with_state` (потолок
         // ×2.5): самое дорогое поле состояния на пути построения ответа не участвует.
-        let reach_bid = self.depth_reach_bid;
-        let reach_ask = self.depth_reach_ask;
 
         let depth_series = self
             .depth
             .iter()
             .map(|row| {
-                let reach = match row.side {
-                    Side::Buy => reach_bid,
-                    Side::Sell => reach_ask,
-                };
-                // M-70 §2bis (DB-I-4): метка ставится НА ТОЧКУ, тем же наблюдением книги,
-                // из которого взят `depth_e8` (`MD-I-8` обязательство 4). Раньше метка жила
-                // на строке и описывала ВСЕ точки одним значением — после ресинка часть
-                // точек наблюдалась при ужатой книге, а метка несла состояние последнего
-                // наблюдения (PL-I-7 наоборот: деградация выдана за норму).
-                let label = depth_provenance_label(row.band_pct_e8, row.side, reach);
                 DepthRow {
                     side: match row.side {
                         Side::Buy => "bid",
@@ -1522,13 +1543,20 @@ impl Reducer {
                     }
                     .to_string(),
                     band_pct_e8: row.band_pct_e8,
+                    // M-70 §2bis.0 (DB-I-4): метка считается ПОТОЧЕЧНО из пары
+                    // `(depth_e8, reach)`, записанной ТЕМ ЖЕ наблюдением книги
+                    // (`MD-I-8` обязательство 4 — число и провенанс сняты ОДНИМ
+                    // наблюдением). Раньше метка жила на строке и описывала ВСЕ точки
+                    // одним значением — после ресинка часть точек наблюдалась при ужатой
+                    // книге, а метка несла состояние последнего наблюдения (PL-I-7
+                    // наоборот: деградация выдана за норму).
                     series: row
                         .values
                         .iter()
-                        .map(|(&t, &v)| DepthPoint {
+                        .map(|(&t, &(v, reach))| DepthPoint {
                             time_s: t,
                             depth_e8: v,
-                            provenance: label.clone(),
+                            provenance: depth_provenance_label(row.band_pct_e8, row.side, reach),
                         })
                         .collect(),
                 }
