@@ -211,7 +211,22 @@ step "task #4b — адаптер sacred-оракула читает метку 
 # SETUP-GUARD НА СОБСТВЕННОЕ УТВЕРЖДЕНИЕ (`A-031` §1): пока формы нет, «оракул зелен» ничего
 # не сказало бы о задаче 4b — метке точки взяться неоткуда. Поэтому сперва форма, потом адаптер.
 if grep -qE '^pub struct DepthPoint' "${LIB}"; then
-  chk "! grep -qE 'vec!\\[row\\.depth_band_provenance' ${T4}"
+  # ПЯТЫЙ НОСИТЕЛЬ КЛАССА `A-031`, найденный `R-171` Н-1 — и найденный НА МНЕ, в том же
+  # файле, где §3ter объявил класс закрытым у четырёх. Прежний предикат
+  # `! grep -qE 'vec!\[row\.depth_band_provenance'` наблюдал ТЕКСТ ФАЙЛА и краснел от
+  # ДОК-КОММЕНТАРИЯ, описывающего ПРЕЖНЮЮ форму (`red_depth_point_provenance.rs:270`), тогда
+  # как сам адаптер (`:274-276`) обновлён верно и исполнение того же шага давало PASS.
+  # Требование шага — «адаптер читает метку КАЖДОЙ точки», и оно про ПОВЕДЕНИЕ: его судит
+  # прогон оракула ниже. Структурный страж сужен до ТЕЛА функции-адаптера и якорится к
+  # конструкции, а не к вхождению строки в файл.
+  ADAPTER_BODY="$(awk '/^fn point_provenances\(/{f=1} f{print} f&&/^}$/{exit}' "${T4}" 2>/dev/null)"
+  if [ "$(printf '%s' "${ADAPTER_BODY}" | wc -l)" -lt 2 ]; then
+    echo "FAIL: task #4b — тело fn point_provenances не извлечено (переименована или удалена): страж адаптера был бы ВАКУУМНО зелёным" >&2
+    FAIL=$((FAIL + 1))
+  else
+    chk "printf '%s' \"\${ADAPTER_BODY}\" | grep -q 'row.series'"
+    chk "! printf '%s' \"\${ADAPTER_BODY}\" | grep -q 'depth_band_provenance'"
+  fi
   chk_named_test "DB-I-4 против НОВОЙ формы (адаптер обновлён)" \
     cargo test -p gateway --test red_depth_point_provenance --quiet
 else
