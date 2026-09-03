@@ -28,14 +28,14 @@
 #
 # | шаг         | требование                                 | предмет наблюдения (чем пиннится)              |
 # |-------------|--------------------------------------------|------------------------------------------------|
-# | ПРЕДУСЛОВИЕ | `M-75` влит в `main`                       | `^pub fn effective_heatmap_window_frac(` в `main` |
+# | ПРЕДУСЛОВИЕ | `M-75` влит в `main`                       | `^pub fn …(` БЕЗ конвейера + самопроверка обоих исходов (`C-208` B-2) |
 # | task #3     | предел полос отвергает ДО построения | ИСПОЛНЕНИЕ `DB-I-3` + `^pub const MAX_BANDS` + равенство чисел |
 # | task #4     | два сценария `DB-I-4` живы                 | `^fn ИМЯ` в T4 + ИСПОЛНЕНИЕ через chk_named_test |
 # | task #4b    | адаптер оракула читает метку КАЖДОЙ точки  | форма `^pub struct DepthPoint` + отсутствие заглушки-однострочника + ИСПОЛНЕНИЕ |
 # | task #5     | словарь метки ОДИН на всю выдачу           | ИСПОЛНЕНИЕ `DB-I-5` + поимённый состав + гвард `serial()` |
 # | task #6     | форма объявлена БАМПОМ                     | ЧИСЛО версии на HEAD строго больше, чем в базе  |
 # | task #6b    | sacred-пины версии подняты вместе с бампом | `EXPECTED_SCHEMA_VERSION` == константа `lib.rs` |
-# | task #7     | канонический состав ДОЕХАЛ до сервиса      | СТРОКА ключа YAML + все семь значений + ИСПОЛНЕНИЕ `DB-I-7` (env → селектор) |
+# | task #7     | канонический состав ДОЕХАЛ до сервиса      | СТРОКА ключа YAML + семь значений + `DB-I-7` ДВУХ уровней (парсер И кадр на проводе) |
 # | task #8     | `VB-I-10` не ослаблен                      | ИСПОЛНЕНИЕ существующих оракулов окна памяти    |
 # | C           | границы предмета не тронуты                | `git diff` от merge-base, не текст файла        |
 #
@@ -115,7 +115,39 @@ step "ПРЕДУСЛОВИЕ — M-75 влит: без него задачи 0 �
 # Якорь КОНСТРУКЦИИ, а не вхождения имени: упоминание в doc-комментарии `main` (например в
 # спеке-цитате внутри кода) удовлетворило бы прежний греп, не означая расцепления (`A-031`
 # носитель №6 — тот же класс).
-chk "git show origin/main:crates/gateway/src/lib.rs | grep -qE '^pub fn effective_heatmap_window_frac\\('"
+#
+# ФОРМА ПРОВЕРКИ — БЕЗ КОНВЕЙЕРА, и это не стиль (`C-208` B-2). Прежняя редакция писала
+# `git show … | grep -q …`. Под `set -o pipefail` это ЛОЖНОЕ КРАСНОЕ: `grep -q` выходит на
+# первом совпадении и закрывает конвейер, `git show` получает SIGPIPE и отдаёт 141, а
+# `pipefail` берёт худший код — предусловие «не выполнено» при ВЫПОЛНЕННОМ требовании
+# (замер критика: `stages=141 0`). Гейт, который не может стать зелёным после сделанной
+# работы, — дефект гейта. Здесь источник читается в переменную, предикат — на herestring:
+# конвейера нет, SIGPIPE неоткуда взяться.
+m75_has_decoupling() { # $1 — текст файла; 0 = конструкция есть, 1 = нет
+  grep -qE '^pub fn effective_heatmap_window_frac\(' <<< "$1"
+}
+M75_SRC="$(git show origin/main:crates/gateway/src/lib.rs 2>/dev/null || true)"
+
+# САМОПРОВЕРКА ПРЕДИКАТА НА ОБОИХ ИСХОДАХ (`C-208` требование 2): предикат, у которого не
+# предъявлены ОБА кода возврата, мог бы быть вечно-красным или вечно-зелёным, и мы бы этого
+# не увидели. Проверяется на синтетических входах, а не на реальном файле.
+if m75_has_decoupling 'pub fn effective_heatmap_window_frac() -> f64 {' \
+   && ! m75_has_decoupling '/// см. pub fn effective_heatmap_window_frac() — упоминание'; then
+  echo "PASS: самопроверка предиката M-75 — истинный вход даёт 0, ложный (комментарий) даёт 1"
+else
+  echo "FAIL: самопроверка предиката M-75 — предикат не различает наличие конструкции и упоминание в комментарии; предусловие судило бы не то" >&2
+  FAIL=$((FAIL + 1))
+fi
+
+if [ -z "${M75_SRC}" ]; then
+  echo "FAIL: ПРЕДУСЛОВИЕ SETUP НЕ СОСТОЯЛСЯ — origin/main:crates/gateway/src/lib.rs не прочитан (нет origin? не тот путь?): вывод о расцеплении был бы ложным при любой реализации" >&2
+  FAIL=$((FAIL + 1))
+elif m75_has_decoupling "${M75_SRC}"; then
+  echo "PASS: ПРЕДУСЛОВИЕ — M-75 влит в main (^pub fn effective_heatmap_window_frac( присутствует)"
+else
+  echo "FAIL: ПРЕДУСЛОВИЕ — M-75 НЕ влит в main: задачи 0 и 3 мерили бы мир, которого не будет (§0.3quater)" >&2
+  FAIL=$((FAIL + 1))
+fi
 
 step "task #0 — объём канонического набора СНЯТ ЗАМЕРОМ в байтах (DB-I-0)"
 # Задача 0 закрыта не текстом в спеке, а ИСПОЛНЯЕМЫМ замером: два наших документа называли
@@ -202,7 +234,7 @@ chk_named_test "оракул DB-I-5 (один словарь на всю выд�
 for t in db_i_5_one_dictionary_for_cell_and_row_in_the_same_response \
          db_i_5b_map_labels_discriminate_side_like_the_series_does \
          db_i_5c_series_does_not_lose_liveness_to_unification \
-         db_i_5d_cell_beyond_current_reach_is_named_not_observed; do
+         db_i_5d_cell_keeps_the_provenance_of_its_own_observation; do
   chk "grep -q '^fn ${t}' crates/gateway/tests/red_depth_label_dictionary.rs"
 done
 # Гвард гигиены: окно heatmap процессно-глобально, а этому файлу нужно ШИРОКОЕ окно —
@@ -259,10 +291,13 @@ step "task #7 — канонический состав GATEWAY_BANDS ДОЕХА
 # его судит оракул. Мир «включили в конфиге, а выдача прежняя» — класс built-not-wired.
 chk_named_test "оракул DB-I-7 (состав из окружения доезжает до селектора)" \
   cargo test -p gateway-serve --test red_depth_bands_delivery --quiet
+# `^(async )?fn` — сценарий уровня доставки асинхронный (`#[tokio::test]`), и якорь `^fn`
+# его не находил: поимённая сверка поймала это на мне же, ровно за тем и стоит.
 for t in db_i_7_canonical_bands_from_env_reach_the_selector \
          db_i_7b_absent_bands_fall_back_to_prod_default_not_to_refusal \
-         db_i_7c_canonical_and_default_are_actually_distinguishable; do
-  chk "grep -q '^fn ${t}' crates/gateway-serve/tests/red_depth_bands_delivery.rs"
+         db_i_7c_canonical_and_default_are_actually_distinguishable \
+         db_i_7d_canonical_bands_reach_the_frame_on_the_wire; do
+  chk "grep -qE '^(async )?fn ${t}' crates/gateway-serve/tests/red_depth_bands_delivery.rs"
 done
 # Требование — «оператор отдаёт канонический набор ИЗ СЕРВИСА, который его читает». Прежний
 # греп смотрел вхождение `GATEWAY_BANDS.*0.015` В ФАЙЛ: его удовлетворяла закомментированная

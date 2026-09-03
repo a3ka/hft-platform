@@ -1,5 +1,8 @@
 //! SACRED (architect-only) — `M-70` `DB-I-7`: **канонический состав полос ДОЕЗЖАЕТ от
-//! конфига до выдачи**, а не остаётся строкой в `docker-compose.yml`.
+//! конфига до КАДРА НА ПРОВОДЕ**, а не остаётся строкой в `docker-compose.yml`.
+//!
+//! Заявление проверяется на ДВУХ уровнях — парсер и прод-точка входа; почему одного мало,
+//! сказано ниже (`C-208` B-3).
 //!
 //! # Против какого мира стоит оракул
 //!
@@ -25,14 +28,27 @@
 //! прод-дефолт, а не отказ. Без него требование удовлетворяется реализацией «всегда Err» —
 //! ценой неработающего сервиса (тот же парный vantage, что в `red_heatmap_window_env.rs`).
 //!
+//! # ДВА УРОВНЯ, и первый сам по себе НЕ доказывает доставку (`C-208` B-3)
+//!
+//! Круг 2 предъявил: сценарии, зовущие только `serve_config_from_env`, покрывают ПАРСЕР, а
+//! не путь выдачи. Реализация, где парсер верен, а исполняемый файл после разбора теряет или
+//! подменяет селектор, проходила бы их все — то есть ровно тот built-not-wired мир, который
+//! оракул заявлял закрытым. Находка верна, и заявление сужено не словами, а работой:
+//!
+//! - **уровень парсера** (`db_i_7`, `db_i_7b`, `db_i_7c`): окружение → `ServeConfig.selector`.
+//!   Дёшев, ловит опечатку в ключе, поломку разделителя, молчаливый дефолт;
+//! - **уровень ДОСТАВКИ** (`db_i_7d`): прод-точка входа `bind` → `serve` → WS-подключение →
+//!   первый `Snapshot` НА ПРОВОДЕ. Это граница процесса тем вызовом, каким её дёргает прод
+//!   (`testing.md` §«Механизм несущего пути обязан иметь оракул точки входа»), и никакой
+//!   парсер её не подменяет.
+//!
 //! # Состояние
 //!
-//! Оракул ЗЕЛЁН уже сегодня: `serve_config_from_env` умеет разбирать список полос, и
-//! механизм доставки существует. Это СТОРОЖ, а не предмет — он краснеет ровно тогда, когда
-//! задача 7 будет сделана «в конфиге, но не на пути»: если разбор сломают, переименуют ключ
-//! или подставят дефолт молча. Зелёное состояние названо здесь прямо, чтобы следующий круг
-//! не искал в нём RED, которого не предполагалось (`gates.md` §2: шаг, зелёный раньше своей
-//! задачи, — дефект; шаг-сторож — не тот случай, и разница объявлена).
+//! Все четыре сценария ЗЕЛЕНЫ уже сегодня: механизм доставки состава существует, задача 7
+//! лишь меняет ЗНАЧЕНИЕ в конфиге. Это СТОРОЖ, а не предмет — он краснеет ровно тогда, когда
+//! задачу 7 сделают «в конфиге, но не на пути». Зелёное состояние названо прямо, чтобы
+//! следующий круг не искал в нём RED, которого не предполагалось (`gates.md` §2: шаг,
+//! зелёный раньше своей задачи, — дефект; шаг-сторож — не тот случай, и разница объявлена).
 
 use gateway_serve::serve_config_from_env;
 use std::collections::HashMap;
@@ -133,5 +149,171 @@ fn db_i_7c_canonical_and_default_are_actually_distinguishable() {
         canon, dflt,
         "SETUP НЕ СОСТОЯЛСЯ: канонический состав и прод-дефолт дали ОДИН результат {canon:?}. \
          Значит `GATEWAY_BANDS` не влияет ни на что, и оба сценария выше зелены ни о чём"
+    );
+}
+
+// ─────────────────────────── УРОВЕНЬ ДОСТАВКИ ───────────────────────────
+
+use futures_util::StreamExt;
+use gateway_serve::server::bind;
+use gateway_serve::wire::ServeMsg;
+use journal::{EpochFilter, Journal, WriterConfig};
+use jsonwebtoken::{encode, DecodingKey, EncodingKey, Header};
+
+const SECRET: &[u8] = b"m70-db-i-7-delivery";
+const MID: f64 = 65_000.0;
+const T0: i64 = 1_752_000_000_000;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Claims {
+    sub: String,
+    exp: usize,
+}
+
+fn sign(secret: &[u8]) -> String {
+    let exp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("время")
+        .as_secs() as usize
+        + 3_600;
+    encode(
+        &Header::default(),
+        &Claims {
+            sub: "db-i-7".to_string(),
+            exp,
+        },
+        &EncodingKey::from_secret(secret),
+    )
+    .expect("подпись JWT")
+}
+
+/// Книга до ±60 % — чтобы КАЖДАЯ каноническая полоса имела уровни и строка серии была не
+/// пустой: «доехало» на пустой выдаче ничего не доказывает.
+fn journal_deep_book() -> tempfile::TempDir {
+    use contracts::{to_fixed, DataSource, EventKind, Level, MdPayload, Side, Venue};
+    const STEP_FRAC: f64 = 0.002;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut j = Journal::open_with(
+        dir.path(),
+        WriterConfig {
+            max_segment_bytes: 1 << 26,
+            min_free_bytes: 0,
+            source: DataSource::OwnCapture,
+            provenance: "M-70 DB-I-7 delivery fixture".to_string(),
+            epoch_id: "own-test".to_string(),
+        },
+    )
+    .expect("open_with");
+    let step = MID * STEP_FRAC;
+    let n = (0.60 / STEP_FRAC) as usize;
+    let lv = |v: Vec<(f64, f64)>| -> Vec<Level> {
+        v.into_iter()
+            .map(|(p, s)| Level {
+                price: to_fixed(p),
+                size: to_fixed(s),
+            })
+            .collect()
+    };
+    for t in 0..3i64 {
+        j.append(EventKind::md(
+            Venue::Binance,
+            "BTCUSDT",
+            MdPayload::L2Snapshot {
+                bids: lv((1..=n).map(|k| (MID - k as f64 * step, 1.0)).collect()),
+                asks: lv((1..=n).map(|k| (MID + k as f64 * step, 1.0)).collect()),
+                ts_exch_ms: T0 + t * 1_000,
+            },
+        ))
+        .expect("append");
+        j.append(EventKind::md(
+            Venue::Binance,
+            "BTCUSDT",
+            MdPayload::Trade {
+                price: to_fixed(MID),
+                size: to_fixed(1.0),
+                side: Side::Buy,
+                ts_exch_ms: T0 + t * 1_000,
+            },
+        ))
+        .expect("append");
+    }
+    j.flush().expect("flush");
+    dir
+}
+
+/// `DB-I-7d` — УРОВЕНЬ ДОСТАВКИ: состав из окружения доезжает до КАДРА НА ПРОВОДЕ.
+///
+/// Закрывает `C-208` B-3. Путь исполняется тот же, каким его дёргает прод:
+/// `serve_config_from_env` → `bind` → `serve` → WS-подключение с валидным JWT → первый
+/// `Snapshot`. Между конфигом и кадром нет ни одной подмены, которую сценарий бы не заметил:
+/// он смотрит на СЕЛЕКТОР ВНУТРИ ОТВЕТА и на число строк депт-серии, а не на `ServeConfig`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn db_i_7d_canonical_bands_reach_the_frame_on_the_wire() {
+    let dir = journal_deep_book();
+    let cfg = serve_config_from_env(getter(&base_plus(&[
+        ("GATEWAY_BANDS", CANONICAL_ENV),
+        ("GATEWAY_SYMBOL", "BTCUSDT"),
+    ])))
+    .expect("конфиг с каноническим составом");
+
+    // Прод-точка входа. Журнал и ключ подменяются на тестовые — это ЕДИНСТВЕННОЕ отличие от
+    // прода, и оно названо: селектор, ради которого сценарий существует, приходит из env.
+    let server = bind(gateway_serve::server::ServeConfig {
+        addr: "127.0.0.1:0".to_string(),
+        journal_dir: dir.path().to_path_buf(),
+        filter: EpochFilter::OwnCaptureOnly,
+        selector: cfg.selector.clone(),
+        decoding_key: DecodingKey::from_secret(SECRET),
+        checkpoint_dir: None,
+    })
+    .await
+    .expect("bind прод-точки входа");
+    let addr = server.local_addr();
+    tokio::spawn(async move {
+        let _ = server.serve().await;
+    });
+
+    let url = format!("ws://{addr}/?token={}", sign(SECRET));
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(url)
+        .await
+        .expect("WS-подключение валидным JWT");
+    let msg = ws
+        .next()
+        .await
+        .expect("сервер обязан прислать первое сообщение")
+        .expect("сообщение читается");
+    let parsed: ServeMsg =
+        serde_json::from_slice(msg.into_data().as_ref()).expect("разбор ServeMsg");
+    let snap = match parsed {
+        ServeMsg::Snapshot(s) => s,
+        other => panic!("первым сообщением обязан быть Snapshot, получено: {other:?}"),
+    };
+
+    assert_eq!(
+        snap.selector.bands.len(),
+        BANDS_CANONICAL.len(),
+        "DB-I-7d НАРУШЕН: кадр НА ПРОВОДЕ несёт {} полос вместо {}. Парсер мог отработать \
+         верно, а исполняемый путь — потерять или подменить селектор после разбора: ровно \
+         built-not-wired, который парсерные сценарии не видят (`C-208` B-3)",
+        snap.selector.bands.len(),
+        BANDS_CANONICAL.len()
+    );
+    assert_eq!(
+        snap.series.depth_series.len(),
+        BANDS_CANONICAL.len() * 2,
+        "DB-I-7d НАРУШЕН: в доставленном кадре {} строк депт-серии, ожидалось {} \
+         (полоса × сторона). Селектор доехал, но выдача по нему не построена — «включили в \
+         конфиге, а выдача прежняя» в чистом виде",
+        snap.series.depth_series.len(),
+        BANDS_CANONICAL.len() * 2
+    );
+    assert!(
+        snap.series
+            .depth_series
+            .iter()
+            .all(|r| !r.series.is_empty()),
+        "DB-I-7d НАРУШЕН: часть строк депт-серии ПУСТА. «Доехало» на пустой выдаче ничего не \
+         доказывает: книга фикстуры тянется до ±60 %, каждая каноническая полоса обязана \
+         иметь уровни"
     );
 }
