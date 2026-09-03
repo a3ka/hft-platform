@@ -31,7 +31,8 @@
 # | ПРЕДУСЛОВИЕ | `M-75` влит в `main`                       | `^pub fn …(` БЕЗ конвейера + самопроверка обоих исходов (`C-208` B-2) |
 # | task #3     | предел полос отвергает ДО построения | ИСПОЛНЕНИЕ `DB-I-3` + `^pub const MAX_BANDS` + равенство чисел |
 # | task #4     | два сценария `DB-I-4` живы                 | `^fn ИМЯ` в T4 + ИСПОЛНЕНИЕ через chk_named_test |
-# | task #4b    | адаптер оракула читает метку КАЖДОЙ точки  | форма `^pub struct DepthPoint` + отсутствие заглушки-однострочника + ИСПОЛНЕНИЕ |
+# | task #4b    | адаптер оракула читает метку КАЖДОЙ точки  | поле `^\s*pub series_provenance:` + тело адаптера + ИСПОЛНЕНИЕ |
+# | task #4c    | длины `series` и `series_provenance` равны | ИСПОЛНЕНИЕ `db_i_4c_lengths_match_on_every_row` (цена аддитивной формы, §2bis.-1) |
 # | task #5     | словарь метки ОДИН на всю выдачу           | ИСПОЛНЕНИЕ `DB-I-5` + поимённый состав + гвард `serial()` |
 # | task #6     | форма объявлена БАМПОМ                     | ЧИСЛО версии на HEAD строго больше, чем в базе  |
 # | task #6b    | sacred-пины версии подняты вместе с бампом | `EXPECTED_SCHEMA_VERSION` == константа `lib.rs` |
@@ -200,7 +201,8 @@ chk_named_test "оракул DB-I-4 (точка/ряд + анти-плацебо
 # Состав ПОИМЁННО (урок 2 шапки): без анти-плацебо основной тест удовлетворяется реализацией,
 # метящей `not-observed` ВСЁ подряд, — она обесценивает метку и формально зеленеет.
 for t in db_i_4_two_points_of_one_row_carry_their_own_provenance \
-         db_i_4b_reachable_point_is_not_falsely_downgraded; do
+         db_i_4b_reachable_point_is_not_falsely_downgraded \
+         db_i_4c_lengths_match_on_every_row; do
   chk "grep -q '^fn ${t}' ${T4}"
 done
 
@@ -210,7 +212,10 @@ step "task #4b — адаптер sacred-оракула читает метку 
 #
 # SETUP-GUARD НА СОБСТВЕННОЕ УТВЕРЖДЕНИЕ (`A-031` §1): пока формы нет, «оракул зелен» ничего
 # не сказало бы о задаче 4b — метке точки взяться неоткуда. Поэтому сперва форма, потом адаптер.
-if grep -qE '^pub struct DepthPoint' "${LIB}"; then
+# ФОРМА ПЕРЕДЕЛАНА НА АДДИТИВНУЮ (`R-171` Б-1, спека §2bis.-1): `pub struct DepthPoint`
+# УПРАЗДНЁН — он ломал `VB-I-4`. Предмет наблюдения — поле `series_provenance` на `DepthRow`,
+# то есть ровно та конструкция, которую объявляет спека; якорь по строке объявления поля.
+if grep -qE '^\s*pub series_provenance: Vec<Option<String>>' "${LIB}"; then
   # ПЯТЫЙ НОСИТЕЛЬ КЛАССА `A-031`, найденный `R-171` Н-1 — и найденный НА МНЕ, в том же
   # файле, где §3ter объявил класс закрытым у четырёх. Прежний предикат
   # `! grep -qE 'vec!\[row\.depth_band_provenance'` наблюдал ТЕКСТ ФАЙЛА и краснел от
@@ -224,13 +229,13 @@ if grep -qE '^pub struct DepthPoint' "${LIB}"; then
     echo "FAIL: task #4b — тело fn point_provenances не извлечено (переименована или удалена): страж адаптера был бы ВАКУУМНО зелёным" >&2
     FAIL=$((FAIL + 1))
   else
-    chk "printf '%s' \"\${ADAPTER_BODY}\" | grep -q 'row.series'"
+    chk "printf '%s' \"\${ADAPTER_BODY}\" | grep -q 'row.series_provenance'"
     chk "! printf '%s' \"\${ADAPTER_BODY}\" | grep -q 'depth_band_provenance'"
   fi
   chk_named_test "DB-I-4 против НОВОЙ формы (адаптер обновлён)" \
     cargo test -p gateway --test red_depth_point_provenance --quiet
 else
-  echo "FAIL: task #4b — формы 'pub struct DepthPoint' в ${LIB} нет: задача 4 не исполнена, и адаптер править не подо что (спека §2bis объявляет форму дословно)" >&2
+  echo "FAIL: task #4b — поля 'pub series_provenance: Vec<Option<String>>' в ${LIB} нет: задача 4 в аддитивной форме не исполнена, и адаптер править не подо что (спека §2bis.-1 объявляет форму дословно)" >&2
   FAIL=$((FAIL + 1))
 fi
 

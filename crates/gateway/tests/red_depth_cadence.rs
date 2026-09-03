@@ -204,12 +204,7 @@ fn md_i8_d12_depth_cadence_is_per_series_and_event_time_driven() {
             sn.series
                 .depth_series
                 .iter()
-                .map(|r| {
-                    (
-                        (r.side.clone(), r.band_pct_e8),
-                        r.series.iter().map(|p| (p.time_s, p.depth_e8)).collect(),
-                    )
-                })
+                .map(|r| ((r.side.clone(), r.band_pct_e8), r.series.clone()))
                 .collect()
         };
     let coarse_rows = rows_of(&coarse);
@@ -530,7 +525,7 @@ fn md_i8_d17_declared_cadence_matches_what_is_delivered() {
         .series
         .depth_series
         .first()
-        .map(|r| r.series.iter().map(|p| p.time_s).collect())
+        .map(|r| r.series.iter().map(|(t, _)| *t).collect())
         .unwrap_or_default();
     if stamps.len() < 2 {
         setup_failed(&format!(

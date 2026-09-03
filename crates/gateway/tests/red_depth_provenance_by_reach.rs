@@ -204,17 +204,17 @@ fn prov(r: &DepthRow) -> String {
         r.band_pct_e8,
         r.side
     );
-    r.series
+    r.series_provenance
         .iter()
         .rev()
-        .find_map(|p| p.provenance.clone())
+        .find_map(|p| p.clone())
         .unwrap_or_default()
 }
 
 /// Пара к `prov` для сценариев, судящих ОТСУТСТВИЕ метки (`VB-I-5`: ≤ 1.3 % метки не несёт).
 /// Требование усилено формой: ни одна точка ряда не смеет нести метку, а не «строка пуста».
 fn has_no_prov(r: &DepthRow) -> bool {
-    !r.series.is_empty() && r.series.iter().all(|p| p.provenance.is_none())
+    !r.series.is_empty() && r.series_provenance.iter().all(|p| p.is_none())
 }
 
 /// ЯДРО (б): на ОДНОЙ и той же глубокой полосе bid и ask несут РАЗНЫЕ метки.
@@ -302,10 +302,7 @@ fn shallow_band_carries_no_provenance() {
             has_no_prov(r),
             "VB-I-5: полоса 0.1 % ≤ 1.3 % — валидированный эталон, метки не несёт НИ В ОДНОЙ \
              точке. side={side}, получено: {:?}",
-            r.series
-                .iter()
-                .map(|p| p.provenance.clone())
-                .collect::<Vec<_>>()
+            r.series_provenance.clone()
         );
     }
 }
@@ -438,15 +435,11 @@ fn provenance_survives_merge_when_reach_changes() {
         // Это УСИЛЕНИЕ: `VB-I-2` требует бит-идентичности живого и реплея, и расхождение в
         // ЛЮБОЙ точке — нарушение, которого прежняя одна метка на строку не увидела бы.
         let want: Vec<Option<String>> = row(&full.series.depth_series, side, 0.02)
-            .series
-            .iter()
-            .map(|p| p.provenance.clone())
-            .collect();
+            .series_provenance
+            .clone();
         let got: Vec<Option<String>> = row(&merged.series.depth_series, side, 0.02)
-            .series
-            .iter()
-            .map(|p| p.provenance.clone())
-            .collect();
+            .series_provenance
+            .clone();
         assert_eq!(
             got, want,
             "GW-I-4/VB-I-2 НАРУШЕН на метке: snapshot(C)+frames расходится с полным реплеем. \
@@ -798,15 +791,11 @@ fn gw_i_4_holds_when_the_tail_frame_is_delta_only() {
         // Это УСИЛЕНИЕ: `VB-I-2` требует бит-идентичности живого и реплея, и расхождение в
         // ЛЮБОЙ точке — нарушение, которого прежняя одна метка на строку не увидела бы.
         let want: Vec<Option<String>> = row(&full.series.depth_series, side, 0.02)
-            .series
-            .iter()
-            .map(|p| p.provenance.clone())
-            .collect();
+            .series_provenance
+            .clone();
         let got: Vec<Option<String>> = row(&merged.series.depth_series, side, 0.02)
-            .series
-            .iter()
-            .map(|p| p.provenance.clone())
-            .collect();
+            .series_provenance
+            .clone();
         assert_eq!(
             got, want,
             "GW-I-4/VB-I-2 НАРУШЕН на метке при DELTA-ONLY хвосте: полный реплей и \

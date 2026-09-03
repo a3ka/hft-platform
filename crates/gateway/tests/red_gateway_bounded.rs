@@ -323,9 +323,7 @@ fn snapshot_memory_bounded_by_window_not_history() {
         assert!(
             // ФОРМА СМЕНИЛАСЬ (задача 4): точка — `DepthPoint`. Предмет `VB-I-10` не тронут:
             // ряд обязан удерживаться ВНУТРИ окна, проверка та же по существу.
-            row.series
-                .iter()
-                .all(|p| p.time_s >= lo && p.time_s <= max_ts),
+            row.series.iter().all(|&(t, _)| t >= lo && t <= max_ts),
             "DepthRow.series содержит точки вне окна [{lo}, {max_ts}] (side={})",
             row.side
         );

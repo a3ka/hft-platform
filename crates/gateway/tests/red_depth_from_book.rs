@@ -292,12 +292,12 @@ fn row<'a>(rows: &'a [DepthRow], side: &str, band: f64) -> &'a DepthRow {
 /// close-семантика (последнее наблюдение бакета побеждает) сохраняется фиксом без изменений.
 fn last_value(rows: &[DepthRow], side: &str, band: f64) -> i64 {
     let r = row(rows, side, band);
-    // ФОРМА СМЕНИЛАСЬ (`M-70` задача 4): ряд — `Vec<DepthPoint>`. Предмет `MD-I-8` здесь —
-    // ЧИСЛО последней точки; провенанс к нему отношения не имеет.
+    // ФОРМА ПЕРЕДЕЛАНА НА АДДИТИВНУЮ (§2bis.-1): `series` снова кортежи, метки — в
+    // параллельном `series_provenance`. Предмет `MD-I-8` здесь — ЧИСЛО последней точки.
     r.series
         .iter()
-        .max_by_key(|p| p.time_s)
-        .map(|p| p.depth_e8)
+        .max_by_key(|(t, _)| *t)
+        .map(|(_, v)| *v)
         .unwrap_or_else(|| panic!("серия side={side} band={band} ПУСТА — setup не состоялся"))
 }
 
@@ -692,13 +692,13 @@ fn md_i8_d7_reach_is_sampled_where_the_numbers_are_delta_shrinks_the_book() {
     }
 
     for side in ["bid", "ask"] {
-        // ФОРМА СМЕНИЛАСЬ (задача 4): метка живёт в ТОЧКЕ. Берём ПОСЛЕДНЮЮ — сценарий
-        // судит состояние на конец окна, ровно то, что означала строковая метка.
+        // Метка i-й точки живёт в параллельном `series_provenance` (§2bis.-1). Берём
+        // ПОСЛЕДНЮЮ непустую — сценарий судит состояние на конец окна.
         let prov = row(&s.series.depth_series, side, MID_BAND)
-            .series
+            .series_provenance
             .iter()
             .rev()
-            .find_map(|p| p.provenance.clone())
+            .find_map(|p| p.clone())
             .unwrap_or_default();
         assert!(
             prov.starts_with("not-observed"),
@@ -748,13 +748,13 @@ fn md_i8_d7b_reach_is_sampled_where_the_numbers_are_delta_grows_the_book() {
     }
 
     for side in ["bid", "ask"] {
-        // ФОРМА СМЕНИЛАСЬ (задача 4): метка живёт в ТОЧКЕ. Берём ПОСЛЕДНЮЮ — сценарий
-        // судит состояние на конец окна, ровно то, что означала строковая метка.
+        // Метка i-й точки живёт в параллельном `series_provenance` (§2bis.-1). Берём
+        // ПОСЛЕДНЮЮ непустую — сценарий судит состояние на конец окна.
         let prov = row(&s.series.depth_series, side, MID_BAND)
-            .series
+            .series_provenance
             .iter()
             .rev()
-            .find_map(|p| p.provenance.clone())
+            .find_map(|p| p.clone())
             .unwrap_or_default();
         assert!(
             !prov.starts_with("not-observed"),

@@ -131,12 +131,19 @@ fn deep_band_carries_provenance() {
                 "GW-I-6: глубокая полоса {}e-8 без единой точки — проверять провенанс не на чем",
                 row.band_pct_e8
             );
-            for pt in &row.series {
-                let prov = pt.provenance.as_deref().unwrap_or("");
+            assert_eq!(
+                row.series.len(),
+                row.series_provenance.len(),
+                "GW-I-6/DB-I-4c: длины `series` и `series_provenance` разошлись ({} против \
+                 {}) — метка i-й точки описывала бы ДРУГУЮ точку",
+                row.series.len(),
+                row.series_provenance.len()
+            );
+            for (i, prov) in row.series_provenance.iter().enumerate() {
                 assert!(
-                    !prov.is_empty(),
+                    prov.as_deref().is_some_and(|p| !p.is_empty()),
                     "GW-I-6: точка t={} полосы {}e-8 глубже 1.3% ОБЯЗАНА нести провенанс",
-                    pt.time_s,
+                    row.series[i].0,
                     row.band_pct_e8
                 );
             }
