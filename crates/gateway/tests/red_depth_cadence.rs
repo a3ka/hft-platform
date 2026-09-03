@@ -195,12 +195,21 @@ fn md_i8_d12_depth_cadence_is_per_series_and_event_time_driven() {
     let coarse = snap(dir.path(), Some(CADENCE_MS));
     let fine = snap(dir.path(), Some(1_000));
 
+    // ФОРМА СМЕНИЛАСЬ (`M-70` задача 4): ряд — `Vec<DepthPoint>`. Сравнение сводится к
+    // ПАРАМ `(time_s, depth_e8)`, потому что предмет этого сценария — КАДЕНЦИЯ (какие такты
+    // попали в серию), а не провенанс. Брать `DepthPoint` целиком значило бы вплести сюда
+    // чужой предмет и получить ложное красное при любой правке метки.
     let rows_of =
         |sn: &gateway::Snapshot| -> std::collections::BTreeMap<(String, i64), Vec<(i64, i64)>> {
             sn.series
                 .depth_series
                 .iter()
-                .map(|r| ((r.side.clone(), r.band_pct_e8), r.series.clone()))
+                .map(|r| {
+                    (
+                        (r.side.clone(), r.band_pct_e8),
+                        r.series.iter().map(|p| (p.time_s, p.depth_e8)).collect(),
+                    )
+                })
                 .collect()
         };
     let coarse_rows = rows_of(&coarse);
@@ -521,7 +530,7 @@ fn md_i8_d17_declared_cadence_matches_what_is_delivered() {
         .series
         .depth_series
         .first()
-        .map(|r| r.series.iter().map(|(t, _)| *t).collect())
+        .map(|r| r.series.iter().map(|p| p.time_s).collect())
         .unwrap_or_default();
     if stamps.len() < 2 {
         setup_failed(&format!(

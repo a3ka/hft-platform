@@ -180,7 +180,10 @@ fn deep_row_label(s: &gateway::Snapshot, side: &str) -> Option<String> {
         .depth_series
         .iter()
         .find(|r| r.side == side)
-        .and_then(|r| r.depth_band_provenance.clone())
+        // ФОРМА СМЕНИЛАСЬ (задача 4): метка живёт в ТОЧКЕ. Берётся ПОСЛЕДНЯЯ непустая —
+        // сравнение с ячейкой карты идёт по СОСТОЯНИЮ НА КОНЕЦ окна, а карта строится из
+        // последнего бакета; брать первую значило бы сравнивать разные моменты.
+        .and_then(|r| r.series.iter().rev().find_map(|p| p.provenance.clone()))
 }
 
 /// SETUP-СТРАЖ: в ответе обязаны быть И глубокая ячейка, И глубокая строка на обеих сторонах.

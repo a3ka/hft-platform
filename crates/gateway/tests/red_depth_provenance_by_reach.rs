@@ -187,6 +187,36 @@ fn row<'a>(rows: &'a [DepthRow], side: &str, band: f64) -> &'a DepthRow {
         })
 }
 
+/// **АДАПТЕР К ФОРМЕ (`M-70` задача 4b).** Метка переехала со СТРОКИ в ТОЧКУ (§2bis,
+/// `TD-159`): одной метки на весь ряд больше нет.
+///
+/// Сценарии этого файла судят УСТАНОВИВШИЙСЯ режим — ни одна их фикстура не делает ресинка,
+/// поэтому все точки ряда наблюдены одинаково, и «метка ряда» осмысленна как метка любой его
+/// точки. Берётся ПОСЛЕДНЯЯ: она описывает состояние на конец окна — ровно то, что прежняя
+/// строковая метка и означала. Смысл каждого сценария сохранён дословно.
+///
+/// Страж вырождения обязателен: пустой ряд дал бы `""`, и сравнения стали бы истинны ни о чём.
+fn prov(r: &DepthRow) -> String {
+    assert!(
+        !r.series.is_empty(),
+        "SETUP НЕ СОСТОЯЛСЯ: ряд полосы {}e-8 стороны {} ПУСТ — метку брать не с чего, и \
+         любое утверждение о провенансе было бы истинно вырожденно",
+        r.band_pct_e8,
+        r.side
+    );
+    r.series
+        .iter()
+        .rev()
+        .find_map(|p| p.provenance.clone())
+        .unwrap_or_default()
+}
+
+/// Пара к `prov` для сценариев, судящих ОТСУТСТВИЕ метки (`VB-I-5`: ≤ 1.3 % метки не несёт).
+/// Требование усилено формой: ни одна точка ряда не смеет нести метку, а не «строка пуста».
+fn has_no_prov(r: &DepthRow) -> bool {
+    !r.series.is_empty() && r.series.iter().all(|p| p.provenance.is_none())
+}
+
 /// ЯДРО (б): на ОДНОЙ и той же глубокой полосе bid и ask несут РАЗНЫЕ метки.
 ///
 /// Сегодняшняя реализация (`crates/gateway/src/lib.rs:1035`) считает метку от
@@ -199,10 +229,7 @@ fn sides_are_distinguished_on_deep_band() {
     let bid = row(&s.series.depth_series, "bid", 0.03);
     let ask = row(&s.series.depth_series, "ask", 0.03);
 
-    let (pb, pa) = (
-        bid.depth_band_provenance.as_deref().unwrap_or(""),
-        ask.depth_band_provenance.as_deref().unwrap_or(""),
-    );
+    let (pb, pa) = (prov(bid), prov(ask));
     assert!(
         pb.contains("liveness=confirmed"),
         "П-014: bid на глубокой полосе обязан нести подтверждённую живость \
@@ -231,7 +258,7 @@ fn band_beyond_reach_is_named_not_observed() {
     let s = snap(dir.path(), &sel(vec![0.001, 0.10]));
     for side in ["bid", "ask"] {
         let r = row(&s.series.depth_series, side, 0.10);
-        let p = r.depth_band_provenance.as_deref().unwrap_or("");
+        let p = prov(r);
         assert!(
             p.starts_with("not-observed"),
             "П-017 предусловие (а): книга достаёт до 5 %, полоса 10 % НЕ наблюдалась — \
@@ -252,7 +279,7 @@ fn band_within_reach_is_not_falsely_marked() {
     let s = snap(dir.path(), &sel(vec![0.001, 0.03]));
     for side in ["bid", "ask"] {
         let r = row(&s.series.depth_series, side, 0.03);
-        let p = r.depth_band_provenance.as_deref().unwrap_or("");
+        let p = prov(r);
         assert!(
             !p.starts_with("not-observed"),
             "полоса 3 % ВНУТРИ охвата 5 % — наблюдалась. Метка «не наблюдалась» здесь \
@@ -272,10 +299,13 @@ fn shallow_band_carries_no_provenance() {
     for side in ["bid", "ask"] {
         let r = row(&s.series.depth_series, side, 0.001);
         assert!(
-            r.depth_band_provenance.is_none(),
-            "VB-I-5: полоса 0.1 % ≤ 1.3 % — валидированный эталон, метки не несёт. \
-             side={side}, получено: {:?}",
-            r.depth_band_provenance
+            has_no_prov(r),
+            "VB-I-5: полоса 0.1 % ≤ 1.3 % — валидированный эталон, метки не несёт НИ В ОДНОЙ \
+             точке. side={side}, получено: {:?}",
+            r.series
+                .iter()
+                .map(|p| p.provenance.clone())
+                .collect::<Vec<_>>()
         );
     }
 }
@@ -301,14 +331,8 @@ fn reach_is_per_side() {
     let dir = journal_of(vec![ev]);
     let s = snap(dir.path(), &sel(vec![0.001, 0.03]));
 
-    let pb = row(&s.series.depth_series, "bid", 0.03)
-        .depth_band_provenance
-        .clone()
-        .unwrap_or_default();
-    let pa = row(&s.series.depth_series, "ask", 0.03)
-        .depth_band_provenance
-        .clone()
-        .unwrap_or_default();
+    let pb = prov(row(&s.series.depth_series, "bid", 0.03));
+    let pa = prov(row(&s.series.depth_series, "ask", 0.03));
 
     assert!(
         !pb.starts_with("not-observed"),
@@ -410,12 +434,19 @@ fn provenance_survives_merge_when_reach_changes() {
     );
 
     for side in ["bid", "ask"] {
-        let want = row(&full.series.depth_series, side, 0.02)
-            .depth_band_provenance
-            .clone();
-        let got = row(&merged.series.depth_series, side, 0.02)
-            .depth_band_provenance
-            .clone();
+        // ФОРМА СМЕНИЛАСЬ (задача 4): сравниваем ВЕСЬ РЯД меток, а не одну строковую.
+        // Это УСИЛЕНИЕ: `VB-I-2` требует бит-идентичности живого и реплея, и расхождение в
+        // ЛЮБОЙ точке — нарушение, которого прежняя одна метка на строку не увидела бы.
+        let want: Vec<Option<String>> = row(&full.series.depth_series, side, 0.02)
+            .series
+            .iter()
+            .map(|p| p.provenance.clone())
+            .collect();
+        let got: Vec<Option<String>> = row(&merged.series.depth_series, side, 0.02)
+            .series
+            .iter()
+            .map(|p| p.provenance.clone())
+            .collect();
         assert_eq!(
             got, want,
             "GW-I-4/VB-I-2 НАРУШЕН на метке: snapshot(C)+frames расходится с полным реплеем. \
@@ -603,14 +634,8 @@ fn label_follows_observation_when_delta_shrinks_the_book() {
         points(&s.series.depth_series, "bid", 0.03)
     );
 
-    let pb = row(&s.series.depth_series, "bid", 0.03)
-        .depth_band_provenance
-        .clone()
-        .unwrap_or_default();
-    let pa = row(&s.series.depth_series, "ask", 0.03)
-        .depth_band_provenance
-        .clone()
-        .unwrap_or_default();
+    let pb = prov(row(&s.series.depth_series, "bid", 0.03));
+    let pa = prov(row(&s.series.depth_series, "ask", 0.03));
     assert!(
         pb.starts_with("not-observed"),
         "Число полосы 3 % посчитано по книге, ОБРЕЗАННОЙ дельтой до ~0 %: наблюдения на 3 % в \
@@ -670,10 +695,7 @@ fn label_follows_observation_when_delta_grows_the_book() {
     );
 
     for side in ["bid", "ask"] {
-        let p = row(&s.series.depth_series, side, 0.02)
-            .depth_band_provenance
-            .clone()
-            .unwrap_or_default();
+        let p = prov(row(&s.series.depth_series, side, 0.02));
         assert!(
             !p.starts_with("not-observed"),
             "Число полосы 2 % посчитано по книге, ДОСТРОЕННОЙ дельтами до 5 %: наблюдение есть, \
@@ -772,12 +794,19 @@ fn gw_i_4_holds_when_the_tail_frame_is_delta_only() {
     );
 
     for side in ["bid", "ask"] {
-        let want = row(&full.series.depth_series, side, 0.02)
-            .depth_band_provenance
-            .clone();
-        let got = row(&merged.series.depth_series, side, 0.02)
-            .depth_band_provenance
-            .clone();
+        // ФОРМА СМЕНИЛАСЬ (задача 4): сравниваем ВЕСЬ РЯД меток, а не одну строковую.
+        // Это УСИЛЕНИЕ: `VB-I-2` требует бит-идентичности живого и реплея, и расхождение в
+        // ЛЮБОЙ точке — нарушение, которого прежняя одна метка на строку не увидела бы.
+        let want: Vec<Option<String>> = row(&full.series.depth_series, side, 0.02)
+            .series
+            .iter()
+            .map(|p| p.provenance.clone())
+            .collect();
+        let got: Vec<Option<String>> = row(&merged.series.depth_series, side, 0.02)
+            .series
+            .iter()
+            .map(|p| p.provenance.clone())
+            .collect();
         assert_eq!(
             got, want,
             "GW-I-4/VB-I-2 НАРУШЕН на метке при DELTA-ONLY хвосте: полный реплей и \
@@ -789,10 +818,13 @@ fn gw_i_4_holds_when_the_tail_frame_is_delta_only() {
         // Позитивный свидетель к равенству: сравнивать `None` с `None` — тавтология, зелёная
         // при любой реализации. Метка обязана СУЩЕСТВОВАТЬ (VB-I-5: глубокая полоса без метки
         // делает серию невалидной).
+        // ФОРМА СМЕНИЛАСЬ (задача 4): `got` — ряд меток. Позитивный свидетель усиливается:
+        // ряд обязан быть непуст И каждая его метка — непуста. Прежнее `got.is_some()`
+        // на ряде выразить нельзя, а «хоть одна непуста» было бы СЛАБЕЕ прежнего.
         assert!(
-            got.is_some(),
-            "VB-I-5: глубокая полоса 2 % обязана нести непустую метку; равенство None==None \
-             инварианта не проверяет. side={side}"
+            !got.is_empty() && got.iter().all(|p| p.is_some()),
+            "VB-I-5: глубокая полоса 2 % обязана нести непустую метку В КАЖДОЙ точке; \
+             равенство пустых рядов инварианта не проверяет. side={side}, получено: {got:?}"
         );
     }
 }

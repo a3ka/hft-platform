@@ -144,7 +144,10 @@ fn md_i8_d9_one_sided_book_writes_no_point_not_a_zero() {
         .series
         .depth_series
         .iter()
-        .flat_map(|r| r.series.iter().copied())
+        // ФОРМА СМЕНИЛАСЬ (задача 4): `DepthPoint` не `Copy`. Предмет сценария —
+        // ЧИСЛА (`d9`: односторонняя книга не даёт точку-ноль), поэтому берём пару
+        // `(time_s, depth_e8)`; провенанс к этому предмету отношения не имеет.
+        .flat_map(|r| r.series.iter().map(|p| (p.time_s, p.depth_e8)))
         .collect();
     let zeros = points.iter().filter(|(_, v)| *v == 0).count();
     assert!(
