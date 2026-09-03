@@ -102,7 +102,9 @@ echo "PASS: самопроверка помощников — зелёное п�
 LIB=crates/gateway/src/lib.rs
 T4=crates/gateway/tests/red_depth_point_provenance.rs
 
-step "task #0 — паритет с CI: fmt + clippy(--all-targets --all-features) + test --all"
+step "ПАРИТЕТ С CI — fmt + clippy(--all-targets --all-features) + test --all"
+# Шаг НЕ называется «task #0»: у милестоуна task 0 — это ЗАМЕР объёма (`DB-I-0`), и одинаковое
+# имя у двух разных предметов отправило бы читателя вердикта искать не то. Свой шаг у замера — ниже.
 chk "cargo fmt --all -- --check"
 chk "cargo clippy --all-targets --all-features -- -D warnings"
 chk "cargo test --all --quiet"
@@ -114,6 +116,19 @@ step "ПРЕДУСЛОВИЕ — M-75 влит: без него задачи 0 �
 # спеке-цитате внутри кода) удовлетворило бы прежний греп, не означая расцепления (`A-031`
 # носитель №6 — тот же класс).
 chk "git show origin/main:crates/gateway/src/lib.rs | grep -qE '^pub fn effective_heatmap_window_frac\\('"
+
+step "task #0 — объём канонического набора СНЯТ ЗАМЕРОМ в байтах (DB-I-0)"
+# Задача 0 закрыта не текстом в спеке, а ИСПОЛНЯЕМЫМ замером: два наших документа называли
+# 22 МБ и 43 МБ, обе величины — арифметика по числу ячеек и обе относились к миру ДО `M-75`.
+# Оракул меряет РЕСУРС (байты сериализованного `Snapshot`) на фикстуре прод-РАЗМЕРА (60
+# бакетов = прод-окно 60 с при `timeframe_ms=1000`) и сторожит два регресса: канонический
+# набор перестал помещаться под подписанный предел, либо карта снова растёт от полос.
+chk_named_test "оракул DB-I-0 (замер объёма + карта не растёт от полос)" \
+  cargo test -p gateway --test red_depth_egress_canonical --quiet
+for t in db_i_0_canonical_set_fits_under_signed_cap \
+         db_i_0b_growth_is_the_depth_series_not_the_map; do
+  chk "grep -q '^fn ${t}' crates/gateway/tests/red_depth_egress_canonical.rs"
+done
 
 step "task #4 (RED) — TD-159: метка достоверности принадлежит ТОЧКЕ, а не ряду"
 chk_named_test "оракул DB-I-4 (точка/ряд + анти-плацебо)" \
