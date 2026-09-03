@@ -344,18 +344,42 @@ pub struct BubbleCell {
     pub sell_vol_e8: i64,
 }
 
+/// M-70 §2bis (DB-I-4, TD-159): одна ТОЧКА депт-серии со СВОЕЙ меткой достоверности.
+/// Раньше метка жила на `DepthRow` и описывала ВСЕ точки ряда разом — что лгало после
+/// ресинка: точка из окна ресинка (книга ещё ужатая до `REST_DEPTH_LIMIT`) описывалась
+/// меткой ПОСЛЕДНЕГО наблюдения (книга уже достроенная дельтами), и `PL-I-7` срабатывал
+/// наоборот (деградация выдана за норму). Теперь метка переехала на ТОЧКУ и снимается
+/// ТЕМ ЖЕ наблюдением, из которого взят `depth_e8` (`MD-I-8` обязательство 4 — число и
+/// провенанс сняты ОДНИМ наблюдением).
+///
+/// **Почему точка, а не параллельный массив меток.** Параллельный `Vec<Option<String>>`
+/// рядом с `Vec<(time_s, depth)>` допускал бы рассинхрон длин, и инвариант пришлось бы
+/// ЗАПРЕЩАТЬ отдельной строкой и СТОРОЖИТЬ оракулом. Эта форма делает рассинхрон
+/// НЕВЫРАЗИМЫМ — тот же критерий, которым `M-75` сузил `build_heatmap_and_cob`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DepthPoint {
+    /// Начало бакета, секунды — прежний первый элемент кортежа `(time_s, depth_e8)`.
+    pub time_s: i64,
+    /// Глубина полосы ×1e8 — прежний второй элемент кортежа.
+    pub depth_e8: i64,
+    /// Метка этой точки. `None` — только для полос ≤ 1.3 % (`VB-I-5`, валидированный
+    /// эталон). Для deep-полос — значение `depth_provenance_label(band_pct_e8, side, reach)`,
+    /// снятое ТЕМ ЖЕ наблюдением книги, что и `depth_e8` (`MD-I-8` обязательство 4).
+    pub provenance: Option<String>,
+}
+
 /// Depth time-series per (side, band) (зеркалит export v1 §4). BID/ASK — РАЗДЕЛЬНЫЕ серии.
+/// M-70 §2bis (DB-I-4): метка достоверности переехала со строки НА ТОЧКУ, поэтому ряд стал
+/// `Vec<DepthPoint>` (а не `Vec<(time_s, depth_e8)>`), и поле `depth_band_provenance` СНЯТО.
+/// Точка из окна ресинка обязана нести метку СВОЕГО наблюдения, а не метку последнего.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DepthRow {
     /// `"bid"` | `"ask"` — не суммируются.
     pub side: String,
     /// Полоса в долях ×1e8 (0.001 ×1e8 = 100000 = 0.1%).
     pub band_pct_e8: i64,
-    /// `(time_s, depth ×1e8)` close-семантика per бакет.
-    pub series: Vec<(i64, i64)>,
-    /// Провенанс полос глубже 1.3% от mid (VB-I-5/GW-I-6): непустой для deep-полос; `None`
-    /// допустим ТОЛЬКО для полос ≤1.3% (валидированного эталона). Отсутствие на deep-серии → snapshot невалиден.
-    pub depth_band_provenance: Option<String>,
+    /// Ряд точек со своими метками — M-70 §2bis (`DB-I-4`, `TD-159`).
+    pub series: Vec<DepthPoint>,
 }
 
 /// Bundle серий — v1-подмножество (M-22). M-23+ добавляют поля АДДИТИВНО (heatmap/vwap/vp).
@@ -1485,6 +1509,12 @@ impl Reducer {
                     Side::Buy => reach_bid,
                     Side::Sell => reach_ask,
                 };
+                // M-70 §2bis (DB-I-4): метка ставится НА ТОЧКУ, тем же наблюдением книги,
+                // из которого взят `depth_e8` (`MD-I-8` обязательство 4). Раньше метка жила
+                // на строке и описывала ВСЕ точки одним значением — после ресинка часть
+                // точек наблюдалась при ужатой книге, а метка несла состояние последнего
+                // наблюдения (PL-I-7 наоборот: деградация выдана за норму).
+                let label = depth_provenance_label(row.band_pct_e8, row.side, reach);
                 DepthRow {
                     side: match row.side {
                         Side::Buy => "bid",
@@ -1492,8 +1522,15 @@ impl Reducer {
                     }
                     .to_string(),
                     band_pct_e8: row.band_pct_e8,
-                    series: row.values.iter().map(|(&t, &v)| (t, v)).collect(),
-                    depth_band_provenance: depth_provenance_label(row.band_pct_e8, row.side, reach),
+                    series: row
+                        .values
+                        .iter()
+                        .map(|(&t, &v)| DepthPoint {
+                            time_s: t,
+                            depth_e8: v,
+                            provenance: label.clone(),
+                        })
+                        .collect(),
                 }
             })
             .collect();
@@ -1878,27 +1915,26 @@ impl Snapshot {
                     row.side == incoming.side && row.band_pct_e8 == incoming.band_pct_e8
                 });
             if let Some(current) = current {
-                let mut values: BTreeMap<i64, i64> = current.series.drain(..).collect();
-                values.extend(incoming.series.iter().copied());
-                current.series = values.into_iter().collect();
-                // `П-014` / `R-110` Б-1: метка СЛЕДУЕТ ЗА incoming — та же close-семантика, что у
-                // ЗНАЧЕНИЙ полосы строкой выше (`values.extend` — последнее наблюдение бакета
-                // побеждает). Было `if current...is_none()` — «первый непустой побеждает», и пока
-                // метка была чистой функцией ШИРИНЫ полосы, это было тождеством: значение не менялось
-                // никогда. После `П-014` метка — функция наблюдённого ОХВАТА, а охват движется во
-                // времени (ресинк после гэпа урезает книгу до ~1.3 %) — и «первый побеждает»
-                // превратилось в ЗАЛИПАНИЕ: WS-клиент получает `Snapshot` ОДИН раз и дальше живёт
-                // на `Frame`'ах, то есть до переподключения читал бы `liveness=confirmed` о полосе,
-                // которой в книге больше нет (`PL-I-7`: деградация не выдаётся за норму). Обратная
-                // сторона тоже вредна: залипшее `not-observed` не снималось после восстановления.
+                // M-70 §2bis (DB-I-4, TD-159): с точечной меткой (`Vec<DepthPoint>`) слияние
+                // становится слиянием ТОЧЕК по ключу `time_s`, и метка едет СО СВОЕЙ точкой —
+                // рассинхрон длин НЕВЫРАЗИМ. Прежнее безусловное копирование метки строки
+                // (`current.depth_band_provenance = incoming.depth_band_provenance.clone()`)
+                // было решением для ОДНОЙ метки на ряд; с точечной меткой это место перестаёт
+                // существовать — метка живёт внутри `DepthPoint.provenance`, и `BTreeMap`-
+                // слияние по `time_s` (close-семантика: последнее наблюдение бакета побеждает)
+                // автоматически сохраняет метку той точки, которая выиграла.
                 //
-                // Почему БЕЗУСЛОВНО, а не «берём incoming, если он непуст»: метка — ЧИСТАЯ
-                // функция `(ширина, сторона, охват)` (`depth_provenance_label`), и для одного и того же
-                // `(side, band_pct_e8)` она `None` тогда и только тогда, когда полоса ≤ 1.3 % (`VB-I-5`) —
-                // то есть ОДИНАКОВО `None` в обоих операндах слияния. Значит «взять incoming» не может
-                // потерять непустую метку глубокой полосы, а условие вносило бы ту же асимметрию,
-                // из-за которой блокер и появился.
-                current.depth_band_provenance = incoming.depth_band_provenance.clone();
+                // close-семантика `incoming.series` (последний `apply` на бакет побеждает —
+                // `П-014`/`R-110` Б-1 в новом виде) выражена через `BTreeMap::entry`: если
+                // точка с этим `time_s` уже есть в existing — её метка и значение переписываются
+                // значением из incoming (своя метка едет С НИМ); иначе — incoming-точка встаёт
+                // целиком. Никакого «залипания» метки на строке больше не существует физически.
+                let mut values: BTreeMap<i64, DepthPoint> =
+                    current.series.drain(..).map(|p| (p.time_s, p)).collect();
+                for incoming_pt in &incoming.series {
+                    values.insert(incoming_pt.time_s, incoming_pt.clone());
+                }
+                current.series = values.into_values().collect();
             } else {
                 self.series.depth_series.push(incoming.clone());
             }
@@ -2079,9 +2115,11 @@ fn evict_series_bundle_under_window(series: &mut SeriesBundle, lo_time_s: i64) {
     // ohlcv
     series.ohlcv.retain(|row| row.time_s >= lo_time_s);
 
-    // depth_series[].series
+    // depth_series[].series — M-70 §2bis: ряд стал `Vec<DepthPoint>`, фильтр по `time_s`
+    // остался прежним (оконная эвикция бакета); метка точки едет с самой точкой, отдельного
+    // шага для неё нет.
     for row in &mut series.depth_series {
-        row.series.retain(|&(t, _)| t >= lo_time_s);
+        row.series.retain(|p| p.time_s >= lo_time_s);
     }
 
     // vwap
