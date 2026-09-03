@@ -29,6 +29,7 @@
 # | шаг         | требование                                 | предмет наблюдения (чем пиннится)              |
 # |-------------|--------------------------------------------|------------------------------------------------|
 # | ПРЕДУСЛОВИЕ | `M-75` влит в `main`                       | `^pub fn effective_heatmap_window_frac(` в `main` |
+# | task #3     | предел полос отвергает ДО построения | ИСПОЛНЕНИЕ `DB-I-3` + `^pub const MAX_BANDS` + равенство чисел |
 # | task #4     | два сценария `DB-I-4` живы                 | `^fn ИМЯ` в T4 + ИСПОЛНЕНИЕ через chk_named_test |
 # | task #4b    | адаптер оракула читает метку КАЖДОЙ точки  | форма `^pub struct DepthPoint` + отсутствие заглушки-однострочника + ИСПОЛНЕНИЕ |
 # | task #5     | словарь метки ОДИН на всю выдачу           | ИСПОЛНЕНИЕ оракула `red_depth_label_dictionary` (пока не написан — честный ВАКУУМ-FAIL) |
@@ -129,6 +130,38 @@ for t in db_i_0_canonical_set_fits_under_signed_cap \
          db_i_0b_growth_is_the_depth_series_not_the_map; do
   chk "grep -q '^fn ${t}' crates/gateway/tests/red_depth_egress_canonical.rs"
 done
+
+step "task #3 — предел ЧИСЛА полос: отказ ДО построения ответа (DB-I-3)"
+# Требование — «клиент не может заставить сервер собрать ответ, чтобы затем его отвергнуть».
+# Замер: 4096 полос = 14 077 293 Б и 18.1 с работы РАДИ ОТКАЗА (§2bis.3). Предел `M-71`
+# срабатывает ПОСЛЕ построения, значит признак «вернулся Err» доступен и миру без гварда —
+# оракул различает миры структурно, вызывая чистую `validate_selector`.
+chk_named_test "оракул DB-I-3 (предел полос + анти-плацебо на подписанный состав)" \
+  cargo test -p gateway --test red_depth_bands_cap --quiet
+for t in db_i_3_selector_with_too_many_bands_is_rejected_before_any_work \
+         db_i_3b_snapshot_path_rejects_by_band_cap_not_by_response_size \
+         db_i_3c_signed_canonical_set_is_accepted \
+         db_i_3d_boundary_is_inclusive_and_exact; do
+  chk "grep -q '^fn ${t}' crates/gateway/tests/red_depth_bands_cap.rs"
+done
+# Гвард обязан жить в `gateway`, а не только в транспорте: `Selector` собирают напрямую
+# (research-cli, чекпоинтер, replay), и предел в `gateway-serve` оставил бы байпас-поверхность.
+chk "grep -qE '^pub const MAX_BANDS' ${LIB}"
+# ЧИСЛО согласовано между реализацией и оракулом — как EXPECTED_SCHEMA_VERSION.
+M_LIB="$(sed -n 's/^pub const MAX_BANDS: usize = \([0-9]\+\);.*/\1/p' "${LIB}" | head -1)"
+M_ORC="$(sed -n 's/^const EXPECTED_MAX_BANDS: usize = \([0-9]\+\);.*/\1/p' crates/gateway/tests/red_depth_bands_cap.rs | head -1)"
+if [ -z "${M_ORC}" ]; then
+  echo "FAIL: task #3 SETUP НЕ СОСТОЯЛСЯ — EXPECTED_MAX_BANDS в оракуле не извлёкся: сравнивать предел не с чем" >&2
+  FAIL=$((FAIL + 1))
+elif [ -z "${M_LIB}" ]; then
+  echo "FAIL: task #3 — MAX_BANDS в ${LIB} нет: гвард не введён (оракул ждёт ${M_ORC})" >&2
+  FAIL=$((FAIL + 1))
+elif [ "${M_LIB}" = "${M_ORC}" ]; then
+  echo "PASS: task #3 предел полос согласован реализацией и оракулом (${M_LIB})"
+else
+  echo "FAIL: task #3 — предел разошёлся: MAX_BANDS=${M_LIB} в реализации, EXPECTED_MAX_BANDS=${M_ORC} в оракуле" >&2
+  FAIL=$((FAIL + 1))
+fi
 
 step "task #4 (RED) — TD-159: метка достоверности принадлежит ТОЧКЕ, а не ряду"
 chk_named_test "оракул DB-I-4 (точка/ряд + анти-плацебо)" \
