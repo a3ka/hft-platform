@@ -1,0 +1,314 @@
+//! SACRED (architect-only) — `M-70` `DB-I-5`: **словарь метки достоверности ОДИН на всю
+//! выдачу.** Закрывает `TD-161` (MINOR, OPEN).
+//!
+//! # Что сломано: два производителя метки с РАЗНОЙ осведомлённостью
+//!
+//! Метку `depth_band_provenance` в одном ответе ставят ДВА пути, и знают они разное
+//! (`docs/fa/viz-backend.md` §4, врезка «⚠️ ПРОИЗВОДИТЕЛЯ МЕТКИ ДВА»):
+//!
+//! | путь | что известно в точке | что ставится |
+//! |---|---|---|
+//! | депт-серия (`lib.rs:1457`) | полоса, СТОРОНА, ОХВАТ | `diff-reconstructed, liveness=confirmed\|unconfirmed` либо `not-observed band=… reach=…` |
+//! | heatmap (`lib.rs:1577→1593/1609`) | только `mid`, порог, расстояние | голое `"diff-reconstructed"`, ОДНО значение на обе стороны |
+//!
+//! Клиент получает в ОДНОМ ответе четыре разные строки от двух путей и не может сказать,
+//! означает ли голое `diff-reconstructed` у ячейки то же самое, что `liveness=confirmed` у
+//! строки. Это `PL-I-7`: провенанс обязан быть ПОНЯТЕН, а не просто присутствовать.
+//!
+//! # Унификация идёт ВВЕРХ, и это не вкус
+//!
+//! Депт-серия знает сторону и охват; heatmap не знает ничего. Привести серию к беззнаковому
+//! `"diff-reconstructed"` значило бы стереть различение сторон — а оно ОБЯЗАТЕЛЬНО по
+//! `П-014` («ask на глубоких полосах — не подтверждена») и по незакрытому замку `A-002` З-2
+//! (`cancel_fraction` меряет насыщение, а не живость). Поэтому heatmap учится у серии, а не
+//! наоборот; спека `M-70` §2.1 запрещает обратное отдельной строкой.
+//!
+//! # Что для этого нужно в коде (§2bis.1) — СИГНАТУРА, а не строка
+//!
+//! Замер: `sed -n '/^fn build_heatmap_and_cob(/,/^}/p' … | grep -c 'reach'` → `0`. Охват —
+//! поле `Reducer` (`depth_reach_bid`/`depth_reach_ask`, `lib.rs:738/741`), внутрь строителя
+//! карты он не приходит вовсе. Значит задача 5 — расширение сигнатуры двумя параметрами, и
+//! метка ячейки берётся тем же `depth_provenance_label(band, side, reach)`, где `band` для
+//! ячейки — её собственное расстояние от mid. На месте вызова (`lib.rs:1506`) обе величины
+//! уже лежат в области видимости (`:1460-1461`) — нового замера не нужно.
+//!
+//! # Различающая сила признаков (`Р-4`) — по сценарию
+//!
+//! Признак сценария 1 — «строки равны». Мир, где «исправили» унификацией ВНИЗ (обе стороны
+//! отдают голое `diff-reconstructed`), этот признак НЕСЁТ — то есть один сценарий слеп, и
+//! это сказано прямо, а не замолчано. Его закрывает сценарий 2 (`bid` ≠ `ask`), которого
+//! мир унификации вниз не несёт по построению: там обе строки одинаковы. Сценарий 3 держит
+//! ту же границу с другой стороны — серия обязана СОХРАНИТЬ `liveness=`.
+//!
+//! Сценарий 4 отличает «прокинули только сторону» от «прокинули сторону И охват»: ячейка
+//! глубже ТЕКУЩЕГО охвата обязана называться `not-observed`, как её назвала бы серия. Мир,
+//! где в строитель передали лишь `side`, а liveness захардкодили, проходит сценарии 1-3 и
+//! падает здесь.
+//!
+//! # Почему ячейка МОЖЕТ оказаться за охватом — это не выдуманный случай
+//!
+//! Ячейки heatmap — снимки книги ПО БАКЕТАМ, а охват снимается по ПОСЛЕДНЕМУ наблюдению.
+//! После ресинка книга ужимается (`REST_DEPTH_LIMIT`), и бакет прошлой секунды продолжает
+//! нести уровни глубже нынешнего охвата. Ровно этот разрыв «ряд точек разного качества под
+//! одной меткой» есть `TD-159` в депт-серии (задача 4); в heatmap он даёт ячейку, которая
+//! обязана честно сказать `not-observed`, а не унаследовать `liveness=confirmed`.
+//!
+//! # Состояние: КРАСНЫЙ ПО ПОСТРОЕНИЮ
+//!
+//! `build_heatmap_and_cob` ставит `"diff-reconstructed"` литералом на обе стороны. Сценарии
+//! 1, 2 и 4 падают; сценарий 3 зелен (серия уже знает сторону) — он сторож, а не предмет.
+
+use contracts::{to_fixed, DataSource, EventKind, Level, MdPayload, Venue};
+use gateway::{Cursor, Selector};
+use journal::{EpochFilter, Journal, WriterConfig};
+
+const MID: f64 = 65_000.0;
+const T0: i64 = 1_752_000_000_000;
+
+/// Полоса ГЛУБЖЕ 1.3 % — только такие несут метку (`VB-I-5`: ≤ 1.3 % — валидированный эталон).
+const DEEP_BAND: f64 = 0.02;
+
+/// **Гигиена процессно-глобального окна** (`C-201` B-6). Эффективное окно heatmap — состояние
+/// ПРОЦЕССА (`M-75`), а этому файлу нужно ШИРОКОЕ окно, чтобы глубокие ячейки вообще попали
+/// в карту. Сосед, ставящий прод-дефолт `0.001`, перезапишет его под ногами, и тест упадёт,
+/// НЕ БУДУЧИ сломанным. Приём и причина — те же, что в `red_heatmap.rs` и `red_egress_cap.rs`.
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+fn cfg() -> WriterConfig {
+    WriterConfig {
+        max_segment_bytes: 1 << 26,
+        min_free_bytes: 0,
+        source: DataSource::OwnCapture,
+        provenance: "M-70 DB-I-5 label-dictionary fixture".to_string(),
+        epoch_id: "own-test".to_string(),
+    }
+}
+
+fn sel() -> Selector {
+    Selector {
+        venue: Venue::Binance,
+        symbol: "BTCUSDT".to_string(),
+        timeframe_ms: 1_000,
+        bands: vec![DEEP_BAND],
+        window_ms: None,
+        depth_cadence_ms: None,
+    }
+}
+
+fn lvls(v: &[(f64, f64)]) -> Vec<Level> {
+    v.iter()
+        .map(|(p, s)| Level {
+            price: to_fixed(*p),
+            size: to_fixed(*s),
+        })
+        .collect()
+}
+
+/// Книга, тянущаяся до `reach_frac` от mid с шагом 0.2 %: достаточно густо, чтобы полоса
+/// 2 % содержала уровни, и достаточно коротко, чтобы охват был УПРАВЛЯЕМ — вторым снимком
+/// его можно ужать и получить бакет глубже текущего охвата (сценарий 4).
+fn snapshot_ev(reach_frac: f64, ts: i64) -> EventKind {
+    const STEP_FRAC: f64 = 0.002;
+    let n = (reach_frac / STEP_FRAC).round() as usize;
+    let step = MID * STEP_FRAC;
+    let bids: Vec<(f64, f64)> = (1..=n)
+        .map(|k| (MID - k as f64 * step, 1.0 + (k % 7) as f64))
+        .collect();
+    let asks: Vec<(f64, f64)> = (1..=n)
+        .map(|k| (MID + k as f64 * step, 1.0 + (k % 7) as f64))
+        .collect();
+    EventKind::md(
+        Venue::Binance,
+        "BTCUSDT",
+        MdPayload::L2Snapshot {
+            bids: lvls(&bids),
+            asks: lvls(&asks),
+            ts_exch_ms: ts,
+        },
+    )
+}
+
+fn journal_of(events: Vec<EventKind>) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut j = Journal::open_with(dir.path(), cfg()).expect("open_with");
+    for e in events {
+        j.append(e).expect("append");
+    }
+    j.flush().expect("flush");
+    dir
+}
+
+fn snap(dir: &std::path::Path) -> gateway::Snapshot {
+    gateway::snapshot(dir, EpochFilter::OwnCaptureOnly, &sel(), Cursor::LATEST).expect("snapshot")
+}
+
+/// Метка ГЛУБОКОЙ ячейки карты на заданной стороне. `None` — таких ячеек нет вовсе, и это
+/// отдельный исход: сравнивать было бы не с чем, значит setup не состоялся.
+fn deep_cell_label(s: &gateway::Snapshot, side: &str) -> Option<Option<String>> {
+    s.series
+        .heatmap
+        .iter()
+        .filter(|c| c.side == side)
+        .find(|c| c.depth_band_provenance.is_some())
+        .map(|c| c.depth_band_provenance.clone())
+}
+
+/// Метка строки депт-серии на заданной стороне (полоса одна — `DEEP_BAND`).
+fn deep_row_label(s: &gateway::Snapshot, side: &str) -> Option<String> {
+    s.series
+        .depth_series
+        .iter()
+        .find(|r| r.side == side)
+        .and_then(|r| r.depth_band_provenance.clone())
+}
+
+/// SETUP-СТРАЖ: в ответе обязаны быть И глубокая ячейка, И глубокая строка на обеих сторонах.
+/// Иначе «строки равны» истинно вырожденно — сравнивать нечего.
+fn assert_both_producers_are_present(s: &gateway::Snapshot) {
+    for side in ["bid", "ask"] {
+        assert!(
+            deep_cell_label(s, side).is_some(),
+            "SETUP НЕ СОСТОЯЛСЯ: в карте нет ни одной ГЛУБОКОЙ ячейки на стороне {side} \
+             (всего ячеек {}). Либо окно уже 1.3 %, либо книга не достаёт — сравнивать \
+             словари не на чем; чинить фикстуру, а не реализацию",
+            s.series.heatmap.len()
+        );
+        assert!(
+            deep_row_label(s, side).is_some(),
+            "SETUP НЕ СОСТОЯЛСЯ: депт-серия не дала метку на стороне {side} (строк {}). \
+             Полоса {DEEP_BAND} обязана быть глубже 1.3 % и попадать в охват",
+            s.series.depth_series.len()
+        );
+    }
+}
+
+/// `DB-I-5` ЯДРО — глубокая ячейка и глубокая строка ОДНОГО ответа описаны ОДИНАКОВО.
+#[test]
+fn db_i_5_one_dictionary_for_cell_and_row_in_the_same_response() {
+    let _g = serial(); // окно heatmap процессно-глобально
+    gateway::set_effective_heatmap_window_frac(0.03); // шире 1.3 %, иначе глубоких ячеек нет
+    let dir = journal_of(vec![snapshot_ev(0.03, T0 + 1_000)]);
+    let s = snap(dir.path());
+    assert_both_producers_are_present(&s);
+
+    for side in ["bid", "ask"] {
+        let cell = deep_cell_label(&s, side).flatten();
+        let row = deep_row_label(&s, side);
+        assert_eq!(
+            cell, row,
+            "DB-I-5 НАРУШЕН на стороне {side}: ячейка карты описана как {cell:?}, а строка \
+             депт-серии — как {row:?}, в ОДНОМ ответе. Клиент не может знать, означают ли эти \
+             две строки одно и то же (`TD-161`, `PL-I-7`). Унификация обязана идти ВВЕРХ: \
+             heatmap получает `side` и `reach` и зовёт тот же `depth_provenance_label`"
+        );
+    }
+}
+
+/// `DB-I-5b` — СТОРОНА доехала до карты. Убивает мир «унифицировали ВНИЗ»: там обе стороны
+/// несут одну голую строку, и ядро (сценарий 1) было бы зелено ни о чём.
+#[test]
+fn db_i_5b_map_labels_discriminate_side_like_the_series_does() {
+    let _g = serial();
+    gateway::set_effective_heatmap_window_frac(0.03);
+    let dir = journal_of(vec![snapshot_ev(0.03, T0 + 1_000)]);
+    let s = snap(dir.path());
+    assert_both_producers_are_present(&s);
+
+    let bid = deep_cell_label(&s, "bid").flatten();
+    let ask = deep_cell_label(&s, "ask").flatten();
+    assert_ne!(
+        bid, ask,
+        "DB-I-5b НАРУШЕН: глубокие ячейки bid и ask описаны ОДИНАКОВО ({bid:?}). `П-014` \
+         требует различения сторон, а `A-002` З-2 не снят: `cancel_fraction` меряет \
+         насыщение, не живость, и ask на глубоких полосах ОПРОВЕРГНУТ на трёх из шести. \
+         Одинаковая метка на обеих сторонах — это либо старое голое \
+         `\"diff-reconstructed\"`, либо унификация ВНИЗ; оба мира запрещены"
+    );
+}
+
+/// АНТИ-ПЛАЦЕБО — серия НЕ теряет `liveness`. Держит ту же границу с другой стороны:
+/// «сделать словари одинаковыми» не должно означать «стереть то, что серия знала».
+#[test]
+fn db_i_5c_series_does_not_lose_liveness_to_unification() {
+    let _g = serial();
+    gateway::set_effective_heatmap_window_frac(0.03);
+    let dir = journal_of(vec![snapshot_ev(0.03, T0 + 1_000)]);
+    let s = snap(dir.path());
+    assert_both_producers_are_present(&s);
+
+    for (side, expect) in [
+        ("bid", "liveness=confirmed"),
+        ("ask", "liveness=unconfirmed"),
+    ] {
+        let row = deep_row_label(&s, side).expect("метка строки");
+        assert!(
+            row.contains(expect),
+            "УНИФИКАЦИЯ ВНИЗ: строка депт-серии на стороне {side} потеряла `{expect}` и стала \
+             {row:?}. Это дешёвый способ сделать словари одинаковыми — стереть знание, а не \
+             передать его. `M-70` §2.1 запрещает приводить серию к словарю карты"
+        );
+    }
+}
+
+/// `DB-I-5d` — ОХВАТ доехал до карты, а не только сторона.
+///
+/// Второй снимок ужимает книгу до 1 %: бакет первой секунды продолжает нести уровни на 2.5 %,
+/// а текущий охват — 1 %. Такая ячейка обязана называться `not-observed`, как её назвала бы
+/// депт-серия для полосы за охватом. Мир, где в строитель прокинули лишь `side`, а liveness
+/// захардкодили, проходит сценарии 1-3 и падает здесь.
+#[test]
+fn db_i_5d_cell_beyond_current_reach_is_named_not_observed() {
+    let _g = serial();
+    gateway::set_effective_heatmap_window_frac(0.03);
+    // t+1: книга до 3 % — бакет запомнит глубокие уровни.
+    // t+2: РЕСИНК-снимок до 1 % — книга ужалась, охват стал 1 %.
+    let dir = journal_of(vec![
+        snapshot_ev(0.03, T0 + 1_000),
+        snapshot_ev(0.01, T0 + 2_000),
+    ]);
+    let s = snap(dir.path());
+
+    // SETUP-СТРАЖ: ячейка ГЛУБЖЕ нынешнего охвата обязана существовать, иначе сценарий
+    // судит не тот мир. Ищем ячейку дальше 1 % от mid в бакете первой секунды.
+    let mid_e8 = to_fixed(MID);
+    let beyond: Vec<&gateway::HeatmapCell> = s
+        .series
+        .heatmap
+        .iter()
+        .filter(|c| {
+            // Порог ОДИН, и это не упрощение ради краткости. Метку несут только ячейки
+            // глубже 1.3 % (`VB-I-5`), а текущий охват после ресинка — 1 %. Раз 1.3 % > 1 %,
+            // в ЭТОЙ фикстуре «несёт метку» уже влечёт «за охватом», и второе условие было
+            // бы тавтологией. Первая редакция писала `dist > 0.013 && dist > 0.011`, будто
+            // это два независимых требования, — clippy справедливо назвал правую часть
+            // не имеющей эффекта. Связь порогов держится ФИКСТУРОЙ (второй снимок ужимает
+            // книгу до 1 %) и сторожится проверкой непустоты ниже.
+            let dist = (c.price_e8 - mid_e8).abs() as f64 / mid_e8 as f64;
+            dist > 0.013
+        })
+        .collect();
+    assert!(
+        !beyond.is_empty(),
+        "SETUP НЕ СОСТОЯЛСЯ: в карте нет ячеек глубже нынешнего охвата (1 %). Второй снимок \
+         обязан УЖАТЬ книгу, а бакет первой секунды — сохранить глубокие уровни (`MD-I-8` \
+         обязательство 2: ресинк-снимок ЗАМЕЩАЕТ книгу). Ячеек всего: {}",
+        s.series.heatmap.len()
+    );
+
+    for c in beyond {
+        let label = c.depth_band_provenance.clone().unwrap_or_default();
+        assert!(
+            label.starts_with("not-observed"),
+            "DB-I-5d НАРУШЕН: ячейка на {:.4} от mid (глубже нынешнего охвата 1 %) описана как \
+             {label:?}. Это утверждение о живости уровня, которого в книге БОЛЬШЕ НЕТ — тихая \
+             ложь класса `PL-I-7`, тот же разрыв «данные одного момента под меткой другого», \
+             что `TD-159` в депт-серии. Ожидалось `not-observed …`",
+            (c.price_e8 - mid_e8).abs() as f64 / mid_e8 as f64
+        );
+    }
+}
