@@ -1679,8 +1679,30 @@ fn build_heatmap_and_cob(
         }
         let low = (mid as f64 * (1.0 - w)) as i64;
         let high = (mid as f64 * (1.0 + w)) as i64;
-        let deep_thr = (mid as f64 * 0.013) as i64; // 1.3% от mid
-        let prov_str = "diff-reconstructed".to_string();
+        // M-70 §2bis.1 (DB-I-5, TD-161): словарь метки ОДИН на всю выдачу. Карта зовёт
+        // ту же `depth_provenance_label(band_pct_e8, side, reach)`, что и депт-серия;
+        // `band` — расстояние ячейки от mid своего бакета, `side` — сторона ячейки,
+        // `reach` — крайний уровень ТОГО ЖЕ бакета на ТОЙ ЖЕ стороне.
+        //
+        // Ячейка карты есть УРОВЕНЬ КНИГИ своего бакета, поэтому её расстояние никогда
+        // не превышает охват этого бакета: ветвь `not-observed` для heatmap структурно
+        // недостижима. Словарь ОДИН, но карта пользуется двумя его значениями из трёх —
+        // это свойство предмета, а не дыра покрытия (DB-I-5d пиннит именно его).
+        let mid_f = mid as f64;
+        let reach_bid = state
+            .bids
+            .iter()
+            .filter(|(_, s)| *s > 0)
+            .map(|(p, _)| *p)
+            .min()
+            .map(|p| (mid_f - p as f64) / mid_f);
+        let reach_ask = state
+            .asks
+            .iter()
+            .filter(|(_, s)| *s > 0)
+            .map(|(p, _)| *p)
+            .max()
+            .map(|p| (p as f64 - mid_f) / mid_f);
 
         // bid: в окне price ∈ [low, mid]; HBMAP-порядок — (side, price) ascending →
         // для bid — price ascending (против естественного bookmap «лучшие наверху»).
@@ -1690,13 +1712,19 @@ fn build_heatmap_and_cob(
                 continue;
             }
             let dist = mid - price;
-            let deep = dist > deep_thr;
+            let band_pct_e8 = ((dist as f64 / mid_f) * 1e8).round() as i64;
+            // `depth_provenance_label` сам решает «глубже 1.3 % или нет»: для band ≤ 1.3 %
+            // возвращает `None` (валидированный эталон, метки не несёт), для глубоких —
+            // строку с `liveness=` по стороне. Охват для этой ячейки берётся из её же
+            // бакета, потому что она и есть уровень этого бакета (см. обоснование выше).
+            let provenance =
+                depth_provenance_label(band_pct_e8, Side::Buy, reach_bid.unwrap_or(0.0));
             heatmap_out.push(HeatmapCell {
                 time_s: *time_s,
                 side: "bid".to_string(),
                 price_e8: price,
                 size_e8: size,
-                depth_band_provenance: deep.then(|| prov_str.clone()),
+                depth_band_provenance: provenance,
             });
         }
 
@@ -1706,13 +1734,15 @@ fn build_heatmap_and_cob(
                 continue;
             }
             let dist = price - mid;
-            let deep = dist > deep_thr;
+            let band_pct_e8 = ((dist as f64 / mid_f) * 1e8).round() as i64;
+            let provenance =
+                depth_provenance_label(band_pct_e8, Side::Sell, reach_ask.unwrap_or(0.0));
             heatmap_out.push(HeatmapCell {
                 time_s: *time_s,
                 side: "ask".to_string(),
                 price_e8: price,
                 size_e8: size,
-                depth_band_provenance: deep.then(|| prov_str.clone()),
+                depth_band_provenance: provenance,
             });
         }
 
