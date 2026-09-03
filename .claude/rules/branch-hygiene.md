@@ -102,6 +102,12 @@ untracked, незапушенный коммит dev'а живёт только 
    /tmp/salvage-<name>.patch` или `git push origin HEAD:<branch>`, потом `worktree remove
    --force`. Молчаливый снос = потеря работы.
 
+## Закрытие сессии — работа обязана быть ДОСТИЖИМА из `origin`
+
+`bash scripts/check_unreachable_work.sh` — ПЕРЕД закрытием сессии и перед сносом любого
+дерева. Недостижимый артефакт гейта = FAIL, закрывать нельзя. Замер 2026-09-01: вердикт на
+316 строк жил в ОДНОМ дереве из 51 и исчез бы вместе с сессией. Разбор — `docs/workflow/session-closeout-2026-09-01.md`.
+
 ## Cross-references
 
 - `.claude/rules/gates.md` §8 (push-scope, RED не живёт на main, intra-chain push), §9 (барьер артефактов)

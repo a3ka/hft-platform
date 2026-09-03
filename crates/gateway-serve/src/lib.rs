@@ -2008,6 +2008,9 @@ pub fn build_selector(
 /// - `GATEWAY_SYMBOL`      — дефолт `"BTCUSDT"`.
 /// - `GATEWAY_TIMEFRAME_MS`— дефолт `1000` (i64, parse).
 /// - `GATEWAY_BANDS`       — comma-separated float'ы, дефолт `"0.001"`.
+/// - `GATEWAY_HEATMAP_WINDOW` — M-75: серверная полуширина окна heatmap/COB,
+///   дефолт `0.001` только при отсутствии; заданное значение обязано быть
+///   разбираемым и строго внутри `(0, 1)`, иначе `Err` на старте.
 /// - `GATEWAY_WINDOW_MS`   — M-69 (GW-I-14): fail-closed гвард на СТАРТЕ. `unset`/пусто/
 ///   пробелы/`"0"` канонизируются в `None` (offline, без bounded-окна — research-cli /
 ///   replay-tutor / чекпоинтер M-38b); парсинг оборачивается в `match` — parse-error,
@@ -2082,6 +2085,31 @@ pub fn serve_config_from_env(
         .map(|s| s.trim().parse::<f64>())
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| format!("GATEWAY_BANDS parse: {e}"))?;
+
+    // M-75: окно heatmap/COB — серверная настройка, не клиентский selector.
+    // Отсутствие переменной использует подписанный дефолт; любое заданное значение
+    // разбирается fail-closed и обязано лежать строго внутри (0, 1). В частности,
+    // пустая строка считается заданным невалидным значением, а не дефолтом.
+    let heatmap_window_frac: f64 = match get("GATEWAY_HEATMAP_WINDOW") {
+        None => gateway::DEFAULT_HEATMAP_WINDOW_FRAC,
+        Some(raw) => {
+            let value = raw.trim();
+            match value.parse::<f64>() {
+                Ok(w) if w.is_finite() && w > 0.0 && w < 1.0 => w,
+                Ok(w) => {
+                    return Err(format!(
+                        "GATEWAY_HEATMAP_WINDOW={w:?} вне интервала (0, 1); \
+                         окно heatmap/COB должно быть положительным и меньше 1"
+                    ));
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "GATEWAY_HEATMAP_WINDOW={value:?} не разбирается как f64 ({e})"
+                    ));
+                }
+            }
+        }
+    };
 
     // M-69 task #1 (GW-I-14, R7/PL-I-5): `GATEWAY_WINDOW_MS` — fail-closed на parse-error
     // и overflow. Невалидное значение больше НЕ даёт `None` тихо (поведение unbounded,
@@ -2326,6 +2354,7 @@ pub fn serve_config_from_env(
     // ВЫШЕ (включая M-68 гвард отношения) делают `return Err(...)` ДО этой строки.
     // Класс GW-I-14/R7: отвергнутая конфигурация не смеет управлять сервисом.
     gateway::set_effective_max_response_bytes(max_response_bytes);
+    gateway::set_effective_heatmap_window_frac(heatmap_window_frac);
 
     Ok(server::ServeConfig {
         addr,

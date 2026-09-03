@@ -28,6 +28,8 @@ services:
       BINANCE_SYMBOLS: ${BINANCE_SYMBOLS:-BTCUSDT,ETHUSDT}
       BINANCE_FUTURES_SYMBOLS: ${BINANCE_FUTURES_SYMBOLS:-BTCUSDT,ETHUSDT}
       HL_COINS: ${HL_COINS:-BTC,ETH}
+      L2DELTA_CAPTURE_SYMBOLS: BTCUSDT,ETHUSDT
+      EPOCH_ID: own-2026-09-m45-ethusdt
     volumes:
       - journal-data:/journal
     healthcheck:
@@ -132,6 +134,7 @@ services:
       GATEWAY_SYMBOL: ${GATEWAY_SYMBOL:-BTCUSDT}
       GATEWAY_TIMEFRAME_MS: ${GATEWAY_TIMEFRAME_MS:-1000}
       GATEWAY_BANDS: ${GATEWAY_BANDS:-0.001}
+      GATEWAY_HEATMAP_WINDOW: ${GATEWAY_HEATMAP_WINDOW:-0.001}
       # M-37 task #7c (анти-TD-020): прод-окно ОКНОВОГО reducer'а. Без активного окна
       # gateway-serve дефолтит в `window_ms = None` = unbounded → снапшот ООМ-ит (TD-039
       # воспроизводится через §8 E2E). 60s = ~60 бакетов в окне при `timeframe_ms=1000`,

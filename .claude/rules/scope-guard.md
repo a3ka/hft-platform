@@ -7,9 +7,9 @@
 
 | Агент | РАЗРЕШЕНО | ЗАПРЕЩЕНО (всё остальное) |
 |---|---|---|
-| **architect** (Fable) | `docs/`, `contracts/` T1-типы (только через contract-RFC, `.claude/rules/gates.md`), `*/tests/` (RED-спеки), `scripts/verify_*.sh`, `milestones/M-NN-*.md` | ЛЮБОЙ impl-код (`crates/*/src/`, `research/*/src/`), билд-конфиги (`Cargo.toml` deps секции) |
+| **architect** (Fable) | `docs/`, `contracts/` T1-типы (только через contract-RFC, `.claude/rules/gates.md`), `*/tests/` (RED-спеки), `scripts/{verify_*.sh,check_*.sh,lib/**}`, `milestones/M-NN-*.md` | ЛЮБОЙ impl-код (`crates/*/src/`, `research/*/src/`), билд-конфиги (`Cargo.toml` deps секции) |
 | **signal-engineer** | ТОЛЬКО `crates/signals/**` + `research/specs/`, `research/hypotheses/` (по назначению) | `journal/venues/book/oms/risk/killswitch/portfolio/strategy` — запрещены безусловно (граница A, `docs/03-integration-contract.md` §4) |
-| **engine-dev** (journal/book/oms/sim/runner/alpha/portfolio/strategy/**ops**/**gateway**/**gateway-serve**/**recorder**) | `crates/{journal,book,oms,sim,runner,alpha,portfolio,strategy,ops,gateway,gateway-serve,recorder}/src/**` (impl, НЕ типы) + `deploy/**` (ops/деплой-механика: cron, Dockerfile, compose, метрики-scrape — НЕ секреты). `crates/recorder` = вход даталеера (venue→journal; де-факто engine-dev: M-05 run_writer, M-08 heartbeat, M-09 recon/метрики — 2026-07-25, M-35). `crates/gateway` = viz-backend Read Gateway (Слой 8, M-22): read-only консюмер журнала через `journal::stream`, БЕЗ journal-writer/order-path (VB-I-3). `crates/gateway-serve` = WS-транспорт (M-28, D1/D6): тонкая IO-оболочка над gateway-lib, read-only, stateless JWT-verify БЕЗ app-БД (GS-I-1/VB-I-9). | `crates/risk/`, `crates/killswitch/`, `crates/contracts/` (T1), другие крейты вне своего списка |
+| **engine-dev** (journal/book/oms/sim/runner/alpha/portfolio/strategy/**ops**/**gateway**/**gateway-serve**/**recorder**) | `crates/{journal,book,oms,sim,runner,alpha,portfolio,strategy,ops,gateway,gateway-serve,recorder}/src/**` (impl, НЕ типы) + `deploy/**` (ops/деплой-механика: cron, Dockerfile, метрики-scrape — НЕ секреты) + **корневой `docker-compose.yml`** — только объявление операторских ручек СВОИХ сервисов; не секреты, не состав данных без подписи (граница C; разбор — `docs/workflow/compose-zone-2026-08-31.md`). `crates/recorder` = вход даталеера (venue→journal; де-факто engine-dev: M-05 run_writer, M-08 heartbeat, M-09 recon/метрики — 2026-07-25, M-35). `crates/gateway` = viz-backend Read Gateway (Слой 8, M-22): read-only консюмер журнала через `journal::stream`, БЕЗ journal-writer/order-path (VB-I-3). `crates/gateway-serve` = WS-транспорт (M-28, D1/D6): тонкая IO-оболочка над gateway-lib, read-only, stateless JWT-verify БЕЗ app-БД (GS-I-1/VB-I-9). | `crates/risk/`, `crates/killswitch/`, `crates/contracts/` (T1), другие крейты вне своего списка |
 | **venue-dev** | `crates/venue-*/src/**` (адаптеры бирж; вкл. recon REST-fetch M-09 — **MD-only**, без order-egress) | всё вне `venue-*`; `risk`/`killswitch` |
 | **research-dev** | `crates/research-cli/src/**`, `research/reports/`, `research/data-quality/**` (генерация: gap-статистика + recon-сводки, офлайн-агрегация журнала) | `crates/{risk,killswitch,journal,oms}`, `research/trials-ledger.json` (append-only механизм — не ручная правка) |
 | **risk-critic** | ТОЛЬКО `research/critiques/*.md` (вердикт-файлы) | ничего в коде; не пишет milestone'ы |
@@ -24,8 +24,8 @@
 - `crates/contracts/**` (T1-типы: `Event`/`EventKind`, `SignalRegistry` entry, `Ctl(ParamChange)`,
   `SignalSpec`, `ValidationReport`, `TrialsLedger` entry, `Decision`) — только через
   contract-RFC, см. `.claude/rules/gates.md` + `docs/05-contract-layer.md` §4.
-- `*/tests/` (везде) — RED-спеки architect'а. dev НЕ правит тест, даже если "тест неправильный".
-- `scripts/verify_*.sh` — acceptance-гейты architect'а.
+- `*/tests/` (везде) — RED-спеки architect'а. dev НЕ правит тест, даже «неправильный».
+- `scripts/{verify_*,check_*}.sh`, `scripts/lib/**` — гейты architect'а.
 - `research/registry/signals.json` (граница B) — движок читает, деск пишет ТОЛЬКО через
   подписанное решение (`docs/03-integration-contract.md` §2, `INTG-I-2`).
 - `research/decisions/D-NNN.md` — пишет ТОЛЬКО founder (Ed25519-подпись).
