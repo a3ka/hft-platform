@@ -75,13 +75,16 @@ fn default_selector() -> Selector {
 /// 9: M-68 (TD-158) — **смена СЕМАНТИКИ депт-серии** (`П-014` п.3, прецедент VB-I-6):
 ///    была «глубина на момент последнего снимка» (snapshot-only, M-22), стала «глубина
 ///    на момент последнего L2-события» (снимок И дельта, каденция + хвост). Форма
-///    `DepthRow` НЕ меняется — меняется СОДЕРЖИМОЕ строки (числа считаются от `self.book`,
-///    охват `depth_reach_*` снимается на КАЖДОМ L2-событии, метка описывает ТО наблюдение,
-///    из которого взяты числа). Bump здесь ЕДИНСТВЕННЫЙ рычаг, отвергающий чекпоинт со
-///    старым смыслом (`read_and_validate` шаг 3, `crates/gateway/src/lib.rs:2901-2904`):
-///    `CKPT_SCHEMA_VERSION` — версия ФОРМАТА файла, формат не меняется; bump его вместо
-///    `GATEWAY_SCHEMA_VERSION` отверг бы кэш, но соврал бы о причине и оставил `П-014` п.3
-///    неисполненным.
+///    `DepthRow` в ревизии R-171 Б-1 (аддитивная, §2bis.-1) ПОМЕНЯЛАСЬ: метка
+///    `depth_band_provenance: Option<String>` снята со СТРОКИ, и добавлен параллельный
+///    массив `series_provenance: Vec<Option<String>>`. `series: Vec<(i64, i64)>` сохранён,
+///    чтобы v1-потребитель продолжал разбирать (аддитивность, `VB-I-4`). Bump здесь
+///    ЕДИНСТВЕННЫЙ рычаг, отвергающий чекпоинт со старым смыслом (`read_and_validate`
+///    шаг 3, `crates/gateway/src/lib.rs:2901-2904`): `CKPT_SCHEMA_VERSION` — версия
+///    ФОРМАТА файла, формат не меняется; bump его вместо `GATEWAY_SCHEMA_VERSION`
+///    отверг бы кэш, но соврал бы о причине и оставил `П-014` п.3 неисполненным.
+///    Бамп `GATEWAY_SCHEMA_VERSION` 9 → 10 (задача 6) ещё не выполнен здесь — он
+///    привязан к решению founder'а по очерёдности с M-72.
 pub const GATEWAY_SCHEMA_VERSION: u32 = 9;
 
 /// M-71 (`milestones/M-71-egress-cap.md` §5.1): дефолт предела объёма ответа в
@@ -344,42 +347,34 @@ pub struct BubbleCell {
     pub sell_vol_e8: i64,
 }
 
-/// M-70 §2bis (DB-I-4, TD-159): одна ТОЧКА депт-серии со СВОЕЙ меткой достоверности.
-/// Раньше метка жила на `DepthRow` и описывала ВСЕ точки ряда разом — что лгало после
-/// ресинка: точка из окна ресинка (книга ещё ужатая до `REST_DEPTH_LIMIT`) описывалась
-/// меткой ПОСЛЕДНЕГО наблюдения (книга уже достроенная дельтами), и `PL-I-7` срабатывал
-/// наоборот (деградация выдана за норму). Теперь метка переехала на ТОЧКУ и снимается
-/// ТЕМ ЖЕ наблюдением, из которого взят `depth_e8` (`MD-I-8` обязательство 4 — число и
-/// провенанс сняты ОДНИМ наблюдением).
-///
-/// **Почему точка, а не параллельный массив меток.** Параллельный `Vec<Option<String>>`
-/// рядом с `Vec<(time_s, depth)>` допускал бы рассинхрон длин, и инвариант пришлось бы
-/// ЗАПРЕЩАТЬ отдельной строкой и СТОРОЖИТЬ оракулом. Эта форма делает рассинхрон
-/// НЕВЫРАЗИМЫМ — тот же критерий, которым `M-75` сузил `build_heatmap_and_cob`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct DepthPoint {
-    /// Начало бакета, секунды — прежний первый элемент кортежа `(time_s, depth_e8)`.
-    pub time_s: i64,
-    /// Глубина полосы ×1e8 — прежний второй элемент кортежа.
-    pub depth_e8: i64,
-    /// Метка этой точки. `None` — только для полос ≤ 1.3 % (`VB-I-5`, валидированный
-    /// эталон). Для deep-полос — значение `depth_provenance_label(band_pct_e8, side, reach)`,
-    /// снятое ТЕМ ЖЕ наблюдением книги, что и `depth_e8` (`MD-I-8` обязательство 4).
-    pub provenance: Option<String>,
-}
-
 /// Depth time-series per (side, band) (зеркалит export v1 §4). BID/ASK — РАЗДЕЛЬНЫЕ серии.
-/// M-70 §2bis (DB-I-4): метка достоверности переехала со строки НА ТОЧКУ, поэтому ряд стал
-/// `Vec<DepthPoint>` (а не `Vec<(time_s, depth_e8)>`), и поле `depth_band_provenance` СНЯТО.
-/// Точка из окна ресинка обязана нести метку СВОЕГО наблюдения, а не метку последнего.
+///
+/// M-70 §2bis.-1 (R-171 Б-1): форма ВЕРНУЛАСЬ к кортежам + ДОБАВЛЕН параллельный массив меток.
+/// Прежняя попытка (`§2bis`, `Vec<DepthPoint>` с меткой в каждой точке) делала рассинхрон длин
+/// НЕВЫРАЗИМЫМ, но ломала `VB-I-4`: v1-потребитель `series: Vec<(i64, i64)>` переставал
+/// разбирать выдачу (`Error("trailing characters")`). Замер Б-1 показал это на двух прототипах;
+/// принят параллельный массив как аддитивное расширение.
+///
+/// ЦЕНА выбора названа: рассинхрон длин `series` и `series_provenance` СТАНОВИТСЯ
+/// ВЫРАЗИМЫМ и СТОРОЖИТСЯ оракулом `DB-I-4c` (`red_depth_point_provenance.rs`).
+/// v1-потребитель, игнорирующий незнакомые поля serde, продолжает читать ряд как читал
+/// (`export_v2.rs::DepthRowV1` — `series: Vec<(i64, i64)>` без меток).
+///
+/// Семантика метки: `None` — только для полос ≤ 1.3 % (`VB-I-5`, валидированный эталон);
+/// для deep-полос — значение `depth_provenance_label(band_pct_e8, side, reach)`, снятое
+/// ТЕМ ЖЕ наблюдением книги, из которого взят `depth_e8` (`MD-I-8` обязательство 4 — число
+/// и провенанс сняты ОДНИМ наблюдением; §2bis.0 / `BTreeMap<i64, (i64, f64)>`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DepthRow {
     /// `"bid"` | `"ask"` — не суммируются.
     pub side: String,
     /// Полоса в долях ×1e8 (0.001 ×1e8 = 100000 = 0.1%).
     pub band_pct_e8: i64,
-    /// Ряд точек со своими метками — M-70 §2bis (`DB-I-4`, `TD-159`).
-    pub series: Vec<DepthPoint>,
+    /// Ряд точек `(time_s, depth_e8)` — форма КАК В v1 (аддитивность, `VB-I-4`).
+    pub series: Vec<(i64, i64)>,
+    /// Метка i-й точки `series` — длина ОБЯЗАНА быть равна `series.len()`
+    /// (страж `DB-I-4c`; цена аддитивной формы, §2bis.-1).
+    pub series_provenance: Vec<Option<String>>,
 }
 
 /// Bundle серий — v1-подмножество (M-22). M-23+ добавляют поля АДДИТИВНО (heatmap/vwap/vp).
@@ -1536,6 +1531,23 @@ impl Reducer {
             .depth
             .iter()
             .map(|row| {
+                // M-70 §2bis.0 (DB-I-4) + §2bis.-1 (R-171 Б-1, аддитивная форма):
+                // метка считается ПОТОЧЕЧНО из пары `(depth_e8, reach)`, записанной
+                // ТЕМ ЖЕ наблюдением книги (`MD-I-8` обязательство 4 — число и
+                // провенанс сняты ОДНИМ наблюдением), и кладётся в ПАРАЛЛЕЛЬНЫЙ
+                // массив `series_provenance` той же длины, что `series`. Один проход
+                // по `values` — два массива пишутся ВМЕСТЕ (страж `DB-I-4c`).
+                let mut series: Vec<(i64, i64)> = Vec::with_capacity(row.values.len());
+                let mut series_provenance: Vec<Option<String>> =
+                    Vec::with_capacity(row.values.len());
+                for (&t, &(v, reach)) in &row.values {
+                    series.push((t, v));
+                    series_provenance.push(depth_provenance_label(
+                        row.band_pct_e8,
+                        row.side,
+                        reach,
+                    ));
+                }
                 DepthRow {
                     side: match row.side {
                         Side::Buy => "bid",
@@ -1543,22 +1555,8 @@ impl Reducer {
                     }
                     .to_string(),
                     band_pct_e8: row.band_pct_e8,
-                    // M-70 §2bis.0 (DB-I-4): метка считается ПОТОЧЕЧНО из пары
-                    // `(depth_e8, reach)`, записанной ТЕМ ЖЕ наблюдением книги
-                    // (`MD-I-8` обязательство 4 — число и провенанс сняты ОДНИМ
-                    // наблюдением). Раньше метка жила на строке и описывала ВСЕ точки
-                    // одним значением — после ресинка часть точек наблюдалась при ужатой
-                    // книге, а метка несла состояние последнего наблюдения (PL-I-7
-                    // наоборот: деградация выдана за норму).
-                    series: row
-                        .values
-                        .iter()
-                        .map(|(&t, &(v, reach))| DepthPoint {
-                            time_s: t,
-                            depth_e8: v,
-                            provenance: depth_provenance_label(row.band_pct_e8, row.side, reach),
-                        })
-                        .collect(),
+                    series,
+                    series_provenance,
                 }
             })
             .collect();
@@ -1826,8 +1824,11 @@ fn build_volume_bubbles(bubbles: &BTreeMap<(i64, i64), (i64, i64)>) -> Vec<Bubbl
 /// `A-002` З-2 (`cancel_fraction` меряет насыщение, а не живость) снимать нельзя, поэтому
 /// liveness по стороне остаётся обязательным.
 ///
-/// Форма `DepthRow` (поле `depth_band_provenance: Option<String>`) не меняется (П-014 п.3: bump
-/// `GATEWAY_SCHEMA_VERSION` — решение architect'а). Меняется только СОДЕРЖИМОЕ строки.
+/// Форма `DepthRow`: в ревизии R-171 Б-1 (аддитивная, §2bis.-1) поле
+/// `depth_band_provenance: Option<String>` СНЯТО со строки и метка переехала на ТОЧКУ через
+/// параллельный массив `series_provenance: Vec<Option<String>>`. `v1`-потребитель,
+/// читающий `series: Vec<(i64, i64)>`, продолжает разбирать выдачу (аддитивность, `VB-I-4`).
+/// Bump `GATEWAY_SCHEMA_VERSION` 9 → 10 выполняется задачей 6 (решение architect'а).
 fn depth_provenance_label(band_pct_e8: i64, side: Side, reach: f64) -> Option<String> {
     // VB-I-5 (прежний, не сдвинут): ≤ 1.3% — валидированный эталон, метки не несёт.
     if band_pct_e8 <= 1_300_000 {
@@ -1973,26 +1974,34 @@ impl Snapshot {
                     row.side == incoming.side && row.band_pct_e8 == incoming.band_pct_e8
                 });
             if let Some(current) = current {
-                // M-70 §2bis (DB-I-4, TD-159): с точечной меткой (`Vec<DepthPoint>`) слияние
-                // становится слиянием ТОЧЕК по ключу `time_s`, и метка едет СО СВОЕЙ точкой —
-                // рассинхрон длин НЕВЫРАЗИМ. Прежнее безусловное копирование метки строки
-                // (`current.depth_band_provenance = incoming.depth_band_provenance.clone()`)
-                // было решением для ОДНОЙ метки на ряд; с точечной меткой это место перестаёт
-                // существовать — метка живёт внутри `DepthPoint.provenance`, и `BTreeMap`-
-                // слияние по `time_s` (close-семантика: последнее наблюдение бакета побеждает)
-                // автоматически сохраняет метку той точки, которая выиграла.
+                // M-70 §2bis.0 (DB-I-4, TD-159) + §2bis.-1 (R-171 Б-1, аддитивная форма):
+                // слияние идёт по КЛЮЧУ `time_s`, и метка едет со СВОЕЙ точкой. Оба массива
+                // правятся В ОДНОМ ЦИКЛЕ, иначе страж `DB-I-4c` покраснеет на рассинхроне длин.
+                // Параллельные массивы наполняются ОДНОЙ таблицей `(time_s → (depth, prov))`,
+                // и оба итоговых вектора — `values.len()` — длины. close-семантика: incoming
+                // точке с тем же `time_s` существующая уступает (как в `BTreeMap::entry`),
+                // и метка тоже — метка живёт при СВОЕЙ точке.
                 //
-                // close-семантика `incoming.series` (последний `apply` на бакет побеждает —
-                // `П-014`/`R-110` Б-1 в новом виде) выражена через `BTreeMap::entry`: если
-                // точка с этим `time_s` уже есть в existing — её метка и значение переписываются
-                // значением из incoming (своя метка едет С НИМ); иначе — incoming-точка встаёт
-                // целиком. Никакого «залипания» метки на строке больше не существует физически.
-                let mut values: BTreeMap<i64, DepthPoint> =
-                    current.series.drain(..).map(|p| (p.time_s, p)).collect();
-                for incoming_pt in &incoming.series {
-                    values.insert(incoming_pt.time_s, incoming_pt.clone());
+                // Прежнее безусловное копирование метки строки
+                // (`current.depth_band_provenance = incoming.depth_band_provenance.clone()`)
+                // больше не существует — метка переехала в ТОЧКУ.
+                let mut merged: BTreeMap<i64, (i64, Option<String>)> = current
+                    .series
+                    .drain(..)
+                    .zip(current.series_provenance.drain(..))
+                    .map(|(pt, prov)| (pt.0, (pt.1, prov)))
+                    .collect();
+                for (pt, prov) in incoming
+                    .series
+                    .iter()
+                    .zip(incoming.series_provenance.iter())
+                {
+                    merged.insert(pt.0, (pt.1, prov.clone()));
                 }
-                current.series = values.into_values().collect();
+                let (merged_series, merged_prov): (Vec<(i64, i64)>, Vec<Option<String>>) =
+                    merged.into_iter().map(|(t, (v, p))| ((t, v), p)).unzip();
+                current.series = merged_series;
+                current.series_provenance = merged_prov;
             } else {
                 self.series.depth_series.push(incoming.clone());
             }
@@ -2173,11 +2182,21 @@ fn evict_series_bundle_under_window(series: &mut SeriesBundle, lo_time_s: i64) {
     // ohlcv
     series.ohlcv.retain(|row| row.time_s >= lo_time_s);
 
-    // depth_series[].series — M-70 §2bis: ряд стал `Vec<DepthPoint>`, фильтр по `time_s`
-    // остался прежним (оконная эвикция бакета); метка точки едет с самой точкой, отдельного
-    // шага для неё нет.
+    // depth_series[].series + series_provenance — M-70 §2bis.0 (DB-I-4) + §2bis.-1 (R-171
+    // Б-1, аддитивная форма): оба массива ВМЕСТЕ проходят оконную эвикцию бакета. Иначе
+    // страж `DB-I-4c` покраснеет на рассинхроне длин. Прежняя запись «метка едет с точкой»
+    // здесь уже не действует — массивы РАЗДЕЛЬНЫ, и фильтр обязан проходить их параллельно.
     for row in &mut series.depth_series {
-        row.series.retain(|p| p.time_s >= lo_time_s);
+        let mut new_series: Vec<(i64, i64)> = Vec::with_capacity(row.series.len());
+        let mut new_prov: Vec<Option<String>> = Vec::with_capacity(row.series_provenance.len());
+        for (pt, p) in row.series.drain(..).zip(row.series_provenance.drain(..)) {
+            if pt.0 >= lo_time_s {
+                new_series.push(pt);
+                new_prov.push(p);
+            }
+        }
+        row.series = new_series;
+        row.series_provenance = new_prov;
     }
 
     // vwap
