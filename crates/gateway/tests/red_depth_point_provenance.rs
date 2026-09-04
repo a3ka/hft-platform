@@ -60,6 +60,14 @@ const T0: i64 = 1_752_000_010_000;
 const DEEP_BAND: f64 = 0.03;
 /// Узкий охват окна ресинка: REST отдаёт ~1.3 % на spot BTCUSDT (`depth-probe-binance.md:15-18`).
 /// Он МЕНЬШЕ полосы 3 % — значит точка этого момента полосой не наблюдена.
+/// Строка депт-серии, развёрнутая в СВЯЗКИ: `(сторона, полоса, [(time_s, depth_e8, метка)])`.
+///
+/// Алиас заведён не ради краткости, а потому что `clippy::type_complexity` справедливо
+/// назвал вложенный кортеж нечитаемым (`-D warnings`, найдено engine-dev'ом в моём же
+/// коммите `2f54595`). Подавлять `#[allow]` здесь было бы хуже: тип действительно требует
+/// имени — он выражает ПРЕДМЕТ `DB-I-4d`, связку точки с её меткой.
+type RowTriples = (String, i64, Vec<(i64, i64, Option<String>)>);
+
 const REACH_RESYNC: f64 = 0.013;
 /// Установившийся охват: дельты достроили книгу вглубь. БОЛЬШЕ полосы 3 %.
 const REACH_SETTLED: f64 = 0.05;
@@ -393,7 +401,7 @@ fn db_i_4d_point_to_label_binding_survives_merge_and_eviction() {
          точке не проверяется: любая перестановка тождественна"
     );
 
-    let triples = |sn: &gateway::Snapshot| -> Vec<(String, i64, Vec<(i64, i64, Option<String>)>)> {
+    let triples = |sn: &gateway::Snapshot| -> Vec<RowTriples> {
         sn.series
             .depth_series
             .iter()
