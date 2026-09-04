@@ -32,7 +32,8 @@
 # | task #3     | предел полос отвергает ДО построения | ИСПОЛНЕНИЕ `DB-I-3` + `^pub const MAX_BANDS` + равенство чисел |
 # | task #4     | два сценария `DB-I-4` живы                 | `^fn ИМЯ` в T4 + ИСПОЛНЕНИЕ через chk_named_test |
 # | task #4b    | адаптер оракула читает метку КАЖДОЙ точки  | поле `^\s*pub series_provenance:` + тело адаптера + ИСПОЛНЕНИЕ |
-# | task #4c    | длины `series` и `series_provenance` равны | ИСПОЛНЕНИЕ `db_i_4c_lengths_match_on_every_row` (цена аддитивной формы, §2bis.-1) |
+# | task #4c    | длины равны на пути построения             | ИСПОЛНЕНИЕ `db_i_4c…` (цена аддитивной формы, §2bis.-1) |
+# | task #4d    | СВЯЗКА «точка ↔ метка» переживает склейку  | ИСПОЛНЕНИЕ `db_i_4d…` — длины на этом пути НЕГОДНЫ как признак (`zip` их выравнивает молча) |
 # | task #5     | словарь метки ОДИН на всю выдачу           | ИСПОЛНЕНИЕ `DB-I-5` + поимённый состав + гвард `serial()` |
 # | task #6     | форма объявлена БАМПОМ                     | ЧИСЛО версии на HEAD строго больше, чем в базе  |
 # | task #6b    | sacred-пины версии подняты вместе с бампом | `EXPECTED_SCHEMA_VERSION` == константа `lib.rs` |
@@ -202,7 +203,8 @@ chk_named_test "оракул DB-I-4 (точка/ряд + анти-плацебо
 # метящей `not-observed` ВСЁ подряд, — она обесценивает метку и формально зеленеет.
 for t in db_i_4_two_points_of_one_row_carry_their_own_provenance \
          db_i_4b_reachable_point_is_not_falsely_downgraded \
-         db_i_4c_lengths_match_on_every_row; do
+         db_i_4c_lengths_match_on_every_row \
+         db_i_4d_point_to_label_binding_survives_merge_and_eviction; do
   chk "grep -q '^fn ${t}' ${T4}"
 done
 
