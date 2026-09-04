@@ -133,7 +133,12 @@ services:
       GATEWAY_VENUE: ${GATEWAY_VENUE:-Binance}
       GATEWAY_SYMBOL: ${GATEWAY_SYMBOL:-BTCUSDT}
       GATEWAY_TIMEFRAME_MS: ${GATEWAY_TIMEFRAME_MS:-1000}
-      GATEWAY_BANDS: ${GATEWAY_BANDS:-0.001}
+      # M-70 task #7 (П-014 п.4, research/data-quality/depth-verdict.md:15): канонический
+      # набор семи полос 1.5/3/5/8/15/30/60 %. Записью env (не комментарием) — verify_M-70
+      # task #7 честно проверяет каждое значение в строке, чтобы потеря одной полосы не
+      # прошла как «почти включили». На проде оператор может переопределить через host .env,
+      # оставив дефолт ниже как единственный источник истины для compose-файла.
+      GATEWAY_BANDS: ${GATEWAY_BANDS:-0.015,0.03,0.05,0.08,0.15,0.3,0.6}
       GATEWAY_HEATMAP_WINDOW: ${GATEWAY_HEATMAP_WINDOW:-0.001}
       # M-37 task #7c (анти-TD-020): прод-окно ОКНОВОГО reducer'а. Без активного окна
       # gateway-serve дефолтит в `window_ms = None` = unbounded → снапшот ООМ-ит (TD-039
