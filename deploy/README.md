@@ -98,7 +98,7 @@ ssh -i /root/.ssh/storagebox \
 С 2026-08-29 офсайт-копия журнала делается по расписанию (`cron.d/journal-offsite`,
 раз в час, `deploy/bin/journal-offsite-cron.sh` — см. §0/§3): инкрементальный
 `rsync` локального `/var/lib/docker/volumes/hft-platform_journal-data/_data/`
-в `u659392-sub1@u659392-sub1.your-storagebox.de:journal/` (форма
+в `u659392-sub1@u659392-sub1.your-storagebox.de:/journal/` (форма
 `user@host:path`, порт 23 указан через `-e "ssh -p 23 …"`; `ssh://URL`
 ЗАПРЕЩЕНА — пара с `-e` даёт «ssh ssh://…», rsync 3.4.1, R-151 Б-3 и
 commit `cf686af`). Файлы

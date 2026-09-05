@@ -116,14 +116,13 @@ LAST_SUCCESS="${JOURNAL_OFFSITE_LAST_SUCCESS:-/var/lib/hft/journal-offsite.last-
 SSH_PORT="${JOURNAL_OFFSITE_SSH_PORT:-23}"
 # Lock — отдельный файл для ОФСАЙТА ПРОТИВ САМОГО СЕБЯ: предыдущий тик ещё
 # работает → следующий пропускается (-n, non-blocking). Это НЕ cross-task
-# serialisation: flock сериализует только процессы на ОДНОМ файле, и ни
-# retention, ни compaction НЕ БЕРУТ LOCK ВОВСЕ — `grep -ciE 'flock|lock'` в
-# их cron-скриптах возвращает 0 (замер R-155 Б-1, воспроизводится). Что
-# offsite действительно требует — непересечение ПАРАЛЛЕЛЬНЫХ offsite-прогонов:
-# SFTP-сессия хранит состояние, общее между ними. Cross-task развязка держится
-# ИСКЛЮЧИТЕЛЬНО на разнице минут расписания (cron.d/journal-offsite:22 ≠
-# retention:04:07 ≠ compaction:03:50 ≠ builder-prune:04:30 — R-151 Б-1):
-# общего lock-файла в проекте нет.
+# serialisation: flock сериализует только процессы на ОДНОМ файле, и retention/
+# compaction берут СВОИ lock-файлы (см. journal-retention-cron.sh и
+# journal-compaction-cron.sh). Что offsite действительно требует — непересечение
+# ПАРАЛЛЕЛЬНЫХ offsite-прогонов: SFTP-сессия хранит состояние, общее между
+# ними. С cross-task развязкой справляется РАЗНОЕ РАСПИСАНИЕ (cron.d/
+# journal-offsite:22 ≠ retention:04:07 ≠ compaction:03:50 ≠ builder-prune:04:30 —
+# R-151 Б-1).
 LOCK_FILE="${JOURNAL_OFFSITE_LOCK:-/var/lock/hft-journal-offsite.lock}"
 
 mkdir -p "$(dirname "${LOG}")" "$(dirname "${ALERT_FILE}")" "$(dirname "${LAST_SUCCESS}")" 2>/dev/null || true
@@ -317,15 +316,8 @@ find "${SRC_DIR}" -type f -mmin +"${MIN_AGE_MIN}" ! -name 'recorder.heartbeat' -
       -e "ssh -i ${SSH_KEY} -o IdentitiesOnly=yes -p ${SSH_PORT} -o StrictHostKeyChecking=accept-new" \
       --from0 --files-from=- \
       "${SRC_DIR}/" "${DST_URL}" >> "${LOG}" 2>&1
-# PIPESTATUS сбрасывается ПОСЛЕ КАЖДОЙ команды, включая присваивание. Снимаем состояние
-# конвейера ОДНИМ снимком ДО любых присваиваний — иначе первый же `rsync_rc=${PIPESTATUS[1]…}`
-# затирает массив, и `find_rc` всегда читает уже статус ПРИСВАИВАНИЯ (=0). Следствие
-# на проде было мёртвым сторожем сбоя ИСТОЧНИКА (R-157 Б-5, OPS-I-2/OPS-I-8-класс):
-# `find` падает (том отвалился, права, ENOENT) → `rsync` не получает списка → обёртка
-# писала «ОК», ставила отметку успеха, гасила алерт и выходила с 0, не скопировав ничего.
-_st=("${PIPESTATUS[@]}")
-rsync_rc=${_st[1]:-0}
-find_rc=${_st[0]:-0}
+rsync_rc=${PIPESTATUS[1]:-0}
+find_rc=${PIPESTATUS[0]:-0}
 # find exit=141 после штатного завершения rsync'а (SIGPIPE из закрытого stdin) — не сбой
 case "${find_rc}" in
   0|141) find_rc=0 ;;
