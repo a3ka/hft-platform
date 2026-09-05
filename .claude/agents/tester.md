@@ -95,7 +95,16 @@ disallowedTools: Write, Edit
 ## Handoff
 - PASS → `reviewer` (передаёт verdict + raw stdout всех гейтов).
 - FAIL по спеке (тест написан неверно/двусмысленно) → `architect` (spec issue).
-- FAIL по реализации → dev-агент, который писал impl (`engine-dev`/`venue-dev`/`signal-engineer`/`research-dev`).
+- FAIL по реализации → **`architect`** (решение founder'а 2026-09-05: разбор ЛЮБОГО отказа
+  гейта ведёт architect, исключений нет). Он называет, что чинить, и через founder'а
+  диспетчеризует dev (`engine-dev`/`venue-dev`/`signal-engineer`/`research-dev`) на
+  impl-правку. Прямой возврат dev'у ОТМЕНЁН тем же решением, что в
+  `.claude/agents/reviewer.md` и `.claude/agents/risk-critic.md` §Handoff.
+- **`COGNITIVE-ONLY`** (`gates.md` §11): механического барьера у этого маршрута нет и он
+  не изображается. Маршрут §D живёт в переписке, а CI видит только артефакты.
+  Кандидат-механизм НАЗВАН и не выдаётся за сделанный: вердикт-файл с
+  `verdict: REJECT` обязан в своём Handoff §D называть `architect`;
+  `scripts/check_gate_meta.sh` эти файлы уже разбирает.
 - Формат — Handoff-блок с §C = сырой stdout (не пересказ), §D = следующий агент.
 
 ## Предъявление startup-протокола (M-66) — механизировано ЧАСТИЧНО
