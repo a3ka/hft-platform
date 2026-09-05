@@ -3900,6 +3900,7 @@ impl LiveReducer {
         let mut batch = Reducer::new(&self.selector);
         batch.vwap.sum_pv = self.vwap.sum_pv;
         batch.vwap.sum_v = self.vwap.sum_v;
+        batch.book = self.full.book.clone();
         let mut batch_consumed = 0_usize;
         // M-68 задача 14 (d10, R-134 B-4): `depth_levels_visited` — семантика ПО ВЫЗОВУ
         // на ВСЕХ путях, включая `pump`. `self.full` — персистентный аккумулятор, его
