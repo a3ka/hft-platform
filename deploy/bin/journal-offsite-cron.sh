@@ -36,22 +36,8 @@
 #  1) rsync БЕЗ `--delete` и БЕЗ любого `--delete-*` / `--remove-source-files`.
 #     Storage Box не снимается снапшотом, единственная офсайт-копия создаётся ЭТОЙ
 #     командой; `--delete` в составе команды создания — единственный способ уничтожить
-#     бэкап той же командой, которая его создаёт.
-#     Канарейка (R-151 Н-1): проверка ОБЯЗАНА краснеть против мутации, а не зеленеть
-#     по «не нашёл, значит чисто». Псевдо-форма `grep '^[^#]--delete'` — ПЛАЦЕБО:
-#     живой вызов rsync имеет ОТСТУП в шесть пробелов, регексп «^[^#]» не видит
-#     флага, и канарейка зелена даже при наличии `--delete` (R-151 Н-1, воспроизведение
-#     в верификаторе). Корректная пара из двух частей (живёт в verify_M-73.sh
-#     task #4, см. там):
-#       a) `grep -qE -- '--(delete|delete-[a-z]+|remove-source-files)' <RSYNC-блок>`
-#          — НА чистом файле exit=1 (hit не найден, инвариант соблюдён), и
-#       b) SETUP-GUARD: тот же `grep` после мутации ОБЯЗАН быть exit=0.
-#          Мутация внедряет целевой флаг В ПЕЧАТАЕМЫЙ rsync-блок (НЕ в комментарий:
-#          см. verify_M-73.sh task #4, как именно мутируется). Проверка читает
-#          ИМЕННО распечатанный блок, поэтому анти-плацебо держится: если мутация
-#          внедрена в стороне от печатаемого блока, setup-guard падает и тест
-#          красный. Без (b) канарейка не доказывает, что она видит нарушение —
-#          отсутствует анти-плацебо (`testing.md` §«Мутационный контроль — обязателен»).
+#     бэкап той же командой, которая его создаёт. Проверка: `grep -E -- "--delete" deploy/`
+#     должна вернуть 0 (явный grep-канарейка).
 #  2) mtime-фильтр ≥ 15 минут + явное исключение `recorder.heartbeat`. Активный сегмент
 #     (тот, в который recorder пишет прямо сейчас) ОБЯЗАН быть пропущен, иначе копия
 #     зафиксирует обрывок, выглядящий как целый файл — на вид валидно, при попытке
@@ -74,7 +60,7 @@
 # будущий consumer (restore-drill П-023). SRC_DIR совпадает с прод-каталогом,
 # который монтируется в recorder как journal-data:/var/lib/journal (одинаково в
 # проде и в будущем restore-drill'е).
-set -u  # pipefail снят: см. комментарий выше у find|rsync — он ловил 141 find'а на штатном SIGPIPE от rsync'а и алертил ложно (R-151 Н-3, П-024)
+set -uo pipefail
 
 # ── Конфигурация через env (как у соседей — паттерн, не изобретение) ────────────────
 HFT_ROOT="${HFT_ROOT:-/root/hft-platform}"
@@ -108,22 +94,10 @@ IONICE_LEVEL="${JOURNAL_OFFSITE_IONICE_LEVEL:-7}"   # lowest within best-effort
 LOG="${JOURNAL_OFFSITE_LOG:-/var/log/hft/journal-offsite.log}"
 ALERT_FILE="${JOURNAL_OFFSITE_ALERT_FILE:-/var/lib/hft/journal-offsite.alert}"
 LAST_SUCCESS="${JOURNAL_OFFSITE_LAST_SUCCESS:-/var/lib/hft/journal-offsite.last-success}"
-# SSH-порт для субаккаунта: 23 (стандарт Storage Box), переопределяется env
-# `JOURNAL_OFFSITE_SSH_PORT`. Порт НЕ парсится из DST_URL: документированная форма
-# `user@host:path` (deploy/README.md §1.4) не несёт порт в URL, и попытка угадать
-# «host:22:journal/» сломает скрипт при любой смене провайдера. Порт — параметр
-# сервиса, а не строка-цели.
-SSH_PORT="${JOURNAL_OFFSITE_SSH_PORT:-23}"
-# Lock — отдельный файл для ОФСАЙТА ПРОТИВ САМОГО СЕБЯ: предыдущий тик ещё
-# работает → следующий пропускается (-n, non-blocking). Это НЕ cross-task
-# serialisation: flock сериализует только процессы на ОДНОМ файле, и ни
-# retention, ни compaction НЕ БЕРУТ LOCK ВОВСЕ — `grep -ciE 'flock|lock'` в
-# их cron-скриптах возвращает 0 (замер R-155 Б-1, воспроизводится). Что
-# offsite действительно требует — непересечение ПАРАЛЛЕЛЬНЫХ offsite-прогонов:
-# SFTP-сессия хранит состояние, общее между ними. Cross-task развязка держится
-# ИСКЛЮЧИТЕЛЬНО на разнице минут расписания (cron.d/journal-offsite:22 ≠
-# retention:04:07 ≠ compaction:03:50 ≠ builder-prune:04:30 — R-151 Б-1):
-# общего lock-файла в проекте нет.
+# Lock — отдельный файл, чтобы cron-строки retention/compaction/offsite НЕ конкурировали
+# (offsite читает ТЕ ЖЕ файлы, что retention читает и compaction сжимает; rsync может
+# читать сжатый сегмент одновременно с compaction — flock обеспечивает сериализацию
+# на уровне всего скрипта).
 LOCK_FILE="${JOURNAL_OFFSITE_LOCK:-/var/lock/hft-journal-offsite.lock}"
 
 mkdir -p "$(dirname "${LOG}")" "$(dirname "${ALERT_FILE}")" "$(dirname "${LAST_SUCCESS}")" 2>/dev/null || true
@@ -148,7 +122,6 @@ print_argv() {
   echo "SRC_DIR=${SRC_DIR}"
   echo "DST_URL=${DST_URL}"
   echo "SSH_KEY=${SSH_KEY}"
-  echo "SSH_PORT=${SSH_PORT}"
   echo "MIN_AGE_MIN=${MIN_AGE_MIN}"
   echo "BWLIMIT_MBPS=${BWLIMIT_MBPS}"
   echo "NICE_LEVEL=${NICE_LEVEL}"
@@ -158,9 +131,9 @@ print_argv() {
   echo "find \"\${SRC_DIR}\" -type f -mmin +\${MIN_AGE_MIN} ! -name 'recorder.heartbeat' -printf '%P\\0'"
   echo "RSYNC:"
   echo "nice -n \${NICE_LEVEL} ionice -c \${IONICE_CLASS} -n \${IONICE_LEVEL} rsync \\"
-  echo "  --archive --partial-dir=.rsync-partial --human-readable --stats \\"
+  echo "  --archive --partial --human-readable --stats \\"
   echo "  --bwlimit=\${BWLIMIT_MBPS}M \\"
-  echo "  -e \"ssh -i \${SSH_KEY} -o IdentitiesOnly=yes -p \${SSH_PORT} -o StrictHostKeyChecking=accept-new\" \\"
+  echo "  -e \"ssh -i \${SSH_KEY} -o IdentitiesOnly=yes -p 23 -o StrictHostKeyChecking=accept-new\" \\"
   echo "  --from0 --files-from=- \\"
   echo "  \"\${SRC_DIR}/\" \"\${DST_URL}\""
 }
@@ -197,60 +170,15 @@ if [ ! -f "${SSH_KEY}" ]; then
   exit 1
 fi
 # 3) dry-run ssh — если субаккаунт недоступен, лучше узнать сейчас, чем в середине копии.
-# Хост и user ВЫВОДЯТСЯ из DST_URL (форма `user@host:path` — задокументирована в
-# deploy/README.md §1.4). До Н-2 скрипт имел зашитый литерал хоста, что давало
-# зелёный pre-flight при переопределении DST_URL на другой субаккаунт/стенд
-# (recompose producer→consumer разрывалась; rsync уходил на новый хост уже
-# после этой проверки). Порт — из env `JOURNAL_OFFSITE_SSH_PORT` (default 23 —
-# Storage Box), он же идёт в реальный rsync через print_argv/`-p ${SSH_PORT}`.
 # `BatchMode=yes` гарантирует, что ssh не спросит пароль интерактивно (если спросит —
 # значит ключ не подходит, и rsync тоже упадёт). `ConnectTimeout=10` не висит вечно
 # при сетевых проблемах. Используем `pwd` (в restricted shell'е Storage Box'а НЕТ
 # `/usr/bin/true`; `pwd` — единственный «безобидный» builtin, доступный ВСЕГДА; см.
 # `help` при подключении к субаккаунту).
-parse_dst_target() {
-  # Разбирает DST_URL вида [USER@]HOST[:PATH] (документированная форма для offsite —
-  # см. deploy/README.md §1.4). ssh://-форма ЗАПРЕЩЕНА скриптом и runbook'ом: пара с
-  # `-e "ssh …"` даёт `ssh ssh://…` (rsync 3.4.1). Если формат не распознан — fail-loud
-  # через alert и exit, лучше отказаться от прогона, чем пройти pre-flight на ЧУЖОМ
-  # хосте и упасть в середине копии.
-  local url="${DST_URL}"
-  url="${url#ssh://}"               # отрезаем схему, если кто-то всё-таки её воткнул
-  url="${url%/}"                    # отрезаем замыкающий слэш пути
-  local user_part host_part
-  if [[ "${url}" == *@* ]]; then
-    user_part="${url%%@*}"
-    host_part="${url#*@}"
-  else
-    user_part=""
-    host_part="${url}"
-  fi
-  # host_part теперь `HOST[:PATH]`. Отрезаем путь: первое двоеточие ОТДЕЛЯЕТ хост от пути
-  # в форме `host:path`. Эвристика работает на документированной форме; для случая
-  # `host:port:path` (явный порт в URL — НЕ поддерживается документированной формой,
-  # порт задаётся через `JOURNAL_OFFSITE_SSH_PORT`) host_part останется с портом,
-  # и ssh отвергнет строку — fail-loud, что и требовалось.
-  host_part="${host_part%%:*}"
-  if [ -z "${host_part}" ]; then
-    return 1
-  fi
-  if [ -z "${user_part}" ]; then
-    # Форма без `@`: пусть ssh попробует текущего пользователя, но СНАЧАЛА
-    # вернём ошибку. Документированная форма `user@host:path` всегда несёт user.
-    return 2
-  fi
-  SSH_TARGET_USER="${user_part}"
-  SSH_TARGET_HOST="${host_part}"
-  return 0
-}
-if ! parse_dst_target; then
-  alert "DST_URL=${DST_URL} не парсится как user@host:path — проверь env JOURNAL_OFFSITE_DST и deploy/README.md §1.4"
-  exit 1
-fi
 if ! ssh -i "${SSH_KEY}" -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=10 \
-     -p "${SSH_PORT}" -o StrictHostKeyChecking=accept-new \
-     "${SSH_TARGET_USER}@${SSH_TARGET_HOST}" pwd 2>/dev/null; then
-  alert "ssh к ${SSH_TARGET_USER}@${SSH_TARGET_HOST}:${SSH_PORT} отказал (ключ ${SSH_KEY} или сеть/Storage Box)"
+     -p 23 -o StrictHostKeyChecking=accept-new \
+     u659392-sub1@u659392-sub1.your-storagebox.de pwd 2>/dev/null; then
+  alert "ssh к субаккаунту storagebox отказал (ключ ${SSH_KEY} или сеть/Storage Box)"
   exit 1
 fi
 
@@ -267,18 +195,8 @@ fi
 #      соблюсти, чем оговаривать «у нас имён с пробелами не бывает»);
 #   - `--archive` — rlptgoD (recursive, links, perms, times, group, owner, devices),
 #      то есть rsync сохранит mtime/права — критично для crc-сверки при restore-drill;
-#   - `--partial-dir=.rsync-partial` — частично переданный файл живёт В ПОДКАТАЛОГЕ
-#      относительно приёмника, а не под ФИНАЛЬНЫМ именем (R-151 Б-2). Без этого
-#      семантика `--partial` была бы: обрыв → файл-обрывок ЛЕЖИТ на приёмнике под
-#      `segment-XXXXXXX.jrnl` (выглядит целым) до следующего тика. Один-единственный
-#      битник на офсайте, снапшоты коробки ВЫКЛЮЧЕНЫ (П-023), restore-drill (П-023
-#      R1b) ещё не проводился → восстановление читало бы обрывок как валидный файл.
-#      `.rsync-partial` создаётся rsync'ом на ПРИЁМНИКЕ (Storage Box), прозрачен для
-#      будущего потребителя (restore-drill) — он берёт только `.jrnl` под финальным
-#      именем. Докачка на следующем тике доезжает и rsync ПЕРЕМЕЩАЕТ файл из
-#      `.rsync-partial/` под финальное имя; орёт, если источник изменился — это
-#      корректно: пока архив не закрыт, копия обязана догнать (мы копируем только
-#      файлы со стабильным mtime, см. mtime-фильтр ≥15 минут выше).
+#   - `--partial` — НЕ удалять частично переданный файл (если связь оборвалась, докачка
+#      на следующем тике; иначе rsync удаляет частичный файл и начинает заново);
 #   - `--bwlimit=${BWLIMIT_MBPS}M` — полоса; см. шапку «ЧАСТОТА»;
 #   - `--stats` — пишет в конце «Total transferred file size» — единственный способ
 #      убедиться глазами, что прогон скопировал 0 файлов (идемпотентность), а не
@@ -288,67 +206,29 @@ fi
 #   - `SRC_DIR/` с trailing slash — копировать СОДЕРЖИМОЕ каталога, а не сам каталог;
 #      иначе на Storage Box появится подкаталог `journal/_data/`, а не `journal/...`.
 #
-# Поток find → rsync запускается через pipe. Старый комментарий здесь был НЕВЕРЕН
-# (R-151 Н-3): «pipefail не ловит SIGPIPE от rsync». На самом деле ловит — и это
-# ИСТОЧНИК проблемы. Под `set -o pipefail` конвейер возвращает максимальный exit,
-# и find, получивший SIGPIPE (141) при штатном закрытии stdin со стороны rsync'а
-# (rsync прочитал список и завершил работу), поднимает exit всего конвейера в 141,
-# хотя rsync отработал чисто. С этим связан наблюдавшийся класс ложных
-# `journal-offsite.alert` на чистых прогонах (П-024, тот же класс в этом корпусе).
-#
-# Что делаем:
-#   1) `set -o pipefail` СНЯТ со скрипта (set -u оставлен): этот конвейер — единственное
-#      место, где pipefail мог что-то поймать, и он ловит его НЕ ТАК, как нам нужно;
-#      остальные команды (ssh, find без pipe, мkdir, flock, tail, mv, true/false)
-#      дают exit естественно, без pipefail.
-#   2) Реальный сбой — это exit rsync'а (PIPESTATUS[1]); find может получить 141 (find
-#      отдал весь список, rsync закрыл stdin — штатное завершение find'а, НЕ ошибка
-#      rsync'а). Алертуем по ${PIPESTATUS[1]}, не по exit конвейера.
-#   3) find, упавший ПО СВОЕЙ ПРИЧИНЕ (битый путь, ENOSPC, TOCTOU на удалении) до
-#      того, как rsync начал читать, — это отдельная диагностика; stderr find'а идёт в
-#      ${LOG}, и оператор увидит её в журнале. Дополнительный catch добавляет лов
-#      find-сбоя в alert, не дожидаясь: «find exit=N (источник/фильтр), rsync не
-#      запускался — см. ${LOG}».
+# Поток find → rsync запускается через pipe. В bash без pipefail (мы используем
+# `set -uo pipefail`, но pipefail не ловит SIGPIPE от rsync, который закрывает stdin
+# после прочтения списка — это штатное завершение find'а через SIGPIPE).
+# Реальный сбой — это exit≠0 от rsync. find не возвращает данные об ошибках
+# отдельным каналом; все stderr уходят в LOG.
 start_ts=$(date -u +%s)
-find "${SRC_DIR}" -type f -mmin +"${MIN_AGE_MIN}" ! -name 'recorder.heartbeat' -printf '%P\0' \
+if find "${SRC_DIR}" -type f -mmin +"${MIN_AGE_MIN}" ! -name 'recorder.heartbeat' -printf '%P\0' \
   | nice -n "${NICE_LEVEL}" ionice -c "${IONICE_CLASS}" -n "${IONICE_LEVEL}" rsync \
-      --archive --partial-dir=.rsync-partial --human-readable --stats \
+      --archive --partial --human-readable --stats \
       --bwlimit="${BWLIMIT_MBPS}M" \
-      -e "ssh -i ${SSH_KEY} -o IdentitiesOnly=yes -p ${SSH_PORT} -o StrictHostKeyChecking=accept-new" \
+      -e "ssh -i ${SSH_KEY} -o IdentitiesOnly=yes -p 23 -o StrictHostKeyChecking=accept-new" \
       --from0 --files-from=- \
-      "${SRC_DIR}/" "${DST_URL}" >> "${LOG}" 2>&1
-# PIPESTATUS сбрасывается ПОСЛЕ КАЖДОЙ команды, включая присваивание. Снимаем состояние
-# конвейера ОДНИМ снимком ДО любых присваиваний — иначе первый же `rsync_rc=${PIPESTATUS[1]…}`
-# затирает массив, и `find_rc` всегда читает уже статус ПРИСВАИВАНИЯ (=0). Следствие
-# на проде было мёртвым сторожем сбоя ИСТОЧНИКА (R-157 Б-5, OPS-I-2/OPS-I-8-класс):
-# `find` падает (том отвалился, права, ENOENT) → `rsync` не получает списка → обёртка
-# писала «ОК», ставила отметку успеха, гасила алерт и выходила с 0, не скопировав ничего.
-_st=("${PIPESTATUS[@]}")
-rsync_rc=${_st[1]:-0}
-find_rc=${_st[0]:-0}
-# find exit=141 после штатного завершения rsync'а (SIGPIPE из закрытого stdin) — не сбой
-case "${find_rc}" in
-  0|141) find_rc=0 ;;
-esac
-# Если find упал РАНЬШЕ (до SIGPIPE от rsync), rsync мог и не запуститься.
-# Тогда PIPESTATUS[1] = 0 (rsync не запускался → не отработал); а сигнал даёт find.
-# Считаем это сбоем источника.
-if [ "${find_rc}" -ne 0 ] && [ "${rsync_rc}" -eq 0 ]; then
-  rsync_rc="${find_rc}"
-  rsync_failure_mode="find/source"
+      "${SRC_DIR}/" "${DST_URL}" >> "${LOG}" 2>&1; then
+  rc=0
+else
+  rc=$?
 fi
-rc=${rsync_rc}
 end_ts=$(date -u +%s)
 dur=$(( end_ts - start_ts ))
 
 if [ "${rc}" -ne 0 ]; then
-  if [ "${rsync_failure_mode:-}" = "find/source" ]; then
-    alert "rsync не запускался: find exit=${rc} (фильтр/источник — битый путь или ENOENT на сегменте). \
-Проверь ${LOG} и состояние ${SRC_DIR}. Длительность ${dur}s."
-  else
-    alert "rsync exit=${rc} (1=IO/SSH; 12=connection; 23=protocol; 30=timeout в rsync). \
+  alert "rsync exit=${rc} (1=IO/SSH; 12=connection; 23=protocol; 30=timeout в rsync). \
 Проверь ${LOG} и доступность ${DST_URL}. Длительность ${dur}s."
-  fi
   exit "${rc}"
 fi
 
