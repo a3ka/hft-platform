@@ -170,4 +170,13 @@ exit=0
 $ bash scripts/next_artifact_id.sh C
 C-211
 exit=0
+
+$ EVENT_NAME=push PUSH_BEFORE=6fb3553509391c5be77b6ff79e7e2f0e8282df40 PR_BASE_SHA='' bash scripts/check_artifact_ids.sh
+OK: ни один коммит диапазона 6fb3553..HEAD не ввёл второй носитель под занятым идентификатором
+exit=0
+
+$ EVENT_NAME=push PUSH_BEFORE=6fb3553509391c5be77b6ff79e7e2f0e8282df40 PR_BASE_SHA='' GITHUB_SHA='' bash scripts/check_gate_meta.sh
+── GATE-META: диапазон 6fb35535..HEAD, origin=a3ka/hft-platform
+VERDICT: PASS — вердиктов проверено: 1, до-нормативных приземлений: 0, merge'ей с milestone в subject'е: 0
+exit=0
 ```
