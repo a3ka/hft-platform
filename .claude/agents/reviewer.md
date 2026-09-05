@@ -43,7 +43,10 @@ model: opus
 
 ## Handoff
 - APPROVED → merge через PR (прямой push в `main` невозможен: branch protection, обязательный чек `All checks passed`); обновляет `PROJECT-STATE.md`/`TECH-DEBT.md`; сообщает architect (milestone Status → DONE).
-- REJECT/CHANGES REQUESTED → dev-агент, который делал impl (SVR-response цикл, не self-fix у architect).
+- REJECT/CHANGES REQUESTED → **`architect`**: разбор находки — его, не dev'а (решение
+  founder'а 2026-09-04). Он правит спеку/оракул сам либо через founder'а диспетчеризует
+  dev на impl-правку. Прямой возврат dev'у ОТМЕНЁН: он чинил названное МЕСТО, а не КЛАСС,
+  и следующий круг ловил ту же находку в новой одежде.
 - Risk-блок отсутствует → блокирует, эскалирует к founder на диспетч `risk-critic`.
 - Формат — PR-комментарий с Block-цитатами (Block-scope, Block-DoneBlock, Block-C, Block-risk) + финальный вердикт APPROVED/REJECTED.
 

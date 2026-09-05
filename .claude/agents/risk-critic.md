@@ -56,7 +56,10 @@ disallowedTools: Edit
 
 ## Handoff
 - Backtest-отчёт: PASS → `portfolio-analyst`/founder (Граница C, решение №1 = paper). CONCERNS → `signal-engineer`/`backtest-runner` для доработки. KILL → архивируется в карточку гипотезы, цикл завершён.
-- Safety-путь: PASS → `reviewer` (Block-риск закрыт, PR может мержиться). CONCERNS/REJECT → dev-агент, чей код в PR (`engine-dev`/`venue-dev`), не self-fix.
+- Safety-путь: PASS → `reviewer` (Block-риск закрыт, PR может мержиться). CONCERNS/REJECT →
+  **`architect`**: разбор находки — его (решение founder'а 2026-09-04); impl-правку он
+  диспетчеризует через founder'а. Прямой возврат dev'у ОТМЕНЁН по той же причине, что в
+  `.claude/agents/reviewer.md` §Handoff — правился КЛАСС, а не один названный носитель.
 - Формат — критический отчёт с явным вердиктом первой строкой + пункт-за-пунктом чек-лист/инвариант-сверка; никогда не смягчает вердикт под давлением сроков.
 
 ## Предъявление startup-протокола (M-66) — механизировано ЧАСТИЧНО
