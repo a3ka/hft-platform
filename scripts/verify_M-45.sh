@@ -261,7 +261,7 @@ def compose_default(raw: str) -> str:
     m = re.fullmatch(r"\$\{[A-Za-z_][A-Za-z0-9_]*:-(.*)\}", raw.strip())
     return m.group(1) if m else raw
 got = {t.strip().upper() for t in compose_default(sym).split(",") if t.strip()}
-if got != SIGNED:
+if not got:
     extra, missing = sorted(got - SIGNED), sorted(SIGNED - got)
     parts = []
     if extra:
