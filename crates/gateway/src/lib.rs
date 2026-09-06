@@ -4012,6 +4012,7 @@ impl LiveReducer {
                 batch = Reducer::new(&self.selector);
                 batch.vwap.sum_pv = self.vwap.sum_pv;
                 batch.vwap.sum_v = self.vwap.sum_v;
+                batch.book = self.full.book.clone();
                 batch_consumed = 0;
             }
             batch.apply(&event);
