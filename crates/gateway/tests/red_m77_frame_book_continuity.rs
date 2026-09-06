@@ -229,6 +229,18 @@ fn drive_prod_path(
     backlog: Vec<EventKind>,
     ticks: Vec<Vec<EventKind>>,
 ) -> (Snapshot, Snapshot, usize, usize) {
+    drive_prod_path_with(dir, backlog, ticks, PUSH_MAX_EVENTS)
+}
+
+/// То же, но с явным `max_events`. Вынесено отдельным входом, чтобы судить РОЛЛОВЕР БАТЧА
+/// (`crates/gateway/src/lib.rs:4011`) — второе место создания `Reducer::new`, которое при
+/// прод-значении 256 и коротком тике не достигается вовсе.
+fn drive_prod_path_with(
+    dir: &std::path::Path,
+    backlog: Vec<EventKind>,
+    ticks: Vec<Vec<EventKind>>,
+    max_events: usize,
+) -> (Snapshot, Snapshot, usize, usize) {
     let ckpt = tempfile::tempdir().unwrap_or_else(|e| setup_failed(&format!("ckpt tempdir: {e}")));
     append(dir, backlog);
 
@@ -237,7 +249,7 @@ fn drive_prod_path(
         gateway::LiveReducer::resume(dir, EpochFilter::OwnCaptureOnly, &s, ckpt.path())
             .unwrap_or_else(|e| setup_failed(&format!("resume: {e}")));
     loop {
-        match live.pump(dir, EpochFilter::OwnCaptureOnly, PUSH_MAX_EVENTS) {
+        match live.pump(dir, EpochFilter::OwnCaptureOnly, max_events) {
             Ok((f, _, _)) if f.is_empty() => break,
             Ok(_) => continue,
             Err(e) => setup_failed(&format!("pump бэклога: {e}")),
@@ -250,7 +262,7 @@ fn drive_prod_path(
     let mut frames_carrying_depth = 0_usize;
     for tick in ticks {
         append(dir, tick);
-        match live.pump(dir, EpochFilter::OwnCaptureOnly, PUSH_MAX_EVENTS) {
+        match live.pump(dir, EpochFilter::OwnCaptureOnly, max_events) {
             Ok((frames, _, _)) => {
                 for f in &frames {
                     frames_total += 1;
@@ -437,5 +449,144 @@ fn vb_i_2_client_equals_replay_across_a_resync_then_delta_tail() {
                  band={band} side={side}. Реплей: {want:?}; клиент: {got:?}"
             );
         }
+    }
+}
+
+/// **ФОРМА 4 — ВЕСЬ БАНДЛ, а не одна серия (`Р-3`).** Книго-зависимых серий в кадре НЕ
+/// ОДНА: из `self.book` строятся `depth_series` (`recompute_depth_from_book`,
+/// `crates/gateway/src/lib.rs:1156`/`:1183`) И `heatmap`/`cob` (`refresh_heatmap_bucket`,
+/// `:1150`/`:1177`). Оракул на выписанный перечень серий пропустил бы ту, что добавят
+/// позже, — «опасна ровно та группа, которая НЕ ВЫПИСАНА»
+/// (`docs/workflow/oracle-blindness-class-2026-08-28.md` §5, `Р-3`). Сравнение целого
+/// `SeriesBundle` накрывает группу ПО КОНСТРУКЦИИ.
+///
+/// **Что это добавляет к ядру, установлено ЗАМЕРОМ, а не предположено** (`M-77` §2bis):
+/// в этом же прод-режиме клиент собирает **6 ячеек heatmap против 18** у реплея — его
+/// heatmap ЗАМИРАЕТ на моменте подключения, потому что книга батча несёт только уровни
+/// своих дельт, а они лежат вне окна heatmap (прод `0.001`, `docker-compose.yml:137`).
+/// Ни один оракул репозитория этого не судит: замер — ни один тест `crates/gateway/tests/`
+/// не сравнивает СОБРАННЫЙ КЛИЕНТОМ heatmap с реплеем на пути `pump`.
+#[test]
+fn vb_i_2_client_bundle_equals_replay_in_prod_steady_state() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ticks = ticks_of(24, |ts, seq| delta(ts, seq, true));
+    let (client, server, frames, with_depth) = drive_prod_path(dir.path(), backlog(), ticks);
+    let full = replay(dir.path());
+    guard_server_matches_replay(&server, &full);
+
+    if with_depth == 0 {
+        setup_failed(&format!(
+            "из {frames} кадров ни один не нёс точки глубины — режим каденции не воспроизведён"
+        ));
+    }
+    if full.series.heatmap.is_empty() {
+        setup_failed("реплей не дал ни одной ячейки heatmap — фикстура не различает миры");
+    }
+
+    // `assert!`, а не `assert_eq!`: последний дампит ОБА бандла целиком (замер: 127 КБ),
+    // что упирается в лимит ответа агента и топит лог CI. Расхождение называется адресно.
+    assert!(
+        client.series == full.series,
+        "VB-I-2 НАРУШЕН НА ПРОД-ПУТИ ПО ВСЕМУ БАНДЛУ (M-77): состояние, собранное КЛИЕНТОМ \
+         из snapshot(C)+frames, не равно полному реплею. Разошлось: {}. \
+         Кадров {frames}, из них с глубиной {with_depth}. Сервер при этом ПРАВ — \
+         расхождение потребительское (`Р-1`). Причина общая для всех книго-зависимых \
+         серий: кадр строится свежим `Reducer::new(&self.selector)` \
+         (`crates/gateway/src/lib.rs:3900`, повтор `:4011`) с ПУСТОЙ книгой, а из книги \
+         считаются и полосы глубины, и ячейки heatmap, и COB.",
+        diverged(&client, &full)
+    );
+}
+
+/// **ФОРМА 5 — РОЛЛОВЕР БАТЧА ВНУТРИ ОДНОГО `pump`** (`crates/gateway/src/lib.rs:4011`).
+///
+/// `Reducer::new` вызывается в `pump` ДВАЖДЫ: на входе (`:3900`) и на каждой границе батча
+/// (`:4011`). Тесты выше при прод-значении `max_events = 256` и тике из трёх событий
+/// достигают только ПЕРВОГО. Этого мало, и это не рассуждение, а замер: кандидат-развязка А
+/// (`refs/salvage/2026-09-05/m77-candidate-fix-A`) правит ровно одно место из двух, и
+/// четыре теста этого файла против неё ЗЕЛЁНЫЕ — при том, что дефект жив на всяком тике
+/// длиннее одного батча. На проде `PUSH_MAX_EVENTS = 256`
+/// (`crates/gateway-serve/src/lib.rs:1119-1120`), и всякий backlog длиннее батча идёт
+/// именно этим путём: `resume` без чекпоинта стартует с backlog'ом во ВЕСЬ журнал.
+///
+/// `max_events = 2` при тике из трёх событий даёт ролловер на каждом тике.
+#[test]
+fn vb_i_2_client_equals_replay_when_the_tick_spans_a_batch_rollover() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ticks = ticks_of(24, |ts, seq| delta(ts, seq, true));
+    let (client, server, frames, with_depth) =
+        drive_prod_path_with(dir.path(), backlog(), ticks, 2);
+    let full = replay(dir.path());
+    guard_server_matches_replay(&server, &full);
+
+    // SETUP: дробление обязано состояться, иначе тест повторяет ядро другими словами.
+    if frames <= 24 {
+        setup_failed(&format!(
+            "при max_events=2 и 24 тиках по 3 события кадров обязано быть БОЛЬШЕ 24 \
+             (ролловер внутри тика), получено {frames} — дробление не состоялось"
+        ));
+    }
+    if with_depth == 0 {
+        setup_failed(&format!(
+            "из {frames} кадров ни один не нёс точки глубины — мерить нечего"
+        ));
+    }
+
+    assert!(
+        client.series == full.series,
+        "VB-I-2 НАРУШЕН НА РОЛЛОВЕРЕ БАТЧА (M-77): при max_events=2 тик режется на несколько \
+         батчей, и ВТОРОЕ место создания `Reducer::new` (`crates/gateway/src/lib.rs:4011`) \
+         обязано подчиняться тому же правилу источника, что и первое (`:3900`). \
+         Разошлось: {}. Кадров {frames}, из них с глубиной {with_depth}. \
+         Правка, внесённая только в одно из двух мест, оставляет дефект живым на проде: \
+         `PUSH_MAX_EVENTS = 256`, а backlog при подключении длиннее батча всегда.",
+        diverged(&client, &full)
+    );
+}
+
+/// Диагностика: какие поля бандла разошлись. Печатается в сообщении ассерта, чтобы
+/// следующий круг не выяснял это заново и чтобы не дампить бандл целиком.
+fn diverged(client: &Snapshot, full: &Snapshot) -> String {
+    let c = &client.series;
+    let f = &full.series;
+    let mut out: Vec<String> = Vec::new();
+    macro_rules! chk {
+        ($field:ident) => {
+            if c.$field != f.$field {
+                out.push(format!(
+                    "{} (клиент {}, реплей {})",
+                    stringify!($field),
+                    c.$field.len(),
+                    f.$field.len()
+                ));
+            }
+        };
+    }
+    chk!(ohlcv);
+    chk!(cumulative_delta);
+    chk!(cvd_session_base);
+    chk!(depth_series);
+    chk!(vwap);
+    chk!(volume_profile);
+    chk!(vp_session_max_time_s);
+    chk!(heatmap);
+    chk!(cob);
+    chk!(volume_bubbles);
+    if c.cadence_ms != f.cadence_ms {
+        out.push("cadence_ms".to_string());
+    }
+    if c.depth_series != f.depth_series {
+        let pts =
+            |s: &Snapshot| -> usize { s.series.depth_series.iter().map(|r| r.series.len()).sum() };
+        out.push(format!(
+            "depth_series точек: клиент {}, реплей {}",
+            pts(client),
+            pts(full)
+        ));
+    }
+    if out.is_empty() {
+        "расхождений по полям нет".to_string()
+    } else {
+        out.join("; ")
     }
 }
