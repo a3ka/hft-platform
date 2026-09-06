@@ -291,7 +291,7 @@ impl SeriesBundle {
 | 2 | **Контракт развязки Б:** правило источника, связь с курсором доставки, сигнатуры — §6bis | **architect** | ✅ DONE |
 | 2bis | **RED окна доставки:** отказ по объёму / терминальность / повтор при `full` впереди курсора | **architect** | ✅ DONE |
 | 3 | Реализация развязки Б по §6bis | engine-dev | ✅ DONE |
-| 4 | **Цена:** сторож на границе `pump` (architect, ✅) + замер ДО/ПОСЛЕ на прод-форме в Done Block (engine-dev) | architect / engine-dev | оракул ✅ · замер 🚧 |
+| 4 | **Цена:** сторож на границе `pump` (architect, ✅) + замер ДО/ПОСЛЕ на прод-форме в Done Block (engine-dev) | architect / engine-dev | оракул ✅ · замер ✅ |
 | 5 | `scripts/verify_M-77.sh` — паритет с CI, ОТДЕЛЬНАЯ проверка на каждую задачу | **architect** | ✅ DONE |
 
 ## 9. RED-набор — что именно он пиннит
