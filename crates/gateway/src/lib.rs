@@ -36,6 +36,19 @@ fn default_selector() -> Selector {
     }
 }
 
+/// M-77 (§6bis.3): default для `Reducer::book_series` при десериализации чекпоинта —
+/// пустой `BTreeMap`. Наблюдения восстанавливаются на первом же `pump()` через
+/// `capture_book_observation` (см. комментарий на поле).
+fn book_series_default() -> BTreeMap<u64, BookSeriesObservation> {
+    BTreeMap::new()
+}
+
+/// M-77: default для `Reducer::capture_book_observations` — `false`. После resume
+/// LiveReducer ЯВНО включает флаг на `self.full` (см. `LiveReducer::resume`).
+fn default_capture_book_observations() -> bool {
+    false
+}
+
 /// Версия экспорт-формы gateway. **Аддитивно** поверх `research-cli::EXPORT_SCHEMA_VERSION = 1`
 /// (VB-I-4/GW-I-5): новые серии (M-23+) добавляют поля, не переопределяют старые; форма меняется
 /// ТОЛЬКО с bump этой константы. T-designate (не T1, не `crates/contracts`).
@@ -436,6 +449,43 @@ pub struct Snapshot {
     pub history_truncated: bool,
 }
 
+/// M-77 (§6bis.3): срез книго-зависимых серий, возвращаемый из живого редьюсера.
+/// T3 (крейт-приватный): на провод не идёт, консюмеров вне `crates/gateway` не имеет
+/// (см. `M-77` §5 — форма выдачи НЕ меняется, бамп `GATEWAY_SCHEMA_VERSION` не нужен).
+/// Замещает собою «неверную» книго-зависимую часть `SeriesBundle`, посчитанную свежим
+/// `Reducer::new` с пустой книгой внутри `pump` (`M-77` §3).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct BookSeriesSlice {
+    /// `depth_series` (Vec<DepthRow>) — срез живого редьюсера по диапазону кадра.
+    /// Провенанс (`depth_band_provenance`) — от наблюдения, ИЗ которого взяты числа
+    /// (`П-014`/`d7`), а не от текущего `self.full.depth_reach_*`.
+    pub depth_series: Vec<DepthRow>,
+    /// `heatmap` — срез живого редьюсера: ячейки бакетов, у которых L2-событие
+    /// попало в диапазон кадра. Close-семантика per `(time_s, side, price_e8)`
+    /// (последний event в диапазоне, попавший в эту ячейку, побеждает — как и в
+    /// `merge_heatmap`).
+    pub heatmap: Vec<HeatmapCell>,
+    /// `cob` — point-in-time снимок книги на момент ПОСЛЕДНЕГО L2-события в диапазоне
+    /// (зеркалит семантику `build_heatmap_and_cob`, где COB — последний обработанный
+    /// bucket в окне). Свежий batch без книги дал бы либо пустой, либо устаревший COB.
+    pub cob: Vec<CobLevel>,
+}
+
+impl SeriesBundle {
+    /// M-77 (§6bis.3): ЗАМЕСТИТЬ книго-зависимые серии срезом живого редьюсера.
+    /// Замещение, а НЕ слияние: у batch'а этих серий быть не должно вовсе (свежий
+    /// `Reducer::new` с пустой книгой даёт неверные числа, а merge оставил бы их).
+    /// Семантика `set_*` (а не `add_*`) — `cob` и `heatmap` замещаются целиком,
+    /// `depth_series` — поэлементно по `(side, band_pct_e8)`. Поля, не относящиеся к
+    /// книге (`ohlcv`, `cumulative_delta`, `vwap`, `volume_profile`, `bubbles`,
+    /// `cadence_ms`, per-session ledgers) — НЕ трогаем.
+    pub(crate) fn set_book_series(&mut self, slice: BookSeriesSlice) {
+        self.depth_series = slice.depth_series;
+        self.heatmap = slice.heatmap;
+        self.cob = slice.cob;
+    }
+}
+
 /// Инкрементальный кадр: приращение серий за `(from .. to]`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Frame {
@@ -761,6 +811,88 @@ struct Reducer {
     /// наивного пути «снять early-return и считать на каждом тике», который стирает
     /// экономию, ради которой каденция заведена).
     depth_cadence_current_bucket: Option<i64>,
+    /// M-77 (§6bis.3): per-event наблюдение книго-зависимого состояния, снятое В МОМЕНТ
+    /// `apply()` ИЗ `self.full`. Ключ — `event.seq`. Используется на пути `pump` для
+    /// построения кадра: кадр есть функция ДИАПАЗОНА `(from, upto]`, а не текущей позиции
+    /// `self.full` (К-1: повторный `pump` после отказа по объёму возвращает тот же кадр
+    /// байт-в-байт, `§6bis.2`/`§9bis`). Без этого хранилища batch в `pump` стартует с
+    /// ПУСТОЙ книгой и считает `depth`/`heatmap`/`cob` от нуля — ровно тот дефект, который
+    /// описывает §2/§3 спеки.
+    ///
+    /// **Эвикция — ДВУХУРОВНЕВАЯ**, и оба механизма СТОРОЖАТ `VB-I-10`:
+    ///   1. `evict_book_series_below_cursor` (явный шаг после успешного commit'а кадра в
+    ///      `pump`): `seq <= cursor.upto_seq` удаляются — кадр доставлен, его наблюдения
+    ///      никогда больше не понадобятся (следующий кадр стартует от `cursor`).
+    ///   2. `evict_window_state` (per-event, уже стоит): НЕ трогает это поле (наблюдения
+    ///      привязаны к seq, не к time_s; эвикция по time_s оставила бы «дыры» в
+    ///      seq-пространстве и нарушила К-1 при повторной попытке после длительного окна).
+    ///
+    /// **Стоимость хранения:** на L2-событие — 4 пары `(band_pct_e8, side, value)` (depth,
+    /// ≤96 Б) + 2-5 ячеек heatmap (`HeatmapCell` × 3 поля + провенанс, ≤400 Б на ячейку
+    /// при широком окне; на проде `0.001` — ≤3 ячеек × ≈60 Б) + 2-5 уровней COB (≤80 Б).
+    /// Итого ≤600 Б на событие; при проде `PUSH_MAX_EVENTS=256` буфер удержания ≤150 КБ —
+    /// на фоне текущего state-кэша `Reducer` (несколько МБ) несоизмеримо.
+    ///
+    /// **`#[serde(skip, default = "book_series_default")]`:** при серилизации чекпоинта поле
+    /// НЕ пишется и при десериализации стартует пустым. Наблюдения восстанавливаются при
+    /// первом же `pump()` после resume (`capture_book_observation` зовётся на каждом
+    /// L2-событии). Без skip серилизация `HeatmapCell`/`CobLevel` в postcard потребовала бы
+    /// derive на `BookSeriesObservation` — лишняя поверхность ради поля, чья ценность только
+    /// в оперативной памяти (на холодном старте буфер пуст по построению).
+    #[serde(skip, default = "book_series_default")]
+    book_series: BTreeMap<u64, BookSeriesObservation>,
+    /// M-77: флаг «захватывать наблюдения на КАЖДОМ L2-событии» (см. комментарий на
+    /// `set_capture_book_observations`). По умолчанию `false` — свежие Reducer'ы (snapshot,
+    /// checkpoint-rebuild, replay) НЕ накапливают наблюдения; self.full в LiveReducer —
+    /// единственное место, где флаг `true`.
+    #[serde(skip, default = "default_capture_book_observations")]
+    capture_book_observations: bool,
+}
+
+/// M-77 (§6bis.3): per-event наблюдение книго-зависимого состояния, снятое в момент
+/// `apply()`. Хранится в `Reducer::book_series` ключом `event.seq`. Поля названы так,
+/// чтобы при извлечении диапазона `(from, upto]` НЕ пришлось лезть в `self.full.book`/
+/// `heatmap_buckets`/`depth[].values` (эти хранилища подчиняются оконной эвикции по
+/// `time_s` и К-1 не держат).
+#[derive(Clone, Default)]
+struct BookSeriesObservation {
+    /// seq события, породившего эту версию наблюдения. Используется в `book_series_in`
+    /// для фильтрации по диапазону `(from, upto]` И для close-семантики внутри диапазона
+    /// (max-seq побеждает для одного ключа). Идентичен ключу `BTreeMap<u64, _>`, в котором
+    /// хранится наблюдение, — но держится в поле чтобы НЕ лезть в ключи при агрегации.
+    seq: u64,
+    /// Heatmap-ячейки бакета `heatmap_time_s` (= `event.ts_exch_ms / 1000` после
+    /// выравнивания по `timeframe_ms`) в окне `[mid*(1−W), mid*(1+W)]`,
+    /// отфильтрованные через эффективный `heatmap_window_frac`. Семантика close-per-bucket:
+    /// позднейшее наблюдение того же `(time_s, side, price_e8)` замещает раннее, как в
+    /// `merge_heatmap` (`GW-I-3`/`HM-I-5`).
+    heatmap_cells: Vec<HeatmapCell>,
+    /// COB на момент наблюдения: последний снимок книги в окне `heatmap_time_s`
+    /// (тот же алгоритм, что `build_cob_from_bucket`). COB — point-in-time: кадр
+    /// берёт COB последнего L2-события в своём диапазоне.
+    cob_levels: Vec<CobLevel>,
+    /// `time_s` ключа depth (None если depth НЕ писался на этом событии — например, в
+    /// режиме каденции без ролловера интервала: `recompute_depth_from_book` ранний
+    /// возврат, `commit_depth_at` тоже не звался).
+    ///
+    /// В режиме каденции этот ключ МОЖЕТ отличаться от `heatmap_time_s`: `commit_depth_at`
+    /// пишет на ГРАНИЦЕ интервала (`prev_bucket * cadence_s`), а heatmap — на ВРЕМЕНИ
+    /// события. Это воспроизводит существующую семантику ролловера (R-138 Б-1: depth
+    /// берётся по состоянию книги ДО обновления новым событием, heatmap — после).
+    depth_time_s: Option<i64>,
+    /// Значения `(band_pct_e8, side, value)` — то, что попало в `depth[].values[depth_time_s]`
+    /// на ЭТОМ событии. По ОДНОЙ записи на пару `(band_pct_e8, side)` — столько же,
+    /// сколько строк в `self.depth`. Пусто если mid невычислим (односторонняя книга;
+    /// `R-134 B-3`).
+    depth_points: Vec<(i64, Side, i64)>,
+    /// Охват bid, зафиксированный В ТОТ ЖЕ момент, что и числа depth (§2bis, d7):
+    /// `commit_depth_at` и `recompute_depth_from_book` обновляют `depth_reach_*`
+    /// синхронно с числами — здесь он просто копируется, чтобы при извлечении
+    /// `depth_band_provenance` описывал ИМЕННО то наблюдение, из которого взяты числа,
+    /// а не текущий `self.full.depth_reach_*` (который мог уехать вперёд).
+    reach_bid: f64,
+    /// Пара к `reach_bid` для `Side::Sell` (П-014: bid и ask расходятся по живости).
+    reach_ask: f64,
 }
 
 /// M-23: per-bucket book snapshot для heatmap. Хранит bids/asks отдельно (Vec<(price,size)>) +
@@ -830,6 +962,12 @@ impl Reducer {
             // вызове `apply()` через `maybe_commit_depth_interval` (None → Some(bucket)
             // без коммита — закрывать нечего).
             depth_cadence_current_bucket: None,
+            // M-77: per-event наблюдения книго-зависимого состояния. Заполняются в `apply`
+            // после обновления heatmap/depth, эвиктируются `evict_book_series_below_cursor`
+            // при успешном commit'е кадра в `pump` (см. комментарий на поле).
+            book_series: BTreeMap::new(),
+            // M-77: по умолчанию выключен — см. `set_capture_book_observations`.
+            capture_book_observations: false,
         }
     }
 
@@ -1143,7 +1281,7 @@ impl Reducer {
                 // ЗАКРЫВАЕМОГО интервала — новый снапшот ещё не применён, `apply_snapshot`
                 // ниже). Без этой строки фильтр бы взял ПЕРВОЕ событие интервала, и
                 // значение точки расходилось с heatmap close-семантикой (§0sexies.2bis).
-                self.maybe_commit_depth_interval(time_s);
+                let depth_time_s_cadence = self.maybe_commit_depth_interval(time_s);
                 // M-23: применить к L2Delta-реконструированной книге (replace), обновить
                 // heatmap-бакет для close-семантики.
                 self.book.apply_snapshot(bids, asks);
@@ -1153,7 +1291,12 @@ impl Reducer {
                 // источник ОДИН (`self.book`, как у heatmap). Однопроходный обход уровней
                 // (`depth_from_book` принимает все полосы разом — задача 8, `d6b`).
                 self.ensure_depth_rows_initialized();
-                self.recompute_depth_from_book(time_s);
+                let depth_time_s_recompute = self.recompute_depth_from_book(time_s);
+                // M-77 (§6bis.3): захватить per-event наблюдение книго-зависимого состояния.
+                // `depth_time_s` — None (кадренс без ролловера), `time_s` (без каденции),
+                // ИЛИ `prev_bucket * cadence_s` (кадренс-ролловер). Heatmap ВСЕГДА `time_s`.
+                let depth_time_s = depth_time_s_cadence.or(depth_time_s_recompute);
+                self.capture_book_observation(event.seq, time_s, depth_time_s);
             }
             MdPayload::L2Delta {
                 bids,
@@ -1169,7 +1312,7 @@ impl Reducer {
                 // предыдущего интервала обязано лечь до `apply_delta` (иначе для дельты
                 // значения были бы последним состоянием delta-книги, а не последним
                 // состоянием ПРЕДЫДУЩЕГО интервала).
-                self.maybe_commit_depth_interval(time_s);
+                let depth_time_s_cadence = self.maybe_commit_depth_interval(time_s);
                 // M-23: L2Delta ВЕТКА — зеркалит venue (M-29 `apply_delta`): size==0 → remove,
                 // size>0 → upsert. Обновляет книгу + heatmap-бакет И (M-68, TD-158) полосы +
                 // охват: депт-серия больше НЕ snapshot-only, источник ОДИН с heatmap.
@@ -1180,7 +1323,10 @@ impl Reducer {
                 // (снимка ещё не было, депт-серия в этом селекторе стартует с первой дельты),
                 // ленивая инициализация строк та же.
                 self.ensure_depth_rows_initialized();
-                self.recompute_depth_from_book(time_s);
+                let depth_time_s_recompute = self.recompute_depth_from_book(time_s);
+                // M-77 (§6bis.3): захватить per-event наблюдение книго-зависимого состояния.
+                let depth_time_s = depth_time_s_cadence.or(depth_time_s_recompute);
+                self.capture_book_observation(event.seq, time_s, depth_time_s);
             }
             _ => {}
         }
@@ -1257,7 +1403,7 @@ impl Reducer {
     /// серию НЕ пишется (R-134 B-3): отсутствие середины ⇒ отсутствие измерения, а
     /// не измерение со значением `0` (значение `0` утверждало бы глубину внутри
     /// несуществующего интервала, смешивая "глубина пуста" и "мерить не от чего").
-    fn recompute_depth_from_book(&mut self, time_s: i64) {
+    fn recompute_depth_from_book(&mut self, time_s: i64) -> Option<i64> {
         // M-68 rev6, задача 12 (R-138 Б-1): В режиме каденции числа и охват обновляются
         // ТОЛЬКО на закрытии интервала (`maybe_commit_depth_interval` в `apply()`),
         // конструкция РОЛЛОВЕРа. На остальных событиях — NO-OP: ни `depth[].values`,
@@ -1268,16 +1414,14 @@ impl Reducer {
         // свойство стоимости НЕ пиннит ни один оракул — пробел, названный открытым
         // долгом №1 «свойство стоимости не пиннится»).
         if self.selector.depth_cadence_ms.is_some() {
-            return;
+            return None;
         }
         // Без каденции: legacy-путь — на КАЖДОМ L2-событии пересчёт и запись в
         // `depth[].values[time_s]` плюс охват с того же наблюдения. `time_s` уже
         // выровнен на `timeframe_ms` (`bucket_time_s`); точка пишется в бакет.
         let bid_levels = self.book.levels(Side::Buy);
         let ask_levels = self.book.levels(Side::Sell);
-        let Some(mid) = HeatmapBucketState::mid_from(&bid_levels, &ask_levels) else {
-            return;
-        };
+        let mid = HeatmapBucketState::mid_from(&bid_levels, &ask_levels)?;
         let bands = &self.selector.bands;
         let (bid_sums, bid_count) = self.depth_from_book(&bid_levels, mid, Side::Buy, bands);
         let (ask_sums, ask_count) = self.depth_from_book(&ask_levels, mid, Side::Sell, bands);
@@ -1303,6 +1447,7 @@ impl Reducer {
         // зависит от глубины книги.
         self.depth_reach_bid = self.book.max_reach_pct(Side::Buy).unwrap_or(0.0);
         self.depth_reach_ask = self.book.max_reach_pct(Side::Sell).unwrap_or(0.0);
+        Some(time_s)
     }
 
     /// M-68 rev6, задача 12 (R-138 Б-1): РОЛЛОВЕР каденс-интервала (§0sexies.2ter).
@@ -1327,20 +1472,29 @@ impl Reducer {
     ///
     /// Первый вызов (после `None`) инициализирует ключ и НЕ коммитит — закрывать
     /// нечего.
-    fn maybe_commit_depth_interval(&mut self, time_s: i64) {
-        let Some(ms) = self.selector.depth_cadence_ms else {
-            return;
-        };
+    ///
+    /// **Возврат `Option<i64>` (M-77, §6bis.3):** `Some(key_time_s)` — depth был записан
+    /// на ролловере (и тогда `time_s` для наблюдения равен `prev_bucket * cadence_s`,
+    /// что может отличаться от `time_s` самого события); `None` — depth не писался
+    /// (нет каденции ИЛИ ролловера не было ИЛИ односторонняя книга). Используется в
+    /// `apply()` чтобы ЗНАТЬ ключ, по которому `commit_depth_at` записал значения
+    /// depth — для захвата per-event наблюдения.
+    fn maybe_commit_depth_interval(&mut self, time_s: i64) -> Option<i64> {
+        let ms = self.selector.depth_cadence_ms?;
         // ms уже провалидирован в `validate_selector` (ms >= 1000, делит 86_400_000),
         // значит деление целое и безопасно.
         let cadence_s = ms / 1000;
         let new_bucket = time_s / cadence_s;
+        let mut written_at = None;
         if let Some(prev_bucket) = self.depth_cadence_current_bucket {
             if new_bucket != prev_bucket {
-                self.commit_depth_at(prev_bucket * cadence_s);
+                let key_time_s = prev_bucket * cadence_s;
+                self.commit_depth_at(key_time_s);
+                written_at = Some(key_time_s);
             }
         }
         self.depth_cadence_current_bucket = Some(new_bucket);
+        written_at
     }
 
     /// M-68 rev6, задача 12: записать CLOSE-значение каденс-интервала по состоянию книги
@@ -1377,6 +1531,242 @@ impl Reducer {
         // O(1) (`keys().next_back()` для bid, `next()` для ask; `crates/book/src/lib.rs`).
         self.depth_reach_bid = self.book.max_reach_pct(Side::Buy).unwrap_or(0.0);
         self.depth_reach_ask = self.book.max_reach_pct(Side::Sell).unwrap_or(0.0);
+    }
+
+    /// M-77 (§6bis.3): захватить per-event наблюдение книго-зависимого состояния.
+    /// Вызывается из `apply()` ПОСЛЕ обновления heatmap/depth. `depth_time_s = None` —
+    /// для режима каденции без ролловера (depth не писался ни на ролловере, ни на самом
+    /// событии: `recompute_depth_from_book` ранний возврат). `heatmap_time_s` — всегда
+    /// `Some`, если был вызван `refresh_heatmap_bucket`.
+    ///
+    /// **ФЛАГ `capture_book_observations`:** для self.full живого редьюсера — `true`,
+    /// наблюдения ЗАПИСЫВАЮТСЯ в `book_series`. Для свежих Reducer'ов (snapshot,
+    /// checkpoint-rebuild, replay, batch в `pump`) — `false`, и метод НЕМЕДЛЕННО
+    /// возвращается: иначе буфер вырос бы до объёма всего журнала и сломал бы
+    /// `snapshot_memory_bounded_by_window_not_history` (`VB-I-10`). Захват НЕ
+    /// нужен этим редьюсерам: они не отдают кадры наружу (snapshot — это
+    /// `finish_with_at`, batch — `Reducer::new` внутри `pump` без `book_series_in`).
+    fn capture_book_observation(
+        &mut self,
+        event_seq: u64,
+        heatmap_time_s: i64,
+        depth_time_s: Option<i64>,
+    ) {
+        if !self.capture_book_observations {
+            return;
+        }
+        // Heatmap cells: снимаем с уже обновлённого `heatmap_buckets[heatmap_time_s]`
+        // ТЕМ ЖЕ алгоритмом, что `build_heatmap_and_cob` (фактически один bucket из него).
+        let (heatmap_cells, cob_levels) = match self.heatmap_buckets.get(&heatmap_time_s) {
+            Some(bucket) => build_heatmap_cells_and_cob_for_bucket(
+                bucket,
+                heatmap_time_s,
+                effective_heatmap_window_frac(),
+            ),
+            None => (Vec::new(), Vec::new()),
+        };
+
+        // Depth values: читаем `self.depth[].values[depth_time_s]`. На каденс-ролловере
+        // это `commit_depth_at(key_time_s)`; на без-каденции — `recompute_depth_from_book(time_s)`.
+        // При односторонней книге значения нет — `depth_points` пуст (R-134 B-3).
+        let depth_points: Vec<(i64, Side, i64)> = match depth_time_s {
+            Some(dts) => self
+                .depth
+                .iter()
+                .filter_map(|row| {
+                    row.values
+                        .get(&dts)
+                        .map(|&v| (row.band_pct_e8, row.side, v))
+                })
+                .collect(),
+            None => Vec::new(),
+        };
+
+        // Reach — с ТОГО ЖЕ наблюдения (reach обновляется синхронно с числами в
+        // `commit_depth_at`/`recompute_depth_from_book`).
+        let reach_bid = self.depth_reach_bid;
+        let reach_ask = self.depth_reach_ask;
+
+        self.book_series.insert(
+            event_seq,
+            BookSeriesObservation {
+                seq: event_seq,
+                heatmap_cells,
+                cob_levels,
+                depth_time_s,
+                depth_points,
+                reach_bid,
+                reach_ask,
+            },
+        );
+    }
+
+    /// M-77 (§6bis.3): срез книго-зависимых серий по диапазону `(from, upto]` —
+    /// ЧИСТАЯ ФУНКЦИЯ ДИАПАЗОНА (`К-1`: повторный вызов с тем же `(from, upto]`
+    /// даёт побайтно тот же результат, даже если `self.full_applied_seq`/`self.cursor`
+    /// ушли вперёд). Реализация — `O(N log N)` по наблюдениям в диапазоне; на
+    /// прод-фикстуре (24 тика × ≤256 событий = до ~6 144 наблюдений) это ≤ единиц
+    /// миллисекунд. `from_seq = None` ⇒ «от первого доступного наблюдения»;
+    /// `upto_seq = None` ⇒ «до последнего наблюдения».
+    pub(crate) fn book_series_in(
+        &self,
+        from_seq: Option<u64>,
+        upto_seq: Option<u64>,
+    ) -> BookSeriesSlice {
+        let lo: u64 = match from_seq {
+            None => 0,
+            Some(s) => s.saturating_add(1), // (from, upto] — полуинтервал
+        };
+        let hi: u64 = upto_seq.unwrap_or(u64::MAX);
+
+        // Собираем наблюдения в диапазоне; close-семантика по `time_s` для heatmap/COB и
+        // depth реализуется ниже через BTreeMap-merge.
+        let observations: Vec<&BookSeriesObservation> = self
+            .book_series
+            .range(lo..=hi)
+            .map(|(_, obs)| obs)
+            .collect();
+
+        if observations.is_empty() {
+            return BookSeriesSlice::default();
+        }
+
+        // Depth: группируем по `depth_index = band_idx * 2 + side_idx`, чтобы
+        // сохранить порядок строк `self.depth`, устанавливаемый `ensure_depth_rows_initialized`
+        // (для каждой полосы первой идёт Buy, затем Sell). Без этого `o1_subscribe_*`
+        // краснел бы на перестановке строк `bid`/`ask` относительно эталона.
+        // Закрытая семантика: per `(band, side, depth_time_s)` побеждает наблюдение с
+        // МАКСИМАЛЬНЫМ seq (последнее в seq-диапазоне).
+        // Reach для provenance берём у последнего наблюдения в группе (>= значения).
+        //
+        // `band_idx_for`: предвычисляем индекс полосы для каждого `band_pct_e8` селектора
+        // — так итерация по наблюдениям O(1) вместо O(N) на поиск в `bands`.
+        type DepthTimeMap = BTreeMap<i64, (i64, u64, f64)>;
+        type DepthRowAcc = (i64, Side, DepthTimeMap);
+        let bands = &self.selector.bands;
+        let mut band_idx_for: std::collections::HashMap<i64, usize> =
+            std::collections::HashMap::new();
+        for (idx, &band) in bands.iter().enumerate() {
+            band_idx_for.insert((band * 1e8).round() as i64, idx);
+        }
+        let mut depth_by_index: BTreeMap<usize, DepthRowAcc> = BTreeMap::new();
+        for obs in &observations {
+            if let Some(dts) = obs.depth_time_s {
+                for &(band_pct_e8, side, value) in &obs.depth_points {
+                    let Some(&band_idx) = band_idx_for.get(&band_pct_e8) else {
+                        continue;
+                    };
+                    let side_idx: usize = match side {
+                        Side::Buy => 0,
+                        Side::Sell => 1,
+                    };
+                    let depth_index = band_idx * 2 + side_idx;
+                    let entry = depth_by_index
+                        .entry(depth_index)
+                        .or_insert_with(|| (band_pct_e8, side, BTreeMap::new()));
+                    let reach = match side {
+                        Side::Buy => obs.reach_bid,
+                        Side::Sell => obs.reach_ask,
+                    };
+                    let cur = entry.2.entry(dts);
+                    match cur {
+                        std::collections::btree_map::Entry::Vacant(v) => {
+                            v.insert((value, obs.seq, reach));
+                        }
+                        std::collections::btree_map::Entry::Occupied(mut o) => {
+                            if obs.seq > o.get().1 {
+                                o.insert((value, obs.seq, reach));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let depth_series: Vec<DepthRow> = depth_by_index
+            .into_iter()
+            .map(|(_, (band_pct_e8, side, time_s_map))| {
+                // Reach для provenance берём из последнего по `time_s` (== max seq) —
+                // это reach самого позднего наблюдения в группе, описывающий самый
+                // свежий state книги, в котором есть значение. Семантика совпадает с
+                // существующим `finish_ref` (берёт `self.depth_reach_*` после применения
+                // всех наблюдений; у batch'а-кадра эквивалент — последнее наблюдение
+                // диапазона, у которого `depth_time_s` МАКСИМАЛЬНЫЙ).
+                let last = time_s_map
+                    .values()
+                    .next_back()
+                    .map(|(_, _, r)| *r)
+                    .unwrap_or(0.0);
+                let series: Vec<(i64, i64)> = time_s_map
+                    .into_iter()
+                    .map(|(t, (v, _, _))| (t, v))
+                    .collect();
+                DepthRow {
+                    side: match side {
+                        Side::Buy => "bid".to_string(),
+                        Side::Sell => "ask".to_string(),
+                    },
+                    band_pct_e8,
+                    series,
+                    depth_band_provenance: depth_provenance_label(band_pct_e8, side, last),
+                }
+            })
+            .collect();
+
+        // Heatmap: close-семантика per `(time_s, side, price_e8)`. Позднейшее наблюдение
+        // (max seq) в диапазоне для каждого ключа побеждает (`merge_heatmap` поведение).
+        let mut heatmap_map: BTreeMap<(i64, String, i64), HeatmapCell> = BTreeMap::new();
+        for obs in &observations {
+            for cell in &obs.heatmap_cells {
+                heatmap_map.insert(
+                    (cell.time_s, cell.side.clone(), cell.price_e8),
+                    cell.clone(),
+                );
+            }
+        }
+        let heatmap: Vec<HeatmapCell> = heatmap_map.into_values().collect();
+
+        // COB: point-in-time. Берём наблюдение с МАКСИМАЛЬНЫМ seq в диапазоне — его
+        // `cob_levels` описывают книгу на момент этого события; для всех последующих
+        // кадров «в окне» COB зафиксирован (зеркалит `build_heatmap_and_cob`, где COB —
+        // последний обработанный bucket в окне).
+        let cob = observations
+            .iter()
+            .max_by_key(|obs| obs.seq)
+            .map(|obs| obs.cob_levels.clone())
+            .unwrap_or_default();
+
+        BookSeriesSlice {
+            depth_series,
+            heatmap,
+            cob,
+        }
+    }
+
+    /// M-77 (§6bis.3 / VB-I-10): эвиктировать наблюдения `seq <= cursor.upto_seq`.
+    /// Зовётся ИЗ `LiveReducer::pump` после успешного commit'а каждого кадра. Семантика:
+    ///   · `cursor.upto_seq == None` (`Cursor::START`) — ничего не удалено (нечего было доставлено).
+    ///   · иначе — все наблюдения с `seq <= cursor.upto_seq` БОЛЬШЕ НЕ НУЖНЫ: следующий
+    ///     кадр стартует от `cursor`, и наблюдения меньших seq никогда в его диапазон не
+    ///     попадут. Это НЕ оконная эвикция по `time_s` — она оставила бы «дыры» в
+    ///     seq-пространстве и сломала бы К-1 при отложенных retry (см. комментарий на
+    ///     `Reducer::book_series`).
+    fn evict_book_series_below_cursor(&mut self, cursor: Cursor) {
+        let Some(hi) = cursor.upto_seq else {
+            return;
+        };
+        self.book_series = self.book_series.split_off(&(hi + 1));
+    }
+
+    /// M-77: включить/выключить захват per-event наблюдений. По умолчанию `false`
+    /// (безопасная сторона: snapshot/checkpoint остаются bounded, `VB-I-10` цел).
+    /// Включается ТОЛЬКО в `LiveReducer::resume` на self.full — там наблюдения питают
+    /// `book_series_in` на пути `pump`. Свежие batch'и в `pump` и Reducer'ы в
+    /// snapshot/checkpoint/replay НЕ включают: для них `book_series_in` не зовётся, а
+    /// буфер бы занял `O(журнал)` памяти (тест
+    /// `snapshot_memory_bounded_by_window_not_history` ловит ровно этот рост).
+    fn set_capture_book_observations(&mut self, on: bool) {
+        self.capture_book_observations = on;
     }
 
     /// M-56 (`TD-097`, task #1): `finish(self)` теперь ТОЛЬКО обёртка над `finish_ref(&self)` —
@@ -1680,6 +2070,100 @@ fn build_heatmap_and_cob(
     });
 
     (heatmap_out, cob)
+}
+
+/// M-77 (§6bis.3): выделить из `build_heatmap_and_cob` логику для ОДНОГО бакета —
+/// используется `capture_book_observation` на пути `apply`, чтобы каждое наблюдение
+/// хранило уже отфильтрованный по окну срез heatmap/COB. Семантика close-per-bucket
+/// та же: ячейки сортируются `(time_s, side, price_e8)`, COB — `(side, price_e8)`
+/// с побайтным совпадением с `merge_heatmap`/`merge_cob` (HM-I-5 детерминизм).
+fn build_heatmap_cells_and_cob_for_bucket(
+    state: &HeatmapBucketState,
+    time_s: i64,
+    window_frac: f64,
+) -> (Vec<HeatmapCell>, Vec<CobLevel>) {
+    let w = window_frac;
+    let Some(mid) = state.mid else {
+        return (Vec::new(), Vec::new());
+    };
+    if mid <= 0 {
+        return (Vec::new(), Vec::new());
+    }
+    let low = (mid as f64 * (1.0 - w)) as i64;
+    let high = (mid as f64 * (1.0 + w)) as i64;
+    let deep_thr = (mid as f64 * 0.013) as i64;
+    let prov_str = "diff-reconstructed".to_string();
+
+    let mut cells: Vec<HeatmapCell> = Vec::new();
+    for &(price, size) in &state.bids {
+        if size <= 0 || price < low || price > mid {
+            continue;
+        }
+        let dist = mid - price;
+        let deep = dist > deep_thr;
+        cells.push(HeatmapCell {
+            time_s,
+            side: "bid".to_string(),
+            price_e8: price,
+            size_e8: size,
+            depth_band_provenance: deep.then(|| prov_str.clone()),
+        });
+    }
+    for &(price, size) in &state.asks {
+        if size <= 0 || price < mid || price > high {
+            continue;
+        }
+        let dist = price - mid;
+        let deep = dist > deep_thr;
+        cells.push(HeatmapCell {
+            time_s,
+            side: "ask".to_string(),
+            price_e8: price,
+            size_e8: size,
+            depth_band_provenance: deep.then(|| prov_str.clone()),
+        });
+    }
+
+    let mut cob_bids: Vec<(i64, i64)> = state
+        .bids
+        .iter()
+        .copied()
+        .filter(|&(p, s)| s > 0 && p >= low && p <= mid)
+        .collect();
+    cob_bids.sort_by_key(|&(p, _)| std::cmp::Reverse(p)); // bid desc (clippy 1.97)
+    let mut cob_asks: Vec<(i64, i64)> = state
+        .asks
+        .iter()
+        .copied()
+        .filter(|&(p, s)| s > 0 && p >= mid && p <= high)
+        .collect();
+    cob_asks.sort_by_key(|&(p, _)| p); // ask asc
+
+    let mut cob: Vec<CobLevel> = Vec::with_capacity(cob_bids.len() + cob_asks.len());
+    for (price, size) in &cob_asks {
+        cob.push(CobLevel {
+            side: "ask".to_string(),
+            price_e8: *price,
+            size_e8: *size,
+        });
+    }
+    for (price, size) in &cob_bids {
+        cob.push(CobLevel {
+            side: "bid".to_string(),
+            price_e8: *price,
+            size_e8: *size,
+        });
+    }
+    cob.sort_by(|a, b| a.side.cmp(&b.side).then(a.price_e8.cmp(&b.price_e8)));
+
+    cells.sort_by(|a, b| {
+        a.time_s
+            .cmp(&b.time_s)
+            .then(a.side.cmp(&b.side))
+            .then(a.price_e8.cmp(&b.price_e8))
+    });
+
+    (cells, cob)
 }
 
 /// M-23: построить `Vec<BubbleCell>` из `bubbles: BTreeMap<(time_s, price), (buy, sell)>`.
@@ -3743,7 +4227,12 @@ impl LiveReducer {
             // серий на `cursor`, не только vwap) — O(1) здесь, второго чтения журнала
             // нет. Хвост докормит его `pump()` тем же `apply()`, каким `advance_to`
             // построил его исходно.
-            let full = r;
+            let mut full = r;
+            // M-77: включить захват per-event наблюдений на self.full. Только здесь —
+            // никакой другой `Reducer` не отдаёт кадры через `book_series_in`. Чекпоинт
+            // восстановил self.full БЕЗ наблюдений (они `#[serde(skip)]`); наблюдения
+            // заполняются с первого же `pump()` от событий хвоста.
+            full.set_capture_book_observations(true);
             let full_applied_seq = cursor.upto_seq;
             return Ok((
                 Self {
@@ -3811,7 +4300,13 @@ impl LiveReducer {
                 // sacred `red_frames_seek_bound.rs` требует, чтобы РАБОТУ по наполнению
                 // сделал последующий `pump()`, не `resume()` (см. doc-комментарий
                 // `LiveReducer`, rev2 M-54 оракулов).
-                full: Reducer::new(sel),
+                full: {
+                    // M-77: включить захват наблюдений на self.full (см. пояснение в
+                    // checkpoint-ветке выше).
+                    let mut r = Reducer::new(sel);
+                    r.set_capture_book_observations(true);
+                    r
+                },
                 // Ничего не свёрнуто — согласовано с `cursor: Cursor::START` (M-71 `R-143` B-1).
                 full_applied_seq: None,
                 cap_refusals: 0,
@@ -3993,7 +4488,18 @@ impl LiveReducer {
                 // Сумму vwap батча снимаем ДО `finish_with_at` — она потребляет `batch`.
                 let batch_sum_pv = batch.vwap.sum_pv;
                 let batch_sum_v = batch.vwap.sum_v;
-                let (delta, at_ms) = batch.finish_with_at();
+                let (mut delta, at_ms) = batch.finish_with_at();
+                // M-77 (§6bis.2): книго-зависимые серии (`depth_series`/`heatmap`/`cob`)
+                // посчитанные свежим `Reducer::new` с пустой книгой — НЕВЕРНЫ; они должны
+                // прийти ОТ ЖИВОГО редьюсера `self.full`, адресованные ДИАПАЗОНОМ кадра
+                // (К-1: повторный `pump` после отказа по объёму даёт тот же кадр
+                // байт-в-бит). Извлекаем срез из `self.full.book_series_in(...)`, который
+                // зависит ТОЛЬКО от диапазона `(batch_from, cursor]` и `self.full`'s
+                // per-event наблюдений — а не от текущего состояния `self.full`.
+                let slice = self
+                    .full
+                    .book_series_in(batch_from.upto_seq, cursor.upto_seq);
+                delta.set_book_series(slice);
                 if let Err(e) = enforce_response_limit(&delta, effective_max_response_bytes()) {
                     return Err(self.refuse_by_cap(e));
                 }
@@ -4006,6 +4512,11 @@ impl LiveReducer {
                 // и применил ровно те же события, что `self.full`), M-36.
                 self.vwap.sum_pv = batch_sum_pv;
                 self.vwap.sum_v = batch_sum_v;
+                // M-77 (VB-I-10): эвиктировать наблюдения с `seq <= cursor.upto_seq` —
+                // ТОЛЬКО ПОСЛЕ УСПЕШНОГО COMMIT'А. До него (на отказе) наблюдения должны
+                // остаться для К-1: повторная попытка того же диапазона обязана дать
+                // побайтно тот же результат.
+                self.full.evict_book_series_below_cursor(cursor);
                 frames.push(Frame::versioned(batch_from, cursor, delta, at_ms));
                 batch_from = cursor;
                 batch = Reducer::new(&self.selector);
@@ -4048,7 +4559,17 @@ impl LiveReducer {
         if batch_consumed > 0 {
             let batch_sum_pv = batch.vwap.sum_pv;
             let batch_sum_v = batch.vwap.sum_v;
-            let (delta, at_ms) = batch.finish_with_at();
+            let (mut delta, at_ms) = batch.finish_with_at();
+            // M-77 (§6bis.2): то же, что и на границе батча — книго-зависимые серии
+            // берём ОТ ЖИВОГО редьюсера по диапазону. ЗДЕСЬ это ОБЯЗАТЕЛЬНО: ровно
+            // ВТОРОЕ место создания `Reducer::new` (`:4011`/`:4490`), которое кандидат
+            // развязки А из `§9bis` не трогал — и четыре теста задачи 1 против неё
+            // оставались зелёными, оставляя дефект живым на всяком тике длиннее одного
+            // батча.
+            let slice = self
+                .full
+                .book_series_in(batch_from.upto_seq, cursor.upto_seq);
+            delta.set_book_series(slice);
             if let Err(e) = enforce_response_limit(&delta, effective_max_response_bytes()) {
                 return Err(self.refuse_by_cap(e));
             }
@@ -4056,6 +4577,11 @@ impl LiveReducer {
             self.cursor = cursor;
             self.vwap.sum_pv = batch_sum_pv;
             self.vwap.sum_v = batch_sum_v;
+            // M-77 (VB-I-10): эвиктировать наблюдения с `seq <= cursor.upto_seq` —
+            // ТОЛЬКО ПОСЛЕ УСПЕШНОГО COMMIT'А. До него (на отказе) наблюдения должны
+            // остаться для К-1: повторная попытка того же диапазона обязана дать
+            // побайтно тот же результат.
+            self.full.evict_book_series_below_cursor(cursor);
             frames.push(Frame::versioned(batch_from, cursor, delta, at_ms));
         }
 
