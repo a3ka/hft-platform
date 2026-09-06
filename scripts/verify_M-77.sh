@@ -57,6 +57,25 @@ run_named() {
   fi
 }
 
+# КАРТА «имя теста → бинарь». Перечень ВЫПИСАН НАМЕРЕННО (`Р-3`,
+# oracle-blindness-class-2026-08-28.md §5): группа, живущая внутри глоба или регекспа,
+# перебором не накрывается, и пер-членная проверка становится невозможной. Здесь каждый
+# член назван, поэтому зелёная фаза проверяет КАЖДЫЙ оракул поимённо.
+declare -A TEST_BIN=(
+  [vb_i_2_c_client_equals_replay_when_the_tail_carries_snapshots]=red_m77_frame_book_continuity
+  [vb_i_2_client_depth_values_equal_replay_in_prod_steady_state]=red_m77_frame_book_continuity
+  [vb_i_2_client_keeps_the_point_when_the_tail_delta_is_one_sided]=red_m77_frame_book_continuity
+  [vb_i_2_client_equals_replay_across_a_resync_then_delta_tail]=red_m77_frame_book_continuity
+  [vb_i_2_client_bundle_equals_replay_in_prod_steady_state]=red_m77_frame_book_continuity
+  [vb_i_2_client_equals_replay_when_the_tick_spans_a_batch_rollover]=red_m77_frame_book_continuity
+  [vb_i_2_w1_refusal_by_cap_is_reachable_and_signals_terminality]=red_m77_delivery_window
+  [vb_i_2_w2_client_equals_replay_after_refusals_are_retried]=red_m77_delivery_window
+  [vb_i_2_w3_client_equals_replay_when_refusal_hits_a_batch_rollover]=red_m77_delivery_window
+  [vb_i_10_pump_cost_does_not_grow_with_the_number_of_batches]=red_m77_pump_cost
+)
+# Исходы зелёной фазы, заполняются в T5 и читаются T7 — чтобы не гонять один тест дважды.
+declare -A GREEN_OUTCOME=()
+
 SPEC=milestones/M-77-frame-book-continuity.md
 ORACLE=crates/gateway/tests/red_m77_frame_book_continuity.rs
 WINDOW=crates/gateway/tests/red_m77_delivery_window.rs
@@ -148,16 +167,25 @@ mapfile -t RED_TESTS < <(awk '/^failures:$/{f=1;next} /^$/{f=0} f && /^    [a-zA
 
 if [ "$SUITE_RC" -eq 0 ]; then
   pass "T4 cargo test --all ЗЕЛЁН (exit=0) — развязка внесена (задачи 2-3 исполнены)"
-  M77_LOG=$(mktemp)
-  cargo test -p gateway --test red_m77_frame_book_continuity >"$M77_LOG" 2>&1; M77_RC=$?
-  cargo test -p gateway --test red_m77_delivery_window >>"$M77_LOG" 2>&1; W_RC=$?
-  if [ "$M77_RC" -eq 0 ] && [ "$W_RC" -eq 0 ]; then
-    pass "T5 оба набора M-77 целиком ЗЕЛЕНЫ — VB-I-2 держится на прод-пути и в окне отказа"
-  else
-    fail "T5 суита зелена, а наборы M-77 КРАСНЫ (continuity=$M77_RC window=$W_RC) — невозможное состояние"
-    tail -20 "$M77_LOG"
-  fi
-  rm -f "$M77_LOG"
+  # ЗЕЛЁНАЯ ФАЗА ПРОВЕРЯЕТСЯ ПОИМЁННО, а не кодом возврата бинаря (`C-212` B-1 + класс).
+  # Прежняя редакция гоняла ЦЕЛЫЙ бинарь и решала по exit — а `cargo` возвращает 0, когда
+  # названные тесты помечены `#[ignore]` или исполнились ноль раз. Носителей класса было
+  # ТРИ: здесь (два прогона) и в T7; критик назвал один, греп по классу нашёл остальные.
+  GREEN_BAD=0
+  for t in "${SUBJECT_TESTS[@]}" "$CONTROL" "$WINDOW_GUARD"; do
+    L=$(mktemp)
+    read -r O N <<<"$(run_named "${TEST_BIN[$t]}" "$t" "$L")"
+    GREEN_OUTCOME[$t]="$O"
+    case "$O" in
+      OK) : ;;
+      VACUUM) fail "T5 '$t' НЕ ИСПОЛНЯЛСЯ (исполнено 0) — вакуум, не успех"; GREEN_BAD=1 ;;
+      *)      fail "T5 '$t' КРАСЕН (исполнено $N) при зелёной суите — невозможное состояние"
+              tail -20 "$L"; GREEN_BAD=1 ;;
+    esac
+    rm -f "$L"
+  done
+  [ "$GREEN_BAD" -eq 0 ] \
+    && pass "T5 все ${#SUBJECT_TESTS[@]} предметных + 2 контроля ИСПОЛНЕНЫ и ЗЕЛЕНЫ поимённо"
 else
   info "RED-ФАЗА: cargo test --all exit=$SUITE_RC — задача 3 не исполнена, это ОЖИДАЕМО"
   # Ожидаемая краснота обязана быть ЛОКАЛИЗОВАНА: красными имеют право быть РОВНО
@@ -209,19 +237,30 @@ else
   fail "T7 §6bis (контракт развязки Б с сигнатурой) в $SPEC ОТСУТСТВУЕТ — задача 2 не закрыта"
 fi
 
-W_LOG=$(mktemp)
-cargo test -p gateway --test red_m77_delivery_window >"$W_LOG" 2>&1; W_ONLY_RC=$?
-W_RED=$(grep -cE '^test vb_i_2_w[23]_.* FAILED$' "$W_LOG")
+W2=vb_i_2_w2_client_equals_replay_after_refusals_are_retried
+W3=vb_i_2_w3_client_equals_replay_when_refusal_hits_a_batch_rollover
 if [ "$SUITE_RC" -eq 0 ]; then
-  [ "$W_ONLY_RC" -eq 0 ] \
-    && pass "T7 оракул окна доставки ЗЕЛЁН (exit=0) — контракт диапазона держится под отказом" \
-    || { fail "T7 оракул окна доставки КРАСЕН (exit=$W_ONLY_RC) при зелёной суите"; tail -20 "$W_LOG"; }
+  # Исходы сняты T5 ПОИМЁННО (см. там же). Вакуум и краснота одинаково валят шаг:
+  # задача 2 закрыта только тогда, когда ОБА её оракула РЕАЛЬНО исполнились и прошли.
+  T7_BAD=0
+  for t in "$W2" "$W3"; do
+    case "${GREEN_OUTCOME[$t]:-VACUUM}" in
+      OK) : ;;
+      VACUUM) fail "T7 '$t' НЕ ИСПОЛНЯЛСЯ — контракт окна доставки не предъявлен (C-212 B-1)"; T7_BAD=1 ;;
+      *)      fail "T7 '$t' КРАСЕН при зелёной суите — контракт диапазона не держится"; T7_BAD=1 ;;
+    esac
+  done
+  [ "$T7_BAD" -eq 0 ] \
+    && pass "T7 оба оракула окна доставки ИСПОЛНЕНЫ и ЗЕЛЕНЫ — контракт диапазона держится под отказом"
 else
+  W_LOG=$(mktemp)
+  cargo test -p gateway --test red_m77_delivery_window >"$W_LOG" 2>&1 || true
+  W_RED=$(grep -cE '^test vb_i_2_w[23]_.* FAILED$' "$W_LOG")
   [ "$W_RED" -eq 2 ] \
     && pass "T7 RED-фаза: оба предметных теста окна доставки красны, дискриминатор зелён" \
     || { fail "T7 RED-фаза: предметных красных в окне доставки $W_RED, ожидалось 2 — оракул не пиннит контракт"; tail -20 "$W_LOG"; }
+  rm -f "$W_LOG"
 fi
-rm -f "$W_LOG"
 
 # ─── T8 (ЗАДАЧА 4): цена развязки Б на границе `pump` ──────────────────────────────
 # `C-211`: «task 4 должен иметь проверку цены Б на границе `pump` (не только `snapshot()`),
