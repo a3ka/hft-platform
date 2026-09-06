@@ -29,6 +29,34 @@ pass() { printf 'PASS  %s\n' "$*"; }
 fail() { printf 'FAIL  %s\n' "$*"; FAILED=$((FAILED + 1)); }
 info() { printf 'INFO  %s\n' "$*"; }
 
+# ТРЁХИСХОДНАЯ ФОРМА ИМЕНОВАННОГО ПРОГОНА (`A-028` §3 п.5, класс `A-031` носитель №8).
+# `cargo test` возвращает 0 при НУЛЕ исполненных тестов — предъявлено замером:
+#   cargo test -p gateway --test red_m77_pump_cost zzz_no_such_test -- --exact
+#   exit=0 · test result: ok. 0 passed; 0 failed; 0 ignored; 1 filtered out
+# Значит шаг, решающий по одному коду возврата, зеленеет ВАКУУМНО: достаточно
+# переименовать тест, навесить `#[ignore]` или разойтись фильтром. Исход обязан
+# различать ТРИ состояния: вакуум (исполнено ноль) ≠ исполнено-и-упало ≠ зелено.
+#
+# `run_named <бинарь> <имя> <куда_лог>` печатает `<исход> <исполнено>`:
+#   VACUUM  0   — тест не исполнялся вовсе (в т.ч. `#[ignore]`)
+#   FAILED  N   — исполнялся и упал
+#   OK      N   — исполнялся и прошёл
+run_named() {
+  local bin="$1" name="$2" log="$3" rc passed failed
+  cargo test -p gateway --test "$bin" "$name" -- --exact >"$log" 2>&1
+  rc=$?
+  passed=$(grep -oE '^test result: [a-zA-Z]+\. [0-9]+ passed' "$log" | grep -oE '[0-9]+ passed' | grep -oE '^[0-9]+' | head -1)
+  failed=$(grep -oE '[0-9]+ failed' "$log" | grep -oE '^[0-9]+' | head -1)
+  passed=${passed:-0}; failed=${failed:-0}
+  if [ "$((passed + failed))" -eq 0 ]; then
+    printf 'VACUUM 0\n'
+  elif [ "$rc" -ne 0 ] || [ "$failed" -gt 0 ]; then
+    printf 'FAILED %s\n' "$((passed + failed))"
+  else
+    printf 'OK %s\n' "$passed"
+  fi
+}
+
 SPEC=milestones/M-77-frame-book-continuity.md
 ORACLE=crates/gateway/tests/red_m77_frame_book_continuity.rs
 WINDOW=crates/gateway/tests/red_m77_delivery_window.rs
@@ -82,25 +110,23 @@ done
 # Они зелены и до реализации, и после. Красный контроль означает, что сравнение негодно
 # само по себе (или что опасное окно недостижимо), и краснота предметных ничего не доказывает.
 CTRL_LOG=$(mktemp)
-cargo test -p gateway --test red_m77_frame_book_continuity "$CONTROL" -- --exact >"$CTRL_LOG" 2>&1
-CTRL_RC=$?
-if [ "$CTRL_RC" -eq 0 ]; then
-  pass "T2 контроль снимочного хвоста ЗЕЛЁН (exit=0)"
-else
-  fail "T2 контроль снимочного хвоста КРАСЕН (exit=$CTRL_RC) — сравнение негодно"
-  tail -20 "$CTRL_LOG"
-fi
+read -r CTRL_OUTCOME CTRL_N <<<"$(run_named red_m77_frame_book_continuity "$CONTROL" "$CTRL_LOG")"
+case "$CTRL_OUTCOME" in
+  OK)     pass "T2 контроль снимочного хвоста ЗЕЛЁН (исполнено $CTRL_N)" ;;
+  VACUUM) fail "T2 контроль снимочного хвоста НЕ ИСПОЛНЯЛСЯ (исполнено 0) — вакуум, не успех" ;;
+  *)      fail "T2 контроль снимочного хвоста КРАСЕН (исполнено $CTRL_N) — сравнение негодно"
+          tail -20 "$CTRL_LOG" ;;
+esac
 rm -f "$CTRL_LOG"
 
 WG_LOG=$(mktemp)
-cargo test -p gateway --test red_m77_delivery_window "$WINDOW_GUARD" -- --exact >"$WG_LOG" 2>&1
-WG_RC=$?
-if [ "$WG_RC" -eq 0 ]; then
-  pass "T2 дискриминатор окна отказа ЗЕЛЁН (exit=0) — окно достижимо"
-else
-  fail "T2 дискриминатор окна отказа КРАСЕН (exit=$WG_RC) — W2/W3 судили бы вакуум"
-  tail -20 "$WG_LOG"
-fi
+read -r WG_OUTCOME WG_N <<<"$(run_named red_m77_delivery_window "$WINDOW_GUARD" "$WG_LOG")"
+case "$WG_OUTCOME" in
+  OK)     pass "T2 дискриминатор окна отказа ЗЕЛЁН (исполнено $WG_N) — окно достижимо" ;;
+  VACUUM) fail "T2 дискриминатор окна отказа НЕ ИСПОЛНЯЛСЯ (исполнено 0) — вакуум, не успех" ;;
+  *)      fail "T2 дискриминатор окна отказа КРАСЕН (исполнено $WG_N) — W2/W3 судили бы вакуум"
+          tail -20 "$WG_LOG" ;;
+esac
 rm -f "$WG_LOG"
 
 # ─── T3 (задача 5): паритет с базовым CI-job'ом ────────────────────────────────────
@@ -202,13 +228,13 @@ rm -f "$W_LOG"
 # а verify обязан запускать и требовать этот оракул». Сторож зелен в ОБЕИХ фазах: цена
 # сегодня не платится, и её появление обязано краснить гейт немедленно, а не после merge.
 COST_LOG=$(mktemp)
-cargo test -p gateway --test red_m77_pump_cost >"$COST_LOG" 2>&1; COST_RC=$?
-if [ "$COST_RC" -eq 0 ]; then
-  pass "T8 сторож цены на границе pump ЗЕЛЁН (exit=0) — работа тика не растёт с числом батчей"
-else
-  fail "T8 сторож цены на границе pump КРАСЕН (exit=$COST_RC) — VB-I-10 ослаблен развязкой"
-  grep -m1 'VB-I-10 НАРУШЕН' "$COST_LOG" || tail -20 "$COST_LOG"
-fi
+read -r COST_OUTCOME COST_N <<<"$(run_named red_m77_pump_cost "$COST_GUARD" "$COST_LOG")"
+case "$COST_OUTCOME" in
+  OK)     pass "T8 сторож цены на границе pump ЗЕЛЁН (исполнено $COST_N) — работа тика не растёт с числом батчей" ;;
+  VACUUM) fail "T8 сторож цены НЕ ИСПОЛНЯЛСЯ (исполнено 0) — вакуум, не успех: цену никто не сторожит" ;;
+  *)      fail "T8 сторож цены КРАСЕН (исполнено $COST_N) — VB-I-10 ослаблен развязкой"
+          grep -m1 'VB-I-10 НАРУШЕН' "$COST_LOG" || tail -20 "$COST_LOG" ;;
+esac
 rm -f "$COST_LOG"
 
 echo "---"
