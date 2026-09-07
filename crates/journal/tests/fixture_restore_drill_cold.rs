@@ -82,12 +82,71 @@ fn cfg() -> WriterConfig {
     }
 }
 
-fn ev(i: u64) -> EventKind {
+/// **ОДНОРАЗОВОЕ ЗНАЧЕНИЕ ПРОГОНА — задача 6b, `Р-4` обязанность (а).**
+///
+/// Зачем. `digest` (ядро rev 5) доказывает чтение только если его НЕЛЬЗЯ НАЗВАТЬ ЗАРАНЕЕ.
+/// Все прежние фикстуры были детерминированы линейным `i`, то есть повторный прогон давал
+/// ТЕ ЖЕ события и ТОТ ЖЕ отпечаток — обёртка, однажды увидевшая правильное значение,
+/// подставила бы его константой, и «мир ¬P не несёт признака» оказалось бы неверным.
+///
+/// Конструкция скопирована с `scripts/reserve_artifact_id.sh` — там структурно ТА ЖЕ
+/// задача («значение обязано быть невоспроизводимо снаружи до факта»), и она уже прошла
+/// круги гейта:
+///   · источник — `/proc/sys/kernel/random/uuid`, иначе `/dev/urandom`;
+///   · **отката на слабый источник НЕТ НАМЕРЕННО** — лучше отказ, чем предсказуемый нонс;
+///   · **самопроверка на ВЫРОЖДЕНИЕ**: два независимых чтения обязаны различаться.
+///
+/// Паника здесь законна и обязательна: фикстура без одноразовости молча превратила бы
+/// оракул отпечатка в проверку константы, то есть в плацебо.
+fn drill_nonce() -> u64 {
+    fn draw() -> Option<u64> {
+        if let Ok(uuid) = fs::read_to_string("/proc/sys/kernel/random/uuid") {
+            let hex: String = uuid
+                .chars()
+                .filter(|c| c.is_ascii_hexdigit())
+                .take(16)
+                .collect();
+            if hex.len() == 16 {
+                if let Ok(v) = u64::from_str_radix(&hex, 16) {
+                    return Some(v);
+                }
+            }
+        }
+        let bytes = fs::read("/dev/urandom").ok()?;
+        let head = bytes.get(..8)?;
+        Some(u64::from_le_bytes(head.try_into().ok()?))
+    }
+    let a = draw().expect(
+        "источника одноразового значения нет (ни /proc/sys/kernel/random/uuid, ни /dev/urandom); \
+         отката на слабый источник нет НАМЕРЕННО: предсказуемый нонс делает оракул отпечатка плацебо",
+    );
+    let b = draw().expect("второе чтение источника одноразового значения не удалось");
+    assert_ne!(
+        a, b,
+        "источник одноразового значения ВЫРОЖДЕН: два независимых чтения дали одно значение. \
+         Фикстура с предсказуемым нонсом превращает digest в константу, и обёртка подставит \
+         его, не читая копию (Р-4 обязанность (а))"
+    );
+    a
+}
+
+/// Фиксированное значение для тестов, которым одноразовость НЕ НУЖНА: они судят
+/// читаемость формы, а не различающую силу отпечатка. Разделение явное, чтобы случайность
+/// не просочилась туда, где она сделала бы тест недетерминированным без пользы.
+const STATIC_NONCE: u64 = 0;
+
+fn ev(i: u64, nonce: u64) -> EventKind {
+    // Нонс входит в `price` — поле, участвующее в формуле `digest`
+    // (`sha256(Σ "<seq>:<ts_exch_ms>:<price_e8>\n")`, спека §«Поле digest»). Через `ts_exch_ms`
+    // его вносить нельзя: время участвует в раскладке по сегментам и окнам, и сдвиг менял бы
+    // ФОРМУ фикстуры, а не только её содержимое. Диапазон сужен остатком, чтобы цена
+    // оставалась правдоподобной величиной, а не переполняла разумные границы.
+    let spread = (nonce % 1_000_000) as i64 * 1_000;
     EventKind::md(
         Venue::Binance,
         "BTCUSDT",
         MdPayload::Trade {
-            price: 6_400_000_000_000 + i as i64,
+            price: 6_400_000_000_000 + spread + i as i64,
             size: 100 + (i as i64 % 7),
             side: if i.is_multiple_of(2) {
                 Side::Buy
@@ -107,13 +166,13 @@ fn empty_manifest_bytes() -> Vec<u8> {
 
 /// Построить STAGING-журнал прод-раскладки и вернуть путь.
 /// Результат: несколько закрытых сегментов, часть сжата в `.jrnl.zst`, активный — сырой.
-fn build_staging(root: &Path) -> PathBuf {
+fn build_staging(root: &Path, nonce: u64) -> PathBuf {
     let stage = root.join("stage");
     fs::create_dir_all(&stage).expect("mkdir stage");
 
     let mut j = Journal::open_with(&stage, cfg()).expect("open_with");
     for i in 0..EVENTS {
-        j.append(ev(i)).expect("append");
+        j.append(ev(i, nonce)).expect("append");
     }
     j.flush().expect("flush");
     drop(j);
@@ -246,6 +305,56 @@ fn corrupt_one_compacted(cold: &Path) -> PathBuf {
 }
 
 /// Сколько событий отдаёт НАСТОЯЩИЙ читатель на каталоге. `Err` — отдельный исход.
+/// **НЕЗАВИСИМЫЙ ЭТАЛОН ОТПЕЧАТКА — опора сценариев `D`/`R` пробы.**
+///
+/// Формула объявлена спекой дословно и обязана считаться ДВУМЯ сторонами одинаково:
+/// `sha256( Σ по событиям в порядке чтения: "<seq>:<ts_exch_ms>:<price_e8>\n" )`.
+///
+/// **Почему здесь, а не через бинарь `journal-drill-read`.** Эталон обязан приходить из
+/// НЕЗАВИСИМОГО пути (`testing.md`: «эталон берётся из независимого пути: полный реплей,
+/// вторая реализация, записанная фикстура»). Бинарь — то, что зовёт судимая обёртка;
+/// брать эталон оттуда значило бы сверять источник с самим собой. Здесь свёртка считается
+/// прямо библиотекой `journal`, и у пробы появляется вторая, не зависящая от бинаря опора.
+///
+/// Практическое следствие, ради которого это и сделано: сценарии `D`/`R` (самопроверка
+/// различающей силы) исполняются УЖЕ СЕЙЧАС, до задачи 2b. Без независимого эталона они
+/// печатали бы `PASS` вакуумно — «поймали подделку» было бы неотличимо от «красно всё,
+/// потому что читателя нет». Такой зелёный и есть тот класс, за который набор отвергали
+/// четыре круга подряд.
+fn digest_of_dir(dir: &Path) -> std::io::Result<(usize, String)> {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    let mut n = 0usize;
+    for e in journal::stream(dir, EpochFilter::All)? {
+        let ev = e?;
+        if let EventKind::Md(md) = &ev.kind {
+            if let MdPayload::Trade {
+                price, ts_exch_ms, ..
+            } = &md.payload
+            {
+                h.update(format!("{}:{}:{}\n", ev.seq, ts_exch_ms, price).as_bytes());
+                n += 1;
+            }
+        }
+    }
+    Ok((n, format!("{:x}", h.finalize())))
+}
+
+/// Точка входа для shell-пробы: посчитать отпечаток каталога и напечатать его.
+/// Каталог приходит в `DRILL_DIGEST_DIR`; без переменной тест не утверждает ничего —
+/// он гоняется в общем `cargo test --all`, где считать нечего.
+#[test]
+fn digest_for_shell_probe() {
+    let Ok(dir) = std::env::var("DRILL_DIGEST_DIR") else {
+        eprintln!("digest_for_shell_probe: DRILL_DIGEST_DIR не задан — расчёт не запрошен");
+        return;
+    };
+    match digest_of_dir(Path::new(&dir)) {
+        Ok((n, d)) => println!("DRILL_DIGEST events={n} digest={d}"),
+        Err(e) => println!("DRILL_DIGEST_ERROR {e}"),
+    }
+}
+
 fn read_events(dir: &Path) -> std::io::Result<usize> {
     let mut n = 0usize;
     for e in journal::stream(dir, EpochFilter::All)? {
@@ -263,7 +372,7 @@ fn read_events(dir: &Path) -> std::io::Result<usize> {
 #[test]
 fn prod_form_cold_copy_is_read_by_real_reader() {
     let root = tempfile::tempdir().expect("tempdir");
-    let stage = build_staging(root.path());
+    let stage = build_staging(root.path(), STATIC_NONCE);
     let cold = root.path().join("cold");
     build_cold(&stage, &cold);
 
@@ -320,7 +429,7 @@ fn prod_form_cold_copy_is_read_by_real_reader() {
 #[test]
 fn corrupted_cold_copy_is_rejected_by_real_reader() {
     let root = tempfile::tempdir().expect("tempdir");
-    let stage = build_staging(root.path());
+    let stage = build_staging(root.path(), STATIC_NONCE);
     let cold = root.path().join("cold");
     build_cold(&stage, &cold);
 
@@ -386,7 +495,7 @@ fn undeclared_legacy_is_a_context_error_not_a_corruption_error() {
                 seq,
                 ts_mono_ns: seq,
                 ts_wall_ms: 1_752_000_000_000 + seq as i64,
-                kind: ev(seq),
+                kind: ev(seq, STATIC_NONCE),
             };
             let payload = postcard::to_stdvec(&e).expect("ser");
             w.write_all(&(payload.len() as u32).to_le_bytes())
@@ -446,6 +555,11 @@ fn materialize_for_shell_probe() {
         return;
     };
     let variant = std::env::var("DRILL_FIXTURE_VARIANT").unwrap_or_else(|_| "healthy".to_string());
+    // Одноразовость ПРОГОНА (задача 6b). Проба обязана знать значение, чтобы предъявить
+    // `Р-4` (а): нонс не встречается ни в одном артефакте, доступном обёртке ДО чтения.
+    // Он печатается в stdout строителя, а НЕ кладётся в каталог фикстуры — иначе обёртка
+    // прочла бы его оттуда, и признак перестал бы различать миры.
+    let nonce = drill_nonce();
     let out = PathBuf::from(out);
     fs::create_dir_all(&out).expect("mkdir out");
 
@@ -458,7 +572,7 @@ fn materialize_for_shell_probe() {
                 .expect("манифест");
         }
         "healthy" | "corrupt" => {
-            let stage = build_staging(&out);
+            let stage = build_staging(&out, nonce);
             build_cold(&stage, &cold);
             if variant == "corrupt" {
                 corrupt_one_compacted(&cold);
@@ -472,7 +586,7 @@ fn materialize_for_shell_probe() {
     fs::create_dir_all(out.join("restore")).expect("mkdir restore");
     fs::create_dir_all(out.join("state")).expect("mkdir state");
     println!(
-        "DRILL_FIXTURE_READY variant={variant} cold={}",
+        "DRILL_FIXTURE_READY variant={variant} nonce={nonce} cold={}",
         cold.display()
     );
 }
