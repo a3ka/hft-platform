@@ -44,6 +44,25 @@ jobs:
           HFT_DELIVERY_DEEP: "1"
         run: bash scripts/verify_delivery_M-08.sh
 
+  secret-material:
+    name: Secret material (ключи не живут в репозитории)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Барьер судит СОСТОЯНИЕ ДЕРЕВА на HEAD, а не диапазон коммитов: секрет, внесённый
+      # месяц назад и с тех пор не тронутый, в диапазон push'а не попадает вовсе. Поэтому
+      # `fetch-depth` по умолчанию достаточен — история барьеру не нужна.
+      - name: Ключевой материал не живёт в отслеживаемых файлах
+        run: bash scripts/check_secret_material.sh
+
+      # Сам барьер обязан быть проверен ТОЙ ЖЕ проводкой, какой его зовёт CI. Проба —
+      # анти-плацебо в ОБЕ стороны: краснеет против ключа каждого класса и молчит на
+      # честном корпусе. Она уже окупилась: предъявила, что шаблон PEM начинался с
+      # дефисов и `git grep` разбирал его как флаги — самый однозначный класс ключа
+      # проходил насквозь при зелёном барьере.
+      - name: Проба барьера (анти-плацебо в обе стороны)
+        run: bash scripts/tests/red_secret_material.sh
+
   protected-artifacts:
     name: Protected artifacts (gate trail)
     runs-on: ubuntu-latest
@@ -554,7 +573,7 @@ jobs:
   status-check:
     name: All checks passed
     runs-on: ubuntu-latest
-    needs: [build-test, security, delivery, protected-artifacts, contracts, docs-freeze, artifact-ids, reserve-ids, design-claims, context-budgets, gate-meta, deploy-catchup, review-fa, resource-oracles, rollout-composition]
+    needs: [build-test, security, delivery, protected-artifacts, secret-material, contracts, docs-freeze, artifact-ids, reserve-ids, design-claims, context-budgets, gate-meta, deploy-catchup, review-fa, resource-oracles, rollout-composition]
     if: always()
     steps:
       - run: |
