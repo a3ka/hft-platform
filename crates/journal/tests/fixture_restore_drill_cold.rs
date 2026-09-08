@@ -355,6 +355,38 @@ fn digest_for_shell_probe() {
     }
 }
 
+/// **ЭТАЛОННЫЙ ЧИТАТЕЛЬ для пробы — закрытие корня вместе с эталонной обёрткой.**
+///
+/// Прод-читатель (`crates/journal/src/bin/journal-drill-read.rs`, задача 2b) — зона
+/// engine-dev, и его ещё нет. Пока его нет, сценарии `H`/`C`/`F`/`A`/`T` пробы не могут
+/// исполниться ВООБЩЕ: обёртке некого звать. Именно так две трети набора и оставались
+/// непроверенным кодом — корень серии из семи отказов (`C-216`, решение founder'а 08.09).
+///
+/// Здесь — ТЕСТОВАЯ реализация объявленного контракта читателя: та же формула отпечатка и
+/// те же классы исхода, что обязан дать прод-бинарь. Она НЕ заменяет его и в прод не идёт;
+/// она делает набор исполнимым СЕЙЧАС, чтобы позитивный контроль был настоящим.
+///
+/// Коды исхода — контракт спеки: `0` прочитано · `4` ПОРЧА · `5` ПУСТОТА/ниже минимума.
+/// Различение 4 и 5 существенно: без него сценарии `C` и `F` судят один и тот же исход.
+#[test]
+fn reference_reader_for_shell_probe() {
+    let Ok(dir) = std::env::var("DRILL_READER_DIR") else {
+        eprintln!("reference_reader_for_shell_probe: DRILL_READER_DIR не задан");
+        return;
+    };
+    let min: usize = std::env::var("DRILL_READER_MIN_EVENTS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
+    match digest_of_dir(Path::new(&dir)) {
+        Err(e) => println!("DRILL_READER rc=4 events_read=0 digest= reason=corrupt:{e}"),
+        Ok((n, _)) if n < min => {
+            println!("DRILL_READER rc=5 events_read={n} digest= reason=empty-below-min")
+        }
+        Ok((n, d)) => println!("DRILL_READER rc=0 events_read={n} digest={d} reason="),
+    }
+}
+
 fn read_events(dir: &Path) -> std::io::Result<usize> {
     let mut n = 0usize;
     for e in journal::stream(dir, EpochFilter::All)? {
