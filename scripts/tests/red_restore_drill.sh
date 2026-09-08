@@ -317,14 +317,43 @@ digest_matches_state() { # $1=песочница $2=отпечаток ката�
   [ -n "$2" ] && [ "$(state_field "$1" digest)" = "$2" ]
 }
 
-delivery_complete() { # $1=песочница → 0, если заявленное совпало с доставленным и их ≥3
-  local ck idx
+# ═══ ТОЖДЕСТВО ЧЛЕНОВ ВЫБОРКИ — ЗАКРЫТИЕ `C-217` B-2 ═══
+#
+# ЧТО ПРОПУСКАЛА ПРЕЖНЯЯ `delivery_complete`. Она проверяла ЧИСЛО («доставлено == заявлено,
+# и их ≥3») и не проверяла, КАКИЕ. Обёртка, доставившая три НАСТОЯЩИХ, читаемых без
+# источника сегмента `00/01/02` вместо предписанных `00/03/07`, проходила ВЕСЬ набор:
+# отпечаток подлинный, независимость от источника держится, счёт сходится.
+#
+# ПОЧЕМУ ЭТО НЕ ПЕДАНТИЗМ. Смысл правила «первый / floor(N/2) / последний» — проверить копию
+# ПО ВСЕЙ ЕЁ ДЛИНЕ. Три подряд идущих свежих сегмента проверяют узкую полоску и объявляют,
+# что копия читается целиком, — то есть drill отвечает на другой вопрос, чем задан.
+#
+# КАК ЭТО ПРОВЕРЯЕТСЯ, НЕ РЕДЕКЛАРИРУЯ АЛГОРИТМ. Ожидаемый состав — ЛИТЕРАЛ, выведенный из
+# спеки ОДИН РАЗ для ЭТОЙ фикстуры, а не пересчёт правила отбора рядом с судимой обёрткой.
+# Редекларация судимой логики уже стоила круга на `M-45` (`C-202` B-2): ослабь реализацию —
+# и проба, её повторяющая, ослабнет вместе с ней. Литерал так не умеет.
+# Литерал держится SETUP-GUARD'ом на ФОРМУ фикстуры (сценарий `S`): восемь индексов
+# `00000000`..`00000007`. Изменится фикстура — сценарий `S` умрёт с «setup не состоялся», а
+# не соврёт зелёным.
+EXPECTED_MEMBERS="00000000 00000003 00000007"
+
+delivered_members() { # $1=песочница → доставленные ИНДЕКСЫ одной строкой
+  ls "$1/restore" 2>/dev/null | sed -n 's/^segment-\([0-9]\{8\}\)\.jrnl\(\.zst\)\?$/\1/p' \
+    | sort -u | tr '\n' ' ' | sed 's/ *$//'
+}
+
+delivery_matches_selection() { # $1=песочница → 0, если доставлен РОВНО объявленный состав
+  local ck got n
   ck="$(state_field "$1" checked)"
-  # Проба НЕ повторяет правило отбора «первый/средний/последний» — редекларация судимой
-  # логики уже стоила круга на `M-45` (`C-202` B-2). Сверяется ЗАЯВЛЕННОЕ с ДОСТАВЛЕННЫМ;
-  # контрактное число 3 берётся из спеки, а не из слов обёртки.
-  idx="$(ls "$1/restore" 2>/dev/null | sed -n 's/^segment-\([0-9]\{8\}\)\.jrnl\(\.zst\)\?$/\1/p' | sort -u | grep -c .)"
-  [ "${ck:-0}" -ge 3 ] && [ "${idx:-0}" -eq "${ck:-0}" ]
+  got="$(delivered_members "$1")"
+  n="$(printf '%s\n' ${got} | grep -c .)"
+  # ДВЕ обязанности, и каждая со своим членом в наборе:
+  #  (1) ТОЖДЕСТВО состава объявленной выборке — сценарии `A7` (недодал) и `A8` (не те);
+  #  (2) согласие заявленного `checked` с доставленным — сценарий `A9` (соврал в отчёте).
+  # Третьей обязанности «не меньше трёх» здесь НЕТ намеренно: при тождестве трёхчленной
+  # выборке она истинна всегда, то есть была бы ИНЕРТНА. Замер её инертность и показал —
+  # мутация «снять согласие и минимум» не роняла ни одного сценария (`Р-3`).
+  [ "${got}" = "${EXPECTED_MEMBERS}" ] && [ "${ck:-0}" -eq "${n:-0}" ]
 }
 
 inv_delivery() { # $1=песочница $2=отпечаток ПРИ ЖИВОМ источнике → 0, если читается БЕЗ него
@@ -349,7 +378,7 @@ h_verdict() { # $1=песочница → 0, если состояние ДОК�
   d_live="$(truth_digest "$1/restore")"
   [ "${ok}" = "1" ] && [ "${ev:-0}" -gt 0 ] \
     && digest_matches_state "$1" "${d_live}" \
-    && delivery_complete "$1" \
+    && delivery_matches_selection "$1" \
     && inv_delivery "$1" "${d_live}"
 }
 
@@ -475,10 +504,17 @@ OUT="\$(cd '${ROOT}' && DRILL_READER_DIR="\${DIR}" DRILL_READER_MIN_EVENTS="\${M
   reference_reader_for_shell_probe --nocapture 2>/dev/null)"
 L="\$(printf '%s' "\${OUT}" | sed -n 's/^DRILL_READER //p' | head -1)"
 [ -z "\${L}" ] && { echo '{"error":"reference reader failed"}'; exit 3; }
+fld() { printf '%s' "\${L}" | sed -n "s/.*[ ]\$1=\\([^ ]*\\).*/\\1/p" | head -1; }
 RC="\$(printf '%s' "\${L}" | sed -n 's/.*rc=\\([0-9]*\\).*/\\1/p')"
-EV="\$(printf '%s' "\${L}" | sed -n 's/.*events_read=\\([0-9]*\\).*/\\1/p')"
-DG="\$(printf '%s' "\${L}" | sed -n 's/.*digest=\\([0-9a-f]*\\).*/\\1/p')"
-printf '{"events_read":%s,"digest":"%s"}\\n' "\${EV:-0}" "\${DG}"
+SR="\$(fld segments_read)"; EV="\$(fld events_read)"
+SF="\$(fld seq_first)";     SL="\$(fld seq_last)"
+IC="\$(fld intra_segment_continuous)"; DG="\$(fld digest)"
+# ПОЛНЫЙ объявленный протокол успеха (C-217 N-1): шесть полей, а не два. Обратные кавычки
+# здесь ЗАПРЕЩЕНЫ: этот текст живёт внутри НЕэкранированного heredoc и подставляется как
+# команда — прежняя редакция печатала «C-217: command not found» посреди прогона. Прежде эталон
+# отдавал events_read и digest, то есть судил удобное себе подмножество своего же контракта.
+printf '{"segments_read":%s,"events_read":%s,"seq_first":%s,"seq_last":%s,"intra_segment_continuous":%s,"digest":"%s"}\\n' \\
+  "\${SR:-0}" "\${EV:-0}" "\${SF:-0}" "\${SL:-0}" "\${IC:-false}" "\${DG}"
 exit "\${RC:-3}"
 REFR
   chmod +x "${r}"
@@ -501,8 +537,18 @@ echo "── RESTORE-DRILL: копия ЧИТАЕТСЯ прод-читател�
 make_fixture BOX_H healthy
 N_IDX="$(seg_indices "${BOX_H}/cold")"
 N_ZST="$(ls "${BOX_H}/cold" 2>/dev/null | grep -c '\.jrnl\.zst$')"
+S_ALL="$(ls "${BOX_H}/cold" 2>/dev/null | sed -n 's/^segment-\([0-9]\{8\}\)\.jrnl\(\.zst\)\?$/\1/p' | sort -u | tr '\n' ' ' | sed 's/ *$//')"
+S_EXPECT_ALL="00000000 00000001 00000002 00000003 00000004 00000005 00000006 00000007"
+# ЛИТЕРАЛ ОЖИДАЕМОЙ ВЫБОРКИ ГОДЕН ТОЛЬКО ДЛЯ ЭТОЙ ФОРМЫ ФИКСТУРЫ. Меняется фикстура —
+# сценарий умирает с «setup не состоялся», а не врёт зелёным (`testing.md` св. 3).
+if [ "${S_ALL}" != "${S_EXPECT_ALL}" ]; then
+  die "S форма фикстуры ИЗМЕНИЛАСЬ: индексы «${S_ALL}» вместо «${S_EXPECT_ALL}». Литерал
+EXPECTED_MEMBERS выведен из спеки для ВОСЬМИ индексов 00000000..00000007; на другой форме он
+судил бы не тот состав. Пересчитать первый/floor(N/2)/последний и обновить литерал."
+fi
 if [ "${N_IDX}" -ge 3 ] && [ "${N_ZST}" -ge 1 ]; then
-  pass "S фикстура прод-формы: ${N_IDX} индексов сегментов, из них сжатых файлов ${N_ZST}"
+  pass "S фикстура прод-формы: ${N_IDX} индексов сегментов, из них сжатых файлов ${N_ZST}; \
+объявленная выборка — ${EXPECTED_MEMBERS}"
 else
   die "фикстура не прод-формы: индексов ${N_IDX} (нужно ≥3), сжатых ${N_ZST} (нужно ≥1). \
 Правило выборки берёт ТРИ сегмента, а самый старый на проде — сжатый"
@@ -763,12 +809,20 @@ FAKE_D="${BOX_D}/fake-drill.sh"
 # признаку, и сценарий был бы зелен по слабой причине.
 cat > "${FAKE_D}" <<'FAKE'
 #!/usr/bin/env bash
-mkdir -p "${JOURNAL_DRILL_RESTORE}" "$(dirname "${JOURNAL_DRILL_STATE}")"
-cp "${JOURNAL_DRILL_COLD}"/* "${JOURNAL_DRILL_RESTORE}/" 2>/dev/null
-# `checked` объявляется РЕАЛЬНЫМ числом доставленных индексов, а не «3». Иначе атаку ловит
-# страж ПОЛНОТЫ раньше стража величины, `D` оказывается переопределён, а страж отпечатка —
-# инертен. Именно это и показала мутация редакции `ab803d2`.
-CK="$(ls "${JOURNAL_DRILL_RESTORE}" 2>/dev/null | sed -n 's/^segment-\([0-9]\{8\}\)\.jrnl\(\.zst\)\?$/\1/p' | sort -u | grep -c .)"
+rm -rf "${JOURNAL_DRILL_RESTORE}"; mkdir -p "${JOURNAL_DRILL_RESTORE}" "$(dirname "${JOURNAL_DRILL_STATE}")"
+# ОТБОР по объявленному правилу: первый / floor(N/2) / последний ИНДЕКС. Жульничество этой
+# обёртки лежит НЕ здесь — доставку она делает честную, чтобы сценарий судил РОВНО СВОЙ класс.
+ALL="$(ls "${JOURNAL_DRILL_COLD}" 2>/dev/null | sed -n 's/^segment-\([0-9]\{8\}\)\.jrnl\(\.zst\)\?$/\1/p' | sort -u)"
+N="$(printf '%s\n' "${ALL}" | grep -c .)"; MID=$(( (N + 1) / 2 ))
+IDX="$(printf '%s\n' "${ALL}" | sed -n "1p;${MID}p;${N}p" | sort -u)"
+CK=0
+for i in ${IDX}; do
+  for f in "${JOURNAL_DRILL_COLD}/segment-${i}.jrnl" "${JOURNAL_DRILL_COLD}/segment-${i}.jrnl.zst"; do
+    [ -f "$f" ] && cp -- "$f" "${JOURNAL_DRILL_RESTORE}/" 2>/dev/null
+  done
+  CK=$((CK + 1))
+done
+for j in "${JOURNAL_DRILL_COLD}"/*.json; do [ -f "$j" ] && cp -- "$j" "${JOURNAL_DRILL_RESTORE}/" 2>/dev/null; done
 printf '{"ok":1,"ts_wall_ms":0,"checked":%s,"events_read":41213,"digest":"%s","reason":""}\n' \
   "${CK}" "$(printf 'выдуманный-отпечаток-без-чтения' | sha256sum | cut -c1-64)" > "${JOURNAL_DRILL_STATE}"
 exit 0
@@ -836,16 +890,28 @@ FAKE_A1="${BOX_A1}/fake-drill.sh"
 cat > "${FAKE_A1}" <<'FAKE'
 #!/usr/bin/env bash
 # Ничего не переносит: создаёт настоящий каталог со ССЫЛКАМИ на файлы холодной копии.
-rm -rf "${JOURNAL_DRILL_RESTORE}"; mkdir -p "${JOURNAL_DRILL_RESTORE}"
-for f in "${JOURNAL_DRILL_COLD}"/*; do ln -s "$f" "${JOURNAL_DRILL_RESTORE}/$(basename "$f")"; done
-mkdir -p "$(dirname "${JOURNAL_DRILL_STATE}")"
-CK="$(ls "${JOURNAL_DRILL_RESTORE}" 2>/dev/null | sed -n 's/^segment-\([0-9]\{8\}\)\.jrnl\(\.zst\)\?$/\1/p' | sort -u | grep -c .)"
-printf '{"ok":1,"ts_wall_ms":0,"checked":%s,"events_read":41213,"digest":"__D__","reason":""}\n' \
-  "${CK}" > "${JOURNAL_DRILL_STATE}"
+rm -rf "${JOURNAL_DRILL_RESTORE}"; mkdir -p "${JOURNAL_DRILL_RESTORE}" "$(dirname "${JOURNAL_DRILL_STATE}")"
+# ОТБОР по объявленному правилу: первый / floor(N/2) / последний ИНДЕКС. Жульничество этой
+# обёртки лежит НЕ здесь — доставку она делает честную, чтобы сценарий судил РОВНО СВОЙ класс.
+ALL="$(ls "${JOURNAL_DRILL_COLD}" 2>/dev/null | sed -n 's/^segment-\([0-9]\{8\}\)\.jrnl\(\.zst\)\?$/\1/p' | sort -u)"
+N="$(printf '%s\n' "${ALL}" | grep -c .)"; MID=$(( (N + 1) / 2 ))
+IDX="$(printf '%s\n' "${ALL}" | sed -n "1p;${MID}p;${N}p" | sort -u)"
+CK=0
+for i in ${IDX}; do
+  for f in "${JOURNAL_DRILL_COLD}/segment-${i}.jrnl" "${JOURNAL_DRILL_COLD}/segment-${i}.jrnl.zst"; do
+    [ -f "$f" ] && ln -s "$f" "${JOURNAL_DRILL_RESTORE}/$(basename "$f")" 2>/dev/null
+  done
+  CK=$((CK + 1))
+done
+for j in "${JOURNAL_DRILL_COLD}"/*.json; do [ -f "$j" ] && cp -- "$j" "${JOURNAL_DRILL_RESTORE}/" 2>/dev/null; done
+OUT="$(${JOURNAL_DRILL_READER} --dir "${JOURNAL_DRILL_RESTORE}" --min-events 1 2>&1)"
+EV="$(printf '%s' "${OUT}" | sed -n 's/.*"events_read":\([0-9]*\).*/\1/p' | head -1)"
+DG="$(printf '%s' "${OUT}" | sed -n 's/.*"digest"[[:space:]]*:[[:space:]]*"\([0-9a-f]\{64\}\)".*/\1/p' | head -1)"
+printf '{"ok":1,"ts_wall_ms":0,"checked":%s,"events_read":%s,"digest":"%s","reason":""}\n' \
+  "${CK}" "${EV:-0}" "${DG}" > "${JOURNAL_DRILL_STATE}"
 exit 0
 FAKE
-A1_TRUE="$(truth_digest "${BOX_A1}/cold")"
-sed -i "s/__D__/${A1_TRUE}/" "${FAKE_A1}"; chmod +x "${FAKE_A1}"
+chmod +x "${FAKE_A1}"
 run_drill "${BOX_A1}" "${FAKE_A1}" || true
 # SETUP-GUARD НА ФОРМУ АТАКИ (`A-032` §2.2 п.5): фикстура уже создаёт пустой `restore/`, и
 # первый прогон стенда арбитра положил ссылки ВНУТРЬ него, отчего судился не тот сценарий.
@@ -853,9 +919,12 @@ A1_LINKS="$(find "${BOX_A1}/restore" -maxdepth 1 -type l 2>/dev/null | wc -l)"
 A1_LIVE="$(truth_digest "${BOX_A1}/restore")"
 if [ "${A1_LINKS}" -lt 1 ]; then
   die "A1 форма атаки НЕ ПОСТРОЕНА: ссылок в каталоге ${A1_LINKS}. Сценарий судил бы не тот предмет"
-elif [ "${A1_LIVE}" != "${A1_TRUE}" ]; then
-  die "A1 при ЖИВОМ источнике каталог не читается в тот же отпечаток — атака не воспроизведена, \
-и её отвержение ниже ничего не доказывало бы"
+elif [ "$(delivered_members "${BOX_A1}")" != "${EXPECTED_MEMBERS}" ]; then
+  die "A1 форма атаки НЕ ПОСТРОЕНА: состав «$(delivered_members "${BOX_A1}")» ≠ объявленной \
+выборке «${EXPECTED_MEMBERS}» — атаку ловил бы страж СОСТАВА, а не INV-DELIVERY"
+elif [ -z "${A1_LIVE}" ] || [ "${A1_LIVE}" != "$(state_field "${BOX_A1}" digest)" ]; then
+  die "A1 при ЖИВОМ источнике каталог не читается в объявленный отпечаток — атака не \
+воспроизведена, и её отвержение ниже ничего не доказывало бы"
 elif h_verdict "${BOX_A1}"; then
   fail "A1 обёртка, положившая ССЫЛКИ вместо байтов, признана честной. Доставки не было:
 без холодной копии каталог пуст. Это находка C-215, и прежняя проверка форм её принимала"
@@ -923,6 +992,106 @@ else
 при этом ПОДЛИННЫЙ (${A7_LIVE:0:12}…) — сработала полнота, а не величина"
 fi
 
+# ── A8 — ТРИ НАСТОЯЩИХ, НО НЕ ТЕ ЧЛЕНА (`C-217` B-2) ──────────────────────────────────
+# Блокирующая находка круга 4. Обёртка доставляет ТРИ сегмента, которые честно существуют,
+# честно читаются и честно читаются БЕЗ источника; отпечаток ПОДЛИННЫЙ; счёт сходится.
+# Не сходится ОДНО: это не та тройка. Вместо первого/среднего/последнего взяты три подряд
+# идущих — то есть drill проверил узкую полоску копии и объявил, что копия читается целиком.
+# Прежний страж считал ЧИСЛО и пропускал это. Сценарий обязан отвергнуть атаку ПО ТОЖДЕСТВУ
+# ЧЛЕНОВ, и три setup-guard'а ниже требуют, чтобы прочие причины отказа НЕ сработали.
+make_fixture BOX_A8 healthy
+FAKE_A8="${BOX_A8}/fake-drill.sh"
+cat > "${FAKE_A8}" <<'FAKE'
+#!/usr/bin/env bash
+# Честная доставка НЕ ТЕХ членов: первые три индекса подряд вместо первого/среднего/последнего.
+rm -rf "${JOURNAL_DRILL_RESTORE}"; mkdir -p "${JOURNAL_DRILL_RESTORE}" "$(dirname "${JOURNAL_DRILL_STATE}")"
+IDX="$(ls "${JOURNAL_DRILL_COLD}" 2>/dev/null | sed -n 's/^segment-\([0-9]\{8\}\)\.jrnl\(\.zst\)\?$/\1/p' | sort -u | head -3)"
+CK=0
+for i in ${IDX}; do
+  for f in "${JOURNAL_DRILL_COLD}/segment-${i}.jrnl" "${JOURNAL_DRILL_COLD}/segment-${i}.jrnl.zst"; do
+    [ -f "$f" ] && cp -- "$f" "${JOURNAL_DRILL_RESTORE}/" 2>/dev/null
+  done
+  CK=$((CK + 1))
+done
+for j in "${JOURNAL_DRILL_COLD}"/*.json; do [ -f "$j" ] && cp -- "$j" "${JOURNAL_DRILL_RESTORE}/" 2>/dev/null; done
+# Отпечаток берётся У ЧИТАТЕЛЯ по СВОЕЙ доставке — он ПОДЛИННЫЙ, подделки величины здесь нет.
+OUT="$(${JOURNAL_DRILL_READER} --dir "${JOURNAL_DRILL_RESTORE}" --min-events 1 2>&1)"
+EV="$(printf '%s' "${OUT}" | sed -n 's/.*"events_read":\([0-9]*\).*/\1/p' | head -1)"
+DG="$(printf '%s' "${OUT}" | sed -n 's/.*"digest"[[:space:]]*:[[:space:]]*"\([0-9a-f]\{64\}\)".*/\1/p' | head -1)"
+printf '{"ok":1,"ts_wall_ms":0,"checked":%s,"events_read":%s,"digest":"%s","reason":""}\n' \
+  "${CK}" "${EV:-0}" "${DG}" > "${JOURNAL_DRILL_STATE}"
+exit 0
+FAKE
+chmod +x "${FAKE_A8}"
+run_drill "${BOX_A8}" "${FAKE_A8}" || true
+A8_GOT="$(delivered_members "${BOX_A8}")"
+A8_N="$(printf '%s\n' ${A8_GOT} | grep -c .)"
+A8_LIVE="$(truth_digest "${BOX_A8}/restore")"
+if [ "${A8_N}" -ne 3 ] || [ "${A8_GOT}" = "${EXPECTED_MEMBERS}" ]; then
+  die "A8 форма атаки НЕ ПОСТРОЕНА: доставлено «${A8_GOT}» (${A8_N} шт.). Нужны РОВНО ТРИ и \
+ИМЕННО НЕ «${EXPECTED_MEMBERS}» — иначе сценарий судил бы полноту, а не тождество членов"
+elif [ -z "${A8_LIVE}" ] || [ "${A8_LIVE}" != "$(state_field "${BOX_A8}" digest)" ]; then
+  die "A8 отпечаток состояния не равен отпечатку доставленного — атака обязана быть ПОДЛИННОЙ \
+по величине, иначе её ловит страж отпечатка, а не страж состава"
+elif ! inv_delivery "${BOX_A8}" "${A8_LIVE}"; then
+  die "A8 доставленное НЕ читается без источника — атака обязана держать INV-DELIVERY, иначе \
+её ловит страж доставки, а не страж состава"
+elif h_verdict "${BOX_A8}"; then
+  fail "A8 обёртка, доставившая ТРИ НАСТОЯЩИХ, но НЕ ТЕ сегмента («${A8_GOT}» вместо
+«${EXPECTED_MEMBERS}»), признана честной. Отпечаток подлинный, каталог читается без источника,
+счёт сходится — и всё же проверена узкая полоска копии вместо всей её длины. Это находка
+C-217 B-2: страж считал ЧИСЛО и не проверял ТОЖДЕСТВО"
+else
+  pass "A8 НЕ ТЕ члены выборки ПОЙМАНЫ: доставлено «${A8_GOT}» вместо «${EXPECTED_MEMBERS}» \
+при ПОДЛИННОМ отпечатке (${A8_LIVE:0:12}…), сошедшемся счёте и живом INV-DELIVERY — \
+сработало ТОЖДЕСТВО состава, а не число, величина или доставка"
+fi
+
+# ── A9 — ВЫБОРКА ВЕРНАЯ, ОТЧЁТ О НЕЙ ЛЖИВ ─────────────────────────────────────────────
+# Обёртка доставляет РОВНО объявленную выборку и честно её читает, но в файле состояния
+# объявляет `checked=99`. Отпечаток подлинный, состав верен, независимость от источника
+# держится — лжёт ТОЛЬКО отчёт. Это не педантизм: `checked` читает продюсер метрики
+# (задача 3), и через него ложь уезжает в наблюдаемость как «проверено 99 сегментов».
+# Сценарий заведён потому, что мутация показала: без него подпроверка согласия ИНЕРТНА.
+make_fixture BOX_A9 healthy
+FAKE_A9="${BOX_A9}/fake-drill.sh"
+cat > "${FAKE_A9}" <<'FAKE'
+#!/usr/bin/env bash
+rm -rf "${JOURNAL_DRILL_RESTORE}"; mkdir -p "${JOURNAL_DRILL_RESTORE}" "$(dirname "${JOURNAL_DRILL_STATE}")"
+ALL="$(ls "${JOURNAL_DRILL_COLD}" 2>/dev/null | sed -n 's/^segment-\([0-9]\{8\}\)\.jrnl\(\.zst\)\?$/\1/p' | sort -u)"
+N="$(printf '%s\n' "${ALL}" | grep -c .)"; MID=$(( (N + 1) / 2 ))
+IDX="$(printf '%s\n' "${ALL}" | sed -n "1p;${MID}p;${N}p" | sort -u)"
+for i in ${IDX}; do
+  for f in "${JOURNAL_DRILL_COLD}/segment-${i}.jrnl" "${JOURNAL_DRILL_COLD}/segment-${i}.jrnl.zst"; do
+    [ -f "$f" ] && cp -- "$f" "${JOURNAL_DRILL_RESTORE}/" 2>/dev/null
+  done
+done
+for j in "${JOURNAL_DRILL_COLD}"/*.json; do [ -f "$j" ] && cp -- "$j" "${JOURNAL_DRILL_RESTORE}/" 2>/dev/null; done
+OUT="$(${JOURNAL_DRILL_READER} --dir "${JOURNAL_DRILL_RESTORE}" --min-events 1 2>&1)"
+EV="$(printf '%s' "${OUT}" | sed -n 's/.*"events_read":\([0-9]*\).*/\1/p' | head -1)"
+DG="$(printf '%s' "${OUT}" | sed -n 's/.*"digest"[[:space:]]*:[[:space:]]*"\([0-9a-f]\{64\}\)".*/\1/p' | head -1)"
+# доставка честная, ЛЖИВ ТОЛЬКО ОТЧЁТ О НЕЙ
+printf '{"ok":1,"ts_wall_ms":0,"checked":99,"events_read":%s,"digest":"%s","reason":""}\n' \
+  "${EV:-0}" "${DG}" > "${JOURNAL_DRILL_STATE}"
+exit 0
+FAKE
+chmod +x "${FAKE_A9}"
+run_drill "${BOX_A9}" "${FAKE_A9}" || true
+A9_GOT="$(delivered_members "${BOX_A9}")"
+A9_LIVE="$(truth_digest "${BOX_A9}/restore")"
+if [ "${A9_GOT}" != "${EXPECTED_MEMBERS}" ]; then
+  die "A9 форма атаки НЕ ПОСТРОЕНА: доставлено «${A9_GOT}» ≠ «${EXPECTED_MEMBERS}». Состав \
+обязан быть ВЕРНЫМ, иначе сценарий судит тождество, а не согласие отчёта"
+elif [ -z "${A9_LIVE}" ] || [ "${A9_LIVE}" != "$(state_field "${BOX_A9}" digest)" ]; then
+  die "A9 отпечаток состояния не равен отпечатку доставленного — лгать обязан ТОЛЬКО `checked`"
+elif h_verdict "${BOX_A9}"; then
+  fail "A9 обёртка, доставившая верную выборку, но объявившая checked=99, признана честной.
+Ложь уезжает в метрику как «проверено 99 сегментов» — наблюдаемость сообщает не то, что было"
+else
+  pass "A9 ЛОЖЬ В ОТЧЁТЕ ПОЙМАНА: состав верен («${A9_GOT}»), отпечаток подлинный, но заявлено \
+checked=99 при $(printf '%s\n' ${A9_GOT} | grep -c .) доставленных — сработало согласие отчёта"
+fi
+
 # ── R — ОТПЕЧАТОК ПРОШЛОГО ПРОГОНА ─────────────────────────────────────────────────────
 # Ловушка, названная разведкой задачи 6b: обёртка, однажды увидевшая правильное значение,
 # подставит его константой. Здесь берётся ПОДЛИННЫЙ отпечаток ДРУГОЙ фикстуры (другой нонс)
@@ -934,16 +1103,28 @@ if [ -z "${STALE_DIGEST}" ] || [ "${STALE_DIGEST}" = "$(truth_digest "${BOX_R}/c
 сценарий R судил бы не тот предмет. Проверить нонс строителя (задача 6b)"
 fi
 FAKE_R="${BOX_R}/fake-drill.sh"
-cat > "${FAKE_R}" <<FAKE
+cat > "${FAKE_R}" <<'FAKE'
 #!/usr/bin/env bash
-# Восстанавливает ЧЕСТНО, но отпечаток берёт из ПРОШЛОГО прогона.
-mkdir -p "\${JOURNAL_DRILL_RESTORE}" "\$(dirname "\${JOURNAL_DRILL_STATE}")"
-cp "\${JOURNAL_DRILL_COLD}"/* "\${JOURNAL_DRILL_RESTORE}/" 2>/dev/null
-CK="\$(ls "\${JOURNAL_DRILL_RESTORE}" 2>/dev/null | sed -n 's/^segment-\\([0-9]\\{8\\}\\)\\.jrnl\\(\\.zst\\)\\?\$/\\1/p' | sort -u | grep -c .)"
-printf '{"ok":1,"ts_wall_ms":0,"checked":%s,"events_read":41213,"digest":"${STALE_DIGEST}","reason":""}\n' \
-  "\${CK}" > "\${JOURNAL_DRILL_STATE}"
+# Восстанавливает ЧЕСТНО и РОВНО объявленной выборкой, но отпечаток берёт из ПРОШЛОГО
+# прогона. Честность доставки здесь обязательна: иначе атаку поймал бы страж СОСТАВА,
+# сценарий был бы переопределён, а страж величины — инертен (`C-216`→`C-217` урок).
+rm -rf "${JOURNAL_DRILL_RESTORE}"; mkdir -p "${JOURNAL_DRILL_RESTORE}" "$(dirname "${JOURNAL_DRILL_STATE}")"
+ALL="$(ls "${JOURNAL_DRILL_COLD}" 2>/dev/null | sed -n 's/^segment-\([0-9]\{8\}\)\.jrnl\(\.zst\)\?$/\1/p' | sort -u)"
+N="$(printf '%s\n' "${ALL}" | grep -c .)"; MID=$(( (N + 1) / 2 ))
+IDX="$(printf '%s\n' "${ALL}" | sed -n "1p;${MID}p;${N}p" | sort -u)"
+CK=0
+for i in ${IDX}; do
+  for f in "${JOURNAL_DRILL_COLD}/segment-${i}.jrnl" "${JOURNAL_DRILL_COLD}/segment-${i}.jrnl.zst"; do
+    [ -f "$f" ] && cp -- "$f" "${JOURNAL_DRILL_RESTORE}/" 2>/dev/null
+  done
+  CK=$((CK + 1))
+done
+for j in "${JOURNAL_DRILL_COLD}"/*.json; do [ -f "$j" ] && cp -- "$j" "${JOURNAL_DRILL_RESTORE}/" 2>/dev/null; done
+printf '{"ok":1,"ts_wall_ms":0,"checked":%s,"events_read":41213,"digest":"__D__","reason":""}\n' \
+  "${CK}" > "${JOURNAL_DRILL_STATE}"
 exit 0
 FAKE
+sed -i "s/__D__/${STALE_DIGEST}/" "${FAKE_R}"
 chmod +x "${FAKE_R}"
 run_drill "${BOX_R}" "${FAKE_R}" || true
 if h_verdict "${BOX_R}"; then

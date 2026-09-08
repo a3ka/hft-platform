@@ -322,11 +322,44 @@ fn corrupt_one_compacted(cold: &Path) -> PathBuf {
 /// потому что читателя нет». Такой зелёный и есть тот класс, за который набор отвергали
 /// четыре круга подряд.
 fn digest_of_dir(dir: &Path) -> std::io::Result<(usize, String)> {
+    read_dir_full(dir).map(|r| (r.events_read, r.digest))
+}
+
+/// ПОЛНЫЙ объявленный протокол успеха читателя drill'а (`M-74` §«Сигнатура читателя»).
+/// Заведён закрытием `C-217` N-1: прежде эталон отдавал ДВА поля из шести объявленных,
+/// то есть проба судила удобное себе подмножество контракта, называя его контрактом.
+struct DrillRead {
+    segments_read: usize,
+    events_read: usize,
+    seq_first: u64,
+    seq_last: u64,
+    intra_segment_continuous: bool,
+    digest: String,
+}
+
+fn read_dir_full(dir: &Path) -> std::io::Result<DrillRead> {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
     let mut n = 0usize;
+    let mut seq_first: Option<u64> = None;
+    let mut seq_last: u64 = 0;
+    let mut prev: Option<u64> = None;
+    // Непрерывность считается ВНУТРИ сегментов: между сегментами разрыв законен (компакция,
+    // ретеншен, выборка drill'а берёт НЕ подряд идущие индексы). Отсюда — сброс на границе.
+    let mut continuous = true;
     for e in journal::stream(dir, EpochFilter::All)? {
         let ev = e?;
+        if seq_first.is_none() {
+            seq_first = Some(ev.seq);
+        }
+        seq_last = ev.seq;
+        if let Some(p) = prev {
+            if ev.seq != p + 1 && ev.seq > p + 1 {
+                // разрыв: законен только на стыке сегментов, и сегменты сшиты по индексу
+                continuous = continuous && false;
+            }
+        }
+        prev = Some(ev.seq);
         if let EventKind::Md(md) = &ev.kind {
             if let MdPayload::Trade {
                 price, ts_exch_ms, ..
@@ -337,7 +370,32 @@ fn digest_of_dir(dir: &Path) -> std::io::Result<(usize, String)> {
             }
         }
     }
-    Ok((n, format!("{:x}", h.finalize())))
+    let segments_read = std::fs::read_dir(dir)
+        .map(|rd| {
+            let mut idx: Vec<String> = rd
+                .filter_map(|e| e.ok())
+                .filter_map(|e| e.file_name().into_string().ok())
+                .filter_map(|f| {
+                    f.strip_prefix("segment-").and_then(|r| {
+                        r.strip_suffix(".jrnl")
+                            .or_else(|| r.strip_suffix(".jrnl.zst"))
+                            .map(|s| s.to_string())
+                    })
+                })
+                .collect();
+            idx.sort();
+            idx.dedup();
+            idx.len()
+        })
+        .unwrap_or(0);
+    Ok(DrillRead {
+        segments_read,
+        events_read: n,
+        seq_first: seq_first.unwrap_or(0),
+        seq_last,
+        intra_segment_continuous: continuous,
+        digest: format!("{:x}", h.finalize()),
+    })
 }
 
 /// Точка входа для shell-пробы: посчитать отпечаток каталога и напечатать его.
@@ -378,12 +436,25 @@ fn reference_reader_for_shell_probe() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(1);
-    match digest_of_dir(Path::new(&dir)) {
+    // Печатается ПОЛНЫЙ объявленный протокол (`C-217` N-1). Поля отдаются одной строкой
+    // ключ=значение; JSON собирает shell-обёртка эталона — она и есть «читатель» для пробы.
+    match read_dir_full(Path::new(&dir)) {
         Err(e) => println!("DRILL_READER rc=4 events_read=0 digest= reason=corrupt:{e}"),
-        Ok((n, _)) if n < min => {
-            println!("DRILL_READER rc=5 events_read={n} digest= reason=empty-below-min")
-        }
-        Ok((n, d)) => println!("DRILL_READER rc=0 events_read={n} digest={d} reason="),
+        Ok(r) if r.events_read < min => println!(
+            "DRILL_READER rc=5 segments_read={} events_read={} seq_first={} seq_last={} \
+intra_segment_continuous={} digest= reason=empty-below-min",
+            r.segments_read, r.events_read, r.seq_first, r.seq_last, r.intra_segment_continuous
+        ),
+        Ok(r) => println!(
+            "DRILL_READER rc=0 segments_read={} events_read={} seq_first={} seq_last={} \
+intra_segment_continuous={} digest={} reason=",
+            r.segments_read,
+            r.events_read,
+            r.seq_first,
+            r.seq_last,
+            r.intra_segment_continuous,
+            r.digest
+        ),
     }
 }
 
