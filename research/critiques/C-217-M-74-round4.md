@@ -125,6 +125,15 @@ allocator_exit=0
 $ EVENT_NAME=push PUSH_BEFORE=8f8e4b606e176b26e11ce84f8398852a9a437c13 bash scripts/check_artifact_ids.sh
 OK: ни один новый артефакт не введён (диапазон 8f8e4b6..HEAD)
 artifact_ids_baseline_exit=0
+
+$ git push origin HEAD:docs/M-73-closeout-architect
+To https://github.com/a3ka/hft-platform.git
+   2d322f8..1bdff21  HEAD -> docs/M-73-closeout-architect
+exit=0
+
+$ git ls-remote --heads origin docs/M-73-closeout-architect
+1bdff21fe6e82b5e011fb634424e4feff5d52c6a	refs/heads/docs/M-73-closeout-architect
+exit=0
 ```
 
 === HANDOFF: CRITIC → FOUNDER ===
@@ -145,8 +154,8 @@ artifact_ids_baseline_exit=0
 
 ## §D — Следующий агент + инвокация
 - **Следующий агент:** `founder`
-- Push-статус: pending this verdict commit and push to `origin/docs/M-73-closeout-architect`.
-- Кэш: ⏸ retained only while the verdict commit/push is completed; remove afterward.
+- Push-статус: ✅ pushed to `origin/docs/M-73-closeout-architect` at `1bdff21`.
+- Кэш: ✅ critic cache removed after push (`/tmp/hft-critic-m74-r4/target`, 9.0G).
 - **Paste-ready промпт:**
   ```
   M-74 final plan-time round is REJECT by C-217. A-032 §4 forbids round 5. Do not dispatch engine-dev. Preserve rev-5 INV-DELIVERY construction; move the artifact set to the agreed different executor. The blocking evidence is executable: a wrapper selects exactly three genuine source-independent indices (00000000/00000001/00000002) instead of the required first/middle/last (00000000/00000003/00000007), yet the full probe retains only its two declared RED lines. The reference reader also emits only events_read/digest rather than the declared full success JSON. Require new architect-owned RED artifacts before any new gate count is started.
