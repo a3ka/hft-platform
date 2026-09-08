@@ -185,11 +185,19 @@ fn build_staging(root: &Path, nonce: u64) -> PathBuf {
         segs.len()
     );
 
-    // Сохраняем СЫРУЮ копию второго сегмента ДО компакции — она станет тем самым дублем
+    // Сохраняем СЫРУЮ копию сегмента ДО компакции — она станет тем самым дублем
     // «и .jrnl, и .jrnl.zst», которых на боевой коробке замерено 17.
-    let dup_idx = segs[1].index;
+    //
+    // ДУБЛЬ ЛЕЖИТ НА ВЫБИРАЕМОМ ИНДЕКСЕ, И ЭТО ТРЕБОВАНИЕ, А НЕ СЛУЧАЙНОСТЬ (`C-218` B-2).
+    // Прежде дубль строился на `segs[1]` — индексе `00000001`, которого правило выборки НЕ
+    // берёт (оно берёт первый / `floor(N/2)` / последний, то есть `00000000`/`00000003`/
+    // `00000007`). Из-за этого обязанность спеки «для каждого выбранного индекса
+    // восстанавливаются ОБЕ формы» была ВАКУУМНА: ни один выбранный индекс не имел двух форм,
+    // и обёртку, роняющую одну из них, отвергнуть было НЕЧЕМ. Дубль перенесён на `segs[3]`
+    // (индекс `00000003` — средний член выборки); страж ниже это утверждает исполнением.
+    let dup_idx = segs[3].index;
     let dup_raw = root.join(format!("dup-segment-{dup_idx:08}.jrnl"));
-    fs::copy(&segs[1].path, &dup_raw).expect("сохранить сырой дубль до компакции");
+    fs::copy(&segs[3].path, &dup_raw).expect("сохранить сырой дубль до компакции");
 
     // `keep_raw = 1`: последний ЗАКРЫТЫЙ остаётся сырым, остальные закрытые сжимаются.
     // Это и есть прод-пропорция (замер: 478 `.zst` против 21 `.jrnl`).
@@ -270,6 +278,46 @@ fn build_cold(stage: &Path, cold: &Path) -> usize {
     copied
 }
 
+/// Убрать ОДИН ЦЕЛЫЙ фрейм события из СЫРОГО сегмента. Обрамление остаётся ЗАКОННЫМ (каждый
+/// фрейм `len u32 LE | payload | crc32 u32 LE` цел), а `seq` внутри ОДНОГО сегмента получает
+/// дыру — ровно тот случай, который `intra_segment_continuous` обязан объявлять `false`.
+///
+/// Заведено закрытием `C-218` B-1: без него «сквозная непрерывность» и «непрерывность внутри
+/// сегмента» дают ОДИН И ТОТ ЖЕ ответ на здоровой выборке, и неверная реализация неотличима
+/// от верной. Здоровый несмежный отбор обязан давать `true`, дыра внутри сегмента — `false`;
+/// один без другого не различает миры.
+fn drop_one_event_frame(path: &Path, skip_events: usize) {
+    let bytes = fs::read(path).expect("read segment");
+    assert!(
+        bytes.starts_with(b"HFTJRN02"),
+        "SETUP НЕ СОСТОЯЛСЯ: {} не сырой сегмент schema-v2 — фреймы не разобрать",
+        path.display()
+    );
+    let read_len = |off: usize| -> usize {
+        u32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]]) as usize
+    };
+    // 8 байт MAGIC, затем фрейм ЗАГОЛОВКА, затем фреймы событий.
+    let mut off = 8usize;
+    off += 4 + read_len(off) + 4; // заголовок
+    for _ in 0..skip_events {
+        assert!(
+            off < bytes.len(),
+            "SETUP НЕ СОСТОЯЛСЯ: событий меньше, чем нужно пропустить"
+        );
+        off += 4 + read_len(off) + 4;
+    }
+    assert!(
+        off < bytes.len(),
+        "SETUP НЕ СОСТОЯЛСЯ: выедать нечего — сегмент кончился на {off} из {}",
+        bytes.len()
+    );
+    let victim_len = 4 + read_len(off) + 4;
+    let mut out = Vec::with_capacity(bytes.len() - victim_len);
+    out.extend_from_slice(&bytes[..off]);
+    out.extend_from_slice(&bytes[off + victim_len..]);
+    fs::write(path, &out).expect("write segment without one frame");
+}
+
 /// ПОРЧА: испортить байты внутри `.zst`-сегмента копии, оставив имя и размер прежними.
 /// Именно так выглядит тихая порча носителя — файл на месте, `ls` ничего не показывает.
 fn corrupt_one_compacted(cold: &Path) -> PathBuf {
@@ -344,8 +392,22 @@ fn read_dir_full(dir: &Path) -> std::io::Result<DrillRead> {
     let mut seq_first: Option<u64> = None;
     let mut seq_last: u64 = 0;
     let mut prev: Option<u64> = None;
-    // Непрерывность считается ВНУТРИ сегментов: между сегментами разрыв законен (компакция,
-    // ретеншен, выборка drill'а берёт НЕ подряд идущие индексы). Отсюда — сброс на границе.
+    // ═══ НЕПРЕРЫВНОСТЬ — ВНУТРИ СЕГМЕНТА, И СБРОС НА ГРАНИЦЕ ТЕПЕРЬ ЕСТЬ (`C-218` B-1) ═══
+    //
+    // Прежняя редакция несла ЭТОТ ЖЕ комментарий («отсюда — сброс на границе») и сброса НЕ
+    // ДЕЛАЛА: `prev` тянулся через весь поток. На здоровой выборке несмежных индексов
+    // (`00000000`/`00000003`/`00000007`) читатель объявлял `intra_segment_continuous=false`,
+    // хотя каждый выбранный сегмент по отдельности непрерывен. Комментарий, описывающий
+    // поведение, которого в коде нет, — ложный якорь: он читается как покрытие.
+    //
+    // Спека (§«Правило выборки», СЕМАНТИКА НЕПРЕРЫВНОСТИ) прямо запрещает заявлять сквозную
+    // непрерывность на выборке: три несмежных сегмента её проверить не могут ПО ПОСТРОЕНИЮ.
+    // Границы берутся из заголовков сегментов (`first_seq`), а не угадываются по величине
+    // разрыва: «большой разрыв = граница» было бы догадкой, и порча внутри сегмента,
+    // выевшая много событий подряд, проехала бы как «стык».
+    let bounds: std::collections::HashSet<u64> = journal::list_segments(dir)
+        .map(|v| v.iter().map(|s| s.header.first_seq).collect())
+        .unwrap_or_default();
     let mut continuous = true;
     for e in journal::stream(dir, EpochFilter::All)? {
         let ev = e?;
@@ -353,10 +415,15 @@ fn read_dir_full(dir: &Path) -> std::io::Result<DrillRead> {
             seq_first = Some(ev.seq);
         }
         seq_last = ev.seq;
+        // Первое событие сегмента — законный разрыв: сравнивать его с хвостом предыдущего
+        // нечего. Если заголовок соврал и `first_seq` не совпал с фактом, сброса не будет и
+        // ответ окажется КОНСЕРВАТИВНЫМ (`false`), а не оптимистичным.
+        if bounds.contains(&ev.seq) {
+            prev = None;
+        }
         if let Some(p) = prev {
-            if ev.seq != p + 1 && ev.seq > p + 1 {
-                // разрыв: законен только на стыке сегментов, и сегменты сшиты по индексу
-                continuous = continuous && false;
+            if ev.seq > p + 1 {
+                continuous = false;
             }
         }
         prev = Some(ev.seq);
@@ -401,6 +468,155 @@ fn read_dir_full(dir: &Path) -> std::io::Result<DrillRead> {
 /// Точка входа для shell-пробы: посчитать отпечаток каталога и напечатать его.
 /// Каталог приходит в `DRILL_DIGEST_DIR`; без переменной тест не утверждает ничего —
 /// он гоняется в общем `cargo test --all`, где считать нечего.
+/// **`C-218` B-1, обязанность (а): здоровый НЕСМЕЖНЫЙ отбор непрерывен.**
+///
+/// Три выбранных индекса (первый / `floor(N/2)` / последний) по построению НЕ СОСЕДНИ, и
+/// между ними в `seq` зияют дыры — законные. Читатель обязан объявить
+/// `intra_segment_continuous=true`, потому что семантика поля — непрерывность ВНУТРИ
+/// сегмента (спека §«Правило выборки»). Прежняя реализация тянула `prev` через весь поток и
+/// отвечала `false` на ЗДОРОВОЙ копии: протокол был well-formed и семантически ложен.
+#[test]
+fn non_adjacent_healthy_selection_is_continuous() {
+    let root = std::env::temp_dir().join(format!("drill-cont-ok-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("mkdir root");
+    let stage = build_staging(&root, drill_nonce());
+    let cold = root.join("cold");
+    build_cold(&stage, &cold);
+
+    let sel = root.join("sel");
+    fs::create_dir_all(&sel).expect("mkdir sel");
+    let picked = select_by_contract(&cold);
+    assert_eq!(
+        picked.len(),
+        3,
+        "SETUP НЕ СОСТОЯЛСЯ: отбор дал {} индексов вместо трёх",
+        picked.len()
+    );
+    let mut copied_forms = 0usize;
+    for idx in &picked {
+        for suffix in [".jrnl", ".jrnl.zst"] {
+            let src = cold.join(format!("segment-{idx:08}{suffix}"));
+            if src.exists() {
+                fs::copy(&src, sel.join(format!("segment-{idx:08}{suffix}"))).expect("copy");
+                copied_forms += 1;
+            }
+        }
+    }
+    for side in ["journal.legacy.json", "journal.replay-digest.json"] {
+        let src = cold.join(side);
+        if src.exists() {
+            fs::copy(&src, sel.join(side)).expect("copy sidecar");
+        }
+    }
+    // Страж НЕСМЕЖНОСТИ: иначе тест был бы зелен и на сквозной семантике, то есть не
+    // различал бы верную реализацию и неверную.
+    assert!(
+        picked[2] > picked[1] + 1 || picked[1] > picked[0] + 1,
+        "SETUP НЕ СОСТОЯЛСЯ: выбранные индексы {picked:?} СОСЕДНИ — на них сквозная и \
+         внутрисегментная семантика дают ОДИН ответ, и тест ничего не различает"
+    );
+    assert!(
+        copied_forms > picked.len(),
+        "SETUP НЕ СОСТОЯЛСЯ: скопировано {copied_forms} файлов на {} индексов — пара raw+zst \
+         на выбранном индексе не воспроизведена (`C-218` B-2)",
+        picked.len()
+    );
+
+    let r = read_dir_full(&sel).expect("читатель обязан открыть здоровую выборку");
+    assert_eq!(r.segments_read, 3, "выборка обязана нести три индекса");
+    assert!(r.events_read > 0, "выборка обязана нести события");
+    assert!(
+        r.intra_segment_continuous,
+        "ЗДОРОВЫЙ несмежный отбор объявлен РАЗРЫВНЫМ: seq_first={} seq_last={} — это `C-218` \
+         B-1, семантика поля читается как сквозная вместо внутрисегментной",
+        r.seq_first, r.seq_last
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// **`C-218` B-1, обязанность (б): дыра ВНУТРИ одного сегмента разрывна.**
+///
+/// Обратная сторона того же поля. Без неё «всегда `true`» прошло бы обязанность (а) и
+/// поле не значило бы ничего — оракул обязан падать против СЛОМАННОГО, а не только
+/// проходить против здорового (`testing.md` §«Целостность гейта» св. 3).
+#[test]
+fn intra_segment_gap_is_discontinuous() {
+    let root = std::env::temp_dir().join(format!("drill-cont-gap-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("mkdir root");
+    let stage = build_staging(&root, drill_nonce());
+
+    // Берём ОДИН сырой закрытый сегмент — «внутри сегмента» требует ровно одного.
+    let segs = journal::list_segments(&stage).expect("list_segments");
+    let raw = segs
+        .iter()
+        .find(|s| {
+            s.path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.ends_with(".jrnl"))
+                .unwrap_or(false)
+                && s.index < segs.iter().map(|x| x.index).max().unwrap()
+        })
+        .expect("SETUP НЕ СОСТОЯЛСЯ: сырого закрытого сегмента нет");
+
+    let one = root.join("one");
+    fs::create_dir_all(&one).expect("mkdir one");
+    let dst = one.join(raw.path.file_name().expect("имя"));
+    fs::copy(&raw.path, &dst).expect("copy raw segment");
+    fs::write(one.join(journal::LEGACY_MANIFEST), empty_manifest_bytes()).expect("манифест");
+
+    let before = read_dir_full(&one).expect("здоровый одиночный сегмент обязан читаться");
+    assert!(
+        before.intra_segment_continuous,
+        "SETUP НЕ СОСТОЯЛСЯ: сегмент разрывен ДО порчи — тест судил бы не тот предмет"
+    );
+
+    drop_one_event_frame(&dst, 5);
+
+    let after = read_dir_full(&one).expect("сегмент с выеденным фреймом обязан читаться");
+    assert!(
+        after.events_read > 0,
+        "SETUP НЕ СОСТОЯЛСЯ: после выедания фрейма событий не осталось — судится пустота, \
+         а не разрыв"
+    );
+    assert!(
+        !after.intra_segment_continuous,
+        "ДЫРА ВНУТРИ СЕГМЕНТА объявлена непрерывной (событий {}, seq {}..{}). Поле \
+         `intra_segment_continuous` не значит ничего",
+        after.events_read, after.seq_first, after.seq_last
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Отбор ПО КОНТРАКТУ спеки §«Правило выборки»: индексы, дедуплицированные по форме имени,
+/// затем первый / `floor(N/2)` / последний. Живёт ЗДЕСЬ, а не в shell-пробе: проба сверяет
+/// доставленное с ЛИТЕРАЛОМ и правило не пересчитывает (редекларация судимой логики стоила
+/// круга на `M-45`). Здесь это строитель фикстуры, а не судья.
+fn select_by_contract(cold: &Path) -> Vec<u32> {
+    let mut idx: Vec<u32> = fs::read_dir(cold)
+        .expect("read_dir cold")
+        .filter_map(|e| e.ok())
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter_map(|n| {
+            n.strip_prefix("segment-").and_then(|r| {
+                r.strip_suffix(".jrnl")
+                    .or_else(|| r.strip_suffix(".jrnl.zst"))
+                    .and_then(|s| s.parse::<u32>().ok())
+            })
+        })
+        .collect();
+    idx.sort_unstable();
+    idx.dedup();
+    let n = idx.len();
+    if n < 3 {
+        return idx;
+    }
+    let mid = (n + 1) / 2;
+    vec![idx[0], idx[mid - 1], idx[n - 1]]
+}
+
 #[test]
 fn digest_for_shell_probe() {
     let Ok(dir) = std::env::var("DRILL_DIGEST_DIR") else {
