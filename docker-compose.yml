@@ -73,6 +73,14 @@ services:
       # recorder'ом (хотя mutex через сегменты обеспечивает и сама логика prune —
       # только сегменты НЕ-активные).
       - journal-data:/journal:ro
+      # Замер 2026-09-08 (harness: барьер достижимости артефакта покрытия): retention
+      # обязан ВИДЕТЬ артефакт покрытия (`covered_through_seq`), который пишет
+      # `gateway-checkpoint`. Без этого монтирования retention на каждом цикле отказывал
+      # кандидатам с «checkpoint coverage artifact absent» (fail-closed) и освобождал
+      # `freed_bytes: 0`. Том — ТОТ ЖЕ, что у `gateway-checkpoint` (RW) и `gateway-serve`
+      # (RO), bind в тот же путь `/ckpt`, режим `:ro` (только чтение артефакта;
+      # единственный писатель чекпоинта — `gateway-checkpoint`).
+      - gateway-ckpt:/ckpt:ro
       # D3: bind-mount холодного хранилища. Если JOURNAL_COLD_DIR не существует на
       # хосте — `docker compose run` упадёт с ошибкой монтирования ДО старта бинаря
       # (явный fail-closed: легче заметить, чем тихо получить exit 2 в логе cron).
