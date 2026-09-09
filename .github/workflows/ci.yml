@@ -589,14 +589,33 @@ jobs:
       - name: Проба барьера (27 сценариев)
         run: bash scripts/tests/red_rollout_composition.sh
 
+  retention-composition:
+    # Барьер достижимости артефакта покрытия (`covered_through_seq`) для retention'а
+    # (коммит 13c48dd на ветке `harness/retention-composition`). До этого джоба защита
+    # жила ТОЛЬКО в milestone-гейте `verify_M-48.sh`, который CI не зовёт: ровно тот же
+    # класс дыры, что закрывает `rollout-composition` (замер 2026-09-08: retention на
+    # проде не удалил НИ ОДНОГО сегмента с момента постройки — обе стороны называли
+    # путь `/ckpt/covered_through_seq`, но тома у потребителя не было, и fail-closed
+    # отказывал кандидатам с «checkpoint coverage artifact absent»). Барьер статически
+    # читает `docker-compose.yml` и обёртку, а не запускает контейнеры — предел назван
+    # в шапке самого скрипта (`scripts/check_retention_composition.sh`).
+    name: Retention composition (артефакт покрытия достижим retention'ом)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Потребитель артефакта покрытия монтирует ТОТ ЖЕ именованный том
+        run: bash scripts/check_retention_composition.sh
+      - name: Проба барьера (5 сценариев — анти-плацебо в обе стороны)
+        run: bash scripts/tests/red_retention_composition.sh
+
   status-check:
     name: All checks passed
     runs-on: ubuntu-latest
-    needs: [build-test, security, delivery, protected-artifacts, secret-material, roadmap-sync, contracts, docs-freeze, artifact-ids, reserve-ids, design-claims, context-budgets, gate-meta, deploy-catchup, review-fa, resource-oracles, rollout-composition]
+    needs: [build-test, security, delivery, protected-artifacts, secret-material, roadmap-sync, contracts, docs-freeze, artifact-ids, reserve-ids, design-claims, context-budgets, gate-meta, deploy-catchup, review-fa, resource-oracles, rollout-composition, retention-composition]
     if: always()
     steps:
       - run: |
-          if [[ "${{ needs.build-test.result }}" != "success" || "${{ needs.security.result }}" != "success" || "${{ needs.delivery.result }}" != "success" || "${{ needs.protected-artifacts.result }}" != "success" || "${{ needs.contracts.result }}" != "success" || "${{ needs.docs-freeze.result }}" != "success" || "${{ needs.artifact-ids.result }}" != "success" || "${{ needs.reserve-ids.result }}" != "success" || "${{ needs.design-claims.result }}" != "success" || "${{ needs.context-budgets.result }}" != "success" || "${{ needs.gate-meta.result }}" != "success" || "${{ needs.deploy-catchup.result }}" != "success" || "${{ needs.review-fa.result }}" != "success" || "${{ needs.resource-oracles.result }}" != "success" || "${{ needs.rollout-composition.result }}" != "success" ]]; then
+          if [[ "${{ needs.build-test.result }}" != "success" || "${{ needs.security.result }}" != "success" || "${{ needs.delivery.result }}" != "success" || "${{ needs.protected-artifacts.result }}" != "success" || "${{ needs.contracts.result }}" != "success" || "${{ needs.docs-freeze.result }}" != "success" || "${{ needs.artifact-ids.result }}" != "success" || "${{ needs.reserve-ids.result }}" != "success" || "${{ needs.design-claims.result }}" != "success" || "${{ needs.context-budgets.result }}" != "success" || "${{ needs.gate-meta.result }}" != "success" || "${{ needs.deploy-catchup.result }}" != "success" || "${{ needs.review-fa.result }}" != "success" || "${{ needs.resource-oracles.result }}" != "success" || "${{ needs.rollout-composition.result }}" != "success" || "${{ needs.retention-composition.result }}" != "success" ]]; then
             echo "One or more checks failed"; exit 1
           fi
           echo "All checks passed"
