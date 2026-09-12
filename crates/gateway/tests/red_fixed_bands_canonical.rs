@@ -49,7 +49,10 @@ fn sel_with(bands: Vec<f64>) -> Selector {
 
 #[test]
 fn canonical_set_exists_and_equals_product_set() {
-    let canon: &[f64] = gateway::CANONICAL_DEPTH_BANDS;
+    // Тип КОНСТАНТЫ не диктуется: массив `[f64; 7]` и срез `&'static [f64]` оба годятся,
+    // и выбор — за реализацией. Прежняя редакция писала `let canon: &[f64] = …` и тем
+    // самым молча требовала срез: массив давал dev'у E0308 вместо спецификации.
+    let canon: Vec<f64> = gateway::CANONICAL_DEPTH_BANDS.to_vec();
     assert_eq!(
         canon.len(),
         PRODUCT_BANDS.len(),
@@ -70,7 +73,10 @@ fn canonical_set_exists_and_equals_product_set() {
 
 #[test]
 fn canonical_set_is_sorted_and_without_duplicates() {
-    let canon: &[f64] = gateway::CANONICAL_DEPTH_BANDS;
+    // Тип КОНСТАНТЫ не диктуется: массив `[f64; 7]` и срез `&'static [f64]` оба годятся,
+    // и выбор — за реализацией. Прежняя редакция писала `let canon: &[f64] = …` и тем
+    // самым молча требовала срез: массив давал dev'у E0308 вместо спецификации.
+    let canon: Vec<f64> = gateway::CANONICAL_DEPTH_BANDS.to_vec();
     for w in canon.windows(2) {
         assert!(
             w[0] < w[1],
@@ -88,9 +94,9 @@ fn canonical_set_within_source_coverage() {
     // Эмиссия режется MAX_REL_DIST = 0.60 (crates/venue-binance/src/lib.rs:33). Полоса ШИРЕ
     // порога никогда не наполнится и молча отдаст заниженное число — ровно класс, против
     // которого подписана П-014 (PL-I-7).
-    for b in gateway::CANONICAL_DEPTH_BANDS {
+    for b in gateway::CANONICAL_DEPTH_BANDS.to_vec() {
         assert!(
-            *b > 0.0 && *b <= 0.60,
+            b > 0.0 && b <= 0.60,
             "полоса {b} вне охвата источника (0, 0.60]: MAX_REL_DIST=0.60 режет эмиссию, \
              и такая полоса отдавала бы заниженное число под меткой достоверности"
         );
