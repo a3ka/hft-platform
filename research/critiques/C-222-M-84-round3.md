@@ -257,8 +257,9 @@ $ nl -ba crates/gateway/src/lib.rs | sed -n '1202,1215p'
 
 - Push-статус: delivery-commit этого файла отправляется в
   `origin/feat/M-84-fixed-bands`; соответствующий immutable ref — audit trail передачи.
-- Кэш: временные `CARGO_TARGET_DIR` и mutation worktree удалить после commit/push; факт
-  удаления записать в итог операции.
+- Кэш: ✅ удалены после delivery-push штатным `cargo clean`: `5.3 GiB` и `9.9 GiB` из
+  двух временных `CARGO_TARGET_DIR`; удалён и dirty mutation worktree
+  `/tmp/hft-critic-M84r3-honest`. Audited worktree сохранён как чистый ref verdict.
 
 ### §E — Риски / открытые вопросы
 
