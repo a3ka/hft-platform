@@ -1,13 +1,35 @@
 //! RED `M-84` (sacred, architect-only) — **слепки РАЗНЫХ наборов СОСУЩЕСТВУЮТ, поэтому новый
 //! собирается при живом старом и окно переключения НУЛЕВОЕ.**
 //!
-//! Заведён закрытием `C-220` B-4. COMPILE-RED: `gateway::CANONICAL_DEPTH_BANDS` ещё нет.
+//! Заведён закрытием `C-220` B-4, переписан по `C-221` B-2. COMPILE-RED:
+//! `gateway::CANONICAL_DEPTH_BANDS` ещё нет.
 //!
-//! ## ПОЧЕМУ ЭТОТ ОРАКУЛ ЗАМЕНЯЕТ ГРЕП ПО СЛОВАМ
+//! ## ПОЧЕМУ ПЕРЕПИСАН — ОРАКУЛ ТРЕБОВАЛ ДЫРЫ В ГВАРДЕ
 //!
-//! Прежний шаг гейта искал в `deploy/README.md` слова «заранее» и `ckpt-`. Критик назвал
-//! последствие точно: замена ключевых слов прозой после реализации делала шаг зелёным БЕЗ
-//! предварительного прогрева и без сосуществования слепков. Гейт проверял орфографию.
+//! Прежняя редакция строила «живой слепок сегодняшнего прода» вызовом
+//! `checkpoint::advance_to` с легаси-набором `[0.001]`. Но `advance_to` первой строкой зовёт
+//! `gateway::validate_selector` (`crates/gateway/src/lib.rs:3541`), а
+//! `red_fixed_bands_canonical.rs` требует от того же гварда легаси-набор ОТВЕРГНУТЬ.
+//! Единственный способ удовлетворить оба требования — убрать проверку из `advance_to`, то
+//! есть открыть обход: через прогрев в систему заезжает ЛЮБАЯ сетка. Критик это и собрал —
+//! мутация «точный гвард + удалить вызов из `advance_to`» оставила ЧЕТЫРЕ набора M-84
+//! зелёными (`C-221` B-2, Done Block).
+//!
+//! ## РАЗВЯЗКА: ЛЕГАСИ-СЛЕПОК НЕ СОЗДАЁТСЯ, ОН УЖЕ ЛЕЖИТ
+//!
+//! На проде слепок старого набора **уже существует** — его написал СЕГОДНЯШНИЙ код, до
+//! M-84. Новому коду не нужно уметь его создавать; ему нужно не затереть чужое имя и
+//! построить своё рядом. Поэтому фикстура кладёт легаси-файл НАПРЯМУЮ: берутся байты
+//! настоящего слепка (построенного законным путём, каноническим набором) и копируются под
+//! ЛЕГАСИ-ИМЕНЕМ. Форма файла при этом настоящая, а не мусор, — отличается ровно то, что и
+//! отличается в проде: отпечаток в имени.
+//!
+//! Имя выводится из `checkpoint::selector_fingerprint` — чистой функции, которая НЕ
+//! валидирует селектор. Построение `Selector`-значения и его проверка — разные вещи, и это
+//! не обход: на диск ничего не пишется гвардованным путём.
+//!
+//! **Мутация, которую файл теперь ловит:** удалить `validate_selector(sel)?` из
+//! `advance_to` ⇒ падает `legacy_selector_is_refused_by_the_normal_checkpoint_api`.
 //!
 //! ## ЧТО ИМЕННО ДОКАЗЫВАЕТСЯ — и почему это НЕ тавтология
 //!
@@ -19,14 +41,13 @@
 //! (`ckpt-<fp_hex16>.bin`), значит слепки разных наборов лежат РЯДОМ и не затирают друг друга.
 //! Свойство проверяемо исполнением — и проверяется здесь, а не обещается в README.
 //!
-//! Тавтологии нет: тест строит слепок СТАРОГО набора, затем слепок КАНОНИЧЕСКОГО и требует,
-//! чтобы ОБА остались на диске и были различимы. Реализация, затирающая слепок при смене
-//! набора (например, «один слепок на каталог»), падает здесь и проходит все прочие тесты M-84.
-//!
 //! ## `testing.md` чек-лист
+//! - **setup-guard на каждый сценарий**: имя, которое выводит тест, сверяется с именем,
+//!   которое РЕАЛЬНО произвела реализация. Разойдутся — тест кричит о несостоявшемся
+//!   setup, а не судит не тот файл;
 //! - п.4 **границы** — прогрев ДО переключения, то есть старый слепок ещё живой;
-//! - п.7 **ПАРНЫЙ vantage** — «оба файла существуют» И «их имена различны». Первое без
-//!   второго удовлетворяется реализацией, пишущей оба под одним именем по очереди.
+//! - п.7 **ПАРНЫЙ vantage** — «оба файла существуют» И «байты старого не изменились».
+//!   Первое без второго удовлетворяется реализацией, переписывающей старый файл заново.
 
 use contracts::{to_fixed, DataSource, EventKind, MdPayload, Side, Venue};
 use gateway::{Cursor, Selector};
@@ -88,6 +109,68 @@ fn ckpt_files(dir: &std::path::Path) -> Vec<String> {
     v
 }
 
+/// Имя слепка, выведенное из отпечатка. Дублирует формулу реализации (`RN-23`,
+/// `ckpt-<fp_hex16>.bin`) — и ровно поэтому каждый сценарий сверяет вывод с настоящим
+/// именем, произведённым `advance_to`. Формула разойдётся — упадёт setup-guard, а не
+/// смысловой ассерт.
+fn fp_name(s: &Selector) -> String {
+    format!(
+        "ckpt-{:016x}.bin",
+        gateway::checkpoint::selector_fingerprint(s)
+    )
+}
+
+/// Настоящий слепок канонического набора, построенный ЗАКОННЫМ путём. Возвращает его байты
+/// — из них делается легаси-фикстура (та же форма файла, другое имя).
+fn real_checkpoint_bytes(jdir: &std::path::Path) -> Vec<u8> {
+    let scratch = tempfile::tempdir().expect("tempdir scratch");
+    let canonical = sel(gateway::CANONICAL_DEPTH_BANDS.to_vec());
+    gateway::checkpoint::advance_to(
+        jdir,
+        scratch.path(),
+        &canonical,
+        EpochFilter::OwnCaptureOnly,
+        Cursor::LATEST,
+    )
+    .expect("слепок канонического набора обязан строиться законным путём");
+    let produced = ckpt_files(scratch.path());
+    assert_eq!(
+        produced,
+        vec![fp_name(&canonical)],
+        "SETUP НЕ СОСТОЯЛСЯ: имя, выведенное тестом из отпечатка, разошлось с тем, что \
+         произвела реализация. Дальше судить нечего — тест смотрел бы не на тот файл"
+    );
+    std::fs::read(scratch.path().join(&produced[0])).expect("read ckpt bytes")
+}
+
+#[test]
+fn legacy_selector_is_refused_by_the_normal_checkpoint_api() {
+    // МУТАЦИЯ-УБИЙЦА (`C-221` B-2). Обычный публичный путь чекпоинта обязан оставаться
+    // гвардованным: убери проверку из `advance_to` ради «прогрева старого набора» — и
+    // через прогрев в систему заедет любая сетка, мимо решения П-029.
+    let jdir = journal_of(vec![trade(65_000.0, 1.0, Side::Buy, T)]);
+    let ckpt = tempfile::tempdir().expect("tempdir ckpt");
+    let err = gateway::checkpoint::advance_to(
+        jdir.path(),
+        ckpt.path(),
+        &sel(vec![0.001]),
+        EpochFilter::OwnCaptureOnly,
+        Cursor::LATEST,
+    )
+    .expect_err(
+        "легаси-набор обязан быть ОТВЕРГНУТ обычным API чекпоинта. Успех здесь означает \
+         дыру в гварде: прогрев становится входом для произвольной сетки (C-221 B-2)",
+    );
+    assert!(
+        err.to_string().contains("bands") || err.to_string().contains("полос"),
+        "отказ обязан НАЗЫВАТЬ причину — оператор выкатки читает именно это. Получено: {err}"
+    );
+    assert!(
+        ckpt_files(ckpt.path()).is_empty(),
+        "отказ обязан быть fail-closed: при отвергнутом селекторе на диск не ложится ничего"
+    );
+}
+
 #[test]
 fn prewarmed_canonical_checkpoint_coexists_with_live_legacy() {
     let jdir = journal_of(vec![
@@ -96,71 +179,81 @@ fn prewarmed_canonical_checkpoint_coexists_with_live_legacy() {
     ]);
     let ckpt = tempfile::tempdir().expect("tempdir ckpt");
 
-    // ЖИВОЙ слепок сегодняшнего прода: одна полоса (GATEWAY_BANDS=0.001).
-    gateway::checkpoint::advance_to(
-        jdir.path(),
-        ckpt.path(),
-        &sel(vec![0.001]),
-        EpochFilter::OwnCaptureOnly,
-        Cursor::LATEST,
-    )
-    .expect("слепок старого набора обязан строиться");
-    let after_legacy = ckpt_files(ckpt.path());
+    // ЖИВОЙ слепок сегодняшнего прода. Он не СОЗДАЁТСЯ новым кодом — он там УЖЕ ЛЕЖИТ,
+    // написанный кодом до M-84. Фикстура повторяет именно это: настоящая форма файла под
+    // легаси-именем. Звать `advance_to` с легаси-набором нельзя — см. шапку файла.
+    let legacy = sel(vec![0.001]);
+    let legacy_name = fp_name(&legacy);
+    let bytes = real_checkpoint_bytes(jdir.path());
+    std::fs::write(ckpt.path().join(&legacy_name), &bytes).expect("положить легаси-слепок");
     assert_eq!(
-        after_legacy.len(),
-        1,
-        "SETUP НЕ СОСТОЯЛСЯ: после первого прогона обязан лежать РОВНО один слепок, \
-         получено {after_legacy:?}"
+        ckpt_files(ckpt.path()),
+        vec![legacy_name.clone()],
+        "SETUP НЕ СОСТОЯЛСЯ: в каталоге обязан лежать РОВНО легаси-слепок"
     );
 
     // ПРОГРЕВ: слепок канонического набора собирается ПРИ ЖИВОМ старом.
+    let canonical = sel(gateway::CANONICAL_DEPTH_BANDS.to_vec());
     gateway::checkpoint::advance_to(
         jdir.path(),
         ckpt.path(),
-        &sel(gateway::CANONICAL_DEPTH_BANDS.to_vec()),
+        &canonical,
         EpochFilter::OwnCaptureOnly,
         Cursor::LATEST,
     )
     .expect("слепок канонического набора обязан строиться РЯДОМ, а не вместо");
 
-    let after_prewarm = ckpt_files(ckpt.path());
+    let after = ckpt_files(ckpt.path());
     assert_eq!(
-        after_prewarm.len(),
+        after.len(),
         2,
         "слепки РАЗНЫХ наборов обязаны СОСУЩЕСТВОВАТЬ: на этом стоит нулевое окно выкатки. \
-         Получено {after_prewarm:?}. Замер прода: холодная пересборка 965 с при интервале \
+         Получено {after:?}. Замер прода: холодная пересборка 965 с при интервале \
          чекпоинтера 900 с — без сосуществования окно не закрывается само"
     );
     assert!(
-        after_prewarm.contains(&after_legacy[0]),
-        "старый слепок ЗАТЁРТ прогревом ({after_legacy:?} → {after_prewarm:?}). Переключение \
-         тогда пойдёт на пустоту, и окно полных проходов откроется ровно в момент выкатки"
+        after.contains(&legacy_name),
+        "старый слепок ЗАТЁРТ прогревом ({legacy_name} → {after:?}). Переключение тогда \
+         пойдёт на пустоту, и окно полных проходов откроется ровно в момент выкатки"
+    );
+    assert!(
+        after.contains(&fp_name(&canonical)),
+        "прогретого слепка нет под ожидаемым именем: {after:?}"
+    );
+    // ПАРНЫЙ vantage: мало «файл на месте» — он обязан быть ТЕМ ЖЕ. Реализация, честно
+    // пересобирающая старый слепок под тем же именем, съела бы ровно то время, ради
+    // экономии которого вся конструкция и затевалась.
+    let still = std::fs::read(ckpt.path().join(&legacy_name)).expect("read legacy after");
+    assert_eq!(
+        still, bytes,
+        "байты живого слепка изменились во время прогрева: он не сосуществует, а \
+         перезаписывается"
     );
 }
 
 #[test]
 fn checkpoint_name_differs_by_band_set() {
-    // ПАРНЫЙ vantage: два файла могли бы существовать и по другой причине. Здесь
-    // проверяется ПРИЧИНА — имя определяется отпечатком, в который входят полосы.
+    // ПАРНЫЙ vantage к предыдущему: два файла могли бы существовать и по другой причине.
+    // Здесь проверяется ПРИЧИНА — имя определяется отпечатком, в который входят полосы.
     let jdir = journal_of(vec![trade(65_000.0, 1.0, Side::Buy, T)]);
-    let a = tempfile::tempdir().expect("a");
-    let b = tempfile::tempdir().expect("b");
-    for (dir, s) in [
-        (a.path(), sel(vec![0.001])),
-        (b.path(), sel(gateway::CANONICAL_DEPTH_BANDS.to_vec())),
-    ] {
-        gateway::checkpoint::advance_to(
-            jdir.path(),
-            dir,
-            &s,
-            EpochFilter::OwnCaptureOnly,
-            Cursor::LATEST,
-        )
-        .expect("advance_to");
-    }
+    let canonical = sel(gateway::CANONICAL_DEPTH_BANDS.to_vec());
+    let dir = tempfile::tempdir().expect("dir");
+    gateway::checkpoint::advance_to(
+        jdir.path(),
+        dir.path(),
+        &canonical,
+        EpochFilter::OwnCaptureOnly,
+        Cursor::LATEST,
+    )
+    .expect("advance_to");
+    assert_eq!(
+        ckpt_files(dir.path()),
+        vec![fp_name(&canonical)],
+        "имя произведённого слепка обязано выводиться из отпечатка канонического селектора"
+    );
     assert_ne!(
-        ckpt_files(a.path()),
-        ckpt_files(b.path()),
+        fp_name(&canonical),
+        fp_name(&sel(vec![0.001])),
         "имена слепков обязаны РАЗЛИЧАТЬСЯ по набору полос — иначе прогретый слепок затрёт \
          живой, и вся конструкция нулевого окна рассыпается"
     );

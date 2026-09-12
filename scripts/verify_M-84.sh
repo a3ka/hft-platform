@@ -48,7 +48,12 @@ step "задача 3 — транспорт: отказ ЯВНЫЙ, а не мо
 chk "cargo test -p gateway-serve --test red_fixed_bands_wire"
 # Самая вероятная «зелёная» реализация — молча заменить присланный набор каноническим.
 # Она удовлетворяет и UX, и экономике, и не ловится ни одним тестом про отпечаток.
-chk "cargo test -p gateway-serve --test red_fixed_bands_wire foreign_bands_rejected_not_swapped"
+# Слой 2 судит НОРМАЛИЗОВАННЫЙ селектор: канонический ПРОХОДИТ (позитивный контроль —
+# именно это значение строит разбор кадра), чужой отвергается с названной причиной.
+# Требовать от валидатора отказа на каноническом значении нельзя: `Selector` не несёт
+# провенанса «пришло от клиента» (`C-221` B-1) — решение живёт на разборе, слой 1.
+chk "cargo test -p gateway-serve --test red_fixed_bands_wire canonical_selector_is_accepted_by_session"
+chk "cargo test -p gateway-serve --test red_fixed_bands_wire foreign_bands_rejected_by_session"
 # НАСТОЯЩИЙ ВХОД, а не внутренняя функция (`C-220` B-1). Прямой вызов валидатора не видит
 # подмену, сидящую в РАЗБОРЕ кадра — критик предъявил её работающей при 16 зелёных тестах.
 chk "cargo test -p gateway-serve --test red_fixed_bands_entrypoint"
@@ -84,6 +89,10 @@ step "задача 5 — НУЛЕВОЕ окно предъявляется ИС
 # Замер 2026-09-10: холодная пересборка 965 с при интервале чекпоинтера 900 с — без
 # сосуществования окно не закрывается само.
 chk "cargo test -p gateway --test red_fixed_bands_prewarm"
+# Гвард обычного API чекпоинта ОСТАЁТСЯ на месте: прогрев не смеет быть входом для
+# произвольной сетки. Мутация «удалить validate_selector из advance_to» роняет этот шаг
+# (`C-221` B-2 — она оставляла четыре набора M-84 зелёными).
+chk "cargo test -p gateway --test red_fixed_bands_prewarm legacy_selector_is_refused_by_the_normal_checkpoint_api"
 
 step "граница C — включение НЕ состоялось (задача 6 заблокирована ДВУМЯ предусловиями)"
 # Зелёный гейт НЕ является разрешением на включение.
