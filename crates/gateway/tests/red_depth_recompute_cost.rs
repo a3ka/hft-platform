@@ -226,7 +226,7 @@ fn md_i8_d6a_counter_actually_measures_visited_levels() {
 /// сумма полосы требует обхода её уровней, `crates/book/src/**` предмету запрещён, и
 /// требовать постоянной цены значило бы требовать невозможного — блокер `C-156` F1.
 #[test]
-fn md_i8_d6b_cost_does_not_multiply_by_number_of_bands() {
+fn md_i8_d6b_single_materialization_pass_for_all_bands() {
     let dir = journal_with_book_depth(400);
 
     let (one, mid_one) = visited(dir.path(), vec![FAR_BAND]);
