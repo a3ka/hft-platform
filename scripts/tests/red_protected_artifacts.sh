@@ -1,0 +1,898 @@
+#!/usr/bin/env bash
+# RED-проба барьера защищённых артефактов (блокер B1, C-006).
+#
+# ЗАЧЕМ. Барьер `scripts/check_protected_artifacts.sh` проверяет ПРАВИЛЬНУЮ вещь (артефакт,
+# который существовал, обязан существовать на HEAD), но был подключён к событию НЕВЕРНО:
+# `ci.yml` звал его как `check_protected_artifacts.sh origin/main`, а на `push`-событии
+# `actions/checkout` ставит `origin/main` на ТОЛЬКО ЧТО ЗАПУШЕННЫЙ коммит ⇒
+# `merge-base(origin/main, HEAD) == HEAD` ⇒ диапазон пуст ⇒ **PASS всегда**.
+# PR в этом репо не используются (все прогоны — event=push на main), поэтому барьер не
+# срабатывал НИКОГДА: коммит, сносящий вердикт критика, проходил CI зелёным. Ложный гейт
+# хуже отсутствующего — он создаёт ощущение защиты.
+#
+# ЭТА ПРОБА ЗОВЁТ БАРЬЕР РОВНО ТАК, КАК ЕГО ЗОВЁТ CI (через env события), а не «как удобно».
+# Гейт, проверенный не тем вызовом, каким его дёргает прод, — не проверен.
+#
+# АНТИ-ПЛАЦЕБО: против пред-фиксной проводки проба ОБЯЗАНА ПАДАТЬ (сценарий P2 даёт exit=0
+# там, где обязан быть отказ). Проверяется так:
+#   git show 2aaa870:scripts/check_protected_artifacts.sh > /tmp/old.sh
+#   BARRIER=/tmp/old.sh bash scripts/tests/red_protected_artifacts.sh   # → FAIL, и это правильно
+set -uo pipefail
+
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+BARRIER="${BARRIER:-${ROOT}/scripts/check_protected_artifacts.sh}"
+
+FAILED=0
+PASSED=0
+pass() { echo "PASS  $*"; PASSED=$((PASSED + 1)); }
+fail() { echo "FAIL  $*"; FAILED=$((FAILED + 1)); }
+
+# Песочница: настоящий git-репозиторий, где мы воспроизводим семантику GitHub-события.
+new_repo() {
+  local d
+  d=$(mktemp -d)
+  git -C "${d}" init -q
+  git -C "${d}" config user.email t@t.local
+  git -C "${d}" config user.name t
+  mkdir -p "${d}/research/critiques" "${d}/research/reviews" "${d}/research/arbitration" \
+           "${d}/milestones" "${d}/docs/rfc"
+  echo "вердикт критика"   > "${d}/research/critiques/C-001.md"
+  echo "вердикт reviewer'а" > "${d}/research/reviews/R-001.md"
+  echo "решение арбитра"    > "${d}/research/arbitration/A-001.md"
+  echo "спека" > "${d}/milestones/M-01.md"
+  echo "контракт" > "${d}/docs/rfc/CT-RFC-01.md"
+  echo "код" > "${d}/src.rs"
+  git -C "${d}" add -A >/dev/null
+  git -C "${d}" commit -qm "base: артефакты гейтов на месте"
+  # Так выглядит main ДО пуша. Это и есть `github.event.before`.
+  git -C "${d}" branch -f main HEAD >/dev/null
+  echo "${d}"
+}
+
+# Вызов барьера ровно как из ci.yml: событие + его база приходят через env.
+#
+# ВАЖНО для честности пробы: перед вызовом мы воспроизводим то, что делает `actions/checkout`
+# на push-событии — ставит `refs/remotes/origin/main` на ТОЛЬКО ЧТО ЗАПУШЕННЫЙ коммит (HEAD).
+# Без этого песочница «добрее» прода: старый барьер падал бы с exit=128 (нет origin/main), и
+# проба зачла бы КРАХ скрипта как отказ гейта — то есть мерила бы не то. С этим ref'ом
+# пред-фиксный барьер ведёт себя ровно как в CI: merge-base(origin/main, HEAD) == HEAD ⇒
+# диапазон пуст ⇒ PASS всегда.
+run_barrier() { # $1=repo $2=event $3=before/base-sha
+  git -C "$1" update-ref refs/remotes/origin/main HEAD
+  ( cd "$1" && EVENT_NAME="$2" PUSH_BEFORE="$3" PR_BASE_SHA="$3" bash "${BARRIER}" >/dev/null 2>&1 )
+  echo $?
+}
+
+expect() { # $1=имя $2=ожидаемый-исход(ok|deny) $3=actual-exit
+  if [ "$2" = "ok" ] && [ "$3" -eq 0 ]; then pass "$1"
+  elif [ "$2" = "deny" ] && [ "$3" -ne 0 ]; then pass "$1"
+  else fail "$1 — exit=$3, ожидалось $2"; fi
+}
+
+# ── SETUP ОБЯЗАН БЫТЬ FAIL-CLOSED (блокер rev9, critic) ───────────────────────────────
+# P15 «подмена симлинком» НЕ СОЗДАВАЛА симлинк: `git rm` удалял единственный файл в
+# `research/critiques/`, каталог исчезал, `ln -s` падал с «No such file or directory» — а проба
+# молча продолжала и печатала PASS, тестируя на самом деле обычное удаление. То есть проба,
+# написанная ПРОТИВ плацебо-гейтов, сама оказалась плацебо: несостоявшийся setup зачитывался
+# за успех. Теперь сценарий обязан ДОКАЗАТЬ, что подготовил ровно то состояние, которое
+# собирается проверять; не доказал — FAIL, а не «ну и ладно».
+head_mode() { git -C "$1" ls-tree HEAD -- "$2" 2>/dev/null | awk '{print $1}'; }
+
+setup_is() { # $1=repo $2=path $3=ожидаемый-режим $4=имя-сценария → 0, если состояние подготовлено
+  local m; m=$(head_mode "$1" "$2")
+  if [ "${m}" != "$3" ]; then
+    fail "$4 — SETUP НЕ СОСТОЯЛСЯ: по пути $2 режим '${m:-<нет>}', ожидался $3. \
+Проба тестировала бы НЕ ТО, что заявляет (ровно плацебо, ради которого её и писали)"
+    return 1
+  fi
+  return 0
+}
+
+# ── SETUP-GUARD ДЛЯ MERGE-СЦЕНАРИЕВ (блокер rev10, critic) ────────────────────────────
+# Тот же класс, что P15: `git merge`/`git commit` в песочнице могут молча не состояться (конфликт,
+# checkout не туда, пустой мерж), а `expect` этого не видит — сценарий рапортует «evil merge» /
+# «merge-born», хотя проверяет ЛИНЕЙНОЕ удаление. Каждый merge-сценарий обязан ДОКАЗАТЬ свою
+# форму: (1) в диапазоне есть merge-коммит; (2) артефакт достиг заявленного HEAD-состояния;
+# для born-in-merge — (3) артефакт действительно СУЩЕСТВОВАЛ где-то в диапазоне.
+setup_has_merge() { # $1=repo $2=before $3=имя → 0, если в before..HEAD есть merge-коммит
+  local n; n=$(git -C "$1" rev-list --merges "$2"..HEAD 2>/dev/null | wc -l | tr -d ' ')
+  if [ "${n:-0}" -lt 1 ]; then
+    fail "$3 — SETUP НЕ СОСТОЯЛСЯ: в ${2:0:7}..HEAD НЕТ merge-коммита (мерж молча не прошёл); \
+проверялось бы линейное удаление, а не заявленный merge-сценарий"
+    return 1
+  fi
+  return 0
+}
+setup_head_absent() { # $1=repo $2=path $3=имя → 0, если пути НЕТ на HEAD (сценарий удаления)
+  if git -C "$1" cat-file -e "HEAD:$2" 2>/dev/null; then
+    fail "$3 — SETUP НЕ СОСТОЯЛСЯ: $2 всё ещё на HEAD — удаление, которое сценарий обязан \
+проверять, не случилось"
+    return 1
+  fi
+  return 0
+}
+setup_existed_in_range() { # $1=repo $2=path $3=before $4=имя → 0, если путь был в дереве диапазона
+  local c
+  git -C "$1" cat-file -e "$3:$2" 2>/dev/null && return 0
+  for c in $(git -C "$1" rev-list "$3"..HEAD); do
+    git -C "$1" cat-file -e "${c}:$2" 2>/dev/null && return 0
+  done
+  fail "$4 — SETUP НЕ СОСТОЯЛСЯ: $2 не существовал НИ В ОДНОМ коммите диапазона — \
+born-in-merge/side не подготовлен (add молча не прошёл)"
+  return 1
+}
+
+# ── SETUP-GUARD для НЕ-merge сценариев (блокер rev11, critic) ─────────────────────────
+# Тот же класс: если scenario-defining команда (git mv / git rm+trailer / выбор base) молча не
+# сработала, сценарий проходит по ДРУГОЙ причине (P4 деградирует в «чистая ветка», P8/P9 — в
+# «обычное удаление»), а проба рапортует заявленное покрытие. Каждый сценарий доказывает форму.
+setup_renamed_within() { # $1=repo $2=старый-путь $3=новый-путь $4=before $5=имя
+  # старого нет на HEAD, новый ЕСТЬ на HEAD как файл, и переименование видно в диапазоне (статус R).
+  if git -C "$1" cat-file -e "HEAD:$2" 2>/dev/null; then
+    fail "$5 — SETUP НЕ СОСТОЯЛСЯ: старый путь $2 всё ещё на HEAD — переименование не случилось"; return 1
+  fi
+  if [ "$(head_mode "$1" "$3")" != "100644" ] && [ "$(head_mode "$1" "$3")" != "100755" ]; then
+    fail "$5 — SETUP НЕ СОСТОЯЛСЯ: новый путь $3 не файл на HEAD — переименование не случилось"; return 1
+  fi
+  if ! git -C "$1" log --diff-filter=R -M --name-status --format='' "$4"..HEAD \
+        | grep -qE "^R[0-9]*	${2}	${3}$"; then
+    fail "$5 — SETUP НЕ СОСТОЯЛСЯ: git не видит переименование $2 → $3 (статус R) в диапазоне — \
+проверялась бы просто чистая ветка, а не rename внутри защиты"; return 1
+  fi
+  return 0
+}
+setup_deleted_with_override() { # $1=repo $2=путь $3=before $4=имя
+  # артефакта нет на HEAD, и КОММИТ, удаливший его, сам несёт ALLOW-ARTIFACT-DELETE в теле.
+  if git -C "$1" cat-file -e "HEAD:$2" 2>/dev/null; then
+    fail "$4 — SETUP НЕ СОСТОЯЛСЯ: $2 всё ещё на HEAD — удаление не случилось, override нечего \
+подтверждать"; return 1
+  fi
+  local c; c=$(git -C "$1" log --diff-filter=D --format='%H' "$3"..HEAD -- "$2" | head -1)
+  if [ -z "${c}" ]; then
+    fail "$4 — SETUP НЕ СОСТОЯЛСЯ: ни один коммит диапазона не удалял $2"; return 1
+  fi
+  if ! git -C "$1" log -1 --format='%B' "${c}" | grep -q '^ALLOW-ARTIFACT-DELETE:'; then
+    fail "$4 — SETUP НЕ СОСТОЯЛСЯ: удаляющий коммит НЕ несёт ALLOW-ARTIFACT-DELETE — \
+проверялось бы обычное удаление, а не осознанный override"; return 1
+  fi
+  return 0
+}
+setup_base_is_zero() { # $1=аргумент-базы $2=имя → 0, если это zero-SHA
+  case "$1" in
+    *[!0]*) fail "$2 — SETUP НЕ СОСТОЯЛСЯ: база '$1' НЕ zero-SHA — отказ пришёл бы от обычного \
+удаления, а не от zero-SHA fail-closed"; return 1 ;;
+    "")     fail "$2 — SETUP НЕ СОСТОЯЛСЯ: база пуста, а не zero-SHA"; return 1 ;;
+    *) return 0 ;;
+  esac
+}
+setup_base_not_ancestor() { # $1=repo $2=аргумент-базы $3=имя → 0, если база НЕ предок HEAD
+  if git -C "$1" merge-base --is-ancestor "$2" HEAD 2>/dev/null; then
+    fail "$3 — SETUP НЕ СОСТОЯЛСЯ: база '${2:0:7}' ЯВЛЯЕТСЯ предком HEAD — отказ пришёл бы от \
+обычного удаления, а не от проверки «база не предок»"; return 1
+  fi
+  return 0
+}
+# Зеркало `is_protected` из `scripts/check_protected_artifacts.sh` (список путей обязан
+# совпадать). Функция ЖИВЁТ ЗДЕСЬ намеренно: тот скрипт не источаемый (при `source` он
+# исполняет проверку и завершает процесс), а без определения вызов ниже возвращал 127, и
+# `if is_protected ...` был тождественно ложен — setup-guard P1 не срабатывал НИКОГДА
+# (замер 2026-08-04: `bash -c 'is_protected x'` → `command not found`, код 127).
+is_protected() {
+  case "$1" in
+    research/critiques/*.md|research/reviews/*.md|research/arbitration/*.md) return 0 ;;
+    milestones/*.md|docs/rfc/*|docs/contract-rfc/*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+setup_source_only_commit() { # $1=repo $2=before $3=имя → 0, если диапазон непуст и изменён ТОЛЬКО незащищённый
+  if [ "$(git -C "$1" rev-parse HEAD)" = "$2" ]; then
+    fail "$3 — SETUP НЕ СОСТОЯЛСЯ: диапазон ПУСТ (коммит не случился) — барьер тривиально \
+пропускает пустой диапазон, «чистый push» не проверен"; return 1
+  fi
+  local changed p; changed=$(git -C "$1" diff --name-only "$2" HEAD)
+  [ -n "${changed}" ] || { fail "$3 — SETUP НЕ СОСТОЯЛСЯ: коммит ничего не изменил"; return 1; }
+  for p in ${changed}; do
+    if is_protected "${p}"; then
+      fail "$3 — SETUP НЕ СОСТОЯЛСЯ: изменён ЗАЩИЩЁННЫЙ ${p} — это не «чистый source-only push»"
+      return 1
+    fi
+  done
+  return 0
+}
+setup_file_content_changed() { # $1=repo $2=path $3=before $4=имя → 0, если blob изменён и это нормальный непустой файл
+  if [ "$(git -C "$1" rev-parse HEAD)" = "$3" ]; then
+    fail "$4 — SETUP НЕ СОСТОЯЛСЯ: диапазон ПУСТ (правка не закоммичена) — барьер пропускает \
+пустой диапазон, «правка содержимого» не проверена"; return 1
+  fi
+  local b0 b1; b0=$(git -C "$1" rev-parse "$3:$2" 2>/dev/null || echo A)
+  b1=$(git -C "$1" rev-parse "HEAD:$2" 2>/dev/null || echo B)
+  if [ "${b0}" = "${b1}" ]; then
+    fail "$4 — SETUP НЕ СОСТОЯЛСЯ: содержимое $2 НЕ изменилось (тот же blob) — правка не случилась"
+    return 1
+  fi
+  setup_is "$1" "$2" 100644 "$4" || return 1   # остался нормальным файлом (не подмена типа)
+  [ "$(git -C "$1" cat-file -s "${b1}" 2>/dev/null || echo 0)" -gt 0 ] \
+    || { fail "$4 — SETUP НЕ СОСТОЯЛСЯ: $2 на HEAD пуст — это уже не «правка», а выхолащивание"; return 1; }
+  return 0
+}
+
+# ── P1: чистый push (артефакты не тронуты) — барьер обязан ПРОПУСТИТЬ ─────────────────
+r=$(new_repo); before=$(git -C "$r" rev-parse HEAD)
+echo "правка" >> "$r/src.rs"; git -C "$r" commit -qam "feat: обычная правка кода"
+if setup_source_only_commit "$r" "$before" "P1"; then
+  expect "P1 чистый push пропускается" ok "$(run_barrier "$r" push "$before")"
+fi
+
+# ── P2: ГЛАВНЫЙ (B1) — push-коммит СНОСИТ вердикт критика ─────────────────────────────
+# Ровно тот инцидент, ради которого барьер писался (139b399 удалил C-006 вместе с §8-правками).
+# Пред-фиксная проводка возвращала здесь 0.
+r=$(new_repo); before=$(git -C "$r" rev-parse HEAD)
+git -C "$r" rm -q research/critiques/C-001.md; git -C "$r" commit -qm "docs: §8 пруфы (и вердикт уехал вместе с git commit -a)"
+expect "P2 удаление вердикта в push-коммите ВАЛИТ гейт" deny "$(run_barrier "$r" push "$before")"
+
+# ── P3: rename защищённого пути В НЕЗАЩИЩЁННЫЙ — исчезновение под видом переезда ──────
+r=$(new_repo); before=$(git -C "$r" rev-parse HEAD)
+mkdir -p "$r/notes"; git -C "$r" mv research/critiques/C-001.md notes/C-001.md
+git -C "$r" commit -qm "chore: прибрал каталог"
+expect "P3 переезд артефакта из-под защиты ВАЛИТ гейт" deny "$(run_barrier "$r" push "$before")"
+
+# ── P4: переезд в ДРУГОЙ защищённый путь — легитимная миграция, пропускается ──────────
+r=$(new_repo); before=$(git -C "$r" rev-parse HEAD)
+git -C "$r" mv docs/rfc/CT-RFC-01.md docs/rfc/CT-RFC-01-renamed.md
+git -C "$r" commit -qm "docs: переименование RFC внутри защиты"
+if setup_renamed_within "$r" docs/rfc/CT-RFC-01.md docs/rfc/CT-RFC-01-renamed.md "$before" "P4"; then
+  expect "P4 переезд внутри защиты пропускается" ok "$(run_barrier "$r" push "$before")"
+fi
+
+# ── P5: осознанное удаление с override В ТЕЛЕ ТОГО ЖЕ коммита ─────────────────────────
+r=$(new_repo); before=$(git -C "$r" rev-parse HEAD)
+git -C "$r" rm -q milestones/M-01.md
+git -C "$r" commit -qm "chore: удаляю милестоун
+
+ALLOW-ARTIFACT-DELETE: спека слита в M-02, согласовано founder'ом"
+if setup_deleted_with_override "$r" milestones/M-01.md "$before" "P5"; then
+  expect "P5 ALLOW-ARTIFACT-DELETE в том же коммите пропускается" ok "$(run_barrier "$r" push "$before")"
+fi
+
+# ── P6: override в ЧУЖОМ коммите диапазона не легитимизирует удаление ─────────────────
+r=$(new_repo); before=$(git -C "$r" rev-parse HEAD)
+git -C "$r" rm -q milestones/M-01.md; git -C "$r" commit -qm "chore: удаляю милестоун (без обоснования)"
+echo x >> "$r/src.rs"; git -C "$r" commit -qam "feat: другой коммит
+
+ALLOW-ARTIFACT-DELETE: обоснование не в том коммите"
+expect "P6 override в чужом коммите НЕ спасает" deny "$(run_barrier "$r" push "$before")"
+
+# ── P7: «злой мерж» — файл выброшен мержем, ни один коммит его не удалял ──────────────
+r=$(new_repo); before=$(git -C "$r" rev-parse HEAD)
+git -C "$r" checkout -qb side
+echo "правка" >> "$r/src.rs"; git -C "$r" commit -qam "side: правка"
+git -C "$r" checkout -q main >/dev/null 2>&1 || git -C "$r" checkout -q -
+git -C "$r" merge -q --no-ff -m "merge: side" side >/dev/null 2>&1
+git -C "$r" rm -q research/critiques/C-001.md
+git -C "$r" commit -q --amend --no-edit >/dev/null 2>&1   # артефакт исчез ВНУТРИ merge-коммита
+if setup_has_merge "$r" "$before" "P7" && setup_head_absent "$r" research/critiques/C-001.md "P7"; then
+  expect "P7 артефакт, выброшенный мержем, ВАЛИТ гейт" deny "$(run_barrier "$r" push "$before")"
+fi
+
+# ── P8: fail-closed — zero-SHA before (создание ветки / force-push) ───────────────────
+# «Базы нет» НЕ ЗНАЧИТ «проверять нечего»: это значит, что мы не можем гарантировать целостность.
+r=$(new_repo); git -C "$r" rm -q research/critiques/C-001.md; git -C "$r" commit -qm "снос под видом новой ветки"
+ZERO=0000000000000000000000000000000000000000
+if setup_base_is_zero "$ZERO" "P8"; then
+  expect "P8 zero-SHA база — fail-closed (не пропуск)" deny "$(run_barrier "$r" push "$ZERO")"
+fi
+
+# ── P9: fail-closed — база не предок HEAD (история переписана force-push'ем) ──────────
+r=$(new_repo)
+main_br=$(git -C "$r" branch --show-current)
+base_root=$(git -C "$r" rev-parse HEAD)
+git -C "$r" rm -q research/critiques/C-001.md; git -C "$r" commit -qm "снос при переписанной истории"
+# Расходящийся СИБЛИНГ от корня В ТОМ ЖЕ репо: объект СУЩЕСТВУЕТ в объектной базе $r (иначе барьер
+# отклонил бы по ветке «объект отсутствует», а не «не предок»), но предком HEAD НЕ является
+# (у alt и HEAD общий предок base_root, но alt — параллельная ветка). Так P9 бьёт именно в
+# проверку «база не предок» (история переписана force-push'ем), а не в missing-object.
+git -C "$r" checkout -q -b alt "${base_root}"
+git -C "$r" commit -q --allow-empty -m "divergent (переписанная история)"
+alt=$(git -C "$r" rev-parse HEAD)
+git -C "$r" checkout -q "${main_br}"   # назад на ветку с удалением (её видит run_barrier)
+if setup_base_not_ancestor "$r" "${alt}" "P9"; then
+  expect "P9 база не предок HEAD — fail-closed" deny "$(run_barrier "$r" push "${alt}")"
+fi
+
+# ── P10: fail-closed — событие не задано (барьер зовут «как удобно», а не как CI) ─────
+r=$(new_repo)
+expect "P10 без события — fail-closed" deny "$(run_barrier "$r" "" "")"
+
+# ── P11 (rev7): артефакт РОДИЛСЯ В SIDE-ВЕТКЕ, пришёл мержем — и удалён потом ─────────
+# Дыра, которую нашёл критик: множество «существовавших» собиралось через
+# `git log --diff-filter=AR`, а git log НЕ показывает диффы merge-коммитов ⇒ артефакт,
+# пришедший мержем, барьер не видел вовсе и его удаление пропускал (exit=0).
+r=$(new_repo); before=$(git -C "$r" rev-parse HEAD)
+git -C "$r" checkout -qb side2
+echo "вердикт, рождённый в ветке" > "$r/research/critiques/C-002.md"
+git -C "$r" add research/critiques/C-002.md >/dev/null; git -C "$r" commit -qm "critic: вердикт C-002"
+git -C "$r" checkout -q -; git -C "$r" merge -q --no-ff -m "merge: side2 (вердикт приезжает мержем)" side2
+git -C "$r" rm -q research/critiques/C-002.md; git -C "$r" commit -qm "docs: правки (вердикт уехал за компанию)"
+if setup_has_merge "$r" "$before" "P11" \
+   && setup_existed_in_range "$r" research/critiques/C-002.md "$before" "P11" \
+   && setup_head_absent "$r" research/critiques/C-002.md "P11"; then
+  expect "P11 артефакт, пришедший МЕРЖЕМ, и удалённый потом — ВАЛИТ гейт" deny "$(run_barrier "$r" push "$before")"
+fi
+
+# ── P12 (rev7): артефакт СОЗДАН ПРЯМО В ТЕЛЕ merge-коммита — и удалён потом ───────────
+r=$(new_repo); before=$(git -C "$r" rev-parse HEAD)
+git -C "$r" checkout -qb side3
+echo "правка" >> "$r/src.rs"; git -C "$r" commit -qam "side3: правка"
+git -C "$r" checkout -q -; git -C "$r" merge -q --no-ff --no-commit side3 >/dev/null 2>&1
+echo "вердикт, рождённый в мерже" > "$r/research/critiques/C-003.md"
+git -C "$r" add research/critiques/C-003.md >/dev/null
+git -C "$r" commit -qm "merge: side3 (+ вердикт C-003 прямо в теле мержа)"
+git -C "$r" rm -q research/critiques/C-003.md; git -C "$r" commit -qm "chore: прибрал"
+if setup_has_merge "$r" "$before" "P12" \
+   && setup_existed_in_range "$r" research/critiques/C-003.md "$before" "P12" \
+   && setup_head_absent "$r" research/critiques/C-003.md "P12"; then
+  expect "P12 артефакт, рождённый В МЕРЖЕ, и удалённый потом — ВАЛИТ гейт" deny "$(run_barrier "$r" push "$before")"
+fi
+
+# ── P13 (rev7, ЛОЖНОЕ СРАБАТЫВАНИЕ): артефакт пришёл мержем и ЦЕЛ — пропускается ──────
+# Расширение множества «существовавших» не смеет сделать барьер параноиком: honest merge,
+# приносящий вердикт критика, обязан проходить.
+r=$(new_repo); before=$(git -C "$r" rev-parse HEAD)
+git -C "$r" checkout -qb side4
+echo "вердикт" > "$r/research/critiques/C-004.md"
+git -C "$r" add research/critiques/C-004.md >/dev/null; git -C "$r" commit -qm "critic: вердикт C-004"
+git -C "$r" checkout -q -; git -C "$r" merge -q --no-ff -m "merge: side4" side4
+if setup_has_merge "$r" "$before" "P13" && setup_is "$r" research/critiques/C-004.md 100644 "P13"; then
+  expect "P13 артефакт, пришедший мержем и ЦЕЛЫЙ, пропускается (нет ложных срабатываний)" ok \
+    "$(run_barrier "$r" push "$before")"
+fi
+
+# ── P14 (rev8): файл подменён КАТАЛОГОМ на том же пути ────────────────────────────────
+# `git cat-file -e HEAD:path` говорит «объект есть» и для ДЕРЕВА — артефакт уничтожен, барьер молчал.
+r=$(new_repo); before=$(git -C "$r" rev-parse HEAD)
+git -C "$r" rm -q research/critiques/C-001.md
+mkdir -p "$r/research/critiques/C-001.md"
+echo "мусор" > "$r/research/critiques/C-001.md/README.md"
+git -C "$r" add research/critiques/C-001.md >/dev/null
+git -C "$r" commit -qm "chore: на месте вердикта теперь каталог"
+# `ls-tree HEAD -- path` для каталога отдаёт запись дерева (040000) — это и есть подмена типа.
+if setup_is "$r" research/critiques/C-001.md 040000 "P14"; then
+  expect "P14 файл подменён КАТАЛОГОМ — ВАЛИТ гейт" deny "$(run_barrier "$r" push "$before")"
+fi
+
+# ── P15 (rev8): файл подменён СИМЛИНКОМ ───────────────────────────────────────────────
+r=$(new_repo); before=$(git -C "$r" rev-parse HEAD)
+git -C "$r" rm -q research/critiques/C-001.md
+# `git rm` унёс единственный файл ⇒ каталога больше нет. Без mkdir симлинк НЕ создавался, и
+# проба тихо тестировала обычное удаление (блокер rev9). Каталог восстанавливаем ЯВНО.
+mkdir -p "$r/research/critiques"
+ln -s /dev/null "$r/research/critiques/C-001.md"
+git -C "$r" add research/critiques/C-001.md >/dev/null
+git -C "$r" commit -qm "chore: вердикт теперь симлинк в /dev/null"
+if setup_is "$r" research/critiques/C-001.md 120000 "P15"; then
+  expect "P15 файл подменён СИМЛИНКОМ — ВАЛИТ гейт" deny "$(run_barrier "$r" push "$before")"
+fi
+
+# ── P16 (rev8): файл усечён в НОЛЬ БАЙТ — то же удаление, только вежливое ─────────────
+r=$(new_repo); before=$(git -C "$r" rev-parse HEAD)
+: > "$r/research/critiques/C-001.md"
+git -C "$r" commit -qam "chore: вердикт выпотрошен до нуля байт"
+if setup_is "$r" research/critiques/C-001.md 100644 "P16" \
+   && [ "$(git -C "$r" cat-file -s "$(git -C "$r" rev-parse HEAD:research/critiques/C-001.md)")" -eq 0 ]; then
+  expect "P16 артефакт усечён в 0 байт — ВАЛИТ гейт" deny "$(run_barrier "$r" push "$before")"
+else
+  fail "P16 — SETUP НЕ СОСТОЯЛСЯ: файл не пуст, проба тестировала бы не то"
+fi
+
+# ── P17 (rev8, ЛОЖНОЕ СРАБАТЫВАНИЕ): обычная правка содержимого — пропускается ────────
+r=$(new_repo); before=$(git -C "$r" rev-parse HEAD)
+echo "дополнение вердикта" >> "$r/research/critiques/C-001.md"
+git -C "$r" commit -qam "critic: дополнил вердикт"
+if setup_file_content_changed "$r" research/critiques/C-001.md "$before" "P17"; then
+  expect "P17 правка содержимого артефакта пропускается (нет ложных срабатываний)" ok \
+    "$(run_barrier "$r" push "$before")"
+fi
+
+# ── P19 (R-032 F-10): вердикт REVIEWER'а снесён — барьер обязан ВАЛИТЬ ────────────────
+# research/reviews/R-NNN.md — условие merge по gates.md §4 (R-031: три milestone'а уехали в
+# прод без него). До R-032 путь в is_protected НЕ входил: удаление проходило молча, exit=0.
+r=$(new_repo); before=$(git -C "$r" rev-parse HEAD)
+git -C "$r" rm -q research/reviews/R-001.md; git -C "$r" commit -qm "docs: правки (и вердикт reviewer'а уехал)"
+expect "P19 удаление вердикта reviewer'а ВАЛИТ гейт" deny "$(run_barrier "$r" push "$before")"
+
+# ── P20 (R-032 F-10): решение АРБИТРА снесено — барьер обязан ВАЛИТЬ ──────────────────
+# Решение арбитра обязательно к исполнению обеими сторонами (gates.md §0); стереть его молча
+# означает отменить гейт задним числом.
+r=$(new_repo); before=$(git -C "$r" rev-parse HEAD)
+git -C "$r" rm -q research/arbitration/A-001.md; git -C "$r" commit -qm "docs: чистка (и решение арбитра уехало)"
+expect "P20 удаление решения арбитра ВАЛИТ гейт" deny "$(run_barrier "$r" push "$before")"
+
+# ── P21 (`TD-163`, ЛОЖНОЕ СРАБАТЫВАНИЕ — main реально покраснел 2026-08-24) ───────────
+# Ветка форкнута ДО того, как `main` удалил артефакт С ТОКЕНОМ (архивный переезд по норме Р-2),
+# и влита merge'ем. Её дерево несёт старый путь, поэтому он попадает в `existed`; объясняющий
+# коммит при этом лежит ДО базы события и в диапазон не входит — барьер объявлял артефакт
+# «исчез, и ни один коммит его не удалял», то есть evil merge'ем.
+#
+# Замер, из-за которого сценарий появился: merge PR #29 → `main` красен, Deploy SKIPPED
+# (`R-118` §10); симуляция merge'а PR #66 → 24 FAIL, exit=1. Оба открытых PR были форкнуты до
+# архивного переезда. Красное снялось СЛУЧАЙНЫМ следующим коммитом — это обход, не фикс.
+#
+# Третий вариант той же асимметрии, что дала `TD-092`: множество «что существовало» собирается
+# честно (по состоянию), а множество «чем это объясняется» ограничено диапазоном.
+r=$(new_repo)
+git -C "$r" checkout -q -b feat
+echo "работа ветки" >> "$r/src.rs"; git -C "$r" commit -qam "feat: работа ветки, форкнутой ДО переезда"
+branch_tip=$(git -C "$r" rev-parse HEAD)
+git -C "$r" checkout -q main
+git -C "$r" rm -q milestones/M-01.md
+git -C "$r" commit -qm "chore(archive): спека уезжает в архив
+
+ALLOW-ARTIFACT-DELETE: перенос закрытой спеки по норме Р-2" >/dev/null
+removal=$(git -C "$r" rev-parse HEAD)
+before=$(git -C "$r" rev-parse HEAD)
+git -C "$r" merge -q --no-ff feat -m "merge ветки, форкнутой ДО удаления"
+p21_ok=1
+git -C "$r" cat-file -e "${branch_tip}:milestones/M-01.md" 2>/dev/null || p21_ok=0   # путь ЖИВ на ветке
+git -C "$r" cat-file -e "HEAD:milestones/M-01.md" 2>/dev/null && p21_ok=0            # и ОТСУТСТВУЕТ на HEAD
+git -C "$r" merge-base --is-ancestor "$removal" "$before" || p21_ok=0                # объяснение ДО базы
+if [ "$p21_ok" -ne 1 ]; then
+  fail "P21 SETUP НЕ СОСТОЯЛСЯ: нужен путь, живой на ветке, отсутствующий на HEAD, с объясняющим \
+коммитом ДО базы события — иначе сценарий не давит на предмет TD-163"
+else
+  expect "P21 ветка старше архивного переезда: удаление объяснено ДО базы ⇒ проход" ok "$(run_barrier "$r" push "$before")"
+fi
+
+# ── P22 — АНТИ-БЛАНКЕТ к послаблению P21 ─────────────────────────────────────────────
+# Послабление обязано быть УЗКИМ: история спрашивается ТОЛЬКО когда диапазон удаления не
+# содержит вовсе. Иначе старое объяснённое удаление становится вечной индульгенцией — файл
+# удалён с токеном, воссоздан, удалён СНОВА молча, и барьер находит в истории первый токен.
+# Без этого сценария реализация «искать объяснение по всей истории» прошла бы P21 и открыла дыру.
+r=$(new_repo)
+git -C "$r" rm -q milestones/M-01.md
+git -C "$r" commit -qm "chore(archive): первое удаление
+
+ALLOW-ARTIFACT-DELETE: объяснённое удаление, легитимное" >/dev/null
+mkdir -p "$r/milestones"   # `git rm` уносит опустевший каталог — та же ловушка, что в P15
+echo "спека воссоздана" > "$r/milestones/M-01.md"; git -C "$r" add -A
+git -C "$r" commit -qm "docs: спека заведена заново"
+before=$(git -C "$r" rev-parse HEAD)
+git -C "$r" rm -q milestones/M-01.md
+git -C "$r" commit -qm "docs: чистка (второе удаление, БЕЗ токена)"
+p22_ok=1
+git -C "$r" cat-file -e "${before}:milestones/M-01.md" 2>/dev/null || p22_ok=0       # на базе путь ЖИВ
+[ -n "$(git -C "$r" log --format='%H' "${before}..HEAD" -- milestones/M-01.md)" ] || p22_ok=0
+if [ "$p22_ok" -ne 1 ]; then
+  fail "P22 SETUP НЕ СОСТОЯЛСЯ: нужен путь, живой на базе и удалённый ВНУТРИ диапазона без \
+токена — иначе сценарий не проверяет узость послабления"
+else
+  expect "P22 анти-бланкет: старый токен НЕ оправдывает новое молчаливое удаление" deny "$(run_barrier "$r" push "$before")"
+fi
+
+# ── P23 (`C-136` Б-1) — ДРЕВНИЙ ТОКЕН НЕ БЛАГОСЛОВЛЯЕТ EVIL MERGE ВОССОЗДАННОГО ПУТИ ──
+# Класс, которого не видел ни `P22`, ни его автор. `P22` удаляет путь явным `git rm` — такое
+# удаление ПОПАДАЕТ в диапазон, fallback не включается, и дыра остаётся невидимой. Здесь путь
+# выбрасывает MERGE: удаления в диапазоне нет вовсе (`--diff-merges` по умолчанию выключен),
+# fallback включается и находит ДРЕВНИЙ токен, к нынешнему исчезновению отношения не имеющий.
+#
+# Сужение, которое сценарий пиннит: fallback не применяется к пути, ПОЯВИВШЕМУСЯ в диапазоне.
+# Появился здесь — значит и исчезновение здешнее.
+r=$(new_repo)
+git -C "$r" rm -q milestones/M-01.md
+git -C "$r" commit -qm "chore(archive): древнее удаление
+
+ALLOW-ARTIFACT-DELETE: объяснённое удаление далёкого прошлого" >/dev/null
+ancient=$(git -C "$r" rev-parse HEAD)
+before=$(git -C "$r" rev-parse HEAD)
+git -C "$r" checkout -q -b feat
+mkdir -p "$r/milestones"
+echo "спека заведена заново" > "$r/milestones/M-01.md"; git -C "$r" add -A
+git -C "$r" commit -qm "docs: спека воссоздана в диапазоне"
+git -C "$r" checkout -q -
+git -C "$r" merge -q --no-commit --no-ff feat >/dev/null 2>&1
+git -C "$r" rm -q -f milestones/M-01.md >/dev/null 2>&1
+git -C "$r" commit -qm "merge ветки (путь выброшен САМИМ merge'ем — evil merge)"
+p23_ok=1
+git -C "$r" merge-base --is-ancestor "$ancient" "$before" || p23_ok=0                 # токен ДО базы
+[ -n "$(git -C "$r" log --full-history --diff-filter=A --format='%H' "${before}..HEAD" -- milestones/M-01.md)" ] || p23_ok=0   # путь ПОЯВИЛСЯ в диапазоне
+[ -z "$(git -C "$r" log --full-history --diff-filter=DR --format='%H' "${before}..HEAD" -- milestones/M-01.md)" ] || p23_ok=0  # и НИ ОДИН коммит его не удалял
+git -C "$r" cat-file -e "HEAD:milestones/M-01.md" 2>/dev/null && p23_ok=0             # на HEAD его нет
+if [ "$p23_ok" -ne 1 ]; then
+  fail "P23 SETUP НЕ СОСТОЯЛСЯ: нужен древний токен-предок базы, путь ВОССОЗДАННЫЙ в диапазоне, \
+диапазон БЕЗ удалений и отсутствие пути на HEAD — иначе сценарий не давит на fallback"
+else
+  expect "P23 древний токен НЕ благословляет evil merge воссозданного пути" deny "$(run_barrier "$r" push "$before")"
+fi
+
+# ── P24 (`TD-163` круг 3) — ПУТЬ РОЖДЁН В ТЕЛЕ MERGE'А: дискриминатор круга 2 здесь СЛЕП ──
+# `P23` закрыл КЛЕТКУ, а не КЛАСС. Он воссоздавал путь обычным коммитом side-ветки — такое
+# рождение видно `git log --diff-filter=A`, на котором стоял дискриминатор круга 2. Способ
+# обхода — воссоздать путь ПРЯМО В ТЕЛЕ merge'а: `git log` по умолчанию не показывает диффы
+# merge-коммитов, а `--full-history` их НЕ включает (включает `--diff-merges`, которого там
+# не было). `born_here` оставался пуст, fallback включался, древний токен благословлял
+# сегодняшнюю потерю — то самое ложное зелёное, ради которого писан `C-136` Б-1.
+#
+# Замер, из-за которого сценарий появился (фикстура ниже, прод-форма вызова):
+#   барьер `origin/main` → exit=1 (ловил) · барьер круга 2 `3edb657` → NOTE + exit=0 (пропускал)
+#
+# Сценарий строится ТЕМ СПОСОБОМ, каким послабление будут обходить, а не первым пришедшим в
+# голову (`docs/workflow/session-handover-2026-08-24.md` §5 п.4). Guard №2 ниже это и
+# закрепляет: он ТРЕБУЕТ, чтобы диффовый вопрос круга 2 давал ПУСТО, — иначе фикстура
+# скатилась бы обратно в класс `P23` и проверяла бы уже закрытое.
+r=$(new_repo)
+git -C "$r" rm -q milestones/M-01.md
+git -C "$r" commit -qm "chore(archive): древнее удаление
+
+ALLOW-ARTIFACT-DELETE: объяснённое удаление далёкого прошлого" >/dev/null
+ancient=$(git -C "$r" rev-parse HEAD)
+before=$(git -C "$r" rev-parse HEAD)
+# merge №1 — путь РОЖДАЕТСЯ в теле мержа (ни у одного родителя его нет)
+git -C "$r" checkout -q -b feat24; echo "работа" >> "$r/src.rs"; git -C "$r" commit -qam "feat24: работа"
+git -C "$r" checkout -q -
+git -C "$r" merge -q --no-commit --no-ff feat24 >/dev/null 2>&1
+mkdir -p "$r/milestones"; echo "спека воссоздана В ТЕЛЕ МЕРЖА" > "$r/milestones/M-01.md"
+git -C "$r" add milestones/M-01.md
+git -C "$r" commit -qm "merge feat24 (спека воссоздана ПРЯМО в теле мержа)"
+born_merge=$(git -C "$r" rev-parse HEAD)
+# merge №2 — тот же приём наоборот: путь выброшен САМИМ мержем, без токена
+git -C "$r" checkout -q -b feat24b; echo "ещё" >> "$r/src.rs"; git -C "$r" commit -qam "feat24b: работа"
+git -C "$r" checkout -q -
+git -C "$r" merge -q --no-commit --no-ff feat24b >/dev/null 2>&1
+git -C "$r" rm -q -f milestones/M-01.md >/dev/null 2>&1
+git -C "$r" commit -qm "merge feat24b (путь выброшен САМИМ мержем — evil merge)"
+p24_ok=1
+git -C "$r" merge-base --is-ancestor "$ancient" "$before" || p24_ok=0                            # токен ДО базы
+[ -z "$(git -C "$r" log --full-history --diff-filter=A --format='%H' "${before}..HEAD" -- milestones/M-01.md)" ] || p24_ok=0   # ⚠ дискриминатор круга 2 обязан быть СЛЕП
+git -C "$r" cat-file -e "${born_merge}:milestones/M-01.md" 2>/dev/null || p24_ok=0               # но путь ЖИЛ в диапазоне
+[ -z "$(git -C "$r" log --full-history --diff-filter=DR --format='%H' "${before}..HEAD" -- milestones/M-01.md)" ] || p24_ok=0  # и НИ ОДИН коммит его не удалял
+git -C "$r" cat-file -e HEAD:milestones/M-01.md 2>/dev/null && p24_ok=0                          # на HEAD его нет
+if [ "$p24_ok" -ne 1 ]; then
+  fail "P24 SETUP НЕ СОСТОЯЛСЯ: нужен древний токен-предок базы, путь РОЖДЁННЫЙ В ТЕЛЕ МЕРЖА \
+(и потому невидимый для --diff-filter=A), диапазон БЕЗ D/R и отсутствие пути на HEAD — иначе \
+сценарий скатывается в уже закрытый класс P23 и не давит на предмет круга 3"
+else
+  expect "P24 древний токен НЕ благословляет evil merge пути, РОЖДЁННОГО В ТЕЛЕ МЕРЖА" deny "$(run_barrier "$r" push "$before")"
+fi
+
+# ── P25 — ПОЗИТИВНЫЙ КОНТРОЛЬ сужения P24: рождение в мерже НЕ должно красить легитимное ──
+# Обратный вопрос к P24 (`testing.md`, «что пришлось ослабить рядом»): ужесточение обязано
+# оставить зелёным путь, который РОДИЛСЯ в теле мержа и был удалён В ДИАПАЗОНЕ С ТОКЕНОМ.
+# Здесь fallback не нужен вовсе — удаление лежит в диапазоне и судится своим телом.
+# Без этого сценария «запретить fallback рождённым здесь» нельзя отличить от «валить всё,
+# что родилось в мерже».
+r=$(new_repo)
+before=$(git -C "$r" rev-parse HEAD)
+git -C "$r" checkout -q -b feat25; echo "работа" >> "$r/src.rs"; git -C "$r" commit -qam "feat25: работа"
+git -C "$r" checkout -q -
+git -C "$r" merge -q --no-commit --no-ff feat25 >/dev/null 2>&1
+mkdir -p "$r/research/critiques"; echo "новый вердикт круга" > "$r/research/critiques/C-777.md"
+git -C "$r" add research/critiques/C-777.md
+git -C "$r" commit -qm "merge feat25 (вердикт заведён в теле мержа)"
+born25=$(git -C "$r" rev-parse HEAD)
+git -C "$r" rm -q research/critiques/C-777.md
+git -C "$r" commit -qm "chore(archive): вердикт уезжает в архив
+
+ALLOW-ARTIFACT-DELETE: осознанный перенос вердикта, причина названа" >/dev/null
+p25_ok=1
+git -C "$r" cat-file -e "${born25}:research/critiques/C-777.md" 2>/dev/null || p25_ok=0          # путь родился в мерже
+[ -z "$(git -C "$r" log --full-history --diff-filter=A --format='%H' "${before}..HEAD" -- research/critiques/C-777.md)" ] || p25_ok=0  # рождение невидимо диффу
+[ -n "$(git -C "$r" log --full-history --diff-filter=DR --format='%H' "${before}..HEAD" -- research/critiques/C-777.md)" ] || p25_ok=0 # удаление В диапазоне
+git -C "$r" cat-file -e HEAD:research/critiques/C-777.md 2>/dev/null && p25_ok=0                  # на HEAD его нет
+if [ "$p25_ok" -ne 1 ]; then
+  fail "P25 SETUP НЕ СОСТОЯЛСЯ: нужен путь, рождённый В ТЕЛЕ МЕРЖА и удалённый В ДИАПАЗОНЕ \
+с токеном — иначе позитивный контроль не проверяет, что ужесточение P24 не бланкетно"
+else
+  expect "P25 позитивный контроль: рождённый в мерже, удалён с токеном В диапазоне ⇒ проход" ok "$(run_barrier "$r" push "$before")"
+fi
+
+# ── P26 (`TD-163` круг 3) — ПУТЬ ВЕРНУЛСЯ В МАГИСТРАЛЬ И БЫЛ ВЫБРОШЕН ────────────────
+# Класс, который «рождён ли здесь» НЕ ловит: ветка форкнута ДО архивного переезда, значит
+# путь она НАСЛЕДУЕТ, а не рождает. Первый merge возвращает путь в магистраль (разрешение
+# modify/delete в пользу ветки), второй — молча выбрасывает. Рождения нет ⇒ fallback круга 2
+# и первой редакции круга 3 включался и находил древний токен.
+# Замер: барьер `origin/main` → exit=1 (ловил), барьер круга 2 → exit=0 (ложное зелёное).
+r=$(new_repo)
+git -C "$r" rm -q milestones/M-01.md
+git -C "$r" commit -qm "chore(archive): древнее удаление
+
+ALLOW-ARTIFACT-DELETE: объяснённое удаление далёкого прошлого" >/dev/null
+ancient=$(git -C "$r" rev-parse HEAD)
+git -C "$r" branch -q feat26 "${ancient}~1"          # ФОРК ДО переезда ⇒ путь унаследован
+git -C "$r" checkout -q feat26; echo "работа" >> "$r/src.rs"; git -C "$r" commit -qam "feat26: работа ветки"
+git -C "$r" checkout -q -
+before=$(git -C "$r" rev-parse HEAD)
+git -C "$r" merge -q --no-commit --no-ff feat26 >/dev/null 2>&1
+git -C "$r" checkout -q feat26 -- milestones/M-01.md   # путь ВОЗВРАЩЁН в магистраль
+git -C "$r" add -A; git -C "$r" commit -qm "merge feat26 (путь возвращён в магистраль)"
+back=$(git -C "$r" rev-parse HEAD)
+git -C "$r" checkout -q -b feat26b; echo "ещё" >> "$r/src.rs"; git -C "$r" commit -qam "feat26b: работа"
+git -C "$r" checkout -q -
+git -C "$r" merge -q --no-commit --no-ff feat26b >/dev/null 2>&1
+git -C "$r" rm -q -f milestones/M-01.md >/dev/null 2>&1
+git -C "$r" commit -qm "merge feat26b (путь выброшен САМИМ мержем)"
+p26_ok=1
+git -C "$r" merge-base --is-ancestor "$ancient" "$before" || p26_ok=0                              # токен ДО базы
+git -C "$r" cat-file -e "${before}:milestones/M-01.md" 2>/dev/null && p26_ok=0                     # на базе пути НЕТ
+git -C "$r" cat-file -e "${back}:milestones/M-01.md" 2>/dev/null || p26_ok=0                       # но он ВЕРНУЛСЯ в магистраль
+[ -z "$(git -C "$r" log --full-history --diff-filter=A --format='%H' "${before}..HEAD" -- milestones/M-01.md)" ] || p26_ok=0   # рождения НЕТ
+[ -z "$(git -C "$r" log --full-history --diff-filter=DR --format='%H' "${before}..HEAD" -- milestones/M-01.md)" ] || p26_ok=0  # и удаления в диапазоне нет
+git -C "$r" cat-file -e HEAD:milestones/M-01.md 2>/dev/null && p26_ok=0                            # на HEAD его нет
+if [ "$p26_ok" -ne 1 ]; then
+  fail "P26 SETUP НЕ СОСТОЯЛСЯ: нужен токен-предок базы, путь ОТСУТСТВУЮЩИЙ на базе, ВЕРНУВШИЙСЯ \
+в магистраль без рождения, диапазон без D/R и отсутствие пути на HEAD — иначе сценарий не давит \
+на условие магистрали"
+else
+  expect "P26 древний токен НЕ объясняет потерю пути, ВЕРНУВШЕГОСЯ в магистраль" deny "$(run_barrier "$r" push "$before")"
+fi
+
+# ── P27 (`TD-163` круг 3) — ПУТЬ ЕСТЬ В САМОЙ БАЗЕ, evil merge его выбрасывает ────────
+# Самый грубый вид того же класса, и он тоже проходил: путь удалён с токеном, ЗАТЕМ воссоздан
+# в магистрали ДО базы. На базе он ЕСТЬ. Evil merge выбрасывает его — рождения в диапазоне нет,
+# fallback включается, древнее удаление объявляется объяснением. Это отказ барьера в его
+# собственном несущем случае: артефакт, живой на базе, исчез молча.
+r=$(new_repo)
+git -C "$r" rm -q research/reviews/R-001.md
+git -C "$r" commit -qm "chore(archive): древнее удаление вердикта
+
+ALLOW-ARTIFACT-DELETE: объяснённое удаление далёкого прошлого" >/dev/null
+ancient=$(git -C "$r" rev-parse HEAD)
+mkdir -p "$r/research/reviews"; echo "вердикт заведён заново" > "$r/research/reviews/R-001.md"
+git -C "$r" add -A; git -C "$r" commit -qm "docs: вердикт воссоздан в магистрали"
+before=$(git -C "$r" rev-parse HEAD)
+git -C "$r" checkout -q -b feat27; echo "работа" >> "$r/src.rs"; git -C "$r" commit -qam "feat27: работа"
+git -C "$r" checkout -q -
+git -C "$r" merge -q --no-commit --no-ff feat27 >/dev/null 2>&1
+git -C "$r" rm -q -f research/reviews/R-001.md >/dev/null 2>&1
+git -C "$r" commit -qm "merge feat27 (вердикт выброшен САМИМ мержем)"
+p27_ok=1
+git -C "$r" merge-base --is-ancestor "$ancient" "$before" || p27_ok=0                              # токен ДО базы
+git -C "$r" cat-file -e "${before}:research/reviews/R-001.md" 2>/dev/null || p27_ok=0              # на базе путь ЖИВ
+[ -z "$(git -C "$r" log --full-history --diff-filter=DR --format='%H' "${before}..HEAD" -- research/reviews/R-001.md)" ] || p27_ok=0
+git -C "$r" cat-file -e HEAD:research/reviews/R-001.md 2>/dev/null && p27_ok=0                      # на HEAD его нет
+if [ "$p27_ok" -ne 1 ]; then
+  fail "P27 SETUP НЕ СОСТОЯЛСЯ: нужен токен-предок базы, путь ЖИВОЙ НА БАЗЕ, диапазон без D/R \
+и отсутствие пути на HEAD — иначе сценарий не давит на несущий случай барьера"
+else
+  expect "P27 путь, живой НА БАЗЕ, не может исчезнуть под древний токен" deny "$(run_barrier "$r" push "$before")"
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════════════
+# КРУГ 4 (`A-017` Р-3, кандидат B) — АВТО-ВОСПРОИЗВОДИМОСТЬ ДРОПА.
+#
+# Имя-уровневая семья предикатов НЕ сходится (четыре круга, пять дыр — `A-017` Р-4), и пятое
+# сужение по имени арбитражем ЗАПРЕЩЕНО. Кандидат B спрашивает САМО свойство: произвела бы
+# дроп авто-резолюция, или его изготовили руками. Ниже — пять ловушек его конструкции,
+# названные арбитром поимённо (Р-3(iii)), каждая отдельным сценарием.
+# ═══════════════════════════════════════════════════════════════════════════════════════
+
+# ── P28 (`C-137` Б-1 / `A-017` Р-2) — РЕБРО ПРЕДКА: дроп рукотворный ─────────────────
+# Путь въезжает в push вложенным мержем старой ветки: он НЕ рождён (есть у родителя) и НЕ в
+# магистрали (не на first-parent-цепочке). Оба имя-уровневых условия слепы. Кандидат B видит:
+# авто-резолюция финального мержа путь СОХРАНИЛА БЫ, значит дроп изготовлен руками.
+r=$(new_repo)
+git -C "$r" checkout -q -b old28
+echo "работа старой ветки" >> "$r/src.rs"; git -C "$r" commit -qam "old28: работа"
+git -C "$r" checkout -q -
+git -C "$r" rm -q milestones/M-01.md
+git -C "$r" commit -qm "chore(archive): древний переезд
+
+ALLOW-ARTIFACT-DELETE: объяснённое удаление далёкого прошлого" >/dev/null
+before=$(git -C "$r" rev-parse HEAD)
+git -C "$r" checkout -q -b feat28
+echo "работа" >> "$r/src.rs"; git -C "$r" commit -qam "feat28: работа"
+git -C "$r" merge -q --no-commit --no-ff old28 >/dev/null 2>&1
+git -C "$r" checkout old28 -- milestones/M-01.md          # путь СОХРАНЁН рукой
+git -C "$r" add -A; git -C "$r" commit -qm "merge old28 (путь сохранён рукой)"
+feat28=$(git -C "$r" rev-parse HEAD)
+git -C "$r" checkout -q -
+git -C "$r" merge -q --no-commit --no-ff feat28 >/dev/null 2>&1
+git -C "$r" rm -q -f milestones/M-01.md >/dev/null 2>&1
+git -C "$r" commit -qm "merge feat28 (путь выброшен рукой — evil merge)"
+p28_ok=1
+[ -n "$(git -C "$r" ls-tree -r --name-only "$(git -C "$r" merge-tree --write-tree "$before" "$feat28" | head -1)" -- milestones)" ] || p28_ok=0   # авто СОХРАНИЛА БЫ
+[ -z "$(git -C "$r" log --full-history --diff-filter=A --format='%H' "${before}..HEAD" -- milestones/M-01.md)" ] || p28_ok=0                     # не рождён
+git -C "$r" cat-file -e HEAD:milestones/M-01.md 2>/dev/null && p28_ok=0                                                                          # нет на HEAD
+if [ "$p28_ok" -ne 1 ]; then
+  fail "P28 SETUP НЕ СОСТОЯЛСЯ: нужен путь БЕЗ рождения в диапазоне, который авто-резолюция \
+СОХРАНИЛА БЫ, и которого нет на HEAD — иначе сценарий не давит на авто-воспроизводимость"
+else
+  expect "P28 ребро предка: авто-резолюция сохранила бы ⇒ дроп РУКОТВОРНЫЙ ⇒ deny" deny "$(run_barrier "$r" push "$before")"
+fi
+
+# ── P29 (`TD-163` — ПОЗИТИВНЫЙ КОНТРОЛЬ, важнее всех остальных) ──────────────────────
+# Ровно тот случай, ради которого fallback вводился: ветка форкнута ДО архивного переезда,
+# путь НАСЛЕДУЕТ и не трогает, авто-резолюция сама его удаляет. Барьер `origin/main` здесь
+# красен — это и есть `TD-163`, сорвавший деплой дважды. Если кандидат B покраснеет тут,
+# он вернул ложное красное, и всё лечение бессмысленно.
+r=$(new_repo)
+git -C "$r" checkout -q -b old29
+echo "работа" >> "$r/src.rs"; git -C "$r" commit -qam "old29: работа, путь НЕ тронут"
+git -C "$r" checkout -q -
+git -C "$r" rm -q milestones/M-01.md
+git -C "$r" commit -qm "chore(archive): переезд по норме Р-2
+
+ALLOW-ARTIFACT-DELETE: перенос закрытой спеки по норме Р-2" >/dev/null
+before=$(git -C "$r" rev-parse HEAD)
+git -C "$r" merge -q --no-ff -m "merge old29" old29 >/dev/null 2>&1
+p29_ok=1
+[ -z "$(git -C "$r" ls-tree -r --name-only "$(git -C "$r" merge-tree --write-tree "$before" old29 | head -1)" -- milestones)" ] || p29_ok=0  # авто УДАЛИЛА БЫ
+git -C "$r" cat-file -e "old29:milestones/M-01.md" 2>/dev/null || p29_ok=0            # ветка путь НЕСЁТ
+git -C "$r" cat-file -e HEAD:milestones/M-01.md 2>/dev/null && p29_ok=0               # на HEAD его нет
+if [ "$p29_ok" -ne 1 ]; then
+  fail "P29 SETUP НЕ СОСТОЯЛСЯ: нужна ветка, НЕСУЩАЯ путь, при авто-резолюции его удаляющей — \
+иначе позитивный контроль TD-163 не проверяет ничего"
+else
+  expect "P29 TD-163 легитимен: чистое наследование, авто-резолюция удаляет ⇒ проход" ok "$(run_barrier "$r" push "$before")"
+fi
+
+# ── P30 (ловушка 1) — КОНФЛИКТ ПО ЧУЖОМУ ПУТИ не смеет красить ───────────────────────
+# `git merge-tree` возвращает ≠0 при конфликте ГДЕ УГОДНО. Вердикт по защищённому пути обязан
+# браться из СПИСКА конфликтующих путей, а не из кода возврата. Без этого сценария наивная
+# реализация «rc≠0 ⇒ рукотворно» проходит P28/P29 и красит любой push с чужим конфликтом.
+r=$(new_repo)
+git -C "$r" checkout -q -b old30
+echo "ветка правит src" >> "$r/src.rs"; git -C "$r" commit -qam "old30"
+git -C "$r" checkout -q -
+git -C "$r" rm -q milestones/M-01.md
+git -C "$r" commit -qm "chore(archive): переезд
+
+ALLOW-ARTIFACT-DELETE: объяснённое удаление далёкого прошлого" >/dev/null
+echo "main правит src ИНАЧЕ" >> "$r/src.rs"; git -C "$r" commit -qam "main правит src"
+before=$(git -C "$r" rev-parse HEAD)
+git -C "$r" merge --no-ff --no-edit old30 >/dev/null 2>&1 || {
+  git -C "$r" checkout -q --ours src.rs 2>/dev/null; git -C "$r" add -A
+  git -C "$r" commit -qm "merge old30 (конфликт по src.rs разрешён)"; }
+p30_ok=1
+git -C "$r" merge-tree --write-tree "$before" old30 >/dev/null 2>&1 && p30_ok=0   # rc обязан быть ≠0
+git -C "$r" cat-file -e HEAD:milestones/M-01.md 2>/dev/null && p30_ok=0
+if [ "$p30_ok" -ne 1 ]; then
+  fail "P30 SETUP НЕ СОСТОЯЛСЯ: нужен конфликт ПО ЧУЖОМУ пути (rc≠0) при защищённом пути, \
+отсутствующем на HEAD — иначе ловушка 1 не проверяется"
+else
+  expect "P30 ловушка 1: конфликт по чужому пути ⇒ вердикт из списка путей, не из rc ⇒ проход" ok "$(run_barrier "$r" push "$before")"
+fi
+
+# ── P31 (ловушка 2) — ОТМЫВАНИЕ ЦЕПОЧКОЙ ────────────────────────────────────────────
+# Рукотворный дроп совершается на ВНУТРЕННЕМ мерже, финальный — авто-чист. Реализация,
+# смотрящая только на вершину, объявит push легитимным.
+#
+# ⚠ ВНУТРЕННИЙ ДРОП ОБЯЗАН БЫТЬ МЕРЖЕМ, а не `git rm`. Первая редакция сценария роняла путь
+# обычным коммитом — такой виден `git log --diff-filter=DR`, попадает в `removed_by`, и
+# сценарий отклонялся СТАРЫМ условием, ни разу не дойдя до кандидата B. Вскрыто мутацией
+# `L2` («смотреть только вершину»): она обязана была уронить P31 и не уронила. То есть проба
+# утверждала бы покрытие ловушки 2, не покрывая её.
+r=$(new_repo)
+base31=$(git -C "$r" rev-parse --abbrev-ref HEAD)   # ⚠ ИМЯ ветки, а не `checkout -`
+git -C "$r" checkout -q -b old31
+echo "работа старой ветки" >> "$r/src.rs"; git -C "$r" commit -qam "old31: работа"
+git -C "$r" checkout -q "$base31"
+git -C "$r" rm -q milestones/M-01.md
+git -C "$r" commit -qm "chore(archive): древний переезд
+
+ALLOW-ARTIFACT-DELETE: объяснённое удаление далёкого прошлого" >/dev/null
+before=$(git -C "$r" rev-parse HEAD)
+# mid31: путь ВОЗВРАЩЁН рукой, затем ВЫБРОШЕН рукой — оба акта внутри МЕРЖЕЙ
+git -C "$r" checkout -q -b mid31
+git -C "$r" merge -q --no-commit --no-ff old31 >/dev/null 2>&1
+git -C "$r" checkout old31 -- milestones/M-01.md; git -C "$r" add -A
+git -C "$r" commit -qm "mid31: merge old31, путь сохранён рукой"
+git -C "$r" checkout -q -b tmp31 old31
+echo "ещё" >> "$r/src.rs"; git -C "$r" commit -qam "tmp31: работа"
+git -C "$r" checkout -q mid31
+git -C "$r" merge -q --no-commit --no-ff tmp31 >/dev/null 2>&1
+git -C "$r" rm -q -f milestones/M-01.md >/dev/null 2>&1
+git -C "$r" commit -qm "mid31: merge tmp31 — путь выброшен рукой ВНУТРИ МЕРЖА"
+# ⚠ Возврат ПО ИМЕНИ. Первая редакция писала `checkout -`, и «предыдущей» оказывалась `tmp31`:
+# финальный мерж уходил не на ту ветку, диапазон получался другой, и сценарий проходил мимо
+# предмета. Guard'ы этого не ловили — они смотрели на HEAD, а он «выглядел правильно».
+git -C "$r" checkout -q "$base31"
+git -C "$r" merge -q --no-ff -m "финальный мерж — авто-чистый" mid31 >/dev/null 2>&1
+p31_ok=1
+git -C "$r" cat-file -e HEAD:milestones/M-01.md 2>/dev/null && p31_ok=0                        # нет на HEAD
+[ -z "$(git -C "$r" log --full-history --diff-filter=DR --format='%H' "${before}..HEAD" -- milestones/M-01.md)" ] || p31_ok=0  # ⚠ removed_by ПУСТ: дроп невиден git log
+[ -z "$(git -C "$r" log --full-history --diff-filter=A  --format='%H' "${before}..HEAD" -- milestones/M-01.md)" ] || p31_ok=0  # и не рождён
+[ "$(git -C "$r" rev-parse --abbrev-ref HEAD)" = "$base31" ] || p31_ok=0   # финальный мерж — на ИСХОДНОЙ ветке
+git -C "$r" merge-base --is-ancestor "$before" HEAD 2>/dev/null || p31_ok=0                                                    # база — предок
+if [ "$p31_ok" -ne 1 ]; then
+  fail "P31 SETUP НЕ СОСТОЯЛСЯ: дроп обязан быть НЕВИДИМ для git log (сделан ВНУТРИ мержа) и \
+путь не рождён в диапазоне — иначе сценарий отклонит СТАРОЕ условие, не дойдя до кандидата B"
+else
+  expect "P31 ловушка 2: рукотворный дроп на ВНУТРЕННЕМ мерже не отмывается финальным" deny "$(run_barrier "$r" push "$before")"
+fi
+
+# ── P32 (ловушка 5) — ЛЕГИТИМНАЯ ручная резолюция ПРЕДЪЯВЛЯЕТ ПРАВО токеном ─────────
+# До круга 4 `removed_by` мержи не видел вовсе, и у честного ручного удаления через merge не
+# было НИ ОДНОГО пути пройти барьер. Токен в теле САМОГО мержа — этот путь.
+r=$(new_repo)
+git -C "$r" checkout -q -b old32
+echo "работа" >> "$r/src.rs"; git -C "$r" commit -qam "old32"
+git -C "$r" checkout -q -
+git -C "$r" rm -q milestones/M-01.md
+git -C "$r" commit -qm "chore(archive): древний переезд
+
+ALLOW-ARTIFACT-DELETE: объяснённое удаление далёкого прошлого" >/dev/null
+before=$(git -C "$r" rev-parse HEAD)
+git -C "$r" checkout -q -b feat32
+git -C "$r" merge -q --no-commit --no-ff old32 >/dev/null 2>&1
+git -C "$r" checkout old32 -- milestones/M-01.md; git -C "$r" add -A
+git -C "$r" commit -qm "feat32: путь сохранён"
+f32=$(git -C "$r" rev-parse HEAD)
+git -C "$r" checkout -q -
+git -C "$r" merge -q --no-commit --no-ff "$f32" >/dev/null 2>&1
+git -C "$r" rm -q -f milestones/M-01.md >/dev/null 2>&1
+git -C "$r" commit -qm "merge feat32 — ручная резолюция, право предъявлено
+
+ALLOW-ARTIFACT-DELETE: спека воскресла ошибочно, снимаем осознанно" >/dev/null
+p32_ok=1
+git -C "$r" cat-file -e HEAD:milestones/M-01.md 2>/dev/null && p32_ok=0
+git -C "$r" log -1 --format='%B' HEAD | grep -q '^ALLOW-ARTIFACT-DELETE:' || p32_ok=0
+if [ "$p32_ok" -ne 1 ]; then
+  fail "P32 SETUP НЕ СОСТОЯЛСЯ: нужен МЕРЖ с токеном в СВОЁМ теле, выбросивший путь — \
+иначе ловушка 5 не проверяется"
+else
+  expect "P32 ловушка 5: токен в теле САМОГО мержа легитимирует ручную резолюцию" ok "$(run_barrier "$r" push "$before")"
+fi
+
+# ── P33 (ловушка 3) — OCTOPUS: merge-tree ПАРНЫЙ ⇒ fail-closed ──────────────────────
+# Три и более родителей проверить нечем. `testing.md`: «не могу гарантировать» обязано
+# означать отказ, а не пропуск — та же дисциплина, что у базы события.
+r=$(new_repo)
+git -C "$r" checkout -q -b oa; echo a >> "$r/src.rs"; git -C "$r" commit -qam oa; OA=$(git -C "$r" rev-parse HEAD)
+git -C "$r" checkout -q -; git -C "$r" checkout -q -b ob; echo b >> "$r/research/reviews/R-001.md"; git -C "$r" commit -qam ob; OB=$(git -C "$r" rev-parse HEAD)
+git -C "$r" checkout -q -
+git -C "$r" rm -q milestones/M-01.md
+git -C "$r" commit -qm "chore(archive): древний переезд
+
+ALLOW-ARTIFACT-DELETE: объяснённое удаление далёкого прошлого" >/dev/null
+before=$(git -C "$r" rev-parse HEAD)
+# Дерево берётся у `before` — в нём пути УЖЕ НЕТ (его снял архивный переезд). Первая
+# редакция брала дерево `OA`, ветки, форкнутой ДО переезда: путь там ЕСТЬ, и setup-guard
+# честно уронил сценарий. Оставлено записью: guard сработал ровно как задуман.
+BT=$(git -C "$r" rev-parse "${before}^{tree}")
+OCT=$(git -C "$r" commit-tree "$BT" -p "$before" -p "$OA" -p "$OB" -m "octopus: три родителя, путь выброшен")
+git -C "$r" reset -q --hard "$OCT"
+p33_ok=1
+[ "$(git -C "$r" rev-parse "${OCT}^@" | wc -l)" -ge 3 ] || p33_ok=0
+git -C "$r" cat-file -e HEAD:milestones/M-01.md 2>/dev/null && p33_ok=0
+if [ "$p33_ok" -ne 1 ]; then
+  fail "P33 SETUP НЕ СОСТОЯЛСЯ: нужен коммит с ≥3 родителями, потерявший путь — \
+иначе ловушка 3 не проверяется"
+else
+  expect "P33 ловушка 3: octopus не проверяем парной авто-резолюцией ⇒ fail-closed" deny "$(run_barrier "$r" push "$before")"
+fi
+
+# ── P18 (rev9, ЛОЖНОЕ СРАБАТЫВАНИЕ — main реально покраснел 2026-08-03) ───────────────
+# ПЕРЕИМЕНОВАНИЕ артефакта в ДРУГОЙ защищённый путь, сделанное коммитом ВНУТРИ feat-ветки
+# и влитое merge'ем, обязано проходить: это легитимная миграция, а не удаление.
+#
+# Почему сценарий появился только на девятом витке: `git log -- <path>` по умолчанию применяет
+# **history simplification** — на merge-коммите идёт лишь по тому родителю, который объясняет
+# итоговое состояние, и коммит переименования из side-ветки в вывод не попадает. Барьер видел
+# «файла нет на HEAD, и никто его не удалял» ⇒ обвинял evil merge и валил CI на КОРРЕКТНОЙ
+# работе. Отличие от P13: там артефакт пришёл мержем и остался ЦЕЛ; здесь он мержем пришёл и
+# ПЕРЕЕХАЛ — то есть проверяется именно ветка «(а) переезд в другой защищённый путь».
+# Лечится `--full-history` в `removed_by`.
+r=$(new_repo); before=$(git -C "$r" rev-parse HEAD)
+git -C "$r" checkout -qb side5
+echo "вердикт критика" > "$r/research/critiques/C-005.md"
+git -C "$r" add research/critiques/C-005.md >/dev/null
+git -C "$r" commit -qm "critic: вердикт C-005"
+git -C "$r" mv research/critiques/C-005.md research/critiques/C-006-renamed.md
+git -C "$r" commit -qm "docs: C-005 -> C-006-renamed (коллизия номеров)"
+git -C "$r" checkout -q -; git -C "$r" merge -q --no-ff -m "merge: side5" side5
+if setup_has_merge "$r" "$before" "P18" \
+   && setup_is "$r" research/critiques/C-006-renamed.md 100644 "P18"; then
+  expect "P18 переименование артефакта внутри влитой ветки пропускается (нет ложных срабатываний)" ok \
+    "$(run_barrier "$r" push "$before")"
+fi
+
+echo
+if [ "${FAILED}" -gt 0 ]; then
+  echo "VERDICT: FAIL (${FAILED})"
+  echo "Барьер не даёт заявленной гарантии. Пока проба красная, gates.md §9 обещает то,"
+  echo "чего в пайплайне нет — а это хуже отсутствия правила."
+  exit 1
+fi
+# Число СЧИТАЕТСЯ, а не заявляется: литерал «18/18» пережил добавление сценариев и
+# врал бы о покрытии — тот же класс, что «17 сценариев» в gates.md (R-032).
+echo "VERDICT: PASS (${PASSED}/${PASSED}) — барьер держит при ТОЙ ЖЕ проводке, какой его зовёт CI"
