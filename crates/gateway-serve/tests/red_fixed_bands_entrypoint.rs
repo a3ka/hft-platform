@@ -1,6 +1,6 @@
 //! RED `M-84` (sacred, architect-only) — **НАСТОЯЩИЙ ВХОД ПРОВОДА, а не внутренняя функция.**
 //!
-//! Заведён закрытием `C-220` B-1. COMPILE-RED: `gateway::CANONICAL_DEPTH_BANDS` ещё нет.
+//! RUNTIME-RED (`A-033`): файл СОБИРАЕТСЯ и падает ПОВЕДЕНИЕМ, не сборкой.
 //!
 //! ## ЗАЧЕМ ОТДЕЛЬНЫЙ ФАЙЛ, ЕСЛИ ЕСТЬ `red_fixed_bands_wire.rs`
 //!
@@ -29,6 +29,13 @@
 use gateway_serve::session::validate_selector;
 use gateway_serve::wire_v1::{parse_message, parse_selector, ClientMessage};
 use serde_json::{json, Value};
+
+/// Продуктовый набор — ЛИТЕРАЛОМ, а не ссылкой на `gateway::CANONICAL_DEPTH_BANDS`.
+/// `A-033`: тест, не собирающийся из-за отсутствующего символа, глушит ВЕСЬ корпус крейта —
+/// именно так три круга не увидели 209 красных из 329. Исполняемый RED строго сильнее
+/// (прецедент: `red_grace_from_env.rs:12-15`, `red_heatmap_window_env.rs:19-30`).
+/// Принадлежность константы крейту держит шаг гейта, а не ссылка отсюда.
+const PRODUCT_BANDS: [f64; 7] = [0.015, 0.03, 0.05, 0.08, 0.15, 0.30, 0.60];
 
 /// Кадр `subscribe` прод-формы (`docs/rfc/CT-RFC-09-ws-session.md` §2.7).
 /// `bands` подставляется ровно так, как его прислал бы клиент.
@@ -96,7 +103,7 @@ fn absent_bands_yield_canonical_selector_at_the_entrypoint() {
         .expect("кадр БЕЗ поля bands — новая норма по П-029: сетку задаёт сервер");
     assert_eq!(
         sel.bands,
-        gateway::CANONICAL_DEPTH_BANDS.to_vec(),
+        PRODUCT_BANDS.to_vec(),
         "селектор, собранный из кадра без полос, обязан нести КАНОНИЧЕСКИЙ набор — иначе \
          сервер не задал сетку, а просто оставил её пустой"
     );
@@ -115,8 +122,39 @@ fn empty_band_array_is_rejected_not_treated_as_absent() {
 fn even_canonical_bands_from_client_rejected_at_entrypoint() {
     // Принять — значит оставить путь «клиент знает сетку». Следующая смена набора сломает
     // такого клиента молча.
-    through_entrypoint(&subscribe_frame(Some(json!(
-        gateway::CANONICAL_DEPTH_BANDS
-    ))))
-    .expect_err("даже канонический набор от клиента обязан отвергаться: сетку задаёт сервер");
+    through_entrypoint(&subscribe_frame(Some(json!(PRODUCT_BANDS))))
+        .expect_err("даже канонический набор от клиента обязан отвергаться: сетку задаёт сервер");
+}
+
+#[test]
+fn two_clients_converge_to_one_selector() {
+    // ЯДРО решения `П-029`, и наблюдаемо оно ТОЛЬКО здесь — на пути клиента. В крейте
+    // `gateway` тот же тест сравнивал бы два селектора, которые сам же и построил
+    // одинаковыми (тавтология, пойманная `C-220` B-1).
+    //
+    // Сегодня: Аня просит [0.15], Боря — [0.03, 0.15]; оба кадра разбираются, дают РАЗНЫЕ
+    // селекторы, разные отпечатки, разные расчёты и разные слепки одного и того же стакана.
+    // После M-84 оба кадра обязаны быть отвергнуты, а кадр БЕЗ поля — дать один и тот же
+    // серверный селектор обоим.
+    let anya = through_entrypoint(&subscribe_frame(Some(json!([0.15]))));
+    let boris = through_entrypoint(&subscribe_frame(Some(json!([0.03, 0.15]))));
+    assert!(
+        anya.is_err() && boris.is_err(),
+        "клиентские сетки обязаны отвергаться ОБЕ: пока хоть одна принимается, ось отпечатка \
+         жива и сервер считает один стакан дважды. Аня: {anya:?}, Боря: {boris:?}"
+    );
+
+    let a = through_entrypoint(&subscribe_frame(None)).expect("кадр без полос — новая норма");
+    let b = through_entrypoint(&subscribe_frame(None)).expect("кадр без полос — новая норма");
+    assert_eq!(
+        a.bands, b.bands,
+        "два клиента на одном инструменте обязаны получить ОДИН серверный набор — это и есть \
+         общий ключ и общий чекпоинт, ради которых принято П-029"
+    );
+    assert_eq!(
+        a.bands,
+        PRODUCT_BANDS.to_vec(),
+        "и этот набор обязан быть продуктовым: {:?}",
+        a.bands
+    );
 }

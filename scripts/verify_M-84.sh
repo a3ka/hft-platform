@@ -31,18 +31,25 @@ chk "cargo fmt --all -- --check"
 chk "cargo clippy --all-targets --all-features -- -D warnings"
 chk "cargo test --all"
 
-step "задача 2 — канонический набор существует и РАВЕН продуктовому"
-chk "cargo test -p gateway --test red_fixed_bands_canonical"
+step "задача 2 — набор, который сервер ПРИМЕНЯЕТ, равен продуктовому"
+# `red_fixed_bands_canonical.rs` УДАЛЁН (`A-033` D-2): гварда СОСТАВА в библиотеке больше
+# нет, а сравнивать литерал с самим собой — тавтология. Свойства набора судятся ТАМ, ГДЕ ОН
+# НАБЛЮДАЕМ — на серверном входе.
+chk "cargo test -p gateway-serve --test red_fixed_bands_server_entrance default_is_the_product_set"
+chk "cargo test -p gateway-serve --test red_fixed_bands_server_entrance default_set_is_sorted_and_within_source_coverage"
 # Набор объявлен в docs/fa/viz-backend.md:42 и подписан П-014. Гейт сверяет КОД с ДОКУМЕНТОМ,
 # а не код с кодом: иначе обе стороны уедут вместе и расхождения никто не заметит.
 chk "grep -q '1\.5/3/5/8/15/30/60' docs/fa/viz-backend.md"
 
-step "задача 2 — гвард живёт в КРЕЙТЕ, а не только в транспорте"
+step "задача 2 — константа принадлежит КРЕЙТУ (единственный источник набора)"
 # Довод — установленный, не новый: Selector собирают напрямую research-cli, чекпоинтер, M-39.
 # Гвард только в транспорте оставил бы байпас-поверхность (crates/gateway/src/lib.rs:2743-2750,
 # так обосновано место GW-I-14). Проверяем ИМЕННО библиотечный валидатор.
 chk "grep -q 'CANONICAL_DEPTH_BANDS' crates/gateway/src/lib.rs"
-chk "cargo test -p gateway --test red_fixed_bands_canonical crate_rejects_foreign_band_set"
+# Гвард СОСТАВА в библиотеке ЗАПРЕЩЁН (`A-033` D-2): он отверг собственную боевую
+# настройку прода и уронил 209 тестов из 329. Состав судят продуктовые входы — ниже.
+chk "cargo test -p gateway-serve --test red_fixed_bands_wire subset_of_effective_set_is_rejected"
+chk "cargo test -p gateway-serve --test red_fixed_bands_wire f32_rounded_lookalike_is_rejected"
 
 step "задача 3 — транспорт: отказ ЯВНЫЙ, а не молчаливая подмена"
 chk "cargo test -p gateway-serve --test red_fixed_bands_wire"
@@ -57,6 +64,7 @@ chk "cargo test -p gateway-serve --test red_fixed_bands_wire foreign_bands_rejec
 # НАСТОЯЩИЙ ВХОД, а не внутренняя функция (`C-220` B-1). Прямой вызов валидатора не видит
 # подмену, сидящую в РАЗБОРЕ кадра — критик предъявил её работающей при 16 зелёных тестах.
 chk "cargo test -p gateway-serve --test red_fixed_bands_entrypoint"
+chk "cargo test -p gateway-serve --test red_fixed_bands_entrypoint two_clients_converge_to_one_selector"
 
 step "задача 3 — кадр несёт РОВНО 14 строк на настоящем пути выдачи"
 chk "cargo test -p gateway --test red_fixed_bands_frame"
@@ -75,7 +83,9 @@ chk "grep -q 'включая канонический' docs/rfc/CT-RFC-09-ws-ses
 chk "grep -q 'VB-I-12' docs/fa/viz-backend.md"
 # Инвариант обязан НАЗЫВАТЬ своё состояние: на этой ревизии кода его ещё нет. Без этой
 # строки FA утверждает о коде то, чего в коде нет, — класс, ради которого заведён FACTS.
-chk "grep -q 'в коде ЕЩЁ НЕТ' docs/fa/viz-backend.md"
+# `A-033` D-5: не грепать фразу, а проверять СОГЛАСОВАННОСТЬ. FA не имеет права говорить
+# «в коде ЕЩЁ НЕТ», когда константа в коде есть, и наоборот.
+chk "bash -c 'if grep -q CANONICAL_DEPTH_BANDS crates/gateway/src/lib.rs; then ! grep -q \"в коде ЕЩЁ НЕТ\" docs/fa/viz-backend.md; else grep -q \"в коде ЕЩЁ НЕТ\" docs/fa/viz-backend.md; fi'"
 chk "bash scripts/verify_design_claims.sh"
 
 step "задача 5 — НУЛЕВОЕ окно предъявляется ИСПОЛНЕНИЕМ, а не словами в README"
@@ -92,9 +102,21 @@ chk "cargo test -p gateway --test red_fixed_bands_prewarm"
 # Гвард обычного API чекпоинта ОСТАЁТСЯ на месте: прогрев не смеет быть входом для
 # произвольной сетки. Мутация «удалить validate_selector из advance_to» роняет этот шаг
 # (`C-221` B-2 — она оставляла четыре набора M-84 зелёными).
-chk "cargo test -p gateway --test red_fixed_bands_prewarm legacy_selector_is_refused_by_the_normal_checkpoint_api"
+# Пиннер гварда крейта УБРАН (`A-033` D-2). Состав на входе чекпоинтера судится на БИНАРЕ
+# в прод-форме argv — там, где этот вход у него и есть.
+chk "cargo test -p gateway --test red_fixed_bands_checkpoint_entrance"
+chk "cargo test -p gateway --test red_fixed_bands_checkpoint_entrance default_argv_uses_the_product_set"
 
-step "граница C — включение НЕ состоялось (задача 6 заблокирована ДВУМЯ предусловиями)"
+step "задача 5 — переходный режим НАБЛЮДАЕМ: применено И названо"
+chk "cargo test -p gateway-serve --test red_fixed_bands_server_entrance override_is_applied"
+chk "cargo test -p gateway-serve --test red_fixed_bands_server_entrance override_is_announced_as_deprecated"
+chk "cargo test -p gateway-serve --test red_fixed_bands_server_entrance absent_override_is_silent"
+chk "cargo test -p gateway --test red_fixed_bands_checkpoint_entrance explicit_override_is_announced_as_deprecated"
+
+step "задача 7 — ПОЛНЫЙ корпус двух крейтов, а не шесть наборов (A-033: 209 красных из 329)"
+chk "cargo test -p gateway -p gateway-serve"
+
+step "граница C — включение НЕ состоялось (владение передано M-70, A-033 §5)"
 # Зелёный гейт НЕ является разрешением на включение.
 chk "grep -q 'GATEWAY_BANDS:-0.001' docker-compose.yml"
 # ПРЕДУСЛОВИЕ 1 — `TD-159` обязан быть ОТКРЫТ. Прежняя редакция искала литерал `TD-159` в

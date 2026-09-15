@@ -1,6 +1,6 @@
 //! RED `M-84` (sacred, architect-only) — **валидатор сессии судит НОРМАЛИЗОВАННЫЙ селектор.**
 //!
-//! COMPILE-RED: `gateway::CANONICAL_DEPTH_BANDS` ещё не существует.
+//! RUNTIME-RED (`A-033`): файл СОБИРАЕТСЯ и падает ПОВЕДЕНИЕМ, не сборкой.
 //!
 //! ## ЭТОТ ФАЙЛ ПЕРЕПИСАН ПО `C-221` B-1 — И ВОТ ЧТО БЫЛО НЕ ТАК
 //!
@@ -40,6 +40,13 @@ use contracts::Venue;
 use gateway::Selector;
 use gateway_serve::session::validate_selector;
 
+/// Продуктовый набор — ЛИТЕРАЛОМ, а не ссылкой на `gateway::CANONICAL_DEPTH_BANDS`.
+/// `A-033`: тест, не собирающийся из-за отсутствующего символа, глушит ВЕСЬ корпус крейта —
+/// именно так три круга не увидели 209 красных из 329. Исполняемый RED строго сильнее
+/// (прецедент: `red_grace_from_env.rs:12-15`, `red_heatmap_window_env.rs:19-30`).
+/// Принадлежность константы крейту держит шаг гейта, а не ссылка отсюда.
+const PRODUCT_BANDS: [f64; 7] = [0.015, 0.03, 0.05, 0.08, 0.15, 0.30, 0.60];
+
 fn sel(bands: Vec<f64>) -> Selector {
     Selector {
         venue: Venue::Binance,
@@ -56,7 +63,7 @@ fn canonical_selector_is_accepted_by_session() {
     // ПОЗИТИВНЫЙ КОНТРОЛЬ и прямое следствие `C-221` B-1: именно это значение приходит
     // сюда после разбора кадра БЕЗ поля `bands`. Отказ здесь остановил бы нормальную
     // подписку — то есть закрыл бы продукт, а не чужую сетку.
-    validate_selector(&sel(gateway::CANONICAL_DEPTH_BANDS.to_vec())).expect(
+    validate_selector(&sel(PRODUCT_BANDS.to_vec())).expect(
         "нормализованный серверный селектор обязан ПРОХОДИТЬ валидатор сессии: он и есть \
          то, что строит разбор кадра по П-029, когда клиент сетку не присылает",
     );
@@ -106,5 +113,43 @@ fn rejection_message_points_at_the_decision() {
     assert!(
         err.len() > 20,
         "сообщение об отказе обязано объяснять, а не только отказывать. Получено: {err:?}"
+    );
+}
+
+#[test]
+fn subset_of_effective_set_is_rejected() {
+    // Пришло из `red_fixed_bands_canonical.rs`, удалённого по `A-033` D-2: свойство верно,
+    // но живёт на слое 2, а не в гварде библиотеки.
+    let mut short: Vec<f64> = PRODUCT_BANDS.to_vec();
+    short.pop();
+    validate_selector(&sel(short)).expect_err(
+        "подмножество эффективного набора — уже ДРУГОЙ набор: свой отпечаток, свой слепок, \
+         свой расчёт. Принять его значит вернуть ось, которую решение П-029 убирает",
+    );
+}
+
+#[test]
+fn reordered_effective_set_is_rejected() {
+    let mut shuffled: Vec<f64> = PRODUCT_BANDS.to_vec();
+    shuffled.swap(0, 6);
+    validate_selector(&sel(shuffled)).expect_err(
+        "перестановка — другой набор: порядок несёт смысл (строки кадра раскладываются \
+         парами (band, side), поиск идёт позицией) и входит в отпечаток",
+    );
+}
+
+#[test]
+fn f32_rounded_lookalike_is_rejected() {
+    // `C-220` B-2. Гвард с допуском `1e-6` принимал двойник: f32 от `0.015` отличается на
+    // 3.4e-10. Сравнение обязано быть ТОЧНЫМ — иначе два «одинаковых» набора дают РАЗНЫЕ
+    // отпечатки (в них идут биты), и слепок молча расходится с запросом.
+    let lookalike: Vec<f64> = PRODUCT_BANDS.iter().map(|b| *b as f32 as f64).collect();
+    assert_ne!(
+        lookalike,
+        PRODUCT_BANDS.to_vec(),
+        "SETUP НЕ СОСТОЯЛСЯ: f32-двойник совпал с оригиналом побитово, сценарий не про то"
+    );
+    validate_selector(&sel(lookalike)).expect_err(
+        "набор, отличающийся лишь f32-округлением, обязан быть отвергнут ТОЧНЫМ сравнением",
     );
 }

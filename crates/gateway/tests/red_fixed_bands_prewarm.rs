@@ -2,7 +2,7 @@
 //! собирается при живом старом и окно переключения НУЛЕВОЕ.**
 //!
 //! Заведён закрытием `C-220` B-4, переписан по `C-221` B-2. COMPILE-RED:
-//! `gateway::CANONICAL_DEPTH_BANDS` ещё нет.
+//! `PRODUCT_BANDS` ещё нет.
 //!
 //! ## ПОЧЕМУ ПЕРЕПИСАН — ОРАКУЛ ТРЕБОВАЛ ДЫРЫ В ГВАРДЕ
 //!
@@ -28,8 +28,10 @@
 //! валидирует селектор. Построение `Selector`-значения и его проверка — разные вещи, и это
 //! не обход: на диск ничего не пишется гвардованным путём.
 //!
-//! **Мутация, которую файл теперь ловит:** удалить `validate_selector(sel)?` из
-//! `advance_to` ⇒ падает `legacy_selector_is_refused_by_the_normal_checkpoint_api`.
+//! **ЗЕЛЁНЫЙ СТОРОЖ, не RED** (`A-033`): сосуществование слепков верно СЕГОДНЯ, и нулевое
+//! окно выкатки стоит именно на нём. Пиннер гварда крейта отсюда УБРАН по `A-033` D-2 —
+//! гварда СОСТАВА в библиотеке больше нет, он переехал на продуктовые входы. Мутация, которую
+//! файл ловит: имя слепка перестаёт зависеть от набора полос ⇒ падают оба теста.
 //!
 //! ## ЧТО ИМЕННО ДОКАЗЫВАЕТСЯ — и почему это НЕ тавтология
 //!
@@ -52,6 +54,13 @@
 use contracts::{to_fixed, DataSource, EventKind, MdPayload, Side, Venue};
 use gateway::{Cursor, Selector};
 use journal::{EpochFilter, Journal, WriterConfig};
+
+/// Продуктовый набор — ЛИТЕРАЛОМ, а не ссылкой на `gateway::CANONICAL_DEPTH_BANDS`.
+/// `A-033`: тест, не собирающийся из-за отсутствующего символа, глушит ВЕСЬ корпус крейта —
+/// именно так три круга не увидели 209 красных из 329. Исполняемый RED строго сильнее
+/// (прецедент: `red_grace_from_env.rs:12-15`, `red_heatmap_window_env.rs:19-30`).
+/// Принадлежность константы крейту держит шаг гейта, а не ссылка отсюда.
+const PRODUCT_BANDS: [f64; 7] = [0.015, 0.03, 0.05, 0.08, 0.15, 0.30, 0.60];
 
 const T: i64 = 1_700_000_000_000;
 
@@ -124,7 +133,7 @@ fn fp_name(s: &Selector) -> String {
 /// — из них делается легаси-фикстура (та же форма файла, другое имя).
 fn real_checkpoint_bytes(jdir: &std::path::Path) -> Vec<u8> {
     let scratch = tempfile::tempdir().expect("tempdir scratch");
-    let canonical = sel(gateway::CANONICAL_DEPTH_BANDS.to_vec());
+    let canonical = sel(PRODUCT_BANDS.to_vec());
     gateway::checkpoint::advance_to(
         jdir,
         scratch.path(),
@@ -141,34 +150,6 @@ fn real_checkpoint_bytes(jdir: &std::path::Path) -> Vec<u8> {
          произвела реализация. Дальше судить нечего — тест смотрел бы не на тот файл"
     );
     std::fs::read(scratch.path().join(&produced[0])).expect("read ckpt bytes")
-}
-
-#[test]
-fn legacy_selector_is_refused_by_the_normal_checkpoint_api() {
-    // МУТАЦИЯ-УБИЙЦА (`C-221` B-2). Обычный публичный путь чекпоинта обязан оставаться
-    // гвардованным: убери проверку из `advance_to` ради «прогрева старого набора» — и
-    // через прогрев в систему заедет любая сетка, мимо решения П-029.
-    let jdir = journal_of(vec![trade(65_000.0, 1.0, Side::Buy, T)]);
-    let ckpt = tempfile::tempdir().expect("tempdir ckpt");
-    let err = gateway::checkpoint::advance_to(
-        jdir.path(),
-        ckpt.path(),
-        &sel(vec![0.001]),
-        EpochFilter::OwnCaptureOnly,
-        Cursor::LATEST,
-    )
-    .expect_err(
-        "легаси-набор обязан быть ОТВЕРГНУТ обычным API чекпоинта. Успех здесь означает \
-         дыру в гварде: прогрев становится входом для произвольной сетки (C-221 B-2)",
-    );
-    assert!(
-        err.to_string().contains("bands") || err.to_string().contains("полос"),
-        "отказ обязан НАЗЫВАТЬ причину — оператор выкатки читает именно это. Получено: {err}"
-    );
-    assert!(
-        ckpt_files(ckpt.path()).is_empty(),
-        "отказ обязан быть fail-closed: при отвергнутом селекторе на диск не ложится ничего"
-    );
 }
 
 #[test]
@@ -193,7 +174,7 @@ fn prewarmed_canonical_checkpoint_coexists_with_live_legacy() {
     );
 
     // ПРОГРЕВ: слепок канонического набора собирается ПРИ ЖИВОМ старом.
-    let canonical = sel(gateway::CANONICAL_DEPTH_BANDS.to_vec());
+    let canonical = sel(PRODUCT_BANDS.to_vec());
     gateway::checkpoint::advance_to(
         jdir.path(),
         ckpt.path(),
@@ -236,7 +217,7 @@ fn checkpoint_name_differs_by_band_set() {
     // ПАРНЫЙ vantage к предыдущему: два файла могли бы существовать и по другой причине.
     // Здесь проверяется ПРИЧИНА — имя определяется отпечатком, в который входят полосы.
     let jdir = journal_of(vec![trade(65_000.0, 1.0, Side::Buy, T)]);
-    let canonical = sel(gateway::CANONICAL_DEPTH_BANDS.to_vec());
+    let canonical = sel(PRODUCT_BANDS.to_vec());
     let dir = tempfile::tempdir().expect("dir");
     gateway::checkpoint::advance_to(
         jdir.path(),
