@@ -68,7 +68,7 @@
 //! задача спеки (`M-85` §3 задача 3), и он обязан мерить РЕСУРС (посещённые события), а не
 //! время: время зависит от хоста и дало бы флак.
 
-use contracts::{to_fixed, DataSource, EventKind, Level, MdPayload, Venue};
+use contracts::{to_fixed, DataSource, EventKind, Level, MdPayload, Side, Venue};
 use gateway::{Cursor, DepthRow, Selector};
 use journal::{EpochFilter, Journal, WriterConfig};
 
@@ -120,6 +120,19 @@ fn book_at(reach_pct: f64, ts: i64) -> EventKind {
         MdPayload::L2Snapshot {
             bids: lvls(&bids),
             asks: lvls(&asks),
+            ts_exch_ms: ts,
+        },
+    )
+}
+
+fn trade_at(price: f64, size: f64, ts: i64) -> EventKind {
+    EventKind::md(
+        Venue::Binance,
+        "BTCUSDT",
+        MdPayload::Trade {
+            price: to_fixed(price),
+            size: to_fixed(size),
+            side: Side::Buy,
             ts_exch_ms: ts,
         },
     )
@@ -307,4 +320,74 @@ fn m85_2_anchored_window_already_agrees_and_must_keep_agreeing() {
              {want:?}\n  клиент: {got:?}"
         );
     }
+}
+
+/// СТОРОЖ ЗАПРЕТНОГО СПИСКА §2.1 — НЕ-книжные серии не смеют задвоиться.
+///
+/// `C-223` N-1: мутант «полный bootstrap» (`reducer.apply(&event)` вместо `seed_vwap` на
+/// затравочных событиях) зеленил ВЕСЬ набор `m85_*`, хотя §2.1 запрещает его прямо. Ловил его
+/// только соседний независимый оракул — то есть запрет жил прозой, а не сторожем.
+///
+/// Мера снята с серий, которые от книги НЕ зависят и потому обязаны сходиться УЖЕ СЕГОДНЯ:
+/// `vwap`, `cumulative_delta`, `volume_profile`. Полный bootstrap сворачивает затравочные
+/// сделки в `frame.delta`, тогда как `snapshot(C)` их уже содержит; `Snapshot::apply` мёржит
+/// `vwap` ЗАМЕНОЙ по ключу (`BTreeMap::extend`), а VP — инкрементом бинов, поэтому задвоение
+/// видно на обоих.
+///
+/// ЗЕЛЁН СЕГОДНЯ и обязан остаться зелёным: его предмет — не прогресс, а граница.
+#[test]
+fn m85_6_non_book_series_do_not_double_count_under_bootstrap() {
+    let _g = serial();
+    let dir = tempfile::tempdir().expect("tempdir");
+    {
+        let mut j = Journal::open_with(dir.path(), cfg()).expect("open_with");
+        j.append(book_at(0.05, T)).expect("c1");
+        // Сделки ДО хвоста — они и задваиваются при полном bootstrap'е.
+        for i in 0..6 {
+            j.append(trade_at(MID + (i as f64), 1.0 + i as f64, T + 100 * i))
+                .expect("trade");
+        }
+        j.append(delta_at(
+            &[(MID * 0.95, 3.0)],
+            &[(MID * 1.05, 3.0)],
+            T + 2_000,
+            9,
+        ))
+        .expect("c2");
+        j.flush().expect("flush");
+    }
+    let s = sel();
+
+    let full = gateway::snapshot(dir.path(), EpochFilter::OwnCaptureOnly, &s, Cursor::LATEST)
+        .expect("snapshot(LATEST)");
+    let (merged, n) = assemble_via_frames(dir.path(), &s);
+    assert!(
+        n >= 2,
+        "SETUP НЕ СОСТОЯЛСЯ: кадров {n} — затравка и хвост не разделены, задваивать нечего"
+    );
+    assert!(
+        !full.series.vwap.is_empty(),
+        "SETUP НЕ СОСТОЯЛСЯ: vwap пуст — сделок в фикстуре нет, сторож судил бы пустоту"
+    );
+
+    assert_eq!(
+        merged.series.vwap, full.series.vwap,
+        "§2.1 НАРУШЕН: `vwap` у клиента разошёлся с полным реплеем. Это подпись ЗАТРАВКИ, \
+         сворачивающей не-книжные события в кадр: `snapshot(C)` их уже содержит, и `apply` \
+         мёржит ряд ЗАМЕНОЙ по ключу — значение кадра обязано быть АБСОЛЮТНЫМ, не локальным.\n  \
+         реплей: {:?}\n  клиент: {:?}",
+        full.series.vwap, merged.series.vwap
+    );
+    assert_eq!(
+        merged.series.cumulative_delta, full.series.cumulative_delta,
+        "§2.1 НАРУШЕН: `cumulative_delta` задвоился — затравка свернула сделки, уже учтённые в \
+         `snapshot(C)`"
+    );
+    assert_eq!(
+        merged.series.volume_profile.len(),
+        full.series.volume_profile.len(),
+        "§2.1 НАРУШЕН: число бинов `volume_profile` разошлось — VP мёржится ИНКРЕМЕНТОМ, \
+         поэтому затравочные сделки, свёрнутые в кадр, добавляются поверх уже учтённых \
+         (`apply_vp`, `crates/gateway/src/lib.rs:1099-1103` называет этот класс прямо)"
+    );
 }
