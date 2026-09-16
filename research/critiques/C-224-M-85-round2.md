@@ -1,5 +1,5 @@
 <!-- GATE-META
-milestone: M-85-frames-book-continuity
+milestone: M-85
 audited_repo: a3ka/hft-platform
 audited_base: d35d25bf216faf86dd217492f3e24aa50166ade0
 audited_head: 08c7fb48ae93b5fd5466d905b3d5c2c6c3f9440a
