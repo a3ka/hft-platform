@@ -43,7 +43,21 @@ model: opus
 
 ## Handoff
 - APPROVED → merge через PR (прямой push в `main` невозможен: branch protection, обязательный чек `All checks passed`); обновляет `PROJECT-STATE.md`/`TECH-DEBT.md`; сообщает architect (milestone Status → DONE).
-- REJECT/CHANGES REQUESTED → dev-агент, который делал impl (SVR-response цикл, не self-fix у architect).
+- REJECT/CHANGES REQUESTED → **`architect`**: разбор находки — его, не dev'а (решение
+  founder'а 2026-09-04, зафиксировано в
+  `docs/workflow/session-handover-2026-09-04.md` §4 п.2; охват уточнён им же 2026-09-05 — см. ниже). Он правит спеку/оракул сам либо через founder'а диспетчеризует
+  dev на impl-правку. Прямой возврат dev'у ОТМЕНЁН: он чинил названное МЕСТО, а не КЛАСС,
+  и следующий круг ловил ту же находку в новой одежде.
+- **Охват правила — по ПРЕДМЕТУ отказа** (уточнён founder'ом 2026-09-05): отказ гейта
+  ПО НАБОРУ АРТЕФАКТОВ МИЛЕСТОУНА и по коду, идущему в прод. Исследовательская петля
+  Границы A (отчёт стратегии, гипотеза, грид) под правило НЕ подпадает — не вырезанным
+  исключением, а ПО ОПРЕДЕЛЕНИЮ: `docs/02-quant-desk.md` §1 — «Fable не участвует в
+  рутине цикла вообще», состав деска — `docs/DESIGN.md` §7 (architect'а в нём нет).
+- **`COGNITIVE-ONLY`** (`gates.md` §11): механического барьера у этого маршрута нет и он
+  не изображается. Маршрут §D живёт в переписке, а CI видит только артефакты.
+  Кандидат-механизм НАЗВАН и не выдаётся за сделанный: вердикт-файл с
+  `verdict: REJECT` обязан в своём Handoff §D называть `architect`;
+  `scripts/check_gate_meta.sh` эти файлы уже разбирает.
 - Risk-блок отсутствует → блокирует, эскалирует к founder на диспетч `risk-critic`.
 - Формат — PR-комментарий с Block-цитатами (Block-scope, Block-DoneBlock, Block-C, Block-risk) + финальный вердикт APPROVED/REJECTED.
 
