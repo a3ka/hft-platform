@@ -124,7 +124,10 @@ chk_named_test "оракул m85_4 + страж оси m85_5 (VB-I-10 на пу�
 
 step "SEEK-ВАРИАНТ — frames_since_with_stats НЕ заведён на путь выдачи (§2bis.2)"
 # Наблюдение ОТСУТСТВИЯ: вне предмета он объявлен ровно потому, что его не зовут из прод-кода.
-chk "! grep -rn 'frames_since_with_stats' crates/gateway-serve/src/ crates/recorder/src/ crates/ops/src/ 2>/dev/null | grep -q ."
+# Универсум — ВЕСЬ `crates/*/src/` (17 каталогов), а не три: `A-034` §2 п.4 — гейт нарушал
+# собственное правило шапки. Объявление и `///`-комментарии исключены, иначе шаг красен на
+# самом объявлении; присутствие объявления сторожит шаг СИГНАТУРА, дубля не заводим.
+chk "! grep -rn 'frames_since_with_stats' crates/*/src/ | grep -v '///' | grep -v 'pub fn frames_since_with_stats' | grep -q ."
 
 step "task #4 — путь \`pump\` НЕ тронут: регресс M-77 недопустим"
 # Наблюдается ИСПОЛНЕНИЕМ чужих оракулов, а не `git diff` по файлу: диф покажет касание
