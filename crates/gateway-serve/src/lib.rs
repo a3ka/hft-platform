@@ -159,7 +159,9 @@ pub mod serve {
 }
 
 /// WS-сервер (bin-путь, task #4). ТОНКАЯ IO-оболочка: accept → verify JWT (`auth::verify_token`) →
-/// snapshot (`serve::snapshot_msg`) + инкрементальный push (`serve::frames_msgs`) + replay. Read-only,
+/// snapshot (`serve::snapshot_msg`) + инкрементальный push через `LiveReducer::pump` + replay.
+/// `serve::frames_msgs` существует как тонкий passthrough-обёртка над `gateway::frames_since`
+/// (GS-I-5), но НЕ вызывается из push-loop'а — прод-вызовов ноль (M-53/TD-083). Read-only,
 /// stateless по юзеру. Токен передаётся клиентом в query (`?token=<jwt>`). Тела — engine-dev (task #4).
 pub mod server {
     use super::session; // M-65: per-connection subscription state
