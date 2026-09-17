@@ -1163,6 +1163,45 @@ impl Reducer {
         self.apply_vwap(event, false);
     }
 
+    /// M-85 (TD-199, §2bis): зеркало `seed_vwap` для книги редьюсера. Применяет
+    /// `MdPayload::L2Snapshot`/`L2Delta`, отобранные `selector.matches`, к `self.book`,
+    /// НЕ сворачивая событие в серии (heatmap/depth/bubbles/VP/CVD/VWAP — НЕ трогаются).
+    ///
+    /// Семантика «зеркала»:
+    /// - VWAP seed = `apply_vwap(event, emit=false)` (аккумулятор без эмита в `self.vwap`).
+    /// - Book seed = `apply_snapshot`/`apply_delta` к `self.book` (состояние без эмита в
+    ///   `self.heatmap_buckets`/`self.depth[].values`/`self.bubbles`/...).
+    ///   `apply()` сам обновит эти хранилища для событий ПОСЛЕ `after` — затравочные
+    ///   события обязаны иметь эффект ТОЛЬКО на состояние, по которому строятся точки
+    ///   ПОСЛЕ `after` (`VB-I-2` на пути `frames_since`, депт-серия считается ИЗ книги).
+    ///
+    /// Вызывается ИЗ `reduce_event_stream` на событиях `seq <= after` (`after`-seed-ветка,
+    /// рядом с `seed_vwap`). Другие вызовы запрещены: (а) `apply()` уже обновляет книгу
+    /// для событий ПОСЛЕ `after`, и звать `seed_book` оттуда — задвоение; (б) `pump` идёт
+    /// через живой `LiveReducer::full`/`book_series_in` (`M-77`), и его путь не трогается.
+    /// На seek-варианте `frames_since_with_stats` событий `seq <= after` в потоке НЕТ
+    /// (`journal::stream_from` пропускает сегменты), и seed-ветка не срабатывает — это
+    /// та самая причина, по которой seek-вариант объявлен ВНЕ предмета (§2bis.2).
+    fn seed_book(&mut self, event: &Event) {
+        let EventKind::Md(md) = &event.kind else {
+            return;
+        };
+        if !self.selector.matches(md) {
+            return;
+        }
+        match &md.payload {
+            MdPayload::L2Snapshot { bids, asks, .. } => {
+                self.book.apply_snapshot(bids, asks);
+            }
+            MdPayload::L2Delta { bids, asks, .. } => {
+                self.book.apply_delta(bids, asks);
+            }
+            // Trade/Heatmap/Secrets/etc — без эффекта: `seed_vwap` уже отбирает `Trade`
+            // для VWAP-аккумулятора; book-зеркало для НЕ-L2 вариантов не существует.
+            _ => {}
+        }
+    }
+
     /// M-24: аккумулировать сделку в per-session VP-гистограмму. Вызывается ТОЛЬКО из apply —
     /// seed (события `seq <= after`) НЕ обновляет VP: per-session гистограмма без time-bucket
     /// эмита, seed-VP дал бы cumulative state в frame.delta → double-counting при apply
@@ -2426,6 +2465,13 @@ fn reduce_event_stream(
         let event = event?;
         if after.upto_seq.is_some_and(|seq| event.seq <= seq) {
             reducer.seed_vwap(&event);
+            // M-85 (TD-199, §2bis): довести книгу до состояния на `after` включительно,
+            // НЕ сворачивая в серии. Зеркало `seed_vwap` для книги: применяем ТОЛЬКО
+            // `L2Snapshot`/`L2Delta`, отобранные селектором, к `self.book`. Без этого
+            // вызова `Reducer::new` на `frames_since` стартует с пустой книгой, и точки
+            // депт-серии, рождающиеся из книги на дельта-хвосте без якоря в окне,
+            // пропадают или приходят с фантомным нулём (`m85_1`, нарушение `VB-I-2`).
+            reducer.seed_book(&event);
             continue;
         }
         if !to.includes(event.seq) || consumed == max_events {
