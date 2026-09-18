@@ -1,0 +1,4329 @@
+//! Сегменты, эпохи, стрим-чтение, ретеншен (M-08 / CT-RFC-02).
+//!
+//! Каркас (типы + сигнатуры) — architect (M-08 task 1).
+//! Реализация — engine-dev (задачи 2/3). Инварианты — RED в `tests/` (sacred).
+//!
+//! Три вещи, которых сегодня нет и из-за которых сбор данных конечен:
+//!  1. **Ротация** — имя сегмента захардкожено (`segment-00000000.jrnl`), файл растёт вечно;
+//!     при 2.8 GB/сут (замер VPS 2026-07-13) диск (120 GB свободно) кончится за ~43 дня.
+//!  2. **Bounded-memory чтение** — `read_all()` грузит ВЕСЬ журнал в `Vec<Event>`; на 8.3 GB
+//!     это не запускается (класс TD-011). Альфы на прод-объёме построить нельзя.
+//!  3. **Provenance** — источник данных нигде не записан; докупленная история станет
+//!     неотличима от собственного захвата (CT-RFC-02).
+//!
+//! ## Wire format (schema v2, текущий прод-формат)
+//!
+//! ```text
+//! SEGMENT_MAGIC            // 8 байт: b"HFTJRN02"
+//! SegmentHeader-frame      // [u32 LE len][postcard(SegmentHeader) len B][u32 LE crc32]
+//! event_frame[0..N]        // [u32 LE len][postcard(Event) len B][u32 LE crc32]
+//! ```
+//!
+//! Legacy (schema v1) — без магии и без заголовка, просто event_frame[0..N]. Читается вечно
+//! ТОЛЬКО через явную декларацию в манифесте `journal.legacy.json` (CT-RFC-02 rev 2,
+//! fail-closed находка critic C-005 C2).
+
+use std::ffi::OsStr;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use contracts::{
+    DataSource, Event, EventKind, LegacyManifest, LegacySegmentDecl, MdPayload, SegmentHeader,
+    LEGACY_FINGERPRINT_BYTES, SEGMENT_MAGIC,
+};
+use sha2::{Digest, Sha256};
+
+use super::{read_meta, META, TAIL_SCAN_CHUNK};
+
+/// Порог ротации по размеру (E2). Сегмент закрывается, когда превысил его.
+pub const DEFAULT_MAX_SEGMENT_BYTES: u64 = 1024 * 1024 * 1024; // 1 GiB
+
+/// Порог свободного места (E4, fail-closed): ниже — запись ОСТАНАВЛИВАЕТСЯ явно.
+pub const DEFAULT_MIN_FREE_BYTES: u64 = 10 * 1024 * 1024 * 1024; // 10 GiB
+
+/// Конфиг писателя (E2/E4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriterConfig {
+    pub max_segment_bytes: u64,
+    /// Свободного места меньше → `append` возвращает `Err(StorageGuard)`, а не «пишет,
+    /// пока диск не кончится». Тихо переполнить диск = тот же остановленный сбор,
+    /// только без предупреждения.
+    pub min_free_bytes: u64,
+    pub source: DataSource,
+    pub provenance: String,
+    pub epoch_id: String,
+}
+
+impl WriterConfig {
+    /// Дефолт для recorder'а: собственный захват.
+    pub fn own_capture(provenance: impl Into<String>, epoch_id: impl Into<String>) -> Self {
+        Self {
+            max_segment_bytes: DEFAULT_MAX_SEGMENT_BYTES,
+            min_free_bytes: DEFAULT_MIN_FREE_BYTES,
+            source: DataSource::OwnCapture,
+            provenance: provenance.into(),
+            epoch_id: epoch_id.into(),
+        }
+    }
+}
+
+/// Сегмент на диске + его заголовок (у legacy-сегмента — вменённый, CT-RFC-02 §3).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SegmentInfo {
+    pub path: PathBuf,
+    pub index: u32,
+    pub header: SegmentHeader,
+    pub size_bytes: u64,
+}
+
+/// Какие эпохи читатель СОГЛАСЕН смешивать (E6, CT-RFC02-3/4).
+///
+/// Дефолта «всё подряд» нет: смешение купленной истории с собственным захватом —
+/// решение, которое принимается ЯВНО, иначе альфа обучается на данных, которых у нас
+/// не было. Тот же класс ошибки, что TD-015, но дороже (там метрики, здесь — обучение).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EpochFilter {
+    /// Только собственный захват (дефолт research-пути).
+    OwnCaptureOnly,
+    /// Явно перечисленные эпохи (`epoch_id`) — осознанное смешение.
+    Explicit(Vec<String>),
+    /// Всё, включая `Vendor`/`Synthetic`. Только для диагностики/дампов, не для обучения.
+    All,
+}
+
+impl EpochFilter {
+    /// Проходит ли сегмент фильтр.
+    pub fn accepts(&self, header: &SegmentHeader) -> bool {
+        match self {
+            EpochFilter::OwnCaptureOnly => header.source == DataSource::OwnCapture,
+            EpochFilter::All => true,
+            EpochFilter::Explicit(allow) => allow.iter().any(|e| e == &header.epoch_id),
+        }
+    }
+}
+
+/// Имя манифеста легаси-деклараций (CT-RFC-02 rev 2).
+pub const LEGACY_MANIFEST: &str = "journal.legacy.json";
+
+// === M-57 (TD-109), круг 2: in-memory курсор хвоста активного сегмента ===
+
+/// КУРСОР ХВОСТА активного сегмента, передаваемый через API.
+///
+/// Прежняя (M-57 задача 2) реализация хранила эту же тройку полей в файловом
+/// sidecar `journal.tail-offset` ВНУТРИ каталога журнала и обновляла его в
+/// `EventStream::drop`. Это не работало на проде (`R-035` F-035-1: `gateway-serve`
+/// монтирует журнал `:ro`, запись sidecar молча проваливалась, активный сегмент
+/// пересканировался каждый тик) и приводило к драке сессий за общий курсор
+/// (F-035-2). С кругом 2 sidecar удалён целиком (задача 9); курсор живёт только
+/// в `LiveReducer::tail_hint` и передаётся через [`stream_from_at`]. Семантика
+/// полей сохранена:
+///
+/// - `seg_idx`: индекс активного сегмента, в котором шло чтение.
+/// - `last_seq`: `seq` ПОСЛЕДНЕГО декодированного события (не yielded — а
+///   именно декодированного; для хвоста после приращения это даёт истинную
+///   верхнюю границу прочитанной зоны).
+/// - `pos`: байтовая позиция в файле активного сегмента СРАЗУ ПОСЛЕ фрейма
+///   последнего декодированного события.
+///
+/// **Источник истины — сам сегмент, не hint.** Если hint не подходит (ротация,
+/// юзер хочет события из уже прочитанной зоны), валидация в `stream_from_at`
+/// откатывается к полному скану активного сегмента с начала.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TailHint {
+    pub seg_idx: u32,
+    pub last_seq: u64,
+    pub pos: u64,
+}
+
+// === M-62 (TD-120): счётчик операций с метаданными сегментов + per-session кеш перечня ===
+
+/// Счётчик операций с метаданными сегментов за проход.
+///
+/// `M-62 (TD-120)`, задача 1: детерминированный счётчик операций (`stat`, `File::open`
+/// ради заголовка, `read_dir`), инкрементируемый в местах РЕАЛЬНЫХ операций, а не раз за
+/// вызов `segments()` — иначе верхний порог проходит мутант `countfake` (раз за вызов).
+/// Аддитивен к `events_scanned`/`events_decoded` (те не трогает — sacred M-57).
+///
+/// Передаётся как `&mut u64` через все `fn`-ы, исполняющие классификацию сегментов; нулевая
+/// стоимость в release (`&mut u64` — одно машинное слово, JIT'ом оптимизируется в
+/// прямую запись). Используется только `stream_from_at` (прод-путь) — другие прод-пути
+/// (`stream`, `read_all`) не интересуются метрикой и зовут общий хелпер `segments()`
+/// через собственные внутренние обёртки с собственным `&mut u64`.
+///
+/// Поле публичное (не `cell`-обёртка): это счётчик, не состояние — потребитель сам решает,
+/// как его использовать (положить в `EventStream`, добавить в `ReadStats`, напечатать).
+pub type SegmentOps = u64;
+
+/// Per-session кеш перечня сегментов каталога. Решает M-62 (TD-120), задачи 2+3:
+/// установившийся тик больше НЕ обходит каталог заново — кеш переиспользует
+/// `SegmentInfo` между тиками, инвалидируясь по дешёвому сигналу (один `stat` хвоста +
+/// один `read_dir` сравнение имён файлов).
+///
+/// **СОСТОЯНИЕ PER-SESSION, не per-catalog (`§5` запретного списка).** Живёт в
+/// `LiveReducer` рядом с `tail_hint`. Никаких файлов в каталоге журнала (`:ro`-том
+/// прода не выдержит записи; M-57 провалил три круга гейтов на sidecar'е
+/// `journal.tail-offset`), никаких общих указателей (`F-035-2`: одна сессия
+/// обесценивает кеш у соседа).
+///
+/// **Инвалидация — дешёвая, без полного перечисления:**
+/// 1. `stat(latest_path)` → если размер изменился, кеш протух (active-сегмент растёт
+///    между тиками — это НОРМА и НЕ инвалидирует кеш; НЕ совпадение пути ⇒ ротация);
+/// 2. одно `read_dir` каталога + сравнение отсортированных имён файлов с кешированными →
+///    если различаются, кеш протух (появился новый сегмент / исчез `.jrnl` при
+///    компакции закрытого сегмента).
+///
+/// Оба сигнала ОБЯЗАНЫ проверяться: `stat` ловит ротацию, `read_dir` ловит компакцию
+/// закрытого сегмента, при которой `latest_path` остаётся прежним.
+pub struct SegmentCatalog {
+    /// Отсортированный по `index` список сегментов (тот же порядок, что выдаёт `segments()`).
+    segments: Vec<SegmentInfo>,
+    /// Отсортированный список имён ВСЕХ файлов каталога на момент построения кеша.
+    /// Сравнение имён — дешёвый O(|files|) тест инвалидации без `metadata` на каждом.
+    file_names: Vec<String>,
+    /// Путь сегмента с МАКСИМАЛЬНЫМ индексом (None если каталог пуст). По нему
+    /// `is_fresh` делает один `stat` — `stat` дешевле `metadata()`.
+    latest_path: Option<PathBuf>,
+    /// Размер `latest_path` на момент кеширования.
+    latest_size: u64,
+}
+
+impl SegmentCatalog {
+    /// Построить кеш, обойдя каталог. Возвращает `(каталог, ops_done)`.
+    ///
+    /// `ops_done` отражает РЕАЛЬНЫЕ syscall'ы построения (≈ `1 (manifest) + 1 (read_dir)
+    /// + N × ~2.5 (per segment)`); см. §1.1 спеки.
+    pub fn open(dir: &Path) -> io::Result<(Self, SegmentOps)> {
+        let mut ops: SegmentOps = 0;
+        let segments = segments_counted(dir, &mut ops)?;
+        let (file_names, latest_path, latest_size) = scan_dir_layout(dir, &mut ops)?;
+        Ok((
+            Self {
+                segments,
+                file_names,
+                latest_path,
+                latest_size,
+            },
+            ops,
+        ))
+    }
+
+    /// Дешёвая проверка свежести кеша. Возвращает `(fresh, ops_done)`.
+    ///
+    /// Стоимость — 1 `stat` + 1 `read_dir` независимо от N (по §1.1 спеки: 410+
+    /// syscall'ов сегодня, ≤2 при кеше).
+    ///
+    /// Правила инвалидации:
+    /// - `latest_path` исчез (ротация) ⇒ stale;
+    /// - `latest_path.len()` УМЕНЬШИЛОСЬ (truncate/компакция активного) ⇒ stale;
+    /// - `latest_path.len()` ВОЗРОСЛО (нормальный append между тиками) ⇒ FRESH —
+    ///   состав сегментов не изменился, только последний вырос, и `catalog.segments()`
+    ///   остаётся корректным (его позиция на НЕ-зависит от текущей длины файла);
+    /// - состав имён файлов изменился ⇒ stale (ротация создала новый файл, или
+    ///   компакция закрытого сегмента удалила `.jrnl`).
+    ///
+    /// Дешёвая проверка свежести кеша. Возвращает `(fresh, ops_done)`.
+    ///
+    /// Стоимость — 1 `stat` + 1 `read_dir` независимо от N (по §1.1 спеки: 410+
+    /// syscall'ов сегодня, ≤2 при кеше в чистом случае).
+    ///
+    /// **Инкрементальная инвалидация для типовых между-тиковых изменений:**
+    /// при ротации (1 новый файл, 0 удалённых) или компакции закрытого сегмента
+    /// (1 файл удалён `.jrnl`, 1 добавлен `.jrnl.zst`) кеш обновляется ЧАСТИЧНО:
+    /// классифицируется только изменённый файл, остальные 199 не трогаются. Стоимость
+    /// остаётся ≤8 операций — в бюджете `BUDGET_META`. Без этого каждый пустой тик
+    /// платил бы O(сегмента) за ротацию, и M-62 отменял бы сам себя.
+    ///
+    /// БОЛЬШОЕ расхождение (mass rotation, multi-сегмент compaction) ⇒ возврат `false`:
+    /// caller обязан вызвать `refresh()` для полного перестроения (полная цена ~N×2.5).
+    /// Это редкий случай и происходит только при долгом простаивании сессии.
+    pub fn is_fresh(&mut self, dir: &Path) -> io::Result<(bool, SegmentOps)> {
+        let mut ops: SegmentOps = 0;
+        // (1) stat хвоста: путь исчез ⇒ точно ротация, нужен refresh.
+        if let Some(latest) = self.latest_path.as_ref() {
+            match fs::metadata(latest) {
+                Ok(m) => {
+                    ops += 1;
+                    if m.len() < self.latest_size {
+                        // Truncate активного — редкий случай, refresh.
+                        return Ok((false, ops));
+                    }
+                }
+                Err(_) => {
+                    // Файл исчез — ротация, нужно полное обновление.
+                    ops += 1;
+                    return Ok((false, ops));
+                }
+            }
+        }
+        // (2) Сравнение состава файлов: вычисляем diff и обновляем инкрементально
+        //     если изменение «маленькое».
+        let (cur_names, cur_latest_path, cur_latest_size) = scan_dir_layout(dir, &mut ops)?;
+        if cur_names == self.file_names {
+            return Ok((true, ops));
+        }
+        // diff: что добавлено и что удалено относительно кеша.
+        let added: Vec<&String> = cur_names
+            .iter()
+            .filter(|n| !self.file_names.contains(n))
+            .collect();
+        // `removed` хранит СВОИ строки (а не ссылки на `self.file_names`): цикл ниже
+        // зовёт `reattach_survivor` (метод на `&mut self`), а иначе borrow
+        // checker запрещает мутацию при живом заимствовании `file_names`. Цена —
+        // копия имени (десятки байт) на каждый удалённый файл; на проде ≤2 за такт.
+        let removed: Vec<String> = self
+            .file_names
+            .iter()
+            .filter(|n| !cur_names.contains(n))
+            .cloned()
+            .collect();
+        // Типовая между-тиковая ситуация: ротация (+1, 0) или компакция закрытого
+        // сегмента (−1 .jrnl, +1 .zst). Оба укладываются в «маленький» diff.
+        let small_change = added.len() <= 2 && removed.len() <= 2;
+        if !small_change {
+            return Ok((false, ops));
+        }
+        // Инкрементальное обновление: применяем diff к кешу. На каждый добавленный
+        // файл — `classify_segment` (~3 операции); на удалённый — убираем из
+        // `self.segments`. На КАЖДЫЙ добавленный — ops учитывается внутри.
+        //
+        // ПОРЯДОК ИМЕЕТ ЗНАЧЕНИЕ (R-053 §Б-1, задача 10). При компакции одного
+        // сегмента `.jrnl` → `.jrnl.zst` индекс у добавленного и удалённого ОДИН.
+        // Если сперва добавить `.zst`, а потом по индексу снести ВСЕ записи с этим
+        // индексом — снесётся и только что добавленная: сегмент ПРОПАДЕТ из кеша, и
+        // `is_fresh` тут же перепишет `file_names`, поэтому следующий тик расхождения
+        // уже не увидит. Поэтому: сперва REMOVE, потом ADD.
+        let manifest = load_manifest(dir, &mut ops)?;
+        for removed_name in &removed {
+            // КЛАСС A (M-62, блокер Б-4 `R-056`; разведка круга 3
+            // `docs/plans/M-62-class-sweep-round3.md` §1, класс `L3-1`).
+            // Инкрементальная ветка ранее удаляла запись кеша ПО ИНДЕКСУ, не
+            // сверяя, остался ли у индекса другой файл на диске. Компакция
+            // состоит из двух наблюдаемых шагов (`compact_segment` :3998-4011:
+            // rename .tmp→.zst, затем remove .jrnl); когда они попадают в
+            // РАЗНЫЕ тики сессии — а на проде они разнесены микросекундами между
+            // шагами 6 и 7 (`fs::remove_file` 1 GiB: 254-728 мс, замер
+            // reviewer'а), плюс self-heal `:3956-3957` разносит те же два
+            // события на ЧАСЫ — тик 1 (промежуточное состояние: `.zst` рядом с
+            // `.jrnl`) кладёт сырой (D-COMP-1), тик 2 (`remove .jrnl`) сносит
+            // запись, хотя `.zst` остался жив. Зеркальный случай (`remove .zst`
+            // при живом `.jrnl`, ветка `:3947`) — тот же корень. Сегмент
+            // исчезает из кеша при `is_fresh=true`; `self.file_names`
+            // переписывается, расхождение становится ненаблюдаемым изнутри до
+            // конца сессии.
+            //
+            // РАЗВЯЗКА (замер разведки, §Р-2): ПЕРЕКЛАССИФИЦИРОВАТЬ выжившего
+            // через `classify_segment` на оставшийся файл. Развязка «не
+            // удалять запись, пока индекс есть в `cur_names`» (`R-056`
+            // условие п.1 развилка №1) ОТВЕРГНУТА: запись продолжает
+            // адресовать УДАЛЁННЫЙ файл, выдача умирает `Os { code: 2,
+            // NotFound }` на прод-пути `pump()` — и ВСЕ 10 оракулов SM при этом
+            // зелены (`M-62-class-sweep-round3.md` §Р-2: «неверный фикс прошёл
+            // бы сегодняшний гейт целиком»). ПЕРЕКЛАССИФИКАЦИЯ платит 6-11
+            // операций против 415-418 у «уходить в `refresh()`» на такте
+            // события каталога — в 60 раз дешевле, при этом обе дают 3 на
+            // установившемся такте (бюджет 8). ОДНА именованная точка
+            // `reattach_survivor` (см. одноимённый метод ниже) — якорь батареи
+            // мутантов (`scripts/tests/red_segment_meta_battery.sh` §4.5bis п.3).
+            //
+            // Порядок «сперва REMOVE, потом ADD» (§5 запретного списка:
+            // перестановка снимает инвариант, о котором здесь не сказано)
+            // СОХРАНЯЕТСЯ: REMOVE вызывает переклассификацию выжившего, ADD —
+            // только для НОВЫХ имён, не присутствовавших в `file_names`.
+            if let Some(idx) = parse_segment_index_any(removed_name) {
+                // Снимаем старую запись (raw или zst) — она могла указывать на УДАЛЁННЫЙ
+                // файл. Эта `retain` остаётся в REMOVE-цикле (а не прячется в
+                // `reattach_survivor`) намеренно: якорь мутанта `pathblind` батареи
+                // (`scripts/tests/red_segment_meta_battery.sh`) оборачивает её в
+                // условный `if !cur_names.iter().any(|n| parse_segment_index_any(n) ==
+                // Some(idx)) { self.segments.retain(...) }`, воспроизводя отвергнутую
+                // замером развязку №1 (оставить висящий путь, если у индекса ещё есть
+                // имя в `cur_names`). Это `retain` остаётся КОМПИЛИРУЕМЫМ после
+                // мутации, потому что `idx` — локальная переменная внешнего `if let`.
+                self.segments.retain(|s| s.index != idx);
+                // Класс A: переклассифицировать выжившего. ОДНА именованная точка
+                // `reattach_survivor` (см. одноимённый метод ниже) — якорь батареи
+                // мутантов (`scripts/tests/red_segment_meta_battery.sh` §4.5bis п.3).
+                // Метод делает ТОЛЬКО классификацию и `push` — retain был уже сделан
+                // выше строкой, которую `pathblind` умеет мутировать. Перенос retain
+                // внутрь метода сломал бы `pathblind` (мутация искала бы retain в
+                // цикле, нашла бы его в теле метода, где `idx` не в области видимости).
+                self.reattach_survivor(dir, &manifest, idx, removed_name, &cur_names, &mut ops)?;
+            }
+        }
+        for added_name in &added {
+            // R-053 §Б-3: в каталоге могут появляться посторонние файлы
+            // (`journal.meta.tmp`, `segment-*.jrnl.zst.tmp`, `replay-digest.tmp`).
+            // `classify_segment` на них вернёт `Err("not a segment file")`, и
+            // ошибка пробрасывается в `pump()` сессии. До M-62 такие файлы были
+            // безвредны — `dedup_indexed_paths` их просто не выбирает. Повторяем
+            // ту же дисциплину и здесь: имя ОБЯЗАНО иметь суффикс `.jrnl` или
+            // `.jrnl.zst` и парситься в индекс, иначе — пропускаем.
+            if !added_name.ends_with(".jrnl") && !is_compacted_name(added_name) {
+                continue;
+            }
+            if parse_segment_index_any(added_name).is_none() {
+                continue;
+            }
+            let p = dir.join(added_name.as_str());
+            let info = classify_segment(&p, &manifest, &mut ops)?;
+            // R-053 §Б-2 — D-COMP-1 (общий хелпер `dedup_indexed_paths`, §907-923):
+            // при коллизии по индексу побеждает СЫРОЙ `.jrnl`, `.zst` игнорируется.
+            // Промежуточное состояние компакции (шаг 6 сделан, шаг 7 ещё нет) даёт
+            // на диске ОБА файла; если в кеше уже лежит `.jrnl` для этого индекса —
+            // пропускаем вновь прибывший `.zst`. Если в кеше лежит `.zst`, а на
+            // диске появился `.jrnl` (например, возвращённый из бэкапа) — заменяем.
+            let new_is_zst = is_compacted_name(added_name);
+            let existing_is_raw = self.segments.iter().any(|s| {
+                s.index == info.index
+                    && !s
+                        .path
+                        .file_name()
+                        .and_then(OsStr::to_str)
+                        .is_some_and(is_compacted_name)
+            });
+            if existing_is_raw && new_is_zst {
+                // D-COMP-1: в кеше уже сырой сегмент этого индекса — оставляем его.
+                continue;
+            }
+            // Иначе (existing zst+new raw, existing отсутствует, или того же типа) —
+            // сносим прежнюю запись с этим индексом и кладём новую.
+            self.segments.retain(|s| s.index != info.index);
+            self.segments.push(info);
+        }
+        // Сортируем на случай, если порядок был нарушен (защита).
+        self.segments.sort_by_key(|s| s.index);
+        // КЛАСС B (M-62, `R-056` блокер кл. B; разведка круга 3 §1, находки
+        // `L2-1`/`L4-2`/`L5-1`). Полный путь `segments_counted` (`:1056-1088`)
+        // = manifest → dedup → classify → sort → **guard** (`check_first_seq_monotonic`,
+        // JR-I-11, M-52, заведён по факту прода TD-030). Инкрементальная ветка
+        // воспроизводит первые четыре шага и НИ ОДНОГО проверочного: тёплая
+        // сессия ПРИНИМАЕТ каталог, который холодный полный путь ОТВЕРГАЕТ.
+        // Иммутабельные инварианты `RK-I-*`/`JR-I-*` наследуются через
+        // метод `validate_like_full_path` — единый именованный вызов, чтобы фикс
+        // было можно ослабить одной строкой (мутант `guardskip`) и удержать в
+        // бюджете (мутант `guardstub` ловит проглатывание отказа).
+        //
+        // Guard дешёв по конструкции: на здоровом каталоге — 0 syscall'ов
+        // (`carries_events` зовётся лениво, только при равенстве `first_seq`).
+        // Бюджет `BUDGET_META=8` он НЕ двигает — `I2` (правдивость) не
+        // покупается ценой `I1` (цена); обратное обязано краснеть (мутант
+        // `alwaysrefresh` роняет 409-413 при бюджете 8, §4.5bis).
+        //
+        // §5 запретного списка (атомарность при Err): `self.file_names =
+        // cur_names` коммитится ПОСЛЕ валидации. На Err следующий такт увидит
+        // расхождение и повторит попытку (полупроводящее поведение),
+        // ПОСЛЕ коммита — ранний выход по совпадению имён, и полуприменённый
+        // кеш живёт до конца сессии. Оракула на G5 в круге 3 НЕТ (§9
+        // спеки), поэтому запрет строже — коммит только здесь, в самом конце.
+        //
+        // Имя метода `validate_like_full_path` — якорь батареи мутантов
+        // (`scripts/tests/red_segment_meta_battery.sh` §4.5bis п.3).
+        // Мутант `guardskip` удаляет ЭТОТ вызов, мутант `guardstub` проглатывает
+        // `?` — обе должны краснеть по `sm11c`. Перенос якоря — вместе с
+        // переименованием метода здесь.
+        self.validate_like_full_path(dir, &mut ops)?;
+        self.file_names = cur_names;
+        self.latest_path = cur_latest_path;
+        self.latest_size = cur_latest_size;
+        Ok((true, ops))
+    }
+
+    /// ПЕРЕКЛАССИФИЦИРОВАТЬ выжившего (КЛАСС A, `R-056` блокер Б-4).
+    ///
+    /// При удалении имени `removed_name` из кеша (например, шаг 7 компакции
+    /// `fs::remove_file(src)` после того, как `.zst` уже опубликован) индекс
+    /// `idx` мог уйти в ноль на диске (`segments.rs:4011`), а мог и остаться
+    /// живым в `.zst` (D-COMP-2 self-heal) или в `.jrnl` (возврат из бэкапа,
+    /// комментарий `:320`). Корень дефекта Б-4 — удаление по ИНДЕКСУ без
+    /// сверки с диском. Эта функция — единственное место, где решается,
+    /// удалять запись или заменить её переклассифицированным выжившим.
+    ///
+    /// Почему НЕ «не удалять, если индекс остался в `cur_names`» (`R-056`
+    /// условие п.1 развилка №1). Замер (`docs/plans/M-62-class-sweep-round3.md`
+    /// §Р-2): такая развязка оставляет в кеше `SegmentInfo`, чей `path`
+    /// указывает на УДАЛЁННЫЙ файл, и выдача умирает `Os { code: 2,
+    /// NotFound }` на прод-точке входа `LiveReducer::pump` —
+    /// `crates/gateway/src/lib.rs:3150`. Ломается при этом ОБЫЧНАЯ
+    /// односегментная компакция (контроль SM-8). Батарея мутантов
+    /// `pathblind` ЗАМЕРЕНО ловит этот исход по ВЫДАЧЕ (`No such file or
+    /// directory (os error 2)`), тогда как по множеству индексов — зелена.
+    ///
+    /// Платит: `classify_segment` (≈2-3 syscall'а) плюс `Vec::push`.
+    /// Замер приёмки развязки: 6-11 операций против 415-418 у «уходить в
+    /// `refresh()`» на такте события каталога — в 60 раз дешевле; на
+    /// установившемся такте обе дают 3 при бюджете 8.
+    ///
+    /// Вызывающий (`is_fresh`, REMOVE-цикл) уже сделал
+    /// `self.segments.retain(|s| s.index != idx)` строкой выше — здесь мы
+    /// только пушим новую запись. Якорь батареи (`scripts/tests/red_segment_meta_battery.sh`
+    /// §4.5bis п.3): `reattach_survivor` (имя вызова). Переименование точки
+    /// требует синхронного переноса якоря в `MANIFEST_AXIS6_A` (спека §4.5bis);
+    /// иначе подстановка молча не сработает, и мутант `indexblind` / `pathblind`
+    /// окажется равен эталону — отказ батареи, а не строка в логе.
+    fn reattach_survivor(
+        &mut self,
+        dir: &Path,
+        manifest: &LegacyManifest,
+        idx: u32,
+        removed_name: &str,
+        cur_names: &[String],
+        ops: &mut SegmentOps,
+    ) -> io::Result<()> {
+        // Имя, оставшееся у индекса на диске. `removed_name` уже не в
+        // `cur_names` (это инвариант `removed`), ищем любое имя того же
+        // индекса.
+        let survivor = cur_names.iter().find_map(|n| {
+            if n.as_str() == removed_name {
+                None
+            } else {
+                match parse_segment_index_any(n) {
+                    Some(i) if i == idx => Some(n.as_str()),
+                    _ => None,
+                }
+            }
+        });
+        if let Some(survivor_name) = survivor {
+            // D-COMP-1: `classify_segment` единый для raw и zst; при коллизии
+            // тот же хелпер использует `dedup_indexed_paths`, но здесь мы
+            // ЗАРАНЕЕ знаем индекс и фильтруем — никаких дублей. Вызывающий
+            // (REMOVE-цикл `is_fresh`) уже сделал `self.segments.retain(|s|
+            // s.index != idx)` строкой выше — мы только пушим новую запись.
+            let p = dir.join(survivor_name);
+            let info = classify_segment(&p, manifest, ops)?;
+            self.segments.push(info);
+        }
+        // Иначе: файлов этого индекса на диске больше нет — запись уже
+        // снята retain'ом вызывающего, ничего больше делать не нужно.
+        Ok(())
+    }
+
+    /// НАСЛЕДОВАТЬ fail-closed guard полного пути (КЛАСС B, `R-056` блок кл. B).
+    ///
+    /// Полный путь (`segments_counted`, `:1056-1088`) завершается guard'ом
+    /// `check_first_seq_monotonic` (JR-I-11, M-52, TD-030): если `first_seq`
+    /// не возрастает по индексу сегмента, каталог объявляется НЕЧИТАЕМЫМ,
+    /// вызов возвращает Err с операторской диагностикой, и НИ ОДНО событие
+    /// наружу не выдаётся. Инкрементальная ветка `is_fresh` строит новое
+    /// состояние кеша мутацией `self.segments` и НЕ зовёт guard ни разу —
+    /// тёплая сессия ПРИНИМАЕТ каталог, который холодный полный путь
+    /// ОТВЕРГАЕТ. Ровно тот сигнал, на который runbook опирается как на
+    /// «инцидент не закрыт», исчезает в момент, когда оператор чинит журнал
+    /// руками.
+    ///
+    /// ОДНА именованная точка `validate_like_full_path` — якорь батареи
+    /// мутантов (`scripts/tests/red_segment_meta_battery.sh` §4.5bis п.3):
+    /// мутант `guardskip` удаляет вызов ЭТОГО метода (и должен краснеть по
+    /// `sm11c`), мутант `guardstub` оставляет вызов, но проглатывает `?` (тоже
+    /// красен по `sm11c` — fail-closed выражен, а не только назван). Перенос
+    /// якоря — вместе с переименованием метода здесь.
+    ///
+    /// Бюджет: на здоровом каталоге — 0 syscall'ов (`carries_events` зовётся
+    /// лениво, только при равенстве `first_seq` соседей; `check_first_seq_monotonic`
+    /// тратит один `match` на пару). На испорченном — `carries_events` откроет
+    /// файл РОВНО ОДИН раз на паре с равными `first_seq`, что на проде
+    /// ничтожно: окно расхождения арифметически ограничено одним сегментом.
+    fn validate_like_full_path(&self, dir: &Path, ops: &mut SegmentOps) -> io::Result<()> {
+        // `self.segments` отсортирован по индексу строкой выше; форма кортежа —
+        // ровно та, что требует `check_first_seq_monotonic` (имя,
+        // schema_version, first_seq).
+        let candidates: Vec<(String, u32, u64)> = self
+            .segments
+            .iter()
+            .map(|s| {
+                (
+                    s.path
+                        .file_name()
+                        .and_then(OsStr::to_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    s.header.schema_version,
+                    s.header.first_seq,
+                )
+            })
+            .collect();
+        check_first_seq_monotonic(&candidates, |name| {
+            segment_carries_any_event(&dir.join(name), ops)
+        })
+    }
+
+    /// Принудительное обновление кеша. Возвращает `ops_done` (полная цена обхода).
+    pub fn refresh(&mut self, dir: &Path) -> io::Result<SegmentOps> {
+        let mut ops: SegmentOps = 0;
+        let segments = segments_counted(dir, &mut ops)?;
+        let (file_names, latest_path, latest_size) = scan_dir_layout(dir, &mut ops)?;
+        self.segments = segments;
+        self.file_names = file_names;
+        self.latest_path = latest_path;
+        self.latest_size = latest_size;
+        Ok(ops)
+    }
+
+    /// Список сегментов, попавших в кеш (отсортирован по индексу).
+    pub fn segments(&self) -> &[SegmentInfo] {
+        &self.segments
+    }
+
+    /// `true`, если кеш пуст (`segments.is_empty()`). Пустой кеш — легитимное
+    /// состояние (каталог ещё не получил ни одного сегмента).
+    pub fn is_empty(&self) -> bool {
+        self.segments.is_empty()
+    }
+}
+
+// === Маркеры ошибок (для type-based проверок в тестах и проде) ===
+
+/// Ошибка: сегмент без магии и без валидной декларации (чужой/неизвестный).
+#[derive(Debug)]
+struct ForeignSegment;
+impl std::fmt::Display for ForeignSegment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("foreign segment (no magic, no declaration)")
+    }
+}
+impl std::error::Error for ForeignSegment {}
+
+/// Ошибка: свободного места меньше `min_free_bytes` (E4, fail-closed).
+#[derive(Debug)]
+struct StorageGuard;
+impl std::fmt::Display for StorageGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("storage guard: free bytes below min_free_bytes")
+    }
+}
+impl std::error::Error for StorageGuard {}
+
+/// Ошибка: магия есть, но заголовок битый.
+#[derive(Debug)]
+struct CorruptHeader;
+impl std::fmt::Display for CorruptHeader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("corrupt SegmentHeader")
+    }
+}
+impl std::error::Error for CorruptHeader {}
+
+/// Ошибка: задекларированный сегмент усечён ниже `size_bytes_at_decl`.
+#[derive(Debug)]
+struct TruncatedLegacy;
+impl std::fmt::Display for TruncatedLegacy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("declared legacy segment truncated below size_bytes_at_decl")
+    }
+}
+impl std::error::Error for TruncatedLegacy {}
+
+/// M-49 (JR-I-8, TD-049): последний `seq` активного (хвостового) сегмента установить не
+/// удалось — сегмент СУЩЕСТВУЕТ и НЕ ПУСТ, но нечитаем (bit-rot, обрыв выкачки, битый
+/// заголовок). `open_with` обязан отказать, а не молча стартовать с `journal.meta`
+/// (при restore из холодного хранилища мета отсутствует ⇒ 0 ⇒ seq-reuse поверх истории).
+#[derive(Debug)]
+struct TailUnreadable {
+    /// Путь нечитаемого сегмента — нужен операторскому пути (карантин при декларации).
+    path: PathBuf,
+    why: String,
+}
+impl std::fmt::Display for TailUnreadable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = self
+            .path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .unwrap_or("<segment>");
+        write!(
+            f,
+            "journal tail unreadable: {name} — last seq could not be established ({}). \
+             Recorder refuses to start: starting from journal.meta would REUSE seq already \
+             present in the log. Action: re-fetch this segment from cold storage, or declare \
+             next_seq explicitly (runbook: docs/ops-journal-tail-unreadable)",
+            self.why
+        )
+    }
+}
+impl std::error::Error for TailUnreadable {}
+
+fn err_with<E: Into<Box<dyn std::error::Error + Send + Sync>>>(
+    kind: io::ErrorKind,
+    e: E,
+) -> io::Error {
+    io::Error::new(kind, e)
+}
+
+pub(crate) fn foreign_err() -> io::Error {
+    err_with(io::ErrorKind::Other, ForeignSegment)
+}
+pub(crate) fn storage_guard_err() -> io::Error {
+    err_with(io::ErrorKind::Other, StorageGuard)
+}
+fn corrupt_header_err() -> io::Error {
+    err_with(io::ErrorKind::Other, CorruptHeader)
+}
+fn truncated_err() -> io::Error {
+    err_with(io::ErrorKind::Other, TruncatedLegacy)
+}
+
+/// M-49: диагностируемый отказ по нечитаемому хвосту (JR-I-8). Сообщение обязано называть
+/// файл + причину + действие (ti_5) — формулировка зафиксирована architect'ом в milestone.
+fn tail_unreadable_err(path: &Path, why: impl Into<String>) -> io::Error {
+    err_with(
+        io::ErrorKind::InvalidData,
+        TailUnreadable {
+            path: path.to_path_buf(),
+            why: why.into(),
+        },
+    )
+}
+
+/// Сегмент без магии и без валидной декларации (чужой/неизвестный).
+/// Читатель ОБЯЗАН вернуть такую ошибку, а не вменить `OwnCapture`.
+pub fn is_foreign_segment(e: &io::Error) -> bool {
+    matches!(e.get_ref(), Some(b) if b.is::<ForeignSegment>())
+}
+
+/// Ошибка disk-guard (E4): свободного места меньше `min_free_bytes`.
+pub fn is_storage_guard(e: &io::Error) -> bool {
+    matches!(e.get_ref(), Some(b) if b.is::<StorageGuard>())
+}
+
+/// M-49 (JR-I-8): хвост сегмента существует, но последний `seq` установить не удалось.
+pub(crate) fn is_tail_unreadable(e: &io::Error) -> bool {
+    matches!(e.get_ref(), Some(b) if b.is::<TailUnreadable>())
+}
+
+// === Утилиты классификации сегмента ===
+
+/// Имя сегмента по индексу: `segment-NNNNNNNN.jrnl`.
+fn segment_name(index: u32) -> String {
+    format!("segment-{index:08}.jrnl")
+}
+
+/// `meta.next_seq` для legacy-сегмента `segment-00000000.jrnl` (CT-I-6, journal.meta).
+pub fn legacy_meta_path(dir: &Path) -> PathBuf {
+    dir.join(META)
+}
+
+/// Прочитать существующий манифест легаси-деклараций (или пустой, если файла нет).
+///
+/// M-62 (TD-120): инкрементирует `ops` за каждый syscall (`p.exists()` + `fs::read`),
+/// чтобы счётчик `segment_meta_ops` на `EventStream` считал РЕАЛЬНЫЕ операции.
+fn load_manifest(dir: &Path, ops: &mut SegmentOps) -> io::Result<LegacyManifest> {
+    let p = dir.join(LEGACY_MANIFEST);
+    if !p.exists() {
+        *ops += 1;
+        return Ok(LegacyManifest::default());
+    }
+    *ops += 2;
+    let bytes = std::fs::read(&p)?;
+    serde_json::from_slice(&bytes)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("legacy manifest: {e}")))
+}
+
+/// Дешёвый скан каталога: имена файлов + путь/размер сегмента с максимальным индексом.
+/// Не открывает файлы — только `read_dir` + `metadata` на хвосте. Используется
+/// `SegmentCatalog` для построения fingerprint'а и его дешёвой проверки свежести.
+fn scan_dir_layout(
+    dir: &Path,
+    ops: &mut SegmentOps,
+) -> io::Result<(Vec<String>, Option<PathBuf>, u64)> {
+    *ops += 1; // read_dir
+               // DET-OK: порядок fs::read_dir не протекает наружу — names.sort() нормализует имена; latest_path/latest_size — индекс максимального сегмента, не позиция обхода.
+    let entries = fs::read_dir(dir)?;
+    let mut names: Vec<String> = Vec::new();
+    let mut latest_idx: Option<u32> = None;
+    let mut latest_path: Option<PathBuf> = None;
+    for entry in entries {
+        let entry = entry?;
+        let p = entry.path();
+        let name = match p.file_name().and_then(OsStr::to_str) {
+            Some(s) => s.to_string(),
+            None => continue,
+        };
+        // Не фильтруем по суффиксу здесь — нам интересны ВСЕ имена для сравнения
+        // (compaction переименовывает .jrnl → .jrnl.zst, и оба варианта должны попасть
+        // в список, иначе инвалидация бы не сработала).
+        if let Some(idx) = parse_segment_index_any(&name) {
+            if latest_idx.is_none_or(|cur| idx > cur) {
+                latest_idx = Some(idx);
+                latest_path = Some(p);
+            }
+        }
+        names.push(name);
+    }
+    names.sort();
+    let latest_size = if let Some(ref p) = latest_path {
+        *ops += 1;
+        fs::metadata(p).map(|m| m.len()).unwrap_or(0)
+    } else {
+        0
+    };
+    Ok((names, latest_path, latest_size))
+}
+
+/// Попытка прочитать `SegmentHeader` с текущей позиции файла.
+///
+/// Возвращает `Ok(Some(header))` если магия и заголовок валидны; `Ok(None)` если магии
+/// нет (legacy); `Err(CorruptHeader)` если магия есть, но заголовок битый.
+fn read_v2_header_and_skip<R: Read + Seek>(mut r: R) -> io::Result<Option<SegmentHeader>> {
+    let mut magic = [0u8; SEGMENT_MAGIC.len()];
+    let n = r.read(&mut magic)?;
+    if n < SEGMENT_MAGIC.len() {
+        if n == 0 {
+            return Ok(None); // пустой файл — трактуем как legacy
+        }
+        // Магия есть, но неполная — битый заголовок.
+        return Err(corrupt_header_err());
+    }
+    if magic != SEGMENT_MAGIC {
+        // Откатываемся на исходную позицию, чтобы caller мог попытаться прочитать как legacy.
+        r.seek(SeekFrom::Current(-(magic.len() as i64)))?;
+        return Ok(None);
+    }
+    // Прочитать фрейм SegmentHeader тем же форматом, что event: [u32 LE len][payload][u32 LE crc32].
+    let payload = read_frame_payload(&mut r)?.ok_or_else(corrupt_header_err)?;
+    let header: SegmentHeader = postcard::from_bytes(&payload).map_err(|_| corrupt_header_err())?;
+    Ok(Some(header))
+}
+
+/// Прочитать ОДИН event-фрейм (после магии/заголовка): [u32 LE len][payload][u32 LE crc32].
+/// Возвращает `Ok(None)` если EOF (0 байт после len).
+pub(crate) fn read_event_frame<R: Read>(mut r: R) -> io::Result<Option<Event>> {
+    let payload = match read_frame_payload(&mut r)? {
+        Some(p) => p,
+        None => return Ok(None),
+    };
+    let ev: Event = postcard::from_bytes(&payload)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    Ok(Some(ev))
+}
+
+/// Прочитать v2-заголовок БЕЗ Seek (forward-only). Для сжатых сегментов, где zstd::Decoder
+/// не импл Seek. Требует магию (иначе → `CorruptHeader`): legacy-формата под zstd не бывает.
+fn skip_v2_header_forward<R: Read>(mut r: R) -> io::Result<SegmentHeader> {
+    let mut magic = [0u8; SEGMENT_MAGIC.len()];
+    r.read_exact(&mut magic)?;
+    if magic != SEGMENT_MAGIC {
+        return Err(corrupt_header_err());
+    }
+    let payload = read_frame_payload(&mut r)?.ok_or_else(corrupt_header_err)?;
+    let header: SegmentHeader = postcard::from_bytes(&payload).map_err(|_| corrupt_header_err())?;
+    Ok(header)
+}
+
+/// Открыть zstd-поток поверх файла компактного сегмента. Двойной BufReader:
+/// внешний — чтобы `read_event_frame`/`skip_v2_header_forward` читали крупными блоками
+/// (внутренний аллокатор zstd не любит тысячи мелких read'ов); внутренний — буфер между
+/// диском и zstd-декодером.
+///
+/// НЕ буферизует весь сегмент: на боевых 1 GiB .zst это OOM (класс TD-011).
+pub(crate) fn open_compacted_reader(
+    f: File,
+) -> io::Result<BufReader<zstd::Decoder<'static, BufReader<File>>>> {
+    let inner = BufReader::with_capacity(64 * 1024, f);
+    let decoder = zstd::Decoder::with_buffer(inner)?;
+    Ok(BufReader::with_capacity(64 * 1024, decoder))
+}
+
+/// M-08 task 10: прочитать ВСЕ события из одного сегмент-файла.
+pub(crate) fn read_segment_events(path: &Path, strict: bool) -> io::Result<Vec<Event>> {
+    // M-08 task 15 (TD-022): сжатый сегмент читается через zstd-декодер; raw — как раньше.
+    let is_zst = path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .is_some_and(is_compacted_name);
+    if is_zst {
+        let f = File::open(path)?;
+        let mut decoder = open_compacted_reader(f)?;
+        skip_v2_header_forward(&mut decoder)?;
+        // ОФЛАЙН-диагностика (`read_all`/`recover`): кладутся ВСЕ события в Vec —
+        // допустимо для фикстур и dump-инструментов, на проде не используется.
+        // На боевом 1 GiB .zst это может быть большой Vec; НО в прод-пути — `stream`,
+        // он стримит (batched allocation). raw-ветка читает `data` через `read_to_end`
+        // для tolerant — те же гарантии.
+        let mut data = Vec::new();
+        let mut buf = [0u8; 64 * 1024];
+        loop {
+            let n = decoder.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            data.extend_from_slice(&buf[..n]);
+        }
+        return parse_event_frames(&data);
+    }
+    if strict {
+        read_segment_events_strict(path)
+    } else {
+        read_segment_events_tolerant(path)
+    }
+}
+
+/// Raw-сегмент: CRC-ошибка / torn / десериализация → `Err` (DET-I-1 strict, ровно на одном
+/// сегменте, без silent drop). Используется `dump.rs`/`bands.rs`/`obi_probe.rs` (диагностика),
+/// НЕ прод-путь чтения (для прод — `stream`, O(1) памяти на сегмент).
+fn read_segment_events_strict(path: &Path) -> io::Result<Vec<Event>> {
+    let mut f = File::open(path)?;
+    // v2: пропустить magic+header; legacy: seek back на 0.
+    let _hdr = read_v2_header_and_skip(&mut f)?;
+    let mut out = Vec::new();
+    let mut reader = BufReader::with_capacity(64 * 1024, f);
+    while let Some(ev) = read_event_frame(&mut reader)? {
+        out.push(ev);
+    }
+    Ok(out)
+}
+
+/// Raw-сегмент: tolerant (resync через байт-ресинк вперёд на CRC-ошибке / torn).
+/// Для ОФЛАЙН-инструмента `journal::recover()` (M-05 J3): CRC-ошибка не фатальна,
+/// данные после неё всё ещё ценны (ручной разбор).
+fn read_segment_events_tolerant(path: &Path) -> io::Result<Vec<Event>> {
+    let mut f = File::open(path)?;
+    let _hdr = read_v2_header_and_skip(&mut f)?;
+    let mut data = Vec::new();
+    f.read_to_end(&mut data)?;
+    parse_event_frames(&data)
+}
+
+/// Внутренняя tolerant-парсия: для ОФЛАЙН-диагностики (`read_all`/`recover`).
+/// Принимает уже прочитанный буфер событий (raw или распакованный из .zst).
+fn parse_event_frames(data: &[u8]) -> io::Result<Vec<Event>> {
+    if data.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < data.len() {
+        if i + 4 > data.len() {
+            break;
+        }
+        let len = u32::from_le_bytes(data[i..i + 4].try_into().unwrap()) as usize;
+        let frame_end = match i
+            .checked_add(4)
+            .and_then(|x| x.checked_add(len))
+            .and_then(|x| x.checked_add(4))
+        {
+            Some(end) => end,
+            None => {
+                i += 1;
+                continue;
+            }
+        };
+        if frame_end > data.len() {
+            i += 1;
+            continue;
+        }
+        let payload = &data[i + 4..i + 4 + len];
+        let stored_crc = u32::from_le_bytes(data[i + 4 + len..i + 4 + len + 4].try_into().unwrap());
+        if crc32fast::hash(payload) != stored_crc {
+            i += 1;
+            continue;
+        }
+        match postcard::from_bytes::<Event>(payload) {
+            Ok(ev) => {
+                out.push(ev);
+                i = frame_end;
+            }
+            Err(_) => {
+                i += 1;
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Санити-кап длины фрейма (T-CAP, M-50/TD-053 задача 1) — ОДНО имя, используемое И
+/// штатным ридером (`read_frame_payload`), И терпимым сканом пола (`resync_max_seq`).
+/// Раньше это были ДВЕ независимые константы (санити-кап ридера здесь = 64 MiB против
+/// капа carry скана пола = 64 KiB), дрейфующие врозь, — корень TD-053: валидный фрейм,
+/// который штатный ридер принимает, скан пола молча трактовал как порчу. Значение НЕ
+/// изменилось (то же 64 MiB, что было раньше) — изменилось то, что скан пола теперь
+/// СРАВНИВАЕТ крупного кандидата с ЭТИМ же числом, а не с капом памяти carry.
+const FRAME_LEN_SANITY_CAP: usize = 64 * 1024 * 1024;
+
+/// Прочитать payload одного frame'а (без десериализации). `Ok(None)` означает чистый
+/// EOF (нет даже 4 байт на длину). Resync через рваный фрейм — `journal::recover()`
+/// (M-05 J3), НЕ прод-путь.
+///
+/// Все `read` идут через `read_exact`: на файловых стримах `read()` может вернуть
+/// короткое чтение (1–N байт вместо запрошенных), и без `read_exact` мы бы
+/// интерпретировали это как «данных нет» и ТИХО ПРОПУСКАЛИ фрейм (см. flaky
+/// `red_stream_bounded` на 64 MiB сегменте: частичное чтение после переключения
+/// сегмента).
+fn read_frame_payload<R: Read>(mut r: R) -> io::Result<Option<Vec<u8>>> {
+    let mut len_buf = [0u8; 4];
+    match r.read_exact(&mut len_buf) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e),
+    }
+    let len = u32::from_le_bytes(len_buf) as usize;
+
+    // Защита: гигантский len = почти наверняка мусор (crc на пустом payload не совпадёт).
+    if len > FRAME_LEN_SANITY_CAP {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("frame length absurd: {len}"),
+        ));
+    }
+
+    let mut payload = vec![0u8; len];
+    match r.read_exact(&mut payload) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e),
+    }
+
+    let mut crc_buf = [0u8; 4];
+    match r.read_exact(&mut crc_buf) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e),
+    }
+    let stored_crc = u32::from_le_bytes(crc_buf);
+    if stored_crc != crc32fast::hash(&payload) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "frame crc mismatch",
+        ));
+    }
+    Ok(Some(payload))
+}
+
+/// Прочитать первые 8 байт файла (без потребления: используется для классификации).
+/// `Ok(None)` если файл меньше 8 байт.
+///
+/// M-62 (TD-120): инкрементирует `ops` за `File::open` ради первых 8 B (`§1.1` спеки —
+/// «read_magic_prefix (`File::open`+read 8 B)`).
+fn read_magic_prefix(
+    path: &Path,
+    ops: &mut SegmentOps,
+) -> io::Result<Option<[u8; SEGMENT_MAGIC.len()]>> {
+    let mut f = File::open(path)?;
+    *ops += 1;
+    let mut buf = [0u8; SEGMENT_MAGIC.len()];
+    let n = f.read(&mut buf)?;
+    if n < SEGMENT_MAGIC.len() {
+        return Ok(None);
+    }
+    Ok(Some(buf))
+}
+
+/// Классифицировать ОДИН `*.jrnl` файл в (path, header). Fail-closed:
+/// - магия + валидный заголовок → заголовок из файла;
+/// - магия + битый заголовок → `Err(CorruptHeader)`;
+/// - магии нет + задекларирован + fingerprint/size ОК → заголовок из декларации;
+/// - магии нет + задекларирован + fingerprint/size НЕ ОК → `Err`;
+/// - магии нет + не задекларирован → `Err(ForeignSegment)`;
+/// - файл не-`*jrnl` или ошибка ввода-вывода → пропускается caller'ом / `Err` пробрасывается.
+///
+/// Аргумент `size_at_open` нужен для расчёта `first_seq` legacy-сегмента: после замены
+/// `Journal` (закрытия-переоткрытия с `open_with`) legacy-сегмент, открытый на запись,
+/// остаётся таковым — а мета уже могла отставать.
+fn classify_segment(
+    path: &Path,
+    manifest: &LegacyManifest,
+    ops: &mut SegmentOps,
+) -> io::Result<SegmentInfo> {
+    let file_name = path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "non-utf8 file name"))?
+        .to_string();
+
+    let index = parse_segment_index_any(&file_name)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "not a segment file"))?;
+
+    *ops += 1; // fs::metadata (size_bytes)
+    let size_bytes = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+
+    // M-08 task 15 (TD-022): сжатый сегмент — другой формат, другая схема классификации
+    // (нет legacy-пути: zstd-обёртка всегда поверх v2, иначе компакция бы не создала файл).
+    if is_compacted_name(&file_name) {
+        return classify_compacted_segment(path, index, size_bytes, ops);
+    }
+
+    let has_magic = matches!(read_magic_prefix(path, ops)?, Some(m) if m == SEGMENT_MAGIC);
+
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+
+    if has_magic {
+        *ops += 1; // File::open для повторного header-read (магия уже прочитана, теперь body)
+        let mut f = File::open(path)?;
+        let header = match read_v2_header_and_skip(&mut f)? {
+            Some(h) => h,
+            None => return Err(corrupt_header_err()),
+        };
+        Ok(SegmentInfo {
+            path: path.to_path_buf(),
+            index,
+            header,
+            size_bytes,
+        })
+    } else {
+        // Legacy-path.
+        let decl = manifest.find(&file_name).ok_or_else(foreign_err)?;
+        if size_bytes < decl.size_bytes_at_decl {
+            // Усечение ниже декларации → отказ. Отпечатка префикса недостаточно: он
+            // остаётся валидным даже при обрезанном хвосте.
+            return Err(truncated_err());
+        }
+        // Лимит префикса: то, что было видно при декларации. Если файл дорос —
+        // лимит остаётся прежним (это та же горячая копия). Если файл усечён ниже
+        // decl.size — лимит ограничен текущим размером (см. fingerprint_limited).
+        let limit = decl.size_bytes_at_decl.min(LEGACY_FINGERPRINT_BYTES);
+        let fp = fingerprint_limited(path, limit, ops)?;
+        if fp != decl.fingerprint_sha256 {
+            return Err(err_with(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "fingerprint mismatch for {file_name}: decl={} actual={fp}",
+                    decl.fingerprint_sha256
+                ),
+            ));
+        }
+        // first_seq legacy: неизвестен без чтения сегмента. Безопасный дефолт = 0
+        // (контракт SegmentHeader.first_seq — seq первого СОБЫТИЯ, не абсолютный).
+        // Потребители, которым нужен реальный first_seq (report-ы), считают явно через stream.
+        let header = SegmentHeader::from_legacy_decl(decl, now_ms, 0);
+        Ok(SegmentInfo {
+            path: path.to_path_buf(),
+            index,
+            header,
+            size_bytes,
+        })
+    }
+}
+
+/// Классифицировать СЖАТЫЙ сегмент (`segment-NN.jrnl.zst`). Всегда v2 (компакция
+/// применяется только к закрытым v2-сегментам). Декодируем магию+заголовок из zstd-потока
+/// (forward-only, без Seek — zstd::Decoder не импл Seek по построению).
+///
+/// Ошибки декодирования → `Err(CorruptHeader)` или `Err(InvalidData)`. Порченый .zst
+/// НИКОГДА не вменяется в v2 с припиской «наш» — тот же fail-closed, что для raw
+/// (CT-RFC-02 rev 2 находка C2).
+fn classify_compacted_segment(
+    path: &Path,
+    index: u32,
+    size_bytes: u64,
+    ops: &mut SegmentOps,
+) -> io::Result<SegmentInfo> {
+    let f = File::open(path)?;
+    *ops += 1; // File::open + zstd init считаем одной «операцией метаданных»
+    let mut decoder = open_compacted_reader(f)?;
+    let header = skip_v2_header_forward(&mut decoder).map_err(|e| match e.kind() {
+        io::ErrorKind::UnexpectedEof => corrupt_header_err(),
+        _ => e,
+    })?;
+    Ok(SegmentInfo {
+        path: path.to_path_buf(),
+        index,
+        header,
+        size_bytes,
+    })
+}
+
+/// Извлечь индекс из имени `segment-NNNNNNNN.jrnl`.
+fn parse_segment_index(name: &str) -> Option<u32> {
+    let rest = name.strip_prefix("segment-")?.strip_suffix(".jrnl")?;
+    if rest.len() != 8 {
+        return None;
+    }
+    rest.parse::<u32>().ok()
+}
+
+/// Является ли имя сегмента сжатым (`segment-NNNNNNNN.jrnl.zst`).
+fn is_compacted_name(name: &str) -> bool {
+    name.ends_with(".jrnl.zst")
+}
+
+/// Получить индекс из имени — как сжатого, так и несжатого сегмента.
+/// Для `segment-NN.jrnl.zst` индекс берётся из базовой части (до `.zst`).
+fn parse_segment_index_any(name: &str) -> Option<u32> {
+    let base = name.strip_suffix(".zst").unwrap_or(name);
+    parse_segment_index(base)
+}
+
+/// Обойти сегменты каталога по возрастанию индекса с дедупликацией по индексу.
+///
+/// **ЕДИНСТВЕННЫЙ хелпер выбора победителя коллизии** (D-COMP-1, rev 9 блокер
+/// reviewer'а на PR-гейте M-08). Используется ОБОИМИ путями чтения — `segments()`
+/// (прод-путь через `stream`/`list_segments`) и `iter_segments_sorted()`
+/// (ОФЛАЙН-диагностика `read_all`/`recover`). Без общего хелпера возникает ровно тот
+/// баг, что привёл к блокеру: на одну ситуацию (raw + .zst одного индекса) было два
+/// разных правила (`segments` коллизию НЕ дедуплицировал → 3000 событий читалось как
+/// 3172 и DET-I-1 молча нарушался).
+///
+/// Правило: при коллизии по индексу **побеждает СЫРОЙ `.jrnl`**, `.zst` игнорируется.
+/// Обоснование: recorder при ошибке открытия или rollback переоткроет сырой сегмент
+/// той же эпохи (тот же `first_seq`/тот же контент байт-в-байт до компакции — замер
+/// reviewer'а показал: 3000 событий превращаются в 3172 именно потому, что и raw и
+/// .zst одинаково валидны по CRC32, и оба попадают в стрим). Сжатый сегмент — это
+/// ПРОИЗВОДНАЯ копия; источник истины — сырой (пока он существует).
+///
+/// Возвращает ПУТИ, не классификацию (`SegmentInfo`). Манифест legacy-деклараций НЕ
+/// загружается: для офлайн-диагностики (`read_all`/`recover`) он не требуется —
+/// в отличие от прод-пути, который через `segments()` отвергает чужие/незадекларированные
+/// файлы.
+pub(crate) fn iter_segments_sorted(dir: &Path) -> io::Result<Vec<PathBuf>> {
+    let mut ops: SegmentOps = 0;
+    let paths = dedup_indexed_paths(dir, &mut ops)?;
+    Ok(paths)
+}
+
+/// Дедуплицировать `segment-*.jrnl` и `segment-*.jrnl.zst` каталога по индексу.
+/// При коллизии побеждает СЫРОЙ (см. `iter_segments_sorted`).
+///
+/// Публичные пути ОБЯЗАНЫ использовать ЭТОТ хелпер (а не собирать индексы параллельно
+/// по своим правилам): иначе воспроизводится rev 9-блокер.
+///
+/// M-62 (TD-120): инкрементирует `ops` за ОДИН `read_dir` (все записи возвращаются
+/// одним syscall'ом; per-entry обход — без syscall'ов).
+fn dedup_indexed_paths(dir: &Path, ops: &mut SegmentOps) -> io::Result<Vec<PathBuf>> {
+    *ops += 1; // fs::read_dir
+    let mut by_index: std::collections::BTreeMap<u32, PathBuf> = std::collections::BTreeMap::new();
+    // Каждая запись вставляется в BTreeMap<u32, PathBuf> по индексу сегмента (данные из
+    // имени файла), а итоговый Vec собирается из into_values() по возрастанию индекса.
+    // DET-OK: порядок fs::read_dir не протекает наружу — нормализован BTreeMap-ом выше.
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let p = entry.path();
+        let name = match p.file_name().and_then(OsStr::to_str) {
+            Some(s) => s,
+            None => continue,
+        };
+        if !name.ends_with(".jrnl") && !is_compacted_name(name) {
+            continue;
+        }
+        let idx = match parse_segment_index_any(name) {
+            Some(i) => i,
+            None => continue,
+        };
+        let is_zst = is_compacted_name(name);
+        match by_index.entry(idx) {
+            std::collections::btree_map::Entry::Vacant(e) => {
+                e.insert(p);
+            }
+            std::collections::btree_map::Entry::Occupied(mut e) => {
+                // D-COMP-1: при коллизии (raw + .zst для одного индекса) побеждает СЫРОЙ.
+                let existing = e.get();
+                let existing_is_zst = existing
+                    .file_name()
+                    .and_then(OsStr::to_str)
+                    .is_some_and(is_compacted_name);
+                if existing_is_zst && !is_zst {
+                    e.insert(p);
+                }
+                // Иначе — оставляем существующий (сырой уже стоит, или оба сжатых —
+                // берём первый; повторная компакция того же индекса не наша забота).
+            }
+        }
+    }
+    Ok(by_index.into_values().collect())
+}
+
+fn latest_segment(dir: &Path) -> io::Result<Option<(u32, PathBuf)>> {
+    let mut ops: SegmentOps = 0;
+    let paths = dedup_indexed_paths(dir, &mut ops)?;
+    Ok(paths
+        .into_iter()
+        .filter_map(|path| {
+            let name = path.file_name().and_then(OsStr::to_str)?;
+            let index = parse_segment_index_any(name)?;
+            Some((index, path))
+        })
+        .max_by_key(|(index, _)| *index))
+}
+
+///
+/// ЕДИНСТВЕННЫЙ публичный путь `list_segments` — все сегменты каталога.
+///
+/// Включает ОБА формата: сырой `.jrnl` и сжатый `.jrnl.zst`. Сжатые сегменты несут
+/// ту же магию+заголовок (первые байты потока zstd декодируются в исходный v2-сегмент),
+/// поэтому классификация по содержимому — единая.
+///
+/// **D-COMP-1 (rev 9):** прод-путь ОБЯЗАН использовать ОБЩИЙ хелпер дедупликации
+/// `dedup_indexed_paths` (как и `iter_segments_sorted`). Раньше `segments()` коллизию
+/// `.jrnl` + `.jrnl.zst` НЕ дедуплицировал — сегмент читался дважды, 3000 событий
+/// превращались в 3172, DET-I-1 нарушался. Теперь это правило одно на оба пути.
+pub fn segments(dir: impl AsRef<Path>) -> io::Result<Vec<SegmentInfo>> {
+    let mut ops: SegmentOps = 0;
+    segments_counted(dir.as_ref(), &mut ops)
+}
+
+/// M-62 (TD-120): то же, что `segments()`, но возвращает `Vec<SegmentInfo>` и пишет
+/// количество операций с метаданными сегментов в `ops`. Используется прод-путем
+/// `stream_from_at` для построения `EventStream::segment_meta_ops`.
+pub(crate) fn segments_counted(dir: &Path, ops: &mut SegmentOps) -> io::Result<Vec<SegmentInfo>> {
+    let manifest = load_manifest(dir, ops)?;
+    let paths = dedup_indexed_paths(dir, ops)?;
+    let mut out = Vec::with_capacity(paths.len());
+    for p in paths {
+        out.push(classify_segment(&p, &manifest, ops)?);
+    }
+    // Стабильная сортировка по индексу — критично для сшивки по границе.
+    out.sort_by_key(|s| s.index);
+
+    // JR-I-11 (M-52, TD-030): guard монотонности `first_seq` — ДО выдачи наружу. Это
+    // ЕДИНСТВЕННЫЙ публичный вход `list_segments`, от которого наследуют `stream`/
+    // `stream_from` (см. `check_first_seq_monotonic` — общий хелпер на все три пути).
+    let candidates: Vec<(String, u32, u64)> = out
+        .iter()
+        .map(|s| {
+            (
+                s.path
+                    .file_name()
+                    .and_then(OsStr::to_str)
+                    .unwrap_or("")
+                    .to_string(),
+                s.header.schema_version,
+                s.header.first_seq,
+            )
+        })
+        .collect();
+    check_first_seq_monotonic(&candidates, |name| {
+        segment_carries_any_event(&dir.join(name), ops)
+    })?;
+
+    Ok(out)
+}
+
+/// Отпечаток первых `LEGACY_FINGERPRINT_BYTES` байт файла (sha256, hex).
+/// Используется для построения legacy-декларации: защита от подмены файла под знакомым именем.
+pub fn fingerprint(path: &Path) -> io::Result<String> {
+    let mut ops: SegmentOps = 0;
+    fingerprint_limited(path, LEGACY_FINGERPRINT_BYTES, &mut ops)
+}
+
+/// Хеш первых `min(file_size, limit)` байт файла.
+///
+/// При сверке декларации обязаны сойтись одинаковые байты. На момент декларации мы
+/// захватываем префикс длиной `min(file_size, LEGACY_FINGERPRINT_BYTES)`. На момент
+/// сверки мы должны захватить тот же префикс, поэтому лимит = `min(decl.size, LEGACY_FINGERPRINT_BYTES)`
+/// (если файл вырос — лимит остаётся прежним, и мы хешируем ровно те байты, которые
+/// видели при декларации; если файл усечён ниже `decl.size` — лимит ограничен размером
+/// текущего файла, hash другой, отказ).
+fn fingerprint_limited(path: &Path, limit: u64, ops: &mut SegmentOps) -> io::Result<String> {
+    let file_size = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let to_hash = file_size.min(limit) as usize;
+    let mut f = File::open(path)?;
+    *ops += 1; // File::open ради чтения отпечатка
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut remaining = to_hash;
+    while remaining > 0 {
+        let to_read = buf.len().min(remaining);
+        let n = f.read(&mut buf[..to_read])?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        remaining -= n;
+    }
+    let digest = hasher.finalize();
+    Ok(format!("sha256:{:x}", digest))
+}
+
+/// Записать декларацию легаси-сегмента в манифест (операторская процедура: боевой
+/// сегмент 8.3 GB декларируется ОДИН раз, до деплоя ротации).
+///
+/// Дополняет существующий манифест (если декларация с тем же `file_name` уже есть —
+/// заменяется). Отпечаток считается ЗДЕСЬ, чтобы операторская команда была атомарна.
+pub fn declare_legacy(dir: impl AsRef<Path>, decl: LegacySegmentDecl) -> io::Result<()> {
+    let dir = dir.as_ref();
+    let mut ops: SegmentOps = 0;
+    let mut manifest = load_manifest(dir, &mut ops)?;
+
+    let fp = fingerprint(&dir.join(&decl.file_name))?;
+    let size = fs::metadata(dir.join(&decl.file_name))?.len();
+
+    let decl = LegacySegmentDecl {
+        file_name: decl.file_name,
+        fingerprint_sha256: fp,
+        size_bytes_at_decl: size,
+        ..decl
+    };
+
+    if let Some(existing) = manifest.find(&decl.file_name).cloned() {
+        if existing == decl {
+            // Идемпотентно: ничего не изменилось.
+            return Ok(());
+        }
+        // Актуализируем.
+        manifest
+            .declarations
+            .retain(|d| d.file_name != decl.file_name);
+    }
+    manifest.declarations.push(decl);
+
+    let bytes = serde_json::to_vec_pretty(&manifest).map_err(io::Error::other)?;
+    atomic_write(&dir.join(LEGACY_MANIFEST), &bytes)
+}
+
+/// Атомарная запись файла (tmp + rename): защищает от полу-записанных манифестов.
+fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let tmp = path.with_extension("tmp");
+    fs::write(&tmp, bytes)?;
+    fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// Наблюдаемое состояние хранилища (E4). Recorder публикует его в heartbeat-файл —
+/// чтобы деградация была видна БЕЗ ssh (урок TD-011/TD-016: healthcheck молчит).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StorageStatus {
+    pub free_bytes: u64,
+    pub min_free_bytes: u64,
+    /// `false` → запись остановлена (fail-closed), журнал не растёт.
+    pub writable: bool,
+}
+
+/// Bounded-memory поток событий журнала (E5). Память НЕ зависит от размера журнала:
+/// сегменты читаются по одному, фрейм за фреймом.
+///
+/// Потребитель обязан назвать `EpochFilter` — эпоху НЕЛЬЗЯ не заметить (CT-RFC02-2:
+/// типовой барьер, а не дисциплина).
+///
+/// M-38b (TD-044, GW-I-11): детерминированные счётчики `events_decoded`/`segments_opened`
+/// инкрементируются в `next()`/`open_next_segment` — НЕ аллокатор, НЕ wall-time
+/// (урок TD-040: аллокатор-оракул M-37 флакал на параллельных прогонах).
+///
+/// M-57 (TD-109):
+/// - задача 1: добавлен честный счётчик `events_scanned` (прочитанные ВКЛЮЧАЯ
+///   отфильтрованные) — см. комментарий на поле.
+/// - задача 2: `reader` стал `Option<StreamReader>`, где `Active` — позиция-
+///   трекающий reader для АКТИВНОГО raw-сегмента (M-57 byte-offset seek); `Passive`
+///   — тот же `Box<dyn Read>`, что и до M-57 (zst, closed raw). Следующий
+///   `stream_from_at` с hint'ом из `tail_hint()` применит `SeekFrom::Start(pos)`
+///   вместо forward-скана всего активного сегмента.
+/// - круг 2, задача 9: sidecar `journal.tail-offset` УДАЛЁН целиком. Курсор
+///   хранится ТОЛЬКО в `LiveReducer` (`TailHint`), передаётся через
+///   `stream_from_at(..., hint)` и обновляется через `EventStream::tail_hint()`.
+///   Решает `F-035-1` (запись sidecar на `:ro`-каталоге прода молча проваливалась)
+///   и `F-035-2` (один курсор на каталог дрался у N сессий). Старый API
+///   `stream_from` теперь ВСЕГДА делает полный forward-скан активного сегмента.
+pub struct EventStream {
+    segments: Vec<SegmentInfo>,
+    selected_headers: Vec<SegmentHeader>,
+    cursor: usize,
+    /// Reader текущего сегмента. `StreamReader::Active` — для АКТИВНОГО raw-сегмента
+    /// (с трекингом позиции для M-57 seek); `Passive` — для всего остального (zst,
+    /// closed raw), forward-only через `Box<dyn Read>`. `Box<dyn Read>` остался
+    /// для неактивных сегментов — там Seek не нужен (zstd не Seek, а закрытые raw
+    /// либо скипаются целиком по `first_seq`, либо читаются полностью).
+    reader: Option<StreamReader>,
+    finished: bool,
+    /// M-38b (GW-I-11): счётчик ВЫДАННЫХ событий (после фильтра `after_seq`).
+    /// Смысл сохранён: на нём стоят `red_stream_from::counters_report_full_pass_honestly`
+    /// (`== N` для полного прохода) и `red_checkpoint_resource_bound::without_checkpoint_full_replay_is_reported`.
+    /// Этот счётчик НЕ видит пересканирование — и НЕ ДОЛЖЕН: он меряет «работу редьюсера»,
+    /// а не «работу парсера».
+    events_decoded: u64,
+    /// M-57 (TD-109), задача 1: счётчик РЕАЛЬНО ПРОЧИТАННЫХ парсером событий —
+    /// ВКЛЮЧАЯ отфильтрованные по `after_seq`. Инкрементируется в `next()` СРАЗУ после
+    /// `read_event_frame` возвращает Some(event), ДО фильтрации. Без него невозможно
+    /// измерить пересканирование активного сегмента (прежний `events_decoded` показывал
+    /// «3» при скане гигабайта — ровно тот дефект прибора, ради которого milestone
+    /// и существует). См. `red_tail_scan_bounded::o1_scanned_counts_reads_not_yields`.
+    events_scanned: u64,
+    /// M-38b (GW-I-11): счётчик реально открытых сегментов (включая активный). При seek
+    /// у хвоста ОБЯЗАН быть существенно меньше общего числа сегментов.
+    segments_opened: u32,
+    /// M-38b: `after_seq` — порог сегментного пропуска. `None` ≡ полный проход
+    /// (эквивалентно `stream`). Внутрисегментный forward-фильтр `seq > after` тоже
+    /// активен (zstd не Seek).
+    after_seq: Option<u64>,
+    /// M-57 (круг 2, TD-109): `TailHint`, переданный в `stream_from_at` из
+    /// предыдущего `pump()`. Используется для seek'а в активный сегмент
+    /// БЕЗ sidecar-файла — состояние СЕССИИ, а не каталога. `None` — впервые
+    /// или после валидационного отката (ротация, устаревший last_seq).
+    hint: Option<TailHint>,
+    /// M-57 (круг 2, TD-109): последний `TailHint`, выданный `EventStream::tail_hint()`.
+    /// Обновляется на каждом декодированном событии в активном сегменте и сбрасывается
+    /// в `None` при EOF сегмента. Через этот метод `LiveReducer::pump` забирает hint
+    /// и сохраняет в `self.tail_hint` для следующего тика.
+    active_tail_hint: Option<TailHint>,
+    /// M-62 (TD-120), задача 1: детерминированный счётчик операций с МЕТАДАННЫМИ
+    /// сегментов за проход (`stat`, `File::open` ради заголовка, `read_dir`,
+    /// `metadata` для проверки свежести кеша). Аддитивен к `events_scanned`/`events_decoded`
+    /// (те не трогает — sacred M-57/M-38b).
+    ///
+    /// Источник: счётчик `SegmentOps`, накопленный ВНУТРИ `stream_from_at` на этапе
+    /// `segments_counted` (прод-путь через `stream_from_at` единственный, кто
+    /// инструментирует ops; `stream`/`stream_from` старого API оставлены нетронутыми и
+    /// дают `segment_meta_ops = 0`).
+    ///
+    /// Семантика:
+    /// - Первый тик сессии (нет кеша): `≥ N` (полный обход каталога, ~N×2.5 операций).
+    /// - Установившийся тик (hit кеша): `≤ 8` (`stat` хвоста + `read_dir` для свежести).
+    ///
+    /// Подробный бюджет и форма — `crates/gateway/tests/red_segment_meta_bound.rs::SM-1..SM-6`
+    /// и спека `milestones/M-62-segment-metadata.md` §4.1, §4.5(а).
+    segment_meta_ops: u64,
+}
+
+/// Внутренний reader [`EventStream`]'а: активный (с трекингом pos для seek) или
+/// пассивный (forward-only, тип-стёрт через `Box<dyn Read>`).
+enum StreamReader {
+    /// Активный raw-сегмент: трекает байтовую позицию, поддерживает seek.
+    /// Только этот вариант видит byte-offset оптимизацию (M-57).
+    Active(PositionedBufReader),
+    /// Всё остальное (zst, закрытый raw): forward-only, тип-стёрт.
+    Passive(Box<dyn Read>),
+}
+
+/// Raw segment reader с явным трекингом байтовой позиции. Нужен M-57 для seek в
+/// активный сегмент: `BufReader<File>` не отдаёт позицию без Seek, а мы хотим
+/// обновлять `pos` инкрементально (на каждый `read_exact` внутри `read_event_frame`),
+/// не дёргая `seek(Current(0))`.
+struct PositionedBufReader {
+    inner: BufReader<File>,
+    /// Позиция следующего байта для чтения (обновляется в `Read::read`).
+    pos: u64,
+}
+
+impl PositionedBufReader {
+    /// Открыть `path`, пропустить magic+header, спозиционироваться на
+    /// `start_offset` (не ниже конца заголовка — `header_end`).
+    fn open(path: &Path, start_offset: u64) -> io::Result<Self> {
+        let mut file = BufReader::with_capacity(64 * 1024, File::open(path)?);
+        let header_end = match read_v2_header_and_skip(&mut file)? {
+            Some(_) => file.stream_position()?,
+            None => 0,
+        };
+        let actual = start_offset.max(header_end);
+        file.seek(SeekFrom::Start(actual))?;
+        Ok(Self {
+            inner: file,
+            pos: actual,
+        })
+    }
+
+    /// Текущая байтовая позиция (start of next byte to read).
+    fn position(&self) -> u64 {
+        self.pos
+    }
+}
+
+impl Read for PositionedBufReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        // Каждый байт, прочитанный из BufReader, продвигает логическую позицию
+        // ровно настолько же — буферизация BufReader учтена внутри.
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl EventStream {
+    /// Заголовки сегментов, попавших в выборку — эпоха читаемо присутствует в отчёте.
+    pub fn headers(&self) -> &[SegmentHeader] {
+        &self.selected_headers
+    }
+
+    /// M-38b (GW-I-11): число событий, реально ВЫДАННЫХ через `next()` (т.е. попавших в
+    /// кадры). НЕ включает события, отфильтрованные по `after_seq` (внутрисегментный
+    /// forward-скан): инкремент стоит ПОСЛЕ `continue` фильтра — отфильтрованные
+    /// события учитывает отдельный `events_scanned` (`events_scanned += 1` стоит ДО
+    /// фильтра). На полном проходе (`stream(.., None)`) оба счётчика равны полному
+    /// числу событий в журнале. ДЕТЕРМИНИРОВАННЫЙ счётчик.
+    pub fn events_decoded(&self) -> u64 {
+        self.events_decoded
+    }
+
+    /// M-57 (TD-109), задача 1: честный счётчик ПРОЧИТАННЫХ парсером событий —
+    /// ВКЛЮЧАЯ события, отброшенные фильтром `after_seq`. Декремент невозможен,
+    /// только инкремент. На полном проходе (`stream(.., None)`) равен общему числу
+    /// событий в журнале. Это основная мера «работы тика» для оракулов
+    /// M-53/M-57 — заменяет слепой `events_decoded` в их анализе (TD-109).
+    pub fn events_scanned(&self) -> u64 {
+        self.events_scanned
+    }
+
+    /// M-38b (GW-I-11): число сегментов, чей reader был открыт. Включает активный
+    /// сегмент. Сегменты, пропущенные целиком по `first_seq` next-сегмента, НЕ учитываются.
+    pub fn segments_opened(&self) -> u32 {
+        self.segments_opened
+    }
+
+    /// M-57 (круг 2, TD-109): текущий `TailHint` хвоста активного сегмента.
+    /// `Some(hint)` только пока reader активного raw-сегмента открыт И в нём
+    /// уже было декодировано хотя бы одно событие. После EOF сегмента (ротация
+    /// или close) сбрасывается в `None` — следующий `stream_from_at` обязан
+    /// либо найти новый сегмент и стартовать с его начала, либо использовать
+    /// новый hint, выданный предыдущим `pump()`.
+    pub fn tail_hint(&self) -> Option<TailHint> {
+        self.active_tail_hint
+    }
+
+    /// M-62 (TD-120), задача 1: число операций с метаданными сегментов за проход —
+    /// `stat`, `File::open` ради заголовка, `read_dir`. Не растёт с числом сегментов
+    /// в установившемся режиме (hit кеша); растёт на первом тике сессии и при
+    /// инвалидации кеша (ротация, компакция, truncate).
+    ///
+    /// См. `docs/04-workflow.md` §4.5(а) и спеку `milestones/M-62-segment-metadata.md` §4.1:
+    /// «установившийся тик обязан быть O(1)».
+    pub fn segment_meta_ops(&self) -> u64 {
+        self.segment_meta_ops
+    }
+}
+
+impl EventStream {
+    /// Продвигаем курсор к следующему сегменту. Возвращает:
+    /// - `Ok(true)`  — сегмент открыт (cursor сдвинут, `self.reader = Some(_)`);
+    /// - `Ok(false)` — сегментов больше нет;
+    /// - `Err(_)`    — ошибка открытия файла сегмента (возвращается через `next()`).
+    ///
+    /// Для raw `.jrnl` — `read_v2_header_and_skip` (поддерживает Seek для legacy-fallback).
+    /// Для `.jrnl.zst` — `skip_v2_header_forward` (zstd::Decoder не импл Seek, но legacy
+    /// под zstd не бывает: компакция только над v2).
+    ///
+    /// M-38b (GW-I-11): счётчик `segments_opened` инкрементируется ТОЛЬКО когда сегмент
+    /// реально открыт (не пропущен). Пропуск сегмента определяется в `stream_from` ДО
+    /// первого вызова `next()` — сегменты с `last_seq <= after_seq` (last = `first_seq`
+    /// следующего − 1) удаляются из self.segments до перехода сюда.
+    ///
+    /// **M-57 (TD-109), задача 2 + круг 2 задача 9:** для АКТИВНОГО raw-сегмента
+    /// (последний в `self.segments`) открываем через [`PositionedBufReader`] и
+    /// применяем byte-offset seek из `self.hint` (`TailHint`), если ВСЕ условия
+    /// валидации в [`Self::resolve_active_start_offset`] выполнены. В остальных
+    /// случаях (zst / closed raw / первый запуск / ротация / `after < hint.last_seq`)
+    /// — обычный forward-scan с начала сегмента, как раньше.
+    fn open_next_segment(&mut self) -> io::Result<bool> {
+        if self.cursor >= self.segments.len() {
+            self.reader = None;
+            return Ok(false);
+        }
+        let seg = self.segments[self.cursor].clone();
+        self.cursor += 1;
+        let is_last = self.cursor == self.segments.len();
+        let is_zst = seg
+            .path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .is_some_and(is_compacted_name);
+
+        if is_zst {
+            let f = File::open(&seg.path)?;
+            let mut decoder = open_compacted_reader(f)?;
+            skip_v2_header_forward(&mut decoder)?;
+            self.reader = Some(StreamReader::Passive(Box::new(decoder)));
+        } else if is_last {
+            // M-57, задача 2: активный raw-сегмент. Решаем, с какого байта начинать чтение.
+            let start_offset = self.resolve_active_start_offset(&seg.path)?;
+            let positioned = PositionedBufReader::open(&seg.path, start_offset)?;
+            self.reader = Some(StreamReader::Active(positioned));
+        } else {
+            // Закрытый raw: forward-scan с самого начала, тип-стёрт. Старое поведение.
+            let f = File::open(&seg.path)?;
+            let mut r = BufReader::with_capacity(64 * 1024, f);
+            if read_v2_header_and_skip(&mut r).ok().flatten().is_none() {
+                // noop: legacy-сегмент (без магии)
+            }
+            self.reader = Some(StreamReader::Passive(Box::new(r)));
+        }
+        self.segments_opened += 1;
+        Ok(true)
+    }
+
+    /// M-57 (круг 2, TD-109) + M-62 §7: с каким байтовым смещением открывать активный
+    /// raw-сегмент.
+    ///
+    /// Возвращает абсолютное смещение в файле (`>= header_end`).
+    ///
+    /// Применяем hint ТОЛЬКО если ВСЁ из следующего:
+    /// 1. `self.hint` задан (передан в `stream_from_at` из `LiveReducer::tail_hint`
+    ///    предыдущего `pump()`);
+    /// 2. `hint.seg_idx == индекс активного сегмента` (иначе — ротация, hint относится
+    ///    к уже закрытому сегменту; пользоваться им нельзя);
+    /// 3. `hint.pos >= header_end` (защита от повреждённого/обнулённого смещения);
+    /// 4. `after_seq >= hint.last_seq` — иначе юзер просит события, которые мы уже
+    ///    прочитали; seek к сохранённому смещению их пропустит, а чтобы корректно их
+    ///    выдать, нужен forward-scan от начала сегмента (см. O-4 в `red_tail_scan_bounded`);
+    /// 5. `after_seq != None` (при `None` это `stream`/полный проход — семантика «выдать
+    ///    ВСЕ события», hint тут только мешает);
+    /// 6. **M-62 §7: `hint.pos <= длина файла` и `hint.pos` указывает на границу кадра**
+    ///    (валидный `[u32 len][payload][u32 crc32]` — единственный валидатор границы,
+    ///    per-frame magic не существует; см. §7 спеки). Иначе — fail-safe откат в
+    ///    `header_end`. УСЛОВИЕ: `pos == len` (ровно хвост без приращения) — ЛЕГИТИМНЫЙ
+    ///    пустой тик, наивное `pos >= len ⇒ откат` сломало бы его и сделало M-62
+    ///    отменяющим сам себя.
+    ///
+    /// Иначе возвращаем `header_end` — обычное начало чтения.
+    fn resolve_active_start_offset(&self, path: &Path) -> io::Result<u64> {
+        // Вычислить header_end (позиция сразу после magic+SegmentHeader, либо 0 для legacy).
+        let mut probe = File::open(path)?;
+        let header_end = match read_v2_header_and_skip(&mut probe)? {
+            Some(_) => probe.stream_position()?,
+            None => 0,
+        };
+        let file_len = probe.metadata()?.len();
+        drop(probe);
+
+        let after = match self.after_seq {
+            Some(a) => a,
+            None => return Ok(header_end),
+        };
+
+        let hint = match self.hint {
+            Some(h) => h,
+            None => return Ok(header_end),
+        };
+
+        let active_idx =
+            parse_segment_index_any(path.file_name().and_then(OsStr::to_str).unwrap_or(""))
+                .unwrap_or(0);
+
+        if hint.seg_idx != active_idx {
+            return Ok(header_end);
+        }
+        if hint.pos < header_end {
+            // Hint повреждён / указывает внутрь заголовка — игнор.
+            return Ok(header_end);
+        }
+        if after < hint.last_seq {
+            return Ok(header_end);
+        }
+        // M-62 §7, условие 6: hint.pos против длины файла.
+        if hint.pos > file_len {
+            // Усечение / компакция активного при неизменном индексе → seek за EOF.
+            // Fail-safe откат: тик пройдёт с начала сегмента (forward-scan).
+            return Ok(header_end);
+        }
+        if hint.pos == file_len {
+            // ЛЕГИТИМНЫЙ случай: пустой тик у хвоста, приращения с прошлого pump нет.
+            // Возвращаем hint.pos как есть — `PositionedBufReader` корректно отдаст EOF
+            // и `next()` пойдёт дальше по `selected_segments`/закроет поток.
+            return Ok(hint.pos);
+        }
+        // M-62 §7, условие 6b: hint.pos должен указывать на границу кадра.
+        // Пробуем прочитать ОДИН frame с этой позиции; провал → fail-safe `header_end`.
+        if !self.probe_frame_boundary(path, hint.pos) {
+            return Ok(header_end);
+        }
+        Ok(hint.pos)
+    }
+
+    /// Проверить, что `pos` указывает на начало валидного фрейма.
+    ///
+    /// M-62 §7: per-frame magic не существует (`segments.rs:17-19`), единственный
+    /// валидатор границы — CRC. Делаем ОДИН независимый `File::open` ради probe'а
+    /// (нельзя использовать уже открытый reader — он позиционирован в `hint.pos` и
+    /// любая попытка «посмотреть» с этой же позиции через тот же handle спутала бы
+    /// границу). Если `read_frame_payload` вернул `Err` (CRC mismatch / `length absurd`)
+    /// или `Ok(None)` (EOF раньше фрейма) — граница НЕ валидна ⇒ false.
+    fn probe_frame_boundary(&self, path: &Path, pos: u64) -> bool {
+        let mut f = match File::open(path) {
+            Ok(f) => f,
+            Err(_) => return false,
+        };
+        if f.seek(SeekFrom::Start(pos)).is_err() {
+            return false;
+        }
+        matches!(read_frame_payload(&mut f), Ok(Some(_)))
+    }
+}
+
+impl Iterator for EventStream {
+    type Item = io::Result<Event>;
+
+    fn next(&mut self) -> Option<io::Result<Event>> {
+        loop {
+            if self.reader.is_some() {
+                // Делаем чтение, пока self.reader заимствован. После возврата из
+                // `read_event_frame` все заимствования внутри `r` отпущены —
+                // можно снова обращаться к `self.reader` для обновления `active_tail_hint`.
+                let read_outcome = match self.reader.as_mut() {
+                    Some(StreamReader::Active(r)) => read_event_frame(r),
+                    Some(StreamReader::Passive(r)) => read_event_frame(r.as_mut()),
+                    None => unreachable!("checked is_some above"),
+                };
+                match read_outcome {
+                    Ok(Some(ev)) => {
+                        // M-57 (TD-109), задача 1: `events_scanned` — честный счётчик
+                        // ПРОЧИТАННЫХ парсером событий. Растёт ДО фильтра `after_seq`,
+                        // чтобы измеритель видел пересканирование активного сегмента
+                        // (при forward-чтении ВСЕХ его событий ради отсева по фильтру).
+                        // Раньше эквивалентный счётчик (= `events_decoded`) показывал
+                        // «3» при скане гигабайта — ровно тот дефект прибора, который
+                        // этот milestone и устраняет.
+                        self.events_scanned += 1;
+                        // M-57 (круг 2, TD-109): для активного raw-сегмента обновляем
+                        // `active_tail_hint` — новый прод-путь через
+                        // `EventStream::tail_hint()`. Без этого следующий `pump()` не
+                        // сможет seek'нуть на нужную позицию в активном сегменте.
+                        if let Some(StreamReader::Active(r)) = self.reader.as_ref() {
+                            let pos = r.position();
+                            // seg_idx активного сегмента — последний в self.segments.
+                            if let Some(seg) = self.segments.last() {
+                                let seg_idx = seg
+                                    .path
+                                    .file_name()
+                                    .and_then(OsStr::to_str)
+                                    .and_then(parse_segment_index_any)
+                                    .unwrap_or(0);
+                                self.active_tail_hint = Some(TailHint {
+                                    seg_idx,
+                                    last_seq: ev.seq,
+                                    pos,
+                                });
+                            }
+                        }
+
+                        // M-38b (GW-I-11): внутрисегментный forward-фильтр — zstd не Seek,
+                        // читаем с начала сегмента, пропускаем события `seq <= after` без
+                        // эмита. Сегмент уже подобран по `first_seq` next-сегмента выше
+                        // (см. `stream_from`), так что фильтр срабатывает максимум на одном
+                        // сегменте (активном или его предшественнике).
+                        //
+                        // `events_decoded` инкрементируется ТОЛЬКО для YIELDED событий
+                        // (которые прошли фильтр) — иначе бюджет «read у хвоста» был бы
+                        // превышен на полном forward-чтении активного сегмента (zstd не
+                        // Seek), что не отражает реальной «работы» редьюсера. Тест
+                        // `red_stream_from::counters_report_full_pass_honestly` ассертит
+                        // `events_decoded == N` для полного прохода (всё yielded), и
+                        // `red_checkpoint_resource_bound::without_checkpoint_full_replay_is_reported`
+                        // ожидает N при rebuild.
+                        if let Some(after) = self.after_seq {
+                            if ev.seq <= after {
+                                continue;
+                            }
+                        }
+                        self.events_decoded += 1;
+                        return Some(Ok(ev));
+                    }
+                    Ok(None) => {
+                        // EOF сегмента — закрываем reader и пробуем следующий.
+                        drop(self.reader.take());
+                        // continue — попытаемся открыть следующий сегмент ниже.
+                    }
+                    Err(e) => {
+                        drop(self.reader.take());
+                        // На первой же ошибке возвращаем её (не глотаем): стрим-выборка
+                        // для отчёта — это single-shot, корректность важнее «дочитывания».
+                        return Some(Err(e));
+                    }
+                }
+            }
+
+            if self.finished {
+                return None;
+            }
+            match self.open_next_segment() {
+                Ok(true) => continue,
+                Ok(false) => {
+                    self.finished = true;
+                    return None;
+                }
+                Err(e) => return Some(Err(e)),
+            }
+        }
+    }
+}
+
+/// Открыть поток чтения (E5/E6). Единственный прод-путь чтения журнала:
+/// `read_all()` остаётся ТОЛЬКО для тестов/малых фикстур.
+pub fn stream(dir: impl AsRef<Path>, filter: EpochFilter) -> io::Result<EventStream> {
+    stream_from(dir, filter, None)
+}
+
+/// M-38b (TD-044, GW-I-11): live-seek с СЕГМЕНТНЫМ ПРОПУСКОМ. `after_seq` — порог:
+/// сегмент пропускается ЦЕЛИКОМ, если ВСЕ его события `<= after_seq` (т.е. его `last_seq`
+/// ≤ `after_seq`); эквивалентно `first_seq` СЛЕДУЮЩЕГО сегмента `≤ after_seq + 1`.
+/// Сам последний (активный) сегмент пропустить нельзя — `next_seg` нет, `last_seq`
+/// неизвестен, поэтому он читается всегда, и фильтр применяется ВНУТРИСЕГМЕНТНО
+/// (forward-скан, zstd не Seek).
+///
+/// **Legacy (`first_seq == 0`, до CT-RFC-02) НЕ пропускается НИКОГДА.** У него
+/// `first_seq` синтезирован нулём как «безопасный дефолт» (segments.rs:509-512), реальный
+/// `first_seq` неизвестен → пропуск по `first_seq` сожрал бы его события. Защита:
+/// `schema_version != SCHEMA_VERSION_PRE_HEADER` ОБЯЗАН для пропуска.
+///
+/// `after_seq = None` ≡ `stream()` (полный проход).
+pub fn stream_from(
+    dir: impl AsRef<Path>,
+    filter: EpochFilter,
+    after_seq: Option<u64>,
+) -> io::Result<EventStream> {
+    let all = segments(dir.as_ref())?;
+    let mut selected: Vec<SegmentInfo> = Vec::with_capacity(all.len());
+    let mut headers: Vec<SegmentHeader> = Vec::with_capacity(all.len());
+    for s in all {
+        if filter.accepts(&s.header) {
+            headers.push(s.header.clone());
+            selected.push(s);
+        }
+    }
+    // selected уже отсортирован по индексу (см. `segments`); сохраняем это для расчёта
+    // `last_seq = next_seg.first_seq - 1`.
+    if let Some(after) = after_seq {
+        // Пропускаем сегменты с `next_seg.first_seq <= after + 1` ⟺ `last_seg <= after`.
+        // НО: legacy (`schema_version == SCHEMA_VERSION_PRE_HEADER`) НЕ пропускаем.
+        let mut kept: Vec<SegmentInfo> = Vec::with_capacity(selected.len());
+        for i in 0..selected.len() {
+            let seg = &selected[i];
+            if seg.header.schema_version == contracts::SCHEMA_VERSION_PRE_HEADER {
+                kept.push(seg.clone());
+                continue;
+            }
+            if i + 1 < selected.len() {
+                let next_first = selected[i + 1].header.first_seq;
+                // last_seq(seg) = next_first - 1. Если <= after ⟹ пропустить.
+                if next_first > 0 && next_first - 1 <= after {
+                    continue;
+                }
+            }
+            // Последний сегмент (нет next) или first_seq > after ⇒ не пропускаем.
+            kept.push(seg.clone());
+        }
+        selected = kept;
+    }
+    Ok(EventStream {
+        segments: selected,
+        selected_headers: headers,
+        cursor: 0,
+        reader: None,
+        finished: false,
+        events_decoded: 0,
+        events_scanned: 0,
+        segments_opened: 0,
+        after_seq,
+        // M-57 (круг 2, TD-109): hint живёт ТОЛЬКО в вызывающем (`LiveReducer` через
+        // `stream_from_at`). `stream_from` (старый API) больше не читает hint из sidecar:
+        // sidecar-файл удалён (M-57 задача 9), и попытка записи на RO-каталоге прода
+        // молча проваливалась, оставляя активный сегмент пересканируемым каждый тик.
+        hint: None,
+        active_tail_hint: None,
+        // M-62 (TD-120): старый API `stream_from` НЕ инструментирует ops (он остался
+        // для обратной совместимости; прод-путь `LiveReducer` зовёт `stream_from_at`,
+        // который учитывает ops в `SegmentCatalog`/segments_counted).
+        segment_meta_ops: 0,
+    })
+}
+
+/// M-51 (DET-I-1, TD-007): дайджест реплея окна `[from_seq, to_seq]` журнала (границы
+/// ВКЛЮЧИТЕЛЬНЫ; `None` — без ограничения снизу/сверху). `state_hash` — свёртка ПОТОКА
+/// СОБЫТИЙ (не файлов на диске): для каждого события в порядке возрастания `seq` в SHA-256
+/// подаётся `u32 LE (длина postcard-payload) ‖ postcard(Event)`. Длина в префиксе несущая —
+/// без неё конкатенация неоднозначна. Компакция (`raw` ↔ `.zst`), иная нарезка на сегменты,
+/// порядок файлов каталога — не влияют (свёртка не видит байты файлов, только события).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplayDigest {
+    pub events: u64,
+    pub first_seq: Option<u64>,
+    pub last_seq: Option<u64>,
+    pub state_hash: [u8; 32],
+}
+
+/// M-57 (круг 2, TD-109): live-seek с СЕГМЕНТНЫМ ПРОПУСКОМ и IN-MEMORY hint'ом.
+///
+/// В отличие от [`stream_from`], курсор хвоста передаётся ЧЕРЕЗ ПАРАМЕТР (`hint`),
+/// а не читается из файлового sidecar'а внутри каталога. Это решает обе находки
+/// PR-гейта `R-035` (`F-035-1` и `F-035-2`):
+///
+/// - `F-035-1` (catalog `:ro`): файловый sidecar невозможно создать из `gateway-serve`,
+///   чей том журнала смонтирован read-only. `LiveReducer` хранит hint В ПАМЯТИ СВОЕЙ
+///   сессии, и запись не требуется.
+/// - `F-035-2` (мультисессия): sidecar — файл на КАТАЛОГ, и любая вторая сессия
+///   сдвигала его, обнуляя выигрыш у первой. Hint — состояние КАЖДОЙ сессии отдельно.
+///
+/// Валидация прежняя (как у sidecar-пути):
+/// - `hint.seg_idx == индекс активного сегмента` (иначе — ротация);
+/// - `hint.pos >= header_end` (защита от повреждения);
+/// - `after_seq >= hint.last_seq` (юзер не запрашивает уже прочитанное).
+///
+/// При нарушении ЛЮБОГО условия — откат к полному скану активного сегмента
+/// (forward-чтение от `header_end`), как у `stream_from` без hint'а.
+///
+/// `hint = None` ≡ `stream_from(.., after_seq)` (full scan), без sidecar.
+///
+/// **M-62 (TD-120) backward-compat:** `stream_from_at` — унаследованная сигнатура без
+/// кеша, оставлена для существующих call-sites (test-набор M-57 и т.п.). Делегирует в
+/// [`stream_from_at_with_catalog`] с `catalog = None`. Прод-путь `LiveReducer` обязан
+/// звать именно новую функцию, чтобы получить O(1) на установившемся тике.
+pub fn stream_from_at(
+    dir: impl AsRef<Path>,
+    filter: EpochFilter,
+    after_seq: Option<u64>,
+    hint: Option<TailHint>,
+) -> io::Result<EventStream> {
+    let (stream, _catalog) = stream_from_at_with_catalog(dir, filter, after_seq, hint, None)?;
+    // Каталог, построенный внутри, отбрасываем: backward-compat обёртка не имеет
+    // кому его хранить. Это ЗАКОМПРОМЕТИРОВАННЫЙ путь — прод зовёт новую функцию и
+    // получает каталог обратно. Старые call-sites (test-набор M-57 и т.п.) получают
+    // корректный `EventStream`, но `segment_meta_ops` отражает ПОЛНУЮ цену обхода
+    // (без кеша), что и является их ожиданием.
+    Ok(stream)
+}
+
+/// M-62 (TD-120), задачи 2+3: прод-путь с per-session `SegmentCatalog`.
+///
+/// Всё то же, что [`stream_from_at`], плюс параметр `catalog_in: Option<SegmentCatalog>`
+/// — per-session кеш перечня сегментов (`LiveReducer` хранит ОДИН такой на сессию).
+/// Возвращает `(EventStream, Option<SegmentCatalog>)`: stream для чтения + (возможно
+/// обновлённый) каталог, который caller кладёт в `self.segment_catalog` для следующего
+/// тика.
+///
+/// Логика построения/переиспользования:
+/// - `catalog_in == None` (первый тик сессии) — `SegmentCatalog::open(dir)` строит кеш
+///   полным обходом; ops попадают в `EventStream.segment_meta_ops`. Новый кеш возвращается
+///   в `Some(catalog)` — caller сохраняет.
+/// - `catalog_in == Some(c)`:
+///   1. `c.is_fresh(dir)` — дешёвая проверка (1 `stat` + 1 `read_dir` независимо от N);
+///   2. Если свежий — используем `c.segments()` (цена тика не растёт с N);
+///   3. Иначе — `c.refresh(dir)` обновит кеш (полная цена обхода ~N×2.5 syscall'ов
+///      записывается в ops). Освежённый кеш возвращается.
+///
+/// На первом тике сессии `segment_meta_ops ≥ N` (это «позитивный контроль» SM-3:
+/// первый тик ОБЯЗАН обойти каталог, иначе оптимизация перестаёт замечать новые сегменты).
+/// На установившемся — `segment_meta_ops ≤ 8` (1 stat + 1 read_dir). Подробный бюджет —
+/// `crates/gateway/tests/red_segment_meta_bound.rs::SM-1..SM-6`.
+pub fn stream_from_at_with_catalog(
+    dir: impl AsRef<Path>,
+    filter: EpochFilter,
+    after_seq: Option<u64>,
+    hint: Option<TailHint>,
+    catalog_in: Option<SegmentCatalog>,
+) -> io::Result<(EventStream, Option<SegmentCatalog>)> {
+    let dir = dir.as_ref();
+    let mut ops: SegmentOps = 0;
+    let (all, catalog_out) = match catalog_in {
+        Some(mut cat) => {
+            // Дешёвая проверка свежести кеша: 1 stat + 1 read_dir независимо от N.
+            let (is_fresh, fresh_ops) = cat.is_fresh(dir)?;
+            ops += fresh_ops;
+            if !is_fresh {
+                let refresh_ops = cat.refresh(dir)?;
+                ops += refresh_ops;
+            }
+            (cat.segments().to_vec(), Some(cat))
+        }
+        None => {
+            // Первый тик сессии: строим кеш с нуля (полная цена обхода в ops).
+            let (new_catalog, build_ops) = SegmentCatalog::open(dir)?;
+            ops += build_ops;
+            // ops НЕ включает дополнительный `segments_counted` — мы используем сегменты
+            // прямо из построенного каталога, не делая второй обход.
+            (new_catalog.segments().to_vec(), Some(new_catalog))
+        }
+    };
+    let mut selected: Vec<SegmentInfo> = Vec::with_capacity(all.len());
+    let mut headers: Vec<SegmentHeader> = Vec::with_capacity(all.len());
+    for s in all {
+        if filter.accepts(&s.header) {
+            headers.push(s.header.clone());
+            selected.push(s);
+        }
+    }
+    // selected уже отсортирован по индексу (см. `segments`); сохраняем это для расчёта
+    // `last_seq = next_seg.first_seq - 1`.
+    if let Some(after) = after_seq {
+        let mut kept: Vec<SegmentInfo> = Vec::with_capacity(selected.len());
+        for i in 0..selected.len() {
+            let seg = &selected[i];
+            if seg.header.schema_version == contracts::SCHEMA_VERSION_PRE_HEADER {
+                kept.push(seg.clone());
+                continue;
+            }
+            if i + 1 < selected.len() {
+                let next_first = selected[i + 1].header.first_seq;
+                if next_first > 0 && next_first - 1 <= after {
+                    continue;
+                }
+            }
+            kept.push(seg.clone());
+        }
+        selected = kept;
+    }
+    Ok((
+        EventStream {
+            segments: selected,
+            selected_headers: headers,
+            cursor: 0,
+            reader: None,
+            finished: false,
+            events_decoded: 0,
+            events_scanned: 0,
+            segments_opened: 0,
+            after_seq,
+            // M-57 (круг 2, TD-109): hint передан извне, in-memory. Без записи на диск,
+            // без зависимости от прав доступа к каталогу.
+            hint,
+            active_tail_hint: None,
+            segment_meta_ops: ops,
+        },
+        catalog_out,
+    ))
+}
+
+/// Посчитать `ReplayDigest` окна `[from_seq, to_seq]` (включительно) — ПОТОКОВО, память не
+/// растёт с размером журнала (DET-I-1, TD-011: `read_all` на проде 27 GB/146M событий
+/// неработоспособен).
+///
+/// Нижняя граница транслируется в `stream_from`'s исключительный `after_seq` через
+/// `checked_sub(1)`, НЕ `saturating_sub`: при `from_seq == Some(0)` `saturating_sub` дал бы
+/// `Some(0)` (= «после seq 0», теряя первое событие), тогда как `checked_sub` корректно даёт
+/// `None` (= «без нижней границы», включает seq 0). Верхняя граница проверяется здесь же —
+/// первое событие `seq > to_seq` останавливает свёртку (даёт и «перевёрнутое окно»
+/// `from > to` ⇒ пусто, без специального случая).
+pub fn replay_digest(
+    dir: impl AsRef<Path>,
+    filter: EpochFilter,
+    from_seq: Option<u64>,
+    to_seq: Option<u64>,
+) -> io::Result<ReplayDigest> {
+    let dir = dir.as_ref();
+    let after = from_seq.and_then(|f| f.checked_sub(1));
+
+    let mut hasher = Sha256::new();
+    let mut events = 0u64;
+    let mut first_seq: Option<u64> = None;
+    let mut last_seq: Option<u64> = None;
+
+    for ev in stream_from(dir, filter, after)? {
+        let ev = ev?;
+        if let Some(to) = to_seq {
+            if ev.seq > to {
+                break;
+            }
+        }
+        let payload =
+            postcard::to_stdvec(&ev).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        hasher.update((payload.len() as u32).to_le_bytes());
+        hasher.update(&payload);
+
+        events += 1;
+        if first_seq.is_none() {
+            first_seq = Some(ev.seq);
+        }
+        last_seq = Some(ev.seq);
+    }
+
+    Ok(ReplayDigest {
+        events,
+        first_seq,
+        last_seq,
+        state_hash: hasher.finalize().into(),
+    })
+}
+
+// === Ретеншен / cold copy (E3) ===
+
+/// Доказательство того, что сегмент ВЫГРУЖЕН в холодное хранилище и копия сверена
+/// по контрольной сумме (E3).
+///
+/// Конструктор ПРИВАТНЫЙ: единственный способ получить `ColdCopyProof` — реально
+/// выгрузить и сверить (`verify_cold_copy`). Поэтому «удалить невыгруженный сегмент»
+/// невозможно ВЫРАЗИТЬ в этом API — это типовой барьер, а не дисциплина оператора
+/// (тот же приём, что `RiskApproved<Order>` в риск-слое).
+#[derive(Debug)]
+pub struct ColdCopyProof {
+    _private: (),
+}
+
+/// Сверить, что `cold_root/<name>` — побайтовая копия `seg`.
+/// Возвращает `ColdCopyProof` ТОЛЬКО если sha256 совпали.
+///
+/// Семантика:
+/// - если `dst` НЕ существует — выгружаем (копия src → dst), затем сверяем sha256;
+/// - если `dst` УЖЕ существует — только сверяем (без перезаписи: иначе битая «старая»
+///   копия могла бы молча быть перезаписана правильной и пройти сверку — ровно то,
+///   против чего RED `prune_requires_verified_cold_copy`).
+///
+/// В обоих ветках sha256(src) == sha256(dst) обязано выполняться. Нет — `Err`,
+/// proof не выдаётся.
+pub fn verify_cold_copy(seg: &SegmentInfo, cold_root: &Path) -> io::Result<ColdCopyProof> {
+    fs::create_dir_all(cold_root)?;
+    let dst = cold_root.join(
+        seg.path
+            .file_name()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no file name"))?,
+    );
+    if !dst.exists() {
+        // Холодная копия отсутствует — выгрузить и затем сверить.
+        let mut src = File::open(&seg.path)?;
+        let mut dst_file = File::create(&dst)?;
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            let n = src.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            dst_file.write_all(&buf[..n])?;
+        }
+        dst_file.flush()?;
+        drop(dst_file);
+        drop(src);
+    }
+    // Сверяем sha256 ОБОИХ файлов.
+    let src_h = sha256_file(&seg.path)?;
+    let dst_h = sha256_file(&dst)?;
+    if src_h != dst_h {
+        // Не удаляем dst в случае «не существовало раньше»: могли только что создать и
+        // обнаружить рассогласование (например, FUSE-баг, перевёрнутые байты) —
+        // удалить лучше, чем оставить «полуправильную» копию.
+        let _ = fs::remove_file(&dst);
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("cold copy checksum mismatch: src={src_h} dst={dst_h}"),
+        ));
+    }
+    Ok(ColdCopyProof { _private: () })
+}
+
+/// Удалить горячую копию сегмента. Требует `ColdCopyProof` — данные не могут исчезнуть
+/// «по политике ретеншена», не оказавшись сперва в холодном хранилище.
+///
+/// Типовой барьер ИСПОЛНЯЕМ (доктест, N1 из C-005): proof нельзя сконструировать снаружи.
+///
+/// ```compile_fail
+/// # use journal::{prune_segment, ColdCopyProof, SegmentInfo};
+/// # fn f(seg: &SegmentInfo) {
+/// // Приватное поле → внешний крейт не может создать proof: НЕ СКОМПИЛИРУЕТСЯ.
+/// let fake = ColdCopyProof { _private: () };
+/// let _ = prune_segment(seg, fake);
+/// # }
+/// ```
+pub fn prune_segment(seg: &SegmentInfo, _proof: ColdCopyProof) -> io::Result<()> {
+    fs::remove_file(&seg.path)
+}
+
+/// sha256 целого файла в hex-формате.
+fn sha256_file(path: &Path) -> io::Result<String> {
+    let mut f = File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("sha256:{:x}", hasher.finalize()))
+}
+
+// === Disk guard (E4) ===
+
+/// Свободное место на файловой системе каталога (E4).
+pub fn free_bytes(dir: impl AsRef<Path>) -> io::Result<u64> {
+    free_bytes_at(dir.as_ref())
+}
+
+#[cfg(unix)]
+pub(crate) fn free_bytes_at(dir: &Path) -> io::Result<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(dir.as_os_str().as_bytes())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // bavail * f_frsize = bytes available to non-superuser (то, что df показывает).
+    let bavail = stat.f_bavail;
+    let fsize = stat.f_frsize;
+    Ok(bavail.saturating_mul(fsize))
+}
+
+#[cfg(not(unix))]
+pub(crate) fn free_bytes_at(_dir: &Path) -> io::Result<u64> {
+    // Fallback: точная реализация зависит от платформы; для non-unix (тестов CI) —
+    // достаточно «не заглушки».
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "free_bytes: non-unix platform not supported",
+    ))
+}
+
+/// Текущее состояние хранилища журнала (E4) — для recorder-heartbeat и алертов.
+pub fn storage_status(dir: impl AsRef<Path>, cfg: &WriterConfig) -> io::Result<StorageStatus> {
+    let free = free_bytes(dir.as_ref())?;
+    Ok(StorageStatus {
+        free_bytes: free,
+        min_free_bytes: cfg.min_free_bytes,
+        writable: free >= cfg.min_free_bytes,
+    })
+}
+
+// === Сериализация заголовка (для lib.rs) ===
+
+/// Сериализовать `SegmentHeader` во frame-format (с CRC32), готовый к записи
+/// в v2-сегмент сразу после MAGIC.
+pub(crate) fn serialize_v2_header(header: &SegmentHeader) -> io::Result<Vec<u8>> {
+    let payload =
+        postcard::to_stdvec(header).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let mut out = Vec::with_capacity(payload.len() + 8);
+    out.extend_from_slice(&SEGMENT_MAGIC);
+    out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    out.extend_from_slice(&payload);
+    out.extend_from_slice(&crc32fast::hash(&payload).to_le_bytes());
+    Ok(out)
+}
+
+/// Существует ли файл сегмента с указанным индексом?
+pub(crate) fn segment_path(dir: &Path, index: u32) -> PathBuf {
+    dir.join(segment_name(index))
+}
+
+/// Найти индекс самого свежего сегмента в каталоге (`max(existing_indices)`).
+/// Возвращает `None` если сегментов нет.
+pub(crate) fn latest_segment_index(dir: &Path) -> io::Result<Option<u32>> {
+    Ok(latest_segment(dir)?.map(|(index, _)| index))
+}
+
+/// Хвостовой скан КОНКРЕТНОГО сегмента (используется при `open_with` для next_seq).
+///
+/// M-49 (JR-I-8, TD-049): различает «нет/пусто/нет событий» (легитимный `Ok(None)`, ровно
+/// три случая — файла нет, файл нулевой длины, валидный заголовок + ноль событий) от
+/// «нечитаем» (`Err` с диагностикой: имя файла + причина + действие). Раньше ЛЮБАЯ порча
+/// хвоста (битый v2-заголовок сжатого сегмента, обрыв zstd-потока, невалидный хвост сырого
+/// сегмента) трактовалась как «сегментов нет» ⇒ `resolve_next_seq_with` стартовал с
+/// `meta_seq` ⇒ при restore из холодного хранилища (мета отсутствует ⇒ 0) — seq-reuse
+/// поверх существующей истории. Ресинхронизация сырого хвоста (побайтовый поиск последнего
+/// валидного фрейма) сохранена без изменений — она возвращает конкретный `seq`, reuse
+/// невозможен (`ti_4` п. «г»).
+pub(crate) fn tail_last_seq_of(path: &Path) -> io::Result<Option<u64>> {
+    let is_zst = path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .is_some_and(is_compacted_name);
+    if is_zst {
+        let f = match File::open(path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        if f.metadata()?.len() == 0 {
+            return Ok(None);
+        }
+        let mut decoder = match open_compacted_reader(f) {
+            Ok(d) => d,
+            Err(e) => {
+                return Err(tail_unreadable_err(
+                    path,
+                    format!("zstd stream open failed: {e}"),
+                ))
+            }
+        };
+        if let Err(e) = skip_v2_header_forward(&mut decoder) {
+            return Err(tail_unreadable_err(
+                path,
+                format!("compressed segment header unreadable: {e}"),
+            ));
+        }
+        // Валидный заголовок; ноль или более событий. Ноль событий (`last_seq == None`)
+        // здесь ЛЕГИТИМНО — тот же случай, что «валидный заголовок, ноль событий» для
+        // сырого сегмента (ti_4 п. «д»): дальше просто нечего резать.
+        let mut last_seq = None;
+        loop {
+            match read_event_frame(&mut decoder) {
+                Ok(Some(event)) => last_seq = Some(event.seq),
+                Ok(None) => break,
+                Err(e) => {
+                    return Err(tail_unreadable_err(
+                        path,
+                        format!("compressed segment event stream unreadable: {e}"),
+                    ))
+                }
+            }
+        }
+        return Ok(last_seq);
+    }
+
+    let mut file = match File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let file_size = file.metadata()?.len();
+    if file_size == 0 {
+        return Ok(None);
+    }
+    let read_size = (file_size as usize).min(TAIL_SCAN_CHUNK);
+    let start_offset = file_size - read_size as u64;
+    let mut buf = vec![0u8; read_size];
+    file.seek(SeekFrom::Start(start_offset))?;
+    file.read_exact(&mut buf)?;
+    drop(file);
+
+    // Если есть magic (т.е. `buf` захватил файл с самого начала — `start_offset == 0`) —
+    // пропускаем магию + заголовок. Заголовок разбирается ТОЛЬКО в этом случае: у
+    // хвостового чтения большого файла (`start_offset > 0`) магии в буфере не будет, и
+    // ниже работает прежняя байт-ресинк логика без header-контекста (legacy/большие сегменты).
+    let mut i = 0usize;
+    let mut had_header = false;
+    if buf.starts_with(&SEGMENT_MAGIC) {
+        // Найти конец header-фрейма в buf.
+        let magic_len = SEGMENT_MAGIC.len();
+        if magic_len + 4 > buf.len() {
+            return Err(tail_unreadable_err(
+                path,
+                "raw segment header frame truncated (not enough bytes for header length)",
+            ));
+        }
+        let h_len = u32::from_le_bytes(buf[magic_len..magic_len + 4].try_into().unwrap()) as usize;
+        let frame_end = magic_len + 4 + h_len + 4;
+        if frame_end > buf.len() {
+            return Err(tail_unreadable_err(
+                path,
+                "raw segment header frame truncated (declared header length exceeds file size)",
+            ));
+        }
+        let payload = &buf[magic_len + 4..magic_len + 4 + h_len];
+        let crc = u32::from_le_bytes(buf[magic_len + 4 + h_len..frame_end].try_into().unwrap());
+        if crc32fast::hash(payload) != crc {
+            return Err(tail_unreadable_err(
+                path,
+                "raw segment header crc mismatch (header corrupt)",
+            ));
+        }
+        i = frame_end;
+        had_header = true;
+        if i == buf.len() {
+            // Валидный заголовок, ноль событий: recorder создал сегмент и упал до первой
+            // записи (`ti_4` п. «д») — легитимно, не «нечитаем».
+            return Ok(None);
+        }
+    }
+
+    let mut last_valid_seq: Option<u64> = None;
+    while i < buf.len() {
+        if i + 4 > buf.len() {
+            break;
+        }
+        let len = u32::from_le_bytes(buf[i..i + 4].try_into().unwrap()) as usize;
+        let frame_end = match i
+            .checked_add(4)
+            .and_then(|x| x.checked_add(len))
+            .and_then(|x| x.checked_add(4))
+        {
+            Some(end) => end,
+            None => {
+                i += 1;
+                continue;
+            }
+        };
+        if frame_end > buf.len() {
+            i += 1;
+            continue;
+        }
+        let payload = &buf[i + 4..i + 4 + len];
+        let stored_crc = u32::from_le_bytes(buf[i + 4 + len..i + 4 + len + 4].try_into().unwrap());
+        if crc32fast::hash(payload) != stored_crc {
+            i += 1;
+            continue;
+        }
+        match postcard::from_bytes::<Event>(payload) {
+            Ok(ev) => {
+                last_valid_seq = Some(ev.seq);
+                i = frame_end;
+            }
+            Err(_) => {
+                i += 1;
+            }
+        }
+    }
+    // M-49 rev4 (JR-I-8 на прод-масштабе, R-001 Находка 1): если окно хвостового скана НЕ
+    // достаёт до начала файла (`file_size > read_size`), в буфере не будет магии независимо
+    // от того, цел заголовок или нет — `had_header` тогда ничего не говорит о здоровье
+    // сегмента. В этом случае отсутствие ЛЮБОГО валидного фрейма в окне тоже обязано
+    // трактоваться как «не удалось установить последний seq», а не как «сегментов нет»:
+    // мы просто НЕ ЗНАЕМ, что лежит до начала окна, и утверждать «легитимно пусто» нельзя.
+    // На маленьких файлах (`file_size <= read_size`, то есть окно = весь файл) это условие
+    // ложно, и поведение не меняется — легитимные случаи (валидный заголовок + 0 событий)
+    // остаются легитимными.
+    let window_did_not_reach_start = file_size > read_size as u64;
+    if last_valid_seq.is_none() && (had_header || window_did_not_reach_start) {
+        // Заголовок валиден, байты после него ЕСТЬ, но ни один фрейм не распознан —
+        // это порча хвоста, не «нет событий» (тот случай уже возвращён выше при
+        // `i == buf.len()` сразу после заголовка). Либо: окно скана не покрыло весь файл,
+        // и внутри него не нашлось ни одного валидного фрейма — максимальный seq неизвестен.
+        return Err(tail_unreadable_err(
+            path,
+            "raw segment tail unreadable: no valid event frame found after header",
+        ));
+    }
+    Ok(last_valid_seq)
+}
+
+/// Определить next_seq для `open_with`: max(последний seq в активном сегменте + 1,
+/// `journal.meta`). Если активного сегмента нет — начинаем с meta.
+pub(crate) fn resolve_next_seq_with(dir: &Path, meta_path: &Path) -> io::Result<u64> {
+    let latest = latest_segment(dir)?;
+    let meta_seq = read_meta(meta_path)?;
+    match latest {
+        None => Ok(meta_seq),
+        Some((_idx, path)) => {
+            let seg_last = tail_last_seq_of(&path)?.map(|s| s + 1).unwrap_or(0);
+            Ok(meta_seq.max(seg_last))
+        }
+    }
+}
+
+// ── M-49 (JR-I-8 операторский выход, TD-049 tasks 3-5) ────────────────────────────────
+//
+// `resolve_next_seq_with` теперь честно отказывает (`is_tail_unreadable`), когда хвост
+// журнала повреждён. Fail-closed БЕЗ выхода означал бы вечно остановленный сбор данных:
+// оператор упёрся в отказ, и единственный доступный ему шаг — удалить каталог (то есть
+// потерять историю, ровно то, от чего защищаемся). Выход — файловая декларация
+// `journal.force-next-seq.json` в каталоге журнала (форма по образцу `journal.legacy.json`:
+// не расширяет публичный API крейта, остаётся в каталоге как след для аудита).
+
+/// Имя операторской декларации ручного переопределения `next_seq`.
+pub const FORCE_NEXT_SEQ_DECL: &str = "journal.force-next-seq.json";
+/// Имя, в которое декларация переименовывается ПОСЛЕ применения (одноразовость + аудит).
+pub const FORCE_NEXT_SEQ_DECL_APPLIED: &str = "journal.force-next-seq.applied.json";
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ForceNextSeqDecl {
+    next_seq: u64,
+    reason: String,
+    #[allow(dead_code)] // хранится/сохраняется для аудита, программно не читается.
+    declared_at_ms: i64,
+}
+
+/// Прочитать `journal.force-next-seq.json`, если он лежит в каталоге. `Ok(None)` — файла нет
+/// (это НЕ ошибка: декларация — опциональный операторский выход).
+fn load_force_next_seq_decl(dir: &Path) -> io::Result<Option<ForceNextSeqDecl>> {
+    let p = dir.join(FORCE_NEXT_SEQ_DECL);
+    if !p.exists() {
+        return Ok(None);
+    }
+    let bytes = fs::read(&p)?;
+    let decl: ForceNextSeqDecl = serde_json::from_slice(&bytes).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{FORCE_NEXT_SEQ_DECL} malformed: {e}"),
+        )
+    })?;
+    Ok(Some(decl))
+}
+
+/// M-49 rev5 (R-002, блокер): пол защиты операторской декларации — ТРИ состояния вместо
+/// `Option<u64>`. Имена вариантов КОНТРАКТНЫЕ (milestone rev5, таблица состояний) — на них
+/// стоит канарейка `verify_M-49.sh` и оракулы `op_6`/`op_7`.
+///
+/// `Option<u64>` не различал «сегментов нет» и «сегменты есть, но максимум установить не
+/// удалось», а `unwrap_or(0)` схлопывал второе в первое: отсутствие знания трактовалось как
+/// разрешение — это противоречит fail-closed всего milestone'а (блокер R-002, Находка 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReadableFloor {
+    /// Максимальный ЧИТАЕМЫЙ `seq` установлен — в т.ч. по ЧИТАЕМОМУ ПРЕФИКСУ повреждённого
+    /// сегмента. Декларация валидна, только если `next_seq` строго больше этого значения.
+    Known(u64),
+    /// Сегментов нет либо все нулевой длины — легитимный restore с нуля, пол = 0.
+    NoSegments,
+    /// Сегменты ЕСТЬ и непусты, но ни в одном не нашлось ни одного валидного фрейма нигде в
+    /// каталоге. Пол НЕИЗВЕСТЕН — декларация непроверяема, единственный fail-closed ответ —
+    /// отказ (не «пол = 0»: см. `op_6`).
+    Unknown,
+}
+
+/// JR-I-10 (M-52, TD-052 + TD-054). Скан пола раньше читал/раздекодировал ВЕСЬ каталог в
+/// худшем случае (прод: 158 сегментов ≈ 140 GiB сырых) без границы по ВРЕМЕНИ/РАБОТЕ — только
+/// память была ограничена (`op_8`, rev5 M-49). Бюджет — счётчик ОСТАВШЕЙСЯ работы в байтах,
+/// протянутый через ВЕСЬ скан пола (все сегменты одного вызова `readable_floor` + side-
+/// верификация крупных кандидатов JR-I-9 внутри них). НЕ функция размера каталога/сегмента —
+/// одна именованная константа (T1, канарейка `verify_M-52.sh`).
+struct WorkBudget {
+    remaining: u64,
+}
+
+impl WorkBudget {
+    fn new(total: u64) -> Self {
+        Self { remaining: total }
+    }
+
+    /// Списать `n` байт работы. `false` — бюджет ИСЧЕРПАН: вызывающий обязан НЕМЕДЛЕННО
+    /// прекратить скан (в т.ч. отбросить уже накопленный частичный результат) и вернуть
+    /// `Unknown` — частичный `Known` по недосмотренному каталогу есть заниженный пол, то
+    /// есть seq-reuse (JR-I-10). Дальнейшие вызовы после исчерпания продолжают отдавать
+    /// `false` (бюджет не восстанавливается).
+    #[must_use]
+    fn spend(&mut self, n: u64) -> bool {
+        match self.remaining.checked_sub(n) {
+            Some(r) => {
+                self.remaining = r;
+                true
+            }
+            None => {
+                self.remaining = 0;
+                false
+            }
+        }
+    }
+}
+
+/// Бюджет РАБОТЫ одного вызова `readable_floor` (JR-I-10). Обязан быть ЗАМЕТНО больше одного
+/// прод-сегмента (`DEFAULT_MAX_SEGMENT_BYTES` = 1 GiB) — иначе честная декларация на здоровом
+/// restore (единственный, но крупный сегмент с валидным содержимым до самого хвоста) перестаёт
+/// проходить (`wb_3`). Восьмикратный запас: достаточно, чтобы дочитать легитимный prod-размера
+/// сегмент целиком практически бесплатно, но исчерпывается за доли секунды на сверхлинейной
+/// side-верификации равномерного мусора (TD-054) — деградация в `Unknown` наступает быстро, а
+/// не после нескольких минут «медленно, но верно».
+const READABLE_FLOOR_WORK_BUDGET_BYTES: u64 = 8 * DEFAULT_MAX_SEGMENT_BYTES;
+
+/// Итог терпимого скана: либо честно завершённый (в т.ч. `None` — валидных фреймов не нашлось
+/// нигде в источнике), либо оборванный исчерпанием бюджета (JR-I-10). В случае исчерпания
+/// накопленный `max_seq` НЕ возвращается вызывающему ни в каком виде — вызывающий обязан
+/// трактовать это как «пол неизвестен», а не как промежуточный ответ.
+enum ScanOutcome {
+    Done(Option<u64>),
+    BudgetExhausted,
+}
+
+/// Пол защиты каталога — best-effort, используется ТОЛЬКО для валидации операторской
+/// декларации (не прод-путь чтения). Терпимый обход (не `stream`/`segments()` — те строгие и
+/// наружу отдают данные потребителям, здесь только внутренняя оценка границы «что уже точно
+/// занято»).
+///
+/// M-49 rev5 (R-002, задача 5a/5b): идём с КОНЦА (сегменты монотонны по `seq` — TD-030); для
+/// КАЖДОГО непустого сегмента, начиная с последнего, пытаемся установить его максимальный
+/// ЧИТАЕМЫЙ `seq` потоковым терпимым сканом С НАЧАЛА файла (`tolerant_max_seq_from_start`,
+/// задача 5b) — а не отбрасываем сегмент целиком, если хвостовой `tail_last_seq_of` вернул
+/// `Err` (это и было блокером R-002: терпимый путь читал префикс, bounded-путь 4b — нет).
+/// Останавливаемся на первом сегменте, где скан нашёл ХОТЬ ОДИН валидный фрейм — более ранние
+/// сегменты по построению несут меньший `seq` (та же монотонность, что и раньше, отложена в
+/// TD-030). Если ни в одном непустом сегменте не нашлось ни одного валидного фрейма —
+/// `Unknown`, не `0`.
+///
+/// M-52 (JR-I-11, TD-030): guard монотонности `first_seq` идёт ПЕРВЫМ, до бюджетного скана —
+/// он дешёвый (только заголовки) и, обнаружив re-stitch архива под чужим индексом, обязан
+/// отказать раньше, чем скан пола успеет опереться на ложную монотонность и занизить пол
+/// (условие закрытия TD-030 из `R-002`/`R-003`).
+///
+/// M-52 (JR-I-10, TD-052/TD-054): бюджет РАБОТЫ единый на ВЕСЬ вызов (все сегменты одного
+/// прохода). Исчерпание в ЛЮБОЙ момент — включая продолжение после уже честно досмотренных
+/// более новых сегментов — немедленно превращает результат ВСЕГО вызова в `Unknown`: то, что
+/// какой-то более старый сегмент мог бы дать `Known`, не имеет значения — сегмент, чей скан
+/// оборван бюджетом, мог нести валидные фреймы с БОЛЕЕ ВЫСОКИМ `seq` за точкой обрыва, и
+/// пропуск к более старому сегменту дал бы ровно тот заниженный пол, от которого защищаемся.
+fn readable_floor(dir: &Path) -> io::Result<ReadableFloor> {
+    let mut ops: SegmentOps = 0;
+    let segs = iter_segments_sorted(dir)?;
+    check_monotonic_paths(dir, &segs, &mut ops)?;
+
+    let mut budget = WorkBudget::new(READABLE_FLOOR_WORK_BUDGET_BYTES);
+    let mut saw_nonempty = false;
+    for p in segs.into_iter().rev() {
+        let len = fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+        if len == 0 {
+            continue;
+        }
+        saw_nonempty = true;
+        match tolerant_max_seq_from_start(&p, &mut budget)? {
+            ScanOutcome::Done(Some(m)) => return Ok(ReadableFloor::Known(m)),
+            ScanOutcome::Done(None) => continue,
+            ScanOutcome::BudgetExhausted => return Ok(ReadableFloor::Unknown),
+        }
+    }
+    if saw_nonempty {
+        Ok(ReadableFloor::Unknown)
+    } else {
+        Ok(ReadableFloor::NoSegments)
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════════════
+// M-52 (JR-I-11, TD-030) — guard монотонности сшивки сегментов
+// ═════════════════════════════════════════════════════════════════════════════════════
+
+/// Best-effort идентичность сегмента (`schema_version`, `first_seq`) для guard'а
+/// `read_all`/`readable_floor` — путей, которые (в отличие от `segments()`) не требуют
+/// строгой классификации/манифеста. `None` — заголовок прочитать не удалось (магия есть, но
+/// битая): сегмент исключается из guard'а, штатное чтение (`read_segment_events`/скан пола)
+/// откажет на нём отдельно со своей диагностикой — дублировать её здесь незачем.
+fn peek_segment_identity(path: &Path, ops: &mut SegmentOps) -> Option<(u32, u64)> {
+    let is_zst = path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .is_some_and(is_compacted_name);
+    if is_zst {
+        let f = File::open(path).ok()?;
+        *ops += 1;
+        let mut decoder = open_compacted_reader(f).ok()?;
+        let header = skip_v2_header_forward(&mut decoder).ok()?;
+        return Some((header.schema_version, header.first_seq));
+    }
+    let mut f = File::open(path).ok()?;
+    *ops += 1;
+    match read_v2_header_and_skip(&mut f) {
+        Ok(Some(h)) => Some((h.schema_version, h.first_seq)),
+        // Магии нет: legacy (до CT-RFC-02) — сентинел, а не факт (JR-I-11 carve-out 1).
+        Ok(None) => Some((contracts::SCHEMA_VERSION_PRE_HEADER, 0)),
+        Err(_) => None,
+    }
+}
+
+/// Несёт ли сегмент хотя бы одно событие — JR-I-11 carve-out 2 (`mn_8`, JR-I-8 случай 3:
+/// «валидный заголовок, ноль событий»). Стоит ОДИН фрейм; вызывается guard'ом ТОЛЬКО при
+/// равенстве соседних `first_seq` — на здоровом каталоге не вызывается никогда.
+/// `Ok(true)` — предохранительный дефолт, когда прочитать не удалось: пустота — это то, что
+/// обязано быть ДОКАЗАНО, отсутствие доказательства не даёт carve-out.
+fn segment_carries_any_event(path: &Path, ops: &mut SegmentOps) -> io::Result<bool> {
+    let is_zst = path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .is_some_and(is_compacted_name);
+    if is_zst {
+        let f = match File::open(path) {
+            Ok(f) => f,
+            Err(_) => return Ok(true),
+        };
+        *ops += 1;
+        let mut decoder = match open_compacted_reader(f) {
+            Ok(d) => d,
+            Err(_) => return Ok(true),
+        };
+        if skip_v2_header_forward(&mut decoder).is_err() {
+            return Ok(true);
+        }
+        return Ok(matches!(read_event_frame(&mut decoder), Ok(Some(_))));
+    }
+    let mut f = match File::open(path) {
+        Ok(f) => f,
+        Err(_) => return Ok(true),
+    };
+    *ops += 1;
+    match read_v2_header_and_skip(&mut f) {
+        Ok(Some(_)) => {}
+        // Не должно происходить (вызывается только на сравнимых, т.е. НЕ-legacy сегментах) —
+        // безопасный дефолт: не подтверждена пустота, carve-out не даём.
+        Ok(None) => return Ok(true),
+        Err(_) => return Ok(true),
+    }
+    let mut r = BufReader::with_capacity(4096, f);
+    Ok(matches!(read_event_frame(&mut r), Ok(Some(_))))
+}
+
+/// JR-I-11 (M-52, TD-030): guard монотонности `first_seq` по возрастанию индекса сегмента —
+/// ОДИН общий хелпер для ТРЁХ прод-путей чтения (`segments()` ⇒ `stream`/`stream_from`,
+/// `read_all`, `readable_floor`); тот же принцип, что `dedup_indexed_paths` (D-COMP-1) — одна
+/// проверка, а не три копии, дрейфующие врозь.
+///
+/// Правило: СРАВНИМЫЕ `first_seq` НЕ УБЫВАЮТ по возрастанию индекса (не «строго возрастают» —
+/// `mn_8`). Два обязательных carve-out'а:
+///  1. legacy (`schema_version == SCHEMA_VERSION_PRE_HEADER`) исключается из сравнения — ни
+///     как левый, ни как правый операнд: его `first_seq` — синтезированный сентинел
+///     «неизвестно», не факт (`mn_5`, класс TD-011);
+///  2. равенство законно, если ЛЕВЫЙ (более ранний по индексу) сегмент не несёт ни одного
+///     события — его `first_seq` тогда обещание, совпадающее с `first_seq` следующего
+///     (`mn_8`, JR-I-8 случай 3). `carries_events` вызывается ЛЕНИВО, только при равенстве.
+///
+/// `candidates` уже отсортированы по возрастанию индекса сегмента (инвариант вызывающих).
+fn check_first_seq_monotonic(
+    candidates: &[(String, u32, u64)],
+    mut carries_events: impl FnMut(&str) -> io::Result<bool>,
+) -> io::Result<()> {
+    let comparable: Vec<&(String, u32, u64)> = candidates
+        .iter()
+        .filter(|(_, schema_version, _)| *schema_version != contracts::SCHEMA_VERSION_PRE_HEADER)
+        .collect();
+    for w in comparable.windows(2) {
+        let (name_a, _, first_a) = w[0];
+        let (name_b, _, first_b) = w[1];
+        if first_a < first_b {
+            continue;
+        }
+        if first_a == first_b && !carries_events(name_a.as_str())? {
+            // Пустой ЛЕВЫЙ сегмент — легитимное равенство (carve-out 2), не нарушение.
+            continue;
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "journal catalogue is not monotonic in first_seq: {name_a} (first_seq={first_a}) \
+                 precedes {name_b} (first_seq={first_b}) in segment-index order, but its \
+                 first_seq does not stay below it — this looks like an archived/quarantined \
+                 segment re-attached under the wrong index (TD-030). Move the misplaced \
+                 segment back to quarantine and re-verify (see \
+                 docs/ops-journal-tail-unreadable.md)."
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Guard монотонности над СПИСКОМ ПУТЕЙ (уже отсортированных по индексу) — общая точка входа
+/// для `read_all` (lib.rs) и `readable_floor`: обе тропы идут по best-effort заголовкам без
+/// требования манифеста/строгой классификации (в отличие от `segments()`, у которой заголовки
+/// уже есть из `classify_segment`, и guard встроен инлайн).
+pub(crate) fn check_monotonic_paths(
+    dir: &Path,
+    paths: &[PathBuf],
+    ops: &mut SegmentOps,
+) -> io::Result<()> {
+    let mut candidates: Vec<(String, u32, u64)> = Vec::with_capacity(paths.len());
+    for p in paths {
+        if let Some((schema_version, first_seq)) = peek_segment_identity(p, ops) {
+            let name = p
+                .file_name()
+                .and_then(OsStr::to_str)
+                .unwrap_or("")
+                .to_string();
+            candidates.push((name, schema_version, first_seq));
+        }
+    }
+    check_first_seq_monotonic(&candidates, |name| {
+        segment_carries_any_event(&dir.join(name), ops)
+    })
+}
+
+/// M-49 rev5 (задача 5b): размер чанка потокового терпимого скана «с начала файла».
+/// Константа, НЕ зависит от размера сегмента — обязательное условие ограниченной памяти
+/// (`op_8`: пик НЕ растёт с размером сегмента).
+///
+/// Размер запроса ВАЖЕН для `.zst`, не только для памяти: на bit-rot внутри сжатого
+/// потока один `read()`-вызов декодера либо целиком успевает, либо целиком проваливается —
+/// байты, которые он декодировал бы ДО повреждённого блока внутри ЭТОГО ЖЕ вызова, наружу
+/// не возвращаются (стандартное поведение `zstd::Decoder`: партиального успеха внутри
+/// проваленного вызова не бывает). Чем МЕНЬШЕ запрашиваемый кусок, тем ближе граница отказа
+/// подходит к фактической границе порчи и тем ПОЛНЕЕ читаемый префикс. Измерено: 256 KiB
+/// терял ~130 KiB декодируемых данных относительно 64 KiB на одной и той же фикстуре
+/// (терялись реальные события, `op_2` регрессировал). 64 KiB — тот же размер, что
+/// `common::tolerant_bytes` (эталон оракулов) использует для decode-цикла; совпадение НЕ
+/// случайное — обе стороны обязаны сходиться к одному и тому же измеримому пределу.
+const READABLE_SCAN_CHUNK: usize = 64 * 1024;
+
+/// Максимальный «перенос» незавершённого фрейма через границу чтения. С запасом больше
+/// самого крупного реального события в системе (~2.4 KiB, `snap`-фикстура), но остаётся
+/// константой — не растёт с файлом. Значение крупнее этого порога трактуется как порча
+/// (абсурдная заявленная длина), а не как валидный фрейм, разрезанный чтением чанками.
+const READABLE_SCAN_MAX_CARRY: usize = 64 * 1024;
+
+/// Источник side-верификации крупного кандидата (JR-I-9, M-50/TD-053): свежий,
+/// НЕЗАВИСИМЫЙ от основного скана поток, спозиционированный на абсолютное смещение
+/// `payload_offset` байт от начала потока событий (сразу ПОСЛЕ header). Отдельный
+/// дескриптор/декодер — иначе состояние основного скана (`r` в `resync_max_seq`) было бы
+/// испорчено попыткой заглянуть вперёд по тому же потоку. `None` — источник не
+/// переоткрылся (напр. файл исчез между шагами скана) — кандидат остаётся непроверенным
+/// (byte-resync, как и для любого другого мусора).
+trait LargeFrameVerifier {
+    fn open_at(&self, payload_offset: u64) -> Option<Box<dyn Read>>;
+}
+
+/// Сырой (несжатый) сегмент: side-источник — независимый файловый дескриптор,
+/// позиционированный `seek`'ом. `header_end` — смещение начала потока событий В ФАЙЛЕ
+/// (после magic+header; 0 для legacy-сегмента без магии).
+struct RawFrameVerifier<'a> {
+    path: &'a Path,
+    header_end: u64,
+}
+
+impl LargeFrameVerifier for RawFrameVerifier<'_> {
+    fn open_at(&self, payload_offset: u64) -> Option<Box<dyn Read>> {
+        let mut f = File::open(self.path).ok()?;
+        f.seek(SeekFrom::Start(
+            self.header_end.checked_add(payload_offset)?,
+        ))
+        .ok()?;
+        Some(Box::new(f))
+    }
+}
+
+/// Компактированный (`.zst`) сегмент: `zstd::Decoder` не `Seek` — side-источник
+/// переоткрывает поток С НАЧАЛА (свежий декодер, header пропускается заново) и
+/// потоково ОТБРАСЫВАЕТ `payload_offset` байт (чанками ограниченного размера, БЕЗ
+/// буферизации отброшенного префикса) — тот же принцип «повторная распаковка до
+/// offset'а», что описан в референс-дизайне milestone'а.
+struct ZstFrameVerifier<'a> {
+    path: &'a Path,
+}
+
+impl LargeFrameVerifier for ZstFrameVerifier<'_> {
+    fn open_at(&self, payload_offset: u64) -> Option<Box<dyn Read>> {
+        let f = File::open(self.path).ok()?;
+        let mut dec = zstd::Decoder::new(f).ok()?;
+        skip_v2_header_forward(&mut dec).ok()?;
+        skip_forward(&mut dec, payload_offset).ok()?;
+        Some(Box::new(dec))
+    }
+}
+
+/// Прочитать-и-отбросить РОВНО `n` байт из `r`, чанками фиксированного размера
+/// (`READABLE_SCAN_CHUNK`) — буфер НЕ растёт с `n`. `Err` — источник кончился раньше
+/// ожидаемого (расхождение с side-верификацией, которая уже подтвердила эти байты
+/// существующими; caller обязан трактовать это как останов, не как «данных нет»).
+fn skip_forward<R: Read>(r: &mut R, mut n: u64) -> io::Result<()> {
+    let mut buf = [0u8; READABLE_SCAN_CHUNK];
+    while n > 0 {
+        let take = n.min(buf.len() as u64) as usize;
+        r.read_exact(&mut buf[..take])?;
+        n -= take as u64;
+    }
+    Ok(())
+}
+
+/// Максимум байт удержанного префикса payload'а для декодирования ведущего varint `seq`
+/// (первое поле `Event` — `u64`, postcard LEB128 ≤ 10 B, см. milestone «Разбор проектных
+/// вопросов» п.2).
+const SEQ_PREFIX_CAP: usize = 10;
+
+/// Side-верификация ОДНОГО крупного кандидата (JR-I-9): CRC считается ПОТОКОВО через
+/// `verifier` (не через основной скан) чанками `READABLE_SCAN_CHUNK` — тело фрейма НЕ
+/// буферизуется ни целиком, ни долей (`fs_8`: пик памяти не растёт с `len`). Держим
+/// только удержанный префикс ≤`SEQ_PREFIX_CAP` байт для декодирования `seq`.
+///
+/// `Accepted(seq)` — CRC совпал И `seq` декодировался: фрейм валиден, тот же критерий, что и
+/// штатный ридер (сначала CRC, потом декод, см. milestone п.2). `Rejected` — ЛЮБОЙ отказ (CRC
+/// не совпал, декодирование `seq` не удалось, источник кончился раньше ожидаемого) —
+/// кандидат трактуется как мусор, ресинк на 1 байт продолжается ровно как сегодня.
+/// `BudgetExhausted` (M-52, JR-I-10/TD-054) — бюджет РАБОТЫ кончился ВНУТРИ этой
+/// side-верификации: результат кандидата остаётся неопределённым, вызывающий обязан
+/// прекратить весь скан пола (частичный ответ = заниженный пол = seq-reuse), а не
+/// трактовать это как «кандидат — мусор» (та ветка продолжила бы резинк, пряча исчерпание).
+enum VerifyOutcome {
+    Accepted(u64),
+    Rejected,
+    BudgetExhausted,
+}
+
+fn verify_large_frame(
+    verifier: &dyn LargeFrameVerifier,
+    payload_offset: u64,
+    len: usize,
+    budget: &mut WorkBudget,
+) -> VerifyOutcome {
+    let mut src = match verifier.open_at(payload_offset) {
+        Some(s) => s,
+        None => return VerifyOutcome::Rejected,
+    };
+    let mut hasher = crc32fast::Hasher::new();
+    let mut prefix: Vec<u8> = Vec::with_capacity(SEQ_PREFIX_CAP);
+    let mut remaining = len;
+    let mut chunk = [0u8; READABLE_SCAN_CHUNK];
+    while remaining > 0 {
+        let take = remaining.min(chunk.len());
+        // JR-I-10: списываем бюджет ПЕРЕД попыткой чтения — каждый кандидат обязан стоить
+        // хотя бы `take` байт независимо от того, доживёт ли источник до конца чтения
+        // (near-EOF кандидаты не должны становиться «бесплатными» просто потому что читать
+        // оказалось нечего).
+        if !budget.spend(take as u64) {
+            return VerifyOutcome::BudgetExhausted;
+        }
+        if src.read_exact(&mut chunk[..take]).is_err() {
+            return VerifyOutcome::Rejected;
+        }
+        if prefix.len() < SEQ_PREFIX_CAP {
+            let want = (SEQ_PREFIX_CAP - prefix.len()).min(take);
+            prefix.extend_from_slice(&chunk[..want]);
+        }
+        hasher.update(&chunk[..take]);
+        remaining -= take;
+    }
+    if !budget.spend(4) {
+        return VerifyOutcome::BudgetExhausted;
+    }
+    let mut crc_buf = [0u8; 4];
+    if src.read_exact(&mut crc_buf).is_err() {
+        return VerifyOutcome::Rejected;
+    }
+    if hasher.finalize() != u32::from_le_bytes(crc_buf) {
+        return VerifyOutcome::Rejected;
+    }
+    match postcard::take_from_bytes::<u64>(&prefix) {
+        Ok((seq, _rest)) => VerifyOutcome::Accepted(seq),
+        Err(_) => VerifyOutcome::Rejected,
+    }
+}
+
+/// Терпимый потоковый байт-ресинк-скан УЖЕ ОТКРЫТОГО источника событий (после заголовка):
+/// та же логика, что у `parse_event_frames`/хвостового скана в `tail_last_seq_of` (CRC-ошибка
+/// / оборванный фрейм / ошибка постpost-декодирования → сдвиг на 1 байт вперёд), но при
+/// ПОСТОЯННОЙ памяти — данные читаются и обрабатываются чанками
+/// (`READABLE_SCAN_CHUNK` + ≤`READABLE_SCAN_MAX_CARRY` НЕЗАВИСИМО от объёма источника, а не
+/// весь файл разом (`read_to_end`/`Vec<Event>`, класс TD-011).
+///
+/// Ошибка чтения источника (напр. обрыв zstd-потока на bit-rot) трактуется как конец
+/// доступных данных — то, что уже распознано ДО неё, остаётся в результате (читаемый
+/// ПРЕФИКС), это и есть терпимость 5b.
+///
+/// JR-I-9 (M-50/TD-053): кандидат, чей заявленный размер превышает `READABLE_SCAN_MAX_CARRY`
+/// (не помещается в удержанный carry), БОЛЬШЕ не трактуется как порча автоматически. Пока
+/// его полный размер (`len+8`) не превышает `FRAME_LEN_SANITY_CAP` — тот же санити-кап, что
+/// применяет штатный ридер (`read_frame_payload`) — он верифицируется ВТОРЫМ, независимым
+/// источником (`verifier`, `verify_large_frame`) потоково, без буферизации тела. Успех →
+/// `seq` входит в пол, основной скан перескакивает фрейм БЕЗ повторного чтения его тела.
+/// Провал (CRC не совпал / seq не декодировался / источник кончился раньше) → байт-ресинк
+/// `i+1`, ровно как для любого другого мусора — терпимость к порче не меняется.
+fn resync_max_seq<R: Read>(
+    mut r: R,
+    verifier: &dyn LargeFrameVerifier,
+    budget: &mut WorkBudget,
+) -> ScanOutcome {
+    let mut carry: Vec<u8> = Vec::new();
+    let mut max_seq: Option<u64> = None;
+    let mut chunk = vec![0u8; READABLE_SCAN_CHUNK];
+    // Байт, прочитанных из `r` с начала потока событий — нужно, чтобы вычислить
+    // АБСОЛЮТНОЕ смещение крупного кандидата для side-верификации и для точного
+    // перескока основного потока за его пределы (без повторного чтения тела).
+    let mut total_read: u64 = 0;
+    loop {
+        // Обрыв потока (напр. bit-rot в zstd-стриме) трактуется как конец доступных данных.
+        let n = r.read(&mut chunk).unwrap_or_default();
+        let at_eof = n == 0;
+        if n > 0 {
+            // JR-I-10 (TD-052): основной скан тоже списывает бюджет — граница работы
+            // покрывает ВЕСЬ обход, не только side-верификацию (TD-054).
+            if !budget.spend(n as u64) {
+                return ScanOutcome::BudgetExhausted;
+            }
+            carry.extend_from_slice(&chunk[..n]);
+            total_read += n as u64;
+        }
+
+        let mut i = 0usize;
+        loop {
+            if i + 8 > carry.len() {
+                break; // недостаточно байт даже на len+crc
+            }
+            let len = u32::from_le_bytes(carry[i..i + 4].try_into().unwrap()) as usize;
+            let frame_end = match i
+                .checked_add(4)
+                .and_then(|x| x.checked_add(len))
+                .and_then(|x| x.checked_add(4))
+            {
+                Some(e) => e,
+                None => {
+                    i += 1;
+                    continue;
+                }
+            };
+            if frame_end > carry.len() {
+                let total_len = frame_end - i; // 4 (len) + payload + 4 (crc)
+                if total_len > FRAME_LEN_SANITY_CAP {
+                    // Абсурдная заявленная длина — мусор ПО ОПРЕДЕЛЕНИЮ ОБОИХ путей: такой
+                    // фрейм не прочитал бы и штатный ридер (`read_frame_payload`). Резинк на
+                    // 1 байт, как раньше (`fs_6`: правдоподобная-но-абсурдная длина).
+                    i += 1;
+                    continue;
+                }
+                if total_len <= READABLE_SCAN_MAX_CARRY {
+                    if at_eof {
+                        // Данных больше не будет — фрейм действительно оборван (не крупный
+                        // кандидат: помещается в кап carry, но так и не дочитался).
+                        i += 1;
+                        continue;
+                    }
+                    // Возможно валидный фрейм, разрезанный границей чтения — ждать ещё байт.
+                    break;
+                }
+                // JR-I-9: total_len между капом carry и санити-капом ридера — штатный ридер
+                // принял бы такую длину, значит скан пола не имеет права молча счесть её
+                // порчей. Side-верификация вторым источником (CRC потоково + seq-префикс).
+                let stream_pos = total_read - carry.len() as u64;
+                let frame_start_abs = stream_pos + i as u64;
+                let payload_off = frame_start_abs + 4;
+                match verify_large_frame(verifier, payload_off, len, budget) {
+                    VerifyOutcome::Accepted(seq) => {
+                        max_seq = Some(max_seq.map_or(seq, |m: u64| m.max(seq)));
+                        // Догнать основной поток до конца принятого фрейма и продолжить с
+                        // чистого carry — тело уже провалидировано вторым путём, повторно
+                        // буферизовать его в carry незачем (и это сломало бы границу памяти).
+                        let frame_end_abs = frame_start_abs + total_len as u64;
+                        let to_skip = frame_end_abs.saturating_sub(total_read);
+                        if skip_forward(&mut r, to_skip).is_err() {
+                            // Основной поток разошёлся с side-источником одного и того же
+                            // файла — не должно происходить штатно; fail-closed: то, что уже
+                            // накоплено (включая этот фрейм), остаётся результатом, скан
+                            // останавливается, а не рискует неверной позицией.
+                            return ScanOutcome::Done(max_seq);
+                        }
+                        total_read += to_skip;
+                        carry.clear();
+                        i = 0;
+                        continue;
+                    }
+                    VerifyOutcome::Rejected => {
+                        i += 1;
+                        continue;
+                    }
+                    VerifyOutcome::BudgetExhausted => {
+                        // JR-I-10: НЕ трактовать как «кандидат — мусор» (это продолжило бы
+                        // резинк, пряча исчерпание) и НЕ возвращать накопленный `max_seq` —
+                        // единственный допустимый исход есть прекращение всего скана.
+                        return ScanOutcome::BudgetExhausted;
+                    }
+                }
+            }
+            let payload = &carry[i + 4..i + 4 + len];
+            let stored_crc = u32::from_le_bytes(carry[i + 4 + len..frame_end].try_into().unwrap());
+            if crc32fast::hash(payload) != stored_crc {
+                i += 1;
+                continue;
+            }
+            match postcard::from_bytes::<Event>(payload) {
+                Ok(ev) => {
+                    max_seq = Some(max_seq.map_or(ev.seq, |m: u64| m.max(ev.seq)));
+                    i = frame_end;
+                }
+                Err(_) => {
+                    i += 1;
+                }
+            }
+        }
+        if i > 0 {
+            carry.drain(0..i);
+        }
+        if at_eof {
+            break;
+        }
+    }
+    ScanOutcome::Done(max_seq)
+}
+
+/// M-49 rev5 (задача 5b): максимальный ЧИТАЕМЫЙ `seq` ОДНОГО сегмента — потоковый скан С
+/// НАЧАЛА файла при ПОСТОЯННОЙ памяти (без `Vec<Event>` на весь сегмент, без полной
+/// распаковки `.zst` — `resync_max_seq`). Терпимый: порча (битый CRC, оборванный фрейм, обрыв
+/// zstd-потока) останавливает скан НА МЕСТЕ порчи и возвращает максимум, накопленный ДО неё
+/// (читаемый ПРЕФИКС), а не `Err` — в отличие от `tail_last_seq_of` (хвостовое окно, прод-путь
+/// отказа `open_with`, НЕ меняется). Битый ЗАГОЛОВОК сегмента трактуется как «читаемого
+/// префикса нет» (`Ok(None)`) — без валидного заголовка формат фреймов ниже не установить
+/// достоверно.
+fn tolerant_max_seq_from_start(path: &Path, budget: &mut WorkBudget) -> io::Result<ScanOutcome> {
+    let is_zst = path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .is_some_and(is_compacted_name);
+
+    if is_zst {
+        let f = match File::open(path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(ScanOutcome::Done(None)),
+            Err(e) => return Err(e),
+        };
+        if f.metadata()?.len() == 0 {
+            return Ok(ScanOutcome::Done(None));
+        }
+        let mut decoder = match zstd::Decoder::new(f) {
+            Ok(d) => d,
+            Err(_) => return Ok(ScanOutcome::Done(None)), // поток не открылся — читаемого префикса нет
+        };
+        if skip_v2_header_forward(&mut decoder).is_err() {
+            return Ok(ScanOutcome::Done(None)); // заголовок битый — читаемого префикса нет
+        }
+        // JR-I-9 (M-50): side-источник для крупных кандидатов — свежий декодер,
+        // переоткрытый С НАЧАЛА файла на каждую верификацию (`.zst` не Seek).
+        let verifier = ZstFrameVerifier { path };
+        return Ok(resync_max_seq(decoder, &verifier, budget));
+    }
+
+    let mut file = match File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(ScanOutcome::Done(None)),
+        Err(e) => return Err(e),
+    };
+    if file.metadata()?.len() == 0 {
+        return Ok(ScanOutcome::Done(None));
+    }
+    if read_v2_header_and_skip(&mut file).is_err() {
+        return Ok(ScanOutcome::Done(None)); // заголовок битый — читаемого префикса нет
+    }
+    // Позиция файла — сразу после заголовка (магия+header) либо 0 (legacy, без магии):
+    // `read_v2_header_and_skip` уже это гарантирует (`Ok(Some(_))` либо `Ok(None)` с откатом).
+    let header_end = file.stream_position()?;
+    let reader = BufReader::with_capacity(64 * 1024, file);
+    // JR-I-9 (M-50): side-источник для крупных кандидатов — независимый файловый
+    // дескриптор, позиционируемый `seek`'ом (сырой формат — Seek доступен).
+    let verifier = RawFrameVerifier { path, header_end };
+    Ok(resync_max_seq(reader, &verifier, budget))
+}
+
+/// Пометить декларацию применённой: переименование `journal.force-next-seq.json` →
+/// `journal.force-next-seq.applied.json` (одноразовость — забыть её в каталоге невозможно,
+/// повторный старт её не подхватит; аудит — `reason`/`declared_at_ms` сохраняются в теле).
+fn mark_force_next_seq_applied(dir: &Path) -> io::Result<()> {
+    fs::rename(
+        dir.join(FORCE_NEXT_SEQ_DECL),
+        dir.join(FORCE_NEXT_SEQ_DECL_APPLIED),
+    )
+}
+
+/// M-49 (JR-I-8 операторский выход): обёртка над `resolve_next_seq_with`. Если хвост читается
+/// — обычный путь, декларация даже не читается (`op_3`: неприменённая декларация ИНЕРТНА при
+/// читаемом хвосте, иначе забытый файл молча переопределял бы честный `next_seq`). Если хвост
+/// нечитаем:
+/// - декларации нет → пробрасываем исходный отказ как есть (fail-closed без деградации);
+/// - декларация есть, но `next_seq` ≤ максимального ЧИТАЕМОГО `seq` → `Err` (декларация НЕ
+///   может стать каналом seq-reuse — `op_2`);
+/// - декларация валидна → пометка применённой + объявленный `next_seq` (`op_1`). Карантин
+///   нечитаемого сегмента файлами данных НЕ занимается — это ручное действие оператора по
+///   runbook (rev3: `open_with` не имеет побочных эффектов на данных, `op_4`).
+pub(crate) fn resolve_next_seq_or_declared(dir: &Path, meta_path: &Path) -> io::Result<u64> {
+    match resolve_next_seq_with(dir, meta_path) {
+        Ok(n) => Ok(n),
+        Err(e) if is_tail_unreadable(&e) => {
+            let decl = match load_force_next_seq_decl(dir)? {
+                Some(d) => d,
+                None => return Err(e),
+            };
+            // M-49 rev5 (R-002, задача 5a): три состояния, не `Option<u64>`. Отсутствие
+            // знания о поле (`Unknown`) НЕ является разрешением — единственный fail-closed
+            // ответ на непроверяемую декларацию есть отказ, а не `next_seq >= 1` без разбора.
+            let readable_max = match readable_floor(dir)? {
+                ReadableFloor::Known(max) => max,
+                ReadableFloor::NoSegments => 0,
+                ReadableFloor::Unknown => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "{FORCE_NEXT_SEQ_DECL} rejected: readable seq floor is UNKNOWN — no \
+                             valid event frame could be read anywhere in this journal directory, \
+                             so declaration next_seq={} cannot be verified against anything. \
+                             Restore the affected segment(s) from a cold copy, or move them to \
+                             manual quarantine, then retry — see \
+                             docs/ops-journal-tail-unreadable.md.",
+                            decl.next_seq
+                        ),
+                    ));
+                }
+            };
+            if decl.next_seq <= readable_max {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "{FORCE_NEXT_SEQ_DECL} rejected: next_seq={} must be strictly greater \
+                         than the maximum READABLE seq={} in this journal — otherwise the \
+                         declaration itself would reuse seq already present in the log",
+                        decl.next_seq, readable_max
+                    ),
+                ));
+            }
+            mark_force_next_seq_applied(dir)?;
+            Ok(decl.next_seq)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Создать `OpenOutcome`: какой сегмент выбран/создан, его first_seq, и куда писать.
+pub(crate) struct OpenDecision {
+    pub seg_index: u32,
+    pub seg_path: PathBuf,
+    pub first_seq: u64,
+    pub reuse: bool,
+}
+
+/// Решить, какой сегмент открывать на запись:
+/// - есть сегменты → ищем последний, чей заголовок совпадает с cfg (source/provenance/epoch_id);
+///   совпал → reuse (append), иначе → создаём новый (index = последний + 1);
+/// - нет сегментов → создаём segment-00000000.jrnl.
+///
+/// `next_seq` передаётся ВЫЗЫВАЮЩИМ (уже разрешён через `resolve_next_seq_with` либо, при
+/// нечитаемом хвосте, через операторскую декларацию — `resolve_next_seq_or_declared`, M-49).
+/// Раньше эта функция пересчитывала `next_seq` САМА повторным вызовом
+/// `resolve_next_seq_with` — при операторском override это давало РАСХОЖДЕНИЕ: `Journal.next_seq`
+/// (из вызывающего) получал бы объявленное значение, а `SegmentHeader.first_seq` нового
+/// сегмента — заново пересчитанное (заниженное, не знающее о декларации).
+pub(crate) fn decide_open_segment(
+    dir: &Path,
+    cfg: &WriterConfig,
+    next_seq: u64,
+) -> io::Result<OpenDecision> {
+    let latest = latest_segment(dir)?;
+
+    if let Some((idx, path)) = latest {
+        // A compacted segment is immutable and cannot be opened for append. Start a
+        // fresh raw segment after the complete indexed history.
+        if path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .is_some_and(is_compacted_name)
+        {
+            let new_idx = idx + 1;
+            return Ok(OpenDecision {
+                seg_index: new_idx,
+                seg_path: segment_path(dir, new_idx),
+                first_seq: next_seq,
+                reuse: false,
+            });
+        }
+
+        // Прочитать заголовок (если есть).
+        let mut f = File::open(&path)?;
+        let header = match read_v2_header_and_skip(&mut f).ok().flatten() {
+            Some(h) => h,
+            None => {
+                drop(f);
+                // Активный сегмент legacy (без магии) — `open_with` не имеет права
+                // дописывать в legacy: новая запись всегда пишет магию. Создаём новый.
+                let new_idx = idx + 1;
+                let new_path = segment_path(dir, new_idx);
+                return Ok(OpenDecision {
+                    seg_index: new_idx,
+                    seg_path: new_path,
+                    first_seq: next_seq,
+                    reuse: false,
+                });
+            }
+        };
+        drop(f);
+
+        // TD-031 (L2D-I-8): reuse требует СОВПАДЕНИЯ ЭПОХИ СХЕМЫ. Изоляция держится
+        // `SCHEMA_VERSION`, не provenance: в прод-контейнере git недоступен → provenance
+        // = КОНСТАНТА `recorder v0.0.0 (git:no-git-info)` на ВСЕХ деплоях, и без schema-гейта
+        // schema-2 сегмент reuse'ился бы schema-3 бинарём → variant-6 (L2Delta) смешивался
+        // в pre-M18 сегмент, quarantine невозможен. Schema-forward ОДНОСТОРОННИЙ: silent-откат
+        // запрещён; fix-forward (RFC §10 / ops §5.1). Квалифицированный путь — намеренно:
+        // self-documenting и не зависит от состава `use contracts::{...}`.
+        if header.source == cfg.source
+            && header.provenance == cfg.provenance
+            && header.epoch_id == cfg.epoch_id
+            && header.schema_version == contracts::SCHEMA_VERSION
+        {
+            // Reuse: дописываем в существующий v2-сегмент ТЕКУЩЕЙ schema-эпохи.
+            return Ok(OpenDecision {
+                seg_index: idx,
+                seg_path: path,
+                first_seq: header.first_seq,
+                reuse: true,
+            });
+        }
+
+        // Header не совпал — новая запись в новый сегмент.
+        let new_idx = idx + 1;
+        let new_path = segment_path(dir, new_idx);
+        Ok(OpenDecision {
+            seg_index: new_idx,
+            seg_path: new_path,
+            first_seq: next_seq,
+            reuse: false,
+        })
+    } else {
+        // Нет ни одного — создаём segment-00000000.jrnl.
+        Ok(OpenDecision {
+            seg_index: 0,
+            seg_path: segment_path(dir, 0),
+            first_seq: next_seq,
+            reuse: false,
+        })
+    }
+}
+
+/// Сериализовать event-frame (с CRC32) — helper для lib.rs, чтобы не дублировать.
+pub(crate) fn serialize_event_frame(ev: &Event) -> io::Result<Vec<u8>> {
+    let payload =
+        postcard::to_stdvec(ev).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let crc = crc32fast::hash(&payload);
+    let mut out = Vec::with_capacity(8 + payload.len());
+    out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    out.extend_from_slice(&payload);
+    out.extend_from_slice(&crc.to_le_bytes());
+    Ok(out)
+}
+
+/// Размер сериализованного event-frame (для решения о ротации до записи).
+#[allow(dead_code)]
+pub(crate) fn event_frame_size(ev: &Event) -> io::Result<u64> {
+    Ok(serialize_event_frame(ev)?.len() as u64)
+}
+/// Открыть файл v2-сегмента на запись. Если файла нет — создать и записать magic + header.
+/// Если файл есть и пустой — то же (новый сегмент `append` после ротации).
+/// `size_after_open` возвращается через структуру для инициализации `seg_size`.
+pub(crate) struct OpenSegForWrite {
+    pub writer: BufWriter<File>,
+    pub seg_size_after_header: u64,
+}
+
+pub(crate) fn open_seg_for_write(
+    path: &Path,
+    reuse: bool,
+    header: &SegmentHeader,
+) -> io::Result<OpenSegForWrite> {
+    let mut f = OpenOptions::new().create(true).append(true).open(path)?;
+
+    let mut seg_size = f.metadata()?.len();
+
+    if !reuse || seg_size == 0 {
+        // Пишем magic + header в начало (или в пустой файл после ротации).
+        let hdr_bytes = serialize_v2_header(header)?;
+        f.write_all(&hdr_bytes)?;
+        f.flush()?;
+        // После write + flush данные в ФАЙЛЕ; размер через metadata() точен.
+        seg_size = f.metadata()?.len();
+    }
+
+    Ok(OpenSegForWrite {
+        writer: BufWriter::with_capacity(256 * 1024, f),
+        seg_size_after_header: seg_size,
+    })
+}
+
+// (Используется локально в `free_bytes_at` под Unix; глобального re-export не требуется.)
+
+// ── Ретеншен: ОПЕРАТОРСКИЙ ПУТЬ (M-08 task 11, TD-020) ────────────────────────────────
+//
+// Находка §8 (reviewer): `verify_cold_copy`/`prune_segment`/`ColdCopyProof` существуют как
+// БИБЛИОТЕКА, но их никто не вызывает — ни recorder, ни CLI, ни cron. Главная цель M-08
+// («сбор не остановится НИКОГДА») поэтому НЕ достигнута: диск растёт те же ~2.8 GB/сут,
+// просто кусками по 1 GiB. ~40 дней до disk-guard.
+//
+// Решение: ОТДЕЛЬНЫЙ бинарь `journal-retention` + cron на VPS. Не поток внутри recorder'а:
+// падение/зависание ретеншена не имеет права ронять СБОР ДАННЫХ (сбор дороже уборки).
+// Каркас — architect; реализация — engine-dev.
+
+/// Политика ретеншена (операторский конфиг).
+///
+/// M-38b (C-030 R1): добавлены два поля — `checkpoint_covered_through_seq` и
+/// `allow_prune_without_checkpoint`. Дефолт через `..Default::default()` подставляет
+/// `covered = None` (= fail-closed) и `override = false` (= без override).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RetentionPolicy {
+    /// Сегменты старше N суток — кандидаты на выгрузку+удаление.
+    pub retain_days: u32,
+    /// Минимум ПОСЛЕДНИХ сегментов, которые остаются горячими независимо от возраста
+    /// (реплей/диагностика недавнего прошлого без обращения к холодному хранилищу).
+    pub keep_min_segments: u32,
+    /// Корень холодного хранилища (Storage Box / смонтированный путь).
+    pub cold_root: PathBuf,
+    /// Порог, ниже которого пустое место требует ВНЕОЧЕРЕДНОЙ выгрузки (алерт).
+    pub min_free_bytes: u64,
+    /// M-38b (C-030 R1): минимум `seq`, свёрнутый ЧЕКПОНТОМ по ВСЕМ сконфигурированным
+    /// селекторам (gateway-checkpoint публикует ОДНО число). Локальный prune РАЗРЕШЁН
+    /// только для сегментов, чьи события полностью покрыты (`last_seq(seg) <= covered`).
+    /// Дефолт `None` = «нет артефакта покрытия» = fail-closed (никаких prune).
+    pub checkpoint_covered_through_seq: Option<u64>,
+    /// M-38b (отклонение от буквы C-030): escape-hatch, разрешающий prune БЕЗ покрытия.
+    /// Дефолт `false` (fail-closed). Если `true` — каждый prune без покрытия ОБЯЗАН
+    /// быть назван в `RetentionReport.pruned_without_checkpoint_coverage`.
+    pub allow_prune_without_checkpoint: bool,
+}
+
+/// M-38b (C-030 R1): DEPRECATED alias для backwards-compatibility. Используйте
+/// поля `RetentionPolicy.checkpoint_covered_through_seq` /
+/// `RetentionPolicy.allow_prune_without_checkpoint` напрямую.
+#[deprecated(note = "use RetentionPolicy fields directly")]
+pub struct RetentionCoverage {
+    pub checkpoint_covered_through_seq: Option<u64>,
+    pub allow_prune_without_checkpoint: bool,
+}
+
+/// Режим запуска. **Дефолт оператора — `DryRun`** (первый прогон на проде — обязательно он).
+///
+/// M-08 task 16 (D-COMP-3): добавлен вариант `Compact` — третий режим ТОГО ЖЕ бинаря
+/// `journal-retention` (`--mode compact`). Компакция сжатием закрытых сегментов
+/// переехала в общий бинарь, чтобы:
+/// - один контракт argv на задание/cron (а не два разных бинаря с разным парсером);
+/// - один Dockerfile pipeline (`--bin recorder --bin journal-retention` уже всё
+///   включает, расщеплять ради операции — размножать интерфейс);
+///
+/// `Compact` НЕ проходит через `retention_plan`/`retention_execute` (это другой
+/// алгоритм с другой инвариантной): `retention_execute` возвращает пустой отчёт
+/// для этого режима — вызывающий (бинарь) переходит к `compact_closed_segments`
+/// напрямую. БИБЛИОТЕКА — отдельные API, БИНАРЬ — один.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetentionMode {
+    DryRun,
+    Apply,
+    Compact,
+}
+
+/// План: что БУДЕТ сделано. Строится ДЕТЕРМИНИРОВАННО (часы передаются аргументом —
+/// никакого `SystemTime::now()` внутри: план обязан быть воспроизводим и тестируем).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RetentionPlan {
+    /// Выгрузить в холодное хранилище и затем удалить горячую копию.
+    pub offload_and_prune: Vec<SegmentInfo>,
+    /// M-38b (C-030 R1): выгрузить в холодное, но НЕ удалять горячую копию (нет покрытия
+    /// чекпоинтом — бэкап R1 идёт, локальная копия остаётся, skip-репорт — на
+    /// операторе). Дефолт пустой, если нет непокрытых сегментов.
+    pub offload_only: Vec<SegmentInfo>,
+    /// Пропущены с причиной (активный сегмент; моложе retain_days; в keep_min_segments;
+    /// legacy без декларации — у него нет эпохи, значит нет и права его удалять;
+    /// **НЕ ПОКРЫТ чекпоинтом** — главный новый класс).
+    pub skipped: Vec<(SegmentInfo, String)>,
+    /// Свободного места меньше `min_free_bytes`, а выгружать нечего → внеочередная тревога.
+    pub disk_pressure: bool,
+}
+
+/// Итог применения плана.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RetentionReport {
+    pub mode: RetentionMode,
+    pub offloaded: Vec<PathBuf>,
+    pub pruned: Vec<PathBuf>,
+    /// M-38b (C-030 R1, escape-hatch аудит): пути сегментов, удалённых БЕЗ покрытия
+    /// чекпоинтом (override `allow_prune_without_checkpoint = true`). Каждый ОБЯЗАН быть
+    /// поимённо перечислен — иначе операторский override становится тихим: «freed N bytes»
+    /// в логе, а read-путь потерял историю, и этого нигде не видно. Сверяется с
+    /// `pruned` — при валидном покрытии должно быть пусто.
+    pub pruned_without_checkpoint_coverage: Vec<PathBuf>,
+    /// Сегменты, у которых сверка холодной копии НЕ прошла (остались горячими).
+    pub failed: Vec<(PathBuf, String)>,
+    pub freed_bytes: u64,
+}
+
+/// Построить план. `now_wall_ms` — снаружи (детерминизм, DESIGN §1).
+///
+/// Гарантии (RED `red_retention_operator.rs`):
+/// - АКТИВНЫЙ (последний) сегмент НИКОГДА не попадает в план — в него сейчас пишут;
+/// - `keep_min_segments` последних остаются горячими независимо от возраста;
+/// - legacy-сегмент без декларации в манифесте НЕ удаляется (нет эпохи → нет права);
+/// - план ДЕТЕРМИНИРОВАН: тот же `now_wall_ms` + та же политика + тот же каталог → тот же план.
+///
+/// Алгоритм:
+///   1. Обойти каталог, классифицировать каждый `*.jrnl`. На `Err` (foreign / corrupt /
+///      truncated) — синтезировать `SegmentInfo` для skipped (а не возвращать `Err`,
+///      иначе один чужой файл отменил бы весь план: оператор обязан узнать о нём,
+///      а не получать «ничего не планируется»);
+///   2. Активный = сегмент с МАКСИМАЛЬНЫМ индексом (писатель всегда дописывает
+///      в сегмент последнего индекса; см. `decide_open_segment`);
+///   3. Отобрать кандидатов: всё, что не активное, не foreign, и возраст ≥ `retain_days`;
+///   4. Из кандидатов исключить `keep_min_segments` последних (по индексу);
+///   5. `disk_pressure` = `free_bytes(dir) < policy.min_free_bytes`.
+pub fn retention_plan(
+    dir: impl AsRef<Path>,
+    policy: &RetentionPolicy,
+    now_wall_ms: i64,
+) -> io::Result<RetentionPlan> {
+    let dir = dir.as_ref();
+
+    // (1) Обход каталога: classify с обработкой foreign/corrupt как skipped.
+    let (classified, foreign_skipped) = enumerate_retention_segments(dir)?;
+
+    // (2) Активный сегмент = сегмент с МАКСИМАЛЬНЫМ индексом среди classified.
+    // Если classified пуст (всё foreign / каталог пуст) — активного нет; все foreign в skipped.
+    let active_index: Option<u32> = classified.iter().map(|s| s.index).max();
+
+    // M-38b: копия all_segs для плана (last_seq = next.first_seq - 1). Берём ДО move
+    // classified в for-loop ниже.
+    let mut segs_by_idx = classified.clone();
+    segs_by_idx.sort_by_key(|s| s.index);
+
+    let mut skipped: Vec<(SegmentInfo, String)> = Vec::new();
+    let mut candidates: Vec<SegmentInfo> = Vec::new();
+    if let Some(act_idx) = active_index {
+        for s in classified {
+            if s.index == act_idx {
+                skipped.push((s, "active segment (writer holds it open)".to_string()));
+            } else {
+                candidates.push(s);
+            }
+        }
+    } else {
+        // Никаких «своих» сегментов. Foreign остаются skipped (для оператора).
+    }
+    skipped.extend(foreign_skipped);
+
+    // (3) Возрастной фильтр: кандидаты старше retain_days.
+    // Возраст = now_wall_ms − ts_exch_ms первого события сегмента (fallback на
+    // header.created_wall_ms, если первый фрейм нечитаем). `segment_decision_ts` —
+    // ЕДИНЫЙ источник истины: используется И здесь для решения, И `print_plan`
+    // (journal-retention.rs) для отчёта — иначе отчёт может печатать значение,
+    // отличное от того, по которому реально принято решение (TD-051).
+    let cutoff_ms = i64::from(policy.retain_days) * 86_400_000;
+    let mut young_passed: Vec<SegmentInfo> = Vec::with_capacity(candidates.len());
+    for s in candidates {
+        let seg_ts = segment_decision_ts(&s);
+        let age_ms = now_wall_ms.saturating_sub(seg_ts);
+        if age_ms < cutoff_ms {
+            skipped.push((
+                s,
+                format!(
+                    "younger than retain_days: age={}ms < {}ms (seg_ts={})",
+                    age_ms, cutoff_ms, seg_ts
+                ),
+            ));
+        } else {
+            young_passed.push(s);
+        }
+    }
+
+    // (4) keep_min_segments: последние N (по индексу, отсортированы по возрастанию)
+    // из young_passed остаются горячими.
+    let keep_min = policy.keep_min_segments as usize;
+    let mut final_candidates: Vec<SegmentInfo>;
+    if young_passed.len() > keep_min {
+        let split = young_passed.len() - keep_min;
+        let (front, back) = young_passed.split_at(split);
+        final_candidates = front.to_vec();
+        for s in back {
+            skipped.push((s.clone(), "protected by keep_min_segments".to_string()));
+        }
+    } else {
+        // Все young_passed защищены keep_min (или keep_min=0, и тогда просто пусто).
+        for s in young_passed {
+            skipped.push((s, "protected by keep_min_segments".to_string()));
+        }
+        final_candidates = Vec::new();
+    }
+
+    // (5) M-38b (C-030 R1): СТРОГАЯ СВЯЗКА prune ↔ покрытие чекпоинтом.
+    //   `last_seq(seg) <= checkpoint_covered_through_seq` ⟺ «все события сегмента
+    //   свёрнуты чекпоинтом, read-путь их уже не прочтёт — prune безопасен».
+    //   `last_seq(seg) = next_seg.first_seq - 1` (если есть next), либо `None` для
+    //   активного. Без `next_seg` (активный) — `last_seq` неизвестен ⇒ консервативно
+    //   НЕ покрыт.
+    //
+    //   Разделение плана:
+    //   - covered (last_seq <= covered) → offload_and_prune;
+    //   - uncovered (last_seq > covered) → offload_only + skip-репорт с причиной
+    //     «нет покрытия чекпоинтом» (R1 идёт, локальная копия остаётся).
+    //   - allow_prune_without_checkpoint=true → uncovered тоже идёт в offload_and_prune,
+    //     но попадает в `pruned_without_checkpoint_coverage` в отчёте.
+    //
+    //   Нет артефакта покрытия (`None`) = fail-closed: ВСЕ непокрытые сегменты → skip,
+    //   даже при allow_prune_without_checkpoint=true (override без артефакта = бессмыслен).
+    //
+    //   D1 (rev3, MAJOR): раннее `offload_and_prune = Vec::new()` было НЕПЕРЕНЕСЕНИЕМ
+    //   кандидатов → retention не прунил НИКОГДА. Плюс гейт шёл по `segs_by_idx` (ВСЕ
+    //   сегменты включая активный), а не по `final_candidates` — активный сегмент попадал
+    //   в `offload_only` (копия в cold файла, в который пишут прямо сейчас). ИСПРАВЛЕНО:
+    //   гейт итерирует `final_candidates` (исключает активный и прошедшие фильтры);
+    //   `offload_and_prune` собирается ИЗ финальных кандидатов.
+    let covered = policy.checkpoint_covered_through_seq;
+    let override_enabled = policy.allow_prune_without_checkpoint;
+    let mut offload_and_prune: Vec<SegmentInfo> = Vec::new();
+    let mut offload_only: Vec<SegmentInfo> = Vec::new();
+    let mut pruned_uncovered: Vec<SegmentInfo> = Vec::new(); // для execute: аудит override
+    match covered {
+        Some(covered_seq) => {
+            // Идём по final_candidates (НЕ по segs_by_idx — активный сегмент и прочие
+            // отфильтрованные уже исключены выше шагами (2)–(4)).
+            let to_classify = std::mem::take(&mut final_candidates);
+            for s in to_classify {
+                // last_seq(s) = next.first_seq - 1 only when the next header is
+                // trustworthy. A legacy declaration synthesizes first_seq=0, so the
+                // candidate's own tail is the source of truth in that case.
+                let last_seq_opt = last_seq_for_segment(&s, &segs_by_idx)?;
+                let covered_seg = match last_seq_opt {
+                    Some(ls) => ls <= covered_seq,
+                    None => false, // активный сегмент — last_seq неизвестен ⇒ не покрыт
+                };
+                if covered_seg {
+                    offload_and_prune.push(s);
+                } else if override_enabled {
+                    // Override разрешает prune без покрытия. Сегмент остаётся prunable,
+                    // пометка попадёт в `pruned_without_checkpoint_coverage` в execute.
+                    pruned_uncovered.push(s.clone());
+                    offload_and_prune.push(s);
+                } else {
+                    // Без override — снимаем из prune. Бэкап идёт всегда (offload_only),
+                    // локальная копия остаётся до прогресса чекпоинтера.
+                    offload_only.push(s.clone());
+                    skipped.push((
+                        s,
+                        format!(
+                            "checkpoint coverage not proven: last_seq > {} \
+                             (covered_through_seq); offload_only — локальная копия \
+                             остаётся до прогресса чекпоинтера",
+                            covered_seq
+                        ),
+                    ));
+                }
+            }
+        }
+        None => {
+            // Нет артефакта покрытия.
+            if override_enabled {
+                // Override без артефакта: согласно architect'у (rev3 D1.2) hatch существует
+                // именно для этого случая («override без артефакта = бессмыслен» —
+                // неверно; смысл hatch'а — «чекпоинтер не развёрнут / сломан»). Все
+                // кандидаты идут в offload_and_prune; каждый без покрытия попадёт в
+                // `pruned_without_checkpoint_coverage` в execute (аудит-трейл).
+                let to_take = std::mem::take(&mut final_candidates);
+                for s in to_take {
+                    pruned_uncovered.push(s.clone());
+                    offload_and_prune.push(s);
+                }
+            } else {
+                // True fail-closed: все потенциальные кандидаты на prune НЕ покрыты.
+                // Бэкап идёт (offload_only), локальная копия остаётся, skip-репорт.
+                for s in final_candidates.drain(..) {
+                    offload_only.push(s.clone());
+                    skipped.push((
+                        s,
+                        "checkpoint coverage artifact absent (fail-closed): бэкап идёт, \
+                         локальная копия остаётся"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+    }
+    // `pruned_uncovered` сейчас хранится локально — execute пересчитывает покрытие
+    // по тому же алгоритму и заполняет `pruned_without_checkpoint_coverage` в отчёте.
+    // Хранение рядом с final_candidates нужно только на случай отладки; функция
+    // `retention_plan` возвращает план, не отчёт. Подавляем dead_code-warning: фактически
+    // значение читается через `plan.offload_and_prune` в execute, где та же классификация
+    // перевычисляется детерминированно.
+    let _ = pruned_uncovered;
+
+    // (6) disk_pressure: free_bytes < min_free_bytes.
+    let free = free_bytes_at(dir)?;
+    let disk_pressure = free < policy.min_free_bytes;
+
+    Ok(RetentionPlan {
+        offload_and_prune,
+        offload_only,
+        skipped,
+        disk_pressure,
+    })
+}
+
+type RetentionEnumeration = (Vec<SegmentInfo>, Vec<(SegmentInfo, String)>);
+
+fn enumerate_retention_segments(dir: &Path) -> io::Result<RetentionEnumeration> {
+    let mut ops: SegmentOps = 0;
+    let manifest = load_manifest(dir, &mut ops)?;
+    let mut classified = Vec::new();
+    let mut foreign_skipped = Vec::new();
+
+    for path in dedup_indexed_paths(dir, &mut ops)? {
+        match classify_segment(&path, &manifest, &mut ops) {
+            Ok(info) => classified.push(info),
+            Err(e) => {
+                // Foreign / corrupt / truncated. Синтезируем info для skipped — оператор
+                // видит файл и причину, а не «план не построен, проверяй вручную».
+                let reason = classify_failure_reason(&e);
+                let file_name = path
+                    .file_name()
+                    .and_then(OsStr::to_str)
+                    .unwrap_or("<non-utf8>")
+                    .to_string();
+                let index = parse_segment_index_any(&file_name).unwrap_or(u32::MAX);
+                let size_bytes = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                let synthetic = SegmentInfo {
+                    path,
+                    index,
+                    header: SegmentHeader {
+                        schema_version: 0, // sentinel: неизвестно (нет магии / нет заголовка)
+                        source: DataSource::Synthetic,
+                        provenance: format!("<{reason}>"),
+                        epoch_id: String::new(),
+                        created_wall_ms: 0,
+                        first_seq: 0,
+                    },
+                    size_bytes,
+                };
+                foreign_skipped.push((synthetic, reason));
+            }
+        }
+    }
+
+    // M-49 (TD-050): `dedup_indexed_paths` молча пропускает `*.jrnl`/`*.jrnl.zst`-файлы,
+    // чьё имя НЕ распознаётся как `segment-NNNNNNNN.jrnl[.zst]` (опечатка, обрыв
+    // копирования с довеском в имени, чужой файл под похожим суффиксом) — они не попадают
+    // в `dedup_indexed_paths(dir)?` вообще (нет индекса → `continue` внутри неё), а значит
+    // раньше выпадали из операторского отчёта СОВСЕМ: оператор не узнавал об их
+    // существовании ниоткуда. Именуем их поимённо в `skipped`, той же дисциплиной, что
+    // classify-отказы выше (принцип M-38b: обход/аномалия обязана быть НАЗВАНА).
+    // Здесь порядок обхода каталога не имеет значения — записи просто добавляются в
+    // foreign_skipped; наружу протекает только ПОСЛЕ сортировки по (index, path) ниже (det_25).
+    // DET-OK: итоговый порядок foreign_skipped задаётся sort_by((index, path)), не read_dir.
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let name = match path.file_name().and_then(OsStr::to_str) {
+            Some(s) => s,
+            None => continue,
+        };
+        if !name.ends_with(".jrnl") && !is_compacted_name(name) {
+            continue;
+        }
+        if parse_segment_index_any(name).is_some() {
+            continue; // штатный паттерн — уже обработан выше через dedup_indexed_paths
+        }
+        let size_bytes = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        let synthetic = SegmentInfo {
+            path,
+            index: u32::MAX,
+            header: SegmentHeader {
+                schema_version: 0, // sentinel: неизвестно (имя не распознано)
+                source: DataSource::Synthetic,
+                provenance: "<unrecognized segment file name>".to_string(),
+                epoch_id: String::new(),
+                created_wall_ms: 0,
+                first_seq: 0,
+            },
+            size_bytes,
+        };
+        foreign_skipped.push((
+            synthetic,
+            "unrecognized segment file name (expected segment-NNNNNNNN.jrnl[.zst])".to_string(),
+        ));
+    }
+
+    // Стабильная сортировка по индексу — критична для воспроизводимости плана (R6)
+    // и для определения «последних N» в keep_min.
+    classified.sort_by_key(|s| s.index);
+    // DET-I-3 (det_25): группа с нераспознанным именем синтезирует ОДИНАКОВЫЙ index
+    // (u32::MAX) — сортировка ТОЛЬКО по index её не упорядочивает; стабильность
+    // sort_by_key тогда сохраняет порядок fs::read_dir (порядок ФС), то есть план
+    // недетерминирован между запусками. Вторичный ключ — путь (тотальный порядок,
+    // не зависящий от ФС) — разрешает коллизию однозначно.
+    foreign_skipped
+        .sort_by(|(a, _), (b, _)| a.index.cmp(&b.index).then_with(|| a.path.cmp(&b.path)));
+    Ok((classified, foreign_skipped))
+}
+
+/// Классифицировать причину отказа `classify_segment` в человеко-читаемую строку.
+fn classify_failure_reason(e: &io::Error) -> String {
+    if is_foreign_segment(e) {
+        "undeclared legacy: no magic and no journal.legacy.json entry".to_string()
+    } else {
+        format!("classify error: {e}")
+    }
+}
+
+/// Прочитать timestamp (ms) ДАННЫХ первого события сегмента: для MD — `ts_exch_ms`,
+/// для `Sys` — `ts_wall_ms` (нет биржевого времени).
+///
+/// Используется `retention_plan` для возрастного фильтра. Семантика:
+/// "насколько стары ДАННЫЕ в сегменте относительно `now_wall_ms`" — измеряется по
+/// биржевому времени событий, а не по моменту записи в журнал (`created_wall_ms`
+/// сегмента ≈ wall clock при append). Это позволяет тестам с фиксированным
+/// `now_wall_ms` получать детерминированный план: биржевые timestamps событий задаются
+/// явно (`trade(i)` пишет `ts_exch_ms = T0 + i`), и план строится по ним, а не по
+/// «сейчас на стеных часах».
+///
+/// На любую ошибку (нет файла, битый заголовок, нет событий) — `Ok(None)`:
+/// вызывающий использует fallback (header.created_wall_ms).
+///
+/// M-49 (TD-051): значение, по которому `retention_plan` РЕАЛЬНО принимает решение о
+/// возрасте сегмента — `first_event_data_ts(path)`, с fallback на `header.created_wall_ms`,
+/// если первый фрейм нечитаем. ЕДИНЫЙ источник истины для `retention_plan` (§3 выше) И
+/// операторского отчёта (`print_plan` в `journal-retention.rs`) — раньше отчёт печатал
+/// `header.created_wall_ms` под подписью `ts_exch/created=`, будто это была основа
+/// решения, хотя решение принималось по данным события (несоответствие TD-051).
+pub fn segment_decision_ts(s: &SegmentInfo) -> i64 {
+    first_event_data_ts(&s.path)
+        .ok()
+        .flatten()
+        .unwrap_or(s.header.created_wall_ms)
+}
+
+fn first_event_data_ts(path: &Path) -> io::Result<Option<i64>> {
+    let is_zst = path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .is_some_and(is_compacted_name);
+    if is_zst {
+        let f = match File::open(path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let mut reader = open_compacted_reader(f)?;
+        // Сжатый сегмент нельзя Seek'нуть: читаем заголовок и первый frame вперёд.
+        if skip_v2_header_forward(&mut reader).is_err() {
+            return Ok(None);
+        }
+        let Some(ev) = read_event_frame(&mut reader)? else {
+            return Ok(None);
+        };
+        return Ok(Some(event_data_ts(&ev)));
+    }
+
+    let mut f = match File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    // Пропускаем magic+header (для v2) или не делаем ничего (для legacy).
+    // Битый заголовок → Ok(None): fallback на created_wall_ms вызывающего.
+    if read_v2_header_and_skip(&mut f).is_err() {
+        return Ok(None);
+    }
+    let mut reader = BufReader::with_capacity(64 * 1024, f);
+    let Some(ev) = read_event_frame(&mut reader)? else {
+        return Ok(None);
+    };
+    Ok(Some(event_data_ts(&ev)))
+}
+
+fn event_data_ts(ev: &Event) -> i64 {
+    match &ev.kind {
+        EventKind::Sys(_) => ev.ts_wall_ms,
+        EventKind::Md(md) => match &md.payload {
+            MdPayload::Trade { ts_exch_ms, .. }
+            | MdPayload::L2Snapshot { ts_exch_ms, .. }
+            | MdPayload::Funding { ts_exch_ms, .. }
+            | MdPayload::OpenInterest { ts_exch_ms, .. }
+            | MdPayload::Liquidation { ts_exch_ms, .. }
+            | MdPayload::MarginRate { ts_exch_ms, .. }
+            | MdPayload::L2Delta { ts_exch_ms, .. }
+            | MdPayload::MarginInventory { ts_exch_ms, .. } => *ts_exch_ms,
+        },
+    }
+}
+
+fn last_seq_for_segment(
+    segment: &SegmentInfo,
+    sorted_segments: &[SegmentInfo],
+) -> io::Result<Option<u64>> {
+    let Some(pos) = sorted_segments
+        .iter()
+        .position(|candidate| candidate.index == segment.index)
+    else {
+        return Ok(None);
+    };
+    let Some(next) = sorted_segments.get(pos + 1) else {
+        return Ok(None);
+    };
+
+    if next.header.schema_version != contracts::SCHEMA_VERSION_PRE_HEADER {
+        return Ok(Some(next.header.first_seq.saturating_sub(1)));
+    }
+
+    // A legacy declaration has a synthetic first_seq. Establish the fact by reading
+    // the candidate's last event instead of trusting that synthetic zero.
+    tail_last_seq_of(&segment.path)
+}
+
+/// Выполнить план. В `DryRun` НИ ОДИН байт не копируется и не удаляется — только отчёт.
+/// В `Apply`: для каждого сегмента сперва `verify_cold_copy` (sha256-сверка), и ТОЛЬКО
+/// полученный `ColdCopyProof` даёт право на `prune_segment`. Сбой сверки → сегмент остаётся
+/// горячим, попадает в `failed`, exit-код ненулевой (оператор обязан узнать).
+///
+/// Параметр `dir` нужен для контекста (например, чтобы убедиться, что путь сегмента
+/// лежит под `dir` — анти-паттерн «символическая ссылка ведёт наружу»). Сейчас
+/// дополнительная валидация намеренно минимальна: путь сегмента уже проверен
+/// `classify_segment`, план построен из легитимных сегментов каталога.
+pub fn retention_execute(
+    _dir: impl AsRef<Path>,
+    plan: &RetentionPlan,
+    policy: &RetentionPolicy,
+    mode: RetentionMode,
+) -> io::Result<RetentionReport> {
+    match mode {
+        RetentionMode::DryRun => {
+            // НОЛЬ побочных эффектов. Никакого создания каталогов, никакого хеширования,
+            // никакого удаления — даже create_dir_all здесь не зовём (это было бы
+            // побочным эффектом на файловой системе: см. RED `r2_dry_run_touches_nothing`).
+            Ok(RetentionReport {
+                mode: RetentionMode::DryRun,
+                offloaded: Vec::new(),
+                pruned: Vec::new(),
+                pruned_without_checkpoint_coverage: Vec::new(),
+                failed: Vec::new(),
+                freed_bytes: 0,
+            })
+        }
+        RetentionMode::Apply => {
+            let mut offloaded: Vec<PathBuf> = Vec::new();
+            let mut pruned: Vec<PathBuf> = Vec::new();
+            let mut pruned_without_checkpoint_coverage: Vec<PathBuf> = Vec::new();
+            let mut failed: Vec<(PathBuf, String)> = Vec::new();
+            let mut freed_bytes: u64 = 0;
+
+            // M-38b (C-030 R1): для каждого сегмента из offload_and_prune определяем,
+            // был ли он uncovered (override). Пересчитываем last_seq тем же способом,
+            // что и retention_plan, чтобы корректно классифицировать.
+            let covered = policy.checkpoint_covered_through_seq;
+            let (all_segs_for_check, _) = enumerate_retention_segments(_dir.as_ref())?;
+            let mut sorted_segs = all_segs_for_check.clone();
+            sorted_segs.sort_by_key(|s| s.index);
+
+            for seg in &plan.offload_and_prune {
+                // Классифицируем: покрыт или нет (для override-аудита).
+                // The same factual rule as retention_plan: do not use a synthetic
+                // legacy first_seq as a coverage boundary.
+                let last_seq_opt = last_seq_for_segment(seg, &sorted_segs)?;
+                let is_uncovered = match (last_seq_opt, covered) {
+                    (Some(ls), Some(c)) => ls > c,
+                    _ => true, // активный или нет артефакта покрытия = uncovered
+                };
+                // (1) verify_cold_copy: sha256-сверка src == dst.
+                match verify_cold_copy(seg, &policy.cold_root) {
+                    Ok(proof) => {
+                        // (2) ТИПОВОЙ БАРЬЕР: proof получен — можно prune.
+                        // ColdCopyProof сконструировать извне невозможно (поле приватное).
+                        match prune_segment(seg, proof) {
+                            Ok(()) => {
+                                offloaded.push(seg.path.clone());
+                                pruned.push(seg.path.clone());
+                                if is_uncovered {
+                                    pruned_without_checkpoint_coverage.push(seg.path.clone());
+                                }
+                                freed_bytes += seg.size_bytes;
+                            }
+                            Err(e) => {
+                                failed.push((
+                                    seg.path.clone(),
+                                    format!("prune failed after verified cold copy: {e}"),
+                                ));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        // Сверка провалилась → сегмент ОСТАЁТСЯ горячим (R3). Ошибка
+                        // попадает в `failed` — оператор узнает из отчёта.
+                        failed.push((
+                            seg.path.clone(),
+                            format!("cold copy verification failed: {e}"),
+                        ));
+                    }
+                }
+            }
+
+            // M-38b (C-030 R1): `offload_only` сегменты тоже ОБЯЗАНЫ быть скопированы
+            // в cold (R1 — экзистенциальный риск docs/08) — просто БЕЗ локального prune.
+            // Сверка нужна та же: гарантия читаемости холодной копии. Сбой сверки →
+            // сегмент остаётся горячим + попадает в `failed`.
+            for seg in &plan.offload_only {
+                match verify_cold_copy(seg, &policy.cold_root) {
+                    Ok(proof) => {
+                        // ColdCopyProof даёт право на запись (но не на удаление). `_proof`
+                        // гарантирует, что холодная копия сверялась.
+                        let _ = proof;
+                        offloaded.push(seg.path.clone());
+                    }
+                    Err(e) => {
+                        failed.push((
+                            seg.path.clone(),
+                            format!(
+                                "offload_only: cold copy verification failed (R1 не сделан): {e}"
+                            ),
+                        ));
+                    }
+                }
+            }
+
+            Ok(RetentionReport {
+                mode: RetentionMode::Apply,
+                offloaded,
+                pruned,
+                pruned_without_checkpoint_coverage,
+                failed,
+                freed_bytes,
+            })
+        }
+        RetentionMode::Compact => {
+            // D-COMP-3: компакция идёт через ОТДЕЛЬНЫЙ API (`compact_closed_segments`),
+            // НЕ через `retention_plan`/`retention_execute`. Сюда мы попадаем только если
+            // бинарь по ошибке перенаправил Compact в этот код — отдаём пустой отчёт
+            // и оставляем main'у свободу вызвать `compact_closed_segments` напрямую
+            // (это и есть нормальный путь).
+            Ok(RetentionReport {
+                mode: RetentionMode::Compact,
+                offloaded: Vec::new(),
+                pruned: Vec::new(),
+                pruned_without_checkpoint_coverage: Vec::new(),
+                failed: Vec::new(),
+                freed_bytes: 0,
+            })
+        }
+    }
+}
+
+// ── КОМПАКЦИЯ ЗАКРЫТЫХ СЕГМЕНТОВ (M-08 task 15, TD-022) ───────────────────────────────
+//
+// Замер на боевых данных (VPS, 2026-07-14): рост журнала **8.83 GB/сут** (в документах
+// значилось 2.8 — цифра до включения фьючерсов в M-06; решения принимались по устаревшему
+// числу). Свободно 118.7 GB, disk-guard при 10 GiB ⇒ **12 дней**, а не 40.
+//
+// zstd на боевом сегменте: **-1 → 4.8×, -3 → 9.1×, -9 → 12.6×**. При -3 рост на диске падает
+// с 8.83 до ~1 GB/сут ⇒ запас 12 дней → **100+ дней**; Storage Box 1 TB: 4 месяца → **~2.5 года**.
+//
+// Почему это безопасно: **закрытый сегмент неизменяем** (recorder пишет ТОЛЬКО в активный).
+// Компакция не трогает горячий путь записи и не может оборвать сбор.
+//
+// Каркас — architect; реализация — engine-dev.
+
+/// Расширение сжатого сегмента: `segment-NNNNNNNN.jrnl.zst`.
+pub const COMPACTED_SUFFIX: &str = ".zst";
+
+/// Уровень zstd по умолчанию: 9.1× при вменяемом CPU (замер на боевом сегменте).
+pub const DEFAULT_COMPACT_LEVEL: i32 = 3;
+
+/// Итог компакции одного сегмента.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactionReport {
+    pub source: PathBuf,
+    pub compacted: PathBuf,
+    pub bytes_before: u64,
+    pub bytes_after: u64,
+}
+
+/// Сжать ЗАКРЫТЫЙ сегмент. Порядок обязателен (RED `red_compaction.rs`):
+///
+/// 1. **Активный сегмент НИКОГДА не сжимается** — в него пишут прямо сейчас (`Err`).
+/// 2. **САМОИЗЛЕЧЕНИЕ КРАХ-ОКНА (rev 9, D-COMP-2):** если `.zst` уже на диске
+///    (предыдущий вызов умер между `rename` и `remove_file(src)`) — НЕ рапортуем
+///    «успех, мы тут не нужны». Сверим sha256 существующего `.zst` (распаковка →
+///    `Sha256::update`) с sha256 оригинала:
+///    - совпало → оригинал удалить (доделать прошлую работу; именно это и было
+///      пропущено в старой ветке `if dst.exists() { return Ok(..) }`); возврат
+///      `CompactionReport` (самоизлечение);
+///    - НЕ совпало → `.zst` удалить, оригинал оставить ГОРЯЧИМ, `Err(InvalidData)`
+///      (принцип `ColdCopyProof`: удалить можно лишь то, чья копия ДОКАЗАНО
+///      читается — битая копия не даёт такого права).
+/// 3. Пишем во ВРЕМЕННЫЙ файл `*.jrnl.zst.tmp` (падение на середине → оригинал цел,
+///    мусор отбрасывается).
+/// 4. **Верифицируем ДО удаления:** распаковываем .tmp и сверяем sha256 с оригиналом.
+///    Расхождение → `Err`, оригинал остаётся, .tmp удаляется. Данные незаменимы —
+///    «сжали и удалили, а там мусор» недопустимо.
+/// 5. `fsync` + атомарный `rename` .tmp → .zst, и только ПОТОМ удаляем оригинал.
+///
+/// Это тот же принцип, что `ColdCopyProof`: удалить можно лишь то, чья копия ДОКАЗАНО читается.
+pub fn compact_segment(seg: &SegmentInfo, level: i32) -> io::Result<CompactionReport> {
+    let src = &seg.path;
+    // (1) Активный сегмент — это тот, у кого индекс МАКСИМАЛЬНЫЙ в каталоге (recorder
+    // дописывает ТОЛЬКО в последний сегмент; см. `decide_open_segment`). Если это он —
+    // отказываем. Никаких «почти активных», никакого TTL: единственный определитель —
+    // позиция в каталоге. Иначе сожмём сегмент, в который пишут, и запись начнёт
+    // дописывать в .zst, что:
+    //   - порушит wire-format (recorder пишет v2-фреймы, не zstd-поток);
+    //   - оставит .zst «недописанным» (zstd не предупредит, что поток обрезан);
+    //   - при следующем open'е recorder откроет новый сегмент → потеря seq-границы.
+    let dir = src
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "segment path has no parent"))?;
+    let latest_idx = latest_segment_index(dir)?;
+    if Some(seg.index) == latest_idx {
+        return Err(io::Error::other(format!(
+            "cannot compact active segment segment-{:08}.jrnl (writer holds it open)",
+            seg.index
+        )));
+    }
+
+    // (1.5) M-08 task 17 (D-COMP-4, CRITICAL, §8): компакция НИКОГДА не трогает legacy/
+    // foreign сегменты. На проде `segment-00000000.jrnl` — 15 GB LEGACY (без v2-магии,
+    // задекларирован в `journal.legacy.json`, невосполнимая история). Предыдущая
+    // реализация его СЖИМАЛА: sha256 round-trip проходит → оригинал удаляется → обратное
+    // чтение `.zst` идёт через `skip_v2_header_forward`, который ТРЕБУЕТ v2-магию
+    // («legacy под zstd не бывает») → `CorruptHeader` → `segments()`/`list_segments`/
+    // `stream` падают на первом классифае ⇒ ВЕСЬ ЖУРНАЛ НЕЧИТАЕМ, 15 GB стёрты.
+    //
+    // Конструктивный барьер (тот же принцип, что «активный не сжимаем»): ПЕРВЫЕ байты
+    // файла ОБЯЗАНЫ быть `SEGMENT_MAGIC` (HFTJRN02), иначе — `Err` ДО любой мутации
+    // (rename / remove / create `.tmp`/`.zst`). Проверяется существующим хелпером
+    // `read_magic_prefix`, который возвращает `Ok(None)` для файла короче магии
+    // (на диске ничего разумного быть не может) и `Ok(Some(buf))` иначе.
+    //
+    // Legacy читается как есть (через манифест + fingerprint — см. `classify_segment`),
+    // но сжатие legacy архитектурно запрещено: обратного декодера для legacy-в-zstd
+    // не существует, и не должен существовать (CT-RFC-02 rev 2 fail-closed находка C2).
+    match read_magic_prefix(src, &mut 0)? {
+        Some(m) if m == SEGMENT_MAGIC => {} // ok: v2-сегмент, можно сжимать
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "compact_segment: legacy/foreign segment cannot be compacted (no v2 magic; \
+                     legacy читается только как есть, сжатие архитектурно запрещено, \
+                     D-COMP-4): {}",
+                    src.display()
+                ),
+            ));
+        }
+    }
+
+    // (2) Имена .tmp / .zst строятся из базовой части (`segment-NN.jrnl` + суффикс).
+    let base = src
+        .file_name()
+        .and_then(OsStr::to_str)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "non-utf8 file name"))?;
+    if !base.ends_with(".jrnl") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("compact_segment: ожидался .jrnl, получили `{base}`"),
+        ));
+    }
+    let dst = src.with_file_name(format!("{base}{}", COMPACTED_SUFFIX)); // .jrnl.zst
+    let tmp = src.with_file_name(format!("{base}{}.tmp", COMPACTED_SUFFIX)); // .jrnl.zst.tmp
+
+    if dst.exists() {
+        // (2) D-COMP-2 — САМОИЗЛЕЧЕНИЕ КРАХ-ОКНА. Прошлая редакция рапортовала
+        // `if dst.exists() { return Ok(...) }`, оставляя оригинал-сироту навсегда
+        // (3000 событий читались как 3172, DET-I-1 нарушен, фикс —
+        // неудаляемый дубликат). Теперь сверяем sha256 существующего `.zst`
+        // с sha256 оригинала; только совпадение даёт право удалить оригинал.
+        let orig_sha = sha256_file(src)?;
+        let verify_sha = sha256_decompressed(&dst).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "self-heal: existing .zst не читается ({e}); оригинал {src:?} оставлен \
+                     ГОРЯЧИМ, .zst НЕ удалён"
+                ),
+            )
+        })?;
+        if verify_sha != orig_sha {
+            // Битый .zst (FUSE-баг, частичная перезапись и пр.). Удаляем .zst,
+            // оригинал оставляем ГОРЯЧИМ — данные не теряются; следующий компакт-
+            // прогон перепишет `.zst` с нуля уже из верифицированного источника.
+            let _ = fs::remove_file(&dst);
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "self-heal: existing .zst sha256 mismatch; оригинал {src:?} оставлен \
+                     ГОРЯЧИМ, .zst удалён. orig={orig_sha} decompressed=.zst={verify_sha}"
+                ),
+            ));
+        }
+        // Совпало → безопасно доделать прошлую работу (удалить оригинал).
+        fs::remove_file(src)?;
+        let bytes_after = fs::metadata(&dst).map(|m| m.len()).unwrap_or(0);
+        let bytes_before = fs::metadata(src).map(|m| m.len()).unwrap_or(seg.size_bytes);
+        return Ok(CompactionReport {
+            source: src.clone(),
+            compacted: dst.clone(),
+            bytes_before,
+            bytes_after,
+        });
+    }
+
+    // (3) Хеш оригинала ДО любых мутаций — для сверки после сжатия.
+    let orig_sha = sha256_file(src)?;
+    let orig_size = fs::metadata(src)?.len();
+
+    // (4) Сжатие в .tmp. При ЛЮБОЙ ошибке (I/O, zstd) — откат, оригинал цел.
+    if let Err(e) = compress_to_tmp(src, &tmp, level) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+
+    // (5) Верификация: распаковываем .tmp, считаем sha256, сравниваем с оригиналом.
+    // Данные незаменимы: «сжали и удалили, а там мусор» недопустимо.
+    let verify_sha = match sha256_decompressed(&tmp) {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = fs::remove_file(&tmp);
+            return Err(e);
+        }
+    };
+    if verify_sha != orig_sha {
+        let _ = fs::remove_file(&tmp);
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "compaction sha256 mismatch: orig={orig_sha} decompressed={verify_sha} \
+                 (сегмент НЕ тронут — данные не удалены; .tmp удалён)"
+            ),
+        ));
+    }
+
+    // (6) fsync .tmp + атомарный rename → .zst.
+    {
+        let f = File::open(&tmp)?;
+        f.sync_all()?;
+    }
+    if let Err(e) = fs::rename(&tmp, &dst) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+
+    // (7) Только теперь удаляем оригинал. Между шагом 6 и 7 на диске лежат ОБА файла:
+    // оригинал и .zst (rename не удаляет src). На короткий миг место вырастает; для
+    // прод-замера это <1 GiB × 1 = безопасно (минуты до окончания операции).
+    fs::remove_file(src)?;
+
+    let compacted_size = fs::metadata(&dst).map(|m| m.len()).unwrap_or(0);
+    Ok(CompactionReport {
+        source: src.clone(),
+        compacted: dst,
+        bytes_before: orig_size,
+        bytes_after: compacted_size,
+    })
+}
+
+/// Сжать ВСЕ закрытые сегменты старше `keep_raw` последних. Активный и `keep_raw` самых
+/// свежих НЕ трогаем: свежие читаются чаще, несжатый доступ дешевле (особенно для
+/// debug-инструментов и bands-дампа).
+///
+/// Алгоритм:
+///   1. Обойти каталог через `segments()` (включая .zst).
+///   2. Определить активный = с максимальным индексом.
+///   3. Отсортировать по индексу, отбросить активный + последние `keep_raw`.
+///   4. На каждом из оставшихся вызвать `compact_segment`.
+pub fn compact_closed_segments(
+    dir: impl AsRef<Path>,
+    keep_raw: u32,
+    level: i32,
+) -> io::Result<Vec<CompactionReport>> {
+    let dir = dir.as_ref();
+    let all = segments(dir)?;
+    if all.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Активный = сегмент с МАКСИМАЛЬНЫМ индексом. Сегменты с .jrnl.zst УЖЕ сжаты
+    // (повторно не сжимаем: `compact_segment` идемпотентен, но фильтруем заранее —
+    // экономим sha256/распаковку).
+    let active_idx = all.iter().map(|s| s.index).max();
+    let mut closed: Vec<&SegmentInfo> = all
+        .iter()
+        .filter(|s| Some(s.index) != active_idx)
+        .filter(|s| {
+            !s.path
+                .file_name()
+                .and_then(OsStr::to_str)
+                .is_some_and(is_compacted_name)
+        })
+        .collect();
+    // Последние `keep_raw` (по индексу, ASC) — защищены.
+    closed.sort_by_key(|s| s.index);
+    let keep_raw = keep_raw as usize;
+    let split = closed.len().saturating_sub(keep_raw);
+    let to_compact: Vec<&SegmentInfo> = closed[..split].to_vec();
+
+    let mut reports = Vec::with_capacity(to_compact.len());
+    for s in to_compact {
+        match compact_segment(s, level) {
+            Ok(r) => reports.push(r),
+            // D-COMP-4: legacy/foreign сегменты пропускаются МОЛЧА (Err → в failed, не трогаем).
+            // Иначе на проде (где legacy-0 задекларирован) первая же попытка сжатия
+            // валила бы задание с exit=2 и поднимала ложный алерт «raw+.zst конфликт»,
+            // хотя данные не пострадали. Идентифицируем по единственному маркеру из
+            // `compact_segment` (других источников этой подстроки в err нет):
+            Err(e)
+                if e.to_string()
+                    .contains("legacy/foreign segment cannot be compacted") =>
+            {
+                // Намеренно тихо: (а) compact-вызов на legacy-сегменте — штатная
+                // ситуация прод-раскладки, не сбой; (б) библиотека не пишет в stderr
+                // (это прерогатива бинаря и оператора); (в) сегмент остаётся
+                // читаемым через `list_segments`/`stream` — оператор видит его
+                // статус иначе (legacy-сегмент в выводе stream/heartbeat/storage_status).
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(reports)
+}
+
+// ── Внутренние helpers компакции ────────────────────────────────────────────────────
+
+/// Сжать `src` → `tmp` через zstd с указанным уровнем. Не fsync, не удаляет src.
+/// На ошибке `tmp` может быть частично записан — вызывающий удаляет.
+fn compress_to_tmp(src: &Path, tmp: &Path, level: i32) -> io::Result<()> {
+    let mut src_f = File::open(src)?;
+    let tmp_f = File::create(tmp)?;
+    // zstd::Encoder оборачивает Write; при drop() finish() делается автоматически.
+    let mut encoder = zstd::Encoder::new(tmp_f, level)?;
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = src_f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        encoder.write_all(&buf[..n])?;
+    }
+    encoder.finish()?;
+    Ok(())
+}
+
+/// sha256 распакованного потока из .zst файла. Используется для верификации, что
+/// сжатие/распаковка — round-trip с потерей нулевых байт (для zstd это гарантия формата,
+/// но в коде могли быть баги; сверяем).
+fn sha256_decompressed(path: &Path) -> io::Result<String> {
+    let f = File::open(path)?;
+    let decoder = open_compacted_reader(f)?;
+    let mut reader = BufReader::with_capacity(64 * 1024, decoder);
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("sha256:{:x}", hasher.finalize()))
+}
