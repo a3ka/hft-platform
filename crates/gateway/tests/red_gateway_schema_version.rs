@@ -70,7 +70,7 @@ use journal::{EpochFilter, Journal, WriterConfig};
 /// последнего события». Форма `DepthRow` не меняется, меняется СМЫСЛ чисел — тот же класс,
 /// что M-36 (VWAP 5→6). Bump здесь ЕДИНСТВЕННЫЙ рычаг, отвергающий чекпоинт со старым
 /// смыслом (`read_and_validate` шаг 3, `crates/gateway/src/lib.rs:2901-2904`).
-const EXPECTED_SCHEMA_VERSION: u32 = 9;
+const EXPECTED_SCHEMA_VERSION: u32 = 10;
 
 fn cfg() -> WriterConfig {
     WriterConfig {
@@ -123,10 +123,12 @@ fn sel() -> Selector {
 fn schema_version_constant_matches_expected() {
     assert_eq!(
         GATEWAY_SCHEMA_VERSION, EXPECTED_SCHEMA_VERSION,
-        "GATEWAY_SCHEMA_VERSION обязан быть {EXPECTED_SCHEMA_VERSION} (M-68: смена СЕМАНТИКИ \
-         депт-серии — была «глубина на момент последнего снимка», стала «на момент последнего \
-         события»; `П-014` п.3, прецедент VB-I-6. Полная история значений — чейнджлог \
-         константы). Текущее {GATEWAY_SCHEMA_VERSION} → bump не сделан"
+        "GATEWAY_SCHEMA_VERSION обязан быть {EXPECTED_SCHEMA_VERSION} (M-70: смена ФОРМЫ \
+         выдачи — `DepthRow` получил параллельный `series_provenance`, метка достоверности \
+         переехала со СТРОКИ на ТОЧКУ, `TD-159`; основание двойное — `VB-I-4` «форма меняется \
+         только с бампом» и `05-contract-layer.md` §2 «формы кокпита меняются аддитивно, с \
+         бампом». Предыдущее значение 9 внесено M-68 за смену СЕМАНТИКИ депт-серии. Полная \
+         история — чейнджлог константы). Текущее {GATEWAY_SCHEMA_VERSION} → bump не сделан"
     );
 }
 

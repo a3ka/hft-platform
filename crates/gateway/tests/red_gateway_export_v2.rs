@@ -123,12 +123,30 @@ fn deep_band_carries_provenance() {
     for row in &snap.series.depth_series {
         if row.band_pct_e8 >= deep_e8 {
             saw_deep = true;
-            let prov = row.depth_band_provenance.as_deref().unwrap_or("");
+            // ФОРМА СМЕНИЛАСЬ (`M-70` задача 4): метка живёт в ТОЧКЕ, а не на строке.
+            // Требование `GW-I-6` УСИЛИВАЕТСЯ, а не ослабляется: раньше хватало одной метки
+            // на весь ряд, теперь КАЖДАЯ точка глубокой полосы обязана нести свою.
             assert!(
-                !prov.is_empty(),
-                "GW-I-6: полоса {}e-8 глубже 1.3% ОБЯЗАНА нести depth_band_provenance",
+                !row.series.is_empty(),
+                "GW-I-6: глубокая полоса {}e-8 без единой точки — проверять провенанс не на чем",
                 row.band_pct_e8
             );
+            assert_eq!(
+                row.series.len(),
+                row.series_provenance.len(),
+                "GW-I-6/DB-I-4c: длины `series` и `series_provenance` разошлись ({} против \
+                 {}) — метка i-й точки описывала бы ДРУГУЮ точку",
+                row.series.len(),
+                row.series_provenance.len()
+            );
+            for (i, prov) in row.series_provenance.iter().enumerate() {
+                assert!(
+                    prov.as_deref().is_some_and(|p| !p.is_empty()),
+                    "GW-I-6: точка t={} полосы {}e-8 глубже 1.3% ОБЯЗАНА нести провенанс",
+                    row.series[i].0,
+                    row.band_pct_e8
+                );
+            }
         }
     }
     assert!(

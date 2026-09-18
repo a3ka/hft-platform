@@ -102,6 +102,52 @@ fn compose_command_args(service: &str) -> Vec<String> {
     out
 }
 
+/// **Дефолт переменной из `environment:`-блока службы compose.**
+///
+/// Парный к `compose_command_args`: писатель (`gateway-checkpoint`) объявлен через
+/// `command:`, читатель (`gateway-serve`) — через `environment:`. Оракул композиции обязан
+/// брать ОБЕ стороны из ОДНОГО источника — прод-файла, — иначе он согласовывает не прод, а
+/// свои собственные литералы (см. шапку `reader_selector`).
+fn compose_env_default(service: &str, key: &str) -> String {
+    let text = std::fs::read_to_string(compose_path()).expect("docker-compose.yml читается");
+    let mut in_service = false;
+    let mut in_env = false;
+    for line in text.lines() {
+        if line.starts_with("  ") && line.trim_end().ends_with(':') && !line.starts_with("    ") {
+            let name = line.trim().trim_end_matches(':');
+            in_service = name == service;
+            in_env = false;
+            continue;
+        }
+        if !in_service {
+            continue;
+        }
+        let t = line.trim();
+        if t == "environment:" {
+            in_env = true;
+            continue;
+        }
+        if !in_env || t.starts_with('#') || t.is_empty() {
+            continue;
+        }
+        // Выход из блока: ключ ВЕРХНЕГО уровня службы (`command:`, `volumes:` и т.п.)
+        if line.starts_with("    ") && !line.starts_with("      ") {
+            in_env = false;
+            continue;
+        }
+        if let Some((k, v)) = t.split_once(':') {
+            if k.trim() == key {
+                return subst_env_default(v.trim().trim_matches('"'));
+            }
+        }
+    }
+    panic!(
+        "SETUP НЕ СОСТОЯЛСЯ: в docker-compose.yml нет переменной `{key}` у службы \
+         `{service}`. Оракул композиции обязан ЧИТАТЬ прод-настройку, а не догадываться \
+         о ней: зашитый литерал согласовывал бы тест сам с собой"
+    );
+}
+
 /// `${VAR:-default}` → `default`; `${VAR}` → пусто (в M-38b таких нет).
 fn subst_env_default(s: &str) -> String {
     let mut out = String::new();
@@ -393,14 +439,60 @@ fn empty_journal_publishes_no_coverage_claim() {
 // C3ter — КОМПОЗИЦИЯ ПИСАТЕЛЬ ↔ ЧИТАТЕЛЬ, предъявленная ИСПОЛНЕНИЕМ (R-145 Б-2)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Селектор читателя ровно тот, что compose даёт службе `gateway-serve`.
+/// **Селектор читателя ВЫВОДИТСЯ из `environment:`-блока службы `gateway-serve`, а не зашит.**
+///
+/// # Почему это не косметика, а исправление слепоты (M-70 §5ter)
+///
+/// Прежняя редакция зашивала `bands: vec![0.001]` и УТВЕРЖДАЛА в доке, что это «ровно то,
+/// что compose даёт `gateway-serve`». Пока оба блока compose несли `0.001`, утверждение было
+/// истинным СЛУЧАЙНО. Задача 7 сменила полосы у `gateway-serve` на канонические семь и НЕ
+/// тронула `gateway-checkpoint` — то есть внесла ровно то расхождение писателя и читателя,
+/// против которого этот оракул и написан. Он остался ЗЕЛЁНЫМ: его читатель был зашит на
+/// `0.001` и совпадал со СЛОМАННЫМ блоком писателя. Оракул согласовывал два своих литерала,
+/// а не две прод-настройки.
+///
+/// Класс — `Р-1` (`docs/workflow/oracle-blindness-class-2026-08-28.md` §5): мера снималась не
+/// с того, что видит потребитель свойства. Литерал в тесте — не прод-настройка.
+///
+/// Теперь обе стороны композиции читаются из ОДНОГО прод-файла: писатель — через
+/// `compose_command_args("gateway-checkpoint")`, читатель — через `compose_env_default(
+/// "gateway-serve", …)`. Расхождение блоков делает отпечатки разными и роняет `c3ter`
+/// АВТОМАТИЧЕСКИ, а канонический набор можно менять, не трогая оракул.
+///
+/// `depth_cadence_ms` НЕ выводится намеренно: это ось парного vantage — тест обязан уметь
+/// подать читателю ДРУГУЮ каденцию, чтобы предъявить, что она в отпечаток входит.
 fn reader_selector(cadence: Option<i64>) -> Selector {
+    let venue_s = compose_env_default("gateway-serve", "GATEWAY_VENUE");
+    // Фикстура покрывает одну площадку; смена venue в compose обязана быть ЗАМЕЧЕНА, а не
+    // молча проигнорирована подстановкой `Venue::Binance`.
+    assert_eq!(
+        venue_s, "Binance",
+        "SETUP НЕ СОСТОЯЛСЯ: compose даёт gateway-serve venue `{venue_s}`, а фикстура умеет \
+         только Binance — оракул судил бы не ту площадку"
+    );
+    let bands: Vec<f64> = compose_env_default("gateway-serve", "GATEWAY_BANDS")
+        .split(',')
+        .map(|b| {
+            b.trim().parse::<f64>().unwrap_or_else(|e| {
+                panic!("SETUP НЕ СОСТОЯЛСЯ: полоса `{b}` из GATEWAY_BANDS не число: {e}")
+            })
+        })
+        .collect();
+    assert!(
+        !bands.is_empty(),
+        "SETUP НЕ СОСТОЯЛСЯ: GATEWAY_BANDS у gateway-serve пуст — сравнивать отпечатки не с чем"
+    );
+    let parse_ms = |key: &str| -> i64 {
+        let raw = compose_env_default("gateway-serve", key);
+        raw.parse::<i64>()
+            .unwrap_or_else(|e| panic!("SETUP НЕ СОСТОЯЛСЯ: {key}=`{raw}` не число: {e}"))
+    };
     Selector {
         venue: Venue::Binance,
-        symbol: "BTCUSDT".to_string(),
-        timeframe_ms: 1_000,
-        bands: vec![0.001],
-        window_ms: Some(60_000),
+        symbol: compose_env_default("gateway-serve", "GATEWAY_SYMBOL"),
+        timeframe_ms: parse_ms("GATEWAY_TIMEFRAME_MS"),
+        bands,
+        window_ms: Some(parse_ms("GATEWAY_WINDOW_MS")),
         depth_cadence_ms: cadence,
     }
 }

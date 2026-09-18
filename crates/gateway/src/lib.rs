@@ -88,14 +88,33 @@ fn default_capture_book_observations() -> bool {
 /// 9: M-68 (TD-158) — **смена СЕМАНТИКИ депт-серии** (`П-014` п.3, прецедент VB-I-6):
 ///    была «глубина на момент последнего снимка» (snapshot-only, M-22), стала «глубина
 ///    на момент последнего L2-события» (снимок И дельта, каденция + хвост). Форма
-///    `DepthRow` НЕ меняется — меняется СОДЕРЖИМОЕ строки (числа считаются от `self.book`,
-///    охват `depth_reach_*` снимается на КАЖДОМ L2-событии, метка описывает ТО наблюдение,
-///    из которого взяты числа). Bump здесь ЕДИНСТВЕННЫЙ рычаг, отвергающий чекпоинт со
-///    старым смыслом (`read_and_validate` шаг 3, `crates/gateway/src/lib.rs:2901-2904`):
-///    `CKPT_SCHEMA_VERSION` — версия ФОРМАТА файла, формат не меняется; bump его вместо
-///    `GATEWAY_SCHEMA_VERSION` отверг бы кэш, но соврал бы о причине и оставил `П-014` п.3
-///    неисполненным.
-pub const GATEWAY_SCHEMA_VERSION: u32 = 9;
+///    `DepthRow` в ревизии R-171 Б-1 (аддитивная, §2bis.-1) ПОМЕНЯЛАСЬ: метка
+///    `depth_band_provenance: Option<String>` снята со СТРОКИ, и добавлен параллельный
+///    массив `series_provenance: Vec<Option<String>>`. `series: Vec<(i64, i64)>` сохранён,
+///    чтобы v1-потребитель продолжал разбирать (аддитивность, `VB-I-4`). Bump здесь
+///    ЕДИНСТВЕННЫЙ рычаг, отвергающий чекпоинт со старым смыслом (`read_and_validate`
+///    шаг 3, `crates/gateway/src/lib.rs:2901-2904`): `CKPT_SCHEMA_VERSION` — версия
+///    ФОРМАТА файла, формат не меняется; bump его вместо `GATEWAY_SCHEMA_VERSION`
+///    отверг бы кэш, но соврал бы о причине и оставил `П-014` п.3 неисполненным.
+/// 10: M-70 — **бамп формы выдачи (VB-I-4 / 05-contract-layer §2)**. Задача 4 закрыла
+///    `TD-159`: метка провенанса описывает ТОЧКУ (`series_provenance: Vec<Option<String>>`),
+///    а не строку (`depth_band_provenance` снят со СТРОКИ). `series: Vec<(i64, i64)>`
+///    сохранён ⇒ v1-потребитель читает без изменений (аддитивность, `VB-I-4`), но
+///    СЕМАНТИКА `DepthRow` сменилась: до фикса задачи 4 (rev9 → §2bis.0) реализация
+///    клонировала метку последнего наблюдения на все точки строки (`MD-I-8` обязательство
+///    4 нарушалось тихо); теперь метка снимается ТЕМ ЖЕ наблюдением `reach_at_observation`,
+///    что и `depth_e8`. Основание бампа — ДВОЙНОЕ: `VB-I-4` («форма меняется только с
+///    bump `export_schema_version`») и `05-contract-layer.md` §2 («формы кокпита — T-designate,
+///    аддитивно, bump; старые консюмеры не ломаются»). `EXPECTED_SCHEMA_VERSION` в
+///    sacred-пине (`crates/gateway/tests/red_gateway_schema_version.rs`) перестала сходиться
+///    с константой в момент этого бампа — её правка отдельная задача 6b architect'а, не dev
+///    (`scope-guard.md`, `*/tests/**` sacred); verify_M-70 честно краснеет task #6b как
+///    индикатор того, что правка пина ещё не пришла. Задача 7 (`GATEWAY_BANDS` → канонический
+///    набор семи полос 0.015/0.03/0.05/0.08/0.15/0.3/0.6, `П-014` п.4) идёт ТЕМ ЖЕ раундом,
+///    но ОТДЕЛЬНЫМ атомарным коммитом: подпись формы и состав полос — разные задачи
+///    милестоуна (§Tasks M-70, номера 6 и 7), и связывать их одним коммитом запрещает
+///    `commit-discipline.md` («одна задача = ≥1 коммит»).
+pub const GATEWAY_SCHEMA_VERSION: u32 = 10;
 
 /// M-71 (`milestones/M-71-egress-cap.md` §5.1): дефолт предела объёма ответа в
 /// БАЙТАХ сериализованной `SeriesBundle` (`serde_json::to_vec`). Значение — продуктовое
@@ -110,6 +129,23 @@ pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 2_000_000;
 /// полуширины окна heatmap/COB как доля от mid. Равен сегодняшнему
 /// эффективному значению, чтобы расцепление не меняло данные при внедрении.
 pub const DEFAULT_HEATMAP_WINDOW_FRAC: f64 = 0.001;
+
+/// M-70 §2bis.3 — предел ЧИСЛА клиентских полос. Решение architect'а по делегированию
+/// founder'а 2026-09-03 (дословно: «решай сам»); снизу зажат подписью `П-014` (семь полос),
+/// сверху — долей подписанного предела ответа (`M-71`, 2 000 000 Б): 32 полосы ≈ 10 %,
+/// 256 ≈ 48 %, а цель `DESIGN` §16 — десять тысяч одновременных подписчиков на общем
+/// бюджете кадра.
+///
+/// **Гвард живёт ЗДЕСЬ, а не только в транспорте:** `Selector` собирают напрямую
+/// `research-cli`, чекпоинтер (`M-38b`) и replay — гвард в `gateway-serve::session` оставил
+/// бы байпас-поверхность (тот же довод, что посадил в `gateway::validate_selector` проверки
+/// `GW-I-10`, `GW-I-14` и каденции `MD-I-8 d14`).
+///
+/// **Число 32 запрещает «мелкую сетку»:** клиент не сможет запросить 100 полос по 0.6 %
+/// шага. Ответ — пирамида разрешений (фиксированная сетка, разделяемая между подписчиками),
+/// а не подъём предела (тот вернул бы линейную цену, от которой `M-75` только что
+/// избавил карту).
+pub const MAX_BANDS: usize = 32;
 
 /// M-75: процессное эффективное значение полуширины окна heatmap/COB.
 /// Читается при каждом построении выдачи и устанавливается один раз при старте
@@ -341,17 +377,33 @@ pub struct BubbleCell {
 }
 
 /// Depth time-series per (side, band) (зеркалит export v1 §4). BID/ASK — РАЗДЕЛЬНЫЕ серии.
+///
+/// M-70 §2bis.-1 (R-171 Б-1): форма ВЕРНУЛАСЬ к кортежам + ДОБАВЛЕН параллельный массив меток.
+/// Прежняя попытка (`§2bis`, `Vec<DepthPoint>` с меткой в каждой точке) делала рассинхрон длин
+/// НЕВЫРАЗИМЫМ, но ломала `VB-I-4`: v1-потребитель `series: Vec<(i64, i64)>` переставал
+/// разбирать выдачу (`Error("trailing characters")`). Замер Б-1 показал это на двух прототипах;
+/// принят параллельный массив как аддитивное расширение.
+///
+/// ЦЕНА выбора названа: рассинхрон длин `series` и `series_provenance` СТАНОВИТСЯ
+/// ВЫРАЗИМЫМ и СТОРОЖИТСЯ оракулом `DB-I-4c` (`red_depth_point_provenance.rs`).
+/// v1-потребитель, игнорирующий незнакомые поля serde, продолжает читать ряд как читал
+/// (`export_v2.rs::DepthRowV1` — `series: Vec<(i64, i64)>` без меток).
+///
+/// Семантика метки: `None` — только для полос ≤ 1.3 % (`VB-I-5`, валидированный эталон);
+/// для deep-полос — значение `depth_provenance_label(band_pct_e8, side, reach)`, снятое
+/// ТЕМ ЖЕ наблюдением книги, из которого взят `depth_e8` (`MD-I-8` обязательство 4 — число
+/// и провенанс сняты ОДНИМ наблюдением; §2bis.0 / `BTreeMap<i64, (i64, f64)>`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DepthRow {
     /// `"bid"` | `"ask"` — не суммируются.
     pub side: String,
     /// Полоса в долях ×1e8 (0.001 ×1e8 = 100000 = 0.1%).
     pub band_pct_e8: i64,
-    /// `(time_s, depth ×1e8)` close-семантика per бакет.
+    /// Ряд точек `(time_s, depth_e8)` — форма КАК В v1 (аддитивность, `VB-I-4`).
     pub series: Vec<(i64, i64)>,
-    /// Провенанс полос глубже 1.3% от mid (VB-I-5/GW-I-6): непустой для deep-полос; `None`
-    /// допустим ТОЛЬКО для полос ≤1.3% (валидированного эталона). Отсутствие на deep-серии → snapshot невалиден.
-    pub depth_band_provenance: Option<String>,
+    /// Метка i-й точки `series` — длина ОБЯЗАНА быть равна `series.len()`
+    /// (страж `DB-I-4c`; цена аддитивной формы, §2bis.-1).
+    pub series_provenance: Vec<Option<String>>,
 }
 
 /// Bundle серий — v1-подмножество (M-22). M-23+ добавляют поля АДДИТИВНО (heatmap/vwap/vp).
@@ -564,12 +616,27 @@ impl VwapAcc {
     }
 }
 
+/// M-70 §2bis.0 (DB-I-4, TD-159): точка депт-серии хранит пару `(depth, reach_at_obs)` —
+/// охват, снятый ТЕМ ЖЕ наблюдением книги, из которого взят `depth_e8`. Без per-point
+/// reach метку можно поставить ЛИШЬ задним числом, из последнего `depth_reach_*` —
+/// то есть не поставить вовсе (та самая тихая ложь `liveness=confirmed` поверх
+/// депт-числа по обрезанной ресинком книге, против которой стоит `П-014`).
+///
+/// `Serialize/Deserialize` на этой структуре — часть чекпоинта (`Reducer.depth: Vec<DepthAcc>`,
+/// M-38b). Смена формы `values` означает, что существующие на диске чекпоинты
+/// `postcard::from_bytes` НЕ ДЕКОДИРУЕТ (тип ключ-значения изменился). Это та же инвалидация,
+/// которую `task #6` (bump `GATEWAY_SCHEMA_VERSION` 9 → 10) вызовет и так — поэтому
+/// нерегистрируемое разрушение кэша архитектурно уже на столе, и остановить его может
+/// только bump, а не отказ от формы (это решение architect'а, см. §2bis.0).
 #[derive(Clone, Serialize, Deserialize)]
 struct DepthAcc {
     side: Side,
     band: f64,
     band_pct_e8: i64,
-    values: BTreeMap<i64, i64>,
+    /// `time_s → (depth_e8, reach_at_observation)`. Раньше — `BTreeMap<i64, i64>`,
+    /// только глубина: метку приходилось брать из `Reducer::depth_reach_*`, что описывало
+    /// ВСЕ точки одним значением. Теперь точка помнит охват СВОЕГО наблюдения.
+    values: BTreeMap<i64, (i64, f64)>,
 }
 
 /// M-24 Volume Profile accumulator (M-24 VP-аккумулятор). Per-session гистограмма
@@ -1465,6 +1532,13 @@ impl Reducer {
         let (bid_sums, bid_count) = self.depth_from_book(&bid_levels, mid, Side::Buy, bands);
         let (ask_sums, ask_count) = self.depth_from_book(&ask_levels, mid, Side::Sell, bands);
         self.depth_levels_visited += bid_count + ask_count;
+        // M-70 §2bis.0 (DB-I-4): охват снимается ПЕР-СТРОКЕ ОДНИМ наблюдением книги
+        // (то же, что у чисел `depth_e8`), и записывается В ТОЧКУ рядом с глубиной. Метка
+        // в `finish_ref` будет считаться из этой пары, а не из последнего `depth_reach_*` —
+        // иначе каждая точка ряда получает метку ПОСЛЕДНЕГО наблюдения, и `PL-I-7`
+        // срабатывает наоборот (точка из окна ресинка описана как `liveness=confirmed`).
+        let reach_bid = self.book.max_reach_pct(Side::Buy).unwrap_or(0.0);
+        let reach_ask = self.book.max_reach_pct(Side::Sell).unwrap_or(0.0);
         // Раскладка строк `self.depth` — `(band, side)` лексикографически (см.
         // `ensure_depth_rows_initialized`); ищем `band_idx` по `band_pct_e8` (`f64 → i64`,
         // детерминированно из селектора), чтобы не зависеть от порядка строк.
@@ -1475,17 +1549,30 @@ impl Reducer {
             else {
                 continue;
             };
-            let sum = match row.side {
-                Side::Buy => bid_sums[band_idx],
-                Side::Sell => ask_sums[band_idx],
+            let (sum, reach) = match row.side {
+                Side::Buy => (bid_sums[band_idx], reach_bid),
+                Side::Sell => (ask_sums[band_idx], reach_ask),
             };
-            row.values.insert(time_s, sum);
+            row.values.insert(time_s, (sum, reach));
         }
-        // Охват — O(1) (`max_reach_pct` = `keys().next_back()` для bid, `next()` для ask;
-        // `crates/book/src/lib.rs`). На КАЖДОМ L2-событии: цена здесь — два скаляра, не
-        // зависит от глубины книги.
-        self.depth_reach_bid = self.book.max_reach_pct(Side::Buy).unwrap_or(0.0);
-        self.depth_reach_ask = self.book.max_reach_pct(Side::Sell).unwrap_or(0.0);
+        // Охват обновляется и глобально (`depth_reach_bid`/`depth_reach_ask` — старый путь,
+        // сейчас не читается для метки, но поддерживается как часть state для обратной
+        // совместимости и диагностики; см. док на полях `Reducer::depth_reach_*`).
+        // Удаление полей — отдельное решение и требует bump `CKPT_SCHEMA_VERSION`, не
+        // входит в задачу 4.
+        //
+        // Используем СУЩЕСТВУЮЩИЕ скаляры `reach_bid`/`reach_ask`, снятые тем же наблюдением
+        // книги, что и числа строк (один `max_reach_pct` на сторону, выше); так же поступает
+        // `maybe_commit_depth_interval` (см. парный коммит ниже). M-77 (origin/main) делал
+        // здесь повторный `book.max_reach_pct` — это лишние два O(1)-вызова и рассинхрон
+        // с §2bis.0 (`d7` — охват снимается ТЕМ ЖЕ наблюдением, что и числа, и пишется
+        // в ТУ ЖЕ точку); оставляем M-70-вариант.
+        self.depth_reach_bid = reach_bid;
+        self.depth_reach_ask = reach_ask;
+        // M-77 (§6bis.3): возврат `Some(time_s)` — `apply()` использует его, чтобы
+        // передать в `BookSeriesObservation.depth_time_s` (через `capture_book_observation`).
+        // Без `Some` обе точки commit'а кадра (`:4502`/`:4572` в main) перестают привязывать
+        // наблюдение к записанному `time_s` — ровно та регрессия, которую M-77 закрывает.
         Some(time_s)
     }
 
@@ -1553,6 +1640,11 @@ impl Reducer {
         let (bid_sums, bid_count) = self.depth_from_book(&bid_levels, mid, Side::Buy, bands);
         let (ask_sums, ask_count) = self.depth_from_book(&ask_levels, mid, Side::Sell, bands);
         self.depth_levels_visited += bid_count + ask_count;
+        // M-70 §2bis.0 (DB-I-4): охват пишется В ТОЧКУ рядом с глубиной (см. зеркальный
+        // комментарий в `recompute_depth_from_book`). Каденс-путь делает то же самое, что
+        // и legacy-путь, только раз в интервал вместо раз в событие.
+        let reach_bid = self.book.max_reach_pct(Side::Buy).unwrap_or(0.0);
+        let reach_ask = self.book.max_reach_pct(Side::Sell).unwrap_or(0.0);
         for row in self.depth.iter_mut() {
             let Some(band_idx) = bands
                 .iter()
@@ -1560,16 +1652,16 @@ impl Reducer {
             else {
                 continue;
             };
-            let sum = match row.side {
-                Side::Buy => bid_sums[band_idx],
-                Side::Sell => ask_sums[band_idx],
+            let (sum, reach) = match row.side {
+                Side::Buy => (bid_sums[band_idx], reach_bid),
+                Side::Sell => (ask_sums[band_idx], reach_ask),
             };
-            row.values.insert(key_time_s, sum);
+            row.values.insert(key_time_s, (sum, reach));
         }
         // Охват — на ТОМ ЖЕ наблюдении, что и числа (§2bis, d7). `max_reach_pct` —
         // O(1) (`keys().next_back()` для bid, `next()` для ask; `crates/book/src/lib.rs`).
-        self.depth_reach_bid = self.book.max_reach_pct(Side::Buy).unwrap_or(0.0);
-        self.depth_reach_ask = self.book.max_reach_pct(Side::Sell).unwrap_or(0.0);
+        self.depth_reach_bid = reach_bid;
+        self.depth_reach_ask = reach_ask;
     }
 
     /// M-77 (§6bis.3): захватить per-event наблюдение книго-зависимого состояния.
@@ -1608,6 +1700,12 @@ impl Reducer {
         // Depth values: читаем `self.depth[].values[depth_time_s]`. На каденс-ролловере
         // это `commit_depth_at(key_time_s)`; на без-каденции — `recompute_depth_from_book(time_s)`.
         // При односторонней книге значения нет — `depth_points` пуст (R-134 B-3).
+        //
+        // `row.values` — `BTreeMap<i64, (i64, f64)>` (M-70 §2bis.0 / DB-I-4: точка хранит
+        // пару `(depth_e8, reach_at_observation)`, охват снят ТЕМ ЖЕ наблюдением книги,
+        // из которого взят `depth_e8`). На провод `depth_points` уходит только `depth_e8`;
+        // reach пер-точки выводится в `book_series_in` из `obs.reach_bid`/`obs.reach_ask`
+        // ТОГО ЖЕ наблюдения, и кладётся в `series_provenance` (DB-I-4c).
         let depth_points: Vec<(i64, Side, i64)> = match depth_time_s {
             Some(dts) => self
                 .depth
@@ -1615,7 +1713,7 @@ impl Reducer {
                 .filter_map(|row| {
                     row.values
                         .get(&dts)
-                        .map(|&v| (row.band_pct_e8, row.side, v))
+                        .map(|&(d, _reach)| (row.band_pct_e8, row.side, d))
                 })
                 .collect(),
             None => Vec::new(),
@@ -1725,20 +1823,24 @@ impl Reducer {
         let depth_series: Vec<DepthRow> = depth_by_index
             .into_iter()
             .map(|(_, (band_pct_e8, side, time_s_map))| {
-                // Reach для provenance берём из последнего по `time_s` (== max seq) —
-                // это reach самого позднего наблюдения в группе, описывающий самый
-                // свежий state книги, в котором есть значение. Семантика совпадает с
-                // существующим `finish_ref` (берёт `self.depth_reach_*` после применения
-                // всех наблюдений; у batch'а-кадра эквивалент — последнее наблюдение
-                // диапазона, у которого `depth_time_s` МАКСИМАЛЬНЫЙ).
-                let last = time_s_map
+                // Per-точечный провенанс (M-70 §2bis.0 / DB-I-4, аддитивная форма
+                // §2bis.-1 R-171 Б-1): охват берётся у КАЖДОЙ точки из её же наблюдения
+                // (`time_s_map[t].2`), а не из «последнего» — иначе воспроизводится та же
+                // тихая ложь `liveness=confirmed` поверх точки из окна ресинка, против
+                // которой стоит `П-014`. В `time_s_map[t]` reach пришёл от `obs.reach_bid`
+                // / `obs.reach_ask` выигравшего по max-seq на слоте `t` (один observation
+                // на слот — одно значение reach, и оно описывает depth_e8 ЭТОГО слота).
+                // Семантика совпадает с `finish_ref` на `self.depth` (M-70 §2bis.0), где
+                // пара `(d, reach)` пишется одним наблюдением и читается тем же.
+                //
+                // Два массива одной длины пишутся ВМЕСТЕ за один проход `BTreeMap` —
+                // страж `DB-I-4c` (инвариант DB-I-4: `len(series) == len(series_provenance)`
+                // обязателен, иначе клиент детектит рассинхрон).
+                let series: Vec<(i64, i64)> =
+                    time_s_map.iter().map(|(&t, &(v, _, _))| (t, v)).collect();
+                let series_provenance: Vec<Option<String>> = time_s_map
                     .values()
-                    .next_back()
-                    .map(|(_, _, r)| *r)
-                    .unwrap_or(0.0);
-                let series: Vec<(i64, i64)> = time_s_map
-                    .into_iter()
-                    .map(|(t, (v, _, _))| (t, v))
+                    .map(|&(_, _, r)| depth_provenance_label(band_pct_e8, side, r))
                     .collect();
                 DepthRow {
                     side: match side {
@@ -1747,7 +1849,7 @@ impl Reducer {
                     },
                     band_pct_e8,
                     series,
-                    depth_band_provenance: depth_provenance_label(band_pct_e8, side, last),
+                    series_provenance,
                 }
             })
             .collect();
@@ -1876,27 +1978,42 @@ impl Reducer {
         // для честности относительно фактического охвата книги после ресинка (`П-017`
         // предусловие (а)).
         //
-        // Охват берётся из `depth_reach_bid`/`depth_reach_ask` — СНЯТОГО в момент последнего
-        // наблюдения глубины (ветка `L2Snapshot` в `apply`), а НЕ из живой `self.book` здесь.
-        // Знание о ресинке по-прежнему НЕ ТРЕБУЕТСЯ (`П-014` явно): охват считается из того же
-        // наблюдения, из которого считается сама глубина. Причина именно такой точки съёма —
-        // `GW-I-4`/`VB-I-2` (`R-110` Б-1) на журнале с дельтами: подробный разбор и замер
-        // расхождения — в доке поля `Reducer::depth_reach_bid`.
+        // Охват берётся из ПАРЫ `(depth_e8, reach)`, записанной ТОГДА ЖЕ, когда пишется число
+        // (ветка `L2Snapshot`/`L2Delta` в `apply`, через `recompute_depth_from_book`/
+        // `commit_depth_at`). Это снимает тихую ложь класса `PL-I-7`: точка из окна ресинка
+        // раньше описывалась меткой последнего наблюдения. `GW-I-4`/`VB-I-2` (`R-110` Б-1) —
+        // замер расхождения до этой правки — см. в истории милестоуна.
+        //
+        // Глобальные `depth_reach_bid`/`depth_reach_ask` ПО-ПРЕЖНЕМУ обновляются на каждом
+        // L2-событии (часть state, не читается для метки; см. док на полях полей). Удаление
+        // их — отдельное решение, требует bump `CKPT_SCHEMA_VERSION` (не входит в задачу 4:
+        // инвалидация кэша и так на столе у задачи 6).
         //
         // `finish_ref` теперь НЕ читает `self.book` вообще — это же и есть дисциплина
         // `red_snapshot_noclone::o1_snapshot_allocation_does_not_grow_with_state` (потолок
         // ×2.5): самое дорогое поле состояния на пути построения ответа не участвует.
-        let reach_bid = self.depth_reach_bid;
-        let reach_ask = self.depth_reach_ask;
 
         let depth_series = self
             .depth
             .iter()
             .map(|row| {
-                let reach = match row.side {
-                    Side::Buy => reach_bid,
-                    Side::Sell => reach_ask,
-                };
+                // M-70 §2bis.0 (DB-I-4) + §2bis.-1 (R-171 Б-1, аддитивная форма):
+                // метка считается ПОТОЧЕЧНО из пары `(depth_e8, reach)`, записанной
+                // ТЕМ ЖЕ наблюдением книги (`MD-I-8` обязательство 4 — число и
+                // провенанс сняты ОДНИМ наблюдением), и кладётся в ПАРАЛЛЕЛЬНЫЙ
+                // массив `series_provenance` той же длины, что `series`. Один проход
+                // по `values` — два массива пишутся ВМЕСТЕ (страж `DB-I-4c`).
+                let mut series: Vec<(i64, i64)> = Vec::with_capacity(row.values.len());
+                let mut series_provenance: Vec<Option<String>> =
+                    Vec::with_capacity(row.values.len());
+                for (&t, &(v, reach)) in &row.values {
+                    series.push((t, v));
+                    series_provenance.push(depth_provenance_label(
+                        row.band_pct_e8,
+                        row.side,
+                        reach,
+                    ));
+                }
                 DepthRow {
                     side: match row.side {
                         Side::Buy => "bid",
@@ -1904,8 +2021,8 @@ impl Reducer {
                     }
                     .to_string(),
                     band_pct_e8: row.band_pct_e8,
-                    series: row.values.iter().map(|(&t, &v)| (t, v)).collect(),
-                    depth_band_provenance: depth_provenance_label(row.band_pct_e8, row.side, reach),
+                    series,
+                    series_provenance,
                 }
             })
             .collect();
@@ -2026,8 +2143,30 @@ fn build_heatmap_and_cob(
         }
         let low = (mid as f64 * (1.0 - w)) as i64;
         let high = (mid as f64 * (1.0 + w)) as i64;
-        let deep_thr = (mid as f64 * 0.013) as i64; // 1.3% от mid
-        let prov_str = "diff-reconstructed".to_string();
+        // M-70 §2bis.1 (DB-I-5, TD-161): словарь метки ОДИН на всю выдачу. Карта зовёт
+        // ту же `depth_provenance_label(band_pct_e8, side, reach)`, что и депт-серия;
+        // `band` — расстояние ячейки от mid своего бакета, `side` — сторона ячейки,
+        // `reach` — крайний уровень ТОГО ЖЕ бакета на ТОЙ ЖЕ стороне.
+        //
+        // Ячейка карты есть УРОВЕНЬ КНИГИ своего бакета, поэтому её расстояние никогда
+        // не превышает охват этого бакета: ветвь `not-observed` для heatmap структурно
+        // недостижима. Словарь ОДИН, но карта пользуется двумя его значениями из трёх —
+        // это свойство предмета, а не дыра покрытия (DB-I-5d пиннит именно его).
+        let mid_f = mid as f64;
+        let reach_bid = state
+            .bids
+            .iter()
+            .filter(|(_, s)| *s > 0)
+            .map(|(p, _)| *p)
+            .min()
+            .map(|p| (mid_f - p as f64) / mid_f);
+        let reach_ask = state
+            .asks
+            .iter()
+            .filter(|(_, s)| *s > 0)
+            .map(|(p, _)| *p)
+            .max()
+            .map(|p| (p as f64 - mid_f) / mid_f);
 
         // bid: в окне price ∈ [low, mid]; HBMAP-порядок — (side, price) ascending →
         // для bid — price ascending (против естественного bookmap «лучшие наверху»).
@@ -2037,13 +2176,19 @@ fn build_heatmap_and_cob(
                 continue;
             }
             let dist = mid - price;
-            let deep = dist > deep_thr;
+            let band_pct_e8 = ((dist as f64 / mid_f) * 1e8).round() as i64;
+            // `depth_provenance_label` сам решает «глубже 1.3 % или нет»: для band ≤ 1.3 %
+            // возвращает `None` (валидированный эталон, метки не несёт), для глубоких —
+            // строку с `liveness=` по стороне. Охват для этой ячейки берётся из её же
+            // бакета, потому что она и есть уровень этого бакета (см. обоснование выше).
+            let provenance =
+                depth_provenance_label(band_pct_e8, Side::Buy, reach_bid.unwrap_or(0.0));
             heatmap_out.push(HeatmapCell {
                 time_s: *time_s,
                 side: "bid".to_string(),
                 price_e8: price,
                 size_e8: size,
-                depth_band_provenance: deep.then(|| prov_str.clone()),
+                depth_band_provenance: provenance,
             });
         }
 
@@ -2053,13 +2198,15 @@ fn build_heatmap_and_cob(
                 continue;
             }
             let dist = price - mid;
-            let deep = dist > deep_thr;
+            let band_pct_e8 = ((dist as f64 / mid_f) * 1e8).round() as i64;
+            let provenance =
+                depth_provenance_label(band_pct_e8, Side::Sell, reach_ask.unwrap_or(0.0));
             heatmap_out.push(HeatmapCell {
                 time_s: *time_s,
                 side: "ask".to_string(),
                 price_e8: price,
                 size_e8: size,
-                depth_band_provenance: deep.then(|| prov_str.clone()),
+                depth_band_provenance: provenance,
             });
         }
 
@@ -2130,8 +2277,30 @@ fn build_heatmap_cells_and_cob_for_bucket(
     }
     let low = (mid as f64 * (1.0 - w)) as i64;
     let high = (mid as f64 * (1.0 + w)) as i64;
-    let deep_thr = (mid as f64 * 0.013) as i64;
-    let prov_str = "diff-reconstructed".to_string();
+    // M-70 §2bis.1 (DB-I-5, TD-161): словарь метки ОДИН на всю выдачу. Per-bucket версия
+    // (M-77 §6bis.3, выделена из `build_heatmap_and_cob` для захвата наблюдений на пути
+    // `apply`) зовёт ту же `depth_provenance_label(band_pct_e8, side, reach)`, что и
+    // полный `build_heatmap_and_cob` и депт-серия; иначе на ВЫДАЧЕ остались бы ДВА словаря
+    // (ветка `capture_book_observation` и `build_heatmap_and_cob`), и TD-161 жил бы.
+    //
+    // Ячейка карты есть УРОВЕНЬ КНИГИ своего бакета, поэтому её расстояние никогда
+    // не превышает охват этого бакета: ветвь `not-observed` для heatmap структурно
+    // недостижима. Словарь ОДИН, карта пользуется двумя его значениями из трёх.
+    let mid_f = mid as f64;
+    let reach_bid = state
+        .bids
+        .iter()
+        .filter(|(_, s)| *s > 0)
+        .map(|(p, _)| *p)
+        .min()
+        .map(|p| (mid_f - p as f64) / mid_f);
+    let reach_ask = state
+        .asks
+        .iter()
+        .filter(|(_, s)| *s > 0)
+        .map(|(p, _)| *p)
+        .max()
+        .map(|p| (p as f64 - mid_f) / mid_f);
 
     let mut cells: Vec<HeatmapCell> = Vec::new();
     for &(price, size) in &state.bids {
@@ -2139,13 +2308,14 @@ fn build_heatmap_cells_and_cob_for_bucket(
             continue;
         }
         let dist = mid - price;
-        let deep = dist > deep_thr;
+        let band_pct_e8 = ((dist as f64 / mid_f) * 1e8).round() as i64;
+        let provenance = depth_provenance_label(band_pct_e8, Side::Buy, reach_bid.unwrap_or(0.0));
         cells.push(HeatmapCell {
             time_s,
             side: "bid".to_string(),
             price_e8: price,
             size_e8: size,
-            depth_band_provenance: deep.then(|| prov_str.clone()),
+            depth_band_provenance: provenance,
         });
     }
     for &(price, size) in &state.asks {
@@ -2153,13 +2323,14 @@ fn build_heatmap_cells_and_cob_for_bucket(
             continue;
         }
         let dist = price - mid;
-        let deep = dist > deep_thr;
+        let band_pct_e8 = ((dist as f64 / mid_f) * 1e8).round() as i64;
+        let provenance = depth_provenance_label(band_pct_e8, Side::Sell, reach_ask.unwrap_or(0.0));
         cells.push(HeatmapCell {
             time_s,
             side: "ask".to_string(),
             price_e8: price,
             size_e8: size,
-            depth_band_provenance: deep.then(|| prov_str.clone()),
+            depth_band_provenance: provenance,
         });
     }
 
@@ -2237,8 +2408,11 @@ fn build_volume_bubbles(bubbles: &BTreeMap<(i64, i64), (i64, i64)>) -> Vec<Bubbl
 /// `A-002` З-2 (`cancel_fraction` меряет насыщение, а не живость) снимать нельзя, поэтому
 /// liveness по стороне остаётся обязательным.
 ///
-/// Форма `DepthRow` (поле `depth_band_provenance: Option<String>`) не меняется (П-014 п.3: bump
-/// `GATEWAY_SCHEMA_VERSION` — решение architect'а). Меняется только СОДЕРЖИМОЕ строки.
+/// Форма `DepthRow`: в ревизии R-171 Б-1 (аддитивная, §2bis.-1) поле
+/// `depth_band_provenance: Option<String>` СНЯТО со строки и метка переехала на ТОЧКУ через
+/// параллельный массив `series_provenance: Vec<Option<String>>`. `v1`-потребитель,
+/// читающий `series: Vec<(i64, i64)>`, продолжает разбирать выдачу (аддитивность, `VB-I-4`).
+/// Bump `GATEWAY_SCHEMA_VERSION` 9 → 10 выполняется задачей 6 (решение architect'а).
 fn depth_provenance_label(band_pct_e8: i64, side: Side, reach: f64) -> Option<String> {
     // VB-I-5 (прежний, не сдвинут): ≤ 1.3% — валидированный эталон, метки не несёт.
     if band_pct_e8 <= 1_300_000 {
@@ -2391,27 +2565,34 @@ impl Snapshot {
                     row.side == incoming.side && row.band_pct_e8 == incoming.band_pct_e8
                 });
             if let Some(current) = current {
-                let mut values: BTreeMap<i64, i64> = current.series.drain(..).collect();
-                values.extend(incoming.series.iter().copied());
-                current.series = values.into_iter().collect();
-                // `П-014` / `R-110` Б-1: метка СЛЕДУЕТ ЗА incoming — та же close-семантика, что у
-                // ЗНАЧЕНИЙ полосы строкой выше (`values.extend` — последнее наблюдение бакета
-                // побеждает). Было `if current...is_none()` — «первый непустой побеждает», и пока
-                // метка была чистой функцией ШИРИНЫ полосы, это было тождеством: значение не менялось
-                // никогда. После `П-014` метка — функция наблюдённого ОХВАТА, а охват движется во
-                // времени (ресинк после гэпа урезает книгу до ~1.3 %) — и «первый побеждает»
-                // превратилось в ЗАЛИПАНИЕ: WS-клиент получает `Snapshot` ОДИН раз и дальше живёт
-                // на `Frame`'ах, то есть до переподключения читал бы `liveness=confirmed` о полосе,
-                // которой в книге больше нет (`PL-I-7`: деградация не выдаётся за норму). Обратная
-                // сторона тоже вредна: залипшее `not-observed` не снималось после восстановления.
+                // M-70 §2bis.0 (DB-I-4, TD-159) + §2bis.-1 (R-171 Б-1, аддитивная форма):
+                // слияние идёт по КЛЮЧУ `time_s`, и метка едет со СВОЕЙ точкой. Оба массива
+                // правятся В ОДНОМ ЦИКЛЕ, иначе страж `DB-I-4c` покраснеет на рассинхроне длин.
+                // Параллельные массивы наполняются ОДНОЙ таблицей `(time_s → (depth, prov))`,
+                // и оба итоговых вектора — `values.len()` — длины. close-семантика: incoming
+                // точке с тем же `time_s` существующая уступает (как в `BTreeMap::entry`),
+                // и метка тоже — метка живёт при СВОЕЙ точке.
                 //
-                // Почему БЕЗУСЛОВНО, а не «берём incoming, если он непуст»: метка — ЧИСТАЯ
-                // функция `(ширина, сторона, охват)` (`depth_provenance_label`), и для одного и того же
-                // `(side, band_pct_e8)` она `None` тогда и только тогда, когда полоса ≤ 1.3 % (`VB-I-5`) —
-                // то есть ОДИНАКОВО `None` в обоих операндах слияния. Значит «взять incoming» не может
-                // потерять непустую метку глубокой полосы, а условие вносило бы ту же асимметрию,
-                // из-за которой блокер и появился.
-                current.depth_band_provenance = incoming.depth_band_provenance.clone();
+                // Прежнее безусловное копирование метки строки
+                // (`current.depth_band_provenance = incoming.depth_band_provenance.clone()`)
+                // больше не существует — метка переехала в ТОЧКУ.
+                let mut merged: BTreeMap<i64, (i64, Option<String>)> = current
+                    .series
+                    .drain(..)
+                    .zip(current.series_provenance.drain(..))
+                    .map(|(pt, prov)| (pt.0, (pt.1, prov)))
+                    .collect();
+                for (pt, prov) in incoming
+                    .series
+                    .iter()
+                    .zip(incoming.series_provenance.iter())
+                {
+                    merged.insert(pt.0, (pt.1, prov.clone()));
+                }
+                let (merged_series, merged_prov): (Vec<(i64, i64)>, Vec<Option<String>>) =
+                    merged.into_iter().map(|(t, (v, p))| ((t, v), p)).unzip();
+                current.series = merged_series;
+                current.series_provenance = merged_prov;
             } else {
                 self.series.depth_series.push(incoming.clone());
             }
@@ -2592,9 +2773,21 @@ fn evict_series_bundle_under_window(series: &mut SeriesBundle, lo_time_s: i64) {
     // ohlcv
     series.ohlcv.retain(|row| row.time_s >= lo_time_s);
 
-    // depth_series[].series
+    // depth_series[].series + series_provenance — M-70 §2bis.0 (DB-I-4) + §2bis.-1 (R-171
+    // Б-1, аддитивная форма): оба массива ВМЕСТЕ проходят оконную эвикцию бакета. Иначе
+    // страж `DB-I-4c` покраснеет на рассинхроне длин. Прежняя запись «метка едет с точкой»
+    // здесь уже не действует — массивы РАЗДЕЛЬНЫ, и фильтр обязан проходить их параллельно.
     for row in &mut series.depth_series {
-        row.series.retain(|&(t, _)| t >= lo_time_s);
+        let mut new_series: Vec<(i64, i64)> = Vec::with_capacity(row.series.len());
+        let mut new_prov: Vec<Option<String>> = Vec::with_capacity(row.series_provenance.len());
+        for (pt, p) in row.series.drain(..).zip(row.series_provenance.drain(..)) {
+            if pt.0 >= lo_time_s {
+                new_series.push(pt);
+                new_prov.push(p);
+            }
+        }
+        row.series = new_series;
+        row.series_provenance = new_prov;
     }
 
     // vwap
@@ -2874,6 +3067,28 @@ pub fn validate_selector(sel: &Selector) -> io::Result<()> {
                 ),
             ));
         }
+    }
+    // M-70 §2bis.3 (DB-I-3): предел ЧИСЛА полос — отказ ДО построения ответа. Без этого
+    // клиент управляет объёмом работы сервера (1024 полосы = 3.5 МБ и 3.8 с работы
+    // ради отказа, 4096 = 14 МБ и 18 с; замер — `milestones/M-70-depth-bands-enablement.md`
+    // §2bis.3, таблица). Гвард живёт здесь, а не только в `gateway-serve`, по тому же
+    // доводу, что и `GW-I-10`/`GW-I-14`: `Selector` собирают напрямую, и проверка ТОЛЬКО
+    // в транспорте оставила бы байпас-поверхность. Проверка СТОИТ ОТДЕЛЬНО от каденции —
+    // клиент вправе прислать хоть `depth_cadence_ms = None` с произвольным числом полос.
+    if sel.bands.len() > MAX_BANDS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "M-70 DB-I-3: selector.bands.len()={} превышает MAX_BANDS={} (предел \
+                 ЧИСЛА клиентских полос). Подписанный канонический набор — 7 полос \
+                 (`П-014`), запас ×4.5 покрывает известные сценарии; больше — значит \
+                 клиент управляет объёмом работы сервера (PL-I-5). Тонкая сетка \
+                 (мелкие полосы) идёт через пирамиду разрешений, а не через подъём \
+                 этого предела",
+                sel.bands.len(),
+                MAX_BANDS
+            ),
+        ));
     }
     Ok(())
 }
