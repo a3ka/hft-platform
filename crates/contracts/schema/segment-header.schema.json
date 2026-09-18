@@ -1,0 +1,71 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "SegmentHeader",
+  "description": "Первый фрейм КАЖДОГО сегмента (CT-I-6, CT-RFC-02). Делает эпоху данных ЧИТАЕМЫМ ФАКТОМ, а не устной договорённостью.",
+  "type": "object",
+  "required": [
+    "created_wall_ms",
+    "epoch_id",
+    "first_seq",
+    "provenance",
+    "schema_version",
+    "source"
+  ],
+  "properties": {
+    "created_wall_ms": {
+      "description": "Часы создания сегмента (отчёты; в детерминизм реплея НЕ входит).",
+      "type": "integer",
+      "format": "int64"
+    },
+    "epoch_id": {
+      "description": "Стабильный ключ эпохи, по которому research фильтрует данные (`own-2026-07`, `tardis-binance-spot-2024`). Смешение эпох — ЯВНОЕ решение.",
+      "type": "string"
+    },
+    "first_seq": {
+      "description": "seq первого события сегмента (сшивка при ротации).",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0.0
+    },
+    "provenance": {
+      "description": "Чем/кем/когда собран: для `OwnCapture` — версия recorder'а + git sha; для `Vendor` — поставщик, датасет, дата выгрузки, лицензия.",
+      "type": "string"
+    },
+    "schema_version": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "source": {
+      "$ref": "#/definitions/DataSource"
+    }
+  },
+  "definitions": {
+    "DataSource": {
+      "description": "Происхождение данных сегмента (CT-RFC-02). Расширяется СТРОГО в конец (сохраняет postcard-дискриминанты).\n\nЗачем: купленная история и собственный захват — РАЗНЫЕ реальности (чужая глубина книги, чужие часы, чужие гэпы). Смешать их в обучении альфы без пометки = обучать на данных, которых у нас никогда не было. Журнал бессмертен — задним числом источник не проставить.",
+      "oneOf": [
+        {
+          "description": "Наш собственный live-захват (recorder → venue-адаптеры).",
+          "type": "string",
+          "enum": [
+            "OwnCapture"
+          ]
+        },
+        {
+          "description": "Импорт исторических данных стороннего поставщика.",
+          "type": "string",
+          "enum": [
+            "Vendor"
+          ]
+        },
+        {
+          "description": "Синтетика (тесты/стресс-фикстуры). В обучение по умолчанию НЕ попадает.",
+          "type": "string",
+          "enum": [
+            "Synthetic"
+          ]
+        }
+      ]
+    }
+  }
+}

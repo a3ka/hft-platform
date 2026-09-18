@@ -1,0 +1,18 @@
+[package]
+name = "signals"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+
+# Слой 2, Граница A (docs/fa/signals.md): единственная зона записи квант-агентов.
+# Зависимости ТОЛЬКО вниз (contracts, book) — SG-I-5; никакого I/O в hot-path (SG-I-3).
+
+[dependencies]
+contracts = { path = "../contracts" }
+book = { path = "../book" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = "3"
