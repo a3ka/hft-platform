@@ -2352,11 +2352,58 @@ pub fn serve_config_from_env(
         },
     };
 
+    // M-86 (`milestones/M-86-vp-bin-width.md` §2.3): ширина корзины профиля объёма.
+    // Политика ЗНАЧЕНИЙ — ТА ЖЕ, что у `GATEWAY_MAX_RESPONSE_BYTES` (отсутствие/пустое/
+    // пробельное ⇒ подписанная норма + warn; мусор, дробное, 0, отрицательное,
+    // переполнение ⇒ отказ старта с сообщением, НАЗЫВАЮЩИМ переменную). Это
+    // исполнение `A-015` §3 п.1 — четвёртая политика для четвёртого лимита одного
+    // сервиса запрещена. Сеттер зовётся СТРОГО ПОСЛЕ успешного разбора —
+    // отвергнутая старт-конфигурация не смеет управлять сервисом (класс GW-I-14 / R7).
+    let raw_vp_bin = get("GATEWAY_VP_BIN_WIDTH_E8");
+    let trimmed_vp_bin = raw_vp_bin.as_deref().map(str::trim);
+    let vp_bin_width_e8: i64 = match trimmed_vp_bin {
+        None | Some("") => {
+            tracing::warn!(
+                "GATEWAY_VP_BIN_WIDTH_E8 is absent or blank (raw={raw_vp_bin:?}); \
+                 GATEWAY_VP_BIN_WIDTH_E8={} — подписанная норма (founder 2026-09-18, \
+                 milestones/M-86-vp-bin-width.md §2.1, A-015 §3 п.1)",
+                gateway::DEFAULT_VP_BIN_WIDTH_E8,
+            );
+            gateway::DEFAULT_VP_BIN_WIDTH_E8
+        }
+        Some(s) => match s.parse::<i64>() {
+            Ok(n) if n > 0 => n,
+            Ok(0) => {
+                return Err(format!(
+                    "GATEWAY_VP_BIN_WIDTH_E8={s} невалидно: должно быть > 0 \
+                     (M-86 §2.3: нулевая ширина даёт деление на ноль или тиковую сетку — \
+                     ровно ту аварию 5 533 287 Б против предела 2 000 000 Б, против которой \
+                     предмет заведён)"
+                ));
+            }
+            Ok(n) => {
+                return Err(format!(
+                    "GATEWAY_VP_BIN_WIDTH_E8={n} невалидно: должно быть > 0 (M-86 §2.3)"
+                ));
+            }
+            Err(e) => {
+                return Err(format!(
+                    "GATEWAY_VP_BIN_WIDTH_E8={s:?} parse: {e} — это опечатка в `.env` \
+                     (мусор/суффикс/научная нотация/дробное/переполнение/Rust-разделитель \
+                     разрядов); оператор обязан задать валидное целое > 0 или \
+                     unset/пусто/пробельное для дефолта"
+                ));
+            }
+        },
+    };
+
     // M-71 §4bis.2: сеттер зовётся СТРОГО ПОСЛЕ успешного разбора — все ветки отказа
-    // ВЫШЕ (включая M-68 гвард отношения) делают `return Err(...)` ДО этой строки.
-    // Класс GW-I-14/R7: отвергнутая конфигурация не смеет управлять сервисом.
+    // ВЫШЕ (включая M-68 гвард отношения и M-86 разбор VP bin width) делают
+    // `return Err(...)` ДО этой строки. Класс GW-I-14/R7: отвергнутая конфигурация
+    // не смеет управлять сервисом.
     gateway::set_effective_max_response_bytes(max_response_bytes);
     gateway::set_effective_heatmap_window_frac(heatmap_window_frac);
+    gateway::set_effective_vp_bin_width_e8(vp_bin_width_e8);
 
     Ok(server::ServeConfig {
         addr,

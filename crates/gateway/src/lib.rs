@@ -15,7 +15,7 @@
 use std::collections::BTreeMap;
 use std::io;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 
 use contracts::{Event, EventKind, MdEvent, MdPayload, Side, Venue};
 use journal::EpochFilter;
@@ -161,6 +161,36 @@ pub fn effective_heatmap_window_frac() -> f64 {
 /// Установить эффективную полуширину окна heatmap/COB.
 pub fn set_effective_heatmap_window_frac(w: f64) {
     EFFECTIVE_HEATMAP_WINDOW_FRAC.store(w.to_bits(), Ordering::Relaxed);
+}
+
+/// M-86 (`milestones/M-86-vp-bin-width.md` §2.1, founder-решение 2026-09-18, вариант A):
+/// ширина корзины профиля объёма, e8. Дефолт — 0.25 USD (`25_000_000` e8).
+/// Фиксированная ценовая сетка для VP: ключ корзины = `price_e8.div_euclid(W) * W`,
+/// якорь — ноль. Семантика подписана `docs/fa/viz-backend.md` `VP-I-4` (`vp_rows` —
+/// единственная точка применения, `merge_volume_profile` работает по уже-огрублённым
+/// ключам из row.bins — форма `VolumeProfileRow` НЕ меняется).
+pub const DEFAULT_VP_BIN_WIDTH_E8: i64 = 25_000_000;
+
+/// M-86: процессное эффективное значение ширины корзины VP (last-write-wins, тот же
+/// приём, что у `EFFECTIVE_MAX_RESPONSE_BYTES` и `EFFECTIVE_HEATMAP_WINDOW_FRAC`).
+/// Читается при каждом `vp_rows()` и устанавливается один раз при старте
+/// `gateway-serve` после успешного разбора `GATEWAY_VP_BIN_WIDTH_E8`. Поле `ServeConfig`
+/// не добавляется: литерал `ServeConfig { .. }` живёт в девяти файлах
+/// `crates/gateway-serve/tests/**` (sacred-зона architect'а), и поле сломало бы их все.
+static EFFECTIVE_VP_BIN_WIDTH_E8: AtomicI64 = AtomicI64::new(DEFAULT_VP_BIN_WIDTH_E8);
+
+/// Получить эффективную ширину корзины профиля объёма в e8.
+/// Дефолт — `DEFAULT_VP_BIN_WIDTH_E8` (founder 2026-09-18).
+pub fn effective_vp_bin_width_e8() -> i64 {
+    EFFECTIVE_VP_BIN_WIDTH_E8.load(Ordering::Relaxed)
+}
+
+/// Установить эффективную ширину корзины. Вызывается из `gateway_serve::serve_config_from_env`
+/// один раз после успешного разбора env (или из sacred-тестов под `serial()` —
+/// `red_vp_bin_width_governed.rs`, `red_vp_bin_width_bridge.rs`). См. замечания на
+/// `EFFECTIVE_VP_BIN_WIDTH_E8`.
+pub fn set_effective_vp_bin_width_e8(w: i64) {
+    EFFECTIVE_VP_BIN_WIDTH_E8.store(w, Ordering::Relaxed);
 }
 
 /// M-71 (`milestones/M-71-egress-cap.md` §4bis.2): эффективное значение предела,
@@ -671,10 +701,32 @@ impl VolumeProfileAcc {
     /// Названо не `into_rows_ref`, чтобы не нарушать clippy `wrong_self_convention`
     /// (`into_*` обязан брать `self` по значению).
     fn vp_rows(&self) -> Vec<VolumeProfileRow> {
+        let w = effective_vp_bin_width_e8();
         let mut rows: Vec<VolumeProfileRow> = self
             .bins
             .iter()
-            .map(|(&session_id, hist)| compute_vp_row(session_id, hist))
+            .map(|(&session_id, hist)| {
+                // M-86 §2.2 (BINDING): ключ корзины = price_e8.div_euclid(W) * W,
+                // якорь — ноль. Форма `VolumeProfileRow` НЕ меняется (ключи и
+                // объёмы внутри корзины сложены в i128, как в apply_trade).
+                // POC/VAH/VAL/VA% считаются ПОСЛЕ огрубления — compute_vp_row
+                // работает на уже-огрублённом hist и возвращает ключи ОТДАННЫХ
+                // корзин. `merge_volume_profile` складывает row.bins двух строк
+                // по ключу — ключи УЖЕ на сетке, форма не меняется, склейка у
+                // потребителя остаётся аддитивной (V8).
+                if w <= 1 {
+                    // Сетка в тик или меньше: огрубление тривиально, ключи совпадают
+                    // с торгованными ценами. Прежнее поведение до M-86.
+                    compute_vp_row(session_id, hist)
+                } else {
+                    let mut coarsened: BTreeMap<i64, i128> = BTreeMap::new();
+                    for (&p, &v) in hist {
+                        let k = p.div_euclid(w) * w;
+                        *coarsened.entry(k).or_insert(0) += v;
+                    }
+                    compute_vp_row(session_id, &coarsened)
+                }
+            })
             .collect();
         rows.sort_by_key(|r| r.session_id);
         rows
