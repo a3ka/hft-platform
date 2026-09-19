@@ -120,7 +120,10 @@ fn only_row(s: &gateway::Snapshot) -> &gateway::VolumeProfileRow {
 #[test]
 fn v2_every_emitted_price_is_on_the_grid() {
     let base = 77_000 * 100_000_000_i64; // 77 000.00 USD
-    let prices = vec![
+                                         // Массив, а не `vec!`: значения только перебираются (`.iter()`), владения не нужно —
+                                         // `clippy::useless_vec` под `-D warnings`. Правка внесена architect'ом по
+                                         // SCOPE VIOLATION REQUEST от engine-dev (тест sacred, dev его не трогает).
+    let prices = [
         base,         // ровно на границе (кратна W при любом делителе 0.25)
         base + W - 1, // на единицу НИЖЕ следующей границы
         base + W,     // ровно следующая граница
