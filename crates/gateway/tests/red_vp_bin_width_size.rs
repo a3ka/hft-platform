@@ -113,8 +113,13 @@ fn v1_production_shaped_frame_fits_signed_limit() {
          {MIN_DISTINCT_PRICES} — это не прод-масштаб, и вывод о размере недействителен"
     );
 
-    let s = gateway::snapshot(dir.path(), EpochFilter::OwnCaptureOnly, &sel(), Cursor::LATEST)
-        .expect("snapshot обязан собраться: предел поднят");
+    let s = gateway::snapshot(
+        dir.path(),
+        EpochFilter::OwnCaptureOnly,
+        &sel(),
+        Cursor::LATEST,
+    )
+    .expect("snapshot обязан собраться: предел поднят");
 
     // 4. Второй SETUP-СТРАЖ: профиль обязан быть НЕПУСТ и односессионен, иначе мы меряем
     //    размер пустоты.

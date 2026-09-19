@@ -299,7 +299,10 @@ fn v6b_whole_session_inside_one_bin_is_legal() {
         "V6-b НАРУШЕН: три цены внутри одной корзины дали {} корзин",
         row.bins.len()
     );
-    assert_eq!(row.bins[0].0, base, "V6-b НАРУШЕН: ключ не на границе сетки");
+    assert_eq!(
+        row.bins[0].0, base,
+        "V6-b НАРУШЕН: ключ не на границе сетки"
+    );
     assert_eq!(
         row.bins[0].1,
         to_fixed(3.0),
@@ -315,7 +318,11 @@ fn v6c_single_trade_yields_single_bin_on_grid() {
     let s = snap(dir.path());
     let row = only_row(&s);
 
-    assert_eq!(row.bins.len(), 1, "V6-c НАРУШЕН: одна сделка — одна корзина");
+    assert_eq!(
+        row.bins.len(),
+        1,
+        "V6-c НАРУШЕН: одна сделка — одна корзина"
+    );
     assert_eq!(
         row.bins[0].0 % W,
         0,
