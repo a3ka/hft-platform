@@ -38,6 +38,7 @@
 use contracts::{to_fixed, DataSource, EventKind, MdPayload, Side, Venue};
 use gateway::{Cursor, Selector};
 use journal::{EpochFilter, Journal, WriterConfig};
+use std::collections::BTreeSet;
 
 /// Геометрия прод-сессии (замер 2026-09-18).
 const TICK_E8: i64 = 1_000_000; // 0.01 USD
@@ -48,7 +49,10 @@ const TICKS_IN_RANGE: i64 = 510_401; // ход 5 104.00 USD в тиках
 const KEEP_OF_5: i64 = 2;
 const MIN_DISTINCT_PRICES: usize = 200_000;
 
-const T: i64 = 1_752_000_010_000;
+/// Начало UTC-суток: все сделки обязаны лечь в ОДНУ сессию (профиль сессионный).
+const SESSION_START_MS: i64 = (1_752_000_010_000 / 86_400_000) * 86_400_000;
+/// Сделки РАЗНОСЯТСЯ по сессии, а не стоят в одном такте — см. §7.1 спеки.
+const SPREAD_MS: i64 = 86_000_000;
 
 fn cfg() -> WriterConfig {
     WriterConfig {
@@ -82,6 +86,10 @@ fn v1_production_shaped_frame_fits_signed_limit() {
     // 2. Строим журнал прод-геометрии.
     let dir = tempfile::tempdir().expect("tempdir");
     let mut distinct = 0_usize;
+    // Эталон `V1b` строится ИЗ ВХОДНЫХ ЦЕН, а не из выдачи: независимый путь, поэтому
+    // сверка нетавтологична (`testing.md` §«Зависимый эталон мутация ловит плохо»).
+    let w = gateway::DEFAULT_VP_BIN_WIDTH_E8;
+    let mut expected_keys: BTreeSet<i64> = BTreeSet::new();
     {
         let mut j = Journal::open_with(dir.path(), cfg()).expect("open_with");
         for i in 0..TICKS_IN_RANGE {
@@ -96,10 +104,18 @@ fn v1_production_shaped_frame_fits_signed_limit() {
                     price,
                     size: to_fixed(0.001),
                     side: Side::Buy,
-                    ts_exch_ms: T, // одна секунда ⇒ одна UTC-сессия, окно ничего не режет
+                    // Разнос по сессии — ПРОД-ФОРМА, а не украшение фикстуры.
+                    // Замер 2026-09-19: при всех сделках в ОДНОМ такте окно ничего не
+                    // эвиктит, `volume_bubbles` растёт вместе с числом цен, и кадр
+                    // остаётся сверхлимитным ДАЖЕ ПОСЛЕ правильного огрубления профиля —
+                    // то есть оракул недостижим GREEN. Плюс свёртка становится
+                    // квадратичной: 50 000 цен в одном такте — 40.7 с, те же 50 000
+                    // вразнос — 0.45 с. На проде `bubbles=407` при 211 381 цене.
+                    ts_exch_ms: SESSION_START_MS + (i * SPREAD_MS) / TICKS_IN_RANGE,
                 },
             ))
             .expect("append");
+            expected_keys.insert(price.div_euclid(w) * w);
             distinct += 1;
         }
         j.flush().expect("flush");
@@ -135,7 +151,32 @@ fn v1_production_shaped_frame_fits_signed_limit() {
         "SETUP НЕ СОСТОЯЛСЯ: профиль пуст — сделки не долетели до редьюсера"
     );
 
-    // 5. ПРЕДМЕТ: длина сериализованного кадра против ПОДПИСАННОГО предела.
+    // 5. **V1b (`C-229` R2) — ТОЧНОСТЬ СЕТКИ, а не только её наличие.**
+    //    `bins >= 1_000` пиннит отсутствие катастрофы, но пропускает заглушку
+    //    «на большом профиле взять 10·W»: она даёт 2 042 корзины против канонических
+    //    20 417, и обе ветки укладываются в предел. Поэтому сверяются МНОЖЕСТВА ключей.
+    let got_keys: BTreeSet<i64> = s.series.volume_profile[0]
+        .bins
+        .iter()
+        .map(|&(p, _)| p)
+        .collect();
+    assert_eq!(
+        got_keys.len(),
+        expected_keys.len(),
+        "V1b НАРУШЕН: корзин {} против канонического разбиения шириной {w} e8 — {}. \
+         Меньше канонического ⇒ сетка ГРУБЕЕ объявленной (продукт сужен сверх формы); \
+         больше ⇒ сетка мельче или не применена. Заглушка «для большого профиля взять 10·W» \
+         даёт ровно этот разрыв и проходит проверку размера.",
+        got_keys.len(),
+        expected_keys.len()
+    );
+    assert_eq!(
+        got_keys, expected_keys,
+        "V1b НАРУШЕН: множество ключей корзин не совпало с каноническим \
+         `price.div_euclid(W)*W` на тех же входных ценах"
+    );
+
+    // 6. ПРЕДМЕТ: длина сериализованного кадра против ПОДПИСАННОГО предела.
     let bytes = serde_json::to_vec(&s).expect("serialize snapshot").len();
     let limit = gateway::DEFAULT_MAX_RESPONSE_BYTES;
 
@@ -149,7 +190,7 @@ fn v1_production_shaped_frame_fits_signed_limit() {
         gateway::DEFAULT_VP_BIN_WIDTH_E8
     );
 
-    // 6. Анти-плацебо в обратную сторону: кадр не смеет оказаться подозрительно пустым.
+    // 7. Анти-плацебо в обратную сторону: кадр не смеет оказаться подозрительно пустым.
     //    Заглушка «отдавать пустой профиль» проходит проверку размера и убивает продукт.
     assert!(
         bins >= 1_000,
