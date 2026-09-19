@@ -41,17 +41,23 @@ chk cargo test -p gateway --test red_vp_bin_width_governed --quiet
 step "D (задача 4) — политика конфигурации на СТАРТЕ"
 chk cargo test -p gateway-serve --test red_vp_bin_width_startup --quiet
 
+step "D2 (задача 4, C-229 R4) — МОСТ env → сетка (и отвергнутый старт не трогает значение)"
+chk cargo test -p gateway-serve --test red_vp_bin_width_bridge --quiet
+
 # Состав наборов НАЗВАН ЛИТЕРАЛОМ, а не `-ge`: порог, отстающий от набора, есть ослабление
 # наблюдения ОТСУТСТВИЯ — потеря оракула оставила бы шаг зелёным (класс `R-118` N-1, `TD-140`).
-step "E — состав наборов (потеря оракула обязана быть ВИДНА)"
-EXPECT_A=8
-N_A=$(grep -cE '^fn v[0-9]' crates/gateway/tests/red_vp_bin_width.rs || echo 0)
-if [ "${N_A}" -eq "${EXPECT_A}" ]; then
-  echo "PASS: red_vp_bin_width.rs несёт ${N_A} оракулов (ожидается ${EXPECT_A})"
-else
-  echo "FAIL: red_vp_bin_width.rs несёт ${N_A} оракулов, ожидается ${EXPECT_A}"
-  FAIL=$((FAIL + 1))
-fi
+step "E — ИМЕНОВАННЫЙ состав обязательств (потеря оракула обязана быть ВИДНА)"
+# `C-229` R3: счёт функций по шаблону `^fn v[0-9]` пропустил ОТСУТСТВИЕ названного `V7` —
+# таблица спеки его требовала, набор не содержал, счёт сходился. Считать число мало:
+# проверяется присутствие КАЖДОГО обязательства поимённо.
+for ORACLE in v1_ v1b v2_ v2b v3_ v4_ v6_ v6b v6c v7_ v8_ v8b; do
+  if grep -rqE "(fn ${ORACLE}|V1b НАРУШЕН|${ORACLE^^})" crates/gateway/tests/red_vp_bin_width.rs crates/gateway/tests/red_vp_bin_width_size.rs; then
+    echo "PASS: обязательство ${ORACLE} предъявлено"
+  else
+    echo "FAIL: обязательство ${ORACLE} НЕ предъявлено ни одним оракулом"
+    FAIL=$((FAIL + 1))
+  fi
+done
 EXPECT_D=10
 N_D=$(grep -c '#\[test\]' crates/gateway-serve/tests/red_vp_bin_width_startup.rs || echo 0)
 if [ "${N_D}" -eq "${EXPECT_D}" ]; then
@@ -71,11 +77,15 @@ chk_sh "grep -qE 'GATEWAY_VP_BIN_WIDTH_E8: \\\$\\{GATEWAY_VP_BIN_WIDTH_E8:-[0-9]
 # ОТРИЦАНИЕ ГРЕПА ЗЕЛЕНО НА ПУСТОМ МЕСТЕ — поймано базовой линией 2026-09-18: при полном
 # отсутствии ручки `! grep -q` давал PASS. Проверка обязана НАБЛЮДАТЬ ОТСУТСТВИЕ
 # (`testing.md` §«Целостность гейта» св. 4), поэтому значение ИЗВЛЕКАЕТСЯ и сравнивается.
+# `C-229` R5.2: «любой дефолт > 1» пропускал `${GATEWAY_VP_BIN_WIDTH_E8:-2}` — строка,
+# практически выключающую огрубление и возвращающую аварию. Подписанная величина ОДНА
+# (§2.1 спеки), поэтому сверяется ТОЧНЫЙ литерал, а не диапазон.
+EXPECT_W=25000000
 VP_DEF=$(grep -oE 'GATEWAY_VP_BIN_WIDTH_E8:-[0-9]+' docker-compose.yml 2>/dev/null | head -1 | sed 's/.*-//')
-if [ -n "${VP_DEF}" ] && [ "${VP_DEF}" -gt 1 ] 2>/dev/null; then
-  echo "PASS: дефолт ручки рабочий (${VP_DEF} e8 — сетка включена без строки оператора)"
+if [ "${VP_DEF:-}" = "${EXPECT_W}" ]; then
+  echo "PASS: дефолт ручки равен подписанному литералу (${EXPECT_W} e8 = 0.25 USD)"
 else
-  echo "FAIL: дефолт ручки отсутствует или выключает сетку (получено: ${VP_DEF:-<нет строки>})"
+  echo "FAIL: дефолт ручки = ${VP_DEF:-<нет строки>}, ожидается РОВНО ${EXPECT_W}"
   FAIL=$((FAIL + 1))
 fi
 
@@ -108,7 +118,7 @@ else
 fi
 
 # Нейтрализация: ширина корзины принудительно = 1 e8 (тик) — сетки как будто нет.
-MUT_SRC="${MUT}/gateway/src/lib.rs"
+MUT_SRC="${MUT}/crates/gateway/src/lib.rs"   # ВНИМАНИЕ: cp -a crates даёт ${MUT}/crates/... — ошибка пути делала шаг H вечно-красным (найдено пробой достижимости rev2)
 if [ -f "${MUT_SRC}" ] && grep -q 'DEFAULT_VP_BIN_WIDTH_E8' "${MUT_SRC}"; then
   sed -i 's/pub const DEFAULT_VP_BIN_WIDTH_E8: i64 = [0-9_]*;/pub const DEFAULT_VP_BIN_WIDTH_E8: i64 = 1;/' "${MUT_SRC}"
   if (cd "${MUT}" && cargo test -p gateway --test red_vp_bin_width_size --quiet >/dev/null 2>&1); then
@@ -134,8 +144,25 @@ chk_sh "git diff --name-only ${BASE}..HEAD -- crates/contracts | grep -q . && ex
   "crates/contracts не тронут (T1 не меняется)"
 chk_sh "git diff ${BASE}..HEAD -- crates/gateway/src/lib.rs | grep -qE '^[+-].*GATEWAY_SCHEMA_VERSION' && exit 1 || exit 0" \
   "GATEWAY_SCHEMA_VERSION не бампнут (форма выдачи не меняется)"
-chk_sh "git diff ${BASE}..HEAD -- crates/gateway/src/lib.rs | grep -qE '^[+-].*fn selector_fingerprint' && exit 1 || exit 0" \
-  "selector_fingerprint не тронут (слепки не инвалидируются)"
+# `C-229` R5.1: греп по строке `fn selector_fingerprint` ловил только смену ОБЪЯВЛЕНИЯ.
+# Добавление `effective_vp_bin_width_e8().hash(&mut h);` в ТЕЛО функции эту строку не
+# трогает — сторож печатал PASS, пока все чекпоинты становились недействительными
+# (имя слепка детерминировано отпечатком, `crates/gateway/src/lib.rs:3710-3731`).
+# Сверяется ХЕШ ТЕЛА целиком.
+FP_EXPECT=e99e808bbce3b2f98a24bc3317230e7896439f4e39616c8ee3e54cb2ec44e181
+FP_BODY=$(sed -n '/pub fn selector_fingerprint/,/^    }$/p' crates/gateway/src/lib.rs)
+FP_GOT=$(printf '%s\n' "${FP_BODY}" | sha256sum | cut -d' ' -f1)
+FP_LINES=$(printf '%s\n' "${FP_BODY}" | wc -l)
+if [ "${FP_LINES}" -lt 10 ]; then
+  echo "FAIL: тело selector_fingerprint извлечено неверно (${FP_LINES} строк) — сторож слеп"
+  FAIL=$((FAIL + 1))
+elif [ "${FP_GOT}" = "${FP_EXPECT}" ]; then
+  echo "PASS: тело selector_fingerprint не тронуто (sha256 ${FP_GOT})"
+else
+  echo "FAIL: тело selector_fingerprint ИЗМЕНЕНО (sha256 ${FP_GOT} != ${FP_EXPECT}) — \
+отпечаток определяет имя слепка, значит все чекпоинты стали недействительны (§4 запрет 2)"
+  FAIL=$((FAIL + 1))
+fi
 chk_sh "git diff ${BASE}..HEAD -- docker-compose.yml | grep -qE '^[+-].*GATEWAY_BANDS' && exit 1 || exit 0" \
   "GATEWAY_BANDS не тронут (состав выдачи — граница C, чужой предмет)"
 chk_sh "git diff ${BASE}..HEAD -- crates/gateway/src/lib.rs | grep -qE '^[+-].*DEFAULT_MAX_RESPONSE_BYTES: usize' && exit 1 || exit 0" \
@@ -144,6 +171,35 @@ chk_sh "git diff --name-only ${BASE}..HEAD -- crates/book crates/venue-binance c
   "книга, venue-адаптеры и журнал не тронуты"
 chk_sh "git diff --name-only ${BASE}..HEAD -- TECH-DEBT.md PROJECT-STATE.md | grep -q . && exit 1 || exit 0" \
   "reviewer-owned файлы не тронуты"
+
+step "J (C-229 R5) — АНТИ-ПЛАЦЕБО САМИХ СТОРОЖЕЙ: они обязаны РЕАГИРОВАТЬ"
+# Сторож, про который сказано «он краснеет», но не предъявлено — описание намерения.
+# Оба новых сторожа проверяются мутацией их ВХОДА, без полной пересборки.
+
+# J1 — внедряем hash ширины в ТЕЛО fingerprint (ровно то нарушение §4 запрет 2, которое
+# прежняя редакция шага I пропускала) и убеждаемся, что хеш тела РАСХОДИТСЯ с эталоном.
+J_TMP=$(mktemp)
+sed -n '/pub fn selector_fingerprint/,/^    }$/p' crates/gateway/src/lib.rs \
+  | sed 's/^        h.finish()$/        effective_vp_bin_width_e8().hash(\&mut h);\n        h.finish()/' > "${J_TMP}"
+J_MUT_SHA=$(sha256sum "${J_TMP}" | cut -d' ' -f1)
+if [ "${J_MUT_SHA}" != "${FP_EXPECT}" ] && [ "$(wc -l < "${J_TMP}")" -gt 10 ]; then
+  echo "PASS: сторож тела fingerprint РАЗЛИЧАЕТ мутацию (внедрённый hash ширины меняет sha256)"
+else
+  echo "FAIL: мутация тела fingerprint НЕ отличается от эталона — сторож слеп к §4 запрету 2"
+  FAIL=$((FAIL + 1))
+fi
+rm -f "${J_TMP}"
+
+# J2 — подсовываем compose-дефолт `:-2` (он «> 1», то есть прежнюю проверку проходил) и
+# убеждаемся, что сверка с ТОЧНЫМ литералом его отвергает.
+J_DEF=$(printf 'GATEWAY_VP_BIN_WIDTH_E8: ${GATEWAY_VP_BIN_WIDTH_E8:-2}\n' \
+  | grep -oE 'GATEWAY_VP_BIN_WIDTH_E8:-[0-9]+' | head -1 | sed 's/.*-//')
+if [ "${J_DEF}" != "${EXPECT_W}" ]; then
+  echo "PASS: сторож дефолта РАЗЛИЧАЕТ выключающее значение (:-2 отвергается литералом ${EXPECT_W})"
+else
+  echo "FAIL: сторож дефолта не отличил :-2 от подписанного ${EXPECT_W}"
+  FAIL=$((FAIL + 1))
+fi
 
 if [ "${FAIL}" -eq 0 ]; then echo "VERDICT: PASS"; exit 0; fi
 echo "VERDICT: FAIL (${FAIL})"; exit 1
