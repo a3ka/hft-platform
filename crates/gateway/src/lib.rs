@@ -701,10 +701,32 @@ impl VolumeProfileAcc {
     /// Названо не `into_rows_ref`, чтобы не нарушать clippy `wrong_self_convention`
     /// (`into_*` обязан брать `self` по значению).
     fn vp_rows(&self) -> Vec<VolumeProfileRow> {
+        let w = effective_vp_bin_width_e8();
         let mut rows: Vec<VolumeProfileRow> = self
             .bins
             .iter()
-            .map(|(&session_id, hist)| compute_vp_row(session_id, hist))
+            .map(|(&session_id, hist)| {
+                // M-86 §2.2 (BINDING): ключ корзины = price_e8.div_euclid(W) * W,
+                // якорь — ноль. Форма `VolumeProfileRow` НЕ меняется (ключи и
+                // объёмы внутри корзины сложены в i128, как в apply_trade).
+                // POC/VAH/VAL/VA% считаются ПОСЛЕ огрубления — compute_vp_row
+                // работает на уже-огрублённом hist и возвращает ключи ОТДАННЫХ
+                // корзин. `merge_volume_profile` складывает row.bins двух строк
+                // по ключу — ключи УЖЕ на сетке, форма не меняется, склейка у
+                // потребителя остаётся аддитивной (V8).
+                if w <= 1 {
+                    // Сетка в тик или меньше: огрубление тривиально, ключи совпадают
+                    // с торгованными ценами. Прежнее поведение до M-86.
+                    compute_vp_row(session_id, hist)
+                } else {
+                    let mut coarsened: BTreeMap<i64, i128> = BTreeMap::new();
+                    for (&p, &v) in hist {
+                        let k = p.div_euclid(w) * w;
+                        *coarsened.entry(k).or_insert(0) += v;
+                    }
+                    compute_vp_row(session_id, &coarsened)
+                }
+            })
             .collect();
         rows.sort_by_key(|r| r.session_id);
         rows
