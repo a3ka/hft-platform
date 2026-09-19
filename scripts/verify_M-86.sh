@@ -139,6 +139,32 @@ else
 fi
 rm -rf "${MUT}"
 
+step "H2 (C-230 B2) — МУТАЦИЯ ЭВИКЦИИ: прошлая VP-сессия не дропается ⇒ V1 обязан краснеть"
+# Без прошлой сессии в фикстуре `V1` не доказывал `VB-I-10`: одна строка профиля выходила
+# и у реализации со сломанным whole-session drop, потому что дропать было нечего.
+MUT2=$(mktemp -d)
+cp -a crates Cargo.toml Cargo.lock rust-toolchain.toml "${MUT2}/" 2>/dev/null
+MUT2_SRC="${MUT2}/crates/gateway/src/lib.rs"
+if [ ! -f "${MUT2_SRC}" ]; then
+  echo "FAIL: H2 копия не собралась"
+  FAIL=$((FAIL + 1))
+elif ! grep -q 'self.vp.bins.remove(&sid);' "${MUT2_SRC}"; then
+  echo "FAIL: H2 точка мутации не найдена — whole-session drop изменён, сторож ослеп"
+  FAIL=$((FAIL + 1))
+else
+  sed -i 's|self\.vp\.bins\.remove(&sid);|/* MUT: whole-session drop отключён */|' "${MUT2_SRC}"
+  if grep -q 'self.vp.bins.remove(&sid);' "${MUT2_SRC}"; then
+    echo "FAIL: H2 SETUP НЕ СОСТОЯЛСЯ — мутация не внесена"
+    FAIL=$((FAIL + 1))
+  elif (cd "${MUT2}" && cargo test -p gateway --test red_vp_bin_width_size --quiet >/dev/null 2>&1); then
+    echo "FAIL: мутация (эвикция отключена) НЕ уронила V1 — VB-I-10 остаётся без защиты"
+    FAIL=$((FAIL + 1))
+  else
+    echo "PASS: мутация (эвикция отключена) уронила V1, как и обязана (VB-I-10)"
+  fi
+fi
+rm -rf "${MUT2}"
+
 step "I — ЗОНА: запретный список §4 спеки соблюдён диапазоном"
 chk_sh "git diff --name-only ${BASE}..HEAD -- crates/contracts | grep -q . && exit 1 || exit 0" \
   "crates/contracts не тронут (T1 не меняется)"

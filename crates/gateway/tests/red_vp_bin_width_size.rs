@@ -53,6 +53,11 @@ const MIN_DISTINCT_PRICES: usize = 200_000;
 const SESSION_START_MS: i64 = (1_752_000_010_000 / 86_400_000) * 86_400_000;
 /// Сделки РАЗНОСЯТСЯ по сессии, а не стоят в одном такте — см. §7.1 спеки.
 const SPREAD_MS: i64 = 86_000_000;
+/// ПРОШЛАЯ UTC-сессия (`C-230` B2): она обязана БЫТЬ в журнале и ОТСУТСТВОВАТЬ в кадре.
+const PREV_SESSION_START_MS: i64 = SESSION_START_MS - 86_400_000;
+/// Цены прошлой сессии заведомо ниже текущих — чтобы её корзины были отличимы.
+const PREV_LOW_E8: i64 = LOW_E8 - 10_000 * 100_000_000;
+const PREV_TRADES: i64 = 500;
 
 fn cfg() -> WriterConfig {
     WriterConfig {
@@ -86,12 +91,35 @@ fn v1_production_shaped_frame_fits_signed_limit() {
     // 2. Строим журнал прод-геометрии.
     let dir = tempfile::tempdir().expect("tempdir");
     let mut distinct = 0_usize;
+    // seq последнего события ПРОШЛОЙ сессии — берётся ЧЕСТНО из `append`, а не угадывается
+    // по порядковому номеру (соседи делают так же: `red_gateway_window.rs` собирает `seqs`).
+    let mut last_prev_seq: u64 = 0;
     // Эталон `V1b` строится ИЗ ВХОДНЫХ ЦЕН, а не из выдачи: независимый путь, поэтому
     // сверка нетавтологична (`testing.md` §«Зависимый эталон мутация ловит плохо»).
     let w = gateway::DEFAULT_VP_BIN_WIDTH_E8;
     let mut expected_keys: BTreeSet<i64> = BTreeSet::new();
     {
         let mut j = Journal::open_with(dir.path(), cfg()).expect("open_with");
+        // ── ПРОШЛАЯ СЕССИЯ (`C-230` B2) ──
+        // Без неё `volume_profile.len() == 1` ниже — ТАВТОЛОГИЯ: одна строка выходит и у
+        // реализации со сломанным whole-session drop, потому что дропать нечего. `VB-I-10`
+        // (эвикция целой ПРОШЛОЙ сессии по `session_max_time_s < lo_time_s`) оставался без
+        // RED-защиты, а измеренная цена кадра была занижена относительно прод-формы.
+        for k in 0..PREV_TRADES {
+            let ev = j
+                .append(EventKind::md(
+                    Venue::Binance,
+                    "BTCUSDT",
+                    MdPayload::Trade {
+                        price: PREV_LOW_E8 + k * TICK_E8,
+                        size: to_fixed(0.001),
+                        side: Side::Buy,
+                        ts_exch_ms: PREV_SESSION_START_MS + k,
+                    },
+                ))
+                .expect("append prev-session");
+            last_prev_seq = ev.seq;
+        }
         for i in 0..TICKS_IN_RANGE {
             if i % 5 >= KEEP_OF_5 {
                 continue; // пропуски — прод заполняет лишь 41 % тиковой сетки
@@ -129,6 +157,26 @@ fn v1_production_shaped_frame_fits_signed_limit() {
          {MIN_DISTINCT_PRICES} — это не прод-масштаб, и вывод о размере недействителен"
     );
 
+    // 3bis. SETUP-СТРАЖ `C-230` B2 — доказать, что прошлая сессия РЕАЛЬНО в журнале и
+    //       видна редьюсеру. Снимок берётся НА КУРСОРЕ конца прошлой сессии: свёртка идёт
+    //       только по её 500 событиям, то есть страж стоит доли секунды и не удваивает
+    //       цену теста. Без него «в кадре одна сессия» ничего не доказывает.
+    let prev_only = gateway::snapshot(
+        dir.path(),
+        EpochFilter::OwnCaptureOnly,
+        &sel(),
+        Cursor::at(last_prev_seq),
+    )
+    .expect("snapshot на курсоре прошлой сессии");
+    assert_eq!(
+        prev_only.series.volume_profile.len(),
+        1,
+        "SETUP НЕ СОСТОЯЛСЯ: на курсоре конца прошлой сессии профиль дал {} строк вместо 1 — \
+         прошлая сессия не записана либо не видна редьюсеру, и проверка эвикции ниже пуста",
+        prev_only.series.volume_profile.len()
+    );
+    let prev_session_id = prev_only.series.volume_profile[0].session_id;
+
     let s = gateway::snapshot(
         dir.path(),
         EpochFilter::OwnCaptureOnly,
@@ -139,11 +187,19 @@ fn v1_production_shaped_frame_fits_signed_limit() {
 
     // 4. Второй SETUP-СТРАЖ: профиль обязан быть НЕПУСТ и односессионен, иначе мы меряем
     //    размер пустоты.
+    // ПРЕДМЕТ `C-230` B2 / `VB-I-10`: прошлая сессия обязана быть эвиктнута ЦЕЛИКОМ.
     assert_eq!(
         s.series.volume_profile.len(),
         1,
-        "SETUP НЕ СОСТОЯЛСЯ: ожидалась одна сессия, получено {}",
+        "V1 НАРУШЕН (`VB-I-10`): в кадре {} строк профиля вместо одной — прошлая UTC-сессия \
+         (session_id={prev_session_id}) не эвиктнута оконным правилом \
+         `session_max_time_s < lo_time_s`, хотя её последний бакет старше окна на сутки",
         s.series.volume_profile.len()
+    );
+    assert_ne!(
+        s.series.volume_profile[0].session_id, prev_session_id,
+        "V1 НАРУШЕН (`VB-I-10`): в кадре осталась ПРОШЛАЯ сессия ({prev_session_id}) вместо \
+         текущей — эвикция выбросила не ту"
     );
     let bins = s.series.volume_profile[0].bins.len();
     assert!(
