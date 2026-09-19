@@ -101,66 +101,77 @@ chk_sh "grep -q 'VP-I-4' docs/fa/viz-backend.md" \
 chk_sh "grep -qE 'VP-I-4.*(диапазон|ДИАПАЗОН)' docs/fa/viz-backend.md" \
   "VP-I-4 в FA описывает корзину профиля как ДИАПАЗОН, а не как точку"
 
-step "H — МУТАЦИОННЫЙ КОНТРОЛЬ: нейтрализация сетки обязана ронять B и A, но НЕ V6"
-# Изолированная копия с ПИННУТЫМ тулчейном. `rust-toolchain.toml` копируется обязательно:
-# без него копия резолвит cargo по системному дефолту и мутация судится ДРУГИМ компилятором,
-# чем прод-гейт (`C-171`, класс `TD-035`). Сравнивается РЕЗУЛЬТАТ (`cargo --version`), а не
-# наличие файла: файл не доказывает, что тулчейн взвёлся.
+step "H/H2 — МУТАЦИОННЫЙ КОНТРОЛЬ через scripts/lib/mutation_gate.sh (A-035 §2.3 M1)"
+# ПЕРЕПИСАНО rev4 по `C-231` B3 и решению арбитра `A-035` §2.2.
+# Прежняя форма `if (cd MUT && cargo test …); then FAIL else PASS` принимала ЛЮБОЙ
+# ненулевой код за доказательство мутации — включая провал КОМПИЛЯЦИИ. Замер `A-035` Ф-3:
+# `cargo test` возвращает 101 и на упавшем ассерте, и на несобравшемся крейте, поэтому
+# «внимательному автору» тут нечего было читать. Успех обратной проверки доказывается
+# ТРЕМЯ свидетелями (W0 baseline GREEN, W1 мутант собрался, W2 упал СВОИМ диагнозом);
+# код возврата по-прежнему решает ОТКАЗ.
+# shellcheck source=scripts/lib/mutation_gate.sh
+. scripts/lib/mutation_gate.sh
+
+# ── H — мутация СЕТКИ: ширина принудительно = 1 e8 (тик), то есть сетки как бы нет ──────
 MUT=$(mktemp -d)
 cp -a crates Cargo.toml Cargo.lock rust-toolchain.toml "${MUT}/" 2>/dev/null
 V_REPO=$(cargo --version 2>/dev/null)
 V_MUT=$(cd "${MUT}" && cargo --version 2>/dev/null)
-if [ -n "${V_REPO}" ] && [ "${V_REPO}" = "${V_MUT}" ]; then
-  echo "PASS: тулчейн копии совпал с репозиторием (${V_MUT})"
-else
-  echo "FAIL: тулчейн копии (${V_MUT}) != репозиторий (${V_REPO}) — мутация судила бы другим компилятором"
+if [ -z "${V_REPO}" ] || [ "${V_REPO}" != "${V_MUT}" ]; then
+  echo "FAIL: H тулчейн копии (${V_MUT}) != репозиторий (${V_REPO}) — мутация судила бы другим компилятором"
   FAIL=$((FAIL + 1))
+else
+  echo "PASS: H тулчейн копии совпал с репозиторием (${V_MUT})"
 fi
-
-# Нейтрализация: ширина корзины принудительно = 1 e8 (тик) — сетки как будто нет.
-MUT_SRC="${MUT}/crates/gateway/src/lib.rs"   # ВНИМАНИЕ: cp -a crates даёт ${MUT}/crates/... — ошибка пути делала шаг H вечно-красным (найдено пробой достижимости rev2)
-if [ -f "${MUT_SRC}" ] && grep -q 'DEFAULT_VP_BIN_WIDTH_E8' "${MUT_SRC}"; then
-  sed -i 's/pub const DEFAULT_VP_BIN_WIDTH_E8: i64 = [0-9_]*;/pub const DEFAULT_VP_BIN_WIDTH_E8: i64 = 1;/' "${MUT_SRC}"
-  if (cd "${MUT}" && cargo test -p gateway --test red_vp_bin_width_size --quiet >/dev/null 2>&1); then
-    echo "FAIL: мутация (сетка = тик) НЕ уронила оракул размера — он не пиннит предмет"
-    FAIL=$((FAIL + 1))
-  else
-    echo "PASS: мутация (сетка = тик) уронила оракул размера, как и обязана"
-  fi
-  if (cd "${MUT}" && cargo test -p gateway --test red_vp_bin_width --quiet >/dev/null 2>&1); then
-    echo "FAIL: мутация (сетка = тик) НЕ уронила оракулы сетки"
-    FAIL=$((FAIL + 1))
-  else
-    echo "PASS: мутация (сетка = тик) уронила оракулы сетки"
-  fi
-else
-  echo "FAIL: точка мутации не найдена — DEFAULT_VP_BIN_WIDTH_E8 отсутствует (набор ещё RED)"
+MUT_SRC="${MUT}/crates/gateway/src/lib.rs"
+if [ ! -f "${MUT_SRC}" ] || ! grep -q 'DEFAULT_VP_BIN_WIDTH_E8' "${MUT_SRC}"; then
+  echo "FAIL: H SETUP — точка мутации не найдена (DEFAULT_VP_BIN_WIDTH_E8 отсутствует: набор ещё plan-time RED)"
   FAIL=$((FAIL + 1))
+else
+  sed -i 's/pub const DEFAULT_VP_BIN_WIDTH_E8: i64 = [0-9_]*;/pub const DEFAULT_VP_BIN_WIDTH_E8: i64 = 1;/' "${MUT_SRC}"
+  if ! grep -q 'DEFAULT_VP_BIN_WIDTH_E8: i64 = 1;' "${MUT_SRC}"; then
+    echo "FAIL: H SETUP НЕ СОСТОЯЛСЯ — мутация не внесена (сигнатура константы разошлась со спекой §2.1)"
+    FAIL=$((FAIL + 1))
+  else
+    echo "--- H.1: V1 обязан упасть ПО РАЗМЕРУ кадра ---"
+    if mutant_must_fail "${MUT}" gateway red_vp_bin_width_size \
+         v1_production_shaped_frame_fits_signed_limit 'V1 НАРУШЕН: кадр прод-формы весит'; then
+      echo "PASS: H.1 мутация (сетка = тик) уронила V1 своим диагнозом"
+    else
+      echo "FAIL: H.1 мутация (сетка = тик) НЕ доказана тремя свидетелями"
+      FAIL=$((FAIL + 1))
+    fi
+    echo "--- H.2: V2 обязан упасть, а V6 обязан ОСТАТЬСЯ ЗЕЛЁНЫМ (он же свидетель сборки) ---"
+    if mutant_must_fail "${MUT}" gateway red_vp_bin_width \
+         v2_every_emitted_price_is_on_the_grid 'V2 НАРУШЕН' \
+         v6_grid_aligned_input_passes_through_unchanged; then
+      echo "PASS: H.2 V2 упал своим диагнозом, V6 остался зелёным"
+    else
+      echo "FAIL: H.2 не сошлось: либо V2 упал не своим диагнозом, либо V6 не пережил мутацию"
+      FAIL=$((FAIL + 1))
+    fi
+  fi
 fi
 rm -rf "${MUT}"
 
-step "H2 (C-230 B2) — МУТАЦИЯ ЭВИКЦИИ: прошлая VP-сессия не дропается ⇒ V1 обязан краснеть"
-# Без прошлой сессии в фикстуре `V1` не доказывал `VB-I-10`: одна строка профиля выходила
-# и у реализации со сломанным whole-session drop, потому что дропать было нечего.
+# ── H2 — мутация ЭВИКЦИИ: whole-session drop отключён (`C-230` B2, `VB-I-10`) ───────────
 MUT2=$(mktemp -d)
 cp -a crates Cargo.toml Cargo.lock rust-toolchain.toml "${MUT2}/" 2>/dev/null
 MUT2_SRC="${MUT2}/crates/gateway/src/lib.rs"
-if [ ! -f "${MUT2_SRC}" ]; then
-  echo "FAIL: H2 копия не собралась"
-  FAIL=$((FAIL + 1))
-elif ! grep -q 'self.vp.bins.remove(&sid);' "${MUT2_SRC}"; then
-  echo "FAIL: H2 точка мутации не найдена — whole-session drop изменён, сторож ослеп"
+if [ ! -f "${MUT2_SRC}" ] || ! grep -q 'self.vp.bins.remove(&sid);' "${MUT2_SRC}"; then
+  echo "FAIL: H2 SETUP — точка мутации не найдена: whole-session drop изменён, сторож ослеп"
   FAIL=$((FAIL + 1))
 else
   sed -i 's|self\.vp\.bins\.remove(&sid);|/* MUT: whole-session drop отключён */|' "${MUT2_SRC}"
   if grep -q 'self.vp.bins.remove(&sid);' "${MUT2_SRC}"; then
     echo "FAIL: H2 SETUP НЕ СОСТОЯЛСЯ — мутация не внесена"
     FAIL=$((FAIL + 1))
-  elif (cd "${MUT2}" && cargo test -p gateway --test red_vp_bin_width_size --quiet >/dev/null 2>&1); then
-    echo "FAIL: мутация (эвикция отключена) НЕ уронила V1 — VB-I-10 остаётся без защиты"
-    FAIL=$((FAIL + 1))
+  elif mutant_must_fail "${MUT2}" gateway red_vp_bin_width_size \
+         v1_production_shaped_frame_fits_signed_limit 'VB-I-10.*в кадре 2 строк'; then
+    echo "PASS: H2 мутация (эвикция отключена) уронила V1 диагнозом про две строки профиля"
   else
-    echo "PASS: мутация (эвикция отключена) уронила V1, как и обязана (VB-I-10)"
+    echo "FAIL: H2 мутация (эвикция отключена) НЕ доказана тремя свидетелями"
+    FAIL=$((FAIL + 1))
   fi
 fi
 rm -rf "${MUT2}"
