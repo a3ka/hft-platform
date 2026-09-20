@@ -1,0 +1,7 @@
+# TD-035 (2026-07-24): пин toolchain — локальный clippy/rustc БИТ-В-БИТ равен CI, иначе
+# «green local ≠ green CI» (инцидент M-23: clippy 1.97 unnecessary_sort_by поймал только merge,
+# локальный 1.94 lint не знал). CI (.github/workflows/ci.yml) ОБЯЗАН использовать ЭТУ же версию
+# (dtolnay/rust-toolchain@1.97.0). Бамп версии — ОДновременно здесь И в ci.yml (осознанно, не drift).
+[toolchain]
+channel = "1.97.0"
+components = ["rustfmt", "clippy"]
