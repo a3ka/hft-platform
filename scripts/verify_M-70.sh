@@ -276,6 +276,12 @@ step "task #6 — bump GATEWAY_SCHEMA_VERSION: смена ФОРМЫ выдач�
 # M-36/M-38a/M-48/M-68). Сверка с `M-72`: два милестоуна не двигают версию одновременно.
 BASE=$(git merge-base HEAD origin/main 2>/dev/null || echo "")
 HEAD_SHA=$(git rev-parse HEAD 2>/dev/null || echo "")
+# V_HEAD читается ВНЕ развилки намеренно (R-191 круг 2, регресс, пойманный полным прогоном).
+# Он не зависит от диапазона — это значение в ТЕКУЩЕМ файле, — а СОСЕДНИЙ шаг task #6b
+# сверяет с ним sacred-пин. Пока присваивание жило внутри else-ветки, любой SKIP шага #6
+# оставлял соседа с пустой переменной и ронял его как "SETUP НЕ СОСТОЯЛСЯ". Починка одного
+# шага, ломающая соседний, — второй вопрос мутационного контроля (`testing.md`).
+V_HEAD="$(sed -n 's/^pub const GATEWAY_SCHEMA_VERSION: u32 = \([0-9]\+\);.*/\1/p' "${LIB}" | head -1)"
 if [ -z "${BASE}" ]; then
   echo "FAIL: merge-base с origin/main не вычислен — шаги диапазона судить не по чему" >&2
   FAIL=$((FAIL + 1))
@@ -301,7 +307,6 @@ else
   # включая правку комментария рядом и возврат к прежнему значению. Требование говорит
   # «форма объявлена БАМПОМ», то есть версия обязана СТАТЬ БОЛЬШЕ.
   V_BASE="$(git show "${BASE}:${LIB}" 2>/dev/null | sed -n 's/^pub const GATEWAY_SCHEMA_VERSION: u32 = \([0-9]\+\);.*/\1/p' | head -1)"
-  V_HEAD="$(sed -n 's/^pub const GATEWAY_SCHEMA_VERSION: u32 = \([0-9]\+\);.*/\1/p' "${LIB}" | head -1)"
   if [ -z "${V_BASE}" ] || [ -z "${V_HEAD}" ]; then
     echo "FAIL: task #6 SETUP НЕ СОСТОЯЛСЯ — версия схемы не извлеклась (база='${V_BASE}' HEAD='${V_HEAD}'): объявление сменило форму, и сравнивать нечего" >&2
     FAIL=$((FAIL + 1))
