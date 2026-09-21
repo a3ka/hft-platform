@@ -30,15 +30,16 @@ else
   fail "task1: нет модуля admission.rs с пятью исходами ServingOutcome"
 fi
 
-# ─────────────── задача 2 — готовность без чтения журнала (предметный набор) ───────────────
-CP_OUT=$(cargo test -p gateway --test red_m87_cold_path_reads_nothing 2>&1)
-CP_RC=$?
-CP_LINE=$(printf '%s\n' "$CP_OUT" | grep -E '^test result' | tail -1)
-if [ $CP_RC -eq 0 ]; then
-  pass "task2: red_m87_cold_path_reads_nothing — ${CP_LINE:-GREEN}"
+# ─────────────── задача 2 — готовность судится ТАМ, ГДЕ ЖИВЁТ ПРЕДОХРАНИТЕЛЬ ───────────────
+# A-037 D-1 следствие 1: файл `crates/gateway/tests/red_m87_cold_path_reads_nothing.rs` ИЗЪЯТ.
+# Он пиннил на ОБЩЕЙ функции LiveReducer::resume поведение, противоположное двум другим
+# sacred-оракулам того же корпуса на той же функции — набор был невыполним против самого
+# себя. Четыре состояния слепка переехали в транспорт: юнит-оракулы `readiness()` в
+# red_m87_admission.rs и WS-оракулы над журналом-ловушкой в red_m87_entrypoint.rs.
+if [ -f crates/gateway/tests/red_m87_cold_path_reads_nothing.rs ]; then
+  fail "task2: изъятый файл red_m87_cold_path_reads_nothing.rs вернулся — набор снова противоречит сам себе (A-037 D-1)"
 else
-  fail "task2: red_m87_cold_path_reads_nothing КРАСЕН — ${CP_LINE:-компиляция}"
-  printf '%s\n' "$CP_OUT" | grep -E '^(thread |assertion|---- |error)' | head -20
+  pass "task2: библиотечный оракул изъят; готовность судится в транспорте"
 fi
 
 # ─────────────── задачи 1+3+4+7 — форма допуска, политика, бюджет, секрет ───────────────
@@ -109,11 +110,15 @@ fi
 # лимит с сервисом. Теперь каждый из трёх поимённо названных сервисов обязан нести И
 # ограничение процессора, И ограничение памяти. Пропуск одного сервиса роняет шаг.
 lim_for_service() {
-  # печатает число лимитов внутри блока сервиса $1 (до следующего сервиса того же уровня)
+  # A-037 У-8: считаются ТОЛЬКО ключи УРОВНЯ СЕРВИСА (отступ ровно 4 пробела) либо
+  # `deploy.resources.limits.*`. Блоки `labels:`/`environment:` исключены — иначе шаг
+  # зеленеет от строки `cpus: "2"` внутри меток, что арбитр и воспроизвёл (мутация M-9a).
   awk -v svc="  $1:" '
     $0 == svc { inblock = 1; next }
     inblock && /^  [a-z][a-z0-9_-]*:/ { inblock = 0 }
-    inblock && /^[[:space:]]+(cpus|mem_limit|memory):/ { n++ }
+    inblock && /^    [a-z_]+:/ { sub(/:.*/, ""); sub(/^ +/, ""); cur = $0 }
+    inblock && /^    (cpus|mem_limit|memory):/ { n++; next }
+    inblock && /^ +(cpus|memory):/ && cur == "deploy" { n++; next }
     END { print n + 0 }
   ' docker-compose.yml
 }
@@ -125,7 +130,7 @@ done
 if [ -z "$LIM_MISSING" ]; then
   pass "task9: процессор И память ограничены у ВСЕХ трёх классов (выдача, запись, прогреватель)"
 else
-  fail "task9: нет пары лимитов у сервисов:$LIM_MISSING — ограничить только контейнер выдачи, оставив пересчёт без контроля, недостаточно"
+  fail "task9: нет пары лимитов уровня сервиса у:$LIM_MISSING — ключи внутри labels/environment не считаются"
 fi
 skip "task9: ФАКТИЧЕСКИ применённые лимиты, запас для recorder'а и поведение НА лимите снимаются на проде (docker inspect) — шаг деплой-гейта §8; замер 2026-09-21 дал NanoCpus=0 Memory=0 при живом описании сервисов"
 
@@ -139,14 +144,46 @@ CORPUS=$( { grep -rl 'checkpoint_dir: None' crates/gateway-serve/tests/ 2>/dev/n
 DECISIONS=$(awk '/^### 16.1. Решения по изменённым ожиданиям/,0' "$SPEC")
 MISSING=""
 for f in $CORPUS; do
-  printf '%s' "$DECISIONS" | grep -q -- "$f" || MISSING="$MISSING $f"
+  # A-037 У-8: решение ищется В ТОЙ ЖЕ строке, что имя файла, и обязано нести токен.
+  # Прежний предикат принимал строку с именем и ПУСТЫМ решением (ложно-зелёный, мутация M-10b).
+  printf '%s' "$DECISIONS" | grep -- "$f" | grep -qE 'ПЕРЕНОСИТСЯ|НЕ ЗАТРАГИВАЕТСЯ|УДАЛЯЕТСЯ' \
+    || MISSING="$MISSING $f"
 done
 CORPUS_N=$(printf '%s\n' $CORPUS | grep -c . || true)
-if [ -n "$CORPUS" ] && [ -z "$MISSING" ] \
-   && ! printf '%s' "$DECISIONS" | grep -q 'на момент коммита набора изменённых ожиданий нет'; then
-  pass "task10: решение записано по каждому из $CORPUS_N файлов корпуса"
+# Два ТЕСТ-уровневых решения (A-037 D-4) — по имени теста, не файла.
+for t in resume_without_checkpoint_reports_full_replay o5_broken_checkpoint; do
+  printf '%s' "$DECISIONS" | grep -q -- "$t" || MISSING="$MISSING тест:$t"
+done
+if [ -n "$CORPUS" ] && [ -z "$MISSING" ]; then
+  pass "task10: решение с токеном записано по каждому из $CORPUS_N файлов и по двум тестам D-4"
 else
-  fail "task10: в §16.1 нет решения по файлам:$MISSING (всего в корпусе: $CORPUS_N; плейсхолдер считается отсутствием решения)"
+  fail "task10: нет решения (или токена ПЕРЕНОСИТСЯ/НЕ ЗАТРАГИВАЕТСЯ/УДАЛЯЕТСЯ) для:$MISSING"
+fi
+
+# ─────────── A-037 D-1 — библиотека меняется ТОЛЬКО АДДИТИВНО ───────────
+# Две команды решения, вынесенные в гейт: (а) корпус библиотеки не тронут, (б) он зелен.
+# Это и есть проверяемая граница с A-033: не-аддитивный сдвиг библиотеки краснит
+# существующий sacred-тест, который dev править не вправе.
+MB87=$(git merge-base origin/main HEAD 2>/dev/null || echo "")
+if [ -z "$MB87" ]; then
+  fail "D-1(а): merge-base не вычислен — аддитивность не предъявлена"
+else
+  NONADD=$(git diff --name-status "$MB87"..HEAD -- crates/gateway/tests/ \
+           | grep -vE '^A[[:space:]]+crates/gateway/tests/red_m87_' || true)
+  if [ -z "$NONADD" ]; then
+    pass "D-1(а): библиотечный корпус тронут только добавлениями red_m87_*"
+  else
+    fail "D-1(а): не-аддитивные правки библиотечного корпуса:"
+    printf '%s\n' "$NONADD" | head -5
+  fi
+fi
+
+LIBOUT=$(cargo test -p gateway 2>&1)
+LIBSUM=$(printf '%s\n' "$LIBOUT" | grep -E '^test result' | awk '{p+=$4; f+=$6} END {print "passed="p" failed="f}')
+if printf '%s\n' "$LIBOUT" | grep -qE '^test result: FAILED'; then
+  fail "D-1(б): библиотечный корпус КРАСЕН — $LIBSUM"
+else
+  pass "D-1(б): библиотечный корпус зелен — $LIBSUM"
 fi
 
 # ─────────────── паритет с CI ───────────────

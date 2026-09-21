@@ -247,6 +247,8 @@ fn form_silence_alarm_ignores_unsupported_traffic() {
         successes: 0,
         refusals_supported: 0,
         refusals_unsupported: 1_000,
+        journal_payload_bytes_read: 0,
+        slots_in_flight: 0,
     };
     assert!(
         !silence_alarm(&noisy),
@@ -259,6 +261,8 @@ fn form_silence_alarm_ignores_unsupported_traffic() {
         successes: 0,
         refusals_supported: 1_000,
         refusals_unsupported: 0,
+        journal_payload_bytes_read: 0,
+        slots_in_flight: 0,
     };
     assert!(
         silence_alarm(&starving),
@@ -277,6 +281,8 @@ fn form_no_demand_is_not_an_alarm() {
         successes: 0,
         refusals_supported: 0,
         refusals_unsupported: 0,
+        journal_payload_bytes_read: 0,
+        slots_in_flight: 0,
     };
     assert!(
         !silence_alarm(&idle),
@@ -369,5 +375,294 @@ fn form_unbounded_profile_is_refused_even_with_canonical_bands() {
         ServingOutcome::Unsupported,
         "селектор с window_ms=None и timeframe_ms=1 принят: это unbounded offline-свёртка \
          (crates/gateway/src/lib.rs:287-305), то есть публичный путь к полной истории"
+    );
+}
+
+// ════════ У-2 (`A-037`) — четыре состояния слепка ПЕРЕЕХАЛИ сюда как юнит-оракулы ════════
+//
+// Прежний файл `crates/gateway/tests/red_m87_cold_path_reads_nothing.rs` ИЗЪЯТ: он пиннил на
+// ОБЩЕЙ функции `LiveReducer::resume` поведение, противоположное двум другим sacred-оракулам
+// того же корпуса на той же функции. Набор был невыполним против самого себя: позеленеть он
+// мог только правкой общей библиотеки, которую §10 спеки запрещает, а `A-033` признал
+// негодной. Дефект конструкции, а не изложения; найден гейтом, решён арбитражем.
+//
+// Здесь те же четыре состояния судятся там, где предохранитель ЖИВЁТ, — в транспорте, через
+// `readiness()`, которая на `LiveReducer::resume` не смотрит вовсе.
+
+fn poison_first_segment(dir: &std::path::Path) {
+    let mut segs: Vec<_> = std::fs::read_dir(dir)
+        .expect("read_dir")
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "jrnl"))
+        .collect();
+    segs.sort();
+    let target = segs.first().expect("setup-страж: сегментов нет");
+    let mut bytes = std::fs::read(target).expect("read segment");
+    assert!(bytes.len() > 512, "setup-страж: сегмент короче 512 Б");
+    let mid = bytes.len() / 2;
+    for b in bytes.iter_mut().skip(mid).take(64) {
+        *b = !*b;
+    }
+    std::fs::write(target, &bytes).expect("write poisoned");
+}
+
+/// Состояние 1 — слепка нет. `readiness` обязана ответить исходом, НЕ создав прогрев и НЕ
+/// прочитав полезной нагрузки: журнал под ловушкой, любое чтение содержимого упало бы.
+#[test]
+fn u2_readiness_missing_checkpoint_over_trap() {
+    let dir = journal_of(40);
+    poison_first_segment(dir.path());
+    let ckpt = tempfile::tempdir().expect("ckpt");
+
+    let before = std::fs::read_dir(ckpt.path()).expect("read_dir").count();
+    let outcome = readiness(ckpt.path(), dir.path(), &sel_with("BTCUSDT", vec![0.001]));
+    let after = std::fs::read_dir(ckpt.path()).expect("read_dir").count();
+
+    assert_eq!(
+        outcome,
+        ServingOutcome::NotReady,
+        "отсутствие слепка обязано давать НАЗВАННЫЙ исход"
+    );
+    assert_eq!(
+        after, before,
+        "проверка готовности создала файлы в каталоге слепков — значит запустила прогрев"
+    );
+}
+
+/// Состояние 2 — слепок повреждён.
+#[test]
+fn u2_readiness_corrupt_checkpoint_over_trap() {
+    let dir = journal_of(40);
+    poison_first_segment(dir.path());
+    let ckpt = tempfile::tempdir().expect("ckpt");
+    let s = sel_with("BTCUSDT", vec![0.001]);
+    std::fs::write(
+        ckpt.path().join(format!(
+            "ckpt-{:016x}.bin",
+            gateway::checkpoint::selector_fingerprint(&s)
+        )),
+        vec![0xABu8; 4096],
+    )
+    .expect("write corrupt");
+    assert_eq!(
+        readiness(ckpt.path(), dir.path(), &s),
+        ServingOutcome::NotReady,
+        "повреждённый слепок обязан давать названный исход, а не уводить в пересчёт"
+    );
+}
+
+/// Состояние 3 — слепок несовместим по версии провода.
+#[test]
+fn u2_readiness_incompatible_checkpoint() {
+    let dir = journal_of(40);
+    let ckpt = tempfile::tempdir().expect("ckpt");
+    let s = sel_with("BTCUSDT", vec![0.001]);
+    gateway::checkpoint::advance(dir.path(), ckpt.path(), &s, EpochFilter::OwnCaptureOnly)
+        .expect("advance");
+    let path = ckpt.path().join(format!(
+        "ckpt-{:016x}.bin",
+        gateway::checkpoint::selector_fingerprint(&s)
+    ));
+    let mut bytes = std::fs::read(&path).expect("read");
+    let declared = u32::from_le_bytes(bytes[12..16].try_into().expect("4 байта"));
+    assert_eq!(
+        declared,
+        gateway::GATEWAY_SCHEMA_VERSION,
+        "setup-страж: не то поле"
+    );
+    bytes[12..16].copy_from_slice(&(declared + 1).to_le_bytes());
+    std::fs::write(&path, &bytes).expect("write");
+    poison_first_segment(dir.path());
+
+    assert_eq!(
+        readiness(ckpt.path(), dir.path(), &s),
+        ServingOutcome::NotReady,
+        "несовместимый по версии слепок обязан давать названный исход"
+    );
+}
+
+/// Состояние 4 — слепок валиден, но отстал сверх бюджета докормки. Порог — КОНФИГ политики,
+/// не константа теста (`A-037` D-1, следствие 1).
+#[test]
+fn u2_readiness_stale_beyond_budget() {
+    let dir = journal_of(40);
+    let ckpt = tempfile::tempdir().expect("ckpt");
+    let s = sel_with("BTCUSDT", vec![0.001]);
+    gateway::checkpoint::advance(dir.path(), ckpt.path(), &s, EpochFilter::OwnCaptureOnly)
+        .expect("advance");
+    // Журнал уезжает далеко вперёд.
+    {
+        let mut j = Journal::open_with(dir.path(), cfg()).expect("open_with");
+        for i in 0..500u64 {
+            j.append(EventKind::md(
+                Venue::Binance,
+                "BTCUSDT",
+                MdPayload::L2Snapshot {
+                    bids: vec![Level {
+                        price: to_fixed(64_900.0 + i as f64),
+                        size: to_fixed(1.0),
+                    }],
+                    asks: vec![Level {
+                        price: to_fixed(65_100.0 + i as f64),
+                        size: to_fixed(1.0),
+                    }],
+                    ts_exch_ms: T0 + 1_000_000 + (i as i64) * 100,
+                },
+            ))
+            .expect("append");
+        }
+        j.flush().expect("flush");
+    }
+    assert_eq!(
+        readiness(ckpt.path(), dir.path(), &s),
+        ServingOutcome::NotReady,
+        "слепок, отставший сверх бюджета докормки, обязан давать названный исход: иначе \
+         'валидный слепок' становится обходным путём к тому же неограниченному пересчёту"
+    );
+}
+
+/// АНТИ-ПЛАЦЕБО к четырём выше: свежий пригодный слепок обязан давать `Ready`.
+/// Без него реализация `readiness → NotReady` всегда проходит все четыре.
+#[test]
+fn u2_readiness_fresh_checkpoint_is_ready() {
+    let dir = journal_of(40);
+    let ckpt = tempfile::tempdir().expect("ckpt");
+    let s = sel_with("BTCUSDT", vec![0.001]);
+    gateway::checkpoint::advance(dir.path(), ckpt.path(), &s, EpochFilter::OwnCaptureOnly)
+        .expect("advance");
+    assert_eq!(
+        readiness(ckpt.path(), dir.path(), &s),
+        ServingOutcome::Ready,
+        "свежий пригодный слепок не признан готовым — 'отказывать всегда' решением не является"
+    );
+}
+
+// ════════ У-5 (`A-037`) — каждый объявленный тип имеет ОРАКУЛ ════════
+
+/// Бюджет исчерпан по событиям ⇒ работа остановлена с НАЗВАННОЙ причиной.
+#[test]
+fn u5_budget_exhausted_by_events_is_named() {
+    use gateway_serve::admission::{BudgetStop, CallBudget};
+    let budget = CallBudget {
+        max_events: 8,
+        max_payload_bytes: u64::MAX,
+        max_wall_ms: u64::MAX,
+        max_output_bytes: u64::MAX,
+        max_state_bytes: u64::MAX,
+    };
+    let dir = journal_of(200);
+    let stop = gateway_serve::admission::feed_tail_within(
+        &dir,
+        &sel_with("BTCUSDT", vec![0.001]),
+        budget,
+        &NeverCancel,
+    );
+    assert_eq!(
+        stop,
+        Some(BudgetStop::Events),
+        "исчерпание бюджета по событиям обязано быть НАЗВАНО, а не проявиться усечением"
+    );
+}
+
+/// Бюджет исчерпан по ПРОЧИТАННЫМ БАЙТАМ ⇒ та же дисциплина. Счётчик событий этого не
+/// ловит (план §15.1): сегмент можно прочитать, не декодируя.
+#[test]
+fn u5_budget_exhausted_by_payload_bytes_is_named() {
+    use gateway_serve::admission::{BudgetStop, CallBudget};
+    let budget = CallBudget {
+        max_events: u64::MAX,
+        max_payload_bytes: 512,
+        max_wall_ms: u64::MAX,
+        max_output_bytes: u64::MAX,
+        max_state_bytes: u64::MAX,
+    };
+    let dir = journal_of(200);
+    let stop = gateway_serve::admission::feed_tail_within(
+        &dir,
+        &sel_with("BTCUSDT", vec![0.001]),
+        budget,
+        &NeverCancel,
+    );
+    assert_eq!(
+        stop,
+        Some(BudgetStop::PayloadBytes),
+        "предел по байтам не назван"
+    );
+}
+
+/// Кооперативная отмена: признак, взведённый после k порций, останавливает обработчик
+/// ДО конца хвоста. Внешне прервать блокирующую задачу нельзя — это факт о рантайме;
+/// проверять признак МЕЖДУ порциями можно и нужно (`A-037` У-5).
+#[test]
+fn u5_cooperative_cancel_stops_between_chunks() {
+    use gateway_serve::admission::{BudgetStop, CallBudget, Cancel};
+    struct AfterK {
+        seen: std::sync::atomic::AtomicUsize,
+        k: usize,
+    }
+    impl Cancel for AfterK {
+        fn cancelled(&self) -> bool {
+            self.seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= self.k
+        }
+    }
+    let budget = CallBudget {
+        max_events: u64::MAX,
+        max_payload_bytes: u64::MAX,
+        max_wall_ms: u64::MAX,
+        max_output_bytes: u64::MAX,
+        max_state_bytes: u64::MAX,
+    };
+    let dir = journal_of(400);
+    let cancel = AfterK {
+        seen: std::sync::atomic::AtomicUsize::new(0),
+        k: 2,
+    };
+    let stop = gateway_serve::admission::feed_tail_within(
+        &dir,
+        &sel_with("BTCUSDT", vec![0.001]),
+        budget,
+        &cancel,
+    );
+    assert_eq!(
+        stop,
+        Some(BudgetStop::Cancelled),
+        "признак отмены не остановил обработчик между порциями"
+    );
+    assert!(
+        cancel.seen.load(std::sync::atomic::Ordering::Relaxed) >= 2,
+        "признак отмены не опрашивался между порциями вовсе"
+    );
+}
+
+struct NeverCancel;
+impl gateway_serve::admission::Cancel for NeverCancel {
+    fn cancelled(&self) -> bool {
+        false
+    }
+}
+
+/// Слот: занят — отказ; освобождён — обслуживание. ДЕТЕРМИНИРОВАННО, без гонок: слот
+/// удерживается САМИМ тестом, а не «долгой работой», исход которой зависит от хоста
+/// (`testing.md`: гейт меряет свой инвариант, не окружение; `A-037` У-6).
+#[test]
+fn u6_slot_held_by_work_not_released_by_waiting() {
+    use gateway_serve::admission::ServingSlots;
+    let slots = ServingSlots::new(1);
+    let guard = slots.try_acquire().expect("первый слот обязан выдаваться");
+    assert_eq!(slots.in_flight(), 1, "занятый слот не наблюдаем снаружи");
+    assert!(
+        slots.try_acquire().is_none(),
+        "второй слот выдан при пределе 1 — ограничителя нет"
+    );
+    drop(guard);
+    assert_eq!(
+        slots.in_flight(),
+        0,
+        "слот не освобождён завершением РАБОТЫ"
+    );
+    assert!(
+        slots.try_acquire().is_some(),
+        "после завершения работы слот обязан выдаваться снова"
     );
 }

@@ -32,7 +32,7 @@ use gateway::Selector;
 use gateway_serve::admission::{AdmissionPolicy, LiveProfile};
 use gateway_serve::auth::Claims;
 use gateway_serve::metrics::{freshness, serving_counters};
-use gateway_serve::server::{bind, ServeConfig};
+use gateway_serve::server::{bind_with_policy, ServeConfig};
 use journal::{EpochFilter, Journal, WriterConfig};
 use jsonwebtoken::{encode, DecodingKey, EncodingKey, Header};
 use serde_json::{json, Value};
@@ -141,8 +141,56 @@ fn config(dir: &std::path::Path, ckpt: Option<std::path::PathBuf>) -> ServeConfi
     }
 }
 
+/// **ЛОВУШКА (`A-037` §3.4, план §15.1).** Журнал, у которого полезная нагрузка сегмента
+/// испорчена при ЦЕЛОМ заголовке: прод-путь чтения строг к CRC (`journal::stream`), поэтому
+/// любое чтение содержимого даёт `Err`, а опись каталога и заголовки читаются.
+///
+/// Это и есть «подставной читатель, немедленно проваливающий проверку при попытке читать
+/// полезную нагрузку». Счётчик декодированных событий недостаточен (план §15.1): сегмент
+/// можно открыть и распаковать, не вызвав декодер. Ловушка ловит именно ЧТЕНИЕ.
+fn poison_segment(dir: &std::path::Path, index: usize) {
+    let mut segs: Vec<_> = std::fs::read_dir(dir)
+        .expect("read_dir")
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "jrnl"))
+        .collect();
+    segs.sort();
+    let target = segs.get(index).unwrap_or_else(|| {
+        panic!(
+            "setup-страж: сегмента {index} нет, сегментов {}",
+            segs.len()
+        )
+    });
+    let mut bytes = std::fs::read(target).expect("read segment");
+    assert!(
+        bytes.len() > 512,
+        "setup-страж: сегмент короче 512 Б — порча попала бы в заголовок, и ловушка ловила бы \
+         не то"
+    );
+    let mid = bytes.len() / 2;
+    for b in bytes.iter_mut().skip(mid).take(64) {
+        *b = !*b;
+    }
+    std::fs::write(target, &bytes).expect("write poisoned segment");
+}
+
 async fn serve(dir: &std::path::Path, ckpt: Option<std::path::PathBuf>) -> String {
-    let server = bind(config(dir, ckpt)).await.expect("bind");
+    serve_with(dir, ckpt, policy()).await
+}
+
+/// Политика передаётся серверу ЯВНО (`A-037` У-3). Билдер выбран вместо поля `ServeConfig`
+/// намеренно: он АДДИТИВЕН — одиннадцать существующих sacred-файлов с литералом
+/// `ServeConfig { … }` не ломаются, и правило `A-037` D-1 («библиотека и корпус меняются
+/// только аддитивно») соблюдается и здесь.
+async fn serve_with(
+    dir: &std::path::Path,
+    ckpt: Option<std::path::PathBuf>,
+    pol: AdmissionPolicy,
+) -> String {
+    let server = bind_with_policy(config(dir, ckpt), pol)
+        .await
+        .expect("bind_with_policy");
     let addr = server.local_addr().to_string();
     tokio::spawn(async move {
         let _ = server.serve().await;
@@ -441,11 +489,15 @@ async fn c6_counters_are_emitted_by_the_real_serving_path() {
 
 // ═════════════ C9 — четыре позиции свежести ═════════════
 
-/// Позиции обязаны быть РАЗЛИЧИМЫ, и отставание СЛЕПКА не имеет права останавливать
-/// исправную живую выдачу: слепок — кэш, а не источник истины.
+/// Позиции обязаны быть РАЗЛИЧИМЫ **конструкцией фикстуры** (`A-037` У-7): слепок строится,
+/// ЗАТЕМ журнал дописывается, ЗАТЕМ поднимается сервер. Обязана выполняться СТРОГАЯ
+/// `snapshot_ms < source_ms` — одна общая константа на четыре поля этот тест не проходит.
+///
+/// И отставание СЛЕПКА не имеет права останавливать исправную живую выдачу: слепок — кэш,
+/// а не источник истины.
 #[tokio::test]
-async fn c9_stale_snapshot_does_not_stop_a_healthy_live_path() {
-    let dir = journal_busy(500);
+async fn c9_four_positions_differ_and_stale_snapshot_does_not_stop_serving() {
+    let dir = journal_busy(300);
     let ckpt = tempfile::tempdir().expect("ckpt");
     gateway::checkpoint::advance(
         dir.path(),
@@ -454,15 +506,35 @@ async fn c9_stale_snapshot_does_not_stop_a_healthy_live_path() {
         EpochFilter::OwnCaptureOnly,
     )
     .expect("advance");
-    let addr = serve(dir.path(), Some(ckpt.path().to_path_buf())).await;
 
+    // Журнал уезжает ПОСЛЕ слепка — источник заведомо свежее слепка.
+    {
+        let mut j = Journal::open_with(dir.path(), writer_cfg()).expect("open_with");
+        for i in 0..200i64 {
+            j.append(EventKind::md(
+                Venue::Binance,
+                "BTCUSDT",
+                MdPayload::Trade {
+                    price: to_fixed(65_020.0),
+                    size: to_fixed(0.2),
+                    side: Side::Buy,
+                    ts_exch_ms: BASE_MS + 500_000 + i * 100,
+                },
+            ))
+            .expect("trade");
+        }
+        j.flush().expect("flush");
+    }
+
+    let addr = serve(dir.path(), Some(ckpt.path().to_path_buf())).await;
     let mut ws = connect(&addr).await;
     send(&mut ws, subscribe("s1", canonical_selector_json())).await;
     let msg = recv(&mut ws).await.expect("сервер промолчал");
     assert_eq!(
         msg.get("type").and_then(|t| t.as_str()),
         Some("snapshot"),
-        "исправная выдача остановлена: {msg}"
+        "исправная выдача остановлена при отставшем СЛЕПКЕ: {msg}. Слепок — кэш, а не \
+         источник истины"
     );
 
     let f = freshness();
@@ -472,8 +544,15 @@ async fn c9_stale_snapshot_does_not_stop_a_healthy_live_path() {
         (f.source_ms, f.projection_ms, f.published_ms, f.snapshot_ms)
     );
     assert!(
+        f.snapshot_ms < f.source_ms,
+        "позиции НЕ различимы: слепок ({}) не отстаёт от источника ({}) на фикстуре, где \
+         журнал дописан ПОСЛЕ слепка. Одна общая константа на четыре поля этот тест не \
+         проходит — и не должна",
+        f.snapshot_ms,
+        f.source_ms
+    );
+    assert!(
         f.published_ms >= f.snapshot_ms,
-        "опубликованные данные не могут отставать от слепка: слепок пишется ИЗ них, \
-         а не наоборот"
+        "опубликованные данные не могут отставать от слепка: слепок пишется ИЗ них"
     );
 }
