@@ -52,6 +52,19 @@ else
   printf '%s\n' "$AD_OUT" | grep -E '^(error|thread |assertion)' | head -20
 fi
 
+# ─────────────── задачи 2+3+5+6+8 — ОРАКУЛ ТОЧКИ ВХОДА (C-234 R2/R3) ───────────────
+# Несущая проверка поставки: предохранитель судится на РЕАЛЬНОМ публичном пути
+# (WS entrypoint), а не рядом с ним. Без неё GREEN достижим без подключения допуска.
+EP_OUT=$(cargo test -p gateway-serve --test red_m87_entrypoint 2>&1)
+EP_RC=$?
+EP_LINE=$(printf '%s\n' "$EP_OUT" | grep -E '^test result' | tail -1)
+if [ $EP_RC -eq 0 ]; then
+  pass "task2+3+5+6+8: red_m87_entrypoint — ${EP_LINE:-GREEN}"
+else
+  fail "task2+3+5+6+8: red_m87_entrypoint КРАСЕН — ${EP_LINE:-компиляция}"
+  printf '%s\n' "$EP_OUT" | grep -E '^(error|thread |assertion)' | head -15
+fi
+
 # ─────────────── задача 4 — счётчик ПРОЧИТАННЫХ БАЙТ существует ───────────────
 if grep -qE '^\s*pub payload_bytes_read: u64,' "$GW"; then
   pass "task4: ReadStats несёт payload_bytes_read"
@@ -91,21 +104,49 @@ else
   fail "task8: свежести нет ни в одном файле выдачи (совпадений: $FRESH)"
 fi
 
-# ─────────────── задача 9 — ресурсные лимиты ОБЪЯВЛЕНЫ ───────────────
-LIM=$(grep -cE '^\s+(cpus|mem_limit|memory):' docker-compose.yml)
-if [ "$LIM" -ge 4 ]; then
-  pass "task9: ресурсные лимиты объявлены (строк: $LIM — выдача, recorder, прогреватель)"
+# ─────────────── задача 9 — лимиты У КАЖДОГО ИЗ ТРЁХ КЛАССОВ СЕРВИСА ───────────────
+# C-234 R4: прежняя проверка считала строки и зеленела от ЛЮБЫХ четырёх — она не связывала
+# лимит с сервисом. Теперь каждый из трёх поимённо названных сервисов обязан нести И
+# ограничение процессора, И ограничение памяти. Пропуск одного сервиса роняет шаг.
+lim_for_service() {
+  # печатает число лимитов внутри блока сервиса $1 (до следующего сервиса того же уровня)
+  awk -v svc="  $1:" '
+    $0 == svc { inblock = 1; next }
+    inblock && /^  [a-z][a-z0-9_-]*:/ { inblock = 0 }
+    inblock && /^[[:space:]]+(cpus|mem_limit|memory):/ { n++ }
+    END { print n + 0 }
+  ' docker-compose.yml
+}
+LIM_MISSING=""
+for svc in gateway-serve recorder gateway-checkpoint; do
+  n=$(lim_for_service "$svc")
+  [ "$n" -ge 2 ] || LIM_MISSING="$LIM_MISSING $svc($n)"
+done
+if [ -z "$LIM_MISSING" ]; then
+  pass "task9: процессор И память ограничены у ВСЕХ трёх классов (выдача, запись, прогреватель)"
 else
-  fail "task9: ресурсных лимитов в docker-compose.yml недостаточно (строк: $LIM, нужно ≥4)"
+  fail "task9: нет пары лимитов у сервисов:$LIM_MISSING — ограничить только контейнер выдачи, оставив пересчёт без контроля, недостаточно"
 fi
-skip "task9: ФАКТИЧЕСКИ применённые лимиты снимаются на проде (docker inspect) — шаг деплой-гейта §8, не этого скрипта"
+skip "task9: ФАКТИЧЕСКИ применённые лимиты, запас для recorder'а и поведение НА лимите снимаются на проде (docker inspect) — шаг деплой-гейта §8; замер 2026-09-21 дал NanoCpus=0 Memory=0 при живом описании сервисов"
 
-# ─────────────── задача 10 — ревизия тест-корпуса ───────────────
-if grep -q '^### 16.1. Решения по изменённым ожиданиям' "$SPEC" \
-   && ! grep -q 'на момент коммита набора изменённых ожиданий нет' "$SPEC"; then
-  pass "task10: решения по изменённым ожиданиям записаны"
+# ─────────────── задача 10 — решение по КАЖДОМУ файлу корпуса ───────────────
+# C-234 R4: прежняя проверка требовала лишь исчезновения одной фразы-плейсхолдера и не
+# ловила ПРОПУСК решения. Теперь состав снимается ТЕМИ ЖЕ командами, что в §16 спеки, и
+# каждый найденный файл обязан быть НАЗВАН в таблице решений §16.1.
+CORPUS=$( { grep -rl 'checkpoint_dir: None' crates/gateway-serve/tests/ 2>/dev/null;
+            grep -rl 'full_replay\|resume_without_checkpoint\|rebuilds' crates/gateway/tests/ 2>/dev/null; } \
+          | xargs -r -n1 basename | sort -u )
+DECISIONS=$(awk '/^### 16.1. Решения по изменённым ожиданиям/,0' "$SPEC")
+MISSING=""
+for f in $CORPUS; do
+  printf '%s' "$DECISIONS" | grep -q -- "$f" || MISSING="$MISSING $f"
+done
+CORPUS_N=$(printf '%s\n' $CORPUS | grep -c . || true)
+if [ -n "$CORPUS" ] && [ -z "$MISSING" ] \
+   && ! printf '%s' "$DECISIONS" | grep -q 'на момент коммита набора изменённых ожиданий нет'; then
+  pass "task10: решение записано по каждому из $CORPUS_N файлов корпуса"
 else
-  fail "task10: таблица §16.1 пуста — решение по каждому изменённому ожиданию не записано"
+  fail "task10: в §16.1 нет решения по файлам:$MISSING (всего в корпусе: $CORPUS_N; плейсхолдер считается отсутствием решения)"
 fi
 
 # ─────────────── паритет с CI ───────────────
