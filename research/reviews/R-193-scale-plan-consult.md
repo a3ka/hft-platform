@@ -488,3 +488,21 @@ exit=101
 $ bash scripts/check_branch_health.sh | tail -1
 VERDICT: PASS — наблюдение состоялось (NOTE не блокируют: это наблюдатель, не барьер)
 ```
+
+## §Барьеры на ветке — сырой вывод, включая КРАСНЫЙ
+
+```
+$ bash scripts/check_gate_meta.sh 399c577 2>&1 | tail -4
+FAIL  research/reviews/R-193-scale-plan-consult.md: milestone «SCALE-PLAN» не похож на идентификатор артефакта (КЛАСС-НОМЕР[буква])
+VERDICT: FAIL (1) — вердикт не привязан к предмету либо merge прошёл без вердикта.
+exit=1
+$ grep -n "grep -qE '\^\[A-Za-z\]+-\[0-9\]+\[a-z\]?\$'" scripts/check_gate_meta.sh
+441:      grep -qE '^[A-Za-z]+-[0-9]+[a-z]?$' <<<"${ms}" \
+```
+
+Значение `milestone: SCALE-PLAN` предписано мандатом дословно; барьер `check_gate_meta.sh:441`
+требует форму `КЛАСС-НОМЕР`. Конфликт мандата с барьером я НЕ разрешаю сам — мандат сузил
+зону до одного файла, а выбор идентификатора предмета (новый `M-NN` для программы SCALE через
+`scripts/next_artifact_id.sh M` либо номер первой спеки S0) — решение ведущего architect'а.
+До правки шапки ветка в `main` не вливается: джоб `gate-meta` входит в агрегат. Барьер
+`check_artifact_ids.sh` в CI-форме (`EVENT_NAME`) не гонял.
