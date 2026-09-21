@@ -18,7 +18,7 @@
 
 use contracts::{to_fixed, DataSource, EventKind, Level, MdPayload, Venue};
 use gateway::Selector;
-use gateway_serve::admission::{admit, readiness, AdmissionPolicy, ServingOutcome};
+use gateway_serve::admission::{admit, readiness, AdmissionPolicy, LiveProfile, ServingOutcome};
 use gateway_serve::metrics::{serving_counters, silence_alarm, ServingCounters};
 use journal::{EpochFilter, Journal, WriterConfig};
 
@@ -80,6 +80,14 @@ fn policy() -> AdmissionPolicy {
     AdmissionPolicy {
         allowed_symbols: vec!["BTCUSDT".to_string()],
         canonical_bands: CANONICAL.to_vec(),
+        // `C-234` R1: конечный перечень профилей. Без него селектор
+        // `{ timeframe_ms: 1, window_ms: None }` проходит по символу и полосам,
+        // оставаясь НЕОГРАНИЧЕННЫМ.
+        allowed_profiles: vec![LiveProfile {
+            timeframe_ms: 1_000,
+            window_ms: 60_000,
+            depth_cadence_ms: None,
+        }],
         max_concurrent_serves: 4,
     }
 }
@@ -223,7 +231,12 @@ fn form_payload_bytes_are_counted_at_all() {
     );
 }
 
-// ─────────────────────── §7 — сторож МОЛЧАНИЯ ───────────────────────
+// ─────────────────────── §7 — сторож МОЛЧАНИЯ: ПРАВИЛО, не эмиссия ───────────────────────
+//
+// ГРАНИЦА НАЗВАНА (`C-234` R3): ниже судится ПРАВИЛО тревоги как чистая функция — что оно
+// не звенит на мусорном трафике и на пустом окне, но звенит на голодании. Этого
+// НЕДОСТАТОЧНО: `OPS-I-10` (`docs/fa/ops.md:478`) требует прогнать ПРОДЮСЕРА и предъявить
+// значение. Эмиссию на реальном пути выдачи судит `red_m87_entrypoint.rs::c6_*`.
 
 /// Успех считается РАБОТОЙ, а не кодом ответа; поддержанные и неподдержанные запросы
 /// считаются ОТДЕЛЬНО — иначе поток мусора держит тревогу включённой и обесценивает её.
@@ -335,5 +348,26 @@ fn form_secret_has_exactly_one_interpretation() {
         verify_token(&token, &key).is_ok(),
         "токен, подписанный общей трактовкой секрета, не принят сервером: трактовок \
          по-прежнему две (TD-207)"
+    );
+}
+
+/// Профиль вне разрешённого перечня ⇒ `Unsupported` (`C-234` R1). Символ и полосы здесь
+/// КАНОНИЧЕСКИЕ — отклонить такой запрос способна только проверка ПРОФИЛЯ.
+#[test]
+fn form_unbounded_profile_is_refused_even_with_canonical_bands() {
+    let p = policy();
+    let unbounded = Selector {
+        venue: Venue::Binance,
+        symbol: "BTCUSDT".to_string(),
+        timeframe_ms: 1,
+        bands: CANONICAL.to_vec(),
+        window_ms: None,
+        depth_cadence_ms: None,
+    };
+    assert_eq!(
+        admit(&p, &unbounded),
+        ServingOutcome::Unsupported,
+        "селектор с window_ms=None и timeframe_ms=1 принят: это unbounded offline-свёртка \
+         (crates/gateway/src/lib.rs:287-305), то есть публичный путь к полной истории"
     );
 }
