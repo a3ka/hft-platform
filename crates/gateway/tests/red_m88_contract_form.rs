@@ -113,6 +113,42 @@ fn sel(bands: Vec<f64>) -> Selector {
     }
 }
 
+/// Фикстура: книга, затем СНЯТИЕ всех её уровней в том же бакете (полный срез пуст).
+fn journal_of_with_removal() -> (tempfile::TempDir, Vec<u64>) {
+    journal_of(vec![
+        snapshot_ev(&[(64_990.0, 5.0), (64_980.0, 3.0)], &[(65_010.0, 4.0)], T),
+        delta_ev(
+            &[(64_990.0, 0.0), (64_980.0, 0.0)],
+            &[(65_010.0, 0.0)],
+            1,
+            2,
+            T + 1,
+        ),
+    ])
+}
+
+/// Фикстура: книга, затем ТОЛЬКО сделки — наблюдения книги в кадре нет вовсе.
+fn journal_of_trades_after_book() -> (tempfile::TempDir, Vec<u64>) {
+    journal_of(vec![
+        snapshot_ev(&[(64_990.0, 5.0)], &[(65_010.0, 4.0)], T),
+        trade_ev(65_000.0, 1.0, Side::Buy, T + 10),
+        trade_ev(65_000.0, 2.0, Side::Buy, T + 20),
+    ])
+}
+
+/// Фикстура на `n` событий книги — для оракула восстановления.
+fn journal_of_n(n: u64) -> (tempfile::TempDir, Vec<u64>) {
+    let mut ev = Vec::new();
+    for i in 0..n {
+        ev.push(snapshot_ev(
+            &[(64_990.0 + i as f64, 3.0)],
+            &[(65_010.0 + i as f64, 4.0)],
+            T + (i as i64) * 100,
+        ));
+    }
+    journal_of(ev)
+}
+
 /// Форма провода объявлена и поднята: смена правила склейки есть смена формы (`VB-I-4`).
 #[test]
 fn form_schema_version_is_bumped_to_11() {
@@ -256,5 +292,232 @@ fn form_apply_reports_outcome() {
         acc.apply(&f),
         ApplyOutcome::OutOfOrder,
         "повторно применённый кадр обязан быть отвергнут ЯВНО, а не молча проигнорирован"
+    );
+}
+
+// ═══════════ ПОЛНЫЙ ЦИКЛ КЛИЕНТА С ВОССТАНОВЛЕНИЕМ (`C-233` R1) ═══════════
+//
+// Находка гейта, принятая целиком: исход `OutOfOrder` полезен ТОЛЬКО если у клиента есть
+// объявленный путь восстановления. Без него «отвергать» означает «тихо заморозить экран» —
+// дефект ХУЖЕ исходного, потому что призрак виден, а заморозка нет.
+//
+// ЧТО ЗДЕСЬ МОДЕЛИРУЕТСЯ И ЧТО НЕТ — граница названа, а не размыта. Производственный
+// потребитель — фронт на Next.js, он вне зоны Market и на Rust не написан. Ниже — модель
+// ПОЛНОГО клиентского цикла: провод → применение → наблюдение исхода → восстановление
+// снимком → сходимость с эталоном. Модель доказывает, что путь восстановления ВЫРАЗИМ и
+// СХОДИТСЯ; она НЕ доказывает, что фронт его реализовал. Последнее — условие приёмки на
+// стороне фронта (зона founder'а), названное в спеке §11.
+
+/// Клиент, который ведёт себя ПО КОНТРАКТУ: применяет кадры, а на отвергнутом кадре
+/// восстанавливается новым снимком вместо того, чтобы замереть.
+struct ContractClient {
+    state: Snapshot,
+    resnapshots: usize,
+    rejected: usize,
+}
+
+impl ContractClient {
+    fn new(state: Snapshot) -> Self {
+        Self {
+            state,
+            resnapshots: 0,
+            rejected: 0,
+        }
+    }
+
+    /// Кадр приходит ПО ПРОВОДУ; исход обязан быть ОБРАБОТАН, а не проглочен.
+    /// Форма `let _ = apply(..)` здесь запрещена намеренно: именно она в первой редакции
+    /// набора обесценивала `#[must_use]` (`C-233` R1).
+    fn on_wire_frame(&mut self, bytes: &[u8], resnapshot: &dyn Fn() -> Snapshot) -> ApplyOutcome {
+        let frame: gateway::Frame = serde_json::from_slice(bytes).expect("wire → frame");
+        let outcome = self.state.apply(&frame);
+        match outcome {
+            ApplyOutcome::Applied => {}
+            ApplyOutcome::OutOfOrder | ApplyOutcome::Incompatible => {
+                // Объявленный путь восстановления: взять новый снимок и продолжить с него.
+                self.rejected += 1;
+                self.resnapshots += 1;
+                self.state = resnapshot();
+            }
+        }
+        outcome
+    }
+}
+
+fn wire(f: &gateway::Frame) -> Vec<u8> {
+    serde_json::to_vec(f).expect("frame → wire")
+}
+
+/// (в) дубль и запоздалый кадр вызывают ОБЪЯВЛЕННОЕ восстановление, а не тихую заморозку,
+/// и после восстановления клиент СХОДИТСЯ с полным пересчётом.
+#[test]
+fn client_recovers_from_rejected_frame_instead_of_freezing() {
+    let _g = serial();
+    let s = sel(vec![0.001]);
+    let (dir, seqs) = journal_of_n(30);
+    let take_snapshot = || {
+        gateway::snapshot(dir.path(), EpochFilter::OwnCaptureOnly, &s, Cursor::LATEST)
+            .expect("snapshot")
+    };
+
+    let base = gateway::snapshot(
+        dir.path(),
+        EpochFilter::OwnCaptureOnly,
+        &s,
+        Cursor::at(seqs[0]),
+    )
+    .expect("snapshot at");
+    let (frames, _next) = gateway::frames_since(
+        dir.path(),
+        EpochFilter::OwnCaptureOnly,
+        &s,
+        Cursor::at(seqs[0]),
+        usize::MAX,
+    )
+    .expect("frames");
+    let f = frames.first().expect("кадр").clone();
+
+    let mut client = ContractClient::new(base);
+    assert_eq!(
+        client.on_wire_frame(&wire(&f), &take_snapshot),
+        ApplyOutcome::Applied,
+        "первый кадр продолжает курсор и обязан быть принят"
+    );
+    assert_eq!(
+        client.on_wire_frame(&wire(&f), &take_snapshot),
+        ApplyOutcome::OutOfOrder,
+        "повтор того же кадра обязан быть отвергнут ЯВНО"
+    );
+    assert_eq!(
+        client.resnapshots, 1,
+        "отвергнутый кадр обязан приводить к восстановлению; клиент, который просто замер, \
+         хуже клиента с призраком — его молчание не видно"
+    );
+    assert_eq!(
+        client.state.series.heatmap,
+        take_snapshot().series.heatmap,
+        "после восстановления клиент обязан СОЙТИСЬ с полным пересчётом"
+    );
+}
+
+/// (а) пустой полный срез ОЧИЩАЕТ колонку у клиента, прошедшего через провод.
+#[test]
+fn client_clears_column_on_empty_full_slice() {
+    let _g = serial();
+    let s = sel(vec![0.001]);
+    let (dir, seqs) = journal_of_with_removal();
+    let take_snapshot = || {
+        gateway::snapshot(dir.path(), EpochFilter::OwnCaptureOnly, &s, Cursor::LATEST)
+            .expect("snapshot")
+    };
+    let base = gateway::snapshot(
+        dir.path(),
+        EpochFilter::OwnCaptureOnly,
+        &s,
+        Cursor::at(seqs[0]),
+    )
+    .expect("snapshot at");
+    assert!(
+        !base.series.heatmap.is_empty(),
+        "setup-страж: до снятия карта обязана быть непустой"
+    );
+
+    let (frames, _n) = gateway::frames_since(
+        dir.path(),
+        EpochFilter::OwnCaptureOnly,
+        &s,
+        Cursor::at(seqs[0]),
+        usize::MAX,
+    )
+    .expect("frames");
+    let mut client = ContractClient::new(base);
+    for f in &frames {
+        client.on_wire_frame(&wire(f), &take_snapshot);
+    }
+    assert_eq!(
+        client.state.series.heatmap,
+        take_snapshot().series.heatmap,
+        "пустой полный срез не очистил колонку у клиента, прошедшего через провод"
+    );
+}
+
+/// (б) ОТСУТСТВИЕ наблюдения колонку НЕ очищает. Обратная ошибка того же класса.
+#[test]
+fn client_keeps_column_when_observation_absent() {
+    let _g = serial();
+    let s = sel(vec![0.001]);
+    let (dir, seqs) = journal_of_trades_after_book();
+    let take_snapshot = || {
+        gateway::snapshot(dir.path(), EpochFilter::OwnCaptureOnly, &s, Cursor::LATEST)
+            .expect("snapshot")
+    };
+    let base = gateway::snapshot(
+        dir.path(),
+        EpochFilter::OwnCaptureOnly,
+        &s,
+        Cursor::at(seqs[0]),
+    )
+    .expect("snapshot at");
+    let before = base.series.heatmap.clone();
+
+    let (frames, _n) = gateway::frames_since(
+        dir.path(),
+        EpochFilter::OwnCaptureOnly,
+        &s,
+        Cursor::at(seqs[0]),
+        usize::MAX,
+    )
+    .expect("frames");
+    let mut client = ContractClient::new(base);
+    for f in &frames {
+        client.on_wire_frame(&wire(f), &take_snapshot);
+    }
+    assert_eq!(
+        client.state.series.heatmap, before,
+        "кадр без наблюдения книги очистил карту — отсутствие наблюдения принято за пустой срез"
+    );
+}
+
+/// Кадр ЧУЖОЙ версии формы обязан быть отвергнут, а не прочитан с дефолтными полями.
+/// Без этого `#[serde(default)]` на новых полях превращает старый кадр в «ничего не
+/// наблюдалось», и карта у клиента замирает МОЛЧА (`C-233` R1).
+#[test]
+fn client_rejects_foreign_schema_version() {
+    let _g = serial();
+    let s = sel(vec![0.001]);
+    let (dir, seqs) = journal_of_with_removal();
+    let take_snapshot = || {
+        gateway::snapshot(dir.path(), EpochFilter::OwnCaptureOnly, &s, Cursor::LATEST)
+            .expect("snapshot")
+    };
+    let base = gateway::snapshot(
+        dir.path(),
+        EpochFilter::OwnCaptureOnly,
+        &s,
+        Cursor::at(seqs[0]),
+    )
+    .expect("snapshot at");
+    let (frames, _n) = gateway::frames_since(
+        dir.path(),
+        EpochFilter::OwnCaptureOnly,
+        &s,
+        Cursor::at(seqs[0]),
+        usize::MAX,
+    )
+    .expect("frames");
+
+    let mut foreign = frames.first().expect("кадр").clone();
+    foreign.schema_version = gateway::GATEWAY_SCHEMA_VERSION - 1;
+
+    let mut client = ContractClient::new(base);
+    assert_eq!(
+        client.on_wire_frame(&wire(&foreign), &take_snapshot),
+        ApplyOutcome::Incompatible,
+        "кадр чужой версии формы принят: поля с дефолтом прочитались как 'наблюдений не было', \
+         и карта замрёт молча"
+    );
+    assert_eq!(
+        client.resnapshots, 1,
+        "несовместимый кадр обязан вести к восстановлению, а не к заморозке"
     );
 }
