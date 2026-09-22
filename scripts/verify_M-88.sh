@@ -144,6 +144,40 @@ else
   bash scripts/tests/red_verify_M-88.sh 2>&1 | grep -E '^FAIL' | head -5
 fi
 
+# ─────────── задача 10 (`R-195` Б-1) — список наблюдений подчинён ОКНУ, не истории ───────────
+# Два оракула, и оба нужны: первый судит ФОРМУ (что объявлено вне окна), второй — ЦЕНУ
+# (что при этом отказывает выдача целиком). Форма без цены выглядит косметикой, цена без
+# формы не говорит, где чинить.
+OW_OUT=$(cargo test -p gateway --test red_m88_observed_window 2>&1)
+OW_RC=$?
+OW_LINE=$(printf '%s\n' "$OW_OUT" | grep -E '^test result' | tail -1)
+if [ $OW_RC -eq 0 ]; then
+  pass "task10: red_m88_observed_window — ${OW_LINE:-GREEN}"
+else
+  fail "task10: red_m88_observed_window КРАСЕН — ${OW_LINE:-компиляция}"
+  printf '%s\n' "$OW_OUT" | grep -E '^(thread |assertion|VB-I-10|---- )' | head -20
+fi
+
+RL_OUT=$(cargo test -p gateway --test red_m88_observed_response_limit 2>&1)
+RL_RC=$?
+RL_LINE=$(printf '%s\n' "$RL_OUT" | grep -E '^test result' | tail -1)
+if [ $RL_RC -eq 0 ]; then
+  pass "task10: бюджет ответа не съеден списком наблюдений — ${RL_LINE:-GREEN}"
+else
+  fail "task10: red_m88_observed_response_limit КРАСЕН — ${RL_LINE:-компиляция}"
+  printf '%s\n' "$RL_OUT" | grep -E '^(thread |PL-I-5|R-195)' | head -10
+fi
+
+# ─────────── задача 11 (`R-195` Б-2) — текст поля и его атрибут говорят ОДНО ───────────
+# Сравниваются ДВА факта в одном месте файла: что утверждает док-комментарий поля и какой
+# атрибут стоит на нём фактически. Проверка fail-closed: поле не найдено ⇒ FAIL, а не SKIP —
+# исчезнувшее поле означает, что гейт судит несуществующий предмет.
+if m88_task11 "$GW"; then
+  pass "task11: док-комментарий heatmap_buckets_observed не противоречит своему serde-атрибуту"
+else
+  fail "task11: текст поля heatmap_buckets_observed утверждает механизм, которого нет (класс TD-138, R-195 Б-2)"
+fi
+
 # ─────────────── паритет с CI (`gates.md` §3): гейт не может быть зеленее CI ───────────────
 if cargo fmt --all -- --check >/dev/null 2>&1; then
   pass "CI-паритет: cargo fmt --all -- --check"
