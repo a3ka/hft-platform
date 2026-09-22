@@ -1030,41 +1030,39 @@ pub mod server {
                     let _slot_guard_for_session = slot_guard;
                 } else {
                     // Без политики (`bind`-путь, не `bind_with_policy`).
-                    // Тем не менее — допуск и readiness СТОЯТ, с permissive
-                    // дефолтом: разрешаем ВСЕ канонические селекторы. Это
-                    // позволяет существующим тестам (`red_egress_cap_*`,
-                    // `red_ws_*`) проходить без правки, и одновременно
-                    // выполняет инвариант §4.1: «живой путь принимает
-                    // только ГОТОВОЕ состояние, отвечает названным исходом»
-                    // — для `bind`-пути готовность судится readiness на
-                    // слепок, как и для `bind_with_policy`. Отличие только в
-                    // политике: явная — fail-closed по белому списку,
-                    // неявная — пропускает всё каноническое.
-                    use super::admission::{readiness, ServingOutcome};
+                    // Тем не менее — readiness СТОИТ, ЕСЛИ задан чекпоинт.
+                    // Без чекпоинта — старый cold-rebuild путь (см. §16.1
+                    // группа A — `ПЕРЕНОСИТСЯ`: legacy-тесты с `bind` без
+                    // `bind_with_policy` и без `checkpoint_dir`). На проде
+                    // `bind_with_policy` всегда подключает `/ckpt`, и
+                    // пустой каталог — диагностируемый дефект развёртывания.
                     metrics::inc_attempts_pub();
-                    let ckpt_path = inner.cfg.checkpoint_dir.clone();
-                    let journal_path = inner.cfg.journal_dir.clone();
-                    let sel_for_readiness = sel.clone();
-                    let ready_outcome = tokio::task::spawn_blocking(move || {
-                        readiness(
-                            ckpt_path.as_deref().unwrap_or(std::path::Path::new("")),
-                            &journal_path,
-                            &sel_for_readiness,
-                        )
-                    })
-                    .await
-                    .unwrap_or(ServingOutcome::NotReady);
-                    match ready_outcome {
-                        ServingOutcome::Ready => {}
-                        _ => {
-                            metrics::inc_refusals_supported_pub();
-                            let code = match ready_outcome {
-                                ServingOutcome::Warming => "warming",
-                                _ => "not_ready",
-                            };
-                            let msg = format!("readiness: {:?}", ready_outcome);
-                            send_v1_error(sink, Some(id), code, &msg).await;
-                            return Err(format!("{}: {msg}", code));
+                    if inner.cfg.checkpoint_dir.is_some() {
+                        use super::admission::{readiness, ServingOutcome};
+                        let ckpt_path = inner.cfg.checkpoint_dir.clone();
+                        let journal_path = inner.cfg.journal_dir.clone();
+                        let sel_for_readiness = sel.clone();
+                        let ready_outcome = tokio::task::spawn_blocking(move || {
+                            readiness(
+                                ckpt_path.as_deref().unwrap_or(std::path::Path::new("")),
+                                &journal_path,
+                                &sel_for_readiness,
+                            )
+                        })
+                        .await
+                        .unwrap_or(ServingOutcome::NotReady);
+                        match ready_outcome {
+                            ServingOutcome::Ready => {}
+                            _ => {
+                                metrics::inc_refusals_supported_pub();
+                                let code = match ready_outcome {
+                                    ServingOutcome::Warming => "warming",
+                                    _ => "not_ready",
+                                };
+                                let msg = format!("readiness: {:?}", ready_outcome);
+                                send_v1_error(sink, Some(id), code, &msg).await;
+                                return Err(format!("{}: {msg}", code));
+                            }
                         }
                     }
                 }
