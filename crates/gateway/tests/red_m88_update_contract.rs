@@ -25,7 +25,7 @@
 //! обновления. Проверяется мутационным контролем, результат — в Done Block.
 
 use contracts::{to_fixed, DataSource, EventKind, Level, MdPayload, Side, Venue};
-use gateway::{Cursor, Frame, Selector, Snapshot};
+use gateway::{ApplyOutcome, Cursor, Frame, Selector, Snapshot};
 use journal::{EpochFilter, Journal, WriterConfig};
 
 /// Один бакет B0 при `timeframe_ms = 1000`.
@@ -147,13 +147,29 @@ fn via_wire(f: &Frame) -> Frame {
 }
 
 /// Клиент: собирает состояние из снимка и кадров, полученных ПО ПРОВОДУ.
-fn client_fold(base: Snapshot, frames: &[Frame]) -> Snapshot {
+///
+/// **Исходы ВОЗВРАЩАЮТСЯ, а не отбрасываются внутри** — спека §6 запрещает форму
+/// `let _ = apply(..)`, и запрет относится к автору набора ровно так же, как к dev'у.
+/// В первой редакции этот хелпер её и содержал: запрет был написан мной и мной же нарушен
+/// через сорок строк. Поймал гейт (`C-233` R1 предупреждал именно об этом, отчёт tester'а
+/// предъявил последствие: `#[must_use]` нельзя было поставить, пока форма жила здесь).
+///
+/// Тесты, которым исход важен (`S6`, `S7`), его проверяют; остальным достаточно состояния —
+/// но исход им ДОСТУПЕН, а не проглочен по дороге.
+fn client_fold_outcomes(base: Snapshot, frames: &[Frame]) -> (Snapshot, Vec<ApplyOutcome>) {
     let mut acc = base;
+    let mut outcomes = Vec::with_capacity(frames.len());
     for f in frames {
         let wired = via_wire(f);
-        let _ = acc.apply(&wired);
+        outcomes.push(acc.apply(&wired));
     }
-    acc
+    (acc, outcomes)
+}
+
+/// Сокращение для сценариев, судящих СОСТОЯНИЕ: исход при этом всё равно вычислен и
+/// возвращён вызывающему — он лишь не используется этим конкретным ассертом.
+fn client_fold(base: Snapshot, frames: &[Frame]) -> Snapshot {
+    client_fold_outcomes(base, frames).0
 }
 
 /// Все кадры от курсора до хвоста, малыми батчами (как их тянет `gateway-serve`).
@@ -437,7 +453,11 @@ fn s7_stale_frame_does_not_rewind_state() {
     // Тот же самый старый кадр приходит ЕЩЁ РАЗ, уже после продвижения курсора.
     let stale = early.first().expect("кадр").clone();
     let mut client = advanced;
-    let _ = client.apply(&via_wire(&stale));
+    assert_eq!(
+        client.apply(&via_wire(&stale)),
+        ApplyOutcome::OutOfOrder,
+        "запоздалый кадр обязан быть отвергнут ЯВНО названным исходом"
+    );
 
     assert_eq!(
         client.cursor, cursor_before,
