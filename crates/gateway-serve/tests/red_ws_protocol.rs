@@ -256,7 +256,13 @@ async fn o3_frames_converge_to_latest() {
         let next = tokio::time::timeout(tokio::time::Duration::from_millis(500), ws.next()).await;
         let Ok(Some(Ok(m))) = next else { continue };
         if let Ok(ServeMsg::Frame(f)) = serde_json::from_slice::<ServeMsg>(m.into_data().as_ref()) {
-            acc.apply(&f);
+            // M-88: исход применения кадра ОБЯЗАН наблюдаться (спека §4.3);
+            // форма `let _ = apply(..)` запрещена §6 — здесь кадр продолжает курсор.
+            assert_eq!(
+                acc.apply(&f),
+                gateway::ApplyOutcome::Applied,
+                "кадр обязан быть принят: он продолжает курсор потребителя"
+            );
             frames_seen += 1;
             let latest = gateway::snapshot(
                 dir.path(),

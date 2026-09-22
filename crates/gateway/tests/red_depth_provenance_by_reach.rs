@@ -415,7 +415,13 @@ fn provenance_survives_merge_when_reach_changes() {
             break;
         }
         for f in &batch {
-            merged.apply(f);
+            // M-88: исход применения кадра ОБЯЗАН наблюдаться (спека §4.3);
+            // форма `let _ = apply(..)` запрещена §6 — здесь кадр продолжает курсор.
+            assert_eq!(
+                merged.apply(f),
+                gateway::ApplyOutcome::Applied,
+                "кадр обязан быть принят: он продолжает курсор потребителя"
+            );
             n_frames += 1;
         }
         assert!(
@@ -771,7 +777,13 @@ fn gw_i_4_holds_when_the_tail_frame_is_delta_only() {
             break;
         }
         for f in &batch {
-            merged.apply(f);
+            // M-88: исход применения кадра ОБЯЗАН наблюдаться (спека §4.3);
+            // форма `let _ = apply(..)` запрещена §6 — здесь кадр продолжает курсор.
+            assert_eq!(
+                merged.apply(f),
+                gateway::ApplyOutcome::Applied,
+                "кадр обязан быть принят: он продолжает курсор потребителя"
+            );
             n_frames += 1;
         }
         assert!(

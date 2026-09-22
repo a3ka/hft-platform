@@ -217,7 +217,13 @@ fn assemble_via_frames(dir: &std::path::Path, s: &Selector) -> (gateway::Snapsho
             break;
         }
         for f in &batch {
-            merged.apply(f);
+            // M-88: исход применения кадра ОБЯЗАН наблюдаться (спека §4.3);
+            // форма `let _ = apply(..)` запрещена §6 — здесь кадр продолжает курсор.
+            assert_eq!(
+                merged.apply(f),
+                gateway::ApplyOutcome::Applied,
+                "кадр обязан быть принят: он продолжает курсор потребителя"
+            );
             n += 1;
         }
         assert!(

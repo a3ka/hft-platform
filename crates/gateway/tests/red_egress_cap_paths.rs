@@ -524,7 +524,13 @@ fn pl_i_5_p5_delivered_frames_reconstruct_the_replay_series() {
         match r.pump(dir.path(), EpochFilter::OwnCaptureOnly, PUMP_BATCH) {
             Ok((frames, _, _)) => {
                 for f in &frames {
-                    consumer.apply(f);
+                    // M-88: исход применения кадра ОБЯЗАН наблюдаться (спека §4.3);
+                    // форма `let _ = apply(..)` запрещена §6 — здесь кадр продолжает курсор.
+                    assert_eq!(
+                        consumer.apply(f),
+                        gateway::ApplyOutcome::Applied,
+                        "кадр обязан быть принят: он продолжает курсор потребителя"
+                    );
                 }
                 break;
             }
@@ -545,7 +551,13 @@ fn pl_i_5_p5_delivered_frames_reconstruct_the_replay_series() {
             Ok((frames, _, _)) if frames.is_empty() => break,
             Ok((frames, _, _)) => {
                 for f in &frames {
-                    consumer.apply(f);
+                    // M-88: исход применения кадра ОБЯЗАН наблюдаться (спека §4.3);
+                    // форма `let _ = apply(..)` запрещена §6 — здесь кадр продолжает курсор.
+                    assert_eq!(
+                        consumer.apply(f),
+                        gateway::ApplyOutcome::Applied,
+                        "кадр обязан быть принят: он продолжает курсор потребителя"
+                    );
                 }
             }
             Err(e) => setup_failed(&format!("догон при снятом пределе отказал: {e}")),
