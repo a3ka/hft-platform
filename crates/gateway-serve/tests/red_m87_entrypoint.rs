@@ -438,10 +438,19 @@ async fn c4_slot_is_held_until_work_ends_not_until_response_timeout() {
 
     let mb = recv(&mut b).await.expect("второй клиент не получил ответа");
     let code = mb.get("code").and_then(|c| c.as_str()).unwrap_or("");
-    assert!(
-        matches!(code, "overloaded") || mb.get("type").and_then(|t| t.as_str()) == Some("snapshot"),
-        "второй запрос при занятом единственном слоте обязан получить 'overloaded' \
-         либо дождаться слота, а не запустить параллельный расчёт: {mb}"
+    // `A-037` У-6: НИКАКИХ «либо». Прежняя редакция принимала и `overloaded`, и `snapshot`,
+    // то есть не могла упасть против «слот освобождён по таймауту ожидания» и падала по
+    // гонке. Исход ОДИН и назван.
+    assert_eq!(
+        code, "overloaded",
+        "при занятом единственном слоте второй запрос обязан получить РОВНО 'overloaded': \
+         {mb}. Приём 'либо snapshot' делает оракул неспособным упасть против освобождения \
+         слота по таймауту ОЖИДАНИЯ"
+    );
+    assert_eq!(
+        serving_counters().slots_in_flight,
+        1,
+        "слот обязан оставаться занятым, пока работа идёт"
     );
     let _ = recv(&mut a).await;
 }
@@ -554,5 +563,241 @@ async fn c9_four_positions_differ_and_stale_snapshot_does_not_stop_serving() {
     assert!(
         f.published_ms >= f.snapshot_ms,
         "опубликованные данные не могут отставать от слепка: слепок пишется ИЗ них"
+    );
+}
+
+// ════════ У-1 (`A-037`) — ЧЕТЫРЕ состояния слепка НА ТОЧКЕ ВХОДА, через ЛОВУШКУ ════════
+//
+// ПРИМЕЧАНИЕ О ПОТЕРЕ И ВОССТАНОВЛЕНИИ. Этот блок был написан, а затем УНИЧТОЖЕН правкой
+// соседнего теста: скрипт обрезал файл по индексу строки и снёс всё, что шло после. Автор
+// отчитался о нём как о сделанном, не проверив грепом. Поймал гейт (`C-238` R3-1), а не
+// автор. След оставлен намеренно: правило «утверждение о состоянии — только с командой в
+// том же сообщении» нарушено ровно там, где казалось, что проверять нечего.
+//
+// План §15.1 требует подставного читателя и прогона на четырёх состояниях. Ловушка строится
+// ФИКСТУРОЙ (`A-037` §3.4): порча полезной нагрузки при целом заголовке, прод-путь чтения
+// строг к CRC. Три обязательных спутника — ниже, без них ловушка есть плацебо.
+
+/// СТРАЖ ЛОВУШКИ: она обязана предъявить себя. Если чтение испорченного журнала НЕ падает,
+/// все оракулы ниже проверяют не тот сценарий, и набор объявляет setup несостоявшимся.
+#[test]
+fn u1_guard_trap_actually_traps() {
+    let dir = journal_busy(2_000);
+    poison_segment(dir.path(), 0);
+    let ckpt = tempfile::tempdir().expect("ckpt");
+    let res = gateway::checkpoint::advance(
+        dir.path(),
+        ckpt.path(),
+        &canonical_sel(),
+        EpochFilter::OwnCaptureOnly,
+    );
+    assert!(
+        res.is_err(),
+        "setup-страж: чтение журнала-ловушки НЕ упало — ловушка не ловит, и проверки \
+         'журнал не читался' ниже бессмысленны"
+    );
+}
+
+/// Состояние 1 — слепка НЕТ, журнал под ловушкой. Вход обязан ответить НАЗВАННЫМ исходом
+/// готовности, а не транспортной ошибкой: `invalid_selector`/`resume failed` означает, что
+/// журнал уже читали, то есть допуска на пути нет.
+#[tokio::test]
+async fn u1_entry_missing_checkpoint_over_trap_gives_named_outcome() {
+    let dir = journal_busy(2_000);
+    poison_segment(dir.path(), 0);
+    let addr = serve(dir.path(), None).await;
+    let mut ws = connect(&addr).await;
+    send(&mut ws, subscribe("s1", canonical_selector_json())).await;
+    let msg = recv(&mut ws).await.expect("сервер промолчал");
+    let code = msg.get("code").and_then(|c| c.as_str()).unwrap_or("");
+    assert!(
+        matches!(code, "not_ready" | "warming"),
+        "ожидался НАЗВАННЫЙ исход готовности, получено '{code}': {msg}"
+    );
+}
+
+/// Состояние 2 — слепок ПОВРЕЖДЁН, журнал под ловушкой.
+#[tokio::test]
+async fn u1_entry_corrupt_checkpoint_over_trap_gives_named_outcome() {
+    let dir = journal_busy(2_000);
+    let ckpt = tempfile::tempdir().expect("ckpt");
+    std::fs::write(
+        ckpt.path().join(format!(
+            "ckpt-{:016x}.bin",
+            gateway::checkpoint::selector_fingerprint(&canonical_sel())
+        )),
+        vec![0xABu8; 4096],
+    )
+    .expect("write corrupt ckpt");
+    poison_segment(dir.path(), 0);
+
+    let addr = serve(dir.path(), Some(ckpt.path().to_path_buf())).await;
+    let mut ws = connect(&addr).await;
+    send(&mut ws, subscribe("s1", canonical_selector_json())).await;
+    let msg = recv(&mut ws).await.expect("сервер промолчал");
+    let code = msg.get("code").and_then(|c| c.as_str()).unwrap_or("");
+    assert!(
+        matches!(code, "not_ready" | "warming"),
+        "повреждённый слепок дал '{code}' вместо названного исхода: {msg}"
+    );
+}
+
+/// Состояние 3 — слепок НЕСОВМЕСТИМ по версии провода, журнал под ловушкой.
+#[tokio::test]
+async fn u1_entry_incompatible_checkpoint_over_trap_gives_named_outcome() {
+    let dir = journal_busy(600);
+    let ckpt = tempfile::tempdir().expect("ckpt");
+    gateway::checkpoint::advance(
+        dir.path(),
+        ckpt.path(),
+        &canonical_sel(),
+        EpochFilter::OwnCaptureOnly,
+    )
+    .expect("advance");
+    let path = ckpt.path().join(format!(
+        "ckpt-{:016x}.bin",
+        gateway::checkpoint::selector_fingerprint(&canonical_sel())
+    ));
+    let mut bytes = std::fs::read(&path).expect("read ckpt");
+    let declared = u32::from_le_bytes(bytes[12..16].try_into().expect("4 байта"));
+    assert_eq!(
+        declared,
+        gateway::GATEWAY_SCHEMA_VERSION,
+        "setup-страж: байты 12..16 не несут версию провода"
+    );
+    bytes[12..16].copy_from_slice(&(declared + 1).to_le_bytes());
+    std::fs::write(&path, &bytes).expect("write incompatible");
+    poison_segment(dir.path(), 0);
+
+    let addr = serve(dir.path(), Some(ckpt.path().to_path_buf())).await;
+    let mut ws = connect(&addr).await;
+    send(&mut ws, subscribe("s1", canonical_selector_json())).await;
+    let msg = recv(&mut ws).await.expect("сервер промолчал");
+    let code = msg.get("code").and_then(|c| c.as_str()).unwrap_or("");
+    assert!(
+        matches!(code, "not_ready" | "warming"),
+        "несовместимый слепок дал '{code}' вместо названного исхода: {msg}"
+    );
+}
+
+/// Состояние 4 — слепок ВАЛИДЕН, но ОТСТАЛ сверх бюджета. Ловушка ставится в первый
+/// сегмент ПОСЛЕ курсора слепка (`A-037` У-1): голова цела, хвост читать нельзя.
+#[tokio::test]
+async fn u1_entry_stale_checkpoint_beyond_budget_gives_named_outcome() {
+    let dir = journal_busy(300);
+    let ckpt = tempfile::tempdir().expect("ckpt");
+    gateway::checkpoint::advance(
+        dir.path(),
+        ckpt.path(),
+        &canonical_sel(),
+        EpochFilter::OwnCaptureOnly,
+    )
+    .expect("advance");
+    let segs_before = std::fs::read_dir(dir.path())
+        .expect("read_dir")
+        .filter_map(Result::ok)
+        .filter(|e| e.path().extension().is_some_and(|x| x == "jrnl"))
+        .count();
+    {
+        let mut j = Journal::open_with(dir.path(), writer_cfg()).expect("open_with");
+        for i in 0..4_000i64 {
+            j.append(EventKind::md(
+                Venue::Binance,
+                "BTCUSDT",
+                MdPayload::Trade {
+                    price: to_fixed(65_000.0 + (i % 20) as f64),
+                    size: to_fixed(0.5),
+                    side: Side::Buy,
+                    ts_exch_ms: BASE_MS + 100_000 + i * 100,
+                },
+            ))
+            .expect("trade");
+        }
+        j.flush().expect("flush");
+    }
+    poison_segment(dir.path(), segs_before);
+
+    let addr = serve(dir.path(), Some(ckpt.path().to_path_buf())).await;
+    let mut ws = connect(&addr).await;
+    send(&mut ws, subscribe("s1", canonical_selector_json())).await;
+    let msg = recv(&mut ws).await.expect("сервер промолчал");
+    let code = msg.get("code").and_then(|c| c.as_str()).unwrap_or("");
+    assert!(
+        matches!(code, "not_ready" | "warming" | "overloaded"),
+        "отставший сверх бюджета слепок дал '{code}': {msg}"
+    );
+}
+
+/// СПУТНИК 2: тёплый путь над журналом С ЛОВУШКОЙ В ГОЛОВЕ обслуживается — слепок построен
+/// ДО порчи, и `resume` со слепком голову не читает. Пин «слепок спасает от чтения головы».
+#[tokio::test]
+async fn u1_warm_path_is_served_over_trapped_head() {
+    let dir = journal_busy(600);
+    let ckpt = tempfile::tempdir().expect("ckpt");
+    gateway::checkpoint::advance(
+        dir.path(),
+        ckpt.path(),
+        &canonical_sel(),
+        EpochFilter::OwnCaptureOnly,
+    )
+    .expect("advance");
+    poison_segment(dir.path(), 0);
+
+    let addr = serve(dir.path(), Some(ckpt.path().to_path_buf())).await;
+    let mut ws = connect(&addr).await;
+    send(&mut ws, subscribe("s1", canonical_selector_json())).await;
+    let msg = recv(&mut ws).await.expect("сервер промолчал");
+    assert_eq!(
+        msg.get("type").and_then(|t| t.as_str()),
+        Some("snapshot"),
+        "тёплый путь не обслужен при ловушке в ГОЛОВЕ: {msg}"
+    );
+}
+
+/// СПУТНИК 3: ПОЗИТИВНЫЙ КОНТРОЛЬ СЧЁТЧИКА. Без него реализация «никогда не инкрементировать
+/// `journal_payload_bytes_read`» проходит все проверки «журнал не читался».
+#[tokio::test]
+async fn u1_served_request_with_tail_increments_payload_counter() {
+    let dir = journal_busy(300);
+    let ckpt = tempfile::tempdir().expect("ckpt");
+    gateway::checkpoint::advance(
+        dir.path(),
+        ckpt.path(),
+        &canonical_sel(),
+        EpochFilter::OwnCaptureOnly,
+    )
+    .expect("advance");
+    {
+        let mut j = Journal::open_with(dir.path(), writer_cfg()).expect("open_with");
+        for i in 0..50i64 {
+            j.append(EventKind::md(
+                Venue::Binance,
+                "BTCUSDT",
+                MdPayload::Trade {
+                    price: to_fixed(65_010.0),
+                    size: to_fixed(0.1),
+                    side: Side::Buy,
+                    ts_exch_ms: BASE_MS + 200_000 + i * 10,
+                },
+            ))
+            .expect("trade");
+        }
+        j.flush().expect("flush");
+    }
+
+    let before = serving_counters().journal_payload_bytes_read;
+    let addr = serve(dir.path(), Some(ckpt.path().to_path_buf())).await;
+    let mut ws = connect(&addr).await;
+    send(&mut ws, subscribe("s1", canonical_selector_json())).await;
+    let msg = recv(&mut ws).await.expect("сервер промолчал");
+    assert_eq!(
+        msg.get("type").and_then(|t| t.as_str()),
+        Some("snapshot"),
+        "тёплый запрос с хвостом обязан обслуживаться: {msg}"
+    );
+    assert!(
+        serving_counters().journal_payload_bytes_read > before,
+        "счётчик прочитанных байт НЕ вырос на законной докормке хвоста — реализация \
+         'никогда не инкрементировать' удовлетворила бы все проверки отсутствия чтения"
     );
 }

@@ -157,6 +157,18 @@ async fn got_snapshot(cfg: ServeConfig, url_token: Option<&str>) -> bool {
     }
 }
 
+/// Первое сообщение ПО ЖИВОМУ соединению, как есть (сырой JSON). В отличие от
+/// `got_snapshot`, различает «пришёл иной исход» и «связь оборвалась»: `None` означает
+/// ровно второе. Нужна для `M-87` (`A-037` D-4, `C-238` R3-3), где проверяется НАЗВАННЫЙ
+/// исход при ЖИВОМ соединении.
+async fn first_message(cfg: ServeConfig, url_token: Option<&str>) -> Option<serde_json::Value> {
+    let mut ws = connect(cfg, url_token).await.ok()?;
+    match ws.next().await {
+        None | Some(Err(_)) => None,
+        Some(Ok(m)) => serde_json::from_slice::<serde_json::Value>(m.into_data().as_ref()).ok(),
+    }
+}
+
 // ─────────────────────────── O-4 ───────────────────────────
 
 /// **O-4.** Матрица отказов авторизации — ВСЕ пять веток (`gateway-serve/src/lib.rs:287-318`).
@@ -353,15 +365,27 @@ async fn o5_broken_checkpoint_is_named_outcome_not_silent_rebuild() {
     std::fs::write(ckpt.path().join("ckpt-deadbeef.bin"), b"not-a-checkpoint")
         .expect("write мусор вместо чекпоинта");
 
-    let ok = got_snapshot(
+    // `C-238` R3-3: проверять ОТСУТСТВИЕ снимка недостаточно — так тест зелен и при разрыве
+    // соединения, и при таймауте. Требуется НАЗВАННЫЙ исход ПРИ ЖИВОМ соединении
+    // (`CT-RFC-09` §2.7: невалидный/неготовый селектор — ошибка СЕССИИ, а не отказ связи).
+    let msg = first_message(
         config(dir.path(), None, Some(ckpt.path())),
         Some(&sign_with(SECRET, FUTURE)),
     )
-    .await;
+    .await
+    .expect("соединение закрыто без ответа — исход обязан прийти ПО ЖИВОМУ соединению");
+
+    let code = msg.get("code").and_then(|c| c.as_str()).unwrap_or("");
     assert!(
-        !ok,
-        "M-87 (A-037 D-4): битый слепок обязан давать НАЗВАННЫЙ исход готовности, а не тихий \
-         полный пересчёт при клиенте. Инвариант «слепок — кэш» проверяется на worker-пути \
-         (red_checkpoint_is_cache.rs), а не здесь"
+        matches!(code, "not_ready" | "warming"),
+        "M-87 (A-037 D-4): битый слепок обязан давать НАЗВАННЫЙ исход готовности \
+         ('not_ready'/'warming'), получено '{code}': {msg}. Тихий полный пересчёт при \
+         клиенте — это авария 2026-09-20; инвариант «слепок — кэш» проверяется на \
+         worker-пути (red_checkpoint_is_cache.rs), а не здесь"
+    );
+    assert_ne!(
+        msg.get("type").and_then(|t| t.as_str()),
+        Some("snapshot"),
+        "пришёл снимок — значит слепок молча пересобрали при клиенте"
     );
 }
