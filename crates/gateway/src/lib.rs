@@ -114,7 +114,7 @@ fn default_capture_book_observations() -> bool {
 ///    но ОТДЕЛЬНЫМ атомарным коммитом: подпись формы и состав полос — разные задачи
 ///    милестоуна (§Tasks M-70, номера 6 и 7), и связывать их одним коммитом запрещает
 ///    `commit-discipline.md` («одна задача = ≥1 коммит»).
-pub const GATEWAY_SCHEMA_VERSION: u32 = 10;
+pub const GATEWAY_SCHEMA_VERSION: u32 = 11;
 
 /// M-71 (`milestones/M-71-egress-cap.md` §5.1): дефолт предела объёма ответа в
 /// БАЙТАХ сериализованной `SeriesBundle` (`serde_json::to_vec`). Значение — продуктовое
@@ -348,6 +348,26 @@ impl Cursor {
     }
 }
 
+/// M-88 (§4.2 контракта обновления, `milestones/M-88-*.md`): ИСХОД применения кадра.
+/// ТРИ исхода обязаны быть РАЗЛИЧИМЫ и ОБЯЗАНЫ быть ОБРАБОТАНЫ вызывающим
+/// (`#[must_use]` + запрет `let _ = apply(..)` в §6); исход, который никто не наблюдает,
+/// эквивалентен его отсутствию.
+///
+/// Семантика (`A-036` §4.3 п.1):
+///   - [`ApplyOutcome::Applied`]     — кадр принят; `self.cursor` продвинут до `frame.to`.
+///   - [`ApplyOutcome::OutOfOrder`]  — `frame.from != self.cursor` (повтор / пропуск /
+///     запоздалый кадр). `self` НЕ ИЗМЕНЁН ни в одном поле; клиент ОБЯЗАН запросить новый
+///     снимок и продолжить с него (§4.3).
+///   - [`ApplyOutcome::Incompatible`] — `frame.schema_version != GATEWAY_SCHEMA_VERSION`.
+///     `self` НЕ ИЗМЕНЁН; без явного отказа `#[serde(default)]` прочитал бы новые поля как
+///     «наблюдений не было» и карта у клиента замерла бы МОЛЧА.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ApplyOutcome {
+    Applied,
+    OutOfOrder,
+    Incompatible,
+}
+
 /// OHLCV-строка (зеркалит export v1 §2; `i64` ×1e8, `time_s` — UTC seconds).
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct OhlcvRow {
@@ -503,6 +523,31 @@ pub struct SeriesBundle {
     /// Пусто — нейтрал, сохраняющий сегодняшнее поведение бит-в-бит.
     #[serde(default)]
     pub cadence_ms: Vec<(String, Option<i64>)>,
+    /// M-88 (контракт обновления книго-зависимых серий, `milestones/M-88-*.md` §4): список
+    /// `time_s` бакетов карты, по которым ЭТО сообщение несёт ПОЛНЫЙ срез (Replace-семантика
+    /// по колонке; спека §4). Производитель (`frames_since`/`replay`) ЗАПИСЫВАЕТ бакет сюда,
+    /// когда кадр свёрнут поверх L2-события, попавшего в этот бакет. Потребитель ОБЯЗАН
+    /// удалить все прежние ячейки с этим `time_s` и положить пришедшие — ВКЛЮЧАЯ СЛУЧАЙ
+    /// пустого среза (книга стала односторонней/пустой; тогда колонка у клиента пустеет
+    /// без ложного «наблюдения не было»). Бакет, по которому кадр не нёс L2-события, НЕ
+    /// должен попадать сюда (запрет §6 «стирать ликвидность из закрытого прошлого»).
+    /// **Отсортирован СТРОГО ВОЗРАСТАЮЩЕ** (детерминизм формы, §5 `VB-I-4`). Поле
+    /// `#[serde(default)]` — defensive-default для консюмера v10, читающего v11: пустой
+    /// список = «наблюдений карты не было», и потребитель НЕ ТРОГАЕТ карту; сама форма
+    /// заставляет консюмера гейтить на `schema_version == 11` (см. `client_rejects_foreign_schema_version`,
+    /// иначе молча заморозит экран).
+    #[serde(default)]
+    pub heatmap_observed_time_s: Vec<i64>,
+    /// M-88 §4: `true` ⇔ ЭТО сообщение несёт ПОЛНЫЙ срез `cob` (Replace-семантика, включая
+    /// пустой срез — «книга стала односторонней»); `false` ⇔ стакан НЕ наблюдался (кадр без
+    /// L2-событий: только сделки/иное), `NoChange` — потребитель оставляет прежний `cob` .
+    /// Без явного признака потребитель неразличим сжимает «наблюдения не было» и «полный
+    /// срез оказался пуст» (прежний дефект `merge_cob` `if incoming.is_empty() { return existing }`).
+    /// Поле `#[serde(default)]` — defensive-default: для v10-консюмера v11-кадр прочитается
+    /// как `cob_observed = false` ⇒ `NoChange` ⇒ стакан у клиента замрёт молча; ровно поэтому
+    /// консюмер ОБЯЗАН гейтить на `schema_version == 11`.
+    #[serde(default)]
+    pub cob_observed: bool,
 }
 
 /// Полная детерминированная свёртка окна `[start .. cursor]`.
@@ -2133,6 +2178,15 @@ impl Reducer {
                 ("depth_series".to_string(), self.selector.depth_cadence_ms),
                 ("heatmap".to_string(), None),
             ],
+            // M-88 §3/§4 (задачи 3-4): на ПУТИ ПЕРЕСЧЁТА (`snapshot`/`replay`/`batch`
+            // через `finish_ref`) проекция наблюдений ещё не наполняется — поля
+            // добавляются в `Reducer` задачей 3. До того оба поля = дефолты (`Vec::new()` /
+            // `false`), что корректно: кадр с пустым `heatmap_observed_time_s` и
+            // `cob_observed = false` означает «наблюдений карты/стакана не было» —
+            // `merge_heatmap` оставит существующее как есть (`S4`), `merge_cob` вернёт
+            // existing (`NoChange`).
+            heatmap_observed_time_s: Vec::new(),
+            cob_observed: false,
         }
     }
 
@@ -2572,7 +2626,50 @@ impl Snapshot {
     /// окна — whole-session drop (см. `evict_series_bundle_under_window`), НЕ переносится в
     /// merge. CVD-кривая остаётся session-locally непрерывной под окном (reset на границах
     /// сохранён при fold'е).
-    pub fn apply(&mut self, frame: &Frame) {
+    ///
+    /// M-88 (контракт обновления, `milestones/M-88-*.md` §4.2): применение кадра — транзакция,
+    /// а не тихий merge. Возвращает [`ApplyOutcome`], и ВСЕ три исхода обязаны быть
+    /// наблюдаемы: исход, который никто не наблюдает, эквивалентен его отсутствию
+    /// (`C-233` R1 — именно `let _ = apply(..)` обесценил первую редакцию оракула).
+    ///   - `Applied`     — кадр принят; `self.cursor` продвинут до `frame.to`.
+    ///   - `OutOfOrder`  — `frame.from != self.cursor` (повтор / пропуск / запоздалый);
+    ///     `self` НЕ ИЗМЕНЁН ни в одном поле, и `self.cursor` НЕ откатился (прежний дефект
+    ///     `:2728` ронял `S7`, удваивая суммируемые ряды при `S6`).
+    ///   - `Incompatible` — `frame.schema_version != GATEWAY_SCHEMA_VERSION`. Поля с
+    ///     `#[serde(default)]` (`heatmap_observed_time_s`, `cob_observed`) прочитались бы как
+    ///     «наблюдений не было» ⇒ карта у клиента замерла бы МОЛЧА. `self` НЕ ИЗМЕНЁН;
+    ///     клиент ОБЯЗАН отвергнуть кадр и запросить новый снимок (§4.3).
+    ///
+    /// **ЗАМЕЧАНИЕ / SCOPE VIOLATION REQUEST:** спека §4.2 предписывает `#[must_use]`,
+    /// но `*/tests/**` (sacred, `scope-guard.md`) содержит десятки вызовов `acc.apply(f)`
+    /// БЕЗ `let _ = ...` (наследие M-22/M-68/M-77/M-85 и др.) — добавление `#[must_use]`
+    /// ломает их компиляцию. Hard-форма атрибута опущена; soft-контракт — возврат
+    /// `ApplyOutcome` + запрет `let _ =` для нового кода (документирован). Architect
+    /// решает: либо обновить legacy-вызовы до `let _ = ...` (правка `*/tests/**`,
+    /// sacred), либо отменить `#[must_use]` в спеке. Источник расхождения —
+    /// спека M-88 не упоминала legacy-вызовы `apply()` в существующих тестах.
+    pub fn apply(&mut self, frame: &Frame) -> ApplyOutcome {
+        // M-88 §4.2: защита курсором — кадр принимается ТОЛЬКО если его `from` равен
+        // текущему `self.cursor` (точное равенство, не `≤`). Повтор (`frame.from == cursor`
+        // уже применённого кадра) и запоздалый (`frame.from` ПОЗАДИ курсора) дают
+        // `OutOfOrder` БЕЗ ИЗМЕНЕНИЯ состояния. Прежний код сверял `self.cursor == frame.to`
+        // БЕЗУСЛОВНО (:2728) и откатывал курсор назад при `S7`, а повторный кадр удваивал
+        // `ohlcv.volume`/`volume_bubbles` при `S6`.
+        //
+        // Сравнение по `Cursor` целиком (а не по `upto_seq`): `Cursor::LATEST` в обеих
+        // сторонах трактуется как «хвост журнала», и сравнение работает для
+        // `snapshot(seq) + frames_since(seq..)` (нормальный live-push).
+        if frame.from != self.cursor {
+            return ApplyOutcome::OutOfOrder;
+        }
+        // M-88 §4.2: версия формы проверяется ДО merge, иначе `#[serde(default)]` на
+        // новых полях прочитал бы кадр v10 как «наблюдений не было» и карта у клиента
+        // замерла бы МОЛЧА (`C-233` R1). Клиент ОБЯЗАН гейтить на `schema_version == 11`
+        // и при `Incompatible` запросить новый снимок (§4.3).
+        if frame.schema_version != GATEWAY_SCHEMA_VERSION {
+            return ApplyOutcome::Incompatible;
+        }
+
         // 1. Финальное окно: `[frame.at_ms − W, frame.at_ms]` (None = unbounded, ничего не эвиктим).
         let final_lo_time_s = self.selector.window_lo_time_s(frame.at_ms);
 
@@ -2726,6 +2823,10 @@ impl Snapshot {
             merge_bubbles(&self.series.volume_bubbles, &frame.delta.volume_bubbles);
 
         self.cursor = frame.to;
+        // M-88 §4.2: успешный merge — единственный исход, продвигающий `self.cursor`.
+        // Ранние `return ApplyOutcome::OutOfOrder` / `::Incompatible` срабатывают ДО любых
+        // мутаций, поэтому `self` остаётся нетронутым при отказе.
+        ApplyOutcome::Applied
     }
 }
 
