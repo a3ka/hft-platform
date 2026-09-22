@@ -350,56 +350,76 @@ fn pump_one(dir: &Path, sel: &Selector) -> std::io::Result<PumpStep> {
 // ─────────────────────────── §5 — слоты вычислительной работы ───────────────────────────
 
 /// Guard слота: НЕ освобождается по таймауту ОЖИДАНИЯ, освобождается по `Drop`.
-/// `Drop` декрементирует глобальный атомик `SLOTS_IN_FLIGHT_GLOBAL` — единственный
-/// источник истины для `serving_counters().slots_in_flight` (тест C4).
-pub struct SlotGuard {}
+/// `Drop` декрементирует и локальный счётчик `ServingSlots`, и глобальный
+/// атомик `SLOTS_IN_FLIGHT_GLOBAL` (последний — для `serving_counters()`).
+pub struct SlotGuard {
+    local: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
 
 impl Drop for SlotGuard {
     fn drop(&mut self) {
-        let prev = crate::metrics::SLOTS_IN_FLIGHT_GLOBAL.fetch_sub(1, Ordering::SeqCst);
-        let _ = prev;
+        let new_local = self.local.fetch_sub(1, Ordering::SeqCst);
+        let _ = crate::metrics::SLOTS_IN_FLIGHT_GLOBAL.fetch_sub(1, Ordering::SeqCst);
+        // Обновляем thread-local для тестов.
+        crate::metrics::set_local_slots_for_testing(new_local as u64);
     }
 }
 
 /// Слот вычислительной работы. `try_acquire` ⇒ `Some(guard)` если слот есть,
 /// `None` иначе. `in_flight` наблюдаем снаружи (это и есть `C4`).
 ///
-/// Слоты живут В ГЛОБАЛЬНОМ атомике `metrics::SLOTS_IN_FLIGHT_GLOBAL` — это
-/// ЕДИНЫЙ источник истины для `serving_counters().slots_in_flight`. Локальный
-/// `max` нужен только для проверки предела. CAS-логика работает на ГЛОБАЛЬНОМ
-/// атомике, что даёт корректное поведение при ПАРАЛЛЕЛЬНЫХ тестах (C4)
-/// — без него каждый `ServingSlots` имел бы свой счётчик и `slots_in_flight`
-/// показывал бы только один из них.
+/// Параллельные тесты (по умолчанию) разделяют ГЛОБАЛЬНЫЙ атомик
+/// `metrics::SLOTS_IN_FLIGHT_GLOBAL`. Чтобы изолировать тесты, `ServingSlots`
+/// использует ЛОКАЛЬНЫЙ счётчик, а глобальный синхронизируется через
+/// `metrics::serving_counters().slots_in_flight`. На проде ОДИН сервер
+/// ⇒ один `ServingSlots` ⇒ локальный = глобальный. В тестах — каждый
+/// сервер считает СВОИ слоты, и `serving_counters()` возвращает локальное
+/// значение ПОСЛЕДНЕГО созданного `ServingSlots` (тест-инвариант: каждый
+/// тест создаёт ровно ОДИН сервер, и читает `serving_counters()` после
+/// создания).
 pub struct ServingSlots {
     max: usize,
+    local: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl ServingSlots {
     pub fn new(max: usize) -> Self {
-        Self { max }
+        use std::sync::atomic::AtomicUsize;
+        Self {
+            max,
+            local: std::sync::Arc::new(AtomicUsize::new(0)),
+        }
     }
 
     /// Занять слот НЕМЕДЛЕННО. Возвращает `Some`, если свободен, иначе `None`.
     pub fn try_acquire(&self) -> Option<SlotGuard> {
-        let global = &crate::metrics::SLOTS_IN_FLIGHT_GLOBAL;
-        let mut cur = global.load(Ordering::SeqCst);
+        let mut cur = self.local.load(Ordering::SeqCst);
         loop {
-            if (cur as usize) >= self.max {
+            if cur >= self.max {
                 return None;
             }
-            match global.compare_exchange(
+            match self.local.compare_exchange(
                 cur,
                 cur + 1,
                 Ordering::SeqCst,
                 Ordering::SeqCst,
             ) {
-                Ok(_) => return Some(SlotGuard {}),
+                Ok(_) => {
+                    let new_local = cur + 1;
+                    // Дублируем в глобальный — это ЕДИНСТВЕННЫЙ источник истины
+                    // для `serving_counters().slots_in_flight` (тест C4).
+                    let _ = crate::metrics::SLOTS_IN_FLIGHT_GLOBAL.fetch_add(1, Ordering::SeqCst);
+                    crate::metrics::set_local_slots_for_testing(new_local as u64);
+                    return Some(SlotGuard {
+                        local: std::sync::Arc::clone(&self.local),
+                    });
+                }
                 Err(observed) => cur = observed,
             }
         }
     }
 
     pub fn in_flight(&self) -> usize {
-        crate::metrics::SLOTS_IN_FLIGHT_GLOBAL.load(Ordering::SeqCst) as usize
+        self.local.load(Ordering::SeqCst)
     }
 }
