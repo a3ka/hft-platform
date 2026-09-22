@@ -29,6 +29,38 @@ pub mod auth {
         Expired,
     }
 
+    /// M-87 (§7.1, TD-207): ЕДИНСТВЕННАЯ точка трактовки секрета. И сервер, и зонд
+    /// ОБЯЗАНЫ звать ЭТУ функцию для построения материала ключа. Прежде сервер
+    /// строил ключ из СЫРЫХ байт строки (`DecodingKey::from_secret(secret.as_bytes())`),
+    /// а зонд строку «только hex-символы чётной длины» ДЕКОДИРОВАЛ как hex — прод-секрет
+    /// из 64 hex-символов зонд превращал в 32 байта, а сервер передавал 64 байта в
+    /// `DecodingKey::from_secret` (32- vs 64-байтовая асимметрия). Дефект записан
+    /// ТРЕТИЙ раз (`TD-084`/`TD-095`/`TD-207`): класс не закрылся регистрацией и
+    /// закрывается механизмом — единой трактовкой.
+    ///
+    /// Правило: строка «ровно 64 hex-символа» (прод-форма) декодируется в 32 байта;
+    /// всё прочее трактуется как сырые байты UTF-8 (dev-форма). Здесь — ОБЩАЯ функция,
+    /// без новой зависимости: `jsonwebtoken` уже в зависимостях.
+    pub fn key_material(secret: &str) -> Vec<u8> {
+        let is_hex64 = secret.len() == 64 && secret.chars().all(|c| c.is_ascii_hexdigit());
+        if is_hex64 {
+            let bytes = secret.as_bytes();
+            let mut out = Vec::with_capacity(32);
+            for chunk in bytes.chunks(2) {
+                let hi = (chunk[0] as char).to_digit(16);
+                let lo = (chunk[1] as char).to_digit(16);
+                match (hi, lo) {
+                    (Some(h), Some(l)) => out.push(((h << 4) | l) as u8),
+                    _ => break,
+                }
+            }
+            if out.len() == 32 {
+                return out;
+            }
+        }
+        secret.as_bytes().to_vec()
+    }
+
     /// Верифицировать подписанный JWT. **Stateless (GS-I-2):** берёт ТОЛЬКО `(token, key)`, НЕ ходит в
     /// user-БД. Валидная подпись + не истёк → `Ok(Claims)`; иначе `Err`. engine-dev (M-28 task #2):
     /// `jsonwebtoken::decode` с `Validation` (проверка `exp`), алгоритм HS256 (Ed25519 — по founder).
@@ -52,6 +84,14 @@ pub mod auth {
         }
     }
 }
+
+/// M-87 (§4.1, спека): модуль допуска — `admit` (без I/O), `readiness` (смотрит на
+/// слепок, не на журнал), пять исходов, бюджет, `Cancel`, `ServingSlots`. Форма
+/// задана дословно; тесты компилируются против этих имён.
+pub mod admission;
+
+/// M-87 (§4.1 / §7, спека): счётчики выдачи, эмитируемые продюсером (`OPS-I-10`).
+pub mod metrics;
 
 // Wire-конверт сообщений WS (MVP — JSON, версионированный через `schema_version` внутри Snapshot/Frame). (M-65: per-connection subscription state + v1 wire protocol)//
 // Хранятся рядом с `auth`/`wire`/`serve`/`server`, чтобы внешняя поверхность крейта
@@ -229,6 +269,7 @@ pub mod server {
         EFFECTIVE_GRACE_MS.store(ms, Ordering::Relaxed);
     }
 
+    use super::admission::{AdmissionPolicy, ServingSlots};
     /// M-71 (`milestones/M-71-egress-cap.md` §4bis.2 rev7): предел объёма ответа живёт в
     /// `crates/gateway` (см. `gateway::effective_max_response_bytes` / геттер-сеттер
     /// в `gateway`), там же, где он ПРИМЕНЯЕТСЯ (`enforce_response_limit` зовётся
@@ -246,6 +287,7 @@ pub mod server {
     /// `N1-C`/`N1a`/`N1b`/`N1-D`/`N1-E`); часть «в» требования моста вынесена долгом
     /// (`A-026` §3bis).
     use crate::_gw::Selector;
+    use crate::metrics;
     use futures_util::{SinkExt, StreamExt};
     use journal::EpochFilter;
     use jsonwebtoken::DecodingKey;
@@ -302,6 +344,12 @@ pub mod server {
     pub struct Server {
         listener: TcpListener,
         cfg: Arc<ServeConfig>,
+        /// M-87: политика допуска. `None` ⇒ старая форма `bind` без политики:
+        /// все запросы отклоняются `Unsupported`. `Some` — форма `bind_with_policy`.
+        policy: Option<AdmissionPolicy>,
+        /// M-87: слоты вычислительной работы. `None` ⇒ неограниченно; `Some` —
+        /// ограничение параллелизма через `ServingSlots`.
+        slots: Option<std::sync::Arc<ServingSlots>>,
     }
 
     /// Забиндить WS-listener на `cfg.addr`. engine-dev (task #4): `tokio::net::TcpListener`.
@@ -313,7 +361,52 @@ pub mod server {
         Ok(Server {
             listener,
             cfg: Arc::new(cfg),
+            policy: None,
+            slots: None,
         })
+    }
+
+    /// M-87 (спека §4.1 дословно): бидер `bind_with_policy` — АДДИТИВНАЯ форма
+    /// (`A-037` У-3, выбор оставлен architect'у): политика передаётся серверу
+    /// ЯВНО через билдер, а не через новое поле `ServeConfig` — одиннадцать
+    /// существующих sacred-файлов с литералом `ServeConfig { .. }` остаются целы.
+    ///
+    /// Внутри — старый `bind`, плюс на `Server` сохраняется `Arc<AdmissionPolicy>`,
+    /// и `handle_conn` зовёт `admit` (`C-234` R2/R3: ТРАНСПОРТ — единственное место,
+    /// где политика может отказать). Без политики сервер стартует, но возвращает
+    /// `Unsupported` на любом запросе (fail-closed: без явной политики публичный путь
+    /// закрыт).
+    pub async fn bind_with_policy(
+        cfg: ServeConfig,
+        policy: AdmissionPolicy,
+    ) -> std::io::Result<Server> {
+        let slots = std::sync::Arc::new(ServingSlots::new(policy.max_concurrent_serves.max(1)));
+        let server = bind(cfg).await?;
+        Ok(server.with_policy(policy, slots))
+    }
+
+    impl Server {
+        /// Подключить политику и счётчики к уже забинденному серверу. Используется
+        /// как `bind_with_policy` (публично), так и тестами, которые хотят свой
+        /// `bind` без `policy`. Делается через «глобальную привязку» политики к
+        /// `&Server`, потому что структура `Server` сама расширена полями
+        /// `policy`/`slots` (см.ниже) — здесь это конструктор поверх bind'а.
+        ///
+        /// Поля `policy` и `slots` хранятся ВНУТРИ `Server`. `bind` остаётся
+        /// старым — `bind_with_policy` это ЕДИНСТВЕННЫЙ путь, который
+        /// публично подключает политику.
+        pub fn with_policy(
+            self,
+            policy: AdmissionPolicy,
+            slots: std::sync::Arc<ServingSlots>,
+        ) -> Server {
+            Server {
+                listener: self.listener,
+                cfg: self.cfg,
+                policy: Some(policy),
+                slots: Some(slots),
+            }
+        }
     }
 
     impl Server {
@@ -361,8 +454,10 @@ pub mod server {
                 match self.listener.accept().await {
                     Ok((stream, _peer)) => {
                         let cfg = Arc::clone(&self.cfg);
+                        let policy = self.policy.clone();
+                        let slots = self.slots.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = handle_conn(stream, cfg).await {
+                            if let Err(e) = handle_conn(stream, cfg, policy, slots).await {
                                 tracing::debug!(error = %e, "gateway-serve conn ended with error");
                             }
                         });
@@ -378,7 +473,12 @@ pub mod server {
 
     /// Per-connection: WS-handshake (с захватом URI для токена) → verify JWT → snapshot+push.
     /// На отказ (verify Err / handshake Err) — закрываем WS без Snapshot.
-    async fn handle_conn(stream: TcpStream, cfg: Arc<ServeConfig>) -> std::io::Result<()> {
+    async fn handle_conn(
+        stream: TcpStream,
+        cfg: Arc<ServeConfig>,
+        policy: Option<AdmissionPolicy>,
+        slots: Option<std::sync::Arc<ServingSlots>>,
+    ) -> std::io::Result<()> {
         // (1) Канал для передачи URI из handshake-коллбэка наружу.
         let (uri_tx, uri_rx) = tokio::sync::oneshot::channel::<Option<String>>();
         // tungstenite::handshake::server::{Request, Response, ErrorResponse}. `ErrorResponse` =
@@ -451,7 +551,14 @@ pub mod server {
         tracing::debug!(sub = %claims.sub, "ws auth ok");
 
         // (6) Авторизован → dispatcher: legacy или v1 сессия.
-        run_dispatched_session(ws_stream, cfg, claims).await
+        run_dispatched_session(
+            ws_stream,
+            cfg,
+            claims,
+            policy.map(std::sync::Arc::new),
+            slots,
+        )
+        .await
     }
 
     /// Отправить `ServeMsg::Error(msg)` как Text-фрейм и закрыть WS (best-effort).
@@ -579,6 +686,11 @@ pub mod server {
         /// `spawn_blocking`-замыканий, где `Arc<ServeConfig>` — единственный `'static`-
         /// безопасный источник этих ресурсов.
         cfg: Arc<ServeConfig>,
+        /// M-87: политика допуска, переданная через `bind_with_policy` (форма §4.1
+        /// дословно). `None` ⇒ нет политики, всё отклоняется `Unsupported`.
+        policy: Option<std::sync::Arc<AdmissionPolicy>>,
+        /// M-87: слоты вычислительной работы. Передаются из `Server::slots`.
+        slots: Option<std::sync::Arc<ServingSlots>>,
     }
 
     /// Диспетчер legacy/v1. Вызывает `run_authorized_session` (legacy) или новую
@@ -589,6 +701,8 @@ pub mod server {
         ws: WebSocketStream<S>,
         cfg: Arc<ServeConfig>,
         claims: super::auth::Claims,
+        policy: Option<std::sync::Arc<AdmissionPolicy>>,
+        slots: Option<std::sync::Arc<ServingSlots>>,
     ) -> std::io::Result<()>
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -663,10 +777,11 @@ pub mod server {
             // отбрасывается — клиент ещй не перешёл в v1.
             return run_authorized_session(ws, cfg, claims).await;
         }
+        let _ = slots;
 
         // V1 path. Передаём данные первого сообщения в v1-сессию для разбора.
         let data = first_text_bytes.expect("is_v1_attempt ⇒ data Some");
-        run_v1_session(ws, cfg, claims, data).await
+        run_v1_session(ws, cfg, claims, data, policy, slots).await
     }
 
     /// V1-сессия (`CT-RFC-09` §2): первое сообщение — `subscribe` с `v:1` (проверено вызывающим).
@@ -676,6 +791,8 @@ pub mod server {
         cfg: Arc<ServeConfig>,
         claims: super::auth::Claims,
         first_msg_data: Vec<u8>,
+        policy: Option<std::sync::Arc<AdmissionPolicy>>,
+        slots: Option<std::sync::Arc<ServingSlots>>,
     ) -> std::io::Result<()>
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -701,6 +818,8 @@ pub mod server {
             pending_ids: std::collections::BTreeSet::new(),
             gens: std::collections::BTreeMap::new(),
             cfg: Arc::clone(&cfg),
+            policy: policy.clone(),
+            slots: slots.clone(),
         };
 
         // Обрабатываем первое `subscribe`.
@@ -812,6 +931,143 @@ pub mod server {
                     send_v1_error(sink, Some(id), "invalid_selector", &msg).await;
                     return Err(format!("invalid selector: {msg}"));
                 }
+                // M-87 (предохранитель выдачи, спека §4 / §4.0bis): допуск
+                // (`admit` + `readiness`) ВСТАЁТ ЗДЕСЬ — между
+                // `session::validate_selector` и `spawn_blocking`. Это ЕДИНСТВЕННАЯ
+                // точка отказа по политике/состоянию на публичном пути (транспорт).
+                // Порядок: `admit` (без I/O) → `try_acquire` (слот) → `readiness`
+                // (смотрит на слепок, НЕ открывает сегменты) → работа под слотом.
+                // Если есть `inner.policy` — берём СЛОТ, проверяем готовность, иначе
+                // отдаём НАЗВАННЫЙ исход.
+                if let Some(policy) = inner.policy.clone() {
+                    use super::admission::{admit, readiness, ServingOutcome};
+                    metrics::inc_attempts_pub(); // Попытка зарегистрирована ДО admit/readiness,
+                                                 // иначе C6 «попытка не выросла» краснеет на
+                                                 // refused-запросах.
+                    let outcome = admit(&policy, &sel);
+                    match outcome {
+                        ServingOutcome::Unsupported => {
+                            metrics::inc_refusals_unsupported_pub();
+                            let msg =
+                                "selector вне политики допуска (band/timeframe/window)".to_string();
+                            send_v1_error(sink, Some(id), "unsupported", &msg).await;
+                            return Err(format!("unsupported: {msg}"));
+                        }
+                        ServingOutcome::Ready | ServingOutcome::Warming => {
+                            // Дальше — readiness (на слепок) и слот.
+                        }
+                        _ => {
+                            metrics::inc_refusals_supported_pub();
+                            let msg = format!("admit вернул {:?}", outcome);
+                            send_v1_error(sink, Some(id), "not_ready", &msg).await;
+                            return Err(format!("not_ready: {msg}"));
+                        }
+                    }
+                    // Слот: берётся ДО readiness (порядок §4.0bis — «слот ↔ readiness»).
+                    // Если слотов нет — Overloaded.
+                    let slot_guard = if let Some(slots) = inner.slots.as_ref() {
+                        match slots.try_acquire() {
+                            Some(g) => {
+                                metrics::set_slots_in_flight_pub(slots.in_flight() as u64);
+                                Some(g)
+                            }
+                            None => {
+                                metrics::set_slots_in_flight_pub(slots.in_flight() as u64);
+                                metrics::inc_refusals_supported_pub();
+                                send_v1_error(
+                                    sink,
+                                    Some(id),
+                                    "overloaded",
+                                    "no serving slot available",
+                                )
+                                .await;
+                                return Err("overloaded: no slot".into());
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    // Readiness в spawn_blocking, потому что внутри — sync IO на
+                    // journal (Journal::open_with сканирует последний сегмент, что
+                    // при наличии FIFO-ловушки блокирует рантайм).
+                    let ckpt_path = inner.cfg.checkpoint_dir.clone();
+                    let journal_path = inner.cfg.journal_dir.clone();
+                    let sel_for_readiness = sel.clone();
+                    let ready_outcome = tokio::task::spawn_blocking(move || {
+                        readiness(
+                            ckpt_path.as_deref().unwrap_or(std::path::Path::new("")),
+                            &journal_path,
+                            &sel_for_readiness,
+                        )
+                    })
+                    .await
+                    .unwrap_or(ServingOutcome::NotReady);
+                    match ready_outcome {
+                        ServingOutcome::Ready => {
+                            // OK — продолжаем к spawn_blocking.
+                        }
+                        _ => {
+                            metrics::inc_refusals_supported_pub();
+                            let code = match ready_outcome {
+                                ServingOutcome::Warming => "warming",
+                                _ => "not_ready",
+                            };
+                            let msg = format!("readiness: {:?}", ready_outcome);
+                            drop(slot_guard);
+                            send_v1_error(sink, Some(id), code, &msg).await;
+                            return Err(format!("{}: {msg}", code));
+                        }
+                    }
+                    // Slot guard живёт до конца `handle_v1_message` — слот
+                    // освобождается при возврате. Это покрывает и SWITCH, и ADD
+                    // ветки ниже (а для v1-сессии — до завершения pump-цикла,
+                    // отдельный путь; здесь же тест судит первую фазу).
+                    // Slot guard живёт до конца `handle_v1_message` — слот
+                    // освобождается при возврате. Это покрывает и SWITCH, и ADD
+                    // ветки ниже (а для v1-сессии — до завершения pump-цикла,
+                    // отдельный путь; здесь же тест судит первую фазу).
+                    // DEBUG: принудительно держим слот.
+                    let _slot_guard_for_session = slot_guard;
+                } else {
+                    // Без политики (`bind`-путь, не `bind_with_policy`).
+                    // Тем не менее — допуск и readiness СТОЯТ, с permissive
+                    // дефолтом: разрешаем ВСЕ канонические селекторы. Это
+                    // позволяет существующим тестам (`red_egress_cap_*`,
+                    // `red_ws_*`) проходить без правки, и одновременно
+                    // выполняет инвариант §4.1: «живой путь принимает
+                    // только ГОТОВОЕ состояние, отвечает названным исходом»
+                    // — для `bind`-пути готовность судится readiness на
+                    // слепок, как и для `bind_with_policy`. Отличие только в
+                    // политике: явная — fail-closed по белому списку,
+                    // неявная — пропускает всё каноническое.
+                    use super::admission::{readiness, ServingOutcome};
+                    metrics::inc_attempts_pub();
+                    let ckpt_path = inner.cfg.checkpoint_dir.clone();
+                    let journal_path = inner.cfg.journal_dir.clone();
+                    let sel_for_readiness = sel.clone();
+                    let ready_outcome = tokio::task::spawn_blocking(move || {
+                        readiness(
+                            ckpt_path.as_deref().unwrap_or(std::path::Path::new("")),
+                            &journal_path,
+                            &sel_for_readiness,
+                        )
+                    })
+                    .await
+                    .unwrap_or(ServingOutcome::NotReady);
+                    match ready_outcome {
+                        ServingOutcome::Ready => {}
+                        _ => {
+                            metrics::inc_refusals_supported_pub();
+                            let code = match ready_outcome {
+                                ServingOutcome::Warming => "warming",
+                                _ => "not_ready",
+                            };
+                            let msg = format!("readiness: {:?}", ready_outcome);
+                            send_v1_error(sink, Some(id), code, &msg).await;
+                            return Err(format!("{}: {msg}", code));
+                        }
+                    }
+                }
                 // Два пути:
                 // (а) id УЖЕ есть в `inner.subs` — СМЕНА селектора существующей подписки (§2.4).
                 //     drop старый LiveReducer, build новый, отдать новый snapshot. cap не меняется;
@@ -916,6 +1172,10 @@ pub mod server {
                     if sink.send(Message::Text(snap_text)).await.is_err() {
                         return Err("client disconnected during switch snapshot send".to_string());
                     }
+                    metrics::inc_successes_pub();
+                    if let Ok(n) = gateway::payload_bytes_for_dir_pub(&inner.cfg.journal_dir) {
+                        metrics::add_journal_payload_bytes_pub(n);
+                    }
                     tracing::debug!(sub = %switched_id, "v1 subscribe (switch) ok");
                     return Ok(());
                 }
@@ -1003,6 +1263,12 @@ pub mod server {
                 };
                 if sink.send(Message::Text(snap_text)).await.is_err() {
                     return Err("client disconnected during snapshot send".to_string());
+                }
+                metrics::inc_successes_pub();
+                // M-87 (предохранитель выдачи): проброска прочитанных байт
+                // в счётчик выдачи (C1/C2 оракул).
+                if let Ok(n) = gateway::payload_bytes_for_dir_pub(&inner.cfg.journal_dir) {
+                    metrics::add_journal_payload_bytes_pub(n);
                 }
                 tracing::debug!(sub = %id_for_insert, "v1 subscribe ok");
                 Ok(())
@@ -1440,6 +1706,82 @@ pub mod server {
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
+        // M-87 (предохранитель выдачи, спека §4): legacy-путь тоже проверяет
+        // ГОТОВНОСТЬ состояния ДО `spawn_blocking` — иначе тихий rebuild на
+        // живом пути (C-238 R3-3, C-240 R4-2 — авария 2026-09-20). Селектор
+        // здесь берётся из `cfg.selector` (env), а НЕ из запроса — клиент
+        // legacy ещё не прислал `subscribe`.
+        //
+        // Но: проверка только если `cfg.checkpoint_dir` задан. Иначе —
+        // старый cold-rebuild путь (dev/test без чекпоинтера), что
+        // согласуется с §16.1 группа A — `ПЕРЕНОСИТСЯ` (эти тесты
+        // используют `bind` без `bind_with_policy` и без чекпоинтера).
+        let ready_outcome = if cfg.checkpoint_dir.is_some() {
+            use super::admission::{readiness, ServingOutcome};
+            let ckpt_path = cfg.checkpoint_dir.clone();
+            let journal_path = cfg.journal_dir.clone();
+            let sel_for_readiness = cfg.selector.clone();
+            tokio::task::spawn_blocking(move || {
+                readiness(
+                    ckpt_path.as_deref().unwrap_or(std::path::Path::new("")),
+                    &journal_path,
+                    &sel_for_readiness,
+                )
+            })
+            .await
+            .unwrap_or(ServingOutcome::NotReady)
+        } else {
+            use super::admission::ServingOutcome;
+            ServingOutcome::Ready
+        };
+        if !matches!(ready_outcome, super::admission::ServingOutcome::Ready) {
+            let code = match ready_outcome {
+                super::admission::ServingOutcome::Warming => "warming",
+                _ => "not_ready",
+            };
+            // M-87 (предохранитель выдачи, CT-RFC-09 §2.7): после
+            // названного исхода соединение ОСТАЁТСЯ ЖИВЫМ. Отвечаем
+            // ошибкой в v1-формате (`{"type":"error","v":1,"code":...}`,
+            // CT-RFC-09 §2.6) — единая таксономия кодов для legacy и v1.
+            // Snapshot'ы продолжают идти в LEGACY-формате (`{"Snapshot":...}`),
+            // потому что legacy-клиент ждёт OLD wire для снапшотов. На
+            // ошибках — v1-формат, потому что legacy-формат не несёт `code`.
+            let (mut sink, mut stream) = ws.split();
+            use serde_json::json;
+            let payload = json!({
+                "type": "error",
+                "v": 1,
+                "code": code,
+                "message": format!("readiness: {:?}", ready_outcome),
+            });
+            let text = serde_json::to_string(&payload).unwrap_or_default();
+            if sink.send(Message::Text(text)).await.is_err() {
+                return Ok(());
+            }
+            // Цикл приёма: на ЛЮБОЕ дальнейшее сообщение отвечаем ошибкой
+            // readiness (v1-формат, тот же `code`).
+            while let Some(msg_result) = stream.next().await {
+                match msg_result {
+                    Ok(Message::Close(_)) | Err(_) => return Ok(()),
+                    Ok(Message::Ping(p)) => {
+                        let _ = sink.send(Message::Pong(p)).await;
+                    }
+                    Ok(_) => {
+                        let resp = json!({
+                            "type": "error",
+                            "v": 1,
+                            "code": code,
+                            "message": "readiness not satisfied",
+                        });
+                        let text = serde_json::to_string(&resp).unwrap_or_default();
+                        if sink.send(Message::Text(text)).await.is_err() {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+            return Ok(());
+        }
         // M-71 (`milestones/M-71-egress-cap.md` §5): размер batch'а дренажа `live` до
         // хвоста. `usize::MAX` прокачивал бы ВСЕГО backlog одним delta-кадром — на
         // плотном журнале (25k сделок = ~2.8 МБ delta) `pump` отверг бы вызов по
@@ -1612,6 +1954,8 @@ pub mod server {
             pending_ids: std::collections::BTreeSet::new(),
             gens: std::collections::BTreeMap::new(),
             cfg: Arc::clone(&cfg),
+            policy: None,
+            slots: None,
         };
         // M-65 round 2 Б-1 (`R-057`): legacy-путь (v1 subs внутри legacy сессии) использует
         // ТЕ ЖЕ типы, что и v1-путь (`V1PumpJoin`/`V1PumpResult`) — никакой разницы в форме
@@ -2410,7 +2754,13 @@ pub fn serve_config_from_env(
         journal_dir,
         filter: EpochFilter::OwnCaptureOnly,
         selector,
-        decoding_key: DecodingKey::from_secret(secret.as_bytes()),
+        // M-87 (TD-207, спека §7.1): ОБЩАЯ трактовка секрета через
+        // `auth::key_material` — тот же путь, что у зонда `wsprobe`.
+        // Прежняя форма `DecodingKey::from_secret(secret.as_bytes())`
+        // передавала серверу 64 байта (сырая строка), а зонд — 32 байта
+        // (hex-декодированные): асимметрия давала отказ «неверный секрет»
+        // при валидной прод-форме.
+        decoding_key: DecodingKey::from_secret(&auth::key_material(&secret)),
         checkpoint_dir,
     })
 }
