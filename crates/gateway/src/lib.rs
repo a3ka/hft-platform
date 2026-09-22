@@ -1347,11 +1347,48 @@ impl Reducer {
             return;
         }
         match &md.payload {
-            MdPayload::L2Snapshot { bids, asks, .. } => {
+            MdPayload::L2Snapshot {
+                bids,
+                asks,
+                ts_exch_ms,
+                ..
+            } => {
                 self.book.apply_snapshot(bids, asks);
+                // M-88 §4 (фикс S12): seed ДОЛЖЕН обновлять heatmap_buckets.
+                // Без этого mid остаётся None и `build_heatmap_and_cob` для следующих
+                // L2-событий не сможет вычислить клетки вокруг исторического mid
+                // (он невидим для offline-редьюсера, у которого `book_series` пуст).
+                // Применяем снимок к bucket'у ровно так же, как `apply` делал бы — чтобы
+                // последующие delta'ы могли ОПЕРЕТЬСЯ на сохранённый mid (как в live-пути,
+                // где `refresh_heatmap_bucket` уже работает на этой памяти).
+                //
+                // `heatmap_buckets_observed` / `cob_observed` НЕ обновляются здесь —
+                // они описывают «наблюдения в КАДРЕ» (что прислал продюсер), а seed
+                // относится к ПРОШЛОМУ и в `SeriesBundle.heatmap_observed_time_s` /
+                // `cob_observed` включаться не должен (см. оракул
+                // `red_m88_contract_form::form_frame_without_book_events_declares_nothing`).
+                if let Some(time_s) = self.bucket_time_s(*ts_exch_ms) {
+                    self.refresh_heatmap_bucket(time_s);
+                }
             }
-            MdPayload::L2Delta { bids, asks, .. } => {
+            MdPayload::L2Delta {
+                bids,
+                asks,
+                ts_exch_ms,
+                ..
+            } => {
                 self.book.apply_delta(bids, asks);
+                // M-88 §4 (фикс S12, сестра L2Snapshot-ветки): дельта в seed ТОЖЕ должна
+                // обновлять bucket — иначе отозванный уровень продолжает жить в bucket'е
+                // (mid сохраняется, клетки остаются), и `build_heatmap_and_cob` для
+                // ПОСЛЕДУЮЩЕГО кадра выдаст «фантомный» срез, который перезапишет
+                // правильное состояние у клиента. `refresh_heatmap_bucket` корректно
+                // трактует пустую сторону: `mid_from` вернёт None → `mid` КЕЕPИТСЯ (так
+                // же, как в `apply` после реального снятия уровня), а `bids`/`asks`
+                // обновляются на текущее состояние книги.
+                if let Some(time_s) = self.bucket_time_s(*ts_exch_ms) {
+                    self.refresh_heatmap_bucket(time_s);
+                }
             }
             // Trade/Heatmap/Secrets/etc — без эффекта: `seed_vwap` уже отбирает `Trade`
             // для VWAP-аккумулятора; book-зеркало для НЕ-L2 вариантов не существует.
