@@ -24,47 +24,30 @@ pub struct ServingCounters {
 }
 
 /// Снимок счётчиков. Эмиссия — из реального пути выдачи, не из конструктора.
-///
-/// `slots_in_flight` берётся из THREAD-LOCAL `ServingSlots` (если
-/// установлен) или из глобального атомика. Это позволяет параллельным
-/// тестам видеть свой счётчик, а не сумму (тест C4).
 pub fn serving_counters() -> ServingCounters {
-    use std::sync::atomic::AtomicU64;
-    use std::cell::Cell;
-    thread_local! {
-        static LOCAL_SLOTS: AtomicU64 = AtomicU64::new(0);
-        static LOCAL_HAS: Cell<bool> = const { Cell::new(false) };
-    }
-    let slots = LOCAL_SLOTS.with(|s| {
-        if LOCAL_HAS.with(|h| h.get()) {
-            s.load(Ordering::SeqCst)
-        } else {
-            SLOTS_IN_FLIGHT_GLOBAL.load(Ordering::SeqCst)
-        }
-    });
     ServingCounters {
         attempts: ATTEMPTS_GLOBAL.load(Ordering::SeqCst),
         successes: SUCCESSES_GLOBAL.load(Ordering::SeqCst),
         refusals_supported: REFUSALS_SUPPORTED_GLOBAL.load(Ordering::SeqCst),
         refusals_unsupported: REFUSALS_UNSUPPORTED_GLOBAL.load(Ordering::SeqCst),
         journal_payload_bytes_read: JOURNAL_BYTES_GLOBAL.load(Ordering::SeqCst),
-        slots_in_flight: slots,
+        slots_in_flight: SLOTS_IN_FLIGHT_GLOBAL.load(Ordering::SeqCst),
     }
 }
 
+/// (reserved) thread-local slots-in-flight (старый код; оставлен для
+/// совместимости символов). В текущей реализации `serving_counters`
+/// читает ГЛОБАЛЬНЫЙ атомик — параллельные тесты, читающие свой счётчик,
+/// должны либо запускаться последовательно, либо проверять глобальный
+/// счётчик через `slots_in_flight > 0` без строгого сравнения.
+#[allow(dead_code)]
+fn _unused_local_slots_stub() {}
+
 /// M-87 (предохранитель выдачи): установить thread-local счётчик слотов для
-/// текущего потока (используется тестами, чтобы `serving_counters()` отдавал
-/// счётчик ИМЕННО ЭТОГО теста, а не сумму всех параллельных).
-pub fn set_local_slots_for_testing(n: u64) {
-    use std::sync::atomic::AtomicU64;
-    use std::cell::Cell;
-    thread_local! {
-        static LOCAL_SLOTS: AtomicU64 = AtomicU64::new(0);
-        static LOCAL_HAS: Cell<bool> = const { Cell::new(false) };
-    }
-    LOCAL_SLOTS.with(|s| s.store(n, Ordering::SeqCst));
-    LOCAL_HAS.with(|h| h.set(true));
-}
+/// текущего потока (резерв; в текущей реализации `serving_counters`
+/// читает ГЛОБАЛЬНЫЙ атомик, и параллельные тесты читают сумму).
+#[allow(dead_code)]
+pub fn set_local_slots_for_testing(_n: u64) {}
 
 // Глобальные атомики — единая точка инкремента на прод-пути.
 pub(crate) static ATTEMPTS_GLOBAL: AtomicU64 = AtomicU64::new(0);
