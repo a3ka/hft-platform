@@ -292,12 +292,46 @@ fn golden_vectors_match_producer_and_expectation() {
             );
         }
 
-        // (2) модель сходится на них с ожиданием — ловит дрейф СЕМАНТИКИ.
+        // (2) ожидание совпадает с полным пересчётом — ловит дрейф СЕМАНТИКИ производителя.
         let frozen_expected =
             std::fs::read(dir.join("expected_series.json")).expect("read expected");
         assert_eq!(
             frozen_expected, expected,
             "вектор '{name}': ожидаемое конечное состояние разошлось с полным пересчётом"
+        );
+
+        // (3) МОДЕЛЬ ПОТРЕБИТЕЛЯ СХОДИТСЯ НА ЗАМОРОЖЕННЫХ БАЙТАХ (`C-237` R1).
+        //
+        // Без этой половины «двусторонняя сверка» была односторонней, и гейт справедливо
+        // это отверг: пункты (1) и (2) сравнивают производителя с собой и ожидание с
+        // пересчётом, но НИ ОДИН не применяет замороженные кадры через потребителя.
+        // Вектор, на котором потребитель не сходится, такую проверку проходил бы — то есть
+        // материал для внешней проверки фронта был бы негоден, оставаясь зелёным.
+        //
+        // Здесь замороженный СНИМОК и замороженные КАДРЫ проходят ровно тот путь, который
+        // пройдёт фронт: разбор проводных байтов → применение → сравнение конечного
+        // состояния с замороженным ожиданием.
+        let mut model: gateway::Snapshot =
+            serde_json::from_slice(&frozen_snap).expect("frozen snapshot → model");
+        for i in 0..frames.len() {
+            let fp = dir.join(format!("frame_{i:02}.json"));
+            let bytes = std::fs::read(&fp).unwrap_or_else(|_| panic!("нет кадра {}", fp.display()));
+            let frame: gateway::Frame =
+                serde_json::from_slice(&bytes).expect("frozen frame → model");
+            let outcome = model.apply(&frame);
+            assert_eq!(
+                outcome,
+                gateway::ApplyOutcome::Applied,
+                "вектор '{name}': кадр {i} отвергнут моделью ({outcome:?}) — замороженная \
+                 последовательность не применима потребителем"
+            );
+        }
+        let model_series = serde_json::to_vec(&model.series).expect("model → wire");
+        assert_eq!(
+            model_series, frozen_expected,
+            "вектор '{name}': МОДЕЛЬ ПОТРЕБИТЕЛЯ не сошлась с замороженным ожиданием. \
+             Материал внешней проверки фронта негоден: мы отдали бы байты, на которых наш \
+             собственный потребитель даёт другое состояние"
         );
     }
 
