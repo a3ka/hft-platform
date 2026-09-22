@@ -63,7 +63,7 @@ m88_task9() {
   local spec="$1" base="$2" changed dec miss=""
   changed=$(git diff --name-only "$base"..HEAD -- \
               'crates/gateway/tests/*.rs' 'crates/gateway-serve/tests/*.rs' 2>/dev/null \
-            | grep -v 'red_m88_update_contract\.rs\|red_m88_contract_form\.rs' \
+            | grep -v 'red_m88_update_contract\.rs\|red_m88_contract_form\.rs\|red_m88_golden_vectors\.rs' \
             | xargs -r -n1 basename | sort -u)
   dec=$(awk '/^### 14.1. Решения по изменённым ожиданиям/,0' "$spec")
   if [ -z "$changed" ]; then

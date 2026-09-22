@@ -14,6 +14,7 @@
 set -uo pipefail
 cd "$(dirname "$0")/../.."
 # shellcheck source=../lib/m88_predicates.sh
+LIBDIR="$(pwd)/scripts/lib"
 . scripts/lib/m88_predicates.sh
 
 TMP=$(mktemp -d /tmp/red-verify-m88-XXXXXX)
@@ -122,14 +123,53 @@ if [ -z "$MB" ]; then
   bad "task9 SETUP: merge-base не вычислен — сценарий не может быть исполнен"
 else
   CHANGED_N=$(git diff --name-only "$MB"..HEAD -- 'crates/gateway/tests/*.rs' 'crates/gateway-serve/tests/*.rs' 2>/dev/null \
-              | grep -vc 'red_m88_update_contract\.rs\|red_m88_contract_form\.rs' || true)
-  ok "task9 SETUP: merge-base $MB, изменённых чужих тестов: $CHANGED_N"
+              | grep -vc 'red_m88_update_contract\.rs\|red_m88_contract_form\.rs\|red_m88_golden_vectors\.rs' || true)
+  ok "task9 SETUP: merge-base $MB, изменённых ЧУЖИХ ожиданий: $CHANGED_N"
+
+  # Сценарии ПУСТОГО множества — на текущем дереве.
   if [ "$CHANGED_N" -eq 0 ]; then
-    expect 0 "task9 ЧЕСТНО: пустое множество ЗАЯВЛЕНО ⇒ предъявлено" -- m88_task9 "$TMP/spec_empty_declared.md" "$MB"
-    expect 1 "task9 ПОДДЕЛКА: пустота молчит под другим плейсхолдером ⇒ отказ" -- m88_task9 "$TMP/spec_empty_silent.md" "$MB"
+    expect 0 "task9 ЧЕСТНО(пусто): пустое множество ЗАЯВЛЕНО ⇒ предъявлено" -- m88_task9 "$TMP/spec_empty_declared.md" "$MB"
+    expect 1 "task9 ПОДДЕЛКА(пусто): пустота молчит под другим плейсхолдером ⇒ отказ" -- m88_task9 "$TMP/spec_empty_silent.md" "$MB"
   else
-    # Множество непусто: таблица без имён обязана отказать.
     expect 1 "task9 ПОДДЕЛКА: изменённые файлы есть, решений нет ⇒ отказ" -- m88_task9 "$TMP/spec_empty_silent.md" "$MB"
+  fi
+
+  # `C-237` R2: ЧЕСТНЫЙ НЕПУСТОЙ сценарий. Прежняя проба на пустом дереве никогда не
+  # проверяла главную ветку предиката — «файл изменён, решение записано ⇒ PASS» и
+  # «файл изменён, решения нет ⇒ FAIL». Строим непустое множество ИСКУССТВЕННО, в
+  # одноразовом дереве, чтобы не трогать предмет.
+  PROBE_WT="$TMP/wt"
+  if git worktree add -q --detach "$PROBE_WT" HEAD 2>/dev/null; then
+    ok "task9 SETUP(непусто): одноразовое дерево создано"
+    # `commit -a` запрещён хуком проекта — пути называются ЯВНО.
+    ( cd "$PROBE_WT" \
+      && printf '\n// проба предиката task9 — файл изменён намеренно\n' >> crates/gateway/tests/red_heatmap.rs \
+      && git add -- crates/gateway/tests/red_heatmap.rs \
+      && git -c user.email=probe@local -c user.name=probe commit -q --no-verify \
+           -m "probe: чужое ожидание изменено" -- crates/gateway/tests/red_heatmap.rs ) >/dev/null 2>&1
+    PROBE_MB=$(git -C "$PROBE_WT" merge-base origin/main HEAD 2>/dev/null)
+    CH=$(git -C "$PROBE_WT" diff --name-only "$PROBE_MB"..HEAD -- 'crates/gateway/tests/*.rs' 2>/dev/null | grep -c 'red_heatmap' || true)
+    if [ "$CH" -ge 1 ]; then
+      ok "task9 SETUP(непусто): множество непусто (red_heatmap.rs изменён)"
+      printf '### 14.1. Решения по изменённым ожиданиям\n\n| red_heatmap.rs | сторож карты | ПЕРЕНОСИТСЯ |\n' \
+        > "$TMP/spec_named.md"
+      printf '### 14.1. Решения по изменённым ожиданиям\n\n| другой_файл.rs | — | ПЕРЕНОСИТСЯ |\n' \
+        > "$TMP/spec_unnamed.md"
+      ( cd "$PROBE_WT" && . "$LIBDIR/m88_predicates.sh" 2>/dev/null
+        m88_task9 "$TMP/spec_named.md" "$PROBE_MB" >/dev/null 2>&1 ) && R1=0 || R1=1
+      ( cd "$PROBE_WT" && . "$LIBDIR/m88_predicates.sh" 2>/dev/null
+        m88_task9 "$TMP/spec_unnamed.md" "$PROBE_MB" >/dev/null 2>&1 ) && R2=0 || R2=1
+      [ "$R1" -eq 0 ] && ok "task9 ЧЕСТНО(непусто): изменённый файл НАЗВАН ⇒ предъявлено (rc=0)" \
+                      || bad "task9 ЧЕСТНО(непусто): изменённый файл назван, а предикат отказал (rc=$R1)"
+      [ "$R2" -eq 1 ] && ok "task9 ПОДДЕЛКА(непусто): изменённый файл НЕ назван ⇒ отказ (rc=1)" \
+                      || bad "task9 ПОДДЕЛКА(непусто): изменённый файл не назван, а предикат принял (rc=$R2)"
+    else
+      bad "task9 SETUP(непусто): множество не стало непустым — сценарий вырожден"
+    fi
+    git worktree remove --force "$PROBE_WT" >/dev/null 2>&1
+    git worktree prune >/dev/null 2>&1
+  else
+    bad "task9 SETUP(непусто): одноразовое дерево не создано — главная ветка предиката не проверена"
   fi
 fi
 
