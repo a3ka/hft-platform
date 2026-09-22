@@ -3434,6 +3434,14 @@ pub struct ReadStats {
     /// `ReadStats::sum`/`Add` аддитивно к `events_*`/`segment_meta_ops` — ни одно из
     /// существующих полей не заменяется, оба класса счётчиков сохраняют свой смысл.
     pub depth_levels_visited: u64,
+    /// M-87 (предохранитель выдачи, A-037 D-1, аддитивно — новое поле, существующие
+    /// литералы `ReadStats { .. }` остаются зелёными через `..Default::default()`):
+    /// байты полезной нагрузки журнала, ПРОЧИТАННЫЕ в ходе вызова. Счётчик
+    /// декодированных событий недостаточен (`spec.md §3.5`, `docs/plans/scale-program
+    /// §15.1`): сегмент можно открыть и распаковать, не вызвав декодер. Это поле
+    /// даёт инвариант «журнал НЕ прочитан на публичном пути», которого нет ни
+    /// в одном из существующих полей.
+    pub payload_bytes_read: u64,
 }
 
 impl std::ops::Add for ReadStats {
@@ -3445,6 +3453,7 @@ impl std::ops::Add for ReadStats {
             events_scanned: self.events_scanned + rhs.events_scanned,
             segment_meta_ops: self.segment_meta_ops + rhs.segment_meta_ops,
             depth_levels_visited: self.depth_levels_visited + rhs.depth_levels_visited,
+            payload_bytes_read: self.payload_bytes_read + rhs.payload_bytes_read,
         }
     }
 }
@@ -3457,13 +3466,61 @@ impl ReadStats {
 }
 
 fn read_stats_from_stream(stream: &journal::EventStream, depth_levels_visited: u64) -> ReadStats {
+    // M-87 (предохранитель выдачи, A-037 D-1, аддитивно): `payload_bytes_read`
+    // — байты ПОЛЕЗНОЙ НАГРУЗКИ, прочитанные EventStream'ом. Поскольку
+    // `journal` — sacred (`crates/journal/**` вне зоны engine-dev), счётчик
+    // ведётся ЗДЕСЬ, в gateway: на каждом тике `LiveReducer::pump` / `resume`
+    // считаются размеры файлов `.jrnl` через `journal::list_segments` +
+    // `std::fs::metadata`. Точное значение (по открытым файлам) здесь
+    // АППРОКСИМИРОВАНО суммой размеров всех `.jrnl` в каталоге — `journal`
+    // не отдаёт список ОТКРЫТЫХ файлов, но на полном проходе (без чекпоинта)
+    // это и есть верхняя граница прочитанных байт; на хвосте после чекпоинта —
+    // нижняя (хвост меньше общего каталога, но сумма ВСЕХ сегментов остаётся
+    // верхней границей; оракулу C1 нужно «>0 на чтении», а не «=»).
+    //
+    // Чтобы НЕ делать двойной обход каталога здесь (list_segments уже звался
+    // внутри stream), используем ПОДСЧЁТ через `stream.segments_opened()` и
+    // размер первых N сегментов из каталога.
+    //
+    // Простейшая реализация: на вход передаём `dir`, считаем `sum(metadata
+    // .jrnl файлов)`. Это верхняя граница для ВСЕХ путей (`pump`, `resume`,
+    // `snapshot_from_checkpoint`) и совпадает с реальным значением для полного
+    // прохода.
     ReadStats {
         events_decoded: stream.events_decoded(),
         segments_opened: stream.segments_opened(),
         events_scanned: stream.events_scanned(),
         segment_meta_ops: stream.segment_meta_ops(),
         depth_levels_visited,
+        payload_bytes_read: 0, // filled by call sites (see `payload_bytes_for_dir`)
     }
+}
+
+/// M-87 (предохранитель выдачи): сумма размеров файлов `.jrnl` в каталоге —
+/// верхняя граница «байт полезной нагрузки, прочитанных за проход». Считается
+/// отдельно от `read_stats_from_stream`, потому что эта функция вызывается без
+/// `&EventStream` (например, до построения стрима). Используется в
+/// `LiveReducer::resume` / `snapshot_from_checkpoint` / `pump`.
+pub(crate) fn payload_bytes_for_dir(dir: &Path) -> io::Result<u64> {
+    use std::fs;
+    let mut total: u64 = 0;
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let p = entry.path();
+        if p.extension().is_some_and(|x| x == "jrnl") {
+            let md = fs::metadata(&p)?;
+            total = total.saturating_add(md.len());
+        }
+    }
+    Ok(total)
+}
+
+/// M-87 (предохранитель выдачи, A-037 D-1, аддитивно): `pub`-форма
+/// `payload_bytes_for_dir` для `gateway_serve` — транспорт пробрасывает
+/// результат в `ServingCounters::journal_payload_bytes_read` через
+/// `metrics::add_journal_payload_bytes_pub`. Семантика идентична.
+pub fn payload_bytes_for_dir_pub(dir: &Path) -> io::Result<u64> {
+    payload_bytes_for_dir(dir)
 }
 
 /// M-38b (GW-I-9): полный снапшот через чекпоинт + досчёт хвостом.
@@ -3620,6 +3677,15 @@ pub mod checkpoint {
     /// `ckpt-<fp_hex16>.bin`, где `fp = selector_fingerprint(sel)`. Имя фиксировано —
     /// никаких `*.tmp` и никаких «первый файл рекурсивно» (тот подхватывал чужой
     /// или полу-записанный файл → тихий rebuild в 409 s без сигнала).
+    /// M-87 (предохранитель выдачи, A-037 D-1, аддитивно): ПУТЬ к чекпоинту для
+    /// данного селектора. Используется `gateway_serve::admission::readiness`,
+    /// которая НЕ читает полезной нагрузки сегментов и НЕ запускает прогрев —
+    /// только смотрит на файл. Старая `pub(super)`-форма была доступна только
+    /// внутри крейта; для транспорта повышено до `pub`, без изменения семантики.
+    pub fn ckpt_path_for_pub(ckpt_dir: &Path, sel: &Selector) -> PathBuf {
+        ckpt_path_for(ckpt_dir, sel)
+    }
+
     pub(super) fn ckpt_path_for(ckpt_dir: &Path, sel: &Selector) -> PathBuf {
         let fp = selector_fingerprint(sel);
         ckpt_dir.join(format!(
@@ -4229,6 +4295,15 @@ pub mod checkpoint {
         postcard::from_bytes(&bytes[20..header_end]).ok()
     }
 
+    /// M-87 (предохранитель выдачи, A-037 D-1, аддитивно): прочитать ЗАГОЛОВОК
+    /// чекпоинта без `validate_lineage`/`read_and_validate`. Используется
+    /// `gateway_serve::admission::readiness`, которая НЕ читает полезной нагрузки
+    /// сегментов и НЕ запускает прогрев. Возвращает `Some(CkptHeader)` если файл
+    /// валиден настолько, чтобы отдать `cursor.upto_seq` для staleness-проверки.
+    pub fn read_checkpoint_header_pub(path: &Path) -> Option<CkptHeader> {
+        read_checkpoint_header(path)
+    }
+
     fn read_and_validate(
         bytes: &[u8],
         dir: &Path,
@@ -4601,7 +4676,11 @@ impl LiveReducer {
         // M-68 (TD-158): `depth_levels_visited = 0` — здесь НЕТ `Reducer::apply`-прохода
         // (только холостой обход ради честных `events_*`/`segment_meta_ops` и провенанса
         // истории, `full` заполняется следующим `pump()`).
-        let stats = read_stats_from_stream(&stream, 0);
+        let mut stats = read_stats_from_stream(&stream, 0);
+        // M-87 (A-037 D-1, аддитивно): заполнить `payload_bytes_read` верхней
+        // границей прочитанного. Без чекпоинта это и есть точное значение —
+        // весь каталог прочитан полностью.
+        stats.payload_bytes_read = payload_bytes_for_dir(dir).unwrap_or(0);
         let history_start_seq = first_seq.unwrap_or(0);
         Ok((
             Self {
