@@ -147,7 +147,12 @@ else
       && git add -- crates/gateway/tests/red_heatmap.rs \
       && git -c user.email=probe@local -c user.name=probe commit -q --no-verify \
            -m "probe: чужое ожидание изменено" -- crates/gateway/tests/red_heatmap.rs ) >/dev/null 2>&1
-    PROBE_MB=$(git -C "$PROBE_WT" merge-base origin/main HEAD 2>/dev/null)
+    # `C-245`/отчёт tester'а: базой пробы обязан быть РОДИТЕЛЬ пробного коммита, а не
+    # merge-base с `main`. От merge-base дифф включает ВСЕ изменения ветки — десятки
+    # файлов, — и фикстура §14.1 из двух строк их назвать не может; предикат честно
+    # отказывал, а проба читала это как свой провал. Сценарий судит ПРЕДИКАТ на
+    # контролируемом диффе, поэтому диапазон обязан быть ровно «родитель..HEAD».
+    PROBE_MB=$(git -C "$PROBE_WT" rev-parse HEAD^ 2>/dev/null)
     CH=$(git -C "$PROBE_WT" diff --name-only "$PROBE_MB"..HEAD -- 'crates/gateway/tests/*.rs' 2>/dev/null | grep -c 'red_heatmap' || true)
     if [ "$CH" -ge 1 ]; then
       ok "task9 SETUP(непусто): множество непусто (red_heatmap.rs изменён)"
