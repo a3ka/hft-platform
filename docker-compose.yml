@@ -15,6 +15,11 @@ services:
     image: hft-platform-recorder:local
     container_name: hft-recorder
     restart: unless-stopped
+    # M-87 (предохранитель выдачи, спека §9): лимиты процессора и памяти
+    # ОБЯЗАНЫ быть на контейнере recorder'а — иначе запись при шторме
+    # не оставляет запаса для выдачи. Конкретные значения — операторские.
+    cpus: "2.0"
+    mem_limit: 4g
     environment:
       JOURNAL_DIR: /journal
       # П-008 п.1 (санкция founder'а 2026-08-03) — СОСТАВ ЗАПИСИ КАК ЯВНАЯ КОНФИГУРАЦИЯ.
@@ -125,6 +130,10 @@ services:
     image: hft-platform-recorder:local
     container_name: hft-gateway-serve
     restart: unless-stopped
+    # M-87 (предохранитель выдачи, спека §9): лимиты процессора и памяти.
+    # Запас для recorder'а («recorder не должен быть вытеснен»).
+    cpus: "1.5"
+    mem_limit: 3g
     environment:
       # Loopback по умолчанию (deploy.MD §8: bind на loopback, внешний доступ через
       # reverse-proxy / ssh-tunnel; безопасный дефолт для проды).
@@ -225,6 +234,11 @@ services:
     image: hft-platform-recorder:local
     container_name: hft-gateway-checkpoint
     profiles: ["ops"]
+    # M-87 (предохранитель выдачи, спека §9): прогреватель ТОЖЕ под лимитом.
+    # «Ограничить контейнер выдачи, оставив тяжёлый пересчёт без контроля,
+    # значит не сделать ничего».
+    cpus: "1.0"
+    mem_limit: 2g
     entrypoint: ["/usr/local/bin/gateway-checkpoint"]
     command:
       - --dir=/journal
