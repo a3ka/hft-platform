@@ -2905,18 +2905,46 @@ impl Snapshot {
         }
         self.series.vp_session_max_time_s = merged_vp_session_max_time_s;
 
-        // M-23 heatmap merge: keyed by (time_s, side, price_e8), close-семантика per бакет —
-        // для одного и того же ключа incoming выигрывает (последний book-applied в этом бакете).
-        // BTreeMap обеспечивает стабильный порядок (HM-I-5 / GW-I-3 детерминизм).
-        self.series.heatmap = merge_heatmap(&self.series.heatmap, &frame.delta.heatmap);
+        // M-88 (контракт обновления, `milestones/M-88-*.md` §4/§5): Replace-семантика карты
+        // по колонкам. Кадр объявляет бакеты, по которым он несёт ПОЛНЫЙ срез, в
+        // `frame.delta.heatmap_observed_time_s`. Прежний код был «объединить existing и
+        // incoming по ключу» — призрак-дефект (§2 п.3/4): снятый уровень жил в existing
+        // и оставался на экране клиента до переподключения. См. оракулы S1/S2/S3.
+        self.series.heatmap = merge_heatmap(
+            &self.series.heatmap,
+            &frame.delta.heatmap,
+            &frame.delta.heatmap_observed_time_s,
+        );
 
-        // M-23 COB merge: keyed by (side, price_e8), close-семантика — incoming выигрывает.
-        self.series.cob = merge_cob(&self.series.cob, &frame.delta.cob);
+        // M-88 §4: Replace-семантика `cob` по `cob_observed`. Пустой `incoming` при
+        // `cob_observed = true` — легитимный исход «книга пуста», колонка удаляется.
+        self.series.cob = merge_cob(&self.series.cob, &frame.delta.cob, frame.delta.cob_observed);
 
         // M-23 bubbles merge: keyed by (time_s, price_e8), кумулятивная (НЕ close) —
         // складываем buy/sell (GW-I-4: frame-серия несёт cumulative-приращение).
         self.series.volume_bubbles =
             merge_bubbles(&self.series.volume_bubbles, &frame.delta.volume_bubbles);
+
+        // M-88 §3/§4: накопление наблюдений карты/стакана в `self.series`. Семантика
+        // «наблюдение — это факт О БАКЕТЕ В ОКНЕ СЕЛЕКТОРА»: если бакет наблюдался хотя бы
+        // в одном кадре сессии, он остаётся в списке; `cob_observed` ИСТИННО если хотя бы
+        // один кадр наблюдал стакан. Без этого `fold(empty, frames) ≠ snapshot(LATEST)`
+        // (оракул `red_gateway_live_eq_replay::snapshot_equals_folded_frames_from_start`):
+        // `merge_heatmap`/`merge_cob` используют входящие `heatmap_observed_time_s` /
+        // `cob_observed` для решения о замене, но не записывают результат в `self.series`
+        // — и сериализованный `acc` после fold'а неотличим от empty.
+        //
+        // Дедупликация + сортировка: контракт поля — «строго возрастающий distinct список»
+        // (оракул `red_m88_contract_form::form_frame_declares_observed_buckets`); для
+        // накопленного списка — тот же инвариант, иначе фронт получит неконсистентную
+        // форму (нельзя отличить «бакет наблюдался дважды» от «бакет в окне два раза»).
+        for t in &frame.delta.heatmap_observed_time_s {
+            if !self.series.heatmap_observed_time_s.contains(t) {
+                self.series.heatmap_observed_time_s.push(*t);
+            }
+        }
+        self.series.heatmap_observed_time_s.sort_unstable();
+        self.series.cob_observed |= frame.delta.cob_observed;
 
         self.cursor = frame.to;
         // M-88 §4.2: успешный merge — единственный исход, продвигающий `self.cursor`.
@@ -2926,12 +2954,42 @@ impl Snapshot {
     }
 }
 
-/// M-23: слить heatmap двух снапшотов по ключу `(time_s, side, price_e8)`. Семантика
-/// close (incoming выигрывает для совпадающего ключа — последний book-applied в бакете).
-/// Итоговый порядок — `(time_s, side, price_e8)` возрастание (BTreeMap).
-fn merge_heatmap(existing: &[HeatmapCell], incoming: &[HeatmapCell]) -> Vec<HeatmapCell> {
+/// M-88 (контракт обновления, `milestones/M-88-*.md` §4): слить heatmap двух снапшотов
+/// по ПРАВИЛУ «Replace по колонке». Кадр, несущий ПОЛНЫЙ срез бакета, ОБЪЯВЛЯЕТ это
+/// через `incoming_observed_time_s: &[i64]`; склейка УДАЛЯЕТ все прежние ячейки с
+/// объявленными `time_s` и кладёт пришечные (включая пустой срез — тогда колонка у клиента
+/// пустеет). Ячейки, чей `time_s` НЕ объявлен, не трогаются (закрытое прошлое не
+/// стирается; §6 запрет №1). Ячейки, чей `time_s` объявлен, но в `incoming` отсутствуют,
+/// удаляются — ровно в этом и состоит «полный срез».
+///
+/// **Почему НЕ close-семантика по `(time_s, side, price_e8)` (прежний `merge_heatmap` `chain`):**
+/// прежний код был «объединить existing и incoming» — и снятый уровень (после delta со
+/// `size == 0`) жил в existing, оставаясь на экране клиента навсегда (`VB-I-2` регресс,
+/// призрак-дефект, против которого заведён оракул `S1`).
+///
+/// Дедупликация по `(time_s, side, price_e8)` нужна лишь на случай дублей в самом
+/// `incoming`; порядок выхода — `(time_s, side, price_e8)` возрастание (BTreeMap,
+/// `GW-I-3`/`HM-I-5` детерминизм).
+fn merge_heatmap(
+    existing: &[HeatmapCell],
+    incoming: &[HeatmapCell],
+    incoming_observed_time_s: &[i64],
+) -> Vec<HeatmapCell> {
+    let observed: std::collections::BTreeSet<i64> =
+        incoming_observed_time_s.iter().copied().collect();
     let mut map: BTreeMap<(i64, String, i64), HeatmapCell> = BTreeMap::new();
-    for cell in existing.iter().chain(incoming.iter()) {
+    // Шаг 1: existing ЯЧЕЙКИ, чей `time_s` НЕ в объявленном множестве, сохраняются.
+    // Шаг 2: incoming (полный срез наблюдённых колонок) — встают на свои ключи; дубли
+    // дедуплицируются last-wins.
+    for cell in existing {
+        if !observed.contains(&cell.time_s) {
+            map.insert(
+                (cell.time_s, cell.side.clone(), cell.price_e8),
+                cell.clone(),
+            );
+        }
+    }
+    for cell in incoming {
         map.insert(
             (cell.time_s, cell.side.clone(), cell.price_e8),
             cell.clone(),
@@ -2940,22 +2998,31 @@ fn merge_heatmap(existing: &[HeatmapCell], incoming: &[HeatmapCell]) -> Vec<Heat
     map.into_values().collect()
 }
 
-/// M-23: слить cob двух снапшотов.
+/// M-88 §4: слить cob двух снапшотов по ПРИЗНАКУ НАБЛЮДЕНИЯ.
 ///
-/// **COB = point-in-time снимоК книги (НЕ additive-серия):** каждый frame несёт полный COB на
-/// конец frame'а, merge = «incoming заменяет existing целиком» (если непустой). Альтернатива
-/// (merge по ключу с last-wins) даёт устаревшие уровни от промежуточных frame'ов — GW-I-4
-/// тест `mid_stream_snapshot_completeness_merges_same_bucket` обнаруживает это (промежуточное
-/// состояние книги в frame1 не равно финальному).
-fn merge_cob(existing: &[CobLevel], incoming: &[CobLevel]) -> Vec<CobLevel> {
-    if incoming.is_empty() {
-        // Пустой frame (событий не было, или COB не построился) → prior COB сохраняется
-        // без изменений (поддерживает partial-fold, когда финальный frame ещё не пришёл).
+/// `incoming_observed = true` ⇔ кадр нёс ХОТЯ БЫ одно L2-событие ⇒ `cob` в этом
+/// сообщении есть ПОЛНЫЙ срез (включая пустой — книга стала односторонней). Replace-
+/// семантика: incoming заменяет existing целиком (пусть даже пустым массивом —
+/// «удалить» легитимный исход для клиента).
+///
+/// `incoming_observed = false` ⇔ кадр без L2-событий (только сделки/иное) ⇒ `NoChange`,
+/// existing сохраняется (прежний кадр «`if incoming.is_empty() { return existing }`» не
+/// различал эти два случая; отсюда рос призрак).
+///
+/// Дедупликация по `(side, price_e8)` нужна лишь на случай дублей в самом `incoming`;
+/// порядок выхода — `(side, price_e8)` возрастание (side алфавитно: «ask» перед «bid»).
+fn merge_cob(
+    existing: &[CobLevel],
+    incoming: &[CobLevel],
+    incoming_observed: bool,
+) -> Vec<CobLevel> {
+    if !incoming_observed {
+        // `NoChange` — кадр не нёс L2-событий; прежний стакан сохраняется нетронутым
+        // (спека §4 «cob → NoChange при cob_observed == false»).
         return existing.to_vec();
     }
-    // Incoming — последнее наблюдение: заменяет existing. Дедупликация по (side, price_e8)
-    // нужна лишь на случай дублей в самом incoming (теоретически); порядок — `(side, price)`
-    // возрастание (side алфавитно: "ask" перед "bid").
+    // Incoming — последний полный срез книги: заменяет existing целиком. Дедупликация
+    // по (side, price_e8) защищает от дублей в самом incoming.
     let mut map: BTreeMap<(String, i64), CobLevel> = BTreeMap::new();
     for level in incoming {
         map.insert((level.side.clone(), level.price_e8), level.clone());
