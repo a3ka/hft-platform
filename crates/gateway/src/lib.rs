@@ -1263,6 +1263,12 @@ impl Reducer {
         // из пришедших frame'ов (heatmap в frame.delta уже ограничен своим reducer'ом).
         self.heatmap_buckets.retain(|&t, _| t >= lo_time_s);
 
+        // M-88 §13bis (R-195 Б-1): список наблюдённых бакетов — такое же бакет-ключевое
+        // состояние, как `heatmap_buckets`, и обязан подчиняться ТОМУ ЖЕ предикату эвикции
+        // (`t >= lo_time_s`). Иначе `BTreeSet` накапливается за всю историю журнала и
+        // на прод-глубине пробивает предел объёма ответа (VB-I-10).
+        self.heatmap_buckets_observed.retain(|&t| t >= lo_time_s);
+
         // bubbles: ключ `(time_s, price_e8)` — эвикт по time_s.
         self.bubbles.retain(|&(t, _), _| t >= lo_time_s);
 
@@ -3152,6 +3158,14 @@ fn evict_series_bundle_under_window(series: &mut SeriesBundle, lo_time_s: i64) {
 
     // heatmap
     series.heatmap.retain(|c| c.time_s >= lo_time_s);
+
+    // M-88 §13bis (R-195 Б-1): список наблюдённых бакетов на стороне клиента подчинён тому же
+    // предикату эвикции, что и сама карта. `Snapshot::apply` только ДОБАВЛЯЕТ в накопленный
+    // список (`:2982-2987`), и без эвикции долгоживущая сессия кокпита копила бы его
+    // неограниченно — тот же дефект, что у редьюсера, только на другой стороне провода.
+    // Тот же предикат `t >= lo_time_s`, та же граница `lo_time_s`, та же точка вызова — это
+    // единственная форма, при которой `VB-I-2` (live==replay) не расходится структурно.
+    series.heatmap_observed_time_s.retain(|&t| t >= lo_time_s);
 
     // volume_bubbles
     series.volume_bubbles.retain(|c| c.time_s >= lo_time_s);
