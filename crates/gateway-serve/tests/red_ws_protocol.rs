@@ -6,7 +6,7 @@
 //! - `window_ms: None` и `checkpoint_dir: None` ⇒ bounded-окно и чекпоинт по WS-пути слепы.
 
 use contracts::{to_fixed, DataSource, EventKind, Level, MdPayload, Side, Venue};
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use gateway::{Cursor, Selector, Snapshot};
 use gateway_serve::auth::Claims;
 use gateway_serve::server::{bind, ServeConfig};
@@ -157,16 +157,23 @@ async fn got_snapshot(cfg: ServeConfig, url_token: Option<&str>) -> bool {
     }
 }
 
-/// Первое сообщение ПО ЖИВОМУ соединению, как есть (сырой JSON). В отличие от
-/// `got_snapshot`, различает «пришёл иной исход» и «связь оборвалась»: `None` означает
-/// ровно второе. Нужна для `M-87` (`A-037` D-4, `C-238` R3-3), где проверяется НАЗВАННЫЙ
-/// исход при ЖИВОМ соединении.
-async fn first_message(cfg: ServeConfig, url_token: Option<&str>) -> Option<serde_json::Value> {
+/// Открывает соединение и отдаёт ЕГО ВМЕСТЕ с первым сообщением. В отличие от
+/// `got_snapshot`, различает «пришёл иной исход» и «связь оборвалась» (`None` — второе),
+/// и, в отличие от прежней редакции, НЕ БРОСАЕТ сокет: продолжение диалога на том же
+/// соединении — предмет проверки (`C-240` R4-2).
+type ProbeWs =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+async fn open_and_first(
+    cfg: ServeConfig,
+    url_token: Option<&str>,
+) -> Option<(ProbeWs, serde_json::Value)> {
     let mut ws = connect(cfg, url_token).await.ok()?;
-    match ws.next().await {
-        None | Some(Err(_)) => None,
-        Some(Ok(m)) => serde_json::from_slice::<serde_json::Value>(m.into_data().as_ref()).ok(),
-    }
+    let msg = match ws.next().await {
+        None | Some(Err(_)) => return None,
+        Some(Ok(m)) => serde_json::from_slice::<serde_json::Value>(m.into_data().as_ref()).ok()?,
+    };
+    Some((ws, msg))
 }
 
 // ─────────────────────────── O-4 ───────────────────────────
@@ -365,10 +372,10 @@ async fn o5_broken_checkpoint_is_named_outcome_not_silent_rebuild() {
     std::fs::write(ckpt.path().join("ckpt-deadbeef.bin"), b"not-a-checkpoint")
         .expect("write мусор вместо чекпоинта");
 
-    // `C-238` R3-3: проверять ОТСУТСТВИЕ снимка недостаточно — так тест зелен и при разрыве
-    // соединения, и при таймауте. Требуется НАЗВАННЫЙ исход ПРИ ЖИВОМ соединении
-    // (`CT-RFC-09` §2.7: невалидный/неготовый селектор — ошибка СЕССИИ, а не отказ связи).
-    let msg = first_message(
+    // `C-238` R3-3 + `C-240` R4-2: мало получить один названный исход — нужно доказать,
+    // что СОЕДИНЕНИЕ после него ПРИГОДНО. Сервер, который шлёт одну ошибку готовности и
+    // немедленно закрывает связь, прежнюю редакцию проходил без изменений.
+    let (mut ws, msg) = open_and_first(
         config(dir.path(), None, Some(ckpt.path())),
         Some(&sign_with(SECRET, FUTURE)),
     )
@@ -387,5 +394,31 @@ async fn o5_broken_checkpoint_is_named_outcome_not_silent_rebuild() {
         msg.get("type").and_then(|t| t.as_str()),
         Some("snapshot"),
         "пришёл снимок — значит слепок молча пересобрали при клиенте"
+    );
+
+    // ТО ЖЕ соединение обязано принять следующее сообщение и ответить на него.
+    // Берём заведомо отвергаемую версию протокола: по `CT-RFC-09` §2.3 сервер обязан
+    // ответить `error` с кодом, а не промолчать и не разорвать связь.
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::json!({"op":"subscribe","v":999,"id":"after","selector":{
+            "venue":"Binance","symbol":"BTCUSDT","timeframe_ms":1000,
+            "bands":[0.001],"window_ms":60000}})
+        .to_string(),
+    ))
+    .await
+    .expect("отправка по тому же соединению не удалась — связь закрыта после исхода");
+
+    let second = match ws.next().await {
+        Some(Ok(m)) => serde_json::from_slice::<serde_json::Value>(m.into_data().as_ref()).ok(),
+        _ => None,
+    };
+    let second = second.expect(
+        "после названного исхода соединение НЕ ПРИГОДНО: второй запрос остался без ответа. \
+         CT-RFC-09 §2.7 — ошибка селектора есть ошибка СЕССИИ, а не отказ связи",
+    );
+    assert_eq!(
+        second.get("type").and_then(|t| t.as_str()),
+        Some("error"),
+        "на неизвестную версию протокола сервер обязан ответить error с кодом: {second}"
     );
 }

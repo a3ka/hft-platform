@@ -406,13 +406,47 @@ async fn c5_entry_refusal_keeps_connection_and_neighbours_alive() {
 
 // ═════════════ C4 — слот НЕ освобождается по таймауту ОЖИДАНИЯ ═════════════
 
-/// При `max_concurrent_serves = 1` вторая одновременная работа обязана получить
-/// `overloaded`, а занятый слот — оставаться занятым, пока работа не завершилась.
-/// Освобождение слота по таймауту ОТВЕТА даёт неограниченное число параллельных расчётов
-/// при формально ограниченном параллелизме.
+/// **ЗАЩЁЛКА, управляемая тестом (`A-037` У-6, `C-240` R4-1).**
+///
+/// Сегмент-канал: файл с именем сегмента, созданный как именованный канал. Открытие такого
+/// файла на чтение БЛОКИРУЕТСЯ, пока никто не открыл его на запись, — значит работа,
+/// дошедшая до него, встаёт и НЕ ДВИЖЕТСЯ, пока тест не отпустит. Отпускание — открыть
+/// канал на запись и закрыть: чтение получает конец файла и работа завершается.
+///
+/// Почему не «большой журнал»: прежняя редакция держала работу ДЛИТЕЛЬНОСТЬЮ, то есть
+/// исходом, зависящим от хоста. Такой оракул не мог упасть против запрещённой реализации
+/// (слот освобождён по таймауту ОЖИДАНИЯ, пока работа идёт) и падал по гонке.
+/// `testing.md`: гейт меряет свой инвариант, а не окружение.
+fn latch_segment(dir: &std::path::Path) -> std::path::PathBuf {
+    let n = std::fs::read_dir(dir)
+        .expect("read_dir")
+        .filter_map(Result::ok)
+        .filter(|e| e.path().extension().is_some_and(|x| x == "jrnl"))
+        .count();
+    let path = dir.join(format!("segment-{n:08}.jrnl"));
+    let st = std::process::Command::new("mkfifo")
+        .arg(&path)
+        .status()
+        .expect("запуск mkfifo");
+    assert!(st.success(), "setup-страж: защёлка не создана ({path:?})");
+    path
+}
+
+/// Отпустить защёлку: открыть канал на запись и закрыть — читатель получает конец файла.
+fn release_latch(path: &std::path::Path) {
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .expect("открыть защёлку на запись");
+    let _ = f.write_all(&[]);
+}
+
+/// ПОЛНЫЙ жизненный цикл слота: удержание → отказ второму → наблюдаемое освобождение.
+/// Каждый переход управляется ТЕСТОМ, а не временем.
 #[tokio::test]
-async fn c4_slot_is_held_until_work_ends_not_until_response_timeout() {
-    let dir = journal_busy(20_000);
+async fn c4_slot_lifecycle_hold_refuse_release() {
+    let dir = journal_busy(300);
     let ckpt = tempfile::tempdir().expect("ckpt");
     gateway::checkpoint::advance(
         dir.path(),
@@ -421,38 +455,68 @@ async fn c4_slot_is_held_until_work_ends_not_until_response_timeout() {
         EpochFilter::OwnCaptureOnly,
     )
     .expect("advance");
+    // Защёлка ставится ПОСЛЕ слепка: голова цела, хвост упирается в канал.
+    let latch = latch_segment(dir.path());
     let addr = serve(dir.path(), Some(ckpt.path().to_path_buf())).await;
 
+    // (1) УДЕРЖАНИЕ. Первый клиент входит и встаёт на защёлке.
     let mut a = connect(&addr).await;
-    let mut b = connect(&addr).await;
     send(&mut a, subscribe("a", canonical_selector_json())).await;
-    // Второй клиент просит, пока первый ещё обслуживается.
-    send(&mut b, subscribe("b", canonical_selector_json())).await;
-
-    let in_flight = serving_counters().slots_in_flight;
+    let held = tokio::time::timeout(std::time::Duration::from_millis(700), a.next()).await;
     assert!(
-        in_flight >= 1,
-        "слот не занят во время работы (slots_in_flight={in_flight}) — ограничитель \
-         не наблюдаем, и его наличие нечем предъявить"
-    );
-
-    let mb = recv(&mut b).await.expect("второй клиент не получил ответа");
-    let code = mb.get("code").and_then(|c| c.as_str()).unwrap_or("");
-    // `A-037` У-6: НИКАКИХ «либо». Прежняя редакция принимала и `overloaded`, и `snapshot`,
-    // то есть не могла упасть против «слот освобождён по таймауту ожидания» и падала по
-    // гонке. Исход ОДИН и назван.
-    assert_eq!(
-        code, "overloaded",
-        "при занятом единственном слоте второй запрос обязан получить РОВНО 'overloaded': \
-         {mb}. Приём 'либо snapshot' делает оракул неспособным упасть против освобождения \
-         слота по таймауту ОЖИДАНИЯ"
+        held.is_err(),
+        "setup-страж: работа НЕ удержана защёлкой — первый клиент ответил сразу. \
+         Сценарий вырожден, и всё ниже проверяет не то"
     );
     assert_eq!(
         serving_counters().slots_in_flight,
         1,
-        "слот обязан оставаться занятым, пока работа идёт"
+        "слот обязан быть занят, пока работа стоит на защёлке"
     );
+
+    // (2) ОТКАЗ ВТОРОМУ — пока первая работа ДЕЙСТВИТЕЛЬНО в полёте.
+    let mut b = connect(&addr).await;
+    send(&mut b, subscribe("b", canonical_selector_json())).await;
+    let mb = recv(&mut b).await.expect("второй клиент не получил ответа");
+    let code = mb.get("code").and_then(|c| c.as_str()).unwrap_or("");
+    assert_eq!(
+        code, "overloaded",
+        "при занятом единственном слоте второй запрос обязан получить РОВНО 'overloaded': \
+         {mb}"
+    );
+    assert_eq!(
+        serving_counters().slots_in_flight,
+        1,
+        "слот освобождён, пока работа ещё стоит на защёлке — это и есть запрещённое \
+         освобождение по таймауту ОЖИДАНИЯ"
+    );
+
+    // (3) ОСВОБОЖДЕНИЕ управляется ТЕСТОМ.
+    release_latch(&latch);
     let _ = recv(&mut a).await;
+    let mut freed = false;
+    for _ in 0..40 {
+        if serving_counters().slots_in_flight == 0 {
+            freed = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        freed,
+        "после завершения работы слот НЕ освобождён (slots_in_flight={})",
+        serving_counters().slots_in_flight
+    );
+
+    // (4) И слот снова выдаётся — иначе «освобождение» не наблюдаемо по существу.
+    let mut c = connect(&addr).await;
+    send(&mut c, subscribe("c", canonical_selector_json())).await;
+    let mc = recv(&mut c).await.expect("третий клиент не получил ответа");
+    assert_ne!(
+        mc.get("code").and_then(|x| x.as_str()),
+        Some("overloaded"),
+        "слот не выдаётся после освобождения: {mc}"
+    );
 }
 
 // ═════════════ C6 — счётчики ЭМИТЯТСЯ продюсером на реальном пути ═════════════
