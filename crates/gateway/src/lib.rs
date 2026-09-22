@@ -244,7 +244,17 @@ pub fn set_effective_max_response_bytes(n: usize) {
 ///    postcard-состояния изменилась, а postcard НЕ self-describing: без bump'а файл, снятый
 ///    v1-кодом, разбирался бы со сдвигом хвоста вместо честного отказа. Bump = тихий rebuild
 ///    кэша (GW-I-9б: файл прошлой версии — КЭШ, не ошибка), миграции не требуются.
-pub const CKPT_SCHEMA_VERSION: u32 = 2;
+/// 3: M-88 (`milestones/M-88-*.md` §3/§4): в состояние `Reducer` добавлены проекции
+///    наблюдений карты — `heatmap_buckets_observed: BTreeSet<i64>` и `cob_observed: bool`,
+///    используемые `finish_ref` для заполнения `SeriesBundle.heatmap_observed_time_s` /
+///    `SeriesBundle.cob_observed`. Без bump'а `snapshot_from_checkpoint` теряет ПЕРВЫЕ
+///    наблюдённые бакеты (те, что в прошлом до чекпоинта) при восстановлении — расхождение
+///    с `snapshot(START, at)` (GW-I-9(а) «байт-в-байт»). Прецедент bump'а тот же, что для
+///    `GATEWAY_SCHEMA_VERSION` (§5 спеки): silent rebuild v2-кэша, миграции не требуются
+///    (`GW-I-9(б)`). Стоимость — первый снапшот после деплоя = ~409 с (прод-замер M-38b),
+///    меры смягчения те же — прогрев чекпоинта ДО включения трафика (как делали при
+///    включении полос, `R-190`).
+pub const CKPT_SCHEMA_VERSION: u32 = 3;
 
 /// M-38b: магия чекпоинт-файла (8 байт). Не путать с `SEGMENT_MAGIC` журнала — это
 /// внутренний кэш редьюсера, не сегмент данных.
@@ -596,6 +606,13 @@ pub(crate) struct BookSeriesSlice {
     /// (зеркалит семантику `build_heatmap_and_cob`, где COB — последний обработанный
     /// bucket в окне). Свежий batch без книги дал бы либо пустой, либо устаревший COB.
     pub cob: Vec<CobLevel>,
+    /// M-88 §3/§4: отсортированный по возрастанию список `time_s` бакетов карты, для которых
+    /// в ДИАПАЗОНЕ кадра есть L2-наблюдение (ПОЛНЫЙ срез). На провод идёт через
+    /// `SeriesBundle.heatmap_observed_time_s` (аддитивное добавление, `VB-I-4`).
+    pub heatmap_observed_time_s: Vec<i64>,
+    /// M-88 §4: `true` ⇔ кадр нёс ХОТЯ БЫ одно L2-событие (Replace-семантика для `cob`,
+    /// включая пустой полный срез).
+    pub cob_observed: bool,
 }
 
 impl SeriesBundle {
@@ -610,6 +627,13 @@ impl SeriesBundle {
         self.depth_series = slice.depth_series;
         self.heatmap = slice.heatmap;
         self.cob = slice.cob;
+        // M-88 §3/§4: провод обязан ОБЪЯВЛЯТЬ наблюдения карты/стакана; иначе потребитель
+        // на Replace-семантике не отличит «наблюдения не было» от «полный срез пуст».
+        // `set_book_series` здесь — единственная точка перехода живого редьюсера в
+        // `SeriesBundle`; именно её `Snapshot::apply` позже прочитает и применит
+        // (§3 п.3 — `merge_heatmap`/`merge_cob`).
+        self.heatmap_observed_time_s = slice.heatmap_observed_time_s;
+        self.cob_observed = slice.cob_observed;
     }
 }
 
@@ -1011,6 +1035,25 @@ struct Reducer {
     /// единственное место, где флаг `true`.
     #[serde(skip, default = "default_capture_book_observations")]
     capture_book_observations: bool,
+    /// M-88 §3/§4 (задачи 3-4): дешёвая проекция наблюдений карты на ПУТИ ПЕРЕСЧЁТА
+    /// (`snapshot`/`replay`/`batch` через `finish_ref`). В отличие от `book_series` —
+    /// хранится ВСЕГДА (включая `capture_book_observations = false`), потому что без
+    /// `heatmap_observed_time_s`/`cob_observed` кадр репротивного паритета будет читаться
+    /// клиентом как «наблюдений не было», и `Replace` колонок не сработает (`VB-I-2` регресс).
+    /// Содержит distinct `time_s` бакетов карты, к которым ПРИКОСНУЛОСЬ ХОТЯ БЫ одно L2-событие
+    /// в окне редьюсера; `BTreeSet` дедуплицирует случаи, когда в одном бакете было несколько
+    /// событий. Чтение — `finish_ref` в `SeriesBundle.heatmap_observed_time_s`.
+    /// `#[serde(skip, default)]` — не часть чекпоинта: на чекпоинт-старте редьюсер создаётся
+    /// с пустым множеством, и при первом же `pump()` (если он вне LiveReducer) или при первом
+    /// L2-событии в `apply()` (для `frames_since`/`replay`) проекция заполнится заново.
+    #[serde(default)]
+    heatmap_buckets_observed: std::collections::BTreeSet<i64>,
+    /// M-88 §3/§4: `true` ⇔ в окне редьюсера было ХОТЯ БЫ одно L2-событие (`L2Snapshot` или
+    /// `L2Delta` через `selector.matches`). Соответствует флагу `SeriesBundle.cob_observed`,
+    /// по которому потребитель выбирает `Replace`-семантику для `cob`. Дешевле-в-разы, чем
+    /// буфер `cob_levels` для каждой версии книги.
+    #[serde(default)]
+    cob_observed: bool,
 }
 
 /// M-77 (§6bis.3): per-event наблюдение книго-зависимого состояния, снятое в момент
@@ -1025,11 +1068,23 @@ struct BookSeriesObservation {
     /// (max-seq побеждает для одного ключа). Идентичен ключу `BTreeMap<u64, _>`, в котором
     /// хранится наблюдение, — но держится в поле чтобы НЕ лезть в ключи при агрегации.
     seq: u64,
+    /// M-88: `time_s` бакета, к которому относится это наблюдение (зеркало
+    /// `heatmap_cells[0].time_s`, хранится в поле чтобы склейщик (`book_series_in`) мог
+    /// объявить наблюдение в `heatmap_observed_time_s` без обхода всей выборки ячеек и
+    /// сохранить корректность для пустого среза — у пустого среза нет ячеек, по к которым
+    /// можно было бы восстановить `time_s`).
+    heatmap_time_s: i64,
     /// Heatmap-ячейки бакета `heatmap_time_s` (= `event.ts_exch_ms / 1000` после
     /// выравнивания по `timeframe_ms`) в окне `[mid*(1−W), mid*(1+W)]`,
-    /// отфильтрованные через эффективный `heatmap_window_frac`. Семантика close-per-bucket:
-    /// позднейшее наблюдение того же `(time_s, side, price_e8)` замещает раннее, как в
-    /// `merge_heatmap` (`GW-I-3`/`HM-I-5`).
+    /// отфильтрованные через эффективный `heatmap_window_frac`. **M-88 (контракт
+    /// обновления, спека §4):** `heatmap_cells` несёт ПОЛНЫЙ срез карты в этом бакете
+    /// на момент наблюдения (все уровни стороны внутри окна, прошедшие через фильтр
+    /// `> 0`), а не дельту и не «снимок живых уровней». Позднейшее наблюдение того же
+    /// `(time_s, side, price_e8)` выигрывает у раннего (BTreeMap-`insert` в
+    /// `book_series_in`), и кадр, несущий этот бакет, ОБЯЗАН объявить `time_s` в
+    /// `SeriesBundle.heatmap_observed_time_s` — иначе потребитель не отличит «наблюдения
+    /// не было» от «полный срез пуст» и снятый уровень останется на экране (`VB-I-2`,
+    /// прежний призрак-дефект склейки `merge_heatmap`).
     heatmap_cells: Vec<HeatmapCell>,
     /// COB на момент наблюдения: последний снимок книги в окне `heatmap_time_s`
     /// (тот же алгоритм, что `build_cob_from_bucket`). COB — point-in-time: кадр
@@ -1132,6 +1187,11 @@ impl Reducer {
             book_series: BTreeMap::new(),
             // M-77: по умолчанию выключен — см. `set_capture_book_observations`.
             capture_book_observations: false,
+            // M-88 §3/§4: дешёвая проекция для ПУТИ ПЕРЕСЧЁТА. Стартует пустой —
+            // наполняется при первом же L2-событии в `apply()`; в `finish_ref` уходит в
+            // `SeriesBundle.heatmap_observed_time_s` / `SeriesBundle.cob_observed`.
+            heatmap_buckets_observed: std::collections::BTreeSet::new(),
+            cob_observed: false,
         }
     }
 
@@ -1477,6 +1537,11 @@ impl Reducer {
                 let Some(time_s) = self.bucket_time_s(*ts_exch_ms) else {
                     return;
                 };
+                // M-88 §3/§4 (задача 4): продюсер на пути ПЕРЕСЧЁТА объявляет бакет карты
+                // и факт наблюдения стакана. `BTreeSet::insert` — дедупликация по `time_s`
+                // (несколько событий в одном бакете дают одну запись в `heatmap_observed_time_s`).
+                self.heatmap_buckets_observed.insert(time_s);
+                self.cob_observed = true;
                 // M-68 rev6, задача 12 (R-138 Б-1): РОЛЛОВЕР каденс-интервала.
                 // ПЕРЕД обновлением книги проверяем, не сменился ли каденс-ключ. Если
                 // сменился — ПРЕДЫДУЩИЙ интервал закрылся, и его CLOSE-значение пишется
@@ -1510,6 +1575,13 @@ impl Reducer {
                 let Some(time_s) = self.bucket_time_s(*ts_exch_ms) else {
                     return;
                 };
+                // M-88 §3/§4 (задача 4): зеркало L2Snapshot-ветки — тот же бакет объявлен,
+                // стакан наблюдался. Дельта с `size == 0` НЕ снимает наблюдение: это снятие
+                // УРОВНЯ, а бакет по-прежнему жив (другая сторона может быть непустой; см.
+                // `form_empty_slice_is_still_an_observation` — полный срез пуст, но наблюдение
+                // БЫЛО).
+                self.heatmap_buckets_observed.insert(time_s);
+                self.cob_observed = true;
                 // M-68 rev6, задача 12: РОЛЛОВЕР каденс-интервала для L2Delta — симметрично
                 // L2Snapshot. Дельта может сменить bucket раньше снимка; close-значение
                 // предыдущего интервала обязано лечь до `apply_delta` (иначе для дельты
@@ -1825,6 +1897,7 @@ impl Reducer {
             event_seq,
             BookSeriesObservation {
                 seq: event_seq,
+                heatmap_time_s,
                 heatmap_cells,
                 cob_levels,
                 depth_time_s,
@@ -1954,7 +2027,24 @@ impl Reducer {
         // Heatmap: close-семантика per `(time_s, side, price_e8)`. Позднейшее наблюдение
         // (max seq) в диапазоне для каждого ключа побеждает (`merge_heatmap` поведение).
         let mut heatmap_map: BTreeMap<(i64, String, i64), HeatmapCell> = BTreeMap::new();
+        // M-88 §4: объявление наблюдённых бакетов карты — кадр ОБЯЗАН перечислить `time_s`,
+        // по которым он несёт полный срез; иначе `merge_heatmap` (Replace по колонкам)
+        // не сможет решить, какие колонки заменять. Собираем distinct-Set из
+        // `observations[].heatmap_time_s` (Set НЕ `Vec`, потому что `BTreeMap`-итерация по
+        // seq уже даёт строгий возрастающий порядок, а Set дедуплицирует случаи, когда
+        // в одном бакете было несколько L2-событий).
+        let mut heatmap_observed_time_s: Vec<i64> = Vec::new();
+        let mut seen_buckets: std::collections::BTreeSet<i64> = std::collections::BTreeSet::new();
+        let mut cob_observed = false;
         for obs in &observations {
+            if seen_buckets.insert(obs.heatmap_time_s) {
+                heatmap_observed_time_s.push(obs.heatmap_time_s);
+            }
+            // M-88 §4: `cob_observed = true` ⇔ в кадре есть ХОТЯ БЫ одно L2-наблюдение
+            // (полный срез стакана; пусть даже пустой — это всё ещё наблюдение). Все
+            // наблюдения в `book_series` порождены L2-событиями (`capture_book_observation`
+            // зовётся только из `L2Snapshot`/`L2Delta`-веток `apply`).
+            cob_observed = true;
             for cell in &obs.heatmap_cells {
                 heatmap_map.insert(
                     (cell.time_s, cell.side.clone(), cell.price_e8),
@@ -1978,6 +2068,8 @@ impl Reducer {
             depth_series,
             heatmap,
             cob,
+            heatmap_observed_time_s,
+            cob_observed,
         }
     }
 
@@ -2157,6 +2249,17 @@ impl Reducer {
         // M-38a (TD-045, task #11): `vp_session_max_time_s` (Vec, per-session — собран выше)
         // экспортируется в SeriesBundle для merge-логики `Snapshot::apply` (whole-session drop
         // по `vp_session_max_time_s[sid] < lo_time_s`).
+        // M-88 §3/§4 (задачи 3-4 — производство на пути ПЕРЕСЧЁТА): для offline-редьюсеров
+        // (`snapshot`/`replay`/`batch` через `finish_ref`) наблюдения в `book_series` НЕ
+        // хранятся (`capture_book_observations = false`), но САМИ L2-события мы уже обработали
+        // в `apply` и знаем, какие бакеты карты ими затронуты (`heatmap_buckets_observed`) и
+        // был ли в кадре хоть один L2 (`cob_observed`). `heatmap_buckets_observed` —
+        // `BTreeSet<time_s>` с порядком возрастания, `cob_observed` — bool. Это та же
+        // информация, что собирает `book_series_in` на живом пути, выраженная двумя
+        // дешевле-в-разы полями `Reducer` (без буфера `book_series`).
+        let heatmap_observed_time_s: Vec<i64> =
+            self.heatmap_buckets_observed.iter().copied().collect();
+        let cob_observed = self.cob_observed;
 
         SeriesBundle {
             ohlcv,
@@ -2178,15 +2281,8 @@ impl Reducer {
                 ("depth_series".to_string(), self.selector.depth_cadence_ms),
                 ("heatmap".to_string(), None),
             ],
-            // M-88 §3/§4 (задачи 3-4): на ПУТИ ПЕРЕСЧЁТА (`snapshot`/`replay`/`batch`
-            // через `finish_ref`) проекция наблюдений ещё не наполняется — поля
-            // добавляются в `Reducer` задачей 3. До того оба поля = дефолты (`Vec::new()` /
-            // `false`), что корректно: кадр с пустым `heatmap_observed_time_s` и
-            // `cob_observed = false` означает «наблюдений карты/стакана не было» —
-            // `merge_heatmap` оставит существующее как есть (`S4`), `merge_cob` вернёт
-            // existing (`NoChange`).
-            heatmap_observed_time_s: Vec::new(),
-            cob_observed: false,
+            heatmap_observed_time_s,
+            cob_observed,
         }
     }
 
