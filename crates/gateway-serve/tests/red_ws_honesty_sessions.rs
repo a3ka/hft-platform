@@ -68,8 +68,29 @@ fn config(dir: &std::path::Path) -> ServeConfig {
     }
 }
 
+/// M-87 §16.1 группа A: этот файл судит честность истории/серий (O-6/O-7), а не
+/// предохранитель — `checkpoint_dir: None` был удобством фикстуры. Живой путь без слепка
+/// теперь отказывает (fail-closed), поэтому здесь снимается слепок по ТОМУ ЖЕ селектору
+/// (`sel()`), с которым сервер поднимается.
+fn warm_checkpoint(dir: &std::path::Path) -> tempfile::TempDir {
+    let ckpt = tempfile::tempdir().expect("ckpt tempdir");
+    gateway::checkpoint::advance(dir, ckpt.path(), &sel(), EpochFilter::OwnCaptureOnly)
+        .expect("advance (warm checkpoint)");
+    ckpt
+}
+
 async fn ws_snapshot(dir: &std::path::Path) -> Snapshot {
-    let server = bind(config(dir)).await.expect("bind");
+    let ckpt = warm_checkpoint(dir);
+    ws_snapshot_with_checkpoint(dir, &ckpt).await
+}
+
+/// Слепок передаётся ГОТОВЫМ — нужен для `o6_pruned_journal_is_honestly_marked`, где
+/// слепок обязан быть снят ДО эмуляции prune (иначе `checkpoint::advance` откажет по
+/// правилу «fail-loud на усечённом префиксе без чекпоинта», §(1b).3 в `gateway::checkpoint`).
+async fn ws_snapshot_with_checkpoint(dir: &std::path::Path, ckpt: &tempfile::TempDir) -> Snapshot {
+    let mut cfg = config(dir);
+    cfg.checkpoint_dir = Some(ckpt.path().to_path_buf());
+    let server = bind(cfg).await.expect("bind");
     let addr = server.local_addr();
     tokio::spawn(async move {
         let _ = server.serve().await;
@@ -220,6 +241,12 @@ async fn o6_pruned_journal_is_honestly_marked() {
         j.flush().expect("flush");
     }
 
+    // M-87 §16.1 группа A: слепок снимается ЗДЕСЬ — ДО эмуляции prune ниже. Журнал в
+    // этот момент ещё ПОЛОН (60 событий, ни один сегмент не удалён), поэтому
+    // `checkpoint::advance` бутстрапится штатно. Снятый ПОСЛЕ удаления сегмента слепок
+    // отказал бы по правилу «fail-loud на усечённом префиксе без чекпоинта».
+    let ckpt = warm_checkpoint(dir.path());
+
     // Эмуляция prune: удаляем САМЫЙ РАННИЙ сегмент — префикс истории исчезает.
     let mut segs: Vec<_> = std::fs::read_dir(dir.path())
         .expect("read_dir")
@@ -239,7 +266,7 @@ async fn o6_pruned_journal_is_honestly_marked() {
     );
     std::fs::remove_file(&segs[0]).expect("remove earliest segment");
 
-    let snap = ws_snapshot(dir.path()).await;
+    let snap = ws_snapshot_with_checkpoint(dir.path(), &ckpt).await;
     assert!(
         snap.history_truncated,
         "O-6: у журнала удалён префикс, но history_truncated=false — \

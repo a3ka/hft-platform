@@ -166,10 +166,20 @@ fn config(dir: &Path) -> ServeConfig {
     }
 }
 
+/// M-87 §16.1 группа A: этот файл судит предел объёма исходящего сообщения (`PL-I-5`), а не
+/// предохранитель — `checkpoint_dir: None` был удобством фикстуры. Живой путь без слепка
+/// теперь отказывает (fail-closed), поэтому здесь снимается слепок по ТОМУ ЖЕ селектору
+/// (`sel()`), с которым сервер поднимается, ДО `bind()`.
 async fn serve_on(dir: &Path) -> String {
-    let server = bind(config(dir)).await.expect("bind");
+    let ckpt = tempfile::tempdir().expect("ckpt tempdir");
+    gateway::checkpoint::advance(dir, ckpt.path(), &sel(), EpochFilter::OwnCaptureOnly)
+        .expect("advance (warm checkpoint)");
+    let mut cfg = config(dir);
+    cfg.checkpoint_dir = Some(ckpt.path().to_path_buf());
+    let server = bind(cfg).await.expect("bind");
     let addr = server.local_addr().to_string();
     tokio::spawn(async move {
+        let _ckpt_guard = ckpt;
         let _ = server.serve().await;
     });
     addr

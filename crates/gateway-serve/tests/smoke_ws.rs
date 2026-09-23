@@ -70,9 +70,10 @@ fn sel() -> Selector {
 }
 
 fn config(dir: &std::path::Path, verify_secret: &[u8]) -> ServeConfig {
-    // M-38b (rev4, B3): `ServeConfig.checkpoint_dir` — новое поле. В smoke-WS нет
-    // чекпоинта (это CI-тест, без прод-обвязки), `None` = прямой rebuild =
-    // прежнее поведение M-28 до rev4.
+    // M-38b (rev4, B3): `ServeConfig.checkpoint_dir` — новое поле.
+    // M-87 §16.1 группа A: живой путь без слепка теперь отказывает (fail-closed) —
+    // `checkpoint_dir: None` больше не законная форма конфига смоука. Слепок снимается
+    // вызывающим тестом (`warm_checkpoint`) и подставляется сюда явно.
     ServeConfig {
         addr: "127.0.0.1:0".to_string(), // ephemeral — реальный порт из local_addr()
         journal_dir: dir.to_path_buf(),
@@ -83,15 +84,28 @@ fn config(dir: &std::path::Path, verify_secret: &[u8]) -> ServeConfig {
     }
 }
 
+/// M-87 §16.1 группа A: снять слепок по ТОМУ ЖЕ селектору (`sel()`), с которым сервер
+/// поднимается, ДО `bind()`.
+fn warm_checkpoint(dir: &std::path::Path) -> tempfile::TempDir {
+    let ckpt = tempfile::tempdir().expect("ckpt tempdir");
+    gateway::checkpoint::advance(dir, ckpt.path(), &sel(), EpochFilter::OwnCaptureOnly)
+        .expect("advance (warm checkpoint)");
+    ckpt
+}
+
 #[tokio::test]
 async fn valid_jwt_receives_snapshot() {
     let secret = b"smoke-secret";
     let token = sign(secret, FUTURE);
     let dir = journal_of();
+    let ckpt = warm_checkpoint(dir.path());
+    let mut cfg = config(dir.path(), secret);
+    cfg.checkpoint_dir = Some(ckpt.path().to_path_buf());
 
-    let server = bind(config(dir.path(), secret)).await.expect("bind");
+    let server = bind(cfg).await.expect("bind");
     let addr = server.local_addr();
     tokio::spawn(async move {
+        let _ckpt_guard = ckpt;
         let _ = server.serve().await;
     });
 
@@ -111,12 +125,14 @@ async fn valid_jwt_receives_snapshot() {
 #[tokio::test]
 async fn invalid_jwt_rejected() {
     let dir = journal_of();
+    let ckpt = warm_checkpoint(dir.path());
+    let mut cfg = config(dir.path(), b"server-secret");
+    cfg.checkpoint_dir = Some(ckpt.path().to_path_buf());
     // Сервер верифицирует ключом server-secret; клиент подписывает ЧУЖИМ → отказ.
-    let server = bind(config(dir.path(), b"server-secret"))
-        .await
-        .expect("bind");
+    let server = bind(cfg).await.expect("bind");
     let addr = server.local_addr();
     tokio::spawn(async move {
+        let _ckpt_guard = ckpt;
         let _ = server.serve().await;
     });
 

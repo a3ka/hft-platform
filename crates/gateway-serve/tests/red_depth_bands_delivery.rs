@@ -256,6 +256,19 @@ async fn db_i_7d_canonical_bands_reach_the_frame_on_the_wire() {
     ])))
     .expect("конфиг с каноническим составом");
 
+    // M-87 §16.1 группа A: этот файл судит доставку состава полос (`DB-I-7d`), а не
+    // предохранитель — `checkpoint_dir: None` был удобством фикстуры. Живой путь без слепка
+    // теперь отказывает (fail-closed), поэтому здесь снимается слепок по ТОМУ ЖЕ селектору
+    // (`cfg.selector`, из `serve_config_from_env`), с которым сервер поднимается, ДО `bind()`.
+    let ckpt = tempfile::tempdir().expect("ckpt tempdir");
+    gateway::checkpoint::advance(
+        dir.path(),
+        ckpt.path(),
+        &cfg.selector,
+        EpochFilter::OwnCaptureOnly,
+    )
+    .expect("advance (warm checkpoint)");
+
     // Прод-точка входа. Журнал и ключ подменяются на тестовые — это ЕДИНСТВЕННОЕ отличие от
     // прода, и оно названо: селектор, ради которого сценарий существует, приходит из env.
     let server = bind(gateway_serve::server::ServeConfig {
@@ -264,12 +277,13 @@ async fn db_i_7d_canonical_bands_reach_the_frame_on_the_wire() {
         filter: EpochFilter::OwnCaptureOnly,
         selector: cfg.selector.clone(),
         decoding_key: DecodingKey::from_secret(SECRET),
-        checkpoint_dir: None,
+        checkpoint_dir: Some(ckpt.path().to_path_buf()),
     })
     .await
     .expect("bind прод-точки входа");
     let addr = server.local_addr();
     tokio::spawn(async move {
+        let _ckpt_guard = ckpt;
         let _ = server.serve().await;
     });
 

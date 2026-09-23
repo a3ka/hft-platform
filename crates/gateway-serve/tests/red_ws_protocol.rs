@@ -120,6 +120,23 @@ fn config(
     }
 }
 
+/// M-87 §16.1 группа A: тесты этого файла судят протокол/окно/авторизацию, а не
+/// предохранитель — `checkpoint_dir: None` был удобством фикстуры. Живой путь без
+/// слепка теперь отказывает (fail-closed), поэтому подписывающий тест обязан снять
+/// слепок ДО `bind()` по ТОМУ ЖЕ селектору (тот же `window_ms`), с которым откроет
+/// соединение — иначе слепок не подойдёт и тест покраснеет не по своей причине.
+fn warm_checkpoint(dir: &std::path::Path, window_ms: Option<i64>) -> tempfile::TempDir {
+    let ckpt = tempfile::tempdir().expect("ckpt tempdir");
+    gateway::checkpoint::advance(
+        dir,
+        ckpt.path(),
+        &sel(window_ms),
+        EpochFilter::OwnCaptureOnly,
+    )
+    .expect("advance (warm checkpoint)");
+    ckpt
+}
+
 /// Подключиться и вернуть поток; сервер живёт в фоне.
 async fn connect(
     cfg: ServeConfig,
@@ -186,8 +203,9 @@ async fn o4_auth_matrix_fail_closed() {
     {
         let dir = tempfile::tempdir().expect("tempdir");
         journal_seed(dir.path());
+        let ckpt = warm_checkpoint(dir.path(), None);
         let ok = got_snapshot(
-            config(dir.path(), None, None),
+            config(dir.path(), None, Some(ckpt.path())),
             Some(&sign_with(SECRET, FUTURE)),
         )
         .await;
@@ -197,22 +215,25 @@ async fn o4_auth_matrix_fail_closed() {
     {
         let dir = tempfile::tempdir().expect("tempdir");
         journal_seed(dir.path());
-        let got = got_snapshot(config(dir.path(), None, None), None).await;
+        let ckpt = warm_checkpoint(dir.path(), None);
+        let got = got_snapshot(config(dir.path(), None, Some(ckpt.path())), None).await;
         assert!(!got, "O-4: без query-строки Snapshot выдаваться НЕ должен");
     }
     // (в) `?token=` пустой → "missing token"
     {
         let dir = tempfile::tempdir().expect("tempdir");
         journal_seed(dir.path());
-        let got = got_snapshot(config(dir.path(), None, None), Some("")).await;
+        let ckpt = warm_checkpoint(dir.path(), None);
+        let got = got_snapshot(config(dir.path(), None, Some(ckpt.path())), Some("")).await;
         assert!(!got, "O-4: пустой token Snapshot выдаваться НЕ должен");
     }
     // (г) истёкший exp → "expired token"
     {
         let dir = tempfile::tempdir().expect("tempdir");
         journal_seed(dir.path());
+        let ckpt = warm_checkpoint(dir.path(), None);
         let got = got_snapshot(
-            config(dir.path(), None, None),
+            config(dir.path(), None, Some(ckpt.path())),
             Some(&sign_with(SECRET, PAST)),
         )
         .await;
@@ -222,8 +243,9 @@ async fn o4_auth_matrix_fail_closed() {
     {
         let dir = tempfile::tempdir().expect("tempdir");
         journal_seed(dir.path());
+        let ckpt = warm_checkpoint(dir.path(), None);
         let got = got_snapshot(
-            config(dir.path(), None, None),
+            config(dir.path(), None, Some(ckpt.path())),
             Some(&sign_with(b"attacker", FUTURE)),
         )
         .await;
@@ -233,7 +255,12 @@ async fn o4_auth_matrix_fail_closed() {
     {
         let dir = tempfile::tempdir().expect("tempdir");
         journal_seed(dir.path());
-        let got = got_snapshot(config(dir.path(), None, None), Some("не-жвт-вовсе")).await;
+        let ckpt = warm_checkpoint(dir.path(), None);
+        let got = got_snapshot(
+            config(dir.path(), None, Some(ckpt.path())),
+            Some("не-жвт-вовсе"),
+        )
+        .await;
         assert!(!got, "O-4: malformed token Snapshot выдаваться НЕ должен");
     }
 }
@@ -249,9 +276,10 @@ async fn o4_auth_matrix_fail_closed() {
 async fn o3_frames_converge_to_latest() {
     let dir = tempfile::tempdir().expect("tempdir");
     journal_seed(dir.path());
+    let ckpt = warm_checkpoint(dir.path(), None);
 
     let mut ws = connect(
-        config(dir.path(), None, None),
+        config(dir.path(), None, Some(ckpt.path())),
         Some(&sign_with(SECRET, FUTURE)),
     )
     .await
@@ -310,8 +338,9 @@ async fn o5_bounded_window_shrinks_ws_payload() {
     append_more(dir.path(), 30, BASE_MS + 10_000); // ~30 s истории
 
     let unbounded = {
+        let ckpt = warm_checkpoint(dir.path(), None);
         let mut ws = connect(
-            config(dir.path(), None, None),
+            config(dir.path(), None, Some(ckpt.path())),
             Some(&sign_with(SECRET, FUTURE)),
         )
         .await
@@ -324,8 +353,9 @@ async fn o5_bounded_window_shrinks_ws_payload() {
     };
 
     let bounded = {
+        let ckpt = warm_checkpoint(dir.path(), Some(5_000));
         let mut ws = connect(
-            config(dir.path(), Some(5_000), None),
+            config(dir.path(), Some(5_000), Some(ckpt.path())),
             Some(&sign_with(SECRET, FUTURE)),
         )
         .await
