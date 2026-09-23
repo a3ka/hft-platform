@@ -155,8 +155,8 @@ exit=0
   роняет сценарий по фикстуре. Докажи это RED/verify, закоммить и запушь GREEN-коммит в
   feat/M-87-serving-circuit-breaker.
   ```
-- Push-статус: pending critic verdict commit to `origin/feat/M-87-serving-circuit-breaker`
-- Кэш: pending cleanup after critic push
+- Push-статус: ✅ C-254 verdict committed and pushed to `origin/feat/M-87-serving-circuit-breaker` at `308560d`
+- ✅ кэш убран — `/tmp/hft-critic-m87-r9/target` очищен после push (`cargo clean`; прямая `rm -rf` была отклонена средой безопасности)
 
 ## §E — Риски / открытые вопросы
 - До задачи 12 сценарий, вызывающий driver через alias, не проверяется r7; это известный,
