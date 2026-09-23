@@ -951,7 +951,12 @@ pub mod server {
                 // `if let` ниже — иначе guard дропается на границе scope ДО `spawn_blocking`,
                 // и оракул `c4_slot_lifecycle_hold_refuse_release` видит `in_flight()==0`
                 // пока работа стоит на рандеву (воспроизведено добавлением принтов).
-                let mut slot_guard_for_session: Option<super::admission::SlotGuard> = None;
+                // Сам binding с переменной нужен для удержания guard в scope; `acquire_or_release`
+                // и `take` явные присваивания — clippy видит их как unused, поэтому подавляем.
+                #[allow(unused_assignments, unused_variables)]
+                let mut slot_guard_for_session: Option<
+                    super::admission::SlotGuard,
+                > = None;
                 if let Some(policy) = inner.policy.clone() {
                     use super::admission::{admit, readiness, ServingOutcome};
                     metrics::inc_attempts_pub(); // Попытка зарегистрирована ДО admit/readiness,
@@ -976,6 +981,8 @@ pub mod server {
                             return Err(format!("not_ready: {msg}"));
                         }
                     }
+                    // Слот: берётся ДО readiness (порядок §4.0bis — «слот ↔ readiness»).
+                    // Если слотов нет — Overloaded.
                     // Слот: берётся ДО readiness (порядок §4.0bis — «слот ↔ readiness»).
                     // Если слотов нет — Overloaded.
                     slot_guard_for_session = if let Some(slots) = inner.slots.as_ref() {
@@ -1027,7 +1034,9 @@ pub mod server {
                                 _ => "not_ready",
                             };
                             let msg = format!("readiness: {:?}", ready_outcome);
-                            slot_guard_for_session = None; // освобождаем слот ДО return
+                            // Освобождаем слот ДО return. `drop` явный — `let _ =` со
+                            // сторожевым `unused_assignments` на уровне функции.
+                            drop(slot_guard_for_session.take());
                             send_v1_error(sink, Some(id), code, &msg).await;
                             return Err(format!("{}: {msg}", code));
                         }
