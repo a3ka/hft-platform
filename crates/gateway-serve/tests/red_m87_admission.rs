@@ -22,6 +22,29 @@ use gateway_serve::admission::{admit, readiness, AdmissionPolicy, LiveProfile, S
 use gateway_serve::metrics::{serving_counters, silence_alarm, ServingCounters};
 use journal::{EpochFilter, Journal, WriterConfig};
 
+/// Политика для сценариев ЭТОГО файла: пороги заведомо щедрые.
+///
+/// Круг `R-196` B2 сделал порог свежести параметром политики, и `readiness` теперь его
+/// принимает. Сценарии ниже судят ПРИГОДНОСТЬ СЛЕПКА (нет/битый/чужая версия), а не
+/// свежесть: если бы они молча унаследовали строгий порог, их исход определялся бы
+/// посторонней величиной, и файл начал бы мерить окружение вместо своего предмета
+/// (`testing.md`, целостность гейта п.2). Предмет свежести живёт отдельно —
+/// `red_m87_staleness_budget.rs`.
+fn pol() -> AdmissionPolicy {
+    AdmissionPolicy {
+        allowed_symbols: vec!["BTCUSDT".to_string()],
+        canonical_bands: vec![0.001],
+        allowed_profiles: vec![LiveProfile {
+            timeframe_ms: 1_000,
+            window_ms: 60_000,
+            depth_cadence_ms: None,
+        }],
+        max_concurrent_serves: 1,
+        max_tail_events: 1_000_000,
+        expected_warmup_events: 1,
+    }
+}
+
 const T0: i64 = 1_752_000_000_000;
 
 /// Канонические семь полос (`П-029`, 2026-09-10): сервер ВСЕГДА считает этот набор,
@@ -191,6 +214,7 @@ fn form_missing_snapshot_is_not_ready_and_starts_no_warmup() {
         ckpt.path(),
         dir.path(),
         &sel_with("BTCUSDT", CANONICAL.to_vec()),
+        &pol(),
     );
     assert_eq!(
         outcome,
@@ -416,7 +440,12 @@ fn u2_readiness_missing_checkpoint_over_trap() {
     let ckpt = tempfile::tempdir().expect("ckpt");
 
     let before = std::fs::read_dir(ckpt.path()).expect("read_dir").count();
-    let outcome = readiness(ckpt.path(), dir.path(), &sel_with("BTCUSDT", vec![0.001]));
+    let outcome = readiness(
+        ckpt.path(),
+        dir.path(),
+        &sel_with("BTCUSDT", vec![0.001]),
+        &pol(),
+    );
     let after = std::fs::read_dir(ckpt.path()).expect("read_dir").count();
 
     assert_eq!(
@@ -446,7 +475,7 @@ fn u2_readiness_corrupt_checkpoint_over_trap() {
     )
     .expect("write corrupt");
     assert_eq!(
-        readiness(ckpt.path(), dir.path(), &s),
+        readiness(ckpt.path(), dir.path(), &s, &pol()),
         ServingOutcome::NotReady,
         "повреждённый слепок обязан давать названный исход, а не уводить в пересчёт"
     );
@@ -476,7 +505,7 @@ fn u2_readiness_incompatible_checkpoint() {
     poison_first_segment(dir.path());
 
     assert_eq!(
-        readiness(ckpt.path(), dir.path(), &s),
+        readiness(ckpt.path(), dir.path(), &s, &pol()),
         ServingOutcome::NotReady,
         "несовместимый по версии слепок обязан давать названный исход"
     );
@@ -515,7 +544,7 @@ fn u2_readiness_stale_beyond_budget() {
         j.flush().expect("flush");
     }
     assert_eq!(
-        readiness(ckpt.path(), dir.path(), &s),
+        readiness(ckpt.path(), dir.path(), &s, &pol()),
         ServingOutcome::NotReady,
         "слепок, отставший сверх бюджета докормки, обязан давать названный исход: иначе \
          'валидный слепок' становится обходным путём к тому же неограниченному пересчёту"
@@ -532,7 +561,7 @@ fn u2_readiness_fresh_checkpoint_is_ready() {
     gateway::checkpoint::advance(dir.path(), ckpt.path(), &s, EpochFilter::OwnCaptureOnly)
         .expect("advance");
     assert_eq!(
-        readiness(ckpt.path(), dir.path(), &s),
+        readiness(ckpt.path(), dir.path(), &s, &pol()),
         ServingOutcome::Ready,
         "свежий пригодный слепок не признан готовым — 'отказывать всегда' решением не является"
     );
