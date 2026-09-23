@@ -37,7 +37,9 @@
 use contracts::{to_fixed, DataSource, EventKind, Level, MdPayload, Venue};
 use gateway::Selector;
 use gateway_serve::admission::{readiness, AdmissionPolicy, LiveProfile, ServingOutcome};
+use gateway_serve::server::{bind_with_policy, ServeConfig};
 use journal::{EpochFilter, Journal, WriterConfig};
+use jsonwebtoken::DecodingKey;
 
 const T0: i64 = 1_784_116_800_000;
 
@@ -199,4 +201,80 @@ fn t5_checkpoint_lagging_beyond_threshold_is_not_ready() {
         "слепок, отставший СВЕРХ порога, признан годным — 'валидный слепок' становится \
          обходным путём к неограниченной докормке хвоста на живом пути"
     );
+}
+
+// ═══════ t6/t7 — ПРОВЕРКА СТОЯТЬ ОБЯЗАНА НА СТАРТЕ, а не в голове разработчика ═══════
+//
+// `C-246` R1: `validate()` сама по себе ничего не гарантирует — её может никто не звать.
+// Инвариант формулируется НЕ как «функция существует», а как «сервер с несогласованной
+// политикой НЕ ПОДНИМАЕТСЯ». Ровно это и пинуется: через `bind_with_policy`, той формой
+// вызова, какой сервер поднимает прод.
+
+fn serve_config(dir: &std::path::Path) -> ServeConfig {
+    ServeConfig {
+        addr: "127.0.0.1:0".to_string(),
+        journal_dir: dir.to_path_buf(),
+        filter: EpochFilter::OwnCaptureOnly,
+        selector: sel(),
+        decoding_key: DecodingKey::from_secret(b"m87-staleness-secret"),
+        checkpoint_dir: None,
+    }
+}
+
+#[tokio::test]
+async fn t6_bind_refuses_to_start_on_inconsistent_policy() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    append_events(dir.path(), 4, T0);
+
+    // Сегодняшняя прод-ситуация в миниатюре: порог 250 при объёме цикла ≈127 800.
+    // `expect_err` здесь НЕ ГОДИТСЯ: он требует `Debug` на типе УСПЕХА, а `Server` его не
+    // несёт и нести не обязан. Разбор через `match` — не стиль, а единственная форма, не
+    // тянущая лишнее требование на прод-тип ради текста ошибки в тесте.
+    let err = match bind_with_policy(
+        serve_config(dir.path()),
+        policy_with(250, PROD_WARMUP_VOLUME),
+    )
+    .await
+    {
+        Ok(_) => panic!(
+            "R-196 B2 / C-246 R1: сервер ПОДНЯЛСЯ с политикой, при которой выдача отказывает \
+             100 % времени между прогревами. Проверка согласованности обязана стоять В ПУТИ \
+             СТАРТА: `validate()`, которую никто не зовёт, не защищает ничего"
+        ),
+        Err(e) => e,
+    };
+
+    assert_eq!(
+        err.kind(),
+        std::io::ErrorKind::InvalidInput,
+        "отказ старта обязан быть ИМЕННО InvalidInput (§4.1): это конфигурация, а не сбой \
+         среды. По роду ошибки оператор решает, чинить конфиг или искать внешнюю причину. \
+         Получено: {:?} — «{err}»",
+        err.kind()
+    );
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("250") && msg.contains(&PROD_WARMUP_VOLUME.to_string()),
+        "отказ старта обязан НАЗВАТЬ оба числа — порог и объём цикла. Без них инженер ищет \
+         причину в коде, а она в конфигурации. Сообщение: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn t7_bind_starts_on_consistent_policy() {
+    // АНТИ-ПЛАЦЕБО к t6: «не подниматься никогда» решением не является.
+    let dir = tempfile::tempdir().expect("tempdir");
+    append_events(dir.path(), 4, T0);
+    let ok = bind_with_policy(
+        serve_config(dir.path()),
+        policy_with(PROD_WARMUP_VOLUME * 2, PROD_WARMUP_VOLUME),
+    )
+    .await;
+    if let Err(e) = ok {
+        panic!(
+            "сервер с СОГЛАСОВАННОЙ политикой не поднялся — проверка старта превратилась в \
+             безусловный отказ: {e}"
+        );
+    }
 }

@@ -127,6 +127,11 @@ fn policy() -> AdmissionPolicy {
             depth_cadence_ms: None,
         }],
         max_concurrent_serves: 1,
+        // Круг `C-245`/`C-246`: шестипольная форма §4.1. Пороги ЗАВЕДОМО ЩЕДРЫЕ —
+        // предмет этого файла не свежесть слепка, и строгий порог определял бы его
+        // исход посторонней величиной (`testing.md`, целостность гейта п.2).
+        max_tail_events: 1_000_000,
+        expected_warmup_events: 1,
     }
 }
 

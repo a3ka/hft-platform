@@ -112,6 +112,10 @@ fn policy() -> AdmissionPolicy {
             depth_cadence_ms: None,
         }],
         max_concurrent_serves: 4,
+        // Шестипольная форма §4.1 (`C-246` R1). Пороги щедрые: предмет файла — допуск,
+        // а не свежесть слепка.
+        max_tail_events: 1_000_000,
+        expected_warmup_events: 1,
     }
 }
 
