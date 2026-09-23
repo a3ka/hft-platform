@@ -2,7 +2,7 @@
 //!
 //! COMPILE-RED по построению: полей `SeriesBundle.heatmap_observed_time_s` /
 //! `SeriesBundle.cob_observed` и типа `gateway::ApplyOutcome` в коде ЕЩЁ НЕТ. Файл перестанет
-//! падать компиляцией после задач 1 и 7 спеки `milestones/M-88-liquidity-removal-contract.md`.
+//! падать компиляцией после задач 1 и 7 спеки `docs/archive/M-88-liquidity-removal-contract.md`.
 //!
 //! Зачем ОТДЕЛЬНЫЙ файл: предметный набор `red_m88_update_contract.rs` падает АССЕРТАМИ на
 //! сегодняшнем коде — он доказывает существование дефекта и не смешивается с формой. Форма
