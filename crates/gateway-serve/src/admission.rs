@@ -421,12 +421,12 @@ pub struct SlotGuard {
 
 impl Drop for SlotGuard {
     fn drop(&mut self) {
-        let new_local = self.local.fetch_sub(1, Ordering::SeqCst);
+        let prev_local = self.local.fetch_sub(1, Ordering::SeqCst);
         let prev_global = crate::metrics::SLOTS_IN_FLIGHT_GLOBAL.load(Ordering::SeqCst);
         let next_global = prev_global.saturating_sub(1);
         crate::metrics::SLOTS_IN_FLIGHT_GLOBAL.store(next_global, Ordering::SeqCst);
-        crate::metrics::set_local_slots_for_testing(new_local as u64);
-        let _ = (new_local, prev_global, next_global);
+        crate::metrics::set_local_slots_for_testing(prev_local as u64);
+        let _ = (prev_local, prev_global, next_global);
     }
 }
 
