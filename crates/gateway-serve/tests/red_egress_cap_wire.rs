@@ -344,17 +344,89 @@ async fn pl_i_5_w_c3_honest_error_is_delivered_over_the_socket() {
 #[tokio::test]
 async fn pl_i_5_w1_v1_snapshot_over_cap_is_not_delivered() {
     let dir = journal_of_trades(DENSE_TRADES);
+    // `serve_on` сам снимает прогретый слепок и держит его живым (§16.1 группа A).
     let addr = serve_on(dir.path()).await;
-    // Отсутствие v1-снапшота — НЕ зелёный исход: `subscribed_snapshot` объявит несостоявшийся
-    // setup. Зелёным этот оракул станет только когда снапшот ПРИДЁТ и уложится в отсечку,
-    // либо когда сервер откажет ЯВНО (ветка ниже недостижима — helper паникует раньше).
-    let (_ws, n, _v) = subscribed_snapshot(&addr, "Binance").await;
-    assert!(
-        n <= PROPOSED_CAP,
-        "PL-I-5 W1 НАРУШЕН: клиенту ПРИШЁЛ v1-снапшот {n} Б при отсечке {PROPOSED_CAP}. Это \
-         байты, снятые С СОКЕТА, а не собранные тестом. Селектор прод-дефолтный, heatmap пуст \
-         — объём принесли сделки; злоупотребления шириной полосы не требуется."
-    );
+
+    // `PL-I-5` удовлетворяется ДВУМЯ РАЗНЫМИ исходами, и оба законны:
+    //   (а) снимок ПРИШЁЛ и уложился в отсечку;
+    //   (б) сервер ОТКАЗАЛ ЯВНО и НАЗВАЛ причину — данных сверх предела не выдано.
+    // Прежняя редакция кодировала только (а), а про (б) её же комментарий говорил
+    // «ветка недостижима — helper паникует раньше». Круг `R-196` сделал (б) ШТАТНЫМ:
+    // с прогретым слепком `resume` восстанавливает ПОЛНОЕ состояние синхронно, первый
+    // снимок становится полным (2.18 МБ) и законно упирается в предел. Оракул, который
+    // на этом падает, судит не `PL-I-5`, а отменённый §16.1 путь холодного пересчёта.
+    let outcome = first_v1_message(&addr, "Binance").await;
+    match outcome {
+        V1First::Snapshot { bytes } => assert!(
+            bytes <= PROPOSED_CAP,
+            "PL-I-5 W1 НАРУШЕН: клиенту ПРИШЁЛ v1-снапшот {bytes} Б при отсечке {PROPOSED_CAP}"
+        ),
+        V1First::Error { code, message } => {
+            // Отказ обязан быть НАЗВАННЫМ. `invalid_selector` здесь — ложное имя: селектор
+            // валиден, а не влезает ОТВЕТ. Разница не косметическая: по первому имени клиент
+            // чинит параметры запроса, по второму — сужает окно. Пять названных исходов
+            // (§4 спеки) существуют ровно затем, чтобы эти случаи не сливались.
+            assert!(
+                message.contains("PL-I-5"),
+                "отказ не называет предел: code={code}, message={message}"
+            );
+            assert_ne!(
+                code, "invalid_selector",
+                "R-196: отказ ПО ПРЕДЕЛУ ОБЪЁМА выдан под именем «invalid_selector» \
+                 (message={message}). Селектор валиден — не влезает ОТВЕТ. Клиент по этому \
+                 имени будет чинить параметры запроса вместо сужения окна, а оператор не \
+                 отличит перегруз от ошибки клиента. Исход обязан быть назван своим именем \
+                 из §4"
+            );
+        }
+        V1First::Nothing { last } => setup_failed(&format!(
+            "ни снимка, ни названного отказа за 8 попыток; последнее сообщение: {last:?}"
+        )),
+    }
+}
+
+/// Первое v1-сообщение подписки, каким бы оно ни было. В отличие от `subscribed_snapshot`,
+/// НЕ считает отказ несостоявшимся setup'ом: отказ — законный исход `PL-I-5`, и судить его
+/// обязан сам оракул, а не хелпер своей паникой.
+enum V1First {
+    Snapshot { bytes: usize },
+    Error { code: String, message: String },
+    Nothing { last: Option<Value> },
+}
+
+async fn first_v1_message(addr: &str, venue: &str) -> V1First {
+    let mut last: Option<Value> = None;
+    for attempt in 1..=8u64 {
+        let mut ws = connect(addr).await;
+        send(&mut ws, subscribe(SHORT_SUB, venue)).await;
+        match recv(&mut ws).await {
+            Some((n, v)) if type_of(&v) == Some("snapshot") => {
+                return V1First::Snapshot { bytes: n }
+            }
+            Some((_, v)) if type_of(&v) == Some("error") => {
+                let code = v
+                    .get("code")
+                    .and_then(|c| c.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let message = v
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                return V1First::Error { code, message };
+            }
+            Some((_, v)) => {
+                last = Some(v);
+                let _ = ws.close(None).await;
+            }
+            None => {
+                let _ = ws.close(None).await;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10 * attempt)).await;
+    }
+    V1First::Nothing { last }
 }
 
 /// **W2 — v1-КАДР: КОНТРОЛЬ по тому же основанию.**
