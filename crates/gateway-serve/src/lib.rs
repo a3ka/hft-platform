@@ -426,6 +426,19 @@ pub mod server {
                 .expect("listener bound; local_addr() is infallible post-bind")
         }
 
+        /// Круг `R-196` (задача 13, §14.1ter): АДДИТИВНЫЙ доступ к слотам ЭТОГО экземпляра
+        /// сервера. `None` ⇒ сервер поднят без политики (`bind` без `bind_with_policy`).
+        ///
+        /// Оракул `C4` (`red_m87_entrypoint::c4_slot_lifecycle_hold_refuse_release`)
+        /// ОБЯЗАН наблюдать слоты по ЭКЗЕМПЛЯРУ, а не процессно: процессное состояние под
+        /// параллельным прогоном меряет соседей по тест-бинарю, а не предмет (`§14.1ter`,
+        /// побочно снимает противоречие «C4 требует --test-threads=1 ↔ CI гоняет
+        /// параллельно»). Прежняя конструкция оракула опиралась на процессный счётчик и
+        /// требовала `--test-threads=1`; теперь это решено конструктивно.
+        pub fn slots_handle(&self) -> Option<std::sync::Arc<ServingSlots>> {
+            self.slots.as_ref().map(std::sync::Arc::clone)
+        }
+
         /// Accept-loop: на соединение — verify JWT из query; успех → snapshot + push + replay; провал →
         /// закрыть с отказом. Read-only (GS-I-3): приём фрейма = только replay-контролы, не запись.
         /// Legacy-mode dispatcher: разбирает входящий Text/Binary КАК v1-сообщение и применяет
@@ -948,6 +961,11 @@ pub mod server {
                 // (смотрит на слепок, НЕ открывает сегменты) → работа под слотом.
                 // Если есть `inner.policy` — берём СЛОТ, проверяем готовность, иначе
                 // отдаём НАЗВАННЫЙ исход.
+                // ВАЖНО (C4, круг `R-196`): `slot_guard_for_session` объявлен ВНЕ блока
+                // `if let` ниже — иначе guard дропается на границе scope ДО `spawn_blocking`,
+                // и оракул `c4_slot_lifecycle_hold_refuse_release` видит `in_flight()==0`
+                // пока работа стоит на рандеву (воспроизведено добавлением принтов).
+                let mut slot_guard_for_session: Option<super::admission::SlotGuard> = None;
                 if let Some(policy) = inner.policy.clone() {
                     use super::admission::{admit, readiness, ServingOutcome};
                     metrics::inc_attempts_pub(); // Попытка зарегистрирована ДО admit/readiness,
@@ -974,7 +992,7 @@ pub mod server {
                     }
                     // Слот: берётся ДО readiness (порядок §4.0bis — «слот ↔ readiness»).
                     // Если слотов нет — Overloaded.
-                    let slot_guard = if let Some(slots) = inner.slots.as_ref() {
+                    slot_guard_for_session = if let Some(slots) = inner.slots.as_ref() {
                         match slots.try_acquire() {
                             Some(g) => {
                                 metrics::set_slots_in_flight_pub(slots.in_flight() as u64);
@@ -1023,22 +1041,15 @@ pub mod server {
                                 _ => "not_ready",
                             };
                             let msg = format!("readiness: {:?}", ready_outcome);
-                            drop(slot_guard);
+                            slot_guard_for_session = None; // освобождаем слот ДО return
                             send_v1_error(sink, Some(id), code, &msg).await;
                             return Err(format!("{}: {msg}", code));
                         }
                     }
-                    // Slot guard живёт до конца `handle_v1_message` — слот
-                    // освобождается при возврате. Это покрывает и SWITCH, и ADD
-                    // ветки ниже (а для v1-сессии — до завершения pump-цикла,
-                    // отдельный путь; здесь же тест судит первую фазу).
-                    // Slot guard живёт до конца `handle_v1_message` — слот
-                    // освобождается при возврате. Это покрывает и SWITCH, и ADD
-                    // ветки ниже (а для v1-сессии — до завершения pump-цикла,
-                    // отдельный путь; здесь же тест судит первую фазу).
-                    // Slot guard живёт до конца `handle_v1_message` — слот
-                    // освобождается при возврате (см. комментарий выше).
-                    let _slot_guard_for_session = slot_guard;
+                    // Слот удерживается через `slot_guard_for_session` (внешний scope,
+                    // объявлен выше `if let`). Без этого guard дропается на границе
+                    // scope и оракул `C4` видит `in_flight()==0` пока работа стоит
+                    // на рандеву.
                 } else {
                     // Без политики (`bind`-путь, не `bind_with_policy`).
                     // Тем не менее — readiness СТОИТ, ЕСЛИ задан чекпоинт.
@@ -1212,6 +1223,20 @@ pub mod server {
                     return Err(format!("cap exceeded for id {id}"));
                 }
                 let (snap, new_sub) = match tokio::task::spawn_blocking(move || -> io::Result<_> {
+                    // Круг `R-196` (задача 13, §14.1ter): ТОЧКА РАНДЕВУ на ADD-пути.
+                    // Первая строка замыкания `spawn_blocking` — ВАЖНО: канал
+                    // `m87-add:<id>` разбужен pump'ом, который пишет в канал `<id>`,
+                    // быть НЕ МОЖЕТ. Префикс ОБЯЗАТЕЛЕН (`C-245` R2): без него оракул
+                    // `C4` не отличит ADD-работу от периодического pump'а M-65 и
+                    // позеленеет, не получив требуемой точки вовсе. Блок компилируется
+                    // ТОЛЬКО в тестовой сборке — на прод-пути не нагружает ничего.
+                    #[cfg(any(test, feature = "testing"))]
+                    {
+                        let id_for_rendezvous = id_for_closure.clone();
+                        crate::test_sync::rendezvous::pump_signal_and_wait(&format!(
+                            "m87-add:{id_for_rendezvous}"
+                        ));
+                    }
                     let (live, _stats) = gateway::LiveReducer::resume(
                         &path_clone,
                         filter_clone,
