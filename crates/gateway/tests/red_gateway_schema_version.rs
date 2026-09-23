@@ -70,7 +70,7 @@ use journal::{EpochFilter, Journal, WriterConfig};
 /// последнего события». Форма `DepthRow` не меняется, меняется СМЫСЛ чисел — тот же класс,
 /// что M-36 (VWAP 5→6). Bump здесь ЕДИНСТВЕННЫЙ рычаг, отвергающий чекпоинт со старым
 /// смыслом (`read_and_validate` шаг 3, `crates/gateway/src/lib.rs:2901-2904`).
-const EXPECTED_SCHEMA_VERSION: u32 = 10;
+const EXPECTED_SCHEMA_VERSION: u32 = 11;
 
 fn cfg() -> WriterConfig {
     WriterConfig {
