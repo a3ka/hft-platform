@@ -1244,9 +1244,9 @@ pub mod server {
                     // валиден — не влезает ОТВЕТ, и клиент по прежнему имени чинил бы
                     // параметры запроса вместо сужения окна (R-196, §14.1octies).
                     if live.is_cap_terminal() {
-                        return Err(io::Error::other(format!(
-                            "PL-I-5 cap exceeded: response would exceed limit"
-                        )));
+                        return Err(io::Error::other(
+                            "PL-I-5 cap exceeded: response would exceed limit",
+                        ));
                     }
                     let snap = live.snapshot_checked()?;
                     Ok((
@@ -1309,8 +1309,6 @@ pub mod server {
                     return Err("client disconnected during snapshot send".to_string());
                 }
                 metrics::inc_successes_pub();
-                // M-87 (предохранитель выдачи): проброска прочитанных байт
-                // в счётчик выдачи (C1/C2 оракул).
                 if let Ok(n) = gateway::payload_bytes_for_dir_pub(&inner.cfg.journal_dir) {
                     metrics::add_journal_payload_bytes_pub(n);
                 }
