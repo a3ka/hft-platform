@@ -23,23 +23,88 @@ use m87_registry::{Request, EXPECTED_WARMUP_EVENTS, MAX_TAIL_EVENTS, REGISTRY};
 /// или собрал бы не то. Прецедент — `crates/venue-hyperliquid/tests/red_provenance_md_only.rs`.
 const SUBJECT_SRC: &str = include_str!("red_m87_entrypoint.rs");
 
-/// Вынуть имена функций, идущих за тестовым атрибутом.
-fn scenarios_in_subject() -> Vec<String> {
+/// Распознан ли атрибут как ТЕСТОВЫЙ.
+///
+/// `C-251`: прежний парсер знал ровно две формы — `#[test]` и `#[tokio::test…]` — и всё
+/// остальное молча считал НЕ тестом. Условный атрибут `#[cfg_attr(test, tokio::test)]`
+/// законен, объявляет тест и проходил мимо биекции БЕЗ следа: сценарий под ним не попадал
+/// ни в найденные, ни в требуемые, и реестр «покрывал» файл, не покрывая его.
+///
+/// Лечение — не добавить третью форму в список (список снова окажется неполным), а
+/// РАЗДЕЛИТЬ три исхода: распознан, НЕ похож на тест, похож на тест но не распознан.
+/// Третий исход — отказ, а не молчание (`testing.md`, целостность гейта: гейт обязан
+/// наблюдать ОТСУТСТВИЕ, а не только сбой).
+#[derive(PartialEq, Eq, Debug)]
+enum Attr {
+    /// Распознанная тестовая форма.
+    Test,
+    /// Атрибут, упоминающий `test`, но не распознанный — повод ОТКАЗАТЬ, а не пропустить.
+    SuspiciousTest,
+    /// К тестам отношения не имеет.
+    Other,
+}
+
+fn classify_attr(line: &str) -> Attr {
+    let t = line.trim_start();
+    let Some(inner) = t.strip_prefix("#[") else {
+        return Attr::Other;
+    };
+    // ГОЛОВА атрибута — имя до скобки: именно она объявляет, ЧЕМ является элемент ниже.
+    // Разбор по голове, а не по вхождению подстроки: `#[cfg(feature = "testing")]` содержит
+    // «test», но НИЧЕГО не объявляет — это предикат сборки. Прежняя редакция этого стража
+    // ловила его как подозрительный и краснела на исправном файле (поймано прогоном здесь же).
+    let head: String = inner
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == ':')
+        .collect();
+    let body = inner;
+
+    // Распознанные формы объявления теста.
+    if head == "test" || head.ends_with("::test") {
+        return Attr::Test;
+    }
+    // `cfg`/`cfg_attr`: первый ничего не объявляет; второй МОЖЕТ объявить тест условно —
+    // и именно эту форму C-251 показал как проезжающую мимо.
+    if head == "cfg" {
+        return Attr::Other;
+    }
+    if head == "cfg_attr" && body.contains("test") {
+        return Attr::SuspiciousTest;
+    }
+    // Чужие тестовые обёртки: `rstest`, `test_case`, `tokio_test` и прочее, чего мы не знаем.
+    if head.ends_with("test") || head.starts_with("test") {
+        return Attr::SuspiciousTest;
+    }
+    Attr::Other
+}
+
+/// Атрибуты, похожие на тестовые, но не распознанные. Непустой список — отказ.
+fn suspicious_attrs_in(src: &str) -> Vec<String> {
+    src.lines()
+        .filter(|l| classify_attr(l) == Attr::SuspiciousTest)
+        .map(|l| l.trim().to_string())
+        .collect()
+}
+
+/// Вынуть имена функций, идущих за распознанным тестовым атрибутом.
+fn scenarios_in(src: &str) -> Vec<String> {
     let mut names = Vec::new();
     let mut armed = false;
-    for line in SUBJECT_SRC.lines() {
-        let t = line.trim_start();
-        if t.starts_with("#[tokio::test") || t == "#[test]" {
-            armed = true;
-            continue;
+    for line in src.lines() {
+        match classify_attr(line) {
+            Attr::Test => {
+                armed = true;
+                continue;
+            }
+            // Прочие атрибуты между тестовым и сигнатурой законны (`#[cfg(...)]`).
+            Attr::Other if line.trim_start().starts_with("#[") => continue,
+            Attr::SuspiciousTest => continue,
+            Attr::Other => {}
         }
         if !armed {
             continue;
         }
-        // Между атрибутом и сигнатурой законны другие атрибуты (`#[cfg(...)]`).
-        if t.starts_with("#[") {
-            continue;
-        }
+        let t = line.trim_start();
         if let Some(rest) = t
             .strip_prefix("async fn ")
             .or_else(|| t.strip_prefix("fn "))
@@ -57,28 +122,37 @@ fn scenarios_in_subject() -> Vec<String> {
     names
 }
 
-/// SETUP-СТРАЖ: парсер, молча нашедший ноль, есть плацебо самого себя.
+fn scenarios_in_subject() -> Vec<String> {
+    scenarios_in(SUBJECT_SRC)
+}
+
+/// FAIL-CLOSED НА НЕРАСПОЗНАННУЮ ФОРМУ (`C-251`).
+///
+/// Парсер, знающий закрытый список форм, слеп к любой шестнадцатой — и молчит об этом.
+/// Здесь он обязан ОТКАЗАТЬ: неизвестная тестовая форма в файле предмета означает, что
+/// биекция ниже считает не всё множество, а её зелёный цвет ничего не стоит.
 #[test]
-fn r0_parser_finds_every_test_attribute() {
-    let attrs = SUBJECT_SRC
-        .lines()
-        .filter(|l| {
-            let t = l.trim_start();
-            t.starts_with("#[tokio::test") || t == "#[test]"
-        })
-        .count();
-    let found = scenarios_in_subject();
+fn r0b_unrecognised_test_attribute_is_refused_not_ignored() {
+    let found = suspicious_attrs_in(SUBJECT_SRC);
     assert!(
-        attrs > 0,
-        "setup-страж: в исходнике предмета НЕ НАЙДЕНО ни одного тестового атрибута — \
-         либо включён не тот файл, либо парсер слеп; всё ниже судило бы пустоту"
+        found.is_empty(),
+        "в файле предмета есть атрибуты, ПОХОЖИЕ на тестовые, но не распознанные: {found:?}. \
+         Пока форма не распознана, сценарий под ней не попадает ни в найденные, ни в \
+         требуемые — реестр «покрывает» файл, не покрывая его (C-251)"
     );
+
+    // АНТИ-ПЛАЦЕБО ЗДЕСЬ ЖЕ: страж обязан ловить ровно ту форму, которой он не знал.
+    // Без этой проверки «список пуст» означало бы лишь, что смотреть научились не туда.
+    let synthetic = "#[cfg_attr(test, tokio::test)]\nasync fn sneaky_scenario() {}\n";
     assert_eq!(
-        found.len(),
-        attrs,
-        "setup-страж: атрибутов {attrs}, а имён вынуто {} — парсер теряет сценарии, и \
-         биекция ниже доказывала бы полноту ПО НЕПОЛНОМУ множеству. Найдено: {found:?}",
-        found.len()
+        suspicious_attrs_in(synthetic).len(),
+        1,
+        "страж НЕ УВИДЕЛ условный тестовый атрибут — ровно тот обход, который нашёл C-251"
+    );
+    assert!(
+        scenarios_in(synthetic).is_empty(),
+        "парсер вынул имя из нераспознанной формы — тогда отказ выше не нужен, а поведение \
+         двусмысленно: форма либо распознана, либо отвергнута, третьего не дано"
     );
 }
 
@@ -238,4 +312,146 @@ fn r4_every_short_circuit_cites_an_existing_witness() {
             }
         }
     }
+}
+
+/// ДРАЙВЕР ДЕЙСТВИТЕЛЬНО ПИТАЕТ ФИКСТУРУ, А НЕ ЛЕЖИТ РЯДОМ (`C-251`).
+///
+/// Круг 6 поймал недоисполнение `A-039`: хелпер состояния слепка существовал, но его никто
+/// не звал — состояние по-прежнему выбирало тело сценария, и переклассификация строки
+/// «слепка нет» в «отставание 0» оставалась зелёной. Полдела здесь хуже, чем ничего:
+/// реестр ВЫГЛЯДЕЛ единственным источником, не будучи им.
+///
+/// Проверяется по ФОРМЕ вызова в исходнике предмета, а не по слову в комментарии. Сегодня
+/// это единственный способ предъявить связь: файл предмета COMPILE-RED до задач 12-13, и
+/// прогнать сами сценарии нельзя. Предел назван — проверка статическая; после задачи 12
+/// связь становится наблюдаемой прогоном, и переклассификация строки роняет сценарий.
+#[test]
+fn r5_checkpoint_state_is_driven_by_registry_not_by_fixture_bodies() {
+    assert!(
+        SUBJECT_SRC.contains("m87_registry::registry_checkpoint("),
+        "файл предмета НЕ ЗОВЁТ registry_checkpoint — состояние слепка снова выбирает тело \
+         сценария, и строку реестра можно переклассифицировать безнаказанно (C-251)"
+    );
+
+    // Построение слепка живёт ТОЛЬКО в драйвере. Исключение ровно одно и оно названо:
+    // `u1_guard_trap_actually_traps` проверяет, что построение слепка НАД ЛОВУШКОЙ
+    // отказывает, — это его предмет, а не оснастка.
+    let advances = SUBJECT_SRC.matches("checkpoint::advance").count();
+    assert_eq!(
+        advances, 3,
+        "построений слепка в предмете: {advances}, ожидалось 3 (две ветви драйвера + \
+         страж ловушки). Лишнее построение означает второе место, где состояние слепка \
+         расходится с реестром"
+    );
+
+    // Путь файла слепка тоже собирается в одном месте: иначе сценарий может испортить
+    // слепок «мимо» классификации.
+    let fingerprints = SUBJECT_SRC.matches("ckpt-{:016x}.bin").count();
+    assert_eq!(
+        fingerprints, 1,
+        "адрес файла слепка собирается в {fingerprints} местах вместо одного — порча или \
+         подделка версии может пройти мимо строки реестра"
+    );
+}
+
+/// Тело сценария по его имени — для сверки ОЖИДАНИЯ с классом строки.
+fn body_of(scenario: &str) -> String {
+    let start = SUBJECT_SRC
+        .find(&format!("async fn {scenario}("))
+        .or_else(|| SUBJECT_SRC.find(&format!("fn {scenario}(")))
+        .unwrap_or_else(|| panic!("сценарий «{scenario}» не найден в исходнике предмета"));
+    let rest = &SUBJECT_SRC[start..];
+    let end = rest.find("\n}\n").unwrap_or(rest.len());
+    rest[..end].to_string()
+}
+
+/// Ждёт ли тело сценария СНИМКА как исхода.
+///
+/// Наивное «в теле встречается слово snapshot» не годится и это поймано прогоном:
+/// `c5_entry_refusal_does_not_substitute_parameters` содержит `Some("snapshot")` ВНУТРИ
+/// `assert_ne!` — то есть утверждает ОБРАТНОЕ. Поэтому отрицательные утверждения из тела
+/// вырезаются перед проверкой.
+///
+/// **Предел назван:** это разбор текста, а не типов. Он различает две формы, которыми
+/// корпус пользуется сегодня (`assert_eq!` и `assert_ne!`), и не претендует на большее;
+/// его собственная годность предъявлена стражем ниже, а не объявлена.
+fn expects_snapshot(body: &str) -> bool {
+    let mut cleaned = String::with_capacity(body.len());
+    let mut rest = body;
+    while let Some(i) = rest.find("assert_ne!") {
+        cleaned.push_str(&rest[..i]);
+        // Конец макро-вызова: строка вида `    );` на своём уровне.
+        let tail = &rest[i..];
+        match tail.find("\n    );") {
+            Some(j) => rest = &tail[j + 7..],
+            None => {
+                rest = "";
+                break;
+            }
+        }
+    }
+    cleaned.push_str(rest);
+    cleaned.contains("\"snapshot\"")
+}
+
+/// КЛАСС СТРОКИ СВЕРЯЕТСЯ С ОЖИДАНИЕМ СЦЕНАРИЯ — обход `C-251`, закрытый НАБЛЮДЕНИЕМ.
+///
+/// Критик показал обход: строку «слепка нет» можно переписать в «отставание 0,
+/// обслуживается», и всё остаётся зелёным. Драйвер делает такую переклассификацию
+/// ОШИБКОЙ ПО ПОСТРОЕНИЮ — фикстура построит прогретый слепок там, где сценарий ждёт
+/// отказа, — но увидеть это прогоном можно лишь после задачи 12: файл предмета
+/// COMPILE-RED. Ждать до тех пор значит оставить обход открытым на всё время кругов.
+///
+/// Поэтому здесь — сверка по исходнику, доступная СЕГОДНЯ: сценарий, у которого ВСЕ
+/// запросы отказные, не имеет права ждать снимка; сценарий с обслуживаемым запросом
+/// обязан снимка ждать. Переклассификация `c1_entry_cold…` из отказа в обслуживание
+/// краснеет здесь и сейчас.
+#[test]
+fn r6_request_class_matches_scenario_expectation() {
+    for (name, requests) in REGISTRY {
+        if requests.is_empty() {
+            continue; // строка-заявление: сценарий сервера не поднимает
+        }
+        let body = body_of(name);
+        let expects_snapshot = expects_snapshot(&body);
+        let any_served = requests
+            .iter()
+            .any(|r| matches!(r, Request::Freshness { served: true, .. }));
+
+        if any_served {
+            assert!(
+                expects_snapshot,
+                "«{name}» объявлен в реестре как ОБСЛУЖИВАЕМЫЙ, но его тело не ждёт снимка. \
+                 Либо строка переклассифицирована ошибочно (класс обхода C-251), либо \
+                 сценарий изменил предмет и реестр отстал"
+            );
+        } else {
+            assert!(
+                !expects_snapshot,
+                "«{name}» объявлен в реестре как ПОЛНОСТЬЮ отказной, но его тело ждёт снимка. \
+                 Реестр и сценарий разошлись, и один из них лжёт"
+            );
+        }
+    }
+}
+
+/// СТРАЖ РАЗБОРЩИКА ОЖИДАНИЙ: он обязан РАЗЛИЧАТЬ утверждение и его отрицание.
+///
+/// Без этого стража `r6` зеленел бы на разборщике, который просто ищет слово, — и тогда
+/// сверка класса с ожиданием была бы тавтологией.
+#[test]
+fn r6b_expectation_parser_distinguishes_assertion_from_its_negation() {
+    let positive =
+        "    assert_eq!(\n        msg.get(\"type\"),\n        Some(\"snapshot\"),\n    );\n";
+    let negative =
+        "    assert_ne!(\n        msg.get(\"type\"),\n        Some(\"snapshot\"),\n    );\n";
+    assert!(
+        expects_snapshot(positive),
+        "разборщик не увидел ПОЛОЖИТЕЛЬНОГО ожидания снимка"
+    );
+    assert!(
+        !expects_snapshot(negative),
+        "разборщик принял ОТРИЦАНИЕ за ожидание — сверка класса стала бы тавтологией \
+         (поймано прогоном на c5_entry_refusal_does_not_substitute_parameters)"
+    );
 }

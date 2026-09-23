@@ -189,6 +189,81 @@ fn poison_segment(dir: &std::path::Path, index: usize) {
     std::fs::write(target, &bytes).expect("write poisoned segment");
 }
 
+/// **СЛЕПОК СТРОИТСЯ ПО РЕЕСТРУ, А НЕ ПО ТЕЛУ СЦЕНАРИЯ (`A-039` §Q2 п. 2, `C-251`).**
+///
+/// Круг 6 поймал недоисполнение решения: числа отставания я из тел фикстур вынес, а
+/// СОСТОЯНИЕ СЛЕПКА оставил там же, где оно и было. Следствие критик воспроизвёл: строку
+/// «слепка нет» можно переписать в `Freshness { tail: 0 }`, и всё остаётся зелёным — тело
+/// сценария по-прежнему само решает, что строить. Полдела здесь хуже, чем ничего: реестр
+/// ВЫГЛЯДЕЛ единственным источником, не будучи им.
+///
+/// Теперь состояние выбирает строка. Переклассификация строки МЕНЯЕТ фикстуру: объявил
+/// «слепка нет» — сервер поднимается без слепка, и сценарий, ждавший обслуживания, падает.
+/// Утверждение и факт снова в одном месте.
+fn ckpt_from_registry(
+    scenario: &str,
+    dir: &std::path::Path,
+) -> (Option<std::path::PathBuf>, Option<tempfile::TempDir>) {
+    use m87_registry::CheckpointFixture as CF;
+    match m87_registry::registry_checkpoint(scenario) {
+        // Слепка нет: каталог не создаётся вовсе.
+        CF::Missing => (None, None),
+        CF::Warm => {
+            let ckpt = tempfile::tempdir().expect("ckpt");
+            gateway::checkpoint::advance(
+                dir,
+                ckpt.path(),
+                &canonical_sel(),
+                EpochFilter::OwnCaptureOnly,
+            )
+            .expect("advance");
+            (Some(ckpt.path().to_path_buf()), Some(ckpt))
+        }
+        CF::Corrupt => {
+            let ckpt = tempfile::tempdir().expect("ckpt");
+            std::fs::write(ckpt_file(ckpt.path()), vec![0xABu8; 4096]).expect("write corrupt ckpt");
+            (Some(ckpt.path().to_path_buf()), Some(ckpt))
+        }
+        CF::Incompatible => {
+            let ckpt = tempfile::tempdir().expect("ckpt");
+            gateway::checkpoint::advance(
+                dir,
+                ckpt.path(),
+                &canonical_sel(),
+                EpochFilter::OwnCaptureOnly,
+            )
+            .expect("advance");
+            let path = ckpt_file(ckpt.path());
+            let mut bytes = std::fs::read(&path).expect("read ckpt");
+            let declared = u32::from_le_bytes(bytes[12..16].try_into().expect("4 байта"));
+            assert_eq!(
+                declared,
+                gateway::GATEWAY_SCHEMA_VERSION,
+                "setup-страж: байты 12..16 не несут версию провода — подделка версии \
+                 сделала бы не то, что обещает строка реестра"
+            );
+            bytes[12..16].copy_from_slice(&(declared + 1).to_le_bytes());
+            std::fs::write(&path, &bytes).expect("write incompatible");
+            (Some(ckpt.path().to_path_buf()), Some(ckpt))
+        }
+    }
+}
+
+/// Путь файла слепка для канонического селектора.
+fn ckpt_file(dir: &std::path::Path) -> std::path::PathBuf {
+    dir.join(format!(
+        "ckpt-{:016x}.bin",
+        gateway::checkpoint::selector_fingerprint(&canonical_sel())
+    ))
+}
+
+/// Поднять сервер для НАЗВАННОГО сценария: и слепок, и его состояние берутся из реестра.
+/// Возвращает адрес и владение временным каталогом — он обязан жить, пока жив сервер.
+async fn serve_for(scenario: &str, dir: &std::path::Path) -> (String, Option<tempfile::TempDir>) {
+    let (ckpt, guard) = ckpt_from_registry(scenario, dir);
+    (serve(dir, ckpt).await, guard)
+}
+
 async fn serve(dir: &std::path::Path, ckpt: Option<std::path::PathBuf>) -> String {
     serve_with(dir, ckpt, policy()).await
 }
@@ -281,7 +356,11 @@ fn canonical_selector_json() -> Value {
 #[tokio::test]
 async fn c1_entry_cold_request_named_outcome_without_reading_journal() {
     let dir = journal_busy(3_000);
-    let addr = serve(dir.path(), None).await;
+    let (addr, _ckpt_guard) = serve_for(
+        "c1_entry_cold_request_named_outcome_without_reading_journal",
+        dir.path(),
+    )
+    .await;
 
     let before = serving_counters().journal_payload_bytes_read;
     let mut ws = connect(&addr).await;
@@ -313,16 +392,9 @@ async fn c1_entry_cold_request_named_outcome_without_reading_journal() {
 #[tokio::test]
 async fn c1_entry_ready_state_is_actually_served() {
     let dir = journal_busy(500);
-    let ckpt = tempfile::tempdir().expect("ckpt");
-    gateway::checkpoint::advance(
-        dir.path(),
-        ckpt.path(),
-        &canonical_sel(),
-        EpochFilter::OwnCaptureOnly,
-    )
-    .expect("advance");
 
-    let addr = serve(dir.path(), Some(ckpt.path().to_path_buf())).await;
+    let (addr, _ckpt_guard) =
+        serve_for("c1_entry_ready_state_is_actually_served", dir.path()).await;
     let mut ws = connect(&addr).await;
     send(&mut ws, subscribe("s1", canonical_selector_json())).await;
     let msg = recv(&mut ws).await.expect("сервер промолчал");
@@ -342,15 +414,7 @@ async fn c1_entry_ready_state_is_actually_served() {
 #[tokio::test]
 async fn c5_entry_unbounded_profile_is_refused() {
     let dir = journal_busy(3_000);
-    let ckpt = tempfile::tempdir().expect("ckpt");
-    gateway::checkpoint::advance(
-        dir.path(),
-        ckpt.path(),
-        &canonical_sel(),
-        EpochFilter::OwnCaptureOnly,
-    )
-    .expect("advance");
-    let addr = serve(dir.path(), Some(ckpt.path().to_path_buf())).await;
+    let (addr, _ckpt_guard) = serve_for("c5_entry_unbounded_profile_is_refused", dir.path()).await;
 
     let before = serving_counters().journal_payload_bytes_read;
     let mut ws = connect(&addr).await;
@@ -383,7 +447,11 @@ async fn c5_entry_unbounded_profile_is_refused() {
 #[tokio::test]
 async fn c5_entry_refusal_does_not_substitute_parameters() {
     let dir = journal_busy(200);
-    let addr = serve(dir.path(), None).await;
+    let (addr, _ckpt_guard) = serve_for(
+        "c5_entry_refusal_does_not_substitute_parameters",
+        dir.path(),
+    )
+    .await;
     let mut ws = connect(&addr).await;
     send(
         &mut ws,
@@ -411,15 +479,11 @@ async fn c5_entry_refusal_does_not_substitute_parameters() {
 #[tokio::test]
 async fn c5_entry_refusal_keeps_connection_and_neighbours_alive() {
     let dir = journal_busy(500);
-    let ckpt = tempfile::tempdir().expect("ckpt");
-    gateway::checkpoint::advance(
+    let (addr, _ckpt_guard) = serve_for(
+        "c5_entry_refusal_keeps_connection_and_neighbours_alive",
         dir.path(),
-        ckpt.path(),
-        &canonical_sel(),
-        EpochFilter::OwnCaptureOnly,
     )
-    .expect("advance");
-    let addr = serve(dir.path(), Some(ckpt.path().to_path_buf())).await;
+    .await;
 
     let mut ws = connect(&addr).await;
     send(&mut ws, subscribe("good", canonical_selector_json())).await;
@@ -536,14 +600,9 @@ async fn c4_slot_lifecycle_hold_refuse_release() {
     use gateway_serve::test_sync::rendezvous;
 
     let dir = journal_busy(300);
-    let ckpt = tempfile::tempdir().expect("ckpt");
-    gateway::checkpoint::advance(
-        dir.path(),
-        ckpt.path(),
-        &canonical_sel(),
-        EpochFilter::OwnCaptureOnly,
-    )
-    .expect("advance");
+    // Состояние слепка — из реестра, как у прочих сценариев (`C-251`).
+    let (ckpt_dir, _ckpt_guard) =
+        ckpt_from_registry("c4_slot_lifecycle_hold_refuse_release", dir.path());
 
     // Канал взводится ДО подъёма сервера: работа первой подписки не должна проскочить
     // точку рандеву раньше, чем тест будет готов её ждать. Имя — КАНАЛА ADD-ПУТИ, а не
@@ -552,7 +611,7 @@ async fn c4_slot_lifecycle_hold_refuse_release() {
     rendezvous::arm(&ch);
     let _rv = RendezvousGuard(ch.clone());
 
-    let (addr, slots) = serve_with_slots(dir.path(), Some(ckpt.path().to_path_buf())).await;
+    let (addr, slots) = serve_with_slots(dir.path(), ckpt_dir).await;
 
     // (1) УДЕРЖАНИЕ. Первый клиент входит; его работа встаёт на рандеву.
     let mut a = connect(&addr).await;
@@ -648,7 +707,11 @@ async fn c4_slot_lifecycle_hold_refuse_release() {
 #[tokio::test]
 async fn c6_counters_are_emitted_by_the_real_serving_path() {
     let dir = journal_busy(300);
-    let addr = serve(dir.path(), None).await;
+    let (addr, _ckpt_guard) = serve_for(
+        "c6_counters_are_emitted_by_the_real_serving_path",
+        dir.path(),
+    )
+    .await;
 
     let before = serving_counters();
     let mut ws = connect(&addr).await;
@@ -692,14 +755,6 @@ async fn c6_counters_are_emitted_by_the_real_serving_path() {
 #[tokio::test]
 async fn c9_four_positions_differ_and_stale_snapshot_does_not_stop_serving() {
     let dir = journal_busy(300);
-    let ckpt = tempfile::tempdir().expect("ckpt");
-    gateway::checkpoint::advance(
-        dir.path(),
-        ckpt.path(),
-        &canonical_sel(),
-        EpochFilter::OwnCaptureOnly,
-    )
-    .expect("advance");
 
     // Журнал уезжает ПОСЛЕ слепка — источник заведомо свежее слепка.
     {
@@ -723,7 +778,11 @@ async fn c9_four_positions_differ_and_stale_snapshot_does_not_stop_serving() {
         j.flush().expect("flush");
     }
 
-    let addr = serve(dir.path(), Some(ckpt.path().to_path_buf())).await;
+    let (addr, _ckpt_guard) = serve_for(
+        "c9_four_positions_differ_and_stale_snapshot_does_not_stop_serving",
+        dir.path(),
+    )
+    .await;
     let mut ws = connect(&addr).await;
     send(&mut ws, subscribe("s1", canonical_selector_json())).await;
     let msg = recv(&mut ws).await.expect("сервер промолчал");
@@ -793,7 +852,11 @@ fn u1_guard_trap_actually_traps() {
 async fn u1_entry_missing_checkpoint_over_trap_gives_named_outcome() {
     let dir = journal_busy(2_000);
     poison_segment(dir.path(), 0);
-    let addr = serve(dir.path(), None).await;
+    let (addr, _ckpt_guard) = serve_for(
+        "u1_entry_missing_checkpoint_over_trap_gives_named_outcome",
+        dir.path(),
+    )
+    .await;
     let mut ws = connect(&addr).await;
     send(&mut ws, subscribe("s1", canonical_selector_json())).await;
     let msg = recv(&mut ws).await.expect("сервер промолчал");
@@ -808,18 +871,15 @@ async fn u1_entry_missing_checkpoint_over_trap_gives_named_outcome() {
 #[tokio::test]
 async fn u1_entry_corrupt_checkpoint_over_trap_gives_named_outcome() {
     let dir = journal_busy(2_000);
-    let ckpt = tempfile::tempdir().expect("ckpt");
-    std::fs::write(
-        ckpt.path().join(format!(
-            "ckpt-{:016x}.bin",
-            gateway::checkpoint::selector_fingerprint(&canonical_sel())
-        )),
-        vec![0xABu8; 4096],
-    )
-    .expect("write corrupt ckpt");
+    // Порчу слепка делает драйвер по строке реестра (`Stage::CkptCorrupt`), а не тело
+    // сценария: иначе строку можно переклассифицировать, и фикстура этого не заметит.
     poison_segment(dir.path(), 0);
 
-    let addr = serve(dir.path(), Some(ckpt.path().to_path_buf())).await;
+    let (addr, _ckpt_guard) = serve_for(
+        "u1_entry_corrupt_checkpoint_over_trap_gives_named_outcome",
+        dir.path(),
+    )
+    .await;
     let mut ws = connect(&addr).await;
     send(&mut ws, subscribe("s1", canonical_selector_json())).await;
     let msg = recv(&mut ws).await.expect("сервер промолчал");
@@ -834,30 +894,15 @@ async fn u1_entry_corrupt_checkpoint_over_trap_gives_named_outcome() {
 #[tokio::test]
 async fn u1_entry_incompatible_checkpoint_over_trap_gives_named_outcome() {
     let dir = journal_busy(600);
-    let ckpt = tempfile::tempdir().expect("ckpt");
-    gateway::checkpoint::advance(
-        dir.path(),
-        ckpt.path(),
-        &canonical_sel(),
-        EpochFilter::OwnCaptureOnly,
-    )
-    .expect("advance");
-    let path = ckpt.path().join(format!(
-        "ckpt-{:016x}.bin",
-        gateway::checkpoint::selector_fingerprint(&canonical_sel())
-    ));
-    let mut bytes = std::fs::read(&path).expect("read ckpt");
-    let declared = u32::from_le_bytes(bytes[12..16].try_into().expect("4 байта"));
-    assert_eq!(
-        declared,
-        gateway::GATEWAY_SCHEMA_VERSION,
-        "setup-страж: байты 12..16 не несут версию провода"
-    );
-    bytes[12..16].copy_from_slice(&(declared + 1).to_le_bytes());
-    std::fs::write(&path, &bytes).expect("write incompatible");
+    // Подделку версии провода делает драйвер по строке реестра (`Stage::CkptIncompatible`);
+    // setup-страж «байты 12..16 несут версию» живёт там же, рядом с подделкой.
     poison_segment(dir.path(), 0);
 
-    let addr = serve(dir.path(), Some(ckpt.path().to_path_buf())).await;
+    let (addr, _ckpt_guard) = serve_for(
+        "u1_entry_incompatible_checkpoint_over_trap_gives_named_outcome",
+        dir.path(),
+    )
+    .await;
     let mut ws = connect(&addr).await;
     send(&mut ws, subscribe("s1", canonical_selector_json())).await;
     let msg = recv(&mut ws).await.expect("сервер промолчал");
@@ -873,14 +918,6 @@ async fn u1_entry_incompatible_checkpoint_over_trap_gives_named_outcome() {
 #[tokio::test]
 async fn u1_entry_stale_checkpoint_beyond_budget_gives_named_outcome() {
     let dir = journal_busy(300);
-    let ckpt = tempfile::tempdir().expect("ckpt");
-    gateway::checkpoint::advance(
-        dir.path(),
-        ckpt.path(),
-        &canonical_sel(),
-        EpochFilter::OwnCaptureOnly,
-    )
-    .expect("advance");
     let segs_before = std::fs::read_dir(dir.path())
         .expect("read_dir")
         .filter_map(Result::ok)
@@ -908,7 +945,11 @@ async fn u1_entry_stale_checkpoint_beyond_budget_gives_named_outcome() {
     }
     poison_segment(dir.path(), segs_before);
 
-    let addr = serve(dir.path(), Some(ckpt.path().to_path_buf())).await;
+    let (addr, _ckpt_guard) = serve_for(
+        "u1_entry_stale_checkpoint_beyond_budget_gives_named_outcome",
+        dir.path(),
+    )
+    .await;
     let mut ws = connect(&addr).await;
     send(&mut ws, subscribe("s1", canonical_selector_json())).await;
     let msg = recv(&mut ws).await.expect("сервер промолчал");
@@ -924,17 +965,10 @@ async fn u1_entry_stale_checkpoint_beyond_budget_gives_named_outcome() {
 #[tokio::test]
 async fn u1_warm_path_is_served_over_trapped_head() {
     let dir = journal_busy(600);
-    let ckpt = tempfile::tempdir().expect("ckpt");
-    gateway::checkpoint::advance(
-        dir.path(),
-        ckpt.path(),
-        &canonical_sel(),
-        EpochFilter::OwnCaptureOnly,
-    )
-    .expect("advance");
     poison_segment(dir.path(), 0);
 
-    let addr = serve(dir.path(), Some(ckpt.path().to_path_buf())).await;
+    let (addr, _ckpt_guard) =
+        serve_for("u1_warm_path_is_served_over_trapped_head", dir.path()).await;
     let mut ws = connect(&addr).await;
     send(&mut ws, subscribe("s1", canonical_selector_json())).await;
     let msg = recv(&mut ws).await.expect("сервер промолчал");
@@ -950,14 +984,6 @@ async fn u1_warm_path_is_served_over_trapped_head() {
 #[tokio::test]
 async fn u1_served_request_with_tail_increments_payload_counter() {
     let dir = journal_busy(300);
-    let ckpt = tempfile::tempdir().expect("ckpt");
-    gateway::checkpoint::advance(
-        dir.path(),
-        ckpt.path(),
-        &canonical_sel(),
-        EpochFilter::OwnCaptureOnly,
-    )
-    .expect("advance");
     {
         let mut j = Journal::open_with(dir.path(), writer_cfg()).expect("open_with");
         for i in 0..(m87_registry::registry_tail(
@@ -980,7 +1006,11 @@ async fn u1_served_request_with_tail_increments_payload_counter() {
     }
 
     let before = serving_counters().journal_payload_bytes_read;
-    let addr = serve(dir.path(), Some(ckpt.path().to_path_buf())).await;
+    let (addr, _ckpt_guard) = serve_for(
+        "u1_served_request_with_tail_increments_payload_counter",
+        dir.path(),
+    )
+    .await;
     let mut ws = connect(&addr).await;
     send(&mut ws, subscribe("s1", canonical_selector_json())).await;
     let msg = recv(&mut ws).await.expect("сервер промолчал");
