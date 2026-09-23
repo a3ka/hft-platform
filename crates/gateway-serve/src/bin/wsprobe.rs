@@ -152,32 +152,6 @@ fn print_help() {
     );
 }
 
-#[allow(dead_code)]
-fn parse_secret(s: &str) -> Vec<u8> {
-    let is_hex =
-        !s.is_empty() && s.len().is_multiple_of(2) && s.chars().all(|c| c.is_ascii_hexdigit());
-    if is_hex {
-        let mut out = Vec::with_capacity(s.len() / 2);
-        let bytes = s.as_bytes();
-        let mut ok = true;
-        for chunk in bytes.chunks(2) {
-            let hi = (chunk[0] as char).to_digit(16);
-            let lo = (chunk[1] as char).to_digit(16);
-            match (hi, lo) {
-                (Some(h), Some(l)) => out.push(((h << 4) | l) as u8),
-                _ => {
-                    ok = false;
-                    break;
-                }
-            }
-        }
-        if ok {
-            return out;
-        }
-    }
-    s.as_bytes().to_vec()
-}
-
 fn now_unix_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
