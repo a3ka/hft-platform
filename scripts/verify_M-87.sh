@@ -97,6 +97,48 @@ else
   fail "task7: key_material отсутствует либо зонд её не зовёт — трактовок по-прежнему две (TD-207)"
 fi
 
+# ─────────── круг `R-196` задача 11 — НАПРАВЛЕНИЕ трактовки секрета (B3) ───────────
+# Прежний шаг task7 проверял ЕДИНСТВО трактовки («одна функция, её зовут обе стороны») и
+# был зелен, когда обе стороны свели к НЕВЕРНОЙ. Единство — не истинность. Направление
+# судится оракулом, который воспроизводит ВНЕШНЕГО подписывателя.
+SEC_OUT=$(cargo test -p gateway-serve --test red_m87_secret_form 2>&1)
+SEC_RC=$?
+SEC_LINE=$(printf '%s\n' "$SEC_OUT" | grep -E '^test result' | tail -1)
+if [ $SEC_RC -eq 0 ]; then
+  pass "task11: направление трактовки секрета — ${SEC_LINE:-GREEN}"
+else
+  fail "task11: red_m87_secret_form КРАСЕН — ${SEC_LINE:-компиляция}"
+  printf '%s\n' "$SEC_OUT" | grep -E '^(thread |R-196)' | head -6
+fi
+
+# ─────────── круг `R-196` задача 12 — порог свежести против каденции прогрева (B2) ───────────
+ST_OUT=$(cargo test -p gateway-serve --test red_m87_staleness_budget 2>&1)
+ST_RC=$?
+ST_LINE=$(printf '%s\n' "$ST_OUT" | grep -E '^test result' | tail -1)
+if [ $ST_RC -eq 0 ]; then
+  pass "task12: порог свежести переживает измеренную каденцию — ${ST_LINE:-GREEN}"
+else
+  fail "task12: red_m87_staleness_budget КРАСЕН — ${ST_LINE:-компиляция}"
+  printf '%s\n' "$ST_OUT" | grep -E '^(thread |R-196|error\[)' | head -6
+fi
+
+# ─────────── круг `R-196` задача 13 — оракул под флагом ОБЯЗАН БЫТЬ ПРОГНАН ───────────
+# Названный предел корпуса, найденный этим кругом: CI гоняет `cargo test --all` БЕЗ
+# `--all-features`, поэтому всё под `#[cfg(feature = "testing")]` в CI не исполняется
+# ВООБЩЕ — оно только компилируется линтером. Так уже живёт `O-12` из M-65. Пока это не
+# закрыто на уровне корпуса (долг ревьюера), milestone закрывает дыру у себя: гейт зовёт
+# набор точки входа ЯВНО с флагом. Без этого шага C4 не исполняется никогда и является
+# украшением, а не гейтом.
+EPF_OUT=$(cargo test -p gateway-serve --features testing --test red_m87_entrypoint 2>&1)
+EPF_RC=$?
+EPF_LINE=$(printf '%s\n' "$EPF_OUT" | grep -E '^test result' | tail -1)
+if [ $EPF_RC -eq 0 ]; then
+  pass "task13: набор точки входа ПОД ФЛАГОМ testing — ${EPF_LINE:-GREEN}"
+else
+  fail "task13: red_m87_entrypoint под --features testing КРАСЕН — ${EPF_LINE:-компиляция}"
+  printf '%s\n' "$EPF_OUT" | grep -E '^(thread |error\[|setup-страж)' | head -8
+fi
+
 # ─────────────── задача 8 — свежесть четырьмя позициями ───────────────
 FRESH=$(grep -rcE 'freshness|свежест' "$GS"/*.rs 2>/dev/null | awk -F: '{s+=$2} END{print s+0}')
 if [ "$FRESH" -gt 0 ]; then
