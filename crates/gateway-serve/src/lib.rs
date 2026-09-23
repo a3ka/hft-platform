@@ -100,7 +100,6 @@ pub mod wire_v1;
 /// `rendezvous`, вызывает `arm(id)` перед сценарием, `test_wait_for_pump(id, ..)`
 /// для синхронизации, `test_release(id)` чтобы pump продолжил, и `test_remove(id)`
 /// после сценария.
-#[cfg(any(test, feature = "testing"))]
 pub mod test_sync;
 
 pub mod wire {
@@ -1240,6 +1239,15 @@ pub mod server {
                     )?;
                     // M-71: ADD-путь так же обязан enforce'ить предел — иначе первая же
                     // подписка с раздувающим селектором ушла бы клиенту без проверки.
+                    // M-87 (задача 18): отказ по пределу объёма возвращается СВОИМ
+                    // именем из §4 (`overloaded`), а не `invalid_selector`. Селектор
+                    // валиден — не влезает ОТВЕТ, и клиент по прежнему имени чинил бы
+                    // параметры запроса вместо сужения окна (R-196, §14.1octies).
+                    if live.is_cap_terminal() {
+                        return Err(io::Error::other(format!(
+                            "PL-I-5 cap exceeded: response would exceed limit"
+                        )));
+                    }
                     let snap = live.snapshot_checked()?;
                     Ok((
                         snap,
@@ -1254,14 +1262,15 @@ pub mod server {
                 {
                     Ok(Ok(pair)) => pair,
                     Ok(Err(e)) => {
-                        send_v1_error(
-                            sink,
-                            Some(id),
-                            "invalid_selector",
-                            &format!("resume failed: {e}"),
-                        )
-                        .await;
-                        return Err(format!("resume failed: {e}"));
+                        let msg = e.to_string();
+                        let code = if msg.contains("PL-I-5") {
+                            "overloaded"
+                        } else {
+                            "invalid_selector"
+                        };
+                        send_v1_error(sink, Some(id), code, &format!("resume failed: {msg}"))
+                            .await;
+                        return Err(format!("resume failed: {msg}"));
                     }
                     Err(join_err) => {
                         send_v1_error(
