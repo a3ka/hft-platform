@@ -129,6 +129,19 @@ fi
 # закрыто на уровне корпуса (долг ревьюера), milestone закрывает дыру у себя: гейт зовёт
 # набор точки входа ЯВНО с флагом. Без этого шага C4 не исполняется никогда и является
 # украшением, а не гейтом.
+# Различитель подменного пути (`C-245` R2) — ЗЕЛЁНЫЙ контроль, работающий уже сегодня:
+# он краснеет, если удержание ADD-работы завязано на канал периодического pump'а M-65.
+# Проверен мутацией: с подмешанным рандеву на голом id — FAILED, после возврата кода — ok.
+RZ_OUT=$(cargo test -p gateway-serve --features testing --test red_m87_rendezvous_discriminator 2>&1)
+RZ_RC=$?
+RZ_LINE=$(printf '%s\n' "$RZ_OUT" | grep -E '^test result' | tail -1)
+if [ $RZ_RC -eq 0 ]; then
+  pass "task13: различитель подменного пути ЗЕЛЁН — ${RZ_LINE:-GREEN}"
+else
+  fail "task13: различитель подменного пути КРАСЕН — удержание завязано на чужой канал (${RZ_LINE:-компиляция})"
+  printf '%s\n' "$RZ_OUT" | grep -E '^(thread |C-245)' | head -5
+fi
+
 EPF_OUT=$(cargo test -p gateway-serve --features testing --test red_m87_entrypoint 2>&1)
 EPF_RC=$?
 EPF_LINE=$(printf '%s\n' "$EPF_OUT" | grep -E '^test result' | tail -1)

@@ -484,16 +484,33 @@ async fn c5_entry_refusal_keeps_connection_and_neighbours_alive() {
 /// RED-состояние; без флага он не компилируется вовсе, поэтому `cargo test --all` и CI
 /// остаются зелёными (тот же порядок, что у `O-12` в M-65).
 
+/// **ИМЯ КАНАЛА РАЗЛИЧАЕТ ЗАМЫКАНИЯ, И ЭТО НЕ УКРАШЕНИЕ (`C-245` R2).**
+///
+/// В дереве УЖЕ ЕСТЬ два вызова `pump_signal_and_wait` с ГОЛЫМ `id` подписки — это
+/// периодический v1-pump из M-65 (`lib.rs:1495`, `:2038`), механизм совсем другой задачи.
+/// Первая редакция этого оракула ждала ровно такой же голый `id` — и потому НЕ МОГЛА
+/// отличить, какое замыкание подало сигнал. Дев, добавив один `slots_handle()`, получил бы
+/// зелёный `C4` БЕЗ требуемой точки на ADD-пути: сигнал пришёл бы от старого pump'а.
+/// Оракул проверял бы наличие КАКОГО-ТО рандеву вместо инварианта задачи 13.
+///
+/// Префикс делает подмену невозможной СТРУКТУРНО: канал `m87-add:<sub>` не может быть
+/// разбужен pump'ом, который пишет в канал `<sub>`. Плюс сценарий `c4b` ниже наблюдает
+/// разницу поведением, а не именем.
+#[cfg(feature = "testing")]
+fn add_channel(sub: &str) -> String {
+    format!("m87-add:{sub}")
+}
+
 /// Снять канал рандеву на любом выходе, включая панику: оставленный канал достался бы
 /// следующему тесту в том же бинаре уже «взведённым».
 #[cfg(feature = "testing")]
-struct RendezvousGuard(&'static str);
+struct RendezvousGuard(String);
 
 #[cfg(feature = "testing")]
 impl Drop for RendezvousGuard {
     fn drop(&mut self) {
-        gateway_serve::test_sync::rendezvous::test_release(self.0);
-        gateway_serve::test_sync::rendezvous::test_remove(self.0);
+        gateway_serve::test_sync::rendezvous::test_release(&self.0);
+        gateway_serve::test_sync::rendezvous::test_remove(&self.0);
     }
 }
 
@@ -515,9 +532,11 @@ async fn c4_slot_lifecycle_hold_refuse_release() {
     .expect("advance");
 
     // Канал взводится ДО подъёма сервера: работа первой подписки не должна проскочить
-    // точку рандеву раньше, чем тест будет готов её ждать.
-    rendezvous::arm("a");
-    let _rv = RendezvousGuard("a");
+    // точку рандеву раньше, чем тест будет готов её ждать. Имя — КАНАЛА ADD-ПУТИ, а не
+    // голый идентификатор подписки: голый занят периодическим pump'ом M-65 (`C-245` R2).
+    let ch = add_channel("a");
+    rendezvous::arm(&ch);
+    let _rv = RendezvousGuard(ch.clone());
 
     let (addr, slots) = serve_with_slots(dir.path(), Some(ckpt.path().to_path_buf())).await;
 
@@ -525,10 +544,23 @@ async fn c4_slot_lifecycle_hold_refuse_release() {
     let mut a = connect(&addr).await;
     send(&mut a, subscribe("a", canonical_selector_json())).await;
     assert!(
-        rendezvous::test_wait_for_pump("a", std::time::Duration::from_secs(10)),
-        "setup-страж: работа НЕ ДОШЛА до точки рандеву за 10 с. Либо вызов \
-         `pump_signal_and_wait` не стоит на ADD-пути (задача dev'а №1), либо запрос не \
-         дошёл до работы вовсе. Сценарий НЕСОСТОЯВШИЙСЯ — всё ниже проверяло бы не то"
+        rendezvous::test_wait_for_pump(&ch, std::time::Duration::from_secs(10)),
+        "setup-страж: работа НЕ ДОШЛА до точки рандеву «{ch}» за 10 с. Либо вызов \
+         `pump_signal_and_wait(&format!(\"m87-add:{{id}}\"))` не стоит ПЕРВОЙ строкой \
+         замыкания ADD-пути (задача 13), либо запрос не дошёл до работы вовсе. Сценарий \
+         НЕСОСТОЯВШИЙСЯ — всё ниже проверяло бы не то"
+    );
+    // РАЗЛИЧИТЕЛЬ ЗАМЫКАНИЙ (`C-245` R2), и он важнее имени канала: пока работа стоит на
+    // рандеву, клиент не получил НИЧЕГО. Если бы сигнал подало замыкание периодического
+    // pump'а, ADD-работа к этому моменту была бы ЗАВЕРШЕНА и снимок уже ушёл бы клиенту.
+    // Имя канала закрывает подмену структурно, эта проверка — наблюдением.
+    let early = tokio::time::timeout(std::time::Duration::from_millis(700), a.next()).await;
+    assert!(
+        early.is_err(),
+        "клиент получил ответ, пока работа якобы удерживается на рандеву: {early:?}. \
+         Значит удерживается НЕ ADD-работа, а что-то после неё — например периодический \
+         pump M-65. Слот при этом мог быть занят по другому пути, и `in_flight()==1` ниже \
+         ничего бы не доказывал"
     );
     assert_eq!(
         slots.in_flight(),
@@ -553,7 +585,7 @@ async fn c4_slot_lifecycle_hold_refuse_release() {
     );
 
     // (3) ОСВОБОЖДЕНИЕ управляется ТЕСТОМ.
-    rendezvous::test_release("a");
+    rendezvous::test_release(&ch);
     let first = recv(&mut a).await.expect("первый клиент не получил ответа");
     assert_eq!(
         first.get("type").and_then(|t| t.as_str()),
