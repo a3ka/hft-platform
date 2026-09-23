@@ -1268,8 +1268,7 @@ pub mod server {
                         } else {
                             "invalid_selector"
                         };
-                        send_v1_error(sink, Some(id), code, &format!("resume failed: {msg}"))
-                            .await;
+                        send_v1_error(sink, Some(id), code, &format!("resume failed: {msg}")).await;
                         return Err(format!("resume failed: {msg}"));
                     }
                     Err(join_err) => {
