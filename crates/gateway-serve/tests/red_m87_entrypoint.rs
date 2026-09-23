@@ -26,6 +26,8 @@
 //!
 //! COMPILE-RED: модулей `gateway_serve::admission` / `gateway_serve::metrics` не существует.
 
+mod m87_registry;
+
 use contracts::{to_fixed, DataSource, EventKind, Level, MdPayload, Side, Venue};
 use futures_util::{SinkExt, StreamExt};
 use gateway::Selector;
@@ -130,26 +132,15 @@ fn policy() -> AdmissionPolicy {
         // Круг `C-245`/`C-246`: шестипольная форма §4.1. Пороги ЗАВЕДОМО ЩЕДРЫЕ —
         // предмет этого файла не свежесть слепка, и строгий порог определял бы его
         // исход посторонней величиной (`testing.md`, целостность гейта п.2).
-        // ПОРОГ ОБЩИЙ НА ФАЙЛ, И ЕГО ВЫБОР ОБЯЗАН БЫТЬ ДОКАЗАН ПО ВСЕМ ПОТРЕБИТЕЛЯМ
-        // (`C-248` R4-2). Прошлая редакция утверждала «прочие сценарии снимают слепок в
-        // конце, отставание ≈0» — утверждение ЛОЖНО: `u1_entry_stale_checkpoint_beyond_budget`
-        // дописывает 4 000 событий ПОСЛЕ слепка и ждёт отказа ИМЕННО по свежести.
+        // ЧИСЛА БЕРУТСЯ ИЗ ЕДИНСТВЕННОГО ИСТОЧНИКА, А НЕ ПОВТОРЯЮТСЯ ЗДЕСЬ (`A-039` §Q2).
         //
-        // Действительная таблица отставаний (снята чтением фикстур, а не памятью):
-        //   c9_four_positions…              +200   ⇒ обязан ОБСЛУЖИТЬ (отставание — норма)
-        //   u1_served_request_with_tail     +50    ⇒ обязан ОБСЛУЖИТЬ
-        //   u1_entry_stale_checkpoint…      +4 000 ⇒ обязан ОТКАЗАТЬ по свежести
-        //   прочие (c1/c4/c5/c6/u1_warm)    0      ⇒ порогом не задеты
-        // Отсюда допустимый порог: 200 ≤ max_tail_events < 4 000. Выбрано 1 000 — середина
-        // коридора, не край: значение на краю ломалось бы от любой правки фикстуры.
-        max_tail_events: 1_000,
-        // ОПОРА СНИЖЕНА С 500 ДО 100 РАДИ ДОКАЗУЕМОСТИ ГРАНИЦЫ (`C-248` R4-1).
-        // Граница `C9` доказывается мутацией порога НИЖЕ отставания 200. При опоре 500
-        // такая мутация делает политику НЕВАЛИДНОЙ (`max_tail_events < expected_warmup_events`),
-        // и сценарий упал бы на отказе СТАРТА, а не на свежести — то есть доказывал бы не то.
-        // При опоре 100 мутация `1_000 → 150` оставляет политику валидной (150 ≥ 100) и
-        // пересекает отставание 200: `C9` обязан покраснеть ИМЕННО по свежести.
-        expected_warmup_events: 100,
+        // Прежде порог жил в этом хелпере, отставания — в телах фикстур, а связь между
+        // ними — в комментарии, скопированном в милестоун. Три места, ни одно не проверяет
+        // другое: каждая правка любого из них молча рассинхронизировала остальные, и
+        // ровно это дало три круга гейта подряд (`C-247` R3-1, `C-248` R4-2, `C-249`).
+        // Полнота и согласованность теперь предъявляются прогоном `red_m87_registry.rs`.
+        max_tail_events: m87_registry::MAX_TAIL_EVENTS,
+        expected_warmup_events: m87_registry::EXPECTED_WARMUP_EVENTS,
     }
 }
 
@@ -713,7 +704,10 @@ async fn c9_four_positions_differ_and_stale_snapshot_does_not_stop_serving() {
     // Журнал уезжает ПОСЛЕ слепка — источник заведомо свежее слепка.
     {
         let mut j = Journal::open_with(dir.path(), writer_cfg()).expect("open_with");
-        for i in 0..200i64 {
+        for i in 0..(m87_registry::registry_tail(
+            "c9_four_positions_differ_and_stale_snapshot_does_not_stop_serving",
+        ) as i64)
+        {
             j.append(EventKind::md(
                 Venue::Binance,
                 "BTCUSDT",
@@ -894,7 +888,10 @@ async fn u1_entry_stale_checkpoint_beyond_budget_gives_named_outcome() {
         .count();
     {
         let mut j = Journal::open_with(dir.path(), writer_cfg()).expect("open_with");
-        for i in 0..4_000i64 {
+        for i in 0..(m87_registry::registry_tail(
+            "u1_entry_stale_checkpoint_beyond_budget_gives_named_outcome",
+        ) as i64)
+        {
             j.append(EventKind::md(
                 Venue::Binance,
                 "BTCUSDT",
@@ -963,7 +960,10 @@ async fn u1_served_request_with_tail_increments_payload_counter() {
     .expect("advance");
     {
         let mut j = Journal::open_with(dir.path(), writer_cfg()).expect("open_with");
-        for i in 0..50i64 {
+        for i in 0..(m87_registry::registry_tail(
+            "u1_served_request_with_tail_increments_payload_counter",
+        ) as i64)
+        {
             j.append(EventKind::md(
                 Venue::Binance,
                 "BTCUSDT",
