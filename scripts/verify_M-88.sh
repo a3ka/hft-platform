@@ -113,7 +113,7 @@ fi
 MUT_BATTERY=scripts/tests/red_m88_mutants.sh
 if [ -f "$MUT_BATTERY" ]; then
   if bash "$MUT_BATTERY" --battery >/dev/null 2>&1; then
-    pass "R4: батарея мутантов ЗЕЛЕНА — обе изолированные мутации красят набор"
+    pass "R4: батарея мутантов ЗЕЛЕНА — все изолированные мутации красят набор"
   else
     fail "R4: батарея мутантов КРАСНАЯ — мутация не роняет набор, оракулы ничего не пиннят"
   fi

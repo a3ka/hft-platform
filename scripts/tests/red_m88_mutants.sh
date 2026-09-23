@@ -52,9 +52,12 @@ else
 fi
 
 # ─────────────── общий прогон мутанта ───────────────
-# $1 — имя мутанта, $2 — python-скрипт мутации, $3 — тест, который ОБЯЗАН упасть
-run_mutant() {
-  local name="$1" script="$2" expect_test="$3"
+# $1 — имя мутанта, $2 — python-скрипт мутации, $3 — тест, который ОБЯЗАН упасть,
+# $4 — набор (по умолчанию $SUITE). Четвёртый параметр появился с МУТАНТОМ-В: правка
+# круга 2 живёт в ДРУГОМ наборе, и прежняя форма, жёстко прибитая к одному `$SUITE`,
+# не могла его судить вовсе.
+run_mutant_in() {
+  local name="$1" script="$2" expect_test="$3" suite="${4:-$SUITE}"
   cp "$BACKUP" "$GW"
 
   if ! python3 -c "$script"; then
@@ -67,7 +70,7 @@ run_mutant() {
   fi
 
   local out
-  out=$(cargo test -p gateway --test "$SUITE" 2>&1)
+  out=$(cargo test -p gateway --test "$suite" 2>&1)
   if printf '%s\n' "$out" | grep -qE "^test ${expect_test} \.\.\. FAILED"; then
     pass "$name: нейтрализация → тест ${expect_test} FAILED"
   elif printf '%s\n' "$out" | grep -qE '^test result: FAILED'; then
@@ -93,7 +96,7 @@ if old not in s:
 s = s.replace(old, "        if true {", 1)
 open(p, "w", encoding="utf-8").write(s)
 '
-run_mutant "МУТАНТ-А (merge_heatmap → объединение)" "$MUT_A" "s1_removed_level_disappears_in_current_bucket"
+run_mutant_in "МУТАНТ-А (merge_heatmap → объединение)" "$MUT_A" "s1_removed_level_disappears_in_current_bucket"
 
 # ─────────────── МУТАНТ Б: пустой полный срез = отсутствие обновления ───────────────
 # Объявленные колонки игнорируются, когда срез пуст: «наблюдали пустоту» снова неотличимо
@@ -113,13 +116,34 @@ new = ("    let observed: std::collections::BTreeSet<i64> = if incoming.is_empty
 s = s.replace(old, new, 1)
 open(p, "w", encoding="utf-8").write(s)
 '
-run_mutant "МУТАНТ-Б (пустой полный срез → NoChange)" "$MUT_B" "s3_empty_full_slice_replaces_previous"
+run_mutant_in "МУТАНТ-Б (пустой полный срез → NoChange)" "$MUT_B" "s3_empty_full_slice_replaces_previous"
+
+# ─────────────── МУТАНТ В: состояние наблюдений НЕ подчинено окну ───────────────
+# `R-197` NOTE-2: батарея несла ДВУХ мутантов, и оба про семантику склейки. Правка круга 2
+# (список наблюдений следует ОКНУ, а не истории — находка `R-195` Б-1) анти-плацебо не
+# имела вовсе: её держал ручной прогон ревьюера, а не гейт. Ручной прогон не повторяется
+# сам, и через месяц о нём знает только git log.
+#
+# Мутант снимает эвикцию списка в РЕДЬЮСЕРЕ. Это ровно тот код, которого не было до круга 2
+# и из-за отсутствия которого выдача упиралась в предел объёма на прод-глубине журнала.
+MUT_V='
+import sys
+p = "crates/gateway/src/lib.rs"
+s = open(p, encoding="utf-8").read()
+old = "        self.heatmap_buckets_observed.retain(|&t| t >= lo_time_s);"
+if old not in s:
+    sys.exit(1)
+s = s.replace(old, "        // МУТАЦИЯ: эвикция списка наблюдений снята", 1)
+open(p, "w", encoding="utf-8").write(s)
+'
+run_mutant_in "МУТАНТ-В (список наблюдений не следует окну)" "$MUT_V" \
+  "w1_observed_list_is_window_bounded_not_history" "red_m88_observed_window"
 
 # ─────────────── итог ───────────────
 cp "$BACKUP" "$GW"
 printf '\n'
 if [ "$FAILURES" -eq 0 ]; then
-  echo "VERDICT: PASS — обе изолированные мутации красят набор на названных тестах"
+  echo "VERDICT: PASS — все изолированные мутации красят набор на названных тестах"
   exit 0
 fi
 echo "VERDICT: FAIL — расхождений: $FAILURES"
