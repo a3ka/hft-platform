@@ -45,12 +45,71 @@ pub struct LiveProfile {
 
 /// Политика допуска: что сервер ОБЕЩАЕТ обслуживать. Селектор, не совпавший НИ С ОДНИМ
 /// профилем, инструментом и набором полос ⇒ `Unsupported`.
+///
+/// Круг `R-196` (задача 12, спека §4.1, §14.1quinquies): пара
+/// `max_tail_events` / `expected_warmup_events` — НЕ два независимых лимита. Первое — порог
+/// свежести (отставание курсора слепка от хвоста журнала), второе — опора (объём цикла
+/// прогрева). Политика с `max_tail_events < expected_warmup_events` отказывает 100 % времени
+/// между прогревами: слепок перекрывает порог через ≈1.8 с и остаётся за ним до следующего
+/// цикла. Проверка СОГЛАСОВАННОСТИ — `validate()`; `bind_with_policy` ОБЯЗАН её звать и при
+/// `Err` возвращать `io::Error(InvalidInput)` с обоими числами в тексте.
 #[derive(Clone, Debug)]
 pub struct AdmissionPolicy {
     pub allowed_symbols: Vec<String>,
     pub canonical_bands: Vec<f64>,
     pub allowed_profiles: Vec<LiveProfile>,
     pub max_concurrent_serves: usize,
+    /// Круг `R-196` (задача 12): порог свежести слепка в событиях. Отставание курсора
+    /// слепка от хвоста журнала сверх этого числа ⇒ `NotReady`. ОБЯЗАН быть ≥
+    /// `expected_warmup_events`, иначе политика невалидна.
+    pub max_tail_events: u64,
+    /// Круг `R-196` (задача 12): опорная величина порога — объём, который прод производит
+    /// МЕЖДУ двумя прогревами слепка. Не «ещё один лимит», а то, относительно чего порог
+    /// только и имеет смысл.
+    pub expected_warmup_events: u64,
+}
+
+impl Default for AdmissionPolicy {
+    /// Круг `R-196` (задача 12, §14.1quinquies): дефолтный порог ОБЯЗАН быть ≥ измеренного
+    /// объёма одного цикла прогрева (замер `R-196`: 142 события/с × 900 с ≈ 127 800).
+    /// Развёртывание, не переопределившее порог явно, обязано работать, а не вставать
+    /// с отказом СТАРТА.
+    fn default() -> Self {
+        // Измеренная прод-каденция (замер 2026-09-23, спека §14.1quinquies).
+        const PROD_EVENTS_PER_SEC: u64 = 142;
+        const WARMUP_INTERVAL_SEC: u64 = 900;
+        // С запасом ×2: дефолт даёт «пережить» один полный пропуск прогрева.
+        const DEFAULT_MAX_TAIL_EVENTS: u64 = PROD_EVENTS_PER_SEC * WARMUP_INTERVAL_SEC * 2;
+        const DEFAULT_EXPECTED_WARMUP_EVENTS: u64 = PROD_EVENTS_PER_SEC * WARMUP_INTERVAL_SEC;
+        Self {
+            allowed_symbols: Vec::new(),
+            canonical_bands: Vec::new(),
+            allowed_profiles: Vec::new(),
+            max_concurrent_serves: 1,
+            max_tail_events: DEFAULT_MAX_TAIL_EVENTS,
+            expected_warmup_events: DEFAULT_EXPECTED_WARMUP_EVENTS,
+        }
+    }
+}
+
+impl AdmissionPolicy {
+    /// Круг `R-196` (задача 12, §14.1quinquies): fail-closed проверка СОГЛАСОВАННОСТИ пары
+    /// порога и опоры. `Err` РОВНО в одном случае: `max_tail_events < expected_warmup_events`.
+    ///
+    /// Текст ошибки ОБЯЗАН содержать ОБА числа десятичными литералами. Требование не
+    /// косметическое: без них инженер ищет причину в коде, а она в конфигурации (оракул
+    /// `red_m87_staleness_budget::t1` проверяет вхождение обеих подстрок).
+    pub fn validate(&self) -> Result<(), String> {
+        if self.max_tail_events < self.expected_warmup_events {
+            return Err(format!(
+                "max_tail_events ({}) must be >= expected_warmup_events ({}) \
+                 — порог свежести меньше объёма одного цикла прогрева \
+                 делает выдачу невозможной 100% времени между прогревами",
+                self.max_tail_events, self.expected_warmup_events
+            ));
+        }
+        Ok(())
+    }
 }
 
 // ─────────────────────────── §4.1 — `admit` (без I/O) ───────────────────────────
@@ -117,7 +176,17 @@ fn profile_allowed(policy: &AdmissionPolicy, sel: &Selector) -> bool {
 /// Возвращаемый `ready` за пределами самого `Ready`/`Warming` — это единая ТОЧКА входа
 /// для подъёма worker-прогрева. На публичном пути сегодня worker не поднимается (сегодня
 /// его нет — `Warming` сюда попадёт позже, через постепенное внедрение).
-pub fn readiness(ckpt_dir: &Path, journal_dir: &Path, sel: &Selector) -> ServingOutcome {
+///
+/// Круг `R-196` (задача 12, спека §4.1, §14.1quinquies): ЧЕТВЁРТЫЙ аргумент — политика.
+/// Порог свежести перестаёт быть константой внутри функции; `readiness` сверяет
+/// отставание с `policy.max_tail_events`. Источник порога — конфиг политики, источник
+/// опоры — `policy.expected_warmup_events`.
+pub fn readiness(
+    ckpt_dir: &Path,
+    journal_dir: &Path,
+    sel: &Selector,
+    policy: &AdmissionPolicy,
+) -> ServingOutcome {
     // Всегда проверяем наличие слепка: «его нет» ⇒ `NotReady` (на проде
     // каталог `/ckpt` смонтирован и пустой каталог — диагностируемый дефект,
     // а не «готов к работе»). Совместимость со СТАРЫМИ legacy-тестами без
@@ -154,24 +223,28 @@ pub fn readiness(ckpt_dir: &Path, journal_dir: &Path, sel: &Selector) -> Serving
         return ServingOutcome::NotReady;
     }
     // (4) Курсор слепка лежит близко к хвосту. staleness-проверка ОТКАЗЫВАЕТ
-    // в `NotReady` если хвост уехал далеко сверх бюджета (порог — 1 000 событий).
+    // в `NotReady` если хвост уехал далеко сверх бюджета.
+    //
+    // Круг `R-196` (задача 12): порог — `policy.max_tail_events`, не константа.
     // Спека §8 говорит «исправную живую выдачу НЕЛЬЗЯ прекращать из-за
-    // ЗАДЕРЖКИ записи слепка» — но отставание в тысячи событий это уже НЕ
+    // ЗАДЕРЖКИ записи слепка» — но отставание сверх бюджета это уже НЕ
     // задержка записи, а полное отставание (докормка хвоста сама по себе
-    // упирается в `feed_tail_within`-бюджет и не может бесконечно). На уровне
-    // 1 000 событий укладывается нормальный cron-перекос (тест c9 с 200
-    // событиями stale пропускается), а реальное отставание ловится.
-    let _ = journal_list_segments_count(journal_dir);
+    // упирается в `feed_tail_within`-бюджет и не может бесконечно).
+    //
+    // Круг `R-196` (задача 13): `journal_list_segments_count` УДАЛЁН из `readiness`.
+    // Он существовал только ради отозванной защёлки (`§14.1ter`) и заставлял
+    // прод обходить все сегменты на каждом запросе — ровно тот расход, против
+    // которого милестоун затевается. Теперь staleness-проверка читает ТОЛЬКО
+    // `journal.meta` (8 байт) — без `read_dir`, без `metadata`, без скана сегментов.
     let cursor_seq = header.cursor.upto_seq.unwrap_or(0);
     let tail_seq = match journal_open_next_seq(journal_dir) {
         Some(n) => n,
         None => return ServingOutcome::NotReady,
     };
-    const TAIL_SEQ_BUDGET: u64 = 250;
-    if tail_seq.saturating_sub(cursor_seq) > TAIL_SEQ_BUDGET {
+    if tail_seq.saturating_sub(cursor_seq) > policy.max_tail_events {
         return ServingOutcome::NotReady;
     }
-    let _ = journal_dir;
+    let _ = (journal_dir, policy, sel);
     ServingOutcome::Ready
 }
 
@@ -188,16 +261,6 @@ fn journal_open_next_seq(dir: &Path) -> Option<u64> {
     }
     let next_seq = u64::from_le_bytes(bytes[..8].try_into().ok()?);
     Some(next_seq)
-}
-
-/// M-87 (предохранитель выдачи): список файлов `.jrnl` через `journal::list_segments`
-/// (НЕ через `Journal::open_with`). `list_segments` ОТКРЫВАЕТ каждый файл ради
-/// 8 байт магии (`read_magic_prefix`); на FIFO без писателя это БЛОКИРУЕТ — ровно
-/// то, что нужно оракулу C4 (защёлка живёт внутри `readiness`, в spawn_blocking).
-/// При этом НЕ МОДИФИЦИРУЕТ каталог — только читает заголовки.
-fn journal_list_segments_count(dir: &Path) -> Option<usize> {
-    let segs = journal::list_segments(dir).ok()?;
-    Some(segs.len())
 }
 
 // ─────────────────────────── §5 — бюджет, отмена, докормка хвоста ───────────────────────────

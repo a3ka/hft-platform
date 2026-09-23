@@ -380,6 +380,15 @@ pub mod server {
         cfg: ServeConfig,
         policy: AdmissionPolicy,
     ) -> std::io::Result<Server> {
+        // Круг `R-196` (задача 12, §14.1quinquies-bis): `validate()` сама по себе ничего не
+        // гарантирует — её может никто не звать. Инвариант переформулирован как «сервер с
+        // несогласованной политикой НЕ ПОДНИМАЕТСЯ». Род ошибки `InvalidInput` пиннится
+        // намеренно: по нему оператор знает, что чинить КОНФИГ, а не искать внешнюю
+        // причину. Текст ошибки ОБЯЗАН содержать оба числа (порог и объём цикла), чтобы
+        // инженер не искал причину в коде.
+        if let Err(msg) = policy.validate() {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, msg));
+        }
         let slots = std::sync::Arc::new(ServingSlots::new(policy.max_concurrent_serves.max(1)));
         let server = bind(cfg).await?;
         Ok(server.with_policy(policy, slots))
@@ -998,6 +1007,7 @@ pub mod server {
                             ckpt_path.as_deref().unwrap_or(std::path::Path::new("")),
                             &journal_path,
                             &sel_for_readiness,
+                            &policy,
                         )
                     })
                     .await
@@ -1039,15 +1049,22 @@ pub mod server {
                     // пустой каталог — диагностируемый дефект развёртывания.
                     metrics::inc_attempts_pub();
                     if inner.cfg.checkpoint_dir.is_some() {
-                        use super::admission::{readiness, ServingOutcome};
+                        use super::admission::{readiness, AdmissionPolicy, ServingOutcome};
                         let ckpt_path = inner.cfg.checkpoint_dir.clone();
                         let journal_path = inner.cfg.journal_dir.clone();
                         let sel_for_readiness = sel.clone();
+                        // Без политики (`bind`-путь, не `bind_with_policy`) — readiness
+                        // всё равно ОБЯЗАН принимать политику (круг `R-196`, задача 12).
+                        // Здесь используем `Default` — дефолтный порог ПЕРЕЖИВАЕТ
+                        // измеренную прод-каденцию (`validate().is_ok()`) и не зависит
+                        // от конфигурации, которой в этой ветке нет.
+                        let fallback_policy = AdmissionPolicy::default();
                         let ready_outcome = tokio::task::spawn_blocking(move || {
                             readiness(
                                 ckpt_path.as_deref().unwrap_or(std::path::Path::new("")),
                                 &journal_path,
                                 &sel_for_readiness,
+                                &fallback_policy,
                             )
                         })
                         .await
@@ -1716,15 +1733,20 @@ pub mod server {
         // согласуется с §16.1 группа A — `ПЕРЕНОСИТСЯ` (эти тесты
         // используют `bind` без `bind_with_policy` и без чекпоинтера).
         let ready_outcome = if cfg.checkpoint_dir.is_some() {
-            use super::admission::{readiness, ServingOutcome};
+            use super::admission::{readiness, AdmissionPolicy, ServingOutcome};
             let ckpt_path = cfg.checkpoint_dir.clone();
             let journal_path = cfg.journal_dir.clone();
             let sel_for_readiness = cfg.selector.clone();
+            // Legacy-путь без политики (`bind` без `bind_with_policy`). `readiness`
+            // обязана принимать политику (круг `R-196`, задача 12); здесь
+            // используется `Default` — дефолт переживает измеренную прод-каденцию.
+            let fallback_policy = AdmissionPolicy::default();
             tokio::task::spawn_blocking(move || {
                 readiness(
                     ckpt_path.as_deref().unwrap_or(std::path::Path::new("")),
                     &journal_path,
                     &sel_for_readiness,
+                    &fallback_policy,
                 )
             })
             .await
