@@ -35,20 +35,6 @@ pub fn serving_counters() -> ServingCounters {
     }
 }
 
-/// (reserved) thread-local slots-in-flight (старый код; оставлен для
-/// совместимости символов). В текущей реализации `serving_counters`
-/// читает ГЛОБАЛЬНЫЙ атомик — параллельные тесты, читающие свой счётчик,
-/// должны либо запускаться последовательно, либо проверять глобальный
-/// счётчик через `slots_in_flight > 0` без строгого сравнения.
-#[allow(dead_code)]
-fn _unused_local_slots_stub() {}
-
-/// M-87 (предохранитель выдачи): установить thread-local счётчик слотов для
-/// текущего потока (резерв; в текущей реализации `serving_counters`
-/// читает ГЛОБАЛЬНЫЙ атомик, и параллельные тесты читают сумму).
-#[allow(dead_code)]
-pub fn set_local_slots_for_testing(_n: u64) {}
-
 // Глобальные атомики — единая точка инкремента на прод-пути.
 pub(crate) static ATTEMPTS_GLOBAL: AtomicU64 = AtomicU64::new(0);
 pub(crate) static SUCCESSES_GLOBAL: AtomicU64 = AtomicU64::new(0);
@@ -79,46 +65,6 @@ pub fn add_journal_payload_bytes_pub(bytes: u64) {
     JOURNAL_BYTES_GLOBAL.fetch_add(bytes, Ordering::SeqCst);
 }
 pub fn set_slots_in_flight_pub(n: u64) {
-    SLOTS_IN_FLIGHT_GLOBAL.store(n, Ordering::SeqCst);
-}
-
-// ─────────────────────────── API продюсера (внутреннее, `pub(crate)`) ───────────────────────────
-
-/// Продюсер: инкрементировать `attempts` при КАЖДОМ входящем публичном запросе.
-#[allow(dead_code)]
-pub(crate) fn inc_attempts() {
-    ATTEMPTS_GLOBAL.fetch_add(1, Ordering::SeqCst);
-}
-
-/// Продюсер: инкрементировать `successes` при обслуженном запросе (готовый снимок
-/// ЛИБО продвижение проекции).
-#[allow(dead_code)]
-pub(crate) fn inc_successes() {
-    SUCCESSES_GLOBAL.fetch_add(1, Ordering::SeqCst);
-}
-
-/// Продюсер: отказ по поддержанному запросу — неготов, перегрузка и т.п.
-#[allow(dead_code)]
-pub(crate) fn inc_refusals_supported() {
-    REFUSALS_SUPPORTED_GLOBAL.fetch_add(1, Ordering::SeqCst);
-}
-
-/// Продюсер: отказ по заведомо неподдержанному запросу — неверный профиль,
-/// неразрешённый инструмент и т.п.
-#[allow(dead_code)]
-pub(crate) fn inc_refusals_unsupported() {
-    REFUSALS_UNSUPPORTED_GLOBAL.fetch_add(1, Ordering::SeqCst);
-}
-
-/// Продюсер: прочитано байт полезной нагрузки.
-#[allow(dead_code)]
-pub(crate) fn add_journal_payload_bytes(bytes: u64) {
-    JOURNAL_BYTES_GLOBAL.fetch_add(bytes, Ordering::SeqCst);
-}
-
-/// Продюсер: текущее число занятых слотов.
-#[allow(dead_code)]
-pub(crate) fn set_slots_in_flight(n: u64) {
     SLOTS_IN_FLIGHT_GLOBAL.store(n, Ordering::SeqCst);
 }
 

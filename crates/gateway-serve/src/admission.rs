@@ -425,7 +425,6 @@ impl Drop for SlotGuard {
         let prev_global = crate::metrics::SLOTS_IN_FLIGHT_GLOBAL.load(Ordering::SeqCst);
         let next_global = prev_global.saturating_sub(1);
         crate::metrics::SLOTS_IN_FLIGHT_GLOBAL.store(next_global, Ordering::SeqCst);
-        crate::metrics::set_local_slots_for_testing(prev_local as u64);
         let _ = (prev_local, prev_global, next_global);
     }
 }
@@ -470,7 +469,6 @@ impl ServingSlots {
                 Ok(_) => {
                     let new_local = cur + 1;
                     let _ = crate::metrics::SLOTS_IN_FLIGHT_GLOBAL.fetch_add(1, Ordering::SeqCst);
-                    crate::metrics::set_local_slots_for_testing(new_local as u64);
                     let _ = (cur, new_local);
                     return Some(SlotGuard {
                         local: std::sync::Arc::clone(&self.local),
