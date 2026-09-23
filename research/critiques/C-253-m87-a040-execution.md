@@ -119,8 +119,9 @@ error[E0560]: AdmissionPolicy has no field `max_tail_events`
 error[E0560]: AdmissionPolicy has no field `expected_warmup_events`
 exit=101
 
-$ bash scripts/verify_M-87.sh | grep 'A-040'
+$ bash scripts/verify_M-87.sh
 FAIL  A-040: перечень харнесса недоступен — предмет не собирается (ожидаемо до задач 12-13)
+VERDICT: FAIL
 exit=1
 
 $ git diff --exit-code -- crates/gateway-serve/tests/red_m87_entrypoint.rs crates/gateway-serve/tests/m87_registry/mod.rs
@@ -155,8 +156,8 @@ exit=0
   После возврата registry-suite зелёный. Не переоткрывай класс парсера, не меняй A-040
   threshold/anchor/mutations/limits. Закоммить и запушь; затем передай critic круг 9.
   ```
-- Push-статус: pending this verdict commit to origin/feat/M-87-serving-circuit-breaker
-- ⏸ кэш оставлен — дерево нужно до конца круга
+- Push-статус: ✅ pushed to origin/feat/M-87-serving-circuit-breaker at 7a3639c
+- ✅ кэш убран — `/tmp/hft-critic-m87-r8/target` удалён после push
 
 ## §E — Риски / открытые вопросы
 - R8-1 оставляет доказательство `GW-I-9(б)` зависимым от дисциплины автора, хотя A-040 требовал механическую связь строки и функции.
