@@ -4126,27 +4126,49 @@ pub mod checkpoint {
         let mut final_cursor = base_cursor;
         let mut first_folded_seq: u64 = history_start_seq; // None-ветка: остаётся 0; Some: уже выставлен
         let mut consumed = 0_usize;
-        let mut stream = journal::stream_from(dir, filter.clone(), base_cursor.upto_seq)?;
-        for event in &mut stream {
-            let event = event?;
-            if !upto.includes(event.seq) {
-                break;
+        // M-87 (задача 17, §14.1septies): если strict `stream_from` упал с CRC-ошибкой
+        // (InvalidData) — НЕ пробрасываем ошибку, а возвращаем успех с курсором,
+        // ОСТАНОВЛЕННЫМ на последнем успешно свёрнутом событии. Это даёт чекпоинт
+        // со СТАРОЙ историей, а прод-путь на готовность (`readiness`) отвечает
+        // `NotReady` — лаг больше бюджета. Прямой смысл: сегмент с испорченной
+        // полезной нагрузкой не разрушает всю предшествующую историю (её
+        // чекпоинт содержит), а продолжение за ней ВЫКЛЮЧЕНО (мы не доверяем
+        // кадрам после испорченного фрейма — могли быть потеряны события).
+        // Только на CRC-ошибке: gap/монотонность/прочие остаются отказом (защита
+        // данных, GW-I-12, `red_checkpoint_bootstrap_truncated`).
+        let stream_result: io::Result<()> = (|| {
+            let mut stream = journal::stream_from(dir, filter.clone(), base_cursor.upto_seq)?;
+            for event in &mut stream {
+                let event = event?;
+                if !upto.includes(event.seq) {
+                    break;
+                }
+                reducer.apply(&event);
+                consumed += 1;
+                // M-48 (VB-I-11): первый `apply` в None-ветке — это первое реально
+                // свёрнутое событие журнала. `base_cursor == START` гарантирует, что
+                // его seq — самый ранний доступный (`first_visible_seq`, корректный
+                // даже при legacy — см. `journal::stream_from` / TD-030 защиту).
+                // В Some-ветке `first_folded_seq` уже равен `history_start_seq` из
+                // старого чекпоинта (D2 сохраняем). Детектируем «первый `apply`» по
+                // счётчику `consumed == 1` (НЕ по значению 0 — это амбигуозно: 0
+                // корректное значение seq на полном журнале, см.
+                // `advance_after_covered_prune_does_not_regress_history_start`).
+                if base_cursor == Cursor::START && consumed == 1 {
+                    first_folded_seq = event.seq;
+                }
+                final_cursor = Cursor::at(event.seq);
             }
-            reducer.apply(&event);
-            consumed += 1;
-            // M-48 (VB-I-11): первый `apply` в None-ветке — это первое реально
-            // свёрнутое событие журнала. `base_cursor == START` гарантирует, что
-            // его seq — самый ранний доступный (`first_visible_seq`, корректный
-            // даже при legacy — см. `journal::stream_from` / TD-030 защиту).
-            // В Some-ветке `first_folded_seq` уже равен `history_start_seq` из
-            // старого чекпоинта (D2 сохраняем). Детектируем «первый `apply`» по
-            // счётчику `consumed == 1` (НЕ по значению 0 — это амбигуозно: 0
-            // корректное значение seq на полном журнале, см.
-            // `advance_after_covered_prune_does_not_regress_history_start`).
-            if base_cursor == Cursor::START && consumed == 1 {
-                first_folded_seq = event.seq;
+            Ok(())
+        })();
+        if let Err(e) = stream_result {
+            if e.kind() != io::ErrorKind::InvalidData {
+                return Err(e);
             }
-            final_cursor = Cursor::at(event.seq);
+            // CRC-ошибка: курсор УЖЕ стоит на последнем успешном событии
+            // (`final_cursor` обновляется внутри цикла выше, до ошибки). Просто
+            // выходим с тем, что есть — `consumed > 0` гарантирует, что чекпоинт
+            // будет записан с прогрессом, а `readiness` ответит `NotReady` по лагу.
         }
         let (history_start_seq, history_truncated) = if base_cursor == Cursor::START {
             // None-ветка: провенанс из первого свёрнутого события.
