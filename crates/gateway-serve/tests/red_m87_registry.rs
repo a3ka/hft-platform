@@ -23,67 +23,74 @@ use m87_registry::{Request, EXPECTED_WARMUP_EVENTS, MAX_TAIL_EVENTS, REGISTRY};
 /// или собрал бы не то. Прецедент — `crates/venue-hyperliquid/tests/red_provenance_md_only.rs`.
 const SUBJECT_SRC: &str = include_str!("red_m87_entrypoint.rs");
 
-/// Распознан ли атрибут как ТЕСТОВЫЙ.
+/// Исход классификации атрибута. Исходов ДВА: распознан или отказ — третьего нет.
 ///
-/// `C-251`: прежний парсер знал ровно две формы — `#[test]` и `#[tokio::test…]` — и всё
-/// остальное молча считал НЕ тестом. Условный атрибут `#[cfg_attr(test, tokio::test)]`
-/// законен, объявляет тест и проходил мимо биекции БЕЗ следа: сценарий под ним не попадал
-/// ни в найденные, ни в требуемые, и реестр «покрывал» файл, не покрывая его.
-///
-/// Лечение — не добавить третью форму в список (список снова окажется неполным), а
-/// РАЗДЕЛИТЬ три исхода: распознан, НЕ похож на тест, похож на тест но не распознан.
-/// Третий исход — отказ, а не молчание (`testing.md`, целостность гейта: гейт обязан
-/// наблюдать ОТСУТСТВИЕ, а не только сбой).
+/// `A-040` §Q3(б): прежний `SuspiciousTest` был ЧЁРНЫМ списком («похоже на тест, но не
+/// знаю такого»), а чёрный список не сходится ни сегодня, ни завтра — круг 6 добавил
+/// `cfg_attr`, круг 7 нашёл `quickcheck`, и следующая форма нашлась бы так же. Список
+/// ИНВЕРТИРОВАН: разрешено ровно то, что стоит в файле сегодня, всё прочее — FAIL.
 #[derive(PartialEq, Eq, Debug)]
 enum Attr {
-    /// Распознанная тестовая форма.
+    /// Распознанная форма объявления теста.
     Test,
-    /// Атрибут, упоминающий `test`, но не распознанный — повод ОТКАЗАТЬ, а не пропустить.
-    SuspiciousTest,
-    /// К тестам отношения не имеет.
-    Other,
+    /// Разрешённый НЕ-тестовый атрибут (сегодня это только `cfg`).
+    AllowedNonTest,
+    /// Не атрибут вовсе.
+    NotAttr,
+    /// Голова вне белого списка — ОТКАЗ с именем строки, а не догадка.
+    Refused,
 }
+
+/// Белый список ГОЛОВ атрибутов. Ровно те три, что есть в предмете на этой ревизии
+/// (замер `A-040`: 5 `cfg`, 1 `test`, 14 `tokio::test`). Расширение — единственная
+/// разрешённая будущая правка, и только вместе с пробой.
+const ALLOWED_ATTR_HEADS: &[&str] = &["test", "tokio::test", "cfg"];
 
 fn classify_attr(line: &str) -> Attr {
     let t = line.trim_start();
     let Some(inner) = t.strip_prefix("#[") else {
-        return Attr::Other;
+        return Attr::NotAttr;
     };
-    // ГОЛОВА атрибута — имя до скобки: именно она объявляет, ЧЕМ является элемент ниже.
-    // Разбор по голове, а не по вхождению подстроки: `#[cfg(feature = "testing")]` содержит
-    // «test», но НИЧЕГО не объявляет — это предикат сборки. Прежняя редакция этого стража
-    // ловила его как подозрительный и краснела на исправном файле (поймано прогоном здесь же).
     let head: String = inner
         .chars()
         .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == ':')
         .collect();
-    let body = inner;
-
-    // Распознанные формы объявления теста.
-    if head == "test" || head.ends_with("::test") {
-        return Attr::Test;
+    match head.as_str() {
+        "test" | "tokio::test" => Attr::Test,
+        "cfg" => Attr::AllowedNonTest,
+        _ => Attr::Refused,
     }
-    // `cfg`/`cfg_attr`: первый ничего не объявляет; второй МОЖЕТ объявить тест условно —
-    // и именно эту форму C-251 показал как проезжающую мимо.
-    if head == "cfg" {
-        return Attr::Other;
-    }
-    if head == "cfg_attr" && body.contains("test") {
-        return Attr::SuspiciousTest;
-    }
-    // Чужие тестовые обёртки: `rstest`, `test_case`, `tokio_test` и прочее, чего мы не знаем.
-    if head.ends_with("test") || head.starts_with("test") {
-        return Attr::SuspiciousTest;
-    }
-    Attr::Other
 }
 
-/// Атрибуты, похожие на тестовые, но не распознанные. Непустой список — отказ.
-fn suspicious_attrs_in(src: &str) -> Vec<String> {
-    src.lines()
-        .filter(|l| classify_attr(l) == Attr::SuspiciousTest)
-        .map(|l| l.trim().to_string())
-        .collect()
+/// Строки предмета, нарушающие СТИЛЕВОЙ КОНТРАКТ, внутри которого построчная выемка вообще
+/// имеет смысл. Вне контракта страж ОТКАЗЫВАЕТ, а не догадывается (`A-040` §4 п. 1).
+fn contract_violations(src: &str) -> Vec<String> {
+    let mut bad = Vec::new();
+    for (n, line) in src.lines().enumerate() {
+        let t = line.trim_start();
+        let no = n + 1;
+        if classify_attr(line) == Attr::Refused {
+            bad.push(format!("{no}: голова атрибута вне белого списка — {t}"));
+        }
+        // Атрибут и объявление на ОДНОЙ строке: построчная выемка их не связывает.
+        if t.starts_with("#[") && (t.contains("] fn ") || t.contains("] async fn ")) {
+            bad.push(format!("{no}: атрибут и fn на одной строке — {t}"));
+        }
+        // Макрос, порождающий тесты: то, чего текст не видит, текст ЗАПРЕЩАЕТ.
+        if t.starts_with("macro_rules!") {
+            bad.push(format!(
+                "{no}: macro_rules! в предмете — порождённые тесты невидимы выемке"
+            ));
+        }
+        // Блочный комментарий: `#[test]` внутри него — ложная находка, которую белый
+        // список не различит.
+        if t.contains("/*") {
+            bad.push(format!(
+                "{no}: блочный комментарий — выемка не различает код и комментарий"
+            ));
+        }
+    }
+    bad
 }
 
 /// Вынуть имена функций, идущих за распознанным тестовым атрибутом.
@@ -96,10 +103,11 @@ fn scenarios_in(src: &str) -> Vec<String> {
                 armed = true;
                 continue;
             }
-            // Прочие атрибуты между тестовым и сигнатурой законны (`#[cfg(...)]`).
-            Attr::Other if line.trim_start().starts_with("#[") => continue,
-            Attr::SuspiciousTest => continue,
-            Attr::Other => {}
+            // Разрешённый не-тестовый атрибут между тестовым и сигнатурой (`#[cfg(...)]`).
+            Attr::AllowedNonTest => continue,
+            // Отказ разбирается стражем контракта; здесь такую строку просто не читаем.
+            Attr::Refused => continue,
+            Attr::NotAttr => {}
         }
         if !armed {
             continue;
@@ -126,33 +134,62 @@ fn scenarios_in_subject() -> Vec<String> {
     scenarios_in(SUBJECT_SRC)
 }
 
-/// FAIL-CLOSED НА НЕРАСПОЗНАННУЮ ФОРМУ (`C-251`).
+/// СТРАЖ СТИЛЕВОГО КОНТРАКТА (`A-040` §Q3 п. 2, §4 п. 1).
 ///
-/// Парсер, знающий закрытый список форм, слеп к любой шестнадцатой — и молчит об этом.
-/// Здесь он обязан ОТКАЗАТЬ: неизвестная тестовая форма в файле предмета означает, что
-/// биекция ниже считает не всё множество, а её зелёный цвет ничего не стоит.
+/// Три захода в один механизм (круг 6 — `cfg_attr`, круг 7 — `quickcheck` и вложенное
+/// отрицание) показали не отдельные промахи, а неверный уровень: чёрный список форм не
+/// сходится. Список инвертирован — разрешено ровно то, что в файле есть, остальное ОТКАЗ.
+///
+/// Страж проверяет не полноту (её истина — перечень харнесса, шаг `A-040` в приёмке), а
+/// то, что файл остаётся в форме, где построчная выемка вообще что-то значит.
 #[test]
-fn r0b_unrecognised_test_attribute_is_refused_not_ignored() {
-    let found = suspicious_attrs_in(SUBJECT_SRC);
+fn r0b_subject_stays_inside_the_parsing_contract() {
+    let bad = contract_violations(SUBJECT_SRC);
     assert!(
-        found.is_empty(),
-        "в файле предмета есть атрибуты, ПОХОЖИЕ на тестовые, но не распознанные: {found:?}. \
-         Пока форма не распознана, сценарий под ней не попадает ни в найденные, ни в \
-         требуемые — реестр «покрывает» файл, не покрывая его (C-251)"
+        bad.is_empty(),
+        "предмет вышел за стилевой контракт разбора:\n  {}\nВне контракта построчная \
+         выемка не значит ничего, и её зелёный цвет — видимость. Расширять белый список \
+         можно ТОЛЬКО вместе с пробой (A-040 §4 п. 5)",
+        bad.join("\n  ")
     );
 
-    // АНТИ-ПЛАЦЕБО ЗДЕСЬ ЖЕ: страж обязан ловить ровно ту форму, которой он не знал.
-    // Без этой проверки «список пуст» означало бы лишь, что смотреть научились не туда.
-    let synthetic = "#[cfg_attr(test, tokio::test)]\nasync fn sneaky_scenario() {}\n";
-    assert_eq!(
-        suspicious_attrs_in(synthetic).len(),
-        1,
-        "страж НЕ УВИДЕЛ условный тестовый атрибут — ровно тот обход, который нашёл C-251"
-    );
+    // Каждый распознанный тестовый атрибут обязан быть ПОТРЕБЛЁН объявлением `fn` — это и
+    // есть setup-страж «найдено ровно столько, сколько атрибутов» (`A-039` §Q2 п. 3),
+    // которого в биекции не было: она сверяла реестр с найденным, а не найденное с числом
+    // атрибутов.
+    let attrs = SUBJECT_SRC
+        .lines()
+        .filter(|l| classify_attr(l) == Attr::Test)
+        .count();
+    let found = scenarios_in_subject();
     assert!(
-        scenarios_in(synthetic).is_empty(),
-        "парсер вынул имя из нераспознанной формы — тогда отказ выше не нужен, а поведение \
-         двусмысленно: форма либо распознана, либо отвергнута, третьего не дано"
+        attrs > 0,
+        "setup-страж: тестовых атрибутов не найдено вовсе"
+    );
+    assert_eq!(
+        found.len(),
+        attrs,
+        "тестовых атрибутов {attrs}, а имён вынуто {} — часть атрибутов не потреблена \
+         объявлением, и выемка считает не всё множество. Найдено: {found:?}",
+        found.len()
+    );
+
+    // АНТИ-ПЛАЦЕБО: страж обязан отвергать ровно те формы, на которых ломались круги 6 и 7.
+    for form in [
+        "#[cfg_attr(test, tokio::test)]\nasync fn sneaky() {}\n",
+        "#[quickcheck]\nfn prop_something(x: u8) -> bool { true }\n",
+        "#[rstest]\nfn parametrised() {}\n",
+    ] {
+        assert!(
+            !contract_violations(form).is_empty(),
+            "страж ПРОПУСТИЛ форму вне белого списка: {form:?} — чёрный список вернулся"
+        );
+    }
+    // И НЕ отвергать законное: ложное срабатывание — такая же находка.
+    assert!(
+        contract_violations("#[cfg(feature = \"testing\")]\n#[tokio::test]\nasync fn ok() {}\n")
+            .is_empty(),
+        "страж отверг законную форму — он краснел бы на исправном файле"
     );
 }
 
@@ -380,14 +417,29 @@ fn expects_snapshot(body: &str) -> bool {
     let mut rest = body;
     while let Some(i) = rest.find("assert_ne!") {
         cleaned.push_str(&rest[..i]);
-        // Конец макро-вызова: строка вида `    );` на своём уровне.
         let tail = &rest[i..];
-        match tail.find("\n    );") {
-            Some(j) => rest = &tail[j + 7..],
-            None => {
-                rest = "";
-                break;
-            }
+
+        // ОДНОСТРОЧНАЯ ФОРМА: `assert_ne!(a, b);` — конец на той же строке.
+        let first_line_end = tail.find('\n').unwrap_or(tail.len());
+        let first_line = &tail[..first_line_end];
+        if first_line.trim_end().ends_with(");") {
+            rest = &tail[first_line_end..];
+            continue;
+        }
+
+        // МНОГОСТРОЧНАЯ: конец — `);` на ОТСТУПЕ ОТКРЫВАЮЩЕЙ строки, а не на четырёх
+        // пробелах (`A-040` P4: вложенное отрицание имеет больший отступ, и поиск
+        // фиксированного отступа обрывал вырезание не там).
+        let indent: String = rest[..i].chars().rev().take_while(|c| *c == ' ').collect();
+        let closer = format!("\n{indent});");
+        match tail.find(&closer) {
+            Some(k) => rest = &tail[k + closer.len()..],
+            None => panic!(
+                "разборщик ожиданий: у `assert_ne!` не найден конец на отступе {} — форма \
+                 вне объявленной грамматики. Молча отбросить остаток нельзя: именно так \
+                 текстовая канарейка превращается в видимость (A-040 §Q3 п. 4)",
+                indent.len()
+            ),
         }
     }
     cleaned.push_str(rest);
@@ -441,17 +493,81 @@ fn r6_request_class_matches_scenario_expectation() {
 /// сверка класса с ожиданием была бы тавтологией.
 #[test]
 fn r6b_expectation_parser_distinguishes_assertion_from_its_negation() {
+    // (1) многострочное положительное
     let positive =
         "    assert_eq!(\n        msg.get(\"type\"),\n        Some(\"snapshot\"),\n    );\n";
+    // (2) многострочное отрицание
     let negative =
         "    assert_ne!(\n        msg.get(\"type\"),\n        Some(\"snapshot\"),\n    );\n";
+    // (3) ВЛОЖЕННОЕ отрицание — `A-040` P4: отступ больше четырёх пробелов
+    let nested = "        assert_ne!(\n            msg.get(\"type\"),\n            Some(\"snapshot\"),\n        );\n";
+    // (4) ОДНОСТРОЧНОЕ отрицание — `A-040` P5
+    let one_line = "    assert_ne!(t, Some(\"snapshot\"));\n";
+
     assert!(
         expects_snapshot(positive),
-        "разборщик не увидел ПОЛОЖИТЕЛЬНОГО ожидания снимка"
+        "не увидено ПОЛОЖИТЕЛЬНОЕ ожидание снимка"
+    );
+    assert!(!expects_snapshot(negative), "отрицание принято за ожидание");
+    assert!(
+        !expects_snapshot(nested),
+        "ВЛОЖЕННОЕ отрицание принято за ожидание — поиск конца по фиксированному отступу \
+         вернулся (A-040 P4)"
     );
     assert!(
-        !expects_snapshot(negative),
-        "разборщик принял ОТРИЦАНИЕ за ожидание — сверка класса стала бы тавтологией \
-         (поймано прогоном на c5_entry_refusal_does_not_substitute_parameters)"
+        !expects_snapshot(one_line),
+        "ОДНОСТРОЧНОЕ отрицание принято за ожидание (A-040 P5)"
+    );
+    // Положительное ПОСЛЕ каждого отрицания обязано остаться видимым: вырезание не имеет
+    // права съедать хвост.
+    assert!(
+        expects_snapshot(&format!("{nested}{positive}")),
+        "после вложенного отрицания положительное ожидание потеряно — вырезание съело хвост"
+    );
+    assert!(
+        expects_snapshot(&format!("{one_line}{positive}")),
+        "после однострочного отрицания положительное ожидание потеряно"
+    );
+}
+
+/// СВЯЗЬ «СТРОКА ↔ ФУНКЦИЯ» — МЕХАНИЗМ, А НЕ ДИСЦИПЛИНА (`A-040` §Q3 п. 3, P6).
+///
+/// Довод «драйвер паникует на незарегистрированном имени» верен для СТРОКИ и неверен для
+/// ФУНКЦИИ: сценарий `foo` может передать драйверу литерал `"bar"`, и паники не будет —
+/// строка `bar` существует. Тогда фикстуру строит ЧУЖАЯ строка, а реестр выглядит
+/// согласованным. Проверяется равенством литерала имени сценария — точная операция под
+/// стилевым контрактом стража выше.
+#[test]
+fn r7_driver_literal_equals_scenario_name() {
+    let drivers = ["serve_for(", "ckpt_from_registry(", "registry_tail("];
+    let mut checked = 0usize;
+    for (name, _) in REGISTRY {
+        let body = body_of(name);
+        for d in drivers {
+            let mut from = 0usize;
+            while let Some(i) = body[from..].find(d) {
+                let at = from + i + d.len();
+                let tail = &body[at..];
+                // Первый строковый литерал вызова.
+                let Some(q1) = tail.find('"') else { break };
+                let Some(q2) = tail[q1 + 1..].find('"') else {
+                    break;
+                };
+                let lit = &tail[q1 + 1..q1 + 1 + q2];
+                assert_eq!(
+                    lit, *name,
+                    "«{name}» передаёт драйверу {d} литерал «{lit}» — фикстуру строит ЧУЖАЯ \
+                     строка реестра. Паника драйвера этого НЕ ловит: строка «{lit}» \
+                     существует, и реестр выглядит согласованным (A-040 P6)"
+                );
+                checked += 1;
+                from = at;
+            }
+        }
+    }
+    assert!(
+        checked >= 3,
+        "setup-страж: проверено {checked} вызовов драйвера — меньше трёх известных, \
+         значит поиск смотрит не туда и страж зеленел бы на пустоте"
     );
 }
