@@ -363,6 +363,24 @@ else
   printf '%s\n' "$ADDP_OUT" | grep -E '^(error|thread |снимок|целый)' | head -6
 fi
 
+# ─────── круг `R-200` §B6 — ТОЧКА ВХОДА ПРОД-БИНАРЯ ИСПОЛНЯЕТСЯ, а не компилируется ───────
+# Задача 14 была предъявлена только сборкой. Написание оракула немедленно вскрыло, что за этим
+# пряталось: `admission_policy_from_env` требует ПЯТЬ переменных как обязательные, и НИ ОДНОЙ
+# из них нет в `docker-compose.yml` — после выкатки сервис выдачи не поднялся бы вообще
+# (замер: `EXIT=2`, `policy error: GATEWAY_ALLOWED_SYMBOLS must be set`).
+# Бинарь обязан быть СОБРАН до прогона: оракул ИСПОЛНЯЕТ границу процесса, а не проверяет
+# наличие файла (`testing.md` §«Механизм несущего пути обязан иметь оракул точки входа»).
+cargo build -q -p gateway-serve --bin gateway-serve 2>/dev/null
+ENTRY_OUT=$(cargo test -p gateway-serve --test red_m87_prod_entrypoint_argv 2>&1)
+ENTRY_RC=$?
+ENTRY_LINE=$(printf '%s\n' "$ENTRY_OUT" | grep -E '^test result' | tail -1)
+if [ $ENTRY_RC -eq 0 ]; then
+  pass "task14: прод-бинарь поднимается на окружении ИЗ compose — ${ENTRY_LINE:-GREEN}"
+else
+  fail "task14: red_m87_prod_entrypoint_argv КРАСЕН — ${ENTRY_LINE:-компиляция}"
+  printf '%s\n' "$ENTRY_OUT" | grep -E '^(error|thread |docker-compose|прод-бинарь|порог)' | head -6
+fi
+
 # ─────────────── паритет с CI ───────────────
 if cargo fmt --all -- --check >/dev/null 2>&1; then
   pass "CI-паритет: cargo fmt --all -- --check"
