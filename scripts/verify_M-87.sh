@@ -381,6 +381,34 @@ else
   printf '%s\n' "$ENTRY_OUT" | grep -E '^(error|thread |docker-compose|прод-бинарь|порог)' | head -6
 fi
 
+# ─────── круг `R-200` §B7 — ПЯТЬ условий `R-196`, проверяемых ПО РАБОТЕ, а не по имени ───────
+# Главное в находке §B7 — не сами пять условий, а приписка «гейт зелен при всех пяти»: шаги
+# задач 4/5/6/8 были грепами ИМЕНИ, а присутствие имени и работа механизма — разные
+# утверждения. Тот же класс дважды стоил круга (моя канарейка задачи 20 считала упоминания,
+# одно из которых было импортом). Лекарство одно: проверять ВЫЗОВ либо ПОВЕДЕНИЕ.
+COND_OUT=$(cargo test -p gateway-serve --test red_m87_r196_conditions 2>&1)
+COND_RC=$?
+COND_LINE=$(printf '%s\n' "$COND_OUT" | grep -E '^test result' | tail -1)
+if [ $COND_RC -eq 0 ]; then
+  pass "task16: четыре условия R-196 (fail-closed без слепка · счётчик · бюджет · метаданные) — ${COND_LINE:-GREEN}"
+else
+  fail "task16: red_m87_r196_conditions КРАСЕН — ${COND_LINE:-компиляция}"
+  printf '%s\n' "$COND_OUT" | grep -E '^(error|thread |счётчик|развёртывание|`feed_tail|ручное)' | head -6
+fi
+
+# Пятое условие — ОТДЕЛЬНЫМ бинарём: глобальный счётчик слотов ПРОЦЕССНЫЙ, и в общем бинаре
+# соседи брали бы слоты параллельно, превращая замер во флак (`testing.md` §Целостность гейта,
+# свойство 2: гейт меряет СВОЙ инвариант, не окружение).
+RACE_OUT=$(cargo test -p gateway-serve --test red_m87_slot_counter_race 2>&1)
+RACE_RC=$?
+RACE_LINE=$(printf '%s\n' "$RACE_OUT" | grep -E '^test result' | tail -1)
+if [ $RACE_RC -eq 0 ]; then
+  pass "task16: глобальный счётчик слотов не теряет декременты под гонкой — ${RACE_LINE:-GREEN}"
+else
+  fail "task16: red_m87_slot_counter_race КРАСЕН — ${RACE_LINE:-компиляция}"
+  printf '%s\n' "$RACE_OUT" | grep -E '^(error|thread |ГЛОБАЛЬНЫЙ|SETUP)' | head -4
+fi
+
 # ─────────────── паритет с CI ───────────────
 if cargo fmt --all -- --check >/dev/null 2>&1; then
   pass "CI-паритет: cargo fmt --all -- --check"
