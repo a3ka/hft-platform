@@ -147,15 +147,28 @@ if [ $HL_RC -ne 0 ]; then
   fail "A-040: перечень харнесса недоступен — предмет не собирается (ожидаемо до задач 12-13)"
 else
   HARNESS=$(printf '%s\n' "$HL_OUT" | sed -n 's/^\([a-z0-9_]*\): test$/\1/p' | sort -u)
-  REG=$(sed -n 's/^ *"\([a-z0-9_]*\)",$/\1/p' crates/gateway-serve/tests/m87_registry/mod.rs | sort -u)
-  ONLY_H=$(comm -23 <(printf '%s\n' "$HARNESS") <(printf '%s\n' "$REG"))
-  ONLY_R=$(comm -13 <(printf '%s\n' "$HARNESS") <(printf '%s\n' "$REG"))
-  if [ -z "$ONLY_H" ] && [ -z "$ONLY_R" ] && [ -n "$HARNESS" ]; then
-    pass "A-040: биекция харнесса — перечни совпали ($(printf '%s\n' "$HARNESS" | wc -l) сценариев)"
+  # Реестр тоже спрашивается у ПРОГРАММЫ, а не разбирается как текст. Первая редакция
+  # вынимала строки `sed`'ом (`^ *"\(...\)",$`) — второй парсер, ровно тот класс, который
+  # арбитр `A-040` и велел убрать, и он немедленно ошибся: однострочная запись
+  # `("name", &[]),` под выражение не попадала, реестр отдавался короче на строку, и
+  # биекция краснела на ИСПРАВНОМ предмете.
+  REG_OUT=$(cargo test -p gateway-serve --test red_m87_registry -- --exact --nocapture \
+            r8_registry_rows_are_printed_for_the_gate 2>&1)
+  REG_RC=$?
+  REG=$(printf '%s\n' "$REG_OUT" | sed -n 's/^M87-REGISTRY-ROW: \([a-z0-9_]*\)$/\1/p' | sort -u)
+  if [ $REG_RC -ne 0 ] || [ -z "$REG" ]; then
+    fail "A-040: выдача реестра недоступна (rc=$REG_RC) — сводить биекцию не с чем"
+    printf '%s\n' "$REG_OUT" | grep -E '^(error|thread )' | head -4
   else
-    fail "A-040: биекция харнесса НЕ сошлась"
-    [ -n "$ONLY_H" ] && printf '      только у харнесса: %s\n' "$(echo $ONLY_H)"
-    [ -n "$ONLY_R" ] && printf '      только в реестре:  %s\n' "$(echo $ONLY_R)"
+    ONLY_H=$(comm -23 <(printf '%s\n' "$HARNESS") <(printf '%s\n' "$REG"))
+    ONLY_R=$(comm -13 <(printf '%s\n' "$HARNESS") <(printf '%s\n' "$REG"))
+    if [ -z "$ONLY_H" ] && [ -z "$ONLY_R" ] && [ -n "$HARNESS" ]; then
+      pass "A-040: биекция харнесса — перечни совпали ($(printf '%s\n' "$HARNESS" | wc -l) сценариев)"
+    else
+      fail "A-040: биекция харнесса НЕ сошлась"
+      [ -n "$ONLY_H" ] && printf '      только у харнесса: %s\n' "$(echo $ONLY_H)"
+      [ -n "$ONLY_R" ] && printf '      только в реестре:  %s\n' "$(echo $ONLY_R)"
+    fi
   fi
 fi
 

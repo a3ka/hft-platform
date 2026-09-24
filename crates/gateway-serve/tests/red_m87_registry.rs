@@ -34,9 +34,9 @@ enum Attr {
     /// Распознанная форма объявления теста.
     Test,
     /// Разрешённый НЕ-тестовый атрибут (сегодня это только `cfg`).
-    AllowedNonTest,
+    AllowedOther,
     /// Не атрибут вовсе.
-    NotAttr,
+    NotAnAttribute,
     /// Голова вне белого списка — ОТКАЗ с именем строки, а не догадка.
     Refused,
 }
@@ -49,16 +49,22 @@ const ALLOWED_ATTR_HEADS: &[&str] = &["test", "tokio::test", "cfg"];
 fn classify_attr(line: &str) -> Attr {
     let t = line.trim_start();
     let Some(inner) = t.strip_prefix("#[") else {
-        return Attr::NotAttr;
+        return Attr::NotAnAttribute;
     };
     let head: String = inner
         .chars()
         .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == ':')
         .collect();
+    // Белый список — ЕДИНСТВЕННЫЙ источник разрешённых голов. Прежде он был объявлен
+    // константой, а решение принимал `match` по литералам: две копии одного правила, и
+    // линтер справедливо назвал константу мёртвой. Копия, которая ничего не решает, — не
+    // документация, а ложь о механизме (класс `TD-138`).
+    if !ALLOWED_ATTR_HEADS.contains(&head.as_str()) {
+        return Attr::Refused;
+    }
     match head.as_str() {
         "test" | "tokio::test" => Attr::Test,
-        "cfg" => Attr::AllowedNonTest,
-        _ => Attr::Refused,
+        _ => Attr::AllowedOther,
     }
 }
 
@@ -104,10 +110,10 @@ fn scenarios_in(src: &str) -> Vec<String> {
                 continue;
             }
             // Разрешённый не-тестовый атрибут между тестовым и сигнатурой (`#[cfg(...)]`).
-            Attr::AllowedNonTest => continue,
+            Attr::AllowedOther => continue,
             // Отказ разбирается стражем контракта; здесь такую строку просто не читаем.
             Attr::Refused => continue,
-            Attr::NotAttr => {}
+            Attr::NotAnAttribute => {}
         }
         if !armed {
             continue;
@@ -283,10 +289,11 @@ fn r2_threshold_is_consistent_with_every_registered_request() {
 /// бы отказом СТАРТА вместо свежести (`C-248` R4-1). Число мутации печатает тест.
 #[test]
 fn r3_valid_mutation_window_exists_and_is_printed() {
-    assert!(
-        EXPECTED_WARMUP_EVENTS <= MAX_TAIL_EVENTS,
-        "сама политика невалидна: опора {EXPECTED_WARMUP_EVENTS} выше порога {MAX_TAIL_EVENTS}"
-    );
+    // Сравнение двух КОНСТАНТ линтер справедливо зовёт «ассертом с постоянным значением»:
+    // оно решается при компиляции и в рантайме ничего не проверяет. Смысл его, однако,
+    // есть — зафиксировать, что пара значений согласована; поэтому оно и предъявляется как
+    // факт компиляции, а не как ассерт.
+    const _POLICY_IS_VALID: () = assert!(EXPECTED_WARMUP_EVENTS <= MAX_TAIL_EVENTS);
 
     let max_served = REGISTRY
         .iter()
@@ -628,5 +635,28 @@ fn r7_driver_argument_is_a_literal_equal_to_scenario_name() {
     assert!(
         driver_violations("c9_probe", honest).is_empty(),
         "честный вызов с прямым литералом отвергнут — страж краснел бы на исправном коде"
+    );
+}
+
+/// ВЫДАЧА РЕЕСТРА ДЛЯ ГЕЙТА — МАШИНОЙ, А НЕ РАЗБОРОМ ИСХОДНИКА.
+///
+/// Шаг `A-040` в `verify_M-87.sh` сводит перечень харнесса с перечнем реестра. Перечень
+/// харнесса он берёт у харнесса (`--list`), а реестр до этого круга вынимал `sed`'ом из
+/// текста `m87_registry/mod.rs` — то есть ВТОРЫМ парсером, ровно тем, что арбитр `A-040`
+/// и велел убрать. Парсер немедленно доказал свою негодность: выражение
+/// `^ *"\(...\)",$` не матчит однострочную запись `("name", &[]),`, реестр отдавался
+/// на одну строку короче, и биекция падала на ИСПРАВНОМ предмете — ложный красный.
+///
+/// Здесь перечень печатает САМ РЕЕСТР: источник тот же, что у `r1`/`r2`, форма строки
+/// стабильна и greppable. Разойтись с фактом эта выдача не может — она и есть факт.
+#[test]
+fn r8_registry_rows_are_printed_for_the_gate() {
+    for (name, _) in REGISTRY {
+        println!("M87-REGISTRY-ROW: {name}");
+    }
+    assert!(
+        !REGISTRY.is_empty(),
+        "реестр пуст — гейт `A-040` свёл бы биекцию с пустотой и позеленел на отсутствии \
+         предмета (`gates.md` §Целостность гейта: падать против несостоявшегося setup)"
     );
 }
