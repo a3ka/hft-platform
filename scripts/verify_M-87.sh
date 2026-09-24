@@ -308,12 +308,17 @@ else
   fi
 fi
 
+# `R-200` §B5: решение по КОДУ ВОЗВРАТА, а не по тексту вывода (`gates.md` §3). Прежняя
+# редакция искала строку `test result: FAILED` грепом — то есть принимала решение по тексту, и
+# ошибка СБОРКИ (когда строки `test result` нет вовсе) читалась бы как зелёное.
 LIBOUT=$(cargo test -p gateway 2>&1)
+LIBRC=$?
 LIBSUM=$(printf '%s\n' "$LIBOUT" | grep -E '^test result' | awk '{p+=$4; f+=$6} END {print "passed="p" failed="f}')
-if printf '%s\n' "$LIBOUT" | grep -qE '^test result: FAILED'; then
-  fail "D-1(б): библиотечный корпус КРАСЕН — $LIBSUM"
+if [ $LIBRC -eq 0 ]; then
+  pass "D-1(б): библиотечный корпус зелен — ${LIBSUM:-GREEN}"
 else
-  pass "D-1(б): библиотечный корпус зелен — $LIBSUM"
+  fail "D-1(б): библиотечный корпус КРАСЕН (rc=$LIBRC) — ${LIBSUM:-сборка не прошла}"
+  printf '%s\n' "$LIBOUT" | grep -E '^(error|thread )' | head -5
 fi
 
 # ─────── круг `R-198`+ задача 20 — СБОЙ провенанса истории НЕ МОЛЧИТ (§14.1decies) ───────
@@ -331,17 +336,31 @@ else
   printf '%s\n' "$HP_OUT" | grep -E '^(error|thread |провенанс|целый)' | head -6
 fi
 
-# Канарейка ФОРМЫ: молчаливое поглощение не имеет права вернуться. Проверяется ВЫЗОВ, а не
-# слово в комментарии: `if let Ok` рядом с `current_history_provenance` в транспорте — это и
-# есть дефект; после задачи 20 оба места зовут `history_provenance_for_serve`.
-SWALLOW=$(grep -cE 'if let Ok\(.*\) *=$|if let Ok\(.*current_history_provenance' \
-          crates/gateway-serve/src/lib.rs || true)
-CHP=$(grep -c 'current_history_provenance' crates/gateway-serve/src/lib.rs || true)
-HPS=$(grep -c 'history_provenance_for_serve' crates/gateway-serve/src/lib.rs || true)
-if [ "$CHP" -eq 0 ] && [ "$HPS" -ge 2 ]; then
-  pass "task20: транспорт зовёт ТОЛЬКО fail-closed обёртку (вызовов: $HPS)"
+# Канарейка ФОРМЫ. Первая редакция считала УПОМИНАНИЯ ИМЕНИ, и это был дефект того самого
+# класса, который милестоун ловит: из трёх упоминаний одно — импорт, поэтому порог «≥2»
+# выполнялся при ОДНОМ живом вызове. Найдено ревьюером мутацией (`R-200` §B4): вызов оставлен,
+# запись признака снята — не покраснело НИЧЕГО. Теперь считаются ВЫЗОВЫ (имя со скобкой), а
+# строка импорта исключена явно — своё же требование «проверка по ВЫЗОВУ, а не по присутствию
+# имени» канарейка обязана исполнять, а не только предъявлять другим.
+HPS=$(grep -cE 'history_provenance_for_serve\(' crates/gateway-serve/src/lib.rs || true)
+CHP=$(grep -cE 'current_history_provenance\(' crates/gateway-serve/src/lib.rs || true)
+SITES=$(grep -cE '(snap|s)\.history_truncated *=' crates/gateway-serve/src/lib.rs || true)
+if [ "$CHP" -eq 0 ] && [ "$HPS" -eq 2 ] && [ "$SITES" -eq 2 ]; then
+  pass "task20: оба сайта зовут fail-closed обёртку (вызовов: $HPS, записей признака: $SITES)"
 else
-  fail "task20: в транспорте осталось $CHP прямых вызовов current_history_provenance при $HPS обёртки — молчаливое поглощение возможно"
+  fail "task20: вызовов обёртки $HPS (нужно РОВНО 2), прямых вызовов current_history_provenance $CHP (нужно 0), записей признака $SITES (нужно 2) — молчаливое поглощение или потеря сайта возможны"
+fi
+
+# Оракул ВТОРОГО сайта — путь подписки (`handle_v1_message`). Покрытие legacy-пути на него не
+# переносится: `o6` судит ПЕРВОЕ сообщение соединения, а клиент выбирает инструмент подпиской.
+ADDP_OUT=$(cargo test -p gateway-serve --test red_m87_provenance_on_add_path 2>&1)
+ADDP_RC=$?
+ADDP_LINE=$(printf '%s\n' "$ADDP_OUT" | grep -E '^test result' | tail -1)
+if [ $ADDP_RC -eq 0 ]; then
+  pass "task20: честность истории на пути ПОДПИСКИ — ${ADDP_LINE:-GREEN}"
+else
+  fail "task20: red_m87_provenance_on_add_path КРАСЕН — ${ADDP_LINE:-компиляция}"
+  printf '%s\n' "$ADDP_OUT" | grep -E '^(error|thread |снимок|целый)' | head -6
 fi
 
 # ─────────────── паритет с CI ───────────────
