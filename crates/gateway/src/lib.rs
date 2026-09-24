@@ -3778,6 +3778,40 @@ pub mod checkpoint {
         };
         Ok((start_seq, truncated))
     }
+    /// M-87 (задача 20, §14.1decies): **fail-closed обвязка** над
+    /// [`current_history_provenance`] для публичного пути выдачи.
+    ///
+    /// Назначение — закрыть тот же класс, что задача 19 (§14.1nonies), только в
+    /// транспорте. Оба вызывателя в `crates/gateway-serve/src/lib.rs` были написаны как
+    /// `if let Ok((live_start, live_truncated)) = current_history_provenance(...)`, и
+    /// при `Err` перезапись `history_*` МОЛЧА пропускалась — клиенту уходило
+    /// замороженное из слепка `history_truncated=false`, ровно та ложь, ради устранения
+    /// которой и заводилась задача 17 (§14.1septies, `VB-I-11`).
+    ///
+    /// Семантика: **не знаем — не обещаем полноту** (развилка §14.1decies).
+    /// При `Ok` — возвращаем ВЫЧИСЛЕННОЕ как есть; при `Err(_)` — возвращаем
+    /// `(frozen_start_seq, true)`, то есть `start_seq` берётся ЗАМОРОЖЕННЫМ из слепка
+    /// (лучшее, что в этой ситуации известно), а `truncated=true` сообщает клиенту, что
+    /// текущая полнота истории НЕ подтверждена.
+    ///
+    /// Развилка НЕ разбирает коды ошибок поимённо: оракул
+    /// `crates/gateway/tests/red_m87_history_provenance_failclosed.rs` гоняет ДВА разных
+    /// кода (`NotADirectory=20` и `NotFound=2`) и требует ОДИН исход. Реализация,
+    /// разбирающая коды, встретит третий (например `PermissionDenied`) и снова замолчит —
+    /// тот же класс дефекта, который чинится.
+    ///
+    /// `current_history_provenance` НЕ удаляется и НЕ меняет семантику: она честная,
+    /// глотала ошибку не она.
+    pub fn history_provenance_for_serve(
+        dir: impl AsRef<Path>,
+        filter: EpochFilter,
+        frozen_start_seq: u64,
+    ) -> (u64, bool) {
+        match current_history_provenance(dir, filter) {
+            Ok(calc) => calc,
+            Err(_) => (frozen_start_seq, true),
+        }
+    }
     /// M-38b: заголовок чекпоинта — magic + версии + фингерпринты + lineage + cursor.
     /// Сериализуется как первая часть файла ДО postcard(state), чтобы при изменении
     /// формата валидация отказывала БЕЗ попытки десериализации state.

@@ -1256,20 +1256,22 @@ pub mod server {
                         ));
                     }
                     let mut snap = live.snapshot_checked()?;
-                    // M-87 (задача 17, §14.1septies): пересчитать провенанс истории
-                    // против ТЕКУЩЕГО начала журнала. `LiveReducer` хранит замороженные
-                    // из чекпоинта `history_*`; ретеншен между снятием и обслуживанием
-                    // мог удалить ранние сегменты, и `history_truncated=false` в слепке
-                    // соврёт: реплей не воспроизведёт то, что обслужено (VB-I-11).
-                    if let Ok((live_start, live_truncated)) =
-                        gateway::checkpoint::current_history_provenance(
+                    // M-87 (задача 20, §14.1decies): fail-closed обвязка над
+                    // пересчётом провенанса истории. Честная функция лежит в
+                    // `gateway::checkpoint`, но при сбое перезапись НЕ ДОЛЖНА молча
+                    // пропускаться — клиент получил бы замороженное
+                    // `history_truncated=false` из слепка, снятого до ретеншена, и счёл бы
+                    // историю полной (VB-I-11). Обвязка возвращает `truncated=true` при
+                    // ЛЮБОМ `Err(_)` и сохраняет `start_seq` из слепка как лучшее
+                    // известное значение.
+                    let (live_start, live_truncated) =
+                        gateway::checkpoint::history_provenance_for_serve(
                             &path_for_history,
                             filter_for_history.clone(),
-                        )
-                    {
-                        snap.history_start_seq = live_start;
-                        snap.history_truncated = live_truncated;
-                    }
+                            snap.history_start_seq,
+                        );
+                    snap.history_start_seq = live_start;
+                    snap.history_truncated = live_truncated;
                     Ok((
                         snap,
                         session::Sub {
@@ -1938,19 +1940,19 @@ pub mod server {
                 Ok(snap) => snap,
                 Err(e) => return Err(e),
             };
-            // M-87 (задача 17, §14.1septies): пересчитать провенанс истории против
-            // ТЕКУЩЕГО начала журнала. `LiveReducer` хранит замороженные `history_*`
-            // из чекпоинта; ретеншен между снятием и обслуживанием мог удалить ранние
-            // сегменты, и `history_truncated=false` в слепке соврёт (VB-I-11).
-            if let Ok((live_start, live_truncated)) =
-                crate::_gw::current_history_provenance(
+            // M-87 (задача 20, §14.1decies): fail-closed обвязка над пересчётом
+            // провенанса истории. При сбое вычисления клиенту уходит `truncated=true` с
+            // `start_seq` из слепка — лучшее, что известно. Молчаливое поглощение ошибки
+            // здесь вернуло бы замороженное `history_truncated=false` и соврало бы о
+            // полноте после ретеншена (VB-I-11).
+            let (live_start, live_truncated) =
+                crate::_gw::history_provenance_for_serve(
                     cfg1.journal_dir.as_path(),
                     cfg1.filter.clone(),
-                )
-            {
-                snap.history_start_seq = live_start;
-                snap.history_truncated = live_truncated;
-            }
+                    snap.history_start_seq,
+                );
+            snap.history_start_seq = live_start;
+            snap.history_truncated = live_truncated;
             let snap_msg = ServeMsg::Snapshot(snap);
             Ok((snap_msg, stats, live, at))
         })
@@ -2391,7 +2393,7 @@ pub mod server {
 #[doc(hidden)]
 pub mod _gw {
     pub use gateway::{
-        checkpoint::current_history_provenance, frames_since, snapshot, snapshot_from_checkpoint,
+        checkpoint::history_provenance_for_serve, frames_since, snapshot, snapshot_from_checkpoint,
         Cursor, Frame, LiveReducer, ReadStats, Selector, SeriesBundle, Snapshot,
         GATEWAY_SCHEMA_VERSION,
     };
