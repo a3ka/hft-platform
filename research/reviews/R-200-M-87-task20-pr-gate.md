@@ -386,7 +386,8 @@ fmt_exit=0
 clippy_exit=0
 tests_exit=0
 passed=1108 failed=0 (блоков: 252)
-$ bash scripts/verify_M-87.sh  → на момент вердикта шаг D-1(б)/паритет ещё идёт; PASS=25 FAIL=0 SKIP=1 на снятых шагах
+$ bash scripts/verify_M-87.sh ; echo exit=$?
+VERDICT: PASS   exit=0   (PASS=26 FAIL=0 SKIP=1 — те же числа, что на ветке)
 
 # ── барьеры CI на ДЕРЕВЕ СЛИЯНИЯ (EVENT_NAME=pull_request, PR_BASE_SHA=origin/main) ──
 check_protected_artifacts      exit=0
