@@ -187,8 +187,7 @@ async fn snapshot_of_subscribe(dir: &std::path::Path, ckpt: &std::path::Path) ->
         json!({"op":"subscribe","v":1,"id":SUB_ID,"selector":{
             "venue":"Binance","symbol":"BTCUSDT","timeframe_ms":1000,
             "bands":[0.001],"window_ms":60000}})
-        .to_string()
-        .into(),
+        .to_string(),
     ))
     .await
     .expect("send subscribe");
