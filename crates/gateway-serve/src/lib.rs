@@ -2812,6 +2812,126 @@ pub fn serve_config_from_env(
     })
 }
 
+/// M-87 (задача 14, §4.1 дословно): прод-бинарь поднимает сервер ЧЕРЕЗ политику.
+///
+/// `bind_with_policy` ОБЯЗАТЕЛЬНО — прод-путь не имеет отдельной семантики
+/// выдачи без политики (это ключевое требование B1: «живой путь принимает
+/// только готовое состояние»). `bind` остался для юнит-/интеграционных
+/// тестов с упрощённым флоу (`serve` в `red_m87_entrypoint.rs:365` —
+/// для entrypoint-оракулов, где политика строится из реестра, не из env).
+///
+/// **Источник значений — env (fail-closed).** Разбор переменных:
+/// - `GATEWAY_ALLOWED_SYMBOLS` — список символов через запятую. Пусто ⇒ `Err`.
+/// - `GATEWAY_ALLOWED_PROFILES` — список `timeframe_ms/window_ms/depth_cadence_ms`
+///   через запятую. `depth_cadence_ms` может быть `none`. Пусто ⇒ `Err`.
+/// - `GATEWAY_MAX_CONCURRENT_SERVES` — `usize`. Невалидное / пропущенное ⇒ `Err`.
+/// - `GATEWAY_MAX_TAIL_EVENTS` / `GATEWAY_EXPECTED_WARMUP_EVENTS` — пара, ОБЯЗАНА
+///   пройти `AdmissionPolicy::validate()`. Порог меньше опоры ⇒ `Err` на старте
+///   (задача 12, §14.1quinquies-bis).
+///
+/// **Сами значения на проде — операторская конфигурация** (`A-037` D-5):
+/// они не выводятся в спеке как числа, потому что каденция между прогревами
+/// и прод-объём журнала зависят от деплоя. Подтверждаются founder'ом при деплое.
+pub fn admission_policy_from_env(
+    get: impl Fn(&str) -> Option<String>,
+) -> Result<admission::AdmissionPolicy, String> {
+    use admission::{AdmissionPolicy, LiveProfile};
+
+    let allowed_symbols: Vec<String> = get("GATEWAY_ALLOWED_SYMBOLS")
+        .ok_or_else(|| "GATEWAY_ALLOWED_SYMBOLS must be set".to_string())?
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if allowed_symbols.is_empty() {
+        return Err("GATEWAY_ALLOWED_SYMBOLS must contain at least one symbol".to_string());
+    }
+
+    let canonical_bands: Vec<f64> = get("GATEWAY_CANONICAL_BANDS")
+        .unwrap_or_else(|| {
+            // Прод-дефолт: семь канонических полос (`П-029`, 2026-09-10).
+            "0.015,0.03,0.05,0.08,0.15,0.30,0.60".to_string()
+        })
+        .split(',')
+        .map(|s| s.trim().parse::<f64>())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("GATEWAY_CANONICAL_BANDS parse: {e}"))?;
+    if canonical_bands.is_empty() {
+        return Err("GATEWAY_CANONICAL_BANDS must contain at least one band".to_string());
+    }
+
+    let allowed_profiles: Vec<LiveProfile> = get("GATEWAY_ALLOWED_PROFILES")
+        .ok_or_else(|| "GATEWAY_ALLOWED_PROFILES must be set".to_string())?
+        .split(',')
+        .map(|s| {
+            let parts: Vec<&str> = s.trim().split('/').collect();
+            if parts.len() < 2 || parts.len() > 3 {
+                return Err(format!(
+                    "GATEWAY_ALLOWED_PROFILES entry {s:?} must be `tf/window[/cadence]`; \
+                     cadence = number или `none`"
+                ));
+            }
+            let tf: i64 = parts[0].trim().parse().map_err(|e| {
+                format!("GATEWAY_ALLOWED_PROFILES timeframe_ms parse {:?}: {e}", parts[0])
+            })?;
+            let window: i64 = parts[1].trim().parse().map_err(|e| {
+                format!("GATEWAY_ALLOWED_PROFILES window_ms parse {:?}: {e}", parts[1])
+            })?;
+            let cadence: Option<i64> = match parts.get(2).map(|s| s.trim()) {
+                Some(s) if s.eq_ignore_ascii_case("none") => None,
+                Some(s) => Some(s.parse().map_err(|e| {
+                    format!("GATEWAY_ALLOWED_PROFILES depth_cadence_ms parse {:?}: {e}", s)
+                })?),
+                None => None,
+            };
+            Ok(LiveProfile {
+                timeframe_ms: tf,
+                window_ms: window,
+                depth_cadence_ms: cadence,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    if allowed_profiles.is_empty() {
+        return Err("GATEWAY_ALLOWED_PROFILES must contain at least one profile".to_string());
+    }
+
+    let max_concurrent_serves: usize = get("GATEWAY_MAX_CONCURRENT_SERVES")
+        .ok_or_else(|| "GATEWAY_MAX_CONCURRENT_SERVES must be set".to_string())?
+        .trim()
+        .parse()
+        .map_err(|e| format!("GATEWAY_MAX_CONCURRENT_SERVES parse: {e}"))?;
+
+    let max_tail_events: u64 = get("GATEWAY_MAX_TAIL_EVENTS")
+        .ok_or_else(|| "GATEWAY_MAX_TAIL_EVENTS must be set".to_string())?
+        .trim()
+        .parse()
+        .map_err(|e| format!("GATEWAY_MAX_TAIL_EVENTS parse: {e}"))?;
+
+    let expected_warmup_events: u64 = get("GATEWAY_EXPECTED_WARMUP_EVENTS")
+        .ok_or_else(|| "GATEWAY_EXPECTED_WARMUP_EVENTS must be set".to_string())?
+        .trim()
+        .parse()
+        .map_err(|e| format!("GATEWAY_EXPECTED_WARMUP_EVENTS parse: {e}"))?;
+
+    let policy = AdmissionPolicy {
+        allowed_symbols,
+        canonical_bands,
+        allowed_profiles,
+        max_concurrent_serves,
+        max_tail_events,
+        expected_warmup_events,
+    };
+    // Круг `R-196` (задача 12, §14.1quinquies-bis): `bind_with_policy` тоже зовёт
+    // `validate`, но здесь он не вызывается — `serve_config_from_env` собирает
+    // `ServeConfig`, а политика пробрасывается через отдельный путь в main.
+    // Вызываем `validate()` САМИ здесь, чтобы недонастроенный прод падал на старте
+    // с тем же `io::ErrorKind::InvalidInput`-по-духу (через `String` Err).
+    policy
+        .validate()
+        .map_err(|msg| format!("GATEWAY policy invalid: {msg}"))?;
+    Ok(policy)
+}
+
 /// Sentinel для verify_M-28.sh — положительная канарейка «gateway-serve использует
 /// библиотеку gateway». Строковый литерал содержит литерал `gateway::` в не-comments
 /// позиции: verify-скрипт делает `sed 's://.*::' <src> | grep -qE 'gateway::'` под
