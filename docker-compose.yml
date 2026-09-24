@@ -198,6 +198,33 @@ services:
       # ОБЯЗАТЕЛЬНО задать в .env на хосте (deploy.MD §D: shared с Next.js-подписателем,
       # D6 marketplace). Без секрета bin падает с exit 2 (config-error).
       GATEWAY_JWT_SECRET: ${GATEWAY_JWT_SECRET:?GATEWAY_JWT_SECRET must be set}
+      # M-87 task #21 (`R-200` §B6): пять обязательных переменных политики допуска
+      # (`admission_policy_from_env` отказывает СТАРТУ при отсутствии любой из них — `e1`
+      # оракула точки входа). Дефолты согласованы:
+      #   * `GATEWAY_ALLOWED_SYMBOLS=BTCUSDT` — сегодняшний прод-инструмент; оператор
+      #     задаёт перечень через хост `.env` и ОБЯЗАН держать его согласованным с
+      #     `GATEWAY_SYMBOL` того же блока, иначе прод-селектор не пройдёт собственную
+      #     политику допуска (`admit` смотрит символ по `allowed_symbols`);
+      #   * `GATEWAY_ALLOWED_PROFILES=1000/60000/1000` — форма `tf/window/cadence`,
+      #     совпадает с прод-дефолтами `GATEWAY_TIMEFRAME_MS` / `GATEWAY_WINDOW_MS` /
+      #     `GATEWAY_DEPTH_CADENCE_MS` этого же блока. Покрытие обязано идти от прод-
+      #     значений, иначе прод-селектор не пройдёт собственную политику допуска (`admit`
+      #     смотрит `timeframe_ms`; `window_ms`/`cadence` — ограничения работы внутри
+      #     `LiveReducer`, проверяются отдельно);
+      #   * `GATEWAY_MAX_CONCURRENT_SERVES=4` — согласован с лимитом `cpus: "1.5"` этого
+      #     сервиса (≈2.7 одновременных tokio-задач на CPU; `4` — практический потолок для
+      #     `current_thread` рантайма, не съедающий процессы у recorder'а);
+      #   * ПАРА `GATEWAY_MAX_TAIL_EVENTS=255600` / `GATEWAY_EXPECTED_WARMUP_EVENTS=127800`
+      #     обязана пройти `AdmissionPolicy::validate()` (`max_tail_events >= expected_warmup_events`,
+      #     иначе выдача отказывает 100% времени между прогревами). Замер `R-196` §14.1quinquies
+      #     на проде 2026-09-23: 142 события/с × 900 с (`*/15`) ≈ 127 800 за цикл. Порог
+      #     поставлен 255 600 (×2 от опоры, тот же запас, что и в `Default for AdmissionPolicy`),
+      #     опора 127 800 — ровно один цикл прогрева.
+      GATEWAY_ALLOWED_SYMBOLS: ${GATEWAY_ALLOWED_SYMBOLS:-BTCUSDT}
+      GATEWAY_ALLOWED_PROFILES: ${GATEWAY_ALLOWED_PROFILES:-1000/60000/1000}
+      GATEWAY_MAX_CONCURRENT_SERVES: ${GATEWAY_MAX_CONCURRENT_SERVES:-4}
+      GATEWAY_MAX_TAIL_EVENTS: ${GATEWAY_MAX_TAIL_EVENTS:-255600}
+      GATEWAY_EXPECTED_WARMUP_EVENTS: ${GATEWAY_EXPECTED_WARMUP_EVENTS:-127800}
     volumes:
       # RO-bind к журналу — gateway-serve только читает (GS-I-3: read-only). Recorder
       # владеет журналом, gateway-serve его НЕ мутирует.
