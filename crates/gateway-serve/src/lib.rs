@@ -1047,13 +1047,18 @@ pub mod server {
                 } else {
                     // Без политики (`bind`-путь, не `bind_with_policy`).
                     // Тем не менее — readiness СТОИТ, ЕСЛИ задан чекпоинт.
-                    // Без чекпоинта — старый cold-rebuild путь (см. §16.1
-                    // группа A — `ПЕРЕНОСИТСЯ`: legacy-тесты с `bind` без
-                    // `bind_with_policy` и без `checkpoint_dir`). На проде
-                    // `bind_with_policy` всегда подключает `/ckpt`, и
-                    // пустой каталог — диагностируемый дефект развёртывания.
+                    // Без чекпоинта — fail-closed НАЗВАННЫМ исходом (круг `R-196`,
+                    // задача №4 / `R-200` §B7): недонастроенное развёртывание
+                    // ОБЯЗАНО отвечать исходом из перечня §4, а не снимком.
+                    // Прежняя редакция (`else { ServingOutcome::Ready }`)
+                    // объявляла готовность значением по умолчанию; прод-путь
+                    // сегодня спасает лишь то, что `main.rs` всегда идёт через
+                    // политику, — сама ветка fail-open была жива и достижима
+                    // неверным развёртыванием. На проде `bind_with_policy`
+                    // всегда подключает `/ckpt`, и пустой каталог —
+                    // диагностируемый дефект развёртывания, а не «готов».
                     metrics::inc_attempts_pub();
-                    if inner.cfg.checkpoint_dir.is_some() {
+                    let ready_outcome = if inner.cfg.checkpoint_dir.is_some() {
                         use super::admission::{readiness, AdmissionPolicy, ServingOutcome};
                         let ckpt_path = inner.cfg.checkpoint_dir.clone();
                         let journal_path = inner.cfg.journal_dir.clone();
@@ -1064,7 +1069,7 @@ pub mod server {
                         // измеренную прод-каденцию (`validate().is_ok()`) и не зависит
                         // от конфигурации, которой в этой ветке нет.
                         let fallback_policy = AdmissionPolicy::default();
-                        let ready_outcome = tokio::task::spawn_blocking(move || {
+                        tokio::task::spawn_blocking(move || {
                             readiness(
                                 ckpt_path.as_deref().unwrap_or(std::path::Path::new("")),
                                 &journal_path,
@@ -1073,19 +1078,28 @@ pub mod server {
                             )
                         })
                         .await
-                        .unwrap_or(ServingOutcome::NotReady);
-                        match ready_outcome {
-                            ServingOutcome::Ready => {}
-                            _ => {
-                                metrics::inc_refusals_supported_pub();
-                                let code = match ready_outcome {
-                                    ServingOutcome::Warming => "warming",
-                                    _ => "not_ready",
-                                };
-                                let msg = format!("readiness: {:?}", ready_outcome);
-                                send_v1_error(sink, Some(id), code, &msg).await;
-                                return Err(format!("{}: {msg}", code));
-                            }
+                        .unwrap_or(ServingOutcome::NotReady)
+                    } else {
+                        // fail-closed: нет каталога слепка ⇒ `NotReady` (см. §4 перечня
+                        // исходов). Это ИМЕННО тот исход, который `readiness` отдала бы,
+                        // если бы `ckpt_path.exists()` вернул `false`; здесь мы не зовём
+                        // `readiness`, потому что её четвёртый аргумент `policy` всё равно
+                        // дефолтный и результат предсказуем. Прямое `NotReady` — короткий
+                        // и однозначный путь.
+                        super::admission::ServingOutcome::NotReady
+                    };
+                    use super::admission::ServingOutcome;
+                    match ready_outcome {
+                        ServingOutcome::Ready => {}
+                        _ => {
+                            metrics::inc_refusals_supported_pub();
+                            let code = match ready_outcome {
+                                ServingOutcome::Warming => "warming",
+                                _ => "not_ready",
+                            };
+                            let msg = format!("readiness: {:?}", ready_outcome);
+                            send_v1_error(sink, Some(id), code, &msg).await;
+                            return Err(format!("{}: {msg}", code));
                         }
                     }
                 }
@@ -1802,8 +1816,19 @@ pub mod server {
             .await
             .unwrap_or(ServingOutcome::NotReady)
         } else {
+            // M-87 (R-196 задача №4, R-200 §B7): ветка «нет каталога слепка» —
+            // fail-closed НАЗВАННЫМ исходом. Прежняя редакция
+            // (`ServingOutcome::Ready`) объявляла готовность значением по
+            // умолчанию; прод-путь спасало лишь то, что `main.rs` всегда идёт
+            // через политику, — сама ветка fail-open была жива и достижима
+            // неверным развёртыванием. Недонастроенное развёртывание
+            // ОБЯЗАНО отвечать исходом `NotReady` из перечня §4, а не
+            // снимком. Это ИМЕННО тот исход, который `readiness` отдала бы,
+            // если бы `ckpt_path.exists()` вернул `false`; мы не зовём
+            // `readiness`, потому что её четвёртый аргумент — `Default`, и
+            // результат предсказуем.
             use super::admission::ServingOutcome;
-            ServingOutcome::Ready
+            ServingOutcome::NotReady
         };
         if !matches!(ready_outcome, super::admission::ServingOutcome::Ready) {
             let code = match ready_outcome {
