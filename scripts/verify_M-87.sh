@@ -316,6 +316,34 @@ else
   pass "D-1(б): библиотечный корпус зелен — $LIBSUM"
 fi
 
+# ─────── круг `R-198`+ задача 20 — СБОЙ провенанса истории НЕ МОЛЧИТ (§14.1decies) ───────
+# Задача 17 завела честный пересчёт провенанса, но оба вызывателя в транспорте писали
+# `if let Ok(...)`: при ошибке перезапись МОЛЧА пропускалась и клиенту уходило замороженное
+# из слепка `history_truncated=false` — ровно та ложь, ради устранения которой задача 17 и
+# заводилась. Тот же класс, что задача 19 (`§14.1nonies`), только ошибку глотал транспорт.
+HP_OUT=$(cargo test -p gateway --test red_m87_history_provenance_failclosed 2>&1)
+HP_RC=$?
+HP_LINE=$(printf '%s\n' "$HP_OUT" | grep -E '^test result' | tail -1)
+if [ $HP_RC -eq 0 ]; then
+  pass "task20: сбой провенанса не выдаётся за полную историю — ${HP_LINE:-GREEN}"
+else
+  fail "task20: red_m87_history_provenance_failclosed КРАСЕН — ${HP_LINE:-компиляция}"
+  printf '%s\n' "$HP_OUT" | grep -E '^(error|thread |провенанс|целый)' | head -6
+fi
+
+# Канарейка ФОРМЫ: молчаливое поглощение не имеет права вернуться. Проверяется ВЫЗОВ, а не
+# слово в комментарии: `if let Ok` рядом с `current_history_provenance` в транспорте — это и
+# есть дефект; после задачи 20 оба места зовут `history_provenance_for_serve`.
+SWALLOW=$(grep -cE 'if let Ok\(.*\) *=$|if let Ok\(.*current_history_provenance' \
+          crates/gateway-serve/src/lib.rs || true)
+CHP=$(grep -c 'current_history_provenance' crates/gateway-serve/src/lib.rs || true)
+HPS=$(grep -c 'history_provenance_for_serve' crates/gateway-serve/src/lib.rs || true)
+if [ "$CHP" -eq 0 ] && [ "$HPS" -ge 2 ]; then
+  pass "task20: транспорт зовёт ТОЛЬКО fail-closed обёртку (вызовов: $HPS)"
+else
+  fail "task20: в транспорте осталось $CHP прямых вызовов current_history_provenance при $HPS обёртки — молчаливое поглощение возможно"
+fi
+
 # ─────────────── паритет с CI ───────────────
 if cargo fmt --all -- --check >/dev/null 2>&1; then
   pass "CI-паритет: cargo fmt --all -- --check"
