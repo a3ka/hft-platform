@@ -3590,6 +3590,11 @@ pub fn snapshot_from_checkpoint(
             // M-48 (VB-I-11): провенанс истории ПЕРЕСИМ от чекпоинта, не вычисляем
             // из хвостовых событий (D2: `red_checkpoint_bootstrap_truncated
             // ::advance_after_covered_prune_does_not_regress_history_start`).
+            // ПЕРЕсчёт против ТЕКУЩЕГО начала журнала (задача 17, §14.1septies)
+            // делается на ПУТИ ОБСЛУЖИВАНИЯ в транспорте, а не здесь —
+            // `snapshot_from_checkpoint` это и библиотечный API (на проде прямо не
+            // вызывается, используется `LiveReducer::snapshot`), и прямой вызов
+            // из оракулов (D2 держится на замороженном значении).
             return Ok((
                 Snapshot {
                     schema_version: GATEWAY_SCHEMA_VERSION,
@@ -3739,7 +3744,12 @@ pub mod checkpoint {
     /// если журнал пуст. Используется для детекта разрыва «чекпоинт↔журнал» (M-48,
     /// GW-I-12): если валидный чекпоинт с курсором `C` и самый ранний видимый
     /// `first_seq > C + 1` — между ними разрыв, докорм запрещён.
-    fn first_visible_seq(dir: &Path, filter: &EpochFilter) -> io::Result<Option<u64>> {
+    /// `pub(crate)` — нужен `snapshot_from_checkpoint` для пересчёта честности
+    /// истории против ТЕКУЩЕГО начала журнала (задача 17, §14.1septies).
+    pub(crate) fn first_visible_seq(
+        dir: &Path,
+        filter: &EpochFilter,
+    ) -> io::Result<Option<u64>> {
         let segs = journal::list_segments(dir)?;
         let mut min_seq: Option<u64> = None;
         for s in &segs {
@@ -3748,6 +3758,25 @@ pub mod checkpoint {
             }
         }
         Ok(min_seq)
+    }
+
+    /// M-87 (задача 17, §14.1septies): пересчитать провенанс истории против ТЕКУЩЕГО
+    /// начала журнала. Используется транспортом, потому что `LiveReducer` хранит
+    /// замороженные из чекпоинта `history_*`, и без пересчёта они врут после ретеншена.
+    /// Возвращает `(history_start_seq, history_truncated)`. `truncated=true`, если
+    /// наименьший видимый `first_seq` превышает 0 — то есть префикс был удалён
+    /// ретеншеном или ловушкой.
+    pub fn current_history_provenance(
+        dir: impl AsRef<Path>,
+        filter: EpochFilter,
+    ) -> io::Result<(u64, bool)> {
+        let first = first_visible_seq(dir.as_ref(), &filter)?;
+        let (start_seq, truncated) = match first {
+            Some(seq) if seq > 0 => (seq, true),
+            Some(seq) => (seq, false),
+            None => (0, false),
+        };
+        Ok((start_seq, truncated))
     }
     /// M-38b: заголовок чекпоинта — magic + версии + фингерпринты + lineage + cursor.
     /// Сериализуется как первая часть файла ДО postcard(state), чтобы при изменении

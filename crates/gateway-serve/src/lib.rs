@@ -1096,6 +1096,12 @@ pub mod server {
                 // (б) id новый — ADD с проверкой cap.
                 let path_clone = inner.cfg.journal_dir.clone();
                 let filter_clone = inner.cfg.filter.clone();
+                // M-87 (задача 17, §14.1septies): для пересчёта провенанса истории против
+                // ТЕКУЩЕГО начала журнала нужно передать в spawn_blocking отдельные копии
+                // пути и фильтра (после `move ||` мы `inner` уже не вернём — его закрытие
+                // вынесло локальные `path_for_history`/`filter_for_history`).
+                let path_for_history = inner.cfg.journal_dir.clone();
+                let filter_for_history = inner.cfg.filter.clone();
                 let ckpt_clone = inner
                     .cfg
                     .checkpoint_dir
@@ -1249,7 +1255,21 @@ pub mod server {
                             "PL-I-5 cap exceeded: response would exceed limit",
                         ));
                     }
-                    let snap = live.snapshot_checked()?;
+                    let mut snap = live.snapshot_checked()?;
+                    // M-87 (задача 17, §14.1septies): пересчитать провенанс истории
+                    // против ТЕКУЩЕГО начала журнала. `LiveReducer` хранит замороженные
+                    // из чекпоинта `history_*`; ретеншен между снятием и обслуживанием
+                    // мог удалить ранние сегменты, и `history_truncated=false` в слепке
+                    // соврёт: реплей не воспроизведёт то, что обслужено (VB-I-11).
+                    if let Ok((live_start, live_truncated)) =
+                        gateway::checkpoint::current_history_provenance(
+                            &path_for_history,
+                            filter_for_history.clone(),
+                        )
+                    {
+                        snap.history_start_seq = live_start;
+                        snap.history_truncated = live_truncated;
+                    }
                     Ok((
                         snap,
                         session::Sub {
@@ -1914,10 +1934,24 @@ pub mod server {
             // «vantage на малом журнале + предмет на плотном», оба молчание/ошибка легитимны;
             // подробнее — §4bis.1bis спеки). Никакого «помеченного усечения через обрезку
             // bubbles» нет и не было с `f2ac1c8`.
-            let snap_msg = match live.snapshot_checked() {
-                Ok(snap) => ServeMsg::Snapshot(snap),
+            let mut snap = match live.snapshot_checked() {
+                Ok(snap) => snap,
                 Err(e) => return Err(e),
             };
+            // M-87 (задача 17, §14.1septies): пересчитать провенанс истории против
+            // ТЕКУЩЕГО начала журнала. `LiveReducer` хранит замороженные `history_*`
+            // из чекпоинта; ретеншен между снятием и обслуживанием мог удалить ранние
+            // сегменты, и `history_truncated=false` в слепке соврёт (VB-I-11).
+            if let Ok((live_start, live_truncated)) =
+                crate::_gw::current_history_provenance(
+                    cfg1.journal_dir.as_path(),
+                    cfg1.filter.clone(),
+                )
+            {
+                snap.history_start_seq = live_start;
+                snap.history_truncated = live_truncated;
+            }
+            let snap_msg = ServeMsg::Snapshot(snap);
             Ok((snap_msg, stats, live, at))
         })
         .await;
@@ -2357,8 +2391,9 @@ pub mod server {
 #[doc(hidden)]
 pub mod _gw {
     pub use gateway::{
-        frames_since, snapshot, snapshot_from_checkpoint, Cursor, Frame, LiveReducer, ReadStats,
-        Selector, SeriesBundle, Snapshot, GATEWAY_SCHEMA_VERSION,
+        checkpoint::current_history_provenance, frames_since, snapshot,
+        snapshot_from_checkpoint, Cursor, Frame, LiveReducer, ReadStats, Selector, SeriesBundle,
+        Snapshot, GATEWAY_SCHEMA_VERSION,
     };
 }
 
