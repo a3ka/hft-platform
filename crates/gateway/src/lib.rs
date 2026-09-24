@@ -3504,6 +3504,9 @@ fn read_stats_from_stream(stream: &journal::EventStream, depth_levels_visited: u
 pub(crate) fn payload_bytes_for_dir(dir: &Path) -> io::Result<u64> {
     use std::fs;
     let mut total: u64 = 0;
+    // DET-OK: read_dir-порядок не имеет значения — суммируем размеры файлов, не
+    // собираем список. Итог коммутативен.
+    // DET-OK: порядок read_dir не имеет значения для данной функции
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let p = entry.path();
