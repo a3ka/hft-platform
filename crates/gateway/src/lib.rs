@@ -3746,10 +3746,7 @@ pub mod checkpoint {
     /// `first_seq > C + 1` — между ними разрыв, докорм запрещён.
     /// `pub(crate)` — нужен `snapshot_from_checkpoint` для пересчёта честности
     /// истории против ТЕКУЩЕГО начала журнала (задача 17, §14.1septies).
-    pub(crate) fn first_visible_seq(
-        dir: &Path,
-        filter: &EpochFilter,
-    ) -> io::Result<Option<u64>> {
+    pub(crate) fn first_visible_seq(dir: &Path, filter: &EpochFilter) -> io::Result<Option<u64>> {
         let segs = journal::list_segments(dir)?;
         let mut min_seq: Option<u64> = None;
         for s in &segs {

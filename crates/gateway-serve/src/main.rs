@@ -49,17 +49,13 @@ async fn main() -> ExitCode {
     let server = match bind_with_policy(cfg, policy).await {
         Ok(s) => s,
         Err(e) => {
-            eprintln!(
-                "gateway-serve: bind_with_policy failed addr={bind_addr} error={e}"
-            );
+            eprintln!("gateway-serve: bind_with_policy failed addr={bind_addr} error={e}");
             return ExitCode::from(3);
         }
     };
 
     let actual = server.local_addr();
-    eprintln!(
-        "gateway-serve: listening on {actual} (read-only, JWT-auth, policy-enforced)"
-    );
+    eprintln!("gateway-serve: listening on {actual} (read-only, JWT-auth, policy-enforced)");
 
     if let Err(e) = server.serve().await {
         eprintln!("gateway-serve: serve loop ended with error: {e}");

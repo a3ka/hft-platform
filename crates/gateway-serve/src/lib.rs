@@ -2391,9 +2391,9 @@ pub mod server {
 #[doc(hidden)]
 pub mod _gw {
     pub use gateway::{
-        checkpoint::current_history_provenance, frames_since, snapshot,
-        snapshot_from_checkpoint, Cursor, Frame, LiveReducer, ReadStats, Selector, SeriesBundle,
-        Snapshot, GATEWAY_SCHEMA_VERSION,
+        checkpoint::current_history_provenance, frames_since, snapshot, snapshot_from_checkpoint,
+        Cursor, Frame, LiveReducer, ReadStats, Selector, SeriesBundle, Snapshot,
+        GATEWAY_SCHEMA_VERSION,
     };
 }
 
@@ -2909,15 +2909,24 @@ pub fn admission_policy_from_env(
                 ));
             }
             let tf: i64 = parts[0].trim().parse().map_err(|e| {
-                format!("GATEWAY_ALLOWED_PROFILES timeframe_ms parse {:?}: {e}", parts[0])
+                format!(
+                    "GATEWAY_ALLOWED_PROFILES timeframe_ms parse {:?}: {e}",
+                    parts[0]
+                )
             })?;
             let window: i64 = parts[1].trim().parse().map_err(|e| {
-                format!("GATEWAY_ALLOWED_PROFILES window_ms parse {:?}: {e}", parts[1])
+                format!(
+                    "GATEWAY_ALLOWED_PROFILES window_ms parse {:?}: {e}",
+                    parts[1]
+                )
             })?;
             let cadence: Option<i64> = match parts.get(2).map(|s| s.trim()) {
                 Some(s) if s.eq_ignore_ascii_case("none") => None,
                 Some(s) => Some(s.parse().map_err(|e| {
-                    format!("GATEWAY_ALLOWED_PROFILES depth_cadence_ms parse {:?}: {e}", s)
+                    format!(
+                        "GATEWAY_ALLOWED_PROFILES depth_cadence_ms parse {:?}: {e}",
+                        s
+                    )
                 })?),
                 None => None,
             };
