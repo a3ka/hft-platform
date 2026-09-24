@@ -1190,13 +1190,14 @@ pub mod server {
                             return Err("snapshot serialize failed".to_string());
                         }
                     };
+                    // M-87 (задача 15): счётчик получает размер сериализованного
+                    // СНИМКА до отправки — `payload_bytes_for_dir_pub` уходит с
+                    // горячего пути (задача B5).
+                    metrics::add_journal_payload_bytes_pub(snap_text.len() as u64);
                     if sink.send(Message::Text(snap_text)).await.is_err() {
                         return Err("client disconnected during switch snapshot send".to_string());
                     }
                     metrics::inc_successes_pub();
-                    if let Ok(n) = gateway::payload_bytes_for_dir_pub(&inner.cfg.journal_dir) {
-                        metrics::add_journal_payload_bytes_pub(n);
-                    }
                     tracing::debug!(sub = %switched_id, "v1 subscribe (switch) ok");
                     return Ok(());
                 }
@@ -1305,13 +1306,14 @@ pub mod server {
                         return Err("snapshot serialize failed".to_string());
                     }
                 };
+                // M-87 (задача 15): счётчик получает размер сериализованного
+                // снимка ДО отправки — `payload_bytes_for_dir_pub` уходит с горячего
+                // пути (задача B5).
+                metrics::add_journal_payload_bytes_pub(snap_text.len() as u64);
                 if sink.send(Message::Text(snap_text)).await.is_err() {
                     return Err("client disconnected during snapshot send".to_string());
                 }
                 metrics::inc_successes_pub();
-                if let Ok(n) = gateway::payload_bytes_for_dir_pub(&inner.cfg.journal_dir) {
-                    metrics::add_journal_payload_bytes_pub(n);
-                }
                 tracing::debug!(sub = %id_for_insert, "v1 subscribe ok");
                 Ok(())
             }
