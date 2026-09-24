@@ -308,7 +308,13 @@ fn windowed_live_eq_replay() {
     )
     .expect("frames_since");
     for f in &frames {
-        merged.apply(f);
+        // M-88: исход применения кадра ОБЯЗАН наблюдаться (спека §4.3);
+        // форма `let _ = apply(..)` запрещена §6 — здесь кадр продолжает курсор.
+        assert_eq!(
+            merged.apply(f),
+            gateway::ApplyOutcome::Applied,
+            "кадр обязан быть принят: он продолжает курсор потребителя"
+        );
     }
 
     // Окновая серия обязана совпасть побайтно (иначе эвикция/merge несогласованы).
@@ -422,7 +428,13 @@ fn windowed_live_eq_replay_overlap_multistep() {
             break;
         }
         for f in &batch {
-            merged.apply(f);
+            // M-88: исход применения кадра ОБЯЗАН наблюдаться (спека §4.3);
+            // форма `let _ = apply(..)` запрещена §6 — здесь кадр продолжает курсор.
+            assert_eq!(
+                merged.apply(f),
+                gateway::ApplyOutcome::Applied,
+                "кадр обязан быть принят: он продолжает курсор потребителя"
+            );
         }
         if next == cur {
             break;
@@ -508,7 +520,13 @@ fn windowed_live_eq_replay_past_session_survives_overlap() {
     )
     .expect("frames_since");
     for f in &frames {
-        merged.apply(f);
+        // M-88: исход применения кадра ОБЯЗАН наблюдаться (спека §4.3);
+        // форма `let _ = apply(..)` запрещена §6 — здесь кадр продолжает курсор.
+        assert_eq!(
+            merged.apply(f),
+            gateway::ApplyOutcome::Applied,
+            "кадр обязан быть принят: он продолжает курсор потребителя"
+        );
     }
 
     let s1 = session_of(t0 / 1000);

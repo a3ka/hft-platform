@@ -128,7 +128,13 @@ fn json<T: serde::Serialize>(x: &T) -> String {
 fn fold(base: Snapshot, frames: &[Frame]) -> Snapshot {
     let mut acc = base;
     for f in frames {
-        acc.apply(f);
+        // M-88: исход применения кадра ОБЯЗАН наблюдаться (спека §4.3);
+        // форма `let _ = apply(..)` запрещена §6 — здесь кадр продолжает курсор.
+        assert_eq!(
+            acc.apply(f),
+            gateway::ApplyOutcome::Applied,
+            "кадр обязан быть принят: он продолжает курсор потребителя"
+        );
     }
     acc
 }

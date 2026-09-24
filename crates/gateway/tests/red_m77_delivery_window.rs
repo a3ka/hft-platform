@@ -339,7 +339,13 @@ fn drive_with_refusals(
         match live.pump(dir, EpochFilter::OwnCaptureOnly, max_events) {
             Ok((frames, _, _)) => {
                 for f in &frames {
-                    client.apply(f);
+                    // M-88: исход применения кадра ОБЯЗАН наблюдаться (спека §4.3);
+                    // форма `let _ = apply(..)` запрещена §6 — здесь кадр продолжает курсор.
+                    assert_eq!(
+                        client.apply(f),
+                        gateway::ApplyOutcome::Applied,
+                        "кадр обязан быть принят: он продолжает курсор потребителя"
+                    );
                 }
             }
             Err(_) => refusals += 1,
@@ -356,7 +362,13 @@ fn drive_with_refusals(
             Ok((frames, _, _)) => {
                 for f in &frames {
                     delivered += 1;
-                    client.apply(f);
+                    // M-88: исход применения кадра ОБЯЗАН наблюдаться (спека §4.3);
+                    // форма `let _ = apply(..)` запрещена §6 — здесь кадр продолжает курсор.
+                    assert_eq!(
+                        client.apply(f),
+                        gateway::ApplyOutcome::Applied,
+                        "кадр обязан быть принят: он продолжает курсор потребителя"
+                    );
                 }
             }
             Err(e) => setup_failed(&format!("pump догона отказал при снятом пределе: {e}")),

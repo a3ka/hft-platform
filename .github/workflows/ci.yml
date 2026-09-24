@@ -115,6 +115,26 @@ jobs:
       - name: Проба барьера явных путей коммита (8 сценариев)
         run: bash scripts/tests/red_commit_paths.sh
 
+  archived-refs:
+    name: Archived refs (ссылка на вынесенный артефакт не висит, TD-218)
+    runs-on: ubuntu-latest
+    steps:
+      # fetch-depth не нужен: барьер судит СОСТОЯНИЕ ДЕРЕВА (`git grep` по HEAD), а не
+      # диапазон. Это намеренно: висячая ссылка — свойство дерева, а не коммита, и
+      # диапазонный барьер пропустил бы её ровно тогда, когда её внёс не тот коммит.
+      - uses: actions/checkout@v4
+
+      # Барьер висячих ссылок на вынесенные нормой Р-2 артефакты. Замер, из-за которого
+      # заведён (`R-198` §5, `TD-218`): переезд M-88 оставил ВОСЕМЬ ссылок в никуда, а тело
+      # коммита переезда утверждало «ссылок из чужих зон нет» — утверждение было ложно.
+      - name: Висячие ссылки на вынесенные артефакты
+        run: bash scripts/check_archived_refs.sh
+
+      # Барьер сам под пробой: односторонняя проверка зелена и у барьера, всегда
+      # возвращающего 0. Шесть сценариев, число печатает сама проба.
+      - name: Проба барьера (обе стороны + свойства базовой линии)
+        run: bash scripts/tests/red_archived_refs.sh
+
   docs-freeze:
     name: Docs-freeze (M-60a — замок процессного слоя)
     runs-on: ubuntu-latest
@@ -592,11 +612,11 @@ jobs:
   status-check:
     name: All checks passed
     runs-on: ubuntu-latest
-    needs: [build-test, security, delivery, protected-artifacts, secret-material, roadmap-sync, contracts, docs-freeze, artifact-ids, reserve-ids, design-claims, context-budgets, gate-meta, deploy-catchup, review-fa, resource-oracles, rollout-composition]
+    needs: [build-test, security, delivery, protected-artifacts, secret-material, roadmap-sync, contracts, docs-freeze, archived-refs, artifact-ids, reserve-ids, design-claims, context-budgets, gate-meta, deploy-catchup, review-fa, resource-oracles, rollout-composition]
     if: always()
     steps:
       - run: |
-          if [[ "${{ needs.build-test.result }}" != "success" || "${{ needs.security.result }}" != "success" || "${{ needs.delivery.result }}" != "success" || "${{ needs.protected-artifacts.result }}" != "success" || "${{ needs.contracts.result }}" != "success" || "${{ needs.docs-freeze.result }}" != "success" || "${{ needs.artifact-ids.result }}" != "success" || "${{ needs.reserve-ids.result }}" != "success" || "${{ needs.design-claims.result }}" != "success" || "${{ needs.context-budgets.result }}" != "success" || "${{ needs.gate-meta.result }}" != "success" || "${{ needs.deploy-catchup.result }}" != "success" || "${{ needs.review-fa.result }}" != "success" || "${{ needs.resource-oracles.result }}" != "success" || "${{ needs.rollout-composition.result }}" != "success" ]]; then
+          if [[ "${{ needs.build-test.result }}" != "success" || "${{ needs.security.result }}" != "success" || "${{ needs.delivery.result }}" != "success" || "${{ needs.protected-artifacts.result }}" != "success" || "${{ needs.contracts.result }}" != "success" || "${{ needs.docs-freeze.result }}" != "success" || "${{ needs.archived-refs.result }}" != "success" || "${{ needs.artifact-ids.result }}" != "success" || "${{ needs.reserve-ids.result }}" != "success" || "${{ needs.design-claims.result }}" != "success" || "${{ needs.context-budgets.result }}" != "success" || "${{ needs.gate-meta.result }}" != "success" || "${{ needs.deploy-catchup.result }}" != "success" || "${{ needs.review-fa.result }}" != "success" || "${{ needs.resource-oracles.result }}" != "success" || "${{ needs.rollout-composition.result }}" != "success" ]]; then
             echo "One or more checks failed"; exit 1
           fi
           echo "All checks passed"

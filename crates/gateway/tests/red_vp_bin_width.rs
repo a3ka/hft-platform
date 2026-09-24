@@ -439,7 +439,13 @@ fn v8_snapshot_plus_frames_equals_full_replay() {
         "SETUP НЕ СОСТОЯЛСЯ: дельта пуста — срез покрыл весь журнал, склейка не проверена"
     );
     for f in &frames {
-        merged.apply(f);
+        // M-88: исход применения кадра ОБЯЗАН наблюдаться (спека §4.3);
+        // форма `let _ = apply(..)` запрещена §6 — здесь кадр продолжает курсор.
+        assert_eq!(
+            merged.apply(f),
+            gateway::ApplyOutcome::Applied,
+            "кадр обязан быть принят: он продолжает курсор потребителя"
+        );
     }
 
     assert_eq!(

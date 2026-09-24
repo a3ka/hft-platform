@@ -174,7 +174,13 @@ fn checkpoint_plus_pumped_frames_equals_full_snapshot() {
             break;
         }
         for f in &frames {
-            snap.apply(f);
+            // M-88: исход применения кадра ОБЯЗАН наблюдаться (спека §4.3);
+            // форма `let _ = apply(..)` запрещена §6 — здесь кадр продолжает курсор.
+            assert_eq!(
+                snap.apply(f),
+                gateway::ApplyOutcome::Applied,
+                "кадр обязан быть принят: он продолжает курсор потребителя"
+            );
         }
     }
 
@@ -311,7 +317,13 @@ fn td083_pumped_frames_fold_into_full_replay_snapshot() {
             break;
         }
         for f in &frames {
-            folded.apply(f);
+            // M-88: исход применения кадра ОБЯЗАН наблюдаться (спека §4.3);
+            // форма `let _ = apply(..)` запрещена §6 — здесь кадр продолжает курсор.
+            assert_eq!(
+                folded.apply(f),
+                gateway::ApplyOutcome::Applied,
+                "кадр обязан быть принят: он продолжает курсор потребителя"
+            );
         }
     }
 

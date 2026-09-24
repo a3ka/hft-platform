@@ -551,7 +551,13 @@ fn apply_frames(mut acc: Snapshot, frames: &[Frame], label: &str) -> Snapshot {
             "{label}: кадр не продолжает текущий курсор снапшота. from={:?}, acc.cursor={:?}, to={:?}",
             frame.from, acc.cursor, frame.to
         );
-        acc.apply(frame);
+        // M-88: исход применения кадра ОБЯЗАН наблюдаться (спека §4.3);
+        // форма `let _ = apply(..)` запрещена §6 — здесь кадр продолжает курсор.
+        assert_eq!(
+            acc.apply(frame),
+            gateway::ApplyOutcome::Applied,
+            "кадр обязан быть принят: он продолжает курсор потребителя"
+        );
     }
     acc
 }

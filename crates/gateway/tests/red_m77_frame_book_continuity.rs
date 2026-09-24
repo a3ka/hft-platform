@@ -270,7 +270,13 @@ fn drive_prod_path_with(
                     if n > 0 {
                         frames_carrying_depth += 1;
                     }
-                    client.apply(f);
+                    // M-88: исход применения кадра ОБЯЗАН наблюдаться (спека §4.3);
+                    // форма `let _ = apply(..)` запрещена §6 — здесь кадр продолжает курсор.
+                    assert_eq!(
+                        client.apply(f),
+                        gateway::ApplyOutcome::Applied,
+                        "кадр обязан быть принят: он продолжает курсор потребителя"
+                    );
                 }
             }
             Err(e) => setup_failed(&format!("pump тика: {e}")),
