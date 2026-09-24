@@ -531,7 +531,11 @@ fn r6b_expectation_parser_distinguishes_assertion_from_its_negation() {
 }
 
 /// Имена драйверов, первый аргумент которых ОБЯЗАН быть прямым строковым литералом.
-const DRIVERS: &[&str] = &["serve_for(", "ckpt_from_registry(", "registry_tail("];
+const DRIVERS: &[&str] = &[
+    "prepare_from_registry(",
+    "ckpt_from_registry(",
+    "registry_tail(",
+];
 
 /// Нарушения связи «строка ↔ функция» в теле одного сценария.
 ///
@@ -612,7 +616,7 @@ fn r7_driver_argument_is_a_literal_equal_to_scenario_name() {
     // АНТИ-ПЛАЦЕБО — ровно обход, найденный `C-253`: чужое имя ПЕРЕМЕННОЙ плюс одноимённый
     // литерал-приманка ПОСЛЕ вызова. Прежняя редакция такое принимала.
     let decoy = "\n    let other = \"u1_warm_path_is_served_over_trapped_head\";\n    \
-                 let (addr, _g) = serve_for(other, dir.path()).await;\n    \
+                 let (addr, _g) = prepare_from_registry(other, dir.path());\n    \
                  // приманка ниже по телу:\n    let _ = \"c9_probe\";\n";
     assert!(
         !driver_violations("c9_probe", decoy).is_empty(),
@@ -620,7 +624,7 @@ fn r7_driver_argument_is_a_literal_equal_to_scenario_name() {
          одноимённый литерал. Проверка обязана смотреть на АРГУМЕНТ, а не на текст рядом"
     );
     // И не должна ругаться на честную форму.
-    let honest = "\n    let (addr, _g) = serve_for(\"c9_probe\", dir.path()).await;\n";
+    let honest = "\n    let (addr, _g) = prepare_from_registry(\"c9_probe\", dir.path());\n";
     assert!(
         driver_violations("c9_probe", honest).is_empty(),
         "честный вызов с прямым литералом отвергнут — страж краснел бы на исправном коде"

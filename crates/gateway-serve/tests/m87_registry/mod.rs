@@ -242,6 +242,21 @@ pub const REGISTRY: &[(&str, &[Request])] = &[
 ///
 /// Паникует на незарегистрированном имени: сценарий, которого нет в реестре, не имеет
 /// права строить фикстуру вслепую — это и есть та дыра, через которую трижды прошла ложь.
+/// Отставание, если строка его объявляет; `None` — сценарий до сверки свежести не доходит.
+/// Нужен драйверу: он материализует строку ЦЕЛИКОМ и обязан отличать «отставания нет» от
+/// «строка не зарегистрирована» (второе — паника, первое — законный случай).
+pub fn registry_tail_opt(scenario: &str) -> Option<u64> {
+    let requests = REGISTRY
+        .iter()
+        .find(|(name, _)| *name == scenario)
+        .unwrap_or_else(|| panic!("сценарий «{scenario}» не зарегистрирован в REGISTRY"))
+        .1;
+    requests.iter().find_map(|r| match r {
+        Freshness { tail, .. } => Some(*tail),
+        ShortCircuit { .. } => None,
+    })
+}
+
 pub fn registry_tail(scenario: &str) -> u64 {
     let requests = REGISTRY
         .iter()

@@ -257,11 +257,100 @@ fn ckpt_file(dir: &std::path::Path) -> std::path::PathBuf {
     ))
 }
 
-/// Поднять сервер для НАЗВАННОГО сценария: и слепок, и его состояние берутся из реестра.
-/// Возвращает адрес и владение временным каталогом — он обязан жить, пока жив сервер.
-async fn serve_for(scenario: &str, dir: &std::path::Path) -> (String, Option<tempfile::TempDir>) {
+/// Дописать в журнал ровно `n` событий (тот же класс, что и фикстура сценария).
+fn append_tail(dir: &std::path::Path, n: u64) {
+    if n == 0 {
+        return;
+    }
+    let mut j = Journal::open_with(dir, writer_cfg()).expect("open_with");
+    for i in 0..n {
+        j.append(EventKind::md(
+            Venue::Binance,
+            "BTCUSDT",
+            MdPayload::L2Snapshot {
+                bids: vec![lvl(65_000.0 - i as f64, 1.0)],
+                asks: vec![lvl(65_100.0 + i as f64, 1.0)],
+                ts_exch_ms: BASE_MS + 600_000 + i as i64,
+            },
+        ))
+        .expect("append tail");
+    }
+    j.flush().expect("flush");
+}
+
+/// Текущий хвостовой `seq` журнала — тем же способом, каким его читает `readiness`
+/// (`journal.meta`, 8 байт), а не через открытие журнала писателем: последнее СОЗДАЁТ
+/// сегмент и сдвинуло бы то, что мы измеряем.
+fn journal_next_seq(dir: &std::path::Path) -> u64 {
+    let bytes = std::fs::read(dir.join("journal.meta")).unwrap_or_default();
+    if bytes.len() < 8 {
+        return 0;
+    }
+    u64::from_le_bytes(bytes[..8].try_into().expect("8 байт"))
+}
+
+/// Курсор слепка — сколько событий в нём свёрнуто.
+fn ckpt_cursor_seq(ckpt_dir: &std::path::Path) -> u64 {
+    let path = gateway::checkpoint::ckpt_path_for_pub(ckpt_dir, &canonical_sel());
+    gateway::checkpoint::read_checkpoint_header_pub(&path)
+        .and_then(|h| h.cursor.upto_seq)
+        .unwrap_or(0)
+}
+
+/// МАТЕРИАЛИЗОВАТЬ СТРОКУ РЕЕСТРА: слепок, его состояние и отставание — и ПРОВЕРИТЬ,
+/// что построено именно объявленное.
+///
+/// **ЗОВЁТСЯ ТАМ, ГДЕ РАНЬШЕ СТОЯЛ `advance` — ДО ловушек сценария (`C-255`).** Прежняя
+/// редакция совмещала подготовку с подъёмом сервера, и порядок молча переворачивался:
+/// сценарий дописывал хвост или портил сегмент ДО подъёма, значит слепок снимался ПОСЛЕ —
+/// отставание получалось нулевым, а ловушка попадала в слепок. `c9` продолжал зеленеть
+/// при пороге ниже объявленного отставания: мутация ничего не пересекала, потому что
+/// пересекать было нечего. Подготовка и подъём разведены, порядок принадлежит сценарию.
+fn prepare_from_registry(
+    scenario: &str,
+    dir: &std::path::Path,
+) -> (Option<std::path::PathBuf>, Option<tempfile::TempDir>) {
     let (ckpt, guard) = ckpt_from_registry(scenario, dir);
-    (serve(dir, ckpt).await, guard)
+
+    let declared = m87_registry::registry_tail_opt(scenario).unwrap_or(0);
+    if declared > 0 {
+        let before = journal_next_seq(dir);
+        append_tail(dir, declared);
+        let after = journal_next_seq(dir);
+        assert_eq!(
+            after - before,
+            declared,
+            "фикстура «{scenario}» дописала {} событий вместо объявленных {declared} — \
+             реестр и журнал разошлись",
+            after - before
+        );
+    }
+
+    // САМОПРОВЕРКА ОТСТАВАНИЯ меряет его ТАК ЖЕ, как продукт: `readiness` считает
+    // `next_seq − upto_seq`. Первое ИСКЛЮЧАЮЩЕЕ, второе ВКЛЮЧАЮЩЕЕ, поэтому на `n`
+    // дописанных событий продукт видит `n + 1`. Единица названа, а не спрятана в допуске:
+    // замер — `before=301 after=501 ckpt=300` при объявленных 200.
+    //
+    // Следствие для реестра: коридор порога сверяется по `tail`, а продукт сравнивает
+    // `tail + 1`. Значения держатся в СЕРЕДИНЕ коридора (`A-039`), поэтому единица ничего
+    // не переворачивает; фикстура у самого края сломалась бы молча — и это причина, по
+    // которой край запрещён.
+    if let Some(ref c) = ckpt {
+        if m87_registry::registry_checkpoint(scenario) == m87_registry::CheckpointFixture::Warm {
+            let lag = journal_next_seq(dir).saturating_sub(ckpt_cursor_seq(c));
+            assert_eq!(
+                lag,
+                declared + 1,
+                "фикстура «{scenario}» создала отставание {lag} при объявленном {declared} \
+                 (ожидается {}). Слепок обязан сниматься ДО дописки хвоста и ДО ловушек: \
+                 снятый после отстаёт не на то, и мутация порога перестаёт что-либо \
+                 пересекать (C-255)",
+                declared + 1
+            );
+        }
+    }
+
+    (ckpt, guard)
 }
 
 async fn serve(dir: &std::path::Path, ckpt: Option<std::path::PathBuf>) -> String {
@@ -356,11 +445,11 @@ fn canonical_selector_json() -> Value {
 #[tokio::test]
 async fn c1_entry_cold_request_named_outcome_without_reading_journal() {
     let dir = journal_busy(3_000);
-    let (addr, _ckpt_guard) = serve_for(
+    let (_ckpt, _ckpt_guard) = prepare_from_registry(
         "c1_entry_cold_request_named_outcome_without_reading_journal",
         dir.path(),
-    )
-    .await;
+    );
+    let addr = serve(dir.path(), _ckpt).await;
 
     let before = serving_counters().journal_payload_bytes_read;
     let mut ws = connect(&addr).await;
@@ -392,9 +481,10 @@ async fn c1_entry_cold_request_named_outcome_without_reading_journal() {
 #[tokio::test]
 async fn c1_entry_ready_state_is_actually_served() {
     let dir = journal_busy(500);
+    let (_ckpt, _ckpt_guard) =
+        prepare_from_registry("c1_entry_ready_state_is_actually_served", dir.path());
 
-    let (addr, _ckpt_guard) =
-        serve_for("c1_entry_ready_state_is_actually_served", dir.path()).await;
+    let addr = serve(dir.path(), _ckpt).await;
     let mut ws = connect(&addr).await;
     send(&mut ws, subscribe("s1", canonical_selector_json())).await;
     let msg = recv(&mut ws).await.expect("сервер промолчал");
@@ -414,7 +504,9 @@ async fn c1_entry_ready_state_is_actually_served() {
 #[tokio::test]
 async fn c5_entry_unbounded_profile_is_refused() {
     let dir = journal_busy(3_000);
-    let (addr, _ckpt_guard) = serve_for("c5_entry_unbounded_profile_is_refused", dir.path()).await;
+    let (_ckpt, _ckpt_guard) =
+        prepare_from_registry("c5_entry_unbounded_profile_is_refused", dir.path());
+    let addr = serve(dir.path(), _ckpt).await;
 
     let before = serving_counters().journal_payload_bytes_read;
     let mut ws = connect(&addr).await;
@@ -447,11 +539,11 @@ async fn c5_entry_unbounded_profile_is_refused() {
 #[tokio::test]
 async fn c5_entry_refusal_does_not_substitute_parameters() {
     let dir = journal_busy(200);
-    let (addr, _ckpt_guard) = serve_for(
+    let (_ckpt, _ckpt_guard) = prepare_from_registry(
         "c5_entry_refusal_does_not_substitute_parameters",
         dir.path(),
-    )
-    .await;
+    );
+    let addr = serve(dir.path(), _ckpt).await;
     let mut ws = connect(&addr).await;
     send(
         &mut ws,
@@ -479,11 +571,11 @@ async fn c5_entry_refusal_does_not_substitute_parameters() {
 #[tokio::test]
 async fn c5_entry_refusal_keeps_connection_and_neighbours_alive() {
     let dir = journal_busy(500);
-    let (addr, _ckpt_guard) = serve_for(
+    let (_ckpt, _ckpt_guard) = prepare_from_registry(
         "c5_entry_refusal_keeps_connection_and_neighbours_alive",
         dir.path(),
-    )
-    .await;
+    );
+    let addr = serve(dir.path(), _ckpt).await;
 
     let mut ws = connect(&addr).await;
     send(&mut ws, subscribe("good", canonical_selector_json())).await;
@@ -707,11 +799,11 @@ async fn c4_slot_lifecycle_hold_refuse_release() {
 #[tokio::test]
 async fn c6_counters_are_emitted_by_the_real_serving_path() {
     let dir = journal_busy(300);
-    let (addr, _ckpt_guard) = serve_for(
+    let (_ckpt, _ckpt_guard) = prepare_from_registry(
         "c6_counters_are_emitted_by_the_real_serving_path",
         dir.path(),
-    )
-    .await;
+    );
+    let addr = serve(dir.path(), _ckpt).await;
 
     let before = serving_counters();
     let mut ws = connect(&addr).await;
@@ -755,34 +847,15 @@ async fn c6_counters_are_emitted_by_the_real_serving_path() {
 #[tokio::test]
 async fn c9_four_positions_differ_and_stale_snapshot_does_not_stop_serving() {
     let dir = journal_busy(300);
-
-    // Журнал уезжает ПОСЛЕ слепка — источник заведомо свежее слепка.
-    {
-        let mut j = Journal::open_with(dir.path(), writer_cfg()).expect("open_with");
-        for i in 0..(m87_registry::registry_tail(
-            "c9_four_positions_differ_and_stale_snapshot_does_not_stop_serving",
-        ) as i64)
-        {
-            j.append(EventKind::md(
-                Venue::Binance,
-                "BTCUSDT",
-                MdPayload::Trade {
-                    price: to_fixed(65_020.0),
-                    size: to_fixed(0.2),
-                    side: Side::Buy,
-                    ts_exch_ms: BASE_MS + 500_000 + i * 100,
-                },
-            ))
-            .expect("trade");
-        }
-        j.flush().expect("flush");
-    }
-
-    let (addr, _ckpt_guard) = serve_for(
+    let (_ckpt, _ckpt_guard) = prepare_from_registry(
         "c9_four_positions_differ_and_stale_snapshot_does_not_stop_serving",
         dir.path(),
-    )
-    .await;
+    );
+
+    // Журнал уезжает ПОСЛЕ слепка — источник заведомо свежее слепка.
+    // Хвост дописывает ДРАЙВЕР, по строке реестра и ДО подъёма сервера (`C-255`).
+
+    let addr = serve(dir.path(), _ckpt).await;
     let mut ws = connect(&addr).await;
     send(&mut ws, subscribe("s1", canonical_selector_json())).await;
     let msg = recv(&mut ws).await.expect("сервер промолчал");
@@ -851,12 +924,12 @@ fn u1_guard_trap_actually_traps() {
 #[tokio::test]
 async fn u1_entry_missing_checkpoint_over_trap_gives_named_outcome() {
     let dir = journal_busy(2_000);
-    poison_segment(dir.path(), 0);
-    let (addr, _ckpt_guard) = serve_for(
+    let (_ckpt, _ckpt_guard) = prepare_from_registry(
         "u1_entry_missing_checkpoint_over_trap_gives_named_outcome",
         dir.path(),
-    )
-    .await;
+    );
+    poison_segment(dir.path(), 0);
+    let addr = serve(dir.path(), _ckpt).await;
     let mut ws = connect(&addr).await;
     send(&mut ws, subscribe("s1", canonical_selector_json())).await;
     let msg = recv(&mut ws).await.expect("сервер промолчал");
@@ -871,15 +944,15 @@ async fn u1_entry_missing_checkpoint_over_trap_gives_named_outcome() {
 #[tokio::test]
 async fn u1_entry_corrupt_checkpoint_over_trap_gives_named_outcome() {
     let dir = journal_busy(2_000);
+    let (_ckpt, _ckpt_guard) = prepare_from_registry(
+        "u1_entry_corrupt_checkpoint_over_trap_gives_named_outcome",
+        dir.path(),
+    );
     // Порчу слепка делает драйвер по строке реестра (`Stage::CkptCorrupt`), а не тело
     // сценария: иначе строку можно переклассифицировать, и фикстура этого не заметит.
     poison_segment(dir.path(), 0);
 
-    let (addr, _ckpt_guard) = serve_for(
-        "u1_entry_corrupt_checkpoint_over_trap_gives_named_outcome",
-        dir.path(),
-    )
-    .await;
+    let addr = serve(dir.path(), _ckpt).await;
     let mut ws = connect(&addr).await;
     send(&mut ws, subscribe("s1", canonical_selector_json())).await;
     let msg = recv(&mut ws).await.expect("сервер промолчал");
@@ -894,15 +967,15 @@ async fn u1_entry_corrupt_checkpoint_over_trap_gives_named_outcome() {
 #[tokio::test]
 async fn u1_entry_incompatible_checkpoint_over_trap_gives_named_outcome() {
     let dir = journal_busy(600);
+    let (_ckpt, _ckpt_guard) = prepare_from_registry(
+        "u1_entry_incompatible_checkpoint_over_trap_gives_named_outcome",
+        dir.path(),
+    );
     // Подделку версии провода делает драйвер по строке реестра (`Stage::CkptIncompatible`);
     // setup-страж «байты 12..16 несут версию» живёт там же, рядом с подделкой.
     poison_segment(dir.path(), 0);
 
-    let (addr, _ckpt_guard) = serve_for(
-        "u1_entry_incompatible_checkpoint_over_trap_gives_named_outcome",
-        dir.path(),
-    )
-    .await;
+    let addr = serve(dir.path(), _ckpt).await;
     let mut ws = connect(&addr).await;
     send(&mut ws, subscribe("s1", canonical_selector_json())).await;
     let msg = recv(&mut ws).await.expect("сервер промолчал");
@@ -918,38 +991,21 @@ async fn u1_entry_incompatible_checkpoint_over_trap_gives_named_outcome() {
 #[tokio::test]
 async fn u1_entry_stale_checkpoint_beyond_budget_gives_named_outcome() {
     let dir = journal_busy(300);
+    // Опись снимается ДО материализации строки: ловушка ставится в сегмент, который
+    // создаёт САМ ХВОСТ. Порядок здесь — предмет сценария, поэтому подготовка стоит
+    // между описью и ловушкой, а не в начале тела (`C-255`).
     let segs_before = std::fs::read_dir(dir.path())
         .expect("read_dir")
         .filter_map(Result::ok)
         .filter(|e| e.path().extension().is_some_and(|x| x == "jrnl"))
         .count();
-    {
-        let mut j = Journal::open_with(dir.path(), writer_cfg()).expect("open_with");
-        for i in 0..(m87_registry::registry_tail(
-            "u1_entry_stale_checkpoint_beyond_budget_gives_named_outcome",
-        ) as i64)
-        {
-            j.append(EventKind::md(
-                Venue::Binance,
-                "BTCUSDT",
-                MdPayload::Trade {
-                    price: to_fixed(65_000.0 + (i % 20) as f64),
-                    size: to_fixed(0.5),
-                    side: Side::Buy,
-                    ts_exch_ms: BASE_MS + 100_000 + i * 100,
-                },
-            ))
-            .expect("trade");
-        }
-        j.flush().expect("flush");
-    }
-    poison_segment(dir.path(), segs_before);
-
-    let (addr, _ckpt_guard) = serve_for(
+    let (_ckpt, _ckpt_guard) = prepare_from_registry(
         "u1_entry_stale_checkpoint_beyond_budget_gives_named_outcome",
         dir.path(),
-    )
-    .await;
+    );
+    poison_segment(dir.path(), segs_before);
+
+    let addr = serve(dir.path(), _ckpt).await;
     let mut ws = connect(&addr).await;
     send(&mut ws, subscribe("s1", canonical_selector_json())).await;
     let msg = recv(&mut ws).await.expect("сервер промолчал");
@@ -965,10 +1021,11 @@ async fn u1_entry_stale_checkpoint_beyond_budget_gives_named_outcome() {
 #[tokio::test]
 async fn u1_warm_path_is_served_over_trapped_head() {
     let dir = journal_busy(600);
+    let (_ckpt, _ckpt_guard) =
+        prepare_from_registry("u1_warm_path_is_served_over_trapped_head", dir.path());
     poison_segment(dir.path(), 0);
 
-    let (addr, _ckpt_guard) =
-        serve_for("u1_warm_path_is_served_over_trapped_head", dir.path()).await;
+    let addr = serve(dir.path(), _ckpt).await;
     let mut ws = connect(&addr).await;
     send(&mut ws, subscribe("s1", canonical_selector_json())).await;
     let msg = recv(&mut ws).await.expect("сервер промолчал");
@@ -984,33 +1041,14 @@ async fn u1_warm_path_is_served_over_trapped_head() {
 #[tokio::test]
 async fn u1_served_request_with_tail_increments_payload_counter() {
     let dir = journal_busy(300);
-    {
-        let mut j = Journal::open_with(dir.path(), writer_cfg()).expect("open_with");
-        for i in 0..(m87_registry::registry_tail(
-            "u1_served_request_with_tail_increments_payload_counter",
-        ) as i64)
-        {
-            j.append(EventKind::md(
-                Venue::Binance,
-                "BTCUSDT",
-                MdPayload::Trade {
-                    price: to_fixed(65_010.0),
-                    size: to_fixed(0.1),
-                    side: Side::Buy,
-                    ts_exch_ms: BASE_MS + 200_000 + i * 10,
-                },
-            ))
-            .expect("trade");
-        }
-        j.flush().expect("flush");
-    }
-
-    let before = serving_counters().journal_payload_bytes_read;
-    let (addr, _ckpt_guard) = serve_for(
+    let (_ckpt, _ckpt_guard) = prepare_from_registry(
         "u1_served_request_with_tail_increments_payload_counter",
         dir.path(),
-    )
-    .await;
+    );
+    // Хвост дописывает ДРАЙВЕР, по строке реестра и ДО подъёма сервера (`C-255`).
+
+    let before = serving_counters().journal_payload_bytes_read;
+    let addr = serve(dir.path(), _ckpt).await;
     let mut ws = connect(&addr).await;
     send(&mut ws, subscribe("s1", canonical_selector_json())).await;
     let msg = recv(&mut ws).await.expect("сервер промолчал");
