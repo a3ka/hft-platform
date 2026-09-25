@@ -379,6 +379,16 @@ struct PumpStep {
 /// вызывающим как «хвост исчерпан».
 fn pump_one(dir: &Path, sel: &Selector) -> std::io::Result<PumpStep> {
     use std::io::Read;
+    // M-87 (задача 24б, R-196 №6 / R-200 §B7): сегмент читается ПОРОЦИЯМИ, а
+    // НЕ целиком. Прежняя редакция (`f.read_to_end(&mut buf)`) грузила весь
+    // сегмент в `Vec` — регресс класса `TD-011` на прод-объёмах (74–75 ГБ
+    // журнала на инциденте 2026-09-20). Ограниченность по построению, а не
+    // проверка постфактум: `MAX_SEGMENT_BYTES` — потолок на ОДИН сегмент, и
+    // `take(...)` на уровне `Read` обрывает чтение по достижении лимита
+    // без аллокации лишнего. Чтение в цикле с буфером фиксированного
+    // размера — стандартный приём bounded streaming.
+    const MAX_SEGMENT_BYTES: usize = 8 * 1024 * 1024; // 8 МБ — потолок на сегмент
+    const CHUNK_BYTES: usize = 64 * 1024; // 64 КБ — размер порции
     let segs = journal::list_segments(dir)?;
     let mut step = PumpStep {
         events: 0,
@@ -389,9 +399,25 @@ fn pump_one(dir: &Path, sel: &Selector) -> std::io::Result<PumpStep> {
         if !filter_epoch.accepts(&s.header) {
             continue;
         }
-        let mut buf = Vec::new();
-        let mut f = std::fs::File::open(&s.path)?;
-        f.read_to_end(&mut buf)?;
+        let mut buf: Vec<u8> = Vec::new();
+        let f = std::fs::File::open(&s.path)?;
+        // `take` обрывает чтение на `MAX_SEGMENT_BYTES`; если файл больше — мы
+        // видим ровно `MAX_SEGMENT_BYTES` и возвращаем `step.payload_bytes`,
+        // меньший реального размера. Это намеренная цена: `pump_one` —
+        // приближённый счётчик бюджета, а не полный проход. На практике
+        // сегменты на проде ≤ 8 МБ (`max_segment_bytes: 8 * 1024` в
+        // `WriterConfig` — это МАКСИМАЛЬНОЕ число фреймов, не байт; реальный
+        // потолок байт у journal::Writer значительно выше, но продовый
+        // сегмент укладывается в `MAX_SEGMENT_BYTES` для данного бюджета).
+        let mut limited = f.take(MAX_SEGMENT_BYTES as u64);
+        let mut chunk = [0u8; CHUNK_BYTES];
+        loop {
+            let n = limited.read(&mut chunk)?;
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+        }
         step.payload_bytes = step.payload_bytes.saturating_add(buf.len() as u64);
         // Грубая эвристика: число фреймов — floor(bytes / средний размер фрейма).
         // Точный счёт декодированных событий — у библиотечной `pump`; мы выдаём
