@@ -422,10 +422,17 @@ pub struct SlotGuard {
 impl Drop for SlotGuard {
     fn drop(&mut self) {
         let prev_local = self.local.fetch_sub(1, Ordering::SeqCst);
-        let prev_global = crate::metrics::SLOTS_IN_FLIGHT_GLOBAL.load(Ordering::SeqCst);
-        let next_global = prev_global.saturating_sub(1);
-        crate::metrics::SLOTS_IN_FLIGHT_GLOBAL.store(next_global, Ordering::SeqCst);
-        let _ = (prev_local, prev_global, next_global);
+        // M-87 (задача 25, R-196 №7 / R-200 §B7): глобальный счётчик занят
+        // через `fetch_sub`, а НЕ через пару `load + store`. Прежняя редакция
+        // читала текущее значение, вычисляла `prev.saturating_sub(1)` и
+        // записывала обратно — между `load` и `store` соседний поток успевал
+        // сделать СВОЙ `store`, и декремент пропадал (замер круга R-196:
+        // потеряно 104 декремента из 4000 циклов при восьми потоках).
+        // Взятие слота уже написано верно (`fetch_add`); освобождение
+        // приведено к той же атомарной форме. Асимметрия — признак дефекта,
+        // и она снята.
+        let prev_global = crate::metrics::SLOTS_IN_FLIGHT_GLOBAL.fetch_sub(1, Ordering::SeqCst);
+        let _ = (prev_local, prev_global);
     }
 }
 
