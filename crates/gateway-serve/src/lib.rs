@@ -987,11 +987,33 @@ pub mod server {
                     slot_guard_for_session = if let Some(slots) = inner.slots.as_ref() {
                         match slots.try_acquire() {
                             Some(g) => {
-                                metrics::set_slots_in_flight_pub(slots.in_flight() as u64);
+                                // M-87 (задача 26, R-201 Н-2 + багфикс): `try_acquire`
+                                // внутри делает `SLOTS_IN_FLIGHT_GLOBAL.fetch_add(1)`, и
+                                // на освобождении `SlotGuard::drop` делает
+                                // `SLOTS_IN_FLIGHT_GLOBAL.fetch_sub(1)`. Прежняя
+                                // `set_slots_in_flight_pub(slots.in_flight())` была
+                                // ПАРАЗИТНОЙ: `slots.in_flight()` — ЛОКАЛЬНЫЙ счётчик
+                                // ЭТОГО сервера, а `SLOTS_IN_FLIGHT_GLOBAL` — общий
+                                // процессный атомик. На проде (один сервер) локальный
+                                // равен глобальному, и `store` ничего не менял; под
+                                // параллельным прогоном cargo test (несколько `Server`
+                                // в одном бинаре, шареющие глобальный счётчик) `store`
+                                // ПЕРЕЗАПИСЫВАЛ глобальный на локальный ОДНОГО из
+                                // серверов — счёт соседа терялся, и парный `fetch_sub`
+                                // на его `Drop` видел `prev_global == 0` и заворачивал
+                                // в `u64::MAX`. Этот заворот сегодня ловится
+                                // `debug_assert!(prev_global > 0)` рядом с `fetch_sub`
+                                // (`admission.rs`), задача 26 — поэтому на красном
+                                // прогоне теста `c5_entry_refusal_…` заворот ВИДЕН, а
+                                // не молчит. Здесь `store` снят: `fetch_add` в
+                                // `try_acquire` + `fetch_sub` в `Drop` — единственный
+                                // путь модификации глобального счётчика, и пара
+                                // приобретение/освобождение гарантирована
+                                // единственным конструктором `SlotGuard` (проверено
+                                // архитектором, R-201 Н-2).
                                 Some(g)
                             }
                             None => {
-                                metrics::set_slots_in_flight_pub(slots.in_flight() as u64);
                                 metrics::inc_refusals_supported_pub();
                                 send_v1_error(
                                     sink,
