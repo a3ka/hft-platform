@@ -115,21 +115,30 @@ fn journal_of(n: u64) -> tempfile::TempDir {
     dir
 }
 
-fn repo_root() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(std::path::Path::parent)
-        .expect("корень репозитория")
-        .to_path_buf()
-}
-
-/// Строки `crates/gateway-serve/src/**`, без комментариев. Греп по тексту вместе с
-/// комментариями — ровно та ошибка, за которую шаг `task8` получил находку `R-200` §N4
-/// (из девяти совпадений семь были строками `//`).
-fn src_code_lines() -> Vec<String> {
-    let mut out = Vec::new();
-    let dir = repo_root().join("crates/gateway-serve/src");
-    let mut stack = vec![dir];
+/// **`c5` — ВТОРОЙ ПУТЬ ЗАПИСИ В СЧЁТЧИК СЛОТОВ ЗАКРЫТ (`R-201` Н-2, доработка).**
+///
+/// **Здесь признаётся моя ошибка расследования, и она поучительна.** Заводя задачу 26, я
+/// утверждал: «заворот недостижим, единственный конструктор `SlotGuard` — внутри
+/// `try_acquire`», и снял это грепом по конструкторам. Утверждение оказалось ЛОЖНЫМ:
+/// разработчик поставил `debug_assert` — и прогон немедленно покраснел. Существовал ВТОРОЙ
+/// путь записи, `set_slots_in_flight_pub(slots.in_flight())`, паразитно писавший ЛОКАЛЬНЫЙ
+/// счётчик в ПРОЦЕССНЫЙ атомик: под параллельным прогоном соседние серверы затирали счёт
+/// друг друга, и на чужом `Drop` `fetch_sub` видел ноль.
+///
+/// Мой греп смотрел на конструкторы `SlotGuard`, а вопрос был о путях записи В СЧЁТЧИК —
+/// команда не могла опровергнуть утверждение, потому что искала не то. Тот же класс, что
+/// «грепнул имя гейта вместо имени спеки»: проверка, не способная дать отрицательный ответ,
+/// не является проверкой.
+///
+/// Вызовы сняты разработчиком, но **функция осталась определённой** — дверь закрыта, а не
+/// заложена. Этот оракул держит её закрытой: единственные пути движения счётчика — парные
+/// `fetch_add` в `try_acquire` и `fetch_sub` в `Drop`. Любая третья запись возвращает ровно
+/// тот дефект, который `debug_assert` поймал на первом прогоне.
+#[test]
+fn c5_slot_counter_has_exactly_two_writers() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut writers: Vec<String> = Vec::new();
+    let mut stack = vec![root.join("src")];
     while let Some(d) = stack.pop() {
         for e in std::fs::read_dir(&d).expect("read_dir src") {
             let p = e.expect("entry").path();
@@ -140,20 +149,42 @@ fn src_code_lines() -> Vec<String> {
             if p.extension().and_then(|x| x.to_str()) != Some("rs") {
                 continue;
             }
-            for line in std::fs::read_to_string(&p).expect("read src").lines() {
+            let text = std::fs::read_to_string(&p).expect("read src");
+            for (n, line) in text.lines().enumerate() {
                 let t = line.trim();
                 if t.starts_with("//") || t.is_empty() {
                     continue;
                 }
-                out.push(t.to_string());
+                // ЗАПИСЬ — это `store`/`swap`/`fetch_add`/`fetch_sub` по счётчику, либо
+                // ВЫЗОВ обёртки. Определение обёртки (`pub fn set_slots_in_flight_pub`)
+                // записью не является: опасен вызов, а не наличие функции.
+                let touches_counter = t.contains("SLOTS_IN_FLIGHT_GLOBAL");
+                let is_write =
+                    t.contains(".store(") || t.contains(".swap(") || t.contains(".fetch_");
+                let calls_setter = t.contains("set_slots_in_flight_pub(") && !t.contains("pub fn ");
+                if (touches_counter && is_write) || calls_setter {
+                    writers.push(format!(
+                        "{}:{}: {}",
+                        p.file_name().and_then(|x| x.to_str()).unwrap_or("?"),
+                        n + 1,
+                        t
+                    ));
+                }
             }
         }
     }
     assert!(
-        !out.is_empty(),
-        "SETUP-СТРАЖ: код транспорта не прочитан — канарейки c2/c3 зеленели бы на пустоте"
+        !writers.is_empty(),
+        "SETUP-СТРАЖ: путей записи не найдено ВОВСЕ — разбор смотрит не туда, и оракул          зеленел бы на пустоте"
     );
-    out
+    assert_eq!(
+        writers.len(),
+        2,
+        "путей записи в счётчик занятых слотов должно быть РОВНО ДВА (парные `fetch_add` при          взятии и `fetch_sub` при освобождении), найдено {}:\n  {}\n\
+         Третий путь возвращает дефект, который `debug_assert` поймал на первом же прогоне:          запись ЛОКАЛЬНОГО значения в ПРОЦЕССНЫЙ атомик затирает счёт соседа, и на чужом          освобождении `fetch_sub` заворачивается в `u64::MAX`.",
+        writers.len(),
+        writers.join("\n  ")
+    );
 }
 
 /// **`c1` — ВЕТКА «НЕТ СЛЕПКА» ОБЯЗАНА БЫТЬ FAIL-CLOSED (условие №4).**
