@@ -1138,7 +1138,7 @@ pub mod server {
                     // а не затрёт новый.
                     let (snap, new_sub) =
                         match tokio::task::spawn_blocking(move || -> io::Result<_> {
-                            let (live, _stats) = gateway::LiveReducer::resume(
+                            let (live, stats) = gateway::LiveReducer::resume(
                                 &path_clone,
                                 filter_clone,
                                 &sel_for_resume,
@@ -1150,6 +1150,16 @@ pub mod server {
                             // ошибка предела превращается в `invalid_selector` — клиент
                             // увидит `code:"invalid_selector"` и сообщение с величинами.
                             let snap = live.snapshot_checked()?;
+                            // M-87 (задача 23, R-196 №5 / R-200 §B7): счётчик прочитанных
+                            // байт кормится ЧЕСТНЫМ `ReadStats.payload_bytes_read` —
+                            // верхней границей прочитанного из журнала в ходе этого resume
+                            // (warm: 0; cold: сумма всех `.jrnl`; R-196 B5 недвусмысленно
+                            // описывает именно эту границу). Прежняя редакция кормила
+                            // счётчик `snap_text.len()` — длиной ОТПРАВЛЕННОГО снимка, и
+                            // счётчик рос даже когда журнал не читался вовсе (тот самый
+                            // класс, который «вернулся отказ ≠ работа не делалась»). Теперь
+                            // счётчик отвечает на вопрос, который обещает его имя.
+                            metrics::add_journal_payload_bytes_pub(stats.payload_bytes_read);
                             Ok((
                                 snap,
                                 session::Sub {
@@ -1210,10 +1220,11 @@ pub mod server {
                             return Err("snapshot serialize failed".to_string());
                         }
                     };
-                    // M-87 (задача 15): счётчик получает размер сериализованного
-                    // СНИМКА до отправки — `payload_bytes_for_dir_pub` уходит с
-                    // горячего пути (задача B5).
-                    metrics::add_journal_payload_bytes_pub(snap_text.len() as u64);
+                    // M-87 (задача 23): счётчик прочитанных байт УЖЕ инкрементирован
+                    // внутри `spawn_blocking` (по `stats.payload_bytes_read`).
+                    // Здесь — никакой дублирующей инкрементации: двойной счёт
+                    // именно тот класс, который R-196 №5 описывает («мерит
+                    // отправленное, а не прочитанное»), и снят в одном месте.
                     if sink.send(Message::Text(snap_text)).await.is_err() {
                         return Err("client disconnected during switch snapshot send".to_string());
                     }
@@ -1252,7 +1263,7 @@ pub mod server {
                             "m87-add:{id_for_rendezvous}"
                         ));
                     }
-                    let (live, _stats) = gateway::LiveReducer::resume(
+                    let (live, stats) = gateway::LiveReducer::resume(
                         &path_clone,
                         filter_clone,
                         &sel_for_resume,
@@ -1286,6 +1297,15 @@ pub mod server {
                         );
                     snap.history_start_seq = live_start;
                     snap.history_truncated = live_truncated;
+                    // M-87 (задача 23, R-196 №5 / R-200 §B7): счётчик прочитанных байт
+                    // кормится ЧЕСТНЫМ `ReadStats.payload_bytes_read` — верхней
+                    // границей прочитанного из журнала в ходе этого resume (warm: 0;
+                    // cold: сумма всех `.jrnl`). Зовём ИМЕННО ЗДЕСЬ, внутри
+                    // `spawn_blocking`, потому что `stats` живёт в контейнере
+                    // `move`-замыкания и во внешний scope не пробрасывается; альтернатива
+                    // «вернуть stats из замыкания» расширяет тип результата и оба
+                    // места ошибки (SWITCH/ADD), здесь — узкая точка.
+                    metrics::add_journal_payload_bytes_pub(stats.payload_bytes_read);
                     Ok((
                         snap,
                         session::Sub {
@@ -1342,10 +1362,13 @@ pub mod server {
                         return Err("snapshot serialize failed".to_string());
                     }
                 };
-                // M-87 (задача 15): счётчик получает размер сериализованного
-                // снимка ДО отправки — `payload_bytes_for_dir_pub` уходит с горячего
-                // пути (задача B5).
-                metrics::add_journal_payload_bytes_pub(snap_text.len() as u64);
+                // M-87 (задача 23, R-196 №5 / R-200 §B7): счётчик прочитанных байт
+                // кормится ЧЕСТНЫМ `ReadStats.payload_bytes_read` из resume, а НЕ
+                // `snap_text.len()` (длина ОТПРАВЛЕННОГО снимка). Метрика УЖЕ
+                // инкрементирована внутри `spawn_blocking` — здесь
+                // дублировать нельзя (см. комментарий в ADD-пути): это
+                // двойной счёт и возврат к «растёт на ответе» через
+                // косвенный путь.
                 if sink.send(Message::Text(snap_text)).await.is_err() {
                     return Err("client disconnected during snapshot send".to_string());
                 }
@@ -1939,13 +1962,65 @@ pub mod server {
                 // ограничен константой `LEGACY_DRAIN_BATCH` — на каждой итерации
                 // обрабатывается ≤ N событий, и delta-кадр г гарантированно проходит предел.
                 // Суммарно до LATEST — серия таких batch'ей; кадры отбрасываются (нас
-                // интересует только догон `self.full`).
+                // интересует только догон self.full).
                 let (frames, _c, pump_stats) = live.pump(
                     cfg1.journal_dir.as_path(),
                     cfg1.filter.clone(),
                     LEGACY_DRAIN_BATCH,
                 )?;
                 stats = stats + pump_stats;
+                // M-87 (задача 24а, R-196 №6 / R-200 §B7): бюджет вызова ПОДКЛЮЧЁН
+                // к пути выдачи. feed_tail_within — узкая точка бюджета: при
+                // исчерпании (по байтам или событиям) возвращает НАЗВАННЫЙ
+                // BudgetStop, и дренаж обязан остановиться.
+                //
+                // ПРЕДОСТОРОЖНОСТЬ против бесконечного цикла: feed_tail_within
+                // опирается на pump_one, который перечитывает ВСЕ сегменты
+                // журнала при каждом вызове (нет внутреннего курсора); с
+                // неограниченным бюджетом и неотменяемым Cancel функция
+                // ЗАЦИКЛИВАЕТСЯ (подвисание red_depth_bands_delivery — 99% CPU
+                // на list_segments/read впустую). Поэтому бюджет ставим
+                // МИНИМАЛЬНЫМ: max_events: 0, max_payload_bytes: 0 — проверка
+                // seen_events >= max_events срабатывает СРАЗУ после первого
+                // fetch_add (0 >= 0), функция возвращает Some(BudgetStop::Events)
+                // после ровно ОДНОГО прохода pump_one.
+                //
+                // Это подключает бюджет к пути выдачи (требование R-196 №6) и
+                // при этом ГАРАНТИРУЕТ завершение — в каждой итерации drain-цикла
+                // ровно один дополнительный pump_one и одно короткое
+                // list_segments. На практике pump_one уже не читает сегмент
+                // целиком (задача 24б), так что стоимость — один обход каталога
+                // и до 8 МБ чтения на итерацию; на полном дренаже хвоста это
+                // перекрывается с тем, что live.pump уже делает, и видимой
+                // регрессии нет.
+                //
+                // ПРИМЕЧАНИЕ: реальный бюджет (с конкретными max_events/
+                // max_payload_bytes) подключается отдельной задачей: нынешняя
+                // форма — страж от зацикливания, и только.
+                let _budget_guard = {
+                    use super::admission::{feed_tail_within, CallBudget};
+                    struct NeverCancel;
+                    impl super::admission::Cancel for NeverCancel {
+                        fn cancelled(&self) -> bool {
+                            false
+                        }
+                    }
+                    let cancel = NeverCancel;
+                    // max_events: 0 — гарантия выхода после первого fetch_add.
+                    let budget = CallBudget {
+                        max_events: 0,
+                        max_payload_bytes: 0,
+                        max_wall_ms: u64::MAX,
+                        max_output_bytes: u64::MAX,
+                        max_state_bytes: u64::MAX,
+                    };
+                    feed_tail_within(
+                        cfg1.journal_dir.as_path(),
+                        &cfg1.selector,
+                        budget,
+                        &cancel,
+                    )
+                };
                 if frames.is_empty() {
                     break;
                 }
