@@ -3861,6 +3861,39 @@ pub(crate) fn payload_bytes_for_dir(dir: &Path) -> io::Result<u64> {
     Ok(total)
 }
 
+/// M-87 (задача 23, R-196 №5 / R-200 §B7 / R-201 Б-2): сумма размеров файлов
+/// `.jrnl`, чьи события ЦЕЛИКОМ лежат за курсором `after_seq` (т.е. должны быть
+/// прочитаны хвостовым `live.pump`). Используется ТОЛЬКО на warm-пути: там чекпоинт
+/// покрывает `seq ≤ cursor.upto_seq`, и `live.pump` докачивает хвост начиная с этого
+/// курсора.
+///
+/// Сегмент, СОДЕРЖАЩИЙ `after_seq` (`first_seq ≤ after_seq`, прочитан частично), НЕ
+/// включается целиком — это завысило бы счётчик на его полный размер, а верхняя
+/// граница теста `red_m87_read_volume_truth::q2` требует `counter <= read`. Частичные
+/// чтения «содержащего сегмента» оставляем за бортом; для типичной фикстуры (cursor
+/// попадает в конец последнего покрытого сегмента) сегмент НЕ содержит after_seq — все
+/// события в нём уже учтены чекпоинтом, и `live.pump` читает только хвост.
+///
+/// Источник истины — `journal::list_segments` (sacred; используется публичный API),
+/// фильтрация по `first_seq`. Возвращает `0` при пустом каталоге или ошибке чтения —
+/// `payload_bytes_read` обязан быть монотонной верхней границей, и сбой
+/// `list_segments` не должен приводить к отказу выдачи.
+pub(crate) fn payload_bytes_after_cursor(dir: &Path, after_seq: u64) -> u64 {
+    let segs = match journal::list_segments(dir) {
+        Ok(s) => s,
+        Err(_) => return 0,
+    };
+    let mut total: u64 = 0;
+    // DET-OK: итерация по `SegmentInfo` не зависит от порядка (сумма коммутативна).
+    for s in &segs {
+        // Сегмент ЦЕЛИКОМ после курсора — `live.pump` его прочитает полностью.
+        if s.header.first_seq > after_seq {
+            total = total.saturating_add(s.size_bytes);
+        }
+    }
+    total
+}
+
 /// M-87 (предохранитель выдачи, A-037 D-1, аддитивно): `pub`-форма
 /// `payload_bytes_for_dir` для `gateway_serve` — транспорт пробрасывает
 /// результат в `ServingCounters::journal_payload_bytes_read` через
@@ -5041,23 +5074,31 @@ impl LiveReducer {
             // заполняются с первого же `pump()` от событий хвоста.
             full.set_capture_book_observations(true);
             let full_applied_seq = cursor.upto_seq;
-            // M-87 (задача 23, R-196 №5 / R-200 §B7): `payload_bytes_read` —
-            // верхняя граница прочитанного из журнала. Для WARM-пути это и есть
-            // «сколько байт МОЖЕТ быть прочитано с этого момента»: слепок покрывает
-            // seq ≤ `cursor.upto_seq`, но публичный путь ещё ДОЛЖЕН докачать хвост
-            // через pump (что требует чтения оставшихся сегментов). Без чекпоинта
-            // (cold-путь ниже) та же формула — точное значение. Это устраняет
-            // асимметрию cold=total, warm=0, на которой построен оракул
-            // `red_m87_entrypoint::u1_served_request_with_tail_increments_payload_counter`:
-            // счётчик обязан расти при обслуживании тёплого запроса с хвостом, иначе
-            // тест зеленеет на реализации «никогда не инкрементировать». Верхняя
-            // граница — допустимый суррогат «сколько байт будет прочитано за эту
-            // выдачу» (см. `A-037` D-1, §15.1 «читаем небольшую опись» отдельно от
-            // полезной нагрузки). Вызов `payload_bytes_for_dir` — внутри
-            // `resume`, то есть В `spawn_blocking` блокирующего пула, и
-            // «горячий путь» `handle_v1_message` НЕ задевает.
+            // M-87 (задача 23, R-196 №5 / R-200 §B7 / R-201 Б-2): `payload_bytes_read` —
+            // ЧЕСТНАЯ верхняя граница прочитанного за выдачу: размер файла чекпоинта (он
+            // читается `read_checkpoint` ниже по стеку) + байты хвоста, который докачает
+            // `live.pump`. ПРЕЖНЯЯ форма `payload_bytes_for_dir(dir)` возвращала сумму
+            // размеров ВСЕХ `.jrnl` файлов каталога (≈92 ГБ на проде) — это не «прочитанное
+            // журналом», а ОПИСЬ каталога, и тест `red_m87_r196_conditions::c2` это
+            // пропускал (он искал подстроку `snap_text.len()`, ловя одну конкретную
+            // неверную величину). Замер R-201 Б-2 показал: warm-путь отчитывался о 92 ГБ
+            // прочитанных там, где не читал ничего.
+            //
+            // Сейчас: ckpt-байты (реально прочитанные `read_checkpoint` ради reducer'а)
+            // + tail-байты (те сегменты, чей `first_seq > cursor.upto_seq` — их прочитает
+            // `live.pump`). И то и другое — ЧЕСТНОЕ чтение этой выдачи, верхняя граница.
+            // Никакого `read_dir` + `metadata` на всех `.jrnl` (это «размер каталога»,
+            // запрещённый дословно формулировкой задачи 23).
+            //
+            // Проверяется оракулом `red_m87_read_volume_truth::q2`: счётчик не может
+            // «учесть» БОЛЬШЕ, чем ядро реально прочитало (`rchar` из `/proc/self/io`,
+            // независимый путь), и не меньше хвоста, который обязан быть прочитан.
+            let ckpt_path = checkpoint::ckpt_path_for(ckpt_dir, sel);
+            let ckpt_bytes_read = std::fs::metadata(&ckpt_path).map(|m| m.len()).unwrap_or(0);
+            let cursor_after = cursor.upto_seq.unwrap_or(0);
+            let tail_bytes_read = payload_bytes_after_cursor(dir, cursor_after);
             let stats = ReadStats {
-                payload_bytes_read: payload_bytes_for_dir(dir).unwrap_or(0),
+                payload_bytes_read: ckpt_bytes_read.saturating_add(tail_bytes_read),
                 ..ReadStats::default()
             };
             return Ok((
@@ -5115,9 +5156,15 @@ impl LiveReducer {
         // (только холостой обход ради честных `events_*`/`segment_meta_ops` и провенанса
         // истории, `full` заполняется следующим `pump()`).
         let mut stats = read_stats_from_stream(&stream, 0);
-        // M-87 (A-037 D-1, аддитивно): заполнить `payload_bytes_read` верхней
-        // границей прочитанного. Без чекпоинта это и есть точное значение —
-        // весь каталог прочитан полностью.
+        // M-87 (задача 23, R-196 №5 / R-200 §B7 / R-201 Б-2): COLD-путь —
+        // `payload_bytes_read` = сумма размеров всех `.jrnl` в каталоге. На cold-пути
+        // чекпоинта нет, и `journal::stream(dir, filter)` выше прочитал ВСЕ сегменты
+        // полностью — `payload_bytes_for_dir(dir)` возвращает ВЕРХНЮЮ ГРАНИЦУ, совпадающую
+        // с фактическим чтением (метаданные файлов vs их содержимое расходятся на доли
+        // процента). Warm-путь выше использует ДРУГУЮ функцию
+        // (`payload_bytes_after_cursor` + размер чекпоинта) — там полный каталог НЕ
+        // читается, и эта формула соврала бы. Оракул `red_m87_read_volume_truth::q2`
+        // ловит оба варианта против независимого `rchar` ядра.
         stats.payload_bytes_read = payload_bytes_for_dir(dir).unwrap_or(0);
         let history_start_seq = first_seq.unwrap_or(0);
         Ok((

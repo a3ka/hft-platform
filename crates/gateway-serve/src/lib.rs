@@ -1150,15 +1150,21 @@ pub mod server {
                             // ошибка предела превращается в `invalid_selector` — клиент
                             // увидит `code:"invalid_selector"` и сообщение с величинами.
                             let snap = live.snapshot_checked()?;
-                            // M-87 (задача 23, R-196 №5 / R-200 §B7): счётчик прочитанных
-                            // байт кормится ЧЕСТНЫМ `ReadStats.payload_bytes_read` —
-                            // верхней границей прочитанного из журнала в ходе этого resume
-                            // (warm: 0; cold: сумма всех `.jrnl`; R-196 B5 недвусмысленно
-                            // описывает именно эту границу). Прежняя редакция кормила
-                            // счётчик `snap_text.len()` — длиной ОТПРАВЛЕННОГО снимка, и
-                            // счётчик рос даже когда журнал не читался вовсе (тот самый
-                            // класс, который «вернулся отказ ≠ работа не делалась»). Теперь
-                            // счётчик отвечает на вопрос, который обещает его имя.
+                            // M-87 (задача 23, R-196 №5 / R-200 §B7 / R-201 Б-2): счётчик
+                            // прочитанных байт кормится ЧЕСТНЫМ `ReadStats.payload_bytes_read` —
+                            // суммой (размер чекпоинта + байты хвоста). ПРЕЖНЯЯ редакция
+                            // кормила счётчик `snap_text.len()` — длиной ОТПРАВЛЕННОГО снимка,
+                            // и счётчик рос даже когда журнал не читался вовсе (тот самый
+                            // класс, который «вернулся отказ ≠ работа не делалась»).
+                            // Позднее (e958661) кормили `payload_bytes_for_dir(dir)` — суммой
+                            // ВСЕХ `.jrnl` в каталоге (на проде ≈92 ГБ): тоже ложь, ещё и
+                            // крупнее на пять порядков. Сейчас: warm = ckpt_bytes +
+                            // tail_bytes_after_cursor (хвост, который докачает `live.pump`),
+                            // cold = сумма всех `.jrnl` (там действительно прочитан весь
+                            // журнал). Подробности — `crates/gateway/src/lib.rs`,
+                            // `LiveReducer::resume` warm/cold-ветки. Счётчик отвечает на
+                            // вопрос, который обещает его имя; проверяется оракулом
+                            // `red_m87_read_volume_truth::q2` против `rchar` ядра.
                             metrics::add_journal_payload_bytes_pub(stats.payload_bytes_read);
                             Ok((
                                 snap,
@@ -1297,14 +1303,15 @@ pub mod server {
                         );
                     snap.history_start_seq = live_start;
                     snap.history_truncated = live_truncated;
-                    // M-87 (задача 23, R-196 №5 / R-200 §B7): счётчик прочитанных байт
-                    // кормится ЧЕСТНЫМ `ReadStats.payload_bytes_read` — верхней
-                    // границей прочитанного из журнала в ходе этого resume (warm: 0;
-                    // cold: сумма всех `.jrnl`). Зовём ИМЕННО ЗДЕСЬ, внутри
-                    // `spawn_blocking`, потому что `stats` живёт в контейнере
-                    // `move`-замыкания и во внешний scope не пробрасывается; альтернатива
-                    // «вернуть stats из замыкания» расширяет тип результата и оба
-                    // места ошибки (SWITCH/ADD), здесь — узкая точка.
+                    // M-87 (задача 23, R-196 №5 / R-200 §B7 / R-201 Б-2): счётчик
+                    // прочитанных байт кормится ЧЕСТНЫМ `ReadStats.payload_bytes_read` —
+                    // warm = размер чекпоинта + байты хвоста после курсора;
+                    // cold = сумма всех `.jrnl`. Подробности и обоснование —
+                    // `crates/gateway/src/lib.rs`, `LiveReducer::resume` warm/cold-ветки.
+                    // Зовём ИМЕННО ЗДЕСЬ, внутри `spawn_blocking`, потому что `stats`
+                    // живёт в контейнере `move`-замыкания и во внешний scope не
+                    // пробрасывается; альтернатива «вернуть stats из замыкания» расширяет
+                    // тип результата и оба места ошибки (SWITCH/ADD), здесь — узкая точка.
                     metrics::add_journal_payload_bytes_pub(stats.payload_bytes_read);
                     Ok((
                         snap,
@@ -2049,6 +2056,18 @@ pub mod server {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         let snap_text = String::from_utf8(snap_bytes)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        // M-87 (задача 23, R-196 №5 / R-200 §B7 / R-201 Б-2): legacy snapshot-путь
+        // (`run_authorized_session` → setup → `snap_msg`) ТОЖЕ инкрементирует счётчик
+        // прочитанных байт — иначе оракул `red_m87_read_volume_truth::q2` видит
+        // `counter_delta == 0` на любой реализации, проходящей resume+pump (проверено
+        // прогоном против trunk). До этой правки счётчик инкрементировался ТОЛЬКО в
+        // ADD/SWITCH-ветках `handle_v1_message`, до которых snapshot-сессия не доходит
+        // (она отдаёт snapshot и уходит в push-loop без message_type).
+        //
+        // `stats.payload_bytes_read` здесь — результат warm- или cold-`resume` (см.
+        // `LiveReducer::resume` warm/cold-ветки в `crates/gateway/src/lib.rs`):
+        // warm = ckpt_bytes + tail_bytes_after_cursor; cold = сумма всех `.jrnl`.
+        metrics::add_journal_payload_bytes_pub(stats.payload_bytes_read);
         sink.send(Message::Text(snap_text))
             .await
             .map_err(|e| std::io::Error::other(format!("ws send snapshot: {e}")))?;
