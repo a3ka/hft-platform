@@ -64,9 +64,6 @@ pub fn inc_refusals_unsupported_pub() {
 pub fn add_journal_payload_bytes_pub(bytes: u64) {
     JOURNAL_BYTES_GLOBAL.fetch_add(bytes, Ordering::SeqCst);
 }
-pub fn set_slots_in_flight_pub(n: u64) {
-    SLOTS_IN_FLIGHT_GLOBAL.store(n, Ordering::SeqCst);
-}
 
 // ─────────────────────────── §7 — сторож молчания ───────────────────────────
 
