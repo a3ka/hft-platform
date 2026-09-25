@@ -1096,12 +1096,6 @@ pub mod server {
                 // (б) id новый — ADD с проверкой cap.
                 let path_clone = inner.cfg.journal_dir.clone();
                 let filter_clone = inner.cfg.filter.clone();
-                // M-87 (задача 17, §14.1septies): для пересчёта провенанса истории против
-                // ТЕКУЩЕГО начала журнала нужно передать в spawn_blocking отдельные копии
-                // пути и фильтра (после `move ||` мы `inner` уже не вернём — его закрытие
-                // вынесло локальные `path_for_history`/`filter_for_history`).
-                let path_for_history = inner.cfg.journal_dir.clone();
-                let filter_for_history = inner.cfg.filter.clone();
                 let ckpt_clone = inner
                     .cfg
                     .checkpoint_dir
@@ -1196,14 +1190,13 @@ pub mod server {
                             return Err("snapshot serialize failed".to_string());
                         }
                     };
-                    // M-87 (задача 15): счётчик получает размер сериализованного
-                    // СНИМКА до отправки — `payload_bytes_for_dir_pub` уходит с
-                    // горячего пути (задача B5).
-                    metrics::add_journal_payload_bytes_pub(snap_text.len() as u64);
                     if sink.send(Message::Text(snap_text)).await.is_err() {
                         return Err("client disconnected during switch snapshot send".to_string());
                     }
                     metrics::inc_successes_pub();
+                    if let Ok(n) = gateway::payload_bytes_for_dir_pub(&inner.cfg.journal_dir) {
+                        metrics::add_journal_payload_bytes_pub(n);
+                    }
                     tracing::debug!(sub = %switched_id, "v1 subscribe (switch) ok");
                     return Ok(());
                 }
@@ -1255,21 +1248,7 @@ pub mod server {
                             "PL-I-5 cap exceeded: response would exceed limit",
                         ));
                     }
-                    let mut snap = live.snapshot_checked()?;
-                    // M-87 (задача 17, §14.1septies): пересчитать провенанс истории
-                    // против ТЕКУЩЕГО начала журнала. `LiveReducer` хранит замороженные
-                    // из чекпоинта `history_*`; ретеншен между снятием и обслуживанием
-                    // мог удалить ранние сегменты, и `history_truncated=false` в слепке
-                    // соврёт: реплей не воспроизведёт то, что обслужено (VB-I-11).
-                    if let Ok((live_start, live_truncated)) =
-                        gateway::checkpoint::current_history_provenance(
-                            &path_for_history,
-                            filter_for_history.clone(),
-                        )
-                    {
-                        snap.history_start_seq = live_start;
-                        snap.history_truncated = live_truncated;
-                    }
+                    let snap = live.snapshot_checked()?;
                     Ok((
                         snap,
                         session::Sub {
@@ -1326,14 +1305,13 @@ pub mod server {
                         return Err("snapshot serialize failed".to_string());
                     }
                 };
-                // M-87 (задача 15): счётчик получает размер сериализованного
-                // снимка ДО отправки — `payload_bytes_for_dir_pub` уходит с горячего
-                // пути (задача B5).
-                metrics::add_journal_payload_bytes_pub(snap_text.len() as u64);
                 if sink.send(Message::Text(snap_text)).await.is_err() {
                     return Err("client disconnected during snapshot send".to_string());
                 }
                 metrics::inc_successes_pub();
+                if let Ok(n) = gateway::payload_bytes_for_dir_pub(&inner.cfg.journal_dir) {
+                    metrics::add_journal_payload_bytes_pub(n);
+                }
                 tracing::debug!(sub = %id_for_insert, "v1 subscribe ok");
                 Ok(())
             }
@@ -1934,24 +1912,10 @@ pub mod server {
             // «vantage на малом журнале + предмет на плотном», оба молчание/ошибка легитимны;
             // подробнее — §4bis.1bis спеки). Никакого «помеченного усечения через обрезку
             // bubbles» нет и не было с `f2ac1c8`.
-            let mut snap = match live.snapshot_checked() {
-                Ok(snap) => snap,
+            let snap_msg = match live.snapshot_checked() {
+                Ok(snap) => ServeMsg::Snapshot(snap),
                 Err(e) => return Err(e),
             };
-            // M-87 (задача 17, §14.1septies): пересчитать провенанс истории против
-            // ТЕКУЩЕГО начала журнала. `LiveReducer` хранит замороженные `history_*`
-            // из чекпоинта; ретеншен между снятием и обслуживанием мог удалить ранние
-            // сегменты, и `history_truncated=false` в слепке соврёт (VB-I-11).
-            if let Ok((live_start, live_truncated)) =
-                crate::_gw::current_history_provenance(
-                    cfg1.journal_dir.as_path(),
-                    cfg1.filter.clone(),
-                )
-            {
-                snap.history_start_seq = live_start;
-                snap.history_truncated = live_truncated;
-            }
-            let snap_msg = ServeMsg::Snapshot(snap);
             Ok((snap_msg, stats, live, at))
         })
         .await;
@@ -2391,9 +2355,8 @@ pub mod server {
 #[doc(hidden)]
 pub mod _gw {
     pub use gateway::{
-        checkpoint::current_history_provenance, frames_since, snapshot, snapshot_from_checkpoint,
-        Cursor, Frame, LiveReducer, ReadStats, Selector, SeriesBundle, Snapshot,
-        GATEWAY_SCHEMA_VERSION,
+        frames_since, snapshot, snapshot_from_checkpoint, Cursor, Frame, LiveReducer, ReadStats,
+        Selector, SeriesBundle, Snapshot, GATEWAY_SCHEMA_VERSION,
     };
 }
 
@@ -2847,135 +2810,6 @@ pub fn serve_config_from_env(
         decoding_key: DecodingKey::from_secret(&auth::key_material(&secret)),
         checkpoint_dir,
     })
-}
-
-/// M-87 (задача 14, §4.1 дословно): прод-бинарь поднимает сервер ЧЕРЕЗ политику.
-///
-/// `bind_with_policy` ОБЯЗАТЕЛЬНО — прод-путь не имеет отдельной семантики
-/// выдачи без политики (это ключевое требование B1: «живой путь принимает
-/// только готовое состояние»). `bind` остался для юнит-/интеграционных
-/// тестов с упрощённым флоу (`serve` в `red_m87_entrypoint.rs:365` —
-/// для entrypoint-оракулов, где политика строится из реестра, не из env).
-///
-/// **Источник значений — env (fail-closed).** Разбор переменных:
-/// - `GATEWAY_ALLOWED_SYMBOLS` — список символов через запятую. Пусто ⇒ `Err`.
-/// - `GATEWAY_ALLOWED_PROFILES` — список `timeframe_ms/window_ms/depth_cadence_ms`
-///   через запятую. `depth_cadence_ms` может быть `none`. Пусто ⇒ `Err`.
-/// - `GATEWAY_MAX_CONCURRENT_SERVES` — `usize`. Невалидное / пропущенное ⇒ `Err`.
-/// - `GATEWAY_MAX_TAIL_EVENTS` / `GATEWAY_EXPECTED_WARMUP_EVENTS` — пара, ОБЯЗАНА
-///   пройти `AdmissionPolicy::validate()`. Порог меньше опоры ⇒ `Err` на старте
-///   (задача 12, §14.1quinquies-bis).
-///
-/// **Сами значения на проде — операторская конфигурация** (`A-037` D-5):
-/// они не выводятся в спеке как числа, потому что каденция между прогревами
-/// и прод-объём журнала зависят от деплоя. Подтверждаются founder'ом при деплое.
-pub fn admission_policy_from_env(
-    get: impl Fn(&str) -> Option<String>,
-) -> Result<admission::AdmissionPolicy, String> {
-    use admission::{AdmissionPolicy, LiveProfile};
-
-    let allowed_symbols: Vec<String> = get("GATEWAY_ALLOWED_SYMBOLS")
-        .ok_or_else(|| "GATEWAY_ALLOWED_SYMBOLS must be set".to_string())?
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-    if allowed_symbols.is_empty() {
-        return Err("GATEWAY_ALLOWED_SYMBOLS must contain at least one symbol".to_string());
-    }
-
-    let canonical_bands: Vec<f64> = get("GATEWAY_CANONICAL_BANDS")
-        .unwrap_or_else(|| {
-            // Прод-дефолт: семь канонических полос (`П-029`, 2026-09-10).
-            "0.015,0.03,0.05,0.08,0.15,0.30,0.60".to_string()
-        })
-        .split(',')
-        .map(|s| s.trim().parse::<f64>())
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| format!("GATEWAY_CANONICAL_BANDS parse: {e}"))?;
-    if canonical_bands.is_empty() {
-        return Err("GATEWAY_CANONICAL_BANDS must contain at least one band".to_string());
-    }
-
-    let allowed_profiles: Vec<LiveProfile> = get("GATEWAY_ALLOWED_PROFILES")
-        .ok_or_else(|| "GATEWAY_ALLOWED_PROFILES must be set".to_string())?
-        .split(',')
-        .map(|s| {
-            let parts: Vec<&str> = s.trim().split('/').collect();
-            if parts.len() < 2 || parts.len() > 3 {
-                return Err(format!(
-                    "GATEWAY_ALLOWED_PROFILES entry {s:?} must be `tf/window[/cadence]`; \
-                     cadence = number или `none`"
-                ));
-            }
-            let tf: i64 = parts[0].trim().parse().map_err(|e| {
-                format!(
-                    "GATEWAY_ALLOWED_PROFILES timeframe_ms parse {:?}: {e}",
-                    parts[0]
-                )
-            })?;
-            let window: i64 = parts[1].trim().parse().map_err(|e| {
-                format!(
-                    "GATEWAY_ALLOWED_PROFILES window_ms parse {:?}: {e}",
-                    parts[1]
-                )
-            })?;
-            let cadence: Option<i64> = match parts.get(2).map(|s| s.trim()) {
-                Some(s) if s.eq_ignore_ascii_case("none") => None,
-                Some(s) => Some(s.parse().map_err(|e| {
-                    format!(
-                        "GATEWAY_ALLOWED_PROFILES depth_cadence_ms parse {:?}: {e}",
-                        s
-                    )
-                })?),
-                None => None,
-            };
-            Ok(LiveProfile {
-                timeframe_ms: tf,
-                window_ms: window,
-                depth_cadence_ms: cadence,
-            })
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    if allowed_profiles.is_empty() {
-        return Err("GATEWAY_ALLOWED_PROFILES must contain at least one profile".to_string());
-    }
-
-    let max_concurrent_serves: usize = get("GATEWAY_MAX_CONCURRENT_SERVES")
-        .ok_or_else(|| "GATEWAY_MAX_CONCURRENT_SERVES must be set".to_string())?
-        .trim()
-        .parse()
-        .map_err(|e| format!("GATEWAY_MAX_CONCURRENT_SERVES parse: {e}"))?;
-
-    let max_tail_events: u64 = get("GATEWAY_MAX_TAIL_EVENTS")
-        .ok_or_else(|| "GATEWAY_MAX_TAIL_EVENTS must be set".to_string())?
-        .trim()
-        .parse()
-        .map_err(|e| format!("GATEWAY_MAX_TAIL_EVENTS parse: {e}"))?;
-
-    let expected_warmup_events: u64 = get("GATEWAY_EXPECTED_WARMUP_EVENTS")
-        .ok_or_else(|| "GATEWAY_EXPECTED_WARMUP_EVENTS must be set".to_string())?
-        .trim()
-        .parse()
-        .map_err(|e| format!("GATEWAY_EXPECTED_WARMUP_EVENTS parse: {e}"))?;
-
-    let policy = AdmissionPolicy {
-        allowed_symbols,
-        canonical_bands,
-        allowed_profiles,
-        max_concurrent_serves,
-        max_tail_events,
-        expected_warmup_events,
-    };
-    // Круг `R-196` (задача 12, §14.1quinquies-bis): `bind_with_policy` тоже зовёт
-    // `validate`, но здесь он не вызывается — `serve_config_from_env` собирает
-    // `ServeConfig`, а политика пробрасывается через отдельный путь в main.
-    // Вызываем `validate()` САМИ здесь, чтобы недонастроенный прод падал на старте
-    // с тем же `io::ErrorKind::InvalidInput`-по-духу (через `String` Err).
-    policy
-        .validate()
-        .map_err(|msg| format!("GATEWAY policy invalid: {msg}"))?;
-    Ok(policy)
 }
 
 /// Sentinel для verify_M-28.sh — положительная канарейка «gateway-serve использует
