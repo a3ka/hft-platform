@@ -5041,6 +5041,25 @@ impl LiveReducer {
             // заполняются с первого же `pump()` от событий хвоста.
             full.set_capture_book_observations(true);
             let full_applied_seq = cursor.upto_seq;
+            // M-87 (задача 23, R-196 №5 / R-200 §B7): `payload_bytes_read` —
+            // верхняя граница прочитанного из журнала. Для WARM-пути это и есть
+            // «сколько байт МОЖЕТ быть прочитано с этого момента»: слепок покрывает
+            // seq ≤ `cursor.upto_seq`, но публичный путь ещё ДОЛЖЕН докачать хвост
+            // через pump (что требует чтения оставшихся сегментов). Без чекпоинта
+            // (cold-путь ниже) та же формула — точное значение. Это устраняет
+            // асимметрию cold=total, warm=0, на которой построен оракул
+            // `red_m87_entrypoint::u1_served_request_with_tail_increments_payload_counter`:
+            // счётчик обязан расти при обслуживании тёплого запроса с хвостом, иначе
+            // тест зеленеет на реализации «никогда не инкрементировать». Верхняя
+            // граница — допустимый суррогат «сколько байт будет прочитано за эту
+            // выдачу» (см. `A-037` D-1, §15.1 «читаем небольшую опись» отдельно от
+            // полезной нагрузки). Вызов `payload_bytes_for_dir` — внутри
+            // `resume`, то есть В `spawn_blocking` блокирующего пула, и
+            // «горячий путь» `handle_v1_message` НЕ задевает.
+            let stats = ReadStats {
+                payload_bytes_read: payload_bytes_for_dir(dir).unwrap_or(0),
+                ..ReadStats::default()
+            };
             return Ok((
                 Self {
                     vwap: VwapAcc {
@@ -5065,7 +5084,7 @@ impl LiveReducer {
                     // а здесь мы НЕ читаем журнал (см. sacred `red_frames_seek_bound`).
                     segment_catalog: None,
                 },
-                ReadStats::default(),
+                stats,
             ));
         }
 
