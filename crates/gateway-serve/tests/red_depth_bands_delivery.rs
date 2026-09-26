@@ -256,6 +256,19 @@ async fn db_i_7d_canonical_bands_reach_the_frame_on_the_wire() {
     ])))
     .expect("конфиг с каноническим составом");
 
+    // M-87 §16.1 группа A: этот файл судит доставку состава полос (`DB-I-7d`), а не
+    // предохранитель — `checkpoint_dir: None` был удобством фикстуры. Живой путь без слепка
+    // теперь отказывает (fail-closed), поэтому здесь снимается слепок по ТОМУ ЖЕ селектору
+    // (`cfg.selector`, из `serve_config_from_env`), с которым сервер поднимается, ДО `bind()`.
+    let ckpt = tempfile::tempdir().expect("ckpt tempdir");
+    gateway::checkpoint::advance(
+        dir.path(),
+        ckpt.path(),
+        &cfg.selector,
+        EpochFilter::OwnCaptureOnly,
+    )
+    .expect("advance (warm checkpoint)");
+
     // Прод-точка входа. Журнал и ключ подменяются на тестовые — это ЕДИНСТВЕННОЕ отличие от
     // прода, и оно названо: селектор, ради которого сценарий существует, приходит из env.
     let server = bind(gateway_serve::server::ServeConfig {
@@ -264,22 +277,49 @@ async fn db_i_7d_canonical_bands_reach_the_frame_on_the_wire() {
         filter: EpochFilter::OwnCaptureOnly,
         selector: cfg.selector.clone(),
         decoding_key: DecodingKey::from_secret(SECRET),
-        checkpoint_dir: None,
+        checkpoint_dir: Some(ckpt.path().to_path_buf()),
     })
     .await
     .expect("bind прод-точки входа");
     let addr = server.local_addr();
     tokio::spawn(async move {
+        let _ckpt_guard = ckpt;
         let _ = server.serve().await;
     });
 
+    // ПРЕДЕЛ ОЖИДАНИЯ ОБЯЗАТЕЛЕН НА ОБОИХ ШАГАХ, и это не перестраховка (`R-200`-круг).
+    //
+    // До этой правки оба ожидания стояли без предела, и когда выдача перестала отвечать на
+    // этом сценарии, тест не упал, а ЗАМОЛЧАЛ: замер 2026-09-25 — 1 ч 09 мин, 99.9 % CPU
+    // сожжено, затем блокировка на futex. Разработчик ждал результата гейта, которого не
+    // будет; прогон пришлось снимать руками.
+    //
+    // **Молчащий оракул хуже ложно-зелёного**: ложно-зелёный хотя бы отдаёт управление и
+    // пропускает дефект дальше, где его поймает следующий гейт. Молчащий не отдаёт ничего и
+    // съедает круг целиком. `testing.md` требует от гейта наблюдать ОТСУТСТВИЕ, а не только
+    // сбой — предел ожидания и есть эта наблюдаемость: он превращает тишину в НАЗВАННЫЙ
+    // провал.
+    //
+    // Числа выбраны с запасом к прод-форме: подключение — секунды, первое сообщение
+    // (снимок из прогретого слепка) — единицы секунд. Тридцать секунд НЕ маскируют
+    // медлительность, они отсекают БЕСКОНЕЧНОСТЬ.
     let url = format!("ws://{addr}/?token={}", sign(SECRET));
-    let (mut ws, _resp) = tokio_tungstenite::connect_async(url)
+    let (mut ws, _resp) = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        tokio_tungstenite::connect_async(url),
+    )
+    .await
+    .expect("ПОДКЛЮЧЕНИЕ не состоялось за 30 с — сервер не принимает соединения вовсе")
+    .expect("WS-подключение валидным JWT");
+    let msg = tokio::time::timeout(std::time::Duration::from_secs(30), ws.next())
         .await
-        .expect("WS-подключение валидным JWT");
-    let msg = ws
-        .next()
-        .await
+        .expect(
+            "СЕРВЕР МОЛЧИТ: первое сообщение не пришло за 30 с. Это не медлительность, а \
+             отсутствие ответа: подключение состоялось, значит обработчик жив, но до отправки \
+             не доходит. Молчание — ХУДШИЙ из исходов (клиент считает, что подписался, и ждёт \
+             данные, которых не будет); выдача обязана ответить хотя бы НАЗВАННЫМ отказом из \
+             перечня §4",
+        )
         .expect("сервер обязан прислать первое сообщение")
         .expect("сообщение читается");
     let parsed: ServeMsg =

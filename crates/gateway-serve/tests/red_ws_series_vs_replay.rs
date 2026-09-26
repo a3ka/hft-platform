@@ -204,11 +204,26 @@ fn config(dir: &std::path::Path) -> ServeConfig {
     }
 }
 
+/// M-87 §16.1 группа A: этот файл судит соответствие WS-выдачи независимому реплею
+/// (O-1/O-2), а не предохранитель — `checkpoint_dir: None` был удобством фикстуры. Живой
+/// путь без слепка теперь отказывает (fail-closed), поэтому здесь снимается слепок по ТОМУ
+/// ЖЕ селектору, с которым сервер поднимается.
+fn warm_checkpoint(dir: &std::path::Path, sel: &Selector) -> tempfile::TempDir {
+    let ckpt = tempfile::tempdir().expect("ckpt tempdir");
+    gateway::checkpoint::advance(dir, ckpt.path(), sel, EpochFilter::OwnCaptureOnly)
+        .expect("advance (warm checkpoint)");
+    ckpt
+}
+
 /// Поднять сервер на ephemeral-порту, подключиться валидным JWT, вернуть первый `Snapshot`.
 async fn ws_snapshot(dir: &std::path::Path) -> Snapshot {
-    let server = bind(config(dir)).await.expect("bind");
+    let ckpt = warm_checkpoint(dir, &sel());
+    let mut cfg = config(dir);
+    cfg.checkpoint_dir = Some(ckpt.path().to_path_buf());
+    let server = bind(cfg).await.expect("bind");
     let addr = server.local_addr();
     tokio::spawn(async move {
+        let _ckpt_guard = ckpt;
         let _ = server.serve().await;
     });
 
@@ -447,6 +462,7 @@ async fn o2w_windowed_mode_ws_equals_replay_incl_cvd_base() {
         window_ms: Some(5_000),
         ..sel()
     };
+    let ckpt = warm_checkpoint(dir.path(), &windowed);
 
     let server = bind(ServeConfig {
         addr: "127.0.0.1:0".to_string(),
@@ -454,12 +470,13 @@ async fn o2w_windowed_mode_ws_equals_replay_incl_cvd_base() {
         filter: EpochFilter::OwnCaptureOnly,
         selector: windowed.clone(),
         decoding_key: DecodingKey::from_secret(SECRET),
-        checkpoint_dir: None,
+        checkpoint_dir: Some(ckpt.path().to_path_buf()),
     })
     .await
     .expect("bind");
     let addr = server.local_addr();
     tokio::spawn(async move {
+        let _ckpt_guard = ckpt;
         let _ = server.serve().await;
     });
 

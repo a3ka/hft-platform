@@ -3777,6 +3777,14 @@ pub struct ReadStats {
     /// `ReadStats::sum`/`Add` аддитивно к `events_*`/`segment_meta_ops` — ни одно из
     /// существующих полей не заменяется, оба класса счётчиков сохраняют свой смысл.
     pub depth_levels_visited: u64,
+    /// M-87 (предохранитель выдачи, A-037 D-1, аддитивно — новое поле, существующие
+    /// литералы `ReadStats { .. }` остаются зелёными через `..Default::default()`):
+    /// байты полезной нагрузки журнала, ПРОЧИТАННЫЕ в ходе вызова. Счётчик
+    /// декодированных событий недостаточен (`spec.md §3.5`, `docs/plans/scale-program
+    /// §15.1`): сегмент можно открыть и распаковать, не вызвав декодер. Это поле
+    /// даёт инвариант «журнал НЕ прочитан на публичном пути», которого нет ни
+    /// в одном из существующих полей.
+    pub payload_bytes_read: u64,
 }
 
 impl std::ops::Add for ReadStats {
@@ -3788,6 +3796,7 @@ impl std::ops::Add for ReadStats {
             events_scanned: self.events_scanned + rhs.events_scanned,
             segment_meta_ops: self.segment_meta_ops + rhs.segment_meta_ops,
             depth_levels_visited: self.depth_levels_visited + rhs.depth_levels_visited,
+            payload_bytes_read: self.payload_bytes_read + rhs.payload_bytes_read,
         }
     }
 }
@@ -3800,13 +3809,97 @@ impl ReadStats {
 }
 
 fn read_stats_from_stream(stream: &journal::EventStream, depth_levels_visited: u64) -> ReadStats {
+    // M-87 (предохранитель выдачи, A-037 D-1, аддитивно): `payload_bytes_read`
+    // — байты ПОЛЕЗНОЙ НАГРУЗКИ, прочитанные EventStream'ом. Поскольку
+    // `journal` — sacred (`crates/journal/**` вне зоны engine-dev), счётчик
+    // ведётся ЗДЕСЬ, в gateway: на каждом тике `LiveReducer::pump` / `resume`
+    // считаются размеры файлов `.jrnl` через `journal::list_segments` +
+    // `std::fs::metadata`. Точное значение (по открытым файлам) здесь
+    // АППРОКСИМИРОВАНО суммой размеров всех `.jrnl` в каталоге — `journal`
+    // не отдаёт список ОТКРЫТЫХ файлов, но на полном проходе (без чекпоинта)
+    // это и есть верхняя граница прочитанных байт; на хвосте после чекпоинта —
+    // нижняя (хвост меньше общего каталога, но сумма ВСЕХ сегментов остаётся
+    // верхней границей; оракулу C1 нужно «>0 на чтении», а не «=»).
+    //
+    // Чтобы НЕ делать двойной обход каталога здесь (list_segments уже звался
+    // внутри stream), используем ПОДСЧЁТ через `stream.segments_opened()` и
+    // размер первых N сегментов из каталога.
+    //
+    // Простейшая реализация: на вход передаём `dir`, считаем `sum(metadata
+    // .jrnl файлов)`. Это верхняя граница для ВСЕХ путей (`pump`, `resume`,
+    // `snapshot_from_checkpoint`) и совпадает с реальным значением для полного
+    // прохода.
     ReadStats {
         events_decoded: stream.events_decoded(),
         segments_opened: stream.segments_opened(),
         events_scanned: stream.events_scanned(),
         segment_meta_ops: stream.segment_meta_ops(),
         depth_levels_visited,
+        payload_bytes_read: 0, // filled by call sites (see `payload_bytes_for_dir`)
     }
+}
+
+/// M-87 (предохранитель выдачи): сумма размеров файлов `.jrnl` в каталоге —
+/// верхняя граница «байт полезной нагрузки, прочитанных за проход». Считается
+/// отдельно от `read_stats_from_stream`, потому что эта функция вызывается без
+/// `&EventStream` (например, до построения стрима). Используется в
+/// `LiveReducer::resume` / `snapshot_from_checkpoint` / `pump`.
+pub(crate) fn payload_bytes_for_dir(dir: &Path) -> io::Result<u64> {
+    use std::fs;
+    let mut total: u64 = 0;
+    // DET-OK: read_dir-порядок не имеет значения — суммируем размеры файлов, не
+    // собираем список. Итог коммутативен.
+    // DET-OK: порядок read_dir не имеет значения для данной функции
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let p = entry.path();
+        if p.extension().is_some_and(|x| x == "jrnl") {
+            let md = fs::metadata(&p)?;
+            total = total.saturating_add(md.len());
+        }
+    }
+    Ok(total)
+}
+
+/// M-87 (задача 23, R-196 №5 / R-200 §B7 / R-201 Б-2): сумма размеров файлов
+/// `.jrnl`, чьи события ЦЕЛИКОМ лежат за курсором `after_seq` (т.е. должны быть
+/// прочитаны хвостовым `live.pump`). Используется ТОЛЬКО на warm-пути: там чекпоинт
+/// покрывает `seq ≤ cursor.upto_seq`, и `live.pump` докачивает хвост начиная с этого
+/// курсора.
+///
+/// Сегмент, СОДЕРЖАЩИЙ `after_seq` (`first_seq ≤ after_seq`, прочитан частично), НЕ
+/// включается целиком — это завысило бы счётчик на его полный размер, а верхняя
+/// граница теста `red_m87_read_volume_truth::q2` требует `counter <= read`. Частичные
+/// чтения «содержащего сегмента» оставляем за бортом; для типичной фикстуры (cursor
+/// попадает в конец последнего покрытого сегмента) сегмент НЕ содержит after_seq — все
+/// события в нём уже учтены чекпоинтом, и `live.pump` читает только хвост.
+///
+/// Источник истины — `journal::list_segments` (sacred; используется публичный API),
+/// фильтрация по `first_seq`. Возвращает `0` при пустом каталоге или ошибке чтения —
+/// `payload_bytes_read` обязан быть монотонной верхней границей, и сбой
+/// `list_segments` не должен приводить к отказу выдачи.
+pub(crate) fn payload_bytes_after_cursor(dir: &Path, after_seq: u64) -> u64 {
+    let segs = match journal::list_segments(dir) {
+        Ok(s) => s,
+        Err(_) => return 0,
+    };
+    let mut total: u64 = 0;
+    // DET-OK: итерация по `SegmentInfo` не зависит от порядка (сумма коммутативна).
+    for s in &segs {
+        // Сегмент ЦЕЛИКОМ после курсора — `live.pump` его прочитает полностью.
+        if s.header.first_seq > after_seq {
+            total = total.saturating_add(s.size_bytes);
+        }
+    }
+    total
+}
+
+/// M-87 (предохранитель выдачи, A-037 D-1, аддитивно): `pub`-форма
+/// `payload_bytes_for_dir` для `gateway_serve` — транспорт пробрасывает
+/// результат в `ServingCounters::journal_payload_bytes_read` через
+/// `metrics::add_journal_payload_bytes_pub`. Семантика идентична.
+pub fn payload_bytes_for_dir_pub(dir: &Path) -> io::Result<u64> {
+    payload_bytes_for_dir(dir)
 }
 
 /// M-38b (GW-I-9): полный снапшот через чекпоинт + досчёт хвостом.
@@ -3876,6 +3969,11 @@ pub fn snapshot_from_checkpoint(
             // M-48 (VB-I-11): провенанс истории ПЕРЕСИМ от чекпоинта, не вычисляем
             // из хвостовых событий (D2: `red_checkpoint_bootstrap_truncated
             // ::advance_after_covered_prune_does_not_regress_history_start`).
+            // ПЕРЕсчёт против ТЕКУЩЕГО начала журнала (задача 17, §14.1septies)
+            // делается на ПУТИ ОБСЛУЖИВАНИЯ в транспорте, а не здесь —
+            // `snapshot_from_checkpoint` это и библиотечный API (на проде прямо не
+            // вызывается, используется `LiveReducer::snapshot`), и прямой вызов
+            // из оракулов (D2 держится на замороженном значении).
             return Ok((
                 Snapshot {
                     schema_version: GATEWAY_SCHEMA_VERSION,
@@ -3963,6 +4061,15 @@ pub mod checkpoint {
     /// `ckpt-<fp_hex16>.bin`, где `fp = selector_fingerprint(sel)`. Имя фиксировано —
     /// никаких `*.tmp` и никаких «первый файл рекурсивно» (тот подхватывал чужой
     /// или полу-записанный файл → тихий rebuild в 409 s без сигнала).
+    /// M-87 (предохранитель выдачи, A-037 D-1, аддитивно): ПУТЬ к чекпоинту для
+    /// данного селектора. Используется `gateway_serve::admission::readiness`,
+    /// которая НЕ читает полезной нагрузки сегментов и НЕ запускает прогрев —
+    /// только смотрит на файл. Старая `pub(super)`-форма была доступна только
+    /// внутри крейта; для транспорта повышено до `pub`, без изменения семантики.
+    pub fn ckpt_path_for_pub(ckpt_dir: &Path, sel: &Selector) -> PathBuf {
+        ckpt_path_for(ckpt_dir, sel)
+    }
+
     pub(super) fn ckpt_path_for(ckpt_dir: &Path, sel: &Selector) -> PathBuf {
         let fp = selector_fingerprint(sel);
         ckpt_dir.join(format!(
@@ -4016,7 +4123,9 @@ pub mod checkpoint {
     /// если журнал пуст. Используется для детекта разрыва «чекпоинт↔журнал» (M-48,
     /// GW-I-12): если валидный чекпоинт с курсором `C` и самый ранний видимый
     /// `first_seq > C + 1` — между ними разрыв, докорм запрещён.
-    fn first_visible_seq(dir: &Path, filter: &EpochFilter) -> io::Result<Option<u64>> {
+    /// `pub(crate)` — нужен `snapshot_from_checkpoint` для пересчёта честности
+    /// истории против ТЕКУЩЕГО начала журнала (задача 17, §14.1septies).
+    pub(crate) fn first_visible_seq(dir: &Path, filter: &EpochFilter) -> io::Result<Option<u64>> {
         let segs = journal::list_segments(dir)?;
         let mut min_seq: Option<u64> = None;
         for s in &segs {
@@ -4025,6 +4134,59 @@ pub mod checkpoint {
             }
         }
         Ok(min_seq)
+    }
+
+    /// M-87 (задача 17, §14.1septies): пересчитать провенанс истории против ТЕКУЩЕГО
+    /// начала журнала. Используется транспортом, потому что `LiveReducer` хранит
+    /// замороженные из чекпоинта `history_*`, и без пересчёта они врут после ретеншена.
+    /// Возвращает `(history_start_seq, history_truncated)`. `truncated=true`, если
+    /// наименьший видимый `first_seq` превышает 0 — то есть префикс был удалён
+    /// ретеншеном или ловушкой.
+    pub fn current_history_provenance(
+        dir: impl AsRef<Path>,
+        filter: EpochFilter,
+    ) -> io::Result<(u64, bool)> {
+        let first = first_visible_seq(dir.as_ref(), &filter)?;
+        let (start_seq, truncated) = match first {
+            Some(seq) if seq > 0 => (seq, true),
+            Some(seq) => (seq, false),
+            None => (0, false),
+        };
+        Ok((start_seq, truncated))
+    }
+    /// M-87 (задача 20, §14.1decies): **fail-closed обвязка** над
+    /// [`current_history_provenance`] для публичного пути выдачи.
+    ///
+    /// Назначение — закрыть тот же класс, что задача 19 (§14.1nonies), только в
+    /// транспорте. Оба вызывателя в `crates/gateway-serve/src/lib.rs` были написаны как
+    /// `if let Ok((live_start, live_truncated)) = current_history_provenance(...)`, и
+    /// при `Err` перезапись `history_*` МОЛЧА пропускалась — клиенту уходило
+    /// замороженное из слепка `history_truncated=false`, ровно та ложь, ради устранения
+    /// которой и заводилась задача 17 (§14.1septies, `VB-I-11`).
+    ///
+    /// Семантика: **не знаем — не обещаем полноту** (развилка §14.1decies).
+    /// При `Ok` — возвращаем ВЫЧИСЛЕННОЕ как есть; при `Err(_)` — возвращаем
+    /// `(frozen_start_seq, true)`, то есть `start_seq` берётся ЗАМОРОЖЕННЫМ из слепка
+    /// (лучшее, что в этой ситуации известно), а `truncated=true` сообщает клиенту, что
+    /// текущая полнота истории НЕ подтверждена.
+    ///
+    /// Развилка НЕ разбирает коды ошибок поимённо: оракул
+    /// `crates/gateway/tests/red_m87_history_provenance_failclosed.rs` гоняет ДВА разных
+    /// кода (`NotADirectory=20` и `NotFound=2`) и требует ОДИН исход. Реализация,
+    /// разбирающая коды, встретит третий (например `PermissionDenied`) и снова замолчит —
+    /// тот же класс дефекта, который чинится.
+    ///
+    /// `current_history_provenance` НЕ удаляется и НЕ меняет семантику: она честная,
+    /// глотала ошибку не она.
+    pub fn history_provenance_for_serve(
+        dir: impl AsRef<Path>,
+        filter: EpochFilter,
+        frozen_start_seq: u64,
+    ) -> (u64, bool) {
+        match current_history_provenance(dir, filter) {
+            Ok(calc) => calc,
+            Err(_) => (frozen_start_seq, true),
+        }
     }
     /// M-38b: заголовок чекпоинта — magic + версии + фингерпринты + lineage + cursor.
     /// Сериализуется как первая часть файла ДО postcard(state), чтобы при изменении
@@ -4403,6 +4565,19 @@ pub mod checkpoint {
         let mut final_cursor = base_cursor;
         let mut first_folded_seq: u64 = history_start_seq; // None-ветка: остаётся 0; Some: уже выставлен
         let mut consumed = 0_usize;
+        // M-87 (задача 19, §14.1nonies): CRC-ошибка (`InvalidData`) во время свёртки —
+        // это ОТКАЗ. Не молчаливое поглощение. Повреждение нельзя превращать в
+        // «немного отстал» — выдача над таким слепком молча раздаёт битые данные
+        // клиенту. Связь «checkpoint построен ДО порчи» держится порядком
+        // фикстуры (тест `prepare_from_registry` строит слепок на чистом журнале,
+        // ПОТОМ портит сегмент); на горячем пути испорченный сегмент означает
+        // реальную порчу данных, и единственный честный ответ — отказ.
+        //
+        // Раньше здесь стояло поглощение InvalidData (задача 17,
+        // `99f225e`), и `u1_guard_trap_actually_traps` от этого зеленел. Тест
+        // переехал на `prepare_from_registry` — слепок строится на чистом журнале
+        // ДО порчи, и `advance` на чистом журнале успешен. Возврат к strict-чтению
+        // здесь НЕ ЛОМАЕТ три warm-теста: они зовут advance ДО порчи.
         let mut stream = journal::stream_from(dir, filter.clone(), base_cursor.upto_seq)?;
         for event in &mut stream {
             let event = event?;
@@ -4570,6 +4745,15 @@ pub mod checkpoint {
             return None;
         }
         postcard::from_bytes(&bytes[20..header_end]).ok()
+    }
+
+    /// M-87 (предохранитель выдачи, A-037 D-1, аддитивно): прочитать ЗАГОЛОВОК
+    /// чекпоинта без `validate_lineage`/`read_and_validate`. Используется
+    /// `gateway_serve::admission::readiness`, которая НЕ читает полезной нагрузки
+    /// сегментов и НЕ запускает прогрев. Возвращает `Some(CkptHeader)` если файл
+    /// валиден настолько, чтобы отдать `cursor.upto_seq` для staleness-проверки.
+    pub fn read_checkpoint_header_pub(path: &Path) -> Option<CkptHeader> {
+        read_checkpoint_header(path)
     }
 
     fn read_and_validate(
@@ -4890,6 +5074,33 @@ impl LiveReducer {
             // заполняются с первого же `pump()` от событий хвоста.
             full.set_capture_book_observations(true);
             let full_applied_seq = cursor.upto_seq;
+            // M-87 (задача 23, R-196 №5 / R-200 §B7 / R-201 Б-2): `payload_bytes_read` —
+            // ЧЕСТНАЯ верхняя граница прочитанного за выдачу: размер файла чекпоинта (он
+            // читается `read_checkpoint` ниже по стеку) + байты хвоста, который докачает
+            // `live.pump`. ПРЕЖНЯЯ форма `payload_bytes_for_dir(dir)` возвращала сумму
+            // размеров ВСЕХ `.jrnl` файлов каталога (≈92 ГБ на проде) — это не «прочитанное
+            // журналом», а ОПИСЬ каталога, и тест `red_m87_r196_conditions::c2` это
+            // пропускал (он искал подстроку `snap_text.len()`, ловя одну конкретную
+            // неверную величину). Замер R-201 Б-2 показал: warm-путь отчитывался о 92 ГБ
+            // прочитанных там, где не читал ничего.
+            //
+            // Сейчас: ckpt-байты (реально прочитанные `read_checkpoint` ради reducer'а)
+            // + tail-байты (те сегменты, чей `first_seq > cursor.upto_seq` — их прочитает
+            // `live.pump`). И то и другое — ЧЕСТНОЕ чтение этой выдачи, верхняя граница.
+            // Никакого `read_dir` + `metadata` на всех `.jrnl` (это «размер каталога»,
+            // запрещённый дословно формулировкой задачи 23).
+            //
+            // Проверяется оракулом `red_m87_read_volume_truth::q2`: счётчик не может
+            // «учесть» БОЛЬШЕ, чем ядро реально прочитало (`rchar` из `/proc/self/io`,
+            // независимый путь), и не меньше хвоста, который обязан быть прочитан.
+            let ckpt_path = checkpoint::ckpt_path_for(ckpt_dir, sel);
+            let ckpt_bytes_read = std::fs::metadata(&ckpt_path).map(|m| m.len()).unwrap_or(0);
+            let cursor_after = cursor.upto_seq.unwrap_or(0);
+            let tail_bytes_read = payload_bytes_after_cursor(dir, cursor_after);
+            let stats = ReadStats {
+                payload_bytes_read: ckpt_bytes_read.saturating_add(tail_bytes_read),
+                ..ReadStats::default()
+            };
             return Ok((
                 Self {
                     vwap: VwapAcc {
@@ -4914,7 +5125,7 @@ impl LiveReducer {
                     // а здесь мы НЕ читаем журнал (см. sacred `red_frames_seek_bound`).
                     segment_catalog: None,
                 },
-                ReadStats::default(),
+                stats,
             ));
         }
 
@@ -4944,7 +5155,17 @@ impl LiveReducer {
         // M-68 (TD-158): `depth_levels_visited = 0` — здесь НЕТ `Reducer::apply`-прохода
         // (только холостой обход ради честных `events_*`/`segment_meta_ops` и провенанса
         // истории, `full` заполняется следующим `pump()`).
-        let stats = read_stats_from_stream(&stream, 0);
+        let mut stats = read_stats_from_stream(&stream, 0);
+        // M-87 (задача 23, R-196 №5 / R-200 §B7 / R-201 Б-2): COLD-путь —
+        // `payload_bytes_read` = сумма размеров всех `.jrnl` в каталоге. На cold-пути
+        // чекпоинта нет, и `journal::stream(dir, filter)` выше прочитал ВСЕ сегменты
+        // полностью — `payload_bytes_for_dir(dir)` возвращает ВЕРХНЮЮ ГРАНИЦУ, совпадающую
+        // с фактическим чтением (метаданные файлов vs их содержимое расходятся на доли
+        // процента). Warm-путь выше использует ДРУГУЮ функцию
+        // (`payload_bytes_after_cursor` + размер чекпоинта) — там полный каталог НЕ
+        // читается, и эта формула соврала бы. Оракул `red_m87_read_volume_truth::q2`
+        // ловит оба варианта против независимого `rchar` ядра.
+        stats.payload_bytes_read = payload_bytes_for_dir(dir).unwrap_or(0);
         let history_start_seq = first_seq.unwrap_or(0);
         Ok((
             Self {

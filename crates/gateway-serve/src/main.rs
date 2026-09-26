@@ -7,12 +7,20 @@
 //! (тестируемая чистая функция с инжектируемым getter'ом env). Анти-TD-020: env→Selector.window_ms
 //! доказуем на unit-уровне (`red_serve_window_wiring`), а не только §8 глазами на VPS.
 //!
+//! **M-87 task #14:** main поднимает сервер ЧЕРЕЗ политику (`bind_with_policy`).
+//! Сама логика разбора `GATEWAY_ALLOWED_SYMBOLS` / `GATEWAY_ALLOWED_PROFILES` /
+//! `GATEWAY_MAX_CONCURRENT_SERVES` / `GATEWAY_MAX_TAIL_EVENTS` /
+//! `GATEWAY_EXPECTED_WARMUP_EVENTS` — в `gateway_serve::admission_policy_from_env`
+//! (тестируемая чистая функция). Прод-путь не имеет отдельной семантики выдачи
+//! без политики; `bind` остался для юнит-/интеграционных тестов с упрощённым
+//! флоу, но бинарь им не пользуется.
+//!
 //! Read-only, stateless по юзеру: JWT-секрет берётся из env (shared с Next.js-подписателем,
 //! D6), без user-БД.
 
 use std::process::ExitCode;
 
-use gateway_serve::server::bind;
+use gateway_serve::server::bind_with_policy;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
@@ -26,17 +34,28 @@ async fn main() -> ExitCode {
         }
     };
 
+    let policy = match gateway_serve::admission_policy_from_env(|k| std::env::var(k).ok()) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("gateway-serve: policy error: {e}");
+            return ExitCode::from(2);
+        }
+    };
+
     let bind_addr = cfg.addr.clone();
-    let server = match bind(cfg).await {
+    // M-87 §4.1: прод-бинарь поднимает сервер ЧЕРЕЗ политику. `bind` без политики
+    // НЕ ЯВЛЯЕТСЯ отдельной семантикой выдачи на проде — это требование B1
+    // («живой путь принимает только готовое состояние»).
+    let server = match bind_with_policy(cfg, policy).await {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("gateway-serve: bind failed addr={bind_addr} error={e}");
+            eprintln!("gateway-serve: bind_with_policy failed addr={bind_addr} error={e}");
             return ExitCode::from(3);
         }
     };
 
     let actual = server.local_addr();
-    eprintln!("gateway-serve: listening on {actual} (read-only, JWT-auth)");
+    eprintln!("gateway-serve: listening on {actual} (read-only, JWT-auth, policy-enforced)");
 
     if let Err(e) = server.serve().await {
         eprintln!("gateway-serve: serve loop ended with error: {e}");

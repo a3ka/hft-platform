@@ -6,7 +6,7 @@
 //! - `window_ms: None` и `checkpoint_dir: None` ⇒ bounded-окно и чекпоинт по WS-пути слепы.
 
 use contracts::{to_fixed, DataSource, EventKind, Level, MdPayload, Side, Venue};
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use gateway::{Cursor, Selector, Snapshot};
 use gateway_serve::auth::Claims;
 use gateway_serve::server::{bind, ServeConfig};
@@ -120,6 +120,23 @@ fn config(
     }
 }
 
+/// M-87 §16.1 группа A: тесты этого файла судят протокол/окно/авторизацию, а не
+/// предохранитель — `checkpoint_dir: None` был удобством фикстуры. Живой путь без
+/// слепка теперь отказывает (fail-closed), поэтому подписывающий тест обязан снять
+/// слепок ДО `bind()` по ТОМУ ЖЕ селектору (тот же `window_ms`), с которым откроет
+/// соединение — иначе слепок не подойдёт и тест покраснеет не по своей причине.
+fn warm_checkpoint(dir: &std::path::Path, window_ms: Option<i64>) -> tempfile::TempDir {
+    let ckpt = tempfile::tempdir().expect("ckpt tempdir");
+    gateway::checkpoint::advance(
+        dir,
+        ckpt.path(),
+        &sel(window_ms),
+        EpochFilter::OwnCaptureOnly,
+    )
+    .expect("advance (warm checkpoint)");
+    ckpt
+}
+
 /// Подключиться и вернуть поток; сервер живёт в фоне.
 async fn connect(
     cfg: ServeConfig,
@@ -157,6 +174,25 @@ async fn got_snapshot(cfg: ServeConfig, url_token: Option<&str>) -> bool {
     }
 }
 
+/// Открывает соединение и отдаёт ЕГО ВМЕСТЕ с первым сообщением. В отличие от
+/// `got_snapshot`, различает «пришёл иной исход» и «связь оборвалась» (`None` — второе),
+/// и, в отличие от прежней редакции, НЕ БРОСАЕТ сокет: продолжение диалога на том же
+/// соединении — предмет проверки (`C-240` R4-2).
+type ProbeWs =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+async fn open_and_first(
+    cfg: ServeConfig,
+    url_token: Option<&str>,
+) -> Option<(ProbeWs, serde_json::Value)> {
+    let mut ws = connect(cfg, url_token).await.ok()?;
+    let msg = match ws.next().await {
+        None | Some(Err(_)) => return None,
+        Some(Ok(m)) => serde_json::from_slice::<serde_json::Value>(m.into_data().as_ref()).ok()?,
+    };
+    Some((ws, msg))
+}
+
 // ─────────────────────────── O-4 ───────────────────────────
 
 /// **O-4.** Матрица отказов авторизации — ВСЕ пять веток (`gateway-serve/src/lib.rs:287-318`).
@@ -167,8 +203,9 @@ async fn o4_auth_matrix_fail_closed() {
     {
         let dir = tempfile::tempdir().expect("tempdir");
         journal_seed(dir.path());
+        let ckpt = warm_checkpoint(dir.path(), None);
         let ok = got_snapshot(
-            config(dir.path(), None, None),
+            config(dir.path(), None, Some(ckpt.path())),
             Some(&sign_with(SECRET, FUTURE)),
         )
         .await;
@@ -178,22 +215,25 @@ async fn o4_auth_matrix_fail_closed() {
     {
         let dir = tempfile::tempdir().expect("tempdir");
         journal_seed(dir.path());
-        let got = got_snapshot(config(dir.path(), None, None), None).await;
+        let ckpt = warm_checkpoint(dir.path(), None);
+        let got = got_snapshot(config(dir.path(), None, Some(ckpt.path())), None).await;
         assert!(!got, "O-4: без query-строки Snapshot выдаваться НЕ должен");
     }
     // (в) `?token=` пустой → "missing token"
     {
         let dir = tempfile::tempdir().expect("tempdir");
         journal_seed(dir.path());
-        let got = got_snapshot(config(dir.path(), None, None), Some("")).await;
+        let ckpt = warm_checkpoint(dir.path(), None);
+        let got = got_snapshot(config(dir.path(), None, Some(ckpt.path())), Some("")).await;
         assert!(!got, "O-4: пустой token Snapshot выдаваться НЕ должен");
     }
     // (г) истёкший exp → "expired token"
     {
         let dir = tempfile::tempdir().expect("tempdir");
         journal_seed(dir.path());
+        let ckpt = warm_checkpoint(dir.path(), None);
         let got = got_snapshot(
-            config(dir.path(), None, None),
+            config(dir.path(), None, Some(ckpt.path())),
             Some(&sign_with(SECRET, PAST)),
         )
         .await;
@@ -203,8 +243,9 @@ async fn o4_auth_matrix_fail_closed() {
     {
         let dir = tempfile::tempdir().expect("tempdir");
         journal_seed(dir.path());
+        let ckpt = warm_checkpoint(dir.path(), None);
         let got = got_snapshot(
-            config(dir.path(), None, None),
+            config(dir.path(), None, Some(ckpt.path())),
             Some(&sign_with(b"attacker", FUTURE)),
         )
         .await;
@@ -214,7 +255,12 @@ async fn o4_auth_matrix_fail_closed() {
     {
         let dir = tempfile::tempdir().expect("tempdir");
         journal_seed(dir.path());
-        let got = got_snapshot(config(dir.path(), None, None), Some("не-жвт-вовсе")).await;
+        let ckpt = warm_checkpoint(dir.path(), None);
+        let got = got_snapshot(
+            config(dir.path(), None, Some(ckpt.path())),
+            Some("не-жвт-вовсе"),
+        )
+        .await;
         assert!(!got, "O-4: malformed token Snapshot выдаваться НЕ должен");
     }
 }
@@ -230,9 +276,10 @@ async fn o4_auth_matrix_fail_closed() {
 async fn o3_frames_converge_to_latest() {
     let dir = tempfile::tempdir().expect("tempdir");
     journal_seed(dir.path());
+    let ckpt = warm_checkpoint(dir.path(), None);
 
     let mut ws = connect(
-        config(dir.path(), None, None),
+        config(dir.path(), None, Some(ckpt.path())),
         Some(&sign_with(SECRET, FUTURE)),
     )
     .await
@@ -297,8 +344,9 @@ async fn o5_bounded_window_shrinks_ws_payload() {
     append_more(dir.path(), 30, BASE_MS + 10_000); // ~30 s истории
 
     let unbounded = {
+        let ckpt = warm_checkpoint(dir.path(), None);
         let mut ws = connect(
-            config(dir.path(), None, None),
+            config(dir.path(), None, Some(ckpt.path())),
             Some(&sign_with(SECRET, FUTURE)),
         )
         .await
@@ -311,8 +359,9 @@ async fn o5_bounded_window_shrinks_ws_payload() {
     };
 
     let bounded = {
+        let ckpt = warm_checkpoint(dir.path(), Some(5_000));
         let mut ws = connect(
-            config(dir.path(), Some(5_000), None),
+            config(dir.path(), Some(5_000), Some(ckpt.path())),
             Some(&sign_with(SECRET, FUTURE)),
         )
         .await
@@ -336,10 +385,22 @@ async fn o5_bounded_window_shrinks_ws_payload() {
     );
 }
 
-/// **O-5(б) деградированный вход.** Невалидный/пустой каталог чекпоинта — НЕ ошибка:
-/// путь обязан тихо свалиться в rebuild (GW-I-9(б)), а не отказать клиенту.
+/// **O-5(б) деградированный вход — ОЖИДАНИЕ ИЗМЕНЕНО ПОСТАВКОЙ `M-87`** (`A-037` D-4,
+/// вариант (i); решение арбитра обязательно к исполнению).
+///
+/// Прежде здесь требовался «тихий rebuild при битом слепке» — и это ровно аварийное
+/// поведение инцидента 2026-09-20: один публичный запрос уходил в полный пересчёт журнала
+/// на 74 ГБ и не прекращался при отключении клиента. Ожидание закрепляло РЕАЛИЗАЦИЮ, а не
+/// продуктовый инвариант, поэтому оно не переносится, а ЗАМЕНЯЕТСЯ.
+///
+/// Инвариант `GW-I-9(б)` («слепок есть кэш, его потеря не теряет данные») никуда не делся —
+/// он переехал на WORKER-путь, где пересчёт законен, и проверяется там
+/// (`crates/gateway/tests/red_checkpoint_is_cache.rs`). На ЖИВОМ пути битый слепок обязан
+/// давать НАЗВАННЫЙ исход при живом соединении.
+///
+/// COMPILE/RED до реализации `M-87`: сегодня путь отвечает снимком через тихий rebuild.
 #[tokio::test]
-async fn o5_broken_checkpoint_falls_back_not_fails() {
+async fn o5_broken_checkpoint_is_named_outcome_not_silent_rebuild() {
     let dir = tempfile::tempdir().expect("tempdir");
     journal_seed(dir.path());
 
@@ -347,13 +408,53 @@ async fn o5_broken_checkpoint_falls_back_not_fails() {
     std::fs::write(ckpt.path().join("ckpt-deadbeef.bin"), b"not-a-checkpoint")
         .expect("write мусор вместо чекпоинта");
 
-    let ok = got_snapshot(
+    // `C-238` R3-3 + `C-240` R4-2: мало получить один названный исход — нужно доказать,
+    // что СОЕДИНЕНИЕ после него ПРИГОДНО. Сервер, который шлёт одну ошибку готовности и
+    // немедленно закрывает связь, прежнюю редакцию проходил без изменений.
+    let (mut ws, msg) = open_and_first(
         config(dir.path(), None, Some(ckpt.path())),
         Some(&sign_with(SECRET, FUTURE)),
     )
-    .await;
+    .await
+    .expect("соединение закрыто без ответа — исход обязан прийти ПО ЖИВОМУ соединению");
+
+    let code = msg.get("code").and_then(|c| c.as_str()).unwrap_or("");
     assert!(
-        ok,
-        "O-5: битый чекпоинт обязан приводить к тихому rebuild (GW-I-9б), а не к отказу клиенту"
+        matches!(code, "not_ready" | "warming"),
+        "M-87 (A-037 D-4): битый слепок обязан давать НАЗВАННЫЙ исход готовности \
+         ('not_ready'/'warming'), получено '{code}': {msg}. Тихий полный пересчёт при \
+         клиенте — это авария 2026-09-20; инвариант «слепок — кэш» проверяется на \
+         worker-пути (red_checkpoint_is_cache.rs), а не здесь"
+    );
+    assert_ne!(
+        msg.get("type").and_then(|t| t.as_str()),
+        Some("snapshot"),
+        "пришёл снимок — значит слепок молча пересобрали при клиенте"
+    );
+
+    // ТО ЖЕ соединение обязано принять следующее сообщение и ответить на него.
+    // Берём заведомо отвергаемую версию протокола: по `CT-RFC-09` §2.3 сервер обязан
+    // ответить `error` с кодом, а не промолчать и не разорвать связь.
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::json!({"op":"subscribe","v":999,"id":"after","selector":{
+            "venue":"Binance","symbol":"BTCUSDT","timeframe_ms":1000,
+            "bands":[0.001],"window_ms":60000}})
+        .to_string(),
+    ))
+    .await
+    .expect("отправка по тому же соединению не удалась — связь закрыта после исхода");
+
+    let second = match ws.next().await {
+        Some(Ok(m)) => serde_json::from_slice::<serde_json::Value>(m.into_data().as_ref()).ok(),
+        _ => None,
+    };
+    let second = second.expect(
+        "после названного исхода соединение НЕ ПРИГОДНО: второй запрос остался без ответа. \
+         CT-RFC-09 §2.7 — ошибка селектора есть ошибка СЕССИИ, а не отказ связи",
+    );
+    assert_eq!(
+        second.get("type").and_then(|t| t.as_str()),
+        Some("error"),
+        "на неизвестную версию протокола сервер обязан ответить error с кодом: {second}"
     );
 }

@@ -152,31 +152,6 @@ fn print_help() {
     );
 }
 
-fn parse_secret(s: &str) -> Vec<u8> {
-    let is_hex =
-        !s.is_empty() && s.len().is_multiple_of(2) && s.chars().all(|c| c.is_ascii_hexdigit());
-    if is_hex {
-        let mut out = Vec::with_capacity(s.len() / 2);
-        let bytes = s.as_bytes();
-        let mut ok = true;
-        for chunk in bytes.chunks(2) {
-            let hi = (chunk[0] as char).to_digit(16);
-            let lo = (chunk[1] as char).to_digit(16);
-            match (hi, lo) {
-                (Some(h), Some(l)) => out.push(((h << 4) | l) as u8),
-                _ => {
-                    ok = false;
-                    break;
-                }
-            }
-        }
-        if ok {
-            return out;
-        }
-    }
-    s.as_bytes().to_vec()
-}
-
 fn now_unix_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -393,7 +368,10 @@ async fn run(args: Args) -> ProbeResult<()> {
         token = match (&args.token, &args.secret) {
             (Some(t), _) => t.clone(),
             (None, Some(s)) => {
-                let key = parse_secret(s);
+                // M-87 (TD-207, спека §7.1): ОБЩАЯ функция `key_material` в
+                // `gateway_serve::auth` зовётся и сервером, и зондом — иначе
+                // 32- vs 64-байтовая асимметрия (TD-207, A-037 §3.5).
+                let key = gateway_serve::auth::key_material(s);
                 sign_hs256(&key, "wsprobe", now_unix_secs() + 3600)?
             }
             (None, None) => return Err("нужен --token, --secret, либо --self-test".to_string()),

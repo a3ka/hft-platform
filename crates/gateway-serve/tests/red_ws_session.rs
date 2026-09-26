@@ -359,10 +359,40 @@ fn reference_bars(dir: &Path, symbol: &str) -> usize {
     n
 }
 
+/// M-87 §16.1 группа A: этот файл судит семантику подписки (`O-1..O-10`), а не
+/// предохранитель — `checkpoint_dir: None` был удобством фикстуры. Живой путь без слепка
+/// теперь отказывает (fail-closed), поэтому здесь снимаются слепки ДО `bind()`.
+///
+/// **Слепков ТРИ, не один** — по числу СЕЛЕКТОРОВ, которые тесты этого файла реально
+/// подписывают: `BTCUSDT`/`ETHUSDT` (оба пишет `seed()`, обязательны для O-1/O-2/O-9 —
+/// смена/мультиплекс инструмента) и `SOLUSDT` (отсутствующий в журнале инструмент из
+/// `o7_selector_validation_keeps_connection_and_neighbours_alive` — валидный селектор,
+/// нулевая история; предохранитель обязан отличать «пока нечего показать» от «мы тебя не
+/// поняли», а без слепка ПОД ЭТОТ селектор он не может отличить это от «не готов вовсе»).
+/// Один слепок на `sel_of(env_symbol)` ловил бы только BTCUSDT и оставлял остальные пять
+/// тестов падать на `not_ready` не по своей причине.
+///
+/// Все три уходят в ОДИН каталог: `gateway::checkpoint::ckpt_path_for_pub` именует файл по
+/// отпечатку селектора (`selector_fingerprint`), поэтому каталог безопасно делит несколько
+/// чекпоинтов без коллизий. `TempDir` уходит В спавненную задачу — держит их живыми, пока
+/// жив сервер.
 async fn serve(dir: &Path, env_symbol: &str) -> String {
-    let server = bind(config(dir, sel_of(env_symbol))).await.expect("bind");
+    let ckpt = tempfile::tempdir().expect("ckpt tempdir");
+    for symbol in ["BTCUSDT", "ETHUSDT", "SOLUSDT"] {
+        gateway::checkpoint::advance(
+            dir,
+            ckpt.path(),
+            &sel_of(symbol),
+            EpochFilter::OwnCaptureOnly,
+        )
+        .expect("advance (warm checkpoint)");
+    }
+    let mut cfg = config(dir, sel_of(env_symbol));
+    cfg.checkpoint_dir = Some(ckpt.path().to_path_buf());
+    let server = bind(cfg).await.expect("bind");
     let addr = server.local_addr().to_string();
     tokio::spawn(async move {
+        let _ckpt_guard = ckpt;
         let _ = server.serve().await;
     });
     addr
