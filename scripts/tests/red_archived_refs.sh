@@ -44,21 +44,42 @@ guard() { # guard <repo> <pathspec> <literal>
   bad "SETUP не состоялся: «$3» не найден под git в $2 — сценарий не судит то, что заявляет"
   return 1
 }
+# СТРАЖ ПОД-GIT: файл фикстуры обязан быть ОТСЛЕЖИВАЕМЫМ. Барьер видит дерево только через
+# `git grep`; неотслеживаемая фикстура для него не существует, и сценарий тогда судит пустоту
+# (`C-255` B-2: без коммита сценарий 4 зеленел, потому что барьер падал по ДРУГОЙ причине).
+tracked() { # tracked <repo> <path>...
+  local r="$1"; shift; local f
+  for f in "$@"; do
+    if ! git -C "$r" ls-files --error-unmatch -- "$f" >/dev/null 2>&1; then
+      bad "SETUP не состоялся: $f не под git — сценарий судил бы не то, что заявляет"
+      return 1
+    fi
+  done
+}
+# ОТКАЗ ПО НАЗВАННОЙ ПРИЧИНЕ. Ненулевой код сам по себе ничего не доказывает: барьер
+# fail-closed и краснеет по многим причинам. Сценарий засчитывается, только если в выводе
+# есть ИМЕННО его причина (`C-255` B-2, `testing.md` §«Целостность гейта» п.3).
+expect_fail() { # expect_fail <repo> <причина-подстрока> <ok-текст> <bad-текст>
+  local rc; rc="$(run "$1")"
+  if [ "$rc" -eq 0 ]; then bad "$4"; return; fi
+  if grep -qF -- "$2" "$TMP/last.out"; then ok "$3"
+  else bad "$4 — отказ был, но НЕ по заявленной причине «$2»: $(grep -m1 '^FAIL' "$TMP/last.out" | cut -c1-120)"; fi
+}
 
 # ─── (1) ИЗВЕСТНЫЙ СЛУЧАЙ: живой код ссылается на вынесенный артефакт ⇒ ОТКАЗ ───
 R="$TMP/case1"; mk_repo "$R"
 printf '// спека milestones/M-99-probe-subject.md §4\n' > "$R/crates/gateway/src/lib.rs"
 commit_all "$R"
-if [ "$(run "$R")" -ne 0 ]; then
-  ok "известный случай: висячая ссылка в живом коде ⇒ отказ"
-else
-  bad "известный случай ПРОПУЩЕН — барьер не ловит то, ради чего заведён"
+if tracked "$R" crates/gateway/src/lib.rs docs/archive/M-99-probe-subject.md; then
+  expect_fail "$R" 'висячая ссылка на вынесенный артефакт «M-99-probe-subject.md»' \
+    "известный случай: висячая ссылка в живом коде ⇒ отказ" \
+    "известный случай ПРОПУЩЕН — барьер не ловит то, ради чего заведён"
 fi
 
 # ─── (2) ПОСЛЕ ПОЧИНКИ: путь исправлен ⇒ ПРИНЯТИЕ ───
 printf '// спека docs/archive/M-99-probe-subject.md §4\n' > "$R/crates/gateway/src/lib.rs"
 commit_all "$R"
-if [ "$(run "$R")" -eq 0 ]; then
+if guard "$R" 'crates/**' 'docs/archive/M-99-probe-subject.md' && [ "$(run "$R")" -eq 0 ]; then
   ok "после починки пути: принятие"
 else
   bad "исправленный путь всё ещё считается висячим — барьер краснеет на правде"
@@ -72,10 +93,11 @@ mkdir -p "$R2/crates/journal/src"
 printf '// тоже старый путь milestones/M-99\n' > "$R2/crates/journal/src/lib.rs"
 printf 'crates/gateway/src/lib.rs|milestones/M-99\n' > "$R2/scripts/lib/archived_refs_baseline.txt"
 commit_all "$R2"
-if [ "$(run "$R2")" -ne 0 ]; then
-  ok "новое нарушение при непустой базовой линии ⇒ отказ (амнистия не распространяется)"
-else
-  bad "новое нарушение ПРОЩЕНО базовой линией — список стал амнистией для всего дерева"
+if tracked "$R2" crates/gateway/src/lib.rs crates/journal/src/lib.rs scripts/lib/archived_refs_baseline.txt; then
+  # причина — именно НОВЫЙ файл, а не амнистированный
+  expect_fail "$R2" 'crates/journal/src/lib.rs' \
+    "новое нарушение при непустой базовой линии ⇒ отказ (амнистия не распространяется)" \
+    "новое нарушение ПРОЩЕНО базовой линией — список стал амнистией для всего дерева"
 fi
 
 # ─── (4) БАЗОВАЯ ЛИНИЯ ОБЯЗАНА СОКРАЩАТЬСЯ: протухшая строка ⇒ ОТКАЗ ───
@@ -83,10 +105,10 @@ R3="$TMP/case4"; mk_repo "$R3"
 printf '// путь уже исправлен: docs/archive/M-99-probe-subject.md\n' > "$R3/crates/gateway/src/lib.rs"
 printf 'crates/gateway/src/lib.rs|milestones/M-99\n' > "$R3/scripts/lib/archived_refs_baseline.txt"
 commit_all "$R3"
-if [ "$(run "$R3")" -ne 0 ]; then
-  ok "протухшая строка базовой линии ⇒ отказ (список обязан сокращаться)"
-else
-  bad "протухшая строка ПРИНЯТА — список амнистирует то, чего уже нет, и слабеет молча"
+if tracked "$R3" crates/gateway/src/lib.rs scripts/lib/archived_refs_baseline.txt; then
+  expect_fail "$R3" 'базовая линия протухла' \
+    "протухшая строка базовой линии ⇒ отказ (список обязан сокращаться)" \
+    "протухшая строка ПРИНЯТА — список амнистирует то, чего уже нет, и слабеет молча"
 fi
 
 # ─── (5) FAIL-CLOSED: базовой линии нет вовсе ⇒ ОТКАЗ ───
@@ -94,10 +116,10 @@ R4="$TMP/case5"; mk_repo "$R4"
 rm -f "$R4/scripts/lib/archived_refs_baseline.txt"
 printf '// чисто\n' > "$R4/crates/gateway/src/lib.rs"
 commit_all "$R4"
-if [ "$(run "$R4")" -ne 0 ]; then
-  ok "отсутствие базовой линии ⇒ отказ (fail-closed)"
-else
-  bad "барьер работает БЕЗ базовой линии — молчание принято за чистоту"
+if tracked "$R4" crates/gateway/src/lib.rs docs/archive/M-99-probe-subject.md; then
+  expect_fail "$R4" 'нет базовой линии' \
+    "отсутствие базовой линии ⇒ отказ (fail-closed)" \
+    "барьер работает БЕЗ базовой линии — молчание принято за чистоту"
 fi
 
 # ─── (6) SETUP-СТРАЖ: пустой архив ⇒ ОТКАЗ, а не «нарушений нет» ───
@@ -105,10 +127,10 @@ R5="$TMP/case6"; mk_repo "$R5"
 rm -f "$R5/docs/archive/M-99-probe-subject.md"
 printf '// что угодно\n' > "$R5/crates/gateway/src/lib.rs"
 commit_all "$R5"
-if [ "$(run "$R5")" -ne 0 ]; then
-  ok "пустой архив ⇒ отказ (барьер не судит пустоту)"
-else
-  bad "пустой архив принят за чистоту — барьер зеленел бы, ничего не проверяя"
+if tracked "$R5" crates/gateway/src/lib.rs scripts/lib/archived_refs_baseline.txt; then
+  expect_fail "$R5" 'не найдено НИ ОДНОГО вынесенного артефакта' \
+    "пустой архив ⇒ отказ (барьер не судит пустоту)" \
+    "пустой архив принят за чистоту — барьер зеленел бы, ничего не проверяя"
 fi
 
 # ─── (7) ИСКЛЮЧЕНИЕ СОБСТВЕННОЙ ОСНАСТКИ НЕ ОСЛЕПЛЯЕТ БАРЬЕР В `scripts/**` ───
@@ -119,10 +141,10 @@ mkdir -p "$R6/scripts/tests"
 printf '// чисто\n' > "$R6/crates/gateway/src/lib.rs"
 printf '# ссылка на milestones/M-99-probe-subject.md\n' > "$R6/scripts/some_other_gate.sh"
 commit_all "$R6"
-if [ "$(run "$R6")" -ne 0 ]; then
-  ok "исключение оснастки точечное: чужой файл под scripts/** по-прежнему судится"
-else
-  bad "исключение оснастки ослепило весь scripts/** — барьер перестал видеть свою же зону"
+if tracked "$R6" scripts/some_other_gate.sh docs/archive/M-99-probe-subject.md; then
+  expect_fail "$R6" 'scripts/some_other_gate.sh' \
+    "исключение оснастки точечное: чужой файл под scripts/** по-прежнему судится" \
+    "исключение оснастки ослепило весь scripts/** — барьер перестал видеть свою же зону"
 fi
 
 # ─── (8) ГРАНИЦА СПЕКИ: вынесен M-99, живая ссылка на СОСЕДА `M-99b` ⇒ ПРИНЯТИЕ ───
@@ -143,11 +165,9 @@ fi
 printf '// спека milestones/M-99 §3 и файл milestones/M-99-probe-subject.md\n' > "$R7/crates/gateway/src/lib.rs"
 commit_all "$R7"
 if guard "$R7" 'crates/**' 'milestones/M-99 §3'; then
-  if [ "$(run "$R7")" -ne 0 ]; then
-    ok "позитивный контроль: ссылка на вынесенный M-99 (конец слова и дефис) ⇒ отказ"
-  else
-    bad "граница УБИЛА обнаружение — ссылка на вынесенный M-99 принята"
-  fi
+  expect_fail "$R7" 'висячая ссылка на вынесенный артефакт «M-99-probe-subject.md»' \
+    "позитивный контроль: ссылка на вынесенный M-99 (конец слова и дефис) ⇒ отказ" \
+    "граница УБИЛА обнаружение — ссылка на вынесенный M-99 принята"
 fi
 
 # ─── (10) ГРАНИЦА ГЕЙТА: вынесен verify_M-99.sh, живая ссылка на verify_M-99b.sh ⇒ ПРИНЯТИЕ ───
@@ -169,11 +189,9 @@ fi
 printf '# гоняем bash scripts/verify_M-99.sh — вынесенный гейт\n' > "$R8/crates/gateway/src/lib.rs"
 commit_all "$R8"
 if guard "$R8" 'crates/**' 'scripts/verify_M-99.sh'; then
-  if [ "$(run "$R8")" -ne 0 ]; then
-    ok "позитивный контроль гейта: ссылка на вынесенный verify_M-99.sh ⇒ отказ"
-  else
-    bad "граница гейта УБИЛА обнаружение — ссылка на вынесенный verify_M-99.sh принята"
-  fi
+  expect_fail "$R8" 'висячая ссылка на вынесенный артефакт «verify_M-99.sh»' \
+    "позитивный контроль гейта: ссылка на вынесенный verify_M-99.sh ⇒ отказ" \
+    "граница гейта УБИЛА обнаружение — ссылка на вынесенный verify_M-99.sh принята"
 fi
 
 # ─── (11) СУФФИКС ГЕЙТА: вынесен `verify_M-98-umbrella-2026-08.sh`, ссылка на прежний путь ⇒ ОТКАЗ ───
@@ -194,7 +212,7 @@ elif guard "$R9" 'crates/**' 'scripts/verify_M-98.sh'; then
   rc="$(run "$R9")"
   if ! grep -q 'вынесенных артефактов найдено: 2' "$TMP/last.out"; then
     bad "суффикс гейта: барьер насчитал не 2 артефакта — суффиксный гейт не признан артефактом (или архив судился как пустой)"
-  elif [ "$rc" -ne 0 ]; then
+  elif [ "$rc" -ne 0 ] && grep -qF 'висячая ссылка на вынесенный артефакт «verify_M-98-umbrella-2026-08.sh»' "$TMP/last.out"; then
     ok "суффикс гейта: verify_M-98-umbrella-*.sh считается артефактом (найдено 2), ссылка на scripts/verify_M-98.sh ⇒ отказ"
   else
     bad "вынесенный гейт с суффиксом признан артефактом, но ссылка на его прежний путь принята"
@@ -209,10 +227,26 @@ printf '// живой сосед: milestones/M-99b-other-subject.md\n' > "$R10/c
 printf 'crates/gateway/src/lib.rs|milestones/M-99\n' > "$R10/scripts/lib/archived_refs_baseline.txt"
 commit_all "$R10"
 if guard "$R10" 'crates/**' 'milestones/M-99b' && guard "$R10" 'scripts/lib/**' 'crates/gateway/src/lib.rs|milestones/M-99'; then
-  if [ "$(run "$R10")" -ne 0 ]; then
-    ok "ложная амнистия: строка на файл, ссылающийся только на живой M-99b, ⇒ отказ (протухла)"
+  expect_fail "$R10" 'базовая линия протухла' \
+    "ложная амнистия: строка на файл, ссылающийся только на живой M-99b, ⇒ отказ (протухла)" \
+    "ложная амнистия ПРИНЯТА — проверка протухания ищет подстрокой и видит M-99 в M-99b"
+fi
+
+# ─── (14) ОТБОР = РАЗБОР: имя в архиве без идентификатора НЕ считается артефактом ───
+# `C-255` B-1: страж «идентификатор не разобран» был недостижим — отбор и разбор держали одну
+# грамматику двумя копиями. Теперь это ОДНО выражение: что не разобралось, то не отобрано.
+# Сценарий пиннит строгость отбора: расширение грамматики без разбора номера роняет счёт.
+R11="$TMP/case14"; mk_repo "$R11"
+: > "$R11/docs/archive/M-probe-notes.md"
+: > "$R11/docs/archive/verify_M-probe.sh"
+printf '// чисто\n' > "$R11/crates/gateway/src/lib.rs"
+commit_all "$R11"
+if tracked "$R11" docs/archive/M-probe-notes.md docs/archive/verify_M-probe.sh docs/archive/M-99-probe-subject.md; then
+  rc="$(run "$R11")"
+  if [ "$rc" -eq 0 ] && grep -qF 'вынесенных артефактов найдено: 1' "$TMP/last.out"; then
+    ok "отбор = разбор: M-probe-notes.md и verify_M-probe.sh без номера артефактами не считаются (найдено 1)"
   else
-    bad "ложная амнистия ПРИНЯТА — проверка протухания ищет подстрокой и видит M-99 в M-99b"
+    bad "имя без идентификатора принято за артефакт или сломало барьер (rc=$rc): $(grep -m1 -E '^(FAIL|PASS  вынесенных)' "$TMP/last.out" | cut -c1-120)"
   fi
 fi
 
