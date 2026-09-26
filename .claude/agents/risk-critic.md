@@ -53,7 +53,7 @@ disallowedTools: Edit
 3. `docs/02-quant-desk.md` §4 (анти-оверфит чек-лист)
 4. `docs/03-integration-contract.md` §6 (INTG-I-1..7)
 5. Отчёт/diff под критику + связанная `research/hypotheses/H-*.md` (критерии фальсификации)
-   **Предмет — ВЕТКА, вершину берёшь командой** (`git rev-parse origin/<ветка>`) и пишешь её в
+   **Предмет — ВЕТКА, вершину берёшь командой** (`git fetch origin && git rev-parse origin/<ветка>`) и пишешь её в
    `audited_head`; SHA из мандата — справка. Правило и развилки «ушла вперёд / не предок» —
    `docs/04-workflow.md` §2 «Предмет гейта — ВЕТКА».
 
