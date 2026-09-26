@@ -81,9 +81,19 @@ LIVE=(
 BASELINE="$(dirname "$0")/lib/archived_refs_baseline.txt"
 [ -f "$BASELINE" ] || { fail "нет базовой линии $BASELINE — барьер fail-closed"; echo "VERDICT: FAIL"; exit 1; }
 
-# Вынесенные артефакты: спеки милестоунов и их гейты.
-# Гейт — с необязательным пояснением после номера: `verify_M-60-umbrella-2026-08.sh`.
-mapfile -t ARCHIVED < <(ls docs/archive/ 2>/dev/null | grep -E '^(M-[0-9]+[a-z]?-.*\.md|verify_M-[0-9]+[a-z]?(-.*)?\.sh)$' || true)
+# Вынесенные артефакты: спеки милестоунов и их гейты. ОТБОР И РАЗБОР — ОДНО ВЫРАЖЕНИЕ
+# (`C-255` B-1): прежде грамматика жила двумя копиями (`grep` отбора и `grep -o` разбора), и
+# страж «идентификатор не разобран» между ними был недостижим — мёртвый код, выдаваемый за
+# защиту. Теперь имя, из которого номер не разобрался, не отбирается вовсе: расхождению
+# копий негде возникнуть. Спека: `M-<id>-<слаг>.md`. Гейт: `verify_M-<id>[-<пояснение>].sh`.
+ARCHIVED=(); OLDPATH=()
+while IFS= read -r art; do
+  if [[ "$art" =~ ^(M-[0-9]+[a-z]?)-.*\.md$ ]]; then
+    ARCHIVED+=("$art"); OLDPATH+=("milestones/${BASH_REMATCH[1]}")
+  elif [[ "$art" =~ ^verify_(M-[0-9]+[a-z]?)(-.*)?\.sh$ ]]; then
+    ARCHIVED+=("$art"); OLDPATH+=("scripts/verify_${BASH_REMATCH[1]}")
+  fi
+done < <(ls docs/archive/ 2>/dev/null)
 
 if [ "${#ARCHIVED[@]}" -eq 0 ]; then
   fail "в docs/archive/ не найдено НИ ОДНОГО вынесенного артефакта — барьер судил бы пустоту"
@@ -99,13 +109,8 @@ pass "вынесенных артефактов найдено: ${#ARCHIVED[@]}"
 # берут её отсюда, иначе две проверки разошлись бы в понимании, что такое «ссылается».
 boundary_re() { printf '%s([^a-z0-9]|$)' "$1"; }
 DANGLING=0
-for art in "${ARCHIVED[@]}"; do
-  case "$art" in
-    verify_M-*.sh) id="$(printf '%s' "${art#verify_}" | grep -oE '^M-[0-9]+[a-z]?')"; old="scripts/verify_${id}" ;;
-    M-*.md)        id="$(printf '%s' "$art" | grep -oE '^M-[0-9]+[a-z]?')"; old="milestones/${id}" ;;
-    *) continue ;;
-  esac
-  [ -n "$id" ] || { fail "не разобран идентификатор артефакта «$art» — барьер fail-closed"; continue; }
+for i in "${!ARCHIVED[@]}"; do
+  art="${ARCHIVED[$i]}"; old="${OLDPATH[$i]}"
 
   hits=$(git grep -n -E "$(boundary_re "$old")" -- "${LIVE[@]}" 2>/dev/null | grep -v 'ARCHIVED-REF-OK' || true)
   # УНАСЛЕДОВАННОЕ отделяется от НОВОГО. Первый проход архива (26 гейтов, норма Р-2) прошёл
