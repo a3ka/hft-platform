@@ -34,6 +34,22 @@ use gateway::Selector;
 use gateway_serve::admission::{AdmissionPolicy, LiveProfile};
 use gateway_serve::auth::Claims;
 use gateway_serve::metrics::{freshness, serving_counters};
+
+/// ТЕСТЫ ЭТОГО ФАЙЛА ИДУТ ПО ОЧЕРЕДИ — и это требование к оракулу, а не к удобству.
+/// `serving_counters()` — ПРОЦЕССНЫЙ счётчик, а тесты одного бинаря по умолчанию идут
+/// параллельно: сценарий, законно читающий журнал, двигает счётчик в окне ЧУЖОГО
+/// утверждения. `c5`/`c1` («до == после») тогда краснеют ложно, `c6` и позитивный
+/// контроль («после > до») — ложно зеленеют на заимствованном приросте.
+/// Замер 2026-09-26: CI `main` после merge #227 — `c5` «отказ наступил ПОСЛЕ чтения
+/// журнала» (54 293 против 39 818), при том что Rust-дерево совпадает с деревом merge #226,
+/// где тот же тест зелен; перезапуск той же проверки — зелен. Локально не воспроизводится
+/// (0 из 85 прогонов файла в четырёх режимах и 0 из 20 одиночных прогонов `c5`) —
+/// поэтому лечение МЕХАНИЧЕСКОЕ, а не по случаю.
+/// Блокировка в коде, а не `--test-threads=1` в командной строке: CI гоняет `cargo test
+/// --all` без флагов, и оракул обязан быть верен в ТОЙ форме вызова (`gates.md` §3).
+/// Корневое лечение — счётчик ЭКЗЕМПЛЯРА сервера (как `Server::slots_handle` для слотов,
+/// §14.1ter спеки M-87); это прод-код, зона engine-dev, — названо долгом.
+static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 use gateway_serve::server::{bind_with_policy, ServeConfig};
 use journal::{EpochFilter, Journal, WriterConfig};
 use jsonwebtoken::{encode, DecodingKey, EncodingKey, Header};
@@ -444,6 +460,7 @@ fn canonical_selector_json() -> Value {
 /// и журнал при этом читаться НЕ ДОЛЖЕН — проверяется счётчиком, снятым до и после.
 #[tokio::test]
 async fn c1_entry_cold_request_named_outcome_without_reading_journal() {
+    let _serial = SERIAL.lock().await;
     let dir = journal_busy(3_000);
     let (_ckpt, _ckpt_guard) = prepare_from_registry(
         "c1_entry_cold_request_named_outcome_without_reading_journal",
@@ -480,6 +497,7 @@ async fn c1_entry_cold_request_named_outcome_without_reading_journal() {
 /// АНТИ-ПЛАЦЕБО: реализация «всегда отказывать» проходит тест выше. Здесь она обязана упасть.
 #[tokio::test]
 async fn c1_entry_ready_state_is_actually_served() {
+    let _serial = SERIAL.lock().await;
     let dir = journal_busy(500);
     let (_ckpt, _ckpt_guard) =
         prepare_from_registry("c1_entry_ready_state_is_actually_served", dir.path());
@@ -503,6 +521,7 @@ async fn c1_entry_ready_state_is_actually_served() {
 /// проверяющая только символ и полосы, такой запрос отклонить не способна.
 #[tokio::test]
 async fn c5_entry_unbounded_profile_is_refused() {
+    let _serial = SERIAL.lock().await;
     let dir = journal_busy(3_000);
     let (_ckpt, _ckpt_guard) =
         prepare_from_registry("c5_entry_unbounded_profile_is_refused", dir.path());
@@ -538,6 +557,7 @@ async fn c5_entry_unbounded_profile_is_refused() {
 /// Параметры НЕ подменяются молча на поддержанные (`CT-RFC-09` §2.7).
 #[tokio::test]
 async fn c5_entry_refusal_does_not_substitute_parameters() {
+    let _serial = SERIAL.lock().await;
     let dir = journal_busy(200);
     let (_ckpt, _ckpt_guard) = prepare_from_registry(
         "c5_entry_refusal_does_not_substitute_parameters",
@@ -570,6 +590,7 @@ async fn c5_entry_refusal_does_not_substitute_parameters() {
 /// Соседняя подписка и соединение остаются живыми (`CT-RFC-09` §2.7).
 #[tokio::test]
 async fn c5_entry_refusal_keeps_connection_and_neighbours_alive() {
+    let _serial = SERIAL.lock().await;
     let dir = journal_busy(500);
     let (_ckpt, _ckpt_guard) = prepare_from_registry(
         "c5_entry_refusal_keeps_connection_and_neighbours_alive",
@@ -691,6 +712,7 @@ impl Drop for RendezvousGuard {
 #[cfg(feature = "testing")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn c4_slot_lifecycle_hold_refuse_release() {
+    let _serial = SERIAL.lock().await;
     use gateway_serve::test_sync::rendezvous;
 
     let dir = journal_busy(300);
@@ -800,6 +822,7 @@ async fn c4_slot_lifecycle_hold_refuse_release() {
 /// литералом и судила чистую функцию правила тревоги; гейт это отклонил (`C-234` R3).
 #[tokio::test]
 async fn c6_counters_are_emitted_by_the_real_serving_path() {
+    let _serial = SERIAL.lock().await;
     let dir = journal_busy(300);
     let (_ckpt, _ckpt_guard) = prepare_from_registry(
         "c6_counters_are_emitted_by_the_real_serving_path",
@@ -848,6 +871,7 @@ async fn c6_counters_are_emitted_by_the_real_serving_path() {
 /// а не источник истины.
 #[tokio::test]
 async fn c9_four_positions_differ_and_stale_snapshot_does_not_stop_serving() {
+    let _serial = SERIAL.lock().await;
     let dir = journal_busy(300);
     let (_ckpt, _ckpt_guard) = prepare_from_registry(
         "c9_four_positions_differ_and_stale_snapshot_does_not_stop_serving",
@@ -925,6 +949,7 @@ fn u1_guard_trap_actually_traps() {
 /// журнал уже читали, то есть допуска на пути нет.
 #[tokio::test]
 async fn u1_entry_missing_checkpoint_over_trap_gives_named_outcome() {
+    let _serial = SERIAL.lock().await;
     let dir = journal_busy(2_000);
     let (_ckpt, _ckpt_guard) = prepare_from_registry(
         "u1_entry_missing_checkpoint_over_trap_gives_named_outcome",
@@ -945,6 +970,7 @@ async fn u1_entry_missing_checkpoint_over_trap_gives_named_outcome() {
 /// Состояние 2 — слепок ПОВРЕЖДЁН, журнал под ловушкой.
 #[tokio::test]
 async fn u1_entry_corrupt_checkpoint_over_trap_gives_named_outcome() {
+    let _serial = SERIAL.lock().await;
     let dir = journal_busy(2_000);
     let (_ckpt, _ckpt_guard) = prepare_from_registry(
         "u1_entry_corrupt_checkpoint_over_trap_gives_named_outcome",
@@ -968,6 +994,7 @@ async fn u1_entry_corrupt_checkpoint_over_trap_gives_named_outcome() {
 /// Состояние 3 — слепок НЕСОВМЕСТИМ по версии провода, журнал под ловушкой.
 #[tokio::test]
 async fn u1_entry_incompatible_checkpoint_over_trap_gives_named_outcome() {
+    let _serial = SERIAL.lock().await;
     let dir = journal_busy(600);
     let (_ckpt, _ckpt_guard) = prepare_from_registry(
         "u1_entry_incompatible_checkpoint_over_trap_gives_named_outcome",
@@ -992,6 +1019,7 @@ async fn u1_entry_incompatible_checkpoint_over_trap_gives_named_outcome() {
 /// сегмент ПОСЛЕ курсора слепка (`A-037` У-1): голова цела, хвост читать нельзя.
 #[tokio::test]
 async fn u1_entry_stale_checkpoint_beyond_budget_gives_named_outcome() {
+    let _serial = SERIAL.lock().await;
     let dir = journal_busy(300);
     // Опись снимается ДО материализации строки: ловушка ставится в сегмент, который
     // создаёт САМ ХВОСТ. Порядок здесь — предмет сценария, поэтому подготовка стоит
@@ -1022,6 +1050,7 @@ async fn u1_entry_stale_checkpoint_beyond_budget_gives_named_outcome() {
 /// ДО порчи, и `resume` со слепком голову не читает. Пин «слепок спасает от чтения головы».
 #[tokio::test]
 async fn u1_warm_path_is_served_over_trapped_head() {
+    let _serial = SERIAL.lock().await;
     let dir = journal_busy(600);
     let (_ckpt, _ckpt_guard) =
         prepare_from_registry("u1_warm_path_is_served_over_trapped_head", dir.path());
@@ -1042,6 +1071,7 @@ async fn u1_warm_path_is_served_over_trapped_head() {
 /// `journal_payload_bytes_read`» проходит все проверки «журнал не читался».
 #[tokio::test]
 async fn u1_served_request_with_tail_increments_payload_counter() {
+    let _serial = SERIAL.lock().await;
     let dir = journal_busy(300);
     let (_ckpt, _ckpt_guard) = prepare_from_registry(
         "u1_served_request_with_tail_increments_payload_counter",
