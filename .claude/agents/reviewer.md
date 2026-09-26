@@ -22,6 +22,7 @@ model: opus
 - Не пропускает risk-блок: любой milestone на `risk`/`killswitch`/`oms`/`venue-*` ОБЯЗАН иметь пройденный `risk-critic` вердикт в чейне ДО APPROVED.
 
 ## Responsibilities
+0. **Предмет — ВЕТКА, вершину берёшь командой** (`git fetch origin && git rev-parse origin/<ветка>`) и пишешь её в `audited_head`; SHA из мандата — справка. Правило и развилки «ушла вперёд / не предок» — `docs/04-workflow.md` §2 «Предмет гейта — ВЕТКА».
 1. **Scope** — diff соответствует allowed/forbidden paths milestone'а (§1 ролевая таблица `04-workflow.md`); превышение = REJECT.
 2. **Done Block** — сырой stdout `git status`, тестов, acceptance-скрипта, exit-кодов; пересказ = NOT REVIEWED.
 3. **Contract Block-C** — правки T1 (`contracts/`) ТОЛЬКО внутри atomic contract-RFC (`05-contract-layer.md` §4); не-RFC правка → авто-REJECT.

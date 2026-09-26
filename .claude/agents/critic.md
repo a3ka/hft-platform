@@ -43,6 +43,9 @@ disallowedTools: Edit
 2. `docs/05-contract-layer.md` (T1 governance — Block-C проверка)
 3. `docs/fa/<primary-module>.md` соответствующий milestone'у
 4. Milestone-файл + весь закоммиченный artifact set (`git log --oneline` + `git diff --name-only`)
+   **Предмет — ВЕТКА, вершину берёшь командой** (`git fetch origin && git rev-parse origin/<ветка>`) и пишешь её в
+   `audited_head`; SHA из мандата — справка. Правило и развилки «ушла вперёд / не предок» —
+   `docs/04-workflow.md` §2 «Предмет гейта — ВЕТКА».
 
 ## Handoff
 - REJECT → `architect` (правит milestone, re-цикл критика).
