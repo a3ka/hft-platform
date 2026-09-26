@@ -7,6 +7,12 @@
 #
 # Проба строит ОДНОРАЗОВЫЙ репозиторий: барьер работает через `git grep`, и подсунуть ему
 # файлы мимо git нельзя. Число сценариев СЧИТАЕТСЯ прогоном, а не заявляется.
+#
+# Сценарии 8-12 (харнесс-трек 2026-09-26, `R-203` §5): ГРАНИЦА идентификатора. Первая
+# редакция барьера искала подстрокой и краснела на живом `M-60b` при вынесенном `M-60`;
+# ложное красное гасили базовой линией — восемь амнистий на живые файлы. Каждая пара ниже
+# держит обе стороны: граница НЕ убивает обнаружение (позитивный контроль в том же репо).
+# У каждого сценария — страж setup'а: проба, молча гоняющая не тот сценарий, — плацебо.
 
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -29,7 +35,15 @@ mk_repo() {
   : > "$d/scripts/lib/archived_refs_baseline.txt"
 }
 commit_all() { git -C "$1" add -A >/dev/null 2>&1; git -C "$1" commit -q -m probe --no-verify >/dev/null 2>&1; }
-run() { ( cd "$1" && bash scripts/check_archived_refs.sh >/dev/null 2>&1; echo $? ); }
+run() { ( cd "$1" && bash scripts/check_archived_refs.sh >"$TMP/last.out" 2>&1; echo $? ); }
+# СТРАЖ SETUP'А: фикстура обязана быть ПОД GIT и содержать ровно тот текст, который сценарий
+# судит; иначе сценарий проверяет не то, что заявляет (`testing.md` §«Целостность гейта» п.3).
+# Возвращает 1 и пишет FAIL — вызывающий сценарий не выполняется.
+guard() { # guard <repo> <pathspec> <literal>
+  if git -C "$1" grep -q -F -- "$3" -- "$2" 2>/dev/null; then return 0; fi
+  bad "SETUP не состоялся: «$3» не найден под git в $2 — сценарий не судит то, что заявляет"
+  return 1
+}
 
 # ─── (1) ИЗВЕСТНЫЙ СЛУЧАЙ: живой код ссылается на вынесенный артефакт ⇒ ОТКАЗ ───
 R="$TMP/case1"; mk_repo "$R"
@@ -109,6 +123,97 @@ if [ "$(run "$R6")" -ne 0 ]; then
   ok "исключение оснастки точечное: чужой файл под scripts/** по-прежнему судится"
 else
   bad "исключение оснастки ослепило весь scripts/** — барьер перестал видеть свою же зону"
+fi
+
+# ─── (8) ГРАНИЦА СПЕКИ: вынесен M-99, живая ссылка на СОСЕДА `M-99b` ⇒ ПРИНЯТИЕ ───
+# Ложное красное первой редакции: `milestones/M-99` — подстрока `milestones/M-99b-…`.
+R7="$TMP/case8"; mk_repo "$R7"
+printf '// живой сосед: milestones/M-99b-other-subject.md §1\n' > "$R7/crates/gateway/src/lib.rs"
+commit_all "$R7"
+if guard "$R7" 'crates/**' 'milestones/M-99b-other-subject.md'; then
+  if [ "$(run "$R7")" -eq 0 ]; then
+    ok "граница спеки: ссылка на живой M-99b при вынесенном M-99 ⇒ принятие"
+  else
+    bad "ссылка на ЖИВОЙ M-99b покраснела — граница идентификатора не работает (подстрока)"
+  fi
+fi
+
+# ─── (9) ПОЗИТИВНЫЙ КОНТРОЛЬ в ТОМ ЖЕ репо: ссылка на сам M-99 ⇒ ОТКАЗ ───
+# Граница — не пробел и не дефис: `milestones/M-99 §3` (конец слова) тоже висячая.
+printf '// спека milestones/M-99 §3 и файл milestones/M-99-probe-subject.md\n' > "$R7/crates/gateway/src/lib.rs"
+commit_all "$R7"
+if guard "$R7" 'crates/**' 'milestones/M-99 §3'; then
+  if [ "$(run "$R7")" -ne 0 ]; then
+    ok "позитивный контроль: ссылка на вынесенный M-99 (конец слова и дефис) ⇒ отказ"
+  else
+    bad "граница УБИЛА обнаружение — ссылка на вынесенный M-99 принята"
+  fi
+fi
+
+# ─── (10) ГРАНИЦА ГЕЙТА: вынесен verify_M-99.sh, живая ссылка на verify_M-99b.sh ⇒ ПРИНЯТИЕ ───
+R8="$TMP/case10"; mk_repo "$R8"
+rm -f "$R8/docs/archive/M-99-probe-subject.md"
+: > "$R8/docs/archive/verify_M-99.sh"
+printf '# гоняем bash scripts/verify_M-99b.sh — живой гейт\n' > "$R8/crates/gateway/src/lib.rs"
+commit_all "$R8"
+if [ -z "$(git -C "$R8" ls-files docs/archive/verify_M-99.sh)" ]; then
+  bad "SETUP не состоялся: docs/archive/verify_M-99.sh не под git — сценарий 10 судил бы пустой архив"
+elif guard "$R8" 'crates/**' 'scripts/verify_M-99b.sh'; then
+  if [ "$(run "$R8")" -eq 0 ]; then
+    ok "граница гейта: ссылка на живой verify_M-99b.sh при вынесенном verify_M-99.sh ⇒ принятие"
+  else
+    bad "ссылка на ЖИВОЙ verify_M-99b.sh покраснела — граница гейта не работает"
+  fi
+fi
+# позитивный контроль в том же репо
+printf '# гоняем bash scripts/verify_M-99.sh — вынесенный гейт\n' > "$R8/crates/gateway/src/lib.rs"
+commit_all "$R8"
+if guard "$R8" 'crates/**' 'scripts/verify_M-99.sh'; then
+  if [ "$(run "$R8")" -ne 0 ]; then
+    ok "позитивный контроль гейта: ссылка на вынесенный verify_M-99.sh ⇒ отказ"
+  else
+    bad "граница гейта УБИЛА обнаружение — ссылка на вынесенный verify_M-99.sh принята"
+  fi
+fi
+
+# ─── (11) СУФФИКС ГЕЙТА: вынесен `verify_M-98-umbrella-2026-08.sh`, ссылка на прежний путь ⇒ ОТКАЗ ───
+# Первая редакция такой файл артефактом не считала (`verify_M-60-umbrella-2026-08.sh` в
+# настоящем архиве) — его ссылки не проверялись вовсе.
+# Спека M-99 в архиве ОСТАЁТСЯ (без живых ссылок): иначе барьер, не видящий суффиксный гейт,
+# упал бы на «пустой архив», и проба приняла бы fail-closed за обнаружение — ровно так
+# первая редакция этого сценария и была зелёной против старого барьера.
+R9="$TMP/case11"; mk_repo "$R9"
+: > "$R9/docs/archive/verify_M-98-umbrella-2026-08.sh"
+printf '# прежний путь: bash scripts/verify_M-98.sh\n' > "$R9/crates/gateway/src/lib.rs"
+commit_all "$R9"
+# стражи: в архиве НЕТ `verify_M-98.sh` без суффикса (обнаружение обязано идти через суффиксную
+# форму), а барьер обязан НАСЧИТАТЬ два артефакта — отказ по «пустому архиву» не засчитывается.
+if [ -e "$R9/docs/archive/verify_M-98.sh" ]; then
+  bad "SETUP не состоялся: в архиве есть verify_M-98.sh без суффикса — сценарий 11 не проверяет суффикс"
+elif guard "$R9" 'crates/**' 'scripts/verify_M-98.sh'; then
+  rc="$(run "$R9")"
+  if ! grep -q 'вынесенных артефактов найдено: 2' "$TMP/last.out"; then
+    bad "суффикс гейта: барьер насчитал не 2 артефакта — суффиксный гейт не признан артефактом (или архив судился как пустой)"
+  elif [ "$rc" -ne 0 ]; then
+    ok "суффикс гейта: verify_M-98-umbrella-*.sh считается артефактом (найдено 2), ссылка на scripts/verify_M-98.sh ⇒ отказ"
+  else
+    bad "вынесенный гейт с суффиксом признан артефактом, но ссылка на его прежний путь принята"
+  fi
+fi
+
+# ─── (12) ЛОЖНАЯ АМНИСТИЯ: строка базовой линии, чей файл ссылается ТОЛЬКО на живой M-99b ⇒ ОТКАЗ ───
+# Проверка протухания обязана использовать ТУ ЖЕ границу, что поиск: иначе восемь строк
+# `…|milestones/M-60` на живые `M-60a/b/c` жили бы вечно.
+R10="$TMP/case12"; mk_repo "$R10"
+printf '// живой сосед: milestones/M-99b-other-subject.md\n' > "$R10/crates/gateway/src/lib.rs"
+printf 'crates/gateway/src/lib.rs|milestones/M-99\n' > "$R10/scripts/lib/archived_refs_baseline.txt"
+commit_all "$R10"
+if guard "$R10" 'crates/**' 'milestones/M-99b' && guard "$R10" 'scripts/lib/**' 'crates/gateway/src/lib.rs|milestones/M-99'; then
+  if [ "$(run "$R10")" -ne 0 ]; then
+    ok "ложная амнистия: строка на файл, ссылающийся только на живой M-99b, ⇒ отказ (протухла)"
+  else
+    bad "ложная амнистия ПРИНЯТА — проверка протухания ищет подстрокой и видит M-99 в M-99b"
+  fi
 fi
 
 printf '\n'
