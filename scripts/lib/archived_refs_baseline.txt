@@ -11,7 +11,18 @@
 #
 # M-88 в списке ОТСУТСТВУЕТ НАМЕРЕННО: это случай, ради которого барьер и заведён,
 # и он чинится в тот же день (PR #220). Барьер обязан краснеть против него до слияния.
-.claude/rules/gates.md|milestones/M-60
+#
+# Ключ <прежний путь> — идентификатор С ГРАНИЦЕЙ: «milestones/M-60» покрывает
+# `milestones/M-60`, `milestones/M-60-*.md`, `milestones/M-60 §…`, но НЕ `milestones/M-60b-…`
+# и не `milestones/M-600`. Так барьер и ищет, так и проверяет протухание.
+#
+# 2026-09-26 (`R-203` §5, харнесс-трек): удалены ВОСЕМЬ строк `…|milestones/M-60`, которые
+# амнистировали не висячие ссылки, а ссылки на ЖИВЫЕ `M-60a`/`M-60b`/`M-60c` — ложное
+# красное подстрочного поиска первой редакции барьера (gates.md, ROADMAP.md,
+# check_context_budgets.sh, check_disk_budget.sh, check_gate_meta.sh, red_docs_freeze.sh,
+# verify_M-60b.sh, verify_M-60c.sh). Оставшаяся строка `red_reserve_id.sh|milestones/M-60`
+# — имя фикстуры `milestones/M-60-x.md` в одноразовом репозитории пробы, не ссылка на
+# спеку; барьер по своему определению её видит, снять можно только маркером в самом файле.
 crates/gateway-serve/src/lib.rs|milestones/M-86
 crates/gateway-serve/tests/red_vp_bin_width_bridge.rs|milestones/M-86
 crates/gateway-serve/tests/red_vp_bin_width_startup.rs|milestones/M-86
@@ -30,13 +41,6 @@ crates/journal/src/segments.rs|milestones/M-62
 crates/journal/tests/red_floor_scan.rs|milestones/M-50
 crates/signals/src/lib.rs|milestones/M-04
 docs/09-roadmap-v2.md|milestones/M-40
-docs/ROADMAP.md|milestones/M-60
-scripts/check_context_budgets.sh|milestones/M-60
-scripts/check_disk_budget.sh|milestones/M-60
-scripts/check_gate_meta.sh|milestones/M-60
 scripts/tests/red_artifact_ids.sh|milestones/M-53
 scripts/tests/red_artifact_ids.sh|milestones/M-85
-scripts/tests/red_docs_freeze.sh|milestones/M-60
 scripts/tests/red_reserve_id.sh|milestones/M-60
-scripts/verify_M-60b.sh|milestones/M-60
-scripts/verify_M-60c.sh|milestones/M-60
