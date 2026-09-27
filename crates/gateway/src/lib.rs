@@ -3808,6 +3808,24 @@ impl ReadStats {
     }
 }
 
+fn read_stats_from_stream_with_bytes(
+    stream: &journal::EventStream,
+    depth_levels_visited: u64,
+    payload_bytes_read: u64,
+) -> ReadStats {
+    // M-89 (`I-4`): `payload_bytes_read` — байты, ПРОЧИТАННЫЕ EventStream'ом.
+    // `journal` — sacred (`crates/journal/**` вне зоны engine-dev), счётчик
+    // ведётся там (`EventStream::payload_bytes_read()`). Здесь только пробрасываем.
+    ReadStats {
+        events_decoded: stream.events_decoded(),
+        segments_opened: stream.segments_opened(),
+        events_scanned: stream.events_scanned(),
+        segment_meta_ops: stream.segment_meta_ops(),
+        depth_levels_visited,
+        payload_bytes_read,
+    }
+}
+
 fn read_stats_from_stream(stream: &journal::EventStream, depth_levels_visited: u64) -> ReadStats {
     // M-87 (предохранитель выдачи, A-037 D-1, аддитивно): `payload_bytes_read`
     // — байты ПОЛЕЗНОЙ НАГРУЗКИ, прочитанные EventStream'ом. Поскольку
@@ -5423,7 +5441,11 @@ impl LiveReducer {
         // R-134 B-4): `ReadStats` объявлена складываемой (`impl Add`, `ReadStats::sum`),
         // кумулятивное поле в ней давало бы квадратичный перечёт при сложении тиков.
         let depth_after = self.full.depth_levels_visited();
-        let stats = read_stats_from_stream(&stream, depth_after - depth_before);
+        let stats = read_stats_from_stream_with_bytes(
+            &stream,
+            depth_after - depth_before,
+            stream.payload_bytes_read(),
+        );
         // M-57 (TD-109): забираем hint СВОЕЙ сессии из стрима. Если за тик НЕ было
         // ни одного декодированного события в активном сегменте (backlog пуст,
         // `stream.tail_hint()` вернёт `None`), НЕ сбрасываем старый hint — он всё ещё
