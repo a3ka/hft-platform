@@ -447,6 +447,20 @@ expect_aggregate A9-барьер-не-зовётся 1 \
 expect_aggregate A10-echo-с-обоими-именами 1 \
   "$(mutate_ci a10 'jobs["deploy-catchup"]["steps"]=[{"run":"echo \"scripts/deploy_catchup.py и scripts/tests/red_deploy_catchup.sh ок\""}]')" mut
 
+# --- C-258 R3: ПРОВОДКА пробы самого агрегата -------------------------------------------
+# `red_ci_aggregate.sh` исполняет условие агрегата для каждого джоба `needs`; зовётся ОДНОЙ
+# строкой — вторым шагом `status-check`. Удалить или обезвредить её — и ни одна проба не
+# краснеет: сторож, наблюдающий расхождение условия с `needs`, исчезает молча. Держит его
+# ЭТОТ барьер — он живёт в ДРУГОМ джобе (`deploy-catchup`) и от пробы не зависит.
+expect_aggregate A11-проба-агрегата-удалена 1 \
+  "$(mutate_ci a11 'jobs["status-check"]["steps"]=[x for x in jobs["status-check"]["steps"] if not (isinstance(x.get("run"),str) and "red_ci_aggregate.sh" in x["run"])]')" mut
+expect_aggregate A12-проба-агрегата-continue-on-error 1 \
+  "$(mutate_ci a12 '[x.__setitem__("continue-on-error",True) for x in jobs["status-check"]["steps"] if isinstance(x.get("run"),str) and "red_ci_aggregate.sh" in x["run"]]')" mut
+expect_aggregate A13-проба-агрегата-глушит-код 1 \
+  "$(mutate_ci a13 '[x.__setitem__("run",x["run"].rstrip()+" || true") for x in jobs["status-check"]["steps"] if isinstance(x.get("run"),str) and "red_ci_aggregate.sh" in x["run"]]')" mut
+expect_aggregate A14-проба-агрегата-echo 1 \
+  "$(mutate_ci a14 '[x.__setitem__("run","echo bash scripts/tests/red_ci_aggregate.sh") for x in jobs["status-check"]["steps"] if isinstance(x.get("run"),str) and "red_ci_aggregate.sh" in x["run"]]')" mut
+
 # ========================================================================================
 # ЧАСТЬ 3 — МУТАЦИОННЫЙ КОНТРОЛЬ (--battery): равенство kill-set'ов
 # ========================================================================================
