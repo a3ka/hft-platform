@@ -105,11 +105,19 @@ fn independent(dir: &Path, after: u64) -> (Vec<u64>, Option<std::io::ErrorKind>)
     (out, err)
 }
 
-/// **f1 — кандидат с неверным seq.** Дыра в нумерации построена ВРУЧНУЮ (кадры seq
-/// `PREFIX+1..` дописаны байтами, `PREFIX` пропущен): единственный способ получить кадр,
-/// который бисекция найдёт, а гард `seq == after+1` отвергнет, не портя CRC.
+/// **f1 — ДЫРА на месте `after+1` (`C-262` R6, `JR-I-2`).** Кадры seq `PREFIX+1..` дописаны
+/// байтами, `PREFIX` пропущен: бисекция найдёт кандидата, гард `seq == after+1` его отвергнет, не
+/// порча CRC. Прежняя редакция объявляла правильным «откат и выдача с `after+2`» — то есть
+/// благословляла МОЛЧАЛИВЫЙ пропуск события (`C-262` R6). `JR-I-2`: разрыв при чтении — abort.
+/// Требование (§5.2 п. 9): первое событие, выданное `stream_from_at(Some(after))` из того же
+/// сегмента, что содержит `after`, обязано быть `after+1`, иначе `Err(InvalidData)` — ничего не
+/// выдано. Откат при этом по-прежнему НАБЛЮДАЕМ (`seek_fallbacks == 1`).
+///
+/// Эталон — ЯВНОЕ ожидание, а не `stream()`: сегодняшний `stream()` дыры не проверяет вовсе
+/// (setup-страж ниже это и фиксирует) — названное в §11 предшествующее отклонение от `JR-I-2`,
+/// вне предмета `M-89`. Сравнивать с ним значило бы требовать того же отклонения.
 #[test]
-fn f1_wrong_seq_candidate_falls_back_observably_and_yields_independent_result() {
+fn f1_gap_at_after_plus_one_aborts_and_fallback_is_observable() {
     const PREFIX: u64 = 3_000;
     const TAIL: u64 = 200;
     let dir = tempfile::tempdir().expect("tempdir");
@@ -125,25 +133,74 @@ fn f1_wrong_seq_candidate_falls_back_observably_and_yields_independent_result() 
         append_bytes(&seg, &frame_of(&ev));
     }
     let after = PREFIX - 1;
-    let (want, want_err) = independent(dir.path(), after);
-    if want.first() != Some(&(PREFIX + 1)) && want_err.is_none() {
+    // SETUP-страж: дыра построена (кадра PREFIX нет, следующий — PREFIX+1). Независимый путь
+    // сегодня её пропускает — это фиксируется, а не выдаётся за эталон.
+    let (indep, indep_err) = independent(dir.path(), after);
+    if indep.first() != Some(&(PREFIX + 1)) || indep_err.is_some() {
         setup_failed("дыра в нумерации не построена: независимый путь не видит PREFIX+1 первым");
     }
     let (got, err, scanned, fallbacks) = run(dir.path(), after);
     assert_eq!(
         fallbacks, 1,
-        "f1 / §5.2 п. 7: кадр after+1 отсутствует (следующий несёт after+2) — гард точности обязан \
-         был отвергнуть кандидата и ОТКАТ обязан быть виден: seek_fallbacks = {fallbacks}"
+        "f1 / §5.2 п. 7: кадр after+1 отсутствует — гард точности обязан был отвергнуть кандидата \
+         и ОТКАТ обязан быть виден: seek_fallbacks = {fallbacks}"
     );
     assert!(
         scanned >= PREFIX,
         "f1: seek_fallbacks == 1, а events_scanned = {scanned} < префикс {PREFIX} — «откат» \
          засчитан без чтения с header_end: счётчик врёт о работе"
     );
+    assert!(
+        got.is_empty(),
+        "f1 / JR-I-2 (C-262 R6): при дыре на after+1 выдано {} событий, первое {:?} — событие \
+         {PREFIX} ПРОПУЩЕНО МОЛЧА. Разрыв при чтении — abort, не «пропустить»",
+        got.len(),
+        got.first()
+    );
     assert_eq!(
-        (got, err),
-        (want, want_err),
-        "f1 / N2: выдача после отката ≠ независимому фильтру"
+        err,
+        Some(std::io::ErrorKind::InvalidData),
+        "f1 / JR-I-2: дыра на after+1 обязана дать Err(InvalidData), получено {err:?}"
+    );
+}
+
+/// **f1b — ДЫРА В СЕРЕДИНЕ хвоста того же сегмента** (`C-262` R6, `JR-I-2`). Путь, который
+/// переписывает `M-89`, обязан проверять непрерывность ВСЕГО, что он выдаёт внутри сегмента, а
+/// не только первого события: иначе мутант «проверять только after+1» пройдёт `f1`.
+/// Выдано РОВНО `after+1 ..= до дыры`, затем `Err(InvalidData)`; после дыры — ничего.
+#[test]
+fn f1b_gap_mid_tail_yields_prefix_then_aborts() {
+    const PREFIX: u64 = 3_000;
+    const HALF: u64 = 100;
+    let dir = tempfile::tempdir().expect("tempdir");
+    write(dir.path(), 0, PREFIX, BIG_SEG);
+    let seg = active_segment(dir.path());
+    let gap = PREFIX + HALF; // этого seq нет
+    for seq in (PREFIX..gap).chain(gap + 1..gap + 1 + HALF) {
+        let ev = Event {
+            seq,
+            ts_mono_ns: 0,
+            ts_wall_ms: common::T0,
+            kind: trade(seq),
+        };
+        append_bytes(&seg, &frame_of(&ev));
+    }
+    let after = PREFIX - 1;
+    let (indep, _) = independent(dir.path(), after);
+    if !indep.contains(&(gap + 1)) || indep.contains(&gap) {
+        setup_failed("дыра в середине хвоста не построена");
+    }
+    let (got, err, _, _) = run(dir.path(), after);
+    let want: Vec<u64> = (PREFIX..gap).collect();
+    assert_eq!(
+        got, want,
+        "f1b / JR-I-2 (C-262 R6): выдача обязана быть РОВНО {PREFIX}..{gap} (до дыры), затем \
+         abort; события после дыры не выдаются"
+    );
+    assert_eq!(
+        err,
+        Some(std::io::ErrorKind::InvalidData),
+        "f1b / JR-I-2: дыра {gap} в середине хвоста обязана дать Err(InvalidData), получено {err:?}"
     );
 }
 
