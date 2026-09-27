@@ -1664,7 +1664,6 @@ pub(crate) fn locate_after_seq(seg_path: &Path, after_seq: u64) -> io::Result<Op
     let chunks = file_len.div_ceil(PROBE_CHUNK).max(1);
     let max_probes = 2u32.saturating_mul(chunks.ilog2() as u32).saturating_add(4);
     let mut probes_used = 0u32;
-    let _ = &mut probes_used; // silences unused_assignments warning (used in loop condition)
 
     while lo < hi && probes_used < max_probes {
         // Если окно маленькое (≤ 8 КиБ), линейный скан — иначе probe от mid не
@@ -2272,11 +2271,17 @@ impl Iterator for EventStream {
                         // M-89 (`§5.2` п. 9, JR-I-2): гард непрерывности yield'ов.
                         // После первого yield'а проверка переходит в режим
                         // `last_yielded + 1`. Для сегмента, СОДЕРЖАЩЕГО `after`,
-                        // первый yield обязан быть `after + 1` (гард «а»).
+                        // первый yield обязан быть `after + 1` (гард «а»); для
+                        // СЛЕДУЮЩЕГО ПРИНЯТОГО сегмента ожидание = `header.first_seq`
+                        // (гард «г»), и НЕ `prev + 1` (это «перенос через стык» — `n5`).
                         if let Some(after) = self.after_seq {
-                            let expected = match self.last_yielded_seq {
-                                None => after + 1,
-                                Some(prev) => prev + 1,
+                            let expected = if let Some(first) = self.expected_first_seq {
+                                first
+                            } else {
+                                match self.last_yielded_seq {
+                                    None => after + 1,
+                                    Some(prev) => prev + 1,
+                                }
                             };
                             if ev.seq != expected {
                                 return Some(Err(io::Error::new(
