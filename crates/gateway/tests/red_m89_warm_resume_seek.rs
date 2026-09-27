@@ -46,8 +46,10 @@
 //!
 //! RUNTIME-RED на ревизии набора: `w1`, `d1`, `d2`, `d3`, `d6`, `d8`, `d9`, `p1` красны
 //! по СТОИМОСТИ (`events_scanned = префикс + хвост`), `p1` — ещё и по счётчику байт
-//! (`payload_bytes_read = 0` у `pump`). `d4`, `d7`, `d7b` — стражи против будущей
-//! реализации, зелены сегодня и названы стражами.
+//! (`payload_bytes_read = 0` у `pump`). `d4`, `d7`, `d7b`, `d7c` — стражи против будущей
+//! реализации, зелены сегодня и названы стражами. ТОЧНЫЙ учёт байт `payload_bytes_read`
+//! (равенство, а не интервал) — `crates/journal/tests/red_m89_bytes_accounting.rs`; `p1`
+//! здесь держит только согласованность с ядром на прод-пути `pump`.
 
 use std::io::Write;
 
@@ -742,6 +744,50 @@ fn d7b_corrupt_frame_a_few_frames_after_seek_point_fails_closed() {
         live.cursor(),
         cursor_before,
         "d7b: курсор доставки сдвинут при отказавшем pump'е"
+    );
+}
+
+/// **d7c — порча в СЕРЕДИНЕ хвоста (`TAIL/2`, `C-260` N1).** `d7`/`d7b` портят кадры `k=0`
+/// и `k=5`; мутант, отдающий EOF после ошибки кадра, ловился бы ими только пока порча лежит
+/// в первых 16 кадрах доставки. Здесь порча существенно дальше: оба пути обязаны отказать
+/// (`Err`, не усечённый `Ok`), курсор доставки не двигается.
+#[test]
+fn d7c_corrupt_frame_mid_tail_fails_closed_and_matches_independent_path() {
+    let _g = serial();
+    let f = fixture(PREFIX_MID, TAIL, SEG_BYTES_PROD);
+    corrupt_first_tail_frame(&f, (TAIL / 2) as usize);
+    let independent = gateway::snapshot(
+        f.dir.path(),
+        EpochFilter::OwnCaptureOnly,
+        &sel(),
+        Cursor::at(f.last_seq),
+    );
+    if independent.is_ok() {
+        setup_failed(
+            "порча в середине хвоста не ловится независимым путём — фикстура испортила не кадр",
+        );
+    }
+    let (mut live, _) = LiveReducer::resume(
+        f.dir.path(),
+        EpochFilter::OwnCaptureOnly,
+        &sel(),
+        f.ckpt.path(),
+    )
+    .expect("resume");
+    let cursor_before = live.cursor();
+    let r = live.pump(f.dir.path(), EpochFilter::OwnCaptureOnly, PUMP_BATCH);
+    assert!(
+        r.is_err(),
+        "d7c / I-2 (JR-I-2): порча на {}-м кадре хвоста ПРОГЛОЧЕНА — pump вернул Ok с {} кадрами; \
+         независимый путь `gateway::snapshot` на том же журнале отказывает. Усечение хвоста до \
+         порчи = «пропустить», а не abort",
+        TAIL / 2,
+        r.as_ref().map(|(fr, _, _)| fr.len()).unwrap_or(0)
+    );
+    assert_eq!(
+        live.cursor(),
+        cursor_before,
+        "d7c: курсор доставки сдвинут при отказавшем pump'е"
     );
 }
 

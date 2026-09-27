@@ -1,6 +1,6 @@
 //! RED `M-89` (sacred, architect-only) — **счётчик `journal_payload_bytes_read` считает
-//! ПРОЧИТАННОЕ на всём пути выдачи, включая первый `pump` и активный сегмент** (`I-4`,
-//! задача 15 `M-87`).
+//! ПРОЧИТАННОЕ на всём пути выдачи, включая первый `pump` и активный сегмент, и получает
+//! ТУ ЖЕ дельту, что и читатель** (`I-4`, задача 15 `M-87`, `C-260` R4).
 //!
 //! # Что не так сегодня — снято командой, не пересказом
 //!
@@ -13,23 +13,27 @@
 //!   _stats))`, `crates/gateway-serve/src/lib.rs`, v1- и legacy-путь) — байты первого и всех
 //!   последующих pump'ов в счётчик не попадают никогда.
 //!
-//! Итог: счётчик ЗАНИЖАЕТ. `red_m87_read_volume_truth::q2` этого не ловил: его нижняя
-//! граница `counter ≥ tail_bytes` выполнялась за счёт размера СЛЕПКА (11 КБ ≫ хвост 466 Б).
+//! # Мера — две, и вторая закрывает мутант критика
 //!
-//! # Мера
-//!
-//! Нижняя граница — `ckpt_bytes + tail_bytes` (обе величины известны фикстуре: слепок
-//! читается целиком, хвост дописан после слепка и обязан быть прочитан первым pump'ом);
-//! верхняя — `rchar` ядра. Один сценарий на бинарь: обе величины процессные. Счётчик
-//! снимается процессным `serving_counters()` намеренно: в этом бинаре ровно один сервер, и
-//! экземплярная ручка (`I-5`) здесь ничего не добавила бы, а форма остаётся RUNTIME-RED, а не
-//! COMPILE-RED — причина красного видна прогоном.
+//! 1. Нижняя граница `ckpt_bytes + tail_bytes` и верхняя `rchar` — как в первой редакции;
+//!    RUNTIME-RED сегодня (`counter = ckpt_bytes`).
+//! 2. **Дельта транспорта = дельта читателя.** `C-260` R4: интервал пропускает синтетику
+//!    (`events_scanned × 64`) и дубликат счётчика, кормящий транспорт при мёртвом публичном
+//!    методе. Здесь ожидание вычисляет РЕПЛИКА того же пути в процессе теста —
+//!    `LiveReducer::resume` (warm) + `pump(256)` (первый, дренирует хвост) + `pump(256)`
+//!    (пустой установившийся тик) на том же журнале и слепке. Транспорт обязан прибавить
+//!    РОВНО `R + P1 + n·P2`, где `R`/`P1`/`P2` — `ReadStats.payload_bytes_read` реплики, а
+//!    `n ≥ 0` — число пустых тиков push-цикла (период 250 мс), ограниченное временем
+//!    наблюдения. Ни одно слагаемое не сочиняется транспортом: значения читателя пиннит
+//!    `crates/journal/tests/red_m89_bytes_accounting.rs` точным учётом, здесь судится ВЕРНОСТЬ
+//!    ПЕРЕДАЧИ. Связь — через процессный `serving_counters()`: в этом бинаре ровно один
+//!    сервер (экземплярная ручка `I-5` — COMPILE-RED, а этот оракул намеренно RUNTIME-RED).
 //!
 //! RUNTIME-RED на ревизии набора: `counter = ckpt_bytes` < `ckpt_bytes + tail_bytes`.
 
 use contracts::{to_fixed, DataSource, EventKind, MdPayload, Side, Venue};
 use futures_util::{SinkExt, StreamExt};
-use gateway::Selector;
+use gateway::{LiveReducer, Selector};
 use gateway_serve::admission::{AdmissionPolicy, LiveProfile};
 use gateway_serve::server::{bind_with_policy, ServeConfig};
 use journal::{EpochFilter, Journal, WriterConfig};
@@ -48,6 +52,9 @@ const PREFIX: u64 = 20_000;
 const TAIL: u64 = 500;
 const MAX_TAIL_EVENTS: u64 = 1_000;
 const EXPECTED_WARMUP_EVENTS: u64 = 100;
+/// Прод-партия push-цикла (`PUSH_MAX_EVENTS`, `crates/gateway-serve/src/lib.rs`) и его период.
+const PUMP_BATCH: usize = 256;
+const PUSH_INTERVAL_MS: u64 = 250;
 
 #[derive(serde::Serialize)]
 struct Claims {
@@ -182,6 +189,38 @@ fn fixture() -> Fixture {
     }
 }
 
+/// Реплика прод-пути в процессе теста: (resume, первый pump, пустой тик) в байтах читателя.
+struct Replica {
+    resume: u64,
+    first_pump: u64,
+    empty_tick: u64,
+}
+
+fn replica(dir: &std::path::Path, ckpt: &std::path::Path) -> Replica {
+    let (mut live, rs) = LiveReducer::resume(dir, EpochFilter::OwnCaptureOnly, &sel(), ckpt)
+        .unwrap_or_else(|e| setup_failed(&format!("реплика resume: {e}")));
+    if rs.events_scanned != 0 {
+        setup_failed("реплика: resume прочитал журнал — слепок не сработал, путь не тёплый");
+    }
+    let (frames, _c, p1) = live
+        .pump(dir, EpochFilter::OwnCaptureOnly, PUMP_BATCH)
+        .unwrap_or_else(|e| setup_failed(&format!("реплика pump #1: {e}")));
+    if frames.is_empty() {
+        setup_failed("реплика: первый pump не отдал кадров — хвост не прочитан");
+    }
+    let (frames2, _c2, p2) = live
+        .pump(dir, EpochFilter::OwnCaptureOnly, PUMP_BATCH)
+        .unwrap_or_else(|e| setup_failed(&format!("реплика pump #2: {e}")));
+    if !frames2.is_empty() {
+        setup_failed("реплика: второй pump отдал кадры — хвост не был дренирован первым");
+    }
+    Replica {
+        resume: rs.payload_bytes_read,
+        first_pump: p1.payload_bytes_read,
+        empty_tick: p2.payload_bytes_read,
+    }
+}
+
 type Ws =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
@@ -192,8 +231,16 @@ async fn recv(ws: &mut Ws) -> Option<Value> {
     }
 }
 
-/// `subscribe` → `snapshot` → первый `frame`; возвращает (прирост rchar, прирост счётчика).
-async fn serve_once(f: &Fixture) -> (u64, u64) {
+struct Served {
+    rchar_delta: u64,
+    counter_delta: u64,
+    /// Время от подписки до снятия счётчика — верхняя граница числа пустых тиков.
+    elapsed_ms: u64,
+}
+
+/// `subscribe` → `snapshot` → первый `frame`; счётчик снимается после паузы, чтобы push-цикл
+/// зафиксировал статистику pump'а, отдавшего кадр.
+async fn serve_once(f: &Fixture) -> Served {
     let cfg = ServeConfig {
         addr: "127.0.0.1:0".to_string(),
         journal_dir: f.dir.path().to_path_buf(),
@@ -212,6 +259,7 @@ async fn serve_once(f: &Fixture) -> (u64, u64) {
 
     let rchar_before = rchar();
     let counter_before = gateway_serve::metrics::serving_counters().journal_payload_bytes_read;
+    let started = std::time::Instant::now();
     let token = sign();
     let (mut ws, _) = tokio::time::timeout(
         BUDGET,
@@ -244,18 +292,19 @@ async fn serve_once(f: &Fixture) -> (u64, u64) {
     if !got_frame {
         setup_failed("первый кадр хвоста не пришёл — первый pump не наблюдался");
     }
-    // Дать push-циклу зафиксировать статистику pump'а после отправки кадра.
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    (
-        rchar().saturating_sub(rchar_before),
-        gateway_serve::metrics::serving_counters()
-            .journal_payload_bytes_read
-            .saturating_sub(counter_before),
-    )
+    let counter_after = gateway_serve::metrics::serving_counters().journal_payload_bytes_read;
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    drop(ws);
+    Served {
+        rchar_delta: rchar().saturating_sub(rchar_before),
+        counter_delta: counter_after.saturating_sub(counter_before),
+        elapsed_ms,
+    }
 }
 
 #[tokio::test]
-async fn v_counter_includes_first_pump_and_active_segment() {
+async fn v_counter_includes_first_pump_and_equals_the_reader_delta() {
     let f = fixture();
     if f.tail_bytes == 0 {
         setup_failed("хвост пуст");
@@ -267,21 +316,60 @@ async fn v_counter_includes_first_pump_and_active_segment() {
     {
         setup_failed("сегментов не один — прод-форма не воспроизведена");
     }
-    let (read, counter) = serve_once(&f).await;
+    // Реплика идёт ДО сервера: её чтение не входит в rchar-окно обслуживания.
+    let r = tokio::task::spawn_blocking({
+        let dir = f.dir.path().to_path_buf();
+        let ckpt = f.ckpt.path().to_path_buf();
+        move || replica(&dir, &ckpt)
+    })
+    .await
+    .expect("replica join");
+
+    let s = serve_once(&f).await;
     let lower = f.ckpt_bytes + f.tail_bytes;
     assert!(
-        counter >= lower,
-        "I-4 / задача 15 M-87: счётчик выдачи объявил {counter} Б, а обслуживание обязано \
-         было прочитать слепок ({} Б) И хвост ({} Б) = {lower} Б. Величина занижена: \
-         warm-resume считает `payload_bytes_after_cursor` без сегмента, содержащего курсор, а \
-         push-цикл отбрасывает `ReadStats` каждого pump'а. Счётчик, который не видит первый \
-         pump, слеп ровно к той работе, ради которой M-89 существует.",
+        s.counter_delta >= lower,
+        "I-4 / задача 15 M-87: счётчик выдачи объявил {} Б, а обслуживание обязано было прочитать \
+         слепок ({} Б) И хвост ({} Б) = {lower} Б. Величина занижена: warm-resume считает \
+         `payload_bytes_after_cursor` без сегмента, содержащего курсор, а push-цикл отбрасывает \
+         `ReadStats` каждого pump'а. Счётчик, который не видит первый pump, слеп ровно к той \
+         работе, ради которой M-89 существует.",
+        s.counter_delta,
         f.ckpt_bytes,
         f.tail_bytes
     );
     assert!(
-        counter <= read,
-        "I-4: счётчик объявил {counter} Б, а ядро видело {read} Б — учесть больше прочитанного \
-         невозможно, величина сочиняется"
+        s.counter_delta <= s.rchar_delta,
+        "I-4: счётчик объявил {} Б, а ядро видело {} Б — учесть больше прочитанного невозможно",
+        s.counter_delta,
+        s.rchar_delta
     );
+
+    // Дельта транспорта = дельта читателя (реплика): R + P1 + n·P2, n — число пустых тиков.
+    let base = r.resume + r.first_pump;
+    let rem = s.counter_delta.checked_sub(base).unwrap_or_else(|| {
+        panic!(
+            "I-4 / C-260 R4: транспорт прибавил {} Б, а читатель на том же пути отдал resume={} + \
+             первый pump={} = {base} Б — транспорт потерял часть дельты читателя",
+            s.counter_delta, r.resume, r.first_pump
+        )
+    });
+    let n_max = s.elapsed_ms / PUSH_INTERVAL_MS + 2;
+    if r.empty_tick == 0 {
+        assert_eq!(
+            rem, 0,
+            "I-4 / C-260 R4: транспорт прибавил {} Б при дельте читателя resume={} + pump={} и \
+             нулевом пустом тике — лишние {rem} Б сочинены транспортом (синтетика вида \
+             events_scanned×64 или дубликат счётчика), а не получены от читателя",
+            s.counter_delta, r.resume, r.first_pump
+        );
+    } else {
+        assert!(
+            rem % r.empty_tick == 0 && rem / r.empty_tick <= n_max,
+            "I-4 / C-260 R4: транспорт прибавил {} Б = resume {} + pump {} + остаток {rem}; остаток \
+             обязан быть n·{} Б (n пустых тиков ≤ {n_max}) — дельта транспорта не равна дельте \
+             читателя, значения сочинены или продублированы",
+            s.counter_delta, r.resume, r.first_pump, r.empty_tick
+        );
+    }
 }

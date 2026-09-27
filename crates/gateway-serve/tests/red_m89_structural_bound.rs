@@ -30,12 +30,21 @@
 //! `snapshot` И первый `frame` — первый `pump` живёт в периодическом push-цикле
 //! (`PUSH_INTERVAL_MS = 250`), и именно он сегодня читает префикс.
 //!
+//! # Два режима входа — оба судятся (`C-260` N3)
+//!
+//! `s1` — v1 (`subscribe` с `v:1`): первый `pump` живёт в push-цикле `run_v1_session_loop`.
+//! `s2` — legacy (клиент молчит grace-окно, env-селектор, OLD wire `{"Snapshot":…}`): тёплый
+//! `resume` + drain-цикл `pump(LEGACY_DRAIN_BATCH)` ДО снимка (`run_authorized_session`).
+//! Оба зовут общий `LiveReducer::pump`, но точки входа разные, и «второй режим унаследует
+//! границу» — довод, а не замер; замер дешевле довода: та же фикстура, второй сервер.
+//! `rchar` процессный ⇒ оба сценария в ОДНОМ теле, последовательно.
+//!
 //! # Чего оракул НЕ ловит
 //!
 //! · время (мерит хост); · правдивость данных (другой класс); · параллелизм (`C4` `M-87`);
 //! · счётчик выдачи (`red_m89_read_volume_truth.rs`).
 //!
-//! RUNTIME-RED на ревизии набора: `s1` — прочитано ≈ размер файла (10 МБ) при пороге
+//! RUNTIME-RED на ревизии набора: `s1`/`s2` — прочитано ≈ размер файла (10 МБ) при пороге
 //! `ckpt + tail·4 + 2 МиБ`.
 
 use contracts::{to_fixed, DataSource, EventKind, MdPayload, Side, Venue};
@@ -277,7 +286,65 @@ async fn serve_admitted_request(f: &Fixture) -> u64 {
     rchar().saturating_sub(before)
 }
 
-/// **s0 + s1 — один сценарий (rchar процессный).**
+/// Legacy-режим: клиент подключается и МОЛЧИТ grace-окно ⇒ env-селектор, OLD wire.
+/// В legacy весь хвост ДРЕНИРУЕТСЯ ДО снимка (`run_authorized_session`: resume + цикл
+/// `pump(LEGACY_DRAIN_BATCH)` до пустого кадра), поэтому дорогая работа заканчивается на
+/// `{"Snapshot":…}`; кадров после него без новых событий не будет. Setup-страж: курсор
+/// снимка == последнее событие журнала (дренаж состоялся). Возвращает прирост `rchar`.
+async fn serve_legacy_request(f: &Fixture) -> u64 {
+    let cfg = ServeConfig {
+        addr: "127.0.0.1:0".to_string(),
+        journal_dir: f.dir.path().to_path_buf(),
+        filter: EpochFilter::OwnCaptureOnly,
+        selector: sel(),
+        decoding_key: DecodingKey::from_secret(SECRET),
+        checkpoint_dir: Some(f.ckpt.path().to_path_buf()),
+    };
+    let server = bind_with_policy(cfg, policy())
+        .await
+        .expect("bind_with_policy (legacy)");
+    let addr = server.local_addr();
+    tokio::spawn(async move {
+        let _ = server.serve().await;
+    });
+
+    let before = rchar();
+    let token = sign();
+    let (mut ws, _) = tokio::time::timeout(
+        BUDGET,
+        tokio_tungstenite::connect_async(format!("ws://{addr}/?token={token}")),
+    )
+    .await
+    .expect("подключение (legacy) не состоялось")
+    .expect("connect");
+    // Ничего не шлём: по истечении grace сервер уходит в legacy-режим.
+    let first = recv(&mut ws)
+        .await
+        .unwrap_or_else(|| setup_failed("legacy: сервер промолчал"));
+    let Some(snap) = first.get("Snapshot") else {
+        setup_failed(&format!(
+            "legacy: первое сообщение — не OLD-wire Snapshot: {first} — режим не legacy, \
+             оракул судит не тот вход"
+        ));
+    };
+    let read = rchar().saturating_sub(before);
+    let upto = snap
+        .get("cursor")
+        .and_then(|c| c.get("upto_seq"))
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| setup_failed(&format!("legacy: в снимке нет cursor.upto_seq: {snap}")));
+    if upto != PREFIX + TAIL - 1 {
+        setup_failed(&format!(
+            "legacy: курсор снимка {upto} ≠ последнему событию {} — хвост не дренирован до снимка, \
+             дорогая работа не наблюдалась",
+            PREFIX + TAIL - 1
+        ));
+    }
+    drop(ws);
+    read
+}
+
+/// **s0 + s1 + s2 — один сценарий (rchar процессный).**
 #[tokio::test]
 async fn s_admitted_request_costs_tail_not_active_segment() {
     let f = fixture();
@@ -303,7 +370,7 @@ async fn s_admitted_request_costs_tail_not_active_segment() {
     let read = serve_admitted_request(&f).await;
     let limit = f.ckpt_bytes + f.tail_bytes * 4 + ALLOWANCE;
 
-    // ── s1: СТРУКТУРНАЯ граница ────────────────────────────────────────────────
+    // ── s1: СТРУКТУРНАЯ граница, v1-вход ─────────────────────────────────────────
     assert!(
         read <= limit,
         "I-3 / TD-219 / PL-I-4: допущенный запрос (хвост {TAIL} ≤ max_tail_events \
@@ -316,6 +383,16 @@ async fn s_admitted_request_costs_tail_not_active_segment() {
          у самого чтения.",
         f.ckpt_bytes,
         f.tail_bytes,
+        f.file_bytes
+    );
+
+    // ── s2: та же граница на LEGACY-входе (C-260 N3) ─────────────────────────────
+    let read_legacy = serve_legacy_request(&f).await;
+    assert!(
+        read_legacy <= limit,
+        "I-3 / C-260 N3: legacy-сессия (env-селектор, OLD wire) стоила {read_legacy} Б при пороге \
+         {limit} Б; файл активного сегмента — {} Б. Второй режим входа делает тёплый resume + \
+         drain через `run_authorized_session`, и граница обязана держаться и там.",
         f.file_bytes
     );
 }

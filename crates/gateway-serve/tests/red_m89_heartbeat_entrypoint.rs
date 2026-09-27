@@ -26,12 +26,20 @@
 //!
 //! # Что здесь пиннится
 //!
-//! · `h0` — КОМПОЗИЦИЯ в compose: переменная объявлена и её каталог лежит на монтировании
-//!   `rw`, отличном от журнала и слепков (`testing.md` §«канарейка», п. 2: путь producer'а);
+//! · `h0` — КОМПОЗИЦИЯ в compose: переменная объявлена, значение — ПУТЬ К ФАЙЛУ (не корень
+//!   монтирования, не каталог с хвостовым `/`, не пустой лист — `C-260` R3: `/state/` прошёл
+//!   бы префиксную проверку, а `rename` в каталог невозможен), лежит на монтировании `rw`,
+//!   отличном от журнала и слепков, том объявлен в `volumes:`; период объявлен и валиден
+//!   (`testing.md` §«канарейка», п. 2: путь producer'а);
 //! · `h1` — ТОЧКА ВХОДА: прод-бинарь на окружении ИЗ compose (образец
-//!   `red_m87_prod_entrypoint_argv.rs`) пишет файл в течение периода; JSON целый при
-//!   каждом чтении (атомарность наблюдается опросом); после обслуженного запроса значения
-//!   РАСТУТ (`OPS-I-10`: продюсер, а не объявление).
+//!   `red_m87_prod_entrypoint_argv.rs`) с ТОЧНЫМ значением `GATEWAY_HEARTBEAT_PATH` из
+//!   compose, отображённым на записываемую фикстуру-монтирование (том `<vol>:<dst>` ⇒
+//!   tmpdir играет `/var/lib/docker/volumes/hft-platform_<vol>/_data`, путь внутри
+//!   монтирования сохраняется) — переопределяется ТОЛЬКО период (200 мс вместо 10 с);
+//!   файл создаётся, заменяется атомарно (`<path>.tmp` → `rename`: JSON целый при каждом
+//!   чтении, `.tmp` не задерживается), а хост-путь этой же фикстуры РАВЕН
+//!   `WATCHDOG_SERVING_HEARTBEAT_PATH` из `deploy/cron.d/watchdog`; после обслуженного
+//!   запроса значения РАСТУТ (`OPS-I-10`: продюсер, а не объявление).
 //!
 //! # Чего оракул НЕ ловит
 //!
@@ -40,7 +48,11 @@
 //! · установку cron на VPS — это §8-гейт и founder ★ (`deploy/README.md`);
 //! · правдивость `freshness` — её позиции судит `C9` `M-87`.
 //!
-//! RUNTIME-RED на ревизии набора: `h0` — переменной нет в compose; `h1` — файл не появляется.
+//! RUNTIME-RED на ревизии набора: `h0` — переменной нет в compose; `h1` — переменной нет в
+//! compose (отобразить нечего), а после её появления — файл не появляется.
+//!
+//! Предел, названный честно: установка `deploy/cron.d/watchdog` в `/etc/cron.d` — РУЧНОЙ шаг
+//! founder ★ (`deploy/README.md`); здесь судится КОМПОЗИЦИЯ путей, не установка.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -300,8 +312,9 @@ fn spawn_prod_binary(
         };
         cmd.env(k, v);
     }
-    // Переменные сердцебиения ставятся ПОВЕРХ compose: если compose их не объявляет, `h0`
-    // краснеет отдельно, а `h1` всё равно судит бинарь.
+    // `C-260` R3: путь НЕ подменяется — `hb_path` уже есть точное значение из compose,
+    // отображённое на фикстуру-монтирование (`mapped_heartbeat_path`). Переопределяется
+    // ТОЛЬКО период: 10 с прода в тесте неисполнимы.
     cmd.env("GATEWAY_HEARTBEAT_PATH", hb_path.display().to_string());
     cmd.env("GATEWAY_HEARTBEAT_PERIOD_MS", HB_PERIOD_MS.to_string());
     let inner = cmd
@@ -328,10 +341,62 @@ fn read_hb(path: &Path) -> Hb {
     }
 }
 
-/// **h0 — compose объявляет путь сердцебиения на ЗАПИСЫВАЕМОМ монтировании.**
-#[test]
-fn h0_compose_declares_heartbeat_path_on_a_writable_mount() {
-    let env = compose_env();
+/// Отвергнуть путь, который не может быть ФАЙЛОМ для `<path>.tmp` → `rename`
+/// (`C-260` R3): корень монтирования, хвостовой `/`, пустой/служебный лист.
+fn assert_file_path_form(what: &str, path: &str, mount_dst: &str) {
+    assert!(
+        path != mount_dst && path.trim_end_matches('/') != mount_dst,
+        "I-6 / C-260 R3: {what}={path} — это КОРЕНЬ монтирования {mount_dst}, а не файл: \
+         `rename` в каталог невозможен, писатель проглотит ошибку, watchdog увидит MISSING"
+    );
+    assert!(
+        !path.ends_with('/'),
+        "I-6 / C-260 R3: {what}={path} оканчивается на `/` — это каталог, не файл сердцебиения"
+    );
+    let leaf = path.rsplit('/').next().unwrap_or("");
+    assert!(
+        !leaf.is_empty() && leaf != "." && leaf != "..",
+        "I-6 / C-260 R3: {what}={path} — пустой/служебный лист `{leaf}`; имя файла обязано быть \
+         непустым"
+    );
+}
+
+/// Тома верхнего уровня `volumes:` compose (объявление именованного тома).
+fn compose_top_level_volumes() -> Vec<String> {
+    let mut out = Vec::new();
+    let mut inside = false;
+    for line in compose_text().lines() {
+        if line.starts_with("volumes:") {
+            inside = true;
+            continue;
+        }
+        if inside && !line.starts_with(' ') && !line.trim().is_empty() {
+            break;
+        }
+        if inside {
+            let t = line.trim();
+            if t.is_empty() || t.starts_with('#') {
+                continue;
+            }
+            if let Some(name) = t.strip_suffix(':') {
+                if !name.contains(' ') {
+                    out.push(name.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Хост-путь именованного тома docker'а (та же формула, что у `verify_M-89.sh` шаг task11
+/// и у `deploy/cron.d/journal-retention` для `journal-data`).
+fn host_path_of(vol: &str, rel: &str) -> String {
+    format!("/var/lib/docker/volumes/hft-platform_{vol}/_data/{rel}")
+}
+
+/// Точное значение compose ⇒ (том, путь ОТНОСИТЕЛЬНО монтирования). Панику даёт с той же
+/// причиной, что `h0`, — обе стороны читают один источник.
+fn mapped_heartbeat_path(env: &BTreeMap<String, String>) -> (String, String) {
     let path = env
         .get("GATEWAY_HEARTBEAT_PATH")
         .cloned()
@@ -363,15 +428,76 @@ fn h0_compose_declares_heartbeat_path_on_a_writable_mount() {
         "I-6: сердцебиение положено на {dst} — это том журнала/слепков, у выдачи он \
          ТОЛЬКО ДЛЯ ЧТЕНИЯ по инварианту (GS-I-3, единственный писатель слепка — прогреватель)"
     );
+    assert_file_path_form("GATEWAY_HEARTBEAT_PATH", &path, dst);
+    let rel = path[dst.len() + 1..].to_string();
+    (src.clone(), rel)
 }
 
-/// **h1 — прод-бинарь пишет сердцебиение, JSON всегда целый, значения растут после выдачи.**
+/// **h0 — compose объявляет ПУТЬ К ФАЙЛУ сердцебиения на ЗАПИСЫВАЕМОМ объявленном томе и
+/// валидный период.**
+#[test]
+fn h0_compose_declares_heartbeat_file_path_on_a_writable_declared_mount() {
+    let env = compose_env();
+    let (vol, rel) = mapped_heartbeat_path(&env);
+    let declared = compose_top_level_volumes();
+    assert!(
+        declared.iter().any(|v| v == &vol),
+        "I-6: том {vol} используется сервисом gateway-serve, но не объявлен в `volumes:` \
+         верхнего уровня ({declared:?}) — compose не поднимется"
+    );
+    let period = env
+        .get("GATEWAY_HEARTBEAT_PERIOD_MS")
+        .cloned()
+        .unwrap_or_default();
+    let ms: u64 = period.parse().unwrap_or_else(|_| {
+        panic!(
+            "I-6 / §9: GATEWAY_HEARTBEAT_PERIOD_MS у gateway-serve не объявлен или не число \
+             (`{period}`) — период сердцебиения обязан быть конфигом оператора, как у recorder'а"
+        )
+    });
+    assert!(
+        ms > 0,
+        "I-6: период сердцебиения {ms} мс — обязан быть положительным"
+    );
+    // Композиция с читателем: хост-путь тома == путь cron'а (та же проверка — шаг task11
+    // `verify_M-89.sh`; здесь она в форме оракула, чтобы `cargo test` её тоже видел).
+    let cron = repo_root().join("deploy/cron.d/watchdog");
+    let cron_text = std::fs::read_to_string(&cron).unwrap_or_else(|e| {
+        panic!(
+            "I-6 / задача 11: нет {} ({e}) — читателю не назначен путь; на проде ops-watchdog не \
+             установлен (ssh 2026-09-27)",
+            cron.display()
+        )
+    });
+    let cron_path = cron_text
+        .lines()
+        .find_map(|l| l.strip_prefix("WATCHDOG_SERVING_HEARTBEAT_PATH="))
+        .map(|v| v.trim().trim_matches('"').to_string())
+        .unwrap_or_default();
+    assert_eq!(
+        cron_path,
+        host_path_of(&vol, &rel),
+        "I-6 / задача 11: КОМПОЗИЦИЯ РАЗОШЛАСЬ — compose пишет в {}, cron читает `{cron_path}`",
+        host_path_of(&vol, &rel)
+    );
+}
+
+/// **h1 — прод-бинарь на ТОЧНОМ пути из compose (отображённом на фикстуру-монтирование)
+/// создаёт файл, заменяет его атомарно, значения растут после выдачи; хост-путь той же
+/// фикстуры равен пути cron'а.**
 #[tokio::test]
-async fn h1_prod_binary_writes_heartbeat_and_values_grow_after_serving() {
+async fn h1_prod_binary_writes_heartbeat_at_compose_path_atomically_and_values_grow() {
     let env = compose_env();
     let (journal, ckpt) = journal_with_warm_ckpt();
-    let state = tempfile::tempdir().expect("state dir");
-    let hb_path = state.path().join("gateway-serve.heartbeat");
+    // Фикстура-монтирование: tmpdir играет `/var/lib/docker/volumes/hft-platform_<vol>/_data`.
+    let (vol, rel) = mapped_heartbeat_path(&env);
+    let volume = tempfile::tempdir().expect("volume dir");
+    let hb_path = volume.path().join(&rel);
+    if let Some(parent) = hb_path.parent() {
+        std::fs::create_dir_all(parent).expect("подкаталоги внутри монтирования");
+    }
+    let tmp_path = PathBuf::from(format!("{}.tmp", hb_path.display()));
+    let cron_expected = host_path_of(&vol, &rel);
     let port = free_port();
     let mut child = spawn_prod_binary(&env, journal.path(), ckpt.path(), port, &hb_path);
 
@@ -449,8 +575,11 @@ async fn h1_prod_binary_writes_heartbeat_and_values_grow_after_serving() {
         None => panic!("SETUP НЕ СОСТОЯЛСЯ: запрос не обслужен — рост счётчиков не наблюдаем"),
     }
 
-    // (3) Ждём ≥ 2 периодов, наблюдая целостность файла при каждом чтении.
+    // (3) Ждём ≥ 2 периодов, наблюдая целостность файла при каждом чтении; `.tmp` не смеет
+    // задерживаться дольше одного опроса подряд (rename потребляет его немедленно).
     let mut last: Option<Value> = None;
+    let mut tmp_seen_in_a_row = 0usize;
+    let mut tmp_lingered = 0usize;
     for _ in 0..((HB_PERIOD_MS * 3) / 20) {
         match read_hb(&hb_path) {
             Hb::Whole(v) => last = Some(v),
@@ -460,12 +589,39 @@ async fn h1_prod_binary_writes_heartbeat_and_values_grow_after_serving() {
             }
             Hb::Missing => broken += 1, // после первой записи файл обязан существовать всегда (rename)
         }
+        if tmp_path.exists() {
+            tmp_seen_in_a_row += 1;
+            if tmp_seen_in_a_row >= 2 {
+                tmp_lingered += 1;
+            }
+        } else {
+            tmp_seen_in_a_row = 0;
+        }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
     assert_eq!(
         broken, 0,
         "I-6: {broken} чтений застали файл частичным или отсутствующим — запись не атомарна \
          (обязана быть `<path>.tmp` → rename); читатель на хосте получит обрывок JSON"
+    );
+    assert_eq!(
+        tmp_lingered,
+        0,
+        "I-6: `{}` пережил два опроса подряд ({tmp_lingered} раз) — временный файл не \
+         переименовывается немедленно, замена не атомарна",
+        tmp_path.display()
+    );
+    // Композиция с читателем: та же фикстура на хосте лежала бы РОВНО там, откуда читает cron.
+    let cron_text =
+        std::fs::read_to_string(repo_root().join("deploy/cron.d/watchdog")).unwrap_or_default();
+    let cron_path = cron_text
+        .lines()
+        .find_map(|l| l.strip_prefix("WATCHDOG_SERVING_HEARTBEAT_PATH="))
+        .map(|v| v.trim().trim_matches('"').to_string())
+        .unwrap_or_default();
+    assert_eq!(
+        cron_path, cron_expected,
+        "I-6 / задача 11: файл сердцебиения на хосте — {cron_expected}, cron читает `{cron_path}`"
     );
     let last = last.expect("хотя бы одно целое чтение после запроса");
     let a1 = last["attempts"].as_u64().expect("attempts");
@@ -481,4 +637,6 @@ async fn h1_prod_binary_writes_heartbeat_and_values_grow_after_serving() {
         "I-6: байты журнала в сердцебиении = 0 после обслуженного запроса"
     );
     drop(ws);
+    drop(child);
+    drop(volume);
 }
