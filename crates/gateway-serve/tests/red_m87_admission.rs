@@ -589,109 +589,15 @@ fn u2_readiness_fresh_checkpoint_is_ready() {
     );
 }
 
-// ════════ У-5 (`A-037`) — каждый объявленный тип имеет ОРАКУЛ ════════
-
-/// Бюджет исчерпан по событиям ⇒ работа остановлена с НАЗВАННОЙ причиной.
-#[test]
-fn u5_budget_exhausted_by_events_is_named() {
-    use gateway_serve::admission::{BudgetStop, CallBudget};
-    let budget = CallBudget {
-        max_events: 8,
-        max_payload_bytes: u64::MAX,
-        max_wall_ms: u64::MAX,
-        max_output_bytes: u64::MAX,
-        max_state_bytes: u64::MAX,
-    };
-    let dir = journal_of(200);
-    let stop = gateway_serve::admission::feed_tail_within(
-        &dir,
-        &sel_with("BTCUSDT", vec![0.001]),
-        budget,
-        &NeverCancel,
-    );
-    assert_eq!(
-        stop,
-        Some(BudgetStop::Events),
-        "исчерпание бюджета по событиям обязано быть НАЗВАНО, а не проявиться усечением"
-    );
-}
-
-/// Бюджет исчерпан по ПРОЧИТАННЫМ БАЙТАМ ⇒ та же дисциплина. Счётчик событий этого не
-/// ловит (план §15.1): сегмент можно прочитать, не декодируя.
-#[test]
-fn u5_budget_exhausted_by_payload_bytes_is_named() {
-    use gateway_serve::admission::{BudgetStop, CallBudget};
-    let budget = CallBudget {
-        max_events: u64::MAX,
-        max_payload_bytes: 512,
-        max_wall_ms: u64::MAX,
-        max_output_bytes: u64::MAX,
-        max_state_bytes: u64::MAX,
-    };
-    let dir = journal_of(200);
-    let stop = gateway_serve::admission::feed_tail_within(
-        &dir,
-        &sel_with("BTCUSDT", vec![0.001]),
-        budget,
-        &NeverCancel,
-    );
-    assert_eq!(
-        stop,
-        Some(BudgetStop::PayloadBytes),
-        "предел по байтам не назван"
-    );
-}
-
-/// Кооперативная отмена: признак, взведённый после k порций, останавливает обработчик
-/// ДО конца хвоста. Внешне прервать блокирующую задачу нельзя — это факт о рантайме;
-/// проверять признак МЕЖДУ порциями можно и нужно (`A-037` У-5).
-#[test]
-fn u5_cooperative_cancel_stops_between_chunks() {
-    use gateway_serve::admission::{BudgetStop, CallBudget, Cancel};
-    struct AfterK {
-        seen: std::sync::atomic::AtomicUsize,
-        k: usize,
-    }
-    impl Cancel for AfterK {
-        fn cancelled(&self) -> bool {
-            self.seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= self.k
-        }
-    }
-    let budget = CallBudget {
-        max_events: u64::MAX,
-        max_payload_bytes: u64::MAX,
-        max_wall_ms: u64::MAX,
-        max_output_bytes: u64::MAX,
-        max_state_bytes: u64::MAX,
-    };
-    let dir = journal_of(400);
-    let cancel = AfterK {
-        seen: std::sync::atomic::AtomicUsize::new(0),
-        k: 2,
-    };
-    let stop = gateway_serve::admission::feed_tail_within(
-        &dir,
-        &sel_with("BTCUSDT", vec![0.001]),
-        budget,
-        &cancel,
-    );
-    assert_eq!(
-        stop,
-        Some(BudgetStop::Cancelled),
-        "признак отмены не остановил обработчик между порциями"
-    );
-    assert!(
-        cancel.seen.load(std::sync::atomic::Ordering::Relaxed) >= 2,
-        "признак отмены не опрашивался между порциями вовсе"
-    );
-}
-
-struct NeverCancel;
-impl gateway_serve::admission::Cancel for NeverCancel {
-    fn cancelled(&self) -> bool {
-        false
-    }
-}
+// ════════ У-5 (`A-037`) — СНЯТ `M-89` (§6, §16) ════════
+//
+// Здесь жили три оракула формы бюджета вызова (`CallBudget`/`BudgetStop`/`Cancel`/
+// `feed_tail_within`). Они закрепляли РЕАЛИЗАЦИЮ, признанную плацебо (`R-201`): `pump_one`
+// читал все сегменты каталога с начала, без курсора и селектора, и с прод-пути не звался
+// ни разу (`TD-219`). Продуктовый инвариант — «объём одной выдачи ограничен» — ПЕРЕНЕСЁН в
+// `red_m89_structural_bound.rs::s1`, который меряет РАБОТУ ядром (`rchar`) на прод-форме,
+// а не форму типов. Удалены architect'ом тем же набором, что вводит `s1`: иначе dev,
+// удаляя типы по задаче 5, упёрся бы в sacred-тесты, которые не вправе править.
 
 /// Слот: занят — отказ; освобождён — обслуживание. ДЕТЕРМИНИРОВАННО, без гонок: слот
 /// удерживается САМИМ тестом, а не «долгой работой», исход которой зависит от хоста
