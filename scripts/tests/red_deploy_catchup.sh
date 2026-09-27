@@ -461,6 +461,45 @@ expect_aggregate A13-проба-агрегата-глушит-код 1 \
 expect_aggregate A14-проба-агрегата-echo 1 \
   "$(mutate_ci a14 '[x.__setitem__("run","echo bash scripts/tests/red_ci_aggregate.sh") for x in jobs["status-check"]["steps"] if isinstance(x.get("run"),str) and "red_ci_aggregate.sh" in x["run"]]')" mut
 
+# --- A-041: ЗАКРЫТАЯ ФОРМА двух гейт-джобов вместо разбора shell ---------------------------
+# Арбитраж `A-041` (после `C-259` R4): разбор строки `run` (`_invokes`) — чёрный список форм
+# оболочки, и он не сходится: `true || P`, `P || echo`, `set +e`, heredoc, `P &`, ключи шага
+# (`if:`, `env:`, `working-directory:`, `timeout-minutes:`), лишний шаг-шим — все обходили его.
+# Основание сменено на БЕЛЫЙ СПИСОК формы: `status-check` и `deploy-catchup` имеют РОВНО
+# заданные шаги с РОВНО заданными командами. Каждый сценарий ниже — обход, пойманный ФОРМОЙ.
+expect_aggregate A0b-честная-форма-с-name-и-переводом-строки 0 \
+  "$(mutate_ci a0b 'jobs["status-check"]["steps"][0]["name"]="Условие агрегата"; [x for x in jobs["status-check"]["steps"] if isinstance(x.get("run"),str) and "red_ci_aggregate.sh" in x["run"]][0]["run"]="bash scripts/tests/red_ci_aggregate.sh\n"')" mut
+expect_aggregate A15-R4-true-или-проба 1 \
+  "$(mutate_ci a15 '[x for x in jobs["status-check"]["steps"] if isinstance(x.get("run"),str) and "red_ci_aggregate.sh" in x["run"]][0]["run"]="true || bash scripts/tests/red_ci_aggregate.sh"')" mut
+expect_aggregate A16-проба-или-echo 1 \
+  "$(mutate_ci a16 '[x for x in jobs["status-check"]["steps"] if isinstance(x.get("run"),str) and "red_ci_aggregate.sh" in x["run"]][0]["run"]="bash scripts/tests/red_ci_aggregate.sh || echo failed"')" mut
+expect_aggregate A17-set-e-снят 1 \
+  "$(mutate_ci a17 '[x for x in jobs["status-check"]["steps"] if isinstance(x.get("run"),str) and "red_ci_aggregate.sh" in x["run"]][0]["run"]="set +e\nbash scripts/tests/red_ci_aggregate.sh\ntrue"')" mut
+expect_aggregate A18-heredoc 1 \
+  "$(mutate_ci a18 '[x for x in jobs["status-check"]["steps"] if isinstance(x.get("run"),str) and "red_ci_aggregate.sh" in x["run"]][0]["run"]="cat <<X\nbash scripts/tests/red_ci_aggregate.sh\nX"')" mut
+expect_aggregate A19-в-фоне 1 \
+  "$(mutate_ci a19 '[x for x in jobs["status-check"]["steps"] if isinstance(x.get("run"),str) and "red_ci_aggregate.sh" in x["run"]][0]["run"]="bash scripts/tests/red_ci_aggregate.sh &"')" mut
+expect_aggregate A20-if-выражение 1 \
+  "$(mutate_ci a20 '[x for x in jobs["status-check"]["steps"] if isinstance(x.get("run"),str) and "red_ci_aggregate.sh" in x["run"]][0]["if"]="${{ github.event_name == \"never\" }}"')" mut
+expect_aggregate A21-env-у-шага-пробы 1 \
+  "$(mutate_ci a21 '[x for x in jobs["status-check"]["steps"] if isinstance(x.get("run"),str) and "red_ci_aggregate.sh" in x["run"]][0]["env"]={"CI_AGG_YML":"/dev/null"}')" mut
+expect_aggregate A22-working-directory 1 \
+  "$(mutate_ci a22 '[x for x in jobs["status-check"]["steps"] if isinstance(x.get("run"),str) and "red_ci_aggregate.sh" in x["run"]][0]["working-directory"]="/tmp"')" mut
+expect_aggregate A23-timeout-minutes-0 1 \
+  "$(mutate_ci a23 '[x for x in jobs["status-check"]["steps"] if isinstance(x.get("run"),str) and "red_ci_aggregate.sh" in x["run"]][0]["timeout-minutes"]=0')" mut
+expect_aggregate A24-шим-до-пробы 1 \
+  "$(mutate_ci a24 'jobs["status-check"]["steps"].insert(2,{"run":"echo /tmp/shim >> $GITHUB_PATH"})')" mut
+expect_aggregate A25-checkout-with 1 \
+  "$(mutate_ci a25 '[x.__setitem__("with",{"fetch-depth":1}) for x in jobs["status-check"]["steps"] if x.get("uses")]')" mut
+expect_aggregate A26-env-на-джобе-агрегата 1 \
+  "$(mutate_ci a26 'jobs["status-check"]["env"]={"CI_AGG_YML":"/dev/null"}')" mut
+expect_aggregate A27-имя-агрегата 1 \
+  "$(mutate_ci a27 'jobs["status-check"]["name"]="All good"')" mut
+expect_aggregate A28-A6-true-или-check-aggregate 1 \
+  "$(mutate_ci a28 '[x for x in jobs["deploy-catchup"]["steps"] if isinstance(x.get("run"),str) and "check-aggregate" in x["run"]][0]["run"]="true || python3 scripts/deploy_catchup.py check-aggregate"')" mut
+expect_aggregate A29-лишний-шаг-до-check-aggregate 1 \
+  "$(mutate_ci a29 'jobs["deploy-catchup"]["steps"].insert(3,{"run":"echo prepared"})')" mut
+
 # ========================================================================================
 # ЧАСТЬ 3 — МУТАЦИОННЫЙ КОНТРОЛЬ (--battery): равенство kill-set'ов
 # ========================================================================================
