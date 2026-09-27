@@ -615,8 +615,31 @@ jobs:
     needs: [build-test, security, delivery, protected-artifacts, secret-material, roadmap-sync, contracts, docs-freeze, archived-refs, artifact-ids, reserve-ids, design-claims, context-budgets, gate-meta, deploy-catchup, review-fa, resource-oracles, rollout-composition]
     if: always()
     steps:
-      - run: |
-          if [[ "${{ needs.build-test.result }}" != "success" || "${{ needs.security.result }}" != "success" || "${{ needs.delivery.result }}" != "success" || "${{ needs.protected-artifacts.result }}" != "success" || "${{ needs.contracts.result }}" != "success" || "${{ needs.docs-freeze.result }}" != "success" || "${{ needs.archived-refs.result }}" != "success" || "${{ needs.artifact-ids.result }}" != "success" || "${{ needs.reserve-ids.result }}" != "success" || "${{ needs.design-claims.result }}" != "success" || "${{ needs.context-budgets.result }}" != "success" || "${{ needs.gate-meta.result }}" != "success" || "${{ needs.deploy-catchup.result }}" != "success" || "${{ needs.review-fa.result }}" != "success" || "${{ needs.resource-oracles.result }}" != "success" || "${{ needs.rollout-composition.result }}" != "success" ]]; then
-            echo "One or more checks failed"; exit 1
-          fi
-          echo "All checks passed"
+      # Проба самого агрегата ТОЙ ЖЕ проводкой (`testing.md` «целостность гейта»): она
+      # извлекает тело ниже из этого файла и гоняет его на заглушках needs. Упала проба —
+      # агрегат красен: сторож, который мог ослепнуть, не судит.
+      - uses: actions/checkout@v4
+      - name: Проба агрегата (7 сценариев)
+        run: bash scripts/tests/red_ci_aggregate.sh
+      # УСЛОВИЕ ВЫВОДИТСЯ ИЗ `needs`, а не перечисляет его копией. До 2026-09-26 здесь стоял
+      # ручной список из 16 проверок при 18 в `needs`: `secret-material` и `roadmap-sync`
+      # (обе добавлены 2026-09-07) в него не попали. При `if: always()` их провал агрегат НЕ
+      # видел — PR с ключом в репозитории влился бы с зелёным «All checks passed». Копия
+      # списка расходится молча при каждом новом джобе; `toJSON(needs)` расходиться не с чем.
+      # Отказ — на ЛЮБОМ исходе, кроме success (failure / cancelled / skipped), как и прежде.
+      # Пустой `needs` — тоже отказ: агрегат, не проверивший ничего, не «прошёл» (fail-closed).
+      - env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json, os, sys
+          needs = json.loads(os.environ["NEEDS_JSON"])
+          if not needs:
+              print("FAIL: needs пуст — агрегат ничего не проверил"); sys.exit(1)
+          bad = sorted(j for j, v in needs.items() if v.get("result") != "success")
+          for j in sorted(needs):
+              print(f"{needs[j].get('result'):>10}  {j}")
+          if bad:
+              print("One or more checks failed:", ", ".join(bad)); sys.exit(1)
+          print(f"All checks passed ({len(needs)} jobs)")
+          PY
