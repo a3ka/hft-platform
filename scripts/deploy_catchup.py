@@ -777,6 +777,21 @@ def cmd_check_aggregate():
                 bad("A3", f"шаг `{AGG_GATE}`, несущий fail-closed условие, обезврежен ({why}) — "
                           f"агрегат станет success при красном джобе")
 
+    # A4 (C-258 R3) — агрегат ЗОВЁТ пробу своего условия, и её шаг не обезврежен.
+    # `red_ci_aggregate.sh` исполняет условие при провале КАЖДОГО джоба `needs` и называет
+    # выпавший; зовётся одной строкой агрегата. Без этой проверки её удаление ненаблюдаемо:
+    # сама себя проба не видит, а её класс (16 проверок условия при 18 в `needs`) уже случался.
+    # Проверка живёт ЗДЕСЬ, в другом джобе, — независимо от пробы.
+    AGG_PROBE = "bash scripts/tests/red_ci_aggregate.sh"
+    if not _invokes(gate, AGG_PROBE):
+        bad("A4", f"`{AGG_GATE}` не ЗОВЁТ `{AGG_PROBE}` в позиции команды — расхождение условия "
+                  f"агрегата с `needs` ненаблюдаемо")
+    for st in _steps(gate):
+        if isinstance(st.get("run"), str) and "red_ci_aggregate.sh" in st["run"]:
+            why = _step_is_disarmed(st)
+            if why:
+                bad("A4", f"шаг `{AGG_GATE}`, зовущий пробу агрегата, обезврежен ({why})")
+
     gate_script = _agg_run_script(gate)
     if not gate_script:
         bad("A3", f"у `{AGG_GATE}` нет ни одного шага `run` — решать нечем")
