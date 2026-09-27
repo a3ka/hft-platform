@@ -1,6 +1,7 @@
 # M-89 — остаток S0: работа одной выдачи ограничена СТРУКТУРНО и видна СНАРУЖИ процесса
 
-**Статус:** PROPOSED (набор коммитится ДО диспетчеризации dev — `04-workflow.md` §2).
+**Статус:** PROPOSED, круг 2 (правка по `C-260` REJECT; набор коммитится ДО диспетчеризации dev —
+`04-workflow.md` §2). Журнал кругов — §20.
 **Ревизия, на которой сняты утверждения о коде:** `origin/main` = `dcb435f`.
 **Предмет роадмапа:** строка `M-89` (`docs/ROADMAP.md`), остаток S0 программы SCALE
 (`docs/plans/scale-program-2026-09-21.md` §4 п. 2, п. 4; §15.1).
@@ -82,27 +83,46 @@ hint. `seq→offset` индекса нет.
 | ID | инвариант | зона | оракул |
 |---|---|---|---|
 | `I-1` | работа первого `pump` после тёплого `resume` ∝ хвосту после курсора слепка + `O(log)` на поиск позиции; НЕ ∝ префиксу сегмента, содержащего курсор | `journal` (аддитивно) + `gateway` | `w1`, `d2`, `d3`, `d6`, `d8`, `d9` |
-| `I-2` | снимок после тёплого `resume` со сдвигом бит-идентичен независимой свёртке (`VB-I-2`, `VB-I-11`) на всех вырожденных входах; порча рядом с точкой сдвига ⇒ `Err`, не пропуск (`JR-I-2`: разрыв при чтении → abort, не «пропустить») | `journal` + `gateway` | `d1`…`d9` |
-| `I-3` | допущенный запрос (`readiness = Ready` ⇔ хвост ≤ `max_tail_events`) стоит `f(max_tail_events)` байт чтения на РЕАЛЬНОМ WS-пути; мёртвый бюджет удалён | `gateway-serve` | `s1` |
-| `I-4` | `journal_payload_bytes_read` — от ЧИТАТЕЛЯ, включая каждый `pump` и сегмент с курсором; `payload_bytes_after_cursor` с горячего пути ушёл | `journal` (счётчик) + `gateway` + `gateway-serve` | `p1`, `v` |
+| `I-2` | снимок после тёплого `resume` со сдвигом бит-идентичен независимой свёртке (`VB-I-2`, `VB-I-11`) на всех вырожденных входах; порча рядом с точкой сдвига и в глубине хвоста ⇒ `Err`, не пропуск (`JR-I-2`: разрыв при чтении → abort, не «пропустить»); публичный договор `stream_from_at(.., Some(after), None)` — РОВНО `after+1` первым, эквивалентность независимому фильтру (N2) | `journal` + `gateway` | `j1`…`j9`, `f1`…`f5`, `d1`…`d9`, `d7c` |
+| `I-3` | допущенный запрос (`readiness = Ready` ⇔ хвост ≤ `max_tail_events`) стоит `f(max_tail_events)` байт чтения на РЕАЛЬНОМ WS-пути — в ОБОИХ режимах входа (v1 и legacy); мёртвый бюджет удалён в любой форме | `gateway-serve` | `s1`, `s2`, шаг `verify` task5 (сканер + проба) |
+| `I-4` | `journal_payload_bytes_read` — от ЧИТАТЕЛЯ, ТОЧНЫМ учётом байт (кадры + заголовки + пробы, инкремент в месте чтения), включая каждый `pump` и сегмент с курсором; транспорт прибавляет РОВНО дельту читателя; `payload_bytes_after_cursor` с горячего пути ушёл | `journal` (счётчик) + `gateway` + `gateway-serve` | `b1`…`b7`, `p1`, `v` |
 | `I-5` | счётчики выдачи — на ЭКЗЕМПЛЯР сервера (`counters_handle`) | `gateway-serve` | `i1`, `i2` |
-| `I-6` | счётчики + свежесть наружу процесса: сердцебиение на записываемом томе; `ops-watchdog` читает и алертит на молчание и несвежесть; композиция путей проверена | `gateway-serve` + `ops` + `deploy` | `h0`, `h1`, `g1`…`g5`, шаг `verify` «композиция» |
+| `I-6` | счётчики + свежесть наружу процесса: сердцебиение — ФАЙЛ на записываемом объявленном томе, по точному пути compose; `ops-watchdog` различает «интеграции нет / путь задан, файла нет / файл есть» и алертит на отсутствие, несвежесть и молчание; композиция путей проверена и судится по форме файла | `gateway-serve` + `ops` + `deploy` | `h0`, `h1`, `g1`…`g5`, шаг `verify` task11 + проба `p1`…`p9` |
 | `I-7` | шаг `task-status` переехал в `verify_M-89.sh` с исправлениями `TD-221` | architect | шаг `verify` `task-status` + проба |
 
 ### 4.1. Форма — задана ДОСЛОВНО там, где RED-набор компилируется против имён
 
 ```rust
 // crates/journal/src/segments.rs — АДДИТИВНО (RAW-гейт критика, gates.md §1: путь чтения журнала)
-/// Найти позицию ПЕРВОГО кадра с `seq > after_seq` в СЫРОМ сегменте `seg_path`, не читая
-/// сегмент целиком. Возвращает `Some(TailHint { seg_idx, last_seq: after_seq, pos })` ТОЛЬКО
-/// при выполнении гарда точности (§5.2); иначе `None` (вызыватель откатывается к чтению с
-/// `header_end`, и откат НАБЛЮДАЕМ — см. `ReadStats::seek_fallbacks`). `.zst` ⇒ `None`.
-pub fn locate_after_seq(seg_path: &Path, after_seq: u64) -> io::Result<Option<TailHint>>;
+//
+// ПУБЛИЧНЫЙ ДОГОВОР — ПОВЕДЕНИЕ, а не примитив (`C-260` R2). При `hint = None` и
+// `after_seq = Some(a)` функции `stream_from_at(dir, filter, Some(a), None)` и
+// `stream_from_at_with_catalog(dir, filter, Some(a), None, catalog)`:
+//   · выдают РОВНО события `seq > a`, первое — `a + 1` (либо ничего, если хвост пуст);
+//   · стоят `events_scanned ≤ хвост + 64`, байт ≤ хвост + заголовок + ПРОБЫ·64 КиБ (§5.2 п. 1)
+//     для СЫРОГО сегмента, содержащего курсор, — активного ИЛИ закрытого;
+//   · порча ⇒ `Err` ровно как у `stream()` (те же выданные события до неё, тот же класс ошибки);
+//     рваный целевой кадр ⇒ пусто без ошибки и без перескана (§5.4); ничего не пишут;
+//   · эквивалентны независимому фильтру `stream(dir, filter)` по `seq > a` на всех вырожденных
+//     входах (N2); `after_seq = None` ⇒ полный проход (как прежде).
+// Оракулы: `crates/journal/tests/red_m89_seek_contract.rs` (`j1`…`j9`).
+//
+// Примитив поиска — ВНУТРЕННИЙ (`pub(crate)`), имя НЕ контрактно и грепом НЕ проверяется;
+// публичного `locate_after_seq` быть НЕ ДОЛЖНО (verify task1 краснеет на `pub fn locate_after_seq`):
+// критик предъявил мутант «публичная заглушка `Ok(None)` + приватный поиск в `LiveReducer`»,
+// проходивший весь прежний набор. Ориентир формы (не требование):
+//   pub(crate) fn locate_after_seq(seg_path: &Path, after_seq: u64) -> io::Result<Option<TailHint>>;
 
-/// Байты, ПРОЧИТАННЫЕ этим стримом: кадры `[len][payload][crc]` + заголовки + пробы границ.
-/// Ведётся тем же приёмом, что `events_scanned` (M-57): инкремент в месте чтения, не в
-/// вызывателе. Аддитивен к остальным счётчикам.
-impl EventStream { pub fn payload_bytes_read(&self) -> u64; }
+impl EventStream {
+    /// Байты, ПРОЧИТАННЫЕ этим стримом: кадры `[len][payload][crc]` + заголовки сегментов
+    /// (магия + header-кадр) + пробы границ; для `.zst` — байты, ПОТРЕБЛЁННЫЕ ИЗ ФАЙЛА (сжатые).
+    /// Инкремент В МЕСТЕ ЧТЕНИЯ (тот же приём, что `events_scanned`, M-57), не в вызывателе
+    /// и не из числа событий: полный проход РАВЕН размеру файлов (`red_m89_bytes_accounting`).
+    pub fn payload_bytes_read(&self) -> u64;
+    /// Число откатов поиска позиции к `header_end` за проход (§5.2 п. 7): кандидат найден,
+    /// гард точности не прошёл. `.zst` — не откат (поиск не предпринимается).
+    pub fn seek_fallbacks(&self) -> u64;
+}
 
 // crates/gateway/src/lib.rs — АДДИТИВНО
 pub struct ReadStats {
@@ -111,7 +131,8 @@ pub struct ReadStats {
     pub seek_fallbacks: u64,
 }
 // `payload_bytes_read` заполняется ИЗ `EventStream::payload_bytes_read()` на ВСЕХ путях
-// (`pump`, `snapshot_from_checkpoint`, cold-`resume`); `payload_bytes_after_cursor` УДАЛЯЕТСЯ.
+// (`pump`, `snapshot_from_checkpoint`, cold-`resume`; warm-`resume` — байты файла слепка);
+// `seek_fallbacks` — из `EventStream::seek_fallbacks()`; `payload_bytes_after_cursor` УДАЛЯЕТСЯ.
 
 // crates/gateway-serve/src/metrics.rs — АДДИТИВНО
 pub struct ServingCountersHandle { /* атомики ЭКЗЕМПЛЯРА */ }
@@ -133,9 +154,10 @@ pub fn heartbeat_config_from_env(get: impl Fn(&str) -> Option<String>) -> Result
 //   CallBudget · BudgetStop · Cancel · feed_tail_within · pump_one · PumpStep
 ```
 
-Что НЕ фиксируется формой, а формулируется ТРЕБОВАНИЯМИ (§5): где именно `gateway` зовёт
-`locate_after_seq` (в `resume` или в первом `pump`), как устроена бисекция, как хранится
-`seek_fallbacks` внутри стрима. Гард точности (§5.2) — не деталь реализации, а инвариант.
+Что НЕ фиксируется формой, а формулируется ТРЕБОВАНИЯМИ (§5): как устроена бисекция, как
+хранятся счётчики внутри стрима. ЗАФИКСИРОВАНО (круг 2): поиск живёт ВНУТРИ `journal`, в
+`stream_from_at_with_catalog` при `hint == None` (§5.3) — иначе публичный договор выше
+недостижим. Гард точности (§5.2) — не деталь реализации, а инвариант.
 
 ### 4.2. Форма сердцебиения выдачи (задана ДОСЛОВНО — её читают ДВА крейта и гейт)
 
@@ -161,12 +183,25 @@ pub fn heartbeat_config_from_env(get: impl Fn(&str) -> Option<String>) -> Result
 pub struct ServingHeartbeatSample { pub ts_wall_ms: i64, pub attempts: u64, pub successes: u64,
     pub refusals_supported: u64, pub refusals_unsupported: u64,
     pub journal_payload_bytes_read: u64, pub slots_in_flight: u64 }
+/// Вход «сердцебиение выдачи» одного такта — ТРИ состояния (`C-260` R1: `Option` кодировал
+/// «интеграции нет» и «файл не прочитан» одним `None`, требуя от него противоположного).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum ServingHeartbeat {
+    /// Интеграции нет (legacy `run_cycle`): serving-проверки НЕ исполняются, serving-якорь в
+    /// состоянии НЕ трогается. `Default`.
+    #[default] Disabled,
+    /// Путь задан, файл не прочитан / не разобран ⇒ `WD-SERVING-HB-MISSING`; якорь молчания
+    /// НЕ сбрасывается (нечитаемый такт не стирает историю, `R-005` F-1).
+    ConfiguredMissing,
+    Present(ServingHeartbeatSample),
+}
 pub enum Incident { /* существующие */ ServingHeartbeatMissing, ServingHeartbeatStale, ServingSilence }
 //   коды: WD-SERVING-HB-MISSING (CRITICAL) · WD-SERVING-HB-STALE (WARNING/CRITICAL по порогам)
 //         · WD-SERVING-SILENCE (CRITICAL)
 pub struct Thresholds { /* существующие */ pub serving_heartbeat_warn_ms: i64, pub serving_heartbeat_crit_ms: i64 }
 //   дефолты: warn 60 000 / crit 180 000 — те же, что у recorder'а (период 10 с, cron */5)
-pub fn check_serving_heartbeat_missing(hb: Option<&ServingHeartbeatSample>) -> Option<Alert>;
+/// `Disabled` ⇒ None · `ConfiguredMissing` ⇒ Some(CRITICAL) · `Present(_)` ⇒ None.
+pub fn check_serving_heartbeat_missing(hb: &ServingHeartbeat) -> Option<Alert>;
 pub fn check_serving_heartbeat_stale(now_ms: i64, hb: &ServingHeartbeatSample, thr: &Thresholds) -> Option<Alert>;
 /// По ДЕЛЬТАМ prev→cur: Δattempts > 0 ∧ Δrefusals_supported > 0 ∧ Δsuccesses == 0 ⇒ Some.
 /// Отрицательная дельта (рестарт процесса) ⇒ None (новый якорь, не голодание).
@@ -174,15 +209,19 @@ pub fn check_serving_silence(prev: &ServingHeartbeatSample, cur: &ServingHeartbe
 
 // crates/ops/src/watchdog_cycle.rs — `CycleInputs` НЕ МЕНЯЕТСЯ (12 литералов в sacred-тестах)
 #[derive(Debug, Clone, Default)]
-pub struct ServingInputs { pub heartbeat: Option<ServingHeartbeatSample> }
+pub struct ServingInputs { pub heartbeat: ServingHeartbeat }        // Default ⇒ Disabled
 pub fn run_cycle_full(inputs: &CycleInputs, serving: &ServingInputs, now_ms: i64,
     thr: &Thresholds, dedup_window_ms: i64, state: &mut WatchdogState) -> CycleOutcome;
-// `run_cycle(..)` ≡ `run_cycle_full(.., &ServingInputs::default(), ..)` — поведение прежнее.
+// `run_cycle(..)` ≡ `run_cycle_full(.., &ServingInputs::default(), ..)` — `Disabled`, поведение
+// прежнее, равенство исходов и состояния проверяется ИСПОЛНЕНИЕМ (`g4b`); `ConfiguredMissing`
+// на том же входе ⇒ MISSING (`g4c`); `Disabled` посреди истории не трогает serving-якорь (`g4` такт 5).
 // crates/ops/src/state.rs
 pub struct WatchdogState { /* существующие */ #[serde(default)] pub prev_serving_heartbeat: Option<ServingHeartbeatSample> }
 // crates/ops/src/bin/ops-watchdog.rs — env `WATCHDOG_SERVING_HEARTBEAT_PATH`
 //   (default `/var/lib/docker/volumes/hft-platform_gateway-state/_data/gateway-serve.heartbeat`);
-//   бинарь зовёт ТОЛЬКО `run_cycle_full`.
+//   бинарь зовёт ТОЛЬКО `run_cycle_full`; путь у него есть ВСЕГДА (env либо дефолт), поэтому он
+//   НИКОГДА не передаёт `Disabled`: файл прочитан и разобран ⇒ `Present`, иначе ⇒ `ConfiguredMissing`
+//   (исполняемый случай — `g5` (1): путь задан, файла нет ⇒ `WD-SERVING-HB-MISSING`).
 ```
 
 Дедуп, якорь и нечитаемый такт — по той же дисциплине, что у recorder-сердцебиения
@@ -215,7 +254,9 @@ pub struct WatchdogState { /* существующие */ #[serde(default)] pub 
    `header_end` (`seek_fallbacks += 1`). Основание — `JR-I-2` (`seq` без дыр: следующий кадр
    ОБЯЗАН нести `after+1`) — гард делает ложное совпадение CRC (2⁻³²) или ошибку бисекции
    НЕВЫПОЛНИМОЙ молча: «перепрыгнуть» валидные события нельзя, потому что позиция —
-   не «где-то после», а РОВНО `after+1`.
+   не «где-то после», а РОВНО `after+1`. Кандидат с НЕВЕРНЫМ seq (дыра в нумерации: следующий
+   кадр несёт `after+2`; курсор за пределами журнала) ⇒ откат, и откат НАСТОЯЩИЙ — чтение с
+   `header_end` (`f1`, `f2`).
 4. **Порча.** Кадр `after+1` испорчен ⇒ гард не проходит ⇒ откат ⇒ чтение с `header_end`
    упирается в порчу и даёт `Err`, как независимый путь (`d7`). Порча дальше по хвосту ⇒
    `Err` из стрима, курсор доставки не двигается (`d7b`). Ресинк ВНУТРИ прода-пути чтения
@@ -227,20 +268,38 @@ pub struct WatchdogState { /* существующие */ #[serde(default)] pub 
    обязательна (`d4`).
 6. **Только чтение.** Никаких файлов рядом с журналом (`:ro`-том прода, `d9`), никакого
    общего состояния между сессиями (`d8`).
-7. **Наблюдаемость отката.** `ReadStats::seek_fallbacks` — чтобы «сдвиг не сработал и всё
-   перечиталось» было видно в статистике, а не только в `rchar`.
+7. **Наблюдаемость отката.** `EventStream::seek_fallbacks()` ⇒ `ReadStats::seek_fallbacks` —
+   чтобы «сдвиг не сработал и всё перечиталось» было видно в статистике, а не только в
+   `rchar`. Откат = «кандидат найден, гард не прошёл, читаем с `header_end`»; успешный сдвиг
+   (`f3`, `f4`) и `.zst` (поиск не предпринимается, `f5`) откатом НЕ считаются.
+8. **Точный учёт байт.** `EventStream::payload_bytes_read()` — полный проход РАВЕН размеру
+   файлов (сырой) / потреблённым сжатым байтам (`.zst`); частичные проходы — в названных
+   границах: валидный hint `[хвост, хвост + 2·заголовок + кадр пробы]`, откат по невалидному
+   hint'у `[файл, файл + 2·заголовок + 64 КиБ]`, сдвиг по seq `[хвост, хвост + заголовок +
+   ПРОБЫ·64 КиБ]` (`b1`…`b7`). Учёт ведётся в месте чтения — «`events_scanned × константа`»
+   и «байты только выданных кадров» краснеют на равенствах (`b1`, `b2`).
 
-### 5.3. Где зовётся — требование, не предписание
+### 5.3. Где зовётся — ЗАФИКСИРОВАНО кругом 2 (`C-260` R2/N2)
 
-`resume` журнал не читает (замер: `events_scanned=0`; sacred `red_frames_seek_bound`). Значит
-позиция ищется в ПЕРВОМ `pump`, когда `self.tail_hint.is_none() && self.cursor.upto_seq.is_some()`:
-по каталогу (`SegmentCatalog::open` уже строится там же) найти сегмент с `first_seq ≤ cursor+1 <
-next.first_seq`, позвать `locate_after_seq`, передать результат как `hint` в
-`stream_from_at_with_catalog`. Найденная позиция проходит СУЩЕСТВУЮЩУЮ валидацию hint'а
-(`resolve_active_start_offset`, условия 1–6) — второй контур, не первый. Реализация внутри
-`journal` (в `stream_from_at_with_catalog` при `hint == None`) допустима, если сохраняет
-семантику `stream`/`stream_from` (`after_seq = None` ⇒ полный проход) и все sacred-оракулы
-`crates/journal/tests/**`, `crates/gateway/tests/**` зелены.
+`resume` журнал не читает (замер: `events_scanned=0`; sacred `red_frames_seek_bound`). Позиция
+ищется в ПЕРВОМ `pump`, и искать её обязан САМ `journal`: `stream_from_at_with_catalog` при
+`hint == None && after_seq == Some(a)` находит в отобранных сегментах тот, что содержит `a+1`
+(`first_seq ≤ a+1 < next.first_seq`; для последнего — активный), ищет позицию по §5.2 и
+открывает чтение с неё. Это делает договор §4.1 ПУБЛИЧНЫМ и проверяемым через
+`stream_from_at`, а `LiveReducer` получает сдвиг, ничего не зная о примитиве: первый `pump`
+передаёт `hint = None`, как и сегодня. Найденная позиция проходит СУЩЕСТВУЮЩУЮ валидацию
+hint'а (`resolve_active_start_offset`, условия 1–6) — второй контур, не первый; эту
+валидацию убирать нельзя (`j9`: невалидный `pos` среди кадра не смеет пропустить события).
+Для ЗАКРЫТОГО сырого сегмента чтение с найденной позиции начинается так же (`j2`, `d3`).
+
+**Совместимость `stream_from_at` (N2).** Публичный `stream_from_at(dir, filter, after, hint)`
+делегирует в `stream_from_at_with_catalog` и НАСЛЕДУЕТ сдвиг — это и есть договор, а не
+побочный эффект: при `after = Some(a), hint = None` он обязан отдавать ровно те же события,
+что независимый фильтр `stream(dir, filter)` по `seq > a`, на всех вырожденных входах
+(активный, закрытый, `.zst`, рваный кадр; `j8`); при `after = None` — полный проход.
+`stream`/`stream_from` в `stream_from_at_with_catalog` не входят (`stream_from` имеет
+собственное тело) и не меняются (§10). Sacred-оракулы `crates/journal/tests/**`,
+`crates/gateway/tests/**` зелены.
 
 ### 5.4. Рваный кадр (`d6`)
 
@@ -272,11 +331,16 @@ next.first_seq`, позвать `locate_after_seq`, передать резул�
 
 ## 7. `I-4` — счётчик от читателя
 
-`EventStream::payload_bytes_read()` (§4.1) кормит `ReadStats.payload_bytes_read` на всех
-путях; в транспорте КАЖДЫЙ `pump` push-цикла (v1 и legacy) прибавляет свои байты к счётчику
-экземпляра. `payload_bytes_after_cursor` удаляется — с ним уходит `read_dir` + заголовки на
-каждую выдачу (задача 15 `M-87`, `R-202` Н-1). Оракулы: `p1` (библиотека, нижняя граница —
-байты хвоста на диске, верхняя — `rchar`), `v` (WS: `≥ ckpt + tail`, `≤ rchar`).
+`EventStream::payload_bytes_read()` (§4.1, точный учёт — §5.2 п. 8) кормит
+`ReadStats.payload_bytes_read` на всех путях; в транспорте КАЖДЫЙ `pump` push-цикла (v1 и
+legacy) прибавляет к счётчику экземпляра РОВНО `stats.payload_bytes_read` своего `pump` —
+ни синтетики, ни дубликата. `payload_bytes_after_cursor` удаляется — с ним уходит `read_dir` +
+заголовки на каждую выдачу (задача 15 `M-87`, `R-202` Н-1). Оракулы: `b1`…`b7`
+(`crates/journal`, равенства и названные границы), `p1` (`gateway`, согласованность с ядром на
+`pump`), `v` (WS: `≥ ckpt + tail`, `≤ rchar` И `== R + P1 + n·P2`, где `R`/`P1`/`P2` —
+`payload_bytes_read` реплики того же пути в процессе теста: warm-`resume`, первый `pump(256)`,
+пустой тик; `n` — число пустых тиков push-цикла за окно наблюдения). Мутант
+`events_scanned × 64` краснеет на `b1` (кадры разного размера) и на `v` (дельта ≠ реплике).
 
 ## 8. `I-5` — счётчики на экземпляр
 
@@ -293,15 +357,24 @@ next.first_seq`, позвать `locate_after_seq`, передать резул�
 | артефакт | зона | что |
 |---|---|---|
 | писатель | `crates/gateway-serve/src/**`, `main.rs` | `with_heartbeat` + `heartbeat_config_from_env` (§4.1), запись §4.2 |
-| описание прода | `docker-compose.yml` (engine-dev) | сервис `gateway-serve`: том `gateway-state:/state` (**rw**), `GATEWAY_HEARTBEAT_PATH: /state/gateway-serve.heartbeat`, `GATEWAY_HEARTBEAT_PERIOD_MS: ${…:-10000}`; объявление `volumes: gateway-state:` |
+| описание прода | `docker-compose.yml` (engine-dev) | сервис `gateway-serve`: том `gateway-state:/state` (**rw**), `GATEWAY_HEARTBEAT_PATH: /state/gateway-serve.heartbeat` — ПУТЬ К ФАЙЛУ (не корень монтирования, не каталог с хвостовым `/`, не пустой/служебный лист — `C-260` R3; `h0` и шаг task11 это отвергают), `GATEWAY_HEARTBEAT_PERIOD_MS: ${…:-10000}` (объявлен, положительное число); объявление `volumes: gateway-state:` |
 | читатель | `crates/ops/src/**` | §4.3 |
 | планировщик | `deploy/cron.d/watchdog` (НОВЫЙ, engine-dev) | по образцу `deploy/cron.d/journal-retention`: `WATCHDOG_SERVING_HEARTBEAT_PATH=/var/lib/docker/volumes/hft-platform_gateway-state/_data/gateway-serve.heartbeat`, `*/5 * * * * root /root/hft-platform/scripts/watchdog_cron.sh` |
 
-**Композиция (шаг `verify`, `testing.md` §«канарейка», п. 2):** путь, куда пишет
+**Композиция (шаг `verify` task11 + `h0`/`h1`, `testing.md` §«канарейка», п. 2):** путь, куда пишет
 `gateway-serve` (`compose`: том + путь в контейнере ⇒ `/var/lib/docker/volumes/hft-platform_<том>/_data/<файл>`),
 обязан СОВПАСТЬ с путём, откуда читает `ops-watchdog` (`deploy/cron.d/watchdog`
-`WATCHDOG_SERVING_HEARTBEAT_PATH`). Две строки в двух файлах — ровно тот тихий no-op, который
-канарейка ловит.
+`WATCHDOG_SERVING_HEARTBEAT_PATH`), и обе строки обязаны быть путями к ФАЙЛУ. Две строки в двух
+файлах — ровно тот тихий no-op, который канарейка ловит. Шаг task11 под пробой
+(`scripts/tests/red_verify_M-89_scan.sh` `p1`…`p9`: корень, хвостовой `/`, `.`, `:ro`, разъезд,
+отсутствие фрагмента, путь вне монтирований).
+
+**`h1` не подменяет путь (`C-260` R3):** прод-бинарь получает ТОЧНОЕ значение
+`GATEWAY_HEARTBEAT_PATH` из compose, отображённое на записываемую фикстуру-монтирование
+(tmpdir играет `/var/lib/docker/volumes/hft-platform_<том>/_data`, путь внутри монтирования
+сохраняется); переопределяется ТОЛЬКО период (200 мс). Проверяется создание файла, атомарная
+замена (`<path>.tmp` → `rename`: JSON целый при каждом чтении, `.tmp` не переживает двух
+опросов подряд) и равенство хост-пути этой же фикстуры пути cron'а.
 
 **Предел, названный честно:** установка `deploy/cron.d/watchdog` в `/etc/cron.d` и сборка
 `ops-watchdog` на VPS — РУЧНОЙ шаг с подписью founder ★ (`deploy/README.md` §Планировщик:
@@ -318,6 +391,11 @@ next.first_seq`, позвать `locate_after_seq`, передать резул�
 | файлы/sidecar рядом с журналом, общее состояние между сессиями | `:ro`-том прода; `R-035` F-035-1/2; `d8`/`d9` |
 | ресинк по байтам ВНУТРИ прод-пути чтения (`journal::stream*`), молчаливый пропуск кадров | `JR-I-2`, `JR-I-11`; ресинк — только в офлайн-`recover`. Поиск позиции пробует, но выдача идёт со строгим CRC от точной позиции (§5.2 п. 3) |
 | менять формат журнала на диске, `SCHEMA_VERSION`, семантику `stream`/`stream_from`/`read_all` | вне предмета; `after_seq = None` ⇒ полный проход остаётся |
+| ломать эквивалентность `stream_from_at(.., Some(a), None)` ≡ `stream()` ∩ `seq > a`; терять/дублировать события на любом вырожденном входе | N2, `j8`; `stream_from_at` — публичный читатель, наследующий сдвиг по построению (§5.3) |
+| публичный `pub fn locate_after_seq` (или иной публичный примитив поиска) | `C-260` R2: заглушка проходит греп; договор — поведение `stream_from_at` (§4.1); verify task1 краснеет |
+| снимать валидацию hint'а (`resolve_active_start_offset`, условия 1–6) в пользу собственного поиска | второй контур `I-2`; `j9` |
+| кормить счётчик байт чем-либо, кроме `EventStream::payload_bytes_read()` (синтетика, дубликат в транспорте) | `I-4`; `b1`…`b7`, `v` (равенство дельте реплики) |
+| передавать в `run_cycle_full` `Disabled` из бинаря; сбрасывать serving-якорь на `ConfiguredMissing` | `C-260` R1; `g4`, `g5` (1) |
 | менять `gateway::validate_selector`, семантику пяти исходов `M-87`, порядок `admit → try_acquire → readiness` | `A-033`/`A-037`/`A-038` |
 | менять состав полос, `GATEWAY_BANDS`, `GATEWAY_CANONICAL_BANDS`, `MAX_REL_DIST` | граница C, `П-014`/`П-029` |
 | менять предел объёма ответа 2 000 000 Б | `П-020` |
@@ -341,9 +419,9 @@ next.first_seq`, позвать `locate_after_seq`, передать резул�
 2. **Размер события в фикстурах ≈ 51 Б против ≈ 1 351 Б на проде** — число проб растёт как
    `log2(размер файла)`, на проде их на ~5 больше; пороги это покрывают, а прод-замер до/после
    (§15, SKIP-шаг) снимает настоящие числа.
-3. **`h1` наблюдает атомарность ОПРОСОМ** (≈ 30 чтений за 3 периода) — неатомарная запись
-   ловится вероятностно, а не доказательно; структурного оракула на `rename` нет, и он не
-   изображается.
+3. **`h1` наблюдает атомарность ОПРОСОМ** (≈ 30 чтений за 3 периода: JSON целый, `.tmp` не
+   задерживается) — неатомарная запись ловится вероятностно, а не доказательно; структурного
+   оракула на `rename` нет, и он не изображается.
 4. **Молчание выдачи судится по ДЕЛЬТАМ между тактами cron'а (5 мин)**: тревога появляется не
    раньше второго такта после начала голодания. Активная проба (`M-87` §7 п. 3, `TD-207`)
    этим не заменяется и здесь не строится.
@@ -367,6 +445,13 @@ next.first_seq`, позвать `locate_after_seq`, передать резул�
    не отменой: работа одной выдачи ограничена п. 8 и доводится до конца. Кооперативная отмена
    жила только в удаляемом плацебо (`feed_tail_within` не звался с прод-пути), то есть потери
    функции нет — есть честное название её отсутствия.
+10. **`v` доказывает верность передачи, а не точность читателя.** Ожидание `v` считает реплика
+    того же библиотечного пути; точность самих чисел пиннят `b1`…`b7` равенствами. Число пустых
+    тиков `n` в `v` не фиксируется (push-цикл 250 мс не синхронизирован с тестом) — судится
+    делимость остатка на цену пустого тика и его верхняя граница по времени наблюдения.
+11. **Оракулы, красные компиляцией сегодня** (`f1`…`f5`, `b1`…`b7`, `g1`…`g5`, `i1`/`i2`),
+    мутационный контроль получают в Done Block dev'а (задачи 1, 6, 10): мутанты названы в §14,
+    architect не пишет реализацию, чтобы их прогнать.
 
 ## 12. Allowed paths
 
@@ -378,9 +463,10 @@ next.first_seq`, позвать `locate_after_seq`, передать резул�
 `crates/ops/src/**` и `src/bin/ops-watchdog.rs` (§4.3) · `docker-compose.yml` (том, две
 переменные) · `deploy/cron.d/watchdog` (новый).
 
-**architect (этот набор и задача 7):** `milestones/M-89-*.md` · `crates/gateway/tests/**` ·
-`crates/gateway-serve/tests/**` · `crates/ops/tests/**` · `scripts/verify_M-89.sh` ·
-`scripts/tests/red_verify_M-89_task_status.sh` · `docs/plans/m89-warm-resume-measure-2026-09-27.md`.
+**architect (этот набор и задача 7):** `milestones/M-89-*.md` · `crates/journal/tests/red_m89_*.rs` ·
+`crates/gateway/tests/**` · `crates/gateway-serve/tests/**` · `crates/ops/tests/**` ·
+`scripts/verify_M-89.sh` · `scripts/tests/red_verify_M-89_{task_status,scan}.sh` ·
+`docs/plans/m89-warm-resume-measure-2026-09-27.md`.
 
 **Вне зоны:** `crates/{risk,killswitch,oms,contracts,venue-*,book,recorder}/**`, секреты,
 `scripts/watchdog_cron.sh` (не требует правок: путь приходит из env фрагмента cron'а).
@@ -389,17 +475,17 @@ next.first_seq`, позвать `locate_after_seq`, передать резул�
 
 | # | Status | задача | зона | проверка |
 |---|---|---|---|---|
-| 1 | ⏳ OPEN | **`journal::locate_after_seq` + счётчик байт стрима + сдвиг в закрытом сыром сегменте + рваный кадр** (§4.1, §5.2, §5.4). Аддитивно; sacred `crates/journal/tests/**` зелены. ОСТАТОК: всё — ещё не начата | engine-dev | `w1`, `d3`, `d6`, `d7`, `d7b`; `cargo test -p journal` |
-| 2 | ⏳ OPEN | **Первый `pump` ищет позицию курсора** (§5.3): `tail_hint` заполняется найденной позицией, откат наблюдаем (`seek_fallbacks`). ОСТАТОК: всё — ещё не начата | engine-dev | `w1`, `d1`, `d2`, `d8`, `d9`, `red_frames_seek_bound`, `red_tick_read_cost` зелены |
-| 3 | ⏳ OPEN | **`payload_bytes_read` от читателя на всех путях; `payload_bytes_after_cursor` удалён** (§7). ОСТАТОК: всё — ещё не начата | engine-dev | `p1`; `grep -c payload_bytes_after_cursor crates/gateway/src/lib.rs` → 0 |
-| 4 | ⏳ OPEN | **Каждый `pump` push-цикла кормит счётчик байт** (v1 и legacy). ОСТАТОК: всё — ещё не начата | engine-dev | `v` (`red_m89_read_volume_truth`), `red_m87_read_volume_truth::q2` зелен |
-| 5 | ⏳ OPEN | **Бюджет-плацебо удалён** из `admission.rs` (§6); комментарии, ссылающиеся на него, приведены к коду. ОСТАТОК: всё — ещё не начата | engine-dev | `verify` шаг task5 (грепы ОТСУТСТВИЯ), `s1` |
+| 1 | ⏳ OPEN | **Сдвиг к позиции курсора ВНУТРИ `journal` (`stream_from_at_with_catalog` при `hint == None`) + `EventStream::{payload_bytes_read, seek_fallbacks}` + сдвиг в закрытом сыром сегменте + рваный кадр** (§4.1, §5.2, §5.3, §5.4). Аддитивно; публичного `locate_after_seq` НЕТ; sacred `crates/journal/tests/**` зелены. ОСТАТОК: всё — ещё не начата (круг 2: договор переведён на публичную точку, `C-260` R2) | engine-dev | `j1`…`j9`, `f1`…`f5`, `b1`…`b7`; `verify` task1 (нет `pub fn locate_after_seq`); `cargo test -p journal`; Done Block с мутантами §14 |
+| 2 | ⏳ OPEN | **Первый `pump` получает сдвиг от `journal`** (§5.3): `hint = None` как сегодня, `ReadStats::seek_fallbacks` из стрима, `tail_hint` после прохода как прежде. ОСТАТОК: всё — ещё не начата | engine-dev | `w1`, `d1`, `d2`, `d8`, `d9`, `red_frames_seek_bound`, `red_tick_read_cost` зелены |
+| 3 | ⏳ OPEN | **`payload_bytes_read` от читателя на всех путях; `payload_bytes_after_cursor` удалён** (§7). ОСТАТОК: всё — ещё не начата | engine-dev | `p1`, `b1`…`b7`; `grep -c payload_bytes_after_cursor crates/gateway/src/lib.rs` → 0 |
+| 4 | ⏳ OPEN | **Каждый `pump` push-цикла кормит счётчик байт РОВНО своей `ReadStats.payload_bytes_read`** (v1 и legacy). ОСТАТОК: всё — ещё не начата | engine-dev | `v` (`red_m89_read_volume_truth`: границы + равенство дельте реплики), `red_m87_read_volume_truth::q2` зелен |
+| 5 | ⏳ OPEN | **Бюджет-плацебо удалён** из `crates/gateway-serve/src/**` В ЛЮБОЙ ФОРМЕ (§6): имена `CallBudget|BudgetStop|Cancel|feed_tail_within|pump_one|PumpStep` не встречаются в коде (комментарии сняты, `type`/`use`/литерал считаются); комментарии приведены к коду. ОСТАТОК: всё — ещё не начата | engine-dev | `verify` шаг task5 (сканер под пробой `red_verify_M-89_scan.sh` t1…t10), `s1`, `s2` |
 | 6 | ⏳ OPEN | **Счётчики на экземпляр**: `ServingCountersHandle`, `Server::counters_handle`, продюсеры пути выдачи пишут в экземпляр (§8). ОСТАТОК: всё — ещё не начата | engine-dev | `i1`, `i2` |
-| 7 | ⏳ OPEN | **Перевод оракулов `red_m87_entrypoint.rs` на ручку экземпляра; `SERIAL` — по мутации** (§8, §16). ОСТАТОК: всё — ждёт задачи 6 | architect | `red_m87_entrypoint` под `--features testing` зелен; `red_m89_serial_guard` зелен; `red_m87_registry::r1` зелен |
-| 8 | ⏳ OPEN | **Сердцебиение выдачи**: `with_heartbeat`, `heartbeat_config_from_env`, запись §4.2, `main.rs` зовёт билдер. ОСТАТОК: всё — ещё не начата | engine-dev | `h1` |
-| 9 | ⏳ OPEN | **compose**: том `gateway-state` (rw), `GATEWAY_HEARTBEAT_PATH`, `GATEWAY_HEARTBEAT_PERIOD_MS` у `gateway-serve`. ОСТАТОК: всё — ещё не начата | engine-dev | `h0`, `red_m87_prod_entrypoint_argv` зелен |
-| 10 | ⏳ OPEN | **`ops`: сэмпл, три инцидента, пороги, `run_cycle_full`, якорь в состоянии, env бинаря** (§4.3). ОСТАТОК: всё — ещё не начата | engine-dev | `g1`…`g5`, `red_ops_watchdog*` зелены, `scripts/verify_alerting.sh` (если зовётся) |
-| 11 | ⏳ OPEN | **`deploy/cron.d/watchdog`** с `WATCHDOG_SERVING_HEARTBEAT_PATH`, равным хост-пути тома из compose (§9). ОСТАТОК: всё — ещё не начата | engine-dev | `verify` шаг «композиция» |
+| 7 | ⏳ OPEN | **Перевод оракулов `red_m87_entrypoint.rs` на ручку экземпляра; `SERIAL` — по мутации** (§8, §16). Пока `SERIAL` объявлен — блокировка ПЕРВОЙ строкой каждого async-теста (сторож по-функционный, `C-260` N4). ОСТАТОК: всё — ждёт задачи 6 | architect | `red_m87_entrypoint` под `--features testing` зелен; `red_m89_serial_guard` (сторож + `m1`…`m6`) зелен; `red_m87_registry::r1` зелен |
+| 8 | ⏳ OPEN | **Сердцебиение выдачи**: `with_heartbeat`, `heartbeat_config_from_env`, запись §4.2 (`<path>.tmp` → `rename`), `main.rs` зовёт билдер. ОСТАТОК: всё — ещё не начата | engine-dev | `h1` (точный путь compose на фикстуре-монтировании, атомарность, рост) |
+| 9 | ⏳ OPEN | **compose**: объявленный том `gateway-state` (rw), `GATEWAY_HEARTBEAT_PATH` — путь к ФАЙЛУ, `GATEWAY_HEARTBEAT_PERIOD_MS` у `gateway-serve`. ОСТАТОК: всё — ещё не начата | engine-dev | `h0`, `verify` task11, `red_m87_prod_entrypoint_argv` зелен |
+| 10 | ⏳ OPEN | **`ops`: сэмпл, `ServingHeartbeat` (три состояния), три инцидента, пороги, `run_cycle_full`, якорь в состоянии, env бинаря (никогда не `Disabled`)** (§4.3). ОСТАТОК: всё — ещё не начата (круг 2: форма — перечисление, `C-260` R1) | engine-dev | `g1`…`g5` (вкл. `g4b`/`g4c`), `red_ops_watchdog*` зелены, `scripts/verify_alerting.sh` (если зовётся); Done Block с мутантами §14 |
+| 11 | ⏳ OPEN | **`deploy/cron.d/watchdog`** с `WATCHDOG_SERVING_HEARTBEAT_PATH` — путь к ФАЙЛУ, равный хост-пути тома из compose (§9); `crontab -n` проходит. ОСТАТОК: всё — ещё не начата | engine-dev | `verify` шаг task11 (под пробой `p1`…`p9`), `h0` |
 | 12 | ⏳ OPEN | **Прод-замер ДО/ПОСЛЕ** (§15, SKIP-шаг): `rchar`/время первой выдачи новой подписки на проде при курсоре слепка глубоко в активном сегменте; сырые строки — в вердикт. ОСТАТОК: снимается reviewer'ом на §8-гейте | reviewer | `verify` SKIP-шаг + `R-NNN` |
 
 Задачи 1–2 ЗАВИСИМЫ и трогают `crates/journal` ⇒ **RAW-гейт критика на сильной модели**
@@ -409,27 +495,48 @@ next.first_seq`, позвать `locate_after_seq`, передать резул�
 
 | ID | файл | что доказывает | какая мутация роняет | чего НЕ ловит | сегодня |
 |---|---|---|---|---|---|
+| `j1` | `crates/journal/tests/red_m89_seek_contract.rs` | публичная точка `stream_from_at(.., Some(a), None)`: первое событие РОВНО `a+1`, `events_scanned ≤ хвост+64`, ≡ независимому фильтру (активный сырой) | «читать с header_end» (сегодня); «где-то после» вместо `a+1` | транспорт; байты | RUNTIME-RED (`20 500` при хвосте 500) |
+| `j2` | там же | курсор в ЗАКРЫТОМ сыром сегменте, хвост через ротацию — та же цена и точность | сдвиг только для активного | `.zst` | RUNTIME-RED (`14 000` при хвосте 8 000) |
+| `j3` | там же | пустой хвост на EOF: 0 событий, `≤ 64` сканов, без ошибки | «нет хвоста ⇒ прочитать всё» | — | RUNTIME-RED (`5 000`) |
+| `j4` | там же | курсор за журналом: пусто, без ошибки | выдача чужих событий | стоимость (откат легитимен) | зелен (страж) |
+| `j5`/`j5b` | там же | порча `a+1` / в середине хвоста (`TAIL/2`, N1): `Err`, те же события до неё и тот же класс ошибки, что у `stream()` | ресинк, перепрыгивающий порчу; усечение до порчи как `Ok` | — | зелены (стражи fail-closed; setup-страж: без порчи — SETUP) |
+| `j6` | там же | рваный целевой кадр: пусто без ошибки и без перескана; три целых кадра перед ним выдаются; дописанный — ровно один раз | откат в `header_end` на рваном; `Err` на рваном; дубль | — | RUNTIME-RED (перескан `5 000`) |
+| `j7` | там же | `:ro`-каталог: сдвиг работает, опись не меняется | sidecar/индекс; запись | root (страж setup) | RUNTIME-RED (`5 500`) |
+| `j8` | там же | N2: для активного/закрытого/`.zst`/рваного и всех граничных `a` — `stream_from_at ≡ stream() ∩ seq>a` по содержимому; `None` ≡ полный проход | любая потеря/дубль (мутация эталона `seq > a+1` роняет) | стоимость | зелен (страж) |
+| `j9` | там же | валидация hint'а сохранена: `pos` среди кадра ⇒ откат/сдвиг без пропуска; валидный `pos` — дёшев | снятие условия 6 | — | зелен (страж) |
+| `f1`…`f5` | `crates/journal/tests/red_m89_seek_fallback_observed.rs` | `EventStream::seek_fallbacks()`: дыра в нумерации ⇒ 1 откат + чтение с `header_end` + выдача ≡ эталону; курсор за журналом ⇒ 1; активный/закрытый ⇒ 0 и цена ∝ хвосту; `.zst` ⇒ 0 | детектор-молчун (всегда 0); детектор-крикун (каждый проход — откат); «откат» без перечитывания | — | COMPILE-RED (`seek_fallbacks`) |
+| `b1`…`b7` | `crates/journal/tests/red_m89_bytes_accounting.rs` | `EventStream::payload_bytes_read()`: полный проход == размер файла(ов) при кадрах 50 Б/2.4 КиБ вперемешку; `stream_from(Some(a))` == файл (прочитанное, не выданное); `.zst` == потреблённые сжатые байты (независимый счётчик под тем же декодером); валидный hint / откат / сдвиг по seq — в названных границах | `events_scanned × 64`; байты только выданных кадров; счёт в вызывателе; распакованные байты у `.zst`; чтение файла целиком при сдвиге (`b7`) | транспорт | COMPILE-RED (`payload_bytes_read`) |
 | `w1` | `crates/gateway/tests/red_m89_warm_resume_seek.rs` | первый pump после тёплого resume: `events_scanned ≤ хвост+64`, `rchar ≤ хвост+2 МиБ`, отношение 200k/2k ≤ 2.0; снимок = независимая свёртка; второй тик дёшев | «читать с header_end» (сегодня); «hint без гарда» — ловит `d7`; «считать честно, читать всё» — `rchar` | транспорт; время | RUNTIME-RED (`200 500` при хвосте 500) |
-| `p1` | там же | `payload_bytes_read` pump'а ∈ `[tail_bytes, rchar]` | литерал / 0 / опись | транспорт | RUNTIME-RED (`0`) |
+| `p1` | там же | `payload_bytes_read` pump'а ∈ `[tail_bytes, rchar]` (согласованность с ядром на прод-пути; точность — `b1`…`b7`) | литерал / 0 / опись | транспорт | RUNTIME-RED (`0`) |
 | `d1` | там же | курсор = первое событие сегмента: позиция «после первого кадра» находится | особый случай ⇒ откат | — | зелен (страж границы; префикс 1 событие) |
 | `d2` | там же | пустой хвост: `events_scanned ≤ 64`, `rchar ≤ 2 МиБ`, снимок = эталон | «нет хвоста ⇒ прочитать всё» | — | RUNTIME-RED |
 | `d3` | там же | курсор в ЗАКРЫТОМ сыром сегменте, хвост через ротацию | сдвиг только для активного | `.zst` | RUNTIME-RED |
 | `d4` | там же | `.zst`: корректность и «не хуже одного сегмента» | пропуск событий на `.zst` | стоимость `.zst` (предел) | зелен (страж) |
 | `d6` | там же | рваный кадр: тик = хвост, без перескана; дописанный кадр — ровно один раз | откат в `header_end` на рваном; дубль | — | RUNTIME-RED |
-| `d7`/`d7b` | там же | порча за курсором / через 5 кадров ⇒ `Err`, курсор стоит | ресинк, перепрыгивающий порчу | — | зелены (стражи fail-closed) |
+| `d7`/`d7b`/`d7c` | там же | порча за курсором / через 5 кадров / в СЕРЕДИНЕ хвоста (`TAIL/2`, N1) ⇒ `Err`, курсор стоит, как независимый `gateway::snapshot` | ресинк, перепрыгивающий порчу; EOF после ошибки кадра глубже 16 кадров | — | зелены (стражи fail-closed; без порчи — SETUP) |
 | `d8` | там же | две сессии из одного слепка: обе ограничены и идентичны | общее состояние сессий | — | RUNTIME-RED |
 | `d9` | там же | `:ro`-каталог: работает, ничего не пишет | sidecar/индекс | root-окружение (страж setup) | RUNTIME-RED |
-| `s1` | `crates/gateway-serve/tests/red_m89_structural_bound.rs` | допущенный WS-запрос на прод-форме ≤ `ckpt + tail·4 + 2 МиБ` по `rchar` | любая работа ∝ префиксу | время; параллелизм | RUNTIME-RED |
-| `v` | `crates/gateway-serve/tests/red_m89_read_volume_truth.rs` | счётчик выдачи ≥ `ckpt + tail`, ≤ `rchar` | отброшенные `ReadStats` pump'а; опись без активного | — | RUNTIME-RED |
+| `s1`/`s2` | `crates/gateway-serve/tests/red_m89_structural_bound.rs` | допущенный запрос на прод-форме ≤ `ckpt + tail·4 + 2 МиБ` по `rchar` — v1 (`subscribe`, кадр из push-цикла) И legacy (молчание в grace, OLD wire, дренаж до снимка; страж: курсор снимка = последнее событие) | любая работа ∝ префиксу на любом из входов | время; параллелизм | RUNTIME-RED (v1: 10 547 492 Б при пороге 2 349 577; legacy — тем же, замер мутацией порядка) |
+| `v` | `crates/gateway-serve/tests/red_m89_read_volume_truth.rs` | счётчик выдачи ≥ `ckpt + tail`, ≤ `rchar` И `== R + P1 + n·P2` реплики того же пути (`LiveReducer::resume` + `pump(256)` ×2) | отброшенные `ReadStats` pump'а; опись без активного; `events_scanned × 64` в транспорте; дубликат счётчика при мёртвом `payload_bytes_read()` | точность самих чисел (`b1`…`b7`) | RUNTIME-RED (`154 563` < `179 025`) |
 | `i1`/`i2` | `crates/gateway-serve/tests/red_m89_counters_instance.rs` | изоляция экземпляров; ручка кормится реальным путём | ручка = процессный счётчик; ручка-нули | — | COMPILE-RED (`counters_handle`, `ServingCountersHandle`; два E0277 — следствие неизвестного типа, не дефект набора) |
-| сторож | `crates/gateway-serve/tests/red_m89_serial_guard.rs` | `#[tokio::test]` == `SERIAL.lock().await` в `red_m87_entrypoint.rs`, пока `SERIAL` объявлен | снять одну блокировку | смысл требования | зелен (14 == 14) |
-| `h0` | `crates/gateway-serve/tests/red_m89_heartbeat_entrypoint.rs` | compose объявляет путь на rw-монтировании ≠ журнал/слепки | переменной нет; `:ro`; `/journal` | установка на VPS | RUNTIME-RED |
-| `h1` | там же | прод-бинарь на окружении из compose пишет файл за период; JSON целый при каждом чтении; после выдачи значения растут | нет файла; `fs::write` (вероятностно); константы | правдивость `freshness` | RUNTIME-RED |
-| `g1`…`g5` | `crates/ops/tests/red_m89_serving_silence.rs` | отсутствие/несвежесть/молчание по дельтам; якорь и дедуп в состоянии; бинарь читает env-путь | детектор-молчун; детектор-крикун; якорь в памяти процесса | установка cron | COMPILE-RED (типов нет); `g5` — RUNTIME-RED и без них |
+| сторож + `m1`…`m6` | `crates/gateway-serve/tests/red_m89_serial_guard.rs` | для КАЖДОГО `#[tokio::test…]` в `red_m87_entrypoint.rs` первая исполняемая строка тела — `let _serial = SERIAL.lock().await;` (пока `SERIAL` объявлен), нарушители названы; счёт — вторым стражем; мутанты сторожа в файле | переставить строку (названа `c6`); убрать в одном + удвоить в другом при равном счёте (названа `c9`) | смысл требования | зелен (14 тестов, 7 passed) |
+| `h0` | `crates/gateway-serve/tests/red_m89_heartbeat_entrypoint.rs` | compose объявляет ПУТЬ К ФАЙЛУ на rw-монтировании ≠ журнал/слепки, том объявлен в `volumes:`, период валиден, хост-путь == cron | переменной нет; `:ro`; `/journal`; `/state/`, `/state`, пустой лист (мутация compose — краснеет по форме); разъезд с cron | установка на VPS | RUNTIME-RED (переменной нет) |
+| `h1` | там же | прод-бинарь на окружении из compose с ТОЧНЫМ путём compose, отображённым на фикстуру-монтирование, создаёт файл за период; JSON целый при каждом чтении; `.tmp` не задерживается; значения растут после выдачи; хост-путь фикстуры == cron | нет файла; `fs::write` (вероятностно); константы; подмена пути | правдивость `freshness`; доказательность атомарности (опрос) | RUNTIME-RED (переменной нет ⇒ отобразить нечего; далее — бинарь не пишет) |
+| `g1`…`g5` | `crates/ops/tests/red_m89_serving_silence.rs` | три состояния входа (`Disabled` молчит / `ConfiguredMissing` CRITICAL / `Present` молчит); несвежесть; молчание по дельтам; склейка: якорь и дедуп в состоянии, `ConfiguredMissing` не стирает якорь, `Disabled` не трогает ничего; `run_cycle ≡ run_cycle_full(Disabled)` исполнением (`g4b`) при `ConfiguredMissing` ⇒ MISSING на том же входе (`g4c`); бинарь: путь задан, файла нет ⇒ MISSING (исполняемый `ConfiguredMissing`), старый ⇒ STALE, свежий ⇒ тишина | детектор-молчун; детектор-крикун; `Default ≠ Disabled`; бинарь передаёт `Disabled`; якорь в памяти процесса | установка cron | COMPILE-RED (типов нет); `g5` — RUNTIME-RED и без них |
+| `p1`…`p9`, `t1`…`t10`, `c1`…`c5` | `scripts/tests/red_verify_M-89_scan.sh` | шаги `verify`: task11 (форма пути: корень, `/`, `.`, `:ro`, разъезд, нет cron, вне монтирований), task5 (сканер: `type`, `use`, блочные/строчные комментарии, `\b`, подкаталоги, имя файла:строки), CI-паритет (новый `run:`/`- run: |` ⇒ FAIL и назван; исчезнувший ⇒ протух; пустой ci.yml ⇒ FAIL) | прежние формы шагов (префиксная проверка пути; `struct|enum|trait` + только `//`; три команды вместо таблицы) | правдивость причин waiver'ов | зелен (24/24) |
 
 **Стражи setup на каждом сценарии:** один сегмент (прод-форма), префикс ≥ 100× хвоста, хвост
 непуст, `resume` не читал журнал, кадры пришли, `/proc/self/io` доступен, ротация/компакция
-состоялись, uid ≠ 0 для `d9`, бинарь собран для `h1`/`g5`.
+состоялись, uid ≠ 0 для `d9`/`j7`, бинарь собран для `h1`/`g5`, порча ловится независимым путём
+(`j5`/`d7*`), дыра в нумерации построена (`f1`), кадры разного размера (`b*`), независимый разбор
+доходит до EOF (`b*`), legacy-снимок дренирован до последнего события (`s2`), реплика тёплая (`v`).
+
+**Мутационный контроль круга 2 предъявлен сырым выводом в `docs`-отчёте архитектора
+(`scratchpad/m89-r2-report.md` → Handoff):** legacy-первым (N3), compose `/state/` и позитивный
+контроль (R3), `SERIAL` переставлен / удалён+удвоен (N4), порча не нанесена ⇒ SETUP (`d7c`, `j5b`),
+мутация эталона `seq > a+1` роняет `j8` (N2), проба `red_verify_M-89_scan.sh` 24/24 (R5, N3-сканер,
+R3-task11). COMPILE-RED оракулы (`f*`, `b*`, `g*`, `i*`) — мутанты названы в таблице, прогон — в
+Done Block dev'а (§11 п. 11).
 
 **Зависимого эталона нет:** `gateway::snapshot` через `journal::stream` не делит с предметом
 ни слепок, ни hint, ни позиционирование; `rchar` ведёт ядро.
@@ -442,13 +549,31 @@ next.first_seq`, позвать `locate_after_seq`, передать резул�
 ## 15. Acceptance — `scripts/verify_M-89.sh`
 
 Агрегатор с FAIL-счётчиком, решение по коду возврата, финальная `VERDICT: PASS|FAIL`, ≥ 1
-проверка на задачу. Паритет с CI (`gates.md` §3): `cargo fmt --all -- --check` ·
-`cargo clippy --all-targets --all-features -- -D warnings` · `cargo test --all` — плюс
-`cargo test` В ФОРМЕ CI (без `--features`) на файлах, у которых под флагом другой состав.
-Шаг `task-status` перенесён из `verify_M-87.sh` с исправлениями `TD-221` (регэксп
-`[0-9]+(б|bis)?`, строки `🟡` проверяются наравне с `⏳ OPEN`); проба —
-`scripts/tests/red_verify_M-89_task_status.sh`. Шаг «композиция» сверяет путь compose ↔ cron.
-**SKIP-шаг прод-замера** (задача 12) печатается явно и не зеленеет сам.
+проверка на задачу. Шаг `task-status` перенесён из `verify_M-87.sh` с исправлениями `TD-221`
+(регэксп `[0-9]+(б|bis)?`, строки `🟡` проверяются наравне с `⏳ OPEN`); проба —
+`scripts/tests/red_verify_M-89_task_status.sh`. Шаг task11 сверяет путь compose ↔ cron и ФОРМУ
+пути (файл, не каталог); шаг task5 — сканер запрещённых имён в любой форме кода; оба под пробой
+`scripts/tests/red_verify_M-89_scan.sh`. **SKIP-шаг прод-замера** (задача 12) печатается явно и
+не зеленеет сам.
+
+**Паритет с CI (`gates.md` §3, `C-260` R5) — ТАБЛИЦА, а не три команды.** Каждый `run:` из
+`.github/workflows/ci.yml` (54 на ревизии набора, включая `- run: |` агрегата) имеет ровно одну
+строку таблицы `CI_MAP` в `verify_M-89.sh`: `EXEC` — шаг исполняется здесь (базовая тройка;
+`cargo audit`; `verify_delivery_M-08.sh` в структурной форме `HFT_DELIVERY_DEEP=0` — сборка
+образа только в CI; `check_{roadmap_sync,secret_material,protected_artifacts,archived_refs,
+docs_freeze,artifact_ids,gate_meta,context_budgets,resource_oracles,review_fa,
+rollout_composition}.sh` и `verify_{contracts,ct_rfc_atomic,design_claims}.sh`,
+`diff_contract_schema.sh`, `deploy_catchup.py`/`check_deploy_gate.py`, `check_branch_health.sh ||
+true`, `git fetch` спас-рефов — переменные события заменены локальной базой `merge-base
+origin/main HEAD`), либо `WAIVER:<предикат>` с причиной по тронутой зоне — предикат исполняется и
+краснеет, когда waiver недействителен (`w_harness_untouched`: пробы `red_*.sh` чужих барьеров —
+пока `scripts/check_*.sh`, `scripts/lib`, чужие `scripts/tests`, `.githooks`, `.github/workflows`
+не тронуты; `w_tool_cargo_audit`/`w_py_*`: шаги установки — пока инструмент доступен;
+`w_ci_plumbing`: шаг базы события и агрегат `All checks passed`). Сверка таблицы с `ci.yml`
+МЕХАНИЧЕСКАЯ в обе стороны (новый `run:` без строки ⇒ FAIL; строка без `run:` ⇒ FAIL) и под
+пробой (`c1`…`c5`). Дополнительно `verify_design_claims.sh --merge-preview origin/main`
+(`gates.md` §8). Шаг `check_review_fa.sh` красен до появления `R-NNN` — это ожидаемая часть
+красной базовой линии, зеленеет на close-out.
 
 **Базовая линия снимается КРАСНОЙ** и печатается в Handoff.
 
@@ -465,6 +590,13 @@ next.first_seq`, позвать `locate_after_seq`, передать резул�
 | `red_frames_seek_bound.rs`, `red_tick_read_cost.rs`, `red_tail_cursor_prod_form.rs`, `red_hint_pos_guard.rs`, `red_segment_meta_bound.rs` | hint, тик, каталог | НЕ ЗАТРАГИВАЮТСЯ; обязаны остаться зелёными — это и есть D-1(б) `A-037` для библиотеки |
 | `crates/journal/tests/**` | формат, пол, монотонность | НЕ ЗАТРАГИВАЮТСЯ; зелены |
 | `red_ops_watchdog_cycle.rs` (12 литералов `CycleInputs`) | склейка recorder-heartbeat | НЕ ЗАТРАГИВАЮТСЯ — форма §4.3 аддитивна намеренно |
+| `red_m89_serving_silence.rs` (круг 1) | `Option`-вход | **ПЕРЕПИСАН кругом 2** (`C-260` R1): три состояния, `g4b` равенство исполнением, `g4c`, `g5` (1) — исполняемый `ConfiguredMissing` |
+| `red_m89_heartbeat_entrypoint.rs` (круг 1) | префиксная проверка пути; подмена пути в `h1` | **ПЕРЕПИСАН кругом 2** (`C-260` R3): форма файла, объявленный том, период, точный путь compose на фикстуре-монтировании, `.tmp`, равенство cron |
+| `red_m89_read_volume_truth.rs` (круг 1) | интервал `[ckpt+tail, rchar]` | **ДОПОЛНЕН кругом 2** (`C-260` R4): равенство дельте реплики `R + P1 + n·P2` |
+| `red_m89_serial_guard.rs` (круг 1) | равенство счётчиков | **ПЕРЕПИСАН кругом 2** (`C-260` N4): по-функционная лексическая проверка + `m1`…`m6` |
+| `red_m89_structural_bound.rs` (круг 1) | v1-вход | **ДОПОЛНЕН кругом 2** (`C-260` N3): `s2` legacy-вход |
+| `red_m89_warm_resume_seek.rs` (круг 1) | порча `k=0`/`k=5` | **ДОПОЛНЕН кругом 2** (`C-260` N1): `d7c` порча `TAIL/2` |
+| `crates/journal/tests/red_m89_{seek_contract,seek_fallback_observed,bytes_accounting}.rs` | — | **НОВЫЕ кругом 2** (`C-260` R2/R4/N2): договор на публичной точке, наблюдаемый откат, точный учёт байт |
 
 ## 17. Предъявление FA — живые инварианты тронутых модулей
 
@@ -483,9 +615,11 @@ next.first_seq`, позвать `locate_after_seq`, передать резул�
 
 ## 18. Handoff
 
-После коммита набора — **critic обязателен**: новая milestone-спека (`gates.md` §9), оценка
-≥ 5 коммитов (§1 п. 3), **и RAW-гейт на СИЛЬНОЙ модели** (§1: задачи 1–2 меняют путь чтения
-журнала — `crates/journal/src/segments.rs`). Мандат критику называет повышение явно.
+После коммита набора — **critic обязателен, круг 2**: круг 1 дал `C-260` REJECT (R1–R5,
+N1–N4), правки — этот набор; нормативные секции спеки изменены (§4.1, §4.3, §5.2, §5.3, §9,
+§10, §14, §15) ⇒ форма, критик (`gates.md` §9), оценка ≥ 5 коммитов (§1 п. 3), **и RAW-гейт
+на СИЛЬНОЙ модели** (§1: задачи 1–2 меняют путь чтения журнала — `crates/journal/src/segments.rs`).
+Мандат критику называет повышение явно и передаёт `C-260` + этот набор + отчёт с мутациями.
 
 **`risk-critic` НЕ требуется:** `crates/risk`, `crates/killswitch`, `crates/oms`,
 `crates/venue-*` и ордерный путь не затронуты (§12).
@@ -504,3 +638,9 @@ architect (задача 7) → tester → reviewer (§8-гейт с прод-з�
 - `docs/fa/journal.md` `JR-I-2`, `JR-I-11` · `docs/fa/viz-backend.md` `VB-I-2/10/11` ·
   `docs/fa/ops.md` `OPS-I-6/8/10` · `docs/DESIGN.md` §22 `PL-I-4/5/8`
 - `docs/PENDING-SIGNATURE.md` `П-020` (предел ответа), `П-029` (семь полос)
+
+## 20. Журнал кругов
+
+| круг | вердикт | предмет | что изменено |
+|---|---|---|---|
+| 1 | `C-260` **REJECT** (critic, RAW-гейт, `2fabb67`) | R1 `Option`-вход ops кодировал два состояния одним `None`; R2 публичный `locate_after_seq` без оракула — заглушка проходила греп; R3 путь сердцебиения принимал каталог, `h1` подменял путь; R4 счётчик байт держался интервалом — `events_scanned×64` проходил; R5 CI-паритет без таблицы; N1 порча только `k≤5`; N2 `stream_from_at` не назван; N3 legacy-вход и сканер task5; N4 сторож `SERIAL` считал, а не привязывал | круг 2 (этот набор): §4.1/§4.3/§5.2/§5.3/§7/§9/§10/§11/§12/§13/§14/§15/§16/§18; новые `crates/journal/tests/red_m89_*.rs` ×3; переписаны `red_m89_{serving_silence,heartbeat_entrypoint,serial_guard}.rs`; дополнены `red_m89_{read_volume_truth,structural_bound,warm_resume_seek}.rs`; `verify_M-89.sh` (таблица CI, сканер, task11-форма, режимы пробы) + `red_verify_M-89_scan.sh` |
