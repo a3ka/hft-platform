@@ -381,6 +381,10 @@ else
 fi
 run_test "task1/договор" "red_m89_seek_contract (j1..j9: after+1, закрытый сегмент, EOF, порча, рваный, :ro, N2-эквивалентность)" -p journal --test red_m89_seek_contract
 run_test "task1/откат" "red_m89_seek_fallback_observed (f1..f5: seek_fallbacks)" -p journal --test red_m89_seek_fallback_observed
+# `A-042` §4 (в)/(г): стык сегментов судится ПРОТИВ ПОЛНОГО КАТАЛОГА — правый край прочитанного
+# сегмента против first_seq физического преемника, левый край открытого против его шапки.
+# n1..n4 красны ПОВЕДЕНЧЕСКИ (Ok через дыру вместо Err), n5 — позитивный контроль.
+run_test "task1/стык" "red_m89_seek_junction (n1..n4: дыра в каталоге ⇒ Err(InvalidData); n5: законная проекция через исключённый сегмент)" -p journal --test red_m89_seek_junction
 run_test "task1/байты" "red_m89_bytes_accounting (b1..b7: точный учёт payload_bytes_read)" -p journal --test red_m89_bytes_accounting
 # Sacred-корпус journal — БЕЗ файлов этого набора (`red_m89_*` красны по заявлению, в т.ч.
 # компиляцией; их судят три шага выше). `cargo test -p journal` целиком не годится: один
