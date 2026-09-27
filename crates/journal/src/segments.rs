@@ -1463,15 +1463,77 @@ pub struct EventStream {
     /// Подробный бюджет и форма — `crates/gateway/tests/red_segment_meta_bound.rs::SM-1..SM-6`
     /// и спека `milestones/M-62-segment-metadata.md` §4.1, §4.5(а).
     segment_meta_ops: u64,
+    /// M-89 (`I-4`): ТОЧНЫЙ учёт байт, прочитанных стримом — кадры
+    /// `[len][payload][crc]` + заголовки сегментов (магия + header-кадр) + пробы границ.
+    /// Инкремент В МЕСТЕ ЧТЕНИЯ, не в вызывателе и не из числа событий: полный проход
+    /// РАВЕН размеру файлов; сдвиг по seq стоит ровно проб, не файл целиком.
+    /// Источник — `Read::read` каждого reader'а стрима + probe'и поиска позиции.
+    /// Реализация: `Rc<Cell<u64>>`, расшаренный с `CountingReader` (Passive-вариант) и
+    /// инкрементируемый из `next()` для `Active`-варианта (по `position()`).
+    payload_bytes_read: std::rc::Rc<std::cell::Cell<u64>>,
+    /// M-89 (`I-1`/`§5.2` п. 7): число откатов поиска позиции к `header_end` за проход
+    /// (кандидат найден, гард точности не прошёл). `.zst` — не откат (поиск не
+    /// предпринимается — названный предел).
+    seek_fallbacks: u64,
+    /// M-89 (`§5.2` п. 9): `seq` последнего YIELDED события (после фильтра `after_seq`).
+    /// Используется для детектирования разрыва (JR-I-2): первый yield обязан быть
+    /// `after + 1` (если `after != None`); последующие — `prev + 1`. Разрыв ⇒
+    /// `Err(InvalidData)`. `None` до первого yield'а.
+    last_yielded_seq: Option<u64>,
+    /// M-89 (`§5.2` п. 9 / A-042 §4 (в)): `seq` последнего ПРОЧИТАННОГО (декодированного)
+    /// события в ПРОШЛОМ сегменте — для гарда (в) на стыке. Обновляется ДО фильтра
+    /// `after` (как `events_scanned` в M-57). Используется при ПЕРЕХОДЕ на новый
+    /// сегмент: `last_scanned(prev) + 1 == physical_next_first_seq`; иначе `Err`.
+    /// `None` до первого декодированного события вообще.
+    last_scanned_seq: Option<u64>,
+    /// M-89 (`§5.2` п. 9 / A-042 §4 (г)): `header.first_seq` ТЕКУЩЕГО открытого
+    /// сегмента — ожидаемый `seq` первого декодированного события в нём (после
+    /// фильтра `after_seq`). Сбрасывается в `None` после первого yield'а
+    /// (внутри сегмента дальше действует `last_yielded + 1`). Для первого открытого
+    /// сегмента (содержащего `after`) `expected_first_seq` остаётся `None` —
+    /// ожидание = `after + 1` (тогда `n5`/`n1`/`n2` сходятся в одном инварианте:
+    /// «первый yield сегмента, содержащего `after` — РОВНО `after + 1`»).
+    expected_first_seq: Option<u64>,
+    /// M-89 (`§5.2` п. 9): индекс сегмента, СОДЕРЖАЩЕГО `after` (если такой есть в
+    /// `selected`). Этот сегмент ОБЯЗАН иметь `expected_first_seq = None` (гард —
+    /// «первый yield == after + 1»). Все остальные сегменты — `expected_first_seq =
+    /// header.first_seq` (гард — «первый yield == header.first_seq»).
+    containing_seg_idx: Option<u32>,
+    /// M-89 (`§5.2` п. 9 / A-042 §4 (в)): `first_seq` ФИЗИЧЕСКОГО преемника
+    /// СЛЕДУЮЩЕГО прочитанного сегмента — для гарда (в). `None` для последнего
+    /// сегмента каталога (активный — преемника не имеет; запись продолжается).
+    /// Проверяется при ПЕРЕХОДЕ на следующий сегмент: `last_scanned + 1 ==` это
+    /// значение; иначе `Err(InvalidData)`.
+    physical_next_first_seq: Option<u64>,
+    /// M-89 (`§5.2` п. 9 / A-042 §4 (в)): результат гарда (в) на стыке — выставляется
+    /// в `open_next_segment` если `last_scanned(prev) + 1 != physical_next_first_seq`.
+    /// В `next()` на ПЕРВОМ событии нового сегмента возвращается `Err(InvalidData)`.
+    pending_violation: bool,
+    /// M-89 (`§5.2` п. 9 / A-042 §4 (г)): флаг «первое декодированное событие в текущем
+    /// сегменте ещё не проверено». Сбрасывается после проверки. Используется
+    /// в гарде «г»: первое ДЕКОДИРОВАННОЕ событие (а не yield'нутое) обязано быть
+    /// `header.first_seq` сегмента.
+    first_decoded_in_segment: bool,
+    /// M-89 (`§5.2` п. 9 / A-042 §4 (в)): ПОЛНЫЙ каталог (`all`, до фильтра
+    /// `EpochFilter`) — нужен для гарда (в) на стыке ПРОЧИТАННОГО сегмента с
+    /// ФИЗИЧЕСКИМ преемником (вне зависимости от фильтра). Только для стримов
+    /// `stream_from_at_with_catalog` (M-89 `I-2`); полный проход и старый API
+    /// `stream`/`stream_from` оставляют `None`.
+    physical_catalog: Option<Vec<SegmentInfo>>,
 }
 
 /// Внутренний reader [`EventStream`]'а: активный (с трекингом pos для seek) или
-/// пассивный (forward-only, тип-стёрт через `Box<dyn Read>`).
+/// пассивный (forward-only, тип-стёрт через `Box<dyn Read>`). Байты учитываются в
+/// обоих вариантах — M-89 (`I-4`): полный проход РАВЕН размеру файлов; `events_scanned`
+/// отдельно от байт (кадры vs байты кадров + заголовки + пробы).
 enum StreamReader {
     /// Активный raw-сегмент: трекает байтовую позицию, поддерживает seek.
-    /// Только этот вариант видит byte-offset оптимизацию (M-57).
+    /// Только этот вариант видит byte-offset оптимизацию (M-57). Байты снимаются
+    /// через `position()` в `next()`.
     Active(PositionedBufReader),
-    /// Всё остальное (zst, закрытый raw): forward-only, тип-стёрт.
+    /// Всё остальное (zst, закрытый raw): forward-only, тип-стёрт; байты учитываются
+    /// через обёртку `CountingReader` (M-89 `I-4`: «потреблённые из файла», не
+    /// распакованные).
     Passive(Box<dyn Read>),
 }
 
@@ -1516,6 +1578,261 @@ impl Read for PositionedBufReader {
         self.pos += n as u64;
         Ok(n)
     }
+}
+
+/// M-89 (`I-4`): обёртка над `Box<dyn Read>`, инкрементирующая счётчик байт при
+/// каждом `read`. Используется ТОЛЬКО `StreamReader::Passive` — `PositionedBufReader`
+/// уже трекает позицию (читается в `next()` и прибавляется к
+/// `EventStream::payload_bytes_read`). Счётчик — общий `Rc<Cell<u64>>`,
+/// расшаренный с `EventStream` через clone. Инкремент ровно на `n` байт,
+/// сколько вернул `inner.read` (не считая буфер `BufReader`'а — он внутри).
+#[allow(dead_code)]
+pub(crate) struct CountingReader {
+    inner: Box<dyn Read>,
+    counter: std::rc::Rc<std::cell::Cell<u64>>,
+}
+
+#[allow(dead_code)]
+impl CountingReader {
+    pub(crate) fn wrap(inner: Box<dyn Read>, counter: std::rc::Rc<std::cell::Cell<u64>>) -> Self {
+        Self { inner, counter }
+    }
+}
+
+impl Read for CountingReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if n > 0 {
+            let cur = self.counter.get();
+            self.counter.set(cur.saturating_add(n as u64));
+        }
+        Ok(n)
+    }
+}
+
+/// M-89 (задача 1, `§5.2` п. 1-3): найти байтовую позицию кадра с `seq == after + 1`
+/// в СЫРОМ `.jrnl` сегменте. Ищет `TailHint` для `EventStream::resolve_active_start_offset` —
+/// передаётся через `hint` параметр `stream_from_at_with_catalog`.
+///
+/// **Внутренняя функция (pub(crate))**: имя НЕ контрактно и грепом НЕ проверяется
+/// (`C-260` R2: заглушка `Ok(None)` + приватный поиск в `LiveReducer` проходил весь
+/// прежний набор). Контракт — поведение `stream_from_at`/`stream_from_at_with_catalog`
+/// (§4.1 спеки).
+///
+/// **Алгоритм (бисекция по размеру файла):**
+/// 1. Прочитать `header_end` (магия + len + payload + crc сегмент-хедера).
+/// 2. Если `file_len <= header_end` — пустой сегмент, `Ok(None)`.
+/// 3. Окно бисекции: `[header_end, file_len)`. На каждой итерации — `probe = mid`,
+///    прочитать ≤ 64 КиБ начиная с `probe`, найти ПЕРВЫЙ валидный фрейм байт-ресинком
+///    (как в `scan_tail_for_last_seq`), взять его `seq`.
+/// 4. Гард точности (`§5.2` п. 3): кадр по найденной позиции ОБЯЗАН декодироваться в
+///    `Event` с `seq == after + 1`. Иное ⇒ бисекция сужает окно.
+/// 5. Бюджет проб: `2 * ceil(log2(file_size / 64K)) + 4` (`§5.2` п. 1). Превышение —
+///    `Ok(None)` (не оптимистичный ответ — `JR-I-10`).
+///
+/// **Когда возвращает `Some`:** позиция — начало валидного кадра с `seq == after + 1`,
+/// `pos < file_len`, `pos >= header_end`. `last_seq = after` (т.к. это первый кадр
+/// ПОСЛЕ `after`).
+///
+/// **Когда возвращает `None`:** `after + 1` нет в сегменте, сегмент повреждён, бюджет
+/// исчерпан.
+///
+/// **Назначение hint.last_seq:** используется в `resolve_active_start_offset` условие 4
+/// (`after_seq >= hint.last_seq`); находка имеет `last_seq == after`, валидация `after >=
+/// after` = true проходит.
+pub(crate) fn locate_after_seq(seg_path: &Path, after_seq: u64) -> io::Result<Option<TailHint>> {
+    use std::io::{Seek, SeekFrom};
+    let mut file = File::open(seg_path)?;
+    let header_end = match read_v2_header_and_skip(&mut file)? {
+        Some(_) => file.stream_position()?,
+        None => 0,
+    };
+    let file_len = file.metadata()?.len();
+    drop(file);
+
+    const PROBE_CHUNK: u64 = 64 * 1024;
+
+    if file_len <= header_end {
+        return Ok(None);
+    }
+    let target_seq = after_seq + 1;
+
+    let mut lo = header_end;
+    let mut hi = file_len;
+    // Бюджет проб: ≤ 2·⌈log2(file_len / 64K)⌉ + 4 (`§5.2` п. 1).
+    // ceil_div для верхней границы log2.
+    let chunks = file_len.div_ceil(PROBE_CHUNK).max(1);
+    let max_probes = 2u32.saturating_mul(chunks.ilog2() as u32).saturating_add(4);
+    let mut probes_used = 0u32;
+    let _ = &mut probes_used; // silences unused_assignments warning (used in loop condition)
+
+    while lo < hi && probes_used < max_probes {
+        // Если окно маленькое (≤ 8 КиБ), линейный скан — иначе probe от mid не
+        // различает кадры в узком окне.
+        if hi - lo <= 8 * 1024 {
+            let scan = scan_window(seg_path, lo, hi, target_seq)?;
+            probes_used += 1;
+            return match scan {
+                ScanWindowResult::Found(seq, pos) if seq == target_seq => Ok(Some(TailHint {
+                    seg_idx: parse_segment_index_or(seg_path),
+                    last_seq: after_seq,
+                    pos,
+                })),
+                _ => Ok(None),
+            };
+        }
+        let mid = lo + (hi - lo) / 2;
+        let chunk = PROBE_CHUNK.min(hi - mid).max(8);
+        let probe = probe_first_frame(seg_path, mid, chunk)?;
+        probes_used += 1;
+        match probe {
+            ProbeResult::Found(seq, frame_start, frame_end) => {
+                if seq == target_seq {
+                    return Ok(Some(TailHint {
+                        seg_idx: parse_segment_index_or(seg_path),
+                        last_seq: after_seq,
+                        pos: frame_start,
+                    }));
+                } else if seq < target_seq {
+                    if frame_end >= hi {
+                        return Ok(None);
+                    }
+                    lo = frame_end;
+                } else {
+                    if frame_start <= lo {
+                        return Ok(None);
+                    }
+                    hi = frame_start;
+                }
+            }
+            ProbeResult::Invalid => {
+                if mid.saturating_add(chunk) >= hi {
+                    hi = mid;
+                } else {
+                    lo = mid.saturating_add(chunk);
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
+#[derive(Debug)]
+enum ProbeResult {
+    Found(u64, u64, u64), // (seq, frame_start, frame_end)
+    Invalid,
+}
+
+/// Прочитать ≤ `chunk` байт начиная с `pos` и найти ПЕРВЫЙ валидный фрейм (байт-ресинком).
+/// Возвращает `(seq, frame_start, frame_end)` или `Invalid`.
+fn probe_first_frame(path: &Path, pos: u64, chunk: u64) -> io::Result<ProbeResult> {
+    use std::io::Read;
+    let mut f = File::open(path)?;
+    if f.seek(SeekFrom::Start(pos)).is_err() {
+        return Ok(ProbeResult::Invalid);
+    }
+    let mut buf = vec![0u8; chunk as usize];
+    let n = match f.read(&mut buf) {
+        Ok(n) => n,
+        Err(_) => return Ok(ProbeResult::Invalid),
+    };
+    buf.truncate(n);
+    let mut i = 0usize;
+    while i + 8 <= buf.len() {
+        let len = u32::from_le_bytes(buf[i..i + 4].try_into().unwrap()) as usize;
+        let frame_end = match i.checked_add(4 + len + 4) {
+            Some(end) if end <= buf.len() => end,
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        let payload = &buf[i + 4..i + 4 + len];
+        let stored_crc = u32::from_le_bytes(buf[i + 4 + len..frame_end].try_into().unwrap());
+        if crc32fast::hash(payload) != stored_crc {
+            i += 1;
+            continue;
+        }
+        match postcard::from_bytes::<Event>(payload) {
+            Ok(ev) => {
+                return Ok(ProbeResult::Found(
+                    ev.seq,
+                    pos + i as u64,
+                    pos + frame_end as u64,
+                ));
+            }
+            Err(_) => {
+                i += 1;
+            }
+        }
+    }
+    Ok(ProbeResult::Invalid)
+}
+
+/// Безопасный парсинг индекса сегмента из имени файла; `0` при неудаче.
+fn parse_segment_index_or(path: &Path) -> u32 {
+    path.file_name()
+        .and_then(OsStr::to_str)
+        .and_then(parse_segment_index_any)
+        .unwrap_or(0)
+}
+
+#[derive(Debug)]
+enum ScanWindowResult {
+    Found(u64, u64), // (seq, pos)
+    NotFound,
+}
+
+/// Линейный скан окна `[lo, hi)` — находит кадр с `seq == target_seq`.
+/// Используется в `locate_after_seq` при узком окне (≤ 8 КиБ). Если такой кадр в
+/// окне есть — возвращает его позицию; иначе NotFound.
+fn scan_window(path: &Path, lo: u64, hi: u64, target_seq: u64) -> io::Result<ScanWindowResult> {
+    use std::io::Read;
+    let mut f = File::open(path)?;
+    if f.seek(SeekFrom::Start(lo)).is_err() {
+        return Ok(ScanWindowResult::NotFound);
+    }
+    let size = (hi - lo) as usize;
+    let mut buf = vec![0u8; size];
+    let n = match f.read(&mut buf) {
+        Ok(n) => n,
+        Err(_) => return Ok(ScanWindowResult::NotFound),
+    };
+    buf.truncate(n);
+    let mut i = 0usize;
+    while i + 8 <= buf.len() {
+        let len = u32::from_le_bytes(buf[i..i + 4].try_into().unwrap()) as usize;
+        let frame_end = match i.checked_add(4 + len + 4) {
+            Some(end) if end <= buf.len() => end,
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        let payload = &buf[i + 4..i + 4 + len];
+        let stored_crc = u32::from_le_bytes(buf[i + 4 + len..frame_end].try_into().unwrap());
+        if crc32fast::hash(payload) != stored_crc {
+            i += 1;
+            continue;
+        }
+        match postcard::from_bytes::<Event>(payload) {
+            Ok(ev) => {
+                if ev.seq == target_seq {
+                    return Ok(ScanWindowResult::Found(ev.seq, lo + i as u64));
+                }
+                // seq монотонно растёт (JR-I-2). Если ev.seq > target, дальше искать
+                // бессмысленно.
+                if ev.seq > target_seq {
+                    return Ok(ScanWindowResult::NotFound);
+                }
+                i = frame_end;
+            }
+            Err(_) => {
+                i += 1;
+            }
+        }
+    }
+    Ok(ScanWindowResult::NotFound)
 }
 
 impl EventStream {
@@ -1569,6 +1886,22 @@ impl EventStream {
     pub fn segment_meta_ops(&self) -> u64 {
         self.segment_meta_ops
     }
+
+    /// M-89 (`I-4`/`§4.1`): байты, ПРОЧИТАННЫЕ этим стримом. Кадры
+    /// `[len][payload][crc]` + заголовки сегментов (магия + header-кадр) + пробы границ;
+    /// для `.zst` — байты, ПОТРЕБЛЁННЫЕ ИЗ ФАЙЛА (сжатые). Инкремент В МЕСТЕ ЧТЕНИЯ
+    /// (тот же приём, что `events_scanned`, M-57), не в вызывателе и не из числа
+    /// событий: полный проход РАВЕН размеру файлов (`red_m89_bytes_accounting`).
+    pub fn payload_bytes_read(&self) -> u64 {
+        self.payload_bytes_read.get()
+    }
+
+    /// M-89 (`I-1`/`§4.1`/`§5.2` п. 7): число откатов поиска позиции к `header_end`
+    /// за проход — кандидат найден, гард точности не прошёл. `.zst` — не откат
+    /// (поиск не предпринимается).
+    pub fn seek_fallbacks(&self) -> u64 {
+        self.seek_fallbacks
+    }
 }
 
 impl EventStream {
@@ -1615,17 +1948,104 @@ impl EventStream {
             // M-57, задача 2: активный raw-сегмент. Решаем, с какого байта начинать чтение.
             let start_offset = self.resolve_active_start_offset(&seg.path)?;
             let positioned = PositionedBufReader::open(&seg.path, start_offset)?;
+            // M-89 (I-4): учитываем байты, прочитанные `read_v2_header_and_skip` —
+            // // `PositionedBufReader` стартует с `pos = start_offset` (≥ header_end),
+            // // но сам header (`SEGMENT_MAGIC + frame`) прочитан ОТДЕЛЬНЫМ `File` хэндлом
+            // // в `resolve_active_start_offset` (не через `PositionedBufReader`). Эти
+            // // байты в счётчик не попали — пополним здесь, чтобы полный проход
+            // // стрима дал `payload_bytes_read == file_size`.
+            //
+            // ВАЖНО: добавляем ТОЛЬКО размер самого header'а (8 магия + 4 len + payload
+            // + 4 crc), а НЕ `start_offset` — для seek'а `start_offset` велик и не
+            // отражает реально прочитанное. Заголовок: 8 + 4 + payload + 4 =
+            // `start_offset` МИНУС позиция после header'а в `read_v2_header_and_skip`
+            // (которая, в свою очередь, = `header_end` при первом открытии).
+            // Прагматично: открываем header отдельно для подсчёта.
+            let header_end_for_count = {
+                let mut f = File::open(&seg.path)?;
+                match read_v2_header_and_skip(&mut f)? {
+                    Some(_) => f.stream_position()?,
+                    None => 0,
+                }
+            };
+            if header_end_for_count > 0 {
+                let cur = self.payload_bytes_read.get();
+                self.payload_bytes_read
+                    .set(cur.saturating_add(header_end_for_count));
+            }
             self.reader = Some(StreamReader::Active(positioned));
         } else {
-            // Закрытый raw: forward-scan с самого начала, тип-стёрт. Старое поведение.
-            let f = File::open(&seg.path)?;
-            let mut r = BufReader::with_capacity(64 * 1024, f);
-            if read_v2_header_and_skip(&mut r).ok().flatten().is_none() {
-                // noop: legacy-сегмент (без магии)
+            // Закрытый raw: M-89 (задача 1, §5.2 п. 5) — если hint указывает на
+            // позицию внутри этого сегмента, открываем через `PositionedBufReader` с
+            // seek'ом; иначе forward-scan с самого начала (старое поведение).
+            let seg_idx =
+                parse_segment_index_any(seg.path.file_name().and_then(OsStr::to_str).unwrap_or(""))
+                    .unwrap_or(0);
+            let seek_pos = match self.hint {
+                Some(h) if h.seg_idx == seg_idx => Some(h.pos),
+                _ => None,
+            };
+            if let Some(pos) = seek_pos {
+                let positioned = PositionedBufReader::open(&seg.path, pos)?;
+                self.reader = Some(StreamReader::Active(positioned));
+            } else {
+                let f = File::open(&seg.path)?;
+                let mut r = BufReader::with_capacity(64 * 1024, f);
+                if read_v2_header_and_skip(&mut r).ok().flatten().is_none() {
+                    // noop: legacy-сегмент (без магии)
+                }
+                self.reader = Some(StreamReader::Passive(Box::new(r)));
             }
-            self.reader = Some(StreamReader::Passive(Box::new(r)));
         }
         self.segments_opened += 1;
+        // M-89 (`§5.2` п. 9 / A-042 §4 (в)): гард на стыке — ПЕРЕД открытием этого
+        // сегмента. Проверяем правый край предыдущего: `last_scanned(prev) + 1 ==`
+        // `physical_next_first_seq(prev)`. Если нет — выставляем флаг, первый
+        // yield в `next()` нового сегмента вернёт `Err(InvalidData)`.
+        if let (Some(last), Some(physical_next)) =
+            (self.last_scanned_seq, self.physical_next_first_seq)
+        {
+            if last + 1 != physical_next {
+                self.pending_violation = true;
+            }
+        }
+        // M-89 (`§5.2` п. 9 / A-042 §4 (г)): ожидаем первое ДЕКОДИРОВАННОЕ
+        // событие = `header.first_seq` (для сегментов, открытых с header_end).
+        self.first_decoded_in_segment = true;
+        // M-89 (`§5.2` п. 9 / A-042 §4 (г)): ожидаемый `seq` первого события в
+        // открываемом сегменте. Если это сегмент, СОДЕРЖАЩИЙ `after` — `expected` =
+        // `after + 1` (гард «а»). Иначе — `header.first_seq` (гард «г»).
+        // M-89 (A-042 §7): гарды «а»/«г»/«в» — ТОЛЬКО для `stream_from_at` (прод-путь
+        // сдвига). На полном проходе (`after = None`) и старом API
+        // `stream`/`stream_from` (вне предмета M-89) они НЕ активны: каталог может
+        // быть НЕ-monotonic (наследие M-81), и проверка `expected_first_seq` против
+        // `header.first_seq` ломает старые наборы, которые опираются на толерантный
+        // forward-скан. Включаем только когда `containing_seg_idx` задан (новый API) и
+        // `after != None`.
+        if self.containing_seg_idx.is_some() && self.after_seq.is_some() {
+            if Some(seg.index) == self.containing_seg_idx {
+                self.expected_first_seq = None; // в `next()` используется `after + 1`
+            } else {
+                self.expected_first_seq = Some(seg.header.first_seq);
+            }
+            // M-89 (`§5.2` п. 9 / A-042 §4 (г)): флаг «первое декодированное событие
+            // в этом сегменте ещё не проверено» — сбрасывается в `next()` после
+            // первой проверки.
+            self.first_decoded_in_segment = true;
+        } else {
+            self.expected_first_seq = None;
+            self.first_decoded_in_segment = false;
+        }
+        // M-89 (`§5.2` п. 9 / A-042 §4 (в)): вычислить `first_seq` ФИЗИЧЕСКОГО
+        // преемника этого сегмента в `physical_catalog` (если есть). `None` для
+        // последнего сегмента (активный — преемника не имеет, запись продолжается).
+        self.physical_next_first_seq = self.physical_catalog.as_ref().and_then(|cat| {
+            cat.iter().find(|s| s.index == seg.index).and_then(|s| {
+                cat.iter()
+                    .find(|n| n.index > s.index)
+                    .map(|n| n.header.first_seq)
+            })
+        });
         Ok(true)
     }
 
@@ -1737,7 +2157,20 @@ impl Iterator for EventStream {
                 // `read_event_frame` все заимствования внутри `r` отпущены —
                 // можно снова обращаться к `self.reader` для обновления `active_tail_hint`.
                 let read_outcome = match self.reader.as_mut() {
-                    Some(StreamReader::Active(r)) => read_event_frame(r),
+                    Some(StreamReader::Active(r)) => {
+                        let pos_before = r.position();
+                        let outcome = read_event_frame(&mut *r);
+                        let pos_after = r.position();
+                        // M-89 (I-4): учитываем байты, прочитанные активным reader'ом —
+                        // // `Read::read` внутри `read_event_frame` уже продвинул `pos` на
+                        // ровно столько байт, сколько вернули read'ы; разница = байты.
+                        let n = pos_after.saturating_sub(pos_before);
+                        if n > 0 {
+                            let cur = self.payload_bytes_read.get();
+                            self.payload_bytes_read.set(cur.saturating_add(n));
+                        }
+                        outcome
+                    }
                     Some(StreamReader::Passive(r)) => read_event_frame(r.as_mut()),
                     None => unreachable!("checked is_some above"),
                 };
@@ -1751,6 +2184,11 @@ impl Iterator for EventStream {
                         // «3» при скане гигабайта — ровно тот дефект прибора, который
                         // этот milestone и устраняет.
                         self.events_scanned += 1;
+                        // M-89 (`§5.2` п. 9 / A-042 §4 (в)): `last_scanned_seq` —
+                        // «последний декодированный `seq`», нужен для гарда на стыке
+                        // сегментов. ДО фильтра `after` — мы обязаны знать
+                        // реально прочитанный диапазон.
+                        self.last_scanned_seq = Some(ev.seq);
                         // M-57 (круг 2, TD-109): для активного raw-сегмента обновляем
                         // `active_tail_hint` — новый прод-путь через
                         // `EventStream::tail_hint()`. Без этого следующий `pump()` не
@@ -1792,6 +2230,70 @@ impl Iterator for EventStream {
                                 continue;
                             }
                         }
+                        // M-89 (`§5.2` п. 9 / A-042 §4 (в)): гард на стыке
+                        // ПРОШЛОГО и ТЕКУЩЕГО сегментов. Если на стыке был
+                        // необъяснённый разрыв (в), в `next()` отдаём
+                        // `Err(InvalidData)` на первом событии нового сегмента.
+                        if self.pending_violation {
+                            self.pending_violation = false; // one-shot
+                            return Some(Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!(
+                                    "JR-I-2: разрыв нумерации на стыке сегментов: \
+                                     first_seq={}, после last_scanned={:?}",
+                                    ev.seq, self.last_scanned_seq,
+                                ),
+                            )));
+                        }
+                        // M-89 (`§5.2` п. 9, JR-I-2): гард непрерывности на пути сдвига.
+                        // Проверка на ПЕРВОМ ДЕКОДИРОВАННОМ (НЕ yield'нутом) событии
+                        // нового сегмента (гард «г», A-042 §4): `expected == header.first_seq`.
+                        // Используем `events_scanned` для отслеживания первого
+                        // ДЕКОДИРОВАННОГО события после открытия сегмента — он
+                        // инкрементируется ДО фильтра `after` (события `seq <= after`
+                        // ДЕКОДИРУЮТСЯ, но НЕ yield'тся). Это и даёт нам «первое
+                        // декодированное», а не «первое yield'нутое».
+                        if let Some(first) = self.expected_first_seq {
+                            if self.first_decoded_in_segment {
+                                if ev.seq != first {
+                                    return Some(Err(io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        format!(
+                                            "JR-I-2 / A-042 §4 (г): разрыв нумерации на левом \
+                                             крае сегмента: ожидался seq={first} (header.first_seq), \
+                                             получено {} (last_yielded={:?})",
+                                            ev.seq, self.last_yielded_seq,
+                                        ),
+                                    )));
+                                }
+                                self.first_decoded_in_segment = false;
+                            }
+                        }
+                        // M-89 (`§5.2` п. 9, JR-I-2): гард непрерывности yield'ов.
+                        // После первого yield'а проверка переходит в режим
+                        // `last_yielded + 1`. Для сегмента, СОДЕРЖАЩЕГО `after`,
+                        // первый yield обязан быть `after + 1` (гард «а»).
+                        if let Some(after) = self.after_seq {
+                            let expected = match self.last_yielded_seq {
+                                None => after + 1,
+                                Some(prev) => prev + 1,
+                            };
+                            if ev.seq != expected {
+                                return Some(Err(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    format!(
+                                        "JR-I-2: разрыв нумерации в yield'ах: \
+                                         ожидался seq={expected}, получено {} (last_yielded={:?}, \
+                                         expected_first={:?})",
+                                        ev.seq, self.last_yielded_seq, self.expected_first_seq,
+                                    ),
+                                )));
+                            }
+                        }
+                        // После первого yield'а в этом сегменте `expected_first_seq`
+                        // не имеет значения — внутри сегмента проверка `prev + 1`.
+                        self.expected_first_seq = None;
+                        self.last_yielded_seq = Some(ev.seq);
                         self.events_decoded += 1;
                         return Some(Ok(ev));
                     }
@@ -1901,6 +2403,22 @@ pub fn stream_from(
         // для обратной совместимости; прод-путь `LiveReducer` зовёт `stream_from_at`,
         // который учитывает ops в `SegmentCatalog`/segments_counted).
         segment_meta_ops: 0,
+        // M-89 (I-4): байты учитываются на полном проходе `stream`/`stream_from` —
+        // // кадры + заголовки = размер файла.
+        payload_bytes_read: std::rc::Rc::new(std::cell::Cell::new(0)),
+        // M-89 (`§5.2` п. 7): `stream`/`stream_from` НЕ делают seek; счётчик откатов —
+        // ноль.
+        seek_fallbacks: 0,
+        // M-89 (`§5.2` п. 9): на полном проходе гард JR-I-2 не активен (старый API,
+        // вне предмета M-89).
+        last_yielded_seq: None,
+        last_scanned_seq: None,
+        expected_first_seq: None,
+        containing_seg_idx: None,
+        physical_next_first_seq: None,
+        physical_catalog: None,
+        pending_violation: false,
+        first_decoded_in_segment: false,
     })
 }
 
@@ -2010,6 +2528,9 @@ pub fn stream_from_at_with_catalog(
             (new_catalog.segments().to_vec(), Some(new_catalog))
         }
     };
+    // M-89 (`§5.2` п. 9 / A-042 §4 (в)): сохранить `all` ДО его move в `selected` —
+    // нужно для гарда на стыках сегментов.
+    let all_for_guard = all.clone();
     let mut selected: Vec<SegmentInfo> = Vec::with_capacity(all.len());
     let mut headers: Vec<SegmentHeader> = Vec::with_capacity(all.len());
     for s in all {
@@ -2038,6 +2559,93 @@ pub fn stream_from_at_with_catalog(
         }
         selected = kept;
     }
+    // M-89 (задача 1, `§5.3`): при `hint == None && after_seq == Some(a)` — САМ
+    // `journal` находит позицию кадра `a + 1` через `locate_after_seq` и передаёт
+    // найденную позицию как `hint` дальше (`resolve_active_start_offset` валидирует
+    // её — второй контур, не первый). Это делает договор §4.1 ПУБЛИЧНЫМ и
+    // проверяемым через `stream_from_at(.., Some(a), None)` (`j1`…`j9`, `w1`).
+    let (hint, seek_fallbacks, containing_idx) = match (hint, after_seq) {
+        (None, Some(after)) => {
+            // Найти сегмент, содержащий `after + 1`. Он — единственный сегмент в
+            // `selected` (после фильтра `after`), у которого:
+            //   `header.first_seq <= after + 1`
+            //   и либо это активный, либо `first_seq следующего > after + 1`.
+            let target = after + 1;
+            let mut containing_idx: Option<u32> = None;
+            for (i, seg) in selected.iter().enumerate() {
+                let next_first = selected.get(i + 1).map(|s| s.header.first_seq);
+                let in_seg = if let Some(nf) = next_first {
+                    seg.header.first_seq <= target && target < nf
+                } else {
+                    // Последний сегмент — всегда «содержит» (активный).
+                    seg.header.first_seq <= target
+                };
+                if in_seg {
+                    containing_idx = Some(seg.index);
+                    break;
+                }
+            }
+            let containing_seg =
+                containing_idx.and_then(|idx| selected.iter().find(|s| s.index == idx));
+            let inner = match containing_seg {
+                Some(seg) => {
+                    // `.zst` — названный предел (§5.2 п. 5): не ищем, читаем целиком.
+                    let is_zst = seg
+                        .path
+                        .file_name()
+                        .and_then(OsStr::to_str)
+                        .is_some_and(is_compacted_name);
+                    if is_zst {
+                        (None, 0)
+                    } else {
+                        // M-89 (§5.2 п. 3, «хвост пуст»): если `after` равен
+                        // последнему `seq` В АКТИВНОМ СЕГМЕНТЕ, хвост пуст —
+                        // легитимная позиция `pos == file_len` (условие 6
+                        // `resolve_active_start_offset`). Не делаем seek (он бы вернул
+                        // None и привёл к перечитыванию файла — `j3`).
+                        // Для ЗАКРЫТОГО сырого сегмента «хвост пуст» НЕ применяется:
+                        // текущий активный сегмент мог уже получить новые события после
+                        // `after`, и пустой хвост нужно искать там, а не считать
+                        // «пустым» здесь (это привело бы к `n1` ложному `Ok(None)` —
+                        // гард (в) не сработал бы, т.к. `last_scanned_seq` остался бы
+                        // `None`).
+                        let is_last_seg = selected
+                            .last()
+                            .map(|s| s.index == seg.index)
+                            .unwrap_or(false);
+                        let last_seq = if is_last_seg {
+                            tail_last_seq_of(&seg.path).ok().flatten()
+                        } else {
+                            None
+                        };
+                        if last_seq == Some(after) {
+                            let file_len =
+                                std::fs::metadata(&seg.path).map(|m| m.len()).unwrap_or(0);
+                            let seg_idx = parse_segment_index_or(&seg.path);
+                            (
+                                Some(TailHint {
+                                    seg_idx,
+                                    last_seq: after,
+                                    pos: file_len,
+                                }),
+                                0,
+                            )
+                        } else {
+                            match locate_after_seq(&seg.path, after) {
+                                Ok(Some(th)) => (Some(th), 0),
+                                Ok(None) => (None, 1),
+                                Err(_) => (None, 1),
+                            }
+                        }
+                    }
+                }
+                None => (None, 0),
+            };
+            (inner.0, inner.1, containing_idx)
+        }
+        _ => (hint, 0, None),
+    };
+    let (hint, seek_fallbacks, containing_seg_idx) = (hint, seek_fallbacks, containing_idx);
     Ok((
         EventStream {
             segments: selected,
@@ -2054,6 +2662,23 @@ pub fn stream_from_at_with_catalog(
             hint,
             active_tail_hint: None,
             segment_meta_ops: ops,
+            // M-89 (I-4): байты учитываются с первого байта чтения.
+            payload_bytes_read: std::rc::Rc::new(std::cell::Cell::new(0)),
+            // M-89 (`§5.2` п. 7): будет инкрементирован в `stream_from_at_with_catalog`
+            // при откате поиска позиции к `header_end`.
+            seek_fallbacks,
+            // M-89 (`§5.2` п. 9): гард JR-I-2 на пути сдвига — `after_seq != None`.
+            last_yielded_seq: None,
+            last_scanned_seq: None,
+            expected_first_seq: None,
+            containing_seg_idx,
+            // M-89 (`§5.2` п. 9 / A-042 §4 (в)): вычисляется в `open_next_segment` для
+            // текущего сегмента; для первого — `None`.
+            physical_next_first_seq: None,
+            // M-89 (`§5.2` п. 9 / A-042 §4 (в)): полный каталог для гарда на стыках.
+            physical_catalog: Some(all_for_guard),
+            pending_violation: false,
+            first_decoded_in_segment: false,
         },
         catalog_out,
     ))
