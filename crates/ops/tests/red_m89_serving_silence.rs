@@ -13,7 +13,12 @@
 //! (б) молчание выдачи: за окно попытки ЕСТЬ, поддержанные отказы ЕСТЬ, успехов НЕТ;
 //! поток заведомо неподдержанных тревогу не держит (`M-87` §7).
 //!
-//! # Форма (спека `M-89` §4.3, задана ДОСЛОВНО — АДДИТИВНО к существующему)
+//! # Три состояния входа, а не два (`C-260` R1)
+//!
+//! Первая редакция кодировала вход как `Option<ServingHeartbeatSample>`, и `None` означал
+//! ОДНОВРЕМЕННО «интеграции нет» (legacy `run_cycle`, тревоги быть не должно) и «файл не
+//! прочитан» (тревога ОБЯЗАНА быть) — g1/g4 и g4b требовали противоположного от одного
+//! значения. Круг 2: вход — перечисление из ТРЁХ состояний:
 //!
 //! ```ignore
 //! // crates/ops/src/watchdog.rs
@@ -23,36 +28,51 @@
 //!     pub refusals_supported: u64, pub refusals_unsupported: u64,
 //!     pub journal_payload_bytes_read: u64, pub slots_in_flight: u64,
 //! }
+//! /// Вход «сердцебиение выдачи» одного такта.
+//! #[derive(Debug, Clone, Copy, PartialEq, Default)]
+//! pub enum ServingHeartbeat {
+//!     /// Интеграции нет (legacy `run_cycle`): serving-проверки НЕ исполняются, состояние
+//!     /// serving-якоря НЕ трогается. Это `Default`.
+//!     #[default]
+//!     Disabled,
+//!     /// Путь задан, файл не прочитан/не разобран ⇒ `WD-SERVING-HB-MISSING`; якорь
+//!     /// молчания НЕ сбрасывается (нечитаемый такт не стирает историю, R-005 F-1).
+//!     ConfiguredMissing,
+//!     Present(ServingHeartbeatSample),
+//! }
 //! pub enum Incident { …, ServingHeartbeatMissing, ServingHeartbeatStale, ServingSilence }
 //! //   коды: WD-SERVING-HB-MISSING · WD-SERVING-HB-STALE · WD-SERVING-SILENCE
 //! pub struct Thresholds { …, pub serving_heartbeat_warn_ms: i64, pub serving_heartbeat_crit_ms: i64 }
-//! pub fn check_serving_heartbeat_missing(hb: Option<&ServingHeartbeatSample>) -> Option<Alert>;
+//! pub fn check_serving_heartbeat_missing(hb: &ServingHeartbeat) -> Option<Alert>;
 //! pub fn check_serving_heartbeat_stale(now_ms: i64, hb: &ServingHeartbeatSample, thr: &Thresholds) -> Option<Alert>;
-//! /// Молчание — по ДЕЛЬТАМ между двумя сэмплами (окно = два такта cron'а с ненулевым
-//! /// приростом попыток), не по абсолютным числам: абсолютные растут с аптаймом.
 //! pub fn check_serving_silence(prev: &ServingHeartbeatSample, cur: &ServingHeartbeatSample) -> Option<Alert>;
 //!
 //! // crates/ops/src/watchdog_cycle.rs — `CycleInputs` НЕ меняется (12 литералов в
 //! // `red_ops_watchdog_cycle.rs`); второй вход идёт отдельной структурой:
 //! #[derive(Debug, Clone, Default)]
-//! pub struct ServingInputs { pub heartbeat: Option<ServingHeartbeatSample> }
+//! pub struct ServingInputs { pub heartbeat: ServingHeartbeat }   // Default = Disabled
 //! pub fn run_cycle_full(inputs: &CycleInputs, serving: &ServingInputs, now_ms: i64,
 //!                       thr: &Thresholds, dedup_window_ms: i64, state: &mut WatchdogState) -> CycleOutcome;
-//! // `run_cycle` остаётся и равен `run_cycle_full(.., &ServingInputs::default(), ..)`.
+//! // `run_cycle(..)` ≡ `run_cycle_full(.., &ServingInputs::default(), ..)` — `Disabled`.
 //! // crates/ops/src/state.rs: `#[serde(default)] pub prev_serving_heartbeat: Option<ServingHeartbeatSample>`
 //! // crates/ops/src/bin/ops-watchdog.rs: env `WATCHDOG_SERVING_HEARTBEAT_PATH`
 //! //   (default `/var/lib/docker/volumes/hft-platform_gateway-state/_data/gateway-serve.heartbeat`)
-//! //   — бинарь зовёт ТОЛЬКО `run_cycle_full`.
+//! //   — бинарь зовёт ТОЛЬКО `run_cycle_full`; путь у него ЕСТЬ ВСЕГДА (env либо дефолт),
+//! //   поэтому он НИКОГДА не передаёт `Disabled`: нечитаемый файл ⇒ `ConfiguredMissing`.
 //! ```
 //!
 //! # Что здесь пиннится
 //!
-//! · `g1`/`g2` — парные vantage на отсутствие и несвежесть (алертит / молчит);
+//! · `g1` — три состояния входа: `Disabled` молчит, `ConfiguredMissing` алертит CRITICAL,
+//!   `Present` молчит; `g2` — несвежесть (WARNING → CRITICAL, свежий молчит);
 //! · `g3` — правило молчания на дельтах: три «молчит» и одно «звенит»;
 //! · `g4` — склейка: дедуп и якорь `prev_serving_heartbeat` живут в СОСТОЯНИИ между
-//!   тактами (иначе правило по дельтам не работает у одноразового cron-процесса);
-//! · `g5` — ТОЧКА ВХОДА: бинарь `ops-watchdog` с `WATCHDOG_SERVING_HEARTBEAT_PATH` печатает
-//!   код отсутствия/несвежести и молчит на свежем здоровом файле.
+//!   тактами; `ConfiguredMissing` звенит и якорь не стирает; `Disabled` не трогает ничего;
+//! · `g4b` — legacy `run_cycle` ≡ `run_cycle_full(.., Disabled)` ИСПОЛНЕНИЕМ (равные исходы),
+//!   ни одного serving-инцидента; `g4c` — парный vantage: `ConfiguredMissing` на том же
+//!   входе даёт `WD-SERVING-HB-MISSING`;
+//! · `g5` — ТОЧКА ВХОДА бинаря: путь задан, файла нет ⇒ `WD-SERVING-HB-MISSING`
+//!   (исполняемый случай «configured-missing»); старый файл ⇒ STALE; свежий ⇒ тишина.
 //!
 //! COMPILE-RED на ревизии набора: типов и функций не существует. `g5` — RUNTIME-RED и без
 //! них (бинарь переменную не читает), но собирается только вместе с файлом.
@@ -60,7 +80,7 @@
 use ops::state::WatchdogState;
 use ops::watchdog::{
     check_serving_heartbeat_missing, check_serving_heartbeat_stale, check_serving_silence,
-    Incident, Level, ServingHeartbeatSample, Thresholds,
+    Incident, Level, ServingHeartbeat, ServingHeartbeatSample, Thresholds,
 };
 use ops::watchdog_cycle::{run_cycle_full, CycleInputs, CycleOutcome, ServingInputs};
 
@@ -82,16 +102,25 @@ fn hb(
     }
 }
 
-// ─────────────────────────── g1 — отсутствие файла ───────────────────────────
+// ─────────────────────────── g1 — три состояния входа ───────────────────────────
 
 #[test]
-fn g1_missing_serving_heartbeat_fires_and_present_is_silent() {
-    let a = check_serving_heartbeat_missing(None).expect("None обязан алертить");
+fn g1_missing_fires_only_when_configured_disabled_and_present_are_silent() {
+    assert!(
+        matches!(ServingHeartbeat::default(), ServingHeartbeat::Disabled),
+        "Default обязан быть Disabled — иначе legacy run_cycle получает тревогу (C-260 R1)"
+    );
+    assert!(
+        check_serving_heartbeat_missing(&ServingHeartbeat::Disabled).is_none(),
+        "Disabled — интеграции нет, тревоги нет"
+    );
+    let a = check_serving_heartbeat_missing(&ServingHeartbeat::ConfiguredMissing)
+        .expect("ConfiguredMissing обязан алертить");
     assert_eq!(a.incident, Incident::ServingHeartbeatMissing);
     assert_eq!(a.level, Level::Critical);
     assert_eq!(a.incident.code(), "WD-SERVING-HB-MISSING");
     let s = hb(1_000, 0, 0, 0, 0);
-    assert!(check_serving_heartbeat_missing(Some(&s)).is_none());
+    assert!(check_serving_heartbeat_missing(&ServingHeartbeat::Present(s)).is_none());
 }
 
 // ─────────────────────────── g2 — несвежесть ───────────────────────────
@@ -169,6 +198,12 @@ fn inputs() -> CycleInputs {
     }
 }
 
+fn present(s: ServingHeartbeatSample) -> ServingInputs {
+    ServingInputs {
+        heartbeat: ServingHeartbeat::Present(s),
+    }
+}
+
 fn fired(out: &CycleOutcome, incident: Incident) -> usize {
     out.fired.iter().filter(|a| a.incident == incident).count()
 }
@@ -194,10 +229,14 @@ fn g4_cycle_keeps_serving_anchor_in_state_and_dedups_silence() {
 
     // Такт 1: первый сэмпл — якоря нет, молчание судить не с чем; несвежести нет.
     let t1 = 1_000_000;
-    let s1 = ServingInputs {
-        heartbeat: Some(hb(t1, 100, 50, 30, 20)),
-    };
-    let o1 = run_cycle_full(&inputs(), &s1, t1, &thr, dedup, &mut state);
+    let o1 = run_cycle_full(
+        &inputs(),
+        &present(hb(t1, 100, 50, 30, 20)),
+        t1,
+        &thr,
+        dedup,
+        &mut state,
+    );
     assert_eq!(
         fired(&o1, Incident::ServingSilence),
         0,
@@ -208,10 +247,14 @@ fn g4_cycle_keeps_serving_anchor_in_state_and_dedups_silence() {
 
     // Такт 2: голодание относительно якоря — звенит и доставляется.
     let t2 = t1 + 60_000;
-    let s2 = ServingInputs {
-        heartbeat: Some(hb(t2, 110, 50, 40, 20)),
-    };
-    let o2 = run_cycle_full(&inputs(), &s2, t2, &thr, dedup, &mut state);
+    let o2 = run_cycle_full(
+        &inputs(),
+        &present(hb(t2, 110, 50, 40, 20)),
+        t2,
+        &thr,
+        dedup,
+        &mut state,
+    );
     assert_eq!(
         fired(&o2, Incident::ServingSilence),
         1,
@@ -222,10 +265,14 @@ fn g4_cycle_keeps_serving_anchor_in_state_and_dedups_silence() {
 
     // Такт 3: то же голодание — сработало, но подавлено дедупом.
     let t3 = t2 + 60_000;
-    let s3 = ServingInputs {
-        heartbeat: Some(hb(t3, 120, 50, 50, 20)),
-    };
-    let o3 = run_cycle_full(&inputs(), &s3, t3, &thr, dedup, &mut state);
+    let o3 = run_cycle_full(
+        &inputs(),
+        &present(hb(t3, 120, 50, 50, 20)),
+        t3,
+        &thr,
+        dedup,
+        &mut state,
+    );
     assert_eq!(fired(&o3, Incident::ServingSilence), 1);
     assert_eq!(
         delivered(&o3, Incident::ServingSilence),
@@ -234,33 +281,116 @@ fn g4_cycle_keeps_serving_anchor_in_state_and_dedups_silence() {
     );
     let mut state = roundtrip(&state);
 
-    // Такт 4: файл исчез — отсутствие звенит; якорь НЕ сбрасывается (нечитаемый такт не
-    // стирает историю — та же дисциплина, что `f1_unreadable_heartbeat_tick…`).
+    // Такт 4: файл исчез при ЗАДАННОМ пути — отсутствие звенит; якорь НЕ сбрасывается
+    // (нечитаемый такт не стирает историю — та же дисциплина, что `f1_unreadable_heartbeat_tick…`).
     let t4 = t3 + 60_000;
     let o4 = run_cycle_full(
         &inputs(),
-        &ServingInputs::default(),
+        &ServingInputs {
+            heartbeat: ServingHeartbeat::ConfiguredMissing,
+        },
         t4,
         &thr,
         dedup,
         &mut state,
     );
     assert_eq!(fired(&o4, Incident::ServingHeartbeatMissing), 1);
+    let anchor_after_missing = state.prev_serving_heartbeat;
     assert!(
-        state.prev_serving_heartbeat.is_some(),
+        anchor_after_missing.is_some(),
         "нечитаемый такт сбросил якорь молчания"
+    );
+    let mut state = roundtrip(&state);
+
+    // Такт 5: интеграция выключена (Disabled) — ни одной serving-тревоги, состояние
+    // serving-якоря НЕ тронуто (ни сброса, ни обновления).
+    let t5 = t4 + 60_000;
+    let o5 = run_cycle_full(
+        &inputs(),
+        &ServingInputs::default(),
+        t5,
+        &thr,
+        dedup,
+        &mut state,
+    );
+    assert_eq!(
+        fired(&o5, Incident::ServingHeartbeatMissing),
+        0,
+        "Disabled дал MISSING"
+    );
+    assert_eq!(
+        fired(&o5, Incident::ServingSilence),
+        0,
+        "Disabled дал SILENCE"
+    );
+    assert_eq!(
+        fired(&o5, Incident::ServingHeartbeatStale),
+        0,
+        "Disabled дал STALE"
+    );
+    assert_eq!(
+        state.prev_serving_heartbeat, anchor_after_missing,
+        "Disabled тронул serving-якорь"
     );
 }
 
-/// `run_cycle` без второго входа — неизменное поведение (аддитивность): ни одного
-/// serving-инцидента при отсутствии входа.
+/// **g4b — legacy `run_cycle` ≡ `run_cycle_full(.., Disabled)` ИСПОЛНЕНИЕМ.** Аддитивность:
+/// прежний вызов не получает ни одного serving-инцидента, и его исход поэлементно равен
+/// исходу полного цикла с `Default` входом на том же состоянии.
 #[test]
-fn g4b_legacy_run_cycle_is_unchanged_without_serving_input() {
+fn g4b_legacy_run_cycle_equals_full_cycle_with_disabled_input() {
     let thr = Thresholds::default();
-    let mut state = WatchdogState::default();
-    let out = ops::watchdog_cycle::run_cycle(&inputs(), 1_000, &thr, 60_000, &mut state);
+    let mut s_legacy = WatchdogState::default();
+    let mut s_full = WatchdogState::default();
+    let out = ops::watchdog_cycle::run_cycle(&inputs(), 1_000, &thr, 60_000, &mut s_legacy);
+    let full = run_cycle_full(
+        &inputs(),
+        &ServingInputs::default(),
+        1_000,
+        &thr,
+        60_000,
+        &mut s_full,
+    );
     assert_eq!(fired(&out, Incident::ServingHeartbeatMissing), 0);
     assert_eq!(fired(&out, Incident::ServingSilence), 0);
+    assert_eq!(fired(&out, Incident::ServingHeartbeatStale), 0);
+    assert_eq!(
+        out.fired, full.fired,
+        "run_cycle ≠ run_cycle_full(Disabled): fired"
+    );
+    assert_eq!(
+        out.delivered, full.delivered,
+        "run_cycle ≠ run_cycle_full(Disabled): delivered"
+    );
+    assert_eq!(out.suppressed, full.suppressed);
+    assert_eq!(
+        s_legacy, s_full,
+        "run_cycle ≠ run_cycle_full(Disabled): состояние"
+    );
+}
+
+/// **g4c — парный vantage к g4b:** тот же вход, но `ConfiguredMissing` — тревога ЕСТЬ.
+/// Без этой пары «Default молчит» неотличим от «serving-проверки не подключены вовсе».
+#[test]
+fn g4c_configured_missing_on_the_same_input_fires_missing() {
+    let thr = Thresholds::default();
+    let mut state = WatchdogState::default();
+    let out = run_cycle_full(
+        &inputs(),
+        &ServingInputs {
+            heartbeat: ServingHeartbeat::ConfiguredMissing,
+        },
+        1_000,
+        &thr,
+        60_000,
+        &mut state,
+    );
+    assert_eq!(
+        fired(&out, Incident::ServingHeartbeatMissing),
+        1,
+        "ConfiguredMissing не дал MISSING"
+    );
+    assert_eq!(delivered(&out, Incident::ServingHeartbeatMissing), 1);
 }
 
 // ─────────────────────────── g5 — точка входа бинаря ───────────────────────────
@@ -296,13 +426,15 @@ fn g5_watchdog_binary_reads_serving_heartbeat_from_env_path() {
     let state = tempfile::tempdir().expect("state");
     let serving = state.path().join("gateway-serve.heartbeat");
 
-    // (1) Файла нет — код отсутствия.
+    // (1) Путь ЗАДАН, файла нет — исполняемый случай `ConfiguredMissing`: код отсутствия.
+    // Это единственный прод-вход, и он не имеет права передавать `Disabled`.
     let out = run_watchdog(&serving, state.path());
     assert!(
         out.contains("WD-SERVING-HB-MISSING"),
-        "I-6 / TD-220: бинарь ops-watchdog не сообщил об отсутствии сердцебиения выдачи по \
-         WATCHDOG_SERVING_HEARTBEAT_PATH — переменную он не читает, и молчание выдачи \
-         снаружи невидимо. Вывод:\n{out}"
+        "I-6 / TD-220 / C-260 R1: бинарь ops-watchdog при ЗАДАННОМ WATCHDOG_SERVING_HEARTBEAT_PATH \
+         и отсутствующем файле не сообщил WD-SERVING-HB-MISSING — либо переменную не читает, либо \
+         передаёт в цикл Disabled вместо ConfiguredMissing; молчание выдачи снаружи невидимо. \
+         Вывод:\n{out}"
     );
 
     // (2) Файл есть, но старый — код несвежести (наблюдать ОТСУТСТВИЕ обновлений).
@@ -321,6 +453,10 @@ fn g5_watchdog_binary_reads_serving_heartbeat_from_env_path() {
     assert!(
         out.contains("WD-SERVING-HB-STALE"),
         "I-6: файл сердцебиения часовой давности не дал кода несвежести. Вывод:\n{out}"
+    );
+    assert!(
+        !out.contains("WD-SERVING-HB-MISSING"),
+        "читаемый файл дал MISSING — бинарь не разобрал форму §4.2. Вывод:\n{out}"
     );
 
     // (3) Свежий здоровый файл — ни отсутствия, ни несвежести.
