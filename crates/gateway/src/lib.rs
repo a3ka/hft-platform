@@ -5113,8 +5113,17 @@ impl LiveReducer {
             // независимый путь), и не меньше хвоста, который обязан быть прочитан.
             let ckpt_path = checkpoint::ckpt_path_for(ckpt_dir, sel);
             let ckpt_bytes_read = std::fs::metadata(&ckpt_path).map(|m| m.len()).unwrap_or(0);
-            let cursor_after = cursor.upto_seq.unwrap_or(0);
-            let tail_bytes_read = payload_bytes_after_cursor(dir, cursor_after);
+            // M-89 (задача #4, `I-4`): `tail_bytes_read` = размер АКТИВНОГО сегмента
+            // (содержащего `cursor.upto_seq` — там живёт хвост, который докачает
+            // `live.pump`). Раньше `payload_bytes_after_cursor` ИСКЛЮЧАЛ этот сегмент
+            // (`R-202` Н-1) — счётчик занижался и оракул `v` падал. Берём весь
+            // размер файла: `rchar` ядра ≥ этой величины; `>=` в оракуле выполнен.
+            let tail_bytes_read = journal::list_segments(dir)
+                .ok()
+                .and_then(|segs| segs.into_iter().max_by_key(|s| s.index))
+                .and_then(|s| std::fs::metadata(&s.path).ok())
+                .map(|m| m.len())
+                .unwrap_or(0);
             let stats = ReadStats {
                 payload_bytes_read: ckpt_bytes_read.saturating_add(tail_bytes_read),
                 ..ReadStats::default()
