@@ -54,6 +54,18 @@ async fn main() -> ExitCode {
         }
     };
 
+    // M-89 (задача #8, §4.2): сердцебиение. Конфиг из env: GATEWAY_HEARTBEAT_PATH
+    // (опционально — `None` если переменная не задана), GATEWAY_HEARTBEAT_PERIOD_MS
+    // (дефолт 10 000). Ошибка парсинга периода — отказ старта (`GW-I-14`).
+    let server = match gateway_serve::heartbeat_config_from_env(|k| std::env::var(k).ok()) {
+        Ok(Some(hb)) => server.with_heartbeat(hb),
+        Ok(None) => server,
+        Err(e) => {
+            eprintln!("gateway-serve: heartbeat config error: {e}");
+            return ExitCode::from(2);
+        }
+    };
+
     let actual = server.local_addr();
     eprintln!("gateway-serve: listening on {actual} (read-only, JWT-auth, policy-enforced)");
 

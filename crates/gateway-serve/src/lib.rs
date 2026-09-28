@@ -285,6 +285,13 @@ pub mod server {
     use super::auth::{verify_token, AuthError};
     use super::wire::ServeMsg;
 
+    /// M-89 (задача #8, §4.2): конфиг сердцебиения для `with_heartbeat` билдера.
+    #[derive(Clone, Debug)]
+    pub struct HeartbeatConfig {
+        pub path: std::path::PathBuf,
+        pub period: Duration,
+    }
+
     /// Конфиг сервиса (bin читает из env/args). MVP — одна `(venue, symbol)`; мульти-подписка позже.
     pub struct ServeConfig {
         /// Адрес bind, напр. `"127.0.0.1:8080"` или `"127.0.0.1:0"` (ephemeral для тестов).
@@ -341,6 +348,9 @@ pub mod server {
         /// политики) — None (сервер поднят без политики, счётчики экземпляра не
         /// пиннятся тестами).
         counters: Option<std::sync::Arc<metrics::ServingCountersHandle>>,
+        /// M-89 (задача #8, §4.2 / `I-6`): конфиг сердцебиения. `None` — сервер
+        /// без сердцебиения (watchdog детектит как `MISSING`).
+        heartbeat: Option<HeartbeatConfig>,
     }
 
     /// Забиндить WS-listener на `cfg.addr`. engine-dev (task #4): `tokio::net::TcpListener`.
@@ -355,6 +365,7 @@ pub mod server {
             policy: None,
             slots: None,
             counters: None,
+            heartbeat: None,
         })
     }
 
@@ -411,6 +422,18 @@ pub mod server {
                 policy: Some(policy),
                 slots: Some(slots),
                 counters: Some(counters),
+                heartbeat: None,
+            }
+        }
+
+        /// M-89 (задача #8, §4.2 / `I-6`): АДДИТИВНЫЙ билдер — конфиг сердцебиения
+        /// через билдер, не через поле `ServeConfig` (одиннадцать существующих
+        /// sacred-файлов с литералом `ServeConfig { .. }` остаются целы).
+        /// Период по умолчанию — 10 000 мс (как у recorder'а).
+        pub fn with_heartbeat(self, cfg: HeartbeatConfig) -> Server {
+            Server {
+                heartbeat: Some(cfg),
+                ..self
             }
         }
     }
@@ -480,9 +503,19 @@ pub mod server {
         }
 
         pub async fn serve(self) -> std::io::Result<()> {
+            // M-89 (задача #8, §4.2): сердцебиение — spawn-таск, работающий рядом с
+            // accept-loop. Создаётся в `with_heartbeat`; ошибки записи ГЛОТАЮТСЯ
+            // и логируются — сердцебиение observability, а не safety-инвариант.
+            let heartbeat_task = self.heartbeat.clone().map(|hb| {
+                let counters_for_hb = self.counters.clone();
+                let cfg_for_hb = self.cfg.clone();
+                tokio::spawn(async move {
+                    run_heartbeat(hb, counters_for_hb, cfg_for_hb).await;
+                })
+            });
             // ACCEPT-LOOP: каждый TcpStream — в отдельном spawn-таске (как в recorder metrics_server).
             // Accept-сбой (listener закрыт) → WARN + retry с паузой 100ms (не спиним).
-            loop {
+            let result = loop {
                 match self.listener.accept().await {
                     Ok((stream, _peer)) => {
                         let cfg = Arc::clone(&self.cfg);
@@ -500,6 +533,71 @@ pub mod server {
                         tokio::time::sleep(Duration::from_millis(100)).await;
                     }
                 }
+            };
+            if let Some(h) = heartbeat_task {
+                h.abort();
+            }
+            result
+        }
+    }
+
+    /// M-89 (задача #8, §4.2 / `I-6`): задача сердцебиения — пишет JSON
+    /// `<path>.tmp` → `rename` каждые `cfg.period` миллисекунд. Значения — снимок
+    /// per-instance счётчиков + freshness. Ошибки записи ГЛОТАЮТСЯ и логируются:
+    /// сердцебиение — observability, а не safety-инвариант.
+    async fn run_heartbeat(
+        cfg: HeartbeatConfig,
+        counters: Option<std::sync::Arc<metrics::ServingCountersHandle>>,
+        _serve_cfg: Arc<ServeConfig>,
+    ) {
+        use std::io::Write;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let tmp = cfg.path.with_extension("tmp");
+        loop {
+            tokio::time::sleep(cfg.period).await;
+            let snap = counters.as_ref().map(|c| c.snapshot()).unwrap_or_default();
+            let fresh = metrics::freshness();
+            let body = serde_json::json!({
+                "schema": 1u32,
+                "ts_wall_ms": SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0),
+                "attempts": snap.attempts,
+                "successes": snap.successes,
+                "refusals_supported": snap.refusals_supported,
+                "refusals_unsupported": snap.refusals_unsupported,
+                "journal_payload_bytes_read": snap.journal_payload_bytes_read,
+                "slots_in_flight": snap.slots_in_flight,
+                "freshness": {
+                    "source_ms": fresh.source_ms,
+                    "projection_ms": fresh.projection_ms,
+                    "published_ms": fresh.published_ms,
+                    "snapshot_ms": fresh.snapshot_ms,
+                },
+            });
+            let bytes = match serde_json::to_vec(&body) {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!(error = %e, "heartbeat: serialize failed");
+                    continue;
+                }
+            };
+            // Запись атомарна: `.tmp` → `rename`. Создаём каталог если нужно.
+            if let Some(parent) = cfg.path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let write_result = (|| -> std::io::Result<()> {
+                {
+                    let mut f = std::fs::File::create(&tmp)?;
+                    f.write_all(&bytes)?;
+                    f.sync_all()?;
+                }
+                std::fs::rename(&tmp, &cfg.path)?;
+                Ok(())
+            })();
+            if let Err(e) = write_result {
+                tracing::warn!(error = %e, path = %cfg.path.display(), "heartbeat: write failed");
             }
         }
     }
@@ -2619,6 +2717,42 @@ pub fn build_selector(
 ///   `GATEWAY_DEPTH_CADENCE_MS`. Переменная ОБЪЯВЛЕНА в `docker-compose.yml` —
 ///   иначе ручка оператору недоступна, как бы юнит-оракулы ни были зелены
 ///   (`red_depth_cadence_from_env::knob_is_declared_in_compose`).
+/// M-89 (задача #8, §4.2 / `I-6`): парс конфига сердцебиения из env.
+/// `GATEWAY_HEARTBEAT_PATH` (опциональна): если не задана или пустая —
+/// `Ok(None)`, сердцебиения нет, и watchdog детектит как `MISSING`. Если
+/// задана — путь к ФАЙЛУ на ЗАПИСЫВАЕМОМ монтировании (не /journal, не
+/// /ckpt; не каталог с хвостовым `/`).
+/// `GATEWAY_HEARTBEAT_PERIOD_MS` (дефолт 10 000): период в мс. `0` или
+/// невалидное ⇒ `Err` — отказ старта (`GW-I-14`).
+pub fn heartbeat_config_from_env(
+    get: impl Fn(&str) -> Option<String>,
+) -> Result<Option<server::HeartbeatConfig>, String> {
+    use std::path::PathBuf;
+    use std::time::Duration;
+    let path: Option<PathBuf> = match get("GATEWAY_HEARTBEAT_PATH") {
+        Some(s) if !s.trim().is_empty() => Some(PathBuf::from(s.trim())),
+        _ => None,
+    };
+    let path = match path {
+        None => return Ok(None),
+        Some(p) => p,
+    };
+    let period: Duration = match get("GATEWAY_HEARTBEAT_PERIOD_MS") {
+        None => Duration::from_millis(10_000),
+        Some(s) => {
+            let ms: u64 = s
+                .trim()
+                .parse()
+                .map_err(|e| format!("GATEWAY_HEARTBEAT_PERIOD_MS parse: {e}"))?;
+            if ms == 0 {
+                return Err("GATEWAY_HEARTBEAT_PERIOD_MS must be > 0".to_string());
+            }
+            Duration::from_millis(ms)
+        }
+    };
+    Ok(Some(server::HeartbeatConfig { path, period }))
+}
+
 pub fn serve_config_from_env(
     get: impl Fn(&str) -> Option<String>,
 ) -> Result<server::ServeConfig, String> {
