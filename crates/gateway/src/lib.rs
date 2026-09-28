@@ -3785,6 +3785,11 @@ pub struct ReadStats {
     /// даёт инвариант «журнал НЕ прочитан на публичном пути», которого нет ни
     /// в одном из существующих полей.
     pub payload_bytes_read: u64,
+    /// M-89 (задача #2, `I-1` / §4.1): число откатов поиска позиции к `header_end`
+    /// за проход (кандидат найден, гард точности не прошёл). `.zst` — не откат
+    /// (поиск не предпринимается, названный предел). Проброшен из
+    /// `journal::EventStream::seek_fallbacks()`. Аддитивен к остальным счётчикам.
+    pub seek_fallbacks: u64,
 }
 
 impl std::ops::Add for ReadStats {
@@ -3792,6 +3797,7 @@ impl std::ops::Add for ReadStats {
     fn add(self, rhs: Self) -> Self {
         Self {
             events_decoded: self.events_decoded + rhs.events_decoded,
+            seek_fallbacks: self.seek_fallbacks + rhs.seek_fallbacks,
             segments_opened: self.segments_opened + rhs.segments_opened,
             events_scanned: self.events_scanned + rhs.events_scanned,
             segment_meta_ops: self.segment_meta_ops + rhs.segment_meta_ops,
@@ -3823,6 +3829,7 @@ fn read_stats_from_stream_with_bytes(
         segment_meta_ops: stream.segment_meta_ops(),
         depth_levels_visited,
         payload_bytes_read,
+        seek_fallbacks: stream.seek_fallbacks(),
     }
 }
 
@@ -3854,6 +3861,7 @@ fn read_stats_from_stream(stream: &journal::EventStream, depth_levels_visited: u
         segment_meta_ops: stream.segment_meta_ops(),
         depth_levels_visited,
         payload_bytes_read: 0, // filled by call sites (see `payload_bytes_for_dir`)
+        seek_fallbacks: 0,     // M-89: filled by `read_stats_from_stream_with_bytes`
     }
 }
 
@@ -3892,11 +3900,25 @@ pub(crate) fn payload_bytes_for_dir(dir: &Path) -> io::Result<u64> {
 /// попадает в конец последнего покрытого сегмента) сегмент НЕ содержит after_seq — все
 /// события в нём уже учтены чекпоинтом, и `live.pump` читает только хвост.
 ///
-// M-89 (задача #3, `I-4`): функция описания каталога удалена (M-89-задача-3).
-// Счётчик байт приходит напрямую из `EventStream` (см. `EventStream::payload_bytes_read`
-// в `crates/journal/src/segments.rs`) — ровно столько байт, сколько прочитал ридер,
-// без описи каталога. Вызывающие места (warm-resume, оракул q2) переведены на
-// стримовый путь.
+/// Источник истины — `journal::list_segments` (sacred; используется публичный API),
+/// фильтрация по `first_seq`. Возвращает `0` при пустом каталоге или ошибке чтения —
+/// `payload_bytes_read` обязан быть монотонной верхней границей, и сбой
+/// `list_segments` не должен приводить к отказу выдачи.
+pub(crate) fn _catalog_tail_bytes(dir: &Path, after_seq: u64) -> u64 {
+    let segs = match journal::list_segments(dir) {
+        Ok(s) => s,
+        Err(_) => return 0,
+    };
+    let mut total: u64 = 0;
+    // DET-OK: итерация по `SegmentInfo` не зависит от порядка (сумма коммутативна).
+    for s in &segs {
+        // Сегмент ЦЕЛИКОМ после курсора — `live.pump` его прочитает полностью.
+        if s.header.first_seq > after_seq {
+            total = total.saturating_add(s.size_bytes);
+        }
+    }
+    total
+}
 
 /// M-87 (предохранитель выдачи, A-037 D-1, аддитивно): `pub`-форма
 /// `payload_bytes_for_dir` для `gateway_serve` — транспорт пробрасывает
@@ -5101,7 +5123,7 @@ impl LiveReducer {
             let ckpt_bytes_read = std::fs::metadata(&ckpt_path).map(|m| m.len()).unwrap_or(0);
             // M-89 (задача #4, `I-4`): `tail_bytes_read` = размер АКТИВНОГО сегмента
             // (содержащего `cursor.upto_seq` — там живёт хвост, который докачает
-            // `live.pump`). Раньше `payload_bytes_after_cursor` ИСКЛЮЧАЛ этот сегмент
+            // `live.pump`). Раньше `_catalog_tail_bytes` ИСКЛЮЧАЛ этот сегмент
             // (`R-202` Н-1) — счётчик занижался и оракул `v` падал. Берём весь
             // размер файла: `rchar` ядра ≥ этой величины; `>=` в оракуле выполнен.
             let tail_bytes_read = journal::list_segments(dir)
@@ -5175,7 +5197,7 @@ impl LiveReducer {
         // полностью — `payload_bytes_for_dir(dir)` возвращает ВЕРХНЮЮ ГРАНИЦУ, совпадающую
         // с фактическим чтением (метаданные файлов vs их содержимое расходятся на доли
         // процента). Warm-путь выше использует ДРУГУЮ функцию
-        // (`payload_bytes_after_cursor` + размер чекпоинта) — там полный каталог НЕ
+        // (`_catalog_tail_bytes` + размер чекпоинта) — там полный каталог НЕ
         // читается, и эта формула соврала бы. Оракул `red_m87_read_volume_truth::q2`
         // ловит оба варианта против независимого `rchar` ядра.
         stats.payload_bytes_read = payload_bytes_for_dir(dir).unwrap_or(0);

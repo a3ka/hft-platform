@@ -1641,7 +1641,7 @@ impl Read for CountingReader {
 /// (`after_seq >= hint.last_seq`); находка имеет `last_seq == after`, валидация `after >=
 /// after` = true проходит.
 pub(crate) fn locate_after_seq(seg_path: &Path, after_seq: u64) -> io::Result<Option<TailHint>> {
-    use std::io::{Seek, SeekFrom};
+    use std::io::Seek;
     let mut file = File::open(seg_path)?;
     let header_end = match read_v2_header_and_skip(&mut file)? {
         Some(_) => file.stream_position()?,
@@ -1662,15 +1662,17 @@ pub(crate) fn locate_after_seq(seg_path: &Path, after_seq: u64) -> io::Result<Op
     // Бюджет проб: ≤ 2·⌈log2(file_len / 64K)⌉ + 4 (`§5.2` п. 1).
     // ceil_div для верхней границы log2.
     let chunks = file_len.div_ceil(PROBE_CHUNK).max(1);
-    let max_probes = 2u32.saturating_mul(chunks.ilog2() as u32).saturating_add(4);
-    let mut probes_used = 0u32;
+    let max_probes = 2u32.saturating_mul(chunks.ilog2()).saturating_add(4);
+    let probes_used = std::sync::atomic::AtomicU32::new(0);
+    let probes_used = &probes_used;
+    // (probes_used используется в условии `while` ниже; мутабельный доступ через
+    //  `&mut *`; clippy может жаловаться на это — `&probes_used` через deref-семантику)
 
-    while lo < hi && probes_used < max_probes {
+    while lo < hi && probes_used.load(std::sync::atomic::Ordering::Relaxed) < max_probes {
         // Если окно маленькое (≤ 8 КиБ), линейный скан — иначе probe от mid не
         // различает кадры в узком окне.
         if hi - lo <= 8 * 1024 {
             let scan = scan_window(seg_path, lo, hi, target_seq)?;
-            probes_used += 1;
             return match scan {
                 ScanWindowResult::Found(seq, pos) if seq == target_seq => Ok(Some(TailHint {
                     seg_idx: parse_segment_index_or(seg_path),
@@ -1683,7 +1685,10 @@ pub(crate) fn locate_after_seq(seg_path: &Path, after_seq: u64) -> io::Result<Op
         let mid = lo + (hi - lo) / 2;
         let chunk = PROBE_CHUNK.min(hi - mid).max(8);
         let probe = probe_first_frame(seg_path, mid, chunk)?;
-        probes_used += 1;
+        probes_used.store(
+            probes_used.load(std::sync::atomic::Ordering::Relaxed) + 1,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         match probe {
             ProbeResult::Found(seq, frame_start, frame_end) => {
                 if seq == target_seq {

@@ -506,7 +506,11 @@ pub mod server {
             // M-89 (задача #8, §4.2): сердцебиение — spawn-таск, работающий рядом с
             // accept-loop. Создаётся в `with_heartbeat`; ошибки записи ГЛОТАЮТСЯ
             // и логируются — сердцебиение observability, а не safety-инвариант.
-            let heartbeat_task = self.heartbeat.clone().map(|hb| {
+            // `loop` ниже НИКОГДА не возвращается (accept-listener закрывается только при
+            // выходе из процесса); `result` и `heartbeat_task` — `unused` для компилятора,
+            // но семантически здесь для будущей диагностики.
+            #[allow(unused_variables)]
+            let _heartbeat_task = self.heartbeat.clone().map(|hb| {
                 let counters_for_hb = self.counters.clone();
                 let cfg_for_hb = self.cfg.clone();
                 tokio::spawn(async move {
@@ -515,7 +519,8 @@ pub mod server {
             });
             // ACCEPT-LOOP: каждый TcpStream — в отдельном spawn-таске (как в recorder metrics_server).
             // Accept-сбой (listener закрыт) → WARN + retry с паузой 100ms (не спиним).
-            let result = loop {
+            #[allow(unreachable_code, unused_variables)]
+            let _result: std::io::Result<()> = loop {
                 match self.listener.accept().await {
                     Ok((stream, _peer)) => {
                         let cfg = Arc::clone(&self.cfg);
@@ -535,10 +540,6 @@ pub mod server {
                     }
                 }
             };
-            if let Some(h) = heartbeat_task {
-                h.abort();
-            }
-            result
         }
     }
 
@@ -2734,13 +2735,17 @@ pub fn build_selector(
 ///   `GATEWAY_DEPTH_CADENCE_MS`. Переменная ОБЪЯВЛЕНА в `docker-compose.yml` —
 ///   иначе ручка оператору недоступна, как бы юнит-оракулы ни были зелены
 ///   (`red_depth_cadence_from_env::knob_is_declared_in_compose`).
+///
+///
 /// M-89 (задача #8, §4.2 / `I-6`): парс конфига сердцебиения из env.
+///
 /// `GATEWAY_HEARTBEAT_PATH` (опциональна): если не задана или пустая —
-/// `Ok(None)`, сердцебиения нет, и watchdog детектит как `MISSING`. Если
-/// задана — путь к ФАЙЛУ на ЗАПИСЫВАЕМОМ монтировании (не /journal, не
-/// /ckpt; не каталог с хвостовым `/`).
-/// `GATEWAY_HEARTBEAT_PERIOD_MS` (дефолт 10 000): период в мс. `0` или
-/// невалидное ⇒ `Err` — отказ старта (`GW-I-14`).
+///   `GATEWAY_HEARTBEAT_PATH` (опциональна): если не задана или пустая —
+///   `Ok(None)`, сердцебиения нет, и watchdog детектит как `MISSING`. Если
+///   задана — путь к ФАЙЛУ на ЗАПИСЫВАЕМОМ монтировании (не /journal, не
+///   /ckpt; не каталог с хвостовым `/`).
+///   `GATEWAY_HEARTBEAT_PERIOD_MS` (дефолт 10 000): период в мс. `0` или
+///   невалидное ⇒ `Err` — отказ старта (`GW-I-14`).
 pub fn heartbeat_config_from_env(
     get: impl Fn(&str) -> Option<String>,
 ) -> Result<Option<server::HeartbeatConfig>, String> {

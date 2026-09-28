@@ -159,7 +159,7 @@ pub struct ContainerStatus {
 /// M-89 (задача #10, §4.3 / `I-6`): снэпшот `gateway-serve.heartbeat` (форма §4.2,
 /// `crates/gateway-serve/src/lib.rs::run_heartbeat`). Все поля обязательны — сердцебиение
 /// пишется прод-бинарём по `with_heartbeat` билдеру (`TD-220`, `OPS-I-10`).
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Default)]
 pub struct ServingHeartbeatSample {
     pub ts_wall_ms: i64,
     pub attempts: u64,
@@ -168,20 +168,6 @@ pub struct ServingHeartbeatSample {
     pub refusals_unsupported: u64,
     pub journal_payload_bytes_read: u64,
     pub slots_in_flight: u64,
-}
-
-impl Default for ServingHeartbeatSample {
-    fn default() -> Self {
-        Self {
-            ts_wall_ms: 0,
-            attempts: 0,
-            successes: 0,
-            refusals_supported: 0,
-            refusals_unsupported: 0,
-            journal_payload_bytes_read: 0,
-            slots_in_flight: 0,
-        }
-    }
 }
 
 /// M-89 (задача #10, §4.3 / `I-6` / `C-260` R1): вход «сердцебиение выдачи» — ТРИ
