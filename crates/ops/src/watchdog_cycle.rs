@@ -165,6 +165,36 @@ pub fn run_cycle(
     dedup_window_ms: i64,
     state: &mut WatchdogState,
 ) -> CycleOutcome {
+    // M-89 (задача #10): legacy `run_cycle` ≡ `run_cycle_full(.., &ServingInputs::default(), ..)`.
+    // `Disabled` — нет serving-интеграции; serving-проверки НЕ исполняются, состояние
+    // serving-якоря НЕ трогается.
+    run_cycle_full(
+        inputs,
+        &ServingInputs::default(),
+        now_ms,
+        thr,
+        dedup_window_ms,
+        state,
+    )
+}
+
+/// M-89 (задача #10, §4.3 / `I-6`): serving-вход отдельной структурой — `CycleInputs`
+/// НЕ меняется (12 литералов в `red_ops_watchdog_cycle.rs`).
+#[derive(Debug, Clone, Default)]
+pub struct ServingInputs {
+    /// `Default` = `ServingHeartbeat::Disabled` — интеграции нет (legacy `run_cycle`).
+    pub heartbeat: crate::watchdog::ServingHeartbeat,
+}
+
+/// M-89 (задача #10, §4.3 / `I-6`): полный такт cron'а. Бинарь зовёт ТОЛЬКО его.
+pub fn run_cycle_full(
+    inputs: &CycleInputs,
+    serving: &ServingInputs,
+    now_ms: i64,
+    thr: &Thresholds,
+    dedup_window_ms: i64,
+    state: &mut WatchdogState,
+) -> CycleOutcome {
     let mut cycle = Cycle {
         state,
         now_ms,
@@ -175,6 +205,7 @@ pub fn run_cycle(
     run_heartbeat_checks(&mut cycle, inputs.heartbeat.as_ref(), thr);
     run_container_checks(&mut cycle, &inputs.containers);
     run_cron_checks(&mut cycle, &inputs.cron_jobs, thr);
+    run_serving_checks(&mut cycle, serving, now_ms, thr);
 
     cycle.outcome
 }
@@ -415,4 +446,64 @@ fn build_cron_failed_alert(name: &str, failure: &CronFailureMarker) -> Alert {
         ),
         target: Some(name.to_string()),
     }
+}
+
+/// M-89 (задача #10, §4.3 / `I-6`): serving-проверки. Дисциплина:
+/// · `Disabled` (legacy) — ничего не делаем (ни serving-проверок, ни обновления якоря);
+/// · `ConfiguredMissing` — MISSING CRITICAL, якорь НЕ трогаем (R-005 F-1);
+/// · `Present(s)` — STALE по порогам, И молчание по дельтам с якорем (если якорь есть).
+fn run_serving_checks(
+    cycle: &mut Cycle,
+    serving: &ServingInputs,
+    now_ms: i64,
+    thr: &Thresholds,
+) {
+    use crate::watchdog::{
+        check_serving_heartbeat_missing, check_serving_heartbeat_stale, check_serving_silence,
+        ServingHeartbeat, ServingHeartbeatSample,
+    };
+    // (1) `Disabled` — путь не задан (legacy `run_cycle`). serving-проверки
+    // НЕ исполняются, состояние serving-якоря НЕ трогается.
+    if matches!(serving.heartbeat, ServingHeartbeat::Disabled) {
+        return;
+    }
+
+    // (2) `ConfiguredMissing` — MISSING CRITICAL; якорь НЕ сбрасывается.
+    cycle.record(
+        Incident::ServingHeartbeatMissing,
+        None,
+        match check_serving_heartbeat_missing(&serving.heartbeat) {
+            Some(a) => Verdict::Alert(a),
+            None => Verdict::Healthy,
+        },
+    );
+    if matches!(serving.heartbeat, ServingHeartbeat::ConfiguredMissing) {
+        // Якорь молчания НЕ сбрасывается на нечитаемом такте (R-005 F-1) — тот же
+        // контракт, что и для `prev_heartbeat` / `prev_check_ms` у `f1_*`.
+        return;
+    }
+
+    // (3) `Present(s)` — STALE (по порогам) И молчание (по дельтам с якорем).
+    let ServingHeartbeat::Present(s) = serving.heartbeat else {
+        unreachable!("non-Disabled/non-Present case выше")
+    };
+    let stale_verdict = match check_serving_heartbeat_stale(now_ms, &s, thr) {
+        Some(a) => Verdict::Alert(a),
+        None => Verdict::Healthy,
+    };
+    cycle.record(Incident::ServingHeartbeatStale, None, stale_verdict);
+
+    // Молчание: ТОЛЬКО если якорь есть (первый такт — `None`, не судим; тот же
+    // контракт, что `red_ops_watchdog_cycle::prev_heartbeat == None`).
+    if let Some(anchor) = cycle.state.prev_serving_heartbeat {
+        let silence_verdict = match check_serving_silence(&anchor, &s) {
+            Some(a) => Verdict::Alert(a),
+            None => Verdict::Healthy,
+        };
+        cycle.record(Incident::ServingSilence, None, silence_verdict);
+    }
+
+    // Якорь движется на каждом Present-такте (как `prev_heartbeat` в recorder-цикле).
+    cycle.state.prev_serving_heartbeat = Some(s);
+    let _ = ServingHeartbeatSample::default(); // подавляем unused
 }

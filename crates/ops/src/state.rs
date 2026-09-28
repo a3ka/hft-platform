@@ -14,7 +14,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::watchdog::HeartbeatSample;
+use crate::watchdog::{HeartbeatSample, ServingHeartbeatSample};
 
 /// По умолчанию — 30 минут. При cron раз в 5 минут это не более одного алерта на условие
 /// за полчаса, пока оно не устранено — достаточно громко, чтобы не потерять сигнал, и
@@ -43,6 +43,12 @@ pub struct WatchdogState {
     pub prev_check_ms: Option<i64>,
     #[serde(default)]
     pub prev_restart_counts: HashMap<String, u64>,
+    /// M-89 (задача #10, §4.3): якорь последнего сэмпла `gateway-serve.heartbeat`
+    /// для правила молчания выдачи (детектор на дельтах). `Disabled` НЕ трогает
+    /// (`Default` = `None`, состояние не накапливается). `ConfiguredMissing` НЕ
+    /// сбрасывает (R-005 F-1: нечитаемый такт не стирает историю).
+    #[serde(default)]
+    pub prev_serving_heartbeat: Option<ServingHeartbeatSample>,
     /// Якорь ПОСЛЕДНЕГО НАБЛЮДАВШЕГОСЯ ПРОГРЕССА `next_seq` (R-005 F-1) — обновляется ТОЛЬКО
     /// когда `next_seq` реально вырос, а не на каждом цикле. Это то, что отличает "застой
     /// длится N минут реального времени" от "застой длится N интервалов cron'а" — старая

@@ -44,6 +44,17 @@ pub enum Incident {
     /// после сбоя. Детектируется в слое склейки (`watchdog_cycle::run_cycle`), не здесь —
     /// вход (`CronJobObservation`/`CronFailureMarker`) специфичен для этого слоя.
     CronFailed,
+    /// M-89 (задача #10, §4.3 / `I-6`): сердцебиение ВЫДАЧИ (`gateway-serve`)
+    /// отсутствует/не разобрано — выдача снаружи невидима. `Critical`.
+    ServingHeartbeatMissing,
+    /// M-89 (задача #10, §4.3 / `I-6`): сердцебиение выдачи не обновлялось
+    /// сверх `serving_heartbeat_warn_ms` (Warning) / `serving_heartbeat_crit_ms`
+    /// (Critical).
+    ServingHeartbeatStale,
+    /// M-89 (задача #10, §4.3 / `OPS-I-8` на выдачу): попытки ЕСТЬ, поддержанные
+    /// отказы ЕСТЬ, успехов НЕТ — голодание на стороне выдачи (read-only
+    /// клиенты подключаются, отказы приходят, но снимков/фреймов — ноль). `Critical`.
+    ServingSilence,
 }
 
 impl Incident {
@@ -61,6 +72,9 @@ impl Incident {
             Incident::CronMarkerMissing => "WD-CRON-MISSING",
             Incident::CronMarkerStale => "WD-CRON-STALE",
             Incident::CronFailed => "WD-CRON-FAILED",
+            Incident::ServingHeartbeatMissing => "WD-SERVING-HB-MISSING",
+            Incident::ServingHeartbeatStale => "WD-SERVING-HB-STALE",
+            Incident::ServingSilence => "WD-SERVING-SILENCE",
         }
     }
 }
@@ -142,6 +156,52 @@ pub struct ContainerStatus {
     pub restart_count: Option<u64>,
 }
 
+/// M-89 (задача #10, §4.3 / `I-6`): снэпшот `gateway-serve.heartbeat` (форма §4.2,
+/// `crates/gateway-serve/src/lib.rs::run_heartbeat`). Все поля обязательны — сердцебиение
+/// пишется прод-бинарём по `with_heartbeat` билдеру (`TD-220`, `OPS-I-10`).
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq)]
+pub struct ServingHeartbeatSample {
+    pub ts_wall_ms: i64,
+    pub attempts: u64,
+    pub successes: u64,
+    pub refusals_supported: u64,
+    pub refusals_unsupported: u64,
+    pub journal_payload_bytes_read: u64,
+    pub slots_in_flight: u64,
+}
+
+impl Default for ServingHeartbeatSample {
+    fn default() -> Self {
+        Self {
+            ts_wall_ms: 0,
+            attempts: 0,
+            successes: 0,
+            refusals_supported: 0,
+            refusals_unsupported: 0,
+            journal_payload_bytes_read: 0,
+            slots_in_flight: 0,
+        }
+    }
+}
+
+/// M-89 (задача #10, §4.3 / `I-6` / `C-260` R1): вход «сердцебиение выдачи» — ТРИ
+/// состояния. Первая редакция кодировала `Option<Sample>`; `None` означал ОДНОВРЕМЕННО
+/// «интеграции нет» (legacy `run_cycle`) и «файл не прочитан» (тревога) — g1 требовал
+/// противоположного от одного значения. Круг 2: `Disabled` / `ConfiguredMissing` /
+/// `Present(Sample)`.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum ServingHeartbeat {
+    /// Интеграции нет (legacy `run_cycle`, тревоги быть не должно; serving-проверки
+    /// НЕ исполняются, состояние serving-якоря НЕ трогается).
+    #[default]
+    Disabled,
+    /// Путь задан, файл не прочитан/не разобран ⇒ `WD-SERVING-HB-MISSING`; якорь
+    /// молчания НЕ сбрасывается (нечитаемый такт не стирает историю, R-005 F-1).
+    ConfiguredMissing,
+    /// Файл прочитан и разобран.
+    Present(ServingHeartbeatSample),
+}
+
 /// Позитивный маркер успешного прогона cron-задачи (компакция/чекпоинт/ретеншен), формат —
 /// как у `deploy/bin/journal-retention-cron.sh` (`RETENTION_LAST_SUCCESS`): содержимое файла —
 /// UTC ISO-8601 момента последнего успеха, распарсенное вызывающим в epoch ms.
@@ -165,6 +225,12 @@ pub struct Thresholds {
     pub disk_crit_hours: f64,
     pub cron_warn_age_ms: i64,
     pub cron_crit_age_ms: i64,
+    /// M-89 (задача #10, §4.3 / `OPS-I-8` на выдачу): пороги несвежести
+    /// сердцебиения `gateway-serve`. Дефолт 60 000 / 180 000 мс — те же,
+    /// что у recorder'а (recorder.heartbeat — период 10 с, протухание recorder-файла
+    /// на 60 с = 6 пропущенных тиков).
+    pub serving_heartbeat_warn_ms: i64,
+    pub serving_heartbeat_crit_ms: i64,
 }
 
 impl Default for Thresholds {
@@ -198,6 +264,10 @@ impl Default for Thresholds {
             // запас сверх суток на дрейф расписания. CRIT — двое суток подряд пропущено.
             cron_warn_age_ms: 26 * 3_600_000,
             cron_crit_age_ms: 48 * 3_600_000,
+            // M-89 (задача #10): пороги несвежести выдачи. Те же 60 / 180 секунд,
+            // что у recorder'а (период 10 с, 6 / 18 пропущенных тиков).
+            serving_heartbeat_warn_ms: 60_000,
+            serving_heartbeat_crit_ms: 180_000,
         }
     }
 }
@@ -510,4 +580,85 @@ pub fn parse_docker_status_healthy(status: &str) -> bool {
         return false;
     }
     true
+}
+
+/// M-89 (задача #10, §4.3 / `I-6`): проверка наличия сердцебиения выдачи.
+/// `Disabled` → `None` (интеграции нет, тревоги быть не должно).
+/// `ConfiguredMissing` → `Some(CRITICAL)` (путь задан, файла нет).
+/// `Present(_)` → `None` (файл прочитан, тревоги нет).
+pub fn check_serving_heartbeat_missing(hb: &ServingHeartbeat) -> Option<Alert> {
+    match hb {
+        ServingHeartbeat::Disabled => None,
+        ServingHeartbeat::ConfiguredMissing => Some(Alert::new(
+            Incident::ServingHeartbeatMissing,
+            Level::Critical,
+            "WATCHDOG_SERVING_HEARTBEAT_PATH задан, но файл не прочитан или не \
+             разобран как JSON — gateway-serve либо не пишет, либо путь/том неверный; \
+             выдача снаружи невидима (PL-I-8: алерт живёт вне наблюдаемой машины)"
+                .to_string(),
+        )),
+        ServingHeartbeat::Present(_) => None,
+    }
+}
+
+/// M-89 (задача #10, §4.3 / `I-6`): несвежесть сердцебиения выдачи — WARNING/CRITICAL
+/// по порогам `serving_heartbeat_warn_ms`/`serving_heartbeat_crit_ms`. `now_ms -
+/// hb.ts_wall_ms` — возраст. Здоровая пара: возраст ≤ `serving_heartbeat_warn_ms` → `None`.
+pub fn check_serving_heartbeat_stale(
+    now_ms: i64,
+    hb: &ServingHeartbeatSample,
+    thr: &Thresholds,
+) -> Option<Alert> {
+    let age_ms = now_ms - hb.ts_wall_ms;
+    if age_ms > thr.serving_heartbeat_crit_ms {
+        Some(Alert::new(
+            Incident::ServingHeartbeatStale,
+            Level::Critical,
+            format!(
+                "gateway-serve.heartbeat не обновлялся {age_ms} мс (CRITICAL {} мс; период \
+                 сердцебиения 10 с, т.е. ~{} тиков подряд) — выдача снаружи невидима",
+                thr.serving_heartbeat_crit_ms,
+                age_ms / 10_000
+            ),
+        ))
+    } else if age_ms > thr.serving_heartbeat_warn_ms {
+        Some(Alert::new(
+            Incident::ServingHeartbeatStale,
+            Level::Warning,
+            format!(
+                "gateway-serve.heartbeat не обновлялся {age_ms} мс (WARNING {} мс)",
+                thr.serving_heartbeat_warn_ms
+            ),
+        ))
+    } else {
+        None
+    }
+}
+
+/// M-89 (задача #10, §4.3 / `OPS-I-8` на выдачу): правило молчания выдачи на ДЕЛЬТАХ
+/// между `prev` и `cur` (как `metrics::silence_alarm` для процесса, только снаружи).
+/// Звенит ТОЛЬКО когда `Δattempts > 0 ∧ Δrefusals_supported > 0 ∧ Δsuccesses == 0` —
+/// поток заявок есть, поддержанные отказы приходят, но снимков/фреймов ноль.
+/// Отрицательная дельта (рестарт процесса) ⇒ `None` (новый якорь, не голодание).
+pub fn check_serving_silence(
+    prev: &ServingHeartbeatSample,
+    cur: &ServingHeartbeatSample,
+) -> Option<Alert> {
+    let d_attempts = cur.attempts as i128 - prev.attempts as i128;
+    let d_refusals_supported =
+        cur.refusals_supported as i128 - prev.refusals_supported as i128;
+    let d_successes = cur.successes as i128 - prev.successes as i128;
+    if d_attempts > 0 && d_refusals_supported > 0 && d_successes == 0 {
+        Some(Alert::new(
+            Incident::ServingSilence,
+            Level::Critical,
+            format!(
+                "выдача голодает: между тактами Δattempts=+{d_attempts}, \
+                 Δrefusals_supported=+{d_refusals_supported}, Δsuccesses=+0 — \
+                 заявки приходят, поддержанные отказы приходят, снимков/фреймов нет"
+            ),
+        ))
+    } else {
+        None
+    }
 }
