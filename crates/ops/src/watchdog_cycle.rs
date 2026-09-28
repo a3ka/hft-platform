@@ -452,12 +452,7 @@ fn build_cron_failed_alert(name: &str, failure: &CronFailureMarker) -> Alert {
 /// · `Disabled` (legacy) — ничего не делаем (ни serving-проверок, ни обновления якоря);
 /// · `ConfiguredMissing` — MISSING CRITICAL, якорь НЕ трогаем (R-005 F-1);
 /// · `Present(s)` — STALE по порогам, И молчание по дельтам с якорем (если якорь есть).
-fn run_serving_checks(
-    cycle: &mut Cycle,
-    serving: &ServingInputs,
-    now_ms: i64,
-    thr: &Thresholds,
-) {
+fn run_serving_checks(cycle: &mut Cycle, serving: &ServingInputs, now_ms: i64, thr: &Thresholds) {
     use crate::watchdog::{
         check_serving_heartbeat_missing, check_serving_heartbeat_stale, check_serving_silence,
         ServingHeartbeat, ServingHeartbeatSample,

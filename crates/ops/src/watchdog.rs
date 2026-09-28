@@ -645,8 +645,7 @@ pub fn check_serving_silence(
     cur: &ServingHeartbeatSample,
 ) -> Option<Alert> {
     let d_attempts = cur.attempts as i128 - prev.attempts as i128;
-    let d_refusals_supported =
-        cur.refusals_supported as i128 - prev.refusals_supported as i128;
+    let d_refusals_supported = cur.refusals_supported as i128 - prev.refusals_supported as i128;
     let d_successes = cur.successes as i128 - prev.successes as i128;
     if d_attempts > 0 && d_refusals_supported > 0 && d_successes == 0 {
         Some(Alert::new(

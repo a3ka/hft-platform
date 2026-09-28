@@ -523,7 +523,8 @@ pub mod server {
                         let slots = self.slots.clone();
                         let counters = self.counters.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = handle_conn(stream, cfg, policy, slots, counters).await {
+                            if let Err(e) = handle_conn(stream, cfg, policy, slots, counters).await
+                            {
                                 tracing::debug!(error = %e, "gateway-serve conn ended with error");
                             }
                         });
@@ -765,8 +766,18 @@ pub mod server {
     /// используется ниже по коду (через `_stats` и для будущих мультиплексных сценариев)»),
     /// врёт: `_stats` тоже дропается, а «будущие сценарии» в природе не появились.
     pub type V1PumpResult = Result<
-        (gateway::LiveReducer, Vec<crate::_gw::Frame>, u64, gateway::ReadStats),
-        Box<(gateway::LiveReducer, std::io::Error, u64, gateway::ReadStats)>,
+        (
+            gateway::LiveReducer,
+            Vec<crate::_gw::Frame>,
+            u64,
+            gateway::ReadStats,
+        ),
+        Box<(
+            gateway::LiveReducer,
+            std::io::Error,
+            u64,
+            gateway::ReadStats,
+        )>,
     >;
     /// Тип FuturesUnordered, агрегирующий in-flight pump'ы. `BTreeSet<String>` отдельно
     /// (поле `pending_ids`) — id'ы в полёте; используется для дешёвой проверки «уже качается»
@@ -1091,8 +1102,8 @@ pub mod server {
                 if let Some(policy) = inner.policy.clone() {
                     use super::admission::{admit, readiness, ServingOutcome};
                     metrics::inc_attempts(inner.counters.as_ref()); // Попытка зарегистрирована ДО admit/readiness,
-                                                 // иначе C6 «попытка не выросла» краснеет на
-                                                 // refused-запросах.
+                                                                    // иначе C6 «попытка не выросла» краснеет на
+                                                                    // refused-запросах.
                     let outcome = admit(&policy, &sel);
                     match outcome {
                         ServingOutcome::Unsupported => {
@@ -1322,7 +1333,10 @@ pub mod server {
                             // `LiveReducer::resume` warm/cold-ветки. Счётчик отвечает на
                             // вопрос, который обещает его имя; проверяется оракулом
                             // `red_m87_read_volume_truth::q2` против `rchar` ядра.
-                            metrics::add_journal_payload_bytes(counters_for_resume.as_ref(), stats.payload_bytes_read);
+                            metrics::add_journal_payload_bytes(
+                                counters_for_resume.as_ref(),
+                                stats.payload_bytes_read,
+                            );
                             Ok((
                                 snap,
                                 session::Sub {
@@ -1469,7 +1483,10 @@ pub mod server {
                     // живёт в контейнере `move`-замыкания и во внешний scope не
                     // пробрасывается; альтернатива «вернуть stats из замыкания» расширяет
                     // тип результата и оба места ошибки (SWITCH/ADD), здесь — узкая точка.
-                    metrics::add_journal_payload_bytes(counters_for_resume.as_ref(), stats.payload_bytes_read);
+                    metrics::add_journal_payload_bytes(
+                        counters_for_resume.as_ref(),
+                        stats.payload_bytes_read,
+                    );
                     Ok((
                         snap,
                         session::Sub {

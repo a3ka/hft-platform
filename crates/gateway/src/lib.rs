@@ -3892,25 +3892,11 @@ pub(crate) fn payload_bytes_for_dir(dir: &Path) -> io::Result<u64> {
 /// попадает в конец последнего покрытого сегмента) сегмент НЕ содержит after_seq — все
 /// события в нём уже учтены чекпоинтом, и `live.pump` читает только хвост.
 ///
-/// Источник истины — `journal::list_segments` (sacred; используется публичный API),
-/// фильтрация по `first_seq`. Возвращает `0` при пустом каталоге или ошибке чтения —
-/// `payload_bytes_read` обязан быть монотонной верхней границей, и сбой
-/// `list_segments` не должен приводить к отказу выдачи.
-pub(crate) fn payload_bytes_after_cursor(dir: &Path, after_seq: u64) -> u64 {
-    let segs = match journal::list_segments(dir) {
-        Ok(s) => s,
-        Err(_) => return 0,
-    };
-    let mut total: u64 = 0;
-    // DET-OK: итерация по `SegmentInfo` не зависит от порядка (сумма коммутативна).
-    for s in &segs {
-        // Сегмент ЦЕЛИКОМ после курсора — `live.pump` его прочитает полностью.
-        if s.header.first_seq > after_seq {
-            total = total.saturating_add(s.size_bytes);
-        }
-    }
-    total
-}
+// M-89 (задача #3, `I-4`): функция описания каталога удалена (M-89-задача-3).
+// Счётчик байт приходит напрямую из `EventStream` (см. `EventStream::payload_bytes_read`
+// в `crates/journal/src/segments.rs`) — ровно столько байт, сколько прочитал ридер,
+// без описи каталога. Вызывающие места (warm-resume, оракул q2) переведены на
+// стримовый путь.
 
 /// M-87 (предохранитель выдачи, A-037 D-1, аддитивно): `pub`-форма
 /// `payload_bytes_for_dir` для `gateway_serve` — транспорт пробрасывает

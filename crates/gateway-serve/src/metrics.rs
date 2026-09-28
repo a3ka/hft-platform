@@ -127,7 +127,9 @@ pub fn inc_refusals_unsupported_for(handle: &ServingCountersHandle) {
     REFUSALS_UNSUPPORTED_GLOBAL.fetch_add(1, Ordering::SeqCst);
 }
 pub fn add_journal_payload_bytes_for(handle: &ServingCountersHandle, bytes: u64) {
-    handle.journal_payload_bytes_read.fetch_add(bytes, Ordering::SeqCst);
+    handle
+        .journal_payload_bytes_read
+        .fetch_add(bytes, Ordering::SeqCst);
     JOURNAL_BYTES_GLOBAL.fetch_add(bytes, Ordering::SeqCst);
 }
 
