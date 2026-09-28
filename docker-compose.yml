@@ -225,6 +225,14 @@ services:
       GATEWAY_MAX_CONCURRENT_SERVES: ${GATEWAY_MAX_CONCURRENT_SERVES:-4}
       GATEWAY_MAX_TAIL_EVENTS: ${GATEWAY_MAX_TAIL_EVENTS:-255600}
       GATEWAY_EXPECTED_WARMUP_EVENTS: ${GATEWAY_EXPECTED_WARMUP_EVENTS:-127800}
+      # M-89 (задача #8/9, §4.2 / `I-6`, `TD-220`, `PL-I-8`): сердцебиение ВНУТРИ
+      # записываемого тома `gateway-state` (НЕ `/journal`, НЕ `/ckpt` — оба `:ro`,
+      # §8-взгляд 2026-09-27). Путь — ФАЙЛ внутри тома (не корень, не каталог с
+      # хвостовым `/` — `C-260` R3). Хост-путь тома ДОЛЖЕН совпасть с
+      # `WATCHDOG_SERVING_HEARTBEAT_PATH` в `deploy/cron.d/watchdog` (композиция
+      # проверяется `verify_M-89.sh` task11 и `red_m89_heartbeat_entrypoint::h0`).
+      GATEWAY_HEARTBEAT_PATH: /state/gateway-serve.heartbeat
+      GATEWAY_HEARTBEAT_PERIOD_MS: ${GATEWAY_HEARTBEAT_PERIOD_MS:-10000}
     volumes:
       # RO-bind к журналу — gateway-serve только читает (GS-I-3: read-only). Recorder
       # владеет журналом, gateway-serve его НЕ мутирует.
@@ -234,6 +242,10 @@ services:
       # gateway-serve отсюда только читает через `snapshot_from_checkpoint`. RW-bind
       # на чтении избыточен и дал бы привилегию удалить чекпоинт.
       - gateway-ckpt:/ckpt:ro
+      # M-89 (задача #8/9, §4.2 / `I-6`): RW-bind к ЗАПИСЫВАЕМОМУ тому для сердцебиения.
+      # Не `/journal`, не `/ckpt` (оба `:ro`); отдельный RW-bind, чтобы прод-смоук
+      # видел файл и у watchdog был свежий mtime. Том объявлен в `volumes:` ниже.
+      - gateway-state:/state
     entrypoint: ["/usr/local/bin/gateway-serve"]
     healthcheck:
       # WS-протокол: healthcheck = TCP-connect к bind-адресу. Полноценный JWT-handshake —
@@ -321,3 +333,7 @@ volumes:
   journal-data:
   # M-38b: RW-том для чекпоинтов (по аналогии с journal-cold для холодного бэкапа).
   gateway-ckpt:
+  # M-89 (задача #9, §4.2 / `I-6`): RW-том для сердцебиения gateway-serve.
+  # Хост-путь: `/var/lib/docker/volumes/hft-platform_gateway-state/_data/`.
+  # Должен совпасть с `WATCHDOG_SERVING_HEARTBEAT_PATH` в `deploy/cron.d/watchdog`.
+  gateway-state:
