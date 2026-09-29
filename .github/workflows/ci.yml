@@ -616,7 +616,15 @@ jobs:
     if: always()
     steps:
       - run: |
-          if [[ "${{ needs.build-test.result }}" != "success" || "${{ needs.security.result }}" != "success" || "${{ needs.delivery.result }}" != "success" || "${{ needs.protected-artifacts.result }}" != "success" || "${{ needs.contracts.result }}" != "success" || "${{ needs.docs-freeze.result }}" != "success" || "${{ needs.archived-refs.result }}" != "success" || "${{ needs.artifact-ids.result }}" != "success" || "${{ needs.reserve-ids.result }}" != "success" || "${{ needs.design-claims.result }}" != "success" || "${{ needs.context-budgets.result }}" != "success" || "${{ needs.gate-meta.result }}" != "success" || "${{ needs.deploy-catchup.result }}" != "success" || "${{ needs.review-fa.result }}" != "success" || "${{ needs.resource-oracles.result }}" != "success" || "${{ needs.rollout-composition.result }}" != "success" ]]; then
+          if [[ "${{ needs.build-test.result }}" != "success" || "${{ needs.security.result }}" != "success" || "${{ needs.delivery.result }}" != "success" || "${{ needs.protected-artifacts.result }}" != "success" || "${{ needs.secret-material.result }}" != "success" || "${{ needs.roadmap-sync.result }}" != "success" || "${{ needs.contracts.result }}" != "success" || "${{ needs.docs-freeze.result }}" != "success" || "${{ needs.archived-refs.result }}" != "success" || "${{ needs.artifact-ids.result }}" != "success" || "${{ needs.reserve-ids.result }}" != "success" || "${{ needs.design-claims.result }}" != "success" || "${{ needs.context-budgets.result }}" != "success" || "${{ needs.gate-meta.result }}" != "success" || "${{ needs.deploy-catchup.result }}" != "success" || "${{ needs.review-fa.result }}" != "success" || "${{ needs.resource-oracles.result }}" != "success" || "${{ needs.rollout-composition.result }}" != "success" ]]; then
             echo "One or more checks failed"; exit 1
           fi
           echo "All checks passed"
+      # ПРОБА САМОГО АГРЕГАТА (2026-09-26). Условие выше — рукописный список; до этой даты в нём
+      # не было `secret-material` и `roadmap-sync` (при 18 в `needs`), и их провал merge не держал.
+      # Проба ИСПОЛНЯЕТ условие для КАЖДОГО джоба `needs` поодиночке и называет выпавший;
+      # стоит ВТОРЫМ шагом — первый шаг агрегата исполняют `deploy_catchup.py check-aggregate`
+      # и `red_review_fa.sh` W8, их форма не меняется (`C-257` R2).
+      - uses: actions/checkout@v4
+      - name: Проба агрегата — каждый джоб needs роняет условие
+        run: bash scripts/tests/red_ci_aggregate.sh

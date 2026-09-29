@@ -609,31 +609,6 @@ def _job_is_disarmed(job):
     return None
 
 
-def _invokes(job, needle):
-    """Команда `needle` стоит В ПОЗИЦИИ КОМАНДЫ хотя бы в одном шаге.
-
-    Отличие от подстроки — принципиальное: `echo "deploy_catchup.py ок"` не считается
-    вызовом. Строка очищается от комментария, режется по разделителям команд (`&&`, `||`,
-    `;`, `|`), и `needle` обязан открывать один из сегментов. Предел назван честно: полного
-    разбора shell тут нет, поэтому `eval`/переменная в имени команды барьером не ловятся.
-    """
-    for st in _steps(job):
-        run = st.get("run")
-        if not isinstance(run, str):
-            continue
-        for line in run.splitlines():
-            body = line.split("#", 1)[0].strip()
-            if not body:
-                continue
-            for seg in re.split(r"&&|\|\||;|\|", body):
-                seg = seg.strip()
-                if seg.startswith(("sudo ", "env ")):
-                    seg = seg.split(None, 1)[1] if " " in seg else seg
-                if seg.startswith(needle):
-                    return True
-    return False
-
-
 # ---------------------------------------------------------------- check-aggregate
 
 # Барьер CI-АГРЕГАТА. Закрывает `C-093` R-1.
@@ -705,6 +680,93 @@ def _agg_exec(script, results, root, env_extra=None):
     return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
 
 
+# ЗАКРЫТАЯ ФОРМА двух гейт-джобов (`A-041`, основание — `A-040` Q2 «сменить основание, а
+# не чинить парсер дальше»). Прежняя проверка разбирала строку `run` (`_invokes`) — это чёрный
+# список форм оболочки, и он не сходится: `true || P`, `P || echo`, `set +e`, heredoc, `P &`,
+# ключи шага (`if:`, `env:`, `working-directory:`, `timeout-minutes:`), лишний шаг-шим — все
+# проходили её (`C-259` R4, восемь исполняемых лазеек в замере арбитра). Белый список формы
+# сходится: всё, что не совпало с каноном, — отказ с путём до места и каноном рядом.
+#
+# Расширение канона — ТОЛЬКО вместе с новым сценарием в `red_deploy_catchup.sh`: иначе канон
+# молча разойдётся с `ci.yml` и начнёт краснеть честную правку или пропускать нечестную.
+#
+# ПРЕДЕЛ, названный честно (`A-041` п.4, COGNITIVE-ONLY): терминальное звено — эта проверка
+# сама ручается за свой вызов (A6 — форма джоба, в котором она стоит). Кто перепишет и
+# проверку, и её вызов одним коммитом, её обойдёт; против этого — круг гейта, не механизм.
+_FORM_STEP_KEYS = {"name", "run"}
+_FORM_CHECKOUT = {"uses": "actions/checkout@v4"}
+_FORM_COND = "<условие агрегата: единственный шаг со ссылкой needs.X.result>"
+_FORM_JOBS = {
+    AGG_GATE: {
+        "code": "A4",
+        "pinned": {"name": "All checks passed", "runs-on": "ubuntu-latest", "if": "always()"},
+        "keys": {"name", "runs-on", "needs", "if", "steps"},
+        "steps": [_FORM_COND, _FORM_CHECKOUT, "bash scripts/tests/red_ci_aggregate.sh"],
+    },
+    AGG_JOB: {
+        "code": "A1",
+        "pinned": {"runs-on": "ubuntu-latest"},
+        "keys": {"name", "runs-on", "steps"},
+        "steps": [
+            _FORM_CHECKOUT,
+            "python3 scripts/deploy_catchup.py check-wiring",
+            "python3 scripts/check_deploy_gate.py",
+            "python3 scripts/deploy_catchup.py check-aggregate",
+            "bash scripts/tests/red_deploy_catchup.sh",
+            "bash scripts/tests/red_deploy_catchup.sh --battery",
+        ],
+    },
+}
+
+
+def _form_violations(jobs, job_name):
+    """Отклонения джоба от закрытой формы: список (код, текст с путём и каноном)."""
+    spec = _FORM_JOBS[job_name]
+    code = spec["code"]
+    out = []
+    job = jobs.get(job_name)
+    if not isinstance(job, dict):
+        return [(code, f"джоба `{job_name}` нет — сторож не проводится в CI вовсе")]
+    extra = sorted(set(job) - spec["keys"])
+    if extra:
+        out.append((code, f"`{job_name}`: ключи {extra} вне канона {sorted(spec['keys'])}"))
+    for k, v in spec["pinned"].items():
+        if job.get(k) != v:
+            out.append((code, f"`{job_name}.{k}` = {job.get(k)!r}, канон {v!r}"))
+    steps = job.get("steps")
+    if not isinstance(steps, list):
+        return out + [(code, f"`{job_name}.steps` не список")]
+    form = spec["steps"]
+    if len(steps) != len(form):
+        out.append((code, f"`{job_name}`: шагов {len(steps)}, канон {len(form)} — лишний или "
+                          f"выпавший шаг (шим до вызова, удалённый вызов)"))
+    for i, (st, want) in enumerate(zip(steps, form)):
+        path = f"`{job_name}.steps[{i}]`"
+        if not isinstance(st, dict):
+            out.append((code, f"{path} не словарь"))
+            continue
+        if want == _FORM_CHECKOUT:
+            if st != _FORM_CHECKOUT:
+                out.append((code, f"{path} = {st!r}, канон {_FORM_CHECKOUT!r} (без with/env/if)"))
+            continue
+        extra = sorted(set(st) - _FORM_STEP_KEYS)
+        if extra:
+            out.append((code, f"{path}: ключи {extra} вне канона {sorted(_FORM_STEP_KEYS)} "
+                              f"(if/env/working-directory/timeout-minutes/continue-on-error меняют исполнение)"))
+        run = st.get("run")
+        if not isinstance(run, str):
+            out.append((code, f"{path}: нет `run`"))
+            continue
+        got = " ".join(run.split())
+        if want == _FORM_COND:
+            if "needs." not in run:
+                out.append((code, f"{path}: условие агрегата без ссылки needs.X.result"))
+        elif got != want:
+            out.append((code, f"{path}.run = {got[:80]!r}, канон {want!r} — строка обязана "
+                              f"совпасть целиком (разбор оболочки не сходится, `A-041`)"))
+    return out
+
+
 def cmd_check_aggregate():
     root = os.environ.get("CATCHUP_REPO_ROOT") or "."
     ci_path = os.environ.get("CATCHUP_CI_YML") or os.path.join(
@@ -719,33 +781,12 @@ def cmd_check_aggregate():
     def bad(code, msg):
         problems.append(f"{code}: {msg}")
 
-    # A1 — джоб существует и РЕАЛЬНО зовёт предмет, а не назван похоже.
-    job = jobs.get(AGG_JOB)
-    if not isinstance(job, dict):
-        bad("A1", f"джоба `{AGG_JOB}` в {ci_path} нет — сторож не проводится в CI вовсе")
-        script = ""
-    else:
-        script = _agg_run_script(job)
-        # ВЫЗОВ, а не вхождение подстроки (`C-096` B-3): джоб из одного `echo` с обоими
-        # именами проходил прежнюю проверку и всю пробу.
-        if not _invokes(job, "python3 scripts/deploy_catchup.py"):
-            bad("A1", f"джоб `{AGG_JOB}` не ЗОВЁТ `scripts/deploy_catchup.py` в позиции команды "
-                      f"(упоминание имени в `echo` вызовом не является)")
-        if not _invokes(job, "bash scripts/tests/red_deploy_catchup.sh"):
-            bad("A1", f"джоб `{AGG_JOB}` не ЗОВЁТ пробу `scripts/tests/red_deploy_catchup.sh` "
-                      f"в позиции команды")
-        # A6 — барьер обязан проверять, что ЕГО САМОГО зовут. Удаление собственного шага
-        # иначе ненаблюдаемо (`C-096` B-3 п.2; класс TD-106/TD-062 — «гейт есть, не гейтит»).
-        if not _invokes(job, "python3 scripts/deploy_catchup.py check-aggregate"):
-            bad("A6", f"`{AGG_JOB}` не зовёт `deploy_catchup.py check-aggregate` — барьер "
-                      f"CI-агрегата не исполняется, и его удаление ненаблюдаемо")
-        for st in _steps(job):
-            why = _step_is_disarmed(st)
-            if why:
-                bad("A6", f"шаг джоба `{AGG_JOB}` обезврежен ({why}) — красное не наблюдается")
-        why = _job_is_disarmed(job)
-        if why:
-            bad("A6", f"джоб `{AGG_JOB}` обезврежен ({why})")
+    # A1 (форма deploy-catchup) и A6 (собственный вызов check-aggregate — шаг формы) — ЗАКРЫТОЙ
+    # ФОРМОЙ, не разбором строки (`A-041`). A6 выделен кодом для шага собственного вызова.
+    for code, msg in _form_violations(jobs, AGG_JOB):
+        if "check-aggregate" in msg:
+            code = "A6"
+        bad(code, msg)
 
     gate = jobs.get(AGG_GATE)
     if not isinstance(gate, dict):
@@ -759,24 +800,18 @@ def cmd_check_aggregate():
     if not isinstance(needs, list) or AGG_JOB not in needs:
         bad("A2", f"`{AGG_JOB}` отсутствует в `{AGG_GATE}.needs` = {needs!r}")
 
+    # A4 — форма агрегата ЗАКРЫТА (`A-041`): три шага по порядку — условие, checkout, проба
+    # `red_ci_aggregate.sh` ровно одной командой; ключи джоба и шагов — только канонические.
+    # Покрывает и прежний A3bis (`continue-on-error`/`if: false` на шаге условия — ключ вне
+    # канона), и прежний A4 по вызову пробы — без разбора оболочки.
+    for code, msg in _form_violations(jobs, AGG_GATE):
+        bad(code, msg)
+
     # A3 — УЧАСТИЕ В РЕШЕНИИ, проверенное ИСПОЛНЕНИЕМ.
     #
     # Две модели, и обе обязательны. Только «красный джоб ⇒ агрегат падает» прошёл бы
     # против условия `exit 1` без всяких условий («падать всегда»); только «всё зелено ⇒
     # агрегат проходит» прошёл бы против `exit 0` («не падать никогда»). Пара различает.
-    # A3bis — исход ДЖОБА, а не выражение внутри него (`C-096` B-2): `continue-on-error`
-    # или `if: false` на шаге агрегата оставляют `status-check` зелёным при красном стороже,
-    # то есть ровно «All checks passed» поверх неработающего механизма.
-    why = _job_is_disarmed(gate)
-    if why:
-        bad("A3", f"джоб-агрегат `{AGG_GATE}` обезврежен ({why}): его красное не блокирует merge")
-    for st in _steps(gate):
-        if isinstance(st.get("run"), str) and "needs." in st["run"]:
-            why = _step_is_disarmed(st)
-            if why:
-                bad("A3", f"шаг `{AGG_GATE}`, несущий fail-closed условие, обезврежен ({why}) — "
-                          f"агрегат станет success при красном джобе")
-
     gate_script = _agg_run_script(gate)
     if not gate_script:
         bad("A3", f"у `{AGG_GATE}` нет ни одного шага `run` — решать нечем")
