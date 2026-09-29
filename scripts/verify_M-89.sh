@@ -133,7 +133,12 @@ ci_runs() { # <ci.yml> → нормализованные команды run:, �
     inblk {
       if ($0 ~ /^[[:space:]]*$/) next
       match($0, /^[[:space:]]*/); n = RLENGTH
-      if (ind < 0) { ind = n; print ltrim($0); next }
+      if (ind < 0) { ind = n; l = ltrim($0)
+        # УСЛОВИЕ АГРЕГАТА — по ФОРМЕ, не по тексту: оно меняется при каждом новом джобе в needs
+        # (PR #232 добавил два), и дословный ключ таблицы протухал бы каждый раз. Правильность
+        # самого условия держит проба red_ci_aggregate.sh (строка EXEC ниже), не эта таблица.
+        if (l ~ /^if \[\[ "\$\{\{ needs\./) l = "<условие агрегата status-check>"
+        print l; next }
       if (n >= ind) next
       inblk = 0
     }
@@ -215,7 +220,8 @@ CI_MAP['python3 -m pip install --quiet pyyaml']='WAIVER:w_py_yaml установ
 CI_MAP['bash scripts/check_rollout_composition.sh']='EXEC'
 CI_MAP['bash scripts/tests/red_rollout_composition.sh']='WAIVER:w_harness_untouched проба барьера; харнесс не тронут'
 # --- status-check: агрегат `All checks passed` — проводка
-CI_MAP['if [[ "${{ needs.build-test.result }}" != "success" || "${{ needs.security.result }}" != "success" || "${{ needs.delivery.result }}" != "success" || "${{ needs.protected-artifacts.result }}" != "success" || "${{ needs.contracts.result }}" != "success" || "${{ needs.docs-freeze.result }}" != "success" || "${{ needs.archived-refs.result }}" != "success" || "${{ needs.artifact-ids.result }}" != "success" || "${{ needs.reserve-ids.result }}" != "success" || "${{ needs.design-claims.result }}" != "success" || "${{ needs.context-budgets.result }}" != "success" || "${{ needs.gate-meta.result }}" != "success" || "${{ needs.deploy-catchup.result }}" != "success" || "${{ needs.review-fa.result }}" != "success" || "${{ needs.resource-oracles.result }}" != "success" || "${{ needs.rollout-composition.result }}" != "success" ]]; then']='WAIVER:w_ci_plumbing агрегат «All checks passed» — проводка CI, не проверка предмета'
+CI_MAP['<условие агрегата status-check>']='WAIVER:w_ci_plumbing агрегат «All checks passed» — проводка CI, не проверка предмета'
+CI_MAP['bash scripts/tests/red_ci_aggregate.sh']='EXEC'
 
 # Предикаты waiver'ов: 0 — waiver действителен.
 harness_touched_files() {
@@ -269,6 +275,7 @@ ci_exec() { # <cmd>
     'bash scripts/check_review_fa.sh')
       if [ -z "$(git diff --name-only --diff-filter=A "$BASE" HEAD -- 'research/reviews/R-*.md' | xargs -r grep -l 'M-89' 2>/dev/null)" ]; then return 97; fi
       env $ev bash scripts/check_review_fa.sh >/dev/null 2>&1 ;;
+    'bash scripts/tests/red_ci_aggregate.sh') bash scripts/tests/red_ci_aggregate.sh >/dev/null 2>&1 ;;
     'bash scripts/check_branch_health.sh || true') bash scripts/check_branch_health.sh >/dev/null 2>&1 || true ;;
     "git fetch --no-tags origin '+refs/salvage/*:refs/salvage/*'") git fetch --no-tags origin '+refs/salvage/*:refs/salvage/*' >/dev/null 2>&1 ;;
     bash\ scripts/check_*|bash\ scripts/verify_*) env $ev bash ${cmd#bash } >/dev/null 2>&1 ;;
