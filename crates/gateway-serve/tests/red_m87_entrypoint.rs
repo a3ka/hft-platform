@@ -33,7 +33,7 @@ use futures_util::{SinkExt, StreamExt};
 use gateway::Selector;
 use gateway_serve::admission::{AdmissionPolicy, LiveProfile};
 use gateway_serve::auth::Claims;
-use gateway_serve::metrics::{freshness, serving_counters};
+use gateway_serve::metrics::freshness;
 
 /// ТЕСТЫ ЭТОГО ФАЙЛА ИДУТ ПО ОЧЕРЕДИ — и это требование к оракулу, а не к удобству.
 /// `serving_counters()` — ПРОЦЕССНЫЙ счётчик, а тесты одного бинаря по умолчанию идут
@@ -422,6 +422,29 @@ async fn serve_with_slots(
     (addr, slots)
 }
 
+/// `M-89` задача 7 (`TD-224`): счётчики ЭКЗЕМПЛЯРА сервера, а не процессные. Процессный
+/// `serving_counters()` суммирует все серверы бинаря, и под параллельным прогоном утверждение
+/// «до == после» мерило соседей (`R-206`). Ручка экземпляра меряет ровно этот сервер.
+async fn serve_counted(
+    dir: &std::path::Path,
+    ckpt: Option<std::path::PathBuf>,
+) -> (
+    String,
+    std::sync::Arc<gateway_serve::metrics::ServingCountersHandle>,
+) {
+    let server = bind_with_policy(config(dir, ckpt), policy())
+        .await
+        .expect("bind_with_policy");
+    let addr = server.local_addr().to_string();
+    let counters = server
+        .counters_handle()
+        .expect("bind_with_policy обязан дать ручку счётчиков экземпляра");
+    tokio::spawn(async move {
+        let _ = server.serve().await;
+    });
+    (addr, counters)
+}
+
 type Ws =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
@@ -466,9 +489,9 @@ async fn c1_entry_cold_request_named_outcome_without_reading_journal() {
         "c1_entry_cold_request_named_outcome_without_reading_journal",
         dir.path(),
     );
-    let addr = serve(dir.path(), _ckpt).await;
+    let (addr, counters) = serve_counted(dir.path(), _ckpt).await;
 
-    let before = serving_counters().journal_payload_bytes_read;
+    let before = counters.snapshot().journal_payload_bytes_read;
     let mut ws = connect(&addr).await;
     send(&mut ws, subscribe("s1", canonical_selector_json())).await;
     let msg = recv(&mut ws).await.expect("сервер промолчал на подписку");
@@ -484,7 +507,7 @@ async fn c1_entry_cold_request_named_outcome_without_reading_journal() {
         "исход обязан быть НАЗВАН ('not_ready'/'warming'), получено '{code}'"
     );
 
-    let after = serving_counters().journal_payload_bytes_read;
+    let after = counters.snapshot().journal_payload_bytes_read;
     assert_eq!(
         after,
         before,
@@ -525,9 +548,9 @@ async fn c5_entry_unbounded_profile_is_refused() {
     let dir = journal_busy(3_000);
     let (_ckpt, _ckpt_guard) =
         prepare_from_registry("c5_entry_unbounded_profile_is_refused", dir.path());
-    let addr = serve(dir.path(), _ckpt).await;
+    let (addr, counters) = serve_counted(dir.path(), _ckpt).await;
 
-    let before = serving_counters().journal_payload_bytes_read;
+    let before = counters.snapshot().journal_payload_bytes_read;
     let mut ws = connect(&addr).await;
     // Символ и полосы КАНОНИЧЕСКИЕ, профиль — неограниченный.
     send(
@@ -548,7 +571,7 @@ async fn c5_entry_unbounded_profile_is_refused() {
          ограничено — это публичный путь к полной свёртке истории"
     );
     assert_eq!(
-        serving_counters().journal_payload_bytes_read,
+        counters.snapshot().journal_payload_bytes_read,
         before,
         "отказ наступил ПОСЛЕ чтения журнала — работа уже оплачена"
     );
@@ -828,9 +851,9 @@ async fn c6_counters_are_emitted_by_the_real_serving_path() {
         "c6_counters_are_emitted_by_the_real_serving_path",
         dir.path(),
     );
-    let addr = serve(dir.path(), _ckpt).await;
+    let (addr, counters) = serve_counted(dir.path(), _ckpt).await;
 
-    let before = serving_counters();
+    let before = counters.snapshot();
     let mut ws = connect(&addr).await;
     send(&mut ws, subscribe("s1", canonical_selector_json())).await;
     let _ = recv(&mut ws).await;
@@ -844,7 +867,7 @@ async fn c6_counters_are_emitted_by_the_real_serving_path() {
     )
     .await;
     let _ = recv(&mut ws).await;
-    let after = serving_counters();
+    let after = counters.snapshot();
 
     assert!(
         after.attempts > before.attempts,
@@ -1079,8 +1102,8 @@ async fn u1_served_request_with_tail_increments_payload_counter() {
     );
     // Хвост дописывает ДРАЙВЕР, по строке реестра и ДО подъёма сервера (находка ТЕСТЕРА круга задачи 12).
 
-    let before = serving_counters().journal_payload_bytes_read;
-    let addr = serve(dir.path(), _ckpt).await;
+    let (addr, counters) = serve_counted(dir.path(), _ckpt).await;
+    let before = counters.snapshot().journal_payload_bytes_read;
     let mut ws = connect(&addr).await;
     send(&mut ws, subscribe("s1", canonical_selector_json())).await;
     let msg = recv(&mut ws).await.expect("сервер промолчал");
@@ -1090,7 +1113,7 @@ async fn u1_served_request_with_tail_increments_payload_counter() {
         "тёплый запрос с хвостом обязан обслуживаться: {msg}"
     );
     assert!(
-        serving_counters().journal_payload_bytes_read > before,
+        counters.snapshot().journal_payload_bytes_read > before,
         "счётчик прочитанных байт НЕ вырос на законной докормке хвоста — реализация \
          'никогда не инкрементировать' удовлетворила бы все проверки отсутствия чтения"
     );
