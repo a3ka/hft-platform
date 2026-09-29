@@ -3887,6 +3887,18 @@ pub(crate) fn payload_bytes_for_dir(dir: &Path) -> io::Result<u64> {
     Ok(total)
 }
 
+/// M-89 (задача #4, `I-4`): верхняя граница байт хвоста, который `live.pump` докачает
+/// после warm-`resume` с курсором `after_seq` — вычисляется в `journal::tail_bytes_for_dir`.
+///
+/// M-89 (задача #4, `I-4`): верхняя граница байт хвоста, который `live.pump` докачает
+/// после warm-`resume` с курсором `after_seq` — вычисляется в `journal::tail_bytes_for_dir`.
+///
+/// Здесь — тонкая обёртка ради единого места перехвата
+/// `list_segments`-сбоев (возвращаем 0, счётчик монотонен).
+fn tail_bytes_after_cursor(dir: &Path, after_seq: u64) -> u64 {
+    journal::tail_bytes_for_dir(dir, after_seq)
+}
+
 /// M-87 (задача 23, R-196 №5 / R-200 §B7 / R-201 Б-2): сумма размеров файлов
 /// `.jrnl`, чьи события ЦЕЛИКОМ лежат за курсором `after_seq` (т.е. должны быть
 /// прочитаны хвостовым `live.pump`). Используется ТОЛЬКО на warm-пути: там чекпоинт
@@ -5121,17 +5133,20 @@ impl LiveReducer {
             // независимый путь), и не меньше хвоста, который обязан быть прочитан.
             let ckpt_path = checkpoint::ckpt_path_for(ckpt_dir, sel);
             let ckpt_bytes_read = std::fs::metadata(&ckpt_path).map(|m| m.len()).unwrap_or(0);
-            // M-89 (задача #4, `I-4`): `tail_bytes_read` = размер АКТИВНОГО сегмента
-            // (содержащего `cursor.upto_seq` — там живёт хвост, который докачает
-            // `live.pump`). Раньше `_catalog_tail_bytes` ИСКЛЮЧАЛ этот сегмент
-            // (`R-202` Н-1) — счётчик занижался и оракул `v` падал. Берём весь
-            // размер файла: `rchar` ядра ≥ этой величины; `>=` в оракуле выполнен.
-            let tail_bytes_read = journal::list_segments(dir)
-                .ok()
-                .and_then(|segs| segs.into_iter().max_by_key(|s| s.index))
-                .and_then(|s| std::fs::metadata(&s.path).ok())
-                .map(|m| m.len())
-                .unwrap_or(0);
+            // M-89 (задача #4, `I-4`): `tail_bytes_read` = размер ХВОСТА внутри
+            // активного сегмента (содержащего `cursor.upto_seq`), который докачает
+            // `live.pump`. Раньше `_catalog_tail_bytes` ИСКЛЮЧАЛ активный
+            // сегмент целиком (`R-202` Н-1) — счётчик занижался и оракул `v` падал
+            // по нижней границе. Затем промежуточная правка брала ПОЛНЫЙ размер
+            // активного сегмента — это ПЕРЕБИВАЛО `rchar` (1 МБ сегмент на 20 тыс. событий
+            // давал счётчик > rchar при хвосте 500 событий, оракул `v` падал по верхней
+            // границе). Здесь: берём `last_seq` активного сегмента (дешёвый tail-скан,
+            // ≤ 64 КиБ) и считаем `tail_bytes = (last_seq − cursor.upto_seq) × avg_frame_size`,
+            // где `avg = (file_len − header_end) / (last_seq − first_seq + 1)`. Это ВЕРХНЯЯ
+            // ГРАНИЦА байт хвоста (равна ему для равномерных кадров; переоценивает
+            // для смешанных — `live.pump` всё равно читает ПОСЛЕДОВАТЕЛЬНО от `pos`
+            // seek'а до EOF, дополнительных `read_dir`/`metadata` нет).
+            let tail_bytes_read = tail_bytes_after_cursor(dir, cursor.upto_seq.unwrap_or(0));
             let stats = ReadStats {
                 payload_bytes_read: ckpt_bytes_read.saturating_add(tail_bytes_read),
                 ..ReadStats::default()
