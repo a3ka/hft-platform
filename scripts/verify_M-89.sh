@@ -263,6 +263,12 @@ ci_exec() { # <cmd>
     'bash scripts/verify_delivery_M-08.sh') HFT_DELIVERY_DEEP=0 bash scripts/verify_delivery_M-08.sh >/dev/null 2>&1 ;;
     'bash scripts/verify_ct_rfc_atomic.sh "${{ steps.base.outputs.sha }}"') bash scripts/verify_ct_rfc_atomic.sh "$BASE" >/dev/null 2>&1 ;;
     'bash scripts/diff_contract_schema.sh "${{ steps.base.outputs.sha }}"') bash scripts/diff_contract_schema.sh "$BASE" >/dev/null 2>&1 ;;
+    # review-fa судит ВЕРДИКТ reviewer'а (живой FA-инвариант в R-файле диапазона). До PR-гейта
+    # вердикта нет по построению — шаг отложен и печатается SKIP с причиной; как только в
+    # диапазоне появился R-файл, называющий M-89, шаг ИСПОЛНЯЕТСЯ и обязан быть зелёным.
+    'bash scripts/check_review_fa.sh')
+      if [ -z "$(git diff --name-only --diff-filter=A "$BASE" HEAD -- 'research/reviews/R-*.md' | xargs -r grep -l 'M-89' 2>/dev/null)" ]; then return 97; fi
+      env $ev bash scripts/check_review_fa.sh >/dev/null 2>&1 ;;
     'bash scripts/check_branch_health.sh || true') bash scripts/check_branch_health.sh >/dev/null 2>&1 || true ;;
     "git fetch --no-tags origin '+refs/salvage/*:refs/salvage/*'") git fetch --no-tags origin '+refs/salvage/*:refs/salvage/*' >/dev/null 2>&1 ;;
     bash\ scripts/check_*|bash\ scripts/verify_*) env $ev bash ${cmd#bash } >/dev/null 2>&1 ;;
@@ -284,6 +290,7 @@ ci_parity() {
       EXEC)
         ci_exec "$cmd"; rc=$?
         if [ $rc -eq 0 ]; then pass "CI-паритет [EXEC]: $cmd"
+        elif [ $rc -eq 97 ]; then skip "CI-паритет [EXEC отложен]: $cmd — вердикта reviewer'а с M-89 в диапазоне ещё нет; судится на PR-гейте, после вердикта исполняется"
         elif [ $rc -eq 99 ]; then fail "CI-паритет [EXEC]: $cmd — строка таблицы EXEC без исполнителя в ci_exec (дефект гейта)"
         else fail "CI-паритет [EXEC]: $cmd — exit=$rc"; fi ;;
       WAIVER)
