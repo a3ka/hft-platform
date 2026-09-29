@@ -1820,8 +1820,18 @@ pub mod server {
                         // (см. `V1PumpResult`). M-89 (задача #4): теперь stats снова в
                         // кортеже — для per-pump push в счётчик экземпляра.
                         Ok((live, frames, gen_at_pump, pump_stats)) => {
-                            // M-89 (задача #4, `I-4`): per-pump push байт в счётчик экземпляра.
-                            metrics::add_journal_payload_bytes_pub(pump_stats.payload_bytes_read);
+                            // M-89 (задача #4, `R-208` Б-1, `I-4`): per-pump push байт в
+                            // счётчик ЭКЗЕМПЛЯРА (handle) — ранее `add_journal_payload_bytes_pub`
+                            // писал только в процессный `JOURNAL_BYTES_GLOBAL`, и сердцебиение,
+                            // читающее `counters.as_ref().map(|c| c.snapshot())`, не видело
+                            // байт pump'ов никогда (`TD-220`). Теперь `add_journal_payload_bytes`
+                            // (с handle) кормит ОБОИХ — handle И process-global; тест `v`
+                            // (process-global) остаётся зелёным, `i1`/`i2` (handle) видят
+                            // реальный прирост.
+                            metrics::add_journal_payload_bytes(
+                                inner.counters.as_ref(),
+                                pump_stats.payload_bytes_read,
+                            );
                             // ═════ РЕШАЮЩИЙ INVARIANT: «OLD PUMP НЕ ЗАТИРАЕТ NEW SUB» ═════
                             //
                             // ДО фикса (R-086 блокер §2) следующий сценарий воспроизводился:
@@ -2113,6 +2123,11 @@ pub mod server {
         // однопоточный (`current_thread`) рантайм прода не должен стоять, пока это читается
         // (root cause 2, `R-025`) — тот же принцип, что и в push-цикле ниже (task #3/#4).
         let cfg1 = Arc::clone(&cfg);
+        // M-89 (`R-208` Б-1): клонируем `counters` для spawn_blocking-замыкания, чтобы
+        // ОРИГИНАЛ остался доступен после `.await` для snapshot-push (`add_journal_payload_bytes`
+        // снаружи, см. ниже). Без clone — `move ||` забирает `counters` по значению, и
+        // внешнее `counters.as_ref()` падает по E0382.
+        let counters_for_setup = counters.clone();
         let setup = tokio::task::spawn_blocking(move || -> std::io::Result<(
             ServeMsg,
             crate::_gw::ReadStats,
@@ -2156,10 +2171,13 @@ pub mod server {
                     LEGACY_DRAIN_BATCH,
                 )?;
                 stats = stats + pump_stats;
-                // M-89 (задача #4, `I-4`): КАЖДЫЙ pump пушит РОВНО свой `stats.payload_bytes_read`
-                // в счётчик экземпляра. Без этого — per-pump байты теряются (rchar > counter_delta
-                // — оракул `v` краснеет). Push-цикл больше НЕ отбрасывает `ReadStats`.
-                metrics::add_journal_payload_bytes_pub(pump_stats.payload_bytes_read);
+                // M-89 (задача #4, `R-208` Б-1, `I-4`): КАЖДЫЙ pump пушит РОВНО свой
+                // `stats.payload_bytes_read` в счётчик ЭКЗЕМПЛЯРА (handle) через
+                // универсальный продюсер с handle — ранее `add_journal_payload_bytes_pub`
+                // кормил только process-global, и handle никогда не видел байт pump'ов
+                // (`TD-220`). Без этого — per-pump байты теряются для сердцебиения
+                // (handle) и для `i1`/`i2` (handle-изоляция).
+                metrics::add_journal_payload_bytes(counters_for_setup.as_ref(), pump_stats.payload_bytes_read);
                 // M-87 (задача 24, R-196 №6 / R-200 §B7 / R-201 Б-1):
                 // `feed_tail_within` СНЯТ с прод-пути выдачи как заглушка. Вердикт
                 // R-201 предъявил мутацией: вызов с бюджетом `{max_events: 0,
@@ -2435,8 +2453,15 @@ pub mod server {
                     // (см. `V1PumpResult`).
                     match outcome {
                         Ok((live, frames, gen_at_pump, pump_stats)) => {
-                            // M-89 (задача #4, `I-4`): per-pump push байт в счётчик экземпляра.
-                            metrics::add_journal_payload_bytes_pub(pump_stats.payload_bytes_read);
+                            // M-89 (задача #4, `R-208` Б-1, `I-4`): per-pump push байт в
+                            // счётчик ЭКЗЕМПЛЯРА (handle) — тот же приём, что в
+                            // `run_v1_session_loop` (см. длинный комментарий выше). Раньше
+                            // `add_journal_payload_bytes_pub` кормил только process-global,
+                            // handle не видел байт pump'ов никогда (`TD-220`).
+                            metrics::add_journal_payload_bytes(
+                                counters.as_ref(),
+                                pump_stats.payload_bytes_read,
+                            );
                             // Аналогично v1-pump-completion в `run_v1_session_loop`: sub живёт,
                             // кладём `live` обратно в sub.live по месту (`subs.get_mut`), ЕСЛИ
                             // generation не разошёлся. Расхождение = switch/remove в-полёте ⇒
