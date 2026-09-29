@@ -24,5 +24,11 @@
 # Без flock — два запуска подряд (редко, но бывает) перетирают state-файл, и watchdog
 # стартует в неконсистентном виде. `gateway-serve` сам heartbeat пишет АТОМАРНО
 # (`<path>.tmp` → `rename`), но state.json ops-watchdog'а не атомарен (JSON pretty).
-*/5 * * * * root flock -n /var/lock/hft-watchdog.lock /root/hft-platform/scripts/watchdog_cron.sh
+#
+# `R-208` Н-1: переменная окружения ВЫШЕ строки расписания — иначе присваивание
+# действует только на записи, ИДУЩИЕ НИЖЕ, и задание получает пустой env
+# (`/etc/cron.d` semantics). Совпадение сегодня с дефолтом бинаря (`ops-watchdog.rs:63-64`)
+# замаскировало дефект, но любое расхождение путей даёт тихий no-op. Шаг verify
+# task11 ранее судил текст файла, не поведение (`testing.md` §канарейка).
 WATCHDOG_SERVING_HEARTBEAT_PATH=/var/lib/docker/volumes/hft-platform_gateway-state/_data/gateway-serve.heartbeat
+*/5 * * * * root flock -n /var/lock/hft-watchdog.lock /root/hft-platform/scripts/watchdog_cron.sh
