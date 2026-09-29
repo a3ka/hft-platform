@@ -169,7 +169,10 @@ fn b2_old_api_counts_what_was_read_not_what_was_yielded() {
 /// **b3 — два сырых сегмента (закрытый + активный), полный проход: Σ размеров.**
 #[test]
 fn b3_two_raw_segments_full_pass_counts_both_files() {
-    const SEG: u64 = 256 * 1024;
+    // 64 КиБ, не 256: 400 смешанных событий весят ≈154 КиБ (57 снимков по ≈2.4 КиБ +
+    // 343 сделки по ≈50 Б) — при 256 КиБ ротации не было, и сценарий падал СОБСТВЕННЫМ
+    // setup-стражем, ничего не проверив (найдено прогоном engine-dev на реализации).
+    const SEG: u64 = 64 * 1024;
     let dir = tempfile::tempdir().expect("tempdir");
     write_mixed(dir.path(), 0, 400, SEG);
     write_mixed(dir.path(), 400, 400, SEG);
@@ -204,7 +207,10 @@ impl<R: Read> Read for Counting<R> {
 /// `BufReader` 64 КиБ — форма `open_compacted_reader`).
 #[test]
 fn b4_compacted_segment_counts_compressed_bytes_consumed_from_file() {
-    const SEG: u64 = 256 * 1024;
+    // 64 КиБ, не 256: 400 смешанных событий весят ≈154 КиБ (57 снимков по ≈2.4 КиБ +
+    // 343 сделки по ≈50 Б) — при 256 КиБ ротации не было, и сценарий падал СОБСТВЕННЫМ
+    // setup-стражем, ничего не проверив (найдено прогоном engine-dev на реализации).
+    const SEG: u64 = 64 * 1024;
     let dir = tempfile::tempdir().expect("tempdir");
     write_mixed(dir.path(), 0, 400, SEG);
     write_mixed(dir.path(), 400, 200, SEG);
