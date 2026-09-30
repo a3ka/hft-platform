@@ -1327,10 +1327,11 @@ pub mod server {
                             // класс, который «вернулся отказ ≠ работа не делалась»).
                             // Позднее (e958661) кормили `payload_bytes_for_dir(dir)` — суммой
                             // ВСЕХ `.jrnl` в каталоге (на проде ≈92 ГБ): тоже ложь, ещё и
-                            // крупнее на пять порядков. Сейчас: warm = ckpt_bytes +
-                            // tail_bytes_after_cursor (хвост, который докачает `live.pump`),
-                            // cold = сумма всех `.jrnl` (там действительно прочитан весь
-                            // журнал). Подробности — `crates/gateway/src/lib.rs`,
+                            // крупнее на пять порядков. Сейчас: warm = только файл слепка
+                            // (`R-208` Б-2); хвост будет прочитан следующим `pump()`,
+                            // и его байты придут в счётчик через per-pump push
+                            // (`add_journal_payload_bytes(counters, pump_stats.payload_bytes_read)`).
+                            // Подробности — `crates/gateway/src/lib.rs`,
                             // `LiveReducer::resume` warm/cold-ветки. Счётчик отвечает на
                             // вопрос, который обещает его имя; проверяется оракулом
                             // `red_m87_read_volume_truth::q2` против `rchar` ядра.
@@ -2268,7 +2269,7 @@ pub mod server {
         //
         // `stats.payload_bytes_read` здесь — результат warm- или cold-`resume` (см.
         // `LiveReducer::resume` warm/cold-ветки в `crates/gateway/src/lib.rs`):
-        // warm = ckpt_bytes + tail_bytes_after_cursor; cold = сумма всех `.jrnl`.
+        // warm = только файл слепка (`R-208` Б-2); cold = сумма всех `.jrnl`.
         metrics::add_journal_payload_bytes(counters.as_ref(), stats.payload_bytes_read);
         sink.send(Message::Text(snap_text))
             .await
