@@ -4,7 +4,7 @@
 //!
 //! # Что не так сегодня — снято командой, не пересказом
 //!
-//! · warm-`resume` кормит счётчик `ckpt_bytes + payload_bytes_after_cursor(dir, cursor)`;
+//! · (история, до `M-89`) warm-`resume` кормил счётчик `ckpt_bytes + payload_bytes_after_cursor(dir, cursor)` — функция удалена фиксом `R-208` Б-2;
 //!   `payload_bytes_after_cursor` (`crates/gateway/src/lib.rs`) суммирует ТОЛЬКО сегменты с
 //!   `first_seq > cursor` — сегмент, СОДЕРЖАЩИЙ курсор (на проде — активный, 585 МБ), в сумму
 //!   не входит вовсе. Цена его получения при этом лежит на горячем пути:
@@ -26,8 +26,10 @@
 //!    `n ≥ 0` — число пустых тиков push-цикла (период 250 мс), ограниченное временем
 //!    наблюдения. Ни одно слагаемое не сочиняется транспортом: значения читателя пиннит
 //!    `crates/journal/tests/red_m89_bytes_accounting.rs` точным учётом, здесь судится ВЕРНОСТЬ
-//!    ПЕРЕДАЧИ. Связь — через процессный `serving_counters()`: в этом бинаре ровно один
-//!    сервер (экземплярная ручка `I-5` — COMPILE-RED, а этот оракул намеренно RUNTIME-RED).
+//!    ПЕРЕДАЧИ. Связь — через РУЧКУ ЭКЗЕМПЛЯРА `Server::counters_handle()` (`R-209` Б-1):
+//!    процессный `serving_counters()` рос и при записи байт pump'ов мимо экземпляра, и
+//!    равенство на нём не ловило регресс задачи 4. Мутация «pump'ы → процессный счётчик»
+//!    обязана ронять этот оракул.
 //!
 //! RUNTIME-RED на ревизии набора: `counter = ckpt_bytes` < `ckpt_bytes + tail_bytes`.
 
@@ -253,12 +255,18 @@ async fn serve_once(f: &Fixture) -> Served {
         .await
         .expect("bind_with_policy");
     let addr = server.local_addr();
+    // `R-209` Б-1: счётчик ЭКЗЕМПЛЯРА, не процессный. Процессный `serving_counters()` растёт и
+    // тогда, когда байты pump'ов пишутся мимо экземпляра (`add_journal_payload_bytes_pub`), —
+    // равенство ниже на нём не отличало исправный путь от регресса задачи 4.
+    let counters = server
+        .counters_handle()
+        .unwrap_or_else(|| setup_failed("bind_with_policy не дал ручку счётчиков экземпляра"));
     tokio::spawn(async move {
         let _ = server.serve().await;
     });
 
     let rchar_before = rchar();
-    let counter_before = gateway_serve::metrics::serving_counters().journal_payload_bytes_read;
+    let counter_before = counters.snapshot().journal_payload_bytes_read;
     let started = std::time::Instant::now();
     let token = sign();
     let (mut ws, _) = tokio::time::timeout(
@@ -293,7 +301,7 @@ async fn serve_once(f: &Fixture) -> Served {
         setup_failed("первый кадр хвоста не пришёл — первый pump не наблюдался");
     }
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    let counter_after = gateway_serve::metrics::serving_counters().journal_payload_bytes_read;
+    let counter_after = counters.snapshot().journal_payload_bytes_read;
     let elapsed_ms = started.elapsed().as_millis() as u64;
     drop(ws);
     Served {
