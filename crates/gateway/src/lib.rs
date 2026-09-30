@@ -3785,6 +3785,11 @@ pub struct ReadStats {
     /// даёт инвариант «журнал НЕ прочитан на публичном пути», которого нет ни
     /// в одном из существующих полей.
     pub payload_bytes_read: u64,
+    /// M-89 (задача #2, `I-1` / §4.1): число откатов поиска позиции к `header_end`
+    /// за проход (кандидат найден, гард точности не прошёл). `.zst` — не откат
+    /// (поиск не предпринимается, названный предел). Проброшен из
+    /// `journal::EventStream::seek_fallbacks()`. Аддитивен к остальным счётчикам.
+    pub seek_fallbacks: u64,
 }
 
 impl std::ops::Add for ReadStats {
@@ -3792,6 +3797,7 @@ impl std::ops::Add for ReadStats {
     fn add(self, rhs: Self) -> Self {
         Self {
             events_decoded: self.events_decoded + rhs.events_decoded,
+            seek_fallbacks: self.seek_fallbacks + rhs.seek_fallbacks,
             segments_opened: self.segments_opened + rhs.segments_opened,
             events_scanned: self.events_scanned + rhs.events_scanned,
             segment_meta_ops: self.segment_meta_ops + rhs.segment_meta_ops,
@@ -3805,6 +3811,25 @@ impl ReadStats {
     /// Сложить несколько `ReadStats` (например, от ckpt-load + tail-feed).
     pub fn sum<I: IntoIterator<Item = Self>>(iter: I) -> Self {
         iter.into_iter().fold(Self::default(), |a, b| a + b)
+    }
+}
+
+fn read_stats_from_stream_with_bytes(
+    stream: &journal::EventStream,
+    depth_levels_visited: u64,
+    payload_bytes_read: u64,
+) -> ReadStats {
+    // M-89 (`I-4`): `payload_bytes_read` — байты, ПРОЧИТАННЫЕ EventStream'ом.
+    // `journal` — sacred (`crates/journal/**` вне зоны engine-dev), счётчик
+    // ведётся там (`EventStream::payload_bytes_read()`). Здесь только пробрасываем.
+    ReadStats {
+        events_decoded: stream.events_decoded(),
+        segments_opened: stream.segments_opened(),
+        events_scanned: stream.events_scanned(),
+        segment_meta_ops: stream.segment_meta_ops(),
+        depth_levels_visited,
+        payload_bytes_read,
+        seek_fallbacks: stream.seek_fallbacks(),
     }
 }
 
@@ -3836,6 +3861,7 @@ fn read_stats_from_stream(stream: &journal::EventStream, depth_levels_visited: u
         segment_meta_ops: stream.segment_meta_ops(),
         depth_levels_visited,
         payload_bytes_read: 0, // filled by call sites (see `payload_bytes_for_dir`)
+        seek_fallbacks: 0,     // M-89: filled by `read_stats_from_stream_with_bytes`
     }
 }
 
@@ -3859,47 +3885,6 @@ pub(crate) fn payload_bytes_for_dir(dir: &Path) -> io::Result<u64> {
         }
     }
     Ok(total)
-}
-
-/// M-87 (задача 23, R-196 №5 / R-200 §B7 / R-201 Б-2): сумма размеров файлов
-/// `.jrnl`, чьи события ЦЕЛИКОМ лежат за курсором `after_seq` (т.е. должны быть
-/// прочитаны хвостовым `live.pump`). Используется ТОЛЬКО на warm-пути: там чекпоинт
-/// покрывает `seq ≤ cursor.upto_seq`, и `live.pump` докачивает хвост начиная с этого
-/// курсора.
-///
-/// Сегмент, СОДЕРЖАЩИЙ `after_seq` (`first_seq ≤ after_seq`, прочитан частично), НЕ
-/// включается целиком — это завысило бы счётчик на его полный размер, а верхняя
-/// граница теста `red_m87_read_volume_truth::q2` требует `counter <= read`. Частичные
-/// чтения «содержащего сегмента» оставляем за бортом; для типичной фикстуры (cursor
-/// попадает в конец последнего покрытого сегмента) сегмент НЕ содержит after_seq — все
-/// события в нём уже учтены чекпоинтом, и `live.pump` читает только хвост.
-///
-/// Источник истины — `journal::list_segments` (sacred; используется публичный API),
-/// фильтрация по `first_seq`. Возвращает `0` при пустом каталоге или ошибке чтения —
-/// `payload_bytes_read` обязан быть монотонной верхней границей, и сбой
-/// `list_segments` не должен приводить к отказу выдачи.
-pub(crate) fn payload_bytes_after_cursor(dir: &Path, after_seq: u64) -> u64 {
-    let segs = match journal::list_segments(dir) {
-        Ok(s) => s,
-        Err(_) => return 0,
-    };
-    let mut total: u64 = 0;
-    // DET-OK: итерация по `SegmentInfo` не зависит от порядка (сумма коммутативна).
-    for s in &segs {
-        // Сегмент ЦЕЛИКОМ после курсора — `live.pump` его прочитает полностью.
-        if s.header.first_seq > after_seq {
-            total = total.saturating_add(s.size_bytes);
-        }
-    }
-    total
-}
-
-/// M-87 (предохранитель выдачи, A-037 D-1, аддитивно): `pub`-форма
-/// `payload_bytes_for_dir` для `gateway_serve` — транспорт пробрасывает
-/// результат в `ServingCounters::journal_payload_bytes_read` через
-/// `metrics::add_journal_payload_bytes_pub`. Семантика идентична.
-pub fn payload_bytes_for_dir_pub(dir: &Path) -> io::Result<u64> {
-    payload_bytes_for_dir(dir)
 }
 
 /// M-38b (GW-I-9): полный снапшот через чекпоинт + досчёт хвостом.
@@ -5075,30 +5060,33 @@ impl LiveReducer {
             full.set_capture_book_observations(true);
             let full_applied_seq = cursor.upto_seq;
             // M-87 (задача 23, R-196 №5 / R-200 §B7 / R-201 Б-2): `payload_bytes_read` —
-            // ЧЕСТНАЯ верхняя граница прочитанного за выдачу: размер файла чекпоинта (он
-            // читается `read_checkpoint` ниже по стеку) + байты хвоста, который докачает
-            // `live.pump`. ПРЕЖНЯЯ форма `payload_bytes_for_dir(dir)` возвращала сумму
-            // размеров ВСЕХ `.jrnl` файлов каталога (≈92 ГБ на проде) — это не «прочитанное
-            // журналом», а ОПИСЬ каталога, и тест `red_m87_r196_conditions::c2` это
-            // пропускал (он искал подстроку `snap_text.len()`, ловя одну конкретную
-            // неверную величину). Замер R-201 Б-2 показал: warm-путь отчитывался о 92 ГБ
-            // прочитанных там, где не читал ничего.
+            // байты РЕАЛЬНО ПРОЧИТАННОГО на этом resume. На warm-пути это ТОЛЬКО файл
+            // слепка (`read_checkpoint` ниже по стеку): журнал НЕ читается (sacred
+            // `red_frames_seek_bound` пиннит `events_scanned == 0` у resume). Хвост будет
+            // прочитан следующим `pump()`, и его байты придут в счётчик через per-pump push
+            // (`R-208` Б-1, `add_journal_payload_bytes(counters, pump_stats.payload_bytes_read)`
+            // в `crates/gateway-serve/src/lib.rs`) — там, где они фактически прочитаны
+            // `EventStream`-ом.
             //
-            // Сейчас: ckpt-байты (реально прочитанные `read_checkpoint` ради reducer'а)
-            // + tail-байты (те сегменты, чей `first_seq > cursor.upto_seq` — их прочитает
-            // `live.pump`). И то и другое — ЧЕСТНОЕ чтение этой выдачи, верхняя граница.
-            // Никакого `read_dir` + `metadata` на всех `.jrnl` (это «размер каталога»,
-            // запрещённый дословно формулировкой задачи 23).
+            // `R-208` Б-2 / §10 запретный список: на warm-пути в счётчик идут байты ФАЙЛА
+            // СЛЕПКА; никакой синтетики, никакого дубликата с транспортом. Прежний вызов
+            // `tail_bytes_after_cursor(dir, cursor.upto_seq)` обходила запрет: функция
+            // `journal::tail_bytes_for_dir` делает `segments(dir)` (read_dir + заголовки)
+            // + открывает активный сегмент ДВАЖДЫ (≤ 64 КиБ чтения), чтобы оценить
+            // `tail_events × avg_frame_size`, и эти ОЦЕНОЧНЫЕ байты прибавлялись к
+            // счётчику ДО реального чтения хвоста `live.pump`-ом. Двойной учёт: те же
+            // байты приходили ВТОРОЙ раз через per-pump push, и зависимый эталон
+            // (`R-208` Б-2 §«Почему v зелен») это не ловил.
             //
-            // Проверяется оракулом `red_m87_read_volume_truth::q2`: счётчик не может
-            // «учесть» БОЛЬШЕ, чем ядро реально прочитало (`rchar` из `/proc/self/io`,
-            // независимый путь), и не меньше хвоста, который обязан быть прочитан.
+            // Гейт task3 (verdict R-208 §6: «grep проверял имя, не свойство» — тот же
+            // класс, что и `TD-219`) видел ИМЯ — ушло. Свойство (read_dir +
+            // заголовки на warm-пути) жило. Здесь — НЕТ ни оценки, ни вызова
+            // `tail_bytes_for_dir` на warm-пути; ниже по стеку `live.pump` доставит
+            // реальные байты хвоста.
             let ckpt_path = checkpoint::ckpt_path_for(ckpt_dir, sel);
             let ckpt_bytes_read = std::fs::metadata(&ckpt_path).map(|m| m.len()).unwrap_or(0);
-            let cursor_after = cursor.upto_seq.unwrap_or(0);
-            let tail_bytes_read = payload_bytes_after_cursor(dir, cursor_after);
             let stats = ReadStats {
-                payload_bytes_read: ckpt_bytes_read.saturating_add(tail_bytes_read),
+                payload_bytes_read: ckpt_bytes_read,
                 ..ReadStats::default()
             };
             return Ok((
@@ -5161,10 +5149,10 @@ impl LiveReducer {
         // чекпоинта нет, и `journal::stream(dir, filter)` выше прочитал ВСЕ сегменты
         // полностью — `payload_bytes_for_dir(dir)` возвращает ВЕРХНЮЮ ГРАНИЦУ, совпадающую
         // с фактическим чтением (метаданные файлов vs их содержимое расходятся на доли
-        // процента). Warm-путь выше использует ДРУГУЮ функцию
-        // (`payload_bytes_after_cursor` + размер чекпоинта) — там полный каталог НЕ
-        // читается, и эта формула соврала бы. Оракул `red_m87_read_volume_truth::q2`
-        // ловит оба варианта против независимого `rchar` ядра.
+        // процента). Warm-путь выше (R-208 Б-2) использует ТОЛЬКО размер слепка — там
+        // полный каталог НЕ читается, и эта формула соврала бы. Оракул
+        // `red_m87_read_volume_truth::q2` ловит оба варианта против независимого `rchar`
+        // ядра.
         stats.payload_bytes_read = payload_bytes_for_dir(dir).unwrap_or(0);
         let history_start_seq = first_seq.unwrap_or(0);
         Ok((
@@ -5423,7 +5411,11 @@ impl LiveReducer {
         // R-134 B-4): `ReadStats` объявлена складываемой (`impl Add`, `ReadStats::sum`),
         // кумулятивное поле в ней давало бы квадратичный перечёт при сложении тиков.
         let depth_after = self.full.depth_levels_visited();
-        let stats = read_stats_from_stream(&stream, depth_after - depth_before);
+        let stats = read_stats_from_stream_with_bytes(
+            &stream,
+            depth_after - depth_before,
+            stream.payload_bytes_read(),
+        );
         // M-57 (TD-109): забираем hint СВОЕЙ сессии из стрима. Если за тик НЕ было
         // ни одного декодированного события в активном сегменте (backlog пуст,
         // `stream.tail_hint()` вернёт `None`), НЕ сбрасываем старый hint — он всё ещё

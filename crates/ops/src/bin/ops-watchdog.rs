@@ -18,6 +18,8 @@
 //! `docs/SESSION-HANDOFF.md §7`):
 //!   - `WATCHDOG_HEARTBEAT_PATH` (default
 //!     `/var/lib/docker/volumes/hft-platform_journal-data/_data/recorder.heartbeat`)
+//!   - `WATCHDOG_SERVING_HEARTBEAT_PATH` (default
+//!     `/var/lib/docker/volumes/hft-platform_gateway-state/_data/gateway-serve.heartbeat`)
 //!   - `WATCHDOG_CRON_DIR` (default `/var/lib/hft`) — сканирует пары
 //!     `<job>.last-success`/`<job>.alert` для `compaction`/`gateway-checkpoint`/`retention`
 //!     (R-005 F-6: оба маркера, не только позитивный).
@@ -41,7 +43,9 @@ use ops::format::format_alert;
 use ops::state::{WatchdogState, DEFAULT_DEDUP_WINDOW_MS};
 use ops::transport::{StdoutTransport, TelegramTransport, Transport};
 use ops::watchdog::{parse_docker_status_healthy, ContainerStatus, Thresholds};
-use ops::watchdog_cycle::{run_cycle, CronFailureMarker, CronJobObservation, CycleInputs};
+use ops::watchdog_cycle::{
+    run_cycle_full, CronFailureMarker, CronJobObservation, CycleInputs, ServingInputs,
+};
 
 /// Задачи обслуживания журнала, за которыми следит watchdog (имена БЕЗ суффикса — см.
 /// `CronJobObservation::name`; у каждой два независимых маркера: `<name>.last-success` и
@@ -52,6 +56,12 @@ fn main() -> anyhow::Result<()> {
     let heartbeat_path = env_path(
         "WATCHDOG_HEARTBEAT_PATH",
         "/var/lib/docker/volumes/hft-platform_journal-data/_data/recorder.heartbeat",
+    );
+    // M-89 (задача #10): путь к сердцебиению ВЫДАЧИ обязателен (env либо дефолт) —
+    // `ConfiguredMissing` звонит `WD-SERVING-HB-MISSING` если файла нет.
+    let serving_heartbeat_path = env_path(
+        "WATCHDOG_SERVING_HEARTBEAT_PATH",
+        "/var/lib/docker/volumes/hft-platform_gateway-state/_data/gateway-serve.heartbeat",
     );
     let cron_dir = env_path("WATCHDOG_CRON_DIR", "/var/lib/hft");
     let state_path = env_path("WATCHDOG_STATE_PATH", "/var/lib/hft/watchdog.state.json");
@@ -68,7 +78,15 @@ fn main() -> anyhow::Result<()> {
     let mut state = WatchdogState::load_or_default(&state_path);
 
     let inputs = gather_inputs(&heartbeat_path, &cron_dir, &container_names);
-    let outcome = run_cycle(&inputs, now_ms, &thr, dedup_window_ms, &mut state);
+    // M-89 (задача #10): serving-вход идёт отдельной структурой (см. `ServingInputs`).
+    // `WATCHDOG_SERVING_HEARTBEAT_PATH` у бинаря ЕСТЬ ВСЕГДА (env либо дефолт), поэтому
+    // НИКОГДА не передаём `Disabled`: нечитаемый файл ⇒ `ConfiguredMissing` (исполняемый
+    // случай).
+    let serving_heartbeat = read_serving_heartbeat(&serving_heartbeat_path);
+    let serving = ServingInputs {
+        heartbeat: serving_heartbeat,
+    };
+    let outcome = run_cycle_full(&inputs, &serving, now_ms, &thr, dedup_window_ms, &mut state);
 
     let stdout_transport = StdoutTransport;
     let telegram_transport = TelegramTransport::from_env();
@@ -142,6 +160,20 @@ fn gather_inputs(
 fn read_heartbeat(path: &Path) -> Option<ops::watchdog::HeartbeatSample> {
     let body = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&body).ok()
+}
+
+/// M-89 (задача #10, §4.3): чтение сердцебиения ВЫДАЧИ. Файл у бинаря ЕСТЬ ВСЕГДА
+/// (env либо дефолт) — НИКОГДА не возвращаем `Disabled`: нечитаемый/не-парсится файл
+/// ⇒ `ConfiguredMissing` (исполняемый случай; g1, g4b). Disabled — только для
+/// legacy `run_cycle` без serving-интеграции.
+fn read_serving_heartbeat(path: &Path) -> ops::watchdog::ServingHeartbeat {
+    let Some(body) = std::fs::read_to_string(path).ok() else {
+        return ops::watchdog::ServingHeartbeat::ConfiguredMissing;
+    };
+    match serde_json::from_str::<ops::watchdog::ServingHeartbeatSample>(&body) {
+        Ok(s) => ops::watchdog::ServingHeartbeat::Present(s),
+        Err(_) => ops::watchdog::ServingHeartbeat::ConfiguredMissing,
+    }
 }
 
 /// Маркер — UTC ISO-8601 (`date -u +%Y-%m-%dT%H:%M:%SZ`), см. `deploy/bin/journal-retention-cron.sh`

@@ -23,6 +23,47 @@ pub struct ServingCounters {
     pub slots_in_flight: u64,
 }
 
+/// M-89 (задача #6, §4.1 / `I-5`): счётчики ЭКЗЕМПЛЯРА сервера (не процессные).
+/// Запросы к серверу A не двигают счётчики сервера B (изоляция — `TD-224`).
+/// Атомики per-instance, делятся с `Server` через `Arc`. Процессный
+/// `serving_counters()` остаётся агрегатом и не запрещён.
+pub struct ServingCountersHandle {
+    pub(crate) attempts: AtomicU64,
+    pub(crate) successes: AtomicU64,
+    pub(crate) refusals_supported: AtomicU64,
+    pub(crate) refusals_unsupported: AtomicU64,
+    pub(crate) journal_payload_bytes_read: AtomicU64,
+    pub(crate) slots_in_flight: AtomicU64,
+}
+
+impl ServingCountersHandle {
+    /// Снимок счётчиков экземпляра. Эмиссия — из реального пути выдачи, не из
+    /// конструктора (`OPS-I-10`).
+    pub fn snapshot(&self) -> ServingCounters {
+        ServingCounters {
+            attempts: self.attempts.load(Ordering::SeqCst),
+            successes: self.successes.load(Ordering::SeqCst),
+            refusals_supported: self.refusals_supported.load(Ordering::SeqCst),
+            refusals_unsupported: self.refusals_unsupported.load(Ordering::SeqCst),
+            journal_payload_bytes_read: self.journal_payload_bytes_read.load(Ordering::SeqCst),
+            slots_in_flight: self.slots_in_flight.load(Ordering::SeqCst),
+        }
+    }
+}
+
+impl Default for ServingCountersHandle {
+    fn default() -> Self {
+        Self {
+            attempts: AtomicU64::new(0),
+            successes: AtomicU64::new(0),
+            refusals_supported: AtomicU64::new(0),
+            refusals_unsupported: AtomicU64::new(0),
+            journal_payload_bytes_read: AtomicU64::new(0),
+            slots_in_flight: AtomicU64::new(0),
+        }
+    }
+}
+
 /// Снимок счётчиков. Эмиссия — из реального пути выдачи, не из конструктора.
 pub fn serving_counters() -> ServingCounters {
     ServingCounters {
@@ -63,6 +104,70 @@ pub fn inc_refusals_unsupported_pub() {
 }
 pub fn add_journal_payload_bytes_pub(bytes: u64) {
     JOURNAL_BYTES_GLOBAL.fetch_add(bytes, Ordering::SeqCst);
+}
+
+/// M-89 (задача #6): per-instance продюсеры. Двигают счётчики ЭКЗЕМПЛЯРА
+/// (атомики в `ServingCountersHandle`) И процессный агрегат (для обратной
+/// совместимости с `serving_counters()`). Запросы к серверу A не двигают
+/// счётчики сервера B (изоляция — `TD-224`).
+pub fn inc_attempts_for(handle: &ServingCountersHandle) {
+    handle.attempts.fetch_add(1, Ordering::SeqCst);
+    ATTEMPTS_GLOBAL.fetch_add(1, Ordering::SeqCst);
+}
+pub fn inc_successes_for(handle: &ServingCountersHandle) {
+    handle.successes.fetch_add(1, Ordering::SeqCst);
+    SUCCESSES_GLOBAL.fetch_add(1, Ordering::SeqCst);
+}
+pub fn inc_refusals_supported_for(handle: &ServingCountersHandle) {
+    handle.refusals_supported.fetch_add(1, Ordering::SeqCst);
+    REFUSALS_SUPPORTED_GLOBAL.fetch_add(1, Ordering::SeqCst);
+}
+pub fn inc_refusals_unsupported_for(handle: &ServingCountersHandle) {
+    handle.refusals_unsupported.fetch_add(1, Ordering::SeqCst);
+    REFUSALS_UNSUPPORTED_GLOBAL.fetch_add(1, Ordering::SeqCst);
+}
+pub fn add_journal_payload_bytes_for(handle: &ServingCountersHandle, bytes: u64) {
+    handle
+        .journal_payload_bytes_read
+        .fetch_add(bytes, Ordering::SeqCst);
+    JOURNAL_BYTES_GLOBAL.fetch_add(bytes, Ordering::SeqCst);
+}
+
+/// M-89 (задача #6): универсальный продюсер — `Option<&Arc<Handle>>` ⇒ per-instance
+/// ИЛИ `None` ⇒ процессный. Удобно для горячих путей, где условие «есть ли
+/// политика/handle» известно в compile-time как `Some/None`.
+pub fn inc_attempts(counters: Option<&std::sync::Arc<ServingCountersHandle>>) {
+    match counters {
+        Some(h) => inc_attempts_for(h),
+        None => inc_attempts_pub(),
+    }
+}
+pub fn inc_successes(counters: Option<&std::sync::Arc<ServingCountersHandle>>) {
+    match counters {
+        Some(h) => inc_successes_for(h),
+        None => inc_successes_pub(),
+    }
+}
+pub fn inc_refusals_supported(counters: Option<&std::sync::Arc<ServingCountersHandle>>) {
+    match counters {
+        Some(h) => inc_refusals_supported_for(h),
+        None => inc_refusals_supported_pub(),
+    }
+}
+pub fn inc_refusals_unsupported(counters: Option<&std::sync::Arc<ServingCountersHandle>>) {
+    match counters {
+        Some(h) => inc_refusals_unsupported_for(h),
+        None => inc_refusals_unsupported_pub(),
+    }
+}
+pub fn add_journal_payload_bytes(
+    counters: Option<&std::sync::Arc<ServingCountersHandle>>,
+    bytes: u64,
+) {
+    match counters {
+        Some(h) => add_journal_payload_bytes_for(h, bytes),
+        None => add_journal_payload_bytes_pub(bytes),
+    }
 }
 
 // ─────────────────────────── §7 — сторож молчания ───────────────────────────

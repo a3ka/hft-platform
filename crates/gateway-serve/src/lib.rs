@@ -285,6 +285,13 @@ pub mod server {
     use super::auth::{verify_token, AuthError};
     use super::wire::ServeMsg;
 
+    /// M-89 (задача #8, §4.2): конфиг сердцебиения для `with_heartbeat` билдера.
+    #[derive(Clone, Debug)]
+    pub struct HeartbeatConfig {
+        pub path: std::path::PathBuf,
+        pub period: Duration,
+    }
+
     /// Конфиг сервиса (bin читает из env/args). MVP — одна `(venue, symbol)`; мульти-подписка позже.
     pub struct ServeConfig {
         /// Адрес bind, напр. `"127.0.0.1:8080"` или `"127.0.0.1:0"` (ephemeral для тестов).
@@ -335,6 +342,15 @@ pub mod server {
         /// M-87: слоты вычислительной работы. `None` ⇒ неограниченно; `Some` —
         /// ограничение параллелизма через `ServingSlots`.
         slots: Option<std::sync::Arc<ServingSlots>>,
+        /// M-89 (задача #6, §4.1 / `I-5`): счётчики ЭКЗЕМПЛЯРА сервера — не
+        /// процессные атомики. Запросы к серверу A не двигают счётчики сервера B
+        /// (изоляция — `TD-224`). `bind_with_policy` всегда даёт Some; `bind` (без
+        /// политики) — None (сервер поднят без политики, счётчики экземпляра не
+        /// пиннятся тестами).
+        counters: Option<std::sync::Arc<metrics::ServingCountersHandle>>,
+        /// M-89 (задача #8, §4.2 / `I-6`): конфиг сердцебиения. `None` — сервер
+        /// без сердцебиения (watchdog детектит как `MISSING`).
+        heartbeat: Option<HeartbeatConfig>,
     }
 
     /// Забиндить WS-listener на `cfg.addr`. engine-dev (task #4): `tokio::net::TcpListener`.
@@ -348,6 +364,8 @@ pub mod server {
             cfg: Arc::new(cfg),
             policy: None,
             slots: None,
+            counters: None,
+            heartbeat: None,
         })
     }
 
@@ -394,11 +412,28 @@ pub mod server {
             policy: AdmissionPolicy,
             slots: std::sync::Arc<ServingSlots>,
         ) -> Server {
+            // M-89 (задача #6, §4.1 / `I-5`): per-instance счётчики. Каждый сервер
+            // получает СВОИ атомики — запросы к серверу A не двигают счётчики
+            // сервера B (изоляция — `TD-224`).
+            let counters = std::sync::Arc::new(metrics::ServingCountersHandle::default());
             Server {
                 listener: self.listener,
                 cfg: self.cfg,
                 policy: Some(policy),
                 slots: Some(slots),
+                counters: Some(counters),
+                heartbeat: None,
+            }
+        }
+
+        /// M-89 (задача #8, §4.2 / `I-6`): АДДИТИВНЫЙ билдер — конфиг сердцебиения
+        /// через билдер, не через поле `ServeConfig` (одиннадцать существующих
+        /// sacred-файлов с литералом `ServeConfig { .. }` остаются целы).
+        /// Период по умолчанию — 10 000 мс (как у recorder'а).
+        pub fn with_heartbeat(self, cfg: HeartbeatConfig) -> Server {
+            Server {
+                heartbeat: Some(cfg),
+                ..self
             }
         }
     }
@@ -422,6 +457,19 @@ pub mod server {
         /// требовала `--test-threads=1`; теперь это решено конструктивно.
         pub fn slots_handle(&self) -> Option<std::sync::Arc<ServingSlots>> {
             self.slots.as_ref().map(std::sync::Arc::clone)
+        }
+
+        /// M-89 (задача #6, §4.1 / `I-5`): АДДИТИВНО, по образцу `slots_handle`
+        /// (задача 13 `M-87`): ручка счётчиков ЭТОГО экземпляра. `None` ⇒
+        /// сервер поднят без политики (`bind` без `bind_with_policy`).
+        ///
+        /// Оракул `i1` (`red_m89_counters_instance::i1_two_servers_have_independent_counters`)
+        /// ОБЯЗАН наблюдать счётчики по ЭКЗЕМПЛЯРУ, а не процессно: процессное
+        /// состояние под параллельным прогоном меряет соседей по тест-бинарю, а не
+        /// предмет (`TD-224`). Прежняя конструкция опиралась на процессный
+        /// счётчик и требовала `--test-threads=1`; теперь это решено конструктивно.
+        pub fn counters_handle(&self) -> Option<std::sync::Arc<metrics::ServingCountersHandle>> {
+            self.counters.as_ref().map(std::sync::Arc::clone)
         }
 
         /// Accept-loop: на соединение — verify JWT из query; успех → snapshot + push + replay; провал →
@@ -455,16 +503,33 @@ pub mod server {
         }
 
         pub async fn serve(self) -> std::io::Result<()> {
+            // M-89 (задача #8, §4.2): сердцебиение — spawn-таск, работающий рядом с
+            // accept-loop. Создаётся в `with_heartbeat`; ошибки записи ГЛОТАЮТСЯ
+            // и логируются — сердцебиение observability, а не safety-инвариант.
+            // `loop` ниже НИКОГДА не возвращается (accept-listener закрывается только при
+            // выходе из процесса); `result` и `heartbeat_task` — `unused` для компилятора,
+            // но семантически здесь для будущей диагностики.
+            #[allow(unused_variables)]
+            let _heartbeat_task = self.heartbeat.clone().map(|hb| {
+                let counters_for_hb = self.counters.clone();
+                let cfg_for_hb = self.cfg.clone();
+                tokio::spawn(async move {
+                    run_heartbeat(hb, counters_for_hb, cfg_for_hb).await;
+                })
+            });
             // ACCEPT-LOOP: каждый TcpStream — в отдельном spawn-таске (как в recorder metrics_server).
             // Accept-сбой (listener закрыт) → WARN + retry с паузой 100ms (не спиним).
-            loop {
+            #[allow(unreachable_code, unused_variables)]
+            let _result: std::io::Result<()> = loop {
                 match self.listener.accept().await {
                     Ok((stream, _peer)) => {
                         let cfg = Arc::clone(&self.cfg);
                         let policy = self.policy.clone();
                         let slots = self.slots.clone();
+                        let counters = self.counters.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = handle_conn(stream, cfg, policy, slots).await {
+                            if let Err(e) = handle_conn(stream, cfg, policy, slots, counters).await
+                            {
                                 tracing::debug!(error = %e, "gateway-serve conn ended with error");
                             }
                         });
@@ -474,6 +539,67 @@ pub mod server {
                         tokio::time::sleep(Duration::from_millis(100)).await;
                     }
                 }
+            };
+        }
+    }
+
+    /// M-89 (задача #8, §4.2 / `I-6`): задача сердцебиения — пишет JSON
+    /// `<path>.tmp` → `rename` каждые `cfg.period` миллисекунд. Значения — снимок
+    /// per-instance счётчиков + freshness. Ошибки записи ГЛОТАЮТСЯ и логируются:
+    /// сердцебиение — observability, а не safety-инвариант.
+    async fn run_heartbeat(
+        cfg: HeartbeatConfig,
+        counters: Option<std::sync::Arc<metrics::ServingCountersHandle>>,
+        _serve_cfg: Arc<ServeConfig>,
+    ) {
+        use std::io::Write;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let tmp = cfg.path.with_extension("tmp");
+        loop {
+            tokio::time::sleep(cfg.period).await;
+            let snap = counters.as_ref().map(|c| c.snapshot()).unwrap_or_default();
+            let fresh = metrics::freshness();
+            let body = serde_json::json!({
+                "schema": 1u32,
+                "ts_wall_ms": SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0),
+                "attempts": snap.attempts,
+                "successes": snap.successes,
+                "refusals_supported": snap.refusals_supported,
+                "refusals_unsupported": snap.refusals_unsupported,
+                "journal_payload_bytes_read": snap.journal_payload_bytes_read,
+                "slots_in_flight": snap.slots_in_flight,
+                "freshness": {
+                    "source_ms": fresh.source_ms,
+                    "projection_ms": fresh.projection_ms,
+                    "published_ms": fresh.published_ms,
+                    "snapshot_ms": fresh.snapshot_ms,
+                },
+            });
+            let bytes = match serde_json::to_vec(&body) {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!(error = %e, "heartbeat: serialize failed");
+                    continue;
+                }
+            };
+            // Запись атомарна: `.tmp` → `rename`. Создаём каталог если нужно.
+            if let Some(parent) = cfg.path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let write_result = (|| -> std::io::Result<()> {
+                {
+                    let mut f = std::fs::File::create(&tmp)?;
+                    f.write_all(&bytes)?;
+                    f.sync_all()?;
+                }
+                std::fs::rename(&tmp, &cfg.path)?;
+                Ok(())
+            })();
+            if let Err(e) = write_result {
+                tracing::warn!(error = %e, path = %cfg.path.display(), "heartbeat: write failed");
             }
         }
     }
@@ -485,6 +611,7 @@ pub mod server {
         cfg: Arc<ServeConfig>,
         policy: Option<AdmissionPolicy>,
         slots: Option<std::sync::Arc<ServingSlots>>,
+        counters: Option<std::sync::Arc<metrics::ServingCountersHandle>>,
     ) -> std::io::Result<()> {
         // (1) Канал для передачи URI из handshake-коллбэка наружу.
         let (uri_tx, uri_rx) = tokio::sync::oneshot::channel::<Option<String>>();
@@ -564,6 +691,7 @@ pub mod server {
             claims,
             policy.map(std::sync::Arc::new),
             slots,
+            counters,
         )
         .await
     }
@@ -639,8 +767,18 @@ pub mod server {
     /// используется ниже по коду (через `_stats` и для будущих мультиплексных сценариев)»),
     /// врёт: `_stats` тоже дропается, а «будущие сценарии» в природе не появились.
     pub type V1PumpResult = Result<
-        (gateway::LiveReducer, Vec<crate::_gw::Frame>, u64),
-        Box<(gateway::LiveReducer, std::io::Error, u64)>,
+        (
+            gateway::LiveReducer,
+            Vec<crate::_gw::Frame>,
+            u64,
+            gateway::ReadStats,
+        ),
+        Box<(
+            gateway::LiveReducer,
+            std::io::Error,
+            u64,
+            gateway::ReadStats,
+        )>,
     >;
     /// Тип FuturesUnordered, агрегирующий in-flight pump'ы. `BTreeSet<String>` отдельно
     /// (поле `pending_ids`) — id'ы в полёте; используется для дешёвой проверки «уже качается»
@@ -648,6 +786,9 @@ pub mod server {
     pub type V1PumpFutures = futures_util::stream::FuturesUnordered<V1PumpJoin>;
 
     pub struct SessionInner {
+        /// M-89 (задача #6): счётчики ЭКЗЕМПЛЯРА сервера — пробрасываются в `handle_v1_message`
+        /// для изоляции `i1`. `None` для `bind` без политики (старый сценарий `red_m87_entrypoint`).
+        counters: Option<std::sync::Arc<metrics::ServingCountersHandle>>,
         /// Подписки на соединении. `BTreeMap` — детерминированный обход и тест «выбор на тик»
         /// (DET-I-1, `R-057` Б-1).
         ///
@@ -710,6 +851,7 @@ pub mod server {
         claims: super::auth::Claims,
         policy: Option<std::sync::Arc<AdmissionPolicy>>,
         slots: Option<std::sync::Arc<ServingSlots>>,
+        counters: Option<std::sync::Arc<metrics::ServingCountersHandle>>,
     ) -> std::io::Result<()>
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -782,13 +924,13 @@ pub mod server {
         if grace_expired || !is_v1_attempt {
             // Legacy path: прошлое поведение, env-селектор, OLD wire. Сообщение, если было,
             // отбрасывается — клиент ещй не перешёл в v1.
-            return run_authorized_session(ws, cfg, claims).await;
+            return run_authorized_session(ws, cfg, claims, counters).await;
         }
         let _ = slots;
 
         // V1 path. Передаём данные первого сообщения в v1-сессию для разбора.
         let data = first_text_bytes.expect("is_v1_attempt ⇒ data Some");
-        run_v1_session(ws, cfg, claims, data, policy, slots).await
+        run_v1_session(ws, cfg, claims, data, policy, slots, counters).await
     }
 
     /// V1-сессия (`CT-RFC-09` §2): первое сообщение — `subscribe` с `v:1` (проверено вызывающим).
@@ -800,6 +942,7 @@ pub mod server {
         first_msg_data: Vec<u8>,
         policy: Option<std::sync::Arc<AdmissionPolicy>>,
         slots: Option<std::sync::Arc<ServingSlots>>,
+        counters: Option<std::sync::Arc<metrics::ServingCountersHandle>>,
     ) -> std::io::Result<()>
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -827,6 +970,7 @@ pub mod server {
             cfg: Arc::clone(&cfg),
             policy: policy.clone(),
             slots: slots.clone(),
+            counters: counters.clone(),
         };
 
         // Обрабатываем первое `subscribe`.
@@ -958,13 +1102,13 @@ pub mod server {
                 > = None;
                 if let Some(policy) = inner.policy.clone() {
                     use super::admission::{admit, readiness, ServingOutcome};
-                    metrics::inc_attempts_pub(); // Попытка зарегистрирована ДО admit/readiness,
-                                                 // иначе C6 «попытка не выросла» краснеет на
-                                                 // refused-запросах.
+                    metrics::inc_attempts(inner.counters.as_ref()); // Попытка зарегистрирована ДО admit/readiness,
+                                                                    // иначе C6 «попытка не выросла» краснеет на
+                                                                    // refused-запросах.
                     let outcome = admit(&policy, &sel);
                     match outcome {
                         ServingOutcome::Unsupported => {
-                            metrics::inc_refusals_unsupported_pub();
+                            metrics::inc_refusals_unsupported(inner.counters.as_ref());
                             let msg =
                                 "selector вне политики допуска (band/timeframe/window)".to_string();
                             send_v1_error(sink, Some(id), "unsupported", &msg).await;
@@ -974,7 +1118,7 @@ pub mod server {
                             // Дальше — readiness (на слепок) и слот.
                         }
                         _ => {
-                            metrics::inc_refusals_supported_pub();
+                            metrics::inc_refusals_supported(inner.counters.as_ref());
                             let msg = format!("admit вернул {:?}", outcome);
                             send_v1_error(sink, Some(id), "not_ready", &msg).await;
                             return Err(format!("not_ready: {msg}"));
@@ -1014,7 +1158,7 @@ pub mod server {
                                 Some(g)
                             }
                             None => {
-                                metrics::inc_refusals_supported_pub();
+                                metrics::inc_refusals_supported(inner.counters.as_ref());
                                 send_v1_error(
                                     sink,
                                     Some(id),
@@ -1049,7 +1193,7 @@ pub mod server {
                             // OK — продолжаем к spawn_blocking.
                         }
                         _ => {
-                            metrics::inc_refusals_supported_pub();
+                            metrics::inc_refusals_supported(inner.counters.as_ref());
                             let code = match ready_outcome {
                                 ServingOutcome::Warming => "warming",
                                 _ => "not_ready",
@@ -1079,7 +1223,7 @@ pub mod server {
                     // неверным развёртыванием. На проде `bind_with_policy`
                     // всегда подключает `/ckpt`, и пустой каталог —
                     // диагностируемый дефект развёртывания, а не «готов».
-                    metrics::inc_attempts_pub();
+                    metrics::inc_attempts(inner.counters.as_ref());
                     let ready_outcome = if inner.cfg.checkpoint_dir.is_some() {
                         use super::admission::{readiness, AdmissionPolicy, ServingOutcome};
                         let ckpt_path = inner.cfg.checkpoint_dir.clone();
@@ -1114,7 +1258,7 @@ pub mod server {
                     match ready_outcome {
                         ServingOutcome::Ready => {}
                         _ => {
-                            metrics::inc_refusals_supported_pub();
+                            metrics::inc_refusals_supported(inner.counters.as_ref());
                             let code = match ready_outcome {
                                 ServingOutcome::Warming => "warming",
                                 _ => "not_ready",
@@ -1132,6 +1276,9 @@ pub mod server {
                 // (б) id новый — ADD с проверкой cap.
                 let path_clone = inner.cfg.journal_dir.clone();
                 let filter_clone = inner.cfg.filter.clone();
+                // M-89 (задача #6): per-instance счётчики пробрасываются в spawn_blocking
+                // — `inner` будет move'нут внутрь, считаем через хэндл.
+                let counters_for_resume = inner.counters.clone();
                 // M-87 (задача 17, §14.1septies): для пересчёта провенанса истории против
                 // ТЕКУЩЕГО начала журнала нужно передать в spawn_blocking отдельные копии
                 // пути и фильтра (после `move ||` мы `inner` уже не вернём — его закрытие
@@ -1180,14 +1327,18 @@ pub mod server {
                             // класс, который «вернулся отказ ≠ работа не делалась»).
                             // Позднее (e958661) кормили `payload_bytes_for_dir(dir)` — суммой
                             // ВСЕХ `.jrnl` в каталоге (на проде ≈92 ГБ): тоже ложь, ещё и
-                            // крупнее на пять порядков. Сейчас: warm = ckpt_bytes +
-                            // tail_bytes_after_cursor (хвост, который докачает `live.pump`),
-                            // cold = сумма всех `.jrnl` (там действительно прочитан весь
-                            // журнал). Подробности — `crates/gateway/src/lib.rs`,
+                            // крупнее на пять порядков. Сейчас: warm = только файл слепка
+                            // (`R-208` Б-2); хвост будет прочитан следующим `pump()`,
+                            // и его байты придут в счётчик через per-pump push
+                            // (`add_journal_payload_bytes(counters, pump_stats.payload_bytes_read)`).
+                            // Подробности — `crates/gateway/src/lib.rs`,
                             // `LiveReducer::resume` warm/cold-ветки. Счётчик отвечает на
                             // вопрос, который обещает его имя; проверяется оракулом
                             // `red_m87_read_volume_truth::q2` против `rchar` ядра.
-                            metrics::add_journal_payload_bytes_pub(stats.payload_bytes_read);
+                            metrics::add_journal_payload_bytes(
+                                counters_for_resume.as_ref(),
+                                stats.payload_bytes_read,
+                            );
                             Ok((
                                 snap,
                                 session::Sub {
@@ -1256,7 +1407,7 @@ pub mod server {
                     if sink.send(Message::Text(snap_text)).await.is_err() {
                         return Err("client disconnected during switch snapshot send".to_string());
                     }
-                    metrics::inc_successes_pub();
+                    metrics::inc_successes(inner.counters.as_ref());
                     tracing::debug!(sub = %switched_id, "v1 subscribe (switch) ok");
                     return Ok(());
                 }
@@ -1334,7 +1485,10 @@ pub mod server {
                     // живёт в контейнере `move`-замыкания и во внешний scope не
                     // пробрасывается; альтернатива «вернуть stats из замыкания» расширяет
                     // тип результата и оба места ошибки (SWITCH/ADD), здесь — узкая точка.
-                    metrics::add_journal_payload_bytes_pub(stats.payload_bytes_read);
+                    metrics::add_journal_payload_bytes(
+                        counters_for_resume.as_ref(),
+                        stats.payload_bytes_read,
+                    );
                     Ok((
                         snap,
                         session::Sub {
@@ -1401,7 +1555,7 @@ pub mod server {
                 if sink.send(Message::Text(snap_text)).await.is_err() {
                     return Err("client disconnected during snapshot send".to_string());
                 }
-                metrics::inc_successes_pub();
+                metrics::inc_successes(inner.counters.as_ref());
                 tracing::debug!(sub = %id_for_insert, "v1 subscribe ok");
                 Ok(())
             }
@@ -1632,12 +1786,13 @@ pub mod server {
                                 cfg2.filter.clone(),
                                 PUSH_MAX_EVENTS,
                             ) {
-                                // Задача 13 §12 N-7: `new_cursor` и `stats` из `pump()` больше
-                                // не пробрасываются — v1-путь их не использует (см. `V1PumpResult`).
-                                Ok((frames, _new_cursor, _stats)) => {
-                                    Ok((live, frames, gen_at_pump))
+                                // M-89 (задача #4, `I-4`): `stats` проброшен в `V1PumpResult` —
+                                // per-pump `payload_bytes_read` ПУШИТСЯ в счётчик экземпляра
+                                // (раньше отбрасывался → оракул `v` краснел).
+                                Ok((frames, _new_cursor, stats)) => {
+                                    Ok((live, frames, gen_at_pump, stats))
                                 }
-                                Err(e) => Err(Box::new((live, e, gen_at_pump))),
+                                Err(e) => Err(Box::new((live, e, gen_at_pump, gateway::ReadStats::default()))),
                             };
                             (id_for_pump, outcome)
                         });
@@ -1663,8 +1818,21 @@ pub mod server {
                     inner.pending_ids.remove(&id);
                     match outcome {
                         // Задача 13 §12 N-7: `_new_cursor` / `_stats` удалены из кортежа
-                        // (см. `V1PumpResult`).
-                        Ok((live, frames, gen_at_pump)) => {
+                        // (см. `V1PumpResult`). M-89 (задача #4): теперь stats снова в
+                        // кортеже — для per-pump push в счётчик экземпляра.
+                        Ok((live, frames, gen_at_pump, pump_stats)) => {
+                            // M-89 (задача #4, `R-208` Б-1, `I-4`): per-pump push байт в
+                            // счётчик ЭКЗЕМПЛЯРА (handle) — ранее `add_journal_payload_bytes_pub`
+                            // писал только в процессный `JOURNAL_BYTES_GLOBAL`, и сердцебиение,
+                            // читающее `counters.as_ref().map(|c| c.snapshot())`, не видело
+                            // байт pump'ов никогда (`TD-220`). Теперь `add_journal_payload_bytes`
+                            // (с handle) кормит ОБОИХ — handle И process-global; тест `v`
+                            // (process-global) остаётся зелёным, `i1`/`i2` (handle) видят
+                            // реальный прирост.
+                            metrics::add_journal_payload_bytes(
+                                inner.counters.as_ref(),
+                                pump_stats.payload_bytes_read,
+                            );
                             // ═════ РЕШАЮЩИЙ INVARIANT: «OLD PUMP НЕ ЗАТИРАЕТ NEW SUB» ═════
                             //
                             // ДО фикса (R-086 блокер §2) следующий сценарий воспроизводился:
@@ -1749,7 +1917,7 @@ pub mod server {
                             }
                         }
                         Err(boxed) => {
-                            let (live, e, gen_at_pump) = *boxed;
+                            let (live, e, gen_at_pump, _pump_stats) = *boxed;
                             // M-71 (rev7, `R-143` B-2 + `R-139` N-1): отказ ПО ПРЕДЕЛУ
                             // ТЕРМИНАЛЕН для подписки. Повторный `pump` того же кадра ничего
                             // не лечит — кадр не станет меньше, пока предел стоит; это
@@ -1834,6 +2002,7 @@ pub mod server {
         ws: WebSocketStream<S>,
         cfg: Arc<ServeConfig>,
         claims: super::auth::Claims,
+        counters: Option<std::sync::Arc<metrics::ServingCountersHandle>>,
     ) -> std::io::Result<()>
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -1955,6 +2124,11 @@ pub mod server {
         // однопоточный (`current_thread`) рантайм прода не должен стоять, пока это читается
         // (root cause 2, `R-025`) — тот же принцип, что и в push-цикле ниже (task #3/#4).
         let cfg1 = Arc::clone(&cfg);
+        // M-89 (`R-208` Б-1): клонируем `counters` для spawn_blocking-замыкания, чтобы
+        // ОРИГИНАЛ остался доступен после `.await` для snapshot-push (`add_journal_payload_bytes`
+        // снаружи, см. ниже). Без clone — `move ||` забирает `counters` по значению, и
+        // внешнее `counters.as_ref()` падает по E0382.
+        let counters_for_setup = counters.clone();
         let setup = tokio::task::spawn_blocking(move || -> std::io::Result<(
             ServeMsg,
             crate::_gw::ReadStats,
@@ -1998,6 +2172,13 @@ pub mod server {
                     LEGACY_DRAIN_BATCH,
                 )?;
                 stats = stats + pump_stats;
+                // M-89 (задача #4, `R-208` Б-1, `I-4`): КАЖДЫЙ pump пушит РОВНО свой
+                // `stats.payload_bytes_read` в счётчик ЭКЗЕМПЛЯРА (handle) через
+                // универсальный продюсер с handle — ранее `add_journal_payload_bytes_pub`
+                // кормил только process-global, и handle никогда не видел байт pump'ов
+                // (`TD-220`). Без этого — per-pump байты теряются для сердцебиения
+                // (handle) и для `i1`/`i2` (handle-изоляция).
+                metrics::add_journal_payload_bytes(counters_for_setup.as_ref(), pump_stats.payload_bytes_read);
                 // M-87 (задача 24, R-196 №6 / R-200 §B7 / R-201 Б-1):
                 // `feed_tail_within` СНЯТ с прод-пути выдачи как заглушка. Вердикт
                 // R-201 предъявил мутацией: вызов с бюджетом `{max_events: 0,
@@ -2088,8 +2269,8 @@ pub mod server {
         //
         // `stats.payload_bytes_read` здесь — результат warm- или cold-`resume` (см.
         // `LiveReducer::resume` warm/cold-ветки в `crates/gateway/src/lib.rs`):
-        // warm = ckpt_bytes + tail_bytes_after_cursor; cold = сумма всех `.jrnl`.
-        metrics::add_journal_payload_bytes_pub(stats.payload_bytes_read);
+        // warm = только файл слепка (`R-208` Б-2); cold = сумма всех `.jrnl`.
+        metrics::add_journal_payload_bytes(counters.as_ref(), stats.payload_bytes_read);
         sink.send(Message::Text(snap_text))
             .await
             .map_err(|e| std::io::Error::other(format!("ws send snapshot: {e}")))?;
@@ -2151,6 +2332,7 @@ pub mod server {
             cfg: Arc::clone(&cfg),
             policy: None,
             slots: None,
+            counters: counters.clone(),
         };
         // M-65 round 2 Б-1 (`R-057`): legacy-путь (v1 subs внутри legacy сессии) использует
         // ТЕ ЖЕ типы, что и v1-путь (`V1PumpJoin`/`V1PumpResult`) — никакой разницы в форме
@@ -2238,13 +2420,13 @@ pub mod server {
                                 cfg2.filter.clone(),
                                 PUSH_MAX_EVENTS,
                             ) {
-                                // Задача 13 §12 N-7: `new_cursor` и `stats` из `pump()` больше
-                                // не пробрасываются — legacy_v1-путь их не использует
-                                // (см. `V1PumpResult`).
-                                Ok((frames, _new_cursor, _stats)) => {
-                                    Ok((live, frames, gen_at_pump))
+                                // M-89 (задача #4, `I-4`): `stats` проброшен в `V1PumpResult` —
+                                // per-pump `payload_bytes_read` ПУШИТСЯ в счётчик экземпляра
+                                // (раньше отбрасывался → оракул `v` краснел).
+                                Ok((frames, _new_cursor, stats)) => {
+                                    Ok((live, frames, gen_at_pump, stats))
                                 }
-                                Err(e) => Err(Box::new((live, e, gen_at_pump))),
+                                Err(e) => Err(Box::new((live, e, gen_at_pump, gateway::ReadStats::default()))),
                             };
                             (id_for_pump, outcome)
                         });
@@ -2271,7 +2453,16 @@ pub mod server {
                     // Задача 13 §12 N-7: `_new_cursor` / `_stats` удалены из кортежа
                     // (см. `V1PumpResult`).
                     match outcome {
-                        Ok((live, frames, gen_at_pump)) => {
+                        Ok((live, frames, gen_at_pump, pump_stats)) => {
+                            // M-89 (задача #4, `R-208` Б-1, `I-4`): per-pump push байт в
+                            // счётчик ЭКЗЕМПЛЯРА (handle) — тот же приём, что в
+                            // `run_v1_session_loop` (см. длинный комментарий выше). Раньше
+                            // `add_journal_payload_bytes_pub` кормил только process-global,
+                            // handle не видел байт pump'ов никогда (`TD-220`).
+                            metrics::add_journal_payload_bytes(
+                                counters.as_ref(),
+                                pump_stats.payload_bytes_read,
+                            );
                             // Аналогично v1-pump-completion в `run_v1_session_loop`: sub живёт,
                             // кладём `live` обратно в sub.live по месту (`subs.get_mut`), ЕСЛИ
                             // generation не разошёлся. Расхождение = switch/remove в-полёте ⇒
@@ -2314,7 +2505,7 @@ pub mod server {
                             // heartbeat.
                         }
                         Err(boxed) => {
-                            let (live, e, gen_at_pump) = *boxed;
+                            let (live, e, gen_at_pump, _pump_stats) = *boxed;
                             // M-71 (rev7, `R-143` B-2): та же терминальность, что в
                             // `run_v1_session_loop` — предел ОБЪЁМА завершает подписку,
                             // клиент извещается и пересобирается снапшотом. Признак —
@@ -2570,6 +2761,46 @@ pub fn build_selector(
 ///   `GATEWAY_DEPTH_CADENCE_MS`. Переменная ОБЪЯВЛЕНА в `docker-compose.yml` —
 ///   иначе ручка оператору недоступна, как бы юнит-оракулы ни были зелены
 ///   (`red_depth_cadence_from_env::knob_is_declared_in_compose`).
+///
+///
+/// M-89 (задача #8, §4.2 / `I-6`): парс конфига сердцебиения из env.
+///
+/// `GATEWAY_HEARTBEAT_PATH` (опциональна): если не задана или пустая —
+///   `GATEWAY_HEARTBEAT_PATH` (опциональна): если не задана или пустая —
+///   `Ok(None)`, сердцебиения нет, и watchdog детектит как `MISSING`. Если
+///   задана — путь к ФАЙЛУ на ЗАПИСЫВАЕМОМ монтировании (не /journal, не
+///   /ckpt; не каталог с хвостовым `/`).
+///   `GATEWAY_HEARTBEAT_PERIOD_MS` (дефолт 10 000): период в мс. `0` или
+///   невалидное ⇒ `Err` — отказ старта (`GW-I-14`).
+pub fn heartbeat_config_from_env(
+    get: impl Fn(&str) -> Option<String>,
+) -> Result<Option<server::HeartbeatConfig>, String> {
+    use std::path::PathBuf;
+    use std::time::Duration;
+    let path: Option<PathBuf> = match get("GATEWAY_HEARTBEAT_PATH") {
+        Some(s) if !s.trim().is_empty() => Some(PathBuf::from(s.trim())),
+        _ => None,
+    };
+    let path = match path {
+        None => return Ok(None),
+        Some(p) => p,
+    };
+    let period: Duration = match get("GATEWAY_HEARTBEAT_PERIOD_MS") {
+        None => Duration::from_millis(10_000),
+        Some(s) => {
+            let ms: u64 = s
+                .trim()
+                .parse()
+                .map_err(|e| format!("GATEWAY_HEARTBEAT_PERIOD_MS parse: {e}"))?;
+            if ms == 0 {
+                return Err("GATEWAY_HEARTBEAT_PERIOD_MS must be > 0".to_string());
+            }
+            Duration::from_millis(ms)
+        }
+    };
+    Ok(Some(server::HeartbeatConfig { path, period }))
+}
+
 pub fn serve_config_from_env(
     get: impl Fn(&str) -> Option<String>,
 ) -> Result<server::ServeConfig, String> {
