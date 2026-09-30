@@ -3309,66 +3309,6 @@ fn seek_back_from_tail(seg_path: &Path, after_seq: u64) -> io::Result<Option<Tai
     Ok(None)
 }
 
-/// M-89 (задача #4, `I-4`): верхняя граница байт хвоста, который `EventStream`
-/// докачает с курсором `after_seq`. Алгоритм:
-/// 1. Сегменты с `first_seq > after_seq` — ЦЕЛИКОМ (`EventStream` прочитает их
-///    полностью, т.к. первое событие после курсора лежит за пределами).
-/// 2. АКТИВНЫЙ сегмент (содержащий `after_seq`: `first_seq ≤ after_seq < next.first_seq`)
-///    — ТОЛЬКО ХВОСТ от `after_seq + 1` до `last_seq`. Оценка через дешёвый
-///    tail-скан (≤ 64 КиБ) и средний размер кадра:
-///    `tail_bytes ≈ (last_seq − after_seq) × avg`, где `avg = (file_len − header_end)
-///    / (last_seq − first_seq + 1)`. Для равномерных кадров — ровно хвост; для
-///    смешанных — верхняя граница (наблюдатель `red_m89_read_volume_truth::v` так
-///    и считает: счётчик не может «учесть» БОЛЬШЕ прочитанного ядром).
-///
-/// Возвращает 0 при пустом каталоге / ошибке чтения — счётчик `payload_bytes_read`
-/// монотонен, и сбой чтения не должен ронять выдачу.
-pub fn tail_bytes_for_dir(dir: impl AsRef<Path>, after_seq: u64) -> u64 {
-    let segs = match segments(dir.as_ref()) {
-        Ok(s) => s,
-        Err(_) => return 0,
-    };
-    // Активный сегмент — тот, в котором `cursor.upto_seq` (последний сегмент в
-    // `selected` при стандартной сортировке по индексу), при условии `first_seq ≤ after_seq`.
-    // Только для НЕГО делаем дешёвый tail-скан (≤ 64 КиБ) — для остальных сегментов
-    // хвост лежит целиком за курсором и оценка `size_bytes` уже точная.
-    let active = segs.iter().rev().find(|s| s.header.first_seq <= after_seq);
-    let mut total: u64 = 0;
-    for s in &segs {
-        // Сегмент ЦЕЛИКОМ после курсора — `EventStream` прочитает его полностью.
-        if s.header.first_seq > after_seq {
-            total = total.saturating_add(s.size_bytes);
-            continue;
-        }
-        // Активный сегмент (содержит курсор) — только хвост.
-        if Some(s) == active && s.header.first_seq <= after_seq {
-            // M-89: cheap_tail_last_seq читает ≤ 64 КиБ от конца, тогда как
-            // `tail_last_seq_of` — `TAIL_SCAN_CHUNK = 4 МиБ`. На прод-сегменте 2.65 ГиБ
-            // разница в 64× (4 МиБ vs 64 КиБ), и warm-resume путь не должен
-            // обходиться «хвостом» в 4 МиБ на КАЖДОЕ подключение. Здесь нам нужна только
-            // `last_seq` для оценки `tail_bytes` — точная позиция кадра не нужна,
-            // `last_seq` в `last 64 KiБ` для типичного сегмента верен.
-            if let Some(last_seq) = cheap_tail_last_seq_pub(&s.path).ok().flatten() {
-                if let Ok(mut probe) = std::fs::File::open(&s.path) {
-                    let header_end = match read_v2_header_and_skip(&mut probe) {
-                        Ok(Some(_)) => probe.stream_position().unwrap_or(0),
-                        _ => 0,
-                    };
-                    let total_events = last_seq
-                        .saturating_sub(s.header.first_seq)
-                        .saturating_add(1);
-                    if total_events > 0 && s.size_bytes > header_end {
-                        let avg = (s.size_bytes - header_end) / total_events;
-                        let tail_events = last_seq.saturating_sub(after_seq);
-                        total = total.saturating_add(tail_events.saturating_mul(avg));
-                    }
-                }
-            }
-        }
-    }
-    total
-}
-
 /// M-89 (`§5.2` п. 1, п. 3): дешёвый tail-скан — последние ≤ `max_window` байт
 /// сырого сегмента (`.zst` — через декомпрессию, без ограничения окна). Возвращает
 /// `seq` последнего ВАЛИДНОГО кадра в окне, либо `None`. Используется ТОЛЬКО
@@ -3378,12 +3318,6 @@ pub fn tail_bytes_for_dir(dir: impl AsRef<Path>, after_seq: u64) -> u64 {
 /// сырого (≪ 4 МиБ `TAIL_SCAN_CHUNK`); `.zst` платит столько, сколько
 /// `tail_last_seq_of` (сжатый поток до EOF) — `.zst`-сегмент, содержащий
 /// курсор, по §5.2 п. 5 читается целиком в любом случае.
-/// M-89: то же, что `cheap_tail_last_seq`, но с фиксированным окном 64 КиБ
-/// (для вызывающих из `tail_bytes_for_dir` и т.п., чтобы не передавать размер).
-pub(crate) fn cheap_tail_last_seq_pub(path: &Path) -> io::Result<Option<u64>> {
-    Ok(cheap_tail_last_seq(path, 64 * 1024))
-}
-
 fn cheap_tail_last_seq(path: &Path, max_window: usize) -> Option<u64> {
     use std::io::{Read, Seek, SeekFrom};
     let is_zst = path
