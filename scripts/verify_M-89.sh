@@ -357,6 +357,12 @@ task11_composition_check() { # <docker-compose.yml> <deploy/cron.d/watchdog>
     fail "task11: КОМПОЗИЦИЯ РАЗОШЛАСЬ — compose пишет в $host_path, cron читает $cron_path"
   elif ! grep -qE 'scripts/watchdog_cron\.sh' "$cron"; then
     fail "task11: $cron не зовёт scripts/watchdog_cron.sh — фрагмент без строки расписания"
+  elif [ "$(grep -nE '^WATCHDOG_SERVING_HEARTBEAT_PATH=' "$cron" | head -1 | cut -d: -f1)" -gt \
+         "$(grep -nE '^[^#]*scripts/watchdog_cron\.sh' "$cron" | head -1 | cut -d: -f1)" ]; then
+    # `R-209` Н-1: в cron.d присваивание действует ТОЛЬКО на строки НИЖЕ себя — переставленная
+    # копия проходила прежний греп (значение где угодно + head -1), а ops-watchdog на проде
+    # получил бы дефолтный путь, то есть композиция расходилась бы молча.
+    fail "task11: в $cron WATCHDOG_SERVING_HEARTBEAT_PATH= стоит НИЖЕ строки расписания — cron.d применяет присваивание только к строкам после него; ops-watchdog его не увидит"
   elif command -v crontab >/dev/null 2>&1 && ! crontab -n "$cron" >/dev/null 2>&1; then
     fail "task11: crontab -n $cron — фрагмент не устанавливается (тот же класс, что D5 M-08)"
   else

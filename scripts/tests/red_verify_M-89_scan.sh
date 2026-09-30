@@ -105,6 +105,11 @@ cron_with() { # <путь> → файл
   printf 'SHELL=/bin/bash\nWATCHDOG_SERVING_HEARTBEAT_PATH=%s\n*/5 * * * * root /root/hft-platform/scripts/watchdog_cron.sh\n' "$1" > "$f"
   printf '%s' "$f"
 }
+cron_swapped() { # <путь> → файл: присваивание НИЖЕ строки расписания (R-209 Н-1)
+  local f="$WORK/cron-swapped-$RANDOM"
+  printf 'SHELL=/bin/bash\n*/5 * * * * root /root/hft-platform/scripts/watchdog_cron.sh\nWATCHDOG_SERVING_HEARTBEAT_PATH=%s\n' "$1" > "$f"
+  printf '%s' "$f"
+}
 t11() { OUT=$(VERIFY_M89_MODE=task11 VERIFY_M89_COMPOSE="$1" VERIFY_M89_CRON="$2" bash "$SUT" 2>&1); RC=$?; }
 expect_t11() { # <имя> <compose> <cron> <rc> <описание> [grep]
   t11 "$2" "$3"
@@ -123,6 +128,7 @@ expect_t11 "p6-ro-mount"      "$(compose_with /state/gateway-serve.heartbeat gat
 expect_t11 "p7-no-cron"       "$(compose_with /state/gateway-serve.heartbeat gateway-state:/state)" "$WORK/absent-cron"                            1 "нет фрагмента cron ⇒ FAIL" "нет "
 expect_t11 "p8-dot-leaf"      "$(compose_with /state/. gateway-state:/state)"                        "$(cron_with $HOST/.)"                         1 "служебный лист . ⇒ FAIL" "не путь к файлу"
 expect_t11 "p9-off-mount"     "$(compose_with /tmp/hb gateway-state:/state)"                         "$(cron_with /tmp/hb)"                         1 "путь вне монтирований ⇒ FAIL" "не лежит"
+expect_t11 "p10-cron-order"   "$(compose_with /state/gateway-serve.heartbeat gateway-state:/state)" "$(cron_swapped $HOST/gateway-serve.heartbeat)" 1 "присваивание ниже строки расписания ⇒ FAIL (R-209 Н-1)" "НИЖЕ строки расписания"
 
 printf '\nитого: ok=%d fail=%d\n' "$PASS" "$FAIL"
 if [ "$FAIL" -eq 0 ]; then echo "VERDICT: PASS"; exit 0; fi
