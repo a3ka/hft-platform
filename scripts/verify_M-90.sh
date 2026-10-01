@@ -37,7 +37,6 @@ BASE="$(git merge-base origin/main HEAD 2>/dev/null || true)"
 if [ -z "$BASE" ]; then
   fail "ci-parity: merge-base origin/main HEAD не вычислен — нет базы события"
 else
-  export EVENT_NAME=pull_request PR_BASE_SHA="$BASE" GITHUB_BASE_REF=main
   mapfile -t RUNS < <(grep -E '^[[:space:]]*(- )?run:[[:space:]]*[^|[:space:]]' .github/workflows/ci.yml \
     | sed -E 's/^[[:space:]]*(- )?run:[[:space:]]*//')
   [ "${#RUNS[@]}" -ge 40 ] || fail "ci-parity: из ci.yml разобрано ${#RUNS[@]} команд — ожидалось ≥ 40 (разбор сломан?)"
@@ -55,7 +54,12 @@ else
         if [ -z "$have_review" ]; then skip "ci-parity: check_review_fa — вердикта R-NNN по M-90 в диапазоне ещё нет (зеленеет на PR-гейте)"; continue; fi ;;
     esac
     cmd=$(printf '%s' "$r" | sed "s/\${{ steps.base.outputs.sha }}/$BASE/g")
-    run_step "ci-parity: $cmd" bash -c "$cmd"
+    # Форма события — ТОЛЬКО барьерам (check_*.sh читают EVENT_NAME/PR_BASE_SHA, как в CI);
+    # пробы red_*.sh — самодостаточные батареи и в CI этих переменных не получают.
+    case "$cmd" in
+      "bash scripts/check_"*) run_step "ci-parity: $cmd" env EVENT_NAME=pull_request PR_BASE_SHA="$BASE" bash -c "$cmd" ;;
+      *) run_step "ci-parity: $cmd" env -u EVENT_NAME -u PR_BASE_SHA bash -c "$cmd" ;;
+    esac
   done
   nmulti=$(grep -cE '^[[:space:]]*(- )?run:[[:space:]]*\|' .github/workflows/ci.yml)
   skip "ci-parity: многострочных run-блоков $nmulti (база события, проверка базы, агрегат) — плумбинг CI; агрегат держит red_ci_aggregate.sh выше"
