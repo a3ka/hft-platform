@@ -56,13 +56,15 @@ const BIN: &str = env!("CARGO_BIN_EXE_gateway-checkpoint");
 const N: u64 = 300;
 const SEVEN: &str = "0.015,0.03,0.05,0.08,0.15,0.3,0.6";
 const SERVICE: &str = "gateway-checkpoint";
-/// Переменные селектора, которые сегодня несёт скрипт cron'а СВОИМИ копиями.
-const SCRIPT_SELECTOR_VARS: [&str; 5] = [
+/// Переменные селектора, которые скрипт cron'а несёт СВОИМИ копиями сегодня (пять) или мог бы нести (каденция — `C-266` F1).
+const SCRIPT_SELECTOR_VARS: [&str; 6] = [
     "CHECKPOINT_VENUE",
     "CHECKPOINT_SYMBOL",
     "CHECKPOINT_TIMEFRAME_MS",
     "CHECKPOINT_BANDS",
     "CHECKPOINT_WINDOW_MS",
+    // `C-266` F1: каденция — ось отпечатка; её копия у скрипта — тот же второй источник.
+    "CHECKPOINT_DEPTH_CADENCE_MS",
 ];
 
 fn repo_root() -> PathBuf {
