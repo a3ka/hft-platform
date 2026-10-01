@@ -12,6 +12,20 @@ a="      - name: Проба агрегата"; b="        run: git fetch --no-ta
 assert a in s and b in s, "SETUP: якоря правки не найдены в ci.yml"
 open(d+'newblock.yml','w').write(s.replace(a,"      - name: новый шаг\n        run: |\n          echo ${{ github.sha }}\n"+a,1))
 open(d+'stale.yml','w').write(s.replace(b,"",1))
+# C-266 F2: работа, дописанная в ИСКЛЮЧЁННЫЙ многострочный блок
+c='          echo "sha=${raw}" >> "$GITHUB_OUTPUT"\n'
+e='          echo "All checks passed"\n'
+assert s.count(c)==1 and s.count(e)==1, "SETUP: якоря блоков базы/агрегата не найдены"
+open(d+'base_append.yml','w').write(s.replace(c,c+"          bash scripts/tests/red_artifact_ids.sh --battery\n",1))
+open(d+'agg_append.yml','w').write(s.replace(e,e+"          bash scripts/check_extra.sh\n",1))
+# агрегат: законный рост needs (новый джоб в условии) — карта обязана пропустить
+f='"${{ needs.build-test.result }}" != "success" || '
+assert s.count(f)==1, "SETUP: начало условия агрегата не найдено"
+open(d+'agg_grow.yml','w').write(s.replace(f,f+'"${{ needs.new-job.result }}" != "success" || ',1))
+# агрегат: команда, спрятанная в строку условия
+g=' ]]; then\n            echo "One or more checks failed"'
+assert s.count(g)==1, "SETUP: хвост условия агрегата не найден"
+open(d+'agg_inject.yml','w').write(s.replace(g,' ]] || bash scripts/check_extra.sh; then\n            echo "One or more checks failed"',1))
 PY
 [ $? -eq 0 ] || { echo "FAIL  SETUP: копии ci.yml не построены"; exit 1; }
 case_() { # <имя> <файл> <ожидаемый exit> <обязательная строка>
@@ -21,8 +35,15 @@ case_() { # <имя> <файл> <ожидаемый exit> <обязательн�
 }
 cmp -s "$T/ok.yml" "$T/newblock.yml" && { echo "FAIL  SETUP: newblock не изменён"; F=$((F+1)); }
 cmp -s "$T/ok.yml" "$T/stale.yml" && { echo "FAIL  SETUP: stale не изменён"; F=$((F+1)); }
+for w in base_append agg_append agg_grow agg_inject; do
+  cmp -s "$T/ok.yml" "$T/$w.yml" && { echo "FAIL  SETUP: $w не изменён"; F=$((F+1)); }
+done
 case_ "честный ci.yml: всё учтено"            "$T/ok.yml"       0 "учтено шагов"
 case_ "новый шаг с \${{ }} вне карты ⇒ FAIL"  "$T/newblock.yml" 1 "не стоит в карте исключений"
 case_ "исключение без шага ⇒ карта протухла"  "$T/stale.yml"    1 "карта протухла"
-[ "$F" -eq 0 ] && { echo "VERDICT: PASS — 3 сценария"; exit 0; }
+case_ "строка дописана в блок базы ⇒ FAIL (C-266 F2)"        "$T/base_append.yml" 1 "карта протухла"
+case_ "строка дописана в блок агрегата ⇒ FAIL"              "$T/agg_append.yml"  1 "карта протухла"
+case_ "агрегат: новый джоб в условии — законно ⇒ PASS"      "$T/agg_grow.yml"    0 "учтено шагов"
+case_ "агрегат: команда в строке условия ⇒ FAIL"            "$T/agg_inject.yml"  1 "карта протухла"
+[ "$F" -eq 0 ] && { echo "VERDICT: PASS — 7 сценариев"; exit 0; }
 echo "VERDICT: FAIL (провалов: $F)"; exit 1
