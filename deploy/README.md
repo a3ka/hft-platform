@@ -462,3 +462,81 @@ docker compose up -d --build recorder  # пересборка
 - `docs/06-data-layer-and-storage.md` — retention/cold, требования к `/journal` и
   `/cold`.
 - `crates/journal/src/bin/journal-retention.rs` — реализация CLI.
+
+---
+
+# Прогреватель слепка чекпоинта (M-90, TD-227)
+
+`deploy/bin/gateway-checkpoint-cron.sh` зовётся из `deploy/cron.d/journal-retention` (`*/15`)
+и через `docker compose run --rm gateway-checkpoint` снимает чекпоинт `Reducer` в том
+`gateway-ckpt`, чтобы `gateway-serve` подхватил его при подключении клиента без холодного
+реплея (M-38b, TD-044).
+
+## 8a. Единый источник селектора (M-90, §3 спеки)
+
+Прогреватель и сервер выдачи берут селектор (площадку, символ, таймфрейм, полосы, окно,
+каденцию) из ОДНОГО источника: `host .env` → `docker-compose.yml environment:` сервисов
+`gateway-serve` и `gateway-checkpoint` → `GATEWAY_*`. **У cron-обёртки нет СВОЕЙ копии
+селектора** — это и есть лечение `TD-227` (прод-выдача восемь суток отвечала `not_ready`
+при зелёных liveness-сигналах; корень — `GATEWAY_BANDS` в `.env` против `CHECKPOINT_BANDS=0.001`
+в обёртке).
+
+| Где | Что |
+|---|---|
+| `docker-compose.yml` (`environment:` сервиса `gateway-checkpoint`) | объявляет `GATEWAY_VENUE` / `_SYMBOL` / `_TIMEFRAME_MS` / `_BANDS` / `_WINDOW_MS` / `_DEPTH_CADENCE_MS` с ТЕМИ ЖЕ дефолтами `${VAR:-…}`, что у `gateway-serve` |
+| `gateway-checkpoint` (binary) | при отсутствии флага читает `GATEWAY_*` env (тот же путь, что `M-68` задача 23 ввела для `--depth-cadence-ms`); флаг имеет приоритет как явная команда оператора |
+| `deploy/bin/gateway-checkpoint-cron.sh` | НЕ передаёт флаги селектора (`--venue`/`--symbol`/`--timeframe-ms`/`--bands`/`--window-ms`/`--depth-cadence-ms`); на любую из шести `CHECKPOINT_*` селектора в своём окружении — отказ с именем переменной, runner НЕ зовётся |
+
+## 8b. Операторские ручки cron-обёртки прогревателя
+
+Разрешено менять в `/etc/cron.d/hft-journal-retention` (для прогревателя) — это НЕ
+селектор, источник через `host .env`:
+
+| Env | Назначение | Дефолт |
+|---|---|---|
+| `CHECKPOINT_RUNNER` | шов: подставить прямой бинарь (использует гейт `verify_M-48.sh`) | `docker compose run --rm gateway-checkpoint` |
+| `CHECKPOINT_JOURNAL_DIR` | путь журнала (внутри контейнера `/journal`, на хосте — том) | `/journal` |
+| `CHECKPOINT_CKPT_DIR` | путь чекпоинт-тома | `/ckpt` |
+| `CHECKPOINT_COVERAGE_OUT` | путь артефакта покрытия (КОНТРАКТ с retention — `verify_M-48` канарейка КОМПОЗИЦИИ) | `/ckpt/covered_through_seq` |
+| `CHECKPOINT_CURSOR` | `--cursor LATEST` по умолчанию; `CHECKPOINT_CURSOR=<seq>` для инкрементального прогона | `LATEST` |
+| `CHECKPOINT_LOG` / `CHECKPOINT_ALERT_FILE` / `CHECKPOINT_LAST_SUCCESS` | observability (D9) | `/var/log/hft/gateway-checkpoint.log` и т.д. |
+
+**Запрещено в окружении cron'а** (отказ с именем переменной в stderr/логе/алерте, прогреватель
+не зовётся):
+
+```text
+CHECKPOINT_VENUE, CHECKPOINT_SYMBOL, CHECKPOINT_TIMEFRAME_MS,
+CHECKPOINT_BANDS, CHECKPOINT_WINDOW_MS, CHECKPOINT_DEPTH_CADENCE_MS
+```
+
+Проверяется демонстрационно (после деплоя):
+
+```bash
+# Любая из шести — exit≠0, имя переменной в stderr:
+CHECKPOINT_BANDS=0.001 /root/hft-platform/deploy/bin/gateway-checkpoint-cron.sh
+# ALERT CHECKPOINT_BANDS в окружении cron'а ЗАПРЕЩЕНА — собственный источник селектора
+# запрещён (TD-227, M-90 I-3). Источник — GATEWAY_* из host .env через compose
+# environment: сервиса gateway-checkpoint.
+
+# argv, который прогреватель ВЫПОЛНИЛ БЫ (контракт HFT_CRON_PRINT_ARGV, M-48):
+HFT_CRON_PRINT_ARGV=1 /root/hft-platform/deploy/bin/gateway-checkpoint-cron.sh
+# --dir
+# /journal
+# --ckpt-dir
+# /ckpt
+# --coverage-out=/ckpt/covered_through_seq
+# --cursor
+# LATEST
+```
+
+## 8c. Что НЕ делать (прогреватель)
+
+- **НЕ вписывать селектор в `/etc/cron.d/hft-*` строкой `CHECKPOINT_*=…`** — это и есть
+  класс `TD-227` (два источника одной величины). Все шесть имён отвергаются скриптом.
+- **НЕ менять `GATEWAY_BANDS` в `docker-compose.yml`** в обход `host .env`: дефолт
+  `${GATEWAY_BANDS:-0.001}` уже снимает замер R-185 §1; канонический набор
+  `0.015,0.03,0.05,0.08,0.15,0.3,0.6` включается ОДНОЙ строкой в `host .env`.
+- **НЕ добавлять `--bands=…` (и любой `--venue`/`--symbol`/`--timeframe-ms`/`--window-ms`)
+  в `command:` compose-сервиса `gateway-checkpoint`** — единый источник с `gateway-serve`
+  через `environment:` блок, откуда их читает бинарь. `--depth-cadence-ms` — исключение
+  (`red_checkpoint_bin_prod_argv::c3ter` требует его присутствия в argv).
