@@ -24,6 +24,15 @@
 //! | `--cursor <LATEST\|i64>` | курсор для advance_to. `LATEST` = до конца журнала | `LATEST` |
 //! | `--depth-cadence-ms <i64>` | каденция депт-серии (M-68); дефолт = `GATEWAY_DEPTH_CADENCE_MS` из env, иначе 1000 | env `GATEWAY_DEPTH_CADENCE_MS` или `1000` |
 //!
+//! **M-90 (TD-227) — единый источник селектора с сервером выдачи.** Все шесть осей
+//! (`--venue` / `--symbol` / `--timeframe-ms` / `--bands` / `--window-ms` /
+//! `--depth-cadence-ms`) при ОТСУТСТВИИ флага читаются из `GATEWAY_*` ТЕМ ЖЕ путём,
+//! каким уже читается `--depth-cadence-ms` → `GATEWAY_DEPTH_CADENCE_MS`. Флаг имеет
+//! приоритет (явная команда оператора); env — следующий; подписанный дефолт в коде —
+//! последний. Невалидное значение env ⇒ exit 2 с сообщением, называющим ПЕРЕМЕННУЮ
+//! (оператор видит, ГДЕ править) — тот же класс `A-015` §3 п.1, что у
+//! `GATEWAY_DEPTH_CADENCE_MS` (fail-closed).
+//!
 //! Обе формы `--flag value` И `--flag=value` принимаются наравне: compose пишет
 //! `--flag=value`, cron-обёртка может писать через пробел. Соседний `journal-retention`
 //! уже так работает; здесь — единый контракт.
@@ -174,9 +183,36 @@ fn parse_args() -> Result<Args, String> {
     }
 
     // Дефолты для прод-cadence.
+    //
+    // M-90 (TD-227): приоритет источника селектора — `--flag` (явная команда) →
+    // `GATEWAY_*` env (ТОТ ЖЕ источник, что у `gateway-serve`) → подписанный дефолт.
+    // Тот же класс, что у `GATEWAY_DEPTH_CADENCE_MS` ниже по коду (M-68 задача 23),
+    // распространённый на ВСЕ шесть осей — иначе «у одной величины два источника»,
+    // и сервер выдачи ищет другой `selector_fingerprint`, чем пишет прогреватель.
+    // Невалидное значение env ⇒ exit 2 с именем ПЕРЕМЕННОЙ (fail-closed, A-015 §3 п.1).
     let venue = match venue_str.as_deref() {
         Some(s) => parse_venue(s)?,
-        None => contracts::Venue::Binance,
+        None => match env_string("GATEWAY_VENUE")? {
+            Some(v) => parse_venue(&v)?,
+            None => contracts::Venue::Binance,
+        },
+    };
+    let symbol = match symbol {
+        Some(s) => s,
+        None => match env_string("GATEWAY_SYMBOL")? {
+            Some(s) => s,
+            None => "BTCUSDT".to_string(),
+        },
+    };
+    let timeframe_ms = match timeframe_ms {
+        Some(t) => t,
+        None => match env_string("GATEWAY_TIMEFRAME_MS")? {
+            Some(s) => s
+                .trim()
+                .parse::<i64>()
+                .map_err(|e| format!("GATEWAY_TIMEFRAME_MS={s:?} не парсится как i64 ({e})"))?,
+            None => 1_000,
+        },
     };
     let bands: Vec<f64> = match bands_str.as_deref() {
         Some(s) => s
@@ -184,13 +220,33 @@ fn parse_args() -> Result<Args, String> {
             .map(|p| p.trim().parse::<f64>())
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("--bands parse: {e}"))?,
-        None => vec![0.001],
+        None => match env_string("GATEWAY_BANDS")? {
+            Some(s) => s
+                .split(',')
+                .map(|p| p.trim().parse::<f64>())
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("GATEWAY_BANDS={s:?} не парсится как f64-список ({e})"))?,
+            None => vec![0.001],
+        },
     };
     // M-37: bounded-window по умолчанию = Some(60_000). 0 ⇒ None (offline unbounded).
     let window_ms = match window_ms {
-        None => Some(60_000_i64),
         Some(0) => None,
         Some(w) => Some(w),
+        None => match env_string("GATEWAY_WINDOW_MS")? {
+            Some(s) => {
+                let v = s
+                    .trim()
+                    .parse::<i64>()
+                    .map_err(|e| format!("GATEWAY_WINDOW_MS={s:?} не парсится как i64 ({e})"))?;
+                if v == 0 {
+                    None
+                } else {
+                    Some(v)
+                }
+            }
+            None => Some(60_000_i64),
+        },
     };
     Ok(Args {
         dir: dir.unwrap_or_else(|| PathBuf::from("./journal-data")),
@@ -198,13 +254,27 @@ fn parse_args() -> Result<Args, String> {
         coverage_out: coverage_out
             .unwrap_or_else(|| PathBuf::from("./gateway-ckpt/covered_through_seq")),
         venue,
-        symbol: symbol.unwrap_or_else(|| "BTCUSDT".to_string()),
-        timeframe_ms: timeframe_ms.unwrap_or(1_000),
+        symbol,
+        timeframe_ms,
         bands,
         window_ms,
         cursor: cursor.unwrap_or(Cursor::LATEST),
         depth_cadence_ms,
     })
+}
+
+/// M-90 (TD-227): прочитать `GATEWAY_*` из env. Пустая строка в env считается
+/// ОТСУТСТВИЕМ и уступает дефолту — чтобы не ломать существующие конфигурации, где
+/// переменная объявлена в compose пустой (`GATEWAY_BANDS: ${GATEWAY_BANDS:-0.001}` при
+/// unset host `.env` не даёт пустой строки, но подстраховка дёшева). Тот же класс,
+/// что у `GATEWAY_DEPTH_CADENCE_MS` (`A-015` §3 п.1) — мусор отвергается тем путём,
+/// который в env-чтении уже есть.
+fn env_string(var: &str) -> Result<Option<String>, String> {
+    match std::env::var(var) {
+        Err(_) => Ok(None),
+        Ok(s) if s.is_empty() => Ok(None),
+        Ok(s) => Ok(Some(s)),
+    }
 }
 
 /// Разбор значения `--cursor`. Принимает `LATEST` (= до конца журнала) ИЛИ `u64`.
@@ -234,6 +304,11 @@ fn print_help() {
                               [--depth-cadence-ms N]\n\
          \n\
          Обе формы `--flag value` и `--flag=value` принимаются.\n\
+         M-90 (TD-227): при ОТСУТСТВИИ флага селектора значение читается из\n  \
+         переменной окружения GATEWAY_VENUE / _SYMBOL / _TIMEFRAME_MS / _BANDS /\n  \
+         _WINDOW_MS / _DEPTH_CADENCE_MS — единый источник с сервером выдачи.\n  \
+         Флаг имеет приоритет; env — следующий; подписанный дефолт — последний.\n\
+         \n\
          Дефолты: --dir=./journal-data --ckpt-dir=./gateway-ckpt\n  \
                   --coverage-out=./gateway-ckpt/covered_through_seq\n  \
                   --venue=Binance --symbol=BTCUSDT --timeframe-ms=1000\n  \
