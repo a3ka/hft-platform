@@ -230,7 +230,8 @@ services:
       # §8-взгляд 2026-09-27). Путь — ФАЙЛ внутри тома (не корень, не каталог с
       # хвостовым `/` — `C-260` R3). Хост-путь тома ДОЛЖЕН совпасть с
       # `WATCHDOG_SERVING_HEARTBEAT_PATH` в `deploy/cron.d/watchdog` (композиция
-      # проверяется `verify_M-89.sh` task11 и `red_m89_heartbeat_entrypoint::h0`).
+      # проверяется `red_m89_heartbeat_entrypoint::h0` — сам оракул композиции;
+      # `verify_M-89.sh` task11 уезжает в архив вместе со спекой M-89, R-212 close-out).
       GATEWAY_HEARTBEAT_PATH: /state/gateway-serve.heartbeat
       GATEWAY_HEARTBEAT_PERIOD_MS: ${GATEWAY_HEARTBEAT_PERIOD_MS:-10000}
     volumes:
