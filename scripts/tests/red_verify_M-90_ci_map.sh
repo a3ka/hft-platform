@@ -25,6 +25,13 @@ open(d+'agg_grow.yml','w').write(s.replace(f,f+'"${{ needs.new-job.result }}" !=
 # агрегат: команда, спрятанная в строку условия
 g=' ]]; then\n            echo "One or more checks failed"'
 assert s.count(g)==1, "SETUP: хвост условия агрегата не найден"
+# A-043 К-3: (i) особая ветка шага не открывается по первой строке; (ii) `|-` — блок; (iii) `>` — FAIL
+h="        run: bash scripts/check_review_fa.sh\n"
+k="        run: |\n          bash scripts/tests/red_artifact_ids.sh\n"
+assert s.count(h)==1 and s.count(k)==1, "SETUP: якоря check_review_fa / red_artifact_ids не найдены"
+open(d+'rfa_append.yml','w').write(s.replace(h,"        run: |\n          bash scripts/check_review_fa.sh\n          bash scripts/evil.sh\n",1))
+open(d+'chomp.yml','w').write(s.replace(k,"        run: |-\n          bash scripts/tests/red_artifact_ids.sh\n",1))
+open(d+'folded.yml','w').write(s.replace(k,"        run: >\n          bash scripts/tests/red_artifact_ids.sh\n",1))
 open(d+'agg_inject.yml','w').write(s.replace(g,' ]] || bash scripts/check_extra.sh; then\n            echo "One or more checks failed"',1))
 PY
 [ $? -eq 0 ] || { echo "FAIL  SETUP: копии ci.yml не построены"; exit 1; }
@@ -35,7 +42,7 @@ case_() { # <имя> <файл> <ожидаемый exit> <обязательн�
 }
 cmp -s "$T/ok.yml" "$T/newblock.yml" && { echo "FAIL  SETUP: newblock не изменён"; F=$((F+1)); }
 cmp -s "$T/ok.yml" "$T/stale.yml" && { echo "FAIL  SETUP: stale не изменён"; F=$((F+1)); }
-for w in base_append agg_append agg_grow agg_inject; do
+for w in base_append agg_append agg_grow agg_inject rfa_append chomp folded; do
   cmp -s "$T/ok.yml" "$T/$w.yml" && { echo "FAIL  SETUP: $w не изменён"; F=$((F+1)); }
 done
 case_ "честный ci.yml: всё учтено"            "$T/ok.yml"       0 "учтено шагов"
@@ -45,5 +52,8 @@ case_ "строка дописана в блок базы ⇒ FAIL (C-266 F2)"  
 case_ "строка дописана в блок агрегата ⇒ FAIL"              "$T/agg_append.yml"  1 "карта протухла"
 case_ "агрегат: новый джоб в условии — законно ⇒ PASS"      "$T/agg_grow.yml"    0 "учтено шагов"
 case_ "агрегат: команда в строке условия ⇒ FAIL"            "$T/agg_inject.yml"  1 "карта протухла"
-[ "$F" -eq 0 ] && { echo "VERDICT: PASS — 7 сценариев"; exit 0; }
+case_ "(i) check_review_fa + дописка ⇒ исполняется, не SKIP" "$T/rfa_append.yml"  0 "исполнилось бы «bash scripts/check_review_fa.sh»"
+case_ "(ii) run: |- — литеральный блок, исполняется"         "$T/chomp.yml"       0 "исполнилось бы «bash scripts/tests/red_artifact_ids.sh»"
+case_ "(iii) run: > — складывающий скаляр ⇒ FAIL"           "$T/folded.yml"      1 "блочный скаляр > не поддержан"
+[ "$F" -eq 0 ] && { echo "VERDICT: PASS — 10 сценариев"; exit 0; }
 echo "VERDICT: FAIL (провалов: $F)"; exit 1
