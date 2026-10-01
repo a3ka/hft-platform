@@ -144,7 +144,12 @@ fn compose_env(service: &str, env: &BTreeMap<String, String>) -> BTreeMap<String
     compose_block(service, "environment")
         .iter()
         .filter_map(|l| l.split_once(':'))
-        .map(|(k, v)| (k.trim().to_string(), interpolate(v.trim().trim_matches('"'), env)))
+        .map(|(k, v)| {
+            (
+                k.trim().to_string(),
+                interpolate(v.trim().trim_matches('"'), env),
+            )
+        })
         .collect()
 }
 
@@ -192,7 +197,11 @@ fn trade(i: u64) -> EventKind {
         MdPayload::Trade {
             price: to_fixed(100.0 + (i % 5) as f64),
             size: to_fixed(1.0),
-            side: if i.is_multiple_of(2) { Side::Buy } else { Side::Sell },
+            side: if i.is_multiple_of(2) {
+                Side::Buy
+            } else {
+                Side::Sell
+            },
             ts_exch_ms: 1_752_000_000_000 + i as i64 * 100,
         },
     )
@@ -237,13 +246,20 @@ fn run_cron(root: &Path, extra: &[(&str, &str)]) -> CronRun {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
-    let (log, alert, last) = (work.join("ckpt.log"), work.join("ckpt.alert"), work.join("ckpt.last"));
+    let (log, alert, last) = (
+        work.join("ckpt.log"),
+        work.join("ckpt.alert"),
+        work.join("ckpt.last"),
+    );
     let mut cmd = Command::new("bash");
     cmd.arg(repo_root().join("deploy/bin/gateway-checkpoint-cron.sh"))
         .env_clear()
         .envs(cron_env())
         .env("HFT_ROOT", root)
-        .env("CHECKPOINT_RUNNER", format!("{} compose run --rm {SERVICE}", shim.display()))
+        .env(
+            "CHECKPOINT_RUNNER",
+            format!("{} compose run --rm {SERVICE}", shim.display()),
+        )
         .env("CHECKPOINT_LOG", &log)
         .env("CHECKPOINT_ALERT_FILE", &alert)
         .env("CHECKPOINT_LAST_SUCCESS", &last)
@@ -266,9 +282,14 @@ fn run_cron(root: &Path, extra: &[(&str, &str)]) -> CronRun {
 
 /// Эффективный argv прогревателя по семантике `docker compose run [opts] SERVICE [ARGS]`.
 fn effective_warmer_argv(runner_argv: &[String], dotenv: &BTreeMap<String, String>) -> Vec<String> {
-    let pos = runner_argv.iter().position(|a| a == SERVICE).unwrap_or_else(|| {
-        panic!("SETUP НЕ СОСТОЯЛСЯ: runner позван без имени сервиса `{SERVICE}`: {runner_argv:?}")
-    });
+    let pos = runner_argv
+        .iter()
+        .position(|a| a == SERVICE)
+        .unwrap_or_else(|| {
+            panic!(
+                "SETUP НЕ СОСТОЯЛСЯ: runner позван без имени сервиса `{SERVICE}`: {runner_argv:?}"
+            )
+        });
     assert_eq!(
         runner_argv.first().map(String::as_str),
         Some("compose"),
@@ -284,12 +305,18 @@ fn effective_warmer_argv(runner_argv: &[String], dotenv: &BTreeMap<String, Strin
 
 /// Перенацелить пути на фикстуру в обеих формах (`--f=v` и `--f v`).
 fn retarget(args: &[String], journal: &Path, ckpt: &Path, cov: &Path) -> Vec<String> {
-    let map = [("--dir", journal), ("--ckpt-dir", ckpt), ("--coverage-out", cov)];
+    let map = [
+        ("--dir", journal),
+        ("--ckpt-dir", ckpt),
+        ("--coverage-out", cov),
+    ];
     let mut out = Vec::new();
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
-        let hit = map.iter().find(|(f, _)| a == f || a.starts_with(&format!("{f}=")));
+        let hit = map
+            .iter()
+            .find(|(f, _)| a == f || a.starts_with(&format!("{f}=")));
         match hit {
             Some((f, p)) if a == f => {
                 out.push(a.clone());
@@ -315,8 +342,16 @@ fn server_selector(dotenv: &BTreeMap<String, String>) -> Selector {
             .cloned()
             .unwrap_or_else(|| panic!("SETUP НЕ СОСТОЯЛСЯ: у gateway-serve в compose нет `{k}`"))
     };
-    assert_eq!(get("GATEWAY_VENUE"), "Binance", "SETUP НЕ СОСТОЯЛСЯ: фикстура умеет только Binance");
-    let ms = |k: &str| get(k).parse::<i64>().unwrap_or_else(|e| panic!("SETUP: {k} не число: {e}"));
+    assert_eq!(
+        get("GATEWAY_VENUE"),
+        "Binance",
+        "SETUP НЕ СОСТОЯЛСЯ: фикстура умеет только Binance"
+    );
+    let ms = |k: &str| {
+        get(k)
+            .parse::<i64>()
+            .unwrap_or_else(|e| panic!("SETUP: {k} не число: {e}"))
+    };
     Selector {
         venue: Venue::Binance,
         symbol: get("GATEWAY_SYMBOL"),
@@ -336,7 +371,11 @@ fn server_selector(dotenv: &BTreeMap<String, String>) -> Selector {
 fn prod_path(dotenv_text: &str) -> (u64, u64, Vec<String>) {
     let root = tempfile::tempdir().expect("root");
     std::fs::write(root.path().join(".env"), dotenv_text).unwrap();
-    std::fs::copy(repo_root().join("docker-compose.yml"), root.path().join("docker-compose.yml")).unwrap();
+    std::fs::copy(
+        repo_root().join("docker-compose.yml"),
+        root.path().join("docker-compose.yml"),
+    )
+    .unwrap();
     let dotenv: BTreeMap<String, String> = dotenv_text
         .lines()
         .filter_map(|l| l.split_once('='))
@@ -350,12 +389,23 @@ fn prod_path(dotenv_text: &str) -> (u64, u64, Vec<String>) {
             cr.code, cr.stderr, cr.log, cr.alert
         )
     });
-    assert_eq!(cr.code, Some(0), "SETUP НЕ СОСТОЯЛСЯ: скрипт cron'а с заглушкой вышел {:?}: {}", cr.code, cr.stderr);
+    assert_eq!(
+        cr.code,
+        Some(0),
+        "SETUP НЕ СОСТОЯЛСЯ: скрипт cron'а с заглушкой вышел {:?}: {}",
+        cr.code,
+        cr.stderr
+    );
 
     let journal = journal_of(N);
     let ckpt = tempfile::tempdir().expect("ckpt");
     let cov = ckpt.path().join("covered_through_seq");
-    let argv = retarget(&effective_warmer_argv(&runner, &dotenv), journal.path(), ckpt.path(), &cov);
+    let argv = retarget(
+        &effective_warmer_argv(&runner, &dotenv),
+        journal.path(),
+        ckpt.path(),
+        &cov,
+    );
     let w = Command::new(BIN)
         .args(&argv)
         .env_clear()
@@ -374,15 +424,28 @@ fn prod_path(dotenv_text: &str) -> (u64, u64, Vec<String>) {
         .filter_map(|e| e.ok())
         .filter(|e| e.file_name().to_string_lossy().starts_with("ckpt-"))
         .count();
-    assert_eq!(written, 1, "SETUP НЕ СОСТОЯЛСЯ: прогреватель записал {written} слепков, ожидался один");
+    assert_eq!(
+        written, 1,
+        "SETUP НЕ СОСТОЯЛСЯ: прогреватель записал {written} слепков, ожидался один"
+    );
 
     let sel = server_selector(&dotenv);
-    let (_r, found) = LiveReducer::resume(journal.path(), EpochFilter::OwnCaptureOnly, &sel, ckpt.path())
-        .expect("resume сервера");
+    let (_r, found) = LiveReducer::resume(
+        journal.path(),
+        EpochFilter::OwnCaptureOnly,
+        &sel,
+        ckpt.path(),
+    )
+    .expect("resume сервера");
     let mut other = sel.clone();
     other.bands = vec![0.002];
-    let (_r2, ctrl) = LiveReducer::resume(journal.path(), EpochFilter::OwnCaptureOnly, &other, ckpt.path())
-        .expect("resume контроля");
+    let (_r2, ctrl) = LiveReducer::resume(
+        journal.path(),
+        EpochFilter::OwnCaptureOnly,
+        &other,
+        ckpt.path(),
+    )
+    .expect("resume контроля");
     (found.events_decoded, ctrl.events_decoded, argv)
 }
 
@@ -409,8 +472,14 @@ fn w1_cron_warmer_snapshot_is_found_by_server_with_prod_dotenv() {
 #[test]
 fn w2_default_dotenv_snapshot_is_found_positive_control() {
     let (found, ctrl, argv) = prod_path("GATEWAY_JWT_SECRET=x\n");
-    assert!(ctrl > 0, "КОНТРОЛЬ НЕ СОСТОЯЛСЯ: свидетель не различает полосы");
-    assert_eq!(found, 0, "позитивный контроль: на дефолтах слепок обязан находиться; argv {argv:?}");
+    assert!(
+        ctrl > 0,
+        "КОНТРОЛЬ НЕ СОСТОЯЛСЯ: свидетель не различает полосы"
+    );
+    assert_eq!(
+        found, 0,
+        "позитивный контроль: на дефолтах слепок обязан находиться; argv {argv:?}"
+    );
 }
 
 /// **`w3` — у скрипта cron'а НЕТ собственного источника селектора: строка `CHECKPOINT_*`
@@ -423,7 +492,11 @@ fn w3_script_refuses_own_selector_copy_and_names_it() {
     for var in SCRIPT_SELECTOR_VARS {
         let root = tempfile::tempdir().expect("root");
         std::fs::write(root.path().join(".env"), format!("GATEWAY_BANDS={SEVEN}\n")).unwrap();
-        std::fs::copy(repo_root().join("docker-compose.yml"), root.path().join("docker-compose.yml")).unwrap();
+        std::fs::copy(
+            repo_root().join("docker-compose.yml"),
+            root.path().join("docker-compose.yml"),
+        )
+        .unwrap();
         let cr = run_cron(root.path(), &[(var, "0.001")]);
         assert!(
             cr.runner_argv.is_none(),
@@ -431,7 +504,11 @@ fn w3_script_refuses_own_selector_copy_and_names_it() {
              снова ДВА источника",
             cr.runner_argv
         );
-        assert_ne!(cr.code, Some(0), "TD-227: при `{var}` скрипт вышел 0 — отказ обязан быть виден");
+        assert_ne!(
+            cr.code,
+            Some(0),
+            "TD-227: при `{var}` скрипт вышел 0 — отказ обязан быть виден"
+        );
         let said = format!("{}{}{}", cr.stderr, cr.log, cr.alert);
         assert!(
             said.contains(var),
