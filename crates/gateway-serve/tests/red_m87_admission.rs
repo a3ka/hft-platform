@@ -2,7 +2,7 @@
 //!
 //! COMPILE-RED по построению: модулей `gateway_serve::admission` / `gateway_serve::metrics`
 //! и поля `gateway::ReadStats.payload_bytes_read` в коде ЕЩЁ НЕТ. Спека —
-//! `milestones/M-87-serving-circuit-breaker.md` §4, §5, §7.
+//! `docs/archive/M-87-serving-circuit-breaker.md` §4, §5, §7 (вынесена на close-out, норма Р-2).
 //!
 //! Зачем ОТДЕЛЬНЫЙ файл: предметный набор `crates/gateway/tests/red_m87_cold_path_reads_nothing.rs`
 //! падает АССЕРТАМИ на сегодняшнем коде и доказывает, что дефект существует. Форма проверяется
