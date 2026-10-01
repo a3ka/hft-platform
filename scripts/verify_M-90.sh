@@ -65,15 +65,27 @@ ci_steps() { # → записи (полный текст шага run:), раз�
   ' "$1"
 }
 
-# ТОЧНАЯ карта исключений: ключ — ПЕРВАЯ строка шага (агрегат — по форме, его условие меняется
-# с каждым джобом в needs), значение — причина. Всё прочее исполняется.
+# ТОЧНАЯ карта исключений (`C-266` F2): ключ — отпечаток ПОЛНОГО текста шага (sha256, 16 знаков),
+# а не первой строки: строка, дописанная в исключённый блок, меняет отпечаток ⇒ исключение не
+# срабатывает, шаг уходит на исполнение, а запись карты — «протухла» (FAIL). Единственная
+# нормализация — строка условия агрегата `status-check` (меняется с каждым джобом в `needs`), и
+# только если она СТРОГО той формы, где нет ничего, кроме сравнений `needs.<джоб>.result`.
+AGG_RE='^if \[\[ ("\$\{\{ needs\.[a-z0-9-]+\.result \}\}" != "success"( \|\| )?)+ \]\]; then$'
+step_key() { # <полный текст шага> → отпечаток
+  local t="$1" first rest
+  first="${t%%$'\n'*}"
+  if [ "$t" != "$first" ]; then rest="${t#*$'\n'}"; else rest=""; fi
+  if printf '%s\n' "$first" | grep -qE "$AGG_RE"; then first='<условие агрегата status-check>'; fi
+  if [ -n "$rest" ] || [ "$t" != "${t%%$'\n'*}" ]; then t="$first"$'\n'"$rest"; else t="$first"; fi
+  printf '%s' "$t" | sha256sum | cut -c1-16
+}
 declare -A EXCL=(
-  ['cargo install cargo-audit --locked']='установка инструмента, не проверка (cargo audit исполняется ниже)'
-  ['pip install --quiet jsonschema']='установка инструмента, не проверка'
-  ['python3 -m pip install --quiet pyyaml']='установка инструмента, не проверка'
-  ["git fetch --no-tags origin '+refs/salvage/*:refs/salvage/*'"]='плумбинг CI: спас-рефы в свежий клон; локальный клон их несёт'
-  ['set -euo pipefail']='шаг «база события» (пишет sha в GITHUB_OUTPUT); локальный эквивалент — merge-base origin/main HEAD выше'
-  ['<агрегат status-check>']='условие агрегата All checks passed; его правильность исполняет red_ci_aggregate.sh (EXEC)'
+  ['188b5f08be3448fb']='«cargo install cargo-audit --locked» — установка инструмента (cargo audit исполняется ниже)'
+  ['0ada681c1a994d65']='«pip install --quiet jsonschema» — установка инструмента'
+  ['ba2ff42976ef05e2']='«python3 -m pip install --quiet pyyaml» — установка инструмента'
+  ['48fbd5e3f735e6ad']='«git fetch … refs/salvage/*» — плумбинг CI: спас-рефы в свежий клон; локальный клон их несёт'
+  ['ddd7a1d0ce254659']='шаг «база события» (12 строк, пишет sha в GITHUB_OUTPUT); локальный эквивалент — merge-base origin/main HEAD выше'
+  ['eb31b754c4a50419']='агрегат «All checks passed» (условие по needs); его правильность исполняет red_ci_aggregate.sh (EXEC)'
 )
 declare -A EXCL_HIT=()
 
@@ -86,11 +98,10 @@ else
   while IFS= read -r -d '' step; do
     nsteps=$((nsteps + 1))
     first="${step%%$'\n'*}"
-    key="$first"
-    case "$first" in 'if [[ "${{ needs.'*) key='<агрегат status-check>' ;; esac
+    key=$(step_key "$step")
     if [ -n "${EXCL[$key]+x}" ]; then
       EXCL_HIT[$key]=1
-      skip "ci-parity: «$key» — ${EXCL[$key]}"
+      skip "ci-parity: [$key] ${EXCL[$key]}"
       continue
     fi
     if [ "$first" = "cargo audit" ] && ! command -v cargo-audit >/dev/null 2>&1; then
@@ -116,7 +127,7 @@ else
   expect=$(grep -cE '^[[:space:]]*(- )?run:' "$CI_FILE")
   [ "$nsteps" -eq "$expect" ] || fail "ci-parity: разобрано шагов $nsteps, а строк run: в $CI_FILE — $expect (разбор сломан)"
   for k in "${!EXCL[@]}"; do
-    [ -n "${EXCL_HIT[$k]+x}" ] || fail "ci-parity: исключение «$k» не совпало ни с одним шагом CI — карта протухла"
+    [ -n "${EXCL_HIT[$k]+x}" ] || fail "ci-parity: исключение [$k] ${EXCL[$k]} не совпало ни с одним шагом CI — карта протухла (шаг изменён или удалён)"
   done
   pass "ci-parity: учтено шагов $nsteps из $expect (исполнено $nexec, исключено по карте ${#EXCL_HIT[@]})"
 fi
