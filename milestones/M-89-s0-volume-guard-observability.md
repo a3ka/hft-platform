@@ -705,7 +705,7 @@ architect (задача 7) → tester → reviewer (§8-гейт с прод-з�
 
 - `docs/plans/scale-program-2026-09-21.md` §4 п. 2/п. 4, §13, §15.1, §15.8
 - `docs/plans/m89-warm-resume-measure-2026-09-27.md` — замер-основание
-- `milestones/M-87-serving-circuit-breaker.md` §4.0bis, §11 п. 5, §14.1ter, §16; задачи 15/16/24
+- `docs/archive/M-87-serving-circuit-breaker.md` §4.0bis, §11 п. 5, §14.1ter, §16; задачи 15/16/24
 - `TECH-DEBT.md` `TD-219`, `TD-220`, `TD-221`, `TD-224`, `TD-225`; `R-035` (sidecar отвергнут),
   `R-187` (23 мин пересборки), `R-201`/`R-202`/`R-205`/`R-206`
 - `docs/fa/journal.md` `JR-I-2`, `JR-I-11` · `docs/fa/viz-backend.md` `VB-I-2/10/11` ·
