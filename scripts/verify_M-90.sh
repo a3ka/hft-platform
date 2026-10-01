@@ -36,7 +36,7 @@ run_step "task1: red_checkpoint_bin_prod_argv (прод-argv compose, c3ter) н�
 run_step "task2: verify_M-48.sh (PRINT_ARGV, coverage-out == checkpoint-coverage ретеншена)" \
   bash scripts/verify_M-48.sh
 
-run_step "ci-map: проба карты CI-паритета (red_verify_M-90_ci_map.sh — 3 мира)" \
+run_step "ci-map: проба карты CI-паритета (red_verify_M-90_ci_map.sh; число миров печатает проба)" \
   bash scripts/tests/red_verify_M-90_ci_map.sh
 fi # DRY
 
@@ -49,7 +49,7 @@ CI_FILE="${VERIFY_M90_CI_FILE:-.github/workflows/ci.yml}"
 
 ci_steps() { # → записи (полный текст шага run:), разделённые NUL
   awk '
-    function flush() { if (have) { printf "%s%c", buf, 0 }; have = 0; buf = "" }
+    function flush() { if (have) { printf "%s%s%c", (folded ? "\001FOLDED\001" : ""), buf, 0 }; have = 0; buf = ""; folded = 0 }
     inblk {
       if ($0 ~ /^[[:space:]]*$/) next
       match($0, /^[[:space:]]*/); n = RLENGTH
@@ -57,7 +57,10 @@ ci_steps() { # → записи (полный текст шага run:), раз�
       if (n >= ind) { l = substr($0, ind + 1); buf = (have ? buf "\n" : "") l; have = 1; next }
       inblk = 0; flush()
     }
-    /^[[:space:]]*(- )?run:[[:space:]]*\|[[:space:]]*$/ { flush(); inblk = 1; ind = -1; next }
+    # A-043 К-2: `|`, `|-`, `|+` — литеральный блок (чомпинг на текст команд не влияет);
+    # `>`, `>-`, `>+` — складывающий: строки сливаются, команда меняется ⇒ помечается и даёт FAIL.
+    /^[[:space:]]*(- )?run:[[:space:]]*\|[-+]?[[:space:]]*$/ { flush(); inblk = 1; ind = -1; next }
+    /^[[:space:]]*(- )?run:[[:space:]]*>[-+]?[[:space:]]*$/ { flush(); inblk = 1; ind = -1; folded = 1; next }
     /^[[:space:]]*(- )?run:[[:space:]]*/ {
       flush(); x = $0; sub(/^[[:space:]]*(- )?run:[[:space:]]*/, "", x); printf "%s%c", x, 0
     }
@@ -97,6 +100,10 @@ else
   nsteps=0; nexec=0
   while IFS= read -r -d '' step; do
     nsteps=$((nsteps + 1))
+    if [ "${step#$'\001'FOLDED$'\001'}" != "$step" ]; then
+      step="${step#$'\001'FOLDED$'\001'}"
+      fail "ci-parity: шаг «${step%%$'\n'*}» — блочный скаляр > не поддержан: складывание строк меняет команду"; continue
+    fi
     first="${step%%$'\n'*}"
     key=$(step_key "$step")
     if [ -n "${EXCL[$key]+x}" ]; then
@@ -104,10 +111,10 @@ else
       skip "ci-parity: [$key] ${EXCL[$key]}"
       continue
     fi
-    if [ "$first" = "cargo audit" ] && ! command -v cargo-audit >/dev/null 2>&1; then
+    if [ "$step" = "cargo audit" ] && ! command -v cargo-audit >/dev/null 2>&1; then
       fail "ci-parity: cargo audit — cargo-audit недоступен локально"; continue
     fi
-    if [ "$first" = "bash scripts/check_review_fa.sh" ] && [ -z "$have_review" ]; then
+    if [ "$step" = "bash scripts/check_review_fa.sh" ] && [ -z "$have_review" ]; then
       skip "ci-parity: check_review_fa — вердикта R-NNN по M-90 в диапазоне ещё нет (зеленеет на PR-гейте)"; continue
     fi
     cmd=$(printf '%s' "$step" | sed "s/\${{ steps.base.outputs.sha }}/$BASE/g")
