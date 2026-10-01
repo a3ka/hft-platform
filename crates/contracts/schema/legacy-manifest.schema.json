@@ -1,0 +1,80 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "LegacyManifest",
+  "description": "Содержимое `journal.legacy.json` (манифест деклараций).",
+  "type": "object",
+  "required": [
+    "declarations"
+  ],
+  "properties": {
+    "declarations": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/LegacySegmentDecl"
+      }
+    }
+  },
+  "definitions": {
+    "DataSource": {
+      "description": "Происхождение данных сегмента (CT-RFC-02). Расширяется СТРОГО в конец (сохраняет postcard-дискриминанты).\n\nЗачем: купленная история и собственный захват — РАЗНЫЕ реальности (чужая глубина книги, чужие часы, чужие гэпы). Смешать их в обучении альфы без пометки = обучать на данных, которых у нас никогда не было. Журнал бессмертен — задним числом источник не проставить.",
+      "oneOf": [
+        {
+          "description": "Наш собственный live-захват (recorder → venue-адаптеры).",
+          "type": "string",
+          "enum": [
+            "OwnCapture"
+          ]
+        },
+        {
+          "description": "Импорт исторических данных стороннего поставщика.",
+          "type": "string",
+          "enum": [
+            "Vendor"
+          ]
+        },
+        {
+          "description": "Синтетика (тесты/стресс-фикстуры). В обучение по умолчанию НЕ попадает.",
+          "type": "string",
+          "enum": [
+            "Synthetic"
+          ]
+        }
+      ]
+    },
+    "LegacySegmentDecl": {
+      "description": "Декларация legacy-сегмента (без заголовка) — ЯВНОЕ утверждение оператора: «эти байты имеют такое-то происхождение». Живёт в `journal.legacy.json` рядом с сегментами.\n\nFail-closed: незадекларированный сегмент без магии НЕ читается вовсе (`Err`), а не «считается нашим». Отпечаток (sha256 первого MiB) + размер на момент декларации защищают от подмены файла под знакомым именем. Боевой сегмент РАСТЁТ — реализация обязана допускать рост хвоста, но не изменение префикса.",
+      "type": "object",
+      "required": [
+        "epoch_id",
+        "file_name",
+        "fingerprint_sha256",
+        "provenance",
+        "size_bytes_at_decl",
+        "source"
+      ],
+      "properties": {
+        "epoch_id": {
+          "type": "string"
+        },
+        "file_name": {
+          "type": "string"
+        },
+        "fingerprint_sha256": {
+          "description": "sha256 первых `LEGACY_FINGERPRINT_BYTES` байт файла (hex).",
+          "type": "string"
+        },
+        "provenance": {
+          "type": "string"
+        },
+        "size_bytes_at_decl": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "source": {
+          "$ref": "#/definitions/DataSource"
+        }
+      }
+    }
+  }
+}

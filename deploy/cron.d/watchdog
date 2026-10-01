@@ -1,0 +1,34 @@
+# /etc/cron.d/hft-watchdog
+# M-89 (задача #11, §4.2 / `I-6`, `TD-220`, `PL-I-8`): планировщик watchdog'а — В РЕПО,
+# а не в голове оператора. Установка — РУЧНОЙ шаг founder ★ (deploy/README.md):
+# этот файл лежит в репо, но НЕ КОПИРУЕТСЯ на VPS автоматически (анти-TD-020:
+# «текст в репо» ≠ «работает в проде»). Команда:
+#   install /etc/cron.d/hft-watchdog /etc/cron.d/
+# или `crontab /etc/cron.d/hft-watchdog` после редактирования прав (0644, root:root).
+#
+# ⚠ ОГРАНИЧЕНИЯ CRON-ПАРСЕРА — на них мы уже обожглись (reviewer, PR-гейт M-08, §B4):
+#   • перенос строки через `\` НЕ ПОДДЕРЖИВАЕТСЯ: каждая физическая строка — отдельная
+#     запись. Гейт `crontab -n` ловит это.
+#   • `%` в команде = перевод строки (спецсимвол cron);
+#   • первая физическая строка после `PATH=`/`SHELL=`/`MAILTO=` — РОВНО cron-запись
+#     (имя, время, пользователь, команда), НЕ комментарий.
+#
+# ⚠ КОМПОЗИЦИЯ С COMPOSE — критична. WATCHDOG_SERVING_HEARTBEAT_PATH здесь ОБЯЗАН
+# совпасть с хост-путём тома `gateway-state` из compose
+# (`/var/lib/docker/volumes/hft-platform_gateway-state/_data/gateway-serve.heartbeat`).
+# Несовпадение — тихий no-op: cron не находит файл, watchdog молчит, при том что
+# gateway-serve пишет. Проверяется `verify_M-89.sh` task11 и
+# `red_m89_heartbeat_entrypoint::h0`. Эта правка — задача 11 спеки.
+
+# Защита от накладывающихся запусков: cron не делает flock внутри, делаем тут.
+# Без flock — два запуска подряд (редко, но бывает) перетирают state-файл, и watchdog
+# стартует в неконсистентном виде. `gateway-serve` сам heartbeat пишет АТОМАРНО
+# (`<path>.tmp` → `rename`), но state.json ops-watchdog'а не атомарен (JSON pretty).
+#
+# `R-208` Н-1: переменная окружения ВЫШЕ строки расписания — иначе присваивание
+# действует только на записи, ИДУЩИЕ НИЖЕ, и задание получает пустой env
+# (`/etc/cron.d` semantics). Совпадение сегодня с дефолтом бинаря (`ops-watchdog.rs:63-64`)
+# замаскировало дефект, но любое расхождение путей даёт тихий no-op. Шаг verify
+# task11 ранее судил текст файла, не поведение (`testing.md` §канарейка).
+WATCHDOG_SERVING_HEARTBEAT_PATH=/var/lib/docker/volumes/hft-platform_gateway-state/_data/gateway-serve.heartbeat
+*/5 * * * * root flock -n /var/lock/hft-watchdog.lock /root/hft-platform/scripts/watchdog_cron.sh
