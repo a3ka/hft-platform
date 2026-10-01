@@ -47,6 +47,7 @@ dev (`04-workflow.md` §2); критик обязателен (`gates.md` §9: �
 | `I-1` | слепок, записанный прогревателем, вызванным ПРОД-путём cron'а при прод-форме host `.env`, находит сервер выдачи (`LiveReducer::resume` с селектором из окружения `gateway-serve`) | `w1` (`red_m90_warmer_cron_composition.rs`) |
 | `I-2` | при `.env` без полос (оба на дефолте compose) слепок также находится — у прогревателя нет СВОЕГО дефолта | `w2` |
 | `I-3` | переменная селектора `CHECKPOINT_{VENUE,SYMBOL,TIMEFRAME_MS,BANDS,WINDOW_MS}` в окружении cron'а ⇒ скрипт выходит `≠ 0`, называет переменную (stderr/лог/алерт), прогреватель НЕ зовётся | `w3` |
+| `I-1bis` | `I-1` для КАЖДОЙ оси отпечатка по отдельности: площадка, символ, таймфрейм, окно, каденция (`C-265` F1) | `w4a`…`w4e` |
 | `I-4` | контракт `HFT_CRON_PRINT_ARGV=1` (M-48) сохранён: печатаются `--dir`, `--ckpt-dir`, `--coverage-out`, и путь покрытия совпадает с путём ретеншена | `scripts/verify_M-48.sh` (шаги `HFT_CRON_PRINT_ARGV`) зелен |
 
 **Форма решения — указание, не требование.** Требование — `I-1`…`I-4`. Рекомендуемая форма (её
@@ -89,7 +90,8 @@ dev (`04-workflow.md` §2); критик обязателен (`gates.md` §9: �
 **engine-dev:** `deploy/bin/gateway-checkpoint-cron.sh` · `crates/gateway/src/bin/gateway-checkpoint.rs` ·
 `docker-compose.yml` (сервис `gateway-checkpoint`: `environment:`, `command:`) · `deploy/README.md`
 (описание операторских ручек прогревателя).
-**architect:** `milestones/M-90-*.md` · `crates/gateway/tests/red_m90_*.rs` · `scripts/verify_M-90.sh`.
+**architect:** `milestones/M-90-*.md` · `crates/gateway/tests/red_m90_*.rs` · `scripts/verify_M-90.sh` ·
+`scripts/tests/red_verify_M-90_ci_map.sh`.
 **Вне зоны:** всё прочее, в том числе `crates/gateway-serve/**`, `crates/gateway/src/lib.rs`.
 
 ## 7. §Tasks
@@ -108,6 +110,12 @@ dev (`04-workflow.md` §2); критик обязателен (`gates.md` §9: �
 | `w1` | прод-путь cron → скрипт → runner-заглушка → эффективный argv по семантике `compose run` → НАСТОЯЩИЙ `gateway-checkpoint` → слепок; `resume` с селектором сервера при `.env` прода: `events_decoded == 0`; контроль с чужими полосами `> 0` | собственная копия полос у скрипта; флаги селектора из скрипта поверх env | RUNTIME-RED (`events_decoded = 300`) |
 | `w2` | позитивный контроль: `.env` без полос — слепок найден | «копия с правильным значением» (`CHECKPOINT_BANDS` по умолчанию = семь полос) | зелен |
 | `w3` | любая из пяти `CHECKPOINT_*` селектора ⇒ exit `≠ 0`, имя переменной в выводе, runner не позван | тихое игнорирование; применение | RUNTIME-RED (runner позван) |
+| `w4a`…`w4e` | мир на КАЖДУЮ ось `selector_fingerprint` (`crates/gateway/src/lib.rs:4252-4274`): host `.env` задаёт только `GATEWAY_VENUE` / `_SYMBOL` / `_TIMEFRAME_MS` / `_WINDOW_MS` / `_DEPTH_CADENCE_MS` — слепок найден; контроль — та же ось со значением, отличным и от мира, и от дефолта compose (`C-265` F1) | «перенесены ТОЛЬКО полосы» (`w4a`…`w4d` FAILED при зелёных `w1`…`w3`); каденция литералом в argv (`w4e` FAILED) | `w4a`…`w4d` RUNTIME-RED (`left: 300`); `w4e` зелен — каденция уже идёт через env compose, сторож |
+
+**Мутационный контроль круга 2 (architect, 2026-10-01, временные правки скрипта, возвращены):**
+«только полосы» (полосы из host `.env`, прочие оси литералами, отказ на `CHECKPOINT_*`) ⇒ `w1`/`w2`/`w3`/`w4e`
+ok, `w4a`/`w4b`/`w4c`/`w4d` FAILED; «каденция литералом `--depth-cadence-ms 1000`» ⇒ `w4e` FAILED;
+правильная форма ⇒ 8 passed.
 
 **Мутационный контроль набора (architect, 2026-10-01, временные правки скрипта, возвращены,
 `git status` чист):** «копия с верным значением» (дефолт `CHECKPOINT_BANDS` = семь полос) ⇒
@@ -122,7 +130,10 @@ dev (`04-workflow.md` §2); критик обязателен (`gates.md` §9: �
 `w1`…`w3` + `red_checkpoint_bin_prod_argv`; `task2` — `verify_M-48.sh`; паритет с CI —
 КАЖДАЯ однострочная команда `run:` из `.github/workflows/ci.yml` исполняется в форме события
 `pull_request` с базой `merge-base origin/main HEAD` (`gates.md` §3); исключения перечислены
-поимённо с причиной (установка инструментов, git-плумбинг, многострочные блоки);
+по ТОЧНОЙ карте с причиной (`C-265` F2): каждый шаг `run:` — однострочный и многострочный — исполняется
+либо стоит в карте; исключение без шага — FAIL (протухло), шаг с `${{ … }}` вне карты — FAIL; число учтённых
+шагов сверяется с числом строк `run:`. Проба карты — `scripts/tests/red_verify_M-90_ci_map.sh` (3 мира, режим
+`VERIFY_M90_CI_DRY=1`), шаг `ci-map` гейта;
 `check_review_fa.sh` до появления `R-NNN` по `M-90` — SKIP с причиной; `task4` — SKIP (§8).
 Базовая линия снимается КРАСНОЙ.
 
@@ -142,4 +153,5 @@ architect (набор) → critic (`gates.md` §9, новая спека; RAW-г
 
 | круг | вердикт | предмет | что изменено |
 |---|---|---|---|
+| 1 | `C-265` **REJECT** (critic, `b999daa`) | F1: RED варьировал только полосы — исправление «только полосы» проходило; F2: гейт пропускал все многострочные шаги CI, включая `red_artifact_ids.sh` и его батарею | круг 2: `w4a`…`w4e` (мир на каждую ось, контроль по той же оси); мутанты «только полосы» и «каденция литералом» предъявлены; карта CI-паритета ТОЧНАЯ, многострочные блоки исполняются, проба карты `red_verify_M-90_ci_map.sh` |
 | 0 | — | набор architect'а | спека, `red_m90_warmer_cron_composition.rs`, `verify_M-90.sh` |
