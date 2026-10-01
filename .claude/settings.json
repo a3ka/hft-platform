@@ -1,0 +1,16 @@
+{
+  "_comment": "Проводка механических гейтов процессного слоя. Правило: норма, объявленная BINDING, живёт вместе со своим механизмом либо несёт честный тег COGNITIVE-ONLY (.claude/rules/binding-requires-mechanism.md).",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Task|Agent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/agent-dispatch-gate.py\""
+          }
+        ]
+      }
+    ]
+  }
+}
