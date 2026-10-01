@@ -342,18 +342,19 @@ fn server_selector(dotenv: &BTreeMap<String, String>) -> Selector {
             .cloned()
             .unwrap_or_else(|| panic!("SETUP НЕ СОСТОЯЛСЯ: у gateway-serve в compose нет `{k}`"))
     };
-    assert_eq!(
-        get("GATEWAY_VENUE"),
-        "Binance",
-        "SETUP НЕ СОСТОЯЛСЯ: фикстура умеет только Binance"
-    );
+    let venue = match get("GATEWAY_VENUE").as_str() {
+        "Binance" => Venue::Binance,
+        "BinanceFutures" => Venue::BinanceFutures,
+        "Hyperliquid" => Venue::Hyperliquid,
+        other => panic!("SETUP НЕ СОСТОЯЛСЯ: GATEWAY_VENUE={other} — сервер такой не принимает"),
+    };
     let ms = |k: &str| {
         get(k)
             .parse::<i64>()
             .unwrap_or_else(|e| panic!("SETUP: {k} не число: {e}"))
     };
     Selector {
-        venue: Venue::Binance,
+        venue,
         symbol: get("GATEWAY_SYMBOL"),
         timeframe_ms: ms("GATEWAY_TIMEFRAME_MS"),
         bands: get("GATEWAY_BANDS")
@@ -367,8 +368,9 @@ fn server_selector(dotenv: &BTreeMap<String, String>) -> Selector {
 
 /// Полный путь прода: host `.env` → cron → скрипт → compose run → НАСТОЯЩИЙ прогреватель →
 /// слепок → `LiveReducer::resume` с селектором сервера. Возвращает `events_decoded`
-/// читателя (0 ⇔ слепок найден) и контроль с ЧУЖИМИ полосами (обязан быть > 0).
-fn prod_path(dotenv_text: &str) -> (u64, u64, Vec<String>) {
+/// читателя (0 ⇔ слепок найден) и контроль: селектор сервера, изменённый `wrong` ПО ТОЙ ЖЕ
+/// ОСИ, что варьирует мир (обязан быть > 0 — свидетель различает именно эту ось).
+fn prod_path(dotenv_text: &str, wrong: impl Fn(&mut Selector)) -> (u64, u64, Vec<String>) {
     let root = tempfile::tempdir().expect("root");
     std::fs::write(root.path().join(".env"), dotenv_text).unwrap();
     std::fs::copy(
@@ -438,7 +440,12 @@ fn prod_path(dotenv_text: &str) -> (u64, u64, Vec<String>) {
     )
     .expect("resume сервера");
     let mut other = sel.clone();
-    other.bands = vec![0.002];
+    wrong(&mut other);
+    assert_ne!(
+        format!("{other:?}"),
+        format!("{sel:?}"),
+        "SETUP НЕ СОСТОЯЛСЯ: контроль не изменил селектор"
+    );
     let (_r2, ctrl) = LiveReducer::resume(
         journal.path(),
         EpochFilter::OwnCaptureOnly,
@@ -455,7 +462,10 @@ fn prod_path(dotenv_text: &str) -> (u64, u64, Vec<String>) {
 /// Сегодня RED: скрипт подаёт `--bands 0.001` из своей копии, слепок ненаходим.
 #[test]
 fn w1_cron_warmer_snapshot_is_found_by_server_with_prod_dotenv() {
-    let (found, ctrl, argv) = prod_path(&format!("GATEWAY_JWT_SECRET=x\nGATEWAY_BANDS={SEVEN}\n"));
+    let (found, ctrl, argv) = prod_path(
+        &format!("GATEWAY_JWT_SECRET=x\nGATEWAY_BANDS={SEVEN}\n"),
+        |s| s.bands = vec![0.002],
+    );
     assert!(ctrl > 0, "КОНТРОЛЬ НЕ СОСТОЯЛСЯ: читатель с чужими полосами тоже нашёл слепок — свидетель не различает");
     assert_eq!(
         found, 0,
@@ -471,7 +481,7 @@ fn w1_cron_warmer_snapshot_is_found_by_server_with_prod_dotenv() {
 /// Зелен и сегодня; держит оракул от красного по неверной причине (поломка фикстуры).
 #[test]
 fn w2_default_dotenv_snapshot_is_found_positive_control() {
-    let (found, ctrl, argv) = prod_path("GATEWAY_JWT_SECRET=x\n");
+    let (found, ctrl, argv) = prod_path("GATEWAY_JWT_SECRET=x\n", |s| s.bands = vec![0.002]);
     assert!(
         ctrl > 0,
         "КОНТРОЛЬ НЕ СОСТОЯЛСЯ: свидетель не различает полосы"
@@ -515,4 +525,61 @@ fn w3_script_refuses_own_selector_copy_and_names_it() {
             "TD-227: отказ при `{var}` не называет переменную (stderr/log/alert: {said:?})"
         );
     }
+}
+
+// ───────────────── w4 — каждая ось отпечатка (`C-265` F1) ─────────────────
+//
+// `selector_fingerprint` (`crates/gateway/src/lib.rs:4252-4274`) хеширует ШЕСТЬ осей. Исправление,
+// перенёсшее из host `.env` только полосы, проходит `w1`…`w3` и воспроизводит `TD-227` на
+// первой же другой операторской ручке. Мир на каждую ось: `.env` задаёт ТОЛЬКО её, остальное на
+// дефолтах compose; контроль — та же ось со значением, отличным И от мира, И от дефолта compose
+// (иначе контроль находит слепок, записанный неисправленным писателем на дефолте, и путает причину).
+
+fn axis_world(axis: &str, line: &str, wrong: impl Fn(&mut Selector)) {
+    let (found, ctrl, argv) = prod_path(&format!("GATEWAY_JWT_SECRET=x\n{line}\n"), wrong);
+    assert!(
+        ctrl > 0,
+        "КОНТРОЛЬ НЕ СОСТОЯЛСЯ ({axis}): читатель с другим значением оси тоже нашёл слепок"
+    );
+    assert_eq!(
+        found, 0,
+        "TD-227 ({axis}): при `{line}` в host .env прогреватель по прод-пути cron'а записал слепок, \
+         которого сервер НЕ НАХОДИТ (декодировано {found} событий вместо 0) — ось `{axis}` у \
+         прогревателя взята не из того источника, что у сервера. argv: {argv:?}"
+    );
+}
+
+#[test]
+fn w4a_venue_axis_single_source() {
+    axis_world("venue", "GATEWAY_VENUE=BinanceFutures", |s| {
+        s.venue = Venue::Hyperliquid
+    });
+}
+
+#[test]
+fn w4b_symbol_axis_single_source() {
+    axis_world("symbol", "GATEWAY_SYMBOL=ETHUSDT", |s| {
+        s.symbol = "SOLUSDT".into()
+    });
+}
+
+#[test]
+fn w4c_timeframe_axis_single_source() {
+    axis_world("timeframe_ms", "GATEWAY_TIMEFRAME_MS=5000", |s| {
+        s.timeframe_ms = 2000
+    });
+}
+
+#[test]
+fn w4d_window_axis_single_source() {
+    axis_world("window_ms", "GATEWAY_WINDOW_MS=30000", |s| {
+        s.window_ms = Some(45_000)
+    });
+}
+
+#[test]
+fn w4e_depth_cadence_axis_single_source() {
+    axis_world("depth_cadence_ms", "GATEWAY_DEPTH_CADENCE_MS=2000", |s| {
+        s.depth_cadence_ms = Some(3000)
+    });
 }
