@@ -656,9 +656,15 @@ fn run_wrapper(
             "#!/bin/bash\n# заглушка docker compose run: до имени сервиса — опции compose\n\
              while [ $# -gt 0 ] && [ \"$1\" != journal-retention ]; do shift; done; shift\n\
              args=(); for a in \"$@\"; do {subst}args+=(\"$a\"); done\n\
+             # A-044 O-3(a): при --mode apply ДО exec снимок каталога аудита и потребляемого манифеста\n\
+             apply=0; man=; prev=; for a in \"${{args[@]}}\"; do case \"$a\" in --mode=apply) apply=1;; --cold-manifest=*) man=\"${{a#--cold-manifest=}}\";; esac; [ \"$prev\" = --mode ] && [ \"$a\" = apply ] && apply=1; [ \"$prev\" = --cold-manifest ] && man=\"$a\"; prev=\"$a\"; done\n\
+             if [ $apply = 1 ]; then rm -rf {snap}; mkdir -p {snap}; cp -r {audit}/. {snap}/ 2>/dev/null; [ -n \"$man\" ] && cp \"$man\" {consumed}; fi\n\
              exec {bin} \"${{args[@]}}\" --now-wall-ms={now}\n",
             bin = BIN,
-            now = T0 + 100 * DAY_MS
+            now = T0 + 100 * DAY_MS,
+            snap = work.join("audit-at-apply").display(),
+            consumed = work.join("manifest-consumed").display(),
+            audit = audit.display()
         ),
     )
     .unwrap();
@@ -815,7 +821,6 @@ fn c1_cron_apply_verifies_against_remote_copy() {
     let plan = plan_names(&journal::retention_plan(dir.path(), &pol, T0 + 100 * DAY_MS).unwrap());
     let victim = plan.iter().next().unwrap().clone();
     let remote = remote_copy_of(dir.path(), Some(&victim));
-    let bad_sum = sha_hex(&remote.path().join(&victim));
     let (code, out) = run_wrapper(
         dir.path(),
         remote.path(),
@@ -872,15 +877,62 @@ fn c1_cron_apply_verifies_against_remote_copy() {
             "M-92 (C-270): манифест в аудит-следе не несёт УДАЛЁННУЮ сумму {n} — сверку удаления нельзя восстановить"
         );
     }
-    let _ = &bad_sum;
+    // A-044 O-1: отчёт КЛАССИФИЦИРУЕТ — `pruned <имя>` / `kept <имя> <причина>` (M-92 §4 п.4)
+    let rows: Vec<Vec<String>> = report_txt
+        .lines()
+        .map(|l| l.split_whitespace().map(str::to_string).collect())
+        .collect();
+    let row = |tok: &str, n: &str| {
+        rows.iter()
+            .find(|r| r.len() >= 2 && r[0] == tok && r[1] == n)
+    };
+    let kept = row("kept", &victim).unwrap_or_else(|| {
+        panic!("M-92 (A-044 O-1): несовпавший {victim} не на строке `kept`: {report_txt}")
+    });
     assert!(
-        report_txt.contains(victim.as_str()),
-        "M-92: отчёт не называет несовпавший {victim}"
+        kept.len() >= 3,
+        "M-92 (A-044 O-1): у `kept {victim}` нет причины: {report_txt}"
+    );
+    assert!(
+        row("pruned", &victim).is_none(),
+        "M-92 (A-044 O-1): несовпавший {victim} на строке `pruned`"
     );
     for n in plan.iter().filter(|n| **n != victim) {
         assert!(
-            report_txt.contains(n.as_str()),
-            "M-92: отчёт не называет удалённый {n}"
+            row("pruned", n).is_some(),
+            "M-92 (A-044 O-1): удалённый {n} не на строке `pruned`: {report_txt}"
+        );
+    }
+    // A-044 O-3(a): к моменту `apply` план и манифест УЖЕ в аудит-следе, манифест — тот самый файл,
+    // что ушёл на вход бинарю, и после прогона эти записи не изменены.
+    let snap = work.path().join("audit-at-apply");
+    let at_apply = audit_files(&snap);
+    let snap_by = |suffix: &str| {
+        at_apply
+            .iter()
+            .find(|(n, _)| n.ends_with(suffix))
+            .cloned()
+            .unwrap_or_else(|| panic!("M-92 (A-044 O-3a): к моменту apply в аудит-следе нет *{suffix} — удаление раньше записи"))
+    };
+    let (snap_plan_name, snap_plan) = snap_by("plan.txt");
+    for n in &plan {
+        assert!(
+            snap_plan.lines().any(|l| l.trim() == n),
+            "M-92 (A-044 O-3a): план на момент apply не называет {n}"
+        );
+    }
+    let (snap_man_name, snap_man) = snap_by("manifest.txt");
+    let consumed = std::fs::read_to_string(work.path().join("manifest-consumed"))
+        .expect("M-92 (A-044 O-3a): apply позван без --cold-manifest");
+    assert_eq!(
+        snap_man, consumed,
+        "M-92 (A-044 O-3a): манифест аудит-следа ≠ манифесту, по которому решено удаление"
+    );
+    let after = audit_files(audit.path());
+    for (name, body) in [(snap_plan_name, snap_plan), (snap_man_name, snap_man)] {
+        assert!(
+            after.iter().any(|(n, b)| *n == name && *b == body),
+            "M-92 (A-044 O-3a): запись {name} изменена или удалена после apply"
         );
     }
 }
@@ -956,5 +1008,98 @@ fn c3_cron_file_apply_without_switch_does_not_delete() {
         names(dir.path()),
         before,
         "M-92: RETENTION_MODE=apply в файле расписания без переключателя удалил сегменты: {out}"
+    );
+}
+
+/// **`c4` — аудит-след НЕ перезаписывается следующим прогоном (`A-044` O-2).** Два прогона в одном
+/// сценарии: после первого остаётся только несовпавший, второй законно снова даёт `exit ≠ 0`. После
+/// второго записи первого целы байт-в-байт, записи второго лежат отдельно под ДРУГИМИ именами.
+#[test]
+fn c4_audit_trail_survives_next_run() {
+    let dir = journal();
+    let work = tempfile::tempdir().unwrap();
+    let audit = tempfile::tempdir().unwrap();
+    let pol = policy(work.path(), Some(max_covered(dir.path())));
+    let plan = plan_names(&journal::retention_plan(dir.path(), &pol, T0 + 100 * DAY_MS).unwrap());
+    let victim = plan.iter().next().unwrap().clone();
+    let remote = remote_copy_of(dir.path(), Some(&victim));
+    let (_c1, out1) = run_wrapper(
+        dir.path(),
+        remote.path(),
+        work.path(),
+        audit.path(),
+        Some("apply"),
+        None,
+    );
+    let first: BTreeSet<(String, String)> = audit_files(audit.path()).into_iter().collect();
+    assert!(
+        !first.is_empty(),
+        "SETUP НЕ СОСТОЯЛСЯ: первый прогон не записал аудит-след: {out1}"
+    );
+    let (_c2, out2) = run_wrapper(
+        dir.path(),
+        remote.path(),
+        work.path(),
+        audit.path(),
+        Some("apply"),
+        None,
+    );
+    let second: BTreeSet<(String, String)> = audit_files(audit.path()).into_iter().collect();
+    for rec in &first {
+        assert!(
+            second.contains(rec),
+            "M-92 (A-044 O-2): запись первого прогона {} перезаписана вторым: {out2}",
+            rec.0
+        );
+    }
+    let first_names: BTreeSet<&String> = first.iter().map(|(n, _)| n).collect();
+    let new: Vec<&String> = second
+        .iter()
+        .map(|(n, _)| n)
+        .filter(|n| !first_names.contains(n))
+        .collect();
+    assert!(
+        new.iter().any(|n| n.ends_with("plan.txt"))
+            && new.iter().any(|n| n.ends_with("report.txt")),
+        "M-92 (A-044 O-2): второй прогон не записал свои план и отчёт под НОВЫМИ именами: {new:?}"
+    );
+}
+
+/// **`c5` — носитель аудита недоступен ⇒ ни одного удаления, выход ненулевой, тревога записана
+/// (`A-044` O-3(b)).** `RETENTION_AUDIT_DIR` указывает внутрь обычного файла — каталог не создать.
+#[test]
+fn c5_no_audit_no_delete() {
+    let dir = journal();
+    let work = tempfile::tempdir().unwrap();
+    let blocker = work.path().join("blocker");
+    std::fs::write(&blocker, "не каталог").unwrap();
+    let audit = blocker.join("audit");
+    assert!(
+        std::fs::create_dir_all(&audit).is_err(),
+        "SETUP НЕ СОСТОЯЛСЯ: каталог аудита создаётся"
+    );
+    let remote = remote_copy_of(dir.path(), None);
+    let before = names(dir.path());
+    let (code, out) = run_wrapper(
+        dir.path(),
+        remote.path(),
+        work.path(),
+        &audit,
+        Some("apply"),
+        None,
+    );
+    assert_eq!(
+        names(dir.path()),
+        before,
+        "M-92 (A-044 O-3b): при недоступном аудите удалены сегменты: {out}"
+    );
+    assert_ne!(
+        code,
+        Some(0),
+        "M-92 (A-044 O-3b): при недоступном аудите выход 0: {out}"
+    );
+    assert!(
+        work.path().join("retention.alert").exists(),
+        "M-92 (A-044 O-3b): тревога при недоступном аудите не записана: {out}"
     );
 }
