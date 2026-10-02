@@ -102,6 +102,22 @@ ps_malformed()    { printf '# PROJECT-STATE\n\n## %s — ✅ ЗАКРЫТ\n<!-- 
 # Соседний номер в той же песочнице: у M-NN0 открытый раздел со старой фразой — к M-NN не относится.
 ps_closed_neighbor_open() { printf '# PROJECT-STATE\n\n## %s — ✅ ЗАКРЫТ\n<!-- MS-STATE: %s CLOSED -->\n## %s0 — **НЕ ЗАКРЫТ — close-out за architect'"'"'ом**\n<!-- MS-STATE: %s0 OPEN -->\n' "$1" "$1" "$1" "$1"; }
 ps_live_open()    { printf '# PROJECT-STATE\n\n## %s — в работе\n<!-- MS-STATE: %s OPEN -->\n' "$1" "$1"; }
+# ── C-272 B-1: маркер принадлежит РАЗДЕЛУ своего милестоуна ─────────────────────────
+# Владелец раздела — ПЕРВЫЙ номер в `## `-заголовке (на реальном реестре заголовок M-89 упоминает
+# ещё M-62 и M-90: «заголовок называет номер» засчитал бы маркер M-90 в разделе M-89).
+# Дословная фикстура критика C-272: валидный маркер M-69 в разделе M-68, раздел M-69 «в работе».
+ps_foreign_marker() { printf '# PROJECT-STATE\n\n## M-68 unrelated item — CLOSED\n<!-- MS-STATE: %s CLOSED -->\n\n## %s probe — still IN PROGRESS; reviewer has not closed it\n' "$1" "$1"; }
+# Номер упомянут в заголовке чужого раздела — упоминание не есть владение.
+ps_mention_marker() { printf '# PROJECT-STATE\n\n## M-68 «предмет» — ✅ ЗАКРЫТ (остаток переехал из %s)\n<!-- MS-STATE: %s CLOSED -->\n\n## %s — в работе\n' "$1" "$1" "$1"; }
+# Маркер до первого раздела — ничей.
+ps_orphan_marker() { printf '# PROJECT-STATE\n<!-- MS-STATE: %s CLOSED -->\n\n## %s — в работе\n' "$1" "$1"; }
+# Противоречие внутри своего раздела: CLOSED и OPEN одного номера.
+ps_contradict()    { printf '# PROJECT-STATE\n\n## %s — в работе\n<!-- MS-STATE: %s CLOSED -->\n<!-- MS-STATE: %s OPEN -->\n' "$1" "$1" "$1"; }
+# Позитивы: у номера несколько разделов, маркер во втором; маркер в ### подразделе; заголовок
+# своего раздела упоминает чужие номера ПОСЛЕ своего (форма M-89 на дереве 2026-10-02).
+ps_second_section() { printf '# PROJECT-STATE\n\n## %s часть 1 — история\nтекст\n\n## M-70 другое\nтекст\n\n## %s часть 2 — ✅ ЗАКРЫТ\n<!-- MS-STATE: %s CLOSED -->\n' "$1" "$1" "$1"; }
+ps_subsection()     { printf '# PROJECT-STATE\n\n## %s «предмет» — ✅ ЗАКРЫТ\n### Состояние\n<!-- MS-STATE: %s CLOSED -->\n' "$1" "$1"; }
+ps_owner_mentions() { printf '# PROJECT-STATE\n\n## %s «предмет» — ✅ ЗАКРЫТ (остаток → M-91, задача из M-62)\n<!-- MS-STATE: %s CLOSED -->\n' "$1" "$1"; }
 ps_archived_open(){ printf '# PROJECT-STATE\n\n## %s — в работе\n<!-- MS-STATE: %s OPEN -->\n<!-- MS-STATE: M-11 OPEN -->\n' "$1" "$1"; }
 
 echo "── МОЛЧИТ на честной работе (позитивный контроль) ───────────────────────────"
@@ -114,6 +130,9 @@ expect "P6 фраза внутри \`кода\` — цитата"               
 expect "P7 соседний номер M-690 открыт со старой фразой — к M-69 не относится" 0 "$(run_case M-69 yes ps_open_phrase ps_closed_neighbor_open)"
 expect "P8 OPEN у ЖИВОГО (невынесенного) милестоуна, без переезда"           0 "$(run_case M-69 no ps_empty ps_live_open)"
 expect "P9 буквенный номер: переезд M-38a + маркер M-38a"                    0 "$(run_case M-38a yes ps_empty ps_closed)"
+expect "P10 несколько разделов номера, маркер во ВТОРОМ своём"               0 "$(run_case M-69 yes ps_empty ps_second_section)"
+expect "P11 маркер в ### подразделе своего раздела"                          0 "$(run_case M-69 yes ps_empty ps_subsection)"
+expect "P12 заголовок своего раздела упоминает чужие номера ПОСЛЕ своего"     0 "$(run_case M-69 yes ps_empty ps_owner_mentions)"
 
 echo
 echo "── КРАСНЕЕТ там, где обязан (мутанты реестра) ───────────────────────────────"
@@ -129,6 +148,11 @@ expect "K9 маркер CLOSED только в РАБОЧЕМ дереве, не
 expect "K10 маркер не по форме (опечатка) при годном соседнем"               1 "$(run_case M-69 yes ps_empty ps_malformed)"
 expect "K11 БЕЗ переезда: OPEN у милестоуна, чья спека в архиве"             1 "$(run_case M-69 no ps_empty ps_archived_open archive_too:M-11)"
 expect "K12 реестр снесён в диапазоне"                                        1 "$(run_case M-69 no ps_empty - rm_ps)"
+expect "K13 C-272: маркер M-69 в разделе M-68, раздел M-69 «в работе» (фикстура критика)" 1 "$(run_case M-69 yes ps_empty ps_foreign_marker)"
+expect "K14 маркер в разделе, чей заголовок лишь УПОМИНАЕТ номер"             1 "$(run_case M-69 yes ps_empty ps_mention_marker)"
+expect "K15 маркер ДО первого раздела — ничей"                               1 "$(run_case M-69 yes ps_empty ps_orphan_marker)"
+expect "K16 БЕЗ переезда: маркер в чужом разделе"                            1 "$(run_case M-69 no ps_empty ps_foreign_marker)"
+expect "K17 БЕЗ переезда: CLOSED и OPEN одного номера в своём разделе"       1 "$(run_case M-69 no ps_empty ps_contradict)"
 
 echo
 echo "── FAIL-CLOSED: «не могу проверить» ≠ «нечего проверять» ────────────────────"
