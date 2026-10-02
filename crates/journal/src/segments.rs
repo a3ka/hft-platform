@@ -3094,15 +3094,35 @@ fn sha256_hex(path: &Path) -> io::Result<String> {
 /// куда-либо ещё (`M-92` §3 `I-4`; `R-180` F-1). Манифест не расширяет право
 /// удалять: отбор — прежний `retention_plan` (`M-92` §3 `I-3`).
 ///
-/// Поток по сегменту `s` из `plan.offload_and_prune`:
-///   1. `manifest.get(name)` — нет строки ⇒ `failed: (path, "absent-remote")`;
+/// Поток по сегменту `s` из `plan.offload_and_prune` (ОТСОРТИРОВАН по
+/// `SegmentInfo.index` по возрастанию — `M-92` §3 `I-2bis`, не полагаемся на
+/// исходный порядок `plan.offload_and_prune`):
+///   1. `manifest.get(name)` — нет строки ⇒ `failed: (path, "absent-remote")` и
+///      УДАЛЕНИЕ ОБРЫВАЕТСЯ: все более молодые сегменты плана идут в `failed` с
+///      причиной `"blocked-by <имя первого>"`; их файлы НЕ ТРОГАЮТСЯ.
 ///   2. локальный sha256 vs `manifest.get(name)` — не совпал ⇒
-///      `failed: (path, "mismatch local=<sum> remote=<sum>")`;
-///   3. совпало — `fs::remove_file` локальной копии; `pruned.push(...)`.
+///      `failed: (path, "mismatch local=<sum> remote=<sum>")`; аналогичный обрыв
+///      по тому же правилу.
+///   3. `fs::read` локального файла дал I/O-ошибку (рассогласование каталога,
+///      разрыв нумерации, отказ ОС) ⇒ `failed: (path, "local sha256 read failed: <e>")`;
+///      аналогичный обрыв.
+///   4. `fs::remove_file` локальной копии дал I/O-ошибку ПОСЛЕ подтверждённой
+///      сверки ⇒ `failed: (path, "prune failed after verified manifest match: <e>")`;
+///      аналогичный обрыв.
+///   5. совпало И `remove_file` отработал — `pruned.push(...)`.
 ///
-/// В `DryRun` шаг 3 не выполняется: нулевые побочные эффекты, `pruned` пуст,
+/// Префиксный обрыв (`I-2bis`) — НЕ косметика, а **защита `JR-I-2`** (сплошная
+/// нумерация каталога). Замер architect'а 2026-10-02: `journal::stream` на каталоге
+/// с дырой (удалены 2-й и 3-й из шести, самый старый оставлен) молча отдал 562
+/// события с одним разрывом нумерации, без ошибки — дыра в истории выдавалась бы
+/// за непрерывную историю. Поэтому при испорченной копии СТАРЕЙШЕГО кандидата
+/// удаление младших ровно эту дыру и оставит. Здесь и стоит обрыв.
+///
+/// В `DryRun` шаги 2/4/5 не выполняются: нулевые побочные эффекты, `pruned` пуст,
 /// `failed` отражает «нет строки» (оператор увидит, чего не хватает в манифесте);
-/// `cold_root` НЕ создаётся (`M-92` §3 `I-4`).
+/// `cold_root` НЕ создаётся (`M-92` §3 `I-4`). Префиксный обрыв в `DryRun`
+/// соблюдается: первое же «нет строки» (а это единственный исход без хеша) обрывает
+/// и младшие идут с `blocked-by` — для согласованности отчёта.
 ///
 /// `policy` принимается, но в теле не используется: манифестный путь — независимый
 /// от `cold_root` (это и есть смена парадигмы, `M-92` §1; `policy.cold_root` остаётся
@@ -3120,18 +3140,36 @@ pub fn retention_execute_with_manifest(
     match mode {
         RetentionMode::DryRun => {
             // НОЛЬ побочных эффектов. Никакого создания каталогов, никакого хеширования
-            // файлов, никакого удаления. Только классификация «нет строки» — оператор
-            // увидит в `failed`, какого имени не хватает в манифесте (это и есть
-            // fail-closed диагностика: в проде `RETENTION_REMOTE_SHA_CMD` либо выдал
-            // строку на КАЖДОЕ имя плана — тогда `failed` пуст, — либо где-то отрезало,
-            // и оператор видит имя).
+            // файлов, никакого удаления. Только классификация «нет строки» + префиксный
+            // обрыв (см. шапку).
             let mut failed: Vec<(PathBuf, String)> = Vec::new();
-            for seg in &plan.offload_and_prune {
-                let name = match seg.path.file_name().and_then(OsStr::to_str) {
-                    Some(s) => s.to_string(),
-                    None => continue,
+            // Сортировка ПРЕФИКСА: не полагаемся на исходный порядок `plan.offload_and_prune`
+            // (`M-92` §3 `I-2bis`). Критерий — `SegmentInfo.index` по возрастанию.
+            let mut sorted: Vec<&SegmentInfo> = plan.offload_and_prune.iter().collect();
+            sorted.sort_by_key(|s| s.index);
+            let mut blocked_by: Option<String> = None;
+            for seg in sorted {
+                let name = match seg.path.file_name() {
+                    Some(n) => n.to_string_lossy().into_owned(),
+                    None => {
+                        // Имени нет — НЕ МОЖЕМ назвать `blocked-by <...>` по имени файла.
+                        // Маркируем по индексу и считаем, что обрыв уже случился.
+                        if blocked_by.is_none() {
+                            blocked_by = Some(format!("<index={}>", seg.index));
+                        }
+                        failed.push((
+                            seg.path.clone(),
+                            "segment path has no file_name".to_string(),
+                        ));
+                        continue;
+                    }
                 };
+                if let Some(ref blocker) = blocked_by {
+                    failed.push((seg.path.clone(), format!("blocked-by {blocker}")));
+                    continue;
+                }
                 if manifest.get(&name).is_none() {
+                    blocked_by = Some(name);
                     failed.push((seg.path.clone(), "absent-remote".to_string()));
                 }
             }
@@ -3156,17 +3194,41 @@ pub fn retention_execute_with_manifest(
             let mut failed: Vec<(PathBuf, String)> = Vec::new();
             let mut freed_bytes: u64 = 0;
 
-            for seg in &plan.offload_and_prune {
-                let name = match seg.path.file_name().and_then(OsStr::to_str) {
-                    Some(s) => s.to_string(),
+            // Сортировка ПРЕФИКСА: не полагаемся на исходный порядок `plan.offload_and_prune`
+            // (`M-92` §3 `I-2bis`). Критерий — `SegmentInfo.index` по возрастанию.
+            let mut sorted: Vec<&SegmentInfo> = plan.offload_and_prune.iter().collect();
+            sorted.sort_by_key(|s| s.index);
+            // Имя сегмента, на котором произошёл ПЕРВЫЙ неподтверждённый исход
+            // (любой из: «нет строки», «сумма не совпала», «ошибка чтения»,
+            // «ошибка remove_file после подтверждения»). Все последующие сегменты
+            // — моложе, идут в `failed` с причиной `blocked-by <имя>` БЕЗ
+            // обращения к файлу и БЕЗ хеширования. Защита `JR-I-2` (см. шапку).
+            let mut blocked_by: Option<String> = None;
+
+            for seg in sorted {
+                let name = match seg.path.file_name() {
+                    Some(n) => n.to_string_lossy().into_owned(),
                     None => {
+                        // Имени нет — НЕ МОЖЕМ назвать `blocked-by <...>` по имени файла.
+                        // Маркируем по индексу (на печати видно, ГДЕ оборвалось), и обрыв
+                        // уже действует.
+                        if blocked_by.is_none() {
+                            blocked_by = Some(format!("<index={}>", seg.index));
+                        }
                         failed.push((
                             seg.path.clone(),
-                            "non-utf8 file name; cannot match against manifest".to_string(),
+                            "segment path has no file_name".to_string(),
                         ));
                         continue;
                     }
                 };
+                // Префиксный обрыв (см. шапку): младший сегмент идёт в failed СВОЕЙ
+                // причиной, и ВСЕ более молодые — в failed с `blocked-by` без единого
+                // обращения к диску (ни хеш, ни `remove_file`). Защита `JR-I-2`.
+                if let Some(ref blocker) = blocked_by {
+                    failed.push((seg.path.clone(), format!("blocked-by {blocker}")));
+                    continue;
+                }
                 // `manifest.verify_local` сам читает файл и сводит. Три исхода:
                 //   Ok(None)         — нет строки (в `failed: absent-remote`);
                 //   Ok(Some(false))  — сумма не совпала;
@@ -3174,12 +3236,14 @@ pub fn retention_execute_with_manifest(
                 //   Err(_)           — I/O (нет файла, разрыв и т. п.) — `failed`.
                 match manifest.verify_local(&seg.path, &name) {
                     Ok(None) => {
+                        blocked_by = Some(name);
                         failed.push((seg.path.clone(), "absent-remote".to_string()));
                     }
                     Ok(Some(false)) => {
                         let local = sha256_hex(&seg.path)
                             .unwrap_or_else(|e| format!("local-read-failed:{e}"));
                         let remote = manifest.get(&name).unwrap_or("");
+                        blocked_by = Some(name);
                         failed.push((
                             seg.path.clone(),
                             format!("mismatch local={local} remote={remote}"),
@@ -3196,6 +3260,11 @@ pub fn retention_execute_with_manifest(
                                 freed_bytes += seg.size_bytes;
                             }
                             Err(e) => {
+                                // `remove_file` упал ПОСЛЕ подтверждённой сверки — это
+                                // та же категория «неподтверждённого» по `I-2bis`:
+                                // следующий сегмент не имеет права появиться (на нём
+                                // уже образовался бы разрыв `JR-I-2`). Обрыв.
+                                blocked_by = Some(name);
                                 failed.push((
                                     seg.path.clone(),
                                     format!("prune failed after verified manifest match: {e}"),
@@ -3204,6 +3273,7 @@ pub fn retention_execute_with_manifest(
                         }
                     }
                     Err(e) => {
+                        blocked_by = Some(name);
                         failed.push((seg.path.clone(), format!("local sha256 read failed: {e}")));
                     }
                 }
