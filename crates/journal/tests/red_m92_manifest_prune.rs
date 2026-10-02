@@ -990,6 +990,26 @@ fn c1_cron_apply_verifies_against_remote_copy() {
         rows.iter()
             .find(|r| r.len() >= 2 && r[0] == tok && r[1] == n)
     };
+    // C-274-1: ОДНА строка на имя плана — ни дубля статуса, ни двух противоречащих строк
+    // (`pruned X` рядом с `kept X …`), ни строк сверх плана.
+    let body_rows: Vec<&Vec<String>> = rows.iter().filter(|r| !r.is_empty()).collect();
+    assert_eq!(
+        body_rows.len(),
+        plan.len(),
+        "M-92 (A-044 O-1, C-274-1): строк отчёта {} при {} именах плана: {report_txt}",
+        body_rows.len(),
+        plan.len()
+    );
+    for n in &plan {
+        let k = body_rows
+            .iter()
+            .filter(|r| r.len() >= 2 && r[1] == *n)
+            .count();
+        assert_eq!(
+            k, 1,
+            "M-92 (A-044 O-1, C-274-1): имени {n} в отчёте {k} строк, ожидается ровно одна: {report_txt}"
+        );
+    }
     let kept = row("kept", &victim).unwrap_or_else(|| {
         panic!("M-92 (A-044 O-1): несовпавший {victim} не на строке `kept`: {report_txt}")
     });
@@ -1140,6 +1160,8 @@ fn c4_audit_trail_survives_next_run() {
         !first.is_empty(),
         "SETUP НЕ СОСТОЯЛСЯ: первый прогон не записал аудит-след: {out1}"
     );
+    // вход первого прогона снимается: ниже `manifest-consumed` обязан быть входом ВТОРОГО
+    let _ = std::fs::remove_file(work.path().join("manifest-consumed"));
     let (_c2, out2) = run_wrapper(
         dir.path(),
         remote.path(),
@@ -1166,6 +1188,27 @@ fn c4_audit_trail_survives_next_run() {
         new.iter().any(|n| n.ends_with("plan.txt"))
             && new.iter().any(|n| n.ends_with("report.txt")),
         "M-92 (A-044 O-2): второй прогон не записал свои план и отчёт под НОВЫМИ именами: {new:?}"
+    );
+    // C-274-2: второй прогон удаляет на основании СВОЕГО манифеста — он обязан лечь в след под
+    // новым именем и быть ТЕМ САМЫМ файлом, что ушёл бинарю (`manifest-consumed` перезаписывается
+    // заглушкой при каждом `apply`, значит здесь — вход ВТОРОГО прогона).
+    let consumed2 =
+        std::fs::read_to_string(work.path().join("manifest-consumed")).unwrap_or_else(|e| {
+            panic!("SETUP НЕ СОСТОЯЛСЯ: второй прогон не дошёл до apply ({e}): {out2}")
+        });
+    let new_manifests: Vec<&(String, String)> = second
+        .iter()
+        .filter(|(n, _)| !first_names.contains(n) && n.ends_with("manifest.txt"))
+        .collect();
+    assert_eq!(
+        new_manifests.len(),
+        1,
+        "M-92 (A-044 O-2, C-274-2): второй прогон обязан записать РОВНО один новый манифест, есть {}: {new:?}",
+        new_manifests.len()
+    );
+    assert_eq!(
+        new_manifests[0].1, consumed2,
+        "M-92 (A-044 O-2/O-3a, C-274-2): манифест второго прогона в следе не равен потреблённому бинарём"
     );
 }
 
