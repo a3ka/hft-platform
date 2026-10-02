@@ -61,8 +61,9 @@ use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use journal::{
-    compact_closed_segments, retention_execute, retention_plan, CompactionReport, EpochFilter,
-    RetentionMode, RetentionPlan, RetentionPolicy, RetentionReport, DEFAULT_COMPACT_LEVEL,
+    compact_closed_segments, retention_execute, retention_execute_with_manifest, retention_plan,
+    ColdManifest, CompactionReport, EpochFilter, RetentionMode, RetentionPlan, RetentionPolicy,
+    RetentionReport, DEFAULT_COMPACT_LEVEL,
 };
 
 /// Имя машинной записи дайджеста (JR-I-12, M-52/TD-067) — КОНТРАКТНОЕ: канарейка
@@ -118,6 +119,21 @@ struct Args {
     /// Дефолт `false` (fail-closed); verify-канарейка verify_M-38b.sh блокирует
     /// передачу этого флага в проде (поведенческий fail-closed).
     allow_prune_without_checkpoint: bool,
+    /// M-92 §4: путь, по которому записываются имена `plan.offload_and_prune`,
+    /// по одному в строке. Пишется в любом режиме (`--mode dry-run` И `--mode apply`),
+    /// до исполнения плана — чтобы скрипт cron'а успел записать `…plan.txt` в
+    /// аудит-след ДО удаления (`A-044` O-3(a)).
+    plan_out: Option<PathBuf>,
+    /// M-92 §4: путь к файлу манифеста (`<64 hex>  <имя>` на C строках). В
+    /// `--mode apply` обязателен; в `--mode dry-run` опционален (DryRun с
+    /// манифестом дополнительно классифицирует «нет строки» в `failed`).
+    cold_manifest: Option<PathBuf>,
+    /// M-92 §4: был ли `--cold` ЯВНО передан в argv. Дефолт `false` (значение по
+    /// умолчанию `--cold = ./journal-cold` НЕ считается явной передачей —
+    /// default-cold на манифестном пути не используется НИКОГДА, A-044 решение
+    /// по `--cold`). В `--mode apply` явный `--cold` ⇒ exit 1 с сообщением,
+    /// называющим R-180 F-1 (даже при `--cold-manifest`).
+    cold_explicit: bool,
 }
 
 /// Парсинг argv. Возвращает Err с человеко-читаемой подсказкой на первой ошибке.
@@ -135,6 +151,9 @@ fn parse_args() -> Result<Args, String> {
     let mut expect: Option<String> = None;
     let mut checkpoint_coverage: Option<PathBuf> = None;
     let mut allow_prune_without_checkpoint: bool = false;
+    let mut plan_out: Option<PathBuf> = None;
+    let mut cold_manifest: Option<PathBuf> = None;
+    let mut cold_explicit: bool = false;
 
     // TD-024: нормализовать argv ПЕРЕД циклом разбора. `--flag=value` (equals-форма — ровно
     // то, что лежит в `docker-compose.yml command:` и печатает `--help`) раскладываем в два
@@ -162,7 +181,10 @@ fn parse_args() -> Result<Args, String> {
         };
         match arg.as_str() {
             "--dir" => dir = Some(PathBuf::from(next()?)),
-            "--cold" => cold = Some(PathBuf::from(next()?)),
+            "--cold" => {
+                cold = Some(PathBuf::from(next()?));
+                cold_explicit = true;
+            }
             "--retain-days" => {
                 retain_days = Some(
                     next()?
@@ -234,6 +256,14 @@ fn parse_args() -> Result<Args, String> {
             "--allow-prune-without-checkpoint" => {
                 allow_prune_without_checkpoint = true;
             }
+            // M-92 §4: путь для записи имён `plan.offload_and_prune`, по одному в строке.
+            // Пишется в любом режиме (dry-run/apply). Используется скриптом cron'а как
+            // именованный источник для последующего шага `--cold-manifest`.
+            "--plan-out" => plan_out = Some(PathBuf::from(next()?)),
+            // M-92 §4: путь к манифесту `sha256sum` с удалённой стороны. Обязателен в
+            // `--mode apply`; в `--mode dry-run` опционален (dry-run с манифестом
+            // дополнительно классифицирует «нет строки» в `failed`).
+            "--cold-manifest" => cold_manifest = Some(PathBuf::from(next()?)),
             "-h" | "--help" => {
                 print_help();
                 std::process::exit(0);
@@ -259,25 +289,39 @@ fn parse_args() -> Result<Args, String> {
         expect,
         checkpoint_coverage,
         allow_prune_without_checkpoint,
+        plan_out,
+        cold_manifest,
+        cold_explicit,
     })
 }
 
 fn print_help() {
     println!(
         "journal-retention — операторский путь ретеншена, компакции И дайджеста реплея \
-         (M-08 TD-020+TD-022, M-52 TD-067)\n\
+         (M-08 TD-020+TD-022, M-52 TD-067, M-92)\n\
          \n\
          Использование:\n  \
            journal-retention [--dir DIR] [--cold COLD] [--retain-days N] [--keep-min N]\n  \
                               [--min-free-gb N] [--keep-raw N] [--now-wall-ms MS]\n  \
                               [--mode dry-run|apply|compact|replay-digest]\n  \
-                              [--from SEQ] [--to SEQ] [--expect HEX]\n\
+                              [--from SEQ] [--to SEQ] [--expect HEX]\n  \
+                              [--plan-out FILE] [--cold-manifest FILE]\n  \
+                              [--checkpoint-coverage FILE]\n  \
+                              [--allow-prune-without-checkpoint]\n\
          \n\
          Дефолты:\n  \
            --dir={DEFAULT_DIR}  --cold={DEFAULT_COLD}\n  \
            --retain-days={DEFAULT_RETAIN_DAYS}  --keep-min={DEFAULT_KEEP_MIN}\n  \
            --min-free-gb={DEFAULT_MIN_FREE_GB}  --keep-raw={DEFAULT_KEEP_RAW}\n  \
            --mode=dry-run  (Apply — ТОЛЬКО после успешного DryRun на проде; Compact безопасен по дизайну)\n\
+         \n\
+         M-92 флаги:\n  \
+           --plan-out FILE       имена plan.offload_and_prune, по одному в строке, в любом\n  \
+                                 режиме (dry-run/apply). Пишется ДО удаления (A-044 O-3a).\n  \
+           --cold-manifest FILE  путь к sha256sum с удалённой стороны (M-92 §4). Обязателен в\n  \
+                                 --mode apply; в dry-run опционален.\n  \
+           В --mode apply: ЯВНЫЙ --cold → отказ exit 1 (R-180 F-1: verify_cold_copy тождественная сверка);\n  \
+                                 без --cold-manifest → отказ exit 1.\n\
          \n\
          --mode replay-digest (JR-I-12, TD-067): считает `journal::replay_digest` ПОТОКОВО\n  \
            (не read_all/recover — 26 GB/148M событий в RAM недопустимо), печатает\n  \
@@ -359,6 +403,32 @@ fn main() -> ExitCode {
         allow_prune_without_checkpoint: args.allow_prune_without_checkpoint,
     };
 
+    // M-92 §4: маршрутизация — манифестный путь vs `verify_cold_copy` (legacy).
+    //   - `--mode apply` ОБЯЗАН идти по манифестному пути; без `--cold-manifest` или с
+    //     явным `--cold` — exit 1 (R-180 F-1 для второго; решение A-044 §5.1).
+    //   - `--mode dry-run` принимает оба пути; манифестный даёт классификацию
+    //     «нет строки» в `failed` (для оператора перед apply); legacy — для совместимости.
+    if args.mode == Mode::Apply {
+        if args.cold_explicit {
+            eprintln!(
+                "journal-retention: в --mode apply ЯВНО переданный --cold запрещён (M-92 §4): \
+                 путь «verify_cold_copy» (`cp src dst && sha256 src == sha256 dst`) был \
+                 тождественной сверкой — R-180 F-1. Используйте --cold-manifest <FILE> \
+                 (sha256sum с УДАЛЁННОЙ стороны офсайт-копии)."
+            );
+            return ExitCode::from(1);
+        }
+        if args.cold_manifest.is_none() {
+            eprintln!(
+                "journal-retention: --mode apply требует --cold-manifest <FILE> (M-92 §4): \
+                 удаление локального сегмента разрешено ТОЛЬКО при равенстве его sha256 \
+                 сумме, посчитанной на стороне офсайт-копии (Storage Box). \
+                 См. --help."
+            );
+            return ExitCode::from(1);
+        }
+    }
+
     let plan = match retention_plan(&args.dir, &policy, now_wall_ms) {
         Ok(p) => p,
         Err(e) => {
@@ -367,15 +437,65 @@ fn main() -> ExitCode {
         }
     };
 
+    // M-92 §4: `--plan-out` пишется в любом режиме ДО исполнения плана (A-044 O-3(a):
+    // аудит-след записывается ДО apply). Если файл уже есть — атомарная замена через
+    // временный файл (tmp + rename), чтобы скрипт cron'а мог атомарно опубликовать
+    // план для следующего шага — `RETENTION_REMOTE_SHA_CMD`.
+    if let Some(ref path) = args.plan_out {
+        if let Err(e) = write_plan_out(path, &plan) {
+            eprintln!(
+                "journal-retention: не удалось записать --plan-out {}: {e}",
+                path.display()
+            );
+            return ExitCode::from(1);
+        }
+    }
+
     // Печать плана (человеко-читаемая сводка) — даже если Apply будет падать, оператор
     // увидит, ЧТО планировалось сделать.
     print_plan(&args, &plan);
 
-    let report = match retention_execute(&args.dir, &plan, &policy, rmode) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("journal-retention: не удалось выполнить план: {e}");
-            return ExitCode::from(1);
+    let report = if let Some(ref cold_manifest_path) = args.cold_manifest {
+        // M-92 §4: манифестный путь. Парсим манифест ОДИН раз здесь; ошибки разбора —
+        // exit 1 (I/O).
+        let manifest_text = match std::fs::read_to_string(cold_manifest_path) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!(
+                    "journal-retention: не удалось прочитать --cold-manifest {}: {e}",
+                    cold_manifest_path.display()
+                );
+                return ExitCode::from(1);
+            }
+        };
+        let manifest = match ColdManifest::parse(&manifest_text) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!(
+                    "journal-retention: ошибка разбора --cold-manifest {}: {e}",
+                    cold_manifest_path.display()
+                );
+                return ExitCode::from(1);
+            }
+        };
+        match retention_execute_with_manifest(&args.dir, &plan, &policy, &manifest, rmode) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("journal-retention: не удалось выполнить план (манифест): {e}");
+                return ExitCode::from(1);
+            }
+        }
+    } else {
+        // Legacy-путь (`verify_cold_copy` / `ColdCopyProof`). Доступен ТОЛЬКО в
+        // `--mode dry-run` (apply отвергнут выше без `--cold-manifest`). Сохранён для
+        // существующих sacred-оракулов `red_retention*`; манифестный путь — это
+        // программа той же процедуры, что исполнена вручную 01.10 (`M-92` §1).
+        match retention_execute(&args.dir, &plan, &policy, rmode) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("journal-retention: не удалось выполнить план: {e}");
+                return ExitCode::from(1);
+            }
         }
     };
     print_report(&report);
@@ -385,8 +505,9 @@ fn main() -> ExitCode {
     // disk_pressure — иначе оператор не увидит, что данные не были выгружены.
     if !report.failed.is_empty() {
         eprintln!(
-            "journal-retention: {} сегмент(ов) остались горячими из-за сбоя сверки холодной копии \
-             (см. failed выше). ПОВТОРНОЕ ЗАПУСК Apply их не исправит — нужно проверить холодное хранилище.",
+            "journal-retention: {} сегмент(ов) остались горячими (см. failed выше). \
+             ПОВТОРНОЕ ЗАПУСК Apply их не исправит — нужно проверить офсайт-копию \
+             (manifest_entry отсутствует или sha256 расходится).",
             report.failed.len()
         );
         return ExitCode::from(2);
@@ -562,6 +683,32 @@ fn print_compact_reports(reports: &[CompactionReport]) {
             total_before as f64 / total_after.max(1) as f64,
         );
     }
+}
+
+/// M-92 §4: записать имена `plan.offload_and_prune`, по одному в строке. Атомарно
+/// (tmp + rename в том же каталоге) — скрипт cron'а не видит частичной записи.
+fn write_plan_out(path: &std::path::Path, plan: &RetentionPlan) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut body = String::new();
+    for seg in &plan.offload_and_prune {
+        if let Some(name) = seg.path.file_name().and_then(std::ffi::OsStr::to_str) {
+            body.push_str(name);
+            body.push('\n');
+        }
+    }
+    // tmp + rename в том же каталоге — стандартный приём atomic-replace.
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let tmp = parent.join(format!(
+        ".{}.tmp",
+        path.file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .unwrap_or("plan-out")
+    ));
+    let mut f = std::fs::File::create(&tmp)?;
+    f.write_all(body.as_bytes())?;
+    f.sync_all()?;
+    drop(f);
+    std::fs::rename(&tmp, path)
 }
 
 fn print_plan(args: &Args, plan: &RetentionPlan) {
