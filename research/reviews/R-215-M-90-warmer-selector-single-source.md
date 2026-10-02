@@ -312,3 +312,105 @@ APPROVED **при** `VERDICT: PASS` гейта на дереве слияния 
   закрывается не здесь, а правкой нормы `gates.md` §8 (зона architect).
 - Класс «ручная правка прод-конфига, стираемая деплоем» (спека §5 п. 3): `M-90` убирает
   ЕДИНСТВЕННУЮ известную величину, жившую так; сторожа на класс нет и он не изображается.
+
+---
+
+# §8-дополнение — деплой-гейт снят (задача 4 спеки). Дописано после merge
+
+**Merge:** PR #296, merge-коммит `d5528788eb69d3dfa7d1459ac6e73b0ebee03766`,
+2026-10-02T16:18:48Z. Агрегат `All checks passed` — **SUCCESS**, 21 чек зелёный, ни одного
+FAILURE; решение о merge принято по коду возврата `gh pr checks 296 --watch` (`exit=0`), а не
+по тексту. Ветка `feat/M-90-warmer-selector-single-source` удалена.
+
+**Подтверждение §1 находки С-1 и диагноза геометрии РЕАЛЬНЫМ CI:** на PR в геометрии
+`refs/pull/296/merge` (первый родитель — `main`) шаг `Protected artifacts (gate trail)` →
+**SUCCESS**, хотя в моём preview он давал `exit=1`. Диагноз подтверждён не рассуждением, а
+исполнением того же барьера в той геометрии, которой пользуется CI. `Review FA` → **SUCCESS**:
+барьер принял `VB-I-11` из этого вердикта.
+
+## Нога 1 — деплой ПО ДЖОБУ, а не по выводу workflow (`TD-230`)
+
+Прежняя форма пруфа («сырые строки `gh run list`») не различает «деплой состоялся» и
+«Deploy-джоб пропущен». Здесь исполнена новая форма:
+
+```
+$ gh run view 37033075015 --json conclusion -q .conclusion      # CI
+success
+$ gh run view 37033075083 --json jobs -q '.jobs[]|"\(.name) → \(.conclusion)"'
+Gate on CI (fail-closed) → success
+Catch-up decision (сторож «деплой не состоялся») → skipped
+Deploy (build on VPS) → success        ← НЕ skipped: прод РЕАЛЬНО обновился
+```
+
+## Нога 2 — глазами на проде (ssh), все четыре пункта спеки
+
+```
+$ git rev-parse --short HEAD                                   # /root/hft-platform
+d5528788                                                       ← ровно merge-коммит
+
+$ grep -c '^CHECKPOINT_BANDS' /etc/cron.d/hft-journal-retention
+0                                                              ← ручная строка СТЁРТА деплоем
+$ stat -c '%y %n' /etc/cron.d/hft-journal-retention
+2026-10-02 16:31:32 … /etc/cron.d/hft-journal-retention        ← момент этого деплоя
+
+$ docker ps --format '{{.Names}} {{.Status}}'
+hft-gateway-serve Up 39 seconds (healthy)
+hft-recorder      Up 45 seconds (healthy)
+$ # heartbeat: recorder 5 с назад, gateway-serve 10 с назад (свежие)
+```
+
+**Решающий замер — прогреватель ТЕМ ЖЕ путём, что cron (строка `:79` cron-файла), при
+СТЁРТОЙ ручной строке.** Именно эта комбинация до `M-90` давала расхождение имён:
+
+```
+$ env -i SHELL=/bin/bash PATH=… HFT_ROOT=/root/hft-platform \
+    flock -n /var/lock/hft-gateway-checkpoint.lock \
+    /root/hft-platform/deploy/bin/gateway-checkpoint-cron.sh
+CRON_PATH_EXIT=0
+
+до  : ckpt-8f69809dd707e8c9.bin  16:30:03  (прогон ДО деплоя, ручная строка ещё была)
+после: ckpt-8f69809dd707e8c9.bin 16:34:14  ← ТО ЖЕ ИМЯ, уже БЕЗ ручной строки
+       (ckpt-b0f1ed89ec2ec142.bin — «узкий» слепок 0.001 — не обновлялся: 10-01 20:58)
+$ tail -1 /var/log/hft/gateway-checkpoint.log
+gateway-checkpoint: ok … covered=773055991 out=/ckpt/covered_through_seq
+$ ls /var/lib/hft/gateway-checkpoint.alert
+No such file or directory                                      ← алерта нет
+```
+
+Это и есть `I-1` на проде: при прод-форме host `.env` (ровно два ключа —
+`GATEWAY_JWT_SECRET`, `GATEWAY_BANDS=0.015,0.03,0.05,0.08,0.15,0.3,0.6`) прогреватель,
+вызванный прод-путём cron'а, пишет ИМЕННО тот файл, который ищет сервер. Второго источника
+полос на проде больше нет.
+
+**Выдача отдаёт снимок, а не `not_ready`** (`wsprobe` внутри контейнера `hft-gateway-serve`,
+секрет — из host `.env`):
+
+```
+wsprobe: schema_version=11 cursor=Some(773063060) history_start_seq=587013695
+         history_truncated=true latency_first_snapshot_ms=453 frames_received=2
+series lengths: ohlcv=59 cvd=59 vwap=59 depth_series=14 volume_profile=1
+                heatmap=5961 cob=17 volume_bubbles=363
+WSPROBE_EXIT=0
+```
+
+`depth_series=14` — это **семь полос × две стороны**: канонический набор `П-014` п. 4
+доходит до клиента, а не только стоит в конфигурации. `latency_first_snapshot_ms=453` —
+тёплый `resume` (для сравнения: `R-211` на временной мере мерил 1726–1817 мс, а отказ
+`not_ready` прилетал за 257–270 мс). Ни одного `{"type":"error","code":"not_ready"}`.
+
+**Содержательная sanity (`gates.md` §8 п. 2):** деплой менял чтение конфигурации
+прогревателем, то есть поведение данных, — поэтому liveness-троек недостаточно. Снято:
+непустые серии по всем десяти, цены heatmap в правдоподобном коридоре
+`85 106.49..85 319.28`, `cursor` растёт (`773 055 991` → `773 063 060` между двумя замерами),
+`history_truncated=true` при `history_start_seq=587 013 695` — ровно та честность провенанса,
+которую требует `VB-I-11` (префикс журнала усечён retention'ом, и система это ОБЪЯВЛЯЕТ, а
+не выдаёт «all-time» за полное).
+
+## Вердикт §8 — PASS. `M-90` закрыт
+
+Задача 4 снята. `TD-227` закрыт — предъявлено прод-замером, а не merge'ем кода.
+
+**Что остаётся открытым и НЕ прикрыто этим закрытием:** `TD-228` (счётчики legacy-пути
+молчат — `M-91`), `TD-229`, `TD-230` (карточка закрывается правкой нормы `gates.md` §8,
+зона architect; форма пруфа здесь уже исполнена), `TD-234`, `TD-235`, и класс «ручная правка
+прод-конфига, стираемая деплоем» целиком (спека §5 п. 3 — сторожа на класс нет).
