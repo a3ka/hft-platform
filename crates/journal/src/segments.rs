@@ -2926,6 +2926,319 @@ fn sha256_file(path: &Path) -> io::Result<String> {
     Ok(format!("sha256:{:x}", hasher.finalize()))
 }
 
+// === M-92: манифест офсайт-копии (замена `verify_cold_copy`-пути) ===
+//
+// Контекст и почему старый путь негоден — замер, а не мнение (`M-92` §2, `A-044` §2,
+// `R-180` F-1): `verify_cold_copy` при отсутствии файла в `cold_root` САМ копировал
+// сегмент туда и сверял копию с источником — тождественная сверка. На проде `cold_root`
+// — путь, которого внутри контейнера уборщика нет (запись на эфемерный слой удавалась);
+// холодного хранилища, примонтированного к серверу, нет вовсе: офсайт — Storage Box по
+// SSH (`/etc/cron.d/hft-journal-offsite` шва `ssh … sha256sum`). Типовой барьер
+// `ColdCopyProof` обходился конфигурацией.
+//
+// Новая конструкция — программа той же процедуры, что исполнена вручную 2026-09-08 и
+// 2026-10-01: отбор кандидатов — прежний `retention_plan` (один источник: активный,
+// `keep_min`, возраст, покрытие слепком, legacy); доказательство — НОВОЕ: манифест
+// `sha256sum` с УДАЛЁННОЙ стороны (`ColdManifest`) и локальная сумма обязаны совпасть
+// ПО ИМЕНИ. Копирования нет ни на каком пути. Удаление 01.10: 298/298 совпали,
+// 58 439 976 703 Б. Ниже — форма §4 спеки: парсер строгий, доказательство — чистая
+// функция от локального файла и манифеста.
+
+/// Манифест офсайт-копии: имя файла → sha256 hex (64 знака, lowercase).
+///
+/// Получается ТОЛЬКО из текста вывода `sha256sum` со стороны офсайт-копии (Storage Box
+/// по SSH). Не сериализуется на диск, не строится из локальных файлов — это «вход с
+/// другой машины», и подделка манифеста явно вне нашего периметра (тот, кто владеет
+/// хостом, владеет и ключом коробки; ловим порчу и отсутствие копии — `M-92` §6 п.1).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ColdManifest {
+    /// Имя файла сегмента (без каталога) → sha256 hex (64 lowercase).
+    sums: std::collections::BTreeMap<String, String>,
+}
+
+impl ColdManifest {
+    /// Разобрать текст вывода `sha256sum`. Строка имеет форму `<64 hex>  <имя>` —
+    /// ДВА пробела между суммой и именем (формат GNU `sha256sum` с `--`). Пустые
+    /// строки пропускаются (их печатает `sha256sum` под некоторыми сборками).
+    ///
+    /// Строгие правила (fail-closed; `M-92` §3 `I-5`):
+    /// - ровно 64 hex-символа в позиции суммы (lower И upper принимаются на разбор;
+    ///   значение нормализуется в lowercase для сверки);
+    /// - разделитель — РОВНО два пробела (один пробел ⇒ `Err`, иначе `sha256sum`
+    ///   «-c» отверг бы файл и форма была бы нечитаемой);
+    /// - имя без каталога (без `/`);
+    /// - имя непустое;
+    /// - дубль строки (одно имя, та же сумма) — допустим (`sha256sum` повторил
+    ///   аргумент; эквивалентная запись);
+    /// - дубль имени с РАЗНОЙ суммой — `Err` (порча манифеста или ошибка склейки);
+    /// - пустой текст — пустой манифест (`Ok`): кандидатов нет, удалять нечего.
+    pub fn parse(text: &str) -> io::Result<ColdManifest> {
+        let mut sums: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        for (lineno, line) in text.lines().enumerate() {
+            if line.is_empty() {
+                continue;
+            }
+            // `split_once("  ")` (ровно два пробела) — формат GNU `sha256sum`. Один пробел
+            // даст `None` ⇒ `Err` (мутант «один пробел вместо двух» из §9 спеки).
+            let (hex, name) = line.split_once("  ").ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "ColdManifest: строка {lineno}: ожидается `<64 hex>  <имя>` \
+                         (два пробела), получили {line:?}"
+                    ),
+                )
+            })?;
+            // 64 hex-символа. Любой регистр принимается; нормализуем в lowercase для
+            // детерминированной сверки (тест использует lowercase, и `sha256sum` по
+            // дефолту lowercase, но жёстко ограничивать регистр — лишний шов).
+            if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "ColdManifest: строка {lineno}: ожидается 64 hex-символа, \
+                         получили {hex:?}"
+                    ),
+                ));
+            }
+            let hex_norm = hex.to_ascii_lowercase();
+            if name.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("ColdManifest: строка {lineno}: пустое имя"),
+                ));
+            }
+            // Имя без каталога. Любой `/` в имени трактуется как путь (мутант «имя с
+            // каталогом» из §9); префикс `journal/` снимает прод-шва
+            // `RETENTION_REMOTE_SHA_CMD`, но это ответственность скрипта, а не парсера.
+            if name.contains('/') {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "ColdManifest: строка {lineno}: имя содержит `/`: {name:?} \
+                         (ожидается имя БЕЗ каталога)"
+                    ),
+                ));
+            }
+            // Дубль имени с разной суммой — `Err` (порча манифеста). Точная дубль
+            // строки (тот же `name`, та же `hex_norm`) проходит как эквивалентная
+            // запись: тест явно это требует.
+            if let Some(prev) = sums.get(name) {
+                if prev != &hex_norm {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "ColdManifest: строка {lineno}: дубль имени {name:?} с \
+                             РАЗНОЙ суммой (было {prev}, стало {hex_norm})"
+                        ),
+                    ));
+                }
+                continue;
+            }
+            sums.insert(name.to_string(), hex_norm);
+        }
+        Ok(ColdManifest { sums })
+    }
+
+    /// Найти запись манифеста по имени сегмента. Возвращает `Some(hex)` если имя есть,
+    /// `None` если отсутствует. `None` для кандидата плана — сигнал «нет строки в
+    /// манифесте», сегмент удерживается (`M-92` §3 `I-2`).
+    pub fn get(&self, name: &str) -> Option<&str> {
+        self.sums.get(name).map(String::as_str)
+    }
+
+    /// Число записей в манифесте (для отчёта/диагностики).
+    pub fn len(&self) -> usize {
+        self.sums.len()
+    }
+
+    /// Манифест пустой?
+    pub fn is_empty(&self) -> bool {
+        self.sums.is_empty()
+    }
+
+    /// Сравнить локальный sha256 файла `path` с записью манифеста по `name`.
+    /// `None` ⇒ в манифесте нет такой записи (без ошибки I/O — «нет строки»).
+    /// `Some(true)` ⇒ локальная сумма == сумма манифеста.
+    /// `Some(false)` ⇒ локальная сумма != сумма манифеста.
+    /// `Err(_)` ⇒ ошибка чтения файла (не манифеста — манифест уже разобран).
+    pub(crate) fn verify_local(&self, path: &Path, name: &str) -> io::Result<Option<bool>> {
+        let Some(expected) = self.sums.get(name) else {
+            return Ok(None);
+        };
+        let actual = sha256_hex(path)?;
+        Ok(Some(actual == *expected))
+    }
+}
+
+/// sha256 файла в hex-формате (lowercase, без префикса). Локальная сумма для сверки
+/// с манифестом — `sha256sum` совместимо. `sha256_file` (с префиксом `sha256:`)
+/// используется нитью `verify_cold_copy` и потому сохранён.
+fn sha256_hex(path: &Path) -> io::Result<String> {
+    let mut f = File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Как `retention_execute`, но доказательство — совпадение локального sha256 сегмента
+/// с записью `ColdManifest` по имени. **НИКОГДА не копирует**: ни в `cold_root`, ни
+/// куда-либо ещё (`M-92` §3 `I-4`; `R-180` F-1). Манифест не расширяет право
+/// удалять: отбор — прежний `retention_plan` (`M-92` §3 `I-3`).
+///
+/// Поток по сегменту `s` из `plan.offload_and_prune`:
+///   1. `manifest.get(name)` — нет строки ⇒ `failed: (path, "absent-remote")`;
+///   2. локальный sha256 vs `manifest.get(name)` — не совпал ⇒
+///      `failed: (path, "mismatch local=<sum> remote=<sum>")`;
+///   3. совпало — `fs::remove_file` локальной копии; `pruned.push(...)`.
+///
+/// В `DryRun` шаг 3 не выполняется: нулевые побочные эффекты, `pruned` пуст,
+/// `failed` отражает «нет строки» (оператор увидит, чего не хватает в манифесте);
+/// `cold_root` НЕ создаётся (`M-92` §3 `I-4`).
+///
+/// `policy` принимается, но в теле не используется: манифестный путь — независимый
+/// от `cold_root` (это и есть смена парадигмы, `M-92` §1; `policy.cold_root` остаётся
+/// на legacy-пути `retention_execute` для существующих sacred-оракулов `red_retention*`).
+/// Параметр сохранён в сигнатуре, чтобы библиотечный вызов был симметричен
+/// `retention_execute` и замена была механической для вызывающей стороны.
+pub fn retention_execute_with_manifest(
+    dir: impl AsRef<Path>,
+    plan: &RetentionPlan,
+    _policy: &RetentionPolicy,
+    manifest: &ColdManifest,
+    mode: RetentionMode,
+) -> io::Result<RetentionReport> {
+    let _dir = dir.as_ref();
+    match mode {
+        RetentionMode::DryRun => {
+            // НОЛЬ побочных эффектов. Никакого создания каталогов, никакого хеширования
+            // файлов, никакого удаления. Только классификация «нет строки» — оператор
+            // увидит в `failed`, какого имени не хватает в манифесте (это и есть
+            // fail-closed диагностика: в проде `RETENTION_REMOTE_SHA_CMD` либо выдал
+            // строку на КАЖДОЕ имя плана — тогда `failed` пуст, — либо где-то отрезало,
+            // и оператор видит имя).
+            let mut failed: Vec<(PathBuf, String)> = Vec::new();
+            for seg in &plan.offload_and_prune {
+                let name = match seg.path.file_name().and_then(OsStr::to_str) {
+                    Some(s) => s.to_string(),
+                    None => continue,
+                };
+                if manifest.get(&name).is_none() {
+                    failed.push((seg.path.clone(), "absent-remote".to_string()));
+                }
+            }
+            Ok(RetentionReport {
+                mode: RetentionMode::DryRun,
+                offloaded: Vec::new(),
+                pruned: Vec::new(),
+                pruned_without_checkpoint_coverage: Vec::new(),
+                failed,
+                freed_bytes: 0,
+            })
+        }
+        RetentionMode::Apply => {
+            let mut offloaded: Vec<PathBuf> = Vec::new();
+            let mut pruned: Vec<PathBuf> = Vec::new();
+            // На манифестном пути override-аудит (`pruned_without_checkpoint_coverage`)
+            // не ведётся: манифестный путь НЕ проходит через покрытие чекпоинтом — это
+            // другой механизм доказательства (равенство sha256 локального файла и
+            // суммы с удалённой стороны). Поле отчёта сохранено для симметрии с
+            // `retention_execute`, всегда пусто на манифестном пути.
+            let pruned_without_checkpoint_coverage: Vec<PathBuf> = Vec::new();
+            let mut failed: Vec<(PathBuf, String)> = Vec::new();
+            let mut freed_bytes: u64 = 0;
+
+            for seg in &plan.offload_and_prune {
+                let name = match seg.path.file_name().and_then(OsStr::to_str) {
+                    Some(s) => s.to_string(),
+                    None => {
+                        failed.push((
+                            seg.path.clone(),
+                            "non-utf8 file name; cannot match against manifest".to_string(),
+                        ));
+                        continue;
+                    }
+                };
+                // `manifest.verify_local` сам читает файл и сводит. Три исхода:
+                //   Ok(None)         — нет строки (в `failed: absent-remote`);
+                //   Ok(Some(false))  — сумма не совпала;
+                //   Ok(Some(true))   — совпало, удаляем;
+                //   Err(_)           — I/O (нет файла, разрыв и т. п.) — `failed`.
+                match manifest.verify_local(&seg.path, &name) {
+                    Ok(None) => {
+                        failed.push((seg.path.clone(), "absent-remote".to_string()));
+                    }
+                    Ok(Some(false)) => {
+                        let local = sha256_hex(&seg.path)
+                            .unwrap_or_else(|e| format!("local-read-failed:{e}"));
+                        let remote = manifest.get(&name).unwrap_or("");
+                        failed.push((
+                            seg.path.clone(),
+                            format!("mismatch local={local} remote={remote}"),
+                        ));
+                    }
+                    Ok(Some(true)) => {
+                        // Совпало — единственный момент, где мы удаляем. Никакого
+                        // `verify_cold_copy`, никакого `fs::create_dir_all(cold_root)`,
+                        // никакого `cp`: манифестный путь не пишет на диск НИЧЕГО.
+                        match fs::remove_file(&seg.path) {
+                            Ok(()) => {
+                                offloaded.push(seg.path.clone());
+                                pruned.push(seg.path.clone());
+                                freed_bytes += seg.size_bytes;
+                            }
+                            Err(e) => {
+                                failed.push((
+                                    seg.path.clone(),
+                                    format!("prune failed after verified manifest match: {e}"),
+                                ));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        failed.push((seg.path.clone(), format!("local sha256 read failed: {e}")));
+                    }
+                }
+            }
+
+            // `offload_only` сегментов на манифестном пути НЕТ: манифест говорит лишь
+            // «это имя можно удалить», а не «это имя нужно скопировать». R1-бэкап
+            // (offsite-copy) идёт отдельным швом `RETENTION_REMOTE_SHA_CMD`; см. §6
+            // спеки (`M-92` §6 п.1, `A-044` §3.1). Здесь — только `offload_and_prune`.
+
+            Ok(RetentionReport {
+                mode: RetentionMode::Apply,
+                offloaded,
+                pruned,
+                pruned_without_checkpoint_coverage,
+                failed,
+                freed_bytes,
+            })
+        }
+        RetentionMode::Compact => {
+            // Манифестный путь — НЕ путь компакции. На всякий случай (если кто-то
+            // зовёт `retention_execute_with_manifest` с этим режимом) — пустой отчёт,
+            // как в `retention_execute`. Сама компакция — через `compact_closed_segments`.
+            Ok(RetentionReport {
+                mode: RetentionMode::Compact,
+                offloaded: Vec::new(),
+                pruned: Vec::new(),
+                pruned_without_checkpoint_coverage: Vec::new(),
+                failed: Vec::new(),
+                freed_bytes: 0,
+            })
+        }
+    }
+}
+
 // === Disk guard (E4) ===
 
 /// Свободное место на файловой системе каталога (E4).
