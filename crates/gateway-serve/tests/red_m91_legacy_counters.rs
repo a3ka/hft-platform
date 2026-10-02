@@ -294,3 +294,51 @@ async fn l3_two_legacy_sessions_count_exactly_two() {
         delta(&before, &after)
     );
 }
+
+/// **`l4` — исход `Warming` в legacy-пути — тоже отказ класса `refusals_supported`: `(1, 0, 1, 0)`,
+/// ответ `warming`** (`C-269`).
+///
+/// На текущем коде `admission::readiness` `Warming` не возвращает (исход объявлен для будущего
+/// пути прогрева), поэтому мир строится ПОДСТАНОВКОЙ исхода: тестовый крючок
+/// `Server::with_readiness_override` существует ТОЛЬКО под `feature = "testing"` — в прод-сборке
+/// способа подменить проверку готовности нет (иначе это был бы обход предохранителя M-87).
+/// Мутант, который ловится: «считать отказом только `NotReady`» — `l2` зелен, `l4` даёт `(1,0,0,0)`.
+#[cfg(feature = "testing")]
+#[tokio::test]
+async fn l4_legacy_warming_is_a_supported_refusal() {
+    use gateway_serve::admission::ServingOutcome;
+    let (dir, ckpt) = fixture(true);
+    let cfg = ServeConfig {
+        addr: "127.0.0.1:0".to_string(),
+        journal_dir: dir.path().to_path_buf(),
+        filter: EpochFilter::OwnCaptureOnly,
+        selector: sel(),
+        decoding_key: DecodingKey::from_secret(SECRET),
+        checkpoint_dir: Some(ckpt.path().to_path_buf()),
+    };
+    let server = bind_with_policy(cfg, policy())
+        .await
+        .expect("bind_with_policy")
+        .with_readiness_override(|| ServingOutcome::Warming);
+    let addr = server.local_addr().to_string();
+    let counters = server.counters_handle().expect("ручка экземпляра");
+    tokio::spawn(async move {
+        let _ = server.serve().await;
+    });
+    let before = counters.snapshot();
+    let outcome = legacy_session(&addr).await;
+    assert_eq!(
+        outcome,
+        Legacy::Refused("warming".to_string()),
+        "SETUP НЕ СОСТОЯЛСЯ: подставленный Warming не дал ответа warming — крючок не дошёл до legacy-пути"
+    );
+    settle().await;
+    let after = counters.snapshot();
+    assert_eq!(
+        delta(&before, &after),
+        (1, 0, 1, 0),
+        "TD-228 / C-269: отказ warming в legacy-пути дал дельты {:?} вместо (1, 0, 1, 0) — правило \
+         тишины OPS-I-8 не увидит отказ «сервер прогревается»",
+        delta(&before, &after)
+    );
+}
