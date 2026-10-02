@@ -230,7 +230,8 @@ services:
       # §8-взгляд 2026-09-27). Путь — ФАЙЛ внутри тома (не корень, не каталог с
       # хвостовым `/` — `C-260` R3). Хост-путь тома ДОЛЖЕН совпасть с
       # `WATCHDOG_SERVING_HEARTBEAT_PATH` в `deploy/cron.d/watchdog` (композиция
-      # проверяется `verify_M-89.sh` task11 и `red_m89_heartbeat_entrypoint::h0`).
+      # проверяется `red_m89_heartbeat_entrypoint::h0` — сам оракул композиции;
+      # `verify_M-89.sh` task11 уезжает в архив вместе со спекой M-89, R-212 close-out).
       GATEWAY_HEARTBEAT_PATH: /state/gateway-serve.heartbeat
       GATEWAY_HEARTBEAT_PERIOD_MS: ${GATEWAY_HEARTBEAT_PERIOD_MS:-10000}
     volumes:
@@ -292,21 +293,6 @@ services:
       - --dir=/journal
       - --ckpt-dir=/ckpt
       - --coverage-out=/ckpt/covered_through_seq
-      - --venue=${GATEWAY_VENUE:-Binance}
-      - --symbol=${GATEWAY_SYMBOL:-BTCUSDT}
-      - --timeframe-ms=${GATEWAY_TIMEFRAME_MS:-1000}
-      # М-70 §5ter (handover 2026-09-04) + R-185 (2026-09-17): дефолт полос у
-      # `gateway-checkpoint` ОБЯЗАН идти через ТУ ЖЕ переменную `${GATEWAY_BANDS}`, что
-      # и у `gateway-serve`, иначе имя файла чекпоинта (детерминировано
-      # `selector_fingerprint`, куда полосы ВХОДЯТ) разойдётся между писателем и
-      # читателем ⇒ чекпоинт не найден ⇒ тёплый старт молча вырождается в холодный.
-      # ПРОД-ДЕФОЛТ — УЗКИЙ `0.001` (R-185 §1: включение отложено до замера длительности
-      # полого окна после ресинка; иначе метка `liveness=confirmed` приходит на
-      # заниженные числа, что запрещено `П-014`). Оператор включает канонический набор
-      # (`1.5/3/5/8/15/30/60 %`) ОДНОЙ строкой в host `.env` (`GATEWAY_BANDS=...`) —
-      # тот же дефолт ниже, что и у `gateway-serve`, остаётся узким.
-      - --bands=${GATEWAY_BANDS:-0.001}
-      - --window-ms=${GATEWAY_WINDOW_MS:-60000}
       # `--cursor LATEST` — снимаем чекпоинт ДО хвоста; усечённый прогон возможен
       # через `--cursor <i64>` (задаётся в cron-обёртке для инкрементальных снапшотов).
       - --cursor=LATEST
@@ -317,8 +303,48 @@ services:
       # журнал целиком при каждом подключении (TD-044/R-029: сотни секунд задержки,
       # против устранения которой строились M-38b/M-48/M-54). Дефолт 1000 совпадает
       # с прод-таймфреймом ⇒ поведение прода не меняется.
+      #
+      # M-90 (TD-227): `--depth-cadence-ms` ОСТАВЛЕН как флаг в `command:`, потому что
+      # соседний оракул `red_checkpoint_bin_prod_argv::c3ter` (`crates/gateway/tests/
+      # red_checkpoint_bin_prod_argv.rs:531-`) имеет SETUP-GUARD, требующий присутствия
+      # `--depth-cadence-ms` в argv compose. Прочие пять осей (`--venue`/`--symbol`/
+      # `--timeframe-ms`/`--bands`/`--window-ms`) УБРАНЫ из `command:` — единый источник
+      # с сервером выдачи через `environment:` ниже (`GATEWAY_*` с дефолтами
+      # `gateway-serve`); cron-обёртка `deploy/bin/gateway-checkpoint-cron.sh` эти
+      # флаги тоже НЕ передаёт (I-3 спеки M-90: шесть `CHECKPOINT_*` селектора в её
+      # окружении ⇒ отказ).
       - --depth-cadence-ms=${GATEWAY_DEPTH_CADENCE_MS:-1000}
     environment:
+      # M-90 (TD-227) — единый источник селектора с сервером выдачи. Все шесть осей
+      # `GATEWAY_*` объявлены в compose ОБЕИХ служб (`gateway-serve` и
+      # `gateway-checkpoint`) с ИДЕНТИЧНЫМИ дефолтами `${VAR:-default}` — это и есть
+      # «один источник». Бинарь `gateway-checkpoint` при отсутствии флага читает из
+      # `GATEWAY_*` (тот же путь, что и `--depth-cadence-ms` уже использует с
+      # `GATEWAY_DEPTH_CADENCE_MS`, M-68 задача 23): единый источник, флаг — надбавка
+      # оператора (явная команда поверх env).
+      #
+      # Имя файла чекпоинта — `selector_fingerprint` (`crates/gateway/src/lib.rs:4252-4274`),
+      # в него входят ВСЕ шесть осей. Если у прогревателя и сервера хотя бы одна ось
+      # разойдётся, имя не совпадёт, сервер не найдёт слепок и реплеит журнал целиком
+      # при КАЖДОМ подключении (TD-044/R-029: сотни секунд задержки). Один источник
+      # ЗАКРЫВАЕТ именно этот класс: до M-90 у полос был `GATEWAY_BANDS` в `.env` И
+      # `CHECKPOINT_BANDS=0.001` в cron-обёртке — и 8 суток каждый клиент получал
+      # `not_ready` при зелёных liveness-сигналах.
+      GATEWAY_VENUE: ${GATEWAY_VENUE:-Binance}
+      GATEWAY_SYMBOL: ${GATEWAY_SYMBOL:-BTCUSDT}
+      GATEWAY_TIMEFRAME_MS: ${GATEWAY_TIMEFRAME_MS:-1000}
+      # М-70 §5ter (handover 2026-09-04) + R-185 (2026-09-17): дефолт полос у
+      # `gateway-checkpoint` ОБЯЗАН идти через ТУ ЖЕ переменную `${GATEWAY_BANDS}`, что
+      # и у `gateway-serve`, иначе имя файла чекпоинта (детерминировано
+      # `selector_fingerprint`, куда полосы ВХОДЯТ) разойдётся между писателем и
+      # читателем ⇒ чекпоинт не найден ⇒ тёплый старт молча вырождается в холодный.
+      # ПРОД-ДЕФОЛТ — УЗКИЙ `0.001` (R-185 §1: включение отложено до замера длительности
+      # полого окна после ресинка; иначе метка `liveness=confirmed` приходит на
+      # заниженные числа, что запрещено `П-014`). Оператор включает канонический набор
+      # (`1.5/3/5/8/15/30/60 %`) ОДНОЙ строкой в host `.env` (`GATEWAY_BANDS=...`) —
+      # тот же дефолт ниже, что и у `gateway-serve`, остаётся узким.
+      GATEWAY_BANDS: ${GATEWAY_BANDS:-0.001}
+      GATEWAY_WINDOW_MS: ${GATEWAY_WINDOW_MS:-60000}
       # M-68 задача 23 (R-141 Б-1): env-переменная объявлена в compose ОБЕИХ служб —
       # писатель и читатель чекпоинта. Иначе (класс M-71 B-1) ручка живёт в коде и
       # оператор её задать не может.

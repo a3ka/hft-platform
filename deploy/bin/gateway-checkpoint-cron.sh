@@ -41,17 +41,23 @@ CHECKPOINT_CKPT_DIR="${CHECKPOINT_CKPT_DIR:-/ckpt}"
 # иначе fail-closed no-op (TD-020). Прод-дефолт совпадает с
 # `gateway-checkpoint --coverage-out=` в docker-compose.yml.
 CHECKPOINT_COVERAGE_OUT="${CHECKPOINT_COVERAGE_OUT:-/ckpt/covered_through_seq}"
-CHECKPOINT_VENUE="${CHECKPOINT_VENUE:-Binance}"
-CHECKPOINT_SYMBOL="${CHECKPOINT_SYMBOL:-BTCUSDT}"
-CHECKPOINT_TIMEFRAME_MS="${CHECKPOINT_TIMEFRAME_MS:-1000}"
-CHECKPOINT_BANDS="${CHECKPOINT_BANDS:-0.001}"
-# Bounded-window (M-37 анти-TD-020): дефолт 60_000. `0` ⇒ offline unbounded.
-CHECKPOINT_WINDOW_MS="${CHECKPOINT_WINDOW_MS:-60000}"
 # `--cursor LATEST` — прод-дефолт (снимаем чекпоинт ДО хвоста). Усечённый
 # прогон возможен через `--cursor <i64>` (операторская диагностика; команда
 # `gateway-checkpoint-cron.sh --cursor <seq>` ниже поддерживает это через env
 # CHECKPOINT_CURSOR).
 CHECKPOINT_CURSOR="${CHECKPOINT_CURSOR:-LATEST}"
+
+# ⚠ СЕЛЕКТОР ПРОГРЕВАТЕЛЯ — НЕ ЗДЕСЬ (M-90, TD-227).
+#
+# Поля селектора (`venue`/`symbol`/`timeframe_ms`/`bands`/`window_ms`/
+# `depth_cadence_ms`) читаются бинарём `gateway-checkpoint` из `GATEWAY_*` env,
+# которую compose ОБЪЯВЛЯЕТ в `environment:` сервиса `gateway-checkpoint`
+# (с теми же дефолтами, что у `gateway-serve`). Собственная копия селектора
+# в этом скрипте = два источника одной величины = ровно класс `TD-227`
+# (прод-выдача 8 суток отвечала каждому клиенту `not_ready` при зелёных
+# liveness-сигналах; корень — семь полос в `.env` против `CHECKPOINT_BANDS=0.001`
+# из этой обёртки). Ниже — `I-3`: на любую из шести `CHECKPOINT_*` селектора
+# в окружении cron'а — отказ с именем переменной, runner НЕ зовётся.
 LOG="${CHECKPOINT_LOG:-/var/log/hft/gateway-checkpoint.log}"
 # Маркер для ВНЕШНЕГО монитора (zabbix/nagios пингуют файл): есть → последний
 # прогон упал.
@@ -72,6 +78,24 @@ alert() {
   echo "ALERT ${msg}" >&2
 }
 
+# I-3 (M-90, TD-227): ОТКАЗ на любую из шести `CHECKPOINT_*` селектора в cron'е.
+# Проверка ВЫШЕ `HFT_CRON_PRINT_ARGV` — оператор задал запрещённую переменную,
+# печатать argv нечего: всё равно exit≠0, прогреватель не зовётся.
+# Список шести — КОНТРАКТ: ровно эти шесть имён читает `selector_fingerprint`
+# (`crates/gateway/src/lib.rs:4252-4274`). Любая ось, не названная здесь, к селектору
+# НЕ относится и не отвергается (`CHECKPOINT_JOURNAL_DIR`/`_CKPT_DIR`/`_COVERAGE_OUT`
+# — пути; `CHECKPOINT_LOG`/`_ALERT_FILE`/`_LAST_SUCCESS` — observability;
+# `CHECKPOINT_CURSOR` — операторская диагностика `--cursor=<seq>`;
+# `CHECKPOINT_RUNNER` — шов гейта).
+for var in CHECKPOINT_VENUE CHECKPOINT_SYMBOL CHECKPOINT_TIMEFRAME_MS \
+           CHECKPOINT_BANDS CHECKPOINT_WINDOW_MS CHECKPOINT_DEPTH_CADENCE_MS; do
+  eval "val=\${$var:-}"
+  if [ -n "$val" ]; then
+    alert "${var} в окружении cron'а ЗАПРЕЩЕНА — собственный источник селектора запрещён (TD-227, M-90 I-3). Источник — GATEWAY_* из host .env через compose environment: сервиса gateway-checkpoint."
+    exit 1
+  fi
+done
+
 # Argv — РАЗДЕЛЬНОЙ формой для большинства флагов. ИСКЛЮЧЕНИЕ: `--coverage-out`
 # пишем в EQUALS-форме (`--coverage-out=<путь>`), потому что retention-обёртка
 # использует путь по этому же правилу (`--checkpoint-coverage=<путь>`), и
@@ -82,15 +106,16 @@ alert() {
 # ровно то, что milestone запрещает (C-032 R4). Парсер `gateway-checkpoint`
 # принимает обе формы (B1, M-38b rev4), так что equals-форма для одного флага
 # не ломает контракт.
+#
+# M-90 (TD-227): флагов селектора (`--venue`/`--symbol`/`--timeframe-ms`/`--bands`/
+# `--window-ms`/`--depth-cadence-ms`) здесь НЕТ и быть не может. Бинарь читает их
+# из `GATEWAY_*` env, которую compose ОБЪЯВЛЯЕТ в `environment:` сервиса
+# `gateway-checkpoint` (тот же источник, что у `gateway-serve`). Скрипт передаёт
+# только пути, `--coverage-out` и `--cursor` — это НЕ селектор.
 ARGV=(
   --dir "${CHECKPOINT_JOURNAL_DIR}"
   --ckpt-dir "${CHECKPOINT_CKPT_DIR}"
   --coverage-out="${CHECKPOINT_COVERAGE_OUT}"
-  --venue "${CHECKPOINT_VENUE}"
-  --symbol "${CHECKPOINT_SYMBOL}"
-  --timeframe-ms "${CHECKPOINT_TIMEFRAME_MS}"
-  --bands "${CHECKPOINT_BANDS}"
-  --window-ms "${CHECKPOINT_WINDOW_MS}"
   --cursor "${CHECKPOINT_CURSOR}"
 )
 
