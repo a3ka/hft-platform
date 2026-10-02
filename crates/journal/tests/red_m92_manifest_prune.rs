@@ -860,10 +860,19 @@ fn c1_cron_apply_verifies_against_remote_copy() {
             "M-92: запись плана не называет {n}"
         );
     }
-    assert!(
-        manifest_txt.lines().any(|l| l.starts_with(&bad_sum) && l.trim_end().ends_with(victim.as_str())),
-        "M-92: манифест в аудит-следе не несёт УДАЛЁННУЮ сумму несовпавшего {victim} — сверку нельзя восстановить"
-    );
+    // C-270: КАЖДОЕ имя плана — в манифесте с суммой, посчитанной на УДАЛЁННОЙ стороне (копия
+    // фикстуры): у несовпавшего — его испорченная сумма, у удалённых — сумма их копии. Удаление,
+    // чья удалённая сумма не записана, восстановить по аудит-следу нельзя.
+    for n in &plan {
+        let remote_sum = sha_hex(&remote.path().join(n));
+        assert!(
+            manifest_txt
+                .lines()
+                .any(|l| l.starts_with(&remote_sum) && l.trim_end().ends_with(n.as_str())),
+            "M-92 (C-270): манифест в аудит-следе не несёт УДАЛЁННУЮ сумму {n} — сверку удаления нельзя восстановить"
+        );
+    }
+    let _ = &bad_sum;
     assert!(
         report_txt.contains(victim.as_str()),
         "M-92: отчёт не называет несовпавший {victim}"
