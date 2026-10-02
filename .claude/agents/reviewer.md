@@ -30,6 +30,7 @@ model: opus
 5. **RED-first проверка** — тесты не переписаны devом под реализацию (sacred); grep `git log` на модификацию файлов `*/tests/`.
 6. **Атомарность коммитов** — одна задача ≥1 коммит, ссылка на milestone/task; бандл-коммит на 5 задач = авто-reject.
 7. После APPROVED — merge ЧЕРЕЗ PR (`gh pr create` → `gh pr checks` зелёные → `gh pr merge --merge --delete-branch`; прямой push в `main` отклоняется защитой ветки с 2026-08-15), затем обновляет `PROJECT-STATE.md` + `TECH-DEBT.md`.
+   Милестоун признан закрытым → в его разделе СРАЗУ «ЗАКРЫТ» + строка `<!-- MS-STATE: M-NN CLOSED -->`, не дожидаясь переезда спеки (`04-workflow.md` §Close-out; барьер `check_ps_on_archive.sh` не пустит переезд без маркера). «НЕ ЗАКРЫТ — close-out за architect'ом» не писать.
 
 ## Startup reading
 1. `docs/04-workflow.md` (гейты §3, PR-time блок)
