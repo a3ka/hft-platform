@@ -36,7 +36,15 @@ run_step "task1: red_retention + red_retention_checkpoint_coverage + red_retenti
 # --- task3: контракт HFT_CRON_PRINT_ARGV и композиция покрытия (M-48)
 run_step "task3: verify_M-48.sh" bash scripts/verify_M-48.sh
 # --- task5: инвариант удаления в описании модуля журнала
-if grep -q 'JR-I-13' docs/fa/journal.md; then pass "task5: JR-I-13 в docs/fa/journal.md"; else fail "task5: в docs/fa/journal.md нет JR-I-13"; fi
+# Определение — пункт списка вида «N. **JR-I-13** (…) — …» с предметом удаления/сверки; простое упоминание номера
+# не засчитывается (строка «Первый свободный номер — `JR-I-13`» есть на main и дала бы ложную зелень).
+fa=docs/fa/journal.md
+if grep -qE '^[0-9]+\. \*\*JR-I-13\*\*.*(удал|prune|сверк|sha256)' "$fa" \
+   && ! grep -qE 'Первый свободный номер — `JR-I-13`' "$fa"; then
+  pass "task5: JR-I-13 определён в $fa (удаление только при совпадении с суммой офсайт-копии); «первый свободный» сдвинут"
+else
+  fail "task5: в $fa нет определения JR-I-13 об удалении/сверке, либо «Первый свободный номер» всё ещё JR-I-13"
+fi
 run_step "ci-map: проба карты CI-паритета (red_verify_M-92_ci_map.sh; число миров печатает проба)" \
   bash scripts/tests/red_verify_M-92_ci_map.sh
 fi # DRY
