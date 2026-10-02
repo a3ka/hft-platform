@@ -30,6 +30,10 @@ if [ "$DRY" != "1" ]; then
 # --- task1: оракулы предмета
 run_step "task1: red_m91_legacy_counters (l1 успех, l2 not_ready, l3 две сессии — равенства дельт)" \
   cargo test -p gateway-serve --test red_m91_legacy_counters
+# C-269: l4 (Warming — refusals_supported) живёт под feature "testing" (крючок подмены исхода готовности
+# только в тестовой сборке); cargo test --all в CI фичу НЕ включает — шаг исполняется здесь.
+run_step "task1: red_m91_legacy_counters --features testing (l4 Warming → (1,0,1,0))" \
+  cargo test -p gateway-serve --features testing --test red_m91_legacy_counters
 # --- task1: соседние оракулы счётчиков выдачи не сломаны (v1-путь, экземпляр, сердцебиение)
 run_step "task1: red_m89_counters_instance + red_m89_read_volume_truth + red_m89_heartbeat_entrypoint" \
   cargo test -p gateway-serve --test red_m89_counters_instance --test red_m89_read_volume_truth --test red_m89_heartbeat_entrypoint
