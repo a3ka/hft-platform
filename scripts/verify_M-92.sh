@@ -28,7 +28,7 @@ DRY="${VERIFY_M92_CI_DRY:-0}"
 
 if [ "$DRY" != "1" ]; then
 # --- task1-3: оракулы предмета (библиотека, бинарь, прод-путь cron'а)
-run_step "task1-3: red_m92_manifest_prune (p1-p7, b1-b2, c1-c2)" \
+run_step "task1-3: red_m92_manifest_prune (p1-p7, b1-b2, c0-c5)" \
   cargo test -p journal --test red_m92_manifest_prune
 # --- task1: прежние оракулы ретеншена не сломаны (отбор кандидатов — один источник)
 run_step "task1: red_retention + red_retention_checkpoint_coverage + red_retention_compacted + red_retention_operator" \
@@ -149,7 +149,7 @@ else
 fi
 
 # --- task4: прод
-[ "$DRY" = "1" ] || skip "task4: §8-гейт — dry-run прод-пути (план и манифест в аудит-следе, 0 удалений), затем подпись founder'а и один apply под наблюдением reviewer'а"
+[ "$DRY" = "1" ] || skip "task4: §8-гейт — dry-run прод-пути (план и манифест в аудит-следе, 0 удалений), затем включение architect'ом по П-031 (перепроверка сверки, переключатель) и подтверждение reviewer'а по аудит-следу"
 
 if [ "$FAIL" -eq 0 ]; then echo "VERDICT: PASS"; exit 0; fi
 echo "VERDICT: FAIL (провалов: $FAIL)"; exit 1
