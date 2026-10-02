@@ -63,6 +63,19 @@ jobs:
       - name: Проба барьера (анти-плацебо в обе стороны)
         run: bash scripts/tests/red_roadmap_sync.sh
 
+      # Тот же триггер (переезд спеки в docs/archive/), другой реестр: PROJECT-STATE.md обязан
+      # нести маркер закрытия ДО переезда (R-213 Ф-2, docs/plans/ps-on-archive-2026-10-02.md).
+      # Живёт в этом джобе намеренно: джоб уже в агрегате `All checks passed`, правка агрегата не нужна.
+      - name: Переезд в архив требует закрытия в PROJECT-STATE.md
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: bash scripts/check_ps_on_archive.sh
+
+      - name: Проба барьера PROJECT-STATE (анти-плацебо + реплей пяти инцидентов)
+        run: bash scripts/tests/red_ps_on_archive.sh
+
   secret-material:
     name: Secret material (ключи не живут в репозитории)
     runs-on: ubuntu-latest
