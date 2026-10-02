@@ -552,7 +552,8 @@ fn run_wrapper(
     remote_copy: &Path,
     work: &Path,
     audit: &Path,
-    mode: &str,
+    mode: Option<&str>,
+    env_mode: &str,
 ) -> (Option<i32>, String) {
     let ckpt = work.join("ckpt");
     std::fs::create_dir_all(&ckpt).unwrap();
@@ -561,6 +562,14 @@ fn run_wrapper(
         max_covered(dir).to_string(),
     )
     .unwrap();
+    // Режим — ТОЛЬКО файл-переключатель на хосте (деплой его не перезаписывает, в отличие от
+    // /etc/cron.d); None — файла нет ⇒ dry-run.
+    match mode {
+        Some(m) => std::fs::write(work.join("retention.mode"), m).unwrap(),
+        None => {
+            let _ = std::fs::remove_file(work.join("retention.mode"));
+        }
+    }
     let shim_dir = work.join("shim");
     std::fs::create_dir_all(&shim_dir).unwrap();
     let runner = shim_dir.join("runner");
@@ -612,7 +621,8 @@ fn run_wrapper(
         .env("RETENTION_REMOTE_SHA_CMD", remote.display().to_string())
         .env("RETENTION_WORK_DIR", work.join("hostwork"))
         .env("RETENTION_AUDIT_DIR", audit)
-        .env("RETENTION_MODE", mode)
+        .env("RETENTION_MODE_FILE", work.join("retention.mode"))
+        .env("RETENTION_MODE", env_mode)
         .env("RETENTION_RETAIN_DAYS", "1")
         .env("RETENTION_KEEP_MIN", "1")
         .env("RETENTION_MIN_FREE_GB", "0")
@@ -668,7 +678,8 @@ fn c1_cron_apply_verifies_against_remote_copy() {
         remote.path(),
         work.path(),
         audit.path(),
-        "apply",
+        Some("apply"),
+        "dry-run",
     );
     assert!(
         dir.path().join(&victim).exists(),
@@ -698,8 +709,8 @@ fn c1_cron_apply_verifies_against_remote_copy() {
     );
 }
 
-/// **`c2` — режим по умолчанию (`dry-run`, как в `deploy/cron.d`): ничего не удаляется даже при
-/// полностью совпадающей копии.** Включение `apply` — подпись founder'а (`П-023`).
+/// **`c2` — файла-переключателя нет (по умолчанию): ничего не удаляется даже при полностью
+/// совпадающей копии.** Включение — запись `apply` в файл-переключатель (`M-92` §4, `П-031`).
 #[test]
 fn c2_cron_default_is_dry_run() {
     let dir = journal();
@@ -712,6 +723,7 @@ fn c2_cron_default_is_dry_run() {
         remote.path(),
         work.path(),
         audit.path(),
+        None,
         "dry-run",
     );
     assert_eq!(
@@ -723,5 +735,30 @@ fn c2_cron_default_is_dry_run() {
         names(dir.path()),
         before,
         "M-92: dry-run прод-пути удалил сегменты"
+    );
+}
+
+/// **`c3` — `RETENTION_MODE=apply` в окружении cron'а БЕЗ файла-переключателя: ничего не удаляется.**
+/// Режим живёт только в файле на хосте: `/etc/cron.d` перезаписывается каждым кодовым деплоем
+/// (так 2026-09-23 была стёрта строка `CHECKPOINT_BANDS`), и режим удаления не смеет зависеть от него.
+#[test]
+fn c3_env_mode_without_switch_file_does_not_delete() {
+    let dir = journal();
+    let work = tempfile::tempdir().unwrap();
+    let audit = tempfile::tempdir().unwrap();
+    let remote = remote_copy_of(dir.path(), None);
+    let before = names(dir.path());
+    let (_code, out) = run_wrapper(
+        dir.path(),
+        remote.path(),
+        work.path(),
+        audit.path(),
+        None,
+        "apply",
+    );
+    assert_eq!(
+        names(dir.path()),
+        before,
+        "M-92: RETENTION_MODE=apply из окружения без файла-переключателя удалил сегменты: {out}"
     );
 }
