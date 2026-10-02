@@ -2,7 +2,7 @@
 
 **Статус:** PROPOSED — набор architect'а (спека + RED + гейт) коммитится ДО диспетчеризации dev
 (`04-workflow.md` §2). **Критик обязателен на СИЛЬНОЙ модели** — RAW-гейт `gates.md` §1 п.1:
-механизм удаления данных журнала. Включение `apply` на проде — **подпись founder'а** (`П-023`, граница C).
+механизм удаления данных журнала. **Включение `apply` на проде — architect, по делегированию founder'а 2026-10-02 (`П-031`)**, только после проверки §8 задачи 4.
 **Ревизия, на которой сняты утверждения о коде:** `origin/main` = `6ef8c67`.
 **Предмет роадмапа:** строка `2ter` (`docs/ROADMAP.md`); сводит `M-08` задачи 11/14/16, `TD-020`, `TD-202`, `R-180` F-1.
 
@@ -37,7 +37,7 @@
 | `I-4` | `DryRun` — ноль побочных эффектов; на манифестном пути ничего не копируется никуда | `p6`, `guard_untouched` во всех |
 | `I-5` | разбор манифеста fail-closed (форма `sha256sum`: 64 hex, два пробела, имя без каталога; дубль имени с разными суммами — `Err`) | `p7` |
 | `I-6` | бинарь: `apply` без `--cold-manifest` или с прежним `--cold` — отказ, ничего не удалено, каталог копий не создан; `--plan-out` ≡ `retention_plan`; несовпадение — `exit 2` с именем сегмента | `b1`, `b2` |
-| `I-7` | прод-путь cron'а: суммы берутся с УДАЛЁННОЙ стороны (испорченная копия удерживает сегмент), аудит-след пишется; режим по умолчанию — `dry-run` | `c1`, `c2` |
+| `I-7` | прод-путь cron'а: суммы берутся с УДАЛЁННОЙ стороны (испорченная копия удерживает сегмент), аудит-след пишется; без файла-переключателя — `dry-run`, и `RETENTION_MODE=apply` в окружении этого не меняет | `c1`, `c2`, `c3` |
 
 ## 4. Форма — задана ДОСЛОВНО (RED компилируется против этих имён)
 
@@ -65,7 +65,10 @@ pub fn retention_execute_with_manifest(dir: impl AsRef<Path>, plan: &RetentionPl
 2. `${RETENTION_REMOTE_SHA_CMD} journal/<имя>…` по именам плана → `RETENTION_WORK_DIR/manifest.txt`
    (префикс `journal/` снимается); дефолт шва — `ssh -i ${JOURNAL_OFFSITE_SSH_KEY} -o IdentitiesOnly=yes
    -p ${JOURNAL_OFFSITE_SSH_PORT} <user@host из JOURNAL_OFFSITE_DST> sha256sum`;
-3. при `RETENTION_MODE=apply` — `RETENTION_RUNNER … --mode apply --cold-manifest=/work/manifest.txt`;
+3. **режим — ТОЛЬКО файл-переключатель** `${RETENTION_MODE_FILE}` (дефолт `/var/lib/hft/retention.mode`) с содержимым `apply`;
+   файла нет или в нём иное ⇒ `dry-run`; переменная `RETENTION_MODE` окружения режим НЕ задаёт (`/etc/cron.d`
+   перезаписывается каждым кодовым деплоем — так 2026-09-23 была стёрта строка `CHECKPOINT_BANDS`). При `apply` —
+   `RETENTION_RUNNER … --mode apply --cold-manifest=/work/manifest.txt`;
 4. план, манифест и отчёт — в `RETENTION_AUDIT_DIR` (дефолт `/var/lib/hft/prune-audit`) с датой в имени;
 5. ненулевой выход бинаря — тревога (как сегодня).
 `RETENTION_WORK_DIR` (дефолт `/var/lib/hft/retention-work`) монтируется в контейнер как `/work`.
@@ -80,7 +83,7 @@ pub fn retention_execute_with_manifest(dir: impl AsRef<Path>, plan: &RetentionPl
 | любой путь `apply`, копирующий сегмент «в холодный каталог» и сверяющий с собой | `R-180` F-1 — тождественная сверка |
 | считать «удалённые» суммы локально (по файлам журнала) | `c1`: испорченная копия обязана удержать сегмент |
 | менять отбор кандидатов (`retention_plan`: активный, `keep_min`, возраст, покрытие, legacy) | один источник отбора; `red_retention*` sacred |
-| удалять при `dry-run`, включать `apply` в `deploy/cron.d/journal-retention` | граница C: включение — подпись founder'а (`П-023`) |
+| удалять при `dry-run`; брать режим из окружения или из `deploy/cron.d/journal-retention`; создавать файл-переключатель кодом или деплоем | включение — отдельное действие architect'а по `П-031` после проверки задачи 4; деплой не смеет включить удаление сам |
 | `allow_prune_without_checkpoint` в прод-cron'е | fail-closed по покрытию (`M-38b`) |
 | `--delete` в офсайт-копии, любое удаление на коробке | копия — единственный носитель удалённого |
 | трогать `*/tests/**`, `scripts/verify_*.sh` | sacred |
@@ -106,7 +109,7 @@ pub fn retention_execute_with_manifest(dir: impl AsRef<Path>, plan: &RetentionPl
 `docker-compose.yml` (сервис `journal-retention`) · `deploy/cron.d/journal-retention` (новые переменные;
 `RETENTION_MODE` остаётся `dry-run`) · `deploy/README.md`.
 **architect:** `milestones/M-92-*.md` · `crates/journal/tests/red_m92_*.rs` · `scripts/verify_M-92.sh` ·
-`scripts/tests/red_verify_M-92_ci_map.sh` · `docs/fa/journal.md` (задача 5).
+`scripts/tests/red_verify_M-92_ci_map.sh` · `docs/fa/journal.md` (задача 5) · `docs/PENDING-SIGNATURE.md` (запись `П-031`).
 
 ## 8. §Tasks
 
@@ -115,7 +118,7 @@ pub fn retention_execute_with_manifest(dir: impl AsRef<Path>, plan: &RetentionPl
 | 1 | ⏳ OPEN | библиотека: `ColdManifest`, `retention_execute_with_manifest` (§4) | engine-dev | `p1`…`p7`; `red_retention*` зелены |
 | 2 | ⏳ OPEN | бинарь: `--plan-out`, `--cold-manifest`, отказ `apply` без манифеста и с `--cold` (§4) | engine-dev | `b1`, `b2` |
 | 3 | ⏳ OPEN | скрипт cron'а по контракту §4 + compose (rw журнал, `/ckpt:ro`, `/work`, без `/cold`) | engine-dev | `c1`, `c2`; `verify_M-48.sh` зелен |
-| 4 | ⏳ OPEN | §8-гейт: прогон прод-пути в `dry-run` — план и манифест в аудит-следе, 0 удалений; затем подпись founder'а → один прогон `apply` под наблюдением reviewer'а | reviewer + **founder** | `verify` SKIP-шаг + `R-NNN` |
+| 4 | ⏳ OPEN | **включение (architect, `П-031`):** (а) прогон прод-пути в `dry-run` — план и манифест в аудит-следе, 0 удалений; (б) НЕЗАВИСИМАЯ перепроверка: для каждого имени плана — файл существует на коробке и его сумма, запрошенная заново, равна локальной; число и байты сходятся; (в) запись `apply` в файл-переключатель; (г) наблюдение первого прогона: удалены ровно сверенные, каталог сплошной, прогреватель `exit=0`, выдача отдаёт снимок; (д) при любом расхождении — файл-переключатель удаляется, удаление стоит. Reviewer подтверждает по аудит-следу | architect → reviewer | `verify` SKIP-шаг + `R-NNN` |
 | 5 | ⏳ OPEN | `docs/fa/journal.md`: `JR-I-13` — «локальный сегмент удаляется только при равенстве его sha256 сумме, посчитанной на стороне офсайт-копии; отбор — `retention_plan`» | architect | критик этого круга |
 
 ## 9. RED — `crates/journal/tests/red_m92_manifest_prune.rs`
@@ -128,7 +131,7 @@ pub fn retention_execute_with_manifest(dir: impl AsRef<Path>, plan: &RetentionPl
 | `p6` | `DryRun` — ноль эффектов | удаление в `DryRun` | COMPILE-RED |
 | `p7` | строгий разбор | разбор «по первой колонке», приём имени с каталогом | COMPILE-RED |
 | `b1`/`b2` | бинарь: отказ без манифеста и с `--cold`; `--plan-out` ≡ план; `exit 2` с именем | `apply` без манифеста; молча успешный выход | COMPILE-RED (файл) |
-| `c1`/`c2` | прод-путь: суммы с удалённой стороны; `dry-run` по умолчанию | суммы локально; `apply` по умолчанию | COMPILE-RED (файл) |
+| `c1`/`c2`/`c3` | прод-путь: суммы с удалённой стороны; без файла-переключателя — `dry-run`, окружение режим не задаёт | суммы локально; `apply` по умолчанию; режим из окружения | COMPILE-RED (файл) |
 
 Файл компилируется против новой формы §4: краснота сегодня — `E0432`/`E0425` (`ColdManifest`,
 `retention_execute_with_manifest`) и никакая иная (замер: `7 previous errors`, только эти два имени).
@@ -150,11 +153,12 @@ pub fn retention_execute_with_manifest(dir: impl AsRef<Path>, plan: &RetentionPl
 ## 12. Handoff
 
 architect (набор) → **critic на сильной модели** (RAW-гейт) → engine-dev (задачи 1–3) → tester →
-reviewer (§8: `dry-run` прод-пути) → **founder** (подпись `apply`) → reviewer (наблюдение первого `apply`).
+reviewer (§8, деплой) → **architect** (включение по задаче 4, `П-031`) → reviewer (подтверждение по аудит-следу).
 **Срок — до повторного заполнения диска: ≈ 3 недели от 2026-10-01.** Вливать ПОСЛЕ `M-90` (кодовый деплой).
 
 ## 13. Журнал кругов
 
 | круг | вердикт | предмет | что изменено |
 |---|---|---|---|
+| 0b | — | решение founder'а 2026-10-02 (`П-031`): включение делегировано architect'у | режим — файл-переключатель на хосте; `c3`; задача 4 переписана |
 | 0 | — | набор architect'а | спека, `red_m92_manifest_prune.rs`, `verify_M-92.sh`, проба карты |
