@@ -175,6 +175,37 @@ fn guard_untouched(w: &World) {
     );
 }
 
+/// Каталог — сплошной ряд индексов (`JR-I-2`): удаление обязано срезать ПРЕФИКС, а не дырявить
+/// середину. Замер architect'а 2026-10-02: `journal::stream` на каталоге с дырой (удалены 2-й и 3-й
+/// из шести, самый старый оставлен) молча отдал 562 события с одним разрывом нумерации, без ошибки —
+/// дыра в истории выдавалась бы за непрерывную историю.
+fn assert_contiguous(dir: &Path, ctx: &str) {
+    let mut idx: Vec<u32> = journal::list_segments(dir)
+        .unwrap()
+        .iter()
+        .map(|s| s.index)
+        .collect();
+    idx.sort();
+    assert!(
+        idx.windows(2).all(|p| p[1] == p[0] + 1),
+        "M-92 (JR-I-2): {ctx}: после удаления в каталоге дыра: {idx:?}"
+    );
+}
+
+/// Манифест плана, где у ОДНОГО имени сумма испорчена (копия на коробке не совпала).
+fn manifest_with_bad(dir: &Path, plan: &BTreeSet<String>, bad: &str) -> String {
+    plan.iter()
+        .map(|n| {
+            if n == bad {
+                format!("{}  {}", "0".repeat(64), n)
+            } else {
+                manifest_line(dir, n)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 // ───────────────────────── библиотека ─────────────────────────
 
 /// **`p1` — полный совпадающий манифест: удалены РОВНО кандидаты плана, остальное цело,
@@ -221,7 +252,8 @@ fn p1_matching_manifest_prunes_exactly_the_plan() {
 fn p2_missing_manifest_entry_keeps_segment() {
     let w = world(true);
     let want = plan_names(&w.plan);
-    let victim = want.iter().next().unwrap().clone();
+    // САМЫЙ МОЛОДОЙ кандидат: удержание его не рвёт префикс старших (p8/p9 — иные позиции).
+    let victim = want.iter().next_back().unwrap().clone();
     let text: String = want
         .iter()
         .filter(|n| **n != victim)
@@ -251,6 +283,7 @@ fn p2_missing_manifest_entry_keeps_segment() {
         want.len() - 1,
         "M-92: прочие совпавшие обязаны удалиться"
     );
+    assert_contiguous(w.dir.path(), "p2");
     guard_untouched(&w);
 }
 
@@ -259,7 +292,7 @@ fn p2_missing_manifest_entry_keeps_segment() {
 fn p3_mismatching_sum_keeps_segment() {
     let w = world(true);
     let want = plan_names(&w.plan);
-    let victim = want.iter().next().unwrap().clone();
+    let victim = want.iter().next_back().unwrap().clone();
     let text: String = want
         .iter()
         .map(|n| {
@@ -288,6 +321,76 @@ fn p3_mismatching_sum_keeps_segment() {
         r.failed.iter().any(|(p, _)| p.ends_with(&victim)),
         "M-92: несовпадение не названо в failed"
     );
+    assert_contiguous(w.dir.path(), "p3");
+}
+
+/// **`p8` — несовпал САМЫЙ СТАРЫЙ кандидат: не удаляется НИЧЕГО** (удаление — префикс плана
+/// в порядке индексов, первый неподтверждённый его обрывает). Иначе старейший остаётся, за ним
+/// дыра, и чтение журнала молча сшивает историю через разрыв (`JR-I-2`). Каждый младший
+/// назван в `failed` с причиной, называющей обрыв (`blocked-by`).
+#[test]
+fn p8_oldest_mismatch_prunes_nothing() {
+    let w = world(true);
+    let want = plan_names(&w.plan);
+    let before = names(w.dir.path());
+    let victim = want.iter().next().unwrap().clone();
+    let m = ColdManifest::parse(&manifest_with_bad(w.dir.path(), &want, &victim)).expect("parse");
+    let r = journal::retention_execute_with_manifest(
+        w.dir.path(),
+        &w.plan,
+        &w.pol,
+        &m,
+        RetentionMode::Apply,
+    )
+    .expect("execute");
+    assert_eq!(
+        names(w.dir.path()),
+        before,
+        "M-92 (JR-I-2): несовпал старейший {victim}, а младшие удалены — в каталоге дыра"
+    );
+    assert!(r.pruned.is_empty(), "M-92: pruned = {:?}", r.pruned);
+    for n in want.iter().filter(|n| **n != victim) {
+        assert!(
+            r.failed
+                .iter()
+                .any(|(p, why)| p.ends_with(n) && why.contains("blocked-by")),
+            "M-92: младший {n} не назван в failed с причиной blocked-by: {:?}",
+            r.failed
+        );
+    }
+    guard_untouched(&w);
+}
+
+/// **`p9` — несовпал СРЕДНИЙ кандидат: удалён РОВНО префикс старше него**, он и младшие целы.
+#[test]
+fn p9_middle_mismatch_prunes_exactly_the_older_prefix() {
+    let w = world(true);
+    let want: Vec<String> = plan_names(&w.plan).into_iter().collect();
+    let victim = want[want.len() / 2].clone();
+    let set: BTreeSet<String> = want.iter().cloned().collect();
+    let before = names(w.dir.path());
+    let m = ColdManifest::parse(&manifest_with_bad(w.dir.path(), &set, &victim)).expect("parse");
+    let r = journal::retention_execute_with_manifest(
+        w.dir.path(),
+        &w.plan,
+        &w.pol,
+        &m,
+        RetentionMode::Apply,
+    )
+    .expect("execute");
+    let gone: BTreeSet<String> = before.difference(&names(w.dir.path())).cloned().collect();
+    let older: BTreeSet<String> = want.iter().filter(|n| **n < victim).cloned().collect();
+    assert!(
+        !older.is_empty(),
+        "SETUP НЕ СОСТОЯЛСЯ: у среднего кандидата нет старших"
+    );
+    assert_eq!(
+        gone, older,
+        "M-92 (JR-I-2): удалён не ровно префикс старше {victim}"
+    );
+    assert_eq!(r.pruned.len(), older.len());
+    assert_contiguous(w.dir.path(), "p9");
+    guard_untouched(&w);
 }
 
 /// **`p4` — манифест несёт ВЕРНЫЕ суммы активного и `keep_min`-сегментов: они не удаляются.**
@@ -497,8 +600,8 @@ fn b2_plan_out_then_manifest_apply() {
         plan_names(&lib_plan),
         "M-92: --plan-out расходится с retention_plan"
     );
-    // манифест: все кроме одного совпадают
-    let victim = planned[0].clone();
+    // манифест: все кроме САМОГО МОЛОДОГО совпадают (удержание младшего не рвёт префикс)
+    let victim = planned.iter().max().unwrap().clone();
     let text: String = planned
         .iter()
         .map(|n| {
@@ -535,6 +638,7 @@ fn b2_plan_out_then_manifest_apply() {
             "M-92: совпавший {n} не удалён"
         );
     }
+    assert_contiguous(dir.path(), "b2");
 }
 
 // ───────────────────────── скрипт расписания ─────────────────────────
@@ -819,7 +923,7 @@ fn c1_cron_apply_verifies_against_remote_copy() {
     let audit = tempfile::tempdir().unwrap();
     let pol = policy(work.path(), Some(max_covered(dir.path())));
     let plan = plan_names(&journal::retention_plan(dir.path(), &pol, T0 + 100 * DAY_MS).unwrap());
-    let victim = plan.iter().next().unwrap().clone();
+    let victim = plan.iter().next_back().unwrap().clone();
     let remote = remote_copy_of(dir.path(), Some(&victim));
     let (code, out) = run_wrapper(
         dir.path(),
@@ -1021,7 +1125,7 @@ fn c4_audit_trail_survives_next_run() {
     let audit = tempfile::tempdir().unwrap();
     let pol = policy(work.path(), Some(max_covered(dir.path())));
     let plan = plan_names(&journal::retention_plan(dir.path(), &pol, T0 + 100 * DAY_MS).unwrap());
-    let victim = plan.iter().next().unwrap().clone();
+    let victim = plan.iter().next_back().unwrap().clone();
     let remote = remote_copy_of(dir.path(), Some(&victim));
     let (_c1, out1) = run_wrapper(
         dir.path(),
