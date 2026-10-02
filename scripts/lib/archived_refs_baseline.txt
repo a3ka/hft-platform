@@ -1,0 +1,46 @@
+# Унаследованный долг висячих ссылок на вынесенные артефакты (TD-218).
+#
+# Формат: <файл>|<прежний путь>. Список имеет право только СОКРАЩАТЬСЯ: починил ссылку —
+# убери строку. Протухшая строка = FAIL: иначе список становится вечной амнистией, и
+# барьер тихо слабеет ровно по мере того, как долг чинят.
+#
+# Заведён 2026-09-23 при постройке барьера. Первый проход архива (26 гейтов, норма Р-2)
+# прошёл БЕЗ барьера и оставил ссылки по всему дереву, часть — в ЧУЖИХ зонах
+# (crates/signals, crates/journal, .claude/rules): одной ролью не чинится, и барьер,
+# красный на унаследованном, не вливается никогда.
+#
+# M-88 в списке ОТСУТСТВУЕТ НАМЕРЕННО: это случай, ради которого барьер и заведён,
+# и он чинится в тот же день (PR #220). Барьер обязан краснеть против него до слияния.
+#
+# Ключ <прежний путь> — идентификатор С ГРАНИЦЕЙ: «milestones/M-60» покрывает
+# `milestones/M-60`, `milestones/M-60-*.md`, `milestones/M-60 §…`, но НЕ `milestones/M-60b-…`
+# и не `milestones/M-600`. Так барьер и ищет, так и проверяет протухание.
+#
+# 2026-09-26 (`R-203` §5, харнесс-трек): удалены ВОСЕМЬ строк `…|milestones/M-60`, которые
+# амнистировали не висячие ссылки, а ссылки на ЖИВЫЕ `M-60a`/`M-60b`/`M-60c` — ложное
+# красное подстрочного поиска первой редакции барьера (gates.md, ROADMAP.md,
+# check_context_budgets.sh, check_disk_budget.sh, check_gate_meta.sh, red_docs_freeze.sh,
+# verify_M-60b.sh, verify_M-60c.sh). Оставшаяся строка `red_reserve_id.sh|milestones/M-60`
+# — имя фикстуры `milestones/M-60-x.md` в одноразовом репозитории пробы, не ссылка на
+# спеку; барьер по своему определению её видит, снять можно только маркером в самом файле.
+crates/gateway-serve/src/lib.rs|milestones/M-86
+crates/gateway-serve/tests/red_vp_bin_width_bridge.rs|milestones/M-86
+crates/gateway-serve/tests/red_vp_bin_width_startup.rs|milestones/M-86
+crates/gateway/src/lib.rs|milestones/M-75
+crates/gateway/src/lib.rs|milestones/M-86
+crates/gateway/tests/red_m77_delivery_window.rs|milestones/M-77
+crates/gateway/tests/red_m77_frame_book_continuity.rs|milestones/M-77
+crates/gateway/tests/red_m77_pump_cost.rs|milestones/M-77
+crates/gateway/tests/red_m85_bootstrap_cost.rs|milestones/M-85
+crates/gateway/tests/red_timeframe_session_alignment.rs|milestones/M-38a
+crates/gateway/tests/red_volume_profile.rs|milestones/M-24
+crates/gateway/tests/red_vp_bin_width_governed.rs|milestones/M-86
+crates/gateway/tests/red_vp_bin_width.rs|milestones/M-86
+crates/gateway/tests/red_vp_bin_width_size.rs|milestones/M-86
+crates/journal/src/segments.rs|milestones/M-62
+crates/journal/tests/red_floor_scan.rs|milestones/M-50
+crates/signals/src/lib.rs|milestones/M-04
+docs/09-roadmap-v2.md|milestones/M-40
+scripts/tests/red_artifact_ids.sh|milestones/M-53
+scripts/tests/red_artifact_ids.sh|milestones/M-85
+scripts/tests/red_reserve_id.sh|milestones/M-60
