@@ -41,6 +41,7 @@ v1-путь (M-87) относит `not_ready`/`warming` к `refusals_supported` 
 | `I-1` | успешная legacy-сессия: дельты экземпляра `(attempts, successes, refusals_supported, refusals_unsupported) == (1, 1, 0, 0)` | `l1` |
 | `I-2` | отказ `not_ready` в legacy-пути: `== (1, 0, 1, 0)` | `l2` |
 | `I-3` | две успешные legacy-сессии подряд: `== (2, 2, 0, 0)` — ни пропуска, ни двойного счёта | `l3` |
+| `I-3bis` | исход `Warming` в legacy-пути: ответ `warming`, `== (1, 0, 1, 0)` — каждый не-`Ready` исход есть `refusals_supported` (`C-269`) | `l4` (`--features testing`) |
 | `I-4` | v1-путь и прочие оракулы счётчиков не сломаны | `red_m89_counters_instance`, `red_m89_read_volume_truth`, `red_m89_heartbeat_entrypoint`, `red_m87_entrypoint` (`--features testing`) |
 
 ## 5. ЗАПРЕЩЕНО
@@ -51,6 +52,7 @@ v1-путь (M-87) относит `not_ready`/`warming` к `refusals_supported` 
 | считать успех ДО отправки снимка | v1 считает после `send` (`:1410`, `:1558`); иначе отключившийся клиент — «успех» |
 | менять семантику v1-счётчиков, `admission::readiness`, пять исходов M-87 | вне предмета; `A-033`/`A-037` |
 | процессный счётчик вместо экземплярного | `I-5` M-89 |
+| крючок подмены исхода готовности вне `#[cfg(feature = "testing")]` | в прод-сборке подмена проверки готовности — обход предохранителя M-87 |
 | трогать `*/tests/**`, `scripts/verify_*.sh` | sacred |
 
 ## 6. Acceptance — `scripts/verify_M-91.sh`
@@ -65,13 +67,14 @@ v1-путь (M-87) относит `not_ready`/`warming` к `refusals_supported` 
 1. **«Успех до отправки» не различается оракулом** — снимок уходит сразу после grace, разрыв
    соединения ровно между учётом и `send` фикстурой не воспроизводится. Держится запретом §5 и
    ревью диффа.
+1bis. **`Warming` сегодня недостижим** через `admission::readiness` (возвращает только `Ready`/`NotReady`); `l4` строит мир подстановкой исхода крючком `Server::with_readiness_override(fn() -> ServingOutcome)`, существующим только под `feature = "testing"`. CI (`cargo test --all`) фичу не включает — `l4` исполняется гейтом `verify_M-91.sh` (класс аудита Б: фича `testing` вне CI).
 2. Legacy-путь БЕЗ политики (`bind` без `bind_with_policy`) ручки счётчиков не имеет — не предмет.
 3. Правило тишины на стороне `ops` не исполняется здесь (у `gateway-serve` нет зависимости на `ops`);
    его вход — именно дельты `I-2`, а сама функция пиннится `red_m89_serving_silence` (M-89).
 
 ## 8. Allowed paths
 
-**engine-dev:** `crates/gateway-serve/src/lib.rs` (`run_authorized_session`).
+**engine-dev:** `crates/gateway-serve/src/lib.rs` (`run_authorized_session`; крючок `Server::with_readiness_override` под `#[cfg(feature = "testing")]`).
 **architect:** `milestones/M-91-*.md` · `crates/gateway-serve/tests/red_m91_*.rs` · `scripts/verify_M-91.sh` ·
 `scripts/tests/red_verify_M-91_ci_map.sh`.
 
@@ -89,6 +92,7 @@ v1-путь (M-87) относит `not_ready`/`warming` к `refusals_supported` 
 | `l1` | успех: `(1, 1, 0, 0)` | счёт отсутствует; двойной успех | RUNTIME-RED `(0, 0, 0, 0)` |
 | `l2` | `not_ready`: `(1, 0, 1, 0)` | успех на входе; отказ не считается | RUNTIME-RED `(0, 0, 0, 0)` |
 | `l3` | две сессии: `(2, 2, 0, 0)` | двойной счёт; счёт только первой | RUNTIME-RED `(0, 0, 0, 0)` |
+| `l4` | `Warming` подстановкой: ответ `warming`, `(1, 0, 1, 0)` | «отказом считается только `NotReady`» (`C-269`) | COMPILE-RED под `--features testing` (`E0599` `with_readiness_override`) |
 
 **Мутационный контроль набора (architect, 2026-10-01, временная правка `run_authorized_session`,
 возвращена, `git status` чист):** правильная форма (попытка на входе, отказ в ветке не-`Ready`, успех
@@ -112,4 +116,5 @@ architect (набор) → critic (`gates.md` §9) → engine-dev (задача 
 
 | круг | вердикт | предмет | что изменено |
 |---|---|---|---|
+| 1 | `C-269` **REJECT** (critic, `89ac1ae`) | `Warming` как отказ поддерживаемого запроса не защищён: реализация «только `NotReady`» проходила `l1`…`l3` | `l4` под `feature = "testing"` с крючком `with_readiness_override`; `I-3bis`; запрет крючка вне тестовой сборки; шаг гейта с `--features testing` |
 | 0 | — | набор architect'а | спека, `red_m91_legacy_counters.rs`, `verify_M-91.sh`, проба карты |
