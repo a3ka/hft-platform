@@ -543,17 +543,76 @@ fn repo() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
-/// Прогнать НАСТОЯЩИЙ `deploy/bin/journal-retention-cron.sh` в окружении прод-cron'а
-/// (`deploy/cron.d/journal-retention`), заменив ТОЛЬКО два шва: `RETENTION_RUNNER` — заглушкой,
-/// исполняющей настоящий бинарь с путями контейнера `/journal`, `/ckpt`, `/work`, перенацеленными на
-/// фикстуру; `RETENTION_REMOTE_SHA_CMD` — «коробкой», считающей суммы по ОТДЕЛЬНОМУ каталогу копии.
+/// Тома сервиса `journal-retention` из НАСТОЯЩЕГО `docker-compose.yml`: `(источник, цель, только_чтение)`.
+/// Разбор нарочно примитивный (блок `volumes:` сервиса — плоский список строк), как в соседних оракулах.
+fn compose_volumes(service: &str) -> Vec<(String, String, bool)> {
+    let text =
+        std::fs::read_to_string(repo().join("docker-compose.yml")).expect("docker-compose.yml");
+    let (mut in_svc, mut in_vol) = (false, false);
+    let mut out = Vec::new();
+    for line in text.lines() {
+        if line.starts_with("  ") && !line.starts_with("    ") && line.trim_end().ends_with(':') {
+            in_svc = line.trim().trim_end_matches(':') == service;
+            in_vol = false;
+            continue;
+        }
+        if !in_svc {
+            continue;
+        }
+        let t = line.trim();
+        if line.starts_with("    ") && !line.starts_with("      ") && t.ends_with(':') {
+            in_vol = t == "volumes:";
+            continue;
+        }
+        if in_vol {
+            if let Some(item) = t.strip_prefix("- ") {
+                let item = item.trim().trim_matches('"');
+                // источник может нести ${VAR:-default} с двоеточием внутри — режем справа
+                let (rest, ro) = match item.strip_suffix(":ro") {
+                    Some(r) => (r, true),
+                    None => (item.strip_suffix(":rw").unwrap_or(item), false),
+                };
+                let idx = rest.rfind(':').expect("том без цели");
+                out.push((rest[..idx].to_string(), rest[idx + 1..].to_string(), ro));
+            } else if !t.is_empty() && !t.starts_with('#') {
+                in_vol = false;
+            }
+        }
+    }
+    out
+}
+
+fn compose_entrypoint(service: &str) -> String {
+    let text = std::fs::read_to_string(repo().join("docker-compose.yml")).unwrap();
+    let mut in_svc = false;
+    for line in text.lines() {
+        if line.starts_with("  ") && !line.starts_with("    ") && line.trim_end().ends_with(':') {
+            in_svc = line.trim().trim_end_matches(':') == service;
+            continue;
+        }
+        if in_svc {
+            if let Some(v) = line.trim().strip_prefix("entrypoint:") {
+                return v.trim().to_string();
+            }
+        }
+    }
+    String::new()
+}
+
+/// Прогнать НАСТОЯЩИЙ `deploy/bin/journal-retention-cron.sh` в окружении прод-cron'а. Окружение —
+/// `cron_text` (по умолчанию НАСТОЯЩИЙ `deploy/cron.d/journal-retention`), и режим из него тест НЕ
+/// перекрывает (`C-268` R2). Заменены два шва: `RETENTION_RUNNER` — заглушка `docker compose run`,
+/// которая подключает каталоги ПО ТОМАМ сервиса из `docker-compose.yml` (`journal-data` → журнал
+/// фикстуры, `gateway-ckpt` → слепки, источник с `RETENTION_WORK_DIR` → рабочий каталог хоста) и
+/// исполняет настоящий бинарь; цель, которой нет в томах сервиса, НЕ подключается — бинарь её не
+/// найдёт (`C-268` R1). `RETENTION_REMOTE_SHA_CMD` — «коробка», считающая суммы по ОТДЕЛЬНОЙ копии.
 fn run_wrapper(
     dir: &Path,
     remote_copy: &Path,
     work: &Path,
     audit: &Path,
-    mode: Option<&str>,
-    env_mode: &str,
+    switch: Option<&str>,
+    cron_text: Option<String>,
 ) -> (Option<i32>, String) {
     let ckpt = work.join("ckpt");
     std::fs::create_dir_all(&ckpt).unwrap();
@@ -562,13 +621,31 @@ fn run_wrapper(
         max_covered(dir).to_string(),
     )
     .unwrap();
-    // Режим — ТОЛЬКО файл-переключатель на хосте (деплой его не перезаписывает, в отличие от
-    // /etc/cron.d); None — файла нет ⇒ dry-run.
-    match mode {
+    let hostwork = work.join("hostwork");
+    std::fs::create_dir_all(&hostwork).unwrap();
+    match switch {
         Some(m) => std::fs::write(work.join("retention.mode"), m).unwrap(),
         None => {
             let _ = std::fs::remove_file(work.join("retention.mode"));
         }
+    }
+    // подмены путей контейнера → фикстура, выведенные из томов сервиса
+    let mut subst = String::new();
+    for (src, target, _ro) in compose_volumes("journal-retention") {
+        let host = if src == "journal-data" {
+            dir.to_path_buf()
+        } else if src == "gateway-ckpt" {
+            ckpt.clone()
+        } else if src.contains("RETENTION_WORK_DIR") {
+            hostwork.clone()
+        } else {
+            continue;
+        };
+        subst.push_str(&format!(
+            "a=\"${{a//{t}/{h}}}\"; ",
+            t = target.replace('/', "\\/"),
+            h = host.display()
+        ));
     }
     let shim_dir = work.join("shim");
     std::fs::create_dir_all(&shim_dir).unwrap();
@@ -576,12 +653,10 @@ fn run_wrapper(
     std::fs::write(
         &runner,
         format!(
-            "#!/bin/bash\n# заглушка docker compose run: всё до имени сервиса отбрасывается\nwhile [ $# -gt 0 ] && [ \"$1\" != journal-retention ]; do shift; done; shift\n\
-             args=(); for a in \"$@\"; do a=\"${{a//\\/journal/{d}}}\"; a=\"${{a//\\/ckpt/{c}}}\"; a=\"${{a//\\/work/{w}}}\"; args+=(\"$a\"); done\n\
+            "#!/bin/bash\n# заглушка docker compose run: до имени сервиса — опции compose\n\
+             while [ $# -gt 0 ] && [ \"$1\" != journal-retention ]; do shift; done; shift\n\
+             args=(); for a in \"$@\"; do {subst}args+=(\"$a\"); done\n\
              exec {bin} \"${{args[@]}}\" --now-wall-ms={now}\n",
-            d = dir.display(),
-            c = ckpt.display(),
-            w = work.join("hostwork").display(),
             bin = BIN,
             now = T0 + 100 * DAY_MS
         ),
@@ -601,7 +676,9 @@ fn run_wrapper(
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(f, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
-    let cron = std::fs::read_to_string(repo().join("deploy/cron.d/journal-retention")).unwrap();
+    let cron = cron_text.unwrap_or_else(|| {
+        std::fs::read_to_string(repo().join("deploy/cron.d/journal-retention")).unwrap()
+    });
     let mut cmd = Command::new("bash");
     cmd.arg(repo().join("deploy/bin/journal-retention-cron.sh"))
         .env_clear();
@@ -619,10 +696,9 @@ fn run_wrapper(
             format!("{} compose run --rm journal-retention", runner.display()),
         )
         .env("RETENTION_REMOTE_SHA_CMD", remote.display().to_string())
-        .env("RETENTION_WORK_DIR", work.join("hostwork"))
+        .env("RETENTION_WORK_DIR", &hostwork)
         .env("RETENTION_AUDIT_DIR", audit)
         .env("RETENTION_MODE_FILE", work.join("retention.mode"))
-        .env("RETENTION_MODE", env_mode)
         .env("RETENTION_RETAIN_DAYS", "1")
         .env("RETENTION_KEEP_MIN", "1")
         .env("RETENTION_MIN_FREE_GB", "0")
@@ -639,6 +715,26 @@ fn run_wrapper(
             String::from_utf8_lossy(&o.stderr)
         ),
     )
+}
+
+/// Все файлы аудит-следа (рекурсивно): имя → содержимое.
+fn audit_files(audit: &Path) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut stack = vec![audit.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else {
+                out.push((
+                    p.file_name().unwrap().to_string_lossy().to_string(),
+                    std::fs::read_to_string(&p).unwrap_or_default(),
+                ));
+            }
+        }
+    }
+    out
 }
 
 fn remote_copy_of(dir: &Path, corrupt: Option<&str>) -> tempfile::TempDir {
@@ -661,9 +757,55 @@ fn remote_copy_of(dir: &Path, corrupt: Option<&str>) -> tempfile::TempDir {
     r
 }
 
-/// **`c1` — прод-путь cron'а в режиме `apply`: удалены сверенные с КОПИЕЙ, испорченная копия
-/// удержала свой сегмент; аудит-след записан.** Свидетель «суммы взяты с удалённой стороны»: копия
-/// одного сегмента испорчена — сумма, посчитанная локально, этого не увидела бы.
+/// **`c0` — топология сервиса `journal-retention` в `docker-compose.yml` (`C-268` R1):** журнал
+/// подключён С ПРАВОМ ЗАПИСИ (удаление), слепки — только на чтение, рабочий каталог хоста — `/work`,
+/// холодного каталога нет; точка входа — бинарь `journal-retention`; скрипт cron'а по умолчанию зовёт
+/// `docker compose run --rm journal-retention` (текстовая сверка дефолта шва — названный предел).
+#[test]
+fn c0_compose_topology_is_the_prune_topology() {
+    let vols = compose_volumes("journal-retention");
+    let find = |target: &str| vols.iter().find(|(_, t, _)| t == target).cloned();
+    let j = find("/journal").expect("M-92: у journal-retention нет тома /journal");
+    assert_eq!(
+        j.0, "journal-data",
+        "M-92: /journal — не том journal-data: {j:?}"
+    );
+    assert!(!j.2, "M-92: журнал подключён :ro — удаление невозможно (EROFS), apply станет тихим no-op: {vols:?}");
+    let c = find("/ckpt").expect("M-92: у journal-retention нет тома /ckpt — артефакта покрытия нет, удаление fail-closed навсегда");
+    assert_eq!(
+        c.0, "gateway-ckpt",
+        "M-92: /ckpt — не том gateway-ckpt: {c:?}"
+    );
+    assert!(
+        c.2,
+        "M-92: слепки подключены уборщику с правом записи — обязаны быть :ro: {c:?}"
+    );
+    let w = find("/work")
+        .expect("M-92: у journal-retention нет тома /work (рабочий каталог плана и манифеста)");
+    assert!(
+        w.0.contains("RETENTION_WORK_DIR"),
+        "M-92: источник /work не RETENTION_WORK_DIR: {w:?}"
+    );
+    assert!(
+        find("/cold").is_none(),
+        "M-92: том /cold остался — путь «скопируй и подтверди» (R-180 F-1): {vols:?}"
+    );
+    assert!(
+        compose_entrypoint("journal-retention").contains("/usr/local/bin/journal-retention"),
+        "M-92: точка входа сервиса — не бинарь journal-retention"
+    );
+    let script =
+        std::fs::read_to_string(repo().join("deploy/bin/journal-retention-cron.sh")).unwrap();
+    assert!(
+        script.contains("docker compose run --rm journal-retention"),
+        "M-92: дефолт RETENTION_RUNNER скрипта — не `docker compose run --rm journal-retention`"
+    );
+}
+
+/// **`c1` — прод-путь cron'а с переключателем `apply`: удалены сверенные с КОПИЕЙ, испорченная
+/// копия удержала свой сегмент; аудит-след — ТРИ записи, связанные с именами (`C-268` R3):** план
+/// (все кандидаты), манифест коробки (строка несовпавшего — с ЕГО испорченной суммой), отчёт
+/// (несовпавший назван, каждый удалённый назван).
 #[test]
 fn c1_cron_apply_verifies_against_remote_copy() {
     let dir = journal();
@@ -673,13 +815,14 @@ fn c1_cron_apply_verifies_against_remote_copy() {
     let plan = plan_names(&journal::retention_plan(dir.path(), &pol, T0 + 100 * DAY_MS).unwrap());
     let victim = plan.iter().next().unwrap().clone();
     let remote = remote_copy_of(dir.path(), Some(&victim));
+    let bad_sum = sha_hex(&remote.path().join(&victim));
     let (code, out) = run_wrapper(
         dir.path(),
         remote.path(),
         work.path(),
         audit.path(),
         Some("apply"),
-        "dry-run",
+        None,
     );
     assert!(
         dir.path().join(&victim).exists(),
@@ -696,21 +839,45 @@ fn c1_cron_apply_verifies_against_remote_copy() {
         Some(0),
         "M-92: несовпадение копии обязано дать ненулевой выход/тревогу: {out}"
     );
-    let trail: Vec<String> = std::fs::read_dir(audit.path())
-        .map(|r| {
-            r.filter_map(|e| e.ok())
-                .map(|e| e.file_name().to_string_lossy().to_string())
-                .collect()
-        })
-        .unwrap_or_default();
+    let files = audit_files(audit.path());
+    let by = |suffix: &str| {
+        files
+            .iter()
+            .find(|(n, _)| n.ends_with(suffix))
+            .map(|(_, c)| c.clone())
+            .unwrap_or_else(|| {
+                panic!(
+                    "M-92: в аудит-следе нет записи *{suffix}: {:?}",
+                    files.iter().map(|(n, _)| n).collect::<Vec<_>>()
+                )
+            })
+    };
+    let (plan_txt, manifest_txt, report_txt) =
+        (by("plan.txt"), by("manifest.txt"), by("report.txt"));
+    for n in &plan {
+        assert!(
+            plan_txt.lines().any(|l| l.trim() == n),
+            "M-92: запись плана не называет {n}"
+        );
+    }
     assert!(
-        !trail.is_empty(),
-        "M-92: аудит-след в RETENTION_AUDIT_DIR не записан"
+        manifest_txt.lines().any(|l| l.starts_with(&bad_sum) && l.trim_end().ends_with(victim.as_str())),
+        "M-92: манифест в аудит-следе не несёт УДАЛЁННУЮ сумму несовпавшего {victim} — сверку нельзя восстановить"
     );
+    assert!(
+        report_txt.contains(victim.as_str()),
+        "M-92: отчёт не называет несовпавший {victim}"
+    );
+    for n in plan.iter().filter(|n| **n != victim) {
+        assert!(
+            report_txt.contains(n.as_str()),
+            "M-92: отчёт не называет удалённый {n}"
+        );
+    }
 }
 
-/// **`c2` — файла-переключателя нет (по умолчанию): ничего не удаляется даже при полностью
-/// совпадающей копии.** Включение — запись `apply` в файл-переключатель (`M-92` §4, `П-031`).
+/// **`c2` — НАСТОЯЩИЙ файл расписания, переключателя нет: ничего не удаляется даже при полностью
+/// совпадающей копии.** Режим теста не перекрывает — его даёт `deploy/cron.d/journal-retention`.
 #[test]
 fn c2_cron_default_is_dry_run() {
     let dir = journal();
@@ -724,41 +891,61 @@ fn c2_cron_default_is_dry_run() {
         work.path(),
         audit.path(),
         None,
-        "dry-run",
+        None,
     );
     assert_eq!(
         code,
         Some(0),
-        "M-92: dry-run прод-пути вышел ненулём: {out}"
+        "M-92: прод-путь без переключателя вышел ненулём: {out}"
     );
     assert_eq!(
         names(dir.path()),
         before,
-        "M-92: dry-run прод-пути удалил сегменты"
+        "M-92: прод-путь без переключателя удалил сегменты"
     );
 }
 
-/// **`c3` — `RETENTION_MODE=apply` в окружении cron'а БЕЗ файла-переключателя: ничего не удаляется.**
-/// Режим живёт только в файле на хосте: `/etc/cron.d` перезаписывается каждым кодовым деплоем
-/// (так 2026-09-23 была стёрта строка `CHECKPOINT_BANDS`), и режим удаления не смеет зависеть от него.
+/// **`c3` — мутант файла расписания `RETENTION_MODE=apply` (то, что запрещено границей C), без
+/// переключателя: ничего не удаляется** (`C-268` R2). Режим живёт только в файле на хосте:
+/// `/etc/cron.d` перезаписывается каждым кодовым деплоем (2026-09-23 стёрта строка `CHECKPOINT_BANDS`).
 #[test]
-fn c3_env_mode_without_switch_file_does_not_delete() {
+fn c3_cron_file_apply_without_switch_does_not_delete() {
     let dir = journal();
     let work = tempfile::tempdir().unwrap();
     let audit = tempfile::tempdir().unwrap();
     let remote = remote_copy_of(dir.path(), None);
     let before = names(dir.path());
+    let cron = std::fs::read_to_string(repo().join("deploy/cron.d/journal-retention")).unwrap();
+    assert!(
+        cron.contains("RETENTION_MODE="),
+        "SETUP НЕ СОСТОЯЛСЯ: в файле расписания нет RETENTION_MODE="
+    );
+    let mutated: String = cron
+        .lines()
+        .map(|l| {
+            if l.starts_with("RETENTION_MODE=") {
+                "RETENTION_MODE=apply".to_string()
+            } else {
+                l.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_ne!(
+        mutated, cron,
+        "SETUP НЕ СОСТОЯЛСЯ: мутант файла расписания не отличается"
+    );
     let (_code, out) = run_wrapper(
         dir.path(),
         remote.path(),
         work.path(),
         audit.path(),
         None,
-        "apply",
+        Some(mutated),
     );
     assert_eq!(
         names(dir.path()),
         before,
-        "M-92: RETENTION_MODE=apply из окружения без файла-переключателя удалил сегменты: {out}"
+        "M-92: RETENTION_MODE=apply в файле расписания без переключателя удалил сегменты: {out}"
     );
 }
