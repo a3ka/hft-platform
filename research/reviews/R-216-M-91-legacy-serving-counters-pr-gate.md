@@ -561,7 +561,92 @@ RESTORED_IDENTICAL
 
 ---
 
-## §12 — §8-гейт (post-merge): ЗАПОЛНЯЕТСЯ ПОСЛЕ ДЕПЛОЯ
+## §12 — §8-гейт (post-merge): СНЯТ 2026-10-03, задача 2 исполнена
 
-Пока merge не состоялся — раздел пуст СОЗНАТЕЛЬНО, а не забыт: пустота здесь означает
-«деплой-гейт не снят», и milestone поверх неё не закрывается (`gates.md` §8).
+**Merge:** PR #298, merge-коммит `1d119d9e` (2026-10-03T10:05:00Z); ветка предмета удалена
+после входа в `main` (`gates.md` §9).
+
+```
+$ gh pr checks 298 >/dev/null 2>&1; echo CHECKS=$?
+CHECKS=0
+$ gh pr checks 298 | grep 'All checks passed'
+All checks passed	pass	6s	…/runs/37114284992/job/111180150442
+
+$ gh run watch 37115214237 --exit-status >/dev/null 2>&1; echo CI_EXIT=$?     # CI на main
+CI_EXIT=0
+$ gh run watch 37115214224 --exit-status >/dev/null 2>&1; echo DEPLOY_EXIT=$? # Deploy (push)
+DEPLOY_EXIT=0
+$ gh run watch 37116132136 --exit-status >/dev/null 2>&1; echo DEPLOY2_EXIT=$? # Deploy (workflow_run)
+DEPLOY2_EXIT=0
+
+$ gh run list --branch main --limit 3
+completed	success	Deploy to VPS	Deploy to VPS	main	workflow_run	37116132136	2m14s	2026-10-03T10:21:11Z
+completed	success	Merge pull request #298 …	CI	main	push	37115214237	16m7s	2026-10-03T10:05:02Z
+completed	success	Merge pull request #298 …	Deploy to VPS	main	push	37115214224	18m11s	2026-10-03T10:05:02Z
+```
+
+### Прод глазами (`gates.md` §8 п. 2)
+
+```
+$ ssh … 'date -u +%FT%TZ; docker ps --format "{{.Names}} {{.Status}}"; cd /root/hft-platform && git log --oneline -1'
+2026-10-03T10:23:33Z
+hft-gateway-serve Up 27 seconds (healthy) hft-platform-recorder:local
+hft-recorder Up 32 seconds (healthy) hft-platform-recorder:local
+1d119d9e Merge pull request #298 from a3ka/feat/M-91-legacy-serving-counters
+
+$ ssh … 'cat …/journal-data/_data/recorder.heartbeat'
+{"events":2265,"free_bytes":74752081920,"min_free_bytes":10737418240,"next_seq":779499705,
+ "segment_index":916,"ts_wall_ms":1791023011081,"writable":true}      # журнал растёт, диск 74.7 ГБ свободно
+
+$ ssh … 'grep RssAnon /proc/<gateway-serve>/status'
+RssAnon:	   11220 kB            # не docker stats (TD-021): анонимная куча, 11 МБ
+```
+
+### Задача 2 — ЗАМЕР, а не рассуждение: legacy-сессия двигает счётчики на проде
+
+Зонд `wsprobe` внутри прод-контейнера, СЕЛЕКТОР НЕ ПОСЫЛАЕТСЯ ⇒ сервер берёт серверный
+селектор ⇒ это ровно legacy-путь (`run_authorized_session`), тот самый, которым ходит
+единственный реальный клиент (`TD-228`).
+
+```
+$ docker exec hft-gateway-serve sh -lc 'wsprobe --url ws://127.0.0.1:8080 --secret "$GATEWAY_JWT_SECRET" --frames 2 --seconds 25 --out /tmp/m91probe'
+… snapshot отдан, schema_version 11, cob/vwap/cvd/profile непусты …
+wrote /tmp/m91probe (snapshot.json, frames.jsonl, summary.json, panel.html)
+PROBE_EXIT=0
+
+$ docker exec hft-gateway-serve sh -lc 'wsprobe … --frames 1 --seconds 20 --out /tmp/m91probe2'
+PROBE2_EXIT=0
+```
+
+| момент (UTC) | `ts_wall_ms` | `attempts` | `successes` | `refusals_supported` | `refusals_unsupported` | `journal_payload_bytes_read` |
+|---|---|---:|---:|---:|---:|---:|
+| до merge'а, 10:04:53 | 1791021887087 | 0 | 0 | 0 | 0 | 7 648 937 |
+| после деплоя, до зонда, 10:23:56 | 1791023036725 | 0 | 0 | 0 | 0 | 0 |
+| после ПЕРВОЙ legacy-сессии, 10:24:24 | 1791023056733 | **1** | **1** | 0 | 0 | 129 936 038 |
+| после ВТОРОЙ legacy-сессии, 10:25:09 | 1791023106751 | **2** | **2** | 0 | 0 | 262 713 882 |
+
+**Дельты:** первая сессия `(1, 1, 0, 0)` — ровно `I-1`; две сессии подряд `(2, 2, 0, 0)` —
+ровно `I-3`. То есть прод воспроизвёл равенства оракулов `l1` и `l3` на РЕАЛЬНОМ трафике, а не
+на фикстуре. До правки те же три успешные подписки давали `attempts:0, successes:0` при росте
+прочитанных байт на 583 МБ (`R-211` §5.2) — это и был предмет `TD-228`.
+
+### Ловушка §8-замера, которую называю, а не замалчиваю
+
+Сердцебиение выдачи пишется **раз в ~10 с** (`ts_wall_ms`: …056733 → …066736 → …076739).
+Чтение СРАЗУ после зонда (10:24:06) вернуло ещё ДОпробный снимок — те же нули и тот же
+`ts_wall_ms`, что до зонда. Одного чтения для §8 НЕДОСТАТОЧНО: его надо повторять до сдвига
+`ts_wall_ms`, иначе верный механизм читается как «счётчики не двинулись», а неверный — как
+«всё хорошо» при протухшем файле. Замер снят пятью чтениями с шагом 4–5 с, а не одним.
+
+### Чего этот гейт НЕ доказывает (границы названы)
+
+1. **Тревога по-прежнему не вычисляется** — `ops-watchdog` на VPS не собран и не собирается
+   ни образом, ни деплоем (`TD-231`). `M-91` снял слепоту ПРОДЮСЕРА; потребителя он не строил.
+   Поэтому `TD-220` остаётся ЧАСТИЧНО, и это не остаток `M-91`.
+2. **Ветка ОТКАЗА на проде не замерена** — для `not_ready` потребовалось бы привести выдачу в
+   неготовое состояние на живом сервере. Она пиннится оракулами `l2`/`l4` и мутационным
+   контролем (§9.2), а не прод-замером; смешивать два уровня предъявления не буду.
+3. **`journal_payload_bytes_read` 130 МБ на первую выдачу** — цена cold-resume, предмет
+   `TD-229`, не этого milestone'а.
+
+**Вердикт по §8: PASS.** `TD-228` закрыт поставкой и прод-замером.
