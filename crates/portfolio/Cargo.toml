@@ -1,0 +1,13 @@
+[package]
+name = "portfolio"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+
+# Слой 3 (docs/fa/strategy-brain.md §5): Forecast + лимит → TargetPosition.
+# ВАЖНО: это pre-risk sanity, НЕ риск-гейт (fail-closed RiskApproved-барьер — M-08,
+# crates/risk). Чистая функция: без I/O/wall-clock/rand.
+
+[dependencies]
+contracts = { path = "../contracts" }
+alpha = { path = "../alpha" }
