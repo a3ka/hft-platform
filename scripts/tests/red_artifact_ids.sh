@@ -769,7 +769,7 @@ R="$(mk_repo n3td)"; td_entry "$R" TD-300 "первый-предмет"; commit_
 setup_assert N3TD "$R" "TD-307 обязан отсутствовать в TECH-DEBT.md своего дерева — иначе сценарий не про объединение" '[ "$(git show side:TECH-DEBT.md | grep -c TD-307)" -ge 1 ] && [ "$(grep -c TD-307 TECH-DEBT.md)" -eq 0 ]'
 expect_alloc N3TD "$R" TD "TD-308" "класс TD: занятость по объединению, а не по своему дереву"
 
-R="$(mk_repo l3ok)"; art "$R" milestones/M-90-a.md ""; commit_all "$R" base2
+R="$(mk_repo l3ok)"; art "$R" milestones/M-90-a.md ""; commit_all "$R" base2  # ARCHIVED-REF-OK: синтетическая фикстура проба номеров, не спека M-90
 ( cd "$R" && git update-ref refs/remotes/origin/main HEAD )
 setup_assert L3OK "$R" "origin-ref обязан существовать — иначе штатный случай не воспроизводится" '[ -n "$(git for-each-ref --format="%(refname)" refs/remotes/origin)" ]'
 expect_alloc L3OK "$R" M "M-91" "штатный случай: максимум по origin ∪ refs/heads"
@@ -852,10 +852,10 @@ expect_block B6DASH "$R" "$B" "M-46 дважды: первая буква СЛА
 # L6ONELETTER — контроль в обратную сторону: слаг ДЛИНОЙ В ОДНУ БУКВУ против буквы вплотную.
 # `M-90-a` и `M-90a-thing` — разные идентификаторы (`M-90` и `M-90a`); реализация с
 # необязательным дефисом схлопывает их в один и краснеет на легитимном.
-R="$(mk_repo l6oneletter)"; art "$R" milestones/M-90-a.md ""; commit_all "$R" base2
+R="$(mk_repo l6oneletter)"; art "$R" milestones/M-90-a.md ""; commit_all "$R" base2  # ARCHIVED-REF-OK: синтетическая фикстура
 B="$(cd "$R" && git rev-parse HEAD)"; art "$R" milestones/M-90a-thing.md ""; commit_all "$R" "сосед с буквенным ID"
 setup_assert L6ONELETTER "$R" "одно имя обязано нести слаг из ОДНОЙ буквы (M-90-a), другое — букву ВПЛОТНУЮ (M-90a)" \
-  '[ "$(git ls-tree -r --name-only HEAD | grep -c "^milestones/M-90-a.md")" -eq 1 ] && [ "$(git ls-tree -r --name-only HEAD | grep -c "^milestones/M-90a-")" -eq 1 ]'
+  '[ "$(git ls-tree -r --name-only HEAD | grep -c "^milestones/M-90-a.md")" -eq 1 ] && [ "$(git ls-tree -r --name-only HEAD | grep -c "^milestones/M-90a-")" -eq 1 ]'  # ARCHIVED-REF-OK: синтетическая фикстура
 expect_allow L6ONELETTER "$R" "$B" "M-90 (слаг «a») и M-90a — РАЗНЫЕ идентификаторы: различитель — ДЕФИС"
 
 # B6ZERO — нормализация ведущих нулей обязана пережить появление буквы. Наивная миграция
