@@ -15,7 +15,7 @@ COPY crates ./crates
 # M-46 task #5a (engine-dev): `wsprobe` — read-only WS-харнесс для sidecar-прогона против
 # прода (M-46 §7: `docker run --rm --network container:hft-gateway-serve <образ> wsprobe ...`).
 # Без этой строки образ не получает бинарь и sidecar-прогон невыполним (находка architect'а).
-RUN cargo build --release --bin recorder --bin journal-retention --bin gateway-serve --bin gateway-checkpoint --bin wsprobe
+RUN cargo build --release --bin recorder --bin journal-retention --bin gateway-serve --bin gateway-checkpoint --bin wsprobe --bin ops-watchdog
 
 FROM debian:stable-slim
 # journal-том монтируется сюда; переживает редеплой контейнера (docs/06 §3, §7).
@@ -33,5 +33,10 @@ COPY --from=builder /build/target/release/gateway-checkpoint /usr/local/bin/gate
 # M-46 task #5a: wsprobe — read-only, никогда не ENTRYPOINT; вызывается явно через
 # `docker run --network container:hft-gateway-serve <образ> wsprobe ...` (sidecar, M-46 §7).
 COPY --from=builder /build/target/release/wsprobe /usr/local/bin/wsprobe
+# M-93 (TD-231): ops-watchdog — хостовый процесс (DESIGN §23.1: канал тревоги не делит судьбу с docker),
+# но бинарь ДОСТАВЛЯЕТСЯ деплоем из этого образа (deploy/bin/install-watchdog.sh). Сборка в образе — это
+# ЕДИНСТВЕННЫЙ источник бинаря; ручной `cargo build` на хосте запрещён (TD-227-класс). На ветке healthy
+# deploy копирует сюда актуальную сборку, на ветке отката — сборку откатного коммита (§3 I-5).
+COPY --from=builder /build/target/release/ops-watchdog /usr/local/bin/ops-watchdog
 # M-00: работаем root'ом (заглушка). Hardening (non-root + права тома) — TODO при реальном recorder.
 ENTRYPOINT ["/usr/local/bin/recorder"]
