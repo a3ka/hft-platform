@@ -109,9 +109,9 @@ health-гейта достаёт его из образа РАБОТАЮЩЕГО
 
 | # | Status | задача | зона | проверка |
 |---|---|---|---|---|
-| 1 | ⏳ OPEN | образ собирает и копирует `ops-watchdog` (§4) | engine-dev | `w6`; D9-deep в CI |
-| 2 | ⏳ OPEN | `deploy/bin/install-watchdog.sh` + дефолт пути в `watchdog_cron.sh` (§3 `I-1`…`I-3`, §4) | engine-dev | `w1`…`w5`, `w8` |
-| 3 | ⏳ OPEN | `deploy.yml`: установка на ветке healthy (отказ — красный деплой) и на ветке отката (§4) — ПОСЛЕ задачи 2, чтобы на ветке деплой ни разу не звал несуществующий скрипт | **architect** (`C-277` B-2) | `w7` |
+| 1 | ✅ DONE (`dd4e183`) | образ собирает и копирует `ops-watchdog` (§4) | engine-dev | `w6`; D9-deep в CI |
+| 2 | ✅ DONE (`6c2a2bc`) | `deploy/bin/install-watchdog.sh` + дефолт пути в `watchdog_cron.sh` (§3 `I-1`…`I-3`, §4) | engine-dev | `w1`…`w5`, `w8` |
+| 3 | ✅ DONE (architect) | `deploy.yml`: установка на ветке healthy (отказ — красный деплой) и на ветке отката (§4) — ПОСЛЕ задачи 2, чтобы на ветке деплой ни разу не звал несуществующий скрипт | **architect** (`C-277` B-2) | `w7` |
 | 4 | ⏳ OPEN | §8-гейт: после деплоя `/usr/local/lib/hft/ops-watchdog` существует и побайтово равен `/usr/local/bin/ops-watchdog` образа работающего `hft-recorder` (`sha256sum` обоих); ближайший прогон cron пишет в журнал результат сторожа, а не «бинарь не найден»; деплой — ПО ДЖОБУ (`TD-230`); переменных `HFT_WATCHDOG_ROOT` / `HFT_WATCHDOG_DST` / `WATCHDOG_BIN` нет в `/etc/cron.d/hft-watchdog` и `/etc/environment` (`grep -c` → 0, `A-046` E4) | reviewer | `verify` SKIP-шаг + `R-NNN` |
 
 ## 9. RED — `scripts/tests/red_m93_watchdog_delivery.sh`
