@@ -79,12 +79,17 @@ RETENTION_WORK_DIR="${RETENTION_WORK_DIR:-/var/lib/hft/retention-work}"
 # НЕДОСТАТОЧЕН (A-045 §2.1: `c4` сравнивает базовые имена). Записи прошлых прогонов
 # не перезаписываются; недоступность носителя ⇒ apply НЕ зовётся.
 RETENTION_AUDIT_DIR="${RETENTION_AUDIT_DIR:-/var/lib/hft/prune-audit}"
-# M-92 (A-044 §5.1, §4 п.2): шов для гейта и прод-пути. Дефолт — SSH-команда, считающая
-# `sha256sum` на СТОРОНЕ офсайт-копии (Storage Box). Префикс `journal/` снимается скриптом —
-# см. §4 п.2: «префикс `journal/` снимается» относится к ВЫВОДУ команды, не к её аргументам.
-# Команда получает `journal/<имя>` (как на проде), выводит `<sha>  journal/<имя>` (как
-# `sha256sum` — два пробела), скрипт срезает префикс перед записью в манифест.
-RETENTION_REMOTE_SHA_CMD="${RETENTION_REMOTE_SHA_CMD:-ssh -i ${JOURNAL_OFFSITE_SSH_KEY:?JOURNAL_OFFSITE_SSH_KEY must be set} -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=10 -p ${JOURNAL_OFFSITE_SSH_PORT:-23} ${JOURNAL_OFFSITE_DST:?JOURNAL_OFFSITE_DST must be set} sha256sum}"
+# M-92 D5c (задача 3, узкая доработка): дефолт `RETENTION_REMOTE_SHA_CMD` раскрывал
+# `${JOURNAL_OFFSITE_SSH_KEY:?…}` и `${JOURNAL_OFFSITE_DST:?…}` ДО определения `alert()` —
+# при отсутствии настройки `set -u` ронял скрипт на unset-переменной МОЛЧА (exit=1 без
+# записи в `ALERT_FILE`/syslog/stderr). Сломанная настройка оставалась НЕВИДИМОЙ оператору
+# и монитору — ровно тот класс «объявлено ≠ работает» (OPS-I-8), который verify_delivery_M-08
+# шаг D5c и ловит. Контракт (M-92 §4 п.1–2, инвариант `JR-I-13` в `docs/fa/journal.md`):
+# либо задан `RETENTION_REMOTE_SHA_CMD` (операторская команда, считающая суммы на УДАЛЁННОЙ
+# стороне — Storage Box), либо оба `JOURNAL_OFFSITE_SSH_KEY` и `JOURNAL_OFFSITE_DST` (дефолт
+# собирается из них). Без этого бинарь не зовётся даже в `dry-run` (dry-run всё равно дёргает
+# `RETENTION_REMOTE_SHA_CMD` ради манифеста — без настройки манифест пуст, а бинарь с пустым
+# манифестом отказывает: `b1`/`b2`). Поднимаем алерт и выходим ДО раскрытия `${:?}`.
 LOG="${RETENTION_LOG:-/var/log/hft/journal-retention.log}"
 # Маркер для ВНЕШНЕГО монитора (zabbix/nagios пингуют файл): есть → последний прогон упал.
 ALERT_FILE="${RETENTION_ALERT_FILE:-/var/lib/hft/retention.alert}"
@@ -93,8 +98,7 @@ ALERT_FILE="${RETENTION_ALERT_FILE:-/var/lib/hft/retention.alert}"
 # пишем сюда UTC-таймстамп; внешний монитор алертит по СВЕЖЕСТИ (старше ~26 ч = cron не
 # отработал). Имя env-var — КОНТРАКТ гейта D9, не менять без обновления verify_delivery_M-08.sh.
 LAST_SUCCESS="${RETENTION_LAST_SUCCESS:-/var/lib/hft/retention.last-success}"
-
-mkdir -p "$(dirname "${LOG}")" "$(dirname "${ALERT_FILE}")" "$(dirname "${LAST_SUCCESS}")" "${RETENTION_WORK_DIR}" 2>/dev/null || true
+mkdir -p "$(dirname "${LOG}")" "$(dirname "${ALERT_FILE}")" "$(dirname "${LAST_SUCCESS}")" 2>/dev/null || true
 
 alert() { # exit≠0 обязан быть ВИДЕН: молчащая уборка = TD-020 на третьем витке
   local msg="$1"
@@ -103,6 +107,31 @@ alert() { # exit≠0 обязан быть ВИДЕН: молчащая убор
   { date -u +%Y-%m-%dT%H:%M:%SZ; echo "${msg}"; } > "${ALERT_FILE}" 2>/dev/null || true
   echo "ALERT ${msg}" >&2
 }
+
+# M-92 D5c: видимость сломанной настройки. Условие — НЕ задан `RETENTION_REMOTE_SHA_CMD` И
+# при этом отсутствует хотя бы один из `JOURNAL_OFFSITE_SSH_KEY` или `JOURNAL_OFFSITE_DST`.
+# `set -u` тут не выстрелит (проверка через `${VAR:-}`); `apply` И `dry-run` дальше НЕ идут —
+# `exit 2` (конфиг-ошибка, отличимо от `1=arg/io` бинаря и `3=disk_pressure`). После этого
+# гейт D5c ждёт: `exit≠0` И `ALERT_FILE` непуст. `HFT_CRON_PRINT_ARGV`/`RETENTION_PRINT_ARGV`
+# обработаны ВЫШЕ отдельной веткой и до этой проверки не доходят — канарейка M-48 не страдает.
+if [ -z "${RETENTION_REMOTE_SHA_CMD:-}" ] \
+   && { [ -z "${JOURNAL_OFFSITE_SSH_KEY:-}" ] || [ -z "${JOURNAL_OFFSITE_DST:-}" ]; }; then
+  alert "нет настройки офсайт-копии: задайте RETENTION_REMOTE_SHA_CMD или оба JOURNAL_OFFSITE_SSH_KEY и JOURNAL_OFFSITE_DST — apply/dry-run НЕ зовутся (M-92 D5c)"
+  exit 2
+fi
+
+# M-92 (A-044 §5.1, §4 п.2): шов для гейта и прод-пути. Дефолт — SSH-команда, считающая
+# `sha256sum` на СТОРОНЕ офсайт-копии (Storage Box). Префикс `journal/` снимается скриптом —
+# см. §4 п.2: «префикс `journal/` снимается» относится к ВЫВОДУ команды, не к её аргументам.
+# Команда получает `journal/<имя>` (как на проде), выводит `<sha>  journal/<имя>` (как
+# `sha256sum` — два пробела), скрипт срезает префикс перед записью в манифест.
+# `?:` сняты: к этой строке `JOURNAL_OFFSITE_SSH_KEY` и `JOURNAL_OFFSITE_DST` ГАРАНТИРОВАННО
+# непусты (проверено строкой выше) — иначе скрипт уже ушёл в `exit 2` через `alert`.
+RETENTION_REMOTE_SHA_CMD="${RETENTION_REMOTE_SHA_CMD:-ssh -i ${JOURNAL_OFFSITE_SSH_KEY} -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=10 -p ${JOURNAL_OFFSITE_SSH_PORT:-23} ${JOURNAL_OFFSITE_DST} sha256sum}"
+# Рабочий каталог плана/манифеста — отдельным `mkdir` ПОСЛЕ дефолта `${RETENTION_WORK_DIR}`
+# (раньше был в одной строке с LOG/ALERT_FILE/LAST_SUCCESS, но сейчас те — выше, до
+# `RETENTION_WORK_DIR`).
+mkdir -p "${RETENTION_WORK_DIR}" 2>/dev/null || true
 
 # M-92 (A-044 §5.1, §4 п.3): режим — ТОЛЬКО из файла-переключателя. RETENTION_MODE в env
 # (включая строку `RETENTION_MODE=dry-run` в `/etc/cron.d/journal-retention`) НЕ управляет
