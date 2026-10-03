@@ -28,11 +28,28 @@ DRY="${VERIFY_M92_CI_DRY:-0}"
 
 if [ "$DRY" != "1" ]; then
 # --- task1-3: оракулы предмета (библиотека, бинарь, прод-путь cron'а)
-run_step "task1-3: red_m92_manifest_prune (p1-p9, b1-b2, c0-c5)" \
+run_step "task1-3: red_m92_manifest_prune (p1-p11, b1-b2, c0-c5)" \
   cargo test -p journal --test red_m92_manifest_prune
 # --- task1: прежние оракулы ретеншена не сломаны (отбор кандидатов — один источник)
 run_step "task1: red_retention + red_retention_checkpoint_coverage + red_retention_compacted + red_retention_operator" \
   cargo test -p journal --test red_retention --test red_retention_checkpoint_coverage --test red_retention_compacted --test red_retention_operator
+# --- task1: типовой барьер на манифестном пути (R-217 Б-2, спека §4). Удаление — ТОЛЬКО через
+# prune_segment(seg, ColdCopyProof); доказательство чеканится ВНЕ тела функции (приватный конструктор
+# в функции сверки с манифестом). Чёрный ящик этого не видит — поэтому текстовая проверка тела
+# (комментарии вырезаны: в них законно упоминается remove_file). Предел назван: проверка по тексту,
+# переименованный вызов или макрос её обойдут — бэкстоп reviewer'а.
+body="$(awk '/^pub fn retention_execute_with_manifest\(/{f=1} f{print} f&&/^}/{exit}' crates/journal/src/segments.rs | sed -E 's://.*$::')"
+if [ -z "$body" ]; then
+  fail "task1-proof: тело retention_execute_with_manifest не найдено в crates/journal/src/segments.rs"
+elif printf '%s\n' "$body" | grep -q 'remove_file'; then
+  fail "task1-proof: retention_execute_with_manifest удаляет напрямую (remove_file) — в обход ColdCopyProof (R-217 Б-2)"
+elif ! printf '%s\n' "$body" | grep -q 'prune_segment('; then
+  fail "task1-proof: retention_execute_with_manifest не зовёт prune_segment(seg, proof) (R-217 Б-2)"
+elif printf '%s\n' "$body" | grep -q 'ColdCopyProof *{'; then
+  fail "task1-proof: ColdCopyProof чеканится прямо в теле удаления — доказательство обязано выдаваться функцией сверки (R-217 Б-2)"
+else
+  pass "task1-proof: удаление на манифестном пути — только prune_segment(seg, ColdCopyProof)"
+fi
 # --- task3: контракт HFT_CRON_PRINT_ARGV и композиция покрытия (M-48)
 run_step "task3: verify_M-48.sh" bash scripts/verify_M-48.sh
 # --- task5: инвариант удаления в описании модуля журнала
