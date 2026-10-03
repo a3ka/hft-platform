@@ -2078,12 +2078,14 @@ pub mod server {
     {
         // M-91 (задача 1, §1, §3): попытка зарегистрирована на ВХОДЕ legacy-сессии,
         // ДО проверки готовности — симметрично с v1-путём (`handle_v1_message`,
-        // строка 1105): «иначе C6 «попытка не выросла» краснеет на refused-запросах».
+        // ДВА `inc_attempts`: :1172 в ветке С `policy`, ДО `admit`; :1293 в
+        // bind-пути БЕЗ `policy`, ДО `readiness` — `admit` там не зовётся).
+        // «Иначе C6 «попытка не выросла» краснеет на refused-запросах».
         // Без этой строки успешные legacy-сессии (с `wsprobe` — единственный реальный
         // клиент) и refused-сессии (`not_ready`) оба не двигают `attempts`, и правило
-        // тишины `OPS-I-8` (built on DEFENSE `attempts > 0 ∧ successes == 0 ∧ refusals_supported > 0`)
-        // не срабатывает на реальном трафике (замер TD-228: attempts:0, successes:0
-        // на УСПЕШНЫЕ подписки, байты при этом +583 МБ).
+        // тишины `OPS-I-11` (на дельтах heartbeat'а: `Δattempts > 0 ∧ Δrefusals_supported > 0
+        // ∧ Δsuccesses == 0`) не срабатывает на реальном трафике (замер TD-228: attempts:0,
+        // successes:0 на УСПЕШНЫЕ подписки, байты при этом +583 МБ).
         metrics::inc_attempts(counters.as_ref());
         // M-87 (предохранитель выдачи, спека §4): legacy-путь тоже проверяет
         // ГОТОВНОСТЬ состояния ДО `spawn_blocking` — иначе тихий rebuild на
@@ -2143,9 +2145,9 @@ pub mod server {
         if !matches!(ready_outcome, super::admission::ServingOutcome::Ready) {
             // M-91 (задача 1, §3, §1 I-2 / I-3bis): ЛЮБОЙ исход готовности, отличный
             // от `Ready`, — `refusals_supported`, как в v1-пути (`handle_v1_message`,
-            // строки 1121/1161/1196/1261). Legacy-путь селектор не выбирает ⇒
-            // `refusals_unsupported` у него не возникает. «Считать отказом только
-            // `NotReady`» — мутант, который роняет `l4` (`C-269`).
+            // ветки `ServingOutcome::*` вокруг `admit`/`readiness`). Legacy-путь
+            // селектор не выбирает ⇒ `refusals_unsupported` у него не возникает.
+            // «Считать отказом только `NotReady`» — мутант, который роняет `l4` (`C-269`).
             metrics::inc_refusals_supported(counters.as_ref());
             let code = match ready_outcome {
                 super::admission::ServingOutcome::Warming => "warming",
@@ -2370,13 +2372,20 @@ pub mod server {
             .await
             .map_err(|e| std::io::Error::other(format!("ws send snapshot: {e}")))?;
         // M-91 (задача 1, §1 I-1, §3, §5): успех засчитан ПОСЛЕ отправки снимка,
-        // не раньше — симметрично с v1-путём (`handle_v1_message`, строки 1410, 1558).
-        // До этой строки счётчик рос ДО фактической отдачи снимка: отключившийся
-        // клиент всё равно считался «успехом», и правило тишины OPS-I-8 не
-        // ловило «клиент получил запрос, но не дождался снимка». Сейчас: `send`
-        // вернул `Ok` ⇒ клиент снимок получил (legacy-путь не поддерживает
-        // ping-keepalive после снимка, сессия завершается на push-loop); счётчик
-        // отражает ФАКТ доставки, не намерение.
+        // не раньше — симметрично с v1-путём (`handle_v1_message`, ADD/SWITCH
+        // на :1625/:1477). ОБА `inc_successes` v1 стоят после
+        // `sink.send(...).await` и ВНЕ `spawn_blocking`; внутри `spawn_blocking`
+        // после `resume` живёт `add_journal_payload_bytes` (:1555/:1405), и v1 на
+        // :1615-1621 прямо запрещает дублировать там `successes` (двойной счёт).
+        // Здесь `send` вернул `Ok` ⇒ кадр сдан в сокет ОС (legacy-путь не
+        // поддерживает ping-keepalive после снимка, сессия уходит в push-loop);
+        // счётчик отражает ФАКТ сдачи кадра в сокет, не намерение.
+        // Контракт «кадр в сокете» ≠ «клиент прочтёт» на не-ping'уемой сессии:
+        // доставка может быть прервана стоком/peer reset'ом. Рабочий признак
+        // доставки — `frames_received` на стороне зонда (TD-236 (б));
+        // если когда-нибудь понадобится жёсткая гарантия не-ping'уемой сессии —
+        // ack-кадр от клиента и инкремент `successes` ТОЛЬКО по нему (отдельная
+        // задача, не в скоупе TD-236).
         metrics::inc_successes(counters.as_ref());
 
         // (6b) Push-loop: `LiveReducer::pump` от последнего курсора (M-53/TD-083 — вместо
