@@ -12,7 +12,7 @@
 # Круг 2 (`C-277` B-1): заглушка `docker` отдаёт СЛУЧАЙНЫЙ на каждый прогон образ работающего
 # `hft-recorder`; любой другой образ (захардкоженный, `:latest`, чужой контейнер) даёт ЧУЖОЙ бинарь —
 # поэтому `w2` доказывает поток «inspect(работающий) → create → cp», а не совпадение литерала.
-# Путь назначения по умолчанию проверяется НАСТОЯЩЕЙ записью (`w1b`), а не только веткой печати.
+# Путь назначения по умолчанию проверяется НАСТОЯЩЕЙ записью под корнем установки (`w1b`, `C-278` B-3).
 # У каждой песочницы — страж подготовки: PATH выбирает именно заглушку.
 #
 # Число сценариев НЕ заявляется — считается и печатается.
@@ -80,21 +80,23 @@ else
   nope "w1 композиция: установка печатает «$dst», cron зовёт «$bin» (обязаны совпасть, абсолютный путь вне target/)"
 fi
 
-# w1b — путь по умолчанию в НАСТОЯЩЕМ режиме (без HFT_WATCHDOG_DST): заглушка `cp` записывает
-# аргументы и отказывает — назначение временного файла обязано лежать рядом с путём cron'а и
-# называться от него (`<путь>.…`). Запись не происходит: отказ `cp` — штатный путь `w3`.
+# w1b — путь по умолчанию в НАСТОЯЩЕМ режиме (без HFT_WATCHDOG_DST/WATCHDOG_BIN), самодостаточно и без
+# привилегий (`C-278` B-3): корень установки `HFT_WATCHDOG_ROOT` (по умолчанию пуст — на проде путь не
+# меняется) читают ОБА — установка и cron. В песочнице установка реально пишет бинарь под корень, а cron
+# печатает ТОТ ЖЕ путь; файл по пути cron'а обязан быть бинарём образа. Мутант «печать — новый путь,
+# запись — старый» кладёт файл мимо (или падает на правах) ⇒ FAIL.
 d="$SANDBOX/w1b"
 if mk_stub "$d"; then
-  : > "$d/log"
-  rc="$( PATH="$d/bin:$PATH" STUB_LOG="$d/log" STUB_FAIL=cp STUB_IMG="sha256:run1b" \
-         STUB_BIN="$d/fixture-bin" FOREIGN_BIN="$d/foreign-bin" env -u HFT_WATCHDOG_DST \
-         bash "$INSTALL" >"$d/out" 2>&1; echo $? )"
-  cpdst="$(awk '$1=="cp"{print $3}' "$d/log" 2>/dev/null | head -1)"
-  if [ -n "$bin" ] && [ -n "$cpdst" ] && [ "$(dirname "$cpdst")" = "$(dirname "$bin")" ] \
-     && [ "${cpdst#"$bin"}" != "$cpdst" ]; then
-    ok "w1b путь по умолчанию в настоящем режиме: временный файл $cpdst рядом с путём cron'а"
+  : > "$d/log"; mkdir -p "$d/root"
+  rc="$( PATH="$d/bin:$PATH" STUB_LOG="$d/log" STUB_IMG="sha256:run1b$RANDOM" \
+         STUB_BIN="$d/fixture-bin" FOREIGN_BIN="$d/foreign-bin" HFT_WATCHDOG_ROOT="$d/root" \
+         env -u HFT_WATCHDOG_DST bash "$INSTALL" >"$d/out" 2>&1; echo $? )"
+  cbin="$( HFT_WATCHDOG_ROOT="$d/root" env -u WATCHDOG_BIN WATCHDOG_PRINT_BIN=1 bash "$CRON" 2>/dev/null )"
+  if [ "$rc" = 0 ] && [ -n "$cbin" ] && [ "${cbin#"$d/root"/}" != "$cbin" ] && cmp -s "$cbin" "$d/fixture-bin" \
+     && [ "${bin#*/target/}" = "$bin" ] && [ "${cbin#"$d/root"}" = "$bin" ]; then
+    ok "w1b путь по умолчанию в настоящем режиме: установка записала, cron зовёт тот же файл (${cbin#"$d/root"})"
   else
-    nope "w1b путь по умолчанию в настоящем режиме: cp пишет в «$cpdst», cron зовёт «$bin» (exit=$rc)"
+    nope "w1b путь по умолчанию в настоящем режиме: exit=$rc, cron под корнем зовёт «$cbin», без корня — «$bin»; $(head -c 200 "$d/out" 2>/dev/null)"
   fi
 else nope "w1b SETUP: заглушка docker не выбрана PATH'ом"; fi
 
