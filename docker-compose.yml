@@ -50,41 +50,52 @@ services:
       retries: 3
       start_period: 15s
 
-  # D2 + D3: ops-профиль. Не поднимается без `--profile ops`. Тег/образ — тот же
-  # (D1: один образ, чтобы wire-format всегда один). Том journal-data общий с recorder'ом
-  # (R/W не нужен для dry-run — достаточно RO; для apply нужно W на upload в /cold).
+  # D2 + M-92 (R-180 F-1, A-044 §5.1): ops-профиль. Не поднимается без `--profile ops`.
+  # Тег/образ — тот же (D1: один образ, чтобы wire-format всегда один). Том journal-data
+  # общий с recorder'ом — apply удаляет сегменты локально (R/W); `/cold` НЕ монтируется
+  # (механизм «скопируй-и-сверь» тождественен и был отвергнут R-180 F-1; теперь
+  # удаление — только по сверке локальной sha256 с суммой, посчитанной НА СТОРОНЕ
+  # офсайт-копии через `--cold-manifest`). Точка входа — бинарь; argv по умолчанию —
+  # dry-run (D4: первый прогон на проде = dry-run). Скрипт cron'а зовёт
+  # `docker compose run --rm journal-retention` с СВОИМ argv, заменяющим `command:`.
   journal-retention:
     image: hft-platform-recorder:local
     container_name: hft-journal-retention
     profiles: ["ops"]
-    # По умолчанию — dry-run (D4: первый прогон на проде = dry-run). Оператор переопределяет
-    # entrypoint/args при ручном запуске apply: `docker compose run --rm journal-retention
-    # --mode apply ...` (см. deploy/README.md).
+    # Точка входа — бинарь. Скрипт cron'а передаёт свой argv через
+    # `docker compose run --rm journal-retention …`; дефолтный `command:` ниже —
+    # для ручного `--help` / `docker compose run --rm journal-retention` без argv.
     entrypoint: ["/usr/local/bin/journal-retention"]
     command:
       - --dir=/journal
-      # D3: --cold пробрасывается через JOURNAL_COLD_DIR (host → /cold). Хранилище
-      # монтируется на ХОСТЕ в JOURNAL_COLD_DIR (по умолчанию /mnt/journal-cold) и
-      # bind-mount'ится сюда. На Storage Box обычно CIFS — fstab в deploy/README.md.
-      - "--cold=${JOURNAL_COLD_DIR:-/cold}"
       - --retain-days=${RETENTION_RETAIN_DAYS:-14}
       - --keep-min=${RETENTION_KEEP_MIN:-4}
       - --min-free-gb=${RETENTION_MIN_FREE_GB:-10}
       - --mode=dry-run
-    environment:
-      # JOURNAL_COLD_DIR задаётся в .env на хосте (или export'ится) — путь к bind-mount
-      # холодного хранилища. По умолчанию /mnt/journal-cold (CIFS Storage Box, см. D6).
-      JOURNAL_COLD_DIR: ${JOURNAL_COLD_DIR:-/mnt/journal-cold}
+      # M-48 (TD-048, GW-I-12): артефакт покрытия, который пишет `gateway-checkpoint`.
+      # Пробрасывается ДЕФОЛТОМ, чтобы ручной `docker compose run --rm journal-retention`
+      # тоже видел покрытие (без него — fail-closed no-op).
+      - --checkpoint-coverage=/ckpt/covered_through_seq
+    # M-92: переменная JOURNAL_COLD_DIR УБРАНА — путь «verify_cold_copy» (тождественная
+    # сверка) отвергнут R-180 F-1. Суммы приходят через `--cold-manifest`,
+    # подготовленный скриптом cron'а (см. deploy/bin/journal-retention-cron.sh §4 п.2).
     volumes:
-      # Тот же том, что у recorder'а: dry-run читает, apply читает+пишет в /cold.
-      # На проде том всегда RO для retention-сервиса, чтобы apply не словил гонку с
-      # recorder'ом (хотя mutex через сегменты обеспечивает и сама логика prune —
-      # только сегменты НЕ-активные).
-      - journal-data:/journal:ro
-      # D3: bind-mount холодного хранилища. Если JOURNAL_COLD_DIR не существует на
-      # хосте — `docker compose run` упадёт с ошибкой монтирования ДО старта бинаря
-      # (явный fail-closed: легче заметить, чем тихо получить exit 2 в логе cron).
-      - "${JOURNAL_COLD_DIR:-/mnt/journal-cold}:/cold"
+      # M-92: журнал подключён С ПРАВОМ ЗАПИСИ — apply удаляет сегменты. На проде это
+      # безопасно по построению: recorder пишет в АКТИВНЫЙ сегмент (максимальный индекс),
+      # retention трогает только неактивные (`I-2ter`/`I-2bis`); реконструкция по
+      # `journal::stream` после удаления — сплошной суффикс каталога.
+      - journal-data:/journal
+      # M-48 (GW-I-12): RO-bind к чекпоинт-тому — `covered_through_seq`. Retention
+      # только читает покрытие; единственный писатель артефакта — `gateway-checkpoint`
+      # (ops-сервис ниже). Без этого volume retention видит пустое покрытие ⇒
+      # fail-closed no-op.
+      - gateway-ckpt:/ckpt:ro
+      # M-92 (§4 п.1–2): bind-mount рабочего каталога хоста, в который скрипт cron'а
+      # пишет `plan.txt`, `manifest.txt`, `bin-output.txt`. Источник — env-переменная
+      # `RETENTION_WORK_DIR` (по умолчанию `/var/lib/hft/retention-work`); оператор
+      # создаёт каталог заранее (`install -d`). Без этого тома `docker compose run`
+      # упадёт с ошибкой монтирования ДО старта бинаря (явный fail-closed).
+      - "${RETENTION_WORK_DIR}:/work"
     # Контейнер одноразовый — без restart; запускается по cron или вручную оператором.
 
   # D-COMP-3 (M-08 task 16, TD-022): компакция закрытых сегментов (zstd) — ОТДЕЛЬНЫЙ

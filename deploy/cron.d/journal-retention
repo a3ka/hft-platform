@@ -19,13 +19,20 @@
 #   - алерт на exit≠0: `logger -p user.err` (syslog/journald) + маркер-файл
 #     /var/lib/hft/retention.alert для внешнего монитора; успешный прогон маркер гасит.
 #
-# Apply — ВРУЧНУЮ, после визуального разбора отчёта dry-run'а:
-#     docker compose run --rm journal-retention --mode apply
+# Apply — ТОЛЬКО через файл-переключатель (M-92, A-044 §5.1, П-031):
+#     echo apply > /var/lib/hft/retention.mode
+#   Включение — отдельное осознанное действие оператора (или architect'а по П-031)
+#   ПОСЛЕ стабильных dry-run'ов И проверки аудит-следа. `RETENTION_MODE` ниже
+#   — декоративная строка, скрипт cron'а её ИГНОРИРУЕТ (cron-файл перезаписывается
+#   каждым кодовым деплоем; 2026-09-23 так была стёрта строка `CHECKPOINT_BANDS` —
+#   деплой не смеет включать apply). Снятие:
+#     : > /var/lib/hft/retention.mode
+#   или `rm /var/lib/hft/retention.mode`.
 #
 # Установка:
 #   sudo install -m 0755 deploy/bin/journal-retention-cron.sh /root/hft-platform/deploy/bin/
 #   sudo install -m 0644 deploy/cron.d/journal-retention /etc/cron.d/hft-journal-retention
-#   sudo install -d /var/log/hft /var/lib/hft
+#   sudo install -d /var/log/hft /var/lib/hft /var/lib/hft/retention-work /var/lib/hft/prune-audit
 # Проверка ДО установки (ровно это делает гейт D5):
 #   crontab -n deploy/cron.d/journal-retention   → exit 0
 # Удаление (revoke):
@@ -34,13 +41,35 @@
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 HFT_ROOT=/root/hft-platform
-JOURNAL_COLD_DIR=/mnt/journal-cold
+# M-92 (A-044 §5.1, §4 п.2): SSH-доступ к Storage Box. `JOURNAL_OFFSITE_SSH_KEY` —
+# приватный ключ (mode 0600, root:root); `JOURNAL_OFFSITE_SSH_PORT` — порт SSH Storage Box'а
+# (23 по умолчанию); `JOURNAL_OFFSITE_DST` — user@host субаккаунта. Дефолтный
+# `RETENTION_REMOTE_SHA_CMD` в deploy/bin/journal-retention-cron.sh использует именно их.
+JOURNAL_OFFSITE_SSH_KEY=/root/.ssh/storagebox
+JOURNAL_OFFSITE_SSH_PORT=23
+JOURNAL_OFFSITE_DST=u659392-sub1@u659392-sub1.your-storagebox.de
 RETENTION_RETAIN_DAYS=14
 RETENTION_KEEP_MIN=4
 RETENTION_MIN_FREE_GB=10
+# M-92: декоративная строка, скрипт cron'а ИГНОРИРУЕТ (см. комментарий выше и
+# deploy/bin/journal-retention-cron.sh `read_mode`). Служит только для grep-видимости
+# «по cron'у не apply» при аудите deploy.yml. Управление режимом — файл-переключатель
+# `RETENTION_MODE_FILE` ниже.
 RETENTION_MODE=dry-run
 RETENTION_LOG=/var/log/hft/journal-retention.log
 RETENTION_ALERT_FILE=/var/lib/hft/retention.alert
+# M-92: рабочий каталог плана и манифеста на ХОСТЕ; bind-mount'ится в контейнер как /work
+# (см. docker-compose.yml сервис journal-retention). Скрипт пишет сюда plan.txt/manifest.txt;
+# compose читает `RETENTION_WORK_DIR` из окружения.
+RETENTION_WORK_DIR=/var/lib/hft/retention-work
+# M-92: аудит-след — три записи на прогон (план, манифест, отчёт) с уникальными
+# БАЗОВЫМИ именами, плоско. Подкаталог на прогон НЕДОСТАТОЧЕН (A-045 §2.1, c4).
+# Носитель недоступен ⇒ apply НЕ зовётся (A-044 O-3b, c5).
+RETENTION_AUDIT_DIR=/var/lib/hft/prune-audit
+# M-92: файл-переключатель режима. Содержимое `apply` ⇒ apply; пусто/иное/нет файла ⇒ dry-run.
+# Создаётся и удаляется ТОЛЬКО оператором (или architect'ом по П-031); ни код, ни деплой
+# его не создают — иначе деплой мог бы случайно включить удаление.
+RETENTION_MODE_FILE=/var/lib/hft/retention.mode
 # D-COMP-3 (M-08 task 16, TD-022): компакция закрытых сегментов — отдельное расписание,
 # НЕ коллидирующее по времени с ретеншеном (оба пишут в /journal; 03:50 UTC — за 17 минут
 # ДО ретеншена, чтобы fsync-волна компакции не наложилась на ретеншен-выгрузку).
