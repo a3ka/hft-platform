@@ -44,7 +44,7 @@
 //! # Чего оракул НЕ ловит
 //!
 //! · путь читателя (ops) — `crates/ops/tests/red_m89_serving_silence.rs`; композиция
-//!   «куда пишет compose ↔ откуда читает cron» — шаг `scripts/verify_M-89.sh`;
+//!   «куда пишет compose ↔ откуда читает cron» — шаг вынесенного гейта `docs/archive/verify_M-89.sh`;
 //! · установку cron на VPS — это §8-гейт и founder ★ (`deploy/README.md`);
 //! · правдивость `freshness` — её позиции судит `C9` `M-87`.
 //!
@@ -388,7 +388,7 @@ fn compose_top_level_volumes() -> Vec<String> {
     out
 }
 
-/// Хост-путь именованного тома docker'а (та же формула, что у `verify_M-89.sh` шаг task11
+/// Хост-путь именованного тома docker'а (та же формула, что у шага task11 вынесенного гейта `docs/archive/verify_M-89.sh`
 /// и у `deploy/cron.d/journal-retention` для `journal-data`).
 fn host_path_of(vol: &str, rel: &str) -> String {
     format!("/var/lib/docker/volumes/hft-platform_{vol}/_data/{rel}")
@@ -460,7 +460,7 @@ fn h0_compose_declares_heartbeat_file_path_on_a_writable_declared_mount() {
         "I-6: период сердцебиения {ms} мс — обязан быть положительным"
     );
     // Композиция с читателем: хост-путь тома == путь cron'а (та же проверка — шаг task11
-    // `verify_M-89.sh`; здесь она в форме оракула, чтобы `cargo test` её тоже видел).
+    // `docs/archive/verify_M-89.sh`; здесь она в форме оракула, чтобы `cargo test` её тоже видел).
     let cron = repo_root().join("deploy/cron.d/watchdog");
     let cron_text = std::fs::read_to_string(&cron).unwrap_or_else(|e| {
         panic!(
