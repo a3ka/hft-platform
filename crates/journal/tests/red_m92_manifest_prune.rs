@@ -180,12 +180,20 @@ fn guard_untouched(w: &World) {
 /// из шести, самый старый оставлен) молча отдал 562 события с одним разрывом нумерации, без ошибки —
 /// дыра в истории выдавалась бы за непрерывную историю.
 fn assert_contiguous(dir: &Path, ctx: &str) {
-    let mut idx: Vec<u32> = journal::list_segments(dir)
-        .unwrap()
+    // Позиции — по ИМЕНИ `segment-NNNNNNNN.jrnl[.zst]`, заголовок не читается (как в спеке §4):
+    // испорченный файл занимает позицию, а `list_segments` на нём законно отказывает (`p10`).
+    let mut idx: Vec<u32> = names(dir)
         .iter()
-        .map(|s| s.index)
+        .filter_map(|n| {
+            n.strip_prefix("segment-")?
+                .split('.')
+                .next()?
+                .parse::<u32>()
+                .ok()
+        })
         .collect();
     idx.sort();
+    idx.dedup();
     assert!(
         idx.windows(2).all(|p| p[1] == p[0] + 1),
         "M-92 (JR-I-2): {ctx}: после удаления в каталоге дыра: {idx:?}"
@@ -233,6 +241,12 @@ fn p1_matching_manifest_prunes_exactly_the_plan() {
         r.failed
     );
     assert_eq!(r.pruned.len(), want.len());
+    // R-217 Н-2: на манифестном пути ничего не выгружается — «выгружено N» было бы ложью
+    assert!(
+        r.offloaded.is_empty(),
+        "M-92 (R-217 Н-2): offloaded = {:?} на пути без копирования",
+        r.offloaded
+    );
     // сплошной суффикс: оставшиеся индексы без дыр
     let mut idx: Vec<u32> = journal::list_segments(w.dir.path())
         .unwrap()
@@ -391,6 +405,99 @@ fn p9_middle_mismatch_prunes_exactly_the_older_prefix() {
     assert_eq!(r.pruned.len(), older.len());
     assert_contiguous(w.dir.path(), "p9");
     guard_untouched(&w);
+}
+
+/// **`p10` — граница удаления — КАТАЛОГ, а не план (`R-217` Б-1).** Сегмент с испорченным
+/// заголовком `retention_plan` не классифицирует и в план не берёт, а его старших И младших
+/// соседей — берёт. Обрыв «по плану» удалил бы младших и оставил дыру (проба `R-217`: каталог
+/// после — `[2,4,5]`, `failed = 0`). Позиции каталога — индексы ИМЁН сегментов, заголовок не
+/// читается: испорченный файл занимает позицию и обрывает удаление.
+#[test]
+fn p10_catalog_position_outside_plan_blocks_younger() {
+    let w = world(true);
+    let all: Vec<String> = names(w.dir.path()).into_iter().collect();
+    let bad = all[2].clone();
+    std::fs::write(w.dir.path().join(&bad), b"XXXX").unwrap();
+    let plan = journal::retention_plan(w.dir.path(), &w.pol, T0 + 100 * DAY_MS).expect("plan");
+    let want = plan_names(&plan);
+    assert!(
+        !want.contains(&bad)
+            && want.iter().any(|n| *n < bad)
+            && want.iter().any(|n| *n > bad),
+        "SETUP НЕ СОСТОЯЛСЯ: испорченный {bad} обязан выпасть из плана, а в плане — соседи с обеих сторон: {want:?}"
+    );
+    let before = names(w.dir.path());
+    let m = ColdManifest::parse(
+        &want
+            .iter()
+            .map(|n| manifest_line(w.dir.path(), n))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .expect("parse");
+    let r = journal::retention_execute_with_manifest(
+        w.dir.path(),
+        &plan,
+        &w.pol,
+        &m,
+        RetentionMode::Apply,
+    )
+    .expect("execute");
+    let gone: BTreeSet<String> = before.difference(&names(w.dir.path())).cloned().collect();
+    let older: BTreeSet<String> = want.iter().filter(|n| **n < bad).cloned().collect();
+    assert_eq!(
+        gone, older,
+        "M-92 (R-217 Б-1, JR-I-2): удалено не ровно то, что старше позиции {bad} вне плана"
+    );
+    assert_contiguous(w.dir.path(), "p10");
+    for n in want.iter().filter(|n| **n > bad) {
+        assert!(
+            r.failed
+                .iter()
+                .any(|(p, why)| p.ends_with(n) && why.contains("blocked-by")),
+            "M-92 (R-217 Б-1): младший {n} за позицией вне плана не назван в failed с blocked-by: {:?}",
+            r.failed
+        );
+    }
+    guard_untouched(&w);
+}
+
+/// **`p11` — `DryRun` предсказывает `Apply` (`R-217` Н-1).** Тот же манифест (копия СТАРЕЙШЕГО
+/// испорчена): множество имён в `failed` у пробного прогона РАВНО множеству у настоящего, на
+/// двух одинаково построенных журналах. Пробный прогон хеширует (чтение — не побочный эффект,
+/// `I-4`) и не удаляет ничего. Иначе задача 4(а) — «прогон прод-пути в dry-run» — показала бы
+/// «всё сходится» там, где `apply` не удалит ничего.
+#[test]
+fn p11_dry_run_failed_set_equals_apply() {
+    let failed_names = |mode: RetentionMode| {
+        let w = world(true);
+        let want = plan_names(&w.plan);
+        let victim = want.iter().next().unwrap().clone();
+        let before = names(w.dir.path());
+        let m =
+            ColdManifest::parse(&manifest_with_bad(w.dir.path(), &want, &victim)).expect("parse");
+        let r = journal::retention_execute_with_manifest(w.dir.path(), &w.plan, &w.pol, &m, mode)
+            .expect("execute");
+        if mode == RetentionMode::DryRun {
+            assert_eq!(names(w.dir.path()), before, "M-92: DryRun удалил файлы");
+        }
+        let set: BTreeSet<String> = r
+            .failed
+            .iter()
+            .map(|(p, _)| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        (set, want)
+    };
+    let (dry, want) = failed_names(RetentionMode::DryRun);
+    let (app, _) = failed_names(RetentionMode::Apply);
+    assert_eq!(
+        app, want,
+        "SETUP НЕ СОСТОЯЛСЯ: apply при испорченном старейшем обязан удержать весь план"
+    );
+    assert_eq!(
+        dry, app,
+        "M-92 (R-217 Н-1): failed пробного прогона расходится с настоящим"
+    );
 }
 
 /// **`p4` — манифест несёт ВЕРНЫЕ суммы активного и `keep_min`-сегментов: они не удаляются.**
