@@ -462,6 +462,91 @@ fn p10_catalog_position_outside_plan_blocks_younger() {
     guard_untouched(&w);
 }
 
+/// **`p12` — ИЗВЕСТНАЯ плану не-кандидатная позиция обрывает удаление (`R-221` Б-2, буква `I-2ter`).**
+/// Возрастной фильтр `retention_plan` не монотонен по индексу: решение берётся по биржевому
+/// времени ПЕРВОГО события сегмента. Если оно у среднего сегмента «свежее» соседей, план кладёт его
+/// в `skipped`, а старших И младших — в кандидаты. Пропуск такой позиции без обрыва удалил бы младших
+/// и оставил дыру (проба `R-221`: каталог после — `[2,4,5]`, `failed = 0`).
+#[test]
+fn p12_known_non_candidate_position_blocks_younger() {
+    // проход 1: те же события — узнать seq первого события сегмента 2
+    let probe = journal();
+    let mut segs = journal::list_segments(probe.path()).unwrap();
+    segs.sort_by_key(|s| s.index);
+    assert!(
+        segs.len() >= 5,
+        "SETUP НЕ СОСТОЯЛСЯ: сегментов {}",
+        segs.len()
+    );
+    let fresh_at = segs[2].header.first_seq - segs[0].header.first_seq;
+    // проход 2: тот же журнал, но первое событие сегмента 2 — «секунду назад» (ширина varint та же)
+    let dir = tempfile::tempdir().expect("dir");
+    let mut j = Journal::open_with(dir.path(), cfg()).expect("open_with");
+    for i in 0..N {
+        let ev = if i == fresh_at {
+            EventKind::md(
+                Venue::Binance,
+                "BTCUSDT",
+                MdPayload::Trade {
+                    price: contracts::to_fixed(65_000.0) + i as i64,
+                    size: contracts::to_fixed(0.01),
+                    side: Side::Buy,
+                    ts_exch_ms: T0 + 100 * DAY_MS - 1_000,
+                },
+            )
+        } else {
+            trade(i)
+        };
+        j.append(ev).expect("append");
+    }
+    j.flush().expect("flush");
+    drop(j);
+    let all: Vec<String> = names(dir.path()).into_iter().collect();
+    assert_eq!(
+        all,
+        names(probe.path()).into_iter().collect::<Vec<_>>(),
+        "SETUP НЕ СОСТОЯЛСЯ: разбиение на сегменты изменилось"
+    );
+    let fresh = all[2].clone();
+    let guard = tempfile::tempdir().expect("guard");
+    let pol = policy(guard.path(), Some(max_covered(dir.path())));
+    let plan = journal::retention_plan(dir.path(), &pol, T0 + 100 * DAY_MS).expect("plan");
+    let want = plan_names(&plan);
+    assert!(
+        !want.contains(&fresh)
+            && plan.skipped.iter().any(|(s, _)| s.path.ends_with(&fresh))
+            && want.iter().any(|n| *n < fresh)
+            && want.iter().any(|n| *n > fresh),
+        "SETUP НЕ СОСТОЯЛСЯ: {fresh} обязан быть в skipped плана, а кандидаты — по обе стороны: {want:?}"
+    );
+    let before = names(dir.path());
+    let m = ColdManifest::parse(
+        &want
+            .iter()
+            .map(|n| manifest_line(dir.path(), n))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .expect("parse");
+    let r =
+        journal::retention_execute_with_manifest(dir.path(), &plan, &pol, &m, RetentionMode::Apply)
+            .expect("execute");
+    let gone: BTreeSet<String> = before.difference(&names(dir.path())).cloned().collect();
+    let older: BTreeSet<String> = want.iter().filter(|n| **n < fresh).cloned().collect();
+    assert_eq!(
+        gone, older,
+        "M-92 (R-221 Б-2, I-2ter, JR-I-2): удалено не ровно то, что старше известной не-кандидатной позиции {fresh}"
+    );
+    assert_contiguous(dir.path(), "p12");
+    for n in want.iter().filter(|n| **n > fresh) {
+        assert!(
+            r.failed.iter().any(|(p, why)| p.ends_with(n) && why.contains("blocked-by")),
+            "M-92 (R-221 Б-2): младший {n} за позицией {fresh} не назван в failed с blocked-by: {:?}",
+            r.failed
+        );
+    }
+}
+
 /// **`p11` — `DryRun` предсказывает `Apply` (`R-217` Н-1).** Тот же манифест (копия СТАРЕЙШЕГО
 /// испорчена): множество имён в `failed` у пробного прогона РАВНО множеству у настоящего, на
 /// двух одинаково построенных журналах. Пробный прогон хеширует (чтение — не побочный эффект,
@@ -842,6 +927,20 @@ fn run_wrapper(
     }
     // подмены путей контейнера → фикстура, выведенные из томов сервиса
     let mut subst = String::new();
+    // R-221 Б-1: ИЗОЛЯЦИЯ ТОМОВ. Внутри контейнера видны только цели томов сервиса; путь хоста
+    // (`/var/lib/hft/...`), переданный в argv, в настоящем контейнере не существует. Заглушка
+    // исполняет бинарь на хосте, поэтому обязана ОТКАЗАТЬ на любом абсолютном пути вне целей томов
+    // — иначе она находит путь хоста там, где прод получит ENOENT (замер R-221: exit=1 на шаге 1).
+    let targets: Vec<String> = compose_volumes("journal-retention")
+        .into_iter()
+        .map(|(_, t, _)| t)
+        .collect();
+    let guard = format!(
+        "for a in \"$@\"; do v=\"$a\"; case \"$v\" in --*=*) v=\"${{v#*=}}\";; esac; \
+         case \"$v\" in /*) ok=0; for t in {t}; do case \"$v\" in \"$t\"|\"$t\"/*) ok=1;; esac; done; \
+         [ $ok = 1 ] || {{ echo \"run_wrapper: путь вне томов сервиса (в контейнере его нет): $a\" >&2; exit 97; }};; esac; done\n",
+        t = targets.join(" ")
+    );
     for (src, target, _ro) in compose_volumes("journal-retention") {
         let host = if src == "journal-data" {
             dir.to_path_buf()
@@ -866,12 +965,14 @@ fn run_wrapper(
         format!(
             "#!/bin/bash\n# заглушка docker compose run: до имени сервиса — опции compose\n\
              while [ $# -gt 0 ] && [ \"$1\" != journal-retention ]; do shift; done; shift\n\
+             {guard}\
              args=(); for a in \"$@\"; do {subst}args+=(\"$a\"); done\n\
              # A-044 O-3(a): при --mode apply ДО exec снимок каталога аудита и потребляемого манифеста\n\
              apply=0; man=; prev=; for a in \"${{args[@]}}\"; do case \"$a\" in --mode=apply) apply=1;; --cold-manifest=*) man=\"${{a#--cold-manifest=}}\";; esac; [ \"$prev\" = --mode ] && [ \"$a\" = apply ] && apply=1; [ \"$prev\" = --cold-manifest ] && man=\"$a\"; prev=\"$a\"; done\n\
              if [ $apply = 1 ]; then rm -rf {snap}; mkdir -p {snap}; cp -r {audit}/. {snap}/ 2>/dev/null; [ -n \"$man\" ] && cp \"$man\" {consumed}; fi\n\
              exec {bin} \"${{args[@]}}\" --now-wall-ms={now}\n",
             bin = BIN,
+            guard = guard,
             now = T0 + 100 * DAY_MS,
             snap = work.join("audit-at-apply").display(),
             consumed = work.join("manifest-consumed").display(),
@@ -883,8 +984,10 @@ fn run_wrapper(
     std::fs::write(
         &remote,
         format!(
-            "#!/bin/bash\n# «коробка»: аргументы вида journal/<имя>, суммы по КОПИИ, вывод как у sha256sum\n\
-             cd {r} && for a in \"$@\"; do sha256sum \"${{a#journal/}}\" | sed 's#  #  journal/#'; done\n",
+            "#!/bin/bash\n# «коробка»: аргументы вида journal/<имя>, суммы по КОПИИ — ОДНИМ вызовом, как настоящий\n\
+             # `sha256sum a b c`: отсутствующий файл — строка в stderr, остальные напечатаны, выход 1 (R-221 Н-1)\n\
+             cd {r} || exit 255; n=(); for a in \"$@\"; do n+=(\"${{a#journal/}}\"); done\n\
+             sha256sum \"${{n[@]}}\" | sed 's#  #  journal/#'; exit ${{PIPESTATUS[0]}}\n",
             r = remote_copy.display()
         ),
     )
@@ -1355,5 +1458,64 @@ fn c5_no_audit_no_delete() {
     assert!(
         work.path().join("retention.alert").exists(),
         "M-92 (A-044 O-3b): тревога при недоступном аудите не записана: {out}"
+    );
+}
+
+/// **`c6` — нет копии ОДНОГО сегмента на коробке: прогон НЕ обрывается целиком (`R-221` Н-1, `I-2`).**
+/// Настоящий `sha256sum a b c` при отсутствии части файлов печатает остальные и выходит 1. Скрипт
+/// обязан отличать это от отказа связи и довести дело до бинаря: старшие сверенные удаляются,
+/// отсутствующий (самый молодой кандидат) остаётся с причиной в отчёте, выход ≠ 0 и тревога.
+#[test]
+fn c6_one_missing_remote_copy_keeps_only_it() {
+    let dir = journal();
+    let work = tempfile::tempdir().unwrap();
+    let audit = tempfile::tempdir().unwrap();
+    let pol = policy(work.path(), Some(max_covered(dir.path())));
+    let plan = plan_names(&journal::retention_plan(dir.path(), &pol, T0 + 100 * DAY_MS).unwrap());
+    let missing = plan.iter().next_back().unwrap().clone();
+    let remote = remote_copy_of(dir.path(), None);
+    std::fs::remove_file(remote.path().join(&missing)).unwrap();
+    assert!(
+        !remote.path().join(&missing).exists(),
+        "SETUP НЕ СОСТОЯЛСЯ: копия {missing} не убрана"
+    );
+    let (code, out) = run_wrapper(
+        dir.path(),
+        remote.path(),
+        work.path(),
+        audit.path(),
+        Some("apply"),
+        None,
+    );
+    assert!(
+        dir.path().join(&missing).exists(),
+        "M-92: сегмент без копии на коробке удалён: {out}"
+    );
+    for n in plan.iter().filter(|n| **n != missing) {
+        assert!(
+            !dir.path().join(n).exists(),
+            "M-92 (R-221 Н-1): сверенный {n} не удалён — отсутствие ОДНОЙ копии оборвало весь прогон: {out}"
+        );
+    }
+    assert_contiguous(dir.path(), "c6");
+    assert_ne!(
+        code,
+        Some(0),
+        "M-92: отсутствие копии обязано дать ненулевой выход: {out}"
+    );
+    assert!(
+        work.path().join("retention.alert").exists(),
+        "M-92: отсутствие копии без тревоги: {out}"
+    );
+    let report: String = audit_files(audit.path())
+        .into_iter()
+        .filter(|(n, _)| n.ends_with("report.txt"))
+        .map(|(_, c)| c)
+        .collect();
+    assert!(
+        report.lines().any(
+            |l| l.starts_with(&format!("kept {missing} ")) && l.split_whitespace().count() >= 3
+        ),
+        "M-92 (R-221 Н-1): в отчёте нет строки «kept {missing} <причина>»: {report}"
     );
 }
