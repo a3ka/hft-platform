@@ -9,7 +9,7 @@
 //! `inc_refusals_*` стоят только в `handle_v1_message`; в `run_authorized_session` (legacy:
 //! клиент молчит grace-окно, селектор из окружения) — ни одного вызова ни на отказе, ни на
 //! успехе. Единственный реальный клиент (`wsprobe`) ходит legacy-путём ⇒ правило тишины
-//! `OPS-I-8` (дельты `attempts`/`successes`/`refusals_supported`) слепо ко ВСЕМУ трафику.
+//! `OPS-I-11` (дельты `attempts`/`successes`/`refusals_supported`) слепо ко ВСЕМУ трафику.
 //!
 //! # Класс отказа — решение architect'а, не новое поле
 //!
@@ -239,7 +239,7 @@ async fn l1_legacy_success_counts_one_attempt_and_one_success() {
         (1, 1, 0, 0),
         "TD-228: успешная legacy-сессия (снимок доставлен) дала дельты \
          (attempts, successes, refusals_supported, refusals_unsupported) = {:?} вместо (1, 1, 0, 0). \
-         Сердцебиение не видит обслуженного клиента — правило тишины OPS-I-8 слепо к реальному трафику",
+         Сердцебиение не видит обслуженного клиента — правило тишины OPS-I-11 слепо к реальному трафику",
         delta(&before, &after)
     );
 }
@@ -338,7 +338,7 @@ async fn l4_legacy_warming_is_a_supported_refusal() {
         delta(&before, &after),
         (1, 0, 1, 0),
         "TD-228 / C-269: отказ warming в legacy-пути дал дельты {:?} вместо (1, 0, 1, 0) — правило \
-         тишины OPS-I-8 не увидит отказ «сервер прогревается»",
+         тишины OPS-I-11 не увидит отказ «сервер прогревается»",
         delta(&before, &after)
     );
 }
