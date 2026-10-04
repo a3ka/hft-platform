@@ -10,12 +10,21 @@
 #
 # Установка (задача reviewer/founder после ревью — не выполняется мной):
 #   */5 * * * * root /root/hft-platform/scripts/watchdog_cron.sh >> /var/log/hft/watchdog.log 2>&1
+#
+# M-93 (TD-231): бинарь `ops-watchdog` ДОСТАВЛЯЕТСЯ деплоем (Dockerfile собирает его в
+# `hft-platform-recorder:local`; `deploy/bin/install-watchdog.sh` после healthy достаёт из
+# РАБОТАЮЩЕГО контейнера и кладёт в `/usr/local/lib/hft/ops-watchdog`). Никакого ручного
+# `cargo build` на хосте — toolchain'а нет, и второй способ сборки = второй источник бинаря
+# (TD-227-класс). Дефолтный путь здесь — ЭТОТ хост-путь; `HFT_WATCHDOG_ROOT` (шейп гейта
+# класса `DESTDIR`, см. `deploy/bin/install-watchdog.sh` шапку) на проде пуст. Установщик
+# и cron читают одну и ту же переменную одинаковым выражением — `I-1` §3 M-93.
 set -uo pipefail
 
 HFT_ROOT="${HFT_ROOT:-/root/hft-platform}"
-# Путь к собранному бинарю (`cargo build --release -p ops --bin ops-watchdog`). Шов для
-# гейта/теста: оракул подставляет сюда путь к тестовому бинарю/стабу.
-WATCHDOG_BIN="${WATCHDOG_BIN:-${HFT_ROOT}/target/release/ops-watchdog}"
+# Путь к бинарю, доставленному деплоем. На проде `/usr/local/lib/hft/ops-watchdog`. Шов
+# для гейта/теста: оракул подставляет сюда путь к тестовому бинарю/стабу; `HFT_WATCHDOG_ROOT`
+# — корень установки (на проде пуст).
+WATCHDOG_BIN="${WATCHDOG_BIN:-${HFT_WATCHDOG_ROOT:-}/usr/local/lib/hft/ops-watchdog}"
 LOG="${WATCHDOG_LOG:-/var/log/hft/watchdog.log}"
 ALERT_FILE="${WATCHDOG_ALERT_FILE:-/var/lib/hft/watchdog.alert}"
 LAST_SUCCESS="${WATCHDOG_LAST_SUCCESS:-/var/lib/hft/watchdog.last-success}"
@@ -36,7 +45,7 @@ if [ "${WATCHDOG_PRINT_BIN:-0}" = "1" ]; then
 fi
 
 if [ ! -x "${WATCHDOG_BIN}" ]; then
-  alert "ops-watchdog: бинарь не найден/не исполняем (${WATCHDOG_BIN}) — соберите \`cargo build --release -p ops --bin ops-watchdog\`"
+  alert "ops-watchdog: бинарь не найден/не исполняем (${WATCHDOG_BIN}) — доставка деплоем не состоялась; проверьте шаг install-watchdog.sh в .github/workflows/deploy.yml и его последний прогон (deploy.yml упадёт КРАСНЫМ на отказе установки — смотрите CI/Deploy)"
   exit 1
 fi
 

@@ -351,6 +351,18 @@ pub mod server {
         /// M-89 (задача #8, §4.2 / `I-6`): конфиг сердцебиения. `None` — сервер
         /// без сердцебиения (watchdog детектит как `MISSING`).
         heartbeat: Option<HeartbeatConfig>,
+        /// M-91 (задача 1, §1, §3): тестовый крючок подмены исхода готовности для
+        /// legacy-пути (`run_authorized_session`). Существует ТОЛЬКО под
+        /// `#[cfg(feature = "testing")]` — в прод-сборке способа задать его нет
+        /// (см. `with_readiness_override`): подменять проверку готовности на проде —
+        /// значит обходить предохранитель M-87. Поле присутствует ВСЕГДА (= `None`
+        /// в проде) ради одного типа `Server` в обеих сборках; инициализируется
+        /// `None` в `bind`/`with_policy`. `dead_code` подавлен ИМЕННО для прод-сборки:
+        /// там поле никогда не читается (см. `serve()`-loop ниже), но присутствие
+        /// поля держит единый тип `Server` в обеих сборках без `cfg`-веток над
+        /// конструкторами.
+        #[allow(dead_code)]
+        readiness_override: Option<fn() -> super::admission::ServingOutcome>,
     }
 
     /// Забиндить WS-listener на `cfg.addr`. engine-dev (task #4): `tokio::net::TcpListener`.
@@ -366,6 +378,7 @@ pub mod server {
             slots: None,
             counters: None,
             heartbeat: None,
+            readiness_override: None,
         })
     }
 
@@ -423,6 +436,7 @@ pub mod server {
                 slots: Some(slots),
                 counters: Some(counters),
                 heartbeat: None,
+                readiness_override: None,
             }
         }
 
@@ -470,6 +484,31 @@ pub mod server {
         /// счётчик и требовала `--test-threads=1`; теперь это решено конструктивно.
         pub fn counters_handle(&self) -> Option<std::sync::Arc<metrics::ServingCountersHandle>> {
             self.counters.as_ref().map(std::sync::Arc::clone)
+        }
+
+        /// M-91 (задача 1, §5): тестовый крючок — подменить результат `readiness`
+        /// в legacy-пути (`run_authorized_session`) на ФИКСИРОВАННЫЙ исход.
+        /// Существует ТОЛЬКО под `#[cfg(feature = "testing")]` — в прод-сборке
+        /// способа подменить проверку готовности НЕТ (иначе это был бы обход
+        /// предохранителя M-87, спека §5 «крючок подмены исхода готовности вне
+        /// `#[cfg(feature = "testing")]` ЗАПРЕЩЁН»).
+        ///
+        /// Параметр — `fn() -> ServingOutcome` (указатель на функцию), не `Fn`:
+        /// не-capturing замыкание коэрцится в `fn`, capturing — нет; это
+        /// делает крючок ДЕТЕРМИНИРОВАННЫМ по построению (без скрытого
+        /// состояния, которое пришлось бы наблюдать из теста). На проде
+        /// (без `feature = "testing"`) этот метод НЕ СУЩЕСТВУЕТ — поэтому
+        /// подмены в проде нет даже при попытке собрать её из теста (тест
+        /// тогда просто не собирается).
+        #[cfg(feature = "testing")]
+        pub fn with_readiness_override(
+            self,
+            f: fn() -> super::admission::ServingOutcome,
+        ) -> Server {
+            Server {
+                readiness_override: Some(f),
+                ..self
+            }
         }
 
         /// Accept-loop: на соединение — verify JWT из query; успех → snapshot + push + replay; провал →
@@ -527,8 +566,28 @@ pub mod server {
                         let policy = self.policy.clone();
                         let slots = self.slots.clone();
                         let counters = self.counters.clone();
+                        // M-91 (задача 1, §5): тестовый крючок подмены исхода готовности
+                        // пробрасывается под `feature = "testing"` (см. `with_readiness_override`).
+                        // В прод-сборке `readiness_override` ВСЕГДА `None`, поэтому
+                        // `handle_conn` зовёт реальный `readiness`. Копирование
+                        // `Option<fn() -> _>` — `Copy`-семантика указателя на функцию,
+                        // без Arc-обвязки.
+                        #[cfg(feature = "testing")]
+                        let readiness_override = self.readiness_override;
+                        #[cfg(not(feature = "testing"))]
+                        let readiness_override: Option<
+                            fn() -> super::admission::ServingOutcome,
+                        > = None;
                         tokio::spawn(async move {
-                            if let Err(e) = handle_conn(stream, cfg, policy, slots, counters).await
+                            if let Err(e) = handle_conn(
+                                stream,
+                                cfg,
+                                policy,
+                                slots,
+                                counters,
+                                readiness_override,
+                            )
+                            .await
                             {
                                 tracing::debug!(error = %e, "gateway-serve conn ended with error");
                             }
@@ -612,6 +671,9 @@ pub mod server {
         policy: Option<AdmissionPolicy>,
         slots: Option<std::sync::Arc<ServingSlots>>,
         counters: Option<std::sync::Arc<metrics::ServingCountersHandle>>,
+        // M-91 (задача 1, §5): тестовый крючок подмены исхода готовности. В прод-сборке
+        // всегда `None` (см. `serve()`-loop выше); legacy-путь зовёт его, если задан.
+        readiness_override: Option<fn() -> super::admission::ServingOutcome>,
     ) -> std::io::Result<()> {
         // (1) Канал для передачи URI из handshake-коллбэка наружу.
         let (uri_tx, uri_rx) = tokio::sync::oneshot::channel::<Option<String>>();
@@ -692,6 +754,7 @@ pub mod server {
             policy.map(std::sync::Arc::new),
             slots,
             counters,
+            readiness_override,
         )
         .await
     }
@@ -852,6 +915,10 @@ pub mod server {
         policy: Option<std::sync::Arc<AdmissionPolicy>>,
         slots: Option<std::sync::Arc<ServingSlots>>,
         counters: Option<std::sync::Arc<metrics::ServingCountersHandle>>,
+        // M-91 (задача 1, §5): тестовый крючок подмены исхода готовности legacy-пути.
+        // В проде всегда `None` (см. `serve()`-loop выше). Прокинут сюда из `handle_conn`,
+        // чтобы `run_authorized_session` (legacy-ветка ниже) его увидел.
+        readiness_override: Option<fn() -> super::admission::ServingOutcome>,
     ) -> std::io::Result<()>
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -924,7 +991,7 @@ pub mod server {
         if grace_expired || !is_v1_attempt {
             // Legacy path: прошлое поведение, env-селектор, OLD wire. Сообщение, если было,
             // отбрасывается — клиент ещй не перешёл в v1.
-            return run_authorized_session(ws, cfg, claims, counters).await;
+            return run_authorized_session(ws, cfg, claims, counters, readiness_override).await;
         }
         let _ = slots;
 
@@ -2003,10 +2070,23 @@ pub mod server {
         cfg: Arc<ServeConfig>,
         claims: super::auth::Claims,
         counters: Option<std::sync::Arc<metrics::ServingCountersHandle>>,
+        // M-91 (задача 1, §5): тестовый крючок подмены исхода готовности. В проде всегда `None`.
+        readiness_override: Option<fn() -> super::admission::ServingOutcome>,
     ) -> std::io::Result<()>
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
+        // M-91 (задача 1, §1, §3): попытка зарегистрирована на ВХОДЕ legacy-сессии,
+        // ДО проверки готовности — симметрично с v1-путём (`handle_v1_message`,
+        // ДВА `inc_attempts`: :1172 в ветке С `policy`, ДО `admit`; :1293 в
+        // bind-пути БЕЗ `policy`, ДО `readiness` — `admit` там не зовётся).
+        // «Иначе C6 «попытка не выросла» краснеет на refused-запросах».
+        // Без этой строки успешные legacy-сессии (с `wsprobe` — единственный реальный
+        // клиент) и refused-сессии (`not_ready`) оба не двигают `attempts`, и правило
+        // тишины `OPS-I-11` (на дельтах heartbeat'а: `Δattempts > 0 ∧ Δrefusals_supported > 0
+        // ∧ Δsuccesses == 0`) не срабатывает на реальном трафике (замер TD-228: attempts:0,
+        // successes:0 на УСПЕШНЫЕ подписки, байты при этом +583 МБ).
+        metrics::inc_attempts(counters.as_ref());
         // M-87 (предохранитель выдачи, спека §4): legacy-путь тоже проверяет
         // ГОТОВНОСТЬ состояния ДО `spawn_blocking` — иначе тихий rebuild на
         // живом пути (C-238 R3-3, C-240 R4-2 — авария 2026-09-20). Селектор
@@ -2051,7 +2131,24 @@ pub mod server {
             use super::admission::ServingOutcome;
             ServingOutcome::NotReady
         };
+        // M-91 (задача 1, §5, C-269): подмена исхода готовности через крючок
+        // `Server::with_readiness_override`. ТОЛЬКО в тестовой сборке (прод —
+        // `readiness_override` всегда `None`, см. `serve()`-loop выше). Цель —
+        // довести до legacy-пути мир `Warming`, который сегодня на
+        // `admission::readiness` недостижим (она возвращает только `Ready` /
+        // `NotReady`); без замера мутант «считать отказом только `NotReady`»
+        // остался бы непокрытым.
+        let ready_outcome = match readiness_override {
+            Some(f) => f(),
+            None => ready_outcome,
+        };
         if !matches!(ready_outcome, super::admission::ServingOutcome::Ready) {
+            // M-91 (задача 1, §3, §1 I-2 / I-3bis): ЛЮБОЙ исход готовности, отличный
+            // от `Ready`, — `refusals_supported`, как в v1-пути (`handle_v1_message`,
+            // ветки `ServingOutcome::*` вокруг `admit`/`readiness`). Legacy-путь
+            // селектор не выбирает ⇒ `refusals_unsupported` у него не возникает.
+            // «Считать отказом только `NotReady`» — мутант, который роняет `l4` (`C-269`).
+            metrics::inc_refusals_supported(counters.as_ref());
             let code = match ready_outcome {
                 super::admission::ServingOutcome::Warming => "warming",
                 _ => "not_ready",
@@ -2274,6 +2371,17 @@ pub mod server {
         sink.send(Message::Text(snap_text))
             .await
             .map_err(|e| std::io::Error::other(format!("ws send snapshot: {e}")))?;
+        // M-91 (задача 1, §1 I-1, §3, §5): успех засчитывается ПОСЛЕ отправки снимка — так же,
+        // как в v1-пути (`handle_v1_message`, ветки ADD и SWITCH): там `inc_successes` тоже стоит
+        // сразу после `sink.send(...).await` и вне `spawn_blocking`. Внутри `spawn_blocking` v1
+        // (после `resume`) растёт ДРУГОЙ счётчик — прочитанные байты (`add_journal_payload_bytes`);
+        // запрет на повторный учёт в точке отправки в v1 относится ТОЛЬКО к нему.
+        // Этот `inc_successes` — единственный учёт успеха legacy-сессии: удалить его как «дубль»
+        // значит вернуть TD-228 (ноль успехов при реальном трафике на проде).
+        // `send` вернул `Ok` ⇒ кадр сдан в сокет ОС, а не «клиент прочёл»: legacy-путь не делает
+        // ping-keepalive после снимка, доставку может оборвать peer reset. Признак доставки —
+        // `frames_received` на стороне зонда (TD-236 (б)).
+        metrics::inc_successes(counters.as_ref());
 
         // (6b) Push-loop: `LiveReducer::pump` от последнего курсора (M-53/TD-083 — вместо
         // `frames_since`, читающего журнал с головы на КАЖДЫЙ тик). Bounded: `max_events =

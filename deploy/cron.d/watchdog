@@ -17,8 +17,8 @@
 # совпасть с хост-путём тома `gateway-state` из compose
 # (`/var/lib/docker/volumes/hft-platform_gateway-state/_data/gateway-serve.heartbeat`).
 # Несовпадение — тихий no-op: cron не находит файл, watchdog молчит, при том что
-# gateway-serve пишет. Проверяется `verify_M-89.sh` task11 и
-# `red_m89_heartbeat_entrypoint::h0`. Эта правка — задача 11 спеки.
+# gateway-serve пишет. Проверяется `red_m89_heartbeat_entrypoint::h0` (сам оракул
+# композиции). Эта правка — задача 11 спеки.
 
 # Защита от накладывающихся запусков: cron не делает flock внутри, делаем тут.
 # Без flock — два запуска подряд (редко, но бывает) перетирают state-файл, и watchdog

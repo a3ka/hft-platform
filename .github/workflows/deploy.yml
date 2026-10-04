@@ -299,6 +299,10 @@ jobs:
                && timeout 300 sh -c 'until [ "$(docker inspect -f "{{.State.Health.Status}}" hft-recorder 2>/dev/null)" = healthy ]; do sleep 5; done' \
                && timeout 300 sh -c 'until [ "$(docker inspect -f "{{.State.Health.Status}}" hft-gateway-serve 2>/dev/null)" = healthy ]; do sleep 5; done'; then
               echo "=== healthy (recorder + gateway-serve) — deployed $(git rev-parse --short HEAD) ==="
+              # M-93 (TD-231): сторож ops-watchdog — хостовый процесс; бинарь берётся из образа
+              # РАБОТАЮЩЕГО hft-recorder и атомарно кладётся в /usr/local/lib/hft/ops-watchdog
+              # (оттуда его зовёт cron). Отказ установки — красный деплой: тревоги без сторожа нет.
+              bash deploy/bin/install-watchdog.sh || { echo "=== WATCHDOG INSTALL FAILED ===" >&2; exit 1; }
               docker image prune -f
             else
               echo "=== DEPLOY FAILED — logs + rollback to $(git rev-parse --short "$PREV") ==="
@@ -306,5 +310,8 @@ jobs:
               docker logs hft-gateway-serve --tail 50 || true
               git reset --hard -q "$PREV"
               docker compose up -d --build recorder gateway-serve
+              # M-93: на хосте — сторож того образа, что реально крутится после отката; откат и так
+              # красный, поэтому отказ установки здесь не маскирует его причину (`|| true`).
+              bash deploy/bin/install-watchdog.sh || true
               exit 1
             fi
