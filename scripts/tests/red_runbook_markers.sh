@@ -147,7 +147,7 @@ EOF
 put "$d" deploy/bin/x.sh 'echo "=== что угодно ==="'
 commit "$d"
 tracked "$d" deploy/bin/x.sh || bad "S9 SETUP НЕ СОСТОЯЛСЯ"
-expect fail "S9 маркер без опознаваемого префикса" "$d" "префикс до подстановки пуст"
+expect fail "S9 маркер без опознаваемого префикса" "$d" "префикс до подстановки короче 3 знаков"
 
 # ── S10 один найден, другой нет — всё-или-ничего — FAIL ────────────────────────────────
 d=$(mk s10 <<'EOF'
@@ -243,6 +243,46 @@ if grep -qE '^(ok|miss) +=====|` и `' "${TMP}/out.$((N-1))"; then
 else
   ok "S18b мусорных маркеров нет"
 fi
+
+# ── S19 маркер только в копии САМОЙ библиотеки — она не код (`R-238` Б-1а) — FAIL ──────
+d=$(mk s19 <<'EOF2'
+Ищите `=== SELF ONLY ===`.
+EOF2
+)
+printf '# пример: === SELF ONLY ===\n' >> "$d/scripts/lib/runbook_markers.sh"
+commit "$d"
+grep -qF 'SELF ONLY' "$d/scripts/lib/runbook_markers.sh" || bad "S19 SETUP НЕ СОСТОЯЛСЯ"
+expect fail "S19 маркер только в файле самой проверки" "$d" "miss  === SELF ONLY ==="
+
+# ── S20 метасимвол в маркере — сравнение ДОСЛОВНОЕ, не шаблоном (`R-238` Б-1б) — FAIL ────
+d=$(mk s20 <<'EOF2'
+Ищите `=== retention v1.2 ===`.
+EOF2
+)
+put "$d" deploy/bin/x.sh 'echo "=== retention v1x2 ==="'
+commit "$d"
+grep -qF 'v1x2' "$d/deploy/bin/x.sh" || bad "S20 SETUP НЕ СОСТОЯЛСЯ"
+expect fail "S20 код отличается на метасимвол (.)" "$d" "miss  === retention v1.2 ==="
+
+# ── S21 порог префикса — величина, а не только пустота (`R-238` Н-2) — FAIL ─────────────
+d=$(mk s21 <<'EOF2'
+Ищите `=== A… ===`.
+EOF2
+)
+put "$d" deploy/bin/x.sh 'echo "=== ABSENT ==="'
+commit "$d"
+tracked "$d" deploy/bin/x.sh || bad "S21 SETUP НЕ СОСТОЯЛСЯ"
+expect fail "S21 префикс из одного знака" "$d" "префикс до подстановки короче 3 знаков"
+
+# ── S22 tests/ в КОРНЕ репозитория — тоже не код (`R-238` Н-3) — FAIL ───────────────────
+d=$(mk s22 <<'EOF2'
+Ищите `=== ROOT TESTS ===`.
+EOF2
+)
+put "$d" tests/t.sh 'grep -q "=== ROOT TESTS ===" out'
+commit "$d"
+tracked "$d" tests/t.sh || bad "S22 SETUP НЕ СОСТОЯЛСЯ"
+expect fail "S22 маркер только в корневом tests/" "$d" "miss  === ROOT TESTS ==="
 
 # ── S12 настоящий runbook репозитория — PASS (прод-форма вызова, как в D6b) ────────────
 if [ -f "${ROOT}/deploy/README.md" ] && grep -q '===' "${ROOT}/deploy/README.md"; then
