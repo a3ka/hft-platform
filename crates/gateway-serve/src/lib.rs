@@ -1176,8 +1176,14 @@ pub mod server {
                     match outcome {
                         ServingOutcome::Unsupported => {
                             metrics::inc_refusals_unsupported(inner.counters.as_ref());
-                            let msg =
-                                "selector вне политики допуска (band/timeframe/window)".to_string();
+                            // `admit()` (`crates/gateway-serve/src/admission.rs:122-131`)
+                            // судит ровно три оси: `bands` ⊆ `policy.canonical_bands`,
+                            // `symbol` ∈ `policy.allowed_symbols`, `timeframe_ms` ∈
+                            // `policy.allowed_profiles`. `window_ms` / `depth_cadence_ms`
+                            // — это ограничения `LiveReducer` (следующий слой, не этот),
+                            // поэтому в строке отказа не упоминаются (TD-242).
+                            let msg = "selector вне политики допуска (bands/symbol/timeframe_ms)"
+                                .to_string();
                             send_v1_error(sink, Some(id), "unsupported", &msg).await;
                             return Err(format!("unsupported: {msg}"));
                         }
