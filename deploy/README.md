@@ -12,9 +12,11 @@
 ## 0. Что есть
 
 - **Образ**: `hft-platform-recorder:local` (Dockerfile, multi-stage). Содержит
-  ВСЕ четыре бинаря: `recorder` (ENTRYPOINT), `journal-retention` (ops-сервис
+  ВСЕ бинари: `recorder` (ENTRYPOINT), `journal-retention` (ops-сервис
   ретеншена), режим `--mode compact` того же бинаря (компакция закрытых
-  сегментов, D-COMP-3), и `gateway-serve` (M-28 WS-транспорт кокпита).
+  сегментов, D-COMP-3), `gateway-serve` (M-28 WS-транспорт кокпита),
+  `gateway-checkpoint`, `wsprobe` (M-46 sidecar) и **`ops-watchdog`**
+  (M-93 — хостовый сторож, см. §0a ниже).
 - **Compose**: `docker-compose.yml`. Сервисы:
   - `recorder` (24/7, default profile) — сбор;
   - `gateway-serve` (24/7, default profile, M-28) — WS-транспорт кокпита,
@@ -31,6 +33,99 @@
   после sha256-сверки сжатого `.zst`; битая копия → `.zst` удаляется,
   оригинал остаётся ГОРЯЧИМ (`Err`, exit 2). Можно запускать без dry-run'а
   по расписанию, но первый ручной прогон всё равно рекомендуется (sanity).
+
+## 0a. Доставка `ops-watchdog` (M-93, TD-231)
+
+Сторож `ops-watchdog` — **хостовый процесс** (DESIGN §23.1: канал тревоги не делит
+судьбу с docker; сторож внутри контейнера не сообщит о смерти самого `dockerd`).
+Бинарь **собирается В ОБРАЗЕ** (`Dockerfile:18` — `--bin ops-watchdog`, копируется в
+`/usr/local/bin/ops-watchdog`) и **доставляется деплоем** на хост: после healthy-гейта
+`deploy.yml` (задача 3) вызывает `deploy/bin/install-watchdog.sh`. Скрипт читает
+`docker inspect -f '{{.Image}}' hft-recorder`, поднимает временный контейнер, копирует
+бинарь во временный файл рядом с целевым, удаляет контейнер, проверяет непустоту и
+`mv -f` кладёт в `/usr/local/lib/hft/ops-watchdog`. На любом отказе — `exit≠0`,
+прежний бинарь цел (`mv` атомарен), временный контейнер удалён, хвостов нет.
+
+`/etc/cron.d/hft-watchdog` зовёт `scripts/watchdog_cron.sh` (cron-обёртка та же, что у
+ретеншена: heartbeat + ALERT-маркер). Дефолтный путь бинаря в обёртке — ЭТОТ хост-путь
+(`/usr/local/lib/hft/ops-watchdog`), так что установщик и cron читают одну
+константу и не могут разойтись (`I-1` спеки M-93, проверяется оракулом `w1`).
+
+Почему НЕ собирать на хосте: на VPS нет rust-toolchain'а, а два способа сборки
+бинаря = два источника правды (класс `TD-227` — то, из-за чего когда-то разъехался
+checkpoint-cron). ЕДИНСТВЕННЫЙ источник `ops-watchdog` — образ, который собрал CI и
+который реально крутится как `hft-recorder` (на ветке healthy — новая сборка, на
+ветке отката — `PREV`, `I-5` спеки).
+
+### Проверка доставки (после деплоя)
+
+```bash
+# (1) бинарь на хосте лежит и не пустой:
+ls -l /usr/local/lib/hft/ops-watchdog
+# -rwxr-xr-x 1 root root ...  /usr/local/lib/hft/ops-watchdog
+
+# (2) и БАЙТ-В-БАЙТ равен бинарю из образа работающего hft-recorder (то, что судит §8 M-93):
+sha256sum /usr/local/lib/hft/ops-watchdog
+docker exec hft-recorder sha256sum /usr/local/bin/ops-watchdog
+# хеши ОБЯЗАНЫ совпасть; иначе — рассогласование образа и хоста (формула «inspect'а»)
+# или чужой контейнер.
+
+# (3) cron вызывает ТОТ ЖЕ путь (композиция I-1, оракул w1):
+grep -h 'WATCHDOG_BIN' /etc/cron.d/hft-watchdog /etc/environment 2>/dev/null | grep . \
+  && echo "FAIL: WATCHDOG_BIN в окружении cron'а — это разрывает композицию с дефолтом обёртки" \
+  || echo "OK: WATCHDOG_BIN не задан — обёртка берёт дефолт /usr/local/lib/hft/ops-watchdog"
+
+# (4) ближайший прогон cron'а в журнале — НЕ «бинарь не найден»:
+sudo tail -5 /var/log/hft/watchdog.log
+# ожидание: строка вида «[ops-watchdog] … — норма, ни одно условие не сработало»
+# или запись ops-watchdog'а о найденной тревоге; НЕ «ALERT … бинарь не найден».
+```
+
+### ALERT `бинарь не найден/не исполняем` — что делать
+
+Текст алерта в `scripts/watchdog_cron.sh` теперь прямо указывает источник:
+
+```
+ALERT ops-watchdog: бинарь не найден/не исполняем (/usr/local/lib/hft/ops-watchdog)
+— доставка деплоем не состоялась; проверьте шаг install-watchdog.sh в
+.github/workflows/deploy.yml и его последний прогон (deploy.yml упадёт КРАСНЫМ
+на отказе установки — смотрите CI/Deploy)
+```
+
+Это НЕ ситуация «соберите `cargo build` на хосте» — toolchain'а на VPS нет, и
+ручная сборка = второй источник бинаря (`TD-227`-класс). Действия оператора:
+
+1. **Посмотреть последний прогон `deploy.yml` на GitHub** (Actions → Deploy). Ожидание:
+   - либо джоб зелёный И `=== WATCHDOG INSTALL OK ===` в логах шага (тогда
+     бинарь на хосте должен быть — пункт 2);
+   - либо джоб красный с `=== WATCHDOG INSTALL FAILED ===` (тогда `install-watchdog.sh`
+     упал; `journalctl -u deploy` или лог шага подскажет, на чём: `inspect`/`create`/
+     `cp`/пустой файл — каждый случай виден в скрипте).
+2. **Проверить, что деплой РЕАЛЬНО выполнил установку** (а не пропустил по фильтру
+   `paths:`). Фильтр `deploy.yml` (`A-046` E3) НЕ содержит `deploy/bin/**` и
+   `scripts/watchdog_cron.sh`: правка одного установщика или обёртки едет на VPS только
+   со следующим КОДОВЫМ push'ем или `workflow_dispatch`. Если алерт появился после
+   правки ТОЛЬКО этих файлов без другого кодового коммита — это и есть причина
+   (нужен `workflow_dispatch` или push в кодовый путь фильтра).
+3. **Перезапустить установку вручную** (если деплой был, но бинаря нет — например,
+   `/usr/local/lib/hft` удалили):
+
+   ```bash
+   # от root'а на VPS; deploy.yml идёт root'ом, sudo не нужно
+   /root/hft-platform/deploy/bin/install-watchdog.sh; echo "exit=$?"
+   # ожидание: exit=0, ls -l /usr/local/lib/hft/ops-watchdog показывает свежий файл
+   ```
+4. **Если деплой не запускался давно** (бинарь протух с прошлой правки `crates/ops/**`)
+   — это НОРМАЛЬНО: `ops-watchdog` обновляется с каждым деплоем кода, как все
+   остальные бинари образа. Свежесть файла на хосте = свежесть образа; рассогласование
+   ловится шагом (2) выше.
+
+Зачистка маркера тревоги (после починки):
+
+```bash
+sudo rm -f /var/lib/hft/watchdog.alert
+# следующий успешный прогон cron'а не поднимет его заново (см. scripts/watchdog_cron.sh)
+```
 
 ## 1. Доступ к Hetzner Storage Box через SSH-субаккаунт (НЕ CIFS)
 

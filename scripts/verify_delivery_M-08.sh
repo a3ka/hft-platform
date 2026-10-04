@@ -51,6 +51,14 @@ if [ "${DEEP}" = "1" ]; then
     else
       fail "D2-deep recorder не исполняем в образе"
     fi
+    # M-93 (TD-231): сторож ops-watchdog едет в образе — деплой достаёт его оттуда на хост
+    # (deploy/bin/install-watchdog.sh). Запуск бинаря здесь НЕ делается: он опрашивает docker
+    # хоста и пишет алерты; достаточно исполняемости в образе, исход на проде — §8.
+    if docker run --rm --entrypoint /bin/sh "${IMG}" -c 'test -x /usr/local/bin/ops-watchdog'; then
+      pass "D9-deep ops-watchdog в образе исполняем (M-93)"
+    else
+      fail "D9-deep ops-watchdog нет в образе — деплою нечего доставить на хост (TD-231)"
+    fi
   else
     fail "D1-deep прод-образ не собирается"
   fi
