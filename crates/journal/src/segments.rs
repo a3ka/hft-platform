@@ -2926,6 +2926,431 @@ fn sha256_file(path: &Path) -> io::Result<String> {
     Ok(format!("sha256:{:x}", hasher.finalize()))
 }
 
+// === M-92: манифест офсайт-копии (замена `verify_cold_copy`-пути) ===
+//
+// Контекст и почему старый путь негоден — замер, а не мнение (`M-92` §2, `A-044` §2,
+// `R-180` F-1): `verify_cold_copy` при отсутствии файла в `cold_root` САМ копировал
+// сегмент туда и сверял копию с источником — тождественная сверка. На проде `cold_root`
+// — путь, которого внутри контейнера уборщика нет (запись на эфемерный слой удавалась);
+// холодного хранилища, примонтированного к серверу, нет вовсе: офсайт — Storage Box по
+// SSH (`/etc/cron.d/hft-journal-offsite` шва `ssh … sha256sum`). Типовой барьер
+// `ColdCopyProof` обходился конфигурацией.
+//
+// Новая конструкция — программа той же процедуры, что исполнена вручную 2026-09-08 и
+// 2026-10-01: отбор кандидатов — прежний `retention_plan` (один источник: активный,
+// `keep_min`, возраст, покрытие слепком, legacy); доказательство — НОВОЕ: манифест
+// `sha256sum` с УДАЛЁННОЙ стороны (`ColdManifest`) и локальная сумма обязаны совпасть
+// ПО ИМЕНИ. Копирования нет ни на каком пути. Удаление 01.10: 298/298 совпали,
+// 58 439 976 703 Б. Ниже — форма §4 спеки: парсер строгий, доказательство — чистая
+// функция от локального файла и манифеста.
+
+/// Манифест офсайт-копии: имя файла → sha256 hex (64 знака, lowercase).
+///
+/// Получается ТОЛЬКО из текста вывода `sha256sum` со стороны офсайт-копии (Storage Box
+/// по SSH). Не сериализуется на диск, не строится из локальных файлов — это «вход с
+/// другой машины», и подделка манифеста явно вне нашего периметра (тот, кто владеет
+/// хостом, владеет и ключом коробки; ловим порчу и отсутствие копии — `M-92` §6 п.1).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ColdManifest {
+    /// Имя файла сегмента (без каталога) → sha256 hex (64 lowercase).
+    sums: std::collections::BTreeMap<String, String>,
+}
+
+impl ColdManifest {
+    /// Разобрать текст вывода `sha256sum`. Строка имеет форму `<64 hex>  <имя>` —
+    /// ДВА пробела между суммой и именем (формат GNU `sha256sum` с `--`). Пустые
+    /// строки пропускаются (их печатает `sha256sum` под некоторыми сборками).
+    ///
+    /// Строгие правила (fail-closed; `M-92` §3 `I-5`):
+    /// - ровно 64 hex-символа в позиции суммы (lower И upper принимаются на разбор;
+    ///   значение нормализуется в lowercase для сверки);
+    /// - разделитель — РОВНО два пробела (один пробел ⇒ `Err`, иначе `sha256sum`
+    ///   «-c» отверг бы файл и форма была бы нечитаемой);
+    /// - имя без каталога (без `/`);
+    /// - имя непустое;
+    /// - дубль строки (одно имя, та же сумма) — допустим (`sha256sum` повторил
+    ///   аргумент; эквивалентная запись);
+    /// - дубль имени с РАЗНОЙ суммой — `Err` (порча манифеста или ошибка склейки);
+    /// - пустой текст — пустой манифест (`Ok`): кандидатов нет, удалять нечего.
+    pub fn parse(text: &str) -> io::Result<ColdManifest> {
+        let mut sums: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        for (lineno, line) in text.lines().enumerate() {
+            if line.is_empty() {
+                continue;
+            }
+            // `split_once("  ")` (ровно два пробела) — формат GNU `sha256sum`. Один пробел
+            // даст `None` ⇒ `Err` (мутант «один пробел вместо двух» из §9 спеки).
+            let (hex, name) = line.split_once("  ").ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "ColdManifest: строка {lineno}: ожидается `<64 hex>  <имя>` \
+                         (два пробела), получили {line:?}"
+                    ),
+                )
+            })?;
+            // 64 hex-символа. Любой регистр принимается; нормализуем в lowercase для
+            // детерминированной сверки (тест использует lowercase, и `sha256sum` по
+            // дефолту lowercase, но жёстко ограничивать регистр — лишний шов).
+            if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "ColdManifest: строка {lineno}: ожидается 64 hex-символа, \
+                         получили {hex:?}"
+                    ),
+                ));
+            }
+            let hex_norm = hex.to_ascii_lowercase();
+            if name.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("ColdManifest: строка {lineno}: пустое имя"),
+                ));
+            }
+            // Имя без каталога. Любой `/` в имени трактуется как путь (мутант «имя с
+            // каталогом» из §9); префикс `journal/` снимает прод-шва
+            // `RETENTION_REMOTE_SHA_CMD`, но это ответственность скрипта, а не парсера.
+            if name.contains('/') {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "ColdManifest: строка {lineno}: имя содержит `/`: {name:?} \
+                         (ожидается имя БЕЗ каталога)"
+                    ),
+                ));
+            }
+            // Дубль имени с разной суммой — `Err` (порча манифеста). Точная дубль
+            // строки (тот же `name`, та же `hex_norm`) проходит как эквивалентная
+            // запись: тест явно это требует.
+            if let Some(prev) = sums.get(name) {
+                if prev != &hex_norm {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "ColdManifest: строка {lineno}: дубль имени {name:?} с \
+                             РАЗНОЙ суммой (было {prev}, стало {hex_norm})"
+                        ),
+                    ));
+                }
+                continue;
+            }
+            sums.insert(name.to_string(), hex_norm);
+        }
+        Ok(ColdManifest { sums })
+    }
+
+    /// Найти запись манифеста по имени сегмента. Возвращает `Some(hex)` если имя есть,
+    /// `None` если отсутствует. `None` для кандидата плана — сигнал «нет строки в
+    /// манифесте», сегмент удерживается (`M-92` §3 `I-2`).
+    pub fn get(&self, name: &str) -> Option<&str> {
+        self.sums.get(name).map(String::as_str)
+    }
+
+    /// Число записей в манифесте (для отчёта/диагностики).
+    pub fn len(&self) -> usize {
+        self.sums.len()
+    }
+
+    /// Манифест пустой?
+    pub fn is_empty(&self) -> bool {
+        self.sums.is_empty()
+    }
+}
+
+/// sha256 файла в hex-формате (lowercase, без префикса). Локальная сумма для сверки
+/// с манифестом — `sha256sum` совместимо. `sha256_file` (с префиксом `sha256:`)
+/// используется нитью `verify_cold_copy` и потому сохранён.
+fn sha256_hex(path: &Path) -> io::Result<String> {
+    let mut f = File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Итог сверки сегмента с манифестом офсайт-копии (приватный — `M-92` §4, типовой барьер
+/// `ColdCopyProof`). Возвращается функцией `verify_segment_against_manifest`; наружу
+/// НЕ вытекает.
+enum ManifestVerify {
+    /// В манифесте НЕТ записи по имени файла сегмента (коробка эту копию не прислала).
+    Absent,
+    /// Локальная sha256 файла НЕ совпала с записью манифеста (копия на коробке
+    /// испорчена либо подменена).
+    Mismatch { local: String, remote: String },
+    /// Совпало — доказательство `ColdCopyProof` выдано. Конструктор приватный,
+    /// наружу `ColdCopyProof` утекает ТОЛЬКО в `prune_segment(seg, proof)` —
+    /// единая точка, где сегмент удаляется (`R-217` Б-2).
+    Prove(ColdCopyProof),
+}
+
+/// Сверить локальный sha256 сегмента `seg` с записью `ColdManifest` по имени.
+/// Возвращает `ManifestVerify`:
+///   - `Absent` — в манифесте нет такой записи (`sha256` НЕ считается; это «нет строки»,
+///     а не «посчитали — не совпало»);
+///   - `Mismatch { local, remote }` — локальная сумма посчитана ОДИН раз и не совпала;
+///   - `Prove(proof)` — локальная сумма посчитана ОДИН раз и совпала, доказательство
+///     выдано через приватный конструктор `ColdCopyProof { _private: () }`.
+///
+/// `Err(_)` — ошибка чтения файла (нет файла, разрыв и т. п.). I/O отделено от
+/// классификационных исходов: `Err` НЕ равен «неподтверждён» в смысле `I-2ter`,
+/// но тело `retention_execute_with_manifest` трактует его как «неподтверждён» —
+/// абсолютно та же категория, что mismatch (на следующей позиции образовалась бы
+/// дыра `JR-I-2`).
+///
+/// Имя берётся из `seg.path` (НЕ из плана), и хешируется сам файл (НЕ его мета).
+/// ПРИВАТНАЯ: наружу не видна, доказательство утекает только через `prune_segment`.
+fn verify_segment_against_manifest(
+    seg: &SegmentInfo,
+    manifest: &ColdManifest,
+) -> io::Result<ManifestVerify> {
+    let name = match seg.path.file_name().and_then(OsStr::to_str) {
+        Some(n) => n,
+        None => {
+            // Имени нет — невозможно ни сверить, ни назвать. Трактовка как I/O:
+            // вызывающий код кладёт это в `failed` с собственной формулировкой.
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "segment path has no file_name",
+            ));
+        }
+    };
+    let Some(expected) = manifest.get(name) else {
+        return Ok(ManifestVerify::Absent);
+    };
+    // ОДИН проход по файлу; результат переиспользуется и для match, и для mismatch
+    // (R-217 Н-3: «не хешировать файл дважды при несовпадении»).
+    let actual = sha256_hex(&seg.path)?;
+    if actual == expected {
+        Ok(ManifestVerify::Prove(ColdCopyProof { _private: () }))
+    } else {
+        Ok(ManifestVerify::Mismatch {
+            local: actual,
+            remote: expected.to_string(),
+        })
+    }
+}
+
+/// Как `retention_execute`, но доказательство — совпадение локального sha256 сегмента
+/// с записью `ColdManifest` по имени. **НИКОГДА не копирует**: ни в `cold_root`, ни
+/// куда-либо ещё (`M-92` §3 `I-4`; `R-180` F-1). Манифест не расширяет право
+/// удалять: отбор — прежний `retention_plan` (`M-92` §3 `I-3`).
+///
+/// Граница удаления — КАТАЛОГ, не план (`M-92` §3 `I-2ter`, `R-217` Б-1):
+/// позиции — индексы всех ИМЁН `segment-NNNNNNNN.jrnl[.zst]` в каталоге (заголовок
+/// НЕ читается), обход с наименьшего. Позиция удаляется, только если КАЖДЫЙ её
+/// файл — кандидат плана с подтверждённой сверкой (proof выдан функцией
+/// `verify_segment_against_manifest`); первая неподтверждённая позиция
+/// (нет строки / сумма не совпала / файл вне плана / I/O) обрывает удаление —
+/// младшие позиции идут в `failed` с причиной `blocked-by <имя>`. Защита `JR-I-2`:
+/// дыра в каталоге — то, что `stream`/`read_all`/`recover` МОЛЧА сшивают
+/// (замер `A-045` §3: `stream` на каталоге с дырой отдал `Ok(562)`).
+///
+/// Удаление — ТОЛЬКО через `prune_segment(seg, proof)` (`R-217` Б-2, типовой
+/// барьер): в теле этой функции НЕТ ни `fs::remove_file`, ни литерала
+/// `ColdCopyProof { … }` — оба сторожит шаг гейта `task1-proof`. Доказательство
+/// чеканится приватной `verify_segment_against_manifest`.
+///
+/// `DryRun` проходит ту же классификацию (хеширует, обрывает) — чтобы
+/// `failed` пробного прогона был РАВЕН `failed` настоящего (`M-92` §3 `I-4`,
+/// `R-217` Н-1). Различие только в том, что в `DryRun` `prune_segment` НЕ зовётся
+/// (иначе это и не `DryRun`); отчёт `pruned`/`freed_bytes` пуст, `offloaded`
+/// пуст в ОБОИХ режимах — на манифестном пути копирования нет.
+///
+/// `policy` принимается, но в теле не используется: манифестный путь — независимый
+/// от `cold_root` (это и есть смена парадигмы, `M-92` §1; `policy.cold_root` остаётся
+/// на legacy-пути `retention_execute` для существующих sacred-оракулов `red_retention*`).
+/// Параметр сохранён в сигнатуре, чтобы библиотечный вызов был симметричен
+/// `retention_execute` и замена была механической для вызывающей стороны.
+pub fn retention_execute_with_manifest(
+    dir: impl AsRef<Path>,
+    plan: &RetentionPlan,
+    _policy: &RetentionPolicy,
+    manifest: &ColdManifest,
+    mode: RetentionMode,
+) -> io::Result<RetentionReport> {
+    let dir = dir.as_ref();
+
+    if mode == RetentionMode::Compact {
+        // Манифестный путь — НЕ путь компакции. На всякий случай (если кто-то
+        // зовёт `retention_execute_with_manifest` с этим режимом) — пустой отчёт,
+        // как в `retention_execute`. Сама компакция — через `compact_closed_segments`.
+        return Ok(RetentionReport {
+            mode: RetentionMode::Compact,
+            offloaded: Vec::new(),
+            pruned: Vec::new(),
+            pruned_without_checkpoint_coverage: Vec::new(),
+            failed: Vec::new(),
+            freed_bytes: 0,
+        });
+    }
+
+    // (1) Граница удаления — КАТАЛОГ, не план (I-2ter). Позиции — индексы ИМЁН
+    // `segment-NNNNNNNN.jrnl[.zst]` в каталоге; заголовок НЕ читается. Испорченный
+    // файл (как в `p10`) занимает позицию и обрывает удаление: `dedup_indexed_paths`
+    // возвращает ПУТИ, не классификацию, ровно как обещано `iter_segments_sorted`.
+    let mut ops: SegmentOps = 0;
+    let catalog_paths = dedup_indexed_paths(dir, &mut ops)?;
+    let _ = ops; // счётчик здесь роли не играет; сохранён `dedup_indexed_paths` для
+                 // дисциплины инкрементов по M-62.
+
+    // (2) Индекс плана: путь файла → кандидат на удаление (`offload_and_prune`).
+    // По `I-2ter`/`R-221` Б-2 позиция удаляется ТОЛЬКО если она в `offload_and_prune`;
+    // всё остальное (включая `skipped`/`offload_only` ИЗ плана, а также файлы вне плана —
+    // испорченный заголовок, чужой) обрывает удаление. Раньше здесь был ещё
+    // `plan_known: HashSet<Path>` для «известных пропусков без обрыва» —
+    // `R-221` Б-2 показал, что `skipped`/`offload_only` НЕЛЬЗЯ пропускать молча:
+    // возрастной фильтр `retention_plan` не монотонен по индексу, и средний сегмент,
+    // чьё первое событие несёт более позднее биржевое время, на границе `retain_days`
+    // попадает в `skipped` между кандидатами. Пропуск без обрыва оставлял дыру
+    // (проба `R-221`: каталог `[2,4,5]`, `failed = 0`, `JR-I-2` нарушен).
+    let plan_candidate: std::collections::HashMap<&Path, &SegmentInfo> = plan
+        .offload_and_prune
+        .iter()
+        .map(|s| (s.path.as_path(), s))
+        .collect();
+
+    // (3) Имя первой неподтверждённой позиции (по `R-217` Б-2/Н-1 — префиксный обрыв
+    // одинаков для Apply и DryRun). Младшие позиции идут в `failed` с этой причиной
+    // БЕЗ обращения к диску (ни хеш, ни `prune_segment`).
+    let mut blocked_by: Option<String> = None;
+    let mut pruned: Vec<PathBuf> = Vec::new();
+    let mut failed: Vec<(PathBuf, String)> = Vec::new();
+    let mut freed_bytes: u64 = 0;
+    // На манифестном пути `offloaded` ВСЕГДА пуст (R-217 Н-2: оператор читает
+    // «выгружено N» там, где выгрузки не было — ложь). R1-бэкап (offsite-copy)
+    // идёт отдельным швом `RETENTION_REMOTE_SHA_CMD`; см. §6 спеки.
+    let offloaded: Vec<PathBuf> = Vec::new();
+    // На манифестном пути override-аудит (`pruned_without_checkpoint_coverage`)
+    // не ведётся: манифестный путь НЕ проходит через покрытие чекпоинтом — это
+    // другой механизм доказательства. Поле сохранено для симметрии, всегда пусто.
+    let pruned_without_checkpoint_coverage: Vec<PathBuf> = Vec::new();
+
+    for path in catalog_paths {
+        let name = match path.file_name().and_then(OsStr::to_str) {
+            Some(n) => n.to_string(),
+            None => {
+                // Не-utf8 имя — НЕ МОЖЕМ назвать `blocked-by <...>`. Маркируем по
+                // индексу и обрыв уже действует. Защита `JR-I-2` держится: дальше
+                // никто не удаляется.
+                let idx_synth = parse_segment_index_any(
+                    path.file_name().and_then(OsStr::to_str).unwrap_or("?"),
+                )
+                .map(|i| i.to_string())
+                .unwrap_or_else(|| "?".to_string());
+                if blocked_by.is_none() {
+                    blocked_by = Some(format!("<index={idx_synth}>"));
+                }
+                failed.push((path.clone(), "segment path has no file_name".to_string()));
+                continue;
+            }
+        };
+
+        // Префиксный обрыв (I-2ter): младший КАНДИДАТ идёт в `failed` СВОЕЙ причиной
+        // (`blocked-by`), и ВСЕ более молодые КАНДИДАТЫ — в `failed` с `blocked-by`
+        // БЕЗ обращения к диску. Известные НЕ-кандидаты (keep_min, active, offload_only)
+        // в `failed` НЕ идут — это `p11` SETUP-ассерт: `failed` пробного прогона РАВЕН
+        // `failed` настоящего, и оба РАВНЫ множеству имён плана (без keep_min/active).
+        // Защита `JR-I-2` (сплошная нумерация каталога).
+        if let Some(ref blocker) = blocked_by {
+            if plan_candidate.contains_key(path.as_path()) {
+                failed.push((path.clone(), format!("blocked-by {blocker}")));
+            }
+            continue;
+        }
+
+        // (4) Позиция КАТАЛОГА. По `I-2ter`/`R-221` Б-2: позиция удаляется,
+        // только если КАЖДЫЙ её файл — кандидат плана с выданным `ColdCopyProof`.
+        // Кандидат — `offload_and_prune`; всё остальное (и `skipped`/`offload_only`
+        // из плана, и файлы вне плана — испорченный заголовок, чужой) — НЕ
+        // кандидат и ОБРЫВАЕТ удаление. Возрастной фильтр `retention_plan` не
+        // монотонен по индексу: средний сегмент, чьё первое событие несёт более
+        // позднее биржевое время, на границе `retain_days` оказывается моложе
+        // соседей и попадает в `skipped` (`p12`). Пропуск такой позиции без
+        // обрыва удалил бы младших и оставил дыру, которую `stream` молча
+        // сшивает (`JR-I-2`). Имя уходит в `blocked_by` для младших кандидатов;
+        // сама позиция НЕ попадает в `failed` (она не кандидат — спека §3
+        // `I-2ter` явно: «младшие КАНДИДАТЫ — в `failed` с `blocked-by <имя>`»).
+        let Some(seg) = plan_candidate.get(path.as_path()).copied() else {
+            // Позиция НЕ кандидат (из плана как `skipped`/`offload_only` либо
+            // вне плана). Имя уходит в `blocked_by`; сама в `failed` не идёт.
+            blocked_by = Some(name);
+            continue;
+        };
+
+        // (5) Сверка через приватную функцию; доказательство — ТОЛЬКО оттуда
+        // (R-217 Б-2: литерала `ColdCopyProof { … }` здесь нет).
+        let verify = match verify_segment_against_manifest(seg, manifest) {
+            Ok(v) => v,
+            Err(e) => {
+                blocked_by = Some(name);
+                failed.push((path.clone(), format!("local sha256 read failed: {e}")));
+                continue;
+            }
+        };
+
+        match verify {
+            ManifestVerify::Absent => {
+                blocked_by = Some(name);
+                failed.push((path.clone(), "absent-remote".to_string()));
+            }
+            ManifestVerify::Mismatch { local, remote } => {
+                blocked_by = Some(name);
+                failed.push((
+                    path.clone(),
+                    format!("mismatch local={local} remote={remote}"),
+                ));
+            }
+            ManifestVerify::Prove(proof) => {
+                if mode == RetentionMode::Apply {
+                    // (6) Удаление — ЕДИНСТВЕННЫЙ путь через `prune_segment(seg, proof)`
+                    // (`R-217` Б-2). Никакого `fs::remove_file` в этой функции — оба
+                    // сторожит `task1-proof`. Если `prune_segment` упал ПОСЛЕ
+                    // подтверждённой сверки — это та же категория «неподтверждённого»
+                    // по `I-2ter` (на следующей позиции образовался бы разрыв `JR-I-2`):
+                    // обрыв, младшие идут в `blocked-by`.
+                    match prune_segment(seg, proof) {
+                        Ok(()) => {
+                            pruned.push(path.clone());
+                            freed_bytes += seg.size_bytes;
+                        }
+                        Err(e) => {
+                            blocked_by = Some(name);
+                            failed.push((
+                                path.clone(),
+                                format!("prune failed after verified manifest match: {e}"),
+                            ));
+                        }
+                    }
+                }
+                // В `DryRun` proof выдан и не использован; `prune_segment` не зовётся.
+                // Классификация состоялась, отчёт `pruned` пуст (`I-4`).
+            }
+        }
+    }
+
+    let mode = match mode {
+        RetentionMode::DryRun => RetentionMode::DryRun,
+        RetentionMode::Apply => RetentionMode::Apply,
+        RetentionMode::Compact => unreachable!("обработан выше"),
+    };
+    Ok(RetentionReport {
+        mode,
+        offloaded,
+        pruned,
+        pruned_without_checkpoint_coverage,
+        failed,
+        freed_bytes,
+    })
+}
+
 // === Disk guard (E4) ===
 
 /// Свободное место на файловой системе каталога (E4).
