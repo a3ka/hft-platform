@@ -1,0 +1,87 @@
+<!-- GATE-META
+milestone: M-92
+audited_repo: a3ka/hft-platform
+audited_base: f64e72fdd0427cb7d82a402ec25a5dbbc97d823f
+audited_head: 5307f04f2d59ff0fdf533ccf575b8101d99f6897
+verdict: APPROVE
+-->
+
+# R-228 — M-92, дополнение к `R-223`: синхронизация с `main` перед PR
+
+**Дата (UTC):** 2026-10-04
+**Предмет:** ветка `origin/feat/M-92-manifest-verified-prune`; вершину я взял командой
+(`git fetch origin && git rev-parse`) — `5307f04`. Справка из мандата — `5307f04`, совпадает.
+Повторный fetch перед записью дал ту же вершину `5307f04`.
+**База:** `f64e72f` — первый родитель `5307f04`, это та ревизия `main`, с которой ветка
+синхронизирована. Пока шла работа, `origin/main` ушёл дальше: `f64e72f` → `947991c` → `32574de`.
+Это только документы: `docs/fa/ops.md`, `R-224`/`R-225`/`R-226`, реестры. Код не задет.
+`git merge-tree --write-tree origin/main(32574de) 5307f04` → exit=0, конфликтов нет.
+
+**Вердикт: APPROVE.** После моей прошлой ревизии `a87425b` (`R-223`, APPROVE над `a11afe0`)
+на ветке появилось ровно то, что перечислено в мандате, и больше ничего. Гейт зелёный.
+
+## Живые инварианты FA (`crates/journal/**` → `docs/fa/journal.md`)
+
+- **`JR-I-13`** (`docs/fa/journal.md:221`): локальный сегмент удаляется ТОЛЬКО при сверке его
+  sha256 с суммой на стороне офсайт-копии. Это и есть предмет M-92. Код, который его держит
+  (`segments.rs`, бинарь, cron-скрипт, compose), после `R-223` не менялся. Доказательство — patch-id ниже.
+- **`JR-I-2`** (сплошной `seq`, удаление оставляет сплошной суффикс) — оракулы `p8`/`p9`/`p10`/`p12`
+  зелены в прогоне ниже.
+
+Ярус C, искал грепом по `origin/main`: в `TECH-DEBT.md` — `M-92` (0 записей), `TD-020`, `TD-202`
+(обе открыты, закрытие — на close-out после задачи 4); в `PROJECT-STATE.md` — `M-92` (0),
+`TD-020`. Для `PENDING-SIGNATURE.md` проверял `П-030…П-033`.
+
+## Что проверено
+
+| пункт мандата | как проверено | итог |
+|---|---|---|
+| вклад ветки после слияния — тот же, что одобрен в `R-223` | для каждого из 23 файлов `git diff f64e72f 5307f04 -- f` против `git diff 6ef8c67 a87425b -- f`, сравнение `git patch-id --stable` | 20 из 23 совпадают бит-в-бит, в том числе весь код: `crates/journal/**`, `deploy/**`, `docker-compose.yml`, RED, проба карты. Различаются ровно три заявленных файла (ниже) |
+| `PENDING-SIGNATURE`: `П-031`, `П-032`, `П-033` все на месте; `П-032`/`П-033` побайтово как в `main` | `git diff f64e72f 5307f04 -- docs/PENDING-SIGNATURE.md` даёт **+31 / −0** (только блок `П-031`); заголовки `П-030…П-033` встречаются по одному разу; блок `П-031` сравнен с `a87425b` через `diff` | `main`-часть не тронута. `П-031` совпадает с `a87425b` до байта, кроме одной пустой строки-разделителя: на `a87425b` блок стоял последним в файле, теперь за ним идёт `П-032` |
+| правка спеки | `git diff a87425b 5307f04 -- milestones/M-92-*.md` | §8: задачи 1–3 → ✅ DONE со ссылкой на `R-223`; задача 4 получила пункт (а0) — это `R-223` N-3 (многоаргументный `sha256sum` на коробке); §13 — строка круга 7 с решениями N-1…N-4. Задача 4 осталась ⏳ OPEN. Других правок нет |
+| метка verify (N-4) | `git diff a87425b 5307f04 -- scripts/verify_M-92.sh` | одна строка: `(p1-p11, b1-b2, c0-c5)` → `(p1-p12, b1-b2, c0-c6)`. Команда шага не изменена |
+| `5307f04` пуст по дереву | `rev-parse 5307f04^{tree}` = `abe6dc6^{tree}` = `4c26d0d9…` | да. Родители: `f64e72f` (main, первый) и `abe6dc6`. В теле объяснено, зачем это нужно, и есть `ALLOW-ARTIFACT-DELETE` за архивный перенос M-89/90/91/93. Сам перенос сделан в `main` (PR #303/#304/#307), ветка его только принимает. Вклад ветки против `f64e72f` не содержит ни одного удаления защищённого артефакта: в списке файлов выше нет `D` |
+| scope после `a87425b` | `git log a87425b..5307f04`, собственные коммиты ветки (не пришедшие из `main`) | коммиты ветки — `8e797cd` (слияние), `5826ff7`, `abe6dc6`, `5307f04`. Все три собственных помечены `[architect]` и лежат в зоне architect'а (`milestones/`, `scripts/verify_*`). `*/tests/**` не трогались. `crates/contracts/**` не тронут → Block-C N/A. `risk`/`killswitch`/`oms`/`venue-*` не тронуты → RISK-BLOCK не применяется |
+| режим удаления | `deploy/cron.d/journal-retention` с `R-223` не менялся (patch-id) | `RETENTION_MODE=dry-run`, файл-переключатель кодом не создаётся. Деплой удаление не включит |
+
+## Наблюдения (не блокируют)
+
+- **N-1.** Решение architect'а по `R-223` N-1 (узкий критик не созывается) записано в §13 с
+  обоснованием. Требование `R-223` («решение должно быть видно, а не подразумеваться») выполнено.
+- **N-2.** `R-223` N-2 (ветки 255 / «пустой вывод» шага 2 не запиннены оракулом) architect назвал
+  пределом с планом «следующей ревизией тест-корпуса». Карточку TD заведу на close-out M-92,
+  вместе с `R-221` Н-2/Н-3/Н-5.
+
+## Done Block (сырой вывод, агрегирован)
+
+```
+$ git fetch origin && git rev-parse origin/feat/M-92-manifest-verified-prune
+5307f04f2d59ff0fdf533ccf575b8101d99f6897
+$ git rev-parse 5307f04^{tree} abe6dc6^{tree}
+4c26d0d927328fb578eea7c52b393f04f7f8a363   (оба)
+$ patch-id сверка вклада (23 файла): РАЗЛИЧИЕ только
+docs/PENDING-SIGNATURE.md · milestones/M-92-manifest-verified-prune.md · scripts/verify_M-92.sh
+$ git diff --stat f64e72f HEAD -- docs/PENDING-SIGNATURE.md
+docs/PENDING-SIGNATURE.md | 31 +   (−0)
+
+# дерево /tmp/hft-reviewer-M-92-r3 на 5307f04
+$ bash scripts/verify_M-92.sh 2>&1 | grep -E '^(FAIL|VERDICT)'; echo exit=$?
+VERDICT: PASS
+exit=0                      (PASS-строк: 58; FAIL: 0; SKIP: task4 по спеке + 6 по карте CI;
+                             ci-parity: учтено шагов 57 из 57 (исполнено 51, исключено по карте 6))
+PASS  task1-3: red_m92_manifest_prune (p1-p12, b1-b2, c0-c6)
+PASS  ci-parity: cargo fmt --all -- --check
+PASS  ci-parity: cargo clippy --all-targets --all-features -- -D warnings
+PASS  ci-parity: cargo test --all
+PASS  ci-parity: bash scripts/check_protected_artifacts.sh
+PASS  ci-parity: bash scripts/verify_delivery_M-08.sh
+
+$ git merge-tree --write-tree origin/main(32574de) 5307f04 >/dev/null; echo exit=$?
+exit=0
+```
+
+## Handoff
+
+APPROVE → reviewer (я): PR → чеки → merge → `gates.md` §8 (режим остаётся `dry-run`). Затем
+**architect** — задача 4 по `П-031`, первым пунктом (а0). Close-out M-92 (`PROJECT-STATE`,
+`TECH-DEBT`, архивный перенос) — только после подтверждения задачи 4 по аудит-следу.
