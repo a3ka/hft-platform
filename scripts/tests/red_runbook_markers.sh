@@ -169,6 +169,81 @@ commit "$d"
 tracked "$d" crates/journal/src/bin/journal-retention.rs || bad "S11 SETUP НЕ СОСТОЯЛСЯ"
 expect pass "S11 маркер печатает код крейта" "$d"
 
+# ── S13 исключение docs/** отдельно от *.md (`R-236` Б-1): не-.md файл под docs/ — FAIL ───
+d=$(mk s13 <<'EOF2'
+Ищите `=== ONLY IN DOCS SCRIPT ===`.
+EOF2
+)
+put "$d" docs/archive/old_verify.sh 'echo "=== ONLY IN DOCS SCRIPT ==="'
+commit "$d"
+tracked "$d" docs/archive/old_verify.sh || bad "S13 SETUP НЕ СОСТОЯЛСЯ"
+expect fail "S13 маркер только в не-.md файле под docs/" "$d" "miss  === ONLY IN DOCS SCRIPT ==="
+
+# ── S14 исключение research/** отдельно (по одному сценарию на исключение) — FAIL ──────
+d=$(mk s14 <<'EOF2'
+Ищите `=== ONLY IN RESEARCH ===`.
+EOF2
+)
+put "$d" research/tool/run.sh 'echo "=== ONLY IN RESEARCH ==="'
+commit "$d"
+tracked "$d" research/tool/run.sh || bad "S14 SETUP НЕ СОСТОЯЛСЯ"
+expect fail "S14 маркер только под research/" "$d" "miss  === ONLY IN RESEARCH ==="
+
+# ── S15 печать из «неожиданного» пути — область поиска весь репозиторий (`R-236` Н-1) — PASS
+d=$(mk s15 <<'EOF2'
+Ищите `=== FROM OPS SCRIPT ===` и `=== FROM COMPOSE ===`.
+EOF2
+)
+put "$d" scripts/ops/x.sh 'echo "=== FROM OPS SCRIPT ==="'
+put "$d" docker-compose.yml '    command: ["sh", "-c", "echo === FROM COMPOSE ==="]'
+commit "$d"
+tracked "$d" scripts/ops/x.sh || bad "S15 SETUP НЕ СОСТОЯЛСЯ"
+expect pass "S15 маркер печатает scripts/ops и docker-compose.yml" "$d"
+
+# ── S16 отличие только регистром — оператор ищет grep -F, регистр важен (`R-236` Н-2) — FAIL
+d=$(mk s16 <<'EOF2'
+Ищите `=== watchdog install failed ===`.
+EOF2
+)
+put "$d" deploy/bin/install.sh 'echo "=== WATCHDOG INSTALL FAILED ==="'
+commit "$d"
+tracked "$d" deploy/bin/install.sh || bad "S16 SETUP НЕ СОСТОЯЛСЯ"
+expect fail "S16 маркер отличается от кода только регистром" "$d" "miss  === watchdog install failed ==="
+
+# ── S17 стражи входа (`R-236` Н-3): нет runbook'а; корень не git — FAIL ──────────────
+d=$(mk s17 <<'EOF2'
+`=== X ===`
+EOF2
+)
+put "$d" deploy/bin/x.sh 'echo "=== X ==="'
+commit "$d"
+rm -f "$d/deploy/README.md"
+[ ! -e "$d/deploy/README.md" ] || bad "S17 SETUP НЕ СОСТОЯЛСЯ"
+expect fail "S17 runbook'а нет" "$d" "нет файла"
+nd="${TMP}/s17-nogit"; mkdir -p "$nd/deploy"
+printf '`=== X ===`\n' > "$nd/deploy/README.md"; printf 'echo "=== X ==="\n' > "$nd/x.sh"
+git -C "$nd" rev-parse --is-inside-work-tree >/dev/null 2>&1 && bad "S17b SETUP НЕ СОСТОЯЛСЯ: каталог внутри git"
+expect fail "S17b корень — не рабочее дерево git" "$nd" "не рабочее дерево git"
+
+# ── S18 извлечение (`R-236` Н-4/Н-6): хвост разорванной цитаты не склеивается с соседним
+#    маркером, setext-подчёркивание не маркер — честный маркер на той же строке проверен ──
+d=$(mk s18 <<'EOF2'
+Заголовок
+=========
+Строка `=== WATCHDOG INSTALL
+OK ===` и `=== MISSING HERE ===`.
+EOF2
+)
+put "$d" deploy/bin/x.sh 'echo "=== OTHER ==="'
+commit "$d"
+grep -q '^=========$' "$d/deploy/README.md" || bad "S18 SETUP НЕ СОСТОЯЛСЯ"
+expect fail "S18 соседний маркер после разорванной цитаты извлечён и проверен" "$d" "miss  === MISSING HERE ==="
+if grep -qE '^(ok|miss) +=====|` и `' "${TMP}/out.$((N-1))"; then
+  bad "S18b извлечён мусорный маркер (setext или склейка через бэктик)"; sed 's/^/      /' "${TMP}/out.$((N-1))"
+else
+  ok "S18b мусорных маркеров нет"
+fi
+
 # ── S12 настоящий runbook репозитория — PASS (прод-форма вызова, как в D6b) ────────────
 if [ -f "${ROOT}/deploy/README.md" ] && grep -q '===' "${ROOT}/deploy/README.md"; then
   expect pass "S12 настоящий deploy/README.md против настоящего кода" "${ROOT}"
