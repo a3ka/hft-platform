@@ -25,7 +25,11 @@ if [ "${HFT_CRON_PRINT_ARGV:-0}" = "1" ] || [ "${RETENTION_PRINT_ARGV:-0}" = "1"
   RETENTION_KEEP_MIN="${RETENTION_KEEP_MIN:-4}"
   RETENTION_MIN_FREE_GB="${RETENTION_MIN_FREE_GB:-10}"
   RETENTION_CHECKPOINT_COVERAGE="${RETENTION_CHECKPOINT_COVERAGE:-/ckpt/covered_through_seq}"
-  RETENTION_WORK_DIR="${RETENTION_WORK_DIR:-/var/lib/hft/retention-work}"
+  # M-92 I-9 (R-221 Б-1): argv контейнера — пути ПОД ЦЕЛЯМИ ТОМОВ сервиса. Хост-каталог
+  # `${RETENTION_WORK_DIR}` (по умолчанию `/var/lib/hft/retention-work`) bind-mount'ится в
+  # `/work` (docker-compose.yml, сервис `journal-retention`), и бинарь видит план как
+  # `/work/plan.txt`. Передача сюда хост-пути = ENOENT на проде (R-221: exit=1, шаг 1).
+  RETENTION_WORK_DIR_IN_CONTAINER="${RETENTION_WORK_DIR_IN_CONTAINER:-/work}"
   printf '%s\n' \
     --dir "${RETENTION_JOURNAL_DIR}" \
     --retain-days "${RETENTION_RETAIN_DAYS}" \
@@ -33,7 +37,7 @@ if [ "${HFT_CRON_PRINT_ARGV:-0}" = "1" ] || [ "${RETENTION_PRINT_ARGV:-0}" = "1"
     --min-free-gb "${RETENTION_MIN_FREE_GB}" \
     --mode dry-run \
     --checkpoint-coverage="${RETENTION_CHECKPOINT_COVERAGE}" \
-    --plan-out "${RETENTION_WORK_DIR}/plan.txt"
+    --plan-out "${RETENTION_WORK_DIR_IN_CONTAINER}/plan.txt"
   exit 0
 fi
 
@@ -74,6 +78,13 @@ RETENTION_CHECKPOINT_COVERAGE="${RETENTION_CHECKPOINT_COVERAGE:-/ckpt/covered_th
 # `journal-retention`-контейнер как `/work`. Сюда же скрипт пишет `plan.txt` (через
 # `--plan-out` бинаря) и `manifest.txt` (через `RETENTION_REMOTE_SHA_CMD`).
 RETENTION_WORK_DIR="${RETENTION_WORK_DIR:-/var/lib/hft/retention-work}"
+# M-92 I-9 (R-221 Б-1): контейнерный путь, ПЕРЕДАВАЕМЫЙ в argv бинаря. Дефолт `/work`
+# СВЯЗАН с compose-топологией (bind-mount `RETENTION_WORK_DIR → /work` в сервисе
+# `journal-retention`); оператор меняет связку только вместе с правкой `docker-compose.yml`,
+# иначе `c1`/`c2`/`c4` откажут на страже «путь вне томов сервиса». Локальный IO скрипта
+# идёт через `${RETENTION_WORK_DIR}` (хост); argv — через `${RETENTION_WORK_DIR_IN_CONTAINER}`
+# (контейнер); bind-mount делает их одним файлом.
+RETENTION_WORK_DIR_IN_CONTAINER="${RETENTION_WORK_DIR_IN_CONTAINER:-/work}"
 # M-92 (A-044 §5.1, §4 п.4): аудит-след — три записи на прогон (план, манифест, отчёт)
 # с уникальными БАЗОВЫМИ именами, плоско в этом каталоге. Подкаталог на прогон
 # НЕДОСТАТОЧЕН (A-045 §2.1: `c4` сравнивает базовые имена). Записи прошлых прогонов
@@ -161,9 +172,12 @@ ARGV=(
   # M-48 (GW-I-12): обязательно передаём путь к артефакту покрытия. Без этого
   # retention не знает, до какого seq безопасно прунить — fail-closed no-op.
   --checkpoint-coverage="${RETENTION_CHECKPOINT_COVERAGE}"
-  # M-92 §4 п.1: dry-run с --plan-out — всегда (источник имён кандидатов для
-  # манифеста). Пишется в RETENTION_WORK_DIR, оттуда читается на шаге 2.
-  --plan-out "${RETENTION_WORK_DIR}/plan.txt"
+  # M-92 §4 п.1 + I-9 (R-221 Б-1): dry-run с --plan-out — всегда (источник имён
+  # кандидатов для манифеста). argv — КОНТЕЙНЕРНЫЙ путь `/work/plan.txt`; скрипт
+  # читает файл обратно с хоста по `${PLAN_FILE}=${RETENTION_WORK_DIR}/plan.txt`
+  # (bind-mount делает их одним файлом). Передача сюда хост-пути даёт ENOENT
+  # в контейнере (R-221: прод-шаг 1 = exit=1, ALERT, ничего не пишется).
+  --plan-out "${RETENTION_WORK_DIR_IN_CONTAINER}/plan.txt"
 )
 
 cd "${HFT_ROOT}" 2>/dev/null || { alert "journal-retention: нет каталога ${HFT_ROOT}"; exit 1; }
@@ -186,20 +200,54 @@ if [ ! -s "${PLAN_FILE}" ]; then
   exit 0
 fi
 
-# ─── ШАГ 2: манифест с УДАЛЁННОЙ стороны (M-92 §4 п.2) ──────────────────────────
+# ─── ШАГ 2: манифест с УДАЛЁННОЙ стороны (M-92 §4 п.2, I-10) ──────────────────
 # Суммы берутся НЕ с локальных файлов (тождественная сверка = R-180 F-1), а через
-# `${RETENTION_REMOTE_SHA_CMD}` — SSH-команда к Storage Box. Префикс `journal/` в выводе
-# команды снимается перед записью в манифест (`ColdManifest::parse` ожидает имя без `/`).
+# `${RETENTION_REMOTE_SHA_CMD}` — SSH-команда к Storage Box.
+#
+# I-10 / R-221 Н-1: ОДНО соединение с коробкой на ВЕСЬ прогон. Цикл по именам = одно
+# SSH-соединение на сегмент (≈300 на первом прогоне); `sha256sum` принимает пачку и
+# выходит 1 при наличии отсутствующих — это ШТАТНО (отсутствующие получат
+# `absent-remote` в бинаре и обрывают префикс по `I-2ter`, см. `c6`).
+# Семантика кодов возврата (I-10):
+#   * 0 или 1 + непустой stdout — штатно. Exit 1 = «хотя бы одного файла нет», но
+#     остальные напечатаны; манифест пишется, бинарь разберёт строки и удержит
+#     отсутствующие (`absent-remote`).
+#   * 255 (отказ SSH: битый ключ / нет сети / таймаут `ConnectTimeout=10`) — тревога,
+#     `apply` НЕ зовётся (R-180 F-1 наоборот: пустой/оборванный конвейер).
+#   * пустой stdout при непустом плане — тревога (бинарь не сверит ни одной строки;
+#     `I-2ter` оставил бы всё горячим без шанса на восстановление).
+#   * прочие коды, кроме {0,1}, при непустом stdout — нештатны: `sha256sum`/`ssh` так
+#     не заканчиваются; защищаемся явно, чтобы дефект реализации коробки не
+#     проходил как «всё ок».
+# Префикс `journal/` в stdout снимается перед записью в манифест (`ColdManifest::parse`
+# ждёт имя без `/`).
 MANIFEST_FILE="${RETENTION_WORK_DIR}/manifest.txt"
 : > "${MANIFEST_FILE}"
-while IFS= read -r name || [ -n "${name}" ]; do
+mapfile -t PLAN_NAMES < "${PLAN_FILE}"
+SHA_ARGS=()
+for name in "${PLAN_NAMES[@]}"; do
   [ -z "${name}" ] && continue
-  if ! ${RETENTION_REMOTE_SHA_CMD} "journal/${name}" 2>>"${LOG}" \
-       | sed 's#  journal/#  #' >> "${MANIFEST_FILE}"; then
-    alert "RETENTION_REMOTE_SHA_CMD failed for journal/${name}; apply НЕ зовётся. Лог: ${LOG}"
-    exit 1
-  fi
-done < "${PLAN_FILE}"
+  SHA_ARGS+=("journal/${name}")
+done
+SHA_OUT=""
+SHA_RC=0
+if [ "${#SHA_ARGS[@]}" -gt 0 ]; then
+  SHA_OUT=$(${RETENTION_REMOTE_SHA_CMD} "${SHA_ARGS[@]}" 2>>"${LOG}")
+  SHA_RC=$?
+fi
+if [ -z "${SHA_OUT}" ] && [ "${#PLAN_NAMES[@]}" -gt 0 ]; then
+  alert "RETENTION_REMOTE_SHA_CMD пустой вывод при непустом плане; apply НЕ зовётся. Лог: ${LOG}"
+  exit 1
+fi
+if [ "${SHA_RC}" -eq 255 ]; then
+  alert "RETENTION_REMOTE_SHA_CMD exit=255 (отказ связи с коробкой); apply НЕ зовётся. Лог: ${LOG}"
+  exit 1
+fi
+if [ "${SHA_RC}" -ne 0 ] && [ "${SHA_RC}" -ne 1 ]; then
+  alert "RETENTION_REMOTE_SHA_CMD неожиданный exit=${SHA_RC}; apply НЕ зовётся. Лог: ${LOG}"
+  exit 1
+fi
+printf '%s\n' "${SHA_OUT}" | sed 's#  journal/#  #' >> "${MANIFEST_FILE}"
 
 MODE=$(read_mode)
 
@@ -246,7 +294,10 @@ APPLY_ARGV=(
   --min-free-gb "${RETENTION_MIN_FREE_GB}"
   --mode "${MODE}"
   --checkpoint-coverage="${RETENTION_CHECKPOINT_COVERAGE}"
-  --cold-manifest "${MANIFEST_FILE}"
+  # M-92 §4 п.2 + I-9 (R-221 Б-1): argv контейнера — `/work/manifest.txt` (bind-mount
+  # `RETENTION_WORK_DIR → /work`); скрипт пишет файл на хосте по `${MANIFEST_FILE}`.
+  # Передача хост-пути = ENOENT в контейнере (R-221: шаг 5 = exit=1, ALERT).
+  --cold-manifest "${RETENTION_WORK_DIR_IN_CONTAINER}/manifest.txt"
 )
 
 # Бинарь печатает `FAIL <path>: <reason>` для каждого сегмента, который НЕ удалось
