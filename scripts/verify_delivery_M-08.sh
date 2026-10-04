@@ -66,12 +66,21 @@ else
   echo "SKIP  D1-deep (сборка образа) — включается HFT_DELIVERY_DEEP=1 (CI-job + §8 на VPS)"
 fi
 
-# ── D3: холодное хранилище смонтировано в контейнер ретеншена ─────────────────────────
-if grep -qE '/cold' docker-compose.yml && grep -qE 'JOURNAL_COLD_DIR|/mnt/journal-cold' docker-compose.yml; then
-  pass "D3 docker-compose монтирует холодное хранилище в /cold"
+# ── D3: сервис ретеншена НЕ монтирует «холодный каталог» (M-92, R-180 F-1) ─────────────
+# До M-92 D3 требовал монтирования /cold: удаление доказывалось копией «в холодный каталог».
+# Замер R-180 F-1 показал, что эта сверка тождественна (копия на эфемерном слое сверялась сама с
+# собой), и M-92 заменил её сверкой с суммами НА СТОРОНЕ офсайт-копии. Теперь /cold в сервисе
+# ретеншена — признак возврата отвергнутого механизма. Полная топология (журнал rw, /ckpt:ro,
+# /work) — оракул `c0` в crates/journal/tests/red_m92_manifest_prune.rs; здесь — доставочная сторона.
+# комментарии вырезаются: в них законно сказано «JOURNAL_COLD_DIR убрана» (ложное красное, замер 2026-10-03)
+d3_vols="$(awk '/^  journal-retention:[[:space:]]*$/{f=1;next} f&&/^  [^ ]/{f=0} f' docker-compose.yml | sed -E 's/(^|[[:space:]])#.*$//')"
+if [ -z "${d3_vols}" ]; then
+  fail "D3 сервис journal-retention в docker-compose.yml не найден"
+elif printf '%s\n' "${d3_vols}" | grep -qE ':/cold([:"[:space:]]|$)|JOURNAL_COLD_DIR'; then
+  fail "D3 сервис journal-retention монтирует /cold или несёт JOURNAL_COLD_DIR — возврат тождественной \
+сверки «скопируй и подтверди» (R-180 F-1); удаление доказывается манифестом офсайт-копии (M-92)"
 else
-  fail "D3 docker-compose НЕ монтирует холодное хранилище — --cold некуда указывать, выгрузка \
-невозможна, а без выгрузки prune запрещён (ColdCopyProof) ⇒ диск не освобождается"
+  pass "D3 сервис journal-retention без /cold — удаление только по манифесту офсайт-копии (M-92)"
 fi
 
 # ── D4: сервис ретеншена объявлен (ops-профиль: не поднимается вместе с recorder) ─────
@@ -143,7 +152,7 @@ else
   # задание реально отдаёт (единственный источник — сам скрипт, RETENTION_PRINT_ARGV=1).
   # Дрейф между cron-скриптом и парсером после этого невозможен: он валит гейт.
   sandbox=$(mktemp -d)
-  mkdir -p "${sandbox}/journal" "${sandbox}/cold" "${sandbox}/root"
+  mkdir -p "${sandbox}/journal" "${sandbox}/cold" "${sandbox}/root" "${sandbox}/work" "${sandbox}/audit"
 
   if cargo build -q -p journal --bin journal-retention 2>/dev/null; then
     BIN="$(cargo metadata --format-version 1 --no-deps 2>/dev/null \
@@ -155,10 +164,24 @@ else
       RETENTION_PRINT_ARGV=1 \
       RETENTION_JOURNAL_DIR="${sandbox}/journal" \
       JOURNAL_COLD_DIR="${sandbox}/cold" \
+      RETENTION_WORK_DIR="${sandbox}/work" \
       RETENTION_MIN_FREE_GB=0 \
       bash "${CRON_JOB}"
     )
 
+    # M-92 (R-221 Б-1): задание печатает argv В ФОРМЕ КОНТЕЙНЕРА (`/work/...`, `/ckpt/...`) — так его
+    # получит бинарь внутри `docker compose run`. Здесь бинарь исполняется на хосте, поэтому цели томов
+    # переводятся в песочницу; путь хоста, оставшийся в argv, сюда не переводится и виден как ошибка.
+    # Подмена ТОЛЬКО в начале пути (отдельный токен или значение после `=`): подстрока `/work`
+    # внутри пути песочницы не трогается (иначе путь удваивается — ошибка первой редакции, f705902).
+    for i in "${!job_argv[@]}"; do
+      t="${job_argv[$i]}"
+      case "$t" in
+        /work|/work/*) t="${sandbox}${t}" ;;
+        --*=/work|--*=/work/*) t="${t%%=*}=${sandbox}${t#*=}" ;;
+      esac
+      job_argv[$i]="$t"
+    done
     set +e
     "${BIN}" "${job_argv[@]}" > "${sandbox}/real.out" 2>&1
     rc_real=$?
@@ -181,10 +204,15 @@ else
   printf '#!/bin/sh\nexit 3\n' > "${sandbox}/fake-runner"
   chmod +x "${sandbox}/fake-runner"
   set +e
+  # M-92: песочница задаёт окружение манифестной топологии (рабочий каталог, носитель аудита,
+  # команда сумм офсайт-копии, отсутствующий файл-переключатель ⇒ dry-run) — иначе задание
+  # падает на проверке настройки ДО раннера и сценарий судит не то.
   RETENTION_RUNNER="${sandbox}/fake-runner" \
     HFT_ROOT="${sandbox}/root" \
     RETENTION_LOG="${sandbox}/retention.log" \
     RETENTION_ALERT_FILE="${sandbox}/retention.alert" \
+    RETENTION_WORK_DIR="${sandbox}/work" RETENTION_AUDIT_DIR="${sandbox}/audit" \
+    RETENTION_REMOTE_SHA_CMD=false RETENTION_MODE_FILE="${sandbox}/no-switch" \
     bash "${CRON_JOB}" >/dev/null 2>&1
   rc_stub=$?
   set -e
@@ -197,6 +225,23 @@ cron/монитор не узнают о disk_pressure"
     d5=1
     fail "D5 задание НЕ подняло маркер алерта на exit≠0 — сбой ретеншена остался бы НЕЗАМЕЧЕННЫМ \
 (2 = сверка холодной копии не прошла, 3 = disk_pressure)"
+  fi
+  # (7) M-92: НЕТ настройки офсайт-копии (ни RETENTION_REMOTE_SHA_CMD, ни JOURNAL_OFFSITE_*) ⇒
+  #     задание обязано ПОДНЯТЬ тревогу и выйти ≠ 0, а не умереть на `${VAR:?}` молча: сломанная
+  #     настройка, о которой никто не узнал, — тот же класс «жив, но не работает» (OPS-I-8).
+  set +e
+  env -u RETENTION_REMOTE_SHA_CMD -u JOURNAL_OFFSITE_SSH_KEY -u JOURNAL_OFFSITE_DST \
+    RETENTION_RUNNER="${sandbox}/fake-runner" HFT_ROOT="${sandbox}/root" \
+    RETENTION_LOG="${sandbox}/cfg.log" RETENTION_ALERT_FILE="${sandbox}/cfg.alert" \
+    RETENTION_WORK_DIR="${sandbox}/work" RETENTION_AUDIT_DIR="${sandbox}/audit" \
+    RETENTION_MODE_FILE="${sandbox}/no-switch" \
+    bash "${CRON_JOB}" >/dev/null 2>&1
+  rc_cfg=$?
+  set -e
+  if [ "${rc_cfg}" -eq 0 ] || [ ! -s "${sandbox}/cfg.alert" ]; then
+    d5=1
+    fail "D5c без настройки офсайт-копии задание вышло exit=${rc_cfg} и тревогу $( [ -s "${sandbox}/cfg.alert" ] && echo подняло || echo НЕ подняло ) \
+— сломанная настройка обязана быть видна (M-92)"
   fi
   rm -rf "${sandbox}"
 
@@ -255,11 +300,13 @@ fi
 и стоит в cron — дедлайн диска двигается фактом, а не тестом"
 
 # ── D6: runbook доставки (кто монтирует Storage Box и как включается Apply) ───────────
-if [ -f deploy/README.md ] && grep -qi 'storage box\|/mnt/journal-cold' deploy/README.md; then
-  pass "D6 deploy/README описывает монтирование холодного хранилища и включение Apply"
+# M-92: процедура — сверка с манифестом офсайт-копии и включение файлом-переключателем.
+if [ -f deploy/README.md ] && grep -q 'retention\.mode' deploy/README.md \
+   && grep -qiE 'манифест|manifest' deploy/README.md && grep -qi 'sha256' deploy/README.md; then
+  pass "D6 deploy/README описывает сверку с манифестом офсайт-копии и включение файлом retention.mode"
 else
-  fail "D6 нет deploy/README.md с процедурой (монтирование Storage Box, первый dry-run, \
-переход на Apply) — ретеншен без оператора = TD-020"
+  fail "D6 deploy/README не описывает процедуру M-92 (манифест sha256 офсайт-копии, файл-переключатель \
+/var/lib/hft/retention.mode) — ретеншен без оператора = TD-020"
 fi
 
 # ── D8: compose `command:`-БЛОК реально парсится бинарём (TD-024, слепое пятно D5a/D7) ─
@@ -336,6 +383,8 @@ for pair in "retention:deploy/bin/journal-retention-cron.sh" "compaction:deploy/
     RETENTION_ALERT_FILE="${sb}/${name}.alert" COMPACTION_ALERT_FILE="${sb}/${name}.alert" \
     RETENTION_LAST_SUCCESS="${sb}/${name}.last-success" \
     COMPACTION_LAST_SUCCESS="${sb}/${name}.last-success" \
+    RETENTION_WORK_DIR="${sb}/work" RETENTION_AUDIT_DIR="${sb}/audit" \
+    RETENTION_REMOTE_SHA_CMD=false RETENTION_MODE_FILE="${sb}/no-switch" \
     bash "${job}" >/dev/null 2>&1
   set -e
   if [ ! -s "${sb}/${name}.last-success" ]; then
