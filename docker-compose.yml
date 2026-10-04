@@ -95,7 +95,7 @@ services:
       # `RETENTION_WORK_DIR` (по умолчанию `/var/lib/hft/retention-work`); оператор
       # создаёт каталог заранее (`install -d`). Без этого тома `docker compose run`
       # упадёт с ошибкой монтирования ДО старта бинаря (явный fail-closed).
-      - "${RETENTION_WORK_DIR}:/work"
+      - "${RETENTION_WORK_DIR:-/var/lib/hft/retention-work}:/work"
     # Контейнер одноразовый — без restart; запускается по cron или вручную оператором.
 
   # D-COMP-3 (M-08 task 16, TD-022): компакция закрытых сегментов (zstd) — ОТДЕЛЬНЫЙ
