@@ -28,7 +28,7 @@ DRY="${VERIFY_M92_CI_DRY:-0}"
 
 if [ "$DRY" != "1" ]; then
 # --- task1-3: оракулы предмета (библиотека, бинарь, прод-путь cron'а)
-run_step "task1-3: red_m92_manifest_prune (p1-p11, b1-b2, c0-c5)" \
+run_step "task1-3: red_m92_manifest_prune (p1-p12, b1-b2, c0-c6)" \
   cargo test -p journal --test red_m92_manifest_prune
 # --- task1: прежние оракулы ретеншена не сломаны (отбор кандидатов — один источник)
 run_step "task1: red_retention + red_retention_checkpoint_coverage + red_retention_compacted + red_retention_operator" \
