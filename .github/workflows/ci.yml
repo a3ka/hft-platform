@@ -43,6 +43,8 @@ jobs:
         env:
           HFT_DELIVERY_DEEP: "1"
         run: bash scripts/verify_delivery_M-08.sh
+      - name: Проба шага D6b — маркеры runbook'а печатает код (TD-243, A-047)
+        run: bash scripts/tests/red_runbook_markers.sh
 
   roadmap-sync:
     name: Roadmap sync (закрытие предмета не проходит мимо порядка работ)

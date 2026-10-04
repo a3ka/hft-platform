@@ -309,6 +309,21 @@ else
 /var/lib/hft/retention.mode) — ретеншен без оператора = TD-020"
 fi
 
+# ── D6b: маркеры runbook'а печатает КОД (TD-243, A-047 §2 п.1) ───────────────────────
+# D6 видит лишь наличие ключевых слов и к истинности runbook'а слеп. Маркер `=== … ===`, который
+# runbook велит искать в логе, обязан дословно (до места подстановки) встречаться в коде —
+# иначе оператор получает пустой grep и читает его как «этого не было». Предел: порядок вывода
+# и прочие утверждения о поведении не проверяются (остаточный риск TD-243). Проба —
+# scripts/tests/red_runbook_markers.sh.
+# shellcheck source=lib/runbook_markers.sh
+source "${ROOT}/scripts/lib/runbook_markers.sh"
+if d6b_out=$(runbook_markers_check "${ROOT}/deploy/README.md" "${ROOT}" 2>&1); then
+  pass "D6b маркеры deploy/README.md печатаются кодом ($(printf '%s\n' "${d6b_out}" | tail -1))"
+else
+  fail "D6b deploy/README.md велит искать в логе маркер, которого код не печатает (TD-243):"
+  printf '%s\n' "${d6b_out}" | grep -vE '^ok ' | sed 's/^/      /'
+fi
+
 # ── D8: compose `command:`-БЛОК реально парсится бинарём (TD-024, слепое пятно D5a/D7) ─
 # D5a/D7 гоняли argv CRON-СКРИПТА (раздельная форма) — и пропустили, что docker-compose держит
 # `command:` в EQUALS-форме (`--dir=/journal`, `--mode=compact`), которую ручной парсер бинаря
