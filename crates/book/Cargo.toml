@@ -1,0 +1,20 @@
+[package]
+name = "book"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+
+# Слой 1 (docs/fa/book.md): L2-стакан из L2Snapshot, microprice/spread/best, depth-полосы
+# depth(side, pct) — примитив OBI-сигнала (полосы 3%/8%). Детерминированный, без I/O.
+
+[dependencies]
+contracts = { path = "../contracts" }
+# M-38b (TD-044): serde derive на OrderBook — чекпоинт-редьюсер M-38b сериализует
+# полное состояние `Reducer`, в котором лежит `book::OrderBook`. Все ЧЕТЫРЕ поля
+# (bids, asks, last_final_update_id, stale) обязаны пережить round-trip, иначе
+# gap-детекция (GD-I-1..6) молча отключается на одну дельту после restore.
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+journal = { path = "../journal" }
+serde_json = "1"
