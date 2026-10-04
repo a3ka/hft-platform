@@ -158,6 +158,14 @@ put "$d" deploy/bin/x.sh 'echo "=== GOOD ==="'
 commit "$d"
 tracked "$d" deploy/bin/x.sh || bad "S10 SETUP НЕ СОСТОЯЛСЯ"
 expect fail "S10 частично найденные маркеры" "$d" "miss  === MISSING ==="
+# S10b (A-048 §3): итог обязан сосчитать ОБА маркера — «проверить только последний/первый»
+# печатает тот же miss, но маркеров 1.
+s10out="${TMP}/out.$((N-1))"
+if grep -qF 'runbook-markers: маркеров 2, не найдено в коде 1' "$s10out"; then
+  ok "S10b оба маркера сосчитаны, один не найден"
+else
+  bad "S10b итог не называет «маркеров 2, не найдено в коде 1» — проверены не все маркеры"; sed 's/^/      /' "$s10out"
+fi
 
 # ── S11 маркер печатает Rust вне tests — PASS (область поиска шире deploy/**) ─────────
 d=$(mk s11 <<'EOF'
@@ -238,8 +246,9 @@ put "$d" deploy/bin/x.sh 'echo "=== OTHER ==="'
 commit "$d"
 grep -q '^=========$' "$d/deploy/README.md" || bad "S18 SETUP НЕ СОСТОЯЛСЯ"
 expect fail "S18 соседний маркер после разорванной цитаты извлечён и проверен" "$d" "miss  === MISSING HERE ==="
-if grep -qE '^(ok|miss) +=====|` и `' "${TMP}/out.$((N-1))"; then
-  bad "S18b извлечён мусорный маркер (setext или склейка через бэктик)"; sed 's/^/      /' "${TMP}/out.$((N-1))"
+s18out="${TMP}/out.$((N-1))"
+if grep -qE '^(ok|miss) +=====|` и `' "$s18out"; then
+  bad "S18b извлечён мусорный маркер (setext или склейка через бэктик)"; sed 's/^/      /' "$s18out"
 else
   ok "S18b мусорных маркеров нет"
 fi
@@ -283,6 +292,26 @@ put "$d" tests/t.sh 'grep -q "=== ROOT TESTS ===" out'
 commit "$d"
 tracked "$d" tests/t.sh || bad "S22 SETUP НЕ СОСТОЯЛСЯ"
 expect fail "S22 маркер только в корневом tests/" "$d" "miss  === ROOT TESTS ==="
+
+# ── S21b порог — величина 3, не 2 (A-048, не условие) — FAIL ───────────────────────────
+d=$(mk s21b <<'EOF2'
+Ищите `=== AB… ===`.
+EOF2
+)
+put "$d" deploy/bin/x.sh 'echo "=== ABSENT ==="'
+commit "$d"
+tracked "$d" deploy/bin/x.sh || bad "S21b SETUP НЕ СОСТОЯЛСЯ"
+expect fail "S21b префикс из двух знаков" "$d" "префикс до подстановки короче 3 знаков"
+
+# ── S23 скобки — не место подстановки: код отличается внутри скобок — FAIL (A-048) ─────
+d=$(mk s23 <<'EOF2'
+Ищите `=== компакция (D-COMP-3) ===`.
+EOF2
+)
+put "$d" crates/journal/src/bin/r.rs 'println!("=== компакция (D-COMP-4) ===");'
+commit "$d"
+tracked "$d" crates/journal/src/bin/r.rs || bad "S23 SETUP НЕ СОСТОЯЛСЯ"
+expect fail "S23 код отличается внутри скобок" "$d" "miss  === компакция (D-COMP-3) ==="
 
 # ── S12 настоящий runbook репозитория — PASS (прод-форма вызова, как в D6b) ────────────
 if [ -f "${ROOT}/deploy/README.md" ] && grep -q '===' "${ROOT}/deploy/README.md"; then
