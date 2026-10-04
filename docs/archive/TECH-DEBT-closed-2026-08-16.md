@@ -2826,3 +2826,35 @@ $ grep -n "cadence_ms" crates/gateway/src/lib.rs | grep "pub "
   ```
   В `red_m91_legacy_counters.rs` попаданий нет; в `crates/*/src/` остались только ссылки про
   `md_event_age_ms` (`R-229`).
+
+- **TD-239** `runbook-ALERT-сторожа-в-deploy-README-ссылается-на-несуществующие-маркер-и-юнит`
+  (заведено reviewer'ом 2026-10-04 на PR-гейте `M-93`, вердикт `R-222` N-2.)
+  **Severity: MINOR.** **Фаза: Ф2.** Зона закрытия: **engine-dev** (`deploy/**`).
+
+  **Что.** Раздел `deploy/README.md` §0a «ALERT `бинарь не найден/не исполняем` — что делать»:
+  ```
+  $ git grep -n "WATCHDOG INSTALL OK"
+  deploy/README.md:99:   - либо джоб зелёный И `=== WATCHDOG INSTALL OK ===` в логах шага (тогда
+                                       ← единственное вхождение: код этот маркер не печатает
+  deploy/README.md:102:  `journalctl -u deploy` …   ← юнита нет: деплой идёт через appleboy/ssh-action,
+                                                       его лог — только лог джоба Actions
+  ```
+  и там же «образ, который собрал CI» — образ собирается на VPS (`docker compose up -d --build`
+  в `deploy.yml`); CI собирает его лишь в джобе `delivery` для D9-deep.
+
+  **Почему долг.** Это инструкция для момента тревоги: оператор, ищущий маркер успеха, не
+  найдёт его и на зелёном деплое, а `journalctl` ничего не покажет. На саму доставку не влияет
+  (прод-замер `R-222` / close-out `M-93`). **OPEN.**
+  **ЗАКРЫТО reviewer'ом 2026-10-04 (`R-234` APPROVE, PR #314).** Три круга: `eea45db` → `R-227`
+  REJECT; `3db4615` → `R-231` REJECT; арбитраж `A-047` (находки верны, круг 3 — один коммит по §4);
+  `7bbebf9` → `R-234` APPROVE. Замер на вершине `7bbebf9`:
+  ```
+  $ git grep -n "WATCHDOG INSTALL OK\|journalctl -u deploy" deploy/README.md
+  (упоминания остались ТОЛЬКО как отрицание: «маркера … не печатают», «юнита … не существует»)
+  $ grep -nF '=== DEPLOY FAILED ===' deploy/README.md; echo rc=$?
+  rc=1
+  ```
+  Каждое утверждение §0a о коде сверено reviewer'ом открытием `deploy.yml:295-317` и
+  `install-watchdog.sh:40-106` (`R-234` §«Сверка»). **Не закрыто этой карточкой и вынесено
+  отдельно:** класс «нарратив runbook'а о коде без оракула» → `TD-243`; маркерная проверка —
+  harness-track architect'а по `A-047` §2 п.1.
