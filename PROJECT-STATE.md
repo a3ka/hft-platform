@@ -3025,6 +3025,47 @@ architect). Прод не затронут: `deploy.yml:33-42` исключае�
 S1a/S2 в `docs/ROADMAP.md`.
 
 
+## M-93 «сторож `ops-watchdog` доставляется деплоем» (`TD-231`) — ✅ **ЗАКРЫТ** (reviewer, 2026-10-04, `R-222` APPROVE): код в `main` (PR #305, merge `fd21292`) **И ПОДТВЕРЖДЁН ПРОДОМ** — задача 4 (§8-гейт) снята замером
+
+<!-- MS-STATE: M-93 CLOSED -->
+
+**Что стало.** Единственный вычислитель тревог `ops-watchdog` больше не собирается руками на
+хосте: образ собирает его вместе с остальными бинарями (`Dockerfile:18`, `COPY` `:40`), шаг
+деплоя после health-гейта достаёт бинарь из образа РАБОТАЮЩЕГО `hft-recorder`
+(`deploy/bin/install-watchdog.sh`: `inspect` → `create` → `cp` во временный файл → `rm`
+контейнера → проверка непустоты → `chmod` → `mv`) и кладёт в `/usr/local/lib/hft/ops-watchdog`;
+cron `*/5` (`scripts/watchdog_cron.sh`) зовёт этот путь. Отказ установки на ветке healthy —
+красный деплой; на ветке отката — установка из откатного образа без маскировки причины. Сторож
+остаётся хостовым процессом (`DESIGN` §23.1: канал тревоги не делит судьбу с docker).
+
+**Цепочка:** `C-277` REJECT → `C-278` REJECT → `A-046` DECISION → engine-dev (задачи 1–2) →
+architect (задача 3, `deploy.yml`) → tester → `R-222` APPROVE (засчитан и как перепроверка
+`gates.md` §9 для `deploy.yml`). Дерево слияния: `verify_design_claims --merge-preview` PASS,
+`red_m93_watchdog_delivery` 9/9, `verify_M-93.sh` 55 PASS (единственный FAIL — барьер `TD-105`
+до коммита вердикта; после — `check_gate_meta` exit=0); PR #305 — 21/21 чеков.
+
+**§8 (задача 4), обе ноги:**
+```
+Deploy to VPS 37195391946 (push fd21292): Gate on CI success · Deploy (build on VPS) success
+CI 37195391937 (push fd21292): success
+VPS: HEAD fd21292d · hft-recorder / hft-gateway-serve (healthy) · heartbeat ts_wall_ms свежий,
+     next_seq растёт (786143579 → 786166990 за 5 мин) · recorder RssAnon 11408 kB, CPU 2 %
+sha256 /usr/local/lib/hft/ops-watchdog            = 1bf269a4…a839e
+sha256 hft-recorder:/usr/local/bin/ops-watchdog   = 1bf269a4…a839e   (побайтово равны)
+grep -c шва (HFT_WATCHDOG_ROOT|HFT_WATCHDOG_DST|WATCHDOG_BIN) в /etc/cron.d/hft-watchdog, /etc/environment → 0, 0
+тик 10:40Z: ALERT «бинарь не найден» — однократно, окно git reset → установка (предсказано R-222 §5)
+тик 10:45Z: «[ops-watchdog] … — норма», watchdog.last-success 10:45:01Z, watchdog.alert снят
+watchdog.state.json: prev_serving_heartbeat (якорь OPS-I-11), disk_history (TD-176)
+```
+
+**Остатки (не блокируют закрытие):** `TD-238` (оракул `w7` не пиннит «отказ установки —
+красный деплой»), `TD-239` (runbook ALERT в `deploy/README.md` ссылается на несуществующие
+маркер и юнит), `TD-220` — обновлена, не закрыта (правило на отказы по бюджету — вопрос
+architect'у). Ручной бинарь `/root/hft-platform/target/release/ops-watchdog` на хосте оставлен —
+cron им не пользуется; уборка — решение architect'а. На architect'е также: строка «Предел» у
+`OPS-I-11` в `docs/fa/ops.md` («потребитель НЕ ИСПОЛНЯЕТСЯ … `TD-231`») с 2026-10-04 неверна;
+строка 4bis `docs/ROADMAP.md`; перенос спеки в `docs/archive/`.
+
 ## M-91 «legacy-путь выдачи считает клиентов как v1-путь» — ✅ **ЗАКРЫТ** (reviewer, 2026-10-03, `R-216` APPROVE): код в `main` (PR #298, `1d119d9e`) **И ПОДТВЕРЖДЁН ПРОДОМ** — задача 2 (§8-гейт) снята замером
 
 <!-- MS-STATE: M-91 CLOSED -->
@@ -3422,7 +3463,7 @@ liveness-сигнала были зелены при полностью нера
 | строка `CHECKPOINT_BANDS=0.015,…,0.6` в cron-файле ретеншена | `/etc/cron.d/hft-journal-retention:50` | НЕТ (в репозитории дефолт `0.001`) | уже описана: `TD-227` (`TECH-DEBT.md:5055-5069` — корень расхождения селекторов) и `TD-230`; исчезнет молча при следующей установке cron-файла из репозитория; порядок соблюдён — `M-91` влит ПОСЛЕ `M-90` (2026-10-03, PR #298) |
 | `.env` (`GATEWAY_JWT_SECRET`, `GATEWAY_BANDS`) | `/root/hft-platform/.env`, mode 600 | gitignored намеренно | описана (9-C, `R-191`) |
 | установка `/etc/cron.d/hft-*` | `/etc/cron.d` | `deploy/cron.d/*` | описана (ручной шаг founder ★, `deploy/README.md`) |
-| бинарь `ops-watchdog` | нет нигде: ни в образе, ни `target/release`, ни `/usr/local/bin` | `Dockerfile:18` его не собирает | **`TD-231`** (заведена этим close-out'ом) |
+| бинарь `ops-watchdog` | нет нигде: ни в образе, ни `target/release`, ни `/usr/local/bin` | `Dockerfile:18` его не собирает | **`TD-231`** (заведена этим close-out'ом) → **снято `M-93` 2026-10-04** (`R-222`): собирается образом, ставится деплоем в `/usr/local/lib/hft/ops-watchdog`, `TD-231` закрыта |
 | ротация `/var/log/hft/*` | `/etc/logrotate.d/hft*` отсутствует | `deploy/cron.d/journal-retention:18` ссылается на раздел `deploy/README.md`, которого нет (`grep logrotate deploy/README.md` → пусто) | **`TD-233`** (заведена этим close-out'ом) |
 
 ### Что НЕ работает на проде при трёх зелёных liveness-сигналах
@@ -3433,7 +3474,7 @@ liveness-сигнала были зелены при полностью нера
 1. **Выдача отвергает КАЖДОГО клиента `not_ready`** восемь суток (`TD-227`): сервер и
    прогреватель резолвят разные имена файла слепка. Контейнеры при этом `healthy`,
    heartbeat свежий, журнал растёт.
-2. **Сторож `ops-watchdog` не исполняется вовсе** — значит ни одна тревога (диск, тишина
+2. ~~**Сторож `ops-watchdog` не исполняется вовсе**~~ (**снято**: ручная сборка 2026-10-02, воспроизводимая доставка — `M-93` 2026-10-04) — значит ни одна тревога (диск, тишина
    выдачи, отсутствие доставки) не вычисляется. Обёртка `*/5` пишет `ALERT … бинарь не
    найден` в лог, `watchdog.last-success` отсутствует.
 3. **Ретеншен «успешен» при нулевом эффекте** — `retention.last-success` свежий, в отчёте

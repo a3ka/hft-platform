@@ -2545,3 +2545,74 @@ $ grep -n "cadence_ms" crates/gateway/src/lib.rs | grep "pub "
   `docs/archive/` (зона architect'а).
   Карточка жила в индексе «В ПЛАНЕ» **34 суток** после приземления фикса, которое сама же
   назвала условием закрытия.
+- **TD-231** ✅ **CLOSED 2026-10-04** (reviewer, `R-222`; фикс — `M-93`, PR #305, merge `fd21292`) `сторож-ops-watchdog-не-собирается-ни-образом-ни-деплоем-ручная-сборка-не-переживает-переустановку`
+  (заведено reviewer'ом 2026-10-02 при приведении реестров к факту, вердикт `R-213`; источник —
+  аудит 2026-10-01, отчёт А §2 и отчёт Б §4.1. Номер — механизмом,
+  `bash scripts/reserve_artifact_id.sh TD`.)
+  **Severity: MAJOR**, класс **«built-not-wired»** (`gates.md` §4, DoD «Механизм на пути»).
+  **Зона правки: engine-dev** (`Dockerfile`, `.github/workflows/deploy.yml` — ops/деплой-механика,
+  `scope-guard.md`); сама разовая сборка на VPS — шаг founder ★.
+
+  **Что.** `ops-watchdog` — ЕДИНСТВЕННЫЙ вычислитель тревог в системе (диск по тренду, тишина
+  выдачи, отсутствие доставки, Telegram-транспорт). Он не входит ни в образ, ни в деплой:
+  ```
+  $ grep -n 'cargo build --release --bin' Dockerfile
+  18:RUN cargo build --release --bin recorder --bin journal-retention --bin gateway-serve \
+       --bin gateway-checkpoint --bin wsprobe        ← пять бинарей, ops-watchdog НЕТ
+
+  $ grep -n 'COPY --from=builder' Dockerfile | grep -c watchdog
+  0
+
+  $ grep -ric 'ops-watchdog' .github/workflows/deploy.yml
+  0
+  ```
+  Замер прода 2026-10-01: `/etc/cron.d/hft-watchdog` установлен и идентичен репозиторию, обёртка
+  `scripts/watchdog_cron.sh` исполняется каждые 5 минут и пишет `ALERT … бинарь не найден`;
+  `watchdog.alert` свежий (20:35Z), `watchdog.last-success` ОТСУТСТВУЕТ; бинаря нет ни в
+  `/usr/local/bin`, ни в `target/release` (на хосте только `target/debug` от 13.07).
+
+  **Почему MAJOR, а не мелочь про сборку.** На этот бинарь опираются ЧЕТЫРЕ открытых предмета
+  одновременно: `TD-220` (экспорт счётчиков выдачи), `TD-176` (предупреждение о диске заранее),
+  `docs/ROADMAP.md` п.3 (`M-78` поглощён) и 9-A-bis (сторож тишины выдачи, построенный `M-89`).
+  Все они «готовы кодом» и НИ ОДИН не работает. Сегодняшняя цена этого видна прямо: прод-выдача
+  отвергала каждого клиента восемь суток (`TD-227`), и заметить это было НЕЧЕМ — три
+  liveness-сигнала §8 (`healthy` / heartbeat / рост журнала) при мёртвой выдаче зелёные.
+
+  **Почему `TD-220` этого не покрывает.** `TD-220` предписывает **разовую ручную** `cargo build`
+  на VPS. Даже исполненная, она не закрывает класс: всё остальное доставляется ОБРАЗОМ, значит
+  после первой же пересборки/переустановки/смены хоста бинарь либо протухнет, либо исчезнет, а
+  cron продолжит кричать в лог. Корень — отсутствие ВОСПРОИЗВОДИМОГО пути сборки, и он в
+  `TD-220` не назван.
+
+  **Чем закрывается:** строка `--bin ops-watchdog` в `Dockerfile:18` + соответствующий
+  `COPY --from=builder`, ЛИБО явный шаг сборки и доставки в `deploy.yml`. Плюс оракул точки
+  входа по `testing.md` §«Механизм несущего пути»: проверка обязана ЗАПУСТИТЬ бинарь тем
+  вызовом, которым его зовёт cron-обёртка, и проверить exit-код — `test -f` и `grep` по имени
+  здесь зелёные ровно сейчас, при неработающем стороже. **Наблюдать ОТСУТСТВИЕ:** свежесть
+  `watchdog.last-success` — та проверка, которой не было. ~~**OPEN.**~~
+
+  **ЗАКРЫТО reviewer'ом 2026-10-04 (`R-222`, close-out `M-93`) — прод-замером, а не оракулом.**
+  Путь — первый из названных: `--bin ops-watchdog` + `COPY` в `Dockerfile` (`:18`, `:40`), плюс
+  доставка на хост `deploy/bin/install-watchdog.sh` из образа РАБОТАЮЩЕГО `hft-recorder` на обеих
+  ветках шага деплоя; cron зовёт `/usr/local/lib/hft/ops-watchdog`. Пруф §8:
+  ```
+  gh run 37195391946 (Deploy to VPS, push fd21292): Gate on CI success · Deploy (build on VPS) success
+  gh run 37195391937 (CI, push fd21292): success
+  лог шага: 10:38:26Z === deploy fd21292d (prev 26c9a019) === · 10:40:20Z === healthy … deployed fd21292d ===
+  $ ssh … 'git rev-parse --short HEAD'                      → fd21292d
+  $ ssh … 'sha256sum /usr/local/lib/hft/ops-watchdog'       → 1bf269a4…a839e
+  $ ssh … 'docker exec hft-recorder sha256sum /usr/local/bin/ops-watchdog' → 1bf269a4…a839e  (равны)
+  $ ssh … 'grep -c "HFT_WATCHDOG_ROOT\|HFT_WATCHDOG_DST\|WATCHDOG_BIN" /etc/cron.d/hft-watchdog /etc/environment' → 0 / 0
+  $ ssh … 'tail /var/log/hft/watchdog.log'
+  2026-10-04T10:40:01Z ALERT … бинарь не найден/не исполняем (/usr/local/lib/hft/ops-watchdog) …
+                             ← однократно: окно между `git reset` и установкой (предсказано `R-222` §5)
+  [ops-watchdog] 1791110701442 — норма, ни одно условие не сработало      ← тик 10:45Z, новым бинарём
+  watchdog.last-success 10:45:01Z · watchdog.alert — снят
+  ```
+  Требование «оракул точки входа ЗАПУСКАЕТ бинарь вызовом cron'а» исполнено прод-тиком cron'а, а
+  не CI (D9-deep — исполняемость в образе; запуск в CI опрашивал бы docker раннера — спека `M-93`
+  §6 п.2). «Наблюдать ОТСУТСТВИЕ» — свежесть `watchdog.last-success` обновляется каждым удачным
+  тиком; сторожа ЭТОГО файла снаружи сторожа нет — предел прежний, не новый.
+  Остатки — отдельными карточками: `TD-238` (оракул `w7`), `TD-239` (runbook README). Ручной
+  `/root/hft-platform/target/release/ops-watchdog` на хосте оставлен: cron им больше не
+  пользуется; уборка — решение architect'а после §8 (спека `M-93` §5).
