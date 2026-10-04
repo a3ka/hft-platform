@@ -469,21 +469,20 @@ fn p10_catalog_position_outside_plan_blocks_younger() {
 /// и оставил дыру (проба `R-221`: каталог после — `[2,4,5]`, `failed = 0`).
 #[test]
 fn p12_known_non_candidate_position_blocks_younger() {
-    // проход 1: те же события — узнать seq первого события сегмента 2
-    let probe = journal();
-    let mut segs = journal::list_segments(probe.path()).unwrap();
-    segs.sort_by_key(|s| s.index);
-    assert!(
-        segs.len() >= 5,
-        "SETUP НЕ СОСТОЯЛСЯ: сегментов {}",
-        segs.len()
-    );
-    let fresh_at = segs[2].header.first_seq - segs[0].header.first_seq;
-    // проход 2: тот же журнал, но первое событие сегмента 2 — «секунду назад» (ширина varint та же)
+    // ОДИН проход, разбиение снимается НА ХОДУ (`R-228` Б-1). Прежняя редакция писала журнал дважды и
+    // ждала одинаковых границ сегментов; но `Journal::append` кладёт `ts_mono_ns` (varint, растёт со
+    // временем), ротация идёт по байтам — на медленном хосте граница уезжает, и сценарий не строился.
+    // Теперь: пока открыт сегмент 1, каждое событие пишется «свежим» (секунду назад) — значит то
+    // событие, которое ОТКРОЕТ сегмент 2, свежее при любой скорости записи. Открылся сегмент 2 —
+    // дальше снова обычные. План судит сегмент по ПЕРВОМУ событию, поэтому свежие события в хвосте
+    // сегмента 1 его решения не меняют (сегмент 1 открыт обычным событием).
     let dir = tempfile::tempdir().expect("dir");
     let mut j = Journal::open_with(dir.path(), cfg()).expect("open_with");
+    let mut fresh_written = 0u64;
     for i in 0..N {
-        let ev = if i == fresh_at {
+        let open_segments = names(dir.path()).len();
+        let ev = if open_segments == 2 {
+            fresh_written += 1;
             EventKind::md(
                 Venue::Binance,
                 "BTCUSDT",
@@ -502,10 +501,10 @@ fn p12_known_non_candidate_position_blocks_younger() {
     j.flush().expect("flush");
     drop(j);
     let all: Vec<String> = names(dir.path()).into_iter().collect();
-    assert_eq!(
-        all,
-        names(probe.path()).into_iter().collect::<Vec<_>>(),
-        "SETUP НЕ СОСТОЯЛСЯ: разбиение на сегменты изменилось"
+    assert!(
+        all.len() >= 5 && fresh_written > 0,
+        "SETUP НЕ СОСТОЯЛСЯ: сегментов {}, свежих событий {fresh_written}",
+        all.len()
     );
     let fresh = all[2].clone();
     let guard = tempfile::tempdir().expect("guard");
