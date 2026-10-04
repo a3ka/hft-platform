@@ -129,6 +129,22 @@ exit=1
 `PROJECT-STATE.md` — `TD-241` (`:3074`, упоминание при заведении). Новой реализованной
 возможности предмет не несёт — запись в `PROJECT-STATE.md` не требуется.
 
-## Пост-проверка
+## Пост-проверка — барьеры на ветке после коммита вердикта (`0aee6fa`) и реестра (`6e64a81`)
 
-(заполняется после коммита вердикта — см. коммит-сообщение и PR)
+```
+$ export EVENT_NAME=pull_request PR_BASE_SHA=32574deddfd273a925a9ae9ca146a4417af6490e
+$ bash scripts/check_review_fa.sh | tail -2; echo exit=$?
+research/reviews/R-229-td-241-watchdog-comments.md: OPS-I-8
+research/reviews/R-229-td-241-watchdog-comments.md: OPS-I-11
+exit=0
+$ bash scripts/check_gate_meta.sh | tail -1
+VERDICT: PASS — вердиктов проверено: 1, до-нормативных приземлений: 0, merge'ей с milestone в subject'е: 0
+exit=0
+$ bash scripts/check_protected_artifacts.sh | tail -1
+OK: защищённые артефакты целы на HEAD (32574de..HEAD; проверка по РЕЗУЛЬТАТУ, не по способу)
+exit=0
+$ bash scripts/check_docs_freeze.sh; echo exit=$?
+exit=0
+```
+
+Merge — только при зелёном `All checks passed` PR-прогона (`gates.md` §8, решение по коду возврата).
