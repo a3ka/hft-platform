@@ -54,12 +54,19 @@
 Почему НЕ собирать на хосте: на VPS нет rust-toolchain'а, а два способа сборки
 бинаря = два источника правды (класс `TD-227` — то, из-за чего когда-то разъехался
 checkpoint-cron). ЕДИНСТВЕННЫЙ источник `ops-watchdog` — образ, который собирает
-САМА VPS шагом `docker compose up -d --build` в `deploy.yml` (задача 3, после
-healthy-гейта), и этот же образ реально крутится как `hft-recorder` (на ветке
-healthy — новая сборка, на ветке отката — `PREV`, `I-5` спеки). Никакого «образа,
-который собрал CI» нет: реестр/registry не используется (`deploy.yml:3` — «без
-registry/ghcr, без токенов. Один VPS, один образ — VPS сам собирает»), а
-`branch-build.yml` гоняет только `fmt + clippy + test`, без `docker build`.
+САМА VPS, и этот же образ реально крутится как `hft-recorder` (на ветке
+healthy — новая сборка, на ветке отката — `PREV`, `I-5` спеки). Реестр/registry
+не используется (`deploy.yml:3` — «без registry/ghcr, без токенов. Один VPS, один
+образ — VPS сам собирает»), `branch-build.yml` гоняет только `fmt + clippy +
+test`, без `docker build`. **CI НЕ доставляет прод-бинарь на VPS**: `ci.yml:37-44`
+джоб `delivery` собирает прод-образ в CI (`HFT_DELIVERY_DEEP=1`, тот же
+`scripts/verify_delivery_M-08.sh`), но не пушит его в registry и не передаёт
+на VPS — прод-бинарь берётся из образа, который собирает
+`docker compose up -d --build recorder gateway-serve` уже В ДЕПЛОЕ
+(`deploy.yml:298`, первое звено условия `if`-блока задачи 3); сторож
+устанавливается ПОСЛЕ healthy-гейта (`deploy.yml:305`, в `then`-ветке, только
+когда обе health-проверки `hft-recorder` и `hft-gateway-serve`
+(`deploy.yml:299-300`) прошли `healthy`).
 
 ### Проверка доставки (после деплоя)
 
@@ -105,17 +112,46 @@ ALERT ops-watchdog: бинарь не найден/не исполняем (/usr
      должен быть — пункт 2; никакого позитивного маркера вроде `WATCHDOG INSTALL OK`
      ни `install-watchdog.sh`, ни `deploy.yml` не печатают, успех = тишина в этой
      строке + зелёный шаг);
-   - либо джоб красный с `=== WATCHDOG INSTALL FAILED ===` в логах шага (тогда
-     `install-watchdog.sh` упал; см. следующий пункт о том, где этот лог смотреть).
+   - либо джоб красный с `=== WATCHDOG INSTALL FAILED ===` в логах шага — это
+     ветка `then` healthy-гейта (`deploy.yml:305`): `install-watchdog.sh` упал,
+     `deploy.yml` напечатал маркер И `exit 1` одной строкой (`{ echo "===
+     WATCHDOG INSTALL FAILED ===" >&2; exit 1; }` в правой части `||`); см.
+     следующий пункт о том, где этот лог смотреть;
+   - либо джоб красный БЕЗ `=== WATCHDOG INSTALL FAILED ===` в логах — это ветка
+     отката `else` (`deploy.yml:308-316`): healthy-гейт не прошёл, `deploy.yml`
+     уже напечатал `=== DEPLOY FAILED — logs + rollback to … ===`
+     (`deploy.yml:308`), снял `docker logs …`, откатил `git reset --hard "$PREV"`
+     (`deploy.yml:311`), поднял `hft-recorder`+`hft-gateway-serve` откатного
+     образа (`deploy.yml:312`) и попытался поставить сторож того же образа через
+     `bash deploy/bin/install-watchdog.sh || true` (`deploy.yml:315`); отказ
+     установки здесь ГЛУШИТСЯ (`|| true`), маркер `=== WATCHDOG INSTALL FAILED
+     ===` НЕ печатается (он бы ввёл в заблуждение — причина красного healthy-гейт,
+     а не установка), и джоб красный по `exit 1` (`deploy.yml:316`) в `else`-ветке.
+     В этом исходе ищите `=== DEPLOY FAILED ===` в логах (п.2), прежде чем
+     разбирать установку.
 2. **Лог шага — НЕ `journalctl`, а лог джоба GitHub Actions.** Деплой не
-   systemd-сервис, юнита `journalctl -u deploy` не существует и не появится: на
-   VPS джоб исполняется через `ssh … 'bash -s …'`, а его stdout/stderr уходит в
-   лог Actions-шага. Смотреть так: `gh run view <id> --log` (где `<id>` —
-   идентификатор прогона из `gh run list`) или UI GitHub → Actions → Deploy →
-   раскрыть шаг. Там видно, на чём упал `install-watchdog.sh`: `docker inspect`
-   (нет `hft-recorder`/`hft-gateway-serve`?) → `docker create` → `docker cp` →
-   пустой файл — каждый случай печатает свой собственный `set -e` выход с
-   предшествующим `docker`/`set -e` trace'ом.
+   systemd-сервис, юнита `journalctl -u deploy` не существует и не появится.
+   Шаг деплоя — `Deploy via SSH` (`deploy.yml:239`), `uses:
+   appleboy/ssh-action@v1` (`deploy.yml:240`) с `script: |` (`deploy.yml:246`)
+   — это action-обёртка над SSH, а НЕ голый `ssh … 'bash -s …'`; её
+   stdout/stderr — лог Actions-шага. Смотреть так: `gh run view <id> --log`
+   (где `<id>` — идентификатор прогона из `gh run list`) или UI GitHub →
+   Actions → Deploy → раскрыть шаг. Что реально видно при отказе
+   `install-watchdog.sh`: `install-watchdog.sh` стартует с `set -euo pipefail`
+   (`install-watchdog.sh:43`), **`set -x` НЕ включён** — `bash -x` trace'а нет;
+   сам скрипт на отказах НЕ печатает ничего — `install-watchdog.sh:78`,
+   `:83`, `:88-89`, `:100-101` это голый `exit 1` без `echo`, — и stderr выдаёт
+   ТОЛЬКО docker CLI на той команде, которая упала: `docker inspect`
+   (`install-watchdog.sh:78`, цель — `CONTAINER`, по умолчанию `hft-recorder`,
+   `install-watchdog.sh:46`; `hft-gateway-serve` в этой цепочке НЕ упоминается
+   ни как цель `inspect`, ни как-то иначе — это compose-сервис, его здоровье
+   судит healthy-гейт `deploy.yml:300`); затем `docker create`
+   (`install-watchdog.sh:83`); затем `docker cp` (`install-watchdog.sh:88-89`);
+   и, наконец, ветка «пустой файл» (`install-watchdog.sh:100-101`) — **НИКАКОЙ**
+   ошибки docker перед маркером `=== WATCHDOG INSTALL FAILED ===` от
+   `deploy.yml:305` (или `=== DEPLOY FAILED ===` от `deploy.yml:308`, см. п.1):
+   само отсутствие docker-ошибки в этой ветке — единственный признак «пустого
+   файла».
 3. **Проверить, что деплой РЕАЛЬНО выполнил установку** (а не пропустил по фильтру
    `paths:`). Фильтр `deploy.yml` (`A-046` E3) НЕ содержит `deploy/bin/**` и
    `scripts/watchdog_cron.sh`: правка одного установщика или обёртки едет на VPS только
