@@ -53,9 +53,20 @@
 
 Почему НЕ собирать на хосте: на VPS нет rust-toolchain'а, а два способа сборки
 бинаря = два источника правды (класс `TD-227` — то, из-за чего когда-то разъехался
-checkpoint-cron). ЕДИНСТВЕННЫЙ источник `ops-watchdog` — образ, который собрал CI и
-который реально крутится как `hft-recorder` (на ветке healthy — новая сборка, на
-ветке отката — `PREV`, `I-5` спеки).
+checkpoint-cron). ЕДИНСТВЕННЫЙ источник `ops-watchdog` — образ, который собирает
+САМА VPS, и этот же образ реально крутится как `hft-recorder` (на ветке
+healthy — новая сборка, на ветке отката — `PREV`, `I-5` спеки). Реестр/registry
+не используется (`deploy.yml:3` — «без registry/ghcr, без токенов. Один VPS, один
+образ — VPS сам собирает»), `branch-build.yml` гоняет только `fmt + clippy +
+test`, без `docker build`. **CI НЕ доставляет прод-бинарь на VPS**: `ci.yml:37-44`
+джоб `delivery` собирает прод-образ в CI (`HFT_DELIVERY_DEEP=1`, тот же
+`scripts/verify_delivery_M-08.sh`), но не пушит его в registry и не передаёт
+на VPS — прод-бинарь берётся из образа, который собирает
+`docker compose up -d --build recorder gateway-serve` уже В ДЕПЛОЕ
+(`deploy.yml:298`, первое звено условия `if`-блока задачи 3); сторож
+устанавливается ПОСЛЕ healthy-гейта (`deploy.yml:305`, в `then`-ветке, только
+когда обе health-проверки `hft-recorder` и `hft-gateway-serve`
+(`deploy.yml:299-300`) прошли `healthy`).
 
 ### Проверка доставки (после деплоя)
 
@@ -96,18 +107,68 @@ ALERT ops-watchdog: бинарь не найден/не исполняем (/usr
 ручная сборка = второй источник бинаря (`TD-227`-класс). Действия оператора:
 
 1. **Посмотреть последний прогон `deploy.yml` на GitHub** (Actions → Deploy). Ожидание:
-   - либо джоб зелёный И `=== WATCHDOG INSTALL OK ===` в логах шага (тогда
-     бинарь на хосте должен быть — пункт 2);
-   - либо джоб красный с `=== WATCHDOG INSTALL FAILED ===` (тогда `install-watchdog.sh`
-     упал; `journalctl -u deploy` или лог шага подскажет, на чём: `inspect`/`create`/
-     `cp`/пустой файл — каждый случай виден в скрипте).
-2. **Проверить, что деплой РЕАЛЬНО выполнил установку** (а не пропустил по фильтру
+   - либо джоб зелёный И в логах шага ОТСУТСТВУЕТ строка `=== WATCHDOG INSTALL
+     FAILED ===` (тогда `install-watchdog.sh` отработал `exit 0`, бинарь на хосте
+     должен быть — пункт 2; никакого позитивного маркера вроде `WATCHDOG INSTALL OK`
+     ни `install-watchdog.sh`, ни `deploy.yml` не печатают, успех = тишина в этой
+     строке + зелёный шаг);
+   - либо джоб красный с `=== WATCHDOG INSTALL FAILED ===` в логах шага — это
+     ветка `then` healthy-гейта (`deploy.yml:305`): `install-watchdog.sh` упал,
+     `deploy.yml` напечатал маркер И `exit 1` одной строкой (`{ echo "===
+     WATCHDOG INSTALL FAILED ===" >&2; exit 1; }` в правой части `||`); см.
+     следующий пункт о том, где этот лог смотреть;
+   - либо джоб красный БЕЗ `=== WATCHDOG INSTALL FAILED ===` в логах — это ветка
+     отката `else` (`deploy.yml:308-316`): healthy-гейт не прошёл, `deploy.yml`
+     уже напечатал `=== DEPLOY FAILED — logs + rollback to … ===`
+     (`deploy.yml:308`), снял `docker logs …`, откатил `git reset --hard "$PREV"`
+     (`deploy.yml:311`), поднял `hft-recorder`+`hft-gateway-serve` откатного
+     образа (`deploy.yml:312`) и попытался поставить сторож того же образа через
+     `bash deploy/bin/install-watchdog.sh || true` (`deploy.yml:315`); отказ
+     установки здесь ГЛУШИТСЯ (`|| true`), маркер `=== WATCHDOG INSTALL FAILED
+     ===` НЕ печатается (он бы ввёл в заблуждение — причина красного healthy-гейт,
+     а не установка), и джоб красный по `exit 1` (`deploy.yml:316`) в `else`-ветке.
+     В этом исходе ищите в логах `grep -F '=== DEPLOY FAILED'` (по
+     префиксу, как печатает `deploy.yml:308` — `=== DEPLOY FAILED — logs +
+     rollback to <sha> ===`); прежде чем разбирать установку, проверьте
+     п.2.
+2. **Лог шага — НЕ `journalctl`, а лог джоба GitHub Actions.** Деплой не
+   systemd-сервис, юнита `journalctl -u deploy` не существует и не появится.
+   Шаг деплоя — `Deploy via SSH` (`deploy.yml:239`), `uses:
+   appleboy/ssh-action@v1` (`deploy.yml:240`) с `script: |` (`deploy.yml:246`)
+   — это action-обёртка над SSH, а НЕ голый `ssh … 'bash -s …'`; её
+   stdout/stderr — лог Actions-шага. Смотреть так: `gh run view <id> --log`
+   (где `<id>` — идентификатор прогона из `gh run list`) или UI GitHub →
+   Actions → Deploy → раскрыть шаг. Что реально видно при отказе
+   `install-watchdog.sh`: `install-watchdog.sh` стартует с `set -euo pipefail`
+   (`install-watchdog.sh:43`), **`set -x` НЕ включён** — `bash -x` trace'а нет;
+   сам скрипт на отказах НЕ печатает ничего — `install-watchdog.sh:78`,
+   `:83`, `:88-89`, `:100-101` это голый `exit 1` без `echo`, — и stderr даёт
+   та команда, которая упала: docker CLI на `inspect` (`install-watchdog.sh:78`)
+   / `create` (`:83`) / `cp` (`:88-89`), coreutils на `mkdir -p` (`:57`),
+   `chmod` (`:105`), `mv -f` (`:106`); EXIT-trap (`:65-73`) молчит — `docker
+   rm` и `rm -f` уведены в `/dev/null`;
+   и, наконец, ветка «пустой файл» распознаётся по-разному в зависимости от
+   ветки `deploy.yml`. **Ветка `then` (`deploy.yml:305`):** между строкой
+   `=== healthy (recorder + gateway-serve) — deployed … ===` (`deploy.yml:301`)
+   и `=== WATCHDOG INSTALL FAILED ===` (`deploy.yml:305`) в логе стоит вывод
+   установщика; пусто между ними ⇒ «пустой файл» (`install-watchdog.sh:100-101`):
+   все остальные точки отказа печатают stderr (п.2 выше), trap молчит. Это
+   единственная ветка, где правило работает. **Ветка `else`
+   (`deploy.yml:308-316`):** `=== DEPLOY FAILED — logs + rollback to <sha> ===`
+   печатается ПЕРВЫМ (`deploy.yml:308`); далее два `docker logs`
+   (`deploy.yml:309-310`), откат (`deploy.yml:311`), сборка откатного образа
+   (`deploy.yml:312`), и только затем установщик (`deploy.yml:315`) с `|| true`
+   — маркера после него НЕТ, следом сразу `exit 1` (`deploy.yml:316`). Успех
+   установки и «пустой файл» здесь ОБА молчат ⇒ **исход установки в ветке
+   отката из лога Actions не определим**; оператор идёт на хост: проверка
+   доставки (1)-(2) (`:74-82`) и при расхождении — п.4 (ручной перезапуск).
+3. **Проверить, что деплой РЕАЛЬНО выполнил установку** (а не пропустил по фильтру
    `paths:`). Фильтр `deploy.yml` (`A-046` E3) НЕ содержит `deploy/bin/**` и
    `scripts/watchdog_cron.sh`: правка одного установщика или обёртки едет на VPS только
    со следующим КОДОВЫМ push'ем или `workflow_dispatch`. Если алерт появился после
    правки ТОЛЬКО этих файлов без другого кодового коммита — это и есть причина
    (нужен `workflow_dispatch` или push в кодовый путь фильтра).
-3. **Перезапустить установку вручную** (если деплой был, но бинаря нет — например,
+4. **Перезапустить установку вручную** (если деплой был, но бинаря нет — например,
    `/usr/local/lib/hft` удалили):
 
    ```bash
@@ -115,7 +176,7 @@ ALERT ops-watchdog: бинарь не найден/не исполняем (/usr
    /root/hft-platform/deploy/bin/install-watchdog.sh; echo "exit=$?"
    # ожидание: exit=0, ls -l /usr/local/lib/hft/ops-watchdog показывает свежий файл
    ```
-4. **Если деплой не запускался давно** (бинарь протух с прошлой правки `crates/ops/**`)
+5. **Если деплой не запускался давно** (бинарь протух с прошлой правки `crates/ops/**`)
    — это НОРМАЛЬНО: `ops-watchdog` обновляется с каждым деплоем кода, как все
    остальные бинари образа. Свежесть файла на хосте = свежесть образа; рассогласование
    ловится шагом (2) выше.
