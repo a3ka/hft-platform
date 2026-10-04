@@ -127,8 +127,10 @@ ALERT ops-watchdog: бинарь не найден/не исполняем (/usr
      установки здесь ГЛУШИТСЯ (`|| true`), маркер `=== WATCHDOG INSTALL FAILED
      ===` НЕ печатается (он бы ввёл в заблуждение — причина красного healthy-гейт,
      а не установка), и джоб красный по `exit 1` (`deploy.yml:316`) в `else`-ветке.
-     В этом исходе ищите `=== DEPLOY FAILED ===` в логах (п.2), прежде чем
-     разбирать установку.
+     В этом исходе ищите в логах `grep -F '=== DEPLOY FAILED'` (по
+     префиксу, как печатает `deploy.yml:308` — `=== DEPLOY FAILED — logs +
+     rollback to <sha> ===`); прежде чем разбирать установку, проверьте
+     п.2.
 2. **Лог шага — НЕ `journalctl`, а лог джоба GitHub Actions.** Деплой не
    systemd-сервис, юнита `journalctl -u deploy` не существует и не появится.
    Шаг деплоя — `Deploy via SSH` (`deploy.yml:239`), `uses:
@@ -140,18 +142,26 @@ ALERT ops-watchdog: бинарь не найден/не исполняем (/usr
    `install-watchdog.sh`: `install-watchdog.sh` стартует с `set -euo pipefail`
    (`install-watchdog.sh:43`), **`set -x` НЕ включён** — `bash -x` trace'а нет;
    сам скрипт на отказах НЕ печатает ничего — `install-watchdog.sh:78`,
-   `:83`, `:88-89`, `:100-101` это голый `exit 1` без `echo`, — и stderr выдаёт
-   ТОЛЬКО docker CLI на той команде, которая упала: `docker inspect`
-   (`install-watchdog.sh:78`, цель — `CONTAINER`, по умолчанию `hft-recorder`,
-   `install-watchdog.sh:46`; `hft-gateway-serve` в этой цепочке НЕ упоминается
-   ни как цель `inspect`, ни как-то иначе — это compose-сервис, его здоровье
-   судит healthy-гейт `deploy.yml:300`); затем `docker create`
-   (`install-watchdog.sh:83`); затем `docker cp` (`install-watchdog.sh:88-89`);
-   и, наконец, ветка «пустой файл» (`install-watchdog.sh:100-101`) — **НИКАКОЙ**
-   ошибки docker перед маркером `=== WATCHDOG INSTALL FAILED ===` от
-   `deploy.yml:305` (или `=== DEPLOY FAILED ===` от `deploy.yml:308`, см. п.1):
-   само отсутствие docker-ошибки в этой ветке — единственный признак «пустого
-   файла».
+   `:83`, `:88-89`, `:100-101` это голый `exit 1` без `echo`, — и stderr даёт
+   та команда, которая упала: docker CLI на `inspect` (`install-watchdog.sh:78`)
+   / `create` (`:83`) / `cp` (`:88-89`), coreutils на `mkdir -p` (`:57`),
+   `chmod` (`:105`), `mv -f` (`:106`); EXIT-trap (`:65-73`) молчит — `docker
+   rm` и `rm -f` уведены в `/dev/null`;
+   и, наконец, ветка «пустой файл» распознаётся по-разному в зависимости от
+   ветки `deploy.yml`. **Ветка `then` (`deploy.yml:305`):** между строкой
+   `=== healthy (recorder + gateway-serve) — deployed … ===` (`deploy.yml:301`)
+   и `=== WATCHDOG INSTALL FAILED ===` (`deploy.yml:305`) в логе стоит вывод
+   установщика; пусто между ними ⇒ «пустой файл» (`install-watchdog.sh:100-101`):
+   все остальные точки отказа печатают stderr (п.2 выше), trap молчит. Это
+   единственная ветка, где правило работает. **Ветка `else`
+   (`deploy.yml:308-316`):** `=== DEPLOY FAILED — logs + rollback to <sha> ===`
+   печатается ПЕРВЫМ (`deploy.yml:308`); далее два `docker logs`
+   (`deploy.yml:309-310`), откат (`deploy.yml:311`), сборка откатного образа
+   (`deploy.yml:312`), и только затем установщик (`deploy.yml:315`) с `|| true`
+   — маркера после него НЕТ, следом сразу `exit 1` (`deploy.yml:316`). Успех
+   установки и «пустой файл» здесь ОБА молчат ⇒ **исход установки в ветке
+   отката из лога Actions не определим**; оператор идёт на хост: проверка
+   доставки (1)-(2) (`:74-82`) и при расхождении — п.4 (ручной перезапуск).
 3. **Проверить, что деплой РЕАЛЬНО выполнил установку** (а не пропустил по фильтру
    `paths:`). Фильтр `deploy.yml` (`A-046` E3) НЕ содержит `deploy/bin/**` и
    `scripts/watchdog_cron.sh`: правка одного установщика или обёртки едет на VPS только
