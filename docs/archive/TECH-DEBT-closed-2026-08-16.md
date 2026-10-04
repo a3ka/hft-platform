@@ -2858,3 +2858,39 @@ $ grep -n "cadence_ms" crates/gateway/src/lib.rs | grep "pub "
   `install-watchdog.sh:40-106` (`R-234` §«Сверка»). **Не закрыто этой карточкой и вынесено
   отдельно:** класс «нарратив runbook'а о коде без оракула» → `TD-243`; маркерная проверка —
   harness-track architect'а по `A-047` §2 п.1.
+
+- **TD-242** `строка-ошибки-допуска-выдачи-называет-оси-которых-admit-не-судит`
+  (заведено reviewer'ом 2026-10-04, вердикт `R-233`, при закрытии `TD-220` — по поручению
+  `R-232` Н-3, находка `R-230` Б-2. Номер — механизмом `scripts/next_artifact_id.sh TD`.)
+  **Severity: MINOR.** **Фаза: Ф2.** Зона закрытия: **engine-dev** (`crates/gateway-serve/src/**`).
+
+  **Что.** Пользовательская строка ошибки ветки `ServingOutcome::Unsupported` перечисляет оси
+  допуска неверно. Замер на `origin/main` `e4cab87`:
+  ```
+  $ git grep -n 'band/timeframe/window' origin/main -- crates/
+  crates/gateway-serve/src/lib.rs:1180:  "selector вне политики допуска (band/timeframe/window)".to_string();
+  ```
+  Код допуска судит ТРИ другие вещи — `admit()` в `crates/gateway-serve/src/admission.rs:122-131`:
+  `bands_subset(&sel.bands, …)`, `sym_ok` (символ), `profile_allowed` (только `timeframe_ms`;
+  `window_ms` там прямо назван непроверяемым на этом слое, `:147-156`). Итого `window` — ложная
+  ось, `symbol` — пропущенная. FA (`docs/fa/ops.md:479`, `OPS-I-11`) уже исправлена по коду
+  (PR #312), а сообщение — нет; именно из него FA и скопировала ошибку в круге 1 (`R-230` Б-2).
+
+  **Почему MINOR.** Поведение допуска верно; неверен только текст отказа. Цена — клиент, отвергнутый
+  по символу, читает про `window` и ищет причину не там. **Чем закрывается:** строка `lib.rs:1180`
+  называет `bands/symbol/timeframe_ms` (или конкретную сработавшую ось). Тест на текст — по решению
+  architect'а. **OPEN.**
+  **ЗАКРЫТО reviewer'ом 2026-10-04 (`R-235` APPROVE, PR #316, merge `087ba99`).** Коммит `c676e1b`
+  [engine-dev]: строка отказа — «selector вне политики допуска (bands/symbol/timeframe_ms)», рядом
+  комментарий о трёх осях `admit()`. Замер на вершине ветки:
+  ```
+  $ grep -rn 'band/timeframe/window' crates/ deploy/ scripts/
+  (пусто)
+  $ sed -n 1185p crates/gateway-serve/src/lib.rs
+      let msg = "selector вне политики допуска (bands/symbol/timeframe_ms)"
+  ```
+  Оси сверены открытием `admission.rs:122-131`. Поведение (`Unsupported`, `refusals_unsupported`,
+  WS-код `"unsupported"`) не тронуто; `cargo test -p gateway-serve` — `passed=203 failed=0`.
+  **Не закрыто этой карточкой (без новых карточек, к architect'у):** `R-235` §5 Н-1 — ссылка
+  `docs/fa/ops.md:479` на `lib.rs:1228` (`overloaded`) сдвинулась на `:1234`; Н-2 — оракула на
+  текст отказа нет, следующая ось в `admit()` снова разойдётся с текстом молча.
