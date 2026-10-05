@@ -40,11 +40,14 @@ if [ ! -f "$APPLY" ]; then
 fi
 ok "a0 скрипт деплоя существует"
 
-# ── мир: <имя> <код гейта> <здоровье recorder> <здоровье gateway-serve> [код сторожа] ──────
-# Здоровье — ПО СЛУЖБЕ (`C-281` B1): общий ответ на любой `inspect` не отличал деплой, ждущий
-# обе службы, от ждущего одну.
+# ── мир: <имя> <код гейта> <здоровье recorder> <здоровье gateway-serve> [код сторожа] [cron невалиден]
+# Здоровье — ПО СЛУЖБЕ (`C-281` B1) и ПОСЛЕДОВАТЕЛЬНОСТЬЮ состояний (`A-049` Р-2): прод после
+# `up -d` отвечает `starting` (healthcheck `start_period`), и константный ответ не отличал «ждёт
+# healthy» от «принимает всё, кроме unhealthy». Язык спецификации здоровья службы:
+#   healthy | unhealthy | starting (навсегда) | starting:K,healthy (K раз starting, затем healthy)
+#   | missing (контейнера нет: `inspect` выходит ≠ 0)
 mk_world() {
-  local w="$SANDBOX/$1" gate_rc="$2" h_rec="$3" h_srv="$4" wd_rc="${5:-0}"
+  local w="$SANDBOX/$1" gate_rc="$2" h_rec="$3" h_srv="$4" wd_rc="${5:-0}" cron_bad="${6:-0}"
   mkdir -p "$w/repo" "$w/cron" "$w/bin" || return 1
   (
     cd "$w/repo" || exit 1
@@ -54,43 +57,58 @@ mk_world() {
     printf 'CALC_PROFILE_VERSION=1\n' > config/calc-profile/active.env
     git add -A && git commit -qm prev || exit 1
     printf '# TARGET\n*/15 * * * * root echo target\n' > deploy/cron.d/journal-retention
+    [ "$cron_bad" = 1 ] && printf 'INVALID-CRON-MARKER\n' >> deploy/cron.d/journal-retention
     printf 'CALC_PROFILE_VERSION=2\n' > config/calc-profile/active.env
     cp "$APPLY" deploy/bin/deploy-apply.sh
     git add -A && git commit -qm target || exit 1
   ) || return 1
   # cron хоста до деплоя — ставлен прошлым деплоем, т.е. из PREV
   printf '# PREV\n*/15 * * * * root echo prev\n' > "$w/cron/hft-journal-retention"
-  cat > "$w/bin/docker" <<EOF
+  printf 'W=%q\nH_REC=%q\nH_SRV=%q\n' "$w" "$h_rec" "$h_srv" > "$w/stub.env"
+  cat > "$w/bin/docker" <<'STUB'
 #!/usr/bin/env bash
-h=\$(git rev-parse --short HEAD 2>/dev/null || echo nohead)
-last=""; for a in "\$@"; do case "\$a" in hft-*) last="\$a" ;; esac; done  # имя контейнера, где бы оно ни стояло
-case "\$1" in
+. "$(dirname "$0")/../stub.env"
+h=$(git rev-parse --short HEAD 2>/dev/null || echo nohead)
+last=""; for a in "$@"; do case "$a" in hft-*) last="$a" ;; esac; done  # имя контейнера, где бы оно ни стояло
+answer() { # <спецификация здоровья> <служба> — состояние на ЭТОТ вызов
+  local spec="$1" svc="$2" n k
+  n=$(( $(cat "$W/cnt.$svc" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$W/cnt.$svc"
+  case "$spec" in
+    missing)    echo "Error: No such object: $svc" >&2; exit 1 ;;
+    starting:*) k="${spec#starting:}"; k="${k%%,*}"
+                if [ "$n" -le "$k" ]; then echo starting; else echo "${spec##*,}"; fi ;;
+    *)          echo "$spec" ;;
+  esac
+}
+case "$1" in
   compose)
-    case "\$2" in
-      build) echo "build@\$h" >> "$w/docker.log" ;;
-      up)    echo "up@\$h" >> "$w/docker.log" ;;
-      *)     echo "other:\$*@\$h" >> "$w/docker.log" ;;
+    case "$2" in
+      build) echo "build@$h" >> "$W/docker.log" ;;
+      up)    echo "up@$h" >> "$W/docker.log" ;;
+      *)     echo "other:$*@$h" >> "$W/docker.log" ;;
     esac ;;
   inspect)
-    echo "inspect:\$last" >> "$w/inspect.log"
-    case "\$last" in
-      hft-recorder)      echo "$h_rec" ;;
-      hft-gateway-serve) echo "$h_srv" ;;
-      *)                 echo "no-such-container" ;;
+    echo "inspect:$last" >> "$W/inspect.log"
+    case "$last" in
+      hft-recorder)      answer "$H_REC" "$last" ;;
+      hft-gateway-serve) answer "$H_SRV" "$last" ;;
+      *)                 echo "Error: No such object" >&2; exit 1 ;;
     esac ;;
-  logs)  echo "logs:\$last@\$h" >> "$w/docker.log" ;;
-  image) [ "\$2" = prune ] && echo "prune@\$h" >> "$w/docker.log" ;;
-  *)     echo "other:\$*@\$h" >> "$w/docker.log" ;;
+  logs)  echo "logs:$last@$h" >> "$W/docker.log" ;;
+  image) [ "$2" = prune ] && echo "prune@$h" >> "$W/docker.log" ;;
+  *)     echo "other:$*@$h" >> "$W/docker.log" ;;
 esac
 exit 0
-EOF
+STUB
+  # валидатор cron: отказывает на файле-маркере (`A-049` Р-3) — то, что `crontab -n` делает на проде
+  printf '#!/usr/bin/env bash\nif grep -q INVALID-CRON-MARKER "$1"; then echo "invalid cron: $1" >&2; exit 1; fi\nexit 0\n' > "$w/bin/cronval"
   cat > "$w/bin/gate" <<EOF
 #!/usr/bin/env bash
 echo "gate@\$(git rev-parse --short HEAD)" >> "$w/docker.log"
 exit $gate_rc
 EOF
   printf '#!/usr/bin/env bash\necho "watchdog@$(git rev-parse --short HEAD)" >> "%s/docker.log"\nexit %s\n' "$w" "$wd_rc" > "$w/bin/watchdog"
-  chmod +x "$w/bin/docker" "$w/bin/gate" "$w/bin/watchdog" || return 1
+  chmod +x "$w/bin/docker" "$w/bin/gate" "$w/bin/watchdog" "$w/bin/cronval" || return 1
   # страж подготовки: две ревизии, на TARGET есть скрипт, на PREV его нет
   [ "$(git -C "$w/repo" rev-list --count HEAD)" = 2 ] \
     && git -C "$w/repo" cat-file -e HEAD:deploy/bin/deploy-apply.sh \
@@ -102,7 +120,7 @@ run_apply() { # <каталог мира> → RC, OUT
   local w="$1" prev
   prev=$(git -C "$w/repo" rev-parse HEAD~1)
   OUT=$(cd "$w/repo" && DEPLOY_DOCKER="$w/bin/docker" DEPLOY_GATE="$w/bin/gate" \
-        DEPLOY_CRON_DIR="$w/cron" DEPLOY_SUDO="" DEPLOY_CRON_VALIDATE=true \
+        DEPLOY_CRON_DIR="$w/cron" DEPLOY_SUDO="" DEPLOY_CRON_VALIDATE="$w/bin/cronval" \
         DEPLOY_WATCHDOG_INSTALL="$w/bin/watchdog" DEPLOY_HEALTH_TIMEOUT=5 \
         timeout 60 bash deploy/bin/deploy-apply.sh "$prev" 2>&1); RC=$?
   PREV_S=$(git -C "$w/repo" rev-parse --short HEAD~1 2>/dev/null)
@@ -139,7 +157,9 @@ if w=$(mk_world a2 0 healthy healthy); then
   reasons=""
   grep -qx 'inspect:hft-recorder' "$w/inspect.log" 2>/dev/null || reasons="$reasons; здоровье hft-recorder не спрашивалось"
   grep -qx 'inspect:hft-gateway-serve' "$w/inspect.log" 2>/dev/null || reasons="$reasons; здоровье hft-gateway-serve не спрашивалось"
-  grep -q "^prune@$t" "$w/docker.log" 2>/dev/null || reasons="$reasons; docker image prune после успешного деплоя не выполнен"
+  pl=$(grep -n "^prune@$t" "$w/docker.log" 2>/dev/null | tail -1 | cut -d: -f1)
+  ul=$(grep -n "^up@$t" "$w/docker.log" 2>/dev/null | tail -1 | cut -d: -f1)
+  { [ -n "$pl" ] && [ -n "$ul" ] && [ "$pl" -gt "$ul" ]; } || reasons="$reasons; docker image prune после успешного up не выполнен (prune строка ${pl:-нет}, up строка ${ul:-нет})"
   grep -q '^logs:' "$w/docker.log" 2>/dev/null && reasons="$reasons; логи сняты при УСПЕШНОМ деплое"
   [ "$RC" -eq 0 ] || reasons="$reasons; exit=$RC"
   [ "$(git -C "$w/repo" rev-parse HEAD)" = "$(git -C "$w/repo" rev-parse main)" ] || reasons="$reasons; чекаут не на TARGET"
@@ -175,6 +195,13 @@ health_world() { # <имя> <recorder> <gateway-serve>
     [ "$RC" -ne 0 ] || reasons="$reasons; exit=0 при нездоровой службе (recorder=$hr, gateway-serve=$hs)"
     [ "$(git -C "$w/repo" rev-parse HEAD)" = "$PREVFULL" ] || reasons="$reasons; чекаут не на PREV"
     [ "$last_up" = "up@$prev_s" ] || reasons="$reasons; последний up «$last_up», а не на PREV"
+    # `A-049` Р-1: up без пересборки поднимает ТОТ ЖЕ образ по тегу — сломанный TARGET. Последняя
+    # сборка обязана быть на PREV и стоять РАНЬШЕ последнего up.
+    local lb lu
+    lb=$(grep -n "^build@$prev_s\$" "$w/docker.log" 2>/dev/null | tail -1 | cut -d: -f1)
+    lu=$(grep -n "^up@$prev_s\$" "$w/docker.log" 2>/dev/null | tail -1 | cut -d: -f1)
+    { [ -n "$lb" ] && [ -n "$lu" ] && [ "$lb" -lt "$lu" ]; } \
+      || reasons="$reasons; при откате образ не пересобран на PREV до up (build@PREV строка ${lb:-нет}, up@PREV строка ${lu:-нет})"
     grep -q 'echo prev' "$w/cron/hft-journal-retention" && ! grep -q 'echo target' "$w/cron/hft-journal-retention" \
       || reasons="$reasons; cron хоста остался от TARGET после отката"
     grep -q '^logs:hft-recorder@' "$w/docker.log" 2>/dev/null || reasons="$reasons; при отказе не сняты логи hft-recorder"
@@ -186,6 +213,43 @@ health_world() { # <имя> <recorder> <gateway-serve>
 health_world a4  unhealthy unhealthy
 health_world a4r unhealthy healthy
 health_world a4s healthy   unhealthy
+# `A-049` Р-2: `starting` навсегда у одной службы ⇒ откат по истечении DEPLOY_HEALTH_TIMEOUT;
+# `inspect` падает (контейнера нет) ⇒ откат. Мутант «всё, кроме unhealthy, — здорово» здесь красен.
+health_world a4t healthy  starting
+health_world a4m missing  healthy
+
+# ── a2s (`A-049` Р-2): starting → healthy у обеих ⇒ деплой ДОЖДАЛСЯ, а не отказал и не проскочил ──
+if w=$(mk_world a2s 0 'starting:2,healthy' 'starting:2,healthy'); then
+  run_apply "$w"
+  nr=$(grep -cx 'inspect:hft-recorder' "$w/inspect.log" 2>/dev/null || true)
+  ns=$(grep -cx 'inspect:hft-gateway-serve' "$w/inspect.log" 2>/dev/null || true)
+  if [ "$RC" -eq 0 ] && [ "${nr:-0}" -ge 3 ] && [ "${ns:-0}" -ge 3 ] && grep -q '^up@' "$w/docker.log" \
+     && [ "$(git -C "$w/repo" rev-parse HEAD)" = "$(git -C "$w/repo" rev-parse main)" ]; then
+    ok "a2s starting→healthy ⇒ дождался: exit 0, inspect recorder=$nr serve=$ns (≥3), чекаут TARGET"
+  else
+    nope "a2s starting→healthy: exit=$RC, inspect recorder=${nr:-0} serve=${ns:-0} (нужно ≥3 — два starting и healthy), HEAD=$(git -C "$w/repo" rev-parse --short HEAD)"
+  fi
+else nope "a2s SETUP не состоялся"; fi
+
+# ── a6 (`A-049` Р-3): cron TARGET не проходит валидацию ⇒ отказ ДО up, cron хоста цел, откат к PREV ──
+# Откат к PREV (чекаут + пересборка образа) — по тому же основанию, что при отказе гейта (`C-280`
+# R3): оставленный за TARGET тег образа даст cron'у прогреватель нового кода.
+if w=$(mk_world a6 0 healthy healthy 0 1); then
+  before=$(stat -c %Y "$w/cron/hft-journal-retention"); sleep 1
+  run_apply "$w"
+  prev_s=$(git -C "$w/repo" rev-parse --short "$PREVFULL")
+  after=$(stat -c %Y "$w/cron/hft-journal-retention" 2>/dev/null || echo gone)
+  last_build=$(grep '^build@' "$w/docker.log" 2>/dev/null | tail -1)
+  reasons=""
+  [ "$RC" -ne 0 ] || reasons="$reasons; exit=0 при невалидном cron"
+  grep -q '^up@' "$w/docker.log" 2>/dev/null && reasons="$reasons; выдача перезапущена при невалидном cron"
+  [ "$before" = "$after" ] || reasons="$reasons; cron-файл хоста перезаписан"
+  grep -q 'INVALID-CRON-MARKER' "$w/cron/hft-journal-retention" 2>/dev/null && reasons="$reasons; невалидный cron установлен"
+  [ "$(git -C "$w/repo" rev-parse HEAD)" = "$PREVFULL" ] || reasons="$reasons; чекаут не возвращён к PREV"
+  [ "$last_build" = "build@$prev_s" ] || reasons="$reasons; последняя сборка «$last_build», а не на PREV"
+  if [ -z "$reasons" ]; then ok "a6 невалидный cron ⇒ отказ до up, cron хоста цел, чекаут и образ — PREV"
+  else nope "a6 невалидный cron:${reasons} | лог: $(tr '\n' ' ' < "$w/docker.log" 2>/dev/null)"; fi
+else nope "a6 SETUP не состоялся"; fi
 
 # ── a5: установка сторожа ОТКАЗАЛА на здоровом деплое ⇒ деплой красный (контракт deploy.yml M-93) ──
 if w=$(mk_world a5 0 healthy healthy 1); then
