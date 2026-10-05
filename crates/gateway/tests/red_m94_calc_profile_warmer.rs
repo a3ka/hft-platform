@@ -1033,6 +1033,25 @@ fn p7_print_ckpt_name_without_journal() {
         slepok_names(tmp.path()).is_empty(),
         "I-8: `--print-ckpt-name` записал слепок — печать имени обязана быть без прогона"
     );
+    // ГОЛАЯ форма — так её зовёт гейт деплоя (`compose run … gateway-checkpoint --print-ckpt-name`:
+    // ARGS непусты ⇒ `command:` заменён целиком, путей нет; `A-049` примечание к `p7`).
+    let o = Command::new(BIN)
+        .arg("--print-ckpt-name")
+        .current_dir(tmp.path())
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("GATEWAY_CALC_PROFILE", active_profile_path())
+        .output()
+        .expect("запуск gateway-checkpoint");
+    assert_eq!(
+        (
+            o.status.code(),
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        ),
+        (Some(0), PROD_CKPT_NAME.to_string()),
+        "I-8: голая форма `--print-ckpt-name` (как её зовёт гейт деплоя) не напечатала имя: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
 }
 
 /// **`p8` — прогрев `next` заранее (`П-032` п.5).** С `next.env` cron делает второй прогон с
@@ -1163,16 +1182,86 @@ fn p9_two_profiles_coexist_first_slepok_untouched() {
 // ───────────────────────── p8b: ЭФФЕКТ на цели ретеншена (C-280 R2) ─────────────────────────
 
 /// Монтирования сервиса compose: `(том, путь в контейнере)`.
-fn compose_volumes(service: &str) -> Vec<(String, String)> {
+/// Монтирования сервиса compose: `(том, путь в контейнере, только-чтение)` — режим НЕСЁТСЯ
+/// (`A-049` Р-5, чек-лист `testing.md` п.6: фикстура повторяет режим монтирования прода).
+fn compose_volumes(service: &str) -> Vec<(String, String, bool)> {
     compose_block(service, "volumes")
         .iter()
         .filter_map(|l| l.strip_prefix("- "))
         .map(|spec| spec.trim().trim_matches('"'))
         .filter_map(|spec| {
             let mut it = spec.split(':');
-            Some((it.next()?.to_string(), it.next()?.to_string()))
+            let vol = it.next()?.to_string();
+            let dst = it.next()?.to_string();
+            let ro = it.next().is_some_and(|m| m.split(',').any(|o| o == "ro"));
+            Some((vol, dst, ro))
         })
         .collect()
+}
+
+/// Том сервиса, на котором лежит путь контейнера: `(том, только-чтение)`.
+fn volume_of(service: &str, p: &str) -> (String, bool) {
+    let p = normalize_container(p);
+    compose_volumes(service)
+        .into_iter()
+        .filter(|(_, dst, _)| p == *dst || p.starts_with(&format!("{dst}/")))
+        .max_by_key(|(_, dst, _)| dst.len())
+        .map(|(v, _, ro)| (v, ro))
+        .unwrap_or_else(|| panic!("SETUP НЕ СОСТОЯЛСЯ: путь `{p}` сервиса `{service}` не на томе"))
+}
+
+/// Тома `:ro` сервиса в фикстуре делаются НЕДОСТУПНЫМИ ДЛЯ ЗАПИСИ на время прогона; возврат
+/// прав — при выходе из области (иначе `TempDir` не уберёт каталог).
+struct ReadOnlySeal(Vec<PathBuf>);
+impl ReadOnlySeal {
+    fn seal(service: &str, vols: &Path) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        let mut sealed = Vec::new();
+        for (vol, _, ro) in compose_volumes(service) {
+            if !ro {
+                continue;
+            }
+            let base = vols.join(&vol);
+            std::fs::create_dir_all(&base).unwrap();
+            for e in walk(&base) {
+                let mode = if e.is_dir() { 0o555 } else { 0o444 };
+                std::fs::set_permissions(&e, std::fs::Permissions::from_mode(mode)).unwrap();
+                sealed.push(e);
+            }
+            // Setup-страж: под root `chmod` не запрещает запись — модель режима не состоялась бы.
+            let probe = base.join(".m94-ro-probe");
+            assert!(
+                std::fs::write(&probe, b"x").is_err(),
+                "SETUP НЕ СОСТОЯЛСЯ: запись в `:ro`-том `{vol}` фикстуры удалась (прогон под root?) — \
+                 режим монтирования прода не смоделирован"
+            );
+        }
+        ReadOnlySeal(sealed)
+    }
+}
+impl Drop for ReadOnlySeal {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        for e in &self.0 {
+            let mode = if e.is_dir() { 0o755 } else { 0o644 };
+            let _ = std::fs::set_permissions(e, std::fs::Permissions::from_mode(mode));
+        }
+    }
+}
+
+fn walk(d: &Path) -> Vec<PathBuf> {
+    let mut out = vec![d.to_path_buf()];
+    if let Ok(rd) = std::fs::read_dir(d) {
+        for e in rd.filter_map(|e| e.ok()) {
+            let p = e.path();
+            if p.is_dir() {
+                out.extend(walk(&p));
+            } else {
+                out.push(p);
+            }
+        }
+    }
+    out
 }
 
 /// Путь ВНУТРИ контейнера сервиса → путь фикстуры: каждый том — свой каталог в `vols`.
@@ -1195,10 +1284,10 @@ fn normalize_container(p: &str) -> String {
 fn map_container_path(service: &str, p: &str, vols: &Path) -> PathBuf {
     let p = normalize_container(p);
     let p = p.as_str();
-    let (vol, dst) = compose_volumes(service)
+    let (vol, dst, _) = compose_volumes(service)
         .into_iter()
-        .filter(|(_, dst)| p == dst || p.starts_with(&format!("{dst}/")))
-        .max_by_key(|(_, dst)| dst.len())
+        .filter(|(_, dst, _)| p == dst || p.starts_with(&format!("{dst}/")))
+        .max_by_key(|(_, dst, _)| dst.len())
         .unwrap_or_else(|| {
             panic!("SETUP НЕ СОСТОЯЛСЯ: путь `{p}` сервиса `{service}` не лежит ни на одном томе")
         });
@@ -1364,7 +1453,10 @@ fn p8b_next_run_cannot_move_the_retention_cursor() {
     let ret_container = retention_coverage_container_path();
     let ret_target = map_container_path("journal-retention", &ret_container, vols.path());
 
-    let (c1, e1) = exec_call(active[0], vols.path(), root.path());
+    let (c1, e1) = {
+        let _ro = ReadOnlySeal::seal(SERVICE, vols.path()); // `A-049` Р-5: режим тома как на проде
+        exec_call(active[0], vols.path(), root.path())
+    };
     assert_eq!(c1, Some(0), "SETUP: прогон active упал: {e1}");
     let cursor_active = std::fs::read_to_string(&ret_target).unwrap_or_else(|e| {
         panic!(
@@ -1374,8 +1466,15 @@ fn p8b_next_run_cannot_move_the_retention_cursor() {
     });
 
     append_trades(&jdir, N, 200); // next увидит больше журнала, чем active
-    let (c2, e2) = exec_call(next[0], vols.path(), root.path());
-    assert_eq!(c2, Some(0), "SETUP: прогон next упал: {e2}");
+    let (c2, e2) = {
+        let _ro = ReadOnlySeal::seal(SERVICE, vols.path());
+        exec_call(next[0], vols.path(), root.path())
+    };
+    assert_eq!(
+        c2,
+        Some(0),
+        "I-7: прогон next упал (на проде так же; например, запись на `:ro`-том — EROFS): {e2}"
+    );
 
     // Setup-страж: next действительно продвинулся дальше active — иначе равенство ниже ничего
     // не доказывает.
@@ -1403,6 +1502,39 @@ fn p8b_next_run_cannot_move_the_retention_cursor() {
         std::fs::canonicalize(&next_cov).unwrap(),
         std::fs::canonicalize(&ret_target).unwrap(),
         "I-7: покрытие next и покрытие ретеншена — ОДИН файл после разрешения путей"
+    );
+    // `A-049` Р-5: пути записи прогона `next` лежат на RW-томе прогревателя.
+    for flag in ["--coverage-out", "--ckpt-dir"] {
+        let p =
+            arg_of(&next_argv, flag).unwrap_or_else(|| panic!("I-7: у прогона next нет {flag}"));
+        let (vol, ro) = volume_of(SERVICE, &p);
+        assert!(
+            !ro,
+            "I-7: прогон next пишет {flag}={p} на том `{vol}`, смонтированный `:ro` — на проде EROFS"
+        );
+    }
+    // `A-049` Р-4: КОМПОЗИЦИЯ С ГЕЙТОМ — гейт ищет слепок нового профиля в КОРНЕ тома слепков
+    // (имя от `--print-ckpt-name`), значит прогон `next` обязан писать туда же, куда `active`.
+    let (_, act_argv) = split_compose_run(active[0]);
+    let act_dir =
+        normalize_container(&arg_of(&act_argv, "--ckpt-dir").expect("у active нет --ckpt-dir"));
+    let nxt_dir_c =
+        normalize_container(&arg_of(&next_argv, "--ckpt-dir").expect("у next нет --ckpt-dir"));
+    assert_eq!(
+        nxt_dir_c, act_dir,
+        "I-7: прогон next пишет слепки в `{nxt_dir_c}`, а active и гейт деплоя — в `{act_dir}`: \
+         переключение на next отвергалось бы вечно («слепка нет»)"
+    );
+    let next_prof = parse_profile_text(&std::fs::read_to_string(pdir.join("next.env")).unwrap());
+    let next_dir = map_container_path(SERVICE, &nxt_dir_c, vols.path());
+    let want =
+        gateway::checkpoint::ckpt_path_for_pub(&next_dir, &selector_from_profile(&next_prof));
+    assert!(
+        want.exists(),
+        "I-7: после прогона next в каталоге слепков нет {} — слепка селектора next.env (имя по \
+         независимому разбору профиля); есть {:?}",
+        want.display(),
+        slepok_names(&next_dir)
     );
     let after = std::fs::read_to_string(&ret_target).expect("покрытие ретеншена исчезло");
     assert_eq!(
