@@ -34,7 +34,7 @@ else
   fail "task7: config/calc-profile/active.env отсутствует или несёт не восемь ключей"
 fi
 # --- task1/2/4/5: прогреватель (c1 c2 p1…p9) — прод-путь cron'а, режим профиля, .profile, next
-run_step "task1-2,4-5: red_m94_calc_profile_warmer (c1 c2 p1…p9)" \
+run_step "task1-2,4-5: red_m94_calc_profile_warmer (c1 c2 p1…p9, p8b)" \
   cargo test -q -p gateway --test red_m94_calc_profile_warmer
 # --- task1/3/4: выдача (s1 s2 s3) — прод-бинарь на окружении compose
 run_step "task1,3-4: red_m94_calc_profile_serve (s1 s2 s3)" \
@@ -46,7 +46,8 @@ run_step "task3: red_m94_heartbeat_profile_compat (o1)" \
 run_step "task4: red_compose_deploy_form.sh (D10)" bash scripts/tests/red_compose_deploy_form.sh
 run_step "task4: verify_delivery_M-08.sh (мелкая форма)" bash scripts/verify_delivery_M-08.sh
 # --- task6: гейт деплоя (g0…g7)
-run_step "task6: red_m94_deploy_gate.sh (g0…g7)" bash scripts/tests/red_m94_deploy_gate.sh
+run_step "task6: red_m94_deploy_gate.sh (g0…g6)" bash scripts/tests/red_m94_deploy_gate.sh
+run_step "task6: red_m94_deploy_apply.sh (a0…a4, a7 — откат исполнением, C-280 R3)" bash scripts/tests/red_m94_deploy_apply.sh
 # --- task8: корпус целиком — исполняется ниже шагом паритета `cargo test --all` (CI build-test)
 # --- task9: барьер изменения профиля (задача architect'а; до сдачи — FAIL, не SKIP)
 if [ -f scripts/tests/red_calc_profile.sh ] && [ -f scripts/check_calc_profile.sh ]; then

@@ -11,15 +11,13 @@
 # Заглушка runner'а пишет argv в журнал и печатает STUB_NAME с кодом STUB_RC — так проба различает
 # «runner не звался» (`.env` отвергнут ДО него) и «звался с не тем argv».
 #
-# Предел (спека §6 п.4): проводка `deploy.yml` судится по ТЕКСТУ (`g7`), `ssh-action` в CI не
-# исполним; исход — §8-гейт.
+# Проводка и откат деплоя — в соседней пробе `red_m94_deploy_apply.sh` (исполняется, не читается).
 #
 # Число сценариев НЕ заявляется — считается и печатается. Решение — по коду возврата.
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # M94_GATE_UNDER_TEST — только для мутационной проверки САМОЙ пробы (эталон и мутанты гейта).
 GATE="${M94_GATE_UNDER_TEST:-$ROOT/deploy/bin/calc-profile-gate.sh}"
-DEPLOY="$ROOT/.github/workflows/deploy.yml"
 PASS=0; FAIL=0
 ok()   { printf 'pass  %s\n' "$*"; PASS=$((PASS+1)); }
 nope() { printf 'FAIL  %s\n' "$*"; FAIL=$((FAIL+1)); }
@@ -128,21 +126,8 @@ if w=$(mk_world g6 $'GATEWAY_JWT_SECRET=x\n' 1 "$NAME" 1); then
   else nope "g6 гейт прошёл при упавшем runner'е"; fi
 else nope "g6 SETUP не состоялся"; fi
 
-# ── g7: проводка deploy.yml — гейт между сборкой и `up`, отказ выходит до `up` ───────
-reset_l=$(grep -n 'git reset --hard -q "\$TARGET_SHA"' "$DEPLOY" | head -1 | cut -d: -f1)
-gate_l=$(grep -n 'calc-profile-gate.sh' "$DEPLOY" | head -1 | cut -d: -f1)
-build_l=$(grep -n 'docker compose build' "$DEPLOY" | head -1 | cut -d: -f1)
-up_l=$(grep -n 'docker compose up -d' "$DEPLOY" | head -1 | cut -d: -f1)
-if [ -z "$reset_l" ] || [ -z "$up_l" ]; then
-  nope "g7 SETUP: в deploy.yml не найдены опорные строки (reset=$reset_l up=$up_l)"
-elif [ -z "$gate_l" ] || [ -z "$build_l" ]; then
-  nope "g7 deploy.yml не зовёт гейт или не собирает образ отдельно от up (gate=${gate_l:-нет} build=${build_l:-нет})"
-elif [ "$reset_l" -lt "$build_l" ] && [ "$build_l" -lt "$gate_l" ] && [ "$gate_l" -lt "$up_l" ] \
-     && sed -n "${gate_l},$((up_l-1))p" "$DEPLOY" | grep -q 'exit 1'; then
-  ok "g7 deploy.yml: reset → build → гейт → up; ветка отказа гейта выходит до up"
-else
-  nope "g7 порядок deploy.yml неверен: reset=$reset_l build=$build_l gate=$gate_l up=$up_l (или нет exit 1 между гейтом и up)"
-fi
+# ── g7 СНЯТ (C-280 R3): порядок строк deploy.yml не доказывал откат. Проводка и откат теперь
+# ИСПОЛНЯЮТСЯ пробой scripts/tests/red_m94_deploy_apply.sh (a1…a4, a7).
 
 printf 'сценариев: %d (pass=%d fail=%d)\n' "$((PASS+FAIL))" "$PASS" "$FAIL"
 if [ "$FAIL" -eq 0 ]; then echo "VERDICT: PASS"; exit 0; fi
