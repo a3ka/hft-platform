@@ -112,7 +112,25 @@ ALERT ops-watchdog: бинарь не найден/не исполняем (/usr
 ```
 
 Это НЕ ситуация «соберите `cargo build` на хосте» — toolchain'а на VPS нет, и
-ручная сборка = второй источник бинаря (`TD-227`-класс). Действия оператора:
+ручная сборка = второй источник бинаря (`TD-227`-класс).
+
+> **M-94 (C-280 R3):** тело деплоя ВЫНЕСЕНО из `deploy.yml` в скрипт
+> `deploy/bin/deploy-apply.sh "$PREV"`. Маркеры в логах теперь
+> печатает СКРИПТ, а не `deploy.yml`. Конкретно:
+> - успех: `=== DEPLOY OK: TARGET deployed, both services healthy, watchdog installed ===`
+>   и `=== STEP 1: docker compose build (TARGET) ===` … `=== STEP 6: docker image prune -f ===`;
+> - отказ гейта/валидации cron: `=== GATE REFUSED — rollback (no up) ===`
+>   и `=== CRON VALIDATION FAILED — rollback (no up) ===` (НЕТ `up` после
+>   reset, милестоун §3.7);
+> - отказ health/cron-install: `=== ROLLBACK (with up) to PREV=<sha> reason=<…> ===`
+>   (`full_rollback_prev`: build, cron, up — на PREV);
+> - отказ watchdog: `=== WATCHDOG INSTALL FAILED ===` (как и было).
+> Маркеры `<DEL>DEPLOY FAILED — logs + rollback to …<END>` и
+> `<DEL>healthy (recorder + gateway-serve) — deployed …<END>` БОЛЬШЕ не
+> печатаются; ниже они упомянуты для исторической справки в строке
+> «(для исторической справки)» — не как маркер для grep'а.
+
+Действия оператора:
 
 1. **Посмотреть последний прогон `deploy.yml` на GitHub** (Actions → Deploy). Ожидание:
    - либо джоб зелёный И в логах шага ОТСУТСТВУЕТ строка `=== WATCHDOG INSTALL
@@ -120,30 +138,19 @@ ALERT ops-watchdog: бинарь не найден/не исполняем (/usr
      должен быть — пункт 2; никакого позитивного маркера вроде `WATCHDOG INSTALL OK`
      ни `install-watchdog.sh`, ни `deploy.yml` не печатают, успех = тишина в этой
      строке + зелёный шаг);
-   - либо джоб красный с `=== WATCHDOG INSTALL FAILED ===` в логах шага — это
-     ветка `then` healthy-гейта (`deploy.yml:305`): `install-watchdog.sh` упал,
-     `deploy.yml` напечатал маркер И `exit 1` одной строкой (`{ echo "===
-     WATCHDOG INSTALL FAILED ===" >&2; exit 1; }` в правой части `||`); см.
-     следующий пункт о том, где этот лог смотреть;
-   - либо джоб красный БЕЗ `=== WATCHDOG INSTALL FAILED ===` в логах — это ветка
-     отката `else` (`deploy.yml:308-316`): healthy-гейт не прошёл, `deploy.yml`
-     уже напечатал `=== DEPLOY FAILED — logs + rollback to … ===`
-     (`deploy.yml:308`), снял `docker logs …`, откатил `git reset --hard "$PREV"`
-     (`deploy.yml:311`), поднял `hft-recorder`+`hft-gateway-serve` откатного
-     образа (`deploy.yml:312`) и попытался поставить сторож того же образа через
-     `bash deploy/bin/install-watchdog.sh || true` (`deploy.yml:315`); отказ
-     установки здесь ГЛУШИТСЯ (`|| true`), маркер `=== WATCHDOG INSTALL FAILED
-     ===` НЕ печатается (он бы ввёл в заблуждение — причина красного healthy-гейт,
-     а не установка), и джоб красный по `exit 1` (`deploy.yml:316`) в `else`-ветке.
-     В этом исходе ищите в логах `grep -F '=== DEPLOY FAILED'` (по
-     префиксу, как печатает `deploy.yml:308` — `=== DEPLOY FAILED — logs +
-     rollback to <sha> ===`); прежде чем разбирать установку, проверьте
-     п.2.
+   - либо джоб красный с `=== WATCHDOG INSTALL FAILED ===` в логах шага —
+     `deploy-apply.sh` напечатал маркер И `exit 1` (`deploy/bin/deploy-apply.sh`
+     в `if ! …` после `bash deploy/bin/install-watchdog.sh`); см. следующий пункт
+     о том, где этот лог смотреть;
+   - либо джоб красный по ДРУГОЙ причине (gate/cron/health). Ищите префиксы
+     `=== GATE REFUSED — rollback (no up) ===` / `=== CRON VALIDATION FAILED — rollback (no up) ===` /
+     `=== ROLLBACK (with up) to PREV=… reason=<…> ===` в логах шага — каждое
+     `reason=` указывает на конкретную ветку (`gate_refused` / `cron_invalid` /
+     `cron_install_failed` / `up_failed` / `health_failed`).
 2. **Лог шага — НЕ `journalctl`, а лог джоба GitHub Actions.** Деплой не
    systemd-сервис, юнита `journalctl -u deploy` не существует и не появится.
-   Шаг деплоя — `Deploy via SSH` (`deploy.yml:239`), `uses:
-   appleboy/ssh-action@v1` (`deploy.yml:240`) с `script: |` (`deploy.yml:246`)
-   — это action-обёртка над SSH, а НЕ голый `ssh … 'bash -s …'`; её
+   Шаг деплоя — `Deploy via SSH`, `uses: appleboy/ssh-action@v1` — это
+   action-обёртка над SSH, а НЕ голый `ssh … 'bash -s …'`; её
    stdout/stderr — лог Actions-шага. Смотреть так: `gh run view <id> --log`
    (где `<id>` — идентификатор прогона из `gh run list`) или UI GitHub →
    Actions → Deploy → раскрыть шаг. Что реально видно при отказе
@@ -154,22 +161,14 @@ ALERT ops-watchdog: бинарь не найден/не исполняем (/usr
    та команда, которая упала: docker CLI на `inspect` (`install-watchdog.sh:78`)
    / `create` (`:83`) / `cp` (`:88-89`), coreutils на `mkdir -p` (`:57`),
    `chmod` (`:105`), `mv -f` (`:106`); EXIT-trap (`:65-73`) молчит — `docker
-   rm` и `rm -f` уведены в `/dev/null`;
-   и, наконец, ветка «пустой файл» распознаётся по-разному в зависимости от
-   ветки `deploy.yml`. **Ветка `then` (`deploy.yml:305`):** между строкой
-   `=== healthy (recorder + gateway-serve) — deployed … ===` (`deploy.yml:301`)
-   и `=== WATCHDOG INSTALL FAILED ===` (`deploy.yml:305`) в логе стоит вывод
-   установщика; пусто между ними ⇒ «пустой файл» (`install-watchdog.sh:100-101`):
-   все остальные точки отказа печатают stderr (п.2 выше), trap молчит. Это
-   единственная ветка, где правило работает. **Ветка `else`
-   (`deploy.yml:308-316`):** `=== DEPLOY FAILED — logs + rollback to <sha> ===`
-   печатается ПЕРВЫМ (`deploy.yml:308`); далее два `docker logs`
-   (`deploy.yml:309-310`), откат (`deploy.yml:311`), сборка откатного образа
-   (`deploy.yml:312`), и только затем установщик (`deploy.yml:315`) с `|| true`
-   — маркера после него НЕТ, следом сразу `exit 1` (`deploy.yml:316`). Успех
-   установки и «пустой файл» здесь ОБА молчат ⇒ **исход установки в ветке
-   отката из лога Actions не определим**; оператор идёт на хост: проверка
-   доставки (1)-(2) (`:74-82`) и при расхождении — п.4 (ручной перезапуск).
+   rm` и `rm -f` уведены в `/dev/null`.
+   **M-94:** маркер `=== WATCHDOG INSTALL FAILED ===` печатает `deploy-apply.sh`
+   в `if !` после `bash deploy/bin/install-watchdog.sh`. Старые маркеры
+   `<DEL>DEPLOY FAILED — logs + rollback to <sha><END>` (для исторической
+   справки) и
+   `<DEL>healthy (recorder + gateway-serve) — deployed …<END>` (для исторической
+   справки) БОЛЬШЕ НЕ печатаются (они были в `deploy.yml`, перенесённом
+   в `deploy-apply.sh`).
 3. **Проверить, что деплой РЕАЛЬНО выполнил установку** (а не пропустил по фильтру
    `paths:`). Фильтр `deploy.yml` (`A-046` E3) НЕ содержит `deploy/bin/**` и
    `scripts/watchdog_cron.sh`: правка одного установщика или обёртки едет на VPS только
