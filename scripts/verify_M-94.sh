@@ -61,7 +61,7 @@ else
   fail "task9: барьера check_calc_profile.sh / пробы red_calc_profile.sh нет (задача architect'а, П-032 п.3)"
 fi
 # --- task10: сторож verify_M-70 task #7 «прод-дефолт ровно 0.001» снят (П-032 п.6)
-if grep -q 'прод-дефолт РОВНО узкий' scripts/verify_M-70.sh; then
+if grep -qE 'прод-дефолт РОВНО узкий|RENDERED|BANDS_BLOCK' scripts/verify_M-70.sh; then
   fail "task10: verify_M-70.sh всё ещё сторожит дефолт GATEWAY_BANDS в compose (П-032 п.6)"
 else
   pass "task10: сторож verify_M-70 task #7 снят"
