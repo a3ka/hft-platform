@@ -69,12 +69,10 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use gateway::calc_profile::{
-    self, AppliedProfile, RawLiveProfile, PROFILE_AXIS_FLAGS,
-};
+use contracts::Venue;
+use gateway::calc_profile::{self, AppliedProfile, RawLiveProfile, PROFILE_AXIS_FLAGS};
 use gateway::checkpoint;
 use gateway::{Cursor, Selector};
-use contracts::Venue;
 use journal::EpochFilter;
 
 #[derive(Debug)]

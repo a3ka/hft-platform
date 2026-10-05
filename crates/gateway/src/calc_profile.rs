@@ -125,11 +125,7 @@ pub enum ProfileError {
     BadValue { key: String, reason: String },
     /// Тройка `(timeframe_ms, window_ms, depth_cadence_ms)` НЕ найдена в
     /// `GATEWAY_ALLOWED_PROFILES` — прогревается слепок, на который подписаться нельзя.
-    TripleNotInAllowed {
-        tf: i64,
-        window: i64,
-        cadence: i64,
-    },
+    TripleNotInAllowed { tf: i64, window: i64, cadence: i64 },
 }
 
 impl fmt::Display for ProfileError {
@@ -137,7 +133,9 @@ impl fmt::Display for ProfileError {
         match self {
             ProfileError::Io(s) => write!(f, "{s}"),
             ProfileError::BadLine(s) => write!(f, "bad profile line: {s:?}"),
-            ProfileError::UnknownKey(s) => write!(f, "unknown key {s:?} in profile (closed set of 8)"),
+            ProfileError::UnknownKey(s) => {
+                write!(f, "unknown key {s:?} in profile (closed set of 8)")
+            }
             ProfileError::MissingKey(s) => write!(f, "missing required key {s:?} in profile"),
             ProfileError::Duplicate(s) => write!(f, "duplicate key {s:?} in profile"),
             ProfileError::BadVersion(s) => write!(
@@ -147,7 +145,11 @@ impl fmt::Display for ProfileError {
             ProfileError::BadValue { key, reason } => {
                 write!(f, "{key} invalid: {reason}")
             }
-            ProfileError::TripleNotInAllowed { tf, window, cadence } => write!(
+            ProfileError::TripleNotInAllowed {
+                tf,
+                window,
+                cadence,
+            } => write!(
                 f,
                 "GATEWAY_ALLOWED_PROFILES does not contain the triple \
                  (timeframe_ms={tf}, window_ms={window}, depth_cadence_ms={cadence}) \
@@ -177,9 +179,8 @@ pub fn sha256_of_bytes(bytes: &[u8]) -> String {
 /// замкнутости/версии/повторов/типов — в `load_profile` (чтобы можно было показать
 /// ошибку в терминах ключа, а не байта).
 fn read_and_parse(path: &Path) -> Result<(Vec<u8>, BTreeMap<String, String>), ProfileError> {
-    let bytes = fs::read(path).map_err(|e| {
-        ProfileError::Io(format!("read profile {}: {e}", path.display()))
-    })?;
+    let bytes = fs::read(path)
+        .map_err(|e| ProfileError::Io(format!("read profile {}: {e}", path.display())))?;
     let text = match std::str::from_utf8(&bytes) {
         Ok(s) => s,
         Err(_) => {
@@ -230,32 +231,33 @@ pub fn load_profile(path: &Path) -> Result<AppliedProfile, ProfileError> {
 
     let version: u32 = map["CALC_PROFILE_VERSION"]
         .parse()
-        .map_err(|e: std::num::ParseIntError| {
-            ProfileError::BadVersion(format!("{e:?}"))
-        })?;
+        .map_err(|e: std::num::ParseIntError| ProfileError::BadVersion(format!("{e:?}")))?;
     if version < 1 {
         return Err(ProfileError::BadVersion(format!("{version} (< 1)")));
     }
 
     let bands = parse_bands(&map["GATEWAY_BANDS"])?;
-    let depth_cadence_ms: i64 = map["GATEWAY_DEPTH_CADENCE_MS"]
-        .parse()
-        .map_err(|e: std::num::ParseIntError| ProfileError::BadValue {
-            key: "GATEWAY_DEPTH_CADENCE_MS".to_string(),
-            reason: e.to_string(),
-        })?;
-    let timeframe_ms: i64 = map["GATEWAY_TIMEFRAME_MS"]
-        .parse()
-        .map_err(|e: std::num::ParseIntError| ProfileError::BadValue {
-            key: "GATEWAY_TIMEFRAME_MS".to_string(),
-            reason: e.to_string(),
-        })?;
-    let window_ms: i64 = map["GATEWAY_WINDOW_MS"]
-        .parse()
-        .map_err(|e: std::num::ParseIntError| ProfileError::BadValue {
-            key: "GATEWAY_WINDOW_MS".to_string(),
-            reason: e.to_string(),
-        })?;
+    let depth_cadence_ms: i64 =
+        map["GATEWAY_DEPTH_CADENCE_MS"]
+            .parse()
+            .map_err(|e: std::num::ParseIntError| ProfileError::BadValue {
+                key: "GATEWAY_DEPTH_CADENCE_MS".to_string(),
+                reason: e.to_string(),
+            })?;
+    let timeframe_ms: i64 =
+        map["GATEWAY_TIMEFRAME_MS"]
+            .parse()
+            .map_err(|e: std::num::ParseIntError| ProfileError::BadValue {
+                key: "GATEWAY_TIMEFRAME_MS".to_string(),
+                reason: e.to_string(),
+            })?;
+    let window_ms: i64 =
+        map["GATEWAY_WINDOW_MS"]
+            .parse()
+            .map_err(|e: std::num::ParseIntError| ProfileError::BadValue {
+                key: "GATEWAY_WINDOW_MS".to_string(),
+                reason: e.to_string(),
+            })?;
 
     // Жёсткие диапазоны осей (милестоун §3.2: разборщик НЕ догадывается о политике,
     // но ЗНАЕТ базовые инварианты типа «каденция >= 1 с и выравнена на сутки» — ровно
@@ -394,19 +396,23 @@ pub fn parse_allowed_profiles(s: &str) -> Result<Vec<RawLiveProfile>, ProfileErr
         if parts.len() < 2 || parts.len() > 3 {
             return Err(ProfileError::BadValue {
                 key: "GATEWAY_ALLOWED_PROFILES".to_string(),
-                reason: format!(
-                    "{t:?} must be `tf/window[/cadence]` (1–3 slash-separated parts)"
-                ),
+                reason: format!("{t:?} must be `tf/window[/cadence]` (1–3 slash-separated parts)"),
             });
         }
-        let tf: i64 = parts[0].trim().parse().map_err(|e| ProfileError::BadValue {
-            key: "GATEWAY_ALLOWED_PROFILES".to_string(),
-            reason: format!("timeframe_ms {:?} not i64 ({e})", parts[0]),
-        })?;
-        let window: i64 = parts[1].trim().parse().map_err(|e| ProfileError::BadValue {
-            key: "GATEWAY_ALLOWED_PROFILES".to_string(),
-            reason: format!("window_ms {:?} not i64 ({e})", parts[1]),
-        })?;
+        let tf: i64 = parts[0]
+            .trim()
+            .parse()
+            .map_err(|e| ProfileError::BadValue {
+                key: "GATEWAY_ALLOWED_PROFILES".to_string(),
+                reason: format!("timeframe_ms {:?} not i64 ({e})", parts[0]),
+            })?;
+        let window: i64 = parts[1]
+            .trim()
+            .parse()
+            .map_err(|e| ProfileError::BadValue {
+                key: "GATEWAY_ALLOWED_PROFILES".to_string(),
+                reason: format!("window_ms {:?} not i64 ({e})", parts[1]),
+            })?;
         let cadence: Option<i64> = match parts.get(2).map(|s| s.trim()) {
             None => None,
             Some(c) if c.eq_ignore_ascii_case("none") => None,
@@ -441,9 +447,7 @@ pub fn check_triple_in_allowed(
 ) -> Result<(), ProfileError> {
     let want_cadence = Some(cadence);
     let hit = allowed.iter().any(|p| {
-        p.timeframe_ms == tf
-            && p.window_ms == window
-            && p.depth_cadence_ms == want_cadence
+        p.timeframe_ms == tf && p.window_ms == window && p.depth_cadence_ms == want_cadence
     });
     if hit {
         Ok(())
@@ -542,16 +546,17 @@ pub fn canonical_bands_or_profile(
     if let Some(p) = profile {
         return Ok(p.bands.clone());
     }
-    let raw = get("GATEWAY_CANONICAL_BANDS").unwrap_or_else(|| {
-        "0.015,0.03,0.05,0.08,0.15,0.30,0.60".to_string()
-    });
+    let raw = get("GATEWAY_CANONICAL_BANDS")
+        .unwrap_or_else(|| "0.015,0.03,0.05,0.08,0.15,0.30,0.60".to_string());
     let mut out = Vec::new();
     for p in raw.split(',') {
         let t = p.trim();
         if t.is_empty() {
             return Err(format!("GATEWAY_CANONICAL_BANDS: empty entry in {raw:?}"));
         }
-        let v: f64 = t.parse().map_err(|e| format!("GATEWAY_CANONICAL_BANDS parse: {e}"))?;
+        let v: f64 = t
+            .parse()
+            .map_err(|e| format!("GATEWAY_CANONICAL_BANDS parse: {e}"))?;
         out.push(v);
     }
     if out.is_empty() {
