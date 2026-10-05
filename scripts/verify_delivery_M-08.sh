@@ -413,35 +413,17 @@ done
 [ "${d9}" -eq 0 ] && pass "D9 cron-задания пишут позитивный *.last-success — silent-absence \
 детектируется по свежести маркера (не только сбой)"
 
-# ── D10: compose разбирается в ПРОД-ФОРМЕ окружения деплоя (M-92, R-237, Deploy 37242446986) ─
-# Деплой зовёт `docker compose up -d --build recorder gateway-serve` в каталоге, где `.env` несёт
-# ровно две переменные (замер VPS 2026-10-04: GATEWAY_JWT_SECRET, GATEWAY_BANDS). compose
-# интерполирует ВЕСЬ файл, а не только поднимаемые сервисы: переменная без значения по умолчанию
-# в ЛЮБОМ сервисе роняет деплой целиком (`"${RETENTION_WORK_DIR}:/work"` → «empty section between
-# colons», откат). Оракулы M-92 всегда ставили переменную сами и этот случай не видели.
-# Проверка: окружение очищено до этих двух имён, `.env` репозитория не читается.
+# ── D10: compose разбирается в ПРОД-ФОРМЕ окружения деплоя (M-92, Deploy 37242446986) ─────
+# Логика и пределы — scripts/lib/compose_deploy_form.sh; проба — scripts/tests/red_compose_deploy_form.sh.
 if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
-  d10_json=$(cd "${ROOT}" && env -i PATH="${PATH}" HOME="${HOME:-/tmp}" \
-               GATEWAY_JWT_SECRET=d10-probe GATEWAY_BANDS=d10-probe \
-               docker compose --env-file /dev/null -f docker-compose.yml --profile "*" config --format json 2>"${ROOT}/.d10.err") \
-    && d10_rc=0 || d10_rc=$?
-  if [ "${d10_rc}" -ne 0 ]; then
-    fail "D10 compose НЕ разбирается в окружении деплоя (только GATEWAY_JWT_SECRET/GATEWAY_BANDS) — \
-деплой упадёт и откатится, как Deploy 37242446986:"
-    sed 's/^/      /' "${ROOT}/.d10.err" | head -3
+  # shellcheck source=lib/compose_deploy_form.sh
+  source "${ROOT}/scripts/lib/compose_deploy_form.sh"
+  if d10_out=$(compose_deploy_form_check "${ROOT}" /var/lib/hft/retention-work 2>&1); then
+    pass "D10 compose в окружении деплоя: $(printf '%s\n' "${d10_out}" | head -1)"
   else
-    d10_src=$(printf '%s' "${d10_json}" | python3 -c '
-import json,sys
-svc=json.load(sys.stdin)["services"].get("journal-retention",{})
-print(next((v.get("source","") for v in svc.get("volumes",[]) if v.get("target")=="/work"),""))')
-    if [ "${d10_src}" = "/var/lib/hft/retention-work" ]; then
-      pass "D10 compose разбирается в окружении деплоя; /work ← /var/lib/hft/retention-work по умолчанию"
-    else
-      fail "D10 источник /work у journal-retention = '${d10_src}', ожидался /var/lib/hft/retention-work \
-(значение по умолчанию, когда деплой/оператор переменную не задал)"
-    fi
+    fail "D10 compose НЕ проходит прод-форму деплоя — деплой упадёт и откатится, как Deploy 37242446986:"
+    printf '%s\n' "${d10_out}" | sed 's/^/      /'
   fi
-  rm -f "${ROOT}/.d10.err"
 elif [ "${DEEP}" = "1" ]; then
   fail "D10 docker compose недоступен — разбор compose в прод-форме проверить нечем"
 else
