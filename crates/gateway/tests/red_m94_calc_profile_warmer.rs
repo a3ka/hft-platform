@@ -1159,3 +1159,255 @@ fn p9_two_profiles_coexist_first_slepok_untouched() {
         "I-7: слепок active изменён прогоном другого профиля — откат лишился готового слепка"
     );
 }
+
+// ───────────────────────── p8b: ЭФФЕКТ на цели ретеншена (C-280 R2) ─────────────────────────
+
+/// Монтирования сервиса compose: `(том, путь в контейнере)`.
+fn compose_volumes(service: &str) -> Vec<(String, String)> {
+    compose_block(service, "volumes")
+        .iter()
+        .filter_map(|l| l.strip_prefix("- "))
+        .map(|spec| spec.trim().trim_matches('"'))
+        .filter_map(|spec| {
+            let mut it = spec.split(':');
+            Some((it.next()?.to_string(), it.next()?.to_string()))
+        })
+        .collect()
+}
+
+/// Путь ВНУТРИ контейнера сервиса → путь фикстуры: каждый том — свой каталог в `vols`.
+/// Лексическая нормализация пути ВНУТРИ контейнера (`.`/`..`/`//`) — так его разрешит ядро
+/// контейнера. Без неё `/ckpt/../ckpt/x` отобразился бы мимо тома и псевдоним цели прошёл бы.
+fn normalize_container(p: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    for seg in p.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            s => parts.push(s),
+        }
+    }
+    format!("/{}", parts.join("/"))
+}
+
+fn map_container_path(service: &str, p: &str, vols: &Path) -> PathBuf {
+    let p = normalize_container(p);
+    let p = p.as_str();
+    let (vol, dst) = compose_volumes(service)
+        .into_iter()
+        .filter(|(_, dst)| p == dst || p.starts_with(&format!("{dst}/")))
+        .max_by_key(|(_, dst)| dst.len())
+        .unwrap_or_else(|| {
+            panic!("SETUP НЕ СОСТОЯЛСЯ: путь `{p}` сервиса `{service}` не лежит ни на одном томе")
+        });
+    let base = vols.join(&vol);
+    std::fs::create_dir_all(&base).unwrap();
+    base.join(p[dst.len()..].trim_start_matches('/'))
+}
+
+/// Аргумент `--flag=v` / `--flag v`.
+fn arg_of(argv: &[String], flag: &str) -> Option<String> {
+    argv.iter().enumerate().find_map(|(i, a)| {
+        a.strip_prefix(&format!("{flag}="))
+            .map(str::to_string)
+            .or_else(|| (a == flag).then(|| argv.get(i + 1).cloned()).flatten())
+    })
+}
+
+/// Путь покрытия, который ЧИТАЕТ ретеншен: НАСТОЯЩИЙ скрипт cron'а ретеншена в режиме печати
+/// argv (контракт M-48 `HFT_CRON_PRINT_ARGV=1`), окружение — прод-cron.
+fn retention_coverage_container_path() -> String {
+    let o = Command::new("bash")
+        .arg(repo_root().join("deploy/bin/journal-retention-cron.sh"))
+        .env_clear()
+        .envs(cron_env())
+        .env("HFT_CRON_PRINT_ARGV", "1")
+        .output()
+        .expect("запуск journal-retention-cron.sh");
+    let argv: Vec<String> = String::from_utf8_lossy(&o.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect();
+    arg_of(&argv, "--checkpoint-coverage").unwrap_or_else(|| {
+        panic!(
+            "SETUP НЕ СОСТОЯЛСЯ: ретеншен не печатает --checkpoint-coverage (exit {:?}): {argv:?}",
+            o.status.code()
+        )
+    })
+}
+
+fn append_trades(dir: &Path, from: u64, n: u64) {
+    let mut j = Journal::open_with(dir, cfg()).expect("open_with");
+    for i in from..from + n {
+        j.append(trade(i)).expect("append");
+    }
+    j.flush().expect("flush");
+}
+
+/// Исполнить вызов runner'а НАСТОЯЩИМ прогревателем: пути контейнера — на тома-фикстуры.
+/// Образ собирается из ЧЕКАУТА (`HFT_ROOT`): путь профиля в образе → файл `checkout/config/…`.
+fn exec_call(call: &[String], vols: &Path, checkout: &Path) -> (Option<i32>, String) {
+    let (opt_env, argv) = split_compose_run(call);
+    let mut env = compose_env(SERVICE, &secret_only_dotenv());
+    env.extend(opt_env);
+    if let Some(c) = env.get("GATEWAY_CALC_PROFILE").cloned() {
+        let dst = dockerfile_profile_dst();
+        let rel = c
+            .strip_prefix(&format!("{dst}/"))
+            .unwrap_or_else(|| panic!("I-5: GATEWAY_CALC_PROFILE={c} вне каталога образа `{dst}`"));
+        let file = checkout.join("config/calc-profile").join(rel);
+        assert!(
+            file.exists(),
+            "I-7: прогон указывает на профиль {c}, а в чекауте его нет ({})",
+            file.display()
+        );
+        env.insert(
+            "GATEWAY_CALC_PROFILE".to_string(),
+            file.display().to_string(),
+        );
+    }
+    env.insert("PATH".to_string(), "/usr/bin:/bin".to_string());
+    let argv: Vec<String> = argv
+        .iter()
+        .map(|a| {
+            for f in ["--dir", "--ckpt-dir", "--coverage-out"] {
+                if let Some(v) = a.strip_prefix(&format!("{f}=")) {
+                    return format!("{f}={}", map_container_path(SERVICE, v, vols).display());
+                }
+            }
+            a.clone()
+        })
+        .collect();
+    // Раздельная форма `--flag value` для путей: перенацелить значение следующего токена.
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < argv.len() {
+        let a = &argv[i];
+        if ["--dir", "--ckpt-dir", "--coverage-out"].contains(&a.as_str()) {
+            out.push(a.clone());
+            if let Some(v) = argv.get(i + 1) {
+                out.push(map_container_path(SERVICE, v, vols).display().to_string());
+            }
+            i += 2;
+            continue;
+        }
+        out.push(a.clone());
+        i += 1;
+    }
+    let o = Command::new(BIN)
+        .args(&out)
+        .env_clear()
+        .envs(&env)
+        .output()
+        .expect("запуск gateway-checkpoint");
+    (
+        o.status.code(),
+        String::from_utf8_lossy(&o.stderr).to_string(),
+    )
+}
+
+/// **`p8b` — ЭФФЕКТ, а не текст (`C-280` R2).** Оба прогона cron'а (active и next) исполняются
+/// НАСТОЯЩИМ прогревателем на ОБЩИХ томах-фикстурах (пути контейнера → тома compose); журнал
+/// между прогонами растёт, так что курсор next ДАЛЬШЕ курсора active. Файл, который ЧИТАЕТ
+/// ретеншен (путь снят с его настоящего скрипта), обязан после прогона next остаться РАВНЫМ
+/// курсору active: только курсор active разрешает удаление хвоста active. Пути сравниваются
+/// после разрешения в файловой системе (`canonicalize`) — синтаксически разные псевдонимы одной
+/// цели (`dir/../dir/…`, симлинк) здесь не проходят.
+#[test]
+fn p8b_next_run_cannot_move_the_retention_cursor() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join(".env"), "GATEWAY_JWT_SECRET=x\n").unwrap();
+    let pdir = root.path().join("config/calc-profile");
+    std::fs::create_dir_all(&pdir).unwrap();
+    std::fs::copy(active_profile_path(), pdir.join("active.env")).unwrap();
+    std::fs::write(
+        pdir.join("next.env"),
+        variant(|l| {
+            replace_key(l, "CALC_PROFILE_VERSION", "2");
+            replace_key(l, "GATEWAY_BANDS", "0.015,0.03,0.05,0.08,0.15,0.3");
+        }),
+    )
+    .unwrap();
+    let (code, err, calls) = run_cron_calls(root.path());
+    assert_eq!(code, Some(0), "SETUP: cron с next вышел {code:?}: {err}");
+    let is_next = |c: &Vec<String>| {
+        split_compose_run(c)
+            .0
+            .get("GATEWAY_CALC_PROFILE")
+            .is_some_and(|p| p.ends_with("/next.env"))
+    };
+    let active: Vec<&Vec<String>> = calls.iter().filter(|c| !is_next(c)).collect();
+    let next: Vec<&Vec<String>> = calls.iter().filter(|c| is_next(c)).collect();
+    assert_eq!(
+        (active.len(), next.len()),
+        (1, 1),
+        "I-7: с next.env ожидался ровно один прогон active и один next; вызовы: {calls:?}"
+    );
+
+    // Тома-фикстуры; журнал — на томе журнала по пути `--dir` прогона active.
+    let vols = tempfile::tempdir().unwrap();
+    let (_, active_argv) = split_compose_run(active[0]);
+    let jdir = map_container_path(
+        SERVICE,
+        &arg_of(&active_argv, "--dir").expect("SETUP: у прогона нет --dir"),
+        vols.path(),
+    );
+    std::fs::create_dir_all(&jdir).unwrap();
+    append_trades(&jdir, 0, N);
+
+    // Цель ретеншена: путь его скрипта, разрешённый через ЕГО монтирования.
+    let ret_container = retention_coverage_container_path();
+    let ret_target = map_container_path("journal-retention", &ret_container, vols.path());
+
+    let (c1, e1) = exec_call(active[0], vols.path(), root.path());
+    assert_eq!(c1, Some(0), "SETUP: прогон active упал: {e1}");
+    let cursor_active = std::fs::read_to_string(&ret_target).unwrap_or_else(|e| {
+        panic!(
+            "I-7: прогон active не записал покрытие туда, откуда читает ретеншен ({}): {e}",
+            ret_target.display()
+        )
+    });
+
+    append_trades(&jdir, N, 200); // next увидит больше журнала, чем active
+    let (c2, e2) = exec_call(next[0], vols.path(), root.path());
+    assert_eq!(c2, Some(0), "SETUP: прогон next упал: {e2}");
+
+    // Setup-страж: next действительно продвинулся дальше active — иначе равенство ниже ничего
+    // не доказывает.
+    let (_, next_argv) = split_compose_run(next[0]);
+    let next_cov = map_container_path(
+        SERVICE,
+        &arg_of(&next_argv, "--coverage-out").expect("I-7: у прогона next нет --coverage-out"),
+        vols.path(),
+    );
+    let next_val = std::fs::read_to_string(&next_cov).unwrap_or_else(|e| {
+        panic!(
+            "I-7: прогон next не записал своё покрытие {}: {e}",
+            next_cov.display()
+        )
+    });
+    let parse = |s: &str| s.trim().parse::<u64>().expect("покрытие — число");
+    assert!(
+        parse(&next_val) > parse(&cursor_active),
+        "SETUP НЕ СОСТОЯЛСЯ: курсор next ({}) не дальше курсора active ({}) — подмена цели \
+         ретеншена была бы неотличима",
+        next_val.trim(),
+        cursor_active.trim()
+    );
+    assert_ne!(
+        std::fs::canonicalize(&next_cov).unwrap(),
+        std::fs::canonicalize(&ret_target).unwrap(),
+        "I-7: покрытие next и покрытие ретеншена — ОДИН файл после разрешения путей"
+    );
+    let after = std::fs::read_to_string(&ret_target).expect("покрытие ретеншена исчезло");
+    assert_eq!(
+        after.trim(),
+        cursor_active.trim(),
+        "I-7: после прогона next файл, который читает ретеншен, сдвинулся с {} на {} — курсор \
+         next разрешил бы удаление хвоста, нужного выдаче для докрутки active (данные, не ресурс)",
+        cursor_active.trim(),
+        after.trim()
+    );
+}
