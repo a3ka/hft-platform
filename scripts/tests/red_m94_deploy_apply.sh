@@ -27,7 +27,7 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # M94_APPLY_UNDER_TEST — только для мутационной проверки САМОЙ пробы (эталон и мутанты).
 APPLY="${M94_APPLY_UNDER_TEST:-$ROOT/deploy/bin/deploy-apply.sh}"
-DEPLOY="$ROOT/.github/workflows/deploy.yml"
+DEPLOY="${M94_DEPLOY_YML_UNDER_TEST:-$ROOT/.github/workflows/deploy.yml}"
 PASS=0; FAIL=0
 ok()   { printf 'pass  %s\n' "$*"; PASS=$((PASS+1)); }
 nope() { printf 'FAIL  %s\n' "$*"; FAIL=$((FAIL+1)); }
@@ -40,9 +40,11 @@ if [ ! -f "$APPLY" ]; then
 fi
 ok "a0 скрипт деплоя существует"
 
-# ── мир: <имя> <код гейта> <здоровье healthy|unhealthy> → печатает каталог мира ─────────
+# ── мир: <имя> <код гейта> <здоровье recorder> <здоровье gateway-serve> [код сторожа] ──────
+# Здоровье — ПО СЛУЖБЕ (`C-281` B1): общий ответ на любой `inspect` не отличал деплой, ждущий
+# обе службы, от ждущего одну.
 mk_world() {
-  local w="$SANDBOX/$1" gate_rc="$2" health="$3"
+  local w="$SANDBOX/$1" gate_rc="$2" h_rec="$3" h_srv="$4" wd_rc="${5:-0}"
   mkdir -p "$w/repo" "$w/cron" "$w/bin" || return 1
   (
     cd "$w/repo" || exit 1
@@ -61,13 +63,24 @@ mk_world() {
   cat > "$w/bin/docker" <<EOF
 #!/usr/bin/env bash
 h=\$(git rev-parse --short HEAD 2>/dev/null || echo nohead)
-case "\$1 \$2" in
-  "compose build"*) echo "build@\$h" >> "$w/docker.log" ;;
-  "compose up"*)    echo "up@\$h" >> "$w/docker.log" ;;
-  "inspect "*|"inspect -f"*) echo "$health" ;;
-  "image prune")    : ;;
-  "logs "*)         : ;;
-  *)                case "\$1" in inspect) echo "$health" ;; logs|image) : ;; *) echo "other:\$*@\$h" >> "$w/docker.log" ;; esac ;;
+last=""; for a in "\$@"; do case "\$a" in hft-*) last="\$a" ;; esac; done  # имя контейнера, где бы оно ни стояло
+case "\$1" in
+  compose)
+    case "\$2" in
+      build) echo "build@\$h" >> "$w/docker.log" ;;
+      up)    echo "up@\$h" >> "$w/docker.log" ;;
+      *)     echo "other:\$*@\$h" >> "$w/docker.log" ;;
+    esac ;;
+  inspect)
+    echo "inspect:\$last" >> "$w/inspect.log"
+    case "\$last" in
+      hft-recorder)      echo "$h_rec" ;;
+      hft-gateway-serve) echo "$h_srv" ;;
+      *)                 echo "no-such-container" ;;
+    esac ;;
+  logs)  echo "logs:\$last@\$h" >> "$w/docker.log" ;;
+  image) [ "\$2" = prune ] && echo "prune@\$h" >> "$w/docker.log" ;;
+  *)     echo "other:\$*@\$h" >> "$w/docker.log" ;;
 esac
 exit 0
 EOF
@@ -76,7 +89,7 @@ EOF
 echo "gate@\$(git rev-parse --short HEAD)" >> "$w/docker.log"
 exit $gate_rc
 EOF
-  printf '#!/usr/bin/env bash\necho "watchdog@$(git rev-parse --short HEAD)" >> "%s/docker.log"\n' "$w" > "$w/bin/watchdog"
+  printf '#!/usr/bin/env bash\necho "watchdog@$(git rev-parse --short HEAD)" >> "%s/docker.log"\nexit %s\n' "$w" "$wd_rc" > "$w/bin/watchdog"
   chmod +x "$w/bin/docker" "$w/bin/gate" "$w/bin/watchdog" || return 1
   # страж подготовки: две ревизии, на TARGET есть скрипт, на PREV его нет
   [ "$(git -C "$w/repo" rev-list --count HEAD)" = 2 ] \
@@ -100,7 +113,7 @@ run_apply() { # <каталог мира> → RC, OUT
 }
 
 # ── a1: гейт профиля ОТКАЗЫВАЕТ ⇒ откат чекаута, образ пересобран на PREV, cron не тронут, up нет ──
-if w=$(mk_world a1 1 healthy); then
+if w=$(mk_world a1 1 healthy healthy); then
   run_apply "$w"
   prev_s=$(git -C "$w/repo" rev-parse --short "$PREVFULL")
   last_build=$(grep '^build@' "$w/docker.log" 2>/dev/null | tail -1)
@@ -119,16 +132,20 @@ if w=$(mk_world a1 1 healthy); then
 else nope "a1 SETUP не состоялся"; fi
 
 # ── a2: гейт пропускает, выдача здорова ⇒ TARGET; порядок build → gate → cron → up; сторож ──
-if w=$(mk_world a2 0 healthy); then
+if w=$(mk_world a2 0 healthy healthy); then
   run_apply "$w"
   t=$(git -C "$w/repo" rev-parse --short HEAD)
   seq=$(grep -E '^(build|gate|up|watchdog)@' "$w/docker.log" 2>/dev/null | tr '\n' ' ')
   reasons=""
+  grep -qx 'inspect:hft-recorder' "$w/inspect.log" 2>/dev/null || reasons="$reasons; здоровье hft-recorder не спрашивалось"
+  grep -qx 'inspect:hft-gateway-serve' "$w/inspect.log" 2>/dev/null || reasons="$reasons; здоровье hft-gateway-serve не спрашивалось"
+  grep -q "^prune@$t" "$w/docker.log" 2>/dev/null || reasons="$reasons; docker image prune после успешного деплоя не выполнен"
+  grep -q '^logs:' "$w/docker.log" 2>/dev/null && reasons="$reasons; логи сняты при УСПЕШНОМ деплое"
   [ "$RC" -eq 0 ] || reasons="$reasons; exit=$RC"
   [ "$(git -C "$w/repo" rev-parse HEAD)" = "$(git -C "$w/repo" rev-parse main)" ] || reasons="$reasons; чекаут не на TARGET"
   [ "$seq" = "build@$t gate@$t up@$t watchdog@$t " ] || reasons="$reasons; порядок «$seq», ожидался build→gate→up→watchdog на $t"
   grep -q 'echo target' "$w/cron/hft-journal-retention" 2>/dev/null || reasons="$reasons; cron не установлен из TARGET"
-  if [ -z "$reasons" ]; then ok "a2 гейт пропустил ⇒ TARGET, build→gate→up→watchdog, cron из TARGET"
+  if [ -z "$reasons" ]; then ok "a2 гейт пропустил ⇒ TARGET, build→gate→up→watchdog, здоровье ОБЕИХ служб спрошено, prune выполнен, cron из TARGET"
   else nope "a2 нормальный деплой:${reasons}"; fi
 else nope "a2 SETUP не состоялся"; fi
 
@@ -136,7 +153,7 @@ else nope "a2 SETUP не состоялся"; fi
 # Проверяется отдельным миром с отказом гейта, но cron-файл TARGET отличим: если cron ставится до
 # гейта, a1 уже красен. Здесь — независимое свидетельство: время установки cron относительно
 # вызова гейта (по mtime файла и записи гейта).
-if w=$(mk_world a3 1 healthy); then
+if w=$(mk_world a3 1 healthy healthy); then
   before=$(stat -c %Y "$w/cron/hft-journal-retention")
   sleep 1
   run_apply "$w"
@@ -145,34 +162,54 @@ if w=$(mk_world a3 1 healthy); then
   else nope "a3 cron-файл хоста ПЕРЕЗАПИСАН при отказе гейта (mtime $before → $after) — установка до гейта"; fi
 else nope "a3 SETUP не состоялся"; fi
 
-# ── a4: выдача НЕ поднялась здоровой ⇒ откат: PREV, cron из PREV, выдача поднята на PREV ──
-if w=$(mk_world a4 0 unhealthy); then
+# ── a4: служба НЕ поднялась здоровой ⇒ откат: PREV, cron из PREV, выдача поднята на PREV, логи ──
+# Три мира (`C-281` B1): обе нездоровы; только recorder; только gateway-serve. Деплой, ждущий одну
+# службу, проходит ровно тот мир, где нездорова другая, — и краснеет здесь.
+health_world() { # <имя> <recorder> <gateway-serve>
+  local name="$1" hr="$2" hs="$3" w prev_s last_up reasons
+  if w=$(mk_world "$name" 0 "$hr" "$hs"); then
+    run_apply "$w"
+    prev_s=$(git -C "$w/repo" rev-parse --short "$PREVFULL")
+    last_up=$(grep '^up@' "$w/docker.log" 2>/dev/null | tail -1)
+    reasons=""
+    [ "$RC" -ne 0 ] || reasons="$reasons; exit=0 при нездоровой службе (recorder=$hr, gateway-serve=$hs)"
+    [ "$(git -C "$w/repo" rev-parse HEAD)" = "$PREVFULL" ] || reasons="$reasons; чекаут не на PREV"
+    [ "$last_up" = "up@$prev_s" ] || reasons="$reasons; последний up «$last_up», а не на PREV"
+    grep -q 'echo prev' "$w/cron/hft-journal-retention" && ! grep -q 'echo target' "$w/cron/hft-journal-retention" \
+      || reasons="$reasons; cron хоста остался от TARGET после отката"
+    grep -q '^logs:hft-recorder@' "$w/docker.log" 2>/dev/null || reasons="$reasons; при отказе не сняты логи hft-recorder"
+    grep -q '^logs:hft-gateway-serve@' "$w/docker.log" 2>/dev/null || reasons="$reasons; при отказе не сняты логи hft-gateway-serve"
+    if [ -z "$reasons" ]; then ok "$name нездорова служба (recorder=$hr, gateway-serve=$hs) ⇒ откат к PREV, cron из PREV, up на PREV, логи обеих"
+    else nope "$name откат по здоровью:${reasons} | лог: $(tr '\n' ' ' < "$w/docker.log" 2>/dev/null)"; fi
+  else nope "$name SETUP не состоялся"; fi
+}
+health_world a4  unhealthy unhealthy
+health_world a4r unhealthy healthy
+health_world a4s healthy   unhealthy
+
+# ── a5: установка сторожа ОТКАЗАЛА на здоровом деплое ⇒ деплой красный (контракт deploy.yml M-93) ──
+if w=$(mk_world a5 0 healthy healthy 1); then
   run_apply "$w"
-  prev_s=$(git -C "$w/repo" rev-parse --short "$PREVFULL")
-  last_up=$(grep '^up@' "$w/docker.log" 2>/dev/null | tail -1)
-  reasons=""
-  [ "$RC" -ne 0 ] || reasons="$reasons; exit=0 при нездоровой выдаче"
-  [ "$(git -C "$w/repo" rev-parse HEAD)" = "$PREVFULL" ] || reasons="$reasons; чекаут не на PREV"
-  [ "$last_up" = "up@$prev_s" ] || reasons="$reasons; последний up «$last_up», а не на PREV"
-  grep -q 'echo prev' "$w/cron/hft-journal-retention" && ! grep -q 'echo target' "$w/cron/hft-journal-retention" \
-    || reasons="$reasons; cron хоста остался от TARGET после отката"
-  if [ -z "$reasons" ]; then ok "a4 нездоровая выдача ⇒ откат к PREV, cron из PREV, up на PREV"
-  else nope "a4 откат по здоровью:${reasons} | лог: $(tr '\n' ' ' < "$w/docker.log" 2>/dev/null)"; fi
-else nope "a4 SETUP не состоялся"; fi
+  if [ "$RC" -ne 0 ] && grep -q '^watchdog@' "$w/docker.log"; then
+    ok "a5 отказ установки сторожа ⇒ деплой красный (exit=$RC)"
+  else
+    nope "a5 отказ установки сторожа: exit=$RC, сторож звался: $(grep -c '^watchdog@' "$w/docker.log" 2>/dev/null) — тревоги без сторожа нет, деплой обязан быть красным"
+  fi
+else nope "a5 SETUP не состоялся"; fi
 
 # ── a7: проводка deploy.yml — тело деплоя вызывается скриптом, после reset на TARGET, с PREV ──
 reset_l=$(grep -n 'git reset --hard -q "\$TARGET_SHA"' "$DEPLOY" | head -1 | cut -d: -f1)
 apply_l=$(grep -n 'deploy/bin/deploy-apply.sh' "$DEPLOY" | head -1 | cut -d: -f1)
-inline_up=$(grep -c 'docker compose up' "$DEPLOY" || true)
+inline_up=$(grep -vE '^[[:space:]]*#' "$DEPLOY" | grep -c 'docker compose up' || true)  # комментарии не исполняются
 if [ -z "$reset_l" ]; then
   nope "a7 SETUP: в deploy.yml нет reset на TARGET_SHA"
 elif [ -z "$apply_l" ]; then
   nope "a7 deploy.yml не зовёт deploy/bin/deploy-apply.sh — тело деплоя не то, что исполняет проба"
 elif [ "$reset_l" -lt "$apply_l" ] && grep -n 'deploy/bin/deploy-apply.sh' "$DEPLOY" | head -1 | grep -q 'PREV' \
-     && [ "$inline_up" -eq 0 ]; then
-  ok "a7 deploy.yml: reset на TARGET → deploy-apply.sh \"\$PREV\"; инлайнового docker compose up нет"
+     && [ "$inline_up" -eq 0 ] && grep -qE '^[[:space:]]+command_timeout:[[:space:]]*15m[[:space:]]*$' "$DEPLOY"; then
+  ok "a7 deploy.yml: reset на TARGET → deploy-apply.sh \"\$PREV\"; инлайнового docker compose up нет; command_timeout: 15m"
 else
-  nope "a7 проводка: reset=$reset_l apply=$apply_l, PREV передан: $(grep 'deploy/bin/deploy-apply.sh' "$DEPLOY" | grep -c PREV), инлайновых 'docker compose up': $inline_up"
+  nope "a7 проводка: reset=$reset_l apply=$apply_l, PREV передан: $(grep 'deploy/bin/deploy-apply.sh' "$DEPLOY" | grep -c PREV), инлайновых 'docker compose up': $inline_up, command_timeout 15m: $(grep -cE '^[[:space:]]+command_timeout:[[:space:]]*15m[[:space:]]*$' "$DEPLOY")"
 fi
 
 printf 'сценариев: %d (pass=%d fail=%d)\n' "$((PASS+FAIL))" "$PASS" "$FAIL"
