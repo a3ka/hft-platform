@@ -92,9 +92,13 @@ services:
       - gateway-ckpt:/ckpt:ro
       # M-92 (§4 п.1–2): bind-mount рабочего каталога хоста, в который скрипт cron'а
       # пишет `plan.txt`, `manifest.txt`, `bin-output.txt`. Источник — env-переменная
-      # `RETENTION_WORK_DIR` (по умолчанию `/var/lib/hft/retention-work`); оператор
-      # создаёт каталог заранее (`install -d`). Без этого тома `docker compose run`
-      # упадёт с ошибкой монтирования ДО старта бинаря (явный fail-closed).
+      # `RETENTION_WORK_DIR` (по умолчанию `/var/lib/hft/retention-work`). Каталог
+      # создаётся скриптом cron'а (`mkdir -p "${RETENTION_WORK_DIR}"` в
+      # `deploy/bin/journal-retention-cron.sh:145`) и, при его отсутствии, самим Docker —
+      # короткая bind-форма не требует заранее существующего источника
+      # (root:root, 0755). (R-240 Н-4: прежняя формулировка «упадёт с ошибкой
+      # монтирования ДО старта бинаря» была ошибочна — Docker сам создаёт каталог
+      # bind-источника; cron-скрипт делает это явно до первого запуска.)
       - "${RETENTION_WORK_DIR:-/var/lib/hft/retention-work}:/work"
     # Контейнер одноразовый — без restart; запускается по cron или вручную оператором.
 
