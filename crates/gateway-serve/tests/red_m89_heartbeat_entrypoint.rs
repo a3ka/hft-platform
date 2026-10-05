@@ -94,6 +94,51 @@ fn compose_text() -> String {
     std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("чтение {}: {e}", p.display()))
 }
 
+/// `M-94` (`П-032`): если compose объявляет `GATEWAY_CALC_PROFILE`, путь ВНУТРИ образа
+/// отображается на файл репозитория по строке `COPY config/calc-profile/ <dst>` финальной
+/// стадии `Dockerfile` (так процесс его и получает), а ключи профиля возвращаются — они считаются
+/// объявленными прод-описанием наравне с `environment:`. Без переменной (до `M-94`) — пусто, и
+/// оракул ведёт себя как прежде.
+fn map_calc_profile(env: &mut BTreeMap<String, String>) -> BTreeMap<String, String> {
+    let Some(container) = env.get("GATEWAY_CALC_PROFILE").cloned() else {
+        return BTreeMap::new();
+    };
+    let docker = std::fs::read_to_string(repo_root().join("Dockerfile")).expect("Dockerfile");
+    let lines: Vec<&str> = docker.lines().collect();
+    let last_from = lines
+        .iter()
+        .rposition(|l| l.trim_start().to_ascii_uppercase().starts_with("FROM "))
+        .expect("SETUP-СТРАЖ: в Dockerfile нет FROM");
+    let dst = lines[last_from..]
+        .iter()
+        .map(|l| l.split_whitespace().collect::<Vec<_>>())
+        .find(|t| {
+            t.first().is_some_and(|c| c.eq_ignore_ascii_case("COPY"))
+                && t.iter()
+                    .any(|x| x.trim_end_matches('/') == "config/calc-profile")
+        })
+        .and_then(|t| t.last().map(|d| d.trim_end_matches('/').to_string()))
+        .expect(
+            "M-94: GATEWAY_CALC_PROFILE объявлен, но Dockerfile не доставляет config/calc-profile/",
+        );
+    let rel = container
+        .strip_prefix(&format!("{dst}/"))
+        .unwrap_or_else(|| panic!("M-94: {container} вне каталога образа {dst}"));
+    let file = repo_root().join("config/calc-profile").join(rel);
+    let text = std::fs::read_to_string(&file)
+        .unwrap_or_else(|e| panic!("M-94: профиль {} не читается: {e}", file.display()));
+    env.insert(
+        "GATEWAY_CALC_PROFILE".to_string(),
+        file.display().to_string(),
+    );
+    text.lines()
+        .map(str::trim)
+        .filter(|t| !t.is_empty() && !t.starts_with('#'))
+        .filter_map(|t| t.split_once('='))
+        .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+        .collect()
+}
+
 /// `${VAR:-default}` → `default`; `${VAR:?msg}` → проба.
 fn subst_default(raw: &str) -> String {
     let s = raw.trim().trim_matches('"');
@@ -487,7 +532,8 @@ fn h0_compose_declares_heartbeat_file_path_on_a_writable_declared_mount() {
 /// фикстуры равен пути cron'а.**
 #[tokio::test]
 async fn h1_prod_binary_writes_heartbeat_at_compose_path_atomically_and_values_grow() {
-    let env = compose_env();
+    let mut env = compose_env();
+    let _ = map_calc_profile(&mut env); // M-94: путь профиля — на файл репозитория
     let (journal, ckpt) = journal_with_warm_ckpt();
     // Фикстура-монтирование: tmpdir играет `/var/lib/docker/volumes/hft-platform_<vol>/_data`.
     let (vol, rel) = mapped_heartbeat_path(&env);

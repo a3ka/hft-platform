@@ -155,6 +155,44 @@ fn compose_env(service: &str, env: &BTreeMap<String, String>) -> BTreeMap<String
         .collect()
 }
 
+/// M-94 (`П-032`): путь профиля расчётов ВНУТРИ образа → файл репозитория (строка
+/// `COPY config/calc-profile/ <dst>` финальной стадии `Dockerfile`).
+fn map_profile_path(container: &str) -> PathBuf {
+    let docker = std::fs::read_to_string(repo_root().join("Dockerfile")).expect("Dockerfile");
+    let lines: Vec<&str> = docker.lines().collect();
+    let last_from = lines
+        .iter()
+        .rposition(|l| l.trim_start().to_ascii_uppercase().starts_with("FROM "))
+        .expect("SETUP НЕ СОСТОЯЛСЯ: в Dockerfile нет FROM");
+    let dst = lines[last_from..]
+        .iter()
+        .map(|l| l.split_whitespace().collect::<Vec<_>>())
+        .find(|t| {
+            t.first().is_some_and(|c| c.eq_ignore_ascii_case("COPY"))
+                && t.iter()
+                    .any(|x| x.trim_end_matches('/') == "config/calc-profile")
+        })
+        .and_then(|t| t.last().map(|d| d.trim_end_matches('/').to_string()))
+        .expect(
+            "M-94: GATEWAY_CALC_PROFILE объявлен, но Dockerfile не доставляет config/calc-profile/",
+        );
+    let rel = container
+        .strip_prefix(&format!("{dst}/"))
+        .unwrap_or_else(|| panic!("M-94: {container} вне каталога образа {dst}"));
+    repo_root().join("config/calc-profile").join(rel)
+}
+
+fn read_profile(file: &Path) -> BTreeMap<String, String> {
+    std::fs::read_to_string(file)
+        .unwrap_or_else(|e| panic!("M-94: профиль {} не читается: {e}", file.display()))
+        .lines()
+        .map(str::trim)
+        .filter(|t| !t.is_empty() && !t.starts_with('#'))
+        .filter_map(|t| t.split_once('='))
+        .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+        .collect()
+}
+
 // ───────────────────────── cron: прод-окружение ─────────────────────────
 
 /// `KEY=VALUE` строки НАСТОЯЩЕГО `deploy/cron.d/journal-retention` — окружение, в котором
@@ -338,7 +376,13 @@ fn retarget(args: &[String], journal: &Path, ckpt: &Path, cov: &Path) -> Vec<Str
 /// Разбор полос/чисел — та же форма, что `serve_config_from_env` (`split(',')`, `parse`):
 /// предмет оракула — КОМПОЗИЦИЯ источников, а не разбор числа (названный предел).
 fn server_selector(dotenv: &BTreeMap<String, String>) -> Selector {
-    let env = compose_env("gateway-serve", dotenv);
+    let mut env = compose_env("gateway-serve", dotenv);
+    // M-94: в режиме профиля величины определения расчёта сервер берёт ИЗ ФАЙЛА профиля, а не
+    // из `environment:` — host `.env` до них не дотягивается. Мир, кладущий ось в `.env`,
+    // становится проверкой «ось из `.env` не просочилась в прогреватель».
+    if let Some(container) = env.get("GATEWAY_CALC_PROFILE").cloned() {
+        env.extend(read_profile(&map_profile_path(&container)));
+    }
     let get = |k: &str| -> String {
         env.get(k)
             .cloned()
@@ -410,10 +454,18 @@ fn prod_path(dotenv_text: &str, wrong: impl Fn(&mut Selector)) -> (u64, u64, Vec
         ckpt.path(),
         &cov,
     );
+    let mut warm_env = compose_env(SERVICE, &dotenv);
+    // M-94: путь профиля внутри образа — на файл репозитория (так процесс его получает).
+    if let Some(container) = warm_env.get("GATEWAY_CALC_PROFILE").cloned() {
+        warm_env.insert(
+            "GATEWAY_CALC_PROFILE".to_string(),
+            map_profile_path(&container).display().to_string(),
+        );
+    }
     let w = Command::new(BIN)
         .args(&argv)
         .env_clear()
-        .envs(compose_env(SERVICE, &dotenv))
+        .envs(&warm_env)
         .output()
         .expect("запуск gateway-checkpoint");
     assert_eq!(
