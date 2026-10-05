@@ -1,0 +1,33 @@
+[package]
+name = "recorder"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+
+# recorder: venue-адаптеры (Binance+HL) -> канал -> журнал (единственный писатель).
+# docs/fa/venues.md, journal.md. Реальные WS-клиенты в venue-* крейтах.
+
+[dependencies]
+contracts = { path = "../contracts" }
+journal = { path = "../journal" }
+# M-09 task 2 wiring: recon-оркестратор использует ops::sink + book::OrderBook (live-книга).
+# ops остаётся БЕЗ journal-dep (OPS-I-6); recorder владеет metrics (Arc) и mpsc-каналом
+# (JR-I-1, единственный путь в журнал).
+ops = { path = "../ops" }
+book = { path = "../book" }
+venue-binance = { path = "../venue-binance" }
+venue-hyperliquid = { path = "../venue-hyperliquid" }
+venue-binance-futures = { path = "../venue-binance-futures" }
+# M-09 task 2 wiring: recon-orchestrator создаёт per-venue `reqwest::Client` для
+# `ReconFetcher`. Передавать Client извне (из deploy-конфига) — следующая итерация
+# (TLS/proxy tuning); сейчас bare `Client::new()`.
+reqwest = { version = "0.12", default-features = false }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "signal", "net", "io-util"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# M-08 / TD-019: heartbeat-файл пишется как JSON с состоянием (storage_status, seq, ...).
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
