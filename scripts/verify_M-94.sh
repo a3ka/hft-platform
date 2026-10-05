@@ -28,7 +28,7 @@ DRY="${VERIFY_M94_CI_DRY:-0}"
 if [ "$DRY" != "1" ]; then
 # --- task7: файл профиля v1 существует и несёт ровно восемь ключей (оракулы разбирают его сами)
 if [ -f config/calc-profile/active.env ] \
-   && [ "$(grep -cE '^[A-Z_]+=' config/calc-profile/active.env)" -eq 8 ]; then
+   && [ "$(grep -cE '^[A-Z][A-Z0-9_]*=' config/calc-profile/active.env)" -eq 8 ]; then
   pass "task7: config/calc-profile/active.env — восемь ключей"
 else
   fail "task7: config/calc-profile/active.env отсутствует или несёт не восемь ключей"
