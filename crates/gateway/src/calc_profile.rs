@@ -257,6 +257,36 @@ pub fn load_profile(path: &Path) -> Result<AppliedProfile, ProfileError> {
             reason: e.to_string(),
         })?;
 
+    // Жёсткие диапазоны осей (милестоун §3.2: разборщик НЕ догадывается о политике,
+    // но ЗНАЕТ базовые инварианты типа «каденция >= 1 с и выравнена на сутки» — ровно
+    // те, что есть в `gateway::validate_selector` и `serve_config_from_env` для
+    // GATEWAY_DEPTH_CADENCE_MS). Сообщение отказа НАЗЫВАЕТ ключ, чтобы `p5`-мир
+    // «каденция 999» поймал `GATEWAY_DEPTH_CADENCE_MS` в stderr.
+    if depth_cadence_ms < 1000 || 86_400_000 % depth_cadence_ms != 0 {
+        return Err(ProfileError::BadValue {
+            key: "GATEWAY_DEPTH_CADENCE_MS".to_string(),
+            reason: format!(
+                "{depth_cadence_ms} must be >= 1000 and divide 86_400_000 \
+                 (MD-I-8 d14: подсекундный интервал даёт ОДИН ключ в секунду молча)"
+            ),
+        });
+    }
+    if timeframe_ms <= 0 || 86_400_000 % timeframe_ms != 0 {
+        return Err(ProfileError::BadValue {
+            key: "GATEWAY_TIMEFRAME_MS".to_string(),
+            reason: format!(
+                "{timeframe_ms} must be > 0 and divide 86_400_000 \
+                 (GW-I-10: иначе бакет пересекает 00:00 UTC)"
+            ),
+        });
+    }
+    if window_ms <= 0 {
+        return Err(ProfileError::BadValue {
+            key: "GATEWAY_WINDOW_MS".to_string(),
+            reason: format!("{window_ms} must be > 0 (M-37: 0 = offline-unbounded)"),
+        });
+    }
+
     // ЧЕТЫРЕ разборщика — публичные, чтобы `gateway-serve` звал их, а не дублировал
     // (`A-049` Р-6). Здесь — для самой загрузки (валидация тройки).
     let heatmap_window_frac = parse_heatmap_window_frac(&map["GATEWAY_HEATMAP_WINDOW"])?;
