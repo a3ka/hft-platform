@@ -283,6 +283,14 @@ services:
       # (COPY `Dockerfile` кладёт `config/calc-profile/` в `/etc/hft/calc-profile/`).
       # Никаких `GATEWAY_*` осей селектора здесь — иначе «наличие — отказ» (`p3`).
       GATEWAY_CALC_PROFILE: /etc/hft/calc-profile/active.env
+      # M-90 (TD-227) — `GATEWAY_VENUE` и `GATEWAY_SYMBOL` НЕ входят в профиль
+      # (§3.1: восемь ключей — `CALC_PROFILE_VERSION` и семь `GATEWAY_*`, без VENUE/SYMBOL).
+      # Единый источник для них — host `.env` → compose у ОБЕИХ служб (M-90): при
+      # расхождении прогреватель пишет слепок по дефолту, сервер ищет по `.env` —
+      # имя слепка расходится, реплей журнала вместо тёплого старта (класс TD-227).
+      # Дефолты — те же, что у `gateway-serve` (`Binance`/`BTCUSDT`).
+      GATEWAY_VENUE: ${GATEWAY_VENUE:-Binance}
+      GATEWAY_SYMBOL: ${GATEWAY_SYMBOL:-BTCUSDT}
     volumes:
       # RO-bind к журналу (JR-I-1) + RW-bind к чекпоинт-тому.
       - journal-data:/journal:ro
