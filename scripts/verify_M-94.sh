@@ -47,7 +47,7 @@ run_step "task4: red_compose_deploy_form.sh (D10)" bash scripts/tests/red_compos
 run_step "task4: verify_delivery_M-08.sh (мелкая форма)" bash scripts/verify_delivery_M-08.sh
 # --- task6: гейт деплоя (g0…g7)
 run_step "task6: red_m94_deploy_gate.sh (g0…g6)" bash scripts/tests/red_m94_deploy_gate.sh
-run_step "task6: red_m94_deploy_apply.sh (a0…a7, a2s, a4r/s/t/m — откат исполнением, C-280 R3, A-049)" bash scripts/tests/red_m94_deploy_apply.sh
+run_step "task6,13: red_m94_deploy_apply.sh (a0…a7, a2s, a4r/s/t/m — откат исполнением, C-280 R3, A-049; сторож в откате — R-245 B-2)" bash scripts/tests/red_m94_deploy_apply.sh
 # --- task8: корпус целиком — исполняется ниже шагом паритета `cargo test --all` (CI build-test)
 # --- task9: барьер изменения профиля (задача architect'а; до сдачи — FAIL, не SKIP)
 if [ -f scripts/tests/red_calc_profile.sh ] && [ -f scripts/check_calc_profile.sh ]; then
@@ -66,6 +66,26 @@ if grep -qE 'прод-дефолт РОВНО узкий|RENDERED|BANDS_BLOCK' s
 else
   pass "task10: сторож verify_M-70 task #7 снят"
 fi
+# --- task12: одна грамматика на величину (R-245 B-1, спека §3.2) — поведение в обоих режимах
+run_step "task12: red_m94_single_grammar (g1 g2)" \
+  cargo test -q -p gateway-serve --test red_m94_single_grammar
+# Единственность ЭКЗЕМПЛЯРА: поведенческий g1 не видит копию, совпадающую по правилу сегодня. Ветки
+# без профиля обоих бинарей обязаны ЗВАТЬ общие разборщики. Предел: проверка по тексту — вызов
+# видит, а оставшийся рядом мёртвый разбор не видит (его ловит g1, как только правила разойдутся).
+check_calls() { # <файл> <функции…>
+  local f="$1" fn n missing=""; shift
+  for fn in "$@"; do
+    n=$(grep -c "calc_profile::${fn}(" "$f" || true)
+    [ "${n:-0}" -ge 1 ] || missing="$missing $fn"
+  done
+  if [ -z "$missing" ]; then pass "task12: $f зовёт общие разборщики ($*)"
+  else fail "task12: $f не зовёт общие разборщики:$missing (R-245 B-1 — второй экземпляр правила)"; fi
+}
+check_calls crates/gateway-serve/src/lib.rs parse_bands parse_timeframe_ms parse_window_ms \
+  parse_depth_cadence_ms parse_heatmap_window_frac parse_vp_bin_width_e8
+check_calls crates/gateway/src/bin/gateway-checkpoint.rs parse_bands parse_timeframe_ms \
+  parse_window_ms parse_depth_cadence_ms
+# --- task13: откат по здоровью ставит сторожа из PREV (R-245 B-2) — миры a4* пробы task6 выше
 run_step "ci-map: проба карты CI-паритета (red_verify_M-94_ci_map.sh; число миров печатает проба)" \
   bash scripts/tests/red_verify_M-94_ci_map.sh
 fi # DRY
