@@ -478,7 +478,12 @@ fn prod_path(dotenv_text: &str, wrong: impl Fn(&mut Selector)) -> (u64, u64, Vec
     let written = std::fs::read_dir(ckpt.path())
         .unwrap()
         .filter_map(|e| e.ok())
-        .filter(|e| e.file_name().to_string_lossy().starts_with("ckpt-"))
+        // M-94: рядом со слепком лежит `ckpt-<fp>.bin.profile` (версия профиля, §3.6 (б)) —
+        // слепком считается только `ckpt-*.bin`.
+        .filter(|e| {
+            let n = e.file_name().to_string_lossy().to_string();
+            n.starts_with("ckpt-") && n.ends_with(".bin")
+        })
         .count();
     assert_eq!(
         written, 1,
