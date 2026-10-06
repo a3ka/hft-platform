@@ -11,12 +11,17 @@
 //!
 //! # Как судится — детерминированно, точкой остановки (`test_sync::rendezvous`, M-65/M-87)
 //!
-//! Контракт точки (спека M-95 §3, задачи 1 и 3): после того как подписка ПОСТРОИЛА свой каталог
-//! и ДО расчёта провенанса транспорт зовёт `rendezvous::pump_signal_and_wait(<канал>)`:
+//! Контракт точки (спека M-95 §3, задачи 1 и 3; `A-050` A1): после того как подписка ПОСТРОИЛА
+//! свой каталог, НЕПОСРЕДСТВЕННО перед расчётом провенанса (на legacy — ПОСЛЕ цикла догона; между
+//! точкой и провенансом нет `pump`/`is_fresh`/`refresh`/`SegmentCatalog::open`) транспорт зовёт `rendezvous::pump_signal_and_wait(<канал>)`:
 //! `m95-catalog:<id подписки>` на v1-пути новой подписки, `m95-catalog:legacy` на legacy-пути.
 //! Точка есть только в тестовой сборке (`feature = "testing"`), как у M-87. Тест в остановке
 //! удаляет самый ранний сегмент (слепок его покрывает — родословная законна, как после
 //! `retention-prune`) и отпускает.
+//!
+//! Место точки доказывается двумя свидетелями: сторож inotify — каталог построен ДО точки
+//! (`C-285`); дописанные в остановке события не попадают в снимок — догон не прошёл ПОСЛЕ точки
+//! (`A-050` A2; мутант E5 «точка до догона + провенанс без проверки свежести» иначе зеленел `f2`).
 //!
 //! Парный мир (`f0`) обязателен: без удаления та же подписка НЕ объявляет историю усечённой —
 //! иначе прошла бы реализация «всегда `truncated = true`».
@@ -73,6 +78,12 @@ fn writer_cfg() -> WriterConfig {
     }
 }
 
+/// Хвост фикстуры, дописанный ПОСЛЕ слепка и ДО подключения: `[TAIL_FROM, TAIL_END)`.
+const TAIL_FROM: u64 = 3_000;
+const TAIL_END: u64 = TAIL_FROM + 40;
+/// Сколько событий дописывается В ОСТАНОВКЕ — свидетель места точки (`A-050` A2).
+const AT_PAUSE: u64 = 7;
+
 fn append(dir: &std::path::Path, from: u64, n: u64) {
     let mut j = Journal::open_with(dir, writer_cfg()).expect("open_with");
     for i in from..from + n {
@@ -98,13 +109,13 @@ fn append(dir: &std::path::Path, from: u64, n: u64) {
 /// Журнал со сжатыми историческими сегментами, слепок покрывает ВСЁ записанное до него.
 fn fixture() -> (tempfile::TempDir, tempfile::TempDir, std::path::PathBuf) {
     let dir = tempfile::tempdir().expect("journal");
-    append(dir.path(), 0, 3_000);
+    append(dir.path(), 0, TAIL_FROM);
     journal::compact_closed_segments(dir.path(), 1, journal::DEFAULT_COMPACT_LEVEL)
         .expect("compact");
     let ckpt = tempfile::tempdir().expect("ckpt");
     gateway::checkpoint::advance(dir.path(), ckpt.path(), &sel(), EpochFilter::OwnCaptureOnly)
         .expect("advance");
-    append(dir.path(), 3_000, 40);
+    append(dir.path(), TAIL_FROM, TAIL_END - TAIL_FROM);
     let earliest = dir.path().join("segment-00000000.jrnl.zst");
     assert!(
         earliest.exists(),
@@ -203,6 +214,34 @@ async fn snapshot_body(ws: &mut Ws) -> Value {
             panic!("SETUP НЕ СОСТОЯЛСЯ: подписка отвергнута: {v}");
         }
     }
+}
+
+/// **Свидетель места (`A-050` A2).** В остановке, кроме удаления, дописываются `AT_PAUSE` событий с
+/// `seq >= TAIL_END`. Снимок, построенный ДО точки, их не содержит; если они в нём — между точкой и
+/// провенансом прошёл догон (`pump`, а с ним `is_fresh`/`refresh`), и проверку свежести сделал
+/// ЧУЖОЙ код: провенанс без собственной проверки оказался бы честен случайно (`A-050` E5).
+///
+/// Нижняя граница (`caught_up`) — setup-страж ТОЛЬКО для legacy: там снимок строится после догона
+/// до хвоста, и без неё верхняя граница была бы вакуумной (снимок, не догнавший даже хвост фикстуры,
+/// прошёл бы её всегда). На v1 догона нет — снимок отдаётся из слепка (`upto_seq` = позиция слепка,
+/// замер 2999), там действует только верхняя граница: она ловит догон, если реализация его введёт.
+fn assert_point_right_before_provenance(body: &Value, path: &str, caught_up: bool) {
+    let upto = body
+        .get("cursor")
+        .and_then(|c| c.get("upto_seq"))
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| panic!("SETUP НЕ СОСТОЯЛСЯ: в снимке нет cursor.upto_seq: {body}"));
+    assert!(
+        !caught_up || upto >= TAIL_END - 1,
+        "SETUP НЕ СОСТОЯЛСЯ: снимок не догнал хвост фикстуры (upto_seq={upto}, ждали ≥ {}): {body}",
+        TAIL_END - 1
+    );
+    assert!(
+        upto < TAIL_END,
+        "M-95 / A-050 E5/W2: {path} — снимок содержит события, дописанные В ОСТАНОВКЕ \
+         (upto_seq={upto} ≥ {TAIL_END}): точка стоит ДО догона, каталог тронут между точкой и \
+         провенансом. Точка обязана стоять непосредственно перед расчётом провенанса (спека §3)"
+    );
 }
 
 fn truncated(body: &Value) -> bool {
@@ -384,14 +423,17 @@ async fn f1_v1_retention_between_catalog_and_provenance_is_honest() {
     let e = earliest.clone();
     let wc = w.clone();
     let en = earliest_name.clone();
+    let jd = dir.path().to_path_buf();
     tokio::task::spawn_blocking(move || {
         pause_and(&chc, &wc, &en, baseline, move || {
-            std::fs::remove_file(&e).expect("удаление раннего сегмента (как retention-prune)")
+            std::fs::remove_file(&e).expect("удаление раннего сегмента (как retention-prune)");
+            append(&jd, TAIL_END, AT_PAUSE); // свидетель места (`A-050` A2)
         })
     })
     .await
     .expect("pause");
     let body = snapshot_body(&mut ws).await;
+    assert_point_right_before_provenance(&body, "v1", false);
     assert!(
         truncated(&body),
         "M-95 / C-284 B2 / VB-I-11: ранний сегмент удалён ПОСЛЕ построения каталога подписки и ДО \
@@ -428,14 +470,17 @@ async fn f2_legacy_retention_between_catalog_and_provenance_is_honest() {
     let e = earliest.clone();
     let wc = w.clone();
     let en = earliest_name.clone();
+    let jd = dir.path().to_path_buf();
     tokio::task::spawn_blocking(move || {
         pause_and(&chc, &wc, &en, baseline, move || {
-            std::fs::remove_file(&e).expect("удаление раннего сегмента (как retention-prune)")
+            std::fs::remove_file(&e).expect("удаление раннего сегмента (как retention-prune)");
+            append(&jd, TAIL_END, AT_PAUSE); // свидетель места (`A-050` A2)
         })
     })
     .await
     .expect("pause");
     let body = snapshot_body(&mut ws).await;
+    assert_point_right_before_provenance(&body, "legacy", true);
     assert!(
         truncated(&body),
         "M-95 / C-284 B2 / VB-I-11: legacy-путь — ранний сегмент удалён между каталогом и \
