@@ -219,14 +219,102 @@ impl Drop for Guard {
     }
 }
 
-/// Остановиться в точке канала, выполнить `act`, отпустить. Точка обязана наступить.
-fn pause_and(ch: &str, act: impl FnOnce()) {
+/// Наблюдатель открытий файлов каталога журнала (`inotify IN_OPEN`, Python `ctypes`) — тот же,
+/// что в `red_m95_catalog_once`. Здесь он ДОКАЗЫВАЕТ ПОРЯДОК (`C-285`): к моменту остановки
+/// подписка уже открыла самый ранний сжатый сегмент, то есть её каталог построен.
+const WATCHER: &str = r#"
+import ctypes, os, struct, sys, select
+libc = ctypes.CDLL("libc.so.6", use_errno=True)
+d, out, ready = sys.argv[1], sys.argv[2], sys.argv[3]
+fd = libc.inotify_init1(0)
+if fd < 0: sys.exit("inotify_init1 failed")
+if libc.inotify_add_watch(fd, d.encode(), 0x20) < 0: sys.exit("inotify_add_watch failed")
+f = open(out, "w", buffering=1)
+open(ready, "w").close()
+while True:
+    r, _, _ = select.select([fd], [], [], 0.05)
+    if not r:
+        if os.path.exists(ready + ".stop"): break
+        continue
+    buf = os.read(fd, 65536); i = 0
+    while i < len(buf):
+        wd, mask, cookie, ln = struct.unpack_from("iIII", buf, i)
+        f.write(buf[i+16:i+16+ln].rstrip(b"\0").decode() + "\n"); i += 16 + ln
+"#;
+
+struct Watcher {
+    child: std::process::Child,
+    out: std::path::PathBuf,
+    _tmp: tempfile::TempDir,
+}
+impl Watcher {
+    fn start(dir: &std::path::Path) -> Self {
+        let tmp = tempfile::tempdir().expect("watcher tmp");
+        let script = tmp.path().join("w.py");
+        std::fs::write(&script, WATCHER).unwrap();
+        let (out, ready) = (tmp.path().join("opens"), tmp.path().join("ready"));
+        let child = std::process::Command::new("python3")
+            .arg(&script)
+            .arg(dir)
+            .arg(&out)
+            .arg(&ready)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("SETUP: python3 недоступен");
+        let t0 = std::time::Instant::now();
+        while !ready.exists() {
+            assert!(
+                t0.elapsed() < Duration::from_secs(10),
+                "SETUP НЕ СОСТОЯЛСЯ: наблюдатель inotify не поднялся"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        Watcher {
+            child,
+            out,
+            _tmp: tmp,
+        }
+    }
+    fn opens_of(&self, name: &str) -> usize {
+        std::fs::read_to_string(&self.out)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| *l == name)
+            .count()
+    }
+}
+impl Drop for Watcher {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Остановиться в точке канала; ДОКАЗАТЬ ПОРЯДОК — к остановке подписка уже открыла `earliest`
+/// (каталог построен; `C-285`); выполнить `act`; отпустить.
+fn pause_and(ch: &str, w: &Watcher, earliest: &str, baseline: usize, act: impl FnOnce()) {
     assert!(
         rendezvous::test_wait_for_pump(ch, BUDGET),
         "M-95 / C-284 B2: точка `{ch}` не наступила за {BUDGET:?} — у реализации нет места «каталог \
          подписки построен, провенанс ещё не посчитан» (контракт точки — спека M-95 §3). Без неё \
          удаление сегмента между двумя наблюдениями не воспроизводится детерминированно"
     );
+    // События ядра доставляются асинхронно: ждём появления открытия до 2 с.
+    let t0 = std::time::Instant::now();
+    while w.opens_of(earliest) <= baseline && t0.elapsed() < Duration::from_secs(2) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let n = w.opens_of(earliest);
+    if n <= baseline {
+        rendezvous::test_release(ch);
+        panic!(
+            "M-95 / C-285: в точке `{ch}` самый ранний сжатый сегмент `{earliest}` не открыт ПОСЛЕ \
+             начала подписки (до неё: {baseline}, сейчас: {n}) — точка стоит ДО построения каталога подписки. Удаление в такой точке произошло \
+             бы раньше обхода, и реализация без проверки свежести прошла бы f1/f2. Точка обязана \
+             стоять ПОСЛЕ построения каталога (спека M-95 §3)"
+        );
+    }
     act();
     rendezvous::test_release(ch);
 }
@@ -241,6 +329,10 @@ async fn f0_v1_without_retention_history_is_complete() {
     rendezvous::arm(&ch);
     let _g = Guard(ch.clone());
     let addr = start(dir.path(), ckpt.path()).await;
+    let w = std::sync::Arc::new(Watcher::start(dir.path()));
+    let earliest_name = "segment-00000000.jrnl.zst".to_string();
+    // Отсчёт ДО подписки/соединения: открытия до неё (старт сервера и т.п.) порядка не доказывают.
+    let baseline = w.opens_of(&earliest_name);
     let mut ws = connect(&addr).await;
     ws.send(Message::Text(
         json!({"op":"subscribe","v":1,"id":"p0","selector":{
@@ -251,7 +343,9 @@ async fn f0_v1_without_retention_history_is_complete() {
     .await
     .expect("send");
     let chc = ch.clone();
-    tokio::task::spawn_blocking(move || pause_and(&chc, || {}))
+    let wc = w.clone();
+    let en = earliest_name.clone();
+    tokio::task::spawn_blocking(move || pause_and(&chc, &wc, &en, baseline, || {}))
         .await
         .expect("pause");
     let body = snapshot_body(&mut ws).await;
@@ -273,6 +367,10 @@ async fn f1_v1_retention_between_catalog_and_provenance_is_honest() {
     rendezvous::arm(&ch);
     let _g = Guard(ch.clone());
     let addr = start(dir.path(), ckpt.path()).await;
+    let w = std::sync::Arc::new(Watcher::start(dir.path()));
+    let earliest_name = "segment-00000000.jrnl.zst".to_string();
+    // Отсчёт ДО подписки/соединения: открытия до неё (старт сервера и т.п.) порядка не доказывают.
+    let baseline = w.opens_of(&earliest_name);
     let mut ws = connect(&addr).await;
     ws.send(Message::Text(
         json!({"op":"subscribe","v":1,"id":"s1","selector":{
@@ -284,8 +382,10 @@ async fn f1_v1_retention_between_catalog_and_provenance_is_honest() {
     .expect("send");
     let chc = ch.clone();
     let e = earliest.clone();
+    let wc = w.clone();
+    let en = earliest_name.clone();
     tokio::task::spawn_blocking(move || {
-        pause_and(&chc, move || {
+        pause_and(&chc, &wc, &en, baseline, move || {
             std::fs::remove_file(&e).expect("удаление раннего сегмента (как retention-prune)")
         })
     })
@@ -319,11 +419,17 @@ async fn f2_legacy_retention_between_catalog_and_provenance_is_honest() {
     rendezvous::arm(&ch);
     let _g = Guard(ch.clone());
     let addr = start(dir.path(), ckpt.path()).await;
+    let w = std::sync::Arc::new(Watcher::start(dir.path()));
+    let earliest_name = "segment-00000000.jrnl.zst".to_string();
+    // Отсчёт ДО подписки/соединения: открытия до неё (старт сервера и т.п.) порядка не доказывают.
+    let baseline = w.opens_of(&earliest_name);
     let mut ws = connect(&addr).await;
     let chc = ch.clone();
     let e = earliest.clone();
+    let wc = w.clone();
+    let en = earliest_name.clone();
     tokio::task::spawn_blocking(move || {
-        pause_and(&chc, move || {
+        pause_and(&chc, &wc, &en, baseline, move || {
             std::fs::remove_file(&e).expect("удаление раннего сегмента (как retention-prune)")
         })
     })
