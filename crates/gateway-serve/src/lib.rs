@@ -2968,69 +2968,43 @@ pub fn serve_config_from_env(
 
     let symbol = get("GATEWAY_SYMBOL").unwrap_or_else(|| "BTCUSDT".to_string());
 
+    // M-94 (задача 12, `R-245` B-1): у КАЖДОЙ из шести величин ОДНА грамматика —
+    // функция `gateway::calc_profile::parse_*`. Ветка «без профиля» обоих бинарей
+    // зовёт те же функции, что и загрузчик профиля (`A-049` Р-6, спека §3.2).
+    // Различие режимов — только политика профиля (окно без границы в профиле
+    // отвергается), грамматика — общая.
+
     // M-94: в режиме профиля `timeframe_ms` берётся ИЗ профиля. Проверка `check_no_env_overrides`
     // выше уже отвергла `GATEWAY_TIMEFRAME_MS` в env, поэтому здесь read из env вне
     // режима профиля.
     let timeframe_ms: i64 = if let Some(p) = &profile {
         p.timeframe_ms
     } else {
-        get("GATEWAY_TIMEFRAME_MS")
-            .unwrap_or_else(|| "1000".to_string())
-            .parse()
-            .map_err(|e| format!("GATEWAY_TIMEFRAME_MS parse: {e}"))?
+        gateway::calc_profile::parse_timeframe_ms(
+            &get("GATEWAY_TIMEFRAME_MS").unwrap_or_else(|| "1000".to_string()),
+        )
+        .map_err(|e| e.to_string())?
     };
-
-    // M-47 (GW-I-10, TD-046): fail-closed гвард на СТАРТЕ прод-бинаря. Зеркалит
-    // `gateway::validate_selector` — но отказ тут на СТАРТЕ, а не при первом клиентском
-    // подключении (урок TD-019/TD-020: иначе оператор с опечаткой поднимет ЗДОРОВЫЙ по
-    // healthcheck контейнер, отдающий ошибку каждому клиенту — §8 eyes-on увидит
-    // `(healthy)`, а кокпит будет пуст). Проверяем ДЕЛИМОСТЬ суток, не «круглость»
-    // (недельный бакет 604_800_000 круглый, но накрывает 7 полуночей — отвергается).
-    // Прод-дефолт 1000 и все выравненные значения (1, 60_000, 3_600_000, 86_400_000)
-    // делят 86_400_000 нацело — прод не ломаем.
-    if timeframe_ms <= 0 || 86_400_000 % timeframe_ms != 0 {
-        return Err(format!(
-            "GATEWAY_TIMEFRAME_MS={timeframe_ms} не выравнен на границу UTC-суток \
-             (требуется > 0 и 86_400_000 % GATEWAY_TIMEFRAME_MS == 0; иначе бакет пересекает \
-             00:00 UTC ⇒ session_id бакета не определён)"
-        ));
-    }
 
     let bands: Vec<f64> = if let Some(p) = &profile {
         p.bands.clone()
     } else {
-        get("GATEWAY_BANDS")
-            .unwrap_or_else(|| "0.001".to_string())
-            .split(',')
-            .map(|s| s.trim().parse::<f64>())
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("GATEWAY_BANDS parse: {e}"))?
+        gateway::calc_profile::parse_bands(
+            &get("GATEWAY_BANDS").unwrap_or_else(|| "0.001".to_string()),
+        )
+        .map_err(|e| e.to_string())?
     };
 
     // M-94: в режиме профиля `heatmap_window_frac` берётся ИЗ профиля (милестоун §3.1,
     // разборщик из `gateway::calc_profile` — единственный дом, `A-049` Р-6). В legacy —
-    // прежний путь `GATEWAY_HEATMAP_WINDOW` (M-75).
+    // прежний путь `GATEWAY_HEATMAP_WINDOW` (M-75); грамматика ОБЩАЯ с профилем.
     let heatmap_window_frac: f64 = if let Some(p) = &profile {
         p.heatmap_window_frac
     } else {
         match get("GATEWAY_HEATMAP_WINDOW") {
             None => gateway::DEFAULT_HEATMAP_WINDOW_FRAC,
             Some(raw) => {
-                let value = raw.trim();
-                match value.parse::<f64>() {
-                    Ok(w) if w.is_finite() && w > 0.0 && w < 1.0 => w,
-                    Ok(w) => {
-                        return Err(format!(
-                            "GATEWAY_HEATMAP_WINDOW={w:?} вне интервала (0, 1); \
-                             окно heatmap/COB должно быть положительным и меньше 1"
-                        ));
-                    }
-                    Err(e) => {
-                        return Err(format!(
-                            "GATEWAY_HEATMAP_WINDOW={value:?} не разбирается как f64 ({e})"
-                        ));
-                    }
-                }
+                gateway::calc_profile::parse_heatmap_window_frac(&raw).map_err(|e| e.to_string())?
             }
         }
     };
@@ -3042,8 +3016,9 @@ pub fn serve_config_from_env(
     // пробелы — легитимный offline (`None`); `"0"` канонизируется в `None` (а не
     // `Some(0)`), чтобы `selector_fingerprint` (M-38b) не расщеплял offline-режим на два
     // ключа чекпоинта (C-099 B-2).
-    // M-94: в режиме профиля `window_ms` берётся ИЗ профиля. Вне профиля —
-    // прежняя логика `GATEWAY_WINDOW_MS` (M-69, GW-I-14, R7/PL-I-5).
+    // M-94: в режиме профиля `window_ms` берётся ИЗ профиля. Вне профиля — общий
+    // грамматический разборщик; семантика `0` → `None` (legacy offline, M-37) и
+    // политика отказа в профиле (`load_profile`) лежат ВНЕ грамматики.
     let window_ms: Option<i64> = if let Some(p) = &profile {
         Some(p.window_ms)
     } else {
@@ -3051,26 +3026,11 @@ pub fn serve_config_from_env(
             None => None,
             Some(s) if s.trim().is_empty() => None,
             Some(s) => {
-                let trimmed = s.trim();
-                match trimmed.parse::<i64>() {
-                    Ok(0) => None,             // "0" — легитимный offline (паритет argv M-38b)
-                    Ok(w) if w > 0 => Some(w), // валидное bounded окно
-                    Ok(w) => {
-                        return Err(format!(
-                            "GATEWAY_WINDOW_MS={w} отрицателен — окно должно быть либо unset \
-                             (offline), либо положительным числом миллисекунд; отрицательное \
-                             ведёт себя как unbounded при непустом поле ⇒ selector_fingerprint \
-                             расходится с offline ⇒ чекпоинт снимается под незаказанным режимом"
-                        ));
-                    }
-                    Err(e) => {
-                        return Err(format!(
-                            "GATEWAY_WINDOW_MS={trimmed:?} не парсится как i64 ({e}) — это \
-                             опечатка в `.env` (мусор/суффикс/научная нотация/дробное/переполнение), \
-                             а не сигнал к unbounded-режиму; оператор обязан задать валидное \
-                             значение или unset/пусто/0 для offline"
-                        ));
-                    }
+                let v = gateway::calc_profile::parse_window_ms(&s).map_err(|e| e.to_string())?;
+                if v == 0 {
+                    None
+                } else {
+                    Some(v)
                 }
             }
         }
@@ -3174,52 +3134,17 @@ pub fn serve_config_from_env(
     // ───────────────────────────────────────────────────────────────────────
     // M-68: GATEWAY_DEPTH_CADENCE_MS — КОНФИГ, а не константа. M-94: в режиме
     // профиля берётся ИЗ профиля (милестоун §3.1, разборщик из `calc_profile`).
+    // M-94 (задача 12): ОБЩАЯ грамматика с профилем (`R-245` B-1); отсутствие/
+    // пустое/пробельное значение — дефолт 1000 (поведение под `A-015` §3 п.1).
     const DEFAULT_CADENCE_MS: i64 = 1_000;
     let depth_cadence_ms: Option<i64> = if let Some(p) = &profile {
         Some(p.depth_cadence_ms)
     } else {
-        let raw_cadence = get("GATEWAY_DEPTH_CADENCE_MS");
-        let trimmed_cadence = raw_cadence.as_deref().map(str::trim);
-        match trimmed_cadence {
+        match get("GATEWAY_DEPTH_CADENCE_MS") {
             None => Some(DEFAULT_CADENCE_MS),
-            Some("") => Some(DEFAULT_CADENCE_MS),
             Some(s) if s.trim().is_empty() => Some(DEFAULT_CADENCE_MS),
             Some(s) => {
-                let trimmed = s.trim();
-                match trimmed.parse::<i64>() {
-                    Ok(ms) if ms >= 1000 && 86_400_000 % ms == 0 => Some(ms),
-                    Ok(ms) if ms >= 1000 && 86_400_000 % ms != 0 => {
-                        return Err(format!(
-                            "GATEWAY_DEPTH_CADENCE_MS={ms} не выравнен на границу UTC-суток \
-                         (требуется 86_400_000 % GATEWAY_DEPTH_CADENCE_MS == 0; иначе \
-                         подсекундные/нестандартные значения дают схлопывание ключей — \
-                         тот же класс, что GW-I-14 для window_ms; см. MD-I-8 d14)"
-                        ));
-                    }
-                    Ok(ms) if ms < 1000 => {
-                        return Err(format!(
-                            "GATEWAY_DEPTH_CADENCE_MS={ms} подсекундная — проводная форма \
-                         ключуется секундами (DepthRow.series — time_s), подсекундный \
-                         интервал даёт ОДИН ключ в секунду молча. Требуется >= 1000; \
-                         см. MD-I-8 d14 (C-167)"
-                        ));
-                    }
-                    Ok(ms) => {
-                        return Err(format!(
-                            "GATEWAY_DEPTH_CADENCE_MS={ms} невалидно: должно быть >= 1000 \
-                         и выравнено на границу UTC-суток (86_400_000 % ms == 0); \
-                         получено {trimmed:?}"
-                        ));
-                    }
-                    Err(e) => {
-                        return Err(format!(
-                            "GATEWAY_DEPTH_CADENCE_MS={trimmed:?} не парсится как i64 ({e}) — \
-                         опечатка в `.env` (мусор/суффикс/научная нотация/дробное/\
-                         переполнение), а не сигнал к дефолту; оператор обязан задать \
-                         валидное значение или unset/пусто/пробельное для дефолта"
-                        ));
-                    }
-                }
+                Some(gateway::calc_profile::parse_depth_cadence_ms(&s).map_err(|e| e.to_string())?)
             }
         }
     };
@@ -3282,12 +3207,13 @@ pub fn serve_config_from_env(
 
     // M-86 (`milestones/M-86-vp-bin-width.md` §2.3): ширина корзины профиля объёма.
     // M-94: в режиме профиля берётся ИЗ профиля (милестоун §3.1).
+    // M-94 (задача 12): ОБЩАЯ грамматика с профилем (`R-245` B-1); отсутствие/пустое/
+    // пробельное значение — дефолт с WARN (поведение под `A-015` §3 п.1).
     let vp_bin_width_e8: i64 = if let Some(p) = &profile {
         p.vp_bin_width_e8
     } else {
         let raw_vp_bin = get("GATEWAY_VP_BIN_WIDTH_E8");
-        let trimmed_vp_bin = raw_vp_bin.as_deref().map(str::trim);
-        match trimmed_vp_bin {
+        match raw_vp_bin.as_deref().map(str::trim) {
             None | Some("") => {
                 tracing::warn!(
                     "GATEWAY_VP_BIN_WIDTH_E8 is absent or blank (raw={raw_vp_bin:?}); \
@@ -3297,30 +3223,9 @@ pub fn serve_config_from_env(
                 );
                 gateway::DEFAULT_VP_BIN_WIDTH_E8
             }
-            Some(s) => match s.parse::<i64>() {
-                Ok(n) if n > 0 => n,
-                Ok(0) => {
-                    return Err(format!(
-                        "GATEWAY_VP_BIN_WIDTH_E8={s} невалидно: должно быть > 0 \
-                         (M-86 §2.3: нулевая ширина даёт деление на ноль или тиковую сетку — \
-                         ровно ту аварию 5 533 287 Б против предела 2 000 000 Б, против которой \
-                         предмет заведён)"
-                    ));
-                }
-                Ok(n) => {
-                    return Err(format!(
-                        "GATEWAY_VP_BIN_WIDTH_E8={n} невалидно: должно быть > 0 (M-86 §2.3)"
-                    ));
-                }
-                Err(e) => {
-                    return Err(format!(
-                        "GATEWAY_VP_BIN_WIDTH_E8={s:?} parse: {e} — это опечатка в `.env` \
-                         (мусор/суффикс/научная нотация/дробное/переполнение/Rust-разделитель \
-                         разрядов); оператор обязан задать валидное целое > 0 или \
-                         unset/пусто/пробельное для дефолта"
-                    ));
-                }
-            },
+            Some(s) => {
+                gateway::calc_profile::parse_vp_bin_width_e8(s).map_err(|e| e.to_string())?
+            }
         }
     };
 

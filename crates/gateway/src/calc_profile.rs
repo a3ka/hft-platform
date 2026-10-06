@@ -28,7 +28,6 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
-use std::io;
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
@@ -237,60 +236,25 @@ pub fn load_profile(path: &Path) -> Result<AppliedProfile, ProfileError> {
     }
 
     let bands = parse_bands(&map["GATEWAY_BANDS"])?;
-    let depth_cadence_ms: i64 =
-        map["GATEWAY_DEPTH_CADENCE_MS"]
-            .parse()
-            .map_err(|e: std::num::ParseIntError| ProfileError::BadValue {
-                key: "GATEWAY_DEPTH_CADENCE_MS".to_string(),
-                reason: e.to_string(),
-            })?;
-    let timeframe_ms: i64 =
-        map["GATEWAY_TIMEFRAME_MS"]
-            .parse()
-            .map_err(|e: std::num::ParseIntError| ProfileError::BadValue {
-                key: "GATEWAY_TIMEFRAME_MS".to_string(),
-                reason: e.to_string(),
-            })?;
-    let window_ms: i64 =
-        map["GATEWAY_WINDOW_MS"]
-            .parse()
-            .map_err(|e: std::num::ParseIntError| ProfileError::BadValue {
-                key: "GATEWAY_WINDOW_MS".to_string(),
-                reason: e.to_string(),
-            })?;
-
-    // Жёсткие диапазоны осей (милестоун §3.2: разборщик НЕ догадывается о политике,
-    // но ЗНАЕТ базовые инварианты типа «каденция >= 1 с и выравнена на сутки» — ровно
-    // те, что есть в `gateway::validate_selector` и `serve_config_from_env` для
-    // GATEWAY_DEPTH_CADENCE_MS). Сообщение отказа НАЗЫВАЕТ ключ, чтобы `p5`-мир
-    // «каденция 999» поймал `GATEWAY_DEPTH_CADENCE_MS` в stderr.
-    if depth_cadence_ms < 1000 || 86_400_000 % depth_cadence_ms != 0 {
-        return Err(ProfileError::BadValue {
-            key: "GATEWAY_DEPTH_CADENCE_MS".to_string(),
-            reason: format!(
-                "{depth_cadence_ms} must be >= 1000 and divide 86_400_000 \
-                 (MD-I-8 d14: подсекундный интервал даёт ОДИН ключ в секунду молча)"
-            ),
-        });
-    }
-    if timeframe_ms <= 0 || 86_400_000 % timeframe_ms != 0 {
-        return Err(ProfileError::BadValue {
-            key: "GATEWAY_TIMEFRAME_MS".to_string(),
-            reason: format!(
-                "{timeframe_ms} must be > 0 and divide 86_400_000 \
-                 (GW-I-10: иначе бакет пересекает 00:00 UTC)"
-            ),
-        });
-    }
-    if window_ms <= 0 {
+    let depth_cadence_ms = parse_depth_cadence_ms(&map["GATEWAY_DEPTH_CADENCE_MS"])?;
+    let timeframe_ms = parse_timeframe_ms(&map["GATEWAY_TIMEFRAME_MS"])?;
+    let window_ms = parse_window_ms(&map["GATEWAY_WINDOW_MS"])?;
+    // Политика профиля (спека §3.2 (б)): `GATEWAY_WINDOW_MS=0` в профиле — отказ с
+    // именем ключа. Грамматически `0` валиден (M-37 / `C-099` B-2 — легитимный offline),
+    // и `parse_window_ms` его пропускает; вне профиля `serve_config_from_env`
+    // канонизирует `0` в `None`, в профиле — здесь.
+    if window_ms == 0 {
         return Err(ProfileError::BadValue {
             key: "GATEWAY_WINDOW_MS".to_string(),
-            reason: format!("{window_ms} must be > 0 (M-37: 0 = offline-unbounded)"),
+            reason: "0 must be > 0 (M-37: 0 = offline-unbounded; определение расчёта \
+                     прода не бывает без окна, TD-020)"
+                .to_string(),
         });
     }
 
-    // ЧЕТЫРЕ разборщика — публичные, чтобы `gateway-serve` звал их, а не дублировал
-    // (`A-049` Р-6). Здесь — для самой загрузки (валидация тройки).
+    // ЧЕТЫРЕ разборщика — публичные, чтобы `gateway-serve` и `gateway-checkpoint`
+    // звали их, а не дублировали (`A-049` Р-6, R-245 B-1). Здесь — для самой
+    // загрузки (валидация тройки).
     let heatmap_window_frac = parse_heatmap_window_frac(&map["GATEWAY_HEATMAP_WINDOW"])?;
     let vp_bin_width_e8 = parse_vp_bin_width_e8(&map["GATEWAY_VP_BIN_WIDTH_E8"])?;
     let allowed_profiles = parse_allowed_profiles(&map["GATEWAY_ALLOWED_PROFILES"])?;
@@ -314,9 +278,19 @@ pub fn load_profile(path: &Path) -> Result<AppliedProfile, ProfileError> {
     })
 }
 
-// ─────────────────────────── ЧЕТЫРЕ разборщика (публичные, единственный дом) ───────────────────────────
+// ─────────────────────────── ШЕСТЬ разборщиков (публичные, единственный дом) ───────────────────────────
+// M-94 задача 12 (`R-245` B-1; спека §3.2 «Одна грамматика на величину»): каждое значение
+// судится ОДНОЙ функцией; её зовут загрузчик профиля и ветки «без профиля» обоих бинарей
+// (`serve_config_from_env`, `gateway-checkpoint`: окружение и флаги). Никакой второй копии
+// разбора (`A-049` Р-6, §5 запрет).
+//
+// Грамматика — та, что у загрузчика сегодня (строже нынешней ветки без профиля; ужесточение
+// fail-closed, прод на нём не стоит после M-94). Различие режимов — только политика профиля
+// (§3.2 (б): `GATEWAY_WINDOW_MS=0` в профиле — отказ с именем ключа; вне профиля — offline).
 
-/// `GATEWAY_BANDS` — comma-separated float'ы, никаких пустых записей.
+/// `GATEWAY_BANDS` — comma-separated float'ы, никаких пустых записей. Правило:
+/// каждое значение — конечное (НЕ NaN, НЕ ±∞), `> 0`. Пустой список или пустой
+/// элемент ⇒ отказ.
 pub fn parse_bands(s: &str) -> Result<Vec<f64>, ProfileError> {
     let mut out = Vec::new();
     for p in s.split(',') {
@@ -348,8 +322,85 @@ pub fn parse_bands(s: &str) -> Result<Vec<f64>, ProfileError> {
     Ok(out)
 }
 
+/// `GATEWAY_TIMEFRAME_MS` — i64, делит 86_400_000 нацело, `> 0`. Парсер тот же
+/// для режима профиля и для режима без профиля (`R-245` B-1). Сообщение отказа
+/// называет ключ (оракул `g1`: «1000 ⇒ принят; 999, 0, -1000, abc — нет»).
+pub fn parse_timeframe_ms(s: &str) -> Result<i64, ProfileError> {
+    let v: i64 = s.trim().parse().map_err(|e| ProfileError::BadValue {
+        key: "GATEWAY_TIMEFRAME_MS".to_string(),
+        reason: format!("{s:?} not i64 ({e})"),
+    })?;
+    if v <= 0 {
+        return Err(ProfileError::BadValue {
+            key: "GATEWAY_TIMEFRAME_MS".to_string(),
+            reason: format!("{v} must be > 0 (GW-I-10: иначе бакет пересекает 00:00 UTC)"),
+        });
+    }
+    if 86_400_000 % v != 0 {
+        return Err(ProfileError::BadValue {
+            key: "GATEWAY_TIMEFRAME_MS".to_string(),
+            reason: format!(
+                "{v} не выравнен на границу UTC-суток \
+                 (требуется 86_400_000 % v == 0)"
+            ),
+        });
+    }
+    Ok(v)
+}
+
+/// `GATEWAY_WINDOW_MS` — i64 `>= 0`. `0` грамматически ДОПУСТИМ и означает
+/// «нет окна» (M-37 / `C-099` B-2): в режиме профиля это отвергается ПОЛИТИКОЙ
+/// (`load_profile` отдельно), вне профиля `serve_config_from_env` канонизирует
+/// в `None`. Отрицательное — отказ с именем ключа. Один грамматический путь —
+/// и в профиле, и без (спека §3.2 (а)).
+pub fn parse_window_ms(s: &str) -> Result<i64, ProfileError> {
+    let v: i64 = s.trim().parse().map_err(|e| ProfileError::BadValue {
+        key: "GATEWAY_WINDOW_MS".to_string(),
+        reason: format!("{s:?} not i64 ({e})"),
+    })?;
+    if v < 0 {
+        return Err(ProfileError::BadValue {
+            key: "GATEWAY_WINDOW_MS".to_string(),
+            reason: format!(
+                "{v} отрицателен — окно должно быть либо unset (offline), \
+                 либо положительным числом миллисекунд; 0 — легитимный offline"
+            ),
+        });
+    }
+    Ok(v)
+}
+
+/// `GATEWAY_DEPTH_CADENCE_MS` — i64, `>= 1000` и делит 86_400_000 нацело
+/// (`MD-I-8` d14: подсекундный интервал даёт ОДИН ключ в секунду молча).
+/// Парсер тот же для режима профиля и для режима без профиля.
+pub fn parse_depth_cadence_ms(s: &str) -> Result<i64, ProfileError> {
+    let v: i64 = s.trim().parse().map_err(|e| ProfileError::BadValue {
+        key: "GATEWAY_DEPTH_CADENCE_MS".to_string(),
+        reason: format!("{s:?} not i64 ({e})"),
+    })?;
+    if v < 1000 {
+        return Err(ProfileError::BadValue {
+            key: "GATEWAY_DEPTH_CADENCE_MS".to_string(),
+            reason: format!(
+                "{v} подсекундная — проводная форма ключуется секундами \
+                 (DepthRow.series — time_s), требуется >= 1000 (MD-I-8 d14)"
+            ),
+        });
+    }
+    if 86_400_000 % v != 0 {
+        return Err(ProfileError::BadValue {
+            key: "GATEWAY_DEPTH_CADENCE_MS".to_string(),
+            reason: format!(
+                "{v} не выравнен на границу UTC-суток \
+                 (требуется 86_400_000 % v == 0)"
+            ),
+        });
+    }
+    Ok(v)
+}
+
 /// `GATEWAY_HEATMAP_WINDOW` — f64 в (0, 1). Сообщение отказа называет ключ (оракул `p5`,
-/// «окно heatmap 1.5»).
+/// «окно heatmap 1.5»). Тот же грамматический путь в обоих режимах (`R-245` B-1).
 pub fn parse_heatmap_window_frac(s: &str) -> Result<f64, ProfileError> {
     let v: f64 = s.trim().parse().map_err(|e| ProfileError::BadValue {
         key: "GATEWAY_HEATMAP_WINDOW".to_string(),
@@ -358,7 +409,10 @@ pub fn parse_heatmap_window_frac(s: &str) -> Result<f64, ProfileError> {
     if !v.is_finite() || v <= 0.0 || v >= 1.0 {
         return Err(ProfileError::BadValue {
             key: "GATEWAY_HEATMAP_WINDOW".to_string(),
-            reason: format!("{v} must be in (0, 1)"),
+            reason: format!(
+                "{v} вне интервала (0, 1); окно heatmap/COB должно быть \
+                 положительным и меньше 1"
+            ),
         });
     }
     Ok(v)
@@ -565,12 +619,10 @@ pub fn canonical_bands_or_profile(
     Ok(out)
 }
 
-#[allow(dead_code)]
-pub fn applied_profile_optional_io() -> io::Result<()> {
-    // Пустышка, чтобы io оставался в зависимостях для будущих расширений
-    // (например, потоковое чтение для ОЧЕНЬ больших профилей).
-    Ok(())
-}
+// R-245 N-4: `applied_profile_optional_io` — мёртвая заглушка «на будущее» под
+// `#[allow(dead_code)]`. Удалена: держать ради воображаемого потокового чтения
+// значит держать неиспользуемый публичный символ; если расширение понадобится,
+// он вернётся с осмысленной сигнатурой и тестом.
 
 #[cfg(test)]
 mod tests {

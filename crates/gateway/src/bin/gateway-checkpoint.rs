@@ -151,19 +151,23 @@ fn parse_args() -> Result<Args, String> {
             "--venue" => venue_str = Some(next()?.to_string()),
             "--symbol" => symbol = Some(next()?.to_string()),
             "--timeframe-ms" => {
-                timeframe_ms = Some(
-                    next()?
-                        .parse::<i64>()
-                        .map_err(|e| format!("--timeframe-ms: {e}"))?,
-                );
+                // M-94 (задача 12, `C-287` B-2, R-245 B-1): ОБЩАЯ грамматика с
+                // профилем и с gateway-serve — `calc_profile::parse_timeframe_ms`.
+                let s = next()?;
+                timeframe_ms =
+                    Some(calc_profile::parse_timeframe_ms(s).map_err(|e| e.to_string())?);
             }
-            "--bands" => bands_str = Some(next()?.to_string()),
+            "--bands" => {
+                // M-94 (задача 12): ОБЩАЯ грамматика — `calc_profile::parse_bands`.
+                bands_str = Some(next()?.to_string());
+            }
             "--window-ms" => {
-                window_ms = Some(
-                    next()?
-                        .parse::<i64>()
-                        .map_err(|e| format!("--window-ms: {e}"))?,
-                );
+                // M-94 (задача 12): ОБЩАЯ грамматика — `calc_profile::parse_window_ms`.
+                // Семантика `0` → offline (legacy, M-37) и политика отказа в профиле
+                // (`load_profile`) лежат ВНЕ грамматики и применяются в финальной
+                // сборке `window_ms`.
+                let s = next()?;
+                window_ms = Some(calc_profile::parse_window_ms(s).map_err(|e| e.to_string())?);
             }
             "--cursor" => {
                 // B1 (rev4): `--cursor LATEST` — прод-дефолт в `docker-compose.yml`.
@@ -171,12 +175,10 @@ fn parse_args() -> Result<Args, String> {
                 cursor = Some(parse_cursor_value(s, "--cursor")?);
             }
             "--depth-cadence-ms" => {
+                // M-94 (задача 12): ОБЩАЯ грамматика — `calc_profile::parse_depth_cadence_ms`.
                 let s = next()?;
-                let parsed = s
-                    .trim()
-                    .parse::<i64>()
-                    .map_err(|e| format!("--depth-cadence-ms: {e}"))?;
-                depth_cadence_ms = Some(parsed);
+                depth_cadence_ms =
+                    Some(calc_profile::parse_depth_cadence_ms(s).map_err(|e| e.to_string())?);
             }
             "--print-ckpt-name" => {
                 // M-94: печать имени без открытия журнала (опора гейта деплоя).
@@ -212,25 +214,14 @@ fn parse_args() -> Result<Args, String> {
     let timeframe_ms = match timeframe_ms {
         Some(t) => t,
         None => match env_string("GATEWAY_TIMEFRAME_MS")? {
-            Some(s) => s
-                .trim()
-                .parse::<i64>()
-                .map_err(|e| format!("GATEWAY_TIMEFRAME_MS={s:?} не парсится как i64 ({e})"))?,
+            Some(s) => calc_profile::parse_timeframe_ms(&s).map_err(|e| e.to_string())?,
             None => 1_000,
         },
     };
     let bands: Vec<f64> = match bands_str.as_deref() {
-        Some(s) => s
-            .split(',')
-            .map(|p| p.trim().parse::<f64>())
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("--bands parse: {e}"))?,
+        Some(s) => calc_profile::parse_bands(s).map_err(|e| e.to_string())?,
         None => match env_string("GATEWAY_BANDS")? {
-            Some(s) => s
-                .split(',')
-                .map(|p| p.trim().parse::<f64>())
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| format!("GATEWAY_BANDS={s:?} не парсится как f64-список ({e})"))?,
+            Some(s) => calc_profile::parse_bands(&s).map_err(|e| e.to_string())?,
             None => vec![0.001],
         },
     };
@@ -239,10 +230,7 @@ fn parse_args() -> Result<Args, String> {
         Some(w) => Some(w),
         None => match env_string("GATEWAY_WINDOW_MS")? {
             Some(s) => {
-                let v = s
-                    .trim()
-                    .parse::<i64>()
-                    .map_err(|e| format!("GATEWAY_WINDOW_MS={s:?} не парсится как i64 ({e})"))?;
+                let v = calc_profile::parse_window_ms(&s).map_err(|e| e.to_string())?;
                 if v == 0 {
                     None
                 } else {
@@ -610,39 +598,29 @@ fn run_legacy_mode(args: Args) -> ExitCode {
     }
 
     // M-68 задача 23 (R-141 Б-1): источник каденции — env GATEWAY_DEPTH_CADENCE_MS
-    // (тот же, что у `gateway-serve`).
+    // (тот же, что у `gateway-serve`). M-94 (задача 12): ОБЩАЯ грамматика с
+    // профилем (`R-245` B-1) — `parse_depth_cadence_ms`. Пустая строка в env
+    // трактуется как дефолт 1000 (`A-015` §3 п.1).
     const DEFAULT_CADENCE_MS: i64 = 1_000;
-    let cadence_from_env: Option<i64> = match std::env::var("GATEWAY_DEPTH_CADENCE_MS") {
-        Err(_) => None,
-        Ok(raw) => {
-            let trimmed = raw.trim();
-            if trimmed.is_empty() {
-                Some(DEFAULT_CADENCE_MS)
-            } else {
-                match trimmed.parse::<i64>() {
-                    Ok(ms) => Some(ms),
-                    Err(e) => {
-                        eprintln!(
-                            "gateway-checkpoint: GATEWAY_DEPTH_CADENCE_MS={trimmed:?} \
-                             не парсится как i64 ({e})"
-                        );
-                        return ExitCode::from(2);
-                    }
-                }
+    let cadence_from_env: Option<i64> = match env_string("GATEWAY_DEPTH_CADENCE_MS") {
+        Ok(Some(s)) if s.trim().is_empty() => Some(DEFAULT_CADENCE_MS),
+        Ok(Some(s)) => match calc_profile::parse_depth_cadence_ms(&s) {
+            Ok(ms) => Some(ms),
+            Err(e) => {
+                eprintln!("gateway-checkpoint: GATEWAY_DEPTH_CADENCE_MS invalid: {e}");
+                return ExitCode::from(2);
             }
+        },
+        Ok(None) => None,
+        Err(e) => {
+            eprintln!("gateway-checkpoint: {e}");
+            return ExitCode::from(1);
         }
     };
     let cadence_raw: i64 = match args.depth_cadence_ms.or(cadence_from_env) {
         Some(ms) => ms,
         None => DEFAULT_CADENCE_MS,
     };
-    if cadence_raw < 1000 || 86_400_000 % cadence_raw != 0 {
-        eprintln!(
-            "gateway-checkpoint: GATEWAY_DEPTH_CADENCE_MS={cadence_raw} невалидно: требуется \
-             >= 1000 и выравнено на границу UTC-суток"
-        );
-        return ExitCode::from(2);
-    }
 
     let selector = Selector {
         venue: args.venue,
