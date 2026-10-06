@@ -66,25 +66,15 @@ if grep -qE 'прод-дефолт РОВНО узкий|RENDERED|BANDS_BLOCK' s
 else
   pass "task10: сторож verify_M-70 task #7 снят"
 fi
-# --- task12: одна грамматика на величину (R-245 B-1, спека §3.2) — поведение в обоих режимах
-run_step "task12: red_m94_single_grammar (g1 g2)" \
+# --- task12: одна грамматика на величину (R-245 B-1, C-287, спека §3.2)
+run_step "task12: red_m94_single_grammar (g1 g2 g3 — выдача, оба режима)" \
   cargo test -q -p gateway-serve --test red_m94_single_grammar
-# Единственность ЭКЗЕМПЛЯРА: поведенческий g1 не видит копию, совпадающую по правилу сегодня. Ветки
-# без профиля обоих бинарей обязаны ЗВАТЬ общие разборщики. Предел: проверка по тексту — вызов
-# видит, а оставшийся рядом мёртвый разбор не видит (его ловит g1, как только правила разойдутся).
-check_calls() { # <файл> <функции…>
-  local f="$1" fn n missing=""; shift
-  for fn in "$@"; do
-    n=$(grep -c "calc_profile::${fn}(" "$f" || true)
-    [ "${n:-0}" -ge 1 ] || missing="$missing $fn"
-  done
-  if [ -z "$missing" ]; then pass "task12: $f зовёт общие разборщики ($*)"
-  else fail "task12: $f не зовёт общие разборщики:$missing (R-245 B-1 — второй экземпляр правила)"; fi
-}
-check_calls crates/gateway-serve/src/lib.rs parse_bands parse_timeframe_ms parse_window_ms \
-  parse_depth_cadence_ms parse_heatmap_window_frac parse_vp_bin_width_e8
-check_calls crates/gateway/src/bin/gateway-checkpoint.rs parse_bands parse_timeframe_ms \
-  parse_window_ms parse_depth_cadence_ms
+run_step "task12: red_m94_single_grammar_warmer (w1 w2 w3 — прогреватель: окружение, флаги, профиль)" \
+  cargo test -q -p gateway --test red_m94_single_grammar_warmer
+# Единственность ЭКЗЕМПЛЯРА — мутацией, не текстом (C-287 B-2): сторожевой отказ общей функции
+# обязан дойти до результата каждой ветки (g4, w4). Долго: холодная сборка в копии дерева.
+run_step "task12: red_m94_shared_grammar_probe.sh (g4 w4 — сторож в общих parse_*)" \
+  bash scripts/tests/red_m94_shared_grammar_probe.sh
 # --- task13: откат по здоровью ставит сторожа из PREV (R-245 B-2) — миры a4* пробы task6 выше
 run_step "ci-map: проба карты CI-паритета (red_verify_M-94_ci_map.sh; число миров печатает проба)" \
   bash scripts/tests/red_verify_M-94_ci_map.sh
