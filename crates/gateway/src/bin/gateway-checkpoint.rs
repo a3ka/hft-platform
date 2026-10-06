@@ -423,7 +423,7 @@ fn run_profile_mode(args: Args, profile_path: &Path) -> ExitCode {
     //    работать (замоканные пути) — `ckpt_path_for` берёт имя от отпечатка, не
     //    от файла.
     if args.print_ckpt_name {
-        let sel = selector_from_profile(&profile);
+        let sel = selector_from_profile(&profile, args.venue, args.symbol.clone());
         let path = checkpoint::ckpt_path_for_pub(&args.ckpt_dir, &sel);
         match path.file_name() {
             Some(name) => {
@@ -440,9 +440,10 @@ fn run_profile_mode(args: Args, profile_path: &Path) -> ExitCode {
         }
     }
 
-    // 5. Собрать `Selector` из профиля + дефолты `venue`/`symbol` (не в профиле —
-    //    `П-032` §3.1, ровно 8 ключей).
-    let selector = selector_from_profile(&profile);
+    // 5. Собрать `Selector` из профиля + `venue`/`symbol` из args (env/флаг,
+    //    не в профиле — `П-032` §3.1, ровно 8 ключей; единый источник с
+    //    `gateway-serve` — host `.env` → compose, `M-90`).
+    let selector = selector_from_profile(&profile, args.venue, args.symbol.clone());
 
     // 6. M-47 (GW-I-10, TD-046): fail-closed гвард. Дублирует `validate_selector`
     //    в библиотеке — здесь он СРАЗУ ЖЕ после сборки, до `advance_to`, чтобы
@@ -537,15 +538,17 @@ fn run_profile_mode(args: Args, profile_path: &Path) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Собрать `Selector` из `AppliedProfile`. `venue`/`symbol` — НЕ в профиле
-/// (`П-032` §3.1, ровно 8 ключей), поэтому подставляются дефолты — `Binance` /
-/// `BTCUSDT`. Тот же селектор, что собирает тест (`selector_from_profile` в
-/// `red_m94_calc_profile_warmer.rs`), чтобы `selector_fingerprint` у прод-пути
-/// и у оракула совпали.
-fn selector_from_profile(p: &AppliedProfile) -> Selector {
+/// Собрать `Selector` из `AppliedProfile` + `venue`/`symbol` из аргументов/env.
+/// `venue`/`symbol` — НЕ в профиле (`П-032` §3.1, ровно 8 ключей); единый
+/// источник с `gateway-serve` — host `.env` → compose (`M-90`, TD-227). В
+/// режиме профиля они ЧИТАЮТСЯ из env (через `args`, который `parse_args` уже
+/// заполнил из `GATEWAY_VENUE`/`GATEWAY_SYMBOL` env или `--venue`/`--symbol`),
+/// иначе имя слепка расходится с сервером при отличии `.env` от дефолта
+/// (`w4a`/`w4b` оракула `red_m90_warmer_cron_composition`).
+fn selector_from_profile(p: &AppliedProfile, venue: Venue, symbol: String) -> Selector {
     Selector {
-        venue: Venue::Binance,
-        symbol: "BTCUSDT".to_string(),
+        venue,
+        symbol,
         timeframe_ms: p.timeframe_ms,
         bands: p.bands.clone(),
         window_ms: Some(p.window_ms),
