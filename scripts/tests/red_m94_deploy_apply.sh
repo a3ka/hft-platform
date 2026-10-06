@@ -204,6 +204,13 @@ health_world() { # <имя> <recorder> <gateway-serve>
       || reasons="$reasons; при откате образ не пересобран на PREV до up (build@PREV строка ${lb:-нет}, up@PREV строка ${lu:-нет})"
     grep -q 'echo prev' "$w/cron/hft-journal-retention" && ! grep -q 'echo target' "$w/cron/hft-journal-retention" \
       || reasons="$reasons; cron хоста остался от TARGET после отката"
+    # `R-245` B-2 (спека §3.7 шаг 4: «сторож `|| true`»): откат по здоровью переустанавливает
+    # сторожа ИЗ PREV — после последнего up на PREV. Без этого после отката на хосте остаётся
+    # сторож TARGET (или никакого, если TARGET его снял), а прежний deploy.yml делал это всегда.
+    local lw
+    lw=$(grep -n "^watchdog@$prev_s\$" "$w/docker.log" 2>/dev/null | tail -1 | cut -d: -f1)
+    { [ -n "$lw" ] && [ -n "$lu" ] && [ "$lw" -gt "$lu" ]; } \
+      || reasons="$reasons; при откате сторож не переустановлен на PREV после up (watchdog@PREV строка ${lw:-нет}, up@PREV строка ${lu:-нет})"
     grep -q '^logs:hft-recorder@' "$w/docker.log" 2>/dev/null || reasons="$reasons; при отказе не сняты логи hft-recorder"
     grep -q '^logs:hft-gateway-serve@' "$w/docker.log" 2>/dev/null || reasons="$reasons; при отказе не сняты логи hft-gateway-serve"
     if [ -z "$reasons" ]; then ok "$name нездорова служба (recorder=$hr, gateway-serve=$hs) ⇒ откат к PREV, cron из PREV, up на PREV, логи обеих"
