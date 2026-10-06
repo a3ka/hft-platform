@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # verify_M-95 — одна подписка обходит каталог журнала один раз (TD-229).
-# Спека: milestones/M-95-calc-profile.md §12. Блок паритета с CI — ВРЕМЕННАЯ копия verify_M-94.sh
+# Спека: milestones/M-95-catalog-once.md §9. Блок паритета с CI — ВРЕМЕННАЯ копия verify_M-94.sh
 # (решение A-043; общий шаг — TD-222). Агрегатор с FAIL-счётчиком; решение — по коду возврата.
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -30,6 +30,8 @@ if [ "$DRY" != "1" ]; then
 run_step "task1-3: red_m95_catalog_once (k1…k4)" \
   cargo test -q -p gateway-serve --test red_m95_catalog_once
 # --- I-4: семантика отказа, честность истории, родословная слепка и монотонность каталога целы
+run_step "task1,3 / I-5: red_m95_provenance_fresh (f0…f2, --features testing — CI их не гоняет)" \
+  cargo test -q -p gateway-serve --features testing --test red_m95_provenance_fresh
 run_step "I-4: red_m87_history_provenance_failclosed" cargo test -q -p gateway --test red_m87_history_provenance_failclosed
 run_step "I-4: red_segment_meta_bound (SM-*)" cargo test -q -p gateway --test red_segment_meta_bound
 run_step "I-4: red_checkpoint_bin_prod_argv" cargo test -q -p gateway --test red_checkpoint_bin_prod_argv
