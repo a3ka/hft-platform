@@ -18,6 +18,16 @@
 # без профиля передают текст `ProfileError` в сообщение отказа. Нет функции с такой сигнатурой —
 # FAIL (setup), а не пропуск.
 #
+# Режим «ОСЛАБИТЕЛЬ» (`A-052` §3 (в).1) — вторая половина того же свойства «результат = общая
+# функция»: сторожевой ОТКАЗ обязан дойти до результата (выше), сторожевой ПРИЁМ — тоже. В ту же копию
+# в `parse_bands` вживляется приём строки `M94-LOOSE-NAN` как `[NaN]` (значение вне грамматики), и
+# оракул согласия двух бинарей (`red_m94_two_binary_agreement.sh`) обязан показать СОГЛАСИЕ: если
+# у прогревателя поверх общей функции осталась своя проверка NaN, он отвергнет, а выдача примет.
+# Негативный контроль — приём `M94-LOOSE-TF` как `604800000` в `parse_timeframe_ms`: расхождение
+# ОБЯЗАНО быть, его даёт инвариант библиотеки `validate_selector` (`A-052` §2.6: грамматика
+# не может быть слабее инварианта; поведенчески эта ось отличить копию от инварианта не может —
+# копии таймфрейма/каденции ловит текстовый шаг verify task12).
+#
 # Дерево копируется ВМЕСТЕ с незакоммиченными правками (dev проверяет себя до коммита); сборка — в
 # своём каталоге, удаляется в конце. Долго: холодная сборка двух тестов.
 #
@@ -43,6 +53,13 @@ CP="$TREE/crates/gateway/src/calc_profile.rs"
 [ -f "$CP" ] || { nope "setup: нет $CP"; echo "VERDICT: FAIL"; exit 1; }
 
 injected=0
+inject() { # <функция> <строка Rust>
+  FN="$1" LINE="$2" perl -0777 -i -pe '
+    my $fn = $ENV{FN}; my $line = "\n    " . $ENV{LINE};
+    $c = s/(pub fn \Q$fn\E\(s: &str\)[^{]*\{)/$1$line/g;
+    END { print STDERR "$c\n" }' "$CP" 2>&1 >/dev/null | tail -1
+}
+
 for spec in $FUNCS; do
   fn="${spec%%:*}"; rest="${spec#*:}"; key="${rest%%:*}"; val="${rest#*:}"
   n=$(FN="$fn" KEY="$key" VAL="$val" perl -0777 -i -pe '
@@ -75,5 +92,36 @@ run "g4: выдача — сторожевой отказ общей функц�
 run "w4: прогреватель — сторожевой отказ доходит в окружении, флагах и профиле" \
   gateway red_m94_single_grammar_warmer w4_shared_parser_result_reaches_every_form
 
-echo "сценариев: 3, провалов: $FAIL"
+# ── режим «ослабитель» ──
+if [ -z "${M94_PROBE_FUNCS:-}" ]; then
+  n1=$(inject parse_bands 'if s.trim() == "M94-LOOSE-NAN" { return Ok(vec![f64::NAN]); }')
+  n2=$(inject parse_timeframe_ms 'if s.trim() == "M94-LOOSE-TF" { return Ok(604_800_000); }')
+  if [ "$n1" = "1" ] && [ "$n2" = "1" ]; then
+    ok "setup: ослабитель вживлён (parse_bands → NaN, parse_timeframe_ms → 604800000)"
+    base_corpus="$TREE/scripts/tests/fixtures/m94_two_binary_corpus.txt"
+    { cat "$base_corpus"; echo "GATEWAY_BANDS=M94-LOOSE-NAN"; } > "$TMP/loose_nan.txt"
+    { cat "$base_corpus"; echo "GATEWAY_TIMEFRAME_MS=M94-LOOSE-TF"; } > "$TMP/loose_tf.txt"
+    out=$(M94_AGREE_TREE="$TREE" M94_AGREE_CORPUS="$TMP/loose_nan.txt" bash "$TREE/scripts/tests/red_m94_two_binary_agreement.sh" 2>&1); rc=$?
+    if [ $rc -eq 0 ]; then
+      ok "ослабитель NaN: приём общей parse_bands дошёл до ОБОИХ бинарей — своей проверки NaN поверх общей функции нет"
+    else
+      nope "ослабитель NaN (A-052 §3 (в).1, R-246 B-1): приём общей parse_bands не дошёл до одного из бинарей — у него своя копия правила"
+      printf '%s\n' "$out" | grep -E '^  |^FAIL' | head -10
+    fi
+    out=$(M94_AGREE_TREE="$TREE" M94_AGREE_CORPUS="$TMP/loose_tf.txt" bash "$TREE/scripts/tests/red_m94_two_binary_agreement.sh" 2>&1); rc=$?
+    if [ $rc -ne 0 ] && grep -qE '^  legacy +GATEWAY_TIMEFRAME_MS=M94-LOOSE-TF: выдача=ACCEPT прогреватель=REFUSE' <<<"$out"; then
+      ok "негативный контроль: ослабленный таймфрейм расходится (держит инвариант validate_selector) — ось согласия чувствительна"
+    else
+      nope "негативный контроль: ослабленный таймфрейм НЕ дал расхождения (exit=$rc) — оракул согласия ослеп или инвариант снят"
+      printf '%s\n' "$out" | tail -6
+    fi
+  else
+    nope "setup: ослабитель не вживлён (parse_bands $n1, parse_timeframe_ms $n2 — нужно по 1)"
+  fi
+  total=6
+else
+  total=3
+fi
+
+echo "сценариев: $total, провалов: $FAIL"
 if [ "$FAIL" -eq 0 ]; then echo "VERDICT: PASS"; exit 0; else echo "VERDICT: FAIL"; exit 1; fi

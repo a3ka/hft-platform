@@ -75,6 +75,16 @@ run_step "task12: red_m94_single_grammar_warmer (w1 w2 w3 — прогреват
 # обязан дойти до результата каждой ветки (g4, w4). Долго: холодная сборка в копии дерева.
 run_step "task12: red_m94_shared_grammar_probe.sh (g4 w4 — сторож в общих parse_*)" \
   bash scripts/tests/red_m94_shared_grammar_probe.sh
+# Согласие двух бинарей (A-052 §3 (б)): старт выдачи и прогреватель одинаково принимают каждое значение.
+run_step "task12: red_m94_two_binary_agreement.sh (выдача ↔ прогреватель, оба режима)" \
+  bash scripts/tests/red_m94_two_binary_agreement.sh
+# Копии правил таймфрейма/каденции/NaN в бинаре прогревателя (R-246 B-1, A-052 §3 (в).2). Поведенческого
+# оракула на копии таймфрейма и каденции НЕТ (A-052 §2.6: тот же предикат, что validate_selector), поэтому
+# — НЕГАТИВНАЯ текстовая проверка мёртвого кода. Предел: ловит литеральную форму, обходится
+# переименованием константы; бэкстоп — диф PR-гейта.
+copies=$(grep -nE '86_400_000 %|< 1000|is_nan' crates/gateway/src/bin/gateway-checkpoint.rs | grep -vE '^[0-9]+:[[:space:]]*//' || true)
+if [ -z "$copies" ]; then pass "task12: в gateway-checkpoint.rs нет встроенных копий правил (86_400_000 % / < 1000 / is_nan)"
+else fail "task12: в gateway-checkpoint.rs остались встроенные копии правил (R-246 B-1, A-052): $(printf '%s' "$copies" | cut -c1-80 | tr '\n' ' ')"; fi
 # --- task13: откат по здоровью ставит сторожа из PREV (R-245 B-2) — миры a4* пробы task6 выше
 run_step "ci-map: проба карты CI-паритета (red_verify_M-94_ci_map.sh; число миров печатает проба)" \
   bash scripts/tests/red_verify_M-94_ci_map.sh
