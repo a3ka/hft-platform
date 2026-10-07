@@ -402,3 +402,40 @@ fn g4_shared_parser_result_reaches_both_modes() {
         missing.join("\n")
     );
 }
+
+/// `g5` (`#[ignore]`) — половина оракула СОГЛАСИЯ ДВУХ БИНАРЕЙ (`A-052` §3 (б)); исполняет
+/// `scripts/tests/red_m94_two_binary_agreement.sh`. Читает корпус `M94_AGREE_CORPUS` (строка —
+/// правки `КЛЮЧ=значение;КЛЮЧ=значение`, `-` — активный профиль без правок), пишет в
+/// `M94_AGREE_OUT` строки `<случай>\t<режим>\tACCEPT|REFUSE` для режимов `legacy` и `profile`.
+/// Сравнивает проба: корпус один на обе половины, значит расхождения корпусов быть не может.
+#[test]
+#[ignore = "исполняется только scripts/tests/red_m94_two_binary_agreement.sh"]
+fn g5_dump_outcomes_for_two_binary_agreement() {
+    let corpus =
+        std::env::var("M94_AGREE_CORPUS").expect("SETUP НЕ СОСТОЯЛСЯ: нет M94_AGREE_CORPUS");
+    let out = std::env::var("M94_AGREE_OUT").expect("SETUP НЕ СОСТОЯЛСЯ: нет M94_AGREE_OUT");
+    let text = std::fs::read_to_string(&corpus).expect("корпус");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut lines = Vec::new();
+    for case in text.lines() {
+        if case.starts_with('#') {
+            continue;
+        }
+        let edits: Vec<(&str, Option<&str>)> = case
+            .split(';')
+            .filter(|p| !p.is_empty() && *p != "-")
+            .map(|p| {
+                let (k, v) = p.split_once('=').expect("правка вида КЛЮЧ=значение");
+                (k, Some(v))
+            })
+            .collect();
+        for (mode, o) in [
+            ("legacy", legacy(&edits)),
+            ("profile", profiled(&edits, dir.path(), true)),
+        ] {
+            let r = if accepted(&o) { "ACCEPT" } else { "REFUSE" };
+            lines.push(format!("{case}\t{mode}\t{r}"));
+        }
+    }
+    std::fs::write(&out, lines.join("\n") + "\n").expect("запись исходов");
+}

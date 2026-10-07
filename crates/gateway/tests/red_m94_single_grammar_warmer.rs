@@ -387,3 +387,38 @@ fn w4_shared_parser_result_reaches_every_form() {
         missing.join("\n")
     );
 }
+
+/// `w5` (`#[ignore]`) — вторая половина оракула согласия двух бинарей (`A-052` §3 (б)); формат —
+/// как `g5` в `gateway-serve/tests/red_m94_single_grammar.rs`. Прогреватель — прод-бинарь на пустом
+/// журнале; режим `legacy` — окружение без профиля.
+#[test]
+#[ignore = "исполняется только scripts/tests/red_m94_two_binary_agreement.sh"]
+fn w5_dump_outcomes_for_two_binary_agreement() {
+    let corpus =
+        std::env::var("M94_AGREE_CORPUS").expect("SETUP НЕ СОСТОЯЛСЯ: нет M94_AGREE_CORPUS");
+    let out = std::env::var("M94_AGREE_OUT").expect("SETUP НЕ СОСТОЯЛСЯ: нет M94_AGREE_OUT");
+    let text = std::fs::read_to_string(&corpus).expect("корпус");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut lines = Vec::new();
+    for case in text.lines() {
+        if case.starts_with('#') {
+            continue;
+        }
+        let edits: Vec<(&str, Option<&str>)> = case
+            .split(';')
+            .filter(|p| !p.is_empty() && *p != "-")
+            .map(|p| {
+                let (k, v) = p.split_once('=').expect("правка вида КЛЮЧ=значение");
+                (k, Some(v))
+            })
+            .collect();
+        for (mode, o) in [
+            ("legacy", legacy_env(&edits)),
+            ("profile", profiled(&edits, dir.path(), true)),
+        ] {
+            let r = if accepted(&o) { "ACCEPT" } else { "REFUSE" };
+            lines.push(format!("{case}\t{mode}\t{r}"));
+        }
+    }
+    std::fs::write(&out, lines.join("\n") + "\n").expect("запись исходов");
+}
