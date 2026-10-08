@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # RED M-94 (C-280 R3) — деплой ИСПОЛНЯЕТСЯ, а не читается: отказ гейта профиля возвращает чекаут,
 # образ и cron к PREV, выдача не перезапускается; отказ здоровья — тоже откат к PREV, включая cron.
-# Спека: milestones/M-94-calc-profile.md §3.7, инвариант I-6, оракулы a0…a4, a7.
+# Спека: docs/archive/M-94-calc-profile.md §3.7, инвариант I-6, оракулы a0…a4, a7.
 #
 # Контракт вызова (спека §3.7): `deploy.yml` после `git reset --hard "$TARGET_SHA"` зовёт
 # `bash deploy/bin/deploy-apply.sh "$PREV"` из каталога чекаута. Швы:
