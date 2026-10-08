@@ -38,5 +38,13 @@ COPY --from=builder /build/target/release/wsprobe /usr/local/bin/wsprobe
 # ЕДИНСТВЕННЫЙ источник бинаря; ручной `cargo build` на хосте запрещён (TD-227-класс). На ветке healthy
 # deploy копирует сюда актуальную сборку, на ветке отката — сборку откатного коммита (§3 I-5).
 COPY --from=builder /build/target/release/ops-watchdog /usr/local/bin/ops-watchdog
+# M-94 (П-032, §3.4): профиль расчётов (`config/calc-profile/active.env` + `next.env`)
+# запечён в образ — это ЕДИНСТВЕННЫЙ носитель определения расчёта на проде. Путь
+# `/etc/hft/calc-profile/` соответствует `GATEWAY_CALC_PROFILE` в compose ОБЕИХ
+# служб. Смена профиля = правка файла в репо + bump `CALC_PROFILE_VERSION` +
+# `CALC-PROFILE-DECISION: П-NNN` (барьер `check_calc_profile.sh`). `next.env` —
+# отдельно (милестоун §3.5), добавляется в репо отдельным коммитом, файл попадает
+# в образ на следующем деплое.
+COPY config/calc-profile/ /etc/hft/calc-profile/
 # M-00: работаем root'ом (заглушка). Hardening (non-root + права тома) — TODO при реальном recorder.
 ENTRYPOINT ["/usr/local/bin/recorder"]

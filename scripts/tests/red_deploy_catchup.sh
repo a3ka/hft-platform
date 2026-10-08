@@ -336,7 +336,36 @@ expect_wiring W9-cancel-in-progress-true 1 "$(mutate_yml w9  'wf["concurrency"][
 expect_wiring W10-concurrency-группа     1 "$(mutate_yml w10 'wf["concurrency"]["group"]="deploy-other"')" mut
 expect_wiring W11-права-расширены        1 "$(mutate_yml w11 'wf["permissions"]["contents"]="write"')" mut
 expect_wiring W12-нет-actions-read       1 "$(mutate_yml w12 'wf["permissions"].pop("actions")')" mut
+# W13 (M-94, C-280 R3): откат вынесен в deploy/bin/deploy-apply.sh — четыре мира вместо одного.
+# Мир, удалявший строку отката из deploy.yml, на новой форме ничего бы не мутировал (страж
+# «мутация не состоялась»), поэтому разведён на две оси: ВЫЗОВ скрипта из deploy.yml и ОТКАТ в нём.
+APPLY_REAL="${ROOT}/deploy/bin/deploy-apply.sh"
+expect_wiring_apply() { # <имя> <код> <yml> <скрипт тела>
+  local name="$1" want_rc="$2" yml="$3" apply="$4" out rc
+  [ -f "${yml}" ] && [ -f "${apply}" ] || { setup_fail "${name}" "фикстура не создана"; return; }
+  out="$(CATCHUP_DEPLOY_YML="${yml}" CATCHUP_DEPLOY_APPLY="${apply}" python3 "${SUT}" check-wiring 2>&1)"; rc=$?
+  if [ "${rc}" -ne "${want_rc}" ]; then
+    nok "${name}" "exit=${rc}, ожидалось ${want_rc}; вывод: $(printf '%s' "${out}" | head -2 | tr '\n' ' ')"; return
+  fi
+  ok "${name}" "exit=${rc}"
+}
+if [ -f "${APPLY_REAL}" ] && grep -q 'deploy/bin/deploy-apply.sh' "${DEPLOY_YML}"; then
+  # (а) вызова тела с $PREV нет — откат не исполнится
+  expect_wiring W13a-вызов-тела-снесён   1 "$(mutate_yml w13a 'jobs["deploy"]["steps"][-1]["with"]["script"]=jobs["deploy"]["steps"][-1]["with"]["script"].replace("bash deploy/bin/deploy-apply.sh \"$PREV\"","true")')" mut
+  # (б) тело без отката: каждая исполняемая строка `git reset --hard -q "$PREV"` заменена на `true`
+  sed -E 's/^([[:space:]]*)git reset --hard -q "\$PREV"/\1true/' "${APPLY_REAL}" > "${WORK}/apply-noreset.sh"
+  if cmp -s "${APPLY_REAL}" "${WORK}/apply-noreset.sh"; then setup_fail W13b-тело-без-отката "мутация не состоялась"
+  else expect_wiring_apply W13b-тело-без-отката 1 "${DEPLOY_YML}" "${WORK}/apply-noreset.sh"; fi
+  # (в) откат остался ТОЛЬКО в комментарии — не исполняется
+  sed -E 's/^([[:space:]]*)git reset --hard -q "\$PREV"/\1# git reset --hard -q "$PREV"/' "${APPLY_REAL}" > "${WORK}/apply-comment.sh"
+  if cmp -s "${APPLY_REAL}" "${WORK}/apply-comment.sh"; then setup_fail W13c-откат-в-комментарии "мутация не состоялась"
+  else expect_wiring_apply W13c-откат-в-комментарии 1 "${DEPLOY_YML}" "${WORK}/apply-comment.sh"; fi
+  # (г) позитивный контроль: прежняя форма (откат строкой в deploy.yml) по-прежнему законна
+  expect_wiring W13d-прежняя-форма-законна 0 "$(mutate_yml w13d 'jobs["deploy"]["steps"][-1]["with"]["script"]=jobs["deploy"]["steps"][-1]["with"]["script"].replace("bash deploy/bin/deploy-apply.sh \"$PREV\"","git reset --hard -q \"$PREV\"")')" mut
+else
+  # прежняя форма deploy.yml (до M-94): откат строкой — прежний мир
 expect_wiring W13-rollback-снесён        1 "$(mutate_yml w13 'jobs["deploy"]["steps"][-1]["with"]["script"]=jobs["deploy"]["steps"][-1]["with"]["script"].replace(chr(39)+"git reset --hard -q \"$PREV\""+chr(39),"").replace("git reset --hard -q \"$PREV\"","true")')" mut
+fi
 expect_wiring W14-CI-гейт-снесён         1 "$(mutate_yml w14 'jobs.pop("ci")')" mut
 expect_wiring W15-CI-гейт-не-fail-closed 1 "$(mutate_yml w15 'jobs["ci"]["steps"][0]["run"]=jobs["ci"]["steps"][0]["run"].replace("exit 1","exit 0")')" mut
 # W16 — TD-150 п.1: возврат к привязке по ВЕТКЕ. Самый вероятный регресс: строка короче

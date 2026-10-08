@@ -112,7 +112,25 @@ ALERT ops-watchdog: бинарь не найден/не исполняем (/usr
 ```
 
 Это НЕ ситуация «соберите `cargo build` на хосте» — toolchain'а на VPS нет, и
-ручная сборка = второй источник бинаря (`TD-227`-класс). Действия оператора:
+ручная сборка = второй источник бинаря (`TD-227`-класс).
+
+> **M-94 (C-280 R3):** тело деплоя ВЫНЕСЕНО из `deploy.yml` в скрипт
+> `deploy/bin/deploy-apply.sh "$PREV"`. Маркеры в логах теперь
+> печатает СКРИПТ, а не `deploy.yml`. Конкретно:
+> - успех: `=== DEPLOY OK: TARGET deployed, both services healthy, watchdog installed ===`
+>   и `=== STEP 1: docker compose build (TARGET) ===` … `=== STEP 6: docker image prune -f ===`;
+> - отказ гейта/валидации cron: `=== GATE REFUSED — rollback (no up) ===`
+>   и `=== CRON VALIDATION FAILED — rollback (no up) ===` (НЕТ `up` после
+>   reset, милестоун §3.7);
+> - отказ health/cron-install: `=== ROLLBACK (with up) to PREV=<sha> reason=<…> ===`
+>   (`full_rollback_prev`: build, cron, up — на PREV);
+> - отказ watchdog: `=== WATCHDOG INSTALL FAILED ===` (как и было).
+> Маркеры `<DEL>DEPLOY FAILED — logs + rollback to …<END>` и
+> `<DEL>healthy (recorder + gateway-serve) — deployed …<END>` БОЛЬШЕ не
+> печатаются; ниже они упомянуты для исторической справки в строке
+> «(для исторической справки)» — не как маркер для grep'а.
+
+Действия оператора:
 
 1. **Посмотреть последний прогон `deploy.yml` на GitHub** (Actions → Deploy). Ожидание:
    - либо джоб зелёный И в логах шага ОТСУТСТВУЕТ строка `=== WATCHDOG INSTALL
@@ -120,30 +138,19 @@ ALERT ops-watchdog: бинарь не найден/не исполняем (/usr
      должен быть — пункт 2; никакого позитивного маркера вроде `WATCHDOG INSTALL OK`
      ни `install-watchdog.sh`, ни `deploy.yml` не печатают, успех = тишина в этой
      строке + зелёный шаг);
-   - либо джоб красный с `=== WATCHDOG INSTALL FAILED ===` в логах шага — это
-     ветка `then` healthy-гейта (`deploy.yml:305`): `install-watchdog.sh` упал,
-     `deploy.yml` напечатал маркер И `exit 1` одной строкой (`{ echo "===
-     WATCHDOG INSTALL FAILED ===" >&2; exit 1; }` в правой части `||`); см.
-     следующий пункт о том, где этот лог смотреть;
-   - либо джоб красный БЕЗ `=== WATCHDOG INSTALL FAILED ===` в логах — это ветка
-     отката `else` (`deploy.yml:308-316`): healthy-гейт не прошёл, `deploy.yml`
-     уже напечатал `=== DEPLOY FAILED — logs + rollback to … ===`
-     (`deploy.yml:308`), снял `docker logs …`, откатил `git reset --hard "$PREV"`
-     (`deploy.yml:311`), поднял `hft-recorder`+`hft-gateway-serve` откатного
-     образа (`deploy.yml:312`) и попытался поставить сторож того же образа через
-     `bash deploy/bin/install-watchdog.sh || true` (`deploy.yml:315`); отказ
-     установки здесь ГЛУШИТСЯ (`|| true`), маркер `=== WATCHDOG INSTALL FAILED
-     ===` НЕ печатается (он бы ввёл в заблуждение — причина красного healthy-гейт,
-     а не установка), и джоб красный по `exit 1` (`deploy.yml:316`) в `else`-ветке.
-     В этом исходе ищите в логах `grep -F '=== DEPLOY FAILED'` (по
-     префиксу, как печатает `deploy.yml:308` — `=== DEPLOY FAILED — logs +
-     rollback to <sha> ===`); прежде чем разбирать установку, проверьте
-     п.2.
+   - либо джоб красный с `=== WATCHDOG INSTALL FAILED ===` в логах шага —
+     `deploy-apply.sh` напечатал маркер И `exit 1` (`deploy/bin/deploy-apply.sh`
+     в `if ! …` после `bash deploy/bin/install-watchdog.sh`); см. следующий пункт
+     о том, где этот лог смотреть;
+   - либо джоб красный по ДРУГОЙ причине (gate/cron/health). Ищите префиксы
+     `=== GATE REFUSED — rollback (no up) ===` / `=== CRON VALIDATION FAILED — rollback (no up) ===` /
+     `=== ROLLBACK (with up) to PREV=… reason=<…> ===` в логах шага — каждое
+     `reason=` указывает на конкретную ветку (`gate_refused` / `cron_invalid` /
+     `cron_install_failed` / `up_failed` / `health_failed`).
 2. **Лог шага — НЕ `journalctl`, а лог джоба GitHub Actions.** Деплой не
    systemd-сервис, юнита `journalctl -u deploy` не существует и не появится.
-   Шаг деплоя — `Deploy via SSH` (`deploy.yml:239`), `uses:
-   appleboy/ssh-action@v1` (`deploy.yml:240`) с `script: |` (`deploy.yml:246`)
-   — это action-обёртка над SSH, а НЕ голый `ssh … 'bash -s …'`; её
+   Шаг деплоя — `Deploy via SSH`, `uses: appleboy/ssh-action@v1` — это
+   action-обёртка над SSH, а НЕ голый `ssh … 'bash -s …'`; её
    stdout/stderr — лог Actions-шага. Смотреть так: `gh run view <id> --log`
    (где `<id>` — идентификатор прогона из `gh run list`) или UI GitHub →
    Actions → Deploy → раскрыть шаг. Что реально видно при отказе
@@ -154,22 +161,14 @@ ALERT ops-watchdog: бинарь не найден/не исполняем (/usr
    та команда, которая упала: docker CLI на `inspect` (`install-watchdog.sh:78`)
    / `create` (`:83`) / `cp` (`:88-89`), coreutils на `mkdir -p` (`:57`),
    `chmod` (`:105`), `mv -f` (`:106`); EXIT-trap (`:65-73`) молчит — `docker
-   rm` и `rm -f` уведены в `/dev/null`;
-   и, наконец, ветка «пустой файл» распознаётся по-разному в зависимости от
-   ветки `deploy.yml`. **Ветка `then` (`deploy.yml:305`):** между строкой
-   `=== healthy (recorder + gateway-serve) — deployed … ===` (`deploy.yml:301`)
-   и `=== WATCHDOG INSTALL FAILED ===` (`deploy.yml:305`) в логе стоит вывод
-   установщика; пусто между ними ⇒ «пустой файл» (`install-watchdog.sh:100-101`):
-   все остальные точки отказа печатают stderr (п.2 выше), trap молчит. Это
-   единственная ветка, где правило работает. **Ветка `else`
-   (`deploy.yml:308-316`):** `=== DEPLOY FAILED — logs + rollback to <sha> ===`
-   печатается ПЕРВЫМ (`deploy.yml:308`); далее два `docker logs`
-   (`deploy.yml:309-310`), откат (`deploy.yml:311`), сборка откатного образа
-   (`deploy.yml:312`), и только затем установщик (`deploy.yml:315`) с `|| true`
-   — маркера после него НЕТ, следом сразу `exit 1` (`deploy.yml:316`). Успех
-   установки и «пустой файл» здесь ОБА молчат ⇒ **исход установки в ветке
-   отката из лога Actions не определим**; оператор идёт на хост: проверка
-   доставки (1)-(2) (`:74-82`) и при расхождении — п.4 (ручной перезапуск).
+   rm` и `rm -f` уведены в `/dev/null`.
+   **M-94:** маркер `=== WATCHDOG INSTALL FAILED ===` печатает `deploy-apply.sh`
+   в `if !` после `bash deploy/bin/install-watchdog.sh`. Старые маркеры
+   `<DEL>DEPLOY FAILED — logs + rollback to <sha><END>` (для исторической
+   справки) и
+   `<DEL>healthy (recorder + gateway-serve) — deployed …<END>` (для исторической
+   справки) БОЛЬШЕ НЕ печатаются (они были в `deploy.yml`, перенесённом
+   в `deploy-apply.sh`).
 3. **Проверить, что деплой РЕАЛЬНО выполнил установку** (а не пропустил по фильтру
    `paths:`). Фильтр `deploy.yml` (`A-046` E3) НЕ содержит `deploy/bin/**` и
    `scripts/watchdog_cron.sh`: правка одного установщика или обёртки едет на VPS только
@@ -797,3 +796,102 @@ HFT_CRON_PRINT_ARGV=1 /root/hft-platform/deploy/bin/gateway-checkpoint-cron.sh
   в `command:` compose-сервиса `gateway-checkpoint`** — единый источник с `gateway-serve`
   через `environment:` блок, откуда их читает бинарь. `--depth-cadence-ms` — исключение
   (`red_checkpoint_bin_prod_argv::c3ter` требует его присутствия в argv).
+
+## 9. M-94 — профиль расчётов: «прогреть, потом переключить» (`П-032`)
+
+После M-94 у `gateway-serve` и `gateway-checkpoint` **ЕДИНСТВЕННЫЙ носитель** определения
+расчёта — `config/calc-profile/active.env` в репозитории (запечён в образ через `COPY` в
+`Dockerfile`, объявлен compose-`environment:` как `GATEWAY_CALC_PROFILE`). Смена любой
+величины, меняющей имя слепка (`GATEWAY_BANDS`, `GATEWAY_DEPTH_CADENCE_MS`,
+`GATEWAY_TIMEFRAME_MS`, `GATEWAY_WINDOW_MS`, `GATEWAY_ALLOWED_PROFILES` через тройку
+`timeframe/window/cadence`), идёт по схеме «прогреть, потом переключить» — иначе
+`gateway-serve` после `up` будет отдавать `not_ready` каждому клиенту до тех пор, пока
+`gateway-checkpoint` не пройдёт полный цикл прогрева (≈16–23 мин, замер M-84/R-187).
+
+### 9a. Смена, НЕ меняющая имя слепка (один PR)
+
+Величины `GATEWAY_HEATMAP_WINDOW` и `GATEWAY_VP_BIN_WIDTH_E8` в `selector_fingerprint`
+НЕ участвуют (`crates/gateway/src/lib.rs:4252-4274`) — их смена не инвалидирует слепок.
+Один PR:
+
+1. Правка `config/calc-profile/active.env` (только эти 2 ключа + bump `CALC_PROFILE_VERSION`
+   на +1).
+2. `CALC-PROFILE-DECISION: П-NNN` в теле коммита; заголовок `## П-NNN` в
+   `docs/PENDING-SIGNATURE.md` ЭТОГО коммита. Барьер `check_calc_profile.sh` в CI.
+3. Merge → деплой поднимает выдачу с новым профилем. Слепок `active.env` (тот же селектор)
+   остаётся, пересборка НЕ нужна.
+
+### 9b. Смена, МЕНЯЮЩАЯ имя слепка (ДВА PR)
+
+Величины `GATEWAY_BANDS`, `GATEWAY_DEPTH_CADENCE_MS`, `GATEWAY_TIMEFRAME_MS`,
+`GATEWAY_WINDOW_MS`, `GATEWAY_ALLOWED_PROFILES` (через `timeframe/window/cadence`)
+входят в `selector_fingerprint` ⇒ меняют имя файла. Два PR, ни один не переключает
+выдачу сам.
+
+#### PR «прогрев» — ДО деплоя
+
+1. Добавить `config/calc-profile/next.env` — полный профиль с НОВЫМИ значениями
+   и `CALC_PROFILE_VERSION >` версии `active.env` (барьер в CI это проверяет).
+2. `CALC-PROFILE-DECISION: П-NNN` в теле коммита; заголовок `## П-NNN` в
+   `docs/PENDING-SIGNATURE.md` ЭТОГО коммита.
+3. Merge → деплой пройдёт штатно (`active.env` не менялся, выдача работает
+   на старом профиле). cron-обёртка `gateway-checkpoint-cron.sh` в КАЖДОМ цикле
+   делает дополнительный прогон:
+   - прогон `active` — `compose run --rm gateway-checkpoint` (наследует
+     `GATEWAY_CALC_PROFILE=/etc/hft/calc-profile/active.env` из compose-`environment:`);
+   - прогон `next` — `<runner> -e GATEWAY_CALC_PROFILE=/etc/hft/calc-profile/next.env
+     gateway-checkpoint ...` (только при наличии `$HFT_ROOT/config/calc-profile/next.env`).
+   Оба прогона пишут слепки в КОРЕНЬ тома `gateway-ckpt` (`--ckpt-dir=/ckpt` общий);
+   покрытие — в РАЗНЫЕ файлы (`/ckpt/covered_through_seq` для `active`,
+   `/ckpt/covered_through_seq.next` для `next`), чтобы курсор `next` (всегда ДАЛЬШЕ
+   `active` — больше хвоста) не сдвинул файл, который читает ретеншен (милестоун
+   §3.5: «покрытие `next` НЕ смеет идти в путь ретеншена»). Старый слепок
+   `active` продолжает освежаться (селектор тот же).
+
+#### Приёмка прогрева (между PR «прогрев» и PR «переключение»)
+
+- Слепок `next.env` существует и свежий:
+
+  ```bash
+  ls -la /var/lib/docker/volumes/hft-platform_gateway-ckpt/_data/
+  # ckpt-<fp_old>.bin   <-- active (старый)
+  # ckpt-<fp_new>.bin   <-- next (новый, имя по `ckpt_path_for_pub` селектора next.env)
+  # covered_through_seq
+  # covered_through_seq.next
+  ```
+
+- `<ckpt-fp>.profile` РЯДОМ с каждым слепком — отчёт о ПРОЧИТАННОМ файле профиля
+  (милестоун §3.6, оракул `p6`). Если `*.profile` отсутствует рядом с `ckpt-<…>.bin` —
+  прогон `gateway-checkpoint` упал, и приёмка НЕ пройдена.
+
+- **Проверка селектора** в `next.env` — разобрать `next.env` и сравнить с селектором
+  в `active.env`. Если тройка `(timeframe_ms, window_ms, depth_cadence_ms)` НЕ входит
+  в `GATEWAY_ALLOWED_PROFILES` (новая политика допуска ещё не развёрнута) — слепок
+  пишется, но сервер его НЕ ОБСЛУЖИВАЕТ (милестоун §3.2, связь тройки). Это
+  легитимный переходный сценарий, и переключение ниже его снимает.
+
+#### PR «переключение»
+
+1. Содержимое `next.env` становится `active.env`, `next.env` удаляется.
+2. `CALC_PROFILE_VERSION` увеличивается на +1 (от версии `next.env`).
+3. `CALC-PROFILE-DECISION: П-NNN` (тот же токен подписи, что и в «прогреве»).
+4. Merge → деплой проходит гейт `deploy/bin/calc-profile-gate.sh` (милестоун §3.7):
+   - host `.env` БЕЗ ключей профиля (барьер `g2`/`g3`: иначе выдача переключится на
+     `active.env` минуя профиль, класс TD-227);
+   - слепок НОВОГО профиля (`ckpt-<fp_new>.bin`) лежит в томе
+     `$CALC_GATE_CKPT_HOST_DIR` (барьер `g4`/`g5`/`g6`).
+5. Тело деплоя (`deploy/bin/deploy-apply.sh "$PREV"`) переустанавливает cron, поднимает
+   обе службы, ждёт `healthy`, ставит сторож. На любом отказе — откат к PREV
+   (чекаут, тег образа, cron, профиль — на PREV), `up` на PREV.
+
+### 9c. После смены профиля
+
+- **Старый слепок НЕ удалять** вручную: `rm /ckpt/ckpt-<fp_old>.bin` оставит
+  `gateway-serve` без реплея истории, а `journal-retention` в следующем цикле может
+  удалить префикс журнала, нужный для отката к `active` (милестоун §5: «удаление
+  слепков запрещено»). Старый слепок лежит до приёмки `next` или до следующей
+  смены профиля.
+- **Не дублировать профиль** в `host .env`: ровно та ошибка, против которой стоит
+  гейт. Если `host .env` ещё несёт `GATEWAY_BANDS=…` от ДО-M-94 формы — это
+  задача 11 (милестоун), архитектор/ревьюер снимает ПОСЛЕ merge M-94 и ДО
+  следующего деплоя (окно ≈16 мин, пока CI бежит).

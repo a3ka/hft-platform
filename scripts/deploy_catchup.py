@@ -463,9 +463,39 @@ def cmd_check_wiring():
     if isinstance(deploy, dict):
         script = json.dumps(deploy.get("steps"), ensure_ascii=False)
 
-    # W7 — rollback-ветка не тронута (запретный список Р-4).
-    if 'git reset --hard -q \\"$PREV\\"' not in script and "git reset --hard -q \"$PREV\"" not in script:
-        bad("W7", "в шагах `deploy` нет отката на $PREV — rollback-ветка тронута (запрещено Р-4)")
+    # W7 — rollback-ветка не тронута (запретный список Р-4). Две законные формы:
+    #   (а) прежняя — откат строкой прямо в шагах `deploy`;
+    #   (б) M-94 (§3.7, `C-280` R3) — тело деплоя вынесено в `deploy/bin/deploy-apply.sh`, шаги
+    #       зовут его с `"$PREV"`, и откат — ИСПОЛНЯЕМАЯ (не комментарий) строка этого скрипта.
+    #       Сам откат там исполняется пробой `scripts/tests/red_m94_deploy_apply.sh` (a1…a6);
+    #       здесь — лишь то, что делегирование есть и откат из него не выброшен.
+    # Шов пробы: CATCHUP_DEPLOY_APPLY — путь к скрипту тела (по умолчанию — в корне репозитория).
+    rollback_inline = (
+        'git reset --hard -q \\"$PREV\\"' in script or "git reset --hard -q \"$PREV\"" in script
+    )
+    apply_call = (
+        'deploy/bin/deploy-apply.sh \\"$PREV\\"' in script
+        or "deploy/bin/deploy-apply.sh \"$PREV\"" in script
+    )
+    rollback_delegated = False
+    if apply_call:
+        apply_path = os.environ.get("CATCHUP_DEPLOY_APPLY") or os.path.join(
+            root, "deploy", "bin", "deploy-apply.sh"
+        )
+        try:
+            with open(apply_path, encoding="utf-8") as fh:
+                rollback_delegated = any(
+                    'git reset --hard -q "$PREV"' in line and not line.lstrip().startswith("#")
+                    for line in fh
+                )
+        except OSError:
+            rollback_delegated = False
+    if not (rollback_inline or rollback_delegated):
+        bad(
+            "W7",
+            "в шагах `deploy` нет отката на $PREV ни строкой, ни через deploy/bin/deploy-apply.sh "
+            "\"$PREV\" с исполняемым откатом в скрипте — rollback-ветка тронута (запрещено Р-4)",
+        )
 
     # W8 — гейт на CI не ослаблен.
     gate = jobs.get("ci")

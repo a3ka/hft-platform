@@ -3997,6 +3997,15 @@ pub fn snapshot_from_checkpoint(
     ))
 }
 
+/// M-94 (П-032): **загрузчик профиля расчётов** + **единственный дом разборщиков**
+/// четырёх величин (`A-049` Р-6: heatmap_window_frac, vp_bin_width_e8, allowed_profiles,
+/// «тройка ∈ `ALLOWED_PROFILES`»). Носитель — `config/calc-profile/active.env`,
+/// ЗАКРЫТЫЙ набор из 8 ключей. Зовут ОБА процесса, считающих выдачу — `gateway-serve`
+/// (через `serve_config_from_env`/`admission_policy_from_env`) и `gateway-checkpoint`
+/// (через бинарь). `sha256` от байтов файла виден снаружи процесса
+/// (`<слепок>.profile` + сердцебиение выдачи).
+pub mod calc_profile;
+
 /// M-38b (GW-I-9): чекпоинт-редьюсер — atomic запись полного состояния `Reducer` в
 /// каталог `ckpt_dir`. Файл единственный (`ckpt.bin`). Атомарность через tmp + rename.
 /// `flock` на каталог опускаем (best-effort: `Journal::rotate` в одном крейте — нет

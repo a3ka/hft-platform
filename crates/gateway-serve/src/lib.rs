@@ -618,7 +618,14 @@ pub mod server {
             tokio::time::sleep(cfg.period).await;
             let snap = counters.as_ref().map(|c| c.snapshot()).unwrap_or_default();
             let fresh = metrics::freshness();
-            let body = serde_json::json!({
+            // M-94 (П-032 п.4 (а)): аддитивный объект `calc_profile: {version, sha256}`
+            // в heartbeat JSON. `schema` остаётся 1 (поле аддитивно; `o1` — сторож
+            // неломающегося разбора). В legacy-режиме (нет `GATEWAY_CALC_PROFILE`)
+            // поля НЕТ — `Deserialize` с `#[serde(default)]` на новом поле
+            // несущественно, и `o1` остаётся зелёным.
+            let calc_profile_json = gateway::calc_profile::effective_calc_profile()
+                .map(|(v, sha)| serde_json::json!({"version": v, "sha256": sha}));
+            let mut body = serde_json::json!({
                 "schema": 1u32,
                 "ts_wall_ms": SystemTime::now()
                     .duration_since(UNIX_EPOCH)
@@ -637,6 +644,9 @@ pub mod server {
                     "snapshot_ms": fresh.snapshot_ms,
                 },
             });
+            if let Some(cp) = calc_profile_json {
+                body["calc_profile"] = cp;
+            }
             let bytes = match serde_json::to_vec(&body) {
                 Ok(b) => b,
                 Err(e) => {
@@ -2921,6 +2931,19 @@ pub fn serve_config_from_env(
     use journal::EpochFilter;
     use jsonwebtoken::DecodingKey;
 
+    // M-94 (П-032, §3.3): режим профиля — `GATEWAY_CALC_PROFILE` задан в env.
+    // Все 8 величин берутся из файла; наличие любого ключа профиля или
+    // `GATEWAY_CANONICAL_BANDS` в env ⇒ отказ старта (оракулы `p3`/`s2`,
+    // `П-032` п.1: «наличие — отказ», даже значение равное профилю). Файл
+    // загружается ЗДЕСЬ, до всех остальных чтений env — `serve_config_from_env`
+    // и `admission_policy_from_env` ОБА зовут `load_from_env` и оба проверяют
+    // отсутствие «наложений» в env, чтобы в обоих результатах был один источник.
+    let profile = gateway::calc_profile::load_from_env(&get)
+        .map_err(|e| format!("GATEWAY_CALC_PROFILE invalid: {e}"))?;
+    if profile.is_some() {
+        gateway::calc_profile::check_no_env_overrides(&get)?;
+    }
+
     let secret = get("GATEWAY_JWT_SECRET")
         .ok_or_else(|| "GATEWAY_JWT_SECRET must be set (HS256 shared secret)".to_string())?;
     if secret.trim().is_empty() {
@@ -2945,55 +2968,43 @@ pub fn serve_config_from_env(
 
     let symbol = get("GATEWAY_SYMBOL").unwrap_or_else(|| "BTCUSDT".to_string());
 
-    let timeframe_ms: i64 = get("GATEWAY_TIMEFRAME_MS")
-        .unwrap_or_else(|| "1000".to_string())
-        .parse()
-        .map_err(|e| format!("GATEWAY_TIMEFRAME_MS parse: {e}"))?;
+    // M-94 (задача 12, `R-245` B-1): у КАЖДОЙ из шести величин ОДНА грамматика —
+    // функция `gateway::calc_profile::parse_*`. Ветка «без профиля» обоих бинарей
+    // зовёт те же функции, что и загрузчик профиля (`A-049` Р-6, спека §3.2).
+    // Различие режимов — только политика профиля (окно без границы в профиле
+    // отвергается), грамматика — общая.
 
-    // M-47 (GW-I-10, TD-046): fail-closed гвард на СТАРТЕ прод-бинаря. Зеркалит
-    // `gateway::validate_selector` — но отказ тут на СТАРТЕ, а не при первом клиентском
-    // подключении (урок TD-019/TD-020: иначе оператор с опечаткой поднимет ЗДОРОВЫЙ по
-    // healthcheck контейнер, отдающий ошибку каждому клиенту — §8 eyes-on увидит
-    // `(healthy)`, а кокпит будет пуст). Проверяем ДЕЛИМОСТЬ суток, не «круглость»
-    // (недельный бакет 604_800_000 круглый, но накрывает 7 полуночей — отвергается).
-    // Прод-дефолт 1000 и все выравненные значения (1, 60_000, 3_600_000, 86_400_000)
-    // делят 86_400_000 нацело — прод не ломаем.
-    if timeframe_ms <= 0 || 86_400_000 % timeframe_ms != 0 {
-        return Err(format!(
-            "GATEWAY_TIMEFRAME_MS={timeframe_ms} не выравнен на границу UTC-суток \
-             (требуется > 0 и 86_400_000 % GATEWAY_TIMEFRAME_MS == 0; иначе бакет пересекает \
-             00:00 UTC ⇒ session_id бакета не определён)"
-        ));
-    }
+    // M-94: в режиме профиля `timeframe_ms` берётся ИЗ профиля. Проверка `check_no_env_overrides`
+    // выше уже отвергла `GATEWAY_TIMEFRAME_MS` в env, поэтому здесь read из env вне
+    // режима профиля.
+    let timeframe_ms: i64 = if let Some(p) = &profile {
+        p.timeframe_ms
+    } else {
+        gateway::calc_profile::parse_timeframe_ms(
+            &get("GATEWAY_TIMEFRAME_MS").unwrap_or_else(|| "1000".to_string()),
+        )
+        .map_err(|e| e.to_string())?
+    };
 
-    let bands: Vec<f64> = get("GATEWAY_BANDS")
-        .unwrap_or_else(|| "0.001".to_string())
-        .split(',')
-        .map(|s| s.trim().parse::<f64>())
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| format!("GATEWAY_BANDS parse: {e}"))?;
+    let bands: Vec<f64> = if let Some(p) = &profile {
+        p.bands.clone()
+    } else {
+        gateway::calc_profile::parse_bands(
+            &get("GATEWAY_BANDS").unwrap_or_else(|| "0.001".to_string()),
+        )
+        .map_err(|e| e.to_string())?
+    };
 
-    // M-75: окно heatmap/COB — серверная настройка, не клиентский selector.
-    // Отсутствие переменной использует подписанный дефолт; любое заданное значение
-    // разбирается fail-closed и обязано лежать строго внутри (0, 1). В частности,
-    // пустая строка считается заданным невалидным значением, а не дефолтом.
-    let heatmap_window_frac: f64 = match get("GATEWAY_HEATMAP_WINDOW") {
-        None => gateway::DEFAULT_HEATMAP_WINDOW_FRAC,
-        Some(raw) => {
-            let value = raw.trim();
-            match value.parse::<f64>() {
-                Ok(w) if w.is_finite() && w > 0.0 && w < 1.0 => w,
-                Ok(w) => {
-                    return Err(format!(
-                        "GATEWAY_HEATMAP_WINDOW={w:?} вне интервала (0, 1); \
-                         окно heatmap/COB должно быть положительным и меньше 1"
-                    ));
-                }
-                Err(e) => {
-                    return Err(format!(
-                        "GATEWAY_HEATMAP_WINDOW={value:?} не разбирается как f64 ({e})"
-                    ));
-                }
+    // M-94: в режиме профиля `heatmap_window_frac` берётся ИЗ профиля (милестоун §3.1,
+    // разборщик из `gateway::calc_profile` — единственный дом, `A-049` Р-6). В legacy —
+    // прежний путь `GATEWAY_HEATMAP_WINDOW` (M-75); грамматика ОБЩАЯ с профилем.
+    let heatmap_window_frac: f64 = if let Some(p) = &profile {
+        p.heatmap_window_frac
+    } else {
+        match get("GATEWAY_HEATMAP_WINDOW") {
+            None => gateway::DEFAULT_HEATMAP_WINDOW_FRAC,
+            Some(raw) => {
+                gateway::calc_profile::parse_heatmap_window_frac(&raw).map_err(|e| e.to_string())?
             }
         }
     };
@@ -3005,34 +3016,21 @@ pub fn serve_config_from_env(
     // пробелы — легитимный offline (`None`); `"0"` канонизируется в `None` (а не
     // `Some(0)`), чтобы `selector_fingerprint` (M-38b) не расщеплял offline-режим на два
     // ключа чекпоинта (C-099 B-2).
-    let window_ms: Option<i64> = match get("GATEWAY_WINDOW_MS") {
-        None => None,
-        Some(s) if s.trim().is_empty() => None,
-        Some(s) => {
-            let trimmed = s.trim();
-            match trimmed.parse::<i64>() {
-                Ok(0) => None,             // "0" — легитимный offline (паритет argv M-38b)
-                Ok(w) if w > 0 => Some(w), // валидное bounded окно
-                Ok(w) => {
-                    // M-69 task #2: отрицательное окно отвергается на старте, а не
-                    // молча проходит как unbounded. `Some(w<0)` в Selector ведёт себя
-                    // как `None` через `window_lo_time_s`, но ОТЛИЧАЕТСЯ от `None` в
-                    // `selector_fingerprint` ⇒ чекпоинт снимается под режимом, которого
-                    // оператор не заказывал, и остаётся валидным по CRC (класс TD-019/TD-020).
-                    return Err(format!(
-                        "GATEWAY_WINDOW_MS={w} отрицателен — окно должно быть либо unset \
-                         (offline), либо положительным числом миллисекунд; отрицательное \
-                         ведёт себя как unbounded при непустом поле ⇒ selector_fingerprint \
-                         расходится с offline ⇒ чекпоинт снимается под незаказанным режимом"
-                    ));
-                }
-                Err(e) => {
-                    return Err(format!(
-                        "GATEWAY_WINDOW_MS={trimmed:?} не парсится как i64 ({e}) — это \
-                         опечатка в `.env` (мусор/суффикс/научная нотация/дробное/переполнение), \
-                         а не сигнал к unbounded-режиму; оператор обязан задать валидное \
-                         значение или unset/пусто/0 для offline"
-                    ));
+    // M-94: в режиме профиля `window_ms` берётся ИЗ профиля. Вне профиля — общий
+    // грамматический разборщик; семантика `0` → `None` (legacy offline, M-37) и
+    // политика отказа в профиле (`load_profile`) лежат ВНЕ грамматики.
+    let window_ms: Option<i64> = if let Some(p) = &profile {
+        Some(p.window_ms)
+    } else {
+        match get("GATEWAY_WINDOW_MS") {
+            None => None,
+            Some(s) if s.trim().is_empty() => None,
+            Some(s) => {
+                let v = gateway::calc_profile::parse_window_ms(&s).map_err(|e| e.to_string())?;
+                if v == 0 {
+                    None
+                } else {
+                    Some(v)
                 }
             }
         }
@@ -3134,49 +3132,19 @@ pub fn serve_config_from_env(
     server::set_effective_grace_ms(grace_ms);
 
     // ───────────────────────────────────────────────────────────────────────
-    // M-68: GATEWAY_DEPTH_CADENCE_MS — КОНФИГ, а не константа.
+    // M-68: GATEWAY_DEPTH_CADENCE_MS — КОНФИГ, а не константа. M-94: в режиме
+    // профиля берётся ИЗ профиля (милестоун §3.1, разборщик из `calc_profile`).
+    // M-94 (задача 12): ОБЩАЯ грамматика с профилем (`R-245` B-1); отсутствие/
+    // пустое/пробельное значение — дефолт 1000 (поведение под `A-015` §3 п.1).
     const DEFAULT_CADENCE_MS: i64 = 1_000;
-    let raw_cadence = get("GATEWAY_DEPTH_CADENCE_MS");
-    let trimmed_cadence = raw_cadence.as_deref().map(str::trim);
-    let depth_cadence_ms: Option<i64> = match trimmed_cadence {
-        None => Some(DEFAULT_CADENCE_MS),
-        Some("") => Some(DEFAULT_CADENCE_MS),
-        Some(s) if s.trim().is_empty() => Some(DEFAULT_CADENCE_MS),
-        Some(s) => {
-            let trimmed = s.trim();
-            match trimmed.parse::<i64>() {
-                Ok(ms) if ms >= 1000 && 86_400_000 % ms == 0 => Some(ms),
-                Ok(ms) if ms >= 1000 && 86_400_000 % ms != 0 => {
-                    return Err(format!(
-                        "GATEWAY_DEPTH_CADENCE_MS={ms} не выравнен на границу UTC-суток \
-                     (требуется 86_400_000 % GATEWAY_DEPTH_CADENCE_MS == 0; иначе \
-                     подсекундные/нестандартные значения дают схлопывание ключей — \
-                     тот же класс, что GW-I-14 для window_ms; см. MD-I-8 d14)"
-                    ));
-                }
-                Ok(ms) if ms < 1000 => {
-                    return Err(format!(
-                        "GATEWAY_DEPTH_CADENCE_MS={ms} подсекундная — проводная форма \
-                     ключуется секундами (DepthRow.series — time_s), подсекундный \
-                     интервал даёт ОДИН ключ в секунду молча. Требуется >= 1000; \
-                     см. MD-I-8 d14 (C-167)"
-                    ));
-                }
-                Ok(ms) => {
-                    return Err(format!(
-                        "GATEWAY_DEPTH_CADENCE_MS={ms} невалидно: должно быть >= 1000 \
-                     и выравнено на границу UTC-суток (86_400_000 % ms == 0); \
-                     получено {trimmed:?}"
-                    ));
-                }
-                Err(e) => {
-                    return Err(format!(
-                        "GATEWAY_DEPTH_CADENCE_MS={trimmed:?} не парсится как i64 ({e}) — \
-                     опечатка в `.env` (мусор/суффикс/научная нотация/дробное/\
-                     переполнение), а не сигнал к дефолту; оператор обязан задать \
-                     валидное значение или unset/пусто/пробельное для дефолта"
-                    ));
-                }
+    let depth_cadence_ms: Option<i64> = if let Some(p) = &profile {
+        Some(p.depth_cadence_ms)
+    } else {
+        match get("GATEWAY_DEPTH_CADENCE_MS") {
+            None => Some(DEFAULT_CADENCE_MS),
+            Some(s) if s.trim().is_empty() => Some(DEFAULT_CADENCE_MS),
+            Some(s) => {
+                Some(gateway::calc_profile::parse_depth_cadence_ms(&s).map_err(|e| e.to_string())?)
             }
         }
     };
@@ -3238,48 +3206,27 @@ pub fn serve_config_from_env(
     };
 
     // M-86 (`milestones/M-86-vp-bin-width.md` §2.3): ширина корзины профиля объёма.
-    // Политика ЗНАЧЕНИЙ — ТА ЖЕ, что у `GATEWAY_MAX_RESPONSE_BYTES` (отсутствие/пустое/
-    // пробельное ⇒ подписанная норма + warn; мусор, дробное, 0, отрицательное,
-    // переполнение ⇒ отказ старта с сообщением, НАЗЫВАЮЩИМ переменную). Это
-    // исполнение `A-015` §3 п.1 — четвёртая политика для четвёртого лимита одного
-    // сервиса запрещена. Сеттер зовётся СТРОГО ПОСЛЕ успешного разбора —
-    // отвергнутая старт-конфигурация не смеет управлять сервисом (класс GW-I-14 / R7).
-    let raw_vp_bin = get("GATEWAY_VP_BIN_WIDTH_E8");
-    let trimmed_vp_bin = raw_vp_bin.as_deref().map(str::trim);
-    let vp_bin_width_e8: i64 = match trimmed_vp_bin {
-        None | Some("") => {
-            tracing::warn!(
-                "GATEWAY_VP_BIN_WIDTH_E8 is absent or blank (raw={raw_vp_bin:?}); \
-                 GATEWAY_VP_BIN_WIDTH_E8={} — подписанная норма (founder 2026-09-18, \
-                 milestones/M-86-vp-bin-width.md §2.1, A-015 §3 п.1)",
-                gateway::DEFAULT_VP_BIN_WIDTH_E8,
-            );
-            gateway::DEFAULT_VP_BIN_WIDTH_E8
+    // M-94: в режиме профиля берётся ИЗ профиля (милестоун §3.1).
+    // M-94 (задача 12): ОБЩАЯ грамматика с профилем (`R-245` B-1); отсутствие/пустое/
+    // пробельное значение — дефолт с WARN (поведение под `A-015` §3 п.1).
+    let vp_bin_width_e8: i64 = if let Some(p) = &profile {
+        p.vp_bin_width_e8
+    } else {
+        let raw_vp_bin = get("GATEWAY_VP_BIN_WIDTH_E8");
+        match raw_vp_bin.as_deref().map(str::trim) {
+            None | Some("") => {
+                tracing::warn!(
+                    "GATEWAY_VP_BIN_WIDTH_E8 is absent or blank (raw={raw_vp_bin:?}); \
+                     GATEWAY_VP_BIN_WIDTH_E8={} — подписанная норма (founder 2026-09-18, \
+                     milestones/M-86-vp-bin-width.md §2.1, A-015 §3 п.1)",
+                    gateway::DEFAULT_VP_BIN_WIDTH_E8,
+                );
+                gateway::DEFAULT_VP_BIN_WIDTH_E8
+            }
+            Some(s) => {
+                gateway::calc_profile::parse_vp_bin_width_e8(s).map_err(|e| e.to_string())?
+            }
         }
-        Some(s) => match s.parse::<i64>() {
-            Ok(n) if n > 0 => n,
-            Ok(0) => {
-                return Err(format!(
-                    "GATEWAY_VP_BIN_WIDTH_E8={s} невалидно: должно быть > 0 \
-                     (M-86 §2.3: нулевая ширина даёт деление на ноль или тиковую сетку — \
-                     ровно ту аварию 5 533 287 Б против предела 2 000 000 Б, против которой \
-                     предмет заведён)"
-                ));
-            }
-            Ok(n) => {
-                return Err(format!(
-                    "GATEWAY_VP_BIN_WIDTH_E8={n} невалидно: должно быть > 0 (M-86 §2.3)"
-                ));
-            }
-            Err(e) => {
-                return Err(format!(
-                    "GATEWAY_VP_BIN_WIDTH_E8={s:?} parse: {e} — это опечатка в `.env` \
-                     (мусор/суффикс/научная нотация/дробное/переполнение/Rust-разделитель \
-                     разрядов); оператор обязан задать валидное целое > 0 или \
-                     unset/пусто/пробельное для дефолта"
-                ));
-            }
-        },
     };
 
     // M-71 §4bis.2: сеттер зовётся СТРОГО ПОСЛЕ успешного разбора — все ветки отказа
@@ -3289,6 +3236,13 @@ pub fn serve_config_from_env(
     gateway::set_effective_max_response_bytes(max_response_bytes);
     gateway::set_effective_heatmap_window_frac(heatmap_window_frac);
     gateway::set_effective_vp_bin_width_e8(vp_bin_width_e8);
+
+    // M-94 (П-032 п.4 (а)): пробросить применённый профиль в `OnceLock`,
+    // который читает heartbeat-таск (`run_heartbeat` ниже). В режиме профиля
+    // поле `calc_profile: {version, sha256}` появляется в JSON; в legacy — нет.
+    if let Some(p) = &profile {
+        gateway::calc_profile::set_effective_calc_profile(p.version, p.sha256.clone());
+    }
 
     Ok(server::ServeConfig {
         addr,
@@ -3331,6 +3285,18 @@ pub fn admission_policy_from_env(
 ) -> Result<admission::AdmissionPolicy, String> {
     use admission::{AdmissionPolicy, LiveProfile};
 
+    // M-94: в режиме профиля `canonical_bands` = полосы профиля (милестоун §3.1,
+    // последний абзац: «канонический набор допуска РАВЕН полосам профиля»).
+    // `gateway::calc_profile::canonical_bands_or_profile` делает это в одном
+    // месте — НЕ держим копию разбора полос (запрет §5: дублирование разборщиков).
+    let profile = gateway::calc_profile::load_from_env(&get)
+        .map_err(|e| format!("GATEWAY_CALC_PROFILE invalid: {e}"))?;
+    if profile.is_some() {
+        gateway::calc_profile::check_no_env_overrides(&get)?;
+    }
+    let canonical_bands: Vec<f64> =
+        gateway::calc_profile::canonical_bands_or_profile(&get, profile.as_ref())?;
+
     let allowed_symbols: Vec<String> = get("GATEWAY_ALLOWED_SYMBOLS")
         .ok_or_else(|| "GATEWAY_ALLOWED_SYMBOLS must be set".to_string())?
         .split(',')
@@ -3341,59 +3307,31 @@ pub fn admission_policy_from_env(
         return Err("GATEWAY_ALLOWED_SYMBOLS must contain at least one symbol".to_string());
     }
 
-    let canonical_bands: Vec<f64> = get("GATEWAY_CANONICAL_BANDS")
-        .unwrap_or_else(|| {
-            // Прод-дефолт: семь канонических полос (`П-029`, 2026-09-10).
-            "0.015,0.03,0.05,0.08,0.15,0.30,0.60".to_string()
-        })
-        .split(',')
-        .map(|s| s.trim().parse::<f64>())
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| format!("GATEWAY_CANONICAL_BANDS parse: {e}"))?;
-    if canonical_bands.is_empty() {
-        return Err("GATEWAY_CANONICAL_BANDS must contain at least one band".to_string());
-    }
-
-    let allowed_profiles: Vec<LiveProfile> = get("GATEWAY_ALLOWED_PROFILES")
-        .ok_or_else(|| "GATEWAY_ALLOWED_PROFILES must be set".to_string())?
-        .split(',')
-        .map(|s| {
-            let parts: Vec<&str> = s.trim().split('/').collect();
-            if parts.len() < 2 || parts.len() > 3 {
-                return Err(format!(
-                    "GATEWAY_ALLOWED_PROFILES entry {s:?} must be `tf/window[/cadence]`; \
-                     cadence = number или `none`"
-                ));
-            }
-            let tf: i64 = parts[0].trim().parse().map_err(|e| {
-                format!(
-                    "GATEWAY_ALLOWED_PROFILES timeframe_ms parse {:?}: {e}",
-                    parts[0]
-                )
-            })?;
-            let window: i64 = parts[1].trim().parse().map_err(|e| {
-                format!(
-                    "GATEWAY_ALLOWED_PROFILES window_ms parse {:?}: {e}",
-                    parts[1]
-                )
-            })?;
-            let cadence: Option<i64> = match parts.get(2).map(|s| s.trim()) {
-                Some(s) if s.eq_ignore_ascii_case("none") => None,
-                Some(s) => Some(s.parse().map_err(|e| {
-                    format!(
-                        "GATEWAY_ALLOWED_PROFILES depth_cadence_ms parse {:?}: {e}",
-                        s
-                    )
-                })?),
-                None => None,
-            };
-            Ok(LiveProfile {
-                timeframe_ms: tf,
-                window_ms: window,
-                depth_cadence_ms: cadence,
+    // M-94: `allowed_profiles` живёт в профиле (милестоун §3.1). Разбор — через
+    // `gateway::calc_profile::parse_allowed_profiles` (единственный дом, `A-049` Р-6);
+    // отображение `RawLiveProfile` → `LiveProfile` — здесь, на стороне `gateway-serve`.
+    let allowed_profiles: Vec<LiveProfile> = if let Some(p) = &profile {
+        p.allowed_profiles
+            .iter()
+            .map(|rp: &gateway::calc_profile::RawLiveProfile| LiveProfile {
+                timeframe_ms: rp.timeframe_ms,
+                window_ms: rp.window_ms,
+                depth_cadence_ms: rp.depth_cadence_ms,
             })
-        })
-        .collect::<Result<Vec<_>, String>>()?;
+            .collect()
+    } else {
+        let raw = get("GATEWAY_ALLOWED_PROFILES")
+            .ok_or_else(|| "GATEWAY_ALLOWED_PROFILES must be set".to_string())?;
+        gateway::calc_profile::parse_allowed_profiles(&raw)
+            .map_err(|e| format!("GATEWAY_ALLOWED_PROFILES invalid: {e}"))?
+            .into_iter()
+            .map(|rp| LiveProfile {
+                timeframe_ms: rp.timeframe_ms,
+                window_ms: rp.window_ms,
+                depth_cadence_ms: rp.depth_cadence_ms,
+            })
+            .collect()
+    };
     if allowed_profiles.is_empty() {
         return Err("GATEWAY_ALLOWED_PROFILES must contain at least one profile".to_string());
     }
