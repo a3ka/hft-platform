@@ -3082,8 +3082,18 @@ RssAnon: gateway-serve 3 288 kB, recorder 12 064 kB; CPU выдачи 0 %
 **Реестр.** Заведены `TD-244`…`TD-248` (неблокирующие находки `R-245`/`R-246`/`R-247`/`A-052`;
 карточки — в `TECH-DEBT.md`). `docs/ROADMAP.md` — «Состояние» строки S1a-P.
 
-**Остатки (не блокируют закрытие).** На architect'е: перенос спеки и гейта `M-94` в
-`docs/archive/` по `Р-2` (колонка Status §11 спеки устарела — `R-247` N-3); уточнения
+**Переезд по `Р-2` — исполнен** (reviewer, 2026-10-08, `R-248` APPROVE, PR #331, merge
+`5770416`): спека, гейт и проба карты CI — в `docs/archive/`, колонка Status §11 — DONE
+(`R-247` N-3 закрыт); ссылки в оракулах, скриптах и `crates/gateway/src/calc_profile.rs` —
+на архивный путь; урок окна миграции — `docs/workflow/host-migration-order.md`. Одна ссылка
+осталась висячей вне зоны барьера — `config/calc-profile/active.env:8` (`TD-249`).
+§8: push-CI 37857079885 на `5770416` упал на флаке `red_m89_warm_resume_seek` w1 (то же
+дерево зелено в PR-прогоне 37855398287; `TD-250`), перезапуск — success; Deploy 37859108302
+success (23:25Z): `hft-recorder`/`hft-gateway-serve` healthy, на VPS `5770416`, heartbeat
+свежий, журнал растёт, сердцебиение выдачи `calc_profile.version == 1`, sha256 `a6ca51bf…` =
+`active.env`; RssAnon recorder 7 MB.
+
+**Остатки (не блокируют закрытие).** Уточнения
 `gates.md` §0 по `A-051` §3 / `A-052` §4 п.5 ждут founder'а. Слепок `ckpt-b0f1ed89ec2ec142.bin`
 больше никто не прогревает; удаление слепков спекой запрещено (§5) — лежит до решения.
 Копия `/root/hft-platform/.env.bak-m94` хранит прежнюю строку (и секрет) — удалить после
