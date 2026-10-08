@@ -1,5 +1,5 @@
 //! Сторож `M-94` (sacred, architect-only) — **поле `calc_profile` в сердцебиении выдачи не
-//! ломает читателя `ops-watchdog`** (`П-032` п.4 (а); спека `milestones/M-94-calc-profile.md`
+//! ломает читателя `ops-watchdog`** (`П-032` п.4 (а); спека `docs/archive/M-94-calc-profile.md`
 //! §3.6, оракул `o1`).
 //!
 //! Сердцебиение `gateway-serve` получает аддитивный объект `"calc_profile": {"version",
