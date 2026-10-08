@@ -433,34 +433,6 @@ fn run_profile_mode(args: Args, profile_path: &Path) -> ExitCode {
     //    `gateway-serve` — host `.env` → compose, `M-90`).
     let selector = selector_from_profile(&profile, args.venue, args.symbol.clone());
 
-    // 6. M-47 (GW-I-10, TD-046): fail-closed гвард. Дублирует `validate_selector`
-    //    в библиотеке — здесь он СРАЗУ ЖЕ после сборки, до `advance_to`, чтобы
-    //    `ckpt_path_for` дал корректное имя.
-    if selector.timeframe_ms <= 0 || 86_400_000 % selector.timeframe_ms != 0 {
-        eprintln!(
-            "gateway-checkpoint: GATEWAY_TIMEFRAME_MS={} (из профиля) не выравнен на границу \
-             UTC-суток (требуется > 0 и 86_400_000 % timeframe_ms == 0)",
-            selector.timeframe_ms
-        );
-        return ExitCode::from(2);
-    }
-    if selector.depth_cadence_ms.unwrap_or(0) < 1000
-        || 86_400_000 % selector.depth_cadence_ms.unwrap_or(0) != 0
-    {
-        eprintln!(
-            "gateway-checkpoint: GATEWAY_DEPTH_CADENCE_MS={} (из профиля) невалидно: \
-             требуется >= 1000 и выравнено на границу UTC-суток",
-            selector.depth_cadence_ms.unwrap_or(0)
-        );
-        return ExitCode::from(2);
-    }
-
-    // 7. NaN guard (M-38b): фингерпринт селектора использует `to_bits()`; NaN != NaN.
-    if selector.bands.iter().any(|b| b.is_nan()) {
-        eprintln!("gateway-checkpoint: bands из профиля содержат NaN — фингерпринт нестабилен.");
-        return ExitCode::from(2);
-    }
-
     // 8. M-94 §3.6 (б) / `p6` / `P-032` п.4: записать `<слепок>.profile` с
     //    `version` и `sha256` БАЙТОВ файла, АТОМАРНО (`.tmp` → `rename`), ПОСЛЕ
     //    успешной записи слепка. Проверка `p6`: на неуспешном прогоне
@@ -587,16 +559,6 @@ fn write_profile_sidecar(
 // ══════════════════════════════════════════════════════════════════════════════
 
 fn run_legacy_mode(args: Args) -> ExitCode {
-    // GW-I-10 (M-47, TD-046): fail-closed гвард на СТАРТЕ прод-бинаря.
-    let timeframe_ms = args.timeframe_ms;
-    if timeframe_ms <= 0 || 86_400_000 % timeframe_ms != 0 {
-        eprintln!(
-            "gateway-checkpoint: GATEWAY_TIMEFRAME_MS={timeframe_ms} не выравнен на границу \
-             UTC-суток (требуется > 0 и 86_400_000 % timeframe_ms == 0)"
-        );
-        return ExitCode::from(2);
-    }
-
     // M-68 задача 23 (R-141 Б-1): источник каденции — env GATEWAY_DEPTH_CADENCE_MS
     // (тот же, что у `gateway-serve`). M-94 (задача 12): ОБЩАЯ грамматика с
     // профилем (`R-245` B-1) — `parse_depth_cadence_ms`. Пустая строка в env
@@ -630,11 +592,6 @@ fn run_legacy_mode(args: Args) -> ExitCode {
         window_ms: args.window_ms,
         depth_cadence_ms: Some(cadence_raw),
     };
-
-    if selector.bands.iter().any(|b| b.is_nan()) {
-        eprintln!("gateway-checkpoint: bands содержат NaN — фингерпринт нестабилен.");
-        return ExitCode::from(2);
-    }
 
     let achieved_cursor = match checkpoint::advance_to(
         &args.dir,
