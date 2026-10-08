@@ -592,6 +592,30 @@ jobs:
       - name: Проба барьера (счёт печатает сама проба)
         run: bash scripts/tests/red_review_fa.sh
 
+  calc-profile:
+    name: Calc profile (M-94 — профиль расчётов меняется со ссылкой на подпись)
+    runs-on: ubuntu-latest
+    steps:
+      # fetch-depth: 0 ОБЯЗАТЕЛЬНО: барьер обходит диапазон `$BASE..HEAD` покоммитно (`git rev-list`)
+      # и читает файлы на каждом коммите; при depth=1 диапазон пуст и барьер зеленел бы всегда —
+      # тот же класс, что у docs-freeze.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # П-032 п.3: правка `config/calc-profile/**` — только со строкой
+      # `CALC-PROFILE-DECISION: П-NNN` в ТЕЛЕ коммита (заголовок `## П-NNN` существует в
+      # docs/PENDING-SIGNATURE.md на том же коммите) и ростом CALC_PROFILE_VERSION. База — ИЗ
+      # СОБЫТИЯ, fail-closed (образец docs-freeze).
+      - name: Барьер изменения профиля расчётов
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: bash scripts/check_calc_profile.sh
+      # Проба ТОЙ ЖЕ проводкой: миры в песочных git-репозиториях + батарея мутантов барьера
+      # (каждый обязан уронить хотя бы один мир); число сценариев печатает проба.
+      - name: Проба барьера профиля расчётов
+        run: bash scripts/tests/red_calc_profile.sh
   rollout-composition:
     name: Rollout composition (состав записи = подписанному, TD-196)
     runs-on: ubuntu-latest
@@ -629,11 +653,11 @@ jobs:
   status-check:
     name: All checks passed
     runs-on: ubuntu-latest
-    needs: [build-test, security, delivery, protected-artifacts, secret-material, roadmap-sync, contracts, docs-freeze, archived-refs, artifact-ids, reserve-ids, design-claims, context-budgets, gate-meta, deploy-catchup, review-fa, resource-oracles, rollout-composition]
+    needs: [build-test, security, delivery, protected-artifacts, secret-material, roadmap-sync, contracts, docs-freeze, archived-refs, artifact-ids, reserve-ids, design-claims, context-budgets, gate-meta, deploy-catchup, review-fa, resource-oracles, rollout-composition, calc-profile]
     if: always()
     steps:
       - run: |
-          if [[ "${{ needs.build-test.result }}" != "success" || "${{ needs.security.result }}" != "success" || "${{ needs.delivery.result }}" != "success" || "${{ needs.protected-artifacts.result }}" != "success" || "${{ needs.secret-material.result }}" != "success" || "${{ needs.roadmap-sync.result }}" != "success" || "${{ needs.contracts.result }}" != "success" || "${{ needs.docs-freeze.result }}" != "success" || "${{ needs.archived-refs.result }}" != "success" || "${{ needs.artifact-ids.result }}" != "success" || "${{ needs.reserve-ids.result }}" != "success" || "${{ needs.design-claims.result }}" != "success" || "${{ needs.context-budgets.result }}" != "success" || "${{ needs.gate-meta.result }}" != "success" || "${{ needs.deploy-catchup.result }}" != "success" || "${{ needs.review-fa.result }}" != "success" || "${{ needs.resource-oracles.result }}" != "success" || "${{ needs.rollout-composition.result }}" != "success" ]]; then
+          if [[ "${{ needs.build-test.result }}" != "success" || "${{ needs.security.result }}" != "success" || "${{ needs.delivery.result }}" != "success" || "${{ needs.protected-artifacts.result }}" != "success" || "${{ needs.secret-material.result }}" != "success" || "${{ needs.roadmap-sync.result }}" != "success" || "${{ needs.contracts.result }}" != "success" || "${{ needs.docs-freeze.result }}" != "success" || "${{ needs.archived-refs.result }}" != "success" || "${{ needs.artifact-ids.result }}" != "success" || "${{ needs.reserve-ids.result }}" != "success" || "${{ needs.design-claims.result }}" != "success" || "${{ needs.context-budgets.result }}" != "success" || "${{ needs.gate-meta.result }}" != "success" || "${{ needs.deploy-catchup.result }}" != "success" || "${{ needs.review-fa.result }}" != "success" || "${{ needs.resource-oracles.result }}" != "success" || "${{ needs.rollout-composition.result }}" != "success" || "${{ needs.calc-profile.result }}" != "success" ]]; then
             echo "One or more checks failed"; exit 1
           fi
           echo "All checks passed"

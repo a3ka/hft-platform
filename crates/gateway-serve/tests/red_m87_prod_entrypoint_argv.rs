@@ -110,6 +110,51 @@ fn compose_env() -> BTreeMap<String, String> {
     out
 }
 
+/// `M-94` (`П-032`): если compose объявляет `GATEWAY_CALC_PROFILE`, путь ВНУТРИ образа
+/// отображается на файл репозитория по строке `COPY config/calc-profile/ <dst>` финальной
+/// стадии `Dockerfile` (так процесс его и получает), а ключи профиля возвращаются — они считаются
+/// объявленными прод-описанием наравне с `environment:`. Без переменной (до `M-94`) — пусто, и
+/// оракул ведёт себя как прежде.
+fn map_calc_profile(env: &mut BTreeMap<String, String>) -> BTreeMap<String, String> {
+    let Some(container) = env.get("GATEWAY_CALC_PROFILE").cloned() else {
+        return BTreeMap::new();
+    };
+    let docker = std::fs::read_to_string(repo_root().join("Dockerfile")).expect("Dockerfile");
+    let lines: Vec<&str> = docker.lines().collect();
+    let last_from = lines
+        .iter()
+        .rposition(|l| l.trim_start().to_ascii_uppercase().starts_with("FROM "))
+        .expect("SETUP-СТРАЖ: в Dockerfile нет FROM");
+    let dst = lines[last_from..]
+        .iter()
+        .map(|l| l.split_whitespace().collect::<Vec<_>>())
+        .find(|t| {
+            t.first().is_some_and(|c| c.eq_ignore_ascii_case("COPY"))
+                && t.iter()
+                    .any(|x| x.trim_end_matches('/') == "config/calc-profile")
+        })
+        .and_then(|t| t.last().map(|d| d.trim_end_matches('/').to_string()))
+        .expect(
+            "M-94: GATEWAY_CALC_PROFILE объявлен, но Dockerfile не доставляет config/calc-profile/",
+        );
+    let rel = container
+        .strip_prefix(&format!("{dst}/"))
+        .unwrap_or_else(|| panic!("M-94: {container} вне каталога образа {dst}"));
+    let file = repo_root().join("config/calc-profile").join(rel);
+    let text = std::fs::read_to_string(&file)
+        .unwrap_or_else(|e| panic!("M-94: профиль {} не читается: {e}", file.display()));
+    env.insert(
+        "GATEWAY_CALC_PROFILE".to_string(),
+        file.display().to_string(),
+    );
+    text.lines()
+        .map(str::trim)
+        .filter(|t| !t.is_empty() && !t.starts_with('#'))
+        .filter_map(|t| t.split_once('='))
+        .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+        .collect()
+}
+
 /// `${VAR:-default}` → `default`; `${VAR:?msg}` → подставляется проба (на проде это
 /// обязательная переменная оператора, её отсутствие — отдельный контур).
 fn subst_default(raw: &str) -> String {
@@ -232,9 +277,14 @@ fn run_with(env: &BTreeMap<String, String>, journal: &Path, ckpt: &Path) -> Run 
 /// обязательны в коде и отсутствуют в прод-описании.
 #[test]
 fn e3_compose_declares_every_required_policy_var() {
-    let env = compose_env();
+    let mut env = compose_env();
+    // M-94: переменная, объявленная профилем расчётов, объявлена прод-описанием.
+    let profile = map_calc_profile(&mut env);
     let required = required_policy_vars();
-    let missing: Vec<&String> = required.iter().filter(|k| !env.contains_key(*k)).collect();
+    let missing: Vec<&String> = required
+        .iter()
+        .filter(|k| !env.contains_key(*k) && !profile.contains_key(*k))
+        .collect();
     assert!(
         missing.is_empty(),
         "docker-compose.yml НЕ объявляет обязательные переменные политики: {missing:?}.\n\
@@ -251,7 +301,8 @@ fn e3_compose_declares_every_required_policy_var() {
 /// долгоживущий, и завершение — это и есть провал.
 #[test]
 fn e1_prod_binary_starts_on_compose_environment() {
-    let env = compose_env();
+    let mut env = compose_env();
+    let _ = map_calc_profile(&mut env); // M-94: путь профиля — на файл репозитория
     let journal = tempfile::tempdir().expect("journal tempdir");
     let ckpt = tempfile::tempdir().expect("ckpt tempdir");
     let r = run_with(&env, journal.path(), ckpt.path());
@@ -272,8 +323,14 @@ fn e1_prod_binary_starts_on_compose_environment() {
 #[test]
 fn e2_inconsistent_policy_refuses_to_start_naming_both_numbers() {
     let mut env = compose_env();
+    // M-94: ключи профиля в окружении при заданном профиле — отказ старта по ДРУГОЙ причине
+    // («наличие — отказ», П-032 п.1); пара порогов этого оракула ключом профиля не является.
+    let profile = map_calc_profile(&mut env);
     for (k, v) in required_policy_vars().iter().zip(std::iter::repeat("")) {
         let _ = v;
+        if profile.contains_key(k) {
+            continue;
+        }
         // Заполняем обязательные переменные заведомо валидными значениями…
         let val = match k.as_str() {
             "GATEWAY_ALLOWED_SYMBOLS" => "BTCUSDT",

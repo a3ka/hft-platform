@@ -184,45 +184,88 @@ fn heatmap_window_is_declared_in_compose() {
         .collect::<Vec<_>>()
         .join("\n");
 
-    // SETUP-СТРАЖ: блок обязан содержать соседнюю gateway-переменную. Иначе отсутствие нашей
-    // ничего не доказывает — мы могли прочитать не тот файл или не тот блок.
-    assert!(
-        block
-            .lines()
-            .any(|l| l.trim_start().starts_with("GATEWAY_BANDS:")),
-        "SETUP НЕ СОСТОЯЛСЯ: в блоке gateway-serve файла {} нет даже записи GATEWAY_BANDS — \
-         прочитан не тот файл или блок не извлечён, и вывод об отсутствии {VAR} был бы ложным \
-         при любой реализации",
-        compose.display()
-    );
-
-    let key = format!("{VAR}:");
-    let decl = block
+    // M-94 (`П-032`): если сервис объявляет `GATEWAY_CALC_PROFILE`, ручка окна живёт в ПРОФИЛЕ
+    // РАСЧЁТОВ (единственный носитель определения расчёта), а не в `environment:`; файл
+    // профиля доставляется в образ (`COPY config/calc-profile/` финальной стадии `Dockerfile`).
+    // Тогда «оператор может задать окно у сервиса, который его читает» = «окно объявлено в
+    // файле, на который указывает сервис». Без переменной (до M-94) — прежний путь.
+    let profile_line = block
         .lines()
-        .find(|l| l.trim_start().starts_with(&key))
-        .unwrap_or_else(|| {
+        .find(|l| l.trim_start().starts_with("GATEWAY_CALC_PROFILE:"));
+    let (decl, value_tok): (String, String) = if let Some(pl) = profile_line {
+        let container = pl
+            .split_once(':')
+            .map(|(_, v)| v.trim().trim_matches('"'))
+            .unwrap_or("");
+        let rel = container
+            .rsplit_once('/')
+            .map(|(_, f)| f)
+            .unwrap_or_else(|| panic!("M-94: путь профиля `{container}` без имени файла"));
+        let file = root.join("config/calc-profile").join(rel);
+        let ptext = std::fs::read_to_string(&file).unwrap_or_else(|e| {
             panic!(
-                "{VAR} не объявлен ЗАПИСЬЮ env в блоке gateway-serve ({}). Ручка, не доехавшая до \
-             деплоя, инертна: оператор не может задать окно, а все юнит-проверки при этом \
-             зелены — класс built-not-wired (gates.md §4 «Механизм на пути»). Упоминание в \
-             комментарии записью НЕ является",
-                compose.display()
+                "M-94: сервис указывает на профиль `{container}`, а {} не читается ({e}) — ручка                  окна недоставлена",
+                file.display()
             )
         });
+        let key = format!("{VAR}=");
+        let line = ptext
+            .lines()
+            .find(|l| l.trim_start().starts_with(&key))
+            .unwrap_or_else(|| {
+                panic!(
+                    "{VAR} не объявлен в профиле расчётов {} — сервис в режиме профиля его не                      получит (built-not-wired)",
+                    file.display()
+                )
+            })
+            .to_string();
+        let v = line
+            .split_once('=')
+            .map(|(_, v)| v.trim().to_string())
+            .unwrap_or_default();
+        (line, v)
+    } else {
+        // SETUP-СТРАЖ: блок обязан содержать соседнюю gateway-переменную. Иначе отсутствие нашей
+        // ничего не доказывает — мы могли прочитать не тот файл или не тот блок.
+        assert!(
+            block
+                .lines()
+                .any(|l| l.trim_start().starts_with("GATEWAY_BANDS:")),
+            "SETUP НЕ СОСТОЯЛСЯ: в блоке gateway-serve файла {} нет ни GATEWAY_CALC_PROFILE, ни \
+             записи GATEWAY_BANDS — прочитан не тот файл или блок не извлечён, и вывод об \
+             отсутствии {VAR} был бы ложным при любой реализации",
+            compose.display()
+        );
+        let key = format!("{VAR}:");
+        let decl = block
+            .lines()
+            .find(|l| l.trim_start().starts_with(&key))
+            .unwrap_or_else(|| {
+                panic!(
+                    "{VAR} не объявлен ЗАПИСЬЮ env в блоке gateway-serve ({}). Ручка, не доехавшая \
+                     до деплоя, инертна: оператор не может задать окно, а все юнит-проверки при \
+                     этом зелены — класс built-not-wired (gates.md §4 «Механизм на пути»). \
+                     Упоминание в комментарии записью НЕ является",
+                    compose.display()
+                )
+            })
+            .to_string();
+        // ЗНАЧЕНИЕ, а не только ключ: задача 4 требует величину, РАВНУЮ сегодняшней эффективной —
+        // расцепление не меняет данные ни на байт в момент внедрения (M-75 §5). Форма записи
+        // допускается любая из принятых соседями: литерал либо `${VAR:-<значение>}`.
+        let raw = decl.split_once(':').map(|(_, v)| v.trim()).unwrap_or("");
+        let v = raw
+            .strip_prefix("${")
+            .and_then(|s| s.strip_suffix('}'))
+            .and_then(|s| s.split_once(":-").or_else(|| s.split_once('-')))
+            .map(|(_, v)| v)
+            .unwrap_or(raw)
+            .to_string();
+        (decl, v)
+    };
 
-    // ЗНАЧЕНИЕ, а не только ключ: задача 4 требует величину, РАВНУЮ сегодняшней эффективной —
-    // расцепление не меняет данные ни на байт в момент внедрения (M-75 §5).
-    //
     // Сравнивается ЧИСЛО, а не подстрока: `contains("0.001")` истинно и для `0.00105`, то есть
-    // страж снова был бы ШИРЕ требования (`A-031` §1). Форма записи допускается любая из
-    // принятых соседями (`GATEWAY_BANDS`): литерал либо `${VAR:-<значение>}`.
-    let raw = decl.split_once(':').map(|(_, v)| v.trim()).unwrap_or("");
-    let value_tok = raw
-        .strip_prefix("${")
-        .and_then(|s| s.strip_suffix('}'))
-        .and_then(|s| s.split_once(":-").or_else(|| s.split_once('-')))
-        .map(|(_, v)| v)
-        .unwrap_or(raw);
+    // страж снова был бы ШИРЕ требования (`A-031` §1).
     let parsed: f64 = value_tok.trim().parse().unwrap_or_else(|_| {
         panic!(
             "значение записи `{decl}` не разбирается как число (токен {value_tok:?}). Гейт и \

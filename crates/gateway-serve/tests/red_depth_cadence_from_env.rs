@@ -228,6 +228,36 @@ fn knob_is_declared_for_both_services_in_compose() {
                 compose.display()
             )
         });
+        // M-94 (`П-032`): в режиме профиля ручка каденции живёт в ПРОФИЛЕ РАСЧЁТОВ, на который
+        // указывает служба (`GATEWAY_CALC_PROFILE`), а не в её `environment:`; что обе службы
+        // указывают на ОДИН профиль, пиннит `c1` (`red_m94_calc_profile_warmer`).
+        if let Some(line) = block
+            .lines()
+            .find(|l| l.trim_start().starts_with("GATEWAY_CALC_PROFILE:"))
+        {
+            let container = line
+                .split_once(':')
+                .map(|(_, v)| v.trim().trim_matches('"'))
+                .unwrap_or("");
+            let file_name = container.rsplit('/').next().unwrap_or("");
+            let file = root.join("config/calc-profile").join(file_name);
+            let ptext = std::fs::read_to_string(&file).unwrap_or_else(|e| {
+                panic!(
+                    "M-94: служба `{service}` указывает на профиль `{container}`, а {} не \
+                     читается ({e}) — ручка каденции недоставлена",
+                    file.display()
+                )
+            });
+            assert!(
+                ptext
+                    .lines()
+                    .any(|l| l.trim_start().starts_with(&format!("{VAR}="))),
+                "{VAR} не объявлена в профиле расчётов {} службы `{service}` — в режиме профиля \
+                 это единственный носитель каденции, и писатель с читателем разойдутся (`TD-044`)",
+                file.display()
+            );
+            continue;
+        }
         assert!(
             block.contains(VAR),
             "{VAR} не объявлена у службы `{service}` в {}. Проверять подстроку по ВСЕМУ файлу              нельзя: снятие ручки у ОДНОЙ службы оставляло страж зелёным, пока она объявлена              у другой (замер `R-145` Б-2). Писатель чекпоинта и читатель обязаны получить ОДНО              значение каденции — иначе `selector_fingerprint` расходится, слепок не находится,              и каждое подключение реплеит журнал целиком (`TD-044`)",

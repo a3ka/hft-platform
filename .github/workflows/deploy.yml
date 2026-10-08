@@ -260,58 +260,10 @@ jobs:
             git fetch -q origin main
             git reset --hard -q "$TARGET_SHA"
             echo "=== deploy $(git rev-parse --short HEAD) (prev $(git rev-parse --short "$PREV")) ==="
-            # M-48 (TD-048, B3): установить `deploy/cron.d/*` в `/etc/cron.d/`. Раньше файл в репо
-            # был инертен на проде (B3 reviewer PR-гейта: `grep -c gateway-checkpoint = 0`),
-            # и cron-чекпоинтер/retention-серии никогда не запускались по расписанию —
-            # ровно тот же класс «объявлено в репо ≠ работает в проде» (TD-048 наоборот,
-            # в M-38b это был сам бинарь; здесь — вызыватель). Идемпотентная установка:
-            # `install -m 0644` переписывает без изменения прав на уже установленный.
-            # Каждый файл из `deploy/cron.d/<name>` → `/etc/cron.d/hft-<name>` (префикс
-            # `hft-` чтобы не пересекаться с системными cron.d-записями). Префикс
-            # сохраняется в имени файла на VPS — порядок «чекпоинт ДО retention»
-            # подтверждается §8 замером на VPS (`grep gateway-checkpoint /etc/cron.d/*`).
-            # Перед установкой — ВАЛИДАЦИЯ каждого cron-файла `crontab -n` (тот же гейт D5,
-            # что и в cron-обёртках): если файл не устанавливается из-за cron-парсера,
-            # деплой ОБЯЗАН провалиться (fail-closed), а не закоммитить «текст в репо».
-            install_cron() {
-              local src="$1" name="$(basename "$1")"
-              # crontab -n — «dry-run», exit 0 если файл парсится cron'ом.
-              if ! crontab -n "$src"; then
-                echo "=== CRON INVALID (NOT INSTALLED): $src ===" >&2
-                crontab -n "$src" 2>&1 | head -5 >&2 || true
-                return 1
-              fi
-              sudo install -m 0644 "$src" "/etc/cron.d/hft-${name}"
-              echo "installed /etc/cron.d/hft-${name} (from $src)"
-            }
-            cron_failed=0
-            for src in deploy/cron.d/*; do
-              [ -f "$src" ] || continue
-              install_cron "$src" || cron_failed=1
-            done
-            if [ "$cron_failed" -ne 0 ]; then
-              echo "=== CRON INSTALL FAILED — aborting deploy ===" >&2
-              exit 1
-            fi
-            # M-28: поднимаем И gateway-serve (WS-транспорт, 24/7 default-profile). Health-gate
-            # ОБОИХ fail-closed (класс M-35: сервис в compose, но пайплайн его не стартовал/не проверял).
-            if docker compose up -d --build recorder gateway-serve \
-               && timeout 300 sh -c 'until [ "$(docker inspect -f "{{.State.Health.Status}}" hft-recorder 2>/dev/null)" = healthy ]; do sleep 5; done' \
-               && timeout 300 sh -c 'until [ "$(docker inspect -f "{{.State.Health.Status}}" hft-gateway-serve 2>/dev/null)" = healthy ]; do sleep 5; done'; then
-              echo "=== healthy (recorder + gateway-serve) — deployed $(git rev-parse --short HEAD) ==="
-              # M-93 (TD-231): сторож ops-watchdog — хостовый процесс; бинарь берётся из образа
-              # РАБОТАЮЩЕГО hft-recorder и атомарно кладётся в /usr/local/lib/hft/ops-watchdog
-              # (оттуда его зовёт cron). Отказ установки — красный деплой: тревоги без сторожа нет.
-              bash deploy/bin/install-watchdog.sh || { echo "=== WATCHDOG INSTALL FAILED ===" >&2; exit 1; }
-              docker image prune -f
-            else
-              echo "=== DEPLOY FAILED — logs + rollback to $(git rev-parse --short "$PREV") ==="
-              docker logs hft-recorder --tail 50 || true
-              docker logs hft-gateway-serve --tail 50 || true
-              git reset --hard -q "$PREV"
-              docker compose up -d --build recorder gateway-serve
-              # M-93: на хосте — сторож того образа, что реально крутится после отката; откат и так
-              # красный, поэтому отказ установки здесь не маскирует его причину (`|| true`).
-              bash deploy/bin/install-watchdog.sh || true
-              exit 1
-            fi
+            bash deploy/bin/deploy-apply.sh "$PREV"
+            # M-94 (C-280 R3, A-049): скрипт делает: build (TARGET), гейт профиля,
+            # валидация cron, установка cron, up обеих служб + ожидание healthy
+            # (A-049 Р-2), install watchdog (M-93), prune. Откат (cron+образ+up
+            # на PREV) при ЛЮБОМ отказе гейта/cron/health. Проба
+            # red_m94_deploy_apply.sh исполняет 13 миров в настоящем git-репо
+            # с заглушкой docker.

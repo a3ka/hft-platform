@@ -230,8 +230,13 @@ rm -f "$d/deploy/README.md"
 expect fail "S17 runbook'а нет" "$d" "нет файла"
 nd="${TMP}/s17-nogit"; mkdir -p "$nd/deploy"
 printf '`=== X ===`\n' > "$nd/deploy/README.md"; printf 'echo "=== X ==="\n' > "$nd/x.sh"
+# Мир «вне git» не зависит от хоста (`A-049` §4, тестер M-94 2026-10-06): на машине, где `/tmp`
+# или `$TMPDIR` сам лежит в git-дереве, `mktemp -d` давал «каталог внутри git» и SETUP-отказ.
+# `GIT_CEILING_DIRECTORIES=$TMP` запрещает git искать репозиторий выше `$TMP` — только для этого мира.
+export GIT_CEILING_DIRECTORIES="$TMP"
 git -C "$nd" rev-parse --is-inside-work-tree >/dev/null 2>&1 && bad "S17b SETUP НЕ СОСТОЯЛСЯ: каталог внутри git"
 expect fail "S17b корень — не рабочее дерево git" "$nd" "не рабочее дерево git"
+unset GIT_CEILING_DIRECTORIES
 
 # ── S18 извлечение (`R-236` Н-4/Н-6): хвост разорванной цитаты не склеивается с соседним
 #    маркером, setext-подчёркивание не маркер — честный маркер на той же строке проверен ──

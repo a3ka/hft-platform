@@ -156,56 +156,30 @@ services:
           cpus: "1.5"
           memory: 3G
     environment:
+      # M-94 (П-032, §3.4): GATEWAY_CALC_PROFILE — ЕДИНСТВЕННЫЙ источник определения
+      # расчёта выдачи. Файл `active.env` (восемь ключей + `CALC_PROFILE_VERSION`)
+      # доставляется в образ через `COPY config/calc-profile/ /etc/hft/calc-profile/`
+      # (финальная стадия `Dockerfile`). Ниже: ни одного ключа профиля в `environment:`
+      # — иначе «наличие — отказ» (`p3`/`s2`, оракулы на старт). `GATEWAY_JOURNAL_DIR`,
+      # `GATEWAY_ADDR`, политика допуска и сердцебиение — не профиль, остаются.
+      GATEWAY_CALC_PROFILE: /etc/hft/calc-profile/active.env
       # Loopback по умолчанию (deploy.MD §8: bind на loopback, внешний доступ через
       # reverse-proxy / ssh-tunnel; безопасный дефолт для проды).
       GATEWAY_ADDR: ${GATEWAY_ADDR:-127.0.0.1:8080}
       GATEWAY_JOURNAL_DIR: /journal
       GATEWAY_VENUE: ${GATEWAY_VENUE:-Binance}
       GATEWAY_SYMBOL: ${GATEWAY_SYMBOL:-BTCUSDT}
-      GATEWAY_TIMEFRAME_MS: ${GATEWAY_TIMEFRAME_MS:-1000}
-      # M-70 task #7 (П-014 п.4, research/data-quality/depth-verdict.md:15): канонический
-      # набор семи полос 1.5/3/5/8/15/30/60 % объявлен в `П-014` и ОСТАЁТСЯ ОЖИДАЕМЫМ ЗНАЧЕНИЕМ
-      # `GATEWAY_BANDS` на проде. Записью env (не комментарием) — verify_M-70 task #7 честно
-      # проверяет каждое значение в строке, чтобы потеря одной полосы не прошла как «почти
-      # включили». ПРОД-ДЕФОЛТ ВНИЗУ — УЗКИЙ (`0.001`), а не канонический: R-185 §1 показал,
-      # что после ресинка метка `liveness=confirmed` возвращается на первом же дальнем
-      # обновлении, пока книга между REST-охватом и этим уровнем ПУСТА. Включение полос
-      # откладывается до замера длительности этого полого окна на прод-журнале
-      # (R-185 §4: «включение — отдельным действием ПОСЛЕ замера»). Оператор включает
-      # канонический набор ОДНОЙ строкой в host `.env` (`GATEWAY_BANDS=0.015,0.03,0.05,0.08,
-      # 0.15,0.3,0.6`) — этот же дефолт ниже остаётся узким до решения.
-      GATEWAY_BANDS: ${GATEWAY_BANDS:-0.001}
-      GATEWAY_HEATMAP_WINDOW: ${GATEWAY_HEATMAP_WINDOW:-0.001}
-      # M-37 task #7c (анти-TD-020): прод-окно ОКНОВОГО reducer'а. Без активного окна
-      # gateway-serve дефолтит в `window_ms = None` = unbounded → снапшот ООМ-ит (TD-039
-      # воспроизводится через §8 E2E). 60s = ~60 бакетов в окне при `timeframe_ms=1000`,
-      # достаточно для 60 секунд истории + память O(окно), не O(длина журнала).
-      GATEWAY_WINDOW_MS: ${GATEWAY_WINDOW_MS:-60000}
       # M-65 (CT-RFC-09 §2.6, подпись founder'а 11.08 = 16): лимит подписок на одно
       # WS-соединение. Дефолт в коде совпадает, но в compose значение НЕ должно жить
       # неявным свойством бинаря — оператор видит его как конфиг (`gates.md` §8,
       # «значение снимается замером, а не воображается»). Невалидное значение (0,
       # отрицательное, нечисловое) ⇒ отказ старта (`R-057` §6 п.5 / `verify_M-65.sh` шаг L).
       GATEWAY_MAX_SUBSCRIPTIONS: ${GATEWAY_MAX_SUBSCRIPTIONS:-16}
-      # M-68 задача 22 (R-138 Б-3, решение founder'а 2026-08-27): каденция депт-серии —
-      # КОНФИГ, а не константа. Дефолт 1000 мс совпадает с прод-таймфреймом ⇒ поведение
-      # прода не меняется при включении (фильтр пропускает те же события, что сегодняшний
-      # `None`). Невалидное (мусор, `0`, `-1`, `1000.0`, `999`) ⇒ отказ старта с сообщением,
-      # называющим переменную (класс GW-I-14; см. `red_depth_cadence_from_env`).
-      GATEWAY_DEPTH_CADENCE_MS: ${GATEWAY_DEPTH_CADENCE_MS:-1000}
       # M-71 (`milestones/M-71-egress-cap.md` §5, PL-I-5): предел объёма ответа в байтах
       # сериализованной `SeriesBundle`. Невалидное/отсутствующее значение = отказ СТАРТА
       # (`PL-I-5` дословно: «отсутствие/невалидность лимита = отказ, не unbounded»).
       # Дефолт — 2 000 000 (founder 2026-08-26, §5.1).
       GATEWAY_MAX_RESPONSE_BYTES: ${GATEWAY_MAX_RESPONSE_BYTES:-2000000}
-      # M-86 (`milestones/M-86-vp-bin-width.md` §2.4): ширина корзины профиля объёма,
-      # e8. Дефолт РАБОЧИЙ — 0.25 USD (`25_000_000` e8, founder 2026-09-18, вариант A),
-      # без явной установки оператором. Замер `docs/plans/vp-frame-size-measurement-2026-09-18.md`:
-      # без сетки профиль занимает 87.41 % кадра (4 836 478 Б / 5 533 287 Б) и не
-      # доезжает до клиента вообще. Невалидное значение (0, отрицательное, нечисловое)
-      # ⇒ отказ старта с сообщением, называющим переменную (`A-015` §3 п.1, тот же
-      # fail-closed, что у `GATEWAY_MAX_RESPONSE_BYTES`).
-      GATEWAY_VP_BIN_WIDTH_E8: ${GATEWAY_VP_BIN_WIDTH_E8:-25000000}
       # M-38b (rev4, B3): путь к чекпоинт-тому на проде. unset → прямой rebuild
       # (dev-сценарий). На проде ОБЯЗАТЕЛЬНО = /ckpt, чтобы snapshot-при-подключении
       # не реплеил историю на 409 s (TD-044, ровно тот замер, который M-38b лечит).
@@ -216,27 +190,14 @@ services:
       # M-87 task #21 (`R-200` §B6): пять обязательных переменных политики допуска
       # (`admission_policy_from_env` отказывает СТАРТУ при отсутствии любой из них — `e1`
       # оракула точки входа). Дефолты согласованы:
-      #   * `GATEWAY_ALLOWED_SYMBOLS=BTCUSDT` — сегодняшний прод-инструмент; оператор
-      #     задаёт перечень через хост `.env` и ОБЯЗАН держать его согласованным с
-      #     `GATEWAY_SYMBOL` того же блока, иначе прод-селектор не пройдёт собственную
-      #     политику допуска (`admit` смотрит символ по `allowed_symbols`);
-      #   * `GATEWAY_ALLOWED_PROFILES=1000/60000/1000` — форма `tf/window/cadence`,
-      #     совпадает с прод-дефолтами `GATEWAY_TIMEFRAME_MS` / `GATEWAY_WINDOW_MS` /
-      #     `GATEWAY_DEPTH_CADENCE_MS` этого же блока. Покрытие обязано идти от прод-
-      #     значений, иначе прод-селектор не пройдёт собственную политику допуска (`admit`
-      #     смотрит `timeframe_ms`; `window_ms`/`cadence` — ограничения работы внутри
-      #     `LiveReducer`, проверяются отдельно);
+      #   * `GATEWAY_ALLOWED_SYMBOLS=BTCUSDT` — сегодняшний прод-инструмент;
       #   * `GATEWAY_MAX_CONCURRENT_SERVES=4` — согласован с лимитом `cpus: "1.5"` этого
-      #     сервиса (≈2.7 одновременных tokio-задач на CPU; `4` — практический потолок для
-      #     `current_thread` рантайма, не съедающий процессы у recorder'а);
+      #     сервиса;
       #   * ПАРА `GATEWAY_MAX_TAIL_EVENTS=255600` / `GATEWAY_EXPECTED_WARMUP_EVENTS=127800`
       #     обязана пройти `AdmissionPolicy::validate()` (`max_tail_events >= expected_warmup_events`,
-      #     иначе выдача отказывает 100% времени между прогревами). Замер `R-196` §14.1quinquies
-      #     на проде 2026-09-23: 142 события/с × 900 с (`*/15`) ≈ 127 800 за цикл. Порог
-      #     поставлен 255 600 (×2 от опоры, тот же запас, что и в `Default for AdmissionPolicy`),
-      #     опора 127 800 — ровно один цикл прогрева.
+      #     иначе выдача отказывает 100% времени между прогревами).
+      # `GATEWAY_ALLOWED_PROFILES` убран: ровно эта строка теперь в профиле.
       GATEWAY_ALLOWED_SYMBOLS: ${GATEWAY_ALLOWED_SYMBOLS:-BTCUSDT}
-      GATEWAY_ALLOWED_PROFILES: ${GATEWAY_ALLOWED_PROFILES:-1000/60000/1000}
       GATEWAY_MAX_CONCURRENT_SERVES: ${GATEWAY_MAX_CONCURRENT_SERVES:-4}
       GATEWAY_MAX_TAIL_EVENTS: ${GATEWAY_MAX_TAIL_EVENTS:-255600}
       GATEWAY_EXPECTED_WARMUP_EVENTS: ${GATEWAY_EXPECTED_WARMUP_EVENTS:-127800}
@@ -310,59 +271,26 @@ services:
       # `--cursor LATEST` — снимаем чекпоинт ДО хвоста; усечённый прогон возможен
       # через `--cursor <i64>` (задаётся в cron-обёртке для инкрементальных снапшотов).
       - --cursor=LATEST
-      # M-68 задача 23 (R-141 Б-1): каденция депт-серии читается ТОЙ ЖЕ env-переменной,
-      # что у `gateway-serve`. Без проводки писатель и читатель чекпоинта расходятся
-      # отпечатком селектора: имя файла чекпоинта есть `selector_fingerprint` (`depth_
-      # cadence_ms` входит в него), слепок не находится, и `gateway-serve` реплеит
-      # журнал целиком при каждом подключении (TD-044/R-029: сотни секунд задержки,
-      # против устранения которой строились M-38b/M-48/M-54). Дефолт 1000 совпадает
-      # с прод-таймфреймом ⇒ поведение прода не меняется.
-      #
-      # M-90 (TD-227): `--depth-cadence-ms` ОСТАВЛЕН как флаг в `command:`, потому что
-      # соседний оракул `red_checkpoint_bin_prod_argv::c3ter` (`crates/gateway/tests/
-      # red_checkpoint_bin_prod_argv.rs:531-`) имеет SETUP-GUARD, требующий присутствия
-      # `--depth-cadence-ms` в argv compose. Прочие пять осей (`--venue`/`--symbol`/
-      # `--timeframe-ms`/`--bands`/`--window-ms`) УБРАНЫ из `command:` — единый источник
-      # с сервером выдачи через `environment:` ниже (`GATEWAY_*` с дефолтами
-      # `gateway-serve`); cron-обёртка `deploy/bin/gateway-checkpoint-cron.sh` эти
-      # флаги тоже НЕ передаёт (I-3 спеки M-90: шесть `CHECKPOINT_*` селектора в её
-      # окружении ⇒ отказ).
-      - --depth-cadence-ms=${GATEWAY_DEPTH_CADENCE_MS:-1000}
+      # M-94 (П-032, §3.4): НИ ОДНОГО флага оси в `command:` — определение расчёта
+      # теперь живёт в `config/calc-profile/active.env`, и наличие любого из
+      # `--bands`/`--timeframe-ms`/`--window-ms`/`--depth-cadence-ms` поверх профиля
+      # — отказ СТАРТА (оракул `p4`). `red_checkpoint_bin_prod_argv::c3ter` обновлён
+      # под M-94 в той же задаче architect'а (коммит `cd9f73e`) — SETUP-GUARD на
+      # `--depth-cadence-ms` в compose отменён, фикстура смотрит на ОТСУТСТВИЕ.
     environment:
-      # M-90 (TD-227) — единый источник селектора с сервером выдачи. Все шесть осей
-      # `GATEWAY_*` объявлены в compose ОБЕИХ служб (`gateway-serve` и
-      # `gateway-checkpoint`) с ИДЕНТИЧНЫМИ дефолтами `${VAR:-default}` — это и есть
-      # «один источник». Бинарь `gateway-checkpoint` при отсутствии флага читает из
-      # `GATEWAY_*` (тот же путь, что и `--depth-cadence-ms` уже использует с
-      # `GATEWAY_DEPTH_CADENCE_MS`, M-68 задача 23): единый источник, флаг — надбавка
-      # оператора (явная команда поверх env).
-      #
-      # Имя файла чекпоинта — `selector_fingerprint` (`crates/gateway/src/lib.rs:4252-4274`),
-      # в него входят ВСЕ шесть осей. Если у прогревателя и сервера хотя бы одна ось
-      # разойдётся, имя не совпадёт, сервер не найдёт слепок и реплеит журнал целиком
-      # при КАЖДОМ подключении (TD-044/R-029: сотни секунд задержки). Один источник
-      # ЗАКРЫВАЕТ именно этот класс: до M-90 у полос был `GATEWAY_BANDS` в `.env` И
-      # `CHECKPOINT_BANDS=0.001` в cron-обёртке — и 8 суток каждый клиент получал
-      # `not_ready` при зелёных liveness-сигналах.
+      # M-94 (П-032, §3.4): GATEWAY_CALC_PROFILE — ЕДИНСТВЕННЫЙ источник определения
+      # расчёта для прогревателя. Параллельный `gateway-serve` через тот же путь
+      # (COPY `Dockerfile` кладёт `config/calc-profile/` в `/etc/hft/calc-profile/`).
+      # Никаких `GATEWAY_*` осей селектора здесь — иначе «наличие — отказ» (`p3`).
+      GATEWAY_CALC_PROFILE: /etc/hft/calc-profile/active.env
+      # M-90 (TD-227) — `GATEWAY_VENUE` и `GATEWAY_SYMBOL` НЕ входят в профиль
+      # (§3.1: восемь ключей — `CALC_PROFILE_VERSION` и семь `GATEWAY_*`, без VENUE/SYMBOL).
+      # Единый источник для них — host `.env` → compose у ОБЕИХ служб (M-90): при
+      # расхождении прогреватель пишет слепок по дефолту, сервер ищет по `.env` —
+      # имя слепка расходится, реплей журнала вместо тёплого старта (класс TD-227).
+      # Дефолты — те же, что у `gateway-serve` (`Binance`/`BTCUSDT`).
       GATEWAY_VENUE: ${GATEWAY_VENUE:-Binance}
       GATEWAY_SYMBOL: ${GATEWAY_SYMBOL:-BTCUSDT}
-      GATEWAY_TIMEFRAME_MS: ${GATEWAY_TIMEFRAME_MS:-1000}
-      # М-70 §5ter (handover 2026-09-04) + R-185 (2026-09-17): дефолт полос у
-      # `gateway-checkpoint` ОБЯЗАН идти через ТУ ЖЕ переменную `${GATEWAY_BANDS}`, что
-      # и у `gateway-serve`, иначе имя файла чекпоинта (детерминировано
-      # `selector_fingerprint`, куда полосы ВХОДЯТ) разойдётся между писателем и
-      # читателем ⇒ чекпоинт не найден ⇒ тёплый старт молча вырождается в холодный.
-      # ПРОД-ДЕФОЛТ — УЗКИЙ `0.001` (R-185 §1: включение отложено до замера длительности
-      # полого окна после ресинка; иначе метка `liveness=confirmed` приходит на
-      # заниженные числа, что запрещено `П-014`). Оператор включает канонический набор
-      # (`1.5/3/5/8/15/30/60 %`) ОДНОЙ строкой в host `.env` (`GATEWAY_BANDS=...`) —
-      # тот же дефолт ниже, что и у `gateway-serve`, остаётся узким.
-      GATEWAY_BANDS: ${GATEWAY_BANDS:-0.001}
-      GATEWAY_WINDOW_MS: ${GATEWAY_WINDOW_MS:-60000}
-      # M-68 задача 23 (R-141 Б-1): env-переменная объявлена в compose ОБЕИХ служб —
-      # писатель и читатель чекпоинта. Иначе (класс M-71 B-1) ручка живёт в коде и
-      # оператор её задать не может.
-      GATEWAY_DEPTH_CADENCE_MS: ${GATEWAY_DEPTH_CADENCE_MS:-1000}
     volumes:
       # RO-bind к журналу (JR-I-1) + RW-bind к чекпоинт-тому.
       - journal-data:/journal:ro

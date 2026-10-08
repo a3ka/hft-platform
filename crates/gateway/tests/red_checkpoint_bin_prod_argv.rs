@@ -109,6 +109,17 @@ fn compose_command_args(service: &str) -> Vec<String> {
 /// брать ОБЕ стороны из ОДНОГО источника — прод-файла, — иначе он согласовывает не прод, а
 /// свои собственные литералы (см. шапку `reader_selector`).
 fn compose_env_default(service: &str, key: &str) -> String {
+    compose_env_opt(service, key).unwrap_or_else(|| {
+        panic!(
+            "SETUP НЕ СОСТОЯЛСЯ: в docker-compose.yml нет переменной `{key}` у службы \
+             `{service}`. Оракул композиции обязан ЧИТАТЬ прод-настройку, а не догадываться \
+             о ней: зашитый литерал согласовывал бы тест сам с собой"
+        )
+    })
+}
+
+/// То же, что `compose_env_default`, но отсутствие ключа — `None` (M-94: признак режима профиля).
+fn compose_env_opt(service: &str, key: &str) -> Option<String> {
     let text = std::fs::read_to_string(compose_path()).expect("docker-compose.yml читается");
     let mut in_service = false;
     let mut in_env = false;
@@ -137,15 +148,52 @@ fn compose_env_default(service: &str, key: &str) -> String {
         }
         if let Some((k, v)) = t.split_once(':') {
             if k.trim() == key {
-                return subst_env_default(v.trim().trim_matches('"'));
+                return Some(subst_env_default(v.trim().trim_matches('"')));
             }
         }
     }
-    panic!(
-        "SETUP НЕ СОСТОЯЛСЯ: в docker-compose.yml нет переменной `{key}` у службы \
-         `{service}`. Оракул композиции обязан ЧИТАТЬ прод-настройку, а не догадываться \
-         о ней: зашитый литерал согласовывал бы тест сам с собой"
-    );
+    None
+}
+
+/// M-94 (`П-032`): профиль расчётов службы. `Some((файл репозитория, ключи))`, если служба
+/// объявляет `GATEWAY_CALC_PROFILE`; путь внутри образа отображается на файл по строке
+/// `COPY config/calc-profile/ <dst>` финальной стадии `Dockerfile` (так процесс его получает).
+/// `None` — служба не в режиме профиля (до M-94): оракул ведёт себя как прежде.
+fn calc_profile(service: &str) -> Option<(PathBuf, std::collections::BTreeMap<String, String>)> {
+    let container = compose_env_opt(service, "GATEWAY_CALC_PROFILE")?;
+    let root = compose_path().parent().expect("корень").to_path_buf();
+    let docker = std::fs::read_to_string(root.join("Dockerfile")).expect("Dockerfile");
+    let lines: Vec<&str> = docker.lines().collect();
+    let last_from = lines
+        .iter()
+        .rposition(|l| l.trim_start().to_ascii_uppercase().starts_with("FROM "))
+        .expect("SETUP НЕ СОСТОЯЛСЯ: в Dockerfile нет FROM");
+    let dst = lines[last_from..]
+        .iter()
+        .map(|l| l.split_whitespace().collect::<Vec<_>>())
+        .find(|t| {
+            t.first().is_some_and(|c| c.eq_ignore_ascii_case("COPY"))
+                && t.iter()
+                    .any(|x| x.trim_end_matches('/') == "config/calc-profile")
+        })
+        .and_then(|t| t.last().map(|d| d.trim_end_matches('/').to_string()))
+        .expect(
+            "M-94: GATEWAY_CALC_PROFILE объявлен, но Dockerfile не доставляет config/calc-profile/",
+        );
+    let rel = container
+        .strip_prefix(&format!("{dst}/"))
+        .unwrap_or_else(|| panic!("M-94: {container} вне каталога образа {dst}"));
+    let file = root.join("config/calc-profile").join(rel);
+    let text = std::fs::read_to_string(&file)
+        .unwrap_or_else(|e| panic!("M-94: профиль {} не читается: {e}", file.display()));
+    let map = text
+        .lines()
+        .map(str::trim)
+        .filter(|t| !t.is_empty() && !t.starts_with('#'))
+        .filter_map(|t| t.split_once('='))
+        .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+        .collect();
+    Some((file, map))
 }
 
 /// `${VAR:-default}` → `default`; `${VAR}` → пусто (в M-38b таких нет).
@@ -462,6 +510,18 @@ fn empty_journal_publishes_no_coverage_claim() {
 /// `depth_cadence_ms` НЕ выводится намеренно: это ось парного vantage — тест обязан уметь
 /// подать читателю ДРУГУЮ каденцию, чтобы предъявить, что она в отпечаток входит.
 fn reader_selector(cadence: Option<i64>) -> Selector {
+    // M-94: в режиме профиля величины определения расчёта читаются из ТОГО ЖЕ файла профиля,
+    // что получает служба выдачи; venue/symbol остаются в `environment:`.
+    let profile = calc_profile("gateway-serve").map(|(_, m)| m);
+    let from = |key: &str| -> String {
+        match &profile {
+            Some(m) => m
+                .get(key)
+                .cloned()
+                .unwrap_or_else(|| panic!("SETUP НЕ СОСТОЯЛСЯ: в профиле расчётов нет `{key}`")),
+            None => compose_env_default("gateway-serve", key),
+        }
+    };
     let venue_s = compose_env_default("gateway-serve", "GATEWAY_VENUE");
     // Фикстура покрывает одну площадку; смена venue в compose обязана быть ЗАМЕЧЕНА, а не
     // молча проигнорирована подстановкой `Venue::Binance`.
@@ -470,7 +530,7 @@ fn reader_selector(cadence: Option<i64>) -> Selector {
         "SETUP НЕ СОСТОЯЛСЯ: compose даёт gateway-serve venue `{venue_s}`, а фикстура умеет \
          только Binance — оракул судил бы не ту площадку"
     );
-    let bands: Vec<f64> = compose_env_default("gateway-serve", "GATEWAY_BANDS")
+    let bands: Vec<f64> = from("GATEWAY_BANDS")
         .split(',')
         .map(|b| {
             b.trim().parse::<f64>().unwrap_or_else(|e| {
@@ -483,7 +543,7 @@ fn reader_selector(cadence: Option<i64>) -> Selector {
         "SETUP НЕ СОСТОЯЛСЯ: GATEWAY_BANDS у gateway-serve пуст — сравнивать отпечатки не с чем"
     );
     let parse_ms = |key: &str| -> i64 {
-        let raw = compose_env_default("gateway-serve", key);
+        let raw = from(key);
         raw.parse::<i64>()
             .unwrap_or_else(|e| panic!("SETUP НЕ СОСТОЯЛСЯ: {key}=`{raw}` не число: {e}"))
     };
@@ -540,15 +600,36 @@ fn c3ter_writer_and_reader_agree_on_checkpoint() {
         ckpt.path(),
         &cov,
     );
-    // SETUP-GUARD: argv обязан НЕСТИ каденцию — иначе тест судит не композицию, а её отсутствие.
-    if !args.iter().any(|a| a.starts_with("--depth-cadence-ms")) {
+    // M-94: в режиме профиля каденция приходит писателю ИЗ ПРОФИЛЯ (флаг оси поверх профиля —
+    // отказ, П-032 п.1), и писатель запускается с путём профиля, отображённым на файл репозитория.
+    let writer_profile = calc_profile("gateway-checkpoint");
+    // SETUP-GUARD: каденция обязана ДОХОДИТЬ до писателя — иначе тест судит не композицию, а её
+    // отсутствие. До M-94 — флагом argv; в режиме профиля — ключом файла профиля.
+    let cadence_delivered = match &writer_profile {
+        Some((_, m)) => m.contains_key("GATEWAY_DEPTH_CADENCE_MS"),
+        None => args.iter().any(|a| a.starts_with("--depth-cadence-ms")),
+    };
+    if !cadence_delivered {
         panic!(
             "SETUP НЕ СОСТОЯЛСЯ: в argv службы gateway-checkpoint нет --depth-cadence-ms. \
              Композиция не может быть предъявлена: ручка не доходит до писателя, и это \
              ОТДЕЛЬНЫЙ дефект (задача 23), а не зелёный этого оракула. argv: {args:?}"
         );
     }
-    let w = run(&args);
+    let w = match &writer_profile {
+        Some((file, _)) => {
+            let o = Command::new(BIN)
+                .args(&args)
+                .env("GATEWAY_CALC_PROFILE", file)
+                .output()
+                .expect("запуск бинаря");
+            Run {
+                code: o.status.code(),
+                stderr: String::from_utf8_lossy(&o.stderr).to_string(),
+            }
+        }
+        None => run(&args),
+    };
     if w.code != Some(0) {
         panic!(
             "SETUP НЕ СОСТОЯЛСЯ: прод-писатель вышел с {:?}: {}",

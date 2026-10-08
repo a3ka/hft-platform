@@ -35,6 +35,11 @@ serde_json = "1"
 # через `libc::flock(LOCK_EX)` (POSIX, Linux/macOS). Windows-семантика не требуется
 # (compose-деплой только на linux). Зеркалит `journal` (тоже использует `libc::statvfs`).
 libc = "0.2"
+# M-94 (П-032 п.4): `sha256` от БАЙТОВ файла профиля (`config/calc-profile/active.env`) —
+# то, что отдаётся в сердцебиении выдачи и в `<слепок>.profile`. `sha2` (НЕ `sha1`/прочие)
+# выбран как де-факто стандарт и единственный алгоритм, о котором договорились между
+# писателем (`sha256sum` в оракулах) и читателем (`calc_profile::sha256_of_bytes`).
+sha2 = "0.10"
 
 [dev-dependencies]
 tempfile = "3"
