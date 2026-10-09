@@ -1575,18 +1575,40 @@ pub mod server {
                             // реализации (не чужой pump), и она должна быть АТОМАРНА
                             // с расчётом провенанса — между ними нет ни точки, ни
                             // чужого `pump` (свидетель в `red_m95_provenance_fresh`).
-                            let (is_fresh, _ops) =
-                                cat.is_fresh(&path_for_history).unwrap_or_default();
-                            if !is_fresh {
-                                let _ = cat.refresh(&path_for_history);
-                            }
-                            let (start, truncated) =
-                                gateway::checkpoint::current_history_provenance_with_catalog(
-                                    &cat,
-                                    &filter_for_history,
-                                );
+                            //
+                            // R-249 Б-1 (M-95 §3/§6, VB-I-11): отказ `is_fresh` ИЛИ
+                            // `refresh` НЕ глотается (`unwrap_or_default`, `let _ =`).
+                            // На ЛЮБОЙ `Err` свежесть каталога НЕ подтверждена ⇒
+                            // провенанс НЕ считается по этому каталогу: исход
+                            // `(frozen_start_seq, true)` — «не знаем, не обещаем»,
+                            // как `history_provenance_for_serve` до M-95 (M-87 задача 20,
+                            // оракул `red_m87_history_provenance_failclosed` `h3`/`h4`).
+                            // Мутант «вернуть `let _ =`» роняет оракулы `f3`/`f4` на
+                            // прод-пути выдачи (R-249 Б-1).
+                            let fresh_ok = cat
+                                .is_fresh(&path_for_history)
+                                .map(|(f, _ops)| f);
+                            let provenance_via_catalog = match fresh_ok {
+                                Ok(true) => Some(
+                                    gateway::checkpoint::current_history_provenance_with_catalog(
+                                        &cat,
+                                        &filter_for_history,
+                                    ),
+                                ),
+                                Ok(false) => match cat.refresh(&path_for_history) {
+                                    Ok(_ops) => Some(
+                                        gateway::checkpoint::current_history_provenance_with_catalog(
+                                            &cat,
+                                            &filter_for_history,
+                                        ),
+                                    ),
+                                    Err(_) => None, // R-249 Б-1: fail-closed
+                                },
+                                Err(_) => None, // R-249 Б-1: fail-closed
+                            };
                             live.put_segment_catalog(cat);
-                            (start, truncated)
+                            provenance_via_catalog
+                                .unwrap_or((snap.history_start_seq, true))
                         }
                         None => (snap.history_start_seq, true),
                     };
@@ -2390,16 +2412,37 @@ pub mod server {
                     // провенанса); на legacy каталог уже обновлён дренажем, и `is_fresh`
                     // здесь срабатывает только при изменении МЕЖДУ точкой и расчётом
                     // (то есть сделанном ТЕСТОМ в остановке).
-                    let (is_fresh, _ops) = cat.is_fresh(cfg1.journal_dir.as_path()).unwrap_or_default();
-                    if !is_fresh {
-                        let _ = cat.refresh(cfg1.journal_dir.as_path());
-                    }
-                    let (start, truncated) =
-                        crate::_gw::current_history_provenance_with_catalog(
-                            &cat, &cfg1.filter,
-                        );
+                    //
+                    // R-249 Б-1 (M-95 §3/§6, VB-I-11): отказ `is_fresh` ИЛИ `refresh`
+                    // НЕ глотается (`unwrap_or_default`, `let _ =`). На ЛЮБОЙ `Err`
+                    // свежесть каталога НЕ подтверждена ⇒ провенанс НЕ считается по
+                    // этому каталогу: исход `(frozen_start_seq, true)` — «не знаем,
+                    // не обещаем», как `history_provenance_for_serve` до M-95 (M-87
+                    // задача 20, оракул `red_m87_history_provenance_failclosed` `h3`/`h4`).
+                    // Мутант «вернуть `let _ =`» роняет оракул `f4` на legacy-пути
+                    // выдачи (R-249 Б-1).
+                    let fresh_ok = cat
+                        .is_fresh(cfg1.journal_dir.as_path())
+                        .map(|(f, _ops)| f);
+                    let provenance_via_catalog = match fresh_ok {
+                        Ok(true) => Some(
+                            crate::_gw::current_history_provenance_with_catalog(
+                                &cat, &cfg1.filter,
+                            ),
+                        ),
+                        Ok(false) => match cat.refresh(cfg1.journal_dir.as_path()) {
+                            Ok(_ops) => Some(
+                                crate::_gw::current_history_provenance_with_catalog(
+                                    &cat, &cfg1.filter,
+                                ),
+                            ),
+                            Err(_) => None, // R-249 Б-1: fail-closed
+                        },
+                        Err(_) => None, // R-249 Б-1: fail-closed
+                    };
                     live.put_segment_catalog(cat);
-                    (start, truncated)
+                    provenance_via_catalog
+                        .unwrap_or((snap.history_start_seq, true))
                 }
                 None => (snap.history_start_seq, true),
             };
