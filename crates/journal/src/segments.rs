@@ -3609,21 +3609,30 @@ pub(crate) fn resolve_next_seq_with(dir: &Path, meta_path: &Path) -> io::Result<
     }
 }
 
-/// M-89 (warm-resume, `I-1`): `seek_back_from_tail` — БЫСТРЫЙ путь для warm-resume
+/// M-96 (warm-resume, `I-1`, `TD-250`): `seek_back_from_tail` — БЫСТРЫЙ путь для warm-resume
 /// (`tail_hint = None`): известен `last_seq` (читаем последние ≤ 64 КиБ), известен
 /// `header_end` и `first_seq` (читаем заголовок). Средний размер кадра
 /// `(file_len − header_end) / (last_seq − first_seq + 1)`. Оценка позиции
-/// `after+1` = `file_len − (last_seq − after) × avg`. Ищем `after+1` в 8 КиБ вокруг
-/// оценки (byte-resync, CRC). Стоимость O(64 КиБ + 8 КиБ) НЕЗАВИСИМО от длины
-/// сегмента; bisection-fallback (когда `after+1` далеко от хвоста или avg
-/// сильно врёт на неравномерных кадрах) остаётся позади.
+/// `after+1` = `file_len − (last_seq − after) × avg`. Ищем `after+1` в 32 КиБ окне
+/// В ОБЕ СТОРОНЫ от оценки: начинаем за 16 КиБ ДО `approx_pos` (или от `header_end`,
+/// если файл короче) и читаем 32 КиБ; цель, отстоящая от оценки до 8 КиБ назад или
+/// вперёд, попадает в окно. Байт-ресинк с CRC и `postcard` — как раньше: кадры
+/// с `seq < after + 1` ПРОПУСКАЮТСЯ (идём дальше), кадр с `seq == after + 1`
+/// — найден, кадр с `seq > after + 1` — `Ok(None)` и откат на бисекцию. Стоимость
+/// `O(64 КиБ + 32 КиБ)` НЕЗАВИСИМО от длины сегмента; bisection-fallback (когда
+/// `after+1` далеко от хвоста или ошибка оценки больше окна) остаётся позади.
 ///
 /// **Возвращает:**
-/// - `Ok(Some(th))` — `after+1` найден в 8 КиБ вокруг оценки, гард `last_seq == after` (§5.2 п. 3)
-/// - `Ok(None)` — `last_seq < after+1` (хвост пуст) ИЛИ `after+1` не в окне
+/// - `Ok(Some(th))` — `after+1` найден в 32 КиБ окне вокруг оценки; гард
+///   `last_seq == after` (§5.2 п. 3) сохранён
+/// - `Ok(None)` — `last_seq < after+1` (хвост пуст) ИЛИ `after+1` вне 32 КиБ окна
 ///   (bisection пусть попробует дальше)
 /// - `Err(_)` — ошибка IO
 fn seek_back_from_tail(seg_path: &Path, after_seq: u64) -> io::Result<Option<TailHint>> {
+    // Размер окна поиска и его половина: накрывает ошибку оценки ±8 КиБ, не выходит
+    // за предел стоимости «хвост + 172 КиБ» (`C-291` B-1; замер 2026-10-09).
+    const WIN: usize = 32 * 1024;
+    const WIN_HALF: u64 = 16 * 1024;
     use std::io::{Read, Seek, SeekFrom};
     // 1. Заголовок: `header_end` (позиция после магии + SegmentHeader) + `first_seq`.
     let mut probe = File::open(seg_path)?;
@@ -3664,12 +3673,16 @@ fn seek_back_from_tail(seg_path: &Path, after_seq: u64) -> io::Result<Option<Tai
         .min(file_len.saturating_sub(header_end));
     let approx_pos = file_len.saturating_sub(approx_offset).max(header_end);
 
-    // 5. Прочитать 8 КиБ от `approx_pos` и найти `after+1` байт-ресинком с CRC.
+    // 5. Окно поиска 32 КиБ В ОБЕ СТОРОНЫ от `approx_pos`: начинаем за `WIN_HALF` ДО
+    // оценки (или от `header_end`, если сегмент короче) и читаем `WIN` байт. Цель,
+    // отстоящая от оценки до 8 КиБ назад или вперёд, гарантированно попадает в окно;
+    // вне окна — `Ok(None)` и откат на бисекцию, как раньше.
+    let win_start = approx_pos.saturating_sub(WIN_HALF).max(header_end);
     let mut f = File::open(seg_path)?;
-    if f.seek(SeekFrom::Start(approx_pos)).is_err() {
+    if f.seek(SeekFrom::Start(win_start)).is_err() {
         return Ok(None);
     }
-    let mut buf = vec![0u8; 8 * 1024];
+    let mut buf = vec![0u8; WIN];
     let n = f.read(&mut buf).unwrap_or(0);
     buf.truncate(n);
     drop(f);
@@ -3711,7 +3724,7 @@ fn seek_back_from_tail(seg_path: &Path, after_seq: u64) -> io::Result<Option<Tai
                     // `ev.seq` МЕНЬШЕ `last_seq` (не равно — иначе last_seq==after_seq+1,
                     // что для bisection-fallback'а уже выше отсечено; но для
                     // safety здесь — `last_seq >= ev.seq`, OK).
-                    let pos = approx_pos + i as u64;
+                    let pos = win_start + i as u64;
                     let seg_idx = parse_segment_index_or(seg_path);
                     return Ok(Some(TailHint {
                         seg_idx,
@@ -3719,8 +3732,9 @@ fn seek_back_from_tail(seg_path: &Path, after_seq: u64) -> io::Result<Option<Tai
                         pos,
                     }));
                 }
-                // seq монотонно растёт (JR-I-2). Дальше искать бессмысленно —
-                // `bisection` сам найдёт, если в файле.
+                // seq монотонно растёт (JR-I-2). Кадры с `seq < after + 1` ПРОПУСКАЮТСЯ
+                // (идём дальше — в окне их может быть несколько); `seq > after + 1` —
+                // `Ok(None)` и откат на бисекцию.
                 if ev.seq > target_seq {
                     return Ok(None);
                 }
