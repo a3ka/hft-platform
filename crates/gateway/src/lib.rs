@@ -4814,6 +4814,43 @@ pub mod checkpoint {
         sel: &Selector,
         filter: EpochFilter,
     ) -> Option<(Reducer, Cursor, CkptHeader)> {
+        read_and_validate_inner(bytes, dir, sel, filter, None)
+    }
+
+    /// M-95 (задача 1, TD-229): `read_and_validate`, принимающий уже построенный
+    /// `SegmentCatalog`. Семантика ИДЕНТИЧНА [`Self::read_and_validate`] — проверяются
+    /// magic / версии / длина / CRC / state decode / фингерпринты / lineage — с той
+    /// разницей, что lineage-сверка идёт по ПЕРЕИСПОЛЬЗОВАННОМУ каталогу, а не через
+    /// свежий `journal::list_segments(dir)`. Зачем: `LiveReducer::resume` строит каталог
+    /// РОВНО ОДИН раз на подписку (§3 спеки), и lineage ОБЯЗАН делить этот обход.
+    /// На непустом `catalog` (Segments присутствуют) — `validate_lineage_with_catalog` —
+    /// тот же `validate_lineage_inner`, что и путь через `list_segments`; иначе поведение
+    /// вырождается в исходное.
+    pub(super) fn read_and_validate_with_catalog(
+        bytes: &[u8],
+        dir: &Path,
+        sel: &Selector,
+        filter: EpochFilter,
+        catalog: &journal::SegmentCatalog,
+    ) -> Option<(Reducer, Cursor, CkptHeader)> {
+        read_and_validate_inner(bytes, dir, sel, filter, Some(catalog))
+    }
+
+    /// R-249 Н-3 (M-95 §6): единственный экземпляр валидации слепка. На `Some(cat)` —
+    /// lineage по ПЕРЕИСПОЛЬЗОВАННОМУ каталогу (M-95, один обход на подписку); на
+    /// `None` — через свежий `journal::list_segments(dir)`. Раньше это были две
+    /// ~70-строчные копии с расхождением только в шаге (10); любая правка правил
+    /// валидации (magic, версия, CRC, фингерпринты, lineage) была обязана попасть в
+    /// ОБЕ, и ничто этого не проверяло. Тонкие обёртки [`Self::read_and_validate`]
+    /// и [`Self::read_and_validate_with_catalog`] выбирают источник lineage и не
+    /// дублируют шаги (1)–(9) и (11).
+    fn read_and_validate_inner(
+        bytes: &[u8],
+        dir: &Path,
+        sel: &Selector,
+        filter: EpochFilter,
+        catalog: Option<&journal::SegmentCatalog>,
+    ) -> Option<(Reducer, Cursor, CkptHeader)> {
         if bytes.len() < 8 + 4 + 4 + 4 {
             return None;
         }
@@ -4878,100 +4915,19 @@ pub mod checkpoint {
         if header.epoch_filter_fingerprint != epoch_filter_fingerprint(&filter) {
             return None;
         }
-        // (10) journal_lineage — суффикс-совместимая валидация
-        if !validate_lineage(dir, &filter, &header.journal_lineage, header.cursor) {
+        // (10) journal_lineage — суффикс-совместимая валидация. Источник: `Some(cat)` —
+        //     ПЕРЕИСПОЛЬЗОВАННЫЙ каталог (M-95 §3, один обход на подписку); `None` —
+        //     свежий `journal::list_segments(dir)` (исходный путь).
+        let lineage_ok = match catalog {
+            Some(cat) => {
+                validate_lineage_with_catalog(cat, &filter, &header.journal_lineage, header.cursor)
+            }
+            None => validate_lineage(dir, &filter, &header.journal_lineage, header.cursor),
+        };
+        if !lineage_ok {
             return None;
         }
         // (11) cursor > at — это проверит вызывающий (ему виднее at).
-        Some((reducer, header.cursor, header))
-    }
-
-    /// M-95 (задача 1, TD-229): `read_and_validate`, принимающий уже построенный
-    /// `SegmentCatalog`. Семантика ИДЕНТИЧНА [`Self::read_and_validate`] — проверяются
-    /// magic / версии / длина / CRC / state decode / фингерпринты / lineage — с той
-    /// разницей, что lineage-сверка идёт по ПЕРЕИСПОЛЬЗОВАННОМУ каталогу, а не через
-    /// свежий `journal::list_segments(dir)`. Зачем: `LiveReducer::resume` строит каталог
-    /// РОВНО ОДИН раз на подписку (§3 спеки), и lineage ОБЯЗАН делить этот обход.
-    /// На непустом `catalog` (Segments присутствуют) — `validate_lineage_with_catalog` —
-    /// тот же `validate_lineage_inner`, что и путь через `list_segments`; иначе поведение
-    /// вырождается в исходное.
-    pub(super) fn read_and_validate_with_catalog(
-        bytes: &[u8],
-        dir: &Path,
-        sel: &Selector,
-        filter: EpochFilter,
-        catalog: &journal::SegmentCatalog,
-    ) -> Option<(Reducer, Cursor, CkptHeader)> {
-        if bytes.len() < 8 + 4 + 4 + 4 {
-            return None;
-        }
-        // (1) magic
-        if bytes[0..8] != CKPT_MAGIC {
-            return None;
-        }
-        // (2) ckpt_schema_version
-        let ckpt_v = u32::from_le_bytes(bytes[8..12].try_into().ok()?);
-        if ckpt_v != CKPT_SCHEMA_VERSION {
-            return None;
-        }
-        // (3) gateway_schema_version
-        let gw_v = u32::from_le_bytes(bytes[12..16].try_into().ok()?);
-        if gw_v != GATEWAY_SCHEMA_VERSION {
-            return None;
-        }
-        // (4) header_len + header_postcard
-        let header_len = u32::from_le_bytes(bytes[16..20].try_into().ok()?) as usize;
-        let header_end = 20 + header_len;
-        if bytes.len() < header_end + 4 {
-            return None;
-        }
-        let header: CkptHeader = match postcard::from_bytes(&bytes[20..header_end]) {
-            Ok(h) => h,
-            Err(_) => return None,
-        };
-        // (5) state_len + state_postcard
-        let state_len =
-            u32::from_le_bytes(bytes[header_end..header_end + 4].try_into().ok()?) as usize;
-        let state_end = header_end + 4 + state_len;
-        if bytes.len() < state_end {
-            return None;
-        }
-        // (6) CRC32 — для детерминизма идемпотентности. CRC по `header_bytes || state_bytes`
-        // (только postcard-сериализованные тела, без magic/версий/длин/state_len).
-        let mut hasher = crc32fast::Hasher::new();
-        hasher.update(&bytes[20..header_end]);
-        hasher.update(&bytes[header_end + 4..state_end]);
-        let expected_crc = hasher.finalize();
-        if bytes.len() < state_end + 4 {
-            return None;
-        }
-        let stored_crc = u32::from_le_bytes(bytes[state_end..state_end + 4].try_into().ok()?);
-        if expected_crc != stored_crc {
-            return None;
-        }
-        // (7) state decode
-        let mut reducer: Reducer = match postcard::from_bytes(&bytes[header_end + 4..state_end]) {
-            Ok(r) => r,
-            Err(_) => return None,
-        };
-        reducer.selector = sel.clone();
-
-        // (8) selector fingerprint
-        if header.selector_fingerprint != selector_fingerprint(sel) {
-            return None;
-        }
-        // (9) epoch_filter fingerprint
-        if header.epoch_filter_fingerprint != epoch_filter_fingerprint(&filter) {
-            return None;
-        }
-        // (10) journal_lineage — суффикс-совместимая валидация по ПЕРЕИСПОЛЬЗОВАННОМУ
-        //     каталогу (M-95 §3 — один обход на подписку).
-        if !validate_lineage_with_catalog(catalog, &filter, &header.journal_lineage, header.cursor)
-        {
-            return None;
-        }
-        // (11) cursor > at — это проверит вызывающий (ему виднее at).
-        let _ = dir; // намеренно НЕ читаем каталог; dir передан для совместимости сигнатуры.
         Some((reducer, header.cursor, header))
     }
 
