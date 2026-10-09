@@ -66,12 +66,28 @@ const SKEW: usize = 6;
 /// Хвост мира `t4`: перелёт ≈ `TAIL_FAR × SKEW` = 120 000 Б ≫ окна поиска.
 const TAIL_FAR: u64 = 20_000;
 const BIG_SEG: u64 = 1 << 30;
+/// Хвост миров `t5`/`t6`: ошибка оценки ≈ 5…7 КиБ — между 4 КиБ и 8 КиБ (`C-291` B-1). Окно
+/// уже 8 КиБ в нужную сторону её не накрывает, окно ≥ 8 КиБ — накрывает.
+const TAIL_MID: u64 = 1_000;
+/// Перекос `t5` (перелёт) и `t6` (недолёт), байт/кадр. Шум varint времени (хвост пишется позже ⇒
+/// его кадры на 0…2 Б длиннее) сдвигает ошибку на +0…2 000 Б: для `t5` вверх (5 000 → ≤7 000),
+/// для `t6` вниз (7 000 → ≥5 000). Фактическая ошибка сверяется setup-стражем `assert_error_band`.
+const SKEW_OVER: usize = 5;
+const SKEW_UNDER: usize = 7;
+/// Полоса ошибки оценки для `t5`/`t6`: строго между 4 КиБ и 8 КиБ с запасом 768 Б.
+const ERR_BAND: (i64, i64) = (4 * 1024 + 768, 8 * 1024 - 768);
 
-/// Граница стоимости БЫСТРОГО пути сверх байт хвоста: 256 КиБ. Замер на образце «окно 32 КиБ в обе
-/// стороны от оценки» (откачен): служебное чтение честного пути ≈ 161–164 КБ (хвостовой скан
-/// `last_seq` 64 КиБ, окно, заголовок, `journal.meta`, буферы чтения стрима). Откат на бисекцию на
-/// файле ≈5 МиБ — ≈ 680 КБ служебного (замер на `ad20a7e`: 701 463 Б при хвосте 25 000 Б).
-const FAST_PATH_OVERHEAD: u64 = 256 * 1024;
+/// Граница стоимости БЫСТРОГО пути сверх байт хвоста: 172 КиБ = 176 128 Б (`C-291` B-1).
+///
+/// Замер 2026-10-09 (`t1`, `t2`, `t3`; образцы откачены): служебное чтение честного пути —
+/// хвостовой скан `last_seq` 64 КиБ, окно, заголовок, `journal.meta`, буферы стрима — постоянно:
+/// окно 32 КиБ с началом за 16 КиБ до оценки — 164 237…164 732 Б; минимально допустимое окно
+/// (8 КиБ назад + 8 КиБ вперёд) — 147 841…148 354 Б; окно 64 КиБ (32 КиБ назад) — 188 737 Б.
+/// Предел ловит окно 64 КиБ (на 12 609 Б выше) и пропускает окно 32 КиБ (на 11 396 Б ниже). Чтение
+/// ВПЕРЁД за конец файла стоит 0 байт, поэтому мера стоимости ограничивает в первую очередь часть
+/// окна ПОЗАДИ оценки — она и есть цена. Откат на бисекцию на файле ≈5 МиБ — ≈ 676 КБ служебного
+/// (замер на `ad20a7e`: 701 463 Б при хвосте 25 000 Б).
+const FAST_PATH_OVERHEAD: u64 = 172 * 1024;
 /// Граница стоимости ОТКАТА на бисекцию сверх байт хвоста (`t4`): ⌈log2(5 МиБ / 64 КиБ)⌉ + 4 проб
 /// по 64 КиБ ≈ 11 × 64 КиБ, с запасом — 1 МиБ. Чтение файла целиком — ≈ 5 МиБ.
 const BISECT_OVERHEAD: u64 = 1024 * 1024;
@@ -209,6 +225,32 @@ fn assert_exact_tail(tag: &str, r: &Read, after: u64, tail: u64) {
     );
 }
 
+/// Ошибка оценки позиции, которую увидит реализация: `+` — оценка ПЕРЕЛЕТАЕТ цель (лежит дальше
+/// от начала, чем `after + 1`), `−` — не долетает. Оценка — как в коде (`§2` п. 1): от конца,
+/// `events_back × floor(байты кадров / N)`; заголовок сегмента (≈ сотня байт на 5 МиБ) меняет
+/// `floor` меньше чем на 1 Б и в оценке ошибки пренебрегается.
+fn estimate_error(dir: &Path, tail_bytes: u64, tail: u64) -> i64 {
+    let seg = only_segment(dir);
+    let file_len = std::fs::metadata(&seg).expect("meta").len();
+    let n = PREFIX + tail;
+    let avg = file_len / n;
+    tail_bytes as i64 - (tail * avg) as i64
+}
+
+/// Setup-страж мира `t5`/`t6`: модуль ошибки — в `ERR_BAND`, знак — заданный.
+fn assert_error_band(tag: &str, err: i64, overshoot: bool) {
+    let ok_sign = if overshoot { err > 0 } else { err < 0 };
+    let m = err.abs();
+    if !(ok_sign && m >= ERR_BAND.0 && m <= ERR_BAND.1) {
+        setup_failed(&format!(
+            "{tag}: ошибка оценки {err} Б вне полосы ±[{}, {}] (знак: {}) — мир не различает окно              < 8 КиБ и ≥ 8 КиБ",
+            ERR_BAND.0,
+            ERR_BAND.1,
+            if overshoot { "перелёт" } else { "недолёт" }
+        ));
+    }
+}
+
 fn tail_symbol(delta: isize) -> String {
     let n = (BASE_SYMBOL.len() as isize + delta) as usize;
     let s: String = "BTCUSDTXYZWQRSTUV".chars().take(n).collect();
@@ -307,6 +349,43 @@ fn t4_overshoot_beyond_window_falls_back_to_bisection_not_full_scan() {
         "M-96: перелёт ≈{} Б — первый сдвиг прочитал {} Б при хвосте {tail_bytes} Б, сверх отката \
          на бисекцию ({BISECT_OVERHEAD} Б): поиск читает префикс, а не пробует log-число окон",
         TAIL_FAR as usize * SKEW,
+        r.rchar
+    );
+}
+
+/// `t5` — перелёт ≈ 5…7 КиБ (`C-291` B-1): окно, начатое меньше чем за 8 КиБ ДО оценки, цель не
+/// накрывает ⇒ бисекция ⇒ RED по стоимости. Требование §3: не меньше 8 КиБ назад.
+#[test]
+fn t5_overshoot_between_4_and_8_kib_needs_8_kib_back() {
+    let (dir, after, tail_bytes) = fixture(PREFIX, TAIL_MID, &tail_symbol(SKEW_OVER as isize));
+    let err = estimate_error(dir.path(), tail_bytes, TAIL_MID);
+    assert_error_band("t5", err, true);
+    let r = subject(dir.path(), after);
+    assert_exact_tail("t5", &r, after, TAIL_MID);
+    assert!(
+        r.rchar <= tail_bytes + FAST_PATH_OVERHEAD,
+        "M-96 / C-291 B-1: оценка перелетает цель на {err} Б (между 4 и 8 КиБ) — первый сдвиг \
+         прочитал {} Б при хвосте {tail_bytes} Б, сверх быстрого пути ({FAST_PATH_OVERHEAD} Б). \
+         Окно назад от оценки уже 8 КиБ (§3)",
+        r.rchar
+    );
+}
+
+/// `t6` — недолёт ≈ 5…7 КиБ: окно, кончающееся меньше чем через 8 КиБ ПОСЛЕ оценки, цель не
+/// накрывает. Требование §3: не меньше 8 КиБ вперёд.
+#[test]
+fn t6_undershoot_between_4_and_8_kib_needs_8_kib_forward() {
+    let (dir, after, tail_bytes) = fixture(PREFIX, TAIL_MID, &tail_symbol(-(SKEW_UNDER as isize)));
+    let err = estimate_error(dir.path(), tail_bytes, TAIL_MID);
+    assert_error_band("t6", err, false);
+    let r = subject(dir.path(), after);
+    assert_exact_tail("t6", &r, after, TAIL_MID);
+    assert!(
+        r.rchar <= tail_bytes + FAST_PATH_OVERHEAD,
+        "M-96 / C-291 B-1: оценка не долетает до цели на {} Б (между 4 и 8 КиБ) — первый сдвиг \
+         прочитал {} Б при хвосте {tail_bytes} Б, сверх быстрого пути ({FAST_PATH_OVERHEAD} Б). \
+         Окно вперёд от оценки уже 8 КиБ (§3)",
+        -err,
         r.rchar
     );
 }
