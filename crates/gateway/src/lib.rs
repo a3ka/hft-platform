@@ -5781,23 +5781,6 @@ impl LiveReducer {
         self.cursor
     }
 
-    /// M-95 (задача 1, §3 спеки, `VB-I-11`): отдать ССЫЛКУ на per-session
-    /// `SegmentCatalog`, построенный `resume()`. Используется транспортом
-    /// (`gateway-serve`) для двух вещей:
-    /// 1. `is_fresh`/`refresh` — дешёвая проверка свежести каталога НЕПОСРЕДСТВЕННО
-    ///    перед расчётом провенанса (чтобы ранний сегмент, удалённый ретеншеном
-    ///    между `resume` и snapshot'ом, дал честный `truncated = true`).
-    /// 2. `current_history_provenance_with_catalog` — расчёт `history_start_seq` /
-    ///    `history_truncated` по тому же каталогу, без второго `list_segments`.
-    ///
-    /// `None` — кеш ещё не построен (например, если `resume` упал на `SegmentCatalog::open`).
-    /// В этом случае вызывающий ОБЯЗАН упасть на безопасный путь
-    /// (`(frozen, true)`, как [`Self::history_provenance_for_serve`]) и НЕ делать
-    /// повторного `list_segments` (это тот же обход, который мы устраняем).
-    pub fn segment_catalog(&self) -> Option<&journal::SegmentCatalog> {
-        self.segment_catalog.as_ref()
-    }
-
     /// M-95 (задача 1, §3 спеки): забрать `SegmentCatalog` из редуктора владением.
     /// Используется транспортом, чтобы передать каталог в `is_fresh` (мутабельно)
     /// и/или положить обратно (`is_fresh` требует `&mut`). На прод-пути НЕ
