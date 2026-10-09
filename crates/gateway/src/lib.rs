@@ -5375,13 +5375,12 @@ impl LiveReducer {
         // is_honestly_marked`, `crates/gateway-serve/tests/red_ws_honesty_sessions.rs` —
         // сценарий БЕЗ чекпоинта на журнале с удалённым первым сегментом).
         //
-        // M-95 (задача 1, §3 спеки): провенанс на cold-пути считается по ТОМУ ЖЕ каталогу,
-        // что построен в начале `resume` (см. блок выше с `SegmentCatalog::open(dir)`).
-        // Это дешевле, чем ходить по всем сегментам в поисках первого события.
-        let (history_start_seq, history_truncated) = match catalog.as_ref() {
-            Some(cat) => checkpoint::current_history_provenance_with_catalog(cat, &filter),
-            None => (0, false),
-        };
+        // R-249 Н-4 (M-95 §3/§6, VB-I-11): холодный путь `resume` НЕ использует
+        // каталог для провенанса. Источник — seq ПЕРВОГО РЕАЛЬНО свёрнутого события
+        // из `journal::stream` ниже, КАК ДО M-95. `header.first_seq` каталога НЕ
+        // подходит: у legacy-сегментов он синтезирован нулём (TD-030), и `truncated`
+        // соврал бы о честности. На `Err` построения каталога — НЕ `(0, false)`:
+        // провенанс строится из стрима независимо от судьбы каталога.
         let mut stream = journal::stream(dir, filter)?;
         let mut first_seq: Option<u64> = None;
         for event in &mut stream {
@@ -5390,6 +5389,12 @@ impl LiveReducer {
                 first_seq = Some(event.seq);
             }
         }
+        // R-249 Н-4: источник провенанса холодного пути — `first_seq` из стрима
+        // (первое реально свёрнутое событие), а не `header.first_seq` каталога.
+        let (history_start_seq, history_truncated) = match first_seq {
+            Some(seq) => (seq, seq > 0),
+            None => (0, false),
+        };
         // M-68 (TD-158): `depth_levels_visited = 0` — здесь НЕТ `Reducer::apply`-прохода
         // (только холостой обход ради честных `events_*`/`segment_meta_ops` и провенанса
         // истории, `full` заполняется следующим `pump()`).
@@ -5409,11 +5414,10 @@ impl LiveReducer {
         // `red_m87_read_volume_truth::q2` ловит оба варианта против независимого `rchar`
         // ядра.
         stats.payload_bytes_read = payload_bytes_for_dir(dir).unwrap_or(0);
-        // Совместимость с pre-M-95 семантикой cold-пути: «провенанс как seq первого
-        // свёрнутого события» — оба источника (catalog и stream) дают ОДНО И ТО ЖЕ на
-        // здоровом журнале. Здесь catalog-провенанс побеждает: на `Err` сегментов он
-        // сводится к `(0, false)` (как `first_visible_seq` в `current_history_provenance`).
-        let _ = first_seq; // не используется — catalog-провенанс эквивалентен и дешевле.
+        // R-249 Н-4: `first_seq` ИСПОЛЬЗУЕТСЯ выше как источник провенанса холодного
+        // пути (`history_start_seq`/`history_truncated`); `let _ = first_seq` снят —
+        // ранее строка была заглушкой для версии «catalog-провенанс побеждает» (M-95
+        // задача 1, до R-249). Теперь источник единственный и он из стрима.
         Ok((
             Self {
                 vwap: VwapAcc::default(),
