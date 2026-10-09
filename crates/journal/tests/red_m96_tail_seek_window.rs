@@ -226,15 +226,26 @@ fn assert_exact_tail(tag: &str, r: &Read, after: u64, tail: u64) {
 }
 
 /// Ошибка оценки позиции, которую увидит реализация: `+` — оценка ПЕРЕЛЕТАЕТ цель (лежит дальше
-/// от начала, чем `after + 1`), `−` — не долетает. Оценка — как в коде (`§2` п. 1): от конца,
-/// `events_back × floor(байты кадров / N)`; заголовок сегмента (≈ сотня байт на 5 МиБ) меняет
-/// `floor` меньше чем на 1 Б и в оценке ошибки пренебрегается.
+/// от начала, чем `after + 1`), `−` — не долетает. Арифметика — ТОЧНО та же, что в
+/// `seek_back_from_tail` (`crates/journal/src/segments.rs`, `C-294` B-1): `header_end` из заголовка
+/// сегмента, `avg = floor((file_len − header_end) / (last − first + 1))`, `approx_offset =
+/// min(events_back × avg, file_len − header_end)`, `approx_pos = max(file_len − approx_offset,
+/// header_end)`. Цель — начало кадра `after + 1` = `file_len − байты хвоста` (хвост дописан
+/// последним, `fixture`).
 fn estimate_error(dir: &Path, tail_bytes: u64, tail: u64) -> i64 {
     let seg = only_segment(dir);
-    let file_len = std::fs::metadata(&seg).expect("meta").len();
-    let n = PREFIX + tail;
-    let avg = file_len / n;
-    tail_bytes as i64 - (tail * avg) as i64
+    let data = std::fs::read(&seg).expect("read segment");
+    let file_len = data.len() as u64;
+    let he = common::header_end(&data) as u64;
+    if he == 0 {
+        setup_failed("сегмент без заголовка v2 — арифметика оценки не воспроизводима");
+    }
+    let total_events = PREFIX + tail; // first = 0, last = PREFIX + tail − 1
+    let avg = (file_len - he) / total_events;
+    let approx_offset = (tail * avg).min(file_len - he);
+    let approx_pos = (file_len - approx_offset).max(he);
+    let target = file_len - tail_bytes;
+    approx_pos as i64 - target as i64
 }
 
 /// Setup-страж мира `t5`/`t6`: модуль ошибки — в `ERR_BAND`, знак — заданный.
