@@ -361,7 +361,7 @@ for t in db_i_7_canonical_bands_from_env_reach_the_selector \
   chk "grep -qE '^(async )?fn ${t}' crates/gateway-serve/tests/red_depth_bands_delivery.rs"
 done
 # СТОРОЖ «прод-дефолт `GATEWAY_BANDS` в compose РОВНО `0.001`» СНЯТ ОСОЗНАННО (`П-032` п.6,
-# `milestones/M-94-calc-profile.md` задача 10). Основания: (1) решение о включении семи полос
+# `docs/archive/M-94-calc-profile.md` задача 10). Основания: (1) решение о включении семи полос
 # исполнено на проде 2026-09-20 (строкой host `.env`, `docs/fa/viz-backend.md` §2); (2) после
 # M-94 у полос НЕТ дефолта в compose вовсе — единственный носитель состава есть профиль расчётов
 # `config/calc-profile/active.env`, а ключ полос в `environment:` любого сервиса запрещён

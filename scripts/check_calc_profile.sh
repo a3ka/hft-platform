@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # scripts/check_calc_profile.sh — профиль расчётов меняется только со ссылкой на подпись founder'а
-# и ростом версии (M-94 задача 9, `П-032` п.3; спека `milestones/M-94-calc-profile.md` §3.8).
+# и ростом версии (M-94 задача 9, `П-032` п.3; спека `docs/archive/M-94-calc-profile.md` §3.8).
 #
 # Инвариант: для КАЖДОГО коммита проверяемого диапазона, чей дифф (с merge-cc содержимым) трогает
 # `config/calc-profile/**`:
