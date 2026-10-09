@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "venue": "Binance",
+  "provenance": "Binance spot, базовый тир Regular User (VIP0, <1M USD 30d volume, БЕЗ BNB-скидки): maker 0.100% / taker 0.100%. Источник: https://www.binance.com/en/fee/schedule (проверено 2026-07-10). rate ×1e8: 0.001 → 100000. Консервативно: скидки (BNB-25%) намеренно НЕ учтены (D7 пессимизм).",
+  "maker_rate_e8": 100000,
+  "taker_rate_e8": 100000
+}
