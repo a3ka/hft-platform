@@ -491,10 +491,12 @@ async fn f2_legacy_retention_between_catalog_and_provenance_is_honest() {
 /// Каталог журнала, закрытый на ЧТЕНИЕ списка (`0300`: `stat`/открытие по пути работают,
 /// `read_dir` — нет). Права возвращаются при выходе из области — иначе `TempDir` не уберёт каталог,
 /// а сервер следующего мира не прочтёт журнал.
-struct UnlistableDir(std::path::PathBuf);
+/// Хранит ИСХОДНЫЙ режим каталога и возвращает именно его (`C-292` примечание).
+struct UnlistableDir(std::path::PathBuf, u32);
 impl UnlistableDir {
     fn seal(dir: &std::path::Path) -> Self {
         use std::os::unix::fs::PermissionsExt;
+        let orig = std::fs::metadata(dir).expect("stat").permissions().mode() & 0o7777;
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o300)).expect("chmod 0300");
         // Setup-страж: под root `chmod` не запрещает чтение — отказ обновления каталога не
         // смоделирован, и мир молча мерил бы f1.
@@ -503,13 +505,13 @@ impl UnlistableDir {
             "SETUP НЕ СОСТОЯЛСЯ: read_dir каталога журнала удался после chmod 0300 (прогон под \
              root?) — отказ обновления каталога не смоделирован"
         );
-        UnlistableDir(dir.to_path_buf())
+        UnlistableDir(dir.to_path_buf(), orig)
     }
 }
 impl Drop for UnlistableDir {
     fn drop(&mut self) {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(self.1));
     }
 }
 
