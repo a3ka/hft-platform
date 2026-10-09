@@ -487,3 +487,122 @@ async fn f2_legacy_retention_between_catalog_and_provenance_is_honest() {
          провенансом, снимок говорит «история полная»: {body}"
     );
 }
+
+/// Каталог журнала, закрытый на ЧТЕНИЕ списка (`0300`: `stat`/открытие по пути работают,
+/// `read_dir` — нет). Права возвращаются при выходе из области — иначе `TempDir` не уберёт каталог,
+/// а сервер следующего мира не прочтёт журнал.
+struct UnlistableDir(std::path::PathBuf);
+impl UnlistableDir {
+    fn seal(dir: &std::path::Path) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o300)).expect("chmod 0300");
+        // Setup-страж: под root `chmod` не запрещает чтение — отказ обновления каталога не
+        // смоделирован, и мир молча мерил бы f1.
+        assert!(
+            std::fs::read_dir(dir).is_err(),
+            "SETUP НЕ СОСТОЯЛСЯ: read_dir каталога журнала удался после chmod 0300 (прогон под \
+             root?) — отказ обновления каталога не смоделирован"
+        );
+        UnlistableDir(dir.to_path_buf())
+    }
+}
+impl Drop for UnlistableDir {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+    }
+}
+
+/// **`f3` — v1: ретеншен удалил префикс И проверка свежести/обновление каталога ОТКАЗАЛИ
+/// (`R-249` Б-1).** Исход обязан быть `(frozen_start_seq, true)` — «не знаем, не обещаем»
+/// (`VB-I-11`, M-87 задача 20, оракул `red_m87_history_provenance_failclosed` `h3`/`h4` — на
+/// функции, которую путь выдачи после M-95 не зовёт). Мутант «отбросить ошибку `refresh`
+/// (`let _ =`) / `is_fresh(..).unwrap_or_default()`» ⇒ провенанс по устаревшему каталогу ⇒
+/// «история полная» ⇒ FAILED.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn f3_v1_catalog_refresh_failure_is_fail_closed() {
+    let _serial = SERIAL.lock().await;
+    gateway_serve::server::set_effective_grace_ms(5_000);
+    let (dir, ckpt, earliest) = fixture();
+    let ch = "m95-catalog:s3".to_string();
+    rendezvous::arm(&ch);
+    let _g = Guard(ch.clone());
+    let addr = start(dir.path(), ckpt.path()).await;
+    let w = std::sync::Arc::new(Watcher::start(dir.path()));
+    let earliest_name = "segment-00000000.jrnl.zst".to_string();
+    let baseline = w.opens_of(&earliest_name);
+    let mut ws = connect(&addr).await;
+    ws.send(Message::Text(
+        json!({"op":"subscribe","v":1,"id":"s3","selector":{
+            "venue":"Binance","symbol":"BTCUSDT","timeframe_ms":1000,
+            "bands":SEVEN.to_vec(),"window_ms":60000,"depth_cadence_ms":1000}})
+        .to_string(),
+    ))
+    .await
+    .expect("send");
+    let chc = ch.clone();
+    let e = earliest.clone();
+    let wc = w.clone();
+    let en = earliest_name.clone();
+    let jd = dir.path().to_path_buf();
+    let sealed = tokio::task::spawn_blocking(move || {
+        let mut sealed = None;
+        pause_and(&chc, &wc, &en, baseline, || {
+            std::fs::remove_file(&e).expect("удаление раннего сегмента (как retention-prune)");
+            append(&jd, TAIL_END, AT_PAUSE); // свидетель места (`A-050` A2)
+            sealed = Some(UnlistableDir::seal(&jd)); // R-249 Б-1: обновление каталога откажет
+        });
+        sealed
+    })
+    .await
+    .expect("pause");
+    let body = snapshot_body(&mut ws).await;
+    drop(sealed);
+    assert_point_right_before_provenance(&body, "v1", false);
+    assert!(
+        truncated(&body),
+        "M-95 / R-249 Б-1 / VB-I-11: префикс удалён, обновление каталога ОТКАЗАЛО, а снимок говорит \
+         «история полная» — ошибка проверки свежести проглочена, провенанс посчитан по устаревшему \
+         каталогу. Обязан: на любой Err проверки свежести/обновления — (frozen_start_seq, true): {body}"
+    );
+}
+
+/// **`f4` — legacy: то же требование, что `f3`, канал `m95-catalog:legacy`.**
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn f4_legacy_catalog_refresh_failure_is_fail_closed() {
+    let _serial = SERIAL.lock().await;
+    let (dir, ckpt, earliest) = fixture();
+    gateway_serve::server::set_effective_grace_ms(200);
+    let ch = "m95-catalog:legacy".to_string();
+    rendezvous::arm(&ch);
+    let _g = Guard(ch.clone());
+    let addr = start(dir.path(), ckpt.path()).await;
+    let w = std::sync::Arc::new(Watcher::start(dir.path()));
+    let earliest_name = "segment-00000000.jrnl.zst".to_string();
+    let baseline = w.opens_of(&earliest_name);
+    let mut ws = connect(&addr).await;
+    let chc = ch.clone();
+    let e = earliest.clone();
+    let wc = w.clone();
+    let en = earliest_name.clone();
+    let jd = dir.path().to_path_buf();
+    let sealed = tokio::task::spawn_blocking(move || {
+        let mut sealed = None;
+        pause_and(&chc, &wc, &en, baseline, || {
+            std::fs::remove_file(&e).expect("удаление раннего сегмента (как retention-prune)");
+            append(&jd, TAIL_END, AT_PAUSE); // свидетель места (`A-050` A2)
+            sealed = Some(UnlistableDir::seal(&jd));
+        });
+        sealed
+    })
+    .await
+    .expect("pause");
+    let body = snapshot_body(&mut ws).await;
+    drop(sealed);
+    assert_point_right_before_provenance(&body, "legacy", true);
+    assert!(
+        truncated(&body),
+        "M-95 / R-249 Б-1 / VB-I-11: legacy-путь — префикс удалён, обновление каталога ОТКАЗАЛО, \
+         снимок говорит «история полная»: {body}"
+    );
+}
