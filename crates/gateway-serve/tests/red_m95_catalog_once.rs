@@ -1,5 +1,5 @@
 //! RED `M-95` (sacred, architect-only) — **одна подписка обходит каталог журнала ОДИН раз**
-//! (`TD-229`; спека `milestones/M-95-catalog-once.md`).
+//! (`TD-229`; спека `docs/archive/M-95-catalog-once.md`).
 //!
 //! # Дефект — замер (`R-211` §4.2 на проде; клон architect'а 2026-10-05 на фикстуре)
 //!
