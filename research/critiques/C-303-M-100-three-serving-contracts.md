@@ -6,7 +6,7 @@ audited_head: 3c1d690200da778231f77ec79165d9a4ef033877
 verdict: REJECT
 -->
 
-# C-297 — M-100 three serving contracts: REJECT
+# C-303 — M-100 three serving contracts: REJECT
 
 ## Scope and subject
 
