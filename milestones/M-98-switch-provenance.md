@@ -105,8 +105,8 @@ NOTE 1 (разбор кода арбитром) · спека `docs/archive/M-95
 | ID | мир | ожидание | на `a660b3a7` |
 |---|---|---|---|
 | `s0` | журнал цел; точка SWITCH пройдена без действия | `truncated == false` | **RED по точке** — `m98-switch-catalog:s0` не наступает; требование `truncated == false` выполнено (страж «всегда `true`») |
-| `s1` | ранний `.zst` удалён между первым снимком и переподпиской | `truncated == true`, `history_start_seq > 0` | **RED**: `truncated = false` (провенанс слепка) |
-| `s2` | удаление + дописка свидетеля В ТОЧКЕ SWITCH | `truncated == true`; `upto_seq < TAIL_END` | **RED** — точка не наступает |
+| `s1` | ранний `.zst` удалён между первым снимком и переподпиской | `truncated == true`, `history_start_seq` == seq первого события `journal::stream` после удаления (независимый эталон, `C-297` B1) | **RED**: `truncated = false` (провенанс слепка) |
+| `s2` | удаление + дописка свидетеля В ТОЧКЕ SWITCH | `truncated == true`; `upto_seq < TAIL_END`; `history_start_seq` == тот же эталон | **RED** — точка не наступает |
 | `s3` | то же + каталог журнала `0300` (`is_fresh` → `Err`) | `truncated == true` | **RED** — точка не наступает |
 | `s4` | три ранних `.zst` удалены, один оставшийся `000` (`is_fresh` → `Ok(false)`, `refresh` → `Err`; setup-страж сверяет оба исхода тем же публичным `SegmentCatalog`) | `truncated == true` | **RED** — точка не наступает |
 
@@ -116,26 +116,32 @@ NOTE 1 (разбор кода арбитром) · спека `docs/archive/M-95
 расчётом нет догона» — свидетель места (`A-050` A2: события, дописанные в остановке, в снимок не
 попадают).
 
-**Проверено исполнением на `a660b3a7`** (временный прототип реализации в SWITCH-ветке — блок
-ADD-ветки с точкой `m98-switch-catalog:<id>`, переключатель мутантов через переменную окружения;
-откачен `git checkout`, в набор не входит):
+**Таблица мутаций ИСПОЛНЯЕМА и входит в гейт (`C-297` B2)** — `scripts/tests/red_m98_mutants.sh`:
+временный worktree на HEAD (текущие тесты), `lib.rs` транспорта с ЗАКРЕПЛЁННОЙ базы `a660b3a7`,
+поверх — `scripts/tests/m98/prototype.patch` (прототип по §3 с точкой `m98-switch-catalog:<id>`;
+мутант выбирается `M98_MUT`). Продуктовый код не трогается, патч применим и после реализации
+dev'а. Fail-closed: патч не применился, исполнено не ровно 5 сценариев, набор красных ≠
+объявленному — FAIL.
 
-| реализация | `s0` | `s1` | `s2` | `s3` | `s4` |
-|---|---|---|---|---|---|
-| сегодняшний код (`a660b3a7`) | FAILED (точки нет) | **FAILED** (провенанс слепка) | FAILED (точки нет) | FAILED (точки нет) | FAILED (точки нет) |
-| прототип по §3 (свежесть → расчёт, `Err` ⇒ `(frozen, true)`) | ok | ok | ok | ok | ok |
-| расчёт по каталогу БЕЗ `is_fresh`/`refresh` | ok | ok | **FAILED** | **FAILED** | **FAILED** |
-| `Err` у `is_fresh` и `refresh` проглочены (`let _ =`) | ok | ok | ok | **FAILED** | **FAILED** |
-| «на SWITCH всегда `(frozen, true)`» | **FAILED** | **FAILED** (`history_start_seq = 0`) | ok | ok | ok |
+| мир | `M98_MUT` | красны (объявлено = измерено) |
+|---|---|---|
+| базовый код `a660b3a7` | — | `s0 s1 s2 s3 s4` (`s1` по дефекту, прочие — нет точки) |
+| прототип по §3 | — | нет |
+| провенанс без `is_fresh`/`refresh` | `nofresh` | `s2 s3 s4` |
+| `Err` `is_fresh`/`refresh` проглочен | `swallow` | `s3 s4` |
+| на SWITCH всегда `(frozen, true)` | `alwaystrue` | `s0 s1 s2` |
+| начало истории = 1 при усечении | `startone` | `s1 s2` — закрытие `C-297` B1 |
 
-Сверх таблицы — как обязан ловиться набор (не исполнено, держится конструкцией помощников,
-перенесённых из `red_m95_provenance_fresh` вместе с их доказательством в `M-95`): точка ДО
-`resume` ⇒ сторож inotify (`C-285`); точка ДО догона при провенансе без своей проверки свежести
-⇒ свидетель места (`A-050` A2).
+Первый прогон воспроизводителя поймал МОЁ устаревшее ожидание (`alwaystrue` объявлялся `s0 s1`;
+после B1 его ловит и `s2` — точный эталон начала): воспроизводитель не вакуумен, ожидание
+исправлено по замеру.
+
+Сверх таблицы — держится конструкцией помощников, перенесённых из `red_m95_provenance_fresh`:
+точка ДО `resume` ⇒ сторож inotify (`C-285`); точка ДО догона ⇒ свидетель места (`A-050` A2).
 
 ## 9. Acceptance — `scripts/verify_M-98.sh`
 
-Агрегатор с FAIL-счётчиком, решение по коду возврата. Шаги: `task1` — `red_m98_switch_provenance`;
+Агрегатор с FAIL-счётчиком, решение по коду возврата. Шаги: `task1` — `red_m98_switch_provenance` и воспроизводитель таблицы мутаций `red_m98_mutants.sh`;
 `I-2` — `red_m95_provenance_fresh`, `red_m87_provenance_on_add_path`; `I-3` — `red_ws_session`;
 паритет с CI — карта по образцу `verify_M-96.sh` (`A-043`, временная копия до `TD-222`), проба
 карты `scripts/tests/red_verify_M-98_ci_map.sh`; `task2` — SKIP (§8, reviewer).
@@ -149,7 +155,7 @@ ADD-ветки с точкой `m98-switch-catalog:<id>`, переключате
 **engine-dev:** `crates/gateway-serve/src/lib.rs` — ветка SWITCH `handle_v1_message` и, при
 выносе общего блока, ветка ADD в части замены блока вызовом (поведение ADD не меняется).
 **architect:** `milestones/M-98-*.md` · `crates/gateway-serve/tests/red_m98_switch_provenance.rs` ·
-`scripts/verify_M-98.sh` · `scripts/tests/red_verify_M-98_ci_map.sh` · `docs/ROADMAP.md` (строка
+`scripts/verify_M-98.sh` · `scripts/tests/red_verify_M-98_ci_map.sh` · `scripts/tests/red_m98_mutants.sh` · `scripts/tests/m98/prototype.patch` · `docs/ROADMAP.md` (строка
 `TD-251` → `M-98`: порядок работ — зона architect'а).
 **Вне зоны:** всё прочее, включая `crates/gateway/**`, `crates/journal/**`, `TECH-DEBT.md`.
 
@@ -175,4 +181,5 @@ reviewer (PR-гейт, §8, задача 2).
 
 | круг | вердикт | предмет | что изменено |
 |---|---|---|---|
+| 1 | `C-297` **REJECT** (critic, аудит `dddb58f9`) | B1: `s1` проверял `history_start_seq > 0`, `s2` — не проверял вовсе: реализация с ложным положительным началом проходила. B2: таблица §8 — проза, прототипа и мутантов в наборе нет | B1 — `s1`/`s2` сверяют `history_start_seq` с независимым эталоном (`journal::stream` после удаления); `s3`/`s4` — прежний `(frozen, true)`. B2 — `red_m98_mutants.sh` + `m98/prototype.patch` в наборе и в гейте; добавлен мутант `startone` (ловится `s1 s2`) |
 | 0 | — | набор architect'а | спека, `red_m98_switch_provenance`, гейт, проба карты |
