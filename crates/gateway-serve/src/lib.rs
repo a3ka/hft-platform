@@ -1583,8 +1583,14 @@ pub mod server {
                             // `(frozen_start_seq, true)` — «не знаем, не обещаем»,
                             // как `history_provenance_for_serve` до M-95 (M-87 задача 20,
                             // оракул `red_m87_history_provenance_failclosed` `h3`/`h4`).
-                            // Мутант «вернуть `let _ =`» роняет оракулы `f3`/`f4` на
-                            // прод-пути выдачи (R-249 Б-1).
+                            // Мутант «вернуть `let _ =`»: ветку `is_fresh → Err`
+                            // сторожат оракулы `f3` (v1) / `f4` (legacy) — `chmod 0300`
+                            // на каталоге журнала даёт `Err` в `is_fresh` (`scan_dir_layout`
+                            // → `read_dir`), до `refresh` дело не доходит; ветку
+                            // `is_fresh → Ok(false)` + `refresh → Err` сторожат
+                            // `f5` (v1) / `f6` (legacy) — diff > 2 ⇒ `is_fresh = Ok(false)`,
+                            // затем ретеншен закрывает один оставшийся `.zst` (`000`) и
+                            // `refresh` падает на классификации (R-249 Б-1, R-250 Б-1).
                             let fresh_ok = cat
                                 .is_fresh(&path_for_history)
                                 .map(|(f, _ops)| f);
@@ -2419,8 +2425,14 @@ pub mod server {
                     // этому каталогу: исход `(frozen_start_seq, true)` — «не знаем,
                     // не обещаем», как `history_provenance_for_serve` до M-95 (M-87
                     // задача 20, оракул `red_m87_history_provenance_failclosed` `h3`/`h4`).
-                    // Мутант «вернуть `let _ =`» роняет оракул `f4` на legacy-пути
-                    // выдачи (R-249 Б-1).
+                    // Мутант «вернуть `let _ =`»: ветку `is_fresh → Err`
+                    // сторожат оракулы `f3` (v1) / `f4` (legacy) — `chmod 0300`
+                    // на каталоге журнала даёт `Err` в `is_fresh` (`scan_dir_layout`
+                    // → `read_dir`), до `refresh` дело не доходит; ветку
+                    // `is_fresh → Ok(false)` + `refresh → Err` сторожат
+                    // `f5` (v1) / `f6` (legacy) — diff > 2 ⇒ `is_fresh = Ok(false)`,
+                    // затем ретеншен закрывает один оставшийся `.zst` (`000`) и
+                    // `refresh` падает на классификации (R-249 Б-1, R-250 Б-1).
                     let fresh_ok = cat
                         .is_fresh(cfg1.journal_dir.as_path())
                         .map(|(f, _ops)| f);
