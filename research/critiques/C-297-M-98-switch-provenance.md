@@ -167,7 +167,8 @@ $ git status --porcelain
   sets and wire it into scripts/verify_M-98.sh.  Commit and push the revised artifact
   set, then request a fresh critic audit of the new branch tip.
   ```
-- Push-статус: ⏸ this verdict is being committed to `origin/feat/M-98-switch-provenance`.
+- Push-статус: ✅ pushed to `origin/feat/M-98-switch-provenance`; verdict commit
+  `bd37950b` is reachable from origin.
 - Кэш: ⏸ shared worktree cache retained while the concurrently started CI-form verify run finishes.
 
 ## §E — Риски / открытые вопросы
