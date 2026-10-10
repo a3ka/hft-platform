@@ -27,10 +27,10 @@ DRY="${VERIFY_M100_CI_DRY:-0}"
 
 if [ "$DRY" != "1" ]; then
 # --- task1: колонка карты живого кадра = состояние бакета на последнем наблюдении (VB-I-2)
-run_step "task1: red_m100_heatmap_frame_close (h1)" cargo test -q -p gateway --test red_m100_heatmap_frame_close
+run_step "task1: red_m100_heatmap_frame_close (h1, h2)" cargo test -q -p gateway --test red_m100_heatmap_frame_close
 # --- task2: выбор отображения (gateway::view) и его проводная форма
 run_step "task2: red_m100_view_projection (p1…p4)" cargo test -q -p gateway --test red_m100_view_projection
-run_step "task2/5: red_m100_three_contracts_wire (w1…w7)" cargo test -q -p gateway-serve --test red_m100_three_contracts_wire
+run_step "task2/4/5: red_m100_three_contracts_wire (w1…w9)" cargo test -q -p gateway-serve --test red_m100_three_contracts_wire
 # --- task3: стабильный идентификатор ключа расчёта; имя слепка не меняется
 run_step "task3: red_m100_calc_key_id (k1…k5)" cargo test -q -p gateway --test red_m100_calc_key_id
 # --- task4: версия провода ≠ версия вычислительного состояния
