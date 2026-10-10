@@ -471,6 +471,25 @@ fn act_refresh_fails(jd: &std::path::Path) -> UnreadableFile {
 
 const EARLIEST: &str = "segment-00000000.jrnl.zst";
 
+/// **Независимый эталон начала истории (`C-297` B1).** `seq` первого события, которое прод-читатель
+/// журнала (`journal::stream`, тот же `EpochFilter`) отдаёт ПОСЛЕ удаления префикса, — по самому
+/// журналу, а не по каталогу транспорта и не по коду выдачи. Прецедент —
+/// `red_m87_provenance_on_add_path::prune_prefix`.
+fn first_retained_seq(dir: &std::path::Path) -> u64 {
+    journal::stream(dir, EpochFilter::OwnCaptureOnly)
+        .expect("stream")
+        .next()
+        .expect("после удаления префикса в журнале обязано остаться событие")
+        .expect("event")
+        .seq
+}
+
+fn start_seq(body: &Value) -> u64 {
+    body.get("history_start_seq")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| panic!("снимок обязан нести history_start_seq (VB-I-11): {body}"))
+}
+
 async fn subscribe(ws: &mut Ws, id: &str) {
     ws.send(Message::Text(
         json!({"op":"subscribe","v":1,"id":id,"selector":{
@@ -558,14 +577,17 @@ async fn s1_switch_after_retention_is_honest() {
          говорит «история полная» — ветка SWITCH отдала провенанс СЛЕПКА, не посчитав его по \
          журналу. Обязан: тот же расчёт, что у новой подписки (M-95 §3): {body}"
     );
-    let start_seq = body
-        .get("history_start_seq")
-        .and_then(Value::as_u64)
-        .expect("history_start_seq");
+    let want = first_retained_seq(dir.path());
     assert!(
-        start_seq > 0,
-        "M-98 / VB-I-11: history_start_seq = 0 после удаления префикса — переподписка объявила \
-         началом истории seq, которого в журнале больше нет: {body}"
+        want > 0,
+        "SETUP НЕ СОСТОЯЛСЯ: после удаления раннего сегмента первое событие журнала — seq 0"
+    );
+    assert_eq!(
+        start_seq(&body),
+        want,
+        "M-98 / C-297 B1 / VB-I-11: history_start_seq переподписки не равен seq первого события, \
+         которое журнал реально отдаёт после удаления префикса — «усечено» объявлено, но начало \
+         истории названо ложно: {body}"
     );
 }
 
@@ -595,6 +617,12 @@ async fn s2_switch_retention_between_catalog_and_provenance_is_honest() {
         "M-98 / TD-251 / VB-I-11: ранний сегмент удалён ПОСЛЕ построения каталога переподписки и ДО \
          провенанса, а снимок говорит «история полная» — провенанс посчитан по устаревшему каталогу \
          либо не посчитан вовсе. Обязан: is_fresh → refresh → расчёт, либо (frozen, true): {body}"
+    );
+    assert_eq!(
+        start_seq(&body),
+        first_retained_seq(dir.path()),
+        "M-98 / C-297 B1 / VB-I-11: проверка свежести прошла успешно, а history_start_seq не равен \
+         seq первого события журнала после удаления префикса: {body}"
     );
 }
 
