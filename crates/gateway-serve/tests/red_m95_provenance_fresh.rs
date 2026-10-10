@@ -608,3 +608,157 @@ async fn f4_legacy_catalog_refresh_failure_is_fail_closed() {
          снимок говорит «история полная»: {body}"
     );
 }
+
+/// Файл, закрытый на чтение (`000`); исходный режим возвращается при выходе из области.
+struct UnreadableFile(std::path::PathBuf, u32);
+impl UnreadableFile {
+    fn seal(path: &std::path::Path) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        let orig = std::fs::metadata(path).expect("stat").permissions().mode() & 0o7777;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000)).expect("chmod 000");
+        UnreadableFile(path.to_path_buf(), orig)
+    }
+}
+impl Drop for UnreadableFile {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(self.1));
+    }
+}
+
+/// Сжатые сегменты каталога по возрастанию индекса.
+fn zst_segments(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut v: Vec<_> = std::fs::read_dir(dir)
+        .expect("read_dir")
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.to_string_lossy().ends_with(".jrnl.zst"))
+        .collect();
+    v.sort();
+    v
+}
+
+/// Мир `R-250` Б-1: в остановке удалить ТРИ самых ранних `.zst` (diff каталога > 2 ⇒
+/// `is_fresh` обязан ответить `Ok(false)`, а не обновиться инкрементально), дописать свидетеля
+/// места, закрыть на чтение один из оставшихся `.zst` (⇒ полный `refresh` классифицирует его и
+/// получает `Err`). Каталог журнала остаётся читаемым — `is_fresh` (список имён + `stat`) успешен.
+///
+/// **Setup-страж исполнения ИМЕННО этой ветки:** каталог, построенный тестом ДО изменений тем же
+/// публичным `journal::SegmentCatalog`, после них обязан дать `is_fresh == Ok(false)` и
+/// `refresh == Err`. Иначе мир не построен (например, `is_fresh` вернул `Err` — это `f3`/`f4`, а не
+/// `R-250`), и тест падает как `SETUP НЕ СОСТОЯЛСЯ`, а не как вердикт.
+fn act_refresh_fails(jd: &std::path::Path) -> UnreadableFile {
+    let (mut guard_cat, _) = journal::SegmentCatalog::open(jd).expect("guard catalog");
+    let zst = zst_segments(jd);
+    assert!(
+        zst.len() >= 4,
+        "SETUP НЕ СОСТОЯЛСЯ: сжатых сегментов {} — нужно ≥ 4 (три удалить, один закрыть)",
+        zst.len()
+    );
+    for p in &zst[..3] {
+        std::fs::remove_file(p).expect("удаление ранних сегментов (как retention-prune)");
+    }
+    append(jd, TAIL_END, AT_PAUSE); // свидетель места (`A-050` A2)
+    let sealed = UnreadableFile::seal(&zst[3]);
+    assert!(
+        std::fs::File::open(&zst[3]).is_err(),
+        "SETUP НЕ СОСТОЯЛСЯ: закрытый на чтение сегмент открывается (прогон под root?)"
+    );
+    match guard_cat.is_fresh(jd) {
+        Ok((false, _)) => {}
+        other => panic!(
+            "SETUP НЕ СОСТОЯЛСЯ: is_fresh после изменений = {other:?}, ожидалось Ok(false) — ветка \
+             «is_fresh → Ok(false), refresh → Err» (R-250 Б-1) не построена"
+        ),
+    }
+    assert!(
+        guard_cat.refresh(jd).is_err(),
+        "SETUP НЕ СОСТОЯЛСЯ: refresh после изменений успешен — ветка «refresh → Err» не построена"
+    );
+    sealed
+}
+
+/// **`f5` — v1: `is_fresh` → `Ok(false)`, затем `refresh` → `Err` (`R-250` Б-1).** Исход обязан
+/// быть `(frozen_start_seq, true)`. Мутант «`Err` у `refresh` проглочен, провенанс по каталогу»
+/// (`R-250` MV2) ⇒ каталог устарел ⇒ «история полная» ⇒ FAILED.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn f5_v1_refresh_failure_after_stale_is_fail_closed() {
+    let _serial = SERIAL.lock().await;
+    gateway_serve::server::set_effective_grace_ms(5_000);
+    let (dir, ckpt, earliest) = fixture();
+    let ch = "m95-catalog:s5".to_string();
+    rendezvous::arm(&ch);
+    let _g = Guard(ch.clone());
+    let addr = start(dir.path(), ckpt.path()).await;
+    let w = std::sync::Arc::new(Watcher::start(dir.path()));
+    let earliest_name = earliest.file_name().unwrap().to_string_lossy().into_owned();
+    let baseline = w.opens_of(&earliest_name);
+    let mut ws = connect(&addr).await;
+    ws.send(Message::Text(
+        json!({"op":"subscribe","v":1,"id":"s5","selector":{
+            "venue":"Binance","symbol":"BTCUSDT","timeframe_ms":1000,
+            "bands":SEVEN.to_vec(),"window_ms":60000,"depth_cadence_ms":1000}})
+        .to_string(),
+    ))
+    .await
+    .expect("send");
+    let chc = ch.clone();
+    let wc = w.clone();
+    let en = earliest_name.clone();
+    let jd = dir.path().to_path_buf();
+    let sealed = tokio::task::spawn_blocking(move || {
+        let mut sealed = None;
+        pause_and(&chc, &wc, &en, baseline, || {
+            sealed = Some(act_refresh_fails(&jd))
+        });
+        sealed
+    })
+    .await
+    .expect("pause");
+    let body = snapshot_body(&mut ws).await;
+    drop(sealed);
+    assert_point_right_before_provenance(&body, "v1", false);
+    assert!(
+        truncated(&body),
+        "M-95 / R-250 Б-1 / VB-I-11: префикс удалён, is_fresh ответил «устарел», refresh ОТКАЗАЛ, а \
+         снимок говорит «история полная» — ошибка refresh проглочена, провенанс посчитан по \
+         устаревшему каталогу. Обязан: (frozen_start_seq, true): {body}"
+    );
+}
+
+/// **`f6` — legacy: то же, что `f5`, канал `m95-catalog:legacy`.**
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn f6_legacy_refresh_failure_after_stale_is_fail_closed() {
+    let _serial = SERIAL.lock().await;
+    let (dir, ckpt, earliest) = fixture();
+    gateway_serve::server::set_effective_grace_ms(200);
+    let ch = "m95-catalog:legacy".to_string();
+    rendezvous::arm(&ch);
+    let _g = Guard(ch.clone());
+    let addr = start(dir.path(), ckpt.path()).await;
+    let w = std::sync::Arc::new(Watcher::start(dir.path()));
+    let earliest_name = earliest.file_name().unwrap().to_string_lossy().into_owned();
+    let baseline = w.opens_of(&earliest_name);
+    let mut ws = connect(&addr).await;
+    let chc = ch.clone();
+    let wc = w.clone();
+    let en = earliest_name.clone();
+    let jd = dir.path().to_path_buf();
+    let sealed = tokio::task::spawn_blocking(move || {
+        let mut sealed = None;
+        pause_and(&chc, &wc, &en, baseline, || {
+            sealed = Some(act_refresh_fails(&jd))
+        });
+        sealed
+    })
+    .await
+    .expect("pause");
+    let body = snapshot_body(&mut ws).await;
+    drop(sealed);
+    assert_point_right_before_provenance(&body, "legacy", true);
+    assert!(
+        truncated(&body),
+        "M-95 / R-250 Б-1 / VB-I-11: legacy-путь — is_fresh «устарел», refresh ОТКАЗАЛ, снимок \
+         говорит «история полная»: {body}"
+    );
+}
