@@ -61,10 +61,14 @@ fn write_state(dir: &Path, body: &str) -> std::path::PathBuf {
     p
 }
 
-/// Тело состояния по T2-контракту спеки `M-74`.
+/// Отпечаток прочитанного — обязателен при `ok=1` (T2-контракт `M-74`; `M-99` §5 — вердикт
+/// общий у recorder'а и сторожа, `ops::restore_drill::restore_drill_verdict`).
+const DIGEST: &str = "96a231ce97316518856045415a7fdf089ce5106f427c239cdc07fb3dbbdb9c81";
+
+/// Тело состояния по T2-контракту спеки `M-74` (с отпечатком; `M-99` правка оракула).
 fn state(ok: u8, ts_wall_ms: i64, events_read: u64) -> String {
     format!(
-        r#"{{"ok":{ok},"ts_wall_ms":{ts_wall_ms},"ts":"2026-08-31T09:52:48Z","checked":3,"events_read":{events_read},"reason":""}}"#
+        r#"{{"ok":{ok},"ts_wall_ms":{ts_wall_ms},"ts":"2026-08-31T09:52:48Z","checked":3,"events_read":{events_read},"digest":"{DIGEST}","reason":""}}"#
     )
 }
 
@@ -196,6 +200,26 @@ fn success_with_zero_events_read_emits_zero() {
         Some(0),
         "«успех» без единого прочитанного события успехом не является — копия не доказана \
          читаемой, доказано лишь, что процедура завершилась"
+    );
+}
+
+/// `M-99` §5: `ok=1` БЕЗ отпечатка — состояние не доказывает чтения (T2-контракт `M-74`:
+/// `digest` «обязательно при `ok=1`»). Это заявление о действии, а не его продукт: его пишет
+/// кто угодно, не прочитав копии (класс `C-191`). Потребитель обязан его отвергнуть.
+#[test]
+fn success_without_digest_emits_zero() {
+    let d = tempfile::tempdir().expect("tempdir");
+    let p = write_state(
+        d.path(),
+        &format!(
+            r#"{{"ok":1,"ts_wall_ms":{},"checked":3,"events_read":41213,"reason":""}}"#,
+            NOW_MS - 60_000
+        ),
+    );
+    assert_eq!(
+        emit(&p),
+        Some(0),
+        "«успех» без отпечатка прочитанного успехом не является — это декларация о действии"
     );
 }
 
