@@ -135,6 +135,7 @@ pub fn sample_restore_drill(metrics: &Metrics, state_path: &Path, now_wall_ms: i
 | `scripts/tests/red_restore_drill.sh`, `scripts/verify_M-99.sh`, `scripts/tests/red_verify_M-99_ci_map.sh` | architect | проба и гейт |
 | `.github/workflows/ci.yml` — ОДНА строка шага в `build-test` | architect | §4 п.6 |
 | `milestones/M-99-*.md`, `milestones/M-74-restore-drill.md` (перенос + строка статуса), `docs/ROADMAP.md` (строка 1 Блока 1) | architect | спека, носитель контрактов, порядок работ |
+| `docs/DESIGN.md` — ТОЛЬКО строка `OPS-I` таблицы §22 (счёт «в оракулах» 9 → 10) | architect | `C-298` B-1: новый оракул `OPS-I-3` меняет замер `verify_design_claims.sh`; документ обязан говорить измеренное |
 | `research/critiques/C-{187,188,189,191,214,215,216,217,218,219}-*.md`, `research/arbitration/A-0{28,32}-*.md` | architect (перенос БЕЗ изменений) | вердикты `M-74` с ветки `docs/M-73-closeout-architect`, токен `TERMINAL-BRANCH-VERDICT` по каждому файлу |
 
 ## 7. ЗАПРЕЩЕНО
@@ -250,4 +251,5 @@ engine-dev (задачи 2, 2b, 3, 4, 5, 6) → tester → reviewer (PR-гейт
 
 | круг | вердикт | предмет | что изменено |
 |---|---|---|---|
+| 1 | `C-298` **REJECT** (critic, аудит `ed0309b4`) | B-1: оракул `OPS-I-3` поднял замер `OPS-I` с 9 до 10, а `DESIGN` §22 заявляет 9 — `verify_design_claims.sh --merge-preview origin/main` exit=1. Закрытия `C-219` B-1/B-2 и все 9 мутаций критик воспроизвёл | `DESIGN` §22 строка `OPS-I`: 9 → 10, путь внесён в §6 Allowed; merge-preview перепрогнан (Done Block коммита) |
 | 0 | — | набор architect'а | перенос набора `M-74` и его вердиктов; закрытие `C-219` B-1/B-2; сторож; шаг CI; гейт |
