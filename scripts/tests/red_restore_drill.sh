@@ -81,6 +81,16 @@
 #   A7 доставлен ОДИН индекс из трёх, отпечаток подлинный → покраснеть (`C-216`)
 #   T  ветка `remote` идёт через ШОВ и падает закрыто (`A-032` §2.3; НЕ доказательство сети)
 #   R  обёртка подставляет отпечаток ПРОШЛОГО прогона → проба ОБЯЗАНА покраснеть
+#   A8 доставлены ТРИ настоящих, но НЕ ТЕ индекса → покраснеть (`C-217` B-2)
+#   A9 выборка верна, отчёт `checked` лжив → покраснеть
+#   Q  читатель говорит ПОЛНЫМ протоколом, непрерывность — ВНУТРИ сегмента (`C-218` B-1)
+#   A10 не привезена одна форма выбранного индекса → покраснеть (`C-218` B-2)
+#   A11 наблюдатель обёртки ВОЗВРАЩАЕТ источник в окне чтения → покраснеть (`C-219` B-1, `M-99`)
+#   A12 sidecar НЕ привезён / A13 sidecar ПОДМЕНЁН → покраснеть (`C-219` B-2, `M-99`)
+#
+# `M-99` (2026-10-10): источник при проверке доставки УНИЧТОЖАЕТСЯ, а не прячется, и всё окно
+# чтения наблюдается inotify; sidecar'ы сверяются побайтно со снимком копии, снятым ДО запуска
+# обёртки. Разбор и таблица мутаций — `milestones/M-99-restore-drill-automation.md` §4, §8.
 #
 # `D` и `R` — самопроверка РАЗЛИЧАЮЩЕЙ СИЛЫ: они подставляют жульническую обёртку и требуют,
 # чтобы набор её поймал. Без них «зелёный на честной обёртке» не отличим от «зелёный на
@@ -110,6 +120,11 @@ die()  { echo "SETUP НЕ СОСТОЯЛСЯ: $*" >&2; exit 2; }
 
 REG="$(mktemp /tmp/red-drill-reg-XXXXXX)" || die mktemp
 cleanup() {
+  # Наблюдатель атаки `A11` — фоновый процесс СУДИМОЙ (жульнической) обёртки; он обязан умереть
+  # вместе с пробой при ЛЮБОМ исходе, включая `die` посреди сценария.
+  if [ -n "${A11_PIDFILE:-}" ] && [ -s "${A11_PIDFILE}" ]; then
+    kill -- "-$(cat "${A11_PIDFILE}")" 2>/dev/null || kill "$(cat "${A11_PIDFILE}")" 2>/dev/null || true
+  fi
   if [ -n "${KEEP_FIXTURES:-}" ]; then echo "песочницы оставлены: ${REG}"; return 0; fi
   while IFS= read -r d; do
     case "$d" in /tmp/red-drill-*) [ -d "$d" ] && rm -rf "$d" ;; esac
@@ -227,6 +242,7 @@ run_drill() { # $1=песочница [$2=путь к обёртке] → код
   # Эталон строится ПОД КАЖДУЮ песочницу: он обязан быть тем же кодом, но не делить
   # состояние между сценариями.
   local wrapper="${2:-}" READER_CMD
+  snapshot_source "$1"
   if [ -n "$(reader_digest "$1/cold" 2>/dev/null)" ] || [ -f "${ROOT}/crates/journal/src/bin/journal-drill-read.rs" ]; then
     READER_CMD="cargo run -q --manifest-path ${ROOT}/Cargo.toml -p journal --bin journal-drill-read --"
   else
@@ -380,28 +396,157 @@ delivery_matches_selection() { # $1=песочница → 0, если дост�
 # ЧТО привезено, формы — за ПОЛНОТУ КАЖДОГО привезённого.
 delivery_forms_complete() { # $1=песочница → 0, если для КАЖДОГО ДОСТАВЛЕННОГО индекса
                             # привезены все формы, что есть в холодной копии
+  # Что есть «в копии» — берётся из СНИМКА, снятого ДО запуска обёртки (`snapshot_source`), а не
+  # из живого `cold`: источник к этому моменту может быть уже уничтожен `retire_source`, а
+  # жульническая обёртка могла сама удалить из `cold` форму, которую не привезла (`M-99` §4).
   local i f base
+  [ -n "${SRC_FORMS[$1]+x}" ] || return 1
   for i in $(delivered_members "$1"); do
     for f in "jrnl" "jrnl.zst"; do
       base="segment-${i}.${f}"
-      if [ -f "$1/cold/${base}" ] && [ ! -f "$1/restore/${base}" ]; then
-        return 1
-      fi
+      case " ${SRC_FORMS[$1]} " in
+        *" ${base} "*) [ -f "$1/restore/${base}" ] || return 1 ;;
+      esac
     done
   done
   return 0
 }
 
-inv_delivery() { # $1=песочница $2=отпечаток ПРИ ЖИВОМ источнике → 0, если читается БЕЗ него
-  local hidden d_after
-  [ -d "$1/restore" ] || return 1
-  hidden="$1/cold-hidden-$$"
-  # Источник УБИРАЕТСЯ переименованием, а не удалением: фикстура дорога, а вернуть надо
-  # обязательно — иначе следующий сценарий судил бы обрубок.
-  mv "$1/cold" "${hidden}" 2>/dev/null || return 1
+# ═══ `M-99`: ЗАКРЫТИЕ `C-219` B-1 — ИСТОЧНИК УНИЧТОЖАЕТСЯ, ОКНО ЧТЕНИЯ НАБЛЮДАЕТСЯ ═══
+#
+# ЧТО ПРОПУСКАЛА РЕДАКЦИЯ `85ae7de`. `inv_delivery` прятала источник ПЕРЕИМЕНОВАНИЕМ
+# (`cold` → `cold-hidden-$$`), читала восстановленное и возвращала имя. Критик (`C-219` B-1)
+# оставил после обёртки фонового наблюдателя: увидев исчезновение `cold`, тот создавал `cold`
+# заново — ссылкой на спрятанный источник. Ссылки в `restore` снова разрешались, чтение
+# проходило, и доставка, не содержащая ни одного своего байта, признавалась честной. Утверждение
+# «источник недоступен» проверялось ОДИН РАЗ — в момент `mv`, а не на всё время чтения.
+#
+# ЧТО ЗДЕСЬ ВМЕСТО ЭТОГО — две меры, и роли у них разные.
+#  1. `retire_source` — источник УНИЧТОЖАЕТСЯ (`rm -rf`), а не прячется: спрятанного источника,
+#     к которому можно привязаться, больше не существует. Фикстура ОДНОРАЗОВА (нонс задачи 6b),
+#     всё, что пробе нужно знать о копии после этого, снято ДО запуска обёртки в
+#     `snapshot_source`. Это мера ПО ПОСТРОЕНИЮ, а не страж; эксклюзивного члена у неё нет и он
+#     здесь не изображается (мутация «переименование вместо удаления» оставляет `A11` пойманным —
+#     его ловит мера 2).
+#  2. `source_stayed_absent` — СТРАЖ: всё окно независимого чтения каталог песочницы наблюдается
+#     inotify (`IN_CREATE|IN_MOVED_TO`); появление имени `cold` в окне — отказ. Так проверяется
+#     требование `C-219` B-1 «источник недоступен ВСЁ время чтения», а не в один момент. Член —
+#     сценарий `A11` (наблюдатель обёртки пере-создаёт `cold` ссылкой на свой тайник).
+#
+# ЧЕГО ЭТО НЕ ЗАКРЫВАЕТ — названо (`A-032` §2.2/§4). Обёртка, положившая в `restore` ссылки
+# ПРЯМО на свой тайник (не через имя `cold`), байты по сути доставила — в другое место; это
+# форма псевдонима, и требовать её покрытия решением арбитра запрещено.
+declare -A SRC_FORMS SRC_SIDECARS RETIRED
+
+snapshot_source() { # $1=песочница — что лежит в копии ДО запуска обёртки (формы, sidecar'ы)
+  [ -d "$1/cold" ] || return 0
+  SRC_FORMS[$1]="$(ls "$1/cold" 2>/dev/null | grep -E '^segment-[0-9]{8}\.jrnl(\.zst)?$' | sort | tr '\n' ' ')"
+  local j acc=""
+  for j in "$1/cold"/*.json; do
+    [ -f "$j" ] || continue
+    acc="${acc} $(basename "$j"):$(sha256sum < "$j" | cut -c1-64)"
+  done
+  SRC_SIDECARS[$1]="${acc# }"
+}
+
+retire_source() { # $1=песочница → источник уничтожен (идемпотентно)
+  case "$1" in /tmp/red-drill-*) ;; *) return 1 ;; esac
+  [ -n "${RETIRED[$1]:-}" ] && return 0
+  rm -rf -- "$1/cold" || return 1
+  RETIRED[$1]=1
+}
+
+source_absent() { [ ! -e "$1/cold" ] && [ ! -L "$1/cold" ]; }
+
+# Наблюдатель окна — тот же приём, что в оракулах `M-95` (`inotify` через `ctypes`). Setup-страж
+# на КАЖДЫЙ запуск: канарейка, созданная пробой, обязана попасть в журнал наблюдателя — иначе
+# страж вакуумен (`testing.md` «Целостность гейта» св. 3).
+INOTIFY_PY='
+import ctypes, os, struct, sys, select
+libc = ctypes.CDLL("libc.so.6", use_errno=True)
+d, out, ready = sys.argv[1], sys.argv[2], sys.argv[3]
+fd = libc.inotify_init1(0)
+if fd < 0: sys.exit(3)
+if libc.inotify_add_watch(fd, d.encode(), 0x100 | 0x80) < 0: sys.exit(3)
+f = open(out, "w", buffering=1); open(ready, "w").close()
+while True:
+    r, _, _ = select.select([fd], [], [], 0.02)
+    if not r:
+        if os.path.exists(ready + ".stop"): break
+        continue
+    buf = os.read(fd, 65536); i = 0
+    while i < len(buf):
+        wd, mask, cookie, ln = struct.unpack_from("iIII", buf, i)
+        f.write(buf[i+16:i+16+ln].rstrip(b"\0").decode() + "\n"); i += 16 + ln
+'
+
+# $1=песочница; УНИЧТОЖАЕТ источник и читает восстановленное, наблюдая ВСЁ окно
+# [уничтожение источника, конец чтения]: наблюдатель поднимается ДО `retire_source`, поэтому
+# возврат имени `cold` в любой момент окна попадает в журнал. Печатает «отпечаток_после».
+# Код: 0 — имя `cold` в окне не появлялось и в конце его нет; 1 — появлялось (или есть);
+# 2 — наблюдатель не поднялся/вакуумен (SETUP).
+retire_and_read_watched() {
+  local w log ready pid t0 d_after canary
+  w="$(mktemp -d /tmp/red-drill-watch-XXXXXX)" || return 2
+  printf '%s\n' "${w}" >> "${REG}"
+  log="${w}/events"; ready="${w}/ready"
+  python3 -c "${INOTIFY_PY}" "$1" "${log}" "${ready}" >/dev/null 2>&1 &
+  pid=$!
+  t0=$SECONDS
+  while [ ! -f "${ready}" ]; do
+    [ $((SECONDS - t0)) -lt 10 ] || { kill "${pid}" 2>/dev/null; return 2; }
+    sleep 0.05
+  done
+  canary="inotify-canary-$$-${RANDOM}"
+  : > "$1/${canary}"; rm -f "$1/${canary}"
+  t0=$SECONDS
+  until grep -qx "${canary}" "${log}" 2>/dev/null; do
+    [ $((SECONDS - t0)) -lt 5 ] || { touch "${ready}.stop"; wait "${pid}" 2>/dev/null; return 2; }
+    sleep 0.05
+  done
+  retire_source "$1" || { touch "${ready}.stop"; wait "${pid}" 2>/dev/null; return 2; }
   d_after="$(truth_digest "$1/restore")"
-  mv "${hidden}" "$1/cold" 2>/dev/null
-  [ -n "${d_after}" ] && [ -n "$2" ] && [ "${d_after}" = "$2" ]
+  touch "${ready}.stop"; wait "${pid}" 2>/dev/null
+  printf '%s' "${d_after}"
+  if grep -qx 'cold' "${log}" 2>/dev/null || ! source_absent "$1"; then return 1; fi
+  return 0
+}
+
+source_stayed_absent() { # $1=песочница → 0, если в окне чтения источник НЕ возвращался
+  [ -n "${WATCH_RC[$1]+x}" ] && [ "${WATCH_RC[$1]}" = "0" ]
+}
+declare -A WATCH_RC D_AFTER
+
+inv_delivery() { # $1=песочница $2=отпечаток ПРИ ЖИВОМ источнике → 0, если читается БЕЗ него
+  local rc
+  [ -d "$1/restore" ] || return 1
+  if [ -z "${D_AFTER[$1]+x}" ]; then
+    D_AFTER[$1]="$(retire_and_read_watched "$1")"; rc=$?
+    RETIRED[$1]=1   # `retire_source` исполнен в подоболочке `$( )` — отметка ставится здесь
+    [ "${rc}" -eq 2 ] && die "наблюдатель окна чтения (inotify) не поднялся или вакуумен в $1 — страж source_stayed_absent судил бы пустоту"
+    WATCH_RC[$1]="${rc}"
+  fi
+  [ -n "${D_AFTER[$1]}" ] && [ -n "$2" ] && [ "${D_AFTER[$1]}" = "$2" ]
+}
+
+# ═══ `M-99`: ЗАКРЫТИЕ `C-219` B-2 — SIDECAR'Ы ВОССТАНАВЛИВАЮТСЯ ПОБАЙТНО ═══
+#
+# Контракт (`M-99` §4 п.2): каждый sidecar (`*.json` в корне холодной копии) восстанавливается
+# ПОБАЙТНО — sha256 восстановленного равен sha256 копии. Прежде правило выборки говорило «берётся
+# то, что в копии ЕСТЬ», а решающий предикат sidecar'ов не смотрел вовсе: прод-читатель на пустом
+# манифесте читает и без него, и пропуск/подмена проходили набор (`C-219` B-2).
+# Судится В СОСТОЯНИИ «ИСТОЧНИКА НЕТ» (`retire_source` уже исполнен): ссылка на sidecar копии
+# тогда не разрешается, и форма подмены значения не имеет. Эталон — снимок ДО запуска обёртки.
+delivery_sidecars_identical() { # $1=песочница
+  local e name sha got
+  [ -n "${SRC_SIDECARS[$1]+x}" ] || return 1
+  retire_source "$1" || return 1
+  for e in ${SRC_SIDECARS[$1]}; do
+    name="${e%%:*}"; sha="${e##*:}"
+    got="$(sha256sum < "$1/restore/${name}" 2>/dev/null | cut -c1-64)"
+    [ -n "${got}" ] && [ "${got}" = "${sha}" ] || return 1
+  done
+  return 0
 }
 
 # ЕДИНСТВЕННЫЙ РЕШАЮЩИЙ ПРЕДИКАТ. `A-032` §2.2 п.1: `H` инлайнил надмножество `h_verdict`
@@ -416,7 +561,9 @@ h_verdict() { # $1=песочница → 0, если состояние ДОК�
     && digest_matches_state "$1" "${d_live}" \
     && delivery_matches_selection "$1" \
     && delivery_forms_complete "$1" \
-    && inv_delivery "$1" "${d_live}"
+    && inv_delivery "$1" "${d_live}" \
+    && source_stayed_absent "$1" \
+    && delivery_sidecars_identical "$1"
 }
 
 # ══════════════════════════════════════════════════════════════════════════════════════
@@ -596,6 +743,13 @@ if [ -z "${S_DUAL}" ]; then
 спеки «для каждого выбранного индекса восстанавливаются обе формы» была бы ВАКУУМНА, а
 сценарий A10 судил бы несуществующий предмет (`C-218` B-2). Чинить в строителе фикстуры."
 fi
+# СТРАЖ SIDECAR'ОВ (`M-99`, `C-219` B-2): копия прода несёт ДВА sidecar'а (замер 2026-10-10:
+# `journal.legacy.json` 25 Б, `journal.replay-digest.json` 155 Б). Без них в фикстуре сценарии
+# `A12`/`A13` судили бы пустоту, а страж `delivery_sidecars_identical` был бы вакуумен.
+for _sc in journal.legacy.json journal.replay-digest.json; do
+  [ -s "${BOX_H}/cold/${_sc}" ] || die "S sidecar ${_sc} в фикстуре ОТСУТСТВУЕТ — страж побайтной \
+доставки sidecar'ов (M-99 §4 п.2) судил бы пустоту. Чинить строитель фикстуры"
+done
 if [ "${N_IDX}" -ge 3 ] && [ "${N_ZST}" -ge 1 ]; then
   pass "S фикстура прод-формы: ${N_IDX} индексов сегментов, из них сжатых файлов ${N_ZST}; \
 объявленная выборка — ${EXPECTED_MEMBERS}; пара raw+zst лежит на ВЫБРАННОМ индексе ${S_DUAL}"
@@ -677,10 +831,12 @@ if run_drill "${BOX_H}"; then
   if h_verdict "${BOX_H}" && [ "${ck}" = "3" ] && [ "${zs}" -ge 1 ]; then
     pass "H здоровая копия ⇒ drill прошёл: ok=1, событий ${ev}, сегментов ${ck}, сжатых в выборке ${zs}; \
 отпечаток состояния СОВПАЛ с отпечатком прод-читателя по восстановленному каталогу (${d_truth:0:12}…)"
-  elif ! inv_delivery "${BOX_H}"; then
+  elif ! inv_delivery "${BOX_H}" "${d_truth}" || ! source_stayed_absent "${BOX_H}"; then
     fail "H отпечаток сошёлся при ЖИВОМ источнике, но восстановленное НЕ ЧИТАЕТСЯ БЕЗ НЕГО.
 Значит доставки не было: каталог лишь указывает на холодную копию (ссылкой, монтированием
 или иначе — INV-DELIVERY форму не спрашивает). Прочитано — да; доставлено — нет"
+  elif ! delivery_sidecars_identical "${BOX_H}"; then
+    fail "H sidecar'ы копии (${SRC_SIDECARS[${BOX_H}]:-∅}) НЕ восстановлены побайтно — контракт `M-99` §4 п.2"
   elif [ -z "${d_state}" ]; then
     fail "H drill отчитался об успехе БЕЗ отпечатка. При ok=1 поле digest обязательно (спека
 §«Поле digest»): без него состояние — заявление о действии, а не его продукт, и подделывается
@@ -852,6 +1008,9 @@ fi
 # жульническая обёртка критика: узнаёт каталоги из окружения и пишет правдоподобное
 # состояние. В rev 4 этого хватало для `PASS (9/9)`.
 make_fixture BOX_D healthy
+# Отпечаток копии D снимается СЕЙЧАС: `h_verdict` ниже УНИЧТОЖАЕТ источник (`retire_source`,
+# `M-99`), а сценарий `R` берёт именно его как «отпечаток прошлого прогона».
+D_COLD_DIGEST="$(truth_digest "${BOX_D}/cold")"
 FAKE_D="${BOX_D}/fake-drill.sh"
 # ВОССТАНАВЛИВАЕТ ЧЕСТНО, но отпечаток ВЫДУМЫВАЕТ. Так проверяется именно то свойство,
 # ради которого rev 5 существует: «назвать величину, не посчитав её». Обёртка, которая
@@ -1230,12 +1389,146 @@ else
 только сжатая; состав, счёт, отпечаток (${A10_LIVE:0:12}…) и INV-DELIVERY при этом ЦЕЛЫ"
 fi
 
+# ── A11 — НАБЛЮДАТЕЛЬ ОБЁРТКИ ВОЗВРАЩАЕТ ИСТОЧНИК В ОКНЕ ЧТЕНИЯ (`C-219` B-1, `M-99`) ──────
+# Обёртка кладёт в `restore` ССЫЛКИ на файлы копии (как `A1`), sidecar'ы — честными байтами,
+# отпечаток — подлинный, у читателя; и оставляет после себя ФОНОВОГО НАБЛЮДАТЕЛЯ. Тот заранее
+# копирует источник в тайник и, увидев исчезновение `cold`, создаёт `cold` заново — ссылкой на
+# спрятанный пробой каталог, если такой есть (атака `C-219` против переименования), иначе на свой
+# тайник. Ссылки в `restore` снова разрешаются, и чтение «без источника» проходит.
+# Обязан поймать СТРАЖ ОКНА (`source_stayed_absent`): имя `cold` появилось, пока шло чтение.
+make_fixture BOX_A11 healthy
+A11_PIDFILE="${BOX_A11}/watcher.pid"; A11_MARK="${BOX_A11}/watcher.acted"
+export A11_PIDFILE A11_MARK
+FAKE_A11="${BOX_A11}/fake-drill.sh"
+cat > "${FAKE_A11}" <<'FAKE'
+#!/usr/bin/env bash
+rm -rf "${JOURNAL_DRILL_RESTORE}"; mkdir -p "${JOURNAL_DRILL_RESTORE}" "$(dirname "${JOURNAL_DRILL_STATE}")"
+ALL="$(ls "${JOURNAL_DRILL_COLD}" 2>/dev/null | sed -n 's/^segment-\([0-9]\{8\}\)\.jrnl\(\.zst\)\?$/\1/p' | sort -u)"
+N="$(printf '%s\n' "${ALL}" | grep -c .)"; MID=$(( (N + 1) / 2 ))
+IDX="$(printf '%s\n' "${ALL}" | sed -n "1p;${MID}p;${N}p" | sort -u)"
+CK=0
+for i in ${IDX}; do
+  for f in "${JOURNAL_DRILL_COLD}/segment-${i}.jrnl" "${JOURNAL_DRILL_COLD}/segment-${i}.jrnl.zst"; do
+    [ -f "$f" ] && ln -s "$f" "${JOURNAL_DRILL_RESTORE}/$(basename "$f")" 2>/dev/null
+  done
+  CK=$((CK + 1))
+done
+for j in "${JOURNAL_DRILL_COLD}"/*.json; do [ -f "$j" ] && cp -- "$j" "${JOURNAL_DRILL_RESTORE}/" 2>/dev/null; done
+OUT="$(${JOURNAL_DRILL_READER} --dir "${JOURNAL_DRILL_RESTORE}" --min-events 1 2>&1)"
+EV="$(printf '%s' "${OUT}" | sed -n 's/.*"events_read":\([0-9]*\).*/\1/p' | head -1)"
+DG="$(printf '%s' "${OUT}" | sed -n 's/.*"digest"[[:space:]]*:[[:space:]]*"\([0-9a-f]\{64\}\)".*/\1/p' | head -1)"
+printf '{"ok":1,"ts_wall_ms":0,"checked":%s,"events_read":%s,"digest":"%s","reason":""}\n' \
+  "${CK}" "${EV:-0}" "${DG}" > "${JOURNAL_DRILL_STATE}"
+STASH="$(dirname "${JOURNAL_DRILL_COLD}")/.stash"
+cp -a "${JOURNAL_DRILL_COLD}" "${STASH}"
+setsid bash -c '
+  C="$1"; S="$2"; M="$3"
+  while :; do
+    if [ ! -e "$C" ] && [ ! -L "$C" ]; then
+      H="$(ls -d "${C}"-hidden-* 2>/dev/null | head -1)"
+      if [ -n "$H" ]; then ln -s "$H" "$C" 2>/dev/null && echo "rebound-hidden" >> "$M"
+      else ln -s "$S" "$C" 2>/dev/null && echo "rebound-stash" >> "$M"; fi
+    fi
+    sleep 0.01
+  done' _ "${JOURNAL_DRILL_COLD}" "${STASH}" "${A11_MARK}" </dev/null >/dev/null 2>&1 &
+echo $! > "${A11_PIDFILE}"
+exit 0
+FAKE
+chmod +x "${FAKE_A11}"
+run_drill "${BOX_A11}" "${FAKE_A11}" || true
+A11_LINKS="$(find "${BOX_A11}/restore" -maxdepth 1 -type l 2>/dev/null | wc -l)"
+A11_LIVE="$(truth_digest "${BOX_A11}/restore")"
+if [ ! -s "${A11_PIDFILE}" ] || ! kill -0 "$(cat "${A11_PIDFILE}")" 2>/dev/null; then
+  die "A11 форма атаки НЕ ПОСТРОЕНА: наблюдатель обёртки не жив — пересоздавать источник некому"
+elif [ "${A11_LINKS}" -lt 1 ]; then
+  die "A11 форма атаки НЕ ПОСТРОЕНА: ссылок в restore ${A11_LINKS} — атака не опирается на источник"
+elif [ "$(delivered_members "${BOX_A11}")" != "${EXPECTED_MEMBERS}" ] || ! delivery_forms_complete "${BOX_A11}"; then
+  die "A11 форма атаки НЕ ПОСТРОЕНА: состав/формы не верны — атаку ловил бы страж СОСТАВА/ФОРМ"
+elif [ -z "${A11_LIVE}" ] || [ "${A11_LIVE}" != "$(state_field "${BOX_A11}" digest)" ]; then
+  die "A11 форма атаки НЕ ПОСТРОЕНА: отпечаток не подлинный — атаку ловил бы страж ВЕЛИЧИНЫ"
+fi
+A11_VERDICT=0; h_verdict "${BOX_A11}" || A11_VERDICT=1
+A11_ACTED="$(sort -u "${A11_MARK}" 2>/dev/null | tr '\n' ' ')"
+kill -- "-$(cat "${A11_PIDFILE}")" 2>/dev/null || kill "$(cat "${A11_PIDFILE}")" 2>/dev/null || true
+if [ -z "${A11_ACTED}" ]; then
+  die "A11 форма атаки НЕ ПОСТРОЕНА: наблюдатель НЕ пересоздал источник за время проверки — \
+сценарий судил бы пустоту, а не возврат источника в окне чтения"
+elif [ "${A11_VERDICT}" -eq 0 ]; then
+  fail "A11 обёртка, чей наблюдатель ВЕРНУЛ источник в окне чтения (${A11_ACTED% }), признана честной.
+Доставки не было: restore — ссылки, читались байты копии. Это находка C-219 B-1"
+elif source_stayed_absent "${BOX_A11}"; then
+  fail "A11 поймана НЕ ПО ТОЙ ПРИЧИНЕ: страж окна считает, что источник не возвращался, хотя \
+наблюдатель отчитался «${A11_ACTED% }» — отвергла атаку другая проверка, страж окна вакуумен"
+else
+  pass "A11 возврат источника в окне чтения ПОЙМАН стражем окна (${A11_ACTED% }) при верном \
+составе, полных формах и подлинном отпечатке (${A11_LIVE:0:12}…)"
+fi
+unset A11_PIDFILE A11_MARK
+
+# ── A12 / A13 — SIDECAR НЕ ПРИВЕЗЁН / ПОДМЕНЁН (`C-219` B-2, `M-99`) ─────────────────────────
+# Доставка честная во всём, кроме sidecar'а: состав, формы, отпечаток, независимость от источника
+# держатся (прод-читатель на пустом манифесте читает и без него). `A12` не привозит
+# `journal.replay-digest.json`; `A13` привозит `journal.legacy.json` с ТЕМ ЖЕ смыслом, но другими
+# байтами (`{"declarations":[]}` без пробелов). Обязан поймать страж `delivery_sidecars_identical`.
+for _mode in A12 A13; do
+  make_fixture BOX_SC healthy
+  FAKE_SC="${BOX_SC}/fake-drill.sh"
+  { printf '#!/usr/bin/env bash\nMODE=%s\n' "${_mode}"; cat <<'FAKE'
+rm -rf "${JOURNAL_DRILL_RESTORE}"; mkdir -p "${JOURNAL_DRILL_RESTORE}" "$(dirname "${JOURNAL_DRILL_STATE}")"
+ALL="$(ls "${JOURNAL_DRILL_COLD}" 2>/dev/null | sed -n 's/^segment-\([0-9]\{8\}\)\.jrnl\(\.zst\)\?$/\1/p' | sort -u)"
+N="$(printf '%s\n' "${ALL}" | grep -c .)"; MID=$(( (N + 1) / 2 ))
+IDX="$(printf '%s\n' "${ALL}" | sed -n "1p;${MID}p;${N}p" | sort -u)"
+CK=0
+for i in ${IDX}; do
+  for f in "${JOURNAL_DRILL_COLD}/segment-${i}.jrnl" "${JOURNAL_DRILL_COLD}/segment-${i}.jrnl.zst"; do
+    [ -f "$f" ] && cp -- "$f" "${JOURNAL_DRILL_RESTORE}/" 2>/dev/null
+  done
+  CK=$((CK + 1))
+done
+for j in "${JOURNAL_DRILL_COLD}"/*.json; do
+  b="$(basename "$j")"
+  # ЕДИНСТВЕННОЕ жульничество — sidecar
+  [ "${MODE}" = "A12" ] && [ "$b" = "journal.replay-digest.json" ] && continue
+  if [ "${MODE}" = "A13" ] && [ "$b" = "journal.legacy.json" ]; then
+    printf '{"declarations":[]}' > "${JOURNAL_DRILL_RESTORE}/$b"; continue
+  fi
+  cp -- "$j" "${JOURNAL_DRILL_RESTORE}/"
+done
+OUT="$(${JOURNAL_DRILL_READER} --dir "${JOURNAL_DRILL_RESTORE}" --min-events 1 2>&1)"
+EV="$(printf '%s' "${OUT}" | sed -n 's/.*"events_read":\([0-9]*\).*/\1/p' | head -1)"
+DG="$(printf '%s' "${OUT}" | sed -n 's/.*"digest"[[:space:]]*:[[:space:]]*"\([0-9a-f]\{64\}\)".*/\1/p' | head -1)"
+printf '{"ok":1,"ts_wall_ms":0,"checked":%s,"events_read":%s,"digest":"%s","reason":""}\n' \
+  "${CK}" "${EV:-0}" "${DG}" > "${JOURNAL_DRILL_STATE}"
+exit 0
+FAKE
+  } > "${FAKE_SC}"
+  chmod +x "${FAKE_SC}"
+  run_drill "${BOX_SC}" "${FAKE_SC}" || true
+  SC_LIVE="$(truth_digest "${BOX_SC}/restore")"
+  if [ "$(delivered_members "${BOX_SC}")" != "${EXPECTED_MEMBERS}" ] || ! delivery_forms_complete "${BOX_SC}"; then
+    die "${_mode} форма атаки НЕ ПОСТРОЕНА: состав/формы не верны — атаку ловил бы страж СОСТАВА/ФОРМ"
+  elif [ -z "${SC_LIVE}" ] || [ "${SC_LIVE}" != "$(state_field "${BOX_SC}" digest)" ]; then
+    die "${_mode} форма атаки НЕ ПОСТРОЕНА: отпечаток не подлинный — атаку ловил бы страж ВЕЛИЧИНЫ"
+  elif ! inv_delivery "${BOX_SC}" "${SC_LIVE}" || ! source_stayed_absent "${BOX_SC}"; then
+    die "${_mode} форма атаки НЕ ПОСТРОЕНА: восстановленное не читается без источника — атаку ловил бы INV-DELIVERY"
+  elif h_verdict "${BOX_SC}"; then
+    if [ "${_mode}" = "A12" ]; then
+      fail "A12 обёртка, НЕ привёзшая sidecar journal.replay-digest.json, признана честной (C-219 B-2)"
+    else
+      fail "A13 обёртка, ПОДМЕНИВШАЯ байты journal.legacy.json, признана честной (C-219 B-2)"
+    fi
+  else
+    pass "${_mode} sidecar $([ "${_mode}" = A12 ] && echo 'НЕ ПРИВЕЗЁН' || echo 'ПОДМЕНЁН') — ПОЙМАН побайтной сверкой при \
+верном составе, формах, подлинном отпечатке (${SC_LIVE:0:12}…) и живом INV-DELIVERY"
+  fi
+done
+
 # ── R — ОТПЕЧАТОК ПРОШЛОГО ПРОГОНА ─────────────────────────────────────────────────────
 # Ловушка, названная разведкой задачи 6b: обёртка, однажды увидевшая правильное значение,
 # подставит его константой. Здесь берётся ПОДЛИННЫЙ отпечаток ДРУГОЙ фикстуры (другой нонс)
 # и предъявляется как свой. Значение настоящее — но не этого прогона.
 make_fixture BOX_R healthy
-STALE_DIGEST="$(truth_digest "${BOX_D}/cold")"
+STALE_DIGEST="${D_COLD_DIGEST}"
 if [ -z "${STALE_DIGEST}" ] || [ "${STALE_DIGEST}" = "$(truth_digest "${BOX_R}/cold")" ]; then
   die "две фикстуры дали ОДИН отпечаток (или ни одного) — одноразовость не состоялась, и
 сценарий R судил бы не тот предмет. Проверить нонс строителя (задача 6b)"
