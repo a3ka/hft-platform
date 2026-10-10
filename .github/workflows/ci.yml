@@ -22,6 +22,18 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
       - name: test (RED/GREEN — наши инварианты)
         run: cargo test --all
+      # Оракулы под `#[cfg(feature = "testing")]` (точки остановки `test_sync::rendezvous`)
+      # шаг выше НЕ исполняет: без фичи они не компилируются в тестовый бинарь вовсе.
+      # До TD-253 их гонял только `verify_M-NN.sh` своего милестоуна и после переезда гейта в
+      # архив (норма Р-2) не гонял никто: fail-closed провенанс `VB-I-11` (`red_m95_provenance_fresh`
+      # f0…f6) молчал бы на регрессии. Весь крейт, без `--test`-сужения: новый файл под фичей
+      # покрыт без правки CI. Форму шага держит барьер `check_feature_oracles.sh` (ниже).
+      - name: test --features testing (оракулы точек остановки, TD-253)
+        run: cargo test -p gateway-serve --features testing
+      - name: Барьер — каждый крейт с оракулами под фичей исполняется здесь (TD-253)
+        run: bash scripts/check_feature_oracles.sh
+      - name: Проба барьера (анти-плацебо)
+        run: bash scripts/tests/red_feature_oracles.sh
 
   security:
     name: cargo audit
