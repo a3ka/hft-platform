@@ -161,3 +161,90 @@ fn h1_level_removed_within_one_live_frame_disappears_for_client() {
          состояние бакета на последнем наблюдении: уровень, снятый внутри кадра, живёт у клиента"
     );
 }
+
+/// Последовательность одного бакета: снимок (bid 64990×5, 64980×3; ask 65010×4) → снятие 64990 →
+/// постановка 64970×2. Свежие значения на каждый вызов (`EventKind` строится заново).
+fn h2_events() -> Vec<EventKind> {
+    vec![
+        snap(&[(64_990.0, 5.0), (64_980.0, 3.0)], &[(65_010.0, 4.0)], T),
+        delta(&[(64_990.0, 0.0)], &[], 1, 2, T + 1),
+        delta(&[(64_970.0, 2.0)], &[], 3, 4, T + 2),
+    ]
+}
+
+/// Клиентская склейка для одного РАЗБИЕНИЯ событий на кадры: каждая группа дописывается в журнал и
+/// отдаётся одним вызовом `pump` (кадров на группу — сколько отдаст живой путь), кадры идут через
+/// провод. Возвращает карту клиента, карту полного пересчёта и число кадров.
+type Hm = std::collections::BTreeMap<(i64, String, i64), i64>;
+fn fold_partition(groups: &[&[usize]]) -> (Hm, Hm, usize) {
+    let s = sel();
+    let dir = tempfile::tempdir().expect("tmp");
+    append(dir.path(), vec![trade(T - 10_000)]);
+    let ckpt = tempfile::tempdir().expect("ckpt");
+    let (mut live, _) =
+        LiveReducer::resume(dir.path(), EpochFilter::OwnCaptureOnly, &s, ckpt.path())
+            .expect("resume");
+    let mut acc = live.snapshot();
+    let mut n_frames = 0;
+    for g in groups {
+        let mut evs = h2_events();
+        let picked: Vec<EventKind> = g
+            .iter()
+            .map(|&i| std::mem::replace(&mut evs[i], trade(0)))
+            .collect();
+        append(dir.path(), picked);
+        let (frames, _c, _s) = live
+            .pump(dir.path(), EpochFilter::OwnCaptureOnly, usize::MAX)
+            .expect("pump");
+        n_frames += frames.len();
+        for f in &frames {
+            let wired: gateway::Frame =
+                serde_json::from_slice(&serde_json::to_vec(f).expect("ser")).expect("de");
+            assert_eq!(acc.apply(&wired), gateway::ApplyOutcome::Applied);
+        }
+    }
+    let full = gateway::snapshot(dir.path(), EpochFilter::OwnCaptureOnly, &s, Cursor::LATEST)
+        .expect("full");
+    (heatmap_of(&acc), heatmap_of(&full), n_frames)
+}
+
+/// **`h2` — те же события, РАЗНЫЕ границы кадров на ЖИВОМ пути (план SCALE §15.9 п.2; `C-297`
+/// M-100 R1) — один и тот же итог у клиента, равный полному пересчёту.** Разбиения: всё одним
+/// кадром · по событию на кадр · снятие с постановкой вместе · постановка отдельно. Ловит и
+/// сегодняшний дефект (объединение внутри кадра), и починку, зелёную лишь при одном разбиении.
+#[test]
+fn h2_same_events_different_live_frame_boundaries_same_state() {
+    let parts: [(&str, &[&[usize]]); 4] = [
+        ("[1 2 3]", &[&[0, 1, 2]]),
+        ("[1][2][3]", &[&[0], &[1], &[2]]),
+        ("[1 2][3]", &[&[0, 1], &[2]]),
+        ("[1][2 3]", &[&[0], &[1, 2]]),
+    ];
+    let mut results = Vec::new();
+    for (name, groups) in parts {
+        let (client, full, n) = fold_partition(groups);
+        assert!(
+            n >= groups.len(),
+            "setup-страж: разбиение {name} дало {n} кадров при {} группах — границы не те",
+            groups.len()
+        );
+        let removed = (T / 1000, "bid".to_string(), to_fixed(64_990.0));
+        let added = (T / 1000, "bid".to_string(), to_fixed(64_970.0));
+        assert!(
+            !full.contains_key(&removed) && full.contains_key(&added),
+            "setup-страж: полный пересчёт обязан не содержать 64990 и содержать 64970 ({name})"
+        );
+        assert_eq!(
+            client, full,
+            "M-100 / VB-I-2 / §15.9 п.2: разбиение {name} — клиент разошёлся с полным пересчётом"
+        );
+        results.push((name, client));
+    }
+    for w in results.windows(2) {
+        assert_eq!(
+            w[0].1, w[1].1,
+            "M-100: разбиения {} и {} дали РАЗНЫЙ итог у клиента",
+            w[0].0, w[1].0
+        );
+    }
+}

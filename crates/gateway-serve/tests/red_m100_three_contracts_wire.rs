@@ -434,3 +434,61 @@ async fn w7_resubscribe_changes_view_not_calc() {
     assert_eq!(b["view"], v2);
     assert_eq!(a["data"]["calc_key_id"], b["data"]["calc_key_id"]);
 }
+
+/// Слепок прод-пути, у которого байты `12..16` заголовка (версия, которую сверяют и
+/// `read_and_validate`, и `admission::readiness`) ЯВНО переписаны на `v` — независимо от того,
+/// что пишет сегодняшний писатель (`C-297` M-100 R2).
+fn fixture_with_header_version(v: u32) -> (tempfile::TempDir, tempfile::TempDir) {
+    let (dir, ckpt) = fixture();
+    let p = gateway::checkpoint::ckpt_path_for_pub(ckpt.path(), &resolved());
+    let mut b = std::fs::read(&p).expect("read ckpt");
+    assert!(b.len() > 16, "SETUP НЕ СОСТОЯЛСЯ: слепок короче заголовка");
+    b[12..16].copy_from_slice(&v.to_le_bytes());
+    std::fs::write(&p, &b).expect("write ckpt");
+    (dir, ckpt)
+}
+
+/// **`w8` — слепок, записанный ДО `M-100` (версия состояния 11), принимается ДОПУСКОМ при проводе
+/// 12:** подписка получает снимок v12, а не `not_ready`. Это прод-случай первого деплоя `M-100`:
+/// прод-слепок `ckpt-8f69809dd707e8c9.bin` несёт 11. Мутация ТОЛЬКО `admission::readiness` обратно
+/// на `GATEWAY_SCHEMA_VERSION` делает этот сценарий красным.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn w8_pre_m100_checkpoint_state_11_admitted_under_wire_12() {
+    let _s = SERIAL.lock().await;
+    let (dir, ckpt) = fixture_with_header_version(11);
+    let mut ws = start(dir.path(), ckpt.path()).await;
+    send(
+        &mut ws,
+        json!({"op":"subscribe","v":1,"id":"w8","selector":sel_json(Some(SEVEN.to_vec()), 60_000)}),
+    )
+    .await;
+    let m = next_of(&mut ws, "w8", "snapshot").await;
+    assert_eq!(
+        m["data"]["schema_version"],
+        json!(12),
+        "M-100 / план §15.6: слепок с версией состояния 11 обязан дать снимок провода v12: {m}"
+    );
+}
+
+/// **`w9` — слепок с ЧУЖОЙ версией состояния (10, и 12 = версия провода) допуск НЕ принимает:**
+/// названный `not_ready`, а не тихий холодный пересчёт и не принятие (развязка ≠ «принимать всё»).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn w9_foreign_state_version_is_not_ready() {
+    let _s = SERIAL.lock().await;
+    for v in [10u32, 12] {
+        let (dir, ckpt) = fixture_with_header_version(v);
+        let mut ws = start(dir.path(), ckpt.path()).await;
+        let id = format!("w9-{v}");
+        send(
+            &mut ws,
+            json!({"op":"subscribe","v":1,"id":id,"selector":sel_json(Some(SEVEN.to_vec()), 60_000)}),
+        )
+        .await;
+        let e = next_of(&mut ws, &id, "error").await;
+        assert_eq!(
+            e["code"],
+            json!("not_ready"),
+            "M-100: слепок с версией состояния {v} ≠ CALC_STATE_VERSION допущен: {e}"
+        );
+    }
+}
