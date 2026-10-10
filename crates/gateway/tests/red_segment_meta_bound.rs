@@ -237,10 +237,16 @@ fn build_prod_form(target: usize) -> (tempfile::TempDir, u64) {
 }
 
 fn new_session(dir: &Path, ckpt: &Path) -> gateway::LiveReducer {
+    new_session_with_stats(dir, ckpt).0
+}
+
+/// M-95 (`C-284` B1): граница наблюдения — ПЕРВОЕ НАБЛЮДЕНИЕ КАТАЛОГА СЕССИЕЙ, то есть `resume`
+/// вместе с первым тактом. После M-95 каталог строится в `resume` и передаётся редуктору; его
+/// цена честно приходит из `resume` (`ReadStats::segment_meta_ops` того API, которое обошло
+/// каталог), а не переносится числом в такт.
+fn new_session_with_stats(dir: &Path, ckpt: &Path) -> (gateway::LiveReducer, gateway::ReadStats) {
     let s = sel();
-    let (live, _st) =
-        gateway::LiveReducer::resume(dir, EpochFilter::OwnCaptureOnly, &s, ckpt).expect("resume");
-    live
+    gateway::LiveReducer::resume(dir, EpochFilter::OwnCaptureOnly, &s, ckpt).expect("resume")
 }
 
 fn catch_up(live: &mut gateway::LiveReducer, dir: &Path) {
@@ -278,15 +284,18 @@ fn sm1_counter_measures_operations_not_calls() {
 
     let ck_b = tempfile::tempdir().expect("ck");
     let ck_s = tempfile::tempdir().expect("ck");
-    let mut lb = new_session(big.path(), ck_b.path());
-    let mut ls = new_session(small.path(), ck_s.path());
+    let (mut lb, rb) = new_session_with_stats(big.path(), ck_b.path());
+    let (mut ls, rs) = new_session_with_stats(small.path(), ck_s.path());
 
-    let (_f, _c, sb) = lb
+    let (_f, _c, mut sb) = lb
         .pump(big.path(), EpochFilter::OwnCaptureOnly, 256)
         .expect("pump big");
-    let (_f, _c, ss) = ls
+    let (_f, _c, mut ss) = ls
         .pump(small.path(), EpochFilter::OwnCaptureOnly, 256)
         .expect("pump small");
+    // M-95 (`C-284` B1): мера — первое наблюдение каталога сессией (`resume` + первый такт).
+    sb.segment_meta_ops += rb.segment_meta_ops;
+    ss.segment_meta_ops += rs.segment_meta_ops;
 
     let n_big = n_segments(big.path()) as u64;
     let n_small = n_segments(small.path()) as u64;
@@ -304,6 +313,17 @@ fn sm1_counter_measures_operations_not_calls() {
          манифест, делает read_dir и классифицирует КАЖДЫЙ сегмент (metadata + один-два \
          open). Счётчик, показывающий меньше, считает не операции, а вызовы — мутант \
          `countfake`, и верхний порог его не ловит в принципе.",
+        sb.segment_meta_ops
+    );
+    // M-95 (`C-284` B1): ВЕРХНЯЯ граница — ОДИН обход каталога (эталон — независимое
+    // `SegmentCatalog::open`) плюс бюджет одного установившегося такта. Ловит и второй обход в
+    // сессии (сегодняшняя цена), и «перенос» числа из `resume` в такт с двойным учётом.
+    let one_walk = full_scan_cost(big.path());
+    assert!(
+        sb.segment_meta_ops <= one_walk + BUDGET_META,
+        "SM-1 / M-95: первое наблюдение каталога сессией (resume + первый такт) стоило {} \
+         операций при цене ОДНОГО обхода {one_walk} (+ такт {BUDGET_META}): каталог обойдён \
+         больше одного раза, либо цена учтена дважды",
         sb.segment_meta_ops
     );
     assert!(
@@ -417,11 +437,13 @@ fn sm3_first_tick_legitimately_pays_full_price() {
 
     let (dir, _n) = build_prod_form(N_SEGMENTS);
     let ckpt = tempfile::tempdir().expect("ckpt");
-    let mut live = new_session(dir.path(), ckpt.path());
+    let (mut live, at_resume) = new_session_with_stats(dir.path(), ckpt.path());
 
-    let (_f, _c, first) = live
+    let (_f, _c, mut first) = live
         .pump(dir.path(), EpochFilter::OwnCaptureOnly, 256)
         .expect("pump 1");
+    // M-95 (`C-284` B1): первое наблюдение каталога сессией — `resume` + первый такт.
+    first.segment_meta_ops += at_resume.segment_meta_ops;
     let n_seg = n_segments(dir.path()) as u64;
 
     assert!(

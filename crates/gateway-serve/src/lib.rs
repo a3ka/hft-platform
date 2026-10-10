@@ -1525,7 +1525,7 @@ pub mod server {
                             "m87-add:{id_for_rendezvous}"
                         ));
                     }
-                    let (live, stats) = gateway::LiveReducer::resume(
+                    let (mut live, stats) = gateway::LiveReducer::resume(
                         &path_clone,
                         filter_clone,
                         &sel_for_resume,
@@ -1543,20 +1543,81 @@ pub mod server {
                         ));
                     }
                     let mut snap = live.snapshot_checked()?;
-                    // M-87 (задача 20, §14.1decies): fail-closed обвязка над
-                    // пересчётом провенанса истории. Честная функция лежит в
-                    // `gateway::checkpoint`, но при сбое перезапись НЕ ДОЛЖНА молча
-                    // пропускаться — клиент получил бы замороженное
-                    // `history_truncated=false` из слепка, снятого до ретеншена, и счёл бы
-                    // историю полной (VB-I-11). Обвязка возвращает `truncated=true` при
-                    // ЛЮБОМ `Err(_)` и сохраняет `start_seq` из слепка как лучшее
-                    // известное значение.
-                    let (live_start, live_truncated) =
-                        gateway::checkpoint::history_provenance_for_serve(
-                            &path_for_history,
-                            filter_for_history.clone(),
-                            snap.history_start_seq,
-                        );
+                    // M-95 (задача 1, §3 спеки, `VB-I-11`): провенанс истории считается
+                    // по КАТАЛОГУ РЕДУКТОРА, построенному `resume` (а не через
+                    // отдельный `list_segments`/`SegmentCatalog::open`). Между
+                    // построением каталога и расчётом провенанса — точка остановки
+                    // `m95-catalog:<id>` (только `feature = "testing"`; M-65/M-87
+                    // rendezvous), где тест может удалить ранний сегмент. После точки
+                    // реализация ОБЯЗАНА проверить свежесть каталога (`is_fresh` →
+                    // `refresh` при необходимости) и только потом считать провенанс —
+                    // иначе снимок скажет «история полная» для журнала, у которого
+                    // ретеншен уже спрунил префикс. Точка ДОКАЗЫВАЕТ ПОРЯДОК: до неё
+                    // (через сторож inotify на раннем `.zst`) — каталог построен; между
+                    // ней и провенансом — нет чужого `pump`/`is_fresh`/`refresh`
+                    // (через свидетеля дописи, `A-050` A2).
+                    //
+                    // Каталог живёт в `LiveReducer.segment_catalog` (M-95, §3 спеки);
+                    // забираем владением, чтобы вызвать мутирующий `is_fresh`, и
+                    // кладём обратно перед возвратом `Sub`. На отсутствующем каталоге
+                    // (сбой `SegmentCatalog::open` в `resume`) — безопасный путь
+                    // `(frozen, true)`, как `history_provenance_for_serve` до M-95.
+                    #[cfg(feature = "testing")]
+                    {
+                        let id_for_rendezvous = id_for_closure.clone();
+                        crate::test_sync::rendezvous::pump_signal_and_wait(&format!(
+                            "m95-catalog:{id_for_rendezvous}"
+                        ));
+                    }
+                    let (live_start, live_truncated) = match live.take_segment_catalog() {
+                        Some(mut cat) => {
+                            // is_fresh/refresh — мутирующие; здесь это СВОЯ операция
+                            // реализации (не чужой pump), и она должна быть АТОМАРНА
+                            // с расчётом провенанса — между ними нет ни точки, ни
+                            // чужого `pump` (свидетель в `red_m95_provenance_fresh`).
+                            //
+                            // R-249 Б-1 (M-95 §3/§6, VB-I-11): отказ `is_fresh` ИЛИ
+                            // `refresh` НЕ глотается (`unwrap_or_default`, `let _ =`).
+                            // На ЛЮБОЙ `Err` свежесть каталога НЕ подтверждена ⇒
+                            // провенанс НЕ считается по этому каталогу: исход
+                            // `(frozen_start_seq, true)` — «не знаем, не обещаем»,
+                            // как `history_provenance_for_serve` до M-95 (M-87 задача 20,
+                            // оракул `red_m87_history_provenance_failclosed` `h3`/`h4`).
+                            // Мутант «вернуть `let _ =`»: ветку `is_fresh → Err`
+                            // сторожат оракулы `f3` (v1) / `f4` (legacy) — `chmod 0300`
+                            // на каталоге журнала даёт `Err` в `is_fresh` (`scan_dir_layout`
+                            // → `read_dir`), до `refresh` дело не доходит; ветку
+                            // `is_fresh → Ok(false)` + `refresh → Err` сторожат
+                            // `f5` (v1) / `f6` (legacy) — diff > 2 ⇒ `is_fresh = Ok(false)`,
+                            // затем ретеншен закрывает один оставшийся `.zst` (`000`) и
+                            // `refresh` падает на классификации (R-249 Б-1, R-250 Б-1).
+                            let fresh_ok = cat
+                                .is_fresh(&path_for_history)
+                                .map(|(f, _ops)| f);
+                            let provenance_via_catalog = match fresh_ok {
+                                Ok(true) => Some(
+                                    gateway::checkpoint::current_history_provenance_with_catalog(
+                                        &cat,
+                                        &filter_for_history,
+                                    ),
+                                ),
+                                Ok(false) => match cat.refresh(&path_for_history) {
+                                    Ok(_ops) => Some(
+                                        gateway::checkpoint::current_history_provenance_with_catalog(
+                                            &cat,
+                                            &filter_for_history,
+                                        ),
+                                    ),
+                                    Err(_) => None, // R-249 Б-1: fail-closed
+                                },
+                                Err(_) => None, // R-249 Б-1: fail-closed
+                            };
+                            live.put_segment_catalog(cat);
+                            provenance_via_catalog
+                                .unwrap_or((snap.history_start_seq, true))
+                        }
+                        None => (snap.history_start_seq, true),
+                    };
                     snap.history_start_seq = live_start;
                     snap.history_truncated = live_truncated;
                     // M-87 (задача 23, R-196 №5 / R-200 §B7 / R-201 Б-2): счётчик
@@ -2332,17 +2393,71 @@ pub mod server {
                 Ok(snap) => snap,
                 Err(e) => return Err(e),
             };
-            // M-87 (задача 20, §14.1decies): fail-closed обвязка над пересчётом
-            // провенанса истории. При сбое вычисления клиенту уходит `truncated=true` с
-            // `start_seq` из слепка — лучшее, что известно. Молчаливое поглощение ошибки
-            // здесь вернуло бы замороженное `history_truncated=false` и соврало бы о
-            // полноте после ретеншена (VB-I-11).
-            let (live_start, live_truncated) =
-                crate::_gw::history_provenance_for_serve(
-                    cfg1.journal_dir.as_path(),
-                    cfg1.filter.clone(),
-                    snap.history_start_seq,
-                );
+            // M-95 (задача 3, §3 спеки, `VB-I-11`): legacy-путь — точка остановки
+            // `m95-catalog:legacy` ПОСЛЕ цикла догона (`loop { pump }`) и `snapshot_checked`,
+            // непосредственно перед расчётом провенанса. На legacy-пути МЕЖДУ `resume` и
+            // провенансом лежит догон: его `pump`-ы уже обновили каталог через
+            // `is_fresh`/`refresh`. Если точка стоит ДО догона, проверку свежести делает
+            // ЧУЖОЙ `pump` (мутант E5), и провенанс без собственной проверки оказывается
+            // честен случайно (`A-050` E5). После догона — каталог отражает состояние
+            // журнала на момент снимка; точка даёт тесту убрать ранний сегмент; далее
+            // реализация ОБЯЗАНА проверить свежесть каталога ещё раз (точка ввела
+            // изменение) и только потом считать провенанс. Свидетель дописи (A-050 A2)
+            // ловит случай, когда drain прошёл ПОСЛЕ точки — `upto_seq` снапшота был бы
+            // ≥ `TAIL_END`.
+            #[cfg(feature = "testing")]
+            {
+                crate::test_sync::rendezvous::pump_signal_and_wait("m95-catalog:legacy");
+            }
+            // M-87 (задача 20, §14.1decies) + M-95 (задача 1, §3): провенанс по КАТАЛОГУ
+            // редьюктора (построен `resume` и обновлён дренажем). На `None` каталога
+            // (сбой `SegmentCatalog::open`) — безопасный путь `(frozen, true)`.
+            let (live_start, live_truncated) = match live.take_segment_catalog() {
+                Some(mut cat) => {
+                    // is_fresh/refresh — СВОЯ операция реализации (атомарна с расчётом
+                    // провенанса); на legacy каталог уже обновлён дренажем, и `is_fresh`
+                    // здесь срабатывает только при изменении МЕЖДУ точкой и расчётом
+                    // (то есть сделанном ТЕСТОМ в остановке).
+                    //
+                    // R-249 Б-1 (M-95 §3/§6, VB-I-11): отказ `is_fresh` ИЛИ `refresh`
+                    // НЕ глотается (`unwrap_or_default`, `let _ =`). На ЛЮБОЙ `Err`
+                    // свежесть каталога НЕ подтверждена ⇒ провенанс НЕ считается по
+                    // этому каталогу: исход `(frozen_start_seq, true)` — «не знаем,
+                    // не обещаем», как `history_provenance_for_serve` до M-95 (M-87
+                    // задача 20, оракул `red_m87_history_provenance_failclosed` `h3`/`h4`).
+                    // Мутант «вернуть `let _ =`»: ветку `is_fresh → Err`
+                    // сторожат оракулы `f3` (v1) / `f4` (legacy) — `chmod 0300`
+                    // на каталоге журнала даёт `Err` в `is_fresh` (`scan_dir_layout`
+                    // → `read_dir`), до `refresh` дело не доходит; ветку
+                    // `is_fresh → Ok(false)` + `refresh → Err` сторожат
+                    // `f5` (v1) / `f6` (legacy) — diff > 2 ⇒ `is_fresh = Ok(false)`,
+                    // затем ретеншен закрывает один оставшийся `.zst` (`000`) и
+                    // `refresh` падает на классификации (R-249 Б-1, R-250 Б-1).
+                    let fresh_ok = cat
+                        .is_fresh(cfg1.journal_dir.as_path())
+                        .map(|(f, _ops)| f);
+                    let provenance_via_catalog = match fresh_ok {
+                        Ok(true) => Some(
+                            crate::_gw::current_history_provenance_with_catalog(
+                                &cat, &cfg1.filter,
+                            ),
+                        ),
+                        Ok(false) => match cat.refresh(cfg1.journal_dir.as_path()) {
+                            Ok(_ops) => Some(
+                                crate::_gw::current_history_provenance_with_catalog(
+                                    &cat, &cfg1.filter,
+                                ),
+                            ),
+                            Err(_) => None, // R-249 Б-1: fail-closed
+                        },
+                        Err(_) => None, // R-249 Б-1: fail-closed
+                    };
+                    live.put_segment_catalog(cat);
+                    provenance_via_catalog
+                        .unwrap_or((snap.history_start_seq, true))
+                }
+                None => (snap.history_start_seq, true),
+            };
             snap.history_start_seq = live_start;
             snap.history_truncated = live_truncated;
             let snap_msg = ServeMsg::Snapshot(snap);
@@ -2818,9 +2933,9 @@ pub mod server {
 #[doc(hidden)]
 pub mod _gw {
     pub use gateway::{
-        checkpoint::history_provenance_for_serve, frames_since, snapshot, snapshot_from_checkpoint,
-        Cursor, Frame, LiveReducer, ReadStats, Selector, SeriesBundle, Snapshot,
-        GATEWAY_SCHEMA_VERSION,
+        checkpoint::{current_history_provenance_with_catalog, history_provenance_for_serve},
+        frames_since, snapshot, snapshot_from_checkpoint, Cursor, Frame, LiveReducer, ReadStats,
+        Selector, SeriesBundle, Snapshot, GATEWAY_SCHEMA_VERSION,
     };
 }
 

@@ -4182,6 +4182,39 @@ pub mod checkpoint {
             Err(_) => (frozen_start_seq, true),
         }
     }
+
+    /// M-95 (задача 1, §3 спеки — `VB-I-11`): провенанс истории, считаемый по
+    /// **уже построенному** `SegmentCatalog`. Семантика ИДЕНТИЧНА
+    /// [`Self::current_history_provenance`]: `(start_seq, truncated)` где
+    /// `truncated = true` ⇔ самый ранний видимый фильтром `first_seq > 0`
+    /// (префикс удалён retention-prune). Преимущество — не делает повторного
+    /// `journal::list_segments(dir)`, расходуя тем самым ещё один полный обход
+    /// каталога поверх того, что уже оплатил `LiveReducer::resume` (§3 спеки:
+    /// одна подписка — ровно один `SegmentCatalog` на троих потребителей —
+    /// lineage / провенанс / первый pump).
+    ///
+    /// NB: эта функция НЕ делает `is_fresh`/`refresh` — это ответственность вызывающего.
+    /// В snapshot-пути `gateway-serve` зовёт `is_fresh`/`refresh` ПЕРЕД расчётом
+    /// провенанса (спека §3: точка остановки `m95-catalog:*` стоит НЕПОСРЕДСТВЕННО
+    /// перед расчётом, между точкой и провенансом нет `pump`/`is_fresh`/`refresh`).
+    /// Тем самым гарантируется, что провенанс считается по АКТУАЛЬНОМУ каталогу.
+    pub fn current_history_provenance_with_catalog(
+        catalog: &journal::SegmentCatalog,
+        filter: &EpochFilter,
+    ) -> (u64, bool) {
+        let mut min_seq: Option<u64> = None;
+        for s in catalog.segments() {
+            if filter.accepts(&s.header) {
+                min_seq =
+                    Some(min_seq.map_or(s.header.first_seq, |m: u64| m.min(s.header.first_seq)));
+            }
+        }
+        match min_seq {
+            Some(seq) if seq > 0 => (seq, true),
+            Some(seq) => (seq, false),
+            None => (0, false),
+        }
+    }
     /// M-38b: заголовок чекпоинта — magic + версии + фингерпринты + lineage + cursor.
     /// Сериализуется как первая часть файла ДО postcard(state), чтобы при изменении
     /// формата валидация отказывала БЕЗ попытки десериализации state.
@@ -4685,6 +4718,31 @@ pub mod checkpoint {
         Ok(read_and_validate(&bytes, dir, sel, filter))
     }
 
+    /// M-95 (задача 1, TD-229): `read_checkpoint`, использующий ПЕРЕИСПОЛЬЗОВАННЫЙ
+    /// `SegmentCatalog` для lineage-сверки. Семантика `None`-исхода идентична
+    /// [`Self::read_checkpoint`] — отсутствие/негодность чекпоинта = silent rebuild.
+    pub(super) fn read_checkpoint_with_catalog(
+        ckpt_dir: &Path,
+        sel: &Selector,
+        filter: EpochFilter,
+        catalog: &journal::SegmentCatalog,
+    ) -> io::Result<Option<(Reducer, Cursor, CkptHeader)>> {
+        let ckpt_path = ckpt_path_for(ckpt_dir, sel);
+        if !ckpt_path.exists() {
+            return Ok(None);
+        }
+        let bytes = match fs::read(&ckpt_path) {
+            Ok(b) => b,
+            Err(_) => return Ok(None),
+        };
+        // `dir` формально нужен `read_and_validate` для совместимости сигнатуры, но
+        // M-95-путь игнорирует его — каталог уже построен.
+        let dir = ckpt_path.parent().unwrap_or_else(|| Path::new(""));
+        Ok(read_and_validate_with_catalog(
+            &bytes, dir, sel, filter, catalog,
+        ))
+    }
+
     /// M-48 (task #8, B1 reviewer): прочитать ТОЛЬКО заголовок чекпоинта из файла.
     /// Парсит magic + `ckpt_schema_version` + postcard-заголовок (offsets 0..20+header_len).
     /// Возвращает `Some(CkptHeader)` ДАЖЕ если состояние непригодно к использованию —
@@ -4756,6 +4814,43 @@ pub mod checkpoint {
         sel: &Selector,
         filter: EpochFilter,
     ) -> Option<(Reducer, Cursor, CkptHeader)> {
+        read_and_validate_inner(bytes, dir, sel, filter, None)
+    }
+
+    /// M-95 (задача 1, TD-229): `read_and_validate`, принимающий уже построенный
+    /// `SegmentCatalog`. Семантика ИДЕНТИЧНА [`Self::read_and_validate`] — проверяются
+    /// magic / версии / длина / CRC / state decode / фингерпринты / lineage — с той
+    /// разницей, что lineage-сверка идёт по ПЕРЕИСПОЛЬЗОВАННОМУ каталогу, а не через
+    /// свежий `journal::list_segments(dir)`. Зачем: `LiveReducer::resume` строит каталог
+    /// РОВНО ОДИН раз на подписку (§3 спеки), и lineage ОБЯЗАН делить этот обход.
+    /// На непустом `catalog` (Segments присутствуют) — `validate_lineage_with_catalog` —
+    /// тот же `validate_lineage_inner`, что и путь через `list_segments`; иначе поведение
+    /// вырождается в исходное.
+    pub(super) fn read_and_validate_with_catalog(
+        bytes: &[u8],
+        dir: &Path,
+        sel: &Selector,
+        filter: EpochFilter,
+        catalog: &journal::SegmentCatalog,
+    ) -> Option<(Reducer, Cursor, CkptHeader)> {
+        read_and_validate_inner(bytes, dir, sel, filter, Some(catalog))
+    }
+
+    /// R-249 Н-3 (M-95 §6): единственный экземпляр валидации слепка. На `Some(cat)` —
+    /// lineage по ПЕРЕИСПОЛЬЗОВАННОМУ каталогу (M-95, один обход на подписку); на
+    /// `None` — через свежий `journal::list_segments(dir)`. Раньше это были две
+    /// ~70-строчные копии с расхождением только в шаге (10); любая правка правил
+    /// валидации (magic, версия, CRC, фингерпринты, lineage) была обязана попасть в
+    /// ОБЕ, и ничто этого не проверяло. Тонкие обёртки [`Self::read_and_validate`]
+    /// и [`Self::read_and_validate_with_catalog`] выбирают источник lineage и не
+    /// дублируют шаги (1)–(9) и (11).
+    fn read_and_validate_inner(
+        bytes: &[u8],
+        dir: &Path,
+        sel: &Selector,
+        filter: EpochFilter,
+        catalog: Option<&journal::SegmentCatalog>,
+    ) -> Option<(Reducer, Cursor, CkptHeader)> {
         if bytes.len() < 8 + 4 + 4 + 4 {
             return None;
         }
@@ -4820,8 +4915,16 @@ pub mod checkpoint {
         if header.epoch_filter_fingerprint != epoch_filter_fingerprint(&filter) {
             return None;
         }
-        // (10) journal_lineage — суффикс-совместимая валидация
-        if !validate_lineage(dir, &filter, &header.journal_lineage, header.cursor) {
+        // (10) journal_lineage — суффикс-совместимая валидация. Источник: `Some(cat)` —
+        //     ПЕРЕИСПОЛЬЗОВАННЫЙ каталог (M-95 §3, один обход на подписку); `None` —
+        //     свежий `journal::list_segments(dir)` (исходный путь).
+        let lineage_ok = match catalog {
+            Some(cat) => {
+                validate_lineage_with_catalog(cat, &filter, &header.journal_lineage, header.cursor)
+            }
+            None => validate_lineage(dir, &filter, &header.journal_lineage, header.cursor),
+        };
+        if !lineage_ok {
             return None;
         }
         // (11) cursor > at — это проверит вызывающий (ему виднее at).
@@ -4836,6 +4939,34 @@ pub mod checkpoint {
     ///     курсором чекпоинта (законный retention-prune);
     /// (в) любое расхождение/переупорядочивание/неизвестный сегмент внутри покрытого
     ///     диапазона → invalid.
+    /// M-95 (задача 1, TD-229): вариант `validate_lineage`, принимающий уже построенный
+    /// `SegmentCatalog` от caller'а. Семантика ИДЕНТИЧНА [`Self::validate_lineage`]:
+    /// суффикс-совместимая сверка манифеста чекпоинта против ТЕКУЩЕГО состава каталога.
+    /// Зачем отдельный путь: `LiveReducer::resume` строит `SegmentCatalog::open(dir)` РОВНО
+    /// ОДИН раз на подписку (§3 спеки — TD-229, чтобы все три потребителя
+    /// — `validate_lineage`, `current_history_provenance`, и начальный `pump` — делили один
+    /// обход). Повторный `journal::list_segments(dir)` ради lineage сжёг бы выигрыш.
+    /// На `Err` пустого каталога — `false` (как `validate_lineage`); на пустом срезе
+    /// видимых — то же правило, что у [`Self::validate_lineage`].
+    ///
+    /// Делегирует общую логику в [`Self::validate_lineage_inner`], чтобы любые правки
+    /// правил lineage-сверки синхронно отражались в обоих путях.
+    pub(super) fn validate_lineage_with_catalog(
+        catalog: &journal::SegmentCatalog,
+        filter: &EpochFilter,
+        manifest: &[SegmentHeader],
+        ckpt_cursor: Cursor,
+    ) -> bool {
+        let mut cur_headers: Vec<SegmentHeader> = catalog
+            .segments()
+            .iter()
+            .filter(|s| filter.accepts(&s.header))
+            .map(|s| s.header.clone())
+            .collect();
+        cur_headers.sort_by_key(|h| h.first_seq);
+        validate_lineage_inner(&cur_headers, manifest, ckpt_cursor)
+    }
+
     fn validate_lineage(
         dir: &Path,
         filter: &EpochFilter,
@@ -4853,7 +4984,19 @@ pub mod checkpoint {
             .map(|s| s.header)
             .collect();
         cur_headers.sort_by_key(|h| h.first_seq);
+        validate_lineage_inner(&cur_headers, manifest, ckpt_cursor)
+    }
 
+    /// Общая логика lineage-сверки, выделенная для [`Self::validate_lineage_with_catalog`]
+    /// (M-95, задача 1, §3 спеки — оба пути делят один источник истины; иначе любая правка
+    /// правил суффикс-совместимости в одном пути оставляла бы второй ложным). Вызывается
+    /// после подготовки `cur_headers` от caller'а (`Vec<SegmentHeader>`, отфильтрованный
+    /// и отсортированный по `first_seq`).
+    fn validate_lineage_inner(
+        cur_headers: &[SegmentHeader],
+        manifest: &[SegmentHeader],
+        ckpt_cursor: Cursor,
+    ) -> bool {
         // Манифест отсортирован по first_seq (advance_to это гарантирует).
         if manifest.is_empty() {
             // Без манифеста — допустимо ТОЛЬКО при пустом журнале (first seq = 0).
@@ -4870,7 +5013,7 @@ pub mod checkpoint {
         // (1) Все ВИДИМЫЕ сегменты должны либо быть в манифесте с совпадением
         //     (`first_seq/source/provenance/epoch_id/schema_version`), либо быть
         //     ВНЕ покрытого диапазона (т.е. иметь `first_seq > ckpt_max_seq`).
-        for h in &cur_headers {
+        for h in cur_headers {
             let in_manifest = manifest.iter().any(|m| {
                 m.first_seq == h.first_seq
                     && m.schema_version == h.schema_version
@@ -5027,9 +5170,13 @@ pub struct LiveReducer {
     /// пути), и компакцию закрытого сегмента (`read_dir` увидит иной состав имён
     /// при неизменённом active).
     ///
-    /// `None` — кеша ещё нет (до первого `pump()` после `resume()`); первый же
-    /// `pump()` строит кеш через `SegmentCatalog::open(dir)`, последующие —
-    /// проверяют свежесть и переиспользуют.
+    /// **M-95 (§3 спеки, TD-229):** кеш строится УЖЕ В `resume()` (а не в первом `pump`)
+    /// и используется ТРЕМЯ потребителями сразу — `validate_lineage` (через
+    /// `read_checkpoint_with_catalog`), `current_history_provenance_with_catalog` (провенанс
+    /// истории в snapshot-пути), и первым `pump`-ом (`stream_from_at_with_catalog` со
+    /// `Some(catalog)`). Без этого каждая подписка обходила каталог ТРИЖДЫ (`TD-229`).
+    /// На warm-пути и cold-пути — `SegmentCatalog::open(dir)` с честным `segment_meta_ops`
+    /// в `ReadStats` (`C-284` B1).
     segment_catalog: Option<journal::SegmentCatalog>,
 }
 
@@ -5049,9 +5196,41 @@ impl LiveReducer {
         let dir = dir.as_ref();
         let ckpt_dir = ckpt_dir.as_ref();
 
-        if let Some((r, cursor, header)) =
-            checkpoint::read_checkpoint(dir, ckpt_dir, sel, filter.clone())?
-        {
+        // M-95 (задача 1, §3 спеки, TD-229): построить `SegmentCatalog` РОВНО ОДИН раз
+        // на подписку. Каталог делят ТРИ потребителя — `validate_lineage` (через
+        // `read_checkpoint_with_catalog`), `current_history_provenance_with_catalog`
+        // (провенанс истории в snapshot-пути), и первый `pump` (`stream_from_at_with_catalog`
+        // со `Some(catalog)`). До этой правки каждый делал свой `journal::list_segments` /
+        // `SegmentCatalog::open` — три обхода на одну подписку.
+        //
+        // Цена построения (`segment_meta_ops`) честно попадает в `ReadStats` от ТОГО API,
+        // который их выполнил (`C-284` B1): resume — это `SegmentCatalog::open` (а не
+        // первый такт, который раньше делал `open` и писал ops в свой `ReadStats`).
+        //
+        // При `Err` построения каталога — оба warm/cold пути возвращают `segment_catalog:
+        // None`, и вызывающий обязан упасть на безопасный (frozen, true) исход в
+        // провенансе (как `history_provenance_for_serve` до M-95). На проде такой сбой
+        // НЕВОЗМОЖЕН: каталог существует пока существует директория, а `dir` уже
+        // открывался раньше по стеку (readiness, read_checkpoint). Тест `k1…k4` защищён
+        // отдельным сценарием и не зависит от этой ошибки.
+        let (catalog, catalog_meta_ops) = match journal::SegmentCatalog::open(dir) {
+            Ok((c, ops)) => (Some(c), ops),
+            Err(_) => (None, 0),
+        };
+
+        // `validate_lineage_with_catalog` нужен НЕ ТОЛЬКО warm-пути: на cold-пути
+        // чекпоинта нет, и lineage не проверяется. Поэтому `catalog_for_read` берётся
+        // из только что построенного `catalog` (`Some` — норма; `None` — на холодном
+        // каталоге построение не удалось, warm-путь ниже корректно это видит и
+        // пере-валидирует через старый `validate_lineage`, иначе проглатывает сбой).
+        let catalog_for_read: Option<&journal::SegmentCatalog> = catalog.as_ref();
+
+        if let Some((r, cursor, header)) = match catalog_for_read {
+            Some(cat) => {
+                checkpoint::read_checkpoint_with_catalog(ckpt_dir, sel, filter.clone(), cat)?
+            }
+            None => checkpoint::read_checkpoint(dir, ckpt_dir, sel, filter.clone())?,
+        } {
             // Чекпоинт валиден: `r.vwap.sum_pv`/`sum_v` — уже честная since-genesis сумма
             // (advance_to накопил её реальным `Reducer::apply` от START). `values` чекпоинта
             // — окно прошлых эмитов, НЕ переносим (см. doc-комментарий `LiveReducer`).
@@ -5094,8 +5273,14 @@ impl LiveReducer {
             // реальные байты хвоста.
             let ckpt_path = checkpoint::ckpt_path_for(ckpt_dir, sel);
             let ckpt_bytes_read = std::fs::metadata(&ckpt_path).map(|m| m.len()).unwrap_or(0);
+            // M-95 (задача 1, `C-284` B1): `segment_meta_ops` описывает работу `resume` —
+            // построение `SegmentCatalog::open(dir)`. Эта цена честно приходит от resume,
+            // а НЕ переносится числом в первый `pump` (запрет §6). На warm-пути до M-95
+            // цена была 0 (SegmentCatalog строил первый pump) и в `ReadStats.resume`
+            // не попадала — теперь попадает.
             let stats = ReadStats {
                 payload_bytes_read: ckpt_bytes_read,
+                segment_meta_ops: catalog_meta_ops,
                 ..ReadStats::default()
             };
             return Ok((
@@ -5116,11 +5301,15 @@ impl LiveReducer {
                     // заполнен ПЕРВЫМ ЖЕ pump'ом через `EventStream::tail_hint()`.
                     // Прямо здесь его вычислить нельзя: `EventStream` ещё не построен.
                     tail_hint: None,
-                    // M-62 (TD-120): кеш перечня сегментов строится первым же `pump()` —
-                    // он зовёт `SegmentCatalog::open(dir)`, который вернёт построенный кеш
-                    // обратно; здесь его вычислять нельзя, т.к. `dir` доступен caller'у,
-                    // а здесь мы НЕ читаем журнал (см. sacred `red_frames_seek_bound`).
-                    segment_catalog: None,
+                    // M-95 (задача 1, §3 спеки): кеш уже построен `resume` и СЕЙЧАС
+                    // же используется lineage-сверкой. Хранится в `LiveReducer`, чтобы
+                    // (а) провенанс истории в snapshot-пути считался по НЕМУ
+                    // (`current_history_provenance_with_catalog`); (б) первый `pump`
+                    // НЕ делал ещё один `SegmentCatalog::open` — а шёл по ветке
+                    // `is_fresh`/`refresh` (см. `stream_from_at_with_catalog(Some(cat))`).
+                    // На warm-пути lineage УЖЕ проверена этим каталогом, второй
+                    // обход НЕ нужен.
+                    segment_catalog: catalog,
                 },
                 stats,
             ));
@@ -5141,6 +5330,13 @@ impl LiveReducer {
         // `0`/`false` соврал бы о честности (регрессия поймана `o6_pruned_journal_
         // is_honestly_marked`, `crates/gateway-serve/tests/red_ws_honesty_sessions.rs` —
         // сценарий БЕЗ чекпоинта на журнале с удалённым первым сегментом).
+        //
+        // R-249 Н-4 (M-95 §3/§6, VB-I-11): холодный путь `resume` НЕ использует
+        // каталог для провенанса. Источник — seq ПЕРВОГО РЕАЛЬНО свёрнутого события
+        // из `journal::stream` ниже, КАК ДО M-95. `header.first_seq` каталога НЕ
+        // подходит: у legacy-сегментов он синтезирован нулём (TD-030), и `truncated`
+        // соврал бы о честности. На `Err` построения каталога — НЕ `(0, false)`:
+        // провенанс строится из стрима независимо от судьбы каталога.
         let mut stream = journal::stream(dir, filter)?;
         let mut first_seq: Option<u64> = None;
         for event in &mut stream {
@@ -5149,11 +5345,22 @@ impl LiveReducer {
                 first_seq = Some(event.seq);
             }
         }
+        // R-249 Н-4: источник провенанса холодного пути — `first_seq` из стрима
+        // (первое реально свёрнутое событие), а не `header.first_seq` каталога.
+        let (history_start_seq, history_truncated) = match first_seq {
+            Some(seq) => (seq, seq > 0),
+            None => (0, false),
+        };
         // M-68 (TD-158): `depth_levels_visited = 0` — здесь НЕТ `Reducer::apply`-прохода
         // (только холостой обход ради честных `events_*`/`segment_meta_ops` и провенанса
         // истории, `full` заполняется следующим `pump()`).
         let mut stats = read_stats_from_stream(&stream, 0);
-        // M-87 (задача 23, R-196 №5 / R-200 §B7 / R-201 Б-2): COLD-путь —
+        // M-95 (`C-284` B1): cold-путь тоже учитывает `segment_meta_ops` построения
+        // каталога (см. блок `SegmentCatalog::open(dir)` в начале `resume`). Суммируем
+        // поверх `stream.segment_meta_ops` — тот для `stream` (старый API) равен 0
+        // (`segments.rs:2482`), так что итог = цена `open` ≈ N × ~2.5 + 1 + 1.
+        stats.segment_meta_ops = stats.segment_meta_ops.saturating_add(catalog_meta_ops);
+        // M-87 (задача 23, R-196 №5 / R-200 §B7 / R-201 Б-1): COLD-путь —
         // `payload_bytes_read` = сумма размеров всех `.jrnl` в каталоге. На cold-пути
         // чекпоинта нет, и `journal::stream(dir, filter)` выше прочитал ВСЕ сегменты
         // полностью — `payload_bytes_for_dir(dir)` возвращает ВЕРХНЮЮ ГРАНИЦУ, совпадающую
@@ -5163,7 +5370,10 @@ impl LiveReducer {
         // `red_m87_read_volume_truth::q2` ловит оба варианта против независимого `rchar`
         // ядра.
         stats.payload_bytes_read = payload_bytes_for_dir(dir).unwrap_or(0);
-        let history_start_seq = first_seq.unwrap_or(0);
+        // R-249 Н-4: `first_seq` ИСПОЛЬЗУЕТСЯ выше как источник провенанса холодного
+        // пути (`history_start_seq`/`history_truncated`); `let _ = first_seq` снят —
+        // ранее строка была заглушкой для версии «catalog-провенанс побеждает» (M-95
+        // задача 1, до R-249). Теперь источник единственный и он из стрима.
         Ok((
             Self {
                 vwap: VwapAcc::default(),
@@ -5185,14 +5395,13 @@ impl LiveReducer {
                 full_applied_seq: None,
                 cap_refusals: 0,
                 full_history_start_seq: history_start_seq,
-                full_history_truncated: history_start_seq > 0,
+                full_history_truncated: history_truncated,
                 // M-57 (TD-109): первый `pump()` заполнит hint из `EventStream::tail_hint()`.
                 tail_hint: None,
-                // M-62 (TD-120): кеш строится в первом же `pump()` через
-                // `SegmentCatalog::open(dir)`; здесь, на no-checkpoint ветке, `dir`
-                // уже был использован для catch-up прохода (для честного `ReadStats`),
-                // но мы НЕ сохраняем кеш — это работа следующего `pump()`.
-                segment_catalog: None,
+                // M-95 (задача 1, §3 спеки): каталог уже построен в начале `resume` —
+                // сохраняем в `LiveReducer`, чтобы (а) провенанс в snapshot-пути
+                // считался по НЕМУ; (б) первый `pump` НЕ строил ещё один.
+                segment_catalog: catalog,
             },
             stats,
         ))
@@ -5526,6 +5735,21 @@ impl LiveReducer {
     /// Текущий курсор (последний свёрнутый seq, либо `Cursor::START` если ни одного).
     pub fn cursor(&self) -> Cursor {
         self.cursor
+    }
+
+    /// M-95 (задача 1, §3 спеки): забрать `SegmentCatalog` из редуктора владением.
+    /// Используется транспортом, чтобы передать каталог в `is_fresh` (мутабельно)
+    /// и/или положить обратно (`is_fresh` требует `&mut`). На прод-пути НЕ
+    /// нужен: там `is_fresh` делается прямо на `&mut self.segment_catalog`. Здесь —
+    /// для тестов и редких обвязок.
+    pub fn take_segment_catalog(&mut self) -> Option<journal::SegmentCatalog> {
+        self.segment_catalog.take()
+    }
+
+    /// M-95 (задача 1, §3 спеки): положить `SegmentCatalog` обратно в редуктор.
+    /// Парный к [`Self::take_segment_catalog`].
+    pub fn put_segment_catalog(&mut self, catalog: journal::SegmentCatalog) {
+        self.segment_catalog = Some(catalog);
     }
 
     /// M-54 (`TD-093(б)`, task #1): отдать ТЕКУЩЕЕ накопленное состояние как `Snapshot`,
