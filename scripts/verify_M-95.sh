@@ -30,7 +30,7 @@ if [ "$DRY" != "1" ]; then
 run_step "task1-3: red_m95_catalog_once (k1…k4)" \
   cargo test -q -p gateway-serve --test red_m95_catalog_once
 # --- I-4: семантика отказа, честность истории, родословная слепка и монотонность каталога целы
-run_step "task1,3,5 / I-5: red_m95_provenance_fresh (f0…f4, --features testing — CI их не гоняет)" \
+run_step "task1,3,5 / I-5: red_m95_provenance_fresh (f0…f6, --features testing — CI их не гоняет)" \
   cargo test -q -p gateway-serve --features testing --test red_m95_provenance_fresh
 run_step "task5 / Н-4: red_m95_cold_resume_provenance (c0 c1 — холодный resume, VB-I-11)" cargo test -q -p gateway --test red_m95_cold_resume_provenance
 run_step "I-4: red_m87_history_provenance_failclosed" cargo test -q -p gateway --test red_m87_history_provenance_failclosed
