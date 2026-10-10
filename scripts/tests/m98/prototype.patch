@@ -1,0 +1,58 @@
+--- a/crates/gateway-serve/src/lib.rs	2026-10-10 22:20:05.816312802 +0000
++++ b/crates/gateway-serve/src/lib.rs	2026-10-10 22:20:05.817312787 +0000
+@@ -1390,7 +1390,7 @@
+                     // а не затрёт новый.
+                     let (snap, new_sub) =
+                         match tokio::task::spawn_blocking(move || -> io::Result<_> {
+-                            let (live, stats) = gateway::LiveReducer::resume(
++                            let (mut live, stats) = gateway::LiveReducer::resume(
+                                 &path_clone,
+                                 filter_clone,
+                                 &sel_for_resume,
+@@ -1401,7 +1401,45 @@
+                             // `milestones/M-71-egress-cap.md` §5). На этом пути (switch)
+                             // ошибка предела превращается в `invalid_selector` — клиент
+                             // увидит `code:"invalid_selector"` и сообщение с величинами.
+-                            let snap = live.snapshot_checked()?;
++                            let mut snap = live.snapshot_checked()?;
++                            // M-98 ПРОТОТИП (только воспроизводитель scripts/tests/red_m98_mutants.sh;
++                            // в продукт не входит). M98_MUT выбирает мутант таблицы спеки §8.
++                            #[cfg(feature = "testing")]
++                            {
++                                crate::test_sync::rendezvous::pump_signal_and_wait(&format!(
++                                    "m98-switch-catalog:{}", id_for_closure
++                                ));
++                            }
++                            let m98 = std::env::var("M98_MUT").unwrap_or_default();
++                            let (ls, lt) = match live.take_segment_catalog() {
++                                Some(mut cat) => {
++                                    let calc = |c: &journal::SegmentCatalog| {
++                                        gateway::checkpoint::current_history_provenance_with_catalog(c, &filter_for_history)
++                                    };
++                                    let p = match m98.as_str() {
++                                        "nofresh" => Some(calc(&cat)),
++                                        "swallow" => {
++                                            let _ = cat.is_fresh(&path_for_history);
++                                            let _ = cat.refresh(&path_for_history);
++                                            Some(calc(&cat))
++                                        }
++                                        "alwaystrue" => Some((snap.history_start_seq, true)),
++                                        _ => match cat.is_fresh(&path_for_history).map(|(f, _)| f) {
++                                            Ok(true) => Some(calc(&cat)),
++                                            Ok(false) => match cat.refresh(&path_for_history) {
++                                                Ok(_) => Some(calc(&cat)),
++                                                Err(_) => None,
++                                            },
++                                            Err(_) => None,
++                                        },
++                                    };
++                                    live.put_segment_catalog(cat);
++                                    p.unwrap_or((snap.history_start_seq, true))
++                                }
++                                None => (snap.history_start_seq, true),
++                            };
++                            snap.history_start_seq = if m98 == "startone" && lt { 1 } else { ls };
++                            snap.history_truncated = lt;
+                             // M-87 (задача 23, R-196 №5 / R-200 §B7 / R-201 Б-2): счётчик
+                             // прочитанных байт кормится ЧЕСТНЫМ `ReadStats.payload_bytes_read` —
+                             // суммой (размер чекпоинта + байты хвоста). ПРЕЖНЯЯ редакция
