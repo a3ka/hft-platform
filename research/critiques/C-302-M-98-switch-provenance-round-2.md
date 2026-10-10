@@ -183,8 +183,8 @@ $ git status --porcelain
   required artifact changes and whether C-302 correctly blocks dev.  Write and push an
   arbitration decision artifact on the subject branch.
   ```
-- Push-статус: pending this verdict commit and push to `origin/feat/M-98-switch-provenance`.
-- Кэш: ⏸ audit worktree cache retained until the verdict is committed and pushed.
+- Push-статус: ✅ verdict committed as `68acb919` and pushed to `origin/feat/M-98-switch-provenance`.
+- Кэш: ✅ audit worktree cache absent; temporary mutation worktree removed.
 
 ## §E — Риски / открытые вопросы
 - B2 is closed; do not reopen its six-world matrix without a measured counterexample.
