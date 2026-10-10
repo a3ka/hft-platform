@@ -62,7 +62,7 @@ world "базовый код a660b3a7"                         ""           "s0 
 world "прототип по §3"                               ""           ""               patch
 world "мутант: провенанс без is_fresh/refresh"       "nofresh"    "s2 s3 s4"       patch
 world "мутант: Err is_fresh/refresh проглочен"       "swallow"    "s3 s4"          patch
-world "мутант: на SWITCH всегда (frozen, true)"      "alwaystrue" "s0 s1"          patch
+world "мутант: на SWITCH всегда (frozen, true)"      "alwaystrue" "s0 s1 s2"       patch
 world "мутант: начало истории = 1 при усечении (C-297 B1)" "startone" "s1 s2"     patch
 
 [ "${FAIL}" -eq 0 ] && { echo "VERDICT: PASS — 6 миров"; exit 0; }
