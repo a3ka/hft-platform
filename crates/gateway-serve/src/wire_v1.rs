@@ -166,12 +166,26 @@ pub fn parse_selector(value: &Value, canonical_bands: &[f64]) -> Result<Selector
     };
     let resolved_bands: Vec<f64> = match bands {
         None => {
-            // Отсутствует ⇒ канонический набор (П-032 п.8).
+            // M-100 (§4.1, CT-RFC-09 §2.10.1): полосы отсутствуют — подставляем
+            // канонический набор ТОЛЬКО при наличии политики (`canonical_bands` не
+            // пустой). Legacy-режим (без политики, `canonical_bands == &[]`)
+            // ОБЯЗАН прислать полосы — иначе перейти на профильный режим.
+            // Прямой отказ (`invalid_selector`) — ниже в коде через пустой резолв.
+            if canonical_bands.is_empty() {
+                return Err(SelectorError::Invalid(
+                    "selector.bands is required (legacy mode without policy)".to_string(),
+                ));
+            }
             canonical_bands.to_vec()
         }
         Some(client_bands) if bands_equal(&client_bands, canonical_bands) => {
             // Равен (порядок + значения) ⇒ принимается как есть. Это переходная
             // совместимость v1-клиентов (CT-RFC-09 §2.2 rev2 присылают `bands`).
+            client_bands
+        }
+        Some(client_bands) if canonical_bands.is_empty() => {
+            // Legacy-режим (нет политики, `canonical_bands == &[]`): полосы
+            // обязательны и принимаются как есть (прежняя семантика M-65/M-87).
             client_bands
         }
         Some(_) => {
