@@ -172,11 +172,14 @@ fn h2_events() -> Vec<EventKind> {
     ]
 }
 
-/// Клиентская склейка для одного РАЗБИЕНИЯ событий на кадры: каждая группа дописывается в журнал и
-/// отдаётся одним вызовом `pump` (кадров на группу — сколько отдаст живой путь), кадры идут через
-/// провод. Возвращает карту клиента, карту полного пересчёта и число кадров.
+/// Клиентская склейка для одного РАЗБИЕНИЯ событий на кадры. Каждая группа дописывается в журнал
+/// и отдаётся ОТДЕЛЬНЫМ вызовом `pump`; кадры идут через провод (`serde_json`). **Setup-страж на
+/// КАЖДЫЙ вызов (`C-305` R1):** группа обязана дать хотя бы один живой кадр, курсор после вызова
+/// обязан стоять ровно на последнем событии группы, и последний кадр обязан его покрывать — иначе
+/// разбиение молча слилось бы с соседним и сценарий судил бы не ту границу. Сумма кадров по
+/// разбиению стражем НЕ является.
 type Hm = std::collections::BTreeMap<(i64, String, i64), i64>;
-fn fold_partition(groups: &[&[usize]]) -> (Hm, Hm, usize) {
+fn fold_partition(name: &str, groups: &[&[usize]]) -> (Hm, Hm) {
     let s = sel();
     let dir = tempfile::tempdir().expect("tmp");
     append(dir.path(), vec![trade(T - 10_000)]);
@@ -185,18 +188,48 @@ fn fold_partition(groups: &[&[usize]]) -> (Hm, Hm, usize) {
         LiveReducer::resume(dir.path(), EpochFilter::OwnCaptureOnly, &s, ckpt.path())
             .expect("resume");
     let mut acc = live.snapshot();
-    let mut n_frames = 0;
-    for g in groups {
+    // Преамбула (сделка в другом бакете) прокачивается ДО групп: после холодного `resume`
+    // курсор пуст, и первая группа иначе слилась бы с преамбулой в один вызов.
+    let (pre, _c, _s) = live
+        .pump(dir.path(), EpochFilter::OwnCaptureOnly, usize::MAX)
+        .expect("pump преамбулы");
+    for f in &pre {
+        let wired: gateway::Frame =
+            serde_json::from_slice(&serde_json::to_vec(f).expect("ser")).expect("de");
+        assert_eq!(acc.apply(&wired), gateway::ApplyOutcome::Applied);
+    }
+    for (gi, g) in groups.iter().enumerate() {
         let mut evs = h2_events();
         let picked: Vec<EventKind> = g
             .iter()
             .map(|&i| std::mem::replace(&mut evs[i], trade(0)))
             .collect();
+        let before = live
+            .cursor()
+            .upto_seq
+            .expect("SETUP НЕ СОСТОЯЛСЯ: курсор живого редуктора пуст до группы");
         append(dir.path(), picked);
-        let (frames, _c, _s) = live
+        let want_upto = before + g.len() as u64;
+        let (frames, cur, _s) = live
             .pump(dir.path(), EpochFilter::OwnCaptureOnly, usize::MAX)
             .expect("pump");
-        n_frames += frames.len();
+        assert!(
+            !frames.is_empty(),
+            "SETUP НЕ СОСТОЯЛСЯ: разбиение {name}, группа {gi} {g:?} не дала НИ ОДНОГО живого \
+             кадра — граница кадра не построена"
+        );
+        assert_eq!(
+            cur.upto_seq,
+            Some(want_upto),
+            "SETUP НЕ СОСТОЯЛСЯ: разбиение {name}, группа {gi}: курсор после pump ≠ seq последнего \
+             события группы — группа не закрыта своим вызовом"
+        );
+        assert_eq!(
+            frames.last().map(|f| f.to.upto_seq),
+            Some(Some(want_upto)),
+            "SETUP НЕ СОСТОЯЛСЯ: разбиение {name}, группа {gi}: последний кадр не покрывает \
+             события группы"
+        );
         for f in &frames {
             let wired: gateway::Frame =
                 serde_json::from_slice(&serde_json::to_vec(f).expect("ser")).expect("de");
@@ -205,13 +238,16 @@ fn fold_partition(groups: &[&[usize]]) -> (Hm, Hm, usize) {
     }
     let full = gateway::snapshot(dir.path(), EpochFilter::OwnCaptureOnly, &s, Cursor::LATEST)
         .expect("full");
-    (heatmap_of(&acc), heatmap_of(&full), n_frames)
+    (heatmap_of(&acc), heatmap_of(&full))
 }
 
 /// **`h2` — те же события, РАЗНЫЕ границы кадров на ЖИВОМ пути (план SCALE §15.9 п.2; `C-297`
-/// M-100 R1) — один и тот же итог у клиента, равный полному пересчёту.** Разбиения: всё одним
-/// кадром · по событию на кадр · снятие с постановкой вместе · постановка отдельно. Ловит и
-/// сегодняшний дефект (объединение внутри кадра), и починку, зелёную лишь при одном разбиении.
+/// M-100 R1, `C-305` R1) — один и тот же итог у клиента, равный полному пересчёту.** Разбиения:
+/// всё одним кадром · по событию на кадр · снятие с постановкой вместе · постановка отдельно.
+///
+/// **Исход КАЖДОГО разбиения печатается одним сообщением** (`H2_PARTITIONS`) до вердикта: сценарий
+/// не обрывается на первом расхождении. Так прогон сам предъявляет, какие разбиения сегодня
+/// расходятся с пересчётом (`C-305`: утверждение спеки — исполняемым доказательством, не прозой).
 #[test]
 fn h2_same_events_different_live_frame_boundaries_same_state() {
     let parts: [(&str, &[&[usize]]); 4] = [
@@ -220,27 +256,40 @@ fn h2_same_events_different_live_frame_boundaries_same_state() {
         ("[1 2][3]", &[&[0, 1], &[2]]),
         ("[1][2 3]", &[&[0], &[1, 2]]),
     ];
-    let mut results = Vec::new();
+    let removed = (T / 1000, "bid".to_string(), to_fixed(64_990.0));
+    let added = (T / 1000, "bid".to_string(), to_fixed(64_970.0));
+    let mut report = Vec::new();
+    let mut diverged = Vec::new();
+    let mut clients = Vec::new();
     for (name, groups) in parts {
-        let (client, full, n) = fold_partition(groups);
-        assert!(
-            n >= groups.len(),
-            "setup-страж: разбиение {name} дало {n} кадров при {} группах — границы не те",
-            groups.len()
-        );
-        let removed = (T / 1000, "bid".to_string(), to_fixed(64_990.0));
-        let added = (T / 1000, "bid".to_string(), to_fixed(64_970.0));
+        let (client, full) = fold_partition(name, groups);
         assert!(
             !full.contains_key(&removed) && full.contains_key(&added),
-            "setup-страж: полный пересчёт обязан не содержать 64990 и содержать 64970 ({name})"
+            "SETUP НЕ СОСТОЯЛСЯ: полный пересчёт обязан не содержать 64990 и содержать 64970 ({name})"
         );
-        assert_eq!(
-            client, full,
-            "M-100 / VB-I-2 / §15.9 п.2: разбиение {name} — клиент разошёлся с полным пересчётом"
-        );
-        results.push((name, client));
+        let ok = client == full;
+        report.push(format!(
+            "{name}: {} (снятый 64990 у клиента: {})",
+            if ok {
+                "== пересчёт"
+            } else {
+                "РАСХОДИТСЯ"
+            },
+            client.contains_key(&removed)
+        ));
+        if !ok {
+            diverged.push(name);
+        }
+        clients.push((name, client));
     }
-    for w in results.windows(2) {
+    println!("H2_PARTITIONS {}", report.join(" | "));
+    assert!(
+        diverged.is_empty(),
+        "M-100 / VB-I-2 / §15.9 п.2: разбиения {diverged:?} расходятся с полным пересчётом. \
+         Исходы всех четырёх: {}",
+        report.join(" | ")
+    );
+    for w in clients.windows(2) {
         assert_eq!(
             w[0].1, w[1].1,
             "M-100: разбиения {} и {} дали РАЗНЫЙ итог у клиента",
