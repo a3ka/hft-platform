@@ -154,6 +154,11 @@ fn h1_level_removed_within_one_live_frame_disappears_for_client() {
         !heatmap_of(&full).contains_key(&key),
         "setup-страж: полный пересчёт ОБЯЗАН не содержать снятый уровень"
     );
+    assert!(
+        heatmap_of(&full).contains_key(&(T / 1000, "bid".to_string(), to_fixed(64_980.0))),
+        "setup-страж (A-054 A4): полный пересчёт ОБЯЗАН содержать живой уровень 64980 — иначе пустые \
+         карты клиента и пересчёта совпали бы, ничего не проверив"
+    );
     assert_eq!(
         heatmap_of(&acc),
         heatmap_of(&full),
