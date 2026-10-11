@@ -1,0 +1,50 @@
+# /etc/cron.d/hft-journal-restore-drill
+# M-99 (задача 4, `OPS-I-3`): расписание УЧЕБНОГО ВОССТАНОВЛЕНИЯ ЖУРНАЛА по офсайт-копии.
+# Раз в месяц (месячное расписание — основание: «месяц плюс запас на пропущенный прогон»;
+# окно свежести 40 суток живёт в `ops::restore_drill::RESTORE_DRILL_FRESH_WINDOW_MS`).
+#
+# ⚠ ОГРАНИЧЕНИЯ CRON-ПАРСЕРА (те же, что у offsite/retention/watchdog):
+#   - `\` не поддерживается: каждая физическая строка — отдельная запись;
+#   - `%` в команде = перевод строки (спецсимвол cron);
+#   - `${VAR}` в командной части не раскрывается (env виден ТОЛЬКО процессу задания).
+#   Команда — ОДНА строка, вся логика в deploy/bin/journal-restore-drill-cron.sh,
+#   где есть `bash -n`, прогон со стабом и проверка argv ДО side-эффектов
+#   (`HFT_CRON_PRINT_ARGV=1`).
+#
+# ⚠ ФЛОК ОБЯЗАТЕЛЕН — на уровне всего скрипта. Без flock — два наложившихся cron'а
+# могут одновременно писать STATE-файл (tmp → rename) и сторож увидит его в полу-обновлённом
+# виде. `flock -n` на lock-файле — non-blocking: пропустить тик безопаснее, чем копить
+# очередь процессов (тот же мотив, что у journal-offsite-cron.sh).
+#
+# ⚠ КОМПОЗИЦИЯ С DEFAULTS WRAPPER'А — критична. Переменные ниже задают ТОЛЬКО пути и
+# флаги; сам алгоритм (выборка, отбор, sidecar'ы, уничтожение источника) живёт в
+# `journal-restore-drill-cron.sh` под дефолтами `JOURNAL_DRILL_*`. Менять СТОИТ через
+# дефолты скриптуна, а не через cron-файл — иначе рассогласование двух строк даёт
+# тихий no-op.
+#
+# УСТАНОВКА (та же, что у соседей):
+#   sudo install -m 0755 deploy/bin/journal-restore-drill-cron.sh /root/hft-platform/deploy/bin/
+#   sudo install -m 0644 deploy/cron.d/journal-restore-drill   /etc/cron.d/hft-journal-restore-drill
+#   sudo install -d /var/log/hft /var/lib/hft
+# Проверка ДО установки (ровно это делает гейт task #4):
+#   crontab -n deploy/cron.d/journal-restore-drill   → exit 0
+
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+HFT_ROOT=/root/hft-platform
+JOURNAL_DRILL_COLD=u659392-sub1@u659392-sub1.your-storagebox.de:journal
+JOURNAL_DRILL_RESTORE=/var/lib/hft/restore-drill
+JOURNAL_DRILL_STATE=/var/lib/hft/journal-restore-drill.json
+JOURNAL_DRILL_TRANSPORT=remote
+JOURNAL_DRILL_REMOTE=ssh -i /root/.ssh/storagebox -p 23
+JOURNAL_DRILL_LOG=/var/log/hft/journal-restore-drill.log
+JOURNAL_DRILL_ALERT_FILE=/var/lib/hft/journal-restore-drill.alert
+JOURNAL_DRILL_LOCK=/var/lock/hft-journal-restore-drill.lock
+
+# m h dom mon dow user command
+# Раз в месяц: 03:13 UTC, день 13 (выбран разносом с другими суточными заданиями —
+# компакция 03:50, retention 04:07, builder-prune 04:30, offsite почасово :22).
+# Число 13 без семантики, кроме «не совпадать ни с чем ежесуточным» и «работать в
+# тихое окно» (нет срочных задач между 03:00 и 03:50). Журнал offsite-коии копируется
+# ежечасно, и к 03:13 он свеж.
+13 3 13 * * root flock -n /var/lock/hft-journal-restore-drill.lock /root/hft-platform/deploy/bin/journal-restore-drill-cron.sh

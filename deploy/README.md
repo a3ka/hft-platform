@@ -895,3 +895,137 @@ HFT_CRON_PRINT_ARGV=1 /root/hft-platform/deploy/bin/gateway-checkpoint-cron.sh
   гейт. Если `host .env` ещё несёт `GATEWAY_BANDS=…` от ДО-M-94 формы — это
   задача 11 (милестоун), архитектор/ревьюер снимает ПОСЛЕ merge M-94 и ДО
   следующего деплоя (окно ≈16 мин, пока CI бежит).
+
+---
+
+# Учебное восстановление журнала по расписанию (M-99, TD-193)
+
+`deploy/bin/journal-restore-drill-cron.sh` зовётся из `deploy/cron.d/journal-restore-drill`
+(13 3 13 * * — раз в месяц, 03:13 UTC) и проверяет читаемость офсайт-копии
+(Storage Box, `OPS-I-3`): скачивает ВЫБОРКУ из трёх сегментов (первый / `floor(N/2)` /
+последний по индексу; обе формы выбранного индекса, если обе есть в копии), читает её
+прод-читателем `journal-drill-read` (внутри образа `hft-recorder`, `--network none`,
+bind-mount `:ro`), пишет файл состояния `/var/lib/hft/journal-restore-drill.json`.
+Этот файл читают ОБА потребителя:
+
+| Потребитель | Что делает |
+|---|---|
+| `recorder` (sampler 1 Гц) | `backup_restore_drill_ok` ∈ {0, 1} — gauge в `/metrics` (`OPS-I-2`/`OPS-I-3`/`OPS-I-10`); `0` на любом отказе, включая ОТСУТСТВИЕ файла (`M-99` §5 «Первое включение»). |
+| `ops-watchdog` (cron `*/5`) | на ЛЮБОМ не-`Ok` вердикте [`ops::restore_drill::restore_drill_verdict`] — `WD-RESTORE-DRILL` CRITICAL (`M-99` §5). |
+
+## Безопасность копии — три ограничения, НАЗВАННЫХ ЯВНО
+
+1. **drill ТОЛЬКО ЧИТАЕТ с Storage Box.** Ни `rsync --delete`, ни любого `--delete-*` /
+   `--remove-source-files`, ни удаления/переименования на стороне коробки. `П-023`: один
+   ключ способен снести и оригинал, и копию; команда создания = команда уничтожения.
+2. **drill ВОССТАНАВЛИВАЕТ В ОТДЕЛЬНЫЙ КАТАЛОГ** (`${JOURNAL_DRILL_RESTORE:-/var/lib/hft/restore-drill}`),
+   НЕ в каталог журнала и НЕ в том `hft-platform_journal-data`. Проверка бэкапа не
+   должна становиться риском для оригинала.
+3. **flock -n** на lock-файле `/var/lock/hft-journal-restore-drill.lock` — non-blocking.
+   Пропустить тик безопаснее, чем копить очередь процессов.
+
+## Шов `JOURNAL_DRILL_READER` — подмена для гейта, на прод-драйв — стандарт
+
+Дефолт (прод): `docker run --rm --network none -v <RESTORE>:<RESTORE>:ro
+--entrypoint /usr/local/bin/journal-drill-read hft-recorder`. Образ работающего recorder'а
+— и есть прод-код; монтирование по тому же пути — `--dir` одинаков снаружи и внутри;
+нет сети — читатель только читает.
+
+Оператор может подменить через `JOURNAL_DRILL_READER`. Гейт `verify_M-99.sh` подставляет
+ПРЯМОЙ бинарь (на фикстуре в локальной песочнице) — обёртка ОБЯЗАНА вызвать ровно его и
+взять исход у него, иначе проба краснеет (`M-74` §«Контракт обёртки»).
+
+## Алгоритм — короткий
+
+1. **Доставка.** `TRANSPORT=remote` → ssh-rsync с Storage Box; `TRANSPORT=local` →
+   уже лежит рядом (проба). Дефолт — `remote`.
+2. **Отбор.** Из листинга извлекаются ИНДЕКСЫ (`segment-NNNNNNNN.jrnl[.zst]` ⇒ один
+   индекс), сортируются и дедуплицируются. Берутся первый, `floor(N/2)`-й и последний.
+   Алгоритм ДЕТЕРМИНИРОВАННЫЙ: drill воспроизводим по своему логу, никакого `$RANDOM`.
+3. **Sidecar'ы.** `journal.legacy.json` + `journal.replay-digest.json` (замер 2026-10-10)
+   проверяются на непустоту.
+4. **УНИЧТОЖЕНИЕ источника** (`M-99` §4 п.1). После доставки каталог `RESTORE` (бывший
+   источник на ЛОКАЛЬНОЙ стороне) `mv`'ается в `RESTORE.source.PID`; `RESTORE` создаётся
+   заново ПУСТЫМ. inotify-сторож в окне `[уничтожение, конец чтения]` ловит появление
+   `cold`-имени в источнике → `source-stayed-present` ⇒ отказ. На проде источник — Storage
+   Box, удалять с него НЕЛЬЗЯ; уничтожение локальной копии — мера по построению, а не
+   страж (`C-219` B-1).
+5. **Чтение.** `${READER} --dir <RESTORE> --min-events 1`. Машинный контракт выхода
+   (`M-74` §«Сигнатура читателя»): `0` успех / `4` чтение (порча) / `5` пустота
+   (доставка молча) / `6` контекст (`is_foreign_segment`).
+6. **Состояние.** Атомарно (`tmp` → `rename`) пишется JSON:
+   `{"ok":0|1,"ts_wall_ms":…,"checked":N,"events_read":…,"digest":"<64 hex>","reason":"…"}`.
+   `ok=1` БЕЗ 64-hex `digest` ⇒ отказ (T2-контракт: «`digest` обязателен при `ok=1`»,
+   `M-99` §4 п.4). `intra_segment_continuous=false` ⇒ отказ (`M-99` §3 «Семантика
+   непрерывности — внутри сегмента»).
+
+## Операторские ручки cron-обёртки
+
+| Env | Назначение | Дефолт |
+|---|---|---|
+| `JOURNAL_DRILL_COLD` | корень холодной копии | `u659392-sub1@…:journal` |
+| `JOURNAL_DRILL_RESTORE` | каталог восстановления, ОТДЕЛЬНЫЙ от боевого | `/var/lib/hft/restore-drill` |
+| `JOURNAL_DRILL_STATE` | файл состояния (тот же путь читает сторож и recorder) | `/var/lib/hft/journal-restore-drill.json` |
+| `JOURNAL_DRILL_TRANSPORT` | `remote` (ssh на Storage Box) / `local` (проба) | `remote` |
+| `JOURNAL_DRILL_REMOTE` | транспорт для `remote` | `ssh -i /root/.ssh/storagebox -p 23` |
+| `JOURNAL_DRILL_READER` | шов читателя | `docker run --rm --network none -v <RESTORE>:<RESTORE>:ro --entrypoint /usr/local/bin/journal-drill-read hft-recorder` |
+| `JOURNAL_DRILL_LOG` | лог | `/var/log/hft/journal-restore-drill.log` |
+| `JOURNAL_DRILL_ALERT_FILE` | `<job>.alert` для монитора | `/var/lib/hft/journal-restore-drill.alert` |
+| `JOURNAL_DRILL_LOCK` | lock-файл (flock) | `/var/lock/hft-journal-restore-drill.lock` |
+
+## Разбор вердикта drill'а (файл состояния)
+
+Поле `reason` ОБЯЗАТЕЛЬНО при `ok=0` и обязано различаться:
+
+| `reason` | Что лечить |
+|---|---|
+| `transport-failed` | ssh/rsync на Storage Box отказал; проверить ключ `/root/.ssh/storagebox`, сеть, `u659392-sub1@…` |
+| `cold-empty` | в копии <3 индексов — нечего выбирать; проверить, что offsite доехал (`journal-offsite.alert`) |
+| `sidecars-missing` | один из sidecar'ов (`journal.legacy.json` / `journal.replay-digest.json`) пуст/отсутствует — пробуй `rsync` руками |
+| `reader-rc-4 (corrupt — порча байт/crc/zstd)` | сегмент копии повреждён; перезалить копию с офсайта, проверить sha256 |
+| `reader-rc-5 (empty — копия не привезла событий)` | доставка молча ничего не привезла (права, сеть, фильтр); разбор доставки |
+| `reader-rc-6 (foreign — сегмент без магии и без декларации)` | сегмент без магии и без валидной декларации; на наших данных недостижимо, расследовать источник |
+| `intra-segment-gap` | дыра ВНУТРИ сегмента (не сквозная — сквозная на выборке невозможна по построению); порча на стороне коробки |
+| `missing-digest-on-success` | читатель назвал ok=1 без 64-hex digest; невозможно на нашем `journal-drill-read`, расследовать вручную |
+| `source-stayed-present` | (закрытая по построению атака) источник появился в окне чтения — расследование |
+| `transport-failed` (DRILL_REMOTE вариант) | то же, что transport-failed; см. выше |
+
+После починки: `rm /var/lib/hft/journal-restore-drill.alert` (зачистка маркера), следующий
+прогон сам перепишет state.
+
+## Зачистка маркера после починки
+
+```bash
+rm /var/lib/hft/journal-restore-drill.alert
+```
+
+Следующий прогон (ручной или автоматический, через месяц) сам перепишет файл состояния.
+
+## Запуск руками (для первого живого прогона, `M-99` задача 8 — reviewer)
+
+```bash
+HFT_CRON_PRINT_ARGV=1 bash /root/hft-platform/deploy/bin/journal-restore-drill-cron.sh
+# Ожидание: RESTORE_DIR/READER_DIR/COLD/TRANSPORT/STATE/READER — все непустые.
+JOURNAL_DRILL_TRANSPORT=remote bash /root/hft-platform/deploy/bin/journal-restore-drill-cron.sh
+# Ожидание: exit=0, файл /var/lib/hft/journal-restore-drill.json содержит ok=1,
+# digest (64 hex), events_read >= 1.
+ls -la /var/lib/hft/restore-drill/  # должны быть три выбранных сегмента + sidecar'ы
+journal-drill-read --dir /var/lib/hft/restore-drill --min-events 1
+# Ожидание: JSON с тем же digest, что в файле состояния.
+```
+
+## Запрещено
+
+- **Не качать копию целиком.** 695 ГБ на прогон — процедуру выключат. Drill берёт
+  ВЫБОРКУ из трёх, и правило выборки объявлено спекой, а не выбирается реализацией.
+- **Не считать drill пройденным по `exit=0` обёртки.** `R-157` `Б-5`: обёртка
+  уже умела рапортовать успех, ничего не сделав. Пройденность доказывается `ok=1` +
+  `digest` (продукт действия, не декларация).
+- **Не делать drill пройденным при `ok=1` без `digest`.** T2-контракт M-74: «`digest`
+  обязателен при `ok=1`». Без него состояние = заявление о действии (класс `C-191`).
+- **Не делать прогон drill'а условием удаления** (связывать с `M-92`). Изменение
+  механизма необратимого удаления — отдельный предмет с RAW-гейтом; здесь не
+  предлагается.
+- **Не править `RESTORE_DRILL_FRESH_WINDOW_MS` без спеки.** Окно живёт В ОДНОМ
+  месте (`ops::restore_drill`); recorder реэкспортирует. Менять — вместе с
+  обновлением спеки.
