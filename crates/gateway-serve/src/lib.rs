@@ -1390,7 +1390,7 @@ pub mod server {
                     // а не затрёт новый.
                     let (snap, new_sub) =
                         match tokio::task::spawn_blocking(move || -> io::Result<_> {
-                            let (live, stats) = gateway::LiveReducer::resume(
+                            let (mut live, stats) = gateway::LiveReducer::resume(
                                 &path_clone,
                                 filter_clone,
                                 &sel_for_resume,
@@ -1401,7 +1401,83 @@ pub mod server {
                             // `milestones/M-71-egress-cap.md` §5). На этом пути (switch)
                             // ошибка предела превращается в `invalid_selector` — клиент
                             // увидит `code:"invalid_selector"` и сообщение с величинами.
-                            let snap = live.snapshot_checked()?;
+                            let mut snap = live.snapshot_checked()?;
+                            // M-98 (задача 1, §3 спеки, `VB-I-11`): провенанс истории на
+                            // ветке SWITCH считается по КАТАЛОГУ РЕДУКТОРА, построенному
+                            // `resume` (а не через отдельный `list_segments`/
+                            // `SegmentCatalog::open`), тем же правилом, что у ADD и
+                            // legacy-пути после `M-95`. Между построением каталога и
+                            // расчётом провенанса — точка остановки `m98-switch-catalog:<id>`
+                            // (только `feature = "testing"`), где тест может удалить ранний
+                            // сегмент. После точки реализация ОБЯЗАНА проверить свежесть
+                            // каталога (`is_fresh` → `refresh` при необходимости) и только
+                            // потом считать провенанс — иначе снимок скажет «история
+                            // полная» для журнала, у которого ретеншен уже спрунил префикс
+                            // (тот же дефект, что закрыл `M-95` на ADD/legacy; `TD-251`).
+                            //
+                            // Канал точки ОТЛИЧЕН от ADD-канала `m95-catalog:<id>`:
+                            // остановка в нём доказывает, что повторный `subscribe`
+                            // исполнил именно ветку SWITCH (а не свёл в неё редуктор,
+                            // уводя в ADD — `CT-RFC-09` §2.4).
+                            //
+                            // Каталог живёт в `LiveReducer.segment_catalog` (`M-95`, §3
+                            // спеки); забираем владением, чтобы вызвать мутирующий
+                            // `is_fresh`, и кладём обратно перед возвратом `Sub`. На
+                            // отсутствующем каталоге (сбой `SegmentCatalog::open` в
+                            // `resume`) — безопасный путь `(frozen, true)`, как
+                            // `history_provenance_for_serve` до `M-95`.
+                            #[cfg(feature = "testing")]
+                            {
+                                let id_for_rendezvous = id_for_closure.clone();
+                                crate::test_sync::rendezvous::pump_signal_and_wait(&format!(
+                                    "m98-switch-catalog:{id_for_rendezvous}"
+                                ));
+                            }
+                            let (live_start, live_truncated) = match live.take_segment_catalog() {
+                                Some(mut cat) => {
+                                    // is_fresh/refresh — мутирующие; здесь это СВОЯ
+                                    // операция реализации (не чужой pump), и она должна
+                                    // быть АТОМАРНА с расчётом провенанса — между ними
+                                    // нет ни точки, ни чужого `pump` (свидетель в
+                                    // `red_m98_switch_provenance`).
+                                    //
+                                    // R-249 Б-1 (M-95 §3/§6, VB-I-11): отказ `is_fresh`
+                                    // ИЛИ `refresh` НЕ глотается (`unwrap_or_default`,
+                                    // `let _ =`). На ЛЮБОЙ `Err` свежесть каталога НЕ
+                                    // подтверждена ⇒ провенанс НЕ считается по этому
+                                    // каталогу: исход `(frozen_start_seq, true)` — «не
+                                    // знаем, не обещаем», как `history_provenance_for_serve`
+                                    // до M-95 (M-87 задача 20, оракул
+                                    // `red_m87_history_provenance_failclosed` `h3`/`h4`).
+                                    let fresh_ok = cat
+                                        .is_fresh(&path_for_history)
+                                        .map(|(f, _ops)| f);
+                                    let provenance_via_catalog = match fresh_ok {
+                                        Ok(true) => Some(
+                                            gateway::checkpoint::current_history_provenance_with_catalog(
+                                                &cat,
+                                                &filter_for_history,
+                                            ),
+                                        ),
+                                        Ok(false) => match cat.refresh(&path_for_history) {
+                                            Ok(_ops) => Some(
+                                                gateway::checkpoint::current_history_provenance_with_catalog(
+                                                    &cat,
+                                                    &filter_for_history,
+                                                ),
+                                            ),
+                                            Err(_) => None, // R-249 Б-1: fail-closed
+                                        },
+                                        Err(_) => None, // R-249 Б-1: fail-closed
+                                    };
+                                    live.put_segment_catalog(cat);
+                                    provenance_via_catalog
+                                        .unwrap_or((snap.history_start_seq, true))
+                                }
+                                None => (snap.history_start_seq, true),
+                            };
+                            snap.history_start_seq = live_start;
+                            snap.history_truncated = live_truncated;
                             // M-87 (задача 23, R-196 №5 / R-200 §B7 / R-201 Б-2): счётчик
                             // прочитанных байт кормится ЧЕСТНЫМ `ReadStats.payload_bytes_read` —
                             // суммой (размер чекпоинта + байты хвоста). ПРЕЖНЯЯ редакция
