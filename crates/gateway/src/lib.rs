@@ -2162,6 +2162,33 @@ impl Reducer {
         let mut heatmap_observed_time_s: Vec<i64> = Vec::new();
         let mut seen_buckets: std::collections::BTreeSet<i64> = std::collections::BTreeSet::new();
         let mut cob_observed = false;
+        // M-100 (§4.5, VB-I-2, VB-I-12): close-семантика per БАКЕТ, а не объединение по
+        // наблюдениям в диапазоне кадра. Раннее наблюдение бакета, чей уровень снят
+        // более поздним наблюдением ТОГО ЖЕ бакета в ТОМ ЖЕ кадре, при ОБЪЕДИНЕНИИ остаётся
+        // у клиента (`merge_heatmap` Replace-семантика по колонке не сможет его стереть,
+        // потому что кадр не объявляет этот бакет как «наблюдённый с ПУСТЫМ срезом» — в
+        // новой копии книги уровня уже нет, и ячейки с ним просто отсутствуют). Это
+        // нарушение `VB-I-2`: `live != full` для карты ВНУТРИ кадра (M-88 закрыл
+        // аналогичный дефект для снятия МЕЖДУ кадрами).
+        //
+        // Решение: для каждого бакета берём только ПОСЛЕДНЕЕ наблюдение (max seq) и его
+        // `heatmap_cells` (это и есть close-срез этого бакета). Дублей на одном бакете в
+        // одном диапазоне кадра здесь уже быть не может — `capture_book_observation`
+        // хранит наблюдения под РАЗНЫМИ seq даже для одного бакета (несколько L2-событий
+        // в одном бакете → несколько наблюдений с разными seq, но одна `heatmap_time_s`).
+        // Объединение этих наблюдений в `BTreeMap` через INSERT даёт прежний объединяющий
+        // дефект; здесь — выбираем max-seq и его срез.
+        let mut last_obs_per_bucket: BTreeMap<i64, &BookSeriesObservation> = BTreeMap::new();
+        for obs in &observations {
+            last_obs_per_bucket
+                .entry(obs.heatmap_time_s)
+                .and_modify(|cur| {
+                    if obs.seq > cur.seq {
+                        *cur = obs;
+                    }
+                })
+                .or_insert(obs);
+        }
         for obs in &observations {
             if seen_buckets.insert(obs.heatmap_time_s) {
                 heatmap_observed_time_s.push(obs.heatmap_time_s);
@@ -2171,6 +2198,12 @@ impl Reducer {
             // наблюдения в `book_series` порождены L2-событиями (`capture_book_observation`
             // зовётся только из `L2Snapshot`/`L2Delta`-веток `apply`).
             cob_observed = true;
+        }
+        // Только close-срез каждого бакета (`last_obs_per_bucket`) идёт в `heatmap_map`.
+        // `BTreeMap` ключ `(time_s, side, price_e8)` дедуплицирует ячейки внутри среза,
+        // что для одного бакета не даёт эффекта (срез — снимок книги, без дублей по
+        // ключу `(side, price)`).
+        for obs in last_obs_per_bucket.values() {
             for cell in &obs.heatmap_cells {
                 heatmap_map.insert(
                     (cell.time_s, cell.side.clone(), cell.price_e8),
