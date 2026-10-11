@@ -55,6 +55,13 @@ pub enum Incident {
     /// отказы ЕСТЬ, успехов НЕТ — голодание на стороне выдачи (read-only
     /// клиенты подключаются, отказы приходят, но снимков/фреймов — ноль). `Critical`.
     ServingSilence,
+    /// M-99 (задача 6, §5): drill restore-процедуры провален — файл состояния
+    /// отсутствует / не читается / не парсится / `ok=0` / просрочен / метка из
+    /// будущего / «успех» без единого прочитанного события. Это «нет периодического
+    /// доказательства читаемости холодной копии» (`OPS-I-3`), и на проде нет
+    /// другого наблюдателя (Prometheus/Alertmanager нет, `docs/ROADMAP.md` строка
+    /// 3) — это ЕДИНСТВЕННЫЙ канал наружу. Код `WD-RESTORE-DRILL`.
+    RestoreDrill,
 }
 
 impl Incident {
@@ -75,6 +82,7 @@ impl Incident {
             Incident::ServingHeartbeatMissing => "WD-SERVING-HB-MISSING",
             Incident::ServingHeartbeatStale => "WD-SERVING-HB-STALE",
             Incident::ServingSilence => "WD-SERVING-SILENCE",
+            Incident::RestoreDrill => "WD-RESTORE-DRILL",
         }
     }
 }
@@ -646,4 +654,44 @@ pub fn check_serving_silence(
     } else {
         None
     }
+}
+
+/// M-99 (задача 6, §5): единственный наблюдатель провала drill'а (`OPS-I-3`) на
+/// проде — `ops-watchdog` (Prometheus/Alertmanager нет, `docs/ROADMAP.md` строка 3).
+/// Звенит на ЛЮБОМ не-`Ok` вердикте [`crate::restore_drill::RestoreDrillVerdict`]:
+/// отсутствие файла / обрывки / неполный JSON / просроченный / метка из будущего /
+/// `ok=0` / `events_read == 0`. Класс вердикта переходит в `message`, чтобы
+/// оператор видел, что именно лечить (порча копии ≠ пустая доставка ≠ сломан
+/// cron). Здоровая пара: `RestoreDrillVerdict::Ok` ⇒ `None`.
+pub fn check_restore_drill(v: &crate::restore_drill::RestoreDrillVerdict) -> Option<Alert> {
+    use crate::restore_drill::RestoreDrillVerdict;
+    let class_msg: &str = match v {
+        RestoreDrillVerdict::Ok => return None,
+        RestoreDrillVerdict::Missing => {
+            "файл состояния drill'а отсутствует или не читается — обёрнул не \
+             запускался (cron пуст / ошибка сценария) ИЛИ путь/том неверный"
+        }
+        RestoreDrillVerdict::Unparseable => {
+            "файл состояния drill'а не парсится как JSON или не выполняет T2-контракт \
+             (нет обязательного поля; `ok=1` без 64-hex `digest`) — состояние не \
+             доказывает чтения, потребитель обязан отвергать"
+        }
+        RestoreDrillVerdict::Failed => "drill явно провалился (`ok=0`) — см. `reason`",
+        RestoreDrillVerdict::Empty => {
+            "drill объявил успех, но `events_read == 0` — копия не доказана \
+             читаемой (R-157 Б-5)"
+        }
+        RestoreDrillVerdict::Stale => {
+            "drill старше окна свежести 40 суток (месячное расписание + запас на \
+             один пропущенный прогон) — возможно, расписание не запускается"
+        }
+        RestoreDrillVerdict::FromFuture => {
+            "drill имеет метку из будущего — часы сбиты либо файл подложен"
+        }
+    };
+    Some(Alert::new(
+        Incident::RestoreDrill,
+        Level::Critical,
+        class_msg.to_string(),
+    ))
 }

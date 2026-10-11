@@ -20,6 +20,11 @@
 //!     `/var/lib/docker/volumes/hft-platform_journal-data/_data/recorder.heartbeat`)
 //!   - `WATCHDOG_SERVING_HEARTBEAT_PATH` (default
 //!     `/var/lib/docker/volumes/hft-platform_gateway-state/_data/gateway-serve.heartbeat`)
+//!   - `WATCHDOG_RESTORE_DRILL_STATE` (default
+//!     `ops::restore_drill::DEFAULT_RESTORE_DRILL_STATE` =
+//!     `/var/lib/hft/journal-restore-drill.json`)
+//!     — файл состояния `M-99` drill'а; `Missing` ⇒ `WD-RESTORE-DRILL` CRITICAL
+//!     на первом же такте до первого прогона.
 //!   - `WATCHDOG_CRON_DIR` (default `/var/lib/hft`) — сканирует пары
 //!     `<job>.last-success`/`<job>.alert` для `compaction`/`gateway-checkpoint`/`retention`
 //!     (R-005 F-6: оба маркера, не только позитивный).
@@ -40,11 +45,12 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ops::format::format_alert;
+use ops::restore_drill::{restore_drill_verdict, DEFAULT_RESTORE_DRILL_STATE};
 use ops::state::{WatchdogState, DEFAULT_DEDUP_WINDOW_MS};
 use ops::transport::{StdoutTransport, TelegramTransport, Transport};
 use ops::watchdog::{parse_docker_status_healthy, ContainerStatus, Thresholds};
 use ops::watchdog_cycle::{
-    run_cycle_full, CronFailureMarker, CronJobObservation, CycleInputs, ServingInputs,
+    run_cycle_with_drill, CronFailureMarker, CronJobObservation, CycleInputs, ServingInputs,
 };
 
 /// Задачи обслуживания журнала, за которыми следит watchdog (имена БЕЗ суффикса — см.
@@ -63,6 +69,11 @@ fn main() -> anyhow::Result<()> {
         "WATCHDOG_SERVING_HEARTBEAT_PATH",
         "/var/lib/docker/volumes/hft-platform_gateway-state/_data/gateway-serve.heartbeat",
     );
+    // M-99 (задача 6, §5): путь к файлу состояния drill'а. Дефолт совпадает с тем,
+    // что пишет обёртка (`JOURNAL_DRILL_STATE`); рассогласование даёт тихий no-op
+    // (`testing.md`, канарейка композиции). Замеряется гейтом `verify_M-99.sh`.
+    let restore_drill_state_path =
+        env_path("WATCHDOG_RESTORE_DRILL_STATE", DEFAULT_RESTORE_DRILL_STATE);
     let cron_dir = env_path("WATCHDOG_CRON_DIR", "/var/lib/hft");
     let state_path = env_path("WATCHDOG_STATE_PATH", "/var/lib/hft/watchdog.state.json");
     let container_names = env_list(
@@ -86,7 +97,21 @@ fn main() -> anyhow::Result<()> {
     let serving = ServingInputs {
         heartbeat: serving_heartbeat,
     };
-    let outcome = run_cycle_full(&inputs, &serving, now_ms, &thr, dedup_window_ms, &mut state);
+    // M-99 (задача 6, §5): drill' вердикт ВСЕГДА передаётся (env WATCHDOG_RESTORE_DRILL_STATE
+    // у бинаря есть ЕСТЬ всегда; нечитаемый/отсутствующий ⇒ `RestoreDrillVerdict::Missing`,
+    // а это уже `WD-RESTORE-DRILL` CRITICAL по дизайну). `None` мы НЕ передаём НИКОГДА:
+    // до первого прогона файла ещё нет, и отсутствие проверки само по себе есть отказ
+    // (`M-99` §5 «Первое включение»).
+    let drill_verdict = restore_drill_verdict(&restore_drill_state_path, now_ms);
+    let outcome = run_cycle_with_drill(
+        &inputs,
+        &serving,
+        Some(&drill_verdict),
+        now_ms,
+        &thr,
+        dedup_window_ms,
+        &mut state,
+    );
 
     let stdout_transport = StdoutTransport;
     let telegram_transport = TelegramTransport::from_env();

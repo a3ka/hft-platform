@@ -10,6 +10,7 @@ pub mod budget;
 pub mod format;
 pub mod metrics;
 pub mod recon;
+pub mod restore_drill;
 pub mod server;
 pub mod silence;
 pub mod sink;
