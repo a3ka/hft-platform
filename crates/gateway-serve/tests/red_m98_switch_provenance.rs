@@ -16,11 +16,11 @@
 //!
 //! | # | мир | требование | против какой реализации |
 //! |---|---|---|---|
-//! | `s0` | переподписка, журнал цел, точка переподписки пройдена без действия | `truncated == false` | «всегда `true`» |
-//! | `s1` | ранний сегмент удалён МЕЖДУ первым снимком и переподпиской | `truncated == true`, `history_start_seq > 0` | сегодняшний код (значения слепка) |
+//! | `s0` | переподписка, журнал цел, точка переподписки пройдена без действия | `truncated == false`, `history_start_seq` == первое событие `journal::stream` | «всегда `true`»; ложное начало на целом журнале (`C-302`) |
+//! | `s1` | ранний сегмент удалён МЕЖДУ первым снимком и переподпиской | `truncated == true`, `history_start_seq` == первое событие `journal::stream` после удаления | сегодняшний код (значения слепка) |
 //! | `s2` | удаление В ТОЧКЕ переподписки: каталог построен, провенанс ещё не посчитан | то же + свидетель места | провенанс без проверки свежести |
-//! | `s3` | то же + каталог журнала не перечисляется (`0300`) | `truncated == true` | `is_fresh(..)` с проглоченным `Err` |
-//! | `s4` | то же + `is_fresh → Ok(false)`, затем `refresh → Err` | `truncated == true` | проглоченный `Err` у `refresh` |
+//! | `s3` | то же + каталог журнала не перечисляется (`0300`) | `(frozen, true)`: `truncated == true`, `history_start_seq` == шапка чекпоинта | `is_fresh(..)` с проглоченным `Err` |
+//! | `s4` | то же + `is_fresh → Ok(false)`, затем `refresh → Err` | `(frozen, true)`, как `s3` | проглоченный `Err` у `refresh` |
 //!
 //! # Точка остановки — новый контракт ветки SWITCH
 //!
@@ -474,7 +474,8 @@ const EARLIEST: &str = "segment-00000000.jrnl.zst";
 /// **Независимый эталон начала истории (`C-297` B1).** `seq` первого события, которое прод-читатель
 /// журнала (`journal::stream`, тот же `EpochFilter`) отдаёт ПОСЛЕ удаления префикса, — по самому
 /// журналу, а не по каталогу транспорта и не по коду выдачи. Прецедент —
-/// `red_m87_provenance_on_add_path::prune_prefix`.
+/// `red_m87_provenance_on_add_path::prune_prefix`. Действует и на ЦЕЛОМ журнале (`s0`, `A-053` A1):
+/// там это начало журнала.
 fn first_retained_seq(dir: &std::path::Path) -> u64 {
     journal::stream(dir, EpochFilter::OwnCaptureOnly)
         .expect("stream")
@@ -482,6 +483,18 @@ fn first_retained_seq(dir: &std::path::Path) -> u64 {
         .expect("после удаления префикса в журнале обязано остаться событие")
         .expect("event")
         .seq
+}
+
+/// **Эталон `frozen_start_seq` (`A-053` A2).** Начало истории из ШАПКИ ЧЕКПОИНТА, с которого
+/// SWITCH поднимает редуктор (`resume` кладёт его в снимок), — публичным API, без транспорта.
+/// Первый снимок подписки эталоном НЕ является: это выход соседней ветки ADD (зависимый эталон).
+fn frozen_start(ckpt: &std::path::Path) -> u64 {
+    gateway::checkpoint::read_checkpoint_header_pub(&gateway::checkpoint::ckpt_path_for_pub(
+        ckpt,
+        &sel(),
+    ))
+    .expect("шапка чекпоинта читается")
+    .history_start_seq
 }
 
 fn start_seq(body: &Value) -> u64 {
@@ -549,6 +562,12 @@ async fn s0_switch_without_retention_history_is_complete() {
         !truncated(&body),
         "M-98 / VB-I-11: на ЦЕЛОМ журнале переподписка объявила историю усечённой — реализация \
          «всегда truncated=true» прошла бы s1…s4 без расчёта провенанса: {body}"
+    );
+    assert_eq!(
+        start_seq(&body),
+        first_retained_seq(dir.path()),
+        "M-98 / C-302 B1-r2 / VB-I-11: на целом журнале начало истории переподписки не равно \
+         первому событию journal::stream: {body}"
     );
 }
 
@@ -638,6 +657,12 @@ async fn s3_switch_catalog_unlistable_is_fail_closed() {
     let w = std::sync::Arc::new(Watcher::start(dir.path()));
     let mut ws = connect(&addr).await;
     first_snapshot_complete(&mut ws, "s3").await;
+    let frozen = frozen_start(ckpt.path());
+    assert_eq!(
+        frozen,
+        first_retained_seq(dir.path()),
+        "SETUP НЕ СОСТОЯЛСЯ: слепок и целый журнал расходятся в начале истории — мир не тот"
+    );
     let _g = Guard("m98-switch-catalog:s3".to_string());
     let jd = dir.path().to_path_buf();
     let sealed = std::sync::Arc::new(std::sync::Mutex::new(None));
@@ -656,6 +681,12 @@ async fn s3_switch_catalog_unlistable_is_fail_closed() {
         "M-98 / R-249 Б-1 / VB-I-11: переподписка — префикс удалён, проверка свежести каталога \
          ОТКАЗАЛА, а снимок говорит «история полная» — Err проглочен. Обязан: (frozen, true): {body}"
     );
+    assert_eq!(
+        start_seq(&body),
+        frozen,
+        "M-98 / A-053 A2 / VB-I-11: fail-closed исход обязан быть (frozen_start_seq, true): \
+         начало не равно шапке чекпоинта: {body}"
+    );
 }
 
 /// **`s4` — то же, `is_fresh → Ok(false)`, затем `refresh → Err`** (мир `R-250` Б-1). Мутант
@@ -669,6 +700,12 @@ async fn s4_switch_refresh_failure_after_stale_is_fail_closed() {
     let w = std::sync::Arc::new(Watcher::start(dir.path()));
     let mut ws = connect(&addr).await;
     first_snapshot_complete(&mut ws, "s4").await;
+    let frozen = frozen_start(ckpt.path());
+    assert_eq!(
+        frozen,
+        first_retained_seq(dir.path()),
+        "SETUP НЕ СОСТОЯЛСЯ: слепок и целый журнал расходятся в начале истории — мир не тот"
+    );
     let _g = Guard("m98-switch-catalog:s4".to_string());
     let jd = dir.path().to_path_buf();
     let sealed = std::sync::Arc::new(std::sync::Mutex::new(None));
@@ -684,5 +721,11 @@ async fn s4_switch_refresh_failure_after_stale_is_fail_closed() {
         truncated(&body),
         "M-98 / R-250 Б-1 / VB-I-11: переподписка — is_fresh «устарел», refresh ОТКАЗАЛ, а снимок \
          говорит «история полная» — Err refresh проглочен. Обязан: (frozen, true): {body}"
+    );
+    assert_eq!(
+        start_seq(&body),
+        frozen,
+        "M-98 / A-053 A2 / VB-I-11: fail-closed исход обязан быть (frozen_start_seq, true): \
+         начало не равно шапке чекпоинта: {body}"
     );
 }
