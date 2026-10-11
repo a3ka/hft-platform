@@ -144,21 +144,45 @@ fn bands_subset(asked: &[f64], canonical: &[f64]) -> bool {
 }
 
 fn profile_allowed(policy: &AdmissionPolicy, sel: &Selector) -> bool {
-    // Профиль — это КОНЕЧНЫЙ перечень `timeframe_ms`, разрешённый на публичном пути
-    // (`C-234` R1, спека §4.1). Проверяем только `timeframe_ms` (остальные поля
-    // профиля — `window_ms`/`depth_cadence_ms` — это ОГРАНИЧЕНИЯ работы внутри
-    // `LiveReducer`, и они проверяются на следующем слое; `admit` судит «вправе ли
-    // клиент ЭТО просить», а не «вправе ли редьюсер ЭТО посчитать»).
+    // M-100 (§4.1, CT-RFC-09 §2.10.1, TD-242): профиль — это КОНЕЧНЫЙ перечень
+    // ТРОЕК (timeframe_ms, window_ms, depth_cadence_ms), разрешённый на публичном
+    // пути. Полная сверка `admit` обязательна — иначе клиент, приславший
+    // `window_ms` вне `allowed_profiles`, получает `not_ready` (слепок под
+    // другой отпечаток) вместо названного `unsupported` (`TD-242`).
     //
-    // Следствие: `timeframe_ms: 1_000` разрешает любой `window_ms` (включая `None` —
-    // unbounded offline), и эта ветка дополнительно проверяется отдельным оракулом
-    // (`form_unbounded_profile_is_refused_even_with_canonical_bands`) с `timeframe_ms: 1`,
-    // который НЕ входит в перечень. То есть: профиль = «разрешённый `timeframe_ms`»,
-    // а не «полный кортеж параметров».
+    // Семантика `window_ms`:
+    //   - `sel.window_ms == None` ⇒ legacy/offline-режим (тест `red_m87_admission::
+    //     form_canonical_request_is_not_refused` использует именно его). `admit`
+    //     НЕ отвергает — offline — это легитимный выбор клиента, и обязанность
+    //     РЕДЬЮСЕРА справиться (валидация в `LiveReducer::resume` уже проверяет
+    //     валидность `None`). Здесь сравниваем только `timeframe_ms`.
+    //   - `sel.window_ms == Some(w)` ⇒ ТРОЙКА проверяется целиком: `w` должно
+    //     совпасть с `Some(p.window_ms)` для ОДНОГО из профилей.
+    //
+    // Семантика `depth_cadence_ms`:
+    //   - `sel.depth_cadence_ms == None` ⇒ ТОЛЬКО профили с `depth_cadence_ms == None`
+    //     совпадают (профиль по умолчанию задаёт `None`).
+    //   - `sel.depth_cadence_ms == Some(c)` ⇒ профили с `Some(c)` совпадают
+    //     (None ≠ Some(c) для каденции ЗАПРЕЩЕНО: это смена СЕМАНТИКИ, см. M-68 d14).
+    //
+    // `timeframe_ms` сравнивается строго.
+    let sel_cadence = sel.depth_cadence_ms;
     for p in &policy.allowed_profiles {
-        if p.timeframe_ms == sel.timeframe_ms {
-            return true;
+        if p.timeframe_ms != sel.timeframe_ms {
+            continue;
         }
+        // Если селектор legacy (`window_ms == None`) — пропускаем проверку окна,
+        // но КАДЕНЦИЮ сверяем (она задаётся профилем — клиентский `None` не
+        // проходит под профильный `Some`; см. M-68 d14, T-инвариант).
+        if let Some(w) = sel.window_ms {
+            if p.window_ms != w {
+                continue;
+            }
+        }
+        if p.depth_cadence_ms != sel_cadence {
+            continue;
+        }
+        return true;
     }
     false
 }

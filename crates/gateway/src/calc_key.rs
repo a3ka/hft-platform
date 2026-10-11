@@ -41,15 +41,15 @@ pub fn canonical_calc_key_bytes(sel: &Selector) -> Vec<u8> {
     out.push('\n');
     out.push_str("window_ms=");
     match sel.window_ms {
-            Some(w) => out.push_str(&w.to_string()),
-            None => out.push_str("none"),
-        }
+        Some(w) => out.push_str(&w.to_string()),
+        None => out.push_str("none"),
+    }
     out.push('\n');
     out.push_str("depth_cadence_ms=");
     match sel.depth_cadence_ms {
-            Some(c) => out.push_str(&c.to_string()),
-            None => out.push_str("none"),
-        }
+        Some(c) => out.push_str(&c.to_string()),
+        None => out.push_str("none"),
+    }
     out.push('\n');
     out.push_str("bands_pct_e8=");
     let mut first = true;
@@ -130,7 +130,8 @@ mod tests {
         let mut s = prod();
         s.window_ms = None;
         s.depth_cadence_ms = None;
-        let s = std::str::from_utf8(&canonical_calc_key_bytes(&s)).unwrap();
+        let binding = canonical_calc_key_bytes(&s);
+        let s = std::str::from_utf8(&binding).unwrap();
         assert!(s.contains("window_ms=none\n"));
         assert!(s.contains("depth_cadence_ms=none\n"));
         // None и Some(0) — разные ключи (GW-I-14).
@@ -147,6 +148,8 @@ mod tests {
     fn id_is_64_lowercase_hex() {
         let id = calc_key_id(&prod());
         assert_eq!(id.len(), 64);
-        assert!(id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+        assert!(id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
     }
 }

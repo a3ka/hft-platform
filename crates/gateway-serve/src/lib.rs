@@ -1073,9 +1073,10 @@ pub mod server {
     {
         match msg {
             wire_v1::ClientMessage::Subscribe {
+                v: _,
                 id,
                 selector: sel_val,
-                ..
+                view: view_val,
             } => {
                 let id_for_closure = id.clone();
                 // Парсим `selector` (JSON → `gateway::Selector`) — ошибки `unknown_venue` /
@@ -1088,7 +1089,14 @@ pub mod server {
                         return Err(format!("missing selector for id {id}"));
                     }
                 };
-                let sel = match wire_v1::parse_selector(sel_val) {
+                let sel = match wire_v1::parse_selector(
+                    sel_val,
+                    inner
+                        .policy
+                        .as_ref()
+                        .map(|p| p.canonical_bands.as_slice())
+                        .unwrap_or(&[]),
+                ) {
                     Ok(s) => s,
                     Err(e) => {
                         let code = e.code();
@@ -1145,9 +1153,47 @@ pub mod server {
                                     s.clone()
                                 }
                             }
+                            wire_v1::SelectorError::UnsupportedBands => {
+                                // M-100 (§4.1, CT-RFC-09 §2.10.1, П-030): отказ по полосам
+                                // называет `view.depth_rows` — клиент видит, КАК выбрать
+                                // отображение вместо подмены.
+                                "selector.bands вне канонического набора — ключ расчёта резолвит сервер; \
+                                 выберите отображение через view.depth_rows (CT-RFC-09 §2.10.1, П-030)"
+                                    .to_string()
+                            }
                         };
                         send_v1_error(sink, Some(id), code, &msg).await;
                         return Err(format!("invalid selector: {msg}"));
+                    }
+                };
+                // M-100 (§4.2, CT-RFC-09 §2.10.2): парсим `view` ПОСЛЕ резолва
+                // `selector.bands` — `ViewSpec::validate` сверяет `band_pct_e8` против
+                // резолвленного ключа, и неизвестная полоса в `view` отвергается сразу,
+                // а не молча фильтруется при проекции. `None` или пустой `Vec` ⇒ тождество
+                // (показывать все строки). Невалидный `view` ⇒ код `invalid_view` на проводе
+                // (`w6` в оракуле M-100).
+                let view = match view_val {
+                    None => None,
+                    Some(v) => {
+                        // `view` — JSON-объект; парсим через serde в `ViewSpec` (обрабатывает
+                        // отсутствие `depth_rows` и пустой список).
+                        let parsed_view: Result<gateway::view::ViewSpec, _> =
+                            serde_json::from_value(v.clone());
+                        match parsed_view {
+                            Ok(vs) => match vs.validate(&sel) {
+                                Ok(()) => Some(vs),
+                                Err(ve) => {
+                                    let msg = format!("view invalid: {ve}");
+                                    send_v1_error(sink, Some(id), "invalid_view", &msg).await;
+                                    return Err(format!("invalid view: {msg}"));
+                                }
+                            },
+                            Err(e) => {
+                                let msg = format!("view JSON deserialize: {e}");
+                                send_v1_error(sink, Some(id), "invalid_view", &msg).await;
+                                return Err(format!("invalid view: {msg}"));
+                            }
+                        }
                     }
                 };
                 // Валидируем selector локально (O-7: пустой symbol / bands вне диапазона /
@@ -1374,6 +1420,14 @@ pub mod server {
                     .as_deref()
                     .map(|p| p.to_path_buf())
                     .unwrap_or_default();
+                // M-100: `view_for_closure` нужен замыканию `spawn_blocking` — Sub
+                // хранит `view`, и смена выбора = переподписка с ТЕМ ЖЕ `id` (§2.4),
+                // при которой новая `Sub` живёт в карте, а не старая. Клонируем В НАЧАЛЕ,
+                // чтобы (а) использовать для `project_view` и `snapshot_msg` ПОСЛЕ
+                // `spawn_blocking` (после await `view_for_closure` уже перемещён),
+                // (б) переместить в `spawn_blocking`-замыкание через `.clone()` ТАМ.
+                let view_for_closure: Option<gateway::view::ViewSpec> = view.clone();
+                let view_for_after: Option<gateway::view::ViewSpec> = view_for_closure.clone();
                 let sel_for_resume = sel.clone();
                 let max_subs = effective_max_subs();
                 if inner.subs.contains_key(id.as_str()) {
@@ -1427,6 +1481,12 @@ pub mod server {
                                 session::Sub {
                                     id: id_for_closure,
                                     selector: sel_for_resume,
+                                    // M-100: view живёт в Sub и применяется к снимку/кадрам
+                                    // на стороне транспорта ПОСЛЕ проверки предела объёма.
+                                    // Сюда передаём ИМЕННО тот `view`, что прислал клиент
+                                    // (валидированный в `wire_v1::parse_message` → `view`:
+                                    // после резолва `selector.bands`).
+                                    view: view_for_closure.clone(),
                                     live: Some(live),
                                 },
                             ))
@@ -1474,7 +1534,24 @@ pub mod server {
                         .and_modify(|g| *g += 1)
                         .or_insert(1);
                     debug_assert!(*next_gen >= 1, "generation must be ≥ 1 after switch");
-                    let snap_msg = wire_v1::snapshot_msg(&switched_id, &snap);
+                    // M-100 (§4.2, CT-RFC-09 §2.10.2): проекция `view` применяется к снимку
+                    // ПЕРЕД проверкой предела объёма — нет, ПОСЛЕ (транспорт, п.1 §4.2):
+                    // предел меряет полный расчёт, проекция только уменьшает. Здесь
+                    // `snapshot_checked` уже прошёл предел, и мы лишь фильтруем
+                    // `depth_series` перед сериализацией. `view_for_closure` клонируем
+                    // ДО перемещения, чтобы и в `snapshot_msg`, и в `project_view` —
+                    // одна и та же `view`.
+                    let view_for_proj = view_for_after.as_ref();
+                    let snap = if let Some(v) = view_for_proj {
+                        let mut s = snap;
+                        s.series = gateway::view::project_view(&s.series, v);
+                        s
+                    } else {
+                        snap
+                    };
+                    let snap_msg =
+                        wire_v1::snapshot_msg(&switched_id, &snap, view_for_after.as_ref());
+                    // ИСПРАВЛЕНО: view_for_closure.as_ref() → &Option<ViewSpec>; передаём как Option<&ViewSpec>.
                     let snap_text = match serde_json::to_string(&snap_msg) {
                         Ok(s) => s,
                         Err(e) => {
@@ -1638,6 +1715,8 @@ pub mod server {
                         session::Sub {
                             id: id_for_closure,
                             selector: sel_for_resume,
+                            // M-100: view живёт в Sub (см. описание SWITCH-пути выше).
+                            view: view_for_closure.clone(),
                             live: Some(live),
                         },
                     ))
@@ -1681,7 +1760,19 @@ pub mod server {
                 // `subs.len()`; этот счётчик — отдельная величина, рассинхрон с `subs` запрещён
                 // и при switch'е ловится сравнением `current_gen == gen_at_pump` на возврате pump'а.
                 inner.gens.entry(id_for_insert.clone()).or_insert(0);
-                let snap_msg = wire_v1::snapshot_msg(&id_for_insert, &snap);
+                // M-100 (§4.2): применяем `view` к снимку после `enforce_response_limit` (полный
+                // расчёт, проекция — только фильтрация `depth_series`).
+                let view_for_proj = view_for_after.as_ref();
+                let snap = if let Some(v) = view_for_proj {
+                    let mut s = snap;
+                    s.series = gateway::view::project_view(&s.series, v);
+                    s
+                } else {
+                    snap
+                };
+                let snap_msg =
+                    wire_v1::snapshot_msg(&id_for_insert, &snap, view_for_after.as_ref());
+                // ИСПРАВЛЕНО: view_for_closure.as_ref() → &Option<ViewSpec>; передаём как Option<&ViewSpec>.
                 let snap_text = match serde_json::to_string(&snap_msg) {
                     Ok(s) => s,
                     Err(e) => {
@@ -2049,7 +2140,15 @@ pub mod server {
                             // "`new_cursor`... используется ниже по коду (через `_stats`)"
                             // удалена — `new_cursor` и `stats` выкинуты из `V1PumpResult`,
                             // v1-путь их не использует.
-                            for frame in frames {
+                            // M-100 (§4.2, CT-RFC-09 §2.10.2): берём `view` из Sub (он обновляется при
+                            // switch'е через новое `view_for_closure`). Проекция применяется
+                            // к каждому кадру ПОСЛЕ `enforce_response_limit` на пути pump'а
+                            // (предел меряет полный расчёт — проекция только уменьшает).
+                            let view_for_pump = inner.subs.get(&id).and_then(|s| s.view.clone());
+                            for mut frame in frames {
+                                if let Some(v) = view_for_pump.as_ref() {
+                                    frame.delta = gateway::view::project_view(&frame.delta, v);
+                                }
                                 let frame_msg = wire_v1::frame_msg(&id, &frame);
                                 let text = match serde_json::to_string(&frame_msg) {
                                     Ok(s) => s,
@@ -2729,7 +2828,13 @@ pub mod server {
                                 }
                                 continue;
                             }
-                            for frame in frames {
+                            // M-100 (§4.2): применяем view из legacy Sub к каждому кадру (транспорт).
+                            let view_for_pump =
+                                v1_session_inner.subs.get(&id).and_then(|s| s.view.clone());
+                            for mut frame in frames {
+                                if let Some(v) = view_for_pump.as_ref() {
+                                    frame.delta = gateway::view::project_view(&frame.delta, v);
+                                }
                                 let frame_msg = wire_v1::frame_msg(&id, &frame);
                                 if let Ok(text) = serde_json::to_string(&frame_msg) {
                                     if sink.send(Message::Text(text)).await.is_err() {

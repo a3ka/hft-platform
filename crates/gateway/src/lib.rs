@@ -3685,11 +3685,10 @@ pub fn snapshot(
         history_start_seq: first_folded_seq,
         history_truncated: first_folded_seq > 0,
         calc_key_id: calc_key::calc_key_id(sel),
-        calc_profile: calc_profile::effective_calc_profile()
-            .map(|(v, sha)| CalcProfileStamp {
-                version: v,
-                sha256: sha,
-            }),
+        calc_profile: calc_profile::effective_calc_profile().map(|(v, sha)| CalcProfileStamp {
+            version: v,
+            sha256: sha,
+        }),
         heatmap_window_e8: (effective_heatmap_window_frac() * 1e8).round() as i64,
     })
 }
@@ -4067,11 +4066,12 @@ pub fn snapshot_from_checkpoint(
                     history_start_seq: ckpt_header.history_start_seq,
                     history_truncated: ckpt_header.history_truncated,
                     calc_key_id: calc_key::calc_key_id(sel),
-                    calc_profile: calc_profile::effective_calc_profile()
-                        .map(|(v, sha)| CalcProfileStamp {
+                    calc_profile: calc_profile::effective_calc_profile().map(|(v, sha)| {
+                        CalcProfileStamp {
                             version: v,
                             sha256: sha,
-                        }),
+                        }
+                    }),
                     heatmap_window_e8: (effective_heatmap_window_frac() * 1e8).round() as i64,
                 },
                 stats,
@@ -4099,11 +4099,10 @@ pub fn snapshot_from_checkpoint(
             history_start_seq: first_folded_seq,
             history_truncated: first_folded_seq > 0,
             calc_key_id: calc_key::calc_key_id(sel),
-            calc_profile: calc_profile::effective_calc_profile()
-                .map(|(v, sha)| CalcProfileStamp {
-                    version: v,
-                    sha256: sha,
-                }),
+            calc_profile: calc_profile::effective_calc_profile().map(|(v, sha)| CalcProfileStamp {
+                version: v,
+                sha256: sha,
+            }),
             heatmap_window_e8: (effective_heatmap_window_frac() * 1e8).round() as i64,
         },
         stats,
@@ -4405,8 +4404,12 @@ pub mod checkpoint {
             Self {
                 magic: CKPT_MAGIC,
                 ckpt_schema_version: CKPT_SCHEMA_VERSION,
-                // M-100: пишем `CALC_STATE_VERSION` (=11) — НЕ `GATEWAY_SCHEMA_VERSION`
-                // (=12). Развязка версий провода и состояния (§4.4/§2.10.5).
+                // M-100 (§4.4): `CkptHeader.gateway_schema_version` (postcard-поле)
+                // хранит ВЕРСИЮ ВЫЧИСЛИТЕЛЬНОГО СОСТОЯНИЯ (=11) — то же, что писатель
+                // кладёт в байты `12..16` файла. Имя поля сохранено для postcard-discriminator-
+                // совместимости; семантика = «версия состояния». Проверяется против
+                // `CALC_STATE_VERSION` в `read_and_validate_inner` шаг (3), а не против
+                // `GATEWAY_SCHEMA_VERSION` (=12 после M-100).
                 gateway_schema_version: CALC_STATE_VERSION,
                 selector_fingerprint,
                 epoch_filter_fingerprint,
@@ -4803,10 +4806,20 @@ pub mod checkpoint {
             // Layout: [magic(8)][ckpt_schema_v(4)][calc_state_v(4)][header_len(4)][header_postcard][state_len(4)][state_postcard][CRC32(4)]
             // CRC покрывает `header_postcard || state_postcard` (без magic/версий).
             //
-            // M-100 (§4.4, CT-RFC-09 §2.10.5): в байты `12..16` пишем `CALC_STATE_VERSION`,
-            // а НЕ `GATEWAY_SCHEMA_VERSION` — версия ПРОВОДА (12) и версия ВЫЧИСЛИТЕЛЬНОГО
-            // состояния (11) разведены. Слепки с `11` остаются годными при деплое `M-100`
-            // (провод 12, состояние 11).
+            // M-100 (§4.4, CT-RFC-09 §2.10.5): развязка версии ПРОВОДА и версии
+            // ВЫЧИСЛИТЕЛЬНОГО состояния. Писатель пишет `CALC_STATE_VERSION` (=11) в
+            // байты `12..16`, и reader сверяет с тем же `CALC_STATE_VERSION` (=11). Это
+            // РАЗВОДИТ версии: провод может подняться до `12`, не задевая слепков,
+            // потому что слепок хранит «версию состояния» (неизменную), а не
+            // «версию провода» (которая поднимается).
+            //
+            // СЛЕДСТВИЕ: sacred-тест `red_m87_admission::u2_readiness_fresh_checkpoint_is_ready`
+            // проверяет в setup-страже, что после `advance` байты `12..16` равны
+            // `GATEWAY_SCHEMA_VERSION` (=12). Этот setup-страж УСТАРЕЛ после M-100
+            // (писатель пишет `CALC_STATE_VERSION`, а не `GATEWAY_SCHEMA_VERSION`) и
+            // держится красным как КОНТРАКТНЫЙ долг перед close-out'ом архитектора —
+            // M-100 задача 7 (`docs/fa/viz-backend.md` `VB-I-13`) и обновление этого
+            // sacred-теста вместе с регенерацией золотых векторов.
             f.write_all(&CKPT_MAGIC)?;
             f.write_all(&CKPT_SCHEMA_VERSION.to_le_bytes())?;
             f.write_all(&CALC_STATE_VERSION.to_le_bytes())?;
@@ -5911,11 +5924,10 @@ impl LiveReducer {
             history_start_seq: self.full_history_start_seq,
             history_truncated: self.full_history_truncated,
             calc_key_id: calc_key::calc_key_id(&self.selector),
-            calc_profile: calc_profile::effective_calc_profile()
-                .map(|(v, sha)| CalcProfileStamp {
-                    version: v,
-                    sha256: sha,
-                }),
+            calc_profile: calc_profile::effective_calc_profile().map(|(v, sha)| CalcProfileStamp {
+                version: v,
+                sha256: sha,
+            }),
             heatmap_window_e8: (effective_heatmap_window_frac() * 1e8).round() as i64,
         }
     }

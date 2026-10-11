@@ -54,6 +54,10 @@ use gateway::{validate_selector as gw_validate_selector, Selector};
 pub struct Sub {
     pub id: String,
     pub selector: Selector,
+    /// M-100 (§4.2, CT-RFC-09 §2.10.2): принятый `view` (после резолва `selector.bands`
+    /// и валидации против него). `None` — клиент НЕ прислал `view` или прислал пустой;
+    /// тождество (`project_view` оставляет все ряды как есть).
+    pub view: Option<gateway::view::ViewSpec>,
     /// `None` пока pump в `spawn_blocking`. На возврате из pump'а live возвращается в
     /// `Some` — если generation не разошёлся. Сама структура `Sub` остаётся в карте
     /// `subs` всё время жизни подписки: pump'у передаётся только `live`, не владение `Sub`.

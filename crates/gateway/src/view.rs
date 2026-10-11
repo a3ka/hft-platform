@@ -11,9 +11,11 @@
 //! `cob`, `volume_bubbles`, `heatmap_observed_time`, `cob_observed`, `cadence_ms`)
 //! проекцией не затрагиваются.
 
+#[cfg(test)]
+use contracts::Venue;
 use serde::{Deserialize, Serialize};
 
-use super::{DepthRow, SeriesBundle, Selector};
+use super::{DepthRow, Selector, SeriesBundle};
 
 /// Ключ одной строки глубины: `(band_pct_e8, side)`. `band_pct_e8` хранится в долях ×1e8
 /// (то же представление, что в `DepthRow.band_pct_e8`, `С-185` B-2 / `MD-I-8` —
@@ -93,8 +95,7 @@ impl ViewSpec {
         }
         // Детектим дубли через BTreeSet: один проход, O(N log N) — для типичных
         // `depth_rows.len() ≤ 14` (одна строка на полосу × сторону) это шум.
-        let mut seen: std::collections::BTreeSet<(i64, &str)> =
-            std::collections::BTreeSet::new();
+        let mut seen: std::collections::BTreeSet<(i64, &str)> = std::collections::BTreeSet::new();
         for k in rows {
             // Нормализуем side (lowercase, как в `DepthRow.side`) для валидации.
             let side_norm: &str = match k.side.as_str() {
@@ -184,11 +185,7 @@ mod tests {
     #[test]
     fn empty_or_none_is_identity_ok() {
         assert!(ViewSpec::default().validate(&calc()).is_ok());
-        assert!(ViewSpec {
-            depth_rows: None
-        }
-        .validate(&calc())
-        .is_ok());
+        assert!(ViewSpec { depth_rows: None }.validate(&calc()).is_ok());
     }
 
     #[test]
