@@ -63,7 +63,9 @@ world "прототип по §3"                               ""           "" 
 world "мутант: провенанс без is_fresh/refresh"       "nofresh"    "s2 s3 s4"       patch
 world "мутант: Err is_fresh/refresh проглочен"       "swallow"    "s3 s4"          patch
 world "мутант: на SWITCH всегда (frozen, true)"      "alwaystrue" "s0 s1 s2"       patch
-world "мутант: начало истории = 1 при усечении (C-297 B1)" "startone" "s1 s2"     patch
+world "мутант: начало истории = 1 при усечении (C-297 B1)" "startone" "s1 s2 s3 s4" patch
+world "мутант: начало = 1 на ЦЕЛОМ журнале (C-302)"      "completeone" "s0"         patch
+world "мутант: fail-closed с ЛОЖНЫМ frozen (A-053)"     "frozenwrong" "s3 s4"      patch
 
-[ "${FAIL}" -eq 0 ] && { echo "VERDICT: PASS — 6 миров"; exit 0; }
+[ "${FAIL}" -eq 0 ] && { echo "VERDICT: PASS — 8 миров"; exit 0; }
 echo "VERDICT: FAIL (провалов: ${FAIL})"; exit 1

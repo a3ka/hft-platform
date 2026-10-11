@@ -30,7 +30,7 @@ if [ "$DRY" != "1" ]; then
 run_step "task1: red_m98_switch_provenance (s0…s4)" \
   cargo test -q -p gateway-serve --features testing --test red_m98_switch_provenance
 # --- task1 / C-297 B2: различающая сила набора — исполняемая таблица мутаций §8 (прототип + 4 мутанта)
-run_step "task1: red_m98_mutants.sh (база красна целиком, прототип зелен, мутанты — объявленные наборы)" \
+run_step "task1: red_m98_mutants.sh (прототип + 6 мутантов: база красна целиком, прототип зелен, мутанты — объявленные наборы)" \
   bash scripts/tests/red_m98_mutants.sh
 # --- I-2: провенанс ADD- и legacy-путей (M-95, M-87) не задет правкой SWITCH-ветки
 run_step "I-2: gateway-serve red_m95_provenance_fresh (f0…f6)" \

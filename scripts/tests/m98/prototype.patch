@@ -1,5 +1,5 @@
---- a/crates/gateway-serve/src/lib.rs	2026-10-10 22:20:05.816312802 +0000
-+++ b/crates/gateway-serve/src/lib.rs	2026-10-10 22:20:05.817312787 +0000
+--- a/crates/gateway-serve/src/lib.rs	2026-10-11 13:35:11.294151873 +0000
++++ b/crates/gateway-serve/src/lib.rs	2026-10-11 13:35:11.328151345 +0000
 @@ -1390,7 +1390,7 @@
                      // а не затрёт новый.
                      let (snap, new_sub) =
@@ -9,7 +9,7 @@
                                  &path_clone,
                                  filter_clone,
                                  &sel_for_resume,
-@@ -1401,7 +1401,45 @@
+@@ -1401,7 +1401,59 @@
                              // `milestones/M-71-egress-cap.md` §5). На этом пути (switch)
                              // ошибка предела превращается в `invalid_selector` — клиент
                              // увидит `code:"invalid_selector"` и сообщение с величинами.
@@ -47,11 +47,25 @@
 +                                        },
 +                                    };
 +                                    live.put_segment_catalog(cat);
-+                                    p.unwrap_or((snap.history_start_seq, true))
++                                    // frozenwrong (A-053 A3): fail-closed исход с ЛОЖНЫМ frozen.
++                                    // Ветка `None` каталога ниже фикстурами не достигается —
++                                    // мутант её не трогает и покрытия ей не изображает.
++                                    if m98 == "frozenwrong" {
++                                        p.unwrap_or((snap.history_start_seq + 1, true))
++                                    } else {
++                                        p.unwrap_or((snap.history_start_seq, true))
++                                    }
 +                                }
 +                                None => (snap.history_start_seq, true),
 +                            };
-+                            snap.history_start_seq = if m98 == "startone" && lt { 1 } else { ls };
++                            // completeone (C-302, A-053 A3): начало = 1 на ЦЕЛОМ журнале.
++                            snap.history_start_seq = if (m98 == "startone" && lt)
++                                || (m98 == "completeone" && !lt)
++                            {
++                                1
++                            } else {
++                                ls
++                            };
 +                            snap.history_truncated = lt;
                              // M-87 (задача 23, R-196 №5 / R-200 §B7 / R-201 Б-2): счётчик
                              // прочитанных байт кормится ЧЕСТНЫМ `ReadStats.payload_bytes_read` —
