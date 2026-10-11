@@ -114,7 +114,36 @@ fn default_capture_book_observations() -> bool {
 ///    но ОТДЕЛЬНЫМ атомарным коммитом: подпись формы и состав полос — разные задачи
 ///    милестоуна (§Tasks M-70, номера 6 и 7), и связывать их одним коммитом запрещает
 ///    `commit-discipline.md` («одна задача = ≥1 коммит»).
-pub const GATEWAY_SCHEMA_VERSION: u32 = 11;
+/// Версия экспорт-формы gateway (живой/провод) — bump при смене ФОРМЫ.
+/// M-100 (`milestones/M-100-three-serving-contracts.md` §4.4, `CT-RFC-09` §2.10.3):
+/// провод v12 несёт `calc_key_id`/`calc_profile`/`heatmap_window_e8` в `Snapshot`.
+/// Слепок продолжает писать `CALC_STATE_VERSION = 11` (форма ВЫЧИСЛИТЕЛЬНОГО состояния
+/// редьюсера не меняется — `VB-I-4` аддитивность).
+pub const GATEWAY_SCHEMA_VERSION: u32 = 12;
+
+/// M-100 (`milestones/M-100-three-serving-contracts.md` §4.4, `CT-RFC-09` §2.10.5):
+/// версия ФОРМЫ ВЫЧИСЛИТЕЛЬНОГО состояния редьюсера (слепок). Независима от
+/// `GATEWAY_SCHEMA_VERSION` (форма провода): правка ФОРМЫ КАДРА не обесценивает слепки.
+/// `11` намеренно: слепки, записанные до `M-100`, остаются годными; прод-деплой `M-100`
+/// НЕ требует холодной пересборки (≈23 мин по замеру `M-70` п.4).
+///
+/// Доступ: `gateway::checkpoint::CALC_STATE_VERSION` (объявлена в `checkpoint`-модуле)
+/// — `gateway-serve::admission::readiness` сверяет байты `12..16` слепка с этой
+/// константой, а НЕ с `GATEWAY_SCHEMA_VERSION`.
+pub use crate::checkpoint::CALC_STATE_VERSION;
+
+/// M-100 (`milestones/M-100-three-serving-contracts.md` §4.3, `CT-RFC-09` §2.10.4):
+/// стабильный идентификатор ключа расчёта. Заменяет отпечаток `DefaultHasher` (зависел от
+/// toolchain), форма независима от Rust-рантайма — `sha256` канонической UTF-8-формы
+/// (`calc-key/v1` · `venue=…` · `symbol=…` · `timeframe_ms=…` · `window_ms=…|none` ·
+/// `depth_cadence_ms=…|none` · `bands_pct_e8=…`). Реализация — `gateway::calc_key` (задача 3).
+pub mod calc_key;
+
+/// M-100 (`milestones/M-100-three-serving-contracts.md` §4.2, `CT-RFC-09` §2.10.2):
+/// проекция отображения (`view`) — выбор строк глубины (`depth_rows`) поверх готового
+/// расчёта; НЕ меняет расчёт (`calc_key_id` остаётся тот же). Применяется ТРАНСПОРТОМ
+/// к снимку И к каждому кадру подписки ПОСЛЕ проверки предела объёма.
+pub mod view;
 
 /// M-71 (`milestones/M-71-egress-cap.md` §5.1): дефолт предела объёма ответа в
 /// БАЙТАХ сериализованной `SeriesBundle` (`serde_json::to_vec`). Значение — продуктовое
@@ -560,6 +589,14 @@ pub struct SeriesBundle {
     pub cob_observed: bool,
 }
 
+/// M-100 (`milestones/M-100-three-serving-contracts.md` §4.4, `CT-RFC-09` §2.10.3,
+/// `П-032` п.4(в)): применённая версия профиля расчётов, объявляется снимком.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CalcProfileStamp {
+    pub version: u32,
+    pub sha256: String,
+}
+
 /// Полная детерминированная свёртка окна `[start .. cursor]`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Snapshot {
@@ -568,6 +605,28 @@ pub struct Snapshot {
     /// Курсор, ДО которого (включительно) свёрнута серия.
     pub cursor: Cursor,
     pub series: SeriesBundle,
+    /// M-100 (`milestones/M-100-three-serving-contracts.md` §4.3, `CT-RFC-09` §2.10.4):
+    /// стабильный идентификатор ключа расчёта (`sha256` канонической формы
+    /// `calc-key/v1`...). Не зависит от toolchain (замена `DefaultHasher`), снаружи
+    /// отображает, ЧТО посчитано; `selector.bands` после резолва сервером равен
+    /// каноническому набору профиля (`П-029`/`П-032`).
+    #[serde(default)]
+    pub calc_key_id: String,
+    /// M-100 (`milestones/M-100-three-serving-contracts.md` §4.4, `CT-RFC-09` §2.10.3,
+    /// `П-032` п.4(в)): применённая версия профиля расчётов `{version, sha256}`.
+    /// `null` — процесс без профиля (legacy-режим); `#[serde(default)]` —
+    /// v11-консьюмер прочитает v12 как `null` без ошибки, но ОБЯЗАН гейтить на
+    /// `schema_version == 12`, иначе `view`-поля останутся непрочитанными
+    /// (тот же класс, что `VB-I-12`).
+    #[serde(default)]
+    pub calc_profile: Option<CalcProfileStamp>,
+    /// M-100 (`milestones/M-100-three-serving-contracts.md` §4.4, `CT-RFC-09` §2.10.3,
+    /// `TD-197`): полуширина ценового окна карты/стакана, доля ×1e8
+    /// (`effective_heatmap_window_frac() * 1e8`, округлено). Объявляется снимком, чтобы
+    /// клиент знал геометрию карты (`heatmap_window_e8 / 1e8` × `mid`) без отдельного
+    /// конфиг-запроса.
+    #[serde(default)]
+    pub heatmap_window_e8: i64,
     /// M-48 (TD-048, VB-I-11): seq ПЕРВОГО РЕАЛЬНО свёрнутого события. Брать из
     /// `header.first_seq` сегмента НЕЛЬЗЯ — у legacy-сегментов он синтезирован нулём
     /// (`segments.rs:509-512`, TD-030) и соврал бы ровно там, где важна правда.
@@ -3592,6 +3651,13 @@ pub fn snapshot(
         series,
         history_start_seq: first_folded_seq,
         history_truncated: first_folded_seq > 0,
+        calc_key_id: calc_key::calc_key_id(sel),
+        calc_profile: calc_profile::effective_calc_profile()
+            .map(|(v, sha)| CalcProfileStamp {
+                version: v,
+                sha256: sha,
+            }),
+        heatmap_window_e8: (effective_heatmap_window_frac() * 1e8).round() as i64,
     })
 }
 
@@ -3967,6 +4033,13 @@ pub fn snapshot_from_checkpoint(
                     series,
                     history_start_seq: ckpt_header.history_start_seq,
                     history_truncated: ckpt_header.history_truncated,
+                    calc_key_id: calc_key::calc_key_id(sel),
+                    calc_profile: calc_profile::effective_calc_profile()
+                        .map(|(v, sha)| CalcProfileStamp {
+                            version: v,
+                            sha256: sha,
+                        }),
+                    heatmap_window_e8: (effective_heatmap_window_frac() * 1e8).round() as i64,
                 },
                 stats,
             ));
@@ -3992,6 +4065,13 @@ pub fn snapshot_from_checkpoint(
             // M-48 (VB-I-11): провенанс из первого свёрнутого события (см. `snapshot`).
             history_start_seq: first_folded_seq,
             history_truncated: first_folded_seq > 0,
+            calc_key_id: calc_key::calc_key_id(sel),
+            calc_profile: calc_profile::effective_calc_profile()
+                .map(|(v, sha)| CalcProfileStamp {
+                    version: v,
+                    sha256: sha,
+                }),
+            heatmap_window_e8: (effective_heatmap_window_frac() * 1e8).round() as i64,
         },
         stats,
     ))
@@ -4019,6 +4099,17 @@ pub mod checkpoint {
     use std::path::{Path, PathBuf};
 
     use contracts::SegmentHeader;
+
+    /// M-100 (`milestones/M-100-three-serving-contracts.md` §4.4, `CT-RFC-09` §2.10.5):
+    /// версия ФОРМЫ ВЫЧИСЛИТЕЛЬНОГО состояния редьюсера (слепок). Независима от
+    /// `GATEWAY_SCHEMA_VERSION` (форма провода): правка ФОРМЫ КАДРА не обесценивает
+    /// слепки. `11` намеренно: слепки до `M-100` остаются годными; прод-деплой `M-100`
+    /// НЕ требует холодной пересборки (≈23 мин по замеру `M-70` п.4).
+    ///
+    /// Доступна и как `gateway::checkpoint::CALC_STATE_VERSION` (для `gateway-serve`,
+    /// сверяющего байты `12..16` слепка), и как `gateway::CALC_STATE_VERSION`
+    /// (реэкспорт через `pub use crate::checkpoint::CALC_STATE_VERSION`).
+    pub const CALC_STATE_VERSION: u32 = 11;
 
     /// RAII-обёртка над `flock(LOCK_EX)`: `Drop` снимает блокировку. `File` держится
     /// до конца жизни guard'а — иначе `flock` ОС снимется при закрытии fd (fd
@@ -4230,6 +4321,11 @@ pub mod checkpoint {
     pub struct CkptHeader {
         pub magic: [u8; 8],
         pub ckpt_schema_version: u32,
+        /// M-100 (§4.4): байты `12..16` файла; с v12 (M-100) сюда пишется
+        /// `CALC_STATE_VERSION` (==11), а НЕ `GATEWAY_SCHEMA_VERSION` (==12). Имя поля
+        /// сохранено для совместимости с discriminator-форматом postcard'а — postcard не
+        /// self-describing и переименование сломало бы десериализацию слепков до M-100
+        /// (оракул `red_m100_state_version::sv2` проверяет слепок с байтами `11`).
         pub gateway_schema_version: u32,
         /// Селектор-фингерпринт: SHA-подобный хеш (Venue+symbol+timeframe_ms+window_ms+
         /// bands-через-`to_bits`). NaN в bands ЗАПРЕЩЁН в `Selector::validate` (см.
@@ -4276,7 +4372,9 @@ pub mod checkpoint {
             Self {
                 magic: CKPT_MAGIC,
                 ckpt_schema_version: CKPT_SCHEMA_VERSION,
-                gateway_schema_version: GATEWAY_SCHEMA_VERSION,
+                // M-100: пишем `CALC_STATE_VERSION` (=11) — НЕ `GATEWAY_SCHEMA_VERSION`
+                // (=12). Развязка версий провода и состояния (§4.4/§2.10.5).
+                gateway_schema_version: CALC_STATE_VERSION,
                 selector_fingerprint,
                 epoch_filter_fingerprint,
                 journal_lineage,
@@ -4669,11 +4767,16 @@ pub mod checkpoint {
         let tmp_path = unique_tmp_path(&final_path);
         {
             let mut f = File::create(&tmp_path)?;
-            // Layout: [magic(8)][ckpt_schema_v(4)][gateway_schema_v(4)][header_len(4)][header_postcard][state_len(4)][state_postcard][CRC32(4)]
+            // Layout: [magic(8)][ckpt_schema_v(4)][calc_state_v(4)][header_len(4)][header_postcard][state_len(4)][state_postcard][CRC32(4)]
             // CRC покрывает `header_postcard || state_postcard` (без magic/версий).
+            //
+            // M-100 (§4.4, CT-RFC-09 §2.10.5): в байты `12..16` пишем `CALC_STATE_VERSION`,
+            // а НЕ `GATEWAY_SCHEMA_VERSION` — версия ПРОВОДА (12) и версия ВЫЧИСЛИТЕЛЬНОГО
+            // состояния (11) разведены. Слепки с `11` остаются годными при деплое `M-100`
+            // (провод 12, состояние 11).
             f.write_all(&CKPT_MAGIC)?;
             f.write_all(&CKPT_SCHEMA_VERSION.to_le_bytes())?;
-            f.write_all(&GATEWAY_SCHEMA_VERSION.to_le_bytes())?;
+            f.write_all(&CALC_STATE_VERSION.to_le_bytes())?;
             f.write_all(&(header_bytes.len() as u32).to_le_bytes())?;
             f.write_all(&header_bytes)?;
             f.write_all(&(state_bytes.len() as u32).to_le_bytes())?;
@@ -4863,9 +4966,11 @@ pub mod checkpoint {
         if ckpt_v != CKPT_SCHEMA_VERSION {
             return None;
         }
-        // (3) gateway_schema_version
+        // (3) gateway_schema_version (M-100: пишется `CALC_STATE_VERSION`, а не
+        // `GATEWAY_SCHEMA_VERSION` — развязка версии ПРОВОДА и версии ВЫЧИСЛИТЕЛЬНОГО
+        // состояния; правка формы кадра НЕ обесценивает слепки, §4.4/§2.10.5).
         let gw_v = u32::from_le_bytes(bytes[12..16].try_into().ok()?);
-        if gw_v != GATEWAY_SCHEMA_VERSION {
+        if gw_v != CALC_STATE_VERSION {
             return None;
         }
         // (4) header_len + header_postcard
@@ -5772,6 +5877,13 @@ impl LiveReducer {
             series,
             history_start_seq: self.full_history_start_seq,
             history_truncated: self.full_history_truncated,
+            calc_key_id: calc_key::calc_key_id(&self.selector),
+            calc_profile: calc_profile::effective_calc_profile()
+                .map(|(v, sha)| CalcProfileStamp {
+                    version: v,
+                    sha256: sha,
+                }),
+            heatmap_window_e8: (effective_heatmap_window_frac() * 1e8).round() as i64,
         }
     }
 

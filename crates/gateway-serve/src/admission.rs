@@ -204,13 +204,18 @@ pub fn readiness(
         Some(h) => h,
         None => return ServingOutcome::NotReady,
     };
-    // (3) Версия провода. `gateway_schema_version` поля `CkptHeader` обязана
-    // совпадать с текущей — иначе слепок считаем несовместимым. Чтение
-    // идёт напрямую из файла по смещению `12..16` (спека M-38b: первая часть
-    // файла — фиксированные `magic || ckpt_v || gw_v || header_len`), а НЕ
+    // (3) Версия состояния (M-100). `readiness` сверяет байты `12..16` слепка с
+    // `gateway::checkpoint::CALC_STATE_VERSION` (== 11), а НЕ `GATEWAY_SCHEMA_VERSION`
+    // (== 12) — развязка версии ПРОВОДА и версии ВЫЧИСЛИТЕЛЬНОГО состояния
+    // (`milestones/M-100-three-serving-contracts.md` §4.4, `CT-RFC-09` §2.10.5): правка
+    // формы кадра (провод 11→12) НЕ обесценивает слепки, потому что байты `12..16`
+    // по-прежнему несут `11`.
+    //
+    // Чтение идёт напрямую из файла по смещению `12..16` (спека M-38b: первая часть
+    // файла — фиксированные `magic || ckpt_v || calc_state_v || header_len`), а НЕ
     // из postcard-сериализованного заголовка (там может быть ОТДЕЛЬНОЕ поле,
-    // и тест `u2_readiness_incompatible_checkpoint` модифицирует именно
-    // байтовое поле).
+    // и тест `w9_foreign_state_version_is_not_ready` модифицирует именно байтовое
+    // поле, подставляя 10 или 12).
     let raw = match std::fs::read(&ckpt_path) {
         Ok(b) => b,
         Err(_) => return ServingOutcome::NotReady,
@@ -219,7 +224,7 @@ pub fn readiness(
         return ServingOutcome::NotReady;
     }
     let declared = u32::from_le_bytes(raw[12..16].try_into().unwrap_or([0u8; 4]));
-    if declared != gateway::GATEWAY_SCHEMA_VERSION {
+    if declared != gateway::checkpoint::CALC_STATE_VERSION {
         return ServingOutcome::NotReady;
     }
     // (4) Курсор слепка лежит близко к хвосту. staleness-проверка ОТКАЗЫВАЕТ
