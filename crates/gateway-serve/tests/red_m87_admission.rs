@@ -503,7 +503,12 @@ fn u2_readiness_corrupt_checkpoint_over_trap() {
     );
 }
 
-/// Состояние 3 — слепок несовместим по версии провода.
+/// Состояние 3 — слепок несовместим по версии СОСТОЯНИЯ.
+///
+/// **M-100 (§4.4):** байты 12..16 несут `CALC_STATE_VERSION`, допуск сверяет её. Подделка
+/// ставит в заголовок ВЕРСИЮ ПРОВОДА `GATEWAY_SCHEMA_VERSION` — единственное значение,
+/// которое отличает правильную сверку от сверки не с той константой: допуск, сравнивающий
+/// заголовок с версией провода, примет такой слепок как свой, и сценарий покраснеет.
 #[test]
 fn u2_readiness_incompatible_checkpoint() {
     let dir = journal_of(40);
@@ -519,10 +524,15 @@ fn u2_readiness_incompatible_checkpoint() {
     let declared = u32::from_le_bytes(bytes[12..16].try_into().expect("4 байта"));
     assert_eq!(
         declared,
-        gateway::GATEWAY_SCHEMA_VERSION,
+        gateway::checkpoint::CALC_STATE_VERSION,
         "setup-страж: не то поле"
     );
-    bytes[12..16].copy_from_slice(&(declared + 1).to_le_bytes());
+    let bad = gateway::GATEWAY_SCHEMA_VERSION;
+    assert_ne!(
+        bad, declared,
+        "setup-страж: версия провода совпала с версией состояния — подделка ничего не меняет"
+    );
+    bytes[12..16].copy_from_slice(&bad.to_le_bytes());
     std::fs::write(&path, &bytes).expect("write");
     poison_first_segment(dir.path());
 

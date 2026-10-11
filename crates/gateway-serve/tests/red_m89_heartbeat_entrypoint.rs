@@ -257,7 +257,10 @@ fn sel() -> Selector {
         timeframe_ms: 1_000,
         bands: CANONICAL.to_vec(),
         window_ms: Some(60_000),
-        depth_cadence_ms: None,
+        // M-100 (`CT-RFC-09` §2.10.1): тройка `(timeframe, window, cadence)` клиента обязана
+        // совпасть с `allowed_profiles` профиля (`config/calc-profile/active.env`:
+        // `1000/60000/1000`); без каденции подписка — `unsupported`, и слепок под неё не нужен.
+        depth_cadence_ms: Some(1_000),
     }
 }
 
@@ -602,7 +605,7 @@ async fn h1_prod_binary_writes_heartbeat_at_compose_path_atomically_and_values_g
     .expect("connect");
     let sub = json!({"op":"subscribe","v":1,"id":"s1","selector":{
         "venue":"Binance","symbol":"BTCUSDT","timeframe_ms":1000,
-        "bands":CANONICAL.to_vec(),"window_ms":60000}});
+        "bands":CANONICAL.to_vec(),"window_ms":60000,"depth_cadence_ms":1000}});
     ws.send(Message::Text(sub.to_string())).await.expect("send");
     let first_msg: Option<Value> =
         match tokio::time::timeout(std::time::Duration::from_secs(10), ws.next()).await {

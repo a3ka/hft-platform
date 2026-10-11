@@ -150,11 +150,13 @@ fn journal_of_n(n: u64) -> (tempfile::TempDir, Vec<u64>) {
 }
 
 /// Форма провода объявлена и поднята: смена правила склейки есть смена формы (`VB-I-4`).
+/// M-88 поднял до 11; M-100 — до 12 (аддитивные поля снимка, `CT-RFC-09` §2.10). Действующее
+/// значение пиннит `red_gateway_schema_version::EXPECTED_SCHEMA_VERSION`; здесь — то же число.
 #[test]
 fn form_schema_version_is_bumped_to_11() {
     assert_eq!(
         gateway::GATEWAY_SCHEMA_VERSION,
-        11,
+        12,
         "смена контракта обновления = смена формы выдачи ⇒ бамп обязателен (VB-I-4)"
     );
 }
