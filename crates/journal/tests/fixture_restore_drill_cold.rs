@@ -613,7 +613,7 @@ fn select_by_contract(cold: &Path) -> Vec<u32> {
     if n < 3 {
         return idx;
     }
-    let mid = (n + 1) / 2;
+    let mid = n.div_ceil(2);
     vec![idx[0], idx[mid - 1], idx[n - 1]]
 }
 
