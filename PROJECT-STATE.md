@@ -3767,6 +3767,23 @@ liveness-сигнала были зелены при полностью нера
 только если специально посмотрит. Исправлено по факту (`R-213`); **правка нормы — зона
 architect'а**, вынесена находкой вердикта.
 
+## Зависимости 2026-10-12 — `quinn-proto` 0.11.16 → 0.11.19 (RUSTSEC-2026-0338..0342), запись reviewer'а (`R-261` APPROVE)
+
+PR #347 (engine-dev, `dae0078e`), merge `dc03af35`. Диф — только `Cargo.lock`, одна запись
+пакета; ни один `Cargo.toml`, код, тесты, контракты не тронуты; Block-risk неприменим. Пакет в
+граф сборки не входит (опциональная HTTP/3-зависимость `reqwest`), эффект на рантайм нулевой
+по замеру. `cargo audit` exit=0 (остались три allow-листных предупреждения: `atomic-polyfill`
+RUSTSEC-2023-0089 «unmaintained», `chacha20`, `spin` — не уязвимости, CI не блокируют);
+против пред-фиксного lock'а тот же гейт — 5 уязвимостей, exit=1. `cargo test --workspace`:
+passed=1245 failed=0. Агрегат `All checks passed` на `main` разблокирован для `M-99`, `M-100`,
+#345, #346. Класс (третий случай) — `TD-087`, severity поднята до MAJOR.
+**§8 пройден** (reviewer, 2026-10-12T23:20Z): на `dc03af35` CI `38319507039` success (20m02s),
+Deploy `38319507043` success (22m37s) и Deploy `38321303514` (workflow_run) success; VPS —
+`hft-recorder`/`hft-gateway-serve` `(healthy)`, heartbeat свежий (~2 с), `next_seq`
+874677675 → 874680717 за ~30 с, журнал +0.8 МБ за 20 с, CPU recorder 3 %, RssAnon ≤ 8.7 МБ.
+PR влит в 22:56:51Z не командой этого прогона reviewer'а (кем — по логу неразличимо: личность
+общая); влита ровно судимая вершина `cc80d881` (`R-261` на ветке).
+
 ## Пока НЕ реализовано (следующие фазы)
 - Крейты `risk`/`killswitch`/`oms`, `runner` — пофазно per DESIGN §10 (M-08: fail-closed риск-гейт
   между `strategy` и `oms`). MM-котирование, wiring весов из `signals.json` (граница B),
