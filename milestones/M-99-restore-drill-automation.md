@@ -68,6 +68,10 @@ T2-контракт файла состояния и поле `digest` (§«T2-�
 | 4 | потребитель (продюсер метрики) принимал `ok=1` без `digest` | `ok=1` без 64-hex `digest` ⇒ `0` / тревога | T2-контракт `M-74`: `digest` обязателен при `ok=1`; состояние без него — заявление о действии (класс `C-191`), потребитель обязан его отвергать |
 | 5 | правило `OPS-BKP` — единственный потребитель метрики | + сторож `ops-watchdog` читает файл состояния ТЕМ ЖЕ отображением (§5) | §2 п.5: без потребителя на проде метрика — «built-not-wired» |
 | 6 | проба вне CI | шаг `bash scripts/tests/red_restore_drill.sh` в джобе `build-test` | гейт уйдёт в архив по норме `Р-2`; без CI-шага проба замолчит навсегда — класс `TD-253` |
+| 7 | `JOURNAL_DRILL_REMOTE` — одна команда «привези копию» с argv `источник назначение` | шов транспорта — ДВЕ операции: **листинг** и **выборка ОДНОГО файла**. `remote`: `COLD=<user@host>:<путь>`; листинг — `${JOURNAL_DRILL_SSH} <user@host> ls <путь>`; выборка — `rsync --archive -e "${JOURNAL_DRILL_SSH}" <user@host>:<путь>/<имя> <RESTORE>/`. `local`: `ls <COLD>` и `cp -p <COLD>/<имя> <RESTORE>/`. Отбор индексов — по ВЫВОДУ листинга. Ветки различаются ТОЛЬКО этими двумя операциями; после доставки — один код. `JOURNAL_DRILL_SSH` (дефолт `ssh -i /root/.ssh/storagebox -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=10 -p 23`) заменяет `JOURNAL_DRILL_REMOTE`. Отказ листинга или любой выборки ⇒ `ok=0`, причина `transport-failed`, код 5 | `R-263` Б-1: одна команда без формы дала ветку, которая не может закончиться успехом — локальный `ls` удалённого адреса, доставка копии целиком (§7), и уничтожение доставленных байтов перед чтением. Корень — в наборе architect'а: §4 п.1 (уничтожение источника) был написан для ПРОБЫ, а сценарий `T` круга 1 требовал argv «`cold` → `restore`», то есть ЗАКРЕПЛЯЛ доставку целиком. Форма команд снята замером на VPS 2026-10-13: `ssh … -p 23 <user@host> ls journal/` — exit 0, листинг; `rsync` — тот же, что у `journal-offsite-cron.sh` |
+| 8 | `flock` и в строке cron'а, и в обёртке (гейт требовал первое, спека задачи 2 — второе) | `flock -n` держит ТОЛЬКО обёртка; строка cron'а зовёт обёртку без `flock` | `R-263` Б-2: блокировка `flock(1)` родителя держит файл, внутреннее `flock -n` того же файла отказывает — SKIP на КАЖДОМ прогоне, состояние не пишется |
+| 9 | читатель «из образа работающего `hft-recorder`» | образ — значение `image:` сервиса `recorder` в `docker-compose.yml` (сегодня `hft-platform-recorder:local`), литералом в дефолте `READER` | `R-263` Б-3: `hft-recorder` — имя КОНТЕЙНЕРА; `docker run hft-recorder` пошёл бы в публичный реестр. Сверка — сценарий `IM` пробы |
+| 10 | файл состояния `/var/lib/hft/journal-restore-drill.json` | `/var/lib/hft/drill-state/journal-restore-drill.json`; каталог `/var/lib/hft/drill-state` монтируется в сервис `recorder` ПО ТОМУ ЖЕ ПУТИ `:ro`; recorder берёт дефолт из `ops::restore_drill::DEFAULT_RESTORE_DRILL_STATE`, второго литерала нет | `R-263` Б-4: контейнер recorder'а видит только том журнала — метрика была бы 0 и после успеха. Монтируется КАТАЛОГ, не файл: обёртка пишет `tmp → rename`, а bind-mount файла держит прежний inode. Каталог отдельный — том не тащит в контейнер ни каталог восстановления (2.5 ГБ), ни `retention.mode` |
 
 **Каталог восстановления живёт до следующего прогона** (обёртка очищает его в НАЧАЛЕ прогона, как
 эталон): ≈ 2.5 ГБ постоянно на `/` (150 ГБ, занято 46 %). Цена названа: удаление сразу после записи
@@ -79,7 +83,7 @@ T2-контракт файла состояния и поле `digest` (§«T2-�
 ```rust
 // crates/ops/src/restore_drill.rs — НОВЫЙ модуль, единственное отображение «файл → вердикт»
 pub const RESTORE_DRILL_FRESH_WINDOW_MS: i64 = 40 * 24 * 60 * 60 * 1000;
-pub const DEFAULT_RESTORE_DRILL_STATE: &str = "/var/lib/hft/journal-restore-drill.json";
+pub const DEFAULT_RESTORE_DRILL_STATE: &str = "/var/lib/hft/drill-state/journal-restore-drill.json";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RestoreDrillVerdict { Ok, Missing, Unparseable, Failed, Empty, Stale, FromFuture }
 impl RestoreDrillVerdict { pub fn is_ok(&self) -> bool; }
@@ -108,14 +112,16 @@ pub fn sample_restore_drill(metrics: &Metrics, state_path: &Path, now_wall_ms: i
 | вход | вердикт |
 |---|---|
 | файла нет / не читается / это каталог | `Missing` |
-| JSON не разобран (в т.ч. обрывок); нет обязательного поля; `ok=1` без 64-hex `digest` | `Unparseable` |
+| JSON не разобран (в т.ч. обрывок); нет обязательного поля — `ok`, `ts_wall_ms`, `checked` (`M-74` T2); `ok=1` без `digest` из 64 СТРОЧНЫХ hex | `Unparseable` |
 | `ok != 1` | `Failed` |
 | `events_read == 0` или поля нет | `Empty` |
 | `ts_wall_ms > now` | `FromFuture` |
-| `now − ts_wall_ms > RESTORE_DRILL_FRESH_WINDOW_MS` | `Stale` (ровно на границе — ещё `Ok`) |
+| `now − ts_wall_ms > RESTORE_DRILL_FRESH_WINDOW_MS` (разность — с насыщением: метка `i64::MIN` даёт `Stale`, не переполнение) | `Stale` (ровно на границе — ещё `Ok`) |
 | иначе | `Ok` |
 
 Порядок проверок в таблице — порядок приоритета: первое сработавшее условие и есть вердикт.
+Круг 2 пиннит порядок оракулом `v4` (`R-263` Н-1: реализация круга 1 отходила от таблицы в
+четырёх местах, одно из них — состояние без `checked` давало `Ok`).
 
 **Первое включение.** До первого прогона файла нет ⇒ сторож поднимает `WD-RESTORE-DRILL` на каждом
 такте (дедуп — общий). Первый прогон исполняется ВРУЧНУЮ сразу после деплоя (задача 8) — окно
@@ -129,6 +135,7 @@ pub fn sample_restore_drill(metrics: &Metrics, state_path: &Path, now_wall_ms: i
 | `deploy/cron.d/journal-restore-drill` (новый), `deploy/README.md` | engine-dev | расписание раз в месяц + runbook (`M-74` задача 4) |
 | `crates/journal/src/bin/journal-drill-read.rs` (новый) | engine-dev | читатель (`M-74` задача 2b) |
 | `Dockerfile` | engine-dev | `--bin journal-drill-read` + `COPY` в прод-образ |
+| `docker-compose.yml` — ОДНА строка в `volumes:` сервиса `recorder`: `/var/lib/hft/drill-state:/var/lib/hft/drill-state:ro` | engine-dev | §4 п.10 (круг 2) |
 | `crates/recorder/src/metric_emit.rs`, `crates/recorder/src/main.rs` | engine-dev | продюсер gauge + вызов из sampler-таска (`M-74` задачи 3/5) |
 | `crates/ops/src/{restore_drill.rs,lib.rs,watchdog.rs,watchdog_cycle.rs,bin/ops-watchdog.rs}` | engine-dev | общее отображение + сторож (§5) |
 | `crates/journal/tests/fixture_restore_drill_cold.rs`, `crates/recorder/tests/red_restore_drill_metric.rs`, `crates/ops/tests/red_m99_restore_drill_watch.rs` | **architect** | оракулы (sacred) |
@@ -147,7 +154,9 @@ pub fn sample_restore_drill(metrics: &Metrics, state_path: &Path, now_wall_ms: i
 | трогать путь удаления: `deploy/bin/journal-retention*`, `crates/journal/src/**` кроме нового бинаря, `retention.mode`, `/etc/cron.d/hft-journal-retention` | удаление — `M-92` и `П-031`; drill его не включает и не выключает |
 | делать прогон drill'а условием удаления (связывать с `M-92`) | изменение механизма необратимого удаления — отдельный предмет с RAW-гейтом; здесь не предлагается |
 | проверять читаемость sha256 файлов вместо чтения журнала | сумма доказывает целостность байт, не читаемость журнала (`Р-1`, `M-74` §Запрещено) |
-| качать копию целиком | 695 ГБ на прогон — процедура, которую выключат |
+| качать копию целиком; выборка каталогом, маской или `rsync -r` по корню копии | 695 ГБ на прогон — процедура, которую выключат |
+| `flock` в строке cron'а | §4 п.8: второй lock того же файла — SKIP на каждом прогоне |
+| монтировать в контейнеры что-либо из `/var/lib/hft`, кроме `/var/lib/hft/drill-state` в `recorder` `:ro`; монтировать его на запись | §4 п.10: состоянием владеет обёртка на хосте; том — только для чтения метрики |
 | считать drill пройденным по `exit=0` обёртки; писать `ok=1` без `digest` | `R-157` Б-5; T2-контракт |
 | второе определение `RESTORE_DRILL_FRESH_WINDOW_MS` | одно место числа; recorder реэкспортирует |
 | трогать `*/tests/**`, `scripts/verify_*.sh`, `scripts/check_*.sh` | sacred ⇒ `!!! SCOPE VIOLATION REQUEST !!!` |
@@ -160,6 +169,13 @@ pub fn sample_restore_drill(metrics: &Metrics, state_path: &Path, now_wall_ms: i
 | `scripts/tests/red_restore_drill.sh` (из `M-74` + §4 п.1–2) | 1, 2, 2b | **КРАСНЫЙ ровно двумя объявленными строками**: нет прод-обёртки (задача 2), нет прод-читателя (задача 2b); 23 из 25 — PASS на эталонной обёртке |
 | `crates/recorder/tests/red_restore_drill_metric.rs` (из `M-74` + `digest` в теле + сценарий «ok=1 без digest ⇒ 0») | 3, 5 | COMPILE-RED (нет сигнатуры продюсера) |
 | `crates/ops/tests/red_m99_restore_drill_watch.rs` (новый) | 6 | COMPILE-RED (нет `ops::restore_drill`, `Incident::RestoreDrill`, `run_cycle_with_drill`) |
+| — круг 2, тот же файл: `v3` (новый путь), `v4` (поля и приоритет таблицы §5), `v5` (каталог состояния смонтирован в `recorder` по тому же пути `:ro`) | 6, §4 п.10 | на `374f6a5c`: `v3`, `v4`, `v5` FAILED; прототип правки (отменён) — 9/9 |
+| — круг 2, `scripts/tests/red_restore_drill.sh`: `T` (отказ транспорта через шов `JOURNAL_DRILL_SSH`), `RT` (УСПЕШНЫЙ транспорт `remote` — решающий предикат `h_verdict`), `RW` (выборка называет один файл; листинг — `ls`), `CR` (строка cron'а исполняется в форме cron'а), `IM` (образ читателя = `image:` recorder'а) | 2, 4, §4 п.7–9 | на `374f6a5c` — все пять FAILED |
+
+**Заглушка транспорта круга 2 (`R-263` Г-1).** `JOURNAL_DRILL_SSH` подменяется скриптом, который
+пропускает опции, отбрасывает хост и исполняет удалённую команду в каталоге песочницы. Обёртка
+зовёт его РОВНО теми командами, что на проде (`… ls <путь>` и `rsync -e …`), поэтому ветка
+`remote` после доставки судится тем же кодом, что и на сервере. Подменена только сеть.
 
 **Новые сценарии пробы.** `A11` — обёртка кладёт ссылки на файлы копии, отпечаток подлинный, и
 оставляет наблюдателя, который пересоздаёт `cold` ссылкой (на спрятанный источник, если тот есть, —
@@ -221,8 +237,9 @@ pub fn sample_restore_drill(metrics: &Metrics, state_path: &Path, now_wall_ms: i
 
 - **Канал наружу не включён** (`П-003`): `WD-RESTORE-DRILL`, как и все тревоги сторожа, сегодня
   печатается в `/var/log/hft/watchdog.log`, в Telegram не уходит (`docs/fa/ops.md` `OPS-I-11`).
-- **Сеть не доказывается локально** (`A-032` §2.1): проба гоняет `TRANSPORT=local`; `remote` — шов +
-  первый живой прогон (задача 8).
+- **Сеть не доказывается локально** (`A-032` §2.1): ветка `remote` гоняется пробой с заглушкой
+  `ssh` (`RT`, `RW`, `T`), то есть судится всё, КРОМЕ сети, ключа и rsync-сервера коробки; их
+  доказывает первый живой прогон (задача 8).
 - **Предел выборки** (`M-74` §«Правило выборки»): порча в невыбранном сегменте не обнаруживается.
   На копии в 992 индекса выборка из трёх — 0.3 %; это выбор цены (2.5 ГБ в месяц), а не покрытие.
 - **Формы псевдонима** (`A-032` §2.2/§4): ссылки в `restore` прямо на тайник обёртки (минуя имя
@@ -251,5 +268,6 @@ engine-dev (задачи 2, 2b, 3, 4, 5, 6) → tester → reviewer (PR-гейт
 
 | круг | вердикт | предмет | что изменено |
 |---|---|---|---|
+| 2 | `R-263` **REJECT** (reviewer, PR-гейт, вершина `374f6a5c`) | Б-1 ветка `remote` не может закончиться успехом; Б-2 двойной `flock` — SKIP каждый прогон; Б-3 образ читателя = имя контейнера; Б-4 recorder не видит файл состояния. Класс — гейт проверен не в прод-форме (`testing.md` «Целостность гейта» св. 1): проба гоняла только `local`, `T` — только отказ, строку cron'а и образ не исполнял никто; часть дефекта внесена набором architect'а (см. §4 п.7) | §4 п.7–10, §5 (путь, поля, приоритет), §6 (`docker-compose.yml`), §7, §8 (круг 2), §11; RED: `v3`/`v4`/`v5`, проба `T`/`RT`/`RW`/`CR`/`IM`; гейт: `task2`/`task4` |
 | 1 | `C-298` **REJECT** (critic, аудит `ed0309b4`) | B-1: оракул `OPS-I-3` поднял замер `OPS-I` с 9 до 10, а `DESIGN` §22 заявляет 9 — `verify_design_claims.sh --merge-preview origin/main` exit=1. Закрытия `C-219` B-1/B-2 и все 9 мутаций критик воспроизвёл | `DESIGN` §22 строка `OPS-I`: 9 → 10, путь внесён в §6 Allowed; merge-preview перепрогнан (Done Block коммита) |
 | 0 | — | набор architect'а | перенос набора `M-74` и его вердиктов; закрытие `C-219` B-1/B-2; сторож; шаг CI; гейт |
