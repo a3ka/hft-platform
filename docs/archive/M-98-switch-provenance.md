@@ -169,8 +169,8 @@ dev'а. Fail-closed: патч не применился, исполнено не
 
 | # | Status | задача | зона | проверка |
 |---|---|---|---|---|
-| 1 | ⏳ OPEN | SWITCH-ветка считает провенанс по каталогу с проверкой свежести; fail-closed на `Err`; точка `m98-switch-catalog:<id>` (§3) | engine-dev | `s0`…`s4`, `f0`…`f6`, `red_ws_session` |
-| 2 | ⏳ OPEN | §8 деплой-гейт после merge: healthy, heartbeat, снимок `wsprobe` (legacy-путь не задет) | reviewer | `R-NNN` |
+| 1 | ✅ DONE (PR #342 `b2c54420`, `R-259` APPROVE) | SWITCH-ветка считает провенанс по каталогу с проверкой свежести; fail-closed на `Err`; точка `m98-switch-catalog:<id>` (§3) | engine-dev | `s0`…`s4`, `f0`…`f6`, `red_ws_session` |
+| 2 | ✅ DONE (`R-260`: CI `38181709202`, Deploy `38181709107`/`38182969663`, ssh healthy) | §8 деплой-гейт после merge: healthy, heartbeat, снимок `wsprobe` (legacy-путь не задет) | reviewer | `R-NNN` |
 
 ## 12. Предъявление FA
 
