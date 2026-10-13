@@ -147,17 +147,18 @@ fn profile_allowed(policy: &AdmissionPolicy, sel: &Selector) -> bool {
     // M-100 (§4.1, CT-RFC-09 §2.10.1, TD-242): профиль — это КОНЕЧНЫЙ перечень
     // ТРОЕК (timeframe_ms, window_ms, depth_cadence_ms), разрешённый на публичном
     // пути. Полная сверка `admit` обязательна — иначе клиент, приславший
-    // `window_ms` вне `allowed_profiles`, получает `not_ready` (слепок под
+    // тройку вне `allowed_profiles`, получает `not_ready` (слепок под
     // другой отпечаток) вместо названного `unsupported` (`TD-242`).
     //
-    // Семантика `window_ms`:
-    //   - `sel.window_ms == None` ⇒ legacy/offline-режим (тест `red_m87_admission::
-    //     form_canonical_request_is_not_refused` использует именно его). `admit`
-    //     НЕ отвергает — offline — это легитимный выбор клиента, и обязанность
-    //     РЕДЬЮСЕРА справиться (валидация в `LiveReducer::resume` уже проверяет
-    //     валидность `None`). Здесь сравниваем только `timeframe_ms`.
-    //   - `sel.window_ms == Some(w)` ⇒ ТРОЙКА проверяется целиком: `w` должно
-    //     совпасть с `Some(p.window_ms)` для ОДНОГО из профилей.
+    // Семантика `window_ms` (`R-264` Б-1):
+    //   - `sel.window_ms == None` НЕ совпадает НИ С ОДНИМ профилем (`LiveProfile.
+    //     window_ms: i64`, без `Option`). Прежний обход («`None` ⇒ legacy/offline,
+    //     только timeframe_ms сверяем») держал зелёным `red_m87_admission::
+    //     form_canonical_request_is_not_refused` на форме без окна, но при RFC
+    //     rev3 (`CT-RFC-09` §2.10.1) — отказ `unsupported`: клиент, забывший
+    //     `window_ms`, получал бы `not_ready` без прогрева, повторяя вечно.
+    //   - `sel.window_ms == Some(w)` ⇒ w должно совпасть с `p.window_ms` для
+    //     ОДНОГО из профилей.
     //
     // Семантика `depth_cadence_ms`:
     //   - `sel.depth_cadence_ms == None` ⇒ ТОЛЬКО профили с `depth_cadence_ms == None`
@@ -171,13 +172,10 @@ fn profile_allowed(policy: &AdmissionPolicy, sel: &Selector) -> bool {
         if p.timeframe_ms != sel.timeframe_ms {
             continue;
         }
-        // Если селектор legacy (`window_ms == None`) — пропускаем проверку окна,
-        // но КАДЕНЦИЮ сверяем (она задаётся профилем — клиентский `None` не
-        // проходит под профильный `Some`; см. M-68 d14, T-инвариант).
-        if let Some(w) = sel.window_ms {
-            if p.window_ms != w {
-                continue;
-            }
+        // Окно сверяется ВСЕГДА: `None` ⇒ мимо (профильное `window_ms: i64` —
+        // не `Option`). Это закрывает R-264 Б-1 / TD-242.
+        if sel.window_ms != Some(p.window_ms) {
+            continue;
         }
         if p.depth_cadence_ms != sel_cadence {
             continue;
