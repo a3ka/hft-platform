@@ -1,0 +1,25 @@
+[package]
+name = "venue-binance"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+
+# Адаптер Binance (docs/fa/venues.md). Emitter-not-owner: WS connect + subscribe + parse +
+# normalize -> emit MdEvent в канал. Никакого Redis/event_bus. seq НЕ проставляет (это журнал).
+
+[dependencies]
+contracts = { path = "../contracts" }
+book = { path = "../book" }
+ops = { path = "../ops" }
+tokio = { version = "1", features = ["rt", "macros", "time", "sync", "net"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+tracing = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# M-35: HMAC-SHA256 + hex для signed read-only poll `/sapi/v1/margin/available-inventory`.
+# `hmac-sha256` — self-contained (no extra deps), off-the-shelf подпись Binance query.
+hex = "0.4"
+hmac-sha256 = "1.1"
