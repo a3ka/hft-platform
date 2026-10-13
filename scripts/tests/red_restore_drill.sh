@@ -990,6 +990,15 @@ shift   # ХОСТ
 # Удалённая команда — то, что ИСПОЛНИЛА БЫ коробка. Её и судит RW по белому списку (`C-311` Б-1).
 printf '%s\n' "$*" >> "${DRILL_SSH_STUB_BOX}/ssh-cmd.txt"
 [ "${DRILL_SSH_STUB_RC:-0}" = "0" ] || exit "${DRILL_SSH_STUB_RC}"
+# Выборочный отказ (`A-055` §5.2): отказывает РОВНО ОДНА — первая — удалённая команда с этим
+# первым словом (`rsync` — выборка); листинг и остальные выборки проходят. Отказ ВСЕХ выборок не
+# годится: обёртка, глотающая отказ, упала бы позже на другом шаге с другой причиной, и мутант
+# «отказ проглочен» прошёл бы (замер круга 4: прошёл).
+if [ -n "${DRILL_SSH_STUB_FAIL_ON:-}" ] && [ "${1:-}" = "${DRILL_SSH_STUB_FAIL_ON}" ] \
+   && [ ! -e "${DRILL_SSH_STUB_BOX}/stub-failed-once" ]; then
+  : > "${DRILL_SSH_STUB_BOX}/stub-failed-once"
+  exit 255
+fi
 cd "${DRILL_SSH_STUB_BOX}" || exit 255
 exec "$@"
 STUB
@@ -1004,14 +1013,14 @@ tree_sum() { # $1=каталог → имена, типы, режимы и sha25
       && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum )
 }
 
-run_drill_remote() { # $1=песочница $2=код заглушки → код возврата обёртки
+run_drill_remote() { # $1=песочница $2=код заглушки [$3=первое слово команды, которой отказать] → код возврата
   local stub wrapper
   stub="$(make_ssh_stub "$1")"
   snapshot_source "$1"
   tree_sum "$1/cold" > "$1/cold.before"
   wrapper="${DRILL}"; [ "${DRILL_PRESENT}" -eq 1 ] || wrapper="$(make_reference_wrapper "$1")"
   ( cd "$1" \
-    && DRILL_SSH_STUB_BOX="$1" DRILL_SSH_STUB_RC="$2" \
+    && DRILL_SSH_STUB_BOX="$1" DRILL_SSH_STUB_RC="$2" DRILL_SSH_STUB_FAIL_ON="${3:-}" \
        JOURNAL_DRILL_COLD="drill-user@drill-box.invalid:cold" \
        JOURNAL_DRILL_RESTORE="$1/restore" \
        JOURNAL_DRILL_STATE="$1/state/journal-restore-drill.json" \
@@ -1026,22 +1035,62 @@ run_drill_remote() { # $1=песочница $2=код заглушки → ко
   return "${rc}"
 }
 
-# ── T — ОТКАЗ транспорта ⇒ fail-closed ────────────────────────────────────────────────────────
+# ── T — ОТКАЗ транспорта ⇒ fail-closed С ОБЕЩАННЫМИ ПРИЧИНОЙ И КОДОМ (`M-99` §4 п.7, `A-055` §5.1) ─
+# §4 п.7 обещает: отказ листинга или любой выборки ⇒ `ok=0`, причина `transport-failed`, код 5.
+# Круг 3 судил только «не успех», и мутант «причина cold-empty, код 7» проходил: оператор видел бы
+# «копия пуста» при живой копии и мёртвой сети. Судья один на `T`, `TF` и самопроверку `T-M`.
+t_judge() { # $1=вызовов шва $2=rc $3=ok $4=digest $5=reason → 0, если отказ оформлен по контракту; T_WHY
+  T_WHY=""
+  if [ "$1" -eq 0 ]; then T_WHY="заглушка ssh не вызвана ни разу — ветка remote НЕ ПРОШЛА ЧЕРЕЗ ШОВ (JOURNAL_DRILL_SSH); «не вызвана» отличимо от «вызвана и отказала» (testing.md св. 4)"
+  elif [ "$3" = "1" ] || [ -n "$4" ] || [ "$2" = "0" ]; then T_WHY="транспорт ОТКАЗАЛ, а drill объявил успех (ok=${3:-∅}, rc=$2, отпечаток «${4:0:12}…»)"
+  elif [ -z "$3" ]; then T_WHY="состояние НЕ ЗАПИСАНО — сторож увидит лишь просрочку через 40 суток, а не отказ сегодня"
+  elif [ "$5" != "transport-failed" ]; then T_WHY="причина «${5:-∅}» вместо transport-failed — диагноз уводит не туда (M-99 §4 п.7)"
+  elif [ "$2" != "5" ]; then T_WHY="код ${2} вместо 5 (M-99 §4 п.7)"
+  fi
+  [ -z "${T_WHY}" ]
+}
+
 make_fixture BOX_T healthy
 run_drill_remote "${BOX_T}" 255; t_rc=$?
 t_calls="$(grep -c . "${BOX_T}/ssh-argv.txt" 2>/dev/null)"; t_calls="${t_calls:-0}"
-t_ok="$(state_field "${BOX_T}" ok)"; t_dig="$(state_field "${BOX_T}" digest)"
-if [ "${t_calls}" -eq 0 ]; then
-  fail "T ветка remote НЕ ПРОШЛА ЧЕРЕЗ ШОВ: заглушка ssh не вызвана ни разу (JOURNAL_DRILL_SSH). \
-«Не вызвана» ОТЛИЧИМО от «вызвана и отказала» (testing.md св. 4), и здесь первое"
-elif [ "${t_ok}" = "1" ] || [ -n "${t_dig}" ] || [ "${t_rc}" = "0" ]; then
-  fail "T транспорт ОТКАЗАЛ (ssh exit 255), а drill объявил успех (ok=${t_ok:-∅}, rc=${t_rc}, \
-отпечаток «${t_dig:0:12}…»). Отказ доставки обязан быть fail-closed"
-elif [ -z "${t_ok}" ]; then
-  fail "T транспорт отказал, а состояние НЕ ЗАПИСАНО — сторож увидит лишь просрочку через 40 суток, \
-а не отказ сегодня"
+if t_judge "${t_calls}" "${t_rc}" "$(state_field "${BOX_T}" ok)" "$(state_field "${BOX_T}" digest)" "$(state_field "${BOX_T}" reason)"; then
+  pass "T отказ листинга: ssh вызван (${t_calls}×), ok=0, причина transport-failed, код 5, без отпечатка"
 else
-  pass "T отказ транспорта: ssh вызван (${t_calls}×), ok=0, rc=${t_rc}, без отпечатка"
+  fail "T отказ листинга (ssh exit 255): ${T_WHY}"
+fi
+
+# ── TF — отказ ОДНОЙ выборки при УСПЕШНОМ листинге (`M-99` §4 п.7 «любой выборки», `A-055` §5.2) ─
+# Заглушка отказывает ПЕРВОЙ выборке (`rsync`), остальные проходят. Обёртка, проглотившая отказ
+# выборки и прочитавшая частично доставленное, проходила и `T` (там падает листинг), и `RT` (там
+# отказов нет); на неполной доставке она способна дойти до `ok=1` — это и ловится.
+make_fixture BOX_TF healthy
+run_drill_remote "${BOX_TF}" 0 rsync; tf_rc=$?
+tf_list="$(grep -cx 'ls cold' "${BOX_TF}/ssh-cmd.txt" 2>/dev/null)"; tf_list="${tf_list:-0}"
+tf_fetch="$(grep -c '^rsync ' "${BOX_TF}/ssh-cmd.txt" 2>/dev/null)"; tf_fetch="${tf_fetch:-0}"
+if [ "${tf_list}" -eq 0 ] || [ "${tf_fetch}" -eq 0 ] || [ ! -e "${BOX_TF}/stub-failed-once" ]; then
+  fail "TF SETUP/шов: листинг ${tf_list}×, выборка ${tf_fetch}× — отказ выборки не смоделирован \
+(ветка remote не дошла до выборки через шов)"
+elif t_judge "${tf_fetch}" "${tf_rc}" "$(state_field "${BOX_TF}" ok)" "$(state_field "${BOX_TF}" digest)" "$(state_field "${BOX_TF}" reason)"; then
+  pass "TF отказ ОДНОЙ выборки (${tf_fetch}× вызвано) при живом листинге: ok=0, причина transport-failed, код 5, без отпечатка"
+else
+  fail "TF отказ ОДНОЙ выборки при живом листинге: ${T_WHY}"
+fi
+
+# ── T-M — САМОПРОВЕРКА судьи отказа (`A-055` §5.1/§5.2) ─────────────────────────────────────────
+tm_missed=""
+t_judge 1 5 0 "" transport-failed || fail "T-M SETUP: судья отверг ДОПУСТИМЫЙ отказ (${T_WHY})"
+t_judge 1 7 0 "" cold-empty        && tm_missed="${tm_missed} причина-cold-empty-код-7"
+t_judge 1 5 0 "" cold-empty        && tm_missed="${tm_missed} причина-иная"
+t_judge 1 7 0 "" transport-failed  && tm_missed="${tm_missed} код-иной"
+t_judge 1 0 1 "$(printf 'a%.0s' $(seq 64))" "" && tm_missed="${tm_missed} отказ-проглочен-ok=1"
+t_judge 1 5 0 "" reader-rc-5       && tm_missed="${tm_missed} отказ-выборки-как-reader-rc-5"
+t_judge 0 5 0 "" transport-failed  && tm_missed="${tm_missed} шов-не-вызван"
+t_judge 1 5 "" "" transport-failed && tm_missed="${tm_missed} состояние-не-записано"
+if [ -n "${tm_missed}" ]; then
+  fail "T-M судья отказа ПРИНЯЛ мутантов:${tm_missed}"
+else
+  pass "T-M судья отказа принял допустимый и отверг 7 мутантов (иная причина, иной код, проглоченный отказ, \
+reader-rc-5 вместо transport-failed, шов не вызван, состояние не записано)"
 fi
 
 # ── RT — УСПЕШНЫЙ транспорт в ветке remote (`R-263` Б-1, Г-1) ───────────────────────────────────
@@ -1092,18 +1141,68 @@ rw_judge() { # $1=файл удалённых команд → 0, если тр�
   [ "${RW_LIST}" -ge 1 ] && [ "${RW_FETCH}" -ge 1 ] && [ -z "${RW_BAD}" ]
 }
 
+# ── Конечная точка (`A-055` §3, `C-313` F-1). Заглушка ЗАПИСЫВАЕТ хост в `ssh-argv.txt`, но
+# отбрасывает его перед `ssh-cmd.txt`; судить только команды — значит доказать «КАКАЯ-ТО коробка
+# только читалась», а не «читалась НАША». Каждая строка argv нормализуется в `пользователь@хост`
+# (`-l U хост` у `rsync -e`, `U@хост` у листинга — обе формы законны) и обязана побайтно равняться
+# `${COLD%%:*}`. Хост без пользователя, расхождение `-l` и `U@`, любая опция, способная сменить
+# точку соединения (`-J`, `-F`, `-o ProxyCommand=…`, `-o HostName=…`) — отказ.
+ssh_endpoint() { # $1=строка argv заглушки → печатает пользователь@хост; 1 при недопустимой форме
+  local -a a; read -r -a a <<<"$1"
+  local i=0 user="" host=""
+  while [ "${i}" -lt "${#a[@]}" ]; do
+    case "${a[$i]}" in
+      -l) user="${a[$((i + 1))]:-}"; i=$((i + 2)) ;;
+      -p|-i) i=$((i + 2)) ;;
+      -o) case "${a[$((i + 1))]:-}" in
+            IdentitiesOnly=*|BatchMode=*|ConnectTimeout=*) i=$((i + 2)) ;;
+            *) return 1 ;;
+          esac ;;
+      -[46ACKNTVXYakqstvxy]) i=$((i + 1)) ;;   # флаги ssh без аргумента, точки не меняют
+      -*) return 1 ;;                          # -J, -F, -W, -b, … — точка могла смениться
+      *) host="${a[$i]}"; break ;;
+    esac
+  done
+  [ -n "${host}" ] || return 1
+  if [[ "${host}" == *@* ]]; then
+    [ -z "${user}" ] || [ "${user}" = "${host%%@*}" ] || return 1
+    printf '%s' "${host}"
+  else
+    [ -n "${user}" ] || return 1
+    printf '%s@%s' "${user}" "${host}"
+  fi
+}
+ep_judge() { # $1=ssh-argv.txt $2=ssh-cmd.txt $3=ожидаемая точка → 0, если КАЖДЫЙ вызов — к ней; EP_BAD
+  EP_BAD=""
+  local na nc line ep
+  na="$(grep -c . "$1" 2>/dev/null)"; na="${na:-0}"
+  nc="$(grep -c . "$2" 2>/dev/null)"; nc="${nc:-0}"
+  [ "${na}" -eq "${nc}" ] || EP_BAD="транскрипты рассогласованы (argv ${na}, команд ${nc}) | "
+  [ "${na}" -gt 0 ] || EP_BAD="${EP_BAD}argv пуст | "
+  while IFS= read -r line || [ -n "${line}" ]; do
+    [ -n "${line}" ] || continue
+    if ! ep="$(ssh_endpoint "${line}")"; then EP_BAD="${EP_BAD}недопустимая форма: ${line:0:80} | "
+    elif [ "${ep}" != "$3" ]; then EP_BAD="${EP_BAD}точка ${ep} вместо $3 | "
+    fi
+  done < "$1"
+  [ -z "${EP_BAD}" ]
+}
+RW_WANT_EP="drill-user@drill-box.invalid"   # = ${JOURNAL_DRILL_COLD%%:*} в run_drill_remote
+
 if [ ! -s "${BOX_RT}/ssh-cmd.txt" ]; then
   fail "RW ветка remote не прошла через шов — удалённых команд нет (журнал вызовов: \
 $(tr '\n' '|' < "${BOX_RT}/ssh-argv.txt" 2>/dev/null | cut -c1-200))"
 elif ! rw_judge "${BOX_RT}/ssh-cmd.txt"; then
   fail "RW транскрипт коробки вне белого списка (листинг ${RW_LIST}×, выборка ${RW_FETCH}×; \
 недопустимо: «${RW_BAD:-∅}») — коробка только читается, выборка — один файл (M-99 §7)"
+elif ! ep_judge "${BOX_RT}/ssh-argv.txt" "${BOX_RT}/ssh-cmd.txt" "${RW_WANT_EP}"; then
+  fail "RW обращение НЕ к коробке из COLD (${RW_WANT_EP}): ${EP_BAD} — drill по чужой точке отчитается о копии, которую никто не открывал (OPS-I-3, A-055 §3)"
 elif ! cmp -s "${BOX_RT}/cold.before" "${BOX_RT}/cold.after"; then
   fail "RW копия ИЗМЕНИЛАСЬ за прогон drill'а: $(diff "${BOX_RT}/cold.before" "${BOX_RT}/cold.after" | head -3 | tr '\n' ' ') \
 — коробка только читается (M-99 §7, П-023)"
 else
-  pass "RW транскрипт коробки — только белый список (листинг ${RW_LIST}×, выборка одного файла ${RW_FETCH}×); \
-копия побайтно та же до и после"
+  pass "RW транскрипт коробки — только белый список (листинг ${RW_LIST}×, выборка одного файла ${RW_FETCH}×), \
+каждый вызов — к ${RW_WANT_EP}; копия побайтно та же до и после"
 fi
 
 # ── RW-M — САМОПРОВЕРКА RW: судья транскрипта ОТВЕРГАЕТ каждого мутанта (`C-311` Б-1, условие 5) ─
@@ -1129,13 +1228,48 @@ rwm_mutant remove-source    'ls cold' 'rsync --server --sender --remove-source-f
 rwm_mutant other-path       'ls cold' 'rsync --server --sender -logDtpre.iLsfxCIvu . ../cold/segment-00000003.jrnl.zst'
 rwm_mutant no-listing       "${rwm_ok}"
 rwm_mutant no-fetch         'ls cold'
-if ! rw_judge "${RWM_DIR}/base"; then
+# Точка соединения (`A-055` §3): позитивный контроль — ОБЕ законные формы; мутанты — таблица §3.
+rwm_r='rsync --server --sender -logDtpre.iLsfxCIvu . cold/segment-00000003.jrnl.zst'
+printf 'ls cold
+%s
+' "${rwm_r}" > "${RWM_DIR}/cmd2"
+printf 'drill-user@drill-box.invalid ls cold
+-l drill-user drill-box.invalid %s
+' "${rwm_r}" > "${RWM_DIR}/argv-ok"
+ep_missed=""
+ep_mutant() { # $1=имя $2,$3=строки argv (к cmd2) [$4=файл команд]
+  local name="$1"
+  printf '%s
+%s
+' "$2" "$3" > "${RWM_DIR}/argv-${name}"
+  if ep_judge "${RWM_DIR}/argv-${name}" "${4:-${RWM_DIR}/cmd2}" "${RW_WANT_EP}"; then ep_missed="${ep_missed} ${name}"; fi
+}
+ep_mutant other-host-everywhere 'wrong-user@wrong-host.invalid ls cold' "-l wrong-user wrong-host.invalid ${rwm_r}"
+ep_mutant fetch-other-host      'drill-user@drill-box.invalid ls cold' "other-box.invalid ${rwm_r}"
+ep_mutant list-other-host       'other@other.invalid ls cold' "-l drill-user drill-box.invalid ${rwm_r}"
+ep_mutant host-without-user     'drill-box.invalid ls cold' "-l drill-user drill-box.invalid ${rwm_r}"
+ep_mutant other-user-via-l      'drill-user@drill-box.invalid ls cold' "-l wrong-user drill-box.invalid ${rwm_r}"
+ep_mutant l-and-at-disagree     'drill-user@drill-box.invalid ls cold' "-l wrong-user drill-user@drill-box.invalid ${rwm_r}"
+ep_mutant jump-host             '-J wrong@jump.invalid drill-user@drill-box.invalid ls cold' "-l drill-user drill-box.invalid ${rwm_r}"
+ep_mutant proxy-command         '-o ProxyCommand=nc wrong.invalid 22 drill-user@drill-box.invalid ls cold' "-l drill-user drill-box.invalid ${rwm_r}"
+: > "${RWM_DIR}/argv-empty"
+ep_judge "${RWM_DIR}/argv-empty" "${RWM_DIR}/cmd2" "${RW_WANT_EP}" && ep_missed="${ep_missed} argv-empty"
+printf 'drill-user@drill-box.invalid ls cold
+' > "${RWM_DIR}/argv-short"
+ep_judge "${RWM_DIR}/argv-short" "${RWM_DIR}/cmd2" "${RW_WANT_EP}" && ep_missed="${ep_missed} argv-short"
+
+if ! ep_judge "${RWM_DIR}/argv-ok" "${RWM_DIR}/cmd2" "${RW_WANT_EP}"; then
+  fail "RW-M SETUP: судья точки отверг ДОПУСТИМЫЙ транскрипт с обеими формами («${EP_BAD}»)"
+elif [ -n "${ep_missed}" ]; then
+  fail "RW-M судья точки ПРИНЯЛ мутантов:${ep_missed} — RW не держит «читается НАША коробка»"
+elif ! rw_judge "${RWM_DIR}/base"; then
   fail "RW-M SETUP: судья отверг ДОПУСТИМЫЙ транскрипт («${RW_BAD}») — пойманные мутанты ничего не значат"
 elif [ -n "${rwm_missed}" ]; then
   fail "RW-M судья транскрипта ПРИНЯЛ мутантов:${rwm_missed} — RW не держит «коробка только читается»"
 else
-  pass "RW-M судья принял допустимый транскрипт и отверг все 11 мутантов (удаление, запись, каталог, маска, \
-запись на коробку, --delete, --remove-source-files, чужой путь, без листинга, без выборки)"
+  pass "RW-M судьи приняли допустимые транскрипты и отвергли 11 мутантов команд (удаление, запись, каталог, маска, \
+запись на коробку, --delete, --remove-source-files, чужой путь, без листинга, без выборки) и 10 мутантов точки \
+(чужой хост везде, в выборке, в листинге; без пользователя; чужой -l; -l против U@; -J; ProxyCommand; argv пуст; argv неполон)"
 fi
 
 # ── CR — СТРОКА CRON'А в форме cron'а исполняет drill (`R-263` Б-2, Г-2) ─────────────────────────
@@ -1154,6 +1288,9 @@ cr_state_env="$(sed -n 's/^JOURNAL_DRILL_STATE=//p' "${CRON_FILE}" 2>/dev/null |
 cr_state_default="$(env -u JOURNAL_DRILL_STATE HFT_CRON_PRINT_ARGV=1 bash "${DRILL}" 2>/dev/null | sed -n 's/^STATE=//p')"
 if [ "${DRILL_PRESENT}" -ne 1 ] || [ -z "${cr_cmd}" ]; then
   fail "CR нет строки расписания или прод-обёртки — судить нечего (строка: «${cr_line}»)"
+elif grep -qE '^JOURNAL_DRILL_(SSH|REMOTE)=' "${CRON_FILE}"; then
+  fail "CR расписание задаёт $(grep -oE '^JOURNAL_DRILL_(SSH|REMOTE)=' "${CRON_FILE}" | tr '\n' ' ')— дефолт шва живёт \
+в ОДНОМ месте, в обёртке (A-055 §5.5); JOURNAL_DRILL_REMOTE после §4 п.7 — мёртвая строка"
 elif [ -n "${cr_state_env}" ] && [ "${cr_state_env}" != "${cr_state_default}" ]; then
   fail "CR расписание переопределяет JOURNAL_DRILL_STATE=${cr_state_env}, а сторож и recorder читают \
 ${cr_state_default:-∅} — на проде продюсер и потребители разойдутся"
@@ -1178,28 +1315,33 @@ else
   fi
 fi
 
-# ── CL — ЗАМОК ОДИН, и держит его ОБЁРТКА (`M-99` §4 п.8, `C-311` Б-2) ─────────────────────────
-# CR доказывает, что строка cron'а ИСПОЛНЯЕТ drill, но не то, что два наложившихся прогона
-# сериализованы: мутант «замка нет нигде» проходил CR (`C-311`: rc=0, ok=1). Здесь замок
-# обёртки ЗАНЯТ (как вторым прогоном), и та же дословная строка cron'а обязана ПРОПУСТИТЬ тик
-# без следа: файл состояния побайтно прежний, каталог восстановления побайтно прежний (строитель
-# фикстуры создаёт его пустым — судится НЕИЗМЕННОСТЬ, а не отсутствие). Замок в строке
-# cron'а — отдельный отказ: с ним CL зеленел бы при обёртке без замка (cron-`flock` на том же
-# файле сам дал бы пропуск), а CR краснеет на двойном замке.
+# ── CL — ЗАМОК ОДИН, держит его ОБЁРТКА, и пропуск тика оформлен по контракту (`M-99` §4 п.8,
+#         `C-311` Б-2, `A-055` §4) ─────────────────────────────────────────────────────────────────
+# Замок обёртки ЗАНЯТ (как вторым прогоном); та же дословная строка cron'а обязана пропустить тик
+# по ВСЕМ признакам §4 п.8: (а) код 0; (б) в логе обёртки — НОВАЯ строка со `SKIP`, без `ALERT`;
+# (в) файл состояния побайтно прежний; (г) каталог восстановления побайтно прежний (строитель
+# фикстуры создаёт его пустым — судится неизменность); (е) файл тревоги не тронут; (д) за
+# ограниченное время — обёртка, ЖДУЩАЯ замок (`flock` без `-n`), даёт код 124 и отдельный отказ.
+# Круг 3 судил только (в)/(г): мутанты «exit 1», «exit 0 без SKIP», «ALERT + exit 2» проходили
+# (`C-313` F-2). Замок в строке cron'а — отдельный отказ: с ним CL зеленел бы при обёртке без замка.
+CL_TIMEOUT="${CL_TIMEOUT:-60}"
 cl_seed_state() { # $1=песочница → состояние «прошлого прогона», которое пропуск обязан не тронуть
   mkdir -p "$1/state"
   printf '{"ok":1,"ts_wall_ms":1,"checked":3,"events_read":7,"digest":"%s","reason":"seed"}\n' \
     "$(printf 'a%.0s' $(seq 64))" > "$1/state/journal-restore-drill.json"
   cp "$1/state/journal-restore-drill.json" "$1/state.seed"
+  printf 'seed-line прошлого прогона\n' > "$1/drill-wrapper.log"   # старая строка не сойдёт за свежую
+  printf 'seed-alert\n' > "$1/drill.alert"; cp "$1/drill.alert" "$1/alert.seed"
 }
-cl_run() { # $1=песочница $2=обёртка [$3=команда вместо строки cron'а] → 0, если при ЗАНЯТОМ замке
-  #          прогон пропущен без следа
-  local box="$1" w="$2" cmd lockfd rc
+cl_run() { # $1=песочница $2=обёртка [$3=команда вместо строки cron'а] [$4=timeout, с] → 0, если тик
+  #          пропущен по всем признакам; CL_WHY — первый нарушенный
+  local box="$1" w="$2" cmd lockfd rc n0 inc
   cmd="${cr_cmd_raw//\/root\/hft-platform\/deploy\/bin\/journal-restore-drill-cron.sh/${w}}"
   cmd="${cmd//${cr_lock_default}/${box}/drill.lock}"
   [ -z "${3:-}" ] || cmd="$3"
   cl_seed_state "${box}"
   tree_sum "${box}/restore" > "${box}/restore.before"
+  n0="$(wc -l < "${box}/drill-wrapper.log")"
   exec {lockfd}>"${box}/drill.lock"
   flock -n "${lockfd}" || die "CL: замок песочницы не взят"
   # setup-страж: из ДРУГОГО процесса замок действительно занят
@@ -1210,13 +1352,22 @@ cl_run() { # $1=песочница $2=обёртка [$3=команда вмес
        JOURNAL_DRILL_LOCK="${box}/drill.lock" JOURNAL_DRILL_LOG="${box}/drill-wrapper.log" \
        JOURNAL_DRILL_ALERT_FILE="${box}/drill.alert" \
        JOURNAL_DRILL_READER="cargo run -q --manifest-path ${ROOT}/Cargo.toml -p journal --bin journal-drill-read --" \
-       bash -c "${cmd}" {lockfd}>&- >"${box}/drill.log" 2>&1 )
+       timeout -k 5 "${4:-${CL_TIMEOUT}}" bash -c "${cmd}" {lockfd}>&- >"${box}/drill.log" 2>&1 )
   rc=$?
   exec {lockfd}>&-
   printf '%s' "${rc}" > "${box}/drill.rc"
   tree_sum "${box}/restore" > "${box}/restore.after"
-  cmp -s "${box}/state.seed" "${box}/state/journal-restore-drill.json" \
-    && cmp -s "${box}/restore.before" "${box}/restore.after"
+  inc="$(tail -n +"$((n0 + 1))" "${box}/drill-wrapper.log" 2>/dev/null)"
+  CL_WHY=""
+  if [ "${rc}" = "124" ] || [ "${rc}" = "137" ]; then CL_WHY="(д) обёртка ЖДЁТ замок вместо пропуска — убита по timeout ${4:-${CL_TIMEOUT}} с"
+  elif ! cmp -s "${box}/state.seed" "${box}/state/journal-restore-drill.json"; then CL_WHY="(в) состояние ПЕРЕПИСАНО — прогон пошёл или пропуск записан как исход"
+  elif ! cmp -s "${box}/restore.before" "${box}/restore.after"; then CL_WHY="(г) каталог восстановления ТРОНУТ"
+  elif [ "${rc}" != "0" ]; then CL_WHY="(а) код ${rc} вместо 0 — письмо cron'а оператору на каждом наложении"
+  elif ! printf '%s\n' "${inc}" | grep -q 'SKIP'; then CL_WHY="(б) в логе нет новой строки SKIP — пропуск неотличим от «cron не сработал»"
+  elif printf '%s\n' "${inc}" | grep -q 'ALERT'; then CL_WHY="(б) пропуск записан как ALERT — тревогу перестанут читать"
+  elif ! cmp -s "${box}/alert.seed" "${box}/drill.alert" 2>/dev/null; then CL_WHY="(е) файл тревоги ТРОНУТ — пропуск тика не тревога"
+  fi
+  [ -z "${CL_WHY}" ]
 }
 
 if [ "${DRILL_PRESENT}" -ne 1 ] || [ -z "${cr_cmd_raw:-}" ]; then
@@ -1226,19 +1377,37 @@ elif printf '%s' "${cr_cmd_raw}" | grep -qw flock; then
 else
   make_fixture BOX_CL healthy
   if cl_run "${BOX_CL}" "${DRILL}"; then
-    pass "CL при занятом замке обёртки строка cron'а пропустила тик: состояние и каталог восстановления побайтно прежние"
+    pass "CL при занятом замке обёртки строка cron'а пропустила тик: код 0, новая строка SKIP без ALERT, \
+состояние, восстановление и файл тревоги побайтно прежние"
   else
-    fail "CL замок обёртки ЗАНЯТ, а прогон всё равно пошёл (rc=$(cat "${BOX_CL}/drill.rc"), состояние \
-$(cmp -s "${BOX_CL}/state.seed" "${BOX_CL}/state/journal-restore-drill.json" && echo прежнее || echo ПЕРЕПИСАНО), \
-восстановление $(cmp -s "${BOX_CL}/restore.before" "${BOX_CL}/restore.after" && echo прежнее || echo ТРОНУТО)) — \
-два наложившихся прогона не сериализованы"
+    fail "CL замок обёртки ЗАНЯТ, пропуск тика нарушает §4 п.8: ${CL_WHY}"
   fi
 fi
 
-# ── CL-M — САМОПРОВЕРКА CL: обёртка БЕЗ замка обязана быть пойманной (`C-311` Б-2, условие 5) ──
-# Мутант `C-311` дословно: замка нет ни в обёртке (эталонная обёртка пробы — без замка по
-# построению), ни в строке cron'а (команда — голый вызов обёртки). Та же процедура `cl_run`; от
-# состояния прод-строки cron'а самопроверка не зависит.
+# ── CL-M — САМОПРОВЕРКА CL (`C-311` Б-2, `A-055` §4) ────────────────────────────────────────────
+# Кандидаты — эталонная обёртка пробы с ВСТАВЛЕННЫМ блоком замка (эталон сам замка не держит:
+# он — мутант «замка нет» по построению). Позитивный контроль — блок по §4 п.8; мутанты — таблица
+# `A-055` §4. Строка cron'а не участвует (голый вызов обёртки): самопроверка не зависит от состояния
+# прод-строки. Каждый мутант обязан быть пойман НАЗВАННЫМ признаком.
+cl_variant() { # $1=песочница $2=вариант → путь к обёртке-кандидату
+  local ref blk out="$1/cand-$2.sh"
+  ref="$(make_reference_wrapper "$1")"
+  case "$2" in
+    ok)        blk='exec 9>"${JOURNAL_DRILL_LOCK:?}"; if ! flock -n 9; then echo "$(date -u +%FT%TZ) SKIP предыдущий прогон ещё работает" >> "${JOURNAL_DRILL_LOG:?}"; exit 0; fi' ;;
+    nolock)    blk=':' ;;
+    exit1)     blk='exec 9>"${JOURNAL_DRILL_LOCK:?}"; if ! flock -n 9; then echo "$(date -u +%FT%TZ) SKIP занято" >> "${JOURNAL_DRILL_LOG:?}"; exit 1; fi' ;;
+    noskip)    blk='exec 9>"${JOURNAL_DRILL_LOCK:?}"; if ! flock -n 9; then exit 0; fi' ;;
+    alert)     blk='exec 9>"${JOURNAL_DRILL_LOCK:?}"; if ! flock -n 9; then echo "$(date -u +%FT%TZ) ALERT lock busy" >> "${JOURNAL_DRILL_LOG:?}"; exit 2; fi' ;;
+    blocking)  blk='exec 9>"${JOURNAL_DRILL_LOCK:?}"; flock 9' ;;
+    statewrite) blk='exec 9>"${JOURNAL_DRILL_LOCK:?}"; if ! flock -n 9; then write_state 0 0 "" "skipped" 0; echo "$(date -u +%FT%TZ) SKIP занято" >> "${JOURNAL_DRILL_LOG:?}"; exit 0; fi' ;;
+    otherfile) blk='exec 9>"${JOURNAL_DRILL_LOCK:?}.other"; if ! flock -n 9; then echo "$(date -u +%FT%TZ) SKIP занято" >> "${JOURNAL_DRILL_LOG:?}"; exit 0; fi' ;;
+    alertfile) blk='exec 9>"${JOURNAL_DRILL_LOCK:?}"; if ! flock -n 9; then echo "$(date -u +%FT%TZ) SKIP занято" >> "${JOURNAL_DRILL_LOG:?}"; echo busy > "${JOURNAL_DRILL_ALERT_FILE:?}"; exit 0; fi' ;;
+  esac
+  # Блок встаёт ПОСЛЕ определения write_state и ДО первого побочного эффекта (очистки восстановления).
+  awk -v blk="${blk}" '!done && /^rm -rf "\$\{RESTORE\}"; mkdir -p "\$\{RESTORE\}"$/ {print blk; done=1} {print} END {if (!done) exit 3}' \
+    "${ref}" > "${out}" || die "CL-M: точка вставки блока замка в эталоне не найдена (вариант $2)"
+  printf '%s' "${out}"
+}
 if [ -z "${cr_cmd_raw:-}" ] || [ -z "${cr_lock_default:-}" ]; then
   fail "CL-M SETUP: нет дословной строки cron'а или действующего пути замка — самопроверку не на чем гонять"
 else
@@ -1246,10 +1415,27 @@ else
   if grep -qw flock "$(make_reference_wrapper "${BOX_CLM}")"; then
     die "CL-M: эталонная обёртка держит flock — она больше не мутант «без замка»"
   fi
-  if cl_run "${BOX_CLM}" "${BOX_CLM}/reference-drill.sh" "bash ${BOX_CLM}/reference-drill.sh"; then
-    fail "CL-M обёртка БЕЗ замка НЕ ПОЙМАНА: при занятом замке прогон «пропущен» — CL ничего не пиннит"
+  clm_missed=""; clm_caught=""
+  c="$(cl_variant "${BOX_CLM}" ok)"
+  if ! cl_run "${BOX_CLM}" "${c}" "bash ${c}" 20; then
+    fail "CL-M SETUP: кандидат по §4 п.8 НЕ прошёл CL (${CL_WHY}) — пойманные мутанты ничего бы не значили"
   else
-    pass "CL-M обёртка без замка ПОЙМАНА: при занятом замке она прогнала drill (состояние переписано)"
+    for v in nolock:в exit1:а noskip:б alert:а blocking:д statewrite:в otherfile:в alertfile:е; do
+      name="${v%%:*}"; want="${v#*:}"
+      c="$(cl_variant "${BOX_CLM}" "${name}")"
+      if cl_run "${BOX_CLM}" "${c}" "bash ${c}" 10; then
+        clm_missed="${clm_missed} ${name}"
+      elif [[ "${CL_WHY}" != "(${want})"* ]]; then
+        clm_missed="${clm_missed} ${name}(пойман не тем признаком: ${CL_WHY%% *})"
+      else
+        clm_caught="${clm_caught} ${name}(${want})"
+      fi
+    done
+    if [ -n "${clm_missed}" ]; then
+      fail "CL-M мутанты пропуска тика НЕ ПОЙМАНЫ или пойманы не тем признаком:${clm_missed}"
+    else
+      pass "CL-M кандидат по §4 п.8 прошёл, 8 мутантов пойманы названным признаком:${clm_caught}"
+    fi
   fi
 fi
 
@@ -1259,15 +1445,20 @@ fi
 # публичный реестр.
 im_compose="$(awk '/^  recorder:$/{f=1;next} /^  [a-z][a-z0-9_-]*:$/{f=0} f && /^    image:/{print $2; exit}' \
   "${ROOT}/docker-compose.yml" 2>/dev/null)"
-im_reader="$(env -u JOURNAL_DRILL_READER HFT_CRON_PRINT_ARGV=1 bash "${DRILL}" 2>/dev/null \
-  | sed -n 's/^READER=//p' | awk '{print $NF}')"
+im_reader_full="$(env -u JOURNAL_DRILL_READER HFT_CRON_PRINT_ARGV=1 bash "${DRILL}" 2>/dev/null | sed -n 's/^READER=//p')"
+im_restore="$(env -u JOURNAL_DRILL_RESTORE HFT_CRON_PRINT_ARGV=1 bash "${DRILL}" 2>/dev/null | sed -n 's/^RESTORE_DIR=//p')"
+im_reader="$(printf '%s' "${im_reader_full}" | awk '{print $NF}')"
 if [ -z "${im_compose}" ]; then
   fail "IM SETUP: образ сервиса recorder в docker-compose.yml не найден"
 elif [ "${im_reader}" != "${im_compose}" ]; then
   fail "IM читатель по умолчанию зовётся из «${im_reader:-∅}», а прод поднимает recorder из «${im_compose}» \
 — такого образа на сервере нет (R-263 Б-3)"
+elif ! printf '%s' " ${im_reader_full} " | grep -q ' --network none ' \
+  || ! printf '%s' " ${im_reader_full} " | grep -qF " -v ${im_restore}:${im_restore}:ro "; then
+  fail "IM читатель по умолчанию без «--network none» или без «-v ${im_restore:-∅}:${im_restore:-∅}:ro» \
+(M-99 §4 п.3: читатель только читает и не ходит в сеть) — READER=«${im_reader_full}»"
 else
-  pass "IM читатель по умолчанию — из образа recorder'а «${im_compose}» (как в docker-compose.yml)"
+  pass "IM читатель по умолчанию — из образа recorder'а «${im_compose}», без сети, восстановление :ro"
 fi
 
 
