@@ -624,17 +624,26 @@ write_state() { # $1=ok $2=events $3=digest $4=reason $5=checked
 
 rm -rf "${RESTORE}"; mkdir -p "${RESTORE}"
 
-# ── ДОСТАВКА ──────────────────────────────────────────────────────────────────────
+# ── ДОСТАВКА: ДВЕ операции шва — листинг и выборка ОДНОГО файла (`M-99` §4 п.7, `R-263` Б-1) ─
+# Ветки `local`/`remote` различаются ТОЛЬКО этими двумя функциями; всё после доставки — один
+# код. Копия целиком не качается никогда: выборка зовётся по имени файла.
+SSH="${JOURNAL_DRILL_SSH:-ssh -i /root/.ssh/storagebox -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=10 -p 23}"
 if [ "${TRANSPORT}" = "remote" ]; then
-  ${JOURNAL_DRILL_REMOTE:?} "${COLD}" "${RESTORE}" || { write_state 0 0 "" "transport-failed" 0; exit 5; }
+  HOSTPART="${COLD%%:*}"; RPATH="${COLD#*:}"
+  list_cold()  { ${SSH} "${HOSTPART}" ls "${RPATH}"; }
+  fetch_one()  { rsync --archive -e "${SSH}" "${HOSTPART}:${RPATH}/$1" "${RESTORE}/"; }
+else
+  list_cold()  { ls "${COLD}"; }
+  fetch_one()  { cp -p -- "${COLD}/$1" "${RESTORE}/"; }
 fi
+LISTING="$(list_cold)" || { write_state 0 0 "" "transport-failed" 0; exit 5; }
 # ОТБОР ПО ИНДЕКСАМ, как предписан спекой §«Алгоритм отбора»: индексы извлекаются из ОБЕИХ
 # форм имени, сортируются и ДЕДУПЛИЦИРУЮТСЯ, затем берутся ПЕРВЫЙ, СРЕДНИЙ и ПОСЛЕДНИЙ.
 # НЕ «три свежих»: первая редакция этого эталона брала `tail -3`, и сценарий порчи стал
 # ВАКУУМНЫМ — фикстура портит САМЫЙ СТАРЫЙ сегмент, он в выборку не попадал, и `C` зеленел
 # на копии, которую никто не проверял. Эталон обязан реализовать ОБЪЯВЛЕННЫЙ контракт, иначе
 # он проверяет не тот предмет.
-ALL="$(ls "${COLD}" 2>/dev/null | sed -n 's/^segment-\([0-9]\{8\}\)\.jrnl\(\.zst\)\?$/\1/p' | sort -u)"
+ALL="$(printf '%s\n' "${LISTING}" | sed -n 's/^segment-\([0-9]\{8\}\)\.jrnl\(\.zst\)\?$/\1/p' | sort -u)"
 N="$(printf '%s\n' "${ALL}" | grep -c .)"
 if [ "${N}" -ge 3 ]; then
   MID=$(( (N + 1) / 2 ))
@@ -644,12 +653,16 @@ else
 fi
 CHECKED=0
 for i in ${IDX}; do
-  for f in "${COLD}/segment-${i}.jrnl" "${COLD}/segment-${i}.jrnl.zst"; do
-    [ -f "$f" ] && cp -- "$f" "${RESTORE}/" 2>/dev/null
+  for f in "segment-${i}.jrnl" "segment-${i}.jrnl.zst"; do
+    if printf '%s\n' "${LISTING}" | grep -qx -- "$f"; then
+      fetch_one "$f" || { write_state 0 0 "" "transport-failed" 0; exit 5; }
+    fi
   done
   CHECKED=$((CHECKED + 1))
 done
-for side in "${COLD}"/*.json; do [ -f "${side}" ] && cp -- "${side}" "${RESTORE}/" 2>/dev/null; done
+for side in $(printf '%s\n' "${LISTING}" | grep -E '^[^/]+\.json$'); do
+  fetch_one "${side}" || { write_state 0 0 "" "transport-failed" 0; exit 5; }
+done
 
 if [ "${CHECKED}" -eq 0 ]; then write_state 0 0 "" "cold-empty" 0; exit 5; fi
 
@@ -952,43 +965,163 @@ else
   fail "A drill на здоровой копии не прошёл (ok=$(state_field "${BOX_A}" ok)) — сценарий не судит атомарность"
 fi
 
-# ── T — ШОВ ТРАНСПОРТА (`A-032` §2.3, постановление 3) ────────────────────────────────
-# Ветка `remote` не исполняется НИЧЕМ до сервера, а `testing.md` требует оракул точки входа
-# ПО ВЫЗОВУ. Это НЕ доказательство сети: доказывается, что ветка существует, идёт через шов
-# и падает ЗАКРЫТО. Сам перенос байтов недоказуем локально (`Р-2`, см. шапку INV-DELIVERY).
-make_fixture BOX_T healthy
-STUB_T="${BOX_T}/transport-stub.sh"
-cat > "${STUB_T}" <<'STUB'
+# ── ШОВ ТРАНСПОРТА — ЗАГЛУШКА `ssh`, ИСПОЛНЯЮЩАЯ УДАЛЁННУЮ КОМАНДУ ЛОКАЛЬНО (`R-263` Г-1) ─────
+# Круг 1 гонял ветку `remote` только на ОТКАЗЕ транспорта, и ветка, которая не могла закончиться
+# успехом ни при каком транспорте (`R-263` Б-1: чтение пустого каталога, локальный `ls`
+# удалённого адреса, доставка копии целиком), прошла весь набор. Заглушка подменяет ТОЛЬКО
+# сеть: обёртка зовёт её ровно теми командами, что на проде (`ssh … ls <путь>`, `rsync -e ssh`),
+# а заглушка исполняет удалённую часть в каталоге песочницы — `cold` там играет роль `journal/`
+# на коробке. Всё, что обёртка делает ПОСЛЕ доставки, судится тем же кодом, что на проде.
+# Чего это НЕ доказывает — сеть, ключ и rsync-сервер коробки: это первый живой прогон (задача 8).
+make_ssh_stub() { # $1=песочница → путь к заглушке; журнал вызовов — $1/ssh-argv.txt
+  local st="$1/ssh-stub.sh"
+  cat > "${st}" <<'STUB'
 #!/usr/bin/env bash
-printf '%s\n' "$*" >> "${JOURNAL_DRILL_STUB_ARGV}"
-exit "${JOURNAL_DRILL_STUB_RC:-0}"
+# Заглушка ssh: argv = [опции] ХОСТ КОМАНДА… (так зовут и обёртка, и `rsync -e`).
+printf '%s\n' "$*" >> "${DRILL_SSH_STUB_BOX}/ssh-argv.txt"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -l|-p|-i|-o) shift 2 ;;
+    -*) shift ;;
+    *) break ;;
+  esac
+done
+shift   # ХОСТ
+[ "${DRILL_SSH_STUB_RC:-0}" = "0" ] || exit "${DRILL_SSH_STUB_RC}"
+cd "${DRILL_SSH_STUB_BOX}" || exit 255
+exec "$@"
 STUB
-chmod +x "${STUB_T}"
-T_ARGV="${BOX_T}/stub-argv.txt"; : > "${T_ARGV}"
-T_WRAPPER="${DRILL}"; [ "${DRILL_PRESENT}" -eq 1 ] || T_WRAPPER="$(make_reference_wrapper "${BOX_T}")"
-( cd "${BOX_T}" \
-  && JOURNAL_DRILL_COLD="${BOX_T}/cold" JOURNAL_DRILL_RESTORE="${BOX_T}/restore" \
-     JOURNAL_DRILL_STATE="${BOX_T}/state/journal-restore-drill.json" \
-     JOURNAL_DRILL_TRANSPORT="remote" JOURNAL_DRILL_REMOTE="bash ${STUB_T}" \
-     JOURNAL_DRILL_READER="$(make_reference_reader "${BOX_T}")" \
-     JOURNAL_DRILL_STUB_ARGV="${T_ARGV}" JOURNAL_DRILL_STUB_RC=1 \
-     bash "${T_WRAPPER}" >"${BOX_T}/drill.log" 2>&1 )
-t_rc=$?
-t_calls="$(grep -c . "${T_ARGV}" 2>/dev/null)"; t_calls="${t_calls:-0}"
+  chmod +x "${st}"
+  : > "$1/ssh-argv.txt"
+  printf '%s' "${st}"
+}
+
+run_drill_remote() { # $1=песочница $2=код заглушки → код возврата обёртки
+  local stub wrapper
+  stub="$(make_ssh_stub "$1")"
+  snapshot_source "$1"
+  wrapper="${DRILL}"; [ "${DRILL_PRESENT}" -eq 1 ] || wrapper="$(make_reference_wrapper "$1")"
+  ( cd "$1" \
+    && DRILL_SSH_STUB_BOX="$1" DRILL_SSH_STUB_RC="$2" \
+       JOURNAL_DRILL_COLD="drill-user@drill-box.invalid:cold" \
+       JOURNAL_DRILL_RESTORE="$1/restore" \
+       JOURNAL_DRILL_STATE="$1/state/journal-restore-drill.json" \
+       JOURNAL_DRILL_TRANSPORT="remote" JOURNAL_DRILL_SSH="bash ${stub}" \
+       JOURNAL_DRILL_LOCK="$1/drill.lock" JOURNAL_DRILL_LOG="$1/drill-wrapper.log" \
+       JOURNAL_DRILL_ALERT_FILE="$1/drill.alert" \
+       JOURNAL_DRILL_READER="cargo run -q --manifest-path ${ROOT}/Cargo.toml -p journal --bin journal-drill-read --" \
+       bash "${wrapper}" >"$1/drill.log" 2>&1 )
+  local rc=$?
+  printf '%s' "${rc}" > "$1/drill.rc"
+  return "${rc}"
+}
+
+# ── T — ОТКАЗ транспорта ⇒ fail-closed ────────────────────────────────────────────────────────
+make_fixture BOX_T healthy
+run_drill_remote "${BOX_T}" 255; t_rc=$?
+t_calls="$(grep -c . "${BOX_T}/ssh-argv.txt" 2>/dev/null)"; t_calls="${t_calls:-0}"
 t_ok="$(state_field "${BOX_T}" ok)"; t_dig="$(state_field "${BOX_T}" digest)"
 if [ "${t_calls}" -eq 0 ]; then
-  fail "T ветка remote НЕ ПРОШЛА ЧЕРЕЗ ШОВ: заглушка транспорта не вызвана ни разу. Ветка либо \
-не существует, либо зовёт транспорт мимо объявленного шва — на сервере это обнаружится отказом \
-раз в месяц. «Не вызвана» ОТЛИЧИМО от «вызвана и отказала» (testing.md св. 4), и здесь первое"
-elif ! grep -q "${BOX_T}/cold" "${T_ARGV}" || ! grep -q "${BOX_T}/restore" "${T_ARGV}"; then
-  fail "T заглушка вызвана (${t_calls}×), но её argv не несёт КОМПОЗИЦИЮ источник→назначение: \
-$(tr '\n' ' ' < "${T_ARGV}" | cut -c1-160)"
+  fail "T ветка remote НЕ ПРОШЛА ЧЕРЕЗ ШОВ: заглушка ssh не вызвана ни разу (JOURNAL_DRILL_SSH). \
+«Не вызвана» ОТЛИЧИМО от «вызвана и отказала» (testing.md св. 4), и здесь первое"
 elif [ "${t_ok}" = "1" ] || [ -n "${t_dig}" ] || [ "${t_rc}" = "0" ]; then
-  fail "T транспорт ОТКАЗАЛ (rc заглушки 1), а drill объявил успех (ok=${t_ok:-∅}, rc=${t_rc}, \
+  fail "T транспорт ОТКАЗАЛ (ssh exit 255), а drill объявил успех (ok=${t_ok:-∅}, rc=${t_rc}, \
 отпечаток «${t_dig:0:12}…»). Отказ доставки обязан быть fail-closed"
+elif [ -z "${t_ok}" ]; then
+  fail "T транспорт отказал, а состояние НЕ ЗАПИСАНО — сторож увидит лишь просрочку через 40 суток, \
+а не отказ сегодня"
 else
-  pass "T шов транспорта: заглушка вызвана (${t_calls}×) с композицией cold→restore; её отказ \
-даёт ok=0, rc=${t_rc}, без отпечатка"
+  pass "T отказ транспорта: ssh вызван (${t_calls}×), ok=0, rc=${t_rc}, без отпечатка"
+fi
+
+# ── RT — УСПЕШНЫЙ транспорт в ветке remote (`R-263` Б-1, Г-1) ───────────────────────────────────
+# Тот же решающий предикат, что у `H` (`h_verdict`): отпечаток, состав, формы, sidecar'ы и
+# INV-DELIVERY — восстановленное читается при УНИЧТОЖЕННОМ источнике (`cold` песочницы = копия).
+make_fixture BOX_RT healthy
+run_drill_remote "${BOX_RT}" 0; rt_rc=$?
+if [ "${rt_rc}" != "0" ]; then
+  fail "RT ветка remote при УСПЕШНОМ транспорте НЕ ПРОШЛА (rc=${rt_rc}, ok=$(state_field "${BOX_RT}" ok), \
+причина «$(state_field "${BOX_RT}" reason)», в restore файлов: $(ls "${BOX_RT}/restore" 2>/dev/null | wc -l)). \
+На проде drill не завершится успехом ни разу (R-263 Б-1)"
+elif ! h_verdict "${BOX_RT}"; then
+  fail "RT ветка remote вернула 0, но состояние не доказывает чтения и доставки (ok=$(state_field "${BOX_RT}" ok), \
+events_read=$(state_field "${BOX_RT}" events_read)) — тот же решающий предикат, что у H"
+else
+  pass "RT ветка remote на успешном транспорте: ok=1, отпечаток, состав и формы сходятся, \
+читается без источника"
+fi
+
+# ── RW — копия целиком НЕ КАЧАЕТСЯ (`M-99` §7, `R-263` Б-1 п.3) ─────────────────────────────────
+# Каждый вызов выборки называет ОДИН файл копии (сегмент выбранного индекса или sidecar);
+# листинг — `ls` пути копии. Источник `cold` или `cold/` целиком — 695 ГБ на проде.
+rw_bad="$(grep -E '(^| )rsync( |$)' "${BOX_RT}/ssh-argv.txt" 2>/dev/null \
+  | awk '{print $NF}' | grep -vE '^cold/(segment-[0-9]{8}\.jrnl(\.zst)?|[^/]+\.json)$' || true)"
+rw_fetch="$(grep -cE '(^| )rsync( |$)' "${BOX_RT}/ssh-argv.txt" 2>/dev/null)"; rw_fetch="${rw_fetch:-0}"
+rw_list="$(grep -cE '(^| )ls cold$' "${BOX_RT}/ssh-argv.txt" 2>/dev/null)"; rw_list="${rw_list:-0}"
+if [ "${rw_fetch}" -eq 0 ] || [ "${rw_list}" -eq 0 ]; then
+  fail "RW ветка remote не прошла через ОБЕ операции шва (листинг ${rw_list}×, выборка rsync ${rw_fetch}×) — \
+journal argv: $(tr '\n' '|' < "${BOX_RT}/ssh-argv.txt" 2>/dev/null | cut -c1-200)"
+elif [ -n "${rw_bad}" ]; then
+  fail "RW выборка запросила НЕ один файл копии: «$(printf '%s' "${rw_bad}" | tr '\n' ' ')» — \
+доставка копии целиком запрещена M-99 §7"
+else
+  pass "RW каждый вызов выборки (${rw_fetch}×) называет один файл; листинг — ls пути копии"
+fi
+
+# ── CR — СТРОКА CRON'А в форме cron'а исполняет drill (`R-263` Б-2, Г-2) ─────────────────────────
+# Команда берётся из `deploy/cron.d/journal-restore-drill` ДОСЛОВНО (поля 7+); подменяется
+# только путь обёртки и lock-файл — на песочницу, тем же значением, что получает обёртка.
+# Двойной `flock` (строка cron'а + обёртка на одном файле) даёт SKIP и НИ ОДНОГО прогона.
+CRON_FILE="${ROOT}/deploy/cron.d/journal-restore-drill"
+make_fixture BOX_CR healthy
+cr_line="$(grep -vE '^[[:space:]]*(#|$)|^[A-Z_]+=' "${CRON_FILE}" 2>/dev/null | tail -1)"
+cr_cmd="$(printf '%s' "${cr_line}" | awk '{for(i=7;i<=NF;i++) printf "%s%s", $i, (i<NF?" ":"")}')"
+# Действующий lock обёртки на проде: значение из шапки расписания, иначе дефолт обёртки.
+cr_lock_default="$(sed -n 's/^JOURNAL_DRILL_LOCK=//p' "${CRON_FILE}" 2>/dev/null | tail -1)"
+[ -n "${cr_lock_default}" ] || cr_lock_default="$(env -u JOURNAL_DRILL_LOCK HFT_CRON_PRINT_ARGV=1 bash "${DRILL}" 2>/dev/null | sed -n 's/^LOCK=//p')"
+cr_state_env="$(sed -n 's/^JOURNAL_DRILL_STATE=//p' "${CRON_FILE}" 2>/dev/null | tail -1)"
+cr_state_default="$(env -u JOURNAL_DRILL_STATE HFT_CRON_PRINT_ARGV=1 bash "${DRILL}" 2>/dev/null | sed -n 's/^STATE=//p')"
+if [ "${DRILL_PRESENT}" -ne 1 ] || [ -z "${cr_cmd}" ]; then
+  fail "CR нет строки расписания или прод-обёртки — судить нечего (строка: «${cr_line}»)"
+elif [ -n "${cr_state_env}" ] && [ "${cr_state_env}" != "${cr_state_default}" ]; then
+  fail "CR расписание переопределяет JOURNAL_DRILL_STATE=${cr_state_env}, а сторож и recorder читают \
+${cr_state_default:-∅} — на проде продюсер и потребители разойдутся"
+else
+  cr_cmd="${cr_cmd//\/root\/hft-platform\/deploy\/bin\/journal-restore-drill-cron.sh/${DRILL}}"
+  [ -n "${cr_lock_default}" ] || die "CR: действующий lock обёртки не установлен — ни в шапке расписания, ни в печати argv (LOCK=)"
+  cr_cmd="${cr_cmd//${cr_lock_default}/${BOX_CR}/drill.lock}"
+  snapshot_source "${BOX_CR}"
+  ( cd "${BOX_CR}" \
+    && JOURNAL_DRILL_COLD="${BOX_CR}/cold" JOURNAL_DRILL_RESTORE="${BOX_CR}/restore" \
+       JOURNAL_DRILL_STATE="${BOX_CR}/state/journal-restore-drill.json" JOURNAL_DRILL_TRANSPORT="local" \
+       JOURNAL_DRILL_LOCK="${BOX_CR}/drill.lock" JOURNAL_DRILL_LOG="${BOX_CR}/drill-wrapper.log" \
+       JOURNAL_DRILL_ALERT_FILE="${BOX_CR}/drill.alert" \
+       JOURNAL_DRILL_READER="cargo run -q --manifest-path ${ROOT}/Cargo.toml -p journal --bin journal-drill-read --" \
+       bash -c "${cr_cmd}" >"${BOX_CR}/drill.log" 2>&1 )
+  cr_rc=$?
+  if [ "$(state_field "${BOX_CR}" ok)" = "1" ] && [ "${cr_rc}" = "0" ]; then
+    pass "CR строка расписания в форме cron'а исполнила drill: ok=1 (команда: ${cr_cmd:0:80}…)"
+  else
+    fail "CR строка расписания в форме cron'а НЕ исполнила drill (rc=${cr_rc}, ok=$(state_field "${BOX_CR}" ok), \
+лог: $(tail -1 "${BOX_CR}/drill-wrapper.log" 2>/dev/null)). По расписанию drill не исполнится ни разу (R-263 Б-2)"
+  fi
+fi
+
+# ── IM — читатель по умолчанию зовётся из СУЩЕСТВУЮЩЕГО образа (`R-263` Б-3, Г-3) ─────────────────
+# Образ — тот, что `docker-compose.yml` объявляет у сервиса recorder (прод поднимает ровно его).
+# Имя контейнера (`hft-recorder`) образом не является: `docker run hft-recorder` пошёл бы в
+# публичный реестр.
+im_compose="$(awk '/^  recorder:$/{f=1;next} /^  [a-z][a-z0-9_-]*:$/{f=0} f && /^    image:/{print $2; exit}' \
+  "${ROOT}/docker-compose.yml" 2>/dev/null)"
+im_reader="$(env -u JOURNAL_DRILL_READER HFT_CRON_PRINT_ARGV=1 bash "${DRILL}" 2>/dev/null \
+  | sed -n 's/^READER=//p' | awk '{print $NF}')"
+if [ -z "${im_compose}" ]; then
+  fail "IM SETUP: образ сервиса recorder в docker-compose.yml не найден"
+elif [ "${im_reader}" != "${im_compose}" ]; then
+  fail "IM читатель по умолчанию зовётся из «${im_reader:-∅}», а прод поднимает recorder из «${im_compose}» \
+— такого образа на сервере нет (R-263 Б-3)"
+else
+  pass "IM читатель по умолчанию — из образа recorder'а «${im_compose}» (как в docker-compose.yml)"
 fi
 
 

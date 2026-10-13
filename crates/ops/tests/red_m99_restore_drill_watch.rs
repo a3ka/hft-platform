@@ -16,7 +16,7 @@
 //! ```ignore
 //! // crates/ops/src/restore_drill.rs
 //! pub const RESTORE_DRILL_FRESH_WINDOW_MS: i64 = 40 * 24 * 60 * 60 * 1000;
-//! pub const DEFAULT_RESTORE_DRILL_STATE: &str = "/var/lib/hft/journal-restore-drill.json";
+//! pub const DEFAULT_RESTORE_DRILL_STATE: &str = "/var/lib/hft/drill-state/journal-restore-drill.json";
 //! pub enum RestoreDrillVerdict { Ok, Missing, Unparseable, Failed, Empty, Stale, FromFuture }
 //! impl RestoreDrillVerdict { pub fn is_ok(&self) -> bool }
 //! pub fn restore_drill_verdict(state_path: &Path, now_wall_ms: i64) -> RestoreDrillVerdict;
@@ -169,11 +169,156 @@ fn v2_freshness_window_is_forty_days_both_sides() {
 /// **`v3` — путь состояния у сторожа и у обёртки ОДИН** (композиция, `testing.md`: путь записи
 /// продюсера = путь чтения потребителя). Обёртка пишет в `JOURNAL_DRILL_STATE` с этим дефолтом
 /// (`M-74` §«Контракт обёртки»); гейт `verify_M-99.sh` сверяет дефолт обёртки с этой константой.
+///
+/// **Круг 2 (`R-263` Б-4): путь живёт в ОТДЕЛЬНОМ каталоге.** Recorder — потребитель метрики —
+/// работает в контейнере и видит хост только через объявленные тома; прежний путь в корне
+/// `/var/lib/hft` в контейнер не монтировался, и метрика на проде была бы 0 и после успеха.
+/// Монтируется КАТАЛОГ, а не файл: обёртка пишет `tmp → rename`, а bind-mount файла держит
+/// прежний inode и не увидел бы ни одной новой записи. Каталог отдельный, чтобы том не тащил в
+/// контейнер ничего, кроме состояния drill'а (каталог восстановления — 2.5 ГБ — туда не входит).
 #[test]
 fn v3_default_state_path_matches_wrapper_contract() {
     assert_eq!(
         DEFAULT_RESTORE_DRILL_STATE,
-        "/var/lib/hft/journal-restore-drill.json"
+        "/var/lib/hft/drill-state/journal-restore-drill.json"
+    );
+}
+
+/// Каталог файла состояния — то, что монтируется в контейнер recorder'а (`v5`).
+fn state_dir() -> &'static str {
+    Path::new(DEFAULT_RESTORE_DRILL_STATE)
+        .parent()
+        .and_then(|p| p.to_str())
+        .expect("у пути состояния есть каталог")
+}
+
+/// **`v4` — поля и приоритет — ровно по таблице спеки §5 (`R-263` Н-1…Н-3).** Каждый случай —
+/// отдельное отступление реализации круга 1:
+/// - `checked` ОБЯЗАТЕЛЕН по T2 (`M-74`): без него — `Unparseable` (круг 1 давал `Ok` —
+///   fail-open на неполном состоянии);
+/// - нет поля `ok` — `Unparseable`, а не `Failed`;
+/// - нет `events_read` при `ok=1` с отпечатком — `Empty`, а не `Unparseable`;
+/// - `Empty` стоит в таблице ВЫШЕ `FromFuture`: первое сработавшее условие и есть вердикт;
+/// - отпечаток — 64 СТРОЧНЫХ hex: заглавные — `Unparseable` (писатель отпечатка — строчный);
+/// - метка `i64::MIN` — не паника и не `Ok` (разность «сейчас − метка» переполнялась бы;
+///   в release `overflow-checks` выключены и вердикт стал бы `Ok`).
+#[test]
+fn v4_fields_and_priority_follow_spec_table() {
+    let d = tempfile::tempdir().expect("tmp");
+    let fresh = NOW_MS - 60_000;
+    let without = |field: &str| -> String {
+        let all = [
+            ("ok", "1".to_string()),
+            ("ts_wall_ms", fresh.to_string()),
+            ("checked", "3".to_string()),
+            ("events_read", "41213".to_string()),
+            ("digest", format!("\"{DIGEST}\"")),
+            ("reason", "\"\"".to_string()),
+        ];
+        let kv: Vec<String> = all
+            .iter()
+            .filter(|(k, _)| *k != field)
+            .map(|(k, v)| format!("\"{k}\":{v}"))
+            .collect();
+        format!("{{{}}}", kv.join(","))
+    };
+    // Setup-страж: полная форма того же построителя — `Ok`; иначе случаи ниже судят построитель.
+    assert_eq!(
+        verdict_of(d.path(), Some(&without("—")), NOW_MS),
+        RestoreDrillVerdict::Ok,
+        "SETUP НЕ СОСТОЯЛСЯ: полное состояние построителя `without` обязано давать Ok"
+    );
+    let upper = DIGEST.to_uppercase();
+    let cases: Vec<(&str, String, RestoreDrillVerdict)> = vec![
+        (
+            "нет checked",
+            without("checked"),
+            RestoreDrillVerdict::Unparseable,
+        ),
+        ("нет ok", without("ok"), RestoreDrillVerdict::Unparseable),
+        (
+            "нет ts_wall_ms",
+            without("ts_wall_ms"),
+            RestoreDrillVerdict::Unparseable,
+        ),
+        (
+            "нет events_read",
+            without("events_read"),
+            RestoreDrillVerdict::Empty,
+        ),
+        (
+            "заглавный отпечаток",
+            body(1, fresh, 41_213, Some(&upper)),
+            RestoreDrillVerdict::Unparseable,
+        ),
+        (
+            "пусто И из будущего — первое по таблице: Empty",
+            body(1, NOW_MS + 1, 0, Some(DIGEST)),
+            RestoreDrillVerdict::Empty,
+        ),
+        (
+            "провал И из будущего — Failed",
+            body(0, NOW_MS + 1, 0, None),
+            RestoreDrillVerdict::Failed,
+        ),
+        (
+            "метка i64::MIN — просрочено, не паника и не Ok",
+            body(1, i64::MIN, 41_213, Some(DIGEST)),
+            RestoreDrillVerdict::Stale,
+        ),
+    ];
+    for (name, text, want) in cases {
+        let got = verdict_of(d.path(), Some(&text), NOW_MS);
+        assert_eq!(
+            got, want,
+            "M-99 §5 / R-263: случай «{name}» дал {got:?}, ожидалось {want:?}; вход: {text}"
+        );
+    }
+}
+
+/// **`v5` — КОМПОЗИЦИЯ хост ↔ контейнер recorder'а (`R-263` Б-4, `testing.md` «Механизм несущего
+/// пути» п.2).** Обёртка пишет файл состояния на ХОСТЕ; recorder читает тот же путь ВНУТРИ
+/// контейнера. Совпадение строк пути ничего не доказывает, пока каталог не смонтирован в
+/// контейнер ПО ТОМУ ЖЕ ПУТИ. Оракул читает `docker-compose.yml` — то, что поднимает прод.
+#[test]
+fn v5_state_dir_is_mounted_into_recorder_at_same_path_read_only() {
+    let compose_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docker-compose.yml");
+    let compose = std::fs::read_to_string(&compose_path).expect("docker-compose.yml читается");
+    // Блок сервиса recorder: от строки `  recorder:` до следующего ключа второго уровня.
+    let mut in_rec = false;
+    let mut block = Vec::new();
+    for line in compose.lines() {
+        let top2 =
+            line.starts_with("  ") && !line.starts_with("   ") && line.trim_end().ends_with(':');
+        if top2 {
+            in_rec = line.trim_end() == "  recorder:";
+            continue;
+        }
+        if !line.starts_with(' ') && !line.is_empty() {
+            in_rec = false;
+        }
+        if in_rec {
+            block.push(line.trim());
+        }
+    }
+    assert!(
+        block.contains(&"container_name: hft-recorder"),
+        "SETUP НЕ СОСТОЯЛСЯ: блок сервиса recorder в docker-compose.yml не найден"
+    );
+    let dir = state_dir();
+    let want = format!("{dir}:{dir}:ro");
+    let mounted = block.iter().any(|l| {
+        let v = l.trim_start_matches("- ").trim_matches('"');
+        v == want
+    });
+    assert!(
+        mounted,
+        "R-263 Б-4 / OPS-I-10: сервис recorder не монтирует каталог состояния drill'а «{want}» — \
+         внутри контейнера файла нет, и backup_restore_drill_ok будет 0 и после успешного drill'а"
+    );
+    assert!(
+        dir != "/var/lib/hft" && dir != "/var/lib/hft/restore-drill",
+        "каталог состояния обязан быть ОТДЕЛЬНЫМ: монтирование {dir} протащит в контейнер лишнее"
     );
 }
 
