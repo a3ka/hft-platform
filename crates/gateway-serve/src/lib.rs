@@ -1232,13 +1232,16 @@ pub mod server {
                     match outcome {
                         ServingOutcome::Unsupported => {
                             metrics::inc_refusals_unsupported(inner.counters.as_ref());
-                            // `admit()` (`crates/gateway-serve/src/admission.rs:122-131`)
-                            // судит ровно три оси: `bands` ⊆ `policy.canonical_bands`,
-                            // `symbol` ∈ `policy.allowed_symbols`, `timeframe_ms` ∈
-                            // `policy.allowed_profiles`. `window_ms` / `depth_cadence_ms`
-                            // — это ограничения `LiveReducer` (следующий слой, не этот),
-                            // поэтому в строке отказа не упоминаются (TD-242).
-                            let msg = "selector вне политики допуска (bands/symbol/timeframe_ms)"
+                            // `admit()` (`crates/gateway-serve/src/admission.rs:profile_allowed`)
+                            // судит все ПЯТЬ осей допуска: `bands` ⊆ `policy.canonical_bands`,
+                            // `symbol` ∈ `policy.allowed_symbols`, И ТРОЙКУ профиля
+                            // `(timeframe_ms, window_ms, depth_cadence_ms)` ∈
+                            // `policy.allowed_profiles` целиком (`CT-RFC-09` §2.10.1,
+                            // `R-264` Б-1, `TD-242`). Текст отказа обязан НАЗВАТЬ все оси,
+                            // по которым судит `admit` — иначе клиент не различает,
+                            // что именно вне профиля.
+                            let msg = "selector вне политики допуска \
+                                       (bands/symbol/timeframe_ms/window_ms/depth_cadence_ms)"
                                 .to_string();
                             send_v1_error(sink, Some(id), "unsupported", &msg).await;
                             return Err(format!("unsupported: {msg}"));
