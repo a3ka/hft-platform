@@ -1,0 +1,363 @@
+# R-077 — PR-гейт: `TD-141` (guard монотонности сшивки на пути `recover`)
+
+**Роль:** reviewer (PR-time гейт, `gates.md` §4 — UNCONDITIONAL).
+**Дата (UTC):** 2026-08-14.
+**Предмет:** ветка `docs/TD-141-recover-red`, tip `1d07d8d`, два коммита поверх `30769a2`.
+**Номер выдан механизмом:** `scripts/next_artifact_id.sh R` → `R-076`, exit=0 — НО номер оказался занят гонкой, см. NOTE-3 (замер времени — §8 NOTE-3).
+
+## ВЕРДИКТ: **APPROVED** — merge разрешён.
+
+Одна находка (**Н-1**, не блокирующая merge, но ЗАПРЕЩАЮЩАЯ закрыть `TD-141` целиком) и
+три NOTE. Все гейты прогнаны мной заново; ни одно утверждение ниже не перенесено из
+handoff'ов dev'а и tester'а.
+
+---
+
+## §1. Block-scope — PASS
+
+| коммит | автор (subject-метка) | файл | numstat | зона по `scope-guard.md` |
+|---|---|---|---|---|
+| `f01f4b4` | `[architect-codex]` | `crates/journal/tests/red_stitch_monotonic.rs` | `+102 −0` | `*/tests/` — **sacred, architect-only** ✓ |
+| `1d07d8d` | `[engine-dev]` | `crates/journal/src/lib.rs` | `+7 −0` | `crates/journal/src/**` — engine-dev ✓ |
+
+Замер (не пересказ):
+
+```
+$ git show --numstat --format='' f01f4b4
+102	0	crates/journal/tests/red_stitch_monotonic.rs
+$ git show --numstat --format='' 1d07d8d
+7	0	crates/journal/src/lib.rs
+$ git diff --stat origin/main...1d07d8d
+ crates/journal/src/lib.rs                    |   7 ++
+ crates/journal/tests/red_stitch_monotonic.rs | 102 +++++++++++++++++++++++++++
+ 2 files changed, 109 insertions(+)
+```
+
+**RED-first (`gates.md` §2) — соблюдён и проверен ПОРЯДКОМ, а не словами:** тест-коммит
+`f01f4b4` (17:30:38Z) предшествует impl-коммиту `1d07d8d` (20:07:56Z), и impl-коммит **не
+трогает ни одного файла в `tests/`** (numstat выше — ровно одна строка). Сценарий «dev
+переписал тест под реализацию» исключён механически.
+
+**Атомарность коммитов** — две задачи (оракул, guard) = два коммита, оба со ссылкой
+`TD-141` в subject'е. Бандла нет.
+
+## §2. Block-DoneBlock — ПРИНЯТ ПОСЛЕ СОБСТВЕННОГО ПРОГОНА (находка **NOTE-4**)
+
+Handoff tester'а §C — **таблица со словами «exit=0», а не сырой stdout**. По
+`commit-discipline.md` это ровно форма «пересказ», на которую положен ответ «NOT REVIEWED —
+RESUBMIT WITH DONE BLOCK». Merge я на этом не блокирую по единственной причине: гейт всё
+равно обязан быть прогнан reviewer'ом лично (профиль: «не мержит с зелёным вердиктом без
+прогона Done Block + acceptance — не суммаризация, сырой stdout»), и я его прогнал — §7.
+Записываю, потому что форма сдачи tester'а воспроизводится из круга в круг и однажды
+совпадёт с реальным расхождением чисел.
+
+## §3. Block-C (контракты) — N/A, проверено замером
+
+`crates/contracts/**` в дифе отсутствует (§1: ровно два файла). Форма T1 не тронута,
+`SCHEMA_VERSION` не бампался, contract-RFC не требуется.
+
+## §4. Block-risk — RISK-BLOCK не сработал; RAW-гейт рассмотрен ЯВНО
+
+- **`gates.md` §5 (RISK-BLOCK):** диф не касается `crates/risk/**`, `crates/killswitch/**`,
+  `crates/oms/**`, `crates/venue-*/**`, `crates/contracts/**` → risk-critic не обязателен.
+  Отсутствие его вердикта в цепочке — законно, а не пропуск гейта.
+- **`gates.md` §1 RAW-гейт (critic на сильной модели: «раскладка/формат журнала»)** —
+  рассмотрен и **не сработан**, обоснование предъявляю, а не подразумеваю: диф не меняет
+  ни схему сегмента, ни формат фрейма, ни `seq`-пространство, ни границы эпох, ни состав и
+  порядок ЗАПИСИ, ни механизм ретеншена. Он добавляет ОТКАЗ на пути ЧТЕНИЯ и повторяет
+  guard, уже прошедший критик-гейт в M-52 (`R-022`). `crates/journal/src/segments.rs` не
+  тронут ни на строку.
+- Оценка объёма — 2 коммита (<5), новых крейтов нет → plan-time critic по §1 не требовался.
+
+## §5. Существо фикса — проверено чтением кода, не диффом-«похоже на правду»
+
+```rust
+// crates/journal/src/lib.rs, recover():
+let mut ops: segments::SegmentOps = 0;
+segments::check_monotonic_paths(dir, &segs, &mut ops)?;
+```
+
+Четыре свойства, каждое проверено по исходнику `segments.rs`, а не предположено:
+
+1. **Зеркальность `read_all`.** Тот же хелпер, та же позиция — ПЕРЕД чтением тел сегментов.
+   `read_all` (`lib.rs:440`) и `recover` (`lib.rs:464`) теперь отличаются ровно одним
+   аргументом строгости `read_segment_events(&seg, true|false)` — то есть тем, чем и обязаны.
+2. **Цена — только заголовки.** `check_monotonic_paths` зовёт `peek_segment_identity` по
+   каждому пути; тела сегментов не читаются. `segment_carries_any_event` (один фрейм)
+   вызывается ТОЛЬКО при равенстве соседних `first_seq` (carve-out 2), то есть на здоровом
+   прод-каталоге — ни разу. Регрессии «`recover` на 158 сегментах подорожал» нет.
+3. **Оба carve-out'а M-52 унаследованы, а не переизобретены:** legacy исключается по
+   `schema_version != SCHEMA_VERSION_PRE_HEADER` (не по значению `first_seq == 0` — класс
+   TD-011), равенство законно для ПУСТОГО левого сегмента.
+4. **Толерантность `recover` не разменяна.** Сегмент с нечитаемым заголовком даёт
+   `peek_segment_identity → None` и просто выпадает из кандидатов — guard на нём не
+   срабатывает ложно. Это ключевое: `recover` существует ради повреждённых каталогов, и
+   новый отказ обязан наступать по НАРУШЕНИЮ ПОРЯДКА, а не по порче внутри сегмента.
+   Свойство подтверждено обратной мутацией — §6.2.
+
+**Прод-потребителя у `recover` нет** (замер: `grep -rn "recover(" crates/*/src` — 4 строки:
+определение `lib.rs:464` и ТРИ док-комментария `lib.rs:12`, `segments.rs:877`, `:945`, где
+он лишь упомянут; ни одного вызова). Поведение прода этим merge'ем не меняется; меняется
+поведение офлайн-инструмента восстановления.
+
+## §6. Мутационный контроль — МОЙ, независимый, в ДВА направления
+
+Tester в §E прямо написал, что мутацию dev'а не воспроизводил. Воспроизвёл я — оба
+направления, потому что «тест зелёный» не равно «инвариант запиннен».
+
+### 6.1. Прямая мутация: guard нейтрализован ⇒ оракул обязан покраснеть
+
+```
+$ # crates/journal/src/lib.rs: строка `segments::check_monotonic_paths(...)` удалена
+$ cargo test -p journal --test red_stitch_monotonic
+test mn_9_recover_refuses_non_monotonic_catalogue ... FAILED
+test mn_10_recover_reads_monotonic_catalogue ... ok
+test mn_11_recover_boundary_catalogues_are_not_monotonicity_violations ... ok
+---- mn_9_recover_refuses_non_monotonic_catalogue stdout ----
+thread 'mn_9...' panicked at crates/journal/tests/red_stitch_monotonic.rs:219:13:
+JR-I-11 НАРУШЕН: `recover` СШИЛ немонотонный каталог молча и вернул 400 событий.
+Первый немонотонный стык seq: (399, 173).
+test result: FAILED. 10 passed; 1 failed; 0 ignored
+MUTANT exit=101
+```
+
+Оракул привязан к УДАЛЁННОЙ строке, а не к окружению. Стык `(399, 173)` совпал с зондом
+карточки `TD-141` до цифры — то есть оракул воспроизводит ровно тот дефект, ради которого
+заведён, а не соседний.
+
+### 6.2. Обратная мутация: «что пришлось ослабить рядом» (`testing.md`)
+
+Guard добавлен, а не снят, поэтому обратный вопрос ставится так: **пиннит ли что-нибудь
+толерантность `recover`, которую новый отказ мог бы незаметно сожрать?** Проверено
+превращением `recover` в СТРОГИЙ (`read_segment_events(&seg, true)`):
+
+```
+$ cargo test -p journal --test red_recover --test red_read_all_v2 --test red_tail_integrity_operator
+test recover_resyncs_across_torn_frame ... FAILED
+panicked at crates/journal/tests/red_recover.rs:50:44
+test result: FAILED. 0 passed; 1 failed; 0 ignored
+MUT2 exit=101
+```
+
+Сторож существует и краснеет. Значит монотонность куплена НЕ ценой толерантности — обе
+стороны запиннены разными оракулами.
+
+### 6.3. Анти-плацебо самого `mn_9`
+
+Ветка `Err` требует, чтобы диагностика содержала `first_seq` И ОБА имени файлов; посторонняя
+ошибка (нет файла, битый заголовок) тест не зазеленит. Ветка `Ok` несёт setup-guard
+(`.expect("setup-guard: recover вернул события без немонотонного стыка…")`) — фикстура,
+переставшая ломать монотонность, покраснеет как СЛОМАННЫЙ SETUP, а не молча «пройдёт».
+`mn_10` (позитивный контроль) и `mn_11` (границы: дыра индексов после ретеншена, один
+сегмент, пустой каталог) закрывают требование `testing.md` о дегенерированном входе.
+
+## §7. Done Block — СЫРОЙ вывод (мой прогон, чистый worktree `/tmp/hft-rev-td141` @ `1d07d8d`)
+
+```
+$ git log -1 --oneline
+1d07d8d fix(TD-141): recover guards first_seq monotonicity [engine-dev]
+
+$ git status --porcelain
+{пусто}
+
+$ sha256sum crates/journal/src/lib.rs ; git show HEAD:crates/journal/src/lib.rs | sha256sum
+260677a2851cc8d9634b2c37ff97b0f9c0cd3d1e6e49348a616cfc1d8818410a  crates/journal/src/lib.rs
+260677a2851cc8d9634b2c37ff97b0f9c0cd3d1e6e49348a616cfc1d8818410a  -
+   ↳ дерево после мутаций восстановлено ПОБАЙТОВО, а не «на глаз»
+
+$ cargo fmt --all -- --check
+fmt exit=0
+
+$ cargo clippy -p journal --all-targets -- -D warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 13.08s
+clippy exit=0
+
+$ cargo test --all   # прод-форма CI (ci.yml:24), НЕ узкий -p
+test-all exit=0
+$ grep -E "^test result" … | awk '{p+=$4; f+=$6; i+=$8} END {…}'
+passed=821 failed=0 ignored=1 (блоков: 199)
+   ↳ единственный ignored — `sm11d_content_rewritten_under_unchanged_name…` (известный
+     G1/`TD-130`, к предмету отношения не имеет)
+
+$ cargo test -p journal --test red_stitch_monotonic
+running 11 tests … test result: ok. 11 passed; 0 failed; 0 ignored
+
+$ bash scripts/verify_design_claims.sh --merge-preview origin/main
+VERDICT: PASS (0 нарушений)
+claims exit=0
+```
+
+Барьеры `check_protected_artifacts.sh` / `check_docs_freeze.sh` / `check_artifact_ids.sh`
+прогнаны в ПРОД-ФОРМЕ (`EVENT_NAME=push`, `PUSH_BEFORE=<origin/main>`) и дали fail-closed
+`FAIL: база не предок HEAD` — **это корректное поведение до merge'а**, а не находка: ветка
+отросла от `30769a2`, а `origin/main` ушёл на `8657fb2`. Их настоящий прогон — на
+merge-коммите; пруф — §9 (close-out).
+
+Отдельно: диф не трогает `.claude/**`, `CLAUDE.md`, `docs/04-workflow.md` → замок §11 к
+предмету не применяется; `FOUNDER-APPROVED` не требуется. Удалений защищённых артефактов в
+дифе нет (`+109 −0`).
+
+## §8. Находка и NOTE
+
+### Н-1 (MAJOR, не блокирует merge, но БЛОКИРУЕТ закрытие `TD-141`) — `docs/fa/journal.md` §I.12 становится ЛОЖНЫМ В МОМЕНТ merge'а
+
+После слияния в cornerstone-FA Layer 0 остаются ЧЕТЫРЕ утверждения, каждое из которых
+неверно (замер по `main` + этот диф):
+
+| строка FA | утверждает | факт после merge |
+|---|---|---|
+| `:154` таблица | `**recover (lib.rs)** \| **ОТСУТСТВУЕТ** \| **ОТСУТСТВУЕТ**` | guard есть (`lib.rs:473`), оракул есть (`mn_9`) |
+| `:157-158` | «в теле `recover` вызовов `check_*` — **0**» | **1** (`grep -n check_monotonic_paths crates/journal/src/lib.rs` → `447` в `read_all`, `473` в `recover`) |
+| `:158` | «в оракуле слово `recover` — **0** вхождений» | **18** (`grep -c recover crates/journal/tests/red_stitch_monotonic.rs`) |
+| `:161-163` | «до закрытия читать инвариант как „держится на всех путях, **КРОМЕ** `recover`“» | carve-out'а больше нет |
+
+**Почему это не блокер merge'а.** Направление лжи — ЗАНИЖЕНИЕ покрытия. Прежние срабатывания
+этого класса (`TD-138`, `R-070` Н-2) были опасным направлением — документ ЗАВЫШАЛ покрытие,
+и следующий читатель не ставил guard, которого нет. Занижение так не работает: никто не
+снимает существующий guard оттого, что документ его не заметил. Держать корректный,
+зелёный, долг-закрывающий фикс вне `main` ради синхронизации абзаца — цена выше пользы.
+
+**Почему это тем не менее находка, а не примечание.** Строка `:161-163` предписывает читать
+инвариант с carve-out'ом, а `recover` по док-комменту — «CLI-инструмент восстановления
+прод-журнала». Оператор под инцидентом, сверившийся с FA, будет ждать от `recover`
+толерантности к re-stitch'нутому каталогу и получит `Err`. Это операционный сюрприз в
+единственном инструменте, спроектированном для аварии.
+
+**Что из этого следует процедурно** (моя зона — `TECH-DEBT.md`):
+`TD-141` **НЕ закрывается**. Закрыта его КОДОВАЯ половина; документная — открыта и передаётся
+architect'у (`docs/fa/**` — не моя зона, `gates.md` §4 граница reviewer↔architect: описываю
+дефект, фикс не проектирую). Форма учёта — та же, что у `TD-137` («закрыта ПОЛОВИНА, и это
+надо читать буквально»), а не новая карточка: предмет тот же, идентификатор уже занят
+(`gates.md` §12).
+
+Отдельно отмечаю метод: dev вписал строку «До закрытия TD-141 читать инвариант как „КРОМЕ
+`recover`“ — теперь КРОМЕ снято» в КОММЕНТАРИЙ ИСХОДНИКА. Он знал, что документ протухает, и
+записал поправку туда, куда имел право писать. Претензии к dev'у нет — есть подтверждение,
+что дыра видна была и на его стороне.
+
+### NOTE-1 — git-личность коммита `1d07d8d` = `engine-dev`
+
+`branch-hygiene.md` п.6 / `commit-discipline.md`: автор всех коммитов — владелец репозитория,
+роль ставится МЕТКОЙ в subject'е (она стоит: `[engine-dev]`). Ролевой `user.name` выставлен
+не должен был быть. `f01f4b4` оформлен верно (`t`, метка `[architect-codex]`). Переписывать
+историю ради этого не буду — лекарство хуже болезни; фиксирую как аудит-след. Замер, из-за
+которого правило и появилось (все 14 worktree несли подпись `reviewer`), делает эту метку
+бесполезной как признак роли — значит вреда, кроме шума в `%an`, нет.
+
+### NOTE-2 — у `TD-141` нет milestone-спеки, а значит нет и `Allowed paths`
+
+Работа шла по TD-карточке. Scope я сверял по таблице `scope-guard.md`, а не по
+milestone-декларации, — предъявляю это явно, чтобы «scope PASS» не читалось как «сверено с
+Allowed paths», которых не существует. Для правки в 7 строк под уже существующим
+оракулом-файлом это соразмерно; для чего-либо большего — нет.
+
+### NOTE-3 — гонка номеров (`TD-150`) сработала на этом круге ПОВТОРНО, и её поймал барьер
+
+Два факта, оба замером.
+
+**(а) Аллокатор шёл 4m21s.** `real 4m21.090s`, выдал `R-076`. Третья точка после 1:38 и
+2:34 (14.08). **Тренд не объявляю** — `R-070` Н-6 уже снял такое утверждение как домысел на
+шумящих точках. Цифра относится к пункту 3 очереди architect'а в `SESSION-HANDOFF`: под
+таймаутом шага `N` в `verify_M-61.sh` аллокатор возвращает пустоту ⇒ гейт красный на любой
+ветке. 4:21 — худшая из наблюдавшихся.
+
+**(б) Выданный номер оказался занят к моменту использования.** Пока аллокатор работал (и
+пока я писал вердикт), параллельная reviewer-сессия закоммитила
+`research/reviews/R-076-M-59-rev2.md` (`7f36ad9`, 2026-08-14T21:00:05Z, ветка
+`feat/M-59-lifetime-memory`). Барьер `check_artifact_ids.sh`, прогнанный мной в ПРОД-ФОРМЕ
+на merge-коммите ДО push'а, покраснел:
+
+```
+$ EVENT_NAME=push PUSH_BEFORE=8657fb2 bash scripts/check_artifact_ids.sh
+FAIL  R-76: второй носитель «research/reviews/R-076-td141-recover-monotonic-guard.md»
+      под идентификатором, занятым «research/reviews/R-076-M-59-rev2.md»
+ids exit=1
+```
+
+Вердикт перенумерован в `R-077` (свободен по `refs/remotes/origin ∪ refs/heads`: замер —
+`git log --all --diff-filter=A --name-only | grep -c R-077` → **0**), коммит ветки переписан,
+барьер перепрогнан — §7. **Это ровно тот класс, который `TD-150` описывает как livelock двух
+аллокаторов `max+1`**, и здесь он проявился в самой неприятной форме: аллокатор был честен в
+момент выдачи, номер увели за время работы. Записываю как ЗАМЕР под `Р-1` (CAS-резерв
+`refs/reserved/<ID>`, ждёт токена founder'а): в пользу резерва теперь говорит не только
+разбор 14.08, но и повторение через сутки, на другой паре сессий. Барьер отработал как
+задумано — он и есть та причина, по которой красное поймано ДО `main`, а не после.
+
+### NOTE-4 — форма Done Block'а tester'а (см. §2).
+
+## §9. Условие APPROVED и close-out
+
+Merge разрешён без условий. После merge (пруфы дописываются в этот файл при close-out):
+
+1. `PROJECT-STATE.md` — секция M-52 говорит «`check_first_seq_monotonic` на ТРЁХ путях
+   чтения»; после merge путей четыре. Правится мной.
+2. `TECH-DEBT.md` — `TD-141` остаётся OPEN с явным разделением половин (Н-1).
+3. `gates.md` §8 — деплой-гейт: `gh run watch` + eyes-on VPS.
+4. `scripts/gc_worktrees.sh` — диск 87 % на момент вердикта.
+
+---
+
+## §10. Close-out — пруф деплой-гейта (`gates.md` §8), дописано после merge
+
+**Merge:** `362784a` (`--no-ff`, ветка `docs/TD-141-recover-red` @ `80fff89`), push в `main`
+2026-08-14T21:18Z. Барьеры перед push'ом прогнаны в ПРОД-ФОРМЕ на merge-коммите
+(`EVENT_NAME=push PUSH_BEFORE=8657fb2`): `check_protected_artifacts.sh` exit=0,
+`check_docs_freeze.sh` exit=0, `check_artifact_ids.sh` exit=0 (после перенумерации — NOTE-3).
+
+### 1. CI + Deploy до терминального статуса
+
+```
+$ gh run list --limit 3
+completed  success  Merge branch 'docs/TD-141-recover-red' …  Deploy to VPS  main  push  31841876372  12m49s  2026-08-14T21:18:52Z
+completed  success  Merge branch 'docs/TD-141-recover-red' …  CI            main  push  31841876307  10m47s  2026-08-14T21:18:52Z
+completed  success  docs(debt): TD-151 …                      CI            main  push  31836162358  11m29s  2026-08-14T20:04:11Z
+
+$ gh run watch 31841876307 --exit-status ; echo CI exit=$?
+CI exit=0
+$ gh run watch 31841876372 --exit-status ; echo DEPLOY exit=$?
+DEPLOY exit=0
+```
+
+### 2. Eyes-on VPS — ДВА замера с интервалом 110 s (одиночный снимок роста не доказывает)
+
+```
+=== containers ===                       === через 110 s ===
+hft-gateway-serve Up 22 seconds (healthy)   hft-gateway-serve Up 2 minutes (healthy)
+hft-recorder      Up 28 seconds (healthy)   hft-recorder      Up 2 minutes (healthy)
+
+=== heartbeat ===
+{"events":1483,"free_bytes":54186856448,"next_seq":236931899,"segment_index":284,
+ "ts_wall_ms":1786743108112,"writable":true}          host date -u +%s = 1786743116  (лаг 8 s)
+{"events":5796,"free_bytes":54185082880,"next_seq":236936223,"segment_index":284,
+ "ts_wall_ms":1786743218112,"writable":true}          host date -u +%s = 1786743221  (лаг 3 s)
+
+=== журнал растёт ===
+segment-00000284.jrnl  467 898 171 B (21:31)  →  469 498 097 B (21:33)   +1.6 MB
+next_seq  236 931 899 → 236 936 223  (+4 324 события за 110 s)
+
+=== RssAnon (TD-021: память меряется так, а не docker stats) ===
+recorder 10 416 kB → 15 576 kB (прогрев после рестарта; долгоживущий recorder сегодня
+                                держался 19 928 kB — на утечку не похоже)
+gateway-serve 336 kB
+=== диск VPS ===  /dev/sda1 150G 94G 51G 65% /
+```
+
+Все три liveness-признака положительны: контейнеры `healthy`, heartbeat свежий (лаг 3–8 s),
+журнал растёт.
+
+**Содержательная санити (`gates.md` §8 п.2) — рассмотрена и НЕ требуется, обоснование
+предъявляю:** пункт обязателен, «если деплой менял поведение данных (парсеры/форматы)».
+Этот деплой не менял ни того, ни другого — диф не касается `segments.rs`, формата фрейма,
+схемы сегмента и пути ЗАПИСИ; единственная изменённая функция (`recover`) прод-процессом не
+вызывается вовсе (замер §5). Пишу это явно, а не молчу: пропуск пункта без названной причины
+неотличим от забывчивости.
+
+### 3. Уборка (`branch-hygiene.md` §Worktree lifecycle)
+
+`bash scripts/gc_worktrees.sh` + снос собственного кэша `/tmp/hft-rev-td141/target` — см.
+Handoff §D. Диск локальной машины на момент вердикта — 87 %.
+
+### 4. Что остаётся открытым после close-out
+
+- `TD-141` — **OPEN**, закрыта кодовая половина (Н-1); документная передана architect'у.
+- `TD-150` — подтверждён повторно (NOTE-3), развязка `Р-1` ждёт токена founder'а.
