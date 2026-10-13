@@ -94,9 +94,14 @@ chk "test -x ${DRILL}"
 chk "! grep -q 'hft-platform_journal-data' ${DRILL}"
 chk "w=\$(HFT_CRON_PRINT_ARGV=1 bash ${DRILL} 2>/dev/null | sed -n 's/^RESTORE_DIR=//p'); r=\$(HFT_CRON_PRINT_ARGV=1 bash ${DRILL} 2>/dev/null | sed -n 's/^READER_DIR=//p'); [ -n \"\$w\" ] && [ \"\$w\" = \"\$r\" ]"
 # §5: дефолт пути состояния у обёртки = DEFAULT_RESTORE_DRILL_STATE сторожа (композиция продюсер→потребитель)
-chk "[ \"\$(env -u JOURNAL_DRILL_STATE HFT_CRON_PRINT_ARGV=1 bash ${DRILL} 2>/dev/null | sed -n 's/^STATE=//p')\" = /var/lib/hft/journal-restore-drill.json ] && grep -q 'DEFAULT_RESTORE_DRILL_STATE: &str = \"/var/lib/hft/journal-restore-drill.json\"' crates/ops/src/restore_drill.rs"
-# §4 п.3: читатель по умолчанию — journal-drill-read из образа работающего hft-recorder
-chk "env -u JOURNAL_DRILL_READER HFT_CRON_PRINT_ARGV=1 bash ${DRILL} 2>/dev/null | grep -E '^READER=.*journal-drill-read' | grep -q 'hft-recorder'"
+# Круг 2 (R-263 Б-4): каталог состояния ОТДЕЛЬНЫЙ — его монтирует recorder (ops v5).
+chk "[ \"\$(env -u JOURNAL_DRILL_STATE HFT_CRON_PRINT_ARGV=1 bash ${DRILL} 2>/dev/null | sed -n 's/^STATE=//p')\" = /var/lib/hft/drill-state/journal-restore-drill.json ] && grep -q 'DEFAULT_RESTORE_DRILL_STATE: &str = \"/var/lib/hft/drill-state/journal-restore-drill.json\"' crates/ops/src/restore_drill.rs"
+# recorder берёт дефолт пути из ops (одно место строки), а не вторым литералом
+chk "grep -q 'DEFAULT_RESTORE_DRILL_STATE' crates/recorder/src/main.rs && ! grep -q 'journal-restore-drill.json' crates/recorder/src/main.rs"
+# §4 п.3: читатель по умолчанию — journal-drill-read; образ = image сервиса recorder в compose
+# (круг 2, R-263 Б-3/Г-3: подстрока «hft-recorder» совпадала с ИМЕНЕМ КОНТЕЙНЕРА; сверку образа
+# исполняет сценарий IM пробы — здесь только наличие читателя в argv)
+chk "env -u JOURNAL_DRILL_READER HFT_CRON_PRINT_ARGV=1 bash ${DRILL} 2>/dev/null | grep -qE '^READER=.*journal-drill-read'"
 # §7: Storage Box только читается — ни --delete, ни удаления на стороне коробки
 chk "! grep -qE -- '--delete|(^|[^-])rm .*JOURNAL_DRILL_COLD' ${DRILL}"
 
@@ -118,7 +123,10 @@ else
   chk "test -f ${CRON}"
   chk "crontab -n ${CRON}"
   # минута, час, день месяца — числа; месяц и день недели — '*': ровно раз в месяц
-  chk "grep -E '^[0-9]+[[:space:]]+[0-9]+[[:space:]]+[0-9]+[[:space:]]+\\*[[:space:]]+\\*[[:space:]]+root[[:space:]].*journal-restore-drill-cron\\.sh' ${CRON} | grep -q flock"
+  chk "grep -qE '^[0-9]+[[:space:]]+[0-9]+[[:space:]]+[0-9]+[[:space:]]+\\*[[:space:]]+\\*[[:space:]]+root[[:space:]].*journal-restore-drill-cron\\.sh' ${CRON}"
+  # Круг 2 (R-263 Б-2/Г-2): flock держит ОБЁРТКА; второй flock в строке cron'а на том же файле
+  # даёт SKIP на каждом прогоне. Исполнением строку судит сценарий CR пробы (task #1)
+  chk "! grep -E '^[0-9]+[[:space:]].*journal-restore-drill-cron\\.sh' ${CRON} | grep -q flock"
 fi
 
 step "task #5 — просрочка есть отказ, окно с обеих сторон"
@@ -126,7 +134,7 @@ chk_named_test "просроченный drill ⇒ 0, внутри окна ⇒ 
   cargo test -p recorder --test red_restore_drill_metric --quiet stale
 
 step "task #6 — сторож видит провал, просрочку и ОТСУТСТВИЕ drill'а (WD-RESTORE-DRILL)"
-chk_named_test "red_m99_restore_drill_watch (v1…v3, w1…w3, b1)" \
+chk_named_test "red_m99_restore_drill_watch (v1…v5, w1…w3, b1)" \
   cargo test -p ops --test red_m99_restore_drill_watch --quiet
 chk "[ \"\$(grep -rlE 'const RESTORE_DRILL_FRESH_WINDOW_MS' crates --include='*.rs' | grep -v '/tests/' | tr '\\n' ' ')\" = 'crates/ops/src/restore_drill.rs ' ]"
 
