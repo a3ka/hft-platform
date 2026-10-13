@@ -436,6 +436,36 @@ async fn w5_window_outside_allowed_profiles_is_unsupported() {
     assert_eq!(e["code"], json!("unsupported"), "M-100 / TD-242: {e}");
 }
 
+/// **`w5b` — тройка БЕЗ `window_ms` — `unsupported` на ПРОВОДЕ** (`R-264` Б-1). Таймфрейм и каденция
+/// — профильные, полос нет; отсутствует только окно. Прежде такой запрос проходил допуск и получал
+/// `not_ready` без прогрева — вечный повтор (`TD-242`). Setup-страж — `w1`/`w2`: та же форма С окном
+/// профиля даёт снимок.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn w5b_triple_without_window_is_unsupported() {
+    let _s = SERIAL.lock().await;
+    let (dir, ckpt) = fixture();
+    let mut ws = start(dir.path(), ckpt.path()).await;
+    let mut sel = sel_json(None, 60_000);
+    sel.as_object_mut()
+        .expect("selector object")
+        .remove("window_ms");
+    assert!(
+        sel.get("window_ms").is_none() && sel["depth_cadence_ms"] == json!(1000),
+        "SETUP НЕ СОСТОЯЛСЯ: селектор обязан нести каденцию профиля и НЕ нести окна: {sel}"
+    );
+    send(
+        &mut ws,
+        json!({"op":"subscribe","v":1,"id":"w5b","selector":sel}),
+    )
+    .await;
+    let e = next_of(&mut ws, "w5b", "error").await;
+    assert_eq!(
+        e["code"],
+        json!("unsupported"),
+        "R-264 Б-1 / CT-RFC-09 §2.10.1 / TD-242: тройка без окна обязана получать unsupported: {e}"
+    );
+}
+
 /// **`w6` — неверный выбор отображения — `invalid_view`**, соединение живо.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn w6_invalid_view_is_named_error() {

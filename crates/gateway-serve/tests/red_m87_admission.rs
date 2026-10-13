@@ -112,7 +112,10 @@ fn sel_with(symbol: &str, bands: Vec<f64>) -> Selector {
         symbol: symbol.to_string(),
         timeframe_ms: 1_000,
         bands,
-        window_ms: None,
+        // `R-264` Б-1: тройка профиля обязана совпасть ЦЕЛИКОМ (`CT-RFC-09` §2.10.1). Прежняя
+        // форма с `window_ms: None` держала зелёным обход в `profile_allowed` — канонический
+        // запрос несёт окно профиля.
+        window_ms: Some(60_000),
         depth_cadence_ms: None,
     }
 }
@@ -421,6 +424,29 @@ fn form_unbounded_profile_is_refused_even_with_canonical_bands() {
         ServingOutcome::Unsupported,
         "селектор с window_ms=None и timeframe_ms=1 принят: это unbounded offline-свёртка \
          (crates/gateway/src/lib.rs:287-305), то есть публичный путь к полной истории"
+    );
+}
+
+/// **`R-264` Б-1 — тройка БЕЗ окна ⇒ `Unsupported`, а не `NotReady`.** Символ, полосы, таймфрейм и
+/// каденция — профильные; отсутствует ТОЛЬКО `window_ms`. Отклонить такой запрос способна лишь
+/// сверка окна. Прежний обход («`None` — legacy, окно не сверяем») отдавал клиенту `not_ready`
+/// без прогрева, то есть вечный повтор (`TD-242`), при RFC, объявившем класс закрытым.
+#[test]
+fn form_profile_triple_without_window_is_unsupported() {
+    let p = policy();
+    let mut s = sel_with("BTCUSDT", CANONICAL.to_vec());
+    assert_ne!(
+        admit(&p, &s),
+        ServingOutcome::Unsupported,
+        "SETUP НЕ СОСТОЯЛСЯ: тот же селектор С окном профиля обязан проходить допуск — иначе \
+         отказ ниже судит не окно"
+    );
+    s.window_ms = None;
+    assert_eq!(
+        admit(&p, &s),
+        ServingOutcome::Unsupported,
+        "R-264 Б-1 / CT-RFC-09 §2.10.1 / TD-242: селектор без window_ms принят — клиент получит \
+         not_ready без прогрева и будет повторять запрос бесконечно"
     );
 }
 
