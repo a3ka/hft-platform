@@ -153,3 +153,33 @@ wsprobe --frames 2 → schema_version 11, latency_first_snapshot_ms=1003, frames
 
 Merge и §8 — reviewer (я). Затем **`architect`** — задача 7 (`VB-I-13`, строка `VB-I-12`,
 `OPS-I-11`), N-1, переезд спеки/гейта M-100 в `docs/archive/`.
+
+## §8 — продолжение после merge (задача 6 СНЯТА)
+
+```
+$ gh pr merge 351 --merge  → merge 2ec2eaec (CHECKS=0 на fe849168); ветка удалена (origin)
+$ gh run list --branch main
+38463626830 CI            completed success 2ec2eaec
+38463626718 Deploy to VPS completed success 2ec2eaec   (Gate on CI success; Deploy (build on VPS) success)
+38466020404 Deploy to VPS completed success 2ec2eaec   (сторож догона; сборка законно skipped)
+$ ssh … прод
+2ec2eaec
+hft-gateway-serve Up About a minute (healthy) · hft-recorder Up About a minute (healthy)
+heartbeat next_seq 886437369 → 886439891 за 30 с, writable=true
+RssAnon: gateway-serve 432 kB, recorder 10288 kB; df / 48 %
+ckpt-8f69809dd707e8c9.bin  od -t u4 -N16 → 1129596488 825249867 3 11   (имя и версия состояния прежние)
+$ wsprobe после деплоя (CPU_до=0.00%)
+wsprobe_exit=0  schema_version 12  latency_first_snapshot_ms=763  frames_received=2  snapshot 556405 Б
+"calc_key_id":"201e0f95…c081"  "calc_profile":{"version":1…  "heatmap_window_e8":100000
+$ /var/log/hft/gateway-checkpoint.log (первый запуск нового бинаря, 21:00)
+gateway-checkpoint: ok … version=1 sha256=a6ca51bf… covered=886469015   (20:45 было covered=886384354)
+$ wsprobe на новом слепке → exit 0, schema 12, 336 мс, ohlcv 53 (= до), depth_series 14
+```
+
+Слепок принят тёплым путём, пересборки не было; провод v12 с тремя полями на проде.
+**Наблюдение без вывода:** слепок 21:00 — 1 577 612 Б против 3 415 406 Б в 20:45; форма
+`Reducer` в M-100 не менялась (спека §7), выдача на нём полна. Причина не установлена —
+сверить на следующих слепках (записано в `PROJECT-STATE.md`).
+
+Close-out: `PROJECT-STATE.md` — `M-100` ЗАКРЫТ + маркер; `TECH-DEBT.md` — `TD-197` закрыт (тело
+в архив), заведён `TD-259` (FA задачи 7 + N-1); `docs/ROADMAP.md` — колонка «Состояние» `S1a-K`.
