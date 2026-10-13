@@ -582,3 +582,124 @@ async fn w9_foreign_state_version_is_not_ready() {
         );
     }
 }
+
+/// Первое НЕ-кадровое сообщение подписки `id` (снимок или ошибка) — исход подписки, какой бы он ни был.
+async fn outcome_of(ws: &mut Ws, id: &str) -> Value {
+    let deadline = tokio::time::Instant::now() + BUDGET;
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let m = match tokio::time::timeout(left, ws.next()).await {
+            Ok(Some(Ok(m))) => m,
+            other => panic!("за {BUDGET:?} не пришло исхода подписки «{id}»: {other:?}"),
+        };
+        let Ok(v) = serde_json::from_slice::<Value>(m.into_data().as_ref()) else {
+            continue;
+        };
+        if v.get("sub").and_then(Value::as_str) != Some(id) {
+            continue;
+        }
+        if v.get("type").and_then(Value::as_str) == Some("frame") {
+            continue;
+        }
+        return v;
+    }
+}
+
+/// **`w10` — текст отказа `unsupported` НАЗЫВАЕТ каждую ось, по которой `admit()` отказал**
+/// (`TD-259`, `R-265` N-1). Расхождение текста с осями допуска случилось ДВАЖДЫ (`R-235` Н-2,
+/// `R-264` Н-1), и оба раза его ловил человек; третье повторение класса прозой не лечится
+/// (`binding-requires-mechanism`).
+///
+/// Оси НЕ перечисляются тестом заранее — они ВЫВОДЯТСЯ поведением сервера. Каждое поле
+/// допущенного селектора портится по своему JSON-типу (число ×2, строка → другая
+/// строка, массив → чужой массив) и, отдельно, удаляется; `bands` (в допущенном селекторе нет —
+/// полосы резолвит сервер) добавляется чужим набором. Если сервер ответил `unsupported`, текст
+/// отказа обязан назвать это поле. Новая ось, добавленная в `admit()` без правки текста,
+/// краснеет здесь без правки теста. Порча, давшая иной исход (ошибка разбора, снимок), не судится.
+///
+/// Setup-стражи: базовый селектор получает СНИМОК (иначе любая порча «отказана» по чужой
+/// причине); пять осей `CT-RFC-09` §2.10.1 действительно отказаны (иначе оракул судил бы пустоту).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn w10_unsupported_message_names_every_judged_axis() {
+    let _s = SERIAL.lock().await;
+    let (dir, ckpt) = fixture();
+    let mut ws = start(dir.path(), ckpt.path()).await;
+    let base = sel_json(None, 60_000);
+    send(
+        &mut ws,
+        json!({"op":"subscribe","v":1,"id":"w10-base","selector":base}),
+    )
+    .await;
+    let b = outcome_of(&mut ws, "w10-base").await;
+    assert_eq!(
+        b["type"],
+        json!("snapshot"),
+        "SETUP НЕ СОСТОЯЛСЯ: допущенный селектор обязан получить снимок: {b}"
+    );
+    send(&mut ws, json!({"op":"unsubscribe","v":1,"id":"w10-base"})).await;
+
+    let obj = base.as_object().expect("selector object").clone();
+    let mut cases: Vec<(String, String, Value)> = Vec::new();
+    for (k, v) in &obj {
+        let spoiled = match v {
+            // ×2 — порча, проходящая проверку ФОРМЫ (выравнивание по UTC-суткам, `GW-I-10`):
+            // `+7` давал `invalid_selector` раньше допуска, и ось допуска не судилась.
+            Value::Number(n) => json!(n.as_i64().expect("целое поле селектора") * 2),
+            Value::String(s) => json!(format!("{s}X")),
+            Value::Array(_) => json!([0.0123]),
+            Value::Null => json!(1),
+            other => panic!("SETUP: неожиданный тип поля «{k}»: {other}"),
+        };
+        let mut s = base.clone();
+        s[k.as_str()] = spoiled;
+        cases.push((k.clone(), format!("{k}: порча значения"), s));
+        let mut r = base.clone();
+        r.as_object_mut().expect("selector object").remove(k);
+        cases.push((k.clone(), format!("{k}: поле удалено"), r));
+    }
+    let mut b2 = base.clone();
+    b2["bands"] = json!([0.0123]);
+    cases.push(("bands".to_string(), "bands: чужой набор".to_string(), b2));
+
+    let mut judged = std::collections::BTreeSet::new();
+    let mut unnamed = Vec::new();
+    for (i, (key, what, sel)) in cases.iter().enumerate() {
+        let id = format!("w10-{i}");
+        send(
+            &mut ws,
+            json!({"op":"subscribe","v":1,"id":id,"selector":sel}),
+        )
+        .await;
+        let r = outcome_of(&mut ws, &id).await;
+        if r["type"] == json!("snapshot") {
+            send(&mut ws, json!({"op":"unsubscribe","v":1,"id":id})).await;
+            continue;
+        }
+        if r["code"] != json!("unsupported") {
+            continue;
+        }
+        judged.insert(key.clone());
+        let msg = r["message"].as_str().unwrap_or("");
+        if !msg.contains(key.as_str()) {
+            unnamed.push(format!("{what} → «{msg}»"));
+        }
+    }
+    for axis in [
+        "bands",
+        "symbol",
+        "timeframe_ms",
+        "window_ms",
+        "depth_cadence_ms",
+    ] {
+        assert!(
+            judged.contains(axis),
+            "SETUP НЕ СОСТОЯЛСЯ: порча оси «{axis}» не дала unsupported (отказанные оси: {judged:?}) — \
+             оракул судил бы пустоту"
+        );
+    }
+    assert!(
+        unnamed.is_empty(),
+        "TD-259 / R-265 N-1: текст отказа unsupported не называет ось, по которой admit() отказал: \
+         {unnamed:#?}"
+    );
+}
