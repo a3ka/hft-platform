@@ -70,7 +70,11 @@ use journal::{EpochFilter, Journal, WriterConfig};
 /// последнего события». Форма `DepthRow` не меняется, меняется СМЫСЛ чисел — тот же класс,
 /// что M-36 (VWAP 5→6). Bump здесь ЕДИНСТВЕННЫЙ рычаг, отвергающий чекпоинт со старым
 /// смыслом (`read_and_validate` шаг 3, `crates/gateway/src/lib.rs:2901-2904`).
-const EXPECTED_SCHEMA_VERSION: u32 = 11;
+/// **M-100: 11→12** — аддитивные поля снимка `calc_key_id`, `calc_profile`,
+/// `heatmap_window_e8` (`CT-RFC-09` §2.10.3–2.10.5) и `view` на проводе. С M-100 версия
+/// ПРОВОДА отделена от версии СОСТОЯНИЯ слепка (`checkpoint::CALC_STATE_VERSION` = 11, байты
+/// 12..16 заголовка): рычагом инвалидации слепка теперь служит она, а не эта константа.
+const EXPECTED_SCHEMA_VERSION: u32 = 12;
 
 fn cfg() -> WriterConfig {
     WriterConfig {
