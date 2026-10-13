@@ -2,7 +2,7 @@
 //! (план SCALE §5: «согласуется будущий стабильный идентификатор состояния; переключение — в S3»;
 //! §1 п.5: сегодняшний отпечаток — `DefaultHasher`, смена toolchain осиротит слепки МОЛЧА).
 //!
-//! # Объявленная форма (спека `milestones/M-100-three-serving-contracts.md` §4.3 — дословно)
+//! # Объявленная форма (спека `docs/archive/M-100-three-serving-contracts.md` §4.3 — дословно)
 //!
 //! ```ignore
 //! // crates/gateway/src/calc_key.rs

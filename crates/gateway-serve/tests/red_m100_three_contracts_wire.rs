@@ -1,5 +1,5 @@
 //! RED `M-100` (sacred, architect-only) — **три контракта выдачи на ПРОВОДЕ** (S1a-K; `CT-RFC-09`
-//! §2.10; спека `milestones/M-100-three-serving-contracts.md`).
+//! §2.10; спека `docs/archive/M-100-three-serving-contracts.md`).
 //!
 //! | контракт | что пиннится здесь |
 //! |---|---|

@@ -1,6 +1,6 @@
 //! RED `M-100` (sacred, architect-only) — **колонка карты в ЖИВОМ кадре есть СОСТОЯНИЕ бакета на
 //! последнем наблюдении кадра (close), а не объединение всех наблюдений кадра** (`VB-I-2`,
-//! `VB-I-12`; спека `milestones/M-100-three-serving-contracts.md` §5 «семантика heatmap»).
+//! `VB-I-12`; спека `docs/archive/M-100-three-serving-contracts.md` §5 «семантика heatmap»).
 //!
 //! # Дефект — по коду и прогоном
 //!
