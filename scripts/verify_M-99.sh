@@ -102,7 +102,9 @@ chk "grep -q 'DEFAULT_RESTORE_DRILL_STATE' crates/recorder/src/main.rs && ! grep
 # (круг 2, R-263 Б-3/Г-3: подстрока «hft-recorder» совпадала с ИМЕНЕМ КОНТЕЙНЕРА; сверку образа
 # исполняет сценарий IM пробы — здесь только наличие читателя в argv)
 chk "env -u JOURNAL_DRILL_READER HFT_CRON_PRINT_ARGV=1 bash ${DRILL} 2>/dev/null | grep -qE '^READER=.*journal-drill-read'"
-# §7: Storage Box только читается — ни --delete, ни удаления на стороне коробки
+# §7: Storage Box только читается — ни --delete, ни удаления на стороне коробки. Текстовая
+# проверка ловит лишь два написания; ИСПОЛНЕНИЕМ коробку судит сценарий RW пробы (task #1):
+# весь транскрипт удалённых команд по белому списку + дерево копии побайтно то же (C-311 Б-1)
 chk "! grep -qE -- '--delete|(^|[^-])rm .*JOURNAL_DRILL_COLD' ${DRILL}"
 
 step "task #2b — читатель существует, различает коды, попадает в прод-образ"
@@ -125,7 +127,8 @@ else
   # минута, час, день месяца — числа; месяц и день недели — '*': ровно раз в месяц
   chk "grep -qE '^[0-9]+[[:space:]]+[0-9]+[[:space:]]+[0-9]+[[:space:]]+\\*[[:space:]]+\\*[[:space:]]+root[[:space:]].*journal-restore-drill-cron\\.sh' ${CRON}"
   # Круг 2 (R-263 Б-2/Г-2): flock держит ОБЁРТКА; второй flock в строке cron'а на том же файле
-  # даёт SKIP на каждом прогоне. Исполнением строку судит сценарий CR пробы (task #1)
+  # даёт SKIP на каждом прогоне. Исполнением строку судит сценарий CR пробы (task #1), замок
+  # обёртки — сценарий CL (занятый замок ⇒ тик пропущен без следа; C-311 Б-2)
   chk "! grep -E '^[0-9]+[[:space:]].*journal-restore-drill-cron\\.sh' ${CRON} | grep -q flock"
 fi
 
@@ -134,7 +137,7 @@ chk_named_test "просроченный drill ⇒ 0, внутри окна ⇒ 
   cargo test -p recorder --test red_restore_drill_metric --quiet stale
 
 step "task #6 — сторож видит провал, просрочку и ОТСУТСТВИЕ drill'а (WD-RESTORE-DRILL)"
-chk_named_test "red_m99_restore_drill_watch (v1…v5, w1…w3, b1)" \
+chk_named_test "red_m99_restore_drill_watch (v1…v5, v5m, w1…w3, b1)" \
   cargo test -p ops --test red_m99_restore_drill_watch --quiet
 chk "[ \"\$(grep -rlE 'const RESTORE_DRILL_FRESH_WINDOW_MS' crates --include='*.rs' | grep -v '/tests/' | tr '\\n' ' ')\" = 'crates/ops/src/restore_drill.rs ' ]"
 
