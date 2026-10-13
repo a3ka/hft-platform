@@ -184,12 +184,14 @@ fn v3_default_state_path_matches_wrapper_contract() {
     );
 }
 
-/// Каталог файла состояния — то, что монтируется в контейнер recorder'а (`v5`).
+/// Каталог файла состояния по СПЕКЕ (`M-99` §4 п.10) — то, что монтируется в контейнер
+/// recorder'а (`v5`). Литерал спеки, а не производное от продуктовой константы: иначе судья
+/// исключительности и его самопроверка судили бы то, что продукт сейчас объявил (`v3` отдельно
+/// пиннит, что продукт объявляет то же).
+const SPEC_STATE_DIR: &str = "/var/lib/hft/drill-state";
+
 fn state_dir() -> &'static str {
-    Path::new(DEFAULT_RESTORE_DRILL_STATE)
-        .parent()
-        .and_then(|p| p.to_str())
-        .expect("у пути состояния есть каталог")
+    SPEC_STATE_DIR
 }
 
 /// **`v4` — поля и приоритет — ровно по таблице спеки §5 (`R-263` Н-1…Н-3).** Каждый случай —
@@ -284,41 +286,249 @@ fn v4_fields_and_priority_follow_spec_table() {
 fn v5_state_dir_is_mounted_into_recorder_at_same_path_read_only() {
     let compose_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docker-compose.yml");
     let compose = std::fs::read_to_string(&compose_path).expect("docker-compose.yml читается");
-    // Блок сервиса recorder: от строки `  recorder:` до следующего ключа второго уровня.
-    let mut in_rec = false;
-    let mut block = Vec::new();
-    for line in compose.lines() {
-        let top2 =
-            line.starts_with("  ") && !line.starts_with("   ") && line.trim_end().ends_with(':');
-        if top2 {
-            in_rec = line.trim_end() == "  recorder:";
-            continue;
-        }
-        if !line.starts_with(' ') && !line.is_empty() {
-            in_rec = false;
-        }
-        if in_rec {
-            block.push(line.trim());
-        }
-    }
+    let binds = compose_binds(&compose);
     assert!(
-        block.contains(&"container_name: hft-recorder"),
-        "SETUP НЕ СОСТОЯЛСЯ: блок сервиса recorder в docker-compose.yml не найден"
+        binds.iter().any(|b| b.service == "recorder"),
+        "SETUP НЕ СОСТОЯЛСЯ: сервис recorder в docker-compose.yml не найден разбором — \
+         оракул судил бы пустоту"
     );
     let dir = state_dir();
-    let want = format!("{dir}:{dir}:ro");
-    let mounted = block.iter().any(|l| {
-        let v = l.trim_start_matches("- ").trim_matches('"');
-        v == want
-    });
     assert!(
-        mounted,
-        "R-263 Б-4 / OPS-I-10: сервис recorder не монтирует каталог состояния drill'а «{want}» — \
-         внутри контейнера файла нет, и backup_restore_drill_ok будет 0 и после успешного drill'а"
-    );
-    assert!(
-        dir != "/var/lib/hft" && dir != "/var/lib/hft/restore-drill",
+        dir != "/var/lib/hft" && dir != RESTORE_DIR,
         "каталог состояния обязан быть ОТДЕЛЬНЫМ: монтирование {dir} протащит в контейнер лишнее"
+    );
+    if let Err(why) = judge_state_mounts(&binds, dir) {
+        panic!(
+            "R-263 Б-4 / C-311 Б-3 / OPS-I-10: {why}. Требуется РОВНО одно монтирование «{dir}:{dir}:ro» — \
+             в recorder, и никакого другого монтирования каталога состояния, его предков или \
+             каталога восстановления ни в одном сервисе"
+        );
+    }
+}
+
+/// Каталог восстановления drill'а (`M-99` §4 п.10): 2.5 ГБ восстановленного журнала, в
+/// контейнеры не монтируется.
+const RESTORE_DIR: &str = "/var/lib/hft/restore-drill";
+
+/// Bind-монтирование сервиса compose: источник на хосте, цель в контейнере, режим.
+#[derive(Debug, Clone, PartialEq)]
+struct Bind {
+    service: String,
+    source: String,
+    target: String,
+    mode: String,
+}
+
+/// Все bind-монтирования ВСЕХ сервисов (`C-311` Б-3: круг 2 смотрел один блок и судил
+/// существование, а не исключительность). Разбирает короткую форму `- "src:dst[:mode]"`;
+/// `${VAR:-default}` в источнике раскрывается в `default` — так его видит прод без `.env`.
+/// Длинная форма (`source:` / `target:`) в нашем compose не встречается; если появится, её
+/// источник учитывается с целью и режимом `?` — судья такую форму не примет как допустимую,
+/// но и не пропустит монтирование, видящее состояние (fail-closed, а не слепое пятно).
+fn compose_binds(compose: &str) -> Vec<Bind> {
+    let mut out = Vec::new();
+    let mut top = String::new();
+    let mut service = String::new();
+    for line in compose.lines() {
+        if line.trim_start().starts_with('#') || line.trim().is_empty() {
+            continue;
+        }
+        if !line.starts_with(' ') {
+            top = line.trim_end().to_string();
+            service.clear();
+            continue;
+        }
+        if top != "services:" {
+            continue;
+        }
+        if line.starts_with("  ") && !line.starts_with("   ") && line.trim_end().ends_with(':') {
+            service = line.trim().trim_end_matches(':').to_string();
+            continue;
+        }
+        let item = line.trim();
+        if let Some(src) = item.trim_start_matches("- ").strip_prefix("source:") {
+            out.push(Bind {
+                service: service.clone(),
+                source: src.trim().trim_matches('"').to_string(),
+                target: "?".into(),
+                mode: "?".into(),
+            });
+            continue;
+        }
+        let Some(v) = item.strip_prefix("- ") else {
+            continue;
+        };
+        let v = v.trim().trim_matches('"').trim_matches('\'');
+        let (source, rest) = if let Some(inner) = v.strip_prefix("${") {
+            let Some(close) = inner.find('}') else {
+                continue;
+            };
+            let var = &inner[..close];
+            let default = var.split_once(":-").map(|(_, d)| d).unwrap_or("");
+            (default.to_string(), &inner[close + 1..])
+        } else {
+            match v.find(':') {
+                Some(i) => (v[..i].to_string(), &v[i..]),
+                None => continue,
+            }
+        };
+        if !(source.starts_with('/') || source.starts_with('.')) {
+            continue;
+        }
+        let Some(rest) = rest.strip_prefix(':') else {
+            continue;
+        };
+        let (target, mode) = match rest.split_once(':') {
+            Some((t, m)) => (t.to_string(), m.to_string()),
+            None => (rest.to_string(), String::new()),
+        };
+        out.push(Bind {
+            service: service.clone(),
+            source,
+            target,
+            mode,
+        });
+    }
+    out
+}
+
+/// `a` — тот же путь, что `b`, или его предок.
+fn covers(a: &str, b: &str) -> bool {
+    let a = a.trim_end_matches('/');
+    a.is_empty() || b == a || b.starts_with(&format!("{a}/"))
+}
+
+/// Судья исключительности (`M-99` §7 строка о монтировании): ровно одно монтирование, видящее
+/// каталог состояния (сам каталог, его предок или потомок), — `recorder`, тот же путь, `:ro`;
+/// ни одного монтирования, видящего каталог восстановления; в `recorder` — никакого иного
+/// источника из `/var/lib/hft`. Соседние каталоги `/var/lib/hft/*` других сервисов (сегодня —
+/// `retention-work` у `retention`, `M-92`) не судятся: они не видят ни состояния, ни восстановления.
+fn judge_state_mounts(binds: &[Bind], dir: &str) -> Result<(), String> {
+    let sees_state: Vec<&Bind> = binds
+        .iter()
+        .filter(|b| covers(&b.source, dir) || covers(dir, &b.source))
+        .collect();
+    let want = Bind {
+        service: "recorder".into(),
+        source: dir.into(),
+        target: dir.into(),
+        mode: "ro".into(),
+    };
+    if sees_state.len() != 1 || *sees_state[0] != want {
+        return Err(format!(
+            "каталог состояния видят монтирования {sees_state:?} — ожидалось ровно одно {want:?}"
+        ));
+    }
+    if let Some(b) = binds
+        .iter()
+        .find(|b| covers(&b.source, RESTORE_DIR) || covers(RESTORE_DIR, &b.source))
+    {
+        return Err(format!("каталог восстановления виден в контейнере: {b:?}"));
+    }
+    if let Some(b) = binds
+        .iter()
+        .find(|b| b.service == "recorder" && covers("/var/lib/hft", &b.source) && b.source != dir)
+    {
+        return Err(format!("recorder монтирует из /var/lib/hft лишнее: {b:?}"));
+    }
+    Ok(())
+}
+
+/// САМОПРОВЕРКА v5 (`C-311` Б-3, условие 5): судья исключительности принимает допустимую форму
+/// и отвергает каждого мутанта. Зелёный с первого прогона ПО НАЗНАЧЕНИЮ — это проверка оракула,
+/// а не продукта (как `D`/`R` пробы). Без неё «v5 зелёный» не отличим от «v5 принимает всё».
+#[test]
+fn v5m_state_mount_judge_rejects_every_mutant() {
+    let dir = state_dir();
+    let good_line = format!("      - {dir}:{dir}:ro");
+    let base = |extra_rec: &str, extra_gw: &str, state_line: &str| {
+        format!(
+            "services:\n  recorder:\n    image: hft-platform-recorder:local\n    container_name: hft-recorder\n    volumes:\n      - journal-data:/data\n{state_line}\n{extra_rec}\n  retention:\n    volumes:\n      - \"${{RETENTION_WORK_DIR:-/var/lib/hft/retention-work}}:/work\"\n  gateway-serve:\n    volumes:\n      - gateway-state:/state\n{extra_gw}\nvolumes:\n  journal-data:\n  gateway-state:\n"
+        )
+    };
+    let ok = base("", "", &good_line);
+    let binds = compose_binds(&ok);
+    assert_eq!(
+        binds.iter().filter(|b| b.source.starts_with('/')).count(),
+        2,
+        "SETUP: разбор допустимой формы не увидел двух хост-путей (состояние и retention-work): {binds:?}"
+    );
+    assert_eq!(
+        judge_state_mounts(&binds, dir),
+        Ok(()),
+        "SETUP: судья отверг ДОПУСТИМУЮ форму — пойманные мутанты ничего бы не значили"
+    );
+    let mutants: Vec<(&str, String)> = vec![
+        (
+            "broad /var/lib/hft в recorder",
+            base("      - /var/lib/hft:/var/lib/hft:ro", "", &good_line),
+        ),
+        (
+            "второй сервис монтирует состояние",
+            base("", &good_line, &good_line),
+        ),
+        (
+            "на запись",
+            base("", "", &format!("      - {dir}:{dir}:rw")),
+        ),
+        ("без режима", base("", "", &format!("      - {dir}:{dir}"))),
+        (
+            "другой путь в контейнере",
+            base("", "", &format!("      - {dir}:/state:ro")),
+        ),
+        ("не в recorder", base("", &good_line, "")),
+        ("нет монтирования", base("", "", "")),
+        (
+            "предок /var/lib",
+            base("      - /var/lib:/host-lib:ro", "", &good_line),
+        ),
+        (
+            "сам файл, а не каталог",
+            base(
+                "",
+                "",
+                &format!(
+                    "      - {dir}/journal-restore-drill.json:{dir}/journal-restore-drill.json:ro"
+                ),
+            ),
+        ),
+        (
+            "каталог восстановления",
+            base(
+                &format!("      - {RESTORE_DIR}:{RESTORE_DIR}:ro"),
+                "",
+                &good_line,
+            ),
+        ),
+        (
+            "лишний источник из /var/lib/hft в recorder",
+            base("      - /var/lib/hft/other:/other:ro", "", &good_line),
+        ),
+        (
+            "длинная форма source:",
+            base(
+                "      - type: bind\n        source: /var/lib/hft\n        target: /hft",
+                "",
+                &good_line,
+            ),
+        ),
+        (
+            "кавычки и переменная не прячут broad",
+            base(
+                "      - \"${HFT_DIR:-/var/lib/hft}:/hft:ro\"",
+                "",
+                &good_line,
+            ),
+        ),
+    ];
+    let accepted: Vec<&str> = mutants
+        .iter()
+        .filter(|(_, text)| judge_state_mounts(&compose_binds(text), dir).is_ok())
+        .map(|(name, _)| *name)
+        .collect();
+    assert!(
+        accepted.is_empty(),
+        "судья v5 ПРИНЯЛ мутантов: {accepted:?}"
     );
 }
 
