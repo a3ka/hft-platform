@@ -114,7 +114,36 @@ fn default_capture_book_observations() -> bool {
 ///    но ОТДЕЛЬНЫМ атомарным коммитом: подпись формы и состав полос — разные задачи
 ///    милестоуна (§Tasks M-70, номера 6 и 7), и связывать их одним коммитом запрещает
 ///    `commit-discipline.md` («одна задача = ≥1 коммит»).
-pub const GATEWAY_SCHEMA_VERSION: u32 = 11;
+/// Версия экспорт-формы gateway (живой/провод) — bump при смене ФОРМЫ.
+/// M-100 (`milestones/M-100-three-serving-contracts.md` §4.4, `CT-RFC-09` §2.10.3):
+/// провод v12 несёт `calc_key_id`/`calc_profile`/`heatmap_window_e8` в `Snapshot`.
+/// Слепок продолжает писать `CALC_STATE_VERSION = 11` (форма ВЫЧИСЛИТЕЛЬНОГО состояния
+/// редьюсера не меняется — `VB-I-4` аддитивность).
+pub const GATEWAY_SCHEMA_VERSION: u32 = 12;
+
+/// M-100 (`milestones/M-100-three-serving-contracts.md` §4.4, `CT-RFC-09` §2.10.5):
+/// версия ФОРМЫ ВЫЧИСЛИТЕЛЬНОГО состояния редьюсера (слепок). Независима от
+/// `GATEWAY_SCHEMA_VERSION` (форма провода): правка ФОРМЫ КАДРА не обесценивает слепки.
+/// `11` намеренно: слепки, записанные до `M-100`, остаются годными; прод-деплой `M-100`
+/// НЕ требует холодной пересборки (≈23 мин по замеру `M-70` п.4).
+///
+/// Доступ: `gateway::checkpoint::CALC_STATE_VERSION` (объявлена в `checkpoint`-модуле)
+/// — `gateway-serve::admission::readiness` сверяет байты `12..16` слепка с этой
+/// константой, а НЕ с `GATEWAY_SCHEMA_VERSION`.
+pub use crate::checkpoint::CALC_STATE_VERSION;
+
+/// M-100 (`milestones/M-100-three-serving-contracts.md` §4.3, `CT-RFC-09` §2.10.4):
+/// стабильный идентификатор ключа расчёта. Заменяет отпечаток `DefaultHasher` (зависел от
+/// toolchain), форма независима от Rust-рантайма — `sha256` канонической UTF-8-формы
+/// (`calc-key/v1` · `venue=…` · `symbol=…` · `timeframe_ms=…` · `window_ms=…|none` ·
+/// `depth_cadence_ms=…|none` · `bands_pct_e8=…`). Реализация — `gateway::calc_key` (задача 3).
+pub mod calc_key;
+
+/// M-100 (`milestones/M-100-three-serving-contracts.md` §4.2, `CT-RFC-09` §2.10.2):
+/// проекция отображения (`view`) — выбор строк глубины (`depth_rows`) поверх готового
+/// расчёта; НЕ меняет расчёт (`calc_key_id` остаётся тот же). Применяется ТРАНСПОРТОМ
+/// к снимку И к каждому кадру подписки ПОСЛЕ проверки предела объёма.
+pub mod view;
 
 /// M-71 (`milestones/M-71-egress-cap.md` §5.1): дефолт предела объёма ответа в
 /// БАЙТАХ сериализованной `SeriesBundle` (`serde_json::to_vec`). Значение — продуктовое
@@ -122,7 +151,7 @@ pub const GATEWAY_SCHEMA_VERSION: u32 = 11;
 /// который падает `gateway-serve` при отсутствии/пустом `GATEWAY_MAX_RESPONSE_BYTES` —
 /// по той же форме, что `DEFAULT_MAX_SUBSCRIPTIONS = 16` для лимита подписок. Спека
 /// §5.1 называет 2 000 000 как предложение founder'а; конструкция (один
-/// `enforce_response_limit`, вызов из шести строителей) от числа НЕ зависит.
+/// `enforce_response_limit`/`enforce_snapshot_limit`, вызов из шести строителей)
 pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 2_000_000;
 
 /// M-75 (`milestones/M-75-heatmap-window-decoupling.md` §5): прод-дефолт
@@ -194,7 +223,9 @@ pub fn set_effective_vp_bin_width_e8(w: i64) {
 }
 
 /// M-71 (`milestones/M-71-egress-cap.md` §4bis.2): эффективное значение предела,
-/// которое читают точки применения в `gateway` (`enforce_response_limit`). Заводится
+/// которое читают точки применения в `gateway` (`enforce_response_limit` для Frame-дельта,
+/// `enforce_snapshot_limit` для полного Snapshot — расщепление M-100, PL-I-5 boundary).
+/// Заводится
 /// ЗДЕСЬ — в крейте, где предел ПРИМЕНЯЕТСЯ — по образцу `EFFECTIVE_MAX_SUBS` /
 /// `EFFECTIVE_GRACE_MS` (`crates/gateway-serve/src/lib.rs:194-210` / `:213-228`), но
 /// в ДРУГОМ крейте, потому что цикл зависимостей запрещает `gateway` звать
@@ -220,7 +251,7 @@ static EFFECTIVE_MAX_RESPONSE_BYTES: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_
 /// Дефолт — `DEFAULT_MAX_RESPONSE_BYTES` (`П-020`).
 ///
 /// Читается на каждом `snapshot`/`frames_since`/`pump`/`snapshot_checked`/
-/// `snapshot_from_checkpoint`-вызове через `enforce_response_limit`.
+/// `snapshot_from_checkpoint`-вызове через `enforce_response_limit`/`enforce_snapshot_limit`.
 pub fn effective_max_response_bytes() -> usize {
     EFFECTIVE_MAX_RESPONSE_BYTES.load(Ordering::Relaxed)
 }
@@ -560,6 +591,14 @@ pub struct SeriesBundle {
     pub cob_observed: bool,
 }
 
+/// M-100 (`milestones/M-100-three-serving-contracts.md` §4.4, `CT-RFC-09` §2.10.3,
+/// `П-032` п.4(в)): применённая версия профиля расчётов, объявляется снимком.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CalcProfileStamp {
+    pub version: u32,
+    pub sha256: String,
+}
+
 /// Полная детерминированная свёртка окна `[start .. cursor]`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Snapshot {
@@ -568,6 +607,28 @@ pub struct Snapshot {
     /// Курсор, ДО которого (включительно) свёрнута серия.
     pub cursor: Cursor,
     pub series: SeriesBundle,
+    /// M-100 (`milestones/M-100-three-serving-contracts.md` §4.3, `CT-RFC-09` §2.10.4):
+    /// стабильный идентификатор ключа расчёта (`sha256` канонической формы
+    /// `calc-key/v1`...). Не зависит от toolchain (замена `DefaultHasher`), снаружи
+    /// отображает, ЧТО посчитано; `selector.bands` после резолва сервером равен
+    /// каноническому набору профиля (`П-029`/`П-032`).
+    #[serde(default)]
+    pub calc_key_id: String,
+    /// M-100 (`milestones/M-100-three-serving-contracts.md` §4.4, `CT-RFC-09` §2.10.3,
+    /// `П-032` п.4(в)): применённая версия профиля расчётов `{version, sha256}`.
+    /// `null` — процесс без профиля (legacy-режим); `#[serde(default)]` —
+    /// v11-консьюмер прочитает v12 как `null` без ошибки, но ОБЯЗАН гейтить на
+    /// `schema_version == 12`, иначе `view`-поля останутся непрочитанными
+    /// (тот же класс, что `VB-I-12`).
+    #[serde(default)]
+    pub calc_profile: Option<CalcProfileStamp>,
+    /// M-100 (`milestones/M-100-three-serving-contracts.md` §4.4, `CT-RFC-09` §2.10.3,
+    /// `TD-197`): полуширина ценового окна карты/стакана, доля ×1e8
+    /// (`effective_heatmap_window_frac() * 1e8`, округлено). Объявляется снимком, чтобы
+    /// клиент знал геометрию карты (`heatmap_window_e8 / 1e8` × `mid`) без отдельного
+    /// конфиг-запроса.
+    #[serde(default)]
+    pub heatmap_window_e8: i64,
     /// M-48 (TD-048, VB-I-11): seq ПЕРВОГО РЕАЛЬНО свёрнутого события. Брать из
     /// `header.first_seq` сегмента НЕЛЬЗЯ — у legacy-сегментов он синтезирован нулём
     /// (`segments.rs:509-512`, TD-030) и соврал бы ровно там, где важна правда.
@@ -2103,6 +2164,33 @@ impl Reducer {
         let mut heatmap_observed_time_s: Vec<i64> = Vec::new();
         let mut seen_buckets: std::collections::BTreeSet<i64> = std::collections::BTreeSet::new();
         let mut cob_observed = false;
+        // M-100 (§4.5, VB-I-2, VB-I-12): close-семантика per БАКЕТ, а не объединение по
+        // наблюдениям в диапазоне кадра. Раннее наблюдение бакета, чей уровень снят
+        // более поздним наблюдением ТОГО ЖЕ бакета в ТОМ ЖЕ кадре, при ОБЪЕДИНЕНИИ остаётся
+        // у клиента (`merge_heatmap` Replace-семантика по колонке не сможет его стереть,
+        // потому что кадр не объявляет этот бакет как «наблюдённый с ПУСТЫМ срезом» — в
+        // новой копии книги уровня уже нет, и ячейки с ним просто отсутствуют). Это
+        // нарушение `VB-I-2`: `live != full` для карты ВНУТРИ кадра (M-88 закрыл
+        // аналогичный дефект для снятия МЕЖДУ кадрами).
+        //
+        // Решение: для каждого бакета берём только ПОСЛЕДНЕЕ наблюдение (max seq) и его
+        // `heatmap_cells` (это и есть close-срез этого бакета). Дублей на одном бакете в
+        // одном диапазоне кадра здесь уже быть не может — `capture_book_observation`
+        // хранит наблюдения под РАЗНЫМИ seq даже для одного бакета (несколько L2-событий
+        // в одном бакете → несколько наблюдений с разными seq, но одна `heatmap_time_s`).
+        // Объединение этих наблюдений в `BTreeMap` через INSERT даёт прежний объединяющий
+        // дефект; здесь — выбираем max-seq и его срез.
+        let mut last_obs_per_bucket: BTreeMap<i64, &BookSeriesObservation> = BTreeMap::new();
+        for obs in &observations {
+            last_obs_per_bucket
+                .entry(obs.heatmap_time_s)
+                .and_modify(|cur| {
+                    if obs.seq > cur.seq {
+                        *cur = obs;
+                    }
+                })
+                .or_insert(obs);
+        }
         for obs in &observations {
             if seen_buckets.insert(obs.heatmap_time_s) {
                 heatmap_observed_time_s.push(obs.heatmap_time_s);
@@ -2112,6 +2200,12 @@ impl Reducer {
             // наблюдения в `book_series` порождены L2-событиями (`capture_book_observation`
             // зовётся только из `L2Snapshot`/`L2Delta`-веток `apply`).
             cob_observed = true;
+        }
+        // Только close-срез каждого бакета (`last_obs_per_bucket`) идёт в `heatmap_map`.
+        // `BTreeMap` ключ `(time_s, side, price_e8)` дедуплицирует ячейки внутри среза,
+        // что для одного бакета не даёт эффекта (срез — снимок книги, без дублей по
+        // ключу `(side, price)`).
+        for obs in last_obs_per_bucket.values() {
             for cell in &obs.heatmap_cells {
                 heatmap_map.insert(
                     (cell.time_s, cell.side.clone(), cell.price_e8),
@@ -3519,6 +3613,59 @@ pub fn validate_selector(sel: &Selector) -> io::Result<()> {
 /// был бы зелен во всех liveness-проверках (`healthy`/heartbeat/рост журнала) и
 /// врёт клиенту; явный `Err` — единственный честный fail-closed.
 // MUT-ANCHOR M-71-LIMIT
+// M-100 (`milestones/M-100-three-serving-contracts.md` §4.4, PL-I-5 boundary regression):
+// `Snapshot` envelope вырос с добавлением `calc_key_id` (64 hex) / `calc_profile`
+// (Option со встроенным `{version, sha256}`) / `heatmap_window_e8` поверх прежних
+// `schema_version`/`selector`/`cursor`/`history_start_seq`/`history_truncated`. Прежняя
+// константа `SNAPSHOT_ENVELOPE_BYTES = 300` недооценивала envelope и пропускала ответы
+// ЗА пределом: оракул `red_egress_cap_boundary::pl_i_5_boundary_last_accepted_fits_and_next_is_refused`
+// мерит ПОЛНЫЙ snapshot (`serde_json::to_vec(&accepted).len()`), а прежняя функция —
+// только `SeriesBundle + 300`. Замер на `Binance/BTCUSDT/1000ms/bands=[0.001]`:
+// последний ПРИНЯТЫЙ ответ весил 2 000 044 Б при пределе 2 000 000 Б (22 914 сделок).
+//
+// Фикс — сериализовать ПОЛНЫЙ snapshot, а не `SeriesBundle` + константу. `SeriesBundle`
+// уже входит в `Snapshot` (через `snap.series`), и полная сериализация учитывает ВСЕ
+// envelope-поля конструктивно — константы, способной расходиться с формой, нет.
+//
+// Расщепление с `enforce_response_limit` намеренное: тот держит путь FRAME-DELTA
+// (`from`/`to`/`at_ms`/`schema_version` — оверхед ~80 Б; константа `FRAME_ENVELOPE_BYTES = 300`
+// остаётся ГЕНЕРОЗНЫМ over-estimat'ом, fail-closed). Расщепление — M-100 круг 5, находка
+// тестера. `enforce_snapshot_limit` — первичный гард на уровне 1 (`A-021`, обязательный
+// набор п.3); полный провод — уровень 2 (`W-C2`, `red_egress_cap_wire.rs`).
+fn enforce_snapshot_limit(snap: &Snapshot, limit: usize) -> io::Result<()> {
+    let bytes = serde_json::to_vec(snap)
+        .map_err(|e| io::Error::other(format!("enforce_snapshot_limit: serialize Snapshot: {e}")))?
+        .len();
+    if bytes > limit {
+        let series = &snap.series;
+        let vp_bins: usize = series.volume_profile.iter().map(|r| r.bins.len()).sum();
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "PL-I-5: response exceeds limit: limit={limit} bytes, observed={bytes} bytes \
+                 (heatmap={} cob={} vp_bins={} bubbles={} ohlcv={} depth_rows={})",
+                series.heatmap.len(),
+                series.cob.len(),
+                vp_bins,
+                series.volume_bubbles.len(),
+                series.ohlcv.len(),
+                series.depth_series.len(),
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// FRAME-путь (`frames_since`/`frames_since_with_stats`/`replay`/`LiveReducer::pump`).
+/// Сериализуется ТОЛЬКО `SeriesBundle` (`Frame.delta`) — envelope `Frame`
+/// (`from`/`to`/`at_ms`/`schema_version`) прикинут константой `FRAME_ENVELOPE_BYTES = 300`,
+/// что для Frame envelope ~80 Б остаётся ГЕНЕРОЗНЫМ OVER-ESTIMAT'ом (fail-closed: Frame
+/// rejection случается чуть раньше строго необходимого, безопаснее). Envelope `Snapshot`
+/// БОЛЬШЕ — отдельная `enforce_snapshot_limit` (выше).
+///
+/// M-71 (`milestones/M-71-egress-cap.md` §5, PL-I-5): предел ОБЪЁМА ответа — DELTA-кадр,
+/// как и снапшот, есть ТЕЛО wire-сообщения (`Frame` сериализуется в `wire_v1::frame_msg`
+/// целиком, `C-158` R1: 2 804 666 Б на плотных сделках).
 fn enforce_response_limit(series: &SeriesBundle, limit: usize) -> io::Result<()> {
     let series_bytes = serde_json::to_vec(series)
         .map_err(|e| {
@@ -3527,22 +3674,8 @@ fn enforce_response_limit(series: &SeriesBundle, limit: usize) -> io::Result<()>
             ))
         })?
         .len();
-    // `Snapshot` несёт ПОВЕРХ `SeriesBundle` поля `schema_version`/`selector`/`cursor`/
-    // `history_start_seq`/`history_truncated`. Замер на фикстуре `Binance/BTCUSDT/1000ms/
-    // bands=[0.001]` показывает 223–228 Б оверхеда; типичный прод-селектор укладывается
-    // в 300 Б (расширенный symbol/мультиполосный селектор поднимают до ~400). Оракул
-    // `red_egress_cap_boundary::pl_i_5_boundary_last_accepted_fits_and_next_is_refused`
-    // судит ПОЛНЫЙ snapshot (`serde_json::to_vec(&accepted).len()`), и без учёта
-    // envelope'а граница разойдётся: последний ПРИНЯТЫЙ ответ формально проходит по
-    // `SeriesBundle` (<limit), но envelope выводит его за предел. Это НЕ «более
-    // строгая» проверка — это та же проверка, что и оракул, только аккуратно
-    // отнормированная на envelope. Оверхед оценивается КОНСТАНТОЙ потому, что
-    // (а) селектор и курсор — статические относительно функции (вызывающий
-    // владеет ими, не функция), (б) единственный надёжный замер — полная сериализация
-    // `Snapshot`, которая требует `&Snapshot`, а не `&SeriesBundle`, и сигнатура
-    // специ зафиксирована (`§5.2`).
-    const SNAPSHOT_ENVELOPE_BYTES: usize = 300;
-    let n = series_bytes + SNAPSHOT_ENVELOPE_BYTES;
+    const FRAME_ENVELOPE_BYTES: usize = 300;
+    let n = series_bytes + FRAME_ENVELOPE_BYTES;
     if n > limit {
         let vp_bins: usize = series.volume_profile.iter().map(|r| r.bins.len()).sum();
         return Err(io::Error::new(
@@ -3576,23 +3709,33 @@ pub fn snapshot(
     let mut stream = journal::stream(dir, filter)?;
     let (series, cursor, _, _at_ms, first_folded_seq, _depth_levels_visited) =
         reduce_event_stream(&mut stream, sel, Cursor::START, at, usize::MAX)?;
-    // M-71 (PL-I-5, `milestones/M-71-egress-cap.md` §5): предел ОБЪЁМА ответа,
-    // fail-closed. Здесь — уровень 1 (анти-байпас: 4 потребителя строят `Selector`
-    // мимо транспорта — чекпоинтер M-38b, shared-tailer, `research-cli`, replay).
-    enforce_response_limit(&series, effective_max_response_bytes())?;
     // M-48 (TD-048, VB-I-11): провенанс истории берётся из ПЕРВОГО свёрнутого события
     // (НЕ из `header.first_seq` — у legacy он синтезирован нулём, TD-030). На полном
     // журнале первый свёрнутый seq = 0 ⇒ `history_truncated = false`; на усечённом —
     // >0 ⇒ `true`. `first_folded_seq == 0` и при пустом журнале (нет ни одного события) —
     // тогда «усечённости» нет (просто пусто), `history_truncated = false`.
-    Ok(Snapshot {
+    let snap = Snapshot {
         schema_version: GATEWAY_SCHEMA_VERSION,
         selector: sel.clone(),
         cursor,
         series,
         history_start_seq: first_folded_seq,
         history_truncated: first_folded_seq > 0,
-    })
+        calc_key_id: calc_key::calc_key_id(sel),
+        calc_profile: calc_profile::effective_calc_profile().map(|(v, sha)| CalcProfileStamp {
+            version: v,
+            sha256: sha,
+        }),
+        heatmap_window_e8: (effective_heatmap_window_frac() * 1e8).round() as i64,
+    };
+    // M-71 (PL-I-5, `milestones/M-71-egress-cap.md` §5) + M-100: предел ОБЪЁМА ответа,
+    // fail-closed. Здесь — уровень 1 (анти-байпас: 4 потребителя строят `Selector`
+    // мимо транспорта — чекпоинтер M-38b, shared-tailer, `research-cli`, replay).
+    // `enforce_snapshot_limit` сериализует ПОЛНЫЙ snapshot (включая `calc_key_id`/
+    // `calc_profile`/`heatmap_window_e8`), константа envelope не нужна (PL-I-5 boundary
+    // regression, круг 5 M-100).
+    enforce_snapshot_limit(&snap, effective_max_response_bytes())?;
+    Ok(snap)
 }
 
 /// Кадры за событиями `seq > after` (batched, ≤ `max_events` событий за вызов), свёрнутые тем же
@@ -3947,10 +4090,6 @@ pub fn snapshot_from_checkpoint(
             let final_cursor = if at == Cursor::LATEST { cursor } else { at };
             let (series, reducer_at_ms) = state.finish_with_at();
             let _ = reducer_at_ms;
-            // M-71: предел ОБЪЁМА на построенный `Snapshot`. Чекпоинт-путь (PRIMARY на
-            // проде, см. `docker-compose.yml`) ОБЯЗАН enforce'ить так же, как прямой
-            // `snapshot` — иначе replay-от-чекпоинта дал бы дыру с другой стороны.
-            enforce_response_limit(&series, effective_max_response_bytes())?;
             // M-48 (VB-I-11): провенанс истории ПЕРЕСИМ от чекпоинта, не вычисляем
             // из хвостовых событий (D2: `red_checkpoint_bootstrap_truncated
             // ::advance_after_covered_prune_does_not_regress_history_start`).
@@ -3959,17 +4098,29 @@ pub fn snapshot_from_checkpoint(
             // `snapshot_from_checkpoint` это и библиотечный API (на проде прямо не
             // вызывается, используется `LiveReducer::snapshot`), и прямой вызов
             // из оракулов (D2 держится на замороженном значении).
-            return Ok((
-                Snapshot {
-                    schema_version: GATEWAY_SCHEMA_VERSION,
-                    selector: sel.clone(),
-                    cursor: final_cursor,
-                    series,
-                    history_start_seq: ckpt_header.history_start_seq,
-                    history_truncated: ckpt_header.history_truncated,
-                },
-                stats,
-            ));
+            let snap = Snapshot {
+                schema_version: GATEWAY_SCHEMA_VERSION,
+                selector: sel.clone(),
+                cursor: final_cursor,
+                series,
+                history_start_seq: ckpt_header.history_start_seq,
+                history_truncated: ckpt_header.history_truncated,
+                calc_key_id: calc_key::calc_key_id(sel),
+                calc_profile: calc_profile::effective_calc_profile().map(|(v, sha)| {
+                    CalcProfileStamp {
+                        version: v,
+                        sha256: sha,
+                    }
+                }),
+                heatmap_window_e8: (effective_heatmap_window_frac() * 1e8).round() as i64,
+            };
+            // M-71: предел ОБЪЁМА на построенный `Snapshot`. Чекпоинт-путь (PRIMARY на
+            // проде, см. `docker-compose.yml`) ОБЯЗАН enforce'ить так же, как прямой
+            // `snapshot` — иначе replay-от-чекпоинта дал бы дыру с другой стороны.
+            // `enforce_snapshot_limit` сериализует ПОЛНЫЙ snapshot (PL-I-5 boundary
+            // regression, круг 5 M-100).
+            enforce_snapshot_limit(&snap, effective_max_response_bytes())?;
+            return Ok((snap, stats));
         }
     }
 
@@ -3978,23 +4129,28 @@ pub fn snapshot_from_checkpoint(
     let mut stream = journal::stream(dir, filter)?;
     let (series, cursor, _consumed, _at_ms, first_folded_seq, depth_levels_visited) =
         reduce_event_stream(&mut stream, sel, Cursor::START, at, usize::MAX)?;
-    // M-71 (PL-I-5, `milestones/M-71-egress-cap.md` §5): rebuild-ветка тоже enforce'ит
-    // предел (анти-байпас).
-    enforce_response_limit(&series, effective_max_response_bytes())?;
     // Re-read stats AFTER iteration (счётчики инкрементируются в `next()`).
     let stats = read_stats_from_stream(&stream, depth_levels_visited);
-    Ok((
-        Snapshot {
-            schema_version: GATEWAY_SCHEMA_VERSION,
-            selector: sel.clone(),
-            cursor,
-            series,
-            // M-48 (VB-I-11): провенанс из первого свёрнутого события (см. `snapshot`).
-            history_start_seq: first_folded_seq,
-            history_truncated: first_folded_seq > 0,
-        },
-        stats,
-    ))
+    let snap = Snapshot {
+        schema_version: GATEWAY_SCHEMA_VERSION,
+        selector: sel.clone(),
+        cursor,
+        series,
+        // M-48 (VB-I-11): провенанс из первого свёрнутого события (см. `snapshot`).
+        history_start_seq: first_folded_seq,
+        history_truncated: first_folded_seq > 0,
+        calc_key_id: calc_key::calc_key_id(sel),
+        calc_profile: calc_profile::effective_calc_profile().map(|(v, sha)| CalcProfileStamp {
+            version: v,
+            sha256: sha,
+        }),
+        heatmap_window_e8: (effective_heatmap_window_frac() * 1e8).round() as i64,
+    };
+    // M-71 (PL-I-5, `milestones/M-71-egress-cap.md` §5): rebuild-ветка тоже enforce'ит
+    // предел (анти-байпас). PL-I-5 boundary regression, круг 5 M-100 — через
+    // `enforce_snapshot_limit`, константа envelope не нужна.
+    enforce_snapshot_limit(&snap, effective_max_response_bytes())?;
+    Ok((snap, stats))
 }
 
 /// M-94 (П-032): **загрузчик профиля расчётов** + **единственный дом разборщиков**
@@ -4019,6 +4175,17 @@ pub mod checkpoint {
     use std::path::{Path, PathBuf};
 
     use contracts::SegmentHeader;
+
+    /// M-100 (`milestones/M-100-three-serving-contracts.md` §4.4, `CT-RFC-09` §2.10.5):
+    /// версия ФОРМЫ ВЫЧИСЛИТЕЛЬНОГО состояния редьюсера (слепок). Независима от
+    /// `GATEWAY_SCHEMA_VERSION` (форма провода): правка ФОРМЫ КАДРА не обесценивает
+    /// слепки. `11` намеренно: слепки до `M-100` остаются годными; прод-деплой `M-100`
+    /// НЕ требует холодной пересборки (≈23 мин по замеру `M-70` п.4).
+    ///
+    /// Доступна и как `gateway::checkpoint::CALC_STATE_VERSION` (для `gateway-serve`,
+    /// сверяющего байты `12..16` слепка), и как `gateway::CALC_STATE_VERSION`
+    /// (реэкспорт через `pub use crate::checkpoint::CALC_STATE_VERSION`).
+    pub const CALC_STATE_VERSION: u32 = 11;
 
     /// RAII-обёртка над `flock(LOCK_EX)`: `Drop` снимает блокировку. `File` держится
     /// до конца жизни guard'а — иначе `flock` ОС снимется при закрытии fd (fd
@@ -4230,6 +4397,11 @@ pub mod checkpoint {
     pub struct CkptHeader {
         pub magic: [u8; 8],
         pub ckpt_schema_version: u32,
+        /// M-100 (§4.4): байты `12..16` файла; с v12 (M-100) сюда пишется
+        /// `CALC_STATE_VERSION` (==11), а НЕ `GATEWAY_SCHEMA_VERSION` (==12). Имя поля
+        /// сохранено для совместимости с discriminator-форматом postcard'а — postcard не
+        /// self-describing и переименование сломало бы десериализацию слепков до M-100
+        /// (оракул `red_m100_state_version::sv2` проверяет слепок с байтами `11`).
         pub gateway_schema_version: u32,
         /// Селектор-фингерпринт: SHA-подобный хеш (Venue+symbol+timeframe_ms+window_ms+
         /// bands-через-`to_bits`). NaN в bands ЗАПРЕЩЁН в `Selector::validate` (см.
@@ -4276,7 +4448,13 @@ pub mod checkpoint {
             Self {
                 magic: CKPT_MAGIC,
                 ckpt_schema_version: CKPT_SCHEMA_VERSION,
-                gateway_schema_version: GATEWAY_SCHEMA_VERSION,
+                // M-100 (§4.4): `CkptHeader.gateway_schema_version` (postcard-поле)
+                // хранит ВЕРСИЮ ВЫЧИСЛИТЕЛЬНОГО СОСТОЯНИЯ (=11) — то же, что писатель
+                // кладёт в байты `12..16` файла. Имя поля сохранено для postcard-discriminator-
+                // совместимости; семантика = «версия состояния». Проверяется против
+                // `CALC_STATE_VERSION` в `read_and_validate_inner` шаг (3), а не против
+                // `GATEWAY_SCHEMA_VERSION` (=12 после M-100).
+                gateway_schema_version: CALC_STATE_VERSION,
                 selector_fingerprint,
                 epoch_filter_fingerprint,
                 journal_lineage,
@@ -4669,11 +4847,29 @@ pub mod checkpoint {
         let tmp_path = unique_tmp_path(&final_path);
         {
             let mut f = File::create(&tmp_path)?;
-            // Layout: [magic(8)][ckpt_schema_v(4)][gateway_schema_v(4)][header_len(4)][header_postcard][state_len(4)][state_postcard][CRC32(4)]
+            // Layout: [magic(8)][ckpt_schema_v(4)][calc_state_v(4)][header_len(4)][header_postcard][state_len(4)][state_postcard][CRC32(4)]
             // CRC покрывает `header_postcard || state_postcard` (без magic/версий).
+            //
+            // M-100 (§4.4, CT-RFC-09 §2.10.5): развязка версии ПРОВОДА и версии
+            // ВЫЧИСЛИТЕЛЬНОГО состояния. Писатель пишет `CALC_STATE_VERSION` (=11) в
+            // байты `12..16`, и `readiness` сверяет байты с тем же `CALC_STATE_VERSION`
+            // (=11). Это РАЗВОДИТ версии: провод может подняться до `12`, не задевая
+            // слепков, потому что слепок хранит «версию состояния» (неизменную), а не
+            // «версию провода» (которая поднимается).
+            //
+            // Состояние sacred-тестов на эту развязку (`R-264` Н-3): после фикса
+            // `872f59f9` (`test(M-100): прежние оракулы под расщепление версий...`)
+            // четыре бывших красных оракула — `red_m87_admission::u2_*`, в том числе
+            // `u2_readiness_fresh_checkpoint_is_ready` и `u2_readiness_incompatible_checkpoint`,
+            // — имеют setup-страж `bytes[12..16] == CALC_STATE_VERSION` (НЕ
+            // `GATEWAY_SCHEMA_VERSION`) и зелёные: подделка ставит в заголовок
+            // ВЕРСИЮ ПРОВОДА, чтобы поймать допуск, сверяющий не с той константой.
+            // Этот комментарий больше не описывает долг — остаётся только задача 7
+            // (`docs/fa/viz-backend.md` `VB-I-13`) и обновление строки FA
+            // `VB-I-12` (\"гейтить на `schema_version == 11`\" → 12), это зона architect'а.
             f.write_all(&CKPT_MAGIC)?;
             f.write_all(&CKPT_SCHEMA_VERSION.to_le_bytes())?;
-            f.write_all(&GATEWAY_SCHEMA_VERSION.to_le_bytes())?;
+            f.write_all(&CALC_STATE_VERSION.to_le_bytes())?;
             f.write_all(&(header_bytes.len() as u32).to_le_bytes())?;
             f.write_all(&header_bytes)?;
             f.write_all(&(state_bytes.len() as u32).to_le_bytes())?;
@@ -4863,9 +5059,11 @@ pub mod checkpoint {
         if ckpt_v != CKPT_SCHEMA_VERSION {
             return None;
         }
-        // (3) gateway_schema_version
+        // (3) gateway_schema_version (M-100: пишется `CALC_STATE_VERSION`, а не
+        // `GATEWAY_SCHEMA_VERSION` — развязка версии ПРОВОДА и версии ВЫЧИСЛИТЕЛЬНОГО
+        // состояния; правка формы кадра НЕ обесценивает слепки, §4.4/§2.10.5).
         let gw_v = u32::from_le_bytes(bytes[12..16].try_into().ok()?);
-        if gw_v != GATEWAY_SCHEMA_VERSION {
+        if gw_v != CALC_STATE_VERSION {
             return None;
         }
         // (4) header_len + header_postcard
@@ -5682,7 +5880,7 @@ impl LiveReducer {
     /// именно по этой причине).
     ///
     /// **Причина различается МЕСТОМ ВЫЗОВА, а не `ErrorKind`.** Сюда попадает только
-    /// отказ собственного гварда `enforce_response_limit`; журнальный I/O идёт другим
+    /// отказ собственного гварда `enforce_response_limit` (Frame-путь); журнальный I/O идёт другим
     /// `?` и счётчик не трогает. Это существенно: `io::ErrorKind` различителем быть НЕ
     /// МОЖЕТ — журнал отдаёт `Other` в четырёх местах
     /// (`crates/journal/src/segments.rs:654,657,660,663`, `R-143` B-3).
@@ -5772,6 +5970,12 @@ impl LiveReducer {
             series,
             history_start_seq: self.full_history_start_seq,
             history_truncated: self.full_history_truncated,
+            calc_key_id: calc_key::calc_key_id(&self.selector),
+            calc_profile: calc_profile::effective_calc_profile().map(|(v, sha)| CalcProfileStamp {
+                version: v,
+                sha256: sha,
+            }),
+            heatmap_window_e8: (effective_heatmap_window_frac() * 1e8).round() as i64,
         }
     }
 
@@ -5783,8 +5987,8 @@ impl LiveReducer {
     /// звать эту функцию вместо `snapshot()` — иначе через live-путь
     /// `LiveReducer::resume → pump → snapshot` на провод уйдёт ответ сверх предела, и
     /// `PL-I-5`/`GW-I-14` останутся без защиты (это тот дыра, который `C-157` R2
-    /// предъявил в первой редакции; теперь закрыта тем же `enforce_response_limit`, что и
-    /// остальные 5 строителей).
+    /// предъявил в первой редакции; теперь закрыта `enforce_snapshot_limit` —
+    /// расщепление M-100, остальные 5 Frame-строителей остались на `enforce_response_limit`).
     ///
     /// **Fail-closed, одинаково на обоих путях** (`M-71` §4bis.1, `R-133` B-2/B-3, `VB-I-2`,
     /// `VB-I-11`). Превышение предела — явный `Err`; молчаливое усечение
@@ -5795,7 +5999,10 @@ impl LiveReducer {
     /// `M-48`) восстанавливается этим изменением: флаг никогда не трогается здесь.
     pub fn snapshot_checked(&self) -> io::Result<Snapshot> {
         let snap = self.snapshot();
-        enforce_response_limit(&snap.series, effective_max_response_bytes())?;
+        // M-100 (PL-I-5 boundary regression, круг 5): `enforce_snapshot_limit` сериализует
+        // ПОЛНЫЙ snapshot (включая `calc_key_id`/`calc_profile`/`heatmap_window_e8`).
+        // Прежняя `enforce_response_limit(&snap.series, …)` недооценивала envelope.
+        enforce_snapshot_limit(&snap, effective_max_response_bytes())?;
         Ok(snap)
     }
 }

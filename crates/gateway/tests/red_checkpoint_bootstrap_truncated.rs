@@ -709,13 +709,17 @@ fn ckpt_file_path(dir: &std::path::Path) -> std::path::PathBuf {
         .expect("advance обязан был создать файл чекпоинта")
 }
 
-/// Подменить `gateway_schema_version` в заголовке файла (смещение 12..16 — сразу после
-/// magic и `ckpt_schema_version`). Моделирует БУДУЩИЙ штатный bump схемы: файл на диске
-/// снят прежней версией кода.
+/// Подменить версию СОСТОЯНИЯ в заголовке файла (смещение 12..16 — сразу после magic и
+/// `ckpt_schema_version`). Моделирует БУДУЩИЙ штатный bump: файл на диске снят прежней
+/// версией кода.
+///
+/// **M-100 (§4.4, расщепление версий):** байты 12..16 несут `CALC_STATE_VERSION` (форма
+/// вычислительного состояния), а НЕ `GATEWAY_SCHEMA_VERSION` (форма провода). До M-100 это
+/// было одно число; якорь подделки — версия, которую слепок реально пишет.
 fn corrupt_gw_schema_version(path: &std::path::Path) {
     let mut bytes = std::fs::read(path).expect("read ckpt");
     assert!(bytes.len() > 16, "чекпоинт подозрительно мал");
-    let other = gateway::GATEWAY_SCHEMA_VERSION + 1;
+    let other = gateway::checkpoint::CALC_STATE_VERSION + 1;
     bytes[12..16].copy_from_slice(&other.to_le_bytes());
     std::fs::write(path, &bytes).expect("write ckpt");
 }
@@ -787,10 +791,11 @@ fn stale_schema_version_checkpoint_rebuilds_silently_and_overwrites() {
          (расхождение здесь означает недетерминизм в заголовке/состоянии — он сломает \
          идемпотентность advance и байт-идентичность реплея)"
     );
+    // M-100 §4.4: заголовок слепка несёт версию СОСТОЯНИЯ, не версию провода.
     assert_eq!(
         &after[12..16],
-        &gateway::GATEWAY_SCHEMA_VERSION.to_le_bytes(),
-        "перезаписанный чекпоинт обязан нести ТЕКУЩУЮ версию схемы"
+        &gateway::checkpoint::CALC_STATE_VERSION.to_le_bytes(),
+        "перезаписанный чекпоинт обязан нести ТЕКУЩУЮ версию состояния (CALC_STATE_VERSION)"
     );
 
     // И read-path обязан работать через него, а не уходить в полный реплей.

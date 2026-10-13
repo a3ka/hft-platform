@@ -252,13 +252,21 @@ fn ckpt_from_registry(
             let path = ckpt_file(ckpt.path());
             let mut bytes = std::fs::read(&path).expect("read ckpt");
             let declared = u32::from_le_bytes(bytes[12..16].try_into().expect("4 байта"));
+            // M-100 §4.4: байты 12..16 несут версию СОСТОЯНИЯ (`CALC_STATE_VERSION`), не
+            // версию провода. Подделка — версия провода: ловит допуск, сверяющий не с той
+            // константой (тот принял бы такой слепок как свой).
             assert_eq!(
                 declared,
-                gateway::GATEWAY_SCHEMA_VERSION,
-                "setup-страж: байты 12..16 не несут версию провода — подделка версии \
+                gateway::checkpoint::CALC_STATE_VERSION,
+                "setup-страж: байты 12..16 не несут версию состояния — подделка версии \
                  сделала бы не то, что обещает строка реестра"
             );
-            bytes[12..16].copy_from_slice(&(declared + 1).to_le_bytes());
+            let bad = gateway::GATEWAY_SCHEMA_VERSION;
+            assert_ne!(
+                bad, declared,
+                "setup-страж: версия провода совпала с версией состояния — подделка пуста"
+            );
+            bytes[12..16].copy_from_slice(&bad.to_le_bytes());
             std::fs::write(&path, &bytes).expect("write incompatible");
             (Some(ckpt.path().to_path_buf()), Some(ckpt))
         }
@@ -1014,7 +1022,7 @@ async fn u1_entry_corrupt_checkpoint_over_trap_gives_named_outcome() {
     );
 }
 
-/// Состояние 3 — слепок НЕСОВМЕСТИМ по версии провода, журнал под ловушкой.
+/// Состояние 3 — слепок НЕСОВМЕСТИМ по версии состояния (M-100 §4.4), журнал под ловушкой.
 #[tokio::test]
 async fn u1_entry_incompatible_checkpoint_over_trap_gives_named_outcome() {
     let _serial = SERIAL.lock().await;
@@ -1023,7 +1031,7 @@ async fn u1_entry_incompatible_checkpoint_over_trap_gives_named_outcome() {
         "u1_entry_incompatible_checkpoint_over_trap_gives_named_outcome",
         dir.path(),
     );
-    // Подделку версии провода делает драйвер по строке реестра (`Stage::CkptIncompatible`);
+    // Подделку версии состояния делает драйвер по строке реестра (`Stage::CkptIncompatible`);
     // setup-страж «байты 12..16 несут версию» живёт там же, рядом с подделкой.
     poison_segment(dir.path(), 0);
 

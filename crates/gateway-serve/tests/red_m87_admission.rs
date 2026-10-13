@@ -112,7 +112,10 @@ fn sel_with(symbol: &str, bands: Vec<f64>) -> Selector {
         symbol: symbol.to_string(),
         timeframe_ms: 1_000,
         bands,
-        window_ms: None,
+        // `R-264` Б-1: тройка профиля обязана совпасть ЦЕЛИКОМ (`CT-RFC-09` §2.10.1). Прежняя
+        // форма с `window_ms: None` держала зелёным обход в `profile_allowed` — канонический
+        // запрос несёт окно профиля.
+        window_ms: Some(60_000),
         depth_cadence_ms: None,
     }
 }
@@ -424,6 +427,29 @@ fn form_unbounded_profile_is_refused_even_with_canonical_bands() {
     );
 }
 
+/// **`R-264` Б-1 — тройка БЕЗ окна ⇒ `Unsupported`, а не `NotReady`.** Символ, полосы, таймфрейм и
+/// каденция — профильные; отсутствует ТОЛЬКО `window_ms`. Отклонить такой запрос способна лишь
+/// сверка окна. Прежний обход («`None` — legacy, окно не сверяем») отдавал клиенту `not_ready`
+/// без прогрева, то есть вечный повтор (`TD-242`), при RFC, объявившем класс закрытым.
+#[test]
+fn form_profile_triple_without_window_is_unsupported() {
+    let p = policy();
+    let mut s = sel_with("BTCUSDT", CANONICAL.to_vec());
+    assert_ne!(
+        admit(&p, &s),
+        ServingOutcome::Unsupported,
+        "SETUP НЕ СОСТОЯЛСЯ: тот же селектор С окном профиля обязан проходить допуск — иначе \
+         отказ ниже судит не окно"
+    );
+    s.window_ms = None;
+    assert_eq!(
+        admit(&p, &s),
+        ServingOutcome::Unsupported,
+        "R-264 Б-1 / CT-RFC-09 §2.10.1 / TD-242: селектор без window_ms принят — клиент получит \
+         not_ready без прогрева и будет повторять запрос бесконечно"
+    );
+}
+
 // ════════ У-2 (`A-037`) — четыре состояния слепка ПЕРЕЕХАЛИ сюда как юнит-оракулы ════════
 //
 // Прежний файл `crates/gateway/tests/red_m87_cold_path_reads_nothing.rs` ИЗЪЯТ: он пиннил на
@@ -503,7 +529,12 @@ fn u2_readiness_corrupt_checkpoint_over_trap() {
     );
 }
 
-/// Состояние 3 — слепок несовместим по версии провода.
+/// Состояние 3 — слепок несовместим по версии СОСТОЯНИЯ.
+///
+/// **M-100 (§4.4):** байты 12..16 несут `CALC_STATE_VERSION`, допуск сверяет её. Подделка
+/// ставит в заголовок ВЕРСИЮ ПРОВОДА `GATEWAY_SCHEMA_VERSION` — единственное значение,
+/// которое отличает правильную сверку от сверки не с той константой: допуск, сравнивающий
+/// заголовок с версией провода, примет такой слепок как свой, и сценарий покраснеет.
 #[test]
 fn u2_readiness_incompatible_checkpoint() {
     let dir = journal_of(40);
@@ -519,10 +550,15 @@ fn u2_readiness_incompatible_checkpoint() {
     let declared = u32::from_le_bytes(bytes[12..16].try_into().expect("4 байта"));
     assert_eq!(
         declared,
-        gateway::GATEWAY_SCHEMA_VERSION,
+        gateway::checkpoint::CALC_STATE_VERSION,
         "setup-страж: не то поле"
     );
-    bytes[12..16].copy_from_slice(&(declared + 1).to_le_bytes());
+    let bad = gateway::GATEWAY_SCHEMA_VERSION;
+    assert_ne!(
+        bad, declared,
+        "setup-страж: версия провода совпала с версией состояния — подделка ничего не меняет"
+    );
+    bytes[12..16].copy_from_slice(&bad.to_le_bytes());
     std::fs::write(&path, &bytes).expect("write");
     poison_first_segment(dir.path());
 

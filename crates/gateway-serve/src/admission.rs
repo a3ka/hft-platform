@@ -144,21 +144,43 @@ fn bands_subset(asked: &[f64], canonical: &[f64]) -> bool {
 }
 
 fn profile_allowed(policy: &AdmissionPolicy, sel: &Selector) -> bool {
-    // Профиль — это КОНЕЧНЫЙ перечень `timeframe_ms`, разрешённый на публичном пути
-    // (`C-234` R1, спека §4.1). Проверяем только `timeframe_ms` (остальные поля
-    // профиля — `window_ms`/`depth_cadence_ms` — это ОГРАНИЧЕНИЯ работы внутри
-    // `LiveReducer`, и они проверяются на следующем слое; `admit` судит «вправе ли
-    // клиент ЭТО просить», а не «вправе ли редьюсер ЭТО посчитать»).
+    // M-100 (§4.1, CT-RFC-09 §2.10.1, TD-242): профиль — это КОНЕЧНЫЙ перечень
+    // ТРОЕК (timeframe_ms, window_ms, depth_cadence_ms), разрешённый на публичном
+    // пути. Полная сверка `admit` обязательна — иначе клиент, приславший
+    // тройку вне `allowed_profiles`, получает `not_ready` (слепок под
+    // другой отпечаток) вместо названного `unsupported` (`TD-242`).
     //
-    // Следствие: `timeframe_ms: 1_000` разрешает любой `window_ms` (включая `None` —
-    // unbounded offline), и эта ветка дополнительно проверяется отдельным оракулом
-    // (`form_unbounded_profile_is_refused_even_with_canonical_bands`) с `timeframe_ms: 1`,
-    // который НЕ входит в перечень. То есть: профиль = «разрешённый `timeframe_ms`»,
-    // а не «полный кортеж параметров».
+    // Семантика `window_ms` (`R-264` Б-1):
+    //   - `sel.window_ms == None` НЕ совпадает НИ С ОДНИМ профилем (`LiveProfile.
+    //     window_ms: i64`, без `Option`). Прежний обход («`None` ⇒ legacy/offline,
+    //     только timeframe_ms сверяем») держал зелёным `red_m87_admission::
+    //     form_canonical_request_is_not_refused` на форме без окна, но при RFC
+    //     rev3 (`CT-RFC-09` §2.10.1) — отказ `unsupported`: клиент, забывший
+    //     `window_ms`, получал бы `not_ready` без прогрева, повторяя вечно.
+    //   - `sel.window_ms == Some(w)` ⇒ w должно совпасть с `p.window_ms` для
+    //     ОДНОГО из профилей.
+    //
+    // Семантика `depth_cadence_ms`:
+    //   - `sel.depth_cadence_ms == None` ⇒ ТОЛЬКО профили с `depth_cadence_ms == None`
+    //     совпадают (профиль по умолчанию задаёт `None`).
+    //   - `sel.depth_cadence_ms == Some(c)` ⇒ профили с `Some(c)` совпадают
+    //     (None ≠ Some(c) для каденции ЗАПРЕЩЕНО: это смена СЕМАНТИКИ, см. M-68 d14).
+    //
+    // `timeframe_ms` сравнивается строго.
+    let sel_cadence = sel.depth_cadence_ms;
     for p in &policy.allowed_profiles {
-        if p.timeframe_ms == sel.timeframe_ms {
-            return true;
+        if p.timeframe_ms != sel.timeframe_ms {
+            continue;
         }
+        // Окно сверяется ВСЕГДА: `None` ⇒ мимо (профильное `window_ms: i64` —
+        // не `Option`). Это закрывает R-264 Б-1 / TD-242.
+        if sel.window_ms != Some(p.window_ms) {
+            continue;
+        }
+        if p.depth_cadence_ms != sel_cadence {
+            continue;
+        }
+        return true;
     }
     false
 }
@@ -204,13 +226,18 @@ pub fn readiness(
         Some(h) => h,
         None => return ServingOutcome::NotReady,
     };
-    // (3) Версия провода. `gateway_schema_version` поля `CkptHeader` обязана
-    // совпадать с текущей — иначе слепок считаем несовместимым. Чтение
-    // идёт напрямую из файла по смещению `12..16` (спека M-38b: первая часть
-    // файла — фиксированные `magic || ckpt_v || gw_v || header_len`), а НЕ
+    // (3) Версия состояния (M-100). `readiness` сверяет байты `12..16` слепка с
+    // `gateway::checkpoint::CALC_STATE_VERSION` (== 11), а НЕ `GATEWAY_SCHEMA_VERSION`
+    // (== 12) — развязка версии ПРОВОДА и версии ВЫЧИСЛИТЕЛЬНОГО состояния
+    // (`milestones/M-100-three-serving-contracts.md` §4.4, `CT-RFC-09` §2.10.5): правка
+    // формы кадра (провод 11→12) НЕ обесценивает слепки, потому что байты `12..16`
+    // по-прежнему несут `11`.
+    //
+    // Чтение идёт напрямую из файла по смещению `12..16` (спека M-38b: первая часть
+    // файла — фиксированные `magic || ckpt_v || calc_state_v || header_len`), а НЕ
     // из postcard-сериализованного заголовка (там может быть ОТДЕЛЬНОЕ поле,
-    // и тест `u2_readiness_incompatible_checkpoint` модифицирует именно
-    // байтовое поле).
+    // и тест `w9_foreign_state_version_is_not_ready` модифицирует именно байтовое
+    // поле, подставляя 10 или 12).
     let raw = match std::fs::read(&ckpt_path) {
         Ok(b) => b,
         Err(_) => return ServingOutcome::NotReady,
@@ -219,7 +246,7 @@ pub fn readiness(
         return ServingOutcome::NotReady;
     }
     let declared = u32::from_le_bytes(raw[12..16].try_into().unwrap_or([0u8; 4]));
-    if declared != gateway::GATEWAY_SCHEMA_VERSION {
+    if declared != gateway::checkpoint::CALC_STATE_VERSION {
         return ServingOutcome::NotReady;
     }
     // (4) Курсор слепка лежит близко к хвосту. staleness-проверка ОТКАЗЫВАЕТ

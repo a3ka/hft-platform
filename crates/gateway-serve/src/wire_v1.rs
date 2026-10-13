@@ -27,7 +27,7 @@
 //! - `unknown_id` (`O-10`/§4.2): `unsubscribe` уже снятого или никогда не существовавшего id.
 
 use contracts::Venue;
-use gateway::{Frame, Selector, Snapshot};
+use gateway::{view::ViewSpec, Frame, Selector, Snapshot};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -41,6 +41,13 @@ pub enum ClientMessage {
         id: String,
         #[serde(default)]
         selector: Option<Value>,
+        /// M-100 (§4.2, CT-RFC-09 §2.10.2): проекция отображения (выбор строк глубины
+        /// из готового расчёта). `Option<Value>` — на проводе это JSON-объект
+        /// `{"depth_rows":[{"band_pct_e8":...,"side":"bid"}, ...]}`, отсутствующий —
+        /// «всё показывать». Парсится в `gateway::view::ViewSpec` позже (после
+        /// резолва `selector.bands`, чтобы валидировать `band_pct_e8` против ключа).
+        #[serde(default)]
+        view: Option<Value>,
     },
     #[serde(rename = "unsubscribe")]
     Unsubscribe { v: u64, id: String },
@@ -117,7 +124,13 @@ pub fn parse_message(bytes: &[u8]) -> Result<ClientMessage, ParseError> {
 
 /// Парсинг `selector`-поля (Value → `gateway::Selector`) со специфичными кодами ошибок.
 /// `unknown_venue` vs `invalid_selector` различается здесь.
-pub fn parse_selector(value: &Value) -> Result<Selector, SelectorError> {
+///
+/// M-100 (§4.1, CT-RFC-09 §2.10.1): `selector.bands` НЕОБЯЗАТЕЛЕН. Отсутствует ⇒
+/// полосы ключа = `canonical_bands` (задаются политикой допуска). Присутствует и
+/// РАВЕН `canonical_bands` (порядок И значения) ⇒ принимается. Присутствует и НЕ
+/// равен ⇒ `SelectorError::UnsupportedBands` (отказ `unsupported` на проводе,
+/// §3 п.1 запрет подмены).
+pub fn parse_selector(value: &Value, canonical_bands: &[f64]) -> Result<Selector, SelectorError> {
     // Venue: строго проверяем (CT-RFC-09 §2.7: неизвестная площадка — `unknown_venue`).
     let venue_str = value
         .get("venue")
@@ -129,11 +142,64 @@ pub fn parse_selector(value: &Value) -> Result<Selector, SelectorError> {
         "BinanceFutures" => Venue::BinanceFutures,
         other => return Err(SelectorError::UnknownVenue(other.to_string())),
     };
-    // Дальше делегируем в serde — `gateway::Selector` уже валидируется нами в `session.rs`.
-    let sel: Selector = serde_json::from_value(value.clone())
+    // Извлекаем `bands` ДО serde-десериализации (она требует `Vec<f64>` нончего):
+    //   - None → подставим `canonical_bands` ниже;
+    //   - Some и равен canonical → примем как есть;
+    //   - Some и НЕ равен → отказ `UnsupportedBands` (`unsupported` на проводе).
+    let bands = value.get("bands").map(|v| match v.as_array() {
+        Some(arr) => arr
+            .iter()
+            .map(|x| {
+                x.as_f64().ok_or_else(|| {
+                    SelectorError::Invalid(format!("bands entry {x:?} not a number"))
+                })
+            })
+            .collect::<Result<Vec<f64>, _>>()
+            .map(Some),
+        None => Err(SelectorError::Invalid("bands is not an array".to_string())),
+    });
+    let bands: Option<Vec<f64>> = match bands {
+        Some(Ok(Some(b))) => Some(b),
+        Some(Ok(None)) => Some(vec![]),
+        Some(Err(e)) => return Err(e),
+        None => None, // ключ `bands` отсутствует в JSON
+    };
+    let resolved_bands: Vec<f64> = match bands {
+        None => {
+            // M-100 (§4.1, CT-RFC-09 §2.10.1): полосы отсутствуют — подставляем
+            // канонический набор ТОЛЬКО при наличии политики (`canonical_bands` не
+            // пустой). Legacy-режим (без политики, `canonical_bands == &[]`)
+            // ОБЯЗАН прислать полосы — иначе перейти на профильный режим.
+            // Прямой отказ (`invalid_selector`) — ниже в коде через пустой резолв.
+            if canonical_bands.is_empty() {
+                return Err(SelectorError::Invalid(
+                    "selector.bands is required (legacy mode without policy)".to_string(),
+                ));
+            }
+            canonical_bands.to_vec()
+        }
+        Some(client_bands) if bands_equal(&client_bands, canonical_bands) => {
+            // Равен (порядок + значения) ⇒ принимается как есть. Это переходная
+            // совместимость v1-клиентов (CT-RFC-09 §2.2 rev2 присылают `bands`).
+            client_bands
+        }
+        Some(client_bands) if canonical_bands.is_empty() => {
+            // Legacy-режим (нет политики, `canonical_bands == &[]`): полосы
+            // обязательны и принимаются как есть (прежняя семантика M-65/M-87).
+            client_bands
+        }
+        Some(_) => {
+            // Подмножество / надмножество / перестановка / чужие полосы ⇒ отказ
+            // (`П-030`: параметры не подменяются). Сообщение называет `view.depth_rows`
+            // как способ выбрать отображение.
+            return Err(SelectorError::UnsupportedBands);
+        }
+    };
+    // Строим `Selector` напрямую (минуя serde для `bands`) — `bands` уже резолвлены.
+    let mut sel_value = value.clone();
+    sel_value["bands"] = serde_json::to_value(&resolved_bands).expect("bands serialize");
+    let sel: Selector = serde_json::from_value(sel_value)
         .map_err(|e| SelectorError::Invalid(format!("selector deserialize: {e}")))?;
-    // Проверяем, что venue в десериализованном совпадает с тем, что мы прочитали (защита от
-    // прохождения через serde мусора в виде Enum-тега).
     if sel.venue != venue {
         return Err(SelectorError::Invalid(format!(
             "venue mismatch: declared {venue:?}, deserialized {:?}",
@@ -143,10 +209,30 @@ pub fn parse_selector(value: &Value) -> Result<Selector, SelectorError> {
     Ok(sel)
 }
 
+/// Сравнение двух списков `band_pct_e8` (f64, через `(b*1e8).round() as i64`) — порядок
+/// и значения. `bands_subset`-семантика здесь НЕ подходит: ровно-равенство.
+fn bands_equal(a: &[f64], b: &[f64]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    for (x, y) in a.iter().zip(b.iter()) {
+        let xi = (x * 1e8).round() as i64;
+        let yi = (y * 1e8).round() as i64;
+        if xi != yi {
+            return false;
+        }
+    }
+    true
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SelectorError {
     UnknownVenue(String),
     Invalid(String),
+    /// M-100 (§4.1, CT-RFC-09 §2.10.1, П-030): клиентские `bands` ≠ каноническому
+    /// набору (подмножество, надмножество, перестановка, чужие полосы). На проводе — код
+    /// `unsupported` (сообщение называет `view.depth_rows` как способ выбрать отображение).
+    UnsupportedBands,
 }
 
 impl SelectorError {
@@ -154,17 +240,40 @@ impl SelectorError {
         match self {
             Self::UnknownVenue(_) => "unknown_venue",
             Self::Invalid(_) => "invalid_selector",
+            Self::UnsupportedBands => "unsupported",
         }
     }
 }
 
 /// Сериализация snapshot-сообщения в NEW wire-форму.
-pub fn snapshot_msg(sub: &str, snap: &Snapshot) -> Value {
+///
+/// M-100 (§4.2, CT-RFC-09 §2.10.2): конверт снимка повторяет принятый выбор —
+/// `"view":{...}|null` после `sub`. `view == None` — клиент НЕ прислал выбора (или
+/// прислдал пустой), показывать все строки расчёта.
+pub fn snapshot_msg(sub: &str, snap: &Snapshot, view: Option<&ViewSpec>) -> Value {
+    let view_inner = view.cloned();
     let data = serde_json::to_value(snap).expect("Snapshot Serialize");
-    json!({"type":"snapshot","v":1,"sub":sub,"data":data})
+    // Форма `view`-поля в конверте: JSON-объект, если задан; `null`, если нет.
+    // Зеркалит `sub` (тоже `string|null`).
+    let view_v = match &view_inner {
+        Some(v) => match &v.depth_rows {
+            // `depth_rows == None` (или пустой Vec) — тождество; на проводе тоже `null`,
+            // чтобы клиент не различал «всё» и «явно все».
+            None => Value::Null,
+            Some(rows) if rows.is_empty() => Value::Null,
+            Some(rows) => {
+                serde_json::json!({"depth_rows": serde_json::to_value(rows).expect("depth_rows serialize")})
+            }
+        },
+        None => Value::Null,
+    };
+    json!({"type":"snapshot","v":1,"sub":sub,"view":view_v,"data":data})
 }
 
-/// Сериализация frame-сообщения в NEW wire-форму.
+/// Сериализация frame-сообщения в NEW wire-форму. Проекция `view` уже применена
+/// к `frame.delta.depth_series` вызывающей стороной (`project_view`) ДО сериализации
+/// (`CT-RFC-09` §2.10.2: проекция применяется транспортом к снимку И к каждому кадру
+/// подписки ПОСЛЕ проверки предела объёма).
 pub fn frame_msg(sub: &str, frame: &Frame) -> Value {
     let data = serde_json::to_value(frame).expect("Frame Serialize");
     json!({"type":"frame","v":1,"sub":sub,"data":data})

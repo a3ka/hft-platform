@@ -781,7 +781,8 @@ fn md_i8_d7b_reach_is_sampled_where_the_numbers_are_delta_grows_the_book() {
 /// `clippy::assertions-on-constants` запрещает, и зазеленеть не мог НИКОГДА (`C-138` п.3).
 ///
 /// **(б) Рычаг работает.** `read_and_validate` шаг (3) отвергает чекпоинт при
-/// `gw_v != GATEWAY_SCHEMA_VERSION` (`crates/gateway/src/lib.rs:2901-2904`). Половина (б)
+/// несовпадении версии в заголовке; с M-100 (§4.4) это `CALC_STATE_VERSION`, а не
+/// `GATEWAY_SCHEMA_VERSION`. Половина (б)
 /// зелена и сегодня — это КОНТРОЛЬ: она предъявляет, что bump из (а) действительно
 /// инвалидирует кэш, а не просто меняет число. `C-094` B3 требовал именно ЯВНОЙ инвалидации.
 #[test]
@@ -822,9 +823,20 @@ fn md_i8_d8_semantics_bump_is_declared_and_invalidates_stale_checkpoint() {
         bytes.len() > 16,
         "SETUP НЕ СОСТОЯЛСЯ: файл чекпоинта короче заголовка"
     );
-    // Портим ИМЕННО `gateway_schema_version` (bytes[12..16]) — не magic и не ckpt-версию:
+    // Портим ИМЕННО версию состояния (bytes[12..16]) — не magic и не ckpt-версию:
     // проверяется рычаг смысла, а не целостность файла.
-    let stale = full.schema_version.saturating_sub(1);
+    //
+    // M-100 §4.4: с расщеплением версий байты 12..16 несут `CALC_STATE_VERSION`, а не версию
+    // провода `full.schema_version`. Прежнее `full.schema_version - 1` после M-100 равно
+    // ровно текущей версии состояния — «подделка» перестала бы быть подделкой, и сценарий
+    // падал бы по неверной причине. Якорь — то, что слепок реально пишет; страж — ниже.
+    let declared = u32::from_le_bytes(bytes[12..16].try_into().expect("4 байта"));
+    assert_eq!(
+        declared,
+        gateway::checkpoint::CALC_STATE_VERSION,
+        "SETUP НЕ СОСТОЯЛСЯ: байты 12..16 слепка не несут версию состояния"
+    );
+    let stale = declared - 1;
     bytes[12..16].copy_from_slice(&stale.to_le_bytes());
     std::fs::write(path, &bytes).expect("write ckpt");
 
