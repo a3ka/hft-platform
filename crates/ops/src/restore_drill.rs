@@ -50,7 +50,7 @@ pub const RESTORE_DRILL_FRESH_WINDOW_MS: i64 = 40 * 24 * 60 * 60 * 1000;
 /// `tmp → rename`, а bind-mount файла держит прежний inode и не увидел бы ни одной новой
 /// записи. Каталог отдельный — том не тащит в контейнер ничего, кроме состояния drill'а
 /// (каталог восстановления — 2.5 ГБ — туда не входит).
-pub const DEFAULT_RESTORE_DRILL_STATE: &str = "/var/lib/hft/journal-restore-drill.json";
+pub const DEFAULT_RESTORE_DRILL_STATE: &str = "/var/lib/hft/drill-state/journal-restore-drill.json";
 
 /// Регулярка для отпечатка при `ok=1`: ровно 64 строчных hex-символа.
 /// T2-контракт: «обязательно при `ok=1`» (`M-74` §«Поле `digest` — ЯДРО rev 5»),
@@ -304,7 +304,7 @@ mod tests {
     fn default_state_path_is_well_known() {
         assert_eq!(
             DEFAULT_RESTORE_DRILL_STATE,
-            "/var/lib/hft/journal-restore-drill.json"
+            "/var/lib/hft/drill-state/journal-restore-drill.json"
         );
     }
 

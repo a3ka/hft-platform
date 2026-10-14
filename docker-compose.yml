@@ -40,6 +40,13 @@ services:
       EPOCH_ID: own-2026-09-m45-ethusdt
     volumes:
       - journal-data:/journal
+      # M-99 (задача 6, §4 п.10 + `R-263` Б-4): каталог состояния drill'а монтируется
+      # в recorder по тому же пути `:ro`. ОДНА строка — никаких других источников из
+      # `/var/lib/hft` в `recorder` (`C-311` Б-3, §7 Запрещено); файл состояния живёт
+      # в `/var/lib/hft/drill-state/journal-restore-drill.json`, обёртка пишет
+      # `tmp → rename`, bind-mount КАТАЛОГА (не файла) видит новую запись. Каталог
+      # восстановления (`/var/lib/hft/restore-drill`, ≈ 2.5 ГБ) НЕ монтируется сюда.
+      - /var/lib/hft/drill-state:/var/lib/hft/drill-state:ro
     healthcheck:
       # heartbeat обновлён за последние 60с → healthy (recorder жив + том пишется).
       # TD-019: heartbeat = JSON с ts_wall_ms/next_seq/segment_index/free_bytes/writable —
