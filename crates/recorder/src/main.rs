@@ -265,11 +265,13 @@ async fn main() -> anyhow::Result<()> {
         // M-99 (задача 3): путь к файлу состояния drill'а. Дефолт совпадает с тем,
         // что пишет cron-обёртка (`JOURNAL_DRILL_STATE`), и с дефолтом `ops-watchdog`
         // (`WATCHDOG_RESTORE_DRILL_STATE`). Один путь у продюсера, один у потребителя —
-        // иначе тихий no-op.
+        // иначе тихий no-op. Единственный источник строки — `ops::restore_drill::
+        // DEFAULT_RESTORE_DRILL_STATE` (`M-99` §4 п.10, §7 «второе определение»);
+        // собственный литерал здесь запрещён.
         let drill_state_path: std::path::PathBuf = std::env::var("JOURNAL_DRILL_STATE")
             .ok()
             .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| "/var/lib/hft/journal-restore-drill.json".to_string())
+            .unwrap_or_else(|| ops::restore_drill::DEFAULT_RESTORE_DRILL_STATE.to_string())
             .into();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(1));
