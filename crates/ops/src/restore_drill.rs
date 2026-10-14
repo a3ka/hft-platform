@@ -42,6 +42,14 @@ pub const RESTORE_DRILL_FRESH_WINDOW_MS: i64 = 40 * 24 * 60 * 60 * 1000;
 /// «путь продюсера = путь потребителя»): обёртка пишет сюда, сторож читает отсюда;
 /// рассогласование даёт тихий no-op. Проверяется `verify_M-99.sh` (задача 6:
 /// сравнение дефолта обёртки с этой константой + регексп по `DEFAULT_RESTORE_DRILL_STATE`).
+///
+/// Круг 2 (`R-263` Б-4): путь в ОТДЕЛЬНОМ каталоге `/var/lib/hft/drill-state/`. Recorder —
+/// потребитель метрики — работает в контейнере и видит хост только через объявленные
+/// тома; прежний путь в корне `/var/lib/hft` в контейнер не монтировался, и метрика на
+/// проде была бы 0 и после успеха. Монтируется КАТАЛОГ, а не файл: обёртка пишет
+/// `tmp → rename`, а bind-mount файла держит прежний inode и не увидел бы ни одной новой
+/// записи. Каталог отдельный — том не тащит в контейнер ничего, кроме состояния drill'а
+/// (каталог восстановления — 2.5 ГБ — туда не входит).
 pub const DEFAULT_RESTORE_DRILL_STATE: &str = "/var/lib/hft/journal-restore-drill.json";
 
 /// Регулярка для отпечатка при `ok=1`: ровно 64 строчных hex-символа.
@@ -111,48 +119,64 @@ pub fn restore_drill_verdict(state_path: &Path, now_wall_ms: i64) -> RestoreDril
         Err(_) => return RestoreDrillVerdict::Unparseable,
     };
 
-    // (3) `ok != 1` — `Failed` (явный провал). Проверяем ДО `digest`, потому что `ok=0`
-    //     снимает требование наличия `digest`: `digest` обязателен ТОЛЬКО при `ok=1`
-    //     (T2-контракт `M-74`).
-    let ok = v.get("ok").and_then(serde_json::Value::as_i64);
-    if ok != Some(1) {
-        return RestoreDrillVerdict::Failed;
-    }
-
-    // (4) `ts_wall_ms` ОБЯЗАТЕЛЬНОЕ поле. Без него — `Unparseable` (поле отсутствует,
-    //     контракт не выполнен). Это РАНЬШЕ проверки «из будущего»: без метки времени
-    //     утверждать о направлении некорректно.
+    // (3) Обязательные поля по T2 (`M-74`): `ok`, `ts_wall_ms`, `checked`. Любое
+    //     отсутствие — `Unparseable` (контракт не выполнен). Это РАНЬШЕ `Failed`:
+    //     «нет поля `ok`» — не «явный провал», а «контракт не выполнен»
+    //     (`R-263` Н-1).
+    let ok = match v.get("ok").and_then(serde_json::Value::as_i64) {
+        Some(o) => o,
+        None => return RestoreDrillVerdict::Unparseable,
+    };
     let ts_wall_ms = match v.get("ts_wall_ms").and_then(serde_json::Value::as_i64) {
         Some(t) => t,
         None => return RestoreDrillVerdict::Unparseable,
     };
+    if v.get("checked").is_none() {
+        return RestoreDrillVerdict::Unparseable;
+    }
 
-    // (5) `ts_wall_ms > now` — `FromFuture` (часы сбиты либо файл подложен). Это РАНЬШЕ
-    //     `Stale`: метка из будущего подозрительнее просроченной.
+    // (4) `ok != 1` — `Failed` (явный провал). Проверяем ДО `digest`, потому что
+    //     `ok=0` снимает требование наличия `digest`: `digest` обязателен ТОЛЬКО при
+    //     `ok=1` (T2-контракт `M-74`).
+    if ok != 1 {
+        return RestoreDrillVerdict::Failed;
+    }
+
+    // (5) `digest` обязателен при `ok=1` (`M-99` §4 п.4 + T2-контракт `M-74`). Без
+    //     него / не 64 СТРОЧНЫХ hex — `Unparseable`: состояние не доказывает действия.
+    //     Заглавные hex — `Unparseable` (писатель отпечатка — строчный; `R-263` Н-3).
+    match v.get("digest").and_then(serde_json::Value::as_str) {
+        Some(d)
+            if is_64_hex(d)
+                && d.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()) => {}
+        _ => return RestoreDrillVerdict::Unparseable,
+    };
+
+    // (6) `events_read == 0` ИЛИ поля нет — `Empty` (нет доказательства чтения).
+    //     Поле `events_read` ОБЯЗАТЕЛЬНО по T2-контракту; отсутствие трактуется как
+    //     «явный ноль» — оба пути дают `Empty`, а не `Unparseable` (`R-263` Н-1).
+    match v.get("events_read") {
+        Some(serde_json::Value::Number(n)) if n.as_u64() == Some(0) => {
+            return RestoreDrillVerdict::Empty;
+        }
+        Some(serde_json::Value::Number(n)) if n.as_u64().is_some() => {}
+        // Поля нет, или это не число, или не u64 — оба дают `Empty` по §5.
+        _ => return RestoreDrillVerdict::Empty,
+    }
+
+    // (7) `ts_wall_ms > now` — `FromFuture` (часы сбиты либо файл подложен). Это
+    //     РАНЬШЕ `Stale`: метка из будущего подозрительнее просроченной. И РАНЬШЕ
+    //     `Empty`: по таблице §5 приоритет Empty выше FromFuture.
     if ts_wall_ms > now_wall_ms {
         return RestoreDrillVerdict::FromFuture;
     }
 
-    // (6) `digest` обязателен при `ok=1` (`M-99` §4 п.4 + T2-контракт `M-74`). Без
-    //     него / не 64-hex — `Unparseable`: состояние не доказывает действия.
-    match v.get("digest").and_then(serde_json::Value::as_str) {
-        Some(d) if is_64_hex(d) => {}
-        _ => return RestoreDrillVerdict::Unparseable,
-    };
-
-    // (7) `events_read == 0` (или поля нет) — `Empty`. Поле `events_read` ОБЯЗАТЕЛЬНО
-    //     по T2-контракту; отсутствие — `Unparseable` (контракт не выполнен), ноль —
-    //     `Empty` (контракт выполнен, но доказано «ничего не прочитано»).
-    match v.get("events_read").and_then(serde_json::Value::as_u64) {
-        Some(0) => return RestoreDrillVerdict::Empty,
-        Some(_) => {}
-        None => return RestoreDrillVerdict::Unparseable,
-    };
-
-    // (8) `now - ts_wall_ms > RESTORE_DRILL_FRESH_WINDOW_MS` — `Stale`. Ровно на
-    //     границе (`== window`) ещё `Ok`; на 1 мс за границей — `Stale`. Это
-    //     симметрия проверяется оракулом v2 (`red_m99_restore_drill_watch`).
-    if now_wall_ms - ts_wall_ms > RESTORE_DRILL_FRESH_WINDOW_MS {
+    // (8) `now - ts_wall_ms > RESTORE_DRILL_FRESH_WINDOW_MS` — `Stale`. Разность
+    //     через `saturating_sub` (метка `i64::MIN` даёт `Stale`, не панику и не
+    //     `Ok` — `R-263` Н-2). Ровно на границе (`== window`) ещё `Ok`; на 1 мс за
+    //     границей — `Stale`. Симметрия проверяется оракулом v2.
+    if now_wall_ms.saturating_sub(ts_wall_ms) > RESTORE_DRILL_FRESH_WINDOW_MS {
         return RestoreDrillVerdict::Stale;
     }
 
