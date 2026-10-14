@@ -284,16 +284,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_args_requires_dir() {
-        // Пустой argv → ошибка.
-        let prev = std::env::args().collect::<Vec<_>>();
-        let prev = format!("{:?}", prev); // сохранить форму, чтобы компилятор не считал dead-code
-        let _ = prev;
-        // Здесь без полноценного `argv` не подменишь — пропускаем «правовой» чек и
-        // проверяем флаг-узнавание:
-    }
-
-    #[test]
     fn empty_result_serialises_with_all_six_fields() {
         let r = DrillResult::empty();
         // шесть полей по контракту: `C-217` N-1 — проверка формой.
