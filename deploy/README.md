@@ -902,11 +902,12 @@ HFT_CRON_PRINT_ARGV=1 /root/hft-platform/deploy/bin/gateway-checkpoint-cron.sh
 
 `deploy/bin/journal-restore-drill-cron.sh` зовётся из `deploy/cron.d/journal-restore-drill`
 (13 3 13 * * — раз в месяц, 03:13 UTC) и проверяет читаемость офсайт-копии
-(Storage Box, `OPS-I-3`): скачивает ВЫБОРКУ из трёх сегментов (первый / `floor(N/2)` /
+(Storage Box, `OPS-I-3`): через ДВУХОПЕРАЦИОННЫЙ ШОВ делает ЛИСТИНГ корня копии и ВЫБОРКУ
+ОДНОГО файла (`M-99` §4 п.7), скачивает ВЫБОРКУ из трёх сегментов (первый / `floor(N/2)` /
 последний по индексу; обе формы выбранного индекса, если обе есть в копии), читает её
-прод-читателем `journal-drill-read` (внутри образа `hft-recorder`, `--network none`,
-bind-mount `:ro`), пишет файл состояния `/var/lib/hft/journal-restore-drill.json`.
-Этот файл читают ОБА потребителя:
+прод-читателем `journal-drill-read` (внутри образа recorder'а, `--network none`,
+bind-mount `:ro`), пишет файл состояния
+`/var/lib/hft/drill-state/journal-restore-drill.json`. Этот файл читают ОБА потребителя:
 
 | Потребитель | Что делает |
 |---|---|
@@ -915,49 +916,71 @@ bind-mount `:ro`), пишет файл состояния `/var/lib/hft/journal-
 
 ## Безопасность копии — три ограничения, НАЗВАННЫХ ЯВНО
 
-1. **drill ТОЛЬКО ЧИТАЕТ с Storage Box.** Ни `rsync --delete`, ни любого `--delete-*` /
-   `--remove-source-files`, ни удаления/переименования на стороне коробки. `П-023`: один
+1. **drill ТОЛЬКО ЧИТАЕТ с Storage Box.** Никаких записывающих команд rsync
+   (удаляющих флагов, `--remove-source-files`), ни масок на стороне коробки,
+   ни удаления/переименования на стороне коробки. Коробка видит ровно `ls <путь>`
+   и `rsync --server --sender … <один файл>` (`M-99` §4 п.7, `A-055` §3). `П-023`: один
    ключ способен снести и оригинал, и копию; команда создания = команда уничтожения.
 2. **drill ВОССТАНАВЛИВАЕТ В ОТДЕЛЬНЫЙ КАТАЛОГ** (`${JOURNAL_DRILL_RESTORE:-/var/lib/hft/restore-drill}`),
    НЕ в каталог журнала и НЕ в том `hft-platform_journal-data`. Проверка бэкапа не
    должна становиться риском для оригинала.
-3. **flock -n** на lock-файле `/var/lock/hft-journal-restore-drill.lock` — non-blocking.
-   Пропустить тик безопаснее, чем копить очередь процессов.
+3. **`flock -n`** на lock-файле `/var/lock/hft-journal-restore-drill.lock` —
+   `flock` держит ТОЛЬКО обёртка, строка cron'а зовёт её без `flock` (`M-99` §4 п.8,
+   `R-263` Б-2). Занятый замок ⇒ тик пропущен БЕЗ СЛЕДА (`exit 0`, новая строка
+   `SKIP` без `ALERT`, состояние и каталог восстановления побайтно прежние, файл
+   тревоги не тронут) — это НЕ тревога (наложение будит оператора на ровном месте).
+   `-n` обязателен, иначе обёртка висит в ожидании и копит очередь процессов.
+
+## Шов `JOURNAL_DRILL_SSH` — единственная точка ssh-команды (`M-99` §4 п.7)
+
+Дефолт (прод): `ssh -i /root/.ssh/storagebox -o IdentitiesOnly=yes -o BatchMode=yes -o
+ConnectTimeout=10 -p 23`. Листинг — `${JOURNAL_DRILL_SSH} <user@host> ls <путь>`.
+Выборка ОДНОГО файла — `rsync --archive -e "${JOURNAL_DRILL_SSH}" <user@host>:<путь>/<имя>
+<RESTORE>/`. Строка cron'а НЕ задаёт `JOURNAL_DRILL_SSH`/`JOURNAL_DRILL_REMOTE` —
+дефолт живёт в обёртке (`A-055` §5.5, `M-99` §7 Запрещено).
+
+Каждый вызов обращается к точке из `${JOURNAL_DRILL_COLD%%:*}` (`U@host` или
+`-l U host`, `A-055` §3); никаких `-J`/`-F`/`-o ProxyCommand=…`, меняющих точку
+соединения. Опции `-l`/`-p`/`-i`/`-o` пропускаются нормализатором; хост без
+пользователя — отказ.
 
 ## Шов `JOURNAL_DRILL_READER` — подмена для гейта, на прод-драйв — стандарт
 
 Дефолт (прод): `docker run --rm --network none -v <RESTORE>:<RESTORE>:ro
---entrypoint /usr/local/bin/journal-drill-read hft-recorder`. Образ работающего recorder'а
-— и есть прод-код; монтирование по тому же пути — `--dir` одинаков снаружи и внутри;
-нет сети — читатель только читает.
+--entrypoint /usr/local/bin/journal-drill-read <image сервиса recorder в
+docker-compose.yml>`. На проде сегодня это `hft-platform-recorder:local`
+(`image:` сервиса `recorder` в `docker-compose.yml`, §4 п.9). `--network none` —
+читатель не ходит в сеть; `-v <RESTORE>:<RESTORE>:ro` — bind-mount по тому же пути,
+что и `--dir` (`M-99` §4 п.3, `A-055` §5.5).
 
-Оператор может подменить через `JOURNAL_DRILL_READER`. Гейт `verify_M-99.sh` подставляет
+Оператор может подменить через `JOURNAL_DRILL_READER` (полная команда) или
+`JOURNAL_DRILL_READER_IMAGE` (только имя образа). Гейт `verify_M-99.sh` подставляет
 ПРЯМОЙ бинарь (на фикстуре в локальной песочнице) — обёртка ОБЯЗАНА вызвать ровно его и
 взять исход у него, иначе проба краснеет (`M-74` §«Контракт обёртки»).
 
 ## Алгоритм — короткий
 
-1. **Доставка.** `TRANSPORT=remote` → ssh-rsync с Storage Box; `TRANSPORT=local` →
-   уже лежит рядом (проба). Дефолт — `remote`.
+1. **Доставка.** `TRANSPORT=remote` → шов `JOURNAL_DRILL_SSH` (листинг + выборка
+   ОДНОГО файла через `rsync --archive -e`); `TRANSPORT=local` → `ls`/`cp` (проба).
+   Дефолт — `remote`. Отказ листинга или ЛЮБОЙ выборки ⇒ `ok=0`, причина
+   `transport-failed`, код 5 (`M-99` §4 п.7, `A-055` §5.1/§5.2).
 2. **Отбор.** Из листинга извлекаются ИНДЕКСЫ (`segment-NNNNNNNN.jrnl[.zst]` ⇒ один
    индекс), сортируются и дедуплицируются. Берутся первый, `floor(N/2)`-й и последний.
    Алгоритм ДЕТЕРМИНИРОВАННЫЙ: drill воспроизводим по своему логу, никакого `$RANDOM`.
-3. **Sidecar'ы.** `journal.legacy.json` + `journal.replay-digest.json` (замер 2026-10-10)
-   проверяются на непустоту.
-4. **УНИЧТОЖЕНИЕ источника** (`M-99` §4 п.1). После доставки каталог `RESTORE` (бывший
-   источник на ЛОКАЛЬНОЙ стороне) `mv`'ается в `RESTORE.source.PID`; `RESTORE` создаётся
-   заново ПУСТЫМ. inotify-сторож в окне `[уничтожение, конец чтения]` ловит появление
-   `cold`-имени в источнике → `source-stayed-present` ⇒ отказ. На проде источник — Storage
-   Box, удалять с него НЕЛЬЗЯ; уничтожение локальной копии — мера по построению, а не
-   страж (`C-219` B-1).
-5. **Чтение.** `${READER} --dir <RESTORE> --min-events 1`. Машинный контракт выхода
+3. **Sidecar'ы.** `*.json` корня копии (`journal.legacy.json` +
+   `journal.replay-digest.json`, замер 2026-10-10) доставляются той же выборкой
+   ОДНОГО файла и проверяются на непустоту (`M-99` §4 п.2).
+4. **Чтение.** `${READER} --dir <RESTORE> --min-events 1`. Машинный контракт выхода
    (`M-74` §«Сигнатура читателя»): `0` успех / `4` чтение (порча) / `5` пустота
    (доставка молча) / `6` контекст (`is_foreign_segment`).
-6. **Состояние.** Атомарно (`tmp` → `rename`) пишется JSON:
+5. **Состояние.** Атомарно (`tmp` → `rename`) пишется JSON в
+   `/var/lib/hft/drill-state/journal-restore-drill.json`:
    `{"ok":0|1,"ts_wall_ms":…,"checked":N,"events_read":…,"digest":"<64 hex>","reason":"…"}`.
    `ok=1` БЕЗ 64-hex `digest` ⇒ отказ (T2-контракт: «`digest` обязателен при `ok=1`»,
    `M-99` §4 п.4). `intra_segment_continuous=false` ⇒ отказ (`M-99` §3 «Семантика
-   непрерывности — внутри сегмента»).
+   непрерывности — внутри сегмента»). Каталог состояния `/var/lib/hft/drill-state/`
+   монтируется в `recorder` по тому же пути `:ro` (`M-99` §4 п.10,
+   `docker-compose.yml`).
 
 ## Операторские ручки cron-обёртки
 
@@ -965,10 +988,11 @@ bind-mount `:ro`), пишет файл состояния `/var/lib/hft/journal-
 |---|---|---|
 | `JOURNAL_DRILL_COLD` | корень холодной копии | `u659392-sub1@…:journal` |
 | `JOURNAL_DRILL_RESTORE` | каталог восстановления, ОТДЕЛЬНЫЙ от боевого | `/var/lib/hft/restore-drill` |
-| `JOURNAL_DRILL_STATE` | файл состояния (тот же путь читает сторож и recorder) | `/var/lib/hft/journal-restore-drill.json` |
+| `JOURNAL_DRILL_STATE` | файл состояния (тот же путь читает сторож и recorder) | `/var/lib/hft/drill-state/journal-restore-drill.json` |
 | `JOURNAL_DRILL_TRANSPORT` | `remote` (ssh на Storage Box) / `local` (проба) | `remote` |
-| `JOURNAL_DRILL_REMOTE` | транспорт для `remote` | `ssh -i /root/.ssh/storagebox -p 23` |
-| `JOURNAL_DRILL_READER` | шов читателя | `docker run --rm --network none -v <RESTORE>:<RESTORE>:ro --entrypoint /usr/local/bin/journal-drill-read hft-recorder` |
+| `JOURNAL_DRILL_SSH` | ssh-команда для шва (заменяет `JOURNAL_DRILL_REMOTE` круга 1; в cron'е НЕ задаётся) | `ssh -i /root/.ssh/storagebox -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=10 -p 23` |
+| `JOURNAL_DRILL_READER_IMAGE` | имя образа читателя (берётся из `image:` recorder'а) | `hft-platform-recorder:local` |
+| `JOURNAL_DRILL_READER` | шов читателя (полная команда) | `docker run --rm --network none -v <RESTORE>:<RESTORE>:ro --entrypoint /usr/local/bin/journal-drill-read <JOURNAL_DRILL_READER_IMAGE>` |
 | `JOURNAL_DRILL_LOG` | лог | `/var/log/hft/journal-restore-drill.log` |
 | `JOURNAL_DRILL_ALERT_FILE` | `<job>.alert` для монитора | `/var/lib/hft/journal-restore-drill.alert` |
 | `JOURNAL_DRILL_LOCK` | lock-файл (flock) | `/var/lock/hft-journal-restore-drill.lock` |
@@ -1007,7 +1031,7 @@ rm /var/lib/hft/journal-restore-drill.alert
 HFT_CRON_PRINT_ARGV=1 bash /root/hft-platform/deploy/bin/journal-restore-drill-cron.sh
 # Ожидание: RESTORE_DIR/READER_DIR/COLD/TRANSPORT/STATE/READER — все непустые.
 JOURNAL_DRILL_TRANSPORT=remote bash /root/hft-platform/deploy/bin/journal-restore-drill-cron.sh
-# Ожидание: exit=0, файл /var/lib/hft/journal-restore-drill.json содержит ok=1,
+# Ожидание: exit=0, файл /var/lib/hft/drill-state/journal-restore-drill.json содержит ok=1,
 # digest (64 hex), events_read >= 1.
 ls -la /var/lib/hft/restore-drill/  # должны быть три выбранных сегмента + sidecar'ы
 journal-drill-read --dir /var/lib/hft/restore-drill --min-events 1
