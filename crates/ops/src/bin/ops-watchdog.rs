@@ -22,7 +22,7 @@
 //!     `/var/lib/docker/volumes/hft-platform_gateway-state/_data/gateway-serve.heartbeat`)
 //!   - `WATCHDOG_RESTORE_DRILL_STATE` (default
 //!     `ops::restore_drill::DEFAULT_RESTORE_DRILL_STATE` =
-//!     `/var/lib/hft/journal-restore-drill.json`)
+//!     `/var/lib/hft/drill-state/journal-restore-drill.json`)
 //!     — файл состояния `M-99` drill'а; `Missing` ⇒ `WD-RESTORE-DRILL` CRITICAL
 //!     на первом же такте до первого прогона.
 //!   - `WATCHDOG_CRON_DIR` (default `/var/lib/hft`) — сканирует пары
