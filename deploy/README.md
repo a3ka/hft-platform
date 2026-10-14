@@ -977,8 +977,10 @@ docker-compose.yml>`. На проде сегодня это `hft-platform-record
    `/var/lib/hft/drill-state/journal-restore-drill.json`:
    `{"ok":0|1,"ts_wall_ms":…,"checked":N,"events_read":…,"digest":"<64 hex>","reason":"…"}`.
    `ok=1` БЕЗ 64-hex `digest` ⇒ отказ (T2-контракт: «`digest` обязателен при `ok=1`»,
-   `M-99` §4 п.4). `intra_segment_continuous=false` ⇒ отказ (`M-99` §3 «Семантика
-   непрерывности — внутри сегмента»). Каталог состояния `/var/lib/hft/drill-state/`
+   `M-99` §4 п.4; ворота протокола успеха §4 стр.11). `intra_segment_continuous=false` ⇒
+   отказ (`M-99` §3 «Семантика непрерывности — внутри сегмента»). Любое иное нарушение
+   протокола читателя на `rc=0` ⇒ `ok=0`, `digest=""`, причина `reader-protocol-violation`,
+   код 7 (состояние ЗАПИСАНО). Каталог состояния `/var/lib/hft/drill-state/`
    монтируется в `recorder` по тому же пути `:ro` (`M-99` §4 п.10,
    `docker-compose.yml`).
 
@@ -999,20 +1001,19 @@ docker-compose.yml>`. На проде сегодня это `hft-platform-record
 
 ## Разбор вердикта drill'а (файл состояния)
 
-Поле `reason` ОБЯЗАТЕЛЬНО при `ok=0` и обязано различаться:
+Поле `reason` ОБЯЗАТЕЛЬНО при `ok=0` и обязано различаться. Список — ровно те причины, что
+пишет обёртка `deploy/bin/journal-restore-drill-cron.sh` (ворота протокола успеха `M-99`
+§4 стр.11):
 
 | `reason` | Что лечить |
 |---|---|
 | `transport-failed` | ssh/rsync на Storage Box отказал; проверить ключ `/root/.ssh/storagebox`, сеть, `u659392-sub1@…` |
 | `cold-empty` | в копии <3 индексов — нечего выбирать; проверить, что offsite доехал (`journal-offsite.alert`) |
-| `sidecars-missing` | один из sidecar'ов (`journal.legacy.json` / `journal.replay-digest.json`) пуст/отсутствует — пробуй `rsync` руками |
 | `reader-rc-4 (corrupt — порча байт/crc/zstd)` | сегмент копии повреждён; перезалить копию с офсайта, проверить sha256 |
 | `reader-rc-5 (empty — копия не привезла событий)` | доставка молча ничего не привезла (права, сеть, фильтр); разбор доставки |
 | `reader-rc-6 (foreign — сегмент без магии и без декларации)` | сегмент без магии и без валидной декларации; на наших данных недостижимо, расследовать источник |
-| `intra-segment-gap` | дыра ВНУТРИ сегмента (не сквозная — сквозная на выборке невозможна по построению); порча на стороне коробки |
-| `missing-digest-on-success` | читатель назвал ok=1 без 64-hex digest; невозможно на нашем `journal-drill-read`, расследовать вручную |
-| `source-stayed-present` | (закрытая по построению атака) источник появился в окне чтения — расследование |
-| `transport-failed` (DRILL_REMOTE вариант) | то же, что transport-failed; см. выше |
+| `intra-segment-gap` | дыра ВНУТРИ сегмента (читатель ДОКАЗУЕМО нашёл её); порча на стороне коробки |
+| `reader-protocol-violation` | `rc=0` от читателя, но протокол успеха неполон: `digest` не 64 строчных hex, или нет `digest`, или `events_read=0`/нет поля, или `intra_segment_continuous` не `true`/нет поля. Не сочинять `ok=1` без `digest` (T2-контракт `M-74`, `M-99` §7, `R-266` Б-1, `A-056` §4.1). Состояние ЗАПИСАНО с `ok=0`, `digest=""`, код выхода обёртки — 7 |
 
 После починки: `rm /var/lib/hft/journal-restore-drill.alert` (зачистка маркера), следующий
 прогон сам перепишет state.
@@ -1034,7 +1035,15 @@ JOURNAL_DRILL_TRANSPORT=remote bash /root/hft-platform/deploy/bin/journal-restor
 # Ожидание: exit=0, файл /var/lib/hft/drill-state/journal-restore-drill.json содержит ok=1,
 # digest (64 hex), events_read >= 1.
 ls -la /var/lib/hft/restore-drill/  # должны быть три выбранных сегмента + sidecar'ы
-journal-drill-read --dir /var/lib/hft/restore-drill --min-events 1
+
+# Ручное ПЕРЕчитывание читателем — бинарь `journal-drill-read` живёт ТОЛЬКО в прод-образе
+# (`hft-platform-recorder:local`); на хосте его нет (нет rust-toolchain'а, не собираем).
+# Запуск — через тот же шов, что у обёртки, БЕЗ переноса бинаря в хост.
+docker run --rm --network none \
+    -v /var/lib/hft/restore-drill:/var/lib/hft/restore-drill:ro \
+    --entrypoint /usr/local/bin/journal-drill-read \
+    hft-platform-recorder:local \
+    --dir /var/lib/hft/restore-drill --min-events 1
 # Ожидание: JSON с тем же digest, что в файле состояния.
 ```
 
@@ -1047,6 +1056,9 @@ journal-drill-read --dir /var/lib/hft/restore-drill --min-events 1
   `digest` (продукт действия, не декларация).
 - **Не делать drill пройденным при `ok=1` без `digest`.** T2-контракт M-74: «`digest`
   обязателен при `ok=1`». Без него состояние = заявление о действии (класс `C-191`).
+  Ворота протокола успеха обёртки (`M-99` §4 стр.11): `rc=0` И полный протокол —
+  `digest` ровно 64 строчных hex, `events_read` ≥ 1, `intra_segment_continuous=true`.
+  Иначе `ok=0`, причина `reader-protocol-violation`, код 7.
 - **Не делать прогон drill'а условием удаления** (связывать с `M-92`). Изменение
   механизма необратимого удаления — отдельный предмет с RAW-гейтом; здесь не
   предлагается.
