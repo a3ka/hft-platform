@@ -16,7 +16,9 @@ COPY crates ./crates
 # прода (M-46 §7: `docker run --rm --network container:hft-gateway-serve <образ> wsprobe ...`).
 # Без этой строки образ не получает бинарь и sidecar-прогон невыполним (находка architect'а).
 # M-99 (задача 2b): `journal-drill-read` — прод-читатель restore-drill'а (обёртка
-# `journal-restore-drill-cron.sh` зовёт его из образа `hft-recorder` через `--entrypoint`,
+# `journal-restore-drill-cron.sh` зовёт его из образа сервиса `recorder` —
+# значение `image:` сервиса `recorder` в `docker-compose.yml`, сегодня
+# `hft-platform-recorder:local` — через `--entrypoint`,
 # `--network none` и bind-mount `--dir`; см. `deploy/bin/journal-restore-drill-cron.sh`).
 # Без `--bin journal-drill-read` бинарь НЕ попадает в сторону, и обёртка не сможет его
 # позвать; COPY ниже идёт ПОСЛЕ сборки.
@@ -34,7 +36,8 @@ VOLUME ["/journal"]
 COPY --from=builder /build/target/release/recorder /usr/local/bin/recorder
 COPY --from=builder /build/target/release/journal-retention /usr/local/bin/journal-retention
 # M-99 (задача 2b): `journal-drill-read` в прод-образе. Обёртка зовёт его из
-# образа работающего `hft-recorder` через `--entrypoint /usr/local/bin/journal-drill-read`
+# образа сервиса `recorder` (значение `image:` сервиса `recorder` в `docker-compose.yml`,
+# сегодня `hft-platform-recorder:local`) через `--entrypoint /usr/local/bin/journal-drill-read`
 # (см. `deploy/bin/journal-restore-drill-cron.sh`). Без COPY бинарь недоступен в
 # прод-образе, и cron-обёртка упадёт на отсутствии файла. Меньше, чем здесь,
 # наталкивает на класс «`testing.md` §Механизм несущего пути, п.3».
