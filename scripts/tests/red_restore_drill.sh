@@ -669,11 +669,26 @@ if [ "${CHECKED}" -eq 0 ]; then write_state 0 0 "" "cold-empty" 0; exit 5; fi
 # ── ЧТЕНИЕ: исход берётся У ЧИТАТЕЛЯ, а не сочиняется ────────────────────────────
 OUT="$(${READER} --dir "${RESTORE}" --min-events 1 2>&1)"; RC=$?
 EV="$(printf '%s' "${OUT}" | sed -n 's/.*"events_read":\([0-9]*\).*/\1/p' | head -1)"
-DG="$(printf '%s' "${OUT}" | sed -n 's/.*"digest"[[:space:]]*:[[:space:]]*"\([0-9a-f]\{64\}\)".*/\1/p' | head -1)"
+# Отпечаток берётся СЫРЫМ (любое содержимое кавычек) и судится целиком ниже: выборка «только
+# 64 строчных hex» превращала заглавный/короткий отпечаток в пустой — и обёртка не могла
+# отличить «читатель не дал отпечаток» от «дал не тот» (`A-056` §3).
+DG="$(printf '%s' "${OUT}" | sed -n 's/.*"digest"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
+INTRA="$(printf '%s' "${OUT}" | sed -n 's/.*"intra_segment_continuous":[[:space:]]*\(true\|false\).*/\1/p' | head -1)"
 if [ "${RC}" -ne 0 ]; then
   write_state 0 "${EV:-0}" "" "reader-rc-${RC}" "${CHECKED}"; exit "${RC}"
 fi
-write_state 1 "${EV:-0}" "${DG}" "" "${CHECKED}"
+# Читатель НАШЁЛ дыру внутри сегмента — его собственный диагноз (`M-74` «Дополнительный fail-closed»).
+if [ "${INTRA}" = "false" ]; then
+  write_state 0 "${EV:-0}" "" "intra-segment-gap" "${CHECKED}"; exit 4
+fi
+# ВОРОТА ПРОТОКОЛА УСПЕХА (`M-99` §4 стр.11, `A-056` §4.1): `ok=1` — ТОЛЬКО при `rc=0` И полном
+# протоколе: отпечаток ровно 64 строчных hex, `events_read` ≥ 1, `intra_segment_continuous=true`.
+# Иное при `rc=0` — противоречие читателя: ни успех, ни чужой класс сочинять нельзя.
+if ! printf '%s' "${DG}" | grep -qxE '[0-9a-f]{64}' \
+   || [ -z "${EV}" ] || [ "${EV}" -lt 1 ] || [ "${INTRA}" != "true" ]; then
+  write_state 0 "${EV:-0}" "" "reader-protocol-violation" "${CHECKED}"; exit 7
+fi
+write_state 1 "${EV}" "${DG}" "" "${CHECKED}"
 exit 0
 REF
   chmod +x "${w}"
@@ -1459,6 +1474,139 @@ elif ! printf '%s' " ${im_reader_full} " | grep -q ' --network none ' \
 (M-99 §4 п.3: читатель только читает и не ходит в сеть) — READER=«${im_reader_full}»"
 else
   pass "IM читатель по умолчанию — из образа recorder'а «${im_compose}», без сети, восстановление :ro"
+fi
+
+# ── RP — ВОРОТА ПРОТОКОЛА УСПЕХА на стороне ПИСАТЕЛЯ (`R-266` Б-1, `A-056` §4) ──────────────────
+# §7 запрещает писать `ok=1` без `digest`; до этого блока у запрета был оракул только на стороне
+# ПОТРЕБИТЕЛЯ (`v1`, `v4`, recorder), а прод-обёртка писала `{"ok":1,"digest":""}`. Класс —
+# «обёртка при протокольно-неверном выводе читателя на `rc=0`», не клетка «digest пуст»: девять
+# форм ниже (замер `A-056` §3). Норма (`M-99` §4 стр.11): `ok=1` ТОЛЬКО при `rc=0` И полном
+# протоколе — отпечаток 64 строчных hex, `events_read` ≥ 1, `intra_segment_continuous=true`; иначе
+# `ok=0`, `digest=""`, причина `reader-protocol-violation`, код 7, состояние ЗАПИСАНО.
+# Читатель здесь — ЗАГЛУШКА через шов `JOURNAL_DRILL_READER`: прод-читатель такого вывода не
+# производит никогда (`format!("{:x}")`), а судится ОБЁРТКА. Сценарии с прод-читателем не меняются.
+RP_REASON="reader-protocol-violation"; RP_CODE=7
+RP_DG="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+rp_run() { # $1=песочница $2=stdout читателя-заглушки $3=код заглушки → код обёртки
+  local wrapper="${DRILL}"
+  [ "${DRILL_PRESENT}" -eq 1 ] || wrapper="$(make_reference_wrapper "$1")"
+  printf '%s' "$2" > "$1/stub-reader.out"
+  cat > "$1/stub-reader.sh" <<STUBR
+#!/usr/bin/env bash
+: > '$1/stub-reader.called'
+cat '$1/stub-reader.out'
+exit $3
+STUBR
+  ( cd "$1" \
+    && JOURNAL_DRILL_COLD="$1/cold" JOURNAL_DRILL_RESTORE="$1/restore" \
+       JOURNAL_DRILL_STATE="$1/state/journal-restore-drill.json" \
+       JOURNAL_DRILL_TRANSPORT="local" JOURNAL_DRILL_READER="bash $1/stub-reader.sh" \
+       JOURNAL_DRILL_LOCK="$1/drill.lock" JOURNAL_DRILL_LOG="$1/drill-wrapper.log" \
+       JOURNAL_DRILL_ALERT_FILE="$1/drill.alert" \
+       bash "${wrapper}" >"$1/drill.log" 2>&1 )
+  local rc=$?
+  printf '%s' "${rc}" > "$1/drill.rc"
+  return "${rc}"
+}
+
+# Судья один на все формы и на самопроверку `RP-M`.
+rp_judge() { # $1=заглушка вызвана (0/1) $2=rc $3=ok $4=digest $5=reason → 0, если отказ по норме; RP_WHY
+  RP_WHY=""
+  if [ "$1" -ne 1 ]; then RP_WHY="SETUP: заглушка читателя НЕ ВЫЗВАНА — судился не тот вывод"
+  elif [ "$3" = "1" ]; then RP_WHY="объявлен УСПЕХ (ok=1, отпечаток «${4:0:12}…») на неполном протоколе читателя — запрет M-99 §7"
+  elif [ -z "$3" ]; then RP_WHY="состояние НЕ ЗАПИСАНО — отказ не виден потребителю до просрочки"
+  elif [ -n "$4" ]; then RP_WHY="отпечаток «${4:0:12}…» проброшен из неверного вывода при ok=0"
+  elif [ "$5" != "${RP_REASON}" ]; then RP_WHY="причина «${5:-∅}» вместо ${RP_REASON} — диагноз сочинён, читатель его не давал"
+  elif [ "$2" != "${RP_CODE}" ]; then RP_WHY="код ${2} вместо ${RP_CODE} (M-99 §4 стр.11)"
+  fi
+  [ -z "${RP_WHY}" ]
+}
+
+rp_line() { # $1=events_read|- $2=intra|- $3=digest|- → строка протокола; «-» = поле отсутствует
+  local o='{"segments_read":3,'
+  [ "$1" = "-" ] || o="${o}\"events_read\":$1,"
+  o="${o}\"seq_first\":1,\"seq_last\":41213,"
+  [ "$2" = "-" ] || o="${o}\"intra_segment_continuous\":$2,"
+  [ "$3" = "-" ] || o="${o}\"digest\":\"$3\","
+  printf '%s}\n' "${o%,}"
+}
+
+# Позитивный контроль ТОЙ ЖЕ заглушкой: полный протокол ⇒ ok=1, отпечаток побайтно заглушечный.
+make_fixture BOX_RP0 healthy
+rp_run "${BOX_RP0}" "$(rp_line 7 true "${RP_DG}")" 0; rp0_rc=$?
+rp0_ok="$(state_field "${BOX_RP0}" ok)"; rp0_dg="$(state_field "${BOX_RP0}" digest)"
+if [ ! -e "${BOX_RP0}/stub-reader.called" ]; then
+  fail "RP0 SETUP: заглушка читателя не вызвана — шов JOURNAL_DRILL_READER не исполнен"
+elif [ "${rp0_rc}" != "0" ] || [ "${rp0_ok}" != "1" ] || [ "${rp0_dg}" != "${RP_DG}" ]; then
+  fail "RP0 полный протокол заглушки НЕ дал успеха: rc=${rp0_rc}, ok=${rp0_ok:-∅}, отпечаток «${rp0_dg:0:12}…» \
+— без позитивного контроля отказы ниже ничего не доказывают"
+else
+  pass "RP0 полный протокол читателя-заглушки ⇒ ok=1, код 0, отпечаток взят у читателя побайтно"
+fi
+
+RP_UP="$(printf '%s' "${RP_DG}" | tr 'a-f' 'A-F')"
+# Одна фикстура на все формы; между прогонами СНИМАЮТСЯ состояние и маркер вызова — иначе
+# состояние прошлой формы маскировало бы «состояние не записано», а маркер — невызов заглушки.
+make_fixture BOX_RPX healthy
+rp_reset() { rm -f "$1/state/journal-restore-drill.json" "$1/stub-reader.called" "$1/drill.rc"; }
+rp_bad=""; rp_n=0
+while IFS='|' read -r name out; do
+  [ -n "${name}" ] || continue
+  rp_n=$((rp_n + 1))
+  rp_reset "${BOX_RPX}"
+  rp_run "${BOX_RPX}" "${out}" 0 </dev/null; rpx_rc=$?
+  rpx_called=0; [ -e "${BOX_RPX}/stub-reader.called" ] && rpx_called=1
+  if ! rp_judge "${rpx_called}" "${rpx_rc}" "$(state_field "${BOX_RPX}" ok)" \
+       "$(state_field "${BOX_RPX}" digest)" "$(state_field "${BOX_RPX}" reason)"; then
+    rp_bad="${rp_bad}
+      ${name}: ${RP_WHY}"
+  fi
+done <<RPFORMS
+digest-пуст|$(rp_line 7 true "")
+digest-заглавные|$(rp_line 7 true "${RP_UP}")
+digest-63-hex|$(rp_line 7 true "${RP_DG:1}")
+digest-не-hex|$(rp_line 7 true "$(printf 'z%.0s' $(seq 64))")
+digest-нет-поля|$(rp_line 7 true -)
+intra-нет-поля|$(rp_line 7 - "${RP_DG}")
+stdout-не-JSON|журнал прочитан успешно
+events_read=0|$(rp_line 0 true "${RP_DG}")
+events_read-нет-поля|$(rp_line - true "${RP_DG}")
+RPFORMS
+# Пустой stdout не проходит через `read` построчно — отдельный прогон.
+rp_n=$((rp_n + 1))
+BOX_RPE="${BOX_RPX}"; rp_reset "${BOX_RPE}"
+rp_run "${BOX_RPE}" "" 0; rpe_rc=$?
+rpe_called=0; [ -e "${BOX_RPE}/stub-reader.called" ] && rpe_called=1
+rp_judge "${rpe_called}" "${rpe_rc}" "$(state_field "${BOX_RPE}" ok)" \
+  "$(state_field "${BOX_RPE}" digest)" "$(state_field "${BOX_RPE}" reason)" \
+  || rp_bad="${rp_bad}
+      stdout-пуст: ${RP_WHY}"
+if [ "${rp_n}" -ne 10 ]; then
+  fail "RP SETUP: прогнано форм ${rp_n} вместо 10 — перечень не исполнен целиком"
+elif [ -n "${rp_bad}" ]; then
+  fail "RP обёртка на протокольно-неверном выводе читателя (rc=0) нарушает M-99 §4 стр.11 / §7:${rp_bad}"
+else
+  pass "RP 10 форм неверного вывода читателя при rc=0 ⇒ ok=0, без отпечатка, причина ${RP_REASON}, код ${RP_CODE}, состояние записано"
+fi
+
+# ── RP-M — САМОПРОВЕРКА судьи протокола (`A-056` §4.2 п.4) — на каждом прогоне ─────────────────
+rpm_missed=""
+rp_judge 1 7 0 "" "${RP_REASON}" || fail "RP-M SETUP: судья отверг ДОПУСТИМЫЙ отказ (${RP_WHY})"
+rp_judge 1 4 1 "" missing-digest-on-success           && rpm_missed="${rpm_missed} прод-обёртка-R-266"
+rp_judge 1 0 1 "" ""                                  && rpm_missed="${rpm_missed} прежний-эталон-ok=1"
+rp_judge 1 7 0 "" "reader-rc-4 (corrupt — порча байт/crc/zstd)" && rpm_missed="${rpm_missed} причина-reader-rc-4"
+rp_judge 1 4 0 "" intra-segment-gap                   && rpm_missed="${rpm_missed} причина-intra-segment-gap"
+rp_judge 1 0 0 "" "${RP_REASON}"                      && rpm_missed="${rpm_missed} код-0"
+rp_judge 1 7 0 "${RP_UP}" "${RP_REASON}"              && rpm_missed="${rpm_missed} отпечаток-проброшен"
+rp_judge 1 0 1 "${RP_DG}" ""                          && rpm_missed="${rpm_missed} ok=1-при-events_read=0"
+rp_judge 1 7 "" "" ""                                 && rpm_missed="${rpm_missed} состояние-не-записано"
+rp_judge 0 7 0 "" "${RP_REASON}"                      && rpm_missed="${rpm_missed} заглушка-не-вызвана"
+if [ -n "${rpm_missed}" ]; then
+  fail "RP-M судья протокола ПРИНЯЛ мутантов:${rpm_missed}"
+else
+  pass "RP-M судья протокола принял допустимый и отверг 9 мутантов (прод-обёртка R-266, прежний эталон, \
+чужие причины ×2, код 0, проброшенный отпечаток, ok=1 при нуле событий, состояние не записано, заглушка не вызвана)"
 fi
 
 
