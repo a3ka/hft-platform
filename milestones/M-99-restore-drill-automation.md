@@ -261,12 +261,12 @@ pub fn sample_restore_drill(metrics: &Metrics, state_path: &Path, now_wall_ms: i
 | # | Status | задача | зона | проверка |
 |---|---|---|---|---|
 | 1 | ✅ DONE (architect, этот набор) | проба `M-74` + закрытие `C-219` B-1/B-2 (§4 п.1–2), сценарии `A11`/`A12`/`A13`, мутационный контроль | architect | `red_restore_drill.sh` |
-| 2 | ⏳ OPEN | обёртка `deploy/bin/journal-restore-drill-cron.sh`: контракт `M-74` + §4 п.1–3; `flock`; пишет состояние атомарно (`tmp` → `rename`) | engine-dev | task2 гейта; проба `H`…`A13` против прод-обёртки |
-| 2b | ⏳ OPEN | читатель `journal-drill-read` + `Dockerfile` | engine-dev | task2b гейта; `N` пробы |
-| 3 | 🚧 COMPILE-RED | продюсер `backup_restore_drill_ok` через `ops::restore_drill` (§5), вызов из sampler-таска | architect RED → engine-dev | `red_restore_drill_metric` |
-| 4 | ⏳ OPEN | расписание раз в месяц `deploy/cron.d/journal-restore-drill` + runbook в `deploy/README.md` (ручной запуск, что делать при каждом вердикте) | engine-dev | task4 гейта |
-| 5 | 🚧 COMPILE-RED | просрочка = отказ (окно 40 суток с обеих сторон) | architect RED → engine-dev | `red_restore_drill_metric stale`, `red_m99_restore_drill_watch v2` |
-| 6 | 🚧 COMPILE-RED | сторож `WD-RESTORE-DRILL` (§5) | architect RED → engine-dev | `red_m99_restore_drill_watch` (`v1`…`v3`, `w1`…`w3`, `b1`) |
+| 2 | ✅ DONE (engine-dev, этот набор) | обёртка `deploy/bin/journal-restore-drill-cron.sh`: контракт `M-74` + §4 п.1–3; `flock`; пишет состояние атомарно (`tmp` → `rename`) | engine-dev | task2 гейта; проба `H`…`A13` против прод-обёртки |
+| 2b | ✅ DONE (engine-dev, этот набор) | читатель `journal-drill-read` + `Dockerfile` | engine-dev | task2b гейта; `N` пробы |
+| 3 | ✅ DONE (engine-dev, этот набор) | продюсер `backup_restore_drill_ok` через `ops::restore_drill` (§5), вызов из sampler-таска | architect RED → engine-dev | `red_restore_drill_metric` |
+| 4 | ✅ DONE (engine-dev, этот набор) | расписание раз в месяц `deploy/cron.d/journal-restore-drill` + runbook в `deploy/README.md` (ручной запуск, что делать при каждом вердикте) | engine-dev | task4 гейта |
+| 5 | ✅ DONE (engine-dev, этот набор) | просрочка = отказ (окно 40 суток с обеих сторон) | architect RED → engine-dev | `red_restore_drill_metric stale`, `red_m99_restore_drill_watch v2` |
+| 6 | ✅ DONE (engine-dev, этот набор) | сторож `WD-RESTORE-DRILL` (§5) | architect RED → engine-dev | `red_m99_restore_drill_watch` (`v1`…`v3`, `w1`…`w3`, `b1`) |
 | 7 | ✅ DONE (architect, этот набор) | шаг пробы в джобе `build-test` | architect | task7 гейта; `check_feature_oracles`-класс не нужен — шаг безусловный |
 | 8 | ⏳ OPEN | первый живой прогон на VPS `TRANSPORT=remote` ВРУЧНУЮ после деплоя (`A-032` §2.4): файл состояния + `ls -la` каталога восстановления + повторное чтение читателем + тик сторожа «норма» | reviewer (close-out) | `R-NNN` |
 
