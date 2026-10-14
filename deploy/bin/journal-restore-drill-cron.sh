@@ -8,32 +8,54 @@
 # ══ КОНТРАКТ, УНАСЛЕДОВАННЫЙ ИЗ M-74 БЕЗ ИЗМЕНЕНИЙ ══
 # T2-контракт файла состояния (поля и их обязательность) — `M-74` §«T2-контракт…».
 # Сигнатуры продюсера (`sample_restore_drill`) и читателя (`journal-drill-read` коды 0/1/4/5/6)
-# — там же, §«Сигнатура продюсера»/§«Сигнатура читателя».
+# — там же, §«Сигнатура продюсера»/«Сигнатура читателя».
 # Правило выборки (первый / `floor(N/2)` / последний индекс; обе формы выбранного индекса,
 # если обе есть) — §«Правило выборки». Алгоритм ОТБОРА — ДЕТЕРМИНИРОВАННЫЙ: индексы
 # извлекаются из ОБЕИХ форм имени, сортируются и дедуплицируются.
 #
 # ══ ЧТО ИЗМЕНЕНО ПРОТИВ M-74 — КАЖДОЕ СО СВОИМ ОСНОВАНИЕМ (M-99 §4) ══
-# (1) Источник УНИЧТОЖАЕТСЯ (`rm -rf`) — фикстура одноразова; ВСЁ окно
-#     `[уничтожение, конец чтения]` наблюдается inotify; появление `cold` в окне — отказ.
-#     Основание: `C-219` B-1 (наблюдатель, оставленный обёрткой, пересоздавал `cold`
-#     ссылкой на спрятанный источник).
-#     ПРИМЕЧАНИЕ: на проде источник — Storage Box, удалять С НЕГО НЕЛЬЗЯ (`M-99` §7
-#     Запрещено). Уничтожение применяется к ЛОКАЛЬНОЙ копии в `${RESTORE}` (после
-#     транспорта из Storage Box), не к удалённой стороне. На локальном транспорте
-#     (проба) источник — `${COLD}` (фикстура песочницы) — также НЕ трогается;
-#     проба сама делает `retire_source` для проверки INV-DELIVERY (`inv_delivery`).
+# (1) Источник НЕ ТРОГАЕТСЯ ОБЁРТКОЙ — ни до, ни после чтения. На проде источник —
+#     Storage Box, удалять С НЕГО НЕЛЬЗЯ (`M-99` §7 Запрещено). Каталог восстановления
+#     `${RESTORE}` ЖИВЁТ до следующего прогона (§4 «Каталог восстановления живёт до
+#     следующего прогона»). УНИЧТОЖЕНИЕ источника в ПРОБЕ делает сама проба
+#     (`scripts/tests/red_restore_drill.sh::retire_and_read_watched`) — её
+#     ответственность, не обёртки: проба следит за `cold` через inotify и судит
+#     `inv_delivery` по `d_after = d_live`. Уничтожение доставленного в `${RESTORE}`
+#     ПЕРЕД чтением — та ошибка круга 1 (`R-263` Б-1), на которую `RT` теперь КРАСЕН:
+#     мутант «прежнее переименование доставленного» ловится `RT` через `reader-rc-5
+#     (empty)`. Основание стража — `C-219` B-1 (наблюдатель, оставленный обёрткой,
+#     пересоздавал `cold` ссылкой на спрятанный источник): ответственность пробы, не
+#     обёртки.
 # (2) Sidecar'ы (`*.json` корня копии) восстанавливаются ПОБАЙТНО (sha256).
 #     Основание: `C-219` B-2 (пропуск и подмена sidecar'а проходили набор).
 # (3) Дефолт `READER` — `docker run --rm --network none -v <RESTORE>:<RESTORE>:ro
-#     --entrypoint /usr/local/bin/journal-drill-read <образ работающего hft-recorder>`.
-#     `HFT_CRON_PRINT_ARGV=1` дополнительно печатает `STATE=` и `READER=`.
+#     --entrypoint /usr/local/bin/journal-drill-read <image сервиса recorder в
+#     docker-compose.yml>` (R-263 Б-3). `HFT_CRON_PRINT_ARGV=1` дополнительно
+#     печатает `STATE=` и `READER=`. Имя образа берётся из `docker-compose.yml`
+#     (`image:` сервиса `recorder`); на проде сегодня — `hft-platform-recorder:local`.
 #     Основание: §4 п.3 (сервиса `journal-drill-read` в `docker-compose.yml` нет и не
 #     нужно: образ работающего recorder'а и есть прод-код).
 # (4) `ok=1` без 64-hex `digest` ⇒ `0` / тревога. Основание: T2-контракт M-74,
 #     `M-99` §4 п.4.
 # (5) + сторож `ops-watchdog` читает файл состояния ТЕМ ЖЕ отображением (§5). Основание:
 #     §2 п.5 (без потребителя на проде метрика — «built-not-wired»).
+# (6) Шов транспорта — ДВЕ операции (§4 п.7, `R-263` Б-1): **листинг** корня
+#     `${COLD%:*}` и **выборка ОДНОГО файла**. Листинг: `${JOURNAL_DRILL_SSH}
+#     <user@host> ls <путь>`. Выборка: `rsync --archive -e "${JOURNAL_DRILL_SSH}"
+#     <user@host>:<путь>/<имя> <RESTORE>/`. Ветки `local`/`remote` различаются
+#     ТОЛЬКО этими двумя операциями. `JOURNAL_DRILL_SSH` (дефолт `ssh -i
+#     /root/.ssh/storagebox -o IdentitiesOnly=yes -o BatchMode=yes -o
+#     ConnectTimeout=10 -p 23`) — единственная точка ssh-команды. Отказ листинга
+#     или любой выборки ⇒ `ok=0`, причина `transport-failed`, код 5.
+# (7) `flock -n` держит ТОЛЬКО обёртка (§4 п.8, `R-263` Б-2): строка cron'а зовёт
+#     обёртку без `flock`. Занятый замок ⇒ тик пропущен: (а) `exit 0`,
+#     (б) в логе — новая строка `SKIP` без `ALERT`, (в) состояние побайтно прежнее,
+#     (г) каталог восстановления побайтно прежний, (д) файл тревоги не тронут,
+#     (е) за ограниченное время (`-n` обязателен, иначе обёртка висит).
+# (8) Файл состояния — `/var/lib/hft/drill-state/journal-restore-drill.json`
+#     (§4 п.10, `R-263` Б-4): КАТАЛОГ отдельный от `/var/lib/hft` (том монтируется
+#     в контейнер recorder'а по тому же пути `:ro`). Обёртка пишет `tmp → rename`;
+#     bind-mount ФАЙЛА держал бы прежний inode и не увидел бы ни одной новой записи.
 #
 # ══ БЕЗОПАСНОСТЬ КОПИИ — те же три ограничения, что у offsite (deploy/bin/journal-offsite-cron.sh):
 # (a) НЕ пишем, НЕ удаляем, НЕ переименовываем на Storage Box — drill ТОЛЬКО читает.
@@ -59,14 +81,14 @@ set -uo pipefail
 if [ "${HFT_CRON_PRINT_ARGV:-0}" = "1" ]; then
   COLD="${JOURNAL_DRILL_COLD:-u659392-sub1@u659392-sub1.your-storagebox.de:journal}"
   RESTORE="${JOURNAL_DRILL_RESTORE:-/var/lib/hft/restore-drill}"
-  STATE="${JOURNAL_DRILL_STATE:-/var/lib/hft/journal-restore-drill.json}"
+  STATE="${JOURNAL_DRILL_STATE:-/var/lib/hft/drill-state/journal-restore-drill.json}"
   TRANSPORT="${JOURNAL_DRILL_TRANSPORT:-remote}"
-  # Дефолт reader'а — через работающий recorder-образ (M-99 §4 п.3):
-  #   `docker run --rm --network none -v <RESTORE>:<RESTORE>:ro
-  #    --entrypoint /usr/local/bin/journal-drill-read hft-recorder`
-  # Оператор может подменить через env `JOURNAL_DRILL_READER`; проба подменяет
-  # прямой бинарь (testing.md §«Шов для гейта»).
-  READER="${JOURNAL_DRILL_READER:-docker run --rm --network none -v ${RESTORE}:${RESTORE}:ro --entrypoint /usr/local/bin/journal-drill-read hft-recorder}"
+  # Образ читателя — `image:` сервиса recorder в `docker-compose.yml` (M-99 §4 п.3/п.9).
+  # Обёртка зовёт дефолт `docker run --rm --network none -v <RESTORE>:<RESTORE>:ro
+  # --entrypoint /usr/local/bin/journal-drill-read <image>`. На проде — `hft-platform-recorder:local`.
+  # (Тот же бинарь читателя в ОБРАЗЕ recorder'а, что и пишет журнал: прод-код — он.)
+  READER_IMAGE="${JOURNAL_DRILL_READER_IMAGE:-hft-platform-recorder:local}"
+  READER="${JOURNAL_DRILL_READER:-docker run --rm --network none -v ${RESTORE}:${RESTORE}:ro --entrypoint /usr/local/bin/journal-drill-read ${READER_IMAGE}}"
   printf 'RESTORE_DIR=%s
 READER_DIR=%s
 COLD=%s
@@ -82,17 +104,30 @@ fi
 # Дефолты — продовые (см. `deploy/README.md` §0, `docs/SESSION-HANDOFF.md §7`).
 COLD="${JOURNAL_DRILL_COLD:-u659392-sub1@u659392-sub1.your-storagebox.de:journal}"
 RESTORE="${JOURNAL_DRILL_RESTORE:-/var/lib/hft/restore-drill}"
-STATE="${JOURNAL_DRILL_STATE:-/var/lib/hft/journal-restore-drill.json}"
+# §4 п.10 (`R-263` Б-4): каталог `/var/lib/hft/drill-state/` ОТДЕЛЬНЫЙ от `/var/lib/hft`,
+# монтируется в recorder по тому же пути `:ro` (см. `docker-compose.yml`); обёртка пишет
+# `tmp → rename`, bind-mount ФАЙЛА держал бы прежний inode и не увидел бы новой записи.
+# Дефолт совпадает с `ops::restore_drill::DEFAULT_RESTORE_DRILL_STATE` — один литерал пути
+# на продюсера/потребителя; `verify_M-99.sh` (task #2/§4 п.10) сверяет по регулярке.
+STATE="${JOURNAL_DRILL_STATE:-/var/lib/hft/drill-state/journal-restore-drill.json}"
 TRANSPORT="${JOURNAL_DRILL_TRANSPORT:-remote}"
-READER="${JOURNAL_DRILL_READER:-docker run --rm --network none -v ${RESTORE}:${RESTORE}:ro --entrypoint /usr/local/bin/journal-drill-read hft-recorder}"
-# Шов транспорта (M-74 §«Контракт обёртки»). Проба гоняет TRANSPORT=local: копия лежит рядом
-# в фикстуре; remote — по сети с Storage Box. ПУСТОЙ `REMOTE` явно НЕ трактуется как
-# «локально» (там же §«JOURNAL_DRILL_TRANSPORT — отдельная переменная»): переменные
-# разведены намеренно.
-REMOTE_CMD="${JOURNAL_DRILL_REMOTE:-ssh -i /root/.ssh/storagebox -p 23}"
-# Логи и маркеры — пути из runbook'а deploy/README.md §5. Дефолты — прод; проба
-# (`scripts/tests/red_restore_drill.sh`) переопределяет через env в локальную
-# песочницу.
+# §4 п.3/п.9: образ — `image:` сервиса recorder в `docker-compose.yml`. На проде сегодня
+# `hft-platform-recorder:local`; оператор может подменить через `JOURNAL_DRILL_READER_IMAGE`.
+READER_IMAGE="${JOURNAL_DRILL_READER_IMAGE:-hft-platform-recorder:local}"
+# `--network none`: читатель не ходит в сеть (`M-99` §4 п.3, `A-055` §5.5).
+# `-v <RESTORE>:<RESTORE>:ro`: bind-mount по тому же пути, что и `--dir`; `:ro` —
+# `M-99` §4 п.3.
+READER="${JOURNAL_DRILL_READER:-docker run --rm --network none -v ${RESTORE}:${RESTORE}:ro --entrypoint /usr/local/bin/journal-drill-read ${READER_IMAGE}}"
+# §4 п.7 (`R-263` Б-1): ШОВ ТРАНСПОРТА — ДВЕ операции. `JOURNAL_DRILL_SSH` — единственная
+# точка ssh-команды (заменяет `JOURNAL_DRILL_REMOTE` круга 1; см. §7 «Запрещено»: cron-строка
+# НЕ задаёт `JOURNAL_DRILL_SSH`/`JOURNAL_DRILL_REMOTE` — дефолт живёт здесь).
+# Проба подменяет `JOURNAL_DRILL_SSH` на стаб-заглушку (`scripts/tests/red_restore_drill.sh`,
+# `make_ssh_stub`); она пропускает опции, отбрасывает хост и исполняет удалённую команду
+# локально, имитируя поведение коробки. ПУСТОЙ `REMOTE` явно НЕ трактуется как «локально»
+# (`M-74` §«JOURNAL_DRILL_TRANSPORT — отдельная переменная»): переменные разведены намеренно.
+SSH="${JOURNAL_DRILL_SSH:-ssh -i /root/.ssh/storagebox -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=10 -p 23}"
+# Логи и маркеры — пути из runbook'а deploy/README.md §0/§5. Дефолты — прод; проба
+# (`scripts/tests/red_restore_drill.sh`) переопределяет через env в локальную песочницу.
 LOG="${JOURNAL_DRILL_LOG:-/var/log/hft/journal-restore-drill.log}"
 ALERT_FILE="${JOURNAL_DRILL_ALERT_FILE:-/var/lib/hft/journal-restore-drill.alert}"
 LOCK_FILE="${JOURNAL_DRILL_LOCK:-/var/lock/hft-journal-restore-drill.lock}"
@@ -118,6 +153,11 @@ write_state() { # $1=ok $2=events_read $3=digest $4=reason $5=checked
 }
 
 # ── flock — non-blocking: пропустить тик безопаснее, чем копить очередь процессов ────
+# §4 п.8 (`R-263` Б-2, `A-055` §4): замок держит ТОЛЬКО обёртка; строка cron'а зовёт
+# её БЕЗ `flock`. Занятый замок ⇒ тик пропущен БЕЗ СЛЕДА по всем признакам:
+# (а) `exit 0`, (б) в логе новая строка `SKIP` без `ALERT`,
+# (в) состояние побайтно прежнее, (г) каталог восстановления побайтно прежний,
+# (д) за ограниченное время, (е) файл тревоги не тронут.
 exec 9>"${LOCK_FILE}" 2>/dev/null || { alert "не могу открыть lock-файл ${LOCK_FILE}"; exit 1; }
 if ! flock -n 9; then
   echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) SKIP предыдущий прогон ещё работает" >> "${LOG}" 2>/dev/null || true
@@ -125,8 +165,8 @@ if ! flock -n 9; then
 fi
 
 # ── Setup-валидация — сбой ДО доставки лучше, чем сбой ПОСЛЕ частичного восстановления ─
-if [ -z "${COLD}" ] || [ -z "${RESTORE}" ] || [ -z "${STATE}" ] || [ -z "${READER}" ]; then
-  alert "не задан один из обязательных параметров (COLD/RESTORE/STATE/READER)"
+if [ -z "${COLD}" ] || [ -z "${RESTORE}" ] || [ -z "${STATE}" ] || [ -z "${READER}" ] || [ -z "${SSH}" ]; then
+  alert "не задан один из обязательных параметров (COLD/RESTORE/STATE/READER/SSH)"
   exit 1
 fi
 
@@ -138,18 +178,27 @@ fi
 # прогона»).
 rm -rf "${RESTORE}" && mkdir -p "${RESTORE}"
 
+# Шов транспорта: две операции — листинг и выборка ОДНОГО файла (`M-99` §4 п.7, `R-263`
+# Б-1, `C-311` Б-1, `A-055` §3/§5.1/§5.2). `local`/`remote` различаются ТОЛЬКО этими
+# двумя функциями; всё после доставки — один код.
+HOSTPART="${COLD%%:*}"; RPATH="${COLD#*:}"
 if [ "${TRANSPORT}" = "remote" ]; then
-  # Шов транспорта (`M-74` §«A-032» §2.3): проба НЕ гоняет `remote` (`A-032` §2.1,
-  # `R-2`); только первый живой прогон на VPS с `TRANSPORT=remote` (`A-032` §2.4)
-  # доказывает перенос байтов по сети. Если ssh отказал — `Failed`-state с `rc=5`.
-  if ! ${REMOTE_CMD} "${COLD}" "${RESTORE}"; then
-    alert "transport-failed (ssh/rsync на Storage Box отказал)"
-    write_state 0 0 "" "transport-failed" 0
-    exit 5
-  fi
-  # remote-режим — каталог привёз ВСЮ копию; отбор ПО ИНДЕКСАМ ниже оставит только
-  # выбранные (невыбранные сегменты удаляются явным циклом).
+  # `remote`: коробка видит ровно `ls <путь>` и `rsync --server --sender … <один файл>`;
+  # никаких записывающих команд (запрещены удаляющие флаги rsync и маски на стороне
+  # коробки), никакого выкачивания копии целиком. Проба подменяет
+  # `JOURNAL_DRILL_SSH` на стаб
+  # (`make_ssh_stub`), который ЗАПИСЫВАЕТ argv (для судьи точки) и ИСПОЛНЯЕТ удалённую
+  # команду в каталоге песочницы — заглушка сети, не логики.
+  list_cold()  { ${SSH} "${HOSTPART}" ls "${RPATH}"; }
+  fetch_one()  { rsync --archive -e "${SSH}" "${HOSTPART}:${RPATH}/$1" "${RESTORE}/"; }
+else
+  list_cold()  { ls "${COLD}"; }
+  fetch_one()  { cp -p -- "${COLD}/$1" "${RESTORE}/"; }
 fi
+
+# Листинг — ДО выборки; отказ листинга ⇒ `transport-failed`, код 5 (`A-055` §5.1:
+# НЕ причина «cold-empty», НЕ код 7 — это тот класс «диагноз уводит не туда»).
+LISTING="$(list_cold)" || { alert "transport-failed (листинг ${COLD} отказал)"; write_state 0 0 "" "transport-failed" 0; exit 5; }
 
 # ── Отбор по ИНДЕКСАМ (детерминированный) — `M-74` §«Правило выборки» ─────────────────
 # Из листинга источника (COLD) извлекаются ИНДЕКСЫ (`segment-NNNNNNNN.jrnl` И
@@ -157,7 +206,7 @@ fi
 # дедуплицируется; берутся первый, `floor(N/2)`-й и последний. Для каждого выбранного
 # индекса восстанавливаются ОБЕ формы, если обе есть. Никакого `$RANDOM`: drill
 # воспроизводим по своему логу.
-ALL="$(ls "${COLD}" 2>/dev/null | sed -n 's/^segment-\([0-9]\{8\}\)\.jrnl\(\.zst\)\?$/\1/p' | sort -u)"
+ALL="$(printf '%s\n' "${LISTING}" | sed -n 's/^segment-\([0-9]\{8\}\)\.jrnl\(\.zst\)\?$/\1/p' | sort -u)"
 N="$(printf '%s\n' "${ALL}" | grep -c . || true)"
 if [ "${N:-0}" -lt 3 ]; then
   alert "cold-empty (в копии <3 индексов — drill не имеет выборки)"
@@ -167,80 +216,48 @@ fi
 MID=$(( (N + 1) / 2 ))
 IDX="$(printf '%s\n' "${ALL}" | sed -n "1p;${MID}p;${N}p" | sort -u)"
 
-# Копируем только ВЫБРАННЫЕ индексы (`local`-режим — точечная выборка; `remote` —
-# удаляем невыбранные после полной доставки). Каждый выбранный индекс — обе формы,
-# если обе есть.
+# Выборка ОДНОГО файла за вызов. Каждый выбранный индекс — обе формы, если обе есть.
+# Отказ ЛЮБОЙ выборки ⇒ `transport-failed`, код 5 (`A-055` §5.2: неполная доставка НЕ
+# есть `ok=1`, и причина читателя НЕ ставится — доставка не дошла до чтения).
 CHECKED=0
 for i in ${IDX}; do
-  for f in "${COLD}/segment-${i}.jrnl" "${COLD}/segment-${i}.jrnl.zst"; do
-    if [ -f "$f" ]; then
-      cp -p -- "$f" "${RESTORE}/" 2>/dev/null || true
+  for f in "segment-${i}.jrnl" "segment-${i}.jrnl.zst"; do
+    if printf '%s\n' "${LISTING}" | grep -qx -- "$f"; then
+      fetch_one "$f" || { alert "transport-failed (выборка ${f} отказала)"; write_state 0 0 "" "transport-failed" "${CHECKED}"; exit 5; }
     fi
   done
   CHECKED=$((CHECKED + 1))
 done
 
-# Sidecar'ы (`M-99` §4 п.2) — побайтная сверка. Копируем ИХ ЯВНО, отдельным
-# шагом, чтобы и в `local`, и в `remote` режимах доставка sidecar'ов была
-# одинаковой: проба (`scripts/tests/red_restore_drill.sh`) подменяет/удаляет
-# sidecar в `${RESTORE}` между шагами пробы, и эта проверка ловит расхождение.
-for _sc in "${COLD}"/*.json; do
-  [ -f "${_sc}" ] && cp -p -- "${_sc}" "${RESTORE}/" 2>/dev/null || true
+# Sidecar'ы (`M-99` §4 п.2) — побайтная сверка. Каждый `*.json` корня копии доставляется
+# ТОЙ ЖЕ выборкой ОДНОГО файла; проба (`A12`/`A13`) подменяет/удаляет sidecar между
+# шагами пробы, и эта проверка ловит расхождение.
+for _sc in $(printf '%s\n' "${LISTING}" | grep -E '^[^/]+\.json$'); do
+  fetch_one "${_sc}" || { alert "transport-failed (выборка sidecar ${_sc} отказала)"; write_state 0 0 "" "transport-failed" "${CHECKED}"; exit 5; }
 done
 
-# `remote` уже доставил всё в `${RESTORE}`; удаляем невыбранные сегменты.
-if [ "${TRANSPORT}" = "remote" ]; then
-  for i in ${ALL}; do
-    case " ${IDX} " in
-      *" $i "*) ;;
-      *)
-        rm -f "${RESTORE}/segment-${i}.jrnl" "${RESTORE}/segment-${i}.jrnl.zst" 2>/dev/null || true
-        ;;
-    esac
-  done
-fi
-
-# Sidecar'ы (`M-99` §4 п.2) — побайтная сверка. Доставка (ssh-rsync / cp) уже
-# привезла их копией (`*.json`); на стороне обёртки — проверка, что они есть и
-# не пусты. `cp` для local-режима и ssh-rsync для remote приносят их как часть
-# `*` — но в сценарии A12/A13 специально вырезают/подменяют, и эта проверка
-# ловит расхождение.
-SIDECARS_OK=1
-for _sc in journal.legacy.json journal.replay-digest.json; do
-  if [ ! -s "${RESTORE}/${_sc}" ]; then
-    SIDECARS_OK=0
-  fi
-done
-if [ "${SIDECARS_OK}" -ne 1 ]; then
-  alert "sidecars-missing (в копии нет одного из sidecar'ов)"
-  write_state 0 0 "" "sidecars-missing" "${CHECKED}"
+if [ "${CHECKED}" -eq 0 ]; then
+  alert "cold-empty (выборка пуста после отбора)"
+  write_state 0 0 "" "cold-empty" 0
   exit 5
 fi
 
-# ── УНИЧТОЖЕНИЕ источника (`M-99` §4 п.1) — фикстура одноразова; всё окно наблюдается ──
-# На проде источник — Storage Box; удалять С НЕГО НЕЛЬЗЯ (M-99 §7 Запрещено). Здесь
-# источник — ЛОКАЛЬНАЯ копия, доставленная в `${RESTORE}` (`cp -rp` выше): это уже
-# НАШИ байты, и их можно уничтожить после доставки. На local-режиме (проба) источник
-# — `${COLD}` фикстуры песочницы, и его трогать нельзя (проба сама делает
-# `retire_source` для проверки INV-DELIVERY через свой inotify).
+# ── ИСТОЧНИК ОСТАВЛЯЕТСЯ НЕТРОНУТЫМ (`M-99` §4 п.1 + §7 Запрещено) ──
+# Обёртка НЕ уничтожает ни источник, ни доставленное. На проде источник — Storage Box,
+# удалять С НЕГО НЕЛЬЗЯ; доставленное в `${RESTORE}` живёт до следующего прогона
+# (§4 «Каталог восстановления живёт до следующего прогона»). На local-транспорте
+# (проба) источник — `${COLD}` фикстуры песочницы: проба сама делает `retire_source`
+# (`scripts/tests/red_restore_drill.sh::retire_and_read_watched`) ДО проверки
+# `inv_delivery` — её забота, не наша. Читатель ниже зовётся на `${RESTORE}` с
+# доставленными байтами; источник к этому моменту может быть уничтожен ПРОБОЙ, и
+# `inv_delivery` судит, что `d_after = d_live` (тот же отпечаток, что был с источником)
+# — доставка держится.
 #
-# Реализация: `mv ${RESTORE} ${RESTORE}.source.PID` переименовывает каталог
-# доставленных файлов в «источник» (где они лежат); `mkdir -p ${RESTORE}` создаёт
-# НОВЫЙ пустой приёмник. Читатель ниже зовётся на ПУСТОЙ `${RESTORE}` — и НЕ сможет
-# прочитать ничего, потому что источник переименован. Это форма INV-DELIVERY:
-# без `mv` чистатель мог бы читать через символическую/жёсткую ссылку, через
-# bind-mount, через lazy passthrough — ровно класс `C-214`/`C-215`/`C-219` B-1.
-if [ "${TRANSPORT}" = "local" ]; then
-  # На local-транспорте доставка идёт из `${COLD}` (источник фикстуры), а
-  # доставленное — в `${RESTORE}`. Проба САМА следит за источником через свой
-  # inotify (`retire_and_read_watched`) — наша забота не нужна и контр-продуктивна
-  # (мы бы уничтожили её собственный источник).
-  :
-else
-  SOURCE_DIR="${RESTORE}.source.$$"
-  mv "${RESTORE}" "${SOURCE_DIR}"
-  mkdir -p "${RESTORE}"
-fi
+# (Сравни с предыдущей редакцией круга 1: `mv ${RESTORE} ${RESTORE}.source.$$`
+# уничтожал доставленное ПЕРЕД чтением — `restore` оказывался пустым, читатель
+# возвращал `rc=5 (empty)`, а `RT` оставался зелёным с причиной «копия не привезла
+# событий». Это та ловушка `R-263` Б-1, на которую `RT` теперь КРАСЕН — мутант
+# «прежнее переименование доставленного» падает на `RT` со ссылкой `reader-rc-5`.)
 
 # ── ЧТЕНИЕ: исход берётся У ЧИТАТЕЛЯ, а не сочиняется (`M-74` §«Контракт обёртки») ──
 # `READER` зовётся ИМЕННО так, как задан в env; никаких подмен. `--dir` РОВНО
@@ -260,7 +277,6 @@ if [ "${RC}" -ne 0 ]; then
     5) reason="reader-rc-5 (empty — копия не привезла событий)" ;;
     6) reason="reader-rc-6 (foreign — сегмент без магии и без декларации)" ;;
   esac
-  [ "${TRANSPORT}" != "local" ] && rm -rf "${SOURCE_DIR}" 2>/dev/null || true
   write_state 0 "${EV:-0}" "" "${reason}" "${CHECKED}"
   exit "${RC}"
 fi
@@ -270,7 +286,6 @@ fi
 # (три несмежных индекса). Дополнительный fail-closed здесь: `intra_segment_continuous=false`
 # на ТОЛЬКО ЧТО ПРОЧИТАННОМ drill'е ⇒ отказ, состояние `ok=0`.
 if [ "${INTRA}" != "true" ]; then
-  [ "${TRANSPORT}" != "local" ] && rm -rf "${SOURCE_DIR}" 2>/dev/null || true
   alert "intra-segment-gap (читатель доказуемо нашёл дыру ВНУТРИ сегмента)"
   write_state 0 "${EV:-0}" "" "intra-segment-gap" "${CHECKED}"
   exit 4
@@ -281,8 +296,6 @@ DIGEST_RE_OK=0
 if printf '%s' "${DG}" | grep -qE '^[0-9a-f]{64}$'; then
   DIGEST_RE_OK=1
 fi
-
-[ "${TRANSPORT}" != "local" ] && rm -rf "${SOURCE_DIR}" 2>/dev/null || true
 
 if [ "${DIGEST_RE_OK}" -ne 1 ]; then
   alert "ok-1-without-digest (читатель назвал ok=1 без 64-hex digest)"
