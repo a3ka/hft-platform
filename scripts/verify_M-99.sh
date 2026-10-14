@@ -107,6 +107,13 @@ chk "env -u JOURNAL_DRILL_READER HFT_CRON_PRINT_ARGV=1 bash ${DRILL} 2>/dev/null
 # весь транскрипт удалённых команд по белому списку + дерево копии побайтно то же (C-311 Б-1)
 chk "! grep -qE -- '--delete|(^|[^-])rm .*JOURNAL_DRILL_COLD' ${DRILL}"
 
+step "task #2c — ворота протокола успеха: ok=1 только при полном протоколе читателя (M-99 §4 стр.11, R-266 Б-1, A-056)"
+# ИСПОЛНЕНИЕМ ворота судит семейство RP пробы (task #1: RP0 / RP 10 форм / RP-M). Здесь — две
+# текстовые канарейки: прежняя ветка «ok=1 без отпечатка» удалена, объявленная причина есть; и
+# семейство RP не выпало из пробы (иначе task #1 зеленел бы без судьи писателя).
+chk "grep -q 'reader-protocol-violation' ${DRILL} && ! grep -q 'missing-digest-on-success' ${DRILL}"
+chk "grep -q '^rp_judge()' scripts/tests/red_restore_drill.sh && grep -q 'RP-M судья протокола' scripts/tests/red_restore_drill.sh"
+
 step "task #2b — читатель существует, различает коды, попадает в прод-образ"
 chk "test -f ${READER}"
 chk "d=\$(mktemp -d) && cargo run -q -p journal --bin journal-drill-read -- --dir \$d --min-events 1; rc=\$?; rm -rf \$d; [ \$rc -eq 5 ]"
