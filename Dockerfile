@@ -15,7 +15,14 @@ COPY crates ./crates
 # M-46 task #5a (engine-dev): `wsprobe` — read-only WS-харнесс для sidecar-прогона против
 # прода (M-46 §7: `docker run --rm --network container:hft-gateway-serve <образ> wsprobe ...`).
 # Без этой строки образ не получает бинарь и sidecar-прогон невыполним (находка architect'а).
-RUN cargo build --release --bin recorder --bin journal-retention --bin gateway-serve --bin gateway-checkpoint --bin wsprobe --bin ops-watchdog
+# M-99 (задача 2b): `journal-drill-read` — прод-читатель restore-drill'а (обёртка
+# `journal-restore-drill-cron.sh` зовёт его из образа сервиса `recorder` —
+# значение `image:` сервиса `recorder` в `docker-compose.yml`, сегодня
+# `hft-platform-recorder:local` — через `--entrypoint`,
+# `--network none` и bind-mount `--dir`; см. `deploy/bin/journal-restore-drill-cron.sh`).
+# Без `--bin journal-drill-read` бинарь НЕ попадает в сторону, и обёртка не сможет его
+# позвать; COPY ниже идёт ПОСЛЕ сборки.
+RUN cargo build --release --bin recorder --bin journal-retention --bin journal-drill-read --bin gateway-serve --bin gateway-checkpoint --bin wsprobe --bin ops-watchdog
 
 FROM debian:stable-slim
 # journal-том монтируется сюда; переживает редеплой контейнера (docs/06 §3, §7).
@@ -28,6 +35,13 @@ RUN mkdir -p /journal /cold
 VOLUME ["/journal"]
 COPY --from=builder /build/target/release/recorder /usr/local/bin/recorder
 COPY --from=builder /build/target/release/journal-retention /usr/local/bin/journal-retention
+# M-99 (задача 2b): `journal-drill-read` в прод-образе. Обёртка зовёт его из
+# образа сервиса `recorder` (значение `image:` сервиса `recorder` в `docker-compose.yml`,
+# сегодня `hft-platform-recorder:local`) через `--entrypoint /usr/local/bin/journal-drill-read`
+# (см. `deploy/bin/journal-restore-drill-cron.sh`). Без COPY бинарь недоступен в
+# прод-образе, и cron-обёртка упадёт на отсутствии файла. Меньше, чем здесь,
+# наталкивает на класс «`testing.md` §Механизм несущего пути, п.3».
+COPY --from=builder /build/target/release/journal-drill-read /usr/local/bin/journal-drill-read
 COPY --from=builder /build/target/release/gateway-serve /usr/local/bin/gateway-serve
 COPY --from=builder /build/target/release/gateway-checkpoint /usr/local/bin/gateway-checkpoint
 # M-46 task #5a: wsprobe — read-only, никогда не ENTRYPOINT; вызывается явно через

@@ -38,12 +38,14 @@
 //! цикла, то есть каждое срабатывание УЖЕ является новым фактом; подавлять по времени
 //! нечего, а раньше подавлялось (закрывало реальные новые рестарты остаточным окном).
 
+use crate::restore_drill::RestoreDrillVerdict;
 use crate::state::{DiskSample, WatchdogState};
 use crate::watchdog::{
     check_container_missing, check_container_restarted, check_container_unhealthy,
     check_cron_marker_missing, check_cron_marker_stale, check_disk, check_heartbeat_missing,
-    check_heartbeat_stale, check_seq_regressed, check_seq_stalled, check_writable, Alert,
-    ContainerStatus, CronMarker, HeartbeatSample, Incident, Level, Thresholds,
+    check_heartbeat_stale, check_restore_drill, check_seq_regressed, check_seq_stalled,
+    check_writable, Alert, ContainerStatus, CronMarker, HeartbeatSample, Incident, Level,
+    Thresholds,
 };
 
 /// Горизонт истории `free_bytes`, используемой для тренда (R-005 F-3): обязан покрывать окно
@@ -195,6 +197,34 @@ pub fn run_cycle_full(
     dedup_window_ms: i64,
     state: &mut WatchdogState,
 ) -> CycleOutcome {
+    // M-99 (задача 6, §5): `run_cycle_full` ≡ `run_cycle_with_drill(.., None, ..)`. Это
+    // держит обратное чередование для прежних вызывателей (без drill-интеграции НЕ
+    // получают ни одной тревоги drill'а) и ЕДИНСТВЕННЫЙ код диагностики живёт в
+    // [`run_cycle_with_drill`]. Без такого канона — два почти-копийных тела цикла и
+    // дрейф условий.
+    run_cycle_with_drill(inputs, serving, None, now_ms, thr, dedup_window_ms, state)
+}
+
+/// M-99 (задача 6, §5): КАНОНИЧЕСКИЙ такт cron'а — принимает ВЕРДИКТ restore-drill'а
+/// (`Option<&RestoreDrillVerdict>`) и звонит [`crate::watchdog::check_restore_drill`].
+/// `None` — drill' инвариант НЕ оценивается (legacy `run_cycle`, ни одной тревоги
+/// drill'а ни при каких входах). `Some(v)` — drill' оценивается: каждый не-`Ok`
+/// вердикт даёт `WD-RESTORE-DRILL` CRITICAL, `Ok` — `None`. Дедуп-окно общее с
+/// прочими условиями, F-7/R-005 F-5 не нарушаются (Healthy → clear, Alert →
+/// дедуп-окно, Unknown отсутствует: drill' детектор ВСЕГДА либо судит, либо
+/// явно знает «подавлять нечего»).
+///
+/// Аддитивно: `CycleInputs` НЕ меняется (12 литералов в `red_ops_watchdog_cycle.rs`),
+/// `WatchdogState` НЕ получает новых полей. Меняется только форма вызова.
+pub fn run_cycle_with_drill(
+    inputs: &CycleInputs,
+    serving: &ServingInputs,
+    drill: Option<&RestoreDrillVerdict>,
+    now_ms: i64,
+    thr: &Thresholds,
+    dedup_window_ms: i64,
+    state: &mut WatchdogState,
+) -> CycleOutcome {
     let mut cycle = Cycle {
         state,
         now_ms,
@@ -206,8 +236,26 @@ pub fn run_cycle_full(
     run_container_checks(&mut cycle, &inputs.containers);
     run_cron_checks(&mut cycle, &inputs.cron_jobs, thr);
     run_serving_checks(&mut cycle, serving, now_ms, thr);
+    run_restore_drill_check(&mut cycle, drill);
 
     cycle.outcome
+}
+
+/// M-99 (задача 6, §5): проверка drill'а. `None` — legacy `run_cycle`, ни одного
+/// обращения к `check_restore_drill`; `Some(Ok)` — `Healthy` (снять подавление,
+/// дедуп-память очищается); `Some(non-Ok)` — `Alert(WD-RESTORE-DRILL CRITICAL)`
+/// под общим дедуп-окном. На вход «вердикт есть» мы ЗНАЕМ ответ детектора; семантика
+/// `Unknown` (R-005 F-5) тут не нужна.
+fn run_restore_drill_check(cycle: &mut Cycle, drill: Option<&RestoreDrillVerdict>) {
+    let Some(v) = drill else {
+        // Legacy `run_cycle` — drill' не оценивается, состояние НЕ трогаем.
+        return;
+    };
+    let verdict = match check_restore_drill(v) {
+        Some(a) => Verdict::Alert(a),
+        None => Verdict::Healthy,
+    };
+    cycle.record(Incident::RestoreDrill, None, verdict);
 }
 
 fn run_heartbeat_checks(cycle: &mut Cycle, hb: Option<&HeartbeatSample>, thr: &Thresholds) {

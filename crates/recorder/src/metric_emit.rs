@@ -19,15 +19,21 @@
 //! - `venue_ws_reconnects_total{venue}`— supervisor main.rs (на Err или exit из venue-`run`).
 //! - `venue_http_status_total`         — venue-fetcher'ы     (event, already wired).
 //! - `book_divergence_bps{venue,symbol}`/`book_resync_total{venue,symbol}` — `ops::sink` (already wired).
-//! - `backup_restore_drill_ok`         — deferred (task 3, OPS-I-2/3).
+//! - `backup_restore_drill_ok`         — `sample_restore_drill` (этот файл; `OPS-I-2`/`OPS-I-3`/`OPS-I-10`,
+//!   `M-99` §5). Окно (Kp из T2-контракта M-74) — `pub use ops::restore_drill::RESTORE_DRILL_FRESH_WINDOW_MS`;
+//!   recorder реэкспортирует, отдельное определение запрещено (M-99 §7 «Запрещено»).
 //!
-//! OPS-I-6 (в журнал НЕ пишется): этот модуль импортирует ТОЛЬКО `ops::metrics` + `contracts`
+//! OPS-I-6 (в журнал НЕ пишется): этот модуль импортирует ТОЛЬКО `ops::metrics` + `ops::restore_drill` + `contracts`
 //! — без `journal` (метрики — наблюдаемость, а не события домена; DET-I-1 на журнале сохраняется).
 //! OPS-I-7 (не в горячем пути): все операции — `Arc<Metrics>::inc_counter`/`set_gauge`, lock-free
 //! атомики (см. `ops::metrics`); этот модуль НЕ делает I/O, кроме разовой `read_to_string(/proc/self/status)`
-//! в `sample_rss` (1 Гц из sampler-таска, не горячий путь).
+//! в `sample_rss` и `read_to_string(<drill state>)` в `sample_restore_drill` (обе 1 Гц из sampler-таска,
+//! не горячий путь).
+
+use std::path::Path;
 
 use ops::metrics::Metrics;
+pub use ops::restore_drill::RESTORE_DRILL_FRESH_WINDOW_MS;
 
 /// Парсер строки `RssAnon:` из `/proc/self/status` (`/proc/[pid]/status` формат, kB).
 /// Возвращает значение В БАЙТАХ (kB × 1024). `None` если строка не найдена (НЕ fallback на
@@ -88,4 +94,29 @@ pub fn sample_rss(metrics: &Metrics) {
 pub fn sample_md_age(metrics: &Metrics, venue: &str, now_ms: i64, last_receipt_ms: i64) {
     let age = now_ms.saturating_sub(last_receipt_ms).max(0);
     metrics.set_gauge("md_event_age_ms", &[("venue", venue)], age);
+}
+
+/// M-99 (задача 3, §5) + `M-74` §«Сигнатура продюсера»: прочитать файл состояния drill'а
+/// и выставить `backup_restore_drill_ok` по ВЕРДИКТУ [`ops::restore_drill::restore_drill_verdict`]
+/// — той же функции, что зовёт сторож. Единственное место логики отображения «файл состояния →
+/// класс»; recorder и watchdog пользуются одним источником (композиция продюсер↔потребитель,
+/// `M-99` §3 + `OPS-I-2`/`OPS-I-3`/`OPS-I-10`).
+///
+/// Сигнатура объявлена спекой `M-74` дословно; не меняется (`A-028` §3 п.3 + проверка
+/// `verify_M-99.sh` задача 3 «нет `set_gauge("backup_restore_drill_ok"…)`»). Часы приходят
+/// СНАРУЖИ (`now_wall_ms`) — иначе оракул просроченности недетерминирован. Тот же приём,
+/// что у `journal-retention --now-wall-ms` (`M-74` шапка).
+///
+/// **НИКОГДА не возвращает Err / не паникует** (`M-74` «Функция НИКОГДА не паникует»):
+/// она живёт в sampler-таске recorder'а — единственного писателя журнала, — и её
+/// падение остановило бы СБОР ДАННЫХ. На отказ чтения файла вердикт — `Missing`,
+/// серия в рендере — `0`. На отказ JSON — `Unparseable`, серия — `0`. То же для
+/// `Failed`/`Stale`/`FromFuture`/`Empty`. Только `Ok` → `1`. Это ОБЪЯВЛЕНОЕ семантикой
+/// fail-closed (`M-74` «Семантика — fail-closed, все ветви обязаны звать `set_gauge`»);
+/// recorder НЕ возвращает Err — на любом отказе он зовёт `set_gauge` с `0`/`1` и
+/// продолжает работу sampler'а.
+pub fn sample_restore_drill(metrics: &Metrics, state_path: &Path, now_wall_ms: i64) {
+    let v = ops::restore_drill::restore_drill_verdict(state_path, now_wall_ms);
+    let g = if v.is_ok() { 1 } else { 0 };
+    metrics.set_gauge("backup_restore_drill_ok", &[], g);
 }

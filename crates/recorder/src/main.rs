@@ -262,6 +262,17 @@ async fn main() -> anyhow::Result<()> {
     {
         let metrics_sampler = Arc::clone(&metrics);
         let last_receipt_sampler = Arc::clone(&last_receipt);
+        // M-99 (задача 3): путь к файлу состояния drill'а. Дефолт совпадает с тем,
+        // что пишет cron-обёртка (`JOURNAL_DRILL_STATE`), и с дефолтом `ops-watchdog`
+        // (`WATCHDOG_RESTORE_DRILL_STATE`). Один путь у продюсера, один у потребителя —
+        // иначе тихий no-op. Единственный источник строки — `ops::restore_drill::
+        // DEFAULT_RESTORE_DRILL_STATE` (`M-99` §4 п.10, §7 «второе определение»);
+        // собственный литерал здесь запрещён.
+        let drill_state_path: std::path::PathBuf = std::env::var("JOURNAL_DRILL_STATE")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| ops::restore_drill::DEFAULT_RESTORE_DRILL_STATE.to_string())
+            .into();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(1));
             // `MissedTickBehavior::Skip` — если tick пропущен, НЕ догоняем пачкой (CDS: на старте
@@ -289,6 +300,19 @@ async fn main() -> anyhow::Result<()> {
                     };
                     recorder::metric_emit::sample_md_age(&metrics_sampler, lbl, now_ms, last_ms);
                 }
+                // (c) M-99 (задача 3) + `OPS-I-2/3/10`: `backup_restore_drill_ok` —
+                //     отображение «файл состояния → gauge», той же функцией
+                //     `ops::restore_drill::restore_drill_verdict`, что зовёт `ops-watchdog`.
+                //     1 Гц (как у соседей); file-read раз в секунду, не в горячем пути.
+                //     I/O в sampler'е уже допускается — `sample_rss` делает то же для
+                //     `/proc/self/status`. Семантика fail-closed живёт ВНУТРИ функции:
+                //     на любом Err чтения серия обязана присутствовать со значением `0`
+                //     (`M-74` «Семантика — fail-closed, все ветви обязаны звать set_gauge»).
+                recorder::metric_emit::sample_restore_drill(
+                    &metrics_sampler,
+                    &drill_state_path,
+                    now_ms,
+                );
             }
         });
     }

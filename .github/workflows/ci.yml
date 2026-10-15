@@ -34,6 +34,8 @@ jobs:
         run: bash scripts/check_feature_oracles.sh
       - name: Проба барьера (анти-плацебо)
         run: bash scripts/tests/red_feature_oracles.sh
+      - name: Проба restore-drill — копия читается прод-читателем, атаки доставки ловятся (M-99)
+        run: bash scripts/tests/red_restore_drill.sh
 
   security:
     name: cargo audit
