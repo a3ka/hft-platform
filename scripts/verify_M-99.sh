@@ -114,6 +114,16 @@ step "task #2c — ворота протокола успеха: ok=1 тольк
 chk "grep -q 'reader-protocol-violation' ${DRILL} && ! grep -q 'missing-digest-on-success' ${DRILL}"
 chk "grep -q '^rp_judge()' scripts/tests/red_restore_drill.sh && grep -q 'RP-M судья протокола' scripts/tests/red_restore_drill.sh"
 
+step "task #2d — checked следует за доставкой; членство в листинге не конвейером с ранним выходом (M-99 §4 стр.12, R-268 Б-1, TD-260)"
+# ИСПОЛНЕНИЕМ судят сценарии пробы (task #1): PS (листинг за буфером канала — детерминированно),
+# DV (транспорт сообщил успех без байт), DV-E (тревога в stderr), PS-M/DV-M (самопроверка судей);
+# PF — прод-форма дня R-268, не RED (гонка). Здесь — текстовые канарейки: в обёртке нет решения
+# по конвейеру `printf … | grep -q` (класс R-268 Б-1), stderr обёртки не глушится навсегда
+# (TD-261 п.3), и семейства PS/DV не выпали из пробы.
+chk "! grep -qE 'printf [^|]*\\|[[:space:]]*grep -q' ${DRILL}"
+chk "! grep -qE '^[[:space:]]*exec 9>\"[^\"]*\"[[:space:]]+2>/dev/null' ${DRILL}"
+chk "grep -q '^ps_judge()' scripts/tests/red_restore_drill.sh && grep -q '^dv_judge()' scripts/tests/red_restore_drill.sh && grep -q 'PS-M/DV-M судьи' scripts/tests/red_restore_drill.sh"
+
 step "task #2b — читатель существует, различает коды, попадает в прод-образ"
 chk "test -f ${READER}"
 chk "d=\$(mktemp -d) && cargo run -q -p journal --bin journal-drill-read -- --dir \$d --min-events 1; rc=\$?; rm -rf \$d; [ \$rc -eq 5 ]"
