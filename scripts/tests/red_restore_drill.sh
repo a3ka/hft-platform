@@ -651,13 +651,24 @@ if [ "${N}" -ge 3 ]; then
 else
   IDX="${ALL}"
 fi
+# `checked` СЛЕДУЕТ ЗА ДОСТАВКОЙ (`M-99` §4 стр.12, `R-268` Б-1): членство — НЕ конвейером с ранним
+# выходом (под `pipefail` `printf | grep -q` ложно проваливается на листинге за буфером канала),
+# индекс засчитывается, только когда КАЖДАЯ его форма из листинга лежит в `RESTORE`; выбранный
+# индекс без форм или с недоставленной формой — неполная доставка, `transport-failed`/5.
 CHECKED=0
 for i in ${IDX}; do
+  want=0; got=0
   for f in "segment-${i}.jrnl" "segment-${i}.jrnl.zst"; do
-    if printf '%s\n' "${LISTING}" | grep -qx -- "$f"; then
-      fetch_one "$f" || { write_state 0 0 "" "transport-failed" 0; exit 5; }
+    if grep -qx -- "$f" <<<"${LISTING}"; then
+      want=$((want + 1))
+      fetch_one "$f" || { write_state 0 0 "" "transport-failed" "${CHECKED}"; exit 5; }
+      [ -f "${RESTORE}/$f" ] && got=$((got + 1))
     fi
   done
+  if [ "${want}" -eq 0 ] || [ "${got}" -ne "${want}" ]; then
+    echo "ALERT transport-failed (индекс ${i}: в листинге форм ${want}, доставлено ${got})" >&2
+    write_state 0 0 "" "transport-failed" "${CHECKED}"; exit 5
+  fi
   CHECKED=$((CHECKED + 1))
 done
 for side in $(printf '%s\n' "${LISTING}" | grep -E '^[^/]+\.json$'); do
@@ -1607,6 +1618,248 @@ if [ -n "${rpm_missed}" ]; then
 else
   pass "RP-M судья протокола принял допустимый и отверг 9 мутантов (прод-обёртка R-266, прежний эталон, \
 чужие причины ×2, код 0, проброшенный отпечаток, ok=1 при нуле событий, состояние не записано, заглушка не вызвана)"
+fi
+
+# ── PS / PF / DV — ОТБОР И ДОСТАВКА: `checked` СЛЕДУЕТ ЗА ДОСТАВКОЙ (`R-268` Б-1, `TD-260`) ─────────
+# Первый живой прогон (`R-268`) нашёл, что прод-обёртка ТЕРЯЕТ выбранные индексы и пишет `ok=1`,
+# `checked=3`: решение «имя есть в листинге» принималось конвейером `printf | grep -qx` под
+# `pipefail`; `grep -q` выходит на первом совпадении, `printf` получает SIGPIPE, конвейер — 141,
+# условие ложно, файл не выбирается, ошибки нет, а `CHECKED` растёт ВНЕ условия. Все сценарии
+# выше гоняли копию из восьми индексов — листинг в сотни байт, гонка не проявлялась.
+#
+# КЛАСС, А НЕ КЛЕТКА (`M-99` §4 стр.12): «выбранный индекс засчитан без доставленных байт». Две
+# независимые причины класса и по сценарию на каждую:
+#  · `PS` — решение о членстве зависит от раннего выхода конвейера. Замер (§8): листинг БОЛЬШЕ
+#    буфера канала (64 КиБ) даёт промах ДЕТЕРМИНИРОВАННО (200/200 на 129 600 байтах), меньше — гонку
+#    (131/200 на 50 256). Прод сегодня — 39 875 байт и растёт (~11 индексов в сутки + вторые формы),
+#    то есть копия идёт к режиму, где drill ВСЕГДА пропускает самый старый индекс. `PS` строит копию
+#    за буфером — красный на сломанной обёртке КАЖДЫЙ раз, а не через раз;
+#  · `DV` — транспорт сообщил успех, а байт в каталоге восстановления нет. Причина здесь не важна
+#    (обрыв, фильтр, чужая реализация `fetch_one`): обязанность — `checked` считает ДОСТАВЛЕННОЕ,
+#    а не ВЫБРАННОЕ, и неполная доставка — `transport-failed`/5 (`A-055` §5.2), не `ok=1`.
+#  · `PF` — прод-ФОРМА листинга дня `R-268` (1 624 строки, индекс 1 — только `.zst`, 524 — обе формы,
+#    1047 — только `.jrnl`), `PF_RUNS` прогонов. На сегодняшнем размере дефект — гонка, поэтому `PF`
+#    НЕ является RED-оракулом (на сломанной обёртке краснеет с вероятностью, а не всегда) — он
+#    держит форму прода (`testing.md` «Форма прода снимается замером») и ловит обёртку, сломанную
+#    на ИМЕННО этой форме иначе. Названо, чтобы зелёный `PF` не читался как покрытие класса.
+# Читатель везде — ЗАГЛУШКА (шов `JOURNAL_DRILL_READER`, как в `RP`): она ЗАПИСЫВАЕТ, что лежало в
+# `--dir` в момент чтения, и печатает полный протокол. Судится ОБЁРТКА; байты сегментов не нужны —
+# имена пустых файлов той же формы, что на проде (замер `R-268`).
+PS_DG="fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+
+ps_box() { # $1=имя переменной → новая песочница (регистрируется на уборку)
+  local d; d="$(mktemp -d /tmp/red-drill-XXXXXX)" || die mktemp
+  printf '%s\n' "${d}" >> "${REG}"; mkdir -p "${d}/cold"; printf -v "$1" '%s' "${d}"
+}
+
+# Копия: `.jrnl.zst` у индексов 1..$3, `.jrnl` у индексов $4..$2 (пересечение —
+# индексы с ОБЕИМИ формами); плюс два sidecar'а корня, как на проде.
+ps_fill() { # $1=песочница $2=N $3=последний с .zst $4=первый с .jrnl
+  ( cd "$1/cold" \
+    && { seq -f 'segment-%08g.jrnl.zst' 1 "$3"; seq -f 'segment-%08g.jrnl' "$4" "$2"; } | xargs touch \
+    && printf '{"legacy":true}\n' > journal.legacy.json \
+    && printf '{"replay":"digest"}\n' > journal.replay-digest.json ) || die "ps_fill $1"
+}
+
+ps_run() { # $1=песочница [$2=транспорт local|remote] → код обёртки
+  local wrapper="${DRILL}" tr="${2:-local}" stub=""
+  [ "${DRILL_PRESENT}" -eq 1 ] || wrapper="$(make_reference_wrapper "$1")"
+  rm -rf "$1/restore" "$1/state" "$1/reader-saw.txt" "$1/stub-reader.called" "$1/drill.rc"
+  cat > "$1/stub-reader.sh" <<STUBR
+#!/usr/bin/env bash
+# Заглушка читателя: что лежало в --dir В МОМЕНТ ЧТЕНИЯ — в reader-saw.txt; полный протокол.
+d=""; while [ \$# -gt 0 ]; do [ "\$1" = "--dir" ] && { d="\$2"; shift; }; shift; done
+: > '$1/stub-reader.called'
+ls -1 "\${d}" > '$1/reader-saw.txt' 2>/dev/null
+printf '{"segments_read":3,"events_read":7,"seq_first":1,"seq_last":7,"intra_segment_continuous":true,"digest":"${PS_DG}"}\n'
+exit 0
+STUBR
+  if [ "${tr}" = "remote" ]; then
+    stub="$(make_ssh_stub "$1")"
+    ( cd "$1" \
+      && PATH="$1/fakebin:${PATH}" DRILL_SSH_STUB_BOX="$1" DRILL_SSH_STUB_RC=0 \
+         JOURNAL_DRILL_COLD="drill-user@drill-box.invalid:cold" JOURNAL_DRILL_SSH="bash ${stub}" \
+         JOURNAL_DRILL_RESTORE="$1/restore" JOURNAL_DRILL_STATE="$1/state/journal-restore-drill.json" \
+         JOURNAL_DRILL_TRANSPORT="remote" JOURNAL_DRILL_READER="bash $1/stub-reader.sh" \
+         JOURNAL_DRILL_LOCK="$1/drill.lock" JOURNAL_DRILL_LOG="$1/drill-wrapper.log" \
+         JOURNAL_DRILL_ALERT_FILE="$1/drill.alert" \
+         bash "${wrapper}" >"$1/drill.out" 2>"$1/drill.err" </dev/null )
+  else
+    ( cd "$1" \
+      && JOURNAL_DRILL_COLD="$1/cold" JOURNAL_DRILL_RESTORE="$1/restore" \
+         JOURNAL_DRILL_STATE="$1/state/journal-restore-drill.json" \
+         JOURNAL_DRILL_TRANSPORT="local" JOURNAL_DRILL_READER="bash $1/stub-reader.sh" \
+         JOURNAL_DRILL_LOCK="$1/drill.lock" JOURNAL_DRILL_LOG="$1/drill-wrapper.log" \
+         JOURNAL_DRILL_ALERT_FILE="$1/drill.alert" \
+         bash "${wrapper}" >"$1/drill.out" 2>"$1/drill.err" </dev/null )
+  fi
+  local rc=$?
+  printf '%s' "${rc}" > "$1/drill.rc"
+  return "${rc}"
+}
+
+# Полнота доставки ОЖИДАЕМОГО состава: для каждого индекса-литерала — каждая форма, что есть в
+# копии, лежит в restore. Литерал выведен из спеки для фикстуры ОДИН раз (как `EXPECTED_MEMBERS`),
+# правило отбора здесь НЕ пересчитывается.
+ps_delivery() { # $1=песочница $2=литерал состава → печатает «индекс:формы-в-копии/доставлено …»
+  local i f want got out=""
+  for i in $2; do
+    want=0; got=0
+    for f in "segment-${i}.jrnl" "segment-${i}.jrnl.zst"; do
+      [ -e "$1/cold/${f}" ] || continue
+      want=$((want + 1)); [ -f "$1/restore/${f}" ] && got=$((got + 1))
+    done
+    out="${out} ${i}:${want}/${got}"
+  done
+  printf '%s' "${out# }"
+}
+
+# Судья успеха на ПОЛНОЙ копии — один на `PS`, `PF` и самопроверку `PS-M`.
+ps_judge() { # $1=вызвана $2=rc $3=ok $4=checked $5=доставка(ps_delivery) $6=digest → 0, если норма; PS_WHY
+  PS_WHY=""
+  local lost; lost="$(printf '%s\n' $5 | awk -F'[:/]' '$2==0 || $3!=$2 {printf "%s(%s из %s) ", $1, $3, $2}')"
+  if [ -n "${lost}" ]; then
+    PS_WHY="выбранные индексы НЕ доставлены: ${lost% }; при этом ok=${3:-∅}, checked=${4:-∅}, rc=$2"
+  elif [ "$1" -ne 1 ]; then PS_WHY="SETUP: доставка полна, но заглушка читателя НЕ ВЫЗВАНА"
+  elif [ "$2" != "0" ] || [ "$3" != "1" ]; then PS_WHY="полная доставка НЕ дала успеха (rc=$2, ok=${3:-∅}) — обёртка отказывает на исправной копии"
+  elif [ "$4" != "3" ]; then PS_WHY="checked=${4:-∅} при трёх полностью доставленных индексах"
+  elif [ "$6" != "${PS_DG}" ]; then PS_WHY="отпечаток «${6:0:12}…» не взят у читателя"
+  fi
+  [ -z "${PS_WHY}" ]
+}
+
+ps_verdict() { # $1=песочница $2=литерал → ps_judge по факту прогона
+  local called=0; [ -e "$1/stub-reader.called" ] && called=1
+  ps_judge "${called}" "$(drill_rc "$1")" "$(state_field "$1" ok)" "$(state_field "$1" checked)" \
+    "$(ps_delivery "$1" "$2")" "$(state_field "$1" digest)"
+}
+
+# ── PS — копия ЗА буфером канала: 3001 индекс, формы как на проде ─────────────────────────────────
+# Индексы 1..3001; `.zst` у 1..1650, `.jrnl` у 26..3001 ⇒ индекс 1 — только `.zst`, средний
+# `(3001+1)/2 = 1501` — обе формы, 3001 — только `.jrnl` (форма дня `R-268`). 4 626 сегментных имён,
+# 108 419 байт листинга — больше 64 КиБ.
+PS_EXPECTED="00000001 00001501 00003001"
+ps_box BOX_PS; ps_fill "${BOX_PS}" 3001 1650 26
+ps_n="$(ls "${BOX_PS}/cold" | grep -c '^segment-')"; ps_b="$(ls "${BOX_PS}/cold" | wc -c)"
+if [ "${ps_n}" -ne 4626 ] || [ "${ps_b}" -le 65536 ]; then
+  fail "PS SETUP: копия ${ps_n} сегментных имён, листинг ${ps_b} байт — не прод-масштаб за буфером канала"
+else
+  ps_run "${BOX_PS}" local
+  if ps_verdict "${BOX_PS}" "${PS_EXPECTED}"; then
+    pass "PS листинг ${ps_b} байт (за буфером канала): все формы индексов ${PS_EXPECTED} доставлены, ok=1, checked=3"
+  else
+    fail "PS листинг прод-масштаба (${ps_b} байт, ${ps_n} имён): ${PS_WHY} — R-268 Б-1 / TD-260"
+  fi
+fi
+
+# ── PF — прод-ФОРМА дня `R-268`: 1 624 строки, PF_RUNS прогонов ───────────────────────────────────
+# Индексы 1..1047; `.zst` у 1..600, `.jrnl` у 26..1047 ⇒ 1 622 сегмента + 2 sidecar'а = 1 624.
+# Состав: 1 (только `.zst`), `(1047+1)/2 = 524` (обе), 1047 (только `.jrnl`). НЕ RED-оракул — см. шапку.
+PF_RUNS=10
+PF_EXPECTED="00000001 00000524 00001047"
+ps_box BOX_PF; ps_fill "${BOX_PF}" 1047 600 26
+pf_lines="$(ls "${BOX_PF}/cold" | wc -l)"
+if [ "${pf_lines}" -ne 1624 ]; then
+  fail "PF SETUP: листинг ${pf_lines} строк вместо 1 624 (форма дня R-268)"
+else
+  pf_bad=""; pf_k=0
+  while [ "${pf_k}" -lt "${PF_RUNS}" ]; do
+    pf_k=$((pf_k + 1))
+    ps_run "${BOX_PF}" local
+    ps_verdict "${BOX_PF}" "${PF_EXPECTED}" || pf_bad="${pf_bad}
+      прогон ${pf_k}: ${PS_WHY}"
+  done
+  if [ -n "${pf_bad}" ]; then
+    fail "PF прод-форма листинга (1 624 строки), ${PF_RUNS} прогонов:${pf_bad}"
+  else
+    pass "PF прод-форма листинга (1 624 строки): ${PF_RUNS} из ${PF_RUNS} прогонов — полный состав, ok=1, checked=3"
+  fi
+fi
+
+# ── DV — транспорт сообщил УСПЕХ, байт НЕТ: `checked` обязан следовать за ДОСТАВКОЙ ────────────────
+# Ветка `remote` (заглушка `ssh` как в `RT`), а `rsync` в PATH подменён: на ОДНОМ названном файле он
+# выходит 0, ничего не скопировав; прочие — настоящим `rsync`. Копия — восемь индексов 0..7, обе
+# формы у 3 (состав `00000000 00000003 00000007`). Два выреза: весь индекс (единственная форма
+# индекса 0) и одна форма из двух (`.zst` индекса 3). Норма — `A-055` §5.2: неполная доставка ⇒
+# `ok=0`, `digest=""`, `transport-failed`, код 5, состояние записано, `checked` < 3.
+dv_judge() { # $1=вырез сработал $2=rc $3=ok $4=digest $5=reason $6=checked → 0, если норма; DV_WHY
+  DV_WHY=""
+  if [ "$1" -ne 1 ]; then DV_WHY="SETUP: подменный rsync НЕ вырезал файл — неполная доставка не смоделирована"
+  elif [ "$3" = "1" ] || [ "$2" = "0" ]; then DV_WHY="объявлен УСПЕХ (ok=${3:-∅}, rc=$2, checked=${6:-∅}) при недоставленном выбранном файле"
+  elif [ -z "$3" ]; then DV_WHY="состояние НЕ ЗАПИСАНО"
+  elif [ -n "$4" ]; then DV_WHY="отпечаток «${4:0:12}…» при неполной доставке"
+  elif [ "$5" != "transport-failed" ]; then DV_WHY="причина «${5:-∅}» вместо transport-failed (A-055 §5.2)"
+  elif [ "$2" != "5" ]; then DV_WHY="код $2 вместо 5"
+  elif [ -z "$6" ] || [ "$6" -ge 3 ] 2>/dev/null; then DV_WHY="checked=${6:-∅} — засчитан недоставленный индекс"
+  fi
+  [ -z "${DV_WHY}" ]
+}
+
+dv_case() { # $1=имя выреза $2=имя файла → дописывает dv_bad
+  local box rc cut=0
+  ps_box box; ps_fill "${box}" 7 3 0
+  # Индексы 0..7, `.jrnl` у всех; `.zst` оставлен только у 3 (обе формы), у 1 и 2 снят.
+  ( cd "${box}/cold" && rm -f segment-00000001.jrnl.zst segment-00000002.jrnl.zst )
+  mkdir -p "${box}/fakebin"
+  cat > "${box}/fakebin/rsync" <<FAKE
+#!/usr/bin/env bash
+# Подменный rsync: на «$2» — выход 0 без копирования; прочее — настоящий rsync.
+for a in "\$@"; do case "\$a" in *"/$2") : > '${box}/dv-cut'; exit 0 ;; esac; done
+exec "$(command -v rsync)" "\$@"
+FAKE
+  chmod +x "${box}/fakebin/rsync"
+  ps_run "${box}" remote; rc=$?
+  [ -e "${box}/dv-cut" ] && [ ! -e "${box}/restore/$2" ] && cut=1
+  dv_judge "${cut}" "${rc}" "$(state_field "${box}" ok)" "$(state_field "${box}" digest)" \
+    "$(state_field "${box}" reason)" "$(state_field "${box}" checked)" \
+    || dv_bad="${dv_bad}
+      $1 ($2): ${DV_WHY}"
+  DV_LAST_BOX="${box}"
+}
+dv_bad=""
+dv_case "весь-индекс" "segment-00000000.jrnl"
+dv_case "одна-форма-из-двух" "segment-00000003.jrnl.zst"
+if [ -n "${dv_bad}" ]; then
+  fail "DV транспорт сообщил успех без доставки — checked не следует за доставкой:${dv_bad}"
+else
+  pass "DV недоставленный выбранный файл при «успешном» транспорте (весь индекс; одна форма из двух) ⇒ ok=0, transport-failed, код 5, checked < 3"
+fi
+
+# ── DV-E — тревога обёртки видна в её stderr (`TD-261` п.3, `R-268` Н-1) ─────────────────────────────
+# `exec 9>… 2>/dev/null` без команды перенаправлял stderr ВСЕЙ обёртки навсегда: первая поломка на
+# проде оставила бы cron-почту и `bash -x` пустыми. Судится stderr прогона `DV` (отказ гарантирован).
+if grep -q 'ALERT transport-failed' "${DV_LAST_BOX}/drill.err" 2>/dev/null; then
+  pass "DV-E тревога отказа доставки видна в stderr обёртки"
+else
+  fail "DV-E stderr обёртки на отказе доставки пуст — тревога ушла в /dev/null (TD-261 п.3, R-268 Н-1)"
+fi
+
+# ── PS-M / DV-M — САМОПРОВЕРКА судей (на каждом прогоне) ─────────────────────────────────────────
+psm_missed=""
+ps_judge 1 0 1 3 "00000001:1/1 00001501:2/2 00003001:1/1" "${PS_DG}" || fail "PS-M SETUP: судья отверг ДОПУСТИМЫЙ успех (${PS_WHY})"
+ps_judge 1 0 1 3 "00000001:1/0 00001501:2/2 00003001:1/1" "${PS_DG}" && psm_missed="${psm_missed} прод-обёртка-R-268-без-индекса-1"
+ps_judge 1 0 1 3 "00000001:1/0 00001501:2/0 00003001:1/1" "${PS_DG}" && psm_missed="${psm_missed} один-индекс-из-трёх"
+ps_judge 1 0 1 3 "00000001:1/1 00001501:2/1 00003001:1/1" "${PS_DG}" && psm_missed="${psm_missed} одна-форма-из-двух"
+ps_judge 1 0 1 3 "00000001:0/0 00001501:2/2 00003001:1/1" "${PS_DG}" && psm_missed="${psm_missed} индекса-нет-в-копии"
+ps_judge 1 5 0 2 "00000001:1/1 00001501:2/2 00003001:1/1" ""         && psm_missed="${psm_missed} отказ-на-исправной-копии"
+ps_judge 1 0 1 2 "00000001:1/1 00001501:2/2 00003001:1/1" "${PS_DG}" && psm_missed="${psm_missed} checked-неверен"
+ps_judge 1 0 1 3 "00000001:1/1 00001501:2/2 00003001:1/1" ""         && psm_missed="${psm_missed} отпечаток-не-взят"
+ps_judge 0 0 1 3 "00000001:1/1 00001501:2/2 00003001:1/1" "${PS_DG}" && psm_missed="${psm_missed} читатель-не-вызван"
+dvm_missed=""
+dv_judge 1 5 0 "" transport-failed 2 || fail "DV-M SETUP: судья отверг ДОПУСТИМЫЙ отказ (${DV_WHY})"
+dv_judge 1 0 1 "${PS_DG}" "" 3                  && dvm_missed="${dvm_missed} прод-обёртка-ok=1-checked=3"
+dv_judge 1 7 0 "" reader-protocol-violation 2   && dvm_missed="${dvm_missed} причина-читателя"
+dv_judge 1 5 0 "" cold-empty 2                  && dvm_missed="${dvm_missed} причина-cold-empty"
+dv_judge 1 7 0 "" transport-failed 2            && dvm_missed="${dvm_missed} код-7"
+dv_judge 1 5 0 "${PS_DG}" transport-failed 2    && dvm_missed="${dvm_missed} отпечаток-при-отказе"
+dv_judge 1 5 0 "" transport-failed 3            && dvm_missed="${dvm_missed} checked=3"
+dv_judge 1 5 "" "" "" ""                        && dvm_missed="${dvm_missed} состояние-не-записано"
+dv_judge 0 5 0 "" transport-failed 2            && dvm_missed="${dvm_missed} вырез-не-сработал"
+if [ -n "${psm_missed}${dvm_missed}" ]; then
+  fail "PS-M/DV-M судьи ПРИНЯЛИ мутантов:${psm_missed}${dvm_missed}"
+else
+  pass "PS-M/DV-M судьи приняли допустимые исходы и отвергли 8 + 8 мутантов (потерянный индекс/форма, отказ на исправной копии, \
+checked, отпечаток, невызов; успех при недоставке, чужие причины ×2, код 7, отпечаток, checked=3, не записано, вырез не сработал)"
 fi
 
 
