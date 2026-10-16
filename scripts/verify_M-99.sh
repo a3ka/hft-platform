@@ -119,10 +119,14 @@ step "task #2d — checked следует за доставкой; членст�
 # DV (транспорт сообщил успех без байт), DV-E (тревога в stderr), PS-M/DV-M (самопроверка судей);
 # PF — прод-форма дня R-268, не RED (гонка). Здесь — текстовые канарейки: в обёртке нет решения
 # по конвейеру `printf … | grep -q` (класс R-268 Б-1), stderr обёртки не глушится навсегда
-# (TD-261 п.3), и семейства PS/DV не выпали из пробы.
+# (TD-261 п.3), и семейства PS/DV не выпали из пробы. §4 стр.12 (д) (`C-318` B-1: байты прошлого
+# прогона в неочищенном RESTORE засчитывались как доставка) судит ИСПОЛНЕНИЕМ `SR`/`SR-M` пробы —
+# текстовой канарейки на форму проверки пустоты нет намеренно: норма требует наблюдения каталога,
+# а не конкретной команды; здесь — только то, что семейство `SR` не выпало из пробы.
 chk "! grep -qE 'printf [^|]*\\|[[:space:]]*grep -q' ${DRILL}"
 chk "! grep -qE '^[[:space:]]*exec 9>\"[^\"]*\"[[:space:]]+2>/dev/null' ${DRILL}"
 chk "grep -q '^ps_judge()' scripts/tests/red_restore_drill.sh && grep -q '^dv_judge()' scripts/tests/red_restore_drill.sh && grep -q 'PS-M/DV-M судьи' scripts/tests/red_restore_drill.sh"
+chk "grep -q '^sr_judge()' scripts/tests/red_restore_drill.sh && grep -q '^sr_case \"SR-1' scripts/tests/red_restore_drill.sh && grep -q '^sr_case \"SR-2' scripts/tests/red_restore_drill.sh && grep -q 'SR-M судья принял' scripts/tests/red_restore_drill.sh"
 
 step "task #2b — читатель существует, различает коды, попадает в прод-образ"
 chk "test -f ${READER}"
