@@ -623,6 +623,13 @@ write_state() { # $1=ok $2=events $3=digest $4=reason $5=checked
 }
 
 rm -rf "${RESTORE}"; mkdir -p "${RESTORE}"
+# Каталог восстановления ПУСТ перед первой выборкой — проверено НАБЛЮДЕНИЕМ, а не кодом возврата
+# очистки (`M-99` §4 стр.12 (д), `C-318` B-1): иначе байты ПРОШЛОГО прогона засчитываются как
+# доставленные этим. Неочищенный каталог — неполная доставка, `transport-failed`/5, читатель не зовётся.
+if [ ! -d "${RESTORE}" ] || [ -n "$(ls -A "${RESTORE}" 2>/dev/null)" ]; then
+  echo "ALERT transport-failed (каталог восстановления ${RESTORE} не очищен)" >&2
+  write_state 0 0 "" "transport-failed" 0; exit 5
+fi
 
 # ── ДОСТАВКА: ДВЕ операции шва — листинг и выборка ОДНОГО файла (`M-99` §4 п.7, `R-263` Б-1) ─
 # Ветки `local`/`remote` различаются ТОЛЬКО этими двумя функциями; всё после доставки — один
@@ -1661,10 +1668,11 @@ ps_fill() { # $1=песочница $2=N $3=последний с .zst $4=пер
     && printf '{"replay":"digest"}\n' > journal.replay-digest.json ) || die "ps_fill $1"
 }
 
-ps_run() { # $1=песочница [$2=транспорт local|remote] → код обёртки
+ps_run() { # $1=песочница [$2=транспорт local|remote] [$3=keep — прежний restore НЕ убирать (`SR`)] → код обёртки
   local wrapper="${DRILL}" tr="${2:-local}" stub=""
   [ "${DRILL_PRESENT}" -eq 1 ] || wrapper="$(make_reference_wrapper "$1")"
-  rm -rf "$1/restore" "$1/state" "$1/reader-saw.txt" "$1/stub-reader.called" "$1/drill.rc"
+  [ "${3:-}" = "keep" ] || rm -rf "$1/restore"
+  rm -rf "$1/state" "$1/reader-saw.txt" "$1/stub-reader.called" "$1/drill.rc"
   cat > "$1/stub-reader.sh" <<STUBR
 #!/usr/bin/env bash
 # Заглушка читателя: что лежало в --dir В МОМЕНТ ЧТЕНИЯ — в reader-saw.txt; полный протокол.
@@ -1686,7 +1694,8 @@ STUBR
          bash "${wrapper}" >"$1/drill.out" 2>"$1/drill.err" </dev/null )
   else
     ( cd "$1" \
-      && JOURNAL_DRILL_COLD="$1/cold" JOURNAL_DRILL_RESTORE="$1/restore" \
+      && PATH="$1/fakebin:${PATH}" \
+         JOURNAL_DRILL_COLD="$1/cold" JOURNAL_DRILL_RESTORE="$1/restore" \
          JOURNAL_DRILL_STATE="$1/state/journal-restore-drill.json" \
          JOURNAL_DRILL_TRANSPORT="local" JOURNAL_DRILL_READER="bash $1/stub-reader.sh" \
          JOURNAL_DRILL_LOCK="$1/drill.lock" JOURNAL_DRILL_LOG="$1/drill-wrapper.log" \
@@ -1832,6 +1841,96 @@ if grep -q 'ALERT transport-failed' "${DV_LAST_BOX}/drill.err" 2>/dev/null; then
   pass "DV-E тревога отказа доставки видна в stderr обёртки"
 else
   fail "DV-E stderr обёртки на отказе доставки пуст — тревога ушла в /dev/null (TD-261 п.3, R-268 Н-1)"
+fi
+
+# ── SR — НЕОЧИЩЕННЫЙ каталог восстановления: байты ПРОШЛОГО прогона не есть доставка (`C-318` B-1) ──
+# `DV` и `PS` начинают с пустого `restore`, поэтому стража «файл лежит в RESTORE» они не отличают от
+# «файл доставлен ЭТИМ прогоном». Обёртка чистит каталог `rm -rf … && mkdir -p …` без проверки; при
+# сбое очистки старые файлы остаются, транспорт без единого нового байта выходит 0 — и проверка `-f`
+# засчитывает старое: `ok=1`, `checked=3` (воспроизведено `C-318` на наброске, прошедшем 41/41).
+# Норма — `M-99` §4 стр.12 (д): перед ПЕРВОЙ выборкой каталог существует и пуст, и это проверено
+# НАБЛЮДЕНИЕМ каталога, а не кодом возврата очистки (тот же принцип, что у `DV`: внешней операции,
+# сообщившей успех, не верим). Иначе `ok=0`, `digest=""`, `transport-failed`, код 5, `checked` < 3,
+# состояние записано, ЧИТАТЕЛЬ НЕ ВЫЗВАН (позитивный страж — маркер заглушки).
+# Два варианта в ОДНОЙ форме (`local`, копия из восьми индексов как у `DV`, прежний restore =
+# полный состав `00000000 00000003 00000007` + sidecar'ы): подменный `cp` выходит 0, ничего не
+# копируя; подменный `rm` на каталоге восстановления ничего не удаляет и выходит
+#  · `SR-1` — 1 (честный сбой очистки, форма `C-318`);
+#  · `SR-2` — 0 (очистка «сообщила успех» без эффекта): краснеет на реализации, сверяющей лишь код
+#    возврата `rm`, — она проходит `SR-1` и не проходит `SR-2`.
+sr_judge() { # $1=читатель вызван $2=rc $3=ok $4=digest $5=reason $6=checked → 0, если норма; SR_WHY
+  SR_WHY=""
+  if [ "$3" = "1" ] || [ "$2" = "0" ]; then SR_WHY="объявлен УСПЕХ (ok=${3:-∅}, rc=$2, checked=${6:-∅}) на байтах прошлого прогона"
+  elif [ "$1" -ne 0 ]; then SR_WHY="читатель ВЫЗВАН на неочищенном каталоге"
+  elif [ -z "$3" ]; then SR_WHY="состояние НЕ ЗАПИСАНО"
+  elif [ -n "$4" ]; then SR_WHY="отпечаток «${4:0:12}…» без доставки"
+  elif [ "$5" != "transport-failed" ]; then SR_WHY="причина «${5:-∅}» вместо transport-failed (A-055 §5.2)"
+  elif [ "$2" != "5" ]; then SR_WHY="код $2 вместо 5"
+  elif [ -z "$6" ] || [ "$6" -ge 3 ] 2>/dev/null; then SR_WHY="checked=${6:-∅} — засчитаны байты прошлого прогона"
+  fi
+  [ -z "${SR_WHY}" ]
+}
+
+sr_case() { # $1=имя варианта $2=код подменного rm → дописывает sr_bad
+  local box rc called=0 f real_rm
+  ps_box box; ps_fill "${box}" 7 3 0
+  ( cd "${box}/cold" && rm -f segment-00000001.jrnl.zst segment-00000002.jrnl.zst )
+  mkdir -p "${box}/restore" "${box}/fakebin"
+  for f in segment-00000000.jrnl segment-00000003.jrnl segment-00000003.jrnl.zst segment-00000007.jrnl \
+           journal.legacy.json journal.replay-digest.json; do
+    cp -p -- "${box}/cold/${f}" "${box}/restore/" || die "sr_case ${f}"
+  done
+  real_rm="$(command -v rm)"
+  cat > "${box}/fakebin/rm" <<FAKE
+#!/usr/bin/env bash
+# Подменный rm: на каталоге восстановления — ничего не удаляет, выходит $2; прочее — настоящий rm.
+for a in "\$@"; do [ "\$a" = "${box}/restore" ] && { : > '${box}/sr-rm-blocked'; exit $2; }; done
+exec "${real_rm}" "\$@"
+FAKE
+  cat > "${box}/fakebin/cp" <<FAKE
+#!/usr/bin/env bash
+# Подменный cp: «успешная» выборка без единого байта.
+: > '${box}/sr-cp-noop'; exit 0
+FAKE
+  chmod +x "${box}/fakebin/rm" "${box}/fakebin/cp"
+  # SETUP-страж: прежний restore полон, подмены стоят первыми в PATH обёртки.
+  if [ "$(ls -A "${box}/restore" | wc -l)" -ne 6 ] \
+     || [ "$(PATH="${box}/fakebin:${PATH}" command -v rm)" != "${box}/fakebin/rm" ] \
+     || [ "$(PATH="${box}/fakebin:${PATH}" command -v cp)" != "${box}/fakebin/cp" ]; then
+    sr_bad="${sr_bad}
+      $1: SETUP — прежний restore не полон или подмены rm/cp не первые в PATH"
+    return
+  fi
+  ps_run "${box}" local keep; rc=$?
+  [ -e "${box}/stub-reader.called" ] && called=1
+  sr_judge "${called}" "${rc}" "$(state_field "${box}" ok)" "$(state_field "${box}" digest)" \
+    "$(state_field "${box}" reason)" "$(state_field "${box}" checked)" \
+    || sr_bad="${sr_bad}
+      $1 (rm → $2, cp без копирования): ${SR_WHY}"
+}
+sr_bad=""
+sr_case "SR-1 очистка-отказала" 1
+sr_case "SR-2 очистка-сообщила-успех" 0
+if [ -n "${sr_bad}" ]; then
+  fail "SR неочищенный каталог восстановления — байты прошлого прогона засчитаны как доставка (C-318 B-1):${sr_bad}"
+else
+  pass "SR неочищенный restore (rm отказал; rm «успешен» без эффекта) + выборка без байт ⇒ ok=0, transport-failed, код 5, checked < 3, читатель не вызван"
+fi
+
+# ── SR-M — САМОПРОВЕРКА судьи `SR` (на каждом прогоне) ───────────────────────────────────────────
+srm_missed=""
+sr_judge 0 5 0 "" transport-failed 0 || fail "SR-M SETUP: судья отверг ДОПУСТИМЫЙ отказ (${SR_WHY})"
+sr_judge 1 0 1 "${PS_DG}" "" 3              && srm_missed="${srm_missed} C-318-ok=1-checked=3"
+sr_judge 1 5 0 "" transport-failed 0        && srm_missed="${srm_missed} читатель-вызван"
+sr_judge 0 5 "" "" "" ""                    && srm_missed="${srm_missed} состояние-не-записано"
+sr_judge 0 5 0 "${PS_DG}" transport-failed 0 && srm_missed="${srm_missed} отпечаток-при-отказе"
+sr_judge 0 5 0 "" cold-empty 0              && srm_missed="${srm_missed} причина-cold-empty"
+sr_judge 0 1 0 "" transport-failed 0        && srm_missed="${srm_missed} код-1"
+sr_judge 0 5 0 "" transport-failed 3        && srm_missed="${srm_missed} checked=3"
+if [ -n "${srm_missed}" ]; then
+  fail "SR-M судья ПРИНЯЛ мутантов:${srm_missed}"
+else
+  pass "SR-M судья принял допустимый отказ и отверг 7 мутантов (успех C-318, вызов читателя, не записано, отпечаток, cold-empty, код 1, checked=3)"
 fi
 
 # ── PS-M / DV-M — САМОПРОВЕРКА судей (на каждом прогоне) ─────────────────────────────────────────
