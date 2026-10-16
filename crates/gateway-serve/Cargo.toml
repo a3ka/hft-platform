@@ -1,0 +1,60 @@
+[package]
+name = "gateway-serve"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+
+# M-28 — WS-транспорт кокпита (market-плоскость, D1/D6). ТОНКАЯ IO-оболочка над `crates/gateway`
+# (детерминированная библиотека M-22). Read-only, stateless по юзеру: auth = verify подписанного JWT
+# БЕЗ user-БД (GS-I-2). НЕ импортирует app-БД (postgres/sqlx/diesel — GS-I-1) и journal-writer (GS-I-3).
+#
+# Скелет (architect): контракт-типы (ServeMsg/Claims/AuthError) + сигнатуры с `unimplemented!()`.
+# Тела auth/wire/serve-adapter + WS-сервер (tokio-tungstenite) — engine-dev (tasks 2-4), он же добавляет
+# tokio/tokio-tungstenite в [dependencies].
+
+# M-65 задача 12а (§10.3.1). Флаг ОБЪЯВЛЕН здесь architect'ом вместе с оракулом `O-12`, а не
+# оставлен engine-dev'у, по механической причине: без объявления `#[cfg(feature = "testing")]`
+# на тесте даёт `unexpected_cfgs`, а CI гоняет `clippy -D warnings` — то есть оракул уронил бы
+# ОБЩИЙ гейт вместо того, чтобы честно краснеть на своём предмете (замер: clippy exit=101).
+#
+# Объявление — не реализация. Тело развязки (снять `#[cfg(test)]` с `pub mod test_sync` и с
+# обеих точек вызова в `lib.rs`) остаётся за engine-dev: задача 12а. До неё оракул с флагом
+# НЕ СОБИРАЕТСЯ (`E0433: could not find test_sync`) — это и есть требуемое RED-состояние
+# набора; `cargo test` без флага при этом зелен, и CI цел.
+[features]
+testing = []
+
+[dependencies]
+contracts = { path = "../contracts" }
+gateway = { path = "../gateway" }
+journal = { path = "../journal" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+jsonwebtoken = "9"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+# M-65 round 2: parallel pumps на одном соединении (Б-1 — мультиплекс). `FuturesUnordered`
+# доступен через `futures-util::stream` при дефолтном наборе фич (`std`+`async-await`); без
+# отдельной фичи `stream` пришлось бы держать фиксированный массив `pending: [Option<
+# JoinHandle>; 16]`, не масштабируемый на переменное число subs.
+futures-util = { version = "0.3", features = ["sink"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# M-46 task #1 (engine-dev): `wsprobe --self-test` builds an ephemeral fixture journal
+# in-process (no network) so the render gate (T9) can run without a live prod WS. This
+# needs the journal *writer* API at BIN-build time (not just `cargo test`), so `tempfile`
+# moves from dev- to real dependency; it's still only exercised by `--self-test`, never by
+# the `gateway-serve` server bin itself (GS-I-3 concerns the server, not this probe tool —
+# see M-46 engine-dev report for the verify_M-28.sh canary-scope finding).
+tempfile = "3"
+
+[dev-dependencies]
+futures-util = { version = "0.3", features = ["sink"] }
+
+[[bin]]
+name = "gateway-serve"
+path = "src/main.rs"
+
+[[bin]]
+name = "wsprobe"
+path = "src/bin/wsprobe.rs"

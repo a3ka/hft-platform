@@ -1,0 +1,1383 @@
+diff --git a/crates/research-cli/src/grid.rs b/crates/research-cli/src/grid.rs
+index f4b6bbb..174f8f4 100644
+--- a/crates/research-cli/src/grid.rs
++++ b/crates/research-cli/src/grid.rs
+@@ -34,6 +34,12 @@ use crate::types::{
+     CellResult, CostsMode, GridSpec, RcError, SplitKind, TrialRecord, TRIALS_LEDGER_SCHEMA_VERSION,
+ };
+ 
++/// Эпоха семантики strategy-grid. Она является частью хэша TrialRecord и отделяет
++/// post-M-07 equity-кривую от четырёх исторических записей старого harness'а
++/// (TD-015). Это не хэш файла сигналов: сам сигнал неизменен, изменилась семантика
++/// исполнения через DirectionalStrategy/StrategyBacktest.
++pub const LEDGER_EPOCH_CUTOFF: &str = "5141fd9";
++
+ /// Аннуализация Sharpe внутри грида (сравнение ячеек между собой; не путать с
+ /// итоговым отчётным Sharpe research/reports — там периодичность явная).
+ const ANNUALIZATION_PERIODS_PER_YEAR: f64 = 252.0;
+@@ -45,8 +51,19 @@ pub struct GridRunEnv<'a> {
+     pub fees: &'a FeeSchedule,
+ }
+ 
+-fn sha256_hex(bytes: &[u8]) -> String {
++/// sha256 исходника сигнала плюс маркер семантической эпохи (D3/TD-015).
++///
++/// Исторические pre-M-07 trial records несут голый sha256 `obi.rs` (его префикс
++/// `f7f4761`). После миграции на настоящий strategy-пайплайн такой хэш был бы
++/// неразличим с legacy-записями, поэтому в post-M-07 хэш включает фиксированный
++/// epoch marker. Идентичные исходы в одинаковой эпохе дают идентичный hash.
++pub fn research_code_hash() -> String {
++    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../signals/src/obi.rs");
++    let bytes = std::fs::read(&path).unwrap_or_default();
+     let mut hasher = Sha256::new();
++    hasher.update(b"research-cli-strategy-grid:");
++    hasher.update(LEDGER_EPOCH_CUTOFF.as_bytes());
++    hasher.update([0]);
+     hasher.update(bytes);
+     hasher
+         .finalize()
+@@ -55,18 +72,6 @@ fn sha256_hex(bytes: &[u8]) -> String {
+         .collect()
+ }
+ 
+-/// sha256 исходника `crates/signals/src/obi.rs` (D3). Путь строится через
+-/// `CARGO_MANIFEST_DIR` (компилируемая константа этого крейта) — детерминирован,
+-/// не зависит от текущего рабочего каталога процесса. "unknown" при отсутствии файла
+-/// (не должно случаться в дереве репозитория; не паникуем).
+-fn signal_code_hash() -> String {
+-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../signals/src/obi.rs");
+-    match std::fs::read(&path) {
+-        Ok(bytes) => sha256_hex(&bytes),
+-        Err(_) => "unknown".to_string(),
+-    }
+-}
+-
+ /// Первый наблюдённый mid именно инструмента ячейки. Реконструкция идёт только вперёд
+ /// по переданному сегменту; отсутствие двусторонней книги даёт 0 (D7 fail-closed).
+ fn first_mid_e8(events: &[Event], instrument: &Instrument) -> i64 {
+@@ -183,7 +188,7 @@ pub fn run_grid(
+ 
+     // D11: грид инстанцирует OBI напрямую (единственный сигнал M-04/M-07).
+     let signal_id_str = format!("{}-obi-asym", spec.signal_id_prefix);
+-    let code_hash = signal_code_hash();
++    let code_hash = research_code_hash();
+     let mut results = Vec::with_capacity(spec.cells.len());
+ 
+     for cell in &spec.cells {
+@@ -492,8 +497,7 @@ pub fn run_grid_streamed(
+     }
+ 
+     let signal_id_str = format!("{}-obi-asym", spec.signal_id_prefix);
+-    let code_hash = signal_code_hash();
+-
++    let code_hash = research_code_hash();
+     // Конструируем runners ДО открытия стрима — fail-closed на кривом конфиге ячейки.
+     // Runners держат state per-cell: BacktestExchange через события + трекинг отчёта.
+     let mut runners: Vec<CellRunner> = Vec::with_capacity(spec.cells.len());
+diff --git a/crates/research-cli/src/ledger.rs b/crates/research-cli/src/ledger.rs
+index 45c62bc..d25ede4 100644
+--- a/crates/research-cli/src/ledger.rs
++++ b/crates/research-cli/src/ledger.rs
+@@ -146,6 +146,36 @@ impl Ledger {
+         Ok(LedgerTrialCount::new_from_ledger(n, family.to_string()))
+     }
+ 
++    /// Счётчик post-M-07 эпохи для семейства. Фильтр по code_hash обязателен:
++    /// старые записи append-only ledger не переписываются и не могут участвовать
++    /// в deflated-Sharpe новой семантики (TD-015).
++    pub fn trial_count_for_code_hash(
++        &self,
++        family: &str,
++        code_hash: &str,
++    ) -> io::Result<LedgerTrialCount> {
++        let all = self.read_all()?;
++        let n = all
++            .iter()
++            .filter(|record| record.signal_family == family && record.code_hash == code_hash)
++            .count() as u64;
++        Ok(LedgerTrialCount::new_from_ledger(n, family.to_string()))
++    }
++
++    /// Sharpe-ряд только указанной code-хэш эпохи (источник V[SR] для DSR).
++    pub fn family_sharpes_for_code_hash(
++        &self,
++        family: &str,
++        code_hash: &str,
++    ) -> io::Result<Vec<f64>> {
++        let all = self.read_all()?;
++        Ok(all
++            .iter()
++            .filter(|record| record.signal_family == family && record.code_hash == code_hash)
++            .filter_map(|record| record.sharpe)
++            .collect())
++    }
++
+     /// Sharpe-ряд семейства (для V[SR] в формуле D4).
+     pub fn family_sharpes(&self, family: &str) -> io::Result<Vec<f64>> {
+         let all = self.read_all()?;
+diff --git a/crates/research-cli/src/main.rs b/crates/research-cli/src/main.rs
+index 5c7fd7e..9acb258 100644
+--- a/crates/research-cli/src/main.rs
++++ b/crates/research-cli/src/main.rs
+@@ -13,7 +13,8 @@ use journal::EpochFilter;
+ use research_cli::grid::{run_grid_streamed, GridRunEnv, JournalSource};
+ use research_cli::ledger::Ledger;
+ use research_cli::report::{
+-    journal_sha256, require_preregistration, write_metrics_json, write_narrative_md,
++    journal_sha256, require_preregistration, run_r001, write_metrics_json, write_narrative_md,
++    R001RunConfig,
+ };
+ use research_cli::types::{GridSpec, SplitKind, ValidationReport};
+ use sim::{FeeSchedule, LatencyTable};
+@@ -134,6 +135,73 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
+     Ok(())
+ }
+ 
++fn cmd_r001(args: &[String]) -> Result<(), String> {
++    let journal_dir = flag(args, "--journal").ok_or("--journal <dir> обязателен")?;
++    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
++        .join("../..")
++        .canonicalize()
++        .map_err(|e| format!("workspace root: {e}"))?;
++    let ledger_path = flag(args, "--ledger")
++        .map(PathBuf::from)
++        .unwrap_or_else(|| root.join("research/trials-ledger.jsonl"));
++    let report_dir = flag(args, "--report-dir")
++        .map(PathBuf::from)
++        .unwrap_or_else(|| root.join("research/reports"));
++    let gap_dir = flag(args, "--gap-dir")
++        .map(PathBuf::from)
++        .unwrap_or_else(|| root.join("research/data-quality"));
++    let latency_path = flag(args, "--latency")
++        .map(PathBuf::from)
++        .unwrap_or_else(|| root.join("research/latency/binance-BTCUSDT.json"));
++    let fees_path = flag(args, "--fees")
++        .map(PathBuf::from)
++        .unwrap_or_else(|| root.join("research/fees/binance.json"));
++    let seed = flag(args, "--seed")
++        .map(|value| value.parse::<u64>().map_err(|e| format!("--seed: {e}")))
++        .unwrap_or(Ok(42))?;
++
++    let source = JournalSource {
++        dir: PathBuf::from(&journal_dir),
++        filter: EpochFilter::OwnCaptureOnly,
++    };
++    let stream = journal::stream(&source.dir, source.filter.clone())
++        .map_err(|e| format!("открытие стрима журнала: {e}"))?;
++    let events: Vec<contracts::Event> = stream
++        .collect::<Result<Vec<_>, _>>()
++        .map_err(|e| format!("чтение журнала: {e}"))?;
++
++    let mut latency = LatencyTable::new();
++    latency
++        .load_artifact(&latency_path)
++        .map_err(|e| format!("latency: {e:?}"))?;
++    let mut fees = FeeSchedule::new();
++    fees.load_artifact(&fees_path)
++        .map_err(|e| format!("fees: {e:?}"))?;
++    let journal_hash = journal_sha256(Path::new(&journal_dir)).map_err(|e| format!("{e:?}"))?;
++    let mut ledger = Ledger::open(&ledger_path).map_err(|e| format!("ledger: {e}"))?;
++
++    let report = run_r001(R001RunConfig {
++        events: &events,
++        source: &source,
++        ledger: &mut ledger,
++        latency: &latency,
++        fees: &fees,
++        journal_sha256: journal_hash,
++        report_dir: &report_dir,
++        gap_dir: &gap_dir,
++        seed,
++    })
++    .map_err(|e| format!("R-001: {e:?}"))?;
++    println!(
++        "R-001: verdict={:?} sharpe={:.6} se={:.6} ledger_n={} report_dir={}",
++        report.verdict,
++        report.sharpe,
++        report.se_sharpe,
++        report.ledger_n,
++        report_dir.display()
++    );
++    Ok(())
++}
+ fn cmd_export(args: &[String]) -> Result<(), String> {
+     use std::path::PathBuf;
+ 
+@@ -191,9 +259,10 @@ fn main() {
+         Some("grid") => cmd_grid(&rest),
+         Some("validate") => cmd_validate(&rest),
+         Some("report") => cmd_report(&rest),
++        Some("r001") => cmd_r001(&rest),
+         Some("export") => cmd_export(&rest),
+         _ => {
+-            eprintln!("usage: research-cli <grid|validate|report|export> ...");
++            eprintln!("usage: research-cli <grid|validate|report|r001|export> ...");
+             std::process::exit(2);
+         }
+     };
+diff --git a/crates/research-cli/src/report.rs b/crates/research-cli/src/report.rs
+index 2384fa8..72e15c9 100644
+--- a/crates/research-cli/src/report.rs
++++ b/crates/research-cli/src/report.rs
+@@ -9,31 +9,545 @@
+ //! Реализация — research-dev (M-04 task 4).
+ 
+ use std::fs;
++use std::io::Read;
+ use std::path::Path;
+ 
++use contracts::Event;
+ use sha2::{Digest, Sha256};
++use sim::{FeeSchedule, LatencyTable};
+ 
+-use crate::types::{RcError, ValidationReport};
++use crate::data_quality;
++use crate::grid::{self, GridRunEnv, JournalSource};
++use crate::ledger::Ledger;
++use crate::metrics;
++pub use crate::types::Verdict;
++use crate::types::{
++    CellResult, CostsMode, GridSpec, RcError, StressResult, ValidationReport, REPORT_SCHEMA_VERSION,
++};
+ 
+-/// Имя сегмента журнала (зеркалит приватную константу `journal::SEGMENT` — тот же
+-/// формат имени файла; research-cli читает журнал read-only, без writer-хэндла, RC-I-7).
+-const JOURNAL_SEGMENT_FILE: &str = "segment-00000000.jrnl";
++/// Kill-screen inputs and classification API are deliberately kept in this module's
++/// public surface: callers must not infer a promotion verdict from prose or from
++/// an ad-hoc backtest harness.
++#[derive(Debug, Clone, PartialEq)]
++pub struct KillScreenInputs {
++    pub sharpe: f64,
++    pub se_sharpe: f64,
++    pub data_span_days: f64,
++    pub oos_sharpe: f64,
++    pub deflated_sharpe: f64,
++    pub walkforward_min_sharpe: f64,
++    pub half_life_ms: i64,
++    pub horizon_ms: i64,
++    pub worst_stress_net_pnl_e8: i64,
++}
+ 
+-fn sha256_hex(bytes: &[u8]) -> String {
+-    let mut hasher = Sha256::new();
+-    hasher.update(bytes);
+-    hasher
+-        .finalize()
++/// Provenance that must accompany an R-001 verdict. It is separate from
++/// `KillScreenInputs` because E8 and TD-015 are produced by I/O/report layers,
++/// not by the pure numerical classifier.
++#[derive(Debug, Clone, PartialEq)]
++pub struct ReportHonesty {
++    pub data_span_days: f64,
++    pub se_sharpe: f64,
++    pub gap_ref: String,
++    pub ledger_cutoff: String,
++}
++
++/// Классифицировать R-001 по ПРЕ-РЕГ критериям.
++///
++/// Порядок является частью контракта KS-I-4/KS-I-1: любой сработавший критерий
++/// фальсификации убивает гипотезу, даже если точечная оценка имеет узкий CI.
++/// Только после проверки всех Kill-критериев разрешается рассматривать нижнюю
++/// границу Sharpe над баром.
++pub fn classify_verdict(inputs: &KillScreenInputs, bar: f64) -> Verdict {
++    if inputs.oos_sharpe <= 0.5 {
++        return Verdict::Kill(format!(
++            "oos_sharpe={:.6} <= 0.5 (пре-рег критерий Net Sharpe)",
++            inputs.oos_sharpe
++        ));
++    }
++    if inputs.deflated_sharpe <= 0.0 {
++        return Verdict::Kill(format!(
++            "deflated_sharpe={:.6} <= 0 (trials-ledger correction)",
++            inputs.deflated_sharpe
++        ));
++    }
++    if inputs.walkforward_min_sharpe < 0.0 {
++        return Verdict::Kill(format!(
++            "walkforward_min_sharpe={:.6} < 0 (режимная нестабильность)",
++            inputs.walkforward_min_sharpe
++        ));
++    }
++    if inputs.half_life_ms < inputs.horizon_ms {
++        return Verdict::Kill(format!(
++            "half_life_ms={} < horizon_ms={} (decay быстрее удержания)",
++            inputs.half_life_ms, inputs.horizon_ms
++        ));
++    }
++    if inputs.worst_stress_net_pnl_e8 < 0 {
++        return Verdict::Kill(format!(
++            "worst_stress_net_pnl_e8={} < 0 (отрицательный stress PnL)",
++            inputs.worst_stress_net_pnl_e8
++        ));
++    }
++
++    if inputs.sharpe - 2.0 * inputs.se_sharpe > bar {
++        Verdict::Pass
++    } else {
++        Verdict::Inconclusive(format!(
++            "нижняя 95%-граница Sharpe={:.6} <= bar={:.6}; данных недостаточно для Pass",
++            inputs.sharpe - 2.0 * inputs.se_sharpe,
++            bar
++        ))
++    }
++}
++
++/// Проверить обязательные provenance-поля R-001 до записи артефакта.
++pub fn validate_report_honesty(report: &ReportHonesty) -> Result<(), String> {
++    if report.gap_ref.trim().is_empty() {
++        return Err("gap_ref пуст: отчёт не ссылается на E8 gap-артефакт".into());
++    }
++    let ledger_cutoff = report.ledger_cutoff.trim();
++    if ledger_cutoff.is_empty() {
++        return Err("ledger_cutoff пуст: эпоха trials-ledger не названа".into());
++    }
++    if ledger_cutoff == "f7f4761" {
++        return Err(
++            "ledger_cutoff=f7f4761: пре-M-07 эпоха TD-015 несопоставима с текущей логикой".into(),
++        );
++    }
++    if !report.data_span_days.is_finite() || report.data_span_days <= 0.0 {
++        return Err(format!(
++            "data_span_days должен быть конечным и > 0, получен {}",
++            report.data_span_days
++        ));
++    }
++    if !report.se_sharpe.is_finite() || report.se_sharpe < 0.0 {
++        return Err(format!(
++            "se_sharpe должен быть конечным и >= 0, получен {}",
++            report.se_sharpe
++        ));
++    }
++    Ok(())
++}
++
++/// Параметры первого сквозного R-001 запуска. Входной поток уже прочитан
++/// read-only journal-хэндлом; `run_r001` не имеет writer-а журнала.
++pub struct R001RunConfig<'a> {
++    pub events: &'a [Event],
++    pub source: &'a JournalSource,
++    pub ledger: &'a mut Ledger,
++    pub latency: &'a LatencyTable,
++    pub fees: &'a FeeSchedule,
++    pub journal_sha256: String,
++    pub report_dir: &'a Path,
++    pub gap_dir: &'a Path,
++    pub seed: u64,
++}
++
++const R001_SIGNAL_FAMILY: &str = "obi";
++const R001_SIGNAL_ID_PREFIX: &str = "S-001";
++const R001_HORIZONS_MS: [i64; 4] = [500, 1_000, 2_000, 5_000];
++const R001_N_LEVELS: [u64; 4] = [1, 5, 10, 20];
++const R001_THETAS_E8: [i64; 4] = [10_000_000, 20_000_000, 30_000_000, 40_000_000];
++const R001_TOP_K: usize = 5;
++const R001_BAR: f64 = 0.5;
++const PERIODS_PER_YEAR: f64 = 252.0;
++const MS_PER_DAY: f64 = 86_400_000.0;
++
++fn r001_spec(cells: Vec<serde_json::Value>, costs_mode: CostsMode, seed: u64) -> GridSpec {
++    GridSpec {
++        signal_family: R001_SIGNAL_FAMILY.to_string(),
++        signal_id_prefix: R001_SIGNAL_ID_PREFIX.to_string(),
++        cells,
++        costs_mode,
++        seed,
++    }
++}
++
++fn r001_cells() -> Vec<serde_json::Value> {
++    let mut cells =
++        Vec::with_capacity(R001_N_LEVELS.len() * R001_THETAS_E8.len() * R001_HORIZONS_MS.len());
++    for n_levels in R001_N_LEVELS {
++        for theta_e8 in R001_THETAS_E8 {
++            for horizon_ms in R001_HORIZONS_MS {
++                cells.push(serde_json::json!({
++                    "mode": "top_n",
++                    "n_levels": n_levels,
++                    "theta_e8": theta_e8,
++                    "horizon_ms": horizon_ms,
++                    "venue": "Binance",
++                    "symbol": "BTCUSDT"
++                }));
++            }
++        }
++    }
++    cells
++}
++
++type TimeRange = (i64, i64);
++type SplitRanges = (TimeRange, TimeRange);
++
++fn split_range(events: &[Event]) -> Result<SplitRanges, RcError> {
++    let first = events
++        .iter()
++        .map(|event| event.ts_wall_ms)
++        .min()
++        .ok_or_else(|| RcError::CorruptInput("R-001: журнал пуст".into()))?;
++    let last = events
++        .iter()
++        .map(|event| event.ts_wall_ms)
++        .max()
++        .ok_or_else(|| RcError::CorruptInput("R-001: журнал пуст".into()))?;
++    if last <= first {
++        return Err(RcError::CorruptInput(
++            "R-001: окно журнала имеет нулевую длину".into(),
++        ));
++    }
++    // 2/3 train, 1/3 OOS. Полуинтервалы сохраняют последнюю точку в OOS.
++    let span = (last as i128) - (first as i128);
++    let train_end = (first as i128 + span * 2 / 3).clamp(i64::MIN as i128, i64::MAX as i128) as i64;
++    Ok(((first, train_end), (train_end, last.saturating_add(1))))
++}
++
++fn grid_env<'a>(
++    ledger: &'a mut Ledger,
++    latency: &'a LatencyTable,
++    fees: &'a FeeSchedule,
++) -> GridRunEnv<'a> {
++    GridRunEnv {
++        ledger,
++        latency,
++        fees,
++    }
++}
++
++fn variance(values: &[f64]) -> f64 {
++    if values.is_empty() {
++        return 0.0;
++    }
++    let mean = values.iter().sum::<f64>() / values.len() as f64;
++    values
++        .iter()
++        .map(|value| (value - mean).powi(2))
++        .sum::<f64>()
++        / values.len() as f64
++}
++
++/// Conservative standard error for an annualized Sharpe estimate.
++///
++/// At short horizons an empty/one-point equity series does not mean certainty:
++/// the effective observation count is clamped to one, yielding a wide finite SE
++/// and therefore `Inconclusive`, not a false `Pass`.
++fn sharpe_se(returns: &[f64], sharpe: f64) -> f64 {
++    let observations = returns.len().max(1) as f64;
++    (PERIODS_PER_YEAR / observations * (1.0 + 0.5 * sharpe * sharpe)).sqrt()
++}
++
++fn min_stress_pnl(stress: &[StressResult]) -> i64 {
++    stress
+         .iter()
+-        .map(|b| format!("{b:02x}"))
+-        .collect()
++        .map(|result| result.net_pnl_e8)
++        .min()
++        .unwrap_or(0)
++}
++
++fn half_life_from_decay(decay: &[(i64, f64)], baseline: f64) -> i64 {
++    if decay.is_empty() {
++        return 0;
++    }
++    if baseline > 0.0 {
++        if let Some((horizon, _)) = decay.iter().find(|(_, value)| *value <= baseline * 0.5) {
++            return *horizon;
++        }
++    }
++    decay.last().map(|(horizon, _)| *horizon).unwrap_or(0)
+ }
+ 
+-/// sha256 файла сегмента журнала (вход воспроизводимости отчёта).
++fn selected_result(results: &[CellResult]) -> Result<CellResult, RcError> {
++    results
++        .first()
++        .cloned()
++        .ok_or_else(|| RcError::CorruptInput("R-001: OOS grid не вернул ячеек".into()))
++}
++
++/// Выполнить R-001 Track A и записать оба детерминированных артефакта.
++///
++/// Путь исполнения намеренно состоит только из существующих компонентов:
++/// `grid::run_grid` → `top_k` → `StrategyBacktest` внутри grid →
++/// `run_walkforward` → отдельные cost/latency grids. Никаких ad-hoc сигналов,
++/// ручной правки чисел или post-hoc пересчёта stress PnL.
++pub fn run_r001(config: R001RunConfig<'_>) -> Result<ValidationReport, RcError> {
++    let (train_range, oos_range) = split_range(config.events)?;
++    let gap_report = data_quality::gaps(config.source, data_quality::DEFAULT_GAP_THRESHOLD_MS)?;
++    let epoch = gap_report
++        .epoch_ids
++        .first()
++        .cloned()
++        .ok_or_else(|| RcError::CorruptInput("R-001: gap-артефакт не назвал эпоху".into()))?;
++    data_quality::write_gap_artifact(&gap_report, config.gap_dir)?;
++    let gap_ref = format!("research/data-quality/gaps-{epoch}.json");
++
++    let cells = r001_cells();
++    let baseline_spec = r001_spec(cells, CostsMode::Baseline, config.seed);
++    let train_results = {
++        let mut env = grid_env(config.ledger, config.latency, config.fees);
++        grid::run_grid(
++            config.events,
++            &baseline_spec,
++            crate::types::SplitKind::Train,
++            train_range,
++            &mut env,
++            None,
++        )?
++    };
++    let top_results = grid::top_k(&train_results, R001_TOP_K);
++    if top_results.is_empty() {
++        return Err(RcError::CorruptInput("R-001: train grid пуст".into()));
++    }
++    let top_cells: Vec<serde_json::Value> = top_results
++        .iter()
++        .map(|result| result.params.clone())
++        .collect();
++
++    let oos_spec = r001_spec(top_cells.clone(), CostsMode::Baseline, config.seed);
++    let oos_results = {
++        let mut env = grid_env(config.ledger, config.latency, config.fees);
++        grid::run_grid(
++            config.events,
++            &oos_spec,
++            crate::types::SplitKind::Val,
++            oos_range,
++            &mut env,
++            None,
++        )?
++    };
++    let best_oos = selected_result(&grid::top_k(&oos_results, 1))?;
++
++    // Stress-режимы — два независимых grid-прогона, поэтому каждая их ячейка
++    // получает собственную params_hash и ledger-запись.
++    let mut stress = Vec::with_capacity(2);
++    for costs_mode in [CostsMode::CostX15, CostsMode::LatencyX2] {
++        let stress_spec = r001_spec(vec![best_oos.params.clone()], costs_mode, config.seed);
++        let results = {
++            let mut env = grid_env(config.ledger, config.latency, config.fees);
++            grid::run_grid(
++                config.events,
++                &stress_spec,
++                crate::types::SplitKind::Val,
++                oos_range,
++                &mut env,
++                None,
++            )?
++        };
++        let result = selected_result(&grid::top_k(&results, 1))?;
++        stress.push(StressResult {
++            mode: costs_mode,
++            sharpe: result.sharpe,
++            net_pnl_e8: result.net_pnl_e8,
++        });
++    }
++
++    let walkforward = crate::walkforward::run_walkforward(
++        config.events,
++        &oos_spec,
++        &crate::types::WalkForwardWindow {
++            train_window_ms: 4 * 60 * 60 * 1_000,
++            test_window_ms: 60 * 60 * 1_000,
++            step_ms: 60 * 60 * 1_000,
++        },
++        config.ledger,
++        config.latency,
++        config.fees,
++    )?;
++    let walkforward_sharpes: Vec<f64> =
++        walkforward.iter().map(|window| window.oos_sharpe).collect();
++    let walkforward_min = walkforward_sharpes
++        .iter()
++        .copied()
++        .reduce(f64::min)
++        .unwrap_or(0.0);
++
++    // Decay — те же top-N/theta, но каждый горизонт снова проходит через grid.
++    // Это сохраняет честное исполнение и не подменяет decay формулой после PnL.
++    let best_mode = best_oos
++        .params
++        .get("mode")
++        .cloned()
++        .unwrap_or_else(|| serde_json::json!("top_n"));
++    let best_n = best_oos
++        .params
++        .get("n_levels")
++        .cloned()
++        .unwrap_or_else(|| serde_json::json!(1));
++    let best_theta = best_oos
++        .params
++        .get("theta_e8")
++        .cloned()
++        .unwrap_or_else(|| serde_json::json!(10_000_000));
++    let best_venue = best_oos
++        .params
++        .get("venue")
++        .cloned()
++        .unwrap_or_else(|| serde_json::json!("Binance"));
++    let best_symbol = best_oos
++        .params
++        .get("symbol")
++        .cloned()
++        .unwrap_or_else(|| serde_json::json!("BTCUSDT"));
++    let mut decay = Vec::with_capacity(R001_HORIZONS_MS.len());
++    for horizon_ms in R001_HORIZONS_MS {
++        let cell = serde_json::json!({
++            "mode": best_mode.clone(),
++            "n_levels": best_n.clone(),
++            "theta_e8": best_theta.clone(),
++            "horizon_ms": horizon_ms,
++            "venue": best_venue.clone(),
++            "symbol": best_symbol.clone()
++        });
++        let decay_spec = r001_spec(vec![cell], CostsMode::Baseline, config.seed);
++        let results = {
++            let mut env = grid_env(config.ledger, config.latency, config.fees);
++            grid::run_grid(
++                config.events,
++                &decay_spec,
++                crate::types::SplitKind::Val,
++                oos_range,
++                &mut env,
++                None,
++            )?
++        };
++        let result = selected_result(&results)?;
++        decay.push((horizon_ms, result.sharpe));
++    }
++
++    let code_hash = grid::research_code_hash();
++    let trials = config
++        .ledger
++        .trial_count_for_code_hash(R001_SIGNAL_FAMILY, &code_hash)
++        .map_err(RcError::Io)?;
++    let family_sharpes = config
++        .ledger
++        .family_sharpes_for_code_hash(R001_SIGNAL_FAMILY, &code_hash)
++        .map_err(RcError::Io)?;
++    let deflated_sharpe = metrics::deflated_sharpe(
++        best_oos.sharpe,
++        best_oos.returns.len(),
++        0.0,
++        3.0,
++        &trials,
++        variance(&family_sharpes),
++    );
++    let span_days = (oos_range.1.saturating_sub(oos_range.0) as f64) / MS_PER_DAY;
++    let se_sharpe = sharpe_se(&best_oos.returns, best_oos.sharpe);
++    let honesty = ReportHonesty {
++        data_span_days: span_days,
++        se_sharpe,
++        gap_ref: gap_ref.clone(),
++        ledger_cutoff: grid::LEDGER_EPOCH_CUTOFF.to_string(),
++    };
++    validate_report_honesty(&honesty).map_err(RcError::GateDenied)?;
++
++    let inputs = KillScreenInputs {
++        sharpe: best_oos.sharpe,
++        se_sharpe,
++        data_span_days: span_days,
++        oos_sharpe: best_oos.sharpe,
++        deflated_sharpe,
++        walkforward_min_sharpe: walkforward_min,
++        half_life_ms: half_life_from_decay(&decay, best_oos.sharpe),
++        horizon_ms: best_oos
++            .params
++            .get("horizon_ms")
++            .and_then(serde_json::Value::as_i64)
++            .unwrap_or(R001_HORIZONS_MS[0]),
++        worst_stress_net_pnl_e8: min_stress_pnl(&stress),
++    };
++    let verdict = classify_verdict(&inputs, R001_BAR);
++
++    let report = ValidationReport {
++        report_schema_version: REPORT_SCHEMA_VERSION,
++        hypothesis: "H-20260710-obi-asym".into(),
++        signal_id: "S-001-obi-asym".into(),
++        params: best_oos.params.clone(),
++        journal_sha256: config.journal_sha256,
++        code_hash,
++        ledger_n: trials.n(),
++        net_pnl_e8: best_oos.net_pnl_e8,
++        sharpe: best_oos.sharpe,
++        deflated_sharpe,
++        max_drawdown_e8: best_oos.max_drawdown_e8,
++        fill_rate: metrics::fill_rate(best_oos.fills, best_oos.intents),
++        turnover_e8: best_oos.turnover_e8,
++        capacity_notional_e8: {
++            let mut turnover = [best_oos.turnover_e8.abs()];
++            metrics::capacity_v1_e8(&mut turnover, 0.05)
++        },
++        capacity_method: "v1-participation".into(),
++        decay,
++        stress,
++        walkforward_sharpes,
++        data_span_days: honesty.data_span_days,
++        se_sharpe: honesty.se_sharpe,
++        verdict,
++        gap_ref: honesty.gap_ref,
++        ledger_cutoff: honesty.ledger_cutoff,
++    };
++
++    fs::create_dir_all(config.report_dir).map_err(RcError::Io)?;
++    let json_path = config.report_dir.join("R-001-obi-trackA.json");
++    let md_path = config.report_dir.join("R-001-obi-trackA.md");
++    write_metrics_json(&report, &json_path)?;
++    write_narrative_md(&report, &md_path)?;
++    Ok(report)
++}
++
++/// Детерминированный sha256 всех raw journal-сегментов выборки.
++///
++/// Имена и байты сегментов хэшируются в лексикографическом порядке. Чтение
++/// чанковое: многогигабайтный боевой срез не материализуется в RAM только ради
++/// provenance отчёта.
+ pub fn journal_sha256(journal_dir: &Path) -> Result<String, RcError> {
+-    let path = journal_dir.join(JOURNAL_SEGMENT_FILE);
+-    let bytes = fs::read(&path).map_err(RcError::Io)?;
+-    Ok(sha256_hex(&bytes))
++    let mut segments: Vec<_> = fs::read_dir(journal_dir)
++        .map_err(RcError::Io)?
++        .filter_map(Result::ok)
++        .map(|entry| entry.path())
++        .filter(|path| {
++            path.extension()
++                .is_some_and(|extension| extension == "jrnl")
++        })
++        .collect();
++    segments.sort();
++    if segments.is_empty() {
++        return Err(RcError::CorruptInput(format!(
++            "{}: journal-сегменты не найдены",
++            journal_dir.display()
++        )));
++    }
++
++    let mut hasher = Sha256::new();
++    let mut buffer = vec![0_u8; 1024 * 1024];
++    for path in segments {
++        let name = path
++            .file_name()
++            .and_then(|name| name.to_str())
++            .ok_or_else(|| RcError::CorruptInput(format!("невалидное имя: {}", path.display())))?;
++        hasher.update(name.as_bytes());
++        hasher.update([0]);
++        let mut file = fs::File::open(&path).map_err(RcError::Io)?;
++        loop {
++            let read = file.read(&mut buffer).map_err(RcError::Io)?;
++            if read == 0 {
++                break;
++            }
++            hasher.update(&buffer[..read]);
++        }
++        hasher.update([0xff]);
++    }
++    Ok(hasher
++        .finalize()
++        .iter()
++        .map(|byte| format!("{byte:02x}"))
++        .collect())
+ }
+ 
+ /// Проверить пре-регистрацию: карточка существует и содержит непустой раздел
+@@ -80,6 +594,13 @@ pub fn require_preregistration(hypothesis_card: &Path) -> Result<(), RcError> {
+ /// Записать metrics.json детерминированно (serde_json по фиксированному порядку
+ /// полей структуры; повторный вызов с тем же отчётом → байт-идентичный файл).
+ pub fn write_metrics_json(report: &ValidationReport, path: &Path) -> Result<(), RcError> {
++    validate_report_honesty(&ReportHonesty {
++        data_span_days: report.data_span_days,
++        se_sharpe: report.se_sharpe,
++        gap_ref: report.gap_ref.clone(),
++        ledger_cutoff: report.ledger_cutoff.clone(),
++    })
++    .map_err(RcError::GateDenied)?;
+     let mut json =
+         serde_json::to_string_pretty(report).map_err(|e| RcError::Parse(e.to_string()))?;
+     json.push('\n');
+@@ -105,6 +626,11 @@ pub fn write_narrative_md(report: &ValidationReport, path: &Path) -> Result<(),
+     ));
+     s.push_str(&format!("- net_pnl_e8: {}\n", report.net_pnl_e8));
+     s.push_str(&format!("- sharpe: {:.6}\n", report.sharpe));
++    s.push_str(&format!("- se_sharpe: {:.6}\n", report.se_sharpe));
++    s.push_str(&format!("- data_span_days: {:.6}\n", report.data_span_days));
++    s.push_str(&format!("- verdict: {:?}\n", report.verdict));
++    s.push_str(&format!("- gap_ref: {}\n", report.gap_ref));
++    s.push_str(&format!("- ledger_cutoff: {}\n", report.ledger_cutoff));
+     s.push_str(&format!(
+         "- deflated_sharpe: {:.6}\n",
+         report.deflated_sharpe
+diff --git a/crates/research-cli/src/types.rs b/crates/research-cli/src/types.rs
+index 052bf2a..8d4d848 100644
+--- a/crates/research-cli/src/types.rs
++++ b/crates/research-cli/src/types.rs
+@@ -7,7 +7,7 @@
+ 
+ use serde::{Deserialize, Serialize};
+ 
+-pub const REPORT_SCHEMA_VERSION: u32 = 1;
++pub const REPORT_SCHEMA_VERSION: u32 = 2;
+ pub const TRIALS_LEDGER_SCHEMA_VERSION: u32 = 1;
+ 
+ #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+@@ -101,6 +101,49 @@ pub struct StressResult {
+     pub net_pnl_e8: i64,
+ }
+ 
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum Verdict {
++    Kill(String),
++    Inconclusive(String),
++    Pass,
++}
++
++impl Serialize for Verdict {
++    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
++    where
++        S: serde::Serializer,
++    {
++        match self {
++            Self::Kill(reason) => serializer.serialize_str(&format!("Kill: {reason}")),
++            Self::Inconclusive(reason) => {
++                serializer.serialize_str(&format!("Inconclusive: {reason}"))
++            }
++            Self::Pass => serializer.serialize_str("Pass"),
++        }
++    }
++}
++
++impl<'de> Deserialize<'de> for Verdict {
++    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
++    where
++        D: serde::Deserializer<'de>,
++    {
++        let value = String::deserialize(deserializer)?;
++        if value == "Pass" {
++            return Ok(Self::Pass);
++        }
++        if let Some(reason) = value.strip_prefix("Kill: ") {
++            return Ok(Self::Kill(reason.to_string()));
++        }
++        if let Some(reason) = value.strip_prefix("Inconclusive: ") {
++            return Ok(Self::Inconclusive(reason.to_string()));
++        }
++        Err(serde::de::Error::custom(
++            "verdict должен быть Pass, Kill: <reason> или Inconclusive: <reason>",
++        ))
++    }
++}
++
+ /// Финальный детерминированный отчёт (T1; RC-I-5: байт-идентичен при тех же входах —
+ /// НИКАКИХ wall-clock полей внутри).
+ #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+@@ -127,6 +170,16 @@ pub struct ValidationReport {
+     pub decay: Vec<(i64, f64)>,
+     pub stress: Vec<StressResult>,
+     pub walkforward_sharpes: Vec<f64>,
++    /// Календарная длина окна, на котором считался отчёт (KS-I-1/5).
++    pub data_span_days: f64,
++    /// Стандартная ошибка годового Sharpe (KS-I-1).
++    pub se_sharpe: f64,
++    /// Машинный kill-screen вердикт (KS-I-4).
++    pub verdict: Verdict,
++    /// Ссылка на E8 gap-артефакт именно этого окна (KS-I-5).
++    pub gap_ref: String,
++    /// Граница эпохи trials-ledger (TD-015), например `5141fd9`.
++    pub ledger_cutoff: String,
+ }
+ 
+ #[derive(Debug)]
+diff --git a/crates/research-cli/tests/red_killscreen.rs b/crates/research-cli/tests/red_killscreen.rs
+new file mode 100644
+index 0000000..2e39998
+--- /dev/null
++++ b/crates/research-cli/tests/red_killscreen.rs
+@@ -0,0 +1,333 @@
++//! RED KS-I-* KILL-SCREEN ЧЕСТНОСТЬ (sacred, architect-only) — M-10 R-001. `docs/02-quant-desk.md` §4.
++//!
++//! R-001 — первое сквозное испытание research-стека. На коротком окне данных точечный Sharpe
++//! недостоверен (SE годового Sharpe ≈ ±11 на 3–7 днях). Отчёт НЕ СМЕЕТ заявить промоушабельный
++//! сигнал на шуме — это тот же анти-плацебо класс, что 7 раундов TD-027, но для ВЫВОДА research'а.
++//!
++//! Контракт (research-dev impl): `research_cli::report::{Verdict, KillScreenInputs, classify_verdict}`:
++//!   `classify_verdict(&KillScreenInputs, bar: f64) -> Verdict { Kill(String) | Inconclusive(String) | Pass }`
++//! Логика (порядок важен):
++//!   1. сработал ЛЮБОЙ пре-рег критерий фальсификации (H-20260710) → `Kill(reason)`:
++//!      oos_sharpe ≤ 0.5 | deflated_sharpe ≤ 0 | walkforward_min_sharpe < 0 (нестабилен) |
++//!      half_life_ms < horizon_ms (decay) | worst_stress_net_pnl_e8 < 0 (fill-PnL под ×1.5/×2);
++//!   2. иначе `sharpe − 2·se_sharpe > bar` (нижняя 95%-граница выше бара) → `Pass`;
++//!   3. иначе → `Inconclusive`.
++//!
++//! Анти-плацебо В ОБЕ СТОРОНЫ:
++//!  - impl, штампующий `Pass` игнорируя `se_sharpe` (шумный SR) → валит KS-I-1a;
++//!  - impl «всё Inconclusive» → валит KS-I-4* (реальный Kill-критерий) И KS-I-1b (достижимый Pass);
++//!  - impl «всё Kill» → валит KS-I-1b.
++//!
++//! ВТОРОЙ контракт (KS-I-5/KS-I-3, C-019 B2/B3 — ЧЕСТНОСТЬ ОТЧЁТА, отдельно от классификатора):
++//!   `research_cli::report::{ReportHonesty, validate_report_honesty}`:
++//!   `validate_report_honesty(&ReportHonesty) -> Result<(), String>`.
++//! Вердикт классификатора БЕЗ доказательства честности окна и эпохи ledger'а НЕДОСТОВЕРЕН.
++//! Валидатор УЗКИЙ (не часть `KillScreenInputs`): gap-статистика (E8) и эпоха ledger'а (TD-015)
++//! генерируются ВНЕ `classify_verdict`, поэтому гейтятся отдельным report-level оракулом.
++//! Правила (research-dev обязан завести их и звать ПЕРЕД записью R-001):
++//!   - `gap_ref` пуст → `Err` (KS-I-5: вердикт без честности окна = ложь);
++//!   - `ledger_cutoff` пуст ИЛИ = пре-M-07 эпохе `f7f4761` → `Err` (TD-015/KS-I-3: несопоставимо);
++//!   - `data_span_days` не конечен / ≤ 0 → `Err`; `se_sharpe` не конечен / < 0 → `Err`.
++//!
++//! Анти-плацебо В ОБЕ СТОРОНЫ: валидатор «всегда Ok» валит err-тесты; «всегда Err» валит
++//! `honest_report_is_reachable_valid` (полностью честный отчёт обязан проходить).
++
++use research_cli::report::{
++    classify_verdict, sharpe_se, validate_report_honesty, KillScreenInputs, ReportHonesty, Verdict,
++};
++
++/// Бар нижней CI-границы Sharpe (KS-I-1) — фикс, не калибруется (согласован с пре-рег «≤0.5 → мёртв»).
++const BAR: f64 = 0.5;
++
++/// Здоровые (не-Kill) значения пре-рег критериев; конкретный тест переопределяет нужные поля.
++fn healthy() -> KillScreenInputs {
++    KillScreenInputs {
++        sharpe: 2.0,
++        se_sharpe: 0.3,
++        data_span_days: 120.0,
++        oos_sharpe: 1.2,             // > 0.5
++        deflated_sharpe: 0.8,        // > 0
++        walkforward_min_sharpe: 0.6, // ≥ 0 (стабилен)
++        half_life_ms: 5_000,         // ≥ horizon
++        horizon_ms: 1_000,
++        worst_stress_net_pnl_e8: 10_000_000, // > 0
++    }
++}
++
++// ── KS-I-4: пре-рег критерий сработал → Kill (машинно, не «на глаз») ───────────────────────────
++
++#[test]
++fn ks_i_4_low_oos_sharpe_is_killed() {
++    let mut i = healthy();
++    i.oos_sharpe = 0.3; // ≤ 0.5 → пре-рег «мёртв»
++    assert!(
++        matches!(classify_verdict(&i, BAR), Verdict::Kill(_)),
++        "oos_sharpe=0.3 (≤0.5, пре-рег критерий) НЕ дал Kill — критерий фальсификации не применён \
++         машинно (KS-I-4). Отчёт обязан УБИВАТЬ по пре-рег числам, а не звать это Inconclusive"
++    );
++}
++
++#[test]
++fn ks_i_4_nonpositive_deflated_is_killed() {
++    let mut i = healthy();
++    i.deflated_sharpe = -0.1; // ≤ 0 → мёртв (перебор съел edge)
++    assert!(
++        matches!(classify_verdict(&i, BAR), Verdict::Kill(_)),
++        "deflated_sharpe=-0.1 (≤0, поправка на trials-ledger) НЕ дал Kill — оверфит не отсечён (KS-I-4)"
++    );
++}
++
++#[test]
++fn ks_i_4_negative_stress_pnl_is_killed() {
++    let mut i = healthy();
++    i.worst_stress_net_pnl_e8 = -5_000_000; // отрицательный PnL под ×1.5-издержки/×2-латентность
++    assert!(
++        matches!(classify_verdict(&i, BAR), Verdict::Kill(_)),
++        "отрицательный net-PnL под стрессом (×1.5/×2) НЕ дал Kill — сигнал не выживает честные издержки \
++         (пре-рег критерий fill-PnL, KS-I-4)"
++    );
++}
++
++#[test]
++fn ks_i_4_decay_faster_than_horizon_is_killed() {
++    let mut i = healthy();
++    i.half_life_ms = 400;
++    i.horizon_ms = 1_000; // полураспад < горизонта удержания → edge выеден раньше выхода
++    assert!(
++        matches!(classify_verdict(&i, BAR), Verdict::Kill(_)),
++        "half-life (400мс) < horizon (1000мс) НЕ дал Kill — decay-критерий не применён (KS-I-4)"
++    );
++}
++
++// ── KS-I-1: PASS запрещён без нижней CI-границы над баром (шумный SR ≠ живой сигнал) ────────────
++
++#[test]
++fn ks_i_1a_high_sharpe_wide_se_is_not_pass() {
++    let mut i = healthy();
++    i.sharpe = 3.0;
++    i.se_sharpe = 5.0; // короткое окно → огромная SE: sharpe−2·se = 3−10 = −7 ≤ BAR
++    i.data_span_days = 5.0; // 3–7 дней — kill-screen территория
++    let v = classify_verdict(&i, BAR);
++    assert!(
++        !matches!(v, Verdict::Pass),
++        "sharpe=3.0, но se=5.0 (нижняя CI-граница −7 ≤ BAR=0.5, окно 5 дней) → классификатор дал Pass \
++         (`{v:?}`). Это ложный промоушен на ШУМЕ — ровно то, что kill-screen обязан запретить: PASS \
++         требует sharpe−2·se > BAR (KS-I-1). Impl, игнорирующий se, тут падает"
++    );
++    assert!(
++        matches!(v, Verdict::Inconclusive(_)),
++        "здоровые пре-рег критерии + недостоверный SR → обязан быть Inconclusive, а не Kill/Pass"
++    );
++}
++
++#[test]
++fn ks_i_1b_high_sharpe_tight_se_is_reachable_pass() {
++    let mut i = healthy();
++    i.sharpe = 3.0;
++    i.se_sharpe = 0.5; // достаточно данных: sharpe−2·se = 3−1 = 2 > BAR=0.5
++    i.data_span_days = 400.0;
++    assert!(
++        matches!(classify_verdict(&i, BAR), Verdict::Pass),
++        "sharpe=3.0, se=0.5 (нижняя CI-граница 2.0 > BAR, окно 400 дней), все пре-рег критерии \
++         здоровы → Pass ДОСТИЖИМ. Оракул валит impl «всё Inconclusive/Kill» (Pass обязан быть \
++         возможен на хороших+обильных данных, иначе kill-screen — не гейт, а заглушка)"
++    );
++}
++
++#[test]
++fn ks_i_1_kill_precedes_pass() {
++    // Даже при формально проходящей CI-границе, сработавший Kill-критерий имеет ПРИОРИТЕТ.
++    let mut i = healthy();
++    i.sharpe = 3.0;
++    i.se_sharpe = 0.5; // CI-граница прошла бы Pass...
++    i.deflated_sharpe = -0.2; // ...но deflated ≤ 0 → мёртв
++    assert!(
++        matches!(classify_verdict(&i, BAR), Verdict::Kill(_)),
++        "Kill-критерий (deflated ≤0) обязан иметь приоритет над Pass — иначе оверфитнутый сигнал \
++         с узкой CI проскочит в Pass (порядок KS-I-4 → KS-I-1)"
++    );
++}
++
++// ── Детерминизм (чистая функция) ──────────────────────────────────────────────────────────────
++
++#[test]
++fn classify_verdict_is_deterministic() {
++    let i = healthy();
++    let a = format!("{:?}", classify_verdict(&i, BAR));
++    let b = format!("{:?}", classify_verdict(&i, BAR));
++    assert_eq!(
++        a, b,
++        "classify_verdict недетерминирована — вердикт research'а обязан быть воспроизводим"
++    );
++}
++
++// ── KS-I-5 / KS-I-3: ЧЕСТНОСТЬ ОТЧЁТА (C-019 B2/B3) ─────────────────────────────────────────────
++// Отдельный, УЗКИЙ валидатор: gap-статистика окна (E8) и эпоха ledger'а (TD-015) не входят в
++// `classify_verdict`, поэтому гейтятся здесь. Прод-РЕЖИМ значения (урок TD-031): `ledger_cutoff`
++// сравнивается с РЕАЛЬНЫМ пре-M-07 хэшем `f7f4761` (фикстура не выдумывает удобный хэш).
++
++/// Полностью честный отчёт; конкретный тест портит ОДНО поле.
++fn honest_report() -> ReportHonesty {
++    ReportHonesty {
++        data_span_days: 11.0, // реальное окно own-capture (2026-07-10..21)
++        se_sharpe: 3.4,       // на 11 днях SE большая — честно
++        gap_ref: "research/data-quality/gaps-own-2026-07.json".to_string(),
++        ledger_cutoff: "5141fd9".to_string(), // эпоха «strategy brain» (TD-015 граница)
++    }
++}
++
++#[test]
++fn ks_i_5_empty_gap_ref_is_invalid() {
++    // Отсутствие: gap_ref не задан → вердикт без честности окна (E8) недостоверен.
++    let mut r = honest_report();
++    r.gap_ref = String::new();
++    assert!(
++        validate_report_honesty(&r).is_err(),
++        "отчёт БЕЗ gap_ref (E8 gap-артефакт тестового окна) обязан быть НЕВАЛИДЕН — KS-I-5: вердикт \
++         не смеет молчать о дырах в данных, на которых он посчитан. Валидатор-заглушка «всегда Ok» тут падает"
++    );
++}
++
++#[test]
++fn ks_i_3_pre_m07_ledger_epoch_is_invalid() {
++    // Прод-режим значение: РЕАЛЬНЫЙ пре-M-07 хэш, а не выдуманный (TD-015 дискриминатор).
++    let mut r = honest_report();
++    r.ledger_cutoff = "f7f4761".to_string();
++    assert!(
++        validate_report_honesty(&r).is_err(),
++        "ledger_cutoff = пре-M-07 эпоха f7f4761 (меряла ЛОГИКУ, КОТОРОЙ НЕТ — TD-015) обязан ВАЛИТЬ \
++         валидацию: смешение эпох в deflated-Sharpe = ложный ориентир для подписи founder'а (KS-I-3)"
++    );
++}
++
++#[test]
++fn ks_i_3_empty_ledger_cutoff_is_invalid() {
++    // Отсутствие: отчёт обязан НАЗВАТЬ эпоху (KS-I-3), молчание = невалиден.
++    let mut r = honest_report();
++    r.ledger_cutoff = String::new();
++    assert!(
++        validate_report_honesty(&r).is_err(),
++        "отчёт БЕЗ названной эпохи ledger'а (пустой ledger_cutoff) невалиден — KS-I-3 требует, чтобы \
++         отчёт САМ называл диапазон записей, по которым посчитан deflated-Sharpe"
++    );
++}
++
++#[test]
++fn ks_i_5_nonfinite_span_or_negative_se_is_invalid() {
++    // Границы: span должен быть конечным и > 0; se — конечным и ≥ 0.
++    let mut r = honest_report();
++    r.data_span_days = f64::NAN;
++    assert!(
++        validate_report_honesty(&r).is_err(),
++        "data_span_days = NaN (окно неизвестно) обязан валить — без длины окна SE-достоверность неоценима"
++    );
++    let mut r2 = honest_report();
++    r2.se_sharpe = -1.0;
++    assert!(
++        validate_report_honesty(&r2).is_err(),
++        "se_sharpe < 0 бессмысленна (стандартная ошибка неотрицательна) — отчёт с ней невалиден"
++    );
++}
++
++#[test]
++fn honest_report_is_reachable_valid() {
++    // Достижимость: полностью честный отчёт ОБЯЗАН проходить, иначе валидатор «всегда Err» —
++    // заглушка, а не гейт (анти-плацебо со стороны Ok).
++    assert!(
++        validate_report_honesty(&honest_report()).is_ok(),
++        "полностью честный отчёт (gap_ref задан, эпоха ≥5141fd9, span/se конечны) обязан быть ВАЛИДЕН"
++    );
++}
++
++// ── KS-I-1 ЯДРО: se_sharpe ПРИВЯЗАН К КАЛЕНДАРНОМУ ОКНУ, не к числу шагов (C-020 A, БЛОКЕР) ─────
++// Находка risk-critic C-020 A (HIGH): `sharpe_se(returns, sharpe)` считал se от returns.len()
++// (~1.4e4 шагов) → se=0.27 на окне 0.353 дня → гейт KS-I-1 (sharpe−2·se>BAR) DEFEATED: ложный PASS
++// достижим на 8-часовом окне (sharpe>~1.04). Это ровно исход, объявленный «АРХИТЕКТУРНО ЗАПРЕЩЁН».
++// Здесь Kill не дал ему проявиться (oos<0), но на положительном сигнале защита не сработала бы.
++//
++// КОНТРАКТ (research-dev impl): сигнатура МЕНЯЕТСЯ — se зависит от КАЛЕНДАРНОГО span, не от шагов:
++//   `pub fn sharpe_se(sharpe: f64, data_span_days: f64) -> f64`
++// Масштаб задан ПРЕМИССОЙ самого milestone'а («SE годового Sharpe ≈ ±11 на 3–7 днях»):
++//   se ≈ sqrt(DAYS_PER_YEAR / data_span_days · (1 + 0.5·sharpe²/ppy)) ⇒ на 3д ≈11, на 7д ≈7, на 0.35д ≈32.
++// Точную константу (252 trading / 365 календарь; форма SR-члена) выбирает research-dev и ДОКУМЕНТИРУЕТ;
++// оракул пиннит МАСШТАБ и ПОВЕДЕНИЕ, а не константу. Компайл-RED против старой сигнатуры (returns).
++//
++// Прод-режим значение (урок TD-031): фикстуры используют РЕАЛЬНОЕ окно R-001 (0.353 дня), где дефект
++// и проявился, а не «удобное» большое окно, которое замаскировало бы step-count реализацию.
++
++/// Здоровые пре-рег критерии + заданные sharpe/se — чтобы Kill не преempt'ил KS-I-1.
++fn healthy_with(sharpe: f64, se_sharpe: f64, span: f64) -> KillScreenInputs {
++    KillScreenInputs {
++        sharpe,
++        se_sharpe,
++        data_span_days: span,
++        ..healthy()
++    }
++}
++
++#[test]
++fn a1_se_is_huge_on_short_window() {
++    // Реальное окно R-001: 0.353 дня. Любая календарная формула даёт se ~27..40; step-count → 0.27.
++    let se = sharpe_se(1.0, 0.353);
++    assert!(
++        se > 10.0,
++        "se на окне 0.353 дня = {se} (ожидается ~30). Значение <10 означает привязку к числу ШАГОВ \
++         (returns.len), а не к КАЛЕНДАРНОМУ окну — KS-I-1 defeated (C-020 A). se=0.27 тут падает"
++    );
++}
++
++#[test]
++fn a2_se_matches_milestone_premise_on_days() {
++    // Премисса milestone: «SE годового Sharpe ≈ ±11 на 3–7 днях». Пиннит масштаб к дням.
++    let se3 = sharpe_se(1.0, 3.0);
++    let se7 = sharpe_se(1.0, 7.0);
++    assert!(
++        (5.0..=25.0).contains(&se3),
++        "se на 3 днях = {se3}, ожидается порядок ±11 (премисса milestone). Вне [5,25] → масштаб сломан"
++    );
++    assert!(
++        (3.0..=20.0).contains(&se7),
++        "se на 7 днях = {se7}, ожидается порядок ±7. Вне [3,20] → масштаб сломан"
++    );
++}
++
++#[test]
++fn a3_se_decreases_monotonically_with_span() {
++    // Больше КАЛЕНДАРНЫХ данных → теснее оценка. Step-count реализация этого не гарантирует
++    // (при равномерной частоте returns.len ∝ span, но при неравномерной — нет; календарь — гарантирует).
++    let s0 = sharpe_se(1.0, 0.353);
++    let s1 = sharpe_se(1.0, 3.0);
++    let s2 = sharpe_se(1.0, 30.0);
++    let s3 = sharpe_se(1.0, 365.0);
++    assert!(
++        s0 > s1 && s1 > s2 && s2 > s3,
++        "se обязан УБЫВАТЬ с календарным окном: {s0} > {s1} > {s2} > {s3} — иначе окно не влияет на достоверность"
++    );
++}
++
++#[test]
++fn a4_se_is_tight_on_long_window() {
++    // 10 лет данных → se мал → Pass достижим честно.
++    let se = sharpe_se(1.0, 3650.0);
++    assert!(
++        se < 1.0,
++        "se на 10-летнем окне = {se}, ожидается <1 (данных много) — иначе Pass недостижим НИКОГДА"
++    );
++}
++
++#[test]
++fn a5_short_window_defeats_pass_long_window_reaches_it() {
++    // ИНТЕГРАЦИЯ с classify_verdict: честный se закрывает ложный PASS на коротком окне
++    // и оставляет Pass достижимым на длинном (иначе kill-screen — заглушка, а не гейт).
++    let short = healthy_with(3.0, sharpe_se(3.0, 0.353), 0.353);
++    assert!(
++        !matches!(classify_verdict(&short, BAR), Verdict::Pass),
++        "sharpe=3 на окне 0.353 дня при ЧЕСТНОМ se не смеет дать Pass — на 8 часах годовой SR это шум (KS-I-1)"
++    );
++    let long = healthy_with(3.0, sharpe_se(3.0, 3650.0), 3650.0);
++    assert!(
++        matches!(classify_verdict(&long, BAR), Verdict::Pass),
++        "sharpe=3 на 10-летнем окне при честном se ОБЯЗАН давать Pass — иначе honest se сделал kill-screen \
++         неспособным к Pass вообще (заглушка). Достижимость Pass — анти-плацебо со стороны «всё зарубить»"
++    );
++}
+diff --git a/crates/research-cli/tests/red_research.rs b/crates/research-cli/tests/red_research.rs
+index 311ffcc..2d098b4 100644
+--- a/crates/research-cli/tests/red_research.rs
++++ b/crates/research-cli/tests/red_research.rs
+@@ -12,7 +12,7 @@ use research_cli::report::{require_preregistration, write_metrics_json};
+ use research_cli::split::SplitState;
+ use research_cli::types::{
+     CostsMode, GridSpec, RcError, SplitKind, StressResult, TimeSplit, TrialRecord,
+-    ValidationReport, REPORT_SCHEMA_VERSION, TRIALS_LEDGER_SCHEMA_VERSION,
++    ValidationReport, Verdict, REPORT_SCHEMA_VERSION, TRIALS_LEDGER_SCHEMA_VERSION,
+ };
+ use sim::{FeeRates, FeeSchedule, LatencyTable};
+ 
+@@ -435,6 +435,14 @@ fn fixed_report() -> ValidationReport {
+             net_pnl_e8: to_fixed(6.0),
+         }],
+         walkforward_sharpes: vec![0.9, 1.2, 0.8],
++        // C-019 rev2: обязательные поля честности kill-screen (M-10). Значения фикстуры —
++        // детерминизм RC-I-5, не классификация; вердикт Inconclusive (не Pass — не подразумеваем
++        // промоушен), эпоха ≥5141fd9, gap_ref задан.
++        data_span_days: 120.0,
++        se_sharpe: 0.3,
++        verdict: Verdict::Inconclusive("fixture: RC-I-5 determinism".into()),
++        gap_ref: "research/data-quality/gaps-own-2026-07.json".into(),
++        ledger_cutoff: "5141fd9".into(),
+     }
+ }
+ 
+diff --git a/crates/research-cli/tests/red_stack_honesty.rs b/crates/research-cli/tests/red_stack_honesty.rs
+new file mode 100644
+index 0000000..8d41619
+--- /dev/null
++++ b/crates/research-cli/tests/red_stack_honesty.rs
+@@ -0,0 +1,122 @@
++//! RED — ЧЕСТНОСТЬ СТЕКА КАК ИЗМЕРИТЕЛЬНОГО ИНСТРУМЕНТА (sacred, architect-only).
++//! Находки risk-critic C-020 B/C/D. Цель R-001 (Objective M-10) — «первое сквозное испытание
++//! стека». Прогон вскрыл, что абсолютные величины отчёта нефизичны: стек как ИЗМЕРИТЕЛЬ ещё не
++//! провалидирован. Для Kill сигнала это не важно (Sharpe масштаб-инвариантен), но ДО того как
++//! отчёту доверят НЕ-Kill вывод, эти дефекты обязаны быть закрыты. Все — компайл-RED против
++//! текущего impl (новые символы отсутствуют), анти-плацебо в обе стороны.
++//!
++//! Контракт (research-dev impl):
++//!   B: `report::fill_probability(filled_intents, intents) -> f64` ∈ [0,1] (честная вероятность);
++//!      поле отчёта `fill_rate` (=fills/intents, может быть >1) ПЕРЕИМЕНОВАНО в `fills_per_intent`.
++//!   C: `report::validate_sizing_honesty(sizing_applied: bool, capacity_notional_e8: i64) -> Result<(),String>`
++//!      — при `!sizing_applied` положительная capacity ЗАПРЕЩЕНА (unsized прогон не измеряет ёмкость
++//!      для аккаунта $500–2k; §4 лимиты не применены). Отчёт несёт `sizing_applied`.
++//!   D: `metrics::robust_family_variance(&[f64]) -> f64` — устойчива к ОДНОМУ экстремальному выбросу
++//!      (winsorize/trim/MAD); `deflated_sharpe` берёт ЕЁ, а не наивную `variance(&family_sharpes)`.
++
++use research_cli::metrics::robust_family_variance;
++use research_cli::report::{fill_probability, validate_sizing_honesty};
++
++// ── B: fill-МЕТРИКА честна по имени и диапазону (C-020 B) ───────────────────────────────────────
++// Прод-факт: отчёт нёс `fill_rate = 1.99` (>1) — «доля исполнения» физически ∈[0,1]. По коду это
++// fills/intents (≈2 = вход+выход). Пре-рег критерий №5 ссылается на ВЕРОЯТНОСТЬ исполнения → метрика
++// измеряла НЕ ТО. Честная вероятность обязана быть ∈[0,1] по построению (filled_intents ≤ intents).
++
++#[test]
++fn b_fill_probability_is_in_unit_interval() {
++    assert_eq!(
++        fill_probability(0, 0),
++        0.0,
++        "нет интентов → вероятность 0, не NaN/деление на ноль"
++    );
++    assert!(
++        (fill_probability(5, 10) - 0.5).abs() < 1e-12,
++        "5 из 10 интентов исполнены → вероятность 0.5"
++    );
++    assert!(
++        (0.0..=1.0).contains(&fill_probability(10, 10)),
++        "все интенты исполнены → вероятность 1.0, НЕ выше"
++    );
++    // Прод-режим значение (реальные числа R-001): даже при 1.99 fills/intent вероятность ≤ 1.
++    for (filled, intents) in [(3usize, 7usize), (7, 7), (1, 1000), (0, 5)] {
++        let p = fill_probability(filled, intents);
++        assert!(
++            (0.0..=1.0).contains(&p),
++            "fill_probability({filled},{intents})={p} вне [0,1] — метрика с именем «вероятность/rate» \
++             ОБЯЗАНА быть в единичном интервале (C-020 B); fills/intents=1.99 — это НЕ вероятность"
++        );
++    }
++}
++
++// ── C: unsized прогон не смеет заявлять ёмкость (C-020 C) ─────────────────────────────────────────
++// Прод-факт: capacity_notional = $508M, turnover = $10B на аккаунт $500–2k — sim гонял БЕЗ
++// max_position/max_order (§4 DESIGN). Для Kill Sharpe масштаб-инвариантен (вывод верен), но поле
++// capacity вводит в заблуждение. Решение architect: R-001 kill-screen идёт UNSIZED (профиль лимитов
++// — зона M-11/M-12 risk/portfolio); отчёт ОБЯЗАН это назвать и НЕ выдавать нефизичную ёмкость.
++
++const R001_CAPACITY_E8: i64 = 50_794_443_807_313_248; // реальное поле прогона (нефизично для $500–2k)
++
++#[test]
++fn c_unsized_run_must_not_claim_capacity() {
++    assert!(
++        validate_sizing_honesty(false, R001_CAPACITY_E8).is_err(),
++        "unsized прогон (sizing_applied=false) с положительной capacity вводит в заблуждение: он измеряет \
++         безлимитный оборот, а не ёмкость для наших размеров. При !sizing_applied capacity обязана быть N/A (0)"
++    );
++    assert!(
++        validate_sizing_honesty(false, 0).is_ok(),
++        "unsized прогон с capacity=0 (явно N/A) — честно"
++    );
++    assert!(
++        validate_sizing_honesty(true, R001_CAPACITY_E8).is_ok(),
++        "sized прогон (лимиты §4 применены) ВПРАВЕ заявлять ёмкость — тогда число физично"
++    );
++}
++
++// ── D: V[SR] семейства робастна к выбросу (C-020 D, форвардный риск) ──────────────────────────────
++// Прогон дописал в ledger obi-испытания с Sharpe до −226.79. `deflated_sharpe` берёт
++// variance(family_sharpes) (report.rs) → выброс раздувает V[SR] → раздувает SR₀ → будущие DSR
++// занижены. Здесь роли не играет (raw SR<0 → DSR=0), но всплывёт на первой ячейке SR>0.
++
++#[test]
++fn d_family_variance_is_robust_to_single_extreme_outlier() {
++    // Штатное семейство (тесное), затем тот же ряд + ОДИН реальный выброс −226.79.
++    let tight = vec![
++        -1.0, -1.2, -0.9, -1.1, -1.05, -0.95, -1.3, -0.8, -1.15, -0.85,
++    ];
++    let with_outlier = {
++        let mut v = tight.clone();
++        v.push(-226.79); // реальное значение из прогона (прод-режим, не выдуманное)
++        v
++    };
++
++    let vr_tight = robust_family_variance(&tight);
++    let vr_out = robust_family_variance(&with_outlier);
++
++    assert!(
++        vr_tight.is_finite() && vr_tight >= 0.0,
++        "робастная дисперсия конечна и ≥0"
++    );
++    // ОДИН выброс не смеет раздуть робастную V[SR] более чем в ~2× (winsorize/trim/MAD его гасит).
++    // Наивная variance тут выросла бы на ПОРЯДКИ (mean уезжает к −21, var ~4500) — анти-плацебо:
++    // реализация robust_family_variance = наивная variance ЗДЕСЬ ПАДАЕТ.
++    assert!(
++        vr_out <= vr_tight * 2.0 + 0.05,
++        "робастная V[SR] раздулась от ОДНОГО выброса −226.79: tight={vr_tight}, с выбросом={vr_out}. \
++         Наивная variance раздувает SR₀ → будущие deflated-Sharpe искусственно занижены (C-020 D). \
++         Нужна winsorize/trim/MAD-устойчивая оценка"
++    );
++}
++
++#[test]
++fn d_robust_variance_still_tracks_real_spread() {
++    // Анти-плацебо со стороны «всегда 0»: робастная дисперсия не смеет быть тождественным нулём —
++    // на реально разбросанном (без выбросов) семействе она положительна.
++    let spread = vec![0.2, -0.4, 0.9, -0.7, 0.5, -0.3, 0.8, -0.6, 0.1, -0.9];
++    let vr = robust_family_variance(&spread);
++    assert!(
++        vr > 0.0,
++        "робастная дисперсия реально разбросанного семейства = {vr}; тождественный ноль = заглушка, \
++         которая убила бы поправку deflated-Sharpe (оверфит-защита исчезла)"
++    );
++}

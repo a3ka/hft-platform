@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/contracts",
+  "crates/derive",
+  "crates/journal",
+  "crates/book",
+  "crates/ops",
+  "crates/venue-binance",
+  "crates/venue-binance-futures",
+  "crates/venue-hyperliquid",
+  "crates/recorder",
+  "crates/signals",
+  "crates/alpha",
+  "crates/portfolio",
+  "crates/strategy",
+  "crates/sim",
+  "crates/research-cli",
+  "crates/gateway",
+  "crates/gateway-serve",
+]
+
+# M-00 bootstrap: минимальный работающий скелет (recorder-заглушка + contracts).
+# Реальные крейты (journal, book, venues, risk, ...) добавляются пофазно per docs/DESIGN.md §10.
+
+[workspace.package]
+edition = "2021"
+license = "UNLICENSED"
+authors = ["a3ka"]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
