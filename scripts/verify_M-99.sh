@@ -127,6 +127,9 @@ chk "! grep -qE 'printf [^|]*\\|[[:space:]]*grep -q' ${DRILL}"
 chk "! grep -qE '^[[:space:]]*exec 9>\"[^\"]*\"[[:space:]]+2>/dev/null' ${DRILL}"
 chk "grep -q '^ps_judge()' scripts/tests/red_restore_drill.sh && grep -q '^dv_judge()' scripts/tests/red_restore_drill.sh && grep -q 'PS-M/DV-M судьи' scripts/tests/red_restore_drill.sh"
 chk "grep -q '^sr_judge()' scripts/tests/red_restore_drill.sh && grep -q '^sr_case \"SR-1' scripts/tests/red_restore_drill.sh && grep -q '^sr_case \"SR-2' scripts/tests/red_restore_drill.sh && grep -q 'SR-M судья принял' scripts/tests/red_restore_drill.sh"
+# §4 стр.12 (в) «индекс без форм в листинге» (`R-269` Б-1/Б-2) судит ИСПОЛНЕНИЕМ `MF`/`MF-M` пробы
+# (ложное «нет» here-string при сбое временного файла); здесь — что семейство не выпало из пробы.
+chk "grep -q '^mf_judge()' scripts/tests/red_restore_drill.sh && grep -q '^  mf_case \"MF-1' scripts/tests/red_restore_drill.sh && grep -q '^  mf_case \"MF-2' scripts/tests/red_restore_drill.sh && grep -q 'MF-M судья принял' scripts/tests/red_restore_drill.sh"
 
 step "task #2b — читатель существует, различает коды, попадает в прод-образ"
 chk "test -f ${READER}"
