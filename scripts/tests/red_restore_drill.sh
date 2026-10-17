@@ -626,8 +626,15 @@ rm -rf "${RESTORE}"; mkdir -p "${RESTORE}"
 # Каталог восстановления ПУСТ перед первой выборкой — проверено НАБЛЮДЕНИЕМ, а не кодом возврата
 # очистки (`M-99` §4 стр.12 (д), `C-318` B-1): иначе байты ПРОШЛОГО прогона засчитываются как
 # доставленные этим. Неочищенный каталог — неполная доставка, `transport-failed`/5, читатель не зовётся.
-if [ ! -d "${RESTORE}" ] || [ -n "$(ls -A "${RESTORE}" 2>/dev/null)" ]; then
-  echo "ALERT transport-failed (каталог восстановления ${RESTORE} не очищен)" >&2
+# Наблюдатель пустоты судится СВОИМ статусом (`A-057` N1, клетка K3): отказ `ls -A` без вывода — НЕ
+# «пусто». Глоб оболочки здесь не годится: на нечитаемом каталоге он молча пуст — та же клетка.
+if [ ! -d "${RESTORE}" ]; then
+  echo "ALERT transport-failed (каталог восстановления ${RESTORE} не создан)" >&2
+  write_state 0 0 "" "transport-failed" 0; exit 5
+fi
+SEEN="$(ls -A "${RESTORE}")"; SEEN_RC=$?
+if [ "${SEEN_RC}" -ne 0 ] || [ -n "${SEEN}" ]; then
+  echo "ALERT transport-failed (каталог восстановления ${RESTORE} не очищен или не наблюдаем, ls rc=${SEEN_RC})" >&2
   write_state 0 0 "" "transport-failed" 0; exit 5
 fi
 
@@ -662,11 +669,30 @@ fi
 # выходом (под `pipefail` `printf | grep -q` ложно проваливается на листинге за буфером канала),
 # индекс засчитывается, только когда КАЖДАЯ его форма из листинга лежит в `RESTORE`; выбранный
 # индекс без форм или с недоставленной формой — неполная доставка, `transport-failed`/5.
+# Производные множества от `LISTING` — ОДНИМ разбором встроенными средствами оболочки, без внешнего
+# процесса и без временного файла (`A-057` N1): here-string/here-doc над `LISTING` запрещены — за
+# буфером канала bash пишет их во временный файл, и сбой записи даёт статус 1, неотличимый от
+# честного «нет» (`R-269` Б-1 — членство, `C-320` Б-1 — перечисление sidecar'ов).
+declare -A IN_LISTING=(); SIDECARS=()
+_ifs="${IFS}"; IFS=$'\n'; set -f; NAMES=( ${LISTING} ); set +f; IFS="${_ifs}"
+for _n in "${NAMES[@]}"; do
+  IN_LISTING["${_n}"]=1
+  [[ "${_n}" =~ ^[^/]+\.json$ ]] && SIDECARS+=("${_n}")
+done
+# Пустота производного множества не благоприятна без положительного установления (`A-057` N2(б)):
+# число sidecar'ов сверяется с НЕЗАВИСИМЫМ счётом вторым механизмом (`grep -c` печатает `0`, а при
+# отказе — ничего: пустой вывод ≠ «0»). Расхождение или нечисловой счёт — неполная доставка.
+SC_N="$(printf '%s\n' "${LISTING}" | grep -cE '^[^/]+\.json$')"
+case "${SC_N}" in ''|*[!0-9]*) SC_N=-1 ;; esac
+if [ "${SC_N}" -ne "${#SIDECARS[@]}" ]; then
+  echo "ALERT transport-failed (sidecar'ов в листинге: разбор ${#SIDECARS[@]}, счёт ${SC_N})" >&2
+  write_state 0 0 "" "transport-failed" 0; exit 5
+fi
 CHECKED=0
 for i in ${IDX}; do
   want=0; got=0
   for f in "segment-${i}.jrnl" "segment-${i}.jrnl.zst"; do
-    if grep -qx -- "$f" <<<"${LISTING}"; then
+    if [ -n "${IN_LISTING[${f}]:-}" ]; then
       want=$((want + 1))
       fetch_one "$f" || { write_state 0 0 "" "transport-failed" "${CHECKED}"; exit 5; }
       [ -f "${RESTORE}/$f" ] && got=$((got + 1))
@@ -678,8 +704,12 @@ for i in ${IDX}; do
   fi
   CHECKED=$((CHECKED + 1))
 done
-for side in $(printf '%s\n' "${LISTING}" | grep -E '^[^/]+\.json$'); do
-  fetch_one "${side}" || { write_state 0 0 "" "transport-failed" 0; exit 5; }
+# Каждый sidecar судится НАЛИЧИЕМ в `RESTORE`, как форма сегмента (`A-057` N3, клетка K4): код
+# возврата выборки — декларация транспорта. `checked` при отказе здесь = все доставленные индексы.
+for side in "${SIDECARS[@]}"; do
+  fetch_one "${side}" && [ -f "${RESTORE}/${side}" ] || {
+    echo "ALERT transport-failed (sidecar ${side} не доставлен)" >&2
+    write_state 0 0 "" "transport-failed" "${CHECKED}"; exit 5; }
 done
 
 if [ "${CHECKED}" -eq 0 ]; then write_state 0 0 "" "cold-empty" 0; exit 5; fi
@@ -1871,8 +1901,8 @@ sr_judge() { # $1=читатель вызван $2=rc $3=ok $4=digest $5=reason 
   [ -z "${SR_WHY}" ]
 }
 
-sr_case() { # $1=имя варианта $2=код подменного rm → дописывает sr_bad
-  local box rc called=0 f real_rm
+sr_case() { # $1=имя варианта $2=код подменного rm [$3=ls — наблюдатель `ls -A` отказывает (`SR-L`)] → дописывает sr_bad
+  local box rc called=0 f real_rm real_ls lsout lsrc
   ps_box box; ps_fill "${box}" 7 3 0
   ( cd "${box}/cold" && rm -f segment-00000001.jrnl.zst segment-00000002.jrnl.zst )
   mkdir -p "${box}/restore" "${box}/fakebin"
@@ -1893,6 +1923,24 @@ FAKE
 : > '${box}/sr-cp-noop'; exit 0
 FAKE
   chmod +x "${box}/fakebin/rm" "${box}/fakebin/cp"
+  if [ "${3:-}" = "ls" ]; then
+    real_ls="$(command -v ls)"
+    cat > "${box}/fakebin/ls" <<FAKE
+#!/usr/bin/env bash
+# Подменный ls: на \`-A\` — отказ (статус 2) БЕЗ вывода; прочее (листинг копии, заглушка читателя) — настоящий ls.
+for a in "\$@"; do [ "\$a" = "-A" ] && { : > '${box}/srl-ls-failed'; exit 2; }; done
+exec "${real_ls}" "\$@"
+FAKE
+    chmod +x "${box}/fakebin/ls"
+    # SETUP-страж подмены: `ls -A` в PATH обёртки отказывает без вывода (маркер затем снимается).
+    lsout="$(PATH="${box}/fakebin:${PATH}" ls -A "${box}/restore" 2>/dev/null)"; lsrc=$?
+    rm -f "${box}/srl-ls-failed"
+    if [ "${lsrc}" -eq 0 ] || [ -n "${lsout}" ]; then
+      sr_bad="${sr_bad}
+      $1: SETUP — подменный ls -A не отказывает (rc=${lsrc}) — наблюдатель пустоты не сломан"
+      return
+    fi
+  fi
   # SETUP-страж: прежний restore полон, подмены стоят первыми в PATH обёртки.
   if [ "$(ls -A "${box}/restore" | wc -l)" -ne 6 ] \
      || [ "$(PATH="${box}/fakebin:${PATH}" command -v rm)" != "${box}/fakebin/rm" ] \
@@ -1933,101 +1981,222 @@ else
   pass "SR-M судья принял допустимый отказ и отверг 7 мутантов (успех C-318, вызов читателя, не записано, отпечаток, cold-empty, код 1, checked=3)"
 fi
 
-# ── MF — ЛОЖНОЕ «нет» проверки членства: индекс без форм в листинге НЕ засчитывается (`R-269` Б-1/Б-2) ──
-# §4 стр.12 (в), первая половина: выбранный индекс, у которого в листинге не найдено НИ ОДНОЙ формы, —
-# неполная доставка. Прежняя редакция §11 объявила этот страж не имеющим эксклюзивного члена («при
-# членстве без канала индекс всегда найден») — ложно, замер `R-269`: here-string больше буфера канала
-# (64 КиБ) bash пишет во ВРЕМЕННЫЙ ФАЙЛ; запись не удалась (`cannot create temp file for here-document`)
-# ⇒ `grep` не запускается, статус 1, и условие читает это как «имени нет». Без стража индекс засчитан
-# без единой выборки — исход `TD-260` (`ok=1`, `checked=3`). Сбой записи моделируется ограничением
-# размера файла (`RLIMIT_FSIZE`) при проигнорированном `SIGXFSZ` — запись падает так же, как при ENOSPC.
-# Копия — форма `PS` (листинг 108 419 байт, за буфером канала), состав `00000001 00001501 00003001`.
-#  · `MF-1` — сбой на ВЕСЬ прогон (`ulimit -f 16`): норма — `transport-failed`, код 5, `checked=0`;
-#  · `MF-2` — сбой начинается ПОСЛЕ первой выборки (подменный `cp`: настоящая копия, затем `prlimit` на
-#    процесс обёртки): индекс 1 доставлен честно, следующий ложно «без форм» — норма `checked=1`.
-# Везде: `ok=0`, `digest=""`, состояние записано, читатель НЕ вызван (заглушка печатает успех на чём угодно —
-# без стража обёртка объявит `ok=1`).
-mf_judge() { # $1=ожидаемый checked $2=читатель вызван $3=rc $4=ok $5=digest $6=reason $7=checked → 0, если норма; MF_WHY
-  MF_WHY=""
-  if [ "$4" = "1" ] || [ "$3" = "0" ]; then MF_WHY="объявлен УСПЕХ (ok=${4:-∅}, rc=$3, checked=${7:-∅}) — индекс без форм в листинге засчитан"
-  elif [ "$2" -ne 0 ]; then MF_WHY="читатель ВЫЗВАН при неполной доставке"
-  elif [ -z "$4" ]; then MF_WHY="состояние НЕ ЗАПИСАНО"
-  elif [ -n "$5" ]; then MF_WHY="отпечаток «${5:0:12}…» без доставки"
-  elif [ "$6" != "transport-failed" ]; then MF_WHY="причина «${6:-∅}» вместо transport-failed (§4 стр.12 (в))"
-  elif [ "$3" != "5" ]; then MF_WHY="код $3 вместо 5"
-  elif [ "$7" != "$1" ]; then MF_WHY="checked=${7:-∅} вместо $1 (полностью доставленные ДО отказа)"
-  fi
-  [ -z "${MF_WHY}" ]
+# ── SR-L — K3: наблюдатель пустоты `RESTORE` ОТКАЗАЛ (`A-057` §3.2, M4) ────────────────────────────────
+# Форма `SR-1` (прежний `restore` полон, `rm` без эффекта, `cp` без байт) + подменный `ls`, отказывающий
+# (статус 2, без вывода) ТОЛЬКО на `-A`; листинг копии работает. Реализация, читающая пустой вывод
+# `ls -A` как «пусто» без статуса, засчитывает байты прошлого прогона: `ok=1`, `checked=3`. Норма —
+# §4 стр.12 (д)/(е): отказ наблюдателя — не пустота; `transport-failed`/5, читатель не вызван. Судья — `sr_judge`.
+# Реализация, наблюдающая пустоту иным механизмом со статусом, видит полный каталог — тот же отказ.
+sr_bad=""
+sr_case "SR-L наблюдатель-пустоты-отказал" 1 ls
+if [ -n "${sr_bad}" ]; then
+  fail "SR-L отказ наблюдателя пустоты прочитан как «пусто» — байты прошлого прогона засчитаны (A-057 K3, §4 стр.12 (е)):${sr_bad}"
+else
+  pass "SR-L ls -A отказал без вывода при неочищенном restore ⇒ ok=0, transport-failed, код 5, checked < 3, читатель не вызван"
+fi
+
+# ── КЛАСС K — «ПУСТОТА ПРОИЗВОДНОГО МНОЖЕСТВА БЛАГОПРИЯТНА» (`A-057` §3; `R-269` Б-1, `C-320` Б-1) ──────
+# Обёртка выводит из внешнего механизма производное множество (членство имени в листинге, список
+# sidecar'ов, пустоту `RESTORE`) и ветвится так, что ПУСТОЙ результат ведёт в благоприятную ветку, а отказ
+# механизма даёт тот же пустой результат. Замер `A-057` M2: here-string за буфером канала (64 КиБ) bash
+# пишет во ВРЕМЕННЫЙ ФАЙЛ; сбой записи (`cannot create temp file for here-document`) — статус 1, ровно как
+# у честного «нет совпадения». Клетки: K1 членство (`MF`), K2 перечисление sidecar'ов (`SC`), K3 наблюдение
+# пустоты `RESTORE` (`SR-L`), K4 доставка sidecar'а без проверки наличия (`SD`). Норма — `M-99` §4 стр.12 (е).
+#
+# ИСХОД СЛЕДУЕТ ЗА ДОСТАВКОЙ — судья один на семейство (`A-032` §2.2 п.1). Сбой временного файла бьёт
+# только по реализации, которая на нём стоит: реализация по норме (е) (разбор `LISTING` встроенными
+# средствами) под тем же ограничителем доставляет ВСЁ и честно читает. Поэтому допустимы ДВА исхода, и
+# каждый — только целиком:
+#  · честный успех — читатель вызван и в момент чтения видел КАЖДУЮ форму выбранных индексов и КАЖДЫЙ
+#    sidecar копии; `ok=1`, `rc=0`, `checked=3`, отпечаток взят у читателя;
+#  · отказ — `ok=0`, `digest=""`, `transport-failed`, код 5, состояние записано, читатель НЕ вызван,
+#    `checked` = индексы, полностью доставленные ДО отказа (параметр мира).
+# Запрещено всё прочее, и прежде всего `ok=1` при неполной доставке — исход `R-269`/`C-320`.
+# Прежняя редакция `MF` требовала ТОЛЬКО отказ (`R-269`): реализация по норме (е) краснела бы на ней,
+# доставив всё, — судья запрещал бы исправление. Ослабления нет: успех принимается лишь при полноте,
+# увиденной читателем, а мутант «успех при неполной доставке» — в самопроверке `DL-M`.
+dl_complete() { # $1=песочница $2=литерал состава → 1, если читатель видел все формы состава и все sidecar'ы копии
+  local i f j
+  [ -f "$1/reader-saw.txt" ] || { printf 0; return; }
+  for i in $2; do
+    for f in "segment-${i}.jrnl" "segment-${i}.jrnl.zst"; do
+      [ -e "$1/cold/${f}" ] || continue
+      grep -qxF -- "${f}" "$1/reader-saw.txt" || { printf 0; return; }
+    done
+  done
+  for j in "$1/cold"/*.json; do
+    [ -e "${j}" ] || continue
+    grep -qxF -- "$(basename "${j}")" "$1/reader-saw.txt" || { printf 0; return; }
+  done
+  printf 1
 }
 
-mf_case() { # $1=имя варианта $2=ожидаемый checked $3=whole|after → дописывает mf_bad
-  local box rc called=0 real_cp
-  ps_box box; ps_fill "${box}" 3001 1650 26; mkdir -p "${box}/fakebin"
-  if [ "$3" = "after" ]; then
-    real_cp="$(command -v cp)"
-    cat > "${box}/fakebin/cp" <<FAKE
+dl_judge() { # $1=ожидаемый checked при отказе $2=читатель вызван $3=rc $4=ok $5=digest $6=reason $7=checked $8=полнота (dl_complete) → 0, если норма; DL_WHY
+  DL_WHY=""
+  if [ "$4" = "1" ] || [ "$3" = "0" ]; then
+    if [ "$8" != "1" ]; then DL_WHY="объявлен УСПЕХ (ok=${4:-∅}, rc=$3, checked=${7:-∅}) при НЕПОЛНОЙ доставке — читатель видел не всё"
+    elif [ "$2" -ne 1 ]; then DL_WHY="успех без вызова читателя"
+    elif [ "$4" != "1" ] || [ "$3" != "0" ]; then DL_WHY="противоречие исхода: ok=${4:-∅}, rc=$3"
+    elif [ "$7" != "3" ]; then DL_WHY="успех с checked=${7:-∅} при трёх доставленных индексах"
+    elif [ "$5" != "${PS_DG}" ]; then DL_WHY="отпечаток «${5:0:12}…» не взят у читателя"
+    fi
+  elif [ "$2" -ne 0 ]; then DL_WHY="читатель ВЫЗВАН при неполной доставке"
+  elif [ -z "$4" ]; then DL_WHY="состояние НЕ ЗАПИСАНО"
+  elif [ -n "$5" ]; then DL_WHY="отпечаток «${5:0:12}…» без доставки"
+  elif [ "$6" != "transport-failed" ]; then DL_WHY="причина «${6:-∅}» вместо transport-failed (§4 стр.12 (в)/(е))"
+  elif [ "$3" != "5" ]; then DL_WHY="код $3 вместо 5"
+  elif [ "$7" != "$1" ]; then DL_WHY="checked=${7:-∅} вместо $1 (полностью доставленные ДО отказа)"
+  fi
+  [ -z "${DL_WHY}" ]
+}
+
+dl_verdict() { # $1=песочница $2=ожидаемый checked при отказе $3=литерал состава → dl_judge по факту прогона
+  local called=0; [ -e "$1/stub-reader.called" ] && called=1
+  dl_judge "$2" "${called}" "$(drill_rc "$1")" "$(state_field "$1" ok)" "$(state_field "$1" digest)" \
+    "$(state_field "$1" reason)" "$(state_field "$1" checked)" "$(dl_complete "$1" "$3")"
+}
+
+# Подменный `cp` с ограничителем: настоящая копия; после N-й выборки СЕГМЕНТНОЙ формы — RLIMIT_FSIZE
+# 16 КиБ на процесс обёртки (`$PPID`), `SIGXFSZ` проигнорирован прелюдией прогона. Считаются ТОЛЬКО
+# сегментные формы: порядок «сегменты, затем sidecar'ы» нормой не задан, и ограничитель не должен
+# зависеть от него.
+dl_limiter_cp() { # $1=песочница $2=после скольких сегментных выборок
+  local real_cp; real_cp="$(command -v cp)"
+  mkdir -p "$1/fakebin"
+  cat > "$1/fakebin/cp" <<FAKE
 #!/usr/bin/env bash
-# Подменный cp: настоящая копия; на ПЕРВОМ вызове — RLIMIT_FSIZE 16 КиБ на процесс обёртки (\$PPID).
 "${real_cp}" "\$@" || exit \$?
-if [ ! -e '${box}/mf-armed' ]; then
-  : > '${box}/mf-armed'
-  prlimit --fsize=16384 --pid "\$PPID" && : > '${box}/mf-limited'
+case "\$*" in *"/segment-"*) printf x >> '$1/dl-seg-count' ;; esac
+if [ ! -e '$1/dl-armed' ] && [ "\$(wc -c < '$1/dl-seg-count' 2>/dev/null || echo 0)" -ge $2 ]; then
+  : > '$1/dl-armed'
+  prlimit --fsize=16384 --pid "\$PPID" && : > '$1/dl-limited'
 fi
 exit 0
 FAKE
-    chmod +x "${box}/fakebin/cp"
-    PS_PRELUDE="trap '' XFSZ" ps_run "${box}" local; rc=$?
-    if [ ! -e "${box}/mf-limited" ]; then
+  chmod +x "$1/fakebin/cp"
+}
+
+# SETUP-страж механизма — один на `MF` и `SC`: на ЭТОМ хосте here-string за буфером канала при
+# RLIMIT_FSIZE даёт ложное «нет», а под буфером — нет (иначе миры судят не тот путь).
+DL_MECH=""
+dl_big="$(seq -f 'segment-%08g.jrnl.zst' 1 6000)"; dl_small="$(seq -f 'segment-%08g.jrnl.zst' 1 100)"
+if ! command -v prlimit >/dev/null 2>&1; then
+  DL_MECH="SETUP: нет prlimit — ограничитель после выборки не на чем ставить"
+elif ( trap '' XFSZ; ulimit -f 16; grep -qx -- 'segment-00000001.jrnl.zst' <<<"${dl_big}" ) 2>/dev/null \
+   || ! ( trap '' XFSZ; ulimit -f 16; grep -qx -- 'segment-00000001.jrnl.zst' <<<"${dl_small}" ) 2>/dev/null; then
+  DL_MECH="SETUP: here-string при RLIMIT_FSIZE ведёт себя не так, как замерено R-269/A-057 M2 (большой — ложное «нет», малый — «да»)"
+fi
+
+# ── MF — K1: ложное «нет» проверки членства (`R-269` Б-1/Б-2) ───────────────────────────────────────
+# Копия формы `PS` (листинг 108 419 байт), состав `00000001 00001501 00003001`.
+#  · `MF-1` — сбой на ВЕСЬ прогон (`ulimit -f 16`): отказ ⇒ `checked=0`;
+#  · `MF-2` — ограничитель после ПЕРВОЙ сегментной выборки: индекс 1 доставлен честно, отказ ⇒ `checked=1`.
+# На реализации с членством через here-string без стража «форм в листинге 0» — `ok=1` при неполной
+# доставке (`2d9c0002`); со стражем — отказ; по норме (е) — честный успех.
+mf_case() { # $1=имя варианта $2=ожидаемый checked при отказе $3=whole|after → дописывает mf_bad
+  local box
+  ps_box box; ps_fill "${box}" 3001 1650 26
+  if [ "$3" = "after" ]; then
+    dl_limiter_cp "${box}" 1
+    PS_PRELUDE="trap '' XFSZ" ps_run "${box}" local
+    if [ ! -e "${box}/dl-limited" ]; then
       mf_bad="${mf_bad}
       $1: SETUP — ограничение после первой выборки НЕ наложено (prlimit на процесс обёртки не сработал)"
       return
     fi
   else
-    PS_PRELUDE="trap '' XFSZ; ulimit -f 16" ps_run "${box}" local; rc=$?
+    PS_PRELUDE="trap '' XFSZ; ulimit -f 16" ps_run "${box}" local
   fi
-  [ -e "${box}/stub-reader.called" ] && called=1
-  mf_judge "$2" "${called}" "${rc}" "$(state_field "${box}" ok)" "$(state_field "${box}" digest)" \
-    "$(state_field "${box}" reason)" "$(state_field "${box}" checked)" \
-    || mf_bad="${mf_bad}
-      $1: ${MF_WHY}"
+  dl_verdict "${box}" "$2" "${PS_EXPECTED}" || mf_bad="${mf_bad}
+      $1: ${DL_WHY}"
 }
-mf_bad=""
-# SETUP-страж механизма: на ЭТОМ хосте here-string за буфером канала при RLIMIT_FSIZE даёт ложное «нет»,
-# а под буфером — нет (иначе сценарий судит не тот путь).
-mf_big="$(seq -f 'segment-%08g.jrnl.zst' 1 6000)"; mf_small="$(seq -f 'segment-%08g.jrnl.zst' 1 100)"
-if ! command -v prlimit >/dev/null 2>&1; then
-  mf_bad="${mf_bad}
-      SETUP: нет prlimit — MF-2 не на чем гонять"
-elif ( trap '' XFSZ; ulimit -f 16; grep -qx -- 'segment-00000001.jrnl.zst' <<<"${mf_big}" ) 2>/dev/null \
-   || ! ( trap '' XFSZ; ulimit -f 16; grep -qx -- 'segment-00000001.jrnl.zst' <<<"${mf_small}" ) 2>/dev/null; then
-  mf_bad="${mf_bad}
-      SETUP: here-string при RLIMIT_FSIZE ведёт себя не так, как замерено R-269 (большой — ложное «нет», малый — «да»)"
-else
+mf_bad="${DL_MECH:+
+      ${DL_MECH}}"
+if [ -z "${DL_MECH}" ]; then
   mf_case "MF-1 сбой-на-весь-прогон" 0 whole
   mf_case "MF-2 сбой-после-первой-выборки" 1 after
 fi
 if [ -n "${mf_bad}" ]; then
-  fail "MF ложное «нет» членства — индекс без форм в листинге засчитан (R-269 Б-1, §4 стр.12 (в)):${mf_bad}"
+  fail "MF ложное «нет» членства — индекс засчитан без доставки (R-269 Б-1, §4 стр.12 (в)/(е)):${mf_bad}"
 else
-  pass "MF ложное «нет» членства (сбой временного файла here-string на весь прогон; после первой выборки) ⇒ ok=0, transport-failed, код 5, checked = доставленные до отказа (0; 1), читатель не вызван"
+  pass "MF ложное «нет» членства (сбой временного файла на весь прогон; после первой выборки) ⇒ исход следует за доставкой: честный успех целиком либо transport-failed/5, checked = доставленные до отказа (0; 1), читатель не вызван"
 fi
 
-# ── MF-M — САМОПРОВЕРКА судьи `MF` (на каждом прогоне) ───────────────────────────────────────────
-mfm_missed=""
-mf_judge 1 0 5 0 "" transport-failed 1 || fail "MF-M SETUP: судья отверг ДОПУСТИМЫЙ отказ (${MF_WHY})"
-mf_judge 1 1 0 1 "${PS_DG}" "" 3              && mfm_missed="${mfm_missed} R-269-ok=1-checked=3"
-mf_judge 0 1 5 0 "" "reader-rc-5 (empty — копия не привезла событий)" 3 && mfm_missed="${mfm_missed} R-269-ложный-диагноз"
-mf_judge 1 1 5 0 "" transport-failed 1        && mfm_missed="${mfm_missed} читатель-вызван"
-mf_judge 1 0 5 "" "" "" ""                    && mfm_missed="${mfm_missed} состояние-не-записано"
-mf_judge 1 0 5 0 "${PS_DG}" transport-failed 1 && mfm_missed="${mfm_missed} отпечаток-при-отказе"
-mf_judge 1 0 5 0 "" cold-empty 1              && mfm_missed="${mfm_missed} причина-cold-empty"
-mf_judge 1 0 1 0 "" transport-failed 1        && mfm_missed="${mfm_missed} код-1"
-mf_judge 1 0 5 0 "" transport-failed 3        && mfm_missed="${mfm_missed} checked=3"
-mf_judge 1 0 5 0 "" transport-failed 0        && mfm_missed="${mfm_missed} checked-занижен"
-if [ -n "${mfm_missed}" ]; then
-  fail "MF-M судья ПРИНЯЛ мутантов:${mfm_missed}"
+# ── SC — K2: перечисление sidecar'ов отказало ПОСЛЕ честной доставки всех сегментов (`C-320` Б-1) ─────
+# Копия формы `PS` + два sidecar'а; ограничитель — после ЧЕТВЁРТОЙ (последней) сегментной выборки.
+# Стражи: ограничение наложено; все четыре сегментные формы лежат в `RESTORE`; в копии два sidecar'а.
+# На вершине (`2d9c0002`) и на кандидате «только страж want=0» — `ok=1`, `checked=3`, sidecar'ов 0.
+sc_bad="${DL_MECH:+
+      ${DL_MECH}}"
+if [ -z "${DL_MECH}" ]; then
+  ps_box BOX_SC; ps_fill "${BOX_SC}" 3001 1650 26
+  dl_limiter_cp "${BOX_SC}" 4
+  PS_PRELUDE="trap '' XFSZ" ps_run "${BOX_SC}" local
+  sc_forms=0
+  for f in segment-00000001.jrnl.zst segment-00001501.jrnl segment-00001501.jrnl.zst segment-00003001.jrnl; do
+    [ -f "${BOX_SC}/restore/${f}" ] && sc_forms=$((sc_forms + 1))
+  done
+  if [ ! -e "${BOX_SC}/dl-limited" ]; then
+    sc_bad="${sc_bad}
+      SETUP: ограничение после четвёртой сегментной выборки НЕ наложено"
+  elif [ "${sc_forms}" -ne 4 ] || [ "$(ls "${BOX_SC}/cold"/*.json | wc -l)" -ne 2 ]; then
+    sc_bad="${sc_bad}
+      SETUP: сегментных форм в RESTORE ${sc_forms} из 4 или в копии не два sidecar'а — мир «после честной доставки сегментов» не построен"
+  elif ! dl_verdict "${BOX_SC}" 3 "${PS_EXPECTED}"; then
+    sc_bad="${sc_bad}
+      ${DL_WHY} (sidecar'ов в RESTORE: $(ls "${BOX_SC}/restore"/*.json 2>/dev/null | wc -l) из 2)"
+  fi
+fi
+if [ -n "${sc_bad}" ]; then
+  fail "SC перечисление sidecar'ов отказало после доставки сегментов — sidecar'ы потеряны молча (C-320 Б-1, §4 стр.12 (е)):${sc_bad}"
 else
-  pass "MF-M судья принял допустимый отказ и отверг 9 мутантов (успех R-269, ложный диагноз R-269, вызов читателя, не записано, отпечаток, cold-empty, код 1, checked=3, checked занижен)"
+  pass "SC отказ временного файла после последней сегментной выборки ⇒ исход следует за доставкой: честный успех со всеми sidecar'ами либо transport-failed/5, checked=3, читатель не вызван"
+fi
+
+# ── SD — K4: транспорт «успешен» без байт на ОДНОМ sidecar'е (`A-057` §3.2, M3) ──────────────────────
+# Форма `DV` (ветка `remote`, восемь индексов, подменный `rsync` выходит 0 без копирования на
+# `journal.legacy.json`), сегменты доставлены честно. Норма — §4 стр.12 (е) N3: отказ, `checked=3`.
+# Страж: вырез сработал, файла в `RESTORE` нет.
+sd_box=""; ps_box sd_box; ps_fill "${sd_box}" 7 3 0
+( cd "${sd_box}/cold" && rm -f segment-00000001.jrnl.zst segment-00000002.jrnl.zst )
+mkdir -p "${sd_box}/fakebin"
+cat > "${sd_box}/fakebin/rsync" <<FAKE
+#!/usr/bin/env bash
+# Подменный rsync: на journal.legacy.json — выход 0 без копирования; прочее — настоящий rsync.
+for a in "\$@"; do case "\$a" in *"/journal.legacy.json") : > '${sd_box}/sd-cut'; exit 0 ;; esac; done
+exec "$(command -v rsync)" "\$@"
+FAKE
+chmod +x "${sd_box}/fakebin/rsync"
+ps_run "${sd_box}" remote
+if [ ! -e "${sd_box}/sd-cut" ] || [ -e "${sd_box}/restore/journal.legacy.json" ]; then
+  fail "SD SETUP: подменный rsync НЕ вырезал journal.legacy.json — недоставка sidecar'а не смоделирована"
+elif dl_verdict "${sd_box}" 3 "00000000 00000003 00000007"; then
+  pass "SD sidecar при «успешной» выборке без байт ⇒ transport-failed/5, checked=3, читатель не вызван"
+else
+  fail "SD транспорт сообщил успех без байт sidecar'а — доставка sidecar'а судится кодом возврата (A-057 K4, §4 стр.12 (е)): ${DL_WHY}"
+fi
+
+# ── DL-M — САМОПРОВЕРКА общего судьи `MF`/`SC`/`SD` (на каждом прогоне) ─────────────────────────────
+dlm_missed=""
+dl_judge 3 0 5 0 "" transport-failed 3 0 || fail "DL-M SETUP: судья отверг ДОПУСТИМЫЙ отказ (${DL_WHY})"
+dl_judge 3 1 0 1 "${PS_DG}" "" 3 1        || fail "DL-M SETUP: судья отверг ЧЕСТНЫЙ успех (${DL_WHY})"
+dl_judge 3 1 0 1 "${PS_DG}" "" 3 0          && dlm_missed="${dlm_missed} R-269/C-320-ok=1-при-неполной"
+dl_judge 3 1 5 0 "" "reader-rc-5 (empty — копия не привезла событий)" 3 0 && dlm_missed="${dlm_missed} R-269-ложный-диагноз"
+dl_judge 3 1 5 0 "" transport-failed 3 0    && dlm_missed="${dlm_missed} читатель-вызван"
+dl_judge 3 0 5 "" "" "" "" 0                && dlm_missed="${dlm_missed} состояние-не-записано"
+dl_judge 3 0 5 0 "${PS_DG}" transport-failed 3 0 && dlm_missed="${dlm_missed} отпечаток-при-отказе"
+dl_judge 3 0 5 0 "" cold-empty 3 0          && dlm_missed="${dlm_missed} причина-cold-empty"
+dl_judge 3 0 5 0 "" reader-rc-5 3 0         && dlm_missed="${dlm_missed} причина-reader-rc-5"
+dl_judge 3 0 1 0 "" transport-failed 3 0    && dlm_missed="${dlm_missed} код-1"
+dl_judge 3 0 5 0 "" transport-failed 0 0    && dlm_missed="${dlm_missed} checked-занижен"
+dl_judge 0 0 5 0 "" transport-failed 3 0    && dlm_missed="${dlm_missed} checked-завышен"
+dl_judge 3 0 0 1 "${PS_DG}" "" 3 1          && dlm_missed="${dlm_missed} успех-без-читателя"
+dl_judge 3 1 0 1 "${PS_DG}" "" 2 1          && dlm_missed="${dlm_missed} успех-checked=2"
+dl_judge 3 1 0 1 "" "" 3 1                  && dlm_missed="${dlm_missed} успех-без-отпечатка"
+if [ -n "${dlm_missed}" ]; then
+  fail "DL-M судья ПРИНЯЛ мутантов:${dlm_missed}"
+else
+  pass "DL-M судья принял честный успех и допустимый отказ и отверг 13 мутантов (успех при неполной доставке, ложный диагноз R-269, вызов читателя, не записано, отпечаток, cold-empty, reader-rc-5, код 1, checked занижен/завышен, успех без читателя, успех checked=2, успех без отпечатка)"
 fi
 
 # ── PS-M / DV-M — САМОПРОВЕРКА судей (на каждом прогоне) ─────────────────────────────────────────
