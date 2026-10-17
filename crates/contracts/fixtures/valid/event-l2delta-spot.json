@@ -1,0 +1,1 @@
+{"seq":7,"ts_mono_ns":100,"ts_wall_ms":1752000000500,"kind":{"Md":{"venue":"Binance","symbol":"BTCUSDT","payload":{"L2Delta":{"bids":[{"price":6500050000000,"size":30000000},{"price":6500040000000,"size":0}],"asks":[{"price":6500060000000,"size":15000000}],"first_update_id":101,"final_update_id":103,"prev_final_update_id":null,"ts_exch_ms":1752000000499}}}}}

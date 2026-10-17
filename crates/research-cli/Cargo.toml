@@ -1,0 +1,40 @@
+[package]
+name = "research-cli"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+
+# Слой 7, мост движок↔деск (docs/fa/research-cli.md). ЧИСТЫЙ Rust-compute:
+# ноль LLM-зависимостей (RC-I-1), read-only журнал (RC-I-7), вне торгового пути.
+# CLI — std::env::args (без clap: меньше зависимостей в мосте).
+
+[dependencies]
+contracts = { path = "../contracts" }
+journal = { path = "../journal" }
+book = { path = "../book" }
+sim = { path = "../sim" }
+signals = { path = "../signals" }
+# M-07 task 6: грид гоняет НАСТОЯЩИЙ strategy-пайплайн через sim::StrategyBacktest.
+alpha = { path = "../alpha" }
+portfolio = { path = "../portfolio" }
+strategy = { path = "../strategy" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = "3"
+# RED-фикстуры M-08: сырые journal-фреймы (заголовок сегмента + события с заданными часами).
+postcard = { version = "1", features = ["use-std"] }
+crc32fast = "1"
+
+[[bin]]
+name = "research-cli"
+path = "src/main.rs"
+
+# M-32 task 2b: one-shot анализ прод-журнала через analyze/consistency на примере BTCUSDT L2Delta.
+# EpochFilter НАЗВАН (CT-RFC02-2): `OwnCaptureOnly` (свой захват, без вендорских/синтетики).
+# Запуск: cargo run --release -p research-cli --example depth_lifetime -- <journal-dir>
+[[example]]
+name = "depth_lifetime"
+path = "examples/depth_lifetime.rs"
