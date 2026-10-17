@@ -127,9 +127,14 @@ chk "! grep -qE 'printf [^|]*\\|[[:space:]]*grep -q' ${DRILL}"
 chk "! grep -qE '^[[:space:]]*exec 9>\"[^\"]*\"[[:space:]]+2>/dev/null' ${DRILL}"
 chk "grep -q '^ps_judge()' scripts/tests/red_restore_drill.sh && grep -q '^dv_judge()' scripts/tests/red_restore_drill.sh && grep -q 'PS-M/DV-M судьи' scripts/tests/red_restore_drill.sh"
 chk "grep -q '^sr_judge()' scripts/tests/red_restore_drill.sh && grep -q '^sr_case \"SR-1' scripts/tests/red_restore_drill.sh && grep -q '^sr_case \"SR-2' scripts/tests/red_restore_drill.sh && grep -q 'SR-M судья принял' scripts/tests/red_restore_drill.sh"
-# §4 стр.12 (в) «индекс без форм в листинге» (`R-269` Б-1/Б-2) судит ИСПОЛНЕНИЕМ `MF`/`MF-M` пробы
-# (ложное «нет» here-string при сбое временного файла); здесь — что семейство не выпало из пробы.
-chk "grep -q '^mf_judge()' scripts/tests/red_restore_drill.sh && grep -q '^  mf_case \"MF-1' scripts/tests/red_restore_drill.sh && grep -q '^  mf_case \"MF-2' scripts/tests/red_restore_drill.sh && grep -q 'MF-M судья принял' scripts/tests/red_restore_drill.sh"
+# §4 стр.12 (в)/(е) — класс K «пустота производного множества благоприятна» (`R-269` Б-1, `C-320` Б-1,
+# `A-057`) судит ИСПОЛНЕНИЕМ проба: `MF` (K1 членство), `SC` (K2 перечисление sidecar'ов), `SR-L` (K3
+# наблюдатель пустоты), `SD` (K4 sidecar без наличия), общий судья `dl_judge` и самопроверка `DL-M`.
+# Здесь — ремень, не суд: семейства не выпали из пробы, и в обёртке (вне комментариев) нет here-string
+# над `LISTING` — по образцу канарейки конвейера выше. Поведенческий суд — проба (`C-319`).
+chk "grep -q '^dl_judge()' scripts/tests/red_restore_drill.sh && grep -q '^  mf_case \"MF-1' scripts/tests/red_restore_drill.sh && grep -q '^  mf_case \"MF-2' scripts/tests/red_restore_drill.sh && grep -q 'DL-M судья принял' scripts/tests/red_restore_drill.sh"
+chk "grep -q '^# ── SC — K2' scripts/tests/red_restore_drill.sh && grep -q '^# ── SD — K4' scripts/tests/red_restore_drill.sh && grep -q '^sr_case \"SR-L' scripts/tests/red_restore_drill.sh"
+chk "! grep -vE '^[[:space:]]*#' ${DRILL} | grep -qE '<<<?[[:space:]]*\"?\\\$\\{?LISTING'"
 
 step "task #2b — читатель существует, различает коды, попадает в прод-образ"
 chk "test -f ${READER}"
