@@ -1693,7 +1693,7 @@ STUBR
          JOURNAL_DRILL_ALERT_FILE="$1/drill.alert" \
          bash "${wrapper}" >"$1/drill.out" 2>"$1/drill.err" </dev/null )
   else
-    ( cd "$1" \
+    ( cd "$1" && eval "${PS_PRELUDE:-:}" \
       && PATH="$1/fakebin:${PATH}" \
          JOURNAL_DRILL_COLD="$1/cold" JOURNAL_DRILL_RESTORE="$1/restore" \
          JOURNAL_DRILL_STATE="$1/state/journal-restore-drill.json" \
@@ -1931,6 +1931,103 @@ if [ -n "${srm_missed}" ]; then
   fail "SR-M судья ПРИНЯЛ мутантов:${srm_missed}"
 else
   pass "SR-M судья принял допустимый отказ и отверг 7 мутантов (успех C-318, вызов читателя, не записано, отпечаток, cold-empty, код 1, checked=3)"
+fi
+
+# ── MF — ЛОЖНОЕ «нет» проверки членства: индекс без форм в листинге НЕ засчитывается (`R-269` Б-1/Б-2) ──
+# §4 стр.12 (в), первая половина: выбранный индекс, у которого в листинге не найдено НИ ОДНОЙ формы, —
+# неполная доставка. Прежняя редакция §11 объявила этот страж не имеющим эксклюзивного члена («при
+# членстве без канала индекс всегда найден») — ложно, замер `R-269`: here-string больше буфера канала
+# (64 КиБ) bash пишет во ВРЕМЕННЫЙ ФАЙЛ; запись не удалась (`cannot create temp file for here-document`)
+# ⇒ `grep` не запускается, статус 1, и условие читает это как «имени нет». Без стража индекс засчитан
+# без единой выборки — исход `TD-260` (`ok=1`, `checked=3`). Сбой записи моделируется ограничением
+# размера файла (`RLIMIT_FSIZE`) при проигнорированном `SIGXFSZ` — запись падает так же, как при ENOSPC.
+# Копия — форма `PS` (листинг 108 419 байт, за буфером канала), состав `00000001 00001501 00003001`.
+#  · `MF-1` — сбой на ВЕСЬ прогон (`ulimit -f 16`): норма — `transport-failed`, код 5, `checked=0`;
+#  · `MF-2` — сбой начинается ПОСЛЕ первой выборки (подменный `cp`: настоящая копия, затем `prlimit` на
+#    процесс обёртки): индекс 1 доставлен честно, следующий ложно «без форм» — норма `checked=1`.
+# Везде: `ok=0`, `digest=""`, состояние записано, читатель НЕ вызван (заглушка печатает успех на чём угодно —
+# без стража обёртка объявит `ok=1`).
+mf_judge() { # $1=ожидаемый checked $2=читатель вызван $3=rc $4=ok $5=digest $6=reason $7=checked → 0, если норма; MF_WHY
+  MF_WHY=""
+  if [ "$4" = "1" ] || [ "$3" = "0" ]; then MF_WHY="объявлен УСПЕХ (ok=${4:-∅}, rc=$3, checked=${7:-∅}) — индекс без форм в листинге засчитан"
+  elif [ "$2" -ne 0 ]; then MF_WHY="читатель ВЫЗВАН при неполной доставке"
+  elif [ -z "$4" ]; then MF_WHY="состояние НЕ ЗАПИСАНО"
+  elif [ -n "$5" ]; then MF_WHY="отпечаток «${5:0:12}…» без доставки"
+  elif [ "$6" != "transport-failed" ]; then MF_WHY="причина «${6:-∅}» вместо transport-failed (§4 стр.12 (в))"
+  elif [ "$3" != "5" ]; then MF_WHY="код $3 вместо 5"
+  elif [ "$7" != "$1" ]; then MF_WHY="checked=${7:-∅} вместо $1 (полностью доставленные ДО отказа)"
+  fi
+  [ -z "${MF_WHY}" ]
+}
+
+mf_case() { # $1=имя варианта $2=ожидаемый checked $3=whole|after → дописывает mf_bad
+  local box rc called=0 real_cp
+  ps_box box; ps_fill "${box}" 3001 1650 26; mkdir -p "${box}/fakebin"
+  if [ "$3" = "after" ]; then
+    real_cp="$(command -v cp)"
+    cat > "${box}/fakebin/cp" <<FAKE
+#!/usr/bin/env bash
+# Подменный cp: настоящая копия; на ПЕРВОМ вызове — RLIMIT_FSIZE 16 КиБ на процесс обёртки (\$PPID).
+"${real_cp}" "\$@" || exit \$?
+if [ ! -e '${box}/mf-armed' ]; then
+  : > '${box}/mf-armed'
+  prlimit --fsize=16384 --pid "\$PPID" && : > '${box}/mf-limited'
+fi
+exit 0
+FAKE
+    chmod +x "${box}/fakebin/cp"
+    PS_PRELUDE="trap '' XFSZ" ps_run "${box}" local; rc=$?
+    if [ ! -e "${box}/mf-limited" ]; then
+      mf_bad="${mf_bad}
+      $1: SETUP — ограничение после первой выборки НЕ наложено (prlimit на процесс обёртки не сработал)"
+      return
+    fi
+  else
+    PS_PRELUDE="trap '' XFSZ; ulimit -f 16" ps_run "${box}" local; rc=$?
+  fi
+  [ -e "${box}/stub-reader.called" ] && called=1
+  mf_judge "$2" "${called}" "${rc}" "$(state_field "${box}" ok)" "$(state_field "${box}" digest)" \
+    "$(state_field "${box}" reason)" "$(state_field "${box}" checked)" \
+    || mf_bad="${mf_bad}
+      $1: ${MF_WHY}"
+}
+mf_bad=""
+# SETUP-страж механизма: на ЭТОМ хосте here-string за буфером канала при RLIMIT_FSIZE даёт ложное «нет»,
+# а под буфером — нет (иначе сценарий судит не тот путь).
+mf_big="$(seq -f 'segment-%08g.jrnl.zst' 1 6000)"; mf_small="$(seq -f 'segment-%08g.jrnl.zst' 1 100)"
+if ! command -v prlimit >/dev/null 2>&1; then
+  mf_bad="${mf_bad}
+      SETUP: нет prlimit — MF-2 не на чем гонять"
+elif ( trap '' XFSZ; ulimit -f 16; grep -qx -- 'segment-00000001.jrnl.zst' <<<"${mf_big}" ) 2>/dev/null \
+   || ! ( trap '' XFSZ; ulimit -f 16; grep -qx -- 'segment-00000001.jrnl.zst' <<<"${mf_small}" ) 2>/dev/null; then
+  mf_bad="${mf_bad}
+      SETUP: here-string при RLIMIT_FSIZE ведёт себя не так, как замерено R-269 (большой — ложное «нет», малый — «да»)"
+else
+  mf_case "MF-1 сбой-на-весь-прогон" 0 whole
+  mf_case "MF-2 сбой-после-первой-выборки" 1 after
+fi
+if [ -n "${mf_bad}" ]; then
+  fail "MF ложное «нет» членства — индекс без форм в листинге засчитан (R-269 Б-1, §4 стр.12 (в)):${mf_bad}"
+else
+  pass "MF ложное «нет» членства (сбой временного файла here-string на весь прогон; после первой выборки) ⇒ ok=0, transport-failed, код 5, checked = доставленные до отказа (0; 1), читатель не вызван"
+fi
+
+# ── MF-M — САМОПРОВЕРКА судьи `MF` (на каждом прогоне) ───────────────────────────────────────────
+mfm_missed=""
+mf_judge 1 0 5 0 "" transport-failed 1 || fail "MF-M SETUP: судья отверг ДОПУСТИМЫЙ отказ (${MF_WHY})"
+mf_judge 1 1 0 1 "${PS_DG}" "" 3              && mfm_missed="${mfm_missed} R-269-ok=1-checked=3"
+mf_judge 0 1 5 0 "" "reader-rc-5 (empty — копия не привезла событий)" 3 && mfm_missed="${mfm_missed} R-269-ложный-диагноз"
+mf_judge 1 1 5 0 "" transport-failed 1        && mfm_missed="${mfm_missed} читатель-вызван"
+mf_judge 1 0 5 "" "" "" ""                    && mfm_missed="${mfm_missed} состояние-не-записано"
+mf_judge 1 0 5 0 "${PS_DG}" transport-failed 1 && mfm_missed="${mfm_missed} отпечаток-при-отказе"
+mf_judge 1 0 5 0 "" cold-empty 1              && mfm_missed="${mfm_missed} причина-cold-empty"
+mf_judge 1 0 1 0 "" transport-failed 1        && mfm_missed="${mfm_missed} код-1"
+mf_judge 1 0 5 0 "" transport-failed 3        && mfm_missed="${mfm_missed} checked=3"
+mf_judge 1 0 5 0 "" transport-failed 0        && mfm_missed="${mfm_missed} checked-занижен"
+if [ -n "${mfm_missed}" ]; then
+  fail "MF-M судья ПРИНЯЛ мутантов:${mfm_missed}"
+else
+  pass "MF-M судья принял допустимый отказ и отверг 9 мутантов (успех R-269, ложный диагноз R-269, вызов читателя, не записано, отпечаток, cold-empty, код 1, checked=3, checked занижен)"
 fi
 
 # ── PS-M / DV-M — САМОПРОВЕРКА судей (на каждом прогоне) ─────────────────────────────────────────
